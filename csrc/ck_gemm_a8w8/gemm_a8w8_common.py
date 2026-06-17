@@ -257,6 +257,9 @@ kernels_list_cktile_95x = {
      8:   tileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
      9:   tileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
     10:   tileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
+    # 8-warp kernel (4x2x1=8)
+    11:   tileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2,     ),
+    12:   tileKernelInstance(   256,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2,     ),
 }
 
 arch = get_gfx()

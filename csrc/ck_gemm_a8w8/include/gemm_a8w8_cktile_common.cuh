@@ -129,6 +129,14 @@ struct QuantGemmPipelineAgBgCrCompV3 : public ck_tile::GemmPipelineAgBgCrCompV3<
     using BQDataType = ck_tile::remove_cvref_t<typename Problem::BQDataType>;
 };
 
+template <typename Problem, typename Policy = ck_tile::GemmPipelineAgBgCrCompAsyncEightWavesPolicy>
+struct QuantGemmPipelineAgBgCrCompAsyncEightWaves
+    : public ck_tile::GemmPipelineAgBgCrCompAsyncEightWaves<Problem, Policy>
+{
+    using AQDataType = ck_tile::remove_cvref_t<typename Problem::AQDataType>;
+    using BQDataType = ck_tile::remove_cvref_t<typename Problem::BQDataType>;
+};
+
 template <typename ABDataType,
           typename DDataType,
           typename EDataType,
@@ -148,6 +156,9 @@ void TileGemmComputeImpl(const HostArguments& args)
     constexpr bool kPadK = false;
 
     constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::RowColQuant;
+    constexpr bool eight_waves =
+        (GemmConfig::M_Warp_v * GemmConfig::N_Warp_v * GemmConfig::K_Warp_v == 8) &&
+        GemmConfig::K_Warp_Tile_v == 128;
 
     constexpr bool TransposeC = false;
 
@@ -205,7 +216,10 @@ void TileGemmComputeImpl(const HostArguments& args)
             has_hot_loop_v,
             tail_number_v>;
 
-        using GemmPipeline = QuantGemmPipelineAgBgCrCompV3<PipelineProblem>;
+        using GemmPipeline =
+            std::conditional_t<eight_waves,
+                               QuantGemmPipelineAgBgCrCompAsyncEightWaves<PipelineProblem>,
+                               QuantGemmPipelineAgBgCrCompV3<PipelineProblem>>;
         static_assert(!GemmConfig::TiledMMAPermuteN_v,
                       "TiledMMAPermuteN=true requires PermuteNEpilogue, not CShuffleEpilogue");
         using EpTraits     = EpilogueTraits<EDataType, HasBias>;
