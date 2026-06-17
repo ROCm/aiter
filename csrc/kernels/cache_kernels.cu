@@ -1276,6 +1276,8 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const int64_t weights_stride_h,
     const int64_t weights_out_stride_t,
     const int64_t weights_out_stride_h,
+    const int64_t k_stride_t,
+    const int64_t k_stride_d,
     const int64_t cos_stride0,
     const int64_t sin_stride0,
     const float epsilon,
@@ -1291,6 +1293,10 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const int head_idx      = blockIdx.y;
     const int dim           = threadIdx.x;
     if(token_idx >= num_tokens || head_idx >= n_heads)
+        return;
+
+    const int64_t slot_idx = slot_mapping[token_idx];
+    if(slot_idx < 0)
         return;
 
     const int64_t pos = positions[token_idx];
@@ -1352,14 +1358,10 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     if(head_idx != 0)
         return;
 
-    const int64_t slot_idx = slot_mapping[token_idx];
-    if(slot_idx < 0)
-        return;
-
     __shared__ float normed[HEAD_DIM];
-    const scalar_t* k_row = k + token_idx * HEAD_DIM;
+    const scalar_t* k_row = k + token_idx * k_stride_t;
 
-    float x = dim < HEAD_DIM ? static_cast<float>(k_row[dim]) : 0.0f;
+    float x = dim < HEAD_DIM ? static_cast<float>(k_row[dim * k_stride_d]) : 0.0f;
     auto sum_func = [](float a, float b) { return a + b; };
     float sum = block_reduce<float, decltype(sum_func), HEAD_DIM, true>(x, sum_func);
     const float mean = sum / static_cast<float>(HEAD_DIM);
@@ -3169,6 +3171,8 @@ void reshape_and_cache_flash(
                                      weights.stride(1),                                           \
                                      weights_out.stride(0),                                       \
                                      weights_out.stride(1),                                       \
+                                     k.stride(0),                                                 \
+                                     k.stride(1),                                                 \
                                      cos_cache.stride(0),                                         \
                                      sin_cache.stride(0),                                         \
                                      epsilon,                                                     \
@@ -3578,7 +3582,7 @@ void indexer_k_quant_and_cache(aiter_tensor_t& k,        // [num_tokens, head_di
                                const std::string& scale_fmt,
                                bool preshuffle)
 {
-    int num_tokens       = k.size(0);
+    int num_tokens       = std::min(k.size(0), slot_mapping.size(0));
     int head_dim         = k.size(1);
     int cache_block_size = kv_cache.size(1);
     int cache_stride     = kv_cache.size(2);
@@ -3632,7 +3636,7 @@ void indexer_qk_rope_quant_and_cache(
     bool preshuffle,
     bool is_neox)
 {
-    int num_tokens       = k.size(0);
+    int num_tokens       = std::min(k.size(0), slot_mapping.size(0));
     int head_dim         = k.size(1);
     int n_heads          = q.size(1);
     int rope_dim         = cos_cache.size(-1) * 2;
@@ -3662,17 +3666,16 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(weights_out.dim() == 2, "weights_out must be [num_tokens, n_heads]");
     AITER_CHECK(cos_cache.dim() == 2, "cos_cache must be [max_position, rope_dim / 2]");
     AITER_CHECK(sin_cache.dim() == 2, "sin_cache must be [max_position, rope_dim / 2]");
-    AITER_CHECK(q.size(0) == num_tokens, "q token dimension must match k");
+    AITER_CHECK(q.size(0) >= num_tokens, "q must cover all indexed tokens");
     AITER_CHECK(q.size(2) == head_dim, "q head_dim must match k head_dim");
-    AITER_CHECK(slot_mapping.size(0) >= num_tokens, "slot_mapping must cover all k tokens");
-    AITER_CHECK(positions.size(0) >= num_tokens, "positions must cover all k tokens");
-    AITER_CHECK(q_out.size(0) == num_tokens && q_out.size(1) == n_heads &&
+    AITER_CHECK(positions.size(0) >= num_tokens, "positions must cover all indexed tokens");
+    AITER_CHECK(q_out.size(0) >= num_tokens && q_out.size(1) == n_heads &&
                     q_out.size(2) == head_dim,
-                "q_out shape must match q");
-    AITER_CHECK(weights.size(0) == num_tokens && weights.size(1) == n_heads,
-                "weights shape must match q [num_tokens, n_heads]");
-    AITER_CHECK(weights_out.size(0) == num_tokens && weights_out.size(1) == n_heads,
-                "weights_out shape must match weights");
+                "q_out must cover all indexed tokens");
+    AITER_CHECK(weights.size(0) >= num_tokens && weights.size(1) == n_heads,
+                "weights must cover all indexed tokens");
+    AITER_CHECK(weights_out.size(0) >= num_tokens && weights_out.size(1) == n_heads,
+                "weights_out must cover all indexed tokens");
     AITER_CHECK(cos_cache.size(0) == sin_cache.size(0) &&
                     cos_cache.size(1) == sin_cache.size(1),
                 "cos_cache and sin_cache shapes must match");
@@ -3682,8 +3685,6 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(rope_dim == 64, "indexer fused qk cache only supports rope_dim=64");
     AITER_CHECK(quant_block_size == head_dim,
                 "indexer fused qk cache only supports quant_block_size == head_dim");
-    AITER_CHECK(k.stride(1) == 1 && k.stride(0) == head_dim,
-                "indexer fused qk cache requires contiguous [num_tokens, head_dim] k");
     AITER_CHECK(k.dtype() == q.dtype(), "k dtype must match q dtype");
     AITER_CHECK(q_out.dtype() == AITER_DTYPE_fp8, "q_out dtype must be fp8");
     AITER_CHECK(weights.dtype() == q.dtype(), "weights dtype must match q dtype");

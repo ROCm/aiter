@@ -27,7 +27,16 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.aot.flydsl.common import fail_on_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
+import aiter.ops.flydsl.moe_kernels as _aiter_mk
+
+try:
+    from tuned_op_bench_utils import append_tuned_op_bench_rows
+except ModuleNotFoundError as e:
+    if e.name != "tuned_op_bench_utils":
+        raise
+    from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 
 
 from aiter.ops.shuffle import (
@@ -64,6 +73,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=True,
     strict_accuracy=True,
+    check_aot_cache=True,
     swiglu_limit=0.0,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
@@ -72,8 +82,9 @@ def test_fmoe(
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
-        if hidden_pad != 0 and intermediate_pad != 0:
+        if hidden_pad != 0:
             w1[:, :, -hidden_pad:] = 0
+        if intermediate_pad != 0:
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
@@ -81,8 +92,9 @@ def test_fmoe(
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
-    if hidden_pad != 0 and intermediate_pad != 0:
+    if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
+    if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if AITER_MOE_EXPERT_BALANCE:
@@ -354,6 +366,15 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+    # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
+    # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
+    # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
+    # masked by atomic-reduction noise, so detect NaN explicitly and deterministically.
+    has_nan = out2_ck.isnan().any().item()
+    if has_nan:
+        logging.error(
+            "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
+        )
     err = checkAllclose(
         out2_ref,
         out2_ck,
@@ -372,15 +393,21 @@ def test_fmoe(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
     if strict_accuracy:
+        assert not has_nan, "accuracy check failed: output contains NaN"
         assert not (
             err != 0 and logits_diff > 0.01
         ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+    elif has_nan:
+        logging.warning("accuracy check failed (non-strict): output contains NaN")
     elif err != 0 and logits_diff > 0.01:
         logging.warning(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
     return {"us": us2, "logits_diff": float(logits_diff)}
+
+
+test_fmoe_with_aot_cache_check = fail_on_aot_cache_miss(_aiter_mk)(test_fmoe)
 
 
 l_quant = [
@@ -649,6 +676,7 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
+        kwargs["check_aot_cache"] = True
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
@@ -724,6 +752,7 @@ def _iter_legacy_cases():
             use_g1u1=True,
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
+            check_aot_cache=False,
             **over,
         )
 
@@ -735,7 +764,7 @@ def _iter_legacy_cases():
     ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
         triple = (quant_type, aq_dtype, wq_dtype)
 
-        if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+        if triple == _PER1X32_BF16_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for m in args.tokenNum:
                     yield _kw(
@@ -751,6 +780,23 @@ def _iter_legacy_cases():
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
                     ), extras
+        elif triple == _PER1X32_FP8_FP4:
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+                for act_type in args.act:
+                    for m in args.tokenNum:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                        ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
@@ -808,6 +854,28 @@ if not args.no_legacy:
     _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
 
+_csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
+
+
+def _write_bench_csv(rows):
+    if not _csv_out or len(rows) == 0:
+        return
+    row = rows[-1]
+    if row.get("model") == "legacy":
+        return
+    written = append_tuned_op_bench_rows(
+        _csv_out,
+        [row],
+        op_name="moe_2stage",
+        metric_cols=("us",),
+        default_impl="fused_moe",
+    )
+    if written:
+        aiter.logger.info(
+            "moe_2stage: appended %d tuned op bench row(s) to %s", written, _csv_out
+        )
+
+
 df = []
 seen = 0
 for kwargs, extras in case_iter:
@@ -827,7 +895,12 @@ for kwargs, extras in case_iter:
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:
-        ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+        run_test_fmoe = (
+            test_fmoe_with_aot_cache_check
+            if kwargs.get("check_aot_cache", False)
+            else test_fmoe
+        )
+        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
@@ -838,6 +911,7 @@ for kwargs, extras in case_iter:
         continue
     ret.update(extras)
     df.append(ret)
+    _write_bench_csv(df)
 
 aiter.logger.info(
     "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",

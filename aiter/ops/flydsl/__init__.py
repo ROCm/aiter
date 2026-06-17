@@ -13,7 +13,7 @@ from packaging.version import Version
 from .utils import is_flydsl_available
 from .moe_common import GateMode
 
-_MIN_FLYDSL_VERSION = Version("0.1.5.dev515")
+_MIN_FLYDSL_VERSION = Version("0.1.8")
 
 __all__ = [
     "is_flydsl_available",
@@ -45,6 +45,7 @@ if is_flydsl_available():
         flydsl_sage_attn_mxfp4_func,
         fav3_sage_mxfp4_flydsl_wrapper,
     )
+    from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -57,5 +58,6 @@ if is_flydsl_available():
         "flydsl_sage_attn_func",
         "flydsl_sage_attn_mxfp4_func",
         "fav3_sage_mxfp4_flydsl_wrapper",
+        "flydsl_qk_norm_rope_quant",
         # "flydsl_gdr_decode",
     ]

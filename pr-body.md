@@ -8,26 +8,26 @@
 
 ### Aiter
 - runs used: `10`
-- discovered files: `67`
-- with samples: `67`
-- added: `4`
-- updated: `59`
-- unchanged: `4`
-- defaulted (no history): `0`
-- removed stale entries: `1`
-- defaulted files list: `none`
-
-### Triton
-- runs used: `10`
-- discovered files: `89`
-- with samples: `89`
-- added: `8`
-- updated: `76`
-- unchanged: `5`
+- discovered files: `77`
+- with samples: `77`
+- added: `5`
+- updated: `70`
+- unchanged: `2`
 - defaulted (no history): `0`
 - removed stale entries: `0`
 - defaulted files list: `none`
 
+### Triton
+- runs used: `10`
+- discovered files: `99`
+- with samples: `99`
+- added: `5`
+- updated: `76`
+- unchanged: `18`
+- defaulted (no history): `0`
+- removed stale entries: `3`
+- defaulted files list: `none`
+
 ## Test plan
-- [x] bash .github/scripts/split_tests.sh --shards 5 --test-type aiter --dry-run
+- [x] bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run
 - [x] bash .github/scripts/split_tests.sh --shards 8 --test-type triton --dry-run
