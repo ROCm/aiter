@@ -345,6 +345,34 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
+    _is_a4w4 = (
+        qType == aiter.QuantType.per_1x32
+        and AQDType == dtypes.fp4x2
+        and WQDType == dtypes.fp4x2
+    )
+    if os.environ.get("AITER_FORCE_FLYDSL_MOE") and _is_a4w4:
+        # opt-in: route the a4w4 MoE through the FlyDSL port kernels
+        # (mxfp4_gemm{1,2}_a4w4_port) instead of fused_moe's default CK dispatch.
+        # The port expects the mxfp4_moe weight layout (shuffle_weight_a16w4 /
+        # shuffle_scale_a16w4), but a4w4's default prep above used
+        # shuffle_weight((16,16)) -> wrong layout for the port (logits_diff ~0.99).
+        # Rebuild EXACTLY like bench_up_moe_v1.build_weights: re-quantize the original
+        # bf16 weights and apply the a16w4 weight/scale shuffles (avoids the subtle
+        # layout drift from the a4w4 default prep's .view + shuffle_weight((16,16))).
+        _w1q, _w1s = torch_quant(w1, quant_dtype=dtypes.fp4x2)
+        _w2q, _w2s = torch_quant(w2, quant_dtype=dtypes.fp4x2)
+        w1_qt_aiter = shuffle_weight_a16w4(_w1q, 16, True)
+        w2_qt_aiter = shuffle_weight_a16w4(_w2q, 16, False)
+        w1_scale_aiter = shuffle_scale_a16w4(_w1s, E, True)
+        w2_scale_aiter = shuffle_scale_a16w4(_w2s, E, False)
+        w1_qt_aiter.gemm1_backend = "flydsl"
+        w2_qt_aiter.gemm2_backend = "flydsl"
+        # shuffle_kind="mxfp4_guinterleave" selects the FlyDSL PORT (gemm{1,2}_a4w4
+        # flydsl) and its own tuned CSV rows (_tag=mxfp4_guinterleave), separate from
+        # the HIP mxfp4_moe backend -- so port-only kernels (BM64/cshuffle) never reach
+        # the HIP gemm.
+        w1_qt_aiter.shuffle_kind = "mxfp4_guinterleave"
+        w2_qt_aiter.shuffle_kind = "mxfp4_guinterleave"
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -541,6 +569,13 @@ parser.add_argument(
     help="Skip validating flydsl shapes from tuned fmoe CSVs.",
 )
 parser.add_argument(
+    "--csv-filter",
+    nargs="*",
+    default=None,
+    help="Only run CSV rows whose kernelName1/2 contain any of these substrings "
+    "(e.g. --csv-filter abf16_wbf16 to validate just bf16-dense flydsl rows).",
+)
+parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
@@ -629,6 +664,10 @@ def _iter_csv_cases():
         kernel_name2 = str(row.get("kernelName2", "") or "")
         if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
             continue
+        if args.csv_filter:
+            _kn = kernel_name1 + " " + kernel_name2
+            if not any(sub in _kn for sub in args.csv_filter):
+                continue
         try:
             kwargs = _row_to_kwargs(row)
         except Exception as e:
@@ -664,7 +703,9 @@ def _iter_csv_cases():
             )
             continue
         kwargs["strict_accuracy"] = True
-        kwargs["check_aot_cache"] = True
+        # In targeted --csv-filter validation runs, skip the AOT-cache gate (new
+        # configs have no pre-registered AOT cache entry).
+        kwargs["check_aot_cache"] = args.csv_filter is None
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
