@@ -34,20 +34,6 @@ WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 
-def unified_attention_prefers_shuffled_kv() -> bool:
-    """Whether unified_attention reads the 5D pre-shuffled paged KV layout more
-    efficiently than the flash (4D NHD) layout on the current device.
-
-    True only where a dedicated gluon kernel consumes the pre-shuffled layout
-    directly (gfx1250). On every other arch the generic triton kernel has to
-    un-shuffle the layout with an in-register transpose, which is LDS-bound on
-    RDNA4 WMMA (~1.7-1.8x slower decode), so the flash layout is preferred. Lets
-    KV-cache allocators (e.g. ATOM's TritonMHABackend) pick the physical layout
-    without arch checks of their own.
-    """
-    return IS_DEVICE_ARCH_GFX12 and _unified_attention_gluon_kernel_2d is not None
-
-
 def is_2d_gluon_available(
     q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
 ):
