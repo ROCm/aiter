@@ -264,10 +264,14 @@ def extract_kv_caches(kv_cache: dict, contiguous_kv: bool):
 
 def verify_fp8_output(out_fp8, o_ref, threshold: float = 0.055):
     """Verify FP8 kernel output against reference."""
-    max_diff = (out_fp8 - o_ref).abs().max().item()
+    diff = (out_fp8 - o_ref).abs()
+    max_diff = diff.max().item()
+    n_mismatch = (diff >= threshold).sum().item()
+    n_total = diff.numel()
     assert max_diff < threshold, (
         f"FP8 kernel vs reference difference too large: "
-        f"{max_diff} (threshold: {threshold})"
+        f"{max_diff} (threshold: {threshold}), "
+        f"mismatches: {n_mismatch}/{n_total} ({100*n_mismatch/n_total:.2f}%)"
     )
 
 
