@@ -114,6 +114,10 @@ struct MlaReduceKernelV1Params
                                // (max_seqlen_q==1, no LSE out, reduce_final_map present)
     int32_t pool_size;         // partial-pool row count P (= partial_output.size(0)),
                                // passed to the fast kernel for its buffer-rsrc extents
+    int32_t active_num_reduce_tile; // uniform-decode live tile count. In cudagraph
+                                    // paths reduce_indptr can be a static-capacity
+                                    // buffer, but final_output is sliced to the
+                                    // current decode token count.
 };
 
 template <typename T>
@@ -1079,7 +1083,8 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
     {
         if(params.fast_eligible)
         {
-            const int num_tiles = params.num_reduce_tile;
+            const int num_tiles = params.active_num_reduce_tile;
+            if(num_tiles <= 0) return;
             int cap = (num_cu + num_tiles - 1) / num_tiles;   // ceil(num_cu / tiles)
             if(cap > 16) cap = 16;
             if(cap < 2)  cap = 2;
@@ -1094,7 +1099,7 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
                         reinterpret_cast<const float*>(params.p_partial_output),
                         reinterpret_cast<const float*>(params.p_partial_lse),
                         reinterpret_cast<out_t*>(params.p_final_output),
-                        params.p_reduce_indptr, params.num_reduce_tile, params.pool_size);
+                        params.p_reduce_indptr, num_tiles, params.pool_size);
             };
             switch(ms)
             {
@@ -1260,6 +1265,9 @@ void mla_reduce_v1(
         params.fast_eligible        = mla_fast_reduce_enabled() &&
                                       (max_seqlen_q == 1 && !output_lse && !no_reduce_final_map);
         params.pool_size            = (int32_t)partial_output.size(0);
+        params.active_num_reduce_tile =
+            params.fast_eligible ? min(num_reduce_tile, (int32_t)final_output.size(-3))
+                                 : num_reduce_tile;
 
         DISPATCH_MLA_REDUCE_KERNEL(output_lse ? final_lse.value().scalar_type()
                                               : at::ScalarType::Float,
