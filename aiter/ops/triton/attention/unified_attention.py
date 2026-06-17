@@ -345,6 +345,15 @@ def unified_attention(
         K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
         SCALE_K_WIDTH = 4
 
+    # value head size can differ from the query/key head size (e.g. MiMo: qk=192,
+    # v=128). The shuffled / packed layouts only support symmetric heads, so fall
+    # back to head_size there and read the value width from the plain cache layout.
+    if shuffled_kv_cache or q_dtype == torch.uint8:
+        v_head_size = head_size
+    else:
+        v_head_size = v.shape[-1]
+    V_HEAD_SIZE_PADDED = triton.next_power_of_2(v_head_size)
+
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
 
@@ -461,6 +470,8 @@ def unified_attention(
                 BLOCK_SIZE=block_size,
                 HEAD_SIZE=head_size,
                 HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                V_HEAD_SIZE=v_head_size,
+                V_HEAD_SIZE_PADDED=V_HEAD_SIZE_PADDED,
                 USE_ALIBI_SLOPES=use_alibi_slopes,
                 USE_QQ_BIAS=use_qq_bias,
                 USE_SOFTCAP=(softcap > 0),
@@ -503,7 +514,7 @@ def unified_attention(
                 q.shape[0],
                 num_query_heads,
                 NUM_SEGMENTS,
-                triton.next_power_of_2(head_size),
+                V_HEAD_SIZE_PADDED,
                 dtype=torch.float32,
                 device=q.device,
             )
@@ -626,6 +637,8 @@ def unified_attention(
                 BLOCK_SIZE=block_size,
                 HEAD_SIZE=head_size,
                 HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                V_HEAD_SIZE=v_head_size,
+                V_HEAD_SIZE_PADDED=V_HEAD_SIZE_PADDED,
                 USE_ALIBI_SLOPES=use_alibi_slopes,
                 USE_QQ_BIAS=use_qq_bias,
                 USE_SOFTCAP=(softcap > 0),
@@ -705,6 +718,8 @@ def unified_attention(
             block_table_stride=block_table.stride(0),
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=head_size_padded,
+            V_HEAD_SIZE=v_head_size,
+            V_HEAD_SIZE_PADDED=V_HEAD_SIZE_PADDED,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             **reduce_config,
