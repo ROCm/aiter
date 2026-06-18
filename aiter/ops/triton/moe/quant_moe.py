@@ -102,8 +102,8 @@ def downcast_to_mxfp(
     kernel_quant_tensor = out_quant_tensor.view(-1, out_quant_tensor.shape[-1])
     kernel_scale = out_scale.view(-1, out_scale.shape[-1])
 
-    BLOCK_OUT_DIM = 128
-    BLOCK_QUANT_DIM = 32
+    BLOCK_OUT_DIM = 16
+    BLOCK_QUANT_DIM = 256
     grid_out = triton.cdiv(kernel_src_tensor.shape[0], BLOCK_OUT_DIM)
     grid_quant = triton.cdiv(kernel_src_tensor.shape[1], BLOCK_QUANT_DIM)
 
@@ -118,7 +118,7 @@ def downcast_to_mxfp(
         BLOCK_OUT_DIM,
         BLOCK_QUANT_DIM,
         DEQUANT_SCALE_ROUNDING_MODE.value,
-        num_warps=8,
+        num_warps=4,
     )
 
     out_quant_tensor = out_quant_tensor.transpose(axis, src_tensor.ndim - 1)

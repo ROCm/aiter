@@ -100,9 +100,9 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
             "block_k": tuned["BLOCK_SIZE_K"],
             "num_warps": tuned["num_warps"],
             "num_stages": tuned["num_stages"],
-            "group_m": group_m,
+            "group_m": tuned.get("group_m", group_m),
             "xcd_swizzle": xcd_swizzle,
-            "w_cache_modifier": w_cache_modifier,
+            "w_cache_modifier": tuned.get("w_cache_modifier", w_cache_modifier),
             "split_k": split_k,
             "waves_per_eu": tuned.get("waves_per_eu", 0),
             "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
@@ -131,9 +131,9 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
             "block_k": proxy["BLOCK_SIZE_K"],
             "num_warps": proxy["num_warps"],
             "num_stages": proxy["num_stages"],
-            "group_m": group_m,
+            "group_m": proxy.get("group_m", group_m),
             "xcd_swizzle": xcd_swizzle,
-            "w_cache_modifier": w_cache_modifier,
+            "w_cache_modifier": proxy.get("w_cache_modifier", w_cache_modifier),
             "split_k": split_k,
             "waves_per_eu": proxy.get("waves_per_eu", 0),
             "matrix_instr_nonkdim": proxy.get("matrix_instr_nonkdim", 16),
@@ -392,7 +392,7 @@ def moe_gemm_a8w4(
     # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
     padded_N = N
     block_m = routing_data.block_m
-    if unpadded_N and block_m == 16:
+    if unpadded_N:
         N = unpadded_N
     if unpadded_K and block_m == 16:
         K = unpadded_K

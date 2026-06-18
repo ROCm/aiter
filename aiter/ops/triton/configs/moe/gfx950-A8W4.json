@@ -5,7 +5,44 @@
         "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 8,
-        "waves_per_eu": 0
+        "waves_per_eu": 1,
+        "w_cache_modifier": ".cg"
+    },
+    "bm128_n768_k7168": {
+        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_N": 256,
+        "matrix_instr_nonkdim": 16,
+        "num_stages": 2,
+        "num_warps": 8,
+        "waves_per_eu": 1,
+        "w_cache_modifier": ".cg"
+    },
+    "bm64_n768_k7168": {
+        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_N": 256,
+        "matrix_instr_nonkdim": 16,
+        "num_stages": 2,
+        "num_warps": 8,
+        "waves_per_eu": 0,
+        "w_cache_modifier": ".cg"
+    },
+    "bm32_n768_k7168": {
+        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_N": 256,
+        "matrix_instr_nonkdim": 16,
+        "num_stages": 2,
+        "num_warps": 4,
+        "waves_per_eu": 0,
+        "w_cache_modifier": ".cg"
+    },
+    "bm16_n768_k7168": {
+        "BLOCK_SIZE_K": 512,
+        "BLOCK_SIZE_N": 128,
+        "matrix_instr_nonkdim": 16,
+        "num_stages": 2,
+        "num_warps": 4,
+        "waves_per_eu": 0,
+        "w_cache_modifier": ".cg"
     },
     "bm128_n1440_k2880": {
         "BLOCK_SIZE_K": 128,
@@ -97,11 +134,12 @@
     },
     "bm128_n7168_k512": {
         "BLOCK_SIZE_K": 256,
-        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_N": 512,
         "matrix_instr_nonkdim": 32,
         "num_stages": 2,
-        "num_warps": 4,
-        "waves_per_eu": 0
+        "num_warps": 8,
+        "waves_per_eu": 0,
+        "group_m": 1
     },
     "bm128_n720_k2880": {
         "BLOCK_SIZE_K": 128,
@@ -113,7 +151,7 @@
     },
     "bm16_n1024_k7168": {
         "BLOCK_SIZE_K": 512,
-        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_N": 128,
         "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 4,
@@ -173,7 +211,8 @@
         "matrix_instr_nonkdim": 16,
         "num_stages": 2,
         "num_warps": 4,
-        "waves_per_eu": 0
+        "waves_per_eu": 0,
+        "group_m": 1
     },
     "bm16_n720_k2880": {
         "BLOCK_SIZE_K": 512,
@@ -182,6 +221,24 @@
         "num_stages": 2,
         "num_warps": 4,
         "waves_per_eu": 0
+    },
+    "bm32_n1024_k7168": {
+        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_N": 256,
+        "matrix_instr_nonkdim": 16,
+        "num_stages": 2,
+        "num_warps": 4,
+        "waves_per_eu": 0
+    },
+    "bm32_n7168_k512": {
+        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_N": 512,
+        "matrix_instr_nonkdim": 32,
+        "num_stages": 2,
+        "num_warps": 8,
+        "waves_per_eu": 0,
+        "w_cache_modifier": null,
+        "group_m": 1
     },
     "bm32_n1440_k2880": {
         "BLOCK_SIZE_K": 512,
