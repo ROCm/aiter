@@ -35,6 +35,7 @@ import torch
 from aiter import ActivationType, QuantType, logger
 from aiter.fused_moe import (
     fused_moe,
+    fused_topk,
     torch_moe_stage1,
     torch_moe_stage2,
 )
@@ -44,13 +45,22 @@ from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.utility import fp4_utils
 from aiter.utility import dtypes
 
+# Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
+# the test body has no `.cuda()` / `.float().cuda()` plumbing.
+torch.set_default_device("cuda")
+
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
+
+# Routing: normal (random) by default; round-robin balanced only when
+# AITER_MOE_EXPERT_BALANCE=1 (mirrors op_tests/test_moe_2stage.py).
+AITER_MOE_EXPERT_BALANCE = (
+    os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
+)
 
 SCALE_BLOCK = 32
 DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
 VERIFY_TOL_A4W4 = 0.02
 VERIFY_TOL_A8W4 = 0.02
-VERIFY_TOL_ALL_ONES = 0.01
 # Production MoE accuracy gate (matches op_tests/test_moe_2stage.py calc_diff):
 # logits_diff = ||x-y||^2 / (||x||^2 + ||y||^2).  rel_l2 is kept as an
 # informational print only; logits_diff < 0.01 is the actual pass/fail gate.
@@ -87,39 +97,11 @@ def is_gfx1250() -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Weight / scale preshuffle helpers (mandatory for the grouped path)
-#
-# Note: ``aiter.ops.shuffle.shuffle_weight(b, layout=(16, 16))`` is
-# byte-for-byte equivalent to the FP4 TDM B layout the grouped FlyDSL
-# kernels consume (16-row * 16-byte chunks). We use that public API
-# directly. Scale shuffle, on the other hand, has its own grouped-only
-# permutation: the grouped n32k4 layout is produced by
-# ``aiter.ops.shuffle.shuffle_scale(..., is_n32k4=True)`` (used below), not by
-# the default ``shuffle_scale``.
-# ---------------------------------------------------------------------------
-def _grouped_scale(
-    scale_raw: torch.Tensor,
-    *,
-    experts: int,
-    rows: int,
-    k_dim: int,
-    tile_n: int = 256,
-    n_warp: int = 4,
-    tile_k: int = 256,
-) -> torch.Tensor:
-    """Prepare grouped weight (B) e8m0 scales for the test kernel.
-
-    Uses the public n32k4 shuffle (``shuffle_scale(..., is_n32k4=True)``); rows /
-    k_dim / tile_n / n_warp / tile_k are kept for call-site compatibility but the
-    layout is fixed by the WMMA scale contract and derives from the shape.
-    """
-    del rows, k_dim, tile_n, n_warp, tile_k  # unused: n32k4 layout is WMMA-fixed
-    return shuffle_scale(
-        scale_raw.contiguous().cuda(), experts_cnt=experts, is_n32k4=True
-    )
-
-
+# Weights/scales use the public shuffle APIs directly:
+#   shuffle_weight(b, layout=(16, 16))            -> FP4 TDM B layout (16-row x
+#       16-byte chunks) the grouped FlyDSL kernels consume.
+#   shuffle_scale(s, experts_cnt=E, is_n32k4=True) -> grouped-only n32k4 e8m0
+#       scale layout (NOT the default shuffle_scale).
 # ---------------------------------------------------------------------------
 # Reference: aiter's own ``torch_moe_stage1`` + ``torch_moe_stage2``
 # (high-precision fp32 baseline that decodes mxfp4/e8m0 internally and
@@ -166,8 +148,8 @@ def _torch_moe_ref(
         q = q_f32.contiguous().to(dtypes.fp8).to(torch.float32).view_as(blk)
         return (q * scale_f32.unsqueeze(1)).view(x_shape).to(x.dtype)
 
-    w1_scale = w1_scale_raw.cuda().view(dtypes.fp8_e8m0)
-    w2_scale = w2_scale_raw.cuda().view(dtypes.fp8_e8m0)
+    w1_scale = w1_scale_raw.view(dtypes.fp8_e8m0)
+    w2_scale = w2_scale_raw.view(dtypes.fp8_e8m0)
     if data_format == "a4w4":
         # Match the grouped a4w4 path: stage1 input is MXFP4, not bf16.
         stage1_hidden, stage1_hidden_scale = per_1x32_f4_quant(
@@ -178,8 +160,8 @@ def _torch_moe_ref(
         stage1_hidden, stage1_hidden_scale = _per_1x32_fp8_dequant(hidden), None
     a2 = torch_moe_stage1(
         stage1_hidden,
-        w1_packed.cuda(),
-        w2_packed.cuda(),
+        w1_packed,
+        w2_packed,
         topk_w,
         topk_id,
         dtype=torch.bfloat16,
@@ -211,8 +193,8 @@ def _torch_moe_ref(
         a2_scale = None
     out = torch_moe_stage2(
         a2,
-        w1_packed.cuda(),
-        w2_packed.cuda(),
+        w1_packed,
+        w2_packed,
         topk_w,
         topk_id,
         dtype=torch.bfloat16,
@@ -228,45 +210,37 @@ def _torch_moe_ref(
 # ---------------------------------------------------------------------------
 # Mock data builders
 # ---------------------------------------------------------------------------
-def _pattern_packed(experts: int, rows: int, k_pack: int, *, seed: int) -> torch.Tensor:
-    """Cheap deterministic mxfp4 packed bytes ``(E, rows, k_pack) uint8``."""
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    return torch.randint(
-        0, 256, (experts, rows, k_pack), dtype=torch.uint8, generator=g
-    )
+def _pattern_packed(experts: int, rows: int, k_pack: int) -> torch.Tensor:
+    """mxfp4 packed bytes ``(E, rows, k_pack) uint8`` from the global RNG."""
+    return torch.randint(0, 256, (experts, rows, k_pack), dtype=torch.uint8)
 
 
-def _weight_scale(
-    experts: int,
-    rows: int,
-    n_blocks: int,
-    *,
-    seed: int = 0,
-    init_const_one: bool = False,
-) -> torch.Tensor:
-    """Per-block e8m0 weight scale.
-
-    init_const_one=True -> every block is 2^0 (=1.0); else random small scales
-    seeded by ``seed``.
-    """
-    if init_const_one:
-        return torch.full(
-            (experts, rows, n_blocks), DEFAULT_SCALE_BYTE, dtype=torch.uint8
-        )
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    r = torch.randint(0, 3, (experts, rows, n_blocks), generator=g, dtype=torch.int16)
+def init_weight_scales(experts: int, rows: int, n_blocks: int) -> torch.Tensor:
+    """Per-block e8m0 weight scale: random small scales (drawn from the global
+    RNG) so the n32k4 B-scale preshuffle layout is actually exercised."""
+    r = torch.randint(0, 3, (experts, rows, n_blocks), dtype=torch.int16)
     return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
 
 
-def _balanced_topk(
-    tokens: int, topk: int, experts: int
+def _make_topk(
+    hidden_states: torch.Tensor, experts: int, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Round-robin (token, rank) -> expert, even mass on each topk slot."""
-    tok = torch.arange(tokens).view(tokens, 1)
-    rk = torch.arange(topk).view(1, topk)
-    ids = ((tok * topk + rk) % experts).to(torch.int32)
-    w = torch.full((tokens, topk), 1.0 / topk, dtype=torch.float32)
-    return ids, w
+    """Route via ``fused_topk``: normal (random gating) by default; round-robin
+    balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
+    op_tests/test_moe_2stage.py). Returns ``(topk_ids, topk_weights)`` on the
+    same device as ``hidden_states``."""
+    tokens = hidden_states.shape[0]
+    if AITER_MOE_EXPERT_BALANCE:
+        score = torch.zeros((tokens, experts), dtype=torch.float32)
+        start_col, end_col = 0, topk
+        for token_id in range(tokens):
+            score[token_id, start_col:end_col] = 1.0
+            start_col = end_col % experts
+            end_col = start_col + topk
+    else:
+        score = torch.randn((tokens, experts), dtype=torch.float32)
+    topk_w, topk_id = fused_topk(hidden_states, score, topk, True)
+    return topk_id.to(torch.int32), topk_w
 
 
 def _gguu_to_gugu_rows(t: torch.Tensor) -> torch.Tensor:
@@ -295,7 +269,6 @@ def _run_grouped_via_fused_moe(
     use_bias: bool = True,
     verify: bool = False,
     seed: int = 0,
-    all_ones: bool = False,  # debug: hidden=1, weight bytes=0x22 (=+1.0/+1.0), scale=127, bias=0
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Build mxfp4 weights + balanced routing, dispatch through ``fused_moe``.
 
@@ -318,40 +291,23 @@ def _run_grouped_via_fused_moe(
     inter_pack = inter // 2
 
     # Logical weights/scale/bias: always GGUU (gate rows then up rows).
-    if all_ones:
-        # Every mxfp4 nibble decodes to +1.0 (byte=0x22 = pair of 0010);
-        # scale=byte 127 = 2^0 = 1.0; bias=0; hidden=1.0.
-        w1_logical = torch.full((experts, 2 * inter, K_pack), 0x22, dtype=torch.uint8)
-        w2_logical = torch.full((experts, K, inter_pack), 0x22, dtype=torch.uint8)
-        w1_scale_raw = _weight_scale(
-            experts, 2 * inter, K // SCALE_BLOCK, init_const_one=True
-        )
-        w2_scale_raw = _weight_scale(
-            experts, K, inter // SCALE_BLOCK, init_const_one=True
-        )
+    # One global seed per case; every draw below uses the global RNG.
+    torch.manual_seed(seed)
+    w1_logical = _pattern_packed(experts, 2 * inter, K_pack)
+    w2_logical = _pattern_packed(experts, K, inter_pack)
+    w1_scale_raw = init_weight_scales(experts, 2 * inter, K // SCALE_BLOCK)
+    w2_scale_raw = init_weight_scales(experts, K, inter // SCALE_BLOCK)
+    if use_bias:
+        bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).float()
+        bias2 = (torch.randn((experts, K)) * 1e-3).float()
+    else:
         bias1 = torch.zeros((experts, 2 * inter))
         bias2 = torch.zeros((experts, K))
-        hidden = torch.ones((tokens, K), dtype=torch.bfloat16)
-    else:
-        w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
-        w2_logical = _pattern_packed(experts, K, inter_pack, seed=seed + 47)
-        w1_scale_raw = _weight_scale(
-            experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201
-        )
-        w2_scale_raw = _weight_scale(experts, K, inter // SCALE_BLOCK, seed=seed + 202)
-        if use_bias:
-            bg = torch.Generator(device="cpu").manual_seed(seed + 91)
-            bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).float()
-            bias2 = (torch.randn((experts, K), generator=bg) * 1e-3).float()
-        else:
-            bias1 = torch.zeros((experts, 2 * inter))
-            bias2 = torch.zeros((experts, K))
-        # Activations: bf16; fused_moe handles the dispatched quant internally.
-        hg = torch.Generator(device="cpu").manual_seed(seed + 123)
-        hidden = (torch.randn((tokens, K), generator=hg) * 0.5).to(torch.bfloat16)
+    # Activations: bf16; fused_moe handles the dispatched quant internally.
+    hidden = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
 
-    # Routing: round-robin balanced.
-    topk_id, topk_w = _balanced_topk(tokens, topk, experts)
+    # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
+    topk_id, topk_w = _make_topk(hidden, experts, topk)
     topk_w = topk_w.to(torch.bfloat16)
 
     # ---- prep grouped GEMM inputs ----
@@ -368,10 +324,14 @@ def _run_grouped_via_fused_moe(
         bias1_phys = bias1
         gate_mode = GateMode.SEPARATED
 
-    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16)).cuda()
-    w2_grouped = shuffle_weight(w2_logical, layout=(16, 16)).cuda()
-    w1_scale = _grouped_scale(w1_scale_phys, experts=experts, rows=2 * inter, k_dim=K)
-    w2_scale = _grouped_scale(w2_scale_raw, experts=experts, rows=K, k_dim=inter)
+    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
+    w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
+    w1_scale = shuffle_scale(
+        w1_scale_phys.contiguous(), experts_cnt=experts, is_n32k4=True
+    )
+    w2_scale = shuffle_scale(
+        w2_scale_raw.contiguous(), experts_cnt=experts, is_n32k4=True
+    )
 
     if data_format == "a4w4":
         w1_arg = w1_grouped.view(dtypes.fp4x2)
@@ -380,29 +340,21 @@ def _run_grouped_via_fused_moe(
         w1_arg = w1_grouped  # uint8 -> grouped helper sets q_dtype_a=fp8
         w2_arg = w2_grouped
 
-    hidden_dev = hidden.cuda()
-    topk_w_dev = topk_w.cuda()
-    topk_id_dev = topk_id.cuda()
-    bias1_dev = bias1.float().cuda()
-    bias1_phys_dev = bias1_phys.float().cuda() if use_bias else None
-    bias2_dev = bias2.float().cuda() if use_bias else None
-    ref_bias2_dev = bias2.float().cuda()
-
     saved = os.environ.get("AITER_USE_GROUPED_GEMM")
     os.environ["AITER_USE_GROUPED_GEMM"] = "1"
     try:
         grouped_out = fused_moe(
-            hidden_dev,
+            hidden,
             w1_arg,
             w2_arg,
-            topk_w_dev,
-            topk_id_dev,
+            topk_w,
+            topk_id,
             activation=activation,
             quant_type=QuantType.per_1x32,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
-            bias1=bias1_phys_dev,
-            bias2=bias2_dev,
+            bias1=bias1_phys if use_bias else None,
+            bias2=bias2 if use_bias else None,
             gate_mode=gate_mode.value,
             dtype=dtypes.bf16,
             swiglu_limit=swiglu_limit,
@@ -418,15 +370,15 @@ def _run_grouped_via_fused_moe(
         # Reference always uses GGUU logical inputs (layouts are numerically
         # equivalent; only physical packing differs).
         ref = _torch_moe_ref(
-            hidden_dev,
+            hidden,
             w1_logical,
             w1_scale_raw,
-            bias1_dev,
+            bias1,
             w2_logical,
             w2_scale_raw,
-            ref_bias2_dev,
-            topk_w_dev,
-            topk_id_dev,
+            bias2,
+            topk_w,
+            topk_id,
             data_format=data_format,
             activation=activation,
             swiglu_limit=swiglu_limit,
@@ -447,7 +399,6 @@ def _prepare_grouped_moe_case(
     swiglu_limit: float = 7.0,
     use_bias: bool = True,
     seed: int = 0,
-    all_ones: bool = False,
 ):
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
@@ -459,40 +410,23 @@ def _prepare_grouped_moe_case(
     K_pack = K // 2
     inter_pack = inter // 2
 
-    if all_ones:
-        w1_logical = torch.full((experts, 2 * inter, K_pack), 0x22, dtype=torch.uint8)
-        w2_logical = torch.full((experts, K, inter_pack), 0x22, dtype=torch.uint8)
-        w1_scale_raw = _weight_scale(
-            experts, 2 * inter, K // SCALE_BLOCK, init_const_one=True
-        )
-        w2_scale_raw = _weight_scale(
-            experts, K, inter // SCALE_BLOCK, init_const_one=True
-        )
+    # One global seed per case; every draw below uses the global RNG.
+    torch.manual_seed(seed)
+    w1_logical = _pattern_packed(experts, 2 * inter, K_pack)
+    w2_logical = _pattern_packed(experts, K, inter_pack)
+    # Varied weight scales so the n32k4 B-scale preshuffle layout is exercised.
+    w1_scale_raw = init_weight_scales(experts, 2 * inter, K // SCALE_BLOCK)
+    w2_scale_raw = init_weight_scales(experts, K, inter // SCALE_BLOCK)
+    if use_bias:
+        bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).to(torch.bfloat16)
+        bias2 = (torch.randn((experts, K)) * 1e-3).to(torch.bfloat16)
+    else:
         bias1 = torch.zeros((experts, 2 * inter), dtype=torch.bfloat16)
         bias2 = torch.zeros((experts, K), dtype=torch.bfloat16)
-        hidden = torch.ones((tokens, K), dtype=torch.bfloat16)
-    else:
-        w1_logical = _pattern_packed(experts, 2 * inter, K_pack, seed=seed + 17)
-        w2_logical = _pattern_packed(experts, K, inter_pack, seed=seed + 47)
-        # Varied weight scales so the B-scale preshuffle layout is actually
-        # exercised (see _weight_scale).
-        w1_scale_raw = _weight_scale(
-            experts, 2 * inter, K // SCALE_BLOCK, seed=seed + 201
-        )
-        w2_scale_raw = _weight_scale(experts, K, inter // SCALE_BLOCK, seed=seed + 202)
-        if use_bias:
-            bg = torch.Generator(device="cpu").manual_seed(seed + 91)
-            bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).to(
-                torch.bfloat16
-            )
-            bias2 = (torch.randn((experts, K), generator=bg) * 1e-3).to(torch.bfloat16)
-        else:
-            bias1 = torch.zeros((experts, 2 * inter), dtype=torch.bfloat16)
-            bias2 = torch.zeros((experts, K), dtype=torch.bfloat16)
-        hg = torch.Generator(device="cpu").manual_seed(seed + 123)
-        hidden = (torch.randn((tokens, K), generator=hg) * 0.5).to(torch.bfloat16)
+    hidden = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
 
-    topk_id, topk_w = _balanced_topk(tokens, topk, experts)
+    # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
+    topk_id, topk_w = _make_topk(hidden, experts, topk)
     topk_w = topk_w.to(torch.bfloat16)
 
     if layout == "gugu":
@@ -506,10 +440,14 @@ def _prepare_grouped_moe_case(
         bias1_phys = bias1
         gate_mode = GateMode.SEPARATED
 
-    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16)).cuda()
-    w2_grouped = shuffle_weight(w2_logical, layout=(16, 16)).cuda()
-    w1_scale = _grouped_scale(w1_scale_phys, experts=experts, rows=2 * inter, k_dim=K)
-    w2_scale = _grouped_scale(w2_scale_raw, experts=experts, rows=K, k_dim=inter)
+    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
+    w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
+    w1_scale = shuffle_scale(
+        w1_scale_phys.contiguous(), experts_cnt=experts, is_n32k4=True
+    )
+    w2_scale = shuffle_scale(
+        w2_scale_raw.contiguous(), experts_cnt=experts, is_n32k4=True
+    )
 
     if data_format == "a4w4":
         w1_arg = w1_grouped.view(dtypes.fp4x2)
@@ -518,17 +456,17 @@ def _prepare_grouped_moe_case(
         w1_arg = w1_grouped
         w2_arg = w2_grouped
 
-    fused_bias1 = bias1_phys.cuda() if use_bias else None
-    fused_bias2 = bias2.cuda() if use_bias else None
-    ref_bias1 = bias1.float().cuda()
-    ref_bias2 = bias2.float().cuda()
+    fused_bias1 = bias1_phys if use_bias else None
+    fused_bias2 = bias2 if use_bias else None
+    ref_bias1 = bias1.float()
+    ref_bias2 = bias2.float()
 
     fused_case = {
-        "hidden_states": hidden.cuda(),
+        "hidden_states": hidden,
         "w1": w1_arg,
         "w2": w2_arg,
-        "topk_weight": topk_w.cuda(),
-        "topk_ids": topk_id.cuda(),
+        "topk_weight": topk_w,
+        "topk_ids": topk_id,
         "activation": activation,
         "w1_scale": w1_scale,
         "w2_scale": w2_scale,
@@ -610,7 +548,6 @@ def run_moe(
     swiglu_limit: float = 7.0,
     use_bias: bool = True,
     tol: float = VERIFY_TOL_A4W4,
-    all_ones: bool = False,
     raise_on_fail: bool = True,
     bench: bool = False,
     warmup: int = 5,
@@ -625,7 +562,7 @@ def run_moe(
     """
     _require_gfx1250()
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
-    tag = f"{data_format} {layout} {act}{' all_ones' if all_ones else ''}"
+    tag = f"{data_format} {layout} {act}"
 
     # --- correctness: grouped FlyDSL vs PyTorch fp32 ref ---
     out, ref = _run_grouped_via_fused_moe(
@@ -640,7 +577,6 @@ def run_moe(
         swiglu_limit=swiglu_limit,
         use_bias=use_bias,
         verify=True,
-        all_ones=all_ones,
     )
     rel = _rel_l2(out, ref)
     ld = _logits_diff(out, ref)
@@ -679,7 +615,6 @@ def run_moe(
             activation=activation,
             swiglu_limit=swiglu_limit,
             use_bias=use_bias,
-            all_ones=all_ones,
         )
         _invoke_grouped_fused_moe(fused_case)  # warmup / JIT
         torch.cuda.synchronize()
@@ -827,13 +762,6 @@ def main() -> None:
         help="call the real grouped WMMA GEMM kernel. Default: True on gfx1250, "
         "False elsewhere (mock the GEMM so the tiny operators run on any arch).",
     )
-    parser.add_argument(
-        "--all-ones",
-        action="store_true",
-        help="(verify only) hidden=1, weight bytes=0x22 (=+1.0), "
-        "scale=127 (=2^0), bias=0. Expect rel_l2 < 0.01 since both "
-        "grouped and ref see the exact same dequantised values.",
-    )
     args = parser.parse_args()
     if not args.real_gemm:
         _mock_grouped_gemm()
@@ -855,11 +783,7 @@ def main() -> None:
         args.tokens = _tok
         if len(token_list) > 1:
             print(f"\n===== tokens={_tok} =====", flush=True)
-        tol = (
-            VERIFY_TOL_ALL_ONES
-            if args.all_ones
-            else VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
-        )
+        tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
         # raise_on_fail=False so one out-of-gate token does not abort the
         # sweep; the failure is recorded and reported after the table.
         metrics = run_moe(
@@ -874,7 +798,6 @@ def main() -> None:
             activation=activation,
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
-            all_ones=args.all_ones,
             raise_on_fail=False,
             bench=args.scenario == "bench",
             warmup=args.warmup,
