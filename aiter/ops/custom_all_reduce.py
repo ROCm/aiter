@@ -8,6 +8,7 @@ import torch
 from ..jit.core import compile_ops
 
 MD_NAME = "module_custom_all_reduce"
+FUSED_AR_MHC_MD_NAME = "module_fused_ar_mhc"
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
@@ -208,3 +209,49 @@ def free_meta_buffer(ptr: int) -> None: ...
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def get_meta_buffer_ipc_handle(inp_ptr: int, out_handle_ptr: int) -> None: ...
+
+
+@compile_ops(FUSED_AR_MHC_MD_NAME)
+def fused_allreduce_mhc_post_only(
+    _fa: int,
+    inp: torch.Tensor,
+    next_residual: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> None: ...
+
+
+def launch_fused_allreduce_mhc_post_only(
+    _fa: int,
+    inp: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    *,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> torch.Tensor:
+    """Launch fused custom AllReduce + MHC post (no pre / RMSNorm)."""
+    if post_layer_mix.ndim == 3:
+        post_layer_mix = post_layer_mix.squeeze(-1)
+    next_residual = torch.empty_like(residual_in)
+    fused_allreduce_mhc_post_only(
+        _fa,
+        inp,
+        next_residual,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        use_new,
+        open_fp8_quant,
+        reg_ptr,
+        reg_bytes,
+    )
+    return next_residual

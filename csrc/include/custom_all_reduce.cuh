@@ -3002,6 +3002,100 @@ using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(hipIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
 
+// Large-M AR+MHC(post) epilogue: reduce input across ranks and write next_residual
+// directly. This mirrors mhc_post's math but avoids materializing layer_input.
+template <typename T, int ngpus, int hc_mult, bool two_way>
+__global__ void __launch_bounds__(1024, 1) allreduce_mhc_post_large_m_kernel(
+    RankData* _dp,
+    RankSignals sg,
+    Signal* self_sg,
+    int rank,
+    T* __restrict__ next_residual,
+    T* __restrict__ residual,
+    float* __restrict__ post_layer_mix,
+    float* __restrict__ comb_res_mix,
+    int m,
+    int input_hidden_dim,
+    int hidden_size,
+    int residual_stride)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    static_assert(hc_mult == 4, "AR+MHC post epilogue currently supports hc_mult=4");
+
+    const int n_packs = hidden_size / pack_size;
+    const int lane    = two_way ? (threadIdx.x % n_packs) : threadIdx.x;
+    const int group   = two_way ? (threadIdx.x / n_packs) : 0;
+    __shared__ P s_reduced[512];
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int r = 0; r < ngpus; ++r)
+    {
+        ptrs[r] = reinterpret_cast<const P*>(_dp->ptrs[r]);
+    }
+
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int row = blockIdx.x; row < m; row += gridDim.x)
+    {
+        P reduced_pack;
+        if constexpr(two_way)
+        {
+            if(group == 0)
+            {
+                const int input_pack_idx = row * (input_hidden_dim / pack_size) + lane;
+                s_reduced[lane]          = packed_reduce<P, ngpus, A>(ptrs, input_pack_idx);
+            }
+            __syncthreads();
+            reduced_pack = s_reduced[lane];
+        }
+        else
+        {
+            const int input_pack_idx = row * (input_hidden_dim / pack_size) + lane;
+            reduced_pack             = packed_reduce<P, ngpus, A>(ptrs, input_pack_idx);
+        }
+        A reduced;
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+            reduced[v] = upcast_s(reduced_pack[v]);
+
+#pragma unroll
+        for(int iter = 0; iter < (two_way ? 2 : hc_mult); ++iter)
+        {
+            const int out_h = two_way ? (iter * 2 + group) : iter;
+            A out;
+            const float post_v = post_layer_mix[row * hc_mult + out_h];
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                out[v] = reduced[v] * post_v;
+            }
+
+#pragma unroll
+            for(int in_h = 0; in_h < hc_mult; ++in_h)
+            {
+                const float comb_v = comb_res_mix[row * hc_mult * hc_mult + in_h * hc_mult + out_h];
+                const int residual_pack_idx =
+                    (row * residual_stride + in_h * hidden_size) / pack_size + lane;
+                P residual_pack = reinterpret_cast<P*>(residual)[residual_pack_idx];
+#pragma unroll
+                for(int v = 0; v < pack_size; ++v)
+                {
+                    out[v] += upcast_s(residual_pack[v]) * comb_v;
+                }
+            }
+
+            P out_pack = downcast<P>(out);
+            const int out_pack_idx =
+                (row * residual_stride + out_h * hidden_size) / pack_size + lane;
+            reinterpret_cast<P*>(next_residual)[out_pack_idx] = out_pack;
+        }
+        if constexpr(two_way)
+            __syncthreads();
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 class CustomAllreduce
 {
     public:
@@ -4371,6 +4465,66 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
 #undef DISPATCH_QKNORM_AR_FUSION_KERNEL
 }
 
+template <typename T>
+void dispatchAllReduceMhcPostLargeM(hipStream_t stream,
+                                    T* input,
+                                    T* next_residual,
+                                    T* residual,
+                                    float* post_layer_mix,
+                                    float* comb_res_mix,
+                                    int m,
+                                    int input_hidden_dim,
+                                    int hidden_size,
+                                    int residual_stride)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    if(input_hidden_dim != hidden_size)
+    {
+        throw std::runtime_error("AR+MHC post epilogue requires full hidden input");
+    }
+    if(hidden_size % pack_size != 0 || residual_stride % pack_size != 0)
+    {
+        throw std::runtime_error("AR+MHC post epilogue requires pack-aligned hidden/stride");
+    }
+    const int n_packs = hidden_size / pack_size;
+    if(n_packs > 512)
+    {
+        throw std::runtime_error("AR+MHC post epilogue hidden dim too large for two-way CTA");
+    }
+
+    RankData* ptrs = get_buffer_RD(stream, input);
+    const bool use_two_way = m >= 8192;
+    dim3 block(use_two_way ? n_packs * 2 : n_packs);
+    dim3 grid(std::min(m, kMaxBlocks));
+
+#define DISPATCH_AR_MHC_POST_IMPL(NGPUS, TWO_WAY)                               \
+    allreduce_mhc_post_large_m_kernel<T, NGPUS, 4, TWO_WAY>                     \
+        <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, next_residual, \
+                                     residual, post_layer_mix, comb_res_mix, m, \
+                                     input_hidden_dim, hidden_size,             \
+                                     residual_stride)
+
+#define DISPATCH_AR_MHC_POST(NGPUS)                                             \
+    do {                                                                        \
+        if(use_two_way)                                                         \
+            DISPATCH_AR_MHC_POST_IMPL(NGPUS, true);                             \
+        else                                                                    \
+            DISPATCH_AR_MHC_POST_IMPL(NGPUS, false);                            \
+    } while(0)
+
+    switch(world_size_)
+    {
+    case 8: DISPATCH_AR_MHC_POST(8); break;
+    case 4: DISPATCH_AR_MHC_POST(4); break;
+    case 2: DISPATCH_AR_MHC_POST(2); break;
+    default:
+        throw std::runtime_error("AR+MHC post epilogue: unsupported world_size=" +
+                                 std::to_string(world_size_));
+    }
+#undef DISPATCH_AR_MHC_POST_IMPL
+#undef DISPATCH_AR_MHC_POST
+}
+
 ~CustomAllreduce()
 {
     for(auto [_, ptr] : ipc_handles_)
@@ -4378,7 +4532,7 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
         HIP_CALL(hipIpcCloseMemHandle(ptr));
     }
 }
-}; // namespace aiter
+};
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:
