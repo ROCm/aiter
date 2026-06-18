@@ -4011,6 +4011,29 @@ def test_batch_prefill_asm_varlen(seqlens, use_p_scale):
     run_batch_prefill_asm(seqlens, use_p_scale=use_p_scale, seed=23)
 
 
+@pytest.mark.skipif(
+    get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only"
+)
+@pytest.mark.parametrize("use_p_scale", [False, True])
+@pytest.mark.parametrize(
+    "seqlens",
+    [
+        [272],  # b=1: one full 256-row Q tile + a 16-row partial tail
+        [257],  # b=1: single-row tail
+        [1000],  # b=1: 3 full tiles + a 232-row tail
+        [272, 257],  # varlen, every batch unaligned
+        [512, 300, 384],  # mixed aligned / unaligned (300, 384 not % 256)
+    ],
+)
+def test_batch_prefill_asm_qseqlen_unaligned_256(seqlens, use_p_scale):
+    """Regression for the FP8 paged qkptph/vph causal asm kernel (ts_qo=256) when a
+    per-batch Q sequence length is NOT a multiple of the 256-row Q tile. The partial
+    last tile must clamp the packed q_descale ([total_q, nheads]) and Q-row reads so
+    no out-of-bounds global access occurs for the padding rows of that tile."""
+    assert any(s % 256 != 0 for s in seqlens), "test must exercise an unaligned seqlen"
+    run_batch_prefill_asm(seqlens, use_p_scale=use_p_scale, seed=29)
+
+
 # Perf sweep: b=1 latency/TFLOPS at increasing context, reporting NRMS + runtime.
 # Opt-in (it is a benchmark, not a correctness gate) via AITER_ASM_PERF=1.
 @pytest.mark.skipif(
