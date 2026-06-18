@@ -67,12 +67,12 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         FP8_TYPE = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(FP8_TYPE).max
 
-        assert hadamard_rotation or turboquant_rotation, (
-            "A rotation must be enabled: set hadamard_rotation=True or turboquant_rotation=True."
-        )
-        assert not (hadamard_rotation and turboquant_rotation), (
-            "hadamard_rotation and turboquant_rotation are mutually exclusive."
-        )
+        assert (
+            hadamard_rotation or turboquant_rotation
+        ), "A rotation must be enabled: set hadamard_rotation=True or turboquant_rotation=True."
+        assert not (
+            hadamard_rotation and turboquant_rotation
+        ), "hadamard_rotation and turboquant_rotation are mutually exclusive."
         sq_result = sage_quant_mxfp4(
             q,
             k,

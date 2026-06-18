@@ -86,18 +86,23 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
     BLOCK_R = args.BLOCK_R
     use_tq = getattr(args, "turboquant_rotation", False)
     if use_tq:
-        R = None          # sage_quant_mxfp4 generates the TurboQuant R internally
+        R = None  # sage_quant_mxfp4 generates the TurboQuant R internally
         hadamard_rotation = False
         turboquant_rotation = True
         turboquant_seed = 1234
-        print(f"[rotation] TurboQuant (Gaussian QR, head_dim={args.d}, seed={turboquant_seed})")
+        print(
+            f"[rotation] TurboQuant (Gaussian QR, head_dim={args.d}, seed={turboquant_seed})"
+        )
     else:
-        R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+        R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
+            BLOCK_R ** 0.5
+        )
         hadamard_rotation = args.hadamard_rotate
         turboquant_rotation = False
         turboquant_seed = 1234
-        print(f"[rotation] Hadamard (BLOCK_R={BLOCK_R}, hadamard_rotate={hadamard_rotation})")
-
+        print(
+            f"[rotation] Hadamard (BLOCK_R={BLOCK_R}, hadamard_rotate={hadamard_rotation})"
+        )
 
     if args.include_quant_overhead:
 
@@ -209,7 +214,7 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
             q_ref, k_ref, v_ref = layout_preprocess(
                 q, k, v, layout=args.layout, target_layout="bshd"
             )
-            sm_scale = D_HEAD**-0.5
+            sm_scale = D_HEAD ** -0.5
 
             if ref_name == "fav2":
                 ref_out = fav2_forward_func(
@@ -579,8 +584,6 @@ def parse_args():
         ),
     )
 
-
-
     parser.add_argument(
         "-BLOCK_R",
         type=int,
@@ -695,7 +698,9 @@ def test_accuracy(q, k, v, args):
         turboquant_rotation = True
         turboquant_seed = 1234
     else:
-        R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+        R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
+            BLOCK_R ** 0.5
+        )
         hadamard_rotation = args.hadamard_rotate
         turboquant_rotation = False
         turboquant_seed = 1234
