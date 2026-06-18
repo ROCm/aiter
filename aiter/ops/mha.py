@@ -315,6 +315,28 @@ def fmha_v3_fwd_sparse(
 ) -> Tuple[Tensor]: ...
 
 
+@compile_ops(
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd_i8fp8_sparse_vfa",
+    gen_fake=_gen_fmha_v3_fwd_sparse_fake_tensors,
+    mutates_args=[],
+)
+def fmha_v3_fwd_i8fp8_sparse_vfa(
+    q: Tensor,                    # [b, sq, hq, 128], int8
+    k: Tensor,                    # [b, sk, hk, 128], int8
+    v: Tensor,                    # [b, sk, hk, 128], fp8
+    q_descale: Tensor,            # [1] or [b, hk], fp32
+    k_descale: Tensor,            # [1] or [b, hk], fp32
+    v_descale: Tensor,            # [1] or [b, hk], fp32
+    kv_block_indices: Tensor,     # int32
+    lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
+    lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
+    softmax_scale: float,
+    freeze_softmax_max_count: int,  # online blocks before freezing the max
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]: ...
+
+
 def _gen_fmha_v3_fwd_mxfp4_sparse_fake_tensors(
     q: Tensor,
     k: Tensor,
@@ -395,6 +417,28 @@ def fmha_v3_fwd_fp8_sparse(
     lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
     lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
     softmax_scale: float,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]: ...
+
+
+@compile_ops(
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd_fp8_sparse_vfa",
+    gen_fake=_gen_fmha_v3_fwd_fp8_sparse_fake_tensors,
+    mutates_args=[],
+)
+def fmha_v3_fwd_fp8_sparse_vfa(
+    q: Tensor,                    # [b, sq, hq, 128], fp8
+    k: Tensor,                    # [b, sk, hk, 128], fp8
+    v: Tensor,                    # [b, sk, hk, 128], fp8
+    q_descale: Tensor,            # [1] or [b, hk], fp32
+    k_descale: Tensor,            # [1] or [b, hk], fp32
+    v_descale: Tensor,            # [1] or [b, hk], fp32
+    kv_block_indices: Tensor,     # int32
+    lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
+    lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
+    softmax_scale: float,
+    freeze_softmax_max_count: int,  # online blocks before freezing the max
     out: Optional[Tensor] = None,
 ) -> Tuple[Tensor]: ...
 
@@ -3361,6 +3405,71 @@ def flash_attn_i8fp8_sparse_pertensor_func(
     return out
 
 
+def flash_attn_i8fp8_sparse_vfa_pertensor_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    kv_block_indices: torch.Tensor,
+    lut_start: torch.Tensor,
+    lut_count: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    freeze_softmax_max_count: int = 1,
+):
+    """Block-sparse Sage i8fp8 VFA ("frozen-max") FMHA forward (hd=128, gfx950).
+
+    Identical contract to flash_attn_i8fp8_sparse_pertensor_func (int8 Q/K, fp8
+    V, fp32 descales, int32 LUT, bf16 out); the only difference is that it
+    routes to the VFA kernel fwd_hd128_i8fp8_sparse_vfa.co, whose no-mask inner
+    blocks freeze the softmax running max (mimics fav3_sage_attention.py's
+    FROZEN_MAX path): each inner block skips the per-block row-max reduction and
+    the accumulator rescale.
+
+    freeze_softmax_max_count controls after how many ONLINE no-mask KV blocks
+    the running max is frozen. The first no-mask block is always online (so the
+    frozen max is well-defined), i.e. values <= 1 mean "freeze right after the
+    warm-up block" (the original VFA behaviour); larger values keep updating
+    the max for that many blocks before freezing. The trailing ragged/masked
+    block, if any, always uses the exact online masked softmax.
+
+    Constraints (assert-checked C++-side, see asm_mha_fwd_sparse.cu::
+    fmha_v3_fwd_i8fp8_sparse_vfa):
+        sq % 256 == 0, sk % 128 == 0, hq % hk == 0, (hq/hk) is a power of 2,
+        head_dim == 128, batch mode, non-causal, gfx950.
+
+    Returns:
+        out: bf16 tensor [b, sq, hq, 128], bshd
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    head_size_q_og = q.size(3)
+    head_size_v_og = v.size(3)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    outs = fmha_v3_fwd_i8fp8_sparse_vfa(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        float(softmax_scale),
+        int(freeze_softmax_max_count),
+        None,
+    )
+    out_padded = outs[0]
+    out = out_padded[..., :head_size_v_og]
+    return out
+
+
 def flash_attn_fp8_sparse_pertensor_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3419,6 +3528,71 @@ def flash_attn_fp8_sparse_pertensor_func(
         lut_start,
         lut_count,
         float(softmax_scale),
+        None,
+    )
+    out_padded = outs[0]
+    out = out_padded[..., :head_size_v_og]
+    return out
+
+
+def flash_attn_fp8_sparse_vfa_pertensor_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    kv_block_indices: torch.Tensor,
+    lut_start: torch.Tensor,
+    lut_count: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    freeze_softmax_max_count: int = 1,
+):
+    """Block-sparse Sage fp8 VFA ("frozen-max") FMHA forward (hd=128, gfx950).
+
+    fp8 sibling of flash_attn_i8fp8_sparse_vfa_pertensor_func: identical contract
+    to flash_attn_fp8_sparse_pertensor_func (fp8 Q/K/V, fp32 descales, int32 LUT,
+    bf16 out) but routes to the VFA kernel fwd_hd128_fp8_sparse_vfa.co, whose
+    no-mask inner blocks freeze the softmax running max (mimics
+    fav3_sage_attention.py's FROZEN_MAX path): each inner block skips the
+    per-block row-max reduction and the accumulator rescale.
+
+    freeze_softmax_max_count controls after how many ONLINE no-mask KV blocks
+    the running max is frozen. The first no-mask block is always online (so the
+    frozen max is well-defined), i.e. values <= 1 mean "freeze right after the
+    warm-up block"; larger values keep updating the max for that many blocks
+    before freezing. The trailing ragged/masked block, if any, always uses the
+    exact online masked softmax.
+
+    Constraints (assert-checked C++-side, see asm_mha_fwd_sparse.cu::
+    fmha_v3_fwd_fp8_sparse_vfa):
+        sq % 256 == 0, sk % 128 == 0, hq % hk == 0, (hq/hk) is a power of 2,
+        head_dim == 128, batch mode, non-causal, gfx950.
+
+    Returns:
+        out: bf16 tensor [b, sq, hq, 128], bshd
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    head_size_q_og = q.size(3)
+    head_size_v_og = v.size(3)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    outs = fmha_v3_fwd_fp8_sparse_vfa(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        float(softmax_scale),
+        int(freeze_softmax_max_count),
         None,
     )
     out_padded = outs[0]

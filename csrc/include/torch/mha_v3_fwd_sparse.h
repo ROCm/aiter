@@ -54,6 +54,45 @@ fmha_v3_fwd_fp8_sparse(at::Tensor& q,                  // [b, sq, hq, d], fp8
 //
 // Kernel: _ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E from
 // aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_mxfp4_sparse.co.
+// Block-sparse i8fp8 VFA ("frozen-max") sibling. Identical contract to
+// fmha_v3_fwd_sparse (int8 Q/K, fp8 V, fp32 descales, int32 LUT, bf16 out);
+// only the routed kernel differs -- it freezes the softmax running max on the
+// no-mask inner blocks (mimics fav3_sage_attention.py FROZEN_MAX). Kernel:
+// _ZN5aiter39fmha_fwd_hd128_i8fp8_sparse_vfa_gfx950E from
+// aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_i8fp8_sparse_vfa.co.
+std::vector<at::Tensor>
+fmha_v3_fwd_i8fp8_sparse_vfa(at::Tensor& q,                  // [b, sq, hq, d], int8
+                             const at::Tensor& k,            // [b, sk, hk, d], int8
+                             const at::Tensor& v,            // [b, sk, hk, d_v], fp8
+                             const at::Tensor& q_descale,    // [1] or [b, hk], fp32
+                             const at::Tensor& k_descale,    // [1] or [b, hk], fp32
+                             const at::Tensor& v_descale,    // [1] or [b, hk], fp32
+                             const at::Tensor& kv_block_indices, // int32
+                             const at::Tensor& lut_start,        // int32 [b*hq*num_q_blocks]
+                             const at::Tensor& lut_count,        // int32 [b*hq*num_q_blocks]
+                             float softmax_scale,
+                             int64_t freeze_softmax_max_count,   // online blocks before freeze
+                             std::optional<at::Tensor> out_ = std::nullopt); // bf16
+
+// Block-sparse fp8 VFA ("frozen-max") sibling. Identical contract to
+// fmha_v3_fwd_fp8_sparse (fp8 Q/K, fp8 V, fp32 descales, int32 LUT, bf16 out)
+// plus freeze_softmax_max_count; routes to the frozen-max kernel. Kernel:
+// _ZN5aiter36fmha_fwd_hd128_fp8_sparse_vfa_gfx950E from
+// aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_fp8_sparse_vfa.co.
+std::vector<at::Tensor>
+fmha_v3_fwd_fp8_sparse_vfa(at::Tensor& q,                  // [b, sq, hq, d], fp8
+                           const at::Tensor& k,            // [b, sk, hk, d], fp8
+                           const at::Tensor& v,            // [b, sk, hk, d_v], fp8
+                           const at::Tensor& q_descale,    // [1] or [b, hk], fp32
+                           const at::Tensor& k_descale,    // [1] or [b, hk], fp32
+                           const at::Tensor& v_descale,    // [1] or [b, hk], fp32
+                           const at::Tensor& kv_block_indices, // int32
+                           const at::Tensor& lut_start,        // int32 [b*hq*num_q_blocks]
+                           const at::Tensor& lut_count,        // int32 [b*hq*num_q_blocks]
+                           float softmax_scale,
+                           int64_t freeze_softmax_max_count,   // online blocks before freeze
+                           std::optional<at::Tensor> out_ = std::nullopt); // bf16
+
 std::vector<at::Tensor>
 fmha_v3_fwd_mxfp4_sparse(at::Tensor& q,                  // [b, sq, hq, d/2], int8/uint8
                         const at::Tensor& k,             // [b, sk, hk, d/2], int8/uint8

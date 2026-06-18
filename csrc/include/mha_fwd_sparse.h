@@ -20,6 +20,10 @@ struct mha_fwd_sparse_args : public mha_fwd_args
     const void* kv_block_indices_ptr; // int32, shape [lut_count.sum()]
     const void* lut_start_ptr;        // int32, shape [B*HQ*num_q_blocks]
     const void* lut_count_ptr;        // int32, same shape
+    // VFA only: number of ONLINE no-mask KV blocks to run before freezing the
+    // softmax running max. <=0 is treated as 1 (freeze after the warm-up
+    // block). Ignored by the non-VFA sparse kernels.
+    int freeze_softmax_max_count = 1;
 };
 
 // On-device kernarg blob: same 656 bytes as fmha_fwd_v3_args + 48 bytes
@@ -38,6 +42,21 @@ static_assert(sizeof(fmha_fwd_v3_sparse_args) == 704,
               "fmha_fwd_v3_sparse_args must be exactly 704 bytes "
               "(matches the @kernel(_kernarg_raw size=704) in "
               "mi350_fmha_hd128_i8fp8_sparse.py).");
+
+// VFA ("frozen-max") kernarg blob: the 704-byte sparse blob plus a 16-byte
+// tail whose first dword is freeze_softmax_max_count (kernarg offset 0x2C0,
+// read into s[73] by mi350_fmha_hd128_i8fp8_sparse_vfa.py). The remaining 12
+// bytes are padding to keep the blob 16-byte aligned (kernarg_segment_size=720).
+struct __attribute__((packed)) fmha_fwd_v3_sparse_vfa_args : public fmha_fwd_v3_sparse_args
+{
+    int32_t s_freeze_softmax_max_count;
+    int32_t _pad_freeze[3];
+};
+
+static_assert(sizeof(fmha_fwd_v3_sparse_vfa_args) == 720,
+              "fmha_fwd_v3_sparse_vfa_args must be exactly 720 bytes "
+              "(matches the @kernel(_kernarg_raw size=720) in "
+              "mi350_fmha_hd128_i8fp8_sparse_vfa.py).");
 
 // Sparse dispatcher. Returns the launch time in ms, -1 on unsupported config.
 float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
@@ -59,5 +78,21 @@ float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_conf
 // and the descales are per-tensor fp32, so the dispatcher reuses the
 // i8fp8 init_sparse_v3_args path verbatim (in_bpe=1 for fp8).
 float fmha_fwd_v3_fp8_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
+// Sparse i8fp8 VFA ("frozen-max") sibling. Same i8fp8 data contract and
+// 704-byte kernarg layout as fmha_fwd_v3_sparse; the only difference is the
+// .co (fwd_hd128_i8fp8_sparse_vfa.co) generated from
+// mi350_fmha_hd128_i8fp8_sparse_vfa.py, whose no-mask inner blocks use the
+// frozen-max softmax (mimics fav3_sage_attention.py's FROZEN_MAX path). So
+// init_sparse_v3_args is reused unchanged; only the kernel symbol + .co differ.
+float fmha_fwd_v3_i8fp8_sparse_vfa(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
+// Sparse fp8 VFA ("frozen-max") sibling. Same fp8 data contract as
+// fmha_fwd_v3_fp8_sparse and the same 720-byte VFA kernarg blob as
+// fmha_fwd_v3_i8fp8_sparse_vfa; the only difference is the .co
+// (fwd_hd128_fp8_sparse_vfa.co) generated from mi350_fmha_hd128_fp8_sparse_vfa.py,
+// whose no-mask inner blocks use the frozen-max softmax. init_sparse_v3_args is
+// reused unchanged (in_bpe=1 for fp8); only the kernel symbol + .co differ.
+float fmha_fwd_v3_fp8_sparse_vfa(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 
 } // namespace aiter
