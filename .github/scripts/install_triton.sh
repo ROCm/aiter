@@ -70,10 +70,10 @@ fi
 TRITON_WHEEL_DIR=${TRITON_WHEEL_DIR:-}
 if ! install_triton_from_wheelhouse "${TRITON_WHEEL_DIR}"; then
     echo "Installing triton from $TRITON_INDEX_URL"
-    python3 -m pip install --extra-index-url "$TRITON_INDEX_URL" triton
+    python3 -m pip install --extra-index-url "$TRITON_INDEX_URL" "triton==3.7.0"
 
     echo "Installing triton-kernels from $TRITON_INDEX_URL"
-    python3 -m pip install --extra-index-url "$TRITON_INDEX_URL" triton-kernels
+    python3 -m pip install --extra-index-url "$TRITON_INDEX_URL" "triton-kernels==1.0.0"
 fi
 
 python3 - <<'PY'
