@@ -346,7 +346,13 @@ def build_flash_attn_fp8_module(
         # each lane independently owns the running stats for q = lo.  We keep
         # m / l as scalars per lane and O as 4 vec<16xf32> (one per d-tile).
         # ===================================================================
-        init_args = [c_neg_inf, c_zero_f]
+        # Step 5: ones-column L.  L[q] = sum_kv P[kv,q] is computed by an MFMA
+        # (A = all-ones fp8, B = P) instead of a VALU rowsum + cross-lane add.
+        # The MFMA K-dim sums all 64 kv (both hi halves), so no peer shuffle is
+        # needed, and L lands in the same C-layout as O -> it rides the corr
+        # rescale.  fp8 E4M3 1.0 == 0x38, so each i32 lane word is 0x38383838.
+        ones_pack = Vec.filled(A_FP8_PER_LANE // 4, 0x38383838, fx.Int32)
+        init_args = [c_neg_inf, Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)]
         for _ in range_constexpr(D_TILES):
             init_args.append(Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32))
         # Double-buffer carried state: buffer parity + prefetched K/V register
@@ -361,7 +367,7 @@ def build_flash_attn_fp8_module(
         loop_results = init_args
         for kv_start, iter_args in range(0, seq_len_v, BLOCK_N, init=init_args):
             m_running = iter_args[0]
-            l_running = iter_args[1]
+            l_acc = iter_args[1]  # vec<16xf32>, ones-column L (Step 5)
             o_accs = [iter_args[2 + i] for i in range_constexpr(D_TILES)]
             buf = iter_args[2 + D_TILES]
             k_reg = iter_args[3 + D_TILES]
@@ -456,19 +462,14 @@ def build_flash_attn_fp8_module(
             neg_scaled_m_new = _fsub(c_zero_f, scaled_m_new)
 
             # P = exp2(scale_log2e * S_int - scale_log2e * m_new), packed fp8.
+            # (No VALU rowsum here: L is accumulated by the ones-column MFMA in
+            # the PV phase below, Step 5.)
             p_vals = [[None] * C_F32_PER_LANE for _ in range_constexpr(N_KV_TILES)]
-            local_sum = c_zero_f
             for nt in range_constexpr(N_KV_TILES):
                 for r in range_constexpr(C_F32_PER_LANE):
                     e = _fadd(_fmul(s_raw[nt][r], scale_log2e), neg_scaled_m_new)
                     p = ArithValue(e).exp2(fastmath=fm_fast)
                     p_vals[nt][r] = p
-                    local_sum = _fadd(local_sum, p)
-            peer_sum = fx.Float32(local_sum).shuffle_xor(
-                fx.Int32(32), fx.Int32(WARP_SIZE)
-            )
-            tile_sum = _fadd(local_sum, peer_sum)
-            l_new = _fadd(_fmul(corr, l_running), tile_sum)
 
             # ---- Build the GEMM2 P B-operand directly in registers ----
             # (Step 1: no LDS round-trip.)  In the GEMM1 C-layout a lane holds
@@ -525,12 +526,16 @@ def build_flash_attn_fp8_module(
                 p_words.append(fx.Int32(sel))
             p_pack = Vec.from_elements(p_words, i32_dtype)
 
-            # Rescale O accumulators by corr before adding this tile.
+            # Rescale O and L accumulators by corr before adding this tile.
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
             )
             for dt in range_constexpr(D_TILES):
                 o_accs[dt] = _fmul(Vec(o_accs[dt]), corr_vec)
+            l_acc = _fmul(Vec(l_acc), corr_vec)
+            # ones-column L: L += ones_fp8 @ P  (sums all 64 kv via the MFMA
+            # K-dim).  Lands in C-layout (every d-row == L[q=lo]).
+            l_acc = mfma.call(ones_pack, p_pack, l_acc)
 
             # V A-operand via HW transpose-on-read (ds_read_tr8_b64).  For a
             # 16-lane group the atom returns result[lane][r] = LDS[group_base +
@@ -565,14 +570,16 @@ def build_flash_attn_fp8_module(
                 o_accs[dt] = mfma.call(v_pack, p_pack, o_accs[dt])
 
             m_running = m_new
-            l_running = l_new
 
             loop_results = yield (
-                [m_running, l_running] + o_accs + [next_buf, k_next, v_next]
+                [m_running, l_acc] + o_accs + [next_buf, k_next, v_next]
             )
 
         # ---- Epilogue: O = (O / l) * v_descale ; store bf16 ----
-        l_final = loop_results[1]
+        # l is the ones-column MFMA accumulator (Step 5): a vec<16xf32> whose
+        # every value == L[q=lo] (the row sum is replicated over the dummy d
+        # rows), so any element is the per-q normalizer.
+        l_final = Vec(loop_results[1])[0]
         o_finals = [loop_results[2 + dt] for dt in range_constexpr(D_TILES)]
 
         inv_l = rocdl.rcp(T.f32, l_final)
