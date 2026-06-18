@@ -18,12 +18,242 @@ using namespace hk_mla;
 // boundary-checked prefetch). Comment out to fall back to the full ladder.
 #define MLA_SLIM_DISPATCH 1
 
+// Warp-index group. The 8 warps pair onto 4 SIMDs as (w, w+4) -- i.e. SIMD
+// pairs are {0,4},{1,5},{2,6},{3,7}. To stagger each SIMD's two warps (one
+// PV-at-end, one PV-deferred) we split by HALF, not parity. The DEFERRED path
+// goes to the Lo half (warps 0-3, all NoPE) so the RoPE owners' buffer_load_lds
+// never lands in a deferred PV's vmcnt window; the Hi half (4-7, incl RoPE 5,7)
+// keeps PV at call end. See kPvAtEnd for the path mapping.
 enum class WarpType : uint8_t
 {
-    EvenNoPEWarp,
-    OddNoPEWarp,
-    OddRoPEWarp
+    LoNoPEWarp, // warps 0-3: PV-deferred path, all NoPE
+    HiNoPEWarp, // warps 4,6: PV-at-end path, NoPE
+    HiRoPEWarp  // warps 5,7: PV-at-end path, RoPE owner
 };
+
+// ---- Shared pinned-VGPR register map (per-lane) ----
+// Single source of truth for the hand-pinned VGPR layout + art (auto-register
+// tile) range/type views, so the per-tile stage functions and both per-tile
+// orchestrators (even/odd) bind to the *same* physical registers. art tiles are
+// stateless register views (the binding is the type's range param), so a stage
+// reconstructs `typename R::p_comp_t p_comp;` and operates on the same vgprs the
+// orchestrator's clobber reserved. See the original inline map for the rationale
+// of every offset (3-register QK K + overlay reuse, v64..v67 unpinned gap).
+template <typename T>
+struct HkMlaV40Regs
+{
+    using comp_t    = float;
+    using mfma_ab_t = hk::bf16;
+
+    static constexpr uint32_t k_o_sz      = 128;
+    static constexpr uint32_t k_p_comp_sz = 8;
+    static constexpr uint32_t k_p_mfma_sz = 4;
+    static constexpr uint32_t k_q_vgpr_sz = 32;
+    static constexpr uint32_t mfma_tile_sz = 4; // one 16x32 bf16 base tile
+
+    static constexpr uint32_t k_o_end        = 255;
+    static constexpr uint32_t k_o_begin      = k_o_end - k_o_sz + 1;             // 128
+    static constexpr uint32_t k_p_comp_end   = k_o_begin - 1;                    // 127
+    static constexpr uint32_t k_p_comp_begin = k_p_comp_end - k_p_comp_sz + 1;   // 120
+    static constexpr uint32_t k_p_mfma_begin = k_p_comp_begin + 0;              // 120 (overlay)
+    static constexpr uint32_t k_p_mfma_end   = k_p_mfma_begin + k_p_mfma_sz - 1; // 123
+    static constexpr uint32_t k_v0_begin     = k_p_comp_begin + 4;              // 124
+    static constexpr uint32_t k_v0_end       = k_v0_begin + mfma_tile_sz - 1;      // 127
+    static constexpr uint32_t k_q_vgpr_end   = k_p_comp_begin - 1;              // 119
+    static constexpr uint32_t k_q_vgpr_begin = k_q_vgpr_end - k_q_vgpr_sz + 1;  // 88
+    static constexpr uint32_t k_k0_begin     = k_q_vgpr_begin - mfma_tile_sz;      // 84
+    static constexpr uint32_t k_k1_begin     = k_k0_begin - mfma_tile_sz;          // 80
+    static constexpr uint32_t k_k2_begin     = k_k1_begin - mfma_tile_sz;          // 76
+    static constexpr uint32_t k_q_lds_1_begin = k_k2_begin - mfma_tile_sz;          // 72
+    static constexpr uint32_t k_q_lds_0_begin = k_q_lds_1_begin - mfma_tile_sz;     // 68
+    static constexpr uint32_t k_q_lds_begin   = k_q_lds_0_begin; // 68
+
+    using q_vgpr_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_vgpr_begin, k_q_vgpr_end>>, 4>;
+    using p_comp_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin, k_p_comp_end>>, 4>;
+    using p_comp_lo_ranges = hkdart::
+        split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin + 0, k_p_comp_begin + 3>>, 4>;
+    using p_comp_hi_ranges = hkdart::
+        split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin + 4, k_p_comp_begin + 7>>, 4>;
+    using kv_top_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k0_begin, k_k0_begin + 3>>, 4>;
+    using kv_bot_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k1_begin, k_k1_begin + 3>>, 4>;
+    using kv_alt_top_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k2_begin, k_k2_begin + 3>>, 4>;
+    using p_mfma_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_mfma_begin, k_p_mfma_end>>, 4>;
+    using o_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_o_begin, k_o_end>>, 4>;
+    using pv_v_0_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_v0_begin, k_v0_end>>, 4>;
+    using pv_v_1_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k0_begin, k_k0_begin + 3>>, 4>;
+    using pv_v_2_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k1_begin, k_k1_begin + 3>>, 4>;
+    using q_lds_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_lds_begin, k_q_lds_begin + 7>>, 4>;
+
+    // art tile types (stage functions reconstruct these from the shared ranges).
+    using q_vgpr_t = hk::art<mfma_ab_t, T::kTileM, 256, hk::row_l, hk::rt_16x32_s, q_vgpr_ranges>;
+    using p_comp_t = hk::art<comp_t, T::kBlockN, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_ranges>;
+    using p_comp_lo_t =
+        hk::art<comp_t, 16, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_lo_ranges>;
+    using p_comp_hi_t =
+        hk::art<comp_t, 16, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_hi_ranges>;
+    using k_0_t = hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_top_ranges>;
+    using k_1_t = hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_bot_ranges>;
+    using k_2_t =
+        hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_alt_top_ranges>;
+    using pv_v_0_t =
+        hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_0_ranges>;
+    using pv_v_1_t =
+        hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_1_ranges>;
+    using pv_v_2_t =
+        hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_2_ranges>;
+    using p_mfma_t =
+        hk::art<mfma_ab_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges>;
+    using oaccu_t = hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges>;
+};
+
+// ---- PV GEMM stage (extracted so even/odd orchestrators share one body) ----
+//
+// O = P @ V computed as oaccu^T = V^T @ P^T via mma_ABt(oaccu, V, p_mfma).
+// V streams as 32 base tiles S_0..S_31 through a 3-deep round-robin
+// pv_v_0/pv_v_1/pv_v_2 (S_j -> slot j%3, 6 ds_read_b64 in flight). p_lds_v is
+// the V pong (curr for the even path; the prior call's next-pong for the rotated
+// odd path). kDoRescale folds the online-softmax oaccu rescale; kIsFirstIter
+// inits oaccu fresh (3-arg mma) and never rescales.
+template <bool kIsFirstIter, bool kDoRescale, typename T>
+__device__ __forceinline__ void
+hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v, const float rescale)
+{
+    using R                        = HkMlaV40Regs<T>;
+    using comp_t                   = typename R::comp_t;
+    constexpr uint32_t k_o_begin   = R::k_o_begin;
+    constexpr uint32_t k_v0_begin  = R::k_v0_begin;
+    constexpr uint32_t k_k0_begin  = R::k_k0_begin;
+    constexpr uint32_t k_k1_begin  = R::k_k1_begin;
+    typename R::p_mfma_t p_mfma;
+    typename R::pv_v_0_t pv_v_0;
+    typename R::pv_v_1_t pv_v_1;
+    typename R::pv_v_2_t pv_v_2;
+
+    constexpr uint32_t num_pv_iter = T::kVoHeadDim / T::kBlockN; // 16
+    constexpr uint32_t kNumVTiles  = 2u * num_pv_iter;          // 32 = S_0..S_31
+
+    auto pk_mul_pair = [&](float r, auto base_c) {
+        constexpr uint32_t base = decltype(base_c)::value;
+        const float2 r2         = {r, r};
+        asm volatile("v_pk_mul_f32 v[%0:%1], %2, v[%0:%1]"
+                     :
+                     : "n"(base), "n"(base + 1), "v"(r2));
+    };
+    auto mul_pair = [&](float r, auto base_c) {
+        constexpr uint32_t base = decltype(base_c)::value;
+        asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base), "v"(r));
+        asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 1), "v"(r));
+    };
+
+    // Issue both ds_read_b64 for base tile S_jj into round-robin slot.
+    auto load_S = [&]<uint32_t jj, uint32_t slot>() {
+        constexpr uint32_t base =
+            (slot == 0u) ? k_v0_begin : (slot == 1u) ? k_k0_begin : k_k1_begin;
+        kv_manager.template load_transposed_v_to_gpr<0u, jj * 16u, base + 0>(p_lds_v);
+        kv_manager.template load_transposed_v_to_gpr<16u, jj * 16u, base + 2>(p_lds_v);
+    };
+    // mfma: oaccu_dst (+)= pv_v_{slot}^T @ p_mfma (3-arg init when first).
+    auto do_mma = [&]<uint32_t slot, typename OA>(OA& oaccu_dst) {
+        auto run = [&](auto& v) {
+            if constexpr(kIsFirstIter) hk::mma_ABt(oaccu_dst, v, p_mfma);
+            else hk::mma_ABt(oaccu_dst, v, p_mfma, oaccu_dst);
+        };
+        if constexpr(slot == 0u) run(pv_v_0);
+        else if constexpr(slot == 1u) run(pv_v_1);
+        else run(pv_v_2);
+    };
+
+    if constexpr(kDoRescale)
+    {
+        opus::static_for<2>([&](auto s) {
+            pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 0u>{});
+            pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 2u>{});
+        });
+    }
+
+    // Prologue: preload S_0,S_1,S_2 (6 ds_read_b64) into slots 0,1,2.
+    load_S.template operator()<0u, 0u>();
+    load_S.template operator()<1u, 1u>();
+    load_S.template operator()<2u, 2u>();
+
+    opus::static_for<num_pv_iter>([&](auto i) {
+        constexpr uint32_t iter            = i.value;
+        constexpr bool     has_next        = (iter + 1u) < num_pv_iter;
+        constexpr uint32_t next_oaccu_base = k_o_begin + (iter + 1u) * 8u;
+        constexpr uint32_t j_lo            = 2u * iter;      // flat mfma idx (a)
+        constexpr uint32_t j_hi            = 2u * iter + 1u; // flat mfma idx (b)
+        constexpr uint32_t slot_lo         = j_lo % 3u;
+        constexpr uint32_t slot_hi         = j_hi % 3u;
+
+        constexpr uint32_t oaccu_base = k_o_begin + iter * 8u;
+        using oaccu_a_r               = hkdart::split_many_t<
+            hkdart::type_list<hkdart::range<oaccu_base + 0, oaccu_base + 3>>,
+            4>;
+        using oaccu_b_r = hkdart::split_many_t<
+            hkdart::type_list<hkdart::range<oaccu_base + 4, oaccu_base + 7>>,
+            4>;
+        hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_a_r> oaccu_a;
+        hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_b_r> oaccu_b;
+
+        // ---- mfma_a (flat j_lo, reads slot_lo) ----
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(has_next ? 4 : 2, -1));
+        do_mma.template operator()<slot_lo>(oaccu_a);
+        if constexpr(j_lo + 3u < kNumVTiles)
+        {
+            load_S.template operator()<j_lo + 3u, slot_lo>();
+        }
+        if constexpr(kDoRescale && has_next)
+        {
+            mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 0>{});
+            mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 0>{});
+        }
+
+        // ---- mfma_b (flat j_hi, reads slot_hi) ----
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(has_next ? 4 : 0, -1));
+        do_mma.template operator()<slot_hi>(oaccu_b);
+        if constexpr(kDoRescale && has_next)
+        {
+            mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 2>{});
+            mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 2>{});
+        }
+        if constexpr(j_hi + 3u < kNumVTiles)
+        {
+            load_S.template operator()<j_hi + 3u, slot_hi>();
+        }
+    });
+}
+
+// PV stage selector: picks the kIsFirstIter / kDoRescale instantiation from the
+// runtime do_rescale decision the softmax produced.
+template <bool kIsFirstIter, typename T>
+__device__ __forceinline__ void
+hk_mla_v40_pv_stage(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
+                    const float rescale, const bool do_rescale)
+{
+    if constexpr(kIsFirstIter)
+    {
+        hk_mla_v40_pv_gemm<true, false, T>(kv_manager, p_lds_v, rescale);
+    }
+    else if(do_rescale)
+    {
+        hk_mla_v40_pv_gemm<false, true, T>(kv_manager, p_lds_v, rescale);
+    }
+    else
+    {
+        hk_mla_v40_pv_gemm<false, false, T>(kv_manager, p_lds_v, rescale);
+    }
+}
 
 // V4.0 mi35x m16x8 decode kernel: separate FP8 NOPE + BF16 ROPE buffers for
 // both Q and KV. End-to-end body (Phases 4a..4g) in place: prologue (Q load +
@@ -48,9 +278,14 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     using G = hk::group<T::kNumWarps>;
 
     // Compile-time warp type (chosen by the __global__ wrapper's entry divergence).
-    constexpr bool kIsRopeWarp = (kWarpType == WarpType::OddRoPEWarp);
-    constexpr bool kIsEvenWarp = (kWarpType == WarpType::EvenNoPEWarp);
-    (void)kIsEvenWarp;
+    constexpr bool kIsRopeWarp = (kWarpType == WarpType::HiRoPEWarp);
+    // kPvAtEnd: Hi group (warps 4-7, incl RoPE owners 5,7) keeps PV at call end;
+    // Lo group (warps 0-3, all NoPE) defers PV by one tile so its prefetch+SALU
+    // overlaps the Hi sibling's PV. The deferred path is given to Lo (NoPE-only)
+    // so the RoPE warps' buffer_load_lds never collides with a deferred PV in the
+    // prefetch's vmcnt window. SIMD pairs (w, w+4) still get one of each path.
+    constexpr bool kPvAtEnd = (kWarpType != WarpType::LoNoPEWarp);
+    (void)kPvAtEnd;
 
     constexpr comp_t log2e = 1.4426950408889634;
 
@@ -84,81 +319,50 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     // v_1 (k_0 slot 84:87), both dead in the other phase. Frees the old
     // k_kv (8) + pv_v_aux (8) and tucks q_lds below the k tiles vs the prior
     // 112-range layout, leaving v64..v67 fully unpinned.
-    constexpr uint32_t k_o_sz      = 128;
-    constexpr uint32_t k_p_comp_sz = 8;
-    constexpr uint32_t k_p_mfma_sz = 4;
-    constexpr uint32_t k_q_vgpr_sz = 32;
-    constexpr uint32_t mfma_tile_sz   = 4; // one 16x32 bf16 base tile
+    // Register layout single source of truth (see HkMlaV40Regs at file scope).
+    // Re-alias the constants/ranges locally so the body below keeps its existing
+    // k_* / *_ranges names; both orchestrators + every stage bind the same regs.
+    using R = HkMlaV40Regs<T>;
+    constexpr uint32_t mfma_tile_sz   = R::mfma_tile_sz;
+    constexpr uint32_t k_o_begin      = R::k_o_begin;
+    constexpr uint32_t k_o_end        = R::k_o_end;
+    constexpr uint32_t k_p_comp_begin = R::k_p_comp_begin;
+    constexpr uint32_t k_p_comp_end   = R::k_p_comp_end;
+    constexpr uint32_t k_p_mfma_begin = R::k_p_mfma_begin;
+    constexpr uint32_t k_p_mfma_end   = R::k_p_mfma_end;
+    constexpr uint32_t k_v0_begin     = R::k_v0_begin;
+    constexpr uint32_t k_v0_end       = R::k_v0_end;
+    constexpr uint32_t k_q_vgpr_begin = R::k_q_vgpr_begin;
+    constexpr uint32_t k_q_vgpr_end   = R::k_q_vgpr_end;
+    constexpr uint32_t k_k0_begin     = R::k_k0_begin;
+    constexpr uint32_t k_k1_begin     = R::k_k1_begin;
+    constexpr uint32_t k_k2_begin     = R::k_k2_begin;
+    constexpr uint32_t k_q_lds_1_begin = R::k_q_lds_1_begin;
+    constexpr uint32_t k_q_lds_0_begin = R::k_q_lds_0_begin;
+    constexpr uint32_t k_q_lds_begin   = R::k_q_lds_begin;
+    (void)mfma_tile_sz;
+    (void)k_o_end;
+    (void)k_p_comp_end;
+    (void)k_p_mfma_end;
+    (void)k_v0_end;
+    (void)k_q_vgpr_end;
+    (void)k_k2_begin;
+    (void)k_q_lds_1_begin;
+    (void)k_q_lds_0_begin;
 
-    constexpr uint32_t k_o_end        = 255;
-    constexpr uint32_t k_o_begin      = k_o_end - k_o_sz + 1;             // 128
-    constexpr uint32_t k_p_comp_end   = k_o_begin - 1;                    // 127
-    constexpr uint32_t k_p_comp_begin = k_p_comp_end - k_p_comp_sz + 1;   // 120
-    constexpr uint32_t k_p_mfma_begin = k_p_comp_begin + 0;              // 120 (overlay)
-    constexpr uint32_t k_p_mfma_end   = k_p_mfma_begin + k_p_mfma_sz - 1; // 123
-    // PV V tile v_0 overlays p_comp's HI half (124:127), dead after pack.
-    constexpr uint32_t k_v0_begin     = k_p_comp_begin + 4;              // 124
-    constexpr uint32_t k_v0_end       = k_v0_begin + mfma_tile_sz - 1;      // 127
-    constexpr uint32_t k_q_vgpr_end   = k_p_comp_begin - 1;              // 119
-    constexpr uint32_t k_q_vgpr_begin = k_q_vgpr_end - k_q_vgpr_sz + 1;  // 88
-    constexpr uint32_t k_k0_begin     = k_q_vgpr_begin - mfma_tile_sz;      // 84
-    constexpr uint32_t k_k1_begin     = k_k0_begin - mfma_tile_sz;          // 80
-    constexpr uint32_t k_k2_begin     = k_k1_begin - mfma_tile_sz;          // 76
-    constexpr uint32_t k_q_lds_1_begin    = k_k2_begin - mfma_tile_sz;          // 72
-    constexpr uint32_t k_q_lds_0_begin    = k_q_lds_1_begin - mfma_tile_sz;         // 68
-    // q_lds (Phase B Q) lives in the q_lds_0/q_lds_1 tiles, a contiguous 8-VGPR block
-    // 68..75 (load uses begin+0 and begin+4). Base = k_q_lds_0_begin (68).
-    constexpr uint32_t k_q_lds_begin = k_q_lds_0_begin; // 68 (q_lds_0=68:71, q_lds_1=72:75)
-
-    // ---- art (auto-register-tile) range views ----
-    //
-    // q_vgpr holds Q[:, 0:256] in mfma A-operand layout: 8 mfma A-tiles total
-    // (256 cols / 32 cols-per-mfma), each 4 vgprs/lane = 32 vgprs.
-    using q_vgpr_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_vgpr_begin, k_q_vgpr_end>>,
-                             4>; // 32 vgprs -> 8 ranges of 4 (8 16x32 base tiles, bf16)
-    // split_many_t<list, N> splits each range into chunks of N vgprs each. N is
-    // registers_per_thread per base tile for the chosen rt_shape + elem_t.
-    //   rt_16x16_s + fp32 -> 4 vgprs/base
-    //   rt_16x16_s + bf16 -> 2 vgprs/base
-    //   rt_16x32_s + bf16 -> 4 vgprs/base
-    using p_comp_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin, k_p_comp_end>>,
-                             4>; // 8 vgprs -> 2 ranges of 4: 2 base tiles (16x16 fp32)
-    // p_comp lo/hi halves over the same vgprs (each is 16 N-rows = 1 base tile).
-    using p_comp_lo_ranges = hkdart::
-        split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin + 0, k_p_comp_begin + 3>>, 4>;
-    using p_comp_hi_ranges = hkdart::
-        split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin + 4, k_p_comp_begin + 7>>, 4>;
-    // 3-deep QK K round-robin tiles k_0/k_1/k_2 (84:87 / 80:83 / 76:79). Each is
-    // one 16x32 bf16 base tile (4 vgprs). Names kept (kv_top/bot/alt_top) so the
-    // k_0/k_1/k_2 art decls below need no change.
-    using kv_top_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k0_begin, k_k0_begin + 3>>, 4>;
-    using kv_bot_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k1_begin, k_k1_begin + 3>>, 4>;
-    using kv_alt_top_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k2_begin, k_k2_begin + 3>>, 4>;
-    using p_mfma_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_mfma_begin, k_p_mfma_end>>,
-                             4>; // 4 vgprs -> 1 range of 4: 1 base tile (16x32 bf16)
-    using o_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_o_begin, k_o_end>>, 4>; // 128 vgprs
-    // PV V operand = three non-contiguous base tiles overlaying dead QK state,
-    // forming a 3-deep round-robin (6 ds_read_b64 in flight) for the PV GEMM:
-    //   pv_v_0 = p_comp HI half (124:127), dead after the fp32->bf16 pack to p_mfma
-    //   pv_v_1 = k_0 slot (84:87),         dead once QK is finished
-    //   pv_v_2 = k_1 slot (80:83),         dead once QK is finished
-    using pv_v_0_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_v0_begin, k_v0_end>>, 4>;
-    using pv_v_1_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k0_begin, k_k0_begin + 3>>, 4>;
-    using pv_v_2_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k1_begin, k_k1_begin + 3>>, 4>;
-    // q_lds: Phase-B Q-from-LDS, contiguous 8 vgprs (68:75) split into q_lds_0 + q_lds_1
-    // (4 vgprs each) so 2 adjacent Phase-B iters can pair-fuse like Phase A.
-    using q_lds_ranges =
-        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_lds_begin, k_q_lds_begin + 7>>, 4>;
+    using q_vgpr_ranges     = typename R::q_vgpr_ranges;
+    using p_comp_ranges     = typename R::p_comp_ranges;
+    using p_comp_lo_ranges  = typename R::p_comp_lo_ranges;
+    using p_comp_hi_ranges  = typename R::p_comp_hi_ranges;
+    using kv_top_ranges     = typename R::kv_top_ranges;
+    using kv_bot_ranges     = typename R::kv_bot_ranges;
+    using kv_alt_top_ranges = typename R::kv_alt_top_ranges;
+    using p_mfma_ranges     = typename R::p_mfma_ranges;
+    using o_ranges          = typename R::o_ranges;
+    using pv_v_0_ranges     = typename R::pv_v_0_ranges;
+    using pv_v_1_ranges     = typename R::pv_v_1_ranges;
+    using pv_v_2_ranges     = typename R::pv_v_2_ranges;
+    using q_lds_ranges      = typename R::q_lds_ranges;
 
     hkdart::clobber<q_vgpr_ranges>();
     hkdart::clobber<p_comp_ranges>();
@@ -172,37 +376,19 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     OManager16bitsV4Gen1Swizzle<T, out_t> o_manager;
     OManager32bitsV4Gen1Swizzle<T, split_t> split_o_manager;
 
-    // ---- art tile declarations ----
-    // q_vgpr: Q[:, 0:256] held bf16 in VGPR, mfma A-operand layout.
-    //   shape = (kTileM=16, 256), row_l, rt_16x32_s -> 8 base tiles x 4 vgprs = 32 vgprs.
-    hk::art<mfma_ab_t, T::kTileM, 256, hk::row_l, hk::rt_16x32_s, q_vgpr_ranges> q_vgpr;
-    // p_comp: kBlockN=32 N-cols x kTileM=16 M-rows in col_l mfma layout (= 2 base tiles fp32).
-    hk::art<comp_t, T::kBlockN, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_ranges> p_comp;
-    // p_comp lo/hi: alternate views over the same vgprs, each (16, 16) = 1 base tile.
-    // Lo covers N=0..15 (the k_* even-mma writes), hi covers N=16..31 (odd writes).
-    hk::art<comp_t, 16, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_lo_ranges> p_comp_lo;
-    hk::art<comp_t, 16, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_hi_ranges> p_comp_hi;
-    // 3-deep QK K round-robin tiles k_0/k_1/k_2 (84:87 / 80:83 / 76:79). The
-    // K-read stream R0,R1,... feeds the QK mfmas with at most 3 in flight:
-    // R_n lands in k_{n%3}, and the load refilling a tile is issued right after
-    // the mfma that consumed its prior occupant. Named k_* (not top/bot)
-    // because a tile holds a "top" 16-row half on one iter and a "bot" half on
-    // the next -- top/bot lives in the load's row offset, not the register.
-    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_top_ranges> k_0;
-    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_bot_ranges> k_1;
-    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_alt_top_ranges> k_2;
-    // PV V round-robin tiles (16 K-rows each = 1 base tile of (16, 32) bf16).
-    // pv_v_0 overlays p_comp HI (124:127, dead after pack), pv_v_1 overlays k_0
-    // (84:87), pv_v_2 overlays k_1 (80:83); both k tiles dead after QK. The PV
-    // GEMM streams 32 V base tiles S_0..S_31 (S_j = V-cols [j*16:(j+1)*16])
-    // through these 3 slots, S_j -> slot (j%3), 6 ds_read_b64 in flight.
-    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_0_ranges> pv_v_0;
-    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_1_ranges> pv_v_1;
-    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_2_ranges> pv_v_2;
-    // p_mfma: bf16 P-operand for PV mfma, row_l 16x32 (4 vgprs/lane = 1 base tile).
-    hk::art<mfma_ab_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges> p_mfma;
-    // oaccu: full kVoHeadDim=512 wide, kTileM=16 rows, row_l 16x16 sub-tiles (fp32).
-    hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
+    // ---- art tile declarations (bound to the shared register ranges) ----
+    typename R::q_vgpr_t q_vgpr;
+    typename R::p_comp_t p_comp;
+    typename R::p_comp_lo_t p_comp_lo;
+    typename R::p_comp_hi_t p_comp_hi;
+    typename R::k_0_t k_0;
+    typename R::k_1_t k_1;
+    typename R::k_2_t k_2;
+    typename R::pv_v_0_t pv_v_0;
+    typename R::pv_v_1_t pv_v_1;
+    typename R::pv_v_2_t pv_v_2;
+    typename R::p_mfma_t p_mfma;
+    typename R::oaccu_t oaccu;
 
     // ---- Runtime constants ----
     const uint32_t lane_idx = opus::lane_id();
@@ -343,6 +529,14 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         // share of the tile, established by the warp_reduce inside softmax_p0).
         comp_t row_max;
         comp_t row_sum_e;
+        // rescale / do_rescale are produced by each tile's softmax and consumed
+        // by its PV. Hoisted to work-item scope so the ODD (rotated) path can
+        // read the PREVIOUS tile's values in the next call's deferred PV; the
+        // softmax assigns (not declares) them, so the deferred PV reads the prior
+        // tile's values before the current softmax overwrites them. Even path:
+        // set + used in the same call, so the hoist is inert.
+        comp_t rescale  = 1.0f;
+        bool do_rescale = false;
 
         // Helper: resolve the physical KV row for the 32-row tile that begins
         // at tile_start. Returns -1 if the tile is entirely OOB.
@@ -435,6 +629,22 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             constexpr bool kIsGlobalLast = kSkipCompute || kDoEpilogue;
             (void)kv_tile_end;
 
+            // ODD (rotated) path: PV is deferred one tile so this call's
+            // prefetch+SALU overlaps the EVEN sibling wave's PV on the shared
+            // SIMD. A deferred PV (of the PREVIOUS tile) runs at call start for
+            // every call that has a not-yet-PV'd prior tile -- all but the
+            // warp's first compute call and the fully-idle skip call.
+            constexpr bool kHasPv = (!kPvAtEnd) && (!kIsFirstIter) &&
+                                    ((!kSkipCompute) || kDoEpilogue);
+            // The deferred first PV uses the accumulate path (3-arg init is
+            // even-only), so the odd path zeroes oaccu once on its first compute
+            // call instead of relying on PV's init. row_max/row_sum_e are still
+            // initialised by the kIsFirstIter softmax below, shared with even.
+            if constexpr((!kPvAtEnd) && kIsFirstIter)
+            {
+                hk::zero(oaccu);
+            }
+
             static_assert((kSkipCompute == false) || (kIsFirstIter == false),
                           "A skipped iter cannot be the warp's first compute iter.");
             static_assert(
@@ -446,6 +656,15 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             if constexpr(kIsGlobalLast == false)
             {
                 row_kv_ld_next = row_kv_ld_next_next;
+                // Deferred-PV (Lo) group: hoist the page-table resolve for the
+                // tile AFTER next to call start (only needs kv_tile_start, no QK
+                // result) so its buffer_load overlaps this call's deferred PV +
+                // QK and the NEXT call's prefetch reads the row without a stall.
+                // PV-at-end (Hi) group keeps it late (below).
+                if constexpr(!kPvAtEnd)
+                {
+                    row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
+                }
             }
 
             // ---- Phase A: prefetch NEXT tile into the next-pong ----
@@ -471,6 +690,18 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                     warp_idx, params.p_kv_buffer, row_kv_ld_next, p0);
                 kv_manager.template prefetch_kv_nope<0u, kTileCols, kCheckBoundaryNext, kIsRopeWarp>(
                     warp_idx, params.p_kv_buffer, row_kv_ld_next, p1);
+            }
+
+            // ---- ODD deferred PV (of the PREVIOUS tile) ----
+            // Issued AFTER this call's prefetch so the prefetch+SALU lands while
+            // the even sibling wave is mid-PV. Reads the previous tile's V from
+            // p_lds_kv_next (left there by the prior call's swap, still alive --
+            // this call's cvt+store has not run yet) and the previous tile's
+            // p_mfma / rescale / do_rescale (pinned regs + hoisted scalars, not
+            // yet overwritten by this call's QK/softmax). Accumulate path only.
+            if constexpr(kHasPv)
+            {
+                hk_mla_v40_pv_stage<false, T>(kv_manager, p_lds_kv_next, rescale, do_rescale);
             }
 
             // Drain the NoPE prefetches enough to leave only this iter's own
@@ -793,12 +1024,12 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             __builtin_amdgcn_s_setprio(2);
 
             // ---- Update row_kv_ld_next_next for the call AFTER this one ----
-            // When there's a next iter (kIsGlobalLast == false), compute the
-            // tile-after-next row index so the next iter's prefetch has it
-            // ready. resolve_row_kv_ld returns -1 if past the global end --
-            // the subsequent iter's boundary-checked prefetch will then
-            // suppress that load.
-            if constexpr(kIsGlobalLast == false)
+            // PV-at-end (Hi) group only: resolve here, just after the QK phase;
+            // its buffer_load overlaps softmax + the end-PV before the next
+            // call's prefetch. The deferred (Lo) group already resolved at call
+            // start (above). resolve_row_kv_ld returns -1 past the global end --
+            // the subsequent boundary-checked prefetch suppresses that load.
+            if constexpr((kIsGlobalLast == false) && kPvAtEnd)
             {
                 row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
             }
@@ -811,7 +1042,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // col_1 group covers +4..+7 (N-cols [col_0_idx*4+16, +20)).
             const uint32_t col_0_idx = lane_idx >> 4;
             comp_t local_max{};
-            comp_t rescale = 1.0f;
+            rescale = 1.0f;
             // Wave-uniform: does the running max move enough this tile to
             // require rescaling the prior oaccu / row_sum_e? Decided by ballot
             // so the whole wave agrees (oaccu rescale is a per-wave op, but
@@ -819,7 +1050,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // prior oaccu) and whenever every active lane's new max is within
             // T::kRescaleThreshold of the stale max -- in which case row_max is
             // kept stale and the rescale multiplies (all == 1) are skipped.
-            bool do_rescale = false;
+            do_rescale = false;
             if constexpr(kSkipCompute == false)
             {
                 // Q was pre-scaled by sm_scale*log2e in load_q, so only mask
@@ -882,9 +1113,12 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 // forward unscaled.
                 softmax_p1_prescaled<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
 
-                __builtin_amdgcn_sched_barrier(0);
-                __builtin_amdgcn_s_setprio(0);
-                __builtin_amdgcn_sched_barrier(0);
+                if constexpr(kPvAtEnd == false)
+                {
+                    __builtin_amdgcn_sched_barrier(0);
+                    __builtin_amdgcn_s_setprio(0);
+                    __builtin_amdgcn_sched_barrier(0);
+                }
 
                 // ---- fp32->bf16 pack (p_comp -> p_mfma overlay) ----
                 // 8 fp32 (v120..v127) -> 4 bf16x2 dwords (v120..v123 overlay).
@@ -922,124 +1156,12 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // Rescale schedule (kDoRescale only): prologue pk_mul_pair scales
             // iter 0's 8 oaccu vgprs; in-loop iter i scales iter (i+1)'s 8 vgprs
             // as 4 mul_pair hidden under the V-tile load latency.
-            constexpr uint32_t num_pv_iter = T::kVoHeadDim / T::kBlockN; // 16
-            constexpr uint32_t kNumVTiles  = 2u * num_pv_iter;          // 32 = S_0..S_31
-            auto pv_gemm = [&]<bool kDoRescale>() {
-                auto pk_mul_pair = [&](float r, auto base_c) {
-                    constexpr uint32_t base = decltype(base_c)::value;
-                    const float2 r2         = {r, r};
-                    asm volatile("v_pk_mul_f32 v[%0:%1], %2, v[%0:%1]"
-                                 :
-                                 : "n"(base), "n"(base + 1), "v"(r2));
-                };
-                auto mul_pair = [&](float r, auto base_c) {
-                    constexpr uint32_t base = decltype(base_c)::value;
-                    asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base), "v"(r));
-                    asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 1), "v"(r));
-                };
-
-                // Issue both ds_read_b64 for base tile S_jj into round-robin slot.
-                auto load_S = [&]<uint32_t jj, uint32_t slot>() {
-                    constexpr uint32_t base =
-                        (slot == 0u) ? k_v0_begin : (slot == 1u) ? k_k0_begin : k_k1_begin;
-                    kv_manager.template load_transposed_v_to_gpr<0u, jj * 16u, base + 0>(
-                        p_lds_kv_curr);
-                    kv_manager.template load_transposed_v_to_gpr<16u, jj * 16u, base + 2>(
-                        p_lds_kv_curr);
-                };
-                // mfma: oaccu_dst (+)= pv_v_{slot}^T @ p_mfma (3-arg init when first).
-                auto do_mma = [&]<uint32_t slot, typename OA>(OA& oaccu_dst) {
-                    auto run = [&](auto& v) {
-                        if constexpr(kIsFirstIter) hk::mma_ABt(oaccu_dst, v, p_mfma);
-                        else hk::mma_ABt(oaccu_dst, v, p_mfma, oaccu_dst);
-                    };
-                    if constexpr(slot == 0u) run(pv_v_0);
-                    else if constexpr(slot == 1u) run(pv_v_1);
-                    else run(pv_v_2);
-                };
-
-                if constexpr(kDoRescale)
-                {
-                    opus::static_for<2>([&](auto s) {
-                        pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 0u>{});
-                        pk_mul_pair(rescale, opus::number<k_o_begin + s.value * 4u + 2u>{});
-                    });
-                }
-
-                // Prologue: preload S_0,S_1,S_2 (6 ds_read_b64) into slots 0,1,2.
-                load_S.template operator()<0u, 0u>();
-                load_S.template operator()<1u, 1u>();
-                load_S.template operator()<2u, 2u>();
-
-                opus::static_for<num_pv_iter>([&](auto i) {
-                    constexpr uint32_t iter            = i.value;
-                    constexpr bool     has_next        = (iter + 1u) < num_pv_iter;
-                    constexpr uint32_t next_oaccu_base = k_o_begin + (iter + 1u) * 8u;
-                    constexpr uint32_t j_lo            = 2u * iter;      // flat mfma idx (a)
-                    constexpr uint32_t j_hi            = 2u * iter + 1u; // flat mfma idx (b)
-                    constexpr uint32_t slot_lo         = j_lo % 3u;
-                    constexpr uint32_t slot_hi         = j_hi % 3u;
-
-                    constexpr uint32_t oaccu_base = k_o_begin + iter * 8u;
-                    using oaccu_a_r               = hkdart::split_many_t<
-                        hkdart::type_list<hkdart::range<oaccu_base + 0, oaccu_base + 3>>,
-                        4>;
-                    using oaccu_b_r = hkdart::split_many_t<
-                        hkdart::type_list<hkdart::range<oaccu_base + 4, oaccu_base + 7>>,
-                        4>;
-                    hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_a_r>
-                        oaccu_a;
-                    hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_b_r>
-                        oaccu_b;
-
-                    // ---- mfma_a (flat j_lo, reads slot_lo) ----
-                    // Steady: FIFO=[S_jlo,S_{jlo+1},S_{jlo+2}]=6, wait(4) drains
-                    // S_jlo leaving 4. Tail iter15 (j=30): FIFO=[S30,S31]=4 -> wait(2).
-                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(has_next ? 4 : 2, -1));
-                    do_mma.template operator()<slot_lo>(oaccu_a);
-                    // Reload S_{jlo+3} -> slot_lo; rescale next oaccu +0/+1,+4/+5.
-                    if constexpr(j_lo + 3u < kNumVTiles)
-                    {
-                        load_S.template operator()<j_lo + 3u, slot_lo>();
-                    }
-                    if constexpr(kDoRescale && has_next)
-                    {
-                        mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 0>{});
-                        mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 0>{});
-                    }
-
-                    // ---- mfma_b (flat j_hi, reads slot_hi) ----
-                    // Steady wait(4); tail iter15 (j=31): FIFO=[S31]=2 -> wait(0).
-                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(has_next ? 4 : 0, -1));
-                    do_mma.template operator()<slot_hi>(oaccu_b);
-                    // Rescale next oaccu +2/+3,+6/+7; reload S_{jhi+3} -> slot_hi.
-                    if constexpr(kDoRescale && has_next)
-                    {
-                        mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 2>{});
-                        mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 2>{});
-                    }
-                    if constexpr(j_hi + 3u < kNumVTiles)
-                    {
-                        load_S.template operator()<j_hi + 3u, slot_hi>();
-                    }
-                });
-            };
-
-            if constexpr(kSkipCompute == false)
+            // EVEN path: PV of THIS tile at call end (reads its own curr-pong V).
+            // Odd defers PV to the next call's start (above) / the epilogue.
+            if constexpr(kPvAtEnd && (kSkipCompute == false))
             {
-                if constexpr(kIsFirstIter)
-                {
-                    // First compute iter inits oaccu fresh -- never rescales.
-                    pv_gemm.template operator()<false>();
-                }
-                else if(do_rescale)
-                {
-                    pv_gemm.template operator()<true>();
-                }
-                else
-                {
-                    pv_gemm.template operator()<false>();
-                }
+                hk_mla_v40_pv_stage<kIsFirstIter, T>(kv_manager, p_lds_kv_curr, rescale,
+                                                     do_rescale);
             }
 
             // ---- Epilogue ----
@@ -1054,6 +1176,18 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // work_idx's KV prologue writes to p_lds_kv_curr).
             if constexpr(kDoEpilogue)
             {
+                // ODD path drain: on the global-last call that ran a QK
+                // (!kSkipCompute), THIS tile's PV is still pending (the rotation
+                // defers PV by one). Do it now, reading V from p_lds_kv_curr
+                // (this tile; no swap on the global last). The kSkipCompute
+                // global-last case already drained the warp's last real tile via
+                // the deferred PV at call start (kHasPv), so it needs nothing
+                // here. Even path: PV already ran at call end.
+                if constexpr((!kPvAtEnd) && (kSkipCompute == false))
+                {
+                    hk_mla_v40_pv_stage<false, T>(kv_manager, p_lds_kv_curr, rescale, do_rescale);
+                }
+
                 // ---- Attention-sink fold ----
                 // Apply on OutputFinal (single-split == global) OR on the
                 // LAST split of this batch element. By inflating exactly
@@ -1463,22 +1597,24 @@ void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdPar
     const uint32_t warp_idx = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
 
     // Diverge on warp type ONCE at kernel entry so each type compiles as its own
-    // body (compile-time kWarpType, no runtime warp-idx branches inside). RoPE
-    // owners are odd warps (5,7); even warps are always NoPE.
-    if(warp_idx % 2 == 0)
+    // body (compile-time kWarpType, no runtime warp-idx branches inside). Split
+    // by HALF (warps 0-3 = Lo / PV-at-end, warps 4-7 = Hi / PV-deferred) so each
+    // SIMD's (w, w+4) pair gets one of each path and the PVs stagger. RoPE
+    // owners are 5,7 (both Hi).
+    if(warp_idx < 4u)
     {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::EvenNoPEWarp>(params,
-                                                                                        warp_idx);
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::LoNoPEWarp>(params,
+                                                                                      warp_idx);
     }
     else if(KvManager8to16bitsV1<T>::wave_is_rope_owner(warp_idx))
     {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::OddRoPEWarp>(params,
-                                                                                       warp_idx);
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::HiRoPEWarp>(params,
+                                                                                      warp_idx);
     }
     else
     {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::OddNoPEWarp>(params,
-                                                                                       warp_idx);
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::HiNoPEWarp>(params,
+                                                                                      warp_idx);
     }
 }
 
