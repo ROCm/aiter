@@ -91,7 +91,7 @@ def _mxfp4out_ok(shape):
 
 
 def flyg_variants(shape):
-    """?? (label, kernelName1, kernelName2) flyg ??;gemm1 BM == gemm2 BM?"""
+    """List of (label, kernelName1, kernelName2) flyg variants to sweep; gemm1 BM == gemm2 BM."""
     out = []
     # BM16: g1 INLINEQUANT x g2 {ATOMIC_NT, ATOMIC}
     for g2v in ("ATOMIC_NT", "ATOMIC"):
@@ -137,7 +137,7 @@ def flyg_variants(shape):
     return out
 
 
-# fly ????:??????? fused_moe ? _INDEX_COLS / get_2stage_cfgs ? keys ???
+# fly (legacy) CSV lookup keys: mirror fused_moe's _INDEX_COLS / get_2stage_cfgs keys.
 _FLY_KEY_COLS = [
     "cu_num",
     "token",
@@ -171,9 +171,10 @@ _FLY_MATCH_COLS = [c for c in _FLY_KEY_COLS if c != "act_type"]
 
 
 def fly_kernel_info(shape, M, csv_path, cu_num):
-    """?? fused_moe ??-tag ?????? (tuned: bool, kernelName1, kernelName2)?
-    ?? act_type?????????????(????? __ignore__ fallback)?
-    tuned=False(??)?? fly ???? heuristics???,?????/???"""
+    """Look up fused_moe's untagged (legacy fly) CSV row -> (tuned: bool, kernelName1, kernelName2).
+    act_type is excluded from the match (at runtime fly resolves via the __ignore__ fallback).
+    tuned=False (no matching row) means the fly path falls back to heuristics, so the kernel
+    names are unknown/unreported."""
     if not csv_path or not os.path.exists(csv_path):
         return (False, "", "")
     df = pd.read_csv(csv_path)
@@ -256,7 +257,7 @@ def build_weights(shape, device, seed=0):
         w2_scale = _pad_last_qt(w2_scale, inter_pad // 32)  # [ne*h, inter//32] e8m0
         inter = inter_pad
 
-    # fly: legacy preshuffle (16,16) ??(op_tests/test_moe_2stage.py ??)?
+    # fly: legacy preshuffle (16,16) layout (matches op_tests/test_moe_2stage.py).
     fly = dict(
         w1=shuffle_weight(w1_qt, layout=(16, 16)),
         w2=shuffle_weight(w2_qt, layout=(16, 16)),
@@ -264,7 +265,7 @@ def build_weights(shape, device, seed=0):
         w2_scale=e8m0_shuffle(w2_scale),
     )
 
-    # mx: mxfp4_moe a16w4 gate/up-interleaved ??,w1 ? shuffle_kind ???
+    # mx: mxfp4_moe a16w4 gate/up-interleaved layout; w1 carries the shuffle_kind tag.
     mx_w1 = shuffle_weight_a16w4(w1_qt, 16, True)
     mx_w1.shuffle_kind = "mxfp4_moe"
     mx_w2 = shuffle_weight_a16w4(w2_qt, 16, False)
@@ -318,7 +319,7 @@ def tensor_hash(*tensors):
 
 
 def run_fly(shape, M, fly_w, hidden, topk_ids, topk_weight, iters, warmup):
-    """legacy 2-stage fly path via fused_moe(? shuffle_kind)??? (us, out)?"""
+    """legacy 2-stage fly path via fused_moe (no shuffle_kind) -> (us, out)."""
 
     def fn():
         return fused_moe(
@@ -350,10 +351,10 @@ def run_flyg_best(
     warmup,
     cos_thresh=0.95,
 ):
-    """?????? flyg ??,????/?????,????? (us, label, out)?
-    ?????? None?ref_out=None ??? cosine ???
-    cos_thresh ???????????(???????),???? fp4 ??:
-    fly/flyg ?? fp4 ???/????,?? cosine ~0.98(mxfp4out ??),??? 0.95?"""
+    """Sweep the flyg variants, gate each on correctness (skip failures), and return the
+    fastest (us, label, out) -- or None if every variant fails. ref_out=None disables the
+    cosine check. cos_thresh gates each variant against the reference: both fly and flyg are
+    fp4-quantized, so cosine is ~0.98 (lower for mxfp4out); default threshold 0.95."""
     best = None
     for label, k1, k2 in flyg_variants(shape):
 
@@ -394,7 +395,7 @@ def _active_csv():
 
 
 def _short_kernel(name):
-    """fly kernelName ??:??????????? '-'?"""
+    """Shorten a fly kernelName for table display; '-' when empty."""
     if not name:
         return "-"
     return name if len(name) <= 40 else "..." + name[-39:]

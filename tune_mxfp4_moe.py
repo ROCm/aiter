@@ -40,7 +40,6 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
     _mxfp4_moe_run,
     _parse_mxfp4_g1_kname,
-    fused_moe,
     get_padded_M,
 )
 from aiter.jit.utils.chip_info import get_cu_num
@@ -226,27 +225,6 @@ def cosine(a, b):
     a = a.float().reshape(-1)
     b = b.float().reshape(-1)
     return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
-
-
-def run_fly(shape, M, fly_w, hidden, topk_ids, topk_weight, iters, warmup):
-    """Legacy 2-stage flydsl_moe via fused_moe (no shuffle_kind) -> (us, out)."""
-
-    def fn():
-        return fused_moe(
-            hidden,
-            fly_w["w1"],
-            fly_w["w2"],
-            topk_weight,
-            topk_ids,
-            activation=ActivationType.Silu,
-            quant_type=QuantType.per_1x32,
-            w1_scale=fly_w["w1_scale"],
-            w2_scale=fly_w["w2_scale"],
-        )
-
-    out = fn().clone()
-    _, us = run_perftest(fn, num_warmup=warmup, num_iters=iters)
-    return us, out
 
 
 def parse_shapes(value):
