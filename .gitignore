@@ -92,10 +92,3 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
-
-# local mxfp4 MoE dev/bench/tune scripts (kept locally, not maintained in git)
-/analyze_moe_kernel_log.py
-/bench_up_moe_v1.py
-/bench_up_moe_v2.py
-/bench_up_moe_v2_back.py
-/tune_mxfp4_moe.py
