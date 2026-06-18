@@ -2998,6 +2998,116 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
             sg, rank, residual_inp, residual_out, output, weight, scale_out, size, hidden_dim, eps);
 }
 
+// Stage 2 for split AR+MHC(post): read all-reduced activations from tmp and
+// apply mhc_post epilogue without materializing reduced layer_input.
+template <typename T, int hc_mult>
+__global__ void __launch_bounds__(1024, 1) local_device_mhc_post_from_tmp(
+    RankSignals sg,
+    int rank,
+    T* __restrict__ residual,
+    float* __restrict__ post_layer_mix,
+    float* __restrict__ comb_res_mix,
+    T* __restrict__ next_residual,
+    int m,
+    int hidden_size,
+    int residual_stride)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    static_assert(hc_mult == 4, "AR+MHC post split epilogue currently supports hc_mult=4");
+    P* tmps       = get_tmp_buf<P>(sg.signals[rank]);
+    const int lane = threadIdx.x;
+    const int n_packs = hidden_size / pack_size;
+    if(lane >= n_packs)
+        return;
+
+    for(int row = blockIdx.x; row < m; row += gridDim.x)
+    {
+        const int input_pack_idx = row * n_packs + lane;
+        P reduced_pack           = tmps[input_pack_idx];
+        A reduced;
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+            reduced[v] = upcast_s(reduced_pack[v]);
+
+#pragma unroll
+        for(int out_h = 0; out_h < hc_mult; ++out_h)
+        {
+            A out;
+            const float post_v = post_layer_mix[row * hc_mult + out_h];
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+                out[v] = reduced[v] * post_v;
+
+#pragma unroll
+            for(int in_h = 0; in_h < hc_mult; ++in_h)
+            {
+                const float comb_v =
+                    comb_res_mix[row * hc_mult * hc_mult + in_h * hc_mult + out_h];
+                const int residual_pack_idx =
+                    (row * residual_stride + in_h * hidden_size) / pack_size + lane;
+                P residual_pack = reinterpret_cast<P*>(residual)[residual_pack_idx];
+#pragma unroll
+                for(int v = 0; v < pack_size; ++v)
+                    out[v] += upcast_s(residual_pack[v]) * comb_v;
+            }
+
+            P out_pack = downcast<P>(out);
+            const int out_pack_idx =
+                (row * residual_stride + out_h * hidden_size) / pack_size + lane;
+            reinterpret_cast<P*>(next_residual)[out_pack_idx] = out_pack;
+        }
+    }
+}
+
+template <typename T, int NGPUS>
+void allreduce_mhc_post_split_launcher(RankData* _dp,
+                                       RankSignals sg,
+                                       Signal* self_sg,
+                                       int rank,
+                                       T* next_residual,
+                                       T* residual,
+                                       float* post_layer_mix,
+                                       float* comb_res_mix,
+                                       int m,
+                                       int input_hidden_dim,
+                                       int hidden_size,
+                                       int residual_stride,
+                                       hipStream_t stream)
+{
+    const int size = m * input_hidden_dim;
+    dim3 block(512);
+    int block_num = ((size / NGPUS) + 512 - 1) / 512;
+    dim3 grid(std::min(block_num, kMaxBlocks));
+    switch(NGPUS)
+    {
+    case 8:
+        reduce_scatter_cross_device_store<T, 8><<<grid, block, 0, stream>>>(
+            _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim);
+        break;
+    case 4:
+        reduce_scatter_cross_device_store<T, 4><<<grid, block, 0, stream>>>(
+            _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim);
+        break;
+    case 2:
+        reduce_scatter_cross_device_store<T, 2><<<grid, block, 0, stream>>>(
+            _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim);
+        break;
+    default:
+        throw std::runtime_error("AR+MHC post split epilogue: unsupported NGPUS=" +
+                                 std::to_string(NGPUS));
+    }
+
+    constexpr int pack_size = 16 / sizeof(T);
+    const int block_size    = hidden_size / pack_size;
+    dim3 threadsPerBlock(block_size);
+    dim3 numBlocks(m);
+    local_device_mhc_post_from_tmp<T, 4><<<numBlocks, threadsPerBlock, 0, stream>>>(
+        sg, rank, residual, post_layer_mix, comb_res_mix, next_residual, m, hidden_size,
+        residual_stride);
+}
+
 using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(hipIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(hipIpcMemHandle_t));
@@ -4523,6 +4633,47 @@ void dispatchAllReduceMhcPostLargeM(hipStream_t stream,
     }
 #undef DISPATCH_AR_MHC_POST_IMPL
 #undef DISPATCH_AR_MHC_POST
+}
+
+template <typename T>
+void dispatchAllReduceMhcPostSplit(hipStream_t stream,
+                                   T* input,
+                                   T* next_residual,
+                                   T* residual,
+                                   float* post_layer_mix,
+                                   float* comb_res_mix,
+                                   int m,
+                                   int input_hidden_dim,
+                                   int hidden_size,
+                                   int residual_stride)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    if(input_hidden_dim != hidden_size)
+    {
+        throw std::runtime_error("AR+MHC post split epilogue requires full hidden input");
+    }
+    if(hidden_size % pack_size != 0 || residual_stride % pack_size != 0)
+    {
+        throw std::runtime_error("AR+MHC post split epilogue requires pack-aligned hidden/stride");
+    }
+
+    RankData* ptrs = get_buffer_RD(stream, input);
+
+#define DISPATCH_AR_MHC_POST_SPLIT(NGPUS)                                              \
+    allreduce_mhc_post_split_launcher<T, NGPUS>(                                       \
+        ptrs, sg_, self_sg_, rank_, next_residual, residual, post_layer_mix,            \
+        comb_res_mix, m, input_hidden_dim, hidden_size, residual_stride, stream)
+
+    switch(world_size_)
+    {
+    case 8: DISPATCH_AR_MHC_POST_SPLIT(8); break;
+    case 4: DISPATCH_AR_MHC_POST_SPLIT(4); break;
+    case 2: DISPATCH_AR_MHC_POST_SPLIT(2); break;
+    default:
+        throw std::runtime_error("AR+MHC post split epilogue: unsupported world_size=" +
+                                 std::to_string(world_size_));
+    }
+#undef DISPATCH_AR_MHC_POST_SPLIT
 }
 
 ~CustomAllreduce()

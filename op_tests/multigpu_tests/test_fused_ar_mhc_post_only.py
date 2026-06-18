@@ -6,12 +6,10 @@
 from __future__ import annotations
 
 import argparse
-import itertools
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from statistics import median
-from typing import Callable, Optional
+from typing import Optional
 
 import pandas as pd
 import torch
@@ -29,7 +27,10 @@ from aiter.dist.parallel_state import (
     set_custom_all_reduce,
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
-from aiter.ops.custom_all_reduce import launch_fused_allreduce_mhc_post_only
+from aiter.ops.custom_all_reduce import (
+    fused_allreduce_mhc_post_only,
+    fused_allreduce_mhc_post_split,
+)
 from aiter.test_common import benchmark, checkAllclose
 
 logger = logging.getLogger("aiter")
@@ -38,7 +39,7 @@ set_start_method("spawn", force=True)
 
 WARMUP = 5
 BENCH_WARMUP = 2
-ITERS = 50
+BENCH_ITERS = 101
 DEFAULT_SHAPES = (
     (1, 4096),
     (2, 4096),
@@ -72,40 +73,20 @@ def _make_inputs(m: int, hidden_size: int, rank: int, device: torch.device):
     }
 
 
-def _event_us(fn: Callable[[], None], *, warmup: int, iters: int) -> list[float]:
+def _event_mean_us(fn, *, warmup: int, iters: int) -> float:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    samples: list[float] = []
+    latencies: list[float] = []
     for _ in range(iters):
         start.record()
         fn()
         end.record()
         end.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0)
-    return samples
-
-
-def _bench_graph(fn: Callable[[], None], *, warmup: int, iters: int) -> list[float]:
-    graph = torch.cuda.CUDAGraph()
-    with graph_capture() as gc:
-        with torch.cuda.graph(graph, stream=gc.stream):
-            fn()
-    for _ in range(warmup):
-        graph.replay()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    samples: list[float] = []
-    for _ in range(iters):
-        start.record()
-        graph.replay()
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0)
-    return samples
+        latencies.append(start.elapsed_time(end) * 1000.0)
+    return sum(latencies) / len(latencies)
 
 
 def _profile_worker(
@@ -117,6 +98,7 @@ def _profile_worker(
     init_method: str,
     *,
     run_correctness: bool,
+    breakdown: bool = False,
 ):
     device = torch.device(f"cuda:{rank_id}")
     torch.cuda.set_device(device)
@@ -133,7 +115,10 @@ def _profile_worker(
     torch.cuda.synchronize()
 
     ca_comm = get_tp_group().device_communicator.ca_comm
-    next_residual = torch.empty_like(tensors["residual_in"])
+    next_residual_split = torch.empty_like(tensors["residual_in"])
+    next_residual_fused = torch.empty_like(tensors["residual_in"])
+    next_residual_split_fused = torch.empty_like(tensors["residual_in"])
+    reduced_buf = torch.empty_like(tensors["layer_input"])
     post_mix = tensors["post_layer_mix"]
     if post_mix.ndim == 3:
         post_mix = post_mix.squeeze(-1)
@@ -146,21 +131,19 @@ def _profile_worker(
     def split_ar_post():
         reduced = tensor_model_parallel_all_reduce(tensors["layer_input"])
         aiter.mhc_post(
-            next_residual,
+            next_residual_split,
             reduced,
             tensors["residual_in"],
             post_mix,
             tensors["comb_res_mix"],
         )
 
-    def fused_ar_post(*, graph_replay: bool = False):
-        if graph_replay:
-            reg_ptr, reg_bytes = 0, 0
-        else:
-            reg_ptr, reg_bytes = _reg()
-        launch_fused_allreduce_mhc_post_only(
+    def fused_ar_post(*, registered: bool):
+        reg_ptr, reg_bytes = (0, 0) if registered else _reg()
+        fused_allreduce_mhc_post_only(
             ca_comm._ptr,
             tensors["layer_input"],
+            next_residual_fused,
             tensors["residual_in"],
             tensors["post_layer_mix"],
             tensors["comb_res_mix"],
@@ -168,48 +151,125 @@ def _profile_worker(
             reg_bytes=reg_bytes,
         )
 
-    err = 0.0
-    if run_correctness:
-        split_ar_post()
-        ref = next_residual.clone()
-        out = launch_fused_allreduce_mhc_post_only(
+    def fused_ar_post_split(*, registered: bool):
+        reg_ptr, reg_bytes = (0, 0) if registered else _reg()
+        fused_allreduce_mhc_post_split(
             ca_comm._ptr,
             tensors["layer_input"],
+            next_residual_split_fused,
             tensors["residual_in"],
             tensors["post_layer_mix"],
             tensors["comb_res_mix"],
-            reg_ptr=_reg()[0],
-            reg_bytes=_reg()[1],
+            reg_ptr=reg_ptr,
+            reg_bytes=reg_bytes,
         )
-        err = checkAllclose(
-            ref,
-            out,
-            msg=f"tp={tp_size} m={m} rank={rank_id}",
+
+    def ar_only():
+        nonlocal reduced_buf
+        reduced_buf = tensor_model_parallel_all_reduce(tensors["layer_input"])
+
+    def mhc_only():
+        aiter.mhc_post(
+            next_residual_split,
+            reduced_buf,
+            tensors["residual_in"],
+            post_mix,
+            tensors["comb_res_mix"],
+        )
+
+    err = 0.0
+    if run_correctness:
+        split_ar_post()
+        ref = next_residual_split.clone()
+        fused_ar_post(registered=False)
+        err = max(
+            err,
+            checkAllclose(
+                ref,
+                next_residual_fused,
+                msg=f"tp={tp_size} m={m} rank={rank_id} fused_1stage",
+            ),
+        )
+        fused_ar_post_split(registered=False)
+        err = max(
+            err,
+            checkAllclose(
+                ref,
+                next_residual_split_fused,
+                msg=f"tp={tp_size} m={m} rank={rank_id} fused_2stage",
+            ),
         )
 
     for _ in range(WARMUP):
         split_ar_post()
-        fused_ar_post()
+        fused_ar_post(registered=False)
+        fused_ar_post_split(registered=False)
     torch.cuda.synchronize()
 
-    bench = _bench_graph if with_graph else _event_us
-    split_us = bench(split_ar_post, warmup=BENCH_WARMUP, iters=ITERS)
+    ar_us = mhc_us = fused_split_us = 0.0
+
     if with_graph:
-        fused_us = bench(
-            lambda: fused_ar_post(graph_replay=True),
-            warmup=BENCH_WARMUP,
-            iters=ITERS,
+        graph_split = torch.cuda.CUDAGraph()
+        with graph_capture() as gc:
+            with torch.cuda.graph(graph_split, stream=gc.stream):
+                reduced = tensor_model_parallel_all_reduce(tensors["layer_input"])
+                aiter.mhc_post(
+                    next_residual_split,
+                    reduced,
+                    tensors["residual_in"],
+                    post_mix,
+                    tensors["comb_res_mix"],
+                )
+        next_residual_split.zero_()
+
+        graph_fused = torch.cuda.CUDAGraph()
+        with graph_capture() as gc:
+            with torch.cuda.graph(graph_fused, stream=gc.stream):
+                fused_ar_post(registered=True)
+        next_residual_fused.zero_()
+
+        split_us = _event_mean_us(
+            graph_split.replay, warmup=BENCH_WARMUP, iters=BENCH_ITERS
         )
+        fused_us = _event_mean_us(
+            graph_fused.replay, warmup=BENCH_WARMUP, iters=BENCH_ITERS
+        )
+        if breakdown:
+            graph_fused_split = torch.cuda.CUDAGraph()
+            with graph_capture() as gc:
+                with torch.cuda.graph(graph_fused_split, stream=gc.stream):
+                    fused_ar_post_split(registered=True)
+            next_residual_split_fused.zero_()
+            fused_split_us = _event_mean_us(
+                graph_fused_split.replay, warmup=BENCH_WARMUP, iters=BENCH_ITERS
+            )
     else:
-        fused_us = bench(fused_ar_post, warmup=BENCH_WARMUP, iters=ITERS)
+        if breakdown:
+            ar_only()
+            ar_us = _event_mean_us(ar_only, warmup=BENCH_WARMUP, iters=BENCH_ITERS)
+            mhc_us = _event_mean_us(mhc_only, warmup=BENCH_WARMUP, iters=BENCH_ITERS)
+            fused_split_us = _event_mean_us(
+                lambda: fused_ar_post_split(registered=False),
+                warmup=BENCH_WARMUP,
+                iters=BENCH_ITERS,
+            )
+        split_us = _event_mean_us(split_ar_post, warmup=BENCH_WARMUP, iters=BENCH_ITERS)
+        fused_us = _event_mean_us(
+            lambda: fused_ar_post(registered=False),
+            warmup=BENCH_WARMUP,
+            iters=BENCH_ITERS,
+        )
 
     destroy_model_parallel()
     destroy_distributed_environment()
 
     return {
         "rank": rank_id,
-        "split_median": median(split_us),
-        "fused_median": median(fused_us),
+        "split_us": split_us,
+        "fused_us": fused_us,
+        "ar_us": ar_us,
+        "mhc_us": mhc_us,
+        "fused_split_us": fused_split_us,
         "err": err,
     }
 
@@ -222,6 +282,7 @@ def _run_profile(
     init_method: Optional[str] = None,
     *,
     run_correctness: bool = False,
+    breakdown: bool = False,
 ):
     if init_method is None:
         init_method = get_distributed_init_method(get_ip(), get_open_port())
@@ -230,19 +291,31 @@ def _run_profile(
         pool.apply_async(
             _profile_worker,
             args=(tp_size, r, m, hidden_size, with_graph, init_method),
-            kwds={"run_correctness": run_correctness},
+            kwds={"run_correctness": run_correctness, "breakdown": breakdown},
         )
         for r in range(tp_size)
     ]
     pool.close()
     pool.join()
     rows = [r.get() for r in rets]
-    split = max(x["split_median"] for x in rows)
-    fused = max(x["fused_median"] for x in rows)
+    split = max(x["split_us"] for x in rows)
+    fused = max(x["fused_us"] for x in rows)
+    ar = max(x["ar_us"] for x in rows)
+    mhc = max(x["mhc_us"] for x in rows)
+    fused_split = max(x["fused_split_us"] for x in rows)
     saved = split - fused
     speedup = (saved / split * 100.0) if split > 0 else 0.0
     err = max(x["err"] for x in rows)
-    return split, fused, saved, speedup, err
+    return {
+        "split_mean_us": split,
+        "fused_mean_us": fused,
+        "ar_mean_us": ar,
+        "mhc_mean_us": mhc,
+        "fused_split_mean_us": fused_split,
+        "saved_us": saved,
+        "speedup_pct": speedup,
+        "err": err,
+    }
 
 
 @benchmark()
@@ -253,25 +326,23 @@ def test_ar_mhc_post_only_profile(
     with_graph: bool = False,
     distributed_init_method: Optional[str] = None,
     run_correctness: bool = False,
+    breakdown: bool = False,
 ):
-    split, fused, saved, speedup, err = _run_profile(
+    stats = _run_profile(
         tp_size,
         m,
         hidden_size,
         with_graph,
         distributed_init_method,
         run_correctness=run_correctness,
+        breakdown=breakdown,
     )
     return {
         "tp_size": tp_size,
         "m": m,
         "hidden_size": hidden_size,
         "withGraph": with_graph,
-        "split_median_us": split,
-        "fused_median_us": fused,
-        "saved_us": saved,
-        "speedup_pct": speedup,
-        "err": err,
+        **stats,
     }
 
 
@@ -306,16 +377,25 @@ def _parse_shapes(raw: str) -> list[tuple[int, int]]:
     return shapes
 
 
-def _print_table(tp_size: int, with_graph: bool, rows: list[dict]):
+def _print_table(tp_size: int, with_graph: bool, rows: list[dict], *, breakdown: bool):
     mode = "graph-on" if with_graph else "graph-off"
     print(f"## TP={tp_size} {mode}")
-    print("M\tsplit\tfused\tsaved\tspeedup")
-    for row in rows:
-        print(
-            f"{row['m']}\t{row['split_median_us']:.1f}\t"
-            f"{row['fused_median_us']:.1f}\t{row['saved_us']:.1f}\t"
-            f"{row['speedup_pct']:+.1f}%"
-        )
+    if breakdown:
+        print("M\tar\tmhc\tsplit\tfused_1stage\tfused_2stage")
+        for row in rows:
+            print(
+                f"{row['m']}\t{row['ar_mean_us']:.1f}\t{row['mhc_mean_us']:.1f}\t"
+                f"{row['split_mean_us']:.1f}\t{row['fused_mean_us']:.1f}\t"
+                f"{row['fused_split_mean_us']:.1f}"
+            )
+    else:
+        print("M\tsplit\tfused\tsaved\tspeedup")
+        for row in rows:
+            print(
+                f"{row['m']}\t{row['split_mean_us']:.1f}\t"
+                f"{row['fused_mean_us']:.1f}\t{row['saved_us']:.1f}\t"
+                f"{row['speedup_pct']:+.1f}%"
+            )
     print()
 
 
@@ -332,6 +412,11 @@ if __name__ == "__main__":
         default=" ".join(f"{m},{h}" for m, h in DEFAULT_SHAPES),
     )
     parser.add_argument("-g", "--graph", type=int, default=-1, choices=[-1, 0, 1])
+    parser.add_argument(
+        "--breakdown",
+        action="store_true",
+        help="also report AR-only / mhc_post-only / fused 2-stage split path",
+    )
     args = parser.parse_args()
 
     shapes = _parse_shapes(args.shapes)
@@ -339,8 +424,9 @@ if __name__ == "__main__":
 
     print("# AR + mhc_post only (split vs fused epilogue)")
     print(f"# HIP_VISIBLE_DEVICES={os.environ.get('HIP_VISIBLE_DEVICES', 'unset')}")
-    print(f"# warmup={WARMUP} bench_warmup={BENCH_WARMUP} iters={ITERS}")
-    print("# metric=rank-max median (us)")
+    print(f"# warmup={WARMUP} bench_warmup={BENCH_WARMUP} bench_iters={BENCH_ITERS}")
+    print("# graph capture: split via registered AR; fused reg_ptr=0 (registered=True)")
+    print("# metric=rank-max mean (us)")
     print()
 
     df_rows = []
@@ -355,10 +441,11 @@ if __name__ == "__main__":
                     hidden_size,
                     with_graph=with_graph,
                     distributed_init_method=init_method,
+                    breakdown=args.breakdown,
                 )
                 mode_rows.append(ret)
                 df_rows.append(ret)
-            _print_table(tp_size, with_graph, mode_rows)
+            _print_table(tp_size, with_graph, mode_rows, breakdown=args.breakdown)
 
     df = pd.DataFrame(df_rows)
     logger.info(

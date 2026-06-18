@@ -226,6 +226,57 @@ def fused_allreduce_mhc_post_only(
 ) -> None: ...
 
 
+@compile_ops(FUSED_AR_MHC_MD_NAME)
+def fused_allreduce_mhc_post_split(
+    _fa: int,
+    inp: torch.Tensor,
+    next_residual: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> None: ...
+
+
+def _launch_fused_allreduce_mhc_post(
+    _fa: int,
+    inp: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    *,
+    next_residual: torch.Tensor | None = None,
+    split_path: bool = False,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> torch.Tensor:
+    if post_layer_mix.ndim == 3:
+        post_layer_mix = post_layer_mix.squeeze(-1)
+    if next_residual is None:
+        next_residual = torch.empty_like(residual_in)
+    launch_fn = (
+        fused_allreduce_mhc_post_split if split_path else fused_allreduce_mhc_post_only
+    )
+    launch_fn(
+        _fa,
+        inp,
+        next_residual,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        use_new,
+        open_fp8_quant,
+        reg_ptr,
+        reg_bytes,
+    )
+    return next_residual
+
+
 def launch_fused_allreduce_mhc_post_only(
     _fa: int,
     inp: torch.Tensor,
@@ -239,19 +290,44 @@ def launch_fused_allreduce_mhc_post_only(
     reg_bytes: int = 0,
 ) -> torch.Tensor:
     """Launch fused custom AllReduce + MHC post (no pre / RMSNorm)."""
-    if post_layer_mix.ndim == 3:
-        post_layer_mix = post_layer_mix.squeeze(-1)
-    next_residual = torch.empty_like(residual_in)
-    fused_allreduce_mhc_post_only(
+    return _launch_fused_allreduce_mhc_post(
         _fa,
         inp,
-        next_residual,
         residual_in,
         post_layer_mix,
         comb_res_mix,
-        use_new,
-        open_fp8_quant,
-        reg_ptr,
-        reg_bytes,
+        split_path=False,
+        use_new=use_new,
+        open_fp8_quant=open_fp8_quant,
+        reg_ptr=reg_ptr,
+        reg_bytes=reg_bytes,
     )
-    return next_residual
+
+
+def launch_fused_allreduce_mhc_post_split(
+    _fa: int,
+    inp: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    *,
+    next_residual: torch.Tensor | None = None,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> torch.Tensor:
+    """Launch 2-stage split AR + MHC post (large-M optimized path)."""
+    return _launch_fused_allreduce_mhc_post(
+        _fa,
+        inp,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        next_residual=next_residual,
+        split_path=True,
+        use_new=use_new,
+        open_fp8_quant=open_fp8_quant,
+        reg_ptr=reg_ptr,
+        reg_bytes=reg_bytes,
+    )
