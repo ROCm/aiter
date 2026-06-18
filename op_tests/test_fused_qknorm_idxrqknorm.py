@@ -230,6 +230,30 @@ def make_insert_outputs(case: dict, *, kv_cache_dtype: Optional[torch.dtype] = N
     return q_out, index_q_out, kv_cache, index_cache
 
 
+def make_shuffle_caches(case: dict, *, kv_cache_dtype: Optional[torch.dtype] = None):
+    """Allocate page-`block_size` SHUFFLE (asm_layout) K/V caches.
+
+    Matches reshape_and_cache(asm_layout=True):
+      K [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+      V [num_blocks, num_kv_heads, block_size/x, head_dim, x]
+    with x = 16 / cache_itemsize.
+    """
+    dtype = kv_cache_dtype or case["dtype"]
+    itemsize = torch.empty(0, dtype=dtype).element_size()
+    x = 16 // itemsize
+    nkv = case["num_kv_heads"]
+    bs = case["block_size"]
+    nb = case["num_blocks"]
+    assert HEAD_DIM % x == 0 and bs % x == 0
+    kv_cache_k = torch.zeros(
+        nb, nkv, HEAD_DIM // x, bs, x, dtype=dtype, device="cuda"
+    )
+    kv_cache_v = torch.zeros(
+        nb, nkv, bs // x, HEAD_DIM, x, dtype=dtype, device="cuda"
+    )
+    return kv_cache_k, kv_cache_v
+
+
 def gather_cache_outputs(
     case: dict,
     kv_cache: torch.Tensor,
@@ -265,6 +289,23 @@ def gather_cache_outputs(
 
     index_k = torch.stack(index_k_outs) if index_k_outs else None
     return torch.stack(k_outs), torch.stack(v_outs), index_k
+
+
+def gather_index_cache(
+    case: dict,
+    index_cache: torch.Tensor,
+    *,
+    index_slot_mapping: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Gather the per-token index_k rows from the page-128-flat index cache."""
+    index_slots = (
+        index_slot_mapping if index_slot_mapping is not None else case["slot_mapping"]
+    )
+    rows = []
+    flat = index_cache.view(-1, HEAD_DIM)
+    for token in range(case["qkv"].size(0)):
+        rows.append(flat[index_slots[token].item()])
+    return torch.stack(rows)
 
 
 def check_close(actual, expected, *, msg: str, rtol: float, atol: float):
@@ -318,7 +359,8 @@ def run_fused_qknorm_idxrqknorm(
         )
         return qkv
 
-    use_uint8_kv_cache = mode == "fp8_kv_cache_uint8"
+    use_asm_layout = mode.startswith("asm_layout")
+    use_uint8_kv_cache = mode in ("fp8_kv_cache_uint8", "asm_layout_fp8_uint8")
     kv_cache_dtype = None
     if use_fp8_kv_cache:
         kv_cache_dtype = torch.uint8 if use_uint8_kv_cache else dtypes.fp8
@@ -326,6 +368,14 @@ def run_fused_qknorm_idxrqknorm(
         case,
         kv_cache_dtype=kv_cache_dtype,
     )
+    if use_asm_layout:
+        # SHUFFLE caches (separate K/V) for the page-16 asm layout.
+        kv_cache_k, kv_cache_v = make_shuffle_caches(case, kv_cache_dtype=kv_cache_dtype)
+    else:
+        # page-128: the op takes separate K/V caches -> use the key/value slices
+        # of the fused [nb, 2, bs, nkv, hd] tensor (views, so gather still works).
+        kv_cache_k = kv_cache[:, 0]
+        kv_cache_v = kv_cache[:, 1]
     index_slot_mapping = case["index_slot_mapping"] if use_index_slot_mapping else None
     index_q_out_arg = index_q_out
     index_cache_arg = index_cache
@@ -355,7 +405,8 @@ def run_fused_qknorm_idxrqknorm(
         case["index_k_norm_weight"],
         case["num_index_heads"],
         case["slot_mapping"],
-        kv_cache,
+        kv_cache_k,
+        kv_cache_v,
         index_cache_arg,
         case["block_size"],
         q_out,
@@ -364,6 +415,7 @@ def run_fused_qknorm_idxrqknorm(
         kv_cache_dtype=kv_cache_dtype_arg,
         k_scale=k_scale,
         v_scale=v_scale,
+        asm_layout=use_asm_layout,
     )
     return (
         q_out,
@@ -373,6 +425,8 @@ def run_fused_qknorm_idxrqknorm(
         index_slot_mapping,
         k_scale,
         v_scale,
+        kv_cache_k,
+        kv_cache_v,
     )
 
 
@@ -385,7 +439,9 @@ def test_fused_qknorm_idxrqknorm(
     rotary_dim: int,
     num_index_heads: int = 4,
 ):
-    use_fp8_kv_cache = mode.startswith("fp8_kv_cache")
+    use_fp8_kv_cache = mode.startswith("fp8_kv_cache") or mode.startswith(
+        "asm_layout_fp8"
+    )
     if use_fp8_kv_cache and fp8_cache_dtype() is None:
         aiter.logger.info("Skip fp8_kv_cache: torch FP8 dtype is unavailable")
         return {
@@ -459,6 +515,8 @@ def test_fused_qknorm_idxrqknorm(
             index_slot_mapping,
             k_scale,
             v_scale,
+            kv_cache_k,
+            kv_cache_v,
         ) = result
         check_close(q_out, refs["q"], msg=f"{msg}(q_out)", rtol=rtol, atol=atol)
         if num_index_heads > 0:
@@ -470,30 +528,67 @@ def test_fused_qknorm_idxrqknorm(
                 atol=atol,
             )
 
-        k_out, v_out, index_k_out = gather_cache_outputs(
-            case,
-            kv_cache,
-            index_cache,
-            index_slot_mapping=index_slot_mapping,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-        if use_fp8_kv_cache:
-            k_ref = fp8_cache_ref(refs["k"], k_scale)
-            v_ref = fp8_cache_ref(refs["v"], v_scale)
-        else:
-            k_ref = refs["k"]
-            v_ref = refs["v"]
-        check_close(k_out, k_ref, msg=f"{msg}(k_cache)", rtol=rtol, atol=atol)
-        check_close(v_out, v_ref, msg=f"{msg}(v_cache)", rtol=rtol, atol=atol)
-        if num_index_heads > 0:
-            check_close(
-                index_k_out,
-                refs["index_k"],
-                msg=f"{msg}(index_cache)",
-                rtol=rtol,
-                atol=atol,
+        if mode.startswith("asm_layout"):
+            # Ground truth: write the SAME normed/roped K and raw V into freshly
+            # zeroed SHUFFLE caches via the PROVEN reshape_and_cache(asm_layout=True)
+            # writer, then compare the fused-op caches against it element-wise. This
+            # directly validates the new SHUFFLE layout offsets.
+            ref_k_cache = torch.zeros_like(kv_cache_k)
+            ref_v_cache = torch.zeros_like(kv_cache_v)
+            kv_dtype_arg = "fp8_e4m3" if use_fp8_kv_cache else "auto"
+            aiter.reshape_and_cache(
+                refs["k"].contiguous(),
+                refs["v"].contiguous(),
+                ref_k_cache,
+                ref_v_cache,
+                case["slot_mapping"],
+                kv_dtype_arg,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                asm_layout=True,
             )
+            act_k = maybe_view_fp8(kv_cache_k).float()
+            act_v = maybe_view_fp8(kv_cache_v).float()
+            ref_k = maybe_view_fp8(ref_k_cache).float()
+            ref_v = maybe_view_fp8(ref_v_cache).float()
+            check_close(act_k, ref_k, msg=f"{msg}(k_shuffle)", rtol=rtol, atol=atol)
+            check_close(act_v, ref_v, msg=f"{msg}(v_shuffle)", rtol=rtol, atol=atol)
+            if num_index_heads > 0:
+                index_k_out = gather_index_cache(
+                    case, index_cache, index_slot_mapping=index_slot_mapping
+                )
+                check_close(
+                    index_k_out,
+                    refs["index_k"],
+                    msg=f"{msg}(index_cache)",
+                    rtol=rtol,
+                    atol=atol,
+                )
+        else:
+            k_out, v_out, index_k_out = gather_cache_outputs(
+                case,
+                kv_cache,
+                index_cache,
+                index_slot_mapping=index_slot_mapping,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            if use_fp8_kv_cache:
+                k_ref = fp8_cache_ref(refs["k"], k_scale)
+                v_ref = fp8_cache_ref(refs["v"], v_scale)
+            else:
+                k_ref = refs["k"]
+                v_ref = refs["v"]
+            check_close(k_out, k_ref, msg=f"{msg}(k_cache)", rtol=rtol, atol=atol)
+            check_close(v_out, v_ref, msg=f"{msg}(v_cache)", rtol=rtol, atol=atol)
+            if num_index_heads > 0:
+                check_close(
+                    index_k_out,
+                    refs["index_k"],
+                    msg=f"{msg}(index_cache)",
+                    rtol=rtol,
+                    atol=atol,
+                )
 
     return {
         "mode": mode,
@@ -519,6 +614,11 @@ DEFAULT_CASES = [
     ("inplace", "fp16", 11, 16, 64, 4),
     ("fp8_kv_cache", "bf16", 17, 16, 64, 4),
     ("fp8_kv_cache_uint8", "bf16", 17, 16, 64, 4),
+    ("asm_layout", "bf16", 17, 16, 64, 4),
+    ("asm_layout", "fp16", 19, 16, 96, 4),
+    ("asm_layout", "bf16", 13, 16, 64, 0),
+    ("asm_layout_fp8", "bf16", 17, 16, 64, 4),
+    ("asm_layout_fp8_uint8", "bf16", 17, 16, 64, 4),
 ]
 
 l_mode = [
@@ -528,6 +628,9 @@ l_mode = [
     "inplace",
     "fp8_kv_cache",
     "fp8_kv_cache_uint8",
+    "asm_layout",
+    "asm_layout_fp8",
+    "asm_layout_fp8_uint8",
 ]
 l_dtype = ["fp16", "bf16"]
 
