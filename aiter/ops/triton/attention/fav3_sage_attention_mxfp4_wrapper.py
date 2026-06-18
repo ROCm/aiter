@@ -53,6 +53,8 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         return_lse: bool = False,
         smooth_k: bool = True,
+        turboquant_rotation: bool = False,
+        turboquant_seed: int = 1234,
     ):
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
@@ -65,7 +67,12 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         FP8_TYPE = aiter.dtypes.fp8
         FP8_MAX = torch.finfo(FP8_TYPE).max
 
-        assert hadamard_rotation, "hadamard_rotation=False not supported at the moment"
+        assert hadamard_rotation or turboquant_rotation, (
+            "A rotation must be enabled: set hadamard_rotation=True or turboquant_rotation=True."
+        )
+        assert not (hadamard_rotation and turboquant_rotation), (
+            "hadamard_rotation and turboquant_rotation are mutually exclusive."
+        )
         sq_result = sage_quant_mxfp4(
             q,
             k,
@@ -80,6 +87,8 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             q_smoothing=q_smooth,
             smooth_k=smooth_k,
             return_lse=return_lse,
+            turboquant_rotation=turboquant_rotation,
+            turboquant_seed=turboquant_seed,
         )
         if return_lse:
             (
@@ -172,7 +181,9 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
     def backward(ctx, dout: torch.Tensor):
         # Backward remains unimplemented
         assert False, "backward not implemented"
-        return (None,) * 12
+        return (None,) * 15  # q, k, v, causal, layout, q_smooth, hadamard_rotation,
+        #                       config, R, BLOCK_R, block_lut, return_lse, smooth_k,
+        #                       turboquant_rotation, turboquant_seed
 
 
 def fav3_sage_mxfp4_wrapper(
@@ -189,6 +200,8 @@ def fav3_sage_mxfp4_wrapper(
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     return_lse: bool = False,
     smooth_k: bool = True,
+    turboquant_rotation: bool = False,
+    turboquant_seed: int = 1234,
 ):
     """High-precision entry point for MXFP4 SageAttention.
 
@@ -199,6 +212,11 @@ def fav3_sage_mxfp4_wrapper(
             FA-style ring-attention merging.
         smooth_k: whether to apply SageAttention-style K smoothing (default
             True). When False, no LSE compensation is needed.
+        turboquant_rotation: if True, use a full (head_dim × head_dim) random
+            orthogonal matrix from QR decomposition (TurboQuant-style) instead
+            of the Hadamard matrix. Mutually exclusive with hadamard_rotation.
+            BLOCK_R is set to head_dim automatically.
+        turboquant_seed: RNG seed for the TurboQuant rotation matrix.
     """
     for tensor, name in zip([q, k, v], ["q", "k", "v"]):
         assert tensor.dtype in [
@@ -221,6 +239,8 @@ def fav3_sage_mxfp4_wrapper(
         block_lut,
         return_lse,
         smooth_k,
+        turboquant_rotation,
+        turboquant_seed,
     )
 
 

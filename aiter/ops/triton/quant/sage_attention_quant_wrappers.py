@@ -120,6 +120,8 @@ def sage_quant_mxfp4(
     BLOCK_R=32,
     smooth_k=True,
     return_lse=False,
+    turboquant_rotation=False,
+    turboquant_seed=1234,
 ):
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
@@ -165,6 +167,16 @@ def sage_quant_mxfp4(
         k_mean = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
     else:
         k_mean = None
+
+    # Generate TurboQuant rotation matrix if requested and R not already provided.
+    # Uses a full (head_dim × head_dim) random orthogonal matrix from QR decomposition —
+    # unlike the default Hadamard which can be block-local when BLOCK_R < head_dim.
+    if turboquant_rotation and R is None:
+        from aiter.ops.triton.attention.turboquant.rotation import get_rotation_matrix
+        R = get_rotation_matrix(
+            head_dim, q.device, seed=turboquant_seed, dtype=q.dtype
+        )
+        BLOCK_R = head_dim  # full cross-channel rotation
 
     q_orig = q
     q, k, delta_s = rotation_smooth_qk(

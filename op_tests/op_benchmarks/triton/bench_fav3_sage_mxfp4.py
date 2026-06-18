@@ -84,7 +84,20 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
         _, HK, N_CTX_K, D_HEAD_V = v.shape
 
     BLOCK_R = args.BLOCK_R
-    R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+    use_tq = getattr(args, "turboquant_rotation", False)
+    if use_tq:
+        R = None          # sage_quant_mxfp4 generates the TurboQuant R internally
+        hadamard_rotation = False
+        turboquant_rotation = True
+        turboquant_seed = 1234
+        print(f"[rotation] TurboQuant (Gaussian QR, head_dim={args.d}, seed={turboquant_seed})")
+    else:
+        R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+        hadamard_rotation = args.hadamard_rotate
+        turboquant_rotation = False
+        turboquant_seed = 1234
+        print(f"[rotation] Hadamard (BLOCK_R={BLOCK_R}, hadamard_rotate={hadamard_rotation})")
+
 
     if args.include_quant_overhead:
 
@@ -96,9 +109,11 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
                 causal=args.causal,
                 layout=args.layout,
                 q_smooth=args.qsmooth,
-                hadamard_rotation=args.hadamard_rotate,
+                hadamard_rotation=hadamard_rotation,
                 R=R,
                 block_lut=block_lut,
+                turboquant_rotation=turboquant_rotation,
+                turboquant_seed=turboquant_seed,
             )
 
     else:
@@ -126,6 +141,8 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
             R=R,
             BLOCK_R=BLOCK_R,
             q_smoothing=args.qsmooth,
+            turboquant_rotation=turboquant_rotation,
+            turboquant_seed=turboquant_seed,
         )
 
         if block_lut is not None:
@@ -553,6 +570,16 @@ def parse_args():
         default=True,
         help="whether to apply hadamard rotate (1) or not (0). Default 1.",
     )
+    parser.add_argument(
+        "--turboquant_rotation",
+        action="store_true",
+        help=(
+            "Use TurboQuant-style rotation (full head_dim×head_dim Gaussian QR) "
+            "instead of Hadamard. Mutually exclusive with -hadamard_rotate 1."
+        ),
+    )
+
+
 
     parser.add_argument(
         "-BLOCK_R",
@@ -661,7 +688,17 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
 def test_accuracy(q, k, v, args):
 
     BLOCK_R = args.BLOCK_R
-    R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+    use_tq = getattr(args, "turboquant_rotation", False)
+    if use_tq:
+        R = None
+        hadamard_rotation = False
+        turboquant_rotation = True
+        turboquant_seed = 1234
+    else:
+        R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (BLOCK_R**0.5)
+        hadamard_rotation = args.hadamard_rotate
+        turboquant_rotation = False
+        turboquant_seed = 1234
 
     triton_out = fav3_sage_mxfp4_wrapper(
         q,
@@ -670,8 +707,10 @@ def test_accuracy(q, k, v, args):
         causal=args.causal,
         layout=args.layout,
         q_smooth=args.qsmooth,
-        hadamard_rotation=args.hadamard_rotate,
+        hadamard_rotation=hadamard_rotation,
         R=R,
+        turboquant_rotation=turboquant_rotation,
+        turboquant_seed=turboquant_seed,
     )
     # permute because FAv2 assumes bshd
     if args.layout == "bhsd":
