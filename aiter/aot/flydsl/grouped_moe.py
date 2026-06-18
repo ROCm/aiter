@@ -9,8 +9,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 import time
+
+# Only when this module is run directly as the AOT compile driver do we hide
+# HIP devices and take aiter's AOT import path; importing it as a library must
+# not mutate the environment. __name__ is already "__main__" here, even though
+# this runs before the aiter imports below that read these variables.
+if __name__ == "__main__":
+    os.environ.setdefault("HIP_VISIBLE_DEVICES", "-1")
+    os.environ.setdefault("AITER_AOT_IMPORT", "1")
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
