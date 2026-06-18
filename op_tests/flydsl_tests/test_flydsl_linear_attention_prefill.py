@@ -38,6 +38,7 @@ try:
         chunk_gated_delta_rule_fwd_h_flydsl_vk_naive,
         chunk_gated_delta_rule_fwd_h_flydsl_kv_naive,
         chunk_gated_delta_rule_fwd_h_flydsl_naive,
+        chunk_gated_delta_rule_fwd_h_flydsl_naive_opt,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h_opt_vk,
@@ -909,6 +910,47 @@ class TestCorrectness:
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl_naive_opt(self, args: PrefillArgs):
+        """Naive-OPT fork: the naive kernel with the OPT-DGL w-load (direct
+        HBM->LDS buffer_load_lds + two-sided XOR swizzle) forced on. Same
+        public VK outputs / numerics as the naive fork; only the w staging
+        path differs (no ds_write / no VGPR staging for w)."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_naive_opt(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_naive_opt",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_correctness_flydsl_kv_naive(self, args: PrefillArgs):
         """Naive (un-pipelined) KV-fork FlyDSL K5 impl (same VWARP layout +
         coalesced KV h-store as flydsl_kv, all prefetch/pipeline scheduling
@@ -1250,6 +1292,17 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
+    def flydsl_naive_opt_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_naive_opt(
+            k=k,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
     def triton_vk_launch():
         chunk_gated_delta_rule_fwd_h_opt_vk(
             k=k,
@@ -1310,6 +1363,7 @@ def _run_perf_comparison(args: PrefillArgs):
     flydsl_vk_naive_launch()
     flydsl_kv_naive_launch()
     flydsl_naive_launch()
+    flydsl_naive_opt_launch()
     if _HAS_VLLM_K5:
         vllm_launch()
     torch.cuda.synchronize()
@@ -1320,6 +1374,7 @@ def _run_perf_comparison(args: PrefillArgs):
     us_fly_vk_naive = _bench_fn(flydsl_vk_naive_launch)
     us_fly_kv_naive = _bench_fn(flydsl_kv_naive_launch)
     us_fly_naive = _bench_fn(flydsl_naive_launch)
+    us_fly_naive_opt = _bench_fn(flydsl_naive_opt_launch)
     us_triton_vk = _bench_fn(triton_vk_launch)
     us_triton_origin_opt = _bench_fn(triton_origin_opt_launch)
     us_vllm = _bench_fn(vllm_launch) if _HAS_VLLM_K5 else float("nan")
@@ -1346,6 +1401,7 @@ def _run_perf_comparison(args: PrefillArgs):
             "FlyDSL_vkfork(us)": us_fly_vk,
             "FlyDSL_vknaive(us)": us_fly_vk_naive,
             "FlyDSL_naive(us)": us_fly_naive,
+            "FlyDSL_naive_opt(us)": us_fly_naive_opt,
             "Triton_vk(us)": us_triton_vk,
             "Triton_origin_opt(us)": us_triton_origin_opt,
             "vLLM_vk(us)": us_vllm,
@@ -1364,6 +1420,86 @@ class TestPerformance:
         _run_perf_comparison(args)
 
 
+_naive_opt_perf_results: list[dict] = []
+
+
+class TestNaiveOptPerformance:
+    """Focused A/B: naive vs naive_opt (DGL w-load) device kernel time.
+
+    Isolates the OPT-DGL w-load win by benching the two forks on identical
+    inputs. The DGL fork should not be slower than the naive fork; we assert
+    a small regression guard band and record the measured speedup for the
+    summary table printed at session teardown.
+    """
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_perf_naive_vs_naive_opt(self, args: PrefillArgs):
+        context_lens = args.resolve_context_lens()
+        k, _, _, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
+
+        def naive_launch():
+            chunk_gated_delta_rule_fwd_h_flydsl_naive(
+                k=k,
+                w=w_c,
+                u=u_c,
+                g=g,
+                initial_state=h0,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
+
+        def naive_opt_launch():
+            chunk_gated_delta_rule_fwd_h_flydsl_naive_opt(
+                k=k,
+                w=w_c,
+                u=u_c,
+                g=g,
+                initial_state=h0,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
+
+        naive_us = _bench_fn(naive_launch)
+        naive_opt_us = _bench_fn(naive_opt_launch)
+        speedup = naive_us / naive_opt_us if naive_opt_us > 0 else float("nan")
+
+        _naive_opt_perf_results.append(
+            {
+                "id": repr(args),
+                "naive_us": naive_us,
+                "naive_opt_us": naive_opt_us,
+                "speedup": speedup,
+            }
+        )
+
+        # Regression guard: DGL must not be materially slower than naive.
+        # Allow a 5% band for measurement noise on tiny shapes.
+        assert naive_opt_us <= naive_us * 1.05, (
+            f"naive_opt ({naive_opt_us:.1f} us) is slower than naive "
+            f"({naive_us:.1f} us) by more than 5% on {args!r}"
+        )
+
+
+def _print_naive_opt_perf_table():
+    if not _naive_opt_perf_results:
+        return
+    lines = [
+        "",
+        "=" * 78,
+        "naive vs naive_opt (DGL w-load) -- K5 device kernel time (us)",
+        "=" * 78,
+        f"{'shape':<44} {'naive':>9} {'naive_opt':>10} {'speedup':>8}",
+        "-" * 78,
+    ]
+    for r in _naive_opt_perf_results:
+        lines.append(
+            f"{r['id']:<44} {r['naive_us']:>9.1f} "
+            f"{r['naive_opt_us']:>10.1f} {r['speedup']:>7.2f}x"
+        )
+    lines.append("-" * 78)
+    print("\n".join(lines))
+
+
 def _print_perf_table():
     if not _perf_results:
         return
@@ -1379,6 +1515,7 @@ def _print_perf_table():
         ("fs", "final_st", 3),
         ("FlyDSL", "FlyDSL_vk(us)", 8),
         ("FlyDSL_n", "FlyDSL_naive(us)", 9),
+        ("FlyDSL_no", "FlyDSL_naive_opt(us)", 10),
         ("FlyDSL_kv", "FlyDSL_kv(us)", 9),
         ("FlyDSL_kvn", "FlyDSL_kvnaive(us)", 10),
         ("FlyDSL_vkf", "FlyDSL_vkfork(us)", 10),
@@ -1426,6 +1563,7 @@ def _print_summary_table(request):
     """Print the summary performance table after all tests finish."""
     yield
     _print_perf_table()
+    _print_naive_opt_perf_table()
 
 
 # -- bf16 SSM-state correctness ----------------------------------------

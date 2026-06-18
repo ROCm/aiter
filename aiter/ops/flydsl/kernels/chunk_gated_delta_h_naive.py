@@ -53,10 +53,19 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+    vector,
+)
 from flydsl.expr.typing import T
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -113,12 +122,19 @@ def compile_chunk_gated_delta_h_naive(
     WU_CONTIGUOUS: bool = True,
     STATE_DTYPE_BF16: bool = False,
     G_IS_LOG2_SCALED: bool = False,
+    W_DGL: bool | None = None,
 ):
     """Compile the NAIVE (un-pipelined) GDN K5 baseline-fork kernel.
 
     Returns a @flyc.jit function with the SAME signature as the baseline
     ``compile_chunk_gated_delta_h``. Produces identical numerical output;
     only the software-pipeline / prefetch scheduling is removed.
+
+    ``W_DGL`` selects the w-load path:
+      * None  -> read the FLYDSL_K5_W_DGL env flag (default off).
+      * False -> original buffer_load -> VGPR -> ds_write (+ swizzle).
+      * True  -> OPT-DGL direct HBM->LDS (buffer_load_lds) with two-sided
+                 XOR swizzle (used by the ``naive_opt`` fork).
     """
     assert K <= 256
     assert K % 64 == 0
@@ -168,13 +184,22 @@ def compile_chunk_gated_delta_h_naive(
     LDS_H_BYTES = LDS_H_ELEMS * 2
 
     # Bump revision so the FlyDSL JIT disk cache invalidates on change.
-    _K5_KERNEL_REVISION = 1  # naive baseline fork: no prefetch/pipeline
+    _K5_KERNEL_REVISION = 2  # + OPT-DGL w load (FLYDSL_K5_W_DGL, sol-3)
+
+    # Resolve the DGL w-load flag early: it tags the kernel name + smem
+    # symbol so the naive and naive_opt forks NEVER share a compiled module
+    # or LDS global (distinct binaries, no JIT cache collision).
+    if W_DGL is None:
+        W_DGL_ENABLED = os.environ.get("FLYDSL_K5_W_DGL", "0") == "1"
+    else:
+        W_DGL_ENABLED = bool(W_DGL)
+    _VARIANT_TAG = "_wdgl" if W_DGL_ENABLED else ""
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_naive_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_naive{_VARIANT_TAG}_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
@@ -191,7 +216,25 @@ def compile_chunk_gated_delta_h_naive(
     ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64  # 32
     NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64  # 2
 
-    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_naive")
+    # -- OPT-DGL: w direct HBM->LDS via buffer_load_lds (gfx950) ---------
+    # Load the FULL K row in one DMA (no kb split) so the DGL hardware-
+    # sequential LDS layout coincides with the contiguous row-major slot
+    # row*K + col. Bank conflicts are removed by a TWO-SIDED XOR swizzle:
+    # the DMA SOURCE column is swizzled (so slot row*K+swz(col) holds
+    # w[row,col]) and the GEMM1 read re-applies the same swz(col); since
+    # swz is self-inverse the two cancel and adjacent lanes scatter across
+    # LDS banks. This keeps DGL's win (no ds_write, no VGPR staging) while
+    # matching the original numerics. Measured ~-18% cycles vs the original
+    # buffer_load + ds_write path on varlen-32k-aws SeqLen1000. Toggle with
+    # FLYDSL_K5_W_DGL=1 (or the naive_opt fork) to A/B against the original.
+    # (W_DGL_ENABLED was resolved above so it can tag the kernel/smem names.)
+    # 16 threads tile a full K=128 row (K/LOAD_VEC_WIDTH); requires K % 8 == 0.
+    THREADS_PER_ROW_FULL = K // LOAD_VEC_WIDTH
+    ROWS_PER_BATCH_FULL = BLOCK_THREADS // THREADS_PER_ROW_FULL
+    NUM_LOAD_BATCHES_FULL = (BT + ROWS_PER_BATCH_FULL - 1) // ROWS_PER_BATCH_FULL
+    DGL_BYTES = LOAD_VEC_WIDTH * 2  # 16 B/lane (gfx950 supports 12/16 B DGL)
+
+    @flyc.kernel(name=f"chunk_gdn_fwd_h_flydsl_naive{_VARIANT_TAG}")
     def gdn_h_kernel(
         k_tensor: fx.Pointer,
         v_tensor: fx.Pointer,
@@ -255,6 +298,13 @@ def compile_chunk_gated_delta_h_naive(
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
         load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(LOAD_VEC_WIDTH)
 
+        # -- DGL (full-K) cooperative load decomposition --
+        # Each thread tiles 8 bf16 of a FULL K row; THREADS_PER_ROW_FULL
+        # threads cover one row's K columns, so a single DGL iteration lays
+        # down a contiguous [ROWS_PER_BATCH_FULL, K] tile = row-major.
+        dgl_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_FULL)
+        dgl_col_base = (tid % fx.Int32(THREADS_PER_ROW_FULL)) * fx.Int32(LOAD_VEC_WIDTH)
+
         # -- XOR swizzle: col ^ ((row & 7) << 3) at 8-element granularity --
         def _xor_swizzle(row, col):
             return col ^ ((row & fx.Int32(0x7)) << fx.Int32(3))
@@ -268,6 +318,15 @@ def compile_chunk_gated_delta_h_naive(
 
         def _lds_vec_read_w_bf16x8(elem_idx):
             return vector.load_op(v8bf16_type, lds_w_memref, [elem_idx])
+
+        # -- DGL destination base pointer for lds_w (!llvm.ptr<3>) --
+        # Absolute LDS byte address = whole-smem base + lds_w_offset.
+        def _dgl_lds_w_base_ptr():
+            base_idx = memref_dialect.extract_aligned_pointer_as_index(lds_base_ptr)
+            base_ptr0 = buffer_ops.create_llvm_ptr(base_idx, address_space=3)
+            return buffer_ops.get_element_ptr(
+                base_ptr0, static_byte_offset=int(lds_w_offset)
+            )
 
         # -- ds_read_b64_tr_b16 helper (gfx950) --
         v4bf16_type = T.vec(4, T.bf16)
@@ -416,21 +475,69 @@ def compile_chunk_gated_delta_h_naive(
             gpu.barrier()
 
             # ============================================================
-            # 2. Load w -> lds_w (inline, no prefetch; XOR swizzled)
+            # 2. Load w -> lds_w (inline, no prefetch)
             # ============================================================
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+            if const_expr(W_DGL_ENABLED):
+                # OPT-DGL: direct HBM->LDS, full-K row per DMA. LDS dest is
+                # wave-uniform; the hardware spreads the 64 lanes of each wave
+                # sequentially, so wave w lands at base + wid*WARP_SIZE*DGL_BYTES
+                # and lane L at +L*DGL_BYTES -> physical slot row*K + dgl_col_base.
+                # Two-sided XOR swizzle (sol "DGL + swizzle"): the SOURCE column
+                # is swizzled so slot (row*K + swz(col)) stores w[row, col]; the
+                # GEMM1 read then re-applies swz(col) and lands on the same slot,
+                # which spreads adjacent lanes across LDS banks (no ds_write needed,
+                # bank conflict eliminated). swz is self-inverse so this matches the
+                # non-DGL read path exactly.
+                lds_w_dma_ptr = _dgl_lds_w_base_ptr()
+                wave_byte = rocdl.readfirstlane(
+                    fx.Int64.ir_type,
+                    fx.Int64(fx.Index(wid) * fx.Index(WARP_SIZE * DGL_BYTES)),
+                )
+                lds_w_dma_ptr = buffer_ops.get_element_ptr(lds_w_dma_ptr, wave_byte)
+
+                for batch in range_constexpr(NUM_LOAD_BATCHES_FULL):
+                    row = fx.Int32(batch * ROWS_PER_BATCH_FULL) + dgl_row_in_batch
                     abs_row = i_t_i32 * fx.Int32(BT) + row
                     safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    w_g_off = (
-                        w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
+                    # SOURCE column swizzled so the contiguous DGL slot
+                    # (row*K + dgl_col_base) ends up holding w[row, swz(dgl_col_base)].
+                    src_col = _xor_swizzle(row, dgl_col_base)
+                    w_g_off = w_base + safe_row * stride_w + src_col
+                    w_g_byte = fx.Int32(w_g_off) * fx.Int32(2)
+
+                    if const_expr(batch > 0):
+                        lds_w_dma_ptr = buffer_ops.get_element_ptr(
+                            lds_w_dma_ptr,
+                            static_byte_offset=BLOCK_THREADS * DGL_BYTES,
+                        )
+                    rocdl.raw_ptr_buffer_load_lds(
+                        w_.rsrc,
+                        lds_w_dma_ptr,
+                        fx.Int32(DGL_BYTES),
+                        w_g_byte,
+                        fx.Int32(0),
+                        fx.Int32(0),
+                        fx.Int32(0),
                     )
-                    w_vec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
-                    col = fx.Int32(kb * 64) + load_col_base
-                    swz_col = _xor_swizzle(row, col)
-                    w_lds_off = row * fx.Int32(LDS_W_STRIDE) + swz_col
-                    lds_w.vec_store((fx.Index(w_lds_off),), w_vec, LOAD_VEC_WIDTH)
+            else:
+                # Original two-stage path: buffer_load -> VGPR -> ds_write
+                # with XOR swizzle (stride = K).
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                        row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                        abs_row = i_t_i32 * fx.Int32(BT) + row
+                        safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                        w_g_off = (
+                            w_base
+                            + safe_row * stride_w
+                            + fx.Int32(kb * 64)
+                            + load_col_base
+                        )
+                        w_vec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
+                        col = fx.Int32(kb * 64) + load_col_base
+                        swz_col = _xor_swizzle(row, col)
+                        w_lds_off = row * fx.Int32(LDS_W_STRIDE) + swz_col
+                        lds_w.vec_store((fx.Index(w_lds_off),), w_vec, LOAD_VEC_WIDTH)
 
             gpu.barrier()
 
@@ -468,6 +575,10 @@ def compile_chunk_gated_delta_h_naive(
                     w_lds_col_idx = fx.Index(
                         kb * 64 + ks * WMMA_K
                     ) + lane_m_base_idx * fx.Index(8)
+                    # Both paths apply the same XOR swizzle on the LDS read:
+                    #  - non-DGL: ds_write placed data at the swizzled slot;
+                    #  - DGL: the source column was swizzled, so the row-major
+                    #    slot row*K+swz(col) holds w[row,col] -> symmetric.
                     w_lds_col_idx = _xor_swizzle_idx(w_lds_row_idx, w_lds_col_idx)
                     w_lds_idx = w_lds_row_idx * fx.Index(LDS_W_STRIDE) + w_lds_col_idx
                     a_frag = _lds_vec_read_w_bf16x8(w_lds_idx)

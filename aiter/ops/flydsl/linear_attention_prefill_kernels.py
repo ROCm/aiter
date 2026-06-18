@@ -34,6 +34,9 @@ import flydsl.expr as fx
 from flydsl.runtime.device import get_rocm_arch
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
 from .kernels.chunk_gated_delta_h_naive import compile_chunk_gated_delta_h_naive
+from .kernels.chunk_gated_delta_h_naive_opt import (
+    compile_chunk_gated_delta_h_naive_opt,
+)
 from .kernels.chunk_gated_delta_h_kv import compile_chunk_gated_delta_h_kv
 from .kernels.chunk_gated_delta_h_vk import compile_chunk_gated_delta_h_vk
 from .kernels.chunk_gated_delta_h_vk_naive import (
@@ -855,6 +858,47 @@ def _get_or_compile_naive(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_naive_opt(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the NAIVE-OPT K5 kernel: the naive fork with the
+    OPT-DGL w-load (direct HBM->LDS via buffer_load_lds + two-sided XOR
+    swizzle) forced on. Same public VK h-layout / tiling / numerics as the
+    naive fork; only the w staging path differs."""
+    return compile_chunk_gated_delta_h_naive_opt(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
 def _resolve_state_dtype(initial_state, state_dtype):
     """Mirror the legacy state-dtype resolution. Cheap; runs every call."""
     if initial_state is not None:
@@ -876,6 +920,14 @@ def _resolve_state_dtype(initial_state, state_dtype):
     return resolved
 
 
+# Valid ``_fork`` selectors for ``chunk_gated_delta_rule_fwd_h_flydsl``. Each
+# maps to its own compiled kernel + cache namespace (see the dispatch in the
+# wrapper body). ``None`` (not listed here) means the baseline kernel.
+_K5_FORKS = frozenset(
+    {"kv", "vk", "kv_naive", "vk_naive", "naive", "naive_opt"}
+)
+
+
 def chunk_gated_delta_rule_fwd_h_flydsl(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -891,21 +943,26 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
-    _use_kv: bool = False,
-    _use_vk: bool = False,
-    _use_vk_naive: bool = False,
-    _use_kv_naive: bool = False,
-    _use_naive: bool = False,
+    _fork: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
-    ``_use_kv=True`` selects the separate KV-layout implementation (VWARP
-    16x16x16 + 3-wave + coalesced KV h-store). ``_use_vk=True`` selects the
-    separate VK-layout implementation (forked from the KV variant; same VWARP
-    16x16x16 + 3-wave kernel, distinct cache namespace). Both are only active
-    when the chosen BV is 64 (the VWARP gate); otherwise they fall back to the
-    baseline kernel. ``_use_kv`` and ``_use_vk`` are mutually exclusive. The
-    public h layout stays VK (a transposed view is returned).
+    ``_fork`` selects which compiled kernel implementation to run; it is an
+    internal routing knob set by the thin per-fork public wrappers
+    (``chunk_gated_delta_rule_fwd_h_flydsl_kv`` etc.), not part of the public
+    API. Valid values:
+
+      * ``None``        -> baseline kernel (``chunk_gated_delta_h.py``).
+      * ``"kv"``        -> KV fork (coalesced [..., K, V] h-store); BV==64 only.
+      * ``"vk"``        -> VK fork (public [..., V, K] layout); BV==64 only.
+      * ``"vk_naive"``  -> un-pipelined VK fork; BV==64 only.
+      * ``"kv_naive"``  -> un-pipelined KV fork; BV==64 only.
+      * ``"naive"``     -> un-pipelined baseline fork; any BV.
+
+    The ``kv``/``kv_naive`` forks store h in [..., K, V] (coalesced) and the
+    wrapper returns a transposed VK view; every other fork writes the public
+    VK layout ([..., V, K]) directly. Forks gated on BV==64 fall back to the
+    baseline kernel for other BV values.
 
     Signature is API-compatible with
     ``aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h.chunk_gated_delta_rule_fwd_h_opt_vk``:
@@ -1011,39 +1068,28 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         BT=BT,
     )
 
-    if (
-        int(bool(_use_kv))
-        + int(bool(_use_vk))
-        + int(bool(_use_vk_naive))
-        + int(bool(_use_kv_naive))
-        + int(bool(_use_naive))
-    ) > 1:
+    if _fork is not None and _fork not in _K5_FORKS:
         raise ValueError(
-            "FlyDSL K5: ``_use_kv`` / ``_use_vk`` / ``_use_vk_naive`` / "
-            "``_use_kv_naive`` / ``_use_naive`` are mutually exclusive; "
-            "pass at most one."
+            f"FlyDSL K5: unknown ``_fork`` {_fork!r}; expected one of "
+            f"{sorted(_K5_FORKS)} or None (baseline)."
         )
 
-    # OPT-KV / OPT-VK: pick the separate VWARP kernel only when BV==64 (the
-    # VWARP gate); otherwise the baseline kernel handles all configs. The KV
-    # forks store h in [..., K, V] (coalesced) and return a transposed VK
-    # view; the VK forks write the public VK layout ([..., V, K]) directly.
-    # The *_naive variants are the un-pipelined forks (same VWARP layout +
-    # same h-store, all prefetch/pipeline scheduling removed).
-    _kv_opt_active = bool(_use_kv) and (BV == 64)
-    _kv_naive_active = bool(_use_kv_naive) and (BV == 64)
-    # NOTE: ``_use_vk`` is intentionally routed to the BASELINE kernel
-    # (``chunk_gated_delta_h.py`` via ``_get_or_compile``) even at BV==64,
-    # instead of the separate VK fork (``chunk_gated_delta_h_vk.py``). The
-    # baseline already emits the public VK layout ([..., V, K]), identical to
-    # the VK fork's output, so this is output-equivalent. Set this back to
-    # ``bool(_use_vk) and (BV == 64)`` to re-enable the VK fork.
-    _vk_active = False
-    _vk_naive_active = bool(_use_vk_naive) and (BV == 64)
-    # NAIVE baseline fork: un-pipelined twin of the baseline kernel. Works at
-    # ANY BV (it is the baseline layout, NOT the BV==64-only VWARP fork) and
-    # emits the public VK h-layout, so it is NOT part of ``_kv_active``.
-    _naive_active = bool(_use_naive)
+    # Fork routing. Each fork maps to its OWN compiled kernel (distinct
+    # ``_get_or_compile*`` cache namespace) -- no shared flag dispatch:
+    #   * kv / kv_naive : separate VWARP kernels storing h coalesced as
+    #     [..., K, V]; gated on BV==64, else fall back to baseline.
+    #   * vk / vk_naive : separate VWARP kernels writing the public VK layout
+    #     [..., V, K] directly; gated on BV==64, else fall back to baseline.
+    #   * naive         : un-pipelined twin of the baseline kernel; ANY BV
+    #     (baseline layout, NOT the BV==64-only VWARP fork).
+    #   * None          : baseline kernel.
+    _vwarp_gate = BV == 64
+    _kv_opt_active = (_fork == "kv") and _vwarp_gate
+    _kv_naive_active = (_fork == "kv_naive") and _vwarp_gate
+    _vk_active = (_fork == "vk") and _vwarp_gate
+    _vk_naive_active = (_fork == "vk_naive") and _vwarp_gate
+    _naive_active = _fork == "naive"
+    _naive_opt_active = _fork == "naive_opt"
     # KV-class forks (h stored [..., K, V] -> host transposes to VK).
     _kv_active = _kv_opt_active or _kv_naive_active
     if _kv_opt_active:
@@ -1056,6 +1102,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         _compile_fn = _get_or_compile_vk_naive
     elif _naive_active:
         _compile_fn = _get_or_compile_naive
+    elif _naive_opt_active:
+        _compile_fn = _get_or_compile_naive_opt
     else:
         _compile_fn = _get_or_compile
     launch_fn = _compile_fn(
@@ -1204,7 +1252,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_kv(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
-        _use_kv=True,
+        _fork="kv",
     )
 
 
@@ -1244,7 +1292,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_vk(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
-        _use_vk=True,
+        _fork="vk",
     )
 
 
@@ -1284,7 +1332,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_vk_naive(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
-        _use_vk_naive=True,
+        _fork="vk_naive",
     )
 
 
@@ -1325,7 +1373,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
-        _use_kv_naive=True,
+        _fork="kv_naive",
     )
 
 
@@ -1365,5 +1413,45 @@ def chunk_gated_delta_rule_fwd_h_flydsl_naive(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
-        _use_naive=True,
+        _fork="naive",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_naive_opt(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """NAIVE-OPT K5 implementation: the naive fork with the OPT-DGL w-load
+    (direct HBM->LDS ``buffer_load_lds`` + two-sided XOR swizzle) forced on.
+    Same public VK h-layout / tiling / numerics as
+    ``chunk_gated_delta_rule_fwd_h_flydsl_naive``; only the w staging path
+    differs (no ds_write / no VGPR staging for w). Works at ANY BV."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="naive_opt",
     )
