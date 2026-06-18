@@ -183,14 +183,12 @@ Cross-axis flags:
 --show-kernel-name                            # include routed kernel name in single-shape output
 ```
 
-Real-model shapes are pre-extracted (no torchvision/diffusers needed at
-bench time). To add a new model, run `extract_conv_shapes.py` once and
-merge its JSON output into `model_shapes.json`:
-
-```bash
-python -m op_tests.op_benchmarks.triton.model_benchmarking_tool.extract_conv_shapes \
-    --model resnet50    # or sd35_vae / flux2_vae with --model-path
-```
+Real-model shapes are pre-extracted into `conv_shapes.json` (no
+torchvision/diffusers needed at bench time). Each conv layer's
+`(N, C, H, W, K, R, S, stride, pad, dilation)` was captured offline once per
+model via forward hooks, deduped, and frozen there. To add a new model, append
+a `"<ModelName>": {"conv2d": [...]}` entry to `conv_shapes.json` with the same
+shape-dict fields.
 
 Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`).
 
@@ -227,7 +225,7 @@ in `_triton_kernels/conv/conv_*.py` for the current process.
 aiter/ops/triton/conv/                Kernel library
   conv2d.py                           Public API + smart routing
   _launch.py                          Grid setup + _select_3x3_method
-  _prepack.py                         Weight/input repack caches (LRU)
+  _prepack.py                         Weight repack caches (LRU) + input packer
   _utils.py                           Shape math, tolerance model
   README.md, DESIGN.md
 
@@ -240,7 +238,5 @@ op_tests/triton_tests/conv/           Pytest unit tests (CI-collected; skipped o
 
 op_tests/op_benchmarks/triton/
   bench_conv2d.py                     Self-contained bench tool (single + sweep)
-  model_benchmarking_tool/
-    extract_conv_shapes.py            One-time offline shape extraction
-    model_shapes.json                 Pre-extracted conv shapes (resnet50, SD3.5, FLUX2)
+  conv_shapes.json                    Pre-extracted conv shapes (resnet50, SD3.5, FLUX2)
 ```

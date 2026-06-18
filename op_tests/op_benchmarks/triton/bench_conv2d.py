@@ -7,7 +7,7 @@ Two modes:
   Bench one shape and emit a single key=value result line. Useful for
   ad-hoc one-off measurements or scripting around a specific shape.
 - Sweep (no --N). Iterates either the built-in default shape list or the
-  conv2d shapes for a model in model_shapes.json (--model NAME), and
+  conv2d shapes for a model in conv_shapes.json (--model NAME), and
   prints three box-drawn tables at the end:
     1. LAYER-BY-LAYER BENCHMARK   (per-layer Tri vs Torch + correctness)
     2. MIOpen SOLVER SUMMARY      (only when --miopen-solvers is passed)
@@ -30,7 +30,8 @@ host every time — the real inference cost when the input layout changes per
 call).
 
 No model loading at runtime — model shapes come from the pre-extracted
-model_shapes.json (see extract_conv_shapes.py for how to regenerate it).
+conv_shapes.json: each conv layer's (N,C,H,W,K,R,S,stride,pad,dilation) was
+captured offline once per model via forward hooks, deduped, and frozen here.
 """
 
 import argparse
@@ -82,7 +83,7 @@ METHODS = {
 # _helpers.get_edge_case_shapes). These exercise degenerate paths (C=1,
 # dilation>1, asymmetric dims, stride>1, etc.) that real production
 # models don't hit. Used only when --smoke is passed; otherwise the sweep
-# defaults to a real model from model_shapes.json.
+# defaults to a real model from conv_shapes.json.
 EDGE_CASE_SHAPES = [
     # (N, C, H, W, K, R, S, stride, padding, dilation, desc)
     (1, 3, 7, 7, 8, 3, 3, (1, 1), (1, 1), (1, 1), "3x3 same padding"),
@@ -678,13 +679,12 @@ def _print_overall_perf_table(layers: list, has_any_repack: bool) -> None:
 
 _MODEL_SHAPES_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "model_benchmarking_tool",
-    "model_shapes.json",
+    "conv_shapes.json",
 )
 
 
 def _load_model_shapes(model_pattern: str) -> tuple[str, list]:
-    """Load conv2d shapes for a model from model_shapes.json.
+    """Load conv2d shapes for a model from conv_shapes.json.
 
     model_pattern: case-insensitive substring matched against model keys.
     Returns (matched_model_name, list of shape tuples in the same form as
@@ -747,7 +747,7 @@ def run_sweep(args) -> None:
             label = f":: {model} ({len(shapes)} layers)"
             if not args.model:
                 label += "  (default — pass --model X or --smoke to change)"
-            print(f"# Sweep source: model_shapes.json {label}")
+            print(f"# Sweep source: conv_shapes.json {label}")
         except (FileNotFoundError, ValueError) as e:
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)
@@ -880,7 +880,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="sweep mode: load conv2d shapes for this model from "
-        "model_shapes.json (case-insensitive substring match). If omitted, "
+        "conv_shapes.json (case-insensitive substring match). If omitted, "
         "defaults to resnet50 unless --smoke is passed.",
     )
     p.add_argument(
