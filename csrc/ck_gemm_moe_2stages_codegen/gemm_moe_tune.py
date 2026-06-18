@@ -3652,8 +3652,19 @@ class FmoeTuner(TunerCommon):
             _non_flydsl_best = _non_flydsl.sort_values("us").drop_duplicates(
                 ["stage", "block_m", "flat"], keep="first"
             )
-            profileDF = profileDF.sort_values("us").drop_duplicates(
-                ["stage", "block_m", "flat"], keep="first"
+            # Fused (_fp4/_fp8) stage1 kernels embed the inter-stage quant+sort;
+            # non-fused kernels get that cost added later (quant-fairness, ~L3829).
+            # Dedup fused and non-fused SEPARATELY per (stage, block_m, flat) so a
+            # marginally-faster RAW non-fused kernel cannot evict the fused kernel
+            # before the fairness penalty is applied (which would otherwise flip the
+            # final pick toward non-fused/CK).
+            profileDF["_is_fused"] = (
+                profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
+            )
+            profileDF = (
+                profileDF.sort_values("us")
+                .drop_duplicates(["stage", "block_m", "flat", "_is_fused"], keep="first")
+                .drop(columns=["_is_fused"])
             )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage", "flat"]
