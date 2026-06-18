@@ -353,18 +353,24 @@ def make_communicator(
 ) -> Communicator:
     """Construct the TP collective backend at the one branching point.
 
-    'iris' is production (gluon GPU-initiated CCL); 'torch' is the
-    torch.distributed reference/control. The caller (vLLM) stays backend-agnostic
-    and passes nothing; the backend is resolved here from ``AITER_COMMS_BACKEND``
-    (default 'iris'), so selecting the control is an aiter-side env, not a vLLM
-    concern. An explicit ``backend`` argument (used by the tests) overrides the env.
+    'iris' is the gluon GPU-initiated CCL; 'torch' is the torch.distributed
+    reference/control. The caller (vLLM) stays backend-agnostic and passes
+    nothing; the backend is then resolved from ``AITER_COMMS_BACKEND``. There is
+    NO default — if neither the ``backend`` argument (used by the tests) nor the
+    env var is set, this raises, so the backend is always an explicit choice.
 
-    Returns the communicator without raising on unavailability — the caller checks
-    ``.disabled`` (IrisCommunicator self-disables on unsupported arch / missing
-    iris / unsupported world size).
+    Returns the communicator without raising on *unavailability* — the caller
+    checks ``.disabled`` (IrisCommunicator self-disables on unsupported arch /
+    missing iris / unsupported world size). A missing or unknown backend is a
+    config error, not unavailability, and raises.
     """
     if backend is None:
-        backend = os.environ.get("AITER_COMMS_BACKEND", "iris")
+        backend = os.environ.get("AITER_COMMS_BACKEND")
+    if backend is None:
+        raise ValueError(
+            "AITER_COMMS_BACKEND is not set; specify the communicator backend "
+            "explicitly ('iris' or 'torch')"
+        )
     backend = backend.lower()
     logger.info("aiter make_communicator: backend=%s", backend)
     if backend == "iris":
