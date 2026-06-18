@@ -305,6 +305,7 @@ void mla_decode_stage1_asm_fwd(
             }else if(max_seqlen_q <= 4){
                 sub_Q = 64;
                 config_max_seqlen_q = 4;
+                args.s_MQA = gqa_ratio;
             }else if (max_seqlen_q > 4){
                 AITER_CHECK(false, __func__, ":only support fp8 mla decoding for qo_len <= 4");
             }
