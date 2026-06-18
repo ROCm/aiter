@@ -537,6 +537,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg(f"using grouped CSV config: {cfg_row}")
     tile_n = int(n_warp) * 64
     tile_k = 256
+    tile_m = 16
+    tile_k = 512
+    tile_n = 64
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
 
