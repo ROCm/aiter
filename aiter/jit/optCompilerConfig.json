@@ -1611,6 +1611,26 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_grouped_gemm_mxfp8": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/grouped_gemm_mxfp8/grouped_gemm_mxfp8.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-O3'",
+            "'-std=c++17'"
+        ],
+        "flags_extra_hip": [
+            "'-O3'",
+            "'-U__HIP_NO_HALF_OPERATORS__'",
+            "'-U__HIP_NO_HALF_CONVERSIONS__'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/grouped_gemm_mxfp8'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_causal_conv1d_fwd_split_qkv": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/causal_conv1d_fwd_split_qkv_pybind.cu'",
