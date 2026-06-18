@@ -2020,19 +2020,28 @@ namespace aiter {
             }
         };
 
+        // On gfx1250 the OOB guard replaces some async_load instructions with
+        // plain LDS zeroing (no async issued), so the number of in-flight async
+        // loads per stage is data-dependent (depends on m_oob), not the compile
+        // -time waitcnt constants. A partial asynccnt wait would then drain the
+        // wrong number of loads and read in-flight / stale LDS, producing
+        // non-deterministic NaNs. Drain all async loads (asynccnt 0) so the wait
+        // is correct regardless of how many were actually issued.
+        static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : x_load_waitcnt + residual_load_waitcnt;
+        static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : residual_load_waitcnt;
         auto wait_load_cnt = [&]() {
             if(threadIdx.x < x_async_load_threads) {
-                s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<x_load_waitcnt + residual_load_waitcnt>{});
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<x_async_wait>{});
             }
             else {
-                s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<residual_load_waitcnt>{});
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<r_async_wait>{});
             }
             __builtin_amdgcn_s_barrier();
             if(threadIdx.x < x_async_load_threads) {
-                s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<x_load_waitcnt + residual_load_waitcnt>{});
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<x_async_wait>{});
             }
             else {
-                s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<residual_load_waitcnt>{});
+                s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<r_async_wait>{});
             }
         };
 
