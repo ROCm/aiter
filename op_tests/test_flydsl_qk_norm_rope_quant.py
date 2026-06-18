@@ -403,8 +403,10 @@ def test_flydsl_qk_norm_rope_quant_kv_write():
     pos = torch.randint(0, max_pos - 1, (T,), dtype=torch.int64, device=device)
 
     # batch_id_per_token: valid tokens map to seqs round-robin; pad tail = -1.
-    bid = torch.full((T,), -1, dtype=torch.int64, device=device)
-    bid[:T_valid] = torch.arange(T_valid, device=device) // tok_per_seq
+    bid = torch.full((T,), -1, dtype=torch.int32, device=device)
+    bid[:T_valid] = (torch.arange(T_valid, device=device) // tok_per_seq).to(
+        torch.int32
+    )
     # random per-seq state slot (distinct so collisions don't mask bugs)
     state_slot = torch.randperm(num_slots, device=device)[:bs].to(torch.int32)
 
