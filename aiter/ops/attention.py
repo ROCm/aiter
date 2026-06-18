@@ -480,17 +480,15 @@ def pa_decode_bf16_asm(
     if out is None:
         out = torch.empty(Q.shape, dtype=torch.bfloat16, device=device)
 
-    def _scale_tensor(scale: Optional[torch.Tensor], multiplier: float = 1.0):
+    def _scale_tensor(scale: Optional[torch.Tensor]):
         # tensor-only: None means identity (1.0); anything else must be a tensor.
+        # Normalizes to a 1-element fp32 contiguous tensor on the right device.
         if scale is None:
-            return torch.tensor([multiplier], dtype=torch.float32, device=device)
+            return torch.tensor([1.0], dtype=torch.float32, device=device)
         assert isinstance(
             scale, torch.Tensor
         ), f"scale must be a torch.Tensor (or None), got {type(scale)}"
-        scale = scale.to(device=device, dtype=torch.float32).reshape(-1)[:1]
-        if multiplier != 1.0:
-            scale = scale * multiplier
-        return scale.contiguous()
+        return scale.to(device=device, dtype=torch.float32).reshape(-1)[:1].contiguous()
 
     q_scale = _scale_tensor(query_scale)
     # softmax_scale is passed BY VALUE (kernarg 0x60); the kernel applies it, so
