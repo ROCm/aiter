@@ -55,7 +55,7 @@ def fused_sage_quant_mxfp4(
         raise ValueError(f"Unknown tensor layout: {layout}")
 
     # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
-    sm_scale = head_dim ** -0.5
+    sm_scale = head_dim**-0.5
 
     q_fp4, q_scale, k_fp4, k_scale, delta_s = smooth_rotate_downcast_qk(
         q,
@@ -159,7 +159,7 @@ def sage_quant_mxfp4(
     # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
 
     if sm_scale is None:
-        sm_scale = head_dim ** -0.5
+        sm_scale = head_dim**-0.5
 
     # Capture un-rotated K mean before rotation_smooth_qk so we can build the
     # ring-attention LSE compensation in natural log units below.
@@ -322,7 +322,7 @@ def sage_quant(
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
     if sm_scale is None:
-        sm_scale = head_dim ** -0.5
+        sm_scale = head_dim**-0.5
 
     q_task_count = b * h_qo * Q_NUM_BLKS
     k_task_count = b * h_kv * K_NUM_BLKS
@@ -421,7 +421,7 @@ def rotation_smooth_qk(
             BLOCK_R is not None
         ), "if not passing R (hadamard matrix), BLOCK_R (size of the hadamard matrix) must be provided."
         R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
-            BLOCK_R ** 0.5
+            BLOCK_R**0.5
         )
     else:
         BLOCK_R = R.shape[-1]
@@ -560,7 +560,7 @@ def smooth_rotate_downcast_qk(
                 BLOCK_R is not None
             ), "if using hadamard rotation, BLOCK_R (size of the hadamard matrix) must be provided."
             R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
-                BLOCK_R ** 0.5
+                BLOCK_R**0.5
             )
         else:
             BLOCK_R = R.shape[-1]
@@ -756,7 +756,7 @@ def create_hadamard_matrix(block_size, device="cuda", dtype=torch.bfloat16):
 def create_random_hadamard_matrix(block_size, device="cuda", dtype=torch.float32):
     # 1. Generate the deterministic Hadamard matrix (H)
     H = create_hadamard_matrix(block_size, device=device, dtype=dtype) / (
-        block_size ** 0.5
+        block_size**0.5
     )
     # 2. Create the random diagonal matrix D (represented as a vector for efficiency)
     # This generates random +1 or -1 for each column

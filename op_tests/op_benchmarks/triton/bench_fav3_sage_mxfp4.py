@@ -95,7 +95,7 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
         )
     else:
         R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
-            BLOCK_R ** 0.5
+            BLOCK_R**0.5
         )
         hadamard_rotation = args.hadamard_rotate
         turboquant_rotation = False
@@ -214,7 +214,7 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
             q_ref, k_ref, v_ref = layout_preprocess(
                 q, k, v, layout=args.layout, target_layout="bshd"
             )
-            sm_scale = D_HEAD ** -0.5
+            sm_scale = D_HEAD**-0.5
 
             if ref_name == "fav2":
                 ref_out = fav2_forward_func(
@@ -699,7 +699,7 @@ def test_accuracy(q, k, v, args):
         turboquant_seed = 1234
     else:
         R = create_hadamard_matrix(BLOCK_R, device=q.device, dtype=q.dtype) / (
-            BLOCK_R ** 0.5
+            BLOCK_R**0.5
         )
         hadamard_rotation = args.hadamard_rotate
         turboquant_rotation = False
