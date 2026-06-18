@@ -1746,10 +1746,17 @@ def get_2stage_cfgs(
         _min_split_k = 2 if swiglu_mxfp4_bf16_cktile else 1
         _split_k = max(int(ksplit), _min_split_k)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        _stage1_n_pad_zeros = (
+            0
+            if swiglu_mxfp4_bf16_cktile
+            else intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1)
+        )
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
-                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                # Keep Swiglu bf16-cktile on full padded N (n_pad_zeros=0);
+                # generic ksplit paths retain the legacy n_pad_zeros formula.
+                n_pad_zeros=_stage1_n_pad_zeros,
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
                 split_k=_split_k,
