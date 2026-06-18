@@ -1032,5 +1032,180 @@ fmha_v3_fwd_mxfp4_sparse(at::Tensor& q,
     return {out};
 }
 
+// =====================================================================
+// DENSE (non-sparse) mxfp4 entry. Identical contract to
+// fmha_v3_fwd_mxfp4_sparse minus the LUT triple; routes to the dense
+// kernel fwd_hd128_mxfp4.co via aiter::fmha_fwd_v3_mxfp4.
+// =====================================================================
+std::vector<at::Tensor>
+fmha_v3_fwd_mxfp4(at::Tensor& q,
+                  const at::Tensor& k,
+                  const at::Tensor& v,
+                  const at::Tensor& q_descale,
+                  const at::Tensor& k_descale,
+                  const at::Tensor& v_descale,
+                  float softmax_scale,
+                  std::optional<at::Tensor> out_)
+{
+    auto is_byte = [](at::ScalarType d) {
+        return d == at::ScalarType::Char || d == at::ScalarType::Byte;
+    };
+    TORCH_CHECK(is_byte(q.dtype().toScalarType()) && is_byte(k.dtype().toScalarType()),
+                "fmha_v3_fwd_mxfp4: Q and K must be int8/uint8 (fp4-packed bytes).");
+    TORCH_CHECK(v.dtype() == at::ScalarType::Float8_e4m3fnuz ||
+                    v.dtype() == at::ScalarType::Float8_e4m3fn,
+                "fmha_v3_fwd_mxfp4: V must be fp8 (mxfp4 Q/K * fp8 V * bf16 out).");
+    TORCH_CHECK(is_byte(q_descale.dtype().toScalarType()) &&
+                    is_byte(k_descale.dtype().toScalarType()),
+                "fmha_v3_fwd_mxfp4: Q/K per-block E8M0 scales must be int8/uint8 byte tensors.");
+    TORCH_CHECK(v_descale.dtype() == torch::kFloat32,
+                "fmha_v3_fwd_mxfp4: V descale must be fp32 (per output channel).");
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(q_descale); CHECK_DEVICE(k_descale); CHECK_DEVICE(v_descale);
+
+    TORCH_CHECK(q.stride(-1) == 1, "Q must have contiguous last dimension");
+    TORCH_CHECK(k.stride(-1) == 1, "K must have contiguous last dimension");
+    TORCH_CHECK(v.stride(-1) == 1, "V must have contiguous last dimension");
+
+    const auto sz = q.sizes();
+    const int batch_size = sz[0];
+    const int seqlen_q = sz[1];
+    const int num_heads = sz[2];
+    const int head_size_q_packed = sz[3];
+    const int head_size_q_logical = head_size_q_packed * 2;
+    const int head_size_v = v.sizes()[3];
+    const int seqlen_k = k.size(1);
+    const int num_heads_k = k.size(2);
+
+    TORCH_CHECK(head_size_q_logical == ASM_SPARSE_HEAD_DIM &&
+                    head_size_v == ASM_SPARSE_HEAD_DIM,
+                "fmha_v3_fwd_mxfp4: only hd=", ASM_SPARSE_HEAD_DIM,
+                " is supported (got logical Qd=", head_size_q_logical,
+                " Vd=", head_size_v, ").");
+    TORCH_CHECK(num_heads % num_heads_k == 0,
+                "fmha_v3_fwd_mxfp4: HQ must be divisible by HK (got HQ=",
+                num_heads, " HK=", num_heads_k, ").");
+    const int gqa_ratio = num_heads / num_heads_k;
+    TORCH_CHECK((gqa_ratio & (gqa_ratio - 1)) == 0,
+                "fmha_v3_fwd_mxfp4: GQA ratio (HQ/HK) must be a power of 2 (got ",
+                gqa_ratio, ").");
+
+    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads,   head_size_q_packed);
+    CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_q_packed);
+    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
+
+    auto opts = q.options();
+    at::Tensor out;
+    if (out_.has_value())
+    {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == torch::kBFloat16, "fmha_v3_fwd_mxfp4: out must be bf16.");
+        CHECK_DEVICE(out);
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
+    }
+    else
+    {
+        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v},
+                           opts.dtype(torch::kBFloat16));
+    }
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    mha_fwd_sparse_args a{};
+    a.use_asm_v3       = true;
+    a.v3_api_check     = false;
+    a.how_v3_bf16_cvt  = 0;
+    a.data_type        = "mxfp4fp8bf16";
+    a.is_group_mode    = false;
+    a.bias_type        = 0;
+    a.has_lse          = false;
+    a.qscale_type      = 0;
+    a.has_sink         = false;
+
+    a.q_ptr            = q.data_ptr();
+    a.k_ptr            = k.data_ptr();
+    a.v_ptr            = v.data_ptr();
+    a.bias_ptr         = nullptr;
+    a.q_descale_ptr    = q_descale.data_ptr();
+    a.k_descale_ptr    = k_descale.data_ptr();
+    a.v_descale_ptr    = v_descale.data_ptr();
+    a.rand_val_ptr     = nullptr;
+    a.lse_ptr          = nullptr;
+    a.o_ptr            = out.data_ptr();
+
+    a.seqstart_q_ptr = nullptr;
+    a.seqstart_k_ptr = nullptr;
+    a.seqlen_q_ptr   = nullptr;
+    a.seqlen_k_ptr   = nullptr;
+    a.cu_seqlen_q_ptr = nullptr;
+    a.cu_seqlen_k_ptr = nullptr;
+    a.block_scale_seqstart_q_ptr = nullptr;
+    a.block_scale_seqstart_k_ptr = nullptr;
+    a.sink_ptr = nullptr;
+
+    a.seqlen_q       = seqlen_q;
+    a.seqlen_k       = seqlen_k;
+    a.batch          = batch_size;
+    a.max_seqlen_q   = seqlen_q;
+    a.hdim_q         = head_size_q_logical;
+    a.hdim_v         = head_size_v;
+    a.nhead_q        = num_heads;
+    a.nhead_k        = num_heads_k;
+    a.scale_s        = softmax_scale;
+    a.logits_soft_cap = 0.0f;
+
+    a.stride_q       = q.stride(1);
+    a.stride_k       = k.stride(1);
+    a.stride_v       = v.stride(1);
+    a.stride_bias    = 0;
+    a.stride_randval = 0;
+    a.stride_o       = out.stride(1);
+    a.nhead_stride_q = q.stride(2);
+    a.nhead_stride_k = k.stride(2);
+    a.nhead_stride_v = v.stride(2);
+    a.nhead_stride_bias = 0;
+    a.nhead_stride_randval = 0;
+    a.nhead_stride_lse = 0;
+    a.nhead_stride_o = out.stride(2);
+    a.nhead_stride_q_descale = 0;
+    a.nhead_stride_k_descale = 0;
+    a.nhead_stride_v_descale = 0;
+    a.batch_stride_q = q.stride(0);
+    a.batch_stride_k = k.stride(0);
+    a.batch_stride_v = v.stride(0);
+    a.batch_stride_bias = 0;
+    a.batch_stride_randval = 0;
+    a.batch_stride_lse = 0;
+    a.batch_stride_o = out.stride(0);
+    a.batch_stride_q_descale = 0;
+    a.batch_stride_k_descale = 0;
+    a.batch_stride_v_descale = 0;
+
+    a.window_size_left = -1;
+    a.window_size_right = -1;
+    a.sink_size = 0;
+    a.mask_type = 0;
+    a.min_seqlen_q = 0;
+    a.p_drop = 0.0f;
+    a.s_randval = false;
+    a.drop_seed_offset =
+        std::pair<const void*, const void*>{nullptr, nullptr};
+    a.block_scale_size_q = 128;
+    a.block_scale_size_kv = 128;
+
+    // No LUT for the dense path.
+    a.kv_block_indices_ptr = nullptr;
+    a.lut_start_ptr        = nullptr;
+    a.lut_count_ptr        = nullptr;
+
+    ck_tile::stream_config stream_config{stream};
+    float t = aiter::fmha_fwd_v3_mxfp4(a, stream_config);
+    TORCH_CHECK(t >= 0, "fmha_v3_fwd_mxfp4: dispatcher returned an error code "
+                        "(unsupported config or .co not found).");
+    return {out};
+}
+
 } // namespace torch_itfs
 } // namespace aiter

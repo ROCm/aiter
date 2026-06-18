@@ -24,6 +24,7 @@ from aiter.ops.mha import (
     flash_attn_i8fp8_sparse_pertensor_func,
     flash_attn_i8fp8_sparse_vfa_pertensor_func,
     flash_attn_mxfp4_sparse_pertensor_func,
+    flash_attn_mxfp4_pertensor_func,
     flash_attn_fp8_sparse_pertensor_func,
     flash_attn_fp8_sparse_vfa_pertensor_func,
 )
@@ -73,6 +74,7 @@ KernelName = Literal[
     "fav3_fp8",
     "aiter_fp8",
     "aiter_i8fp8",
+    "aiter_mxfp4",
     "aiter_bf16",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
@@ -86,6 +88,7 @@ ALL_KERNELS: List[str] = [
     "sage_mxfp4",
     "aiter_fp8",
     "aiter_i8fp8",
+    "aiter_mxfp4",
     "aiter_bf16",
 ]
 
@@ -95,6 +98,7 @@ FP8_CHECK_KERNELS = {
     "fav3_fp8",
     "aiter_fp8",
     "aiter_i8fp8",
+    "aiter_mxfp4",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
     "aiter_asm_sparse_fp8",
@@ -548,6 +552,98 @@ def make_asm_sparse_mxfp4_runner(
             kv_block_indices,
             lut_start,
             lut_count,
+            softmax_scale=softmax_scale,
+        )
+
+    return _run
+
+
+def make_dense_mxfp4_runner(
+    args: argparse.Namespace,
+    q_bshd: torch.Tensor,
+    k_bshd: torch.Tensor,
+    v_bshd: torch.Tensor,
+) -> Any:
+    """Runner factory for the hand-written dense mxfp4 Sage kernel.
+
+    Dense sibling of ``make_asm_sparse_mxfp4_runner`` (no block LUT). Uses the
+    same ``sage_quant_mxfp4`` contract (fp4-packed Q,K + fp8 V + E8M0 scales)
+    and dispatches through ``flash_attn_mxfp4_pertensor_func`` ->
+    ``aiter.ops.mha.fmha_v3_fwd_mxfp4`` -> .co launch
+    (fwd_hd128_mxfp4.co, kernel symbol
+    _ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E).
+
+    Like the sparse mxfp4 kernel, the dense kernarg blob has no slot for the
+    sage smoothing ``delta_s`` correction, so q_smoothing is disabled (affects
+    only accuracy reporting, not throughput).
+    """
+    if args.causal:
+        raise NotImplementedError(
+            "aiter_mxfp4 does not support causal masking yet."
+        )
+    if args.layout != "bshd":
+        raise ValueError("aiter_mxfp4 expects --layout=bshd inputs.")
+    if (
+        q_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+        or v_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+    ):
+        raise ValueError(
+            f"aiter_mxfp4 is hard-coded to hd={ASM_SPARSE_HEAD_DIM} "
+            f"(got Qd={q_bshd.shape[-1]}, Vd={v_bshd.shape[-1]})."
+        )
+
+    cfg = get_sage_fwd_configs_mxfp4()
+    fp8_type = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_type).max
+
+    block_r = args.block_r
+    if block_r > q_bshd.shape[-1]:
+        raise ValueError(
+            f"block_r ({block_r}) must be <= head dim ({q_bshd.shape[-1]})"
+        )
+    r = create_hadamard_matrix(block_r, device=q_bshd.device, dtype=q_bshd.dtype) / (
+        block_r**0.5
+    )
+
+    (
+        q_quant,
+        q_descale,
+        k_quant,
+        k_descale,
+        v_quant,
+        v_descale,
+        _delta_s,  # ignored: ASM kernel has no smoothing-bias slot
+    ) = sage_quant_mxfp4(
+        q_bshd,
+        k_bshd,
+        v_bshd,
+        fp8_type,
+        fp8_max,
+        BLKQ=cfg["BLOCK_M"],
+        BLKK=64,
+        layout=args.layout,
+        R=r,
+        BLOCK_R=block_r,
+        q_smoothing=False,
+    )
+
+    q_quant = q_quant.contiguous()
+    k_quant = k_quant.contiguous()
+    v_quant = v_quant.contiguous()
+    q_descale = q_descale.contiguous()
+    k_descale = k_descale.contiguous()
+    v_descale = v_descale.to(torch.float32).contiguous()
+
+    softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
+
+    def _run() -> torch.Tensor:
+        return flash_attn_mxfp4_pertensor_func(
+            q_quant,
+            k_quant,
+            v_quant,
+            q_descale,
+            k_descale,
+            v_descale,
             softmax_scale=softmax_scale,
         )
 
@@ -1268,6 +1364,9 @@ def make_kernel_runner(
             v_descale=v_descale,
         )
 
+    if args.kernel == "aiter_mxfp4":
+        return make_dense_mxfp4_runner(args, q_bshd, k_bshd, v_bshd)
+
     if args.kernel == "fav3_fp8":
         return make_fav3_fp8_runner(
             q_bshd,
@@ -1470,6 +1569,7 @@ def benchmark_single_case(
         "fav3_fp8",
         "aiter_fp8",
         "aiter_i8fp8",
+        "aiter_mxfp4",
         "sage_fp8",
         "sage_mxfp4",
         "aiter_asm_sparse",
@@ -1496,6 +1596,7 @@ def benchmark_single_case(
             "fav3_fp8",
             "aiter_fp8",
             "aiter_i8fp8",
+            "aiter_mxfp4",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
             "aiter_asm_sparse_fp8",
@@ -2069,6 +2170,7 @@ def parse_args() -> argparse.Namespace:
             "fav3_fp8",
             "aiter_fp8",
             "aiter_i8fp8",
+            "aiter_mxfp4",
             "aiter_bf16",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",

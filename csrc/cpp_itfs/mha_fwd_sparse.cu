@@ -31,6 +31,11 @@ static constexpr const char* kSparseMxfp4KernelName =
     "_ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E";
 static constexpr const char* kSparseMxfp4CoName =
     "fmha_v3_fwd/fwd_hd128_mxfp4_sparse.co";
+// DENSE mxfp4 sibling (no LUT; reads the 656-byte dense kernarg).
+static constexpr const char* kDenseMxfp4KernelName =
+    "_ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E";
+static constexpr const char* kDenseMxfp4CoName =
+    "fmha_v3_fwd/fwd_hd128_mxfp4.co";
 // fp8-quantized sibling (E4M3 Q/K/V). Same 704-byte kernarg layout and
 // same in_bpe=1 byte stride as the i8fp8 path, so init_sparse_v3_args is
 // reused unchanged; only the kernel symbol + .co name differ.
@@ -218,6 +223,60 @@ float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_conf
 
     fmha_fwd_v3_sparse_args args{};
     size_t arg_size = sizeof(args);
+    init_sparse_v3_args(args, a);
+
+    const int num_q_blocks = (a.seqlen_q + kSparseTileQ - 1) / kSparseTileQ;
+    const int gdx = num_q_blocks;
+    const int gdy = a.nhead_q;
+    const int gdz = a.batch;
+    const int bdx = kSparseBdx;
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr     = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
+                                 bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// DENSE (non-sparse) mxfp4 fmha. Same fp4-Q/K * fp8-V * bf16-out contract as the
+// mxfp4 sparse path, but the kernel walks all KV blocks sequentially (no LUT). It
+// reads the standard 656-byte dense kernarg, so we reuse init_sparse_v3_args (which
+// fills the dense 656-byte prefix) and copy only those bytes -- the trailing LUT
+// pointers are not part of the dense kernarg layout.
+float fmha_fwd_v3_mxfp4(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
+{
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_mxfp4: only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_mxfp4: unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must all be off)");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        kDenseMxfp4KernelName,
+        [&]() { return AiterAsmKernel(kDenseMxfp4KernelName, kDenseMxfp4CoName); });
+
+    fmha_fwd_v3_sparse_args args{};
+    // Dense kernarg = the 656-byte dense prefix only (no LUT tail).
+    size_t arg_size = sizeof(fmha_fwd_v3_args);
     init_sparse_v3_args(args, a);
 
     const int num_q_blocks = (a.seqlen_q + kSparseTileQ - 1) / kSparseTileQ;

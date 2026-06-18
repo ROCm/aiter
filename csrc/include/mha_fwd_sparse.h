@@ -72,6 +72,13 @@ float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
 // validate shapes (see asm_mha_fwd_sparse.cu::fmha_v3_fwd_mxfp4_sparse).
 float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 
+// DENSE (non-sparse) mxfp4 sibling. Same fp4-Q/K * fp8-V * bf16-out contract as
+// the mxfp4 sparse path, but the kernel (fwd_hd128_mxfp4.co, from
+// mi350_fmha_hd128_mxfp4.py) walks all KV blocks sequentially -- no LUT. It reads
+// the standard 656-byte dense kernarg, so the launcher reuses init_sparse_v3_args
+// (which fills the dense 656-byte prefix) and copies only those bytes.
+float fmha_fwd_v3_mxfp4(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
 // Sparse fp8 sibling. Same kernarg layout, different .co
 // (fwd_hd128_fp8_sparse.co) generated from
 // /workspace/mi350_fmha_hd128_fp8_sparse.py. Q/K/V are all fp8 (E4M3)
