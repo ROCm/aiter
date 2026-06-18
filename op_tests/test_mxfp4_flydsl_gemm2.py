@@ -4,11 +4,11 @@ import torch
 
 
 def test_port_module_imports_and_constants():
-    """?????????,?????????? Kimi ???"""
+    """Port module imports cleanly and exposes the compile fn + the Kimi constants."""
     from aiter.ops.flydsl.kernels import mxfp4_gemm2 as port
 
     assert callable(port.compile_gemm2_a4w4_port)
-    # gemm2 ?? K=512 (contraction = inter_dim),N_OUT = model_dim = 7168?
+    # gemm2 contraction K=512 (= inter_dim); N_OUT = model_dim = 7168.
     assert (port.NE, port.K, port.N_OUT) == (385, 512, 7168)
     # KIMI-default K-derived sizes via the *_for(512) helpers (byte-for-byte).
     assert port.K_HALF == port.k_half_for(512) == 256
@@ -33,7 +33,7 @@ def test_k_parametrized_helpers():
 
 
 def test_guard_rejects_bad_shape():
-    """D_INTER ?? 256 ?? -> fail-loud (e.g. 384/192)?"""
+    """D_INTER must be a multiple of 256 -> fail-loud (e.g. 384/192)."""
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _assert_supported
 
     with pytest.raises(NotImplementedError, match="256"):
@@ -85,7 +85,7 @@ def test_guard_accepts_non_kimi_hidden_ne():
 
 
 def test_guard_accepts_new_inter():
-    """??? inter_dim(768/2048, %256) ??? (D_INTER ??)?"""
+    """New inter_dim values (768/2048, multiples of 256) are accepted (parametrized D_INTER)."""
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _assert_supported
 
     for D_INTER in (256, 512, 768, 1024, 2048):
@@ -102,7 +102,7 @@ def test_guard_accepts_new_inter():
 
 
 def test_guard_rejects_bad_variant():
-    """?????????? fail-loud(atomic ??? BM16/32/64)?"""
+    """An unsupported variant fails loud (atomic only on BM16/32/64)."""
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _assert_supported
 
     with pytest.raises(NotImplementedError, match="variant"):
@@ -119,7 +119,7 @@ def test_guard_rejects_bad_variant():
 
 
 def test_guard_accepts_supported():
-    """Kimi/DSR ?? + ????????(?????)?"""
+    """Kimi/DSR shape + supported variant combos pass the guard."""
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _assert_supported
 
     supported = [
@@ -164,7 +164,7 @@ def _is_gfx950():
 
 _GFX950 = pytest.mark.skipif(
     not _is_gfx950(),
-    reason="flydsl gemm2 ?? gfx950 (mfma_scale_f32_16x16x128_f8f6f4)",
+    reason="flydsl gemm2 requires gfx950 (mfma_scale_f32_16x16x128_f8f6f4)",
 )
 
 

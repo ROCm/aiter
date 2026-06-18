@@ -5,9 +5,9 @@ For every (shape, token) it scans the buildable port variants -- BM x B-load x
 gemm2-epilog (enumerated by the self-contained `flyg_variants`) -- benchmarks each,
 drops numerically-broken ones (cosine gate vs the legacy ``flydsl_moe`` output),
 and records the fastest survivor. Output is a ``tuned_fmoe``-schema CSV whose rows
-are tagged ``_tag=mxfp4_guinterleave`` (the FlyDSL port; separate from the HIP
-mxfp4_moe backend) so ``fused_moe.get_2stage_cfgs`` prefers them when
-``w1.shuffle_kind == "mxfp4_guinterleave"``.
+are tagged ``_tag=mxfp4_moe`` (the FlyDSL a4w4 port) so
+``fused_moe.get_2stage_cfgs`` selects them when ``w1.shuffle_kind == "mxfp4_moe"``.
+(randomflow's HIP a4w4 backend, #3470, uses ``mxfp4_guinterleave`` instead.)
 
 The tunable knobs (all encoded in the kernelName the row selects):
   * BM / sort block  : 16 (inline_quant+atomic, decode) / 32 (atomic) / 128 (nonatomic, prefill)
@@ -168,7 +168,7 @@ def build_weights(shape, device, seed=0):
         w2_scale=e8m0_shuffle(w2_scale),
     )
     mx_w1 = shuffle_weight_a16w4(w1_qt, 16, True)
-    mx_w1.shuffle_kind = "mxfp4_guinterleave"
+    mx_w1.shuffle_kind = "mxfp4_moe"
     mx = dict(
         w1=mx_w1,
         w2=shuffle_weight_a16w4(w2_qt, 16, False),

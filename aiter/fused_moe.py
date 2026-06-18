@@ -1149,6 +1149,20 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         raise ValueError(f"bad mxfp4 g2 kernel name: {kname!r}")
     sk = m.group("sk")
     variant = m.group("variant")
+    atomic = variant == "ATOMIC"
+    # _MXFP4OUT / _CSHUFFLE are nonatomic-only epilogs: atomic accumulates straight
+    # into the (M, D_HIDDEN) output buffer, while these stage flat_out at max_sorted
+    # rows. The regex tolerates either suffix after ATOMIC, so reject the contradiction
+    # here -- a malformed CSV row like ..._ATOMIC_CSHUFFLE would size the buffer for
+    # atomic but run the nonatomic epilog, an out-of-bounds write.
+    mxfp4out = m.group("mxfp4out") == "MXFP4OUT"
+    cshuffle = m.group("cshuffle") == "CSHUFFLE"
+    if atomic and (mxfp4out or cshuffle):
+        bad = "MXFP4OUT" if mxfp4out else "CSHUFFLE"
+        raise ValueError(
+            f"illegal mxfp4 g2 kernel name {kname!r}: ATOMIC is incompatible with "
+            f"{bad} (nonatomic-only epilog)"
+        )
     return {
         "BM": int(m.group("bm")),
         "NE": int(m.group("ne")),
@@ -1157,12 +1171,12 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         "TOPK": int(m.group("topk")) if m.group("topk") else None,
         "splitk": sk is not None,
         "kSplitK": int(sk) if sk else 0,
-        "atomic": variant == "ATOMIC",
+        "atomic": atomic,
         "use_nt": m.group("nt") == "NT",  # non-temporal B load (atomic only)
         # _MXFP4OUT (nonatomic only): gemm2 stages flat_out as packed fp4+e8m0 and
         # scatter_reduce reads it back as mxfp4 (the mxfp4-intermediate path).
-        "mxfp4out": m.group("mxfp4out") == "MXFP4OUT",
-        "cshuffle": m.group("cshuffle") == "CSHUFFLE",
+        "mxfp4out": mxfp4out,
+        "cshuffle": cshuffle,
     }
 
 
@@ -1513,8 +1527,9 @@ def mxfp4_moe_run(
 
 @functools.lru_cache(maxsize=2048)
 def _mxfp4_scale_u8(scale):
-    """FlyDSL ? DLPack ?? fp4/e8m0 dtype code;????? uint8 view(? HIP
-    reinterpret_cast ????)??? uint8 / None ??????"""
+    """FlyDSL can't ingest fp4/e8m0 dtype codes via DLPack, so pass a uint8 view (the
+    same reinterpret_cast HIP does). Returns the uint8 view, or the input (already
+    uint8, or None) unchanged."""
     if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
         return scale.view(torch.uint8)
     return scale
@@ -1605,6 +1620,18 @@ def _mxfp4_moe_run(
     gemm2_backend = getattr(w2, "gemm2_backend", None) or (
         "flydsl" if _port_kind else None
     )
+    # The port runs only on the flydsl gemm engines. Fail loud with an actionable
+    # message if either stage resolves to flydsl but FlyDSL is not installed, rather
+    # than letting the bare `import aiter.ops.flydsl.mxfp4_gemm*_kernels` below raise a
+    # cryptic ImportError.
+    if (gemm1_backend == "flydsl" or gemm2_backend == "flydsl") and (
+        not is_flydsl_available()
+    ):
+        raise RuntimeError(
+            "mxfp4_moe FlyDSL port requested (shuffle_kind='mxfp4_moe' or "
+            "gemm{1,2}_backend='flydsl') but FlyDSL is not available. Install FlyDSL, "
+            "or use randomflow's HIP a4w4 backend (shuffle_kind='mxfp4_guinterleave')."
+        )
     # Real (unpadded) inter for a non-256-aligned shard (dsv4 TP8: 384). The weights
     # are zero-padded to D_INTER (next %256) so the gemm2 runs the proven layout, but
     # this lets it skip loading/MFMA-ing the pad-tail half-steps. Read before .view
@@ -1781,8 +1808,8 @@ def _mxfp4_moe_run(
     if gemm1_backend == "flydsl":
         from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
-        # FlyDSL ? DLPack ?? fp4/e8m0 dtype code;????? uint8 view(? HIP
-        # reinterpret_cast ????)?????? view,HIP ?????????
+        # FlyDSL can't ingest fp4/e8m0 dtype codes via DLPack, so pass a uint8 view (the
+        # same reinterpret_cast HIP does); the kernel reads the raw bytes either way.
         w1_scale_u8 = (
             w1_scale.view(torch.uint8)
             if (
@@ -1971,9 +1998,9 @@ def _mxfp4_moe_run(
     if gemm2_backend == "flydsl":
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
 
-        # FlyDSL ? DLPack ?? fp4/e8m0 dtype code;????? uint8 view(? HIP
-        # reinterpret_cast ????)?????? view,HIP ?????????
-        # ????? atomic (BM16/32/64) ? nonatomic bf16 (BM128) ?? epilog?
+        # FlyDSL can't ingest fp4/e8m0 dtype codes via DLPack, so pass a uint8 view (the
+        # same reinterpret_cast HIP does); the kernel reads the raw bytes either way.
+        # The epilog is atomic (BM16/32/64) or nonatomic bf16 (BM128).
         flydsl_mxfp4_gemm2(
             inter_sorted_quant=inter_sorted_quant,
             inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,

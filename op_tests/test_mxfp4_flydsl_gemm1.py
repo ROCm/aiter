@@ -4,7 +4,7 @@ import torch
 
 
 def test_port_module_imports_and_constants():
-    """?????????,??????????grid ? Kimi ???"""
+    """Port module imports cleanly and exposes the compile fn / grid + the Kimi constants."""
     from aiter.ops.flydsl.kernels import mxfp4_gemm1 as port
 
     assert callable(port.compile_gemm1_a4w4_port)
@@ -57,7 +57,7 @@ def test_guard_rejects_bad_inter():
 
 
 def test_guard_rejects_non_256_multiple_k():
-    """K (= D_HIDDEN) ?????,???? 256 ????"""
+    """K (= D_HIDDEN) must be a multiple of 256; otherwise the guard rejects it."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     with pytest.raises(NotImplementedError, match="256"):
@@ -73,7 +73,7 @@ def test_guard_rejects_non_256_multiple_k():
 
 
 def test_guard_accepts_parametrized_k():
-    """? 7168 ??? K (256 ???) ????? (?????)?"""
+    """Non-7168 K values that are multiples of 256 are accepted (parametrized K)."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     for H in (3072, 4096, 7168):
@@ -89,7 +89,7 @@ def test_guard_accepts_parametrized_k():
 
 
 def test_guard_rejects_bad_variant():
-    """?????????? fail-loud?"""
+    """An unsupported variant fails loud."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     with pytest.raises(NotImplementedError, match="variant"):
@@ -105,7 +105,7 @@ def test_guard_rejects_bad_variant():
 
 
 def test_guard_accepts_supported():
-    """Kimi ?? + ????????(?????)?"""
+    """Kimi shape + supported (BM, nt, inline_quant) combos pass the guard."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     for BM, nt, iq in [
@@ -139,7 +139,8 @@ def _is_gfx950():
 
 
 _GFX950 = pytest.mark.skipif(
-    not _is_gfx950(), reason="flydsl gemm1 ?? gfx950 (mfma_scale_f32_16x16x128_f8f6f4)"
+    not _is_gfx950(),
+    reason="flydsl gemm1 requires gfx950 (mfma_scale_f32_16x16x128_f8f6f4)",
 )
 
 
