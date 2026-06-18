@@ -184,8 +184,9 @@ def _find_grouped_config(
 
 
 def _use_grouped_gemm_enabled() -> bool:
-    """Runtime check for AITER_USE_GROUPED_GEMM so tests can toggle it."""
-    return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
+    env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
+    is_gfx1250 = get_gfx() == "gfx1250"
+    return env_enabled or is_gfx1250
 
 
 def _align_up(value: int, alignment: int) -> int:

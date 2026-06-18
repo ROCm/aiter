@@ -269,8 +269,11 @@ def _run_grouped_via_fused_moe(
     use_bias: bool = True,
     verify: bool = False,
     seed: int = 0,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Build mxfp4 weights + balanced routing, dispatch through ``fused_moe``.
+    bench: bool = False,
+    warmup: int = 5,
+    iters: int = 101,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[float]]:
+    """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
     ``layout`` selects the stage1 weight physical layout:
     ``gguu`` (gate rows then up rows, default) pairs with ``GateMode.SEPARATED``;
@@ -278,7 +281,9 @@ def _run_grouped_via_fused_moe(
     ``GateMode.INTERLEAVE``. The PyTorch reference always evaluates the
     GGUU logical weights, so both paths share the same numerical result.
 
-    Returns ``(grouped_out, ref_out_or_None)``.
+    When ``bench`` is set, the same ``fused_moe`` call is timed end-to-end via
+    ``run_perftest`` in CUDA-graph mode. Returns
+    ``(grouped_out, ref_out_or_None, bench_us_or_None)``.
     """
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
@@ -340,10 +345,8 @@ def _run_grouped_via_fused_moe(
         w1_arg = w1_grouped  # uint8 -> grouped helper sets q_dtype_a=fp8
         w2_arg = w2_grouped
 
-    saved = os.environ.get("AITER_USE_GROUPED_GEMM")
-    os.environ["AITER_USE_GROUPED_GEMM"] = "1"
-    try:
-        grouped_out = fused_moe(
+    def _call():  # the grouped path is auto-enabled on gfx1250
+        return fused_moe(
             hidden,
             w1_arg,
             w2_arg,
@@ -359,11 +362,8 @@ def _run_grouped_via_fused_moe(
             dtype=dtypes.bf16,
             swiglu_limit=swiglu_limit,
         )
-    finally:
-        if saved is None:
-            os.environ.pop("AITER_USE_GROUPED_GEMM", None)
-        else:
-            os.environ["AITER_USE_GROUPED_GEMM"] = saved
+
+    grouped_out = _call()
 
     ref = None
     if verify:
@@ -383,132 +383,14 @@ def _run_grouped_via_fused_moe(
             activation=activation,
             swiglu_limit=swiglu_limit,
         ).to(grouped_out.dtype)
-    return grouped_out, ref
 
+    us = None
+    if bench:
+        from aiter.test_common import run_perftest
 
-def _prepare_grouped_moe_case(
-    *,
-    experts: int,
-    tokens: int,
-    topk: int,
-    model_dim: int,
-    inter_dim: int,
-    data_format: str,
-    layout: str = "gguu",
-    activation: ActivationType = ActivationType.Swiglu,
-    swiglu_limit: float = 7.0,
-    use_bias: bool = True,
-    seed: int = 0,
-):
-    if data_format not in ("a4w4", "a8w4"):
-        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
-    if layout not in ("gguu", "gugu"):
-        raise ValueError(f"layout must be gguu or gugu, got {layout!r}")
-
-    K = model_dim
-    inter = inter_dim
-    K_pack = K // 2
-    inter_pack = inter // 2
-
-    # One global seed per case; every draw below uses the global RNG.
-    torch.manual_seed(seed)
-    w1_logical = _pattern_packed(experts, 2 * inter, K_pack)
-    w2_logical = _pattern_packed(experts, K, inter_pack)
-    # Varied weight scales so the n32k4 B-scale preshuffle layout is exercised.
-    w1_scale_raw = init_weight_scales(experts, 2 * inter, K // SCALE_BLOCK)
-    w2_scale_raw = init_weight_scales(experts, K, inter // SCALE_BLOCK)
-    if use_bias:
-        bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).to(torch.bfloat16)
-        bias2 = (torch.randn((experts, K)) * 1e-3).to(torch.bfloat16)
-    else:
-        bias1 = torch.zeros((experts, 2 * inter), dtype=torch.bfloat16)
-        bias2 = torch.zeros((experts, K), dtype=torch.bfloat16)
-    hidden = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
-
-    # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
-    topk_id, topk_w = _make_topk(hidden, experts, topk)
-    topk_w = topk_w.to(torch.bfloat16)
-
-    if layout == "gugu":
-        w1_phys = _gguu_to_gugu_rows(w1_logical)
-        w1_scale_phys = _gguu_to_gugu_rows(w1_scale_raw)
-        bias1_phys = _gguu_to_gugu_rows(bias1)
-        gate_mode = GateMode.INTERLEAVE
-    else:
-        w1_phys = w1_logical
-        w1_scale_phys = w1_scale_raw
-        bias1_phys = bias1
-        gate_mode = GateMode.SEPARATED
-
-    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
-    w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
-    w1_scale = shuffle_scale(
-        w1_scale_phys.contiguous(), experts_cnt=experts, is_n32k4=True
-    )
-    w2_scale = shuffle_scale(
-        w2_scale_raw.contiguous(), experts_cnt=experts, is_n32k4=True
-    )
-
-    if data_format == "a4w4":
-        w1_arg = w1_grouped.view(dtypes.fp4x2)
-        w2_arg = w2_grouped.view(dtypes.fp4x2)
-    else:
-        w1_arg = w1_grouped
-        w2_arg = w2_grouped
-
-    fused_bias1 = bias1_phys if use_bias else None
-    fused_bias2 = bias2 if use_bias else None
-    ref_bias1 = bias1.float()
-    ref_bias2 = bias2.float()
-
-    fused_case = {
-        "hidden_states": hidden,
-        "w1": w1_arg,
-        "w2": w2_arg,
-        "topk_weight": topk_w,
-        "topk_ids": topk_id,
-        "activation": activation,
-        "w1_scale": w1_scale,
-        "w2_scale": w2_scale,
-        "bias1": fused_bias1,
-        "bias2": fused_bias2,
-        "gate_mode": gate_mode.value,
-        "swiglu_limit": swiglu_limit,
-    }
-    ref_case = {
-        "hidden": fused_case["hidden_states"],
-        "w1_logical": w1_logical,
-        "w1_scale_raw": w1_scale_raw,
-        "bias1": ref_bias1,
-        "w2_logical": w2_logical,
-        "w2_scale_raw": w2_scale_raw,
-        "bias2": ref_bias2,
-        "topk_weight": fused_case["topk_weight"],
-        "topk_ids": fused_case["topk_ids"],
-        "data_format": data_format,
-        "activation": activation,
-        "swiglu_limit": swiglu_limit,
-    }
-    return fused_case, ref_case
-
-
-def _invoke_grouped_fused_moe(fused_case):
-    return fused_moe(
-        fused_case["hidden_states"],
-        fused_case["w1"],
-        fused_case["w2"],
-        fused_case["topk_weight"],
-        fused_case["topk_ids"],
-        activation=fused_case["activation"],
-        quant_type=QuantType.per_1x32,
-        w1_scale=fused_case["w1_scale"],
-        w2_scale=fused_case["w2_scale"],
-        bias1=fused_case["bias1"],
-        bias2=fused_case["bias2"],
-        gate_mode=fused_case["gate_mode"],
-        dtype=dtypes.bf16,
-        swiglu_limit=fused_case["swiglu_limit"],
-    )
+        torch.cuda.synchronize()
+        _, us = run_perftest(_call, num_warmup=warmup, num_iters=iters, testGraph=True)
+    return grouped_out, ref, us
 
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -564,8 +446,8 @@ def run_moe(
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
     tag = f"{data_format} {layout} {act}"
 
-    # --- correctness: grouped FlyDSL vs PyTorch fp32 ref ---
-    out, ref = _run_grouped_via_fused_moe(
+    # --- correctness (+ optional bench): grouped FlyDSL vs PyTorch fp32 ref ---
+    out, ref, us = _run_grouped_via_fused_moe(
         experts=experts,
         tokens=tokens,
         topk=topk,
@@ -577,6 +459,9 @@ def run_moe(
         swiglu_limit=swiglu_limit,
         use_bias=use_bias,
         verify=True,
+        bench=bench,
+        warmup=warmup,
+        iters=iters,
     )
     rel = _rel_l2(out, ref)
     ld = _logits_diff(out, ref)
@@ -600,30 +485,8 @@ def run_moe(
         "ref_norm": float(ref.float().norm()),
     }
 
-    # --- perf (bench only): time fused_moe end-to-end from a HIP/CUDA graph ---
+    # --- perf (bench only): timed end-to-end inside _run_grouped_via_fused_moe ---
     if bench:
-        from aiter.test_common import run_perftest
-
-        fused_case, _ = _prepare_grouped_moe_case(
-            experts=experts,
-            tokens=tokens,
-            topk=topk,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            data_format=data_format,
-            layout=layout,
-            activation=activation,
-            swiglu_limit=swiglu_limit,
-            use_bias=use_bias,
-        )
-        _invoke_grouped_fused_moe(fused_case)  # warmup / JIT
-        torch.cuda.synchronize()
-        _, us = run_perftest(
-            lambda: _invoke_grouped_fused_moe(fused_case),
-            num_warmup=warmup,
-            num_iters=iters,
-            testGraph=True,
-        )
         print(
             f"[bench {tag}] fused_moe end-to-end us = {us:.2f} (graph=True)",
             flush=True,
@@ -677,7 +540,7 @@ def _mock_grouped_gemm() -> None:
     q.per_1x32_f4_quant_hip = q.per_1x32_f4_quant_triton
 
 
-def _summarize_accuracy(rows: list):
+def summarize(rows: list):
     """Build a precision summary table from per-case metrics and print it.
 
     Mirrors the pandas DataFrame reporting in op_tests/test_moe_2stage.py.
@@ -803,26 +666,27 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
         )
-        if args.scenario == "verify":
-            rows.append(
-                {
-                    "data_format": args.data_format,
-                    "layout": args.layout,
-                    "act": args.act,
-                    "experts": args.experts,
-                    "tokens": _tok,
-                    "topk": args.topk,
-                    "model_dim": args.model_dim,
-                    "inter_dim": args.inter_dim,
-                    "logits_diff": metrics["logits_diff"],
-                    "rel_l2": metrics["rel_l2"],
-                    "pass": metrics["passed"],
-                }
-            )
+        rows.append(
+            {
+                "data_format": args.data_format,
+                "layout": args.layout,
+                "act": args.act,
+                "experts": args.experts,
+                "tokens": _tok,
+                "topk": args.topk,
+                "model_dim": args.model_dim,
+                "inter_dim": args.inter_dim,
+                "logits_diff": metrics["logits_diff"],
+                "rel_l2": metrics["rel_l2"],
+                "pass": metrics["passed"],
+                "us": metrics.get("us"),
+            }
+        )
 
+    # Always print the summary table (verify and bench).
+    summarize(rows)
+    # Preserve CI semantics: non-zero exit if any verify case missed the gate.
     if args.scenario == "verify":
-        _summarize_accuracy(rows)
-        # Preserve CI semantics: non-zero exit if any case missed the gate.
         failed = [r for r in rows if not r["pass"]]
         if failed:
             raise SystemExit(
