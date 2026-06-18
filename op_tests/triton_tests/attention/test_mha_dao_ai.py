@@ -67,6 +67,18 @@ def dao_ai_impl():
         # GQA (num_q_heads != num_k_heads) combined with sliding-window backward
         (2, 128, 128, 16, 4, 64, True, False, True, (32, 0)),  # GQA causal window
         (2, 128, 128, 16, 4, 64, False, True, True, (16, 16)),  # GQA symmetric varlen
+        # Production-size sequence lengths (beyond the upstream 2048 cap) with
+        # large windows (128/256). seqlen >> window means the window spans many
+        # key blocks, exercising the bwd full/partial/skipped block
+        # classification that the small (seqlen 128, window 16/32) cases barely
+        # reach.
+        (1, 4096, 4096, 8, 8, 64, True, False, True, (256, 0)),  # large causal window
+        (1, 4096, 4096, 8, 8, 64, True, True, True, (256, 0)),  # large causal varlen
+        (1, 4096, 4096, 8, 8, 64, False, False, True, (256, 256)),  # large symmetric
+        (2, 4096, 4096, 16, 4, 64, True, False, True, (128, 0)),  # GQA large causal
+        # seqlen_q != seqlen_k at production size exercises the causal_offset /
+        # delta_qk arithmetic with a window spanning many blocks.
+        (1, 4096, 8192, 8, 8, 64, True, False, True, (256, 0)),  # large causal sq != sk
     ],
 )
 def test_mha_dao_ai(

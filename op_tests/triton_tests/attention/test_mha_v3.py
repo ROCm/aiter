@@ -930,6 +930,75 @@ def test_mha_backward_fp8(
         assert_cosine_similarity(tri, ref)
 
 
+@pytest.mark.parametrize(
+    "CAUSAL, WINDOW_SIZE",
+    [
+        (True, (64, 0)),  # causal sliding window
+        (False, (64, 64)),  # non-causal symmetric window
+        (False, (-1, 64)),  # non-causal infinite-left window
+    ],
+)
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(512, 512), (512, 1024)])
+def test_mha_backward_fp8_sliding_window(
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    CAUSAL: bool,
+    WINDOW_SIZE: tuple,
+    dtype=torch.float16,
+):
+    """FP8 backward combined with sliding-window attention.
+
+    test_mha_backward_fp8 exercises the FP8 bwd without a window; this pins the
+    window x IS_FP8 interaction in the bwd kernels (the per-element mask is
+    applied to P before the FP8 dP/dS compute). Checks out/dq/dk/dv against the
+    FP8 PyTorch reference with the same window, including seqlen_q != seqlen_k.
+    """
+    if not _supports_fp8:
+        pytest.skip(f"FP8 not supported on {_arch}")
+
+    BATCH = 2
+    NUM_Q_HEADS = 16
+    NUM_K_HEADS = 8  # GQA
+    HEAD_SZ = 128
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    v = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+    do = torch.randn_like(q)
+
+    with torch.enable_grad():
+        triton_out = flash_attn_fp8_func(
+            q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE
+        )
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+        triton_out, (q, k, v), do.clone()
+    )
+
+    torch_out, torch_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
+        q,
+        k,
+        v,
+        do,
+        is_fp8=True,
+        causal=CAUSAL,
+        window_size=WINDOW_SIZE,
+    )
+    torch_dq, torch_dk, torch_dv = torch_grads
+
+    triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
+    ref_vals = [torch_out, torch_dq, torch_dk, torch_dv]
+    tols = [fwd_tol] + bwd_tols
+    for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+        assert_cosine_similarity(tri, ref)
+
+
 @pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
 @pytest.mark.parametrize("SEQLEN_K", [512, 2048])
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
@@ -1062,8 +1131,76 @@ def test_mha_v3_sliding_window_bwd(
     the PyTorch reference for causal, symmetric, and infinite-left windows, across
     equal/unequal seqlens and GQA, dense and varlen.
     """
-    BATCH = 2
-    HEAD_SZ = 64
+    _check_sliding_window_bwd(
+        CAUSAL,
+        WINDOW_SIZE,
+        SEQLEN_Q,
+        SEQLEN_K,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        VARLEN,
+        dtype,
+    )
+
+
+@pytest.mark.parametrize("VARLEN", [False, True])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, CAUSAL, WINDOW_SIZE",
+    [
+        # Production-size sequence lengths (beyond the upstream 2048 cap) paired
+        # with large windows (128/256). seqlen >> window means the window spans
+        # many key blocks, so the bwd full/partial/skipped block classification
+        # is exercised across many blocks -- the small (seqlen 128, window 16/32)
+        # cases above barely span more than one block.
+        (4096, 4096, 8, 8, True, (256, 0)),  # large causal window
+        (4096, 4096, 16, 4, False, (128, 128)),  # GQA large symmetric window
+        (8192, 8192, 8, 8, True, (256, 0)),  # larger causal window
+        (4096, 8192, 8, 8, True, (256, 0)),  # large causal, seqlen_q != seqlen_k
+    ],
+)
+def test_mha_v3_sliding_window_bwd_large(
+    CAUSAL: bool,
+    WINDOW_SIZE: tuple,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    VARLEN: bool,
+):
+    """Production-size FA3 sliding-window backward.
+
+    Same checks as ``test_mha_v3_sliding_window_bwd`` but at sequence lengths past
+    the upstream 2048 ceiling and with 128/256-wide windows. fp16 only: the fp32
+    reference materializes full [batch, heads, seqlen_q, seqlen_k] scores, so the
+    cross-product with fp32 would be needlessly heavy without adding coverage the
+    smaller fp32 matrix doesn't already give.
+    """
+    _check_sliding_window_bwd(
+        CAUSAL,
+        WINDOW_SIZE,
+        SEQLEN_Q,
+        SEQLEN_K,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        VARLEN,
+        torch.float16,
+    )
+
+
+def _check_sliding_window_bwd(
+    CAUSAL: bool,
+    WINDOW_SIZE: tuple,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    VARLEN: bool,
+    dtype: torch.dtype,
+    BATCH: int = 2,
+    HEAD_SZ: int = 64,
+):
+    """Run one FA3 sliding-window backward and check out/dq/dk/dv vs the PyTorch
+    reference. Shared by the small-matrix and production-size tests above."""
     # fp16 is limited by its ~1e-3 round-trip; fp32 is accumulated in fp32 end to
     # end (observed max abs error < 4e-6 across these configs), so it gets a much
     # tighter check.
