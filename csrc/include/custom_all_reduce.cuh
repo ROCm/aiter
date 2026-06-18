@@ -4576,7 +4576,7 @@ void dispatchFusedQKNormAllReduce(hipStream_t stream,
 }
 
 template <typename T>
-void dispatchAllReduceMhcPostLargeM(hipStream_t stream,
+void dispatchAllReduceMhcPost1Stage(hipStream_t stream,
                                     T* input,
                                     T* next_residual,
                                     T* residual,
@@ -4602,7 +4602,7 @@ void dispatchAllReduceMhcPostLargeM(hipStream_t stream,
         throw std::runtime_error("AR+MHC post epilogue hidden dim too large for two-way CTA");
     }
 
-    RankData* ptrs = get_buffer_RD(stream, input);
+    RankData* ptrs        = get_buffer_RD(stream, input);
     const bool use_two_way = m >= 8192;
     dim3 block(use_two_way ? n_packs * 2 : n_packs);
     dim3 grid(std::min(m, kMaxBlocks));
@@ -4633,6 +4633,59 @@ void dispatchAllReduceMhcPostLargeM(hipStream_t stream,
     }
 #undef DISPATCH_AR_MHC_POST_IMPL
 #undef DISPATCH_AR_MHC_POST
+}
+
+template <typename T>
+void dispatchAllReduceMhcPostLargeM(hipStream_t stream,
+                                    T* input,
+                                    T* next_residual,
+                                    T* residual,
+                                    float* post_layer_mix,
+                                    float* comb_res_mix,
+                                    int m,
+                                    int input_hidden_dim,
+                                    int hidden_size,
+                                    int residual_stride)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    if(input_hidden_dim != hidden_size)
+    {
+        throw std::runtime_error("AR+MHC post epilogue requires full hidden input");
+    }
+    if(hidden_size % pack_size != 0 || residual_stride % pack_size != 0)
+    {
+        throw std::runtime_error("AR+MHC post epilogue requires pack-aligned hidden/stride");
+    }
+
+    const int64_t size_bytes = (int64_t)m * input_hidden_dim * sizeof(T);
+    // Same 512 KiB budget as fused AR+RMSNorm: TP>=4 large tensors use
+    // reduce-scatter + local epilogue instead of 1-stage row-wise IPC reduce.
+    constexpr int64_t kSplitMinBytes = 512 * 1024;
+    if(world_size_ >= 4 && size_bytes > kSplitMinBytes)
+    {
+        dispatchAllReduceMhcPostSplit<T>(stream,
+                                         input,
+                                         next_residual,
+                                         residual,
+                                         post_layer_mix,
+                                         comb_res_mix,
+                                         m,
+                                         input_hidden_dim,
+                                         hidden_size,
+                                         residual_stride);
+        return;
+    }
+
+    dispatchAllReduceMhcPost1Stage<T>(stream,
+                                      input,
+                                      next_residual,
+                                      residual,
+                                      post_layer_mix,
+                                      comb_res_mix,
+                                      m,
+                                      input_hidden_dim,
+                                      hidden_size,
+                                      residual_stride);
 }
 
 template <typename T>

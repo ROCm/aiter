@@ -227,6 +227,21 @@ def fused_allreduce_mhc_post_only(
 
 
 @compile_ops(FUSED_AR_MHC_MD_NAME)
+def fused_allreduce_mhc_post_one_stage(
+    _fa: int,
+    inp: torch.Tensor,
+    next_residual: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
+) -> None: ...
+
+
+@compile_ops(FUSED_AR_MHC_MD_NAME)
 def fused_allreduce_mhc_post_split(
     _fa: int,
     inp: torch.Tensor,

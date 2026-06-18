@@ -113,6 +113,36 @@ void run_ar_mhc_post_split(CustomAllreduce* fa,
                                          residual_stride);
 }
 
+template <typename T>
+void run_ar_mhc_post_1stage(CustomAllreduce* fa,
+                            hipStream_t stream,
+                            T* inp_ptr,
+                            T* next_residual_ptr,
+                            T* residual_ptr,
+                            float* post_layer_mix_ptr,
+                            float* comb_res_mix_ptr,
+                            int m,
+                            int input_n,
+                            int hidden_size,
+                            int residual_stride,
+                            int64_t reg_ptr,
+                            int64_t reg_bytes)
+{
+    void* actual_inp = inp_ptr;
+    if(reg_ptr != 0)
+        actual_inp = (void*)reg_ptr;
+    fa->dispatchAllReduceMhcPost1Stage<T>(stream,
+                                          reinterpret_cast<T*>(actual_inp),
+                                          next_residual_ptr,
+                                          residual_ptr,
+                                          post_layer_mix_ptr,
+                                          comb_res_mix_ptr,
+                                          m,
+                                          input_n,
+                                          hidden_size,
+                                          residual_stride);
+}
+
 } // namespace
 
 void fused_allreduce_mhc_post_only(fptr_t _fa,
@@ -178,6 +208,72 @@ void fused_allreduce_mhc_post_only(fptr_t _fa,
     }
     default:
         throw std::runtime_error("fused AR+MHC post only supports fp16/bf16 activations");
+    }
+}
+
+void fused_allreduce_mhc_post_one_stage(fptr_t _fa,
+                                        torch::Tensor& inp,
+                                        torch::Tensor& next_residual,
+                                        torch::Tensor& residual_in,
+                                        torch::Tensor& post_layer_mix,
+                                        torch::Tensor& comb_res_mix,
+                                        bool use_new,
+                                        bool open_fp8_quant,
+                                        int64_t reg_ptr,
+                                        int64_t reg_bytes)
+{
+    (void)use_new;
+    (void)open_fp8_quant;
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<CustomAllreduce*>(_fa);
+    auto inp_at        = make_aiter_tensor(inp);
+
+    const int m       = static_cast<int>(inp_at.numel() / inp_at.size(-1));
+    const int input_n = static_cast<int>(inp_at.size(-1));
+    const int hidden  = static_cast<int>(residual_in.size(-1));
+    const int stride  = static_cast<int>(residual_in.stride(0));
+
+    copy_input_to_registered_buffer(inp_at, m, input_n, stream, reg_ptr, reg_bytes);
+
+    switch(inp.scalar_type())
+    {
+    case at::ScalarType::BFloat16: {
+        run_ar_mhc_post_1stage<opus::bf16_t>(
+            fa,
+            stream,
+            reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(next_residual.data_ptr()),
+            reinterpret_cast<opus::bf16_t*>(residual_in.data_ptr()),
+            reinterpret_cast<float*>(post_layer_mix.data_ptr()),
+            reinterpret_cast<float*>(comb_res_mix.data_ptr()),
+            m,
+            input_n,
+            hidden,
+            stride,
+            reg_ptr,
+            reg_bytes);
+        break;
+    }
+    case at::ScalarType::Half: {
+        run_ar_mhc_post_1stage<opus::fp16_t>(
+            fa,
+            stream,
+            reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(next_residual.data_ptr()),
+            reinterpret_cast<opus::fp16_t*>(residual_in.data_ptr()),
+            reinterpret_cast<float*>(post_layer_mix.data_ptr()),
+            reinterpret_cast<float*>(comb_res_mix.data_ptr()),
+            m,
+            input_n,
+            hidden,
+            stride,
+            reg_ptr,
+            reg_bytes);
+        break;
+    }
+    default:
+        throw std::runtime_error("fused AR+MHC post one-stage supports fp16/bf16 activations");
     }
 }
 

@@ -21,6 +21,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("open_fp8_quant") = false,
           py::arg("reg_ptr") = static_cast<int64_t>(0),
           py::arg("reg_bytes") = static_cast<int64_t>(0));
+    m.def("fused_allreduce_mhc_post_one_stage",
+          &aiter::fused_allreduce_mhc_post_one_stage,
+          py::arg("_fa"),
+          py::arg("inp"),
+          py::arg("next_residual"),
+          py::arg("residual_in"),
+          py::arg("post_layer_mix"),
+          py::arg("comb_res_mix"),
+          py::arg("use_new") = true,
+          py::arg("open_fp8_quant") = false,
+          py::arg("reg_ptr") = static_cast<int64_t>(0),
+          py::arg("reg_bytes") = static_cast<int64_t>(0));
     m.def("fused_allreduce_mhc_post_split",
           &aiter::fused_allreduce_mhc_post_split,
           py::arg("_fa"),
