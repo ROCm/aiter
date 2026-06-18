@@ -18,15 +18,22 @@ using namespace hk_mla;
 // boundary-checked prefetch). Comment out to fall back to the full ladder.
 #define MLA_SLIM_DISPATCH 1
 
+enum class WarpType : uint8_t
+{
+    EvenNoPEWarp,
+    OddNoPEWarp,
+    OddRoPEWarp
+};
+
 // V4.0 mi35x m16x8 decode kernel: separate FP8 NOPE + BF16 ROPE buffers for
 // both Q and KV. End-to-end body (Phases 4a..4g) in place: prologue (Q load +
 // first KV tile) -> per-warp dispatch ladder over mla_main (QK GEMM + softmax
 // + PV GEMM + epilogue, with online-softmax rescale across K-tile iters).
 #if defined(__gfx950__)
-template <typename T>
-__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgpu_num_vgpr(
-    64))) void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T>
-                                                                          params)
+template <WarpType kWarpType, typename T>
+__device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV40DecodeFwdParams<T>
+                                                                          params,
+                                                                          const uint32_t warp_idx)
 {
     using q_nope_t  = T::q_nope_t;
     using q_rope_t  = T::q_rope_t;
@@ -39,6 +46,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
     using mfma_ab_t = hk::bf16;
 
     using G = hk::group<T::kNumWarps>;
+
+    // Compile-time warp type (chosen by the __global__ wrapper's entry divergence).
+    constexpr bool kIsRopeWarp = (kWarpType == WarpType::OddRoPEWarp);
+    constexpr bool kIsEvenWarp = (kWarpType == WarpType::EvenNoPEWarp);
+    (void)kIsEvenWarp;
 
     constexpr comp_t log2e = 1.4426950408889634;
 
@@ -193,7 +205,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
 
     // ---- Runtime constants ----
-    const uint32_t warp_idx = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
     const uint32_t lane_idx = opus::lane_id();
 
     // Causal mask: compute per-warp kv_end offset for MTP.
@@ -384,7 +395,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
         // kCheckBoundary is true when the tile straddles the batch tail.
         if(kv_len < T::kBlockN)
         {
-            kv_manager.template async_load_k<true>(p_lds_kv_curr,
+            kv_manager.template async_load_k<true, kIsRopeWarp>(p_lds_kv_curr,
                                                    warp_idx,
                                                    params.p_kv_buffer,
                                                    params.p_kv_buffer_rope,
@@ -392,7 +403,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
         }
         else
         {
-            kv_manager.template async_load_k<false>(p_lds_kv_curr,
+            kv_manager.template async_load_k<false, kIsRopeWarp>(p_lds_kv_curr,
                                                     warp_idx,
                                                     params.p_kv_buffer,
                                                     params.p_kv_buffer_rope,
@@ -456,9 +467,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
             // so the post-barrier wait below is wave-dependent.
             if constexpr((kSkipCompute == false) && (kIsGlobalLast == false))
             {
-                kv_manager.template prefetch_kv_nope<0u, 0u, kCheckBoundaryNext>(
+                kv_manager.template prefetch_kv_nope<0u, 0u, kCheckBoundaryNext, kIsRopeWarp>(
                     warp_idx, params.p_kv_buffer, row_kv_ld_next, p0);
-                kv_manager.template prefetch_kv_nope<0u, kTileCols, kCheckBoundaryNext>(
+                kv_manager.template prefetch_kv_nope<0u, kTileCols, kCheckBoundaryNext, kIsRopeWarp>(
                     warp_idx, params.p_kv_buffer, row_kv_ld_next, p1);
             }
 
@@ -466,7 +477,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
             // prologue loads pending, then cross-warp barrier so KV LDS
             // sub-blocks are visible to QK reads. RoPE-owner waves issued 2
             // fewer loads, so they wait on vmcnt(2) vs vmcnt(4).
-            if(kv_manager.wave_is_rope_owner(warp_idx))
+            if constexpr(kIsRopeWarp)
             {
                 __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/2));
             }
@@ -728,7 +739,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                 {
                     // No QK GEMM ran -> prefetches weren't issued inline.
                     // Full prefetch + wait + cvt + store via async_load_k.
-                    kv_manager.template async_load_k<kCheckBoundaryNext>(p_lds_kv_next,
+                    kv_manager.template async_load_k<kCheckBoundaryNext, kIsRopeWarp>(p_lds_kv_next,
                                                                          warp_idx,
                                                                          params.p_kv_buffer,
                                                                          params.p_kv_buffer_rope,
@@ -742,38 +753,38 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
                     // wait below so its vmem load is counted. NoPE halves were
                     // issued pre-barrier; this is vmcnt, the QK ds_reads are
                     // lgkmcnt -- different counters.
-                    kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext>(
+                    kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext, kIsRopeWarp>(
                         p_lds_kv_next, warp_idx, params.p_kv_buffer_rope, row_kv_ld_next);
 
                     // Prefetches already issued mid-QK-body. Just drain +
                     // cvt + store. 4 vmem ops in flight; first wait drains
                     // tile-0 (leave tile-1's 2 in flight); second drains tile-1.
                     hk::u32x4 dw;
-                    kv_manager.template wait_kv_loads<0u, 0u, /*kVmCnt=*/2>(warp_idx);
+                    kv_manager.template wait_kv_loads<0u, 0u, kIsRopeWarp, /*kVmCnt=*/2>(warp_idx);
                     const float scale_f0 = kv_manager.kv_tile_scale_f(p0);
                     kv_manager.template cvt_kv_tile_step<0>(dw, p0, scale_f0);
                     kv_manager.template cvt_kv_tile_step<1>(dw, p0, scale_f0);
-                    kv_manager.template store_kv_tile_step<0u, 0u, 0>(p_lds_kv_next, warp_idx, dw);
+                    kv_manager.template store_kv_tile_step<0u, 0u, 0, kIsRopeWarp>(p_lds_kv_next, warp_idx, dw);
                     kv_manager.template cvt_kv_tile_step<2>(dw, p0, scale_f0);
                     kv_manager.template cvt_kv_tile_step<3>(dw, p0, scale_f0);
-                    kv_manager.template store_kv_tile_step<0u, 0u, 1>(p_lds_kv_next, warp_idx, dw);
+                    kv_manager.template store_kv_tile_step<0u, 0u, 1, kIsRopeWarp>(p_lds_kv_next, warp_idx, dw);
 
                     // Tile-1 is the RoPE half for waves 5,7 -- they have no NoPE
                     // data in p1 (prefetch_kv_nope was a no-op) and their
                     // store_kv_tile_step already skips, so skip the scale+cvts
                     // too (they'd compute discarded garbage from uninit p1).
-                    if(!kv_manager.wave_is_rope_owner(warp_idx))
+                    if constexpr(!kIsRopeWarp)
                     {
-                        kv_manager.template wait_kv_loads<0u, kTileCols, /*kVmCnt=*/0>(warp_idx);
+                        kv_manager.template wait_kv_loads<0u, kTileCols, kIsRopeWarp, /*kVmCnt=*/0>(warp_idx);
 
                         const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
                         kv_manager.template cvt_kv_tile_step<0>(dw, p1, scale_f1);
                         kv_manager.template cvt_kv_tile_step<1>(dw, p1, scale_f1);
-                        kv_manager.template store_kv_tile_step<0u, kTileCols, 0>(
+                        kv_manager.template store_kv_tile_step<0u, kTileCols, 0, kIsRopeWarp>(
                             p_lds_kv_next, warp_idx, dw);
                         kv_manager.template cvt_kv_tile_step<2>(dw, p1, scale_f1);
                         kv_manager.template cvt_kv_tile_step<3>(dw, p1, scale_f1);
-                        kv_manager.template store_kv_tile_step<0u, kTileCols, 1>(
+                        kv_manager.template store_kv_tile_step<0u, kTileCols, 1, kIsRopeWarp>(
                             p_lds_kv_next, warp_idx, dw);
                     }
                 }
@@ -1443,6 +1454,34 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgp
 #endif // MLA_SLIM_DISPATCH
     }
 }
+
+template <typename T>
+__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgpu_num_vgpr(64)))
+void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T>
+                                                                                   params)
+{
+    const uint32_t warp_idx = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
+
+    // Diverge on warp type ONCE at kernel entry so each type compiles as its own
+    // body (compile-time kWarpType, no runtime warp-idx branches inside). RoPE
+    // owners are odd warps (5,7); even warps are always NoPE.
+    if(warp_idx % 2 == 0)
+    {
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::EvenNoPEWarp>(params,
+                                                                                        warp_idx);
+    }
+    else if(KvManager8to16bitsV1<T>::wave_is_rope_owner(warp_idx))
+    {
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::OddRoPEWarp>(params,
+                                                                                       warp_idx);
+    }
+    else
+    {
+        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::OddNoPEWarp>(params,
+                                                                                       warp_idx);
+    }
+}
+
 #else
 template <typename T>
 __global__ __launch_bounds__(

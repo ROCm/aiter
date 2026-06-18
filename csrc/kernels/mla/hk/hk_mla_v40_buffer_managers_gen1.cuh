@@ -921,7 +921,7 @@ class KvManager8to16bitsV1
     // (their RoPE half is issued by prefetch_kv_rope after the barrier).
     //
     // No s_waitcnt is issued here -- the caller chooses when to wait.
-    template <uint32_t kRowOffset, uint32_t kColOffset, bool kCheckBoundary>
+    template <uint32_t kRowOffset, uint32_t kColOffset, bool kCheckBoundary, bool kIsRopeWarp>
     __device__ __forceinline__ static void prefetch_kv_nope(const uint32_t warp_idx,
                                                             const kv_nope_t* p_kv_buf_nope,
                                                             const int32_t row_kv_ld,
@@ -931,16 +931,16 @@ class KvManager8to16bitsV1
                       "prefetch_kv_nope: kRowOffset must be 0 -- a tile spans all 32 rows.");
         static_assert((kColOffset % kTileCols == 0u) && (kColOffset < T::kQkHeadDim),
                       "prefetch_kv_nope: kColOffset must be 0 or kTileCols (=256).");
+
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
+        constexpr bool kIsNoPEPath = (kTileIdx == 0u) || (kIsRopeWarp == false);
 
         const uint32_t lane_idx         = opus::lane_id();
         const uint32_t col_group        = lane_idx & 3u; // 0..3
         const uint32_t col_tile_in_tile = wave_col_tile_in_tile(warp_idx);
         const bool in_bounds            = (kCheckBoundary == false) || (row_kv_ld >= 0);
-        // Tile-1 RoPE-owner waves (5,7) hold no NoPE data -> no load.
-        const bool is_nope_path = (kTileIdx == 0u) || (wave_is_rope_owner(warp_idx) == false);
 
-        if(is_nope_path)
+        if constexpr(kIsNoPEPath)
         {
             // ---------------- NoPE prefetch ----------------
             constexpr uint32_t kPackedStride = T::kQkPackedNopeKvElems * sizeof(kv_nope_t); // 576
@@ -1008,7 +1008,7 @@ class KvManager8to16bitsV1
     // Only the tile-1 RoPE-owner waves (5,7) do work; every other wave (and any
     // tile-0 call) is a no-op. Writes p_lds_kv directly, so the caller MUST
     // issue this AFTER the cross-warp barrier that protects p_lds_kv.
-    template <uint32_t kRowOffset, uint32_t kColOffset, bool kCheckBoundary>
+    template <uint32_t kRowOffset, uint32_t kColOffset, bool kCheckBoundary, bool kIsRopeWarp>
     __device__ __forceinline__ static void prefetch_kv_rope(const uintptr_t p_lds_kv,
                                                             const uint32_t warp_idx,
                                                             const kv_rope_t* p_kv_buf_rope,
@@ -1018,14 +1018,15 @@ class KvManager8to16bitsV1
                       "prefetch_kv_rope: kRowOffset must be 0 -- a tile spans all 32 rows.");
         static_assert((kColOffset % kTileCols == 0u) && (kColOffset < T::kQkHeadDim),
                       "prefetch_kv_rope: kColOffset must be 0 or kTileCols (=256).");
+
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
+        constexpr bool kIsRoPEPath = (kTileIdx == 1u) && kIsRopeWarp;
 
         const uint32_t lane_idx  = opus::lane_id();
         const uint32_t col_group = lane_idx & 3u; // 0..3
         const bool in_bounds     = (kCheckBoundary == false) || (row_kv_ld >= 0);
-        const bool is_rope_path  = (kTileIdx == 1u) && wave_is_rope_owner(warp_idx);
 
-        if(is_rope_path)
+        if constexpr(kIsRoPEPath)
         {
             // ---------------- RoPE prefetch (vmem -> LDS direct) ----------------
             //
@@ -1125,7 +1126,7 @@ class KvManager8to16bitsV1
     // synchronized later by an s_barrier (the QK consumer reads from LDS), so
     // they don't need to gate cvt+store on vmcnt here -- and their
     // cvt_and_store_kv_tile<1> is itself a no-op.
-    template <uint32_t kRowOffset, uint32_t kColOffset, int32_t kVmCnt = 0>
+    template <uint32_t kRowOffset, uint32_t kColOffset, bool kIsRopeWarp, int32_t kVmCnt = 0>
     __device__ __forceinline__ static void wait_kv_loads(const uint32_t warp_idx)
     {
         static_assert(kRowOffset == 0u,
@@ -1134,8 +1135,8 @@ class KvManager8to16bitsV1
                       "wait_kv_loads: kColOffset must be 0 or kTileCols (=256).");
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
 
-        const bool skip = (kTileIdx == 1u) && wave_is_rope_owner(warp_idx);
-        if(skip == false)
+        constexpr bool skip = (kTileIdx == 1u) && kIsRopeWarp;
+        if constexpr(skip == false)
         {
             __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/kVmCnt));
             __builtin_amdgcn_sched_barrier(0);
@@ -1185,7 +1186,7 @@ class KvManager8to16bitsV1
 
     // kStep in {0,1}: 0 -> store lo (offset 0), 1 -> store hi (offset
     // kNumRowTiles * kSubBlockBytes = 2048).
-    template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t kStep>
+    template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t kStep, bool kIsRopeWarp>
     __device__ __forceinline__ static void
     store_kv_tile_step(const uintptr_t p_lds_kv, const uint32_t warp_idx, const hk::u32x4& dw)
     {
@@ -1196,8 +1197,8 @@ class KvManager8to16bitsV1
         static_assert(kStep < 2u, "store_kv_tile_step: kStep must be 0 or 1.");
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
 
-        const bool skip = (kTileIdx == 1u) && wave_is_rope_owner(warp_idx);
-        if(skip)
+        constexpr bool skip = (kTileIdx == 1u) && kIsRopeWarp;
+        if constexpr(skip)
         {
             return;
         }
@@ -1225,7 +1226,7 @@ class KvManager8to16bitsV1
     // Equivalent to: prefetch tile 0 -> prefetch tile 1 -> wait<0> -> cvt+store
     // tile 0 -> wait<1> -> cvt+store tile 1. Useful for the prologue (and for
     // any callers that don't need to interleave QK mfmas with the cvts).
-    template <bool kCheckBoundary>
+    template <bool kCheckBoundary, bool kIsRopeWarp>
     __device__ __forceinline__ static void async_load_k(const uintptr_t p_lds_kv,
                                                         const uint32_t warp_idx,
                                                         const kv_nope_t* p_kv_buf_nope,
@@ -1233,35 +1234,36 @@ class KvManager8to16bitsV1
                                                         const int32_t row_kv_ld)
     {
         KvTilePrefetch p0, p1;
-        prefetch_kv_nope<0u, 0u, kCheckBoundary>(warp_idx, p_kv_buf_nope, row_kv_ld, p0);
-        prefetch_kv_nope<0u, kTileCols, kCheckBoundary>(warp_idx, p_kv_buf_nope, row_kv_ld, p1);
-        prefetch_kv_rope<0u, kTileCols, kCheckBoundary>(
+        prefetch_kv_nope<0u, 0u, kCheckBoundary, kIsRopeWarp>(warp_idx, p_kv_buf_nope, row_kv_ld, p0);
+        prefetch_kv_nope<0u, kTileCols, kCheckBoundary, kIsRopeWarp>(
+            warp_idx, p_kv_buf_nope, row_kv_ld, p1);
+        prefetch_kv_rope<0u, kTileCols, kCheckBoundary, kIsRopeWarp>(
             p_lds_kv, warp_idx, p_kv_buf_rope, row_kv_ld);
 
         // Full-pong cvt+store, expressed via split steps (no interleave
         // here -- the wrapper is for prologue / cold callers).
         hk::u32x4 dw;
-        wait_kv_loads<0u, 0u, /*kVmCnt=*/2>(warp_idx);
+        wait_kv_loads<0u, 0u, kIsRopeWarp, /*kVmCnt=*/2>(warp_idx);
         const float scale_f0 = kv_tile_scale_f(p0);
         cvt_kv_tile_step<0>(dw, p0, scale_f0);
         cvt_kv_tile_step<1>(dw, p0, scale_f0);
-        store_kv_tile_step<0u, 0u, 0>(p_lds_kv, warp_idx, dw);
+        store_kv_tile_step<0u, 0u, 0, kIsRopeWarp>(p_lds_kv, warp_idx, dw);
         cvt_kv_tile_step<2>(dw, p0, scale_f0);
         cvt_kv_tile_step<3>(dw, p0, scale_f0);
-        store_kv_tile_step<0u, 0u, 1>(p_lds_kv, warp_idx, dw);
+        store_kv_tile_step<0u, 0u, 1, kIsRopeWarp>(p_lds_kv, warp_idx, dw);
 
-        wait_kv_loads<0u, kTileCols, /*kVmCnt=*/0>(warp_idx);
+        wait_kv_loads<0u, kTileCols, kIsRopeWarp, /*kVmCnt=*/0>(warp_idx);
         // Tile-1 RoPE-owner waves (5,7) have no NoPE data in p1 -> skip the
         // scale+cvt+store (store already skips; the cvts would be discarded).
-        if(!wave_is_rope_owner(warp_idx))
+        if constexpr(!kIsRopeWarp)
         {
             const float scale_f1 = kv_tile_scale_f(p1);
             cvt_kv_tile_step<0>(dw, p1, scale_f1);
             cvt_kv_tile_step<1>(dw, p1, scale_f1);
-            store_kv_tile_step<0u, kTileCols, 0>(p_lds_kv, warp_idx, dw);
+            store_kv_tile_step<0u, kTileCols, 0, kIsRopeWarp>(p_lds_kv, warp_idx, dw);
             cvt_kv_tile_step<2>(dw, p1, scale_f1);
             cvt_kv_tile_step<3>(dw, p1, scale_f1);
-            store_kv_tile_step<0u, kTileCols, 1>(p_lds_kv, warp_idx, dw);
+            store_kv_tile_step<0u, kTileCols, 1, kIsRopeWarp>(p_lds_kv, warp_idx, dw);
         }
     }
 
