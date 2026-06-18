@@ -15,7 +15,12 @@
 import argparse
 import os
 import sys
-from multiprocessing import Pool, TimeoutError as MpTimeoutError, freeze_support, set_start_method
+from multiprocessing import (
+    Pool,
+    TimeoutError as MpTimeoutError,
+    freeze_support,
+    set_start_method,
+)
 
 import torch
 import torch.distributed as dist
@@ -82,7 +87,8 @@ def _worker(
             logger.error(
                 "RANK %d: IPC initialization failed (likely hipExtMallocWithFlags "
                 "or hipIpcGetMemHandle issue on this GPU arch). Error: %s",
-                rank, err_msg,
+                rank,
+                err_msg,
             )
         raise
 
@@ -151,9 +157,7 @@ def test_gfx1250_allreduce(
     results = []
     try:
         for i, r in enumerate(rets):
-            results.append(
-                r.get(timeout=_INIT_TIMEOUT_SEC)
-            )
+            results.append(r.get(timeout=_INIT_TIMEOUT_SEC))
     except Exception as e:
         pool.terminate()
         pool.join()
@@ -272,9 +276,7 @@ if __name__ == "__main__":
     df = []
     for tp_size in test_tp_sizes:
         if tp_size > num_gpus:
-            logger.warning(
-                "Skipping tp=%d: only %d GPUs available", tp_size, num_gpus
-            )
+            logger.warning("Skipping tp=%d: only %d GPUs available", tp_size, num_gpus)
             continue
         for dtype in test_dtypes:
             for shape in test_shapes:
