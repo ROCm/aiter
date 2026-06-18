@@ -10,6 +10,7 @@ enum class ActivationType : int
     Silu   = 0,
     Gelu   = 1,
     Swiglu = 2,
+    SwigluStep = 3,
 };
 enum class QuantType : int
 {

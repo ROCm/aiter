@@ -1700,7 +1700,8 @@ def compile_ops(
 
                     log_args(func, *args, **kwargs)
                 # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
-                if develop:
+                # Guard: only wrap if the module supports aiter_tensor_t (has _set_current_hip_stream)
+                if develop and hasattr(module, "_set_current_hip_stream"):
                     import torch
 
                     from ..utility.dtypes import torch_to_aiter_pybind
@@ -1718,7 +1719,7 @@ def compile_ops(
                         for k, v in kwargs.items()
                     }
 
-                if develop:
+                if develop and hasattr(module, "_set_current_hip_stream"):
                     module._set_current_hip_stream(
                         torch.cuda.current_stream().cuda_stream
                     )

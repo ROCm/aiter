@@ -9,6 +9,7 @@ from typing import Callable, Optional
 
 import aiter
 import torch
+import torch.nn.functional as F
 
 # from aiter import get_torch_quant as get_quant
 from aiter import ActivationType, QuantType, dtypes
@@ -808,6 +809,7 @@ fused_moe_1stage_dict = {
     },
     "gfx950":
     {
+        (ActivationType.Silu,          QuantType.No,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False,   False) : aiter.fmoe,
         (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
         (ActivationType.Gelu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
@@ -1274,7 +1276,10 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 128 == 0)
+                # NEW-RC-3 patch (2026-04-28): force CK blockscale path on gfx942 to avoid
+                # routing per_1x128 prefill to ASM fmoe_g1u1 which lacks block shape param
+                # original: run_1stage = token > 32 and (inter_dim % 128 == 0)
+                run_1stage = False
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -1294,6 +1299,32 @@ def get_2stage_cfgs(
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
         )
+        # gfx950 workaround: V1 CK kernel produces wrong results for inter_dim>192
+        # (memory corruption / incorrect computation for both preshuffle_on and
+        # preshuffle_off paths). Force block_m=128 to select the correct V3 stage1
+        # kernel. For preshuffle_off, also force the V3 stage2 kernel by name.
+        # Note: blockscale (per_1x128/per_1x32) dispatch only supports block_m<=64
+        # and is not affected by the V1 bug, so exclude it from this override.
+        if (
+            not run_1stage
+            and inter_dim > 192
+            and get_gfx() == "gfx950"
+            and q_type not in (QuantType.per_1x128, QuantType.per_1x32)
+        ):
+            block_m = 128
+            if not is_shuffled and not kernelName2:
+                stage2_consumes_routed_weight = not doweight_stage1
+                stage2_op = (
+                    "TypeCastExpertWeight"
+                    if stage2_consumes_routed_weight
+                    else "TypeCast"
+                )
+                stage2_mul_routed_weight = 1 if stage2_consumes_routed_weight else 0
+                kernelName2 = (
+                    "moe_ck2stages_gemm2_256x128x128x64_1x4_"
+                    f"{stage2_op}_v3_Nswizzle0_Quant0_"
+                    f"MulRoutedWeight{stage2_mul_routed_weight}_B16_B16_B16"
+                )
         ksplit = (
             ksplit
             if (run_1stage)
@@ -1365,7 +1396,11 @@ def get_2stage_cfgs(
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
-    if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
+    if (
+        (is_flydsl1 or is_flydsl2)
+        and is_flydsl_available()
+        and activation != ActivationType.SwigluStep
+    ):
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
@@ -2012,12 +2047,33 @@ def fused_moe_2stages(
     return moe_out
 
 
-def torch_moe_act(act_input, torch_act, inter_dim):
+def torch_moe_act(act_input, torch_act, inter_dim, activation=ActivationType.No):
     if act_input.shape[-1] == inter_dim:
         return torch_act(act_input)
     else:
         gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
+        if activation == ActivationType.Swiglu:
+            return swiglu(gate, up)
+        if activation == ActivationType.SwigluStep:
+            return swiglustep(gate, up)
         return torch_act(gate) * up
+
+
+def apply_act_and_mul(out, act_input, activation=ActivationType.No):
+    if activation == ActivationType.Silu:
+        aiter.silu_and_mul(out, act_input)
+    elif activation == ActivationType.Gelu:
+        aiter.gelu_and_mul(out, act_input)
+    elif activation == ActivationType.Swiglu:
+        aiter.swiglu_and_mul(out, act_input)
+    else:
+        inter_dim = act_input.shape[-1] // 2
+        torch_act = aiter.get_torch_act(activation)
+        result = torch_moe_act(act_input, torch_act, inter_dim, activation).to(
+            out.dtype
+        )
+        out.view(-1, inter_dim).copy_(result.view(-1, inter_dim))
+    return out
 
 
 def asm_stage1(
@@ -2077,12 +2133,7 @@ def asm_stage1(
         sorted_weights=sorted_weights,
     )
     if ksplit > 0:
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
-        elif activation == ActivationType.Swiglu:
-            aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
-        else:
-            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
+        apply_act_and_mul(out, tmp_out.view(dtypes.fp32), activation)
     return out
 
 
@@ -2142,7 +2193,7 @@ def torch_moe(
                 sub_tokens = sub_tokens * (fc1_smooth_scale[E_id])
 
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
-            act_out = torch_moe_act(act_input, torch_act, inter_dim)
+            act_out = torch_moe_act(act_input, torch_act, inter_dim, activation)
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])
             out[mask] = act_out @ (w2[E_id].transpose(0, 1))
@@ -2160,6 +2211,13 @@ def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
     out_glu = x_glu * torch.sigmoid(alpha * x_glu)
     # Note we add an extra bias of 1 to the linear layer
     return out_glu * (x_linear + 1)
+
+
+def swiglustep(x_glu, x_linear, limit: float = 7.0):
+    x_glu = F.silu(x_glu)
+    x_glu = x_glu.clamp(min=None, max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+    return x_glu * x_linear
 
 
 def torch_moe_stage1(
@@ -2274,11 +2332,22 @@ def torch_moe_stage1(
                 out[mask] = out[mask] + w1_bias[E_id].view(1, -1)
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
     use_swiglu = activation == aiter.ActivationType.Swiglu
+    use_swiglustep = activation == aiter.ActivationType.SwigluStep
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
         if use_swiglu:
-            out = swiglu(gate, up, limit=swiglu_limit)
+            if (
+                quant_type == QuantType.per_1x32
+                and w1_scale is not None
+                and w1_scale.dtype == dtypes.bf16
+            ):
+                # a16wi4: FlyDSL int4_bf16 kernel uses standard silu(gate)*up
+                out = torch.nn.functional.silu(gate) * up
+            else:
+                out = swiglu(gate, up, limit=swiglu_limit)
+        elif use_swiglustep:
+            out = swiglustep(gate, up)
         else:
             if swiglu_limit != 0:
                 gate = gate.clamp(min=None, max=swiglu_limit)
@@ -2442,10 +2511,7 @@ def ck_moe_stage1(
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
-        else:
-            aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
+        apply_act_and_mul(out, valid_out.view(dtypes.fp32), activation)
     return out
 
 
@@ -2586,6 +2652,12 @@ def cktile_moe_stage1(
                 aiter.silu_and_mul(out, valid_out)
             elif activation == ActivationType.Swiglu:
                 aiter.swiglu_and_mul(out, valid_out)
+            elif activation == ActivationType.SwigluStep:
+                if bias1 is not None:
+                    raise NotImplementedError(
+                        "SwigluStep + bias1 not supported in CK-Tile split-k path"
+                    )
+                apply_act_and_mul(out, valid_out, activation)
             else:
                 aiter.gelu_and_mul(out, valid_out)
     return out

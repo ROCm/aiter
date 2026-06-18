@@ -142,4 +142,16 @@ def str2Dtype(v):
 
 def str2ActivationType(s):
     """Convert string to ActivationType."""
-    return getattr(ActivationType, s.capitalize())
+    mapping = {
+        "no": ActivationType.No,
+        "silu": ActivationType.Silu,
+        "gelu": ActivationType.Gelu,
+        "swiglu": ActivationType.Swiglu,
+        "swiglustep": ActivationType.SwigluStep,
+    }
+    key = s.lower()
+    if key not in mapping:
+        raise argparse.ArgumentTypeError(
+            f"invalid activation type {s!r}; choose from {sorted(mapping)}"
+        )
+    return mapping[key]

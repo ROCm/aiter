@@ -313,7 +313,7 @@ parser.add_argument(
     "-q",
     "--quant_type",
     type=str,
-    choices=["No", "per_Token", "per_128x128"],
+    choices=["No", "per_Token", "per_128x128", "per_1x128"],
     nargs="?",
     const=None,
     default=None,
@@ -333,11 +333,24 @@ parser.add_argument(
     "-s",
     "--shape",
     type=dtypes.str2tuple,
-    choices=l_shape,
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="shape (M,hdim,idim)",
+)
+parser.add_argument(
+    "-e",
+    "--experts",
+    type=int,
+    default=16,
+    help="number of experts",
+)
+parser.add_argument(
+    "-k",
+    "--topk",
+    type=int,
+    default=2,
+    help="top-k experts per token",
 )
 
 
@@ -356,4 +369,6 @@ if __name__ == "__main__":
     for quant_type in quant_types:
         for dtype in l_dtype:
             for shape in l_shape:
-                test_dispatch_combine(8, shape, dtype, 16, 2, quant_type)
+                test_dispatch_combine(
+                    8, shape, dtype, args.experts, args.topk, quant_type
+                )

@@ -17,6 +17,14 @@ sys.path.insert(0, AITER_CORE_DIR)
 
 from chip_info import get_gfx  # noqa: E402
 
+ACT_OP_MAP = {
+    "gelu": 0,
+    "silu": 1,
+    "swiglustep": 2,
+}
+
+ACT_OP_NAME = {v: k for k, v in ACT_OP_MAP.items()}
+
 
 @dataclass
 class kernelInstanceGEMM1:
@@ -29,7 +37,7 @@ class kernelInstanceGEMM1:
     GemmPipelineVersion: int
     Nswizzle: bool = False
     MulRoutedWeight: bool = False
-    ActOP: bool = False
+    ActOP: int = 0
     CDEElementOp: str = "TypeCast"
     QuantType: int = 1
     stage: int = 1
@@ -59,7 +67,7 @@ class kernelInstanceGEMM1:
                 "Nswizzle" + str(int(self.Nswizzle)),
                 "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
-                "silu" if self.ActOP else "gelu",
+                ACT_OP_NAME[self.ActOP],
                 self.Adtype.upper(),
                 self.Bdtype.upper(),
                 self.Cdtype.upper(),
@@ -185,9 +193,8 @@ a8w8_gemm1_blockscale_kernels_list= {
      1: kernelInstanceGEMM1(       128,       16,        128,       128,     1,       2,        1,),
      2: kernelInstanceGEMM1(       256,       32,        128,       128,     1,       4,        1,),
      3: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
-    # 4: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
-     5: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        1,),
-    # 6: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        1,),
+     # NWaves=4 variant of #3 (added on main)
+     7: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        1,),
 }
 
 # gemm1 out:bf16/fp16 A:fp8 B:win4
@@ -310,9 +317,7 @@ a8w8_gemm2_blockscale_kernels_list= {
      1: kernelInstanceGEMM2(       128,       16,        128,       128,     1,       2,        1,),
      2: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
      3: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
-    # 4: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
      5: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        1,),
-    # 6: kernelInstanceGEMM2(       256,      128,        128,       128,     1,       4,        1,),
 }
 
 # gemm2 out:bf16/fp16 A:fp8 B:in4
@@ -410,7 +415,7 @@ def get_gemm1_kernels_list(
     kernels_list = {k: copy.deepcopy(v) for k, v in gemm1_kernels_dict[tag].items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
-        kernel.ActOP = ActOP == "silu"
+        kernel.ActOP = ACT_OP_MAP[ActOP]
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
         kernel.Adtype = Adtype
