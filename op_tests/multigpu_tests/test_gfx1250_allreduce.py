@@ -161,7 +161,7 @@ def test_gfx1250_allreduce(
     except Exception as e:
         pool.terminate()
         pool.join()
-        err_msg = str(e)
+        str(e)
         if isinstance(e, (MpTimeoutError, TimeoutError)):
             raise RuntimeError(
                 f"Worker timed out after {_INIT_TIMEOUT_SEC}s — likely hung "
