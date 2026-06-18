@@ -22,7 +22,7 @@ from .kernels_common import dtype_to_elem_type, get_warp_size
 
 KERNEL_NAME = "rmsnorm"
 
-EPS = 1e-5
+DEFAULT_EPS = 1e-5
 
 BLOCK_THREADS = 256
 WARP_SIZE = get_warp_size()
@@ -110,9 +110,9 @@ def _quant_dtype_max(dtype_str: str) -> float:
     raise ValueError(f"unsupported quant dtype: {dtype_str!r} (expected 'i8' or 'int8')")
 
 
-def build_rmsnorm_module(M: int, N: int, dtype_str: str):
+def build_rmsnorm_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EPS):
     if M > 8192 and N <= 2048:
-        return _build_rmsnorm_large_m_small_n_module(M, N, dtype_str)
+        return _build_rmsnorm_large_m_small_n_module(M, N, dtype_str, eps=eps)
 
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
@@ -135,7 +135,7 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
 
         elem_dtype = dtype_to_elem_type(dtype_str)
         fm_fast = arith.FastMathFlags.fast
-        eps_c = EPS
+        eps_c = eps
         n_float = float(N)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -308,7 +308,7 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
     return launch_rmsnorm
 
 
-def _build_rmsnorm_large_m_small_n_module(M: int, N: int, dtype_str: str):
+def _build_rmsnorm_large_m_small_n_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EPS):
     BLOCK_N = 1 << (N - 1).bit_length()
     BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
     THREADS_PER_ROW = min(WARP_SIZE, 1024 // BLOCK_M)
@@ -332,7 +332,7 @@ def _build_rmsnorm_large_m_small_n_module(M: int, N: int, dtype_str: str):
         if row < M:
             elem_dtype = dtype_to_elem_type(dtype_str)
             fm_fast = arith.FastMathFlags.fast
-            eps_c = EPS
+            eps_c = eps
             n_float = float(N)
 
             Input_buf = fx.rocdl.make_buffer_tensor(Input)
@@ -405,7 +405,7 @@ def _build_rmsnorm_large_m_small_n_module(M: int, N: int, dtype_str: str):
     return launch_rmsnorm_large_m_small_n
 
 
-def build_fused_add_rmsnorm_module(M: int, N: int, dtype_str: str):
+def build_fused_add_rmsnorm_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EPS):
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
 
@@ -428,7 +428,7 @@ def build_fused_add_rmsnorm_module(M: int, N: int, dtype_str: str):
 
         elem_dtype = dtype_to_elem_type(dtype_str)
         fm_fast = arith.FastMathFlags.fast
-        eps_c = EPS
+        eps_c = eps
         n_float = float(N)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -626,6 +626,7 @@ def _build_rmsnorm_quant_module(
     *,
     is_smooth: bool,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     tile_cols = BLOCK_THREADS * VEC_WIDTH
     RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
@@ -649,7 +650,7 @@ def _build_rmsnorm_quant_module(
         quant_dtype = _quant_dtype_to_elem_type(quant_dtype_str)
 
         fm_fast = arith.FastMathFlags.fast
-        eps_c = EPS
+        eps_c = eps
         n_float = float(N)
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
@@ -968,6 +969,7 @@ def build_rmsnorm_dynamicquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     return _build_rmsnorm_quant_module(
         M,
@@ -975,6 +977,7 @@ def build_rmsnorm_dynamicquant_module(
         dtype_str,
         is_smooth=False,
         quant_dtype_str=quant_dtype_str,
+        eps=eps,
     )
 
 
@@ -983,6 +986,7 @@ def build_rmsnorm_smoothquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     return _build_rmsnorm_quant_module(
         M,
@@ -990,6 +994,7 @@ def build_rmsnorm_smoothquant_module(
         dtype_str,
         is_smooth=True,
         quant_dtype_str=quant_dtype_str,
+        eps=eps,
     )
 
 
@@ -1000,6 +1005,7 @@ def _build_fused_add_rmsnorm_quant_module(
     *,
     is_smooth: bool,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
@@ -1028,7 +1034,7 @@ def _build_fused_add_rmsnorm_quant_module(
         quant_dtype = _quant_dtype_to_elem_type(quant_dtype_str)
 
         fm_fast = arith.FastMathFlags.fast
-        eps_c = EPS
+        eps_c = eps
         n_float = float(N)
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
@@ -1372,6 +1378,7 @@ def build_fused_add_rmsnorm_dynamicquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     return _build_fused_add_rmsnorm_quant_module(
         M,
@@ -1379,6 +1386,7 @@ def build_fused_add_rmsnorm_dynamicquant_module(
         dtype_str,
         is_smooth=False,
         quant_dtype_str=quant_dtype_str,
+        eps=eps,
     )
 
 
@@ -1387,6 +1395,7 @@ def build_fused_add_rmsnorm_smoothquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     return _build_fused_add_rmsnorm_quant_module(
         M,
@@ -1394,4 +1403,5 @@ def build_fused_add_rmsnorm_smoothquant_module(
         dtype_str,
         is_smooth=True,
         quant_dtype_str=quant_dtype_str,
+        eps=eps,
     )

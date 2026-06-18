@@ -23,7 +23,7 @@ from .kernels_common import dtype_to_elem_type, get_warp_size
 
 KERNEL_NAME = "layernorm"
 
-EPS = 1e-5
+DEFAULT_EPS = 1e-5
 
 BLOCK_THREADS = 256
 WARP_SIZE = get_warp_size()
@@ -112,7 +112,7 @@ def _quant_dtype_max(dtype_str: str) -> float:
     raise ValueError(f"unsupported quant dtype: {dtype_str!r} (expected 'i8' or 'int8')")
 
 
-def build_layernorm_module(M: int, N: int, dtype_str: str):
+def build_layernorm_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EPS):
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
 
@@ -134,7 +134,7 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
 
         elem_dtype = dtype_to_elem_type(dtype_str)
         fm_fast = arith.FastMathFlags.fast
-        eps_c = EPS
+        eps_c = eps
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         s_sum = lds.s_sum.view(fx.make_layout(RED_SLOTS, 1))
@@ -342,7 +342,7 @@ def build_layernorm_module(M: int, N: int, dtype_str: str):
     return launch_layernorm
 
 
-def build_fused_add_layernorm_module(M: int, N: int, dtype_str: str):
+def build_fused_add_layernorm_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EPS):
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
 
@@ -365,7 +365,7 @@ def build_fused_add_layernorm_module(M: int, N: int, dtype_str: str):
 
         elem_dtype = dtype_to_elem_type(dtype_str)
         fm_fast = arith.FastMathFlags.fast
-        eps_c = EPS
+        eps_c = eps
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         s_sum = lds.s_sum.view(fx.make_layout(RED_SLOTS, 1))
@@ -569,6 +569,7 @@ def _build_layernorm_quant_module(
     *,
     is_smooth: bool,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
     elem_bits = 32 if dtype_str == "f32" else 16
@@ -592,7 +593,7 @@ def _build_layernorm_quant_module(
         quant_dtype = _quant_dtype_to_elem_type(quant_dtype_str)
 
         fm_fast = arith.FastMathFlags.fast
-        eps_c = EPS
+        eps_c = eps
         n_float = float(N)
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
@@ -914,6 +915,7 @@ def _build_fused_add_layernorm_quant_module(
     *,
     is_smooth: bool,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
@@ -942,7 +944,7 @@ def _build_fused_add_layernorm_quant_module(
         quant_dtype = _quant_dtype_to_elem_type(quant_dtype_str)
 
         fm_fast = arith.FastMathFlags.fast
-        eps_c = EPS
+        eps_c = eps
         n_float = float(N)
         c_zero_f = fx.Float32(0.0)
         c_one_f = fx.Float32(1.0)
@@ -1291,6 +1293,7 @@ def build_layernorm_dynamicquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     return _build_layernorm_quant_module(
         M,
@@ -1298,6 +1301,7 @@ def build_layernorm_dynamicquant_module(
         dtype_str,
         is_smooth=False,
         quant_dtype_str=quant_dtype_str,
+        eps=eps,
     )
 
 
@@ -1306,6 +1310,7 @@ def build_layernorm_smoothquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     return _build_layernorm_quant_module(
         M,
@@ -1313,6 +1318,7 @@ def build_layernorm_smoothquant_module(
         dtype_str,
         is_smooth=True,
         quant_dtype_str=quant_dtype_str,
+        eps=eps,
     )
 
 
@@ -1321,6 +1327,7 @@ def build_fused_add_layernorm_dynamicquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     return _build_fused_add_layernorm_quant_module(
         M,
@@ -1328,6 +1335,7 @@ def build_fused_add_layernorm_dynamicquant_module(
         dtype_str,
         is_smooth=False,
         quant_dtype_str=quant_dtype_str,
+        eps=eps,
     )
 
 
@@ -1336,6 +1344,7 @@ def build_fused_add_layernorm_smoothquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
+    eps: float = DEFAULT_EPS,
 ):
     return _build_fused_add_layernorm_quant_module(
         M,
@@ -1343,4 +1352,5 @@ def build_fused_add_layernorm_smoothquant_module(
         dtype_str,
         is_smooth=True,
         quant_dtype_str=quant_dtype_str,
+        eps=eps,
     )
