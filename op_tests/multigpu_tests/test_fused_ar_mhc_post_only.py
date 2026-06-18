@@ -1,16 +1,19 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Benchmark split (AR + mhc_post) vs fused (AR+mhc_post epilogue only)."""
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Multigpu tests: split (AR + mhc_post) vs fused AR+mhc_post epilogue."""
 
 from __future__ import annotations
 
 import argparse
+import itertools
+import logging
 import os
-import sys
-from multiprocessing import Pool, set_start_method
+from multiprocessing import Pool, freeze_support, set_start_method
 from statistics import median
 from typing import Callable, Optional
 
+import pandas as pd
 import torch
 import torch.distributed as dist
 
@@ -27,11 +30,26 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.custom_all_reduce import launch_fused_allreduce_mhc_post_only
+from aiter.test_common import benchmark, checkAllclose
+
+logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
 
 WARMUP = 5
+BENCH_WARMUP = 2
 ITERS = 50
+DEFAULT_SHAPES = (
+    (1, 4096),
+    (2, 4096),
+    (4, 4096),
+    (16, 4096),
+    (32, 4096),
+    (128, 4096),
+    (1024, 4096),
+    (2048, 4096),
+    (8192, 4096),
+)
 
 
 def _make_inputs(m: int, hidden_size: int, rank: int, device: torch.device):
@@ -90,13 +108,15 @@ def _bench_graph(fn: Callable[[], None], *, warmup: int, iters: int) -> list[flo
     return samples
 
 
-def profile_worker(
+def _profile_worker(
     tp_size: int,
     rank_id: int,
     m: int,
     hidden_size: int,
     with_graph: bool,
     init_method: str,
+    *,
+    run_correctness: bool,
 ):
     device = torch.device(f"cuda:{rank_id}")
     torch.cuda.set_device(device)
@@ -148,19 +168,40 @@ def profile_worker(
             reg_bytes=reg_bytes,
         )
 
+    err = 0.0
+    if run_correctness:
+        split_ar_post()
+        ref = next_residual.clone()
+        out = launch_fused_allreduce_mhc_post_only(
+            ca_comm._ptr,
+            tensors["layer_input"],
+            tensors["residual_in"],
+            tensors["post_layer_mix"],
+            tensors["comb_res_mix"],
+            reg_ptr=_reg()[0],
+            reg_bytes=_reg()[1],
+        )
+        err = checkAllclose(
+            ref,
+            out,
+            msg=f"tp={tp_size} m={m} rank={rank_id}",
+        )
+
     for _ in range(WARMUP):
         split_ar_post()
         fused_ar_post()
     torch.cuda.synchronize()
 
     bench = _bench_graph if with_graph else _event_us
-    split_us = bench(split_ar_post, warmup=2, iters=ITERS)
+    split_us = bench(split_ar_post, warmup=BENCH_WARMUP, iters=ITERS)
     if with_graph:
         fused_us = bench(
-            lambda: fused_ar_post(graph_replay=True), warmup=2, iters=ITERS
+            lambda: fused_ar_post(graph_replay=True),
+            warmup=BENCH_WARMUP,
+            iters=ITERS,
         )
     else:
-        fused_us = bench(fused_ar_post, warmup=2, iters=ITERS)
+        fused_us = bench(fused_ar_post, warmup=BENCH_WARMUP, iters=ITERS)
 
     destroy_model_parallel()
     destroy_distributed_environment()
@@ -169,23 +210,27 @@ def profile_worker(
         "rank": rank_id,
         "split_median": median(split_us),
         "fused_median": median(fused_us),
+        "err": err,
     }
 
 
-def run_profile(
+def _run_profile(
     tp_size: int,
     m: int,
     hidden_size: int,
     with_graph: bool,
     init_method: Optional[str] = None,
+    *,
+    run_correctness: bool = False,
 ):
     if init_method is None:
         init_method = get_distributed_init_method(get_ip(), get_open_port())
     pool = Pool(processes=tp_size)
     rets = [
         pool.apply_async(
-            profile_worker,
+            _profile_worker,
             args=(tp_size, r, m, hidden_size, with_graph, init_method),
+            kwds={"run_correctness": run_correctness},
         )
         for r in range(tp_size)
     ]
@@ -196,47 +241,127 @@ def run_profile(
     fused = max(x["fused_median"] for x in rows)
     saved = split - fused
     speedup = (saved / split * 100.0) if split > 0 else 0.0
-    return split, fused, saved, speedup
+    err = max(x["err"] for x in rows)
+    return split, fused, saved, speedup, err
 
 
-def main():
-    parser = argparse.ArgumentParser(description="AR+mhc_post only profile TP=2")
-    parser.add_argument("-t", "--tp-size", type=int, default=2)
+@benchmark()
+def test_ar_mhc_post_only_profile(
+    tp_size: int,
+    m: int,
+    hidden_size: int,
+    with_graph: bool = False,
+    distributed_init_method: Optional[str] = None,
+    run_correctness: bool = False,
+):
+    split, fused, saved, speedup, err = _run_profile(
+        tp_size,
+        m,
+        hidden_size,
+        with_graph,
+        distributed_init_method,
+        run_correctness=run_correctness,
+    )
+    return {
+        "tp_size": tp_size,
+        "m": m,
+        "hidden_size": hidden_size,
+        "withGraph": with_graph,
+        "split_median_us": split,
+        "fused_median_us": fused,
+        "saved_us": saved,
+        "speedup_pct": speedup,
+        "err": err,
+    }
+
+
+try:
+    import pytest
+
+    @pytest.mark.parametrize("m", [16, 4096])
+    def test_fused_ar_mhc_post_only_tp2_smoke(m: int):
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >=2 GPUs, got {torch.cuda.device_count()}")
+        ret = test_ar_mhc_post_only_profile(
+            tp_size=2,
+            m=m,
+            hidden_size=4096,
+            with_graph=False,
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+            run_correctness=True,
+        )
+        assert ret["err"] == 0
+
+except ImportError:
+    pass
+
+
+def _parse_shapes(raw: str) -> list[tuple[int, int]]:
+    shapes = []
+    for tok in raw.split():
+        m_s, h_s = tok.split(",")
+        shapes.append((int(m_s), int(h_s)))
+    return shapes
+
+
+def _print_table(tp_size: int, with_graph: bool, rows: list[dict]):
+    mode = "graph-on" if with_graph else "graph-off"
+    print(f"## TP={tp_size} {mode}")
+    print("M\tsplit\tfused\tsaved\tspeedup")
+    for row in rows:
+        print(
+            f"{row['m']}\t{row['split_median_us']:.1f}\t"
+            f"{row['fused_median_us']:.1f}\t{row['saved_us']:.1f}\t"
+            f"{row['speedup_pct']:+.1f}%"
+        )
+    print()
+
+
+if __name__ == "__main__":
+    freeze_support()
+    parser = argparse.ArgumentParser(
+        description="Profile split AR+mhc_post vs fused post-only epilogue"
+    )
+    parser.add_argument("-t", "--tp-size", type=int, nargs="+", default=[2])
     parser.add_argument(
         "-s",
         "--shapes",
         type=str,
-        default="1,4096 2,4096 4,4096 16,4096 32,4096 128,4096 1024,4096 2048,4096 8192,4096",
+        default=" ".join(f"{m},{h}" for m, h in DEFAULT_SHAPES),
     )
     parser.add_argument("-g", "--graph", type=int, default=-1, choices=[-1, 0, 1])
     args = parser.parse_args()
 
-    shapes = []
-    for tok in args.shapes.split():
-        m_s, h_s = tok.split(",")
-        shapes.append((int(m_s), int(h_s)))
-
+    shapes = _parse_shapes(args.shapes)
     graph_modes = [False, True] if args.graph < 0 else [bool(args.graph)]
 
     print("# AR + mhc_post only (split vs fused epilogue)")
     print(f"# HIP_VISIBLE_DEVICES={os.environ.get('HIP_VISIBLE_DEVICES', 'unset')}")
-    print(f"# warmup={WARMUP} iters={ITERS} metric=rank-max median (us)")
+    print(f"# warmup={WARMUP} bench_warmup={BENCH_WARMUP} iters={ITERS}")
+    print("# metric=rank-max median (us)")
     print()
 
+    df_rows = []
     init_method = get_distributed_init_method(get_ip(), get_open_port())
-    for with_graph in graph_modes:
-        mode = "graph-on" if with_graph else "graph-off"
-        print(f"## {mode}")
-        print("M\tsplit\tfused\tsaved\tspeedup")
-        for m, hidden_size in shapes:
-            split, fused, saved, sp = run_profile(
-                args.tp_size, m, hidden_size, with_graph, init_method
-            )
-            print(f"{m}\t{split:.1f}\t{fused:.1f}\t{saved:.1f}\t{sp:+.1f}%")
-        print()
+    for tp_size in args.tp_size:
+        for with_graph in graph_modes:
+            mode_rows = []
+            for m, hidden_size in shapes:
+                ret = test_ar_mhc_post_only_profile(
+                    tp_size,
+                    m,
+                    hidden_size,
+                    with_graph=with_graph,
+                    distributed_init_method=init_method,
+                )
+                mode_rows.append(ret)
+                df_rows.append(ret)
+            _print_table(tp_size, with_graph, mode_rows)
 
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    df = pd.DataFrame(df_rows)
+    logger.info(
+        "AR+mhc_post profile summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
