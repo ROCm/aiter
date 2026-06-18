@@ -529,152 +529,6 @@ def pa_decode_bf16_asm(
     return out
 
 
-@triton.jit
-def _pa_reduce_v1_triton_kernel(
-    partial_output_ptr,
-    partial_lse_ptr,
-    reduce_indptr_ptr,
-    reduce_final_map_ptr,
-    reduce_partial_map_ptr,
-    final_output_ptr,
-    final_lse_ptr,
-    stride_po_tok: tl.int64,
-    stride_po_head: tl.int64,
-    stride_po_dim: tl.int64,
-    stride_lse_tok: tl.int64,
-    stride_lse_head: tl.int64,
-    stride_o_tok: tl.int64,
-    stride_o_head: tl.int64,
-    stride_o_dim: tl.int64,
-    stride_final_lse_tok: tl.int64,
-    stride_final_lse_head: tl.int64,
-    TILE_Q: tl.constexpr,
-    V_HEAD_DIM: tl.constexpr,
-    BLOCK_DIM: tl.constexpr,
-    HAS_FINAL_LSE: tl.constexpr,
-):
-    group_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-    tok_id = tl.program_id(2)
-
-    start_idx = tl.load(reduce_indptr_ptr + group_id)
-    end_idx = tl.load(reduce_indptr_ptr + group_id + 1)
-    num_partials = end_idx - start_idx
-    if num_partials == 0:
-        return
-
-    final_map_offset = group_id * 2
-    qo_start = tl.load(reduce_final_map_ptr + final_map_offset)
-    qo_end = tl.load(reduce_final_map_ptr + final_map_offset + 1)
-    q_len = qo_end - qo_start
-    if tok_id >= q_len:
-        return
-
-    max_lse = -float("inf")
-    for p_idx in range(num_partials):
-        partial_qo_loc = tl.load(reduce_partial_map_ptr + start_idx + p_idx)
-        lse_offset = (partial_qo_loc + tok_id) * stride_lse_tok + head_id * stride_lse_head
-        lse = tl.load(partial_lse_ptr + lse_offset)
-        lse = tl.where(lse == lse, lse, -float("inf"))
-        max_lse = tl.maximum(max_lse, lse)
-
-    sum_exp = 0.0
-    for p_idx in range(num_partials):
-        partial_qo_loc = tl.load(reduce_partial_map_ptr + start_idx + p_idx)
-        lse_offset = (partial_qo_loc + tok_id) * stride_lse_tok + head_id * stride_lse_head
-        lse = tl.load(partial_lse_ptr + lse_offset)
-        lse = tl.where(lse == lse, lse, -float("inf"))
-        sum_exp += tl.exp(lse - max_lse)
-
-    final_lse = max_lse + tl.log(sum_exp)
-    if HAS_FINAL_LSE:
-        tl.store(
-            final_lse_ptr + (qo_start + tok_id) * stride_final_lse_tok + head_id * stride_final_lse_head,
-            final_lse,
-        )
-
-    num_dim_blocks = tl.cdiv(V_HEAD_DIM, BLOCK_DIM)
-    for dim_block_id in range(num_dim_blocks):
-        dim_offsets = dim_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
-        dim_mask = dim_offsets < V_HEAD_DIM
-        acc = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
-
-        for p_idx in range(num_partials):
-            partial_qo_loc = tl.load(reduce_partial_map_ptr + start_idx + p_idx)
-            lse_offset = (partial_qo_loc + tok_id) * stride_lse_tok + head_id * stride_lse_head
-            lse = tl.load(partial_lse_ptr + lse_offset)
-            lse = tl.where(lse == lse, lse, -float("inf"))
-            scale = tl.exp(lse - final_lse)
-
-            out_offset = (
-                (partial_qo_loc + tok_id) * stride_po_tok
-                + head_id * stride_po_head
-                + dim_offsets * stride_po_dim
-            )
-            partial_out = tl.load(partial_output_ptr + out_offset, mask=dim_mask, other=0.0)
-            partial_out = tl.where(partial_out == partial_out, partial_out, 0.0)
-            acc += scale * partial_out
-
-        output_offset = (
-            (qo_start + tok_id) * stride_o_tok
-            + head_id * stride_o_head
-            + dim_offsets * stride_o_dim
-        )
-        tl.store(final_output_ptr + output_offset, acc.to(final_output_ptr.dtype.element_ty), mask=dim_mask)
-
-
-def _pa_reduce_v1_triton(
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    reduce_indptr: torch.Tensor,
-    reduce_final_map: torch.Tensor,
-    reduce_partial_map: torch.Tensor,
-    max_seqlen_q: int,
-    final_output: torch.Tensor,
-    final_lse: Optional[torch.Tensor] = None,
-) -> None:
-    if partial_output.dim() == 4:
-        assert partial_output.shape[1] == 1
-        partial_output = partial_output[:, 0]
-    if partial_lse.dim() == 4:
-        assert partial_lse.shape[1] == 1 and partial_lse.shape[-1] == 1
-        partial_lse = partial_lse[:, 0, :, 0]
-    elif partial_lse.dim() == 3 and partial_lse.shape[-1] == 1:
-        partial_lse = partial_lse[:, :, 0]
-
-    num_reduce_groups = reduce_indptr.shape[0] - 1
-    _, num_heads, v_head_dim = partial_output.shape
-    if num_reduce_groups == 0:
-        return
-
-    block_dim = 64 if v_head_dim > 64 else triton.next_power_of_2(v_head_dim)
-    grid = (num_reduce_groups, num_heads, max_seqlen_q)
-    _pa_reduce_v1_triton_kernel[grid](
-        partial_output,
-        partial_lse,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        final_output,
-        final_lse,
-        partial_output.stride(0),
-        partial_output.stride(1),
-        partial_output.stride(2),
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        final_output.stride(0),
-        final_output.stride(1),
-        final_output.stride(2),
-        final_lse.stride(0) if final_lse is not None else 0,
-        final_lse.stride(1) if final_lse is not None else 0,
-        TILE_Q=max_seqlen_q,
-        V_HEAD_DIM=v_head_dim,
-        BLOCK_DIM=block_dim,
-        HAS_FINAL_LSE=(final_lse is not None),
-        num_warps=4,
-    )
-
-
 def pa_reduce_v1(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -682,20 +536,19 @@ def pa_reduce_v1(
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
     max_seqlen_q: int,
-    num_kv_splits: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
 ) -> None:
-    if reduce_final_map is None:
-        raise NotImplementedError("pa_reduce_v1 requires reduce_final_map for the Triton reduce path")
-    _pa_reduce_v1_triton(
+    mla_reduce_v1(
         partial_output,
         partial_lse,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
         max_seqlen_q,
-        num_kv_splits,
+        # num_kv_splits: persistent path has variable splits; the kernel uses
+        # max(SM_count, num_kv_splits), so 0 reproduces the SM_count behavior.
+        0,
         final_output,
         final_lse,
     )
@@ -766,7 +619,6 @@ def pa_persistent_fwd(
         reduce_final_map,
         reduce_partial_map,
         max_qlen,
-        0,
         output,
         final_lse,
     )
