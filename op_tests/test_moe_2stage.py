@@ -3,6 +3,7 @@
 
 import torch
 import itertools
+import math
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest
@@ -627,6 +628,10 @@ def _row_to_kwargs(row):
         hidden_pad=0,
         intermediate_pad=0,
         preshuffle=True,
+        swiglu_limit=(
+            _row_swiglu_limit(row)
+            or _effective_swiglu_limit(q_type, aq_dtype, wq_dtype, args.swiglu_limit)
+        ),
     )
 
 
@@ -701,6 +706,21 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     return None
 
 
+def _row_swiglu_limit(row):
+    """Parse a CSV row's swiglu_limit. Empty / NaN / 0 all mean no clamp (None),
+    matching the reference's `if swiglu_limit:` truthiness and the AOT build."""
+    value = row.get("swiglu_limit") if hasattr(row, "get") else None
+    if value is None:
+        return None
+    try:
+        limit = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(limit) or limit == 0.0:
+        return None
+    return limit
+
+
 def _runtime_swiglu_mxfp4_q_dtype_a(
     token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
 ):
@@ -753,6 +773,9 @@ def _iter_legacy_cases():
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
+            swiglu_limit=_effective_swiglu_limit(
+                quant_type, aq_dtype, wq_dtype, args.swiglu_limit
+            ),
             **over,
         )
 
@@ -880,12 +903,6 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    swiglu_limit = _effective_swiglu_limit(
-        kwargs["qType"],
-        kwargs["AQDType"],
-        kwargs["WQDType"],
-        args.swiglu_limit,
-    )
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     _force_moe_bound_zero = (
         kwargs["qType"],
@@ -900,7 +917,7 @@ for kwargs, extras in case_iter:
             if kwargs.get("check_aot_cache", False)
             else test_fmoe
         )
-        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+        ret = run_test_fmoe(**kwargs)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:

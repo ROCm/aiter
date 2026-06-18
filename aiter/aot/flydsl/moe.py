@@ -70,7 +70,13 @@ def _parse_optional_float(value, source: str) -> float | None:
 
 
 def _row_swiglu_limit(row: dict[str, str]) -> float | None:
-    return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit")
+    limit = _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit")
+    # Treat 0.0 (and the merge fill default) the same as None: a 0 clamp is
+    # meaningless and matches the reference's `if swiglu_limit:` truthiness,
+    # so "no column", empty, and 0 all mean "no clamp".
+    if limit == 0.0:
+        return None
+    return limit
 
 
 def parse_csv(csv_path: str):
