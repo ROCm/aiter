@@ -184,11 +184,26 @@ def _mhc_fused_config_gfx1250_256(m, hidden_size, num_cu):
     # (m upper bound, target split_k) measured per (m, hidden) then merged; the
     # target is snapped to a legal divisor below so it stays valid for any hidden.
     if hidden_size >= 7168:
-        table = [(128, 56), (256, 56), (512, 32), (1024, 8),
-                 (2048, 16), (4096, 8), (8192, 4), (1 << 30, 2)]
+        table = [
+            (128, 56),
+            (256, 56),
+            (512, 32),
+            (1024, 8),
+            (2048, 16),
+            (4096, 8),
+            (8192, 4),
+            (1 << 30, 2),
+        ]
     else:
-        table = [(256, 32), (512, 64), (1024, 16), (2048, 16),
-                 (4096, 16), (8192, 4), (1 << 30, 2)]
+        table = [
+            (256, 32),
+            (512, 64),
+            (1024, 16),
+            (2048, 16),
+            (4096, 16),
+            (8192, 4),
+            (1 << 30, 2),
+        ]
     target = next(t for ub, t in table if m <= ub)
     splitk = min(valid, key=lambda s: (abs(math.log(s) - math.log(target)), -s))
     return splitk, tile_m, tile_n, tile_k
