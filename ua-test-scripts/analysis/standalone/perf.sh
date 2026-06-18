@@ -23,15 +23,36 @@ ITERS="${ITERS:-100}"; WARMUP="${WARMUP:-10}"; ROTATE="${ROTATE:-1}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 EXE="$HERE/build/ua_trace"
 
+# Decode auto-config. The decode tiers are paged-only instances selected at
+# runtime by rows = sq * (hq/hk): <=16 -> m16 (decode_t), <=32 -> m32
+# (decode_s), <=128 -> m128 (decode). When SK is set (sq=1 decode), pick the
+# matching target instance + force PAGED=1 unless the caller overrode them, so
+# `SK=196608 perf.sh 1 16 2 128 0` just works. PAGE_BLK defaults to 64.
+MASKTAG=$([[ "$MASK" == "0" ]] && echo "nmask" || echo "mask")
+if [[ -n "${SK:-}" ]]; then
+    rows=$(( SQ * HQ / HK ))
+    if   [[ $rows -le 16  ]]; then tier="decode_t"
+    elif [[ $rows -le 32  ]]; then tier="decode_s"
+    elif [[ $rows -le 128 ]]; then tier="decode"
+    else tier=""; fi   # rows>128 isn't a decode tier; leave default (prefill)
+    [[ -n "$tier" ]] && export TARGET_INSTANCE="${TARGET_INSTANCE:-unified_attention_d${D}_${DTYPE}_${MASKTAG}_${tier}}"
+    export PAGED="${PAGED:-1}"; export PAGE_BLK="${PAGE_BLK:-64}"
+fi
+
 # build.sh self-guards (rebuilds iff stamp mismatch or any source newer than exe).
 ARCH="$ARCH" DTYPE="$DTYPE" D="$D" MASK="$MASK" bash "$HERE/build.sh" >&2
 
 run() {  # $1=sq
-    HIP_VISIBLE_DEVICES="$GPU" PERF=1 WARMUP="$WARMUP" ROTATE="$ROTATE" \
-        "$EXE" "$1" "$HQ" "$HK" "$D" "$MASK" "$ITERS" | sed -n 's/^\[perf\]/  /p'
+    local env=(HIP_VISIBLE_DEVICES="$GPU" PERF=1 WARMUP="$WARMUP" ROTATE="$ROTATE")
+    [[ -n "${SK:-}"         ]] && env+=(SK="$SK")
+    [[ -n "${PAGED:-}"      ]] && env+=(PAGED="$PAGED")
+    [[ -n "${PAGE_BLK:-}"   ]] && env+=(PAGE_BLK="$PAGE_BLK")
+    [[ -n "${NUM_SPLITS:-}" ]] && env+=(NUM_SPLITS="$NUM_SPLITS")
+    [[ -n "${NUM_SEQS:-}"   ]] && env+=(NUM_SEQS="$NUM_SEQS")
+    env "${env[@]}" "$EXE" "$1" "$HQ" "$HK" "$D" "$MASK" "$ITERS" | sed -n 's/^\[perf\]/  /p'
 }
 
-echo "# UA standalone perf  dtype=$DTYPE d=$D mask=$MASK heads=$HQ/$HK  iters=$ITERS rotate=$ROTATE"
+echo "# UA standalone perf  dtype=$DTYPE d=$D mask=$MASK heads=$HQ/$HK  iters=$ITERS rotate=$ROTATE${SK:+ sk=$SK paged=$PAGE_BLK target=${TARGET_INSTANCE:-?}}"
 if [[ -n "${SWEEP:-}" ]]; then
     for s in $SWEEP; do printf 'sq=%-7s' "$s"; run "$s"; done
 else

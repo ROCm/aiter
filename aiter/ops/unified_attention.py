@@ -41,21 +41,43 @@ def _fast_exp(x):
     return tl.math.exp2(x * RCP_LN2)
 
 
+# -----------------------------------------------------------------------------
+# Two-level parallel split-KV combine.
+#
+# The previous single-kernel reduce launched grid=(num_tokens, num_query_heads)
+# and processed ALL splits inside one program. At the low-batch / long-context
+# decode target that is catastrophically under-parallel: b=1 GQA-8 == 8 programs
+# (8 CUs of 256), and at high split counts each program loads a [num_splits,
+# head_size] tile that spills, so the combine cost EXPLODED with num_splits
+# (measured ~92 us @1024 splits, dominating a ~16 us main kernel).
+#
+# This version parallelizes over the SPLIT axis so all CUs participate even when
+# there is a single output tile (decode_pipeline_research_plan.md, Design C):
+#   * Kernel A (grid = tokens x heads x chunks): each program online-softmax-
+#     reduces CHUNK splits into a partial (max, sumexp, weighted-acc) triple.
+#   * Kernel B (grid = tokens x heads): merges the few chunk-partials with the
+#     standard online-softmax rescale (associative), then normalizes + stores.
+# No atomics (deterministic), only two launches, and ~flat in num_splits
+# (~13-18 us across 128..1024 splits, vs the old kernel's blow-up).
+# -----------------------------------------------------------------------------
 @triton.jit
-def _reduce_segments_ck_layout(
-    output_ptr,       # [num_tokens, num_query_heads, head_size]  (bf16/fp16)
-    o_acc_ptr,        # [num_query_heads, num_splits, num_tokens, head_size]  fp32
-    lse_acc_ptr,      # [num_query_heads, num_splits, num_tokens]             fp32
-    num_tokens,       # int (runtime, stride multiplier)
-    num_splits,       # int (runtime, stride multiplier + active-split mask)
-    output_stride_0: tl.int64,
-    output_stride_1: tl.int64,
+def _reduce_chunk_partials(
+    o_acc_ptr,        # [num_query_heads, num_splits, num_tokens, head_size] fp32
+    lse_acc_ptr,      # [num_query_heads, num_splits, num_tokens]            fp32
+    cmax_ptr,         # [num_tokens, num_query_heads, NUM_CHUNKS]            fp32
+    csum_ptr,         # [num_tokens, num_query_heads, NUM_CHUNKS]            fp32
+    cacc_ptr,         # [num_tokens, num_query_heads, NUM_CHUNKS, HEAD_SIZE_PADDED] fp32
+    num_tokens,       # int (runtime stride multiplier)
+    num_query_heads,  # int (runtime stride multiplier)
+    num_splits,       # int (runtime stride multiplier + active-split mask)
     HEAD_SIZE: tl.constexpr,
     HEAD_SIZE_PADDED: tl.constexpr,
-    NUM_SPLITS_PADDED: tl.constexpr,
+    CHUNK: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx  = tl.program_id(1)
+    chunk_idx       = tl.program_id(2)
 
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     if HEAD_SIZE_PADDED != HEAD_SIZE:
@@ -63,7 +85,7 @@ def _reduce_segments_ck_layout(
     else:
         dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
-    s_idx      = tl.arange(0, NUM_SPLITS_PADDED)
+    s_idx      = chunk_idx * CHUNK + tl.arange(0, CHUNK)
     split_mask = s_idx < num_splits
 
     lse_offset = (
@@ -75,29 +97,84 @@ def _reduce_segments_ck_layout(
 
     is_empty = lse == float("-inf")
     lse_safe = tl.where(is_empty, -1.0e38, lse)
-    lse_max  = tl.max(lse_safe)
+    cmax     = tl.max(lse_safe)
 
-    weight = _fast_exp(lse - lse_max)
+    weight = _fast_exp(lse - cmax)
     weight = tl.where(is_empty, 0.0, weight)
-    weight_sum = tl.sum(weight)
-    weight_sum_safe = tl.where(weight_sum == 0.0, 1.0, weight_sum)
+    csum   = tl.sum(weight)
 
+    # Mask out empty splits in the load itself: the CK kernel skips writing
+    # o_acc for splits whose KV range is fully outside the SWA window, so those
+    # lanes contain uninitialized memory that may be NaN/Inf. `NaN * 0 == NaN`
+    # would poison the reduction, so exclude them from the load.
     o_offset = (
         query_head_idx.to(tl.int64) * (num_splits * num_tokens * HEAD_SIZE)
         + s_idx[:, None].to(tl.int64) * (num_tokens * HEAD_SIZE)
         + query_token_idx * HEAD_SIZE
         + offs_d[None, :]
     )
-    # Mask out empty splits in the load itself: the CK kernel skips
-    # writing o_acc for splits whose KV range is fully outside the SWA
-    # window (or otherwise produced no work), so those lanes contain
-    # uninitialized memory that may be NaN/Inf. Relying on `weight==0`
-    # to zero them out is unsafe because `NaN * 0 == NaN` and that NaN
-    # then poisons the per-token reduction.
     valid = split_mask[:, None] & dim_mask[None, :] & (~is_empty)[:, None]
-    o = tl.load(o_acc_ptr + o_offset, mask=valid, other=0.0)
-    o = o * weight[:, None]
-    acc = tl.sum(o, axis=0) / weight_sum_safe
+    o     = tl.load(o_acc_ptr + o_offset, mask=valid, other=0.0)
+    cacc  = tl.sum(o * weight[:, None], axis=0)  # [HEAD_SIZE_PADDED], NOT normalized
+
+    part_offset = (
+        query_token_idx.to(tl.int64) * (num_query_heads * NUM_CHUNKS)
+        + query_head_idx * NUM_CHUNKS
+        + chunk_idx
+    )
+    tl.store(cmax_ptr + part_offset, cmax)
+    tl.store(csum_ptr + part_offset, csum)
+    cacc_offset = part_offset * HEAD_SIZE_PADDED + offs_d
+    tl.store(cacc_ptr + cacc_offset, cacc, mask=dim_mask)
+
+
+@triton.jit
+def _reduce_chunk_final(
+    output_ptr,       # [num_tokens, num_query_heads, head_size] (bf16/fp16)
+    cmax_ptr,         # [num_tokens, num_query_heads, NUM_CHUNKS] fp32
+    csum_ptr,         # [num_tokens, num_query_heads, NUM_CHUNKS] fp32
+    cacc_ptr,         # [num_tokens, num_query_heads, NUM_CHUNKS, HEAD_SIZE_PADDED] fp32
+    num_query_heads,  # int (runtime stride multiplier)
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
+    NUM_CHUNKS_PADDED: tl.constexpr,
+):
+    query_token_idx = tl.program_id(0)
+    query_head_idx  = tl.program_id(1)
+
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    if HEAD_SIZE_PADDED != HEAD_SIZE:
+        dim_mask = offs_d < HEAD_SIZE
+    else:
+        dim_mask = tl.full((1,), 1, dtype=tl.int1)
+
+    c_idx  = tl.arange(0, NUM_CHUNKS_PADDED)
+    c_mask = c_idx < NUM_CHUNKS
+
+    base = (
+        query_token_idx.to(tl.int64) * (num_query_heads * NUM_CHUNKS)
+        + query_head_idx * NUM_CHUNKS
+    )
+    cmax = tl.load(cmax_ptr + base + c_idx, mask=c_mask, other=float("-inf"))
+    csum = tl.load(csum_ptr + base + c_idx, mask=c_mask, other=0.0)
+
+    # A chunk with no live splits has cmax == -inf (csum == 0); rescale to 0.
+    is_empty = cmax == float("-inf")
+    cmax_safe = tl.where(is_empty, -1.0e38, cmax)
+    gmax      = tl.max(cmax_safe)
+
+    scale = _fast_exp(cmax - gmax)
+    scale = tl.where(is_empty, 0.0, scale)
+    total = tl.sum(scale * csum)
+    total_safe = tl.where(total == 0.0, 1.0, total)
+
+    cacc_offset = (base + c_idx)[:, None] * HEAD_SIZE_PADDED + offs_d[None, :]
+    valid = c_mask[:, None] & dim_mask[None, :]
+    cacc  = tl.load(cacc_ptr + cacc_offset, mask=valid, other=0.0)
+    acc   = tl.sum(cacc * scale[:, None], axis=0) / total_safe
 
     output_offset = (
         query_token_idx * output_stride_0
@@ -208,6 +285,23 @@ def _num_cus(device: torch.device) -> int:
 # only a sub-2us miss at very short sk). Env-overridable for tuning.
 _UA_MIN_SPLIT_KV_TOKENS = int(os.environ.get("AITER_UA_MIN_SPLIT_KV_TOKENS", "128"))
 
+# Splits reduced per program in kernel A of the two-level combine. Trades the
+# per-program serial split walk (small -> short) against the kernel-B fan-in
+# (small -> more chunks). 16 was the standalone sweet spot across 128..1024
+# splits. Env-overridable for tuning.
+_UA_COMBINE_CHUNK = int(os.environ.get("AITER_UA_COMBINE_CHUNK", "16"))
+
+# CTA-occupancy target for split-KV, in waves/CU. Default is ADAPTIVE: decode
+# launches one warp per CTA and a CU has 4 SIMDs, but filling all 4 only pays off
+# for SINGLE-sequence decode (num_seqs==1) — a uniquely starved single KV stream
+# that, with the now-cheap two-level combine, profits from 4 waves at long
+# context (measured b=1 sk=196608: 1024 splits 27.9us vs 512's 31.8us). Once
+# there are >=2 sequences/tiles the e2e optimum is 2 waves; 4 waves over-splits
+# and regresses (b=2 41.5 vs 35.9us, b=4/b=8 ~7-9%) — see
+# decode_pipeline_research_plan.md §14. Set AITER_UA_OCC_WAVES to force a fixed
+# value (e.g. "2" to disable the single-seq bump, "4" for always-4).
+_UA_OCC_WAVES = os.environ.get("AITER_UA_OCC_WAVES")  # None => adaptive
+
 
 def _pick_num_splits(
     query: torch.Tensor,
@@ -219,10 +313,11 @@ def _pick_num_splits(
 
     Cost model (pure-CPU, no device sync — safe under CUDA graph capture):
         base_ctas    = num_kv_heads * q_tiles
-        occ_splits   = ceil(num_cus * 2 / base_ctas)        # fill ~2 waves/CU
+        occ_waves    = 4 if num_seqs == 1 else 2            # single-seq fills all SIMDs
+        occ_splits   = ceil(num_cus * occ_waves / base_ctas)
         sk_ub        = max_num_blocks_per_seq * block_size  # host-side sk bound
         work_splits  = sk_ub // _UA_MIN_SPLIT_KV_TOKENS      # combine-amortize cap
-        num_splits   = clamp(next_pow2(min(occ_splits, work_splits)), 1, num_cus*2)
+        num_splits   = clamp(next_pow2(min(occ_splits, work_splits)), 1, num_cus*occ_waves)
 
     `sk_ub` is read from tensor SHAPES only (block_tables.shape[1] *
     key_cache.shape[1]) — an upper bound on per-seq KV length that needs no
@@ -230,23 +325,30 @@ def _pick_num_splits(
     common uniform-batch decode case and conservatively large (more splits
     allowed) when block tables are padded.
 
-    Why 2x oversubscription + an sk-derived work cap (was 4x + flat cap 128):
-      * The flat cap 128 truncated only the LOW-batch end: for b=1 GQA-8
-        long-context decode the 4x rule wants ~1024 splits but clamped to
-        128, leaving ~3 of every 4 SIMDs idle. Measured end-to-end (CK incl.
-        combine, MI355X, GQA-8 d128 fp8, decode_pipeline_research_plan.md
-        §13): raising splits is 1.5-1.9x at b<=4 long context. But pushing
-        too far regresses — combine cost (linear in num_splits) overtakes the
-        main-kernel saving. The end-to-end optimum is ~2 waves/CU (hence
-        num_cus*2, not *4), bounded by the per-split work cap below.
+    Why an adaptive 2/4-wave target + an sk-derived work cap:
+      * Decode launches one warp/CTA and a CU has 4 SIMDs. Filling all 4
+        (num_cus*4 CTAs) only pays off for SINGLE-sequence decode (num_seqs==1):
+        one starved KV stream with, at long context, enough per-split work to
+        amortize the (now cheap) combine. Measured end-to-end (CK incl. combine,
+        MI355X, GQA-8 d128 fp8, decode_pipeline_research_plan.md §14): b=1
+        sk=196608 1024 splits 27.9us vs 512's 31.8us (and vs the OLD combine's
+        108.6us @1024 — the two-level `_reduce_chunk_*` combine is ~flat in
+        num_splits, which is what unlocks pushing splits this high at all).
+      * Once there are >=2 sequences the e2e optimum drops to 2 waves: 4 waves
+        over-splits and regresses (b=2 41.5 vs 35.9us; b=4/b=8 ~7-9%). The total
+        optimal grid is ~num_cus*2 CTAs for b>=2, num_cus*4 only for b=1 — hence
+        occ_waves = 4 if num_seqs==1 else 2.
+      * Higher batch additionally self-limits via base_ctas (grows with batch),
+        so occ_splits = ceil(num_cus*occ_waves / base_ctas) falls (b=4 -> 256,
+        b=8 -> 128), matching the measured per-batch optima.
       * The optimal per-split KV size grows ~sqrt(sk); _UA_MIN_SPLIT_KV_TOKENS
         is the best single constant for the linear `sk_ub // min` cap (optimal
         at mid/long sk, sub-2us miss at very short sk). This keeps short-context
         decode from over-splitting into combine-bound territory.
       * Workspace stays bounded: o_acc is fp32 [num_q_heads, num_splits,
-        total_q, head_size]; num_splits <= num_cus*2 keeps it within a small
-        multiple of the old cap-128 footprint (largest at low batch, where
-        total_q is tiny). Combine reads each split's o_acc/lse_acc once.
+        total_q, head_size]; num_splits <= num_cus*4 keeps it small (largest at
+        low batch, where total_q is tiny). Combine reads each split's
+        o_acc/lse_acc once.
       * Rounding to next_pow2 matches the combine kernel's
         NUM_SPLITS_PADDED = next_pow2(num_splits), so we don't pay
         for masked-out lanes — and stays compatible with the
@@ -331,9 +433,12 @@ def _pick_num_splits(
     if avg_q > 8 and base_ctas >= num_cus:
         return 1
 
-    # Occupancy target: enough CTAs to fill ~2 waves/CU. ceil-div so a single
-    # under-saturated base_ctas still gets bumped to the next splits tier.
-    hard_cap    = num_cus * 2
+    # Occupancy target: fill ~occ_waves/CU. Adaptive default — 4 waves (all SIMDs)
+    # for the uniquely-starved single-sequence case, 2 waves otherwise (the
+    # measured multi-sequence optimum; 4 over-splits and regresses b>=2). ceil-div
+    # so a single under-saturated base_ctas still gets bumped to the next tier.
+    occ_waves   = int(_UA_OCC_WAVES) if _UA_OCC_WAVES is not None else (4 if num_seqs == 1 else 2)
+    hard_cap    = num_cus * occ_waves
     occ_splits  = (hard_cap + base_ctas - 1) // max(1, base_ctas)
 
     # Combine-amortization cap. Each split traverses ~sk_ub/num_splits KV tokens;
@@ -363,14 +468,15 @@ def _combine_splits(
     o_acc: torch.Tensor,
     lse_acc: torch.Tensor,
 ) -> None:
-    """FlashDecoding-style LSE merge via a Triton kernel.
+    """FlashDecoding-style LSE merge via a two-level parallel Triton reduction.
 
-    This is a thin wrapper around `reduce_segments_ck_layout`, which is the
-    CK-layout sibling of `reduce_segments` (the kernel that Triton-UA's 3D
-    path uses). Algorithmically identical — both fuse the LSE rescale +
-    weighted sum into a single Triton launch — so combine-step overhead is
-    the same on both backends, eliminating it as a confounder when
-    comparing CK vs Triton attention-kernel performance.
+    Kernel A (`_reduce_chunk_partials`, grid = tokens x heads x chunks) reduces
+    CHUNK splits per program into a partial (max, sumexp, un-normalized acc);
+    kernel B (`_reduce_chunk_final`, grid = tokens x heads) merges the few
+    chunk-partials with the associative online-softmax rescale and normalizes.
+    Parallelizing over the SPLIT axis is what keeps the combine ~flat in
+    num_splits (the single-program-per-(token,head) reduce blew up to ~92us at
+    1024 splits at b=1); see decode_pipeline_research_plan.md §14.
 
     o_acc   : [nhead, num_splits, total_q, hdim]  fp32, contiguous,
                                                   per-split-normalized
@@ -384,24 +490,53 @@ def _combine_splits(
         out[t,h] = sum_s o_acc[h, s, t, :] * w[s] / sum_s w[s]
     """
     num_q_heads, num_splits, num_tokens, head_size = o_acc.shape
-    head_size_padded   = triton.next_power_of_2(head_size)
-    # NUM_SPLITS_PADDED is the `tl.arange` upper bound — only it needs to
-    # be a power of 2. `num_splits` itself is the actual stride multiplier
-    # and the kernel masks the [num_splits, NUM_SPLITS_PADDED) tail.
-    num_splits_padded  = triton.next_power_of_2(num_splits)
-    grid = (num_tokens, num_q_heads)
-    _reduce_segments_ck_layout[grid](
-        output_ptr=output,
+    head_size_padded = triton.next_power_of_2(head_size)
+
+    # Split-axis parallelism: reduce CHUNK splits per program (kernel A), then
+    # merge the few chunk-partials (kernel B). CHUNK==16 was the standalone
+    # sweet spot (short serial walk + shallow fan-in); env-overridable.
+    chunk = _UA_COMBINE_CHUNK
+    num_chunks = (num_splits + chunk - 1) // chunk
+    num_chunks_padded = triton.next_power_of_2(num_chunks)
+
+    # FP32 chunk-partials: max / sumexp (scalar per chunk) + un-normalized
+    # weighted accumulator (head_size_padded per chunk). Bounded: num_splits is
+    # capped by the heuristic and num_chunks == ceil(num_splits/CHUNK) is small.
+    cmax = torch.empty((num_tokens, num_q_heads, num_chunks),
+                       dtype=torch.float32, device=o_acc.device)
+    csum = torch.empty_like(cmax)
+    cacc = torch.empty((num_tokens, num_q_heads, num_chunks, head_size_padded),
+                       dtype=torch.float32, device=o_acc.device)
+
+    _reduce_chunk_partials[(num_tokens, num_q_heads, num_chunks)](
         o_acc_ptr=o_acc,
         lse_acc_ptr=lse_acc,
+        cmax_ptr=cmax,
+        csum_ptr=csum,
+        cacc_ptr=cacc,
         num_tokens=num_tokens,
+        num_query_heads=num_q_heads,
         num_splits=num_splits,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=head_size_padded,
+        CHUNK=chunk,
+        NUM_CHUNKS=num_chunks,
+        num_warps=2,
+        num_stages=1,
+    )
+    _reduce_chunk_final[(num_tokens, num_q_heads)](
+        output_ptr=output,
+        cmax_ptr=cmax,
+        csum_ptr=csum,
+        cacc_ptr=cacc,
+        num_query_heads=num_q_heads,
         output_stride_0=output.stride(0),
         output_stride_1=output.stride(1),
         HEAD_SIZE=head_size,
         HEAD_SIZE_PADDED=head_size_padded,
-        NUM_SPLITS_PADDED=num_splits_padded,
-        num_warps=2 if num_splits >= 4 else 1,
+        NUM_CHUNKS=num_chunks,
+        NUM_CHUNKS_PADDED=num_chunks_padded,
+        num_warps=2 if num_chunks >= 4 else 1,
         num_stages=1,
     )
 

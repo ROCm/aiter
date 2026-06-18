@@ -580,3 +580,60 @@ returns 1; GQA-3/5/6 decode + prefill fixtures unaffected). Only the predicted, 
 **Remaining:** A/B vs Triton across the full 640-shape production trace to confirm the net
 distribution win; consider the √sk form (C≈1.4) if the mid-sk residual (b=1 sk=65536 picks
 512 vs optimal 256) matters.
+
+---
+
+## 14. IMPLEMENTED (2026-06-18): parallel two-level combine + adaptive split target
+
+The combine — not the main kernel — turned out to be the lever that caps how far split-KV
+can be pushed. The old combine (`_reduce_segments_ck_layout`) launched grid =
+`(num_tokens, num_query_heads)` and reduced ALL splits inside one program, so at b=1 GQA-8
+it ran **8 programs (8 of 256 CUs)** and each loaded a `[num_splits, head_size]` tile that
+spilled. Its cost **exploded with num_splits**, which is what forced the `num_cus*2` cap.
+
+**Standalone combine A/B** (`ua_trace_main.cpp`, `COMBINE=1`, b=1 sk=196608 GQA-8, isolated
+combine kernel time; the standalone serial reduce is a 1-thread/(tok,head) strawman):
+
+| splits | serial (strawman) | parallel-reduce | plain atomic | last-CTA (Lean naive) | **chunked (C=16)** |
+|---|---|---|---|---|---|
+| 512  | ~12,000 µs | 74 | 22 | **511** | **14.6** |
+| 1024 | ~25,000 µs | 145 | 35 | **1308** | **15.4** |
+
+Two decisive findings:
+1. **The cost was under-parallelization over the SPLIT axis**, not the separate launch.
+   A chunked segmented reduce (each block folds C=16 splits, then a shallow fan-in) is
+   ~flat in num_splits (~13–18 µs across 128..1024 splits).
+2. **The literal "Lean fused = last-arriving CTA does the merge" is a trap for low batch.**
+   At b≤8 there are only 1–8 output tiles, so 1–8 CTAs do the whole reduction serially over
+   splits → 0.5–2 **ms**. Distributing the reduction (chunked/Stream-K) is mandatory; a true
+   fused version would need cross-CTA online-softmax atomics (deferred — the separate chunked
+   reduce already captures the parallel-reduction win).
+
+The CK FMHA combine (`fmha_fwd_splitkv_combine_kernel.hpp`, used by the standard CK
+`fmha_fwd_splitkv` path) is well-built (in-block LDS warp reduction) but **hard-capped at
+`num_splits ≤ 128`** (codegen `kLogMaxSplits` 3→7), which pins the main kernel to its
+under-occupied 128-split regime (65 µs at b=1) — so it can't reach the 1024-split regime
+this workload needs. Not adopted.
+
+**Shipped (`unified_attention.py`):**
+- `_combine_splits` rewritten as a **two-level parallel reduction** (`_reduce_chunk_partials`
+  grid = tokens×heads×chunks → `_reduce_chunk_final` grid = tokens×heads). No atomics
+  (deterministic), 2 launches, ~flat in num_splits. `AITER_UA_COMBINE_CHUNK` (=16) tunes it.
+- `_pick_num_splits` occupancy target made **adaptive**: `occ_waves = 4 if num_seqs==1 else 2`.
+  4 waves (all SIMDs) only helps the uniquely-starved single-sequence case; ≥2 sequences peak
+  at 2 waves (`AITER_UA_OCC_WAVES` overrides).
+
+**End-to-end (CK incl. combine, heuristic picks; MI355X GQA-8 d128 fp8 sk=196608):**
+
+| b | picked splits | old combine best | new e2e | vs Triton |
+|---|---|---|---|---|
+| 1 | 1024 | 40.8 µs (@512) | **26.7** | **2.04×** |
+| 2 | 512  | 45.7 (@512)     | **36.7** | **1.62×** |
+| 4 | 256  | 54.1 (@256)     | **56.5** | 1.12× |
+| 8 | 128  | 88.6 (@128)     | 93.1     | 0.88× |
+
+The 1024-split blow-up is gone (108.6 → 28 µs at b=1), moving the b=1 optimum to `num_cus*4`.
+Correctness PASS across split counts, dtypes (bf16/fp8), d64/d128, GQA-1/8, and all 26 SWA
+fixtures (empty-split masking) at forced 1024 splits. b=8 is unchanged by this work (128
+splits before and after) and remains a pre-existing CK main-kernel gap vs Triton at high
+batch — orthogonal to the combine.

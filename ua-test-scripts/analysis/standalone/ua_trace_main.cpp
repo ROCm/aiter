@@ -32,6 +32,17 @@
 //   PAGE_BLK=128 paging granularity (tokens/page). 128 == the kv tile (one page
 //                per tile, kRebaseKSrd fast path); 16/32/64 span multiple pages.
 //                Must match the built ps{N} instance.
+//   SK           KV context length (default = sq). Set sq=1 SK=<context> to
+//                profile the decode tier (selected via max_seqlen_q==sq). The
+//                decode instances are paged-only, so pair with PAGED=1.
+//   NUM_SEQS     number of independent sequences (default 1). Decode grid is
+//                dim3(num_kv_heads, num_seqs, num_splits) -> this is the knob
+//                for resident CTAs/CU (production decode runs batch>1). sq/sk
+//                are PER-SEQ; each seq gets its own KV region.
+//   NUM_SPLITS   split-KV count (gridDim.z). 0/unset = production heuristic
+//                (aiter/ops/unified_attention.py _pick_num_splits); >=1 forces
+//                a value. >1 launches the 3D split grid, writes fp32
+//                (o_acc,lse_acc) partials, and the CHECK path merges them.
 //   SEED=42      RNG seed
 //   QKV_STD=1.0  stddev of the normal fill for Q/K/V
 //   RTOL=2e-2 ATOL=1e-2   accuracy tolerances (|got-ref| <= ATOL + RTOL*|ref|)
@@ -159,22 +170,29 @@ static std::vector<float> reference(const std::vector<T>& q,
 // d is bounded by kRefMaxD (these instances are d<=128); guarded in main().
 static constexpr int kRefMaxD = 256;
 
+// Multi-seq aware: each of `total_q` global query tokens belongs to seq =
+// token/sq (equal sq per seq) and attends only to its own KV region, whose
+// physical base token is seq*kv_seq_stride (kv_seq_stride = pages_per_seq*
+// page_blk for paged, sk for contiguous). sq/sk are PER-SEQ lengths.
 template <typename T>
 __global__ void ref_attn_kernel(const T* __restrict__ q,
                                 const T* __restrict__ k,
                                 const T* __restrict__ v,
                                 float* __restrict__ o,
-                                int sq, int sk, int hq, int hk, int d, int mask,
-                                float qk_scale, float v_descale)
+                                int total_q, int sq, int sk, int hq, int hk, int d, int mask,
+                                long kv_seq_stride, float qk_scale, float v_descale)
 {
-    const long row = (long)blockIdx.x * blockDim.x + threadIdx.x; // 0..hq*sq
-    if(row >= (long)hq * sq)
+    const long row = (long)blockIdx.x * blockDim.x + threadIdx.x; // 0..hq*total_q
+    if(row >= (long)hq * total_q)
         return;
-    const int  h   = (int)(row % hq); // O/Q layout is [token, head, d]
-    const int  i   = (int)(row / hq);
-    const int  nr  = hq / hk;
-    const int  kv  = h / nr;
-    const long off = (long)sk - (long)sq; // bottom-right causal anchor
+    const int  h       = (int)(row % hq); // O/Q layout is [token, head, d]
+    const int  i       = (int)(row / hq); // global query token
+    const int  seq     = i / sq;
+    const int  i_local = i % sq;          // query index within its seq
+    const int  nr      = hq / hk;
+    const int  kv      = h / nr;
+    const long off     = (long)sk - (long)sq; // bottom-right causal anchor (per-seq)
+    const long kv_base = (long)seq * kv_seq_stride;
 
     const T*     qrow = &q[((long)i * hq + h) * d];
     float        acc[kRefMaxD];
@@ -185,9 +203,9 @@ __global__ void ref_attn_kernel(const T* __restrict__ q,
 
     for(int j = 0; j < sk; ++j)
     {
-        if(mask == 2 && (long)j > (long)i + off)
+        if(mask == 2 && (long)j > (long)i_local + off)
             break; // causal: no valid keys past the diagonal
-        const T*     krow = &k[((long)j * hk + kv) * d];
+        const T*     krow = &k[((kv_base + j) * hk + kv) * d];
         float        dot  = 0.f;
         for(int e = 0; e < d; ++e)
             dot += ck_tile::type_convert<float>(qrow[e]) * ck_tile::type_convert<float>(krow[e]);
@@ -196,7 +214,7 @@ __global__ void ref_attn_kernel(const T* __restrict__ q,
         const float corr  = expf(m - m_new); // 0 on the first valid key (m=-inf)
         const float p     = expf(s - m_new);
         l                 = l * corr + p;
-        const T*     vrow = &v[((long)j * hk + kv) * d];
+        const T*     vrow = &v[((kv_base + j) * hk + kv) * d];
         for(int e = 0; e < d; ++e)
             acc[e] = acc[e] * corr + p * ck_tile::type_convert<float>(vrow[e]);
         m = m_new;
@@ -210,19 +228,21 @@ __global__ void ref_attn_kernel(const T* __restrict__ q,
 
 template <typename T>
 static std::vector<float> reference_gpu(const T* q, const T* k, const T* v,
-                                        int sq, int sk, int hq, int hk, int d, int mask,
+                                        int total_q, int sq, int sk, int hq, int hk, int d,
+                                        int mask, long kv_seq_stride,
                                         float scale_s, float q_descale, float k_descale,
                                         float v_descale)
 {
     const float qk_scale = scale_s * q_descale * k_descale;
-    const size_t n       = (size_t)sq * hq * d;
+    const size_t n       = (size_t)total_q * hq * d;
     float*       o_dev   = nullptr;
     HIP_CHECK(hipMalloc(&o_dev, n * sizeof(float)));
 
-    const long  rows  = (long)hq * sq;
+    const long  rows  = (long)hq * total_q;
     const int   block = 128;
     const int   grid  = (int)((rows + block - 1) / block);
-    ref_attn_kernel<T><<<grid, block>>>(q, k, v, o_dev, sq, sk, hq, hk, d, mask, qk_scale, v_descale);
+    ref_attn_kernel<T><<<grid, block>>>(q, k, v, o_dev, total_q, sq, sk, hq, hk, d, mask,
+                                        kv_seq_stride, qk_scale, v_descale);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -230,6 +250,294 @@ static std::vector<float> reference_gpu(const T* q, const T* k, const T* v,
     HIP_CHECK(hipMemcpy(o_host.data(), o_dev, n * sizeof(float), hipMemcpyDeviceToHost));
     HIP_CHECK(hipFree(o_dev));
     return o_host;
+}
+
+// ---------------------------------------------------------------------------
+// Split-KV count heuristic, mirroring aiter/ops/unified_attention.py
+// (_pick_num_splits) so the standalone launches the SAME 3D grid (gridDim.z ==
+// num_splits) the production wrapper would for this shape. NUM_SPLITS env
+// overrides: >=1 forces that value, 0 (default) runs the heuristic.
+//   base_ctas   = num_kv_heads * q_tiles
+//   occ_splits  = ceil(num_cus * 2 / base_ctas)          # fill ~2 waves/CU
+//   work_splits = sk_ub // MIN_SPLIT_KV_TOKENS           # combine-amortize cap
+//   num_splits  = clamp(next_pow2(min(occ, work)), 1, num_cus*2)
+// with the prefill saturation guard (avg_q>8 && base_ctas>=num_cus -> 1).
+// sk_ub is the per-seq KV upper bound (pages_per_seq * page_blk in production).
+static int pick_num_splits(long total_q, int hq, int hk, int num_seqs, int num_cus,
+                           long sk_ub)
+{
+    if(const char* e = std::getenv("NUM_SPLITS"))
+    {
+        const int v = std::atoi(e);
+        if(v >= 1) return v;           // explicit force (0 -> fall through to heuristic)
+    }
+    if(num_seqs <= 0) return 1;
+    const int  num_qpkv = hq / hk;
+    const long avg_q    = total_q / num_seqs;
+    int kBlockQ;
+    if(num_qpkv == 1)
+        kBlockQ = avg_q <= 16 ? 16 : avg_q <= 32 ? 32 : avg_q <= 128 ? 128 : 256;
+    else
+    {
+        const int tiny = 16 / num_qpkv, small = 64 / num_qpkv;
+        kBlockQ = avg_q <= tiny ? tiny : avg_q <= small ? small : 128 / num_qpkv;
+    }
+    kBlockQ            = std::max(1, kBlockQ);
+    const long q_tiles = std::max(1L, (total_q + kBlockQ - 1) / kBlockQ);
+    const long base    = (long)hk * q_tiles;
+    if(avg_q > 8 && base >= num_cus) return 1;   // prefill already saturates
+    const long hard_cap   = (long)num_cus * 2;
+    const long occ_splits = (hard_cap + base - 1) / std::max(1L, base);
+    long min_split_kv = 128;
+    if(const char* e = std::getenv("AITER_UA_MIN_SPLIT_KV_TOKENS"))
+        min_split_kv = std::max(1, std::atoi(e));
+    const long work_splits = std::max(1L, sk_ub / std::max(1L, min_split_kv));
+    const long raw         = std::min(occ_splits, work_splits);
+    int pow2 = 1;
+    while(pow2 < raw) pow2 <<= 1;
+    return std::max(1, (int)std::min(hard_cap, (long)pow2));
+}
+
+// FlashDecoding LSE merge: combine the per-split fp32 partials into the bf16
+// output. One thread per (token, head). Layouts:
+//   o_acc   [hq, splits, total_q, d]   lse_acc [hq, splits, total_q]
+//   out     [total_q, hq, d]           (output_stride_0 = hq*d, _1 = d)
+__global__ void combine_splits_kernel(const float* __restrict__ o_acc,
+                                      const float* __restrict__ lse_acc,
+                                      bf16_t* __restrict__ out,
+                                      int total_q, int hq, int d, int num_splits)
+{
+    const long row = (long)blockIdx.x * blockDim.x + threadIdx.x; // 0..total_q*hq
+    if(row >= (long)total_q * hq) return;
+    const int t = (int)(row / hq);
+    const int h = (int)(row % hq);
+
+    const long lse_h = (long)h * num_splits * total_q;
+    const long o_h   = (long)h * num_splits * total_q * d;
+
+    float m = -std::numeric_limits<float>::infinity();
+    for(int s = 0; s < num_splits; ++s)
+        m = fmaxf(m, lse_acc[lse_h + (long)s * total_q + t]);
+
+    float wsum = 0.f;
+    for(int s = 0; s < num_splits; ++s)
+    {
+        const float l = lse_acc[lse_h + (long)s * total_q + t];
+        if(l != -std::numeric_limits<float>::infinity()) wsum += expf(l - m);
+    }
+    const float inv = wsum > 0.f ? 1.f / wsum : 0.f;
+
+    bf16_t* orow = &out[(long)t * hq * d + (long)h * d];
+    for(int e = 0; e < d; ++e)
+    {
+        float acc = 0.f;
+        for(int s = 0; s < num_splits; ++s)
+        {
+            const float l = lse_acc[lse_h + (long)s * total_q + t];
+            if(l == -std::numeric_limits<float>::infinity()) continue;
+            const float w = expf(l - m) * inv;
+            acc += w * o_acc[o_h + (long)s * total_q * d + (long)t * d + e];
+        }
+        orow[e] = ck_tile::type_convert<bf16_t>(acc);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COMBINE VARIANTS (gated by env COMBINE=1, selected by COMBINE_KIND).
+// All consume the same fp32 partials the main split-KV kernel wrote:
+//   o_acc [hq, splits, total_q, d]   lse_acc [hq, splits, total_q]
+// and produce the bf16 output [total_q, hq, d]. We time them in isolation to
+// quantify the combine overhead the e2e A/B showed exploding with num_splits
+// (b=1: ~20us @512 -> ~92us @1024). The serial kernel is the production-shaped
+// reduce (1 thread per (token,head)); the others are the fix candidates.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float blk_max(float v, float* sh)
+{
+    const int t = threadIdx.x;
+    sh[t] = v;
+    __syncthreads();
+    for(int o = blockDim.x >> 1; o > 0; o >>= 1)
+    { if(t < o) sh[t] = fmaxf(sh[t], sh[t + o]); __syncthreads(); }
+    const float r = sh[0];
+    __syncthreads();
+    return r;
+}
+__device__ __forceinline__ float blk_sum(float v, float* sh)
+{
+    const int t = threadIdx.x;
+    sh[t] = v;
+    __syncthreads();
+    for(int o = blockDim.x >> 1; o > 0; o >>= 1)
+    { if(t < o) sh[t] += sh[t + o]; __syncthreads(); }
+    const float r = sh[0];
+    __syncthreads();
+    return r;
+}
+
+// PARALLEL REDUCE: one block per (token,head); threads cooperate across splits
+// (max + wsum block-reduce, weights cached in shared) then across the d dims.
+// Dynamic shared = (blockDim.x + num_splits) floats.
+__global__ void combine_par_kernel(const float* __restrict__ o_acc,
+                                   const float* __restrict__ lse_acc,
+                                   bf16_t* __restrict__ out,
+                                   int total_q, int hq, int d, int num_splits)
+{
+    extern __shared__ float smem[];
+    float* sred = smem;                 // blockDim.x scratch for reductions
+    float* sw   = smem + blockDim.x;     // num_splits cached weights/lse
+    const long row = blockIdx.x;
+    if(row >= (long)total_q * hq) return;
+    const int  t     = (int)(row / hq);
+    const int  h     = (int)(row % hq);
+    const long lse_h = (long)h * num_splits * total_q;
+    const long o_h   = (long)h * num_splits * total_q * d;
+    const int  tid   = threadIdx.x;
+
+    float lm = -std::numeric_limits<float>::infinity();
+    for(int s = tid; s < num_splits; s += blockDim.x)
+    { const float l = lse_acc[lse_h + (long)s * total_q + t]; sw[s] = l; lm = fmaxf(lm, l); }
+    const float m = blk_max(lm, sred);
+
+    float ls = 0.f;
+    for(int s = tid; s < num_splits; s += blockDim.x)
+    { const float l = sw[s]; const float w = (l == -std::numeric_limits<float>::infinity()) ? 0.f : __expf(l - m);
+      sw[s] = w; ls += w; }
+    const float wsum = blk_sum(ls, sred);
+    const float inv  = wsum > 0.f ? 1.f / wsum : 0.f;
+
+    bf16_t* orow = &out[(long)t * hq * d + (long)h * d];
+    for(int e = tid; e < d; e += blockDim.x)
+    {
+        float acc = 0.f;
+        for(int s = 0; s < num_splits; ++s)
+        { const float w = sw[s]; if(w != 0.f) acc += w * o_acc[o_h + (long)s * total_q * d + (long)t * d + e]; }
+        orow[e] = ck_tile::type_convert<bf16_t>(acc * inv);
+    }
+}
+
+// ATOMIC ADD (the "no buffer, atomic into output" idea). Correctness still needs
+// the global per-(token,head) softmax max, so phase 1 computes (m, inv) exactly
+// like the reduce; phase 2 has every (row, split) block atomicAdd its rescaled
+// contribution into an fp32 accumulator (contended: num_splits adds per element).
+__global__ void combine_atomic_prep(const float* __restrict__ lse_acc,
+                                     float* __restrict__ m_out, float* __restrict__ inv_out,
+                                     int total_q, int hq, int num_splits)
+{
+    extern __shared__ float smem[];
+    const long row = blockIdx.x;
+    if(row >= (long)total_q * hq) return;
+    const int  t     = (int)(row / hq);
+    const int  h     = (int)(row % hq);
+    const long lse_h = (long)h * num_splits * total_q;
+    const int  tid   = threadIdx.x;
+    float lm = -std::numeric_limits<float>::infinity();
+    for(int s = tid; s < num_splits; s += blockDim.x)
+        lm = fmaxf(lm, lse_acc[lse_h + (long)s * total_q + t]);
+    const float m = blk_max(lm, smem);
+    float ls = 0.f;
+    for(int s = tid; s < num_splits; s += blockDim.x)
+    { const float l = lse_acc[lse_h + (long)s * total_q + t];
+      if(l != -std::numeric_limits<float>::infinity()) ls += __expf(l - m); }
+    const float wsum = blk_sum(ls, smem);
+    if(tid == 0) { m_out[row] = m; inv_out[row] = wsum > 0.f ? 1.f / wsum : 0.f; }
+}
+// grid = (total_q*hq, num_splits); block = d. Each thread atomicAdds into oat.
+__global__ void combine_atomic_accum(const float* __restrict__ o_acc,
+                                     const float* __restrict__ lse_acc,
+                                     const float* __restrict__ m_in, const float* __restrict__ inv_in,
+                                     float* __restrict__ oat,
+                                     int total_q, int hq, int d, int num_splits)
+{
+    const long row = blockIdx.x;
+    const int  s   = blockIdx.y;
+    const int  e   = threadIdx.x;
+    if(row >= (long)total_q * hq || e >= d) return;
+    const int  t     = (int)(row / hq);
+    const int  h     = (int)(row % hq);
+    const long lse_h = (long)h * num_splits * total_q;
+    const long o_h   = (long)h * num_splits * total_q * d;
+    const float l = lse_acc[lse_h + (long)s * total_q + t];
+    if(l == -std::numeric_limits<float>::infinity()) return;
+    const float w = __expf(l - m_in[row]) * inv_in[row];
+    atomicAdd(&oat[row * d + e], w * o_acc[o_h + (long)s * total_q * d + (long)t * d + e]);
+}
+// CHUNKED atomic: grid = (rows, ceil(splits/chunk)); each block serially folds
+// `chunk` splits in registers, then ONE atomicAdd per element. This cuts both
+// the serial split-walk (par's bottleneck, now `chunk` long) and the atomic
+// contention depth (plain-atomic's, now splits/chunk). Standard segmented reduce.
+__global__ void combine_atomic_accum_chunked(const float* __restrict__ o_acc,
+                                             const float* __restrict__ lse_acc,
+                                             const float* __restrict__ m_in, const float* __restrict__ inv_in,
+                                             float* __restrict__ oat,
+                                             int total_q, int hq, int d, int num_splits, int chunk)
+{
+    const long row = blockIdx.x;
+    const int  s0  = blockIdx.y * chunk;
+    const int  e   = threadIdx.x;
+    if(row >= (long)total_q * hq || e >= d) return;
+    const int  t     = (int)(row / hq);
+    const int  h     = (int)(row % hq);
+    const long lse_h = (long)h * num_splits * total_q;
+    const long o_h   = (long)h * num_splits * total_q * d;
+    const float m = m_in[row], inv = inv_in[row];
+    float acc = 0.f;
+    const int s1 = ck_tile::min(s0 + chunk, num_splits);
+    for(int s = s0; s < s1; ++s)
+    {
+        const float l = lse_acc[lse_h + (long)s * total_q + t];
+        if(l == -std::numeric_limits<float>::infinity()) continue;
+        const float w = __expf(l - m) * inv;
+        acc += w * o_acc[o_h + (long)s * total_q * d + (long)t * d + e];
+    }
+    if(acc != 0.f) atomicAdd(&oat[row * d + e], acc);
+}
+__global__ void combine_atomic_finalize(const float* __restrict__ oat, bf16_t* __restrict__ out,
+                                        int total_q, int hq, int d)
+{
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if(i >= (long)total_q * hq * d) return;
+    const int  t = (int)(i / ((long)hq * d));
+    const int  r = (int)(i % ((long)hq * d));
+    const int  h = r / d, e = r % d;
+    out[(long)t * hq * d + (long)h * d + e] = ck_tile::type_convert<bf16_t>(oat[i]);
+}
+
+// LAST-CTA (Lean fused proxy): one block per (kv_head, token) output tile merges
+// ALL nqpkv query heads of that group over splits. This is what the last-arriving
+// split CTA would have to do in a fused kernel -- so it measures whether dumping
+// a whole tile's reduction on a single CTA is viable at high split counts (the
+// pitfall: at low batch there's only one tile -> no cross-CTA parallelism).
+// grid = dim3(hk, total_q); block = 256, threads parallel over (local_head, e).
+__global__ void combine_lastcta_kernel(const float* __restrict__ o_acc,
+                                       const float* __restrict__ lse_acc,
+                                       bf16_t* __restrict__ out,
+                                       int total_q, int hq, int hk, int d, int num_splits)
+{
+    const int nqpkv = hq / hk;
+    const int kvh   = blockIdx.x;
+    const int t     = blockIdx.y;
+    const int work  = nqpkv * d;
+    for(int idx = threadIdx.x; idx < work; idx += blockDim.x)
+    {
+        const int  lh = idx / d, e = idx % d;
+        const int  h  = kvh * nqpkv + lh;
+        const long lse_h = (long)h * num_splits * total_q;
+        const long o_h   = (long)h * num_splits * total_q * d;
+        float m = -std::numeric_limits<float>::infinity();
+        for(int s = 0; s < num_splits; ++s) m = fmaxf(m, lse_acc[lse_h + (long)s * total_q + t]);
+        float wsum = 0.f, acc = 0.f;
+        for(int s = 0; s < num_splits; ++s)
+        {
+            const float l = lse_acc[lse_h + (long)s * total_q + t];
+            if(l == -std::numeric_limits<float>::infinity()) continue;
+            const float w = __expf(l - m);
+            wsum += w;
+            acc  += w * o_acc[o_h + (long)s * total_q * d + (long)t * d + e];
+        }
+        out[(long)t * hq * d + (long)h * d + e] =
+            ck_tile::type_convert<bf16_t>(wsum > 0.f ? acc / wsum : 0.f);
+    }
 }
 
 int main(int argc, char** argv)
@@ -256,10 +564,22 @@ int main(int argc, char** argv)
     const int              mask = argc > 5 ? std::atoi(argv[5]) : 0;
     const int              iters = argc > 6 ? std::atoi(argv[6]) : 3;
 
-    const ck_tile::index_t sk        = sq;          // self-attention prefill
-    const ck_tile::index_t num_seqs  = 1;
-    const ck_tile::index_t total_q   = sq;
-    const ck_tile::index_t total_kv  = sk;
+    // SK decouples the KV context length from the query length. Default sk==sq
+    // (self-attention prefill); set SK to profile decode (sq=1, sk=context),
+    // which selects the decode tier via max_seqlen_q==sq below. The decode
+    // tiers are paged-only instances, so a decode run also needs PAGED=1.
+    //
+    // NUM_SEQS replicates the shape across `num_seqs` independent sequences
+    // (each sq queries / sk context, its own KV region) -- the decode grid is
+    // dim3(num_kv_heads, num_seqs, num_splits), so num_seqs is the direct knob
+    // for resident CTAs/CU (production decode runs batch>1). sq/sk stay PER-SEQ.
+    const char*            sk_env    = std::getenv("SK");
+    const ck_tile::index_t sk        = sk_env ? (ck_tile::index_t)std::atol(sk_env) : sq;
+    const ck_tile::index_t num_seqs  = std::getenv("NUM_SEQS")
+                                           ? (ck_tile::index_t)std::max(1, std::atoi(std::getenv("NUM_SEQS")))
+                                           : 1;
+    const ck_tile::index_t total_q   = sq * num_seqs;        // all query tokens
+    const ck_tile::index_t total_kv  = sk * num_seqs;        // contiguous KV pool tokens
     const ck_tile::index_t nqpkv     = hq / hk;
 
     const bool         do_check = std::getenv("CHECK") && std::atoi(std::getenv("CHECK")) != 0;
@@ -286,10 +606,14 @@ int main(int argc, char** argv)
     //   PAGE_BLK=128   paging granularity (tokens/page). 128 == the kv tile, so
     //                  one page per tile (kRebaseKSrd fast path). 16/32/64 span
     //                  multiple pages (dedup path). Must match the built instance.
-    const bool paged     = std::getenv("PAGED") && std::atoi(std::getenv("PAGED")) != 0;
-    const int  page_blk  = std::max(1, (int)env_d("PAGE_BLK", 128));
-    const int  num_pages = paged ? (int)(((long)sk + page_blk - 1) / page_blk) : 0;
-    const long padded_kv = paged ? (long)num_pages * page_blk : (long)total_kv;
+    const bool paged          = std::getenv("PAGED") && std::atoi(std::getenv("PAGED")) != 0;
+    const int  page_blk       = std::max(1, (int)env_d("PAGE_BLK", 128));
+    const int  pages_per_seq  = paged ? (int)(((long)sk + page_blk - 1) / page_blk) : 0;
+    const int  num_pages      = pages_per_seq * (int)num_seqs;          // total physical pages
+    // Tokens between consecutive per-seq KV bases in the physical pool: a whole
+    // (padded) page run for paged, exactly sk for contiguous.
+    const long kv_seq_stride  = paged ? (long)pages_per_seq * page_blk : (long)sk;
+    const long padded_kv      = kv_seq_stride * (long)num_seqs;        // total pool tokens
 
     // ---- random host inputs (fp8 in, bf16 out) ----
     std::mt19937 gen(seed);
@@ -303,19 +627,14 @@ int main(int argc, char** argv)
         for(size_t i = 0; i < n; ++i) h[i] = ck_tile::type_convert<qkv_t>(nd(gen));
         return h;
     };
+    // KV pool spans padded_kv = kv_seq_stride*num_seqs tokens (per-seq region +
+    // page padding). Filling it all random is fine: the kernel reads only the
+    // first sk tokens of each seq region (seq_len=sk), the page-padding tail is
+    // never touched, and the reference reads the same [kv_base, kv_base+sk).
     std::vector<qkv_t>  q_h = fill_qkv((size_t)total_q * hq * d);
-    std::vector<qkv_t>  k_h = fill_qkv((size_t)total_kv * hk * d);
-    std::vector<qkv_t>  v_h = fill_qkv((size_t)total_kv * hk * d);
+    std::vector<qkv_t>  k_h = fill_qkv((size_t)padded_kv * hk * d);
+    std::vector<qkv_t>  v_h = fill_qkv((size_t)padded_kv * hk * d);
     std::vector<bf16_t> o_h((size_t)total_q * hq * d, ck_tile::type_convert<bf16_t>(0.0f));
-    if(paged)
-    {
-        // Pad the pool tail (tokens [sk, num_pages*page_blk)) with zeros. The
-        // kernel never reads past seq_len=sk (identity table), so the tail is
-        // inert -- it only exists so the buffer descriptor's (num_blks*page_blk)
-        // rows stay in-bounds of the allocation.
-        k_h.resize((size_t)padded_kv * hk * d, ck_tile::type_convert<qkv_t>(0.f));
-        v_h.resize((size_t)padded_kv * hk * d, ck_tile::type_convert<qkv_t>(0.f));
-    }
 
     qkv_t*  q = device_from(q_h);
     qkv_t*  k = device_from(k_h);
@@ -331,15 +650,52 @@ int main(int argc, char** argv)
         v_rot.push_back(device_from(v_h));
     }
 
-    // Identity block table for paged mode (logical page p -> physical block p),
-    // so the paged pool is byte-identical to contiguous. [1, num_pages] int32.
+    // Per-seq block table for paged mode: [num_seqs, pages_per_seq], seq s's
+    // logical page i -> physical page s*pages_per_seq + i. Each seq owns a
+    // DISTINCT physical page run, so its KV lives at distinct DRAM addresses
+    // (no cross-seq L2 reuse confound). block_table_stride = pages_per_seq.
     std::vector<int32_t> bt_host;
     if(paged) { bt_host.resize(num_pages); for(int i = 0; i < num_pages; ++i) bt_host[i] = i; }
     else      { bt_host = {0}; }                              // ignored when !is_paged
+    // seq_lens [num_seqs] = sk each; query_start_len/kv_start_len are the
+    // cumulative [num_seqs+1] offsets into the packed query / contiguous-KV pools.
+    std::vector<int32_t> sl_host(num_seqs, (int32_t)sk);
+    std::vector<int32_t> qsl_host(num_seqs + 1), ksl_host(num_seqs + 1);
+    for(ck_tile::index_t s = 0; s <= num_seqs; ++s)
+    { qsl_host[s] = (int32_t)(s * sq); ksl_host[s] = (int32_t)(s * sk); }
     int32_t* block_tables    = device_i32(bt_host);
-    int32_t* seq_lens        = device_i32({(int32_t)sk});     // [num_seqs]
-    int32_t* query_start_len = device_i32({0, (int32_t)sq});  // [num_seqs+1]
-    int32_t* kv_start_len    = device_i32({0, (int32_t)sk});  // [num_seqs+1]
+    int32_t* seq_lens        = device_i32(sl_host);
+    int32_t* query_start_len = device_i32(qsl_host);
+    int32_t* kv_start_len    = device_i32(ksl_host);
+
+    // ---- split-KV (FlashDecoding) ------------------------------------------
+    // The production wrapper (aiter/ops/unified_attention.py) launches a 3D grid
+    // with gridDim.z == num_splits to fan the KV range across CTAs (essential to
+    // fill the machine in decode, where the base grid num_kv_heads*num_seqs is
+    // tiny). Mirror that here so the profiled grid matches deployment. When
+    // num_splits>1 the kernel writes fp32 (o_acc,lse_acc) partials and a combine
+    // merges them into o; num_splits==1 writes o_ptr directly (no workspace).
+    int num_cus = 0;
+    { hipDeviceProp_t p{}; HIP_CHECK(hipGetDeviceProperties(&p, 0)); num_cus = p.multiProcessorCount; }
+    // sk upper bound = max_num_blocks_per_seq * page_blk (paged) -- the same
+    // capture-safe shape-derived bound production reads from block_tables.
+    const long sk_ub = paged ? (long)pages_per_seq * page_blk : (long)sk;
+    const int num_splits = pick_num_splits(total_q, hq, hk, num_seqs, num_cus, sk_ub);
+
+    float* o_acc   = nullptr;   // [hq, num_splits, total_q, d]   fp32
+    float* lse_acc = nullptr;   // [hq, num_splits, total_q]      fp32
+    if(num_splits > 1)
+    {
+        const size_t n_o   = (size_t)hq * num_splits * total_q * d;
+        const size_t n_lse = (size_t)hq * num_splits * total_q;
+        HIP_CHECK(hipMalloc(&o_acc, n_o * sizeof(float)));
+        HIP_CHECK(hipMalloc(&lse_acc, n_lse * sizeof(float)));
+        // lse seeded to -inf so any split the kernel leaves unwritten (fewer KV
+        // pages than splits) is inert in the combine; o_acc zeroed for safety.
+        HIP_CHECK(hipMemset(o_acc, 0, n_o * sizeof(float)));
+        std::vector<float> lse_init(n_lse, -std::numeric_limits<float>::infinity());
+        HIP_CHECK(hipMemcpy(lse_acc, lse_init.data(), n_lse * sizeof(float), hipMemcpyHostToDevice));
+    }
 
     ck_tile::unified_attention_args args{};
     args.data_type          = kTraceDtype;
@@ -383,13 +739,25 @@ int main(int argc, char** argv)
     args.output_stride_1 = d;
 
     args.block_tables_ptr   = block_tables;
-    args.block_table_stride = paged ? num_pages : 1;  // max_num_blocks_per_seq
+    args.block_table_stride = paged ? pages_per_seq : 1;  // max_num_blocks_per_seq
     args.seq_lens_ptr       = seq_lens;
     args.query_start_len_ptr = query_start_len;
     args.num_seqs           = num_seqs;
-    args.max_seqlen_q       = sq;        // force the prefill_d128 tier
+    args.max_seqlen_q       = sq;        // tier selector: sq>1 -> prefill, sq==1 -> decode
     args.cache_ptr_int32_overflow_possible = false;
-    args.num_splits         = 1;
+    args.num_splits         = num_splits;
+    if(num_splits > 1)
+    {
+        // Workspaces are [hq, num_splits, total_q, *] contiguous, so the q-token
+        // axis stride is implicit (d for o_acc, 1 for lse_acc) and only the
+        // nhead/split strides are passed -- matching the .cu glue + kernel.
+        args.o_acc_ptr            = o_acc;
+        args.lse_acc_ptr          = lse_acc;
+        args.nhead_stride_o_acc   = (ck_tile::index_t)((long)num_splits * total_q * d);
+        args.split_stride_o_acc   = (ck_tile::index_t)((long)total_q * d);
+        args.nhead_stride_lse_acc = (ck_tile::index_t)((long)num_splits * total_q);
+        args.split_stride_lse_acc = (ck_tile::index_t)total_q;
+    }
     args.is_paged           = paged;     // PAGED=1 -> ps{page_blk} instance
     args.kv_start_len_ptr   = kv_start_len;  // ignored when is_paged
 
@@ -414,10 +782,13 @@ int main(int argc, char** argv)
                   << std::endl;
         return 2;
     }
-    std::cout << "[ua_trace] launched ok  sq=" << sq << " hq=" << hq << " hk=" << hk
+    std::cout << "[ua_trace] launched ok  sq=" << sq << " sk=" << sk << " seqs=" << num_seqs
+              << " hq=" << hq << " hk=" << hk
               << " d=" << d << " mask=" << mask << " std=" << qkv_std
+              << "  splits=" << num_splits << " (cus=" << num_cus
+              << ", grid_ctas=" << (num_seqs * (hq / nqpkv) * num_splits) << ")"
               << (paged ? ("  [paged blk=" + std::to_string(page_blk)
-                           + " pages=" + std::to_string(num_pages) + "]")
+                           + " pages/seq=" + std::to_string(pages_per_seq) + "]")
                         : "  [contiguous]")
               << (do_perf ? "  [perf]" : "") << std::endl;
 
@@ -439,15 +810,17 @@ int main(int argc, char** argv)
         const double lat_s  = (double)ms_total / 1e3 / iters;
         const double lat_us = lat_s * 1e6;
 
-        // valid (unmasked) (q,k) pairs -- same accounting as the Python harness.
-        // non-causal: sq*sk ; causal (bottom-right anchor): key j<=i+(sk-sq).
+        // valid (unmasked) (q,k) pairs -- same accounting as the Python harness,
+        // summed over all num_seqs sequences. non-causal: sq*sk per seq; causal
+        // (bottom-right anchor): key j<=i+(sk-sq).
         const long off = (long)sk - (long)sq;
-        long long valid = 0;
+        long long valid_per_seq = 0;
         if(mask == 0)
-            valid = (long long)sq * sk;
+            valid_per_seq = (long long)sq * sk;
         else
             for(long i = 0; i < sq; ++i)
-            { long c = i + off + 1; if(c < 0) c = 0; if(c > sk) c = sk; valid += c; }
+            { long c = i + off + 1; if(c < 0) c = 0; if(c > sk) c = sk; valid_per_seq += c; }
+        const long long valid = valid_per_seq * (long long)num_seqs;
 
         const double flops = 4.0 * (double)valid * d * hq;             // QK + PV
         const long long mem = (long long)total_q * hq * d * 1          // Q (fp8)
@@ -462,6 +835,83 @@ int main(int argc, char** argv)
                     mem / 1048576.0);
         HIP_CHECK(hipEventDestroy(ev0));
         HIP_CHECK(hipEventDestroy(ev1));
+
+        // ---- combine A/B (COMBINE=1) ---------------------------------------
+        // Time the split-KV combine in isolation on the partials the main loop
+        // just wrote. COMBINE_KIND=serial|par|atomic|all (default all). This
+        // quantifies the overhead that the e2e A/B showed exploding with splits
+        // and compares the production-shaped serial reduce against the fixes.
+        const bool combine = std::getenv("COMBINE") && std::atoi(std::getenv("COMBINE")) != 0;
+        if(combine && num_splits > 1)
+        {
+            const std::string kind = std::getenv("COMBINE_KIND") ? std::getenv("COMBINE_KIND") : "all";
+            const long rows = (long)total_q * hq;
+            // atomic scratch
+            float* m_buf   = nullptr; float* inv_buf = nullptr; float* oat = nullptr;
+            HIP_CHECK(hipMalloc(&m_buf, rows * sizeof(float)));
+            HIP_CHECK(hipMalloc(&inv_buf, rows * sizeof(float)));
+            HIP_CHECK(hipMalloc(&oat, rows * d * sizeof(float)));
+            const int cblk = 256;
+
+            auto time_kernel = [&](const char* name, auto&& fn) {
+                for(int i = 0; i < warmup; ++i) fn();
+                HIP_CHECK(hipDeviceSynchronize());
+                hipEvent_t a, b; HIP_CHECK(hipEventCreate(&a)); HIP_CHECK(hipEventCreate(&b));
+                HIP_CHECK(hipEventRecord(a, nullptr));
+                for(int i = 0; i < iters; ++i) fn();
+                HIP_CHECK(hipEventRecord(b, nullptr));
+                HIP_CHECK(hipEventSynchronize(b));
+                float ms = 0.f; HIP_CHECK(hipEventElapsedTime(&ms, a, b));
+                std::printf("[combine] %-8s lat=%.2f us  (rows=%ld, splits=%d)\n",
+                            name, (double)ms / iters * 1e3, rows, num_splits);
+                HIP_CHECK(hipEventDestroy(a)); HIP_CHECK(hipEventDestroy(b));
+            };
+
+            if(kind == "serial" || kind == "all")
+                time_kernel("serial", [&]{
+                    const int grid = (int)((rows + 127) / 128);
+                    combine_splits_kernel<<<grid, 128>>>(o_acc, lse_acc, o, total_q, hq, d, num_splits);
+                });
+            if(kind == "par" || kind == "all")
+                time_kernel("par", [&]{
+                    const size_t sh = (size_t)(cblk + num_splits) * sizeof(float);
+                    combine_par_kernel<<<(int)rows, cblk, sh>>>(o_acc, lse_acc, o, total_q, hq, d, num_splits);
+                });
+            if(kind == "atomic" || kind == "all")
+                time_kernel("atomic", [&]{
+                    combine_atomic_prep<<<(int)rows, cblk, cblk * sizeof(float)>>>(
+                        lse_acc, m_buf, inv_buf, total_q, hq, num_splits);
+                    HIP_CHECK(hipMemsetAsync(oat, 0, rows * d * sizeof(float), nullptr));
+                    dim3 ag((unsigned)rows, (unsigned)num_splits, 1);
+                    combine_atomic_accum<<<ag, d>>>(o_acc, lse_acc, m_buf, inv_buf, oat,
+                                                    total_q, hq, d, num_splits);
+                    const long n = rows * d;
+                    combine_atomic_finalize<<<(int)((n + 255) / 256), 256>>>(oat, o, total_q, hq, d);
+                });
+            if(kind == "lastcta" || kind == "all")
+                time_kernel("lastcta", [&]{
+                    dim3 g((unsigned)hk, (unsigned)total_q, 1);
+                    combine_lastcta_kernel<<<g, 256>>>(o_acc, lse_acc, o, total_q, hq, hk, d, num_splits);
+                });
+            if(kind == "chunk" || kind == "all")
+            {
+                const int chunk = (int)env_d("COMBINE_CHUNK", 16);
+                char nm[16]; std::snprintf(nm, sizeof(nm), "chunk%d", chunk);
+                time_kernel(nm, [&]{
+                    combine_atomic_prep<<<(int)rows, cblk, cblk * sizeof(float)>>>(
+                        lse_acc, m_buf, inv_buf, total_q, hq, num_splits);
+                    HIP_CHECK(hipMemsetAsync(oat, 0, rows * d * sizeof(float), nullptr));
+                    dim3 ag((unsigned)rows, (unsigned)((num_splits + chunk - 1) / chunk), 1);
+                    combine_atomic_accum_chunked<<<ag, d>>>(o_acc, lse_acc, m_buf, inv_buf, oat,
+                                                            total_q, hq, d, num_splits, chunk);
+                    const long n = rows * d;
+                    combine_atomic_finalize<<<(int)((n + 255) / 256), 256>>>(oat, o, total_q, hq, d);
+                });
+            }
+            HIP_CHECK(hipGetLastError());
+            HIP_CHECK(hipDeviceSynchronize());
+            HIP_CHECK(hipFree(m_buf)); HIP_CHECK(hipFree(inv_buf)); HIP_CHECK(hipFree(oat));
+        }
     }
 
     int rc = 0;
@@ -478,6 +928,60 @@ int main(int argc, char** argv)
         const double atol          = env_d("ATOL", 1.5e-1);
         const double tol_err_ratio = env_d("TOL_ERR_RATIO", 0.05);
 
+        // With split-KV the kernel wrote fp32 partials (o_acc,lse_acc), not o.
+        // Merge them into o exactly as the production combine kernel would, so
+        // the accuracy check still validates the bench setup end-to-end.
+        if(num_splits > 1)
+        {
+            const long rows = (long)total_q * hq;
+            const std::string ckind = std::getenv("COMBINE_KIND") ? std::getenv("COMBINE_KIND") : "serial";
+            const int cblk = 256;
+            if(ckind == "par")
+            {
+                const size_t sh = (size_t)(cblk + num_splits) * sizeof(float);
+                combine_par_kernel<<<(int)rows, cblk, sh>>>(o_acc, lse_acc, o, total_q, hq, d, num_splits);
+            }
+            else if(ckind == "lastcta")
+            {
+                dim3 g((unsigned)hk, (unsigned)total_q, 1);
+                combine_lastcta_kernel<<<g, 256>>>(o_acc, lse_acc, o, total_q, hq, hk, d, num_splits);
+            }
+            else if(ckind == "atomic" || ckind == "chunk")
+            {
+                const int chunk = (int)env_d("COMBINE_CHUNK", 16);
+                float *m_buf, *inv_buf, *oat;
+                HIP_CHECK(hipMalloc(&m_buf, rows * sizeof(float)));
+                HIP_CHECK(hipMalloc(&inv_buf, rows * sizeof(float)));
+                HIP_CHECK(hipMalloc(&oat, rows * d * sizeof(float)));
+                combine_atomic_prep<<<(int)rows, cblk, cblk * sizeof(float)>>>(
+                    lse_acc, m_buf, inv_buf, total_q, hq, num_splits);
+                HIP_CHECK(hipMemset(oat, 0, rows * d * sizeof(float)));
+                if(ckind == "chunk")
+                {
+                    dim3 ag((unsigned)rows, (unsigned)((num_splits + chunk - 1) / chunk), 1);
+                    combine_atomic_accum_chunked<<<ag, d>>>(o_acc, lse_acc, m_buf, inv_buf, oat,
+                                                            total_q, hq, d, num_splits, chunk);
+                }
+                else
+                {
+                    dim3 ag((unsigned)rows, (unsigned)num_splits, 1);
+                    combine_atomic_accum<<<ag, d>>>(o_acc, lse_acc, m_buf, inv_buf, oat,
+                                                    total_q, hq, d, num_splits);
+                }
+                const long n = rows * d;
+                combine_atomic_finalize<<<(int)((n + 255) / 256), 256>>>(oat, o, total_q, hq, d);
+                HIP_CHECK(hipDeviceSynchronize());
+                HIP_CHECK(hipFree(m_buf)); HIP_CHECK(hipFree(inv_buf)); HIP_CHECK(hipFree(oat));
+            }
+            else
+            {
+                const int grid = (int)((rows + 127) / 128);
+                combine_splits_kernel<<<grid, 128>>>(o_acc, lse_acc, o, total_q, hq, d, num_splits);
+            }
+            HIP_CHECK(hipGetLastError());
+            HIP_CHECK(hipDeviceSynchronize());
+        }
+
         HIP_CHECK(hipMemcpy(o_h.data(), o, o_h.size() * sizeof(bf16_t), hipMemcpyDeviceToHost));
 
         // Default to the GPU reference (independent naive kernel, ~ms even at
@@ -488,6 +992,12 @@ int main(int argc, char** argv)
         std::vector<float> o_ref;
         if(use_cpu)
         {
+            if(num_seqs != 1)
+            {
+                std::cerr << "[check] REF=cpu only supports num_seqs==1; use the GPU reference"
+                          << std::endl;
+                return 2;
+            }
             std::cout << "[check] computing HOST reference (O(hq*sq^2*d), slow) ..." << std::endl;
             o_ref = reference(q_h, k_h, v_h, sq, sk, hq, hk, d, mask,
                               scale_s, q_descale, k_descale, v_descale);
@@ -502,7 +1012,7 @@ int main(int argc, char** argv)
             }
             std::cout << "[check] computing GPU reference (naive independent kernel) ..."
                       << std::endl;
-            o_ref = reference_gpu(q, k, v, sq, sk, hq, hk, d, mask,
+            o_ref = reference_gpu(q, k, v, total_q, sq, sk, hq, hk, d, mask, kv_seq_stride,
                                   scale_s, q_descale, k_descale, v_descale);
         }
 
@@ -529,6 +1039,8 @@ int main(int argc, char** argv)
     for(int r = 0; r < rotate; ++r)
     { HIP_CHECK(hipFree(q_rot[r])); HIP_CHECK(hipFree(k_rot[r])); HIP_CHECK(hipFree(v_rot[r])); }
     HIP_CHECK(hipFree(o));
+    if(o_acc)   HIP_CHECK(hipFree(o_acc));
+    if(lse_acc) HIP_CHECK(hipFree(lse_acc));
     HIP_CHECK(hipFree(block_tables));    HIP_CHECK(hipFree(seq_lens));
     HIP_CHECK(hipFree(query_start_len)); HIP_CHECK(hipFree(kv_start_len));
     return rc;

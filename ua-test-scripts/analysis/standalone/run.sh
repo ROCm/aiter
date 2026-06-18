@@ -23,12 +23,28 @@ SIMD="${SIMD:-0}"; REPORT_ITERS="${REPORT_ITERS:-4}"
 # Paged-path overlay: PAGED=1 traces the paged instance (PAGE_BLK tokens/page).
 # Needs a build whose real instance matches the page size, e.g.
 #   PAGED=1 PAGE_BLK=128 TARGET_INSTANCE=unified_attention_d128_fp8_nmask_ps128
-PAGED="${PAGED:-0}"; PAGE_BLK="${PAGE_BLK:-128}"
+PAGED="${PAGED:-0}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS="$(dirname "$HERE")"
 EXE="$HERE/build/ua_trace"
 MASKTAG=$([[ "$MASK" == "0" ]] && echo "noncausal" || echo "causal")
+
+# Decode auto-config (mirrors perf.sh): when SK is set (sq=1 decode) pick the
+# paged decode tier instance from rows = sq*(hq/hk) and force PAGED=1, so
+# `SK=196608 run.sh 1 16 2 128 0` traces the real decode kernel. PAGE_BLK
+# defaults to 64 in decode, else the 128 (one-page-per-tile) prefill default.
+if [[ -n "${SK:-}" ]]; then
+    INSTMASK=$([[ "$MASK" == "0" ]] && echo "nmask" || echo "mask")
+    rows=$(( SQ * HQ / HK ))
+    if   [[ $rows -le 16  ]]; then tier="decode_t"
+    elif [[ $rows -le 32  ]]; then tier="decode_s"
+    elif [[ $rows -le 128 ]]; then tier="decode"
+    else tier=""; fi
+    [[ -n "$tier" ]] && export TARGET_INSTANCE="${TARGET_INSTANCE:-unified_attention_d${D}_${DTYPE}_${INSTMASK}_${tier}}"
+    PAGED=1; PAGE_BLK="${PAGE_BLK:-64}"
+fi
+PAGE_BLK="${PAGE_BLK:-128}"
 PAGETAG=$([[ "$PAGED" == "0" ]] && echo "" || echo "_paged${PAGE_BLK}")
 TAG="${TAG:-att_std_d${D}_${DTYPE}_${MASKTAG}_sq${SQ}${PAGETAG}}"
 RUN_DIR="$SCRIPTS/rocprof_analysis/runs/$TAG"
@@ -44,7 +60,7 @@ ARCH="$ARCH" DTYPE="$DTYPE" D="$D" MASK="$MASK" bash "$HERE/build.sh"
 echo "[std] (2/3) rocprofv3 ATT on executable -> $TAG ..."
 rm -rf "$ATT_DIR"; mkdir -p "$ATT_DIR"
 ATT_LIB_DIR="/opt/rocm/lib"
-HIP_VISIBLE_DEVICES="$GPU" PAGED="$PAGED" PAGE_BLK="$PAGE_BLK" /opt/rocm/bin/rocprofv3 \
+HIP_VISIBLE_DEVICES="$GPU" PAGED="$PAGED" PAGE_BLK="$PAGE_BLK" ${SK:+SK="$SK"} ${NUM_SPLITS:+NUM_SPLITS="$NUM_SPLITS"} ${NUM_SEQS:+NUM_SEQS="$NUM_SEQS"} /opt/rocm/bin/rocprofv3 \
     --att --att-library-path "$ATT_LIB_DIR" \
     --att-target-cu "$CU" --att-shader-engine-mask "$SE_MASK" \
     --att-simd-select "$SIMD_MASK" --att-consecutive-kernels 1 --att-activity 8 \
