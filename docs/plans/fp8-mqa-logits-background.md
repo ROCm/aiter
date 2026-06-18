@@ -44,13 +44,46 @@ X   with shape [L, d_model]
 
 #### Query, Key, and Value matrices
 
-We have **Q, K, V matrices with one row per token.**, that is, query, key and value matrices.
+Each token gets **three** vectors — its query, key, and value — stacked row-by-row into the
+matrices `Q`, `K`, `V` (one row per token). The cleanest way to understand them is as a
+**soft, content-based associative lookup** (a "fuzzy dictionary"):
 
-Intuition for each:
+> Attention is a dictionary lookup where, instead of one exact-matching key, *every* key
+> matches the query a little, and the result is a **weighted blend** of the values.
 
-- **Query (Q)** — "what is this token looking for?"
-- **Key (K)** — "what does this token contain / advertise?"
-- **Value (V)** — "what will this token contribute if attended to?"
+Map that analogy onto the three roles (notation: `Q[t]` means **row `t` of the matrix `Q`** —
+one token's query vector; likewise `K[s]`, `V[s]` are rows of their corresponding matrices. 
+Since we describe a single head here, these
+are `d_k`/`d_v`-length rows of that head's slice; with the full multi-head reshape from §1.1 the
+per-head vector is strictly `Q[t, h]`):
+
+- **Query (Q) — the lookup request.** `Q[t]` is a vector describing *the kind of information
+  token `t` wants to pull in from the sequence* (the **sequence** = the ordered list of `L`
+  tokens being processed — the tokenized sentence/document, i.e. the rows of `X`). What it is
+  looking for is **other tokens** in that list, addressed by their **content**, not by their
+  position. (Positional information is a
+  separate ingredient — added via positional encodings / RoPE — not what the query/key match
+  encodes.) Token `t`'s query is compared against the keys of all tokens; e.g. the query of the
+  word "it" might encode "I'm looking for the noun I refer to."
+- **Key (K) — the advertised label.** `K[s]` is a vector that *describes what token `s` offers*,
+  living in the **same space** as the queries so the two can be compared. The "quantity
+  advertised" is a learned descriptor of the token's content/role — the searchable index entry.
+  The match score is the **dot product** `Q[t]·K[s]`: large when token `s` advertises what
+  token `t` is looking for. Q and K must share width `d_k` precisely so this dot product is
+  defined.
+- **Value (V) — the payload delivered.** `V[s]` is the actual information token `s` passes along
+  *if it is attended to*. After the query-key scores are turned into weights (softmax), the
+  output for token `t` is the **weighted sum of the value vectors**, `Σ_s weight[t,s]·V[s]`.
+  So a value contributes to the **new representation of the *querying* token `t`** — i.e. the
+  attention layer's output row for `t`, which feeds the next layer. `V` can have its own width
+  `d_v` because it is the payload, never directly dot-producted against `Q`.
+
+Putting it together for one query token `t`: compare its query to every key
+(`Q[t]·K[s]` for all `s`) → softmax into weights → blend the values (`Σ_s weight·V[s]`) →
+that blend *is* token `t`'s updated vector. Keys and values come in pairs (both derived from
+the same source token `s`): the key decides *how much* token `s` is attended to, the value
+decides *what* is contributed when it is. The worked example in §1.2 makes this concrete with
+numbers.
 
 #### How matrices Q, K, V are formed
 
@@ -72,6 +105,15 @@ Q = X · W_Q   →  [L, H · d_k]   reshape →  [L, H, d_k]
 K = X · W_K   →  [L, H · d_k]   reshape →  [L, H, d_k]
 V = X · W_V   →  [L, H · d_v]   reshape →  [L, H, d_v]
 ```
+
+> **What "slice" means here — output side, not input.** The per-head slice is a slice of the
+> projection's **output** (`H · d_head` wide), *not* a slice of the input `d_model`. Every head
+> reads the **full** `d_model`-wide token vector; what differs is the weights. Concretely, head
+> `h` owns columns `[h·d_head : (h+1)·d_head]` of `W_Q` — a `[d_model, d_head]` sub-matrix that
+> maps the *entire* `d_model` input down to that head's own `d_head`-wide subspace. So heads are
+> distinguished by having their **own learned `[d_model, d_head]` projection**, not by each
+> seeing a different `d_head`-wide chunk of the input. (The output width is fundamentally
+> `H · d_head`; it equals `d_model` only in the common `d_k = d_head` case, not by definition.)
 
 Here `d_k` and `d_v` are the **per-head** widths (usually both `= d_head`); they are written
 separately only to show that K and Q must match each other (for the dot product), while V's
@@ -131,6 +173,33 @@ Attention(Q, K, V) = softmax( Q Kᵀ / sqrt(d_k) ) · V
 
 Shapes: `Q Kᵀ` is `[L, L]` (every token vs. every token), softmax is applied **row-wise**,
 and multiplying by `V [L, d_v]` gives an output `[L, d_v]` — one new vector per token.
+
+#### What "logits" means (and why this kernel is named after them)
+
+The word **logit** is worth pinning down, because it is in the kernel's name and is used
+throughout this document.
+
+- **Origin.** In statistics a *logit* is the log-odds `log(p/(1−p))` — the inverse of the
+  logistic (sigmoid) function. It maps a probability in `(0, 1)` to a raw number in
+  `(−∞, +∞)`.
+- **Deep-learning usage.** By extension, "logits" came to mean the **raw, unnormalized scores
+  a model produces *before* a normalizing function turns them into probabilities or weights.**
+  A classifier's final layer emits logits, and `softmax` (or `sigmoid`) converts them to
+  probabilities. Logits live on the whole real line: larger = more preferred, and only their
+  *relative* values matter to the normalizer.
+- **In attention.** The entries of `Q Kᵀ / sqrt(d_k)` — the scores *before* the row-wise
+  softmax — are exactly the **attention logits**. "Score" and "logit" are used
+  interchangeably for these pre-softmax values. In the worked example below, `[1, 0, 1]` are
+  the logits and `[0.422, 0.155, 0.422]` are the post-softmax weights.
+
+**The twist for *our* kernel.** The MQA-logits kernel also outputs "logits," but they are
+**not** consumed by a softmax — they feed a **top-k** selection (Part 3). The name persists
+because they play the same role: *unnormalized scores used to rank/choose*, not final
+probabilities. They are also shaped differently from attention logits — a per-head ReLU'd,
+weighted sum (§4.1), not a plain `q·k` — but conceptually they are still "the raw numbers a
+downstream normalizing/selection step ranks." This is why `-inf` is the natural mask value
+(§1.2): just as `-inf` logits vanish under softmax, an `-inf` logit can never be picked by
+top-k.
 
 #### Tiny worked example
 
@@ -336,6 +405,17 @@ selection, and a sliding window). *Reference: Yuan et al., 2025 (NSA).*
 DeepSeek-V3.2(-Exp) introduces **DeepSeek Sparse Attention (DSA)**, built on top of MLA. The
 *only* architectural change versus the previous model is DSA, and its cheap selector is the
 **lightning indexer**.
+
+> **What the indexer reduces: tokens, not heads.** The sparsity is along the **sequence
+> (token) axis** — for each query, it selects a *subset of past KV positions* to attend to.
+> It does **not** drop or reduce attention heads: every main attention head still runs, each
+> simply over the shorter selected key/value list. This is a different axis of savings from
+> MQA/GQA, which reduce **KV heads** (sharing K/V across query heads) to shrink the cache.
+> The two are orthogonal and DeepSeek-V3.2 uses both (MLA cache compression + DSA token
+> sparsity). The indexer's own `H_I` heads below are a property of the *scorer* (how it
+> computes a good score cheaply), not a sparsity knob — and the "MQA" in this kernel's name
+> refers only to the indexer's compute *shape* (many query heads, one shared key per
+> position), not to any head reduction.
 
 The pipeline has three stages:
 
