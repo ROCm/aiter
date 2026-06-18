@@ -23,6 +23,7 @@ def _fused_qk_rmsnorm_group_quant_kernel(
     q_weight: Optional[Tensor] = None,
     q_epsilon: float = 1e-6,
     q_out_unquantized: Optional[Tensor] = None,
+    q_out_unquantized_fp32: Optional[Tensor] = None,
     k_out: Optional[Tensor] = None,
     q_res_out: Optional[Tensor] = None,
     k: Optional[Tensor] = None,
@@ -64,6 +65,7 @@ def fused_qk_rmsnorm_group_quant(
     q_weight: Optional[Tensor] = None,
     q_epsilon: float = 1e-6,
     q_out_unquantized: Optional[Tensor] = None,
+    q_out_unquantized_fp32: Optional[Tensor] = None,
     k_out: Optional[Tensor] = None,
     q_res_out: Optional[Tensor] = None,
     k: Optional[Tensor] = None,
@@ -114,6 +116,11 @@ def fused_qk_rmsnorm_group_quant(
                     f"fp4x2 q_out_quantized.size(1) should be {expected_packed} "
                     f"(n1//2 packed), got {q_out_quantized.size(1)}"
                 )
+    if q_out_unquantized_fp32 is not None and q_out_unquantized is None:
+        raise ValueError(
+            "fused_qk_rmsnorm_group_quant: q_out_unquantized_fp32 requires "
+            "q_out_unquantized to also be provided"
+        )
 
     _fused_qk_rmsnorm_group_quant_kernel(
         q_out_quantized,
@@ -122,6 +129,7 @@ def fused_qk_rmsnorm_group_quant(
         q_weight,
         q_epsilon,
         q_out_unquantized,
+        q_out_unquantized_fp32,
         k_out,
         q_res_out,
         k,
@@ -236,6 +244,7 @@ def fused_qk_rmsnorm(
         q_weight,
         q_epsilon,
         q_out_unquantized,
+        None,
         k_out,
         q_res_out,
         k,
