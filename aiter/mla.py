@@ -152,7 +152,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         512: 32,
     }
 
-    if dtype == dtypes.fp8:
+    if dtype == dtypes.fp8 and get_gfx() != "gfx1250":
         min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
         # ceil(avg_kv / min_block_n) computed in pure integers (avg_kv = total_kv/bs).
         num_kv_splits = min(
