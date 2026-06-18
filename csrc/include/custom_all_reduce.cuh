@@ -39,7 +39,7 @@ namespace aiter {
 // corresponding dim = input_dim / ngpus.
 enum class ReduceScatterSplitDim : int { kFirst = 0, kLast = 1, kMid = 2 };
 
-constexpr int kMaxBlocks = 80;
+constexpr int kMaxBlocks = 256;
 // note: we don't want to use atomics for signals because peer atomics are no
 // supported on PCIe links
 struct Signal
@@ -272,6 +272,96 @@ DINLINE P packed_reduce(const P* ptrs[], int idx)
     }
     return downcast<P>(tmp);
 }
+
+// ---------- gfx1250 allreduce ----------
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
+__global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
+    RankData* _input_dp,
+    RankData* _output_dp,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size
+    )
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int unroll    = 4;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    // each thread processes a contiguous chunk of `unroll` packed elements
+    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    int nthds  = blockDim.x * gridDim.x;
+    // note: we don't reorder the address so the accumulation order is the same
+    // for all ranks, ensuring bitwise identical results
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    // main loop: unroll x4, each thread handles 4 contiguous packed elements
+    int aligned_size = (size / unroll) * unroll;
+    for(int base = tid * unroll; base < aligned_size; base += nthds * unroll)
+    {
+      P inp_reg[ngpus][unroll];
+#pragma unroll
+      for (int i = 0; i < ngpus; ++i)
+      {
+#pragma unroll
+        for (int j = 0; j < unroll; ++j)
+          inp_reg[i][j] = ptrs[i][base + j];
+      }
+      A rslt_tmp[unroll];
+      P rslt_reg[unroll];
+#pragma unroll
+      for (int u = 0; u < unroll; ++u)
+      {
+#pragma unroll
+        for (int j = 0; j < pack_size; ++j)
+          rslt_tmp[u][j] = upcast_s(inp_reg[0][u][j]);
+#pragma unroll
+        for (int g = 1; g < ngpus; ++g)
+        {
+#pragma unroll
+          for (int j = 0; j < pack_size; ++j)
+            rslt_tmp[u][j] += upcast_s(inp_reg[g][u][j]);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < unroll; ++u)
+      {
+#pragma unroll
+        for (int j = 0; j < pack_size; ++j)
+          rslt_reg[u][j] = downcast_s<T>(rslt_tmp[u][j]);
+        *(reinterpret_cast<P*>(result) + base + u) = rslt_reg[u];
+      }
+    }
+    // tail: process remaining packed elements that don't fill a full unroll group
+    for(int idx = aligned_size + tid; idx < size; idx += nthds)
+    {
+      A acc;
+#pragma unroll
+      for (int j = 0; j < pack_size; ++j)
+        acc[j] = upcast_s(ptrs[0][idx][j]);
+#pragma unroll
+      for (int i = 1; i < ngpus; ++i)
+      {
+#pragma unroll
+        for (int j = 0; j < pack_size; ++j)
+          acc[j] += upcast_s(ptrs[i][idx][j]);
+      }
+      P out_val;
+#pragma unroll
+      for (int j = 0; j < pack_size; ++j)
+        out_val[j] = downcast_s<T>(acc[j]);
+      *(reinterpret_cast<P*>(result) + idx) = out_val;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+// ---------- gfx1250 allreduce ----------
 
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage_naive(RankData* _input_dp,
@@ -3571,6 +3661,29 @@ class CustomAllreduce
         hipGetDeviceProperties(&dev_prop, dev);
         std::string arch    = dev_prop.gcnArchName;
         bool use_write_mode = false;
+
+        // gfx1250 (MI450): dedicated 1-stage kernel for tp2/tp4
+        if(arch.find("gfx1250") != std::string::npos)
+        {
+            if(world_size_ > 4)
+                throw std::runtime_error(
+                    "gfx1250 custom allreduce only supports world_size <= 4, got " +
+                    std::to_string(world_size_));
+            constexpr int gfx1250_threads = 256;
+            int gfx1250_blocks = std::min(kMaxBlocks,
+                                          (size + gfx1250_threads * 4 - 1) / (gfx1250_threads * 4));
+            if(world_size_ == 2)
+            {
+                ar_gfx1250_naive_unroll4<T, 2><<<gfx1250_blocks, gfx1250_threads, 0, stream>>>(
+                    input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);
+            }
+            else
+            {
+                ar_gfx1250_naive_unroll4<T, 4><<<gfx1250_blocks, gfx1250_threads, 0, stream>>>(
+                    input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);
+            }
+            return;
+        }
 
         int blocks       = 16;
         bool call_1stage = false;
