@@ -3,7 +3,7 @@
 > **Purpose.** This document builds up — from first principles — the background needed to
 > work on the FP8 MQA logits kernel. It provides background on attention 
 > and walks through: how attention works, the efficiency variants
-> that lead to DeepSeek's design, what the "lightning indexer" is and where it fits.
+> that lead to DeepSeek's design, what the "lightning indexer" is and where it fits in.
 >
 
 ### Notation used throughout

@@ -15,7 +15,9 @@ Examples:
 """
 import argparse
 import os
+import subprocess
 import sys
+from datetime import datetime, timezone
 
 # Make the script runnable directly (python path/to/bench.py) by putting the
 # repo root on sys.path, so `import aiter` / `import op_tests` resolve without
@@ -147,6 +149,10 @@ def run(args):
 
     _print_table(rows, impls, args)
 
+    if args.output:
+        _write_markdown(args.output, rows, impls, args)
+        print(f"\n[wrote] {args.output}", file=sys.stderr, flush=True)
+
 
 def _run_one(idx, impls, shape, args):
     """Time + (optionally) verify one case; return a row dict for the table."""
@@ -219,6 +225,112 @@ def _fmt_shape(shape):
         f"bs{shape.batch_size} {shape.seq_q_l}x{shape.seq_kv_l} "
         f"H{shape.num_heads_q} D{shape.head_dim}"
     )
+
+
+def _git_commit():
+    """Return the current short+long git commit hash, or None if unavailable."""
+    try:
+        full = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_REPO_ROOT,
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        dirty = subprocess.call(
+            ["git", "diff", "--quiet"], cwd=_REPO_ROOT,
+            stderr=subprocess.DEVNULL,
+        ) != 0
+        return full + (" (dirty)" if dirty else "")
+    except Exception:
+        return None
+
+
+def _gpu_info():
+    """Return a list of (label, value) describing the GPU / runtime environment."""
+    info = []
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        info.append(("GPU", props.name))
+        arch = getattr(props, "gcnArchName", None)
+        if arch:
+            info.append(("Arch", arch))
+        info.append(("GPU count", str(torch.cuda.device_count())))
+        info.append(
+            ("VRAM", f"{props.total_memory / (1024 ** 3):.1f} GiB")
+        )
+    else:
+        info.append(("GPU", "none (CUDA/HIP not available)"))
+    info.append(("torch", torch.__version__))
+    info.append(("triton", triton.__version__))
+    hip = getattr(getattr(torch, "version", None), "hip", None)
+    if hip:
+        info.append(("HIP", hip))
+    info.append(("flydsl", "available" if is_flydsl_available() else "unavailable"))
+    return info
+
+
+def _markdown_table(rows, impls):
+    """Return the comparison table as a GitHub-flavored Markdown string."""
+    has_tri = "triton" in impls
+    has_fly = "flydsl" in impls
+
+    headers = ["idx", "shape"]
+    if has_tri:
+        headers += ["tri_ms", "tri_TFLOP/s", "tri_vrf"]
+    if has_fly:
+        headers += ["fly_ms", "fly_TFLOP/s", "fly_vrf"]
+    if has_tri and has_fly:
+        headers += ["vs-triton"]
+
+    def cell(val, fmt):
+        return "N/A" if val is None else format(val, fmt)
+
+    lines = ["| " + " | ".join(headers) + " |"]
+    lines.append("| " + " | ".join("---" for _ in headers) + " |")
+    for r in rows:
+        out = [str(r["idx"]), _fmt_shape(r["shape"])]
+        if has_tri:
+            out += [
+                cell(r["times"]["triton"], ".4f"),
+                cell(r["tflops"]["triton"], ".2f"),
+                r["verify"].get("triton", "N/A"),
+            ]
+        if has_fly:
+            out += [
+                cell(r["times"]["flydsl"], ".4f"),
+                cell(r["tflops"]["flydsl"], ".2f"),
+                r["verify"].get("flydsl", "N/A"),
+            ]
+        if has_tri and has_fly:
+            out += [r["speedup"]]
+        lines.append("| " + " | ".join(out) + " |")
+    return "\n".join(lines)
+
+
+def _write_markdown(path, rows, impls, args):
+    """Write the comparison table + environment/git metadata as Markdown."""
+    commit = _git_commit() or "unknown"
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    parts = [
+        "# FlyDSL vs Triton FP8 MQA Logits benchmark",
+        "",
+        f"- Generated: {when}",
+        f"- Git commit: `{commit}`",
+        f"- Verify: {'on' if args.verify else 'off'}"
+        f" (warmup={args.warmup}, rep={args.rep})",
+        "",
+        "## Environment",
+        "",
+    ]
+    for label, value in _gpu_info():
+        parts.append(f"- {label}: {value}")
+    parts += ["", "## Results", "", _markdown_table(rows, impls), ""]
+
+    base_dir = os.path.dirname(path)
+    if base_dir and not os.path.exists(base_dir):
+        os.makedirs(base_dir)
+    with open(path, "w") as f:
+        f.write("\n".join(parts))
 
 
 def _print_table(rows, impls, args):
@@ -349,6 +461,14 @@ def main():
         "--verify",
         action="store_true",
         help="check each impl against the torch reference (calc_diff < 1e-3)",
+    )
+    p.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="write the comparison table (Markdown) + GPU/git metadata to FILE",
     )
     p.add_argument(
         "--list",
