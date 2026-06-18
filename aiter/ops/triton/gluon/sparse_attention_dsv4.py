@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 import torch
 import triton
 import triton.language as tl
@@ -421,6 +422,7 @@ def _decode_core_attn(
     acc_rope,
     smem_knT,
     smem_krT,
+    kr_buf0,
     NOPE_DIM: gl.constexpr,
     NOPE_BLOCK: gl.constexpr,
     ROPE_DIM: gl.constexpr,
@@ -456,14 +458,34 @@ def _decode_core_attn(
     sl_k_qk: gl.constexpr = gl.SliceLayout(0, mma_qk)
     sl_h_pv: gl.constexpr = gl.SliceLayout(1, mma_pv)
 
+    # rope async-copy ([ROPE_DIM, BLOCK_K], D rows contiguous 8xbf16=16B). This
+    # triton requires buffer_load_to_shared offsets in a Blocked/Slice layout
+    # (NOT a DistributedLinearLayout), matching the in-file q async-copy pattern.
+    blk_kr: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[8, 1], threads_per_warp=[8, 8],
+        warps_per_cta=[1, nw], order=[0, 1],
+    )
+    sl_d_kr: gl.constexpr = gl.SliceLayout(1, blk_kr)   # rope dim rows
+    sl_k_kr: gl.constexpr = gl.SliceLayout(0, blk_kr)   # kpos cols (slot)
+
     nope_off = gl.arange(0, NOPE_BLOCK, layout=sl_d_n)
     nope_mask = nope_off < NOPE_DIM
     nope_grp = nope_off // 64
     rope_off = gl.arange(0, ROPE_DIM, layout=sl_d_r)
     k_off_n = gl.arange(0, BLOCK_K, layout=sl_k_n)
     k_off_r = gl.arange(0, BLOCK_K, layout=sl_k_r)
+    d_kr = gl.arange(0, ROPE_DIM, layout=sl_d_kr)
+    k_off_kr = gl.arange(0, BLOCK_K, layout=sl_k_kr)
+    krT_base = cache_ptr.to(gl.pointer_type(gl.bfloat16))
 
     for k_start in tl.range(0, seg_len, BLOCK_K):
+        # smem_krT is async-filled, so it is double buffered: the compiler only
+        # tracks the DMA completion, not the WAR against the previous tile's PV
+        # read. Alternating the slot (parity threaded across main/extra via
+        # kr_buf0) removes that hazard.
+        kbuf = (kr_buf0 + k_start // BLOCK_K) % 2
+        krT = smem_krT.index(kbuf)
+
         # --- nope tile (fp8 dequant) ---
         kpos = k_start + k_off_n
         slot = gl.load(indices_ptr + seg_start + kpos, mask=kpos < seg_len, other=-1)
@@ -494,36 +516,35 @@ def _decode_core_attn(
         k_nope = gl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_n)
         k_nope = gl.where(k_nope == k_nope, k_nope, zero_n)
 
-        # --- rope tile (bf16) ---
-        kpos_r = k_start + k_off_r
-        slot_r = gl.load(
-            indices_ptr + seg_start + kpos_r, mask=kpos_r < seg_len, other=-1
+        # --- rope tile (bf16): async-copy straight into the transposed [D, K]
+        # shared buffer (no register round-trip / permute). Invalid lanes are
+        # clamped to token 0 and dropped by the score mask below. ---
+        kpos_kr = k_start + k_off_kr
+        slot_kr = gl.load(
+            indices_ptr + seg_start + kpos_kr, mask=kpos_kr < seg_len, other=-1
         )
-        valid_r = (kpos_r < seg_len) & (slot_r >= 0) & (slot_r < num_rows)
-        safe_r = gl.where(valid_r, slot_r, 0)
-        block_off_r = (safe_r // block_size).to(gl.int64) * cache_stride0
-        token_off_r = block_off_r + (safe_r % block_size) * 576 + NOPE_DIM
-        rope_base = (cache_ptr + token_off_r).to(gl.pointer_type(gl.bfloat16))
-        k_rope = gl.load(
-            rope_base[:, None] + rope_off[None, :],
-            mask=valid_r[:, None],
-            other=0.0,
-        )
-        zero_r = gl.zeros([BLOCK_K, ROPE_DIM], dtype=gl.bfloat16, layout=blk_r)
-        k_rope = gl.where(valid_r[:, None], k_rope, zero_r)
-        k_rope = gl.where(k_rope == k_rope, k_rope, zero_r)
+        valid_kr = (kpos_kr < seg_len) & (slot_kr >= 0) & (slot_kr < num_rows)
+        safe_kr = gl.where(valid_kr, slot_kr, 0)
+        rope_elem = (
+            (safe_kr // block_size).to(gl.int64) * cache_stride0
+            + (safe_kr % block_size) * 576
+            + NOPE_DIM
+        ) // 2  # bf16-element offset of each token's rope segment
+        offs_kr = rope_elem[None, :].to(gl.int32) + d_kr[:, None]
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(krT, krT_base, offs_kr)
+        gl.amd.cdna4.async_copy.commit_group()
 
-        # --- stage K tiles transposed [D, K] in shared memory (single buffer
-        # per tensor): QK reads K^T directly, PV reads the permuted view ---
+        # --- stage nope tile transposed [D, K] in shared memory (single buffer):
+        # QK reads K^T directly, PV reads the permuted view ---
         smem_knT.store(gl.permute(k_nope, [1, 0]))
-        smem_krT.store(gl.permute(k_rope, [1, 0]))
 
+        gl.amd.cdna4.async_copy.wait_group(0)
         valid_qk = gl.convert_layout(valid, sl_k_qk)
 
         # --- QK: scores = q_nope @ k_nope^T + q_rope @ k_rope^T ---
         scores = gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=mma_qk)
         scores = gl.amd.cdna4.mfma(q_nope_dot, smem_knT.load(layout=qk_b), scores)
-        scores = gl.amd.cdna4.mfma(q_rope_dot, smem_krT.load(layout=qk_b), scores)
+        scores = gl.amd.cdna4.mfma(q_rope_dot, krT.load(layout=qk_b), scores)
         scores = scores * scale
         scores = gl.where(valid_qk[None, :], scores, float("-inf"))
 
@@ -542,7 +563,7 @@ def _decode_core_attn(
         acc_nope = acc_nope * alpha_pv[:, None]
         acc_nope = gl.amd.cdna4.mfma(p_dot, smem_knT.permute([1, 0]).load(layout=pv_b), acc_nope)
         acc_rope = acc_rope * alpha_pv[:, None]
-        acc_rope = gl.amd.cdna4.mfma(p_dot, smem_krT.permute([1, 0]).load(layout=pv_b), acc_rope)
+        acc_rope = gl.amd.cdna4.mfma(p_dot, krT.permute([1, 0]).load(layout=pv_b), acc_rope)
 
     return m_i, l_i, acc_nope, acc_rope
 
@@ -690,30 +711,33 @@ def _sparse_attn_decode_kernel(
         acc_nope = gl.zeros([BLOCK_H, NOPE_BLOCK], dtype=gl.float32, layout=mma_pv)
         acc_rope = gl.zeros([BLOCK_H, ROPE_DIM], dtype=gl.float32, layout=mma_pv)
 
-        # --- shared staging buffers (transposed single buffer, reused both passes) ---
+        # --- shared staging buffers: smem_knT single (sync store); smem_krT
+        # double-buffered (async-filled, needs WAR-free slot alternation). ---
         smem_knT = gl.allocate_shared_memory(gl.bfloat16, [NOPE_BLOCK, BLOCK_K], sh_knT)
-        smem_krT = gl.allocate_shared_memory(gl.bfloat16, [ROPE_DIM, BLOCK_K], sh_krT)
+        smem_krT = gl.allocate_shared_memory(gl.bfloat16, [2, ROPE_DIM, BLOCK_K], sh_krT)
 
         main_start = gl.load(main_indptr_ptr + query_idx)
         main_end = gl.load(main_indptr_ptr + query_idx + 1)
+        main_len = main_end - main_start
         m_i, l_i, acc_nope, acc_rope = _decode_core_attn(
-            main_cache_ptr, main_indices_ptr, main_start, main_end - main_start,
+            main_cache_ptr, main_indices_ptr, main_start, main_len,
             main_cache_stride0, main_block_size, main_num_rows,
             q_nope_dot, q_rope_dot, scale,
             m_i, l_i, acc_nope, acc_rope,
-            smem_knT, smem_krT,
+            smem_knT, smem_krT, 0,
             NOPE_DIM, NOPE_BLOCK, ROPE_DIM, BLOCK_H, BLOCK_K, IS_FNUZ,
         )
 
         if HAS_EXTRA:
             extra_start = gl.load(extra_indptr_ptr + query_idx)
             extra_end = gl.load(extra_indptr_ptr + query_idx + 1)
+            extra_kr_buf0 = ((main_len + BLOCK_K - 1) // BLOCK_K) % 2
             m_i, l_i, acc_nope, acc_rope = _decode_core_attn(
                 extra_cache_ptr, extra_indices_ptr, extra_start, extra_end - extra_start,
                 extra_cache_stride0, extra_block_size, extra_num_rows,
                 q_nope_dot, q_rope_dot, scale,
                 m_i, l_i, acc_nope, acc_rope,
-                smem_knT, smem_krT,
+                smem_knT, smem_krT, extra_kr_buf0,
                 NOPE_DIM, NOPE_BLOCK, ROPE_DIM, BLOCK_H, BLOCK_K, IS_FNUZ,
             )
 
@@ -755,103 +779,6 @@ def _sparse_attn_decode_kernel(
             offsets=out_head[:, None] * out_stride1 + NOPE_DIM + rope_off_pv[None, :],
             mask=(out_head < num_heads)[:, None],
         )
-
-
-def sparse_attn_decode_gluon(
-    q,                  # [T, H, D] bf16 queries (D = NOPE_DIM + ROPE_DIM)
-    main_cache,         # [num_blocks, block_size, row_bytes] uint8 fp8_ds_mla cache
-    main_indices,       # [nnz] int32 ragged slot ids
-    main_indptr,        # [T + 1] int32 ragged offsets
-    out,                # [T, H, D] output (filled in place)
-    scale,              # softmax scale
-    extra_cache=None,   # optional second ragged pass (top-k) cache
-    extra_indices=None,
-    extra_indptr=None,
-    attn_sink=None,     # optional [H] fp32 per-head sink bias
-    nope_dim=448,
-    rope_dim=64,
-    is_fnuz=False,
-    num_sms=None,       # persistent program count (defaults to device CU count)
-):
-    """Host launcher for the persistent DSV4 sparse-MLA decode kernel.
-
-    Mirrors ``sparse_attn_prefill_gluon``: the kernel is persistent, so a fixed
-    pool of ``num_sms`` programs grid-strides over the (query, head-block) tile
-    space and the launch grid is 1-D instead of ``(num_queries, num_pid_h)``.
-    The autotuned search is removed -- the best config is hard-coded here
-    (BLOCK_H=64, BLOCK_K=32, num_warps=8, num_ctas=1).
-
-    The optional ``extra_*`` arguments drive the second ragged pass (top-k);
-    when omitted the kernel runs the single (main / SWA) pass only.
-    """
-    assert q.ndim == 3, f"expected q=[T,H,D], got {tuple(q.shape)}"
-    assert main_cache.ndim == 3, (
-        f"expected main_cache=[blocks,block,bytes], got {tuple(main_cache.shape)}"
-    )
-    assert q.is_cuda and main_cache.is_cuda, "q/main_cache must be on the GPU"
-
-    num_queries, num_heads, head_dim = q.shape
-    nope_block = triton.next_power_of_2(nope_dim)
-
-    has_attn_sink = attn_sink is not None
-    if attn_sink is None:
-        attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
-
-    has_extra = (
-        extra_cache is not None
-        and extra_indices is not None
-        and extra_indptr is not None
-    )
-    if not has_extra:
-        # Pass valid (but unused-by-dead-code) pointers so the HAS_EXTRA
-        # constexpr branch in the kernel never materializes.
-        extra_cache = main_cache
-        extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
-        extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
-
-    if num_sms is None:
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-
-    BLOCK_H = 64
-    BLOCK_K = 32
-
-    # Persistent 1-D grid: cap the program count at the number of tiles so small
-    # problems never launch idle workgroups.
-    num_pid_h = triton.cdiv(num_heads, BLOCK_H)
-    grid = (min(num_sms, num_queries * num_pid_h),)
-    _sparse_attn_decode_kernel[grid](
-        q,
-        main_cache,
-        main_indices,
-        main_indptr,
-        extra_cache,
-        extra_indices,
-        extra_indptr,
-        attn_sink,
-        out,
-        q.stride(0), q.stride(1),
-        out.stride(0), out.stride(1),
-        main_cache.stride(0),
-        extra_cache.stride(0),
-        main_cache.shape[0] * main_cache.shape[1],
-        extra_cache.shape[0] * extra_cache.shape[1],
-        main_cache.shape[1],
-        extra_cache.shape[1],
-        float(scale),
-        num_queries,
-        num_heads,
-        HAS_ATTN_SINK=has_attn_sink,
-        HAS_EXTRA=has_extra,
-        NOPE_DIM=nope_dim,
-        NOPE_BLOCK=nope_block,
-        ROPE_DIM=rope_dim,
-        IS_FNUZ=is_fnuz,
-        BLOCK_H=BLOCK_H,
-        BLOCK_K=BLOCK_K,
-        num_warps=8,
-    )
-    return out
-
 
 # ---------------------------------------------------------------------------
 # Decode kernel — flash-decode (split-K) variant
@@ -917,13 +844,13 @@ def _sparse_attn_decode_partial_kernel(
     )
     qk_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mma_qk, k_width=8)
 
-    # Transposed single-buffer KV staging layouts (mirror the single-pass kernel).
-    if BLOCK_K == 32:
-        sh_knT: gl.constexpr = gl.PaddedSharedLayout(interval_padding_pairs=[[512, 16]], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 1], [0, 2], [0, 4], [0, 8], [0, 16]], cga_layout=[], shape=[512, 32])
-        sh_krT: gl.constexpr = gl.PaddedSharedLayout(interval_padding_pairs=[[512, 16]], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 1], [0, 2], [0, 8], [0, 4], [0, 16]], cga_layout=[], shape=[64, 32])
-    else:
-        sh_knT: gl.constexpr = gl.PaddedSharedLayout(interval_padding_pairs=[[512, 16]], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 1], [0, 2], [0, 8], [0, 4]], cga_layout=[], shape=[512, 16])
-        sh_krT: gl.constexpr = gl.PaddedSharedLayout(interval_padding_pairs=[[512, 16]], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 1], [0, 2], [0, 8], [0, 4]], cga_layout=[], shape=[64, 16])
+    # Transposed single-buffer deq-KV staging layouts ([D, BLOCK_K], D contiguous,
+    # [[512,16]] pad). BLOCK_H=64, BLOCK_K=64 only: QK reads K^T directly and PV
+    # reads the permuted view, so no normal-orientation duplicate is needed.
+    gl.static_assert(BLOCK_K == 64, "decode partial kernel is BLOCK_K=64 only")
+    sh_slot: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
+    sh_knT: gl.constexpr = gl.PaddedSharedLayout(interval_padding_pairs=[[512, 16]], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], cga_layout=[], shape=[512, 64])
+    sh_krT: gl.constexpr = gl.PaddedSharedLayout(interval_padding_pairs=[[512, 16]], offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]], cga_layout=[], shape=[64, 64])
 
     sl_h_qk: gl.constexpr = gl.SliceLayout(1, mma_qk)
     sl_h_pv: gl.constexpr = gl.SliceLayout(1, mma_pv)
@@ -934,8 +861,9 @@ def _sparse_attn_decode_partial_kernel(
         size_per_thread=[1, 8], threads_per_warp=[1, 64],
         warps_per_cta=[nw, 1], order=[1, 0],
     )
+    # q_pe (rope) async-copy: 16-byte granule [1,8] over [BLOCK_H, ROPE_DIM=64].
     blk_qr: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1], threads_per_warp=[1, 64],
+        size_per_thread=[1, 8], threads_per_warp=[8, 8],
         warps_per_cta=[nw, 1], order=[1, 0],
     )
     sl_h_qn: gl.constexpr = gl.SliceLayout(1, blk_qn)
@@ -949,8 +877,15 @@ def _sparse_attn_decode_partial_kernel(
         cga_layout=[],
         shape=[64, 512],
     )
+    sh_qpe: gl.constexpr = gl.PaddedSharedLayout(
+        interval_padding_pairs=[[512, 16]],
+        offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32],
+                      [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+        cga_layout=[],
+        shape=[64, 64],
+    )
 
-    # --- load q (nope + rope) ---
+    # --- Global Load q (nope + rope) ---
     head_n = pid_h * BLOCK_H + gl.arange(0, BLOCK_H, layout=sl_h_qn)
     head_r = pid_h * BLOCK_H + gl.arange(0, BLOCK_H, layout=sl_h_qr)
     nope_off = gl.arange(0, NOPE_BLOCK, layout=sl_d_qn)
@@ -958,21 +893,23 @@ def _sparse_attn_decode_partial_kernel(
 
     q_base = q_ptr + query_idx * q_stride0
     buf_qn = gl.allocate_shared_memory(q_ptr.dtype.element_ty, [BLOCK_H, NOPE_BLOCK], sh_qn)
+    buf_qpe = gl.allocate_shared_memory(q_ptr.dtype.element_ty, [BLOCK_H, ROPE_DIM], sh_qpe)
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         buf_qn, q_base,
         head_n[:, None] * q_stride1 + nope_off[None, :],
         mask=(head_n < num_heads)[:, None],
     )
     gl.amd.cdna4.async_copy.commit_group()
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        buf_qpe, q_base,
+        head_r[:, None] * q_stride1 + NOPE_DIM + rope_off[None, :],
+        mask=(head_r < num_heads)[:, None],
+    )
+    gl.amd.cdna4.async_copy.commit_group()
+
     gl.amd.cdna4.async_copy.wait_group(0)
     q_nope_dot = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_qn, qk_a)
-    q_rope = gl.amd.cdna4.buffer_load(
-        ptr=q_base,
-        offsets=head_r[:, None] * q_stride1 + NOPE_DIM + rope_off[None, :],
-        mask=(head_r < num_heads)[:, None],
-        other=0.0,
-    )
-    q_rope_dot = gl.convert_layout(q_rope, qk_a)
+    q_rope_dot = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_qpe, qk_a)
 
     # --- running softmax state ---
     m_i = gl.full([BLOCK_H], float("-inf"), dtype=gl.float32, layout=sl_h_qk)
@@ -981,7 +918,7 @@ def _sparse_attn_decode_partial_kernel(
     acc_rope = gl.zeros([BLOCK_H, ROPE_DIM], dtype=gl.float32, layout=mma_pv)
 
     smem_knT = gl.allocate_shared_memory(gl.bfloat16, [NOPE_BLOCK, BLOCK_K], sh_knT)
-    smem_krT = gl.allocate_shared_memory(gl.bfloat16, [ROPE_DIM, BLOCK_K], sh_krT)
+    smem_krT = gl.allocate_shared_memory(gl.bfloat16, [2, ROPE_DIM, BLOCK_K], sh_krT)
 
     # --- main (SWA) pass over this split's contiguous slice ---
     main_start = gl.load(main_indptr_ptr + query_idx)
@@ -990,15 +927,26 @@ def _sparse_attn_decode_partial_kernel(
     main_chunk = (main_len + NUM_SPLITS - 1) // NUM_SPLITS
     main_lo = split_id * main_chunk
     main_hi = gl.minimum(main_lo + main_chunk, main_len)
+
+    # Prologue: GL slot[0];
+    #           GL slot[1];
+    #           LL Q;
+    #           LL slot[0] + GL KV[0].
+
+    # Main Loop: GL slot[i+2]
+    #            LL KV[i]^T + MFMA QK
+    #            LL slot[i+1] + GL KV[i+1];
+    #            LL KV[i]   + MFMA PV
     m_i, l_i, acc_nope, acc_rope = _decode_core_attn(
         main_cache_ptr, main_indices_ptr, main_start + main_lo, main_hi - main_lo,
         main_cache_stride0, main_block_size, main_num_rows,
         q_nope_dot, q_rope_dot, scale,
         m_i, l_i, acc_nope, acc_rope,
-        smem_knT, smem_krT,
+        smem_knT, smem_krT, 0,
         NOPE_DIM, NOPE_BLOCK, ROPE_DIM, BLOCK_H, BLOCK_K, IS_FNUZ,
     )
 
+    # --- Extra (TopK) pass share the same core attention with main pass ---
     if HAS_EXTRA:
         extra_start = gl.load(extra_indptr_ptr + query_idx)
         extra_end = gl.load(extra_indptr_ptr + query_idx + 1)
@@ -1006,12 +954,14 @@ def _sparse_attn_decode_partial_kernel(
         extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
         extra_lo = split_id * extra_chunk
         extra_hi = gl.minimum(extra_lo + extra_chunk, extra_len)
+        # Continue the smem_krT slot parity from where the main pass left off.
+        extra_kr_buf0 = ((main_hi - main_lo + BLOCK_K - 1) // BLOCK_K) % 2
         m_i, l_i, acc_nope, acc_rope = _decode_core_attn(
             extra_cache_ptr, extra_indices_ptr, extra_start + extra_lo, extra_hi - extra_lo,
             extra_cache_stride0, extra_block_size, extra_num_rows,
             q_nope_dot, q_rope_dot, scale,
             m_i, l_i, acc_nope, acc_rope,
-            smem_knT, smem_krT,
+            smem_knT, smem_krT, extra_kr_buf0,
             NOPE_DIM, NOPE_BLOCK, ROPE_DIM, BLOCK_H, BLOCK_K, IS_FNUZ,
         )
 
@@ -1128,14 +1078,98 @@ def _sparse_attn_decode_reduce_kernel(
     )
 
 
-def sparse_attn_decode_split_gluon(
+def _decode_partial_iters(
+    avg_main_len: float, avg_extra_len: float, splits: int, block_k: int
+) -> int:
+    """BLOCK_K iterations one partial workgroup walks for ``splits`` splits.
+
+    Each split processes ``ceil(seg_len / splits)`` tokens of a segment, walked
+    ``BLOCK_K`` at a time, and the main/extra segments are handled separately.
+    """
+    main_iters = (
+        math.ceil(math.ceil(avg_main_len / splits) / block_k) if avg_main_len > 0 else 0
+    )
+    extra_iters = (
+        math.ceil(math.ceil(avg_extra_len / splits) / block_k)
+        if avg_extra_len > 0
+        else 0
+    )
+    return main_iters + extra_iters
+
+
+def _decode_num_splits(
+    num_queries: int,
+    heads_blocks: int,
+    main_indices: torch.Tensor,
+    extra_indices: torch.Tensor,
+    has_extra: bool,
+    block_k: int = 32,
+    max_splits: int = 8,
+    num_cus: int = 256,
+) -> int:
+    """Pick a flash-decode split count for the gather-latency-bound decode.
+
+    Decode launches only ``num_queries * heads_blocks`` workgroups, which
+    under-fills the device in the low-batch regime that dominates latency.
+    Splitting the per-query KV segment across workgroups adds memory-level
+    parallelism (more concurrent gathers), which is the right lever for this
+    HBM-gather-latency-bound kernel.
+
+    But each split also writes a full fp32 partial accumulator
+    (``BLOCK_H x COMB_DIM`` per workgroup) to HBM that the reduce kernel reads
+    back, so the overhead grows with the split count. The cost model works in
+    ``BLOCK_K``-iteration units::
+
+        cost(s) = waves(s) * (iters_per_split(s) + MU) + NU * (s - 1)
+
+    where ``waves = ceil(base * s / CU)``, ``iters_per_split`` is the real
+    per-workgroup BLOCK_K iteration count (``_decode_partial_iters``), ``MU``
+    charges per-wave launch/tail latency, and ``NU`` charges the per-split
+    reduce + partial-accumulator HBM traffic. Splitting is chosen only when the
+    iteration drop outweighs the extra-wave and reduce overhead; ties favour
+    fewer splits. This avoids splitting short segments (where the gather is too
+    cheap to offset the reduce overhead) and over-splitting tiny batches (where
+    the partial-acc HBM traffic dominates) — both measured net losses on gfx950.
+    Returns 1 (use the single-pass kernel, no reduce) when no split helps.
+
+    Tuned on gfx950 against the split-vs-single-pass decode sweep.
+    """
+    inv_q = 1.0 / max(1, num_queries)
+    avg_main_len = main_indices.numel() * inv_q
+    avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
+    if avg_main_len <= 0.0 and avg_extra_len <= 0.0:
+        return 1
+    # Minimum per-query work to split at all. Short segments are too cheap to
+    # gather for the split to offset the second kernel launch + partial-acc HBM
+    # round-trip: measured net loss on gfx950 once the single-pass per-query
+    # iteration count drops below ~16 BLOCK_K tiles (e.g. topk<=256).
+    MIN_ITERS_TO_SPLIT = 16
+    if _decode_partial_iters(avg_main_len, avg_extra_len, 1, block_k) < MIN_ITERS_TO_SPLIT:
+        return 1
+    base = max(1, num_queries * heads_blocks)
+    cu = max(1, num_cus)
+    MU = 1.0  # per-wave launch/tail latency penalty
+    NU = 4.0  # per-extra-split reduce + partial-accumulator HBM penalty
+    best_splits = 1
+    best_cost = None
+    for splits in range(1, max_splits + 1):
+        waves = (base * splits + cu - 1) // cu
+        iters = _decode_partial_iters(avg_main_len, avg_extra_len, splits, block_k)
+        cost = waves * (iters + MU) + NU * (splits - 1)
+        if best_cost is None or cost < best_cost - 1e-9:
+            best_splits = splits
+            best_cost = cost
+    return best_splits
+
+
+def sparse_attn_decode_gluon(
     q,                  # [T, H, D] bf16 queries (D = NOPE_DIM + ROPE_DIM)
     main_cache,         # [num_blocks, block_size, row_bytes] uint8 fp8_ds_mla cache
     main_indices,       # [nnz] int32 ragged slot ids
     main_indptr,        # [T + 1] int32 ragged offsets
     out,                # [T, H, D] output (filled in place)
     scale,              # softmax scale
-    num_splits,         # flash-decode split count (chosen by the caller)
+    num_splits=None,    # flash-decode split count (chosen by the caller)
     extra_cache=None,   # optional second ragged pass (top-k) cache
     extra_indices=None,
     extra_indptr=None,
@@ -1156,9 +1190,12 @@ def sparse_attn_decode_split_gluon(
     assert main_cache.ndim == 3, (
         f"expected main_cache=[blocks,block,bytes], got {tuple(main_cache.shape)}"
     )
-    assert q.is_cuda and main_cache.is_cuda, "q/main_cache must be on the GPU"
+    assert nope_dim == 448, f"DSv4 sparse_attn_decode_gluon requires nope_dim=448, got {nope_dim=}"
+    assert rope_dim == 64, f"DSv4 sparse_attn_decode_gluon requires rope_dim=448, got {rope_dim=}"
 
     num_queries, num_heads, head_dim = q.shape
+    assert head_dim == 512, f"DSv4 sparse_attn_decode_gluon requires Q head_dim=512, got {head_dim=}"
+
     nope_block = triton.next_power_of_2(nope_dim)
     comb_dim = nope_dim + rope_dim
 
@@ -1171,14 +1208,38 @@ def sparse_attn_decode_split_gluon(
         and extra_indices is not None
         and extra_indptr is not None
     )
-    if not has_extra:
+    if has_extra:
+        assert extra_cache is not None
+        assert extra_indices is not None
+        assert extra_indptr is not None
+        assert extra_indices.ndim == 1, (
+            f"expected extra_indices=[nnz], got {extra_indices.shape}"
+        )
+        assert extra_indptr.ndim == 1, (
+            f"expected extra_indptr=[b+1], got {extra_indptr.shape}"
+        )
+        assert extra_indptr.numel() == num_queries + 1, (
+            f"expected extra_indptr shape [{num_queries + 1}], got {extra_indptr.shape}"
+        )
+    else:
         extra_cache = main_cache
         extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
     BLOCK_H = 64
-    BLOCK_K = 32
+    BLOCK_K = 64
+    # NUM_XCDS = get_num_xcds()
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     heads_blocks = triton.cdiv(num_heads, BLOCK_H)
+    num_splits = _decode_num_splits(
+        num_queries,
+        heads_blocks,
+        main_indices,
+        extra_indices,
+        has_extra,
+        block_k = BLOCK_K,
+        num_cus = NUM_SMS,
+        )
 
     part_m = torch.empty(
         (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device

@@ -15,7 +15,7 @@ Usage:
 from aiter.ops.triton.gluon.sparse_attention_dsv4 import (
     sparse_attn_prefill_gluon,
     sparse_attn_decode_gluon,
-    sparse_attn_decode_split_gluon,
+    # sparse_attn_decode_split_gluon,
 )
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_decode_kernel as csa_decode_tl,
@@ -192,17 +192,35 @@ def _launch_decode(
     has_sink,
     scale,
 ):
+    # Print each kernel input tensor shape (once; this is called every bench rep).
+    if not getattr(_launch_decode, "_shapes_printed", False):
+        print("---- _sparse_attn_decode_kernel input tensor shapes ----")
+        for name, t in (
+            ("q             ", q),
+            ("main_cache    ", main_cache),
+            ("main_idx      ", main_idx),
+            ("main_indptr   ", main_indptr),
+            ("extra_cache   ", extra_cache),
+            ("extra_idx     ", extra_idx),
+            ("extra_indptr  ", extra_indptr),
+            ("attn_sink     ", attn_sink),
+            ("out           ", out),
+        ):
+            print(f"  {name}: {tuple(t.shape)}  {t.dtype}")
+        print(f"  has_extra: {has_extra}, has_sink: {has_sink}")
+        _launch_decode._shapes_printed = True
+
     if USE_GLUON:
         # Persistent Gluon decode kernel: the host launcher builds the 1-D grid
         # and passes num_queries (it grid-strides over the tile space itself).
-        sparse_attn_decode_split_gluon(
+        # sparse_attn_decode_split_gluon(
+        sparse_attn_decode_gluon(
             q,
             main_cache,
             main_idx,
             main_indptr,
             out,
             scale,
-            num_splits=1,
             extra_cache=extra_cache if has_extra else None,
             extra_indices=extra_idx if has_extra else None,
             extra_indptr=extra_indptr if has_extra else None,
@@ -417,31 +435,25 @@ def _parse_args():
         type=str,
         default=[
             # Format: (num_q, num_heads, block_size, num_blocks, topk, has_extra)
-            # num_q     = decode batch size (1 token per active sequence)
-            # num_heads = 128 total DSv4 heads (÷TP for per-rank shape)
-            # block_size= storage_block_size = 256//compress_ratio
-            # num_blocks= pool size; must satisfy num_blocks*block_size >= topk
-            # topk      = max KV slots each query attends (SWA window or index_topk)
-            # has_extra = 1 when MLA compressed cache accompanies the SWA cache
+            # num_blocks only needs to satisfy: num_blocks * block_size >= topk
 
-            # ── SWA-only layers (CR=1, sbs=256, no MLA extra) ──
-            # SWA window ~2048 tokens; 512 × 256 = 131 072 slots >> window
-            "1,128,256,512,2048,0",
-            "32,128,256,512,2048,0",
-            "128,128,256,512,2048,0",
+            # ── SWA-only (CR=1, sbs=256): 512 × 256 = 131 072 >> topk ──
+            # "1,128,256,512,1024,0",
+            "128,128,256,512,1024,0",
+            "2048,128,256,512,1024,0",
+            "4096,128,256,512,1024,0",
+            "8192,128,256,512,1024,0",
 
-            # ── C4A layers (CR=4, sbs=64) with SWA+MLA extra ──
-            # index_topk = 2048 compressed entries; 512 × 64 = 32 768 >> topk
-            "1,128,64,512,2048,1",
-            "32,128,64,512,2048,1",
-            "128,128,64,512,2048,1",
+            # ── C4A (CR=4, sbs=64): 512 × 64 = 32 768 >> topk ──
+            # "1,128,64,512,1024,1",
+            # "32,128,64,512,1024,1",
+            # "2048,128,64,512,1024,1",
+            # "4096,128,64,512,1024,1",
 
-            # ── C128A layers (CR=128, sbs=2) with SWA+MLA extra ──
-            # 128K context → 128K/128 = 1024 compressed entries (attend all)
-            # 2048 × 2 = 4096 >> 1024
-            "1,128,2,2048,1024,1",
-            "32,128,2,2048,1024,1",
-            "128,128,2,2048,1024,1",
+            # ── C128A (CR=128, sbs=2): 2048 × 2 = 4096 >> topk ──
+            # "1,128,2,2048,1024,1",
+            # "32,128,2,2048,1024,1",
+            # "128,128,2,2048,1024,1",
         ],
     )
     args = p.parse_args()
@@ -461,8 +473,8 @@ def main():
     )
     print(f"Triton: {triton.__version__}")
     print(f"Backend: {'GLUON (gfx950)' if USE_GLUON else 'TRITON'} ")
-    if args.shapes in ("all", "prefill"):
-        run_prefill_bench(args, device)
+    # if args.shapes in ("all", "prefill"):
+    #     run_prefill_bench(args, device)
     if args.shapes in ("all", "decode"):
         run_decode_bench(args, device)
 
