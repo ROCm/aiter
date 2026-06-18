@@ -176,7 +176,31 @@ def build_weights(shape, device, seed=0):
         w1_scale=shuffle_scale_a16w4(w1_scale, ne, True),
         w2_scale=shuffle_scale_a16w4(w2_scale, ne, False),
     )
-    return fly, mx
+    return fly, mx, w1, w2
+
+
+@torch.no_grad()
+def torch_moe_ref(shape, w1, w2, hidden, topk_ids, topk_weight):
+    """Reference MoE in torch bf16 (the true computation). Used to gate broken port
+    variants -- correct a4w4 variants land ~0.95 cos vs this; broken ones collapse.
+    w1: [E, 2*inter, h] (gate||up), w2: [E, h, inter]; matches build_weights' bf16."""
+    ne, h, inter, topk = shape.NE, shape.H, shape.INTER, shape.TOPK
+    M = hidden.shape[0]
+    out = torch.zeros((M, h), dtype=torch.float32, device=hidden.device)
+    hf, w1f, w2f = hidden.float(), w1.float(), w2.float()
+    for e in range(ne):
+        mask = topk_ids == e
+        if not mask.any():
+            continue
+        tok, kk = mask.nonzero(as_tuple=True)
+        x = hf[tok]
+        g = x @ w1f[e, :inter].T
+        u = x @ w1f[e, inter:].T
+        act = torch.nn.functional.silu(g) * u
+        out.index_add_(
+            0, tok, topk_weight[tok, kk].float().unsqueeze(1) * (act @ w2f[e].T)
+        )
+    return out.to(dtypes.bf16)
 
 
 def build_inputs(shape, M, device, seed=1):
@@ -277,9 +301,9 @@ FIXED = {
     "q_type": "QuantType.per_1x32",
     "use_g1u1": 1,
     "doweight_stage1": 0,
-    "_tag": "mxfp4_guinterleave",
+    "_tag": "mxfp4_moe",
 }
-GATE = 0.90  # cosine vs flydsl_moe; rejects broken variants, not the fp4 ceiling
+GATE = 0.85  # cosine vs torch bf16 MoE ref; correct a4w4 variants ~0.95, garbage <<
 
 
 def candidate_variants(shape, M):
@@ -327,38 +351,15 @@ def time_variant(shape, mx_w, hidden, tids, tw, ref, k1, k2, iters, warmup):
 
 def tune_shape(name, shape, M_list, cu_num, writer, iters, warmup):
     dev = torch.device("cuda")
-    fly_w, mx_w = build_weights(shape, dev)
-    # The legacy a4w4 SEGFAULTS on the dsv4 geometry (uncatchable, kills the tuner),
-    # so anchor the cosine gate on the port's own BM16-inline output for dsv4 instead
-    # of run_fly. BM16 is the simplest/most-trusted variant and runs for all dsv4 M.
-    _dsv4 = name.startswith("dsv4")
+    fly_w, mx_w, w1_bf16, w2_bf16 = build_weights(shape, dev)
+    mx_w["w1"].gemm1_backend = "flydsl"
+    mx_w["w2"].gemm2_backend = "flydsl"
     for M in M_list:
         hidden, tids, tw = build_inputs(shape, M, dev)
-        if _dsv4:
-            try:
-                mx_w["w1"].gemm1_backend = "flydsl"
-                mx_w["w2"].gemm2_backend = "flydsl"
-                ref = _mxfp4_moe_run(
-                    hidden,
-                    mx_w["w1"],
-                    mx_w["w2"],
-                    tids,
-                    tw,
-                    shape.TOPK,
-                    kernelName1=g1_kernel_name(shape, 16, "INLINEQUANT"),
-                    kernelName2=g2_kernel_name(shape, 16, "ATOMIC"),
-                    w1_scale=mx_w["w1_scale"],
-                    w2_scale=mx_w["w2_scale"],
-                    activation=ActivationType.Silu,
-                    quant_type=QuantType.per_1x32,
-                ).clone()
-            except Exception:
-                ref = None
-        else:
-            try:
-                _, ref = run_fly(shape, M, fly_w, hidden, tids, tw, iters, warmup)
-            except Exception:
-                ref = None  # no anchor -> accept any variant that runs
+        # Reference: a torch bf16 MoE (the true computation), NOT the legacy CK path
+        # (slow build / segfaults on dsv4). Rejects broken port variants (cos < GATE);
+        # correct a4w4 variants land ~0.95 vs this bf16 reference.
+        ref = torch_moe_ref(shape, w1_bf16, w2_bf16, hidden, tids, tw)
         best = None
         for label, k1, k2 in candidate_variants(shape, M):
             try:
