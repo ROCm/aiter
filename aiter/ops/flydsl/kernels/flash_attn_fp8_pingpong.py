@@ -144,9 +144,11 @@ def build_flash_attn_fp8_module(
     V_KV_STRIDE = 16  # bytes per kv within a 16-wide d block
     V_DBLOCK_STRIDE = BLOCK_N * V_KV_STRIDE
     N_DBLOCKS = HEAD_DIM // 16  # 8
-    # Step 2: double-buffer K and V (ping-pong by KV-tile parity) so the
-    # global load for tile i+1 overlaps the MFMA compute of tile i.
-    NUM_BUF = 2
+    # Triple-buffer K/V (Step 7): with deferred PV the buffer overwritten in
+    # iteration i (tile i-3) was last read two iterations earlier, so a single
+    # barrier/iteration suffices (no extra hazard barrier) while PV(i-1) still
+    # reads tile i-1 from a live buffer.
+    NUM_BUF = 3
     LDS_K_TILE = BLOCK_N * K_STRIDE
     LDS_V_TILE = N_DBLOCKS * V_DBLOCK_STRIDE  # == HEAD_DIM * BLOCK_N
     LDS_K_SIZE = NUM_BUF * LDS_K_TILE
@@ -352,17 +354,55 @@ def build_flash_attn_fp8_module(
         # needed, and L lands in the same C-layout as O -> it rides the corr
         # rescale.  fp8 E4M3 1.0 == 0x38, so each i32 lane word is 0x38383838.
         ones_pack = Vec.filled(A_FP8_PER_LANE // 4, 0x38383838, fx.Int32)
+
+        # ---- V HW-transpose read + PV/L accumulate helpers (Step 7) ----
+        # Factored out so both the deferred in-loop PV (tile i-1) and the
+        # epilogue PV (tile N-1) share one code path.
+        v_tr8_ty = Vec.make_type(2, fx.Int32)
+        lo_in_grp = lo % fx.Index(16)
+
+        def read_v_pack(v_off, dt):
+            d_block = (lo // fx.Index(16)) + fx.Index(2 * dt)
+            grp_db = fx.Index(lds_offset) + v_off + d_block * fx.Index(V_DBLOCK_STRIDE)
+            reads = []
+            for kc in range_constexpr(4):
+                kv0 = hi * fx.Index(32) + fx.Index(8 * kc)
+                byte_off = (
+                    grp_db + kv0 * fx.Index(V_KV_STRIDE) + lo_in_grp * fx.Index(8)
+                )
+                ptr = fx.buffer_ops.create_llvm_ptr(fx.Int64(byte_off), address_space=3)
+                reads.append(Vec(rocdl.ds_read_tr8_b64(v_tr8_ty, ptr).result))
+            ab = reads[0].shuffle(reads[1], list(range(4)))
+            cd = reads[2].shuffle(reads[3], list(range(4)))
+            return ab.shuffle(cd, list(range(8)))
+
+        def apply_pv(o_accs, l_acc, p_pack, corr, v_off):
+            # O,L *= corr ; then O += V^T@P and L += ones@P.  The PV/L MFMAs
+            # (matrix pipe) are issued next to the following tile's softmax
+            # exp2 (transcendental pipe) so the two pipes overlap (deferred PV).
+            corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
+                C_F32_PER_LANE
+            )
+            o2 = [_fmul(Vec(o_accs[dt]), corr_vec) for dt in range_constexpr(D_TILES)]
+            l2 = _fmul(Vec(l_acc), corr_vec)
+            l2 = mfma.call(ones_pack, p_pack, l2)
+            for dt in range_constexpr(D_TILES):
+                v_pack = read_v_pack(v_off, dt)
+                o2[dt] = mfma.call(v_pack, p_pack, o2[dt])
+            return o2, l2
+
         init_args = [c_neg_inf, Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)]
         for _ in range_constexpr(D_TILES):
             init_args.append(Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32))
-        # Double-buffer carried state: buffer parity + prefetched K/V register
-        # vectors for the *current* tile.  Prefetch tile 0 before the loop.
-        # The global loads (the latency-bound part) are issued one iteration
-        # ahead so they overlap the previous tile's MFMA compute; the SSA
-        # dependency from the LDS store auto-inserts the consume waitcnt.
+        # Carried state: buffer parity + prefetched K/V register vectors for the
+        # *current* tile + deferred-PV state P_prev/corr_prev (tile i-1's packed
+        # P and softmax correction, consumed by the next iteration's PV so the
+        # PV MFMAs overlap this iteration's softmax exp2).
         init_args.append(fx.Index(0))  # buf parity
         init_args.append(global_load_kv(fx.Index(0), k_ptr))  # K reg, tile 0
         init_args.append(global_load_kv(fx.Index(0), v_ptr))  # V reg, tile 0
+        init_args.append(Vec.filled(A_FP8_PER_LANE // 4, 0, fx.Int32))  # P_prev=0
+        init_args.append(fx.Float32(1.0))  # corr_prev=1 (no-op rescale at i=0)
 
         loop_results = init_args
         for kv_start, iter_args in range(0, seq_len_v, BLOCK_N, init=init_args):
@@ -372,21 +412,31 @@ def build_flash_attn_fp8_module(
             buf = iter_args[2 + D_TILES]
             k_reg = iter_args[3 + D_TILES]
             v_reg = iter_args[4 + D_TILES]
+            p_prev = iter_args[5 + D_TILES]
+            corr_prev = iter_args[6 + D_TILES]
 
             k_buf_off = fx.Index(LDS_K_OFF) + buf * fx.Index(LDS_K_TILE)
             v_buf_off = fx.Index(LDS_V_OFF) + buf * fx.Index(LDS_V_TILE)
-            next_buf = fx.Index(1) - buf
+            prev_buf = (buf + fx.Index(2)) % fx.Index(NUM_BUF)  # tile i-1
+            v_prev_off = fx.Index(LDS_V_OFF) + prev_buf * fx.Index(LDS_V_TILE)
+            next_buf = (buf + fx.Index(1)) % fx.Index(NUM_BUF)
             next_kv = kv_start + fx.Index(BLOCK_N)
 
-            # ---- Commit the prefetched current tile into its LDS buffer ----
+            # ---- Triple-buffered: one barrier publishes tile i.  The buffer
+            #      written here (tile i-3) was last read in iteration i-2, so no
+            #      separate hazard barrier is needed. ----
             store_k_lds(k_reg, k_buf_off)
             store_v_lds_dblocked(v_reg, v_buf_off)
             gpu.barrier()
 
-            # ---- Prefetch the NEXT tile's global loads (latency hides under
-            #      this tile's MFMA compute below).  Carried to next iter. ----
+            # ---- Prefetch the NEXT tile's global loads (carried to next iter).
             k_next = global_load_kv(next_kv, k_ptr)
             v_next = global_load_kv(next_kv, v_ptr)
+
+            # ---- Deferred PV for tile i-1 (P_prev register-resident): its
+            #      PV/L MFMAs overlap tile i's softmax exp2 below.  At i=0,
+            #      P_prev=0 nullifies the read of the not-yet-filled buffer. ----
+            o_accs, l_acc = apply_pv(o_accs, l_acc, p_prev, corr_prev, v_prev_off)
 
             # ===============================================================
             # GEMM1: S[kv,q] = K @ Q^T  for each of the N_KV_TILES kv subtiles
@@ -526,61 +576,30 @@ def build_flash_attn_fp8_module(
                 p_words.append(fx.Int32(sel))
             p_pack = Vec.from_elements(p_words, i32_dtype)
 
-            # Rescale O and L accumulators by corr before adding this tile.
-            corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
-                C_F32_PER_LANE
-            )
-            for dt in range_constexpr(D_TILES):
-                o_accs[dt] = _fmul(Vec(o_accs[dt]), corr_vec)
-            l_acc = _fmul(Vec(l_acc), corr_vec)
-            # ones-column L: L += ones_fp8 @ P  (sums all 64 kv via the MFMA
-            # K-dim).  Lands in C-layout (every d-row == L[q=lo]).
-            l_acc = mfma.call(ones_pack, p_pack, l_acc)
-
-            # V A-operand via HW transpose-on-read (ds_read_tr8_b64).  For a
-            # 16-lane group the atom returns result[lane][r] = LDS[group_base +
-            # lane%16 + 16*r], an 8x16 byte transpose.  With the d-block layout
-            #   group_base = v_buf_off + d_block*V_DBLOCK_STRIDE + (hi*32+8*kc)*16
-            #   d_block    = lo//16 + 2*dt        (uniform within a 16-lane group)
-            # each lane passes ptr = group_base + (lo%16)*8 and gets
-            #   result[r] = V[kv = hi*32 + 8*kc + r, d = lo + dt*32]   r in [0,8)
-            # so 4 reads (kc=0..3) assemble A_frag[L][8*kc+r] = V[kv, d].
-            v_tr8_ty = Vec.make_type(2, fx.Int32)
-            lo_in_grp = lo % fx.Index(16)
-            for dt in range_constexpr(D_TILES):
-                d_block = (lo // fx.Index(16)) + fx.Index(2 * dt)
-                grp_db = (
-                    fx.Index(lds_offset)
-                    + v_buf_off
-                    + d_block * fx.Index(V_DBLOCK_STRIDE)
-                )
-                reads = []
-                for kc in range_constexpr(4):
-                    kv0 = hi * fx.Index(32) + fx.Index(8 * kc)
-                    byte_off = (
-                        grp_db + kv0 * fx.Index(V_KV_STRIDE) + lo_in_grp * fx.Index(8)
-                    )
-                    ptr = fx.buffer_ops.create_llvm_ptr(
-                        fx.Int64(byte_off), address_space=3
-                    )
-                    reads.append(Vec(rocdl.ds_read_tr8_b64(v_tr8_ty, ptr).result))
-                ab = reads[0].shuffle(reads[1], list(range(4)))
-                cd = reads[2].shuffle(reads[3], list(range(4)))
-                v_pack = ab.shuffle(cd, list(range(8)))
-                o_accs[dt] = mfma.call(v_pack, p_pack, o_accs[dt])
-
+            # Defer this tile's PV: carry p_pack/corr to the next iteration so
+            # its PV/L MFMAs overlap the next tile's softmax exp2 (Step 7).
             m_running = m_new
 
             loop_results = yield (
-                [m_running, l_acc] + o_accs + [next_buf, k_next, v_next]
+                [m_running, l_acc] + o_accs + [next_buf, k_next, v_next, p_pack, corr]
             )
 
-        # ---- Epilogue: O = (O / l) * v_descale ; store bf16 ----
+        # ---- Epilogue: flush the final deferred PV (tile N-1), then
+        #      O = (O / l) * v_descale ; store bf16. ----
+        buf_final = loop_results[2 + D_TILES]  # = next_buf of last iter
+        o_carry = [loop_results[2 + dt] for dt in range_constexpr(D_TILES)]
+        l_carry = loop_results[1]
+        p_final = loop_results[5 + D_TILES]
+        corr_final = loop_results[6 + D_TILES]
+        # tile N-1's V lives in buffer (buf_final + NUM_BUF - 1) % NUM_BUF.
+        last_buf = (buf_final + fx.Index(NUM_BUF - 1)) % fx.Index(NUM_BUF)
+        v_last_off = fx.Index(LDS_V_OFF) + last_buf * fx.Index(LDS_V_TILE)
+        o_finals, l_vec = apply_pv(o_carry, l_carry, p_final, corr_final, v_last_off)
+
         # l is the ones-column MFMA accumulator (Step 5): a vec<16xf32> whose
         # every value == L[q=lo] (the row sum is replicated over the dummy d
         # rows), so any element is the per-q normalizer.
-        l_final = Vec(loop_results[1])[0]
-        o_finals = [loop_results[2 + dt] for dt in range_constexpr(D_TILES)]
+        l_final = Vec(l_vec)[0]
 
         inv_l = rocdl.rcp(T.f32, l_final)
         inv_l_v = _fmul(inv_l, v_descale)
