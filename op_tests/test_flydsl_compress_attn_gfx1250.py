@@ -323,9 +323,7 @@ for mode in args.modes:
         )
         if shape_label == "hca_main":
             df.append(
-                test_flydsl_compress_attn_gfx1250(
-                    shape_label, bs, mtp, mode, "2kernel"
-                )
+                test_flydsl_compress_attn_gfx1250(shape_label, bs, mtp, mode, "2kernel")
             )
 df = pd.DataFrame(df)
 aiter.logger.info(

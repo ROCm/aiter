@@ -416,7 +416,8 @@ def _build_kernel(
                     for chunk in range_constexpr(dwords // half_dw):
                         r = buffer_ops.buffer_load(
                             rsrc,
-                            ArithValue(off_dw) + arith.constant(chunk * half_dw, type=i32),
+                            ArithValue(off_dw)
+                            + arith.constant(chunk * half_dw, type=i32),
                             vec_width=half_dw,
                             dtype=i32,
                         )
@@ -454,13 +455,16 @@ def _build_kernel(
                     for q in range_constexpr(n_chunks):
                         r = buffer_ops.buffer_load(
                             rsrc,
-                            ArithValue(off_elems_i32) + arith.constant(q * quarter, type=i32),
+                            ArithValue(off_elems_i32)
+                            + arith.constant(q * quarter, type=i32),
                             vec_width=quarter,
                             dtype=f32,
                         )
                         for i in range_constexpr(quarter):
                             out.append(
-                                vector.extract(r, static_position=[i], dynamic_position=[])
+                                vector.extract(
+                                    r, static_position=[i], dynamic_position=[]
+                                )
                             )
                     return out
 
@@ -926,10 +930,18 @@ def _build_kernel(
                         # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
                         c4_i32 = arith.constant(4, type=i32)
                         lo = vector.extract_strided_slice(
-                            T.vec(4, T.i32), bf16_as_i32, offsets=[0], sizes=[4], strides=[1]
+                            T.vec(4, T.i32),
+                            bf16_as_i32,
+                            offsets=[0],
+                            sizes=[4],
+                            strides=[1],
                         )
                         hi = vector.extract_strided_slice(
-                            T.vec(4, T.i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
+                            T.vec(4, T.i32),
+                            bf16_as_i32,
+                            offsets=[4],
+                            sizes=[4],
+                            strides=[1],
                         )
                         buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
                         buffer_ops.buffer_store(
@@ -1458,13 +1470,16 @@ def _build_kernel_ksplit(
                     for q in range_constexpr(n_chunks):
                         r = buffer_ops.buffer_load(
                             rsrc,
-                            ArithValue(off_elems_i32) + arith.constant(q * quarter, type=i32),
+                            ArithValue(off_elems_i32)
+                            + arith.constant(q * quarter, type=i32),
                             vec_width=quarter,
                             dtype=f32,
                         )
                         for i in range_constexpr(quarter):
                             out.append(
-                                vector.extract(r, static_position=[i], dynamic_position=[])
+                                vector.extract(
+                                    r, static_position=[i], dynamic_position=[]
+                                )
                             )
                     return out
 
@@ -1502,7 +1517,8 @@ def _build_kernel_ksplit(
                     for chunk in range_constexpr(dwords // half_dw):
                         r = buffer_ops.buffer_load(
                             rsrc,
-                            ArithValue(off_dw) + arith.constant(chunk * half_dw, type=i32),
+                            ArithValue(off_dw)
+                            + arith.constant(chunk * half_dw, type=i32),
                             vec_width=half_dw,
                             dtype=i32,
                         )
@@ -1867,10 +1883,18 @@ def _build_kernel_ksplit(
                         # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
                         c4_i32 = arith.constant(4, type=i32)
                         lo = vector.extract_strided_slice(
-                            T.vec(4, T.i32), bf16_as_i32, offsets=[0], sizes=[4], strides=[1]
+                            T.vec(4, T.i32),
+                            bf16_as_i32,
+                            offsets=[0],
+                            sizes=[4],
+                            strides=[1],
                         )
                         hi = vector.extract_strided_slice(
-                            T.vec(4, T.i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
+                            T.vec(4, T.i32),
+                            bf16_as_i32,
+                            offsets=[4],
+                            sizes=[4],
+                            strides=[1],
                         )
                         buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
                         buffer_ops.buffer_store(
@@ -2281,7 +2305,7 @@ def flydsl_fused_compress_attn_gfx1250(
     """
     # gfx1250 overrides
     preshuffle = False  # MFMA preshuffle is gfx9-only; force linear layout
-    enable_prefetch_input = False  # VEC=16 VGPR pressure
+    enable_prefetch_input = False  # noqa: F841  # VEC=16 VGPR pressure
     # ---- input validation ----
     plan_capacity = plan_gpu.shape[0]
     if plan_capacity == 0:

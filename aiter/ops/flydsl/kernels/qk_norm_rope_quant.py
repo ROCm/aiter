@@ -248,9 +248,9 @@ def _build_kernel(
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
 
-    assert (
-        D % BLOCK_THREADS == 0
-    ), f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
+    assert D % BLOCK_THREADS == 0, (
+        f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
+    )
     assert NOPE % VEC == 0, f"NOPE={NOPE} must be divisible by VEC={VEC}"
     assert RD % 2 == 0, "rope_head_dim must be even (GPT-J pair layout)"
     assert RD % VEC == 0, f"RD={RD} must be divisible by VEC={VEC}"
@@ -270,20 +270,20 @@ def _build_kernel(
     # --- quant-group layout ------------------------------------------------
     # group_size must divide D evenly AND be a multiple of VEC (so a single
     # thread's VEC-wide slice never crosses a group boundary).
-    assert (
-        group_size > 0 and D % group_size == 0
-    ), f"group_size {group_size} must divide head_dim {D}"
-    assert (
-        group_size % VEC == 0
-    ), f"group_size {group_size} must be a multiple of VEC {VEC}"
+    assert group_size > 0 and D % group_size == 0, (
+        f"group_size {group_size} must divide head_dim {D}"
+    )
+    assert group_size % VEC == 0, (
+        f"group_size {group_size} must be a multiple of VEC {VEC}"
+    )
     TPG = group_size // VEC  # threads per group
     NG = D // group_size  # number of groups per row
-    assert (
-        TPG > 0 and (TPG & (TPG - 1)) == 0
-    ), f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
-    assert (
-        scale_dtype in SCALE_DTYPE_OPTIONS
-    ), f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
+    assert TPG > 0 and (TPG & (TPG - 1)) == 0, (
+        f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
+    )
+    assert scale_dtype in SCALE_DTYPE_OPTIONS, (
+        f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
+    )
 
     log2_block = int(math.log2(BLOCK_THREADS))
     log2_tpg = int(math.log2(TPG))
@@ -1047,7 +1047,7 @@ def flydsl_qk_norm_rope_quant(
     # Normalize Q to [T, H, D] (the kernel expects 3D).
     if q.dim() == 2:
         if q.shape[1] != H * D:
-            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H*D}]")
+            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H * D}]")
         if not q.is_contiguous():
             raise ValueError("2D q must be contiguous to .view as [T,H,D]")
         q_view = q.view(T_tok, H, D)

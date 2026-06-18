@@ -127,21 +127,21 @@ def _build_compress_forward_kernel(
     sub-loop reading kv_in + score_in. Phase 2 in_row is clamped to ≥ 0
     so wasted reads in pure-Phase-1 iters stay in-bounds.
     """
-    assert (
-        head_dim % slice_size == 0
-    ), f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
-    assert (
-        slice_size % 64 == 0
-    ), f"slice_size={slice_size} must be a multiple of 64 (wave width)"
+    assert head_dim % slice_size == 0, (
+        f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
+    )
+    assert slice_size % 64 == 0, (
+        f"slice_size={slice_size} must be a multiple of 64 (wave width)"
+    )
     assert slice_size // 64 in (
         1,
         2,
         4,
         8,
     ), f"VEC={slice_size // 64} must be 1, 2, 4, or 8"
-    assert (
-        ratio % k_split_num_waves == 0
-    ), f"K={ratio} must divide evenly across {k_split_num_waves} waves"
+    assert ratio % k_split_num_waves == 0, (
+        f"K={ratio} must divide evenly across {k_split_num_waves} waves"
+    )
     assert state_size >= ratio, f"state_size={state_size} must be >= K={ratio}"
     D = head_dim
     K = ratio

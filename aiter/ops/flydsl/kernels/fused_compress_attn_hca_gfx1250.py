@@ -101,12 +101,12 @@ def _build_compress_forward_kernel(
     sub-loop reading kv_in + score_in. Phase 2 in_row is clamped to ≥ 0
     so wasted reads in pure-Phase-1 iters stay in-bounds.
     """
-    assert (
-        head_dim % slice_size == 0
-    ), f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
-    assert (
-        slice_size % 32 == 0
-    ), f"slice_size={slice_size} must be a multiple of 32 (wave width)"
+    assert head_dim % slice_size == 0, (
+        f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
+    )
+    assert slice_size % 32 == 0, (
+        f"slice_size={slice_size} must be a multiple of 32 (wave width)"
+    )
     assert slice_size // 32 in (
         1,
         2,
@@ -114,9 +114,9 @@ def _build_compress_forward_kernel(
         8,
         16,
     ), f"VEC={slice_size // 32} must be 1, 2, 4, 8, or 16"
-    assert (
-        ratio % k_split_num_waves == 0
-    ), f"K={ratio} must divide evenly across {k_split_num_waves} waves"
+    assert ratio % k_split_num_waves == 0, (
+        f"K={ratio} must divide evenly across {k_split_num_waves} waves"
+    )
     assert state_size >= ratio, f"state_size={state_size} must be >= K={ratio}"
     D = head_dim
     K = ratio
@@ -149,9 +149,7 @@ def _build_compress_forward_kernel(
     lds_w_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_off + LDS_W_BYTES
 
-    _kname = (
-        f"hca_compress_forward_w32_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
-    )
+    _kname = f"hca_compress_forward_w32_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
     fm_fast = arith.FastMathFlags.fast
 
     @flyc.kernel(name=_kname, known_block_size=[BLOCK_TH, 1, 1])
@@ -793,7 +791,8 @@ def _build_norm_rope_scatter_kernel(
                     for chunk in range_constexpr(dwords // half_dw):
                         r = buffer_ops.buffer_load(
                             rmsw_rsrc,
-                            ArithValue(off_dw) + arith.constant(chunk * half_dw, type=i32),
+                            ArithValue(off_dw)
+                            + arith.constant(chunk * half_dw, type=i32),
                             vec_width=half_dw,
                             dtype=i32,
                         )
@@ -819,13 +818,16 @@ def _build_norm_rope_scatter_kernel(
                     for q in range_constexpr(n_chunks):
                         r = buffer_ops.buffer_load(
                             rmsw_rsrc,
-                            ArithValue(tid_x_vec) + arith.constant(q * quarter, type=i32),
+                            ArithValue(tid_x_vec)
+                            + arith.constant(q * quarter, type=i32),
                             vec_width=quarter,
                             dtype=f32,
                         )
                         for i in range_constexpr(quarter):
                             rmsw_lane.append(
-                                vector.extract(r, static_position=[i], dynamic_position=[])
+                                vector.extract(
+                                    r, static_position=[i], dynamic_position=[]
+                                )
                             )
 
             normed_lane = [
@@ -958,9 +960,7 @@ def _build_norm_rope_scatter_kernel(
                     T.vec(4, T.i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
                 )
                 buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
-                buffer_ops.buffer_store(
-                    hi, out_rsrc, ArithValue(cache_off_dw) + c4_i32
-                )
+                buffer_ops.buffer_store(hi, out_rsrc, ArithValue(cache_off_dw) + c4_i32)
 
     @flyc.jit
     def launch_hca_norm_rope_scatter(
