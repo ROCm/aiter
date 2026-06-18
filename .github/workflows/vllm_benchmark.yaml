@@ -140,6 +140,7 @@ jobs:
     runs-on: aiter-8gpu-runner
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - model: openai/gpt-oss-120b
