@@ -2,18 +2,27 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """A/B performance harness: FlyDSL vs Triton FP8 MQA logits (gfx942).
 
-Times both kernels on identical inputs and prints a side-by-side table
-(time, TFLOP/s, and FlyDSL/Triton speedup). 
+Times Triton plus one or more FlyDSL kernel *variants* (kernel versions) on
+identical inputs and prints a side-by-side table (time, TFLOP/s, verify, and
+each impl's speedup vs Triton).
+
+The FlyDSL kernel ships several versions, registered in
+``aiter.ops.flydsl.kernels.fp8_mqa_logits`` (``KERNEL_VARIANTS``): ``"mfma"`` is
+the baseline, ``"scalar"`` the correctness-first fallback, and new versions can
+be added there. Pick which to benchmark with ``--flydsl-variants`` (default:
+just the baseline). Each becomes its own column, e.g. ``flydsl:mfma``.
 
 Examples:
-    # default DeepSeek-ish shape
+    # default DeepSeek-ish shape, baseline FlyDSL variant vs Triton
     python op_tests/op_benchmarks/triton/bench_flydsl_vs_triton_fp8_mqa_logits.py
 
-    # custom shape + parity check against the torch reference
+    # compare two FlyDSL variants against Triton on a custom shape, with parity
     python .../bench_flydsl_vs_triton_fp8_mqa_logits.py \
+        --flydsl-variants mfma,scalar \
         --seq_q_l 1024 --seq_kv_l 4096 --num_heads_q 64 --head_dim 128 --verify
 """
 import argparse
+import functools
 import os
 import subprocess
 import sys
@@ -109,25 +118,91 @@ PRESET_SHAPES = [
 ]
 
 
-def _select_impls(which):
-    """Return {name: fn} for the requested impl selection ('all'/'triton'/'flydsl')."""
-    available = {"triton": triton_logits}
+FLYDSL_PREFIX = "flydsl:"
+
+
+def _is_flydsl_impl(name):
+    return name.startswith(FLYDSL_PREFIX)
+
+
+def _flydsl_variant_of(name):
+    """Return the variant tag for a 'flydsl:<variant>' impl name."""
+    return name[len(FLYDSL_PREFIX):]
+
+
+def _impl_label(name):
+    """Short, column-friendly label for an impl name (e.g. 'triton', 'fly:mfma')."""
+    if name == "triton":
+        return "triton"
+    if _is_flydsl_impl(name):
+        return "fly:" + _flydsl_variant_of(name)
+    return name
+
+
+def _available_variants():
+    """Return ``(tuple_of_variant_tags, default_tag)`` or ``(None, None)``.
+
+    ``None`` when FlyDSL isn't importable (so the bench can still run Triton-only).
+    """
+    if not is_flydsl_available():
+        return None, None
+    from aiter.ops.flydsl import (
+        FP8_MQA_LOGITS_VARIANTS,
+        FP8_MQA_LOGITS_DEFAULT_VARIANT,
+    )
+
+    return tuple(FP8_MQA_LOGITS_VARIANTS), FP8_MQA_LOGITS_DEFAULT_VARIANT
+
+
+def _select_impls(which, flydsl_variants):
+    """Return an ordered ``{impl_name: fn}`` for the requested selection.
+
+    ``which`` is the impl-family selection ('all'/'triton'/'flydsl').
+    ``flydsl_variants`` is the resolved list of FlyDSL kernel-version tags to
+    benchmark; each becomes its own impl named ``flydsl:<variant>`` bound to that
+    variant via ``functools.partial``.
+    """
+    flydsl_fn = None
+    available_variants = ()
     if is_flydsl_available():
-        from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+        from aiter.ops.flydsl import (
+            flydsl_fp8_mqa_logits,
+            FP8_MQA_LOGITS_VARIANTS,
+        )
 
-        available["flydsl"] = flydsl_fp8_mqa_logits
+        flydsl_fn = flydsl_fp8_mqa_logits
+        available_variants = tuple(FP8_MQA_LOGITS_VARIANTS)
 
-    if which == "all":
-        if "flydsl" not in available:
-            print("[warn] flydsl unavailable -- benchmarking Triton only.")
-        return available
-    if which == "flydsl" and "flydsl" not in available:
-        raise SystemExit("[error] --impl flydsl requested but flydsl is unavailable.")
-    return {which: available[which]}
+    want_triton = which in ("all", "triton")
+    want_flydsl = which in ("all", "flydsl")
+
+    if want_flydsl and flydsl_fn is None:
+        if which == "flydsl":
+            raise SystemExit(
+                "[error] --impl flydsl requested but flydsl is unavailable."
+            )
+        print("[warn] flydsl unavailable -- benchmarking Triton only.")
+        want_flydsl = False
+
+    impls = {}
+    if want_triton:
+        impls["triton"] = triton_logits
+    if want_flydsl:
+        for v in flydsl_variants:
+            if v not in available_variants:
+                raise SystemExit(
+                    f"[error] unknown FlyDSL variant {v!r}; available: "
+                    f"{list(available_variants)}."
+                )
+            impls[FLYDSL_PREFIX + v] = functools.partial(flydsl_fn, variant=v)
+
+    if not impls:
+        raise SystemExit("[error] no implementations selected.")
+    return impls
 
 
 def run(args):
-    impls = _select_impls(args.impl)
+    impls = _select_impls(args.impl, args.flydsl_variants)
     shapes = _resolve_shapes(args)
 
     rows = []
@@ -178,9 +253,14 @@ def _run_one(idx, impls, shape, args):
         if args.verify else {name: "N/A" for name in impls}
     )
 
+    # Per-impl speedup vs the Triton baseline (one column per FlyDSL variant).
     base = times.get("triton")
-    fly = times.get("flydsl")
-    speedup = f"{base / fly:.2f}x" if base and fly else "-"
+    speedups = {}
+    for name in impls:
+        if name == "triton":
+            continue
+        t = times.get(name)
+        speedups[name] = f"{base / t:.2f}x" if base and t else "-"
 
     return {
         "idx": idx,
@@ -188,7 +268,7 @@ def _run_one(idx, impls, shape, args):
         "times": times,
         "tflops": tflops,
         "verify": verify,
-        "speedup": speedup,
+        "speedups": speedups,
     }
 
 
@@ -269,17 +349,22 @@ def _gpu_info():
 
 
 def _markdown_table(rows, impls):
-    """Return the comparison table as a GitHub-flavored Markdown string."""
-    has_tri = "triton" in impls
-    has_fly = "flydsl" in impls
+    """Return the comparison table as a GitHub-flavored Markdown string.
+
+    One ``<impl>_ms / <impl>_TFLOP/s / <impl>_vrf`` column trio per impl, plus a
+    ``<impl>_vs-tri`` speedup column for each non-Triton impl when Triton is run.
+    """
+    names = list(impls)
+    has_tri = "triton" in names
+    others = [n for n in names if n != "triton"]
 
     headers = ["idx", "shape"]
+    for n in names:
+        lbl = _impl_label(n)
+        headers += [f"{lbl}_ms", f"{lbl}_TFLOP/s", f"{lbl}_vrf"]
     if has_tri:
-        headers += ["tri_ms", "tri_TFLOP/s", "tri_vrf"]
-    if has_fly:
-        headers += ["fly_ms", "fly_TFLOP/s", "fly_vrf"]
-    if has_tri and has_fly:
-        headers += ["vs-triton"]
+        for n in others:
+            headers += [f"{_impl_label(n)}_vs-tri"]
 
     def cell(val, fmt):
         return "N/A" if val is None else format(val, fmt)
@@ -288,20 +373,15 @@ def _markdown_table(rows, impls):
     lines.append("| " + " | ".join("---" for _ in headers) + " |")
     for r in rows:
         out = [str(r["idx"]), _fmt_shape(r["shape"])]
+        for n in names:
+            out += [
+                cell(r["times"].get(n), ".4f"),
+                cell(r["tflops"].get(n), ".2f"),
+                r["verify"].get(n, "N/A"),
+            ]
         if has_tri:
-            out += [
-                cell(r["times"]["triton"], ".4f"),
-                cell(r["tflops"]["triton"], ".2f"),
-                r["verify"].get("triton", "N/A"),
-            ]
-        if has_fly:
-            out += [
-                cell(r["times"]["flydsl"], ".4f"),
-                cell(r["tflops"]["flydsl"], ".2f"),
-                r["verify"].get("flydsl", "N/A"),
-            ]
-        if has_tri and has_fly:
-            out += [r["speedup"]]
+            for n in others:
+                out += [r["speedups"].get(n, "-")]
         lines.append("| " + " | ".join(out) + " |")
     return "\n".join(lines)
 
@@ -334,17 +414,28 @@ def _write_markdown(path, rows, impls, args):
 
 
 def _print_table(rows, impls, args):
-    """Print one row per case across all shapes in a single table."""
-    has_tri = "triton" in impls
-    has_fly = "flydsl" in impls
+    """Print one row per case across all shapes in a single table.
+
+    Columns are generated per impl (``<lbl>_ms``, ``<lbl>_TFLOP/s``,
+    ``<lbl>_vrf``) plus a per-non-Triton-impl ``<lbl>_vs-tri`` speedup column;
+    each is widened to fit its header so variant labels don't truncate.
+    """
+    names = list(impls)
+    has_tri = "triton" in names
+    others = [n for n in names if n != "triton"]
 
     cols = [("idx", 5), ("shape", 26)]
+    for n in names:
+        lbl = _impl_label(n)
+        cols += [
+            (f"{lbl}_ms", max(12, len(lbl) + 4)),
+            (f"{lbl}_TFLOP/s", max(13, len(lbl) + 10)),
+            (f"{lbl}_vrf", max(9, len(lbl) + 5)),
+        ]
     if has_tri:
-        cols += [("tri_ms", 12), ("tri_TFLOP/s", 13), ("tri_vrf", 9)]
-    if has_fly:
-        cols += [("fly_ms", 12), ("fly_TFLOP/s", 13), ("fly_vrf", 9)]
-    if has_tri and has_fly:
-        cols += [("vs-triton", 11)]
+        for n in others:
+            lbl = _impl_label(n)
+            cols += [(f"{lbl}_vs-tri", max(11, len(lbl) + 8))]
 
     header = "".join(f"{name:>{w}}" for name, w in cols)
     print()
@@ -354,22 +445,22 @@ def _print_table(rows, impls, args):
     def cell(val, fmt):
         return "N/A" if val is None else format(val, fmt)
 
+    # Column widths in the same order as the per-row values below.
+    data_widths = [w for _, w in cols[2:]]
+
     for r in rows:
-        out = [f"{str(r['idx']):>5}", f"{_fmt_shape(r['shape']):>26}"]
+        vals = []
+        for n in names:
+            vals += [
+                cell(r["times"].get(n), ".4f"),
+                cell(r["tflops"].get(n), ".2f"),
+                r["verify"].get(n, "N/A"),
+            ]
         if has_tri:
-            out += [
-                f"{cell(r['times']['triton'], '.4f'):>12}",
-                f"{cell(r['tflops']['triton'], '.2f'):>13}",
-                f"{r['verify'].get('triton', 'N/A'):>9}",
-            ]
-        if has_fly:
-            out += [
-                f"{cell(r['times']['flydsl'], '.4f'):>12}",
-                f"{cell(r['tflops']['flydsl'], '.2f'):>13}",
-                f"{r['verify'].get('flydsl', 'N/A'):>9}",
-            ]
-        if has_tri and has_fly:
-            out += [f"{r['speedup']:>11}"]
+            for n in others:
+                vals.append(r["speedups"].get(n, "-"))
+        out = [f"{str(r['idx']):>5}", f"{_fmt_shape(r['shape']):>26}"]
+        out += [f"{v:>{w}}" for v, w in zip(vals, data_widths)]
         print("".join(out))
 
 
@@ -452,7 +543,22 @@ def main():
         "--impl",
         choices=["all", "triton", "flydsl"],
         default="all",
-        help="which implementation(s) to run",
+        help="which implementation family(ies) to run",
+    )
+    p.add_argument(
+        "--flydsl-variants",
+        type=str,
+        default=None,
+        metavar="V1,V2,...",
+        help=(
+            "comma-separated FlyDSL kernel-version tags to benchmark, each as its "
+            "own column (default: the baseline variant). See --list-variants."
+        ),
+    )
+    p.add_argument(
+        "--list-variants",
+        action="store_true",
+        help="list the available FlyDSL kernel variants and exit",
     )
     p.add_argument("--clean_logits", type=int, default=1)
     p.add_argument("--warmup", type=int, default=25)
@@ -482,6 +588,26 @@ def main():
         for i, s in enumerate(PRESET_SHAPES):
             print(f"  {i + 1}: {s}")
         return
+
+    avail, default = _available_variants()
+    if args.list_variants:
+        if avail is None:
+            print("FlyDSL is unavailable; no variants to list.")
+        else:
+            print("FlyDSL kernel variants (default marked *):")
+            for v in avail:
+                print(f"  {'*' if v == default else ' '} {v}")
+        return
+
+    # Resolve the requested FlyDSL variants (comma list), defaulting to the
+    # baseline. Validation against what's actually registered happens in
+    # _select_impls so an unavailable-FlyDSL run still works for --impl triton.
+    if args.flydsl_variants:
+        args.flydsl_variants = [
+            v.strip() for v in args.flydsl_variants.split(",") if v.strip()
+        ]
+    else:
+        args.flydsl_variants = [default] if default is not None else []
 
     run(args)
 

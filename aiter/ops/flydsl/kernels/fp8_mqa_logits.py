@@ -489,6 +489,57 @@ def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int):
     return launch_fp8_mqa_logits_mfma
 
 
+# --------------------------------------------------------------------------- #
+# Kernel-variant registry.
+#
+# Each entry maps a variant *tag* (the version label used by callers/benchmarks)
+# to its ``_build_*`` factory. To add a new version of the indexer kernel, write
+# a ``_build_kernel_<name>`` factory with the same ``(*, num_heads, head_size,
+# block_kv)`` signature and register it here -- it then becomes selectable via
+# ``variant="<name>"`` everywhere (public API, tests, the A/B benchmark) without
+# touching the call sites.
+#
+# ``"mfma"`` is the current default/baseline; ``"scalar"`` is the slow
+# correctness-first fallback.
+# --------------------------------------------------------------------------- #
+_VARIANT_BUILDERS = {
+    "scalar": _build_kernel,
+    "mfma": _build_kernel_mfma,
+}
+
+# Order matters: the first available tag is the default.
+KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
+DEFAULT_VARIANT = "mfma"
+
+
+def _resolve_variant(variant=None, *, use_mfma=None):
+    """Resolve the effective variant tag from the (variant, use_mfma, env) inputs.
+
+    Precedence: explicit ``variant=`` > legacy ``use_mfma=`` > env var
+    ``FLYDSL_FP8_MQA_LOGITS_VARIANT`` > legacy env ``FLYDSL_FP8_MQA_LOGITS_MFMA``
+    > ``DEFAULT_VARIANT``.
+    """
+    if variant is not None:
+        tag = variant
+    elif use_mfma is not None:
+        tag = "mfma" if use_mfma else "scalar"
+    else:
+        env_variant = os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
+        if env_variant:
+            tag = env_variant
+        else:
+            # Legacy boolean env toggle (kept for back-compat): "0" -> scalar.
+            tag = "scalar" if (
+                os.environ.get("FLYDSL_FP8_MQA_LOGITS_MFMA", "1") == "0"
+            ) else DEFAULT_VARIANT
+    if tag not in _VARIANT_BUILDERS:
+        raise ValueError(
+            f"unknown fp8_mqa_logits variant {tag!r}; "
+            f"available: {list(KERNEL_VARIANTS)}"
+        )
+    return tag
+
+
 @lru_cache(maxsize=32)
 def compile_fp8_mqa_logits(
     *,
@@ -496,7 +547,7 @@ def compile_fp8_mqa_logits(
     head_size: int,
     block_kv: int = 128,
     paged: bool = False,
-    use_mfma: bool = True,
+    variant: str = DEFAULT_VARIANT,
 ):
     """Return a cached, compiled FlyDSL launcher for the given shape config.
 
@@ -510,15 +561,21 @@ def compile_fp8_mqa_logits(
         KV tile width processed per inner-loop iteration.
     paged : bool
         Reserved for the Phase-2 paged variant. Must be False for now.
-    use_mfma : bool
-        If True, use the fp8-MFMA matrix-core kernel; otherwise use the scalar
-        ``v_cvt_f32_fp8`` correctness-first kernel (kept as a fallback).
+    variant : str
+        Which kernel version to build (see ``KERNEL_VARIANTS``). ``"mfma"`` is the
+        fp8-MFMA matrix-core baseline; ``"scalar"`` is the ``v_cvt_f32_fp8``
+        correctness-first fallback.
     """
     if paged:
         raise NotImplementedError(
             "Paged FlyDSL fp8_mqa_logits is Phase 2 and not implemented yet."
         )
-    builder = _build_kernel_mfma if use_mfma else _build_kernel
+    if variant not in _VARIANT_BUILDERS:
+        raise ValueError(
+            f"unknown fp8_mqa_logits variant {variant!r}; "
+            f"available: {list(KERNEL_VARIANTS)}"
+        )
+    builder = _VARIANT_BUILDERS[variant]
     launcher = builder(
         num_heads=num_heads, head_size=head_size, block_kv=block_kv
     )
@@ -535,6 +592,7 @@ def flydsl_fp8_mqa_logits(
     cu_ends,
     clean_logits=True,
     stream=None,
+    variant=None,
 ):
     """FlyDSL gfx942 FP8 MQA logits -- drop-in for the Triton ``fp8_mqa_logits``.
 
@@ -548,6 +606,10 @@ def flydsl_fp8_mqa_logits(
                   in row i are written as -inf. If False, the kernel skips
                   those positions and the caller owns whatever is left there.
     stream:       optional HIP stream; defaults to the current stream.
+    variant:      optional kernel-version tag (see ``KERNEL_VARIANTS``). If None,
+                  resolved from the ``FLYDSL_FP8_MQA_LOGITS_VARIANT`` env var
+                  (or the legacy ``FLYDSL_FP8_MQA_LOGITS_MFMA`` toggle), defaulting
+                  to ``DEFAULT_VARIANT`` (``"mfma"``).
 
     Returns
     -------
@@ -567,13 +629,13 @@ def flydsl_fp8_mqa_logits(
     cu_starts = cu_starts.reshape(seq_len)
     cu_ends = cu_ends.reshape(seq_len)
 
-    use_mfma = os.environ.get("FLYDSL_FP8_MQA_LOGITS_MFMA", "1") != "0"
+    variant = _resolve_variant(variant)
     launcher = compile_fp8_mqa_logits(
         num_heads=num_heads,
         head_size=head_size,
         block_kv=128,
         paged=False,
-        use_mfma=use_mfma,
+        variant=variant,
     )
 
     # Match the Triton launcher's -inf-prefill / padding behavior so the two
