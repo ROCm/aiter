@@ -24,7 +24,7 @@ python3 -m pip download \
     --dest "${TRITON_WHEEL_DIR}" \
     --index-url "${TRITON_INDEX_URL}" \
     --extra-index-url https://pypi.org/simple \
-    triton
+    "triton==3.7.0"
 
 echo "Downloading triton-kernels wheel from ${TRITON_INDEX_URL} into ${TRITON_WHEEL_DIR}"
 python3 -m pip download \
@@ -32,6 +32,6 @@ python3 -m pip download \
     --dest "${TRITON_WHEEL_DIR}" \
     --index-url "${TRITON_INDEX_URL}" \
     --extra-index-url https://pypi.org/simple \
-    triton-kernels
+    "triton-kernels==1.0.0"
 
 ls -lh "${TRITON_WHEEL_DIR}"

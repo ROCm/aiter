@@ -329,7 +329,7 @@ def _build_kernel(
         kv_in_row_stride: Int32,  # KV row stride in bf16 elements
         swa_kv: fx.Pointer,  # [num_slots, cache_size, D] bf16 (dummy if not kv_write)
         state_slot_mapping: fx.Pointer,  # [bs] i32 (dummy if not kv_write)
-        batch_id_per_token: fx.Pointer,  # [T] i64, -1 sentinel (dummy if not kv_write)
+        batch_id_per_token: fx.Pointer,  # [T] i32, -1 sentinel (dummy if not kv_write)
         swa_slot_stride: Int32,  # bf16 elements (= cache_size * D)
         swa_pos_stride: Int32,  # bf16 elements (= D)
         swa_cache_size: Int32,  # ring slot count
@@ -740,17 +740,16 @@ def _build_kernel(
                 # ---- Fused SWA scatter setup (kv_write only) ----
                 # Target swa_kv[slot, pos % cache_size, :] where
                 # slot = state_slot_mapping[batch_id_per_token[bid_t]].
-                # batch_id is i64 with -1 sentinel on CG-pad tokens; clamp it
-                # to 0 for the (predicated-off) slot load to keep the load
-                # in-bounds, and gate the actual store on do_swa = batch_id>=0.
+                # batch_id is i32 with -1 sentinel on CG-pad tokens; clamp it to
+                # 0 for the (predicated-off) slot load to keep the load in-bounds,
+                # and gate the actual store on do_swa = batch_id>=0.
                 swa_out_g = None
                 do_swa = None
                 if const_expr(kv_write):
                     bid_rsrc = _ptr_buffer_resource(batch_id_per_token)
-                    bid_i64 = buffer_ops.buffer_load(
-                        bid_rsrc, bid_t, vec_width=1, dtype=T.i64
+                    bid_i32 = buffer_ops.buffer_load(
+                        bid_rsrc, bid_t, vec_width=1, dtype=i32
                     )
-                    bid_i32 = arith.trunci(i32, bid_i64)
                     do_swa = bid_i32 >= fx.Int32(0)
                     bid_safe = arith.maxsi(bid_i32, arith.constant(0, type=i32))
                     slot_rsrc = _ptr_buffer_resource(state_slot_mapping)
@@ -970,7 +969,7 @@ def flydsl_qk_norm_rope_quant(
             fusing the standalone ``swa_write``.
         state_slot_mapping: ``[bs]`` int32 — per-seq SWA ring slot. Required
             when ``swa_kv`` is set.
-        batch_id_per_token: ``[T]`` int64, ``-1`` on CG-pad tokens — token→seq
+        batch_id_per_token: ``[T]`` int32, ``-1`` on CG-pad tokens — token→seq
             map for the fused SWA scatter (store gated off on ``-1``). Required
             when ``swa_kv`` is set.
 
@@ -1098,8 +1097,8 @@ def flydsl_qk_norm_rope_quant(
             raise ValueError("swa_kv must be contiguous")
         if state_slot_mapping.dim() != 1 or state_slot_mapping.dtype != torch.int32:
             raise TypeError("state_slot_mapping must be 1-D int32")
-        if batch_id_per_token.dim() != 1 or batch_id_per_token.dtype != torch.int64:
-            raise TypeError("batch_id_per_token must be 1-D int64")
+        if batch_id_per_token.dim() != 1 or batch_id_per_token.dtype != torch.int32:
+            raise TypeError("batch_id_per_token must be 1-D int32")
         if batch_id_per_token.shape[0] < T_tok:
             raise ValueError(
                 f"batch_id_per_token len {batch_id_per_token.shape[0]} < T={T_tok}"
@@ -1117,7 +1116,7 @@ def flydsl_qk_norm_rope_quant(
         swa_cache_size = 1
         swa_kv_arg = kv_out  # bf16 dummy
         ssm_arg = q.new_empty(1, dtype=torch.int32)
-        bid_arg = q.new_empty(1, dtype=torch.int64)
+        bid_arg = q.new_empty(1, dtype=torch.int32)
 
     launcher = compile_flydsl_qk_norm_rope_quant(
         num_q_heads=H,

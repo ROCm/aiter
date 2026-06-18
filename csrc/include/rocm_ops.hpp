@@ -301,111 +301,137 @@ namespace py = pybind11;
           "graph capture) before capturing graphs that include "     \
           "opus_gemm splitk kernels under TBO.");
 
-#define CACHE_PYBIND                                                                         \
-    m.def("swap_blocks",                                                                     \
-          &aiter::swap_blocks,                                                               \
-          py::arg("src"),                                                                    \
-          py::arg("dst"),                                                                    \
-          py::arg("block_mapping"));                                                         \
-    m.def("copy_blocks",                                                                     \
-          &aiter::copy_blocks,                                                               \
-          py::arg("key_caches"),                                                             \
-          py::arg("value_caches"),                                                           \
-          py::arg("block_mapping"));                                                         \
-    m.def("reshape_and_cache",                                                               \
-          &aiter::reshape_and_cache,                                                         \
-          py::arg("key"),                                                                    \
-          py::arg("value"),                                                                  \
-          py::arg("key_cache"),                                                              \
-          py::arg("value_cache"),                                                            \
-          py::arg("slot_mapping"),                                                           \
-          py::arg("kv_cache_dtype"),                                                         \
-          py::arg("k_scale")    = std::nullopt,                                              \
-          py::arg("v_scale")    = std::nullopt,                                              \
-          py::arg("asm_layout") = false);                                                    \
-    m.def("reshape_and_cache_flash", &aiter::reshape_and_cache_flash);                       \
-    m.def("reshape_and_cache_with_pertoken_quant",                                           \
-          &aiter::reshape_and_cache_with_pertoken_quant,                                     \
-          py::arg("key"),                                                                    \
-          py::arg("value"),                                                                  \
-          py::arg("key_cache"),                                                              \
-          py::arg("value_cache"),                                                            \
-          py::arg("k_dequant_scales"),                                                       \
-          py::arg("v_dequant_scales"),                                                       \
-          py::arg("slot_mapping"),                                                           \
-          py::arg("asm_layout"));                                                            \
-    m.def("reshape_and_cache_with_block_quant", &aiter::reshape_and_cache_with_block_quant); \
-    m.def("reshape_and_cache_with_block_quant_for_asm_pa",                                   \
-          &aiter::reshape_and_cache_with_block_quant_for_asm_pa,                             \
-          py::arg("key"),                                                                    \
-          py::arg("value"),                                                                  \
-          py::arg("key_cache"),                                                              \
-          py::arg("value_cache"),                                                            \
-          py::arg("k_dequant_scales"),                                                       \
-          py::arg("v_dequant_scales"),                                                       \
-          py::arg("slot_mapping"),                                                           \
-          py::arg("asm_layout"),                                                             \
-          py::arg("ori_block_size") = 128);                                                  \
-    m.def("concat_and_cache_mla",                                                            \
-          &aiter::concat_and_cache_mla,                                                      \
-          py::arg("kv_c"),                                                                   \
-          py::arg("k_pe"),                                                                   \
-          py::arg("kv_cache"),                                                               \
-          py::arg("slot_mapping"),                                                           \
-          py::arg("kv_cache_dtype"),                                                         \
-          py::arg("scale"));                                                                 \
-    m.def("indexer_k_quant_and_cache",                                                       \
-          &aiter::indexer_k_quant_and_cache,                                                 \
-          py::arg("k"),                                                                      \
-          py::arg("kv_cache"),                                                               \
-          py::arg("slot_mapping"),                                                           \
-          py::arg("quant_block_size"),                                                       \
-          py::arg("scale_fmt"),                                                              \
-          py::arg("preshuffle") = false);                                                    \
-    m.def("indexer_qk_rope_quant_and_cache",                                                 \
-          &aiter::indexer_qk_rope_quant_and_cache,                                           \
-          py::arg("q"),                                                                      \
-          py::arg("q_out"),                                                                  \
-          py::arg("weights"),                                                                \
-          py::arg("weights_out"),                                                            \
-          py::arg("k"),                                                                      \
-          py::arg("kv_cache"),                                                               \
-          py::arg("slot_mapping"),                                                           \
-          py::arg("norm_weight"),                                                            \
-          py::arg("norm_bias"),                                                              \
-          py::arg("positions"),                                                              \
-          py::arg("cos_cache"),                                                              \
-          py::arg("sin_cache"),                                                              \
-          py::arg("epsilon"),                                                                \
-          py::arg("quant_block_size"),                                                       \
-          py::arg("scale_fmt"),                                                              \
-          py::arg("weights_scale"),                                                          \
-          py::arg("preshuffle") = false,                                                     \
-          py::arg("is_neox")    = true);                                                        \
-    m.def("cp_gather_indexer_k_quant_cache",                                                 \
-          &aiter::cp_gather_indexer_k_quant_cache,                                           \
-          py::arg("kv_cache"),                                                               \
-          py::arg("dst_k"),                                                                  \
-          py::arg("dst_scale"),                                                              \
-          py::arg("block_table"),                                                            \
-          py::arg("cu_seq_lens"),                                                            \
-          py::arg("preshuffle") = false);                                                    \
-    m.def("fused_qk_rope_concat_and_cache_mla",                                              \
-          &aiter::fused_qk_rope_concat_and_cache_mla,                                        \
-          py::arg("q_nope"),                                                                 \
-          py::arg("q_pe"),                                                                   \
-          py::arg("kv_c"),                                                                   \
-          py::arg("k_pe"),                                                                   \
-          py::arg("kv_cache"),                                                               \
-          py::arg("q_out"),                                                                  \
-          py::arg("slot_mapping"),                                                           \
-          py::arg("k_scale"),                                                                \
-          py::arg("q_scale"),                                                                \
-          py::arg("positions"),                                                              \
-          py::arg("cos_cache"),                                                              \
-          py::arg("sin_cache"),                                                              \
-          py::arg("is_neox"),                                                                \
-          py::arg("is_nope_first"));
+#define CACHE_PYBIND                                                                \
+    m.def("swap_blocks",                                                            \
+          &aiter::swap_blocks,                                                      \
+          py::arg("src"),                                                           \
+          py::arg("dst"),                                                           \
+          py::arg("block_mapping"));                                                \
+    m.def("copy_blocks",                                                            \
+          &aiter::copy_blocks,                                                      \
+          py::arg("key_caches"),                                                    \
+          py::arg("value_caches"),                                                  \
+          py::arg("block_mapping"));                                                \
+    m.def("reshape_and_cache",                                                      \
+          &aiter::reshape_and_cache,                                                \
+          py::arg("key"),                                                           \
+          py::arg("value"),                                                         \
+          py::arg("key_cache"),                                                     \
+          py::arg("value_cache"),                                                   \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("k_scale")    = std::nullopt,                                     \
+          py::arg("v_scale")    = std::nullopt,                                     \
+          py::arg("asm_layout") = false);                                           \
+    m.def("reshape_and_cache_flash",                                                \
+          &aiter::reshape_and_cache_flash);                                         \
+    m.def("reshape_and_cache_with_pertoken_quant",                                  \
+          &aiter::reshape_and_cache_with_pertoken_quant,                            \
+          py::arg("key"),                                                           \
+          py::arg("value"),                                                         \
+          py::arg("key_cache"),                                                     \
+          py::arg("value_cache"),                                                   \
+          py::arg("k_dequant_scales"),                                              \
+          py::arg("v_dequant_scales"),                                              \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("asm_layout"));                                                   \
+    m.def("reshape_and_cache_with_block_quant",                                     \
+          &aiter::reshape_and_cache_with_block_quant);                              \
+    m.def("reshape_and_cache_with_block_quant_for_asm_pa",                          \
+          &aiter::reshape_and_cache_with_block_quant_for_asm_pa,                    \
+          py::arg("key"),                                                           \
+          py::arg("value"),                                                         \
+          py::arg("key_cache"),                                                     \
+          py::arg("value_cache"),                                                   \
+          py::arg("k_dequant_scales"),                                              \
+          py::arg("v_dequant_scales"),                                              \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("asm_layout"),                                                    \
+          py::arg("ori_block_size") = 128);                                         \
+    m.def("concat_and_cache_mla",                                                   \
+          &aiter::concat_and_cache_mla,                                             \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("scale"));                                                        \
+    m.def("concat_and_cache_mla_seg",                                               \
+          &aiter::concat_and_cache_mla_seg,                                         \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("kv_cache_dtype"),                                                \
+          py::arg("scale"));                                                        \
+    m.def("indexer_k_quant_and_cache",                                              \
+          &aiter::indexer_k_quant_and_cache,                                        \
+          py::arg("k"),                                                             \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("quant_block_size"),                                              \
+          py::arg("scale_fmt"),                                                     \
+          py::arg("preshuffle") = false);                                           \
+    m.def("indexer_qk_rope_quant_and_cache",                                        \
+          &aiter::indexer_qk_rope_quant_and_cache,                                  \
+          py::arg("q"),                                                             \
+          py::arg("q_out"),                                                         \
+          py::arg("weights"),                                                       \
+          py::arg("weights_out"),                                                   \
+          py::arg("k"),                                                             \
+          py::arg("kv_cache"),                                                      \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("norm_weight"),                                                   \
+          py::arg("norm_bias"),                                                     \
+          py::arg("positions"),                                                     \
+          py::arg("cos_cache"),                                                     \
+          py::arg("sin_cache"),                                                     \
+          py::arg("epsilon"),                                                       \
+          py::arg("quant_block_size"),                                              \
+          py::arg("scale_fmt"),                                                     \
+          py::arg("weights_scale"),                                                 \
+          py::arg("preshuffle") = false,                                            \
+          py::arg("is_neox") = true);                                               \
+    m.def("cp_gather_indexer_k_quant_cache",                                        \
+          &aiter::cp_gather_indexer_k_quant_cache,                                  \
+          py::arg("kv_cache"),                                                      \
+          py::arg("dst_k"),                                                         \
+          py::arg("dst_scale"),                                                     \
+          py::arg("block_table"),                                                   \
+          py::arg("cu_seq_lens"),                                                   \
+          py::arg("preshuffle") = false);                                           \
+    m.def("fused_qk_rope_concat_and_cache_mla",                                     \
+          &aiter::fused_qk_rope_concat_and_cache_mla,                               \
+          py::arg("q_nope"),                                                        \
+          py::arg("q_pe"),                                                          \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("q_out"),                                                         \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("k_scale"),                                                       \
+          py::arg("q_scale"),                                                       \
+          py::arg("positions"),                                                     \
+          py::arg("cos_cache"),                                                     \
+          py::arg("sin_cache"),                                                     \
+          py::arg("is_neox"),                                                       \
+          py::arg("is_nope_first"));                                                \
+    m.def("fused_qk_rope_concat_and_cache_mla_seg",                                 \
+          &aiter::fused_qk_rope_concat_and_cache_mla_seg,                           \
+          py::arg("q_nope"),                                                        \
+          py::arg("q_pe"),                                                          \
+          py::arg("kv_c"),                                                          \
+          py::arg("k_pe"),                                                          \
+          py::arg("kv_cache"),                                                      \
+          py::arg("q_out"),                                                         \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("k_scale"),                                                       \
+          py::arg("q_scale"),                                                       \
+          py::arg("positions"),                                                     \
+          py::arg("cos_cache"),                                                     \
+          py::arg("sin_cache"),                                                     \
+          py::arg("is_neox"),                                                       \
+          py::arg("is_nope_first") = true);
 
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
@@ -464,7 +490,8 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"));                                                              \
+          py::arg("use_1stage"),                                                               \
+          py::arg("gemma_norm") = false);                                                      \
     m.def("fused_allreduce_rmsnorm_pad",                                                       \
           &aiter::fused_allreduce_rmsnorm_pad,                                                 \
           py::arg("_fa"),                                                                      \
@@ -476,7 +503,8 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"));                                                              \
+          py::arg("use_1stage"),                                                               \
+          py::arg("gemma_norm") = false);                                                      \
     m.def("fused_allreduce_rmsnorm_quant",                                                     \
           &aiter::fused_allreduce_rmsnorm_quant,                                               \
           py::arg("_fa"),                                                                      \

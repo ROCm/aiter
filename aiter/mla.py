@@ -24,6 +24,7 @@ def _fwd_kernel_stage2_asm(
     Final_lse,
     qo_indptr,
     kv_indptr,
+    kv_last_page_lens,
     num_kv_splits_indptr,
     stride_mid_ob: tl.int64,
     stride_mid_oh: tl.int64,
@@ -31,6 +32,8 @@ def _fwd_kernel_stage2_asm(
     stride_obs: tl.int64,
     stride_oh: tl.int64,
     stride_lse_bs: tl.int64,
+    page_size: tl.constexpr,
+    KV_INDPTR_IS_PAGE_LEVEL: tl.constexpr,
     MAYBE_FINAL_OUT: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
     BATCH_NUM: tl.constexpr,
@@ -45,7 +48,14 @@ def _fwd_kernel_stage2_asm(
     cur_split_start = tl.load(num_kv_splits_indptr + cur_batch)
     cur_split_end = tl.load(num_kv_splits_indptr + cur_batch + 1)
     num_max_kv_splits = tl.load(num_kv_splits_indptr + BATCH_NUM)
-    cur_kv_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
+    cur_kv_start = tl.load(kv_indptr + cur_batch)
+    cur_kv_end = tl.load(kv_indptr + cur_batch + 1)
+    cur_kv_seq_len = cur_kv_end - cur_kv_start
+    if KV_INDPTR_IS_PAGE_LEVEL:
+        cur_kv_page_count = cur_kv_seq_len
+        cur_kv_seq_len = (cur_kv_page_count - 1) * page_size + tl.load(
+            kv_last_page_lens + cur_batch
+        )
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
 
@@ -111,11 +121,17 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         cu_num = get_cu_num()
         avg_kv = total_kv / bs
         overhead = 84.1
+        # qh128 decode launches 2 head-group workgroups per (batch, split) along z
+        # (mirrors gdz = kv_split*2 in asm_mla.cu / qh64_group_count() in poc_kl),
+        # so the real workgroup count feeding CU occupancy is bs*i*wg_per_split.
+        is_gfx1250 = get_gfx() == "gfx1250"
+        wg_per_split = 2 if nhead == 128 and is_gfx1250 else 1
         tmp = [
             (
                 bs
                 * i
-                / ((bs * i + cu_num - 1) // cu_num * cu_num)
+                * wg_per_split
+                / ((bs * i * wg_per_split + cu_num - 1) // cu_num * cu_num)
                 * avg_kv
                 / (avg_kv + overhead * i),
                 i,
@@ -136,15 +152,17 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         512: 32,
     }
 
-    if dtype == dtypes.fp8:
+    if dtype == dtypes.fp8 and get_gfx() != "gfx1250":
         min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
+        # ceil(avg_kv / min_block_n) computed in pure integers (avg_kv = total_kv/bs).
         num_kv_splits = min(
-            num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
+            num_kv_splits,
+            (total_kv + bs * min_block_n - 1) // (bs * min_block_n),
         )
         if num_kv_splits > 1:
             num_kv_splits = min(
                 num_kv_splits,
-                (abs(total_kv / bs - max_seqlen_q) // min_block_n + 1),
+                int(abs(total_kv / bs - max_seqlen_q) // min_block_n) + 1,
             )
 
     num_kv_splits_indptr = torch.arange(
@@ -322,6 +340,7 @@ def mla_decode_fwd(
             final_lse_buf,
             qo_indptr,
             kv_indptr,
+            kv_last_page_lens,
             num_kv_splits_indptr,
             attn_lse.stride(0),
             attn_lse.stride(2),
@@ -329,6 +348,8 @@ def mla_decode_fwd(
             o.stride(0),
             o.stride(1),
             final_lse_buf.stride(0) if has_final_lse else 0,
+            page_size=page_size,
+            KV_INDPTR_IS_PAGE_LEVEL=page_size > 1,
             MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
             HAS_FINAL_LSE=has_final_lse,
             BATCH_NUM=bs,
