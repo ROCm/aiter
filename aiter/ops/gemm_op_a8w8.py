@@ -1030,6 +1030,7 @@ def gemm_a8w8_blockscale_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -1098,6 +1099,7 @@ def gemm_a8w8_blockscale_bpreshuffle_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor: ...
 
 

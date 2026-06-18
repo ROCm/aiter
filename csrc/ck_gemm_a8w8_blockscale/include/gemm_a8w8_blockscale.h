@@ -21,4 +21,5 @@ torch::Tensor gemm_a8w8_blockscale_tune(torch::Tensor& XQ,
                                         torch::Tensor& w_scale,
                                         torch::Tensor& Y,
                                         int kernelId,
-                                        int splitK);
+                                        int splitK,
+                                        bool y_is_zeroed = false);
