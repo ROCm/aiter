@@ -12,9 +12,10 @@ ping-pong fp8 FMHA kernel.  It deliberately keeps things simple:
   reused from :mod:`aiter.ops.flydsl.rocdl_mfma_fp8`.
 - SageAttention per-tensor recipe: exact softmax in the log2 domain
   (``exp2``), online over KV tiles, with scalar Q/K/V descales.
-- The softmax output ``P`` and the value tile ``V`` are round-tripped
-  through LDS so the QK accumulator C-layout can be re-read in the MFMA
-  A/B fragment layouts for the PV stage (no register shuffle tricks).
+- ``P`` is register-resident (Step 1): the GEMM1 C-layout is reshaped to
+  the GEMM2 B-operand via an intra-wave hi-peer ``shuffle_xor`` (no LDS).
+- ``V`` is stored row-major in 16-wide d-blocks and read with HW transpose
+  ``ds_read_tr8_b64`` (Step 2) for the PV A-operand (no scatter store).
 
 Layout: Q/K/V/O are 1D flattened from BSHD (batch, seq, heads, head_dim).
 Grid:   (num_q_tiles * batch * num_heads,)  with num_q_tiles = seq/BLOCK_M.
@@ -124,24 +125,30 @@ def build_flash_attn_fp8_module(
 
     # ---- LDS layout (fp8 element type) ----
     # K tile : [BLOCK_N kv][HEAD_DIM d]          row-major
-    # V tile : [HEAD_DIM d][BLOCK_N kv] (fp8)    *transposed* (Step 1)
+    # V tile : [d_block(8)][BLOCK_N kv][d_in(16)] row-major (Step 2)
     #
     # P is NOT in LDS (Step 1, register-resident): the GEMM1 C-layout P is
     # packed to fp8 in registers and reshaped into the GEMM2 B-operand via an
     # intra-wave cross-lane shuffle (hi-peer exchange), so no LDS round-trip.
     #
-    # V is laid out transposed so the GEMM2 A-operand fragment
-    #   A_frag[L][v] = V[kv = hi*32 + v, d = lo + dt*32]
-    #             = Vt[d = lo + dt*32][kv = hi*32 + v]
-    # is a single contiguous 32-byte (v_i8x32) load along kv, replacing the
-    # old 32 single-byte strided gathers.
+    # V layout (Step 2, HW-transpose read): V is stored row-major in 16-wide
+    # d blocks so the cooperative load is a clean 16-byte vector store (no
+    # scatter).  The GEMM2 A-operand
+    #   A_frag[L][8*kc + r] = V[kv = hi*32 + 8*kc + r, d = lo + dt*32]
+    # is produced by ds_read_tr8_b64 (HW transpose-on-read): for a 16-lane
+    # group the atom returns result[lane][r] = LDS[group_base + lane%16 + 16*r]
+    # (an 8x16 byte transpose).  With the d-block layout the per-(dt,kc) group
+    # base = d_block*(BLOCK_N*16) + (hi*32+8*kc)*16 and d_block = lo//16 + 2*dt,
+    # giving exactly V[kv, d] for the A fragment.  4 reads (kc=0..3) per d-tile.
     K_STRIDE = HEAD_DIM
-    V_STRIDE = BLOCK_N  # transposed: stride over kv per d-row
+    V_KV_STRIDE = 16  # bytes per kv within a 16-wide d block
+    V_DBLOCK_STRIDE = BLOCK_N * V_KV_STRIDE
+    N_DBLOCKS = HEAD_DIM // 16  # 8
     # Step 2: double-buffer K and V (ping-pong by KV-tile parity) so the
     # global load for tile i+1 overlaps the MFMA compute of tile i.
     NUM_BUF = 2
     LDS_K_TILE = BLOCK_N * K_STRIDE
-    LDS_V_TILE = HEAD_DIM * V_STRIDE
+    LDS_V_TILE = N_DBLOCKS * V_DBLOCK_STRIDE  # == HEAD_DIM * BLOCK_N
     LDS_K_SIZE = NUM_BUF * LDS_K_TILE
     LDS_V_SIZE = NUM_BUF * LDS_V_TILE
     LDS_K_OFF = 0
@@ -287,13 +294,17 @@ def build_flash_attn_fp8_module(
             lds_idx = fx.Index(lds_off) + load_row * K_STRIDE + load_col
             Vec(vec).store(lds, [lds_idx])
 
-        def store_v_lds_transposed(vec, lds_off):
-            # Scatter the 16 contiguous d-values into transposed Vt[d][kv].
-            vv = Vec(vec)
-            for e in range_constexpr(VEC):
-                d_row = load_col + fx.Index(e)
-                vt_idx = fx.Index(lds_off) + d_row * V_STRIDE + load_row
-                Vec.from_elements([vv[e]], i8_dtype).store(lds, [vt_idx])
+        def store_v_lds_dblocked(vec, lds_off):
+            # Step 2: store the lane's 16 contiguous d-values (one kv row) as a
+            # single 16-byte vector into the d-block layout
+            #   Vlds[d_block][kv][d_in] : d_block = load_col//16, kv = load_row.
+            d_block = load_col // fx.Index(16)
+            v_idx = (
+                fx.Index(lds_off)
+                + d_block * fx.Index(V_DBLOCK_STRIDE)
+                + load_row * fx.Index(V_KV_STRIDE)
+            )
+            Vec(vec).store(lds, [v_idx])
 
         # ---- Preload Q packs (register resident) for this wave ----
         # A-operand for GEMM1 is K; B-operand is Q (Q^T).  But we keep Q in
@@ -353,7 +364,7 @@ def build_flash_attn_fp8_module(
 
             # ---- Commit the prefetched current tile into its LDS buffer ----
             store_k_lds(k_reg, k_buf_off)
-            store_v_lds_transposed(v_reg, v_buf_off)
+            store_v_lds_dblocked(v_reg, v_buf_off)
             gpu.barrier()
 
             # ---- Prefetch the NEXT tile's global loads (latency hides under
@@ -488,14 +499,36 @@ def build_flash_attn_fp8_module(
             for dt in range_constexpr(D_TILES):
                 o_accs[dt] = _fmul(Vec(o_accs[dt]), corr_vec)
 
+            # V A-operand via HW transpose-on-read (ds_read_tr8_b64).  For a
+            # 16-lane group the atom returns result[lane][r] = LDS[group_base +
+            # lane%16 + 16*r], an 8x16 byte transpose.  With the d-block layout
+            #   group_base = v_buf_off + d_block*V_DBLOCK_STRIDE + (hi*32+8*kc)*16
+            #   d_block    = lo//16 + 2*dt        (uniform within a 16-lane group)
+            # each lane passes ptr = group_base + (lo%16)*8 and gets
+            #   result[r] = V[kv = hi*32 + 8*kc + r, d = lo + dt*32]   r in [0,8)
+            # so 4 reads (kc=0..3) assemble A_frag[L][8*kc+r] = V[kv, d].
+            v_tr8_ty = Vec.make_type(2, fx.Int32)
+            lo_in_grp = lo % fx.Index(16)
             for dt in range_constexpr(D_TILES):
-                # V A-operand: kv = hi*32+v, d = lo + dt*32.  V_lds is now
-                # transposed Vt[d][kv] so the 32 kv values for a fixed
-                # d = lo + dt*32 are contiguous -> single v_i8x32 load.
-                d_row = lo + fx.Index(dt * 32)
-                vlds = v_buf_off + d_row * V_STRIDE + hi * 32
-                v_pack = Vec.load(v_i8x32, lds, [vlds])
-                v_pack = Vec(v_pack).bitcast(fx.Int32)
+                d_block = (lo // fx.Index(16)) + fx.Index(2 * dt)
+                grp_db = (
+                    fx.Index(lds_offset)
+                    + v_buf_off
+                    + d_block * fx.Index(V_DBLOCK_STRIDE)
+                )
+                reads = []
+                for kc in range_constexpr(4):
+                    kv0 = hi * fx.Index(32) + fx.Index(8 * kc)
+                    byte_off = (
+                        grp_db + kv0 * fx.Index(V_KV_STRIDE) + lo_in_grp * fx.Index(8)
+                    )
+                    ptr = fx.buffer_ops.create_llvm_ptr(
+                        fx.Int64(byte_off), address_space=3
+                    )
+                    reads.append(Vec(rocdl.ds_read_tr8_b64(v_tr8_ty, ptr).result))
+                ab = reads[0].shuffle(reads[1], list(range(4)))
+                cd = reads[2].shuffle(reads[3], list(range(4)))
+                v_pack = ab.shuffle(cd, list(range(8)))
                 o_accs[dt] = mfma.call(v_pack, p_pack, o_accs[dt])
 
             m_running = m_new
