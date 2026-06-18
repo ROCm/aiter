@@ -269,10 +269,9 @@ def _run_grouped_via_fused_moe(
     use_bias: bool = True,
     verify: bool = False,
     seed: int = 0,
-    bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
-) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[float]]:
+) -> tuple[torch.Tensor, Optional[torch.Tensor], float, Optional[float]]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
     ``layout`` selects the stage1 weight physical layout:
@@ -281,9 +280,11 @@ def _run_grouped_via_fused_moe(
     ``GateMode.INTERLEAVE``. The PyTorch reference always evaluates the
     GGUU logical weights, so both paths share the same numerical result.
 
-    When ``bench`` is set, the same ``fused_moe`` call is timed end-to-end via
-    ``run_perftest`` in CUDA-graph mode. Returns
-    ``(grouped_out, ref_out_or_None, bench_us_or_None)``.
+    The ``fused_moe`` call always runs through ``run_perftest`` in CUDA-graph
+    mode (production path), so timing reflects the graph path. When ``verify``
+    is set, an eager (graph-off) output is also returned so the caller can
+    compare both the graph and eager outputs against the reference. Returns
+    ``(grouped_out, eager_out_or_None, ref_out_or_None, graph_us)``.
     """
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
@@ -363,10 +364,22 @@ def _run_grouped_via_fused_moe(
             swiglu_limit=swiglu_limit,
         )
 
-    grouped_out = _call()
+    # Always run via run_perftest's CUDA-graph mode so correctness is validated
+    # on the graph (production) path, not eager. The returned data is the
+    # graph-captured output.
+    from aiter.test_common import run_perftest
+
+    torch.cuda.synchronize()
+    grouped_out, us = run_perftest(
+        _call, num_warmup=warmup, num_iters=iters, testGraph=True
+    )
 
     ref = None
+    eager_out = None
     if verify:
+        # Also run eager (graph-off) so the caller can compare BOTH the graph
+        # and eager outputs against the reference.
+        eager_out = _call()
         # Reference always uses GGUU logical inputs (layouts are numerically
         # equivalent; only physical packing differs).
         ref = _torch_moe_ref(
@@ -383,14 +396,7 @@ def _run_grouped_via_fused_moe(
             activation=activation,
             swiglu_limit=swiglu_limit,
         ).to(grouped_out.dtype)
-
-    us = None
-    if bench:
-        from aiter.test_common import run_perftest
-
-        torch.cuda.synchronize()
-        _, us = run_perftest(_call, num_warmup=warmup, num_iters=iters, testGraph=True)
-    return grouped_out, ref, us
+    return grouped_out, eager_out, ref, us
 
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -447,7 +453,8 @@ def run_moe(
     tag = f"{data_format} {layout} {act}"
 
     # --- correctness (+ optional bench): grouped FlyDSL vs PyTorch fp32 ref ---
-    out, ref, us = _run_grouped_via_fused_moe(
+    # Always graph mode; verify uses light iters, bench uses the full sweep.
+    out, eager_out, ref, us = _run_grouped_via_fused_moe(
         experts=experts,
         tokens=tokens,
         topk=topk,
@@ -459,27 +466,32 @@ def run_moe(
         swiglu_limit=swiglu_limit,
         use_bias=use_bias,
         verify=True,
-        bench=bench,
-        warmup=warmup,
-        iters=iters,
+        warmup=warmup if bench else 1,
+        iters=iters if bench else 2,
     )
-    rel = _rel_l2(out, ref)
+    # Compare BOTH the graph output (production path) and the eager output
+    # against the fp32 reference.
     ld = _logits_diff(out, ref)
+    rel = _rel_l2(out, ref)
+    ld_eager = _logits_diff(eager_out, ref)
+    rel_eager = _rel_l2(eager_out, ref)
     print(
-        f"[sanity {tag}] logits_diff = {ld:.4e} (gate<{LOGITS_DIFF_TOL}) "
-        f"rel_l2 = {rel:.4e} (info, was tol={tol}) "
-        f"(grouped_norm={float(out.float().norm()):.4e} ref_norm={float(ref.float().norm()):.4e})",
+        f"[sanity {tag}] graph: logits_diff={ld:.4e} rel_l2={rel:.4e} | "
+        f"eager: logits_diff={ld_eager:.4e} rel_l2={rel_eager:.4e} "
+        f"(gate<{LOGITS_DIFF_TOL}, ref_norm={float(ref.float().norm()):.4e})",
         flush=True,
     )
     passed = ld < LOGITS_DIFF_TOL
     if raise_on_fail:
         assert passed, (
-            f"grouped {tag} vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL} "
-            f"(rel_l2={rel:.4f}, informational)"
+            f"grouped {tag} graph vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL} "
+            f"(eager logits_diff={ld_eager:.4e}, informational)"
         )
     metrics = {
         "logits_diff": ld,
         "rel_l2": rel,
+        "logits_diff_eager": ld_eager,
+        "rel_l2_eager": rel_eager,
         "passed": passed,
         "grouped_norm": float(out.float().norm()),
         "ref_norm": float(ref.float().norm()),
@@ -677,6 +689,7 @@ def main() -> None:
                 "model_dim": args.model_dim,
                 "inter_dim": args.inter_dim,
                 "logits_diff": metrics["logits_diff"],
+                "logits_diff_eager": metrics["logits_diff_eager"],
                 "rel_l2": metrics["rel_l2"],
                 "pass": metrics["passed"],
                 "us": metrics.get("us"),
