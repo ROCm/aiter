@@ -2,9 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, contextmanager
-from typing import Iterator, Union
+from typing import Iterator, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -345,18 +346,27 @@ class TorchCommunicator(Communicator):
 
 
 def make_communicator(
-    backend: str,
     group: ProcessGroup,
     device: Union[int, str, torch.device],
     max_size: int = _DEFAULT_MAX_SIZE,
+    backend: Optional[str] = None,
 ) -> Communicator:
     """Construct the TP collective backend at the one branching point.
 
     'iris' is production (gluon GPU-initiated CCL); 'torch' is the
-    torch.distributed reference/control. Returns the communicator without raising
-    on unavailability — the caller checks ``.disabled`` (IrisCommunicator
-    self-disables on unsupported arch / missing iris / unsupported world size).
+    torch.distributed reference/control. The caller (vLLM) stays backend-agnostic
+    and passes nothing; the backend is resolved here from ``AITER_COMMS_BACKEND``
+    (default 'iris'), so selecting the control is an aiter-side env, not a vLLM
+    concern. An explicit ``backend`` argument (used by the tests) overrides the env.
+
+    Returns the communicator without raising on unavailability — the caller checks
+    ``.disabled`` (IrisCommunicator self-disables on unsupported arch / missing
+    iris / unsupported world size).
     """
+    if backend is None:
+        backend = os.environ.get("AITER_COMMS_BACKEND", "iris")
+    backend = backend.lower()
+    logger.info("aiter make_communicator: backend=%s", backend)
     if backend == "iris":
         return IrisCommunicator(group, device, max_size)
     if backend == "torch":

@@ -72,7 +72,7 @@ OPS = ["all_reduce", "all_gather"]
 
 
 def _build_communicator(backend, group, device):
-    comm = make_communicator(backend, group, device)
+    comm = make_communicator(group, device, backend=backend)
     if comm.disabled:
         raise RuntimeError(f"{backend} communicator disabled")
     return comm
