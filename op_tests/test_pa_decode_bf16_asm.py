@@ -412,9 +412,11 @@ def run_pa_stage(
         kv_indptr,
         gqa=gqa,
         mtp=mtp,
-        query_scale=query_scale,
-        key_scale=key_scale,
-        value_scale=value_scale,
+        # pa_decode_bf16_asm is tensor-only for scales; the reference math above
+        # still uses the python floats, so wrap them here for the kernel call.
+        query_scale=torch.tensor([query_scale], dtype=torch.float32, device=Q.device),
+        key_scale=torch.tensor([key_scale], dtype=torch.float32, device=Q.device),
+        value_scale=torch.tensor([value_scale], dtype=torch.float32, device=Q.device),
         qo_indptr=qo_indptr,
         work_indptr=work_indptr,
         work_info=work_info,
@@ -809,9 +811,16 @@ def _run_pa_kernel(inp, V):
         inp["kv_indptr"],
         gqa=inp["gqa"],
         mtp=inp["mtp"],
-        query_scale=inp["query_scale"],
-        key_scale=inp["key_scale"],
-        value_scale=inp["value_scale"],
+        # pa_decode_bf16_asm is tensor-only for scales; wrap the python floats.
+        query_scale=torch.tensor(
+            [inp["query_scale"]], dtype=torch.float32, device=inp["Q"].device
+        ),
+        key_scale=torch.tensor(
+            [inp["key_scale"]], dtype=torch.float32, device=inp["Q"].device
+        ),
+        value_scale=torch.tensor(
+            [inp["value_scale"]], dtype=torch.float32, device=inp["Q"].device
+        ),
         qo_indptr=inp["qo_indptr"],
         work_indptr=inp["work_indptr"],
         work_info=inp["work_info"],

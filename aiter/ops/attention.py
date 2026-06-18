@@ -446,9 +446,9 @@ def pa_decode_bf16_asm(
     kv_indptr: torch.Tensor,
     gqa: int = 8,
     mtp: int = 0,
-    query_scale: float | torch.Tensor = 1.0,
-    key_scale: float | torch.Tensor = 1.0,
-    value_scale: float | torch.Tensor = 1.0,
+    query_scale: Optional[torch.Tensor] = None,
+    key_scale: Optional[torch.Tensor] = None,
+    value_scale: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     work_indptr: Optional[torch.Tensor] = None,
     work_info: Optional[torch.Tensor] = None,
@@ -463,7 +463,8 @@ def pa_decode_bf16_asm(
     Contract details:
       * `Q`/`K`/`V` are FP8; `out` is bf16 with Q's logical shape.
       * `query_scale`/`key_scale`/`value_scale` are the per-tensor FP8 dequant
-        scales; the attention `softmax_scale` (typically 1/sqrt(head_dim)) is
+        scales as 1-element fp32 tensors (None means 1.0); the attention
+        `softmax_scale` (typically 1/sqrt(head_dim)) is
         passed BY VALUE (kernarg 0x60) and the kernel forms
         scl_log2e = query_scale * key_scale * softmax_scale * log2e.
       * `sink` (optional) holds per-Q-head fp32 logits in the SCALED-logit
@@ -479,15 +480,17 @@ def pa_decode_bf16_asm(
     if out is None:
         out = torch.empty(Q.shape, dtype=torch.bfloat16, device=device)
 
-    def _scale_tensor(scale: float | torch.Tensor, multiplier: float = 1.0):
-        if isinstance(scale, torch.Tensor):
-            scale = scale.to(device=device, dtype=torch.float32).reshape(-1)[:1]
-            if multiplier != 1.0:
-                scale = scale * multiplier
-            return scale.contiguous()
-        return torch.tensor(
-            [float(scale) * multiplier], dtype=torch.float32, device=device
-        )
+    def _scale_tensor(scale: Optional[torch.Tensor], multiplier: float = 1.0):
+        # tensor-only: None means identity (1.0); anything else must be a tensor.
+        if scale is None:
+            return torch.tensor([multiplier], dtype=torch.float32, device=device)
+        assert isinstance(
+            scale, torch.Tensor
+        ), f"scale must be a torch.Tensor (or None), got {type(scale)}"
+        scale = scale.to(device=device, dtype=torch.float32).reshape(-1)[:1]
+        if multiplier != 1.0:
+            scale = scale * multiplier
+        return scale.contiguous()
 
     q_scale = _scale_tensor(query_scale)
     # softmax_scale is passed BY VALUE (kernarg 0x60); the kernel applies it, so
