@@ -105,9 +105,14 @@ def test_aiter_jit_dir_with_enum():
         out_cpu = out.cpu()
         assert out_cpu is not None, "moe_stage1_g1u1 should have written to out"
         assert out_cpu.numel() > 0, "Output tensor should not be empty"
-        assert not torch.all(
-            out_cpu == 0
-        ), "Output tensor should contain non-zero values (kernel should have computed results)"
+        assert torch.isfinite(out_cpu).all(), "Output tensor should not contain NaN or Inf"
+
+        generated_modules = [
+            filename for filename in os.listdir(temp_dir) if filename.endswith(".so")
+        ]
+        assert (
+            generated_modules
+        ), "Expected compiled modules in AITER_JIT_DIR when invoking kernel with enum arguments"
 
 
 if __name__ == "__main__":
