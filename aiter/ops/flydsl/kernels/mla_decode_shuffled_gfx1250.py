@@ -30,17 +30,130 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, tdm_ops, vector
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    gpu,
+    math as fmath,
+    range_constexpr,
+    rocdl,
+    tdm_ops,
+)
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
+from flydsl.expr.vector import ReductionOp
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .pa_decode_gfx1250 import (
-    _build_v4i32_buffer_rsrc,
-    _s_buffer_load_b32,
-    _s_buffer_load_vec,
-)
+
+def _build_v4i32_buffer_rsrc(tensor, num_records_bytes=0xFFFFFFFF, arch=None):
+    """Build a ``<4 x i32>`` V# (buffer resource descriptor) for ``s_buffer_load``.
+
+    ``s_buffer_load`` intrinsics take the legacy ``<4 x i32>`` descriptor;
+    ``rocdl.make.buffer.rsrc`` (the modern op used by
+    ``buffer_ops.create_buffer_resource``) only produces ``!llvm.ptr<8>``, so
+    we assemble the V# manually here.
+
+    AMDGPU V# layout (low to high):
+      word0: base[31:0]
+      word1: base[47:32] (low 16) | stride<<16 (high 16)
+      word2: num_records (bytes)
+      word3: flags (DATA_FORMAT, NUM_FORMAT, OOB_SELECT, etc.)
+    """
+    i32_t = ir.IntegerType.get_signless(32)
+
+    base_idx = buffer_ops.extract_base_index(tensor, address_space=1)
+    base_i64 = _raw(arith.index_cast(T.i64, base_idx))
+
+    # word 0: base[31:0]
+    w0 = arith.trunci(i32_t, base_i64)
+
+    # word 1: base[63:32] truncated to i32 — only base[47:32] is meaningful
+    # for addresses, and stride=0 leaves the high 16 bits zero.
+    shift_amt = _raw(arith.constant(32, type=T.i64))
+    base_hi_i64 = arith.shrui(base_i64, shift_amt)
+    w1 = arith.trunci(i32_t, base_hi_i64)
+
+    # word 2: num_records (bytes)
+    w2 = _raw(arith.constant(num_records_bytes, type=T.i32))
+
+    # word 3: flags (data format, OOB select, etc.)
+    w3 = _raw(arith.constant(buffer_ops._get_buffer_flags(arch), type=T.i32))
+
+    return fx.Vector.from_elements([w0, w1, w2, w3], fx.Int32)
+
+
+def _s_buffer_load_b32(rsrc_v4i32, byte_offset_i32):
+    """Emit ``s_buffer_load_b32`` — scalar K$ load, result lands in an SGPR.
+
+    Bypasses the VGPR → ``v_readfirstlane`` round-trip that the vmem
+    ``buffer_load`` path requires, and uses the ``s_wait_kmcnt`` counter
+    (separate from vmem ``s_wait_loadcnt``).
+
+    Args:
+        rsrc_v4i32: buffer descriptor as ``vector<4xi32>``
+                    (from ``_build_v4i32_buffer_rsrc``).
+        byte_offset_i32: byte offset (i32 SGPR value).
+
+    Returns: i32 (scalar — uniform across the wave).
+    """
+    cachepol = _raw(arith.constant(0, type=T.i32))
+    return _llvm.call_intrinsic(
+        T.i32,
+        "llvm.amdgcn.s.buffer.load.i32",
+        [_raw(rsrc_v4i32), _raw(byte_offset_i32), cachepol],
+        [],
+        [],
+    )
+
+
+def _s_buffer_load_v2i32(rsrc_v4i32, byte_offset_i32):
+    """Emit ``s_buffer_load_b64`` — 2-dword scalar K$ load returning vector<2xi32>.
+
+    All lanes see the same vector; per-element extracts stay uniform.
+    """
+    cachepol = _raw(arith.constant(0, type=T.i32))
+    return _llvm.call_intrinsic(
+        ir.Type.parse("vector<2xi32>"),
+        "llvm.amdgcn.s.buffer.load.v2i32",
+        [_raw(rsrc_v4i32), _raw(byte_offset_i32), cachepol],
+        [],
+        [],
+    )
+
+
+def _s_buffer_load_v4i32(rsrc_v4i32, byte_offset_i32):
+    """Emit ``s_buffer_load_b128`` — 4-dword scalar K$ load returning vector<4xi32>."""
+    cachepol = _raw(arith.constant(0, type=T.i32))
+    return _llvm.call_intrinsic(
+        ir.Type.parse("vector<4xi32>"),
+        "llvm.amdgcn.s.buffer.load.v4i32",
+        [_raw(rsrc_v4i32), _raw(byte_offset_i32), cachepol],
+        [],
+        [],
+    )
+
+
+def _s_buffer_load_vec(rsrc_v4i32, byte_offset_i32, width):
+    """Width-dispatched ``s_buffer_load`` returning a vector<widthxi32>.
+
+    Module-level so the dispatch runs at Python trace time and the kernel's
+    AST rewriter never sees the ``if/elif`` (which it would otherwise lift
+    into ``scf.if`` branches and scope away the assigned value).
+
+    Supports width ∈ {2, 4}. Width=1 should use ``_s_buffer_load_b32`` directly.
+    """
+    if width == 2:
+        return _s_buffer_load_v2i32(rsrc_v4i32, byte_offset_i32)
+    if width == 4:
+        return _s_buffer_load_v4i32(rsrc_v4i32, byte_offset_i32)
+    raise ValueError(
+        f"_s_buffer_load_vec width must be 2 or 4 (got {width}); "
+        "use _s_buffer_load_b32 for width=1."
+    )
+
 
 WAVE_SIZE = 32
 WMMA_M = 16
@@ -201,6 +314,7 @@ def compile_mla_decode_main(
         seq_len = fx.Index(seq_len_i32)
 
         elem_ty = T.bf16 if dtype == "bf16" else T.f16
+        elem_dtype = fx.BFloat16 if dtype == "bf16" else fx.Float16
         wmma_op = (
             rocdl.wmma_f32_16x16x32_bf16
             if dtype == "bf16"
@@ -243,16 +357,14 @@ def compile_mla_decode_main(
         # We multiply scale by log2e so we can use exp2 later for softmax (exp2 op faster than exp)
         qk_scale_f32 = fx.Float32(arith.bitcast(T.f32, i32_qk_scale.ir_value()))
         LOG2E = fx.Float32(1.4426950408889634)
-        qk_scale_log2_vec = vector.broadcast(
-            T.vec(8, T.f32), (qk_scale_f32 * LOG2E).ir_value()
-        )
+        qk_scale_log2_scalar = qk_scale_f32 * LOG2E
 
         neg_inf_f32 = fx.Float32(float("-inf"))
         zero_f32 = fx.Float32(0.0)
         # Padded (unused) head rows are masked to a large FINITE negative, not -inf, so the
         # softmax of an all-masked row stays finite (-inf - -inf would be NaN).
         NEG_FINITE_MAX = -3.4e38
-        neg_finite_max_vec8 = arith.constant_vector(NEG_FINITE_MAX, T.vec(8, T.f32))
+        neg_finite_max_vec8 = fx.Vector.filled(8, NEG_FINITE_MAX, fx.Float32)
         zero_i32 = arith.constant(0, type=T.i32)
 
         # Loads one 16-row x 32-K WMMA fragment for Q from Q LDS.
@@ -262,8 +374,8 @@ def compile_mla_decode_main(
             for k0 in range_constexpr(2):
                 kk_base = fx.Index(k_base_elem) + (fx.Index(k0 * 2) + lane_kgrp) * fx.Index(8)
                 elem_off = row_base_idx * fx.Index(row_stride) + kk_base
-                chunks.append(vector.load_op(T.vec(8, elem_ty), lds_mem, [elem_off]))
-            return vector.shuffle(chunks[0], chunks[1], list(range(16)))
+                chunks.append(fx.Vector.load(T.vec(8, elem_ty), lds_mem, [elem_off]))
+            return chunks[0].shuffle(chunks[1], list(range(16)))
 
         # ---- shuffled K fragment loader (straight ds_load_b128) ----
         def _load_shuf_K(lds_ptr, n_tile, ks, bsg_stride, stage_off):
@@ -271,9 +383,9 @@ def compile_mla_decode_main(
             base_t = stage_off + fx.Index(n_tile * bsg_stride)
             o0 = base_t + fx.Index((2 * ks) * 256) + lane_id * fx.Index(8)
             o1 = base_t + fx.Index((2 * ks + 1) * 256) + lane_id * fx.Index(8)
-            c0 = vector.load_op(T.vec(8, elem_ty), lds_mem, [o0])
-            c1 = vector.load_op(T.vec(8, elem_ty), lds_mem, [o1])
-            return vector.shuffle(c0, c1, list(range(16)))
+            c0 = fx.Vector.load(T.vec(8, elem_ty), lds_mem, [o0])
+            c1 = fx.Vector.load(T.vec(8, elem_ty), lds_mem, [o1])
+            return c0.shuffle(c1, list(range(16)))
 
         # ---- shuffled V fragment loader (transpose ds_load_tr16_b128) ----
         lane8 = lane16 % fx.Index(8)
@@ -288,9 +400,13 @@ def compile_mla_decode_main(
             )
             o0 = stage_off + fx.Index((2 * ks) * LORA_BSG_STRIDE) + base
             o1 = stage_off + fx.Index((2 * ks + 1) * LORA_BSG_STRIDE) + base
-            v0 = rocdl.lds_transpose_load(T.vec(8, elem_ty), lds_mem, o0, elem_bytes)
-            v1 = rocdl.lds_transpose_load(T.vec(8, elem_ty), lds_mem, o1, elem_bytes)
-            return vector.shuffle(v0, v1, list(range(16)))
+            v0 = fx.Vector(
+                rocdl.lds_transpose_load(T.vec(8, elem_ty), lds_mem, o0, elem_bytes)
+            )
+            v1 = fx.Vector(
+                rocdl.lds_transpose_load(T.vec(8, elem_ty), lds_mem, o1, elem_bytes)
+            )
+            return v0.shuffle(v1, list(range(16)))
 
         # ---- block table -> physical page IDs ----
         KVB_idx = fx.Index(KV_BLOCK_SIZE)
@@ -314,9 +430,11 @@ def compile_mla_decode_main(
                     phys_i32 = arith.select(in_range, phys_i32, zero_i32)
                     out.append(fx.Index(phys_i32))
                 else:
-                    phys_vec = _s_buffer_load_vec(bt_rsrc_v4i32, bt_off_bytes_i32, this_width)
+                    phys_vec = fx.Vector(
+                        _s_buffer_load_vec(bt_rsrc_v4i32, bt_off_bytes_i32, this_width)
+                    )
                     for b in range_constexpr(this_width):
-                        elem = vector.extract(phys_vec, static_position=[b], dynamic_position=[])
+                        elem = phys_vec[b]
                         logical_idx = base_logical + fx.Index(this_offset + b)
                         in_range = logical_idx < live_blocks
                         elem = arith.select(in_range, elem, zero_i32)
@@ -433,7 +551,7 @@ def compile_mla_decode_main(
             m_list = [neg_inf_f32 for _ in range(NUM_QGSP_TILES)]
             l_list = [zero_f32 for _ in range(NUM_QGSP_TILES)]
             pv_list = [
-                [arith.constant_vector(0.0, T.vec(8, T.f32)) for _ in range(P)]
+                [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(P)]
                 for _ in range(NUM_QGSP_TILES)
             ]
             return _pack(m_list, l_list, pv_list, fx.Index(0))
@@ -447,7 +565,7 @@ def compile_mla_decode_main(
             for qt in range_constexpr(NUM_QGSP_TILES):
                 m_list.append(fx.Float32(state[si])); si += 1
                 l_list.append(fx.Float32(state[si])); si += 1
-                pv_list.append(list(state[si : si + P])); si += P
+                pv_list.append([fx.Vector(v) for v in state[si : si + P]]); si += P
 
             cur_stage = state[si]
             nxt_stage = fx.Index(1) - cur_stage
@@ -471,66 +589,66 @@ def compile_mla_decode_main(
 
             # Every warp runs QK redundantly
             qk_accs = [
-                [arith.constant_vector(0.0, T.vec(8, T.f32)) for _ in range(N_QK_TILES)]
+                [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(N_QK_TILES)]
                 for _ in range(NUM_QGSP_TILES)
             ]
             for n_tile in range_constexpr(N_QK_TILES):
                 for ks in range_constexpr(K_QK_LORA_TILES):
                     k_frag = _load_shuf_K(kv_lora_lds, n_tile, ks, LORA_BSG_STRIDE, cur_lora_elem_off)
                     for qt in range_constexpr(NUM_QGSP_TILES):
-                        qk_accs[qt][n_tile] = wmma_op(
-                            T.vec(8, T.f32), k_frag, q_lora_frags[qt][ks], qk_accs[qt][n_tile],
-                            signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
-                        ).result
+                        qk_accs[qt][n_tile] = fx.Vector(
+                            wmma_op(
+                                T.vec(8, T.f32), k_frag, q_lora_frags[qt][ks], qk_accs[qt][n_tile],
+                                signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
+                            ).result
+                        )
                 for ks in range_constexpr(K_QK_ROPE_TILES):
                     k_frag = _load_shuf_K(kv_rope_lds, n_tile, ks, ROPE_BSG_STRIDE, cur_rope_elem_off)
                     for qt in range_constexpr(NUM_QGSP_TILES):
-                        qk_accs[qt][n_tile] = wmma_op(
-                            T.vec(8, T.f32), k_frag, q_rope_frags[qt][ks], qk_accs[qt][n_tile],
-                            signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
-                        ).result
+                        qk_accs[qt][n_tile] = fx.Vector(
+                            wmma_op(
+                                T.vec(8, T.f32), k_frag, q_rope_frags[qt][ks], qk_accs[qt][n_tile],
+                                signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
+                            ).result
+                        )
 
             # ---- online-softmax update ----
             for qt in range_constexpr(NUM_QGSP_TILES):
                 # Apply scale*log2e so so we can use exp2
                 for n_tile in range_constexpr(N_QK_TILES):
-                    qk_accs[qt][n_tile] = qk_accs[qt][n_tile] * qk_scale_log2_vec
+                    qk_accs[qt][n_tile] = qk_accs[qt][n_tile] * qk_scale_log2_scalar
 
                 # Token mask
                 for n_tile in range_constexpr(N_QK_TILES):
                     new_vals = []
                     for mi in range_constexpr(8):
-                        v = vector.extract(qk_accs[qt][n_tile], static_position=[mi], dynamic_position=[])
+                        v = qk_accs[qt][n_tile][mi]
                         tok_abs = (
                             tile_first_tok + fx.Index(n_tile * WMMA_M)
                             + lane_kgrp * fx.Index(8) + fx.Index(mi)
                         )
                         in_range = tok_abs < seq_len
                         new_vals.append(arith.select(in_range, v, neg_inf_f32))
-                    qk_accs[qt][n_tile] = vector.from_elements(T.vec(8, T.f32), new_vals)
+                    qk_accs[qt][n_tile] = fx.Vector.from_elements(new_vals, fx.Float32)
 
                 # row mask when NUM_Q_HEADS isn't a multiple of 16:
                 if qt * WMMA_M + WMMA_M > NUM_Q_HEADS:
                     is_row_valid = (fx.Index(qt * WMMA_M) + lane16) < num_q_heads_idx
                     for n_tile in range_constexpr(N_QK_TILES):
-                        qk_accs[qt][n_tile] = arith.select(
-                            is_row_valid, qk_accs[qt][n_tile], neg_finite_max_vec8
+                        qk_accs[qt][n_tile] = fx.Vector(
+                            arith.select(
+                                is_row_valid, qk_accs[qt][n_tile], neg_finite_max_vec8
+                            )
                         )
 
                 # Row max
                 m_state = m_list[qt]
                 l_state = l_list[qt]
-                local_max = fx.Float32(
-                    vector.extract(qk_accs[qt][0], static_position=[0], dynamic_position=[])
-                )
-                for mi in range_constexpr(1, 8):
-                    v = vector.extract(qk_accs[qt][0], static_position=[mi], dynamic_position=[])
-                    local_max = local_max.maximumf(v)
-                if N_QK_TILES > 1:
-                    for n_tile in range_constexpr(1, N_QK_TILES):
-                        for mi in range_constexpr(8):
-                            v = vector.extract(qk_accs[qt][n_tile], static_position=[mi], dynamic_position=[])
-                            local_max = local_max.maximumf(v)
+                local_max = qk_accs[qt][0].reduce(ReductionOp.MAX)
+                for n_tile in range_constexpr(1, N_QK_TILES):
+                    local_max = local_max.maximumf(
+                        qk_accs[qt][n_tile].reduce(ReductionOp.MAX)
+                    )
                 peer = local_max.shuffle_xor(fx.Int32(16), fx.Int32(WAVE_SIZE))
                 row_max = local_max.maximumf(peer)
 
@@ -541,13 +659,15 @@ def compile_mla_decode_main(
                 # PV can read them straight from these registers. Sum the lane-local part.
                 row_sum_partial = zero_f32
                 for n_tile in range_constexpr(N_QK_TILES):
-                    vals_new = []
-                    for mi in range_constexpr(8):
-                        q_ij = vector.extract(qk_accs[qt][n_tile], static_position=[mi], dynamic_position=[])
-                        p_ij = (q_ij - new_m).exp2(fastmath=arith.FastMathFlags.fast)
-                        vals_new.append(p_ij)
-                        row_sum_partial = row_sum_partial + p_ij
-                    qk_accs[qt][n_tile] = vector.from_elements(T.vec(8, T.f32), vals_new)
+                    p_vec = fx.Vector(
+                        fmath.exp2(
+                            qk_accs[qt][n_tile] - new_m, fastmath=arith.FastMathFlags.fast
+                        )
+                    )
+                    qk_accs[qt][n_tile] = p_vec
+                    row_sum_partial = row_sum_partial + p_vec.reduce(
+                        ReductionOp.ADD, fastmath=arith.FastMathFlags.fast
+                    )
 
                 # Complete the row sum across the two half-waves, then update running l and m.
                 peer = row_sum_partial.shuffle_xor(fx.Int32(16), fx.Int32(WAVE_SIZE))
@@ -557,9 +677,8 @@ def compile_mla_decode_main(
                 m_list[qt] = new_m
 
                 # rescale pv_accs by alpha
-                alpha_vec = vector.broadcast(T.vec(8, T.f32), alpha.ir_value())
                 for pv_n in range_constexpr(P):
-                    pv_list[qt][pv_n] = pv_list[qt][pv_n] * alpha_vec
+                    pv_list[qt][pv_n] = pv_list[qt][pv_n] * alpha
 
             # ---- PV ----
             # Split across warps along d_c
@@ -567,15 +686,17 @@ def compile_mla_decode_main(
                 for pv_n in range_constexpr(P):
                     pv_n_global = wave_id * fx.Index(P) + fx.Index(pv_n)
                     for ks in range_constexpr(K_PV_TILES):
-                        p_f32 = vector.shuffle(
-                            qk_accs[qt][2 * ks], qk_accs[qt][2 * ks + 1], list(range(16))
+                        p_f32 = qk_accs[qt][2 * ks].shuffle(
+                            qk_accs[qt][2 * ks + 1], list(range(16))
                         )
-                        p_frag = arith.trunc_f(T.vec(16, elem_ty), p_f32)
+                        p_frag = p_f32.to(elem_dtype)
                         v_frag = _load_shuf_V_tr(pv_n_global, ks, cur_lora_elem_off)
-                        pv_list[qt][pv_n] = wmma_op(
-                            T.vec(8, T.f32), v_frag, p_frag, pv_list[qt][pv_n],
-                            signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
-                        ).result
+                        pv_list[qt][pv_n] = fx.Vector(
+                            wmma_op(
+                                T.vec(8, T.f32), v_frag, p_frag, pv_list[qt][pv_n],
+                                signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
+                            ).result
+                        )
 
             # Barrier so every warp is done reading this stage's LDS before the next
             # iteration prefetches into (and overwrites) it.
@@ -588,7 +709,7 @@ def compile_mla_decode_main(
         for qt in range_constexpr(NUM_QGSP_TILES):
             m_final.append(fx.Float32(results[si])); si += 1
             l_final.append(fx.Float32(results[si])); si += 1
-            pv_final.append(list(results[si : si + P])); si += P
+            pv_final.append([fx.Vector(v) for v in results[si : si + P]]); si += P
 
         out_base = seq_idx * stride_o_seq + seg_idx * stride_o_seg
         lse_base = seq_idx * stride_lse_seq + seg_idx * stride_lse_seg
@@ -602,8 +723,8 @@ def compile_mla_decode_main(
                 head_col_base = pv_n_global * fx.Index(WMMA_M) + lane_kgrp * fx.Index(8)
                 off_lo = out_base + row * stride_o_row + head_col_base
                 off_hi = off_lo + fx.Index(4)
-                lo = vector.shuffle(pv_final[qt][pv_n], pv_final[qt][pv_n], [0, 1, 2, 3])
-                hi = vector.shuffle(pv_final[qt][pv_n], pv_final[qt][pv_n], [4, 5, 6, 7])
+                lo = pv_final[qt][pv_n].shuffle(pv_final[qt][pv_n], [0, 1, 2, 3])
+                hi = pv_final[qt][pv_n].shuffle(pv_final[qt][pv_n], [4, 5, 6, 7])
                 if row_valid:
                     buffer_ops.buffer_store(lo, out_rsrc, off_lo)
                     buffer_ops.buffer_store(hi, out_rsrc, off_hi)
@@ -720,9 +841,7 @@ def compile_mla_decode_reduce(
         arg_seq_lens: fx.Tensor,
         i32_num_seqs: fx.Int32,
     ):
-        elem_ty = T.bf16 if dtype == "bf16" else T.f16
-        vec_f32_ty = T.vec(VEC, T.f32)
-        vec_half_ty = T.vec(VEC, elem_ty)
+        elem_dtype = fx.BFloat16 if dtype == "bf16" else fx.Float16
 
         tx = gpu.thread_id("x")
         seq_idx = gpu.block_id("x")          # grid = (num_seqs,): one block per sequence
@@ -786,8 +905,10 @@ def compile_mla_decode_reduce(
                 for c in range_constexpr(N_COL_CHUNKS):
                     tmp_off = tmp_row_base + p_idx * stride_tmp_seg + _lane_col(c)
                     v_chunks.append(
-                        buffer_ops.buffer_load(
-                            tmp_rsrc, tmp_off, vec_width=VEC, dtype=T.f32
+                        fx.Vector(
+                            buffer_ops.buffer_load(
+                                tmp_rsrc, tmp_off, vec_width=VEC, dtype=T.f32
+                            )
                         )
                     )
                 return m_f, l_f, v_chunks
@@ -812,7 +933,7 @@ def compile_mla_decode_reduce(
             m_state = neg_inf_f32
             l_state = zero_f32
             acc_chunks = [
-                arith.constant_vector(0.0, vec_f32_ty) for _ in range(N_COL_CHUNKS)
+                fx.Vector.filled(VEC, 0.0, fx.Float32) for _ in range(N_COL_CHUNKS)
             ]
 
             # Software-pipelined merge: combine the current partition while the next one's
@@ -824,15 +945,13 @@ def compile_mla_decode_reduce(
                 new_m = m_state.maximumf(m_p)
                 alpha_old = (m_state - new_m).exp2(fastmath=arith.FastMathFlags.fast)
                 alpha_this_raw = (m_p - new_m).exp2(fastmath=arith.FastMathFlags.fast)
-                alpha_this = arith.select(valid, alpha_this_raw, zero_f32)
+                alpha_this = fx.Float32(arith.select(valid, alpha_this_raw, zero_f32))
                 new_l = alpha_old * l_state + alpha_this * l_p
 
-                alpha_old_vec = vector.broadcast(vec_f32_ty, alpha_old.ir_value())
-                alpha_this_vec = vector.broadcast(vec_f32_ty, alpha_this)
                 new_acc = []
                 for c in range_constexpr(N_COL_CHUNKS):
                     new_acc.append(
-                        alpha_old_vec * acc_chunks[c] + alpha_this_vec * v_p_chunks[c]
+                        acc_chunks[c] * alpha_old + v_p_chunks[c] * alpha_this
                     )
 
                 m_state = new_m
@@ -845,15 +964,16 @@ def compile_mla_decode_reduce(
 
             # Normalize (numerator / total l), cast to bf16/f16, store. An empty sequence has
             # no live segments -> write zeros instead of the 0/0 = NaN the merge would give.
-            inv_l = rocdl.rcp(T.f32, l_state.ir_value())
-            inv_l_vec = vector.broadcast(vec_f32_ty, inv_l)
+            inv_l = fx.Float32(rocdl.rcp(T.f32, l_state.ir_value()))
             is_empty = num_segs_actual == zero_idx
-            zero_vec_half = arith.constant_vector(0.0, vec_half_ty)
+            zero_vec_half = fx.Vector.filled(VEC, 0.0, elem_dtype)
 
             for c in range_constexpr(N_COL_CHUNKS):
-                out_vec_f32 = acc_chunks[c] * inv_l_vec
-                out_vec_half = arith.trunc_f(vec_half_ty, out_vec_f32)
-                out_vec_half = arith.select(is_empty, zero_vec_half, out_vec_half)
+                out_vec_f32 = acc_chunks[c] * inv_l
+                out_vec_half = out_vec_f32.to(elem_dtype)
+                out_vec_half = fx.Vector(
+                    arith.select(is_empty, zero_vec_half, out_vec_half)
+                )
                 out_off = seq_idx * stride_out_seq + r * stride_out_row + _lane_col(c)
                 buffer_ops.buffer_store(out_vec_half, out_rsrc, out_off)
 
