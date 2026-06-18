@@ -178,9 +178,10 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int kBRows = kBlockN;                       // w1 loads all B rows
     static constexpr int kSlotElemsA = kARows * kSmemPitch;
     static constexpr int kSlotElemsB = kBRows * kSmemPitch;
-    // Prefetch depth P (number of LDS slots == in-flight TDM count). Runtime
-    // config: the producer keeps exactly kNumSlots TDMs in flight (decoupled
-    // run-ahead, s_wait_tensorcnt(kNumSlots-1)). Lower P reduces the in-flight
+    // Prefetch depth P (number of LDS slots). The s_barrier producer issues the
+    // first P TDMs in the prologue (peak in-flight = P), then per K-step does a
+    // full s_wait_tensorcnt(0) drain before the workgroup barrier and refills one
+    // slot -- so P bounds the peak in-flight TDM count. Lower P reduces the
     // direct-copy TDM request count req = rows * P * (B_K/128) per operand,
     // which must stay under the hardware direct-copy limit (256 / SIMD-pair;
     // < 128 per operand for 2 WG/CU co-residency). The codegen picks P per tile

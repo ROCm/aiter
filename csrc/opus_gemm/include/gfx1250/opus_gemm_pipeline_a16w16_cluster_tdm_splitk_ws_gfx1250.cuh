@@ -47,38 +47,31 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
     using DataA = typename T::DataA;
     using DataB = typename T::DataB;
     using DataAcc = typename T::DataAcc;
-    DECLARE_NAMED_BARRIERS();
-
-    auto bjs = [&](auto IdN) {
-        constexpr int id = IdN.value;
-        if      constexpr (id == 1) { s_barrier_join_ptr(&__nbar_1); __builtin_amdgcn_s_barrier_signal(1); }
-        else if constexpr (id == 2) { s_barrier_join_ptr(&__nbar_2); __builtin_amdgcn_s_barrier_signal(2); }
-        else if constexpr (id == 3) { s_barrier_join_ptr(&__nbar_3); __builtin_amdgcn_s_barrier_signal(3); }
-        else if constexpr (id == 4) { s_barrier_join_ptr(&__nbar_4); __builtin_amdgcn_s_barrier_signal(4); }
-        else if constexpr (id == 5) { s_barrier_join_ptr(&__nbar_5); __builtin_amdgcn_s_barrier_signal(5); }
-        else                        { s_barrier_join_ptr(&__nbar_6); __builtin_amdgcn_s_barrier_signal(6); }
-    };
-    auto bjsw = [&](auto IdN) {
-        constexpr int id = IdN.value;
-        if      constexpr (id == 1) { s_barrier_join_ptr(&__nbar_1); __builtin_amdgcn_s_barrier_signal(1); __builtin_amdgcn_s_barrier_wait(1); }
-        else if constexpr (id == 2) { s_barrier_join_ptr(&__nbar_2); __builtin_amdgcn_s_barrier_signal(2); __builtin_amdgcn_s_barrier_wait(2); }
-        else if constexpr (id == 3) { s_barrier_join_ptr(&__nbar_3); __builtin_amdgcn_s_barrier_signal(3); __builtin_amdgcn_s_barrier_wait(3); }
-        else if constexpr (id == 4) { s_barrier_join_ptr(&__nbar_4); __builtin_amdgcn_s_barrier_signal(4); __builtin_amdgcn_s_barrier_wait(4); }
-        else if constexpr (id == 5) { s_barrier_join_ptr(&__nbar_5); __builtin_amdgcn_s_barrier_signal(5); __builtin_amdgcn_s_barrier_wait(5); }
-        else                        { s_barrier_join_ptr(&__nbar_6); __builtin_amdgcn_s_barrier_signal(6); __builtin_amdgcn_s_barrier_wait(6); }
-    };
+    // Producer/consumer synchronization uses a plain workgroup barrier
+    // (__builtin_amdgcn_s_barrier), mirroring the gfx950 flatmm-splitk pipeline:
+    // ONE s_barrier per K-step is the rendezvous between the 2 producer waves and
+    // the 2 consumer waves. The full-workgroup barrier is a memory fence, so a
+    // producer that has drained its TDM (s_wait_tensorcnt) before the barrier
+    // makes that slot's LDS write visible to the consumer wave after the barrier.
+    // No named barriers (DATA/FREE) are needed.
 
     const int wave_id = __builtin_amdgcn_readfirstlane((int)opus::waveid_in_workgroup());
     const int lane_id = (int)opus::lane_id();
     const bool is_producer = wave_id < T::kNumProducerWaves;
 
     // No cluster: each workgroup maps directly to one (tile_row, tile_col) tile
-    // via blockIdx and loads its own A/B tile (no TDM multicast). The TDM
-    // workgroup mask is "self only" (bit 0).
+    // via blockIdx and loads its own A/B tile. The TDM workgroup_mask MUST be 0:
+    // per MI400 SPG Table 80 / §4.10.3, a NON-ZERO D#.workgroup_mask makes
+    // TENSOR_LOAD_TO_LDS use CLUSTER_LOAD_ASYNC (cluster multicast) instead of
+    // GLOBAL_LOAD_ASYNC, and the multicast waits for the masked cluster peers to
+    // request (or the McEarlyTimeout). This kernel launches a PLAIN grid (no
+    // cluster), so any non-zero mask (even bit 0 "self") puts the TDM into the
+    // cluster path with no real cluster -> the arrival/timeout wait can deadlock
+    // (grid-size dependent). mask=0 selects the plain GLOBAL_LOAD_ASYNC path.
     const int tile_row = (int)__builtin_amdgcn_workgroup_id_x() * T::kBlockM;
     const int tile_col = (int)__builtin_amdgcn_workgroup_id_y() * T::kBlockN;
-    const uint16_t mask_a = 1u;
-    const uint16_t mask_b = 1u;
+    const uint16_t mask_a = 0u;
+    const uint16_t mask_b = 0u;
 
     const int stride_a = kargs.stride_a;
     const int stride_b = kargs.stride_b;
@@ -101,12 +94,6 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
     using WindowA = typename T::WindowA;
     using WindowB = typename T::WindowB;
 
-    if (!is_producer) {
-        s_barrier_init_ptr(&__nbar_1, T::kNumWaves); s_barrier_init_ptr(&__nbar_2, T::kNumWaves); s_barrier_init_ptr(&__nbar_3, T::kNumWaves);
-        s_barrier_init_ptr(&__nbar_4, T::kNumWaves); s_barrier_init_ptr(&__nbar_5, T::kNumWaves); s_barrier_init_ptr(&__nbar_6, T::kNumWaves);
-    }
-    __builtin_amdgcn_s_barrier();
-
     // ---- Producers: w0 fills A slots, w1 fills B slots (triple buffer). ----
     if (is_producer) {
         const int gk0 = k_step_beg * T::kBlockK;
@@ -125,69 +112,43 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
         // reads (it iterates m in [0, M)). Same idea for B/N below.
         const int row_extent_a = kargs.m - tile_row;
         const int row_extent_b = kargs.n - tile_col;
-        // Producer body, generic over prefetch depth (T::kNumSlots = 2 or 3).
-        // slot_b_bytes is the per-operand LDS slot stride (A: slot_a_b, B: slot_b_b).
-        // Compile-time dual specialization keeps every barrier id a literal and
-        // the slot ring (slot = k % kNumSlots) a compile-time constant per path.
-        // Runtime DATA-signal dispatchers (epilogue announces slots whose id is
-        // (k_steps-x) % kNumSlots, a runtime value). s_barrier_signal needs a
-        // literal id, so switch the runtime slot -> literal DATA id (1+slot).
-        auto bjs_data_rt = [&](int slot) __attribute__((always_inline)) {
-            if (slot == 0) bjs(opus::number<1>{});
-            else if (slot == 1) bjs(opus::number<2>{});
-            else bjs(opus::number<3>{});
-        };
 
-        // DECOUPLED run-ahead producer: keep kNumSlots TDMs in flight. Each main-
-        // loop step issues ONE prefetch into the just-freed slot, then waits for
-        // exactly the OLDEST outstanding TDM (s_wait_tensorcnt(kNumSlots-1), a
-        // FIXED count) and signals DATA for THAT completed (older) slot -- not the
-        // one just issued. This lets the producer run kNumSlots-1 steps ahead of
-        // the consumer (TDM loads complete in-order, SPG p.33). The first
-        // kNumSlots loads are issued in the prologue (no FREE wait: first use); the
-        // last kNumSlots-1 announces drain in the epilogue (no new issue).
+        // s_barrier producer (gfx950 flatmm-splitk style). Steps are issued
+        // strictly sequentially into a kNumSlots ring (slot = step % kNumSlots),
+        // so the LDS delta between consecutive loads is a fixed +slot_bytes,
+        // except a wrap (-(kNumSlots-1)*slot_bytes) when step % kNumSlots == 0.
+        //
+        // Schedule (per producer wave, A on w0 / B on w1):
+        //   * Prologue: issue the first min(kNumSlots, k_steps) loads (slots
+        //     0..nload-1) with NO barrier -- these slots are on first use.
+        //   * Loop j in [0, k_steps): s_wait_tensorcnt(0) fully drains every
+        //     outstanding TDM (so step j's LDS write has landed), then s_barrier
+        //     hands step j to the consumer. Draining ALL (not a counted partial
+        //     wait) keeps TDM->LDS visibility robust across the workgroup fence.
+        //   * Refill: after the barrier of iter j>=1 we issue the load for the
+        //     next step into slot (j-1)%kNumSlots. That slot was last read by the
+        //     consumer at iter j-1 (done before this barrier j) and is DISTINCT
+        //     from slot j%kNumSlots that the consumer reads this iter -- so the
+        //     async write never aliases the slot in use. The drain at iter j+1
+        //     lands it before its barrier.
         auto produce = [&](auto& w, int slot_bytes) __attribute__((always_inline)) {
-        if constexpr (T::kNumSlots == 3) {
-            // prologue: issue steps 0,1,2 -> slots 0,1,2 (3 in flight).
-            w.load_to_lds();
-            if (k_steps >= 2) { w.move(KStep, 0_I,0_I,0_I,0_I, slot_bytes); w.load_to_lds(); }
-            if (k_steps >= 3) { w.move(KStep, 0_I,0_I,0_I,0_I, slot_bytes); w.load_to_lds(); }
-            if (k_steps >= 3) {
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{});  // drain ALL: partial wait announces a slot whose TDM LDS write is not yet visible to the consumer wave (producer-side visibility gap, run-ahead races); draining all lets it land.
-                // issue step p into slot p%3, then drain ALL outstanding TDMs and
-                // announce the completed step p-2 (slot (p-2)%3). FREE[p%3] gates
-                // overwriting slot p%3 (consumer must be done with step p-3).
-                for (int p = 3; p < k_steps; ) {
-                    bjsw(opus::number<4>{}); w.move(KStep,0_I,0_I,0_I,0_I, -2*slot_bytes); w.load_to_lds(); __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<2>{}); if (++p >= k_steps) break;  // slot0 loaded; announce step p-2 slot1
-                    bjsw(opus::number<5>{}); w.move(KStep,0_I,0_I,0_I,0_I,    slot_bytes); w.load_to_lds(); __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<3>{}); if (++p >= k_steps) break;  // slot1 loaded; announce slot2
-                    bjsw(opus::number<6>{}); w.move(KStep,0_I,0_I,0_I,0_I,    slot_bytes); w.load_to_lds(); __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{}); ++p;                          // slot2 loaded; announce slot0
+            int loaded = 0;
+            auto load_next = [&]() __attribute__((always_inline)) {
+                if (loaded > 0) {
+                    const int delta = (loaded % T::kNumSlots == 0)
+                        ? -(T::kNumSlots - 1) * slot_bytes : slot_bytes;
+                    w.move(KStep, 0_I, 0_I, 0_I, 0_I, delta);
                 }
-                // epilogue: announce the last 2 still-in-flight steps (no issue).
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs_data_rt((k_steps - 2) % 3);
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs_data_rt((k_steps - 1) % 3);
-            } else if (k_steps == 2) {
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{});
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<2>{});
-            } else {  // k_steps == 1
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{});
+                w.load_to_lds();
+                ++loaded;
+            };
+            const int nload = opus_ctdm_ws_min_i(T::kNumSlots, k_steps);
+            for (int p = 0; p < nload; ++p) load_next();
+            for (int j = 0; j < k_steps; ++j) {
+                __builtin_amdgcn_s_wait_tensorcnt(0);   // step j (and all older) landed
+                __builtin_amdgcn_s_barrier();           // rendezvous: hand step j to consumer
+                if (loaded < k_steps && j >= 1) load_next();   // refill freed slot (j-1)%kNumSlots
             }
-        } else {  // kNumSlots == 2: run 1 step ahead. ids 1,2 / 4,5.
-            w.load_to_lds();                                                              // step0 -> slot0
-            if (k_steps >= 2) { w.move(KStep, 0_I,0_I,0_I,0_I, slot_bytes); w.load_to_lds(); }  // step1 -> slot1
-            if (k_steps >= 2) {
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{});  // drain ALL before announce (producer-side LDS visibility; see P=3 path)
-                for (int p = 2; p < k_steps; ) {
-                    bjsw(opus::number<4>{}); w.move(KStep,0_I,0_I,0_I,0_I, -slot_bytes); w.load_to_lds(); __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<2>{}); if (++p >= k_steps) break;  // slot0 loaded; announce step p-1 slot1
-                    bjsw(opus::number<5>{}); w.move(KStep,0_I,0_I,0_I,0_I,  slot_bytes); w.load_to_lds(); __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{}); ++p;                          // slot1 loaded; announce slot0
-                }
-                // epilogue: 1 step still in flight.
-                __builtin_amdgcn_s_wait_tensorcnt(0);
-                if (((k_steps - 1) & 1) == 0) bjs(opus::number<1>{});
-                else                          bjs(opus::number<2>{});
-            } else {  // k_steps == 1
-                __builtin_amdgcn_s_wait_tensorcnt(0); bjs(opus::number<1>{});
-            }
-        }
         };  // produce
 
         if (wave_id == 0) {
@@ -234,10 +195,18 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
     typename decltype(mma)::vtype_c reg_c;
     clear(reg_c);
 
-    auto consume = [&](auto Sn, auto AFirstN) __attribute__((always_inline)) {
-        constexpr int s = Sn.value;
+    // Per K-step consumer. The slot is now a RUNTIME index (slot = k % kNumSlots)
+    // because the single s_barrier rendezvous is shared by all waves; there is no
+    // per-slot named barrier to dispatch on a compile-time id anymore.
+    //
+    // The s_barrier at the top of each step rendezvous with the producer's
+    // matching barrier for the SAME K-step: after it, this slot's TDM->LDS write
+    // is visible (the producer drained s_wait_tensorcnt(0) before the barrier).
+    // The intra-slot ds-read / WMMA schedule (2-deep ping-pong, per-round drain)
+    // is preserved verbatim -- it fixes the WMMA-source WAR reg race, independent
+    // of the producer/consumer handshake.
+    auto consume_slot = [&](int s, auto AFirstN) __attribute__((always_inline)) {
         constexpr bool AFirst = AFirstN.value;
-        bjsw(opus::number<1 + s>{});
         // Explicit per-round (per-half) schedule, replacing the fragile
         // sched_group_barrier hints. Those mis-schedule on high-expand tiles
         // (e.g. tileM B_N=64 -> kExpN=4) and surface as deterministic NaN. Per
@@ -281,23 +250,12 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
             __builtin_amdgcn_sched_barrier(0);
             reg_c = mma(v_a[cur], v_b[cur], reg_c);
         }
-        // FREE: all of this slot's ds_reads are drained per-round above; the
-        // wall keeps the FREE signal AFTER the last WMMA so the run-ahead
-        // producer cannot overwrite a slot whose reads are still pending.
         __builtin_amdgcn_sched_barrier(0);
-        bjs(opus::number<4 + s>{});
     };
     auto run = [&](auto AFirstN) __attribute__((always_inline)) {
-        if constexpr (T::kNumSlots == 3) {
-            int k = 0;
-            for (; k + 3 <= k_steps; k += 3) { consume(0_I, AFirstN); consume(1_I, AFirstN); consume(2_I, AFirstN); }
-            const int rem = k_steps - k;
-            if (rem >= 1) consume(0_I, AFirstN);
-            if (rem >= 2) consume(1_I, AFirstN);
-        } else {  // kNumSlots == 2: unroll by 2 (slot = k % 2, ids 1,2 / 4,5).
-            int k = 0;
-            for (; k + 2 <= k_steps; k += 2) { consume(0_I, AFirstN); consume(1_I, AFirstN); }
-            if (k_steps - k >= 1) consume(0_I, AFirstN);
+        for (int k = 0; k < k_steps; ++k) {
+            __builtin_amdgcn_s_barrier();               // rendezvous: producer handed step k
+            consume_slot(k % T::kNumSlots, AFirstN);
         }
     };
     if (wave_split == 0) run(opus::true_type{});

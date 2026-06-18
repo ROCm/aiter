@@ -64,6 +64,7 @@ from opus_gemm_common import (
     a16w16_persistent_kernels_list_cpol_nooob,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
+    gfx1250_kernels_list,
     SPLITK_KIDS,
     NON_SPLITK_KIDS,
     BIAS_AWARE_KIDS,
@@ -176,6 +177,19 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
 
     if max_split_k < 1:
         return [0]
+
+    # 2-WG/CU co-residency cap: when wg_per_cu == 2 the grid (total workgroups,
+    # = ceil(M/B_M) * ceil(N/B_N) * split_k) MUST stay strictly < 512 (= 2 *
+    # 256-CU target) so the device holds it in a single 2-WG/CU wave and the
+    # per-CU TDM direct-copy request budget (2 * per-operand req < 256) is never
+    # oversubscribed across waves. Cap split_k accordingly; if even split_k==1
+    # already reaches 512 tiles, this wg==2 kid is not usable for this shape.
+    if getattr(k_inst, "wg_per_cu", 1) == 2:
+        num_tiles = _ceil_div(M, k_inst.B_M) * _ceil_div(N, k_inst.B_N)
+        grid_cap = (512 - 1) // num_tiles if num_tiles > 0 else 0
+        if grid_cap < 1:
+            return []
+        max_split_k = min(max_split_k, grid_cap)
 
     for kb in range(1, max_split_k + 1):
         candidates.add(kb)
@@ -744,6 +758,7 @@ a16w16_all_kernels = {
     **a16w16_persistent_kernels_list_cpol_nooob,
     **gfx942_nosplit_kernels_list,
     **gfx942_splitk_kernels_list,
+    **gfx1250_kernels_list,
 }
 
 # Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a
@@ -836,9 +851,11 @@ def generate_data(
     XQ = torch.randn((batch, m, k), dtype=dtype, device=device)
     WQ = torch.randn((batch, n, k), dtype=dtype, device=device)
     Y = torch.empty((batch, m, n), dtype=outdtype, device=device)
-    # bias dtype matches Y (match_d_out convention).
+    # bias dtype matches Y (match_d_out convention). Opus bias is per-output-
+    # feature (per-N): the splitk reduce folds a [N] / [batch, N] vector
+    # (see splitk_reduce_*.cuh "per-output-feature bias"), NOT per-row (M).
     if bias:
-        bias_t = torch.randn((batch, m), dtype=outdtype, device=device)
+        bias_t = torch.randn((batch, n), dtype=outdtype, device=device)
     else:
         bias_t = None
     return XQ, WQ, Y, bias_t
@@ -848,7 +865,7 @@ MAX_DELTA_SCALE = 0.1
 
 
 def opus_gemm_ref(XQ, WQ, bias=None, out_dtype=None):
-    """Reference matmul (+ optional per-row bias).
+    """Reference matmul (+ optional per-output-feature bias).
 
     out_dtype must match the tuner's Y.dtype so the post-run checkAllclose
     in mp_tuner.worker compares same-dtype tensors (mismatched dtype raises
@@ -857,14 +874,16 @@ def opus_gemm_ref(XQ, WQ, bias=None, out_dtype=None):
     -> bf16 -> bf16 path.
 
     bias is summed in fp32 to match the kernel-side fp32 acc + cast order;
-    accepted shapes are [M] (broadcast across batch) or [batch, M].
+    accepted shapes are [N] (broadcast across batch) or [batch, N]. Opus folds
+    a per-output-feature (per-N) bias, matching splitk_reduce_*.cuh.
     """
     if out_dtype is None:
         out_dtype = XQ.dtype
     acc = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2))
     if bias is not None:
-        # Per-row broadcast: unsqueeze last dim so bias [..., M] -> [..., M, 1] and add across N.
-        acc = acc + bias.float().unsqueeze(-1)
+        # Per-N broadcast: unsqueeze the M axis so bias [..., N] -> [..., 1, N]
+        # and add across M (acc is [batch, M, N]).
+        acc = acc + bias.float().unsqueeze(-2)
     return acc.to(out_dtype)
 
 
