@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""DPP helpers used by paged-attention kernels."""
-
 
 def _to_ir(v):
     """Coerce DSL Numeric values to raw MLIR values."""
