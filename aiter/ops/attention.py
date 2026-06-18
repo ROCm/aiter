@@ -480,21 +480,9 @@ def pa_decode_bf16_asm(
     if out is None:
         out = torch.empty(Q.shape, dtype=torch.bfloat16, device=device)
 
-    def _scale_tensor(scale: Optional[torch.Tensor]):
-        # tensor-only: None means identity (1.0); anything else must be a tensor.
-        # Normalizes to a 1-element fp32 contiguous tensor on the right device.
-        if scale is None:
-            return torch.tensor([1.0], dtype=torch.float32, device=device)
-        assert isinstance(
-            scale, torch.Tensor
-        ), f"scale must be a torch.Tensor (or None), got {type(scale)}"
-        return scale.to(device=device, dtype=torch.float32).reshape(-1)[:1].contiguous()
-
-    q_scale = _scale_tensor(query_scale)
-    # softmax_scale is passed BY VALUE (kernarg 0x60); the kernel applies it, so
-    # do NOT pre-fold it into key_scale.
-    k_scale = _scale_tensor(key_scale)
-    v_scale = _scale_tensor(value_scale)
+    # query/key/value_scale are 1-element fp32 dequant scales, passed straight to
+    # the kernel. softmax_scale is passed BY VALUE (kernarg 0x60); the kernel
+    # applies it, so do NOT pre-fold it into key_scale.
 
     if sink is None:
         # The kernel is compiled sink-enabled (always reads + merges the sink
@@ -512,9 +500,9 @@ def pa_decode_bf16_asm(
         kv_indices,
         context_lens,
         softmax_scale,
-        q_scale,
-        k_scale,
-        v_scale,
+        query_scale,
+        key_scale,
+        value_scale,
         out,
         qo_indptr,
         kv_indptr,
