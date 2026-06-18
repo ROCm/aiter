@@ -381,7 +381,7 @@ def gen_lookup_header_map(kernels_dict, istune=False):
             # 5-tuple key: (gfx, cu_num, M, N, K)
             # 6-tuple key: (gfx, cu_num, B, M, N, K)
             # key[0] is the gfx arch string; the remaining elements are ints.
-            yield (key, k.name)
+            yield ((f'"{key[0]}"', key[1:]), k.name)
         elif istune and isinstance(key, int) and key >= 0:
             yield (key, k.name)
 
@@ -418,16 +418,11 @@ def write_lookup_header(
                 # 6-tuple key: (gfx, cu_num, B, M, N, K)
                 # key[0] is the gfx arch string; the remaining elements are ints.
                 cpp_key = (
-                    '{"' + key[0] + '", ' + ", ".join(str(x) for x in key[1:]) + "}"
-                )
-                f.write(
-                    lookup_template.format(
-                        MNK=cpp_key,
-                        kernel_name=name,
-                    )
+                    "{" + ", ".join(str(x) for x in key) + "}"
                 )
             else:
-                f.write(lookup_template.format(MNK=key, kernel_name=name))
+                cpp_key = key
+            f.write(lookup_template.format(MNK=cpp_key, kernel_name=name))
         f.write(lookup_end)
 
 
