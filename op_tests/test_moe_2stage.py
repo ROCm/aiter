@@ -365,14 +365,13 @@ def test_fmoe(
         w2_qt_aiter = shuffle_weight_a16w4(_w2q, 16, False)
         w1_scale_aiter = shuffle_scale_a16w4(_w1s, E, True)
         w2_scale_aiter = shuffle_scale_a16w4(_w2s, E, False)
-        w1_qt_aiter.gemm1_backend = "flydsl"
-        w2_qt_aiter.gemm2_backend = "flydsl"
-        # shuffle_kind="mxfp4_guinterleave" selects the FlyDSL PORT (gemm{1,2}_a4w4
-        # flydsl) and its own tuned CSV rows (_tag=mxfp4_guinterleave), separate from
-        # the HIP mxfp4_moe backend -- so port-only kernels (BM64/cshuffle) never reach
-        # the HIP gemm.
-        w1_qt_aiter.shuffle_kind = "mxfp4_guinterleave"
-        w2_qt_aiter.shuffle_kind = "mxfp4_guinterleave"
+        # shuffle_kind="mxfp4_moe" alone selects the FlyDSL a4w4 PORT: it routes to
+        # _mxfp4_moe_run, implies the flydsl gemm backend (no explicit gemm{1,2}_backend
+        # needed), and looks up the tuned CSV rows tagged "mxfp4_moe" -- so the tuned
+        # port kernels (BM64/cshuffle) are actually exercised rather than the M-adaptive
+        # synthesis fallback. (randomflow's HIP backend uses "mxfp4_guinterleave".)
+        w1_qt_aiter.shuffle_kind = "mxfp4_moe"
+        w2_qt_aiter.shuffle_kind = "mxfp4_moe"
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,

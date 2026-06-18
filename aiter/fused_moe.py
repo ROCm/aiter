@@ -36,14 +36,17 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
-# mxfp4_moe pipeline kinds (w1.shuffle_kind / CSV `_tag`). Both use the same a16w4
-# gate/up-interleaved weight+scale layout; the kind selects the gemm engine and the
-# tuned-CSV set so the two backends can be tuned/dispatched independently:
-#   "mxfp4_moe"          -> HIP MFMA gemm (PR #3470 backend)
-#   "mxfp4_guinterleave" -> FlyDSL port gemm (gemm{1,2}_a4w4 flydsl); implies flydsl
-# Both route through _mxfp4_moe_run; only the per-kernel gemm backend differs.
-_MXFP4_PORT_KIND = "mxfp4_guinterleave"
-_MXFP4_KINDS = ("mxfp4_moe", _MXFP4_PORT_KIND)
+# mxfp4 a4w4 MoE backends share the a16w4 gate/up-interleaved weight+scale layout
+# but ship identically-named CSV kernels, so w1.shuffle_kind (== CSV `_tag`) both
+# routes the request and selects the gemm backend + the tuned-CSV set:
+#   "mxfp4_moe"          -> FlyDSL port (gemm{1,2}_a4w4 flydsl) via _mxfp4_moe_run;
+#                           the kind alone implies the flydsl gemm backend
+#   "mxfp4_guinterleave" -> randomflow's HIP a4w4 MoE (#3470) via mxfp4_moe_run
+#                           (on-device 1stage, mxfp4_hip)
+# Only "mxfp4_moe" is a flydsl-port kind (drives synthesis + the flydsl backend);
+# "mxfp4_guinterleave" is dispatched separately in get_2stage_cfgs.
+_MXFP4_PORT_KIND = "mxfp4_moe"
+_MXFP4_KINDS = (_MXFP4_PORT_KIND,)
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -1592,9 +1595,9 @@ def _mxfp4_moe_run(
     prologue_name = "inline_quant" if inline_quant else "threestage"
 
     # FlyDSL gemm1/gemm2 backend. Explicit gemm{1,2}_backend tag wins; otherwise the
-    # port kind (shuffle_kind=="mxfp4_guinterleave") implies flydsl so the tag alone
-    # fully selects the backend (HIP rows can't accidentally drive flydsl-only kernels
-    # and vice-versa). Read before any .view() that would drop the attribute.
+    # port kind (shuffle_kind=="mxfp4_moe") implies flydsl so the tag alone fully
+    # selects the backend (HIP rows can't accidentally drive flydsl-only kernels and
+    # vice-versa). Read before any .view() that would drop the attribute.
     _port_kind = getattr(w1, "shuffle_kind", None) == _MXFP4_PORT_KIND
     gemm1_backend = getattr(w1, "gemm1_backend", None) or (
         "flydsl" if _port_kind else None
