@@ -534,6 +534,18 @@ def _a16w16_kbuf1_sk_bf16ws_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     return _with_bf16_splitk_workspace(inst, "splitk_legacy_bf16ws")
 
 
+def _a16w16_kbuf2v_sk_bf16ws_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """SplitK P1 with bf16 workspace."""
+    inst = _a16w16_kbuf2v_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk)
+    return _with_bf16_splitk_workspace(inst, "splitk_p1_bf16ws")
+
+
+def _a16w16_kbuf2v_bk128_sk_bf16ws_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """SplitK P1 B_K=128 with bf16 workspace."""
+    inst = _a16w16_kbuf2v_bk128_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk)
+    return _with_bf16_splitk_workspace(inst, "splitk_p1_bk128_bf16ws")
+
+
 # gfx942 P1-family non-splitK factories (siblings of corresponding splitK kids).
 def _a16w16_p1_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     """Non-splitK P1 (K-dbuf depth=2 + V-dbuf), sibling of 10201."""
@@ -618,6 +630,7 @@ gfx942_nosplit_kernels_list = {
     10301: _a16w16_wave_k_coop_gfx942(512, 16, 32, 32,    1, 16, 16, 16),  # WKC 16x32, B_K=32
     10302: _a16w16_wave_k_coop_gfx942(512, 32, 16, 64,    1, 16, 16, 16),  # WKC 32x16, aliased partial
     10303: _a16w16_wave_k_coop_gfx942(256, 32, 32, 64,    1, 16, 16, 16),  # WKC 32x32, T_K=4
+    10305: _a16w16_wave_k_coop_gfx942(512, 16, 32, 64,    1, 16, 16, 16),  # WKC 16x32, B_K=64
     10310: _a16w16_wave_k_coop_accum_gfx942(256, 16, 16, 64, 1, 16, 16, 16),  # WKC 16x16 split8 atomic accumulate
     10311: _a16w16_wave_k_coop_accum_gfx942(512, 16, 32, 32, 1, 16, 16, 16),  # WKC 16x32 split8 atomic accumulate
     10312: _a16w16_wave_k_coop_accum_gfx942(512, 32, 16, 64, 1, 16, 16, 16),  # WKC 32x16 split8 atomic accumulate
@@ -633,6 +646,8 @@ gfx942_splitk_kernels_list = {
     10204: _a16w16_em3en4_lds1_pgr2_sk_gfx942 (256, 128,  96, 128,    2, 16, 16, 16),                # EM3EN4 LDS1/PGR2 hipb-orientation (host 128M x 96N)
     10205: _a16w16_kbuf1_sk_gfx942      (512,  64, 128,  64,    4, 16, 16, 16),                # legacy 4-phase M64 x N128
     10210: _a16w16_kbuf1_sk_bf16ws_gfx942(512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile + bf16 workspace
+    10211: _a16w16_kbuf2v_sk_bf16ws_gfx942(256,  64,  64,  64,    2, 16, 16, 16),                # P1 depth=2 + bf16 workspace
+    10213: _a16w16_kbuf2v_bk128_sk_bf16ws_gfx942(256, 64,  64, 128,    2, 16, 16, 16),           # P1 B_K=128 + bf16 workspace
 }
 
 # NOTE: 10402 (a16w16_naive_64x64) was removed -- 32.85us never matched WKC's
@@ -760,10 +775,13 @@ HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
         10204,  # gfx942 splitk_em3en4_lds1_pgr2 256x128x96x128 hipb-orientation
         10205,  # gfx942 splitk_legacy    512x64x128x64 16x16x16
         10210,  # gfx942 splitk_legacy_bf16ws 512x128x128x64
+        10211,  # gfx942 splitk_p1_bf16ws 256x64x64x64
+        10213,  # gfx942 splitk_p1_bk128_bf16ws 256x64x64x128
         10300,  # gfx942 wave_k_coop     512x16x16x64 T_K=8
         10301,  # gfx942 wave_k_coop     512x16x32x32 T_K=8
         10302,  # gfx942 wave_k_coop     512x32x16x64 T_K=8
         10303,  # gfx942 wave_k_coop     256x32x32x64 T_K=4
+        10305,  # gfx942 wave_k_coop     512x16x32x64 T_K=8
     }
 )
 

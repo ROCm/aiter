@@ -355,6 +355,44 @@ void load_wkc_e1n2_tile(opus::array<short4_ab, 2>& v_a,
     v_b[3] = load_b_mfma_operand<T>(smem_b_base, wave_slab_id, 1, 1, u_ub);
 }
 
+template<typename T, int E_K, typename U_A, typename U_B>
+__device__ __forceinline__
+void load_wkc_e1n2_k(opus::array<short4_ab, 4>& v_a,
+                     opus::array<short4_ab, 8>& v_b,
+                     const char* smem_a_base,
+                     const char* smem_b_base,
+                     int wave_slab_id,
+                     const U_A& u_ua,
+                     const U_B& u_ub)
+{
+    v_a[E_K] = load_a_mfma_operand<T>(
+        smem_a_base, wave_slab_id, 0, E_K, u_ua);
+    v_b[E_K] = load_b_mfma_operand<T>(
+        smem_b_base, wave_slab_id, 0, E_K, u_ub);
+    v_b[4 + E_K] = load_b_mfma_operand<T>(
+        smem_b_base, wave_slab_id, 1, E_K, u_ub);
+}
+
+template<typename T, typename U_A, typename U_B>
+__device__ __forceinline__
+void load_wkc_e1n2k4_tile(opus::array<short4_ab, 4>& v_a,
+                          opus::array<short4_ab, 8>& v_b,
+                          const char* smem_a_base,
+                          const char* smem_b_base,
+                          int wave_slab_id,
+                          const U_A& u_ua,
+                          const U_B& u_ub)
+{
+    load_wkc_e1n2_k<T, 0>(v_a, v_b, smem_a_base, smem_b_base,
+                          wave_slab_id, u_ua, u_ub);
+    load_wkc_e1n2_k<T, 1>(v_a, v_b, smem_a_base, smem_b_base,
+                          wave_slab_id, u_ua, u_ub);
+    load_wkc_e1n2_k<T, 2>(v_a, v_b, smem_a_base, smem_b_base,
+                          wave_slab_id, u_ua, u_ub);
+    load_wkc_e1n2_k<T, 3>(v_a, v_b, smem_a_base, smem_b_base,
+                          wave_slab_id, u_ua, u_ub);
+}
+
 template<typename T, typename U_A>
 __device__ __forceinline__
 void load_wkc_e2n2_a_tile(opus::array<short4_ab, 2>& v_a,
@@ -422,6 +460,23 @@ void phase_wkc_e1n2k2(opus::array<short4_ab, 2>& v_a,
 {
     v_c = mma.step_k(0_I, v_a, v_b, v_c);
     v_c = mma.step_k(1_I, v_a, v_b, v_c);
+}
+
+template<typename MMA>
+__device__ __forceinline__
+void phase_wkc_e1n2k4(opus::array<short4_ab, 4>& v_a,
+                      opus::array<short4_ab, 8>& v_b,
+                      opus::array<float4_acc, 2>& v_c,
+                      MMA& mma)
+{
+    s_waitcnt_lgkmcnt(9_I);
+    v_c = mma.step_k(0_I, v_a, v_b, v_c);
+    s_waitcnt_lgkmcnt(6_I);
+    v_c = mma.step_k(1_I, v_a, v_b, v_c);
+    s_waitcnt_lgkmcnt(3_I);
+    v_c = mma.step_k(2_I, v_a, v_b, v_c);
+    s_waitcnt_lgkmcnt(0_I);
+    v_c = mma.step_k(3_I, v_a, v_b, v_c);
 }
 
 template<typename T, int K_NEXT, typename U_A, typename U_B>
@@ -545,6 +600,30 @@ void wkc_compute_tile(const char* smem_a_base,
     v_c[0] = acc[0];
     v_c[1] = acc[1];
     phase_wkc_e2n1k4(v_a, v_b, v_c, mma);
+    acc[0] = v_c[0];
+    acc[1] = v_c[1];
+}
+
+template<typename T, typename U_A, typename U_B>
+__device__ __forceinline__
+void wkc_compute_tile(const char* smem_a_base,
+                      const char* smem_b_base,
+                      int wave_slab_id,
+                      const U_A& u_ua,
+                      const U_B& u_ub,
+                      float4_acc* acc,
+                      wkc_tile_tag<1, 2, 4>)
+{
+    auto mma = make_wkc_tiled_mma<1, 2, 4>();
+    opus::array<short4_ab, 4> v_a;
+    opus::array<short4_ab, 8> v_b;
+    opus::array<float4_acc, 2> v_c;
+
+    load_wkc_e1n2k4_tile<T>(
+        v_a, v_b, smem_a_base, smem_b_base, wave_slab_id, u_ua, u_ub);
+    v_c[0] = acc[0];
+    v_c[1] = acc[1];
+    phase_wkc_e1n2k4(v_a, v_b, v_c, mma);
     acc[0] = v_c[0];
     acc[1] = v_c[1];
 }
