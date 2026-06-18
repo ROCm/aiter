@@ -39,7 +39,8 @@ namespace aiter {
 // corresponding dim = input_dim / ngpus.
 enum class ReduceScatterSplitDim : int { kFirst = 0, kLast = 1, kMid = 2 };
 
-constexpr int kMaxBlocks = 256;
+constexpr int kMaxBlocks    = 256;
+constexpr int kMaxBlocksLegacy = 80;
 // note: we don't want to use atomics for signals because peer atomics are no
 // supported on PCIe links
 struct Signal
@@ -2283,7 +2284,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
     int block_size  = hidden_dim / pack_size;
     int padded_size = (block_size + 31) / 32 * 32;
     int m           = size / hidden_dim;
-    if(m > kMaxBlocks)
+    if(m > kMaxBlocksLegacy)
         throw std::runtime_error(
             "Token number is too large for allreduce_fusion_kernel_1stage_mxfp4 kernel");
     dim3 grid(m);
@@ -2302,7 +2303,7 @@ void allreduce_fusion_kernel_1stage_mxfp4_launcher(
 //          tensor), adds the residual, RMSNorms, and runs the MXFP4 epilogue.
 //
 // Compared to the 1-stage variant this:
-//   * supports m > kMaxBlocks via grid-stride looping in stage 2,
+//   * supports m > kMaxBlocksLegacy via grid-stride looping in stage 2,
 //   * keeps the stage-1 numerics identical to the per-group 2-stage kernel
 //     (sum in fp32, downcast to T before storing in tmp), which matches the
 //     unfused (allreduce -> RMSNorm -> dynamic_mxfp4_quant) reference.
@@ -2426,7 +2427,7 @@ void allreduce_fusion_kernel_2stage_mxfp4_launcher(
             std::to_string(BLOCK_SIZE) + " ngpus=" + std::to_string(NGPUS));
     int padded_block_size = (BLOCK_SIZE + 31) / 32 * 32;
     dim3 threadsPerBlock(padded_block_size);
-    token_num = std::min(token_num, kMaxBlocks);
+    token_num = std::min(token_num, kMaxBlocksLegacy);
     dim3 numBlocks(token_num);
     size_t smem_size = padded_block_size * sizeof(typename opus::vector_t<T, PACK_SIZE>);
     allreduce_fusion_kernel_2stage_mxfp4<T, NGPUS>
@@ -2460,7 +2461,7 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
     // pad to next multiple of WARP_SIZE for correct block reduction
     int LAUNCH_THREADS       = ((OUT_BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
     int token_num            = size / hidden_dim;
-    if(token_num > kMaxBlocks)
+    if(token_num > kMaxBlocksLegacy)
         throw std::runtime_error(
             "Token number is too large for allreduce_fusion_kernel_1stage kernel");
     dim3 threadsPerBlock(LAUNCH_THREADS);
@@ -2655,7 +2656,7 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
         throw std::runtime_error(
             "Invalid qk hidden dim layout for qknorm_allreduce_fusion_kernel_2stage kernel");
     dim3 threadsPerBlock(BLOCK_SIZE);
-    int grid_blocks = std::min(token_num, kMaxBlocks);
+    int grid_blocks = std::min(token_num, kMaxBlocksLegacy);
     dim3 numBlocks(grid_blocks);
     qknorm_allreduce_fusion_kernel_2stage<T, NGPUS, WARP_SIZE>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
@@ -2789,7 +2790,7 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
     int token_num           = size / hidden_dim;
     dim3 threadsPerBlock(BLOCK_SIZE);
-    token_num = std::min(token_num, kMaxBlocks);
+    token_num = std::min(token_num, kMaxBlocksLegacy);
     dim3 numBlocks(token_num);
     size_t smem_size = BLOCK_SIZE * sizeof(typename opus::vector_t<T, PACK_SIZE>);
     allreduce_fusion_kernel_2stage<T, OutT, NGPUS>
@@ -2906,7 +2907,7 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
     int token_num           = size / hidden_dim;
     dim3 threadsPerBlock(BLOCK_SIZE);
-    token_num = std::min(token_num, kMaxBlocks);
+    token_num = std::min(token_num, kMaxBlocksLegacy);
     dim3 numBlocks(token_num);
     size_t smem_size = BLOCK_SIZE * sizeof(typename opus::vector_t<T, PACK_SIZE>);
     allreduce_fusion_kernel_2stage_per_group<T, OutT, NGPUS>
@@ -3119,7 +3120,7 @@ void allreduce_mhc_post_split_launcher(RankData* _dp,
     const int size = m * input_hidden_dim;
     dim3 block(512);
     int block_num = ((size / NGPUS) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, kMaxBlocks));
+    dim3 grid(std::min(block_num, kMaxBlocksLegacy));
     switch(NGPUS)
     {
     case 8:
@@ -3638,8 +3639,8 @@ class CustomAllreduce
         throw std::runtime_error("custom allreduce currently requires input length to be multiple "
                                  "of " +
                                  std::to_string(d));
-    if(block_limit > kMaxBlocks)
-        throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) +
+    if(block_limit > kMaxBlocksLegacy)
+        throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocksLegacy) +
                                  ". Got " + std::to_string(block_limit));
 
     RankData* input_ptrs  = get_buffer_RD(stream, input);
@@ -3705,12 +3706,12 @@ class CustomAllreduce
         }
         if(call_1stage)
         {
-            blocks = std::min(kMaxBlocks,
+            blocks = std::min(kMaxBlocksLegacy,
                               (size + (threads / world_size_) - 1) / (threads / world_size_));
         }
         else if(call_2stage)
         {
-            blocks = std::min(kMaxBlocks,
+            blocks = std::min(kMaxBlocksLegacy,
                               (size / world_size_ + (threads / world_size_) - 1) /
                                   (threads / world_size_));
             if(world_size_ == 8 && bytes > 512 * 4096 * 2 &&
@@ -3837,7 +3838,7 @@ void dispatchReduceScatter(hipStream_t stream, T* input, T* output,
 {
     RankData* ptrs          = get_buffer_RD(stream, input);
     constexpr int pack_size = 16 / sizeof(T);
-    constexpr int kGridCap  = 80;  // bounded by signal slots (see kMaxBlocks)
+    constexpr int kGridCap  = kMaxBlocksLegacy;
 
     switch(split_dim)
     {
@@ -4574,7 +4575,7 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
     auto pack_size   = 16 / sizeof(T);
     int  block_size  = n / (int)pack_size;
     bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
-    bool can_1stage  = use_1stage && n_constrain && (m <= kMaxBlocks);
+    bool can_1stage  = use_1stage && n_constrain && (m <= kMaxBlocksLegacy);
     // 2-stage budget mirrors the per-group FP8 dispatcher: 512 KiB of input
     // bytes is the largest size where keeping the full reduction in shared
     // memory still beats the split (reduce-scatter + local) variant.
@@ -4587,7 +4588,7 @@ void dispatchFusedAllReduceRMSNormQuantMXFP4(hipStream_t stream,
         throw std::runtime_error(
             "MXFP4 fused kernel: unsupported shape m=" + std::to_string(m) +
             " n=" + std::to_string(n) + " (1-stage requires use_1stage && m<=" +
-            std::to_string(kMaxBlocks) +
+            std::to_string(kMaxBlocksLegacy) +
             ", 2-stage requires hidden_dim/PACK_SIZE divisible by world_size, "
             "bf16 side-output requires hidden_dim/PACK_SIZE divisible by 32, and "
             "size*sizeof(T) <= 512 KiB)");
@@ -4708,7 +4709,7 @@ void dispatchAllReduceMhcPost1Stage(hipStream_t stream,
     RankData* ptrs        = get_buffer_RD(stream, input);
     const bool use_two_way = m >= 8192;
     dim3 block(use_two_way ? n_packs * 2 : n_packs);
-    dim3 grid(std::min(m, kMaxBlocks));
+    dim3 grid(std::min(m, kMaxBlocksLegacy));
 
 #define DISPATCH_AR_MHC_POST_IMPL(NGPUS, TWO_WAY)                               \
     allreduce_mhc_post_large_m_kernel<T, NGPUS, 4, TWO_WAY>                     \
