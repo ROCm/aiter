@@ -125,7 +125,10 @@ def build_flash_attn_fp8_module(
     # ---- LDS layout (fp8 element type) ----
     # K tile : [BLOCK_N kv][HEAD_DIM d]          row-major
     # V tile : [HEAD_DIM d][BLOCK_N kv] (fp8)    *transposed* (Step 1)
-    # P tile : [BLOCK_M q][BLOCK_N kv] (fp8)     row-major, per workgroup
+    #
+    # P is NOT in LDS (Step 1, register-resident): the GEMM1 C-layout P is
+    # packed to fp8 in registers and reshaped into the GEMM2 B-operand via an
+    # intra-wave cross-lane shuffle (hi-peer exchange), so no LDS round-trip.
     #
     # V is laid out transposed so the GEMM2 A-operand fragment
     #   A_frag[L][v] = V[kv = hi*32 + v, d = lo + dt*32]
@@ -134,7 +137,6 @@ def build_flash_attn_fp8_module(
     # old 32 single-byte strided gathers.
     K_STRIDE = HEAD_DIM
     V_STRIDE = BLOCK_N  # transposed: stride over kv per d-row
-    P_STRIDE = BLOCK_N
     # Step 2: double-buffer K and V (ping-pong by KV-tile parity) so the
     # global load for tile i+1 overlaps the MFMA compute of tile i.
     NUM_BUF = 2
@@ -142,11 +144,9 @@ def build_flash_attn_fp8_module(
     LDS_V_TILE = HEAD_DIM * V_STRIDE
     LDS_K_SIZE = NUM_BUF * LDS_K_TILE
     LDS_V_SIZE = NUM_BUF * LDS_V_TILE
-    LDS_P_SIZE = BLOCK_M * P_STRIDE
     LDS_K_OFF = 0
     LDS_V_OFF = LDS_K_OFF + LDS_K_SIZE
-    LDS_P_OFF = LDS_V_OFF + LDS_V_SIZE
-    LDS_TOTAL = LDS_P_OFF + LDS_P_SIZE
+    LDS_TOTAL = LDS_V_OFF + LDS_V_SIZE
 
     allocator = SmemAllocator(
         None,
@@ -426,41 +426,31 @@ def build_flash_attn_fp8_module(
             tile_sum = _fadd(local_sum, peer_sum)
             l_new = _fadd(_fmul(corr, l_running), tile_sum)
 
-            # ---- Write P to LDS in [q, kv] layout (fp8 stored as i8) ----
-            # C-layout coord: kv = hi*4 + (r%4) + 8*(r//4) (+ nt*32); q = lo.
-            # P_lds is shared by all 8 waves, so the row index must be the
-            # block-local q = wave_q_offset + lo (NOT just lo, which would
-            # make every wave collide on the same 32 rows).
-            # The C-layout value index r maps to kv = hi*4 + (r%4) + 8*(r//4)
-            # (+ nt*32).  For each group rg = r//4 the four values r=rg*4+0..3
-            # land on CONTIGUOUS kv = hi*4 + 8*rg + nt*32 + {0,1,2,3}, so pack
-            # them into one i32 (4 fp8 bytes) and emit a single b32 LDS store
-            # instead of four byte stores (16 -> 4 stores per kv subtile).
-            p_q_local = wave_q_offset + lo
+            # ---- Build the GEMM2 P B-operand directly in registers ----
+            # (Step 1: no LDS round-trip.)  In the GEMM1 C-layout a lane holds
+            # P[kv = hi*4 + (r%4) + 8*(r//4) + nt*32, q = lo].  The four values
+            # r = rg*4 + {0..3} land on CONTIGUOUS kv = hi*4 + 8*rg + nt*32 +
+            # {0..3}, so pack each group into one i32 (4 fp8 bytes): myword[nt][rg].
             i32_dtype = fx.Int32
+            n_groups = C_F32_PER_LANE // 4  # 4
+            myword = [[None] * n_groups for _ in range_constexpr(N_KV_TILES)]
             for nt in range_constexpr(N_KV_TILES):
-                for rg in range_constexpr(C_F32_PER_LANE // 4):
+                for rg in range_constexpr(n_groups):
                     base = rg * 4
-                    word = _f32x4_to_fp8_word(
+                    myword[nt][rg] = _f32x4_to_fp8_word(
                         p_vals[nt][base + 0],
                         p_vals[nt][base + 1],
                         p_vals[nt][base + 2],
                         p_vals[nt][base + 3],
                     )
-                    kv_row = hi * 4 + 8 * rg + nt * 32
-                    p_idx = (
-                        fx.Index(LDS_P_OFF) + p_q_local * P_STRIDE + fx.Index(kv_row)
+            # peerword[nt][rg] = the hi-peer lane's myword[nt][rg], fetched via
+            # an intra-wave cross-lane shuffle (lane ^ 32 swaps hi=0 <-> hi=1).
+            peerword = [[None] * n_groups for _ in range_constexpr(N_KV_TILES)]
+            for nt in range_constexpr(N_KV_TILES):
+                for rg in range_constexpr(n_groups):
+                    peerword[nt][rg] = fx.Int32(myword[nt][rg]).shuffle_xor(
+                        fx.Int32(32), fx.Int32(WARP_SIZE)
                     )
-                    # Store the i32 as 4 contiguous int8 bytes at p_idx:
-                    # vec<1xi32> -> bitcast -> vec<4xi8>.
-                    word_vec = Vec.from_elements([fx.Int32(word)], i32_dtype)
-                    Vec(word_vec).bitcast(i8_dtype).store(lds, [p_idx])
-            # P round-trip is intra-wave (each wave writes & reads only its own
-            # 32 P rows), but a lane reads kv columns written by its hi-peer
-            # lane in the same wave -> only an LDS fence is needed, NOT a full
-            # workgroup barrier.  s_waitcnt lgkmcnt(0) (keep vm/exp maxed):
-            #   vmcnt[3:0]=0xF, expcnt[2:0]=0x7, lgkmcnt[3:0]=0x0, vmcnt[5:4]=0x3
-            rocdl.s_waitcnt(0xC07F)
 
             # ===============================================================
             # GEMM2: O[d,q] += V^T @ P
@@ -468,12 +458,28 @@ def build_flash_attn_fp8_module(
             #   B = P   : B_frag[L][v] = P[kv = hi*32+v, q = lo]
             # both read along kv = hi*32+v (contiguous 32 kv).
             # ===============================================================
-            # B (P) packs: read 32 contiguous kv for q = lo from LDS P[q, kv].
-            # P_lds is [q, kv] row-major so P[lo, hi*32 : hi*32+32] is
-            # contiguous.
-            p_idx_b = fx.Index(LDS_P_OFF) + p_q_local * P_STRIDE + hi * 32
-            p_pack = Vec.load(v_i8x32, lds, [p_idx_b])
-            p_pack = Vec(p_pack).bitcast(fx.Int32)
+            # B (P) word w covers kv = hi*32 + 4w .. +3.  Solving the C-layout
+            # map, the source is nt = hi, rg = w//2, hi_src = w%2:
+            #   - hi_src == hi -> this lane's myword[hi][w//2]
+            #   - hi_src != hi -> the hi-peer's word == peerword[hi][w//2]
+            # hi is runtime; (w%2) is compile-time, so the parity test collapses
+            # to a single select on (hi == 0) per word.
+            hi_is0 = hi < fx.Index(1)
+            p_words = []
+            for w in range_constexpr(8):
+                rg = w // 2
+                if const_expr(w % 2 == 0):
+                    # hi==0 -> myword[0][rg]; hi==1 -> peerword[1][rg]
+                    sel = ArithValue(hi_is0).select(
+                        _raw(myword[0][rg]), _raw(peerword[1][rg])
+                    )
+                else:
+                    # hi==0 -> peerword[0][rg]; hi==1 -> myword[1][rg]
+                    sel = ArithValue(hi_is0).select(
+                        _raw(peerword[0][rg]), _raw(myword[1][rg])
+                    )
+                p_words.append(fx.Int32(sel))
+            p_pack = Vec.from_elements(p_words, i32_dtype)
 
             # Rescale O accumulators by corr before adding this tile.
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
