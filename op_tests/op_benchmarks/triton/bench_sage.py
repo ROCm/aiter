@@ -982,7 +982,10 @@ def benchmark_single_case(
     fn = make_kernel_runner(args, q, k, v, block_lut=block_lut)
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
-    if args.compare_to_ref:
+    # perf_report invokes this body once per metric column (provider); gate the
+    # (expensive, side-effecting) reference comparison to a single provider so
+    # the cosine block is printed exactly once even when several metrics show.
+    if args.compare_to_ref and "time(ms)" in provider:
         current_primary = primary_output(fn())
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
