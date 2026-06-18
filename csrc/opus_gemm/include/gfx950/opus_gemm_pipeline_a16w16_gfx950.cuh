@@ -212,17 +212,39 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         constexpr int C = T::SWIZZLE_C;
         int xy = wgid;
         int blocks_per_cycle = nXCD * C;
+        int tid_per_group = W * num_tiles_n;
         int limit = (total_wgs / blocks_per_cycle) * blocks_per_cycle;
         if (xy >= limit) {
-            tile_m_id = xy / num_tiles_n;
-            tile_n_id = xy % num_tiles_n;
+            // Swizzle covers new_xy ∈ [0, limit) contiguously. Within that,
+            // (limit / tid_per_group) groups are full; the remainder lands in
+            // a partial last group covering (covered_cols) complete tn
+            // columns. The original fallback `xy/num_tiles_n` jumps row-major
+            // from xy without accounting for those holes, dropping the
+            // (partial_first_row..end, covered_cols..num_tiles_n) rectangle.
+            int full_groups = limit / tid_per_group;
+            int covered_cols = (limit - full_groups * tid_per_group) / W;
+            int partial_first_row = full_groups * W;
+            int partial_row_extent = num_tiles_m - partial_first_row;
+            if (partial_row_extent > W) partial_row_extent = W;
+            int f = xy - limit;
+            int remaining_in_partial =
+                (partial_row_extent > 0)
+                    ? (num_tiles_n - covered_cols) * partial_row_extent
+                    : 0;
+            if (f < remaining_in_partial) {
+                tile_m_id = partial_first_row + (f % partial_row_extent);
+                tile_n_id = covered_cols + (f / partial_row_extent);
+            } else {
+                int g = f - remaining_in_partial;
+                tile_m_id = (partial_first_row + partial_row_extent) + g / num_tiles_n;
+                tile_n_id = g % num_tiles_n;
+            }
         } else {
             int xcd = xy % nXCD;
             int local = xy / nXCD;
             int chunk_idx = local / C;
             int pos = local % C;
             int new_xy = xcd * C + chunk_idx * blocks_per_cycle + pos;
-            int tid_per_group = W * num_tiles_n;
             int group_id = new_xy / tid_per_group;
             int first_row = group_id * W;
             int win_h = num_tiles_m - first_row;
@@ -302,19 +324,19 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
     int tic = 0, toc = 1;
 
     // Prologue
-    async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0), opus::number<T::CACHECTL_B>{});
-    async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0), opus::number<T::CACHECTL_A>{});
-    async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0), opus::number<T::CACHECTL_B>{});
-    async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0), opus::number<T::CACHECTL_A>{});
+    async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
+    async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
+    async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
+    async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
 
     if (wave_id_m == 1) __builtin_amdgcn_s_barrier();
 
     s_waitcnt_vmcnt(number<T::a_buffer_load_insts + T::b_buffer_load_insts>{});
     __builtin_amdgcn_s_barrier();
 
-    async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1), opus::number<T::CACHECTL_B>{});
-    async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, 1), opus::number<T::CACHECTL_A>{});
-    async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, 1), opus::number<T::CACHECTL_B>{});
+    async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
+    async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, 1), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
+    async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, 1), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
 
     s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
     __builtin_amdgcn_s_barrier();
@@ -326,7 +348,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
     for(int tile = 0; tile < loops - 2; tile += 2) {
         // First tile
         v_a = load<T::VEC_A>(s_a[tic][0], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<T::CACHECTL_A>{});
+        async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
         s_waitcnt_lgkmcnt(number<T::a_ds_read_insts>{});
         __builtin_amdgcn_s_barrier();
 
@@ -338,7 +360,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_sched_barrier(0);
 
         v_b[1] = load<T::VEC_B>(s_b[tic][1], u_rb);
-        async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, tile + 2), opus::number<T::CACHECTL_B>{});
+        async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, tile + 2), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -349,7 +371,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_sched_barrier(0);
 
         v_a = load<T::VEC_A>(s_a[tic][1], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, tile + 2), opus::number<T::CACHECTL_A>{});
+        async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, tile + 2), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -359,7 +381,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2), opus::number<T::CACHECTL_B>{});
+        async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
         v_b[0] = load<T::VEC_B>(s_b[toc][0], u_rb);
@@ -372,7 +394,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
 
         // Second tile
         v_a = load<T::VEC_A>(s_a[toc][0], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, tile + 2), opus::number<T::CACHECTL_A>{});
+        async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, tile + 2), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
         s_waitcnt_lgkmcnt(number<T::a_ds_read_insts>{});
         __builtin_amdgcn_s_barrier();
 
@@ -384,7 +406,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_sched_barrier(0);
 
         v_b[1] = load<T::VEC_B>(s_b[toc][1], u_rb);
-        async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, tile + 3), opus::number<T::CACHECTL_B>{});
+        async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, tile + 3), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -395,7 +417,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_sched_barrier(0);
 
         v_a = load<T::VEC_A>(s_a[toc][1], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, tile + 3), opus::number<T::CACHECTL_A>{});
+        async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, tile + 3), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
         __builtin_amdgcn_s_barrier();
 
         s_waitcnt_lgkmcnt(0_I);
@@ -405,7 +427,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 3), opus::number<T::CACHECTL_B>{});
+        async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 3), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
         v_b[0] = load<T::VEC_B>(s_b[tic][0], u_rb);
@@ -422,7 +444,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         int tile = loops - 2;
 
         v_a = load<T::VEC_A>(s_a[tic][0], u_ra);
-        async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<T::CACHECTL_A>{});
+        async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 1), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
         __builtin_amdgcn_s_barrier();
         s_waitcnt_lgkmcnt(0_I);
 

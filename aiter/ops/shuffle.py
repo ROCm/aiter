@@ -2,6 +2,45 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+import torch.nn.functional as F
+
+
+def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
+    """
+    Preshuffle weights for gfx1250 WMMA.
+
+    For 2D input (N, K): view as (N//16, 16, K//32, 2, 16) ->
+        permute(0, 2, 3, 1, 4) -> reshape (N//16, K*16).
+    For 3D input (E, N, K) or (E, K, N): transpose to (E, N, K) first,
+        then apply the same pattern per-expert.
+
+    The result is reshaped to (N//16, K*16) for TDM-optimal loading.
+    """
+    x_type = w.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        w = w.view(torch.uint8)
+
+    if w.ndim == 2:
+        N, K = w.shape
+        assert N % 16 == 0, f"N={N} must be divisible by 16"
+        assert K % 32 == 0, f"K={K} must be divisible by 32"
+        w = w.view(N // 16, 16, K // 32, 2, 16)
+        w = w.permute(0, 2, 3, 1, 4).contiguous()
+        w = w.view(N // 16, K * 16)
+    elif w.ndim == 3:
+        E, K, N = w.shape
+        assert K % 32 == 0, f"K={K} must be divisible by 32"
+        assert N % 16 == 0, f"N={N} must be divisible by 16"
+        w = w.transpose(-1, -2)  # (E, N, K)
+        w = w.view(E, N // 16, 16, K // 32, 2, 16)
+        w = w.permute(0, 1, 3, 4, 2, 5).contiguous()
+        w = w.view(E, N // 16, K * 16)
+        w = w.transpose(-1, -2)  # (E, K*16, N//16)
+    else:
+        raise ValueError(f"Expected 2D or 3D tensor, got {w.ndim}D")
+
+    w = w.view(x_type)
+    return w
 
 
 def shuffle_weight(
@@ -10,10 +49,25 @@ def shuffle_weight(
     use_int4=False,
     is_guinterleave=False,
     gate_up: bool = False,
+    pad_k_to: int = 0,
 ) -> torch.Tensor:
     x_type = x.dtype
     if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
         x = x.view(torch.uint8)
+
+    original_k = x.shape[-1]
+    if pad_k_to:
+        if pad_k_to < 0:
+            raise ValueError(f"pad_k_to must be non-negative, got {pad_k_to}")
+        if use_int4:
+            raise NotImplementedError("pad_k_to is not supported with use_int4=True")
+        if is_guinterleave:
+            raise NotImplementedError(
+                "pad_k_to is not supported with is_guinterleave=True"
+            )
+        padded_k = ((original_k + pad_k_to - 1) // pad_k_to) * pad_k_to
+        if padded_k != original_k:
+            x = F.pad(x.contiguous(), (0, padded_k - original_k), value=0)
 
     if is_guinterleave:
         experts_cnt, N, K_pk = x.shape
@@ -47,6 +101,9 @@ def shuffle_weight(
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
     x_.is_shuffled = True
+    if pad_k_to:
+        x_.aiter_original_k = original_k
+        x_.aiter_padded_k = x.shape[-1]
     return x_
 
 
