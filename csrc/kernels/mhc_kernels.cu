@@ -301,24 +301,38 @@ namespace aiter {
                 }
             }
         };
-        auto lds_load_bf_window_w32 = [&](float* s_fn_rd_ptr, float (&dst)[8], int p_window_base) {
-            int kk_window_base = p_window_base / repeat_n;
+
+        // ---- gfx1250 (wave32) bf16 WMMA path ----------------------------------------
+        // One wmma_f32_16x16x32_bf16 contracts a full K=32 chunk; it replaces the 8
+        // fp32 K=4 WMMAs the scalar path issued per (chunk, n). x is already bf16 in
+        // v_a in the exact A-operand register order (reg[r*8+p] = K(r*16 + kg*8 + p),
+        // kg = lane/16), so no repack is needed -- a chunk's 16 bf16 x-values are
+        // v_a[c*16 .. c*16+15]. fn (fp32 in LDS) is read in the matching K order and
+        // split into hi + unscaled bf16 residual just before the MFMA so the convert
+        // VALU co-execs with the XDL WMMA. hi*x and lo*x accumulate into one v_cf.
+        using wmma_bf16 = opus::wmma<DTYPE_I, DTYPE_I, opus::fp32_t, mfma_m, mfma_n, 32>;
+        static constexpr int bf_chunks = vec_tile / 16;   // K=32 chunks per lane
+        // Read fn chunk c into fp32 regs, K-order matched to v_a's register layout:
+        // raw[n][reg] aligns with v_a[c*16 + reg] (same lane holds 16 contiguous regs
+        // per chunk), so the swizzled LDS address uses kk = c*16 + reg.
+        auto lds_read_fn_chunk_bf = [&](float* s_fn_rd_ptr, float (&raw)[repeat_n][16], int c) {
             #pragma unroll
-            for (int vec_id = 0; vec_id < bf_vecs_per_window; vec_id++) {
-                int n = vec_id / bf_vecs_per_n;
-                int kk_vec_base = kk_window_base + (vec_id % bf_vecs_per_n) * fn_vec_size;
+            for (int n = 0; n < repeat_n; n++) {
                 int fn_row = n * mfma_n + lane_id % mfma_n;
                 int k_group = lane_id / mfma_m;
-                int K_wanted_base = k_group * x_vec_size +
-                                    (kk_vec_base / x_vec_size) * interleave_size * x_vec_size +
-                                    kk_vec_base % x_vec_size;
-                int K_lds_base = K_wanted_base ^ ((fn_row & 0xF) << fn_xor_shift);
-                fp32x4_t bf_vec = *(reinterpret_cast<fp32x4_t*>(
-                    s_fn_rd_ptr + fn_row * tile_k + K_lds_base));
                 #pragma unroll
-                for (int i = 0; i < fn_vec_size; i++) {
-                    int p_offset = (kk_vec_base + i) * repeat_n + n - p_window_base;
-                    dst[p_offset] = bf_vec[i];
+                for (int v = 0; v < 16 / fn_vec_size; v++) {
+                    int kk_base = c * 16 + v * fn_vec_size;
+                    int K_wanted_base = k_group * x_vec_size +
+                                        (kk_base / x_vec_size) * interleave_size * x_vec_size +
+                                        kk_base % x_vec_size;
+                    int K_lds_base = K_wanted_base ^ ((fn_row & 0xF) << fn_xor_shift);
+                    fp32x4_t bf_vec = *(reinterpret_cast<fp32x4_t*>(
+                        s_fn_rd_ptr + fn_row * tile_k + K_lds_base));
+                    #pragma unroll
+                    for (int i = 0; i < fn_vec_size; i++) {
+                        raw[n][v * fn_vec_size + i] = bf_vec[i];
+                    }
                 }
             }
         };
@@ -342,15 +356,40 @@ namespace aiter {
             }                                                                                     \
             __builtin_amdgcn_s_barrier();                                                         \
             float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
-            float v_bf[2][8];                                                                      \
             if constexpr (warp_size == 32) {                                                       \
-                lds_load_bf_window_w32(s_fn_rd_ptr, v_bf[0], 0);                                  \
-            } else {                                                                               \
-                lds_load_bf_window(s_fn_rd_ptr, v_bf[0], 0);                                      \
-            }                                                                                     \
+                /* bf16 K=32 WMMA: one MFMA per (chunk, n) per fn-half. */                        \
+                _Pragma("unroll")                                                                 \
+                for (int c = 0; c < bf_chunks; c++) {                                             \
+                    float raw[repeat_n][16];                                                       \
+                    lds_read_fn_chunk_bf(s_fn_rd_ptr, raw, c);                                     \
+                    opus::vector_t<DTYPE_I, 16> x16;                                               \
+                    _Pragma("unroll")                                                             \
+                    for (int e = 0; e < 16; e++)                                                  \
+                        x16[e] = static_cast<DTYPE_I>(v_af[c * 16 + e]);                          \
+                    _Pragma("unroll")                                                             \
+                    for (int n = 0; n < repeat_n; n++) {                                          \
+                        opus::vector_t<DTYPE_I, 16> fn_hi, fn_lo;                                  \
+                        _Pragma("unroll")                                                         \
+                        for (int e = 0; e < 16; e++) {                                            \
+                            DTYPE_I h = static_cast<DTYPE_I>(raw[n][e]);                           \
+                            fn_hi[e] = h;                                                          \
+                            fn_lo[e] = static_cast<DTYPE_I>(raw[n][e] - static_cast<float>(h));    \
+                        }                                                                          \
+                        v_cf[n] = wmma_bf16{}(fn_hi, x16, v_cf[n]);                                \
+                        v_cf[n] = wmma_bf16{}(fn_lo, x16, v_cf[n]);                                \
+                        __builtin_amdgcn_sched_barrier(0);                                         \
+                    }                                                                              \
+                }                                                                                  \
+                if (DO_PREFETCH) {                                                                \
+                    __syncthreads();                                                              \
+                    lds_load_fn_tile((k) + 2);                                                    \
+                }                                                                                 \
+            } else {                                                                              \
+            float v_bf[2][8];                                                                      \
+            lds_load_bf_window(s_fn_rd_ptr, v_bf[0], 0);                                          \
             __builtin_amdgcn_sched_barrier(0);                                                     \
             _Pragma("unroll")                                                                     \
-            for (int p_base = 8; p_base < (warp_size == 32 ? vec_tile * repeat_n : gemm_steps); p_base += 8) { \
+            for (int p_base = 8; p_base < gemm_steps; p_base += 8) {                               \
                 int bf_rd_buf = (p_base / 8 - 1) & 0x1;                                           \
                 int bf_wr_buf = (p_base / 8) & 0x1;                                               \
                 _Pragma("unroll")                                                                 \
@@ -370,11 +409,7 @@ namespace aiter {
                         }                                                                          \
                         v_cf[n_old] = MMA_F32_16X16X4(b_pack, a_pack, v_cf[n_old]);                \
                         if (p_offset == 0 && n_delta == 0) {                                       \
-                            if constexpr (warp_size == 32) {                                       \
-                                lds_load_bf_window_w32(s_fn_rd_ptr, v_bf[bf_wr_buf], p_base);      \
-                            } else {                                                               \
-                                lds_load_bf_window(s_fn_rd_ptr, v_bf[bf_wr_buf], p_base);          \
-                            }                                                                      \
+                            lds_load_bf_window(s_fn_rd_ptr, v_bf[bf_wr_buf], p_base);              \
                         }                                                                          \
                         __builtin_amdgcn_sched_barrier(0);                                         \
                     }                                                                              \
@@ -384,12 +419,12 @@ namespace aiter {
                 __syncthreads();                                                                  \
                 lds_load_fn_tile((k) + 2);                                                        \
             }                                                                                     \
-            int bf_tail_buf = ((warp_size == 32 ? vec_tile * repeat_n : gemm_steps) / 8 - 1) & 0x1; \
+            int bf_tail_buf = (gemm_steps / 8 - 1) & 0x1;                                          \
             _Pragma("unroll")                                                                     \
             for (int p_offset = 0; p_offset < 8; p_offset += mma_pack_size * repeat_n) {           \
                 _Pragma("unroll")                                                                 \
                 for (int n_delta = 0; n_delta < repeat_n; n_delta++) {                             \
-                    int p_old = (warp_size == 32 ? vec_tile * repeat_n : gemm_steps) - 8 + p_offset + n_delta; \
+                    int p_old = gemm_steps - 8 + p_offset + n_delta;                               \
                     int kk_base = p_old / repeat_n;                                                \
                     int n_old = p_old % repeat_n;                                                  \
                     fp32xmma_t a_pack;                                                             \
@@ -402,6 +437,7 @@ namespace aiter {
                     }                                                                              \
                     v_cf[n_old] = MMA_F32_16X16X4(b_pack, a_pack, v_cf[n_old]);                    \
                 }                                                                                  \
+            }                                                                                      \
             }                                                                                      \
         } while (0)
         for (int k = 0; k < k_loop - 2; k += 2) {
@@ -1971,6 +2007,13 @@ namespace aiter {
             }
         }
 
+        // gfx1250 (wave32) bf16 WMMA: one wmma_f32_16x16x32_bf16 needs 16 elems/lane,
+        // i.e. two ds_read_vec(=8) groups, so the activation res is accumulated across
+        // a pair of j-iterations into a 16-wide bf16 buffer before issuing the MFMA.
+        // fn is split into hi + unscaled bf16 residual just before the WMMA (delayed
+        // convert => VALU/XDL co-exec); hi*res and lo*res go into one v_cf. res and fn
+        // share the same per-lane K ordering, so the contraction stays correct.
+        using wmma_bf16 = opus::wmma<DTYPE_I, DTYPE_I, opus::fp32_t, mfma_m, mfma_n, 32>;
         auto compute_store_tile = [&](int i, fp32xfntile& v_fn) {
             DTYPE_I* s_x_rd_ptr = s_x + (i & 1) * tile_mk;
             DTYPE_I* s_residual_rd_ptr = s_residual + (i & 1) * (hc_mult * tile_mk);
@@ -1979,6 +2022,7 @@ namespace aiter {
             static constexpr int band_j = band_mk / (warp_size * ds_read_vec);
             for(int b = 0; b < m_repeat; b++) {
                 int s_offset = b * band_mk + lane_id % mfma_m * tile_k + lane_id / mfma_m * vec_tile;
+                opus::vector_t<DTYPE_I, 2 * ds_read_vec> res_bf;   // wave32: 16-wide bf16 operand
                 for(int j = 0; j < band_j; j++) {
                     opus::vector_t<float, ds_read_vec> res;
                     using DTYPE_I_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
@@ -2005,15 +2049,36 @@ namespace aiter {
                         g_nres, res, (b * mfma_m + lane_id % mfma_m) * residual_stride + warp_id * hidden_size + i * tile_k +
                         (s_offset % tile_k) + k_split_offset);
                     s_offset += step;
-                    for(int n = 0; n < repeat_n; n++) {
-                        for(int k = 0; k < ds_read_vec; k += mma_pack_size) {
-                            fp32xmma_t a_pack;
-                            fp32xmma_t b_pack;
-                            for (int pack = 0; pack < mma_pack_size; pack++) {
-                                a_pack[pack] = v_fn[n][k + pack + j * ds_read_vec];
-                                b_pack[pack] = res[k + pack];
+                    if constexpr (warp_size == 32) {
+                        int half = j & 1;
+                        for (int k = 0; k < ds_read_vec; k++) {
+                            res_bf[half * ds_read_vec + k] = static_cast<DTYPE_I>(res[k]);
+                        }
+                        if (half == 1) {
+                            int idx_base = (j - 1) * ds_read_vec;   // 16 fn elems: idx_base .. +15
+                            for (int n = 0; n < repeat_n; n++) {
+                                opus::vector_t<DTYPE_I, 2 * ds_read_vec> fn_hi, fn_lo;
+                                for (int e = 0; e < 2 * ds_read_vec; e++) {
+                                    float f = v_fn[n][idx_base + e];
+                                    DTYPE_I h = static_cast<DTYPE_I>(f);
+                                    fn_hi[e] = h;
+                                    fn_lo[e] = static_cast<DTYPE_I>(f - static_cast<float>(h));
+                                }
+                                v_cf[b][n] = wmma_bf16{}(fn_hi, res_bf, v_cf[b][n]);
+                                v_cf[b][n] = wmma_bf16{}(fn_lo, res_bf, v_cf[b][n]);
                             }
-                            v_cf[b][n] = MMA_F32_16X16X4(a_pack, b_pack, v_cf[b][n]);
+                        }
+                    } else {
+                        for(int n = 0; n < repeat_n; n++) {
+                            for(int k = 0; k < ds_read_vec; k += mma_pack_size) {
+                                fp32xmma_t a_pack;
+                                fp32xmma_t b_pack;
+                                for (int pack = 0; pack < mma_pack_size; pack++) {
+                                    a_pack[pack] = v_fn[n][k + pack + j * ds_read_vec];
+                                    b_pack[pack] = res[k + pack];
+                                }
+                                v_cf[b][n] = MMA_F32_16X16X4(a_pack, b_pack, v_cf[b][n]);
+                            }
                         }
                     }
                 }
