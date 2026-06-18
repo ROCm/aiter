@@ -1171,6 +1171,36 @@ namespace aiter {
     }
 
 
+#define MHC_POST_KERNEL_IMPL_RAW_(kernel_name, hidden_size, residual_block, store_nt) \
+    AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
+    AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
+    int block_size = 4 * WARP_SIZE; \
+    int num_tg_cu = 32 / (block_size / WARP_SIZE); \
+    int max_k_blocks = min(cu_num * num_tg_cu / m, hidden_size / (residual_block)); \
+    if (max_k_blocks < 1) max_k_blocks = 1; \
+    int k_blocks = max_k_blocks; \
+    for(; k_blocks > 1; k_blocks--) { \
+        if (hidden_size % (k_blocks * residual_block) == 0 && hidden_size / k_blocks >= residual_block) break; \
+    } \
+    int sub_hidden_size = hidden_size / k_blocks; \
+    dim3 grid(m, k_blocks); \
+    dim3 block(block_size); \
+    AITER_DISPATCH_FLOATING16_TYPES(dtype, "mhc_post_raw", [&] { \
+        using DTYPE_I = typename t2opus<scalar_t>::type; \
+        kernel_name<DTYPE_I, 4, 4, residual_block, store_nt><<<grid, block, 0, stream>>>( \
+            reinterpret_cast<DTYPE_I*>(out), \
+            reinterpret_cast<DTYPE_I*>(x), \
+            reinterpret_cast<DTYPE_I*>(residual), \
+            reinterpret_cast<float*>(post_layer_mix), \
+            reinterpret_cast<float*>(comb_res_mix), \
+            m, \
+            hidden_size, \
+            x_stride, \
+            residual_stride, \
+            sub_hidden_size \
+        ); \
+    });
+
 #define MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, store_nt) \
     AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
     AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
@@ -1220,6 +1250,19 @@ namespace aiter {
         AITER_CHECK(false, "hidden_size must be divisible by 256"); \
     }
 
+#define MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, store_nt_val) \
+    do { \
+        if (arch_id != "gfx942" && hidden_size % 1024 == 0) { \
+            MHC_POST_KERNEL_IMPL_RAW_(mhc_post_kernel, hidden_size, 1024, store_nt_val); \
+        } else if (hidden_size % 512 == 0) { \
+            MHC_POST_KERNEL_IMPL_RAW_(mhc_post_kernel, hidden_size, 512, store_nt_val); \
+        } else if (hidden_size % 256 == 0) { \
+            MHC_POST_KERNEL_IMPL_RAW_(mhc_post_kernel_x2vgpr, hidden_size, 256, store_nt_val); \
+        } else { \
+            AITER_CHECK(false, "hidden_size must be divisible by 256"); \
+        } \
+    } while (0)
+
 #define MHC_POST_KERNEL_DISPATCH(hidden_size) \
     do { \
         if (m > 8 * cu_num) { \
@@ -1228,6 +1271,42 @@ namespace aiter {
             MHC_POST_KERNEL_DISPATCH_NT(hidden_size, false); \
         } \
     } while (0)
+
+    void launch_mhc_post_raw(hipStream_t stream,
+                             c10::ScalarType dtype,
+                             void* out,
+                             void* x,
+                             void* residual,
+                             void* post_layer_mix,
+                             void* comb_res_mix,
+                             int m,
+                             int hidden_size,
+                             int x_stride,
+                             int residual_stride,
+                             int store_nt)
+    {
+        const int cu_num = get_num_cu_func();
+        const std::string arch_id = get_gpu_arch();
+        if(store_nt < 0)
+        {
+            if(m > 8 * cu_num)
+            {
+                MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, true);
+            }
+            else
+            {
+                MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, false);
+            }
+        }
+        else if(store_nt != 0)
+        {
+            MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, true);
+        }
+        else
+        {
+            MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, false);
+        }
+    }
 
     void mhc_post(
         torch::Tensor& out,
@@ -1246,15 +1325,18 @@ namespace aiter {
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(residual));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
-        const int cu_num = get_num_cu_func();
-        const std::string arch_id = get_gpu_arch();
-        if (store_nt < 0) {
-            MHC_POST_KERNEL_DISPATCH(hidden_size);
-        } else if (store_nt != 0) {
-            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, true);
-        } else {
-            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, false);
-        }
+        launch_mhc_post_raw(stream,
+                            x.scalar_type(),
+                            out.data_ptr(),
+                            x.data_ptr(),
+                            residual.data_ptr(),
+                            post_layer_mix.data_ptr(),
+                            comb_res_mix.data_ptr(),
+                            m,
+                            hidden_size,
+                            x_stride,
+                            residual_stride,
+                            store_nt);
     }
 
 

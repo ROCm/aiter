@@ -2998,68 +2998,8 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
             sg, rank, residual_inp, residual_out, output, weight, scale_out, size, hidden_dim, eps);
 }
 
-// Stage 2 for split AR+MHC(post): read all-reduced activations from tmp and
-// apply mhc_post epilogue without materializing reduced layer_input.
-template <typename T, int hc_mult>
-__global__ void __launch_bounds__(1024, 1) local_device_mhc_post_from_tmp(
-    RankSignals sg,
-    int rank,
-    T* __restrict__ residual,
-    float* __restrict__ post_layer_mix,
-    float* __restrict__ comb_res_mix,
-    T* __restrict__ next_residual,
-    int m,
-    int hidden_size,
-    int residual_stride)
-{
-    constexpr int pack_size = 16 / sizeof(T);
-    using P                 = typename opus::vector_t<T, pack_size>;
-    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
-    static_assert(hc_mult == 4, "AR+MHC post split epilogue currently supports hc_mult=4");
-    P* tmps       = get_tmp_buf<P>(sg.signals[rank]);
-    const int lane = threadIdx.x;
-    const int n_packs = hidden_size / pack_size;
-    if(lane >= n_packs)
-        return;
-
-    for(int row = blockIdx.x; row < m; row += gridDim.x)
-    {
-        const int input_pack_idx = row * n_packs + lane;
-        P reduced_pack           = tmps[input_pack_idx];
-        A reduced;
-#pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-            reduced[v] = upcast_s(reduced_pack[v]);
-
-#pragma unroll
-        for(int out_h = 0; out_h < hc_mult; ++out_h)
-        {
-            A out;
-            const float post_v = post_layer_mix[row * hc_mult + out_h];
-#pragma unroll
-            for(int v = 0; v < pack_size; ++v)
-                out[v] = reduced[v] * post_v;
-
-#pragma unroll
-            for(int in_h = 0; in_h < hc_mult; ++in_h)
-            {
-                const float comb_v =
-                    comb_res_mix[row * hc_mult * hc_mult + in_h * hc_mult + out_h];
-                const int residual_pack_idx =
-                    (row * residual_stride + in_h * hidden_size) / pack_size + lane;
-                P residual_pack = reinterpret_cast<P*>(residual)[residual_pack_idx];
-#pragma unroll
-                for(int v = 0; v < pack_size; ++v)
-                    out[v] += upcast_s(residual_pack[v]) * comb_v;
-            }
-
-            P out_pack = downcast<P>(out);
-            const int out_pack_idx =
-                (row * residual_stride + out_h * hidden_size) / pack_size + lane;
-            reinterpret_cast<P*>(next_residual)[out_pack_idx] = out_pack;
-        }
-    }
-}
+// Stage 2 for split AR+MHC(post) is launched via optimized mhc_post kernels on the
+// IPC tmp buffer (see launch_mhc_post_raw in fused_ar_mhc_post.cu).
 
 template <typename T, int NGPUS>
 void allreduce_mhc_post_split_launcher(RankData* _dp,
@@ -3098,14 +3038,6 @@ void allreduce_mhc_post_split_launcher(RankData* _dp,
         throw std::runtime_error("AR+MHC post split epilogue: unsupported NGPUS=" +
                                  std::to_string(NGPUS));
     }
-
-    constexpr int pack_size = 16 / sizeof(T);
-    const int block_size    = hidden_size / pack_size;
-    dim3 threadsPerBlock(block_size);
-    dim3 numBlocks(m);
-    local_device_mhc_post_from_tmp<T, 4><<<numBlocks, threadsPerBlock, 0, stream>>>(
-        sg, rank, residual, post_layer_mix, comb_res_mix, next_residual, m, hidden_size,
-        residual_stride);
 }
 
 using IPC_KEY = std::array<uint8_t, sizeof(hipIpcMemHandle_t)>;
@@ -3225,6 +3157,12 @@ class CustomAllreduce
     std::vector<void*> graph_unreg_output_buffers_;
     // a map from IPC handles to opened IPC pointers
     std::map<IPC_KEY, char*> ipc_handles_;
+
+    template <typename T>
+    T* local_tmp_reduced_ptr() const
+    {
+        return reinterpret_cast<T*>(self_sg_ + 1);
+    }
 
     /**
      * meta is a pointer to device metadata and temporary buffer for allreduce.
@@ -4647,35 +4585,6 @@ void dispatchAllReduceMhcPostLargeM(hipStream_t stream,
                                     int hidden_size,
                                     int residual_stride)
 {
-    constexpr int pack_size = 16 / sizeof(T);
-    if(input_hidden_dim != hidden_size)
-    {
-        throw std::runtime_error("AR+MHC post epilogue requires full hidden input");
-    }
-    if(hidden_size % pack_size != 0 || residual_stride % pack_size != 0)
-    {
-        throw std::runtime_error("AR+MHC post epilogue requires pack-aligned hidden/stride");
-    }
-
-    const int64_t size_bytes = (int64_t)m * input_hidden_dim * sizeof(T);
-    // Same 512 KiB budget as fused AR+RMSNorm: TP>=4 large tensors use
-    // reduce-scatter + local epilogue instead of 1-stage row-wise IPC reduce.
-    constexpr int64_t kSplitMinBytes = 512 * 1024;
-    if(world_size_ >= 4 && size_bytes > kSplitMinBytes)
-    {
-        dispatchAllReduceMhcPostSplit<T>(stream,
-                                         input,
-                                         next_residual,
-                                         residual,
-                                         post_layer_mix,
-                                         comb_res_mix,
-                                         m,
-                                         input_hidden_dim,
-                                         hidden_size,
-                                         residual_stride);
-        return;
-    }
-
     dispatchAllReduceMhcPost1Stage<T>(stream,
                                       input,
                                       next_residual,

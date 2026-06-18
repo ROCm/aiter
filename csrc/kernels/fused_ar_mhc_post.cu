@@ -3,10 +3,12 @@
 
 #include "fused_ar_mhc_post.h"
 #include "custom_all_reduce.cuh"
+#include "mhc.h"
 #include "aiter_enum.h"
 #include "aiter_hip_common.h"
 #include "py_itfs_common.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <c10/core/ScalarType.h>
 
 namespace aiter {
 
@@ -54,6 +56,31 @@ void copy_input_to_registered_buffer(const aiter_tensor_t& inp,
 }
 
 template <typename T>
+c10::ScalarType scalar_type_for_ar_mhc_post()
+{
+    if constexpr(std::is_same_v<T, opus::bf16_t>)
+        return c10::ScalarType::BFloat16;
+    else
+        return c10::ScalarType::Half;
+}
+
+template <typename T>
+void run_ar_mhc_post_split(CustomAllreduce* fa,
+                           hipStream_t stream,
+                           c10::ScalarType dtype,
+                           T* inp_ptr,
+                           T* next_residual_ptr,
+                           T* residual_ptr,
+                           float* post_layer_mix_ptr,
+                           float* comb_res_mix_ptr,
+                           int m,
+                           int input_n,
+                           int hidden_size,
+                           int residual_stride,
+                           int64_t reg_ptr,
+                           int64_t reg_bytes);
+
+template <typename T>
 void run_ar_mhc_post_large_m(CustomAllreduce* fa,
                              hipStream_t stream,
                              T* inp_ptr,
@@ -68,10 +95,31 @@ void run_ar_mhc_post_large_m(CustomAllreduce* fa,
                              int64_t reg_ptr,
                              int64_t reg_bytes)
 {
+    const int64_t size_bytes = static_cast<int64_t>(m) * input_n * static_cast<int64_t>(sizeof(T));
+    constexpr int64_t kSplitMinBytes = 512 * 1024;
+    if(fa->world_size_ >= 4 && size_bytes > kSplitMinBytes)
+    {
+        run_ar_mhc_post_split(fa,
+                              stream,
+                              scalar_type_for_ar_mhc_post<T>(),
+                              inp_ptr,
+                              next_residual_ptr,
+                              residual_ptr,
+                              post_layer_mix_ptr,
+                              comb_res_mix_ptr,
+                              m,
+                              input_n,
+                              hidden_size,
+                              residual_stride,
+                              reg_ptr,
+                              reg_bytes);
+        return;
+    }
+
     void* actual_inp = inp_ptr;
     if(reg_ptr != 0)
         actual_inp = (void*)reg_ptr;
-    fa->dispatchAllReduceMhcPostLargeM<T>(stream,
+    fa->dispatchAllReduceMhcPost1Stage<T>(stream,
                                           reinterpret_cast<T*>(actual_inp),
                                           next_residual_ptr,
                                           residual_ptr,
@@ -86,6 +134,7 @@ void run_ar_mhc_post_large_m(CustomAllreduce* fa,
 template <typename T>
 void run_ar_mhc_post_split(CustomAllreduce* fa,
                            hipStream_t stream,
+                           c10::ScalarType dtype,
                            T* inp_ptr,
                            T* next_residual_ptr,
                            T* residual_ptr,
@@ -111,6 +160,17 @@ void run_ar_mhc_post_split(CustomAllreduce* fa,
                                          input_n,
                                          hidden_size,
                                          residual_stride);
+    launch_mhc_post_raw(stream,
+                        dtype,
+                        next_residual_ptr,
+                        fa->local_tmp_reduced_ptr<T>(),
+                        residual_ptr,
+                        post_layer_mix_ptr,
+                        comb_res_mix_ptr,
+                        m,
+                        hidden_size,
+                        hidden_size,
+                        residual_stride);
 }
 
 template <typename T>
@@ -308,6 +368,7 @@ void fused_allreduce_mhc_post_split(fptr_t _fa,
         run_ar_mhc_post_split<opus::bf16_t>(
             fa,
             stream,
+            at::ScalarType::BFloat16,
             reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(next_residual.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(residual_in.data_ptr()),
@@ -325,6 +386,7 @@ void fused_allreduce_mhc_post_split(fptr_t _fa,
         run_ar_mhc_post_split<opus::fp16_t>(
             fa,
             stream,
+            at::ScalarType::Half,
             reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(next_residual.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(residual_in.data_ptr()),
