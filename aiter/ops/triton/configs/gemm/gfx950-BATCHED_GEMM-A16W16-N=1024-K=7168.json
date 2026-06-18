@@ -8,7 +8,7 @@
         "num_stages": 2,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
-        "NUM_KSPLIT": 1
+        "NUM_KSPLIT": 7
     },
     "any": {
         "BLOCK_SIZE_M": 128,
