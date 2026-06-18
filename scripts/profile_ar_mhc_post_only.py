@@ -37,12 +37,20 @@ ITERS = 50
 def _make_inputs(m: int, hidden_size: int, rank: int, device: torch.device):
     torch.manual_seed(20260617)
     hc_mult = 4
-    base_layer_input = torch.randn(m, hidden_size, dtype=aiter.dtypes.bf16, device=device)
+    base_layer_input = torch.randn(
+        m, hidden_size, dtype=aiter.dtypes.bf16, device=device
+    )
     return {
         "layer_input": base_layer_input * float(rank + 1),
-        "residual_in": torch.randn(m, hc_mult, hidden_size, dtype=aiter.dtypes.bf16, device=device),
-        "post_layer_mix": torch.randn(m, hc_mult, 1, dtype=aiter.dtypes.fp32, device=device),
-        "comb_res_mix": torch.randn(m, hc_mult, hc_mult, dtype=aiter.dtypes.fp32, device=device),
+        "residual_in": torch.randn(
+            m, hc_mult, hidden_size, dtype=aiter.dtypes.bf16, device=device
+        ),
+        "post_layer_mix": torch.randn(
+            m, hc_mult, 1, dtype=aiter.dtypes.fp32, device=device
+        ),
+        "comb_res_mix": torch.randn(
+            m, hc_mult, hc_mult, dtype=aiter.dtypes.fp32, device=device
+        ),
     }
 
 
@@ -148,7 +156,9 @@ def profile_worker(
     bench = _bench_graph if with_graph else _event_us
     split_us = bench(split_ar_post, warmup=2, iters=ITERS)
     if with_graph:
-        fused_us = bench(lambda: fused_ar_post(graph_replay=True), warmup=2, iters=ITERS)
+        fused_us = bench(
+            lambda: fused_ar_post(graph_replay=True), warmup=2, iters=ITERS
+        )
     else:
         fused_us = bench(fused_ar_post, warmup=2, iters=ITERS)
 
