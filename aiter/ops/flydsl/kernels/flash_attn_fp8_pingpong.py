@@ -290,8 +290,18 @@ def build_flash_attn_fp8_module(
             vec = _load_global_i8x16(src_ptr, g_idx)
             return ArithValue(in_bounds).select(vec, zero_vec16.ir_value())
 
+        def _k_swizzle(row_idx, col_idx):
+            # Step 3: XOR swizzle at 16-element granularity, col ^ ((row&7)<<4),
+            # to break the 32-way LDS bank conflict on the GEMM1 K read (32 lanes
+            # sharing the same lo land on identical banks without it).
+            mask = (row_idx & fx.Index(0x7)) << fx.Index(4)
+            return col_idx ^ mask
+
         def store_k_lds(vec, lds_off):
-            lds_idx = fx.Index(lds_off) + load_row * K_STRIDE + load_col
+            # The cooperative store is exactly one 16-element block, so the
+            # swizzle just relocates the whole block (no split needed).
+            swz_col = _k_swizzle(load_row, load_col)
+            lds_idx = fx.Index(lds_off) + load_row * K_STRIDE + swz_col
             Vec(vec).store(lds, [lds_idx])
 
         def store_v_lds_dblocked(vec, lds_off):
@@ -381,12 +391,35 @@ def build_flash_attn_fp8_module(
             for nt in range_constexpr(N_KV_TILES):
                 s_acc = mfma.zero_value
                 for ks in range_constexpr(K_STEPS):
-                    # K A-operand: kv-row = lo + nt*32, d = ks*64 + hi*32 + v
+                    # K A-operand: kv-row = lo + nt*32, d = ks*64 + hi*32 + v.
+                    # The swizzle is 16-granular, so the 32-byte operand is read
+                    # as two 16-byte blocks at separately-swizzled columns and
+                    # concatenated back into logical (d_base..d_base+31) order.
                     kv_row = lo + fx.Index(nt * 32)
                     d_base = fx.Index(ks * MFMA_K) + hi * 32
-                    lds_idx = k_buf_off + kv_row * K_STRIDE + d_base
-                    k_pack = Vec.load(v_i8x32, lds, [lds_idx])
-                    k_pack = Vec(k_pack).bitcast(fx.Int32)
+                    blk_lo = Vec(
+                        Vec.load(
+                            v_i8x16,
+                            lds,
+                            [
+                                k_buf_off
+                                + kv_row * K_STRIDE
+                                + _k_swizzle(kv_row, d_base)
+                            ],
+                        )
+                    ).bitcast(fx.Int32)
+                    blk_hi = Vec(
+                        Vec.load(
+                            v_i8x16,
+                            lds,
+                            [
+                                k_buf_off
+                                + kv_row * K_STRIDE
+                                + _k_swizzle(kv_row, d_base + fx.Index(16))
+                            ],
+                        )
+                    ).bitcast(fx.Int32)
+                    k_pack = blk_lo.shuffle(blk_hi, list(range(8)))
                     s_acc = mfma.call(k_pack, q_packs[ks], s_acc)
                 s_accs.append(s_acc)
 
