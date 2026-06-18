@@ -846,6 +846,44 @@ __device__ void store_vector(opus::gmem<T>& buffer,
     }
 }
 
+// Wait until both the regular load queue and the async-load queue have at most
+// the given number of outstanding entries. A negative count means "don't wait"
+// on that queue: on split-counter archs the corresponding instruction is not
+// emitted, and on the combined-vmcnt arch it is treated as 0 in the sum.
+// gfx9 only has the combined vmcnt, which covers both, so wait on the sum.
+// Other archs (e.g. gfx1250) have split counters, so wait on loadcnt and asynccnt independently.
+template <index_t load_cnt, index_t async_load_cnt>
+OPUS_D void s_wait_all_loadcnt(number<load_cnt> = {}, number<async_load_cnt> = {})
+{
+#if defined(__gfx1250__)
+    if constexpr(load_cnt >= 0)
+        s_wait_loadcnt(number<load_cnt>{});
+    if constexpr(async_load_cnt >= 0)
+        s_wait_asynccnt(number<async_load_cnt>{});
+#else
+    constexpr index_t vmcnt = (load_cnt < 0 ? 0 : load_cnt) + (async_load_cnt < 0 ? 0 : async_load_cnt);
+    s_waitcnt_vmcnt(number<vmcnt>{});
+#endif
+}
+
+// Wait until the LDS (shared-memory) queue has at most the given number of
+// outstanding entries. A negative count means "don't wait", so no instruction
+// is emitted.
+// gfx9 routes LDS waits through the combined lgkmcnt; other archs (e.g. gfx1250)
+// have a dedicated dscnt counter.
+template <index_t ds_cnt>
+OPUS_D void s_wait_all_dscnt(number<ds_cnt> = {})
+{
+    if constexpr(ds_cnt >= 0)
+    {
+#if defined(__gfx1250__)
+        s_wait_dscnt(number<ds_cnt>{});
+#else
+        s_waitcnt_lgkmcnt(number<ds_cnt>{});
+#endif
+    }
+}
+
 // todo: edit this to use aiterTensor dtype
 template <typename T>
 struct t2opus;

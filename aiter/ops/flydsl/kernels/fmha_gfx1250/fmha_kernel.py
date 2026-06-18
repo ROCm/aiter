@@ -56,6 +56,7 @@ from flydsl.expr.primitive import const_expr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator
+from ..tensor_shim import _run_compiled
 from flydsl.compiler.kernel_function import (
     CompilationContext,
 )
@@ -3327,15 +3328,6 @@ def _ensure_kernel(is_causal: bool, return_lse: bool = False):
     _launch_fns[key] = _launch
 
 
-def _run_compiled(exe, args):
-    cf = getattr(exe, "_cf", None)
-    if cf is None:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
-    else:
-        cf(*args)
-
-
 def flash_attn_varlen_d192_gfx1250(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3394,30 +3386,28 @@ def flash_attn_varlen_d192_gfx1250(
 
     _run_compiled(
         _launch_fns[(bool(causal), bool(return_lse))],
-        (
-            out,
-            q,
-            k,
-            v,
-            lse,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            softmax_scale,
-            stride_q_seq,
-            stride_k_seq,
-            stride_v_seq,
-            stride_o_seq,
-            stride_q_head,
-            stride_k_head,
-            stride_v_head,
-            stride_o_head,
-            gqa,
-            max_seqlen_q,
-            max_seqlen_k,
-            nheads_q,
-            batch,
-            torch.cuda.current_stream(),
-        ),
+        out,
+        q,
+        k,
+        v,
+        lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        softmax_scale,
+        stride_q_seq,
+        stride_k_seq,
+        stride_v_seq,
+        stride_o_seq,
+        stride_q_head,
+        stride_k_head,
+        stride_v_head,
+        stride_o_head,
+        gqa,
+        max_seqlen_q,
+        max_seqlen_k,
+        nheads_q,
+        batch,
+        torch.cuda.current_stream(),
     )
 
     if return_lse:
