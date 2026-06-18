@@ -527,6 +527,10 @@ def pa_reduce_v1(
     max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
+    # num_kv_splits is trailing+optional so the ATOM call site (which passes 8
+    # positional args, no split count) stays aligned. The kernel uses
+    # max(SM_count, num_kv_splits), so the default 0 means "auto" (SM_count).
+    num_kv_splits: int = 0,
 ) -> None:
     mla_reduce_v1(
         partial_output,
@@ -535,9 +539,7 @@ def pa_reduce_v1(
         reduce_final_map,
         reduce_partial_map,
         max_seqlen_q,
-        # num_kv_splits: persistent path has variable splits; the kernel uses
-        # max(SM_count, num_kv_splits), so 0 reproduces the SM_count behavior.
-        0,
+        num_kv_splits,
         final_output,
         final_lse,
     )
