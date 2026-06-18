@@ -24,7 +24,7 @@ from gemm_a8w8_common import (  # noqa: E402
     kernelInstance,
     kernels_list,
 )
-from template_env import render as _render  # noqa: E402
+from template_env import stream as stream_template  # noqa: E402
 
 
 class gemm_a8w8_fwd_codegen:
@@ -35,57 +35,65 @@ class gemm_a8w8_fwd_codegen:
         self.istune = istune
 
     def gen_instance(self, k: kernelInstance):
-        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
-            _render("impl.cuh.j2", k=k, istune=self.istune)
+        stream_template(
+            "impl.cuh.j2",
+            os.path.join(self.impl_path, f"{k.name}.cuh"),
+            k=k,
+            istune=self.istune,
         )
 
         if self.istune:
             # Generate both I8 and F8 instances for tuning
             # I8 instances
             for EDtype in ["B16"]:
-                Path(
+                stream_template(
+                    "instance.cpp.j2",
                     os.path.join(
                         self.instances_path, f"{k.name}_abI8_dB16_e{EDtype}.cpp"
-                    )
-                ).write_text(
-                    _render("instance.cpp.j2", name=k.name, dtypes=f"I8, B16, {EDtype}")
+                    ),
+                    name=k.name,
+                    dtypes=f"I8, B16, {EDtype}",
                 )
 
             # F8 instances
             for EDtype in ["B16"]:
-                Path(
+                stream_template(
+                    "instance.cpp.j2",
                     os.path.join(
                         self.instances_path, f"{k.name}_abF8_dF32_e{EDtype}.cpp"
-                    )
-                ).write_text(
-                    _render("instance.cpp.j2", name=k.name, dtypes=f"F8, F32, {EDtype}")
+                    ),
+                    name=k.name,
+                    dtypes=f"F8, F32, {EDtype}",
                 )
         else:
             for EDtype in ["B16", "F16"]:
                 for ABDtype in ["I8", "F8"]:
                     for DDtype in ["F32", EDtype]:
-                        Path(
+                        stream_template(
+                            "instance.cpp.j2",
                             os.path.join(
                                 self.instances_path,
                                 f"{k.name}_ab{ABDtype}_d{DDtype}_e{EDtype}.cpp",
-                            )
-                        ).write_text(
-                            _render(
-                                "instance.cpp.j2",
-                                name=k.name,
-                                dtypes=f"{ABDtype}, {DDtype}, {EDtype}",
-                            )
+                            ),
+                            name=k.name,
+                            dtypes=f"{ABDtype}, {DDtype}, {EDtype}",
                         )
 
     def gen_lookup_dict(self, kernels_dict):
         kernels_dict = gen_lookup_header_map(kernels_dict, self.istune)
-        with open(os.path.join(self.working_path, "gemm_a8w8_lookup.h"), "w") as f:
-            f.write(_render("lookup.cuh.j2", kernels_dict=kernels_dict))
+        stream_template(
+            "lookup.cuh.j2",
+            os.path.join(self.working_path, "gemm_a8w8_lookup.h"),
+            kernels_dict=kernels_dict,
+        )
 
     def gen_manifest_head(self, kernels_dict):
         kernel_names = [k.name for k in kernels_dict.values()]
-        Path(os.path.join(self.working_path, "gemm_a8w8_manifest.h")).write_text(
-            _render("gemm_a8w8_manifest.h.j2", kernel_names=kernel_names)
+
+        stream_template(
+            "gemm_a8w8_manifest.h.j2",
+            os.path.join(self.working_path, "gemm_a8w8_manifest.h"),
+            kernel_names=kernel_names,
         )
 
     def gen_instances(self, kernels_dict):
