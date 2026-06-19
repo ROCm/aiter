@@ -174,13 +174,16 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
         impl = gluon_gfx950_gemm_a8w8_blockscale
     else:
         if shuffle:
-            impl = lambda x, w, xs, ws, dt, y: gemm_a8w8_blockscale_preshuffle(
-                x, w, xs, ws, dt, y, backend=backend
-            )
+
+            def impl(x, w, xs, ws, dt, y):
+                return gemm_a8w8_blockscale_preshuffle(
+                    x, w, xs, ws, dt, y, backend=backend
+                )
+
         else:
-            impl = lambda x, w, xs, ws, dt, y: gemm_a8w8_blockscale(
-                x, w, xs, ws, dt, y, backend=backend
-            )
+
+            def impl(x, w, xs, ws, dt, y):
+                return gemm_a8w8_blockscale(x, w, xs, ws, dt, y, backend=backend)
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 

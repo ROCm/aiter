@@ -344,7 +344,7 @@ def gemm_a8w8_blockscale_preshuffle(
     if backend == "gluon":
         assert _is_gluon_available(
             preshuffle=True
-        ), f"Gluon preshuffle requires one of {_GLUON_PRESHUFFLE_ARCHS}, got '{get_arch()}'"
+        ), f"Gluon preshuffle requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
             _PRESHUFFLE_KERNEL_MAP,
         )

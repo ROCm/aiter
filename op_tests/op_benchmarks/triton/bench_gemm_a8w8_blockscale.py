@@ -4,12 +4,9 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
 )
-
-
-def gluon_gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype, y=None):
-    return triton_gemm_a8w8_blockscale(
-        x, w, x_scale, w_scale, dtype, y, backend="gluon"
-    )
+from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+)
 
 
 from aiter.test_common import checkAllclose
