@@ -490,7 +490,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                         const int kblock_idx = kglobal_token_idx / BLOCK_SIZE;
                         const int ktoken_in_block = kglobal_token_idx % BLOCK_SIZE;
                         const int k_scale_idx =
-                            kblock_idx * NUM_KV_HEADS * BLOCK_SIZE + wg_start_kv_head_idx * BLOCK_SIZE + ktoken_in_block;
+                            kblock_idx * gridDim.z * BLOCK_SIZE + wg_start_kv_head_idx * BLOCK_SIZE + ktoken_in_block;
                         d_out[gqa_ratio_loop][mtp][token_depth] *=
                             k_scale_ptr ? *(k_scale_ptr + k_scale_idx) : float(1.0);
                     }
@@ -780,7 +780,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                             const int vblock_idx = vglobal_token_idx / BLOCK_SIZE;
                             const int vtoken_in_block = vglobal_token_idx % BLOCK_SIZE;
                             const int v_scale_idx =
-                                vblock_idx * NUM_KV_HEADS * BLOCK_SIZE + wg_start_kv_head_idx * BLOCK_SIZE + vtoken_in_block;
+                                vblock_idx * gridDim.z * BLOCK_SIZE + wg_start_kv_head_idx * BLOCK_SIZE + vtoken_in_block;
                             v_scale = v_scale_ptr ? *(v_scale_ptr + v_scale_idx) : float(1.0);
                         }
 
