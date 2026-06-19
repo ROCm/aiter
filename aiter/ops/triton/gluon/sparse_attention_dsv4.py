@@ -611,7 +611,7 @@ def _decode_core_attn(
 
 
 @gluon.jit
-def _sparse_attn_decode_partial_kernel(
+def _sparse_attn_decode_kernel(
     q_ptr,              # [T, H, D]  (D = NOPE_DIM + ROPE_DIM)
     main_cache_ptr,     # [num_blocks, block_size, 584]  packed bytes
     main_indices_ptr,   # [main_nnz]
@@ -636,6 +636,7 @@ def _sparse_attn_decode_partial_kernel(
     main_block_size,
     extra_block_size,
     scale,
+    num_queries,
     num_heads,
     HAS_EXTRA: gl.constexpr,
     NOPE_DIM: gl.constexpr,
@@ -645,11 +646,19 @@ def _sparse_attn_decode_partial_kernel(
     BLOCK_H: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
 ):
-    # Non-persistent 3-D grid: (query, split, head-block).
-    query_idx = gl.program_id(axis=0)
-    split_id = gl.program_id(axis=1)
-    pid_h = gl.program_id(axis=2)
+    # Non-persistent 3-D XCD-pinned grid: axis0 = xcd, axis1 = head-block,
+    # axis2 = query-chunk * NUM_SPLITS + split. Pins consecutive queries to
+    # distinct XCDs (same scheme as the prefill / mla_decode grids) for XCD/L2
+    # load balance.
+    query_idx = gl.program_id(axis=0) + (gl.program_id(axis=2) // NUM_SPLITS) * NUM_XCDS
+    pid_h = gl.program_id(axis=1)
+    split_id = gl.program_id(axis=2) % NUM_SPLITS
+
+    # The grid rounds num_queries up to a multiple of NUM_XCDS; guard the tail.
+    if query_idx >= num_queries:
+        return
 
     nw: gl.constexpr = gl.num_warps()
     gl.static_assert(nw == 4, "decode core slot async gather assumes num_warps == 4")
@@ -1146,7 +1155,7 @@ def sparse_attn_decode_gluon(
 
     BLOCK_H = 64
     BLOCK_K = 64
-    # NUM_XCDS = get_num_xcds()
+    NUM_XCDS = get_num_xcds()
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     heads_blocks = triton.cdiv(num_heads, BLOCK_H)
     num_splits = _decode_num_splits(
@@ -1169,7 +1178,8 @@ def sparse_attn_decode_gluon(
         device=q.device,
     )
 
-    _sparse_attn_decode_partial_kernel[(num_queries, num_splits, heads_blocks)](
+    grid = (NUM_XCDS, heads_blocks, triton.cdiv(num_queries, NUM_XCDS) * num_splits)
+    _sparse_attn_decode_kernel[grid](
         q,
         main_cache,
         main_indices,
@@ -1190,6 +1200,7 @@ def sparse_attn_decode_gluon(
         main_cache.shape[1],
         extra_cache.shape[1],
         float(scale),
+        num_queries,
         num_heads,
         HAS_EXTRA=has_extra,
         NOPE_DIM=nope_dim,
@@ -1199,6 +1210,7 @@ def sparse_attn_decode_gluon(
         BLOCK_H=BLOCK_H,
         BLOCK_K=BLOCK_K,
         NUM_SPLITS=num_splits,
+        NUM_XCDS=NUM_XCDS,
         num_warps=num_warps,
     )
 
