@@ -1001,6 +1001,9 @@ def flydsl_qk_norm_rope_quant(
             kv_out=kv_out,
             q_scale=q_scale,
             kv_scale=kv_scale,
+            swa_kv=swa_kv,
+            state_slot_mapping=state_slot_mapping,
+            batch_id_per_token=batch_id_per_token,
             stream=stream,
         )
 
