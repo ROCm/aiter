@@ -76,7 +76,7 @@ def prepack_oihw_to_kmajor(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
             (K_out, K_pad - K_red), device=w_oihw.device, dtype=w_oihw.dtype
         )
         w_rs = torch.cat([w_rs, pad], dim=1)
-    return w_rs.contiguous(), (K_out, K_pad)
+    return w_rs.contiguous(), K_pad
 
 
 def get_or_make_weight_pack(w_oihw: torch.Tensor, block_k: int = BLOCK_K):
@@ -105,7 +105,7 @@ def prepack_oihw_to_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
             (K_out, 9, C_pad - C), device=w_oihw.device, dtype=w_oihw.dtype
         )
         w_rs = torch.cat([w_rs, pad], dim=2)
-    return w_rs.contiguous(), (K_out, C_pad)
+    return w_rs.contiguous(), C_pad
 
 
 def get_or_make_weight_pack_3x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
@@ -173,7 +173,7 @@ def prepack_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):
             (36, K_out, C_pad - C), device=w_oihw.device, dtype=torch.float32
         )
         u = torch.cat([u, pad], dim=2)
-    return u.to(w_oihw.dtype).contiguous(), (K_out, C_pad)
+    return u.to(w_oihw.dtype).contiguous(), C_pad
 
 
 def get_or_make_winograd_filter_f4x3(w_oihw: torch.Tensor, block_c: int = BLOCK_K):

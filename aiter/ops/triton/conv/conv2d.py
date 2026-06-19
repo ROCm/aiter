@@ -116,7 +116,7 @@ def conv2d_winograd_f4x3(
     else:
         y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
-    U, (_, C_pad) = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
+    U, C_pad = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
     _launch_winograd_f4x3(
         x,
         U,
@@ -170,7 +170,7 @@ def conv2d_winograd_f4x3_cblocked(
 
     y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
-    U, (_, C_pad) = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
+    U, C_pad = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
     if x_blocked is None:
         x_blocked, C_pad_blocked = prepack_nchw_to_cblocked(x, block_k)
     else:
@@ -224,7 +224,7 @@ def conv2d_winograd_f4x3_fused(
 
     y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
-    U, (_, C_pad) = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
+    U, C_pad = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
     _launch_winograd_f4x3_fused(
         x,
         U,
@@ -316,7 +316,7 @@ def conv2d_general(
     else:
         y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
-    w_k, (_, K_pad) = get_or_make_weight_pack(w_oihw.contiguous(), block_k)
+    w_k, K_pad = get_or_make_weight_pack(w_oihw.contiguous(), block_k)
     _launch_general(
         x,
         w_k,
@@ -365,7 +365,7 @@ def conv2d_nhwc_3x3(
         memory_format=torch.channels_last
     )
     bias_fp32 = bias.float().contiguous() if bias is not None else None
-    w_3x3, (_, C_pad) = get_or_make_weight_pack_3x3(w_oihw.contiguous(), block_k)
+    w_3x3, C_pad = get_or_make_weight_pack_3x3(w_oihw.contiguous(), block_k)
     _launch_3x3_nhwc(
         x,
         w_3x3,
@@ -576,7 +576,7 @@ def conv2d_nchw_cblocked(
 
     y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
-    w_3x3, (_, C_pad) = get_or_make_weight_pack_3x3(w_oihw.contiguous(), block_k)
+    w_3x3, C_pad = get_or_make_weight_pack_3x3(w_oihw.contiguous(), block_k)
     if x_blocked is None:
         # input channel-block size matches the weight padding block
         x_blocked, C_pad_x = prepack_nchw_to_cblocked(x, block_k)
