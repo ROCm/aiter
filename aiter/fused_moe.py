@@ -1526,11 +1526,12 @@ def get_2stage_cfgs(
         _a_type = "fp4" if q_dtype_a == dtypes.fp4x2 else "fp8"
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
+        _s2_tk = 256 if (inter_dim % 256 == 0) else 128
         if token < 2048:
             _tile_m = 32
             _base_kn1 = flydsl_kernel_name(1, _a_type, _w_type, _out_type, 32, 128, 256)
             _base_kn2 = flydsl_kernel_name(
-                2, _a_type, _w_type, _out_type, 32, 128, 256, "atomic"
+                2, _a_type, _w_type, _out_type, 32, 128, _s2_tk, "atomic"
             )
             kn1 = f"{_base_kn1}_w2"
             kn2 = f"{_base_kn2}_bnt2"
@@ -1538,7 +1539,7 @@ def get_2stage_cfgs(
             _tile_m = 64
             _base_kn1 = flydsl_kernel_name(1, _a_type, _w_type, _out_type, 64, 128, 256)
             _base_kn2 = flydsl_kernel_name(
-                2, _a_type, _w_type, _out_type, 64, 128, 256, "atomic"
+                2, _a_type, _w_type, _out_type, 64, 128, _s2_tk, "atomic"
             )
             kn1 = f"{_base_kn1}_w3_bnt0"
             kn2 = _base_kn2
@@ -1548,7 +1549,7 @@ def get_2stage_cfgs(
                 1, _a_type, _w_type, _out_type, 128, 128, 256
             )
             _base_kn2 = flydsl_kernel_name(
-                2, _a_type, _w_type, _out_type, 128, 128, 256, "atomic"
+                2, _a_type, _w_type, _out_type, 128, 128, _s2_tk, "atomic"
             )
             kn1 = f"{_base_kn1}_w2_bnt0"
             kn2 = _base_kn2
@@ -1556,7 +1557,7 @@ def get_2stage_cfgs(
             _tile_m = 64
             _base_kn1 = flydsl_kernel_name(1, _a_type, _w_type, _out_type, 64, 128, 256)
             _base_kn2 = flydsl_kernel_name(
-                2, _a_type, _w_type, _out_type, 64, 128, 256, "atomic"
+                2, _a_type, _w_type, _out_type, 64, 128, _s2_tk, "atomic"
             )
             kn1 = f"{_base_kn1}_w4_bnt0"
             kn2 = _base_kn2

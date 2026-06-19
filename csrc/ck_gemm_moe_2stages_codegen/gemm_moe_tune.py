@@ -1035,10 +1035,6 @@ class FmoeTuner(TunerCommon):
             w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
-            # stage2 (down-proj) scale: e8m0_shuffle is byte-identical to
-            # shuffle_scale_a16w4(gate_up=False) for inter%256==0, but PADS
-            # inter//32 to a multiple of 8 -> supports tile_k=128 shapes whose
-            # inter_dim is not a multiple of 256 (e.g. MiniMax M3 inter=384).
             w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         else:
             w1_qt_shffle_ck = w1_qt_shffle
@@ -1186,16 +1182,15 @@ class FmoeTuner(TunerCommon):
                     block_size=blockM,
                 )
             elif q_type == QuantType.per_1x32 and q_dtype_a == dtypes.fp8:
-                # FlyDSL stage2 receives fp8 input. The scale's group-N dim is
-                # padded to a multiple of 8 (matching fused_dynamic_mxfp8_quant's
-                # scaleN_pad and the kernel's padded read), so non-256 inter_dim
-                # (e.g. M3 inter=384 -> 12 -> 16) doesn't read OOB.
+                # FlyDSL stage2 receives fp8 input
                 a2_qt = ref1.to(dtypes.fp8)
                 M = sorted_ids.shape[0]
                 N = a2_qt.shape[-1]
                 scaleN_pad = ((N // 32) + 7) // 8 * 8
                 a2_scale = torch.ones(
-                    [token * topk, scaleN_pad], dtype=dtypes.fp8_e8m0, device=a2_qt.device
+                    [token * topk, scaleN_pad],
+                    dtype=dtypes.fp8_e8m0,
+                    device=a2_qt.device,
                 )
                 a2_scale_mxfp4_sort = torch.ones(
                     [M, scaleN_pad], dtype=dtypes.fp8_e8m0, device=a2_qt.device
@@ -2244,6 +2239,9 @@ class FmoeTuner(TunerCommon):
 
         if _is_a8w4:
             return self._gen_2stages_task_cktile(info, blockMs)
+
+        if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
+            return tasks_ck
 
         # CK kernels don't support a16wi4 (per_1x32 + i4x2); skip to FlyDSL path
         if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
