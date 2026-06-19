@@ -488,10 +488,17 @@ def compile_flydsl_moe_stage1(
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
-        if a_dtype == "bf16" and not _has_scaled_mxfp4_mfma():
-            # gfx942 a16w4: bf16 activations x MX-FP4 (E2M1) weights, per-32 E8M0
-            # block scale. No scaled MFMA on CDNA3, so dequantize the FP4 weight
-            # to bf16 in-kernel and use legacy bf16 MFMA (fp4_bf16 path).
+        # gfx942 (CDNA3) has no scaled MX-FP4 MFMA: route MX-FP4 weights through
+        # the moe_gemm_2stage in-kernel dequant + legacy bf16 MFMA decode path.
+        #   a16w4 (bf16 act)  -> in_dtype="fp4_bf16"  (weight decode only)
+        #   a8w4  (fp8 act)   -> in_dtype="a8w4_bf16" (fp8 A decode + FP4 weight)
+        _decode_in_dtype = None
+        if not _has_scaled_mxfp4_mfma():
+            if a_dtype == "bf16":
+                _decode_in_dtype = "fp4_bf16"
+            elif a_dtype == "fp8":
+                _decode_in_dtype = "a8w4_bf16"
+        if _decode_in_dtype is not None:
             from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
             # split-K needs cshuffle (None -> auto-enable); non-split-K uses direct epilog
@@ -506,7 +513,7 @@ def compile_flydsl_moe_stage1(
                 tile_n=tile_n,
                 tile_k=tile_k,
                 doweight_stage1=doweight_stage1,
-                in_dtype="fp4_bf16",
+                in_dtype=_decode_in_dtype,
                 group_size=32,
                 out_dtype=out_dtype,
                 use_cshuffle_epilog=_use_cshuffle,
@@ -596,8 +603,15 @@ def compile_flydsl_moe_stage2(
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
-        if a_dtype == "bf16" and not _has_scaled_mxfp4_mfma():
-            # gfx942 a16w4 (see stage1): dequant MX-FP4 weight to bf16, legacy MFMA.
+        # gfx942 decode routing (see compile_flydsl_moe_stage1):
+        #   a16w4 (bf16 act) -> fp4_bf16 ; a8w4 (fp8 act) -> a8w4_bf16.
+        _decode_in_dtype = None
+        if not _has_scaled_mxfp4_mfma():
+            if a_dtype == "bf16":
+                _decode_in_dtype = "fp4_bf16"
+            elif a_dtype == "fp8":
+                _decode_in_dtype = "a8w4_bf16"
+        if _decode_in_dtype is not None:
             from .kernels.moe_gemm_2stage import compile_moe_gemm2
 
             return compile_moe_gemm2(
@@ -609,7 +623,7 @@ def compile_flydsl_moe_stage2(
                 tile_n=tile_n,
                 tile_k=tile_k,
                 doweight_stage2=doweight_stage2,
-                in_dtype="fp4_bf16",
+                in_dtype=_decode_in_dtype,
                 group_size=32,
                 out_dtype=out_dtype,
                 accumulate=accumulate,
@@ -1420,10 +1434,12 @@ def flydsl_moe_stage1(
     kernel_bias = None if _is_splitk else bias
     is_fp4 = b_dtype == "fp4"
     # gfx942 a16w4 (bf16 x MX-FP4) has no scaled MFMA: it runs the moe_gemm
-    # ``fp4_bf16`` decode kernel, which uses the int4-style 14-arg launcher
-    # (``_s1_args_std``, n_in=inter_dim), not the mixed-MFMA fused-quant fp4
-    # launcher (``_s1_args_fp4``, n_in=2*inter_dim + bias/out_scale slots).
-    _decode_w4 = is_fp4 and a_dtype == "bf16" and not _has_scaled_mxfp4_mfma()
+    # ``fp4_bf16``/``a8w4_bf16`` decode kernel, which uses the int4-style 14-arg
+    # launcher (``_s1_args_std``, n_in=inter_dim), not the mixed-MFMA fused-quant
+    # fp4 launcher (``_s1_args_fp4``, n_in=2*inter_dim + bias/out_scale slots).
+    # a16w4 (bf16 act) and a8w4 (fp8 act) both take the std launcher; for a8w4 the
+    # a_scale slot carries the per-1x32 E8M0 activation scale (f32 pow2).
+    _decode_w4 = is_fp4 and a_dtype in ("bf16", "fp8") and not _has_scaled_mxfp4_mfma()
     _use_fp4_args = is_fp4 and not _decode_w4
     _n_in = inter_dim * 2 if _use_fp4_args else inter_dim
     _k_in = model_dim
@@ -1750,9 +1766,10 @@ def flydsl_moe_stage2(
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
     is_fp4 = b_dtype == "fp4"
-    # gfx942 a16w4 decode path: moe_gemm ``fp4_bf16`` kernel uses the 14-arg
-    # std launcher (no bias/out-scale slots), same as int4_bf16.
-    _decode_w4 = is_fp4 and a_dtype == "bf16" and not _has_scaled_mxfp4_mfma()
+    # gfx942 a16w4/a8w4 decode path: moe_gemm ``fp4_bf16``/``a8w4_bf16`` kernel
+    # uses the 14-arg std launcher (no bias/out-scale slots), same as int4_bf16.
+    # a8w4 (fp8 act) carries the per-1x32 E8M0 a2-scale in the a_scale slot.
+    _decode_w4 = is_fp4 and a_dtype in ("bf16", "fp8") and not _has_scaled_mxfp4_mfma()
     _use_fp4_args = is_fp4 and not _decode_w4
     _n_in = model_dim
     _k_in = inter_dim
