@@ -231,7 +231,7 @@ def _precompile_to_cache(
     import torch
 
     dev = torch.device("cpu")
-    is_fp4_weight = b_dtype in ("fp4", "fp8")
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
     is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
@@ -299,7 +299,7 @@ def _precompile_to_cache(
 
     def _make_a1_scale():
         """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
-        if not is_fp4_weight:
+        if not use_mx_gemm:
             if is_int4_weight:
                 # a16wi4: bf16 activations, int4 weights — no activation scale.
                 return None
@@ -336,7 +336,7 @@ def _precompile_to_cache(
         buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
         its own input and the resulting sorted scale uses 32-row alignment.
         """
-        if not is_fp4_weight:
+        if not use_mx_gemm:
             return None
         if stage1_fuse_quant in ("fp4", "fp8"):
             # mirror flydsl_moe_stage1's out_scale_sorted_flat allocation:
@@ -454,7 +454,7 @@ def _precompile_to_cache(
 
             a1_scale = _make_a1_scale()
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
-            if is_fp4_weight:
+            if use_mx_gemm:
                 w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
             elif is_int4_weight:
                 # a16wi4: bf16 groupwise scale over (E, K//32, N).
@@ -491,7 +491,7 @@ def _precompile_to_cache(
             _grid_y = min(max_num_m_blocks, tokens * topk)
             _kernel_out = tmp_out if _is_splitk else out
             kernel_bias = None if _is_splitk else bias
-            _n_in = inter_dim * 2 if is_fp4_weight else inter_dim
+            _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
             _k_in = model_dim
 
             scale_cols = inter_dim // 32
@@ -504,7 +504,7 @@ def _precompile_to_cache(
                 else torch.empty(0, dtype=torch.uint8, device=dev)
             )
 
-            if is_fp4_weight:
+            if use_mx_gemm:
                 args = _s1_args_fp4(
                     _kernel_out.view(-1),
                     a.view(-1),
@@ -617,7 +617,7 @@ def _precompile_to_cache(
             w2 = _alloc(w2_shape, _storage_dtype(b_dtype))
 
             a2_scale = _make_a2_scale_for_stage2()
-            if is_fp4_weight:
+            if use_mx_gemm:
                 w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
             elif is_int4_weight:
                 w2_scale = torch.zeros(
@@ -682,7 +682,7 @@ def _precompile_to_cache(
             _n_in = model_dim
             _k_in = inter_dim
 
-            if is_fp4_weight:
+            if use_mx_gemm:
                 args = _s2_args_fp4(
                     target,
                     a,

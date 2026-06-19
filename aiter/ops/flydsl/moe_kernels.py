@@ -1240,12 +1240,12 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    # fp4 and fp8 weights both use the mixed kernel (bias/out_scale arg builder).
-    is_fp4 = b_dtype in ("fp4", "fp8")
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    # fp4 and fp8 weights both use the MX gemm kernel (bias/out_scale arg builder).
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
 
-    if is_fp4:
+    if use_mx_gemm:
         args = _s1_args_fp4(
             _kernel_out.view(-1),
             a.view(-1),
@@ -1566,8 +1566,8 @@ def flydsl_moe_stage2(
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
-    # fp4 and fp8 weights both use the mixed kernel (bias arg builder).
-    is_fp4 = b_dtype in ("fp4", "fp8")
+    # fp4 and fp8 weights both use the MX gemm kernel (bias arg builder).
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
     _n_in = model_dim
     _k_in = inter_dim
 
@@ -1582,7 +1582,7 @@ def flydsl_moe_stage2(
                 dtype=out.dtype,
             )
 
-    if is_fp4:
+    if use_mx_gemm:
         args = _s2_args_fp4(
             target,
             inter_states,

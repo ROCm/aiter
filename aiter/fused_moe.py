@@ -1528,40 +1528,23 @@ def get_2stage_cfgs(
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = 256 if (inter_dim % 256 == 0) else 128
+        # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
         if token < 2048:
-            _tile_m = 32
-            _base_kn1 = flydsl_kernel_name(1, _a_type, _w_type, _out_type, 32, 128, 256)
-            _base_kn2 = flydsl_kernel_name(
-                2, _a_type, _w_type, _out_type, 32, 128, _s2_tk, "atomic"
-            )
-            kn1 = f"{_base_kn1}_w2"
-            kn2 = f"{_base_kn2}_bnt2"
+            _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
         elif token < 4096:
-            _tile_m = 64
-            _base_kn1 = flydsl_kernel_name(1, _a_type, _w_type, _out_type, 64, 128, 256)
-            _base_kn2 = flydsl_kernel_name(
-                2, _a_type, _w_type, _out_type, 64, 128, _s2_tk, "atomic"
-            )
-            kn1 = f"{_base_kn1}_w3_bnt0"
-            kn2 = _base_kn2
+            _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
         elif token < 16384:
-            _tile_m = 128
-            _base_kn1 = flydsl_kernel_name(
-                1, _a_type, _w_type, _out_type, 128, 128, 256
-            )
-            _base_kn2 = flydsl_kernel_name(
-                2, _a_type, _w_type, _out_type, 128, 128, _s2_tk, "atomic"
-            )
-            kn1 = f"{_base_kn1}_w2_bnt0"
-            kn2 = _base_kn2
+            _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
         else:
-            _tile_m = 64
-            _base_kn1 = flydsl_kernel_name(1, _a_type, _w_type, _out_type, 64, 128, 256)
-            _base_kn2 = flydsl_kernel_name(
-                2, _a_type, _w_type, _out_type, 64, 128, _s2_tk, "atomic"
-            )
-            kn1 = f"{_base_kn1}_w4_bnt0"
-            kn2 = _base_kn2
+            _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+        _base_kn1 = flydsl_kernel_name(
+            1, _a_type, _w_type, _out_type, _tile_m, 128, 256
+        )
+        _base_kn2 = flydsl_kernel_name(
+            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+        )
+        kn1 = f"{_base_kn1}{_s1_sfx}"
+        kn2 = f"{_base_kn2}{_s2_sfx}"
 
         # fp8 stage1 kernel names always carry a "_gui" suffix
         # (moe_kernels.py:114-115). Append it before the lookup so the fp8
