@@ -316,8 +316,10 @@ pytest op_tests/test_batch_prefill.py -k combined_kv -v
 # All ASM qkptph/vph cases (self-attn, varlen, unaligned, combined-KV):
 pytest op_tests/test_batch_prefill.py -k batch_prefill_asm -v
 
-# Latency/TFLOPS perf sweep (opt-in):
-AITER_ASM_PERF=1 pytest op_tests/test_batch_prefill.py -k batch_prefill_asm_perf -v
+# Latency/TFLOPS perf sweep (opt-in). NOTE: pass -s (disable pytest output
+# capture) so the per-seqlen "latency=... ms ... TFLOPS" lines are printed;
+# without it pytest swallows stdout for passing tests (use -rP to dump it after).
+AITER_ASM_PERF=1 pytest op_tests/test_batch_prefill.py -k batch_prefill_asm_perf -v -s
 ```
 
 Or drive it directly from Python (no pytest), e.g. a single combined-KV run:
