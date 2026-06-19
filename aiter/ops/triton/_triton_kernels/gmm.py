@@ -329,8 +329,37 @@ def _gmm(
 
 
 @triton.jit
-def _inc(tile_counter_ptr):
+def _inc_tile_counter(tile_counter_ptr):
     return tl.atomic_add(tile_counter_ptr, 1, sem="relaxed", scope="gpu")
+
+
+# Claims the next GMM tile, handling the local-XCD to global phase transition.
+# The first claim is just a claim entered with `in_global_phase == False` (or
+# `True` when there is no XCD phase at all).
+@triton.jit
+def _claim_gmm_tile(
+    in_global_phase,
+    xcd,
+    tiles_per_xcd,
+    xcd_phase_tiles,
+    xcd_tile_counter_ptr,
+    global_tile_counter_ptr,
+    INT_TYPE: tl.constexpr,
+):
+    if in_global_phase:
+        # Already draining the global counter, skip the XCD counter entirely.
+        global_tile = _inc_tile_counter(global_tile_counter_ptr)
+        tile = (xcd_phase_tiles + global_tile).to(INT_TYPE)
+    else:
+        xcd_tile = _inc_tile_counter(xcd_tile_counter_ptr)
+        if xcd_tile >= tiles_per_xcd:
+            # XCD phase exhausted: transition to the global phase.
+            in_global_phase = True
+            global_tile = _inc_tile_counter(global_tile_counter_ptr)
+            tile = (xcd_phase_tiles + global_tile).to(INT_TYPE)
+        else:
+            tile = (xcd * tiles_per_xcd + xcd_tile).to(INT_TYPE)
+    return tile, in_global_phase
 
 
 @triton.jit
@@ -400,14 +429,18 @@ def _work_stealing_gmm(
     # The kernel starts in phase 1 and then proceeds to phase 2 when (tile >= xcd_phase_tiles).
     xcd_phase_tiles = tiles_per_xcd * NUM_XCDS
 
-    # Claim first tile.
-    xcd_tile = _inc(xcd_tile_counter_ptr)
-    in_global_phase = xcd_tile >= tiles_per_xcd
-    if in_global_phase:
-        global_tile = _inc(global_tile_counter_ptr)
-        tile = (xcd_phase_tiles + global_tile).to(INT_TYPE)
-    else:
-        tile = (xcd * tiles_per_xcd + xcd_tile).to(INT_TYPE)
+    # Claim first tile. When there is no XCD phase (`tiles_per_xcd == 0`) we go
+    # straight to the global phase.
+    in_global_phase = tiles_per_xcd == 0
+    tile, in_global_phase = _claim_gmm_tile(
+        in_global_phase,
+        xcd,
+        tiles_per_xcd,
+        xcd_phase_tiles,
+        xcd_tile_counter_ptr,
+        global_tile_counter_ptr,
+        INT_TYPE=INT_TYPE,
+    )
 
     while tile < total_tiles:
         # Resolve and process tile.
@@ -447,18 +480,15 @@ def _work_stealing_gmm(
         )
 
         # Claim next tile.
-        if in_global_phase:
-            global_tile = _inc(global_tile_counter_ptr)
-            tile = (xcd_phase_tiles + global_tile).to(INT_TYPE)
-        else:
-            xcd_tile = _inc(xcd_tile_counter_ptr)
-            if xcd_tile >= tiles_per_xcd:
-                # Transition from XCD phase to global phase.
-                in_global_phase = True
-                global_tile = _inc(global_tile_counter_ptr)
-                tile = (xcd_phase_tiles + global_tile).to(INT_TYPE)
-            else:
-                tile = (xcd * tiles_per_xcd + xcd_tile).to(INT_TYPE)
+        tile, in_global_phase = _claim_gmm_tile(
+            in_global_phase,
+            xcd,
+            tiles_per_xcd,
+            xcd_phase_tiles,
+            xcd_tile_counter_ptr,
+            global_tile_counter_ptr,
+            INT_TYPE=INT_TYPE,
+        )
 
 
 @triton.heuristics(
