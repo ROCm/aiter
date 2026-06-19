@@ -36,7 +36,7 @@ from aiter.int4_utils import (
     rearrange_4bit_elements,
     convert_int8_to_uint32_int4,
 )
-from aiter.ops.quant import per_1x32_i4_quant
+from aiter.ops.quant import per_1x32_i4_quant, per_1x32_f8_scale_f8_quant
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
@@ -202,6 +202,10 @@ class FmoeTuner(TunerCommon):
             )
         elif qType == QuantType.per_1x32 and quant_dtype == dtypes.i4x2:
             weight_qt, weight_scale = per_1x32_i4_quant(weight)
+        elif qType == QuantType.per_1x32 and quant_dtype == dtypes.fp8:  # mxfp8
+            weight_qt, weight_scale = per_1x32_f8_scale_f8_quant(
+                weight, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            )
         else:
             torch_quant = aiter.get_torch_quant(qType)
             weight_qt, weight_scale = torch_quant(weight, quant_dtype=quant_dtype)
@@ -781,7 +785,11 @@ class FmoeTuner(TunerCommon):
             q_type == aiter.QuantType.per_1x32
             and (q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
             and q_dtype_w == dtypes.fp4x2
-        ):  # a16w4 or a8w4
+        ) or (
+            q_type == aiter.QuantType.per_1x32
+            and q_dtype_a == dtypes.fp8
+            and q_dtype_w == dtypes.fp8
+        ):  # a16w4 / a8w4 / mxfp8 (runtime fuses the fp8 a-quant)
             a1_qt = input.to(dtype)
             a1_scale = None
         elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:  # a16wi4
@@ -986,6 +994,11 @@ class FmoeTuner(TunerCommon):
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
             w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
+        elif q_dtype_w == dtypes.fp8 and q_dtype_a == dtypes.fp8:  # mxfp8 (a8w8)
+            w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
+            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
+            w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
@@ -1136,11 +1149,14 @@ class FmoeTuner(TunerCommon):
                 a2_qt = ref1.to(dtypes.fp8)
                 M = sorted_ids.shape[0]
                 N = a2_qt.shape[-1]
+                scaleN_pad = ((N // 32) + 7) // 8 * 8
                 a2_scale = torch.ones(
-                    [token * topk, N // 32], dtype=dtypes.fp8_e8m0, device=a2_qt.device
+                    [token * topk, scaleN_pad],
+                    dtype=dtypes.fp8_e8m0,
+                    device=a2_qt.device,
                 )
                 a2_scale_mxfp4_sort = torch.ones(
-                    [M, N // 32], dtype=dtypes.fp8_e8m0, device=a2_qt.device
+                    [M, scaleN_pad], dtype=dtypes.fp8_e8m0, device=a2_qt.device
                 )
             else:
                 torch_quant = aiter.get_torch_quant(q_type)
@@ -2213,6 +2229,9 @@ class FmoeTuner(TunerCommon):
         if _is_a8w4:
             return self._gen_2stages_task_cktile(info, blockMs)
 
+        if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
+            return tasks_ck
+
         # CK kernels don't support a16wi4 (per_1x32 + i4x2); skip to FlyDSL path
         if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
             return tasks_ck
@@ -2596,7 +2615,10 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
+        if q_type != QuantType.per_1x32 or q_dtype_w not in (
+            dtypes.fp4x2,
+            dtypes.fp8,
+        ):
             return tasks_flydsl
 
         _a_dtype_map = {
@@ -2606,7 +2628,7 @@ class FmoeTuner(TunerCommon):
             dtypes.bf16: "fp16",
         }
         a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
-        b_dtype_str = "fp4"
+        b_dtype_str = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
         flydsl_s1_kernels = get_flydsl_stage1_kernels(
