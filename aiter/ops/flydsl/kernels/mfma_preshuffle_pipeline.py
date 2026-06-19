@@ -9,18 +9,26 @@ Key primitives:
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
+
+import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
-from flydsl.expr.typing import T
 from flydsl.expr import arith as _arith
-import flydsl.expr as fx
+from flydsl.expr.typing import T
 
 
 def crd2idx(crd, layout):
-    """crd2idx returning an index-type scalar (unwraps fly.int_tuple)."""
-    result = fx.crd2idx(crd, layout)
-    scalar = fx.get_scalar(result)
+    """crd2idx returning an index-typed ir.Value (unwraps fly.int_tuple).
+
+    Version-agnostic: flydsl>=0.2.2 ``get_scalar`` returns an ``ArithValue``
+    wrapper (unwrap via ``.ir_value()``), while 0.2.1 returns the raw
+    ``ir.Value`` directly.
+    """
+    scalar = fx.get_scalar(fx.crd2idx(crd, layout))
+    if hasattr(scalar, "ir_value"):
+        scalar = scalar.ir_value()
     if isinstance(scalar, ir.Value) and not isinstance(scalar.type, ir.IndexType):
         scalar = _arith.IndexCastOp(T.index, scalar).result
     return scalar
@@ -130,9 +138,7 @@ def make_preshuffle_scale_layout(
     c_mn1 = (c_mn // c16) // fx.Index(mn_pack)
     c_k1 = (c_k_scale // c4) // fx.Index(k_pack)
     if elem_bytes != mn_pack * k_pack:
-        raise ValueError(
-            f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
-        )
+        raise ValueError(f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}")
 
     stride_klane = c16
     stride_k0 = c4 * stride_klane
@@ -191,11 +197,7 @@ def make_preshuffle_b_layout(
     c_k_bytes = c_k * arith.constant(int(elem_bytes), index=True)
     n0 = c_n // c16
 
-    c_kpack_elems = (
-        c_kpack
-        if elem_bytes == 1
-        else (c_kpack // arith.constant(int(elem_bytes), index=True))
-    )
+    c_kpack_elems = c_kpack if elem_bytes == 1 else (c_kpack // arith.constant(int(elem_bytes), index=True))
 
     stride_nlane = c_kpack_elems
 
@@ -225,9 +227,7 @@ def make_preshuffle_b_layout(
     stride_nlane_i32 = arith.index_cast(T.i32, stride_nlane)
 
     stride_b = (stride_n0_i32, stride_k0_i32, stride_klane_i32, stride_nlane_i32, 1)
-    layout_b = fx.make_layout(
-        (n0_i32, c_k0_i32, klane_dim, 16, kpack_elems_static), stride_b
-    )
+    layout_b = fx.make_layout((n0_i32, c_k0_i32, klane_dim, 16, kpack_elems_static), stride_b)
     return PreshuffleBLayout(layout_b=layout_b, kpack_bytes=kpack_bytes)
 
 
@@ -332,7 +332,7 @@ def load_b_raw_w4a16(
     k2_base = lane_odd * fx.Index(half_bytes)
 
     coord_pack = (n_blk, k0, k1_local, n_intra, fx.Index(0))
-    idx_pack = crd2idx(coord_pack, layout_b)
+    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
     idx_bytes = idx_pack + k2_base
 
     b4 = _buffer_load_vec(
@@ -353,9 +353,7 @@ def load_b_raw_w4a16(
     return packed32
 
 
-def _int4_to_bf16x4_i64_gfx950(
-    packed32, nibble_offsets, arith, vector, scale_val=None, defer_scale16=False
-):
+def _int4_to_bf16x4_i64_gfx950(packed32, nibble_offsets, arith, vector, scale_val=None, defer_scale16=False):
     """Convert 4 int4 nibbles to 4 bf16 packed as i64 using gfx950 instructions.
 
     Uses v_cvt_off_f32_i4_sdwa with byte_sel to avoid per-nibble shifts.
@@ -367,8 +365,8 @@ def _int4_to_bf16x4_i64_gfx950(
     omitted and must be applied later (e.g. in the epilogue).  This saves VALU
     in the hot loop and uses v_cvt_pk_bf16_f32 for proper f32→bf16 conversion.
     """
-    from flydsl.expr import rocdl
     from flydsl._mlir.dialects._arith_ops_gen import MulFOp as _MulFOp
+    from flydsl.expr import rocdl
 
     _uw = _arith._to_raw
     _av = _arith.ArithValue
@@ -411,9 +409,7 @@ def _int4_to_bf16x4_i64_gfx950(
     return vector.extract(v64, static_position=[0], dynamic_position=[])
 
 
-def unpack_b_w4a16(
-    packed32, arith, vector, scale_val=None, use_gfx950_cvt=False, defer_scale16=False
-):
+def unpack_b_w4a16(packed32, arith, vector, scale_val=None, use_gfx950_cvt=False, defer_scale16=False):
     """Phase 2 of W4A16 B load: unpack int4->int8 + convert int8->bf16.
 
     Takes raw packed32 from load_b_raw_w4a16 and produces (b0, b1) --
@@ -427,27 +423,212 @@ def unpack_b_w4a16(
     in the epilogue.
     """
     if use_gfx950_cvt:
-        b0 = _int4_to_bf16x4_i64_gfx950(
-            packed32,
-            [0, 2, 4, 6],
-            arith,
-            vector,
-            scale_val,
-            defer_scale16=defer_scale16,
-        )
-        b1 = _int4_to_bf16x4_i64_gfx950(
-            packed32,
-            [1, 3, 5, 7],
-            arith,
-            vector,
-            scale_val,
-            defer_scale16=defer_scale16,
-        )
+        b0 = _int4_to_bf16x4_i64_gfx950(packed32, [0, 2, 4, 6], arith, vector, scale_val, defer_scale16=defer_scale16)
+        b1 = _int4_to_bf16x4_i64_gfx950(packed32, [1, 3, 5, 7], arith, vector, scale_val, defer_scale16=defer_scale16)
         return (b0, b1)
     even, odd = _unpack_int4_to_int8_pair(packed32)
     b0 = _i8x4_in_i32_to_bf16x4_i64(even, arith, vector, scale_val=scale_val)
     b1 = _i8x4_in_i32_to_bf16x4_i64(odd, arith, vector, scale_val=scale_val)
     return (b0, b1)
+
+
+def _fp4_code_to_f32_bits(code, arith):
+    """Convert one MX-FP4 (E2M1) 4-bit code (in low nibble of ``code``) to the
+    IEEE-754 f32 bit pattern (as an i32), pure-ALU (no gfx950 scaled-convert).
+
+    E2M1 layout: [sign:1][exp:2][mantissa:1]. The 16 representable values are
+    {0, .5, 1, 1.5, 2, 3, 4, 6} and their negatives (matches
+    ``fp4_utils.mxfp4_to_f32`` LUT order).
+
+    Magnitude index ``mag = code & 7`` maps to f32 as:
+      mag>=2 (normal): exp_field = mag>>1, mant = mag&1
+                       f32_exp = exp_field + 126, f32_mantissa_msb = mant
+      mag==1 -> 0.5 (0x3F000000), mag==0 -> 0.0 (subnormal fixups).
+    The sign bit (code bit 3) is OR'd into f32 bit 31.
+    """
+    sign = (code & fx.Int32(0x8)) << fx.Int32(28)  # code bit3 -> f32 bit31
+    mag = code & fx.Int32(0x7)
+    exp_field = mag >> fx.Int32(1)  # logical shift (0..3)
+    mant = mag & fx.Int32(0x1)
+    norm_bits = ((exp_field + fx.Int32(126)) << fx.Int32(23)) | (mant << fx.Int32(22))
+    is_zero = arith.cmpi(CmpIPredicate.eq, mag, fx.Int32(0))
+    is_half = arith.cmpi(CmpIPredicate.eq, mag, fx.Int32(1))
+    mag_bits = arith.select(is_half, fx.Int32(0x3F000000), norm_bits)  # 0.5
+    mag_bits = arith.select(is_zero, fx.Int32(0x00000000), mag_bits)  # 0.0
+    return mag_bits | sign
+
+
+def _fp4x4_in_i32_to_bf16x4_i64(nib_i32, arith, vector, scale_val=None):
+    """Convert one i32 holding 4 E2M1 codes (low nibble of each byte) to 4 bf16
+    packed as i64. Mirrors ``_i8x4_in_i32_to_bf16x4_i64`` packing.
+
+    f32->bf16 uses the lshr-16 truncation (exact here: every E2M1 magnitude has
+    <=3 significant mantissa bits, so the low 16 f32 bits are zero).
+
+    When ``scale_val`` is given (an f32 per-32-element block scale), each value is
+    multiplied by it before bf16 truncation. For MX block scales (E8M0 = pure
+    powers of two) this exponent-only multiply is exact and leaves the low 16
+    f32 bits zero, so the lshr-16 truncation stays exact.
+    """
+    f32_bits = [_fp4_code_to_f32_bits((nib_i32 >> fx.Int32(8 * i)) & fx.Int32(0xF), arith) for i in range(4)]
+    if scale_val is not None:
+        scaled = []
+        for b in f32_bits:
+            fv = arith.bitcast(T.f32, _arith._to_raw(b))
+            fv = fv * scale_val
+            scaled.append(arith.bitcast(T.i32, _arith._to_raw(fv)))
+        f32_bits = scaled
+    c16 = fx.Int32(16)
+    c_ffff0000 = fx.Int32(0xFFFF0000)
+    i32_lo = (f32_bits[0] >> c16) | (f32_bits[1] & c_ffff0000)
+    i32_hi = (f32_bits[2] >> c16) | (f32_bits[3] & c_ffff0000)
+    v2 = vector.from_elements(T.i32x2, [_arith._to_raw(i32_lo), _arith._to_raw(i32_hi)])
+    v64 = vector.bitcast(T.vec(1, T.i64), v2)
+    return vector.extract(v64, static_position=[0], dynamic_position=[])
+
+
+def _fp4x4_in_i32_to_bf16x4_i64_via_fp8(nib_i32, arith, vector):
+    """Fast E2M1->bf16 for 4 nibbles (low nibble of each byte of ``nib_i32``).
+
+    Builds the E4M3FNUZ fp8 byte for all 4 nibbles with branchless SWAR integer
+    ops (once per i32, not per-nibble), then uses the hardware ``cvt_pk_f32_fp8``
+    to expand fp8->f32 -- avoiding the per-nibble IEEE-bit construction and the
+    cmp/select special-casing of the pure-ALU path.
+
+    E2M1 magnitude (mag = code & 7) -> E4M3FNUZ byte, gathered for all 4 nibbles
+    with a single ``v_perm_b32`` byte-LUT (mag is already a 0..7 byte index):
+      mag: 0    1    2    3    4    5    6    7
+      fp8: 0x00 0x38 0x40 0x44 0x48 0x4C 0x50 0x54
+    The sign bit (code bit3) goes to fp8 bit7, but is forced off when mag==0 so
+    E2M1 -0.0 maps to fp8 +0.0 (0x80 is NaN in FNUZ), matching the reference LUT.
+
+    f32->bf16 uses the lshr-16 truncation (exact: every value has <=3 mantissa
+    bits, so the low 16 f32 bits are zero).
+    """
+    from flydsl.expr import rocdl
+
+    c7 = fx.Int32(7)
+    mag = nib_i32 & fx.Int32(0x07070707)
+    # v_perm_b32 byte pool {SRC_HI:SRC_LO}: sel 0..3 -> SRC_LO bytes, 4..7 -> SRC_HI.
+    src_lo = fx.Int32(0x44403800)  # bytes[0..3] = fp8[mag 0..3]
+    src_hi = fx.Int32(0x54504C48)  # bytes[4..7] = fp8[mag 4..7]
+    magbyte = _arith.ArithValue(
+        rocdl.perm_b32(_arith._to_raw(src_hi), _arith._to_raw(src_lo), _arith._to_raw(mag))
+    )
+    nz = ((mag + fx.Int32(0x7F7F7F7F)) >> c7) & fx.Int32(0x01010101)  # 1 per byte if mag>=1
+    signbit = (nib_i32 & fx.Int32(0x08080808)) << fx.Int32(4)  # code bit3 -> fp8 bit7 (0x80)
+    signmask = nz << c7  # 0x80 where mag>=1 (drop sign on zero -> avoid FNUZ NaN)
+    fp8_i32 = magbyte | (signbit & signmask)
+
+    lo = rocdl.cvt_pk_f32_fp8(T.f32x2, _arith._to_raw(fp8_i32), word_sel=False)
+    hi = rocdl.cvt_pk_f32_fp8(T.f32x2, _arith._to_raw(fp8_i32), word_sel=True)
+    f = [
+        vector.extract(lo, static_position=[0], dynamic_position=[]),
+        vector.extract(lo, static_position=[1], dynamic_position=[]),
+        vector.extract(hi, static_position=[0], dynamic_position=[]),
+        vector.extract(hi, static_position=[1], dynamic_position=[]),
+    ]
+    bits = [arith.bitcast(T.i32, _arith._to_raw(fv)) for fv in f]
+    c16 = fx.Int32(16)
+    c_ffff0000 = fx.Int32(0xFFFF0000)
+    i32_lo = (bits[0] >> c16) | (bits[1] & c_ffff0000)
+    i32_hi = (bits[2] >> c16) | (bits[3] & c_ffff0000)
+    v2 = vector.from_elements(T.i32x2, [_arith._to_raw(i32_lo), _arith._to_raw(i32_hi)])
+    v64 = vector.bitcast(T.vec(1, T.i64), v2)
+    return vector.extract(v64, static_position=[0], dynamic_position=[])
+
+
+def dequant_fp4_to_bf16(packed32, arith, vector, scale_val=None):
+    """Dequantize 8 packed MX-FP4 (E2M1) nibbles -> (b0, b1), two i64 each
+    holding 4 bf16, for one bf16 MFMA K64 micro-step on gfx942 (CDNA3).
+
+    Drop-in replacement for ``unpack_b_w4a16`` on the FP4 weight path: same
+    even/odd nibble split (b0 = nibbles 0,2,4,6; b1 = 1,3,5,7) so the existing
+    int4_bf16 preshuffle layout and MFMA consumption order are reused unchanged.
+
+    ``scale_val`` is the f32 per-32-element E8M0 block scale (one block == one
+    K64 micro-step). Because E8M0 scales are powers of two, applying it here as
+    an exponent-only multiply on the dequantized weight is exact and equivalent
+    to a post-MFMA scale of the dot product (the scale is constant across the
+    block's K reduction). Pass ``None`` for the unscaled magnitude.
+    """
+    c_0f0f = fx.Int32(0x0F0F0F0F)
+    even = packed32 & c_0f0f
+    odd = (packed32 >> fx.Int32(4)) & c_0f0f
+    if scale_val is None:
+        # Fast path (gfx942): SWAR fp8-byte build + hardware cvt_pk_f32_fp8.
+        b0 = _fp4x4_in_i32_to_bf16x4_i64_via_fp8(even, arith, vector)
+        b1 = _fp4x4_in_i32_to_bf16x4_i64_via_fp8(odd, arith, vector)
+        return (b0, b1)
+    b0 = _fp4x4_in_i32_to_bf16x4_i64(even, arith, vector, scale_val=scale_val)
+    b1 = _fp4x4_in_i32_to_bf16x4_i64(odd, arith, vector, scale_val=scale_val)
+    return (b0, b1)
+
+
+def e8m0_to_f32_inkernel(e8m0_i32, arith):
+    """Decode an E8M0 block-scale byte (biased exponent) to an f32 scale.
+
+    Equivalent to ``v_ldexp_f32(1.0, byte - 127)`` for the normal range
+    (byte in 1..254): the result is ``2^(byte-127)`` built directly as
+    ``(byte << 23)`` reinterpreted as f32. The byte==0 (tiny) / byte==0xFF
+    (NaN) specials of ``fp4_utils.e8m0_to_f32`` are not reproduced because MX
+    weight scales are always in the normal range.
+    """
+    bits = (e8m0_i32 & fx.Int32(0xFF)) << fx.Int32(23)
+    return arith.bitcast(T.f32, _arith._to_raw(bits))
+
+
+def _fp8x4_in_i32_to_bf16x4_i64(fp8_i32, arith, vector, scale_val=None):
+    """Convert one i32 holding 4 E4M3FNUZ fp8 bytes to 4 bf16 packed in one i64.
+
+    gfx942 activation decode for the a8w4 path: expand fp8->f32 with the hardware
+    ``cvt_pk_f32_fp8`` (the same intrinsic the FP4 weight decode uses), then
+    truncate f32->bf16 via the lshr-16 path. The truncation is exact: E4M3 has
+    only 3 mantissa bits, so the low 16 bits of the f32 representation are zero.
+
+    ``scale_val`` is an optional f32 per-32-element E8M0 block scale (one scale
+    for the 4 contiguous-K bytes in this i32, which lie in the same MX block).
+    Because E8M0 scales are powers of two, folding it in here is exact and
+    equivalent to a post-MFMA scale of the dot product. Pass ``None`` to leave
+    the magnitude unscaled (deferred-scale path).
+    """
+    from flydsl.expr import rocdl
+
+    lo = rocdl.cvt_pk_f32_fp8(T.f32x2, _arith._to_raw(fp8_i32), word_sel=False)
+    hi = rocdl.cvt_pk_f32_fp8(T.f32x2, _arith._to_raw(fp8_i32), word_sel=True)
+    f = [
+        vector.extract(lo, static_position=[0], dynamic_position=[]),
+        vector.extract(lo, static_position=[1], dynamic_position=[]),
+        vector.extract(hi, static_position=[0], dynamic_position=[]),
+        vector.extract(hi, static_position=[1], dynamic_position=[]),
+    ]
+    if scale_val is not None:
+        f = [arith.ArithValue(_arith._to_raw(fv)) * scale_val for fv in f]
+    bits = [arith.bitcast(T.i32, _arith._to_raw(fv)) for fv in f]
+    c16 = fx.Int32(16)
+    c_ffff0000 = fx.Int32(0xFFFF0000)
+    i32_lo = (bits[0] >> c16) | (bits[1] & c_ffff0000)
+    i32_hi = (bits[2] >> c16) | (bits[3] & c_ffff0000)
+    v2 = vector.from_elements(T.i32x2, [_arith._to_raw(i32_lo), _arith._to_raw(i32_hi)])
+    v64 = vector.bitcast(T.vec(1, T.i64), v2)
+    return vector.extract(v64, static_position=[0], dynamic_position=[])
+
+
+def dequant_fp8_to_bf16(fp8_i64, arith, vector, scale_val=None):
+    """Dequantize 8 packed E4M3FNUZ fp8 activation bytes (one i64) -> (a0, a1),
+    two i64 each holding 4 bf16, for one bf16 MFMA K-step on gfx942 (CDNA3).
+
+    Mirror of ``dequant_fp4_to_bf16`` for the activation side of the a8w4 path:
+    the fp8 byte stream is split into the low/high i32 (4 bytes each) and each is
+    expanded fp8->f32->bf16. ``scale_val`` (optional, f32 power-of-two E8M0 block
+    scale) is folded in exactly when provided.
+    """
+    v2 = vector.bitcast(T.i32x2, vector.from_elements(T.vec(1, T.i64), [_arith._to_raw(fp8_i64)]))
+    lo_i32 = vector.extract(v2, static_position=[0], dynamic_position=[])
+    hi_i32 = vector.extract(v2, static_position=[1], dynamic_position=[])
+    a0 = _fp8x4_in_i32_to_bf16x4_i64(lo_i32, arith, vector, scale_val=scale_val)
+    a1 = _fp8x4_in_i32_to_bf16x4_i64(hi_i32, arith, vector, scale_val=scale_val)
+    return (a0, a1)
 
 
 def load_b_pack_k32(
@@ -488,7 +669,7 @@ def load_b_pack_k32(
     k2_base = arith.constant((ki_step % 2) * half_bytes, index=True)
 
     coord_pack = (n_blk, k0, k1, n_intra, fx.Index(0))
-    idx_pack = crd2idx(coord_pack, layout_b)
+    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
 
     if unpack_int4:
         idx_bytes = idx_pack + k2_base
@@ -551,7 +732,7 @@ def tile_chunk_coord_i32(
         raise ValueError(f"chunk_i32 must be one of (1,2,4), got {chunk_i32!r}")
     chunk_off_i32 = arith.constant(i * total_threads * chunk_i32, index=True)
     tile_idx_i32 = tx_i32_base + chunk_off_i32
-    coord_local = fx.idx2crd(tile_idx_i32, layout_tile_div4)
+    coord_local = fx.idx2crd(fx.Int32(tile_idx_i32), layout_tile_div4)
     row_local = fx.get(coord_local, 0)
     col_local_i32 = fx.get(coord_local, 1)
     return row_local, col_local_i32
@@ -604,7 +785,7 @@ def lds_store_16b_xor16(
     col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
     col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
-    idx0 = crd2idx(coord_store, layout_lds) + lds_base
+    idx0 = crd2idx(tuple(fx.Int32(c) for c in coord_store), layout_lds) + lds_base
     v16 = vector.bitcast(vec16_ty, vec_part_i32x4)
     vector.store(v16, lds_memref, [idx0])
 
@@ -631,7 +812,7 @@ def lds_store_8b_xor16(
     col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
     col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
-    idx0 = crd2idx(coord_store, layout_lds) + lds_base
+    idx0 = crd2idx(tuple(fx.Int32(c) for c in coord_store), layout_lds) + lds_base
     v8 = vector.bitcast(vec8_ty, vec_part_i32x2)
     vector.store(v8, lds_memref, [idx0])
 
@@ -658,7 +839,7 @@ def lds_store_4b_xor16(
     col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
     col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
-    idx0 = crd2idx(coord_store, layout_lds) + lds_base
+    idx0 = crd2idx(tuple(fx.Int32(c) for c in coord_store), layout_lds) + lds_base
     v4 = vector.bitcast(vec4_ty, vec_part_i32x1)
     vector.store(v4, lds_memref, [idx0])
 
@@ -684,14 +865,14 @@ def lds_load_pack_k32(
     col_base_swz = swizzle_xor16(curr_row_a_lds, col_base, k_blocks16)
     if ck_lds128:
         coord_a16 = (curr_row_a_lds, col_base_swz)
-        idx_a16 = crd2idx(coord_a16, layout_lds) + lds_base
+        idx_a16 = crd2idx(tuple(fx.Int32(c) for c in coord_a16), layout_lds) + lds_base
         loaded_a16 = vector.load_op(vec16_ty, lds_memref, [idx_a16])
         a_vec128 = vector.bitcast(vec2_i64_ty, loaded_a16)
         return vector.extract(a_vec128, static_position=[half], dynamic_position=[])
     else:
         col_swizzled = col_base_swz + (half * 8)
         coord_a = (curr_row_a_lds, col_swizzled)
-        idx_a = crd2idx(coord_a, layout_lds) + lds_base
+        idx_a = crd2idx(tuple(fx.Int32(c) for c in coord_a), layout_lds) + lds_base
         loaded_a8 = vector.load_op(vec8_ty, lds_memref, [idx_a])
         a_vec64 = vector.bitcast(vec1_i64_ty, loaded_a8)
         return vector.extract(a_vec64, static_position=[0], dynamic_position=[])
@@ -738,13 +919,8 @@ def xcd_remap_bx_by(
     _num_wgs = _gx * _gy
 
     _c_xcds = fx.arith.constant(num_xcds, index=True)
-    _q = _num_wgs / _c_xcds
-    _r = _num_wgs % _c_xcds
-    _xcd = _linear_id % _c_xcds
-    _in_xcd = _linear_id / _c_xcds
-    _xcd_lt_r = fx.arith.cmpi(CmpIPredicate.ult, _xcd, _r)
-    _clip = fx.arith.select(_xcd_lt_r, _xcd, _r)
-    _wgid = _xcd * _q + _clip + _in_xcd
+    _wgs_per_xcd = _num_wgs / _c_xcds
+    _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
 
     _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
     _num_wgid_in_group = _c_wgm * _gx
@@ -772,14 +948,10 @@ __all__ = [
     "make_preshuffle_b_layout",
     "make_preshuffle_scale_layout",
     "load_b_pack_k32",
-    "load_b_raw_w4a16",
-    "unpack_b_w4a16",
-    "load_b_raw_w4a16_groupwise",
-    "unpack_b_w4a16_groupwise",
-    "extract_bf16_scale",
     "split_row_major_2d",
     "swizzle_xor16",
     "tile_chunk_coord_i32",
+    "unpack_b_w4a16",
     "xcd_remap_bx_by",
 ]
 
@@ -833,18 +1005,14 @@ def _load_groupwise_scale(
         dword_elem = dword_base + pair_idx * c_npe
         dword_idx = arith.index_cast(T.i32, dword_elem)
         # Return raw i32 dword — extraction deferred to compute phase.
-        scale_val = buffer_ops.buffer_load(
-            scale_rsrc, dword_idx, vec_width=1, dtype=T.i32
-        )
+        scale_val = buffer_ops.buffer_load(scale_rsrc, dword_idx, vec_width=1, dtype=T.i32)
     else:
         # (E, G, N) layout with f32 dtype
         c_gm1 = fx.Index(num_groups - 1)
         base_scale = expert_offset * c_gm1 + n_global
         elem_idx = base_scale + group_idx * c_npe
         scale_idx_i32 = arith.index_cast(T.i32, elem_idx)
-        scale_val = buffer_ops.buffer_load(
-            scale_rsrc, scale_idx_i32, vec_width=1, dtype=T.f32
-        )
+        scale_val = buffer_ops.buffer_load(scale_rsrc, scale_idx_i32, vec_width=1, dtype=T.f32)
     return scale_val
 
 
@@ -930,6 +1098,4 @@ def load_b_raw_w4a16_groupwise(
 
 def unpack_b_w4a16_groupwise(packed32, scale_val, arith, vector, use_gfx950_cvt=False):
     """Phase 2 of W4A16 groupwise: unpack + scale + convert to bf16."""
-    return unpack_b_w4a16(
-        packed32, arith, vector, scale_val=scale_val, use_gfx950_cvt=use_gfx950_cvt
-    )
+    return unpack_b_w4a16(packed32, arith, vector, scale_val=scale_val, use_gfx950_cvt=use_gfx950_cvt)

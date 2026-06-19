@@ -22,6 +22,24 @@ def _get_dtypes():
 _SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
 
 
+@functools.lru_cache(maxsize=1)
+def _has_scaled_mxfp4_mfma() -> bool:
+    """True on archs with native scaled MX-FP4 MFMA (``mfma.scale f8f6f4``).
+
+    That instruction is CDNA4 (gfx950) and newer only. gfx942 (CDNA3) lacks it,
+    so the MX-FP4 weight path must dequantize to bf16 and use legacy bf16 MFMA
+    (the ``moe_gemm_2stage`` ``fp4_bf16`` path) instead of the scaled-MFMA
+    ``mixed_moe_gemm`` kernel, which fails to select the intrinsic on gfx942.
+    """
+    try:
+        from flydsl.runtime.device import get_rocm_arch
+
+        g = (get_rocm_arch() or "").lower()
+    except Exception:
+        return False
+    return g.startswith("gfx950") or g.startswith("gfx12")
+
+
 def flydsl_kernel_name(
     stage: int,
     a_dtype: str,
@@ -353,6 +371,30 @@ def compile_flydsl_moe_stage1(
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
+        if a_dtype == "bf16" and not _has_scaled_mxfp4_mfma():
+            # gfx942 a16w4: bf16 activations x MX-FP4 (E2M1) weights, per-32 E8M0
+            # block scale. No scaled MFMA on CDNA3, so dequantize the FP4 weight
+            # to bf16 in-kernel and use legacy bf16 MFMA (fp4_bf16 path).
+            from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+            # split-K needs cshuffle (None -> auto-enable); non-split-K uses direct epilog
+            _use_cshuffle = None if k_batch > 1 else False
+
+            return compile_moe_gemm1(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=experts,
+                topk=topk,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                doweight_stage1=doweight_stage1,
+                in_dtype="fp4_bf16",
+                group_size=32,
+                out_dtype=out_dtype,
+                use_cshuffle_epilog=_use_cshuffle,
+                k_batch=k_batch,
+            )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
 
@@ -437,6 +479,24 @@ def compile_flydsl_moe_stage2(
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
+        if a_dtype == "bf16" and not _has_scaled_mxfp4_mfma():
+            # gfx942 a16w4 (see stage1): dequant MX-FP4 weight to bf16, legacy MFMA.
+            from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+            return compile_moe_gemm2(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=experts,
+                topk=topk,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                doweight_stage2=doweight_stage2,
+                in_dtype="fp4_bf16",
+                group_size=32,
+                out_dtype=out_dtype,
+                accumulate=accumulate,
+            )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
         return compile_mixed_moe_gemm2(
@@ -582,16 +642,20 @@ def _s1_args_std(
 ):
     if stream is None:
         stream = torch.cuda.current_stream()
+    # moe_gemm (int4_bf16 / fp4_bf16) kernels take memref/Tensor args (they build
+    # buffer resources via create_buffer_resource, which needs the memref pointer
+    # + size) -- NOT raw device pointers.  Pass tensors (dtype-safe views), not
+    # from_c_void_p handles.  (mixed_moe fp4 kernels still use _s1_args_fp4 ptrs.)
     return (
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(w),
-        _ptr_view_safe(a_scale),
-        _ptr_view_safe(w_scale),
-        _ptr_view_safe(sorted_ids),
-        _ptr_view_safe(sorted_expert_ids),
-        _ptr_view_safe(sorted_weights),
-        _ptr_view_safe(num_valid_ids),
+        _view_safe(out),
+        _view_safe(a),
+        _view_safe(w),
+        _view_safe(a_scale),
+        _view_safe(w_scale),
+        _view_safe(sorted_ids),
+        _view_safe(sorted_expert_ids),
+        _view_safe(sorted_weights),
+        _view_safe(num_valid_ids),
         token_num,
         n_in,
         k_in,
@@ -662,16 +726,18 @@ def _s2_args_std(
 ):
     if stream is None:
         stream = torch.cuda.current_stream()
+    # moe_gemm (int4_bf16 / fp4_bf16) kernels take memref/Tensor args, not raw
+    # device pointers (see _s1_args_std).
     return (
-        _ptr_view_safe(target),
-        _ptr_view_safe(a),
-        _ptr_view_safe(w),
-        _ptr_view_safe(a_scale),
-        _ptr_view_safe(w_scale),
-        _ptr_view_safe(sorted_ids),
-        _ptr_view_safe(sorted_expert_ids),
-        _ptr_view_safe(sorted_weights),
-        _ptr_view_safe(num_valid_ids),
+        _view_safe(target),
+        _view_safe(a),
+        _view_safe(w),
+        _view_safe(a_scale),
+        _view_safe(w_scale),
+        _view_safe(sorted_ids),
+        _view_safe(sorted_expert_ids),
+        _view_safe(sorted_weights),
+        _view_safe(num_valid_ids),
         token_num,
         n_in,
         k_in,
@@ -1236,10 +1302,16 @@ def flydsl_moe_stage1(
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
     is_fp4 = b_dtype == "fp4"
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    # gfx942 a16w4 (bf16 x MX-FP4) has no scaled MFMA: it runs the moe_gemm
+    # ``fp4_bf16`` decode kernel, which uses the int4-style 14-arg launcher
+    # (``_s1_args_std``, n_in=inter_dim), not the mixed-MFMA fused-quant fp4
+    # launcher (``_s1_args_fp4``, n_in=2*inter_dim + bias/out_scale slots).
+    _decode_w4 = is_fp4 and a_dtype == "bf16" and not _has_scaled_mxfp4_mfma()
+    _use_fp4_args = is_fp4 and not _decode_w4
+    _n_in = inter_dim * 2 if _use_fp4_args else inter_dim
     _k_in = model_dim
 
-    if is_fp4:
+    if _use_fp4_args:
         args = _s1_args_fp4(
             _kernel_out.view(-1),
             a.view(-1),
@@ -1561,6 +1633,10 @@ def flydsl_moe_stage2(
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
     is_fp4 = b_dtype == "fp4"
+    # gfx942 a16w4 decode path: moe_gemm ``fp4_bf16`` kernel uses the 14-arg
+    # std launcher (no bias/out-scale slots), same as int4_bf16.
+    _decode_w4 = is_fp4 and a_dtype == "bf16" and not _has_scaled_mxfp4_mfma()
+    _use_fp4_args = is_fp4 and not _decode_w4
     _n_in = model_dim
     _k_in = inter_dim
 
@@ -1575,7 +1651,7 @@ def flydsl_moe_stage2(
                 dtype=out.dtype,
             )
 
-    if is_fp4:
+    if _use_fp4_args:
         args = _s2_args_fp4(
             target,
             inter_states,
