@@ -337,5 +337,88 @@ def _main():
     return 0 if (ok1 and ok2 and ok3 and ok4) else 1
 
 
+def _bench(shape, num_iters=50, num_warmup=10):
+    """Time the public-bridge stage1/stage2 decode kernels and report TFLOPS.
+
+    Correctness is covered by the tests above; this only measures kernel time.
+    Weights/scales are built once so run_perftest times the kernel launch, not
+    the input preparation. Stage2 re-zeros its output each call (atomic mode),
+    so repeated timing iterations do not over-accumulate.
+    """
+    from aiter.test_common import run_perftest
+
+    tokens, model_dim, inter_dim = shape["tokens"], shape["model_dim"], shape["inter_dim"]
+    experts, topk, gsize = shape["experts"], shape["topk"], 32
+    tile_m, tile_n, tile_k = shape["tile_m"], shape["tile_n"], shape["tile_k"]
+
+    g = _gen_common(tokens, model_dim, inter_dim, experts, topk, tile_m)
+    dev = g["dev"]
+    _, _, w1_kernel, scale_w1_1d = _gen_w1(dev, experts, inter_dim, model_dim, gsize)
+    _, _, w2_kernel, scale_w2_1d = _gen_w2(dev, experts, inter_dim, model_dim, gsize)
+    w1 = w1_kernel.view(experts, 2 * inter_dim, model_dim // 2)
+    w2 = w2_kernel.view(experts, model_dim, inter_dim // 2)
+
+    def _s1():
+        return flydsl_moe_stage1(
+            a=g["x"], w1=w1,
+            sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
+            num_valid_ids=g["num_valid_ids"], topk=topk,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", act="silu",
+            w1_scale=scale_w1_1d, a1_scale=None, sorted_weights=None,
+        )
+
+    out1, us1 = run_perftest(_s1, num_iters=num_iters, num_warmup=num_warmup)
+    a2 = out1.reshape(tokens, topk, inter_dim).to(torch.bfloat16)
+
+    def _s2():
+        out = torch.zeros((tokens, model_dim), device=dev, dtype=torch.bfloat16)
+        return flydsl_moe_stage2(
+            inter_states=a2, w2=w2,
+            sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
+            num_valid_ids=g["num_valid_ids"], out=out, topk=topk,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", mode="atomic",
+            w2_scale=scale_w2_1d, a2_scale=None, sorted_weights=None,
+        )
+
+    _, us2 = run_perftest(_s2, num_iters=num_iters, num_warmup=num_warmup)
+
+    # 2 FLOP/MAC. stage1 = gate+up (2*inter_dim cols); stage2 = down (model_dim cols).
+    f1 = 2 * tokens * topk * (2 * inter_dim) * model_dim
+    f2 = 2 * tokens * topk * inter_dim * model_dim
+    print(
+        f"\na16w4 decode (gfx942)  tokens={tokens} model_dim={model_dim} "
+        f"inter_dim={inter_dim} E={experts} topk={topk} "
+        f"tile={tile_m}x{tile_n}x{tile_k}"
+    )
+    print(f"[stage1 gate+up] {us1:9.2f} us   {f1 / us1 / 1e6:8.1f} TFLOPS")
+    print(f"[stage2 down   ] {us2:9.2f} us   {f2 / us2 / 1e6:8.1f} TFLOPS")
+    return 0
+
+
 if __name__ == "__main__":
+    import argparse
+
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--bench", action="store_true",
+                   help="report kernel time + TFLOPS instead of correctness")
+    p.add_argument("-t", "--tokens", type=int, default=4096)
+    p.add_argument("--model-dim", type=int, default=4096)
+    p.add_argument("--inter-dim", type=int, default=1536)
+    p.add_argument("-e", "--experts", type=int, default=32)
+    p.add_argument("--tile-m", type=int, default=64)
+    p.add_argument("--tile-n", type=int, default=128)
+    p.add_argument("--tile-k", type=int, default=128)
+    args = p.parse_args()
+
+    if args.bench:
+        if not _is_gfx942():
+            print("[SKIP] not gfx942")
+            sys.exit(0)
+        sys.exit(_bench(dict(
+            tokens=args.tokens, model_dim=args.model_dim, inter_dim=args.inter_dim,
+            experts=args.experts, topk=1,
+            tile_m=args.tile_m, tile_n=args.tile_n, tile_k=args.tile_k,
+        )))
     sys.exit(_main())
