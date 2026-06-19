@@ -4,11 +4,8 @@
 import torch
 import pytest
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
-    gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
-)
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+    gemm_a8w8_blockscale,
+    gemm_a8w8_blockscale_preshuffle,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
@@ -129,35 +126,28 @@ def generate_gemm_a8w8_blockscale_inputs(
         for shape in get_x_vals()
     ],
 )
-@pytest.mark.parametrize(
-    "impl",
-    [
-        "gluon",
-        "triton",
-        "triton_shuffle",
-    ],
-)
-def test_gemm(dtype, M, N, K, layout, output, impl: str):
+@pytest.mark.parametrize("backend", ["gluon", "triton"])
+@pytest.mark.parametrize("shuffle", [True, False])
+def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
 
     block_shape_n, block_shape_k = block_shape
 
-    if impl == "gluon" and DEVICE_ARCH not in ("gfx950",):
-        pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4/gfx950)."
-        )
+    if backend == "gluon":
+        if shuffle:
+            if DEVICE_ARCH not in ("gfx1250"):
+                pytest.skip("Gluon + shuffle implementation requires gfx1250.")
+        elif DEVICE_ARCH not in ("gfx950", "gfx1250"):
+            pytest.skip("Gluon implementation requires gfx950 or gfx1250.")
 
-    if impl == "triton_shuffle":
+    if shuffle:
         if N % 16 > 0 or K % 32 > 0:
             pytest.skip(
                 "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
             )
 
-    if impl != "gluon" and K < 512:
-        # Small-K shapes were added for the gluon wind-down's num_k_iter
-        # guards; the standard triton / preshuffle autotune configs fail to
-        # compile at these K values (BLOCK_SIZE_K mismatch).
+    if backend not in ("gluon",) and K < 512:
         pytest.skip("Small-K shapes exercise gluon-only paths.")
 
     dtype = str_to_torch_dtype[dtype]
@@ -171,20 +161,20 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
             dtype=dtype,
             layout=layout,
             output=output,
-            shuffle=("_shuffle" in impl),
+            shuffle=shuffle,
         )
     )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
-    if impl == "gluon":
-        impl = gluon_gemm_a8w8_blockscale
-    elif impl == "triton":
-        impl = triton_gemm_a8w8_blockscale
-    elif impl == "triton_shuffle":
-        impl = triton_gemm_a8w8_blockscale_preshuffle
+    if shuffle:
+        impl = lambda x, w, xs, ws, dt, y: gemm_a8w8_blockscale_preshuffle(
+            x, w, xs, ws, dt, y, backend=backend
+        )
     else:
-        raise ValueError(f"Unknown implementation: {impl}")
+        impl = lambda x, w, xs, ws, dt, y: gemm_a8w8_blockscale(
+            x, w, xs, ws, dt, y, backend=backend
+        )
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
