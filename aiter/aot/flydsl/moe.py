@@ -231,7 +231,9 @@ def _precompile_to_cache(
     import torch
 
     dev = torch.device("cpu")
-    is_fp4_weight = b_dtype == "fp4"
+    # fp4 and fp8 weights both use the mixed kernel (extended args + e8m0
+    # scales). Only the weight-tensor byte packing (272/281) is fp4-specific.
+    is_fp4_weight = b_dtype in ("fp4", "fp8")
     is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
