@@ -706,7 +706,7 @@ def get_moe_a8w4_prefill_layouts(
     BLOCK_M,
     BLOCK_N,
     BLOCK_K,
-    num_ctas,
+    ctas_per_cga,
     ACTIVATION_REDUCTION_N,
     PRESHUFFLED,
     SWIZZLE_MX_SCALE,
@@ -731,15 +731,7 @@ def get_moe_a8w4_prefill_layouts(
         PACKED_MX_BLOCK = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N = BLOCK_N
 
-    if num_ctas == 4:
-        ctas_per_cga = [2, 2]
-    elif num_ctas == 8:
-        ctas_per_cga = [2, 4]
-    elif num_ctas == 16:
-        ctas_per_cga = [4, 4]
-    else:
-        ctas_per_cga = [1, num_ctas]
-
+    ctas_per_cga = list(ctas_per_cga)
     cga_layout_c = make_cga_layout(ctas_per_cga, ctas_per_cga, [0, 1])
 
     if num_warps == 2:

@@ -243,12 +243,27 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     }
 
 
+def get_ctas_per_cga(num_ctas, is_prefill):
+    if not is_prefill:
+        # Shard the cluster along N only for prefill.
+        return [1, num_ctas]
+    if num_ctas == 4:
+        return [2, 2]
+    elif num_ctas == 8:
+        return [2, 4]
+    elif num_ctas == 16:
+        return [4, 4]
+    else:
+        return [1, num_ctas]
+
+
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_buffers = 3
     num_ctas = 4
+    ctas_per_cga = get_ctas_per_cga(num_ctas, is_prefill=m >= 1024)
     split_k = 1
     block_k = 512
 
@@ -289,6 +304,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
         "num_ctas": num_ctas,
+        "ctas_per_cga": ctas_per_cga,
     }
     return ret
 
@@ -559,7 +575,7 @@ def moe_gemm_a8w4(
             BLOCK_M=config["block_m"],
             BLOCK_N=config["block_n"],
             BLOCK_K=config["block_k"],
-            num_ctas=config["num_ctas"],
+            ctas_per_cga=config["ctas_per_cga"],
             ACTIVATION_REDUCTION_N=reduction_n_matmul,
             PRESHUFFLED=preshuffled,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
