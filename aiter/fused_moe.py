@@ -1431,6 +1431,7 @@ def get_2stage_cfgs(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
+        and q_dtype_a != dtypes.fp8
     ):
         return MOEMetadata(
             functools.partial(
