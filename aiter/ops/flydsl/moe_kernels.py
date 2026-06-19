@@ -1241,8 +1241,7 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    # fp4 and fp8 weights both use the mixed kernel, whose moe_gemm1 signature
-    # carries the bias + out_scale_sorted pointers (the "_fp4" arg builder).
+    # fp4 and fp8 weights both use the mixed kernel (bias/out_scale arg builder).
     is_fp4 = b_dtype in ("fp4", "fp8")
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
     _k_in = model_dim

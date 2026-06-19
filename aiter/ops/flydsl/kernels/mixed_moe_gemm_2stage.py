@@ -164,16 +164,10 @@ def compile_mixed_moe_gemm1(
     tile_k_bytes = int(tile_k) * int(a_elem_bytes)
     a_elem_vec_pack = 2 if is_f4_a else 1
     cbsz = 0 if is_f8_a else 4
-    # blgp selects the B (weight) operand format for the f8f6f4 MFMA:
-    #   0 -> fp8 (mxfp8 weight), 4 -> fp4 (a*w4 weight).
-    blgp = 0 if is_f8_b else 4
-    # B is byte-addressed in the preshuffled weight. fp4 packs 2 nibbles/byte
-    # (so K-elements / 2 = bytes); fp8 is 1 byte/element. This factor converts a
-    # K-element offset into a B byte offset for the preshuffle layout / loads.
+    blgp = 0 if is_f8_b else 4  # MFMA B-operand format: 0=fp8, 4=fp4
+    # B byte offset along K: fp4 packs 2 nibbles/byte, fp8 is 1 byte/elem.
     _b_byte_div = 2 if is_f4_b else 1
-    # Number of 16-byte B kpack cells consumed per MFMA k-step. fp4 packs a full
-    # K=128 contraction into one 16-byte (32-nibble) cell; fp8 needs 32 bytes =
-    # two adjacent k0 cells (mirroring the fp8-A two-load LDS path).
+    # fp8-B needs 32B/MFMA = two adjacent 16B k0 cells; fp4-B fits one.
     _b_cells_per_ku = 2 if is_f8_b else 1
 
     if (tile_k_bytes % 64) != 0:
@@ -442,9 +436,7 @@ def compile_mixed_moe_gemm1(
 
     fp4_ratio = 2 if a_dtype == "fp4" else 1
     gui_ratio = 1 if gate_up_interleave else 2
-    # fp8-B issues two VMEM loads per B kpack (32B operand) vs one for fp4-B,
-    # so the number of in-flight B prefetches before the barrier doubles.
-    _b_load_mult = 2 if is_f8_b else 1
+    _b_load_mult = 2 if is_f8_b else 1  # fp8-B = 2 VMEM loads per B kpack
     _vmcnt_before_barrier = (
         tile_m // 32 // fp4_ratio + tile_n // 32 * gui_ratio * _b_load_mult
     )
@@ -506,9 +498,7 @@ def compile_mixed_moe_gemm1(
             b_layout = make_preshuffle_b_layout(
                 arith,
                 c_n=c_n_total,
-                # c_k is the B byte count along K: fp4 packs 2 nibbles/byte
-                # (k_in/2), fp8 is 1 byte/element (k_in).
-                c_k=k_in // _b_byte_div,
+                c_k=k_in // _b_byte_div,  # B byte count along K (fp4: k_in/2)
                 kpack_bytes=kpack_bytes,
                 elem_bytes=b_elem_bytes,
                 # k_major=True,
@@ -888,9 +878,7 @@ def compile_mixed_moe_gemm1(
                     (_tail_ku + pack_K - 1) // pack_K if _pad_ku_skip > 0 else None
                 )
 
-                # B load for gate and up separately.
-                # Returns 2 i64 packs (fp4: 16B = lower MFMA half) or 4 i64 packs
-                # (fp8: 32B = full MFMA operand, two adjacent k0 cells).
+                # Returns 2 i64 packs (fp4, 16B) or 4 (fp8, 32B two k0 cells).
                 def load_b_packs_k64(base_k, ku: int, n_blk, n_intra):
                     c64 = arith.constant(64, index=True)
                     c1 = arith.constant(1, index=True)
@@ -940,10 +928,8 @@ def compile_mixed_moe_gemm1(
                     return b0, b1
 
                 def load_b_tile(base_k, ku_limit=k_unroll):
-                    """Load B tiles. Returns (gate_b_tile, up_b_tile).
-                    When mock_gate_only or gate_up_interleave, up_b_tile is None.
-                    Each tile entry is (packs0, packs1, packs2, packs3); packs2/3
-                    are populated only for fp8-B (full 32B MFMA operand)."""
+                    """Load B tiles -> (gate_b_tile, up_b_tile); up is None for
+                    interleave/mock. Tile entry (packs0..3); packs2/3 fp8-B only."""
                     gate_b_tile = []
                     up_b_tile = (
                         [] if (not mock_gate_only and not gate_up_interleave) else None
@@ -971,13 +957,9 @@ def compile_mixed_moe_gemm1(
                                 if const_expr(is_f8_b):
                                     u_packs2.append(ub[2])
                                     u_packs3.append(ub[3])
-                        gate_b_tile.append(
-                            (g_packs0, g_packs1, g_packs2, g_packs3)
-                        )
+                        gate_b_tile.append((g_packs0, g_packs1, g_packs2, g_packs3))
                         if const_expr(not mock_gate_only and not gate_up_interleave):
-                            up_b_tile.append(
-                                (u_packs0, u_packs1, u_packs2, u_packs3)
-                            )
+                            up_b_tile.append((u_packs0, u_packs1, u_packs2, u_packs3))
                     return gate_b_tile, up_b_tile
 
                 # Pre-compute scale base element indices (K-loop invariant).
@@ -1490,9 +1472,8 @@ def compile_mixed_moe_gemm1(
                     A tiles come from LDS (already available, no VMEM wait).
 
                     all_a_tiles: flat list indexed by [k*m_repeat + mi].
-                    gate_b_single/up_b_single: (b0, b1) for fp4 or (b0, b1, b2, b3)
-                      for fp8, for one specific ni. When _single_b_pipe
-                      (mock_gate_only or interleave), up_b_single is None.
+                    gate_b_single/up_b_single: (b0,b1) fp4 or (b0,b1,b2,b3) fp8 for
+                      one ni; up is None under _single_b_pipe.
                     a_scale_vals: list of A scale scalars indexed by mi_packed.
                     """
                     c0_i64 = arith.constant(0, type=T.i64)
@@ -2967,13 +2948,9 @@ def compile_mixed_moe_gemm2(
 
     a_elem_vec_pack = 2 if is_f4_a else 1
     cbsz = 0 if is_f8_a else 4
-    # blgp selects the B (weight) operand format for the f8f6f4 MFMA:
-    #   0 -> fp8 (mxfp8 weight), 4 -> fp4 (a*w4 weight).
-    blgp = 0 if is_f8_b else 4
-    # fp4 packs 2 nibbles/byte (K-elements / 2 = bytes); fp8 is 1 byte/element.
-    _b_byte_div = 2 if is_f4_b else 1
-    # fp8-B needs 32B/lane per MFMA = two adjacent k0 cells; fp4-B fits in one.
-    _b_cells_per_ku = 2 if is_f8_b else 1
+    blgp = 0 if is_f8_b else 4  # MFMA B-operand format: 0=fp8, 4=fp4
+    _b_byte_div = 2 if is_f4_b else 1  # B byte offset along K (fp4 packs 2/byte)
+    _b_cells_per_ku = 2 if is_f8_b else 1  # fp8-B = 2 adjacent 16B k0 cells/MFMA
 
     # ---- Static B preshuffle strides (compile-time) ----
     # All values below are Python ints computable at kernel-compile time.
@@ -2982,9 +2959,7 @@ def compile_mixed_moe_gemm2(
     # non-power-of-2 ``n0 = experts*model_dim//16`` shape.
     _b_kpack_bytes_s = 8 if (b_dtype == "int4") else 16
     _b_kpack_elems_s = _b_kpack_bytes_s // b_elem_bytes
-    # B byte count along K: fp4 packs 2 nibbles/byte (inter_dim/2); fp8 is
-    # 1 byte/element (inter_dim). _scale_pack_k == 2 matches the fp4 packing.
-    _b_c_k_s = inter_dim // _b_byte_div
+    _b_c_k_s = inter_dim // _b_byte_div  # B byte count along K (fp4: inter_dim/2)
     _b_c_k0_s = (_b_c_k_s * b_elem_bytes) // 64
     _b_stride_nlane = _b_kpack_elems_s  # 16
     _b_stride_klane = 16 * _b_stride_nlane  # 256
@@ -3811,8 +3786,7 @@ def compile_mixed_moe_gemm2(
                     return b0, b1
 
                 def _accum_b_ku(b_tile, base_k, ku, n_blk_p, n_intra_p):
-                    """Load all N packs for one ku and append a (p0,p1,p2,p3)
-                    entry to b_tile. p2/p3 are populated only for fp8-B."""
+                    """Append one ku's (p0..p3) N-packs to b_tile (p2/p3 fp8-B only)."""
                     packs0, packs1, packs2, packs3 = [], [], [], []
                     for ni in range_constexpr(num_acc_n):
                         b = load_b_packs_k64(

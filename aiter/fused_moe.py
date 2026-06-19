@@ -1950,8 +1950,7 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.fp8
         and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
     ):
-        # a8w4 (fp4 weight) or mxfp8 (fp8 weight): quantize stage1 output to
-        # mxfp8 for stage2's fp8 activation operand.
+        # a8w4 / mxfp8: quantize stage1 output to mxfp8 for stage2's fp8 operand.
         if not _MOE_A8W4_BYPASS_QUANT:
             a2 = a2.view(-1, inter_dim)
             a2, a2_scale = fused_dynamic_mxfp8_quant_moe_sort(
