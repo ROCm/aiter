@@ -327,6 +327,119 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+# gfx942 (CDNA3) has 64 KiB LDS per CU. The a16w4 decode kernels stage the
+# bf16 A tile in LDS (ping-pong, 2 bytes/elem) and optionally a CShuffle/split-K
+# epilogue tile. This mirrors the kernel's own LDS sizing in
+# ``kernels/moe_gemm_2stage.py`` (``lds_total_bytes``) so the registry never
+# offers a tile that the SmemAllocator cannot fit on CDNA3.
+_GFX942_LDS_BYTES = 65536
+
+
+def _fp4_bf16_lds_total_bytes(
+    tile_m: int, tile_n: int, tile_k: int, k_batch: int, out_dtype: str
+) -> int:
+    """Replicate moe_gemm_2stage stage1/2 ``lds_total_bytes`` for fp4_bf16.
+
+    A is staged in LDS as bf16 (``elem_bytes=2``); default LDS128 mode uses
+    ``lds_stride == tile_k`` (no K padding). Split-K forces a CShuffle epilogue
+    (bf16 atomics for bf16 out, else f32).
+    """
+    elem_bytes = 2
+    lds_stride = tile_k  # pad_k=0 under default FLYDSL_CK_LDS128=1
+    is_splitk = k_batch > 1
+    splitk_use_bf16 = is_splitk and out_dtype == "bf16"
+    cshuffle_elem = 2 if (not is_splitk or splitk_use_bf16) else 4
+    lds_x_bytes = 2 * tile_m * lds_stride * elem_bytes
+    lds_out_bytes = cshuffle_elem * tile_m * tile_n if is_splitk else 0
+    return max(lds_x_bytes, lds_out_bytes)
+
+
+def get_flydsl_stage1_kernels_fp4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for gfx942 a16w4 (bf16 x MX-FP4) stage1.
+
+    Decode path: dequant E2M1->bf16 + per-32 E8M0 block scale, legacy bf16 MFMA.
+    Tile set mirrors int4_bf16 (the reuse template); configs whose LDS footprint
+    exceeds the CDNA3 64 KiB budget are dropped (ticket Track A LDS guard).
+    """
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "fp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+    k_batches = [1, 2, 4, 7, 14]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for kb in k_batches:
+                    if (
+                        _fp4_bf16_lds_total_bytes(tm, tn, tk, kb, out_dtype)
+                        > _GFX942_LDS_BYTES
+                    ):
+                        continue
+                    name = flydsl_kernel_name(
+                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                    )
+                    if kb != 1:
+                        name += f"_kb{kb}"
+                    kernels[name] = {
+                        "stage": 1,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "in_dtype": "fp4_bf16",
+                        "k_batch": kb,
+                    }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_fp4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for gfx942 a16w4 (bf16 x MX-FP4) stage2."""
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "fp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    if (
+                        _fp4_bf16_lds_total_bytes(tm, tn, tk, 1, out_dtype)
+                        > _GFX942_LDS_BYTES
+                    ):
+                        continue
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "fp4_bf16",
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {
+                        **base_params,
+                        "persist": True,
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -338,6 +451,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # fp4_bf16 (a16w4 gfx942 decode) configs, LDS-guarded for CDNA3 64 KiB
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_fp4_bf16(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_fp4_bf16(out))
 
 
 _register_all_configs()
