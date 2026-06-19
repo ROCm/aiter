@@ -911,7 +911,12 @@ def _flydsl_stage1_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    if activation == ActivationType.Swiglu:
+        act = "swiglu"
+    elif activation == ActivationType.Gelu:
+        act = "gelu"
+    else:
+        act = "silu"
     _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
@@ -943,6 +948,7 @@ def _flydsl_stage1_wrapper(
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
+        scale_scheme=parsed.get("scale_scheme", ""),
     )
 
 
@@ -1012,6 +1018,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        scale_scheme=parsed.get("scale_scheme", ""),
     )
 
 

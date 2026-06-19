@@ -19,9 +19,11 @@ def _get_dtypes():
     return dtypes
 
 
-_SUFFIX_RE = re.compile(
-    r"(?P<blk>_blkscale)?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
-)
+# Only the runtime-override suffixes (quant dtype + sort_block_m) are stripped.
+# ``_blkscale`` is part of the registered base name and must be preserved, so a
+# fused-quant name like ``..._blkscale_fp8`` resolves to the ``..._blkscale``
+# registry key with out_dtype overridden to fp8.
+_SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
 
 
 def flydsl_kernel_name(
@@ -138,6 +140,12 @@ def get_flydsl_stage1_kernels(
                                         ),
                                         "xcd_swizzle": xcd,
                                     }
+                                    if b_dtype == "fp8":
+                                        # mxfp8 (per-1x32 e8m0); distinguishes
+                                        # from fp8/fp8 per-1x128 blockscale.
+                                        kernels[name][
+                                            "scale_scheme"
+                                        ] = "mxfp8_1x32_e8m0"
     return kernels
 
 
@@ -186,6 +194,10 @@ def get_flydsl_stage2_kernels(
                                 "b_nt": bnt,
                                 "xcd_swizzle": xcd,
                             }
+                            if b_dtype == "fp8":
+                                # mxfp8 (per-1x32 e8m0); distinguishes from
+                                # fp8/fp8 per-1x128 blockscale.
+                                base_params["scale_scheme"] = "mxfp8_1x32_e8m0"
                             kernels[base_name] = base_params
                             kernels[base_name + "_persist"] = {
                                 **base_params,
@@ -328,30 +340,35 @@ def get_flydsl_stage1_kernels_fp8_blockscale(out_dtype: str) -> Dict[str, Dict]:
     # (bnt=2, xcd=0 for stage1) are reachable, so we don't enumerate them.
     bnt = 2
     xcd = 0
+    k_batches = [1, 2, 4]
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
                 for wpe in waves_per_eus:
-                    name = flydsl_kernel_name(
-                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                    )
-                    name += "_blkscale"
-                    if wpe != 1:
-                        name += f"_w{wpe}"
-                    kernels[name] = {
-                        "stage": 1,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": tm,
-                        "tile_n": tn,
-                        "tile_k": tk,
-                        "MPerBlock": tm,
-                        "waves_per_eu": wpe,
-                        "b_nt": bnt,
-                        "xcd_swizzle": xcd,
-                        "scale_scheme": "blockscale_1x128_fp32",
-                    }
+                    for kb in k_batches:
+                        name = flydsl_kernel_name(
+                            1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                        )
+                        name += "_blkscale"
+                        if wpe != 1:
+                            name += f"_w{wpe}"
+                        if kb != 1:
+                            name += f"_kb{kb}"
+                        kernels[name] = {
+                            "stage": 1,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": tn,
+                            "tile_k": tk,
+                            "MPerBlock": tm,
+                            "waves_per_eu": wpe,
+                            "k_batch": kb,
+                            "b_nt": bnt,
+                            "xcd_swizzle": xcd,
+                            "scale_scheme": "blockscale_1x128_fp32",
+                        }
     return kernels
 
 
@@ -441,9 +458,15 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    scale_scheme: str = "",
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    if b_dtype in ("fp4", "fp8"):
+    # fp8/fp8 defaults to per-1x128 blockscale; only the explicit mxfp8
+    # microscale scheme routes through the mixed (mx) pipeline.
+    _use_mx = b_dtype == "fp4" or (
+        b_dtype == "fp8" and scale_scheme == "mxfp8_1x32_e8m0"
+    )
+    if _use_mx:
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
 
@@ -553,9 +576,15 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    scale_scheme: str = "",
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
-    if b_dtype in ("fp4", "fp8"):
+    # fp8/fp8 defaults to per-1x128 blockscale; only the explicit mxfp8
+    # microscale scheme routes through the mixed (mx) pipeline.
+    _use_mx = b_dtype == "fp4" or (
+        b_dtype == "fp8" and scale_scheme == "mxfp8_1x32_e8m0"
+    )
+    if _use_mx:
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
         return compile_mixed_moe_gemm2(
@@ -764,11 +793,10 @@ def _s1_args_std(
 ):
     if stream is None:
         stream = torch.cuda.current_stream()
-    # The std stage1 launcher feeds two kernel families with different arg
-    # annotations: the bf16/int4 ``moe_gemm1`` (moe_gemm_2stage.py) takes
-    # ``fx.Pointer`` args (calls ptrtoint) and needs ``_as_pointer``, while
-    # the fp8/fp8 blockscale launcher takes ``fx.Tensor`` (memref) args and
-    # needs ``_as_memref``. ``use_ptr`` selects the right helper.
+    # Both std stage1 families now take ``fx.Pointer`` args (call ptrtoint):
+    # bf16/int4 ``moe_gemm1`` (moe_gemm_2stage.py) and fp8/fp8 blockscale
+    # ``moe_blockscale_gemm1``. ``use_ptr`` selects ``_as_pointer``; the
+    # ``_as_memref`` path is kept for any legacy memref launcher.
     _ptr = _as_pointer if use_ptr else _as_memref
     # The `arg_out_scale_sorted` slot only exists on the blockscale fp8/fp8
     # launcher (Phase B-v2). Other stage1 launchers (mixed_moe_gemm1 fp4,
@@ -860,8 +888,8 @@ def _s2_args_std(
 ):
     if stream is None:
         stream = torch.cuda.current_stream()
-    # See _s1_args_std: bf16/int4 moe_gemm2 wants fx.Pointer args (ptrtoint),
-    # fp8/fp8 blockscale moe_gemm2 wants fx.Tensor (memref) args.
+    # See _s1_args_std: bf16/int4 moe_gemm2 and fp8/fp8 blockscale moe_gemm2
+    # both take fx.Pointer args (ptrtoint), so both pass use_ptr=True.
     _ptr = _as_pointer if use_ptr else _as_memref
     return (
         _ptr(target),
@@ -977,10 +1005,10 @@ def _run_moe_reduction(
     _run_compiled(
         reduce_exe,
         (
-            _ptr_view_safe(X),
-            _ptr_view_safe(out),
-            _ptr_view_safe(em),
-            _ptr_view_safe(tk),
+            _as_pointer(X),
+            _as_pointer(out),
+            _as_pointer(em),
+            _as_pointer(tk),
             token_num,
             stream,
         ),
@@ -1270,13 +1298,13 @@ def flydsl_silu_and_mul_interleaved(
     _run_compiled(
         _silu_fn,
         (
-            _ptr_view_safe(input),
-            _ptr_view_safe(out),
-            _ptr_view_safe(empty_scale),
-            _ptr_view_safe(sorted_token_ids),
-            _ptr_view_safe(num_valid_ids),
-            _ptr_view_safe(empty_i32),
-            _ptr_view_safe(empty_f32),
+            _as_pointer(input),
+            _as_pointer(out),
+            _as_pointer(empty_scale),
+            _as_pointer(sorted_token_ids),
+            _as_pointer(num_valid_ids),
+            _as_pointer(empty_i32),
+            _as_pointer(empty_f32),
             token_num,
             num_sorted_rows,
             torch.cuda.current_stream(),
@@ -1319,6 +1347,7 @@ def flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    scale_scheme: str = "",
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1389,23 +1418,6 @@ def flydsl_moe_stage1(
     _is_splitk = k_batch > 1
     gate_up_interleave = gate_mode == "interleave"
 
-    # Split-K cannot fuse the per-1x128 f32 blockscale into the GEMM epilog
-    # (partials are atomic-added, then reduced). If an fp8 output were also
-    # requested, the only available fused-quant path is silu_and_mul_fq, which
-    # emits an e8m0 per-32 MX scale -- a different block size (32 vs 128) AND a
-    # different scale dtype (e8m0 vs f32) than stage2 reads. Stage2 would then
-    # misparse the scale buffer (garbage/NaN), and the result would diverge from
-    # CK's per-1x128 f32 reference. CK/ASM avoid this by reducing split-K in
-    # bf16 and quantizing in a separate post-reduction step; mirror that by
-    # restricting blockscale split-K to bf16 output for now.
-    if _is_splitk and a_dtype == "fp8" and b_dtype == "fp8" and _need_fp8:
-        raise NotImplementedError(
-            "fp8/fp8 blockscale split-K (k_batch>1) with out_dtype='fp8' is not "
-            "supported: the split-K fused-quant path emits an e8m0 per-32 scale, "
-            "which is incompatible with the per-1x128 f32 scale stage2 consumes. "
-            "Use out_dtype='bf16' for split-K, or k_batch=1 to fuse the f32 scale."
-        )
-
     dev = a.device
     _splitk_fp4 = _is_splitk and _need_fp4
     _gui_sk = gate_up_interleave and _is_splitk
@@ -1469,13 +1481,36 @@ def flydsl_moe_stage1(
     #   * Legacy post-quant kernels (silu_and_mul_fq via _gui_sk_fused,
     #     _gui_sk, _splitk_fp4): per-32 e8m0 in sorted-tile uint8 layout
     #     with padding. Unchanged.
-    # Restrict the per-row f32 layout to the FP8/FP8 blockscale GEMM. Other
-    # `out_dtype == "fp8"` configs (notably A8W4 wfp4) still expect the legacy
-    # fp8_e8m0 per-32 sorted layout that the wfp4 kernels read/write.
-    _fused_fp8_in_gemm = (
-        _need_fp8 and a_dtype == "fp8" and b_dtype == "fp8" and not _is_splitk
+    # fp4 weights and mxfp8 (per-1x32 e8m0) use the MX gemm kernel (bias/out_scale
+    # arg builder). fp8/fp8 per-1x128 blockscale uses the std launcher instead.
+    # Computed here (before the scale-buffer gates) so the blockscale-specific
+    # per-1x128 f32 layout below can exclude the mxfp8 case, which shares
+    # a_dtype/b_dtype == "fp8" but needs the legacy e8m0 per-32 buffer.
+    use_mx_gemm = b_dtype == "fp4" or (
+        b_dtype == "fp8" and scale_scheme == "mxfp8_1x32_e8m0"
     )
-    if _fused_fp8_in_gemm:
+    # Restrict the per-row f32 layout to the FP8/FP8 blockscale GEMM. Other
+    # `out_dtype == "fp8"` configs (notably A8W4 wfp4 and mxfp8 per-1x32) still
+    # expect the legacy fp8_e8m0 per-32 sorted layout that those kernels
+    # read/write.
+    _fused_fp8_in_gemm = (
+        _need_fp8
+        and a_dtype == "fp8"
+        and b_dtype == "fp8"
+        and not _is_splitk
+        and not use_mx_gemm
+    )
+    # Split-K fp8/fp8 blockscale: GEMM emits bf16 partials, then the post-GEMM
+    # interleaved-silu + per_group_quant_hip (below) fills this same per-1x128
+    # f32 scale layout so the existing per-1x128 stage2 consumes it unchanged.
+    _splitk_fp8_blockscale = (
+        _need_fp8
+        and a_dtype == "fp8"
+        and b_dtype == "fp8"
+        and _is_splitk
+        and not use_mx_gemm
+    )
+    if _fused_fp8_in_gemm or _splitk_fp8_blockscale:
         # Per-row f32 layout. Size = n_blocks_k * tokens*topk * 4 bytes.
         # Stage2 indexes as a2_scale[blk_k, t*topk + s].
         _n_blocks_k_s1 = inter_dim // 128
@@ -1506,8 +1541,6 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    # fp4 and fp8 weights both use the MX gemm kernel (bias/out_scale arg builder).
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
 
@@ -1547,9 +1580,11 @@ def flydsl_moe_stage1(
             _s1_scale_arg = torch.empty(1, dtype=torch.uint8, device=dev)
         else:
             _s1_scale_arg = None
-        # bf16/int4 routes to moe_gemm1 (fx.Pointer / ptrtoint); fp8 blockscale
-        # routes to the upstream memref kernel.
-        _s1_use_ptr = a_dtype == "bf16" and b_dtype == "int4"
+        # Both std-launcher families now take fx.Pointer (ptrtoint) args:
+        # bf16/int4 moe_gemm1 and fp8/fp8 blockscale moe_blockscale_gemm1.
+        _s1_use_ptr = (a_dtype == "bf16" and b_dtype == "int4") or (
+            a_dtype == "fp8" and b_dtype == "fp8"
+        )
         args = _s1_args_std(
             _kernel_out.view(-1),
             a.view(-1),
@@ -1593,6 +1628,7 @@ def flydsl_moe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
+        scale_scheme=scale_scheme,
     )
     _run_compiled(exe, args)
 
@@ -1690,6 +1726,48 @@ def flydsl_moe_stage1(
                 torch.cuda.current_stream(),
             ),
         )
+    elif _splitk_fp8_blockscale:
+        # Split-K GEMM always writes tmp_out in gugu per-16 INTERLEAVED layout
+        # (blockscale_moe_gemm_2stage.py), so it must be de-interleaved by the
+        # gui_layout activation kernel (not aiter's separated silu). Activate
+        # -> bf16, then per-1x128 f32 quant so the existing per-1x128 stage2
+        # consumes the result unchanged.
+        from aiter.ops.quant import per_group_quant_hip
+
+        act_bf16 = torch.empty(
+            (token_num * topk, inter_dim), dtype=torch_tmp_out_dtype, device=dev
+        )
+        _silu_act_k = _get_compiled_silu_fused(
+            inter_dim,
+            topk,
+            "none",
+            gui_layout=True,
+            act=act,
+            enable_bias=use_splitk_bias,
+            swiglu_limit=swiglu_limit,
+        )
+        _run_compiled(
+            _silu_act_k,
+            (
+                _as_pointer(tmp_out.view(-1, inter_dim * 2)),
+                _as_pointer(act_bf16),
+                _as_pointer(out_scale_sorted_flat),
+                _as_pointer(sorted_token_ids),
+                _as_pointer(num_valid_ids),
+                _as_pointer(topk_ids_arg),
+                _as_pointer(bias_arg),
+                token_num,
+                num_sorted_rows,
+                torch.cuda.current_stream(),
+            ),
+        )
+        out_fp8, out_scale_sorted_flat = per_group_quant_hip(
+            act_bf16,
+            quant_dtype=torch_out_dtype,
+            group_size=128,
+            transpose_scale=True,
+        )
+        out.view(-1, inter_dim).copy_(out_fp8.view(-1, inter_dim))
     elif _is_splitk:
         from aiter.ops.activation import (
             silu_and_mul,
@@ -1715,7 +1793,7 @@ def flydsl_moe_stage1(
             silu_and_mul(post_out, post_input)
 
     if _fuse_any_quant and _need_sort:
-        if _fused_fp8_in_gemm:
+        if _fused_fp8_in_gemm or _splitk_fp8_blockscale:
             # Per-row f32 blockscale (n_blocks_k, tokens*topk).
             out_scale = out_scale_sorted_flat.view(inter_dim // 128, token_num * topk)
             return out, out_scale
@@ -1761,6 +1839,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
+    scale_scheme: str = "",
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1853,8 +1932,11 @@ def flydsl_moe_stage2(
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
-    # fp4 and fp8 weights both use the MX gemm kernel (bias arg builder).
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    # fp4 weights and mxfp8 (per-1x32 e8m0) use the MX gemm kernel (bias arg
+    # builder). fp8/fp8 per-1x128 blockscale uses the std launcher instead.
+    use_mx_gemm = b_dtype == "fp4" or (
+        b_dtype == "fp8" and scale_scheme == "mxfp8_1x32_e8m0"
+    )
     _n_in = model_dim
     _k_in = inter_dim
 
@@ -1902,7 +1984,8 @@ def flydsl_moe_stage2(
             _n_in,
             _k_in,
             m_blocks,
-            use_ptr=(a_dtype == "bf16" and b_dtype == "int4"),
+            use_ptr=(a_dtype == "bf16" and b_dtype == "int4")
+            or (a_dtype == "fp8" and b_dtype == "fp8"),
         )
 
     exe = compile_flydsl_moe_stage2(
@@ -1928,6 +2011,7 @@ def flydsl_moe_stage2(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        scale_scheme=scale_scheme,
     )
     _run_compiled(exe, args)
 

@@ -46,6 +46,7 @@ from aiter.ops.flydsl.kernels.blockscale_moe_gemm_2stage import (
     pick_k_batch_for_blockscale_stage1,
 )
 from aiter.ops.flydsl.moe_kernels import (
+    _as_pointer,
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
 )
@@ -542,43 +543,29 @@ def _launch_flydsl_stage1(
     stream = torch.cuda.current_stream()
     w1_shuf_flat = data["w1_bq_shuf"].view(-1)
     _scale_ph = torch.empty(1, dtype=torch.uint8, device=DEVICE)
-    compiled = flyc.compile(
-        exe1,
-        out1.view(-1),
-        a1_bq.view(-1),
-        w1_shuf_flat,
-        a1_scale_fly,
-        w1_scale_fly,
-        sorted_ids,
-        sorted_e,
-        sorted_w,
-        num_valid,
-        _scale_ph,
+    # moe_blockscale_gemm1 takes fx.Pointer args, so tensors must be wrapped
+    # with _as_pointer (raw tensors would auto-convert to memref).
+    s1_args = (
+        _as_pointer(out1.view(-1)),
+        _as_pointer(a1_bq.view(-1)),
+        _as_pointer(w1_shuf_flat),
+        _as_pointer(a1_scale_fly),
+        _as_pointer(w1_scale_fly),
+        _as_pointer(sorted_ids),
+        _as_pointer(sorted_e),
+        _as_pointer(sorted_w),
+        _as_pointer(num_valid),
+        _as_pointer(_scale_ph),
         tokens,
         inter_dim,
         model_dim,
         size_expert_ids,
         stream,
     )
+    compiled = flyc.compile(exe1, *s1_args)
 
     def _run():
-        compiled(
-            out1.view(-1),
-            a1_bq.view(-1),
-            w1_shuf_flat,
-            a1_scale_fly,
-            w1_scale_fly,
-            sorted_ids,
-            sorted_e,
-            sorted_w,
-            num_valid,
-            _scale_ph,
-            tokens,
-            inter_dim,
-            model_dim,
-            size_expert_ids,
-            stream,
-        )
+        compiled(*s1_args)
 
     _, us = run_perftest(_run, num_iters=num_iters, num_warmup=num_warmup)
     torch.cuda.synchronize()
@@ -634,41 +621,27 @@ def _launch_flydsl_stage2(
     )
     stream = torch.cuda.current_stream()
     w2_shuf_flat = data["w2_bq_shuf"].view(-1)
-    compiled = flyc.compile(
-        exe2,
-        out2.view(-1),
-        a2_bq.view(-1),
-        w2_shuf_flat,
-        a2_scale_fly,
-        w2_scale_fly,
-        sorted_ids,
-        sorted_e,
-        sorted_w,
-        num_valid,
+    # moe_blockscale_gemm2 takes fx.Pointer args (see _launch_flydsl_stage1).
+    s2_args = (
+        _as_pointer(out2.view(-1)),
+        _as_pointer(a2_bq.view(-1)),
+        _as_pointer(w2_shuf_flat),
+        _as_pointer(a2_scale_fly),
+        _as_pointer(w2_scale_fly),
+        _as_pointer(sorted_ids),
+        _as_pointer(sorted_e),
+        _as_pointer(sorted_w),
+        _as_pointer(num_valid),
         tokens,
         model_dim,
         inter_dim,
         size_expert_ids,
         stream,
     )
+    compiled = flyc.compile(exe2, *s2_args)
 
     def _run():
-        compiled(
-            out2.view(-1),
-            a2_bq.view(-1),
-            w2_shuf_flat,
-            a2_scale_fly,
-            w2_scale_fly,
-            sorted_ids,
-            sorted_e,
-            sorted_w,
-            num_valid,
-            tokens,
-            model_dim,
-            inter_dim,
-            size_expert_ids,
-            stream,
-        )
+        compiled(*s2_args)
 
     _, us = run_perftest(_run, num_iters=num_iters, num_warmup=num_warmup)
     torch.cuda.synchronize()
@@ -905,43 +878,28 @@ def _launch_flydsl_stage1_splitk(data, *, tile_m, tile_n, tile_k, k_batch, act):
     )
     stream = torch.cuda.current_stream()
     _scale_ph = torch.empty(1, dtype=torch.uint8, device=DEVICE)
-    compiled = flyc.compile(
-        exe1,
-        tmp_out.view(-1),
-        a1_bq.view(-1),
-        w1_shuf_flat,
-        a1_scale_fly,
-        w1_scale_fly,
-        sorted_ids,
-        sorted_e,
-        sorted_w,
-        num_valid,
-        _scale_ph,
+    # moe_blockscale_gemm1 takes fx.Pointer args (see _launch_flydsl_stage1).
+    s1_args = (
+        _as_pointer(tmp_out.view(-1)),
+        _as_pointer(a1_bq.view(-1)),
+        _as_pointer(w1_shuf_flat),
+        _as_pointer(a1_scale_fly),
+        _as_pointer(w1_scale_fly),
+        _as_pointer(sorted_ids),
+        _as_pointer(sorted_e),
+        _as_pointer(sorted_w),
+        _as_pointer(num_valid),
+        _as_pointer(_scale_ph),
         tokens,
         inter_dim,
         model_dim,
         size_expert_ids,
         stream,
     )
+    compiled = flyc.compile(exe1, *s1_args)
     # Atomic-add into a zeroed buffer: must clear before each launch.
     tmp_out.zero_()
-    compiled(
-        tmp_out.view(-1),
-        a1_bq.view(-1),
-        w1_shuf_flat,
-        a1_scale_fly,
-        w1_scale_fly,
-        sorted_ids,
-        sorted_e,
-        sorted_w,
-        num_valid,
-        _scale_ph,
-        tokens,
-        inter_dim,
-        model_dim,
-        size_expert_ids,
-        stream,
-    )
+    compiled(*s1_args)
     torch.cuda.synchronize()
     return tmp_out
 

@@ -2,7 +2,11 @@ import pytest
 import torch
 
 from aiter import dtypes
-from aiter.ops.flydsl.moe_kernels import _get_compiled_silu_fused, _run_compiled
+from aiter.ops.flydsl.moe_kernels import (
+    _as_pointer,
+    _get_compiled_silu_fused,
+    _run_compiled,
+)
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.utility.fp4_utils import moe_mxfp4_sort
@@ -63,13 +67,13 @@ def test_flydsl_swiglu_fused_fp4_quant_matches_reference(
     _run_compiled(
         kernel,
         (
-            x,
-            out.view(-1).view(torch.uint8),
-            out_scale_sorted,
-            sorted_ids,
-            num_valid_ids,
-            sorted_ids,
-            torch.empty(0, dtype=torch.float32, device=device),
+            _as_pointer(x),
+            _as_pointer(out.view(-1).view(torch.uint8)),
+            _as_pointer(out_scale_sorted),
+            _as_pointer(sorted_ids),
+            _as_pointer(num_valid_ids),
+            _as_pointer(sorted_ids),
+            _as_pointer(torch.empty(0, dtype=torch.float32, device=device)),
             token_num,
             sorted_ids.numel(),
             torch.cuda.current_stream(),
