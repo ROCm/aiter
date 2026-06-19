@@ -91,12 +91,10 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
 
     Computes the 8 bit matmul C = A x B using the block-scale quantization approach, with block shape assumed to be the same as BLOCK_SIZE_N/K.
 
-    Split-K not supported due to design decision.
-
     Key parameters:
     - A: Matrix A with shape (M, K).
     - B: Matrix B with shape (K, N).
-    - C: Matrix C with shape (M, N).
+    - C: Matrix C with shape (M, N) or (NUM_KSPLIT, M, N) when split-K.
     - A_scale: Scale tensor for A with shape (M, *scale_k).
     - B_scale: Scale tensor for B with shape (*scale_k, **scale_n).
 
@@ -104,11 +102,24 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     **scale_n = (N + GROUP_N - 1) // GROUP_N
     """
 
-    # program setup
-    pid = gl.program_id(axis=0)
+    # program setup — split-K decomposition
+    pid_unified = gl.program_id(axis=0)
+    pid_k = pid_unified // GRID_MN
+    pid = pid_unified % GRID_MN
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+
+    if NUM_KSPLIT == 1:
+        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    else:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+
+    # K-split range for this partition
+    k_split_offset = pid_k * SPLITK_BLOCK_SIZE
+    K_local = K - k_split_offset
+    if NUM_KSPLIT > 1:
+        K_local = SPLITK_BLOCK_SIZE
 
     # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
@@ -157,21 +168,26 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     offs_b_scale_n = offs_bn // GROUP_N
     offs_b_scale = offs_b_scale_n * stride_bscale_n
 
+    # Offset scale pointers to this split-K partition
+    k_scale_offset = k_split_offset // GROUP_K
+    a_scale_ptr += k_scale_offset * stride_ascale_k
+    b_scale_ptr += k_scale_offset * stride_bscale_k
+
     # tdm offsets
     off_am_tdm = pid_m * BLOCK_SIZE_M
     off_bm_tdm = pid_n * BLOCK_SIZE_N
 
-    # TDM tensor descriptors and shared mem
+    # TDM tensor descriptors — offset base pointers by k_split_offset
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_ptr,
-        shape=(M, K),
+        base=a_ptr + k_split_offset * stride_ak,
+        shape=(M, K_local),
         strides=(stride_am, stride_ak),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
         layout=tdm_shared_a,
     )
     b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_ptr,
-        shape=(N, K),
+        base=b_ptr + k_split_offset * stride_bk,
+        shape=(N, K_local),
         strides=(stride_bn, stride_bk),
         block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
         layout=tdm_shared_b,
@@ -223,13 +239,6 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     # wait for the buffers to finish
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
-    # load shared relaxed for a and b
-    # cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-    #         tdm_smem_a.index(num_computes % NUM_BUFFERS), dot_a_layout
-    #     )
-    # cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-    #         tdm_smem_b.index(num_computes % NUM_BUFFERS).permute((1, 0)), dot_b_layout
-    #     )
     cur_a = tdm_smem_a.index(num_computes % NUM_BUFFERS).load(layout=dot_a_layout)
     cur_b = (
         tdm_smem_b.index(num_computes % NUM_BUFFERS)
@@ -241,8 +250,8 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     smem_scale_a.store(a_scale)
     smem_scale_b.store(b_scale)
 
-    # setup for loop
-    k_tiles_count = gl.cdiv(K, BLOCK_SIZE_K)
+    # setup for loop — iterate over this partition's K tiles
+    k_tiles_count = gl.cdiv(K_local, BLOCK_SIZE_K)
 
     # ----- Main Loop --------
 
@@ -272,13 +281,6 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
         num_loads += 1
 
-        # begin loading in advance
-        # next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        #         tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS), dot_a_layout
-        #     )
-        # next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        #         tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS).permute((1, 0)), dot_b_layout
-        #     )
         next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
             layout=dot_a_layout
         )
@@ -329,12 +331,6 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
             cache=cache_modifier,
         )
 
-        # next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        #         tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS), dot_a_layout
-        #     )
-        # next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        #         tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS).permute((1, 0)), dot_b_layout
-        #     )
         next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
             layout=dot_a_layout
         )
@@ -361,10 +357,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-    # if NUM_BUFFERS > 2:
-    #     gl.amd.sched_barrier(0)
-
-    # Store
+    # Store — offset c_ptr by pid_k * stride_ck for split-K
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
@@ -379,7 +372,7 @@ def _gemm_a8w8_blockscale_bandwidth_bound_kernel(
     gl.barrier()
 
     c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr,
+        base=c_ptr + pid_k * stride_ck,
         shape=(M, N),
         strides=(stride_cm, stride_cn),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
@@ -445,11 +438,23 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     this is currently a copy of the bandwidth_bound kernel
     """
 
-    # program setup
-    pid = gl.program_id(axis=0)
+    # program setup — split-K decomposition
+    pid_unified = gl.program_id(axis=0)
+    pid_k = pid_unified // GRID_MN
+    pid = pid_unified % GRID_MN
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+
+    if NUM_KSPLIT == 1:
+        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    else:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+
+    k_split_offset = pid_k * SPLITK_BLOCK_SIZE
+    K_local = K - k_split_offset
+    if NUM_KSPLIT > 1:
+        K_local = SPLITK_BLOCK_SIZE
 
     # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
@@ -477,11 +482,9 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
         operand_index=1, parent=wmma_layout, k_width=8
     )
 
-    # scales shared mem and offsets -- offsets in wmma layout to match tdm
     smem_scale_a = gl.allocate_shared_memory(
         gl.float32, [BLOCK_SIZE_M], layout=shared_a_scale
     )
-
     smem_scale_b = gl.allocate_shared_memory(
         gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
     )
@@ -494,25 +497,26 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     )
 
     offs_a_scale = offs_am * stride_ascale_m
-
     offs_b_scale_n = offs_bn // GROUP_N
     offs_b_scale = offs_b_scale_n * stride_bscale_n
 
-    # tdm offsets
+    k_scale_offset = k_split_offset // GROUP_K
+    a_scale_ptr += k_scale_offset * stride_ascale_k
+    b_scale_ptr += k_scale_offset * stride_bscale_k
+
     off_am_tdm = pid_m * BLOCK_SIZE_M
     off_bm_tdm = pid_n * BLOCK_SIZE_N
 
-    # TDM tensor descriptors and shared mem
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_ptr,
-        shape=(M, K),
+        base=a_ptr + k_split_offset * stride_ak,
+        shape=(M, K_local),
         strides=(stride_am, stride_ak),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
         layout=tdm_shared_a,
     )
     b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_ptr,
-        shape=(N, K),
+        base=b_ptr + k_split_offset * stride_bk,
+        shape=(N, K_local),
         strides=(stride_bn, stride_bk),
         block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
         layout=tdm_shared_b,
@@ -524,18 +528,15 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
         b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=tdm_shared_b
     )
 
-    # loads/computes indexes/counters
     num_loads = 0
     num_computes = 0
 
-    # acc setup
     acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
     zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
 
     # ------------ Prologue ---------------
 
-    # load scales
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr,
         offsets=offs_a_scale,
@@ -547,7 +548,6 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
         cache=cache_modifier,
     )
 
-    # TDM prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
             a_desc,
@@ -561,16 +561,8 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
         )
         num_loads += 1
 
-    # wait for the buffers to finish
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
-    # load shared relaxed for a and b
-    # cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-    #         tdm_smem_a.index(num_computes % NUM_BUFFERS), dot_a_layout
-    #     )
-    # cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-    #         tdm_smem_b.index(num_computes % NUM_BUFFERS).permute((1, 0)), dot_b_layout
-    #     )
     cur_a = tdm_smem_a.index(num_computes % NUM_BUFFERS).load(layout=dot_a_layout)
     cur_b = (
         tdm_smem_b.index(num_computes % NUM_BUFFERS)
@@ -578,24 +570,20 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
         .load(layout=dot_b_layout)
     )
 
-    # store scales
     smem_scale_a.store(a_scale)
     smem_scale_b.store(b_scale)
 
-    # setup for loop
-    k_tiles_count = gl.cdiv(K, BLOCK_SIZE_K)
+    k_tiles_count = gl.cdiv(K_local, BLOCK_SIZE_K)
 
     # ----- Main Loop --------
 
     for k in range(k_tiles_count - (NUM_BUFFERS - 1)):
-        # Loading a scale and curr A scale
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
-        # wmma
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
-        # load into tdm
+
         gl.amd.gfx1250.tdm.async_load(
             a_desc,
             [off_am_tdm, num_loads * BLOCK_SIZE_K],
@@ -609,17 +597,9 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
             pred=1,
         )
 
-        # wait for loads before proceeding
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
         num_loads += 1
 
-        # begin loading in advance
-        # next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        #         tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS), dot_a_layout
-        #     )
-        # next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        #         tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS).permute((1, 0)), dot_b_layout
-        #     )
         next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
             layout=dot_a_layout
         )
@@ -629,7 +609,6 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
             .load(layout=dot_b_layout)
         )
 
-        # scales -- ptrs, load from global
         a_scale_ptr += stride_ascale_k
         b_scale_ptr += stride_bscale_k
         a_scale = gl.amd.cdna4.buffer_load(
@@ -651,7 +630,6 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
 
     # ======= Epilogue ========
 
-    # scale from last store
     cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
     cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
@@ -670,12 +648,6 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
             cache=cache_modifier,
         )
 
-        # next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        #         tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS), dot_a_layout
-        #     )
-        # next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        #         tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS).permute((1, 0)), dot_b_layout
-        #     )
         next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
             layout=dot_a_layout
         )
@@ -684,14 +656,13 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
             .permute((1, 0))
             .load(layout=dot_b_layout)
         )
-        # wmma
+
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
         cur_a = next_a
         cur_b = next_b
         num_computes += 1
 
-        # scale store in smem and load for next iteration
         smem_scale_a.store(a_scale)
         smem_scale_b.store(b_scale)
 
@@ -702,10 +673,7 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-    # if NUM_BUFFERS > 2:
-    #     gl.amd.sched_barrier(0)
-
-    # Store
+    # Store — offset c_ptr by pid_k * stride_ck for split-K
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
@@ -716,11 +684,10 @@ def _gemm_a8w8_blockscale_compute_bound_kernel(
     )
     tdm_smem_c.store(acc.to(c_ptr.type.element_ty))
 
-    # wait for all wavefronts before write
     gl.barrier()
 
     c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr,
+        base=c_ptr + pid_k * stride_ck,
         shape=(M, N),
         strides=(stride_cm, stride_cn),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
@@ -832,10 +799,23 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     transposed vs non-transposed case.
     """
 
-    pid = gl.program_id(axis=0)
+    # program setup — split-K decomposition
+    pid_unified = gl.program_id(axis=0)
+    pid_k = pid_unified // GRID_MN
+    pid = pid_unified % GRID_MN
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+
+    if NUM_KSPLIT == 1:
+        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    else:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+
+    k_split_offset = pid_k * SPLITK_BLOCK_SIZE
+    K_local = K - k_split_offset
+    if NUM_KSPLIT > 1:
+        K_local = SPLITK_BLOCK_SIZE
 
     # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
@@ -864,7 +844,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         operand_index=1, parent=wmma_layout, k_width=8
     )
 
-    # Scales shared mem
     smem_scale_a = gl.allocate_shared_memory(
         gl.float32, [BLOCK_SIZE_M], layout=shared_a_scale
     )
@@ -872,7 +851,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
     )
 
-    # Scale offsets in wmma layout
     offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
         0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
     )
@@ -884,27 +862,31 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     offs_b_scale_n = offs_bn // GROUP_N
     offs_b_scale = offs_b_scale_n * stride_bscale_n
 
+    # Offset scale pointers to this split-K partition
+    k_scale_offset = k_split_offset // GROUP_K
+    a_scale_ptr += k_scale_offset * stride_ascale_k
+    b_scale_ptr += k_scale_offset * stride_bscale_k
+
     # TDM offsets
     off_am_tdm = pid_m * BLOCK_SIZE_M
     off_bn_tdm = pid_n * (BLOCK_SIZE_N // 16)
 
-    # TDM tensor descriptors
+    # TDM tensor descriptors — offset by k_split_offset
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_ptr,
-        shape=(M, K),
+        base=a_ptr + k_split_offset * stride_ak,
+        shape=(M, K_local),
         strides=(stride_am, stride_ak),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
         layout=tdm_shared_a,
     )
     b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_ptr,
-        shape=(gl.cdiv(N, 16), K * 16),
+        base=b_ptr + k_split_offset * 16 * stride_bk,
+        shape=(gl.cdiv(N, 16), K_local * 16),
         strides=(stride_bn, stride_bk),
         block_shape=(BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16),
         layout=tdm_shared_b,
     )
 
-    # Shared memory for A and B tiles
     tdm_smem_a = gl.allocate_shared_memory(
         a_desc.dtype,
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_K],
@@ -916,18 +898,15 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         layout=tdm_shared_b,
     )
 
-    # Counters
     num_loads = 0
     num_computes = 0
 
-    # Accumulator
     acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
     zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
 
     # ------------ Prologue ---------------
 
-    # Load scales
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr, offsets=offs_a_scale, cache=cache_modifier
     )
@@ -935,7 +914,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         ptr=b_scale_ptr, offsets=offs_b_scale, cache=cache_modifier
     )
 
-    # TDM prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
             a_desc,
@@ -951,7 +929,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
 
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
-    # Load from shared into registers (unshuffle B)
     cur_a = tdm_smem_a.index(num_computes % NUM_BUFFERS).load(layout=dot_a_layout)
     cur_b = depreshuffle_b(
         tdm_smem_b.index(num_computes % NUM_BUFFERS),
@@ -959,11 +936,10 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     ).load(layout=dot_b_layout)
 
-    # Store scales to shared
     smem_scale_a.store(a_scale)
     smem_scale_b.store(b_scale)
 
-    k_tiles_count = gl.cdiv(K, BLOCK_SIZE_K)
+    k_tiles_count = gl.cdiv(K_local, BLOCK_SIZE_K)
 
     # ----- Main Loop --------
 
@@ -1058,7 +1034,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-    # Store output via TDM
+    # Store — offset c_ptr by pid_k * stride_ck for split-K
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
@@ -1072,7 +1048,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     gl.barrier()
 
     c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr,
+        base=c_ptr + pid_k * stride_ck,
         shape=(M, N),
         strides=(stride_cm, stride_cn),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
@@ -1140,17 +1116,28 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     this is currently a copy of the preshuffle bandwidth_bound kernel
     """
 
-    pid = gl.program_id(axis=0)
+    # program setup — split-K decomposition
+    pid_unified = gl.program_id(axis=0)
+    pid_k = pid_unified // GRID_MN
+    pid = pid_unified % GRID_MN
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
-    # acc layout
+    if NUM_KSPLIT == 1:
+        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    else:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+
+    k_split_offset = pid_k * SPLITK_BLOCK_SIZE
+    K_local = K - k_split_offset
+    if NUM_KSPLIT > 1:
+        K_local = SPLITK_BLOCK_SIZE
+
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         3, True, warp_bases, [], [16, 16, 128]
     )
 
-    # Shared memory layouts
     tdm_shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_K, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_K], [1, 0]
     )
@@ -1172,7 +1159,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         operand_index=1, parent=wmma_layout, k_width=8
     )
 
-    # Scales shared mem
     smem_scale_a = gl.allocate_shared_memory(
         gl.float32, [BLOCK_SIZE_M], layout=shared_a_scale
     )
@@ -1180,7 +1166,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
     )
 
-    # Scale offsets in wmma layout
     offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
         0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
     )
@@ -1192,27 +1177,28 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     offs_b_scale_n = offs_bn // GROUP_N
     offs_b_scale = offs_b_scale_n * stride_bscale_n
 
-    # TDM offsets
+    k_scale_offset = k_split_offset // GROUP_K
+    a_scale_ptr += k_scale_offset * stride_ascale_k
+    b_scale_ptr += k_scale_offset * stride_bscale_k
+
     off_am_tdm = pid_m * BLOCK_SIZE_M
     off_bn_tdm = pid_n * (BLOCK_SIZE_N // 16)
 
-    # TDM tensor descriptors
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_ptr,
-        shape=(M, K),
+        base=a_ptr + k_split_offset * stride_ak,
+        shape=(M, K_local),
         strides=(stride_am, stride_ak),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
         layout=tdm_shared_a,
     )
     b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_ptr,
-        shape=(gl.cdiv(N, 16), K * 16),
+        base=b_ptr + k_split_offset * 16 * stride_bk,
+        shape=(gl.cdiv(N, 16), K_local * 16),
         strides=(stride_bn, stride_bk),
         block_shape=(BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16),
         layout=tdm_shared_b,
     )
 
-    # Shared memory for A and B tiles
     tdm_smem_a = gl.allocate_shared_memory(
         a_desc.dtype,
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_K],
@@ -1224,18 +1210,15 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         layout=tdm_shared_b,
     )
 
-    # Counters
     num_loads = 0
     num_computes = 0
 
-    # Accumulator
     acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
     zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
 
     # ------------ Prologue ---------------
 
-    # Load scales
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr, offsets=offs_a_scale, cache=cache_modifier
     )
@@ -1243,7 +1226,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         ptr=b_scale_ptr, offsets=offs_b_scale, cache=cache_modifier
     )
 
-    # TDM prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
             a_desc,
@@ -1259,7 +1241,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
 
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
-    # Load from shared into registers (unshuffle B)
     cur_a = tdm_smem_a.index(num_computes % NUM_BUFFERS).load(layout=dot_a_layout)
     cur_b = depreshuffle_b(
         tdm_smem_b.index(num_computes % NUM_BUFFERS),
@@ -1267,11 +1248,10 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     ).load(layout=dot_b_layout)
 
-    # Store scales to shared
     smem_scale_a.store(a_scale)
     smem_scale_b.store(b_scale)
 
-    k_tiles_count = gl.cdiv(K, BLOCK_SIZE_K)
+    k_tiles_count = gl.cdiv(K_local, BLOCK_SIZE_K)
 
     # ----- Main Loop --------
 
@@ -1282,7 +1262,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-        # TDM load next tile
         gl.amd.gfx1250.tdm.async_load(
             a_desc,
             [off_am_tdm, num_loads * BLOCK_SIZE_K],
@@ -1299,7 +1278,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
         num_loads += 1
 
-        # Load next tile from shared (unshuffle B)
         next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
             layout=dot_a_layout
         )
@@ -1309,7 +1287,6 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
             BLOCK_SIZE_K=BLOCK_SIZE_K,
         ).load(layout=dot_b_layout)
 
-        # Advance scales
         a_scale_ptr += stride_ascale_k
         b_scale_ptr += stride_bscale_k
         a_scale = gl.amd.cdna4.buffer_load(
@@ -1366,7 +1343,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-    # Store output via TDM
+    # Store — offset c_ptr by pid_k * stride_ck for split-K
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
@@ -1380,7 +1357,7 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     gl.barrier()
 
     c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr,
+        base=c_ptr + pid_k * stride_ck,
         shape=(M, N),
         strides=(stride_cm, stride_cn),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
