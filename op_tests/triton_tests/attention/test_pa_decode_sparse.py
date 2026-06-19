@@ -199,9 +199,7 @@ def _reduce_partials_torch(
         m_p = m_partial[t, :, :H].clone()  # [KV_SPLITS, H]
         l_p = l_partial[t, :, :H]
         a_p = acc_partial[t, :, :H, :]  # [KV_SPLITS, H, D]
-        m_p = torch.where(
-            seg_mask[:, None], m_p, torch.full_like(m_p, float("-inf"))
-        )
+        m_p = torch.where(seg_mask[:, None], m_p, torch.full_like(m_p, float("-inf")))
 
         m_max = m_p.max(dim=0).values  # [H]
         is_dead = m_p == float("-inf")  # [KV_SPLITS, H]
@@ -209,7 +207,9 @@ def _reduce_partials_torch(
         l_comb = torch.where(is_dead, torch.zeros_like(l_p), l_p * alpha).sum(0)  # [H]
         acc_comb = torch.where(
             is_dead[:, :, None], torch.zeros_like(a_p), a_p * alpha[:, :, None]
-        ).sum(0)  # [H, D]
+        ).sum(
+            0
+        )  # [H, D]
 
         m_final = torch.maximum(m_max, sink)
         alpha_kv = expfn(m_max - m_final)
@@ -232,7 +232,9 @@ def _reduce_partials_torch(
 @pytest.mark.parametrize("var_len", [True, False])
 @pytest.mark.parametrize("sentinels", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
-def test_pa_decode_sparse_vs_reference(T, H, D, kv_len, var_len, sentinels, skip_reduce):
+def test_pa_decode_sparse_vs_reference(
+    T, H, D, kv_len, var_len, sentinels, skip_reduce
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
@@ -249,7 +251,14 @@ def test_pa_decode_sparse_vs_reference(T, H, D, kv_len, var_len, sentinels, skip
 
     ref = pa_decode_sparse_reference(q, ukv, indices, indptr, sink, scale)
     result = pa_decode_sparse(
-        q, ukv, indices, indptr, sink, scale, skip_reduce=skip_reduce
+        q,
+        ukv,
+        indices,
+        indptr,
+        sink,
+        scale,
+        has_invalid=sentinels,
+        skip_reduce=skip_reduce,
     )
 
     if isinstance(result, tuple):
@@ -266,3 +275,81 @@ def test_pa_decode_sparse_vs_reference(T, H, D, kv_len, var_len, sentinels, skip
         out = result
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+
+
+# ---------------------------------------------------------------------------
+# FP8 KV cache quantization helpers
+# ---------------------------------------------------------------------------
+
+_FP8_GROUP_SIZE = 64
+_FP8_DTYPE = torch.float8_e4m3fnuz
+
+
+def _quantize_kv_fp8(unified_kv, group_size=_FP8_GROUP_SIZE):
+    """Quantize bf16/fp16 unified_kv to (fp8, scales) with 1xGROUP_SIZE block scaling.
+
+    Returns (kv_fp8, kv_scales) where kv_fp8 is float8_e4m3fnuz and
+    kv_scales is [total_pages, D // group_size] fp32.
+    """
+    total_pages, D = unified_kv.shape
+    assert D % group_size == 0
+    num_groups = D // group_size
+    kv_f32 = unified_kv.float().view(total_pages, num_groups, group_size)
+    amax = kv_f32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    fp8_max = torch.finfo(_FP8_DTYPE).max
+    scales = (amax / fp8_max).squeeze(-1)  # [total_pages, num_groups]
+    kv_scaled = kv_f32 / amax * fp8_max
+    kv_fp8 = kv_scaled.view(total_pages, D).to(_FP8_DTYPE)
+    return kv_fp8, scales.to(torch.float32)
+
+
+def _dequant_kv_fp8(kv_fp8, kv_scales, group_size=_FP8_GROUP_SIZE):
+    """Dequantize for reference comparison."""
+    total_pages, D = kv_fp8.shape
+    num_groups = D // group_size
+    kv_f32 = kv_fp8.float().view(total_pages, num_groups, group_size)
+    scales_expanded = kv_scales.unsqueeze(-1).expand(
+        total_pages, num_groups, group_size
+    )
+    return (kv_f32 * scales_expanded).view(total_pages, D)
+
+
+@pytest.mark.parametrize("T", [1, 32, 128])
+@pytest.mark.parametrize("H", [1, 8, 16])
+@pytest.mark.parametrize("D", [512])
+@pytest.mark.parametrize("kv_len", [100, 400, 1024])
+@pytest.mark.parametrize("var_len", [True, False])
+def test_pa_decode_sparse_fp8_vs_reference(T, H, D, kv_len, var_len):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    pages = T * kv_len
+    q, ukv_bf16, indices, indptr, sink, scale = _make_inputs(
+        T,
+        H,
+        D,
+        kv_len,
+        pages,
+        variable_len=var_len,
+    )
+
+    # Quantize KV to fp8 + scales
+    kv_fp8, kv_scales = _quantize_kv_fp8(ukv_bf16)
+
+    # Reference: dequant back to bf16, run the torch reference
+    ukv_deq = _dequant_kv_fp8(kv_fp8, kv_scales).to(q.dtype)
+    ref = pa_decode_sparse_reference(q, ukv_deq, indices, indptr, sink, scale)
+
+    # Triton kernel with fp8 kv + kv_scales
+    out = pa_decode_sparse(
+        q,
+        kv_fp8,
+        indices,
+        indptr,
+        sink,
+        scale,
+        kv_scales=kv_scales,
+        has_invalid=False,
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

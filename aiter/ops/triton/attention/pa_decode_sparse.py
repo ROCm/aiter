@@ -30,6 +30,10 @@ DEVICE_ARCH = arch_info.get_arch()
 _LOGGER = AiterTritonLogger()
 
 
+_FP8_GROUP_SIZE = 64
+_FP8_DTYPE = torch.float8_e4m3fnuz
+
+
 def pa_decode_sparse(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -37,6 +41,7 @@ def pa_decode_sparse(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    kv_scales: Optional[torch.Tensor] = None,
     block_h: Optional[int] = None,
     kv_splits: Optional[int] = None,
     has_invalid: Optional[bool] = True,
@@ -84,10 +89,31 @@ def pa_decode_sparse(
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_decode_sparse expects fp16/bf16 q, got {q.dtype}")
-    if unified_kv.dtype != q.dtype:
-        raise RuntimeError(
-            f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+
+    quant_kv = kv_scales is not None
+    if quant_kv:
+        assert unified_kv.dtype == _FP8_DTYPE, (
+            f"kv_scales supplied but unified_kv is {unified_kv.dtype}, "
+            f"expected {_FP8_DTYPE}"
         )
+        assert (
+            kv_scales.dtype == torch.float32
+        ), f"kv_scales must be fp32, got {kv_scales.dtype}"
+        D_check = unified_kv.shape[-1]
+        assert (
+            D_check % _FP8_GROUP_SIZE == 0
+        ), f"D={D_check} must be divisible by GROUP_SIZE={_FP8_GROUP_SIZE}"
+        expected_g = D_check // _FP8_GROUP_SIZE
+        assert kv_scales.shape == (unified_kv.shape[0], expected_g), (
+            f"kv_scales shape {tuple(kv_scales.shape)} does not match "
+            f"expected ({unified_kv.shape[0]}, {expected_g})"
+        )
+        assert kv_scales.is_contiguous()
+    else:
+        if unified_kv.dtype != q.dtype:
+            raise RuntimeError(
+                f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+            )
 
     T, H, D = q.shape
     _LOGGER.info(
@@ -162,6 +188,15 @@ def pa_decode_sparse(
         lp_strides = l_partial.stride()
         ap_strides = acc_partial.stride()
 
+    if quant_kv:
+        kv_scales_arg = kv_scales
+        ks_stride_n_arg = kv_scales.stride(0)
+        num_groups_arg = D // _FP8_GROUP_SIZE
+    else:
+        kv_scales_arg = q.new_empty(1, dtype=torch.float32)
+        ks_stride_n_arg = 1
+        num_groups_arg = 1
+
     if use_gluon:
         impl = gluon_pa_decode_sparse
     else:
@@ -171,6 +206,7 @@ def pa_decode_sparse(
     impl[grid_attn](
         q,
         unified_kv,
+        kv_scales_arg,
         kv_indices,
         kv_indptr,
         m_partial,
@@ -184,6 +220,7 @@ def pa_decode_sparse(
         q.stride(2),
         unified_kv.stride(0),
         unified_kv.stride(1),
+        ks_stride_n_arg,
         mp_strides[0],
         mp_strides[1],
         mp_strides[2],
@@ -205,6 +242,9 @@ def pa_decode_sparse(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         HAS_INVALID=has_invalid,
+        QUANT_KV=quant_kv,
+        GROUP_SIZE=_FP8_GROUP_SIZE,
+        NUM_GROUPS=num_groups_arg,
         num_warps=attn_num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,

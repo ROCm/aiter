@@ -36,6 +36,7 @@ _pa_decode_sparse_repr = make_kernel_repr(
 def _pa_decode_sparse(
     q_ptr,
     unified_kv_ptr,
+    kv_scales_ptr,
     kv_indices_ptr,
     kv_indptr_ptr,
     m_partial_ptr,
@@ -49,6 +50,7 @@ def _pa_decode_sparse(
     q_stride_d: gl.constexpr,
     kv_stride_n: gl.constexpr,
     kv_stride_d: gl.constexpr,
+    ks_stride_n: gl.constexpr,
     mp_stride_t: gl.constexpr,
     mp_stride_k: gl.constexpr,
     mp_stride_h: gl.constexpr,
@@ -70,6 +72,9 @@ def _pa_decode_sparse(
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
     HAS_INVALID: gl.constexpr,
+    QUANT_KV: gl.constexpr,
+    GROUP_SIZE: gl.constexpr,
+    NUM_GROUPS: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     WARP_SIZE: gl.constexpr = 32
@@ -235,6 +240,19 @@ def _pa_decode_sparse(
         [NUM_SLOT_BUFFERS, 1, BLOCK_K],
         slot_shared,
     )
+    # Dequant buffer: when QUANT_KV, fp8 KV is gathered into kv_bufs, then
+    # dequanted (fp8→f32*scale→bf16) and stored into this bf16 shared buffer
+    # from which the dot operands are loaded. One tile is enough since dequant
+    # is synchronous before the dots.
+    if QUANT_KV:
+        kv_dq_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_D, 8]], [BLOCK_K, BLOCK_D], [1, 0]
+        )
+        kv_dq_buf = gl.allocate_shared_memory(
+            q_ptr.dtype.element_ty,
+            [BLOCK_K, BLOCK_D],
+            kv_dq_shared,
+        )
 
     # TDM tensor descriptor over unified_kv [pages, D].
     kv_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -280,6 +298,8 @@ def _pa_decode_sparse(
     else:
         safe_slot_cur = slot_reg
     gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, 0, kv_bufs.index(0))
+    if QUANT_KV:
+        cur_safe_slot = safe_slot_cur
 
     buf_idx: gl.int32 = 0
 
@@ -315,26 +335,42 @@ def _pa_decode_sparse(
             kv_desc, safe_next_slot, 0, kv_bufs.index(async_idx)
         )
 
-        # Wait for KV[i] (leaves slot[i+2] and KV[i+1] in flight, 2 outstanding).
+        # Wait for KV[i] (the FIFO ordering guarantees it is older than the
+        # ops we want to keep in flight).
         gl.amd.gfx1250.tdm.async_wait(2)
 
         # ---- Math for tile (tile_start + i) using kv_bufs[buf_idx] ----
-        # cur_valid (slot[i] >= 0) was computed when slot[i] was loaded (prev
-        # iter / prologue) and carried in. Main-loop tiles are always full (only
-        # the final tile, peeled into the epilogue, can be partial), so the -1
-        # sentinel mask is the only mask needed here.
         kv_smem_cur = kv_bufs.index(buf_idx)
-        kv_t = kv_smem_cur.permute([1, 0]).load(dot_k_layout)
+        if QUANT_KV:
+            # Dequant fp8 KV: load fp8 from shared, buffer_load scales from
+            # global, broadcast-multiply, store dequanted bf16 to kv_dq_buf.
+            kv_raw_reg = kv_smem_cur.load(Q_BLOCKED_LAYOUT)
+            d_offs_bl = gl.arange(
+                0, BLOCK_D, layout=gl.SliceLayout(0, Q_BLOCKED_LAYOUT)
+            )
+            slot_bl = gl.convert_layout(
+                cur_safe_slot, gl.SliceLayout(1, Q_BLOCKED_LAYOUT)
+            )
+            scale_offsets = (
+                slot_bl[:, None] * ks_stride_n + (d_offs_bl[None, :] // GROUP_SIZE)
+            ).to(gl.int32)
+            scales_reg = gl.amd.cdna4.buffer_load(
+                ptr=kv_scales_ptr,
+                offsets=scale_offsets,
+            )
+            kv_dq = (kv_raw_reg.to(gl.float32) * scales_reg).to(q_ptr.dtype.element_ty)
+            kv_dq_buf.store(kv_dq)
+            kv_src = kv_dq_buf
+        else:
+            kv_src = kv_smem_cur
+
+        kv_t = kv_src.permute([1, 0]).load(dot_k_layout)
         scores = gl.amd.gfx1250.wmma(
             mfma_q,
             kv_t,
             gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
         )
-        # scores = scores * softmax_scale
 
-        # Main-loop tiles are always full (only the partial final tile is peeled
-        # into the epilogue), so the only mask needed here is the -1 sentinel
-        # mask. Skip it entirely when the caller guarantees no -1.
         if HAS_INVALID:
             valid_col = gl.convert_layout(cur_valid, valid_col_mma)
             score_bias = gl.where(valid_col, 0.0, float("-inf"))
@@ -346,18 +382,19 @@ def _pa_decode_sparse(
         p = gl.exp(scores - m_new[:, None])
         l_new = l_i * alpha + gl.sum(p, axis=1)
 
-        kv_for_acc = kv_smem_cur.load(dot_v_layout)
-        p_dot = gl.convert_layout(p.to(unified_kv_ptr.dtype.element_ty), dot_p_layout)
+        kv_for_acc = kv_src.load(dot_v_layout)
+        p_dot = gl.convert_layout(p.to(q_ptr.dtype.element_ty), dot_p_layout)
         acc = acc * gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
         acc = gl.amd.gfx1250.wmma(p_dot, kv_for_acc, acc)
 
         m_i = m_new
         l_i = l_new
 
-        # Rotate. slot_reg / cur_valid now describe slot[i+1] (the next tile,
-        # also the final tile after the last iteration -> used by the epilogue).
+        # Rotate. slot_reg / cur_valid / cur_safe_slot now describe slot[i+1].
         if HAS_INVALID:
             cur_valid = next_valid
+        if QUANT_KV:
+            cur_safe_slot = safe_next_slot
         buf_idx = async_idx
 
     # ---- Epilogue: process final tile (tile_end - 1) ----
@@ -374,13 +411,30 @@ def _pa_decode_sparse(
         final_valid = final_in_range
 
     kv_smem_final = kv_bufs.index(buf_idx)
-    kv_t = kv_smem_final.permute([1, 0]).load(dot_k_layout)
+    if QUANT_KV:
+        # Dequant epilogue tile (same pattern as main loop).
+        kv_raw_reg = kv_smem_final.load(Q_BLOCKED_LAYOUT)
+        d_offs_bl = gl.arange(0, BLOCK_D, layout=gl.SliceLayout(0, Q_BLOCKED_LAYOUT))
+        slot_bl = gl.convert_layout(cur_safe_slot, gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+        scale_offsets = (
+            slot_bl[:, None] * ks_stride_n + (d_offs_bl[None, :] // GROUP_SIZE)
+        ).to(gl.int32)
+        scales_reg = gl.amd.cdna4.buffer_load(
+            ptr=kv_scales_ptr,
+            offsets=scale_offsets,
+        )
+        kv_dq = (kv_raw_reg.to(gl.float32) * scales_reg).to(q_ptr.dtype.element_ty)
+        kv_dq_buf.store(kv_dq)
+        kv_src_final = kv_dq_buf
+    else:
+        kv_src_final = kv_smem_final
+
+    kv_t = kv_src_final.permute([1, 0]).load(dot_k_layout)
     scores = gl.amd.gfx1250.wmma(
         mfma_q,
         kv_t,
         gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
     )
-    # scores = scores * softmax_scale
 
     # Mask OOB / -1 sentinel columns via an additive -inf bias (see main loop).
     valid_col = gl.convert_layout(final_valid, valid_col_mma)
@@ -393,8 +447,8 @@ def _pa_decode_sparse(
     p = gl.exp(scores - m_new[:, None])
     l_new = l_i * alpha + gl.sum(p, axis=1)
 
-    kv_for_acc = kv_smem_final.load(dot_v_layout)
-    p_dot = gl.convert_layout(p.to(unified_kv_ptr.dtype.element_ty), dot_p_layout)
+    kv_for_acc = kv_src_final.load(dot_v_layout)
+    p_dot = gl.convert_layout(p.to(q_ptr.dtype.element_ty), dot_p_layout)
     acc = acc * gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
     acc = gl.amd.gfx1250.wmma(p_dot, kv_for_acc, acc)
 
