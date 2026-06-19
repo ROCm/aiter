@@ -7,8 +7,12 @@
         "num_warps": 4,
         "num_stages": 2,
         "waves_per_eu": 1,
+<<<<<<< HEAD
         "matrix_instr_nonkdim": 16,
         "NUM_KSPLIT": 1
+=======
+        "matrix_instr_nonkdim": 16
+>>>>>>> origin/main
     },
     "any": {
         "BLOCK_SIZE_M": 128,
@@ -18,7 +22,11 @@
         "num_warps": 4,
         "num_stages": 2,
         "waves_per_eu": 1,
+<<<<<<< HEAD
         "matrix_instr_nonkdim": 16,
         "NUM_KSPLIT": 1
+=======
+        "matrix_instr_nonkdim": 16
+>>>>>>> origin/main
     }
 }
