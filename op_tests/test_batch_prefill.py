@@ -3874,6 +3874,92 @@ def _asm_pack_paged_kv(kf8_list, vf8_list, kdesc_list, num_heads_k, head_dim):
     )
 
 
+def _asm_pack_paged_kv_alllayers(
+    kf8_list, vf8_list, kdesc_list, num_heads_k, head_dim, num_layers, layer_idx, seed=0
+):
+    """Pack per-batch fp8 K/V into the vLLM "all-layers-per-block" combined KV
+    cache (vllm-project/vllm#27742) and return strided K/V views for ONE layer.
+
+    The backing buffer is C-contiguous as
+        (num_blocks, num_kv_heads, num_layers, 2, page * head_dim)
+    so all layers (and both K and V) of a block sit contiguously. The inner
+    page*head_dim chunk keeps the kernel's existing swizzle: K as
+    [head_dim/x, page, x], V (col-major) as [head_dim, page]. The per-layer view
+    handed to the launcher then matches the issue's 5D shape/stride (with only
+    the innermost (page, head_dim) reinterpreted as the kernel swizzle):
+        K view: (num_pages, hk, head_dim/x, page, x)
+        V view: (num_pages, hk, head_dim, page)
+        block stride = num_kv_heads*num_layers*2*page*head_dim   (== view.stride(0))
+        head  stride = num_layers*2*page*head_dim                (== view.stride(1))
+        K/V split    = page*head_dim                             (V base = K base + this)
+        layer base   = layer_idx * 2*page*head_dim
+
+    All non-target layers are filled with random fp8 so a correct run proves the
+    kernel addresses the cache purely via stride(0)/stride(1) and the K/V base
+    pointers (no contiguity assumption).
+    """
+    dev = kf8_list[0].device
+    page, x = _ASM_PAGE, _ASM_VECX
+    ppb = [(kf8.shape[0] + page - 1) // page for kf8 in kf8_list]
+    num_pages = sum(ppb)
+    kv_indptr = torch.tensor(
+        [0, *list(itertools.accumulate(ppb))], dtype=torch.int32, device=dev
+    )
+    kv_page_indices = torch.arange(num_pages, dtype=torch.int32, device=dev)
+    seqlens_kvcache = torch.tensor(
+        [kf8.shape[0] for kf8 in kf8_list], dtype=torch.int32, device=dev
+    )
+
+    inner = page * head_dim  # fp8 elements per (block,head,layer,kv) tile
+    kv_stride = inner
+    layer_stride = 2 * inner
+    head_stride = num_layers * layer_stride
+    block_stride = num_heads_k * head_stride
+    total = num_pages * block_stride
+
+    # Random fp8 noise everywhere; the target layer's tiles are overwritten below.
+    gen = torch.Generator(device=dev).manual_seed(1234 + seed)
+    buf = (torch.rand(total, generator=gen, device=dev) * 2 - 1).to(_ASM_FP8)
+
+    k_pool = torch.as_strided(
+        buf,
+        (num_pages, num_heads_k, head_dim // x, page, x),
+        (block_stride, head_stride, page * x, x, 1),
+        storage_offset=layer_idx * layer_stride,  # kv index 0 (K)
+    )
+    v_pool = torch.as_strided(
+        buf,
+        (num_pages, num_heads_k, head_dim, page),
+        (block_stride, head_stride, page, 1),
+        storage_offset=layer_idx * layer_stride + kv_stride,  # kv index 1 (V)
+    )
+
+    kdesc_pool = torch.zeros(
+        num_pages, page, num_heads_k, dtype=torch.float32, device=dev
+    )
+
+    for b, (kf8, vf8, kdesc) in enumerate(zip(kf8_list, vf8_list, kdesc_list)):
+        sk = kf8.shape[0]
+        base = kv_indptr[b].item()
+        for t in range(sk):
+            phys = base + t // page  # identity LTD
+            row = t % page
+            kt = kf8[t].view(num_heads_k, head_dim // x, x)  # [hk, d/x, x]
+            k_pool[phys, :, :, row, :] = kt
+            v_pool[phys, :, :, row] = vf8[t]  # [hk, d]
+            kdesc_pool[phys, row, :] = kdesc[t]
+    return dict(
+        k_pool=k_pool,
+        v_pool=v_pool,
+        kdesc_pool=kdesc_pool,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        seqlens_kvcache=seqlens_kvcache,
+        num_pages=num_pages,
+        buf=buf,
+    )
+
+
 def run_batch_prefill_asm(
     seqlens,
     num_qo_heads=8,
@@ -3884,6 +3970,9 @@ def run_batch_prefill_asm(
     bench=False,
     warmup=10,
     iters=50,
+    combined_kv=False,
+    num_kv_layers=4,
+    kv_layer_idx=2,
 ):
     """Drive mha_batch_prefill_asm for the given per-batch seqlens (prefill:
     qo_len==kv_len per batch) and validate against the fp32 reference. When
@@ -3926,7 +4015,21 @@ def run_batch_prefill_asm(
     cu_seqlens_q = torch.tensor(
         [0, *list(itertools.accumulate(seqlens))], dtype=torch.int32, device=dev
     )
-    paged = _asm_pack_paged_kv(kf8_list, vf8_list, kdesc_list, num_kv_heads, head_dim)
+    if combined_kv:
+        paged = _asm_pack_paged_kv_alllayers(
+            kf8_list,
+            vf8_list,
+            kdesc_list,
+            num_kv_heads,
+            head_dim,
+            num_kv_layers,
+            kv_layer_idx,
+            seed=seed,
+        )
+    else:
+        paged = _asm_pack_paged_kv(
+            kf8_list, vf8_list, kdesc_list, num_kv_heads, head_dim
+        )
 
     out = torch.empty_like(q_packed, dtype=torch.bfloat16)
 
@@ -4032,6 +4135,33 @@ def test_batch_prefill_asm_qseqlen_unaligned_256(seqlens, use_p_scale):
     no out-of-bounds global access occurs for the padding rows of that tile."""
     assert any(s % 256 != 0 for s in seqlens), "test must exercise an unaligned seqlen"
     run_batch_prefill_asm(seqlens, use_p_scale=use_p_scale, seed=29)
+
+
+@pytest.mark.skipif(
+    get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only"
+)
+@pytest.mark.parametrize("use_p_scale", [False, True])
+@pytest.mark.parametrize(
+    "num_kv_layers,kv_layer_idx", [(1, 0), (4, 0), (4, 2), (4, 3), (8, 5)]
+)
+@pytest.mark.parametrize("seqlens", [[512], [256, 384]])
+def test_batch_prefill_asm_combined_kv(seqlens, num_kv_layers, kv_layer_idx, use_p_scale):
+    """vLLM "all-layers-per-block" combined KV cache (vllm-project/vllm#27742).
+
+    The kernel must read a SINGLE layer's strided K/V views out of a backing
+    buffer that interleaves all layers and both K/V per block:
+        (num_blocks, num_kv_heads, num_layers, 2, page*head_dim)
+    The other layers are random noise, so a passing NRMS proves the kernel
+    addresses KV purely via the per-layer view's stride(0)/stride(1) and K/V
+    base pointers, with the inner swizzle preserved."""
+    run_batch_prefill_asm(
+        seqlens,
+        use_p_scale=use_p_scale,
+        seed=37,
+        combined_kv=True,
+        num_kv_layers=num_kv_layers,
+        kv_layer_idx=kv_layer_idx,
+    )
 
 
 # Perf sweep: b=1 latency/TFLOPS at increasing context, reporting NRMS + runtime.
