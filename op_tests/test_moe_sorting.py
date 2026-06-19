@@ -27,13 +27,13 @@ def set_moe_sorting_backend(backend: str) -> None:
                 "backend=flydsl requested but FlyDSL is not available in this build"
             )
         fm._USE_CK_MOE_SORTING = False
-        fm._USE_OPUS_MOE_SORTING = False
+        fm._USE_FLYDSL_MOE_SORTING = True
     elif backend == "opus":
         fm._USE_CK_MOE_SORTING = False
-        fm._USE_OPUS_MOE_SORTING = True
+        fm._USE_FLYDSL_MOE_SORTING = False
     elif backend == "ck":
         fm._USE_CK_MOE_SORTING = True
-        fm._USE_OPUS_MOE_SORTING = False
+        fm._USE_FLYDSL_MOE_SORTING = False
     elif backend == "auto":
         pass  # leave module defaults as imported
     else:
