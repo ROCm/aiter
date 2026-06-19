@@ -417,9 +417,7 @@ def write_lookup_header(
                 # 5-tuple key: (gfx, cu_num, M, N, K)
                 # 6-tuple key: (gfx, cu_num, B, M, N, K)
                 # key[0] is the gfx arch string; the remaining elements are ints.
-                cpp_key = (
-                    "{" + ", ".join(str(x) for x in key) + "}"
-                )
+                cpp_key = "{" + ", ".join(str(x) for x in key) + "}"
             else:
                 cpp_key = key
             f.write(lookup_template.format(MNK=cpp_key, kernel_name=name))
