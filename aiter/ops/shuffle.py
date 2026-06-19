@@ -169,10 +169,18 @@ def shuffle_scale(
     experts_cnt: int = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
-    is_n32k4: bool = False,
+    is_n32k4: bool | None = None,
 ) -> torch.Tensor:
     if src is None:
         return src
+    # Leaving is_n32k4 at its default auto-detects the layout: the n32k4
+    # scale folding is only consumed by the gfx1250 grouped MoE GEMM, so we
+    # enable it exactly on gfx1250. Callers may still pass True/False to force
+    # the layout regardless of the running GPU (the interface is preserved).
+    if is_n32k4 is None:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        is_n32k4 = get_gfx() == "gfx1250"
     if is_n32k4:
         return shuffle_scale_n32k4(src, experts_cnt)
     if src.dtype == torch.float32:
