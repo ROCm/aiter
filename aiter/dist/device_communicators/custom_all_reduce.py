@@ -34,6 +34,7 @@ from aiter.utility.dtypes import fp8
 def _detect_gfx1250() -> bool:
     try:
         import torch
+
         if not torch.cuda.is_available():
             return False
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -242,10 +243,17 @@ class IPCBufferPool:
 
     _pool_seq: int = 0
 
-    def __init__(self, device: torch.device, group: ProcessGroup,
-                 ipc_handle_fn=None, graph_count_fn=None,
-                 graph_ipc_meta_fn=None, graph_register_fn=None,
-                 alloc_fn=None, free_fn=None):
+    def __init__(
+        self,
+        device: torch.device,
+        group: ProcessGroup,
+        ipc_handle_fn=None,
+        graph_count_fn=None,
+        graph_ipc_meta_fn=None,
+        graph_register_fn=None,
+        alloc_fn=None,
+        free_fn=None,
+    ):
         self._device = device
         self._group = group
         self._rank = dist.get_rank(group=group)
@@ -293,8 +301,13 @@ class IPCBufferPool:
         """
         if key in self._buffers:
             raise KeyError(f"IPCBuffer '{key}' already exists in the pool")
-        buf = IPCBuffer(size, self._device, uncached=uncached,
-                        alloc_fn=self._alloc_fn, free_fn=self._free_fn)
+        buf = IPCBuffer(
+            size,
+            self._device,
+            uncached=uncached,
+            alloc_fn=self._alloc_fn,
+            free_fn=self._free_fn,
+        )
         self._buffers[key] = buf
         return buf
 
@@ -372,25 +385,25 @@ class IPCBufferPool:
 
 
 class _GFX1250BufferProxy:
-    """Minimal proxy that exposes pool-like access for gfx1250's pointer-based
+    """Minimal proxy that exposes pool-like access for gfx1250's VMM-based
     buffers so the rest of CustomAllreduce can use self._pool["meta"] etc."""
 
-    def __init__(self, meta_tensor, input_tensor, ca):
-        self._meta = meta_tensor
-        self._input = input_tensor
+    def __init__(self, vmm_meta, vmm_input, ca):
+        self._meta = vmm_meta
+        self._input = vmm_input
         self._ca = ca
 
     class _Entry:
-        def __init__(self, tensor):
-            self._tensor = tensor
+        def __init__(self, vmm_buf):
+            self._buf = vmm_buf
 
         @property
         def data_ptr(self):
-            return self._tensor.data_ptr()
+            return self._buf.data_ptr
 
         @property
         def max_size(self):
-            return self._tensor.numel()
+            return self._buf.alloc_size
 
     def __getitem__(self, key):
         if key == "meta":
@@ -400,33 +413,53 @@ class _GFX1250BufferProxy:
         raise KeyError(key)
 
     def flush_graph_buffers(self, ar_ptr):
+        # TODO: full CUDA graph support on gfx1250 requires VMM-based
+        # exchange for graph-captured buffers. For now, graph capture
+        # is not supported on gfx1250 — log a warning.
         count = self._ca._ops_get_graph_buffer_count(ar_ptr)
-        if count == 0:
-            return
-        ptrs_tensor = torch.empty(count, dtype=torch.int64)
-        self._ca._ops_get_graph_buffer_ptrs(ar_ptr, ptrs_tensor.data_ptr())
-        local_ptrs = ptrs_tensor.tolist()
-        all_ptrs_flat = []
-        for ptr in local_ptrs:
-            all_rank_ptrs = self._ca._exchange_ptrs(
-                f"graph_{id(self)}_{ptr}", ptr
+        if count > 0:
+            logger.warning(
+                "gfx1250: CUDA graph buffer registration not yet "
+                "supported (%d buffers skipped)",
+                count,
             )
-            all_ptrs_flat.append(all_rank_ptrs)
-        # Flatten: [rank0_buf0, rank0_buf1, ..., rank1_buf0, ...]
-        world_size = self._ca.world_size
-        flat = []
-        for r in range(world_size):
-            for buf_idx in range(count):
-                flat.append(all_ptrs_flat[buf_idx][r])
-        logger.info("Registering %d cuda graph addresses (gfx1250)", count)
-        self._ca._ops_register_graph_buffers(ar_ptr, flat)
 
     def get_external_ipc_meta(self, tensor):
-        """Exchange a tensor's pointer across ranks and return ptrs list."""
-        all_ptrs = self._ca._exchange_ptrs(
-            f"ext_{id(self)}_{tensor.data_ptr()}", tensor.data_ptr()
+        """Exchange a tensor's pointer across ranks using VMM."""
+        from .vmm_allocator import VMMBuffer, vmm_exchange
+        import torch.distributed as dist
+
+        ca = self._ca
+        store = dist.distributed_c10d._get_default_store()
+        ranks_tag = "_".join(map(str, sorted(dist.get_process_group_ranks(ca.group))))
+        all_device_ids = list(range(ca.world_size))
+        vmm_buf = VMMBuffer(tensor.numel() * tensor.element_size(), ca.device.index)
+        # Copy tensor data into VMM buffer
+        import ctypes
+
+        _hip = ctypes.CDLL("libamdhip64.so")
+        _hip.hipMemcpyAsync(
+            ctypes.c_void_p(vmm_buf.data_ptr),
+            ctypes.c_void_p(tensor.data_ptr()),
+            tensor.numel() * tensor.element_size(),
+            4,
+            ctypes.c_void_p(0),  # hipMemcpyDeviceToDevice
         )
-        return all_ptrs
+        _hip.hipDeviceSynchronize()
+        ptrs, imports = vmm_exchange(
+            ca.rank,
+            ca.world_size,
+            f"ext_{id(self)}_{tensor.data_ptr()}",
+            vmm_buf,
+            store,
+            ranks_tag,
+            all_device_ids,
+        )
+        if not hasattr(ca, "_vmm_ext_imports"):
+            ca._vmm_ext_imports = []
+        ca._vmm_ext_imports.extend(imports)
+        ca._vmm_ext_imports.append(vmm_buf)
+        return ptrs
 
 
 class CustomAllreduce:
@@ -586,55 +619,50 @@ class CustomAllreduce:
         else:
             self._init_ipc(rank, world_size, max_size)
 
-    def _share_tensor_via_store(self, key: str, tensor: torch.Tensor) -> List[int]:
-        """Share a CUDA tensor across ranks using torch's IPC mechanism and
-        return a list of device pointers (one per rank) that are valid in
-        this process's address space."""
-        store = dist.distributed_c10d._get_default_store()
-        rank = self.rank
-        world_size = self.world_size
-        ranks_tag = "_".join(
-            map(str, sorted(dist.get_process_group_ranks(self.group)))
-        )
-        prefix = f"aiter_p2p/{ranks_tag}/{key}"
-
-        ipc_data = tensor.untyped_storage()._share_cuda_()
-        store.set(f"{prefix}/r{rank}", pickle.dumps(ipc_data))
-
-        ptrs = []
-        self._shared_storages = getattr(self, "_shared_storages", [])
-        for r in range(world_size):
-            if r == rank:
-                ptrs.append(tensor.data_ptr())
-                continue
-            raw = store.get(f"{prefix}/r{r}")
-            remote_data = pickle.loads(raw)
-            (device, handle, size, offset,
-             ref_counter_handle, ref_counter_offset,
-             event_handle, event_sync) = remote_data
-            remote_storage = torch.UntypedStorage._new_shared_cuda(
-                device, handle, size, offset,
-                ref_counter_handle, ref_counter_offset,
-                event_handle, event_sync,
-            )
-            self._shared_storages.append(remote_storage)
-            ptrs.append(remote_storage.data_ptr())
-        return ptrs
-
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
-        """gfx1250 init: hipIpc C++ path unavailable, use torch's own
-        cross-process CUDA tensor sharing + direct pointer exchange."""
-        meta_sz = self._ops_meta_size()
-        self._meta_tensor = torch.zeros(
-            meta_sz + max_size * 2, dtype=torch.uint8, device=self.device
-        )
-        self._input_tensor = torch.empty(
-            max_size, dtype=torch.uint8, device=self.device
-        )
+        """gfx1250 init: hipIpc unavailable, use HIP VMM API to share
+        GPU buffers across processes via exported fd + Unix socket."""
+        from .vmm_allocator import VMMBuffer, vmm_exchange
 
-        all_meta_ptrs = self._share_tensor_via_store("meta", self._meta_tensor)
+        meta_sz = self._ops_meta_size()
+        # gfx1250 is 1-stage only — no tmp buffer after Signal needed
+        total_meta = meta_sz
+        device_id = self.device.index
+
+        # Collect all device ids in this group for VMM access permissions
+        all_device_ids = list(range(world_size))
+
+        store = dist.distributed_c10d._get_default_store()
+        ranks_tag = "_".join(map(str, sorted(dist.get_process_group_ranks(self.group))))
+
+        # Allocate meta buffer via VMM and zero-init
+        self._vmm_meta = VMMBuffer(total_meta, device_id)
+        import ctypes
+
+        _hip = ctypes.CDLL("libamdhip64.so")
+        _hip.hipMemsetAsync(
+            ctypes.c_void_p(self._vmm_meta.data_ptr),
+            0,
+            self._vmm_meta.alloc_size,
+            ctypes.c_void_p(0),
+        )
+        _hip.hipDeviceSynchronize()
+
+        # Allocate input buffer via VMM
+        self._vmm_input = VMMBuffer(max_size, device_id)
+
+        # Exchange meta buffers across ranks
+        all_meta_ptrs, self._vmm_meta_imports = vmm_exchange(
+            rank,
+            world_size,
+            "meta",
+            self._vmm_meta,
+            store,
+            ranks_tag,
+            all_device_ids,
+        )
         self._ptr = self._ops_init_custom_ar(
-            self._meta_tensor.data_ptr(),
+            self._vmm_meta.data_ptr,
             self.rank_data.data_ptr(),
             self.rank_data.numel(),
             all_meta_ptrs,
@@ -642,16 +670,24 @@ class CustomAllreduce:
             self.fully_connected,
         )
 
-        all_input_ptrs = self._share_tensor_via_store("input", self._input_tensor)
+        # Exchange input buffers across ranks
+        all_input_ptrs, self._vmm_input_imports = vmm_exchange(
+            rank,
+            world_size,
+            "input",
+            self._vmm_input,
+            store,
+            ranks_tag,
+            all_device_ids,
+        )
         self._ops_register_input_buffer(
             self._ptr,
-            self._input_tensor.data_ptr(),
+            self._vmm_input.data_ptr,
             all_input_ptrs,
         )
 
         # Expose pool-like interface for the rest of the class
-        self._pool = _GFX1250BufferProxy(
-            self._meta_tensor, self._input_tensor, self)
+        self._pool = _GFX1250BufferProxy(self._vmm_meta, self._vmm_input, self)
 
     def _init_ipc(self, rank: int, world_size: int, max_size: int):
         """Standard init path using hipIpc handles."""
@@ -698,9 +734,7 @@ class CustomAllreduce:
         """Register an external tensor as an IPC input buffer."""
         if self._is_gfx1250:
             all_ptrs = self._pool.get_external_ipc_meta(inp)
-            self._ops_register_input_buffer(
-                self._ptr, inp.data_ptr(), all_ptrs
-            )
+            self._ops_register_input_buffer(self._ptr, inp.data_ptr(), all_ptrs)
         else:
             handles, offsets = self._pool.get_external_ipc_meta(inp)
             self._ops_register_input_buffer(
@@ -711,9 +745,7 @@ class CustomAllreduce:
         """Register an external tensor as an IPC output buffer."""
         if self._is_gfx1250:
             all_ptrs = self._pool.get_external_ipc_meta(out)
-            self._ops_register_output_buffer(
-                self._ptr, out.data_ptr(), all_ptrs
-            )
+            self._ops_register_output_buffer(self._ptr, out.data_ptr(), all_ptrs)
         else:
             handles, offsets = self._pool.get_external_ipc_meta(out)
             self._ops_register_output_buffer(
@@ -1536,7 +1568,10 @@ class CustomAllreduce:
 
     def close(self):
         if not self.disabled and getattr(self, "_ptr", 0):
-            self._ops_dispose(self._ptr)
+            try:
+                self._ops_dispose(self._ptr)
+            except (AttributeError, RuntimeError):
+                pass
             self._ptr = 0
 
     def __del__(self):
