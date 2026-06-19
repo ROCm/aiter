@@ -30,8 +30,25 @@ from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
 from aiter.utility.dtypes import fp8
 
+
+def _detect_gfx1250() -> bool:
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return "gfx1250" in getattr(props, "gcnArchName", "")
+    except Exception:
+        return False
+
+
+_is_gfx1250 = _detect_gfx1250()
+
 try:
-    ops.meta_size()
+    if _is_gfx1250:
+        ops.meta_size_gfx1250()
+    else:
+        ops.meta_size()
     custom_ar = True
 except Exception as e:
     # For CPUs
@@ -165,12 +182,16 @@ class IPCBuffer:
         size: int,
         device: torch.device,
         uncached: bool = False,
+        alloc_fn=None,
+        free_fn=None,
     ):
         self._size = size
         self._uncached = uncached
+        self._free_fn = free_fn or ops.free_meta_buffer
         if uncached:
             self._buffer = None
-            self._raw_ptr = ops.allocate_meta_buffer(size)
+            _alloc = alloc_fn or ops.allocate_meta_buffer
+            self._raw_ptr = _alloc(size)
         else:
             self._buffer = torch.empty(size, dtype=torch.uint8, device=device)
             self._raw_ptr = self._buffer.data_ptr()
@@ -197,7 +218,7 @@ class IPCBuffer:
 
     def __del__(self):
         if self._uncached and self._raw_ptr:
-            ops.free_meta_buffer(self._raw_ptr)
+            self._free_fn(self._raw_ptr)
             self._raw_ptr = 0
 
 
@@ -221,12 +242,21 @@ class IPCBufferPool:
 
     _pool_seq: int = 0
 
-    def __init__(self, device: torch.device, group: ProcessGroup):
+    def __init__(self, device: torch.device, group: ProcessGroup,
+                 ipc_handle_fn=None, graph_count_fn=None,
+                 graph_ipc_meta_fn=None, graph_register_fn=None,
+                 alloc_fn=None, free_fn=None):
         self._device = device
         self._group = group
         self._rank = dist.get_rank(group=group)
         self._world_size = dist.get_world_size(group=group)
         self._buffers: Dict[str, IPCBuffer] = {}
+        self._ipc_handle_fn = ipc_handle_fn or ops.get_meta_buffer_ipc_handle
+        self._graph_count_fn = graph_count_fn or ops.get_graph_buffer_count
+        self._graph_ipc_meta_fn = graph_ipc_meta_fn or ops.get_graph_buffer_ipc_meta
+        self._graph_register_fn = graph_register_fn or ops.register_graph_buffers
+        self._alloc_fn = alloc_fn or ops.allocate_meta_buffer
+        self._free_fn = free_fn or ops.free_meta_buffer
 
         self._store = dist.distributed_c10d._get_default_store()
         self._assert_pure_tcp_store(self._store)
@@ -263,7 +293,8 @@ class IPCBufferPool:
         """
         if key in self._buffers:
             raise KeyError(f"IPCBuffer '{key}' already exists in the pool")
-        buf = IPCBuffer(size, self._device, uncached=uncached)
+        buf = IPCBuffer(size, self._device, uncached=uncached,
+                        alloc_fn=self._alloc_fn, free_fn=self._free_fn)
         self._buffers[key] = buf
         return buf
 
@@ -293,16 +324,16 @@ class IPCBufferPool:
         are not yet IPC-registered.  After capture ends this method exchanges
         their IPC handles across all ranks and completes registration.
         """
-        count = ops.get_graph_buffer_count(ar_ptr)
+        count = self._graph_count_fn(ar_ptr)
         if count == 0:
             return
         handle_sz = 64  # sizeof(hipIpcMemHandle_t)
         handle = torch.empty(count * handle_sz, dtype=torch.uint8)
         offset = torch.empty(count, dtype=torch.int64)
-        ops.get_graph_buffer_ipc_meta(ar_ptr, handle.data_ptr(), offset.data_ptr())
+        self._graph_ipc_meta_fn(ar_ptr, handle.data_ptr(), offset.data_ptr())
         handles, offsets = self._gather_ipc_meta((handle, offset))
         logger.info("Registering %d cuda graph addresses", count)
-        ops.register_graph_buffers(
+        self._graph_register_fn(
             ar_ptr,
             [h.data_ptr() for h in handles],
             [o.data_ptr() for o in offsets],
@@ -313,7 +344,7 @@ class IPCBufferPool:
     def _broadcast_ipc(self, data_ptr: int) -> Tuple[List, List]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
         handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
-        ops.get_meta_buffer_ipc_handle(data_ptr, handle.data_ptr())
+        self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 
     def _gather_ipc_meta(self, shard_data) -> Tuple[List, List]:
@@ -340,9 +371,90 @@ class IPCBufferPool:
         return handles, offsets
 
 
+class _GFX1250BufferProxy:
+    """Minimal proxy that exposes pool-like access for gfx1250's pointer-based
+    buffers so the rest of CustomAllreduce can use self._pool["meta"] etc."""
+
+    def __init__(self, meta_tensor, input_tensor, ca):
+        self._meta = meta_tensor
+        self._input = input_tensor
+        self._ca = ca
+
+    class _Entry:
+        def __init__(self, tensor):
+            self._tensor = tensor
+
+        @property
+        def data_ptr(self):
+            return self._tensor.data_ptr()
+
+        @property
+        def max_size(self):
+            return self._tensor.numel()
+
+    def __getitem__(self, key):
+        if key == "meta":
+            return self._Entry(self._meta)
+        elif key == "input":
+            return self._Entry(self._input)
+        raise KeyError(key)
+
+    def flush_graph_buffers(self, ar_ptr):
+        count = self._ca._ops_get_graph_buffer_count(ar_ptr)
+        if count == 0:
+            return
+        ptrs_tensor = torch.empty(count, dtype=torch.int64)
+        self._ca._ops_get_graph_buffer_ptrs(ar_ptr, ptrs_tensor.data_ptr())
+        local_ptrs = ptrs_tensor.tolist()
+        all_ptrs_flat = []
+        for ptr in local_ptrs:
+            all_rank_ptrs = self._ca._exchange_ptrs(
+                f"graph_{id(self)}_{ptr}", ptr
+            )
+            all_ptrs_flat.append(all_rank_ptrs)
+        # Flatten: [rank0_buf0, rank0_buf1, ..., rank1_buf0, ...]
+        world_size = self._ca.world_size
+        flat = []
+        for r in range(world_size):
+            for buf_idx in range(count):
+                flat.append(all_ptrs_flat[buf_idx][r])
+        logger.info("Registering %d cuda graph addresses (gfx1250)", count)
+        self._ca._ops_register_graph_buffers(ar_ptr, flat)
+
+    def get_external_ipc_meta(self, tensor):
+        """Exchange a tensor's pointer across ranks and return ptrs list."""
+        all_ptrs = self._ca._exchange_ptrs(
+            f"ext_{id(self)}_{tensor.data_ptr()}", tensor.data_ptr()
+        )
+        return all_ptrs
+
+
 class CustomAllreduce:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+
+    def _select_ops(self):
+        """Select the correct ops backend based on GPU architecture."""
+        if self._is_gfx1250:
+            self._ops_meta_size = ops.meta_size_gfx1250
+            self._ops_init_custom_ar = ops.init_custom_ar_gfx1250
+            self._ops_all_reduce = ops.all_reduce_gfx1250
+            self._ops_dispose = ops.dispose_gfx1250
+            self._ops_register_input_buffer = ops.register_input_buffer_gfx1250
+            self._ops_register_output_buffer = ops.register_output_buffer_gfx1250
+            self._ops_get_graph_buffer_count = ops.get_graph_buffer_count_gfx1250
+            self._ops_get_graph_buffer_ptrs = ops.get_graph_buffer_ptrs_gfx1250
+            self._ops_register_graph_buffers = ops.register_graph_buffers_gfx1250
+        else:
+            self._ops_meta_size = ops.meta_size
+            self._ops_init_custom_ar = ops.init_custom_ar
+            self._ops_all_reduce = ops.all_reduce
+            self._ops_dispose = ops.dispose
+            self._ops_register_input_buffer = ops.register_input_buffer
+            self._ops_register_output_buffer = ops.register_output_buffer
+            self._ops_get_graph_buffer_count = ops.get_graph_buffer_count
+            self._ops_get_graph_buffer_ptrs = None
+            self._ops_register_graph_buffers = ops.register_graph_buffers
 
     # max_size: max supported allreduce size
     def __init__(
@@ -364,6 +476,8 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self._is_gfx1250 = _is_gfx1250
+        self._select_ops()
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -465,19 +579,89 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
 
+        self.fully_connected = fully_connected
+
+        if self._is_gfx1250:
+            self._init_gfx1250(rank, world_size, max_size)
+        else:
+            self._init_ipc(rank, world_size, max_size)
+
+    def _share_tensor_via_store(self, key: str, tensor: torch.Tensor) -> List[int]:
+        """Share a CUDA tensor across ranks using torch's IPC mechanism and
+        return a list of device pointers (one per rank) that are valid in
+        this process's address space."""
+        store = dist.distributed_c10d._get_default_store()
+        rank = self.rank
+        world_size = self.world_size
+        ranks_tag = "_".join(
+            map(str, sorted(dist.get_process_group_ranks(self.group)))
+        )
+        prefix = f"aiter_p2p/{ranks_tag}/{key}"
+
+        ipc_data = tensor.untyped_storage()._share_cuda_()
+        store.set(f"{prefix}/r{rank}", pickle.dumps(ipc_data))
+
+        ptrs = []
+        self._shared_storages = getattr(self, "_shared_storages", [])
+        for r in range(world_size):
+            if r == rank:
+                ptrs.append(tensor.data_ptr())
+                continue
+            raw = store.get(f"{prefix}/r{r}")
+            remote_data = pickle.loads(raw)
+            (device, handle, size, offset,
+             ref_counter_handle, ref_counter_offset,
+             event_handle, event_sync) = remote_data
+            remote_storage = torch.UntypedStorage._new_shared_cuda(
+                device, handle, size, offset,
+                ref_counter_handle, ref_counter_offset,
+                event_handle, event_sync,
+            )
+            self._shared_storages.append(remote_storage)
+            ptrs.append(remote_storage.data_ptr())
+        return ptrs
+
+    def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
+        """gfx1250 init: hipIpc C++ path unavailable, use torch's own
+        cross-process CUDA tensor sharing + direct pointer exchange."""
+        meta_sz = self._ops_meta_size()
+        self._meta_tensor = torch.zeros(
+            meta_sz + max_size * 2, dtype=torch.uint8, device=self.device
+        )
+        self._input_tensor = torch.empty(
+            max_size, dtype=torch.uint8, device=self.device
+        )
+
+        all_meta_ptrs = self._share_tensor_via_store("meta", self._meta_tensor)
+        self._ptr = self._ops_init_custom_ar(
+            self._meta_tensor.data_ptr(),
+            self.rank_data.data_ptr(),
+            self.rank_data.numel(),
+            all_meta_ptrs,
+            rank,
+            self.fully_connected,
+        )
+
+        all_input_ptrs = self._share_tensor_via_store("input", self._input_tensor)
+        self._ops_register_input_buffer(
+            self._ptr,
+            self._input_tensor.data_ptr(),
+            all_input_ptrs,
+        )
+
+        # Expose pool-like interface for the rest of the class
+        self._pool = _GFX1250BufferProxy(
+            self._meta_tensor, self._input_tensor, self)
+
+    def _init_ipc(self, rank: int, world_size: int, max_size: int):
+        """Standard init path using hipIpc handles."""
         # Create IPC buffer pool and allocate all named buffers.
-        # "meta" uses hipAlloc (uncached) for synchronization metadata +
-        # intermediate allreduce temp storage.
-        # "input" uses torchAlloc (cached) for D2D relay in eager mode.
         self._pool = IPCBufferPool(self.device, self.group)
-        self._pool.create("meta", ops.meta_size() + max_size * 2, uncached=True)
+        self._pool.create("meta", self._ops_meta_size() + max_size * 2, uncached=True)
         self._pool.create("input", max_size)
 
-        # Exchange meta buffer IPC handles to initialize C++ backend
         handles, offsets = self._pool.get_ipc_meta("meta")
-
-        self.fully_connected = fully_connected
-        self._ptr = ops.init_custom_ar(
+        self._ptr = self._ops_init_custom_ar(
             self._pool["meta"].data_ptr,
             self.rank_data.data_ptr(),
             self.rank_data.numel(),
@@ -487,9 +671,8 @@ class CustomAllreduce:
             self.fully_connected,
         )
 
-        # Register input IPC buffer with the C++ backend
         handles, offsets = self._pool.get_ipc_meta("input")
-        ops.register_input_buffer(
+        self._ops_register_input_buffer(
             self._ptr,
             self._pool["input"].data_ptr,
             [h.data_ptr() for h in handles],
@@ -513,17 +696,29 @@ class CustomAllreduce:
 
     def register_input_buffer(self, inp: torch.Tensor):
         """Register an external tensor as an IPC input buffer."""
-        handles, offsets = self._pool.get_external_ipc_meta(inp)
-        ops.register_input_buffer(
-            self._ptr, inp.data_ptr(), [h.data_ptr() for h in handles], offsets
-        )
+        if self._is_gfx1250:
+            all_ptrs = self._pool.get_external_ipc_meta(inp)
+            self._ops_register_input_buffer(
+                self._ptr, inp.data_ptr(), all_ptrs
+            )
+        else:
+            handles, offsets = self._pool.get_external_ipc_meta(inp)
+            self._ops_register_input_buffer(
+                self._ptr, inp.data_ptr(), [h.data_ptr() for h in handles], offsets
+            )
 
     def register_output_buffer(self, out: torch.Tensor):
         """Register an external tensor as an IPC output buffer."""
-        handles, offsets = self._pool.get_external_ipc_meta(out)
-        ops.register_output_buffer(
-            self._ptr, out.data_ptr(), [h.data_ptr() for h in handles], offsets
-        )
+        if self._is_gfx1250:
+            all_ptrs = self._pool.get_external_ipc_meta(out)
+            self._ops_register_output_buffer(
+                self._ptr, out.data_ptr(), all_ptrs
+            )
+        else:
+            handles, offsets = self._pool.get_external_ipc_meta(out)
+            self._ops_register_output_buffer(
+                self._ptr, out.data_ptr(), [h.data_ptr() for h in handles], offsets
+            )
 
     def register_graph_buffers(self):
         """Batch-register graph-captured buffer addresses."""
@@ -595,7 +790,7 @@ class CustomAllreduce:
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
-        ops.all_reduce(
+        self._ops_all_reduce(
             self._ptr,
             inp,
             out,
@@ -1341,7 +1536,7 @@ class CustomAllreduce:
 
     def close(self):
         if not self.disabled and getattr(self, "_ptr", 0):
-            ops.dispose(self._ptr)
+            self._ops_dispose(self._ptr)
             self._ptr = 0
 
     def __del__(self):
