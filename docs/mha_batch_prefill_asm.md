@@ -30,9 +30,12 @@ The call **raises** (no silent fallback) unless all of these hold:
 | Q/K/V dtype | FP8 E4M3 (`torch.float8_e4m3fnuz` on gfx942) |
 | Output dtype | `torch.bfloat16` |
 | Masking | causal (bottom-right aligned), always on |
-| Attention type | prefill / self-attention (`kv_len == q_len` per batch) |
+| Attention type | causal prefill. Per-batch KV length (`seqlens_kvcache`) is independent of the Q length: `kv_len >= q_len` is supported (prefix / chunked prefill against a cached KV prefix), not just `kv_len == q_len` self-attention. |
 
-All tensors must be CUDA tensors, contiguous, on the same device.
+All tensors must be CUDA tensors on the same device. `q`/`out` and the page/scale
+tables are contiguous; `k`/`v` may be **non-contiguous strided views** — the kernel
+addresses them purely through `stride(0)`/`stride(1)` and the base pointer (see
+[Multi-layer KV cache](#multi-layer-kv-cache-all-layers-per-block)).
 
 ---
 
@@ -84,8 +87,13 @@ head)` each holds `d*page` elements.
 | `k` | `[num_pages, hk, d/x, page, x]` | fp8 | **vec_k_col_v**: token `t`'s element `e` of head `hk` sits at `[phys, hk, e//x, t%page, e%x]`. |
 | `v` | `[num_pages, hk, d, page]` | fp8 | **column / token-minor**: `[phys, hk, e, t%page]`. |
 
-`phys` is the physical page id obtained from the page table (see below). Both
-must be contiguous so the kernel can read strides directly.
+`phys` is the physical page id obtained from the page table (see below). The
+kernel reads the physical-block stride from `k.stride(0)`/`v.stride(0)`, the
+KV-head stride from `stride(1)`, and the K/V bases from the tensor data pointers,
+so the pools need **not** be contiguous: a strided view into a larger buffer is
+fine (this is what the [multi-layer KV cache](#multi-layer-kv-cache-all-layers-per-block)
+relies on). The only requirement is that the inner `(d/x, page, x)` / `(d, page)`
+swizzle is intact per block.
 
 ### Page table (SGLang 1D)
 
@@ -94,7 +102,7 @@ must be contiguous so the kernel can read strides directly.
 | `cu_seqlens_q` | `[b+1]` | int32 | Prefix sum of per-batch `seqlen_q`; `cu_seqlens_q[b] == total_q`. Drives the packed-Q base. |
 | `kv_indptr` | `[b+1]` | int32 | Prefix sum of per-batch **page counts** (LTP). Batch `i` owns pages `kv_page_indices[kv_indptr[i] : kv_indptr[i+1]]`. |
 | `kv_page_indices` | `[num_pages]` | int32 | Flat list of **physical** page ids (LTD). |
-| `seqlens_kvcache` | `[b]` | int32 | Per-batch KV token length (for prefill = per-batch `seqlen_q`). |
+| `seqlens_kvcache` | `[b]` | int32 | Per-batch KV token length. Independent of `seqlen_q`; set equal to it for plain self-attention, or larger for prefix / chunked prefill (`kv_len >= q_len`). |
 
 ### Scales (FP8 descales + P scale)
 
@@ -206,6 +214,73 @@ mha_batch_prefill_asm(
 
 ---
 
+## Multi-layer KV cache (all-layers-per-block)
+
+The kernel addresses `k`/`v` only through their `stride(0)` (physical-block
+stride), `stride(1)` (KV-head stride) and base pointer — it makes no assumption
+that the page pool is contiguous. This lets it consume vLLM's **all-layers-per-block**
+combined KV cache ([vllm-project/vllm#27742](https://github.com/vllm-project/vllm/issues/27742))
+with **no kernel or launcher change**: allocate one buffer that interleaves every
+layer (and both K and V) per block, and hand each attention layer a strided view.
+
+Backing buffer, C-contiguous, exactly as in the issue:
+
+```text
+(num_blocks, num_kv_heads, num_layers, 2, page * d)
+```
+
+The innermost `page * d` chunk keeps the kernel's existing swizzle (`[d/x, page, x]`
+for K, `[d, page]` col-major for V) — only the **outer** block/head/layer/(K|V)
+strides are new. A single layer's views are then:
+
+| view | shape | stride (elements) | base offset (elements) |
+|---|---|---|---|
+| `k` | `[num_pages, hk, d/x, PAGE, x]` | `(hk*L2, L2, PAGE*x, x, 1)` | `layer * 2*PAGE*d` |
+| `v` | `[num_pages, hk, d, PAGE]`       | `(hk*L2, L2, PAGE, 1)`      | `layer * 2*PAGE*d + PAGE*d` |
+
+where `L2 = num_layers * 2 * PAGE * d`. `stride(0) = hk*L2` is the per-block
+stride; `stride(1) = L2` the KV-head stride; V starts exactly one `PAGE*d` tile
+after K within the block (the issue's `dim0` / K-vs-V stride).
+
+```python
+inner = PAGE * d                         # fp8 elements per (block,head,layer,kv) tile
+L2    = num_layers * 2 * inner
+blk   = hk * L2                          # per-physical-block stride
+
+# One buffer for ALL layers + K and V (vLLM allocates this once per model).
+kv_buf = torch.empty(num_pages * blk, dtype=FP8, device=dev)
+
+def layer_k(layer):                       # K view for `layer`
+    return torch.as_strided(kv_buf, (num_pages, hk, d // X, PAGE, X),
+                            (blk, L2, PAGE * X, X, 1), layer * 2 * inner)
+
+def layer_v(layer):                       # V view for `layer`
+    return torch.as_strided(kv_buf, (num_pages, hk, d, PAGE),
+                            (blk, L2, PAGE, 1), layer * 2 * inner + inner)
+
+# Same call as the contiguous case — just pass the strided per-layer views.
+mha_batch_prefill_asm(
+    q_packed, layer_k(layer), layer_v(layer),
+    cu_seqlens_q, kv_indptr, kv_page_indices, seqlens_kvcache,
+    out, qdesc, kdesc_pool, v_desc,
+    b, hq, hk, d, d, PAGE, num_pages, max(seqlens), scale, p_scale=p_scale,
+)
+```
+
+The launcher derives the block/head strides from `view.stride(0)`/`stride(1)` and
+the K/V bases from the view data pointers, so correctness **and** performance are
+identical to the contiguous pools. This is verified bit-for-bit (NRMS unchanged
+across layer counts and layer indices, with the non-target layers filled with
+noise) in `op_tests/test_batch_prefill.py::test_batch_prefill_asm_combined_kv`
+(driven via `run_batch_prefill_asm(..., combined_kv=True, num_kv_layers=N,
+kv_layer_idx=L)`).
+
+> **Descales** (`k_descale_per_token`, etc.) are separate inputs and are *not*
+> part of the combined buffer; pass them as usual. If a future vLLM layout also
+> combines descales per layer, the same strided-view trick applies to them.
+
+---
+
 ## Notes & gotchas
 
 - **Packed Q**: there is no batch dimension on `q`/`out`; batches are
@@ -217,6 +292,44 @@ mha_batch_prefill_asm(
   (e.g. MI300X) need the binary placed in the corresponding arch subfolder.
 - **No KV append**: this is a prefill kernel; it reads the full per-batch KV
   range, it does not write new tokens into the cache.
+- **`kv_len` need not be a multiple of `page` (16).** Only `page_block_size`
+  itself must be 16. A batch allocates `ceil(kv_len / 16)` physical pages; the
+  last page may be partially filled, and `seqlens_kvcache[i]` gives the exact
+  per-batch token count so the kernel masks the unused tail of the final page.
+  (The unaligned cases `257`, `300`, `1000`, … are covered by
+  `test_batch_prefill_asm_qseqlen_unaligned_256`.) What *is* fixed is `page == 16`
+  and the per-block inner swizzle.
+
+---
+
+## Running the tests
+
+All ASM tests are gfx942-only and require the kernel `.co` to be built/deployed
+under `hsa/gfx942/fmha_v3_fwd/MI308/` (see `scripts/f8_fmha_prefill/build_qkptph.sh`).
+
+```bash
+cd /workspace/aiter
+
+# Multi-layer (all-layers-per-block) combined KV cache — vllm#27742:
+pytest op_tests/test_batch_prefill.py -k combined_kv -v
+
+# All ASM qkptph/vph cases (self-attn, varlen, unaligned, combined-KV):
+pytest op_tests/test_batch_prefill.py -k batch_prefill_asm -v
+
+# Latency/TFLOPS perf sweep (opt-in):
+AITER_ASM_PERF=1 pytest op_tests/test_batch_prefill.py -k batch_prefill_asm_perf -v
+```
+
+Or drive it directly from Python (no pytest), e.g. a single combined-KV run:
+
+```python
+from aiter.ops.mha_batch_prefill_asm import mha_batch_prefill_asm  # ensure .co is deployed
+import op_tests.test_batch_prefill as t
+
+# layer 2 of an 8-layer all-layers-per-block cache, varlen batch:
+t.run_batch_prefill_asm([256, 384], use_p_scale=True, seed=37,
+                        combined_kv=True, num_kv_layers=8, kv_layer_idx=2)
+```
 
 See `op_tests/test_batch_prefill.py` (`run_batch_prefill_asm`,
 `test_batch_prefill_asm_*`) for a reference driver, an fp32 correctness check,
