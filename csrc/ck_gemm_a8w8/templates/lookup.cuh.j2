@@ -5,9 +5,11 @@
 #ifdef USE_ROCM
 
 #define GENERATE_LOOKUP_TABLE(ABTYPE, DTYPE, ETYPE) \
-   {                                                \
+    {                                               \
 {%- for mnk, kernel_name in kernels_dict %}
-        { {{mnk}}, {{kernel_name}}<ABTYPE, DTYPE, ETYPE> }{% if not loop.last %},{% endif %} \
+        { { {%-for arg in mnk %}{{arg}}{% if not loop.last %}, {% endif %}{%-endfor -%} }, \
+          {{kernel_name}}<ABTYPE, DTYPE, ETYPE> }, \
 {%- endfor %}
+    }
 
 #endif // USE_ROCM

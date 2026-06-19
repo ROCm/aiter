@@ -381,7 +381,7 @@ def gen_lookup_header_map(kernels_dict, istune=False):
             # 5-tuple key: (gfx, cu_num, M, N, K)
             # 6-tuple key: (gfx, cu_num, B, M, N, K)
             # key[0] is the gfx arch string; the remaining elements are ints.
-            yield ((f'"{key[0]}"', key[1:]), k.name)
+            yield ((f'"{key[0]}"', *key[1:]), k.name)
         elif istune and isinstance(key, int) and key >= 0:
             yield (key, k.name)
 
