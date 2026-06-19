@@ -21,8 +21,10 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
                                 aiter_tensor_t& kv_indptr_extend,
                                 aiter_tensor_t& attn_sink,
                                 aiter_tensor_t& out,
-                                float softmax_scale)
+                                float softmax_scale,
+                                std::optional<aiter_tensor_t> kv_scales)
 {
+    const bool use_fp8_prefix = kv_scales.has_value();
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q.dim() == 3, "q must be 3-D [N, H, D], got ndim=", q.dim());
     AITER_CHECK(unified_kv.dim() == 2,
@@ -34,11 +36,18 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
     AITER_CHECK(out.dim() == 3, "out must be 3-D [N, H, D], got ndim=", out.dim());
     AITER_CHECK(attn_sink.dim() == 1, "attn_sink must be 1-D [H]");
 
-    AITER_CHECK(q.dtype() == kv.dtype() && q.dtype() == unified_kv.dtype() &&
-                    q.dtype() == out.dtype(),
-                "q/unified_kv/kv/out must share dtype");
+    // q/kv/out always share the compute dtype (bf16/fp16). unified_kv matches
+    // that on the bf16 path, but is fp8 when kv_scales is provided (dequant in-kernel).
+    AITER_CHECK(q.dtype() == kv.dtype() && q.dtype() == out.dtype(),
+                "q/kv/out must share dtype");
     AITER_CHECK(q.dtype() == AITER_DTYPE_bf16 || q.dtype() == AITER_DTYPE_fp16,
                 "Only bf16/fp16 are supported");
+    if(use_fp8_prefix)
+        AITER_CHECK(unified_kv.dtype() == AITER_DTYPE_fp8,
+                    "fp8 prefix path: unified_kv must be fp8 (provide kv_scales only for fp8 unified_kv)");
+    else
+        AITER_CHECK(unified_kv.dtype() == q.dtype(),
+                    "bf16 path: unified_kv must share dtype with q");
     AITER_CHECK(attn_sink.dtype() == AITER_DTYPE_fp32, "attn_sink must be fp32");
 
     AITER_CHECK(kv_indptr_prefix.dtype() == AITER_DTYPE_i32, "kv_indptr_prefix must be int32");
@@ -102,18 +111,38 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
                 "unified_kv and kv must share row stride along the D dim");
     kargs.softmax_scale     = softmax_scale;
 
+    // fp8 prefix block scales (null/0 on the bf16 path).
+    if(use_fp8_prefix)
+    {
+        AITER_CHECK(kv_scales->dim() == 2,
+                    "kv_scales must be 2-D [total_pages, num_groups], got ndim=", kv_scales->dim());
+        AITER_CHECK(kv_scales->dtype() == AITER_DTYPE_fp32, "kv_scales must be fp32");
+        AITER_CHECK(kv_scales->size(0) == total_pages,
+                    "kv_scales rows must equal unified_kv total_pages");
+        AITER_CHECK(kv_scales->stride(1) == 1, "kv_scales groups must be contiguous (stride(1)==1)");
+        kargs.kv_scales_ptr   = kv_scales->data_ptr();
+        kargs.stride_kv_scale = static_cast<int>(kv_scales->stride(0));
+        kargs.num_groups      = static_cast<int>(kv_scales->size(1));
+    }
+    else
+    {
+        kargs.kv_scales_ptr   = nullptr;
+        kargs.stride_kv_scale = 0;
+        kargs.num_groups      = 0;
+    }
+
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-#define LAUNCH_PA_PREFILL(KERNEL, TRAITS, KV_TILE, NUM_WARPS)                        \
+#define LAUNCH_PA_PREFILL(KERNEL, TRAITS, KV_TILE, NUM_WARPS, PREFIX_FP8)            \
     do {                                                                             \
         auto launch = [&](auto dtype_tag) {                                          \
             using Traits = TRAITS<16, KV_TILE, 512, NUM_WARPS, decltype(dtype_tag)>; \
             const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M); \
             dim3 grid(N, num_h_blocks, 1);                                           \
             dim3 block(Traits::BLOCK_SIZE);                                          \
-            KERNEL<Traits><<<grid, block, 0, stream>>>(kargs);                       \
+            KERNEL<Traits, PREFIX_FP8><<<grid, block, 0, stream>>>(kargs);           \
             HIP_CALL_LAUNCH(hipGetLastError());                                      \
         };                                                                           \
         if(q.dtype() == AITER_DTYPE_bf16)                                            \
@@ -123,10 +152,23 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
     } while(0)
 
     // 16mx8_32nx1 (T_M=NUM_WARPS) for H > 32; 16mx1_16nx4 (T_M=1) for H <= 32.
+    // Both variants support the fp8 prefix: H<=32 uses the pipelined 16mx1 fp8
+    // path; H>32 (e.g. DP attention carrying all heads per rank) dequants the
+    // prefix via the 16mx8 le2_tiles accumulator.
     if(H <= 32)
-        LAUNCH_PA_PREFILL(pa_prefill_16mx1_16nx4_kernel, pa_prefill_16mx1_16nx4_traits, 64, 4);
+    {
+        if(use_fp8_prefix)
+            LAUNCH_PA_PREFILL(pa_prefill_16mx1_16nx4_kernel, pa_prefill_16mx1_16nx4_traits, 64, 4, true);
+        else
+            LAUNCH_PA_PREFILL(pa_prefill_16mx1_16nx4_kernel, pa_prefill_16mx1_16nx4_traits, 64, 4, false);
+    }
     else
-        LAUNCH_PA_PREFILL(pa_prefill_16mx8_32nx1_kernel, pa_prefill_16mx8_32nx1_traits, 32, 8);
+    {
+        if(use_fp8_prefix)
+            LAUNCH_PA_PREFILL(pa_prefill_16mx8_32nx1_kernel, pa_prefill_16mx8_32nx1_traits, 32, 8, true);
+        else
+            LAUNCH_PA_PREFILL(pa_prefill_16mx8_32nx1_kernel, pa_prefill_16mx8_32nx1_traits, 32, 8, false);
+    }
 
 #undef LAUNCH_PA_PREFILL
 }

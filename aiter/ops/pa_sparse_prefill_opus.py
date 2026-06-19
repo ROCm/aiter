@@ -45,6 +45,7 @@ def pa_sparse_prefill_opus_fwd(
     attn_sink: torch.Tensor,
     out: torch.Tensor,
     softmax_scale: float,
+    kv_scales: Optional[torch.Tensor] = None,
 ) -> None: ...
 
 
@@ -59,6 +60,7 @@ def _pa_sparse_prefill_opus_fake(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: Optional[torch.Tensor] = None,
+    kv_scales: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return out if out is not None else torch.empty_like(q)
 
@@ -75,6 +77,7 @@ def pa_sparse_prefill_opus(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: Optional[torch.Tensor] = None,
+    kv_scales: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources (paged ``unified_kv`` +
     flat per-fwd ``kv``), backed by the OPUS gfx950 HIP kernel.
@@ -98,6 +101,11 @@ def pa_sparse_prefill_opus(
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, D]`` output buffer; allocated if
         ``None``.
+      kv_scales:         Optional ``[total_pages, D//GROUP_SIZE]`` fp32 1xGROUP_SIZE
+        block scales. When provided, ``unified_kv`` is the arch fp8 format
+        (e4m3fn on gfx950) and the paged prefix is dequantized in-kernel
+        (``bf16 = fp8 * scale``); ``kv`` (extend) stays bf16/fp16. ``None`` ->
+        bf16 prefix (default).
 
     Returns:
       ``out`` (``[T, H, D]`` same dtype as ``q``).
@@ -108,10 +116,18 @@ def pa_sparse_prefill_opus(
 
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_sparse_prefill_opus expects fp16/bf16 q, got {q.dtype}")
-    if unified_kv.dtype != q.dtype:
-        raise RuntimeError(
-            f"unified_kv dtype mismatch: unified_kv={unified_kv.dtype}, q={q.dtype}"
-        )
+    if kv_scales is None:
+        if unified_kv.dtype != q.dtype:
+            raise RuntimeError(
+                f"unified_kv dtype mismatch: unified_kv={unified_kv.dtype}, q={q.dtype}"
+            )
+    else:
+        if unified_kv.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            raise RuntimeError(
+                f"fp8 prefix: unified_kv must be fp8 when kv_scales given, got {unified_kv.dtype}"
+            )
+        if kv_scales.dtype != torch.float32:
+            raise RuntimeError(f"kv_scales must be fp32, got {kv_scales.dtype}")
     if kv.dtype != q.dtype:
         raise RuntimeError(f"kv dtype mismatch: kv={kv.dtype}, q={q.dtype}")
     if unified_kv.size(-1) != kv.size(-1):
@@ -138,6 +154,7 @@ def pa_sparse_prefill_opus(
         attn_sink,
         out,
         float(softmax_scale),
+        kv_scales,
     )
     return out
 

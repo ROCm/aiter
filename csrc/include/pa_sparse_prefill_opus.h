@@ -11,6 +11,7 @@
 
 #pragma once
 #include "aiter_tensor.h"
+#include <optional>
 
 // Public API: prefill attention over two CSR ranges (prefix + extend).
 //
@@ -25,6 +26,11 @@
 //   attn_sink          : [H] fp32 (per-head softmax-denominator bias)
 //   out                : [N, H, D]   same dtype as q (caller-allocated)
 // `softmax_scale` is forwarded to the kernel as-is (no implicit 1/sqrt(D)).
+//
+// fp8 prefix (optional): when `kv_scales` is provided, `unified_kv` is the arch
+// fp8 format (e4m3fn on gfx950) and is dequantized in-kernel via 1xGROUP_SIZE
+// block scales `kv_scales : [total_pages, D/GROUP_SIZE] fp32`. q/kv/out stay
+// bf16/fp16; only the paged prefix source is fp8. None -> bf16 prefix (default).
 void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
                                 aiter_tensor_t& unified_kv,
                                 aiter_tensor_t& kv_indices_prefix,
@@ -34,7 +40,8 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
                                 aiter_tensor_t& kv_indptr_extend,
                                 aiter_tensor_t& attn_sink,
                                 aiter_tensor_t& out,
-                                float softmax_scale);
+                                float softmax_scale,
+                                std::optional<aiter_tensor_t> kv_scales = std::nullopt);
 
 #ifdef PA_SPARSE_PREFILL_OPUS_IMPL
 // ============================================================================
@@ -56,6 +63,10 @@ struct pa_sparse_prefill_kargs
     const int* __restrict__ kv_indices_prefix; // [nnz_prefix]
     const int* __restrict__ kv_indptr_extend;  // [N+1]
     const int* __restrict__ kv_indices_extend; // [nnz_extend]
+    // fp8 prefix dequant (null/0 on the bf16 path):
+    const void* __restrict__ kv_scales_ptr;    // [total_pages, num_groups] fp32, 1xGROUP_SIZE block scales
+    int stride_kv_scale;                        // row stride of kv_scales (groups contiguous => stride(0))
+    int num_groups;                             // D / GROUP_SIZE (e.g. 512/64 = 8)
     int N;
     int H;
     int D;
@@ -210,18 +221,20 @@ struct pa_prefill_16mx1_16nx4_traits
 __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
 // Device kernel templates — declared here, defined in the device pass below.
-template <class Traits>
+// PREFIX_FP8: when true, the paged prefix source (unified_kv) is fp8 and is
+// dequantized in-kernel via kargs.kv_scales_ptr; the extend source stays bf16.
+template <class Traits, bool PREFIX_FP8 = false>
 __global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs kargs);
-template <class Traits>
+template <class Traits, bool PREFIX_FP8 = false>
 __global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs kargs);
 
 // Pull in the device kernel template bodies only on the gfx950 device pass.
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
-template <class Traits>
+template <class Traits, bool PREFIX_FP8>
 __global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs)
 {
 }
-template <class Traits>
+template <class Traits, bool PREFIX_FP8>
 __global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs)
 {
 }
@@ -560,7 +573,7 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
     });
 }
 
-template<class Traits>
+template<class Traits, bool IS_FP8_SRC = false>
 __device__ void pa_prefill_accum_le2_tiles(pa_sparse_prefill_kargs kargs,
                                            const void* kv_ptr, int kv_rows,
                                            const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
@@ -616,6 +629,54 @@ __device__ void pa_prefill_accum_le2_tiles(pa_sparse_prefill_kargs kargs,
         return number<(s / 2) * T::smem_n_rpt * (T::smem_linear_wave + T::smem_padding_32B) + (s % 2) * T::SLICE_D>{};
     };
 
+    // fp8 prefix dequant (compile-time gated via IS_FP8_SRC). When false, none of
+    // this is instantiated and the bf16 async_load fill below codegens unchanged.
+    // Mirrors the 16mx1 fp8 path but derives the smem write offsets from u_skv via
+    // layout_to_offsets (instead of hardcoded strides) so it matches async_load's
+    // per-issue smem base; the implicit buffer_load_lds lane spread (lane*VEC_KV)
+    // is added explicitly. fp8 e4m3fn -> fp32 via native cvt, then round-to-nearest
+    // -> D_ATTN (truncating cast would bias dequant toward zero vs the bf16 ref).
+    // i32-dword view of the fp8 prefix (see the 16mx1 path): loading through a
+    // u8 ext-vector mis-dispatches gmem::_load's width select for VEC_KV=8 and
+    // duplicates the low dword into the high dword, permuting the dequantized K/V.
+    auto g_kv_fp8 = make_gmem(reinterpret_cast<const i32_t*>(kv_ptr),
+                              static_cast<unsigned int>(kv_rows * kargs.stride_kv_page));
+    const float* g_kv_scale = reinterpret_cast<const float*>(kargs.kv_scales_ptr);
+    auto round_to_attn = [](float v) -> D_ATTN {
+        if constexpr (std::is_same_v<D_ATTN, opus::bf16_t>) return opus::fp32_to_bf16<0>(v);
+        else                                                return cast<D_ATTN>(v);
+    };
+    const int group_size = T::D_TILE_SIZE / kargs.num_groups;  // 512/8 = 64
+    auto gmem_d_offsets = layout_to_offsets<T::VEC_KV>(u_gkv);  // page-relative d
+    auto smem_d_offsets = layout_to_offsets<T::VEC_KV>(u_skv);  // per-issue smem base
+    constexpr int r_issues =
+        layout_load_traits<opus::remove_cvref_t<decltype(u_gkv)>, T::VEC_KV>::r_elem.value;
+    D_ATTN* smem_kv_raw = reinterpret_cast<D_ATTN*>(smem_kv_buf);
+    auto dequant_fill = [&](int page) {
+        const int base = kv_token_offset(page);
+        const float* sc_row = g_kv_scale + page * kargs.stride_kv_scale;
+        const int lane_off = lane_id * T::VEC_KV;
+        static_for<r_issues>([&](auto ii) {
+            constexpr int i = ii.value;
+            // VEC_KV fp8 bytes == VEC_KV/4 dwords; gmem_d_offsets/base are 4B-aligned.
+            auto raw_i32 = g_kv_fp8.template load<T::VEC_KV / 4>((base + gmem_d_offsets[i]) / 4);
+            const float sc = sc_row[gmem_d_offsets[i] / group_size];
+            const int dst = smem_d_offsets[i] + lane_off;
+            static_for<T::VEC_KV / 4>([&](auto iq) {
+                constexpr int q = iq.value;
+                // See the 16mx1 path: decode via the cvt builtin directly on the i32
+                // dword; the fp8x4_t bit_cast mis-compiles in the unrolled loop.
+                const int bits = raw_i32[q];
+                auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(bits, 0);  // bytes 0,1
+                auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(bits, 1);  // bytes 2,3
+                smem_kv_raw[dst + q * 4 + 0] = round_to_attn(lo[0] * sc);
+                smem_kv_raw[dst + q * 4 + 1] = round_to_attn(lo[1] * sc);
+                smem_kv_raw[dst + q * 4 + 2] = round_to_attn(hi[0] * sc);
+                smem_kv_raw[dst + q * 4 + 3] = round_to_attn(hi[1] * sc);
+            });
+        });
+    };
+
     auto compute_qk = [&](auto& s, const auto& q, auto& k) {
         clear(s);
         static_for<T::NUM_D_SLICES>([&](auto i) {
@@ -654,9 +715,17 @@ __device__ void pa_prefill_accum_le2_tiles(pa_sparse_prefill_kargs kargs,
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int kv_page = load_kv_page(tile_idx);
-        async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page), u_skv);
-        s_waitcnt_vmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        if constexpr (IS_FP8_SRC) {
+            // Gather fp8 prefix global -> dequant -> bf16 LDS (same coverage as
+            // the async_load below); lgkmcnt(0) drains ds_writes before the read.
+            dequant_fill(kv_page);
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        } else {
+            async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page), u_skv);
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
 
         v_k[0] = load<T::VEC_KV>(s_kv, u_rk);
         v_k[1] = load<T::VEC_KV>(s_kv, u_rk + skv_slice(1_I));
@@ -1254,7 +1323,7 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
 } // namespace pa_16mx8_32nx1
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
-template<class Traits>
+template<class Traits, bool PREFIX_FP8>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs kargs) {
     using namespace opus;
     using namespace pa_16mx8_32nx1;
@@ -1301,14 +1370,22 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        if (num_kv_tiles <= 2) {
-            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
-        }
-        if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
-        }
-        if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+        if constexpr (PREFIX_FP8) {
+            // fp8 unified-KV prefix: dequant in-kernel via the (unpipelined)
+            // le2_tiles accumulator for any tile count. The pipelined path is
+            // bf16-only; reading the fp8 prefix once here (one 128-head launch)
+            // beats splitting into <=32-head bf16-OPUS calls that re-read the KV.
+            pa_prefill_accum_le2_tiles<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+        } else {
+            if (num_kv_tiles <= 2) {
+                pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+            }
+            if (num_kv_tiles > 2 && num_kv_tiles & 1) {
+                pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+            }
+            if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
+                pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row);
+            }
         }
     }
 
@@ -1633,7 +1710,7 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
     });
 }
 
-template<class Traits, class VQ, class VO>
+template<class Traits, bool IS_FP8_SRC, class VQ, class VO>
 __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_sparse_prefill_kargs kargs,
                                                 const void* kv_ptr, int kv_rows,
                                                 const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
@@ -1693,12 +1770,102 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_sparse_prefill_kargs kargs,
         }
     };
 
+    // fp8 prefix dequant (compile-time gated). The fast bf16 path is untouched:
+    // when IS_FP8_SRC is false, none of this is instantiated and the loop below
+    // codegens identically to the original async_load fill.
+    constexpr int smem_page_stride =
+        T::NUM_WARPS * T::smem_d_rpt * (T::smem_linear_wave + T::smem_padding_32B);
+    // Load the fp8 prefix as i32 dwords (VEC_KV/4 per issue, one b64) and decode
+    // explicitly below. Loading through a u8 ext-vector (vector_t<u8_t,VEC_KV>)
+    // mis-dispatches gmem::_load's sizeof-based width select for the 8-wide case
+    // (the "danguous" _BitInt(8) ext-vector), duplicating the low dword into the
+    // high dword -> a deterministic d-permutation of the dequantized K/V. The i32
+    // view is the same bytes (gmem_d_offsets/base are 4B-aligned) with a sane size
+    // dispatch. Byte offsets are converted to dword units at the load site.
+    auto g_kv_fp8 = make_gmem(reinterpret_cast<const i32_t*>(kv_ptr),
+                              static_cast<unsigned int>(kv_rows * kargs.stride_kv_page));
+    const float* g_kv_scale = reinterpret_cast<const float*>(kargs.kv_scales_ptr);
+    // Load one gathered fp8 page, dequant to bf16 with its 1xGROUP_SIZE scales,
+    // and store into the bf16 LDS slot the async_load would have filled. The
+    // per-thread gkv fragment iterates smem_d_rpt blocks; block g spans exactly
+    // d in [g*D_128B_SIZE, (g+1)*D_128B_SIZE), i.e. scale group g.
+    // fp8 -> fp32 uses the native gfx950 cvt_pk_f32_fp8 (OCP e4m3fn here; the
+    // fnuz concern is gfx942-only and this kernel is gfx950-gated). 2 elems/inst
+    // via fp8_to_fp32_packed_x4 — far cheaper than a per-element software decode.
+    // fp32 -> D_ATTN with round-to-nearest-even, matching torch `.to(bf16)` and
+    // the Triton QUANT_KV dequant. opus' default fp32->bf16 cast TRUNCATES
+    // (OPUS_FP32_to_BF16_DEFAULT==2), which biases every dequant toward zero and
+    // diverges from the bf16 reference; the bf16 fast path never hits this since
+    // it loads already-bf16 KV. fp16 static_cast is already round-to-nearest.
+    auto round_to_attn = [](float v) -> D_ATTN {
+        if constexpr (std::is_same_v<D_ATTN, opus::bf16_t>) return opus::fp32_to_bf16<0>(v);
+        else                                                return cast<D_ATTN>(v);
+    };
+    // Scale group for an element is (page-relative d offset) / GROUP_SIZE; derive
+    // it from the gmem layout offsets so it is correct regardless of how the
+    // fragment chunks map onto d (no assumption that chunk index == scale group).
+    const int group_size = T::D_TILE_SIZE / kargs.num_groups;  // 512/8 = 64
+    auto gmem_d_offsets = layout_to_offsets<T::VEC_KV>(u_gkv);  // page-relative
+    // Mirror async_load's loop exactly: pair gmem_offsets[i] <-> smem_offsets[i]
+    // per issue, but read fp8 scalars, dequant with the per-1xGROUP scale, and
+    // write bf16. Same offsets/issue-count as the bf16 DMA path -> identical LDS
+    // coverage that u_rk/u_rv consume.
+    constexpr int r_issues =
+        layout_load_traits<opus::remove_cvref_t<decltype(u_gkv)>, T::VEC_KV>::r_elem.value;
+    constexpr int r_issues_smem =
+        layout_load_traits<opus::remove_cvref_t<decltype(u_skv)>, T::VEC_KV>::r_elem.value;
+    static_assert(r_issues == T::smem_d_rpt, "gkv issue count mismatch");
+    static_assert(r_issues_smem == T::smem_d_rpt, "skv issue count mismatch");
+    // SMEM write address per issue. async_load's buffer_load_lds DMA implicitly
+    // spreads consecutive lanes across the wave row (lane L -> +L*VEC_KV); a plain
+    // ds_write does not, so we add the lane offset explicitly. Row layout:
+    // d-iter i and warp w select row (i*NUM_WARPS + w); lane fills within the row.
+    constexpr int skv_row = T::smem_linear_wave + T::smem_padding_32B;   // 528
+    constexpr int skv_dim0_stride = skv_row * T::NUM_WARPS;              // 2112
+    auto dequant_fill = [&](int page, int page_smem_base) {
+        const int base = kv_token_offset(page);
+        const float* sc_row = g_kv_scale + page * kargs.stride_kv_scale;
+        D_ATTN* smem_raw = reinterpret_cast<D_ATTN*>(smem_kv);
+        const int lane_off = warp_id * skv_row + lane_id * T::VEC_KV + page_smem_base;
+        static_for<r_issues>([&](auto ii) {
+            constexpr int i = ii.value;
+            // VEC_KV fp8 bytes == VEC_KV/4 dwords; gmem_d_offsets/base are 4B-aligned.
+            auto raw_i32 = g_kv_fp8.template load<T::VEC_KV / 4>((base + gmem_d_offsets[i]) / 4);
+            const float sc = sc_row[gmem_d_offsets[i] / group_size];
+            const int dst = i * skv_dim0_stride + lane_off;
+            static_for<T::VEC_KV / 4>([&](auto iq) {
+                constexpr int q = iq.value;
+                // Decode the dword's 4 fp8 bytes via the cvt builtin directly on the
+                // i32 (no fp8x4_t bit_cast): the ext-vector bit_cast collapses the
+                // q=1 decode onto q=0 in this unrolled loop, permuting the K/V.
+                const int bits = raw_i32[q];
+                auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(bits, 0);  // bytes 0,1
+                auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(bits, 1);  // bytes 2,3
+                smem_raw[dst + q * 4 + 0] = round_to_attn(lo[0] * sc);
+                smem_raw[dst + q * 4 + 1] = round_to_attn(lo[1] * sc);
+                smem_raw[dst + q * 4 + 2] = round_to_attn(hi[0] * sc);
+                smem_raw[dst + q * 4 + 3] = round_to_attn(hi[1] * sc);
+            });
+        });
+    };
+
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const auto kv_page = load_kv_page(tile_idx);
-        async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
-        async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv + T::NUM_WARPS * T::smem_d_rpt * (T::smem_linear_wave + T::smem_padding_32B));
-        s_waitcnt_vmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        if constexpr (IS_FP8_SRC) {
+            // Dequant fp8 prefix global -> bf16 LDS, replicating async_load's
+            // gmem-read (u_gkv, lane-specific) + lane-spread LDS write. decode is
+            // total (never NaN) and OOB buffer loads return 0; lgkmcnt(0) drains the
+            // ds_writes before the barrier so fills are visible to the LDS reads.
+            dequant_fill(kv_page[0], 0);
+            dequant_fill(kv_page[1], smem_page_stride);
+            s_waitcnt_lgkmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        } else {
+            async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[0]), u_skv);
+            async_load<T::VEC_KV>(g_kv, s_kv.ptr, u_gkv + kv_token_offset(kv_page[1]), u_skv + smem_page_stride);
+            s_waitcnt_vmcnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        }
 
         v_k = load<T::VEC_KV>(s_kv, u_rk);
         s_waitcnt_lgkmcnt(0_I);
@@ -1733,7 +1900,7 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_sparse_prefill_kargs kargs,
 } // namespace pa_16mx1_16nx4
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
-template<class Traits>
+template<class Traits, bool PREFIX_FP8>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs kargs) {
     using namespace opus;
     using namespace pa_16mx1_16nx4;
@@ -1781,7 +1948,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row);
+        pa_prefill_16mx1_16nx4_pipeline<Traits, PREFIX_FP8>(kargs, kargs.unified_kv_ptr, kargs.total_pages, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row);
     }
 
     // ──── Extend segment ────
@@ -1791,7 +1958,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row);
+        pa_prefill_16mx1_16nx4_pipeline<Traits, false>(kargs, kargs.kv_ptr, kargs.total_tokens, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row);
     }
 
     // ──── Sink finalization, normalize O, and store to gmem ────
