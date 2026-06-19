@@ -32,9 +32,10 @@ from aiter import (
 
 BLOCK_SIZE_M = 32
 
-# Default to FlyDSL unless Opus or CK sorting is explicitly requested or FlyDSL fallback.
+# Sorting backend flags (mutually exclusive; CK > FlyDSL > Opus priority).
+# Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
-_USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+_USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
@@ -224,7 +225,7 @@ def moe_sorting(
 ):
     if (
         not _USE_CK_MOE_SORTING
-        and not _USE_OPUS_MOE_SORTING
+        and _USE_FLYDSL_MOE_SORTING
         and is_flydsl_available()
         and not return_local_topk_ids
         and not flat
