@@ -3747,11 +3747,6 @@ def compile_mixed_moe_gemm2(
                     vec_elems = kpack_bytes // int(b_elem_bytes)
 
                     def _load_cell(k0):
-                        # Incremental B addressing: _expert_b_base carries the
-                        # expert's preshuffle offset (updated via delta each
-                        # persist_m iteration); local n_blk/n_intra contribute
-                        # the per-lane within-tile offset.  All strides are
-                        # compile-time constants -> shift/mul, no Barrett.
                         idx_pack = (
                             _expert_b_base
                             + _blk[ni] * arith.constant(_b_stride_n0, index=True)

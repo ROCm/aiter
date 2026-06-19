@@ -150,7 +150,6 @@ def get_flydsl_stage2_kernels(
     # fp4 stage2 supports tile_k=128 (pack_K=1 scale sub-group shift path) as
     # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
     # whose inter_dim is a multiple of 128 but not 256 (e.g. MiniMax TP4=384).
-    # mxfp8 (a8w8) uses the same mixed kernel and tile_k=256 (matching stage1).
     tile_ks = [128, 256] if (is_fp4 or is_fp8) else [128]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
