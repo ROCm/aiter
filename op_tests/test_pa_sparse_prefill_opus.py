@@ -311,6 +311,41 @@ def _make_inputs(
 
 
 # ---------------------------------------------------------------------------
+# fp8 prefix helpers: block-wise (1xGROUP) e4m3 quantization of unified_kv.
+# Mirrors the Triton QUANT_KV path: bf16 = fp8 * scale[page, d // GROUP].
+# ---------------------------------------------------------------------------
+
+_FP8_GROUP = 64
+_FP8_DTYPE = torch.float8_e4m3fn  # gfx950 = OCP e4m3fn
+_FP8_MAX = 448.0
+
+
+def _quantize_unified_kv_fp8(
+    unified_kv: torch.Tensor, group: int = _FP8_GROUP
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-(page, 1xgroup) e4m3 quantization.
+
+    Returns ``(q_fp8 [P, D], scales_f32 [P, D//group], deq_bf16 [P, D])`` where
+    ``deq = (q_fp8.float() * scale)`` is exactly what the kernel reconstructs --
+    the reference runs on ``deq`` so the comparison isolates kernel dequant from
+    quantization error.
+    """
+    p, d = unified_kv.shape
+    assert d % group == 0
+    g = d // group
+    xf = unified_kv.float().reshape(p, g, group)
+    amax = xf.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    scale = amax / _FP8_MAX  # [P, G, 1]
+    q = (xf / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+    deq = (q.float() * scale).reshape(p, d).to(unified_kv.dtype)
+    return (
+        q.reshape(p, d),
+        scale.reshape(p, g).contiguous().float(),
+        deq,
+    )
+
+
+# ---------------------------------------------------------------------------
 # perftest-wrapped kernel call (same shape as test_batch_prefill.py)
 # ---------------------------------------------------------------------------
 
@@ -444,6 +479,114 @@ def test_pa_sparse_prefill_opus(dtype, n, h, total_pages, total_tokens, mode):
 
 
 # ---------------------------------------------------------------------------
+# fp8 prefix correctness driver + pytest (H<=32 only; the variant DSV4 uses).
+# ---------------------------------------------------------------------------
+
+
+@benchmark()
+def run_pa_sparse_prefill_opus_fp8(
+    n: int,
+    h: int,
+    d: int,
+    total_pages: int,
+    total_tokens: int,
+    dtype: torch.dtype,
+    *,
+    mode: str = "sparse",
+    seed: int = 0,
+    verify: bool = True,
+    bench: bool = True,
+) -> Optional[dict]:
+    if _skip_if_unsupported(d=d):
+        return None
+
+    inputs = _make_inputs(
+        n, h, d, total_pages, total_tokens, dtype, mode=mode, seed=seed
+    )
+    softmax_scale = 1.0 / math.sqrt(d)
+
+    q_fp8, scales, deq = _quantize_unified_kv_fp8(inputs["unified_kv"])
+
+    nnz_p = int(inputs["kv_indices_prefix"].numel())
+    nnz_e = int(inputs["kv_indices_extend"].numel())
+    row: dict = {"nnz_prefix": nnz_p, "nnz_extend": nnz_e}
+
+    fp8_inputs = dict(inputs)
+    fp8_inputs["unified_kv"] = q_fp8
+
+    if verify:
+        # Reference runs on the dequantized prefix pool -> isolates the kernel's
+        # in-kernel dequant from quantization error.
+        ref_inputs = dict(inputs)
+        ref_inputs["unified_kv"] = deq
+        ref = _ref_pa_sparse_prefill_opus(**ref_inputs, softmax_scale=softmax_scale)
+        got = pa_sparse_prefill_opus(
+            **fp8_inputs, softmax_scale=softmax_scale, kv_scales=scales
+        )
+        rtol, atol = _get_tolerances(dtype)
+        checkAllclose(
+            got,
+            ref,
+            rtol=rtol,
+            atol=atol,
+            msg=(
+                f"[FP8 N={n} H={h} D={d} total_pages={total_pages} "
+                f"total_tokens={total_tokens} dtype={dtype} mode={mode}]"
+            ),
+        )
+
+    if bench:
+        _, lat_us = _profile_func(
+            pa_sparse_prefill_opus,
+            **fp8_inputs,
+            softmax_scale=softmax_scale,
+            kv_scales=scales,
+        )
+        total_nnz = nnz_p + nnz_e
+        flops = 4.0 * h * total_nnz * d
+        tflops = flops / max(lat_us * 1e-6, 1e-12) / 1e12
+        row["latency_us"] = round(float(lat_us), 2)
+        row["TFLOPS"] = round(float(tflops), 2)
+
+    return row
+
+
+_PYTEST_FP8_SHAPES = [
+    # (N, H, total_pages, total_tokens)
+    # H<=32 -> 16mx1_16nx4 variant; H>32 -> 16mx8_32nx1 variant (DP attention).
+    (64, 16, 256, 256),
+    (128, 16, 1024, 1024),
+    (128, 32, 256, 256),
+    (128, 64, 1024, 1024),
+    (128, 128, 1024, 1024),
+]
+
+
+@pytest.mark.parametrize("dtype", _PYTEST_DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize(
+    "n,h,total_pages,total_tokens",
+    _PYTEST_FP8_SHAPES,
+    ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
+)
+@pytest.mark.parametrize("mode", ["sparse", "dense"])
+def test_pa_sparse_prefill_opus_fp8(dtype, n, h, total_pages, total_tokens, mode):
+    run_pa_sparse_prefill_opus_fp8(
+        n=n,
+        h=h,
+        d=512,
+        total_pages=total_pages,
+        total_tokens=total_tokens,
+        dtype=dtype,
+        mode=mode,
+        seed=(
+            hash((n, h, total_pages, total_tokens, str(dtype), mode, "fp8")) & 0xFFFF
+        ),
+        verify=True,
+        bench=False,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
 # ---------------------------------------------------------------------------
 
@@ -532,6 +675,13 @@ parser.add_argument(
     default=0,
     help="RNG seed for input + CSR generation",
 )
+parser.add_argument(
+    "--fp8",
+    action="store_true",
+    help="run ONLY the fp8 OPUS prefix path (quantize unified_kv to e4m3 with "
+    "1x64 block scales). Default (no flag) runs both the bf16 and fp8 prefix "
+    "paths so CI -- which invokes this file as `python3 <file>` -- covers both.",
+)
 
 
 _DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
@@ -539,6 +689,17 @@ _DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 if __name__ == "__main__":
     args = parser.parse_args()
+
+    # CI runs this file as `python3 <file>` (no args, no pytest), so the default
+    # sweep must exercise BOTH the bf16 prefix path and the fp8 prefix path.
+    # `--fp8` narrows the run to the fp8 path only.
+    if args.fp8:
+        drivers = [("fp8", run_pa_sparse_prefill_opus_fp8)]
+    else:
+        drivers = [
+            ("bf16", run_pa_sparse_prefill_opus),
+            ("fp8", run_pa_sparse_prefill_opus_fp8),
+        ]
 
     rows = []
     for n, h, dtype_str, mode, pages_arg in itertools.product(
@@ -551,20 +712,22 @@ if __name__ == "__main__":
         # 0 is the sentinel for "mirror -n" on a per-sweep-point basis.
         total_pages = pages_arg if pages_arg > 0 else n
         total_tokens = args.total_tokens if args.total_tokens is not None else n
-        row = run_pa_sparse_prefill_opus(
-            n=n,
-            h=h,
-            d=args.head_dim,
-            total_pages=total_pages,
-            total_tokens=total_tokens,
-            dtype=_DTYPE_MAP[dtype_str],
-            mode=mode,
-            seed=args.seed,
-            verify=not args.no_verify,
-            bench=not args.no_bench,
-        )
-        if row:
-            rows.append(row)
+        for prefix_path, driver in drivers:
+            row = driver(
+                n=n,
+                h=h,
+                d=args.head_dim,
+                total_pages=total_pages,
+                total_tokens=total_tokens,
+                dtype=_DTYPE_MAP[dtype_str],
+                mode=mode,
+                seed=args.seed,
+                verify=not args.no_verify,
+                bench=not args.no_bench,
+            )
+            if row:
+                row.setdefault("prefix", prefix_path)
+                rows.append(row)
 
     if rows:
         df = pd.DataFrame(rows)

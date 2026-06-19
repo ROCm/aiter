@@ -1365,7 +1365,8 @@ namespace py = pybind11;
           py::arg("kv_indptr_extend"),  \
           py::arg("attn_sink"),         \
           py::arg("out"),               \
-          py::arg("softmax_scale"));
+          py::arg("softmax_scale"),     \
+          py::arg("kv_scales") = std::nullopt);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
