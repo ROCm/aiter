@@ -577,9 +577,9 @@ def conv2d_nchw_cblocked(
     y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
     bias_fp32 = bias.float().contiguous() if bias is not None else None
     w_3x3, (_, C_pad) = get_or_make_weight_pack_3x3(w_oihw.contiguous(), block_k)
-    Cb = block_k  # packing block size matches weight padding block
     if x_blocked is None:
-        x_blocked, C_pad_x = prepack_nchw_to_cblocked(x, Cb)
+        # input channel-block size matches the weight padding block
+        x_blocked, C_pad_x = prepack_nchw_to_cblocked(x, block_k)
     else:
         C_pad_x = x_blocked.shape[-1] * x_blocked.shape[1]
     # Ensure channel padding is consistent
@@ -599,7 +599,7 @@ def conv2d_nchw_cblocked(
         P,
         Q,
         C_pad,
-        Cb,
+        block_k,
         stride,
         padding,
         dilation,
