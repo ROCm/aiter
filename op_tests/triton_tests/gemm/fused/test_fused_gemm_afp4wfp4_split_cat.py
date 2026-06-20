@@ -16,7 +16,7 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.shuffle import shuffle_weight
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import shuffle_scales
+from aiter.ops.shuffle import shuffle_scale_gemm
 
 SCALE_GROUP_SIZE = 32
 
@@ -137,11 +137,22 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
     x_scale = x_scale.T
     w_scale = w_scale.T
     if shuffle:
-        if M >= 32:
-            x_scales_shuffled = shuffle_scales(x_scale)
+        if arch_info.get_arch() == "gfx1250":
+            if M >= 32:
+                x_scales_shuffled = shuffle_scale_gemm(
+                    x_scale, preshuffle_factor=16, scale_kwidth=4
+                )
+            else:
+                x_scales_shuffled = x_scale.contiguous()
+            w_scales_shuffled = shuffle_scale_gemm(
+                w_scale, preshuffle_factor=16, scale_kwidth=4
+            )
         else:
-            x_scales_shuffled = x_scale.contiguous()
-        w_scales_shuffled = shuffle_scales(w_scale)
+            if M >= 32:
+                x_scales_shuffled = shuffle_scale_gemm(x_scale)
+            else:
+                x_scales_shuffled = x_scale.contiguous()
+            w_scales_shuffled = shuffle_scale_gemm(w_scale)
         use_int4 = False
         weight_shuffle_layout = (16, 16)
         w_shuffed = shuffle_weight(
