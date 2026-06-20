@@ -46,6 +46,14 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 _MXFP4_MOE_FLYDSL_ENV = (
     os.environ.get("AITER_MXFP4_MOE_BACKEND", "hip").lower() == "flydsl"
 )
+# Log the resolved a4w4 gemm backend once per distinct choice (avoids per-call spam).
+_MXFP4_BACKEND_LOGGED: set = set()
+
+
+def _log_mxfp4_backend_once(backend: str):
+    if backend not in _MXFP4_BACKEND_LOGGED:
+        _MXFP4_BACKEND_LOGGED.add(backend)
+        logger.info(f"[fused_moe] mxfp4 a4w4 MoE gemm backend = {backend}")
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -495,6 +503,9 @@ def fused_moe_(
                 kernelName2=_kw.get("kernelName2", ""),
             ),
         )
+        _log_mxfp4_backend_once("flydsl (_mxfp4_moe_run)")
+    elif metadata.mxfp4_hip:
+        _log_mxfp4_backend_once("hip (mxfp4_moe_run)")
 
     if metadata.pipeline is not None:
         return metadata.pipeline(
