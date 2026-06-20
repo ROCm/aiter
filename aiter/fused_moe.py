@@ -41,6 +41,11 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # keys off the kernel name (mxfp4_moe_g{1,2}_a4w4_*) -> mxfp4_moe_run (HIP); the
 # FlyDSL gemm engines are selected per-stage via the gemm{1,2}_backend weight attr
 # or a `_FLYDSL` kernel-name token, routing to _mxfp4_moe_run.
+# Global override (serving toggle): AITER_MXFP4_MOE_BACKEND=flydsl runs the whole
+# a4w4 MoE on the FlyDSL gemm engines; default ("hip"/unset) keeps the HIP path.
+_MXFP4_MOE_FLYDSL_ENV = (
+    os.environ.get("AITER_MXFP4_MOE_BACKEND", "hip").lower() == "flydsl"
+)
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -468,11 +473,14 @@ def fused_moe_(
 
     # mxfp4 a4w4: the tuned CSV ships HIP kernel names, so get_2stage_cfgs routes them
     # to the on-device HIP pipeline (mxfp4_moe_run, mxfp4_hip). Re-route to the
-    # FlyDSL-capable pipeline when the FlyDSL gemm engine is explicitly requested on
-    # the weights (gemm{1,2}_backend="flydsl"); the pure-HIP production path is
-    # untouched. _mxfp4_moe_run runs the requested stage on FlyDSL and the other on HIP.
+    # FlyDSL-capable pipeline when FlyDSL is requested -- globally via
+    # AITER_MXFP4_MOE_BACKEND=flydsl (serving toggle) or per-stage via the
+    # gemm{1,2}_backend="flydsl" weight attr. The pure-HIP production path (the
+    # default) is untouched. _mxfp4_moe_run runs the requested stage(s) on FlyDSL
+    # and any other on HIP.
     if metadata.mxfp4_hip and (
-        getattr(w1, "gemm1_backend", None) == "flydsl"
+        _MXFP4_MOE_FLYDSL_ENV
+        or getattr(w1, "gemm1_backend", None) == "flydsl"
         or getattr(w2, "gemm2_backend", None) == "flydsl"
     ):
         _kw = getattr(metadata.stage1, "keywords", {})
@@ -1587,10 +1595,11 @@ def _mxfp4_moe_run(
     prologue_name = "inline_quant" if inline_quant else "threestage"
 
     # Per-stage gemm engine: an explicit gemm{1,2}_backend weight attr wins; otherwise
-    # a `_FLYDSL` token in the kernel name selects flydsl. Anything else (the default)
-    # runs the HIP a4w4 gemm. Read the attr before any .view() that would drop it.
-    _name_flydsl1 = _is_flydsl_mxfp4_kname(kernelName1)
-    _name_flydsl2 = _is_flydsl_mxfp4_kname(kernelName2)
+    # a `_FLYDSL` token in the kernel name or the global AITER_MXFP4_MOE_BACKEND=flydsl
+    # toggle selects flydsl. Anything else (the default) runs the HIP a4w4 gemm. Read
+    # the attr before any .view() that would drop it.
+    _name_flydsl1 = _is_flydsl_mxfp4_kname(kernelName1) or _MXFP4_MOE_FLYDSL_ENV
+    _name_flydsl2 = _is_flydsl_mxfp4_kname(kernelName2) or _MXFP4_MOE_FLYDSL_ENV
     gemm1_backend = getattr(w1, "gemm1_backend", None) or (
         "flydsl" if _name_flydsl1 else None
     )
