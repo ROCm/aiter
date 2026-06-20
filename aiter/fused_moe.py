@@ -36,17 +36,11 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
-# mxfp4 a4w4 MoE backends share the a16w4 gate/up-interleaved weight+scale layout
-# but ship identically-named CSV kernels, so w1.shuffle_kind (== CSV `_tag`) both
-# routes the request and selects the gemm backend + the tuned-CSV set:
-#   "mxfp4_moe"          -> FlyDSL port (gemm{1,2}_a4w4 flydsl) via _mxfp4_moe_run;
-#                           the kind alone implies the flydsl gemm backend
-#   "mxfp4_guinterleave" -> randomflow's HIP a4w4 MoE (#3470) via mxfp4_moe_run
-#                           (on-device 1stage, mxfp4_hip)
-# Only "mxfp4_moe" is a flydsl-port kind (drives synthesis + the flydsl backend);
-# "mxfp4_guinterleave" is dispatched separately in get_2stage_cfgs.
-_MXFP4_PORT_KIND = "mxfp4_moe"
-_MXFP4_KINDS = (_MXFP4_PORT_KIND,)
+# mxfp4 a4w4 MoE: the HIP backend (#3470) and the FlyDSL port share the a16w4
+# gate/up-interleaved weight+scale layout and the same CSV kernel names. Dispatch
+# keys off the kernel name (mxfp4_moe_g{1,2}_a4w4_*) -> mxfp4_moe_run (HIP); the
+# FlyDSL gemm engines are selected per-stage via the gemm{1,2}_backend weight attr
+# or a `_FLYDSL` kernel-name token, routing to _mxfp4_moe_run.
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -434,11 +428,6 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    # Backend opt-in via shuffle_kind tag on w1: tells get_2stage_cfgs to
-    # prefer CSV rows tagged with this backend (e.g., "mxfp4_moe") over the
-    # default untagged rows. None / missing attribute -> default CSV lookup.
-    shuffle_kind = getattr(w1, "shuffle_kind", None)
-
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -457,7 +446,6 @@ def fused_moe_(
         isShuffled,
         gate_mode,
         is_ep=expert_mask is not None,
-        shuffle_kind=shuffle_kind,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -478,55 +466,26 @@ def fused_moe_(
         not metadata.flat or get_gfx() == "gfx950"
     ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
 
-    _w1_kind = getattr(w1, "shuffle_kind", None)
-    _csv_is_mxfp4 = metadata.pipeline is not None
-    if _w1_kind in _MXFP4_KINDS and not _csv_is_mxfp4:
-        # No tuned CSV pipeline for this mxfp4 shape -> synthesize an M-adaptive port
-        # pipeline mirroring what the tuned CSV / the bench's per-M-best selection
-        # picks: BM16 inline_quant + atomic for decode (small M), BM32 atomic for mid
-        # M, BM128 nonatomic for prefill (large M). The BM32/BM128 paths are NON-inline
-        # (threestage sort + mxfp4_moe_quant + sort_scales), codegen'd only for the
-        # Kimi/DSR SHAPES; every other shape stays on BM16 (its only built variant).
-        # Thresholds are heuristic -- production tunes them per shape via the CSV.
-        _g = f"mxfp4_moe_g{{n}}_a4w4_NE{E}_H{model_dim}_E{inter_dim}"
-        # Shapes whose full BM128 non-inline aux (threestage sort + quant +
-        # sort_scales + scatter) is codegen'd (gen_instances SHAPES + AUX_EXTRA_SHAPES).
-        # Must match those lists exactly -- sort_scales is per (NE, E, H), so each
-        # INTER variant needs its own entry.
-        _noninline_ok = (E, model_dim, inter_dim, topk) in _MXFP4_BM128_SHAPES
-        if not _noninline_ok or M <= 1024:
-            # decode / mid-M: BM16 inline_quant + atomic (latency-bound). (The BM16<->
-            # BM128 crossover near M=1024 is shape-dependent -- wide shapes prefer BM128
-            # earlier, narrow ones like Qwen INTER=256 prefer BM16 longer -- and main
-            # wins at 1024 either way; production tunes the threshold per shape via CSV.)
-            _bm = 16
-            _kn1 = _g.format(n=1) + "_BM16_INLINEQUANT"
-            _kn2 = _g.format(n=2) + f"_TOPK{topk}_BM16_ATOMIC"
-        else:
-            # prefill (large M): BM128 nonatomic (throughput-bound). (BM32 measured
-            # no better than BM16 here, so we skip straight to BM128.)
-            _bm = 128
-            _kn1 = _g.format(n=1) + "_BM128"
-            _kn2 = _g.format(n=2) + f"_TOPK{topk}_BM128_NONATOMIC"
+    # mxfp4 a4w4: the tuned CSV ships HIP kernel names, so get_2stage_cfgs routes them
+    # to the on-device HIP pipeline (mxfp4_moe_run, mxfp4_hip). Re-route to the
+    # FlyDSL-capable pipeline when the FlyDSL gemm engine is explicitly requested on
+    # the weights (gemm{1,2}_backend="flydsl"); the pure-HIP production path is
+    # untouched. _mxfp4_moe_run runs the requested stage on FlyDSL and the other on HIP.
+    if metadata.mxfp4_hip and (
+        getattr(w1, "gemm1_backend", None) == "flydsl"
+        or getattr(w2, "gemm2_backend", None) == "flydsl"
+    ):
+        _kw = getattr(metadata.stage1, "keywords", {})
         metadata = MOEMetadata(
             stage1=None,
             stage2=None,
-            block_m=_bm,
-            ksplit=1,
+            block_m=metadata.block_m,
+            ksplit=metadata.ksplit,
             pipeline=functools.partial(
-                _mxfp4_moe_run, kernelName1=_kn1, kernelName2=_kn2
+                _mxfp4_moe_run,
+                kernelName1=_kw.get("kernelName1", ""),
+                kernelName2=_kw.get("kernelName2", ""),
             ),
-        )
-        _csv_is_mxfp4 = True
-    if (_w1_kind in _MXFP4_KINDS) != _csv_is_mxfp4:
-        raise TypeError(
-            f"fused_moe: weight/CSV backend mismatch. "
-            f"w1.shuffle_kind={_w1_kind!r}, "
-            f"csv_pipeline={metadata.pipeline!r}, "
-            f"M={M}, model_dim={model_dim}, inter_dim={inter_dim}, "
-            f"E={E}, topk={topk}, dtype={dtype}, "
-            f"q_dtype_a={q_dtype_a}, q_dtype_w={q_dtype_w}, "
-            f"quant_type={quant_type}, isShuffled={isShuffled}"
         )
 
     if metadata.pipeline is not None:
@@ -855,9 +814,6 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 
 cfg_2stages = None
-# Per-tag tuned-cfg cache, indexed by `_tag` value (e.g., "mxfp4_moe").
-# Populated lazily when get_2stage_cfgs is called with shuffle_kind set.
-cfg_2stages_tagged: dict = {}
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -1120,6 +1076,9 @@ _MXFP4_G2_KNAME_RE = re.compile(
 
 
 def _parse_mxfp4_g1_kname(kname: str) -> dict:
+    # The optional `_FLYDSL` backend token only routes the gemm engine; strip it
+    # so the shared mxfp4 kernel-name grammar parses HIP and FlyDSL names alike.
+    kname = (kname or "").replace("_FLYDSL", "")
     m = _MXFP4_G1_KNAME_RE.match(kname or "")
     if not m:
         raise ValueError(f"bad mxfp4 g1 kernel name: {kname!r}")
@@ -1144,6 +1103,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
 
 
 def _parse_mxfp4_g2_kname(kname: str) -> dict:
+    kname = (kname or "").replace("_FLYDSL", "")
     m = _MXFP4_G2_KNAME_RE.match(kname or "")
     if not m:
         raise ValueError(f"bad mxfp4 g2 kernel name: {kname!r}")
@@ -1182,6 +1142,12 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
 
 def _is_mxfp4_kname(kname: str) -> bool:
     return bool(kname) and kname.startswith("mxfp4_moe_")
+
+
+def _is_flydsl_mxfp4_kname(kname: str) -> bool:
+    # mxfp4 a4w4 row whose kernel name carries the `_FLYDSL` backend token, i.e.
+    # routed to the FlyDSL gemm engines (_mxfp4_moe_run) instead of HIP.
+    return _is_mxfp4_kname(kname) and "_FLYDSL" in kname
 
 
 def _empty_bf16(device):
@@ -1609,28 +1575,27 @@ def _mxfp4_moe_run(
     cshuffle = p2.get("cshuffle", False)
     prologue_name = "inline_quant" if inline_quant else "threestage"
 
-    # FlyDSL gemm1/gemm2 backend. Explicit gemm{1,2}_backend tag wins; otherwise the
-    # port kind (shuffle_kind=="mxfp4_moe") implies flydsl so the tag alone fully
-    # selects the backend (HIP rows can't accidentally drive flydsl-only kernels and
-    # vice-versa). Read before any .view() that would drop the attribute.
-    _port_kind = getattr(w1, "shuffle_kind", None) == _MXFP4_PORT_KIND
+    # Per-stage gemm engine: an explicit gemm{1,2}_backend weight attr wins; otherwise
+    # a `_FLYDSL` token in the kernel name selects flydsl. Anything else (the default)
+    # runs the HIP a4w4 gemm. Read the attr before any .view() that would drop it.
+    _name_flydsl1 = _is_flydsl_mxfp4_kname(kernelName1)
+    _name_flydsl2 = _is_flydsl_mxfp4_kname(kernelName2)
     gemm1_backend = getattr(w1, "gemm1_backend", None) or (
-        "flydsl" if _port_kind else None
+        "flydsl" if _name_flydsl1 else None
     )
     gemm2_backend = getattr(w2, "gemm2_backend", None) or (
-        "flydsl" if _port_kind else None
+        "flydsl" if _name_flydsl2 else None
     )
-    # The port runs only on the flydsl gemm engines. Fail loud with an actionable
-    # message if either stage resolves to flydsl but FlyDSL is not installed, rather
-    # than letting the bare `import aiter.ops.flydsl.mxfp4_gemm*_kernels` below raise a
-    # cryptic ImportError.
+    # Fail loud with an actionable message if either stage resolves to flydsl but
+    # FlyDSL is not installed, rather than letting the bare
+    # `import aiter.ops.flydsl.mxfp4_gemm*_kernels` below raise a cryptic ImportError.
     if (gemm1_backend == "flydsl" or gemm2_backend == "flydsl") and (
         not is_flydsl_available()
     ):
         raise RuntimeError(
-            "mxfp4_moe FlyDSL port requested (shuffle_kind='mxfp4_moe' or "
-            "gemm{1,2}_backend='flydsl') but FlyDSL is not available. Install FlyDSL, "
-            "or use randomflow's HIP a4w4 backend (shuffle_kind='mxfp4_guinterleave')."
+            "mxfp4_moe FlyDSL gemm requested (gemm{1,2}_backend='flydsl' or a "
+            "`_FLYDSL` kernel-name token) but FlyDSL is not available. Install "
+            "FlyDSL, or use the HIP a4w4 backend (#3470) by dropping the request."
         )
     # Real (unpadded) inter for a non-256-aligned shard (dsv4 TP8: 384). The weights
     # are zero-padded to D_INTER (next %256) so the gemm2 runs the proven layout, but
@@ -2077,15 +2042,7 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
-    shuffle_kind=None,
 ):
-    """
-    `shuffle_kind`: if set (e.g., "mxfp4_moe"), prefer CSV rows tagged with
-    this backend (`_tag == shuffle_kind`) over the default untagged rows;
-    fall back to untagged on miss. None -> current behaviour (untagged only).
-    Used to let a model-specific backend (mxfp4_moe et al.) ship its own
-    tuned rows alongside the existing default tuning without dedup conflict.
-    """
     gate_mode = GateMode(gate_mode)
     _INDEX_COLS = [
         "cu_num",
@@ -2116,20 +2073,15 @@ def get_2stage_cfgs(
             df["gate_mode"] = "separated"
         return df
 
-    def get_cfg_2stages(tune_file, tag=""):
-        """Build (primary, fallback) lookup dicts for one `_tag` value.
-        Default ``tag=""`` returns the untagged rows (legacy behaviour);
-        passing e.g. ``tag="mxfp4_moe"`` returns the rows the mxfp4_moe
-        backend ships."""
+    def get_cfg_2stages(tune_file):
+        """Build (primary, fallback) lookup dicts. Excludes flydsl_fallback rows
+        (loaded separately); mxfp4 rows are kept and disambiguated by gate_mode."""
         import pandas as pd
 
         df = pd.read_csv(tune_file)
         df = _norm_gate_mode_col(df)
         if "_tag" in df.columns:
-            df = df[df["_tag"].fillna("") == tag]
-        elif tag != "":
-            # CSV has no `_tag` column -> no tagged rows exist.
-            return ({}, {})
+            df = df[df["_tag"].fillna("") != "flydsl_fallback"]
 
         # Primary dict: keep original act_type for exact-match lookup.
         df_primary = df.copy()
@@ -2190,16 +2142,13 @@ def get_2stage_cfgs(
         _flydsl_fallback_cache[tune_file] = result
         return result
 
-    global cfg_2stages, cfg_2stages_tagged
+    global cfg_2stages
     config_path = os.path.dirname(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
     tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    # Lazy-load per-tag tuned dicts (e.g., shuffle_kind="mxfp4_moe").
-    if shuffle_kind and shuffle_kind not in cfg_2stages_tagged:
-        cfg_2stages_tagged[shuffle_kind] = get_cfg_2stages(tune_file, tag=shuffle_kind)
     cu_num = get_cu_num()
     # EP convention: callers append one always-masked fake-expert slot to
     # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
@@ -2280,14 +2229,7 @@ def get_2stage_cfgs(
                     break
         return result
 
-    # Backend-tagged rows (if requested) win over the default untagged rows.
-    # E.g., w1.shuffle_kind="mxfp4_moe" makes us look up CSV rows tagged
-    # "mxfp4_moe" first; only on miss do we fall back to the untagged set.
-    cfg = None
-    if shuffle_kind:
-        cfg = _lookup_cfg(cfg_2stages_tagged.get(shuffle_kind))
-    if cfg is None:
-        cfg = _lookup_cfg(cfg_2stages)
+    cfg = _lookup_cfg(cfg_2stages)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_name = re.sub(r"[^\w.\-]", "_", str(keys))
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
@@ -2404,24 +2346,22 @@ def get_2stage_cfgs(
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
-    # mxfp4_moe port rows are logged as "1stage" but drive a fused _mxfp4_moe_run
-    # pipeline (sort+gemm1+gemm2+scatter), NOT fused_moe_1stage. Build that pipeline
-    # from the CSV kernelName HERE, before the run_1stage early-return below --
-    # otherwise the run_1stage path returns pipeline=None and fused_moe falls back to
-    # the M-adaptive synthesis (BM128 nonatomic), silently discarding the tuned
-    # cshuffle/BM64 kernelName the CSV selected.
+    # mxfp4 a4w4 rows are logged as "1stage" but drive an on-device pipeline
+    # (sort+gemm1+gemm2+scatter), NOT fused_moe_1stage. Build it from the CSV
+    # kernelName HERE, before the run_1stage early-return below -- otherwise the
+    # run_1stage path returns pipeline=None and fused_moe silently discards the
+    # tuned kernelName the CSV selected.
     if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
         try:
             _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
         except ValueError:
             _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
-        # Both backends ship identically-named CSV kernels, so disambiguate by the
-        # weight's shuffle_kind: the flydsl port ("mxfp4_moe") drives the fused
-        # _mxfp4_moe_run pipeline; randomflow's HIP a4w4 (#3470,
-        # "mxfp4_guinterleave") drives mxfp4_moe_run with on-device 1stage routing
-        # (mxfp4_hip). Both are logged "1stage" in the CSV, so this must run before
-        # the run_1stage early-return below.
-        if shuffle_kind == "mxfp4_moe":
+        # A `_FLYDSL` kernel-name token selects the FlyDSL-capable pipeline
+        # (_mxfp4_moe_run); plain mxfp4_moe_* names run the HIP a4w4 backend
+        # (#3470) via mxfp4_moe_run with on-device 1stage routing (mxfp4_hip).
+        # fused_moe_ can also re-route a HIP row to _mxfp4_moe_run when the
+        # weights carry gemm{1,2}_backend="flydsl".
+        if _is_flydsl_mxfp4_kname(kernelName1) or _is_flydsl_mxfp4_kname(kernelName2):
             return MOEMetadata(
                 stage1=None,
                 stage2=None,
