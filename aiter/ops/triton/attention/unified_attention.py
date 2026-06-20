@@ -715,7 +715,11 @@ def _gfx1250_unified_attention_2d(
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
         num_blocks, NUM_KV_HEADS, _, BLOCK_SIZE, K_WIDTH = k.shape
-        TILE_SIZE = 128
+        # TILE_SIZE must be a multiple of the page size. Default to 128 so that
+        # small pages pack several blocks per tile, but grow it to BLOCK_SIZE
+        # when the page is larger (e.g. --block-size 256) so the invariant
+        # TILE_SIZE >= BLOCK_SIZE still holds.
+        TILE_SIZE = max(128, BLOCK_SIZE)
         num_kv_blocks = TILE_SIZE // BLOCK_SIZE
         assert (
             TILE_SIZE >= BLOCK_SIZE
