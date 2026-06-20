@@ -431,6 +431,7 @@ def _decode_core_attn(
     BLOCK_H: gl.constexpr,
     BLOCK_K: gl.constexpr,
     IS_FNUZ: gl.constexpr,
+    ASSUME_DENSE_SLOTS: gl.constexpr,
 ):
     nw: gl.constexpr = gl.num_warps()
     mma_qk: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -561,16 +562,22 @@ def _decode_core_attn(
     #   read slot[t+1] -> GL KV[t+1] (nope+rope+enc, 1 tile ahead)
     #   softmax + PV[t]
     # Tiles 0..eff_iter-3 are always full so the kpos<seg_len tail mask is
-    # dropped here; the slot-validity mask (slot in [0, num_rows)) is KEPT
-    # because interior slots can be -1 (top-k / combine ragged paths).
+    # dropped here. The slot-validity mask (slot in [0, num_rows)) is kept unless
+    # ASSUME_DENSE_SLOTS (the SWA/main pass, whose window slots are contiguous and
+    # always valid) -> then the hot loop drops it entirely, matching the prefill
+    # mask-free body. The extra (top-k) pass passes ASSUME_DENSE_SLOTS=False
+    # because its ragged stream can carry interior -1 sentinels. The nope padding
+    # zero (cols [NOPE_DIM,NOPE_BLOCK)) is structural and kept in both modes.
     for t in tl.range(0, eff_iter - 2):
         cur = (kv_buf_n + t) % 2
         nxt = (kv_buf_n + t + 1) % 2
 
-        # --- read slot[t] (nope view) for the validity mask; KV[t] + enc[t]
-        # were prefetched into buffer `cur` one tile ago (or by the prologue). ---
-        slot_n = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(cur), sl_k_n)
-        valid = (slot_n >= 0) & (slot_n < num_rows)
+        # --- read slot[t] for the per-key validity mask (dense pass skips it);
+        # KV[t] + enc[t] were prefetched into buffer `cur` one tile ago. ---
+        if not ASSUME_DENSE_SLOTS:
+            slot_n = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(cur), sl_k_n)
+            valid = (slot_n >= 0) & (slot_n < num_rows)
+            valid_qk = gl.convert_layout(valid, sl_k_qk)
 
         # --- slot[t+2] prefetch into slot[t]'s now-free buffer ---
         gpos = (t + 2) * BLOCK_K + g_off
@@ -602,43 +609,68 @@ def _decode_core_attn(
         k_nope_fp8 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_nope.index(cur), blk_n)
         k_nope = k_nope_fp8.to(gl.bfloat16) * scales.to(gl.bfloat16)
         # invalid cols -> 0 (else PV's 0*NaN=NaN) and pad dims [NOPE_DIM,NOPE_BLOCK) -> 0.
-        k_nope = gl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_n)
+        if ASSUME_DENSE_SLOTS:
+            k_nope = gl.where(nope_mask[None, :], k_nope, zero_n)
+        else:
+            k_nope = gl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_n)
         smem_kn.store(gl.permute(k_nope, [1, 0]))
-        valid_qk = gl.convert_layout(valid, sl_k_qk)
         scores = gl.amd.cdna4.mfma(q_nope_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_kn, qk_b), scores)
         scores = scores * scale
-        scores = gl.where(valid_qk[None, :], scores, float("-inf"))
+        if not ASSUME_DENSE_SLOTS:
+            scores = gl.where(valid_qk[None, :], scores, float("-inf"))
 
         # --- read slot[t+1] -> prefetch KV[t+1] (nope + rope + enc, 1 tile ahead).
-        # Target tiles 1..eff_iter-2 are full -> drop kpos<seg_len; keep slot
-        # validity (interior slots can be -1). ---
+        # Target tiles 1..eff_iter-2 are full -> drop kpos<seg_len; the dense pass
+        # also drops the slot-validity clamp/mask (nope padding mask kept). ---
         slot_n1 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(nxt), sl_k_n)
         slot_kr1 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(nxt), sl_k_kr)
-        valid_n = (slot_n1 >= 0) & (slot_n1 < num_rows)
-        safe_n = gl.where(valid_n, slot_n1, 0)
+        if ASSUME_DENSE_SLOTS:
+            safe_n = slot_n1
+        else:
+            valid_n = (slot_n1 >= 0) & (slot_n1 < num_rows)
+            safe_n = gl.where(valid_n, slot_n1, 0)
         tok_n = ((safe_n // block_size).to(gl.int64) * cache_stride0 + (safe_n % block_size) * 576).to(gl.int32)
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            smem_k_nope.index(nxt), knT_base, tok_n[:, None] + nope_off[None, :],
-            mask=valid_n[:, None] & nope_mask[None, :],
-        )
-        valid_kn = (slot_kr1 >= 0) & (slot_kr1 < num_rows)
-        safe_kn = gl.where(valid_kn, slot_kr1, 0)
+        if ASSUME_DENSE_SLOTS:
+            # dense pass: no per-row slot-validity predicate, only the structural
+            # nope padding-column mask (broadcast over rows by the load).
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smem_k_nope.index(nxt), knT_base, tok_n[:, None] + nope_off[None, :],
+                mask=nope_mask[None, :],
+            )
+        else:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smem_k_nope.index(nxt), knT_base, tok_n[:, None] + nope_off[None, :],
+                mask=valid_n[:, None] & nope_mask[None, :],
+            )
+        if ASSUME_DENSE_SLOTS:
+            safe_kn = slot_kr1
+        else:
+            valid_kn = (slot_kr1 >= 0) & (slot_kr1 < num_rows)
+            safe_kn = gl.where(valid_kn, slot_kr1, 0)
         rope_n = ((safe_kn // block_size).to(gl.int64) * cache_stride0 + (safe_kn % block_size) * 576 + NOPE_DIM) // 2
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_k_pe.index(nxt), krT_base, rope_n[None, :].to(gl.int32) + d_kr[:, None],
         )
         # --- enc[t+1] prefetch (8 scale bytes = ENC_W int32 / token), same group ---
         slot_we1 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(nxt), sl_we_row)
-        valid_we = (slot_we1 >= 0) & (slot_we1 < num_rows)
-        safe_we = gl.where(valid_we, slot_we1, 0)
+        if ASSUME_DENSE_SLOTS:
+            safe_we = slot_we1
+        else:
+            valid_we = (slot_we1 >= 0) & (slot_we1 < num_rows)
+            safe_we = gl.where(valid_we, slot_we1, 0)
         senc = (
             (safe_we // block_size).to(gl.int64) * cache_stride0
             + block_size * 576 + (safe_we % block_size) * 8
         ) // 4
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            smem_enc.index(nxt), enc_base, senc[:, None].to(gl.int32) + word_off[None, :],
-            mask=valid_we[:, None],
-        )
+        if ASSUME_DENSE_SLOTS:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smem_enc.index(nxt), enc_base, senc[:, None].to(gl.int32) + word_off[None, :],
+            )
+        else:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smem_enc.index(nxt), enc_base, senc[:, None].to(gl.int32) + word_off[None, :],
+                mask=valid_we[:, None],
+            )
         gl.amd.cdna4.async_copy.commit_group()
 
         # --- softmax + PV[t] ---
@@ -646,7 +678,8 @@ def _decode_core_attn(
         m_new = gl.maximum(m_i, m_block)
         alpha = gl.exp(m_i - m_new)
         p = gl.exp(scores - m_new[:, None])
-        p = gl.where(valid_qk[None, :], p, 0.0)
+        if not ASSUME_DENSE_SLOTS:
+            p = gl.where(valid_qk[None, :], p, 0.0)
         l_i = l_i * alpha + gl.sum(p, axis=1)
         m_i = m_new
         p_dot = gl.convert_layout(p.to(gl.bfloat16), pv_a)
@@ -831,6 +864,7 @@ def _sparse_attn_decode_kernel(
     BLOCK_K: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
+    ASSUME_DENSE_MAIN: gl.constexpr,
 ):
     # Non-persistent 3-D XCD-pinned grid: axis0 = xcd, axis1 = head-block,
     # axis2 = query-chunk * NUM_SPLITS + split. Pins consecutive queries to
@@ -1057,6 +1091,7 @@ def _sparse_attn_decode_kernel(
         m_i, l_i, acc_nope, acc_rope,
         smem_k_nope, smem_k_pe, smem_slot, smem_enc, 0,
         NOPE_DIM, NOPE_BLOCK, ROPE_DIM, BLOCK_H, BLOCK_K, IS_FNUZ,
+        ASSUME_DENSE_MAIN,
     )
 
     # --- Extra (TopK) pass share the same core attention with main pass ---
@@ -1121,6 +1156,7 @@ def _sparse_attn_decode_kernel(
             m_i, l_i, acc_nope, acc_rope,
             smem_k_nope, smem_k_pe, smem_slot, smem_enc, 0,
             NOPE_DIM, NOPE_BLOCK, ROPE_DIM, BLOCK_H, BLOCK_K, IS_FNUZ,
+            False,   # top-k extra stream can carry interior -1 -> keep masking
         )
 
     # --- store raw partials (no sink, no normalize) ---
@@ -1336,6 +1372,9 @@ def sparse_attn_decode_gluon(
     rope_dim=64,
     is_fnuz=False,
     num_warps=4,        # partial-kernel warps (8 -> 2 waves/SIMD on gfx950)
+    assume_dense_main=True,  # main pass is SWA: window slots are contiguous and
+                             # always valid, so the hot loop drops slot-validity
+                             # masking. Set False if main can carry interior -1.
 ):
     """Host launcher for the flash-decode (split-K) DSV4 sparse-MLA decode.
 
@@ -1442,6 +1481,7 @@ def sparse_attn_decode_gluon(
         BLOCK_K=BLOCK_K,
         NUM_SPLITS=num_splits,
         NUM_XCDS=NUM_XCDS,
+        ASSUME_DENSE_MAIN=assume_dense_main,
         num_warps=num_warps,
     )
 
