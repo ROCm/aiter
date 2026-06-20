@@ -1963,28 +1963,40 @@ namespace py = pybind11;
     m.def("rocb_mm", &RocSolIdxBlas, "mm");                                        \
     m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
-#define TOP_K_PER_ROW_PYBIND       \
-    m.def("top_k_per_row_prefill", \
-          &top_k_per_row_prefill,  \
-          py::arg("logits"),       \
-          py::arg("rowStarts"),    \
-          py::arg("rowEnds"),      \
-          py::arg("indices"),      \
-          py::arg("values"),       \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
-          py::arg("stride1"),      \
-          py::arg("k") = 2048);    \
-    m.def("top_k_per_row_decode",  \
-          &top_k_per_row_decode,   \
-          py::arg("logits"),       \
-          py::arg("next_n"),       \
-          py::arg("seqLens"),      \
-          py::arg("indices"),      \
-          py::arg("numRows"),      \
-          py::arg("stride0"),      \
-          py::arg("stride1"),      \
-          py::arg("k") = 2048);
+#define TOP_K_PER_ROW_PYBIND                     \
+    m.def("top_k_per_row_prefill",               \
+          &top_k_per_row_prefill,                \
+          py::arg("logits"),                     \
+          py::arg("rowStarts"),                  \
+          py::arg("rowEnds"),                    \
+          py::arg("indices"),                    \
+          py::arg("values"),                     \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt);  \
+    m.def("top_k_per_row_decode",                \
+          &top_k_per_row_decode,                 \
+          py::arg("logits"),                     \
+          py::arg("next_n"),                     \
+          py::arg("seqLens"),                    \
+          py::arg("indices"),                    \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("stride1"),                    \
+          py::arg("k")         = 2048,           \
+          py::arg("workspace") = std::nullopt);  \
+    m.def("topk_mb_workspace_size",              \
+          &topk_mb_workspace_size,               \
+          py::arg("numRows"),                    \
+          py::arg("stride0"),                    \
+          py::arg("k"),                          \
+          py::arg("is_decode"));                 \
+    m.def("topk_use_mulblocks",                  \
+          &topk_use_mulblocks,                   \
+          py::arg("numRows"),                    \
+          py::arg("stride0"));
 
 #define MLA_METADATA_PYBIND                              \
     m.def("get_mla_metadata_v1",                         \
