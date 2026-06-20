@@ -544,28 +544,33 @@ def _decode_core_attn(
     enc_templ3 = gl.full([BLOCK_K, ENC_G, ENC_R], 0.0, gl.float32, layout=blk_e3)
 
     num_iter = (seg_len + BLOCK_K - 1) // BLOCK_K
-    # Clamp >= 2 so the loop is non-empty and the masked overshoot prefetches stay
-    # a single straight-line path (no branch on num_iter -> avoids the
-    # SIInsertWaitcnts crash). Tiles past num_iter mask to all-invalid.
+    # Clamp >= 2 so the 2-tile-peeled epilogue below always addresses two valid
+    # buffers (mirrors the prefill kernel). The main loop then walks only the
+    # guaranteed-full tiles 0..eff_iter-3; the trailing (possibly-partial) two
+    # tiles are handled by the straight-line epilogue. eff_iter stays a single
+    # straight-line path (no data-dependent branch -> avoids the SIInsertWaitcnts
+    # crash).
     eff_iter = gl.maximum(num_iter, 2)
 
-    # Main loop (2-deep pipeline, prologue-seeded). 
+    # Main loop (2-deep pipeline, prologue-seeded), FULL tiles only.
     # Entry invariant per iter t:
     # async in flight = [slot[t+1], KV[t]]; slot[t] already resident in buffer.
-    #   read slot[t] + enc/scale[t]               (consumes slot[t])
+    #   read slot[t]                               (consumes slot[t])
     #   GL slot[t+2] -> slot[t]'s freed buffer     (Solution 1: 2 slot buffers)
     #   wait KV[t]+slot[t+1]; dequant + QK[t]
-    #   read slot[t+1] -> GL KV[t+1] (nope+rope, 1 tile ahead)
+    #   read slot[t+1] -> GL KV[t+1] (nope+rope+enc, 1 tile ahead)
     #   softmax + PV[t]
-    for t in tl.range(0, eff_iter):
+    # Tiles 0..eff_iter-3 are always full so the kpos<seg_len tail mask is
+    # dropped here; the slot-validity mask (slot in [0, num_rows)) is KEPT
+    # because interior slots can be -1 (top-k / combine ragged paths).
+    for t in tl.range(0, eff_iter - 2):
         cur = (kv_buf_n + t) % 2
         nxt = (kv_buf_n + t + 1) % 2
 
         # --- read slot[t] (nope view) for the validity mask; KV[t] + enc[t]
         # were prefetched into buffer `cur` one tile ago (or by the prologue). ---
         slot_n = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(cur), sl_k_n)
-        kpos = t * BLOCK_K + k_off_n
-        valid = (kpos < seg_len) & (slot_n >= 0) & (slot_n < num_rows)
+        valid = (slot_n >= 0) & (slot_n < num_rows)
 
         # --- slot[t+2] prefetch into slot[t]'s now-free buffer ---
         gpos = (t + 2) * BLOCK_K + g_off
@@ -604,19 +609,19 @@ def _decode_core_attn(
         scores = scores * scale
         scores = gl.where(valid_qk[None, :], scores, float("-inf"))
 
-        # --- read slot[t+1] -> prefetch KV[t+1] (nope + rope, 1 tile ahead) ---
+        # --- read slot[t+1] -> prefetch KV[t+1] (nope + rope + enc, 1 tile ahead).
+        # Target tiles 1..eff_iter-2 are full -> drop kpos<seg_len; keep slot
+        # validity (interior slots can be -1). ---
         slot_n1 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(nxt), sl_k_n)
         slot_kr1 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(nxt), sl_k_kr)
-        kpos_n = (t + 1) * BLOCK_K + k_off_n
-        valid_n = (kpos_n < seg_len) & (slot_n1 >= 0) & (slot_n1 < num_rows)
+        valid_n = (slot_n1 >= 0) & (slot_n1 < num_rows)
         safe_n = gl.where(valid_n, slot_n1, 0)
         tok_n = ((safe_n // block_size).to(gl.int64) * cache_stride0 + (safe_n % block_size) * 576).to(gl.int32)
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_k_nope.index(nxt), knT_base, tok_n[:, None] + nope_off[None, :],
             mask=valid_n[:, None] & nope_mask[None, :],
         )
-        kpos_kn = (t + 1) * BLOCK_K + k_off_kr
-        valid_kn = (kpos_kn < seg_len) & (slot_kr1 >= 0) & (slot_kr1 < num_rows)
+        valid_kn = (slot_kr1 >= 0) & (slot_kr1 < num_rows)
         safe_kn = gl.where(valid_kn, slot_kr1, 0)
         rope_n = ((safe_kn // block_size).to(gl.int64) * cache_stride0 + (safe_kn % block_size) * 576 + NOPE_DIM) // 2
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -624,8 +629,7 @@ def _decode_core_attn(
         )
         # --- enc[t+1] prefetch (8 scale bytes = ENC_W int32 / token), same group ---
         slot_we1 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(nxt), sl_we_row)
-        kpos_we = (t + 1) * BLOCK_K + k_off_we
-        valid_we = (kpos_we < seg_len) & (slot_we1 >= 0) & (slot_we1 < num_rows)
+        valid_we = (slot_we1 >= 0) & (slot_we1 < num_rows)
         safe_we = gl.where(valid_we, slot_we1, 0)
         senc = (
             (safe_we // block_size).to(gl.int64) * cache_stride0
@@ -652,8 +656,130 @@ def _decode_core_attn(
         acc_rope = acc_rope * alpha_pv[:, None]
         acc_rope = gl.amd.cdna4.mfma(p_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_pe.index(cur).permute([1, 0]), pv_b), acc_rope)
 
-    # drain the trailing masked overshoot prefetches (slot[eff_iter+1], KV[eff_iter])
-    gl.amd.cdna4.async_copy.wait_group(0)
+    # ===================== Epilogue (trailing two tiles) =====================
+    # On entry: async in flight = [slot[eff_iter-1], KV[eff_iter-2]];
+    # slot[eff_iter-2] resident. Mirrors the prefill epilogue: stage the last
+    # tile's KV (not prefetched by the loop), then compute tiles eff_iter-2 and
+    # eff_iter-1 with their kpos<seg_len tail masks restored. eff_iter-2 is full
+    # when num_iter>=2 (tail a no-op) and partial only when num_iter<=1;
+    # eff_iter-1 is always possibly-partial.
+    c2 = (kv_buf_n + eff_iter - 2) % 2
+    cl = (kv_buf_n + eff_iter - 1) % 2
+
+    # --- Part 1: read slot[eff_iter-1] -> GL KV[eff_iter-1] (nope+rope+enc). The
+    # last tile was not prefetched by the loop. Tail/invalid lanes clamp to slot 0
+    # (a safe in-bounds row); the -inf score mask drops them in Part 3. ---
+    gl.amd.cdna4.async_copy.wait_group(1)   # slot[eff_iter-1] ready; KV[eff_iter-2] in flight
+    sl_l_n = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(cl), sl_k_n)
+    sl_l_kr = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(cl), sl_k_kr)
+    sl_l_we = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(cl), sl_we_row)
+    valid_l = ((eff_iter - 1) * BLOCK_K + k_off_n < seg_len) & (sl_l_n >= 0) & (sl_l_n < num_rows)
+    safeL_n = gl.where(valid_l, sl_l_n, 0)
+    tokL_n = ((safeL_n // block_size).to(gl.int64) * cache_stride0 + (safeL_n % block_size) * 576).to(gl.int32)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_k_nope.index(cl), knT_base, tokL_n[:, None] + nope_off[None, :],
+        mask=valid_l[:, None] & nope_mask[None, :],
+    )
+    vL_kr = ((eff_iter - 1) * BLOCK_K + k_off_kr < seg_len) & (sl_l_kr >= 0) & (sl_l_kr < num_rows)
+    safeL_kr = gl.where(vL_kr, sl_l_kr, 0)
+    ropeL = ((safeL_kr // block_size).to(gl.int64) * cache_stride0 + (safeL_kr % block_size) * 576 + NOPE_DIM) // 2
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_k_pe.index(cl), krT_base, ropeL[None, :].to(gl.int32) + d_kr[:, None],
+    )
+    vL_we = ((eff_iter - 1) * BLOCK_K + k_off_we < seg_len) & (sl_l_we >= 0) & (sl_l_we < num_rows)
+    safeL_we = gl.where(vL_we, sl_l_we, 0)
+    sencL = (
+        (safeL_we // block_size).to(gl.int64) * cache_stride0
+        + block_size * 576 + (safeL_we % block_size) * 8
+    ) // 4
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_enc.index(cl), enc_base, sencL[:, None].to(gl.int32) + word_off[None, :],
+        mask=vL_we[:, None],
+    )
+    gl.amd.cdna4.async_copy.commit_group()   # in flight: [KV[eff_iter-2], KV[eff_iter-1]]
+
+    # --- Part 2: compute tile eff_iter-2 (KV resident in buffer c2). ---
+    gl.amd.cdna4.async_copy.wait_group(1)   # KV[eff_iter-2] ready; KV[eff_iter-1] in flight
+    slot2 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(c2), sl_k_n)
+    valid2 = ((eff_iter - 2) * BLOCK_K + k_off_n < seg_len) & (slot2 >= 0) & (slot2 < num_rows)
+
+    scores = gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=mma_qk)
+    scores = gl.amd.cdna4.mfma(q_rope_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_pe.index(c2), qk_b), scores)
+    w_enc = gl.convert_layout(
+        gl.amd.cdna4.async_copy.load_shared_relaxed(smem_enc.index(c2), blk_we), sl_eA2,
+    )
+    w_bc, _ = gl.broadcast(gl.expand_dims(w_enc, 2), enc_templA)
+    sh_bc, _ = gl.broadcast(enc_sh3, enc_templA)
+    enc8 = gl.convert_layout(
+        gl.reshape((w_bc >> sh_bc) & 0xFF, [BLOCK_K, ENC_G]), sl_e8,
+    ).to(gl.float32)
+    scales8 = gl.exp2(enc8 - 127.0)
+    sc_bc, _ = gl.broadcast(gl.expand_dims(scales8, 2), enc_templ3)
+    scales = gl.convert_layout(gl.reshape(sc_bc, [BLOCK_K, NOPE_BLOCK]), blk_n)
+
+    k_nope_fp8 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_nope.index(c2), blk_n)
+    k_nope = k_nope_fp8.to(gl.bfloat16) * scales.to(gl.bfloat16)
+    k_nope = gl.where(valid2[:, None] & nope_mask[None, :], k_nope, zero_n)
+    smem_kn.store(gl.permute(k_nope, [1, 0]))
+    valid2_qk = gl.convert_layout(valid2, sl_k_qk)
+    scores = gl.amd.cdna4.mfma(q_nope_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_kn, qk_b), scores)
+    scores = scores * scale
+    scores = gl.where(valid2_qk[None, :], scores, float("-inf"))
+
+    m_block = gl.max(scores, axis=1)
+    m_new = gl.maximum(m_i, m_block)
+    alpha = gl.exp(m_i - m_new)
+    p = gl.exp(scores - m_new[:, None])
+    p = gl.where(valid2_qk[None, :], p, 0.0)
+    l_i = l_i * alpha + gl.sum(p, axis=1)
+    m_i = m_new
+    p_dot = gl.convert_layout(p.to(gl.bfloat16), pv_a)
+    alpha_pv = gl.convert_layout(alpha, sl_h_pv)
+    acc_nope = acc_nope * alpha_pv[:, None]
+    acc_nope = gl.amd.cdna4.mfma(p_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_kn.permute([1, 0]), pv_b), acc_nope)
+    acc_rope = acc_rope * alpha_pv[:, None]
+    acc_rope = gl.amd.cdna4.mfma(p_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_pe.index(c2).permute([1, 0]), pv_b), acc_rope)
+
+    # --- Part 3: compute tile eff_iter-1 (KV resident in buffer cl; valid_l from
+    # Part 1). Drains the last in-flight group. ---
+    gl.amd.cdna4.async_copy.wait_group(0)   # KV[eff_iter-1] ready
+    scores = gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=mma_qk)
+    scores = gl.amd.cdna4.mfma(q_rope_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_pe.index(cl), qk_b), scores)
+    w_enc = gl.convert_layout(
+        gl.amd.cdna4.async_copy.load_shared_relaxed(smem_enc.index(cl), blk_we), sl_eA2,
+    )
+    w_bc, _ = gl.broadcast(gl.expand_dims(w_enc, 2), enc_templA)
+    sh_bc, _ = gl.broadcast(enc_sh3, enc_templA)
+    enc8 = gl.convert_layout(
+        gl.reshape((w_bc >> sh_bc) & 0xFF, [BLOCK_K, ENC_G]), sl_e8,
+    ).to(gl.float32)
+    scales8 = gl.exp2(enc8 - 127.0)
+    sc_bc, _ = gl.broadcast(gl.expand_dims(scales8, 2), enc_templ3)
+    scales = gl.convert_layout(gl.reshape(sc_bc, [BLOCK_K, NOPE_BLOCK]), blk_n)
+
+    k_nope_fp8 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_nope.index(cl), blk_n)
+    k_nope = k_nope_fp8.to(gl.bfloat16) * scales.to(gl.bfloat16)
+    k_nope = gl.where(valid_l[:, None] & nope_mask[None, :], k_nope, zero_n)
+    smem_kn.store(gl.permute(k_nope, [1, 0]))
+    valid_l_qk = gl.convert_layout(valid_l, sl_k_qk)
+    scores = gl.amd.cdna4.mfma(q_nope_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_kn, qk_b), scores)
+    scores = scores * scale
+    scores = gl.where(valid_l_qk[None, :], scores, float("-inf"))
+
+    m_block = gl.max(scores, axis=1)
+    m_new = gl.maximum(m_i, m_block)
+    alpha = gl.exp(m_i - m_new)
+    p = gl.exp(scores - m_new[:, None])
+    p = gl.where(valid_l_qk[None, :], p, 0.0)
+    l_i = l_i * alpha + gl.sum(p, axis=1)
+    m_i = m_new
+    p_dot = gl.convert_layout(p.to(gl.bfloat16), pv_a)
+    alpha_pv = gl.convert_layout(alpha, sl_h_pv)
+    acc_nope = acc_nope * alpha_pv[:, None]
+    acc_nope = gl.amd.cdna4.mfma(p_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_kn.permute([1, 0]), pv_b), acc_nope)
+    acc_rope = acc_rope * alpha_pv[:, None]
+    acc_rope = gl.amd.cdna4.mfma(p_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_pe.index(cl).permute([1, 0]), pv_b), acc_rope)
+
     return m_i, l_i, acc_nope, acc_rope
 
 # ---------------------------------------------------------------------------
@@ -838,7 +964,14 @@ def _sparse_attn_decode_kernel(
     gl.amd.cdna4.async_copy.commit_group()
 
     # --- running softmax state ---
-    m_i = gl.full([BLOCK_H], float("-inf"), dtype=gl.float32, layout=sl_h_qk)
+    # Finite sentinel (not -inf) so an empty/negative-length split — whose core
+    # still runs eff_iter=max(num_iter,2) fully-masked tiles — yields a neutral
+    # (m=neg_large, l=0, acc=0) partial instead of NaN. With -inf, a fully-masked
+    # first tile computes (-inf)-(-inf)=NaN -> alpha=NaN -> l_i/acc = 0*NaN = NaN,
+    # which the reduce then propagates via w_s(=0)*NaN. Matches the Triton ref +
+    # the reduce kernel's neg_large.
+    neg_large = -3.4028234663852886e38
+    m_i = gl.full([BLOCK_H], neg_large, dtype=gl.float32, layout=sl_h_qk)
     l_i = gl.zeros([BLOCK_H], dtype=gl.float32, layout=sl_h_qk)
     acc_nope = gl.zeros([BLOCK_H, NOPE_BLOCK], dtype=gl.float32, layout=mma_pv)
     acc_rope = gl.zeros([BLOCK_H, ROPE_DIM], dtype=gl.float32, layout=mma_pv)
