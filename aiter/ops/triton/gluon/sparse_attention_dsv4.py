@@ -423,6 +423,7 @@ def _decode_core_attn(
     smem_k_nope,
     smem_k_pe,
     smem_slot,
+    smem_enc,
     kv_buf_n,
     NOPE_DIM: gl.constexpr,
     NOPE_BLOCK: gl.constexpr,
@@ -488,9 +489,37 @@ def _decode_core_attn(
         cga_layout=[], shape=[NOPE_BLOCK, BLOCK_K],
     )
 
+    # --- per-tile UE8M0 scale (enc) async-copy + register broadcast layouts ---
+    # The 8 scale bytes/token (one e8m0 exponent per 64-dim nope group) are
+    # gathered as ENC_W=2 int32 words (1-byte async-copy doesn't lower on CDNA4),
+    # unpacked to 8 bytes in registers, then broadcast [BLOCK_K,8] -> [BLOCK_K,512]
+    # (each group byte spans its 64 nope dims) to form the dequant multiplier.
+    ENC_G: gl.constexpr = NOPE_BLOCK // 64        # 8 scale groups / token
+    ENC_R: gl.constexpr = 64                      # nope dims per group
+    ENC_W: gl.constexpr = ENC_G // 4              # 2 int32 words (8 bytes)
+    BPW: gl.constexpr = 4                         # bytes per int32 word
+    blk_we: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [BLOCK_K // ENC_W, ENC_W], [nw, 1], [1, 0],
+    )                                             # [BLOCK_K, ENC_W] async/readback
+    sl_we_row: gl.constexpr = gl.SliceLayout(1, blk_we)
+    sl_we_col: gl.constexpr = gl.SliceLayout(0, blk_we)
+    blk_eA: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 1], [BLOCK_K // (ENC_W * BPW), ENC_W, BPW], [nw, 1, 1], [2, 1, 0],
+    )                                             # [BLOCK_K, ENC_W, BPW] byte unpack
+    sl_eA2: gl.constexpr = gl.SliceLayout(2, blk_eA)
+    sh_eax: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, blk_eA))   # [BPW]
+    blk_e3: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 16], [2, ENC_G, 4], [nw, 1, 1], [2, 1, 0],
+    )                                             # [BLOCK_K, ENC_G, ENC_R] broadcast
+    sl_e8: gl.constexpr = gl.SliceLayout(2, blk_e3)
+    sh_we: gl.constexpr = gl.PaddedSharedLayout(
+        interval_padding_pairs=[[BLOCK_K, 4]],
+        offset_bases=[[0, 1], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+        cga_layout=[], shape=[BLOCK_K, ENC_W],
+    )
+
     nope_off = gl.arange(0, NOPE_BLOCK, layout=sl_d_n)
     nope_mask = nope_off < NOPE_DIM
-    nope_grp = nope_off // 64
     k_off_n = gl.arange(0, BLOCK_K, layout=sl_k_n)
     k_off_kr = gl.arange(0, BLOCK_K, layout=sl_k_kr)
     d_kr = gl.arange(0, ROPE_DIM, layout=sl_d_kr)
@@ -500,10 +529,19 @@ def _decode_core_attn(
         knT_base = cache_ptr.to(gl.pointer_type(gl.float8e4b15))
     else:
         knT_base = cache_ptr.to(gl.pointer_type(gl.float8e4nv))
-    # bf16 nope dequant target (single). smem_slot / smem_k_nope / smem_k_pe are
-    # passed in (2-buffered) and pre-seeded by the in-kernel prologue.
+    # bf16 nope dequant target (single). smem_slot / smem_k_nope / smem_k_pe /
+    # smem_enc are passed in (2-buffered) and pre-seeded by the in-kernel prologue.
     smem_kn = gl.allocate_shared_memory(gl.bfloat16, [NOPE_BLOCK, BLOCK_K], sh_knT)
     zero_n = gl.zeros([BLOCK_K, NOPE_BLOCK], dtype=gl.bfloat16, layout=blk_n)
+
+    # enc (scale) gather/unpack helpers (loop-invariant).
+    enc_base = cache_ptr.to(gl.pointer_type(gl.int32))
+    word_off = gl.arange(0, ENC_W, layout=sl_we_col)               # [ENC_W]
+    k_off_we = gl.arange(0, BLOCK_K, layout=sl_we_row)             # [BLOCK_K]
+    enc_shift = gl.arange(0, BPW, layout=sh_eax) * 8               # [BPW] byte shifts
+    enc_sh3 = gl.expand_dims(gl.expand_dims(enc_shift, 0), 1)      # [1,1,BPW]
+    enc_templA = gl.full([BLOCK_K, ENC_W, BPW], 0, gl.int32, layout=blk_eA)
+    enc_templ3 = gl.full([BLOCK_K, ENC_G, ENC_R], 0.0, gl.float32, layout=blk_e3)
 
     num_iter = (seg_len + BLOCK_K - 1) // BLOCK_K
     # Clamp >= 2 so the loop is non-empty and the masked overshoot prefetches stay
@@ -523,20 +561,13 @@ def _decode_core_attn(
         cur = (kv_buf_n + t) % 2
         nxt = (kv_buf_n + t + 1) % 2
 
-        # --- read slot[t] (both views) + per-tile enc/scale (consumes slot[t]) ---
+        # --- read slot[t] (nope view) for the validity mask; KV[t] + enc[t]
+        # were prefetched into buffer `cur` one tile ago (or by the prologue). ---
         slot_n = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(cur), sl_k_n)
         kpos = t * BLOCK_K + k_off_n
         valid = (kpos < seg_len) & (slot_n >= 0) & (slot_n < num_rows)
-        safe = gl.where(valid, slot_n, 0)
-        block_off = (safe // block_size).to(gl.int64) * cache_stride0
-        scale_ptr = cache_ptr + block_off + block_size * 576 + (safe % block_size) * 8
-        enc = gl.load(
-            scale_ptr[:, None] + nope_grp[None, :],
-            mask=valid[:, None] & nope_mask[None, :], other=127,
-        )
-        scales = gl.exp2(enc.to(gl.float32) - 127.0)
 
-        # --- slot[t+2] prefetch into slot[t]'s now-free buffer (after enc) ---
+        # --- slot[t+2] prefetch into slot[t]'s now-free buffer ---
         gpos = (t + 2) * BLOCK_K + g_off
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_slot.index(cur), indices_ptr + seg_start, gpos, mask=gpos < seg_len,
@@ -546,16 +577,30 @@ def _decode_core_attn(
         # --- wait KV[t] + slot[t+1] (leaves slot[t+2] in flight) ---
         gl.amd.cdna4.async_copy.wait_group(1)
 
+        scores = gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=mma_qk)
+        scores = gl.amd.cdna4.mfma(q_rope_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_pe.index(cur), qk_b), scores)
+        # --- read enc[t] from LDS, unpack 2 int32 -> 8 bytes, exp2 on the compact
+        # [BLOCK_K, 8] tile, then broadcast each group byte across its 64 nope dims. ---
+        w_enc = gl.convert_layout(
+            gl.amd.cdna4.async_copy.load_shared_relaxed(smem_enc.index(cur), blk_we), sl_eA2,
+        )
+        w_bc, _ = gl.broadcast(gl.expand_dims(w_enc, 2), enc_templA)      # [BLOCK_K, ENC_W, BPW]
+        sh_bc, _ = gl.broadcast(enc_sh3, enc_templA)
+        enc8 = gl.convert_layout(
+            gl.reshape((w_bc >> sh_bc) & 0xFF, [BLOCK_K, ENC_G]), sl_e8,
+        ).to(gl.float32)                                                  # [BLOCK_K, 8]
+        scales8 = gl.exp2(enc8 - 127.0)
+        sc_bc, _ = gl.broadcast(gl.expand_dims(scales8, 2), enc_templ3)  # [BLOCK_K, ENC_G, ENC_R]
+        scales = gl.convert_layout(gl.reshape(sc_bc, [BLOCK_K, NOPE_BLOCK]), blk_n)
+
         # --- dequant KV_nope[t] -> bf16 target, QK ---
-        k_nope_fp8 = smem_k_nope.index(cur).load(layout=blk_n)
+        k_nope_fp8 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_nope.index(cur), blk_n)
         k_nope = k_nope_fp8.to(gl.bfloat16) * scales.to(gl.bfloat16)
         # invalid cols -> 0 (else PV's 0*NaN=NaN) and pad dims [NOPE_DIM,NOPE_BLOCK) -> 0.
         k_nope = gl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_n)
         smem_kn.store(gl.permute(k_nope, [1, 0]))
         valid_qk = gl.convert_layout(valid, sl_k_qk)
-        scores = gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=mma_qk)
-        scores = gl.amd.cdna4.mfma(q_nope_dot, smem_kn.load(layout=qk_b), scores)
-        scores = gl.amd.cdna4.mfma(q_rope_dot, smem_k_pe.index(cur).load(layout=qk_b), scores)
+        scores = gl.amd.cdna4.mfma(q_nope_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_kn, qk_b), scores)
         scores = scores * scale
         scores = gl.where(valid_qk[None, :], scores, float("-inf"))
 
@@ -577,6 +622,19 @@ def _decode_core_attn(
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_k_pe.index(nxt), krT_base, rope_n[None, :].to(gl.int32) + d_kr[:, None],
         )
+        # --- enc[t+1] prefetch (8 scale bytes = ENC_W int32 / token), same group ---
+        slot_we1 = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(nxt), sl_we_row)
+        kpos_we = (t + 1) * BLOCK_K + k_off_we
+        valid_we = (kpos_we < seg_len) & (slot_we1 >= 0) & (slot_we1 < num_rows)
+        safe_we = gl.where(valid_we, slot_we1, 0)
+        senc = (
+            (safe_we // block_size).to(gl.int64) * cache_stride0
+            + block_size * 576 + (safe_we % block_size) * 8
+        ) // 4
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_enc.index(nxt), enc_base, senc[:, None].to(gl.int32) + word_off[None, :],
+            mask=valid_we[:, None],
+        )
         gl.amd.cdna4.async_copy.commit_group()
 
         # --- softmax + PV[t] ---
@@ -590,9 +648,9 @@ def _decode_core_attn(
         p_dot = gl.convert_layout(p.to(gl.bfloat16), pv_a)
         alpha_pv = gl.convert_layout(alpha, sl_h_pv)
         acc_nope = acc_nope * alpha_pv[:, None]
-        acc_nope = gl.amd.cdna4.mfma(p_dot, smem_kn.permute([1, 0]).load(layout=pv_b), acc_nope)
+        acc_nope = gl.amd.cdna4.mfma(p_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_kn.permute([1, 0]), pv_b), acc_nope)
         acc_rope = acc_rope * alpha_pv[:, None]
-        acc_rope = gl.amd.cdna4.mfma(p_dot, smem_k_pe.index(cur).permute([1, 0]).load(layout=pv_b), acc_rope)
+        acc_rope = gl.amd.cdna4.mfma(p_dot, gl.amd.cdna4.async_copy.load_shared_relaxed(smem_k_pe.index(cur).permute([1, 0]), pv_b), acc_rope)
 
     # drain the trailing masked overshoot prefetches (slot[eff_iter+1], KV[eff_iter])
     gl.amd.cdna4.async_copy.wait_group(0)
@@ -713,6 +771,21 @@ def _sparse_attn_decode_kernel(
     kv_d_kr = gl.arange(0, ROPE_DIM, layout=sl_d_kr)
     kv_g_off = gl.arange(0, BLOCK_K, layout=dll_slot)
 
+    # --- enc (scale) async-copy layouts (MUST match _decode_core_attn) ---
+    ENC_W: gl.constexpr = (NOPE_BLOCK // 64) // 4         # 2 int32 words / token
+    blk_we: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [BLOCK_K // ENC_W, ENC_W], [nw, 1], [1, 0],
+    )
+    sl_we_row: gl.constexpr = gl.SliceLayout(1, blk_we)
+    sl_we_col: gl.constexpr = gl.SliceLayout(0, blk_we)
+    sh_we: gl.constexpr = gl.PaddedSharedLayout(
+        interval_padding_pairs=[[BLOCK_K, 4]],
+        offset_bases=[[0, 1], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+        cga_layout=[], shape=[BLOCK_K, ENC_W],
+    )
+    kv_word_off = gl.arange(0, ENC_W, layout=sl_we_col)
+    kv_k_off_we = gl.arange(0, BLOCK_K, layout=sl_we_row)
+
     # --- q async-copy (global -> LDS) layouts (mirror the single-pass kernel) ---
     blk_qn: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8], threads_per_warp=[1, 64],
@@ -792,6 +865,7 @@ def _sparse_attn_decode_kernel(
     main_seg = main_hi - main_lo
     main_knT = main_cache_ptr.to(gl.pointer_type(k_nope_ty))
     main_krT = main_cache_ptr.to(gl.pointer_type(gl.bfloat16))
+    main_enc_base = main_cache_ptr.to(gl.pointer_type(gl.int32))
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_slot.index(0), main_indices_ptr + main_start + main_lo, kv_g_off,
         mask=kv_g_off < main_seg,
@@ -812,6 +886,7 @@ def _sparse_attn_decode_kernel(
     # smem_k allocation should be right after LL Q to reuse LDS.
     smem_k_nope = gl.allocate_shared_memory(k_nope_ty, [2, BLOCK_K, NOPE_BLOCK], sh_kn_fp8)
     smem_k_pe = gl.allocate_shared_memory(gl.bfloat16, [2, ROPE_DIM, BLOCK_K], sh_krT)
+    smem_enc = gl.allocate_shared_memory(gl.int32, [2, BLOCK_K, ENC_W], sh_we)
 
     gl.amd.cdna4.async_copy.wait_group(1)   # slot[0] ready (slot[1] in flight)
     ps_n = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(0), sl_k_n)
@@ -829,6 +904,17 @@ def _sparse_attn_decode_kernel(
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         smem_k_pe.index(0), main_krT, prope_n[None, :].to(gl.int32) + kv_d_kr[:, None],
     )
+    ps_we = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(0), sl_we_row)
+    pv_we = (kv_k_off_we < main_seg) & (ps_we >= 0) & (ps_we < main_num_rows)
+    psafe_we = gl.where(pv_we, ps_we, 0)
+    psenc = (
+        (psafe_we // main_block_size).to(gl.int64) * main_cache_stride0
+        + main_block_size * 576 + (psafe_we % main_block_size) * 8
+    ) // 4
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem_enc.index(0), main_enc_base, psenc[:, None].to(gl.int32) + kv_word_off[None, :],
+        mask=pv_we[:, None],
+    )
     gl.amd.cdna4.async_copy.commit_group()
 
     m_i, l_i, acc_nope, acc_rope = _decode_core_attn(
@@ -836,7 +922,7 @@ def _sparse_attn_decode_kernel(
         main_cache_stride0, main_block_size, main_num_rows,
         q_nope_dot, q_rope_dot, scale,
         m_i, l_i, acc_nope, acc_rope,
-        smem_k_nope, smem_k_pe, smem_slot, 0,
+        smem_k_nope, smem_k_pe, smem_slot, smem_enc, 0,
         NOPE_DIM, NOPE_BLOCK, ROPE_DIM, BLOCK_H, BLOCK_K, IS_FNUZ,
     )
 
@@ -855,6 +941,7 @@ def _sparse_attn_decode_kernel(
         extra_seg = extra_hi - extra_lo
         extra_knT = extra_cache_ptr.to(gl.pointer_type(k_nope_ty))
         extra_krT = extra_cache_ptr.to(gl.pointer_type(gl.bfloat16))
+        extra_enc_base = extra_cache_ptr.to(gl.pointer_type(gl.int32))
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_slot.index(0), extra_indices_ptr + extra_start + extra_lo, kv_g_off,
             mask=kv_g_off < extra_seg,
@@ -881,6 +968,17 @@ def _sparse_attn_decode_kernel(
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             smem_k_pe.index(0), extra_krT, erope_n[None, :].to(gl.int32) + kv_d_kr[:, None],
         )
+        es_we = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_slot.index(0), sl_we_row)
+        ev_we = (kv_k_off_we < extra_seg) & (es_we >= 0) & (es_we < extra_num_rows)
+        esafe_we = gl.where(ev_we, es_we, 0)
+        esenc = (
+            (esafe_we // extra_block_size).to(gl.int64) * extra_cache_stride0
+            + extra_block_size * 576 + (esafe_we % extra_block_size) * 8
+        ) // 4
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem_enc.index(0), extra_enc_base, esenc[:, None].to(gl.int32) + kv_word_off[None, :],
+            mask=ev_we[:, None],
+        )
         gl.amd.cdna4.async_copy.commit_group()
 
         m_i, l_i, acc_nope, acc_rope = _decode_core_attn(
@@ -888,7 +986,7 @@ def _sparse_attn_decode_kernel(
             extra_cache_stride0, extra_block_size, extra_num_rows,
             q_nope_dot, q_rope_dot, scale,
             m_i, l_i, acc_nope, acc_rope,
-            smem_k_nope, smem_k_pe, smem_slot, 0,
+            smem_k_nope, smem_k_pe, smem_slot, smem_enc, 0,
             NOPE_DIM, NOPE_BLOCK, ROPE_DIM, BLOCK_H, BLOCK_K, IS_FNUZ,
         )
 
