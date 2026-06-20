@@ -5,7 +5,6 @@
 #undef __HIP_NO_HALF_OPERATORS__
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
-#include <rocwmma/rocwmma.hpp>
 #ifndef __HIP_NO_HALF_OPERATORS__
 #define __HIP_NO_HALF_OPERATORS__ 1
 #endif
@@ -13,13 +12,23 @@
 #define __HIP_NO_HALF_CONVERSIONS__ 1
 #endif
 #include <ATen/hip/HIPContext.h>
-#include <c10/hip/HIPException.h>
 #include <c10/hip/HIPStream.h>
+#include <c10/hip/HIPException.h>
 #include <torch/extension.h>
 
 #include "hip_float8.h"
 
-namespace aiter_rope {
+// FWHT butterfly: default to the single-FMA sign form. It folds the per-element
+// sub+add+cndmask of the select form into one fmaf, removing the v_cndmask that
+// dominates the VALU-bound FWHT (measured: ~373 -> ~50 v_cndmask in the hpw8
+// prefill kernel, up to 1.56x faster at 32k prefill, no decode regression) and
+// is bit-equivalent (single-rounded). Define NO_FWHT_FMA_SIGN to fall back to
+// the select form.
+#if !defined(FWHT_FMA_SIGN) && !defined(NO_FWHT_FMA_SIGN)
+#define FWHT_FMA_SIGN 1
+#endif
+
+namespace aiter {
 
 constexpr int kHeadDim = 128;
 constexpr int kWarpSize = 32;
@@ -62,6 +71,25 @@ __device__ __forceinline__ float load_scalar_f32(const void* ptr, int kind, int6
 __device__ __forceinline__ float bf16_round_f32(float x) {
   return static_cast<float>(__hip_bfloat16(x));
 }
+
+// ==== Default prefill formulation (verified -12% on MI300 32k prefill via
+// rocprofv3 hardware timestamps + eager event timing; dynamic SQ_INSTS_VALU
+// -20%). Two changes that only pay off TOGETHER:
+//   1) SWZ_USE_SWIZZLE: route every FWHT/reduction cross-lane through ds_swizzle
+//      (the LDS port) instead of DPP. The kernel is VALU-issue bound, so keeping
+//      lane-exchange OFF the saturated VALU port is strictly better as long as
+//      LDS latency stays hidden by the HPW*4-way ILP (it does: SQ_WAIT_INST_LDS
+//      is a small fraction of the wait).
+//   2) FWHT_FMA_SIGN: express each butterfly as one sign-FMA, removing the
+//      per-element v_cndmask. This only helps once (1) is on -- with the DPP
+//      path it instead breaks the v_*_dpp fusion and regresses.
+// Define SWZ_USE_SHFL / SWZ_FORCE_DPP / FWHT_NO_FMA_SIGN to A/B the old path.
+#if !defined(SWZ_USE_SHFL) && !defined(SWZ_FORCE_DPP) && !defined(SWZ_USE_SWIZZLE)
+#define SWZ_USE_SWIZZLE
+#endif
+#if !defined(FWHT_NO_FMA_SIGN) && !defined(FWHT_FMA_SIGN)
+#define FWHT_FMA_SIGN
+#endif
 
 // Cross-lane xor-permute via ds_swizzle instead of __shfl_xor. On gfx942,
 // __shfl_xor lowers to ds_bpermute plus VALU address math (__lane_id, a clamp
@@ -191,20 +219,47 @@ __device__ __forceinline__ uint8_t float_to_fp8_byte(float x, float fp8_max) {
   return hip_fp8(x).data;
 }
 
-// Compile-time divide/modulo: when the divisor C is a known constant (the
-// common block_size=32 / k_cache_x=16 / k_scale_l=32 case) the compiler turns
-// these into a shift / and; C==0 selects the runtime divisor. The whole reason
-// for this is that prefill is VALU-bound almost entirely on the integer
-// div/mod magic-number sequences these addressing ops generate, so killing the
-// runtime division is the single biggest lever (verified via rocprofv3:
-// VALUBusy~100%, dominated by v_mul_lo/v_mul_hi/v_cndmask from these divides).
+// Pack TWO fp32 -> two e4m3fnuz bytes in ONE v_cvt_pk_fp8_f32 (byte0=a, byte1=b),
+// matching to_fp8_from_fp32's internal +-240 fmed3 saturation. Halves the
+// conversion VALU vs two scalar hip_fp8() calls (each wastes the packed cvt on a
+// single element). Mirrors the NVIDIA cvt.rn.satfinite.e4m3x2.f32 path.
+__device__ __forceinline__ uint32_t float2_to_fp8x2(float a, float b) {
+  // Explicit fmed3 saturation: unlike NVIDIA's free F2FP.SATFINITE, the AMD
+  // v_cvt_pk_fp8_f32 has NO clamp/saturate modifier (CDNA3 ISA: only op_sel), so
+  // out-of-range inputs are not clamped by the cvt. Kept unconditionally for
+  // safety -- dropping it on the amax-normalized path saves ~1.5% but risks a
+  // NaN in the KV cache at the rcp-rounding boundary, not worth it.
+  a = __builtin_amdgcn_fmed3f(a, 240.0f, -240.0f);
+  b = __builtin_amdgcn_fmed3f(b, 240.0f, -240.0f);
+  return __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false);  // WORD0 -> bytes 0,1
+}
+
+// Fast hardware reciprocal (v_rcp_f32, ~2.5 ulp). The FP8 quant scales feed a
+// 3-mantissa-bit format and a stored fp32 scale, so full IEEE-754 division
+// (v_div_scale/v_div_fmas/v_div_fixup + cndmask, ~8 VALU each) is wasted
+// precision. These scales are uniform per (warp,head); with HPW=8 the compiler
+// otherwise replicates ~56 of those full divisions across 64 lanes -- a large
+// slice of the VALU-issue-bound prefill budget. rcp+mul collapses each to ~2
+// ops. Verified within the abkit fp8 tolerance vs the Triton reference.
+__device__ __forceinline__ float fast_rcp(float x) {
+  return __builtin_amdgcn_rcpf(x);
+}
+
+// Divide/modulo for the KV-cache addressing. block_size / k_cache_x / k_scale_l
+// are ALWAYS powers of two in vLLM, so x/rt = x>>log2(rt) and x%rt = x&(rt-1) --
+// a runtime shift/and (the divisor is a uniform kernel arg, so the compiler
+// hoists the ctz out of the per-element loops). This kills the magic-number
+// runtime division (the dominant VALU cost per rocprofv3) WITHOUT any
+// per-block_size template specialization -- one kernel instance serves every
+// power-of-two block_size. The C template arg is kept for the rare compile-time
+// constant call but is no longer needed for speed.
 template <int C>
 __device__ __forceinline__ int idiv(int x, int rt) {
-  if constexpr (C != 0) return x / C; else return x / rt;
+  if constexpr (C != 0) return x / C; else return x >> __builtin_ctz(static_cast<unsigned>(rt));
 }
 template <int C>
 __device__ __forceinline__ int imod(int x, int rt) {
-  if constexpr (C != 0) return x % C; else return x % rt;
+  if constexpr (C != 0) return x % C; else return x & (rt - 1);
 }
 
 __device__ __forceinline__ void fwht128_inplace(float* x, int lane) {
@@ -367,48 +422,7 @@ __device__ __forceinline__ float hadamard_scale_128() {
   return static_cast<float>(__hip_bfloat16(0.08838834764831845f));
 }
 
-__global__ void compute_pos_slot_kernel_hip(const int32_t* __restrict__ q_index,
-                                        const int32_t* __restrict__ num_seqlen_per_req,
-                                        const int32_t* __restrict__ kvcache_indices,
-                                        int32_t* __restrict__ positions,
-                                        int64_t* __restrict__ slot_indices,
-                                        int32_t* __restrict__ req_ids,
-                                        int32_t* __restrict__ local_idx,
-                                        int64_t stride_kvi_r,
-                                        int64_t stride_kvi_b,
-                                        int64_t block_size) {
-  const int req = blockIdx.x;
-  const int32_t start = q_index[req];
-  const int32_t end = q_index[req + 1];
-  const int32_t seq_len = num_seqlen_per_req[req];
-  const int32_t num_rows_req = end - start;
-
-  if (seq_len <= 0 || num_rows_req <= 0) {
-    return;
-  }
-
-  const int32_t pos_offset = seq_len - end;
-  for (int32_t row_local = threadIdx.x; row_local < num_rows_req; row_local += blockDim.x) {
-    const int32_t row = start + row_local;
-    const int32_t token_pos = row + pos_offset;
-    const int64_t block_idx = token_pos / block_size;
-    const int32_t block_row = token_pos - block_idx * block_size;
-    const int64_t phys_block =
-        static_cast<int64_t>(kvcache_indices[req * stride_kvi_r + block_idx * stride_kvi_b]);
-    positions[row] = token_pos;
-    slot_indices[row] = phys_block * block_size + block_row;
-    req_ids[row] = req;
-    local_idx[row] = row_local;
-  }
-}
-
-// One thread per row: resolve req -> (token_pos, packed slot) exactly once, so
-// the heavy fused kernel's num_q_heads warps-per-row can just load these values
-// instead of each re-running the req guess (two runtime 64-bit divisions) and
-// the kvcache_indices lookup. slot = phys_block*block_size + block_row, or -1
-// when the row maps to no valid KV slot. Cheap (a few ops/row) and fully
-// parallel over rows, so it adds negligible time to prefill.
-__global__ void compute_row_meta_kernel_hip(
+__global__ void compute_row_meta_kernel(
     const int32_t* __restrict__ q_index,
     const int32_t* __restrict__ num_seqlen_per_req,
     const int32_t* __restrict__ kvcache_indices,
@@ -444,8 +458,9 @@ __global__ void compute_row_meta_kernel_hip(
       (seq_len > 0) ? static_cast<int32_t>(row + seq_len - req_end) : 0;
   int64_t slot = -1;
   if (seq_len > 0 && req_end > req_start) {
-    const int64_t block_idx = token_pos / block_size;
-    const int32_t block_row = static_cast<int32_t>(token_pos - block_idx * block_size);
+    const int bs_log = __builtin_ctz(static_cast<unsigned>(block_size));
+    const int64_t block_idx = token_pos >> bs_log;
+    const int32_t block_row = static_cast<int32_t>(token_pos & (block_size - 1));
     const int64_t phys_block = static_cast<int64_t>(
         kvcache_indices[req * stride_kvi_r + block_idx * stride_kvi_b]);
     const int64_t s = phys_block * block_size + block_row;
@@ -460,7 +475,7 @@ __global__ void compute_row_meta_kernel_hip(
 template <bool CosSinBF16, bool WeightBF16, bool HadamardBF16, bool DecodeOneToken,
           int BSIZE = 0, int KCX = 0, int KSL = 0, bool CONTIG = false,
           bool USE_META = false>
-__global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
+__global__ void rope_norm_store_kv_fp8_fused_kernel(
     const __hip_bfloat16* __restrict__ qkv,
     const void* __restrict__ cos_sin,
     const int32_t* __restrict__ q_index,
@@ -511,8 +526,7 @@ __global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
     int64_t k_scale_l,
     int64_t k_cache_x,
     const int32_t* __restrict__ row_token_pos,
-    const int64_t* __restrict__ row_slot_meta,
-    int64_t max_pos) {
+    const int64_t* __restrict__ row_slot_meta) {
   const int warp_id = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x & (kWarpSize - 1);
   const int64_t global_warp = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp_id;
@@ -529,7 +543,7 @@ __global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
   if constexpr (USE_META) {
     // Prefill path: token_pos and the packed slot (= phys_block*block_size +
     // block_row, or -1 when invalid) are precomputed once per row by
-    // compute_row_meta_kernel_hip. This removes the per-warp req lookup -- including
+    // compute_row_meta_kernel. This removes the per-warp req lookup -- including
     // the two runtime 64-bit divisions in the guess -- which was otherwise
     // recomputed redundantly by every one of the num_q_heads warps of a row.
     token_pos = row_token_pos[row];
@@ -540,8 +554,9 @@ __global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
       phys_block = slot >> kBsLog;
       block_row = static_cast<int32_t>(slot & (BSIZE - 1));
     } else {
-      phys_block = (block_size > 0) ? (slot / block_size) : 0;
-      block_row = static_cast<int32_t>(slot - phys_block * block_size);
+      const int bs_log = __builtin_ctz(static_cast<unsigned>(block_size));
+      phys_block = slot >> bs_log;
+      block_row = static_cast<int32_t>(slot & (block_size - 1));
     }
   } else {
     int64_t req;
@@ -591,6 +606,7 @@ __global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
   const int cos_kind = CosSinBF16 ? kBFloat16 : kFloat32;
   const int weight_kind = WeightBF16 ? kBFloat16 : kFloat32;
   const float had_scale = hadamard_scale_128();
+  const float fp8_max_inv = fast_rcp(fp8_max);
   (void)hadamard;
 
   // Effective innermost strides: for the standard contiguous vLLM layout these
@@ -603,47 +619,53 @@ __global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
   const int64_t es_kc_x = CONTIG ? 1 : stride_kc_x;
   const int64_t es_vc_t = CONTIG ? 1 : stride_vc_t;
 
+  // 2+2 register<->head_dim layout (see tiled kernel for the full rationale):
+  //   d(i) = lane*2 + (i&1) + 64*(i>>1)
+  // keeps RoPE rotate-half in-register (i<->i+2) while making (i0,i1)/(i2,i3)
+  // contiguous so qkv loads coalesce as bf16x2 and fp8 stores emit one b16/pair.
   float q_vals[4];
   float local_sq = 0.0f;
+  const int64_t q_hb = row * stride_qkv_t + hq * kHeadDim * es_qkv_d;
+  if constexpr (CONTIG) {
+    const __hip_bfloat162 p0 = *reinterpret_cast<const __hip_bfloat162*>(&qkv[q_hb + lane * 2]);
+    const __hip_bfloat162 p1 = *reinterpret_cast<const __hip_bfloat162*>(&qkv[q_hb + lane * 2 + 64]);
+    q_vals[0] = static_cast<float>(p0.x); q_vals[1] = static_cast<float>(p0.y);
+    q_vals[2] = static_cast<float>(p1.x); q_vals[3] = static_cast<float>(p1.y);
+  } else {
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
-    const int64_t off = row * stride_qkv_t + (hq * kHeadDim + d) * es_qkv_d;
-    const float x = static_cast<float>(qkv[off]);
-    q_vals[i] = x;
-    local_sq += x * x;
+    for (int i = 0; i < 4; ++i) {
+      const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
+      q_vals[i] = static_cast<float>(qkv[q_hb + d * es_qkv_d]);
+    }
   }
-  const float q_rms = sqrtf(warp_sum(local_sq) / static_cast<float>(kHeadDim) + eps);
-  const float q_rms_inv = 1.0f / q_rms;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) local_sq += q_vals[i] * q_vals[i];
+  const float q_rms_inv = rsqrtf(warp_sum(local_sq) / static_cast<float>(kHeadDim) + eps);
 
   // Defer the uniform 1/rms factor: it is linear through RoPE + Hadamard, so it
   // cancels in the quantized output and only re-enters the stored scale. This
   // removes a per-element divide from the hot path.
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
+    const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
     const float w = load_scalar_f32(q_norm_weight, weight_kind, d);
     q_vals[i] = q_vals[i] * w;
   }
 
-  // Defensive clamp (parity with the Triton OOB fix 8bb3ead9): a malformed or
-  // padded row could carry token_pos >= cos table length. Reading row 0
-  // (cos=1, sin=0) makes rope a no-op and avoids an out-of-bounds cos/sin read.
-  const int32_t cos_pos = (token_pos >= 0 && token_pos < max_pos) ? token_pos : 0;
   float rope_cos[4];
   float rope_sin[4];
   float q_hadamard[4];
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
+    const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
     // NeoX rotate-half partner is x[d +/- 64], i.e. register i+/-2 in the same
-    // lane. d = lane + i*32 with lane in [0,31] => (d<64) == (i<2) is a
-    // compile-time fact for each unrolled i. Spelling it as (i<2) keeps the
-    // partner index a constant so the compiler avoids a dynamic-VGPR select
-    // tree (the source of ~170 v_cndmask in the old build).
+    // lane (the (i>>1) term in d is exactly the +64 half-offset). lane in [0,31]
+    // => (d<64) == (i<2) is a compile-time fact for each unrolled i. Spelling it
+    // as (i<2) keeps the partner index a constant so the compiler avoids a
+    // dynamic-VGPR select tree (the source of ~170 v_cndmask in the old build).
     const float rotated = (i < 2) ? -q_vals[i + 2] : q_vals[i - 2];
     const int d_mod = d & 63;
-    const int64_t cos_off = cos_pos * stride_cos_t + d_mod * es_cos_d;
+    const int64_t cos_off = token_pos * stride_cos_t + d_mod * es_cos_d;
     rope_cos[i] = load_scalar_f32(cos_sin, cos_kind, cos_off);
     rope_sin[i] = load_scalar_f32(cos_sin, cos_kind, cos_off + 64 * es_cos_d);
     // had_scale is deferred: it is a uniform scalar and FWHT is linear, so it
@@ -662,16 +684,22 @@ __global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
     q_abs = fmaxf(q_abs, fabsf(q_hadamard[i]));
   }
   const float q_amax = warp_max(q_abs) * q_rms_had;
-  const float q_scale = fmaxf(q_amax / fp8_max, 1.0e-12f);
+  const float q_scale = fmaxf(q_amax * fp8_max_inv, 1.0e-12f);
   if (lane == 0) {
     q_scale_out[row * stride_qs_t + hq * stride_qs_h] = q_scale;
   }
-  const float q_inv_scale = q_rms_had / q_scale;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
-    const int64_t off = row * stride_out_q_t + hq * stride_out_q_h + d * es_oq_d;
-    out_q[off] = float_to_fp8_byte(q_hadamard[i] * q_inv_scale, fp8_max);
+  const float q_inv_scale = q_rms_had * fast_rcp(q_scale);
+  const int64_t oq_h = row * stride_out_q_t + hq * stride_out_q_h;
+  const uint32_t qp01 = float2_to_fp8x2(q_hadamard[0] * q_inv_scale, q_hadamard[1] * q_inv_scale);
+  const uint32_t qp23 = float2_to_fp8x2(q_hadamard[2] * q_inv_scale, q_hadamard[3] * q_inv_scale);
+  if constexpr (CONTIG) {
+    *reinterpret_cast<uint16_t*>(&out_q[oq_h + lane * 2]) = (uint16_t)qp01;
+    *reinterpret_cast<uint16_t*>(&out_q[oq_h + lane * 2 + 64]) = (uint16_t)qp23;
+  } else {
+    out_q[oq_h + (lane * 2) * es_oq_d] = (uint8_t)(qp01);
+    out_q[oq_h + (lane * 2 + 1) * es_oq_d] = (uint8_t)(qp01 >> 8);
+    out_q[oq_h + (lane * 2 + 64) * es_oq_d] = (uint8_t)(qp23);
+    out_q[oq_h + (lane * 2 + 65) * es_oq_d] = (uint8_t)(qp23 >> 8);
   }
 
   if (hq >= num_kv_heads) {
@@ -681,21 +709,27 @@ __global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
   const int64_t q_dim = num_q_heads * kHeadDim;
   const int64_t k_off_base = q_dim + hq * kHeadDim;
   float k_vals[4];
+  const int64_t k_hb = row * stride_qkv_t + k_off_base * es_qkv_d;
+  if constexpr (CONTIG) {
+    const __hip_bfloat162 p0 = *reinterpret_cast<const __hip_bfloat162*>(&qkv[k_hb + lane * 2]);
+    const __hip_bfloat162 p1 = *reinterpret_cast<const __hip_bfloat162*>(&qkv[k_hb + lane * 2 + 64]);
+    k_vals[0] = static_cast<float>(p0.x); k_vals[1] = static_cast<float>(p0.y);
+    k_vals[2] = static_cast<float>(p1.x); k_vals[3] = static_cast<float>(p1.y);
+  } else {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
+      k_vals[i] = static_cast<float>(qkv[k_hb + d * es_qkv_d]);
+    }
+  }
   local_sq = 0.0f;
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
-    const int64_t off = row * stride_qkv_t + (k_off_base + d) * es_qkv_d;
-    const float x = static_cast<float>(qkv[off]);
-    k_vals[i] = x;
-    local_sq += x * x;
-  }
-  const float k_rms = sqrtf(warp_sum(local_sq) / static_cast<float>(kHeadDim) + eps);
-  const float k_rms_inv = 1.0f / k_rms;
+  for (int i = 0; i < 4; ++i) local_sq += k_vals[i] * k_vals[i];
+  const float k_rms_inv = rsqrtf(warp_sum(local_sq) / static_cast<float>(kHeadDim) + eps);
 
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
+    const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
     const float w = load_scalar_f32(k_norm_weight, weight_kind, d);
     k_vals[i] = k_vals[i] * w;
   }
@@ -716,8 +750,8 @@ __global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
   }
 
   const float k_amax = warp_max(k_abs) * k_rms_had;
-  const float k_scale_dyn = fmaxf(k_amax / fp8_max, 1.0e-12f);
-  const float k_inv_scale = k_rms_had / k_scale_dyn;
+  const float k_scale_dyn = fmaxf(k_amax * fp8_max_inv, 1.0e-12f);
+  const float k_inv_scale = k_rms_had * fast_rcp(k_scale_dyn);
   if (lane == 0 && valid_row) {
     const int r_idx = idiv<KSL>(block_row, static_cast<int>(k_scale_l));
     const int l_idx = imod<KSL>(block_row, static_cast<int>(k_scale_l));
@@ -726,22 +760,26 @@ __global__ void rope_norm_store_kv_fp8_fused_kernel_hip(
     k_scale[ks_off] = k_scale_dyn;
   }
 
+  const uint32_t kp01 = float2_to_fp8x2(k_hadamard[0] * k_inv_scale, k_hadamard[1] * k_inv_scale);
+  const uint32_t kp23 = float2_to_fp8x2(k_hadamard[2] * k_inv_scale, k_hadamard[3] * k_inv_scale);
+  const uint8_t kb[4] = {(uint8_t)(kp01), (uint8_t)(kp01 >> 8),
+                         (uint8_t)(kp23), (uint8_t)(kp23 >> 8)};
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
+    const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
     if (valid_row) {
       const int k_group = idiv<KCX>(d, static_cast<int>(k_cache_x));
       const int k_x = imod<KCX>(d, static_cast<int>(k_cache_x));
       const int64_t kc_off = phys_block * stride_kc_b + hq * stride_kc_h +
                              k_group * stride_kc_g + block_row * stride_kc_t +
                              k_x * es_kc_x;
-      key_cache[kc_off] = float_to_fp8_byte(k_hadamard[i] * k_inv_scale, fp8_max);
+      key_cache[kc_off] = kb[i];
     }
   }
 
   const int64_t k_dim = num_kv_heads * kHeadDim;
   const int64_t v_off_base = q_dim + k_dim + hq * v_head_dim;
-  const float v_scale_inv = 1.0f / v_scale[hq];
+  const float v_scale_inv = fast_rcp(v_scale[hq]);
   const int v_iters = static_cast<int>((v_head_dim + kWarpSize - 1) / kWarpSize);
   for (int i = 0; i < v_iters; ++i) {
     const int d = lane + i * kWarpSize;
@@ -796,8 +834,9 @@ __device__ __forceinline__ RowMeta compute_row_meta(
     m.token_pos = (seq_len > 0) ? static_cast<int32_t>(row + seq_len - req_end) : 0;
   }
   if (seq_len > 0 && req_end > req_start) {
-    const int64_t block_idx = m.token_pos / block_size;
-    m.block_row = static_cast<int32_t>(m.token_pos - block_idx * block_size);
+    const int bs_log = __builtin_ctz(static_cast<unsigned>(block_size));
+    const int64_t block_idx = m.token_pos >> bs_log;
+    m.block_row = static_cast<int32_t>(m.token_pos & (block_size - 1));
     m.phys_block = static_cast<int64_t>(
         kvcache_indices[req * stride_kvi_r + block_idx * stride_kvi_b]);
     const int64_t slot = m.phys_block * block_size + m.block_row;
@@ -811,9 +850,17 @@ __device__ __forceinline__ RowMeta compute_row_meta(
 // SALU/addressing), and the HPW heads' FWHT + reductions run interleaved
 // (HPW*4-way ILP) to hide the ds_swizzle latency. Requires num_q_heads % HPW
 // == 0 and num_kv_heads % HPW == 0 so a head-group is uniformly K-active.
+#ifndef TILED_LB_MINW
+#define TILED_LB_MINW 0
+#endif
+#if TILED_LB_MINW > 0
+#define TILED_LB __launch_bounds__(128, TILED_LB_MINW)
+#else
+#define TILED_LB
+#endif
 template <bool CosSinBF16, bool WeightBF16, bool HadamardBF16, bool DecodeOneToken, int HPW,
           int BSIZE = 0, int KCX = 0, int KSL = 0, bool CONTIG = false, bool USE_META = false>
-__global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
+__global__ void TILED_LB rope_norm_store_kv_fp8_fused_tiled_kernel(
     const __hip_bfloat16* __restrict__ qkv,
     const void* __restrict__ cos_sin,
     const int32_t* __restrict__ q_index,
@@ -841,8 +888,7 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
     int64_t num_q_heads, int64_t num_kv_heads, int64_t v_head_dim,
     int64_t block_size, int64_t k_scale_l, int64_t k_cache_x,
     const int32_t* __restrict__ row_token_pos,
-    const int64_t* __restrict__ row_slot_meta,
-    int64_t max_pos) {
+    const int64_t* __restrict__ row_slot_meta) {
   const int warp_id = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x & (kWarpSize - 1);
   const int64_t head_groups = num_q_heads / HPW;
@@ -856,7 +902,7 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
   RowMeta meta{0, 0, 0, false};
   if constexpr (USE_META) {
     // Prefill: per-row (token_pos, packed slot) precomputed once by
-    // compute_row_meta_kernel_hip -> the head-group warps just load them.
+    // compute_row_meta_kernel -> the head-group warps just load them.
     meta.token_pos = row_token_pos[row];
     const int64_t slot = row_slot_meta[row];
     meta.valid = slot >= 0;
@@ -865,22 +911,21 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
       meta.phys_block = slot >> kBsLog;
       meta.block_row = static_cast<int32_t>(slot & (BSIZE - 1));
     } else {
-      meta.phys_block = (block_size > 0) ? (slot / block_size) : 0;
-      meta.block_row = static_cast<int32_t>(slot - meta.phys_block * block_size);
+      const int bs_log = __builtin_ctz(static_cast<unsigned>(block_size));
+      meta.phys_block = slot >> bs_log;
+      meta.block_row = static_cast<int32_t>(slot & (block_size - 1));
     }
   } else {
     meta = compute_row_meta<DecodeOneToken>(
         row, q_index, num_seqlen_per_req, kvcache_indices, num_req, num_rows,
         total_num_kv_cache_tokens, stride_kvi_r, stride_kvi_b, block_size);
   }
-  // Defensive clamp (parity with the Triton OOB fix 8bb3ead9): out-of-range
-  // token_pos reads cos row 0 (cos=1, sin=0) -> rope no-op, never OOB.
-  const int32_t token_pos =
-      (meta.token_pos >= 0 && meta.token_pos < max_pos) ? meta.token_pos : 0;
+  const int32_t token_pos = meta.token_pos;
 
   const int cos_kind = CosSinBF16 ? kBFloat16 : kFloat32;
   const int weight_kind = WeightBF16 ? kBFloat16 : kFloat32;
   const float had_scale = hadamard_scale_128();
+  const float fp8_max_inv = fast_rcp(fp8_max);  // one rcp, reused by every head
   (void)hadamard;
 
   const int64_t es_qkv_d = CONTIG ? 1 : stride_qkv_d;
@@ -890,15 +935,35 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
   const int64_t es_vc_t = CONTIG ? 1 : stride_vc_t;
 
   // cos/sin + q norm weight are identical for every head of this row.
+  // 2+2 register<->head_dim layout: reg i owns head_dim index
+  //   d(i) = lane*2 + (i&1) + 64*(i>>1)
+  // This keeps RoPE rotate-half (j <-> j+64) inside registers (i <-> i+2, since
+  // the (i>>1) term is exactly the +64 half-offset) AND makes the pair (i0,i1)
+  // and (i2,i3) CONTIGUOUS in head_dim, so qkv loads coalesce as bf16x2 dwords
+  // and fp8 stores emit one b16 per pair (the packed v_cvt_pk_fp8_f32 output).
+  // The FWHT is bit-separable so this permutation is bit-exact vs the strided
+  // lane+32*i layout (intra-lane combines output bits {0,6}, cross-lane bits
+  // 1..5; verified by the cmp_ref / abkit correctness checks).
   float rope_cos[4], rope_sin[4], qw[4];
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
+    const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
     const int dm = d & 63;
     const int64_t coff = token_pos * stride_cos_t + dm * es_cos_d;
     rope_cos[i] = load_scalar_f32(cos_sin, cos_kind, coff);
     rope_sin[i] = load_scalar_f32(cos_sin, cos_kind, coff + 64 * es_cos_d);
     qw[i] = load_scalar_f32(q_norm_weight, weight_kind, d);
+  }
+  // Fold the (uniform-per-row) RMSNorm weight into the RoPE coefficients ONCE
+  // per row, so the per-head loop drops its `qv *= qw` multiply (amortized over
+  // HPW heads). qh[i] = qv[i]*qw[i]*cos[i] +/- qv[i±2]*qw[i±2]*sin[i]
+  //         = qv[i]*qwc[i] +/- qv[i±2]*qws[i], with the rotate using RAW qv.
+  // qws carries the PARTNER's weight: partner(i) = (i+2)&3. Algebraically exact.
+  float qwc[4], qws[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    qwc[i] = qw[i] * rope_cos[i];
+    qws[i] = qw[(i + 2) & 3] * rope_sin[i];
   }
 
   // ===== Q (HPW heads interleaved) =====
@@ -906,32 +971,39 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
   float qsq[HPW];
 #pragma unroll
   for (int h = 0; h < HPW; ++h) {
+    const int64_t hb = row * stride_qkv_t + (hq_base + h) * kHeadDim * es_qkv_d;
+    if constexpr (CONTIG) {
+      // contiguous bf16x2 loads of the two RoPE-pair dwords (d=lane*2, lane*2+64)
+      const __hip_bfloat162 p0 = *reinterpret_cast<const __hip_bfloat162*>(&qkv[hb + lane * 2]);
+      const __hip_bfloat162 p1 = *reinterpret_cast<const __hip_bfloat162*>(&qkv[hb + lane * 2 + 64]);
+      qv[h][0] = static_cast<float>(p0.x); qv[h][1] = static_cast<float>(p0.y);
+      qv[h][2] = static_cast<float>(p1.x); qv[h][3] = static_cast<float>(p1.y);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
+        qv[h][i] = static_cast<float>(qkv[hb + d * es_qkv_d]);
+      }
+    }
     float s = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int d = lane + i * kWarpSize;
-      const float x = static_cast<float>(
-          qkv[row * stride_qkv_t + ((hq_base + h) * kHeadDim + d) * es_qkv_d]);
-      qv[h][i] = x;
-      s += x * x;
-    }
+    for (int i = 0; i < 4; ++i) s += qv[h][i] * qv[h][i];
     qsq[h] = s;
   }
   warp_sum_multi<HPW>(qsq);
   float q_rms_inv[HPW];
 #pragma unroll
-  for (int h = 0; h < HPW; ++h) q_rms_inv[h] = 1.0f / sqrtf(qsq[h] / static_cast<float>(kHeadDim) + eps);
+  for (int h = 0; h < HPW; ++h) q_rms_inv[h] = rsqrtf(qsq[h] / static_cast<float>(kHeadDim) + eps);
 
   float qh[HPW][4];
 #pragma unroll
   for (int h = 0; h < HPW; ++h) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) qv[h][i] *= qw[i];
-#pragma unroll
     for (int i = 0; i < 4; ++i) {
+      // RAW qv for both the direct and rotate terms; weight is folded into
+      // qwc/qws above. had_scale deferred into the per-head scale below.
       const float rot = (i < 2) ? -qv[h][i + 2] : qv[h][i - 2];
-      // had_scale deferred into the per-head scale below.
-      qh[h][i] = qv[h][i] * rope_cos[i] + rot * rope_sin[i];
+      qh[h][i] = qv[h][i] * qwc[i] + rot * qws[i];
     }
   }
   fwht128_regs_multi<HPW>(qh, lane);
@@ -950,14 +1022,20 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
     const int64_t hq = hq_base + h;
     const float q_rms_had = q_rms_inv[h] * had_scale;
     const float q_amax = qabs[h] * q_rms_had;
-    const float q_scale = fmaxf(q_amax / fp8_max, 1.0e-12f);
+    const float q_scale = fmaxf(q_amax * fp8_max_inv, 1.0e-12f);
     if (lane == 0) q_scale_out[row * stride_qs_t + hq * stride_qs_h] = q_scale;
-    const float q_inv = q_rms_had / q_scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int d = lane + i * kWarpSize;
-      out_q[row * stride_out_q_t + hq * stride_out_q_h + d * es_oq_d] =
-          float_to_fp8_byte(qh[h][i] * q_inv, fp8_max);
+    const float q_inv = q_rms_had * fast_rcp(q_scale);
+    const int64_t oq_h = row * stride_out_q_t + hq * stride_out_q_h;
+    const uint32_t qp01 = float2_to_fp8x2(qh[h][0] * q_inv, qh[h][1] * q_inv);
+    const uint32_t qp23 = float2_to_fp8x2(qh[h][2] * q_inv, qh[h][3] * q_inv);
+    if constexpr (CONTIG) {
+      *reinterpret_cast<uint16_t*>(&out_q[oq_h + lane * 2]) = (uint16_t)qp01;
+      *reinterpret_cast<uint16_t*>(&out_q[oq_h + lane * 2 + 64]) = (uint16_t)qp23;
+    } else {
+      out_q[oq_h + (lane * 2) * es_oq_d] = (uint8_t)(qp01);
+      out_q[oq_h + (lane * 2 + 1) * es_oq_d] = (uint8_t)(qp01 >> 8);
+      out_q[oq_h + (lane * 2 + 64) * es_oq_d] = (uint8_t)(qp23);
+      out_q[oq_h + (lane * 2 + 65) * es_oq_d] = (uint8_t)(qp23 >> 8);
     }
   }
 
@@ -974,7 +1052,7 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
   const int64_t k_dim = num_kv_heads * kHeadDim;
   float kw[4];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) kw[i] = load_scalar_f32(k_norm_weight, weight_kind, lane + i * kWarpSize);
+  for (int i = 0; i < 4; ++i) kw[i] = load_scalar_f32(k_norm_weight, weight_kind, lane * 2 + (i & 1) + 64 * (i >> 1));
 
 #pragma unroll
   for (int h = 0; h < HPW; ++h) {
@@ -983,16 +1061,23 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
       continue;
     }
     float kv[4];
+    const int64_t kb_in = row * stride_qkv_t + (q_dim + hq * kHeadDim) * es_qkv_d;
+    if constexpr (CONTIG) {
+      const __hip_bfloat162 p0 = *reinterpret_cast<const __hip_bfloat162*>(&qkv[kb_in + lane * 2]);
+      const __hip_bfloat162 p1 = *reinterpret_cast<const __hip_bfloat162*>(&qkv[kb_in + lane * 2 + 64]);
+      kv[0] = static_cast<float>(p0.x); kv[1] = static_cast<float>(p0.y);
+      kv[2] = static_cast<float>(p1.x); kv[3] = static_cast<float>(p1.y);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
+        kv[i] = static_cast<float>(qkv[kb_in + d * es_qkv_d]);
+      }
+    }
     float ksq = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int d = lane + i * kWarpSize;
-      const float x = static_cast<float>(
-          qkv[row * stride_qkv_t + (q_dim + hq * kHeadDim + d) * es_qkv_d]);
-      kv[i] = x;
-      ksq += x * x;
-    }
-    const float k_rms_inv = 1.0f / sqrtf(warp_sum(ksq) / static_cast<float>(kHeadDim) + eps);
+    for (int i = 0; i < 4; ++i) ksq += kv[i] * kv[i];
+    const float k_rms_inv = rsqrtf(warp_sum(ksq) / static_cast<float>(kHeadDim) + eps);
     float kh[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) kv[i] *= kw[i];
@@ -1007,28 +1092,31 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
     for (int i = 0; i < 4; ++i) kabs = fmaxf(kabs, fabsf(kh[i]));
     const float k_rms_had = k_rms_inv * had_scale;
     const float k_amax = warp_max(kabs) * k_rms_had;
-    const float k_scale_dyn = fmaxf(k_amax / fp8_max, 1.0e-12f);
-    const float k_inv = k_rms_had / k_scale_dyn;
+    const float k_scale_dyn = fmaxf(k_amax * fp8_max_inv, 1.0e-12f);
+    const float k_inv = k_rms_had * fast_rcp(k_scale_dyn);
     if (lane == 0 && meta.valid) {
       const int r_idx = idiv<KSL>(meta.block_row, static_cast<int>(k_scale_l));
       const int l_idx = imod<KSL>(meta.block_row, static_cast<int>(k_scale_l));
       k_scale[meta.phys_block * stride_ks_b + r_idx * stride_ks_r + hq * stride_ks_h +
               l_idx * stride_ks_l] = k_scale_dyn;
     }
+    const uint32_t kp01 = float2_to_fp8x2(kh[0] * k_inv, kh[1] * k_inv);
+    const uint32_t kp23 = float2_to_fp8x2(kh[2] * k_inv, kh[3] * k_inv);
+    const uint8_t kb[4] = {(uint8_t)(kp01), (uint8_t)(kp01 >> 8),
+                           (uint8_t)(kp23), (uint8_t)(kp23 >> 8)};
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      const int d = lane + i * kWarpSize;
+      const int d = lane * 2 + (i & 1) + 64 * (i >> 1);
       if (meta.valid) {
         const int kg = idiv<KCX>(d, static_cast<int>(k_cache_x));
         const int kx = imod<KCX>(d, static_cast<int>(k_cache_x));
         key_cache[meta.phys_block * stride_kc_b + hq * stride_kc_h + kg * stride_kc_g +
-                  meta.block_row * stride_kc_t + kx * es_kc_x] =
-            float_to_fp8_byte(kh[i] * k_inv, fp8_max);
+                  meta.block_row * stride_kc_t + kx * es_kc_x] = kb[i];
       }
     }
     // V (no Hadamard)
     const int64_t v_off_base = q_dim + k_dim + hq * v_head_dim;
-    const float v_scale_inv = 1.0f / v_scale[hq];
+    const float v_scale_inv = fast_rcp(v_scale[hq]);
     const int v_iters = static_cast<int>((v_head_dim + kWarpSize - 1) / kWarpSize);
     for (int it = 0; it < v_iters; ++it) {
       const int d = lane + it * kWarpSize;
@@ -1042,550 +1130,6 @@ __global__ void rope_norm_store_kv_fp8_fused_tiled_kernel_hip(
   }
 }
 
-// ===================== MFMA Hadamard variant =====================
-// Block = 512 threads (16 warps of 32 = 8 wavefronts of 64); processes a
-// BLOCK_T=16 row tile of ONE q-head. Phase split:
-//   (1) per-row (warp32) RMSNorm + RoPE -> bf16 tile in LDS
-//   (2) 8 wavefronts do the [16,128]@[128,128] Hadamard via MFMA (1 N-tile/wave)
-//   (3) per-row (warp32) amax + FP8 quant + store
-// RoPE/norm/quant logic mirrors the shuffle kernel; only the Hadamard moves to
-// the matrix cores. RMSNorm 1/rms is deferred into the final scale (same trick).
-template <bool CosSinBF16, bool WeightBF16, bool HadamardBF16, bool DecodeOneToken>
-__global__ __launch_bounds__(512) void rope_norm_store_kv_fp8_fused_mfma_kernel_hip(
-    const __hip_bfloat16* __restrict__ qkv,
-    const void* __restrict__ cos_sin,
-    const int32_t* __restrict__ q_index,
-    const int32_t* __restrict__ num_seqlen_per_req,
-    const int32_t* __restrict__ kvcache_indices,
-    const void* __restrict__ q_norm_weight,
-    const void* __restrict__ k_norm_weight,
-    const void* __restrict__ hadamard,
-    float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
-    uint8_t* __restrict__ out_q,
-    uint8_t* __restrict__ key_cache,
-    uint8_t* __restrict__ value_cache,
-    float* __restrict__ q_scale_out,
-    int64_t num_rows,
-    int64_t num_req,
-    int64_t total_num_kv_cache_tokens,
-    float eps,
-    float fp8_max,
-    int64_t stride_qkv_t, int64_t stride_qkv_d,
-    int64_t stride_cos_t, int64_t stride_cos_d,
-    int64_t stride_kvi_r, int64_t stride_kvi_b,
-    int64_t stride_out_q_t, int64_t stride_out_q_h, int64_t stride_out_q_d,
-    int64_t stride_kc_b, int64_t stride_kc_h, int64_t stride_kc_g, int64_t stride_kc_t, int64_t stride_kc_x,
-    int64_t stride_vc_b, int64_t stride_vc_h, int64_t stride_vc_d, int64_t stride_vc_t,
-    int64_t stride_ks_b, int64_t stride_ks_r, int64_t stride_ks_h, int64_t stride_ks_l,
-    int64_t stride_qs_t, int64_t stride_qs_h,
-    int64_t num_q_heads, int64_t num_kv_heads, int64_t v_head_dim,
-    int64_t block_size, int64_t k_scale_l, int64_t k_cache_x) {
-  using namespace rocwmma;
-  constexpr int BT = 16;
-  const int warp32 = threadIdx.x >> 5;   // 0..15 -> row in tile
-  const int lane = threadIdx.x & 31;
-  const int64_t hq = blockIdx.y;
-  const int64_t row = static_cast<int64_t>(blockIdx.x) * BT + warp32;
-  const bool row_in_range = row < num_rows;
-
-  __shared__ __hip_bfloat16 qS[BT * kHeadDim];   // RoPE'd tile (reused for K)
-  __shared__ float qO[BT * kHeadDim];            // Hadamard output (reused for K)
-  __shared__ __hip_bfloat16 Hs[kHeadDim * kHeadDim];
-  __shared__ float rms_inv_s[BT];
-  __shared__ int64_t phys_s[BT];
-  __shared__ int32_t brow_s[BT];
-  __shared__ int32_t valid_s[BT];
-
-  for (int i = threadIdx.x; i < kHeadDim * kHeadDim; i += blockDim.x)
-    Hs[i] = reinterpret_cast<const __hip_bfloat16*>(hadamard)[i];
-
-  const int cos_kind = CosSinBF16 ? kBFloat16 : kFloat32;
-  const int weight_kind = WeightBF16 ? kBFloat16 : kFloat32;
-
-  // ---- per-row metadata (every lane of the warp computes the same values) ----
-  int32_t token_pos = 0;
-  int64_t phys_block = 0;
-  int32_t block_row = 0;
-  bool valid_row = false;
-  if (row_in_range) {
-    int64_t req;
-    int32_t req_start, req_end, seq_len;
-    if constexpr (DecodeOneToken) {
-      req = row;
-      seq_len = num_seqlen_per_req[req];
-      token_pos = (seq_len > 0) ? (seq_len - 1) : 0;
-      req_start = static_cast<int32_t>(row);
-      req_end = static_cast<int32_t>(row + 1);
-    } else {
-      const int64_t qlen_guess = (num_req > 0) ? (num_rows / num_req) : 1;
-      int64_t guess = (qlen_guess > 0) ? (row / qlen_guess) : 0;
-      if (guess >= num_req) guess = num_req - 1;
-      req_start = q_index[guess];
-      req_end = q_index[guess + 1];
-      if (row >= req_start && row < req_end) {
-        req = guess;
-      } else {
-        req = find_req_for_row(q_index, num_req, row);
-        req_start = q_index[req];
-        req_end = q_index[req + 1];
-      }
-      seq_len = num_seqlen_per_req[req];
-      token_pos = (seq_len > 0) ? static_cast<int32_t>(row + seq_len - req_end) : 0;
-    }
-    if (seq_len > 0 && req_end > req_start) {
-      const int64_t block_idx = token_pos / block_size;
-      block_row = static_cast<int32_t>(token_pos - block_idx * block_size);
-      phys_block = static_cast<int64_t>(kvcache_indices[req * stride_kvi_r + block_idx * stride_kvi_b]);
-      const int64_t slot = phys_block * block_size + block_row;
-      valid_row = slot >= 0 && slot < total_num_kv_cache_tokens;
-    }
-  }
-  if (lane == 0) {
-    phys_s[warp32] = phys_block;
-    brow_s[warp32] = block_row;
-    valid_s[warp32] = valid_row ? 1 : 0;
-  }
-
-  // ===================== Q =====================
-  float vals[4];
-  float local_sq = 0.0f;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
-    float x = 0.0f;
-    if (row_in_range) x = static_cast<float>(qkv[row * stride_qkv_t + (hq * kHeadDim + d) * stride_qkv_d]);
-    vals[i] = x;
-    local_sq += x * x;
-  }
-  const float q_rms_inv = 1.0f / sqrtf(warp_sum(local_sq) / static_cast<float>(kHeadDim) + eps);
-  if (lane == 0) rms_inv_s[warp32] = q_rms_inv;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
-    vals[i] *= load_scalar_f32(q_norm_weight, weight_kind, d);
-  }
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
-    const float rot = (i < 2) ? -vals[i + 2] : vals[i - 2];
-    const int dm = d & 63;
-    const int64_t coff = token_pos * stride_cos_t + dm * stride_cos_d;
-    const float c = load_scalar_f32(cos_sin, cos_kind, coff);
-    const float s = load_scalar_f32(cos_sin, cos_kind, coff + 64 * stride_cos_d);
-    qS[warp32 * kHeadDim + d] = static_cast<__hip_bfloat16>(vals[i] * c + rot * s);
-  }
-  __syncthreads();
-  {
-    const int wv = threadIdx.x >> 6;  // 0..7 -> output N-tile
-    fragment<accumulator, 16, 16, 16, float> acc;
-    fill_fragment(acc, 0.0f);
-    const bfloat16_t* A = reinterpret_cast<const bfloat16_t*>(qS);
-    const bfloat16_t* B = reinterpret_cast<const bfloat16_t*>(Hs);
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      fragment<matrix_a, 16, 16, 16, bfloat16_t, row_major> a;
-      fragment<matrix_b, 16, 16, 16, bfloat16_t, row_major> b;
-      load_matrix_sync(a, A + k * 16, kHeadDim);
-      load_matrix_sync(b, B + (k * 16) * kHeadDim + wv * 16, kHeadDim);
-      mma_sync(acc, a, b, acc);
-    }
-    store_matrix_sync(qO + wv * 16, acc, kHeadDim, mem_row_major);
-  }
-  __syncthreads();
-  if (row_in_range) {
-    float h[4];
-    float q_abs = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int d = lane + i * kWarpSize;
-      h[i] = qO[warp32 * kHeadDim + d];
-      q_abs = fmaxf(q_abs, fabsf(h[i]));
-    }
-    const float q_amax = warp_max(q_abs) * q_rms_inv;
-    const float q_scale = fmaxf(q_amax / fp8_max, 1.0e-12f);
-    if (lane == 0) q_scale_out[row * stride_qs_t + hq * stride_qs_h] = q_scale;
-    const float q_inv = q_rms_inv / q_scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int d = lane + i * kWarpSize;
-      const int64_t off = row * stride_out_q_t + hq * stride_out_q_h + d * stride_out_q_d;
-      out_q[off] = float_to_fp8_byte(h[i] * q_inv, fp8_max);
-    }
-  }
-
-  if (hq >= num_kv_heads) return;
-  __syncthreads();  // reuse qS/qO for K
-
-  // ===================== K =====================
-  const int64_t q_dim = num_q_heads * kHeadDim;
-  const int64_t k_off_base = q_dim + hq * kHeadDim;
-  local_sq = 0.0f;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
-    float x = 0.0f;
-    if (row_in_range) x = static_cast<float>(qkv[row * stride_qkv_t + (k_off_base + d) * stride_qkv_d]);
-    vals[i] = x;
-    local_sq += x * x;
-  }
-  const float k_rms_inv = 1.0f / sqrtf(warp_sum(local_sq) / static_cast<float>(kHeadDim) + eps);
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
-    vals[i] *= load_scalar_f32(k_norm_weight, weight_kind, d);
-  }
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int d = lane + i * kWarpSize;
-    const float rot = (i < 2) ? -vals[i + 2] : vals[i - 2];
-    const int dm = d & 63;
-    const int64_t coff = token_pos * stride_cos_t + dm * stride_cos_d;
-    const float c = load_scalar_f32(cos_sin, cos_kind, coff);
-    const float s = load_scalar_f32(cos_sin, cos_kind, coff + 64 * stride_cos_d);
-    qS[warp32 * kHeadDim + d] = static_cast<__hip_bfloat16>(vals[i] * c + rot * s);
-  }
-  __syncthreads();
-  {
-    const int wv = threadIdx.x >> 6;
-    fragment<accumulator, 16, 16, 16, float> acc;
-    fill_fragment(acc, 0.0f);
-    const bfloat16_t* A = reinterpret_cast<const bfloat16_t*>(qS);
-    const bfloat16_t* B = reinterpret_cast<const bfloat16_t*>(Hs);
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      fragment<matrix_a, 16, 16, 16, bfloat16_t, row_major> a;
-      fragment<matrix_b, 16, 16, 16, bfloat16_t, row_major> b;
-      load_matrix_sync(a, A + k * 16, kHeadDim);
-      load_matrix_sync(b, B + (k * 16) * kHeadDim + wv * 16, kHeadDim);
-      mma_sync(acc, a, b, acc);
-    }
-    store_matrix_sync(qO + wv * 16, acc, kHeadDim, mem_row_major);
-  }
-  __syncthreads();
-  if (row_in_range) {
-    const bool valid = valid_s[warp32] != 0;
-    const int64_t pb = phys_s[warp32];
-    const int32_t br = brow_s[warp32];
-    float h[4];
-    float k_abs = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int d = lane + i * kWarpSize;
-      h[i] = qO[warp32 * kHeadDim + d];
-      k_abs = fmaxf(k_abs, fabsf(h[i]));
-    }
-    const float k_amax = warp_max(k_abs) * k_rms_inv;
-    const float k_scale_dyn = fmaxf(k_amax / fp8_max, 1.0e-12f);
-    const float k_inv = k_rms_inv / k_scale_dyn;
-    if (lane == 0 && valid) {
-      const int64_t r_idx = br / k_scale_l;
-      const int64_t l_idx = br - r_idx * k_scale_l;
-      k_scale[pb * stride_ks_b + r_idx * stride_ks_r + hq * stride_ks_h + l_idx * stride_ks_l] = k_scale_dyn;
-    }
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int d = lane + i * kWarpSize;
-      if (valid) {
-        const int64_t kg = d / k_cache_x;
-        const int64_t kx = d - kg * k_cache_x;
-        const int64_t kc = pb * stride_kc_b + hq * stride_kc_h + kg * stride_kc_g +
-                           br * stride_kc_t + kx * stride_kc_x;
-        key_cache[kc] = float_to_fp8_byte(h[i] * k_inv, fp8_max);
-      }
-    }
-  }
-
-  // ===================== V (no Hadamard) =====================
-  if (row_in_range) {
-    const bool valid = valid_s[warp32] != 0;
-    const int64_t pb = phys_s[warp32];
-    const int32_t br = brow_s[warp32];
-    const int64_t k_dim = num_kv_heads * kHeadDim;
-    const int64_t v_off_base = q_dim + k_dim + hq * v_head_dim;
-    const float v_scale_inv = 1.0f / v_scale[hq];
-    const int v_iters = static_cast<int>((v_head_dim + kWarpSize - 1) / kWarpSize);
-    for (int i = 0; i < v_iters; ++i) {
-      const int d = lane + i * kWarpSize;
-      if (d < v_head_dim && valid) {
-        const float v = static_cast<float>(qkv[row * stride_qkv_t + (v_off_base + d) * stride_qkv_d]) * v_scale_inv;
-        const int64_t vc = pb * stride_vc_b + hq * stride_vc_h + d * stride_vc_d + br * stride_vc_t;
-        value_cache[vc] = float_to_fp8_byte(v, fp8_max);
-      }
-    }
-  }
-}
-
-// ===================== MFMA Hadamard variant v2 =====================
-// Fixes the v1 inefficiencies (M=16 cooperative GEMM with 3 block syncs per 16
-// rows + per-block Hs LDS reload):
-//   - each wave is fully independent and owns RPW=16 rows (its own MFMA M-tile),
-//     so there is no inter-wave cooperation on a tile;
-//   - a block packs WPB waves => WPB*16 rows, amortizing setup;
-//   - H is read straight from global (32KB, L2-resident, reused by every block)
-//     so no per-block Hs staging;
-//   - RoPE uses 4 lanes/row (quad) so the RMSNorm / q-amax reductions are pure
-//     DPP quad_perm.
-// Math mirrors the v1 kernel exactly (RMS variance on raw qkv, weight then RoPE,
-// rms_inv folded into the final dynamic quant scale).
-#if defined(MFMA_V2)
-__device__ __forceinline__ float quad_reduce_sum(float v) {
-  v += swz_xor<1>(v);
-  v += swz_xor<2>(v);
-  return v;
-}
-__device__ __forceinline__ float quad_reduce_max(float v) {
-  v = fmaxf(v, swz_xor<1>(v));
-  v = fmaxf(v, swz_xor<2>(v));
-  return v;
-}
-
-template <bool CosSinBF16, bool WeightBF16, bool HadamardBF16, bool DecodeOneToken>
-__global__ __launch_bounds__(256) void rope_norm_store_kv_fp8_fused_mfma2_kernel_hip(
-    const __hip_bfloat16* __restrict__ qkv,
-    const void* __restrict__ cos_sin,
-    const int32_t* __restrict__ q_index,
-    const int32_t* __restrict__ num_seqlen_per_req,
-    const int32_t* __restrict__ kvcache_indices,
-    const void* __restrict__ q_norm_weight,
-    const void* __restrict__ k_norm_weight,
-    const void* __restrict__ hadamard,
-    float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
-    uint8_t* __restrict__ out_q,
-    uint8_t* __restrict__ key_cache,
-    uint8_t* __restrict__ value_cache,
-    float* __restrict__ q_scale_out,
-    int64_t num_rows,
-    int64_t num_req,
-    int64_t total_num_kv_cache_tokens,
-    float eps,
-    float fp8_max,
-    int64_t stride_qkv_t, int64_t stride_qkv_d,
-    int64_t stride_cos_t, int64_t stride_cos_d,
-    int64_t stride_kvi_r, int64_t stride_kvi_b,
-    int64_t stride_out_q_t, int64_t stride_out_q_h, int64_t stride_out_q_d,
-    int64_t stride_kc_b, int64_t stride_kc_h, int64_t stride_kc_g, int64_t stride_kc_t, int64_t stride_kc_x,
-    int64_t stride_vc_b, int64_t stride_vc_h, int64_t stride_vc_d, int64_t stride_vc_t,
-    int64_t stride_ks_b, int64_t stride_ks_r, int64_t stride_ks_h, int64_t stride_ks_l,
-    int64_t stride_qs_t, int64_t stride_qs_h,
-    int64_t num_q_heads, int64_t num_kv_heads, int64_t v_head_dim,
-    int64_t block_size, int64_t k_scale_l, int64_t k_cache_x) {
-  using namespace rocwmma;
-  constexpr int RPW = 16;            // rows per wave (= MFMA M tile)
-#ifndef MFMA2_WPB
-#define MFMA2_WPB 4
-#endif
-  constexpr int WPB = MFMA2_WPB;     // waves per block
-  const int wave = threadIdx.x >> 6;       // 0..WPB-1
-  const int lane = threadIdx.x & 63;       // 0..63
-  const int rowInWave = lane >> 2;         // 0..15
-  const int sub = lane & 3;                // 0..3 (4 lanes/row)
-  const int64_t hq = blockIdx.y;
-  const int64_t row = static_cast<int64_t>(blockIdx.x) * (WPB * RPW) + wave * RPW + rowInWave;
-  const bool row_in_range = row < num_rows;
-
-  __shared__ __hip_bfloat16 qS[WPB * RPW * kHeadDim];  // RoPE'd tile (reused K)
-  __shared__ float qO[WPB * RPW * kHeadDim];           // Hadamard out (reused K)
-
-  const int cos_kind = CosSinBF16 ? kBFloat16 : kFloat32;
-  const int weight_kind = WeightBF16 ? kBFloat16 : kFloat32;
-
-  // ---- per-row metadata (redundant across the 4 lanes of a row) ----
-  int32_t token_pos = 0;
-  int64_t phys_block = 0;
-  int32_t block_row = 0;
-  bool valid_row = false;
-  if (row_in_range) {
-    int64_t req;
-    int32_t req_start, req_end, seq_len;
-    if constexpr (DecodeOneToken) {
-      req = row;
-      seq_len = num_seqlen_per_req[req];
-      token_pos = (seq_len > 0) ? (seq_len - 1) : 0;
-      req_start = static_cast<int32_t>(row);
-      req_end = static_cast<int32_t>(row + 1);
-    } else {
-      const int64_t qlen_guess = (num_req > 0) ? (num_rows / num_req) : 1;
-      int64_t guess = (qlen_guess > 0) ? (row / qlen_guess) : 0;
-      if (guess >= num_req) guess = num_req - 1;
-      req_start = q_index[guess];
-      req_end = q_index[guess + 1];
-      if (row >= req_start && row < req_end) {
-        req = guess;
-      } else {
-        req = find_req_for_row(q_index, num_req, row);
-        req_start = q_index[req];
-        req_end = q_index[req + 1];
-      }
-      seq_len = num_seqlen_per_req[req];
-      token_pos = (seq_len > 0) ? static_cast<int32_t>(row + seq_len - req_end) : 0;
-    }
-    if (seq_len > 0 && req_end > req_start) {
-      const int64_t block_idx = token_pos / block_size;
-      block_row = static_cast<int32_t>(token_pos - block_idx * block_size);
-      phys_block = static_cast<int64_t>(kvcache_indices[req * stride_kvi_r + block_idx * stride_kvi_b]);
-      const int64_t slot = phys_block * block_size + block_row;
-      valid_row = slot >= 0 && slot < total_num_kv_cache_tokens;
-    }
-  }
-
-  const bfloat16_t* Hg = reinterpret_cast<const bfloat16_t*>(hadamard);
-  const int64_t q_dim = num_q_heads * kHeadDim;
-
-  // ============ helper lambda: one head's RoPE -> qS, MFMA -> qO ============
-  // Returns rms_inv for the row. weight_ptr selects q/k norm weight; in_base is
-  // the qkv column offset of this head.
-  auto rope_to_qS = [&](const void* weight_ptr, int64_t in_base) -> float {
-    float xl[16], xh[16];
-    float local_sq = 0.0f;
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-      const int dl = sub * 16 + j;        // 0..63
-      const int dh = 64 + sub * 16 + j;   // 64..127
-      float a = 0.0f, b = 0.0f;
-      if (row_in_range) {
-        a = static_cast<float>(qkv[row * stride_qkv_t + (in_base + dl) * stride_qkv_d]);
-        b = static_cast<float>(qkv[row * stride_qkv_t + (in_base + dh) * stride_qkv_d]);
-      }
-      xl[j] = a; xh[j] = b;
-      local_sq += a * a + b * b;
-    }
-    const float sq = quad_reduce_sum(local_sq);
-    const float rms_inv = 1.0f / sqrtf(sq / static_cast<float>(kHeadDim) + eps);
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-      const int dl = sub * 16 + j;
-      const int dh = 64 + sub * 16 + j;
-      const float wl = load_scalar_f32(weight_ptr, weight_kind, dl);
-      const float wh = load_scalar_f32(weight_ptr, weight_kind, dh);
-      float vl = xl[j] * wl;
-      float vh = xh[j] * wh;
-      const int64_t coff = token_pos * stride_cos_t + dl * stride_cos_d;  // dl<64
-      const float c = load_scalar_f32(cos_sin, cos_kind, coff);
-      const float s = load_scalar_f32(cos_sin, cos_kind, coff + 64 * stride_cos_d);
-      const int base = wave * RPW * kHeadDim + rowInWave * kHeadDim;
-      qS[base + dl] = static_cast<__hip_bfloat16>(vl * c - vh * s);
-      qS[base + dh] = static_cast<__hip_bfloat16>(vh * c + vl * s);
-    }
-    return rms_inv;
-  };
-
-  // MFMA: this wave's 16 rows (qS region) @ H[128,128] -> qO region.
-  auto hadamard_mfma = [&]() {
-    const bfloat16_t* A = reinterpret_cast<const bfloat16_t*>(qS) + wave * RPW * kHeadDim;
-    float* O = qO + wave * RPW * kHeadDim;
-#pragma unroll
-    for (int n = 0; n < 8; ++n) {
-      fragment<accumulator, 16, 16, 16, float> acc;
-      fill_fragment(acc, 0.0f);
-#pragma unroll
-      for (int k = 0; k < 8; ++k) {
-        fragment<matrix_a, 16, 16, 16, bfloat16_t, row_major> a;
-        fragment<matrix_b, 16, 16, 16, bfloat16_t, row_major> b;
-        load_matrix_sync(a, A + k * 16, kHeadDim);
-        load_matrix_sync(b, Hg + (k * 16) * kHeadDim + n * 16, kHeadDim);
-        mma_sync(acc, a, b, acc);
-      }
-      store_matrix_sync(O + n * 16, acc, kHeadDim, mem_row_major);
-    }
-  };
-
-  // ===================== Q =====================
-  const float q_rms_inv = rope_to_qS(q_norm_weight, hq * kHeadDim);
-  __syncthreads();
-  hadamard_mfma();
-  __syncthreads();
-  if (row_in_range) {
-    const int base = wave * RPW * kHeadDim + rowInWave * kHeadDim;
-    float h[32];
-    float q_abs = 0.0f;
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-      h[j] = qO[base + sub * 16 + j];
-      h[16 + j] = qO[base + 64 + sub * 16 + j];
-      q_abs = fmaxf(q_abs, fmaxf(fabsf(h[j]), fabsf(h[16 + j])));
-    }
-    const float q_amax = quad_reduce_max(q_abs) * q_rms_inv;
-    const float q_scale = fmaxf(q_amax / fp8_max, 1.0e-12f);
-    if (sub == 0) q_scale_out[row * stride_qs_t + hq * stride_qs_h] = q_scale;
-    const float q_inv = q_rms_inv / q_scale;
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-      const int dl = sub * 16 + j;
-      const int dh = 64 + sub * 16 + j;
-      out_q[row * stride_out_q_t + hq * stride_out_q_h + dl * stride_out_q_d] =
-          float_to_fp8_byte(h[j] * q_inv, fp8_max);
-      out_q[row * stride_out_q_t + hq * stride_out_q_h + dh * stride_out_q_d] =
-          float_to_fp8_byte(h[16 + j] * q_inv, fp8_max);
-    }
-  }
-
-  if (hq >= num_kv_heads) return;
-
-  // ===================== K =====================
-  __syncthreads();
-  const float k_rms_inv = rope_to_qS(k_norm_weight, q_dim + hq * kHeadDim);
-  __syncthreads();
-  hadamard_mfma();
-  __syncthreads();
-  if (row_in_range && valid_row) {
-    const int base = wave * RPW * kHeadDim + rowInWave * kHeadDim;
-    float h[32];
-    float k_abs = 0.0f;
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-      h[j] = qO[base + sub * 16 + j];
-      h[16 + j] = qO[base + 64 + sub * 16 + j];
-      k_abs = fmaxf(k_abs, fmaxf(fabsf(h[j]), fabsf(h[16 + j])));
-    }
-    const float k_amax = quad_reduce_max(k_abs) * k_rms_inv;
-    const float k_scale_dyn = fmaxf(k_amax / fp8_max, 1.0e-12f);
-    const float k_inv = k_rms_inv / k_scale_dyn;
-    if (sub == 0) {
-      const int64_t r_idx = block_row / k_scale_l;
-      const int64_t l_idx = block_row - r_idx * k_scale_l;
-      k_scale[phys_block * stride_ks_b + r_idx * stride_ks_r + hq * stride_ks_h +
-              l_idx * stride_ks_l] = k_scale_dyn;
-    }
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-      const int dl = sub * 16 + j;
-      const int dh = 64 + sub * 16 + j;
-#pragma unroll
-      for (int two = 0; two < 2; ++two) {
-        const int d = two == 0 ? dl : dh;
-        const float val = two == 0 ? h[j] : h[16 + j];
-        const int64_t kg = d / k_cache_x;
-        const int64_t kx = d - kg * k_cache_x;
-        key_cache[phys_block * stride_kc_b + hq * stride_kc_h + kg * stride_kc_g +
-                  block_row * stride_kc_t + kx * stride_kc_x] =
-            float_to_fp8_byte(val * k_inv, fp8_max);
-      }
-    }
-  }
-
-  // ===================== V (no Hadamard) =====================
-  if (row_in_range && valid_row) {
-    const int64_t k_dim = num_kv_heads * kHeadDim;
-    const int64_t v_off_base = q_dim + k_dim + hq * v_head_dim;
-    const float v_scale_inv = 1.0f / v_scale[hq];
-#pragma unroll
-    for (int j = 0; j < 16; ++j) {
-#pragma unroll
-      for (int two = 0; two < 2; ++two) {
-        const int d = two == 0 ? (sub * 16 + j) : (64 + sub * 16 + j);
-        if (d < v_head_dim) {
-          const float v = static_cast<float>(
-              qkv[row * stride_qkv_t + (v_off_base + d) * stride_qkv_d]) * v_scale_inv;
-          value_cache[phys_block * stride_vc_b + hq * stride_vc_h + d * stride_vc_d +
-                      block_row * stride_vc_t] = float_to_fp8_byte(v, fp8_max);
-        }
-      }
-    }
-  }
-}
-#endif  // MFMA_V2
 
 template <bool WeightBF16, bool HadamardBF16>
 void launch_cos_dispatch(const torch::Tensor& qkv,
@@ -1614,7 +1158,6 @@ void launch_cos_dispatch(const torch::Tensor& qkv,
   const int64_t k_cache_x = key_cache.size(4);
   const int64_t k_scale_l = k_scale.size(3);
   const int64_t total_tokens = key_cache.size(0) * block_size;
-  const int64_t max_pos = cos_sin.size(0);
   const int64_t total_warps = num_rows * num_q_heads;
   const dim3 block(kWarpsPerBlock * kWarpSize);
   const dim3 grid((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
@@ -1638,7 +1181,7 @@ void launch_cos_dispatch(const torch::Tensor& qkv,
     row_slot_ptr = row_slot_t.data_ptr<int64_t>();
     const int meta_threads = 256;
     const dim3 meta_grid((num_rows + meta_threads - 1) / meta_threads);
-    hipLaunchKernelGGL(compute_row_meta_kernel_hip, meta_grid, dim3(meta_threads), 0, stream,
+    hipLaunchKernelGGL(compute_row_meta_kernel, meta_grid, dim3(meta_threads), 0, stream,
                        q_index.data_ptr<int32_t>(), num_seqlen_per_req.data_ptr<int32_t>(),
                        kvcache_indices.data_ptr<int32_t>(), num_rows, num_req, total_tokens,
                        kvcache_indices.stride(0), kvcache_indices.stride(1), block_size,
@@ -1660,22 +1203,22 @@ void launch_cos_dispatch(const torch::Tensor& qkv,
       value_cache.stride(1), value_cache.stride(2), value_cache.stride(3), k_scale.stride(0),       \
       k_scale.stride(1), k_scale.stride(2), k_scale.stride(3), q_scale_out.stride(0),               \
       q_scale_out.stride(1), num_q_heads, num_kv_heads, v_head_dim, block_size, k_scale_l,          \
-      k_cache_x, row_token_pos_ptr, row_slot_ptr, max_pos
+      k_cache_x, row_token_pos_ptr, row_slot_ptr
 #define LAUNCH_DECODE(CB, DEC, BS, KCX, KSL, CTG, META)                                            \
   hipLaunchKernelGGL(                                                                              \
-      (rope_norm_store_kv_fp8_fused_kernel_hip<CB, WeightBF16, HadamardBF16, DEC, BS, KCX, KSL, CTG, META>), \
+      (rope_norm_store_kv_fp8_fused_kernel<CB, WeightBF16, HadamardBF16, DEC, BS, KCX, KSL, CTG, META>), \
       grid, block, smem, stream, DECODE_ARGS)
   // Standard contiguous vLLM layout -> innermost strides are 1.
   const bool contig = qkv.stride(1) == 1 && cos_sin.stride(1) == 1 && out_q.stride(2) == 1 &&
                       key_cache.stride(4) == 1 && value_cache.stride(3) == 1;
-  // Specialize the common (block_size=32, k_cache_x=16, k_scale_l=32) + fully
-  // contiguous layout so addressing div/mod fold to shift/and and the inner
-  // stride multiplies vanish; fall back to the fully-runtime instantiation
-  // for any other shape/layout. META mirrors use_meta (prefill = !decode).
+  // Only CONTIG (innermost-stride==1) needs a compile-time branch: it selects the
+  // vectorized bf16x2/b16 load-store path. The KV-cache div/mod are now runtime
+  // power-of-two shifts (block-size agnostic), so we do NOT specialize on
+  // block_size/k_cache_x/k_scale_l. META mirrors use_meta (prefill = !decode).
 #define LAUNCH_DECODE_DIV(CB, DEC, META)                                                            \
   do {                                                                                             \
-    if (block_size == 32 && k_cache_x == 16 && k_scale_l == 32 && contig)                          \
-      LAUNCH_DECODE(CB, DEC, 32, 16, 32, true, META);                                              \
+    if (contig)                                                                                    \
+      LAUNCH_DECODE(CB, DEC, 0, 0, 0, true, META);                                                 \
     else                                                                                           \
       LAUNCH_DECODE(CB, DEC, 0, 0, 0, false, META);                                                \
   } while (0)
@@ -1708,87 +1251,6 @@ void launch_cos_dispatch(const torch::Tensor& qkv,
   C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
-template <bool WeightBF16, bool HadamardBF16>
-void launch_cos_dispatch_mfma(const torch::Tensor& qkv,
-                              const torch::Tensor& cos_sin,
-                              const torch::Tensor& q_index,
-                              const torch::Tensor& num_seqlen_per_req,
-                              const torch::Tensor& kvcache_indices,
-                              const torch::Tensor& q_norm_weight,
-                              const torch::Tensor& k_norm_weight,
-                              const torch::Tensor& hadamard,
-                              const torch::Tensor& k_scale,
-                              const torch::Tensor& v_scale,
-                              const torch::Tensor& out_q,
-                              const torch::Tensor& key_cache,
-                              const torch::Tensor& value_cache,
-                              const torch::Tensor& q_scale_out,
-                              float eps,
-                              float fp8_max,
-                              bool decode_one_token) {
-  const int64_t num_rows = qkv.size(0);
-  const int64_t num_req = num_seqlen_per_req.size(0);
-  const int64_t num_q_heads = out_q.size(1);
-  const int64_t num_kv_heads = key_cache.size(1);
-  const int64_t v_head_dim = value_cache.size(2);
-  const int64_t block_size = key_cache.size(3);
-  const int64_t k_cache_x = key_cache.size(4);
-  const int64_t k_scale_l = k_scale.size(3);
-  const int64_t total_tokens = key_cache.size(0) * block_size;
-#if defined(MFMA_V2)
-#ifndef MFMA2_WPB
-#define MFMA2_WPB 4
-#endif
-  const int rows_per_block = MFMA2_WPB * 16;
-  const dim3 block(MFMA2_WPB * 64);
-  const dim3 grid(static_cast<unsigned>((num_rows + rows_per_block - 1) / rows_per_block),
-                  static_cast<unsigned>(num_q_heads));
-#else
-  const dim3 block(512);
-  const dim3 grid(static_cast<unsigned>((num_rows + 15) / 16), static_cast<unsigned>(num_q_heads));
-#endif
-  const size_t smem = 0;
-  const auto stream = c10::hip::getCurrentHIPStream();
-#if defined(MFMA_V2)
-#define MFMA_KERNEL rope_norm_store_kv_fp8_fused_mfma2_kernel_hip
-#else
-#define MFMA_KERNEL rope_norm_store_kv_fp8_fused_mfma_kernel_hip
-#endif
-#define MFMA_ARGS                                                                                  \
-  reinterpret_cast<const __hip_bfloat16*>(qkv.data_ptr()), cos_sin.data_ptr(),                     \
-      q_index.data_ptr<int32_t>(), num_seqlen_per_req.data_ptr<int32_t>(),                         \
-      kvcache_indices.data_ptr<int32_t>(), q_norm_weight.data_ptr(), k_norm_weight.data_ptr(),     \
-      hadamard.data_ptr(), k_scale.data_ptr<float>(), v_scale.data_ptr<float>(),                   \
-      reinterpret_cast<uint8_t*>(out_q.data_ptr()),                                                \
-      reinterpret_cast<uint8_t*>(key_cache.data_ptr()),                                            \
-      reinterpret_cast<uint8_t*>(value_cache.data_ptr()), q_scale_out.data_ptr<float>(), num_rows, \
-      num_req, total_tokens, eps, fp8_max, qkv.stride(0), qkv.stride(1), cos_sin.stride(0),         \
-      cos_sin.stride(1), kvcache_indices.stride(0), kvcache_indices.stride(1), out_q.stride(0),     \
-      out_q.stride(1), out_q.stride(2), key_cache.stride(0), key_cache.stride(1),                   \
-      key_cache.stride(2), key_cache.stride(3), key_cache.stride(4), value_cache.stride(0),         \
-      value_cache.stride(1), value_cache.stride(2), value_cache.stride(3), k_scale.stride(0),       \
-      k_scale.stride(1), k_scale.stride(2), k_scale.stride(3), q_scale_out.stride(0),               \
-      q_scale_out.stride(1), num_q_heads, num_kv_heads, v_head_dim, block_size, k_scale_l, k_cache_x
-  if (cos_sin.scalar_type() == at::kBFloat16) {
-    if (decode_one_token)
-      hipLaunchKernelGGL((MFMA_KERNEL<true, WeightBF16, HadamardBF16, true>),
-                         grid, block, smem, stream, MFMA_ARGS);
-    else
-      hipLaunchKernelGGL((MFMA_KERNEL<true, WeightBF16, HadamardBF16, false>),
-                         grid, block, smem, stream, MFMA_ARGS);
-  } else {
-    if (decode_one_token)
-      hipLaunchKernelGGL((MFMA_KERNEL<false, WeightBF16, HadamardBF16, true>),
-                         grid, block, smem, stream, MFMA_ARGS);
-    else
-      hipLaunchKernelGGL((MFMA_KERNEL<false, WeightBF16, HadamardBF16, false>),
-                         grid, block, smem, stream, MFMA_ARGS);
-  }
-#undef MFMA_ARGS
-#undef MFMA_KERNEL
-  C10_HIP_KERNEL_LAUNCH_CHECK();
-}
-
 template <bool WeightBF16, bool HadamardBF16, int HPW>
 void launch_cos_dispatch_tiled(const torch::Tensor& qkv,
                                const torch::Tensor& cos_sin,
@@ -1816,7 +1278,6 @@ void launch_cos_dispatch_tiled(const torch::Tensor& qkv,
   const int64_t k_cache_x = key_cache.size(4);
   const int64_t k_scale_l = k_scale.size(3);
   const int64_t total_tokens = key_cache.size(0) * block_size;
-  const int64_t max_pos = cos_sin.size(0);
   const int64_t total_warps = num_rows * (num_q_heads / HPW);
   const dim3 block(kWarpsPerBlock * kWarpSize);
   const dim3 grid(static_cast<unsigned>((total_warps + kWarpsPerBlock - 1) / kWarpsPerBlock));
@@ -1835,7 +1296,7 @@ void launch_cos_dispatch_tiled(const torch::Tensor& qkv,
     row_slot_ptr = row_slot_t.data_ptr<int64_t>();
     const int meta_threads = 256;
     const dim3 meta_grid((num_rows + meta_threads - 1) / meta_threads);
-    hipLaunchKernelGGL(compute_row_meta_kernel_hip, meta_grid, dim3(meta_threads), 0, stream,
+    hipLaunchKernelGGL(compute_row_meta_kernel, meta_grid, dim3(meta_threads), 0, stream,
                        q_index.data_ptr<int32_t>(), num_seqlen_per_req.data_ptr<int32_t>(),
                        kvcache_indices.data_ptr<int32_t>(), num_rows, num_req, total_tokens,
                        kvcache_indices.stride(0), kvcache_indices.stride(1), block_size,
@@ -1856,18 +1317,21 @@ void launch_cos_dispatch_tiled(const torch::Tensor& qkv,
       value_cache.stride(1), value_cache.stride(2), value_cache.stride(3), k_scale.stride(0),       \
       k_scale.stride(1), k_scale.stride(2), k_scale.stride(3), q_scale_out.stride(0),               \
       q_scale_out.stride(1), num_q_heads, num_kv_heads, v_head_dim, block_size, k_scale_l,          \
-      k_cache_x, row_token_pos_ptr, row_slot_ptr, max_pos
+      k_cache_x, row_token_pos_ptr, row_slot_ptr
   const bool contig = qkv.stride(1) == 1 && cos_sin.stride(1) == 1 && out_q.stride(2) == 1 &&
                       key_cache.stride(4) == 1 && value_cache.stride(3) == 1;
 #define LAUNCH_TILED_K(CB, DEC, BS, KCX, KSL, CTG, META)                                           \
   hipLaunchKernelGGL(                                                                              \
-      (rope_norm_store_kv_fp8_fused_tiled_kernel_hip<CB, WeightBF16, HadamardBF16, DEC, HPW, BS, \
+      (rope_norm_store_kv_fp8_fused_tiled_kernel<CB, WeightBF16, HadamardBF16, DEC, HPW, BS, \
                                                         KCX, KSL, CTG, META>),                      \
       grid, block, smem, stream, TILED_ARGS)
+  // Only CONTIG needs a compile-time branch (vectorized load/store path). The
+  // KV-cache div/mod are runtime power-of-two shifts now, so no block_size
+  // specialization -- one tiled instance serves every power-of-two block_size.
 #define LAUNCH_TILED_DIV(CB, DEC, META)                                                            \
   do {                                                                                             \
-    if (block_size == 32 && k_cache_x == 16 && k_scale_l == 32 && contig)                          \
-      LAUNCH_TILED_K(CB, DEC, 32, 16, 32, true, META);                                             \
+    if (contig)                                                                                    \
+      LAUNCH_TILED_K(CB, DEC, 0, 0, 0, true, META);                                                \
     else                                                                                           \
       LAUNCH_TILED_K(CB, DEC, 0, 0, 0, false, META);                                               \
   } while (0)
@@ -1914,7 +1378,6 @@ void launch_hadamard_dispatch(const torch::Tensor& qkv,
                               float eps,
                               float fp8_max,
                               bool decode_one_token,
-                              bool use_mfma,
                               int64_t tile_hpw) {
 #define LAUNCH_TILED(HADBF, HPW)                                                                   \
   launch_cos_dispatch_tiled<WeightBF16, HADBF, HPW>(                                               \
@@ -1931,13 +1394,7 @@ void launch_hadamard_dispatch(const torch::Tensor& qkv,
       LAUNCH_TILED(HADBF, 2);                                                                       \
   } while (0)
   if (hadamard.scalar_type() == at::kBFloat16) {
-    if (use_mfma)
-      launch_cos_dispatch_mfma<WeightBF16, true>(qkv, cos_sin, q_index, num_seqlen_per_req,
-                                                 kvcache_indices, q_norm_weight, k_norm_weight,
-                                                 hadamard, k_scale, v_scale, out_q, key_cache,
-                                                 value_cache, q_scale_out, eps, fp8_max,
-                                                 decode_one_token);
-    else if (tile_hpw > 1)
+    if (tile_hpw > 1)
       DISPATCH_TILED(true);
     else
       launch_cos_dispatch<WeightBF16, true>(qkv, cos_sin, q_index, num_seqlen_per_req,
@@ -1958,45 +1415,9 @@ void launch_hadamard_dispatch(const torch::Tensor& qkv,
 #undef DISPATCH_TILED
 }
 
-}  // namespace aiter_rope
+}  // namespace aiter
 
-using namespace aiter_rope;
-
-void compute_pos_slot_hip(torch::Tensor q_index,
-                          torch::Tensor num_seqlen_per_req,
-                          torch::Tensor kvcache_indices,
-                          torch::Tensor positions,
-                          torch::Tensor slot_indices,
-                          torch::Tensor req_ids,
-                          torch::Tensor local_idx,
-                          int64_t block_size) {
-  CHECK_HIP_TENSOR(q_index);
-  CHECK_HIP_TENSOR(num_seqlen_per_req);
-  CHECK_HIP_TENSOR(kvcache_indices);
-  CHECK_HIP_TENSOR(positions);
-  CHECK_HIP_TENSOR(slot_indices);
-  CHECK_HIP_TENSOR(req_ids);
-  CHECK_HIP_TENSOR(local_idx);
-  CHECK_DTYPE(q_index, at::kInt);
-  CHECK_DTYPE(num_seqlen_per_req, at::kInt);
-  CHECK_DTYPE(kvcache_indices, at::kInt);
-  CHECK_DTYPE(positions, at::kInt);
-  CHECK_DTYPE(slot_indices, at::kLong);
-  CHECK_DTYPE(req_ids, at::kInt);
-  CHECK_DTYPE(local_idx, at::kInt);
-
-  const int64_t num_req = num_seqlen_per_req.size(0);
-  const dim3 block(128);
-  const dim3 grid(num_req);
-  const auto stream = c10::hip::getCurrentHIPStream();
-  hipLaunchKernelGGL(compute_pos_slot_kernel_hip, grid, block, 0, stream,
-                     q_index.data_ptr<int32_t>(), num_seqlen_per_req.data_ptr<int32_t>(),
-                     kvcache_indices.data_ptr<int32_t>(), positions.data_ptr<int32_t>(),
-                     slot_indices.data_ptr<int64_t>(), req_ids.data_ptr<int32_t>(),
-                     local_idx.data_ptr<int32_t>(), kvcache_indices.stride(0),
-                     kvcache_indices.stride(1), block_size);
-  C10_HIP_KERNEL_LAUNCH_CHECK();
-}
+using namespace aiter;
 
 void rope_norm_store_kv_fp8_fused_hip(torch::Tensor qkv,
                                              torch::Tensor cos_sin,
@@ -2015,7 +1436,6 @@ void rope_norm_store_kv_fp8_fused_hip(torch::Tensor qkv,
                                              double eps,
                                              double fp8_max,
                                              bool assume_decode_one_token,
-                                             bool use_mfma,
                                              int64_t tile_hpw) {
   CHECK_HIP_TENSOR(qkv);
   CHECK_HIP_TENSOR(cos_sin);
@@ -2064,18 +1484,13 @@ void rope_norm_store_kv_fp8_fused_hip(torch::Tensor qkv,
                   value_cache.element_size() == 1,
               "out_q/key_cache/value_cache must be byte-sized FP8 tensors");
 
-  // Instantiate the few dtype combinations needed by the current ROCm path.
-  if (use_mfma) {
-    TORCH_CHECK(hadamard.scalar_type() == at::kBFloat16,
-                "use_mfma requires a bfloat16 hadamard matrix");
-  }
   // The multi-head tiled kernel tiles Q by HPW; K/V is handled per-kv-head so
   // num_kv_heads need not be divisible by HPW (supports GQA, e.g. nkv==1). Only
   // num_q_heads must be divisible by the tile width.
   int64_t eff_tile_hpw = tile_hpw;
   if (eff_tile_hpw > 1) {
     const int64_t nqh = out_q.size(1);
-    if (use_mfma || (nqh % eff_tile_hpw != 0)) {
+    if (nqh % eff_tile_hpw != 0) {
       eff_tile_hpw = 1;
     }
   }
@@ -2085,13 +1500,13 @@ void rope_norm_store_kv_fp8_fused_hip(torch::Tensor qkv,
                                    k_scale, v_scale, out_q, key_cache, value_cache,
                                    q_scale_out, static_cast<float>(eps),
                                    static_cast<float>(fp8_max),
-                                   assume_decode_one_token, use_mfma, eff_tile_hpw);
+                                   assume_decode_one_token, eff_tile_hpw);
   } else {
     launch_hadamard_dispatch<false>(qkv, cos_sin, q_index, num_seqlen_per_req,
                                     kvcache_indices, q_norm_weight, k_norm_weight, hadamard,
                                     k_scale, v_scale, out_q, key_cache, value_cache,
                                     q_scale_out, static_cast<float>(eps),
                                     static_cast<float>(fp8_max),
-                                    assume_decode_one_token, use_mfma, eff_tile_hpw);
+                                    assume_decode_one_token, eff_tile_hpw);
   }
 }

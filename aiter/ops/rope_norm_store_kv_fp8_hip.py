@@ -61,7 +61,6 @@ def rope_norm_store_kv_fp8_fused_hip(
     eps: float,
     fp8_max: float,
     assume_decode_one_token: bool,
-    use_mfma: bool = False,
     tile_hpw: int = 1,
 ) -> None: ...
 
@@ -285,7 +284,6 @@ def rope_norm_store_kv_fp8_hip(
         1e-5,
         float(fp8_max),
         bool(decode_one_token),
-        False,
         tile_hpw,
     )
 
