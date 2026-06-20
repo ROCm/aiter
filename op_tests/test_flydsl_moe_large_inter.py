@@ -12,15 +12,19 @@ model_dim=6144, E=128 -> 9 GiB). Validates BOTH stage1 paths:
 Run:  python op_tests/test_flydsl_moe_large_inter.py
       pytest op_tests/test_flydsl_moe_large_inter.py
 """
+
 import torch
 
 import flydsl.compiler as flyc
 from aiter.fused_moe import moe_sorting
 from aiter.ops.activation import silu_and_mul
-from aiter.ops.flydsl.kernels.moe_gemm_2stage import compile_moe_gemm1, compile_moe_gemm2
+from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
+    compile_moe_gemm1,
+    compile_moe_gemm2,
+)
 from aiter.ops.shuffle import shuffle_weight
 
-H = 6144          # model_dim
+H = 6144  # model_dim
 E = 128
 TOPK = 4
 DEV = "cuda"
@@ -52,7 +56,10 @@ def _cos(a, b):
 def _make(ntok, inter, seed=0):
     g = torch.Generator(device=DEV).manual_seed(seed)
     x = torch.randn(ntok, H, device=DEV, dtype=torch.bfloat16, generator=g) * 0.1
-    w1 = torch.randn(E, 2 * inter, H, device=DEV, dtype=torch.bfloat16, generator=g) * 0.05
+    w1 = (
+        torch.randn(E, 2 * inter, H, device=DEV, dtype=torch.bfloat16, generator=g)
+        * 0.05
+    )
     w2 = torch.randn(E, H, inter, device=DEV, dtype=torch.bfloat16, generator=g) * 0.05
     logits = torch.randn(ntok, E, device=DEV, dtype=torch.float32, generator=g)
     tw, tid = torch.topk(torch.softmax(logits, dim=-1), TOPK, dim=-1)
@@ -74,34 +81,120 @@ def run_flydsl(x, w1, w2, tw, tid, inter, *, tile_m, tile_k, k_batch):
     st = torch.cuda.current_stream()
 
     e1 = compile_moe_gemm1(
-        model_dim=H, inter_dim=inter, experts=E, topk=TOPK, in_dtype="bf16",
-        group_size=-1, tile_m=tile_m, tile_n=128, tile_k=tile_k,
-        doweight_stage1=False, use_cshuffle_epilog=False, out_dtype="bf16",
-        scale_is_bf16=False, k_batch=int(k_batch))
+        model_dim=H,
+        inter_dim=inter,
+        experts=E,
+        topk=TOPK,
+        in_dtype="bf16",
+        group_size=-1,
+        tile_m=tile_m,
+        tile_n=128,
+        tile_k=tile_k,
+        doweight_stage1=False,
+        use_cshuffle_epilog=False,
+        out_dtype="bf16",
+        scale_is_bf16=False,
+        k_batch=int(k_batch),
+    )
     e2 = compile_moe_gemm2(
-        model_dim=H, inter_dim=inter, experts=E, topk=TOPK, in_dtype="bf16",
-        group_size=-1, tile_m=tile_m, tile_n=256, tile_k=tile_k,
-        doweight_stage2=True, use_cshuffle_epilog=True, accumulate=True,
-        out_dtype="bf16", scale_is_bf16=False)
+        model_dim=H,
+        inter_dim=inter,
+        experts=E,
+        topk=TOPK,
+        in_dtype="bf16",
+        group_size=-1,
+        tile_m=tile_m,
+        tile_n=256,
+        tile_k=tile_k,
+        doweight_stage2=True,
+        use_cshuffle_epilog=True,
+        accumulate=True,
+        out_dtype="bf16",
+        scale_is_bf16=False,
+    )
 
     s1_w = 2 * inter if split_k else inter
     g1 = torch.zeros(ntok * TOPK, s1_w, device=DEV, dtype=torch.bfloat16)
-    a2 = g1 if not split_k else torch.empty(ntok * TOPK, inter, device=DEV, dtype=torch.bfloat16)
+    a2 = (
+        g1
+        if not split_k
+        else torch.empty(ntok * TOPK, inter, device=DEV, dtype=torch.bfloat16)
+    )
     out = torch.zeros(ntok, H, device=DEV, dtype=torch.bfloat16)
 
-    c1 = flyc.compile(e1, g1.view(-1), x.view(-1), w1s, sd, sd, s, se, sw1d, nv,
-                      ntok, inter, H, blocks, st)
-    c2 = flyc.compile(e2, out.view(-1), a2.view(-1), w2s, sd, sd, s, se, sw1d, nv,
-                      ntok, H, inter, blocks, st)
+    c1 = flyc.compile(
+        e1,
+        g1.view(-1),
+        x.view(-1),
+        w1s,
+        sd,
+        sd,
+        s,
+        se,
+        sw1d,
+        nv,
+        ntok,
+        inter,
+        H,
+        blocks,
+        st,
+    )
+    c2 = flyc.compile(
+        e2,
+        out.view(-1),
+        a2.view(-1),
+        w2s,
+        sd,
+        sd,
+        s,
+        se,
+        sw1d,
+        nv,
+        ntok,
+        H,
+        inter,
+        blocks,
+        st,
+    )
 
     def go():
         if split_k:
             g1.zero_()
-        c1(g1.view(-1), x.view(-1), w1s, sd, sd, s, se, sw1d, nv, ntok, inter, H, blocks, st)
+        c1(
+            g1.view(-1),
+            x.view(-1),
+            w1s,
+            sd,
+            sd,
+            s,
+            se,
+            sw1d,
+            nv,
+            ntok,
+            inter,
+            H,
+            blocks,
+            st,
+        )
         if split_k:
             silu_and_mul(a2, g1.view(-1, 2 * inter))
         out.zero_()
-        c2(out.view(-1), a2.view(-1), w2s, sd, sd, s, se, sw1d, nv, ntok, H, inter, blocks, st)
+        c2(
+            out.view(-1),
+            a2.view(-1),
+            w2s,
+            sd,
+            sd,
+            s,
+            se,
+            sw1d,
+            nv,
+            ntok,
+            H,
+            inter,
+            blocks,
+            st,
+        )
         return out
 
     return go
@@ -133,14 +226,20 @@ def _gib(inter):
 CASES = []
 # decode (small M), fused (k_batch=1): sweep inter below/at/above the boundary
 for it in (384, 768, 1280, 1408, 1536, 2048, 3072):
-    CASES.append((16, it, 16, 128, 1, f"decode  fused    inter={it:<4} ({_gib(it):.2f}GiB)"))
+    CASES.append(
+        (16, it, 16, 128, 1, f"decode  fused    inter={it:<4} ({_gib(it):.2f}GiB)")
+    )
 # decode, split-K (k_batch=6): small + M3
 for it in (384, 3072):
-    CASES.append((16, it, 16, 128, 6, f"decode  split-K  inter={it:<4} ({_gib(it):.2f}GiB)"))
+    CASES.append(
+        (16, it, 16, 128, 6, f"decode  split-K  inter={it:<4} ({_gib(it):.2f}GiB)")
+    )
 # prefill (large M): boundary + M3, both paths
 for it, kb in ((1408, 1), (3072, 1), (3072, 2)):
     tag = "split-K" if kb > 1 else "fused  "
-    CASES.append((2048, it, 128, 64, kb, f"prefill {tag} inter={it:<4} ({_gib(it):.2f}GiB)"))
+    CASES.append(
+        (2048, it, 128, 64, kb, f"prefill {tag} inter={it:<4} ({_gib(it):.2f}GiB)")
+    )
 
 
 def test_flydsl_moe_large_inter():
@@ -157,7 +256,9 @@ def test_flydsl_moe_large_inter():
         ok = cd < 0.01
         if not ok:
             bad.append(name)
-        print(f"{name:40s} {inter:>5} {kb:>3} {cd:>10.2e} {ms:>9.4f}  {'OK' if ok else 'FAIL'}")
+        print(
+            f"{name:40s} {inter:>5} {kb:>3} {cd:>10.2e} {ms:>9.4f}  {'OK' if ok else 'FAIL'}"
+        )
         del x, w1, w2, ref, out
         torch.cuda.empty_cache()
     assert not bad, f"cos_dist >= 0.01 for: {bad}"

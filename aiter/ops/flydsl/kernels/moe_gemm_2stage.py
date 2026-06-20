@@ -564,7 +564,9 @@ def compile_moe_gemm1(
                 # path unchanged (packed dtypes need their own byte-offset validation).
                 if const_expr(is_f16_or_bf16):
                     _w_base_addr = buffer_ops.extract_base_index(arg_w)
-                    _w_expert_byte = expert_off_idx * k_in * arith.index(int(w_elem_bytes))
+                    _w_expert_byte = (
+                        expert_off_idx * k_in * arith.index(int(w_elem_bytes))
+                    )
                     w_rsrc = buffer_ops.create_buffer_resource_from_addr(
                         arith.index_cast(T.i64, _w_base_addr + _w_expert_byte)
                     )
@@ -2459,7 +2461,9 @@ def compile_moe_gemm2(
                 # expert_off_idx(rows) * inter(k_in) * w_elem_bytes. f16/bf16 only.
                 if const_expr(is_f16_or_bf16):
                     _w_base_addr = buffer_ops.extract_base_index(arg_w)
-                    _w_expert_byte = expert_off_idx * k_in * arith.index(int(w_elem_bytes))
+                    _w_expert_byte = (
+                        expert_off_idx * k_in * arith.index(int(w_elem_bytes))
+                    )
                     w_rsrc = buffer_ops.create_buffer_resource_from_addr(
                         arith.index_cast(T.i64, _w_base_addr + _w_expert_byte)
                     )
