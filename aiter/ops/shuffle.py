@@ -411,7 +411,8 @@ def shuffle_scale_batched(
 
     https://github.com/triton-lang/triton/blob/main/third_party/amd/python/examples/gluon/mxfp_gemm_gfx1250.py#L1014
     """
-    if arch is not None and arch != "gfx1250":
+    arch = arch or get_arch()
+    if arch != "gfx1250":
         raise NotImplementedError(
             f"shuffle_scale_batched only supports gfx1250, got {arch!r}"
         )
