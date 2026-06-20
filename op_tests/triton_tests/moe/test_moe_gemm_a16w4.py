@@ -215,8 +215,6 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-# @pytest.mark.parametrize("has_y_gammas", [False])
-# @pytest.mark.parametrize("apply_swiglu", [False])
 def test_op(
     m,
     n,
