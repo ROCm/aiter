@@ -84,6 +84,8 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
     void *k_descale_ptr = nullptr;
     void *v_descale_ptr = nullptr;
 
+    const bool is_mxfp4 = (data_type == "mxfp4bf16");
+
     if (bias_.has_value()) {
         auto bias = bias_.value();
         CHECK_DEVICE(bias);
@@ -101,31 +103,38 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
+    // mxfp4 carries per-block scales (q/k: [b, sq, h, d/32]; v: [b, h_kv, d]),
+    // so its descale tensors don't match the {1}/{b, h_k} contract used by the
+    // scalar/per-head paths. Only the strict shape check is relaxed; the stride
+    // extraction below is identical for the {1}/{b, h_k} shapes (dim 1 or 2).
     if (q_descale_.has_value()) {
         auto q_descale = q_descale_.value();
         CHECK_DEVICE(q_descale);
-        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
-        if (q_descale.dim() == 2) {
+        if (!is_mxfp4)
+            TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        if (q_descale.dim() >= 2) {
             batch_stride_descale_q = q_descale.stride(0);
-            nhead_stride_descale_q = q_descale.stride(1);
+            nhead_stride_descale_q = q_descale.stride(q_descale.dim() >= 3 ? 2 : 1);
         }
         q_descale_ptr = q_descale.data_ptr();
     }
     if (k_descale_.has_value()) {
         auto k_descale = k_descale_.value();
         CHECK_DEVICE(k_descale);
-        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) || k_descale.sizes() == torch::IntArrayRef({b, h_k}));
-        if (k_descale.dim() == 2) {
+        if (!is_mxfp4)
+            TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) || k_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        if (k_descale.dim() >= 2) {
             batch_stride_descale_k = k_descale.stride(0);
-            nhead_stride_descale_k = k_descale.stride(1);
+            nhead_stride_descale_k = k_descale.stride(k_descale.dim() >= 3 ? 2 : 1);
         }
         k_descale_ptr = k_descale.data_ptr();
     }
     if (v_descale_.has_value()) {
         auto v_descale = v_descale_.value();
         CHECK_DEVICE(v_descale);
-        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) || v_descale.sizes() == torch::IntArrayRef({b, h_k}));
-        if (v_descale.dim() == 2) {
+        if (!is_mxfp4)
+            TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) || v_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        if (v_descale.dim() >= 2) {
             batch_stride_descale_v = v_descale.stride(0);
             nhead_stride_descale_v = v_descale.stride(1);
         }
@@ -233,19 +242,24 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     bool is_qk_int8 = q_dtype == at::ScalarType::Char;
     bool is_v_fp8 = v_dtype == at::ScalarType::Float8_e4m3fn || v_dtype == at::ScalarType::Float8_e4m3fnuz;
     bool is_i8fp8 = is_qk_int8 && is_v_fp8;
+    bool is_mxfp4 = q_dtype == at::ScalarType::Byte; // uint8-packed fp4 (2 elem/byte)
 
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || is_qkv_fp8 || is_i8fp8,
-                "FlashAttention only support fp16, bf16, fp8_e4m3, and int8(q/k)+fp8(v) data type");
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || is_qkv_fp8 || is_i8fp8 || is_mxfp4,
+                "FlashAttention only support fp16, bf16, fp8_e4m3, int8(q/k)+fp8(v), or mxfp4 data type");
 
-    if (is_i8fp8) {
-        TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype (int8)");
+    if (is_i8fp8 || is_mxfp4) {
+        TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     } else {
         TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
         TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     }
 
     std::string dtype_str;
-    if (q_dtype == torch::kFloat16) {
+    if (is_mxfp4) {
+        TORCH_CHECK(!out_.has_value() || out_.value().dtype() == torch::kBFloat16,
+                    "For mxfp4 input, output must have dtype BF16");
+        dtype_str = "mxfp4bf16";
+    } else if (q_dtype == torch::kFloat16) {
         dtype_str = "fp16";
     } else if (q_dtype == torch::kBFloat16) {
         dtype_str = "bf16";
@@ -275,6 +289,11 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                         v_descale_.value().dtype() == torch::kFloat32,
                     "q_descale, k_descale, v_descale must be float32");
     }
+    if(is_mxfp4)
+    {
+        TORCH_CHECK(q_descale_.has_value() && k_descale_.has_value() && v_descale_.has_value(),
+                    "q_descale, k_descale, v_descale must be provided for mxfp4 attention");
+    }
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -285,7 +304,11 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     const int batch_size = sizes[0];
     int seqlen_q = sizes[1];
     int num_heads = sizes[2];
-    const int head_size_q = sizes[3];
+    // mxfp4 packs two fp4 elements per byte, so the logical head dim is 2x the
+    // physical extent; q/k use _phys for shape checks/reshapes, the kernel uses
+    // the logical head_size_q. v stays fp8 (one element per byte).
+    const int head_size_q_phys = sizes[3];
+    const int head_size_q = is_mxfp4 ? sizes[3] * 2 : sizes[3];
     const int head_size_v = v.sizes()[3];
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
@@ -329,17 +352,17 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
         !alibi_slopes_.has_value() && !bias_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
-        q = q.reshape({batch_size, num_heads_k, ngroups, head_size_q}).transpose(1, 2);
+        q = q.reshape({batch_size, num_heads_k, ngroups, head_size_q_phys}).transpose(1, 2);
         seqlen_q = ngroups;
         num_heads = num_heads_k;
     }
 
-    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_q);
-    CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_q);
+    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_q_phys);
+    CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_q_phys);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
 
     auto opts = q.options();
-    auto out_type = (dtype_str == "fp8bf16" || dtype_str == "i8fp8bf16") ? torch::kBFloat16 : q.scalar_type();
+    auto out_type = (dtype_str == "fp8bf16" || dtype_str == "i8fp8bf16" || dtype_str == "mxfp4bf16") ? torch::kBFloat16 : q.scalar_type();
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -437,8 +460,8 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     }
 
     if (seqlenq_ngroups_swapped) {
-        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_q});
-        q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_q});
+        out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, is_mxfp4 ? head_size_v : head_size_q});
+        q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_q_phys});
         if (has_lse) {
             softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
         }

@@ -21,6 +21,7 @@ from aiter.ops.mha import (
     flash_attn_func,
     flash_attn_fp8_pertensor_func,
     flash_attn_i8fp8_pertensor_func,
+    flash_attn_mxfp4_func,
 )
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
@@ -68,6 +69,7 @@ KernelName = Literal[
     "fav3_fp8",
     "aiter_fp8",
     "aiter_i8fp8",
+    "aiter_mxfp4",
     "aiter_bf16",
 ]
 
@@ -76,6 +78,7 @@ ALL_KERNELS: List[str] = [
     "sage_mxfp4",
     "aiter_fp8",
     "aiter_i8fp8",
+    "aiter_mxfp4",
     "aiter_bf16",
 ]
 
@@ -85,6 +88,7 @@ FP8_CHECK_KERNELS = {
     "fav3_fp8",
     "aiter_fp8",
     "aiter_i8fp8",
+    "aiter_mxfp4",
 }
 
 
@@ -161,6 +165,96 @@ def generate_test_tensors(
         k = torch.randn((batch, hk, sk, d_head), device=device, dtype=dtype)
         v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=dtype)
         return q, k, v
+
+    if distribution == "underflow":
+        # Reproduces the fp8 underflow tile-skip regression on the microbench.
+        #
+        # A strong "hotspot" in the first KV tile (keys [0:128]) establishes a
+        # high frozen softmax max. Every later KV tile then sits far below the
+        # e4m3 round-to-zero floor (~2^-11 of the max ≈ 7.62 nats), so the
+        # kernel's underflow tile-skip path fires on those tiles. A per-query-row
+        # jitter on the hotspot strength makes the all-underflow condition
+        # row-dependent, so the two anti-phase co-resident wave groups (which own
+        # different query-row blocks) disagree on which tiles to skip. The
+        # shared-VALU lockstep barrier then eats the saving while the extra
+        # underflow compare is still paid on every no-mask tile -> net slowdown,
+        # matching the real-Wan result.
+        #
+        # Tunables (env):
+        #   AITER_UNDERFLOW_GAP    max hotspot logit in nats (default 16.0)
+        #   AITER_UNDERFLOW_JITTER per-row hotspot factor ~ U[jitter, 1]
+        #                          (default 0.4 -> asymmetric/realistic regression;
+        #                           set 1.0 for the symmetric best-case where every
+        #                           later tile underflows for both partner waves)
+        gap = float(os.environ.get("AITER_UNDERFLOW_GAP", "16.0"))
+        jitter = float(os.environ.get("AITER_UNDERFLOW_JITTER", "0.4"))
+        jitter = min(max(jitter, 0.0), 1.0)
+        scale = float(d_head) ** -0.5  # kernel softmax scale (1/sqrt(d_head))
+        hot_keys = min(128, sk)        # one KV tile
+
+        # Single shared hotspot direction (unit vector), broadcast over heads.
+        u = torch.randn((1, 1, 1, d_head), device=device, dtype=torch.float32)
+        u = u / u.pow(2).sum(dim=-1, keepdim=True).add(1e-12).sqrt()
+
+        # Amplitude so a fully-aligned Q/K pair (row_factor=1) yields a hotspot
+        # logit == gap after the 1/sqrt(d_head) softmax scaling.
+        amp = (gap / scale) ** 0.5
+
+        # Per-query-row hotspot factor in [jitter, 1]; the hotspot logit for a
+        # row is gap * row_factor, so rows with row_factor < ~7.62/gap will NOT
+        # fully underflow the later tiles -> partner-wave disagreement.
+        row_factor = jitter + (1.0 - jitter) * torch.rand(
+            (batch, hq, sq, 1), device=device, dtype=torch.float32
+        )
+        q = amp * row_factor * u + 0.35 * torch.randn(
+            (batch, hq, sq, d_head), device=device, dtype=torch.float32
+        )
+
+        # Remaining keys: small, near-orthogonal -> low logits. Hotspot keys
+        # (first tile) aligned with u at amplitude `amp`.
+        k = 0.30 * torch.randn(
+            (batch, hk, sk, d_head), device=device, dtype=torch.float32
+        )
+        k[:, :, :hot_keys, :] = amp * u + 0.10 * torch.randn(
+            (batch, hk, hot_keys, d_head), device=device, dtype=torch.float32
+        )
+
+        v = 0.5 * torch.randn(
+            (batch, hk, sk, d_head_v), device=device, dtype=torch.float32
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution == "latesink":
+        # ADVERSARIAL TRIPWIRE for the frozen-max rollback (added 2026-06-14 after the black-video
+        # regression). Mirrors `underflow` but places the high-norm "attention sink" hotspot in the
+        # LAST KV tile instead of the first. With a frozen-max rollback that seeds from tile 0, the
+        # seed is LOW and the late hotspot's logit blows far past it -> the Schraudolph u32-cvt
+        # saturates to 0xFFFFFFFF (NaN bits) -> corrupt P -> NaN/black. The exact (proper running
+        # max) path is immune (S - m_new <= 0 always). Random transformer/normal/underflow never
+        # produce a late-tile outlier, so this is the structured input cosine-on-random missed.
+        #   AITER_LATESINK_GAP : late-hotspot logit in nats (default 40.0 -> well past the cvt
+        #                        saturation at scale_log2e*(S-seed) > 128 for 1/sqrt(d) scaling)
+        gap = float(os.environ.get("AITER_LATESINK_GAP", "40.0"))
+        scale = float(d_head) ** -0.5
+        hot_keys = min(128, sk)              # one KV tile
+        u = torch.randn((1, 1, 1, d_head), device=device, dtype=torch.float32)
+        u = u / u.pow(2).sum(dim=-1, keepdim=True).add(1e-12).sqrt()
+        amp = (gap / scale) ** 0.5
+        # Q fully aligned with the sink direction so the late tile dominates.
+        q = amp * u + 0.35 * torch.randn(
+            (batch, hq, sq, d_head), device=device, dtype=torch.float32
+        )
+        # All keys small/near-orthogonal EXCEPT the LAST tile, which holds the sink.
+        k = 0.30 * torch.randn(
+            (batch, hk, sk, d_head), device=device, dtype=torch.float32
+        )
+        k[:, :, sk - hot_keys:, :] = amp * u + 0.10 * torch.randn(
+            (batch, hk, hot_keys, d_head), device=device, dtype=torch.float32
+        )
+        v = 0.5 * torch.randn(
+            (batch, hk, sk, d_head_v), device=device, dtype=torch.float32
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution != "transformer":
         raise ValueError(f"Unsupported input distribution: {distribution}")
@@ -440,8 +534,8 @@ def i8fp8_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_clip: float = 0.8,
-    k_clip: float = 0.8,
+    q_clip: float = 1.0,
+    k_clip: float = 1.0,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -794,6 +888,78 @@ def make_kernel_runner(
             v_descale=v_descale,
         )
 
+    if args.kernel == "aiter_mxfp4":
+        # Drive flash_attn_mxfp4_func with mxfp4 inputs from sage_quant_mxfp4 (the
+        # same quantizer fav3_sage_mxfp4 uses): q/k are uint8-packed fp4 (head dim
+        # 128 -> 64) with per-block E8M0 descales (head_dim/32), v is fp8 with
+        # per-channel fp32 descales (as in the i8fp8 path).
+        logger.info(
+            "aiter_mxfp4: using sage_quant_mxfp4 (real fp4 q/k, per-block "
+            "E8M0 descales, fp8 v with per-channel descales)."
+        )
+        cfg = get_sage_fwd_configs_mxfp4()
+        fp8_type = aiter.dtypes.fp8
+        fp8_max = torch.finfo(fp8_type).max
+
+        block_r = args.block_r
+        if block_r > q_bshd.shape[-1]:
+            raise ValueError(
+                f"block_r ({block_r}) must be <= head dim ({q_bshd.shape[-1]})"
+            )
+        r = create_hadamard_matrix(
+            block_r, device=q_bshd.device, dtype=q_bshd.dtype
+        ) / (block_r**0.5)
+
+        # sage_quant_mxfp4 folds sm_scale into Q before fp4 quant, so the kernel
+        # consumes a pre-scaled Q and must NOT re-apply the scale (doing so
+        # double-scales the softmax). Pin the fold scale to the same softmax_scale
+        # used by the reference and pass it through explicitly.
+        def _quantize_mxfp4():
+            return sage_quant_mxfp4(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                fp8_type,
+                fp8_max,
+                BLKQ=cfg["BLOCK_M"],
+                BLKK=64,
+                layout="bshd",
+                R=r,
+                BLOCK_R=block_r,
+                sm_scale=softmax_scale,
+                q_smoothing=args.qsmooth,
+            )
+
+        def _run_aiter_mxfp4():
+            q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale, _delta_s = (
+                _quantize_mxfp4()
+            )
+            return flash_attn_mxfp4_func(
+                q_fp4,
+                k_fp4,
+                v_fp8,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            return _run_aiter_mxfp4
+
+        q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale, _delta_s = (
+            _quantize_mxfp4()
+        )
+        return lambda: flash_attn_mxfp4_func(
+            q_fp4,
+            k_fp4,
+            v_fp8,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softmax_scale=softmax_scale,
+        )
+
     if args.kernel == "fav3_fp8":
         return make_fav3_fp8_runner(
             q_bshd,
@@ -961,6 +1127,7 @@ def benchmark_single_case(
         "fav3_fp8",
         "aiter_fp8",
         "aiter_i8fp8",
+        "aiter_mxfp4",
         "sage_fp8",
         "sage_mxfp4",
     ):
@@ -972,7 +1139,7 @@ def benchmark_single_case(
 
     v_elem_size = (
         1
-        if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8")
+        if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "aiter_mxfp4")
         else v.element_size()
     )
     mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
@@ -1167,6 +1334,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "fav3_fp8",
         "aiter_fp8",
         "aiter_i8fp8",
+        "aiter_mxfp4",
     )
 
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
@@ -1493,6 +1661,7 @@ def parse_args() -> argparse.Namespace:
             "fav3_fp8",
             "aiter_fp8",
             "aiter_i8fp8",
+            "aiter_mxfp4",
             "aiter_bf16",
             "all",
         ],
@@ -1516,7 +1685,7 @@ def parse_args() -> argparse.Namespace:
         "--input-distribution",
         type=str,
         default="transformer",
-        choices=["normal", "transformer"],
+        choices=["normal", "transformer", "underflow", "latesink"],
         help="Distribution used for generated Q/K/V tensors",
     )
     parser.add_argument(
@@ -1635,6 +1804,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=25,
         help="do_bench warmup time in ms",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed torch RNG before generating Q/K/V so runs are reproducible "
+        "(use the same --seed across kernels to compare on identical inputs)",
     )
 
     args = parser.parse_args()
@@ -1845,6 +2022,10 @@ def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:
 def main() -> int:
     args = parse_args()
     validate_args(args)
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
 
     loaded_masks = load_block_mask_from_json(args.block_mask_file, torch.device("cuda"))
     loaded_single_mask: Optional[LoadedMask] = None
