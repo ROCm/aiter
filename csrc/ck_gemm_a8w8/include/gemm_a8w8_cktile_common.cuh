@@ -219,7 +219,7 @@ void TileGemmComputeImpl(const HostArguments& args)
             has_hot_loop_v,
             tail_number_v,
             ck_tile::CastPolicy::AfterLDSRead,
-            GemmConfig::Async>;
+            GemmConfig::Async_v>;
 
         using GemmPipeline =
             std::conditional_t<eight_waves,
