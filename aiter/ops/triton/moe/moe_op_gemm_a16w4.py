@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.moe.reduce import reduce_grouped
 
 # -----------------------------------------------------------------------------
@@ -233,7 +234,7 @@ def moe_gemm_a16w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
-    use_gluon=False,
+    # use_gluon=False,
 ):
     """
     Y[:, :] = 0.
@@ -241,6 +242,7 @@ def moe_gemm_a16w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
 
+    use_gluon = get_arch() == "gfx1250"
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"
     assert x_static_scale is None, "x_static_scale must be none"
@@ -254,10 +256,6 @@ def moe_gemm_a16w4(
         N = unpadded_N
     if unpadded_K and block_m == 16:
         K = unpadded_K
-
-    # if use_gluon:
-    #    w = w.transpose(1, 2)
-    #    w_scales = w_scales.transpose(1, 2)
 
     # compute optimization flags
     if use_gluon:

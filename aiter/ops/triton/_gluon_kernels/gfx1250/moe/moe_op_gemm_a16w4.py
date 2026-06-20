@@ -390,9 +390,33 @@ def _moe_gemm_a16w4(
         acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
         consumer += 1
 
+    if B is not None:
+        BPtrs = B + expt_id * stride_b_e
+        SHARED_LAYOUT_BIAS: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+        bias_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=BPtrs,
+            shape=(1, N),
+            strides=(N, 1),
+            block_shape=(1, BLOCK_N),
+            layout=SHARED_LAYOUT_BIAS,
+        )
+        bias_buffer = gl.allocate_shared_memory(
+            bias_desc.dtype, shape=[1, BLOCK_N], layout=bias_desc.layout
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            bias_desc,
+            [0, pid_n * BLOCK_N],
+            bias_buffer,
+        )
+        TDM_BIAS_WAIT: gl.constexpr = 1
+    else:
+        TDM_BIAS_WAIT: gl.constexpr = 0
+
     # Epilogue: drain remaining NUM_BUFFERS - 1 tiles with a counting-down wait threshold.
     for i in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * NUM_TDM_OPS)
+        gl.amd.gfx1250.tdm.async_wait(
+            (NUM_BUFFERS - 2 - i) * NUM_TDM_OPS + TDM_BIAS_WAIT
+        )
         c_idx = consumer % NUM_BUFFERS
         x_tile = x_buffer.index(c_idx).load(layout=DOT_LAYOUT_X)
         w_packed = w_buffer.index(c_idx).load(layout=PACKED_LAYOUT)
@@ -402,36 +426,30 @@ def _moe_gemm_a16w4(
         acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
         consumer += 1
 
-    # bias / activation / write-back (unchanged from prior version)
-    offs_m = BLOCK_M * block_id + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-    )
-    offs_y_n = BLOCK_N * pid_n + gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-    )
-    mask_m = offs_m < M
-    mask_n = offs_y_n < N
+    # bias / activation / write-back
     if B is not None:
-        BPtrs = B + expt_id * stride_b_e
-        bias = gl.amd.gfx1250.buffer_load(BPtrs, offs_y_n, mask=mask_n)
+        gl.amd.gfx1250.tdm.async_wait(0)
+        bias = bias_buffer.reshape((BLOCK_N,)).load(
+            layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
         acc = acc + bias[None, :]
+
     if APPLY_SWIGLU:
         out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
         )
-        offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
-        offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(0, OUT_BLOCK_N)
-        mask_m = offs_m < M
-        mask_n = offs_y_n < yN
     else:
         tl.static_assert(
             ACTIVATION_REDUCTION_N == 1,
             "Activation reduction must be 1 if no activation fn is provided",
         )
         out = acc
+
     if Gammas is not None:
+        offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
         gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
 
