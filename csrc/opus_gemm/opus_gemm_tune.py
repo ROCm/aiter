@@ -88,6 +88,14 @@ BF16WS_EXACT_REDUCE_SHAPES = (
     (2048, 1),
 )
 
+EVEN_LOOP_SPLITK_TAGS = frozenset(
+    (
+        "a16w16_kbuf2v_sk",
+        "a16w16_kbuf2v_bk128_sk",
+        "a16w16_quad_mfma32_kbuf1_sk",
+    )
+)
+
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-int(a) // int(b))
@@ -166,8 +174,9 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     for kb in range(1, max_split_k + 1):
         candidates.add(kb)
 
-    # kbuf2v_sk family: launcher requires both iters_full and last_loops even AND >=2.
-    if k_inst.kernel_tag in ("a16w16_kbuf2v_sk", "a16w16_kbuf2v_bk128_sk"):
+    # kbuf2v_sk and quad_mfma32 splitK families require both iters_full and
+    # last_loops even AND >=2.
+    if k_inst.kernel_tag in EVEN_LOOP_SPLITK_TAGS:
         total_iters = (K + k_inst.B_K - 1) // k_inst.B_K
 
         def _ok_sk(sk):
@@ -243,6 +252,7 @@ def kid_rejects_shape(k_inst, M, N, K):
     if k_inst.kernel_tag in (
         "a16w16",
         "a16w16_kbuf1_large_tile",
+        "a16w16_quad_mfma32_kbuf1",
         "a16w16_kbuf2v",
         "a16w16_kbuf2v_bk128",
         "a16w16_kbuf1",
@@ -282,8 +292,9 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         return False
 
-    # kbuf2v_sk family: launcher requires loops_per_split (both full and last) even AND >=2.
-    if k_inst.kernel_tag in ("a16w16_kbuf2v_sk", "a16w16_kbuf2v_bk128_sk"):
+    # kbuf2v_sk and quad_mfma32 splitK families require loops_per_split
+    # (both full and last) even AND >=2.
+    if k_inst.kernel_tag in EVEN_LOOP_SPLITK_TAGS:
         total_iters = _ceil_div(K, B_K)
         max_sk = max(1, min(16, total_iters // max(_flatmm_splitk_pfk(k_inst), 1)))
         for sk in range(1, max_sk + 1):

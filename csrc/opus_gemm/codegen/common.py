@@ -16,6 +16,7 @@ W3_KERNEL_PAIRS = {
     "a16w16_kbuf2v": "a16w16_kbuf2v_sk",
     "a16w16_kbuf2v_bk128": "a16w16_kbuf2v_bk128_sk",
     "a16w16_kbuf1": "a16w16_kbuf1_sk",
+    "a16w16_quad_mfma32_kbuf1": "a16w16_quad_mfma32_kbuf1_sk",
 }
 _NOSPLIT = tuple(W3_KERNEL_PAIRS.keys())
 _SPLITK = tuple(W3_KERNEL_PAIRS.values())

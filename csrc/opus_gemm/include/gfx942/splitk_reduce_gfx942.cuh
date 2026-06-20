@@ -47,7 +47,7 @@ __device__ __forceinline__ void splitk_reduce_kernel_fallback_body(
 
     const int b = bm_id / M;
     const int m = bm_id - b * M;
-    const D_WS* workspace = reinterpret_cast<const D_WS*>(ws_handle->ptr);
+    const D_WS* workspace = opus_splitk_ws_ptr<const D_WS>(ws_handle);
 
     opus::vector_t<float, VEC> bias_fp32;
     if constexpr (HAS_BIAS) {
@@ -257,7 +257,7 @@ __global__ void splitk_reduce_kernel_exact_n_rowblock(
     if (m >= M) {
         return;
     }
-    const D_WS* workspace = reinterpret_cast<const D_WS*>(ws_handle->ptr);
+    const D_WS* workspace = opus_splitk_ws_ptr<const D_WS>(ws_handle);
 
     opus::vector_t<float, VEC> bias_fp32;
     if constexpr (HAS_BIAS) {

@@ -18,6 +18,8 @@ _GFX942_KERNEL_NAME_TAGS = {
     "a16w16_kbuf2v": "p1",
     "a16w16_kbuf2v_bk128": "p1_bk128",
     "a16w16_kbuf1": "legacy",
+    "a16w16_quad_mfma32_kbuf1": "quad_mfma32",
+    "a16w16_quad_mfma32_kbuf1_sk": "splitk_quad_mfma32_bf16ws",
 }
 
 
@@ -499,6 +501,38 @@ def _a16w16_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     )
 
 
+def _a16w16_quad_mfma32_gfx942(bs, bm, bn, bk, tm, tn, wm, wn, wk):
+    """gfx942 quad MFMA32 path."""
+    vec = 16 // 2  # bf16
+    return OpusGemmInstance(
+        bs, bm, bn, bk,
+        tm, tn,
+        wm, wn, wk,
+        vec, vec, 4,
+        0, 0, 0,
+        "a16w16_quad_mfma32_kbuf1",
+        ["bf16_t"],
+        arch_prefix="gfx942",
+    )
+
+
+def _a16w16_quad_mfma32_sk_bf16ws_gfx942(bs, bm, bn, bk, tm, tn, wm, wn, wk, group_m=0):
+    """gfx942 quad MFMA32 splitK path with bf16 workspace."""
+    vec = 16 // 2  # bf16
+    inst = OpusGemmInstance(
+        bs, bm, bn, bk,
+        tm, tn,
+        wm, wn, wk,
+        vec, vec, 4,
+        group_m, 0, 0,
+        "a16w16_quad_mfma32_kbuf1_sk",
+        ["fp32_t"],
+        arch_prefix="gfx942",
+    )
+    inst.splitk_workspace_dtype = "bf16_t"
+    return inst
+
+
 def _a16w16_splitk_tag_gfx942(bs, bm, bn, bk, tn, wm, wn, wk, tag):
     """Factory for gfx942 splitK kids that write fp32 workspace + reduce."""
     vec = 16 // 2  # bf16
@@ -626,6 +660,7 @@ gfx942_nosplit_kernels_list = {
     10001: _a16w16_p1_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),   # P1 depth=2 sibling of 10201
     10002: _a16w16_kbuf1_gfx942 (256, 128,  64,  64,    2, 16, 16, 16),   # legacy 4-phase E_M=2 sibling of 10202
     10003: _a16w16_kbuf2v_bk128_gfx942(256, 64,  64, 128,    2, 16, 16, 16),   # P1 B_K=128 sibling of 10203
+    10006: _a16w16_quad_mfma32_gfx942(256, 256, 256, 32, 2, 2, 32, 32, 8), # quad MFMA32 pipeline
     10300: _a16w16_wave_k_coop_gfx942(512, 16, 16, 64,    1, 16, 16, 16),  # wave-K-coop 16x16, T_K=8
     10301: _a16w16_wave_k_coop_gfx942(512, 16, 32, 32,    1, 16, 16, 16),  # WKC 16x32, B_K=32
     10302: _a16w16_wave_k_coop_gfx942(512, 32, 16, 64,    1, 16, 16, 16),  # WKC 32x16, aliased partial
@@ -648,6 +683,7 @@ gfx942_splitk_kernels_list = {
     10210: _a16w16_kbuf1_sk_bf16ws_gfx942(512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile + bf16 workspace
     10211: _a16w16_kbuf2v_sk_bf16ws_gfx942(256,  64,  64,  64,    2, 16, 16, 16),                # P1 depth=2 + bf16 workspace
     10213: _a16w16_kbuf2v_bk128_sk_bf16ws_gfx942(256, 64,  64, 128,    2, 16, 16, 16),           # P1 B_K=128 + bf16 workspace
+    10216: _a16w16_quad_mfma32_sk_bf16ws_gfx942(256, 256, 256, 32, 2, 2, 32, 32, 8, group_m=6),  # 10006 bf16 splitK sibling, group-M=6
 }
 
 # NOTE: 10402 (a16w16_naive_64x64) was removed -- 32.85us never matched WKC's
