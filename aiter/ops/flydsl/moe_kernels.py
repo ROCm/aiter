@@ -355,6 +355,7 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    k_split: int = 1,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype in ("fp4", "fp8"):
@@ -386,6 +387,7 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             swiglu_limit=swiglu_limit,
+            k_split=k_split,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -1123,6 +1125,7 @@ def flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    k_split: int = 1,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1310,6 +1313,7 @@ def flydsl_moe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
+        k_split=k_split,
     )
     _run_compiled(exe, args)
 

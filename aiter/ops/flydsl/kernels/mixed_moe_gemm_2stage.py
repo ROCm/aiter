@@ -27,6 +27,8 @@ from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
 from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl, const_expr
+from flydsl.expr.gpu import lds_space as _lds_space
+from flydsl._mlir.extras import types as _mT
 from flydsl._mlir.dialects import llvm, scf, memref
 from flydsl._mlir.dialects.arith import CmpIPredicate
 
@@ -117,6 +119,7 @@ def compile_mixed_moe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    k_split: int = 1,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -151,8 +154,19 @@ def compile_mixed_moe_gemm1(
     is_f8_b = b_dtype == "fp8"
 
     sort_block_m = max(32, tile_m)
+    # num_waves: waves splitting the N (inter_dim) tile -- existing semantics.
     num_waves = min(4, tile_n // 32)
-    total_threads = num_waves * 64
+    # k_split: intra-block K-slicing. The N-waves are replicated k_split times;
+    # each replica (wave_k_id) computes a contiguous K-slice and the partial
+    # accumulators are reduced in LDS before the epilogue. k_split=1 keeps the
+    # original single-K-group behaviour byte-for-byte.
+    num_n_waves = num_waves
+    num_waves_total = num_n_waves * k_split
+    # a_load_threads: threads cooperating on ONE A(X) tile. With k_split>1 each
+    # K-group fills its own A-LDS buffer using only its own (num_n_waves*64)
+    # threads, so the cooperative-load striding is group-local.
+    a_load_threads = num_n_waves * 64
+    total_threads = num_waves_total * 64
     pack_M = 1 if tile_m < 32 else 2
     n_per_wave = tile_n // num_waves
     pack_N = min(2, n_per_wave // 16)
@@ -224,12 +238,36 @@ def compile_mixed_moe_gemm1(
         _k_per_batch = model_dim
     _k_dim = _k_per_batch
 
+    # Intra-block K-slicing constraints (prototype scope). Keep the change off
+    # the production fast paths: only a4w4 (fp4xfp4), gate/up SEPARATED, no
+    # cross-CTA split-K, no async copy, no persistence.
+    if k_split > 1:
+        if not (is_f4_a and is_f4_b):
+            raise NotImplementedError("k_split>1 only supports a4w4 (fp4xfp4)")
+        if mock_gate_only or gate_up_interleave:
+            raise NotImplementedError("k_split>1 only supports SEPARATED gate/up")
+        if _is_splitk:
+            raise NotImplementedError("k_split>1 is incompatible with k_batch>1")
+        if use_async_copy:
+            raise NotImplementedError("k_split>1 does not support async copy")
+        if persist_m != 1:
+            raise NotImplementedError("k_split>1 requires persist_m=1")
+        if _k_dim % k_split != 0:
+            raise ValueError(f"model_dim={_k_dim} not divisible by k_split={k_split}")
+        _klen = _k_dim // k_split
+        if _klen % tile_k != 0:
+            raise ValueError(f"K per group={_klen} not divisible by tile_k={tile_k}")
+    else:
+        _klen = _k_dim
+
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
-    if bytes_x_per_tile % total_threads != 0:
+    # A(X) tile is cooperatively loaded by a_load_threads (one K-group's worth).
+    # For k_split=1 this equals total_threads (unchanged behaviour).
+    if bytes_x_per_tile % a_load_threads != 0:
         raise ValueError(
-            f"tile_m*tile_k*elem_bytes must be divisible by {total_threads}"
+            f"tile_m*tile_k*elem_bytes must be divisible by {a_load_threads}"
         )
-    bytes_per_thread_x = bytes_x_per_tile // total_threads
+    bytes_per_thread_x = bytes_x_per_tile // a_load_threads
 
     _use_lds128 = os.environ.get("FLIR_CK_LDS128", "1") in (
         "1",
@@ -265,18 +303,22 @@ def compile_mixed_moe_gemm1(
     _sort_tag = "_sort" if _need_sort else ""
     _async_tag = "_async" if use_async_copy else ""
     _sk_tag = f"_sk{k_batch}" if _is_splitk else ""
+    _ks_tag = f"_ks{k_split}" if k_split > 1 else ""
     _go_tag = "_go" if mock_gate_only else ""
     _gui_tag = "_gui" if gate_up_interleave else ""
     _as1_tag = "_as1" if a_scale_one else ""
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_ks_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
     ).replace("-", "_")
 
     # -- LDS sizing --
     _cshuffle_elem_bytes = 4 if _need_quant else (4 if out_is_f32 else 2)
     _single_x_bytes = int(tile_m) * int(lds_stride) * int(a_elem_bytes)
+    # With k_split>1 each K-group owns its own A tile (k_split contiguous tiles
+    # per ping/pong buffer). The reduction scratch reuses this (freed) region.
+    _x_region_bytes = k_split * _single_x_bytes
     lds_out_bytes = (
         _cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     )
@@ -287,16 +329,18 @@ def compile_mixed_moe_gemm1(
     # Standard layout: pong = max(input, lds_out) + tid, ping = input.
     # When this overflows, split lds_out into two halves across pong & ping.
     _GLOBAL_ALIGN = 1024
-    _std_pong = max(_single_x_bytes, lds_out_bytes) + lds_tid_bytes
-    _std_ping = _single_x_bytes
+    _std_pong = max(_x_region_bytes, lds_out_bytes) + lds_tid_bytes
+    _std_ping = _x_region_bytes
     _std_pong_aligned = allocator_pong._align(_std_pong, 128)
     _std_total = allocator_pong._align(
         _std_pong_aligned, _GLOBAL_ALIGN
     ) + allocator_pong._align(_std_ping, 128)
     _lds_limit = {"gfx950": 163840, "gfx942": 65536}.get(gpu_arch, 0)
 
+    # k_split mode keeps lds_out un-split (LDS budget is ample on gfx950).
     _split_lds_out = (
-        _lds_limit > 0
+        k_split == 1
+        and _lds_limit > 0
         and lds_out_bytes > 0
         and _std_total > _lds_limit
         and num_waves >= 2
@@ -307,8 +351,8 @@ def compile_mixed_moe_gemm1(
         _pong_buffer_bytes = max(_single_x_bytes, _half_out_bytes)
         _ping_buffer_bytes = max(_single_x_bytes, _half_out_bytes)
     else:
-        _pong_buffer_bytes = max(_single_x_bytes, lds_out_bytes)
-        _ping_buffer_bytes = _single_x_bytes
+        _pong_buffer_bytes = max(_x_region_bytes, lds_out_bytes)
+        _ping_buffer_bytes = _x_region_bytes
 
     def x_lds_elem():
         return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
@@ -443,7 +487,7 @@ def compile_mixed_moe_gemm1(
 
     if True:
 
-        @flyc.kernel(name=module_name)
+        @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
         def moe_gemm1(
             arg_out: fx.Pointer,
             arg_x: fx.Pointer,
@@ -575,7 +619,7 @@ def compile_mixed_moe_gemm1(
                 k_base_idx = bz * arith.constant(_k_dim, index=True)
 
             k_blocks16 = arith.constant(_eff_tile_k_bytes // 16, index=True)
-            layout_tx_wave_lane = fx.make_layout((num_waves, 64), stride=(64, 1))
+            layout_tx_wave_lane = fx.make_layout((num_waves_total, 64), stride=(64, 1))
             layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
 
             base_ptr_pong = allocator_pong.get_base()
@@ -719,6 +763,8 @@ def compile_mixed_moe_gemm1(
             )
 
             def _moe_gemm1_body():
+                # k_split rebinds these per-K-group (see wave decomposition).
+                nonlocal k_base_idx, lds_x_pong, lds_x_ping
                 # Gate expert offset: first inter_dim rows of each expert's 2*inter_dim block
                 expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
 
@@ -737,7 +783,14 @@ def compile_mixed_moe_gemm1(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
                 )
                 c_chunk_i32 = arith.constant(chunk_i32, index=True)
-                tx_i32_base = tx * c_chunk_i32
+                # Group-local thread id for the cooperative A(X) load: with
+                # k_split>1 each K-group's a_load_threads threads fill their own
+                # A tile. a_load_threads == total_threads when k_split==1.
+                if const_expr(k_split > 1):
+                    _x_load_tid = tx % arith.constant(a_load_threads, index=True)
+                else:
+                    _x_load_tid = tx
+                tx_i32_base = _x_load_tid * c_chunk_i32
 
                 topk_i32 = arith.constant(topk)
                 mask24 = arith.constant(0xFFFFFF)
@@ -748,7 +801,7 @@ def compile_mixed_moe_gemm1(
                         arith,
                         tx_i32_base=tx_i32_base,
                         i=i,
-                        total_threads=total_threads,
+                        total_threads=a_load_threads,
                         layout_tile_div4=layout_x_tile_div4,
                         chunk_i32=chunk_i32,
                     )
@@ -813,6 +866,24 @@ def compile_mixed_moe_gemm1(
                 lane_mod_16 = layout_get(coord_l16, 1)
                 row_a_lds = lane_mod_16
                 col_offset_base = lane_div_16 * arith.constant(16, index=True)
+
+                # Intra-block K-slicing: give this wave its own K-group and a
+                # private A(X)-LDS buffer (ping/pong). W/scale loads are keyed by
+                # base_k, so offsetting k_base_idx makes them fetch this group's
+                # K-slice automatically. k_split==1 leaves everything unchanged.
+                if const_expr(k_split > 1):
+                    wave_k_id = wave_id / arith.constant(num_n_waves, index=True)
+                    k_base_idx = k_base_idx + wave_k_id * arith.constant(_klen, index=True)
+                    _grp_x_bytes = wave_k_id * arith.constant(_single_x_bytes, index=True)
+                    _x_view_ty = _mT.memref(
+                        _input_elems, x_lds_elem(), memory_space=_lds_space()
+                    )
+                    _pong_off = arith.constant(lds_pong_offset, index=True) + _grp_x_bytes
+                    _ping_off = arith.constant(lds_ping_offset, index=True) + _grp_x_bytes
+                    lds_x_pong = memref.view(_x_view_ty, base_ptr_pong, _pong_off, sizes=[])
+                    lds_x_ping = memref.view(_x_view_ty, base_ptr_ping, _ping_off, sizes=[])
+                else:
+                    wave_k_id = arith.index(0)
 
                 num_acc_n = n_per_wave // 16
                 c_n_per_wave = arith.constant(n_per_wave, index=True)
@@ -1583,30 +1654,32 @@ def compile_mixed_moe_gemm1(
                         _x_regs = load_x_tile(_abs_k_dma)
 
                     # ---- Extract previous scale values ----
+                    # Extract ALL k_unroll_packed*count entries (ku-major), so
+                    # tile_k>256 (k_unroll_packed>1) selects per-ku128 scales below.
                     _prev_asvs = []
-                    for _mi_p in range_constexpr(m_repeat_packed):
+                    for _i_as in range_constexpr(len(prev_a_scale)):
                         _prev_asvs.append(
                             vector.extract(
-                                prev_a_scale[_mi_p],
+                                prev_a_scale[_i_as],
                                 static_position=[0],
                                 dynamic_position=[],
                             )
                         )
                     _prev_gsv_list = []
-                    for _gs_ni in range_constexpr(num_acc_n_packed):
+                    for _i_gs in range_constexpr(len(prev_gate_bs)):
                         _prev_gsv_list.append(
                             vector.extract(
-                                prev_gate_bs[_gs_ni],
+                                prev_gate_bs[_i_gs],
                                 static_position=[0],
                                 dynamic_position=[],
                             )
                         )
                     if const_expr(not _single_b_pipe):
                         _prev_usv_list = []
-                        for _us_ni in range_constexpr(num_acc_n_packed):
+                        for _i_us in range_constexpr(len(prev_up_bs)):
                             _prev_usv_list.append(
                                 vector.extract(
-                                    prev_up_bs[_us_ni],
+                                    prev_up_bs[_i_us],
                                     static_position=[0],
                                     dynamic_position=[],
                                 )
@@ -1618,42 +1691,50 @@ def compile_mixed_moe_gemm1(
                     _b_up_all = {}
 
                     for _p in range_constexpr(_pipe_n_phases):
-                        # Scale VMEM loads (phase 0 only)
+                        # Scale VMEM loads (phase 0 only). Loop over the
+                        # k_unroll_packed packed-ku steps in this tile (tile_k>256
+                        # has >1); each steps the scale offset by stride_k0. The
+                        # ku-major append order matches prefetch_ab_scale_tile and
+                        # compute_tile's gate_b_scale[ku128*nap + ni] indexing.
                         if const_expr(_pp_has_scale[_p]):
                             _new_as_list = []
-                            for _mi_p in range_constexpr(m_repeat_packed):
-                                if const_expr(a_scale_one):
-                                    _new_as_list.append(_as1_const)
-                                else:
-                                    _raw_as = buffer_ops.buffer_load(
-                                        sx_rsrc,
-                                        _a_scale_bases[_mi_p] + _k_off,
-                                        vec_width=1,
-                                        dtype=T.i32,
-                                        cache_modifier=0,
-                                    )
-                                    _new_as_list.append(_rearrange_a_scale(_raw_as))
                             _new_gs_list = []
-                            for _gs_ni in range_constexpr(num_acc_n_packed):
-                                _gs_raw = buffer_ops.buffer_load(
-                                    sw_rsrc,
-                                    _gate_scale_bases[_gs_ni] + _k_off,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                    cache_modifier=0,
-                                )
-                                _new_gs_list.append(_rearrange_b_scale(_gs_raw))
-                            if const_expr(not _single_b_pipe):
-                                _new_us_list = []
-                                for _us_ni in range_constexpr(num_acc_n_packed):
-                                    _us_raw = buffer_ops.buffer_load(
+                            _new_us_list = [] if const_expr(not _single_b_pipe) else None
+                            for _ku_s in range_constexpr(k_unroll_packed):
+                                _ku_off = _k_off + arith.constant(
+                                    _ku_s, index=True
+                                ) * layout_b_scale.stride_k0
+                                for _mi_p in range_constexpr(m_repeat_packed):
+                                    if const_expr(a_scale_one):
+                                        _new_as_list.append(_as1_const)
+                                    else:
+                                        _raw_as = buffer_ops.buffer_load(
+                                            sx_rsrc,
+                                            _a_scale_bases[_mi_p] + _ku_off,
+                                            vec_width=1,
+                                            dtype=T.i32,
+                                            cache_modifier=0,
+                                        )
+                                        _new_as_list.append(_rearrange_a_scale(_raw_as))
+                                for _gs_ni in range_constexpr(num_acc_n_packed):
+                                    _gs_raw = buffer_ops.buffer_load(
                                         sw_rsrc,
-                                        _up_scale_bases[_us_ni] + _k_off,
+                                        _gate_scale_bases[_gs_ni] + _ku_off,
                                         vec_width=1,
                                         dtype=T.i32,
                                         cache_modifier=0,
                                     )
-                                    _new_us_list.append(_rearrange_b_scale(_us_raw))
+                                    _new_gs_list.append(_rearrange_b_scale(_gs_raw))
+                                if const_expr(not _single_b_pipe):
+                                    for _us_ni in range_constexpr(num_acc_n_packed):
+                                        _us_raw = buffer_ops.buffer_load(
+                                            sw_rsrc,
+                                            _up_scale_bases[_us_ni] + _ku_off,
+                                            vec_width=1,
+                                            dtype=T.i32,
+                                            cache_modifier=0,
+                                        )
+                                        _new_us_list.append(_rearrange_b_scale(_us_raw))
 
                         # B VMEM loads
                         for _b_j in range_constexpr(len(_pp_b_loads[_p])):
@@ -1705,14 +1786,17 @@ def compile_mixed_moe_gemm1(
                                 if not _single_b_pipe
                                 else None
                             )
+                            # Select this MFMA's packed-ku scale slice (ku-major).
+                            _as_off = _ku128 * m_repeat_packed
+                            _bs_idx = _ku128 * num_acc_n_packed + _ni_packed_idx
                             compute_bmajor_mfma_phase(
                                 prev_a_tile,
                                 _mk_single(prev_gate_w[_k_idx], _ni_idx),
                                 _up_b_single,
-                                _prev_asvs,
-                                _prev_gsv_list[_ni_packed_idx],
+                                _prev_asvs[_as_off : _as_off + m_repeat_packed],
+                                _prev_gsv_list[_bs_idx],
                                 (
-                                    _prev_usv_list[_ni_packed_idx]
+                                    _prev_usv_list[_bs_idx]
                                     if not _single_b_pipe
                                     else None
                                 ),
@@ -1755,27 +1839,29 @@ def compile_mixed_moe_gemm1(
                         if const_expr(not _single_b_pipe):
                             cur_up_w.append((u_packs0, u_packs1, u_packs2, u_packs3))
 
+                    # Repackage ALL k_unroll_packed*count scale entries (tile_k>256
+                    # produces >1 packed-ku worth); iterate the full built lists.
                     cur_a_scale = []
-                    for _mi_p in range_constexpr(m_repeat_packed):
+                    for _i_as in range_constexpr(len(_new_as_list)):
                         cur_a_scale.append(
                             vector.from_elements(
                                 T.vec(1, T.i32),
-                                [_new_as_list[_mi_p]],
+                                [_new_as_list[_i_as]],
                             )
                         )
                     cur_gate_bs = []
-                    for _gs_ni in range_constexpr(num_acc_n_packed):
+                    for _i_gs in range_constexpr(len(_new_gs_list)):
                         cur_gate_bs.append(
                             vector.from_elements(
-                                T.vec(1, T.i32), [_new_gs_list[_gs_ni]]
+                                T.vec(1, T.i32), [_new_gs_list[_i_gs]]
                             )
                         )
                     if const_expr(not _single_b_pipe):
                         cur_up_bs = []
-                        for _us_ni in range_constexpr(num_acc_n_packed):
+                        for _i_us in range_constexpr(len(_new_us_list)):
                             cur_up_bs.append(
                                 vector.from_elements(
-                                    T.vec(1, T.i32), [_new_us_list[_us_ni]]
+                                    T.vec(1, T.i32), [_new_us_list[_i_us]]
                                 )
                             )
                     else:
@@ -1846,7 +1932,7 @@ def compile_mixed_moe_gemm1(
                 rocdl.sched_barrier(0)
                 rocdl.s_waitcnt(6)
 
-                num_k_tiles_py = int(_k_dim) // int(tile_k)
+                num_k_tiles_py = int(_klen) // int(tile_k)
                 odd_k_tiles = (num_k_tiles_py % 2) == 1
                 tail_tiles = 1 if odd_k_tiles else 2
                 k_main2_py = (num_k_tiles_py - tail_tiles) * int(tile_k)
@@ -1939,7 +2025,7 @@ def compile_mixed_moe_gemm1(
                         ku_count=_tail_ku if _pad_ku_skip > 0 else k_unroll,
                     )
                 else:
-                    _k_tail_rel = arith.constant(_k_dim - tile_k, index=True)
+                    _k_tail_rel = arith.constant(_klen - tile_k, index=True)
                     k_tail1 = k_base_idx + _k_tail_rel
                     x_regs_ping = []
                     if const_expr(use_async_copy):
@@ -2077,6 +2163,62 @@ def compile_mixed_moe_gemm1(
                         return _swiglu_mul_vec4(gate_v4, up_v4)
                     else:
                         return _silu_mul_vec4(gate_v4, up_v4)
+
+                # Intra-block K-slice reduction: sum the per-K-group partial
+                # accumulators across the k_split wave-groups (same wave_n_id)
+                # through LDS, broadcasting the full-K result back to every wave
+                # so the activation/epilogue below runs identically on all waves
+                # (avoids barrier divergence). Reuses the now-free A(X)-LDS
+                # region (pong=gate, ping=up) as f32 scratch. Done before the
+                # bias add so bias is applied once to the summed result.
+                if const_expr(k_split > 1):
+                    _nm = num_acc_n * m_repeat
+                    _grp_stride = 64 * _nm  # vec4 slots per wave
+                    _scr_ty = _mT.memref(
+                        num_waves_total * _grp_stride * 4, f32, memory_space=_lds_space()
+                    )
+                    _scr_g = memref.view(
+                        _scr_ty,
+                        base_ptr_pong,
+                        arith.constant(lds_pong_offset, index=True),
+                        sizes=[],
+                    )
+                    _scr_u = memref.view(
+                        _scr_ty,
+                        base_ptr_ping,
+                        arith.constant(lds_ping_offset, index=True),
+                        sizes=[],
+                    )
+                    _c_gs = arith.constant(_grp_stride, index=True)
+                    _c_nm = arith.constant(_nm, index=True)
+                    _c4 = arith.constant(4, index=True)
+                    _lane_off = lane_id * _c_nm
+                    _my_base = wave_id * _c_gs + _lane_off
+                    gpu.barrier()
+                    for _ai in range_constexpr(_nm):
+                        _sidx = (_my_base + arith.constant(_ai, index=True)) * _c4
+                        vector.store(acc_gate[_ai], _scr_g, [_sidx], alignment=16)
+                        vector.store(acc_up[_ai], _scr_u, [_sidx], alignment=16)
+                    gpu.barrier()
+                    for _ai in range_constexpr(_nm):
+                        _sg = acc_init
+                        _su = acc_init
+                        for _g in range_constexpr(k_split):
+                            _peer = (
+                                arith.constant(_g * num_n_waves, index=True) + wave_n_id
+                            )
+                            _pidx = (
+                                _peer * _c_gs
+                                + _lane_off
+                                + arith.constant(_ai, index=True)
+                            ) * _c4
+                            _gv = vector.load_op(vec4_f32, _scr_g, [_pidx])
+                            _uv = vector.load_op(vec4_f32, _scr_u, [_pidx])
+                            _sg = arith.addf(_sg, _gv)
+                            _su = arith.addf(_su, _uv)
+                        acc_gate[_ai] = _sg
+                        acc_up[_ai] = _su
+                    gpu.barrier()
 
                 # Add bias to raw GEMM accumulators before activation.
                 # bias layout: [E, 2*inter_dim] flat f32 (non-interleaved: gate then up).
