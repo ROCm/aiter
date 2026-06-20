@@ -17,6 +17,7 @@
  */
 #include "aiter_hip_common.h"
 #include "hip_float8.h"
+#include "hip_reduce.h"
 #include "opus/opus.hpp"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -1593,7 +1594,7 @@ __device__ __forceinline__ T ar_fusion_epilogue_block_reduce(T val, int block_si
     int reduce_width    = 1;
     while(reduce_width < num_warps)
         reduce_width <<= 1;
-    val                 = warpReduce<functor, T, WARP_SIZE>(val);
+    val                 = multithread_reduce<T, functor<T>, WARP_SIZE>(val, functor<T>{}, WARP_SIZE);
     if(w_tid == 0)
     {
         shared[wid] = val;
