@@ -1555,7 +1555,9 @@ namespace py = pybind11;
           py::arg("cos"),                                                                    \
           py::arg("sin"),                                                                    \
           py::arg("positions"),                                                              \
-          py::arg("rope_dim"));
+          py::arg("rope_dim"),                                                               \
+          py::arg("out_scale") = std::nullopt,                                               \
+          py::arg("group_size") = 128);
 
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
     m.def("init_custom_qr",                                                                \
