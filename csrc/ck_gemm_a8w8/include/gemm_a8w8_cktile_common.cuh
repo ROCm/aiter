@@ -126,7 +126,7 @@ struct EpilogueTraits<EDataType, false>
 };
 
 // Needed only for passing AQDataType and BQDataType to QuantGemmKernel
-template <typename Problem, typename Policy = ck_tile::UniversalGemmPipelineAgBgCrPolicy>
+template <typename Problem, typename Policy = ck_tile::GemmPipelineAgBgCrDefaultPolicy>
 struct QuantGemmPipelineAgBgCrCompV3 : public ck_tile::GemmPipelineAgBgCrCompV3<Problem, Policy>
 {
     using AQDataType = ck_tile::remove_cvref_t<typename Problem::AQDataType>;
