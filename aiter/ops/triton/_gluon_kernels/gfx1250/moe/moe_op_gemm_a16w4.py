@@ -4,7 +4,7 @@ import torch
 import triton.language as tl
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
 
@@ -170,24 +170,23 @@ def _moe_gemm_a16w4(
 
     pid = gl.program_id(0)
 
-    padding_m: gl.constexpr = 0
     index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
 
-    unpadded_m = grid_m - padding_m
-    gl.assume(unpadded_m >= 0)
-    total_actual_tiles = unpadded_m * grid_n * SPLIT_K
-    if padding_m > 0 and pid >= total_actual_tiles:
-        return
+    if XCD_SWIZZLE != 1:
+        padding_m = grid_m - gl.load(ExptOffsSum)
+        unpadded_m = grid_m - padding_m
+        total_actual_tiles = unpadded_m * grid_n
+        if padding_m > 0 and pid >= total_actual_tiles:
+            return
+        pid = remap_xcd(pid, total_actual_tiles, XCD_SWIZZLE)
+    else:
+        unpadded_m = grid_m
 
-    pid_emnk = pid
-    pid_mnk = pid_emnk % (unpadded_m * grid_n * SPLIT_K)
-    pid_k = pid_mnk % SPLIT_K
-    pid_mn = pid_mnk // SPLIT_K
-    pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, GROUP_M)
+    pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, 1)
 
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)
-    if expt_data == -1:
+    if XCD_SWIZZLE == 1 and expt_data == -1:
         return
     expt_id = expt_data & 0x0000FFFF
     block_id = expt_data >> 16
@@ -195,7 +194,7 @@ def _moe_gemm_a16w4(
     start_m = gl.load(ExptOffs + expt_id)
     expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
     start_m = start_m.to(index_type)
-    pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
+    pid_n = pid_n.to(index_type)
 
     # X / gather offsets
     offs_x_m_scalar = BLOCK_M * block_id
@@ -203,13 +202,27 @@ def _moe_gemm_a16w4(
         X += start_m * stride_x_m
         offs_x_m = offs_x_m_scalar  # unused in non-gather path
     else:
-        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-            0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
-        )
+        if GatherIndx.dtype.element_ty == gl.uint16:
+            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
+                0, gl.BlockedLayout([1, 16], [32, 1], [1, num_warps], [0, 1])
+            )
+            oob_idx = (num_tokens).to(gl.uint16)
+        else:
+            gl.static_assert(
+                GatherIndx.dtype.element_ty == gl.int32,
+                "Gather index datatype should be uint16 or int32",
+            )
+            IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
+                0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
+            )
+            oob_idx = num_tokens
+
         offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
+        mask_idx = offs_x_m < M
+        offs_x_m = offs_x_m % M
         GatherIndx += start_m
-        # No need to bounds-check: `offs_x_m` wraps around M dim.
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+        offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
 
     W_K_DIVISOR: gl.constexpr = 2  # fp4: two values packed per uint8 along K
     W_N_DIVISOR: gl.constexpr = 1
@@ -267,6 +280,9 @@ def _moe_gemm_a16w4(
     )
     SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [BLOCK_N, BLOCK_K], [1, 0]
+    )
+    SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
     )
 
     if GatherIndx is None:
@@ -419,11 +435,24 @@ def _moe_gemm_a16w4(
         gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
 
+    out = out.to(gl.bfloat16)
+
+    # TDM Store: accumulator -> shared memory -> global memory
     Y += start_m * stride_y_m
-    offs_y_m = offs_m
-    offs_y = (
-        offs_y_m.to(index_type)[:, None] * stride_y_m
-        + offs_y_n.to(index_type)[None, :] * stride_y_n
+    y_buffer = gl.allocate_shared_memory(
+        Y.type.element_ty,
+        shape=[BLOCK_M, OUT_BLOCK_N],
+        layout=SHARED_LAYOUT_Y,
     )
-    mask = mask_m[:, None] & mask_n[None, :]
-    gl.amd.gfx1250.buffer_store(out.to(Y.dtype.element_ty), Y, offs_y, mask=mask)
+    y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=Y,
+        shape=(M, yN),
+        strides=(stride_y_m, stride_y_n),
+        block_shape=(BLOCK_M, OUT_BLOCK_N),
+        layout=SHARED_LAYOUT_Y,
+    )
+    y_buffer.store(out)
+    gl.amd.gfx1250.tdm.async_store(
+        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+    )
+    gl.amd.gfx1250.tdm.async_wait(0)
