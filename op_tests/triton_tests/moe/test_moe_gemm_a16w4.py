@@ -190,16 +190,17 @@ class Case:
             Case(300, 400, 800, 8, 4),
             Case(1000, 704, 800, 8, 2),
             Case(4097, 1024, 1024, 128, 4),
-            # Case(16, 256, 256, 8, 4, hbm_swizzling=True),
-            # Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
-            # Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
-            # Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
-            # Case(16, 1024, 1024, 2, 1, hbm_swizzling=True),
-            # Case(16, 256, 256, 128, 4, hbm_swizzling=True),
-            # Case(1024, 3072, 512, 128, 4, hbm_swizzling=True),
-            # Case(4096, 256, 256, 128, 4, hbm_swizzling=True),
-            # Case(4097, 1024, 1024, 128, 4, hbm_swizzling=True),
-            # Case(8192, 3072, 3072, 128, 4, hbm_swizzling=True),
+            Case(16, 32, 256, 2, 1, hbm_swizzling=True),
+            Case(16, 256, 256, 8, 4, hbm_swizzling=True),
+            Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
+            Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
+            Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
+            Case(16, 1024, 1024, 2, 1, hbm_swizzling=True),
+            Case(16, 256, 256, 128, 4, hbm_swizzling=True),
+            Case(1024, 3072, 512, 128, 4, hbm_swizzling=True),
+            Case(4096, 256, 256, 128, 4, hbm_swizzling=True),
+            Case(4097, 1024, 1024, 128, 4, hbm_swizzling=True),
+            Case(8192, 3072, 3072, 128, 4, hbm_swizzling=True),
         ]
     ],
 )
@@ -214,6 +215,8 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
+# @pytest.mark.parametrize("has_y_gammas", [False])
+# @pytest.mark.parametrize("apply_swiglu", [False])
 def test_op(
     m,
     n,
@@ -277,15 +280,16 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        if arch_info().get_arch() == "gfx1250":
+        # print(f"Before swizzle w_scale_tri={w_scale_tri}")
+        if arch_info.get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
             w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
+            # print(f"Post gfx1250 swizzle w_scale_tri={w_scale_tri}")
         else:
-            assert arch_info().get_arch() == "gfx950"
+            assert arch_info.get_arch() == "gfx950"
             swizzle_mx_scale = "CDNA4_SCALE"
             w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
+            # print(f"Post gfx950 swizzle w_scale_tri={w_scale_tri}")
     else:
         swizzle_mx_scale = None
 

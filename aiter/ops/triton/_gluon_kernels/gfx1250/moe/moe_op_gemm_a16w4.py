@@ -77,6 +77,30 @@ def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: gl.constexpr):
     return new_pid
 
 
+@gluon.jit
+def unswizzle_mx_scale_gfx1250(
+    scale, BLOCK_N, MX_SCALE_BLOCK_K, PRESHUFFLE_FACTOR, SCALE_KWIDTH, MX_PACK_DIVISOR
+):
+    # Step 1: invert the host-side preshuffle. The loaded compact tile is
+    # (BLOCK_N // PRESHUFFLE_FACTOR, MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR); the
+    # contiguous dim packs (k0, n1, k1), so reshape + permute reassembles the
+    # logical compact scale (BLOCK_N, MX_SCALE_BLOCK_K) (one byte per 32-elem group).
+    scale = (
+        scale.reshape(
+            (
+                BLOCK_N // PRESHUFFLE_FACTOR,
+                MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+            )
+        )
+        .permute((0, 2, 1, 3))
+        .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
+    )
+
+    return scale
+
+
 @gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a16w4(
     Y,
@@ -132,10 +156,10 @@ def _moe_gemm_a16w4(
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
 ):
-    gl.static_assert(
-        SWIZZLE_MX_SCALE is None,
-        "Gluon a16w4 path requires pre-expanded scales (SWIZZLE_MX_SCALE=None)",
-    )
+    # gl.static_assert(
+    #    SWIZZLE_MX_SCALE is None,
+    #    "Gluon a16w4 path requires pre-expanded scales (SWIZZLE_MX_SCALE=None)",
+    # )
 
     gl.assume(stride_y_k >= 0)
     gl.assume(stride_y_m >= 0)
@@ -228,13 +252,30 @@ def _moe_gemm_a16w4(
     W_N_DIVISOR: gl.constexpr = 1
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // W_K_DIVISOR
     PACKED_BLOCK_N_W: gl.constexpr = BLOCK_N // W_N_DIVISOR
+    MX_SCALE_BLOCK_K: gl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
     off_w_n = pid_n * PACKED_BLOCK_N_W
-    # WMxScale is the pre-expanded e8m0 tensor of shape (E, K, N); we read it as (N, K).
-    off_w_n_scale = pid_n * BLOCK_N
 
     W += expt_id * stride_w_e
     WMxScale += expt_id * stride_w_mx_e
+    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+        gl.static_assert(stride_w_mx_k is not None)
+        gl.static_assert(stride_w_mx_n is not None)
+        PRESHUFFLE_FACTOR: gl.constexpr = 32
+        PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
+        SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
+        SCALE_KWIDTH: gl.constexpr = 8
+    else:
+        PRESHUFFLE_FACTOR: gl.constexpr = 1
+        PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
+        SCALE_BLOCK_N: gl.constexpr = BLOCK_N
+
+    # Scale tile offsets are in units of the scale descriptor's own blocking
+    # (N block = SCALE_BLOCK_N, K block = PACKED_MX_BLOCK) -- NOT the weight's
+    # BLOCK_N / BLOCK_K. For the compact (non-swizzle) scale the K dimension is
+    # cdiv(K, 32), so the per-tile K step is PACKED_MX_BLOCK (= MX_SCALE_BLOCK_K),
+    # not BLOCK_K.
+    off_w_n_scale = pid_n * SCALE_BLOCK_N
 
     # WMMA layout for plain bf16 x bf16: instr_shape [16, 16, 32], k_width=8.
     if num_warps == 4:
@@ -279,7 +320,10 @@ def _moe_gemm_a16w4(
         [[PACKED_BLOCK_K_W, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0]
     )
     SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K, 16]], [BLOCK_N, BLOCK_K], [1, 0]
+        # [[BLOCK_K, 16]], [BLOCK_N, BLOCK_K], [1, 0]
+        [[BLOCK_K, 16]],
+        [SCALE_BLOCK_N, PACKED_MX_BLOCK],
+        [1, 0],
     )
     SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
@@ -312,9 +356,11 @@ def _moe_gemm_a16w4(
 
     ws_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=WMxScale,
-        shape=(N, K),
+        # shape=(N, K),
+        shape=(N // PRESHUFFLE_FACTOR, tl.cdiv(K, MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR),
         strides=(stride_w_mx_n, stride_w_mx_k),
-        block_shape=(BLOCK_N, BLOCK_K),
+        # block_shape=(BLOCK_N, BLOCK_K),
+        block_shape=(SCALE_BLOCK_N, PACKED_MX_BLOCK),
         layout=SHARED_LAYOUT_W_SCALES,
     )
 
@@ -338,6 +384,7 @@ def _moe_gemm_a16w4(
         idx = producer % NUM_BUFFERS
         k_off = producer * BLOCK_K
         kp_off = producer * PACKED_BLOCK_K_W
+        ks_off = producer * PACKED_MX_BLOCK
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc, [offs_x_m_scalar, k_off], x_buffer.index(idx)
@@ -348,7 +395,7 @@ def _moe_gemm_a16w4(
             )
         gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, kp_off], w_buffer.index(idx))
         gl.amd.gfx1250.tdm.async_load(
-            ws_desc, [off_w_n_scale, k_off], ws_buffer.index(idx)
+            ws_desc, [off_w_n_scale, ks_off], ws_buffer.index(idx)
         )
         producer += 1
 
@@ -363,6 +410,7 @@ def _moe_gemm_a16w4(
         idx = producer % NUM_BUFFERS
         k_off = producer * BLOCK_K
         kp_off = producer * PACKED_BLOCK_K_W
+        ks_off = producer * PACKED_MX_BLOCK
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc, [offs_x_m_scalar, k_off], x_buffer.index(idx)
@@ -373,7 +421,7 @@ def _moe_gemm_a16w4(
             )
         gl.amd.gfx1250.tdm.async_load(w_desc, [off_w_n, kp_off], w_buffer.index(idx))
         gl.amd.gfx1250.tdm.async_load(
-            ws_desc, [off_w_n_scale, k_off], ws_buffer.index(idx)
+            ws_desc, [off_w_n_scale, ks_off], ws_buffer.index(idx)
         )
         producer += 1
 
@@ -383,6 +431,21 @@ def _moe_gemm_a16w4(
         x_tile = x_buffer.index(c_idx).load(layout=DOT_LAYOUT_X)
         w_packed = w_buffer.index(c_idx).load(layout=PACKED_LAYOUT)
         w_scale = ws_buffer.index(c_idx).load(layout=UNPACKED_LAYOUT)
+        if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scale = unswizzle_mx_scale_gfx1250(
+                w_scale,
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+                MX_PACK_DIVISOR,
+            )
+        w_scale = (
+            w_scale.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
+            .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
+            .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR))
+        )
+        w_scale = gl.convert_layout(w_scale, UNPACKED_LAYOUT)
         # fp4 -> bf16 with per-32 e8m0 scale folded in. axis=1 means K doubles after unpack.
         w_bf16 = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=1)
         # (N, K) -> (K, N) for the B operand of WMMA, then move to the dot-operand layout.
@@ -421,6 +484,21 @@ def _moe_gemm_a16w4(
         x_tile = x_buffer.index(c_idx).load(layout=DOT_LAYOUT_X)
         w_packed = w_buffer.index(c_idx).load(layout=PACKED_LAYOUT)
         w_scale = ws_buffer.index(c_idx).load(layout=UNPACKED_LAYOUT)
+        if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            w_scale = unswizzle_mx_scale_gfx1250(
+                w_scale,
+                BLOCK_N,
+                MX_SCALE_BLOCK_K,
+                PRESHUFFLE_FACTOR,
+                SCALE_KWIDTH,
+                MX_PACK_DIVISOR,
+            )
+        w_scale = (
+            w_scale.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
+            .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
+            .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR))
+        )
+        w_scale = gl.convert_layout(w_scale, UNPACKED_LAYOUT)
         w_bf16 = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=1)
         w_kn = gl.convert_layout(w_bf16.trans(1, 0), DOT_LAYOUT_W)
         acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
