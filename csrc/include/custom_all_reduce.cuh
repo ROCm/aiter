@@ -1536,7 +1536,7 @@ __global__ void __launch_bounds__(256, 1)
             float tmp_sum = packReduce<AddFunctor, float, pack_size>(reduce_pack);
             square_sum += tmp_sum;
         }
-        square_sum  = warpReduce<AddFunctor, float, 64>(square_sum);
+        square_sum  = wave_reduce<float, AddFunctor<float>, 64, true>(square_sum, AddFunctor<float>{});
         float denom = rsqrtf(square_sum / n + eps);
 #pragma unroll
         for(int n_iter = 0; n_iter < n_loop; ++n_iter)
