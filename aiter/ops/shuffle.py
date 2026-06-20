@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn.functional as F
+from aiter.jit.utils.chip_info import get_gfx
 
 
 def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
@@ -169,20 +170,9 @@ def shuffle_scale(
     experts_cnt: int = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
-    is_n32k4: bool | None = None,
 ) -> torch.Tensor:
     if src is None:
         return src
-    # Leaving is_n32k4 at its default auto-detects the layout: the n32k4
-    # scale folding is only consumed by the gfx1250 grouped MoE GEMM, so we
-    # enable it exactly on gfx1250. Callers may still pass True/False to force
-    # the layout regardless of the running GPU (the interface is preserved).
-    if is_n32k4 is None:
-        from aiter.jit.utils.chip_info import get_gfx
-
-        is_n32k4 = get_gfx() == "gfx1250"
-    if is_n32k4:
-        return shuffle_scale_n32k4(src, experts_cnt)
     if src.dtype == torch.float32:
         return src
     assert src.ndim == 2, "scale must be a 2D tensor"
@@ -233,6 +223,26 @@ def shuffle_scale(
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
     return shfl_scale.view(*src.shape).contiguous()
+
+
+def moe_shuffle_scale(
+    src: torch.Tensor,
+    experts_cnt: int = None,
+    is_guinterleave: bool = False,
+    gate_up: bool = False,
+) -> torch.Tensor:
+    """Arch-aware MoE weight (B) scale shuffle."""
+
+    if get_gfx() == "gfx1250":
+        if is_guinterleave:
+            raise ValueError(
+                "moe_shuffle_scale: is_guinterleave is not supported on gfx1250; "
+                "the n32k4 grouped-MoE B-scale layout does not interleave gate/up."
+            )
+        return shuffle_scale_n32k4(src, experts_cnt)
+    return shuffle_scale(
+        src, experts_cnt=experts_cnt, is_guinterleave=is_guinterleave, gate_up=gate_up
+    )
 
 
 def shuffle_scale_a16w4(

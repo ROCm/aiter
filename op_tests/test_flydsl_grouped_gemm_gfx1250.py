@@ -41,7 +41,7 @@ from aiter.fused_moe import (
 )
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
 from aiter.utility import fp4_utils
 from aiter.utility import dtypes
 
@@ -100,8 +100,8 @@ def is_gfx1250() -> bool:
 # Weights/scales use the public shuffle APIs directly:
 #   shuffle_weight(b, layout=(16, 16))            -> FP4 TDM B layout (16-row x
 #       16-byte chunks) the grouped FlyDSL kernels consume.
-#   shuffle_scale(s, experts_cnt=E, is_n32k4=True) -> grouped-only n32k4 e8m0
-#       scale layout (NOT the default shuffle_scale).
+#   moe_shuffle_scale(s, experts_cnt=E) -> arch-aware MoE B-scale shuffle; on
+#       gfx1250 it folds to the grouped-only n32k4 e8m0 layout (shuffle_scale_n32k4).
 # ---------------------------------------------------------------------------
 # Reference: aiter's own ``torch_moe_stage1`` + ``torch_moe_stage2``
 # (high-precision fp32 baseline that decodes mxfp4/e8m0 internally and
@@ -332,12 +332,8 @@ def _run_grouped_via_fused_moe(
 
     w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
     w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
-    w1_scale = shuffle_scale(
-        w1_scale_phys.contiguous(), experts_cnt=experts, is_n32k4=True
-    )
-    w2_scale = shuffle_scale(
-        w2_scale_raw.contiguous(), experts_cnt=experts, is_n32k4=True
-    )
+    w1_scale = moe_shuffle_scale(w1_scale_phys.contiguous(), experts_cnt=experts)
+    w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
 
     if data_format == "a4w4":
         w1_arg = w1_grouped.view(dtypes.fp4x2)

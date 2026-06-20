@@ -279,7 +279,7 @@ def _grouped_a8w4_prepare_scale_batch(
 
 
 # The weight (B) scale n32k4 preshuffle now lives in aiter.ops.shuffle as
-# shuffle_scale_n32k4 / shuffle_scale(..., is_n32k4=True).  Production consumes
+# shuffle_scale_n32k4 (dispatched on gfx1250 via moe_shuffle_scale).  Production consumes
 # weights that are already preshuffled, so the grouped path only reshapes them
 # (see grouped_w1_scale below); the producer is the shuffle.py helper.
 def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
