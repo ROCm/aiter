@@ -99,11 +99,8 @@ def generate_gemm_afp4wfp4_inputs(
 
     if shuffle_weight_fg:
         # shuffle_weight returns the (N, K) shuffled weight on both arches; reshape
-        # to the (N//16, K*16) layout the kernel consumes (1-byte fp4: gfx950 and
-        # gfx1250 yield identical bytes).
-        w_shuffed = shuffle_weight(w).reshape(
-            w.shape[0] // 16, w.shape[1] * 16
-        )
+        # to the (N//16, K*16) layout the kernel consumes
+        w_shuffed = shuffle_weight(w).reshape(w.shape[0] // 16, w.shape[1] * 16)
     else:
         w_shuffed = w
 

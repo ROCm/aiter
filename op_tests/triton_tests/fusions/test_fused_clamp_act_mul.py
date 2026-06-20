@@ -179,7 +179,9 @@ def test_fused_clamp_act_mul_ue8m0(M, D, swiglu_limit, with_weights, shuffle_sca
         expected = fp4_utils.e8m0_shuffle(ref_scale)
         assert scale.shape == expected.shape
         sm = scale.shape[0]
-        got = unshuffle_scale_gemm(scale.view(sm // 32, -1), arch="gfx950")[:M, :num_blocks]
+        got = unshuffle_scale_gemm(scale.view(sm // 32, -1), arch="gfx950")[
+            :M, :num_blocks
+        ]
         exp = unshuffle_scale_gemm(expected.view(sm // 32, -1), arch="gfx950")[
             :M, :num_blocks
         ]
