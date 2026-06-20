@@ -52,7 +52,8 @@ template <ck_tile::index_t M_Tile,
           bool TransposeC                          = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
-          int BlockPerCu                           = 1>
+          int BlockPerCu                           = 1,
+          bool Async                               = false>
 struct CreateTileGemmConfig
 {
     static constexpr ck_tile::index_t M_Tile_v                  = M_Tile;
@@ -69,6 +70,7 @@ struct CreateTileGemmConfig
     static constexpr bool UsePersistentKernel_v                 = UsePersistentKernel;
     static constexpr ck_tile::GemmPipelineScheduler Scheduler_v = Scheduler;
     static constexpr int BlockPerCu_v                           = BlockPerCu;
+    static constexpr bool Async_v                               = Async;
 };
 
 template <ck_tile::index_t M_Tile,
@@ -84,7 +86,8 @@ template <ck_tile::index_t M_Tile,
           bool TransposeC                          = false,
           bool UsePersistentKernel                 = false,
           ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Intrawave,
-          int BlockPerCu                           = 1>
+          int BlockPerCu                           = 1,
+          bool Async                               = false>
 using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             N_Tile,
                                             K_Tile,
@@ -98,7 +101,8 @@ using TileGemmConfig = CreateTileGemmConfig<M_Tile,
                                             TransposeC,
                                             UsePersistentKernel,
                                             Scheduler,
-                                            BlockPerCu>;
+                                            BlockPerCu,
+                                            Async>;
 
 template <typename EDataType, bool HasBias>
 struct EpilogueTraits;
@@ -157,8 +161,7 @@ void TileGemmComputeImpl(const HostArguments& args)
 
     constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::RowColQuant;
     constexpr bool eight_waves =
-        (GemmConfig::M_Warp_v * GemmConfig::N_Warp_v * GemmConfig::K_Warp_v == 8) &&
-        GemmConfig::K_Warp_Tile_v == 128;
+        (GemmConfig::M_Warp_v * GemmConfig::N_Warp_v * GemmConfig::K_Warp_v == 8);
 
     constexpr bool TransposeC = false;
 
@@ -214,7 +217,9 @@ void TileGemmComputeImpl(const HostArguments& args)
             ComputeDataType,
             GemmConfig::Scheduler_v,
             has_hot_loop_v,
-            tail_number_v>;
+            tail_number_v,
+            ck_tile::CastPolicy::AfterLDSRead,
+            GemmConfig::Async>;
 
         using GemmPipeline =
             std::conditional_t<eight_waves,
