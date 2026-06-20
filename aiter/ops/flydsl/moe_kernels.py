@@ -19,7 +19,9 @@ def _get_dtypes():
     return dtypes
 
 
-_SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
+_SUFFIX_RE = re.compile(
+    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
+)
 
 
 def flydsl_kernel_name(
@@ -45,7 +47,7 @@ def flydsl_kernel_name(
 def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
     """Lookup kernel params by name.
 
-    Strips ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
+    Strips ``_kw{N}`` / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
     """
     params = _KERNEL_PARAMS.get(name)
     if params is not None:
@@ -56,6 +58,8 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
         params = _KERNEL_PARAMS.get(base_name)
         if params is not None:
             extra: Dict = {}
+            if m.group("kw") is not None:
+                extra["k_wave"] = int(m.group("kw"))
             if m.group("fp4"):
                 extra["out_dtype"] = "fp4"
             if m.group("fp8"):
@@ -98,44 +102,58 @@ def get_flydsl_stage1_kernels(
                             )
                             for go in gate_onlys:
                                 for xcd in xcd_swizzles:
-                                    name = flydsl_kernel_name(
+                                    base = flydsl_kernel_name(
                                         1, a_dtype, b_dtype, out_dtype, tm, tn, tk
                                     )
                                     if wpe != 1:
-                                        name += f"_w{wpe}"
+                                        base += f"_w{wpe}"
                                     if kb != 1:
-                                        name += f"_kb{kb}"
+                                        base += f"_kb{kb}"
                                     if bnt != 2:
-                                        name += f"_bnt{bnt}"
+                                        base += f"_bnt{bnt}"
                                     if go:
-                                        name += "_go"
+                                        base += "_go"
                                     if a_dtype == "fp8":
-                                        name += "_gui"
+                                        base += "_gui"
                                     if xcd > 0:
-                                        name += f"_xcd{xcd}"
-                                    kernels[name] = {
-                                        "stage": 1,
-                                        "a_dtype": a_dtype,
-                                        "b_dtype": b_dtype,
-                                        "out_dtype": out_dtype,
-                                        "tile_m": tm,
-                                        "tile_n": tn,
-                                        "tile_k": tk,
-                                        "MPerBlock": tm,
-                                        "waves_per_eu": wpe,
-                                        "k_batch": kb,
-                                        "b_nt": bnt,
-                                        "gate_mode": (
-                                            "mock_gate_only"
-                                            if go
-                                            else (
-                                                "interleave"
-                                                if a_dtype == "fp8"
-                                                else "separated"
-                                            )
-                                        ),
-                                        "xcd_swizzle": xcd,
-                                    }
+                                        base += f"_xcd{xcd}"
+                                    # k_wave (intra-block K-slice): only for the
+                                    # small-M tile (tile_m==32), no split-K/mock,
+                                    # and capped to <=8 total waves (<=512 threads).
+                                    num_n_waves = min(4, tn // 32)
+                                    k_waves = (
+                                        [1, 2, 4]
+                                        if (tm == 32 and kb == 1 and not go)
+                                        else [1]
+                                    )
+                                    for kw in k_waves:
+                                        if num_n_waves * kw > 8:
+                                            continue
+                                        name = base + (f"_kw{kw}" if kw > 1 else "")
+                                        kernels[name] = {
+                                            "stage": 1,
+                                            "a_dtype": a_dtype,
+                                            "b_dtype": b_dtype,
+                                            "out_dtype": out_dtype,
+                                            "tile_m": tm,
+                                            "tile_n": tn,
+                                            "tile_k": tk,
+                                            "MPerBlock": tm,
+                                            "waves_per_eu": wpe,
+                                            "k_batch": kb,
+                                            "b_nt": bnt,
+                                            "gate_mode": (
+                                                "mock_gate_only"
+                                                if go
+                                                else (
+                                                    "interleave"
+                                                    if a_dtype == "fp8"
+                                                    else "separated"
+                                                )
+                                            ),
+                                            "xcd_swizzle": xcd,
+                                            "k_wave": kw,
+                                        }
     return kernels
 
 
@@ -355,7 +373,7 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
-    k_split: int = 1,
+    k_wave: int = 1,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype in ("fp4", "fp8"):
@@ -387,7 +405,7 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             swiglu_limit=swiglu_limit,
-            k_split=k_split,
+            k_wave=k_wave,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -1125,7 +1143,7 @@ def flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
-    k_split: int = 1,
+    k_wave: int = 1,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1313,7 +1331,7 @@ def flydsl_moe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
-        k_split=k_split,
+        k_wave=k_wave,
     )
     _run_compiled(exe, args)
 

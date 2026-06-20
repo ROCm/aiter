@@ -119,7 +119,7 @@ def compile_mixed_moe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
-    k_split: int = 1,
+    k_wave: int = 1,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -156,13 +156,13 @@ def compile_mixed_moe_gemm1(
     sort_block_m = max(32, tile_m)
     # num_waves: waves splitting the N (inter_dim) tile -- existing semantics.
     num_waves = min(4, tile_n // 32)
-    # k_split: intra-block K-slicing. The N-waves are replicated k_split times;
+    # k_wave: intra-block K-slicing. The N-waves are replicated k_wave times;
     # each replica (wave_k_id) computes a contiguous K-slice and the partial
-    # accumulators are reduced in LDS before the epilogue. k_split=1 keeps the
+    # accumulators are reduced in LDS before the epilogue. k_wave=1 keeps the
     # original single-K-group behaviour byte-for-byte.
     num_n_waves = num_waves
-    num_waves_total = num_n_waves * k_split
-    # a_load_threads: threads cooperating on ONE A(X) tile. With k_split>1 each
+    num_waves_total = num_n_waves * k_wave
+    # a_load_threads: threads cooperating on ONE A(X) tile. With k_wave>1 each
     # K-group fills its own A-LDS buffer using only its own (num_n_waves*64)
     # threads, so the cooperative-load striding is group-local.
     a_load_threads = num_n_waves * 64
@@ -238,19 +238,11 @@ def compile_mixed_moe_gemm1(
         _k_per_batch = model_dim
     _k_dim = _k_per_batch
 
-    # Intra-block K-slicing: SEPARATED gate/up only, no split-K/async/persist.
-    if k_split > 1:
-        if mock_gate_only or gate_up_interleave:
-            raise NotImplementedError("k_split>1 only supports SEPARATED gate/up")
-        if _is_splitk:
-            raise NotImplementedError("k_split>1 is incompatible with k_batch>1")
-        if use_async_copy:
-            raise NotImplementedError("k_split>1 does not support async copy")
-        if persist_m != 1:
-            raise NotImplementedError("k_split>1 requires persist_m=1")
-        if _k_dim % k_split != 0:
-            raise ValueError(f"model_dim={_k_dim} not divisible by k_split={k_split}")
-        _klen = _k_dim // k_split
+    # Intra-block K-slicing. K per wave-group must divide evenly into tiles.
+    if k_wave > 1:
+        if _k_dim % k_wave != 0:
+            raise ValueError(f"model_dim={_k_dim} not divisible by k_wave={k_wave}")
+        _klen = _k_dim // k_wave
         if _klen % tile_k != 0:
             raise ValueError(f"K per group={_klen} not divisible by tile_k={tile_k}")
     else:
@@ -258,7 +250,7 @@ def compile_mixed_moe_gemm1(
 
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
     # A(X) tile is cooperatively loaded by a_load_threads (one K-group's worth).
-    # For k_split=1 this equals total_threads (unchanged behaviour).
+    # For k_wave=1 this equals total_threads (unchanged behaviour).
     if bytes_x_per_tile % a_load_threads != 0:
         raise ValueError(
             f"tile_m*tile_k*elem_bytes must be divisible by {a_load_threads}"
@@ -299,22 +291,22 @@ def compile_mixed_moe_gemm1(
     _sort_tag = "_sort" if _need_sort else ""
     _async_tag = "_async" if use_async_copy else ""
     _sk_tag = f"_sk{k_batch}" if _is_splitk else ""
-    _ks_tag = f"_ks{k_split}" if k_split > 1 else ""
+    _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     _go_tag = "_go" if mock_gate_only else ""
     _gui_tag = "_gui" if gate_up_interleave else ""
     _as1_tag = "_as1" if a_scale_one else ""
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_ks_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_kw_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
     ).replace("-", "_")
 
     # -- LDS sizing --
     _cshuffle_elem_bytes = 4 if _need_quant else (4 if out_is_f32 else 2)
     _single_x_bytes = int(tile_m) * int(lds_stride) * int(a_elem_bytes)
-    # With k_split>1 each K-group owns its own A tile (k_split contiguous tiles
+    # With k_wave>1 each K-group owns its own A tile (k_wave contiguous tiles
     # per ping/pong buffer). The reduction scratch reuses this (freed) region.
-    _x_region_bytes = k_split * _single_x_bytes
+    _x_region_bytes = k_wave * _single_x_bytes
     lds_out_bytes = (
         _cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     )
@@ -333,9 +325,9 @@ def compile_mixed_moe_gemm1(
     ) + allocator_pong._align(_std_ping, 128)
     _lds_limit = {"gfx950": 163840, "gfx942": 65536}.get(gpu_arch, 0)
 
-    # k_split mode keeps lds_out un-split (LDS budget is ample on gfx950).
+    # k_wave mode keeps lds_out un-split (LDS budget is ample on gfx950).
     _split_lds_out = (
-        k_split == 1
+        k_wave == 1
         and _lds_limit > 0
         and lds_out_bytes > 0
         and _std_total > _lds_limit
@@ -759,7 +751,7 @@ def compile_mixed_moe_gemm1(
             )
 
             def _moe_gemm1_body():
-                # k_split rebinds these per-K-group (see wave decomposition).
+                # k_wave rebinds these per-K-group (see wave decomposition).
                 nonlocal k_base_idx, lds_x_pong, lds_x_ping
                 # Gate expert offset: first inter_dim rows of each expert's 2*inter_dim block
                 expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
@@ -780,9 +772,9 @@ def compile_mixed_moe_gemm1(
                 )
                 c_chunk_i32 = arith.constant(chunk_i32, index=True)
                 # Group-local thread id for the cooperative A(X) load: with
-                # k_split>1 each K-group's a_load_threads threads fill their own
-                # A tile. a_load_threads == total_threads when k_split==1.
-                if const_expr(k_split > 1):
+                # k_wave>1 each K-group's a_load_threads threads fill their own
+                # A tile. a_load_threads == total_threads when k_wave==1.
+                if const_expr(k_wave > 1):
                     _x_load_tid = tx % arith.constant(a_load_threads, index=True)
                 else:
                     _x_load_tid = tx
@@ -866,8 +858,8 @@ def compile_mixed_moe_gemm1(
                 # Intra-block K-slicing: give this wave its own K-group and a
                 # private A(X)-LDS buffer (ping/pong). W/scale loads are keyed by
                 # base_k, so offsetting k_base_idx makes them fetch this group's
-                # K-slice automatically. k_split==1 leaves everything unchanged.
-                if const_expr(k_split > 1):
+                # K-slice automatically. k_wave==1 leaves everything unchanged.
+                if const_expr(k_wave > 1):
                     wave_k_id = wave_id / arith.constant(num_n_waves, index=True)
                     k_base_idx = k_base_idx + wave_k_id * arith.constant(_klen, index=True)
                     _grp_x_bytes = wave_k_id * arith.constant(_single_x_bytes, index=True)
@@ -2191,15 +2183,18 @@ def compile_mixed_moe_gemm1(
                             u = arith.maximumf(u, _nlim)
                         return _silu_elem(g) * u
 
-                _ksplit_fused = const_expr(
-                    k_split > 1
+                _kwave_fused = const_expr(
+                    k_wave > 1
                     and not enable_bias
                     and not _is_splitk
                     and not gate_up_interleave
                     and _need_quant
                 )
 
-                if const_expr(k_split > 1 and not _ksplit_fused):
+                if const_expr(k_wave > 1 and not _kwave_fused):
+                    # Interleave packs gate+up into the single acc_gate set
+                    # (acc_up is None); separated reduces both via pong/ping.
+                    _has_up = const_expr(acc_up is not None)
                     _nm = num_acc_n * m_repeat
                     _grp_stride = 64 * _nm  # vec4 slots per wave
                     _scr_ty = _mT.memref(
@@ -2211,12 +2206,13 @@ def compile_mixed_moe_gemm1(
                         arith.constant(lds_pong_offset, index=True),
                         sizes=[],
                     )
-                    _scr_u = memref.view(
-                        _scr_ty,
-                        base_ptr_ping,
-                        arith.constant(lds_ping_offset, index=True),
-                        sizes=[],
-                    )
+                    if const_expr(_has_up):
+                        _scr_u = memref.view(
+                            _scr_ty,
+                            base_ptr_ping,
+                            arith.constant(lds_ping_offset, index=True),
+                            sizes=[],
+                        )
                     _c_gs = arith.constant(_grp_stride, index=True)
                     _c4 = arith.constant(4, index=True)
                     _c64 = arith.constant(64, index=True)
@@ -2225,27 +2221,31 @@ def compile_mixed_moe_gemm1(
                     for _ai in range_constexpr(_nm):
                         _sidx = (_my_base + arith.constant(_ai, index=True) * _c64) * _c4
                         vector.store(acc_gate[_ai], _scr_g, [_sidx], alignment=16)
-                        vector.store(acc_up[_ai], _scr_u, [_sidx], alignment=16)
+                        if const_expr(_has_up):
+                            vector.store(acc_up[_ai], _scr_u, [_sidx], alignment=16)
                     gpu.barrier()
                     for _ai in range_constexpr(_nm):
                         _ai_off = arith.constant(_ai, index=True) * _c64 + lane_id
                         _gvs = []
                         _uvs = []
-                        for _g in range_constexpr(k_split):
+                        for _g in range_constexpr(k_wave):
                             _peer = (
                                 arith.constant(_g * num_n_waves, index=True) + wave_n_id
                             )
                             _pidx = (_peer * _c_gs + _ai_off) * _c4
                             _gvs.append(vector.load_op(vec4_f32, _scr_g, [_pidx]))
-                            _uvs.append(vector.load_op(vec4_f32, _scr_u, [_pidx]))
+                            if const_expr(_has_up):
+                                _uvs.append(vector.load_op(vec4_f32, _scr_u, [_pidx]))
 
                         _sg = _gvs[0]
-                        _su = _uvs[0]
-                        for _g in range_constexpr(1, k_split):
+                        for _g in range_constexpr(1, k_wave):
                             _sg = arith.addf(_sg, _gvs[_g])
-                            _su = arith.addf(_su, _uvs[_g])
                         acc_gate[_ai] = _sg
-                        acc_up[_ai] = _su
+                        if const_expr(_has_up):
+                            _su = _uvs[0]
+                            for _g in range_constexpr(1, k_wave):
+                                _su = arith.addf(_su, _uvs[_g])
+                            acc_up[_ai] = _su
                     # No trailing barrier: CShuffle's leading barrier already gates
                     # scratch reads before lds_out writes (only reg bias+silu between).
 
@@ -2328,7 +2328,7 @@ def compile_mixed_moe_gemm1(
                             acc[_out_idx] = _act_vec4(
                                 acc_gate[_g_idx], acc_gate[_u_idx]
                             )
-                elif const_expr(not _is_splitk and not _ksplit_fused):
+                elif const_expr(not _is_splitk and not _kwave_fused):
                     acc = [None] * (int(num_acc_n) * int(m_repeat))
                     for _mi in range_constexpr(m_repeat):
                         for _ni in range_constexpr(num_acc_n):
@@ -2723,10 +2723,10 @@ def compile_mixed_moe_gemm1(
                     else (ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get())
                 )
 
-                if const_expr(_ksplit_fused):
+                if const_expr(_kwave_fused):
                     _slab_n = tile_m * tile_n
                     _slab_ty = _mT.memref(
-                        k_split * _slab_n, f32, memory_space=_lds_space()
+                        k_wave * _slab_n, f32, memory_space=_lds_space()
                     )
                     _gate_slab = memref.view(
                         _slab_ty,
@@ -2811,7 +2811,7 @@ def compile_mixed_moe_gemm1(
                                 _base = _rb + _cp0
                                 _gsum = [None] * int(_e_vec)
                                 _usum = [None] * int(_e_vec)
-                                for _kg in range_constexpr(k_split):
+                                for _kg in range_constexpr(k_wave):
                                     _ko = (
                                         arith.constant(_kg, index=True) * _c_slabn + _base
                                     )
