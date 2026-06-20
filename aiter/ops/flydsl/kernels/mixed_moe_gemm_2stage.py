@@ -43,7 +43,7 @@ from .mfma_preshuffle_pipeline import (
     tile_chunk_coord_i32,
     swizzle_xor16,
 )
-from .mfma_epilogues import c_shuffle_epilog
+from .mfma_epilogues import c_shuffle_epilog, default_epilog
 from .layout_utils import crd2idx, idx2crd, get as layout_get
 
 import functools
@@ -2164,6 +2164,50 @@ def compile_mixed_moe_gemm1(
                     else:
                         return _silu_mul_vec4(gate_v4, up_v4)
 
+                def _act_elem(g, u):
+                    """Scalar activation, byte-identical per-element to _act_vec4.
+                    Used by the fused k-split epilogue (operates on summed f32
+                    gate/up scalars in the CShuffle read phase)."""
+                    if const_expr(act == "swiglu"):
+                        _alpha = arith.constant(1.702, type=f32)
+                        _one = arith.constant(1.0, type=f32)
+                        _neg_log2e = arith.constant(-1.4426950408889634, type=f32)
+                        _lim = arith.constant(
+                            float(swiglu_limit) if swiglu_limit != 0 else 7.0, type=f32
+                        )
+                        _nlim = arith.constant(
+                            -float(swiglu_limit) if swiglu_limit != 0 else -7.0, type=f32
+                        )
+                        g = arith.minimumf(g, _lim)
+                        u = arith.minimumf(u, _lim)
+                        u = arith.maximumf(u, _nlim)
+                        t = g * _alpha * _neg_log2e
+                        emu = llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [t], [], [])
+                        den = _one + emu
+                        sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
+                        return g * sig * (u + _one)
+                    else:
+                        if const_expr(swiglu_limit != 0):
+                            _lim = arith.constant(float(swiglu_limit), type=f32)
+                            _nlim = arith.constant(-float(swiglu_limit), type=f32)
+                            g = arith.minimumf(g, _lim)
+                            u = arith.minimumf(u, _lim)
+                            u = arith.maximumf(u, _nlim)
+                        return _silu_elem(g) * u
+
+                # Fused k-split epilogue: when applicable, skip the separate
+                # register reduction below and instead fold the cross-K-group sum
+                # + activation into the CShuffle READ phase (one LDS round-trip
+                # instead of two; saves 2 barriers + the intermediate register
+                # materialization). Guarded to the cases that path supports.
+                _ksplit_fused = const_expr(
+                    k_split > 1
+                    and not enable_bias
+                    and not _is_splitk
+                    and not gate_up_interleave
+                    and _need_quant
+                )
+
                 # Intra-block K-slice reduction: sum the per-K-group partial
                 # accumulators across the k_split wave-groups (same wave_n_id)
                 # through LDS, broadcasting the full-K result back to every wave
@@ -2171,7 +2215,7 @@ def compile_mixed_moe_gemm1(
                 # (avoids barrier divergence). Reuses the now-free A(X)-LDS
                 # region (pong=gate, ping=up) as f32 scratch. Done before the
                 # bias add so bias is applied once to the summed result.
-                if const_expr(k_split > 1):
+                if const_expr(k_split > 1 and not _ksplit_fused):
                     _nm = num_acc_n * m_repeat
                     _grp_stride = 64 * _nm  # vec4 slots per wave
                     _scr_ty = _mT.memref(
@@ -2190,35 +2234,50 @@ def compile_mixed_moe_gemm1(
                         sizes=[],
                     )
                     _c_gs = arith.constant(_grp_stride, index=True)
-                    _c_nm = arith.constant(_nm, index=True)
                     _c4 = arith.constant(4, index=True)
-                    _lane_off = lane_id * _c_nm
-                    _my_base = wave_id * _c_gs + _lane_off
+                    _c64 = arith.constant(64, index=True)
+                    # Bank-conflict-free scratch layout: within each wave's slab,
+                    # store [slot][lane] (lane-INNER, stride 1 vec4). The previous
+                    # [lane][slot] layout gave a lane stride of nm*4=16 f32 words
+                    # -> ~16-way LDS bank conflict; lane-inner hits the vec4 floor
+                    # (4-way). slab base = wave_id*grp_stride; offset = ai*64 + lane.
+                    _my_base = wave_id * _c_gs + lane_id
                     gpu.barrier()
                     for _ai in range_constexpr(_nm):
-                        _sidx = (_my_base + arith.constant(_ai, index=True)) * _c4
+                        _sidx = (_my_base + arith.constant(_ai, index=True) * _c64) * _c4
                         vector.store(acc_gate[_ai], _scr_g, [_sidx], alignment=16)
                         vector.store(acc_up[_ai], _scr_u, [_sidx], alignment=16)
                     gpu.barrier()
                     for _ai in range_constexpr(_nm):
-                        _sg = acc_init
-                        _su = acc_init
+                        _ai_off = arith.constant(_ai, index=True) * _c64 + lane_id
+                        # Latency hiding: issue ALL k_split peer loads first (so they
+                        # are in flight together), THEN reduce. Interleaving load+add
+                        # serialized each LDS-load latency, which at ~2 waves/CU has
+                        # no other warp to hide behind. Pairwise (tree) sum shortens
+                        # the dependency chain vs a serial accumulate.
+                        _gvs = []
+                        _uvs = []
                         for _g in range_constexpr(k_split):
                             _peer = (
                                 arith.constant(_g * num_n_waves, index=True) + wave_n_id
                             )
-                            _pidx = (
-                                _peer * _c_gs
-                                + _lane_off
-                                + arith.constant(_ai, index=True)
-                            ) * _c4
-                            _gv = vector.load_op(vec4_f32, _scr_g, [_pidx])
-                            _uv = vector.load_op(vec4_f32, _scr_u, [_pidx])
-                            _sg = arith.addf(_sg, _gv)
-                            _su = arith.addf(_su, _uv)
+                            _pidx = (_peer * _c_gs + _ai_off) * _c4
+                            _gvs.append(vector.load_op(vec4_f32, _scr_g, [_pidx]))
+                            _uvs.append(vector.load_op(vec4_f32, _scr_u, [_pidx]))
+
+                        _sg = _gvs[0]
+                        _su = _uvs[0]
+                        for _g in range_constexpr(1, k_split):
+                            _sg = arith.addf(_sg, _gvs[_g])
+                            _su = arith.addf(_su, _uvs[_g])
                         acc_gate[_ai] = _sg
                         acc_up[_ai] = _su
-                    gpu.barrier()
+                    # NOTE: no trailing barrier here. The k-group reduction reads
+                    # the scratch (which aliases lds_out / the pong region); the
+                    # CShuffle epilogue's leading `gpu.barrier()` already gates
+                    # "all reduction-scratch reads done" before any thread writes
+                    # lds_out. Only register-only bias+silu runs in between, so a
+                    # barrier here is redundant. (byte-identical, ~1 barrier saved)
 
                 # Add bias to raw GEMM accumulators before activation.
                 # bias layout: [E, 2*inter_dim] flat f32 (non-interleaved: gate then up).
@@ -2299,7 +2358,7 @@ def compile_mixed_moe_gemm1(
                             acc[_out_idx] = _act_vec4(
                                 acc_gate[_g_idx], acc_gate[_u_idx]
                             )
-                elif const_expr(not _is_splitk):
+                elif const_expr(not _is_splitk and not _ksplit_fused):
                     acc = [None] * (int(num_acc_n) * int(m_repeat))
                     for _mi in range_constexpr(m_repeat):
                         for _ni in range_constexpr(num_acc_n):
@@ -2694,7 +2753,141 @@ def compile_mixed_moe_gemm1(
                     else (ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get())
                 )
 
-                if const_expr(gate_up_interleave and not _is_splitk):
+                if const_expr(_ksplit_fused):
+                    # ---- Fused k-split epilogue (one LDS round-trip) ----
+                    # Each k-group wave writes its RAW gate/up partials (frag ->
+                    # row-major) into its own slab; the CShuffle read then sums the
+                    # k_split slabs, applies activation, and quant-stores. Replaces
+                    # reduction(store+barrier+load) + cshuffle(write+barrier+read)
+                    # with write+barrier+read. Scratch reuses pong(gate)/ping(up).
+                    _slab_n = tile_m * tile_n
+                    _slab_ty = _mT.memref(
+                        k_split * _slab_n, f32, memory_space=_lds_space()
+                    )
+                    _gate_slab = memref.view(
+                        _slab_ty,
+                        base_ptr_pong,
+                        arith.constant(lds_pong_offset, index=True),
+                        sizes=[],
+                    )
+                    _up_slab = memref.view(
+                        _slab_ty,
+                        base_ptr_ping,
+                        arith.constant(lds_ping_offset, index=True),
+                        sizes=[],
+                    )
+                    _c_tn = arith.constant(tile_n, index=True)
+                    _c_slabn = arith.constant(_slab_n, index=True)
+                    _kg_base = wave_k_id * _c_slabn
+                    _vec1_f32 = T.vec(1, f32)
+                    _vecev_f32 = T.vec(_e_vec, f32)
+
+                    # ensure mainloop's A-LDS (pong/ping) reads are done before reuse
+                    gpu.barrier()
+
+                    def _fused_write(mi, ii, row_in_tile, row):
+                        _rb = row_in_tile * _c_tn
+                        for _ni in range_constexpr(num_acc_n):
+                            _col = (
+                                n_tile_base
+                                + lane_mod_16
+                                + arith.constant(_ni * 16, index=True)
+                            )
+                            _aidx = mi * num_acc_n + _ni
+                            _gv = vector.extract(
+                                acc_gate[_aidx], static_position=[ii], dynamic_position=[]
+                            )
+                            _uv = vector.extract(
+                                acc_up[_aidx], static_position=[ii], dynamic_position=[]
+                            )
+                            _idx = _kg_base + _rb + _col
+                            vector.store(
+                                vector.from_elements(_vec1_f32, [_gv]),
+                                _gate_slab,
+                                [_idx],
+                                alignment=4,
+                            )
+                            vector.store(
+                                vector.from_elements(_vec1_f32, [_uv]),
+                                _up_slab,
+                                [_idx],
+                                alignment=4,
+                            )
+
+                    default_epilog(
+                        arith=arith,
+                        range_constexpr=range_constexpr,
+                        m_repeat=m_repeat,
+                        lane_div_16=lane_div_16,
+                        bx_m=bx_m,
+                        body_row=_fused_write,
+                    )
+                    gpu.barrier()
+
+                    _cn = int(_cshuffle_nlane)
+                    _cm = int(total_threads) // _cn
+                    _mreps = int(tile_m) // _cm
+                    _nreps = int(tile_n) // (_cn * int(_e_vec))
+                    _c_cn = arith.constant(_cn, index=True)
+                    _c_ev = arith.constant(_e_vec, index=True)
+                    _m_lane = tx / _c_cn
+                    _n_lane = tx % _c_cn
+                    for _mr in range_constexpr(_mreps):
+                        _row_local = arith.constant(_mr * _cm, index=True) + _m_lane
+                        _row = bx_m + _row_local
+                        # precompute_row always returns ((fused2, row_byte_base),
+                        # row_valid). Unpack unconditionally -- a Python `if` here
+                        # would be rewritten into scf.if and lose the binding.
+                        _rc, _rp = precompute_row(row_local=_row_local, row=_row)
+
+                        def _fused_read(_row_local=_row_local, _row=_row, _rc=_rc):
+                            _rb = _row_local * _c_tn
+                            for _nr in range_constexpr(_nreps):
+                                _cp0 = (
+                                    arith.constant(_nr * (_cn * int(_e_vec)), index=True)
+                                    + _n_lane * _c_ev
+                                )
+                                _base = _rb + _cp0
+                                _gsum = [None] * int(_e_vec)
+                                _usum = [None] * int(_e_vec)
+                                for _kg in range_constexpr(k_split):
+                                    _ko = (
+                                        arith.constant(_kg, index=True) * _c_slabn + _base
+                                    )
+                                    _gvv = vector.load_op(_vecev_f32, _gate_slab, [_ko])
+                                    _uvv = vector.load_op(_vecev_f32, _up_slab, [_ko])
+                                    for _e in range_constexpr(int(_e_vec)):
+                                        _ge = vector.extract(
+                                            _gvv, static_position=[_e], dynamic_position=[]
+                                        )
+                                        _ue = vector.extract(
+                                            _uvv, static_position=[_e], dynamic_position=[]
+                                        )
+                                        if _kg == 0:
+                                            _gsum[_e] = _ge
+                                            _usum[_e] = _ue
+                                        else:
+                                            _gsum[_e] = arith.addf(_gsum[_e], _ge)
+                                            _usum[_e] = arith.addf(_usum[_e], _ue)
+                                _fe = [
+                                    _act_elem(_gsum[_e], _usum[_e])
+                                    for _e in range_constexpr(int(_e_vec))
+                                ]
+                                _frag = vector.from_elements(_vecev_f32, _fe)
+                                store_pair(
+                                    row_local=_row_local,
+                                    row=_row,
+                                    row_ctx=_rc,
+                                    col_pair0=_cp0,
+                                    col_g0=by_n + _cp0,
+                                    frag=_frag,
+                                )
+
+                        _ifr = scf.IfOp(_rp)
+                        with ir.InsertionPoint(_ifr.then_block):
+                            _fused_read()
+                            scf.YieldOp([])
+                elif const_expr(gate_up_interleave and not _is_splitk):
                     # gui without splitk: acc has activation applied, halved N
                     _gui_eff_n = _gui_out_n
                     _gui_tile_n = tile_n // 2
