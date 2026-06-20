@@ -238,12 +238,8 @@ def compile_mixed_moe_gemm1(
         _k_per_batch = model_dim
     _k_dim = _k_per_batch
 
-    # Intra-block K-slicing constraints (prototype scope). Keep the change off
-    # the production fast paths: only a4w4 (fp4xfp4), gate/up SEPARATED, no
-    # cross-CTA split-K, no async copy, no persistence.
+    # Intra-block K-slicing: SEPARATED gate/up only, no split-K/async/persist.
     if k_split > 1:
-        if not (is_f4_a and is_f4_b):
-            raise NotImplementedError("k_split>1 only supports a4w4 (fp4xfp4)")
         if mock_gate_only or gate_up_interleave:
             raise NotImplementedError("k_split>1 only supports SEPARATED gate/up")
         if _is_splitk:
@@ -2195,11 +2191,6 @@ def compile_mixed_moe_gemm1(
                             u = arith.maximumf(u, _nlim)
                         return _silu_elem(g) * u
 
-                # Fused k-split epilogue: when applicable, skip the separate
-                # register reduction below and instead fold the cross-K-group sum
-                # + activation into the CShuffle READ phase (one LDS round-trip
-                # instead of two; saves 2 barriers + the intermediate register
-                # materialization). Guarded to the cases that path supports.
                 _ksplit_fused = const_expr(
                     k_split > 1
                     and not enable_bias
@@ -2208,13 +2199,6 @@ def compile_mixed_moe_gemm1(
                     and _need_quant
                 )
 
-                # Intra-block K-slice reduction: sum the per-K-group partial
-                # accumulators across the k_split wave-groups (same wave_n_id)
-                # through LDS, broadcasting the full-K result back to every wave
-                # so the activation/epilogue below runs identically on all waves
-                # (avoids barrier divergence). Reuses the now-free A(X)-LDS
-                # region (pong=gate, ping=up) as f32 scratch. Done before the
-                # bias add so bias is applied once to the summed result.
                 if const_expr(k_split > 1 and not _ksplit_fused):
                     _nm = num_acc_n * m_repeat
                     _grp_stride = 64 * _nm  # vec4 slots per wave
@@ -2236,11 +2220,6 @@ def compile_mixed_moe_gemm1(
                     _c_gs = arith.constant(_grp_stride, index=True)
                     _c4 = arith.constant(4, index=True)
                     _c64 = arith.constant(64, index=True)
-                    # Bank-conflict-free scratch layout: within each wave's slab,
-                    # store [slot][lane] (lane-INNER, stride 1 vec4). The previous
-                    # [lane][slot] layout gave a lane stride of nm*4=16 f32 words
-                    # -> ~16-way LDS bank conflict; lane-inner hits the vec4 floor
-                    # (4-way). slab base = wave_id*grp_stride; offset = ai*64 + lane.
                     _my_base = wave_id * _c_gs + lane_id
                     gpu.barrier()
                     for _ai in range_constexpr(_nm):
@@ -2250,11 +2229,6 @@ def compile_mixed_moe_gemm1(
                     gpu.barrier()
                     for _ai in range_constexpr(_nm):
                         _ai_off = arith.constant(_ai, index=True) * _c64 + lane_id
-                        # Latency hiding: issue ALL k_split peer loads first (so they
-                        # are in flight together), THEN reduce. Interleaving load+add
-                        # serialized each LDS-load latency, which at ~2 waves/CU has
-                        # no other warp to hide behind. Pairwise (tree) sum shortens
-                        # the dependency chain vs a serial accumulate.
                         _gvs = []
                         _uvs = []
                         for _g in range_constexpr(k_split):
@@ -2272,12 +2246,8 @@ def compile_mixed_moe_gemm1(
                             _su = arith.addf(_su, _uvs[_g])
                         acc_gate[_ai] = _sg
                         acc_up[_ai] = _su
-                    # NOTE: no trailing barrier here. The k-group reduction reads
-                    # the scratch (which aliases lds_out / the pong region); the
-                    # CShuffle epilogue's leading `gpu.barrier()` already gates
-                    # "all reduction-scratch reads done" before any thread writes
-                    # lds_out. Only register-only bias+silu runs in between, so a
-                    # barrier here is redundant. (byte-identical, ~1 barrier saved)
+                    # No trailing barrier: CShuffle's leading barrier already gates
+                    # scratch reads before lds_out writes (only reg bias+silu between).
 
                 # Add bias to raw GEMM accumulators before activation.
                 # bias layout: [E, 2*inter_dim] flat f32 (non-interleaved: gate then up).
@@ -2754,12 +2724,6 @@ def compile_mixed_moe_gemm1(
                 )
 
                 if const_expr(_ksplit_fused):
-                    # ---- Fused k-split epilogue (one LDS round-trip) ----
-                    # Each k-group wave writes its RAW gate/up partials (frag ->
-                    # row-major) into its own slab; the CShuffle read then sums the
-                    # k_split slabs, applies activation, and quant-stores. Replaces
-                    # reduction(store+barrier+load) + cshuffle(write+barrier+read)
-                    # with write+barrier+read. Scratch reuses pong(gate)/ping(up).
                     _slab_n = tile_m * tile_n
                     _slab_ty = _mT.memref(
                         k_split * _slab_n, f32, memory_space=_lds_space()
@@ -2782,7 +2746,6 @@ def compile_mixed_moe_gemm1(
                     _vec1_f32 = T.vec(1, f32)
                     _vecev_f32 = T.vec(_e_vec, f32)
 
-                    # ensure mainloop's A-LDS (pong/ping) reads are done before reuse
                     gpu.barrier()
 
                     def _fused_write(mi, ii, row_in_tile, row):
@@ -2835,9 +2798,7 @@ def compile_mixed_moe_gemm1(
                     for _mr in range_constexpr(_mreps):
                         _row_local = arith.constant(_mr * _cm, index=True) + _m_lane
                         _row = bx_m + _row_local
-                        # precompute_row always returns ((fused2, row_byte_base),
-                        # row_valid). Unpack unconditionally -- a Python `if` here
-                        # would be rewritten into scf.if and lose the binding.
+                        # Unpack unconditionally (a Python `if` becomes scf.if and loses the binding).
                         _rc, _rp = precompute_row(row_local=_row_local, row=_row)
 
                         def _fused_read(_row_local=_row_local, _row=_row, _rc=_rc):
