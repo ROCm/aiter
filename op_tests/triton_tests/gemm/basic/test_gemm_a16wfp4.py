@@ -65,12 +65,8 @@ def generate_gemm_a16wfp4_inputs(
             w.shape[1] * weight_shuffle_layout[0],
         )
 
-        if arch_info.get_arch() == "gfx1250":
-            w_scales_shuffled = shuffle_scale_gemm(
-                w_scales, preshuffle_factor=16, scale_kwidth=4
-            )
-        else:
-            w_scales_shuffled = shuffle_scale_gemm(w_scales)
+        # CDNA4-only triton kernel -> always the gfx950 scale layout.
+        w_scales_shuffled = shuffle_scale_gemm(w_scales, arch="gfx950")
     else:
         w_shuffed = w
         w_scales_shuffled = w_scales
