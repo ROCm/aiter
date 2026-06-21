@@ -554,15 +554,7 @@ def compile_moe_gemm1(
                 inter2_idx = arith.index(2 * inter_dim)
                 expert_off_idx = expert_idx * inter2_idx  # index
 
-                # --- 64-bit per-expert weight base (fix >4GiB overflow) ---------------
-                # The whole-tensor buffer resource uses a 32-bit byte offset, which wraps
-                # once E*2*inter*model_dim*elem_bytes > 4GiB (e.g. MiniMax-M3: 9GiB).
-                # Rebase the weight resource to this expert's 64-bit address so the
-                # in-kernel offset (row*K) stays within one expert (<4GiB). Equivalent
-                # because expert_off_idx is a multiple of 16 (the preshuffle row group).
-                # Only f16/bf16 (validated). fp8/fp4/int4 keep the original whole-tensor
-                # path unchanged (packed dtypes need their own byte-offset validation).
-                if const_expr(is_f16_or_bf16):
+                if const_expr(is_f16_or_bf16 and not w_is_int4):
                     _w_base_addr = buffer_ops.extract_base_index(arg_w)
                     _w_expert_byte = (
                         expert_off_idx * k_in * arith.index(int(w_elem_bytes))
@@ -2454,12 +2446,7 @@ def compile_moe_gemm2(
                 n_idx = fx.Index(model_dim)
                 expert_off_idx = expert_idx * n_idx  # index
 
-                # --- 64-bit per-expert weight base (fix >4GiB overflow) ---------------
-                # See stage1: rebase weight resource to this expert's 64-bit address so
-                # the 32-bit in-kernel byte offset stays within one expert. Stage2 weight
-                # is [experts*model_dim, inter], K=inter, so per-expert byte offset =
-                # expert_off_idx(rows) * inter(k_in) * w_elem_bytes. f16/bf16 only.
-                if const_expr(is_f16_or_bf16):
+                if const_expr(is_f16_or_bf16 and not w_is_int4):
                     _w_base_addr = buffer_ops.extract_base_index(arg_w)
                     _w_expert_byte = (
                         expert_off_idx * k_in * arith.index(int(w_elem_bytes))
