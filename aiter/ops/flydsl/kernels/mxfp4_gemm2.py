@@ -184,12 +184,12 @@ def _raw(v):
 
 def _udiv(a, c):
     cc = fx.Int32(c) if isinstance(c, int) else c
-    return a // cc
+    return fx.Int32(arith.divui(_raw(a), _raw(cc)))
 
 
 def _umod(a, c):
     cc = fx.Int32(c) if isinstance(c, int) else c
-    return a % cc
+    return fx.Int32(arith.remui(_raw(a), _raw(cc)))
 
 
 def _lds_ptr3(base_i32, byte_off_i32):
@@ -870,14 +870,9 @@ def _gemm2_body(
             )
             _s_barrier_bare()
         else:
-            llvm.inline_asm(
-                res=None,
-                operands_=[],
-                asm_string="s_waitcnt vmcnt(16) lgkmcnt(0)",
-                constraints="",
-                has_side_effects=True,
-            )
-            _s_barrier_bare()
+            # nonatomic: plain barrier (== HIP __syncthreads); the backend inserts
+            # the buffer_load_lds->ds_read vmcnt wait.
+            rocdl.barrier()
 
     if const_expr(_K_TILES_TOTAL <= kStages):
         # -- KIMI/DSR fast path: K_TILES_TOTAL <= 2 (D_INTER <= 512), fully
@@ -1012,20 +1007,16 @@ def _flat_bf16_epilog(accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, kMC
     breaks store coalescing, costing more than the ~37% saved padding writes)."""
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
+    row_base = m_row + lane_div_16 * fx.Int32(4)
+    gn_base = n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + lane_mod_16
+    byte_base = (fx.Int64(row_base) * fx.Int64(N_OUT) + fx.Int64(gn_base)) * fx.Int64(2)
     for i in range_constexpr(kMChunks):
         for J in range_constexpr(4):
-            gn = (
-                n_block_idx * fx.Int32(BN)
-                + wave * fx.Int32(BN // 4)
-                + fx.Int32(J * 16)
-                + lane_mod_16
-            )
             vec = Vec(accm[i][J])
             for v in range_constexpr(4):
-                row = m_row + fx.Int32(i * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(v)
-                elem = fx.Int64(row) * fx.Int64(N_OUT) + fx.Int64(gn)
+                const_off = ((i * 16 + v) * N_OUT + J * 16) * 2
                 bf = Vec.from_elements([vec[v]], fx.Float32).to(fx.BFloat16)
-                llvm.StoreOp(_raw(bf), _gep1(out_base, elem * fx.Int64(2)))
+                llvm.StoreOp(_raw(bf), _gep1(out_base, byte_base + fx.Int64(const_off)))
 
 
 def _cshuffle_flat_bf16_epilog(
@@ -1121,9 +1112,11 @@ def _flat_mxfp4_epilog(
     wave_grp = n_lane // fx.Int32(4)
     kk = n_lane % fx.Int32(4)
     i7fff = _raw(fx.Int32(0x7FFFFFFF))
+    _m_base = m_row + m_lane
+    _q_row0 = fx.Int64(_m_base) * fx.Int64(N_OUT // 2)
+    _s_row0 = fx.Int64(_m_base) * fx.Int64(N_OUT // 32)
     for mr in range_constexpr(kMChunks):  # BM/16
         row_local = fx.Int32(mr * 16) + m_lane
-        out_row = m_row + row_local
         for half in range_constexpr(NBLK // 4):  # 2
             group = wave_grp + fx.Int32(half * 4)
             col0 = group * fx.Int32(32) + kk * fx.Int32(8)
@@ -1171,10 +1164,12 @@ def _flat_mxfp4_epilog(
             )
             global_col = n_block_idx * fx.Int32(BN) + col0
             blk = n_block_idx * fx.Int32(NBLK) + group
-            q_byte = fx.Int64(out_row) * fx.Int64(N_OUT // 2) + fx.Int64(
-                global_col // fx.Int32(2)
+            q_byte = (
+                _q_row0
+                + fx.Int64(mr * 16 * (N_OUT // 2))
+                + fx.Int64(global_col // fx.Int32(2))
             )
-            s_byte = fx.Int64(out_row) * fx.Int64(N_OUT // 32) + fx.Int64(blk)
+            s_byte = _s_row0 + fx.Int64(mr * 16 * (N_OUT // 32)) + fx.Int64(blk)
             llvm.StoreOp(packed, _gep1(out_q_base, q_byte), nontemporal=True)
             if kk == fx.Int32(0):
                 llvm.StoreOp(arith.trunci(T.i8, e8), _gep1(out_scale_base, s_byte))
