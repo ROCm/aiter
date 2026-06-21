@@ -212,6 +212,7 @@ sort_subkernel(const int32_t *topk_ids, const float *topk_weight, int32_t *sorte
 
     if (tid == 0) {
         cumsum_tensor[0] = cumsum[NUM_EXPERTS];
+        cumsum_tensor[1] = M;  // num_valid_ids[1] = valid tokens (non-EP == M)
     }
 }
 
