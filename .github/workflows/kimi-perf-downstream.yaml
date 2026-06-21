@@ -1,0 +1,133 @@
+name: Kimi Perf Downstream
+
+# End-to-end Kimi-K2.5-MXFP4 PERFORMANCE regression for AITER against the
+# official nightly downstream images (vLLM + SGLang) on MI350X (gfx950, TP8).
+# Companion to kimi-downstream.yaml (accuracy). Each job builds the PR's AITER
+# from source into the official image, launches the server with the same
+# validated flags as the accuracy gate, runs a throughput sweep
+# (ISL/OSL 1024/1024, concurrency 4..64) and gates on the c=64 output token
+# throughput staying above a conservative floor.
+#
+# Triggered by the `ci:performance` (or `ci:all`) label, nightly schedule, and
+# manual dispatch. NOT run on every push (heavy: builds AITER + loads 521GB).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  schedule:
+    # Nightly, off-peak, offset from the accuracy run (19:17 UTC).
+    - cron: '43 20 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+
+jobs:
+  kimi-perf:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:performance') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    name: Kimi-K2.5 perf (${{ matrix.backend }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: vllm
+            base_image: rocm/vllm-dev:nightly
+            script: kimi_vllm_perf.sh
+            # Validated MI350X gfx950 TP8: c=64 output 3126.4 tok/s. Floor =
+            # 2250 (~28% margin) absorbs JIT/run-to-run variance.
+            floor_c64: "2250"
+          - backend: sglang
+            base_image: lmsysorg/sglang-rocm:v0.5.12.post1-rocm720-mi35x-20260531
+            script: kimi_sglang_perf.sh
+            # Validated MI350X gfx950 TP8: c=64 output 3284.7 tok/s. Floor =
+            # 2400 (~27% margin) absorbs JIT/run-to-run variance.
+            floor_c64: "2400"
+    runs-on: linux-aiter-mi35x-8
+    timeout-minutes: 180
+    env:
+      MODEL_PATH: "amd/Kimi-K2.5-MXFP4"
+      CONTAINER: "kimi_perf_${{ matrix.backend }}_aiter_test"
+      FLOOR_C64: ${{ matrix.floor_c64 }}
+    steps:
+      - name: Checkout AITER (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pull base image
+        run: docker pull ${{ matrix.base_image }}
+
+      - name: Start CI container
+        run: |
+          docker ps -aq -f name=${CONTAINER} | xargs -r docker stop | xargs -r docker rm
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            --ipc=host --group-add video --shm-size=16G --privileged \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 \
+            --network=host \
+            -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
+            -v "${{ github.workspace }}:/workspace" -w /workspace \
+            -v /models:/models \
+            --name ${CONTAINER} \
+            ${{ matrix.base_image }}
+          docker exec ${CONTAINER} git config --global --add safe.directory /workspace || true
+
+      - name: Build & install PR AITER (gfx950)
+        run: |
+          docker exec ${CONTAINER} bash -lc '
+            set -e
+            pip uninstall -y amd-aiter aiter 2>/dev/null || true
+            pip install --upgrade "pybind11>=3.0.1"
+            cd /workspace
+            MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
+          '
+
+      - name: Run Kimi-K2.5 throughput sweep
+        timeout-minutes: 120
+        run: |
+          set -uo pipefail
+          docker exec ${CONTAINER} bash -lc '
+            chmod +x /workspace/.github/scripts/${{ matrix.script }}
+            bash /workspace/.github/scripts/${{ matrix.script }}
+          ' 2>&1 | tee kimi_perf_${{ matrix.backend }}_output.txt
+
+      - name: Check perf floor (c=64 output tok/s)
+        run: |
+          val=$(grep -oE 'KIMI_PERF_C64_OUT_TOKS=[0-9.]+' kimi_perf_${{ matrix.backend }}_output.txt | tail -1 | cut -d= -f2)
+          if [ -z "$val" ]; then echo "ERROR: no KIMI_PERF_C64_OUT_TOKS in output"; exit 2; fi
+          echo "Kimi-K2.5 ${{ matrix.backend }} c=64 output tok/s = ${val}  (floor ${FLOOR_C64})"
+          if [ "${FLOOR_C64}" = "0" ]; then
+            echo "Floor not set (record-only run); reporting throughput without gating."
+            exit 0
+          fi
+          if awk -v v="$val" -v f="${FLOOR_C64}" 'BEGIN{exit (v<f)?0:1}'; then
+            echo "PERF REGRESSION: ${val} < floor ${FLOOR_C64}"; exit 1
+          fi
+          echo "Perf OK: ${val} >= floor ${FLOOR_C64}"
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-perf-${{ matrix.backend }}-output
+          path: kimi_perf_${{ matrix.backend }}_output.txt
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker stop ${CONTAINER} || true
+          docker rm ${CONTAINER} || true

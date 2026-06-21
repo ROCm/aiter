@@ -8,6 +8,7 @@ import logging
 import multiprocessing
 import os
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -21,12 +22,15 @@ from packaging.version import Version, parse
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
 from chip_info import get_gfx, get_gfx_list  # noqa: E402
-from cpp_extension import _jit_compile, get_hip_version  # noqa: E402
+from cpp_extension import _jit_compile, executable_path, get_hip_version  # noqa: E402
 from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
+AITER_DISABLE_KERNARG_PRELOAD = (
+    int(os.environ.get("AITER_DISABLE_KERNARG_PRELOAD", "0")) != 0
+)
 
 
 def is_experimental_enabled() -> bool:
@@ -104,6 +108,11 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_GROUPED_FMOE = os.getenv(
+    "AITER_CONFIG_GROUPED_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_grouped_fmoe.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
@@ -160,6 +169,14 @@ class AITER_CONFIG(object):
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_GROUPED_FMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GROUPED_FMOE",
+            AITER_CONFIG_GROUPED_FMOE,
+            "tuned_grouped_fmoe",
         )
 
     @property
@@ -225,7 +242,15 @@ class AITER_CONFIG(object):
         for i, (path, df) in enumerate(source_pairs):
             for c in all_cols:
                 if c not in df.columns:
-                    df[c] = _FILL_DEFAULTS.get(c, 0)
+                    if c == "gfx" and "cu_num" in df.columns:
+                        # Legacy config without a gfx column: infer the arch from
+                        # cu_num (256->gfx950, 80/304->gfx942) so archs that share
+                        # a cu_num stay distinguishable after the merge.
+                        from aiter.jit.utils.chip_info import gfx_from_cu_num
+
+                        df[c] = df["cu_num"].map(gfx_from_cu_num)
+                    else:
+                        df[c] = _FILL_DEFAULTS.get(c, 0)
             source_pairs[i] = (path, df[all_cols])
 
         non_empty = [df for _, df in source_pairs if not df.empty]
@@ -464,7 +489,7 @@ def hip_flag_checker(flag_hip: str) -> bool:
     import subprocess
 
     cmd = (
-        ["hipcc"]
+        [executable_path("hipcc")]
         + flag_hip.split()
         + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
     )
@@ -486,11 +511,12 @@ def check_LLVM_MAIN_REVISION():
     #define CK_TILE_HOST_DEVICE_EXTERN"""
     import subprocess
 
-    cmd = """echo "#include <tuple>
-__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
     try:
+        hipcc = shlex.quote(executable_path("hipcc"))
+        cmd = f"""echo "#include <tuple>
+__host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" | {hipcc} -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
         subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, AssertionError):
         return 554785
     return 554785 - 1
 
@@ -777,7 +803,6 @@ def build_module(
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
-            "-mllvm --amdgpu-kernarg-preload-count=16",
             # "-v --save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
@@ -788,6 +813,8 @@ def build_module(
             "-fgpu-flush-denormals-to-zero",
             f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
         ]
+        if not AITER_DISABLE_KERNARG_PRELOAD:
+            flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=16"]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
@@ -829,6 +856,13 @@ def build_module(
             flags_hip.append(
                 f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
             )
+
+        # ASM kernel debug instrumentation (host prints + post-launch sync) in
+        # *.cu is compiled only when AITER_ASM_DEBUG=1, mirroring poc_kl's
+        # `compile-dbg` / -DASM_DEBUG. Default builds stay free of debug code.
+        if int(os.environ.get("AITER_ASM_DEBUG", "0")) != 0:
+            if not any("ASM_DEBUG" in f for f in flags_extra_hip):
+                flags_hip.append("-DASM_DEBUG")
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
@@ -995,10 +1029,7 @@ def _get_ck_exclude_modules():
         "module_mla_metadata",
         "module_mla_reduce",
         "module_moe_asm",
-        "module_pa",
         "module_pa_metadata",
-        "module_pa_ragged",
-        "module_pa_v1",
         "module_ps_metadata",
         "module_quant",
         "module_rmsnorm_quant",
@@ -1555,6 +1586,18 @@ def compile_ops(
                         func.__signature__ = sig
                         ann = {k: v.annotation for k, v in sig.parameters.items()}
                         ann["return"] = sig.return_annotation
+                        _tensor_types = (torch.Tensor,)
+                        if aiter_tensor_t is not object:
+                            _tensor_types = (torch.Tensor, aiter_tensor_t)
+
+                        def _is_tensor_like(obj):
+                            return isinstance(obj, _tensor_types)
+
+                        def _is_tensor_type(tp):
+                            return tp is torch.Tensor or (
+                                aiter_tensor_t is not object and tp is aiter_tensor_t
+                            )
+
                         callargs = inspect.getcallargs(func, *args, **kwargs)
                         for el, arg in callargs.items():
                             expected_type = ann[el]
@@ -1563,7 +1606,11 @@ def compile_ops(
                             sub_t = typing.get_args(expected_type)
 
                             if origin is None:
-                                if not isinstance(arg, expected_type) and not (
+                                if _is_tensor_type(expected_type) and _is_tensor_like(
+                                    arg
+                                ):
+                                    pass
+                                elif not isinstance(arg, expected_type) and not (
                                     any(el in str(expected_type) for el in enum_types)
                                     and isinstance(arg, int)
                                 ):
@@ -1576,7 +1623,11 @@ def compile_ops(
                                         f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
                                     )
                             elif origin is typing.Union or origin is types.UnionType:
-                                if arg is not None and not isinstance(arg, sub_t):
+                                if (
+                                    arg is not None
+                                    and not _is_tensor_like(arg)
+                                    and not isinstance(arg, sub_t)
+                                ):
                                     raise TypeError(
                                         f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
                                     )
@@ -1641,6 +1692,13 @@ def compile_ops(
                             )
                     return True
 
+                if not func.arg_checked:
+                    func.arg_checked = check_args()
+
+                if AITER_LOG_MORE == 2:
+                    from ..test_common import log_args
+
+                    log_args(func, *args, **kwargs)
                 # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
                 if develop:
                     import torch
@@ -1659,14 +1717,6 @@ def compile_ops(
                         )
                         for k, v in kwargs.items()
                     }
-
-                if not func.arg_checked:
-                    func.arg_checked = check_args()
-
-                if AITER_LOG_MORE == 2:
-                    from ..test_common import log_args
-
-                    log_args(func, *args, **kwargs)
 
                 if develop:
                     module._set_current_hip_stream(

@@ -59,7 +59,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .tensor_shim import STensor, _to_raw
+from .tensor_shim import STensor, _to_raw, _run_compiled
 
 # Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
 # (the multi-wave LDS kernel references CompilationContext, STensor,
@@ -1103,6 +1103,36 @@ def flydsl_hca_compress_attn(
     docstring). Override only when bench-sweeping; the default matches the
     production tuning used by ATOM's compressor.
     """
+    # ---- gfx1250 dispatch (wave32) ----
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+
+    if _get_gfx() == "gfx1250":
+        from .fused_compress_attn_hca_gfx1250 import flydsl_hca_compress_attn_gfx1250
+
+        return flydsl_hca_compress_attn_gfx1250(
+            kv_in=kv_in,
+            score_in=score_in,
+            kv_state=kv_state,
+            score_state=score_state,
+            state_slot_mapping=state_slot_mapping,
+            plan_gpu=plan_gpu,
+            ape=ape,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            k_per_block=k_per_block,
+            ratio=ratio,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            kv_compressed_scratch=kv_compressed_scratch,
+            k_split_num_waves=k_split_num_waves,
+            slice_size=slice_size,
+            stream=stream,
+        )
+
     if k_split_num_waves is None or slice_size is None:
         # Local import to avoid a circular import between the two HCA modules
         # at package init time.
@@ -1203,7 +1233,7 @@ def flydsl_hca_compress_attn(
         k_split_num_waves=k_split_num_waves,
         slice_size=slice_size,
     )
-    compress_fn(
+    compress_args = (
         kv_in,
         int(kv_in.stride(0)),
         score_in,
@@ -1220,8 +1250,9 @@ def flydsl_hca_compress_attn(
         kv_compressed,
         int(kv_compressed.stride(0)),
         int(plan_capacity),
-        stream=stream_obj,
+        stream_obj,
     )
+    _run_compiled(compress_fn, *compress_args)
 
     rms_weight_is_bf16 = rms_weight.dtype == torch.bfloat16
     norm_fn = compile_hca_norm_rope_scatter(
@@ -1232,7 +1263,7 @@ def flydsl_hca_compress_attn(
         rms_weight_is_bf16=rms_weight_is_bf16,
         rms_eps=rms_eps,
     )
-    norm_fn(
+    norm_args = (
         kv_compressed,
         int(kv_compressed.stride(0)),
         plan_gpu,
@@ -1245,5 +1276,6 @@ def flydsl_hca_compress_attn(
         block_tables,
         int(block_tables.stride(0)),
         int(plan_capacity),
-        stream=stream_obj,
+        stream_obj,
     )
+    _run_compiled(norm_fn, *norm_args)

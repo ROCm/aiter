@@ -38,9 +38,20 @@ void all_reduce(fptr_t _fa,
                 bool open_fp8_quant,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
+// reduce_scatter dispatcher. (m, n, k, split_dim) describe the canonical
+// shape the Python wrapper collapsed the input to:
+//   split_dim = 0 (kFirst): only `k` (= numel) used
+//   split_dim = 1 (kLast) : input reshaped to (n, k); m=0
+//   split_dim = 2 (kMid)  : input reshaped to (m, n, k)
+// In all cases the scattered dim length is the input dim (k for kFirst,
+// n for kLast/kMid); output's scattered dim = that / ngpus.
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
+                    int64_t m,
+                    int64_t n,
+                    int64_t k,
+                    int64_t split_dim,
                     int64_t reg_ptr,
                     int64_t reg_bytes);
 void all_gather_reg(fptr_t _fa,
@@ -62,7 +73,19 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              double eps,
                              int64_t reg_ptr,
                              int64_t reg_bytes,
-                             bool use_1stage);
+                             bool use_1stage,
+                             bool gemma_norm = false);
+void fused_allreduce_rmsnorm_pad(fptr_t _fa,
+                                 const aiter_tensor_t& inp,
+                                 const aiter_tensor_t& res_inp,
+                                 const aiter_tensor_t& res_out,
+                                 const aiter_tensor_t& out,
+                                 const aiter_tensor_t& w,
+                                 double eps,
+                                 int64_t reg_ptr,
+                                 int64_t reg_bytes,
+                                 bool use_1stage,
+                                 bool gemma_norm = false);
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& inp,
                                    const aiter_tensor_t& res_inp,
@@ -87,6 +110,18 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t reg_bytes,
                                              bool use_1stage,
                                              int64_t bf16_out_ptr = 0);
+void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
+                                         const aiter_tensor_t& inp,
+                                         const aiter_tensor_t& res_inp,
+                                         const aiter_tensor_t& res_out,
+                                         const aiter_tensor_t& out,
+                                         const aiter_tensor_t& scale_out,
+                                         const aiter_tensor_t& w,
+                                         double eps,
+                                         int64_t reg_ptr,
+                                         int64_t reg_bytes,
+                                         bool use_1stage,
+                                         int64_t bf16_out_ptr = 0);
 void fused_qknorm_allreduce(fptr_t _fa,
                             const aiter_tensor_t& qkv_in,
                             const aiter_tensor_t& q_w,
