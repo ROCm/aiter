@@ -119,7 +119,7 @@ def dynamic_nvfp4_quant_kv_buffer(
         cache_shuffled_scale = cache_shuffled_scale.view(
             -1, num_kv_heads, block_size, scale_width
         )
-        cache_shuffled = shuffle_weight(cache_shuffled, arch="gfx1250").view(
+        cache_shuffled = shuffle_weight(cache_shuffled, arch="gfx950").view(
             -1, num_kv_heads, block_size * quant_head_size
         )
         cache_shuffled_scale = shuffle_scale_batched(cache_shuffled_scale).view(
