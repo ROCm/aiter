@@ -216,7 +216,7 @@ def _lds_swizzle_mask(row):
 def _silu_mul(g, u):
     """silu(g)*u, matching HIP silu_mul_fast (mxfp4_gemm_common.hpp:62-65):
     e = __expf(-g) = exp2(-g*log2e); sig = rcpf(1+e); return g*sig*u."""
-    e = (g * fx.Float32(-LOG2E)).exp2()
+    e = fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E))))
     sig = fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e)))
     return g * sig * u
 
