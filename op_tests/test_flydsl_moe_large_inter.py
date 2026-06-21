@@ -16,6 +16,7 @@ Run:  python op_tests/test_flydsl_moe_large_inter.py
 import torch
 
 import flydsl.compiler as flyc
+import flydsl.expr as fx
 from aiter.fused_moe import moe_sorting
 from aiter.ops.activation import silu_and_mul
 from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
@@ -28,6 +29,14 @@ H = 6144  # model_dim
 E = 128
 TOPK = 4
 DEV = "cuda"
+
+
+def _p(t):
+    # Pass tensors as raw device pointers (fx.Pointer), matching how aiter's
+    # production path (moe_kernels._ptr_view_safe) invokes these kernels. Passing
+    # a torch tensor directly makes flydsl treat it as a memref, which breaks
+    # _ptr_buffer_resource's ptrtoint.
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 
 def _ref(x, w1, w2, tw, tid):
@@ -124,15 +133,15 @@ def run_flydsl(x, w1, w2, tw, tid, inter, *, tile_m, tile_k, k_batch):
 
     c1 = flyc.compile(
         e1,
-        g1.view(-1),
-        x.view(-1),
-        w1s,
-        sd,
-        sd,
-        s,
-        se,
-        sw1d,
-        nv,
+        _p(g1.view(-1)),
+        _p(x.view(-1)),
+        _p(w1s),
+        _p(sd),
+        _p(sd),
+        _p(s),
+        _p(se),
+        _p(sw1d),
+        _p(nv),
         ntok,
         inter,
         H,
@@ -141,15 +150,15 @@ def run_flydsl(x, w1, w2, tw, tid, inter, *, tile_m, tile_k, k_batch):
     )
     c2 = flyc.compile(
         e2,
-        out.view(-1),
-        a2.view(-1),
-        w2s,
-        sd,
-        sd,
-        s,
-        se,
-        sw1d,
-        nv,
+        _p(out.view(-1)),
+        _p(a2.view(-1)),
+        _p(w2s),
+        _p(sd),
+        _p(sd),
+        _p(s),
+        _p(se),
+        _p(sw1d),
+        _p(nv),
         ntok,
         H,
         inter,
@@ -161,15 +170,15 @@ def run_flydsl(x, w1, w2, tw, tid, inter, *, tile_m, tile_k, k_batch):
         if split_k:
             g1.zero_()
         c1(
-            g1.view(-1),
-            x.view(-1),
-            w1s,
-            sd,
-            sd,
-            s,
-            se,
-            sw1d,
-            nv,
+            _p(g1.view(-1)),
+            _p(x.view(-1)),
+            _p(w1s),
+            _p(sd),
+            _p(sd),
+            _p(s),
+            _p(se),
+            _p(sw1d),
+            _p(nv),
             ntok,
             inter,
             H,
@@ -180,15 +189,15 @@ def run_flydsl(x, w1, w2, tw, tid, inter, *, tile_m, tile_k, k_batch):
             silu_and_mul(a2, g1.view(-1, 2 * inter))
         out.zero_()
         c2(
-            out.view(-1),
-            a2.view(-1),
-            w2s,
-            sd,
-            sd,
-            s,
-            se,
-            sw1d,
-            nv,
+            _p(out.view(-1)),
+            _p(a2.view(-1)),
+            _p(w2s),
+            _p(sd),
+            _p(sd),
+            _p(s),
+            _p(se),
+            _p(sw1d),
+            _p(nv),
             ntok,
             H,
             inter,

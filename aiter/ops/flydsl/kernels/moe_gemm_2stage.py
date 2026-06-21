@@ -555,12 +555,12 @@ def compile_moe_gemm1(
                 expert_off_idx = expert_idx * inter2_idx  # index
 
                 if const_expr(is_f16_or_bf16 and not w_is_int4):
-                    _w_base_addr = buffer_ops.extract_base_index(arg_w)
+                    _w_base_addr = fx.ptrtoint(arg_w)
                     _w_expert_byte = (
                         expert_off_idx * k_in * arith.index(int(w_elem_bytes))
                     )
                     w_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                        arith.index_cast(T.i64, _w_base_addr + _w_expert_byte)
+                        _w_base_addr + arith.index_cast(T.i64, _w_expert_byte)
                     )
                     w_row_off = arith.index(0)
                 else:
@@ -1157,7 +1157,7 @@ def compile_moe_gemm1(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
@@ -2447,12 +2447,12 @@ def compile_moe_gemm2(
                 expert_off_idx = expert_idx * n_idx  # index
 
                 if const_expr(is_f16_or_bf16 and not w_is_int4):
-                    _w_base_addr = buffer_ops.extract_base_index(arg_w)
+                    _w_base_addr = fx.ptrtoint(arg_w)
                     _w_expert_byte = (
                         expert_off_idx * k_in * arith.index(int(w_elem_bytes))
                     )
                     w_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                        arith.index_cast(T.i64, _w_base_addr + _w_expert_byte)
+                        _w_base_addr + arith.index_cast(T.i64, _w_expert_byte)
                     )
                     w_row_off = arith.index(0)
                 else:
@@ -2991,7 +2991,7 @@ def compile_moe_gemm2(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
