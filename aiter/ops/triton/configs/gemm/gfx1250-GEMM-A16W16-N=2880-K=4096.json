@@ -1,10 +1,10 @@
 {
     "M_LEQ_64": {
-        "BLOCK_M": 16,
+        "BLOCK_M": 32,
         "BLOCK_N": 32,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 5,
-        "num_warps": 2
+        "NUM_BUFFERS": 4,
+        "num_warps": 4
     },
     "M_LEQ_256": {
         "BLOCK_M": 64,
