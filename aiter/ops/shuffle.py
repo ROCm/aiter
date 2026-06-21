@@ -404,18 +404,14 @@ def shuffle_scale_moe(
 
 
 # --- batched scales (FP4 blockscale16, attention) ---
-def shuffle_scale_batched(
-    data: torch.Tensor, scale_k_width=None, arch=None
-) -> torch.Tensor:
-    """Batched shuffle scales for FP4 blockscale16 format (gfx1250).
+def shuffle_scale_batched(data: torch.Tensor, scale_k_width=None) -> torch.Tensor:
+    """Batched shuffle scales for the FP4 blockscale16 format.
 
+    Single-layout permute, no arch branch: the blockscale16 layout is
+    arch-independent and is consumed by the FP4 MLA KV-cache path on both gfx950
+    and gfx1250
     https://github.com/triton-lang/triton/blob/main/third_party/amd/python/examples/gluon/mxfp_gemm_gfx1250.py#L1014
     """
-    arch = arch or get_arch()
-    if arch != "gfx1250":
-        raise NotImplementedError(
-            f"shuffle_scale_batched only supports gfx1250, got {arch!r}"
-        )
     data_shape = data.shape
     N = data_shape[-2]
     SCALE_K = data_shape[-1]
