@@ -2159,12 +2159,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Seed torch RNG for reproducible Q/K/V generation (default: nondeterministic)",
-    )
-    parser.add_argument(
         "--rep",
         type=int,
         default=100,
