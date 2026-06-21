@@ -129,6 +129,13 @@ def get_flydsl_stage1_kernels(
                                     for kw in k_waves:
                                         if num_n_waves * kw > 8:
                                             continue
+                                        # The cross-wave reduction scratch reuses the
+                                        # X/out LDS buffer (sized ~k_wave*tile_m*tile_k),
+                                        # but needs k_wave*tile_m*tile_n*4 bytes. Require
+                                        # 4*tile_n<=tile_k so it fits; otherwise it
+                                        # overruns into lds_tid (e.g. t32x128x256_kw2).
+                                        if kw > 1 and 4 * tn > tk:
+                                            continue
                                         name = base + (f"_kw{kw}" if kw > 1 else "")
                                         kernels[name] = {
                                             "stage": 1,
