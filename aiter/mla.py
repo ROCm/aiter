@@ -198,6 +198,14 @@ def mla_decode_fwd(
     intra_batch_mode=False,
     return_logits=False,
     return_lse=False,
+    # round-robin context-parallel (CP): when cp_world_size > 1 the local KV is a
+    # round-robin shard of a global sequence (global pos p -> rank p % W). The
+    # kernel maps a local kv index j back to its global position g(j)=j*W+r to
+    # apply the causal mask on GLOBAL positions. g_kv_indptr carries the GLOBAL
+    # per-request kv_indptr (global KV length). cp_world_size==1 disables it.
+    g_kv_indptr=None,
+    cp_world_size=1,
+    cp_rank=0,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -296,6 +304,9 @@ def mla_decode_fwd(
             final_lse,
             q_scale,
             kv_scale,
+            g_kv_indptr,
+            cp_world_size,
+            cp_rank,
         )
 
         if num_kv_splits == 1 and (
@@ -511,6 +522,9 @@ def mla_decode_fwd(
                 final_lse,
                 q_scale,
                 kv_scale,
+                g_kv_indptr,
+                cp_world_size,
+                cp_rank,
             )
 
         aiter.mla_reduce_v1(

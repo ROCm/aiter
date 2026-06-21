@@ -70,6 +70,16 @@ struct __attribute__((packed)) KernelArgs
     p3 _p23;
     void* ptr_LSEP;
     p2 _p24;
+    // round-robin context-parallel (CP) extension:
+    //   ptr_GKVTP        : GLOBAL kv_indptr [batch+1] (per-request global KV length)
+    //   s_cp_world_size  : number of CP ranks (W); 1 == disabled
+    //   s_cp_rank        : this rank id (r); local kv idx j -> global pos j*W + r
+    void* ptr_GKVTP;       // 0x140
+    p2 _p25;
+    unsigned int s_cp_world_size;  // 0x150
+    p3 _p26;
+    unsigned int s_cp_rank;        // 0x160
+    p3 _p27;
 };
 
 struct __attribute__((packed)) MlaMi400KernelArgs
@@ -124,7 +134,8 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                                      int qseqlen,
                                      std::string arch_id,
                                      CFG* cfgs,
-                                     int lse = 0)
+                                     int lse = 0,
+                                     int cprr = 0)
 {
     for(const auto& el : *cfgs)
     {
@@ -140,6 +151,10 @@ std::string get_heuristic_kernel_mla(std::string q_type,
             continue;
         if (cfg.lse != lse)
             continue;
+        // round-robin context-parallel: select the dedicated `cprr` kernel when
+        // g_kv_indptr is provided (cprr==1), and the plain kernel otherwise.
+        if (cfg.cprr != cprr)
+            continue;
         return el.first;
     }
     
@@ -153,7 +168,8 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                 " prefill:", prefill,
                 " causal:", causal,
                 " qseqlen:", qseqlen,
-                " lse:", lse);
+                " lse:", lse,
+                " cprr:", cprr);
     return "";
 }
 
@@ -624,6 +640,9 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* lse,                  //   [batch_size, num_heads] (nullable)
     aiter_tensor_t* q_scale,              //   [1] (nullable)
     aiter_tensor_t* kv_scale,             //   [1] (nullable)
+    aiter_tensor_t* g_kv_indptr,          //   [batch_size+1] GLOBAL kv_indptr for round-robin CP (nullable)
+    int cp_world_size,                    //   round-robin CP world size (1 == disabled)
+    int cp_rank,                          //   round-robin CP rank id
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -689,6 +708,17 @@ void mla_decode_stage1_asm_fwd(
         args.ptr_LSEP = lse->data_ptr();
     }
 
+    // round-robin context-parallel inputs (no-op when cp_world_size <= 1)
+    args.ptr_GKVTP       = (g_kv_indptr != nullptr) ? g_kv_indptr->data_ptr() : nullptr;
+    args.s_cp_world_size = (cp_world_size > 0) ? (unsigned int)cp_world_size : 1u;
+    args.s_cp_rank       = (cp_rank >= 0) ? (unsigned int)cp_rank : 0u;
+    if (args.ptr_GKVTP != nullptr)
+    {
+        AITER_CHECK(cp_world_size > 0,
+                    __func__, ": cp_world_size must be > 0 when g_kv_indptr is provided");
+        AITER_CHECK(cp_rank >= 0 && cp_rank < cp_world_size,
+                    __func__, ": cp_rank must be in [0, cp_world_size) when g_kv_indptr is provided");
+    }
     if (persistent)
     {
         args.out_16_nosplit = kv_split;
@@ -847,10 +877,6 @@ void mla_decode_stage1_asm_fwd(
             if(!persistent){
                 config_max_seqlen_q = 0;
                 sub_Q = 64;
-            } else if(persistent && max_seqlen_q == 1){
-                config_max_seqlen_q = 4;
-                config_gqa_ratio = 32;
-                args.s_MQA = gqa_ratio;
             }
         }else if (q_type == "fp8" && kv_type == "fp8"){
             if((max_seqlen_q == 1) && !persistent){
@@ -907,7 +933,7 @@ void mla_decode_stage1_asm_fwd(
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
-    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio > 16) && (gqa_ratio * max_seqlen_q != 32)){
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio >= 16)){
         config_max_seqlen_q = 1;
         config_gqa_ratio = 64;
         args.s_MQA = gqa_ratio;
@@ -920,7 +946,9 @@ void mla_decode_stage1_asm_fwd(
         args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
-    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
+
+    int cprr_flag = (g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr) ? 1 : 0;
+    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;

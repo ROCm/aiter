@@ -817,6 +817,13 @@ def mla_decode_stage1_asm_fwd(
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
     # [1] pertensor
+    # round-robin context-parallel (CP) extension:
+    #   g_kv_indptr   : [batch_size+1] GLOBAL kv_indptr (per-request global KV length)
+    #   cp_world_size : number of CP ranks (W); 1 == disabled
+    #   cp_rank       : this rank id (r); local kv idx j -> global pos j*W + r
+    g_kv_indptr: Optional[torch.Tensor] = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
 ) -> None: ...
 
 
@@ -1208,6 +1215,7 @@ def get_mla_metadata_v1(
     intra_batch_mode: bool = False,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
+    is_cp_round_robin: bool = False,
 ) -> None:
     """
     Inputs:

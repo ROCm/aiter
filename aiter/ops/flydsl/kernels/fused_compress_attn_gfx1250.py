@@ -1,66 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused Compressor boundary kernel for V4 attention (FlyDSL).
+"""Fused Compressor boundary kernel for V4 attention — **gfx1250 (RDNA4, wave32)**.
 
-Drop-in replacement for the Triton ``_fused_compress_attn_kernel`` in
-``atom/model_ops/v4_kernels/fused_compress.py``. Per-boundary online-softmax
-pool over K=2*RATIO source positions, RMSNorm (fp32), GPT-J interleaved RoPE,
-optional FP8 (ue8m0 scale + MFMA 16x16 preshuffle) cache scatter.
+Port of ``fused_compress_attn.py`` (wave64) to gfx1250 wave32.
+Key differences from the wave64 version:
+  - BLOCK_THREADS = 32 (wave32)
+  - VEC = D / 32 (D=512 → VEC=16; D=128 → VEC=4)
+  - VEC=16 load/store paths (4× dwordx4 for f32, 2× dwordx4 for bf16)
+  - preshuffle forced False (MFMA preshuffle is gfx9-only)
+  - Kernel names suffixed with "w32" to avoid JIT cache collision
+  - FP8 VEC=4 packing path (no pair-coop shuffle needed)
 
-Two kernel families share this file:
-  - Legacy single-wave (``_build_kernel``): 1 wave64 per boundary, K iters
-    serialized. Handles all shapes + the FP8/quant/preshuffle family.
-  - K-split multi-wave (``_build_kernel_ksplit``, BF16 + FP8 scatter): K split
-    across NW waves in one workgroup (block = 64*NW), LDS cross-wave
-    online-softmax reduce, single dispatch. Parallelizes the serial softmax
-    chain that bottlenecks the latency-bound small-N decode regime. On the
-    CSA Main (D=512, BF16) and CSA Indexer (D=128, FP8) shapes it auto-engages
-    via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4× (BF16) /
-    ~1.15-1.24× (FP8) at decode bs=1-32; it falls back to legacy at high N
-    where CU occupancy already saturates. See
-    ``flydsl_fused_compress_attn``'s ``k_split_num_waves`` arg.
+Two kernel families:
+  - Single-wave (``_build_kernel``): 1 wave32 per boundary
+  - K-split multi-wave (``_build_kernel_ksplit``): K split across NW waves,
+    block = 32*NW
 
-Grid: ``(plan_capacity, 1, 1)`` — one program per packed plan row
-``[ragged_id, batch_id, position, window_len]``. Position == -1 rows
-sentinel-skip; sentinel-skip is implemented as an scf.IfOp that wraps the
-entire body (flydsl ``if cond: return`` does NOT actually early-exit inside
-a @flyc.kernel — same trap as ``qk_norm_rope_quant``'s grid-Y chunk loop).
-
-Per-thread layout (single wave64, BLOCK_THREADS=64):
-  - VEC = D / 64 (V4-Pro Main: D=512 → VEC=8; Indexer: D=128 → VEC=2)
-  - Thread t owns ``D`` elements ``[t*VEC, t*VEC+VEC)`` of the BLOCK_D vector.
-  - Online-softmax accumulators ``m_acc/kv_acc/w_acc`` are per-thread fp32
-    arrays carried across K iterations via scf.for loop-carried state.
-
-Two-phase K loop (matches Triton perf split):
-  Phase 1 (state cache): k ∈ [0, window_len) — dynamic bound, scf.for with
-    loop-carry. Each iter loads kv_state/score_state at ``s = pos - K + 1 + k``,
-    masking padding (s < 0) via ``select(is_padding, NEG_INF, score_b)``.
-  Phase 2 (ragged input): k ∈ [window_len, K) — dynamic start, constexpr end.
-    Each iter loads kv_in/score_in/ape, then ``score_k = score_a + ape_v``.
-
-Both phases share the max-rescale update:
-  m_new = max(m_acc, score_k)
-  scale = (m_acc == -inf) ? 0 : exp(m_acc - m_new)
-  w_k   = (score_k == -inf) ? 0 : exp(score_k - m_new)
-  kv_acc = kv_acc * scale + w_k * kv_k
-  w_acc  = w_acc  * scale + w_k
-  m_acc  = m_new
-
-After the K loop:
-  compressed = kv_acc / w_acc                              # fp32 per-lane
-  rstd       = rsqrt(sum_wave(compressed^2) / D + eps)     # fp32 scalar
-  normed     = compressed * rstd * rms_weight              # fp32 per-lane
-  rotated    = GPT-J RoPE on rope_head_dim tail            # fp32 per-lane
-
-Scatter (only when block_table is non-null, i.e. not warmup):
-  QUANT=0: bf16 paged write to kv_cache[physical_block, slot_in_block, :]
-  QUANT=1: per-row amax → ue8m0 scale (silu_and_mul_fq encoding) → fp8 cast
-           → MFMA 16x16 preshuffled write + fp32 scale write into cache_scale.
-
-Correctness invariant (caller-side): kernel reads state cache as-of-end-of-
-previous-fwd. Caller MUST invoke BEFORE ``update_compressor_states``.
+See ``fused_compress_attn.py`` for the original wave64 documentation.
 """
 
 # NOTE: do NOT add `from __future__ import annotations` (see qk_norm_rope_quant
@@ -101,7 +58,7 @@ _FORCE_BIND_LDS = (
 )
 
 # --- shape constants --------------------------------------------------------
-BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
+BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250); D must be a multiple
 
 # --- fp8 + e8m0 constants ---------------------------------------------------
 # Defer ``aiter.utility.dtypes`` import to first call (matches
@@ -166,7 +123,7 @@ def _build_kernel(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    enable_prefetch_input: bool = True,
+    enable_prefetch_input: bool = False,
 ):
     """Build the @flyc.kernel + @flyc.jit launcher for a given config.
 
@@ -198,12 +155,12 @@ def _build_kernel(
     # --- per-thread vec layout ----
     ROPE_THREAD_LO = NOPE // VEC  # first rope-thread tid
     PAIRS_PER_THREAD = VEC // 2  # GPT-J pairs each rope-thread owns
-    # For Main (D=512, VEC=8) → 56 .. 63 are rope threads, 4 pairs each (=64 total).
-    # For Indexer (D=128, VEC=2) → 32 .. 63 are rope threads, 1 pair each (=64=2RD/2).
+    # For Main (D=512, VEC=16) → 28 .. 31 are rope threads, 8 pairs each (=64 total).
+    # For Indexer (D=128, VEC=4) → 16 .. 31 are rope threads, 2 pairs each (=64=2RD/2).
     # The RD%(2*VEC) == 0 invariant means rope threads cleanly own whole pairs.
 
     assert D % BLOCK_THREADS == 0, f"D={D} must divide BLOCK_THREADS={BLOCK_THREADS}"
-    assert VEC in (2, 4, 8), f"VEC={VEC} (D/{BLOCK_THREADS}) outside supported set"
+    assert VEC in (2, 4, 8, 16), f"VEC={VEC} (D/{BLOCK_THREADS}) outside supported set"
     assert NOPE >= 0 and NOPE % VEC == 0
     assert RD > 0 and RD % 2 == 0 and RD % VEC == 0
     assert state_size >= K, f"state_size={state_size} < K={K}"
@@ -217,7 +174,7 @@ def _build_kernel(
 
     # --- kernel name ----
     _name_parts = [
-        "fused_compress_attn",
+        "fused_compress_attn_w32",
         f"D{D}",
         f"RD{RD}",
         f"R{ratio}",
@@ -278,7 +235,7 @@ def _build_kernel(
 
         # --- thread / block ids ---
         pid = fx.block_idx.x  # one program per plan row
-        tid = fx.thread_idx.x  # 0 .. 63
+        tid = fx.thread_idx.x  # 0 .. 31
 
         # --- constants ---
         c_neg_inf = arith.constant(_NEG_INF, type=f32)
@@ -294,7 +251,7 @@ def _build_kernel(
             )
 
         def wave_reduce_add(x):
-            """Butterfly sum across wave64."""
+            """Butterfly sum across wave32."""
             w = _to_raw(x)
             for sh_exp in range_constexpr(log2_block):
                 off = BLOCK_THREADS // (2 << sh_exp)
@@ -303,7 +260,7 @@ def _build_kernel(
             return w
 
         def wave_reduce_max(x):
-            """Butterfly max across wave64 (used by quant path)."""
+            """Butterfly max across wave32 (used by quant path)."""
             w = _to_raw(x)
             for sh_exp in range_constexpr(log2_block):
                 off = BLOCK_THREADS // (2 << sh_exp)
@@ -415,36 +372,71 @@ def _build_kernel(
                 """Load VEC bf16 from byte-aligned dword stream → fp32 VEC scalars.
 
                 Returns a list of VEC fp32 MLIR values.
+                VEC=16 → dwords=8 → 2× dwordx4 loads, bitcast each to vec<8,bf16>.
                 """
                 off_dw = ArithValue(off_elems_i32) >> arith.constant(1, type=i32)
-                # bf16 VEC = VEC * 2 bytes; for VEC ∈ {2, 4, 8} that's
-                # {4, 8, 16} bytes = {1, 2, 4} dwords.
+                # bf16 VEC = VEC * 2 bytes; dwords = VEC/2.
                 dwords = (VEC + 1) // 2  # ceil(VEC*2 / 4)
                 if const_expr(dwords == 1):
                     # buffer_load(vec_width=1) returns a scalar i32; wrap into
                     # vec<1xi32> before bitcasting to vec<2xbf16>.
                     raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
                     raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
-                else:
+                    vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                    out = []
+                    for i in range_constexpr(VEC):
+                        bf16_v = vector.extract(
+                            vec_bf16,
+                            static_position=[i],
+                            dynamic_position=[],
+                        )
+                        f32_v = arith.extf(f32, bf16_v)
+                        out.append(f32_v)
+                    return out
+                elif const_expr(dwords <= 4):
                     raw = buffer_ops.buffer_load(
                         rsrc, off_dw, vec_width=dwords, dtype=i32
                     )
-                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
-                out = []
-                for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16,
-                        static_position=[i],
-                        dynamic_position=[],
-                    )
-                    f32_v = arith.extf(f32, bf16_v)
-                    out.append(f32_v)
-                return out
+                    vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                    out = []
+                    for i in range_constexpr(VEC):
+                        bf16_v = vector.extract(
+                            vec_bf16,
+                            static_position=[i],
+                            dynamic_position=[],
+                        )
+                        f32_v = arith.extf(f32, bf16_v)
+                        out.append(f32_v)
+                    return out
+                else:
+                    # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
+                    half_dw = 4
+                    half_bf16 = half_dw * 2  # 8 bf16 per chunk
+                    out = []
+                    for chunk in range_constexpr(dwords // half_dw):
+                        r = buffer_ops.buffer_load(
+                            rsrc,
+                            ArithValue(off_dw)
+                            + arith.constant(chunk * half_dw, type=i32),
+                            vec_width=half_dw,
+                            dtype=i32,
+                        )
+                        vbf16 = vector.bitcast(T.vec(half_bf16, T.bf16), r)
+                        for i in range_constexpr(half_bf16):
+                            bf16_v = vector.extract(
+                                vbf16,
+                                static_position=[i],
+                                dynamic_position=[],
+                            )
+                            f32_v = arith.extf(f32, bf16_v)
+                            out.append(f32_v)
+                    return out
 
             def _load_f32_vec(rsrc, off_elems_i32):
                 """Load VEC fp32 from byte-aligned stream → list of VEC fp32 scalars.
 
-                For VEC=2 → dwordx2; VEC=4 → dwordx4; VEC=8 → 2× dwordx4 (HW max).
+                For VEC=2 → dwordx2; VEC=4 → dwordx4; VEC=8 → 2× dwordx4;
+                VEC=16 → 4× dwordx4 (HW max is dwordx4).
                 """
                 if const_expr(VEC <= 4):
                     vw = VEC
@@ -456,27 +448,24 @@ def _build_kernel(
                         for i in range(VEC)
                     ]
                 else:
-                    # VEC == 8 → 2× dwordx4
-                    assert VEC == 8
-                    half = VEC // 2
-                    r0 = buffer_ops.buffer_load(
-                        rsrc, off_elems_i32, vec_width=half, dtype=f32
-                    )
-                    r1 = buffer_ops.buffer_load(
-                        rsrc,
-                        ArithValue(off_elems_i32) + arith.constant(half, type=i32),
-                        vec_width=half,
-                        dtype=f32,
-                    )
+                    # VEC in {8, 16} → split into quarter=4 chunks
+                    quarter = 4
+                    n_chunks = VEC // quarter
                     out = []
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r0, static_position=[i], dynamic_position=[])
+                    for q in range_constexpr(n_chunks):
+                        r = buffer_ops.buffer_load(
+                            rsrc,
+                            ArithValue(off_elems_i32)
+                            + arith.constant(q * quarter, type=i32),
+                            vec_width=quarter,
+                            dtype=f32,
                         )
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r1, static_position=[i], dynamic_position=[])
-                        )
+                        for i in range_constexpr(quarter):
+                            out.append(
+                                vector.extract(
+                                    r, static_position=[i], dynamic_position=[]
+                                )
+                            )
                     return out
 
             # Buffer resources reused across K iters.
@@ -918,7 +907,7 @@ def _build_kernel(
                         + tid_x_vec
                     )
                     # Build a per-block GTensor and store VEC bf16 via dword path.
-                    # bf16 VEC ∈ {2, 4, 8} = {4, 8, 16} bytes = {1, 2, 4} dwords.
+                    # bf16 VEC ∈ {2, 4, 8, 16} = {4, 8, 16, 32} bytes = {1, 2, 4, 8} dwords.
                     out_vec_t = T.vec(VEC, T.bf16)
                     raw_vec = vector.from_elements(vecVf32, out_lane)
                     bf16_vec = raw_vec.truncf(out_vec_t)
@@ -935,8 +924,29 @@ def _build_kernel(
                             bf16_as_i32, static_position=[0], dynamic_position=[]
                         )
                         buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
-                    else:
+                    elif const_expr(dwords <= 4):
                         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+                    else:
+                        # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
+                        c4_i32 = arith.constant(4, type=i32)
+                        lo = vector.extract_strided_slice(
+                            T.vec(4, T.i32),
+                            bf16_as_i32,
+                            offsets=[0],
+                            sizes=[4],
+                            strides=[1],
+                        )
+                        hi = vector.extract_strided_slice(
+                            T.vec(4, T.i32),
+                            bf16_as_i32,
+                            offsets=[4],
+                            sizes=[4],
+                            strides=[1],
+                        )
+                        buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
+                        buffer_ops.buffer_store(
+                            hi, out_rsrc, ArithValue(cache_off_dw) + c4_i32
+                        )
                 else:
                     # ── QUANT=1: FP8 per-row scaled write + fp32 scale ──
                     # Steps:
@@ -1041,21 +1051,28 @@ def _build_kernel(
                         )
                         dword = pk
                     else:
-                        # VEC == 8: 8 bytes = 2 dwords. Build separately.
-                        assert VEC == 8
-                        p0 = rocdl.cvt_pk_fp8_f32(
-                            i32, fp8_inputs[0], fp8_inputs[1], c_p0, 0
-                        )
-                        p0 = rocdl.cvt_pk_fp8_f32(
-                            i32, fp8_inputs[2], fp8_inputs[3], p0, 1
-                        )
-                        p1 = rocdl.cvt_pk_fp8_f32(
-                            i32, fp8_inputs[4], fp8_inputs[5], c_p0, 0
-                        )
-                        p1 = rocdl.cvt_pk_fp8_f32(
-                            i32, fp8_inputs[6], fp8_inputs[7], p1, 1
-                        )
-                        dword = (p0, p1)
+                        # VEC in {8, 16}: VEC bytes = VEC/4 dwords. Build per-dword.
+                        assert VEC in (8, 16)
+                        n_dwords = VEC // 4
+                        dword_list = []
+                        for dw_idx in range_constexpr(n_dwords):
+                            base = dw_idx * 4
+                            pk = rocdl.cvt_pk_fp8_f32(
+                                i32,
+                                fp8_inputs[base + 0],
+                                fp8_inputs[base + 1],
+                                c_p0,
+                                0,
+                            )
+                            pk = rocdl.cvt_pk_fp8_f32(
+                                i32,
+                                fp8_inputs[base + 2],
+                                fp8_inputs[base + 3],
+                                pk,
+                                1,
+                            )
+                            dword_list.append(pk)
+                        dword = tuple(dword_list)
 
                     # Compute store address (in BYTES from kv_cache base).
                     # Both layouts use the same base (= phys * block_stride);
@@ -1119,16 +1136,34 @@ def _build_kernel(
                             dword, out_rsrc, byte_off, offset_is_bytes=True
                         )
                     else:
-                        # VEC == 8: store 2 dwords (8 bytes) via vec<2xi32>
-                        store_vec = vector.from_elements(
-                            T.vec(2, i32), [dword[0], dword[1]]
-                        )
-                        buffer_ops.buffer_store(
-                            store_vec,
-                            out_rsrc,
-                            byte_off,
-                            offset_is_bytes=True,
-                        )
+                        # VEC in {8, 16}: store n_dwords via dwordx4 chunks
+                        n_dw = VEC // 4
+                        if const_expr(n_dw <= 4):
+                            store_vec = vector.from_elements(
+                                T.vec(n_dw, i32), list(dword)
+                            )
+                            buffer_ops.buffer_store(
+                                store_vec,
+                                out_rsrc,
+                                byte_off,
+                                offset_is_bytes=True,
+                            )
+                        else:
+                            # n_dw > 4 (VEC=16 → n_dw=4, actually fits dwordx4;
+                            # kept for future-proofing)
+                            for chunk_start in range_constexpr(n_dw // 4):
+                                base = chunk_start * 4
+                                sv = vector.from_elements(
+                                    T.vec(4, i32),
+                                    list(dword[base : base + 4]),
+                                )
+                                buffer_ops.buffer_store(
+                                    sv,
+                                    out_rsrc,
+                                    ArithValue(byte_off)
+                                    + arith.constant(base * 4, type=i32),
+                                    offset_is_bytes=True,
+                                )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
                     is_lane0 = arith.cmpi(
@@ -1214,7 +1249,7 @@ def _build_kernel(
 # K-split single-kernel builder (multi-wave LDS reduce)
 # ============================================================================
 #
-# Why this exists: the legacy single-wave kernel above runs ONE wave64 per
+# Why this exists: the legacy single-wave kernel above runs ONE wave32 per
 # boundary, serializing K iters of online-softmax. PMC on CSA Main (D=512,
 # K=8) showed VALU IPC ~0.33 with 53% of cycles in SQ_WAIT_ANY and only 128
 # VMEM insts — i.e. the wave is stalled on the *serial dependency chain*
@@ -1222,7 +1257,7 @@ def _build_kernel(
 # memory. At decode bs=1-32 each CU holds a single wave, so nothing hides the
 # chain latency.
 #
-# Fix: split K across NW waves in ONE workgroup (block = 64*NW), grid stays
+# Fix: split K across NW waves in ONE workgroup (block = 32*NW), grid stays
 # = plan_capacity (single dispatch → no extra ~2.2us launch floor). Each wave
 # runs K/NW iters; LDS cross-wave online-softmax merges the per-wave
 # accumulators; wave 0 then does RMSNorm + GPT-J RoPE + BF16 scatter inline
@@ -1248,23 +1283,16 @@ def _build_kernel_ksplit(
     rms_weight_is_bf16: bool,
     rms_eps: float,
 ):
-    """K-split single-kernel: NW-wave LDS-reduced compress + norm + rope +
-    scatter (BF16 or FP8). Constexpr knobs mirror :func:`_build_kernel` minus
-    ``enable_prefetch_input`` (each wave runs so few iters that prefetch is
-    moot). The FP8 / ue8m0 / preshuffle scatter is emitted in wave 0, where
-    ``lid`` (0..63) plays the single-wave ``tid`` role — pair-coop
-    shuffle_xor and wave_reduce_max stay within wave 0's 64 lanes, identical
-    to the legacy kernel's semantics.
+    """K-split single-kernel (wave32 / gfx1250): NW-wave LDS-reduced compress +
+    norm + rope + scatter (BF16 or FP8).
 
     Layout:
       - Grid:  (plan_capacity, 1, 1)  — one workgroup per plan row.
-      - Block: 64 * NW threads (NW waves).
-      - VEC = D / 64: each lane owns VEC contiguous D-columns. One wave's 64
+      - Block: 32 * NW threads (NW waves).
+      - VEC = D / 32: each lane owns VEC contiguous D-columns. One wave's 32
         lanes cover the full head_dim.
       - K = (2 if overlap else 1) * ratio, split into NW slices of K_PER_WAVE.
-      - LDS: 3 fp32 arrays of NW*D (m, kv, w). Each lane writes its VEC
-        accumulator values at wid*D + lid*VEC + i; wave 0 reads NW values per
-        owned element and folds them with a global-max online-softmax.
+      - LDS: 3 fp32 arrays of NW*D (m, kv, w).
     """
     D = head_dim
     RD = rope_head_dim
@@ -1280,7 +1308,7 @@ def _build_kernel_ksplit(
     PAIRS_PER_THREAD = VEC // 2
 
     assert D % BLOCK_THREADS == 0, f"D={D} must divide {BLOCK_THREADS}"
-    assert VEC in (2, 4, 8), f"VEC={VEC} outside supported set"
+    assert VEC in (2, 4, 8, 16), f"VEC={VEC} outside supported set"
     assert NOPE >= 0 and NOPE % VEC == 0
     assert RD > 0 and RD % 2 == 0 and RD % VEC == 0
     assert state_size >= K, f"state_size={state_size} < K={K}"
@@ -1309,7 +1337,7 @@ def _build_kernel_ksplit(
     allocator.ptr = lds_w_off + LDS_BYTES
 
     _name_parts = [
-        "fused_compress_attn",
+        "fused_compress_attn_w32",
         f"D{D}",
         f"RD{RD}",
         f"R{ratio}",
@@ -1369,7 +1397,7 @@ def _build_kernel_ksplit(
         c_zero_f32 = arith.constant(0.0, type=f32)
         c_zero_i32 = arith.constant(0, type=i32)
         c_one_i32 = arith.constant(1, type=i32)
-        c_64 = arith.constant(BLOCK_THREADS, type=i32)
+        c_WS = arith.constant(BLOCK_THREADS, type=i32)
         c_eps = arith.constant(rms_eps, type=f32)
         c_inv_D = arith.constant(1.0 / D, type=f32)
         c_log2e = arith.constant(_LOG2E, type=f32)
@@ -1384,8 +1412,8 @@ def _build_kernel_ksplit(
                 f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
             )
 
-        wid = arith.divsi(_to_raw(tid), c_64)  # ∈ [0, NW)
-        lid = arith.remui(_to_raw(tid), c_64)  # ∈ [0, 64)
+        wid = arith.divsi(_to_raw(tid), c_WS)  # ∈ [0, NW)
+        lid = arith.remui(_to_raw(tid), c_WS)  # ∈ [0, 32)
 
         # ---- plan row (single dwordx4) ----
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
@@ -1435,26 +1463,24 @@ def _build_kernel_ksplit(
                         for i in range(VEC)
                     ]
                 else:
-                    assert VEC == 8
-                    half = VEC // 2
-                    r0 = buffer_ops.buffer_load(
-                        rsrc, off_elems_i32, vec_width=half, dtype=f32
-                    )
-                    r1 = buffer_ops.buffer_load(
-                        rsrc,
-                        ArithValue(off_elems_i32) + arith.constant(half, type=i32),
-                        vec_width=half,
-                        dtype=f32,
-                    )
+                    # VEC in {8, 16} → split into quarter=4 chunks
+                    quarter = 4
+                    n_chunks = VEC // quarter
                     out = []
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r0, static_position=[i], dynamic_position=[])
+                    for q in range_constexpr(n_chunks):
+                        r = buffer_ops.buffer_load(
+                            rsrc,
+                            ArithValue(off_elems_i32)
+                            + arith.constant(q * quarter, type=i32),
+                            vec_width=quarter,
+                            dtype=f32,
                         )
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r1, static_position=[i], dynamic_position=[])
-                        )
+                        for i in range_constexpr(quarter):
+                            out.append(
+                                vector.extract(
+                                    r, static_position=[i], dynamic_position=[]
+                                )
+                            )
                     return out
 
             def _load_bf16_vec_then_f32(rsrc, off_elems_i32):
@@ -1463,18 +1489,46 @@ def _build_kernel_ksplit(
                 if const_expr(dwords == 1):
                     raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
                     raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
-                else:
+                    vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                    out = []
+                    for i in range_constexpr(VEC):
+                        bf16_v = vector.extract(
+                            vec_bf16, static_position=[i], dynamic_position=[]
+                        )
+                        out.append(arith.extf(f32, bf16_v))
+                    return out
+                elif const_expr(dwords <= 4):
                     raw = buffer_ops.buffer_load(
                         rsrc, off_dw, vec_width=dwords, dtype=i32
                     )
-                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
-                out = []
-                for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
-                    out.append(arith.extf(f32, bf16_v))
-                return out
+                    vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
+                    out = []
+                    for i in range_constexpr(VEC):
+                        bf16_v = vector.extract(
+                            vec_bf16, static_position=[i], dynamic_position=[]
+                        )
+                        out.append(arith.extf(f32, bf16_v))
+                    return out
+                else:
+                    # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
+                    half_dw = 4
+                    half_bf16 = half_dw * 2
+                    out = []
+                    for chunk in range_constexpr(dwords // half_dw):
+                        r = buffer_ops.buffer_load(
+                            rsrc,
+                            ArithValue(off_dw)
+                            + arith.constant(chunk * half_dw, type=i32),
+                            vec_width=half_dw,
+                            dtype=i32,
+                        )
+                        vbf16 = vector.bitcast(T.vec(half_bf16, T.bf16), r)
+                        for i in range_constexpr(half_bf16):
+                            bf16_v = vector.extract(
+                                vbf16, static_position=[i], dynamic_position=[]
+                            )
+                            out.append(arith.extf(f32, bf16_v))
+                    return out
 
             def _softmax_step(m_lane, kv_lane, w_lane, score_lane, kv_v_lane):
                 """Padding-aware per-lane online-softmax update. Phase 2 scores
@@ -1823,8 +1877,29 @@ def _build_kernel_ksplit(
                             bf16_as_i32, static_position=[0], dynamic_position=[]
                         )
                         buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
-                    else:
+                    elif const_expr(dwords <= 4):
                         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+                    else:
+                        # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
+                        c4_i32 = arith.constant(4, type=i32)
+                        lo = vector.extract_strided_slice(
+                            T.vec(4, T.i32),
+                            bf16_as_i32,
+                            offsets=[0],
+                            sizes=[4],
+                            strides=[1],
+                        )
+                        hi = vector.extract_strided_slice(
+                            T.vec(4, T.i32),
+                            bf16_as_i32,
+                            offsets=[4],
+                            sizes=[4],
+                            strides=[1],
+                        )
+                        buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
+                        buffer_ops.buffer_store(
+                            hi, out_rsrc, ArithValue(cache_off_dw) + c4_i32
+                        )
                 else:
                     # ── FP8 per-row scaled write + fp32 scale (mirror legacy) ──
                     # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
@@ -1906,20 +1981,28 @@ def _build_kernel_ksplit(
                         )
                         dword = pk
                     else:
-                        assert VEC == 8
-                        p0 = rocdl.cvt_pk_fp8_f32(
-                            i32, fp8_inputs[0], fp8_inputs[1], c_p0, 0
-                        )
-                        p0 = rocdl.cvt_pk_fp8_f32(
-                            i32, fp8_inputs[2], fp8_inputs[3], p0, 1
-                        )
-                        p1 = rocdl.cvt_pk_fp8_f32(
-                            i32, fp8_inputs[4], fp8_inputs[5], c_p0, 0
-                        )
-                        p1 = rocdl.cvt_pk_fp8_f32(
-                            i32, fp8_inputs[6], fp8_inputs[7], p1, 1
-                        )
-                        dword = (p0, p1)
+                        # VEC in {8, 16}: VEC bytes = VEC/4 dwords
+                        assert VEC in (8, 16)
+                        n_dwords = VEC // 4
+                        dword_list = []
+                        for dw_idx in range_constexpr(n_dwords):
+                            base = dw_idx * 4
+                            pk = rocdl.cvt_pk_fp8_f32(
+                                i32,
+                                fp8_inputs[base + 0],
+                                fp8_inputs[base + 1],
+                                c_p0,
+                                0,
+                            )
+                            pk = rocdl.cvt_pk_fp8_f32(
+                                i32,
+                                fp8_inputs[base + 2],
+                                fp8_inputs[base + 3],
+                                pk,
+                                1,
+                            )
+                            dword_list.append(pk)
+                        dword = tuple(dword_list)
 
                     out_rsrc = buffer_ops.create_buffer_resource(
                         kv_cache, max_size=True
@@ -1968,12 +2051,32 @@ def _build_kernel_ksplit(
                             dword, out_rsrc, byte_off, offset_is_bytes=True
                         )
                     else:
-                        store_vec = vector.from_elements(
-                            T.vec(2, i32), [dword[0], dword[1]]
-                        )
-                        buffer_ops.buffer_store(
-                            store_vec, out_rsrc, byte_off, offset_is_bytes=True
-                        )
+                        # VEC in {8, 16}: store n_dwords via dwordx4 chunks
+                        n_dw = VEC // 4
+                        if const_expr(n_dw <= 4):
+                            store_vec = vector.from_elements(
+                                T.vec(n_dw, i32), list(dword)
+                            )
+                            buffer_ops.buffer_store(
+                                store_vec,
+                                out_rsrc,
+                                byte_off,
+                                offset_is_bytes=True,
+                            )
+                        else:
+                            for chunk_start in range_constexpr(n_dw // 4):
+                                base = chunk_start * 4
+                                sv = vector.from_elements(
+                                    T.vec(4, i32),
+                                    list(dword[base : base + 4]),
+                                )
+                                buffer_ops.buffer_store(
+                                    sv,
+                                    out_rsrc,
+                                    ArithValue(byte_off)
+                                    + arith.constant(base * 4, type=i32),
+                                    offset_is_bytes=True,
+                                )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
                     is_lane0 = arith.cmpi(
@@ -2071,37 +2174,22 @@ _DEFAULT_COMPILE_HINTS = {
 }
 
 
-def hca_per_n_config(plan_capacity: int) -> tuple[int, int]:
-    """Return ``(slice_size, k_split_num_waves)`` for ``flydsl_hca_compress_attn``
-    tuned for V4-Pro HCA Main (D=512, ratio=128, overlap=False) on MI355X.
+def hca_per_n_config_gfx1250(plan_capacity: int) -> tuple[int, int]:
+    """Return ``(slice_size, k_split_num_waves)`` for gfx1250 HCA.
 
-    Dispatch on ``plan_capacity`` (NOT ``num_compress``): the HCA kernel's
-    grid is ``plan_capacity`` (sentinel rows bail inside), and only
-    ``plan_capacity`` is CUDAGraph-stable (it's fixed per (ratio,
-    batch_bucket) and baked into captured launch args). Dispatching on the
-    runtime-varying ``num_compress`` would silently mis-select kernels for
-    captured graphs.
+    Initial values — need hardware tuning.
     """
     if plan_capacity <= 64:
-        return 64, 8
+        return 32, 8
     if plan_capacity <= 256:
-        return 128, 8
-    if plan_capacity <= 384:
-        return 256, 8
-    if plan_capacity <= 768:
-        # HCA decode bs=512 (plan_cap = bs * ceil((1+MTP)/ratio) = 512 for
-        # ratio=128, MTP≤3) prefers k_split=4 over 8: 30.4 vs 34.9 us on
-        # MI355X (~14% win, ~5 us per HCA layer).
-        return 256, 4
+        return 64, 8
     if plan_capacity <= 1024:
-        return 512, 8
-    if plan_capacity <= 8192:
-        return 512, 4
+        return 256, 4
     return 512, 1
 
 
 @lru_cache(maxsize=32)
-def compile_flydsl_fused_compress_attn(
+def compile_flydsl_fused_compress_attn_gfx1250(
     *,
     head_dim: int,
     rope_head_dim: int,
@@ -2115,7 +2203,7 @@ def compile_flydsl_fused_compress_attn(
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    enable_prefetch_input: bool = True,
+    enable_prefetch_input: bool = False,
 ):
     launcher = _build_kernel(
         head_dim=head_dim,
@@ -2136,34 +2224,20 @@ def compile_flydsl_fused_compress_attn(
     return launcher
 
 
-def csa_ksplit_num_waves(plan_capacity: int) -> int:
-    """Auto-pick ``k_split_num_waves`` for the CSA Main BF16 path
-    (D=512, RD=64, ratio=4, overlap, K=8) and the CSA Indexer FP8 path
-    (D=128, RD=64, ratio=4, overlap, K=8) on MI355X. Returns 1 to mean
-    "use the legacy single-wave kernel".
+def csa_ksplit_num_waves_gfx1250(plan_capacity: int) -> int:
+    """Auto-pick ``k_split_num_waves`` for gfx1250 (wave32).
 
-    Rationale (measured, MI355X): the multi-wave LDS K-split parallelizes the
-    serial online-softmax chain that bottlenecks the latency-bound small-N
-    regime (decode: plan_capacity ≤ ~528 always). It wins ~22-30% (BF16) /
-    ~15-24% (FP8) there. At high N the per-boundary CU occupancy is already
-    saturated, so the extra NW× blocks + LDS reduce become pure overhead and
-    the kernel regresses past plan_capacity ≈ 1300. NW=4 beats NW=8 (8-wave
-    LDS fold costs more than the 2 extra K-iters it removes for K=8) and
-    beats NW=2 across both shapes' decode range.
-
-    Dispatch on ``plan_capacity`` (NOT num_compress): it's the grid size and
-    is CUDAGraph-stable (baked into captured launch args), so captured graphs
-    select the same kernel they were traced with.
+    Initial values — need hardware tuning.
     """
-    if plan_capacity <= 768:
+    if plan_capacity <= 512:
         return 4
-    if plan_capacity <= 1280:
+    if plan_capacity <= 1024:
         return 2
     return 1  # legacy single-wave
 
 
 @lru_cache(maxsize=32)
-def compile_flydsl_fused_compress_attn_ksplit(
+def compile_flydsl_fused_compress_attn_ksplit_gfx1250(
     *,
     head_dim: int,
     rope_head_dim: int,
@@ -2196,7 +2270,7 @@ def compile_flydsl_fused_compress_attn_ksplit(
     return launcher
 
 
-def flydsl_fused_compress_attn(
+def flydsl_fused_compress_attn_gfx1250(
     *,
     kv_in: torch.Tensor,  # [num_q_tokens, DIM_FULL] bf16
     score_in: torch.Tensor,  # [num_q_tokens, DIM_FULL] bf16
@@ -2223,54 +2297,15 @@ def flydsl_fused_compress_attn(
     k_split_num_waves: Optional[int] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> None:
-    """FlyDSL drop-in replacement for ``fused_compress_attn`` (Triton).
+    """gfx1250 (wave32) drop-in for ``flydsl_fused_compress_attn``.
 
-    Same side-effecting semantics: cache scatter IS the output. Caller MUST
-    invoke BEFORE ``update_compressor_states`` (state cache reads must see
-    previous-fwd data).
-
-    ``k_split_num_waves`` (BF16 or FP8 scatter): when set to NW > 1, routes to
-    the multi-wave LDS K-split kernel (block = 64*NW, K split across NW waves,
-    single dispatch). Speeds up the latency-bound decode regime (small N,
-    1 wave/CU) where the legacy single-wave serial K-chain stalls. Requires a
-    real ``block_tables`` (has_block_table). When None, auto-picks NW for the
-    tuned CSA Main (BF16) and CSA Indexer (FP8) shapes via
-    :func:`csa_ksplit_num_waves` and uses legacy elsewhere; when 1, forces
-    legacy. K must be divisible by NW.
+    Forces ``preshuffle=False`` (MFMA preshuffle is gfx9-only; gfx1250 uses
+    linear FP8 layout) and ``enable_prefetch_input=False`` (VEC=16 register
+    pressure on RDNA4's 512 VGPRs/wave).
     """
-    # ---- gfx1250 dispatch (wave32) ----
-    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
-
-    if _get_gfx() == "gfx1250":
-        from .fused_compress_attn_gfx1250 import flydsl_fused_compress_attn_gfx1250
-
-        return flydsl_fused_compress_attn_gfx1250(
-            kv_in=kv_in,
-            score_in=score_in,
-            kv_state=kv_state,
-            score_state=score_state,
-            plan_gpu=plan_gpu,
-            state_slot_mapping=state_slot_mapping,
-            ape=ape,
-            rms_weight=rms_weight,
-            rms_eps=rms_eps,
-            cos_cache=cos_cache,
-            sin_cache=sin_cache,
-            kv_cache=kv_cache,
-            block_tables=block_tables,
-            k_per_block=k_per_block,
-            overlap=overlap,
-            ratio=ratio,
-            head_dim=head_dim,
-            rope_head_dim=rope_head_dim,
-            quant=quant,
-            cache_scale=cache_scale,
-            use_ue8m0=use_ue8m0,
-            preshuffle=preshuffle,
-            k_split_num_waves=k_split_num_waves,
-            stream=stream,
-        )
-
+    # gfx1250 overrides
+    preshuffle = False  # MFMA preshuffle is gfx9-only; force linear layout
+    enable_prefetch_input = False  # noqa: F841  # VEC=16 VGPR pressure
     # ---- input validation ----
     plan_capacity = plan_gpu.shape[0]
     if plan_capacity == 0:
@@ -2395,7 +2430,7 @@ def flydsl_fused_compress_attn(
         head_dim == 128 and rope_head_dim == 64 and ratio == 4 and overlap and quant
     )
     if k_split_num_waves is None and has_bt and (_is_csa_main or _is_csa_indexer):
-        nw_eff = csa_ksplit_num_waves(plan_capacity)
+        nw_eff = csa_ksplit_num_waves_gfx1250(plan_capacity)
     else:
         nw_eff = k_split_num_waves if k_split_num_waves is not None else 1
     use_ksplit = nw_eff > 1 and has_bt
@@ -2405,7 +2440,7 @@ def flydsl_fused_compress_attn(
             raise ValueError(
                 f"k_split_num_waves={k_split_num_waves} must divide K={K_pool}"
             )
-        ks_launcher = compile_flydsl_fused_compress_attn_ksplit(
+        ks_launcher = compile_flydsl_fused_compress_attn_ksplit_gfx1250(
             head_dim=head_dim,
             rope_head_dim=rope_head_dim,
             ratio=ratio,
@@ -2452,7 +2487,7 @@ def flydsl_fused_compress_attn(
         _run_compiled(ks_launcher, *ks_args)
         return
 
-    launcher = compile_flydsl_fused_compress_attn(
+    launcher = compile_flydsl_fused_compress_attn_gfx1250(
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         ratio=ratio,
