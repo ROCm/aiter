@@ -60,7 +60,9 @@ def build_decode_inputs(batch_size, ctx_len, dtype, kvtype, nhead, *, jitter, se
     """
     if jitter:
         rng = random.Random(seed)
-        kv_lens = [rng.randint(max(1, ctx_len // 2), ctx_len) for _ in range(batch_size)]
+        kv_lens = [
+            rng.randint(max(1, ctx_len // 2), ctx_len) for _ in range(batch_size)
+        ]
     else:
         kv_lens = [ctx_len] * batch_size
 
@@ -215,9 +217,7 @@ def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_i
     ok, mism, num_works, num_groups = compare_metadata(golden, parallel)
 
     if not ok:
-        print(
-            f"  [MISMATCH] bs={batch_size} ctx={ctx_len} nhead={nhead}: {mism}"
-        )
+        print(f"  [MISMATCH] bs={batch_size} ctx={ctx_len} nhead={nhead}: {mism}")
 
     # Microbench both planners.
     serial_outs = alloc_outputs(out_meta)
