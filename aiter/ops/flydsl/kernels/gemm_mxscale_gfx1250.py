@@ -2206,10 +2206,8 @@ def compile_mxscale_gemm(
                     dgroup1_bs_up = desc_bs_up_init.dgroup1
 
                 def _advance_addr(lo, hi, adv):
-                    new_lo = arith.addi(lo, adv)
-                    wrapped = arith.cmpi(arith.CmpIPredicate.ult, new_lo, lo)
-                    hi_inc = arith.addi(hi, arith.constant(1, type=T.i32))
-                    return new_lo, arith.select(wrapped, hi_inc, hi)
+                    # Clean i64 carry-add (no select) -> stays uniform/SGPR.
+                    return tdm_ops.add_addr_with_carry(lo, hi, adv)
 
             # Prologue
             if const_expr(wave_specialized_tdm):
