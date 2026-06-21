@@ -2456,6 +2456,10 @@ def compile_moe_gemm2(
                     )
                     w_row_off = arith.index(0)
                 else:
+                    # Re-bind w_rsrc in this closure's scope (the assignment above makes
+                    # it a local of _moe_gemm2_then_body); packed int4 keeps the
+                    # whole-tensor resource with the per-expert row offset.
+                    w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
                     w_row_off = expert_off_idx
 
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
