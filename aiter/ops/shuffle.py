@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn.functional as F
+from aiter.jit.utils.chip_info import get_gfx
 
 
 def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
@@ -135,6 +136,35 @@ def shuffle_weight_NK(
     return x_.view(*x.shape)
 
 
+def shuffle_scale_n32k4(src: torch.Tensor, experts_cnt: int = None) -> torch.Tensor:
+    """Shuffle a raw per-expert e8m0 weight (B) scale into the n32k4 layout.
+
+    Input: ``(E, N, K//32)`` (3D) or ``(E*N, K//32)`` (2D, needs ``experts_cnt``).
+    Output: ``(E, N//32, (K//32)*32)`` uint8.
+
+    Within a 32-row super-row the column is ``remain_k*128 + row32*4 + r`` so each
+    lane reads its full WMMA scaleB operand (4 e8m0 of one WMMA-K=128 step) with
+    one contiguous ds_load_b32.  Consumed by the gfx1250 grouped MoE GEMM
+    (see kernels/gemm_mxscale_gfx1250.py).
+    """
+    s = src.view(torch.uint8).contiguous()
+    if s.ndim == 2:
+        if experts_cnt is None:
+            raise ValueError("experts_cnt is required for a 2D n32k4 scale")
+        s = s.view(experts_cnt, -1, s.shape[-1])
+    elif s.ndim != 3:
+        raise ValueError(f"n32k4 scale must be 2D or 3D, got {s.ndim}D")
+    E, N, k_scale = s.shape
+    if N % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
+    if k_scale % 4 != 0:
+        raise ValueError(
+            f"B-scale K//32 must be divisible by 4 (K%128==0), got {k_scale}"
+        )
+    g = s.view(E, N // 32, 32, k_scale // 4, 4).permute(0, 1, 3, 2, 4).contiguous()
+    return g.reshape(E, N // 32, k_scale * 32)
+
+
 def shuffle_scale(
     src: torch.Tensor,
     experts_cnt: int = None,
@@ -193,6 +223,26 @@ def shuffle_scale(
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
     return shfl_scale.view(*src.shape).contiguous()
+
+
+def moe_shuffle_scale(
+    src: torch.Tensor,
+    experts_cnt: int = None,
+    is_guinterleave: bool = False,
+    gate_up: bool = False,
+) -> torch.Tensor:
+    """Arch-aware MoE weight (B) scale shuffle."""
+
+    if get_gfx() == "gfx1250":
+        if is_guinterleave:
+            raise ValueError(
+                "moe_shuffle_scale: is_guinterleave is not supported on gfx1250; "
+                "the n32k4 grouped-MoE B-scale layout does not interleave gate/up."
+            )
+        return shuffle_scale_n32k4(src, experts_cnt)
+    return shuffle_scale(
+        src, experts_cnt=experts_cnt, is_guinterleave=is_guinterleave, gate_up=gate_up
+    )
 
 
 def shuffle_scale_a16w4(
