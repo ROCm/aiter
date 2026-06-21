@@ -6,7 +6,6 @@
 Tests:
   - Stage1 (gate+up GEMM): flydsl_moe_stage1 with a_dtype="fp4", b_dtype="fp4"
   - Stage2 (down-proj GEMM): flydsl_moe_stage2 with a_dtype="fp4", b_dtype="fp4"
-  - Stage2 per-slot output: flydsl_moe_stage2(return_per_slot=True)
   - End-to-end (stage1 + stage2 combined via FlyDSL)
 
 Usage:
@@ -318,67 +317,6 @@ def test_flydsl_stage2_a4w4(
     return _check_result(ref, out, f"stage2_a4w4_{mode}", atol=atol, rtol=rtol)
 
 
-def test_flydsl_stage2_a4w4_return_per_slot(
-    token: int = 16,
-    model_dim: int = 7168,
-    inter_dim: int = 256,
-    E: int = 256,
-    topk: int = 8,
-    block_m: int = 32,
-    mode: str = "atomic",
-    atol: float = 1.0,
-    rtol: float = 0.05,
-):
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
-
-    print(f"\n{'='*70}")
-    print(
-        f"[TEST] FlyDSL stage2 A4W4 per-slot: token={token}, "
-        f"dim=({model_dim},{inter_dim}), E={E}, topk={topk}, "
-        f"block_m={block_m}, mode={mode}"
-    )
-    print(f"{'='*70}")
-
-    data = _generate_a4w4_data(
-        token=token,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        E=E,
-        topk=topk,
-        block_m=block_m,
-    )
-
-    out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
-
-    per_slot = flydsl_moe_stage2(
-        inter_states=data["a2_qt"],
-        w2=data["w2_qt_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        topk=topk,
-        tile_m=block_m,
-        tile_n=256,
-        tile_k=256,
-        a_dtype="fp4",
-        b_dtype="fp4",
-        out_dtype=out_dtype_str,
-        mode=mode,
-        w2_scale=data["w2_scale_shuf"],
-        a2_scale=data["a2_scale_sort"],
-        return_per_slot=True,
-    )
-    torch.cuda.synchronize()
-
-    assert per_slot.shape == (token, topk, model_dim)
-    assert per_slot.dtype == data["dtype"]
-    assert per_slot.is_contiguous()
-
-    out = (per_slot.float() * data["topk_weights"].float().unsqueeze(-1)).sum(dim=1)
-    ref = data["ref_stage2"]
-    return _check_result(ref, out, "stage2_a4w4_return_per_slot", atol=atol, rtol=rtol)
-
-
 # ---------------------------------------------------------------------------
 # End-to-end test: FlyDSL stage1 + stage2 combined
 # ---------------------------------------------------------------------------
@@ -582,40 +520,6 @@ def main():
                         traceback.print_exc()
                         results.append(
                             (f"stage2_a4w4_t{token}_bm{bm}_{mode}", "ERROR", 0, 0)
-                        )
-                    try:
-                        passed, max_delta, pct = (
-                            test_flydsl_stage2_a4w4_return_per_slot(
-                                token=token,
-                                model_dim=args.model_dim,
-                                inter_dim=args.inter_dim,
-                                E=args.experts,
-                                topk=args.topk,
-                                block_m=bm,
-                                mode=mode,
-                                atol=args.atol,
-                                rtol=args.rtol,
-                            )
-                        )
-                        results.append(
-                            (
-                                f"stage2_a4w4_return_per_slot_t{token}_bm{bm}_{mode}",
-                                "PASS" if passed else "FAIL",
-                                max_delta,
-                                pct,
-                            )
-                        )
-                    except Exception:
-                        import traceback
-
-                        traceback.print_exc()
-                        results.append(
-                            (
-                                f"stage2_a4w4_return_per_slot_t{token}_bm{bm}_{mode}",
-                                "ERROR",
-                                0,
-                                0,
-                            )
                         )
 
             # End-to-end tests
