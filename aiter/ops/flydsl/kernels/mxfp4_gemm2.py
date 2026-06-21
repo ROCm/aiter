@@ -63,9 +63,6 @@ PORT_XCD_SWIZZLE = int(os.environ.get("PORT_XCD_SWIZZLE", "-1"))
 # Measured: 1 workgroup/CU (grid == NUM_CU) is optimal; over-subscribing the
 # persistent grid only adds L2/memory-queue contention (the kernel has enough
 # memory-level parallelism at 1 wg/CU), so the grid is capped at NUM_CU.
-# Explicit hand-tuned vmcnt for the nonatomic K-loop ds_read fence (inline asm).
-# None -> let the backend choose (rocdl.barrier); an int forces s_waitcnt vmcnt(N).
-_NONATOMIC_KLOOP_VMCNT = 16
 
 # scale-layout consts (mirror gemm2_a4w4.cuh). K-independent stride:
 kBS_stride_k0_dw = 64
@@ -185,6 +182,16 @@ def _raw(v):
     return v
 
 
+def _udiv(a, c):
+    cc = fx.Int32(c) if isinstance(c, int) else c
+    return a // cc
+
+
+def _umod(a, c):
+    cc = fx.Int32(c) if isinstance(c, int) else c
+    return a % cc
+
+
 def _lds_ptr3(base_i32, byte_off_i32):
     """ptr<3> = inttoptr(i64(base_i32 + byte_off_i32))."""
     addr_i64 = fx.Int64(base_i32 + byte_off_i32)
@@ -217,10 +224,14 @@ def _s_barrier_bare():
     )
 
 
-def _global_base_ptr1(arg):
-    """One ptr<1> base for a global tensor (single memref->ptr conversion)."""
-    base_idx = buffer_ops.extract_base_index(arg, address_space=1)
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(base_idx)))
+def _global_base_ptr1(addr_i64):
+    """One ptr<1> base from a raw i64 device address.
+
+    Global args are passed as bare ``data_ptr()`` (fx.Int64) rather than full
+    memref descriptors (ported from gemm1): the kernel only needs base pointers
+    (it assumes contiguity + derives sizes from compile-time consts), so raw i64
+    addresses pack contiguously into kernargs -> coalesced s_load prologue."""
+    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
 
 
 def _gep1(base_ptr, byte_off_i32):
@@ -364,17 +375,17 @@ def compile_gemm2_a4w4_port(
 
     @flyc.kernel(name=_name, known_block_size=[256, 1, 1])
     def gemm2_kernel(
-        arg_aq: fx.Tensor,
-        arg_ascale: fx.Tensor,
-        arg_bq: fx.Tensor,
-        arg_bscale: fx.Tensor,
-        arg_eids: fx.Tensor,
-        arg_cumsum: fx.Tensor,
-        arg_stids: fx.Tensor,
-        arg_sweights: fx.Tensor,
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_stids: fx.Int64,
+        arg_sweights: fx.Int64,
         i32_M: fx.Int32,
-        arg_out: fx.Tensor,
-        arg_out_scale: fx.Tensor,  # flat_out_scale (mxfp4 epilog only; dummy otherwise)
+        arg_out: fx.Int64,
+        arg_out_scale: fx.Int64,  # flat_out_scale (mxfp4 epilog only; dummy otherwise)
     ):
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
@@ -384,8 +395,8 @@ def compile_gemm2_a4w4_port(
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))  # wave == wave_n
 
-        aq_rsrc = buffer_ops.create_buffer_resource(
-            arg_aq, max_size=False, num_records_bytes=fx.Index(_aq_bytes)
+        aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_aq)), num_records_bytes=fx.Index(_aq_bytes)
         )
         saq = SmemPtr(
             allocator.get_base(), lds_off, T.i8, shape=(_aStages * _slot_bytes,)
@@ -450,7 +461,7 @@ def compile_gemm2_a4w4_port(
             # run without it so the compiler overlaps each tile's loads with the
             # previous tile's epilog.
             cumsum0 = llvm.load(T.i32, _global_ptr1(arg_cumsum, fx.Int32(0)))
-            total_m_blocks = cumsum0 // fx.Int32(BM)
+            total_m_blocks = _udiv(cumsum0, BM)
             bound = total_m_blocks * fx.Int32(_num_n_blocks)
             grid_nb = fx.Int32(gpu.grid_dim.x)
 
@@ -462,16 +473,16 @@ def compile_gemm2_a4w4_port(
             #   PORT_XCD_SWIZZLE<=0: step-1-only (mirrors xcd_remap.hpp swizzle=-1).
             #   PORT_XCD_SWIZZLE>0 : 2-step M-major grouping (positive swizzle).
             _NXCD = 8
-            _xq = bound // fx.Int32(_NXCD)
-            _xr = bound % fx.Int32(_NXCD)
+            _xq = _udiv(bound, _NXCD)
+            _xr = _umod(bound, _NXCD)
             _SW = PORT_XCD_SWIZZLE
 
             def _xcd(pid):
-                xc = pid % fx.Int32(_NXCD)
+                xc = _umod(pid, _NXCD)
                 wgid = (
                     xc * _xq
                     + fx.Int32(arith.minsi(_raw(xc), _raw(_xr)))
-                    + pid // fx.Int32(_NXCD)
+                    + _udiv(pid, _NXCD)
                 )
                 if const_expr(_SW <= 0):
                     return wgid
@@ -492,7 +503,7 @@ def compile_gemm2_a4w4_port(
 
             if bx_i32 < bound:
                 tile = _xcd(bx_i32)
-                _issue_all_a_loads((tile // fx.Int32(_num_n_blocks)) * fx.Int32(BM))
+                _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
                 rocdl.sched_barrier(0)
                 _run_tile(tile)
 
@@ -507,14 +518,14 @@ def compile_gemm2_a4w4_port(
                 # a loop-carried iter_arg, which only MLIR values can be.
                 setattr(saq, "_view_cache", None)
                 tile = _xcd(wu)
-                _issue_all_a_loads((tile // fx.Int32(_num_n_blocks)) * fx.Int32(BM))
+                _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
                 _run_tile(tile)
         else:
             # One-shot grid (atomic): issue A->LDS BEFORE the cumsum load so the
             # A->LDS HBM latency overlaps the cumsum load + bound check (A->LDS
             # depends only on bx/lane). Only the first n_load_waves hold A rows
             # (BM16: waves 0,1), so gate on wave < n_load_waves.
-            m_row0 = (bx_i32 // fx.Int32(_num_n_blocks)) * fx.Int32(BM)
+            m_row0 = _udiv(bx_i32, _num_n_blocks) * fx.Int32(BM)
             if const_expr(_n_load_waves < 4):  # BM16: only waves 0,1 hold A rows
                 if wave < fx.Int32(_n_load_waves):
                     _issue_all_a_loads(m_row0)
@@ -523,7 +534,7 @@ def compile_gemm2_a4w4_port(
             rocdl.sched_barrier(0)
 
             cumsum0 = llvm.load(T.i32, _global_ptr1(arg_cumsum, fx.Int32(0)))
-            total_m_blocks = cumsum0 // fx.Int32(BM)
+            total_m_blocks = _udiv(cumsum0, BM)
             bound = total_m_blocks * fx.Int32(_num_n_blocks)
 
             if bx_i32 < bound:
@@ -531,18 +542,18 @@ def compile_gemm2_a4w4_port(
 
     @flyc.jit
     def launch_gemm2(
-        arg_aq: fx.Tensor,
-        arg_ascale: fx.Tensor,
-        arg_bq: fx.Tensor,
-        arg_bscale: fx.Tensor,
-        arg_eids: fx.Tensor,
-        arg_cumsum: fx.Tensor,
-        arg_stids: fx.Tensor,
-        arg_sweights: fx.Tensor,
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_stids: fx.Int64,
+        arg_sweights: fx.Int64,
         i32_M: fx.Int32,
         i32_max_m_blocks: fx.Int32,
-        arg_out: fx.Tensor,
-        arg_out_scale: fx.Tensor,  # flat_out_scale (mxfp4 epilog only; dummy otherwise)
+        arg_out: fx.Int64,
+        arg_out_scale: fx.Int64,  # flat_out_scale (mxfp4 epilog only; dummy otherwise)
         stream: fx.Stream,
     ):
         from flydsl.compiler.kernel_function import CompilationContext
@@ -643,22 +654,22 @@ def _gemm2_body(
     b_aux = 2 if use_nt else 0  # NT: B_q loads carry aux=2 (non-temporal hint)
 
     # block -> (m_block_idx, n_block_idx) ; e = sorted_expert_ids[m_block_idx]
-    n_block_idx = bx_i32 % fx.Int32(_num_n_blocks)
-    m_block_idx = bx_i32 // fx.Int32(_num_n_blocks)
+    m_block_idx = _udiv(bx_i32, _num_n_blocks)
+    n_block_idx = bx_i32 - m_block_idx * fx.Int32(_num_n_blocks)
     e = llvm.load(T.i32, _global_ptr1(arg_eids, m_block_idx * fx.Int32(4)))
     e = rocdl.readfirstlane(T.i32, e)
     m_row = m_block_idx * fx.Int32(BM)
 
     # -- buffer resources (exact num_bytes) ----------------------------------
     # (A_q resource + A->LDS loads are issued by the kernel before the branch.)
-    ascale_rsrc = buffer_ops.create_buffer_resource(
-        arg_ascale, max_size=False, num_records_bytes=fx.Index(_ascale_bytes)
+    ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_ascale)), num_records_bytes=fx.Index(_ascale_bytes)
     )
-    bq_rsrc = buffer_ops.create_buffer_resource(
-        arg_bq, max_size=False, num_records_bytes=fx.Index(_bq_bytes)
+    bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_bq)), num_records_bytes=fx.Index(_bq_bytes)
     )
-    bscale_rsrc = buffer_ops.create_buffer_resource(
-        arg_bscale, max_size=False, num_records_bytes=fx.Index(_bscale_bytes)
+    bscale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_bscale)), num_records_bytes=fx.Index(_bscale_bytes)
     )
 
     # -- LDS base ------------------------------------------------------------
@@ -858,18 +869,11 @@ def _gemm2_body(
                 has_side_effects=True,
             )
             _s_barrier_bare()
-        elif const_expr(_NONATOMIC_KLOOP_VMCNT is None):
-            # nonatomic: plain barrier (== HIP __syncthreads); the backend inserts
-            # the buffer_load_lds->ds_read vmcnt wait.
-            rocdl.barrier()
         else:
-            # nonatomic: explicit hand-tuned fence (inline asm) -- replaces the
-            # backend's auto waitcnt before the ds_read with a less-conservative one.
-            _v = _NONATOMIC_KLOOP_VMCNT
             llvm.inline_asm(
                 res=None,
                 operands_=[],
-                asm_string=f"s_waitcnt vmcnt({_v}) lgkmcnt(0)",
+                asm_string="s_waitcnt vmcnt(16) lgkmcnt(0)",
                 constraints="",
                 has_side_effects=True,
             )
@@ -1019,9 +1023,7 @@ def _flat_bf16_epilog(accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, kMC
             vec = Vec(accm[i][J])
             for v in range_constexpr(4):
                 row = m_row + fx.Int32(i * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(v)
-                elem = fx.Int64(row) * fx.Int64(N_OUT) + fx.Int64(
-                    gn
-                )  # i64 element index
+                elem = fx.Int64(row) * fx.Int64(N_OUT) + fx.Int64(gn)
                 bf = Vec.from_elements([vec[v]], fx.Float32).to(fx.BFloat16)
                 llvm.StoreOp(_raw(bf), _gep1(out_base, elem * fx.Int64(2)))
 
@@ -1168,12 +1170,12 @@ def _flat_mxfp4_epilog(
                 T.i32, packed, _raw(r[6]), _raw(r[7]), qscale, 3
             )
             global_col = n_block_idx * fx.Int32(BN) + col0
+            blk = n_block_idx * fx.Int32(NBLK) + group
             q_byte = fx.Int64(out_row) * fx.Int64(N_OUT // 2) + fx.Int64(
                 global_col // fx.Int32(2)
             )
-            llvm.StoreOp(packed, _gep1(out_q_base, q_byte), nontemporal=True)
-            blk = n_block_idx * fx.Int32(NBLK) + group
             s_byte = fx.Int64(out_row) * fx.Int64(N_OUT // 32) + fx.Int64(blk)
+            llvm.StoreOp(packed, _gep1(out_q_base, q_byte), nontemporal=True)
             if kk == fx.Int32(0):
                 llvm.StoreOp(arith.trunci(T.i8, e8), _gep1(out_scale_base, s_byte))
 
