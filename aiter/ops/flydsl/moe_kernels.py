@@ -136,6 +136,16 @@ def get_flydsl_stage1_kernels(
                                         # overruns into lds_tid (e.g. t32x128x256_kw2).
                                         if kw > 1 and 4 * tn > tk:
                                             continue
+                                        # The fp8/a8w4 path uses gate-up interleave,
+                                        # whose cross-wave k_wave reduction is the
+                                        # non-fused variant and is only correct with
+                                        # >=2 N-waves. At tile_n==32 (num_n_waves==1)
+                                        # it produces wrong results (~11% stage1 err),
+                                        # so disallow k_wave there. The fp4/a4w4
+                                        # (separated) path uses the fused reduction and
+                                        # is fine at tile_n==32.
+                                        if kw > 1 and a_dtype == "fp8" and num_n_waves < 2:
+                                            continue
                                         name = base + (f"_kw{kw}" if kw > 1 else "")
                                         kernels[name] = {
                                             "stage": 1,
