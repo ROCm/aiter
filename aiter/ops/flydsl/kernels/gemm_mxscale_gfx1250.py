@@ -12,6 +12,8 @@ import flydsl.expr as fx
 
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import memref as _memref
+from flydsl._mlir.extras import types as _lds_types
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
@@ -117,6 +119,7 @@ def compile_mxscale_gemm(
     inst_prefetch: bool = False,
     wave_specialized_tdm: bool = False,
     split_k: int = 1,
+    k_warp: int = 1,
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     atomic_barrier_enable: bool = False,
@@ -163,6 +166,13 @@ def compile_mxscale_gemm(
         raise ValueError(f"num_buffers must be 2, 3, or 4, got {num_buffers}")
     if split_k < 1:
         raise ValueError(f"split_k must be >= 1, got {split_k}")
+    # slice-K: partition the per-CTA K loop across k_warp warp-groups, then
+    # reduce the partial [tile_m, tile_n] sums across groups in LDS. k_warp==1
+    # is the original path; all slice-K logic is gated by const_expr(k_warp > 1).
+    if k_warp not in (1, 2, 4, 8):
+        raise ValueError(f"k_warp must be 1, 2, 4, or 8, got {k_warp}")
+    if k_warp > 1 and wave_specialized_tdm:
+        raise ValueError("k_warp > 1 does not support wave_specialized_tdm")
     if batch_count < 1:
         raise ValueError(f"batch_count must be >= 1, got {batch_count}")
     if grouped_masked_m and batch_count <= 1:
@@ -246,8 +256,9 @@ def compile_mxscale_gemm(
     if use_cluster and effective_waves_per_eu is None:
         effective_waves_per_eu = 2
 
+    # num_warps is the per-group wave count; k_warp replicates that group across K.
     num_warps = m_warp * n_warp
-    block_threads = num_warps * WAVE_SIZE
+    block_threads = k_warp * num_warps * WAVE_SIZE
     if block_threads > 1024:
         raise ValueError(f"block_threads must be <= 1024, got {block_threads}")
 
@@ -283,6 +294,12 @@ def compile_mxscale_gemm(
     K_packed_b = K // PACK_FACTOR_B
     K_scale = K // SCALE_BLOCK
     split_k_chunk = K // split_k
+    # per-group K extent: each group contracts a disjoint kgrp_chunk slice
+    if k_warp > 1 and split_k_chunk % k_warp != 0:
+        raise ValueError(
+            f"K/split_k must be divisible by k_warp={k_warp}, got {split_k_chunk}"
+        )
+    kgrp_chunk = split_k_chunk // k_warp
     stage1_act_interleave = (
         stage1_act_mode is not None and stage1_weight_layout_mode == "gugu"
     )
@@ -297,6 +314,11 @@ def compile_mxscale_gemm(
     if split_k_chunk % tile_k != 0:
         raise ValueError(
             f"K/split_k must be divisible by tile_k={tile_k}, got {split_k_chunk}"
+        )
+    if k_warp > 1 and kgrp_chunk % tile_k != 0:
+        raise ValueError(
+            f"(K // split_k // k_warp) must be divisible by tile_k={tile_k}, "
+            f"got {kgrp_chunk} (K={K}, split_k={split_k}, k_warp={k_warp})"
         )
     if tile_k % WMMA_K != 0:
         raise ValueError(f"tile_k must be a multiple of {WMMA_K}, got {tile_k}")
@@ -329,7 +351,7 @@ def compile_mxscale_gemm(
     if split_k > 1 and use_tdm_store:
         raise ValueError("split_k > 1 currently requires use_tdm_store=False")
 
-    num_k_tiles = split_k_chunk // tile_k
+    num_k_tiles = kgrp_chunk // tile_k
     if num_k_tiles < num_buffers:
         raise ValueError(
             f"{num_buffers}-stage buffering requires num_k_tiles >= {num_buffers}, "
@@ -442,7 +464,9 @@ def compile_mxscale_gemm(
     stage_base_off = [0] * num_buffers
     for phys_i, logical_i in enumerate(stage_phys_order):
         stage_base_off[logical_i] = phys_i * stage_pitch_bytes
-    arena_alloc.ptr = stage_pitch_bytes * num_buffers
+    # per-group arena; the CTA lays k_warp of these back-to-back (see below)
+    grp_arena_bytes = stage_pitch_bytes * num_buffers
+    arena_alloc.ptr = grp_arena_bytes
     arena_total_bytes = arena_alloc.ptr
     epilogue_fence_threshold_bytes = tdm_epilogue_fence_threshold_bytes(
         stage_base_off=stage_base_off,
@@ -486,7 +510,18 @@ def compile_mxscale_gemm(
         if total_d_bytes > arena_total_bytes:
             arena_total_bytes = total_d_bytes
             arena_alloc.ptr = total_d_bytes
-    check_smem_capacity(arena_total_bytes, gpu_arch)
+    # Total CTA LDS = k_warp per-group arenas; the epilogue reuses this arena as
+    # f32 reduction scratch. Each thread owns _kw_pt f32, padded to an ODD stride
+    # so the 32 lanes of a wave hit distinct banks (conflict-free).
+    _kw_pt = n_accs * ACC_VEC_SIZE
+    _kw_stride = _kw_pt + 1 if _kw_pt % 2 == 0 else _kw_pt
+    _kw_gate_f32 = block_threads * _kw_stride
+    kwarp_reduce_scratch_bytes = (
+        (2 if stage1_dual_b else 1) * _kw_gate_f32 * 4 if k_warp > 1 else 0
+    )
+    full_arena_bytes = max(k_warp * arena_alloc.ptr, kwarp_reduce_scratch_bytes)
+    arena_alloc.ptr = full_arena_bytes
+    check_smem_capacity(full_arena_bytes, gpu_arch)
 
     # TENSORcnt is tracked per-wave in hardware. The regular path issues four
     # tensor ops per wave per K-stage, while the wave-specialized path issues
@@ -667,19 +702,85 @@ def compile_mxscale_gemm(
                 a_mcast_mask = 0
                 b_mcast_mask = 0
 
-            layout_thr = fx.make_layout(
-                (m_warp, n_warp, 2, 16), (n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1)
-            )
-            thr_coord = idx2crd(tx, layout_thr)
-            wave_m_idx, wave_n_idx, lane_kgrp, lane16 = (
-                fx.get(thr_coord, 0),
-                fx.get(thr_coord, 1),
-                fx.get(thr_coord, 2),
-                fx.get(thr_coord, 3),
-            )
+            if const_expr(k_warp > 1):
+                layout_thr = fx.make_layout(
+                    (k_warp, m_warp, n_warp, 2, 16),
+                    (num_warps * WAVE_SIZE, n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1),
+                )
+                _crd = idx2crd(tx, layout_thr)
+                wave_k_id, wave_m_idx, wave_n_idx, lane_kgrp, lane16 = (
+                    fx.get(_crd, i) for i in range(5)
+                )
+                # shift this group's K window; split_k_base only feeds K offsets.
+                split_k_base = split_k_base + wave_k_id * arith.index(kgrp_chunk)
+            else:
+                layout_thr = fx.make_layout(
+                    (m_warp, n_warp, 2, 16), (n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1)
+                )
+                _crd = idx2crd(tx, layout_thr)
+                wave_m_idx, wave_n_idx, lane_kgrp, lane16 = (
+                    fx.get(_crd, i) for i in range(4)
+                )
+                wave_k_id = arith.index(0)
 
             warp_m_base = wave_m_idx * arith.index(warp_tile_m)
             warp_n_base = wave_n_idx * arith.index(warp_tile_n)
+            # group-local wave id (0..num_warps-1): flydsl's TDM auto-split keys
+            # off the hardware wave id (spans all groups), so k_warp drives the
+            # cooperative load with this instead (see _kw_warp_desc).
+            local_wave_idx = wave_m_idx * arith.index(n_warp) + wave_n_idx
+
+            def _kw_warp_desc(
+                *,
+                global_ptr,
+                lds_memref,
+                global_offset,
+                tensor_shape,
+                strides,
+                tile_shape,
+                elem_bytes,
+                pad_interval,
+                pad_amount,
+                workgroup_mask,
+                num_warps=num_warps,
+                atomic_barrier_enable=atomic_barrier_enable,
+            ):
+                # make_tensor_descriptor_2d's per-warp split, but driven by the
+                # group-local wave id so each group loads its own per-group tile.
+                outer_off, inner_off = global_offset
+                outer_tile, inner_tile = tile_shape
+                warps_per_dim, bpw = tdm_ops.compute_warp_distribution(
+                    [outer_tile, inner_tile], num_warps
+                )
+                if warps_per_dim[1] != 1:
+                    raise ValueError(
+                        f"k_warp needs an un-split inner tile dim, got "
+                        f"warps_per_dim={warps_per_dim} for tile_shape={tile_shape}"
+                    )
+                bpw_outer, bpw_inner = bpw
+                wco = local_wave_idx % arith.index(warps_per_dim[0])
+                wci = local_wave_idx / arith.index(warps_per_dim[0])
+                off_o = wco * arith.index(bpw_outer)
+                off_i = wci * arith.index(bpw_inner)
+                # elem_bytes==1 for A/B/scales, so element offset == byte offset.
+                lds_byte = off_o * arith.index(inner_tile + pad_amount) + off_i
+                return tdm_ops.make_tensor_descriptor_2d(
+                    global_ptr=global_ptr,
+                    lds_memref=lds_memref,
+                    global_offset=(outer_off + off_o, inner_off + off_i),
+                    tensor_shape=tensor_shape,
+                    strides=strides,
+                    tile_shape=(bpw_outer, bpw_inner),
+                    elem_bytes=elem_bytes,
+                    pad_interval=pad_interval,
+                    pad_amount=pad_amount,
+                    num_warps=1,
+                    workgroup_mask=workgroup_mask,
+                    lds_byte_offset=_raw(lds_byte),
+                    atomic_barrier_enable=atomic_barrier_enable,
+                )
+
+            _mk_desc = _kw_warp_desc if k_warp > 1 else tdm_ops.make_tensor_descriptor_2d
 
             m_idx = arith.index_cast(T.index, i32_m.ir_value())
             n_stride = arith.index(C_N)
@@ -697,7 +798,7 @@ def compile_mxscale_gemm(
 
             def make_desc_a(memref, k_base):
                 k_packed_off = k_base / arith.index(PACK_FACTOR_A)
-                return tdm_ops.make_tensor_descriptor_2d(
+                return _mk_desc(
                     global_ptr=arg_a,
                     lds_memref=memref,
                     global_offset=(flat_m_base, k_packed_off),
@@ -717,7 +818,7 @@ def compile_mxscale_gemm(
 
             def make_desc_b(memref, k_base, n_offset=0):
                 k_packed_off = k_base / arith.index(PACK_FACTOR_B)
-                return tdm_ops.make_tensor_descriptor_2d(
+                return _mk_desc(
                     global_ptr=arg_b,
                     lds_memref=memref,
                     global_offset=(
@@ -743,7 +844,7 @@ def compile_mxscale_gemm(
                 a_scale_row_base = batch_as_base + outer_off
                 if flat_m_base_override is not None:
                     a_scale_row_base = flat_m_base / arith.index(wmma_m_rep)
-                return tdm_ops.make_tensor_descriptor_2d(
+                return _mk_desc(
                     global_ptr=arg_a_scale,
                     lds_memref=memref,
                     global_offset=(a_scale_row_base, inner_off),
@@ -773,7 +874,7 @@ def compile_mxscale_gemm(
                     BS_N32K4_BLOCK_N
                 )
                 inner_off = k_scale_off * arith.index(BS_N32K4_BLOCK_N)
-                return tdm_ops.make_tensor_descriptor_2d(
+                return _mk_desc(
                     global_ptr=arg_b_scale,
                     lds_memref=memref,
                     global_offset=(batch_bs_base + outer_off, inner_off),
@@ -1651,11 +1752,18 @@ def compile_mxscale_gemm(
                     elems.append(_stage1_act_mul_scalar(g, u))
                 return vector.from_elements(T.vec(8, T.f32), elems)
 
-            def epilogue_stage1_act_stores(gate_accs, up_accs, addrs):
+            def epilogue_stage1_act_stores(gate_accs, up_accs, addrs, src=None):
+                # src (slice-K fused path) reads+sums the gate/up sub-vec from the
+                # LDS reduction slab directly, so the peer-read latency overlaps
+                # this activation ALU instead of a separate reduction pass.
                 addr_idx = 0
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    gate_sub8 = _get_acc_sub8(gate_accs, acc_idx, vec_base)
-                    up_sub8 = _get_acc_sub8(up_accs, acc_idx, vec_base)
+                    if const_expr(src is not None):
+                        gate_sub8 = src(0, acc_idx, vec_base)
+                        up_sub8 = src(_kw_gate_f32, acc_idx, vec_base)
+                    else:
+                        gate_sub8 = _get_acc_sub8(gate_accs, acc_idx, vec_base)
+                        up_sub8 = _get_acc_sub8(up_accs, acc_idx, vec_base)
                     gate_sub8 = _add_bias_vec8(gate_sub8, wn)
                     up_sub8 = _add_bias_vec8(up_sub8, wn, N)
                     out_sub8 = _stage1_act_mul_vec8(gate_sub8, up_sub8)
@@ -1894,9 +2002,24 @@ def compile_mxscale_gemm(
 
             arena_base_ptr = arena_alloc.get_base()
 
+            # each group stages into its own arena slice (d_lds and reduction
+            # scratch keep using the full base = group 0's region)
+            if const_expr(k_warp > 1):
+                _grp_view_ty = _lds_types.memref(
+                    grp_arena_bytes, _lds_types.i8(), memory_space=gpu.lds_space()
+                )
+                group_arena_base = _memref.view(
+                    _grp_view_ty,
+                    arena_base_ptr,
+                    _raw(wave_k_id * arith.index(grp_arena_bytes)),
+                    sizes=[],
+                )
+            else:
+                group_arena_base = arena_base_ptr
+
             stages_a = [
                 SmemPtr(
-                    arena_base_ptr,
+                    group_arena_base,
                     stage_a_data_off[i],
                     elem_ty_lds,
                     shape=(lds_a_data_f16,),
@@ -1905,7 +2028,7 @@ def compile_mxscale_gemm(
             ]
             stages_b = [
                 SmemPtr(
-                    arena_base_ptr,
+                    group_arena_base,
                     stage_b_data_off[i],
                     elem_ty_lds,
                     shape=(lds_b_data_f16,),
@@ -1914,7 +2037,7 @@ def compile_mxscale_gemm(
             ]
             stages_b_up = [
                 SmemPtr(
-                    arena_base_ptr,
+                    group_arena_base,
                     stage_b_up_data_off[i],
                     elem_ty_lds,
                     shape=(lds_b_data_f16,),
@@ -1923,7 +2046,7 @@ def compile_mxscale_gemm(
             ]
             stages_as = [
                 SmemPtr(
-                    arena_base_ptr,
+                    group_arena_base,
                     stage_a_scale_off[i],
                     elem_ty_lds,
                     shape=(lds_a_scale_f16,),
@@ -1932,7 +2055,7 @@ def compile_mxscale_gemm(
             ]
             stages_bs = [
                 SmemPtr(
-                    arena_base_ptr,
+                    group_arena_base,
                     stage_b_scale_off[i],
                     elem_ty_lds,
                     shape=(lds_b_scale_f16,),
@@ -1941,7 +2064,7 @@ def compile_mxscale_gemm(
             ]
             stages_bs_up = [
                 SmemPtr(
-                    arena_base_ptr,
+                    group_arena_base,
                     stage_b_up_scale_off[i],
                     elem_ty_lds,
                     shape=(lds_b_scale_f16,),
@@ -2818,26 +2941,117 @@ def compile_mxscale_gemm(
             if const_expr(stage1_dual_b):
                 accs_up = finalize_acc_layout(accs_up)
 
-            if const_expr(use_tdm_store and not needs_grouped_row_masked_store):
-                if const_expr(d_need_epilogue_fence):
-                    pipeline_fence(outstanding=0, use_cluster=use_cluster)
-                rocdl.sched_barrier(0)
-                epilogue_lds_stores(accs, d_lds_buffer, d_lane_base)
-                rocdl.s_wait_dscnt(0)
-                tdm_ops.tensor_store_2d(d_desc)
-                tdm_ops.tensor_wait(0)
-            else:
-                rocdl.sched_barrier(0)
-                if const_expr(epi_addrs_box[0] is None):
-                    epi_addrs_box[0] = epilogue_prepare_addrs()
-                if const_expr(stage1_dual_b):
-                    epilogue_stage1_act_stores(accs, accs_up, epi_addrs_box[0])
-                elif const_expr(stage1_act_interleave):
-                    epilogue_stage1_act_interleaved_stores(accs)
-                elif const_expr(split_k > 1):
-                    epilogue_atomic_adds(accs, epi_addrs_box[0])
+            # slice-K: each group holds a disjoint-K partial of the same tile.
+            # Stage the (finalized) partials into the dead pipeline arena, then
+            # the epilogue reads+sums the k_warp peers. For dual_b that read is
+            # folded into the swiglu epilogue (src=_kw_sum8) so the LDS-read
+            # latency overlaps the activation ALU; only one group stores.
+            kwarp_store_gate = None
+            _kw_sum8 = None
+            if const_expr(k_warp > 1):
+                _kw_grp_threads = num_warps * WAVE_SIZE
+                _kw_chunks = ACC_VEC_SIZE // 4
+                _kw_slab = SmemPtr(
+                    arena_base_ptr, 0, T.f32,
+                    shape=((2 if stage1_dual_b else 1) * _kw_gate_f32,),
+                ).get()
+                _kw_base = tx * arith.index(_kw_stride)
+                _kw_within_base = arith.subi(
+                    tx, wave_k_id * arith.index(_kw_grp_threads)
+                ) * arith.index(_kw_stride)
+
+                gpu.barrier()  # all groups done with staged A/B before reuse
+                for ai in range_constexpr(n_accs):
+                    for c in range_constexpr(_kw_chunks):
+                        _idx = [c * 4 + i for i in range_constexpr(4)]
+                        _o = _kw_base + arith.index(ai * ACC_VEC_SIZE + c * 4)
+                        vector.store(
+                            vector.shuffle(accs[ai], accs[ai], _idx), _kw_slab, [_o]
+                        )
+                        if const_expr(stage1_dual_b):
+                            vector.store(
+                                vector.shuffle(accs_up[ai], accs_up[ai], _idx),
+                                _kw_slab,
+                                [_o + arith.index(_kw_gate_f32)],
+                            )
+                gpu.barrier()
+
+                def _kw_sum8(base, acc_idx, vec_base):
+                    parts = [None, None]
+                    for g in range_constexpr(k_warp):
+                        _p = _kw_within_base + arith.index(
+                            base
+                            + g * _kw_grp_threads * _kw_stride
+                            + acc_idx * ACC_VEC_SIZE
+                            + vec_base
+                        )
+                        for j in range_constexpr(2):
+                            _v = vector.load_op(
+                                T.vec(4, T.f32), _kw_slab, [_p + arith.index(j * 4)]
+                            )
+                            parts[j] = _v if g == 0 else arith.addf(parts[j], _v)
+                    return vector.shuffle(parts[0], parts[1], list(range(8)))
+
+                kwarp_store_gate = arith.cmpi(
+                    arith.CmpIPredicate.eq,
+                    arith.index_cast(T.i32, wave_k_id),
+                    arith.constant(0, type=T.i32),
+                )
+
+            def _kw_reduced_accs():
+                # rebuild full reduced accumulators from the slab (non-dual
+                # epilogues consume VGPR accs directly)
+                out = []
+                for ai in range_constexpr(n_accs):
+                    if const_expr(ACC_VEC_SIZE == 8):
+                        out.append(_kw_sum8(0, ai, 0))
+                    else:
+                        out.append(
+                            vector.shuffle(
+                                _kw_sum8(0, ai, 0), _kw_sum8(0, ai, 8), list(range(16))
+                            )
+                        )
+                return out
+
+            def _emit_epilogue():
+                _accs = (
+                    _kw_reduced_accs()
+                    if const_expr(k_warp > 1 and not stage1_dual_b)
+                    else accs
+                )
+                if const_expr(use_tdm_store and not needs_grouped_row_masked_store):
+                    if const_expr(d_need_epilogue_fence):
+                        pipeline_fence(outstanding=0, use_cluster=use_cluster)
+                    rocdl.sched_barrier(0)
+                    epilogue_lds_stores(_accs, d_lds_buffer, d_lane_base)
+                    rocdl.s_wait_dscnt(0)
+                    tdm_ops.tensor_store_2d(d_desc)
+                    tdm_ops.tensor_wait(0)
                 else:
-                    epilogue_stores(accs, epi_addrs_box[0])
+                    rocdl.sched_barrier(0)
+                    if const_expr(epi_addrs_box[0] is None):
+                        epi_addrs_box[0] = epilogue_prepare_addrs()
+                    if const_expr(stage1_dual_b):
+                        epilogue_stage1_act_stores(
+                            accs,
+                            accs_up,
+                            epi_addrs_box[0],
+                            src=_kw_sum8 if const_expr(k_warp > 1) else None,
+                        )
+                    elif const_expr(stage1_act_interleave):
+                        epilogue_stage1_act_interleaved_stores(_accs)
+                    elif const_expr(split_k > 1):
+                        epilogue_atomic_adds(_accs, epi_addrs_box[0])
+                    else:
+                        epilogue_stores(_accs, epi_addrs_box[0])
+
+            if const_expr(k_warp > 1):
+                _kw_gif = scf.IfOp(kwarp_store_gate, results_=[], has_else=False)
+                with ir.InsertionPoint(_kw_gif.then_block):
+                    _emit_epilogue()
+                    scf.YieldOp([])
+            else:
+                _emit_epilogue()
 
         if const_expr(grouped_persistent_m):
             prefix_rsrc = buffer_ops.create_buffer_resource(

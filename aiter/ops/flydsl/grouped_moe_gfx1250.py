@@ -477,11 +477,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("imports done")
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    tile_m, tile_n, tile_k = 64, 256, 256
+    tile_m, tile_k = 64, 256
+    tile_n = None  # derived from n_warp below unless the config pins it
     m_warp, n_warp = 1, 4
     num_buffers = 2
     split_k1 = 1
     split_k2 = 1
+    k_warp = 1  # slice-K warp-groups for stage1 (gemm1); 1 = disabled
     grouped_contiguous_m = False
     cfg_row = _find_grouped_config(
         token_num=_get_padded_M(token_num),
@@ -502,6 +504,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
         split_k1 = _as_int(cfg_row.get("split_k1"), split_k1)
         split_k2 = _as_int(cfg_row.get("split_k2"), split_k2)
+        k_warp = _as_int(cfg_row.get("k_warp"), k_warp)
+        tile_n = _as_int(cfg_row.get("tile_n"), tile_n)
+        tile_k = _as_int(cfg_row.get("tile_k"), tile_k)
         grouped_contiguous_m = _as_bool(
             cfg_row.get("grouped_contiguous_m"), grouped_contiguous_m
         )
@@ -509,8 +514,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             cfg_row.get("stage1_weight_layout") or stage1_weight_layout
         )
         _grouped_dbg(f"using grouped CSV config: {cfg_row}")
-    tile_n = int(n_warp) * 64
-    tile_k = 256
+    # tile_n defaults to one 64-col N block per warp; a config can pin a smaller
+    # N tile (e.g. 32) so a higher k_warp fits in LDS. Slice-K subsumes cross-CTA
+    # split-K for stage1 and the fused epilogue requires split_k1 == 1.
+    if tile_n is None:
+        tile_n = int(n_warp) * 64
+    if k_warp > 1:
+        split_k1 = 1
+
     warp_tile_m = tile_m // m_warp
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
@@ -762,6 +773,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         out_dtype=out_dtype_str,
         num_buffers=num_buffers,
         split_k=split_k1,
+        k_warp=k_warp,
         expert_sched_mode=False,
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
