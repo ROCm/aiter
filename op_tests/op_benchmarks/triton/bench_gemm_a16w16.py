@@ -30,6 +30,7 @@ def bench_gemm_fn(
     backend: str,
     atomic: bool = False,
     activation: Optional[str] = None,
+    cudagraph: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -46,6 +47,9 @@ def bench_gemm_fn(
     mem_write = (M * N) * x.element_size()
     mem = mem_read + mem_write
 
+    bench_fn = triton.testing.do_bench_cudagraph if cudagraph else triton.testing.do_bench
+    bench_kwargs = {} if cudagraph else {"warmup": 25, "rep": 100}
+
     if atomic:
         # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
         assert backend != "gluon", "Atomic kernel is triton-only"
@@ -53,18 +57,16 @@ def bench_gemm_fn(
             activation is None
         ), "Atomic kernel does not currently support fused activation"
         y = y.to(torch.float32).zero_()
-        ms = triton.testing.do_bench(
+        ms = bench_fn(
             lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
-            warmup=25,
-            rep=100,  # noqa: E731
+            **bench_kwargs,
         )
     else:
-        ms = triton.testing.do_bench(
+        ms = bench_fn(
             lambda: gemm_a16w16(
                 x, w, bias, c_dtype, y, activation=activation, backend=backend
             ),
-            warmup=25,
-            rep=100,  # noqa: E731
+            **bench_kwargs,
         )
 
     # Return exactly one scalar depending on which metric is active
@@ -121,6 +123,7 @@ def run_model_benchmark(args, backend):
             backend,
             atomic=args.atomic,
             activation=args.activation,
+            cudagraph=args.cudagraph,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -136,7 +139,7 @@ def run_shape_benchmark(args, backend):
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, backend, atomic=args.atomic)
+        return bench_gemm_fn(M, N, K, metric, args.layout, backend, atomic=args.atomic, cudagraph=args.cudagraph)
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -192,6 +195,12 @@ def parse_args(args: list[str] | None = None):
         choices=["triton", "gluon"],
         default=None,
         help="Backend to use. Default: auto-detect (gluon on gfx1250, triton elsewhere).",
+    )
+    parser.add_argument(
+        "--cudagraph",
+        action="store_true",
+        default=False,
+        help="Use do_bench_cudagraph instead of do_bench to reduce CPU overhead for bandwidth-bound kernels.",
     )
     return get_ff_args(parser, args=args)
 
