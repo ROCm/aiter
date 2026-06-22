@@ -156,12 +156,10 @@ def run_flydsl_bwd(which, jagged, dense, bias, d_out, seq_offsets, n_groups, max
 
     if "dbias" in which:
         d_bias = torch.zeros(n_groups, N, dtype=torch.bfloat16, device=device)
-        bias_partials = torch.zeros(n_groups, SPLIT, N, dtype=torch.float32, device=device)
+        # fp32 split-reduction scratch, viewed as (n_groups * SPLIT, N).
+        bias_partials = torch.zeros(n_groups * SPLIT, N, dtype=torch.float32, device=device)
         try:
-            grad_bias(
-                d_bias, tDOut, seq_offsets, n_groups, max_seq_len,
-                partials=bias_partials, split=SPLIT, stream=stream,
-            )
+            grad_bias(d_bias, tDOut, seq_offsets, bias_partials, n_groups, max_seq_len, stream=stream)
             torch.cuda.synchronize()
             results["dbias"] = d_bias
         except NotImplementedError as ex:
