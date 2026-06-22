@@ -62,9 +62,22 @@ __device__ __forceinline__ float bf16_to_float(const bf16_t x)
 
 __device__ __forceinline__ bf16_t float_to_bf16(const float x)
 {
+#if defined(__gfx950__) || defined(__gfx9_4_generic__)
+    // gfx950 has a native round-to-nearest-even f32->bf16 convert
+    // (``v_cvt_pk_bf16_f32``). Emitting it via the ``__bf16`` cast matches
+    // torch/Triton's RNE rounding without the extra VGPRs + NaN branch a
+    // software RNE needs -- so it keeps the truncation path's occupancy
+    // (and thus its speed) while halving the worst-case rounding error.
+    const __bf16 rounded = static_cast<__bf16>(x);
+    bf16_t raw;
+    raw.data = __builtin_bit_cast(unsigned short, rounded);
+    return bf16_t(raw);
+#else
+    // Portable fallback: truncate the low 16 mantissa bits.
     bf16_t raw;
     raw.data = static_cast<unsigned short>(__builtin_bit_cast(uint32_t, x) >> 16);
     return bf16_t(raw);
+#endif
 }
 
 __device__ __forceinline__ bit16_t bf16_to_bits(const bf16_t x)
