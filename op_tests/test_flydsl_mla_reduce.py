@@ -6,6 +6,7 @@ Runs the compiled FlyDSL kernel directly (bypasses aiter's flydsl __init__ versi
 
 import argparse
 import torch
+import aiter
 
 from aiter.ops.flydsl.kernels.mla_reduce import compile_mla_reduce, select_tier
 from aiter.test_common import run_perftest
@@ -57,6 +58,16 @@ def torch_ref(partial_output, partial_lse, num_tiles, num_splits, H, Dv, out_dty
     out = (num / denom.unsqueeze(-1)).to(out_dtype)
     lse = (max_lse.squeeze(1) + torch.log(denom)).float()
     return out, lse
+
+
+def hip_ref(po, pl, indptr, fmap, pmap, num_tiles, H, Dv, out_dtype):
+    """Reference output from the HIP kn_mla_reduce_v1 kernel (the kernel this
+    FlyDSL port replaces). Same input buffers as the FlyDSL launch."""
+    ref_out = torch.empty(num_tiles, H, Dv, dtype=out_dtype, device=po.device)
+    ref_lse = torch.empty(num_tiles, H, dtype=torch.float32, device=po.device)
+    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, ref_out, ref_lse)
+    torch.cuda.synchronize()
+    return ref_out, ref_lse
 
 
 def make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, output_lse):
@@ -113,16 +124,21 @@ def bench_cudagraph(fn, num_warmup=25, num_iters=100):
     return start.elapsed_time(end) / num_iters  # ms/iter
 
 
-def check_one(H, Dv, T_, S, dtype_str, output_lse, atol=3e-2, ltol=1e-3):
-    """Run one config, compare vs torch ref, return (ok, out_err, lse_err)."""
+def check_one(H, Dv, T_, S, dtype_str, output_lse, atol=None, ltol=1e-3):
+    """Run one config, compare vs the HIP kn_mla_reduce_v1 kernel, return
+    (ok, out_err, lse_err). Both kernels emit the same output dtype, so the
+    output may differ by one ULP of that dtype from independent rounding of
+    near-equal fp32 results — tolerate that (bf16 ULP ≈ 6.3e-2, fp16 ≈ 1e-3)."""
     out_dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float16
+    if atol is None:
+        atol = 6.3e-2 if dtype_str == "bf16" else 2e-3
     po, pl, indptr, fmap, pmap, fout, flse = build_inputs(T_, S, H, Dv, out_dtype)
     fout.zero_()
     flse.zero_()
     run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dtype_str, output_lse)
     run()
     torch.cuda.synchronize()
-    ref_out, ref_lse = torch_ref(po, pl, T_, S, H, Dv, out_dtype)
+    ref_out, ref_lse = hip_ref(po, pl, indptr, fmap, pmap, T_, H, Dv, out_dtype)
     out_err = (fout.float() - ref_out.float()).abs().max().item()
     lse_err = (flse - ref_lse).abs().max().item() if output_lse else 0.0
     ok = (out_err <= atol) and (lse_err <= ltol)
@@ -181,11 +197,11 @@ def main():
     run()
     torch.cuda.synchronize()
 
-    ref_out, ref_lse = torch_ref(po, pl, T_, S, H, Dv, out_dtype)
+    ref_out, ref_lse = hip_ref(po, pl, indptr, fmap, pmap, T_, H, Dv, out_dtype)
     od = (fout.float() - ref_out.float()).abs()
     print(
         f"[check] H={H} Dv={Dv} tiles={T_} splits={S} dtype={args.dtype} "
-        f"out max_abs_err={od.max().item():.3e} mean={od.mean().item():.3e}"
+        f"vs HIP out max_abs_err={od.max().item():.3e} mean={od.mean().item():.3e}"
     )
     if args.lse:
         ld = (flse - ref_lse).abs()

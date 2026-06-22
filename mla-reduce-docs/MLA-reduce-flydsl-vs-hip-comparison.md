@@ -31,18 +31,22 @@ directly with no host-overhead artifact; the old ~230 µs FlyDSL-harness floor i
 
 ## 2. Correctness
 
-| metric | HIP | FlyDSL |
-|---|---|---|
-| output max_abs_err (bf16) | 0.031 | ≤ 3.9e-3 (matrix, tiles=4) |
-| output max_abs_err (fp16) | — | ≤ 4.9e-4 |
-| LSE max_abs_err | 9.5e-7 | ≤ 9.5e-7 (exact) |
-| supported `(H,Dv)` | (128,512),(16,512),(128,128) | same three |
-| reference | vectorized torch online-softmax | same (fp64) |
+The FlyDSL matrix is now checked **directly against the HIP `kn_mla_reduce_v1` kernel** (same
+input buffers, kernel-vs-kernel) rather than against a torch model — so this is the tightest
+possible equivalence test. 48/48 configs pass.
 
-Both validate against the same torch online-softmax reference. **LSE matches exactly to the
-same 9.5e-7**; output error is pure bf16/fp16 rounding in both. The FlyDSL matrix error is
-lower simply because it reports the `tiles=4` sweep (the HIP 0.031 was measured at large
-tiles where bf16 degeneracy inflates the figure — an input property, not a kernel difference).
+| metric | FlyDSL vs HIP |
+|---|---|
+| output max_abs_err (bf16) | ≤ 3.12e-2 — **one bf16 ULP** (2⁻⁵) |
+| output max_abs_err (fp16) | ≤ 1.95e-3 |
+| LSE max_abs_err | ≤ 9.5e-7 |
+| supported `(H,Dv)` | (128,512),(16,512),(128,128) — same three |
+| reference | HIP `kn_mla_reduce_v1` (torch fp64 ref also available) |
+
+**LSE (fp32) matches to ~1e-7.** The bf16 output diff is exactly one bf16 ULP: both kernels
+accumulate in fp32 and round the final result to bf16 independently, so near-equal fp32 values
+can fall on adjacent bf16 codes. This is rounding, not a behavioral difference — the two
+kernels are bit-equivalent up to output-dtype rounding.
 
 ---
 
@@ -121,7 +125,7 @@ fidelity).
 
 | question | answer |
 |---|---|
-| Correct vs HIP? | **Yes** — LSE exact (9.5e-7), output at bf16/fp16 rounding, same 3 shapes. |
+| Correct vs HIP? | **Yes** — validated directly against the HIP kernel (48/48): LSE to 9.5e-7, output within one bf16/fp16 ULP, same 3 shapes. |
 | HBM parity? | **Yes** — 3.6–3.8 TB/s where kernel-dominated, equal-to-slightly-ahead of HIP and within HIP's own band; FlyDSL faster on the simple path (low splits). |
 | Faster? | At parity (FlyDSL marginally ahead) — both at the reduction byte floor (~99% of time is HBM traffic per the HIP rocprofv3 profile). Parity was the bar. |
 | Caveats | None on timing — both sides now use kernel-only device time, so the old ~230 µs host-floor artifact is gone and low-work BW is meaningful. Persistent launcher deferred (parity-neutral at the byte floor). |

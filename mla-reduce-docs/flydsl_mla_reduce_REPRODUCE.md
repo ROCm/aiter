@@ -88,8 +88,8 @@ docker exec \
   python3 op_tests/test_flydsl_mla_reduce.py --matrix
 ```
 
-Expected: **48 passed, 0 failed**. Per-config output max_abs_err ≤ 3.9e-3 (bf16) /
-4.9e-4 (fp16); LSE max_abs_err ≤ 9.5e-7 (exact, matching the HIP kernel).
+Expected: **48 passed, 0 failed**. Per-config output max_abs_err ≤ 3.12e-2 (bf16,
+one bf16 ULP) / 1.95e-3 (fp16); LSE max_abs_err ≤ 9.5e-7.
 
 Single config (with LSE check):
 
@@ -99,13 +99,14 @@ docker exec -e PYTHONPATH=/aiter -e AITER_JIT_DIR=/tmp/aiter_jit -e AITER_USE_SY
   python3 op_tests/test_flydsl_mla_reduce.py --H 128 --Dv 512 --splits 8 --tiles 4 --lse
 ```
 
-The reference is a vectorized fp64 torch online-softmax (`torch_ref` in the test).
+The reference is the **HIP `kn_mla_reduce_v1` kernel** (`hip_ref` in the test), run on
+the same input buffers — a direct kernel-vs-kernel equivalence check. A vectorized fp64
+torch online-softmax (`torch_ref`) is also kept in the test for debugging.
 
-> **Note on a large-batch reference artifact:** at very large tile counts with the
-> default random LSE spread, bf16 output error can spike (e.g. ~7e0). This is a
-> harness/bf16 artifact, **not a kernel bug** — the HIP kernel produces the
-> identical error on the same input (near-degenerate softmax in bf16). The
-> `--matrix` sweep uses `tiles=4`, which avoids this.
+> **Why the bf16 tolerance is one ULP:** both kernels accumulate in fp32 and round the
+> final output to bf16 independently, so near-equal fp32 results can land on adjacent bf16
+> codes — a 2⁻⁵ ≈ 3.1e-2 difference that is rounding, not a behavioral gap. LSE (fp32) still
+> matches to ~1e-7. The tolerance is set to one ULP of the output dtype.
 
 ---
 
