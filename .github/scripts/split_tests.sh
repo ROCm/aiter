@@ -131,7 +131,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_indexer_k_quant_and_cache.py]=6
     FILE_TIMES[op_tests/test_mha_flydsl_varlen.py]=6
     FILE_TIMES[op_tests/test_mha_varlen_fp8.py]=6
-    FILE_TIMES[op_tests/test_rotate_fp4quant.py]=6
+    FILE_TIMES[op_tests/test_dsv4_rotate_quant.py]=14
     FILE_TIMES[op_tests/test_topk_row_prefill.py]=6
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_per_token_quant.py]=5
     FILE_TIMES[op_tests/test_gemm_a4w4.py]=5

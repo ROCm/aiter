@@ -184,8 +184,9 @@ def _find_grouped_config(
 
 
 def _use_grouped_gemm_enabled() -> bool:
-    """Runtime check for AITER_USE_GROUPED_GEMM so tests can toggle it."""
-    return os.environ.get("AITER_USE_GROUPED_GEMM", "1") in _TRUTHY_ENV
+    env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
+    is_gfx1250 = get_gfx() == "gfx1250"
+    return env_enabled or is_gfx1250
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -277,6 +278,10 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
+# The weight (B) scale n32k4 preshuffle now lives in aiter.ops.shuffle as
+# shuffle_scale_n32k4 (dispatched on gfx1250 via moe_shuffle_scale).  Production consumes
+# weights that are already preshuffled, so the grouped path only reshapes them
+# (see grouped_w1_scale below); the producer is the shuffle.py helper.
 def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     """Torch fallback for route -> grouped-row maps."""
     import torch.nn.functional as F
@@ -508,7 +513,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     tile_n = int(n_warp) * 64
     tile_k = 256
     warp_tile_m = tile_m // m_warp
-    warp_tile_n = tile_n // n_warp
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
@@ -545,7 +549,28 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
             raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
     counts = None
-    raw_max_m = _as_int(cfg_row.get("max_m"), token_num) if cfg_row else token_num
+    # Per-expert row capacity. A single expert can receive up to token_num*topk
+    # routes (worst case: every token routes all topk slots to it), so token_num
+    # alone is too small under imbalanced routing -- the slot then overflows the
+    # `expert*max_m + slot` stride in build_route_maps, corrupting the route maps
+    # and the contiguous-M `// max_m` decode (out-of-bounds GPU access).
+    #
+    # The capacity differs by scheduler (grouped_contiguous_m is already final
+    # here -- it is decided at the token-count threshold above):
+    #   * contiguous-M: max_m is only the routing-encode stride; the physical
+    #     grouped buffer is contiguous_m, decoupled from max_m. It MUST be at
+    #     least token_num*topk (the worst-case per-expert load), so clamp the
+    #     tuned-config value UP to that bound -- a stale/too-small CSV max_m would
+    #     otherwise overflow the `expert*max_m + slot` stride and crash. Free: no
+    #     extra GEMM VRAM, just the E*max_m int32 routing buffer; no host sync.
+    #   * masked: max_m IS the physical per-expert capacity (E*max_m rows), so
+    #     token_num*topk would inflate VRAM by topk. Keep token_num (this path is
+    #     only used for small token counts, below the contiguous-M threshold).
+    if grouped_contiguous_m:
+        _cfg_max_m = _as_int(cfg_row.get("max_m"), 0) if cfg_row else 0
+        raw_max_m = max(_cfg_max_m, token_num * topk)
+    else:
+        raw_max_m = _as_int(cfg_row.get("max_m"), token_num) if cfg_row else token_num
     _grouped_dbg(f"routing cfg_row={cfg_row} raw_max_m={raw_max_m}")
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
@@ -705,14 +730,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     grouped_w1 = _grouped_weight_uint8(w1)
     grouped_w2 = _grouped_weight_uint8(w2)
     _grouped_dbg("weight layout done")
-    # Weight scales are already preshuffled per expert.
-    _wmma_rep = warp_tile_n // 16
+    # Weight scales are already preshuffled per expert (n32k4 B-scale layout:
+    # rows N -> N//32 super-rows, k_scale cols -> k_scale*32 folded cols; see
+    # aiter.ops.shuffle.shuffle_scale_n32k4).
     grouped_w1_scale = w1_scale.reshape(
-        E, (2 * inter_dim) // _wmma_rep, (model_dim // 32) * _wmma_rep
+        E, (2 * inter_dim) // 32, (model_dim // 32) * 32
     )
-    grouped_w2_scale = w2_scale.reshape(
-        E, model_dim // _wmma_rep, (inter_dim // 32) * _wmma_rep
-    )
+    grouped_w2_scale = w2_scale.reshape(E, model_dim // 32, (inter_dim // 32) * 32)
 
     # grouped_a1_scale already produced above (fast or naive path).
     _grouped_dbg("scale layout done")
