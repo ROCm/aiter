@@ -140,6 +140,7 @@ jobs:
     runs-on: aiter-8gpu-runner
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - model: openai/gpt-oss-120b
@@ -245,7 +246,9 @@ jobs:
                 bash ./.github/scripts/install_triton.sh
                 pip show triton
                 pip uninstall -y aiter amd-aiter || true
-                pip install --no-deps \"\${wheels[0]}\"
+                pip config set global.default-timeout 60
+                pip config set global.retries 10
+                pip install \"\${wheels[0]}\"
                 pip show amd-aiter || pip show aiter
                 if [ -d \"/models/${{ matrix.model }}\" ]; then
                   model_path=\"/models/${{ matrix.model }}\"
