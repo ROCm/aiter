@@ -19,7 +19,7 @@ def copy_blocks(
 ) -> None: ...
 
 
-@compile_ops("module_cache", develop=True)
+@compile_ops("module_cache_reshape", develop=True)
 def reshape_and_cache(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -33,7 +33,7 @@ def reshape_and_cache(
 ) -> None: ...
 
 
-@compile_ops("module_cache", develop=True)
+@compile_ops("module_cache_reshape", develop=True)
 def reshape_and_cache_flash(
     key: Tensor,
     value: Tensor,

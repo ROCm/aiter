@@ -106,6 +106,20 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_cache_reshape": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/cache_reshape_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/cache_reshape_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DENABLE_FP8'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_custom_all_reduce": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_pybind.cu'",
