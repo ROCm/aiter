@@ -100,10 +100,10 @@ def _fused_qk_rmsnorm_kernel(
 
 @compile_ops(
     "module_fused_qk_norm_rope_cache_quant_shuffle",
-    fc_name="minimax_qk_norm_rope_tp1",
+    fc_name="minimax_qk_norm_rope",
     develop=True,
 )
-def _minimax_qk_norm_rope_tp1_kernel(
+def _minimax_qk_norm_rope_kernel(
     qkv: Tensor,
     q_weight: Tensor,
     k_weight: Tensor,
@@ -121,7 +121,7 @@ def _minimax_qk_norm_rope_tp1_kernel(
 ) -> None: ...
 
 
-def minimax_qk_norm_rope_tp1(
+def minimax_qk_norm_rope(
     qkv: Tensor,
     q_weight: Tensor,
     k_weight: Tensor,
@@ -153,7 +153,7 @@ def minimax_qk_norm_rope_tp1(
     if v_out is None:
         v_out = torch.empty((num_tokens, kv_size), dtype=qkv.dtype, device=qkv.device)
 
-    _minimax_qk_norm_rope_tp1_kernel(
+    _minimax_qk_norm_rope_kernel(
         qkv,
         q_weight,
         k_weight,

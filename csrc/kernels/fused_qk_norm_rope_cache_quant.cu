@@ -2772,7 +2772,7 @@ minimax_apply_gptj_rope_pack(vec_t<scalar_t, PackSize> x,
 }
 
 template <typename scalar_t, typename weight_t, int BlockSize>
-__global__ void minimax_qk_norm_rope_tp1_kernel(
+__global__ void minimax_qk_norm_rope_kernel(
     scalar_t const* __restrict__ qkv,
     weight_t const* __restrict__ q_weight,
     weight_t const* __restrict__ k_weight,
@@ -2889,7 +2889,7 @@ __global__ void minimax_qk_norm_rope_tp1_kernel(
 
 namespace aiter {
 
-void minimax_qk_norm_rope_tp1(aiter_tensor_t& qkv,
+void minimax_qk_norm_rope(aiter_tensor_t& qkv,
                               aiter_tensor_t& q_weight,
                               aiter_tensor_t& k_weight,
                               aiter_tensor_t& cos_sin_cache,
@@ -2958,7 +2958,7 @@ void minimax_qk_norm_rope_tp1(aiter_tensor_t& qkv,
     const hipStream_t stream = aiter::getCurrentHIPStream();
     constexpr int block_size = 1024;
 
-    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(qkv.dtype(), "minimax_qk_norm_rope_tp1", [&] {
+    VLLM_DISPATCH_FLOATING_TYPES_rmTorch(qkv.dtype(), "minimax_qk_norm_rope", [&] {
         constexpr int pack_size = 16 / sizeof(scalar_t);
         AITER_CHECK(q_size % pack_size == 0 && kv_size % pack_size == 0 &&
                         head_dim % pack_size == 0,
@@ -2971,7 +2971,7 @@ void minimax_qk_norm_rope_tp1(aiter_tensor_t& qkv,
         dim3 block(block_size);
         if(q_weight.dtype() == AITER_DTYPE_fp32)
         {
-            minimax_qk_norm_rope_tp1_kernel<scalar_t, float, block_size>
+            minimax_qk_norm_rope_kernel<scalar_t, float, block_size>
                 <<<grid, block, 0, stream>>>(
                     reinterpret_cast<scalar_t const*>(qkv.data_ptr()),
                     reinterpret_cast<float const*>(q_weight.data_ptr()),
@@ -2990,7 +2990,7 @@ void minimax_qk_norm_rope_tp1(aiter_tensor_t& qkv,
         }
         else
         {
-            minimax_qk_norm_rope_tp1_kernel<scalar_t, scalar_t, block_size>
+            minimax_qk_norm_rope_kernel<scalar_t, scalar_t, block_size>
                 <<<grid, block, 0, stream>>>(
                     reinterpret_cast<scalar_t const*>(qkv.data_ptr()),
                     reinterpret_cast<scalar_t const*>(q_weight.data_ptr()),

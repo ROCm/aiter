@@ -1739,8 +1739,8 @@ namespace py = pybind11;
           py::arg("k_eps"),                                     \
           py::arg("q_out"),                                     \
           py::arg("k_out"));                                    \
-    m.def("minimax_qk_norm_rope_tp1",                           \
-          &aiter::minimax_qk_norm_rope_tp1,                     \
+    m.def("minimax_qk_norm_rope",                               \
+          &aiter::minimax_qk_norm_rope,                         \
           py::arg("qkv"),                                       \
           py::arg("q_weight"),                                  \
           py::arg("k_weight"),                                  \
