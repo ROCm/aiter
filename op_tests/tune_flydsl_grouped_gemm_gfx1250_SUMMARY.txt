@@ -1,0 +1,153 @@
+================================================================================
+gfx1250 Grouped MoE GEMM Tile-Size Tuner — 实现总结
+================================================================================
+
+目标
+----
+为 gfx1250 grouped MoE GEMM kernel (aiter.fused_moe 的 grouped 路径) 增加 tuner，
+覆盖大部分 tile size，遍历全部 7 个 tile 维度：
+    tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers, split_k
+并且把 gemm1 (stage1) 与 gemm2 (stage2) 的 tune 分离，同时保证精度。
+
+
+核心思路：gemm1 / gemm2 分离 tune（参考 FmoeTuner 策略）
+--------------------------------------------------------
+参考 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py 里 FmoeTuner 的做法：
+每个 stage 独立 benchmark（tag "stage1"/"stage2"），结果按共享的 block_m 合并，
+取 us1+us2 的 idxmin。
+
+本 tuner 把同样的「分离再合并」搬到 grouped 路径上：
+- gemm1 形状: N=2*inter_dim, K=model_dim
+- gemm2 形状: N=model_dim,   K=inter_dim
+  两者形状不同，最优 tile 几乎必然不同 => 必须分开 tune。
+
+grouped 架构里的约束：
+- 共享维度: tile_m / m_warp
+    它们决定 max_m padding 和按行的 scale 布局，而两个 stage 共用同一份 grouped
+    buffer，所以 M-tiling 必须一致（类比 FmoeTuner 的 block_m）。
+- 每 stage 独立: tile_n / tile_k / n_warp / num_buffers / split_k
+
+tune 流程（坐标下降 coordinate descent）：
+    for each 共享 (tile_m, m_warp):
+        1) 固定 gemm2=baseline，扫所有 gemm1 配置，取端到端 us 最小 => best gemm1
+        2) 固定 gemm1=best，扫所有 gemm2 配置，取端到端 us 最小 => best gemm2
+        3) 记录该 (tile_m,m_warp) 的组合 us
+    选 us 最小的 (tile_m, m_warp)，再做精度校验
+
+为什么坐标下降有效：fused_moe 一次跑两个 stage，无法单独计时；但固定另一个 stage
+时，端到端时间里只有被扫 stage 的耗时在变，故 arg-min 即该 stage 的最优 —— 这就
+实现了「分离 tune」。代价从全耦合的乘积级降到每个 M-config 约 (|gemm1|+|gemm2|)。
+
+
+精度保证
+--------
+扫描阶段只测速（快）。选出全局最优配置后，复用 ut 测试模块的端到端对照harness
+(_run_grouped_via_fused_moe + _logits_diff)，对 PyTorch fp32 参考做 logits_diff
+校验，门槛 = LOGITS_DIFF_TOL (0.01)。不过门槛的配置不会被写出（避免「快但错」）。
+可用 --no-verify 关闭。
+
+
+改动文件
+--------
+1. 新增（独立文件，不动 ut 测试文件）：
+       op_tests/tune_flydsl_grouped_gemm_gfx1250.py
+
+2. 必要的库改动（向后兼容）：
+       aiter/ops/flydsl/grouped_moe_gfx1250.py
+
+
+--------------------------------------------------------------------------------
+库改动 aiter/ops/flydsl/grouped_moe_gfx1250.py（关键）
+--------------------------------------------------------------------------------
+原 grouped 路径把 tile_n/tile_k/m_warp 写死 (tile_n=n_warp*64, tile_k=256,
+m_warp=1)，且 CSV 只读 tile_m/n_warp/num_buffers/split_k1/split_k2 —— 而且这一套
+配置是两个 stage 共用的，无法分离。
+
+改动：
+- tile_m / m_warp 作为「共享」维度从 CSV 读取。
+- gemm1 / gemm2 各自独立读取 per-stage 列：
+      stage1: tile_n1, tile_k1, n_warp1, num_buffers1, split_k1
+      stage2: tile_n2, tile_k2, n_warp2, num_buffers2, split_k2
+- per-stage 列缺省时，回退到旧的共享列 (tile_n/tile_k/n_warp/num_buffers)，
+  再回退到派生默认值 (n_warp*64 / 256 / 2)。
+- 同时让 stage1/stage2 各自的 scale preshuffle 用对应的 tile_k1 / tile_k2。
+
+完全向后兼容：现有 tuned_grouped_fmoe.csv 没有 *1/*2 列，会走回退分支，行为与改动
+前完全一致。
+
+
+--------------------------------------------------------------------------------
+新文件 op_tests/tune_flydsl_grouped_gemm_gfx1250.py
+--------------------------------------------------------------------------------
+- 候选生成 + 约束过滤：分为
+    _valid_m_config(tile_m,m_warp)            共享 M-tiling 合法性
+    _valid_stage_config(...K=...)             每 stage 的 N/K-tiling 合法性
+                                              (含 m_warp*n_warp*32<=1024 线程上限)
+  约束完整复刻 gemm_mxscale_gfx1250.py，绝不发射编译器会拒绝的配置。
+- 注入方式：写单行 config CSV -> 设 AITER_CONFIG_GROUPED_FMOE -> 清
+  _GROUPED_CONFIG_CACHE / _find_grouped_config / 两个 compile 的 LRU 缓存 ->
+  run_perftest 测 fused_moe -> 还原。
+- 复用 ut 测试模块的数据构造/路由/精度 harper（import，不复制）。
+- 输出每 token 的最优「共享 + per-stage」配置；--tune-output 写 CSV（含 *1/*2 列）。
+- --dry-run：枚举每个 M-config 的 gemm1/gemm2 候选数与总运行数（无需 GPU）。
+- --no-verify：跳过精度门槛。
+- --max-stage-candidates N：每个 M-config 每 stage 限制候选数（控制 tune 时长，
+  baseline 始终保留）。
+
+搜索空间（文件顶部常量，可裁剪）：
+    TUNE_TILE_M      = [16, 32, 64, 128, 256]
+    TUNE_M_WARP      = [1, 2, 4]
+    TUNE_TILE_N      = [64, 128, 256, 512]
+    TUNE_TILE_K      = [128, 256, 512]
+    TUNE_N_WARP      = [1, 2, 4]
+    TUNE_NUM_BUFFERS = [2, 3, 4]
+    TUNE_SPLIT_K     = [1, 2]
+
+
+--------------------------------------------------------------------------------
+规模估算（实测自约束逻辑）
+--------------------------------------------------------------------------------
+分离 tune（坐标下降，每 token）：
+    a8w4 md=7168 idim=2048 : 12 个 M-config, ~4896 次测速/token
+    a4w4 md=7168 idim=2048 : 12 个 M-config, ~4488 次测速/token
+比全耦合(~2300)多约 2 倍，换来 gemm1/gemm2 各自独立寻优（覆盖更全）。
+用 --dry-run 查看具体数量，用 --max-stage-candidates / 裁剪常量列表控制时长。
+
+
+--------------------------------------------------------------------------------
+用法示例
+--------------------------------------------------------------------------------
+    # 预览每 stage 候选数与总运行数（无需 GPU）
+    python op_tests/tune_flydsl_grouped_gemm_gfx1250.py --dry-run \
+        --data-format a8w4 --model-dim 7168 --inter-dim 2048 \
+        --experts 256 --topk 8
+
+    # 在 gfx1250 上 tune（含精度门槛），写出最优 per-stage 配置
+    python op_tests/tune_flydsl_grouped_gemm_gfx1250.py \
+        --data-format a8w4 --model-dim 7168 --inter-dim 2048 \
+        --experts 256 --topk 8 --tokens 1 8 64 \
+        --tune-output /tmp/tuned_grouped.csv
+
+    # 限制每 stage 候选数，缩短 tune 时长
+    python op_tests/tune_flydsl_grouped_gemm_gfx1250.py \
+        --data-format a8w4 --tokens 64 --max-stage-candidates 40 \
+        --tune-output /tmp/tuned_grouped.csv
+
+
+--------------------------------------------------------------------------------
+注意事项 / 限制
+--------------------------------------------------------------------------------
+- 扫描阶段仅测速；最优配置才做端到端精度校验（logits_diff<0.01），不过门槛不写出。
+- 坐标下降假设两 stage 可分离（顺序、互不影响），在该架构成立。
+- 本机无可用 GPU（rocminfo 段错误、aiter 无法 import），仅做了：
+    * 两个文件 py_compile 通过
+    * 约束/候选生成与规模估算的独立验证
+  实际测速需在 gfx1250 硬件上运行。
+
+
+--------------------------------------------------------------------------------
+可选后续
+--------------------------------------------------------------------------------
+- 把更广的分离 sweep 接进现有标准 tuning CLI (GroupedFmoeTuner / --grouped-gemm)。
+- 给 GroupedFmoeTuner 增加 per-stage 列输出，与本 tuner 统一 schema。
+================================================================================
