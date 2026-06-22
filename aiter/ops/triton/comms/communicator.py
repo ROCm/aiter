@@ -353,6 +353,60 @@ class TorchCommunicator(Communicator):
         yield
 
 
+class DummyCommunicator(Communicator):
+    """No-op communicator — the comms-free floor for reasoning about integration
+    quality. Routes through the EXACT same path as iris (CudaCommunicator ->
+    aiter_comm -> here) and preserves tensor shapes + cudagraph structure, but
+    does ZERO cross-rank communication: all_reduce returns the input unreduced,
+    all_gather replicates the local input. Output is therefore GARBAGE — this is
+    perf-only, never eval it. Its value is the timing: dummy isolates the
+    wrapper/dispatch path with no comm, so `iris - dummy` is iris's real
+    comm+kernel+staging cost above that floor and `baseline - dummy` is baseline's
+    comm cost. It uses no NCCL, so it captures cleanly at full cudagraph (unlike
+    the torch backend, whose per-graph NCCL buffer registration OOMs)."""
+
+    def __init__(
+        self,
+        cpu_group: ProcessGroup,
+        device_group: ProcessGroup,
+        device: Union[int, str, torch.device],
+        max_size: int = _DEFAULT_MAX_SIZE,
+    ) -> None:
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        assert isinstance(device, torch.device)
+        self.cpu_group = cpu_group
+        self.device_group = device_group
+        self.device = device
+        self.max_size = max_size
+        self.world_size = dist.get_world_size(device_group)
+        self.disabled = False
+
+    def should_allreduce(self, inp: torch.Tensor) -> bool:
+        return not self.disabled
+
+    def should_allgather(self, inp: torch.Tensor) -> bool:
+        return not self.disabled
+
+    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        # No-op: shape-preserving, no comm. Returns the (unreduced) input as a new
+        # tensor to honor the out-of-place contract; the value is garbage.
+        return inp.clone()
+
+    def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if dim < 0:
+            dim += inp.dim()
+        # Shape-correct no-op: replicate the local input across the world dim (no
+        # comm). Matches the all_gather output shape; values are garbage.
+        return torch.cat([inp] * self.world_size, dim=dim)
+
+    @contextmanager
+    def capture(self) -> Iterator[None]:
+        yield
+
+
 def make_communicator(
     cpu_group: ProcessGroup,
     device_group: ProcessGroup,
@@ -369,8 +423,9 @@ def make_communicator(
     neither (its own symmetric-heap CCL).
 
     'iris' is the gluon GPU-initiated CCL; 'torch' is the torch.distributed
-    reference/control. The caller (vLLM) stays backend-agnostic and passes
-    nothing; the backend is then resolved from ``AITER_COMMS_BACKEND``. There is
+    reference/control; 'dummy' is a no-op comms-free floor (perf only — garbage
+    output). The caller (vLLM) stays backend-agnostic and passes nothing; the
+    backend is then resolved from ``AITER_COMMS_BACKEND``. There is
     NO default — if neither the ``backend`` argument (used by the tests) nor the
     env var is set, this raises, so the backend is always an explicit choice.
 
@@ -384,7 +439,7 @@ def make_communicator(
     if backend is None:
         raise ValueError(
             "AITER_COMMS_BACKEND is not set; specify the communicator backend "
-            "explicitly ('iris' or 'torch')"
+            "explicitly ('iris', 'torch', or 'dummy')"
         )
     backend = backend.lower()
     logger.info("aiter make_communicator: backend=%s", backend)
@@ -392,4 +447,6 @@ def make_communicator(
         return IrisCommunicator(cpu_group, device_group, device, max_size)
     if backend == "torch":
         return TorchCommunicator(cpu_group, device_group, device, max_size)
+    if backend == "dummy":
+        return DummyCommunicator(cpu_group, device_group, device, max_size)
     raise ValueError(f"unknown communicator backend {backend!r}")
