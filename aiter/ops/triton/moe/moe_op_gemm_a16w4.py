@@ -62,6 +62,7 @@ def allocate_output(
     return matmul_output, final_output
 
 
+def get_kernel_config_triton(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -113,7 +114,7 @@ def allocate_output(
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
-    return 
+    return ret
 
 
 def get_kernel_config_gluon(m, n, k, routing_data):
