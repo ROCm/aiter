@@ -185,10 +185,15 @@ def _gep3(base_ptr, byte_off_i32):
     )
 
 
-def _global_base_ptr1(arg):
-    """One ptr<1> base for a global tensor (single memref->ptr conversion)."""
-    base_idx = buffer_ops.extract_base_index(arg, address_space=1)
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(base_idx)))
+def _global_base_ptr1(addr_i64):
+    """ptr<1> base from a raw i64 device address.
+
+    Global args are passed as bare ``data_ptr()`` (fx.Int64) rather than full
+    memref descriptors: this kernel only ever needs the base pointer (it assumes
+    contiguity and derives all sizes from i32_ntok / compile-time constants), so
+    the dynamic-memref shape/stride layout buffer was dead weight that scattered
+    the kernarg pointers and blocked LLVM from coalescing the scalar loads."""
+    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
 
 
 def _gep1(base_ptr, byte_off_i32):
@@ -211,7 +216,7 @@ def _lds_swizzle_mask(row):
 def _silu_mul(g, u):
     """silu(g)*u, matching HIP silu_mul_fast (mxfp4_gemm_common.hpp:62-65):
     e = __expf(-g) = exp2(-g*log2e); sig = rcpf(1+e); return g*sig*u."""
-    e = (g * fx.Float32(-LOG2E)).exp2()
+    e = fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E))))
     sig = fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e)))
     return g * sig * u
 
@@ -240,14 +245,16 @@ def _e8m0_from_amax(amax_f32):
 # -- inline-quant helpers (HIP mxfp4_gemm_common.hpp:76-94) -------------------
 def _pkmax_u16(a_i32, b_i32):
     """v_pk_max_u16 a, b -- pairwise u16 max of two packed-u16 dwords.
-    No FlyDSL builtin; mirror HIP inline_quant_pkmax_u16 via inline asm."""
-    out = llvm.inline_asm(
-        res=T.i32,
-        operands_=[_raw(a_i32), _raw(b_i32)],
-        asm_string="v_pk_max_u16 $0, $1, $2",
-        constraints="=v,v,v",
-        has_side_effects=False,
-    )
+
+    No FlyDSL builtin, but no inline asm needed: bitcast each dword to
+    vector<2xi16> and let arith.maxui lower through MLIR -> LLVM. The AMDGPU
+    backend ISel-pattern-matches `umax <2 x i16>` to a single v_pk_max_u16,
+    so this emits the same instruction with zero inline asm."""
+    _v2i16 = ir.Type.parse("vector<2xi16>")
+    va = llvm.BitcastOp(_v2i16, _raw(a_i32)).result
+    vb = llvm.BitcastOp(_v2i16, _raw(b_i32)).result
+    vm = arith.MaxUIOp(va, vb).result
+    out = llvm.BitcastOp(T.i32, vm).result
     return fx.Int32(out)
 
 
@@ -369,26 +376,28 @@ def _gemm1_body(
     # max_size=False memref fallback for DLPack's dynamic-shape a_quant) would read
     # garbage past the logical extent into the padding rows. Pass the exact byte
     # count = n_tokens * K_HALF (a_quant is uint8, 1 byte/elem).
+    # args arrive as raw i64 device addresses (data_ptr()); build buffer resources
+    # straight from the address -- no memref descriptor needed (see _global_base_ptr1).
     aq_num_records = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K_HALF)))
-    aq_rsrc = buffer_ops.create_buffer_resource(
-        arg_aq, max_size=False, num_records_bytes=aq_num_records
+    aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num_records
     )
-    ascale_rsrc = buffer_ops.create_buffer_resource(
-        arg_ascale, max_size=False, num_records_bytes=fx.Index(ASCALE_BYTES)
+    ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_ascale)), num_records_bytes=ASCALE_BYTES
     )
-    bq_rsrc = buffer_ops.create_buffer_resource(
-        arg_bq, max_size=False, num_records_bytes=fx.Index(BQ_BYTES)
+    bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_bq)), num_records_bytes=BQ_BYTES
     )
-    bscale_rsrc = buffer_ops.create_buffer_resource(
-        arg_bscale, max_size=False, num_records_bytes=fx.Index(BSCALE_BYTES)
+    bscale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_bscale)), num_records_bytes=BSCALE_BYTES
     )
     # hidden_states rsrc (inline-quant only): n_tokens*K*sizeof(bf16) bytes (HIP :92-97).
     # Non-inline keeps arg_hidden unused.
     hidden_rsrc = None
     if const_expr(inline_quant):
         hidden_num = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K * 2)))
-        hidden_rsrc = buffer_ops.create_buffer_resource(
-            arg_hidden, max_size=False, num_records_bytes=hidden_num
+        hidden_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_hidden)), num_records_bytes=hidden_num
         )
 
     # -- LDS views (s_aq / s_asc, union-overlapping lds_acc) ------------------
@@ -608,6 +617,72 @@ def _gemm1_body(
         pack_byte = B128_IDX * 2 + SUB
         scale_accum[0] = scale_accum[0] | (e8m0 << fx.Int32(pack_byte * 8))
 
+    def _inline_quant_core_pair(specs, slot, kt, scale_accum):
+        """Interleaved N-row variant of _inline_quant_core: emit each pipeline
+        stage (abs+pkmax, cross-lane DPP quad-reduce, e8m0) for ALL rows
+        back-to-back so the scheduler can hide one row's high-latency DPP /
+        umax behind the other row's independent work -- matching HIP gemm1
+        BM16's quant interleave (flydsl's row-by-row order leaves s_nop bubbles
+        in the DPP latency window). specs = [(B128_IDX, SUB, h_v), ...]."""
+        n = len(specs)
+        h_dw = [
+            [fx.Int32(_raw(h_v[j])) for j in range_constexpr(4)]
+            for (_b, _s, h_v) in specs
+        ]
+        # stage 1: |bf16| + pkmax tree -> per-row local u16 amax
+        la = [None] * n
+        for i in range_constexpr(n):
+            hm = [h_dw[i][j] & fx.Int32(0x7FFF7FFF) for j in range_constexpr(4)]
+            m01 = _pkmax_u16(hm[0], hm[1])
+            m23 = _pkmax_u16(hm[2], hm[3])
+            m0123 = _pkmax_u16(m01, m23)
+            lo = m0123 & fx.Int32(0xFFFF)
+            hi = m0123.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)
+            la[i] = _umax_i32(lo, hi)
+        # stage 2: DPP quad-reduce, INTERLEAVED across rows (hide DPP latency)
+        a = [fx.Int32(_raw(la[i])) for i in range_constexpr(n)]
+        s1 = [
+            fx.Int32(dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0xB1, 0xF, 0xF, True))
+            for i in range_constexpr(n)
+        ]
+        a = [_umax_i32(a[i], s1[i]) for i in range_constexpr(n)]
+        s2 = [
+            fx.Int32(dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0x4E, 0xF, 0xF, True))
+            for i in range_constexpr(n)
+        ]
+        a = [_umax_i32(a[i], s2[i]) for i in range_constexpr(n)]
+        # stage 3: e8m0 per row
+        e8 = [_inline_e8m0(a[i]) for i in range_constexpr(n)]
+        # stage 4: cvt pack + LDS store + scale fold per row
+        for i in range_constexpr(n):
+            B128_IDX, SUB, _hv = specs[i]
+            qs_raw = _raw(
+                fx.Float32(_raw(e8[i] << fx.Int32(23)).bitcast(T.f32))
+            )
+            pk = _raw(fx.Int32(0))
+            for j in range_constexpr(4):
+                src_bf16x2 = _raw(
+                    Vec.from_elements([h_dw[i][j]], fx.Int32).bitcast(fx.BFloat16)
+                )
+                pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, src_bf16x2, qs_raw, j)
+            pk = fx.Int32(pk)
+            r = fx.Int32(SUB * 16) + r_in_chunk
+            kb_in_kt = fx.Int32(B128_IDX * 4) + lane_shr2_and3
+            mask_r = _lds_swizzle_mask(r)
+            b_off = lib * fx.Int32(4)
+            aq_base = fx.Int32(
+                memref_dialect.extract_aligned_pointer_as_index(s_aq.get())
+            )
+            off = (
+                fx.Int32(slot * (BM * KH_TILE))
+                + r * fx.Int32(KH_TILE)
+                + ((kb_in_kt * fx.Int32(16)) ^ mask_r)
+                + b_off
+            )
+            llvm.StoreOp(_raw(pk), _lds_ptr3(aq_base, off))
+            pack_byte = B128_IDX * 2 + SUB
+            scale_accum[0] = scale_accum[0] | (e8[i] << fx.Int32(pack_byte * 8))
+
     def inline_quant_kt(B128_IDX, SUB, slot, kt, row_token, scale_accum):
         h_v = inline_quant_load_kt(B128_IDX, kt, row_token)
         _inline_quant_core(B128_IDX, SUB, slot, kt, h_v, scale_accum)
@@ -774,8 +849,9 @@ def _gemm1_body(
         # Inline quant of the pre-loaded h_v0/h_v1 into write_slot (HIP :545-550).
         if const_expr(inline_quant):
             scale_accum = [fx.Int32(0)]
-            inline_quant_finish_kt(0, 0, write_slot, K_C, h_v0, scale_accum)
-            inline_quant_finish_kt(1, 0, write_slot, K_C, h_v1, scale_accum)
+            _inline_quant_core_pair(
+                [(0, 0, h_v0), (1, 0, h_v1)], write_slot, K_C, scale_accum
+            )
             inline_quant_pack_write(K_C, scale_accum)
 
     # ---- drain: S in [0,2) (HIP 554-565) ----
@@ -1022,17 +1098,17 @@ def compile_gemm1_a4w4_port(
 
     @flyc.kernel(name=f"gemm1_a4w4_port_{name_suffix}", known_block_size=[256, 1, 1])
     def gemm1_kernel(
-        arg_aq: fx.Tensor,
-        arg_ascale: fx.Tensor,
-        arg_bq: fx.Tensor,
-        arg_bscale: fx.Tensor,
-        arg_eids: fx.Tensor,
-        arg_cumsum: fx.Tensor,
-        arg_mind: fx.Tensor,
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_mind: fx.Int64,
         i32_ntok: fx.Int32,
-        arg_aqout: fx.Tensor,
-        arg_ascaleout: fx.Tensor,
-        arg_hidden: fx.Tensor,
+        arg_aqout: fx.Int64,
+        arg_ascaleout: fx.Int64,
+        arg_hidden: fx.Int64,
     ):
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
@@ -1089,18 +1165,18 @@ def compile_gemm1_a4w4_port(
 
     @flyc.jit
     def launch_gemm1(
-        arg_aq: fx.Tensor,
-        arg_ascale: fx.Tensor,
-        arg_bq: fx.Tensor,
-        arg_bscale: fx.Tensor,
-        arg_eids: fx.Tensor,
-        arg_cumsum: fx.Tensor,
-        arg_mind: fx.Tensor,
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_mind: fx.Int64,
         i32_ntok: fx.Int32,
         i32_grid: fx.Int32,
-        arg_aqout: fx.Tensor,
-        arg_ascaleout: fx.Tensor,
-        arg_hidden: fx.Tensor,
+        arg_aqout: fx.Int64,
+        arg_ascaleout: fx.Int64,
+        arg_hidden: fx.Int64,
         stream: fx.Stream,
     ):
         from flydsl.compiler.kernel_function import CompilationContext

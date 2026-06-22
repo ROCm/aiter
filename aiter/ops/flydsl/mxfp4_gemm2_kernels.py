@@ -157,18 +157,21 @@ def flydsl_mxfp4_gemm2(
     # launch signature stays uniform.
     out_scale = flat_out_scale if mxfp4out else _dummy_out_scale(flat_out.device.index)
 
+    # gemm2 only needs base pointers (assumes contiguity + derives sizes from
+    # compile-time consts), so pass raw data_ptr() addresses instead of full
+    # memref descriptors -> contiguous, coalescible kernargs (ported from gemm1).
     launch(
-        inter_sorted_quant,
-        inter_sorted_shuffled_scale,
-        w2_u8,
-        w2_scale_u8,
-        sorted_expert_ids,
-        cumsum_tensor,
-        sorted_token_ids,
-        sorted_weights,
+        inter_sorted_quant.data_ptr(),
+        inter_sorted_shuffled_scale.data_ptr(),
+        w2_u8.data_ptr(),
+        w2_scale_u8.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        cumsum_tensor.data_ptr(),
+        sorted_token_ids.data_ptr(),
+        sorted_weights.data_ptr(),
         M_logical,
         max_m_blocks,
-        flat_out,
-        out_scale,
+        flat_out.data_ptr(),
+        out_scale.data_ptr(),
         torch.cuda.current_stream(),
     )

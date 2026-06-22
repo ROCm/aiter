@@ -102,18 +102,21 @@ def flydsl_mxfp4_gemm1(
         BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER)
+    # gemm1 only needs base pointers (it assumes contiguity + derives sizes
+    # from n_tokens / compile-time consts), so pass raw data_ptr() addresses
+    # instead of full memref descriptors -> contiguous, coalescible kernargs.
     launch(
-        a_quant,
-        a_scale_sorted_shuffled,
-        w1_u8,
-        w1_scale_u8,
-        sorted_expert_ids,
-        cumsum_tensor,
-        m_indices,
+        a_quant.data_ptr(),
+        a_scale_sorted_shuffled.data_ptr(),
+        w1_u8.data_ptr(),
+        w1_scale_u8.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        cumsum_tensor.data_ptr(),
+        m_indices.data_ptr(),
         n_tokens,
         grid,
-        inter_sorted_quant,
-        inter_sorted_shuffled_scale,
-        hidden_states,
+        inter_sorted_quant.data_ptr(),
+        inter_sorted_shuffled_scale.data_ptr(),
+        hidden_states.data_ptr(),
         torch.cuda.current_stream(),
     )
