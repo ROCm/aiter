@@ -25,7 +25,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl, vector
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.numeric import ArithValue
 from flydsl.expr.typing import T
 from flydsl._mlir.dialects import scf, vector as mlir_vector
@@ -248,6 +248,7 @@ def _build_kernel(*, num_heads: int, head_size: int, block_kv: int):
     return launch_fp8_mqa_logits
 
 
+# MFMA based direct port of the Triton kernel.
 def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int):
     """MFMA-based kernel: fp8 ``v_mfma_f32_16x16x32_fp8_fp8`` Q.K.
 
@@ -489,6 +490,396 @@ def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int):
     return launch_fp8_mqa_logits_mfma
 
 
+# GEAK optimized FlyDSL kernel
+def _iv_to_i32(idx_val):
+    """Cast an scf.for induction variable (index type) to fx.Int32.
+
+    The MLIR i32 type must be built inside an active MLIR context (i.e. during
+    kernel tracing), so it is resolved lazily here rather than at import.
+    """
+    i32_ty = ir.IntegerType.get_signless(32)
+    return fx.Int32(arith.index_cast(i32_ty, fx.arith._to_raw(idx_val)))
+
+
+# Each wave stages into and reads from its own private LDS slab, so a
+# workgroup barrier is not required for correctness (intra-wave LDS
+# write->read is ordered by the compiler's lds waitcnt). Kept as a toggle so
+# the safe behaviour can be restored if a future layout shares slabs.
+import os as _os
+_USE_LDS_BARRIER = _os.environ.get("FLYDSL_MQA_LDS_BARRIER", "0") == "1"
+
+_FNUZ = torch.float8_e4m3fnuz
+_DTYPE_LOGGED = False
+
+NUM_HEADS = 64
+HEAD_DIM = 128
+
+WAVE = 64
+M_TILES = NUM_HEADS // 16     # 4
+K_STEPS = HEAD_DIM // 32      # 4
+N_TILE = 16
+WAVES = 4                     # waves per block
+TPW = 2                       # ntiles processed per wave (ILP)
+# NOTE: GEAK-specific block size (256 = 4 wave64). Named distinctly so it does
+# NOT clobber the module-level ``BLOCK_THREADS = 64`` that the scalar and mfma
+# kernels rely on -- the builders read module globals at call time, so a plain
+# ``BLOCK_THREADS`` here would silently launch those kernels with 256 threads.
+_GEAK_BLOCK_THREADS = WAVE * WAVES  # 256
+COLS_PER_BLOCK = N_TILE * WAVES * TPW   # 128 kv columns finished per grid.y block
+# Query rows handled per block. Each kv column tile is staged into LDS ONCE and
+# reused across all ROWS_PER_BLOCK rows' MFMAs (rows processed sequentially so
+# accumulators/weights are reused -> VGPR/occupancy stay healthy). This cuts KV
+# global traffic and per-tile loop/staging overhead by ~ROWS_PER_BLOCK.
+ROWS_PER_BLOCK = 2
+NEG_INF = float("-inf")
+
+# Back-compat default shape for the standalone Model below.
+S_Q = 128
+S_K = 1024
+
+def build_mqa_logits(S_K, ROWS=ROWS_PER_BLOCK):
+    assert S_K % COLS_PER_BLOCK == 0, (
+        f"S_K ({S_K}) must be a multiple of {COLS_PER_BLOCK}"
+    )
+    COLS_PER_WAVE = 16 * TPW          # kv columns staged per wave
+    KV_SLAB_I64 = COLS_PER_WAVE * (HEAD_DIM // 8)  # i64 per wave slab
+    NSTAGE = (KV_SLAB_I64 + WAVE - 1) // WAVE   # coalesced copy steps per wave
+
+    @fx.struct
+    class SharedStorage:
+        # Single per-wave-private KV slab, shared across the ROWS rows in the
+        # block. (A double-buffered variant regressed: doubling LDS halved
+        # occupancy; this kernel is occupancy/TLP-bound.)
+        kv: fx.Array[fx.Int64, WAVES * KV_SLAB_I64, 16]
+
+    @flyc.kernel(known_block_size=[_GEAK_BLOCK_THREADS, 1, 1])
+    def mqa_logits_kernel(
+        Q: fx.Tensor,        # i64 view: 8 fp8 per i64
+        KV: fx.Tensor,       # i64 view
+        KVSCALE: fx.Tensor,  # f32 [S_K]
+        W: fx.Tensor,        # f32 [M*NUM_HEADS]
+        STARTS: fx.Tensor,   # i32 [M]
+        ENDS: fx.Tensor,     # i32 [M]
+        OUT: fx.Tensor,      # f32 [M*S_K]
+    ):
+        # One block per ROWS query rows. The block (4 waves = 256 lanes) walks
+        # the union of the rows' active kv-column blocks with an internal runtime
+        # loop; each column tile is staged into LDS ONCE and reused across all
+        # ROWS rows. Q frags for all ROWS rows stay resident; accumulators are
+        # reused per row (rows processed sequentially) to keep VGPR pressure low.
+        rt = fx.block_idx.x
+        tid = fx.thread_idx.x
+        wave = tid // fx.Int32(WAVE)
+        lane = tid % fx.Int32(WAVE)
+
+        q_rsrc = buffer_ops.create_buffer_resource(Q, max_size=True)
+        kv_rsrc = buffer_ops.create_buffer_resource(KV, max_size=True)
+        ks_buf = fx.rocdl.make_buffer_tensor(KVSCALE)
+        w_buf = fx.rocdl.make_buffer_tensor(W)
+        st_buf = fx.rocdl.make_buffer_tensor(STARTS)
+        en_buf = fx.rocdl.make_buffer_tensor(ENDS)
+        OUT_buf = fx.rocdl.make_buffer_tensor(OUT)
+
+        c16 = fx.Int32(16)
+        lane_row = lane % c16
+        lane_kg = lane // c16
+        ROW_I64 = fx.Int32(HEAD_DIM // 8)   # 16 i64 per head/kvcol row
+        cpb = fx.Int32(COLS_PER_BLOCK)
+
+        # ---- per-row metadata, Q frags, weights, out base (all resident) ----
+        starts = [None] * ROWS
+        ends = [None] * ROWS
+        q_frag = [None] * ROWS
+        wvals = [None] * ROWS
+        out_base = [None] * ROWS
+        for j in range_constexpr(ROWS):
+            r = rt * fx.Int32(ROWS) + fx.Int32(j)
+            s = fx.memref_load(st_buf, r)
+            e = fx.memref_load(en_buf, r)
+            starts[j] = (s > fx.Int32(0)).select(s, fx.Int32(0))
+            ends[j] = (e < fx.Int32(S_K)).select(e, fx.Int32(S_K))
+            out_base[j] = r * fx.Int32(S_K)
+            q_row_base = r * fx.Int32(NUM_HEADS) * ROW_I64
+            frag = [[None] * K_STEPS for _ in range(M_TILES)]
+            for mt in range_constexpr(M_TILES):
+                head_i64 = q_row_base + (fx.Int32(mt * 16) + lane_row) * ROW_I64
+                for ks in range_constexpr(K_STEPS):
+                    frag[mt][ks] = buffer_ops.buffer_load(
+                        q_rsrc, head_i64 + fx.Int32(ks * 4) + lane_kg,
+                        vec_width=1, dtype=fx.Int64)
+            q_frag[j] = frag
+            w_row_base = r * fx.Int32(NUM_HEADS)
+            wj = [[None] * 4 for _ in range(M_TILES)]
+            for mt in range_constexpr(M_TILES):
+                for i in range_constexpr(4):
+                    head = fx.Int32(mt * 16) + lane_kg * fx.Int32(4) + fx.Int32(i)
+                    wj[mt][i] = fx.memref_load(w_buf, w_row_base + head)
+            wvals[j] = wj
+
+        # union of the rows' active column-block ranges (j=0 init is idempotent)
+        cb_start = starts[0] // cpb
+        cb_end = (ends[0] + fx.Int32(COLS_PER_BLOCK - 1)) // cpb
+        for j in range_constexpr(ROWS):
+            csj = starts[j] // cpb
+            cb_start = (csj < cb_start).select(csj, cb_start)
+            cej = (ends[j] + fx.Int32(COLS_PER_BLOCK - 1)) // cpb
+            cb_end = (cej > cb_end).select(cej, cb_end)
+        n_iter = cb_end - cb_start
+
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        kv_sh = lds.kv.view(fx.make_layout(WAVES * KV_SLAB_I64, 1))
+        wave_slab = wave * fx.Int32(KV_SLAB_I64)
+
+        for cbi, _state in range(0, fx.arith._to_raw(n_iter), 1, init=[fx.Int32(0)]):
+            cb = cb_start + _iv_to_i32(cbi)
+            nt0 = (cb * fx.Int32(WAVES) + wave) * fx.Int32(TPW)
+
+            # ---- stage this column tile's KV into LDS ONCE (shared by rows) ----
+            kv_global_base = nt0 * fx.Int32(16) * ROW_I64
+            for e in range_constexpr(NSTAGE):
+                idx = lane + fx.Int32(e * WAVE)
+                if const_expr(KV_SLAB_I64 % WAVE != 0):
+                    if idx < fx.Int32(KV_SLAB_I64):
+                        v = buffer_ops.buffer_load(kv_rsrc, kv_global_base + idx,
+                                                   vec_width=1, dtype=fx.Int64)
+                        fx.memref_store(v, kv_sh, wave_slab + idx)
+                else:
+                    v = buffer_ops.buffer_load(kv_rsrc, kv_global_base + idx,
+                                               vec_width=1, dtype=fx.Int64)
+                    fx.memref_store(v, kv_sh, wave_slab + idx)
+            if const_expr(_USE_LDS_BARRIER):
+                gpu.barrier()
+
+            # B fragments + columns + per-column kv scale (shared across rows).
+            b_frag = [[None] * K_STEPS for _ in range(TPW)]
+            cols = [None] * TPW
+            kvsc = [None] * TPW
+            for tp in range_constexpr(TPW):
+                cols[tp] = (nt0 + fx.Int32(tp)) * fx.Int32(16) + lane_row
+                kvsc[tp] = fx.memref_load(ks_buf, cols[tp])
+                col_in_slab = fx.Int32(tp * 16) + lane_row
+                for ks in range_constexpr(K_STEPS):
+                    chunk = fx.Int32(ks * 4) + lane_kg
+                    slab_idx = wave_slab + col_in_slab * ROW_I64 + chunk
+                    b_frag[tp][ks] = fx.memref_load(kv_sh, slab_idx)
+
+            # ---- per row: MFMA (reusing staged KV) + reduce + store ----
+            for j in range_constexpr(ROWS):
+                accs = [[None] * M_TILES for _ in range(TPW)]
+                for tp in range_constexpr(TPW):
+                    for mt in range_constexpr(M_TILES):
+                        accs[tp][mt] = arith.constant_vector(0.0, T.f32x4)
+                for ks in range_constexpr(K_STEPS):
+                    for tp in range_constexpr(TPW):
+                        for mt in range_constexpr(M_TILES):
+                            accs[tp][mt] = rocdl.mfma_f32_16x16x32_fp8_fp8(
+                                T.f32x4,
+                                [fx.arith._to_raw(q_frag[j][mt][ks]),
+                                 fx.arith._to_raw(b_frag[tp][ks]),
+                                 fx.arith._to_raw(accs[tp][mt]), 0, 0, 0])
+                for tp in range_constexpr(TPW):
+                    col = cols[tp]
+                    in_window = (col >= starts[j]) & (col < ends[j])
+                    partial = fx.Float32(0.0)
+                    for mt in range_constexpr(M_TILES):
+                        accv = fx.Vector(accs[tp][mt])
+                        for i in range_constexpr(4):
+                            sc = accv[i] * kvsc[tp]
+                            sc = sc.maximumf(fx.Float32(0.0))
+                            sc = sc * wvals[j][mt][i]
+                            partial = partial + sc
+                    r = partial
+                    r = r + r.shuffle_xor(16, WAVE)
+                    r = r + r.shuffle_xor(32, WAVE)
+                    if lane_kg == fx.Int32(0):
+                        if in_window:
+                            fx.memref_store(r, OUT_buf, out_base[j] + col)
+
+            # Per-wave-private slab: next iteration's staging waits on this
+            # iteration's reads via the compiler's lds waitcnt (no barrier).
+            if const_expr(_USE_LDS_BARRIER):
+                gpu.barrier()
+            _next = yield [_state[0] + fx.Int32(1)]
+
+    @flyc.jit
+    def launch(
+        Q: fx.Tensor,
+        KV: fx.Tensor,
+        KVSCALE: fx.Tensor,
+        W: fx.Tensor,
+        STARTS: fx.Tensor,
+        ENDS: fx.Tensor,
+        OUT: fx.Tensor,
+        n_blocks: int,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        l = mqa_logits_kernel(Q, KV, KVSCALE, W, STARTS, ENDS, OUT)
+        l.launch(grid=(n_blocks, 1, 1), block=(_GEAK_BLOCK_THREADS, 1, 1), stream=stream)
+
+    return launch
+
+
+class _GeakLauncher:
+    """Registry-compatible adapter around the standalone ``build_mqa_logits``.
+
+    The GEAK kernel was written with its own ABI: it takes ``Q``/``KV`` as i64
+    views (8 fp8 packed per i64), flattened ``W``/``OUT`` (``M*NUM_HEADS`` /
+    ``M*S_K``), per-row ``STARTS``/``ENDS``, and a ``n_blocks`` launch argument;
+    it also bakes ``S_K`` into the kernel (it must be a multiple of
+    ``COLS_PER_BLOCK``) and assumes one block per ``ROWS_PER_BLOCK`` query rows.
+
+    The rest of this module (``flydsl_fp8_mqa_logits`` -> ``_run_compiled``)
+    drives every variant through the common ABI
+
+        launcher(Q, KV, kv_scales, weights, cu_starts, cu_ends, logits,
+                 seq_len, seq_len_kv, out_stride, stream)
+
+    with raw fp8 ``Q``/``KV`` and a (possibly non-contiguous) ``logits`` slice.
+    This adapter bridges the two: it reinterprets the fp8 tensors as i64,
+    flattens the f32 inputs, pads ``S_K``/rows to the kernel's tiling, runs the
+    GEAK kernel into a contiguous padded scratch buffer, and copies the valid
+    region back into ``logits``. One compiled ``launch`` is cached per padded
+    ``S_K`` (``S_K`` is a compile-time constant of the GEAK kernel).
+    """
+
+    # Tells flydsl_fp8_mqa_logits to invoke us directly (we own the GEAK ABI &
+    # compilation) instead of routing through _run_compiled.
+    _is_adapter = True
+
+    def __init__(self, *, num_heads: int, head_size: int):
+        # The GEAK kernel hard-codes NUM_HEADS=64 / HEAD_DIM=128 (and the MFMA
+        # fragment + LDS layout depend on it), so reject other shapes loudly
+        # rather than silently miscomputing.
+        if num_heads != NUM_HEADS or head_size != HEAD_DIM:
+            raise NotImplementedError(
+                f"geak fp8_mqa_logits variant only supports "
+                f"num_heads={NUM_HEADS}, head_size={HEAD_DIM}; "
+                f"got num_heads={num_heads}, head_size={head_size}."
+            )
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.compile_hints = None
+        self._by_skv = {}  # padded_S_K -> compiled geak launch
+
+    def _launch_for(self, padded_skv):
+        launch = self._by_skv.get(padded_skv)
+        if launch is None:
+            launch = build_mqa_logits(padded_skv)
+            if self.compile_hints is not None:
+                launch.compile_hints = dict(self.compile_hints)
+            self._by_skv[padded_skv] = launch
+        return launch
+
+    def __call__(
+        self,
+        Q,
+        KV,
+        kv_scales,
+        weights,
+        cu_starts,
+        cu_ends,
+        logits,
+        seq_len,
+        seq_len_kv,
+        out_stride,
+        stream,
+    ):
+        # Pad S_K up to the kernel's column-block granularity, and rows up to
+        # ROWS_PER_BLOCK so the grid covers every query row.
+        padded_skv = (
+            (seq_len_kv + COLS_PER_BLOCK - 1) // COLS_PER_BLOCK * COLS_PER_BLOCK
+        )
+        padded_rows = (
+            (seq_len + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK * ROWS_PER_BLOCK
+        )
+        n_blocks = padded_rows // ROWS_PER_BLOCK
+
+        device = Q.device
+        H = self.num_heads
+        aligned = padded_skv == seq_len_kv and padded_rows == seq_len
+
+        # fp8 -> i64 views (8 fp8 per i64). Both operands must be contiguous so
+        # the flat i64 reinterpretation matches the kernel's index math.
+        # ``.contiguous()`` is a no-op when the input already is (the common
+        # case), so this does not copy on the hot path.
+        q_i64 = Q.contiguous().view(torch.int64).reshape(-1)
+        kv_c = KV.contiguous()
+        if padded_skv != seq_len_kv:
+            kv_pad = torch.empty(
+                (padded_skv, self.head_size), dtype=KV.dtype, device=device
+            )
+            kv_pad[:seq_len_kv] = kv_c  # tail rows masked out by window test
+            kv_c = kv_pad
+        kv_i64 = kv_c.view(torch.int64).reshape(-1)
+
+        # kv_scales padded to padded_skv (padding columns are masked out by the
+        # window test, so their scale value is irrelevant).
+        if padded_skv != seq_len_kv:
+            ks = torch.empty(padded_skv, dtype=torch.float32, device=device)
+            ks[:seq_len_kv] = kv_scales
+        else:
+            ks = kv_scales.contiguous()
+
+        # weights flattened to [M*NUM_HEADS]; pad rows if needed.
+        w = weights.contiguous()
+        if padded_rows != seq_len:
+            w_pad = torch.empty((padded_rows, H), dtype=torch.float32, device=device)
+            w_pad[:seq_len] = w
+            w = w_pad
+        w = w.reshape(-1)
+
+        # starts/ends padded to padded_rows. Padding rows get an empty window
+        # (start==end==0) so they store nothing.
+        st = cu_starts.contiguous()
+        en = cu_ends.contiguous()
+        if padded_rows != seq_len:
+            st_pad = torch.zeros(padded_rows, dtype=torch.int32, device=device)
+            en_pad = torch.zeros(padded_rows, dtype=torch.int32, device=device)
+            st_pad[:seq_len] = st
+            en_pad[:seq_len] = en
+            st, en = st_pad, en_pad
+
+        launch = self._launch_for(padded_skv)
+
+        # Fast path: when no S_K/row padding is needed AND the caller's ``logits``
+        # is already contiguous with row stride == padded_skv, the kernel can
+        # write straight into it -- the kernel only touches each row's window and
+        # the host already prefilled the rest (-inf for clean_logits). This
+        # avoids a full-size scratch alloc + two full-size copies per call, which
+        # otherwise added ~20-30% to the measured time.
+        if aligned and logits.is_contiguous() and logits.stride(0) == padded_skv:
+            _run_compiled(
+                launch, q_i64, kv_i64, ks, w, st, en, logits.reshape(-1),
+                int(n_blocks), stream,
+            )
+            return logits
+
+        # Slow path (S_K/row padding or a non-contiguous logits slice): run into
+        # a contiguous padded scratch, then copy the valid region back. The
+        # untouched scratch cells must match the caller's logits (-inf for
+        # clean_logits), so seed them; the kernel overwrites the in-window cells.
+        out = torch.empty(
+            (padded_rows, padded_skv), dtype=torch.float32, device=device
+        )
+        out[:seq_len, :seq_len_kv] = logits
+        _run_compiled(
+            launch, q_i64, kv_i64, ks, w, st, en, out.reshape(-1),
+            int(n_blocks), stream,
+        )
+        logits.copy_(out[:seq_len, :seq_len_kv])
+        return logits
+
+
+def _build_kernel_geak(*, num_heads: int, head_size: int, block_kv: int):
+    """Registry builder for the GEAK-optimized variant.
+
+    Returns a ``_GeakLauncher`` adapter exposing the common variant ABI (see the
+    class docstring). ``block_kv`` is accepted for signature compatibility but
+    the GEAK kernel uses its own internal column-block tiling.
+    """
+    return _GeakLauncher(num_heads=num_heads, head_size=head_size)
+
+
 # --------------------------------------------------------------------------- #
 # Kernel-variant registry.
 #
@@ -505,6 +896,7 @@ def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int):
 _VARIANT_BUILDERS = {
     "scalar": _build_kernel,
     "mfma": _build_kernel_mfma,
+    "geak": _build_kernel_geak,
 }
 
 # Order matters: the first available tag is the default.
@@ -662,8 +1054,13 @@ def flydsl_fp8_mqa_logits(
         stream = torch.cuda.current_stream()
 
     with torch.cuda.device(Q.device.index):
-        _run_compiled(
-            launcher,
+        # Adapter launchers (e.g. the GEAK variant) implement the common ABI
+        # directly and own their own compilation; the plain @flyc.jit launchers
+        # are compiled+dispatched via _run_compiled.
+        run = launcher if getattr(launcher, "_is_adapter", False) else _run_compiled
+        args = () if run is launcher else (launcher,)
+        run(
+            *args,
             Q,
             KV,
             kv_scales,

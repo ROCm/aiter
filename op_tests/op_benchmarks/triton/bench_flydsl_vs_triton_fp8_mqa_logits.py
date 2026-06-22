@@ -100,6 +100,16 @@ def _time_ms(func, warmup=25, rep=100):
 # Each entry: (batch_size, seq_q_l, seq_kv_l, num_heads_q, head_dim).
 # Covers both head counts the ticket calls out (H in {64, 128}) at D=128,
 # square + rectangular windows, plus a non-aligned s_kv "tail" shape.
+#
+# Caveats for the long-ISL shapes:
+#   * The torch reference OOMs (it materializes a dense [s_q, s_kv, H] tensor:
+#     256 GiB at 32k), so --verify automatically falls back to grading against
+#     the Triton kernel (itself validated vs torch where torch fits). Those
+#     grades are suffixed "*" (e.g. PASS*) and Triton is shown as "REF".
+#   * The geak variant indexes with int32 and writes a dense logits buffer, so it
+#     is limited to outputs with < 2^31 elements (~32k square is the practical
+#     ceiling); larger square shapes overflow FlyDSL's argument packing. In real
+#     serving the dense logits are never materialized at once.
 PRESET_SHAPES = [
     # H = 64
     (1, 1024, 1024, 64, 128),
@@ -108,6 +118,10 @@ PRESET_SHAPES = [
     (1, 1024, 4096, 64, 128),
     (1, 4096, 16384, 64, 128),
     (1, 4096, 16000, 64, 128),  # non-aligned s_kv (tail)
+    # H = 64, long-ISL prefill (square; run without --verify, see note above)
+    (1, 8192, 8192, 64, 128),
+    (1, 16384, 16384, 64, 128),
+    (1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
     # H = 128
     (1, 1024, 1024, 128, 128),
     (1, 2048, 2048, 128, 128),
@@ -273,22 +287,49 @@ def _run_one(idx, impls, shape, args):
 
 
 def _verify(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shape):
-    """Grade every implementation against the pure-PyTorch reference.
+    """Grade every implementation against a reference.
 
-    ``ref_fp8_mqa_logits`` (the DeepGEMM-derived torch implementation, also used
-    by the unit test) is the ground truth so Triton and FlyDSL are each
-    validated independently. Returns {impl_name: "PASS"|"FAIL"|"SKIP"}.
+    The primary ground truth is ``ref_fp8_mqa_logits`` (the DeepGEMM-derived
+    torch implementation, also used by the unit test). It materializes a dense
+    ``[s_q, s_kv, H]`` tensor, which OOMs at long ISL (256 GiB at 32k). In that
+    case we fall back to the **Triton** kernel as the reference. 
+    Grades against the Triton reference are suffixed ``*`` to flag the
+    weaker check, and Triton (when present) is marked ``REF`` since it can't be
+    graded against itself.
+
+    Returns {impl_name: "PASS"|"FAIL"|"SKIP"|"PASS*"|"FAIL*"|"REF"|"OOM"}.
     """
     from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
         calc_diff,
         ref_fp8_mqa_logits,
     )
 
-    ref, _ = ref_fp8_mqa_logits(
-        q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
-    )
+    ref_is_triton = False
+    try:
+        ref, _ = ref_fp8_mqa_logits(
+            q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke
+        )
+    except torch.OutOfMemoryError:
+        # Torch reference OOMs at long ISL (dense [s_q, s_kv, H]). Fall back to
+        # the Triton kernel as the reference -- it's validated vs torch wherever
+        # torch fits. If Triton itself OOMs too, give up and report OOM.
+        torch.cuda.empty_cache()
+        try:
+            ref = triton_logits(
+                q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits
+            )
+            ref_is_triton = True
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return {name: "OOM" for name in impls}
+
+    suffix = "*" if ref_is_triton else ""
     status = {}
     for name, fn in impls.items():
+        # Triton can't be graded against a Triton reference (it'd be exact).
+        if ref_is_triton and name == "triton":
+            status[name] = "REF"
+            continue
         try:
             out = fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)
         except NotImplementedError:
@@ -296,7 +337,7 @@ def _verify(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shape):
             continue
         m = (ref == float("-inf")) | (out == float("-inf"))
         diff = calc_diff(out.masked_fill(m, 0), ref.masked_fill(m, 0))
-        status[name] = "PASS" if diff < 1e-3 else "FAIL"
+        status[name] = ("PASS" if diff < 1e-3 else "FAIL") + suffix
     return status
 
 
@@ -552,7 +593,7 @@ def main():
         metavar="V1,V2,...",
         help=(
             "comma-separated FlyDSL kernel-version tags to benchmark, each as its "
-            "own column (default: the baseline variant). See --list-variants."
+            "own column (default: all registered variants). See --list-variants."
         ),
     )
     p.add_argument(
@@ -599,15 +640,16 @@ def main():
                 print(f"  {'*' if v == default else ' '} {v}")
         return
 
-    # Resolve the requested FlyDSL variants (comma list), defaulting to the
-    # baseline. Validation against what's actually registered happens in
-    # _select_impls so an unavailable-FlyDSL run still works for --impl triton.
+    # Resolve the requested FlyDSL variants (comma list), defaulting to all
+    # registered variants so new entries (e.g. "geak") appear automatically.
+    # Validation against what's actually registered happens in _select_impls so
+    # an unavailable-FlyDSL run still works for --impl triton.
     if args.flydsl_variants:
         args.flydsl_variants = [
             v.strip() for v in args.flydsl_variants.split(",") if v.strip()
         ]
     else:
-        args.flydsl_variants = [default] if default is not None else []
+        args.flydsl_variants = list(avail) if avail is not None else []
 
     run(args)
 
