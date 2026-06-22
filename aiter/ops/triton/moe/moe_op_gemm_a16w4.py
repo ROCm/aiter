@@ -62,7 +62,6 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config_triton(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -73,7 +72,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
     block_k = 256
 
     if block_m == 16:
-        block_n = 256
+        block_n = 128
         num_warps = 4
 
         grid_m = routing_data.n_blocks(m, block_m)
@@ -88,17 +87,17 @@ def get_kernel_config_triton(m, n, k, routing_data):
     elif block_m == 32:
         if n <= 1024:
             block_n = 128
-            num_warps = 2
+            num_warps = 4
         elif n <= 4096:
             block_n = 256
-            num_warps = 4
+            num_warps = 8
         else:
-            block_n = 256
-            num_warps = 4
+            block_n = 512
+            num_warps = 8
 
     else:
-        block_n = 256
-        num_warps = 4
+        block_n = 512
+        num_warps = 8
 
     ret = {
         "block_m": block_m,
@@ -114,7 +113,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
-    return ret
+    return 
 
 
 def get_kernel_config_gluon(m, n, k, routing_data):
