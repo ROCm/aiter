@@ -60,7 +60,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
     )
-    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", 128))
+    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", -1))
 
     def __init__(
         self,
@@ -278,10 +278,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         can_use_custom_ar = (
             ca_comm is not None and not ca_comm.disabled and can_use_fuse_ar_rms
         )
+        total_bytes_limit = (
+            self._ar_1stage_max_kb
+            if self._ar_1stage_max_kb >= 0
+            else self.world_size * 32 * 1024
+        )
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else (total_bytes <= self.world_size * 32 * 1024)
+            else (total_bytes <= total_bytes_limit)
         )
         if (
             not use_general_path
@@ -418,10 +423,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and total_bytes <= 4096 * 1024
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
+            total_bytes_limit = (
+                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+            )
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= self._ar_1stage_max_kb * 1024)
+                else (total_bytes <= total_bytes_limit)
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
@@ -467,10 +475,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and self.world_size != 6
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
+            total_bytes_limit = (
+                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+            )
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= self._ar_1stage_max_kb * 1024)
+                else (total_bytes <= total_bytes_limit)
             )
             try:
                 result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
