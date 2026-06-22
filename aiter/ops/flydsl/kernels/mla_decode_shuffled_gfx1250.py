@@ -340,9 +340,6 @@ def compile_mla_decode_main(
         stride_bt_seq = max_blocks
 
         bt_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_block_tables, arch=gpu_arch)
-        out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
-        ml_rsrc = buffer_ops.create_buffer_resource(arg_max_logits, max_size=True)
-        es_rsrc = buffer_ops.create_buffer_resource(arg_exp_sums, max_size=True)
 
         base = allocator.get_base()
         q_lora_lds = SmemPtr(base, q_lora_off, elem_ty, shape=(q_lora_elems,))
@@ -711,6 +708,10 @@ def compile_mla_decode_main(
             l_final.append(fx.Float32(results[si])); si += 1
             pv_final.append([fx.Vector(v) for v in results[si : si + P]]); si += P
 
+        out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
+        ml_rsrc = buffer_ops.create_buffer_resource(arg_max_logits, max_size=True)
+        es_rsrc = buffer_ops.create_buffer_resource(arg_exp_sums, max_size=True)
+
         out_base = seq_idx * stride_o_seq + seg_idx * stride_o_seg
         lse_base = seq_idx * stride_lse_seq + seg_idx * stride_lse_seg
 
@@ -855,11 +856,11 @@ def compile_mla_decode_reduce(
         # Re-derive the main kernel's tiling to learn how many segments actually produced partials.
         # num_segs_actual = ceil(num_tiles / tiles_per_seg) = number of live partition slots.
         KVC = fx.Index(KV_COMPUTE_BLOCK_SIZE)
-        num_tiles = (seq_len + KVC - fx.Index(1)) / KVC
-        tiles_per_seg = (num_tiles + fx.Index(NUM_SEGS) - fx.Index(1)) / fx.Index(NUM_SEGS)
+        num_tiles = (seq_len + KVC - fx.Index(1)) // KVC
+        tiles_per_seg = (num_tiles + fx.Index(NUM_SEGS) - fx.Index(1)) // fx.Index(NUM_SEGS)
         nonzero_tps = tiles_per_seg > fx.Index(0)
         tiles_per_seg = arith.select(nonzero_tps, tiles_per_seg, fx.Index(1))
-        num_segs_actual = (num_tiles + tiles_per_seg - fx.Index(1)) / tiles_per_seg
+        num_segs_actual = (num_tiles + tiles_per_seg - fx.Index(1)) // tiles_per_seg
 
         stride_tmp_seq = fx.Index(NUM_SEGS * NUM_Q_HEADS * V_HEAD_DIM)
         stride_tmp_seg = fx.Index(NUM_Q_HEADS * V_HEAD_DIM)
