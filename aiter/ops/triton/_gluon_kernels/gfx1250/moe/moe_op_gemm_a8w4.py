@@ -84,7 +84,22 @@ def unswizzle_mx_scale_gfx1250(
     return scale_buffer_slice
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata, do_not_specialize=["num_tokens"])
+def kernel_repr_decode_fn():
+    def _repr(specialization):
+        constants = specialization.constants
+        gather_indx = constants.get("gather_indx", None)
+        if gather_indx is not None:
+            return "_moe_gemm_a8w4_layer1_decode"
+        else:
+            return "_moe_gemm_a8w4_layer2_decode"
+
+    return _repr
+
+
+kernel_repr_decode = kernel_repr_decode_fn()
+
+
+@gluon.jit(repr=kernel_repr_decode, launch_metadata=matmul_launch_metadata, do_not_specialize=["num_tokens"])
 def _moe_gemm_a8w4_decode(
     Y,
     stride_y_m,
