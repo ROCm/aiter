@@ -14,7 +14,7 @@ Tensor layout: NHWC bf16.  The kernel requires padded tensors:
 This module handles padding/packing transparently.
 """
 
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -28,13 +28,22 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 def _gen_conv2d_fake(
-    input: Tensor, weight: Tensor, output: Tensor,
-    N_batch: int, C: int, K: int,
-    Hi: int, Wi: int,
-    R: int, S: int,
-    pad_h: int, pad_w: int,
-    stride_h: int, stride_w: int,
-    dil_h: int, dil_w: int,
+    input: Tensor,
+    weight: Tensor,
+    output: Tensor,
+    N_batch: int,
+    C: int,
+    K: int,
+    Hi: int,
+    Wi: int,
+    R: int,
+    S: int,
+    pad_h: int,
+    pad_w: int,
+    stride_h: int,
+    stride_w: int,
+    dil_h: int,
+    dil_w: int,
     group: int,
 ) -> Tensor:
     return output
@@ -47,13 +56,22 @@ def _gen_conv2d_fake(
     develop=True,
 )
 def _opus_conv2d_implicit_raw(
-    input: Tensor, weight: Tensor, output: Tensor,
-    N_batch: int, C: int, K: int,
-    Hi: int, Wi: int,
-    R: int, S: int,
-    pad_h: int, pad_w: int,
-    stride_h: int, stride_w: int,
-    dil_h: int, dil_w: int,
+    input: Tensor,
+    weight: Tensor,
+    output: Tensor,
+    N_batch: int,
+    C: int,
+    K: int,
+    Hi: int,
+    Wi: int,
+    R: int,
+    S: int,
+    pad_h: int,
+    pad_w: int,
+    stride_h: int,
+    stride_w: int,
+    dil_h: int,
+    dil_w: int,
     group: int,
 ) -> Tensor: ...
 
@@ -67,8 +85,14 @@ def _pad_input(x: Tensor, C: int, C_pad: int) -> Tensor:
 
 def _pack_weight_rsc(
     weight: Tensor,
-    K: int, R: int, S: int, Cpg: int,
-    group: int, Kpg_pad: int, GEMM_K_pad: int, Cpg_pad: int,
+    K: int,
+    R: int,
+    S: int,
+    Cpg: int,
+    group: int,
+    Kpg_pad: int,
+    GEMM_K_pad: int,
+    Cpg_pad: int,
 ) -> Tensor:
     """Pack weight [K, R, S, Cpg] -> [group, Kpg_pad, GEMM_K_pad] in RSC order with padding."""
     Kpg = K // group
@@ -86,12 +110,17 @@ def _pack_weight_rsc(
 
 def _pack_weight_rsc_vectorized(
     weight: Tensor,
-    K: int, R: int, S: int, Cpg: int,
-    group: int, Kpg_pad: int, GEMM_K_pad: int, Cpg_pad: int,
+    K: int,
+    R: int,
+    S: int,
+    Cpg: int,
+    group: int,
+    Kpg_pad: int,
+    GEMM_K_pad: int,
+    Cpg_pad: int,
 ) -> Tensor:
     """Vectorized weight packing: [K, R, S, Cpg] -> [group, Kpg_pad, GEMM_K_pad]."""
     Kpg = K // group
-    device = weight.device
 
     # weight is [K, R, S, Cpg] = [group*Kpg, R, S, Cpg]
     # reshape to [group, Kpg, R, S, Cpg]
@@ -182,9 +211,23 @@ def conv2d_implicit_opus(
     output = torch.zeros(M, stride_out, dtype=input.dtype, device=input.device)
 
     _opus_conv2d_implicit_raw(
-        input_padded, weight_packed, output,
-        N, C, K, Hi, Wi, R, S,
-        pad_h, pad_w, stride_h, stride_w, dil_h, dil_w, groups,
+        input_padded,
+        weight_packed,
+        output,
+        N,
+        C,
+        K,
+        Hi,
+        Wi,
+        R,
+        S,
+        pad_h,
+        pad_w,
+        stride_h,
+        stride_w,
+        dil_h,
+        dil_w,
+        groups,
     )
 
     # Extract real output: [M, group*Kpg_pad] -> [N, Ho, Wo, K]

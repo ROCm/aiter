@@ -9,7 +9,6 @@ Usage:
 """
 
 import sys
-import time
 import argparse
 
 import torch
@@ -32,7 +31,9 @@ def _torch_ref_nhwc(input_nhwc, weight_nhwc, stride, padding, dilation, groups):
     x = input_nhwc.float().permute(0, 3, 1, 2).contiguous()
     # weight: [K, R, S, Cpg] -> [K, Cpg, R, S]
     w = weight_nhwc.float().permute(0, 3, 1, 2).contiguous()
-    out_nchw = F.conv2d(x, w, stride=stride, padding=padding, dilation=dilation, groups=groups)
+    out_nchw = F.conv2d(
+        x, w, stride=stride, padding=padding, dilation=dilation, groups=groups
+    )
     # [N, K, Ho, Wo] -> [N, Ho, Wo, K]
     return out_nchw.permute(0, 2, 3, 1).contiguous()
 
@@ -68,23 +69,23 @@ def _bench_us(fn, *args, warmup=5, iters=50, **kwargs):
 # ---- Test cases (from PoC) ----
 CORRECTNESS_CASES = [
     # (N, C, K, Hi, Wi, R, S, pad_h, pad_w, stride_h, stride_w, dil_h, dil_w, group, name)
-    (1, 16,  64, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1, 1, "3x3_basic"),
+    (1, 16, 64, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1, 1, "3x3_basic"),
     (2, 32, 128, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1, 1, "3x3_larger"),
-    (1, 64,  64,  8,  8, 3, 3, 1, 1, 1, 1, 1, 1, 1, "3x3_small"),
-    (2, 32,  64, 16, 16, 3, 3, 1, 1, 2, 2, 1, 1, 1, "3x3_s2"),
-    (1, 32,  64, 16, 16, 3, 3, 2, 2, 1, 1, 2, 2, 1, "3x3_d2"),
-    (1, 64, 128,  8,  8, 1, 1, 0, 0, 1, 1, 1, 1, 1, "1x1"),
-    (2, 16,  32, 32, 32, 5, 5, 2, 2, 1, 1, 1, 1, 1, "5x5"),
-    (1, 64,  64, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1, 4, "3x3_group4"),
-    (2, 32,  64, 16, 16, 3, 3, 0, 0, 1, 1, 1, 1, 1, "3x3_no_pad"),
+    (1, 64, 64, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 1, "3x3_small"),
+    (2, 32, 64, 16, 16, 3, 3, 1, 1, 2, 2, 1, 1, 1, "3x3_s2"),
+    (1, 32, 64, 16, 16, 3, 3, 2, 2, 1, 1, 2, 2, 1, "3x3_d2"),
+    (1, 64, 128, 8, 8, 1, 1, 0, 0, 1, 1, 1, 1, 1, "1x1"),
+    (2, 16, 32, 32, 32, 5, 5, 2, 2, 1, 1, 1, 1, 1, "5x5"),
+    (1, 64, 64, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1, 4, "3x3_group4"),
+    (2, 32, 64, 16, 16, 3, 3, 0, 0, 1, 1, 1, 1, 1, "3x3_no_pad"),
 ]
 
 BENCH_CASES = [
-    (2,  64,  64, 56, 56, 3, 3, 1, 1, 1, 1, 1, 1, 1, "ResNet-3x3-56"),
+    (2, 64, 64, 56, 56, 3, 3, 1, 1, 1, 1, 1, 1, 1, "ResNet-3x3-56"),
     (2, 128, 128, 28, 28, 3, 3, 1, 1, 1, 1, 1, 1, 1, "ResNet-3x3-28"),
     (2, 256, 256, 14, 14, 3, 3, 1, 1, 1, 1, 1, 1, 1, "ResNet-3x3-14"),
-    (2, 512, 512,  7,  7, 3, 3, 1, 1, 1, 1, 1, 1, 1, "ResNet-3x3-7"),
-    (2,  64, 256, 56, 56, 1, 1, 0, 0, 1, 1, 1, 1, 1, "ResNet-1x1-56"),
+    (2, 512, 512, 7, 7, 3, 3, 1, 1, 1, 1, 1, 1, 1, "ResNet-3x3-7"),
+    (2, 64, 256, 56, 56, 1, 1, 0, 0, 1, 1, 1, 1, 1, "ResNet-1x1-56"),
     (2, 256, 512, 28, 28, 1, 1, 0, 0, 1, 1, 1, 1, 1, "ResNet-1x1-28"),
 ]
 
@@ -101,10 +102,12 @@ def run_correctness():
         x = (torch.randn(N, Hi, Wi, C, device="cuda") * 0.3).to(torch.bfloat16)
         w = (torch.randn(K, R, S, Cpg, device="cuda") * 0.3).to(torch.bfloat16)
 
-        ref = _torch_ref_nhwc(x, w, stride=(sh, sw), padding=(ph, pw),
-                              dilation=(dh, dw), groups=g)
-        got = conv2d_implicit_opus(x, w, stride=(sh, sw), padding=(ph, pw),
-                                   dilation=(dh, dw), groups=g)
+        ref = _torch_ref_nhwc(
+            x, w, stride=(sh, sw), padding=(ph, pw), dilation=(dh, dw), groups=g
+        )
+        got = conv2d_implicit_opus(
+            x, w, stride=(sh, sw), padding=(ph, pw), dilation=(dh, dw), groups=g
+        )
 
         if _check_close(got, ref, name):
             passed += 1
@@ -128,9 +131,15 @@ def run_benchmark():
         x = (torch.randn(N, Hi, Wi, C, device="cuda") * 0.3).to(torch.bfloat16)
         w = (torch.randn(K, R, S, Cpg, device="cuda") * 0.3).to(torch.bfloat16)
 
-        us = _bench_us(conv2d_implicit_opus, x, w,
-                       stride=(sh, sw), padding=(ph, pw),
-                       dilation=(dh, dw), groups=g)
+        us = _bench_us(
+            conv2d_implicit_opus,
+            x,
+            w,
+            stride=(sh, sw),
+            padding=(ph, pw),
+            dilation=(dh, dw),
+            groups=g,
+        )
 
         flops = 2.0 * N * K * Ho * Wo * Cpg * R * S
         tflops = flops / (us * 1e-6) / 1e12
@@ -141,7 +150,9 @@ def run_benchmark():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bench", action="store_true", help="Run benchmark after correctness")
+    parser.add_argument(
+        "--bench", action="store_true", help="Run benchmark after correctness"
+    )
     args = parser.parse_args()
 
     all_pass = run_correctness()
