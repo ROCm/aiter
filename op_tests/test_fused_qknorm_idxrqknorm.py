@@ -245,13 +245,174 @@ def make_shuffle_caches(case: dict, *, kv_cache_dtype: Optional[torch.dtype] = N
     bs = case["block_size"]
     nb = case["num_blocks"]
     assert HEAD_DIM % x == 0 and bs % x == 0
-    kv_cache_k = torch.zeros(
-        nb, nkv, HEAD_DIM // x, bs, x, dtype=dtype, device="cuda"
-    )
-    kv_cache_v = torch.zeros(
-        nb, nkv, bs // x, HEAD_DIM, x, dtype=dtype, device="cuda"
-    )
+    kv_cache_k = torch.zeros(nb, nkv, HEAD_DIM // x, bs, x, dtype=dtype, device="cuda")
+    kv_cache_v = torch.zeros(nb, nkv, bs // x, HEAD_DIM, x, dtype=dtype, device="cuda")
     return kv_cache_k, kv_cache_v
+
+
+def make_pertoken_scales(case: dict, *, asm_layout: bool):
+    """Allocate per-token dynamic-quant OUTPUT dequant-scale tensors.
+
+    Layout mirrors reshape_and_cache_with_pertoken_quant:
+      asm_layout : [num_blocks, num_kv_heads, block_size]
+      page-128   : [num_kv_heads, max_kv_tokens]  (max_kv_tokens = num_blocks*block_size)
+    """
+    nkv = case["num_kv_heads"]
+    nb = case["num_blocks"]
+    bs = case["block_size"]
+    if asm_layout:
+        shape = (nb, nkv, bs)
+    else:
+        shape = (nkv, nb * bs)
+    k_scale = torch.zeros(shape, dtype=torch.float32, device="cuda")
+    v_scale = torch.zeros(shape, dtype=torch.float32, device="cuda")
+    return k_scale, v_scale
+
+
+def pertoken_scale_at(
+    scale: torch.Tensor, *, asm_layout: bool, slot: int, head: int, block_size: int
+) -> torch.Tensor:
+    """Read one (token-slot, head) scalar from a per-token scale tensor."""
+    if asm_layout:
+        block, offset = divmod(slot, block_size)
+        return scale[block, head, offset]
+    return scale[head, slot]
+
+
+def pertoken_quant_ref(x: torch.Tensor):
+    """Per-token (per head-dim row) dynamic fp8 quant reference.
+
+    x: [..., head_dim] float. Returns (dequant, scale) where
+       scale = amax/448, dequant = round_to_fp8(x/scale)*scale.
+    """
+    fp8_dtype = fp8_cache_dtype()
+    assert fp8_dtype is not None
+    amax = x.float().abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
+    deq = (x.float() / scale).to(fp8_dtype).float() * scale
+    return deq, scale.squeeze(-1)
+
+
+def gather_shuffle_k_row(
+    kv_cache_k: torch.Tensor, slot: int, head: int, block_size: int
+) -> torch.Tensor:
+    """Read one (token-slot, head) K head-dim row from a SHUFFLE K cache
+    [num_blocks, num_kv_heads, head_dim/x, block_size, x]."""
+    nb, nkv, hd_over_x, bs, x = kv_cache_k.shape
+    head_dim = hd_over_x * x
+    block, offset = divmod(slot, block_size)
+    row = torch.empty(head_dim, dtype=kv_cache_k.dtype, device=kv_cache_k.device)
+    for d in range(head_dim):
+        row[d] = kv_cache_k[block, head, d // x, offset, d % x]
+    return row
+
+
+def gather_shuffle_v_row(
+    kv_cache_v: torch.Tensor, slot: int, head: int, block_size: int
+) -> torch.Tensor:
+    """Read one (token-slot, head) V head-dim row from a SHUFFLE V cache
+    [num_blocks, num_kv_heads, block_size/x, head_dim, x]."""
+    nb, nkv, bs_over_x, head_dim, x = kv_cache_v.shape
+    block, offset = divmod(slot, block_size)
+    row = torch.empty(head_dim, dtype=kv_cache_v.dtype, device=kv_cache_v.device)
+    for d in range(head_dim):
+        row[d] = kv_cache_v[block, head, offset // x, d, offset % x]
+    return row
+
+
+def check_pertoken_fp8(
+    case: dict,
+    refs: dict,
+    kv_cache: torch.Tensor,
+    kv_cache_k: torch.Tensor,
+    kv_cache_v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    *,
+    asm_layout: bool,
+    msg: str,
+):
+    """Validate per-token dynamic-quant fp8 K/V caches + emitted dequant scales."""
+    block_size = case["block_size"]
+    num_kv_heads = case["num_kv_heads"]
+    num_tokens = case["qkv"].size(0)
+
+    k_ref = refs["k"]  # [tokens, nkv, hd] post norm+rope
+    v_ref = refs["v"]  # [tokens, nkv, hd] raw
+
+    cos_acc = []
+    cos_min = 1.0
+    for token in range(num_tokens):
+        slot = case["slot_mapping"][token].item()
+        for head in range(num_kv_heads):
+            kref_row = k_ref[token, head].float()
+            vref_row = v_ref[token, head].float()
+            k_deq_ref, k_scale_ref = pertoken_quant_ref(kref_row)
+            v_deq_ref, v_scale_ref = pertoken_quant_ref(vref_row)
+
+            # emitted per-token scales must equal amax/448
+            k_scale_act = pertoken_scale_at(
+                k_scale,
+                asm_layout=asm_layout,
+                slot=slot,
+                head=head,
+                block_size=block_size,
+            )
+            v_scale_act = pertoken_scale_at(
+                v_scale,
+                asm_layout=asm_layout,
+                slot=slot,
+                head=head,
+                block_size=block_size,
+            )
+            check_close(
+                k_scale_act.reshape(1),
+                k_scale_ref.reshape(1),
+                msg=f"{msg}(k_scale tok{token} h{head})",
+                rtol=1e-3,
+                atol=1e-3,
+            )
+            check_close(
+                v_scale_act.reshape(1),
+                v_scale_ref.reshape(1),
+                msg=f"{msg}(v_scale tok{token} h{head})",
+                rtol=1e-3,
+                atol=1e-3,
+            )
+
+            # read cache row + dequant by emitted per-token scale
+            if asm_layout:
+                k_raw = gather_shuffle_k_row(kv_cache_k, slot, head, block_size)
+                v_raw = gather_shuffle_v_row(kv_cache_v, slot, head, block_size)
+            else:
+                block, offset = divmod(slot, block_size)
+                k_raw = kv_cache[block, 0, offset, head]
+                v_raw = kv_cache[block, 1, offset, head]
+            k_deq_act = maybe_view_fp8(k_raw).float() * k_scale_act
+            v_deq_act = maybe_view_fp8(v_raw).float() * v_scale_act
+
+            check_close(
+                k_deq_act,
+                k_deq_ref,
+                msg=f"{msg}(k_cache tok{token} h{head})",
+                rtol=0.1,
+                atol=0.1,
+            )
+            check_close(
+                v_deq_act,
+                v_deq_ref,
+                msg=f"{msg}(v_cache tok{token} h{head})",
+                rtol=0.1,
+                atol=0.1,
+            )
+            for a, b in ((k_deq_act, kref_row), (v_deq_act, vref_row)):
+                cos = torch.nn.functional.cosine_similarity(
+                    a.reshape(1, -1), b.reshape(1, -1)
+                ).item()
+                cos_acc.append(cos)
+                cos_min = min(cos_min, cos)
+    aiter.logger.info("%s pertoken fp8 min cosine=%.5f", msg, cos_min)
+    assert cos_min > 0.99, f"{msg} pertoken cosine too low: {cos_min}"
 
 
 def gather_cache_outputs(
@@ -360,7 +521,7 @@ def run_fused_qknorm_idxrqknorm(
         return qkv
 
     use_asm_layout = mode.startswith("asm_layout")
-    use_uint8_kv_cache = mode in ("fp8_kv_cache_uint8", "asm_layout_fp8_uint8")
+    use_uint8_kv_cache = mode.endswith("_uint8")
     kv_cache_dtype = None
     if use_fp8_kv_cache:
         kv_cache_dtype = torch.uint8 if use_uint8_kv_cache else dtypes.fp8
@@ -370,7 +531,9 @@ def run_fused_qknorm_idxrqknorm(
     )
     if use_asm_layout:
         # SHUFFLE caches (separate K/V) for the page-16 asm layout.
-        kv_cache_k, kv_cache_v = make_shuffle_caches(case, kv_cache_dtype=kv_cache_dtype)
+        kv_cache_k, kv_cache_v = make_shuffle_caches(
+            case, kv_cache_dtype=kv_cache_dtype
+        )
     else:
         # page-128: the op takes separate K/V caches -> use the key/value slices
         # of the fused [nb, 2, bs, nkv, hd] tensor (views, so gather still works).
@@ -385,10 +548,15 @@ def run_fused_qknorm_idxrqknorm(
         index_slot_mapping = None
     k_scale = None
     v_scale = None
+    use_pertoken = "pertoken" in mode
     kv_cache_dtype_arg = "auto"
     if use_fp8_kv_cache:
-        k_scale = torch.tensor(0.75, dtype=torch.float32, device="cuda")
-        v_scale = torch.tensor(1.25, dtype=torch.float32, device="cuda")
+        if use_pertoken:
+            # Per-token dynamic quant: k_scale/v_scale are OUTPUT tensors the op fills.
+            k_scale, v_scale = make_pertoken_scales(case, asm_layout=use_asm_layout)
+        else:
+            k_scale = torch.tensor(0.75, dtype=torch.float32, device="cuda")
+            v_scale = torch.tensor(1.25, dtype=torch.float32, device="cuda")
         kv_cache_dtype_arg = "fp8_e4m3"
 
     aiter.fused_qknorm_idxrqknorm(
@@ -528,7 +696,38 @@ def test_fused_qknorm_idxrqknorm(
                 atol=atol,
             )
 
-        if mode.startswith("asm_layout"):
+        if "pertoken" in mode:
+            check_pertoken_fp8(
+                case,
+                refs,
+                kv_cache,
+                kv_cache_k,
+                kv_cache_v,
+                k_scale,
+                v_scale,
+                asm_layout=mode.startswith("asm_layout"),
+                msg=msg,
+            )
+            if num_index_heads > 0:
+                if mode.startswith("asm_layout"):
+                    index_k_out = gather_index_cache(
+                        case, index_cache, index_slot_mapping=index_slot_mapping
+                    )
+                else:
+                    _, _, index_k_out = gather_cache_outputs(
+                        case,
+                        kv_cache,
+                        index_cache,
+                        index_slot_mapping=index_slot_mapping,
+                    )
+                check_close(
+                    index_k_out,
+                    refs["index_k"],
+                    msg=f"{msg}(index_cache)",
+                    rtol=rtol,
+                    atol=atol,
+                )
+        elif mode.startswith("asm_layout"):
             # Ground truth: write the SAME normed/roped K and raw V into freshly
             # zeroed SHUFFLE caches via the PROVEN reshape_and_cache(asm_layout=True)
             # writer, then compare the fused-op caches against it element-wise. This
@@ -612,13 +811,15 @@ DEFAULT_CASES = [
     ("inplace", "bf16", 11, 16, 64, 0),
     ("inplace", "bf16", 11, 16, 64, 4),
     ("inplace", "fp16", 11, 16, 64, 4),
-    ("fp8_kv_cache", "bf16", 17, 16, 64, 4),
-    ("fp8_kv_cache_uint8", "bf16", 17, 16, 64, 4),
     ("asm_layout", "bf16", 17, 16, 64, 4),
     ("asm_layout", "fp16", 19, 16, 96, 4),
     ("asm_layout", "bf16", 13, 16, 64, 0),
-    ("asm_layout_fp8", "bf16", 17, 16, 64, 4),
-    ("asm_layout_fp8_uint8", "bf16", 17, 16, 64, 4),
+    # fp8 path is per-token dynamic quant only (no per-tensor static scale).
+    ("fp8_kv_cache_pertoken", "bf16", 17, 16, 64, 4),
+    ("fp8_kv_cache_pertoken_uint8", "bf16", 17, 16, 64, 4),
+    ("asm_layout_fp8_pertoken", "bf16", 17, 16, 64, 4),
+    ("asm_layout_fp8_pertoken", "fp16", 19, 16, 96, 4),
+    ("asm_layout_fp8_pertoken_uint8", "bf16", 17, 16, 64, 4),
 ]
 
 l_mode = [
@@ -626,11 +827,11 @@ l_mode = [
     "dense_insert",
     "slot_mapping_fallback",
     "inplace",
-    "fp8_kv_cache",
-    "fp8_kv_cache_uint8",
     "asm_layout",
-    "asm_layout_fp8",
-    "asm_layout_fp8_uint8",
+    "fp8_kv_cache_pertoken",
+    "fp8_kv_cache_pertoken_uint8",
+    "asm_layout_fp8_pertoken",
+    "asm_layout_fp8_pertoken_uint8",
 ]
 l_dtype = ["fp16", "bf16"]
 

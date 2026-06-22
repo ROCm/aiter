@@ -33,6 +33,20 @@ __device__ __forceinline__ float warpReduceSum(float val)
     return val;
 }
 
+__device__ __forceinline__ float warpReduceMax(float val)
+{
+#pragma unroll
+    for(int mask = 16; mask > 0; mask >>= 1)
+    {
+        val = fmaxf(val, __shfl_xor(val, mask, 32));
+    }
+    return val;
+}
+
+// fp8 e4m3 max magnitude (matches opus::cast<fp8> clamp range). Per-token dynamic
+// quant scale = amax / FP8_E4M3_MAX so the largest |value| maps to the fp8 max.
+constexpr float kFp8E4M3Max = 448.0f;
+
 template <typename scalar_t>
 __device__ __forceinline__ void loadElems(const scalar_t* __restrict__ src,
                                           float (&elems)[kElemsPerLane])
@@ -199,8 +213,14 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     cache_t* __restrict__ kv_cache_k,
     cache_t* __restrict__ kv_cache_v,
     scalar_t* __restrict__ index_cache,
-    const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
+    // Per-token dynamic-quant OUTPUT dequant scales (fp8 path only). Layout mirrors
+    // reshape_and_cache_with_pertoken_quant:
+    //   asm_layout : [num_blocks, num_kv_heads, block_size]
+    //     idx = block_idx*(nkv*block_size) + head*block_size + block_offset
+    //   page-128   : [num_kv_heads, max_kv_tokens]
+    //     idx = head*max_kv_tokens + slot
+    float* __restrict__ k_scale,
+    float* __restrict__ v_scale,
     float eps,
     int rotary_dim,
     int num_tokens,
@@ -209,6 +229,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int niq,
     int block_size,
     int x,
+    int max_kv_tokens,
     // page-128 (asm_layout=false) strides for the separate K/V caches
     // (each [num_blocks, block_size, num_kv_heads, head_dim]); unused when kAsmLayout.
     int64_t k_s_block,
@@ -314,8 +335,32 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         {
             if(mapped_slot >= 0)
             {
-                const float v_scale_val =
-                    (kv_dt == vllm::Fp8KVCacheDataType::kAuto) ? 1.0f : *v_scale;
+                // Per-token dynamic quant: amax over the lane's raw V elems, then a
+                // full-warp max -> the (token, head) head-dim amax. scale = amax/FP8_MAX.
+                float v_scale_val = 1.0f;
+                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    float local_amax = 0.0f;
+#pragma unroll
+                    for(int i = 0; i < kElemsPerLane; ++i)
+                    {
+                        local_amax = fmaxf(local_amax,
+                                           fabsf(static_cast<float>(row_ptr[dim_base + i])));
+                    }
+                    const float amax = warpReduceMax(local_amax);
+                    v_scale_val = (amax > 0.0f) ? amax / kFp8E4M3Max : 1.0f;
+                    if(lane_id == 0)
+                    {
+                        const int64_t b = mapped_slot / block_size;
+                        const int64_t t = mapped_slot % block_size;
+                        const int64_t scale_idx =
+                            kAsmLayout
+                                ? (b * (static_cast<int64_t>(nkv) * block_size) +
+                                   static_cast<int64_t>(head) * block_size + t)
+                                : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
+                        v_scale[scale_idx] = v_scale_val;
+                    }
+                }
                 if constexpr(kAsmLayout)
                 {
                     // V SHUFFLE: [num_blocks, num_kv_heads, block_size/x, head_dim, x]
@@ -367,8 +412,31 @@ __global__ void fusedQKNormIdxrQKNormKernel(
             }
             else if(is_k)
             {
-                const float k_scale_val =
-                    (kv_dt == vllm::Fp8KVCacheDataType::kAuto) ? 1.0f : *k_scale;
+                // Per-token dynamic quant: amax over the lane's post-norm/rope K elems,
+                // then a full-warp max -> the (token, head) head-dim amax.
+                float k_scale_val = 1.0f;
+                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    float local_amax = 0.0f;
+#pragma unroll
+                    for(int i = 0; i < kElemsPerLane; ++i)
+                    {
+                        local_amax = fmaxf(local_amax, fabsf(elems[i]));
+                    }
+                    const float amax = warpReduceMax(local_amax);
+                    k_scale_val = (amax > 0.0f) ? amax / kFp8E4M3Max : 1.0f;
+                    if(lane_id == 0)
+                    {
+                        const int64_t b = mapped_slot / block_size;
+                        const int64_t t = mapped_slot % block_size;
+                        const int64_t scale_idx =
+                            kAsmLayout
+                                ? (b * (static_cast<int64_t>(nkv) * block_size) +
+                                   static_cast<int64_t>(head) * block_size + t)
+                                : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
+                        k_scale[scale_idx] = k_scale_val;
+                    }
+                }
                 if constexpr(kAsmLayout)
                 {
                     // K SHUFFLE: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
@@ -421,8 +489,8 @@ void launchFusedQKNormIdxrQKNorm(
     cache_t* kv_cache_k,
     cache_t* kv_cache_v,
     scalar_t* index_cache,
-    const float* k_scale,
-    const float* v_scale,
+    float* k_scale,
+    float* v_scale,
     float eps,
     int rotary_dim,
     int num_tokens,
@@ -431,6 +499,7 @@ void launchFusedQKNormIdxrQKNorm(
     int niq,
     int block_size,
     int x,
+    int max_kv_tokens,
     int64_t k_s_block,
     int64_t k_s_token,
     int64_t k_s_head,
@@ -480,6 +549,7 @@ void launchFusedQKNormIdxrQKNorm(
                                           niq,                                               \
                                           block_size,                                        \
                                           x,                                                 \
+                                          max_kv_tokens,                                     \
                                           k_s_block,                                         \
                                           k_s_token,                                         \
                                           k_s_head,                                          \
@@ -621,6 +691,7 @@ static void fused_qknorm_idxrqknorm_impl(
     int64_t v_s_token = 0;
     int64_t v_s_head = 0;
     int x = 0;  // SHUFFLE interleave factor = 16 / cache_itemsize (asm_layout only)
+    int max_kv_tokens = 0;  // page-128 per-token scale stride (scales: [nkv, max_kv_tokens])
     if(insert_kv)
     {
         AITER_CHECK(block_size > 0, "block_size must be positive in insert mode");
@@ -659,14 +730,15 @@ static void fused_qknorm_idxrqknorm_impl(
                         "fused_qknorm_idxrqknorm fp8 cache insert supports fp8_e4m3 only");
             AITER_CHECK(kc.dtype() == AITER_DTYPE_fp8 || kc.dtype() == AITER_DTYPE_u8,
                         "fp8 kv_cache must use float8_e4m3 or uint8 storage");
+            // k_scale/v_scale are per-token dynamic-quant OUTPUT tensors (fp32). Their
+            // exact shape is validated in the asm/page-128 branches below.
             AITER_CHECK(k_scale.has_value() && v_scale.has_value() &&
                             k_scale->is_gpu() && v_scale->is_gpu() &&
                             k_scale->is_contiguous() && v_scale->is_contiguous() &&
                             k_scale->dtype() == AITER_DTYPE_fp32 &&
                             v_scale->dtype() == AITER_DTYPE_fp32,
-                        "fp8 insert requires contiguous float32 CUDA k_scale/v_scale");
-            AITER_CHECK(k_scale->numel() >= 1 && v_scale->numel() >= 1,
-                        "k_scale/v_scale must contain at least one element");
+                        "fp8 per-token insert requires contiguous float32 CUDA "
+                        "k_scale/v_scale output tensors");
         }
         else
         {
@@ -712,6 +784,16 @@ static void fused_qknorm_idxrqknorm_impl(
                             "* 128 elements");
             }
             // strides unused in asm_layout (kernel computes SHUFFLE offsets directly).
+            if(fp8_kv_cache)
+            {
+                // Per-token dequant scales: [num_blocks, num_kv_heads, block_size]
+                // (mirrors reshape_and_cache_with_pertoken_quant asm_layout).
+                const int64_t num_blocks = kv_cache_k->size(0);
+                AITER_CHECK(k_scale->numel() >= num_blocks * nkv * block_size &&
+                                v_scale->numel() >= num_blocks * nkv * block_size,
+                            "asm_layout fp8 per-token k_scale/v_scale must have at least "
+                            "num_blocks * num_kv_heads * block_size elements");
+            }
         }
         else
         {
@@ -744,6 +826,23 @@ static void fused_qknorm_idxrqknorm_impl(
             v_s_block = kv_cache_v->stride(0);
             v_s_token = kv_cache_v->stride(1);
             v_s_head = kv_cache_v->stride(2);
+            if(fp8_kv_cache)
+            {
+                // Per-token dequant scales: [num_kv_heads, max_kv_tokens] with
+                // idx = head * max_kv_tokens + slot (mirrors
+                // reshape_and_cache_with_pertoken_quant page-128). max_kv_tokens is the
+                // scale tensor's last-dim size (caller-sized to cover all slots).
+                AITER_CHECK(k_scale->dim() == 2 && v_scale->dim() == 2 &&
+                                k_scale->size(0) == nkv && v_scale->size(0) == nkv &&
+                                k_scale->size(1) == v_scale->size(1),
+                            "page-128 fp8 per-token k_scale/v_scale must be "
+                            "[num_kv_heads, max_kv_tokens]");
+                max_kv_tokens = static_cast<int>(k_scale->size(1));
+                const int64_t num_blocks = kv_cache_k->size(0);
+                AITER_CHECK(max_kv_tokens >= num_blocks * block_size,
+                            "page-128 fp8 per-token scale max_kv_tokens must be >= "
+                            "num_blocks * block_size");
+            }
         }
     }
 
@@ -801,6 +900,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 niq,
                 static_cast<int>(block_size),
                 x,
+                max_kv_tokens,
                 k_s_block,
                 k_s_token,
                 k_s_head,
@@ -843,6 +943,7 @@ static void fused_qknorm_idxrqknorm_impl(
                 niq,
                 static_cast<int>(block_size),
                 x,
+                max_kv_tokens,
                 k_s_block,
                 k_s_token,
                 k_s_head,
