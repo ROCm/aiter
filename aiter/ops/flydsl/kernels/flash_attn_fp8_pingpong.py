@@ -449,50 +449,73 @@ def build_flash_attn_fp8_module(
                 C_F32_PER_LANE
             )
             l2 = _fadd(_fmul(l_acc, corr), p_rowsum)
-            # Scale O by corr in place on the first K-step (fold into the slot the
-            # MFMA accumulates into) so the rescaled and pre-rescale copies never
-            # co-exist as two full 64-VGPR lists.
+            p_ks_list = [
+                Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
+                for r in range_constexpr(PV_K_STEPS)
+            ]
+            # Software-pipelined PV (spec order: d-tile outer, kv K-step inner):
+            # prime PREFETCH_DEPTH V units, then issue each future ds_read_tr8 one
+            # window ahead.  O is rescaled by corr in place on the first K-step.
+            PV_UNITS = D_TILES * PV_K_STEPS  # 8
+            vw = [None] * PV_UNITS
+            for u in range_constexpr(PREFETCH_DEPTH):
+                vw[u] = read_v_pack(v_off, u // PV_K_STEPS, u % PV_K_STEPS)
             o = list(o_accs)
-            for ks in range_constexpr(PV_K_STEPS):
-                p_ks = Vec(p_pack).shuffle(Vec(p_pack), list(range(ks * 8, ks * 8 + 8)))
-                for dt in range_constexpr(D_TILES):
-                    v_pack = read_v_pack(v_off, dt, ks)
-                    if const_expr(ks == 0):
-                        o[dt] = _fmul(Vec(o[dt]), corr_vec)
-                    o[dt] = mfma.call(v_pack, p_ks, o[dt])
+            for u in range_constexpr(PV_UNITS):
+                dt = u // PV_K_STEPS
+                ks = u % PV_K_STEPS
+                if const_expr(ks == 0):
+                    o[dt] = _fmul(Vec(o[dt]), corr_vec)
+                o[dt] = mfma.call(vw[u], p_ks_list[ks], o[dt])
+                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
+                if const_expr(u + PREFETCH_DEPTH < PV_UNITS):
+                    un = u + PREFETCH_DEPTH
+                    vw[un] = read_v_pack(v_off, un // PV_K_STEPS, un % PV_K_STEPS)
+                    # 4 ds_read_tr8 per V unit, scheduled to overlap this MFMA.
+                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 4, 0)
             return o, l2
 
+        # GEMM1 K-unit = K^i_{nt,ks}: one 32x64 MFMA A-fragment (8 i32 / lane),
+        # read as two 16B ds_read_b128 from the padded K LDS + a shuffle.
+        QK_UNITS = N_KV_TILES * K_STEPS  # 8 (nt outer, ks inner)
+        # Prefetch depth for the register-window software pipeline: prime this
+        # many units, then issue each future ds_read one+ window ahead of the
+        # consuming MFMA.  Depth 2 measured best (depth 3 over-prefetches and the
+        # extra live windows cost more than the latency they hide).
+        PREFETCH_DEPTH = 2
+
+        def _load_k_unit(k_buf_off, nt, ks):
+            kv_row = lo + fx.Index(nt * 32)
+            d_base = fx.Index(ks * MFMA_K) + hi * 32
+            row_off = kv_row * K_STRIDE + (kv_row // fx.Index(K_UNIT_ROWS)) * fx.Index(
+                PAD_K
+            )
+            blk_lo = Vec(
+                Vec.load(v_i8x16, lds, [k_buf_off + row_off + d_base])
+            ).bitcast(fx.Int32)
+            blk_hi = Vec(
+                Vec.load(v_i8x16, lds, [k_buf_off + row_off + d_base + fx.Index(16)])
+            ).bitcast(fx.Int32)
+            return blk_lo.shuffle(blk_hi, list(range(8)))
+
         def do_qk(k_buf_off):
-            # GEMM1: S[kv,q] = K @ Q^T over N_KV_TILES kv subtiles.  Returns the
-            # list of N_KV_TILES accumulators (each vec<16xf32>).
-            s_accs = []
-            for nt in range_constexpr(N_KV_TILES):
-                s_acc = mfma.zero_value
-                for ks in range_constexpr(K_STEPS):
-                    kv_row = lo + fx.Index(nt * 32)
-                    d_base = fx.Index(ks * MFMA_K) + hi * 32
-                    # Padded K LDS: each 8-kv-row unit is K_UNIT_STRIDE apart, so
-                    # the row offset is kv_row*K_STRIDE + (kv_row//8)*PAD_K.
-                    row_off = kv_row * K_STRIDE + (
-                        kv_row // fx.Index(K_UNIT_ROWS)
-                    ) * fx.Index(PAD_K)
-                    blk_lo = Vec(
-                        Vec.load(
-                            v_i8x16,
-                            lds,
-                            [k_buf_off + row_off + d_base],
-                        )
-                    ).bitcast(fx.Int32)
-                    blk_hi = Vec(
-                        Vec.load(
-                            v_i8x16,
-                            lds,
-                            [k_buf_off + row_off + d_base + fx.Index(16)],
-                        )
-                    ).bitcast(fx.Int32)
-                    k_pack = blk_lo.shuffle(blk_hi, list(range(8)))
-                    s_acc = mfma.call(k_pack, q_packs[ks], s_acc)
-                s_accs.append(s_acc)
+            # GEMM1: S[kv,q] = K @ Q^T over N_KV_TILES kv subtiles, software-
+            # pipelined: prime PREFETCH_DEPTH K units, then for each MFMA issue the
+            # ds_read for the unit PREFETCH_DEPTH ahead (rotating register window).
+            kw = [None] * QK_UNITS
+            for u in range_constexpr(PREFETCH_DEPTH):
+                kw[u] = _load_k_unit(k_buf_off, u // K_STEPS, u % K_STEPS)
+            s_accs = [mfma.zero_value for _ in range_constexpr(N_KV_TILES)]
+            for u in range_constexpr(QK_UNITS):
+                nt = u // K_STEPS
+                ks = u % K_STEPS
+                s_accs[nt] = mfma.call(kw[u], q_packs[ks], s_accs[nt])
+                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
+                if const_expr(u + PREFETCH_DEPTH < QK_UNITS):
+                    un = u + PREFETCH_DEPTH
+                    kw[un] = _load_k_unit(k_buf_off, un // K_STEPS, un % K_STEPS)
+                    # 2 ds_read_b128 per K unit, scheduled to overlap this MFMA.
+                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 2, 0)
             return s_accs
 
         def do_softmax(s_accs, m_running):
