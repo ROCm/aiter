@@ -129,21 +129,8 @@ def get_flydsl_stage1_kernels(
                                     for kw in k_waves:
                                         if num_n_waves * kw > 8:
                                             continue
-                                        # The cross-wave reduction scratch reuses the
-                                        # X/out LDS buffer (sized ~k_wave*tile_m*tile_k),
-                                        # but needs k_wave*tile_m*tile_n*4 bytes. Require
-                                        # 4*tile_n<=tile_k so it fits; otherwise it
-                                        # overruns into lds_tid (e.g. t32x128x256_kw2).
                                         if kw > 1 and 4 * tn > tk:
                                             continue
-                                        # The fp8/a8w4 path uses gate-up interleave,
-                                        # whose cross-wave k_wave reduction is the
-                                        # non-fused variant and is only correct with
-                                        # >=2 N-waves. At tile_n==32 (num_n_waves==1)
-                                        # it produces wrong results (~11% stage1 err),
-                                        # so disallow k_wave there. The fp4/a4w4
-                                        # (separated) path uses the fused reduction and
-                                        # is fine at tile_n==32.
                                         if (
                                             kw > 1
                                             and a_dtype == "fp8"
@@ -235,22 +222,9 @@ def get_flydsl_stage2_kernels(
 def _register_production_variants_stage2(
     kernels: Dict[str, Dict], a_dtype: str, b_dtype: str, out_dtype: str
 ) -> None:
-    """Append hand-tuned stage2 variants to ``kernels`` in-place.
-
-    Pulled out of the 6-deep tile/mode/bnt/xcd cartesian product in
-    ``get_flydsl_stage2_kernels`` so we don't pay a ``base_name == "..."``
-    string special-case on every iteration. Each entry pins a specific
-    shape (tile/mode/dtype) and applies a hand-tuned override dict.
-    """
+    """Append hand-tuned stage2 variants to ``kernels`` in-place."""
     # (a, b, out, tile_m, tile_n, tile_k, mode, suffix, overrides)
     PRODUCTION_VARIANTS = (
-        # EP4 DeepSeek prefill on MI355X (M=49152, model_dim=7168, inter_dim=2048):
-        #   use_async_copy=True  -- async X DMA in prologue overlaps with B/scale VMEM
-        #   cu_num_mul=3         -- persistent grid 3x CU count fills in-flight
-        #                           slack from small per-WG M tile counts;
-        #                           cu_num_mul=4 regresses ~2.4% on the same shape
-        #   waves_per_eu=4       -- best on EP4 prefill at cu_num_mul=3;
-        #                           wpe=5/6 underperform here
         (
             "fp4",
             "fp4",
