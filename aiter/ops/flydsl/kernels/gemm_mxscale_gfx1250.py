@@ -212,9 +212,14 @@ def compile_mxscale_gemm(
             raise ValueError(
                 "stage1_act GEMM epilogue fuse requires use_tdm_store=False"
             )
-        if wave_specialized_tdm:
+        if wave_specialized_tdm and stage1_weight_layout_mode != "gugu":
+            # gguu is dual-B: gate+up are separate weights -> 6 TDM streams
+            # (A, B_gate, B_up, As, Bs_gate, Bs_up), which cannot map onto the
+            # 4-wave / 4-way wave-specialized load model. The gugu (interleaved)
+            # layout is single-B (4 streams: A, B, As, Bs) and IS supported.
             raise ValueError(
-                "stage1_act GEMM epilogue fuse does not support wave_specialized_tdm"
+                "stage1_act fused epilogue supports wave_specialized_tdm only for "
+                "the gugu (interleaved single-B) layout, not gguu (dual-B)"
             )
         if stage1_weight_layout_mode == "gugu" and N % 2 != 0:
             raise ValueError("stage1 gugu fused epilogue requires raw N == 2*inter_dim")

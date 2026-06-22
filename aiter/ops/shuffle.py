@@ -136,7 +136,12 @@ def shuffle_weight_NK(
     return x_.view(*x.shape)
 
 
-def shuffle_scale_n32k4(src: torch.Tensor, experts_cnt: int = None) -> torch.Tensor:
+def shuffle_scale_n32k4(
+    src: torch.Tensor,
+    experts_cnt: int = None,
+    is_guinterleave: bool = False,
+    gate_up: bool = False,
+) -> torch.Tensor:
     """Shuffle a raw per-expert e8m0 weight (B) scale into the n32k4 layout.
 
     Input: ``(E, N, K//32)`` (3D) or ``(E*N, K//32)`` (2D, needs ``experts_cnt``).
@@ -146,6 +151,18 @@ def shuffle_scale_n32k4(src: torch.Tensor, experts_cnt: int = None) -> torch.Ten
     lane reads its full WMMA scaleB operand (4 e8m0 of one WMMA-K=128 step) with
     one contiguous ds_load_b32.  Consumed by the gfx1250 grouped MoE GEMM
     (see kernels/gemm_mxscale_gfx1250.py).
+
+    ``is_guinterleave`` selects the stage1 gate/up packing (``N == 2*inter_dim``):
+
+    * ``False`` (GGUU / ``GateMode.SEPARATED``): rows are ``[g0..g_{I-1},
+      u0..u_{I-1}]``; the n32k4 super-rows are taken as-is.
+    * ``True`` (GUGU / ``GateMode.INTERLEAVE``): the raw GGUU rows are first
+      interleaved to ``[g0,u0,g1,u1,...]`` (matching the INTERLEAVE stage1
+      weight layout produced for the fused gemm1) and then folded into n32k4.
+
+    ``gate_up`` is accepted for signature parity with ``shuffle_scale`` /
+    ``moe_shuffle_scale``; the gate/up interleave is driven by
+    ``is_guinterleave`` (the n32k4 fold is identical for both).
     """
     s = src.view(torch.uint8).contiguous()
     if s.ndim == 2:
@@ -155,6 +172,19 @@ def shuffle_scale_n32k4(src: torch.Tensor, experts_cnt: int = None) -> torch.Ten
     elif s.ndim != 3:
         raise ValueError(f"n32k4 scale must be 2D or 3D, got {s.ndim}D")
     E, N, k_scale = s.shape
+    if is_guinterleave:
+        # GUGU: interleave gate/up rows [g..,u..] -> [g0,u0,g1,u1,...] so the
+        # n32k4 super-rows line up with the INTERLEAVE stage1 weight layout.
+        if N % 2 != 0:
+            raise ValueError(
+                f"GUGU n32k4 scale needs N=2*inter_dim (even rows), got N={N}"
+            )
+        # (E, [g..,u..], k) -> (E, 2, N/2, k) -> (E, N/2, 2, k) -> (E, N, k)
+        s = (
+            s.view(E, 2, N // 2, k_scale)
+            .permute(0, 2, 1, 3)
+            .reshape(E, N, k_scale)
+        )
     if N % 32 != 0:
         raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
     if k_scale % 4 != 0:
@@ -234,12 +264,14 @@ def moe_shuffle_scale(
     """Arch-aware MoE weight (B) scale shuffle."""
 
     if get_gfx() == "gfx1250":
-        if is_guinterleave:
-            raise ValueError(
-                "moe_shuffle_scale: is_guinterleave is not supported on gfx1250; "
-                "the n32k4 grouped-MoE B-scale layout does not interleave gate/up."
-            )
-        return shuffle_scale_n32k4(src, experts_cnt)
+        # n32k4 grouped-MoE B-scale. GGUU (is_guinterleave=False) folds rows
+        # as-is; GUGU (is_guinterleave=True) interleaves gate/up rows first.
+        return shuffle_scale_n32k4(
+            src,
+            experts_cnt,
+            is_guinterleave=is_guinterleave,
+            gate_up=gate_up,
+        )
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=is_guinterleave, gate_up=gate_up
     )

@@ -768,6 +768,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
+        wave_specialized_tdm=(
+            stage1_weight_layout == "gugu"
+            and (m_warp * n_warp) == 4
+            and os.environ.get("AITER_GROUPED_GEMM1_WAVE_SPECIALIZED", "0")
+            in _TRUTHY_ENV
+        ),
     )
     _grouped_dbg("stage1 compile done; start launch")
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
@@ -903,6 +909,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
+        wave_specialized_tdm=(
+            (m_warp * n_warp) == 4
+            and os.environ.get("AITER_GROUPED_GEMM2_WAVE_SPECIALIZED", "0")
+            in _TRUTHY_ENV
+        ),
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None

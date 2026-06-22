@@ -271,6 +271,7 @@ def _run_grouped_via_fused_moe(
     seed: int = 0,
     warmup: int = 5,
     iters: int = 101,
+    gu_interleave: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[float]]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -290,6 +291,8 @@ def _run_grouped_via_fused_moe(
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
     if layout not in ("gguu", "gugu"):
         raise ValueError(f"layout must be gguu or gugu, got {layout!r}")
+    if gu_interleave and layout != "gugu":
+        raise ValueError("gu_interleave requires layout='gugu'")
 
     K = model_dim
     inter = inter_dim
@@ -332,7 +335,19 @@ def _run_grouped_via_fused_moe(
 
     w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
     w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
-    w1_scale = moe_shuffle_scale(w1_scale_phys.contiguous(), experts_cnt=experts)
+    if gu_interleave:
+        # Production GUGU B-scale path: feed the RAW GGUU scale to
+        # moe_shuffle_scale(is_guinterleave=True), which interleaves gate/up rows
+        # then folds n32k4 -- exercising aiter.ops.shuffle end to end (vs. the
+        # default path that pre-interleaves rows with _gguu_to_gugu_rows).
+        w1_scale = moe_shuffle_scale(
+            w1_scale_raw.contiguous(),
+            experts_cnt=experts,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+    else:
+        w1_scale = moe_shuffle_scale(w1_scale_phys.contiguous(), experts_cnt=experts)
     w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
 
     if data_format == "a4w4":
@@ -434,6 +449,7 @@ def run_moe(
     bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
+    gu_interleave: bool = False,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
     validated path: bench checks (and times) the CUDA-graph production path;
@@ -462,6 +478,7 @@ def run_moe(
         bench=bench,
         warmup=warmup,
         iters=iters,
+        gu_interleave=gu_interleave,
     )
     mode = "graph" if bench else "eager"
     ld = _logits_diff(out, ref)
@@ -494,14 +511,28 @@ def run_moe(
     return metrics
 
 
+# model_dim=512 (not the 256 default): the grouped mxscale kernel needs
+# num_k_tiles = (K // split_k) // tile_k >= 2, i.e. K >= 2*tile_k = 512.
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
 def test_grouped_a4w4_silu_matches_torch_ref(layout):
-    run_moe("a4w4", layout=layout, activation=ActivationType.Silu)
+    run_moe(
+        "a4w4",
+        layout=layout,
+        activation=ActivationType.Silu,
+        model_dim=512,
+        inter_dim=512,
+    )
 
 
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
 def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
-    run_moe("a4w4", layout=layout, activation=ActivationType.Swiglu)
+    run_moe(
+        "a4w4",
+        layout=layout,
+        activation=ActivationType.Swiglu,
+        model_dim=512,
+        inter_dim=512,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +649,24 @@ def main() -> None:
         help="run with zero stage1/stage2 bias tensors",
     )
     parser.add_argument(
+        "--gu-interleave",
+        action="store_true",
+        help="GUGU only: shuffle the stage1 B-scale via the production "
+        "moe_shuffle_scale(is_guinterleave=True) path (raw GGUU scale -> n32k4) "
+        "instead of pre-interleaving rows. Use with --layout gugu --scenario verify "
+        "to validate aiter.ops.shuffle.shuffle_scale_n32k4 end to end.",
+    )
+    parser.add_argument(
+        "--wst",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable/disable wave-specialized TDM (WST) for the grouped gemm1 "
+        "and gemm2 (4 TDM streams -> 4 loader waves). --wst enables, --no-wst "
+        "disables (default). Sets AITER_GROUPED_GEMM1/2_WAVE_SPECIALIZED. Applies "
+        "where valid: gemm2 (non-fused single-B) always; gemm1 only for gugu "
+        "(gguu is dual-B and ignores it).",
+    )
+    parser.add_argument(
         "--real-gemm",
         action="store_true",
         default=is_gfx1250(),
@@ -625,6 +674,13 @@ def main() -> None:
         "False elsewhere (mock the GEMM so the tiny operators run on any arch).",
     )
     args = parser.parse_args()
+    if args.gu_interleave and args.layout != "gugu":
+        raise SystemExit("--gu-interleave requires --layout gugu")
+    # Toggle wave-specialized TDM for the grouped gemm1 and gemm2 (read by
+    # grouped_moe; applied where valid).
+    _wst = "1" if args.wst else "0"
+    os.environ["AITER_GROUPED_GEMM1_WAVE_SPECIALIZED"] = _wst
+    os.environ["AITER_GROUPED_GEMM2_WAVE_SPECIALIZED"] = _wst
     if not args.real_gemm:
         _mock_grouped_gemm()
     if args.model_dim < 512 or args.inter_dim < 512:
@@ -664,6 +720,7 @@ def main() -> None:
             bench=args.scenario == "bench",
             warmup=args.warmup,
             iters=args.iters,
+            gu_interleave=args.gu_interleave,
         )
         rows.append(
             {
