@@ -312,6 +312,26 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
                     raise
             else:
                 raise AssertionError("hipb_mm(use_gelu=True) should require bias")
+
+            try:
+                hipb_findallsols(
+                    x,
+                    weightshuffle.t(),
+                    bias=None,
+                    out_dtype=dtype,
+                    scaleA=x_scale,
+                    scaleB=scale_b,
+                    scaleC=None,
+                    bpreshuffle=True,
+                    use_gelu=True,
+                )
+            except RuntimeError as exc:
+                if "requires bias" not in str(exc):
+                    raise
+            else:
+                raise AssertionError(
+                    "hipb_findallsols(use_gelu=True) should require bias"
+                )
     else:
         avg_e = None
         err_e = None
