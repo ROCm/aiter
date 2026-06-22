@@ -144,7 +144,11 @@ def get_flydsl_stage1_kernels(
                                         # so disallow k_wave there. The fp4/a4w4
                                         # (separated) path uses the fused reduction and
                                         # is fine at tile_n==32.
-                                        if kw > 1 and a_dtype == "fp8" and num_n_waves < 2:
+                                        if (
+                                            kw > 1
+                                            and a_dtype == "fp8"
+                                            and num_n_waves < 2
+                                        ):
                                             continue
                                         name = base + (f"_kw{kw}" if kw > 1 else "")
                                         kernels[name] = {
