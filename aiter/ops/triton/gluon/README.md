@@ -53,6 +53,12 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
   <td>TBD</td><td>TBD</td><td>TBD</td>
 </tr>
+<tr>
+  <td><code>sparse_attention_dsv4</code></td><td>Sparse Attn<br>Prefill</td><td>CDNA4</td>
+  <td nowrap>Q/Out: bf16/fp16<br>num_heads=128<br>head_dim=512 (NoPE 448 + RoPE 64)<br>Prefill KV: bf16 flat [N, D]</td>
+  <td>python op_tests/<br>test_sparse_attention_dsv4.py \<br>--cfgs 4096,128,4096,512</td>
+  <td>~520<br>TFLOPS</td><td>—</td><td>—</td>
+</tr>
 </table>
 </small>
 
@@ -258,3 +264,50 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | KV block sizes | 16, 64, 1024 (selected by kernel variant) |
 | Context partition | 256 (static_assert) |
 | Constraint | `query_length * query_group_size` &le; 64 |
+
+### `sparse_attention_dsv4.py` — DeepSeek V4 Sparse MLA (Prefill)
+
+**Functions:** `sparse_attn_prefill_gluon(q, kv, indices, indptr, out, scale, attn_sink=None`
+
+**Description:** DeepSeek V4 Compressed Sparse Attention. Each query token attends to a sparse, per-token set of KV positions supplied as CSR `(indices, indptr)` where `indices` are valid global KV slot ids in `[0, num_kv)`.
+
+- **Prefill** (`_sparse_attn_prefill_kernel`): bf16 KV in a flat `[N, D]` buffer, ragged per-query indices, optional per-head attention sink. One program per query token &times; `BLOCK_H` head block. The gathered KV tile is DMA'd global&rarr;LDS once via `async_copy` and read in both orientations (K^T for QK, V for PV) through a `permute` view of a single padded LDS buffer.
+
+| Parameter | Details |
+|-----------|---------|
+| Arch | gfx950 (CDNA4) only |
+| Q dtype | bf16 |
+| KV dtype | bf16 flat buffer |
+| Output | bf16 |
+| head_dim | 512 = nope_head_dim (448) + rope_head_dim (64), enforced |
+| Sparsity | CSR ragged `(indices, indptr)`; `-1` sentinels masked |
+| Attn sink | optional `[H]` fp32 per-head softmax-denominator bias |
+| MFMA | QK 16&times;16&times;32 (kWidth=8) |
+
+**Test** (prefill accuracy + perf vs a torch reference, gfx950):
+
+```
+# config is num_queries,num_heads,num_kv,topk
+python op_tests/test_sparse_attention_dsv4.py --cfgs 4096,128,4096,512
+
+# multiple shapes; add --sink to exercise the per-head attention-sink path
+python op_tests/test_sparse_attention_dsv4.py \
+    --cfgs 4096,128,4096,512 8192,128,8192,1024 --sink
+```
+
+Per-query ragged top-k indices keep a random count in `[topk//4, topk]` of
+unique slots; the test checks `checkAllclose` against a per-query masked-softmax
+torch reference and reports TFLOPS / GB/s.
+
+**Perf** (MI350, prefill, bf16, H=128):
+
+```
+python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py --shapes prefill
+```
+
+|    Q |   H |   Kv | topk | triton TFLOPS | gluon TFLOPS | speedup |
+| ---- | --- | ---- | ---- | ------------- | ------------ | ------- |
+| 4096 | 128 | 4096 |  512 |       192.035 |      400.964 |   2.09&times; |
+| 4096 | 128 | 4096 | 1024 |       209.629 |      520.291 |   2.48&times; |
+| 8192 | 128 | 8192 |  512 |       191.414 |      411.194 |   2.15&times; |
+| 8192 | 128 | 8192 | 1024 |       212.226 |      516.077 |   2.43&times; |
