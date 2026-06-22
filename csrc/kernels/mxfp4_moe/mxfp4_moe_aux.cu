@@ -71,7 +71,7 @@ Fn aux_find(const std::unordered_map<std::string, Fn>& table,
     auto it = table.find(key);
     TORCH_CHECK(it != table.end(), what,
         ": no codegen'd instance for shape key '", key,
-        "'. See gen_instances.py (enumerate_instances, --target aux).");
+        "'. See moe_aux/codegen/gen_instances.py (enumerate_instances).");
     return it->second;
 }
 

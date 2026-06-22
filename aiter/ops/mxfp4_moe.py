@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# mxfp4_moe — pure-HIP MoE backend for MXFP4 (a4w4) weights.
+# mxfp4_moe — HIP aux kernels (sort / quant / sort_scales / scatter_reduce) for
+# the MXFP4 (a4w4) MoE. The gemm1/gemm2 themselves run on the FlyDSL port
+# (aiter/ops/flydsl/mxfp4_gemm{1,2}*.py); only these shared aux ops stay in HIP.
 #
 # Each function is a thin @compile_ops binding to a C++ host entry in
-# csrc/py_itfs_cu/mxfp4_moe_{aux,gemm}.cu. The C++ side internally switches
-# on (NE, TOPK, D_HIDDEN, D_INTER, MB) to pick the right template
-# instantiation. Adding a new shape: edit the switch-case in C++ + add a
-# row to aiter/configs/tuned_fmoe.csv.
+# csrc/kernels/mxfp4_moe/mxfp4_moe_aux.cu. The codegen'd dispatch switches on
+# (NE, TOPK, D_HIDDEN, D_INTER, MB) to pick the right template instantiation.
 #
 # Shape-parameter glossary (uppercase params on the host-side wrappers):
 #   NE       = num routed experts + 1 shared expert (e.g. 385 for Kimi-K2.5)
@@ -121,54 +121,4 @@ def mxfp4_moe_scatter_reduce_q(
     TOPK: int,
     D_HIDDEN: int,
     MB: int,
-) -> None: ...
-
-
-@compile_ops("module_moe_mxfp4_gemm")
-def mxfp4_moe_gemm2_a4w4_mxfp4out(
-    cumsum_tensor: Tensor,
-    inter_sorted_quant: Tensor,
-    inter_sorted_shuffled_scale: Tensor,
-    w3_shuffled_quant: Tensor,
-    w3_shuffled_scale: Tensor,
-    sorted_expert_ids: Tensor,
-    flat_out_q: Tensor,
-    flat_out_scale: Tensor,
-    NE: int,
-    D_HIDDEN: int,
-    D_INTER: int,
-    max_sorted: int,
-) -> None: ...
-
-
-@compile_ops("module_moe_mxfp4_gemm")
-def mxfp4_moe_gemm1_a4w4(
-    cumsum_tensor: Tensor,
-    a_quant: Tensor,
-    a_scale_sorted_shuffled: Tensor,
-    w12_shuffled_quant: Tensor,
-    w12_shuffled_scale: Tensor,
-    sorted_expert_ids: Tensor,
-    m_indices: Tensor,
-    inter_sorted_quant: Tensor,
-    inter_sorted_shuffled_scale: Tensor,
-    hidden_states: Tensor,
-    kernelName: str,
-) -> None: ...
-
-
-@compile_ops("module_moe_mxfp4_gemm")
-def mxfp4_moe_gemm2_a4w4(
-    cumsum_tensor: Tensor,
-    inter_sorted_quant: Tensor,
-    inter_sorted_shuffled_scale: Tensor,
-    w3_shuffled_quant: Tensor,
-    w3_shuffled_scale: Tensor,
-    sorted_token_ids: Tensor,
-    sorted_expert_ids: Tensor,
-    sorted_weights: Tensor,
-    flat_out: Tensor,
-    M_logical: int,
-    max_sorted: int,
-    kernelName: str,
 ) -> None: ...

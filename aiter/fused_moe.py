@@ -47,10 +47,7 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
-_MXFP4_MOE_FLYDSL_ENV = (
-    os.environ.get("AITER_MXFP4_MOE_BACKEND", "hip").lower() == "flydsl"
-)
-# Log the resolved a4w4 gemm backend once per distinct choice (avoids per-call spam).
+# Log the a4w4 gemm backend once (avoids per-call spam).
 _MXFP4_BACKEND_LOGGED: set = set()
 
 
@@ -102,7 +99,7 @@ def _mxfp4_sort_shapes():
     try:
         path = os.path.join(
             AITER_CSRC_DIR,
-            "kernels/mxfp4_moe/gemm_a4w4/codegen/gen_instances.py",
+            "kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py",
         )
         spec = importlib.util.spec_from_file_location("_mxfp4_gen_instances", path)
         mod = importlib.util.module_from_spec(spec)
@@ -661,18 +658,8 @@ def fused_moe_(
     ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
 
     if metadata.mxfp4_hip:
-        # a4w4 runs through the unified stage backend; the gemm engine (HIP vs the
-        # flydsl port) is resolved per stage inside the adapters from the weight
-        # attr / `_FLYDSL` token / AITER_MXFP4_MOE_BACKEND env.
-        _log_mxfp4_backend_once(
-            "flydsl (stage backend)"
-            if (
-                _MXFP4_MOE_FLYDSL_ENV
-                or getattr(w1, "gemm1_backend", None) == "flydsl"
-                or getattr(w2, "gemm2_backend", None) == "flydsl"
-            )
-            else "hip (stage backend)"
-        )
+        # a4w4 gemm1/gemm2 run exclusively on the flydsl port.
+        _log_mxfp4_backend_once("flydsl (stage backend)")
 
     if metadata.pipeline is not None:
         return metadata.pipeline(
@@ -1257,10 +1244,8 @@ def _flydsl_stage2_wrapper(
     )
 
 
-# Kernel names follow the codegen scheme enumerated in
-# csrc/kernels/mxfp4_moe/gemm_a4w4/codegen/gen_instances.py
-# (enumerate_g1_instances / enumerate_g2_instances) -- each name uniquely
-# identifies one template instance (NE / D_HIDDEN / D_INTER / BM / variant).
+# mxfp4 a4w4 gemm1/gemm2 kernel names encode the shape + tile + variant
+# (NE / D_HIDDEN / D_INTER / BM / variant) and route to the FlyDSL port.
 # The "E{n}" tag inside the name encodes D_INTER (per-shard inter_dim) --
 # the single-letter "E" is kept for brevity and does NOT mean expert count.
 # (NE, model_dim/H, inter_dim/E, topk) shapes whose full BM128 non-inline aux
@@ -1398,12 +1383,6 @@ def _is_mxfp4_kname(kname: str) -> bool:
     return bool(kname) and kname.startswith("mxfp4_moe_")
 
 
-def _is_flydsl_mxfp4_kname(kname: str) -> bool:
-    # mxfp4 a4w4 row whose kernel name carries the `_FLYDSL` backend token, i.e.
-    # routed to the FlyDSL gemm engines (_mxfp4_moe_run) instead of HIP.
-    return _is_mxfp4_kname(kname) and "_FLYDSL" in kname
-
-
 def _empty_bf16(device):
     return torch.empty((0,), dtype=dtypes.bf16, device=device)
 
@@ -1434,7 +1413,6 @@ def _mxfp4_a4w4_stage1(
     max_sorted,
     kernelName1,
     device,
-    gemm_backend=None,  # None -> HIP a4w4 gemm1; "flydsl" -> the flydsl port
     use_nt=False,
 ):
     if not inline_quant:
@@ -1470,19 +1448,12 @@ def _mxfp4_a4w4_stage1(
         a_scale_sorted_shuffled = _empty_u8(device)
 
     # -- gemm1: A_q x w1 -> inter (packed MXFP4, sorted layout) ----------
-    # The inter buffer is backend-strided: the flydsl port reads/writes D_INTER;
-    # the HIP gemm K-pads to Kpad_inter (256-multiple) and zero-inits the tail.
+    # The flydsl port reads/writes D_INTER directly (no K-pad tail to zero).
     BM_MIN = 64
-    if gemm_backend == "flydsl":
-        _ia = torch.empty
-        inter_cols = D_INTER // 2
-        inter_scale_cols = D_INTER // 32
-        inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
-    else:
-        _ia = torch.zeros if Kpad_inter != D_INTER else torch.empty
-        inter_cols = Kpad_inter // 2
-        inter_scale_cols = Kpad_inter // 32
-        inter_scale_bytes = max_sorted * (1024 // BM_MIN) * 4
+    _ia = torch.empty
+    inter_cols = D_INTER // 2
+    inter_scale_cols = D_INTER // 32
+    inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
     inter_sorted_quant = _ia(
         (max_sorted, inter_cols), device=device, dtype=torch.uint8
     )
@@ -1492,43 +1463,28 @@ def _mxfp4_a4w4_stage1(
         (inter_scale_rows, inter_scale_cols), device=device, dtype=torch.uint8
     )
 
-    if gemm_backend == "flydsl":
-        from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
-        flydsl_mxfp4_gemm1(
-            a_quant=a_quant,
-            a_scale_sorted_shuffled=a_scale_sorted_shuffled,
-            w1_u8=w1,
-            w1_scale_u8=_mxfp4_scale_u8(w1_scale),
-            sorted_expert_ids=sorted_expert_ids,
-            cumsum_tensor=cumsum_tensor,
-            m_indices=m_indices,
-            inter_sorted_quant=inter_sorted_quant,
-            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-            hidden_states=hidden_states,
-            n_tokens=hidden_states.shape[0],
-            BM=BM,
-            use_nt=use_nt,
-            inline_quant=inline_quant,
-            NE=NE,
-            D_HIDDEN=D_HIDDEN,
-            D_INTER=D_INTER,
-            topk=topk,
-        )
-    else:
-        aiter.mxfp4_moe_gemm1_a4w4(
-            cumsum_tensor=cumsum_tensor,
-            a_quant=a_quant,
-            a_scale_sorted_shuffled=a_scale_sorted_shuffled,
-            w12_shuffled_quant=w1,
-            w12_shuffled_scale=w1_scale,
-            sorted_expert_ids=sorted_expert_ids,
-            m_indices=m_indices,
-            inter_sorted_quant=inter_sorted_quant,
-            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-            hidden_states=hidden_states,
-            kernelName=kernelName1,
-        )
+    flydsl_mxfp4_gemm1(
+        a_quant=a_quant,
+        a_scale_sorted_shuffled=a_scale_sorted_shuffled,
+        w1_u8=w1,
+        w1_scale_u8=_mxfp4_scale_u8(w1_scale),
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=cumsum_tensor,
+        m_indices=m_indices,
+        inter_sorted_quant=inter_sorted_quant,
+        inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+        hidden_states=hidden_states,
+        n_tokens=hidden_states.shape[0],
+        BM=BM,
+        use_nt=use_nt,
+        inline_quant=inline_quant,
+        NE=NE,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        topk=topk,
+    )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
 
@@ -1555,7 +1511,6 @@ def _mxfp4_a4w4_stage2(
     D_INTER,
     BM,
     device,
-    gemm_backend=None,  # None -> HIP a4w4 gemm2; "flydsl" -> the flydsl port
     use_nt=False,
     cshuffle=False,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
@@ -1566,45 +1521,6 @@ def _mxfp4_a4w4_stage2(
         _mx_shape_ok = (
             BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
         )
-
-        if _mx_shape_ok and int(os.environ.get("AITER_MXFP4_INTERMEDIATE", "0")) == 2:
-            from aiter.ops.quant import quant_mxfp4_hip
-            from aiter.utility import fp4_utils
-
-            out_buf = torch.zeros(
-                (max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device
-            )
-            aiter.mxfp4_moe_gemm2_a4w4(
-                cumsum_tensor=cumsum_tensor,
-                inter_sorted_quant=inter_sorted_quant,
-                inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-                w3_shuffled_quant=w2,
-                w3_shuffled_scale=w2_scale,
-                sorted_token_ids=sorted_token_ids,
-                sorted_expert_ids=sorted_expert_ids,
-                sorted_weights=sorted_weights,
-                flat_out=out_buf,
-                M_logical=M,
-                max_sorted=max_sorted,
-                kernelName=kernelName2.replace("_MXFP4OUT", ""),
-            )
-            pk, sc = quant_mxfp4_hip(out_buf, group_size=32)
-            deq = fp4_utils.mxfp4_to_f32(pk.view(torch.uint8)) * fp4_utils.e8m0_to_f32(
-                sc.view(torch.uint8)
-            ).float().repeat_interleave(32, dim=-1)
-            out_buf = deq.to(dtypes.bf16)
-            out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
-            aiter.mxfp4_moe_scatter_reduce(
-                flat_out=out_buf,
-                reverse_sorted=reverse_sorted,
-                sorted_weights=sorted_weights,
-                out=out,
-                NE=NE,
-                TOPK=topk,
-                D_HIDDEN=D_HIDDEN,
-                MB=BM,
-            )
-            return out
 
         # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
         if (
@@ -1618,48 +1534,32 @@ def _mxfp4_a4w4_stage2(
             flat_out_scale = torch.empty(
                 (max_sorted, D_HIDDEN // 32), dtype=torch.uint8, device=device
             )
-            if gemm_backend == "flydsl":
-                from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
+            from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
 
-                flydsl_mxfp4_gemm2(
-                    inter_sorted_quant=inter_sorted_quant,
-                    inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-                    w2_u8=w2,
-                    w2_scale_u8=_mxfp4_scale_u8(w2_scale),
-                    sorted_expert_ids=sorted_expert_ids,
-                    cumsum_tensor=cumsum_tensor,
-                    sorted_token_ids=sorted_token_ids,
-                    sorted_weights=sorted_weights,
-                    flat_out=flat_out_q,
-                    flat_out_scale=flat_out_scale,
-                    M_logical=M,
-                    max_sorted=max_sorted,
-                    BM=BM,
-                    use_nt=use_nt,
-                    atomic=False,
-                    mxfp4out=True,
-                    cshuffle=cshuffle,
-                    NE=NE,
-                    D_HIDDEN=D_HIDDEN,
-                    D_INTER=D_INTER,
-                    D_INTER_REAL=inter_real,
-                    topk=topk,
-                )
-            else:
-                aiter.mxfp4_moe_gemm2_a4w4_mxfp4out(
-                    cumsum_tensor=cumsum_tensor,
-                    inter_sorted_quant=inter_sorted_quant,
-                    inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-                    w3_shuffled_quant=w2,
-                    w3_shuffled_scale=w2_scale,
-                    sorted_expert_ids=sorted_expert_ids,
-                    flat_out_q=flat_out_q,
-                    flat_out_scale=flat_out_scale,
-                    NE=NE,
-                    D_HIDDEN=D_HIDDEN,
-                    D_INTER=D_INTER,
-                    max_sorted=max_sorted,
-                )
+            flydsl_mxfp4_gemm2(
+                inter_sorted_quant=inter_sorted_quant,
+                inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+                w2_u8=w2,
+                w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+                sorted_expert_ids=sorted_expert_ids,
+                cumsum_tensor=cumsum_tensor,
+                sorted_token_ids=sorted_token_ids,
+                sorted_weights=sorted_weights,
+                flat_out=flat_out_q,
+                flat_out_scale=flat_out_scale,
+                M_logical=M,
+                max_sorted=max_sorted,
+                BM=BM,
+                use_nt=use_nt,
+                atomic=False,
+                mxfp4out=True,
+                cshuffle=cshuffle,
+                NE=NE,
+                D_HIDDEN=D_HIDDEN,
+                D_INTER=D_INTER,
+                D_INTER_REAL=inter_real,
+                topk=topk,
+            )
             out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
             aiter.mxfp4_moe_scatter_reduce_q(
                 flat_out_q=flat_out_q,
@@ -1681,47 +1581,31 @@ def _mxfp4_a4w4_stage2(
         # Non-atomic bf16: per-sorted-row staging; scatter_reduce afterwards.
         out_buf = torch.empty((max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
 
-    if gemm_backend == "flydsl":
-        from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
+    from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
 
-        flydsl_mxfp4_gemm2(
-            inter_sorted_quant=inter_sorted_quant,
-            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-            w2_u8=w2,
-            w2_scale_u8=_mxfp4_scale_u8(w2_scale),
-            sorted_expert_ids=sorted_expert_ids,
-            cumsum_tensor=cumsum_tensor,
-            sorted_token_ids=sorted_token_ids,
-            sorted_weights=sorted_weights,
-            flat_out=out_buf,
-            M_logical=M,
-            max_sorted=max_sorted,
-            BM=BM,
-            use_nt=use_nt,
-            atomic=atomic,
-            mxfp4out=False,
-            cshuffle=cshuffle,
-            NE=NE,
-            D_HIDDEN=D_HIDDEN,
-            D_INTER=D_INTER,
-            D_INTER_REAL=inter_real,
-            topk=topk,
-        )
-    else:
-        aiter.mxfp4_moe_gemm2_a4w4(
-            cumsum_tensor=cumsum_tensor,
-            inter_sorted_quant=inter_sorted_quant,
-            inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
-            w3_shuffled_quant=w2,
-            w3_shuffled_scale=w2_scale,
-            sorted_token_ids=sorted_token_ids,
-            sorted_expert_ids=sorted_expert_ids,
-            sorted_weights=sorted_weights,
-            flat_out=out_buf,
-            M_logical=M,
-            max_sorted=max_sorted,
-            kernelName=kernelName2,
-        )
+    flydsl_mxfp4_gemm2(
+        inter_sorted_quant=inter_sorted_quant,
+        inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
+        w2_u8=w2,
+        w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=cumsum_tensor,
+        sorted_token_ids=sorted_token_ids,
+        sorted_weights=sorted_weights,
+        flat_out=out_buf,
+        M_logical=M,
+        max_sorted=max_sorted,
+        BM=BM,
+        use_nt=use_nt,
+        atomic=atomic,
+        mxfp4out=False,
+        cshuffle=cshuffle,
+        NE=NE,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        D_INTER_REAL=inter_real,
+        topk=topk,
+    )
 
     if atomic:
         return out_buf
@@ -1758,20 +1642,12 @@ def _mxfp4_a4w4_stage1_fw(
     kernelName1="",
     m_indices=None,
     moe_buf=None,
-    gemm_backend=None,
     **_kwargs,
 ):
     device = hidden_states.device
     p1 = _parse_mxfp4_g1_kname(kernelName1)
     BM = p1["BM"]
     inline_quant = p1["inline_quant"]
-    # Resolve the gemm1 engine BEFORE any w1.view() drops the attr: weight attr
-    # wins, else a `_FLYDSL` kernel-name token or the AITER_MXFP4_MOE_BACKEND env.
-    gemm1_backend = getattr(w1, "gemm1_backend", None) or (
-        "flydsl"
-        if (_is_flydsl_mxfp4_kname(kernelName1) or _MXFP4_MOE_FLYDSL_ENV)
-        else None
-    )
     if w1.element_size() == 1 and w1.dtype != torch.uint8:
         w1 = w1.view(torch.uint8)
     NE = w1.shape[0]
@@ -1808,7 +1684,6 @@ def _mxfp4_a4w4_stage1_fw(
         max_sorted=sorted_token_ids.shape[0],
         kernelName1=kernelName1,
         device=device,
-        gemm_backend=gemm1_backend,
         use_nt=p1["use_nt"],
     )
 
@@ -1829,7 +1704,6 @@ def _mxfp4_a4w4_stage2_fw(
     sorted_weights=None,
     kernelName2="",
     reverse_sorted=None,
-    gemm_backend=None,
     **_kwargs,
 ):
 
@@ -1838,28 +1712,14 @@ def _mxfp4_a4w4_stage2_fw(
     BM = p2["BM"]
     atomic = p2["atomic"]
     mxfp4out = p2.get("mxfp4out", False)
-    # Resolve the gemm2 engine + read inter_real BEFORE any w2.view() drops attrs.
-    gemm2_backend = getattr(w2, "gemm2_backend", None) or (
-        "flydsl"
-        if (_is_flydsl_mxfp4_kname(kernelName2) or _MXFP4_MOE_FLYDSL_ENV)
-        else None
-    )
+    # Read inter_real BEFORE any w2.view() drops the attr. The flydsl port reads
+    # D_INTER directly (D_INTER_REAL handles the unpadded shard); no K-pad needed.
     inter_real = getattr(w2, "inter_real", None)
     if w2.element_size() == 1 and w2.dtype != torch.uint8:
         w2 = w2.view(torch.uint8)
     NE = w2.shape[0]
     D_HIDDEN = w2.shape[1]
     D_INTER = w1.shape[1] // 2
-    # HIP gemm2 needs K (= D_INTER) 256-aligned -> zero-pad w2/w2_scale. The flydsl
-    # port reads D_INTER directly (D_INTER_REAL handles the unpadded shard).
-    if gemm2_backend != "flydsl":
-        Kpad_inter = ((D_INTER + 255) // 256) * 256
-        if Kpad_inter != D_INTER:
-            w2 = torch.nn.functional.pad(w2, (0, (Kpad_inter - D_INTER) // 2))
-            if w2_scale is not None:
-                w2_scale = torch.nn.functional.pad(
-                    w2_scale, (0, (Kpad_inter - D_INTER) // 32)
-                )
     M = moe_out.shape[0]
     out = _mxfp4_a4w4_stage2(
         inter_states,
@@ -1883,7 +1743,6 @@ def _mxfp4_a4w4_stage2_fw(
         D_INTER=D_INTER,
         BM=BM,
         device=device,
-        gemm_backend=gemm2_backend,
         use_nt=p2["use_nt"],
         cshuffle=p2.get("cshuffle", False),
         inter_real=inter_real,
