@@ -70,13 +70,24 @@ from test_flydsl_grouped_gemm_gfx1250 import (
     SCALE_BLOCK,
     _gguu_to_gugu_rows,
     _logits_diff,
-    _make_topk,
     _pattern_packed,
     _run_grouped_via_fused_moe,
     init_weight_scales,
     is_gfx1250,
     set_data_format,
 )
+
+
+def _make_topk_torch(
+    hidden_states: torch.Tensor, experts: int, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch topk routing — avoids ``fused_topk`` which triggers
+    ``module_moe_asm`` JIT compilation (CK cannot compile for gfx1250)."""
+    tokens = hidden_states.shape[0]
+    score = torch.randn((tokens, experts), dtype=torch.float32, device=hidden_states.device)
+    topk_w, topk_id = torch.topk(torch.softmax(score, dim=-1), topk, dim=-1)
+    topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+    return topk_id.to(torch.int32), topk_w
 
 # Build every tensor straight on the device (mirrors the test module).
 torch.set_default_device("cuda")
@@ -85,7 +96,7 @@ torch.set_default_device("cuda")
 # ---------------------------------------------------------------------------
 # Search space
 # ---------------------------------------------------------------------------
-TUNE_TILE_M = [16, 32, 64, 128, 256]
+TUNE_TILE_M = [16]
 TUNE_M_WARP = [1, 2, 4]
 TUNE_TILE_N = [64, 128, 256, 512]
 TUNE_TILE_K = [128, 256, 512]
@@ -320,7 +331,7 @@ def _prepare_data(
     w1_scale_raw = init_weight_scales(experts, 2 * inter, K // SCALE_BLOCK)
     w2_scale_raw = init_weight_scales(experts, K, inter // SCALE_BLOCK)
     hidden = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
-    topk_id, topk_w = _make_topk(hidden, experts, topk)
+    topk_id, topk_w = _make_topk_torch(hidden, experts, topk)
     topk_w = topk_w.to(torch.bfloat16)
 
     if layout == "gugu":
@@ -463,6 +474,9 @@ def _precision_check(
 ) -> float:
     """Run the full grouped path with this config and return logits_diff vs the
     PyTorch reference (reuses the test module's end-to-end harness)."""
+    import test_flydsl_grouped_gemm_gfx1250 as _test_mod
+    _saved_make_topk = _test_mod._make_topk
+    _test_mod._make_topk = _make_topk_torch
 
     def _run():
         out, ref, _ = _run_grouped_via_fused_moe(
@@ -479,7 +493,10 @@ def _precision_check(
         )
         return _logits_diff(out, ref.to(out.dtype))
 
-    return _with_injected_config(csv_row, _run)
+    try:
+        return _with_injected_config(csv_row, _run)
+    finally:
+        _test_mod._make_topk = _saved_make_topk
 
 
 # ---------------------------------------------------------------------------
