@@ -16,6 +16,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr import arith as _arith
+from flydsl.expr.arith import CmpFPredicate
 from flydsl.expr.typing import T
 
 
@@ -487,6 +488,132 @@ def _fp4x4_in_i32_to_bf16x4_i64(nib_i32, arith, vector, scale_val=None):
     return vector.extract(v64, static_position=[0], dynamic_position=[])
 
 
+def _fp4x4_nibbles_to_fp8x4_i32(nib_i32, arith):
+    """Map 4 E2M1 codes (low nibble of each byte of ``nib_i32``) to 4 E4M3FNUZ
+    fp8 bytes packed in one i32, with branchless SWAR integer ops.
+
+    E2M1 magnitude (mag = code & 7) -> E4M3FNUZ byte via a single ``v_perm_b32``
+    byte-LUT (mag is already a 0..7 byte index):
+      mag: 0    1    2    3    4    5    6    7
+      fp8: 0x00 0x38 0x40 0x44 0x48 0x4C 0x50 0x54
+    The sign bit (code bit3) goes to fp8 bit7, forced off when mag==0 so E2M1
+    -0.0 maps to fp8 +0.0 (0x80 is NaN in FNUZ), matching ``mxfp4_to_f32``.
+
+    The fp8 magnitudes equal the E2M1 magnitudes exactly (E2M1's 8 values are a
+    subset of E4M3), so this remap is lossless -- no scale is folded here; the
+    per-32 E8M0 block scale is applied later (deferred post-MFMA).
+    """
+    from flydsl.expr import rocdl
+
+    c7 = fx.Int32(7)
+    mag = nib_i32 & fx.Int32(0x07070707)
+    # v_perm_b32 byte pool {SRC_HI:SRC_LO}: sel 0..3 -> SRC_LO bytes, 4..7 -> SRC_HI.
+    src_lo = fx.Int32(0x44403800)  # bytes[0..3] = fp8[mag 0..3]
+    src_hi = fx.Int32(0x54504C48)  # bytes[4..7] = fp8[mag 4..7]
+    magbyte = _arith.ArithValue(
+        rocdl.perm_b32(_arith._to_raw(src_hi), _arith._to_raw(src_lo), _arith._to_raw(mag))
+    )
+    nz = ((mag + fx.Int32(0x7F7F7F7F)) >> c7) & fx.Int32(0x01010101)  # 1 per byte if mag>=1
+    signbit = (nib_i32 & fx.Int32(0x08080808)) << fx.Int32(4)  # code bit3 -> fp8 bit7 (0x80)
+    signmask = nz << c7  # 0x80 where mag>=1 (drop sign on zero -> avoid FNUZ NaN)
+    return magbyte | (signbit & signmask)
+
+
+def dequant_fp4_to_fp8(packed32, arith, vector):
+    """Decode 8 packed MX-FP4 (E2M1) nibbles -> one i64 of 8 E4M3FNUZ fp8 bytes,
+    the operand for one native fp8 K32 MFMA (``mfma_f32_16x16x32_fp8_fp8``) on
+    gfx942 (CDNA3). Weight decode for the native-fp8 MFMA path.
+
+    ``packed32`` holds 8 nibbles in the shared packed-4-bit layout: byte i = low
+    nibble ``v[i]`` | high nibble ``v[i+4]`` (i in 0..3). The even nibbles
+    ``v0..v3`` and odd nibbles ``v4..v7`` are each remapped E2M1->fp8
+    (``_fp4x4_nibbles_to_fp8x4_i32``) and concatenated so the returned i64 is fp8
+    bytes ``[v0,v1,v2,v3,v4,v5,v6,v7]`` -- the same 8 contiguous-K values the bf16
+    decode path splits across two K16 MFMAs,
+    here fed as a single K32 fp8 operand.
+
+    No scale is folded: the per-32 E8M0 block scale (both activation and weight)
+    is applied as a deferred post-MFMA FMA on the f32 partial, exact because E8M0
+    is a power of two and constant across the block's K reduction.
+    """
+    c_0f0f = fx.Int32(0x0F0F0F0F)
+    even = packed32 & c_0f0f  # v0,v1,v2,v3 in bytes 0..3
+    odd = (packed32 >> fx.Int32(4)) & c_0f0f  # v4,v5,v6,v7 in bytes 0..3
+    fe = _arith._to_raw(_fp4x4_nibbles_to_fp8x4_i32(even, arith))  # fp8[v0..v3]
+    fo = _arith._to_raw(_fp4x4_nibbles_to_fp8x4_i32(odd, arith))  # fp8[v4..v7]
+    v2 = vector.from_elements(T.i32x2, [fe, fo])
+    v64 = vector.bitcast(T.vec(1, T.i64), v2)
+    return vector.extract(v64, static_position=[0], dynamic_position=[])
+
+
+def scale_fp8_i32(fp8_i32, scale_val, arith, vector):
+    """Fold an f32 (power-of-two E8M0) block scale into 4 E4M3FNUZ fp8 bytes.
+
+    Decodes the 4 fp8 bytes to f32 (hardware ``cvt_pk_f32_fp8``), multiplies by
+    ``scale_val``, and re-encodes to fp8 (``cvt_pk_fp8_f32``) with the FNUZ
+    tiny-negative -> +0 guard (avoids the 0x80 NaN encoding). Returns the scaled
+    4 fp8 bytes packed in one i32.
+
+    Native-fp8 activation path: lets the per-32 E8M0 activation scale be applied
+    at the gmem->LDS load while keeping the activation in fp8 (so the native fp8
+    K32 MFMA can consume it). Because E8M0 is a power of two, ``fp8 * 2^k`` is
+    exactly representable in fp8 whenever it stays in range, so this is lossless
+    for in-range blocks (only saturating at the fp8 dynamic-range edges).
+    """
+    from flydsl.expr import rocdl
+
+    lo = rocdl.cvt_pk_f32_fp8(T.f32x2, _arith._to_raw(fp8_i32), word_sel=False)
+    hi = rocdl.cvt_pk_f32_fp8(T.f32x2, _arith._to_raw(fp8_i32), word_sel=True)
+    f = [
+        vector.extract(lo, static_position=[0], dynamic_position=[]),
+        vector.extract(lo, static_position=[1], dynamic_position=[]),
+        vector.extract(hi, static_position=[0], dynamic_position=[]),
+        vector.extract(hi, static_position=[1], dynamic_position=[]),
+    ]
+    c0 = arith.constant(0.0, type=T.f32)
+    c_neg_uf = arith.constant(-(2.0**-8), type=T.f32)
+    scaled = []
+    for fv in f:
+        sv = arith.ArithValue(_arith._to_raw(fv)) * scale_val
+        # FNUZ guard: values in (-2^-8, 0) round to 0x80 (NaN); clamp to +0.
+        is_tn = arith.andi(
+            arith.cmpf(CmpFPredicate.OLT, _arith._to_raw(sv), c0),
+            arith.cmpf(CmpFPredicate.OGT, _arith._to_raw(sv), c_neg_uf),
+        )
+        scaled.append(arith.select(is_tn, c0, sv))
+    p = arith.constant(0, type=T.i32)
+    p = rocdl.cvt_pk_fp8_f32(T.i32, scaled[0], scaled[1], p, 0)
+    p = rocdl.cvt_pk_fp8_f32(T.i32, scaled[2], scaled[3], p, 1)
+    return p
+
+
+def scale_fp8x8_i64(fp8_i64, scale_val, arith, vector):
+    """Fold an f32 (power-of-two E8M0) block scale into 8 E4M3FNUZ fp8 bytes (i64).
+
+    Splits the i64 into its two i32 halves and applies :func:`scale_fp8_i32` to
+    each, returning the scaled 8 fp8 bytes packed back into one i64. Because the
+    scale is a power of two, ``fp8 * 2^k`` is exact in fp8 for in-range values,
+    so this is lossless (only saturating at the fp8 dynamic-range edges).
+
+    Native-fp8 weight path: lets the per-32 E8M0 *weight* block scale be folded into
+    the fp8 weight operand *before* the K32 MFMA. Necessary because a single fp8
+    16x16x32 MFMA reduces K across two MX-FP4 blocks (the K layout pairs each lane
+    group ``klane`` with the contiguous stripe ``K[klane*16 .. +15]`` -> block
+    ``klane//2``), so a deferred post-MFMA scalar cannot represent the per-block
+    weight scale. Each lane's 8 weight bytes lie in exactly one block, so folding
+    one ``scale_val`` per (lane, K64 step) is exact.
+    """
+    v1 = vector.from_elements(T.vec(1, T.i64), [_arith._to_raw(fp8_i64)])
+    v2 = vector.bitcast(T.i32x2, v1)
+    lo = vector.extract(v2, static_position=[0], dynamic_position=[])
+    hi = vector.extract(v2, static_position=[1], dynamic_position=[])
+    slo = scale_fp8_i32(lo, scale_val, arith, vector)
+    shi = scale_fp8_i32(hi, scale_val, arith, vector)
+    out2 = vector.from_elements(T.i32x2, [_arith._to_raw(slo), _arith._to_raw(shi)])
+    out64 = vector.bitcast(T.vec(1, T.i64), out2)
+    return vector.extract(out64, static_position=[0], dynamic_position=[])
+
+
 def _fp4x4_in_i32_to_bf16x4_i64_via_fp8(nib_i32, arith, vector):
     """Fast E2M1->bf16 for 4 nibbles (low nibble of each byte of ``nib_i32``).
 
@@ -507,18 +634,7 @@ def _fp4x4_in_i32_to_bf16x4_i64_via_fp8(nib_i32, arith, vector):
     """
     from flydsl.expr import rocdl
 
-    c7 = fx.Int32(7)
-    mag = nib_i32 & fx.Int32(0x07070707)
-    # v_perm_b32 byte pool {SRC_HI:SRC_LO}: sel 0..3 -> SRC_LO bytes, 4..7 -> SRC_HI.
-    src_lo = fx.Int32(0x44403800)  # bytes[0..3] = fp8[mag 0..3]
-    src_hi = fx.Int32(0x54504C48)  # bytes[4..7] = fp8[mag 4..7]
-    magbyte = _arith.ArithValue(
-        rocdl.perm_b32(_arith._to_raw(src_hi), _arith._to_raw(src_lo), _arith._to_raw(mag))
-    )
-    nz = ((mag + fx.Int32(0x7F7F7F7F)) >> c7) & fx.Int32(0x01010101)  # 1 per byte if mag>=1
-    signbit = (nib_i32 & fx.Int32(0x08080808)) << fx.Int32(4)  # code bit3 -> fp8 bit7 (0x80)
-    signmask = nz << c7  # 0x80 where mag>=1 (drop sign on zero -> avoid FNUZ NaN)
-    fp8_i32 = magbyte | (signbit & signmask)
+    fp8_i32 = _fp4x4_nibbles_to_fp8x4_i32(nib_i32, arith)
 
     lo = rocdl.cvt_pk_f32_fp8(T.f32x2, _arith._to_raw(fp8_i32), word_sel=False)
     hi = rocdl.cvt_pk_f32_fp8(T.f32x2, _arith._to_raw(fp8_i32), word_sel=True)
@@ -648,15 +764,35 @@ def load_b_pack_k32(
     kpack_bytes: int = 16,
     elem_bytes: int = 1,
     unpack_int4: bool = False,
+    return_raw_packed32: bool = False,
+    klane_override: ir.Value = None,
+    half_override: ir.Value = None,
 ) -> ir.Value:
     """Load one B pack for one MFMA(x32) micro-step.
 
     Returns an i64 Value containing 8 bytes consumed by MFMA.
+
+    When ``return_raw_packed32`` is set (requires the packed-4bit layout,
+    ``kpack_bytes=8``), returns the raw ``packed32`` (8 packed 4-bit codes)
+    using this loader's K32 addressing -- the caller decodes it (e.g. MX-FP4
+    E2M1->fp8 for the native-fp8 path) so the weight K-layout matches
+    the fp8 activation LDS layout (which this loader is co-designed with),
+    unlike the bf16/16x16x16 ``load_b_raw_w4a16`` addressing.
+
+    ``klane_override`` / ``half_override`` (runtime ``ir.Value``s, default
+    ``None``) re-route the K-lane coordinate (``k1``) and the within-pack 8-code
+    half (``k2``) WITHOUT changing the B memory layout. They exist for the
+    native-fp8 stage2 "block-major" read: each fp8 K32 MFMA must consume exactly one MX
+    (per-32) scale block, which requires distributing one block's 32 K across all
+    4 lane groups (8 each) instead of the default 16-contiguous-per-lane stripe.
+    Only the per-lane addressing of the same preshuffled bytes changes.
     """
     if kpack_bytes not in (8, 16):
         raise ValueError(f"kpack_bytes must be 8 or 16, got {kpack_bytes!r}")
     if unpack_int4 and kpack_bytes != 8:
         raise ValueError("unpack_int4 requires kpack_bytes=8 (packed int4 layout)")
+    if return_raw_packed32 and kpack_bytes != 8:
+        raise ValueError("return_raw_packed32 requires kpack_bytes=8 (packed 4-bit layout)")
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
 
@@ -664,14 +800,17 @@ def load_b_pack_k32(
     base_k_bytes = base_k * arith.constant(int(elem_bytes), index=True)
     k0_base = base_k_bytes // c64
     k0 = k0_base + arith.constant(ki_step // 2, index=True)
-    k1 = lane_div_16
+    k1 = lane_div_16 if klane_override is None else klane_override
     half_bytes = kpack_bytes // 2
-    k2_base = arith.constant((ki_step % 2) * half_bytes, index=True)
+    if half_override is None:
+        k2_base = arith.constant((ki_step % 2) * half_bytes, index=True)
+    else:
+        k2_base = half_override * arith.constant(half_bytes, index=True)
 
     coord_pack = (n_blk, k0, k1, n_intra, fx.Index(0))
     idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
 
-    if unpack_int4:
+    if unpack_int4 or return_raw_packed32:
         idx_bytes = idx_pack + k2_base
         b4 = _buffer_load_vec(
             buffer_ops,
@@ -688,6 +827,8 @@ def load_b_pack_k32(
             static_position=[0],
             dynamic_position=[],
         )
+        if return_raw_packed32:
+            return packed32
         even, odd = _unpack_int4_to_int8_pair(packed32)
         return _pack_i32_pair_to_i64(even, odd, vector)
 

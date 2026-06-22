@@ -359,7 +359,7 @@ def get_flydsl_stage1_kernels_fp4_bf16(out_dtype: str) -> Dict[str, Dict]:
 
     Decode path: dequant E2M1->bf16 + per-32 E8M0 block scale, legacy bf16 MFMA.
     Tile set mirrors int4_bf16 (the reuse template); configs whose LDS footprint
-    exceeds the CDNA3 64 KiB budget are dropped (ticket Track A LDS guard).
+    exceeds the CDNA3 64 KiB budget are dropped (LDS-footprint guard).
     """
     kernels = {}
     a_dtype = "bf16"
@@ -492,12 +492,16 @@ def compile_flydsl_moe_stage1(
         # the moe_gemm_2stage in-kernel dequant + legacy bf16 MFMA decode path.
         #   a16w4 (bf16 act)  -> in_dtype="fp4_bf16"  (weight decode only)
         #   a8w4  (fp8 act)   -> in_dtype="a8w4_bf16" (fp8 A decode + FP4 weight)
+        # Native fp8 MFMA path (opt-in via AITER_FLYDSL_A8W4_FP8=1):
+        #   a8w4  (fp8 act)   -> in_dtype="a8w4_fp8"  (fp8 A + FP4->fp8 weight, fp8 MFMA)
         _decode_in_dtype = None
         if not _has_scaled_mxfp4_mfma():
             if a_dtype == "bf16":
                 _decode_in_dtype = "fp4_bf16"
             elif a_dtype == "fp8":
-                _decode_in_dtype = "a8w4_bf16"
+                _decode_in_dtype = (
+                    "a8w4_fp8" if os.environ.get("AITER_FLYDSL_A8W4_FP8", "0") == "1" else "a8w4_bf16"
+                )
         if _decode_in_dtype is not None:
             from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
@@ -605,12 +609,16 @@ def compile_flydsl_moe_stage2(
     if b_dtype == "fp4":
         # gfx942 decode routing (see compile_flydsl_moe_stage1):
         #   a16w4 (bf16 act) -> fp4_bf16 ; a8w4 (fp8 act) -> a8w4_bf16.
+        # Native fp8 MFMA path (opt-in via AITER_FLYDSL_A8W4_FP8=1):
+        #   a8w4  (fp8 act)  -> in_dtype="a8w4_fp8"  (fp8 A2 + FP4->fp8 weight, fp8 MFMA)
         _decode_in_dtype = None
         if not _has_scaled_mxfp4_mfma():
             if a_dtype == "bf16":
                 _decode_in_dtype = "fp4_bf16"
             elif a_dtype == "fp8":
-                _decode_in_dtype = "a8w4_bf16"
+                _decode_in_dtype = (
+                    "a8w4_fp8" if os.environ.get("AITER_FLYDSL_A8W4_FP8", "0") == "1" else "a8w4_bf16"
+                )
         if _decode_in_dtype is not None:
             from .kernels.moe_gemm_2stage import compile_moe_gemm2
 

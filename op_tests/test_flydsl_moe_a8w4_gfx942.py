@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FlyDSL MX-FP4 a8w4 fused-MoE correctness test (Track B / B1).
+"""gfx942 FlyDSL MX-FP4 a8w4 fused-MoE correctness test.
+
+Covers both a8w4 decode strategies: the default bf16-decode path (decode fp8
+activation and FP4 weight to bf16, legacy bf16 MFMA) and the native-fp8 path
+(keep activation fp8, decode FP4 weight to fp8, native fp8 16x16x32 MFMA).
 
 a8w4 = MX-FP8 activation (E4M3FNUZ, per-1x32 E8M0 scale) x MX-FP4 (E2M1,
 per-1x32 E8M0 scale) weight.
@@ -10,8 +14,8 @@ On gfx942 (CDNA3) there is no scaled MX-FP4 MFMA, so the FlyDSL path dequantizes
 BOTH operands to bf16 in-kernel -- fp8 activation via ``dequant_fp8_to_bf16``
 (folding the per-32 E8M0 A-scale) and FP4 weight via ``dequant_fp4_to_bf16``
 (folding the per-32 E8M0 weight scale) -- then runs the legacy bf16 MFMA hot
-loop (the ``moe_gemm_2stage`` ``in_dtype="a8w4_bf16"`` kernels, B1 of the
-ticket). This test exercises those (vendored) kernels directly and through the
+loop (the ``moe_gemm_2stage`` ``in_dtype="a8w4_bf16"`` kernels, the bf16-decode
+path). This test exercises those (vendored) kernels directly and through the
 public bridge, validating both stages against a torch reference that decodes the
 fp8 codes and the E2M1 codes and applies the per-32 power-of-two block scales.
 
@@ -132,17 +136,21 @@ def _prep_w4(codes_i8: torch.Tensor):
     return _pack_shuffled_int8_to_packed_int4_no_perm(shuf).contiguous()
 
 
-def _gen_w1(dev, experts, inter_dim, model_dim, group_size):
+def _gen_w1(dev, experts, inter_dim, model_dim, group_size, fp8native: bool = False):
     N1 = 2 * inter_dim
     codes = torch.randint(0, 16, (experts, N1, model_dim), device=dev, dtype=torch.int8)
     exps = torch.randint(-2, 3, (experts, model_dim // group_size, N1), device=dev)
     scale_groups = torch.pow(2.0, exps.to(torch.float32))
+    # The native-fp8 MFMA path reuses the SAME packed-4-bit weight layout as the
+    # bf16-decode path: the fp8 K32 MFMA pairs each lane group with the contiguous
+    # K stripe the 16x16 preshuffle already produces; only the in-kernel scale
+    # wiring differs.
     kernel = _prep_w4(codes)
     scale_1d = shuffle_scale_for_int4(scale_groups, group_size=group_size).view(-1).contiguous()
     return codes, scale_groups, kernel, scale_1d
 
 
-def _gen_w2(dev, experts, inter_dim, model_dim, group_size):
+def _gen_w2(dev, experts, inter_dim, model_dim, group_size, fp8native: bool = False):
     codes = torch.randint(0, 16, (experts, model_dim, inter_dim), device=dev, dtype=torch.int8)
     exps = torch.randint(-2, 3, (experts, inter_dim // group_size, model_dim), device=dev)
     scale_groups = torch.pow(2.0, exps.to(torch.float32))
@@ -223,6 +231,43 @@ def _run_stage1(tokens, model_dim, inter_dim, experts, topk, tile_m, tile_n, til
     return g, out, ref
 
 
+def _run_stage1_fp8native(tokens, model_dim, inter_dim, experts, topk, tile_m, tile_n, tile_k, group_size=32):
+    """Native fp8 MFMA path (in_dtype='a8w4_fp8'). Same inputs/args as the
+    bf16-decode path.
+
+    Returns (g, out, ref). The activation per-32 E8M0 scale is folded into fp8 at
+    load (exact for in-range blocks); the MX-FP4 weight is remapped E2M1->fp8 and
+    its per-32 E8M0 block scale is folded into the fp8 weight operand *before* the
+    K32 MFMA (a single fp8 16x16x32 MFMA reduces K across two MX blocks, so a
+    deferred post-MFMA scalar cannot represent the per-block scale).
+    """
+    g = _gen_common(tokens, model_dim, inter_dim, experts, topk, tile_m, group_size)
+    dev = g["dev"]
+    w1_codes, scale_w1_groups, w1_kernel, scale_w1_1d = _gen_w1(
+        dev, experts, inter_dim, model_dim, group_size, fp8native=True
+    )
+    out = torch.empty((tokens, topk, inter_dim), device=dev, dtype=torch.bfloat16)
+
+    exe = compile_moe_gemm1(
+        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
+        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage1=False,
+        in_dtype="a8w4_fp8", group_size=group_size, out_dtype="bf16",
+        use_cshuffle_epilog=False, scale_is_bf16=False,
+    )
+    args = (
+        out, g["a_fp8"], w1_kernel, g["a_scale_1d"], scale_w1_1d,
+        g["sorted_ids"], g["sorted_expert_ids"], g["sorted_weights"].view(-1),
+        g["num_valid_ids"], tokens, inter_dim, model_dim, g["blocks"],
+        torch.cuda.current_stream(),
+    )
+    compiled = flyc.compile(exe, *args)
+    compiled(*args)
+    torch.cuda.synchronize()
+
+    ref = _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, group_size)
+    return g, out, ref
+
+
 def _run_stage2(g, a2_fp8, a2_scale_1d, tokens, model_dim, inter_dim, experts, topk,
                 tile_m, tile_n, tile_k, group_size=32):
     dev = g["dev"]
@@ -235,6 +280,46 @@ def _run_stage2(g, a2_fp8, a2_scale_1d, tokens, model_dim, inter_dim, experts, t
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage2=True,
         in_dtype="a8w4_bf16", group_size=group_size, out_dtype="bf16",
+        accumulate=True, scale_is_bf16=False,
+    )
+    args = (
+        target, a2_fp8.reshape(tokens * topk, inter_dim), w2_kernel, a2_scale_1d, scale_w2_1d,
+        g["sorted_ids"], g["sorted_expert_ids"], g["sorted_weights"].view(-1),
+        g["num_valid_ids"], tokens, model_dim, inter_dim, g["blocks"],
+        torch.cuda.current_stream(),
+    )
+    compiled = flyc.compile(exe, *args)
+    target.zero_()
+    compiled(*args)
+    torch.cuda.synchronize()
+
+    ref = _ref_stage2(g, a2_fp8, a2_scale_groups_from_1d(a2_scale_1d, tokens * topk, inter_dim, group_size),
+                      w2_codes, scale_w2_groups, model_dim, group_size)
+    return target, ref
+
+
+def _run_stage2_fp8native(g, a2_fp8, a2_scale_1d, tokens, model_dim, inter_dim, experts, topk,
+                          tile_m, tile_n, tile_k, group_size=32):
+    """Stage2 (down projection) native fp8 MFMA path (in_dtype='a8w4_fp8').
+
+    Same inputs/args as the bf16-decode ``_run_stage2``. The A2 activation (stage1
+    output, requantized to fp8 with per-32 E8M0 scales) stays fp8 -- its per-32
+    scale is folded into the fp8 value at the gmem->LDS load (exact for in-range
+    blocks). The MX-FP4 down weight is remapped E2M1->fp8 and its per-32 E8M0 block
+    scale is folded into the fp8 weight operand *before* each K32 MFMA (one fp8
+    16x16x32 MFMA reduces K across two MX blocks, so a deferred post-MFMA scalar
+    cannot represent the per-block scale).
+    """
+    dev = g["dev"]
+    w2_codes, scale_w2_groups, w2_kernel, scale_w2_1d = _gen_w2(
+        dev, experts, inter_dim, model_dim, group_size, fp8native=True
+    )
+    target = torch.zeros((tokens, model_dim), device=dev, dtype=torch.bfloat16)
+
+    exe = compile_moe_gemm2(
+        model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
+        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage2=True,
+        in_dtype="a8w4_fp8", group_size=group_size, out_dtype="bf16",
         accumulate=True, scale_is_bf16=False,
     )
     args = (
@@ -315,6 +400,17 @@ def test_a8w4_stage1_gfx942():
 
 
 @pytest.mark.skipif(not _is_gfx942(), reason="gfx942-only decode path")
+def test_a8w4_stage1_fp8native_gfx942():
+    """Stage1 native fp8 MFMA vs torch ref AND vs the bf16-decode MFMA path."""
+    g, out, ref = _run_stage1_fp8native(**_SHAPE)
+    ok_ref = _check(ref, out, "stage1_a8w4_fp8native")
+    # Same seed/inputs as the bf16-decode path: cross-check the two match numerically.
+    _, out_bf16, _ = _run_stage1(**_SHAPE)
+    ok_cross = _check(out_bf16.float(), out.float(), "stage1_fp8native_vs_bf16decode", rel_l2_max=0.05)
+    assert ok_ref and ok_cross
+
+
+@pytest.mark.skipif(not _is_gfx942(), reason="gfx942-only decode path")
 def test_a8w4_stage2_gfx942():
     g, out1, ref1 = _run_stage1(**_SHAPE)
     a2_fp8, a2_scale = _quant_a2(out1.float(), 32)
@@ -334,6 +430,62 @@ def test_a8w4_stage2_bridge_gfx942():
     a2_fp8, a2_scale = _quant_a2(out1.reshape(ref1.shape).float(), 32)
     out, ref = _run_stage2_bridge(g, a2_fp8, a2_scale.view(-1).contiguous(), **_SHAPE)
     assert _check(ref, out, "stage2_a8w4_bridge")
+
+
+@pytest.mark.skipif(not _is_gfx942(), reason="gfx942-only decode path")
+def test_a8w4_stage2_fp8native_gfx942():
+    """Stage2 native fp8 MFMA vs torch ref AND vs the bf16-decode MFMA path.
+
+    The bf16-decode and native-fp8 stage2 kernels consume bit-identical inputs:
+    the same A2 activation (a single bf16-decode stage1 output, requantized once)
+    and -- via reseeding right before each weight build -- the same MX-FP4 down
+    weight + scales.
+    """
+    g, out1, ref1 = _run_stage1(**_SHAPE)
+    a2_fp8, a2_scale = _quant_a2(out1.float(), 32)
+    a2_scale_1d = a2_scale.view(-1).contiguous()
+
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+    target_fp8, ref = _run_stage2_fp8native(g, a2_fp8, a2_scale_1d, **_SHAPE)
+    ok_ref = _check(ref, target_fp8, "stage2_a8w4_fp8native")
+
+    # Same seed -> identical w2/scale; same a2 -> pure bf16-decode-vs-native-fp8
+    # stage2 cross-check.
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+    target_bf16, _ = _run_stage2(g, a2_fp8, a2_scale_1d, **_SHAPE)
+    ok_cross = _check(target_bf16.float(), target_fp8.float(), "stage2_fp8native_vs_bf16decode", rel_l2_max=0.05)
+    assert ok_ref and ok_cross
+
+
+@pytest.mark.skipif(not _is_gfx942(), reason="gfx942-only decode path")
+def test_a8w4_e2e_fp8native_bridge_gfx942():
+    """Native-fp8 end-to-end (both stages fp8 via AITER_FLYDSL_A8W4_FP8=1) vs torch
+    ref AND vs the bf16-decode end-to-end bridge (default path)."""
+    import os
+
+    prev = os.environ.get("AITER_FLYDSL_A8W4_FP8")
+    os.environ["AITER_FLYDSL_A8W4_FP8"] = "1"
+    try:
+        gb, out1b, ref1b = _run_stage1_bridge(**_SHAPE)
+        a2_fp8, a2_scale = _quant_a2(out1b.reshape(ref1b.shape).float(), 32)
+        out2_fp8, ref2 = _run_stage2_bridge(gb, a2_fp8, a2_scale.view(-1).contiguous(), **_SHAPE)
+        ok_ref = _check(ref2, out2_fp8, "e2e_stage2_a8w4_fp8native_bridge")
+    finally:
+        if prev is None:
+            os.environ.pop("AITER_FLYDSL_A8W4_FP8", None)
+        else:
+            os.environ["AITER_FLYDSL_A8W4_FP8"] = prev
+
+    # bf16-decode end-to-end (env off): _gen_common reseeds (seed=0) so
+    # weights/activations match; only the kernel math differs. Compare
+    # full-pipeline outputs.
+    gb_bf16, out1b_bf16, ref1b_bf16 = _run_stage1_bridge(**_SHAPE)
+    a2_bf16_fp8, a2_bf16_scale = _quant_a2(out1b_bf16.reshape(ref1b_bf16.shape).float(), 32)
+    out2_bf16, _ = _run_stage2_bridge(gb_bf16, a2_bf16_fp8, a2_bf16_scale.view(-1).contiguous(), **_SHAPE)
+    ok_cross = _check(out2_bf16.float(), out2_fp8.float(), "e2e_fp8native_vs_bf16decode_bridge", rel_l2_max=0.05)
+    assert ok_ref and ok_cross
 
 
 def _main():
