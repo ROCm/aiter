@@ -392,7 +392,6 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     mp_lock(lock_path=lock_path, main_func=main_func, final_func=final_func)
 
 
-@lru_cache(maxsize=AITER_MAX_CACHE_SIZE)
 def _find_built(folder):
     """Return the dir containing folder/lib.so, or None if it must be (re)compiled.
 
@@ -415,6 +414,7 @@ def _find_built(folder):
     return None
 
 
+@lru_cache(maxsize=AITER_MAX_CACHE_SIZE)
 def run_lib(func_name, folder=None):
     if folder is None:
         folder = func_name

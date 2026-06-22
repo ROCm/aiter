@@ -436,16 +436,23 @@ if PREBUILD_KERNELS != 0:
             print("=" * 72)
             print("[aiter] WARNING: pa_ps AOT prebuild produced 0 kernels.")
             print("[aiter] The wheel will NOT carry prebuilt pa_ps; first-inference")
-            print("[aiter] hipcc JIT (cold-start slowdown) is back. Check hipcc/GPU_ARCHS.")
+            print(
+                "[aiter] hipcc JIT (cold-start slowdown) is back. Check hipcc/GPU_ARCHS."
+            )
             print("=" * 72)
         else:
             _pa_ps_libs = glob.glob(os.path.join(bd, "pa_ps_*", "lib.so"))
             _pa_ps_metas = glob.glob(
                 os.path.join(bd, "pa_ps_*", "aiter_prebuild_meta.json")
             )
-            if len(_pa_ps_metas) != len(_pa_ps_libs) or len(_pa_ps_libs) != _pa_ps_built:
+            if (
+                len(_pa_ps_metas) != len(_pa_ps_libs)
+                or len(_pa_ps_libs) != _pa_ps_built
+            ):
                 print("=" * 72)
-                print("[aiter] WARNING: pa_ps AOT prebuild packaging sanity check failed.")
+                print(
+                    "[aiter] WARNING: pa_ps AOT prebuild packaging sanity check failed."
+                )
                 print(
                     "[aiter] Expected every pa_ps lib.so to have "
                     "aiter_prebuild_meta.json for runtime arch validation."
