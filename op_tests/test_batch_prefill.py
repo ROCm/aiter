@@ -4064,6 +4064,9 @@ def run_batch_prefill_asm(
     diff = out_f - out_ref
     nrms = (diff.pow(2).sum() / out_ref.pow(2).sum().clamp(min=1e-20)).sqrt().item()
     max_abs = diff.abs().max().item()
+    cos_sim = torch.nn.functional.cosine_similarity(
+        out_f.reshape(-1), out_ref.reshape(-1), dim=0, eps=1e-20
+    ).item()
 
     latency_ms = None
     tflops = None
@@ -4085,13 +4088,19 @@ def run_batch_prefill_asm(
 
     msg = (
         f"[asm] seqlens={seqlens} hq={num_qo_heads} hk={num_kv_heads} "
-        f"p_scale={use_p_scale} NRMS={nrms:.4e} max_abs={max_abs:.4e}"
+        f"p_scale={use_p_scale} NRMS={nrms:.4e} cos={cos_sim:.6f} max_abs={max_abs:.4e}"
     )
     if bench:
         msg += f" | latency={latency_ms:.4f} ms  {tflops:.1f} TFLOPS"
     print(msg)
     assert nrms < 0.06, f"asm kernel vs reference NRMS too high: {nrms:.4e}"
-    return dict(nrms=nrms, max_abs=max_abs, latency_ms=latency_ms, tflops=tflops)
+    return dict(
+        nrms=nrms,
+        cos_sim=cos_sim,
+        max_abs=max_abs,
+        latency_ms=latency_ms,
+        tflops=tflops,
+    )
 
 
 @pytest.mark.skipif(
