@@ -509,6 +509,30 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             cfg_row.get("stage1_weight_layout") or stage1_weight_layout
         )
         _grouped_dbg(f"using grouped CSV config: {cfg_row}")
+    else:
+        logger.info(
+            "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
+            "experts=%d topk=%d act=%s dtype=%s q_dtype_a=%s q_dtype_w=%s "
+            "quant_type=%s gate_mode=%s); using defaults tile_m=%d n_warp=%d "
+            "num_buffers=%d split_k1=%d split_k2=%d stage1_weight_layout=%s",
+            _get_padded_M(token_num),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            activation,
+            dtype,
+            q_dtype_a,
+            q_dtype_w_key,
+            quant_type,
+            gate_mode,
+            tile_m,
+            n_warp,
+            num_buffers,
+            split_k1,
+            split_k2,
+            stage1_weight_layout,
+        )
     tile_n = int(n_warp) * 64
     tile_k = 256
     warp_tile_m = tile_m // m_warp
