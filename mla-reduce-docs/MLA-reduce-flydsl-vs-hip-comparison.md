@@ -128,7 +128,7 @@ fidelity).
 | Correct vs HIP? | **Yes** — validated directly against the HIP kernel (48/48): LSE to 9.5e-7, output within one bf16/fp16 ULP, same 3 shapes. |
 | HBM parity? | **Yes** — 3.6–3.8 TB/s where kernel-dominated, equal-to-slightly-ahead of HIP and within HIP's own band; FlyDSL faster on the simple path (low splits). |
 | Faster? | At parity (FlyDSL marginally ahead) — both at the reduction byte floor (~99% of time is HBM traffic per the HIP rocprofv3 profile). Parity was the bar. |
-| Caveats | None on timing — both sides now use kernel-only device time, so the old ~230 µs host-floor artifact is gone and low-work BW is meaningful. Persistent launcher deferred (parity-neutral at the byte floor). |
+| Caveats | None on timing — both sides now use kernel-only device time, so the old ~230 µs host-floor artifact is gone and low-work BW is meaningful. Persistent launcher deferred (parity-neutral at the byte floor). Production wiring is an opt-in fallback: `aiter/mla.py` routes to `flydsl_mla_reduce_v1` only when `AITER_MLA_REDUCE_FLYDSL=1`; default is still HIP `aiter.mla_reduce_v1`. ||
 
 **The FlyDSL prototype achieves its goal: a native, correct, HBM-parity replacement for the
 HIP MLA decode-reduce on gfx942.**
