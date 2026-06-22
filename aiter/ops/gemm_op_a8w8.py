@@ -25,18 +25,14 @@ from ..ops.flydsl.utils import is_flydsl_available
 aiter_lib = Library("aiter", "FRAGMENT")
 
 
-# Arches where the prebuilt HIP CK modules `module_gemm_a8w8_blockscale`
-# and `module_gemm_a8w8_blockscale_bpreshuffle` ship matching code objects.
-# On any other arch (e.g. gfx1201 RDNA4) the HIP kernel launch SIGSEGVs
-# with "No compatible code objects found for the device" -- there is no
-# catchable exception, so we must allowlist BEFORE calling the HIP path.
-# Update when the prebuilt distribution adds support.
+# Arches whose prebuilt HIP CK blockscale modules ship matching code objects.
+# Other arches (e.g. gfx1201) SIGSEGV uncatchably at kernel launch, so gate
+# before the HIP call rather than try/except. Extend when prebuilts add archs.
 _BLOCKSCALE_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
 
 
 def _hip_blockscale_supported() -> bool:
-    """True when the prebuilt HIP CK blockscale modules have a code object
-    for the running device. False -> fall back to the triton variant."""
+    """True if the prebuilt HIP CK blockscale module covers the running arch (else triton)."""
     try:
         return get_gfx() in _BLOCKSCALE_HIP_PREBUILT_ARCHES
     except Exception:
@@ -758,10 +754,8 @@ def gemm_a8w8_blockscale(
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
         if not _hip_blockscale_supported():
-            # HIP CK module has no gfx1201 (or other non-prebuilt arch)
-            # code object. Triton non-preshuffle gemm_a8w8_blockscale
-            # accepts the same row-major x_scale + plain (N, K) weight
-            # layout, JIT-compiles for the live arch.
+            # No CK code object for this arch -> triton (same row-major x_scale
+            # + (N, K) weight layout; JIT-compiles per-arch).
             from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
                 gemm_a8w8_blockscale as _gemm_a8w8_blockscale_triton,
             )
@@ -850,23 +844,17 @@ def gemm_a8w8_blockscale_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[1]
     if not _hip_blockscale_supported():
-        # HIP CK bpreshuffle module has no code object for the live arch.
-        # The weight WQ here has already been shuffled with the (16, 16)
-        # layout (the only layout aiter.ops.shuffle.shuffle_weight emits
-        # for blockscale GEMMs). That matches what the triton preshuffle
-        # kernel expects after a (N//16, K*16) reshape view -- the kernel
-        # asserts that shape. x_scale is column-major (transpose_scale=True
-        # convention), also the triton preshuffle layout. Direct fit.
+        # No CK code object for this arch -> triton preshuffle. WQ is already
+        # (16,16)-shuffled (the only blockscale layout) == triton's (N//16, K*16)
+        # view; x_scale is column-major. Direct fit.
         from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
             gemm_a8w8_blockscale_preshuffle as _gemm_a8w8_blockscale_preshuffle_triton,
         )
 
         xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
         wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
-        # Conservative config: matches the non-preshuffle gfx1201 default
-        # for M_LEQ_8 (ships in gfx1201-GEMM-A8W8_BLOCKSCALE.json). No
-        # PRESHUFFLED tuning file exists on origin/main yet; pass explicitly
-        # so _get_config doesn't look one up and fail.
+        # Explicit config (no PRESHUFFLED tuning file on main yet); mirrors the
+        # gfx1201 non-preshuffle M_LEQ_8 default.
         _fallback_cfg = {
             "BLOCK_SIZE_M": 32,
             "BLOCK_SIZE_N": 16,
