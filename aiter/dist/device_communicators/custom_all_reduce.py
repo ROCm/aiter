@@ -822,6 +822,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
         post_per_token_quant: bool = False,
         out_hidden_dim: int = 0,
+        gemma_norm: bool = False,
     ):
         valid_dim = w.numel()
         if res_out is None:
@@ -849,6 +850,7 @@ class CustomAllreduce:
                     reg,
                     reg_bytes,
                     use_1stage,
+                    gemma_norm,
                 )
             else:
                 ops.fused_allreduce_rmsnorm_pad(
@@ -862,6 +864,7 @@ class CustomAllreduce:
                     reg,
                     reg_bytes,
                     use_1stage,
+                    gemma_norm,
                 )
             return out, res_out
         else:
@@ -895,6 +898,7 @@ class CustomAllreduce:
         eps: float,
         use_1stage: bool,
         out_hidden_dim: int = 0,
+        gemma_norm: bool = False,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -909,6 +913,7 @@ class CustomAllreduce:
                     registered=True,
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
+                    gemma_norm=gemma_norm,
                 )
             else:
                 out_dim = out_hidden_dim or input.shape[-1]
@@ -933,6 +938,7 @@ class CustomAllreduce:
                 registered=False,
                 use_1stage=use_1stage,
                 out_hidden_dim=out_hidden_dim,
+                gemma_norm=gemma_norm,
             )
 
     def custom_fused_ar_rms_packed_input(
@@ -944,6 +950,7 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         prefill_support: bool = False,
+        gemma_norm: bool = False,
     ) -> Optional[torch.Tensor]:
         # Let the C++ wrapper pack supported last-dim sliced views directly
         # into the registered IPC buffer so eager and graph paths both avoid
@@ -960,6 +967,7 @@ class CustomAllreduce:
                     registered=False,
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
+                    gemma_norm=gemma_norm,
                 )
             else:
                 out_dim = out_hidden_dim or input.shape[-1]
@@ -983,6 +991,7 @@ class CustomAllreduce:
             registered=False,
             use_1stage=use_1stage,
             out_hidden_dim=out_hidden_dim,
+            gemma_norm=gemma_norm,
         )
 
     def custom_fused_ar_rms_quant(
