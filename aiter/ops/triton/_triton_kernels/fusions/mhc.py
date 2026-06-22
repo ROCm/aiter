@@ -106,7 +106,10 @@ def _mhc_fused_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # int64: rm is the row/token index; rm * stride_xm (= hc_mult*dim) overflows
+    # int32 when num_tokens * stride_xm >= 2**31 (e.g. dim=4096,hc=4 -> >=131072
+    # tokens), causing OOB memory access on long-sequence prefill.
+    rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
 
     n_blocks_pre = tl.cdiv(n, BLOCK_N)
     n_blocks_post = n_blocks_pre
@@ -287,7 +290,7 @@ def _mhc_fused_split_kernel(
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     rn = tl.arange(0, N_TOTAL_POW2)
 
     split_k_start = pid_k * SPLITK_BLOCK_SIZE
@@ -465,7 +468,7 @@ def _mhc_reduce_apply_kernel(
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     rc = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     rn_pre = tl.arange(0, N_POW2)
 
@@ -686,7 +689,7 @@ def _mhc_post_kernel(
     """
     pid_m = tl.program_id(0)
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     i_n = tl.arange(0, n)
 
     m_mask = rm < M
@@ -812,7 +815,7 @@ def _mhc_post_pre_split_kernel(
 ):
     """Fused mhc_post + (next) mhc_pre split-K kernel.
 
-    Per (M-tile, C-tile) — n streams unrolled via tl.static_range — this CTA:
+    Per (M-tile, C-tile) -- n streams unrolled via tl.static_range -- this CTA:
       1. Computes the new mHC residual stream (mhc_post step):
              residual_out[m, j, c] = post_mix[m, j] * layer_input[m, c]
                                    + sum_h comb_mix[m, h, j] * residual_in[m, h, c]
@@ -841,7 +844,7 @@ def _mhc_post_pre_split_kernel(
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     rc = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     rn = tl.arange(0, N_TOTAL_POW2)
     i_n = tl.arange(0, n)
@@ -913,7 +916,7 @@ def _mhc_post_pre_split_kernel(
     )
 
     # --- 3) Next-pre split-K partial GEMM + sqrsum, sharing out_tile in registers. ---
-    # Reshape (BLOCK_M, n, BLOCK_C) → (BLOCK_M, n*BLOCK_C) as the next pre's
+    # Reshape (BLOCK_M, n, BLOCK_C) -> (BLOCK_M, n*BLOCK_C) as the next pre's
     # flattened x for this K-split. The matching phi rows are (n, BLOCK_C, N)
     # tiled at offsets ``h*C + c`` for h in [0, n), c in [c_block, c_block+BLOCK_C);
     # we 3D-load and reshape to (n*BLOCK_C, N_TOTAL_POW2) so a single tl.dot
@@ -980,9 +983,9 @@ def _mhc_post_pre_reduce_apply_res_block(
     ``_mhc_post_pre_reduce_apply_kernel``.
 
     Sinkhorn variant selected by ``ASYMMETRIC_EXP_DOMAIN``:
-      False (default) → canonical log-domain Sinkhorn-Knopp: symmetric row/col
+      False (default) -> canonical log-domain Sinkhorn-Knopp: symmetric row/col
           normalization, no eps perturbation.
-      True            → HIP-compatible exp-domain Sinkhorn
+      True            -> HIP-compatible exp-domain Sinkhorn
           (``mhc_kernels.cu:493-507``): first iter is asymmetric
           (softmax(row) + eps, then div(col + eps)); remaining
           ``NUM_SINKHORN_ITERS - 1`` iters are symmetric div(row + eps) /
@@ -1051,11 +1054,11 @@ def _mhc_post_pre_reduce_apply_res_block(
 def _mhc_post_pre_reduce_apply_kernel(
     acc_ptr,  # Unified split-K partials: (NUM_KSPLIT, M, n + n + n_squared), layout [pre | post | res]
     acc_sq_ptr,  # Sum-of-squares partials: (NUM_KSPLIT, M)
-    alpha_ptr,  # (3,) fp32 — [alpha_pre, alpha_post, alpha_res]
+    alpha_ptr,  # (3,) fp32 -- [alpha_pre, alpha_post, alpha_res]
     bias_ptr,  # (n + n + n_squared,) fp32
     x_ptr,  # (M, n*C)
-    h_post_ptr,  # (M, n) — written by the post CTA
-    h_res_ptr,  # (M, n*n) — written by the res CTA (flat n_squared view)
+    h_post_ptr,  # (M, n) -- written by the post CTA
+    h_res_ptr,  # (M, n*n) -- written by the res CTA (flat n_squared view)
     layer_input_ptr,  # (M, C) in x.dtype
     M,
     K: tl.constexpr,
@@ -1106,7 +1109,7 @@ def _mhc_post_pre_reduce_apply_kernel(
     ``acc_sq``). Compared to the earlier layout where the post and res CTAs
     were piggybacked onto ``pid_c == 0`` / ``pid_c == RES_PID_C`` and did
     apply-pre work on top, these dedicated CTAs do **only** their stream's
-    activation — so the 20-iter Sinkhorn on the res CTA runs in parallel with
+    activation -- so the 20-iter Sinkhorn on the res CTA runs in parallel with
     apply-pre on the other ``NUM_C_BLOCKS`` CTAs rather than serializing
     behind it.
 
@@ -1137,7 +1140,7 @@ def _mhc_post_pre_reduce_apply_kernel(
         pid_m = pid // NUM_C_BLOCKS
         pid_c = pid % NUM_C_BLOCKS
         rc = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-        m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_offs = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
         m_mask = m_offs < M
         acc_sq = tl.load(
             acc_sq_ptr
