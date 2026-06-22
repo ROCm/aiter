@@ -5,6 +5,7 @@ import triton.experimental.gluon.language as gl
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -96,10 +97,19 @@ def kernel_repr_decode_fn():
     return _repr
 
 
-kernel_repr_decode = kernel_repr_decode_fn()
+decode_kernel_repr = make_kernel_repr(
+    "_moe_gemm_a8w4_decode",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "num_warps",
+        "NUM_BUFFERS",
+    ],
+)
 
 
-@gluon.jit(repr=kernel_repr_decode, launch_metadata=matmul_launch_metadata, do_not_specialize=["num_tokens"])
+@gluon.jit(repr=decode_kernel_repr, launch_metadata=matmul_launch_metadata, do_not_specialize=["num_tokens"])
 def _moe_gemm_a8w4_decode(
     Y,
     stride_y_m,
