@@ -129,7 +129,8 @@ def gemm_a16w16_(
         ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
         assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
 
-        M, K = x.shape
+        M, _ = x.shape
+        K = x.stride(0)
         N, _ = w.shape
 
         if config is None:

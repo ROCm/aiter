@@ -27,6 +27,7 @@ import csv
 import os
 import sys
 import time
+from typing import Optional
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -186,7 +187,14 @@ def _precompile_to_cache(
     out_dtype: str = "bf16",
     act: str = "silu",
     doweight_stage1: bool = False,
-    waves_per_eu: int = 3,
+    # Must match the runtime default of ``compile_mixed_moe_gemm2`` /
+    # ``compile_mixed_moe_gemm1`` (``Optional[int] = None``). A scalar default
+    # (e.g. ``3``) would make the AOT-side ``_cache_tag`` tuple disagree with
+    # the runtime-side tuple for any legacy kernel that does not explicitly
+    # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
+    # production-variant ``_persist_async_w4_cumul3`` does), causing
+    # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
+    waves_per_eu: Optional[int] = None,
     k_batch: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",
@@ -201,6 +209,11 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     swiglu_limit: float = 0.0,
+    # Stage2-only kernel tuning knobs (registered by the production-variant
+    # entries in `get_flydsl_stage2_kernels`). Forwarded into
+    # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
     **kwargs,
 ):
     """Trigger MLIR compilation by calling the runtime stage1/stage2 entry points
@@ -218,7 +231,7 @@ def _precompile_to_cache(
     import torch
 
     dev = torch.device("cpu")
-    is_fp4_weight = b_dtype == "fp4"
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
     is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
@@ -286,7 +299,7 @@ def _precompile_to_cache(
 
     def _make_a1_scale():
         """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
-        if not is_fp4_weight:
+        if not use_mx_gemm:
             if is_int4_weight:
                 # a16wi4: bf16 activations, int4 weights — no activation scale.
                 return None
@@ -323,7 +336,7 @@ def _precompile_to_cache(
         buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
         its own input and the resulting sorted scale uses 32-row alignment.
         """
-        if not is_fp4_weight:
+        if not use_mx_gemm:
             return None
         if stage1_fuse_quant in ("fp4", "fp8"):
             # mirror flydsl_moe_stage1's out_scale_sorted_flat allocation:
@@ -441,7 +454,7 @@ def _precompile_to_cache(
 
             a1_scale = _make_a1_scale()
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
-            if is_fp4_weight:
+            if use_mx_gemm:
                 w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
             elif is_int4_weight:
                 # a16wi4: bf16 groupwise scale over (E, K//32, N).
@@ -478,7 +491,7 @@ def _precompile_to_cache(
             _grid_y = min(max_num_m_blocks, tokens * topk)
             _kernel_out = tmp_out if _is_splitk else out
             kernel_bias = None if _is_splitk else bias
-            _n_in = inter_dim * 2 if is_fp4_weight else inter_dim
+            _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
             _k_in = model_dim
 
             scale_cols = inter_dim // 32
@@ -491,7 +504,7 @@ def _precompile_to_cache(
                 else torch.empty(0, dtype=torch.uint8, device=dev)
             )
 
-            if is_fp4_weight:
+            if use_mx_gemm:
                 args = _s1_args_fp4(
                     _kernel_out.view(-1),
                     a.view(-1),
@@ -604,7 +617,7 @@ def _precompile_to_cache(
             w2 = _alloc(w2_shape, _storage_dtype(b_dtype))
 
             a2_scale = _make_a2_scale_for_stage2()
-            if is_fp4_weight:
+            if use_mx_gemm:
                 w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
             elif is_int4_weight:
                 w2_scale = torch.zeros(
@@ -669,7 +682,7 @@ def _precompile_to_cache(
             _n_in = model_dim
             _k_in = inter_dim
 
-            if is_fp4_weight:
+            if use_mx_gemm:
                 args = _s2_args_fp4(
                     target,
                     a,
@@ -721,11 +734,33 @@ def _precompile_to_cache(
                 accumulate=accumulate,
                 persist_m=_persist_m,
                 sort_block_m=sort_block_m,
+                waves_per_eu=waves_per_eu,
+                use_async_copy=use_async_copy,
+                cu_num_mul=cu_num_mul,
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
             )
             _run_compiled(exe, args)
+
+            # Reduce mode (accumulate=False) runs a separate topk reduction
+            # kernel inside the runtime stage2 wrapper. Precompile it via the
+            # same shared helper the runtime uses so the cache key matches.
+            # Single-GPU path uses use_mask=False (plain); EP/masked reduction
+            # is a multi-GPU path (separately gated) and not covered here.
+            if not accumulate:
+                from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+                _run_moe_reduction(
+                    target,
+                    out,
+                    tokens,
+                    topk,
+                    model_dim,
+                    expert_mask=None,
+                    topk_ids=None,
+                    stream=0,
+                )
 
 
 def compile_one_config(
