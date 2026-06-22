@@ -817,6 +817,13 @@ def mla_decode_stage1_asm_fwd(
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
     # [1] pertensor
+    # round-robin context-parallel (CP) extension:
+    #   g_kv_indptr   : [batch_size+1] GLOBAL kv_indptr (per-request global KV length)
+    #   cp_world_size : number of CP ranks (W); 1 == disabled
+    #   cp_rank       : this rank id (r); local kv idx j -> global pos j*W + r
+    g_kv_indptr: Optional[torch.Tensor] = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
 ) -> None: ...
 
 
@@ -1157,12 +1164,19 @@ def get_mla_metadata_info_v1(
         max_split_tiles = tile_cnt * cu_num
 
     # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
-    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). A single tile can in
-    # the worst case absorb the entire global budget, so reduce_partial_map must
-    # hold up to tile_cnt * per_tile_cap entries.
+    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). This is a GLOBAL
+    # budget shared across all tiles, so the total number of partial reduce
+    # entries is bounded by the base tiles (one per tile) plus at most the global
+    # split budget of EXTRA splits distributed across them:
+    #     reduce_partial_map <= tile_cnt + per_tile_cap
+    # The previous `tile_cnt * per_tile_cap` assumed every tile could individually
+    # absorb the whole global budget simultaneously, which the shared budget
+    # forbids. With cudagraph batch_size >> cu_num that product collapsed to
+    # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
+    # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
     if max_split_per_batch > 0:
         per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
-        max_split_tiles = max(max_split_tiles, tile_cnt * per_tile_cap)
+        max_split_tiles = max(max_split_tiles, tile_cnt + per_tile_cap)
 
     if not intra_batch_mode:
         return (
@@ -1208,6 +1222,7 @@ def get_mla_metadata_v1(
     intra_batch_mode: bool = False,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
+    is_cp_round_robin: bool = False,
 ) -> None:
     """
     Inputs:
