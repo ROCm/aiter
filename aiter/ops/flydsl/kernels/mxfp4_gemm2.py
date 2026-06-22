@@ -1115,15 +1115,37 @@ def _flat_mxfp4_epilog(
     _m_base = m_row + m_lane
     _q_row0 = fx.Int64(_m_base) * fx.Int64(N_OUT // 2)
     _s_row0 = fx.Int64(_m_base) * fx.Int64(N_OUT // 32)
-    for mr in range_constexpr(kMChunks):  # BM/16
+    # Each (mr, half) block needs 8 contiguous f32 from LDS = 2x ds_read_b128.
+    # The blocks are independent, so software-pipeline the LDS reads: issue the
+    # NEXT block's ds_read before computing the CURRENT block's amax/DPP/pack, so
+    # the ds_read latency (the epilog's top lgkmcnt(1) stall) is hidden behind the
+    # ~16 ALU ops of amax + 4 DPP + 4 cvt_fp4. Distance-1 prefetch keeps only one
+    # extra block of registers live (matters: this kernel is 1-wave / 440 VGPR).
+    _blocks = [(mr, half) for mr in range(kMChunks) for half in range(NBLK // 4)]
+
+    def _issue_load(mr, half):
         row_local = fx.Int32(mr * 16) + m_lane
-        for half in range_constexpr(NBLK // 4):  # 2
-            group = wave_grp + fx.Int32(half * 4)
-            col0 = group * fx.Int32(32) + kk * fx.Int32(8)
-            r = []
-            for e in range_constexpr(8):
-                idx = row_local * fx.Int32(BN) + col0 + fx.Int32(e)
-                r.append(llvm.load(T.f32, _gep3(lds_base, idx * fx.Int32(4))))
+        group = wave_grp + fx.Int32(half * 4)
+        col0 = group * fx.Int32(32) + kk * fx.Int32(8)
+        base_idx = row_local * fx.Int32(BN) + col0
+        v0 = Vec(llvm.load(T.vec(4, T.f32), _gep3(lds_base, base_idx * fx.Int32(4))))
+        v1 = Vec(
+            llvm.load(
+                T.vec(4, T.f32),
+                _gep3(lds_base, (base_idx + fx.Int32(4)) * fx.Int32(4)),
+            )
+        )
+        return [v0[0], v0[1], v0[2], v0[3], v1[0], v1[1], v1[2], v1[3]], group, col0
+
+    # prologue: issue first block's loads
+    _r_next, _grp_next, _col0_next = _issue_load(*_blocks[0])
+    for _bi in range_constexpr(len(_blocks)):
+        mr, half = _blocks[_bi]
+        r, group, col0 = _r_next, _grp_next, _col0_next
+        # prefetch next block's LDS reads before consuming the current block
+        if _bi + 1 < len(_blocks):
+            _r_next, _grp_next, _col0_next = _issue_load(*_blocks[_bi + 1])
+        if True:
             # block amax over |r[0..7]| (positive-float bits) -> bf16-bits
             maxb = arith.andi(arith.bitcast(T.i32, _raw(r[0])), i7fff)
             for e in range_constexpr(1, 8):
