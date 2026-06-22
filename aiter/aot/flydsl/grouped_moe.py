@@ -122,6 +122,7 @@ def compile_one_config(**job):
         compile_moe_grouped_gemm2_a8w4_masked,
         compile_moe_grouped_gemm2_mxfp4_masked,
         preshuffled_scale_shape,
+        preshuffled_b_scale_shape,
     )
 
     aot_arch = job.pop("gfx", "") or GROUPED_MOE_AOT_ARCH_DEFAULT
@@ -148,7 +149,6 @@ def compile_one_config(**job):
             else compile_moe_grouped_gemm2_a8w4_masked
         )
         warp_tile_m = job["tile_m"] // job["m_warp"]
-        warp_tile_n = job["tile_n"] // job["n_warp"]
         contiguous = bool(job.get("grouped_contiguous_m", False))
         common = dict(
             model_dim=job["model_dim"],
@@ -206,9 +206,7 @@ def compile_one_config(**job):
             sw1 = torch.empty(
                 (
                     job["experts"],
-                    *preshuffled_scale_shape(
-                        2 * job["inter_dim"], job["model_dim"], warp_tile_n, _TILE_K
-                    ),
+                    *preshuffled_b_scale_shape(2 * job["inter_dim"], job["model_dim"]),
                 ),
                 dtype=torch.uint8,
             )
@@ -232,9 +230,7 @@ def compile_one_config(**job):
             sw2 = torch.empty(
                 (
                     job["experts"],
-                    *preshuffled_scale_shape(
-                        job["model_dim"], job["inter_dim"], warp_tile_n, _TILE_K
-                    ),
+                    *preshuffled_b_scale_shape(job["model_dim"], job["inter_dim"]),
                 ),
                 dtype=torch.uint8,
             )

@@ -196,7 +196,7 @@ def write_summary(
 
 def select_tests() -> None:
     event_name = os.environ.get("EVENT_NAME") or os.environ.get("GITHUB_EVENT_NAME", "")
-    run_key = "run_on_pr" if event_name == "pull_request" else "run_on_schedule"
+    run_key = "run_on_schedule" if event_name == "schedule" else "run_on_pr"
     disabled = [
         test
         for test in TESTS

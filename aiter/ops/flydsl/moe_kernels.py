@@ -145,11 +145,12 @@ def get_flydsl_stage2_kernels(
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
+    is_fp8 = b_dtype == "fp8"
     tile_ns = [128, 256] if is_fp4 else [128]
     # fp4 stage2 supports tile_k=128 (pack_K=1 scale sub-group shift path) as
     # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
     # whose inter_dim is a multiple of 128 but not 256 (e.g. MiniMax TP4=384).
-    tile_ks = [128, 256] if is_fp4 else [128]
+    tile_ks = [128, 256] if (is_fp4 or is_fp8) else [128]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
 
@@ -316,6 +317,10 @@ def _register_all_configs():
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
                 _KERNEL_PARAMS.update(get_flydsl_stage2_kernels(a, b, out))
+    # mxfp8 (a8w8): fp8 activation + fp8 weight, per-1x32 e8m0 microscale.
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels("fp8", "fp8", out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels("fp8", "fp8", out))
     # int4_bf16 (a16wi4) configs
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
@@ -352,7 +357,7 @@ def compile_flydsl_moe_stage1(
     swiglu_limit: float = 0.0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    if b_dtype == "fp4":
+    if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
 
@@ -436,7 +441,7 @@ def compile_flydsl_moe_stage2(
     enable_bias: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
-    if b_dtype == "fp4":
+    if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
         return compile_mixed_moe_gemm2(
@@ -1016,6 +1021,73 @@ def _get_compiled_swiglu(inter_dim: int):
     return build_swiglu_and_mul_module(inter_dim)
 
 
+def flydsl_swiglu_and_mul_interleaved(
+    input: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Fused swiglu activation for interleaved (gate/up block-interleaved) layout.
+
+    input: (rows, inter_dim*2) bf16, interleaved layout.
+    out:   (rows, inter_dim) bf16.
+    """
+    inter_dim = out.shape[-1]
+    num_rows = input.shape[0]
+    _swiglu_fn = _get_compiled_swiglu(inter_dim)
+    _run_compiled(
+        _swiglu_fn,
+        (
+            input,
+            out,
+            num_rows,
+            torch.cuda.current_stream(),
+        ),
+    )
+
+
+def flydsl_silu_and_mul_interleaved(
+    input: torch.Tensor,
+    out: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    quant_mode: str = "none",
+    gui_layout: bool = True,
+) -> None:
+    """Fused silu activation for interleaved (gate/up block-interleaved) layout.
+
+    input: (rows, inter_dim*2) bf16, interleaved layout.
+    out:   (rows, inter_dim) bf16.
+    """
+    inter_dim = out.shape[-1]
+    num_sorted_rows = sorted_token_ids.shape[0]
+    _silu_fn = _get_compiled_silu_fused(
+        inter_dim,
+        topk,
+        quant_mode=quant_mode,
+        gui_layout=gui_layout,
+        act="silu",
+    )
+    empty_scale = torch.empty(0, dtype=torch.uint8, device=out.device)
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=out.device)
+    empty_f32 = torch.empty(0, dtype=torch.float32, device=out.device)
+    _run_compiled(
+        _silu_fn,
+        (
+            _ptr_view_safe(input),
+            _ptr_view_safe(out),
+            _ptr_view_safe(empty_scale),
+            _ptr_view_safe(sorted_token_ids),
+            _ptr_view_safe(num_valid_ids),
+            _ptr_view_safe(empty_i32),
+            _ptr_view_safe(empty_f32),
+            token_num,
+            num_sorted_rows,
+            torch.cuda.current_stream(),
+        ),
+    )
+
+
 # Public API
 
 
@@ -1168,11 +1240,12 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    is_fp4 = b_dtype == "fp4"
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    # fp4 and fp8 weights both use the MX gemm kernel (bias/out_scale arg builder).
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
 
-    if is_fp4:
+    if use_mx_gemm:
         args = _s1_args_fp4(
             _kernel_out.view(-1),
             a.view(-1),
@@ -1493,7 +1566,8 @@ def flydsl_moe_stage2(
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
-    is_fp4 = b_dtype == "fp4"
+    # fp4 and fp8 weights both use the MX gemm kernel (bias arg builder).
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
     _n_in = model_dim
     _k_in = inter_dim
 
@@ -1508,7 +1582,7 @@ def flydsl_moe_stage2(
                 dtype=out.dtype,
             )
 
-    if is_fp4:
+    if use_mx_gemm:
         args = _s2_args_fp4(
             target,
             inter_states,
