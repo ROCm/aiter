@@ -398,8 +398,7 @@ def pa_ps_fwd_asm(
 # gqa=8).  FP8 Q **and** FP8 paged KV cache, bf16 output, **per-tensor** scalar
 # dequant scales for Q/K/V (distinct from the per-token/per-block scale tensors
 # used by pa_ps_fwd_asm).  GPT-OSS style attention sink (per-Q-head fp32 logits
-# in the SCALED-logit domain, exp(sink); kernel divides by s_eff internally) is
-# always read by the kernel.
+# in the kernel's pre-scale raw-logit domain) is always read by the kernel.
 #
 # Memory-allocation policy: all GPU tensors are allocated on the Python side;
 # the C++ entry point performs only pointer + stride bookkeeping and the kernel
@@ -418,7 +417,6 @@ def _pa_decode_bf16_asm(
     V: torch.Tensor,
     kv_indices: torch.Tensor,
     context_lens: torch.Tensor,
-    softmax_scale: float,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
@@ -446,9 +444,9 @@ def pa_decode_bf16_asm(
     kv_indptr: torch.Tensor,
     gqa: int = 8,
     mtp: int = 0,
-    query_scale: Optional[torch.Tensor] = None,
-    key_scale: Optional[torch.Tensor] = None,
-    value_scale: Optional[torch.Tensor] = None,
+    query_scale: float = 1.0,
+    key_scale: float = 1.0,
+    value_scale: float = 1.0,
     qo_indptr: Optional[torch.Tensor] = None,
     work_indptr: Optional[torch.Tensor] = None,
     work_info: Optional[torch.Tensor] = None,
@@ -463,15 +461,13 @@ def pa_decode_bf16_asm(
     Contract details:
       * `Q`/`K`/`V` are FP8; `out` is bf16 with Q's logical shape.
       * `query_scale`/`key_scale`/`value_scale` are the per-tensor FP8 dequant
-        scales as 1-element fp32 tensors (None means 1.0); the attention
-        `softmax_scale` (typically 1/sqrt(head_dim)) is
-        passed BY VALUE (kernarg 0x60) and the kernel forms
-        scl_log2e = query_scale * key_scale * softmax_scale * log2e.
-      * `sink` (optional) holds per-Q-head fp32 logits in the SCALED-logit
-        domain (exp(sink), Triton/GPT-OSS convention; the kernel divides by
-        s_eff internally), shape [kv_head_num * gqa].  The kernel always reads
-        this slot, so when `sink` is None a -inf buffer is allocated, making the
-        sink a numerical no-op.
+        scales; the attention `softmax_scale` (typically 1/sqrt(head_dim)) is
+        folded into `key_scale` before launch (the kernel forms
+        scl_log2e = query_scale * key_scale * log2e).
+      * `sink` (optional) holds per-Q-head fp32 logits in the kernel's
+        pre-scale raw-logit domain, shape [kv_head_num * gqa].  The kernel
+        always reads this slot, so when `sink` is None a -inf buffer is
+        allocated, making the sink a numerical no-op.
     """
     device = Q.device
     kv_head_num = K.shape[1]
@@ -480,9 +476,12 @@ def pa_decode_bf16_asm(
     if out is None:
         out = torch.empty(Q.shape, dtype=torch.bfloat16, device=device)
 
-    # query/key/value_scale are 1-element fp32 dequant scales, passed straight to
-    # the kernel. softmax_scale is passed BY VALUE (kernarg 0x60); the kernel
-    # applies it, so do NOT pre-fold it into key_scale.
+    q_scale = torch.tensor([query_scale], dtype=torch.float32, device=device)
+    # Fold the attention softmax scale into key_scale (matches pa_ps.cpp).
+    k_scale = torch.tensor(
+        [key_scale * softmax_scale], dtype=torch.float32, device=device
+    )
+    v_scale = torch.tensor([value_scale], dtype=torch.float32, device=device)
 
     if sink is None:
         # The kernel is compiled sink-enabled (always reads + merges the sink
@@ -499,10 +498,9 @@ def pa_decode_bf16_asm(
         V,
         kv_indices,
         context_lens,
-        softmax_scale,
-        query_scale,
-        key_scale,
-        value_scale,
+        q_scale,
+        k_scale,
+        v_scale,
         out,
         qo_indptr,
         kv_indptr,
@@ -525,12 +523,9 @@ def pa_reduce_v1(
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
     max_seqlen_q: int,
+    num_kv_splits: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
-    # num_kv_splits is trailing+optional so the ATOM call site (which passes 8
-    # positional args, no split count) stays aligned. The kernel uses
-    # max(SM_count, num_kv_splits), so the default 0 means "auto" (SM_count).
-    num_kv_splits: int = 0,
 ) -> None:
     mla_reduce_v1(
         partial_output,
@@ -610,6 +605,7 @@ def pa_persistent_fwd(
         reduce_final_map,
         reduce_partial_map,
         max_qlen,
+        0,
         output,
         final_lse,
     )
@@ -817,13 +813,6 @@ def mla_decode_stage1_asm_fwd(
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
     # [1] pertensor
-    # round-robin context-parallel (CP) extension:
-    #   g_kv_indptr   : [batch_size+1] GLOBAL kv_indptr (per-request global KV length)
-    #   cp_world_size : number of CP ranks (W); 1 == disabled
-    #   cp_rank       : this rank id (r); local kv idx j -> global pos j*W + r
-    g_kv_indptr: Optional[torch.Tensor] = None,
-    cp_world_size: int = 1,
-    cp_rank: int = 0,
 ) -> None: ...
 
 
@@ -1216,7 +1205,6 @@ def get_mla_metadata_v1(
     intra_batch_mode: bool = False,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
-    is_cp_round_robin: bool = False,
 ) -> None:
     """
     Inputs:
