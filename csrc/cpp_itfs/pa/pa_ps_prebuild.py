@@ -205,7 +205,9 @@ def prebuild_pa_ps():
                 _clean_intermediates(folder)
                 ok += 1
             except Exception as e:  # noqa: BLE001
-                # One bad variant must not abort the whole wheel build.
+                # Continue through the recipe to report every failing variant, then
+                # fail the wheel build below. A successful PREBUILD_KERNELS build must
+                # not silently ship without complete pa_ps prebuild coverage.
                 errs.append((kw, repr(e)))
                 print(f"[aiter] prebuild pa_ps FAILED {folder}: {e}")
     finally:
@@ -214,8 +216,16 @@ def prebuild_pa_ps():
             cpp_utils._find_built.cache_clear()
 
     print(f"[aiter] prebuild pa_ps: {ok}/{len(variants)} built, {len(errs)} failed")
-    if ok == 0 and variants:
-        raise RuntimeError("pa_ps prebuild built nothing; check GPU_ARCHS / hipcc")
+    if errs:
+        raise RuntimeError(
+            "pa_ps prebuild failed for "
+            f"{len(errs)}/{len(variants)} variant(s); check GPU_ARCHS / hipcc"
+        )
+    if ok != len(variants):
+        raise RuntimeError(
+            "pa_ps prebuild incomplete: "
+            f"built {ok}/{len(variants)} variant(s); check GPU_ARCHS / hipcc"
+        )
     return ok
 
 

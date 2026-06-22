@@ -421,25 +421,22 @@ if PREBUILD_KERNELS != 0:
         # fallback is used only when metadata proves the .so covers the live GPU arch.
         if this_dir not in sys.path:
             sys.path.insert(0, this_dir)
-        try:
-            from csrc.cpp_itfs.pa.pa_ps_prebuild import prebuild_pa_ps
+        from csrc.cpp_itfs.pa.pa_ps_prebuild import prebuild_pa_ps
 
-            _pa_ps_built = prebuild_pa_ps()
-        except Exception as e:  # noqa: BLE001 - never fail the whole wheel on prebuild
-            _pa_ps_built = 0
-            print(f"[aiter] pa_ps prebuild raised: {e}")
-        # Make a no-op prebuild loud: the wheel still builds, but ships WITHOUT the
-        # prebuilt pa_ps kernels, so cold-start JIT returns silently (gpt-oss-120b
-        # first-run ~24k vs ~31k tok/s). Don't fail the build (triton-only / no-hipcc
-        # envs legitimately produce nothing), just make it impossible to miss.
+        _pa_ps_built = prebuild_pa_ps()
+        # PREBUILD_KERNELS wheel builds promise the pa_ps reduce-kernel prebuild. This
+        # adds a small amount of build time, but failures must be hard errors; otherwise
+        # we can publish a wheel that built successfully while silently losing the
+        # gpt-oss-120b cold-start benefit.
         if not _pa_ps_built:
             print("=" * 72)
-            print("[aiter] WARNING: pa_ps AOT prebuild produced 0 kernels.")
+            print("[aiter] ERROR: pa_ps AOT prebuild produced 0 kernels.")
             print("[aiter] The wheel will NOT carry prebuilt pa_ps; first-inference")
             print(
                 "[aiter] hipcc JIT (cold-start slowdown) is back. Check hipcc/GPU_ARCHS."
             )
             print("=" * 72)
+            raise RuntimeError("pa_ps AOT prebuild produced 0 kernels")
         else:
             _pa_ps_libs = glob.glob(os.path.join(bd, "pa_ps_*", "lib.so"))
             _pa_ps_metas = glob.glob(
@@ -451,7 +448,7 @@ if PREBUILD_KERNELS != 0:
             ):
                 print("=" * 72)
                 print(
-                    "[aiter] WARNING: pa_ps AOT prebuild packaging sanity check failed."
+                    "[aiter] ERROR: pa_ps AOT prebuild packaging sanity check failed."
                 )
                 print(
                     "[aiter] Expected every pa_ps lib.so to have "
@@ -462,6 +459,7 @@ if PREBUILD_KERNELS != 0:
                     f"lib.so={len(_pa_ps_libs)}, metadata={len(_pa_ps_metas)}"
                 )
                 print("=" * 72)
+                raise RuntimeError("pa_ps AOT prebuild packaging sanity check failed")
 
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:
