@@ -1580,3 +1580,239 @@ def flydsl_moe_stage2(
             target, out, token_num, topk, model_dim, expert_mask, topk_ids
         )
     return out
+
+# ---------------------------------------------------------------------------
+# Fused MoE route-map + MXFP4 quant + scatter-copy + scale-preshuffle
+#
+# One warp-per-route kernel that replaces the four-step stage1-input prep
+# (build_route_maps -> per_1x32_f4_quant -> scatter_copy_token ->
+# scatter_preshuffle_scale). Each warp claims its grouped row via atomicAdd,
+# quantizes its token's activations straight into the grouped fp4 payload, and
+# writes the e8m0 block scales into the preshuffled WMMA layout -- no per-token
+# intermediates, no rows_to_tokens round trip. See
+# ``kernels/moe_fused_route_quant_scatter.py`` for the layout/index math.
+# ---------------------------------------------------------------------------
+
+@functools.cache
+def _get_compiled_fused_route_quant_scatter(
+    model_dim: int,
+    topk: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    """Compile and cache the fused route+quant+scatter+preshuffle kernel.
+
+    Both the payload conversion path (native vs portable) and the FP8 e8m0 dtype
+    are selected inside the kernel builder from the current arch -- not caller
+    arguments.
+    """
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_fused_route_quant_scatter_module,
+    )
+
+    return build_moe_fused_route_quant_scatter_module(
+        model_dim=model_dim,
+        topk=topk,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+    )
+
+
+def flydsl_moe_fused_route_quant_scatter(
+    hidden_states: torch.Tensor,  # (token_num, model_dim) bf16
+    topk_ids: torch.Tensor,  # (token_num, topk) int32 local expert ids
+    E: int,
+    max_m: int,
+    *,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+    grouped_a1: Optional[torch.Tensor] = None,  # (E, max_m, model_dim//2) uint8 out
+    grouped_a1_scale: Optional[
+        torch.Tensor
+    ] = None,  # (E, max_m//wmma_rep, (model_dim//32)*wmma_rep) uint8 out
+):
+    """Fused route-map + MXFP4 quant + scatter-copy + scale-preshuffle in one pass.
+
+    Replaces ``build_route_maps`` + ``per_1x32_f4_quant`` / MXFP8 quant +
+    ``flydsl_moe_scatter_copy_token`` + ``flydsl_moe_scatter_preshuffle_scale``
+    for the grouped a8w4/fp4 stage1 input. One warp per route ``i = t*topk + k``:
+    lane 0 claims the grouped row via ``atomicAdd`` on a per-expert counter
+    (init 0), broadcasts it to the warp, and the warp quantizes token ``t``'s
+    activations straight into ``grouped_a1[row]`` (fp4 e2m1 or fp8 e4m3) and the
+    preshuffled ``grouped_a1_scale`` (e8m0). Padding rows are left untouched (the
+    masked GEMM never reads them, matching ``flydsl_moe_scatter_copy_token``).
+
+    ``hidden_states`` must be bf16. ``max_m`` must be a multiple of
+    ``wmma_rep*16``. ``quant_mode`` is ``"fp4"`` (payload model_dim//2) or
+    ``"fp8"`` (payload model_dim). The payload conversion path (native
+    ``v_cvt_scalef32_pk_{fp4,fp8}_f32`` on gfx950/gfx1250 vs the portable path
+    elsewhere) is chosen inside the kernel by arch -- not a caller argument.
+    Returns ``(grouped_a1, grouped_a1_scale, masked_m, topids_to_rows)``:
+
+      grouped_a1       : (E, max_m, Pb)        uint8  payload (Pb=md//2 fp4 / md fp8)
+      grouped_a1_scale : (E, max_m//wmma_rep, (model_dim//32)*wmma_rep) uint8 e8m0
+      masked_m         : (E,)                  int32  rows routed per expert
+      topids_to_rows   : (token_num, topk)     int32  route -> grouped row
+    """
+    if quant_mode not in ("fp4", "fp8"):
+        raise NotImplementedError(
+            f"flydsl_moe_fused_route_quant_scatter: quant_mode={quant_mode!r} "
+            "unsupported (expected 'fp4' or 'fp8')."
+        )
+    assert hidden_states.dtype == torch.bfloat16, (
+        "fused route+quant kernel currently requires bf16 hidden_states "
+        f"(got {hidden_states.dtype})"
+    )
+    device = hidden_states.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    model_dim = hidden_states.shape[-1]
+    rows_per_tile = wmma_rep * 16
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+
+    payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
+    scale_bytes_per_row = model_dim // 32
+
+    counter = torch.zeros(E, dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+    if grouped_a1 is None:
+        grouped_a1 = torch.empty(
+            (E, max_m, payload_bytes_per_row), dtype=torch.uint8, device=device
+        )
+    if grouped_a1_scale is None:
+        grouped_a1_scale = torch.empty(
+            (E, max_m // wmma_rep, scale_bytes_per_row * wmma_rep),
+            dtype=torch.uint8,
+            device=device,
+        )
+
+    from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+
+    wave_size = get_warp_size()
+    warps_per_block = 256 // wave_size
+    grid_blocks = (numel + warps_per_block - 1) // warps_per_block
+
+    hidden_flat = hidden_states.contiguous().view(-1)
+    # The kernel reads int32 expert ids (the router's only output dtype).
+    topk_ids_i32 = topk_ids.to(torch.int32).reshape(-1)
+
+    launch = _get_compiled_fused_route_quant_scatter(
+        model_dim=model_dim,
+        topk=topk,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+    )
+    launch(
+        topk_ids_i32,
+        counter,
+        topids_to_rows,
+        hidden_flat,
+        grouped_a1.view(-1),
+        grouped_a1_scale.view(-1),
+        numel,
+        max_m,
+        grid_blocks,
+        stream=torch.cuda.current_stream(),
+    )
+    # counter[e] == masked_m[e] after the run.
+    return (
+        grouped_a1,
+        grouped_a1_scale,
+        counter,
+        topids_to_rows.view(token_num, topk),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fused grouped MXFP4/MXFP8 quant + scale-preshuffle (stage2 input prep)
+#
+# The stage2 analog of flydsl_moe_fused_route_quant_scatter: the input is already
+# grouped row-major (E, max_m, feat_dim) (the stage1 GEMM output), so there is no
+# route map / scatter -- one warp per grouped row quantizes that row into the
+# grouped MX payload and writes the preshuffled e8m0 scale in one pass. Replaces
+# per_1x32_f4_quant / MXFP8 quant + flydsl_moe_preshuffle_scale.
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _get_compiled_fused_quant_preshuffle(
+    feat_dim: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_fused_quant_preshuffle_module,
+    )
+
+    return build_moe_fused_quant_preshuffle_module(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+    )
+
+
+def flydsl_moe_fused_quant_preshuffle(
+    grouped_in: torch.Tensor,  # (E, max_m, feat_dim) or (E*max_m, feat_dim) bf16
+    E: int,
+    max_m: int,
+    *,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+    out_payload: Optional[torch.Tensor] = None,  # (E, max_m, Pb) uint8
+    out_scale: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+):
+    """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
+
+    ``grouped_in`` is already grouped row-major bf16 (stage2 input), so all
+    ``E*max_m`` rows are quantized (padding rows are unread by the masked GEMM).
+    ``quant_mode`` is ``"fp4"`` (payload feat_dim//2) or ``"fp8"`` (payload
+    feat_dim). Returns ``(payload (E,max_m,Pb), scale_pre (E, max_m//wmma_rep,
+    (feat_dim//32)*wmma_rep))`` -- the same layout the grouped GEMM consumes.
+    """
+    if quant_mode not in ("fp4", "fp8"):
+        raise NotImplementedError(
+            f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
+            "unsupported (expected 'fp4' or 'fp8')."
+        )
+    assert grouped_in.dtype == torch.bfloat16, (
+        "fused grouped quant+preshuffle requires bf16 input "
+        f"(got {grouped_in.dtype})"
+    )
+    device = grouped_in.device
+    feat_dim = grouped_in.shape[-1]
+    rows_per_tile = wmma_rep * 16
+    assert (
+        max_m % rows_per_tile == 0
+    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+
+    n_rows = E * max_m
+    Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
+    Ws = feat_dim // 32
+    if out_payload is None:
+        out_payload = torch.empty((E, max_m, Pb), dtype=torch.uint8, device=device)
+    if out_scale is None:
+        out_scale = torch.empty(
+            (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
+        )
+
+    from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+
+    wave_size = get_warp_size()
+    warps_per_block = 256 // wave_size
+    grid_blocks = (n_rows + warps_per_block - 1) // warps_per_block
+
+    launch = _get_compiled_fused_quant_preshuffle(
+        feat_dim=feat_dim, wmma_rep=wmma_rep, quant_mode=quant_mode
+    )
+    launch(
+        grouped_in.contiguous().view(-1),
+        out_payload.view(-1),
+        out_scale.view(-1),
+        n_rows,
+        max_m,
+        grid_blocks,
+        stream=torch.cuda.current_stream(),
+    )
+    return out_payload, out_scale

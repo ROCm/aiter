@@ -551,30 +551,130 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     _grouped_dbg(f"routing max_m={max_m}")
 
-    # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
-    # the naive path keeps a deterministic torch fallback for tests/debug.
+    # Stage1 input prep. The fast (non-naive) path is the fused warp-per-route
+    # kernel: build_route_maps + per_1x32 MX quant + scatter_copy + scale
+    # preshuffle in a single launch (fp4 a4w4 / fp8 a8w4, quant_mode from
+    # data_format). It is the *sole* router on this path, so its
+    # topids_to_rows/masked_m feed both the GEMM and the gather-reduce. The naive
+    # path (AITER_GROUPED_GEMM_NAIVE=1) keeps a deterministic torch fallback for
+    # tests/debug and is the only path supporting doweight_stage1 / non-bf16.
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
-    # Per-expert counts are only consumed by the naive epilogues, the doweight
-    # multiply, and the optional dump (masked_m drives the GEMM). Build it only on
-    # the naive path so the fast path skips the bincount (two int reductions + a
-    # host sync); the lazy fallbacks below recompute it if ever needed.
+    fused_quant_mode = "fp4" if data_format == "fp4" else "fp8"
+    # Both branches produce grouped_a1 / grouped_a1_scale / masked_m /
+    # topids_to_rows. The naive path additionally builds counts / route_tokens /
+    # route_weights for its torch epilogues.
+    grouped_a1 = None
+    grouped_a1_scale = None
+
+    def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
+        from aiter.ops.triton.quant import dynamic_mxfp8_quant
+
+        y, scale = dynamic_mxfp8_quant(
+            x.contiguous().view(-1, last_dim), quant_dtype=dtypes.fp8
+        )
+        payload = y.view(torch.uint8).contiguous().view(*x.shape)
+        scale_u8 = (
+            scale.view(*x.shape[:-1], last_dim // 32).view(torch.uint8).contiguous()
+        )
+        return payload, scale_u8
+
     if _use_naive:
+        # Deterministic torch fallback: route maps + per-token MX quant +
+        # route-gather + scale preshuffle, all in torch. Also the only path
+        # supporting doweight_stage1 / non-bf16 hidden.
         if counts is None:
             counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
         topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
             topk_ids, E, max_m
         )
         route_tokens = rows_to_tokens.view(E, max_m).to(torch.long)
+        # Per-token MX quant (fp4 torch ref / a8w4 MXFP8).
+        if data_format == "fp4":
+            from aiter.ops.quant import per_1x32_f4_quant
+
+            _grouped_dbg("start a1 fp4 quant (naive)")
+            a1_quant, a1_scale_token = per_1x32_f4_quant(
+                hidden_states, quant_dtype=dtypes.fp4x2, shuffle=False
+            )
+            _grouped_dbg("a1 fp4 quant done")
+            a1_payload = a1_quant.view(torch.uint8).contiguous()
+            a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
+            grouped_a1 = torch.empty(
+                (E, max_m, model_dim // 2), dtype=torch.uint8, device=device
+            )
+        else:
+            a1_payload, a1_scale_token_u8 = _quantize_mxfp8_payload(
+                hidden_states, model_dim
+            )
+            grouped_a1 = torch.empty(
+                (E, max_m, model_dim), dtype=torch.uint8, device=device
+            )
+        # Padding rows decode with scale=1.0.
+        a1_scale_raw = torch.empty(
+            (E, max_m, model_dim // 32), dtype=torch.uint8, device=device
+        )
+
+        # Route-gather + scale preshuffle (torch).
+        _grouped_dbg("start route gather (naive)")
+        flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
+        flat_tokens = flat_routes // topk
+        flat_rows = topids_to_rows.reshape(-1).to(torch.long)
+        grouped_a1.view(E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
+        if a1_scale_token_u8 is not None:
+            a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
+        # Only the naive epilogue needs grouped row weights.
+        route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
+        route_weights.view(-1)[topids_to_rows.reshape(-1)] = topk_weight.reshape(-1).to(
+            route_weights.dtype
+        )
+        grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
+            a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
+        )
+        _grouped_dbg("route gather done")
     else:
+        # Fast path: one fused warp-per-route kernel does build_route_maps +
+        # per_1x32 MX quant + scatter_copy + scale preshuffle (fp4 a4w4 / fp8
+        # a8w4). It is the *sole* router, feeding both the GEMM and the
+        # gather-reduce. It supports only what the warp-per-route quant expresses
+        # today; fall back to the naive path (AITER_GROUPED_GEMM_NAIVE=1)
+        # otherwise.
         if doweight_stage1:
             raise NotImplementedError(
                 "doweight_stage1 is only supported on the grouped NAIVE path; "
                 "set AITER_GROUPED_GEMM_NAIVE=1"
             )
 
-        topids_to_rows, rows_to_tokens, masked_m = build_route_maps(topk_ids, E, max_m)
-    # Grouped row -> source token, (E, max_m); padding rows (-1) are never read
-    # because the naive epilogues are bounded by per-expert counts.
+        if data_format not in ("fp4", "a8w4"):
+            raise NotImplementedError(
+                f"fused grouped stage1 prep: unsupported data_format "
+                f"{data_format!r} (expected 'fp4' or 'a8w4')"
+            )
+        if hidden_states.dtype != dtypes.bf16:
+            raise NotImplementedError(
+                "fused grouped stage1 prep requires bf16 hidden_states "
+                f"(got {hidden_states.dtype}); set AITER_GROUPED_GEMM_NAIVE=1"
+            )
+        from aiter.ops.flydsl.moe_kernels import (
+            flydsl_moe_fused_route_quant_scatter,
+        )
+
+        _grouped_dbg(f"start fused route+quant+scatter ({fused_quant_mode})")
+        (
+            grouped_a1,
+            grouped_a1_scale,
+            masked_m,
+            topids_to_rows,
+        ) = flydsl_moe_fused_route_quant_scatter(
+            hidden_states,
+            topk_ids,
+            E,
+            max_m,
+            wmma_rep=warp_tile_m // 16,
+            quant_mode=fused_quant_mode,
+        )
+        rows_to_tokens = None
+        _grouped_dbg("fused route+quant+scatter done")
+
     out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
     m_tile_prefix = None
     m_tile_map = None
@@ -596,110 +696,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
         route_E = 1
         route_max_m = int(contiguous_m)
-
-    def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
-        from aiter.ops.triton.quant import dynamic_mxfp8_quant
-
-        y, scale = dynamic_mxfp8_quant(
-            x.contiguous().view(-1, last_dim), quant_dtype=dtypes.fp8
-        )
-        payload = y.view(torch.uint8).contiguous().view(*x.shape)
-        scale_u8 = (
-            scale.view(*x.shape[:-1], last_dim // 32).view(torch.uint8).contiguous()
-        )
-        return payload, scale_u8
-
-    if data_format == "fp4":
-        # a1 fp4 quant: AITER_GROUPED_GEMM_NAIVE=1 uses the torch reference;
-        # the fast path uses the HIP MXFP4 quant kernel so its e8m0 rounding
-        # matches the production HIP quant contract.
-        if _use_naive:
-            from aiter.ops.quant import per_1x32_f4_quant as _a1_f4_quant
-        else:
-            from aiter.ops.quant import per_1x32_f4_quant_hip as _a1_f4_quant
-
-        _grouped_dbg("start a1 fp4 quant")
-        a1_quant, a1_scale_token = _a1_f4_quant(
-            hidden_states, quant_dtype=dtypes.fp4x2, shuffle=False
-        )
-        _grouped_dbg("a1 fp4 quant done")
-        a1_payload = a1_quant.view(torch.uint8).contiguous()
-        a1_scale_token_u8 = a1_scale_token.view(torch.uint8).contiguous()
-        grouped_a1 = torch.empty(
-            (route_E, route_max_m, model_dim // 2), dtype=torch.uint8, device=device
-        )
-        # Only the naive path needs the row-major scale buffer; the fast path
-        # gathers + preshuffles the scale in one fused kernel (no a1_scale_raw).
-        a1_scale_raw = (
-            torch.empty(
-                (route_E, route_max_m, model_dim // 32),
-                dtype=torch.uint8,
-                device=device,
-            )
-            if _use_naive
-            else None
-        )
-    else:
-        # a8w4 stage1 input: per-block-32 MXFP8 quantization.
-        a1_payload, a1_scale_token_u8 = _quantize_mxfp8_payload(
-            hidden_states, model_dim
-        )
-        grouped_a1 = torch.empty(
-            (route_E, route_max_m, model_dim), dtype=torch.uint8, device=device
-        )
-        # Padding rows decode with scale=1.0. Only the naive path needs the
-        # row-major scale buffer; the fast path fuses gather + preshuffle.
-        a1_scale_raw = (
-            torch.empty(
-                (route_E, route_max_m, model_dim // 32),
-                dtype=torch.uint8,
-                device=device,
-            )
-            if _use_naive
-            else None
-        )
-
-    # Route-gather into the grouped per-expert layout.
-    if not _use_naive:
-        _grouped_dbg("start route gather (scatter-copy kernel)")
-        # Payload route-gather only; the e8m0 scale is route-gathered AND
-        # preshuffled into the WMMA layout in one fused pass below (no
-        # intermediate row-major a1_scale_raw + separate permute).
-        flydsl_moe_scatter_copy_token(
-            a1_payload,
-            None,
-            rows_to_tokens,
-            route_E,
-            route_max_m,
-            grouped_a1=grouped_a1,
-        )
-        grouped_a1_scale = flydsl_moe_scatter_preshuffle_scale(
-            a1_scale_token_u8,
-            rows_to_tokens,
-            route_E,
-            route_max_m,
-            wmma_rep=warp_tile_m // 16,
-            scale_k_per_tile=tile_k // 32,
-        )
-        _grouped_dbg("route gather + scale preshuffle done")
-    else:
-        _grouped_dbg("start route gather (naive)")
-        # Naive torch route-gather.
-        flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
-        flat_tokens = flat_routes // topk
-        flat_rows = topids_to_rows.reshape(-1).to(torch.long)
-        grouped_a1.view(E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
-        if a1_scale_token_u8 is not None:
-            a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
-        # Only the naive epilogue needs grouped row weights.
-        route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
-        route_weights.view(-1)[topids_to_rows.reshape(-1)] = topk_weight.reshape(-1).to(
-            route_weights.dtype
-        )
-        grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
-            a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
-        )
-        _grouped_dbg("route gather done")
 
     grouped_w1 = _grouped_weight_uint8(w1)
     grouped_w2 = _grouped_weight_uint8(w2)
@@ -803,63 +799,85 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             if n:
                 grouped_a2[e, :n].mul_(route_weights[e, :n].view(-1, 1))
 
-    if data_format == "fp4":
-        # a2 fp4 quant: same NAIVE gating as a1 -- torch reference on NAIVE=1,
-        # HIP MXFP4 quant on the fast path.
-        if _use_naive:
-            from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
-        else:
-            from aiter.ops.quant import per_1x32_f4_quant_hip as _a2_f4_quant
-
-        _grouped_dbg("start a2 fp4 quant")
-        a2_quant, a2_scale_token = _a2_f4_quant(
-            grouped_a2.view(route_E * route_max_m, inter_dim),
-            quant_dtype=dtypes.fp4x2,
-            shuffle=False,
-        )
-        _grouped_dbg("a2 fp4 quant done")
-        grouped_a2_payload = (
-            a2_quant.view(torch.uint8)
-            .contiguous()
-            .view(route_E, route_max_m, inter_dim // 2)
-        )
-        a2_scale_raw = (
-            a2_scale_token.view(torch.uint8)
-            .contiguous()
-            .view(route_E, route_max_m, inter_dim // 32)
-        )
-        if _grouped_sync_dbg:
-            torch.cuda.synchronize()
-        _grouped_dbg("[crash-probe] after a2 fp4 quant sync OK")
-    else:
-        # a8w4 stage2 input also needs per-block-32 MXFP8 scale; SiLU outputs
-        # can exceed unit-scale fp8 and direct casts may encode NaNs.
-        grouped_a2_payload, a2_scale_raw = _quantize_mxfp8_payload(
-            grouped_a2, inter_dim
-        )
     if _use_naive:
+        # Deterministic torch fallback: per-row MX quant + torch preshuffle.
+        if data_format == "fp4":
+            from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
+
+            _grouped_dbg("start a2 fp4 quant (naive)")
+            a2_quant, a2_scale_token = _a2_f4_quant(
+                grouped_a2.view(E * max_m, inter_dim),
+                quant_dtype=dtypes.fp4x2,
+                shuffle=False,
+            )
+            _grouped_dbg("a2 fp4 quant done")
+            grouped_a2_payload = (
+                a2_quant.view(torch.uint8).contiguous().view(E, max_m, inter_dim // 2)
+            )
+            a2_scale_raw = (
+                a2_scale_token.view(torch.uint8)
+                .contiguous()
+                .view(E, max_m, inter_dim // 32)
+            )
+        else:
+            # a8w4 stage2 input also needs per-block-32 MXFP8 scale; SiLU outputs
+            # can exceed unit-scale fp8 and direct casts may encode NaNs.
+            grouped_a2_payload, a2_scale_raw = _quantize_mxfp8_payload(
+                grouped_a2, inter_dim
+            )
         grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
             a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
         )
     else:
-        # a2_scale_raw is already grouped row-major (no route-gather), so use the
-        # in-kernel preshuffle (gather-less fused version, like stage1).
+        # Fast path: one fused kernel does the grouped MX quant AND writes the
+        # preshuffled e8m0 scale (the stage2 analog of the fused stage1 input
+        # prep). grouped_a2 is already grouped row-major, so no route-gather.
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_fused_quant_preshuffle
 
-        grouped_a2_scale = flydsl_moe_preshuffle_scale(
-            a2_scale_raw,
-            route_E,
-            route_max_m,
+        _grouped_dbg("start a2 fused quant+preshuffle")
+        grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
+            grouped_a2,
+            E,
+            max_m,
             wmma_rep=warp_tile_m // 16,
-            scale_k_per_tile=tile_k // 32,
+            quant_mode=fused_quant_mode,
         )
+        if not _capturing:
+            torch.cuda.synchronize()
+        _grouped_dbg("[crash-probe] after a2 fused quant+preshuffle sync OK")
     _grouped_dbg("a2 scale layout done")
-    grouped_out = torch.empty(
-        (route_E, route_max_m, model_dim), dtype=dtype, device=device
-    )
+    grouped_out = torch.empty((E, max_m, model_dim), dtype=dtype, device=device)
     stage2_compiler = (
         compile_moe_grouped_gemm2_mxfp4_masked
         if data_format == "fp4"
         else compile_moe_grouped_gemm2_a8w4_masked
+    )
+    _grouped_dbg(
+        "kernel_mxscale_gemm2 tile config: "
+        + ", ".join(
+            f"{k}={v}"
+            for k, v in [
+                ("data_format", data_format),
+                ("model_dim", model_dim),
+                ("inter_dim", inter_dim),
+                ("experts", E),
+                ("max_m", max_m),
+                ("tile_m", tile_m),
+                ("tile_n", tile_n),
+                ("tile_k", tile_k),
+                ("m_warp", m_warp),
+                ("n_warp", n_warp),
+                ("warp_tile_m", warp_tile_m),
+                ("warp_tile_n", warp_tile_n),
+                ("out_dtype", out_dtype_str),
+                ("num_buffers", num_buffers),
+                ("split_k", split_k2),
+                ("expert_sched_mode", False),
+                ("grouped_persistent_m", effective_grouped_persistent_m),
+                ("persistent_workers", persistent_workers),
+                ("cfg_row", cfg_row),
+            ]
+        )
     )
     _grouped_dbg("start stage2 compile")
     stage2 = stage2_compiler(
