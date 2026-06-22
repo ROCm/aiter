@@ -66,6 +66,7 @@ class _GroupedA8W4Config:
     data_format: str = "a8w4"
     act: str = "silu"
     stage1_weight_layout: str = "gguu"
+    k_warp: int = 1
 
 
 def _validate_common(cfg: _GroupedA8W4Config) -> None:
@@ -751,6 +752,7 @@ def _compile_base_a8w4_gemm(
         inst_prefetch=cfg.inst_prefetch,
         wave_specialized_tdm=cfg.wave_specialized_tdm and stage1_act is None,
         split_k=cfg.split_k,
+        k_warp=cfg.k_warp,
         cluster_m=cfg.cluster_m,
         cluster_n=cfg.cluster_n,
         use_scale_opsel=cfg.use_scale_opsel,
@@ -796,6 +798,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     act: str = "silu",
     stage1_weight_layout: str = "gguu",
     data_format: str = "a8w4",
+    k_warp: int = 1,
 ):
     cfg = _GroupedA8W4Config(
         model_dim=int(model_dim),
@@ -824,6 +827,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         data_format=str(data_format),
         act=str(act),
         stage1_weight_layout=str(stage1_weight_layout),
+        k_warp=int(k_warp),
     )
     _validate_common(cfg)
     fused_n = cfg.inter_dim

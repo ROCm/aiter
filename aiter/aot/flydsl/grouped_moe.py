@@ -54,6 +54,20 @@ def _preshuffled_scale_shape(
     return int(rows) // wmma_rep, k_scale * wmma_rep
 
 
+def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
+    """Weight (B) scale shape in the n32k4 layout: (rows//32, (k_dim//32)*32).
+
+    Mirrors moe_grouped_gemm_mxscale_gfx1250._preshuffled_b_scale_shape (the
+    layout the grouped launchers validate for scale_w / scale_w2).
+    """
+    k_scale = int(k_dim) // 32
+    if k_scale % 4 != 0:
+        raise ValueError(f"B-scale K//32 must be divisible by 4, got {k_scale}")
+    if int(rows) % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {rows}")
+    return int(rows) // 32, k_scale * 32
+
+
 def _as_bool(value, default: bool = False) -> bool:
     if value is None or str(value).strip() == "":
         return default
@@ -108,6 +122,12 @@ def parse_csv(csv_path: str):
                 warp_tile_m,
                 ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m,
             )
+            # slice-K config (matches grouped_moe_gfx1250 dispatch): k_warp>1
+            # partitions K across warp-groups and forces split_k1=1.
+            k_warp = int(row.get("k_warp") or 1)
+            split_k1 = int(row.get("split_k1") or 1)
+            if k_warp > 1:
+                split_k1 = 1
             base_job = {
                 "kernel_name": row.get("kernelName1", "grouped_gemm1"),
                 "model_dim": int(row["model_dim"]),
@@ -117,12 +137,13 @@ def parse_csv(csv_path: str):
                 "token_num": token_num,
                 "topk": topk,
                 "tile_m": tile_m,
-                "tile_n": n_warp * _WARP_TILE_N,
-                "tile_k": _TILE_K,
+                "tile_n": _as_int(row.get("tile_n"), n_warp * _WARP_TILE_N),
+                "tile_k": int(row.get("tile_k") or _TILE_K),
                 "m_warp": m_warp,
                 "n_warp": n_warp,
+                "k_warp": k_warp,
                 "num_buffers": int(row.get("num_buffers") or 2),
-                "split_k1": int(row.get("split_k1") or 1),
+                "split_k1": split_k1,
                 "split_k2": int(row.get("split_k2") or 1),
                 "out_dtype": "bf16" if row.get("dtype") == "torch.bfloat16" else "f16",
                 "persistent_workers": _as_int(row.get("persistent_workers"), None),
@@ -173,7 +194,6 @@ def compile_one_config(**job):
         else compile_moe_grouped_gemm2_a8w4_masked
     )
     warp_tile_m = job["tile_m"] // job["m_warp"]
-    warp_tile_n = job["tile_n"] // job["n_warp"]
     contiguous = bool(job.get("grouped_contiguous_m", False))
     common = dict(
         model_dim=job["model_dim"],
@@ -224,9 +244,7 @@ def compile_one_config(**job):
         sw1 = torch.empty(
             (
                 job["experts"],
-                *_preshuffled_scale_shape(
-                    2 * job["inter_dim"], job["model_dim"], warp_tile_n
-                ),
+                *_preshuffled_b_scale_shape(2 * job["inter_dim"], job["model_dim"]),
             ),
             dtype=torch.uint8,
         )
@@ -243,9 +261,7 @@ def compile_one_config(**job):
         sw2 = torch.empty(
             (
                 job["experts"],
-                *_preshuffled_scale_shape(
-                    job["model_dim"], job["inter_dim"], warp_tile_n
-                ),
+                *_preshuffled_b_scale_shape(job["model_dim"], job["inter_dim"]),
             ),
             dtype=torch.uint8,
         )
@@ -253,6 +269,7 @@ def compile_one_config(**job):
             act=job["act"],
             stage1_weight_layout=job["stage1_weight_layout"],
             split_k=job["split_k1"],
+            k_warp=job["k_warp"],
             **common,
         )
         exe1(
