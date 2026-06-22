@@ -379,6 +379,21 @@ void causal_conv1d_fwd_split_qkv_hip_impl(
     AITER_CHECK(x.dim() == 2, "`x` must be 2-D [dim, cu_seqlen].");
     AITER_CHECK(block_m == 8 || block_m == 16 || block_m == 32 || block_m == 64,
                 "`block_m` must be 8, 16, 32, or 64.");
+    AITER_CHECK(weight.dtype() == AITER_DTYPE_bf16, "`weight` must be bfloat16.");
+    AITER_CHECK(conv_states.dtype() == AITER_DTYPE_bf16, "`conv_states` must be bfloat16.");
+    AITER_CHECK(q.dtype() == AITER_DTYPE_bf16 && k.dtype() == AITER_DTYPE_bf16 &&
+                    v.dtype() == AITER_DTYPE_bf16,
+                "`q`/`k`/`v` outputs must be bfloat16.");
+    AITER_CHECK(cache_indices.dtype() == AITER_DTYPE_i32 &&
+                    query_start_loc.dtype() == AITER_DTYPE_i32 &&
+                    batch_ptr.dtype() == AITER_DTYPE_i32 &&
+                    token_chunk_offset_ptr.dtype() == AITER_DTYPE_i32,
+                "`cache_indices`/`query_start_loc`/`batch_ptr`/`token_chunk_offset_ptr` "
+                "must be int32.");
+    AITER_CHECK(has_initial_state.dtype() == AITER_DTYPE_u8,
+                "`has_initial_state` must be uint8.");
+    if(has_bias)
+        AITER_CHECK(bias.dtype() == AITER_DTYPE_bf16, "`bias` must be bfloat16.");
 
     const int dim       = (int)x.size(0);
     const int cu_seqlen = (int)x.size(1);

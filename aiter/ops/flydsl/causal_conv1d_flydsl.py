@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import functools
 
-import numpy as np
 import torch
 
 try:
@@ -546,15 +545,18 @@ def _build_chunk_metadata(query_start_loc: torch.Tensor, block_m: int):
     """Build (num_programs, batch_ptr, token_chunk_offset_ptr) like the Triton wrapper."""
     device = query_start_loc.device
     seqlens = query_start_loc.diff().to("cpu")
-    nums = -(-seqlens // block_m)  # ceil
+    nums = (-(-seqlens // block_m)).to(torch.int64)  # ceil-div per sequence
+    n_seqs = nums.numel()
     tot = int(nums.sum().item())
-    mlist = np.repeat(np.arange(len(nums)), nums.numpy())
-    offsetlist = []
-    for num in nums.tolist():
-        offsetlist.extend(range(int(num)))
-    batch_ptr = torch.from_numpy(np.asarray(mlist, dtype=np.int32)).to(device)
-    token_chunk_offset_ptr = torch.tensor(offsetlist, dtype=torch.int32, device=device)
-    return tot, batch_ptr, token_chunk_offset_ptr
+    if tot == 0:
+        z = torch.zeros(0, dtype=torch.int32, device=device)
+        return 0, z, z
+    seq_ids = torch.arange(n_seqs, dtype=torch.int32)
+    batch_ptr = torch.repeat_interleave(seq_ids, nums)
+    starts = nums.cumsum(0) - nums  # exclusive prefix sum
+    base = torch.repeat_interleave(starts, nums)
+    tco = (torch.arange(tot, dtype=torch.int64) - base).to(torch.int32)
+    return tot, batch_ptr.to(device), tco.to(device)
 
 
 def causal_conv1d_split_qkv_flydsl_fn(
