@@ -15,7 +15,8 @@ This kernel fuses all four into one *warp-per-route* pass. Each warp owns one
 route ``i = token*topk + k``:
 
     lane 0   : expert = topk_ids[i]; slot = atomicAdd(counter[expert], 1)
-               grouped_row = expert*max_m + slot; topids_to_rows[i] = grouped_row
+               grouped_row = expert_row_base[expert] + slot (masked: e*max_m,
+               contiguous-M: starts[e]); topids_to_rows[i] = grouped_row
     broadcast slot (hence grouped_row) to the whole warp via readlane
     all lanes: quantize token's activation row directly into
                grouped_payload[grouped_row] (fp4 e2m1 or fp8 e4m3) and write the
@@ -428,20 +429,33 @@ def build_moe_fused_route_quant_scatter_module(
     native scaled-convert instruction, everything else (incl. gfx942) uses the
     portable path. ``topk_ids`` is int32 (the router's only output dtype).
 
+    The destination row for each route is ``expert_row_base[expert] + slot`` and
+    both the payload and the e8m0 scale are indexed by that *global* row, so the
+    same kernel serves either output layout (the caller picks via the base array):
+
+      * masked     : ``expert_row_base[e] = e*max_m``     -> buffer (E, max_m)
+      * contiguous : ``expert_row_base[e] = starts[e]``   -> buffer (1, contiguous_m)
+                     (DeepGEMM contiguous-M; ``starts`` is the tile_m-aligned
+                     exclusive prefix sum of masked_m)
+
+    Every base must be a multiple of ``wmma_rep*16`` (both forms are) so the
+    preshuffle tiling stays consistent.
+
     Launcher signature::
 
         (topk_ids, counter, topids_to_rows, hidden, grouped_payload, grouped_scale,
-         numel, max_m, grid_blocks, stream=...)
+         expert_row_base, numel, grid_blocks, stream=...)
 
       topk_ids        : (numel,)               int32  flattened expert ids
       counter         : (E,)                   int32  per-expert counter, init 0
                         (== masked_m[expert] after the run)
       topids_to_rows  : (numel,)               int32  out: route -> grouped row
       hidden          : (token_num*model_dim,) bf16   flat activations
-      grouped_payload : (E*max_m*payload_bytes_per_row,) uint8  out: MX payload
-                        (payload_bytes_per_row = model_dim//2 fp4 / model_dim fp8)
-      grouped_scale   : (E*(max_m//wmma_rep)*(model_dim//32)*wmma_rep,) uint8
-                        out: preshuffled e8m0 scale
+      grouped_payload : (n_rows*payload_bytes_per_row,) uint8  out: MX payload
+                        (payload_bytes_per_row = model_dim//2 fp4 / model_dim fp8;
+                        n_rows = E*max_m masked / contiguous_m contiguous)
+      grouped_scale   : (n_rows*(model_dim//32),) uint8  out: preshuffled e8m0
+      expert_row_base : (E,)                   int32  per-expert dst row base
     """
     L = _quant_layout(model_dim, quant_mode, wmma_rep)
     is_fp8 = L.is_fp8
@@ -474,10 +488,10 @@ def build_moe_fused_route_quant_scatter_module(
         counter: fx.Tensor,  # (E,) int32, init 0
         topids_to_rows: fx.Tensor,  # (numel,) int32 out
         hidden: fx.Tensor,  # (token_num*model_dim,) bf16
-        grouped_payload: fx.Tensor,  # (E*max_m*payload_bytes_per_row,) uint8 out
+        grouped_payload: fx.Tensor,  # (n_rows*payload_bytes_per_row,) uint8 out
         grouped_scale: fx.Tensor,  # preshuffled e8m0 out
+        expert_row_base: fx.Tensor,  # (E,) int32 per-expert dst row base
         numel: Int32,
-        max_m: Int32,
     ):
         i32 = T.i32
         f32 = T.f32
@@ -550,7 +564,20 @@ def build_moe_fused_route_quant_scatter_module(
             # /workspace/FlyDSL example's auto-unwrap + T.i32() are a newer API).
             slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
 
-            grouped_row = slot + expert * ArithValue(max_m)
+            # Destination row = per-expert base + within-expert slot. The base
+            # array selects the output layout: masked (base[e]=e*max_m, buffer
+            # (E,max_m)) or DeepGEMM contiguous-M (base[e]=starts[e], buffer
+            # (1,contiguous_m)). Both payload and scale are indexed by this global
+            # ``grouped_row`` so the kernel is layout-agnostic; bases must be a
+            # multiple of rows_per_tile (e*max_m and tile_m-aligned starts both
+            # are), which keeps the preshuffle tiling consistent.
+            erb_rsrc = buffer_ops.create_buffer_resource(
+                expert_row_base, max_size=True
+            )
+            row_base = ArithValue(
+                buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
+            )
+            grouped_row = slot + row_base
             token = arith.divui(route, c_topk)
 
             # topids_to_rows[route] = grouped_row (lane 0 only; warp-uniform value)
@@ -560,17 +587,18 @@ def build_moe_fused_route_quant_scatter_module(
                 )
                 buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
 
-            # --- per-row scale-preshuffle geometry (uniform; row position == slot) ---
-            scale_tile = arith.divui(slot, c_rows_per_tile)
-            row_in_tile = slot - scale_tile * c_rows_per_tile
+            # --- per-row scale-preshuffle geometry (uniform; from the *global*
+            #     grouped_row so the same math serves both output layouts). Since
+            #     every expert base is a multiple of rows_per_tile, tiling by the
+            #     global row reproduces the per-expert byte layout exactly. ---
+            scale_tile = arith.divui(grouped_row, c_rows_per_tile)
+            row_in_tile = grouped_row - scale_tile * c_rows_per_tile
             wmma_row = arith.divui(row_in_tile, c16_i32)
             row_lane16 = row_in_tile - wmma_row * c16_i32
             out_row = scale_tile * c16_i32 + row_lane16
-            # dst dword base for (expert, out_row); scale_dword*wmma_rep added per block
+            # dst dword base for out_row; scale_dword*wmma_rep added per block.
             scale_row_dword_base = (
-                expert * (ArithValue(max_m) * c_scale_dwords_per_row)
-                + out_row * c_dst_scale_dwords_per_row
-                + wmma_row
+                out_row * c_dst_scale_dwords_per_row + wmma_row
             )
 
             payload_row_byte_base = grouped_row * c_payload_bytes_per_row
@@ -630,8 +658,8 @@ def build_moe_fused_route_quant_scatter_module(
         hidden: fx.Tensor,
         grouped_payload: fx.Tensor,
         grouped_scale: fx.Tensor,
+        expert_row_base: fx.Tensor,
         numel: fx.Int32,
-        max_m: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -647,8 +675,8 @@ def build_moe_fused_route_quant_scatter_module(
             hidden,
             grouped_payload,
             grouped_scale,
+            expert_row_base,
             numel,
-            max_m,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_THREADS, 1, 1),

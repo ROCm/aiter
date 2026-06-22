@@ -565,6 +565,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # route_weights for its torch epilogues.
     grouped_a1 = None
     grouped_a1_scale = None
+    out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+    m_tile_prefix = None
+    m_tile_map = None
+    route_E = E
+    route_max_m = max_m
+    # The DeepGEMM contiguous-M scheduler packs every expert's rows into one
+    # (1, contiguous_m) buffer. The fused kernel handles it directly by scattering
+    # into per-expert tile-aligned ``starts`` offsets (no post-hoc remap); only
+    # the non-naive fast path supports it.
+    effective_grouped_contiguous_m = (not _use_naive) and bool(grouped_contiguous_m)
 
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
         from aiter.ops.triton.quant import dynamic_mxfp8_quant
@@ -658,6 +668,22 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             flydsl_moe_fused_route_quant_scatter,
         )
 
+        expert_row_base = None
+        if effective_grouped_contiguous_m:
+            # Precompute per-expert counts + tile-aligned starts so the fused
+            # kernel scatters straight into the (1, contiguous_m) DeepGEMM layout.
+            # contiguous_m is a static upper bound (no .item() sync), CUDAGraph-safe.
+            masked_m_pre = torch.bincount(
+                flat_experts.to(torch.long), minlength=E
+            ).to(torch.int32)
+            starts_t, psum_t, _ = contiguous_psum(masked_m_pre, E, tile_m)
+            ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
+            contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
+            m_tile_map = psum_t
+            route_E = 1
+            route_max_m = int(contiguous_m)
+            expert_row_base = starts_t
+
         _grouped_dbg(f"start fused route+quant+scatter ({fused_quant_mode})")
         (
             grouped_a1,
@@ -671,31 +697,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             max_m,
             wmma_rep=warp_tile_m // 16,
             quant_mode=fused_quant_mode,
+            expert_row_base=expert_row_base,
+            out_E=route_E,
+            out_max_m=route_max_m,
         )
         rows_to_tokens = None
         _grouped_dbg("fused route+quant+scatter done")
-
-    out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
-    m_tile_prefix = None
-    m_tile_map = None
-    route_E = E
-    route_max_m = max_m
-    effective_grouped_contiguous_m = bool(grouped_contiguous_m)
-    if not _use_naive and effective_grouped_contiguous_m:
-        topids_to_rows, rows_to_tokens, m_tile_map, contiguous_m = (
-            _make_contiguous_psum_layout(
-                masked_m=masked_m,
-                rows_to_tokens=rows_to_tokens,
-                topids_to_rows=topids_to_rows,
-                experts=E,
-                max_m=max_m,
-                tile_m=tile_m,
-                token_num=token_num,
-                topk=topk,
-            )
-        )
-        route_E = 1
-        route_max_m = int(contiguous_m)
 
     grouped_w1 = _grouped_weight_uint8(w1)
     grouped_w2 = _grouped_weight_uint8(w2)
@@ -835,18 +842,23 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         from aiter.ops.flydsl.moe_kernels import flydsl_moe_fused_quant_preshuffle
 
         _grouped_dbg("start a2 fused quant+preshuffle")
+        # grouped_a2 is (route_E, route_max_m, inter_dim): masked (E, max_m) or
+        # contiguous (1, contiguous_m). The fused kernel derives expert=row//max_m
+        # so passing route_E/route_max_m yields the matching scale layout for both.
         grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
             grouped_a2,
-            E,
-            max_m,
+            route_E,
+            route_max_m,
             wmma_rep=warp_tile_m // 16,
             quant_mode=fused_quant_mode,
         )
-        if not _capturing:
+        if _grouped_sync_dbg:
             torch.cuda.synchronize()
         _grouped_dbg("[crash-probe] after a2 fused quant+preshuffle sync OK")
     _grouped_dbg("a2 scale layout done")
-    grouped_out = torch.empty((E, max_m, model_dim), dtype=dtype, device=device)
+    grouped_out = torch.empty(
+        (route_E, route_max_m, model_dim), dtype=dtype, device=device
+    )
     stage2_compiler = (
         compile_moe_grouped_gemm2_mxfp4_masked
         if data_format == "fp4"
@@ -873,8 +885,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 ("num_buffers", num_buffers),
                 ("split_k", split_k2),
                 ("expert_sched_mode", False),
-                ("grouped_persistent_m", effective_grouped_persistent_m),
-                ("persistent_workers", persistent_workers),
+                ("grouped_contiguous_m", effective_grouped_contiguous_m),
+                ("persistent_workers", None),
                 ("cfg_row", cfg_row),
             ]
         )
