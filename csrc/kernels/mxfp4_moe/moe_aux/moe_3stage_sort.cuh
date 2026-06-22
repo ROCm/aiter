@@ -40,6 +40,7 @@ __global__ void sort_count_kernel_impl(
 
 template <int NE, int N_SORT_CTAS, int MB, int THREADS_PER_CTA>
 __global__ void sort_cumsum_kernel_impl(
+    int M,
     int32_t *__restrict__ block_offsets,
     int32_t *__restrict__ masked_m,
     int32_t *__restrict__ real_counts,
@@ -72,6 +73,7 @@ __global__ void sort_cumsum_kernel_impl(
         for (int e = 0; e < NE; ++e) { expert_starts[e] = acc; acc += padded_count[e]; }
         expert_starts[NE] = acc;
         cumsum_tensor[0] = acc;
+        cumsum_tensor[1] = M;  // num_valid_ids[1] = valid tokens (non-EP == M)
     }
     __syncthreads();
 
@@ -171,7 +173,7 @@ inline void launch(
 
     sort_cumsum_kernel_impl<NE, N_SORT_CTAS, MB, THREADS_PER_CTA>
         <<<1, THREADS_PER_CTA, 0, stream>>>(
-            block_offsets, masked_m, real_counts, cumsum_tensor, sorted_expert_ids);
+            M, block_offsets, masked_m, real_counts, cumsum_tensor, sorted_expert_ids);
 
     sort_place_pad_kernel_impl<NE, TOPK, N_SORT_CTAS, MB, THREADS_PER_CTA>
         <<<N_SORT_CTAS, THREADS_PER_CTA, 0, stream>>>(

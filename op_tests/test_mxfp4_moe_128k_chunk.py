@@ -40,7 +40,13 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import mxfp4_moe_run
+from aiter.fused_moe import (
+    moe_sorting,
+    _mxfp4_a4w4_stage1_fw,
+    _mxfp4_a4w4_stage2_fw,
+    _parse_mxfp4_g1_kname,
+    _parse_mxfp4_g2_kname,
+)
 
 torch.set_default_device("cuda")
 
@@ -81,13 +87,36 @@ def make_routing(num_tokens, seed=1):
 
 
 def run(hidden, topk_ids, topk_weight, w):
+    # a4w4 HIP pipeline = the production path's three steps: a fused HIP sort ->
+    # stage1 (quant + gemm1) -> stage2 (gemm2 [+ scatter]). Called directly to
+    # exercise a fixed kernelName pair without a tuned CSV row.
     w1, w2, w1s, w2s = w
-    return mxfp4_moe_run(
-        hidden, w1, w2, TOPK, topk_ids, topk_weight,
-        kernelName1=KN1, kernelName2=KN2,
-        w1_scale=w1s, w2_scale=w2s,
-        quant_type=QuantType.per_1x32,
-        activation=ActivationType.Silu,
+    p1 = _parse_mxfp4_g1_kname(KN1)
+    p2 = _parse_mxfp4_g2_kname(KN2)
+    BM = p1["BM"]
+    M = hidden.shape[0]
+    sti, sw, sei, nvi, moe_buf, aux = moe_sorting(
+        topk_ids,
+        topk_weight,
+        NE,
+        D_HIDDEN,
+        dtypes.bf16,
+        block_size=BM,
+        accumulate=p2["atomic"],
+        fused_sort=True,
+    )
+    moe_out = (
+        moe_buf if moe_buf.numel() else torch.empty((M, D_HIDDEN), dtype=dtypes.bf16)
+    )
+    inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+        hidden, w1, w2, sti, sei, nvi, None, TOPK,
+        block_m=BM, w1_scale=w1s, kernelName1=KN1,
+        m_indices=aux.m_indices, moe_buf=moe_buf,
+    )
+    return _mxfp4_a4w4_stage2_fw(
+        inter_q, w1, w2, sti, sei, nvi, moe_out, TOPK,
+        w2_scale=w2s, a2_scale=inter_s, block_m=BM,
+        sorted_weights=sw, kernelName2=KN2, reverse_sorted=aux.reverse_sorted,
     )
 
 
