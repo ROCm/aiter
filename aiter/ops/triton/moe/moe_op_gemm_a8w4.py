@@ -253,12 +253,9 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     if block_m == 16:
         block_k = 512
         num_warps = 4
-        if get_arch() == "gfx1250":
-            # decode (block_m==16): NUM_BUFFERS=3 + block_n=128 restores the
-            # software-pipelined expert GEMM; the #3504 decode kernel's
-            # block_n=256/NUM_BUFFERS=1 regressed conc-1 decode on gfx1250.
+        if n <= 3072:
             block_n = 128
-            num_stages = 3
+            num_stages = 2
         else:
             block_n = 256
             num_stages = 1
