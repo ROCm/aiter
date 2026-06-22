@@ -187,8 +187,8 @@ def quantize_fp6_k_lds_order(k_thd: np.ndarray, tile: int = 128):
     """
     k = np.asarray(k_thd)
     b, sk, h, d = k.shape
-    assert d == 128 and tile == 128 and sk % tile == 0, (d, sk, tile)
-    nt = sk // tile
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nt = (sk + tile - 1) // tile  # ceil; the valid=(g<total) mask zeroes a partial tail tile
     packed, scale = quantize_fp6_lastdim(k.astype(np.float64))  # [b,sk,h,96], [b,sk,h,4]
     # token-major flat per (b,h): [b, h, sk*96]
     km = np.ascontiguousarray(np.transpose(packed, (0, 2, 1, 3))).reshape(b, h, sk * 96)
@@ -589,5 +589,110 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
         packed.reshape(*lead, NB * 24),
         scale.reshape(*lead, NB),
     )
+
+
+# ---------------------------------------------------------------------------
+# Kernel-ready packed views (GPU): bench / integration entry points
+# ---------------------------------------------------------------------------
+# These return tensors in the EXACT shape+stride the fwd_hd128_mxfp6 kernel
+# consumes, so a consumer just hands them to flash_attn_mxfp4_func. They own the
+# kernel-ABI knowledge -- the coalesced LDS-order K gather and the d-major
+# tile-flat V byte strides -- that used to live in the benchmark. Both support
+# S % 128 != 0 (the kernel masks the partial tail tile in softmax).
+
+_K_LDS_GIDX_CACHE: dict = {}
+
+
+def _k_lds_gather_index(nt: int, total: int, device):
+    """Cached [(nt*16384)] LDS-order gather index + valid mask. valid = (g < total)
+    zeroes BOTH the fp6 dup/overflow LDS tail AND a partial seq tail. Keyed by
+    (nt, total, device): with a partial tail the same nt pairs with different total."""
+    key = (nt, total, device)
+    g = _K_LDS_GIDX_CACHE.get(key)
+    if g is None:
+        idx16k = torch.as_tensor(
+            _k_lds_order_gather_index(), dtype=torch.long, device=device
+        )
+        full = (
+            torch.arange(nt, device=device, dtype=torch.long) * 12288
+        ).unsqueeze(1) + idx16k.unsqueeze(0)
+        full = full.reshape(-1)
+        valid = full < total
+        gc = torch.where(valid, full, torch.zeros_like(full))
+        g = (gc, valid)
+        _K_LDS_GIDX_CACHE[key] = g
+    return g
+
+
+def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128):
+    """GPU equivalent of quantize_fp6_k_lds_order, returning the kernel-ready K view
+    (seq stride 128) + E8M0 scale. Byte-identical to the numpy oracle's buffer but
+    runs the pack+gather entirely on-device (seconds vs the per-tile numpy CPU
+    round-trip). Supports S % tile != 0 (the gather's valid mask zeroes the partial
+    tail tile, which the kernel masks in softmax).
+
+    k_thd : float K [b, sk, h, 128] on GPU.
+    Returns (k_view uint8 [b, sk, h, 96] strided over a [b,h,n_tiles*16384] buffer,
+             scale uint8 [b, sk, h, 4])."""
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h, d = k_thd.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    nt = (sk + tile - 1) // tile  # ceil; partial tail handled by the valid mask
+    packed, scale = quantize_fp6_lastdim_triton(k_thd)  # [b,sk,h,96], [b,sk,h,4]
+    total = sk * 96
+    # token-major flat per (b,h): [b, h, sk*96]
+    km = packed.permute(0, 2, 1, 3).reshape(b, h, total).contiguous()
+    gc, valid = _k_lds_gather_index(nt, total, k_thd.device)
+    out = km[:, :, gc]  # [b, h, nt*16384] on-device gather
+    out = torch.where(valid.view(1, 1, -1), out, torch.zeros_like(out))
+    k_hs = nt * 16384
+    k_bs = h * k_hs
+    buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=k_thd.device)
+    buf[: out.numel()] = out.reshape(-1)
+    # seq stride = tile (=128) -> the kernel's _s_k_Seqs=128 -> tile base = token*128.
+    k_view = buf.as_strided((b, sk, h, 96), (k_bs, tile, k_hs, 1))
+    return k_view, scale
+
+
+def pack_fp6_v_kernel_view(
+    v_fp8: "torch.Tensor", tile: int = 128, use_triton: bool = True, out_device=None
+):
+    """Pack raw fp8 V into the kernel's native fp6 d-major tile-flat HBM layout and
+    return it as a [b, sk, h_kv, d] view with the kernel's byte strides
+    (v_Seqs=100, v_Hs=n_tiles*12800, v_Bs=h_kv*v_Hs). The per-channel v_descale is
+    applied in the kernel epilogue, so this is a layout cast only. Supports
+    S % tile != 0 by EDGE-padding the partial tail tile (replicate the last token so
+    every E8M0 32-block keeps a finite magnitude -- a zero block could dequant
+    0*inf -> NaN; the kernel masks tokens >= sk, so the padding never reaches out).
+
+    v_fp8 : torch fp8 V [b, sk, h_kv, d=128]. use_triton=False forces the numpy
+    host pack. out_device: move the final buffer here (the numpy pack lands on CPU).
+    Returns uint8 view [b, sk, h_kv, d]."""
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h_kv, d = v_fp8.shape
+    n_tiles = (sk + tile - 1) // tile
+    sk_pad = n_tiles * tile
+    if sk_pad != sk:
+        tail = v_fp8[:, sk - 1 : sk].expand(b, sk_pad - sk, h_kv, d)
+        v_in = torch.cat([v_fp8, tail], dim=1)
+    else:
+        v_in = v_fp8
+    if use_triton and _HAVE_TRITON:
+        packed_flat = quantize_fp6_v_clean_triton(v_in, tile=tile).reshape(-1)
+    else:
+        v_f = v_in.detach().to(torch.float32).cpu().numpy()  # [b, sk_pad, h_kv, d]
+        v_dmajor = np.transpose(v_f, (0, 2, 3, 1))  # [b, h_kv, d, sk_pad]
+        packed = quantize_fp6_v_clean(v_dmajor, tile=tile)
+        packed_flat = torch.from_numpy(np.ascontiguousarray(packed).reshape(-1))
+    tile_bytes = d * 96 + d * 4  # 12800 for d=128
+    v_hs = n_tiles * tile_bytes
+    v_bs = h_kv * v_hs
+    # as_strided can read up to (sk-1)*100 + (h_kv-1)*v_hs + (d-1), slightly past
+    # b*v_bs; the +256 tail keeps the view in-bounds.
+    buf = torch.empty(b * v_bs + 256, dtype=torch.uint8, device=packed_flat.device)
+    buf[: packed_flat.numel()] = packed_flat
+    if out_device is not None:
+        buf = buf.to(out_device)
+    return buf.as_strided((b, sk, h_kv, d), (v_bs, 100, v_hs, 1))
 
 
