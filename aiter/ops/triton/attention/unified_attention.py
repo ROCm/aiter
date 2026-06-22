@@ -13,9 +13,11 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_3d import (
         _unified_attention_gluon_kernel_3d,
+        gluon_reduce_segments,
     )
 except:  # noqa: E722
     _unified_attention_gluon_kernel_3d = None
+    gluon_reduce_segments = None
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_2d import (
@@ -133,10 +135,13 @@ def select_3d_config(
     ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
     reduce_num_warps = 2
     attn_warps = 2
+    reduce_waves_per_eu = 2
     waves_per_eu = 2
     num_segments = 0
     attn_stages = 2
     if IS_DEVICE_ARCH_GFX12:
+        reduce_num_warps = 1
+        reduce_waves_per_eu = 1
         attn_warps = 1
         TILE_SIZE = block_size
         if shuffled_kv_cache and head_size < 128:
@@ -227,7 +232,7 @@ def select_3d_config(
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": reduce_num_warps,
-        "waves_per_eu": 2,
+        "waves_per_eu": reduce_waves_per_eu,
         "num_stages": 1,
     }
 
@@ -332,6 +337,7 @@ def unified_attention(
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
+    num_query_tokens = q.shape[0]
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -412,7 +418,7 @@ def unified_attention(
             if ALL_DECODE:
                 total_num_q_blocks = num_seqs
             else:
-                total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
+                total_num_q_blocks = num_query_tokens // config["BLOCK_Q"] + num_seqs
 
             kernel_unified_attention_2d[
                 (
@@ -484,7 +490,7 @@ def unified_attention(
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
-                q.shape[0],
+                num_query_tokens,
                 num_query_heads,
                 NUM_SEGMENTS,
                 triton.next_power_of_2(head_size),
@@ -492,14 +498,14 @@ def unified_attention(
                 device=q.device,
             )
             segm_max = torch.empty(
-                q.shape[0],
+                num_query_tokens,
                 num_query_heads,
                 NUM_SEGMENTS,
                 dtype=torch.float32,
                 device=q.device,
             )
             segm_expsum = torch.empty(
-                q.shape[0],
+                num_query_tokens,
                 num_query_heads,
                 NUM_SEGMENTS,
                 dtype=torch.float32,
@@ -640,7 +646,23 @@ def unified_attention(
         elif skip_reduce:
             return segm_output, segm_max, segm_expsum
 
-        reduce_segments[(q.shape[0], num_query_heads)](
+        BLOCK_QH_REDUCE = 1
+        if ALL_DECODE:
+            total_wg_reduce = num_query_tokens * num_query_heads
+            if total_wg_reduce >= 1024:
+                BLOCK_QH_REDUCE = 4
+            num_qh_blocks = triton.cdiv(num_query_heads, BLOCK_QH_REDUCE)
+        else:
+            num_qh_blocks = num_query_heads
+
+        if IS_DEVICE_ARCH_GFX12 and gluon_reduce_segments is not None:
+            _reduce_kernel = gluon_reduce_segments
+        else:
+            _reduce_kernel = reduce_segments
+
+        # temporarily block off gluon path
+        _reduce_kernel = reduce_segments
+        _reduce_kernel[(num_query_tokens, num_qh_blocks)](
             output_ptr=out,
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
@@ -649,6 +671,9 @@ def unified_attention(
             num_seqs=num_seqs,
             num_query_heads=num_query_heads,
             out_scale_ptr=output_scale,
+            segm_output_stride_0=segm_output.stride(0),
+            segm_output_stride_1=segm_output.stride(1),
+            segm_output_stride_2=segm_output.stride(2),
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
@@ -656,6 +681,8 @@ def unified_attention(
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
+            ALL_DECODE=ALL_DECODE,
+            BLOCK_QH_REDUCE=BLOCK_QH_REDUCE,
             **reduce_config,
         )
 

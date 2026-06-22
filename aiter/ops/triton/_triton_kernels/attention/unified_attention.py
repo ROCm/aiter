@@ -852,6 +852,10 @@ _reduce_segments_repr = make_kernel_repr(
         "TILE_SIZE",
         "HEAD_SIZE",
         "NUM_SEGMENTS_PER_SEQ",
+        "BLOCK_QH_REDUCE",
+        "ALL_DECODE",
+        "num_warps",
+        "waves_per_eu",
     ],
 )
 
@@ -867,6 +871,9 @@ def reduce_segments(
     num_seqs,  # int
     num_query_heads: tl.constexpr,  # int
     out_scale_ptr,  # float32
+    segm_output_stride_0: tl.int64,
+    segm_output_stride_1: tl.int64,
+    segm_output_stride_2: tl.int64,
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
     block_table_stride: tl.int64,  # int
@@ -876,22 +883,29 @@ def reduce_segments(
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    num_warps: tl.constexpr,
+    waves_per_eu: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    ALL_DECODE: tl.constexpr = False,
+    BLOCK_QH_REDUCE: tl.constexpr = 1,
 ):
     query_token_idx = tl.program_id(0)
-    query_head_idx = tl.program_id(1)
+    qh_block_idx = tl.program_id(1)
 
-    out_scale = None
-    if out_scale_ptr is not None:
-        out_scale = 1 / tl.load(out_scale_ptr)
-
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
-    )
+    if ALL_DECODE:
+        seq_idx = query_token_idx
+    else:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
+        )
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    out_scale = None
+    if out_scale_ptr is not None:
+        out_scale = tl.load(out_scale_ptr)
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
@@ -903,56 +917,107 @@ def reduce_segments(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
     )
 
-    if HEAD_SIZE_PADDED != HEAD_SIZE:
-        offs_d = tl.arange(0, HEAD_SIZE_PADDED)
-        dim_mask = offs_d < HEAD_SIZE
+    if BLOCK_QH_REDUCE > 1 and ALL_DECODE:
+        offs_qh = (
+            qh_block_idx * BLOCK_QH_REDUCE + tl.arange(0, BLOCK_QH_REDUCE)
+        ) % num_query_heads
+
+        # [BLOCK_QH_REDUCE, NUM_SEGMENTS_PER_SEQ]
+        segm_offset = (
+            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + offs_qh[:, None] * NUM_SEGMENTS_PER_SEQ
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[None, :]
+        )
+
+        segm_max = tl.load(
+            segm_max_ptr + segm_offset, mask=segm_mask[None, :], other=float("-inf")
+        )
+        overall_max = tl.max(segm_max, axis=1)  # [BLOCK_QH_REDUCE]
+
+        segm_expsum = tl.load(
+            segm_expsum_ptr + segm_offset, mask=segm_mask[None, :], other=0.0
+        )
+        segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max[:, None])
+        overall_expsum = tl.sum(segm_expsum, axis=1)  # [BLOCK_QH_REDUCE]
+
+        # [BLOCK_QH_REDUCE, NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED]
+        segm_output_offset = (
+            query_token_idx.to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + offs_qh[:, None, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[None, :, None] * HEAD_SIZE_PADDED
+            + tl.arange(0, HEAD_SIZE_PADDED)[None, None, :]
+        )
+        segm_output = tl.load(
+            segm_output_ptr + segm_output_offset,
+            mask=segm_mask[None, :, None],
+            other=0.0,
+        )
+        segm_output *= tl.math.exp2(segm_max - overall_max[:, None])[:, :, None]
+        acc_sum = tl.sum(segm_output, axis=1)  # [BLOCK_QH_REDUCE, HEAD_SIZE_PADDED]
+        acc = tl.where(
+            overall_expsum[:, None] == 0.0, 0.0, acc_sum / overall_expsum[:, None]
+        )
+
+        if out_scale_ptr is not None:
+            out_scale = 1 / out_scale
+            acc = acc * out_scale
+
+        if output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
+        output_offset = (
+            query_token_idx * output_stride_0
+            + offs_qh[:, None] * output_stride_1
+            + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+        )
+        tl.store(
+            output_ptr + output_offset,
+            acc.to(output_ptr.type.element_ty),
+        )
     else:
-        dim_mask = tl.full((1,), 1, dtype=tl.int1)
+        query_head_idx = qh_block_idx
 
-    # load segment maxima
-    segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
-    )
-    segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
-    overall_max = tl.max(segm_max)
+        segm_offset = (
+            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_head_idx * NUM_SEGMENTS_PER_SEQ
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+        )
+        segm_max = tl.load(
+            segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
+        )
+        overall_max = tl.max(segm_max)
 
-    # load and rescale segment exp sums
-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
-    segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
-    overall_expsum = tl.sum(segm_expsum)
+        segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+        segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
+        overall_expsum = tl.sum(segm_expsum)
 
-    # load, rescale, and add segment attention outputs
-    segm_output_offset = (
-        query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
-        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
-    )
-    segm_output = tl.load(
-        segm_output_ptr + segm_output_offset,
-        mask=segm_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
-    segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
-    acc_sum = tl.sum(segm_output, axis=0)
-    # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
-    acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+        segm_output_offset = (
+            query_token_idx.to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
+            + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+        )
+        segm_output = tl.load(
+            segm_output_ptr + segm_output_offset,
+            mask=segm_mask[:, None],
+            other=0.0,
+        )
+        segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
+        acc_sum = tl.sum(segm_output, axis=0)
+        acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
-    if out_scale_ptr is not None:
-        acc = acc * out_scale
+        if out_scale_ptr is not None:
+            out_scale = 1 / out_scale
+            acc = acc * out_scale
 
-    if output_ptr.type.element_ty.is_fp8():
-        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+        if output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
-    # write result
-    output_offset = (
-        query_token_idx * output_stride_0
-        + query_head_idx * output_stride_1
-        + tl.arange(0, HEAD_SIZE_PADDED)
-    )
-    tl.store(
-        output_ptr + output_offset, acc.to(output_ptr.type.element_ty), mask=dim_mask
-    )
+        output_offset = (
+            query_token_idx * output_stride_0
+            + query_head_idx * output_stride_1
+            + tl.arange(0, HEAD_SIZE_PADDED)
+        )
+        tl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))

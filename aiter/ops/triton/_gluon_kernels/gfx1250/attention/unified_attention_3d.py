@@ -2437,3 +2437,320 @@ def _unified_attention_gluon_kernel_3d(
             L,
             segm_idx,
         )
+
+
+_gluon_reduce_segments_repr = make_kernel_repr(
+    "gluon_reduce_segments",
+    [
+        "num_query_heads",
+        "TILE_SIZE",
+        "HEAD_SIZE_PADDED",
+        "NUM_SEGMENTS_PER_SEQ",
+        "BLOCK_QH_REDUCE",
+        "ALL_DECODE",
+        "num_warps",
+    ],
+)
+
+
+@gluon.jit(repr=_gluon_reduce_segments_repr)
+def gluon_reduce_segments(
+    output_ptr,  # [num_tokens, num_query_heads, head_size]
+    segm_output_ptr,
+    # [num_tokens, num_query_heads, max_num_segments, head_size_padded]
+    segm_max_ptr,  # [num_tokens, num_query_heads, max_num_segments]
+    segm_expsum_ptr,  # [num_tokens, num_query_heads, max_num_segments]
+    seq_lens_ptr,  # [num_seqs]
+    num_seqs,  # int
+    num_query_heads: gl.constexpr,  # int
+    out_scale_ptr,  # float32
+    segm_output_stride_0: gl.int64,
+    segm_output_stride_1: gl.int64,
+    segm_output_stride_2: gl.int64,
+    output_stride_0: gl.int64,
+    output_stride_1: gl.int64,
+    block_table_stride: gl.int64,
+    TILE_SIZE: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    HEAD_SIZE_PADDED: gl.constexpr,
+    query_start_len_ptr,  # [num_seqs+1]
+    BLOCK_Q: gl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: gl.constexpr,
+    num_warps: gl.constexpr = 1,
+    waves_per_eu: gl.constexpr = 1,
+    num_stages: gl.constexpr = 1,
+    FP8_MIN: gl.constexpr = float8_info.min,
+    FP8_MAX: gl.constexpr = float8_info.max,
+    ALL_DECODE: gl.constexpr = False,
+    BLOCK_QH_REDUCE: gl.constexpr = 1,
+):
+    _WARP_SIZE: gl.constexpr = 32
+
+    query_token_idx = gl.program_id(0)
+    qh_block_idx = gl.program_id(1)
+
+    if ALL_DECODE:
+        seq_idx = query_token_idx
+    else:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
+        )
+
+    seq_len = gl.load(seq_lens_ptr + seq_idx)
+
+    out_scale = None
+    if out_scale_ptr is not None:
+        out_scale = gl.load(out_scale_ptr)
+
+    num_segments = NUM_SEGMENTS_PER_SEQ
+    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+
+    if BLOCK_QH_REDUCE > 1 and ALL_DECODE:
+        # Multi-head path: load BLOCK_QH_REDUCE heads at once, reduce in parallel
+        SEGM_PER_HEAD: gl.constexpr = gl.constexpr(
+            NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED
+        )
+        TOTAL_SEGS: gl.constexpr = gl.constexpr(BLOCK_QH_REDUCE * NUM_SEGMENTS_PER_SEQ)
+
+        tpw_d: gl.constexpr = gl.constexpr(min(_WARP_SIZE, HEAD_SIZE_PADDED))
+        wpc_d: gl.constexpr = gl.constexpr(
+            min(num_warps, HEAD_SIZE_PADDED // min(_WARP_SIZE, HEAD_SIZE_PADDED))
+        )
+        spt_d: gl.constexpr = gl.constexpr(
+            HEAD_SIZE_PADDED
+            // (
+                min(_WARP_SIZE, HEAD_SIZE_PADDED)
+                * min(num_warps, HEAD_SIZE_PADDED // min(_WARP_SIZE, HEAD_SIZE_PADDED))
+            )
+        )
+        REDUCE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 1, spt_d],
+            threads_per_warp=[1, 1, tpw_d],
+            warps_per_cta=[1, 1, wpc_d],
+            order=[2, 1, 0],
+        )
+        REDUCE_2D_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[BLOCK_QH_REDUCE, spt_d],
+            threads_per_warp=[1, tpw_d],
+            warps_per_cta=[1, wpc_d],
+            order=[1, 0],
+        )
+        SEGM_QH_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[NUM_SEGMENTS_PER_SEQ, BLOCK_QH_REDUCE],
+            threads_per_warp=[1, 32],
+            warps_per_cta=[1, num_warps],
+            order=[1, 0],
+        )
+        SEGM_LAYOUT: gl.constexpr = gl.SliceLayout(1, SEGM_QH_LAYOUT)
+        QH_LAYOUT: gl.constexpr = gl.SliceLayout(0, SEGM_QH_LAYOUT)
+        QH_OUTPUT_LAYOUT: gl.constexpr = gl.SliceLayout(1, REDUCE_2D_LAYOUT)
+        OUTPUT_LAYOUT: gl.constexpr = gl.SliceLayout(0, REDUCE_2D_LAYOUT)
+
+        SEGM_OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1,
+            per_phase=1,
+            max_phase=1,
+            order=[1, 0],
+        )
+
+        SEGM_OUTPUT_SHARED_LAYOUT_3D: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1,
+            per_phase=1,
+            max_phase=1,
+            order=[2, 1, 0],
+        )
+
+        offs_segm = gl.arange(0, NUM_SEGMENTS_PER_SEQ, layout=SEGM_LAYOUT)
+        offs_qh = (
+            qh_block_idx * BLOCK_QH_REDUCE
+            + gl.arange(0, BLOCK_QH_REDUCE, layout=QH_LAYOUT)
+        ) % num_query_heads
+        segm_mask = offs_segm < gl.full(
+            [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=gl.int32, layout=SEGM_LAYOUT
+        )
+
+        total_rows = num_seqs * num_query_heads
+        segm_output_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=segm_output_ptr + query_token_idx * segm_output_stride_0,
+            shape=(NUM_SEGMENTS_PER_SEQ, num_query_heads, HEAD_SIZE_PADDED),
+            strides=(segm_output_stride_2, segm_output_stride_1, gl.constexpr(1)),
+            block_shape=(NUM_SEGMENTS_PER_SEQ, BLOCK_QH_REDUCE, HEAD_SIZE_PADDED),
+            layout=SEGM_OUTPUT_SHARED_LAYOUT_3D,
+        )
+        segm_output_shared = gl.allocate_shared_memory(
+            segm_output_ptr.type.element_ty,
+            [NUM_SEGMENTS_PER_SEQ, BLOCK_QH_REDUCE, HEAD_SIZE_PADDED],
+            layout=SEGM_OUTPUT_SHARED_LAYOUT_3D,
+        )
+
+        first_head_idx = qh_block_idx * BLOCK_QH_REDUCE
+        gl.amd.gfx1250.tdm.async_load(
+            segm_output_desc,
+            [0, first_head_idx, 0],
+            segm_output_shared,
+        )
+
+        # [NUM_SEGMENTS_PER_SEQ, BLOCK_QH_REDUCE]
+        segm_offset_all = (
+            query_token_idx.to(gl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + offs_qh[None, :] * NUM_SEGMENTS_PER_SEQ
+            + offs_segm[:, None]
+        )
+
+        segm_max_2d = gl.load(
+            segm_max_ptr + segm_offset_all, mask=segm_mask[:, None], other=float("-inf")
+        )
+        overall_max = gl.max(segm_max_2d, axis=0)  # [BLOCK_QH_REDUCE]
+
+        segm_expsum_2d = gl.load(
+            segm_expsum_ptr + segm_offset_all, mask=segm_mask[:, None], other=0.0
+        )
+        segm_expsum_2d = segm_expsum_2d * gl.exp2(segm_max_2d - overall_max[None, :])
+        overall_expsum = gl.sum(segm_expsum_2d, axis=0)  # [BLOCK_QH_REDUCE]
+        overall_expsum = gl.convert_layout(
+            overall_expsum.reshape((BLOCK_QH_REDUCE, 1)),
+            layout=gl.SliceLayout(0, REDUCE_LAYOUT),
+        )
+
+        exp_scale = gl.exp2(segm_max_2d - overall_max[None, :])
+        exp_scale_3D = gl.convert_layout(
+            exp_scale.reshape((NUM_SEGMENTS_PER_SEQ, BLOCK_QH_REDUCE, 1)),
+            layout=REDUCE_LAYOUT,
+        )
+        segm_mask_3D = gl.convert_layout(
+            segm_mask.reshape((NUM_SEGMENTS_PER_SEQ, 1, 1)), layout=REDUCE_LAYOUT
+        )
+
+        gl.amd.gfx1250.tdm.async_wait(0)
+
+        segm_output_all = segm_output_shared.load(layout=REDUCE_LAYOUT)
+
+        segm_output_all = gl.where(segm_mask_3D, segm_output_all, 0.0)
+        segm_output_all *= exp_scale_3D
+
+        acc_sum = gl.sum(segm_output_all, axis=0)  # [BLOCK_QH_REDUCE, HEAD_SIZE_PADDED]
+        acc = gl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+        acc = gl.convert_layout(acc, layout=REDUCE_2D_LAYOUT)
+
+        if out_scale_ptr is not None:
+            out_scale = 1 / out_scale
+            acc = acc * out_scale
+
+        if output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
+        # Store results for each head
+        offs_qh_out = (
+            qh_block_idx * BLOCK_QH_REDUCE
+            + gl.arange(0, BLOCK_QH_REDUCE, layout=QH_OUTPUT_LAYOUT)
+        ) % num_query_heads
+        offs_d = gl.arange(0, HEAD_SIZE_PADDED, layout=OUTPUT_LAYOUT)
+        output_offset = (
+            query_token_idx * output_stride_0
+            + offs_qh_out[:, None] * output_stride_1
+            + offs_d[None, :]
+        )
+        gl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))
+    else:
+        # Single-head path
+        tpw_d: gl.constexpr = gl.constexpr(min(_WARP_SIZE, HEAD_SIZE_PADDED))
+        wpc_d: gl.constexpr = gl.constexpr(
+            min(num_warps, HEAD_SIZE_PADDED // min(_WARP_SIZE, HEAD_SIZE_PADDED))
+        )
+        spt_d: gl.constexpr = gl.constexpr(
+            HEAD_SIZE_PADDED
+            // (
+                min(_WARP_SIZE, HEAD_SIZE_PADDED)
+                * min(num_warps, HEAD_SIZE_PADDED // min(_WARP_SIZE, HEAD_SIZE_PADDED))
+            )
+        )
+        REDUCE_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[NUM_SEGMENTS_PER_SEQ, spt_d],
+            threads_per_warp=[1, tpw_d],
+            warps_per_cta=[1, wpc_d],
+            order=[1, 0],
+        )
+        SEGM_LAYOUT: gl.constexpr = gl.SliceLayout(1, REDUCE_LAYOUT)
+        OUTPUT_LAYOUT: gl.constexpr = gl.SliceLayout(0, REDUCE_LAYOUT)
+
+        SEGM_OUTPUT_SHARED_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1,
+            per_phase=1,
+            max_phase=1,
+            order=[1, 0],
+        )
+
+        offs_segm = gl.arange(0, NUM_SEGMENTS_PER_SEQ, layout=SEGM_LAYOUT)
+        segm_mask = offs_segm < gl.full(
+            [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=gl.int32, layout=SEGM_LAYOUT
+        )
+
+        query_head_idx = qh_block_idx
+
+        SEGM_OUTPUT_COLS: gl.constexpr = gl.constexpr(
+            NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED
+        )
+        total_rows = (
+            num_seqs * num_query_heads
+            if ALL_DECODE
+            else gl.load(query_start_len_ptr + num_seqs) * num_query_heads
+        )
+        segm_output_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=segm_output_ptr,
+            shape=(total_rows, SEGM_OUTPUT_COLS),
+            strides=(SEGM_OUTPUT_COLS, gl.constexpr(1)),
+            block_shape=(gl.constexpr(1), SEGM_OUTPUT_COLS),
+            layout=SEGM_OUTPUT_SHARED_LAYOUT,
+        )
+        segm_output_shared = gl.allocate_shared_memory(
+            segm_output_ptr.type.element_ty,
+            [gl.constexpr(1), SEGM_OUTPUT_COLS],
+            layout=SEGM_OUTPUT_SHARED_LAYOUT,
+        )
+
+        row_idx = (query_token_idx * num_query_heads + query_head_idx).to(gl.int32)
+        gl.amd.gfx1250.tdm.async_load(
+            segm_output_desc,
+            [row_idx, 0],
+            segm_output_shared,
+        )
+
+        segm_offset = (
+            query_token_idx.to(gl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_head_idx * NUM_SEGMENTS_PER_SEQ
+            + offs_segm
+        )
+        segm_max = gl.load(
+            segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
+        )
+        overall_max = gl.max(segm_max)
+
+        segm_expsum = gl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+        segm_expsum = segm_expsum * gl.exp2(segm_max - overall_max)
+        overall_expsum = gl.sum(segm_expsum)
+
+        gl.amd.gfx1250.tdm.async_wait(0)
+        segm_output = segm_output_shared.reshape(
+            (NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED)
+        ).load(layout=REDUCE_LAYOUT)
+
+        segm_output = gl.where(segm_mask[:, None], segm_output, 0.0)
+        segm_output *= gl.exp2(segm_max - overall_max)[:, None]
+        acc_sum = gl.sum(segm_output, axis=0)
+        acc = gl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+
+        if out_scale_ptr is not None:
+            out_scale = 1 / out_scale
+            acc = acc * out_scale
+
+        if output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+
+        offs_d = gl.arange(0, HEAD_SIZE_PADDED, layout=OUTPUT_LAYOUT)
+        output_offset = (
+            query_token_idx * output_stride_0
+            + query_head_idx * output_stride_1
+            + offs_d
+        )
+        gl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))
