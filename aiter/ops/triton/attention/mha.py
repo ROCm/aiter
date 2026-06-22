@@ -51,6 +51,22 @@ def _get_sliding_window_size(window_size: Tuple[int, int]) -> int:
     return int(window_size[0]) if int(window_size[0]) >= 0 else 0
 
 
+def _split_head_dim(head_dim: int) -> Tuple[int, int]:
+    """Pick (BLOCK_DMODEL_MAIN, BLOCK_DMODEL_TAIL) covering ``head_dim``.
+
+    Power-of-2 head_dim -> (head_dim, 0) (single-block, unchanged kernel).
+    Otherwise: largest power-of-2 main block strictly below head_dim plus a
+    power-of-2 tail block, so D is covered at ~ceil(head_dim/16)*16 instead of
+    next_pow2(head_dim) (e.g. 72 -> 64 + 16 = 80 vs 128).
+    """
+    npo2 = triton.next_power_of_2(head_dim)
+    if npo2 == head_dim:
+        return npo2, 0
+    main = npo2 // 2
+    tail = max(16, triton.next_power_of_2(head_dim - main))
+    return main, tail
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -252,6 +268,21 @@ def _flash_attn_forward(
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
 
+        # Split-D: cover a non-power-of-2 head_dim as a power-of-2 main block
+        # plus a power-of-2 tail block (e.g. 72 -> 64 + 16 = 80) instead of
+        # padding to next_pow2 (128), cutting wasted WMMA K/N passes. Limited to
+        # the simple path (no positional encoding, not FP8, qk dim == v dim);
+        # everything else uses the original padded single block (tail == 0).
+        if (
+            pe_head_dim == 0
+            and not IS_FP8
+            and qk_head_dim == v_head_dim
+            and triton.next_power_of_2(v_head_dim) != v_head_dim
+        ):
+            block_dmodel_main, block_dmodel_tail = _split_head_dim(v_head_dim)
+        else:
+            block_dmodel_main, block_dmodel_tail = BLOCK_DMODEL_POW2, 0
+
         _attn_fwd[grid](
             q,
             k,
@@ -293,8 +324,9 @@ def _flash_attn_forward(
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
             BLOCK_DMODEL=v_head_dim,
-            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_POW2=block_dmodel_main,
             BLOCK_DMODEL_PE=pe_head_dim,
+            BLOCK_DMODEL_TAIL=block_dmodel_tail,
             RETURN_SCORES=return_softmax,
             ENABLE_DROPOUT=enable_dropout,
             IS_FP8=IS_FP8,
