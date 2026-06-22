@@ -365,13 +365,11 @@ def test_fmoe(
         w2_qt_aiter = shuffle_weight_a16w4(_w2q, 16, False)
         w1_scale_aiter = shuffle_scale_a16w4(_w1s, E, True)
         w2_scale_aiter = shuffle_scale_a16w4(_w2s, E, False)
-        # shuffle_kind="mxfp4_moe" alone selects the FlyDSL a4w4 PORT: it routes to
-        # _mxfp4_moe_run, implies the flydsl gemm backend (no explicit gemm{1,2}_backend
-        # needed), and looks up the tuned CSV rows tagged "mxfp4_moe" -- so the tuned
-        # port kernels (BM64/cshuffle) are actually exercised rather than the M-adaptive
-        # synthesis fallback. (randomflow's HIP backend uses "mxfp4_guinterleave".)
-        w1_qt_aiter.shuffle_kind = "mxfp4_moe"
-        w2_qt_aiter.shuffle_kind = "mxfp4_moe"
+        # gemm{1,2}_backend="flydsl" routes both a4w4 MoE GEMMs through the FlyDSL
+        # engines: fused_moe finds the tuned HIP mxfp4 row for this shape and then
+        # re-routes it to _mxfp4_moe_run, running gemm1/gemm2 on FlyDSL.
+        w1_qt_aiter.gemm1_backend = "flydsl"
+        w2_qt_aiter.gemm2_backend = "flydsl"
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -718,7 +716,11 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
-    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
+    # mxfp4 weights (a4w4/a8w4/a16w4) all run the gate/up-interleaved (guinterleave)
+    # layout that the tuned kimik2_5 rows are keyed on, matching serving's
+    # ATOM_MOE_GU_ITLV=1. Include fp4x2 activations (true a4w4) so op_tests reach
+    # the HIP a4w4 backend instead of falling through to the separated default.
+    if aq_dtype in [dtypes.fp8, dtypes.bf16, dtypes.fp4x2] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
 
