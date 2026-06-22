@@ -556,9 +556,7 @@ def compile_moe_gemm1(
 
                 if const_expr(is_f16_or_bf16 and not w_is_int4):
                     _w_base_addr = fx.ptrtoint(arg_w)
-                    _w_expert_byte = (
-                        expert_off_idx * k_in * arith.index(int(w_elem_bytes))
-                    )
+                    _w_expert_byte = expert_off_idx * k_in * w_elem_bytes
                     w_rsrc = buffer_ops.create_buffer_resource_from_addr(
                         _w_base_addr + arith.index_cast(T.i64, _w_expert_byte)
                     )
@@ -2448,9 +2446,7 @@ def compile_moe_gemm2(
 
                 if const_expr(is_f16_or_bf16 and not w_is_int4):
                     _w_base_addr = fx.ptrtoint(arg_w)
-                    _w_expert_byte = (
-                        expert_off_idx * k_in * arith.index(int(w_elem_bytes))
-                    )
+                    _w_expert_byte = expert_off_idx * k_in * w_elem_bytes
                     w_rsrc = buffer_ops.create_buffer_resource_from_addr(
                         _w_base_addr + arith.index_cast(T.i64, _w_expert_byte)
                     )
