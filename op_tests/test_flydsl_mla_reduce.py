@@ -8,7 +8,7 @@ import argparse
 import torch
 
 from aiter.ops.flydsl.kernels.mla_reduce import compile_mla_reduce, select_tier
-from aiter.ops.flydsl.moe_kernels import _run_compiled
+from aiter.test_common import run_perftest
 
 
 def build_inputs(num_tiles, num_splits, H, Dv, out_dtype, device="cuda", seed=0):
@@ -69,15 +69,16 @@ def make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, ou
         H=H, Dv=Dv, out_dtype=out_dtype_str, tier=tier,
         persistent=False, output_lse=output_lse, use_reduce_final_map=True,
     )
-    args = (
+    head = (
         po, pl, indptr, pmap, fmap, fout, flse,
         int(fout.stride(0)), int(fout.stride(1)),
         int(max_splits), int(num_tiles),
-        torch.cuda.current_stream(),
     )
 
     def run():
-        kernel(*args)
+        # Read the stream at call time so CUDA-graph capture (side stream) sees
+        # the launch — binding it once would pin the kernel to the capture stream.
+        kernel(*head, torch.cuda.current_stream())
 
     return run
 
@@ -86,18 +87,30 @@ def run_flydsl(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, out
     make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, output_lse)()
 
 
-def bench(fn, warmup=25, iters=100):
-    for _ in range(warmup):
+def bench_cudagraph(fn, num_warmup=25, num_iters=100):
+    """CUDA-graph + cuda.Event cross-check: capture num_iters launches into one
+    graph and time a single replay, so per-call Python launch overhead is removed.
+    Returns ms/iter. Modeled on _opus_run_perftest in opus_gemm_tune.py."""
+    for _ in range(max(1, num_warmup)):
         fn()
     torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side):
+        fn()
+        side.synchronize()
+        with torch.cuda.graph(graph, stream=side):
+            for _ in range(num_iters):
+                fn()
+    torch.cuda.current_stream().wait_stream(side)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(iters):
-        fn()
+    graph.replay()
     end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters  # ms
+    end.synchronize()
+    return start.elapsed_time(end) / num_iters  # ms/iter
 
 
 def check_one(H, Dv, T_, S, dtype_str, output_lse, atol=3e-2, ltol=1e-3):
@@ -179,17 +192,21 @@ def main():
         print(f"[check] lse max_abs_err={ld.max().item():.3e}")
 
     if args.bench:
-        ms = bench(run)
+        # Primary: device-only time from aiter's profiler-based run_perftest
+        # (excludes the ~230us per-call Python host overhead). Returns us/iter.
+        _, kernel_us = run_perftest(run, num_warmup=25, num_iters=100)
+        # Cross-check: CUDA-graph replay (per-iter launch overhead amortized).
+        graph_us = bench_cudagraph(run) * 1e3
         bytes_partial_o = T_ * S * H * Dv * 4
         bytes_partial_lse = T_ * S * H * 4
         bytes_final_o = T_ * H * Dv * out_dtype.itemsize
         bytes_final_lse = T_ * H * 4
         total = bytes_partial_o + bytes_partial_lse + bytes_final_o + bytes_final_lse
-        gbps = total / (ms * 1e-3) / 1e9
+        gbps = total / (kernel_us * 1e-6) / 1e9
         path = "massive" if S >= 4 else "simple"
         print(
             f"[bench] H={H} Dv={Dv} tiles={T_} splits={S} path={path} "
-            f"latency={ms*1e3:.1f}us BW={gbps:.0f}GB/s "
+            f"kernel={kernel_us:.1f}us graph={graph_us:.1f}us BW={gbps:.0f}GB/s "
             f"({gbps/5300*100:.0f}% of 5.3TB/s)"
         )
 

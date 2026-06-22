@@ -104,22 +104,23 @@ tiles/splits — compare against measured `FETCH_SIZE`/`WRITE_SIZE` for the 0.99
 
 ## 2. Benchmark results
 
-Shape: **H=128, Dv=512, bf16 output** (GLM/DeepSeek decode shape). 25 warmup / 100 timed iters,
-HIP events.
+Shape: **H=128, Dv=512, bf16 output** (GLM/DeepSeek decode shape). 25 warmup / 100 timed iters.
+Latency is **kernel-only device time** from aiter's `run_perftest` (`self_device_time_total`);
+the `CUDA graph` column is a CUDA-graph `cuda.Event` replay cross-check. Both exclude host overhead.
 
 ### Split-count sweep (tiles=256)
 
-| splits | path | latency | achieved BW | % of 5.3 TB/s |
-|---|---|---|---|---|
-| 2 | simple | 45 µs | 3.73 TB/s | 70% |
-| 3 | simple | 61 µs | 3.87 TB/s | 73% |
-| 4 | massive | 78 µs | 3.90 TB/s | 74% |
-| 8 | massive | 165 µs | 3.45 TB/s | 65% |
-| 16 | massive | 342 µs | 3.24 TB/s | 61% |
-| 32 | massive | 656 µs | 3.33 TB/s | 63% |
-| 64 | massive | 1267 µs | 3.42 TB/s | 65% |
-| 128 | massive | 2460 µs | 3.51 TB/s | 66% |
-| 256 | massive (tiles=64) | 1190 µs | 3.62 TB/s | 68% |
+| splits | path | kernel | CUDA graph | achieved BW | % of 5.3 TB/s |
+|---|---|---|---|---|---|
+| 2 | simple | 49.7 µs | 40.1 µs | 3.38 TB/s | 64% |
+| 3 | simple | 66.1 µs | 53.8 µs | 3.56 TB/s | 67% |
+| 4 | massive | 78.5 µs | 77.6 µs | 3.86 TB/s | 73% |
+| 8 | massive | 176.7 µs | 168.7 µs | 3.24 TB/s | 61% |
+| 16 | massive | 357.6 µs | 353.6 µs | 3.10 TB/s | 59% |
+| 32 | massive | 661.2 µs | 666.9 µs | 3.31 TB/s | 62% |
+| 64 | massive | 1255.7 µs | 1235.4 µs | 3.45 TB/s | 65% |
+| 128 | massive | 2501.0 µs | 2498.5 µs | 3.46 TB/s | 65% |
+| 256 | massive (tiles=64) | 1167.9 µs | 1169.8 µs | 3.69 TB/s | 70% |
 
 The simple↔massive switch at splits=4 (`kMassiveThreshold`) is visible. BW dips in the
 mid-split range (8–16) then recovers as the 2-way software pipeline amortizes better at high
@@ -127,19 +128,21 @@ split counts.
 
 ### Batch (tile) sweep (splits=8)
 
-| tiles | work items | latency | achieved BW |
-|---|---|---|---|
-| 1 | 128 | 8.9 µs | 250 GB/s |
-| 4 | 512 | 13.6 µs | 657 GB/s |
-| 16 | 2048 | 13.8 µs | 2.58 TB/s |
-| 64 | 8192 | 40.7 µs | 3.51 TB/s |
-| 128 | 16384 | 66.2 µs | **4.32 TB/s (81%)** |
-| 256 | 32768 | 165 µs | 3.46 TB/s |
-| 512 | 65536 | 329 µs | 3.47 TB/s |
-| 1024 | 131072 | 681 µs | 3.36 TB/s |
+| tiles | work items | kernel | graph | achieved BW |
+|---|---|---|---|---|
+| 1 | 128 | 4.7 µs | 3.8 µs | 474 GB/s |
+| 4 | 512 | 4.5 µs | 3.9 µs | 1.98 TB/s |
+| 16 | 2048 | 8.2 µs | 6.9 µs | **4.39 TB/s (83%)** |
+| 64 | 8192 | 45.7 µs | 33.5 µs | 3.13 TB/s |
+| 128 | 16384 | 74.1 µs | 64.7 µs | 3.86 TB/s |
+| 256 | 32768 | 175.8 µs | 169.0 µs | 3.25 TB/s |
+| 512 | 65536 | 337.2 µs | 339.5 µs | 3.39 TB/s |
+| 1024 | 131072 | 683.2 µs | 682.4 µs | 3.35 TB/s |
 
 Small batches are **latency-bound** (tiles=1 → 128 work items vs 4864 WG slots, only 5% machine
-fill). Saturates by tiles≈64. Peak observed **4.32 TB/s (81%)** at tiles=128.
+fill). With host overhead removed, the kernel reaches peak by tiles≈16 — **4.39 TB/s (83%)**,
+a small-footprint cache effect — then settles to the streaming **3.2–3.9 TB/s** band as the
+working set exceeds cache.
 
 ---
 
@@ -211,15 +214,15 @@ The kernel behaves exactly as the dissection's TL;DR claims:
 - **HBM-bandwidth-bound at the byte floor** (read/write ratios 0.99/1.01 vs model).
 - **No MFMA, no LDS bank conflicts**, occupancy-8 sustained.
 - Online-softmax scalar work is hidden behind loads (VALUBusy 8%, VALUUtil 92%).
-- Real-world BW utilization: **65→81% of peak** depending on batch (best ≈4.32 TB/s at tiles=128).
-  The gap to peak is streaming-read latency the 2-way software pipeline only partly hides at high
-  split counts.
+- Real-world BW utilization: **~60→83% of peak** depending on batch (best ≈4.39 TB/s at
+  tiles=16, a small-footprint cache effect). The gap to peak in the streaming regime is
+  read latency the 2-way software pipeline only partly hides at high split counts.
 
 ### Implications for the FlyDSL port
 
 - The byte floor is already hit → **expect HBM parity, not speedup**. Confirm with rocprofv3
   before tuning.
-- The only lever with headroom is the 65%→81% BW utilization band. The most promising knob is
+- The only lever with headroom is the ~60%→83% BW utilization band. The most promising knob is
   **deeper prefetch (`prefetch_depth > 2`)** at high split counts, where the current 2-way pipeline
   under-hides latency.
 - Levers that do **not** apply: chiplet/XCD remap, L2-reuse swizzle (no reuse), MFMA atom tuning

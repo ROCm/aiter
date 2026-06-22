@@ -9,9 +9,9 @@ Each work item online-softmax-combines `num_splits` partials of one head into on
 """
 
 import argparse
-import math
 import torch
 import aiter
+from aiter.test_common import run_perftest
 
 
 def build_inputs(num_tiles, num_splits, H, Dv, out_dtype, device="cuda", seed=0):
@@ -70,18 +70,30 @@ def torch_ref(partial_output, partial_lse, num_tiles, num_splits, H, Dv, out_dty
     return out, lse
 
 
-def bench(fn, warmup=25, iters=100):
-    for _ in range(warmup):
+def bench_cudagraph(fn, num_warmup=25, num_iters=100):
+    """CUDA-graph + cuda.Event cross-check: capture num_iters launches into one
+    graph and time a single replay, so per-call Python launch overhead is removed.
+    Returns ms/iter. Modeled on _opus_run_perftest in opus_gemm_tune.py."""
+    for _ in range(max(1, num_warmup)):
         fn()
     torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side):
+        fn()
+        side.synchronize()
+        with torch.cuda.graph(graph, stream=side):
+            for _ in range(num_iters):
+                fn()
+    torch.cuda.current_stream().wait_stream(side)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(iters):
-        fn()
+    graph.replay()
     end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters  # ms
+    end.synchronize()
+    return start.elapsed_time(end) / num_iters  # ms/iter
 
 
 def main():
@@ -114,7 +126,11 @@ def main():
             f"lse max_abs_err={ld.max().item():.3e}"
         )
 
-    ms = bench(run)
+    # Primary: device-only time from aiter's profiler-based run_perftest
+    # (excludes per-call Python host overhead). Returns us/iter.
+    _, kernel_us = run_perftest(run, num_warmup=25, num_iters=100)
+    # Cross-check: CUDA-graph replay (per-iter launch overhead amortized).
+    graph_us = bench_cudagraph(run) * 1e3
 
     # traffic model (the byte floor for this reduction)
     bytes_partial_o = T * S * H * Dv * 4
@@ -123,7 +139,7 @@ def main():
     bytes_final_lse = T * H * 4
     # gather map staged to LDS once per tile per (loaded by kernel from gmem)
     total_bytes = bytes_partial_o + bytes_partial_lse + bytes_final_o + bytes_final_lse
-    gbps = total_bytes / (ms * 1e-3) / 1e9
+    gbps = total_bytes / (kernel_us * 1e-6) / 1e9
 
     path = "massive" if S >= 4 else "simple"
     print(
@@ -131,7 +147,8 @@ def main():
         f"work_items={H*T}"
     )
     print(
-        f"  latency = {ms*1e3:.2f} us | traffic = {total_bytes/1e6:.1f} MB "
+        f"  kernel = {kernel_us:.2f} us (graph {graph_us:.2f} us) | "
+        f"traffic = {total_bytes/1e6:.1f} MB "
         f"({bytes_partial_o/1e6:.0f} MB partial_O read) | "
         f"achieved BW = {gbps:.0f} GB/s"
     )

@@ -10,10 +10,10 @@ container. Sources:
 - Design: `MLA-reduce-HIP-kernel-dissection.md`, `MLA-reduce-flydsl-moe-reduction-dissection.md`
 
 **Bottom line:** the FlyDSL port reaches the same HBM-bandwidth band as HIP
-(**~3.5–3.7 TB/s, 65–70% of peak**) with bit-comparable accuracy. Both are at the reduction
-byte floor — parity was the goal, and it is met. Differences in the tables below at *low work*
-are a harness artifact (FlyDSL's standalone Python driver has a ~230 µs per-call host floor;
-the HIP harness uses the C++-bound op and does not), **not** a kernel-speed difference.
+(**~3.5–3.8 TB/s, 65–72% of peak**) with bit-comparable accuracy. Both are at the reduction
+byte floor — parity was the goal, and it is met. Both sides are now measured with **kernel-only
+device time** (aiter's `run_perftest` + a CUDA-graph cross-check), so the tables compare kernels
+directly with no host-overhead artifact; the old ~230 µs FlyDSL-harness floor is gone.
 
 ---
 
@@ -25,7 +25,7 @@ the HIP harness uses the C++-bound op and does not), **not** a kernel-speed diff
 | Container | `rocm/ali-private:...rocm7.2.0...torch2.9.1...` |
 | ROCm / Python / PyTorch | 7.2.0 / 3.10.12 / 2.9.1+rocm7.2.0 |
 | flydsl | 0.2.0 |
-| Timing | 25 warmup / 100 iters, CUDA/HIP events; same traffic model |
+| Timing | 25 warmup / 100 iters, **kernel-only device time** (`run_perftest` `self_device_time_total` + CUDA-graph `cuda.Event` cross-check); same traffic model |
 
 ---
 
@@ -50,52 +50,46 @@ tiles where bf16 degeneracy inflates the figure — an input property, not a ker
 
 HIP at tiles=256; FlyDSL at tiles=256 (splits=256 row at tiles=64 for both).
 
-| splits | path | HIP latency | HIP BW | FlyDSL latency | FlyDSL BW | notes |
+| splits | path | HIP kernel | HIP BW | FlyDSL kernel | FlyDSL BW | notes |
 |---|---|---|---|---|---|---|
-| 2 | simple | 45 µs | 3.73 TB/s | 235 µs | 0.72 TB/s | FlyDSL host-floor bound |
-| 3 | simple | 61 µs | 3.87 TB/s | 440 µs | 0.54 TB/s | host-floor bound |
-| 4 | massive | 78 µs | 3.90 TB/s | 445 µs | 0.68 TB/s | host-floor bound |
-| 8 | massive | 165 µs | 3.45 TB/s | 282 µs | 2.03 TB/s | partly floor-bound |
-| 16 | massive | 342 µs | 3.24 TB/s | 453 µs | 2.45 TB/s | |
-| 32 | massive | 656 µs | 3.33 TB/s | 634 µs | **3.45 TB/s** | kernel-dominated |
-| 64 | massive | 1267 µs | 3.42 TB/s | 1247 µs | **3.48 TB/s** | kernel-dominated |
-| 128 | massive | 2460 µs | 3.51 TB/s | 2448 µs | **3.53 TB/s** | kernel-dominated |
-| 256 | massive (t=64) | 1190 µs | 3.62 TB/s | 1203 µs | **3.59 TB/s** | kernel-dominated |
+| 2 | simple | 49.7 µs | 3.38 TB/s | 36.5 µs | **4.61 TB/s** | FlyDSL faster on simple path |
+| 3 | simple | 66.1 µs | 3.56 TB/s | 48.6 µs | **4.84 TB/s** | FlyDSL faster |
+| 4 | massive | 78.5 µs | 3.86 TB/s | 83.2 µs | 3.64 TB/s | ~parity |
+| 8 | massive | 176.7 µs | 3.24 TB/s | 153.3 µs | 3.73 TB/s | ~parity |
+| 16 | massive | 357.6 µs | 3.10 TB/s | 328.3 µs | 3.38 TB/s | ~parity |
+| 32 | massive | 661.2 µs | 3.31 TB/s | 642.8 µs | 3.40 TB/s | ~parity |
+| 64 | massive | 1255.7 µs | 3.45 TB/s | 1270.1 µs | 3.42 TB/s | ~parity |
+| 128 | massive | 2501.0 µs | 3.46 TB/s | 2458.7 µs | 3.51 TB/s | ~parity |
+| 256 | massive (t=64) | 1167.9 µs | 3.69 TB/s | 1200.3 µs | 3.59 TB/s | ~parity |
 
-**Where both are kernel-dominated (splits ≥ 32), they are within ~1–3% of each other** — the
-FlyDSL port matches HIP byte-for-byte at the floor. Below splits≈16 the FlyDSL standalone
-harness's host floor dominates, so its achieved-BW understates the kernel; the HIP harness
-(C++-bound op, no per-call Python) keeps showing the kernel's true high-BW at low splits.
-**This gap is the harness, not the kernel.**
+With both sides on kernel-only device time, **they track within a few percent across the whole
+sweep** — the FlyDSL port matches HIP byte-for-byte on the massive path. On the **simple path
+(splits 2–3) FlyDSL is actually faster** (4.6–4.8 vs 3.4–3.6 TB/s). The old large low-split gap
+was purely the FlyDSL standalone harness's host floor and has now disappeared.
 
 ---
 
 ## 4. Bandwidth — batch sweep (H=128, Dv=512, bf16, splits=8)
 
-| tiles | HIP latency | HIP BW | FlyDSL latency | FlyDSL BW | regime |
+| tiles | HIP kernel | HIP BW | FlyDSL kernel | FlyDSL BW | regime |
 |---|---|---|---|---|---|
-| 1 | 8.9 µs | 250 GB/s | 258 µs | 9 GB/s | FlyDSL host-floor |
-| 4 | 13.6 µs | 657 GB/s | 241 µs | 37 GB/s | FlyDSL host-floor |
-| 16 | 13.8 µs | 2.58 TB/s | 449 µs | 80 GB/s | FlyDSL host-floor |
-| 64 | 40.7 µs | 3.51 TB/s | 240 µs | 595 GB/s | FlyDSL host-floor |
-| 128 | 66.2 µs | **4.32 TB/s** | 234 µs | 1.22 TB/s | FlyDSL host-floor |
-| 256 | 165 µs | 3.46 TB/s | 260 µs | 2.20 TB/s | mixed |
-| 512 | 329 µs | 3.47 TB/s | 319 µs | **3.58 TB/s** | both kernel-dominated |
-| 1024 | 681 µs | 3.36 TB/s | 619 µs | **3.70 TB/s** | both kernel-dominated |
-| 2048 | — | — | 1246 µs | 3.67 TB/s | kernel-dominated |
-| 4096 | — | — | 2499 µs | 3.66 TB/s | kernel-dominated |
+| 1 | 4.7 µs | 474 GB/s | 4.7 µs | 480 GB/s | latency-bound |
+| 4 | 4.5 µs | 1.98 TB/s | 4.8 µs | 1.87 TB/s | latency-bound |
+| 16 | 8.2 µs | **4.39 TB/s** | 6.8 µs | **5.25 TB/s** | near peak (cache) |
+| 64 | 45.7 µs | 3.13 TB/s | 33.1 µs | 4.32 TB/s | saturating |
+| 128 | 74.1 µs | 3.86 TB/s | 59.3 µs | 4.82 TB/s | saturating |
+| 256 | 175.8 µs | 3.25 TB/s | 150.0 µs | 3.81 TB/s | kernel-dominated |
+| 512 | 337.2 µs | 3.39 TB/s | 316.2 µs | 3.62 TB/s | kernel-dominated |
+| 1024 | 683.2 µs | 3.35 TB/s | 608.3 µs | **3.76 TB/s** | kernel-dominated |
+| 2048 | — | — | 1211.7 µs | 3.77 TB/s | kernel-dominated |
+| 4096 | — | — | 2472.2 µs | 3.70 TB/s | kernel-dominated |
 
-At the points where **both** harnesses are kernel-dominated (tiles ≥ 512), FlyDSL is **equal to
-or slightly faster than HIP** (3.58–3.70 vs 3.36–3.47 TB/s). The dramatic low-tile gap is
-entirely the FlyDSL standalone harness's ~230 µs host-call floor: HIP saturates by tiles≈64
-because its C++-bound launch is ~free, whereas the FlyDSL Python driver can't expose the kernel
-until the work exceeds the floor. **The kernels themselves are at parity.**
-
-> HIP's headline 4.32 TB/s at tiles=128 is a genuine peak the FlyDSL *standalone harness*
-> cannot show (that work size is below its host floor). Confirming the FlyDSL kernel hits the
-> same peak would require either a C++-bound launch path or CUDA-graph capture to remove the
-> per-call Python overhead — a harness change, not a kernel change. Deferred (the prototype
-> bar is parity at the byte floor, already demonstrated at saturating batch).
+With both sides on kernel-only device time, the two **track closely at every tile count**, and
+FlyDSL is **equal to or slightly faster than HIP** across the saturating/kernel-dominated range
+(e.g. 3.62–3.77 vs 3.35–3.39 TB/s at tiles 512–1024). Both are latency-bound only at tiles 1–4,
+and both touch peak near tiles≈16 (a small-footprint cache effect). The dramatic low-tile gap
+seen in earlier reports was entirely the FlyDSL standalone harness's ~230 µs host-call floor;
+with device timing it is gone. **The kernels are at parity (FlyDSL marginally ahead).**
 
 ---
 
@@ -128,9 +122,9 @@ fidelity).
 | question | answer |
 |---|---|
 | Correct vs HIP? | **Yes** — LSE exact (9.5e-7), output at bf16/fp16 rounding, same 3 shapes. |
-| HBM parity? | **Yes** — 3.5–3.7 TB/s where kernel-dominated, within 1–3% of HIP and within HIP's own 3.24–3.51 TB/s band. |
-| Faster? | No, and not expected — both at the reduction byte floor (~99% of time is HBM traffic per the HIP rocprofv3 profile). Parity was the bar. |
-| Caveats | FlyDSL standalone harness has a ~230 µs host floor that understates low-work BW; HIP's 4.32 TB/s tiles=128 peak needs a lower-overhead FlyDSL launch path to reproduce. Persistent launcher deferred. |
+| HBM parity? | **Yes** — 3.6–3.8 TB/s where kernel-dominated, equal-to-slightly-ahead of HIP and within HIP's own band; FlyDSL faster on the simple path (low splits). |
+| Faster? | At parity (FlyDSL marginally ahead) — both at the reduction byte floor (~99% of time is HBM traffic per the HIP rocprofv3 profile). Parity was the bar. |
+| Caveats | None on timing — both sides now use kernel-only device time, so the old ~230 µs host-floor artifact is gone and low-work BW is meaningful. Persistent launcher deferred (parity-neutral at the byte floor). |
 
 **The FlyDSL prototype achieves its goal: a native, correct, HBM-parity replacement for the
 HIP MLA decode-reduce on gfx942.**

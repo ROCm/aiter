@@ -115,11 +115,16 @@ The first invocation of a given `(shape, tier)` JIT-compiles the kernel (a few
 seconds); benchmark numbers come from the steady-state timed loop (25 warmup /
 100 iters, CUDA events).
 
-### Saturating batch (HBM parity — the headline number)
+### Kernel-only timing
 
-Small batches are **launch-overhead / latency bound** and will report low BW
-(the kernel time is dwarfed by per-call host work). To measure achieved HBM
-bandwidth, use a large tile count so kernel time dominates:
+`--bench` reports **kernel-only GPU device time**, not wall clock. The headline
+`kernel=` number is aiter's profiler-based `run_perftest`
+(`aiter/test_common.py` → `self_device_time_total`, IQR-filtered); the `graph=`
+number is an independent CUDA-graph `cuda.Event` replay. Both exclude the per-call
+Python host overhead (the standalone driver's ~230 µs DLPack/launcher cost), so
+BW is meaningful at every work size — there is no host-floor caveat to work around.
+
+### Saturating batch (HBM parity — the headline number)
 
 ```bash
 docker exec -e PYTHONPATH=/aiter -e AITER_JIT_DIR=/tmp/aiter_jit -e AITER_USE_SYSTEM_TRITON=1 \
@@ -130,23 +135,23 @@ docker exec -e PYTHONPATH=/aiter -e AITER_JIT_DIR=/tmp/aiter_jit -e AITER_USE_SY
 
 Reference result (this machine):
 
-| shape | splits | tiles | path | latency | achieved BW |
-|---|---|---|---|---|---|
-| H=128,Dv=512 | 16 | 2048 | massive | ~2517 µs | **3527 GB/s (67%)** |
-| H=128,Dv=512 | 8 | 4096 | massive | ~2492 µs | **3670 GB/s (69%)** |
+| shape | splits | tiles | path | kernel | graph | achieved BW |
+|---|---|---|---|---|---|---|
+| H=128,Dv=512 | 16 | 2048 | massive | ~2414 µs | ~2438 µs | **3677 GB/s (69%)** |
+| H=128,Dv=512 | 8 | 4096 | massive | ~2448 µs | ~2496 µs | **3736 GB/s (70%)** |
 
 This matches/slightly exceeds the HIP baseline in the same container at the
-comparable point (HIP T2048/S16 ≈ 3334 GB/s). The HIP report's split-sweep band
-is 3.24–3.51 TB/s (61–74%); FlyDSL lands in/above that band → **HBM parity
+comparable point (HIP T2048/S16 ≈ 3422 GB/s, device time). The HIP report's
+split-sweep band is 3.10–3.86 TB/s; FlyDSL lands in/above that band → **HBM parity
 confirmed**.
 
-### Why small configs report low BW
+### Low-work configs now read the true kernel BW
 
-The traffic model and BW math live in the test (`--bench`). At small tiles the
-denominator (kernel time) is tiny while fixed per-call Python launch overhead
-dominates, so reported BW is misleadingly low — this is a measurement artifact of
-the standalone harness, not the kernel. Always benchmark at saturating batch
-(tiles ≳ 2048) for the BW figure.
+With device-time measurement, small batches are only **latency-bound at very low
+tile counts** (1–4 tiles = 128–512 work items, far below the machine's WG slots).
+From tiles≈16 up the kernel already shows high BW. The simple path (splits 2–3)
+reaches 87–91%. There is no longer a flat ~230 µs harness floor to discount, so
+every row reports the kernel, not the driver.
 
 ---
 
