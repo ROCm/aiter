@@ -236,9 +236,10 @@ def _e8m0_from_amax(amax_f32):
     qscale_bits = amax_i + _raw(fx.Int32(0x200000))
     qscale = fx.Float32(qscale_bits.bitcast(T.f32)) * fx.Float32(0.25)
     sb_raw = fx.Int32(_raw(qscale).bitcast(T.i32)).shrui(fx.Int32(23))  # logical >>23
-    # unsigned min(sb_raw, 254): sb_raw is a small non-negative exponent.
-    is_lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(sb_raw), _raw(fx.Int32(254)))
-    e8m0 = fx.Int32(arith.select(is_lt, _raw(sb_raw), _raw(fx.Int32(254))))
+    # unsigned min(sb_raw, 254): sb_raw is a small non-negative exponent. The
+    # Uint32 wrap makes the python `<` lower to cmpi(ult) (Int32's `<` is slt).
+    is_lt = fx.Uint32(_raw(sb_raw)) < fx.Uint32(254)
+    e8m0 = fx.Int32(is_lt.select(sb_raw, fx.Int32(254)))
     return e8m0, qscale
 
 
@@ -272,8 +273,9 @@ def _inline_dpp_quad_amax(a32):
 
 def _umax_i32(a, b):
     """unsigned max of two i32 (used for u16-amax reduction)."""
-    is_gt = arith.cmpi(arith.CmpIPredicate.ugt, _raw(a), _raw(b))
-    return fx.Int32(arith.select(is_gt, _raw(a), _raw(b)))
+    # Uint32 wrap makes the python `>` lower to cmpi(ugt) (Int32's `>` is sgt).
+    is_gt = fx.Uint32(_raw(a)) > fx.Uint32(_raw(b))
+    return fx.Int32(is_gt.select(a, b))
 
 
 def _inline_e8m0(amax_u16_i32):
@@ -289,11 +291,12 @@ def _inline_e8m0(amax_u16_i32):
     bexp = (f32bits + fx.Int32(0x200000)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
     # max(0, bexp - 2)
     bm2 = bexp - fx.Int32(2)
-    ge0 = arith.cmpi(arith.CmpIPredicate.sgt, _raw(bm2), _raw(fx.Int32(0)))
-    bm2 = fx.Int32(arith.select(ge0, _raw(bm2), _raw(fx.Int32(0))))
+    # bm2 is signed Int32, so python `>`/`<` lower to cmpi(sgt)/cmpi(slt).
+    ge0 = bm2 > fx.Int32(0)
+    bm2 = fx.Int32(ge0.select(bm2, fx.Int32(0)))
     # min(254, .)
-    lt = arith.cmpi(arith.CmpIPredicate.slt, _raw(bm2), _raw(fx.Int32(254)))
-    return fx.Int32(arith.select(lt, _raw(bm2), _raw(fx.Int32(254))))
+    lt = bm2 < fx.Int32(254)
+    return fx.Int32(lt.select(bm2, fx.Int32(254)))
 
 
 def gemm1_grid(n_tokens, BM=32, NE=NE, TOPK=TOPK, INTER=INTER):
@@ -642,12 +645,16 @@ def _gemm1_body(
         # stage 2: DPP quad-reduce, INTERLEAVED across rows (hide DPP latency)
         a = [fx.Int32(_raw(la[i])) for i in range_constexpr(n)]
         s1 = [
-            fx.Int32(dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0xB1, 0xF, 0xF, True))
+            fx.Int32(
+                dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0xB1, 0xF, 0xF, True)
+            )
             for i in range_constexpr(n)
         ]
         a = [_umax_i32(a[i], s1[i]) for i in range_constexpr(n)]
         s2 = [
-            fx.Int32(dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0x4E, 0xF, 0xF, True))
+            fx.Int32(
+                dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0x4E, 0xF, 0xF, True)
+            )
             for i in range_constexpr(n)
         ]
         a = [_umax_i32(a[i], s2[i]) for i in range_constexpr(n)]
@@ -656,9 +663,7 @@ def _gemm1_body(
         # stage 4: cvt pack + LDS store + scale fold per row
         for i in range_constexpr(n):
             B128_IDX, SUB, _hv = specs[i]
-            qs_raw = _raw(
-                fx.Float32(_raw(e8[i] << fx.Int32(23)).bitcast(T.f32))
-            )
+            qs_raw = _raw(fx.Float32(_raw(e8[i] << fx.Int32(23)).bitcast(T.f32)))
             pk = _raw(fx.Int32(0))
             for j in range_constexpr(4):
                 src_bf16x2 = _raw(
