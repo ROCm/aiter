@@ -911,7 +911,12 @@ def _flydsl_stage1_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    if activation == ActivationType.Swiglu:
+        act = "swiglu"
+    elif activation == ActivationType.Gelu:
+        act = "gelu"
+    else:
+        act = "silu"
     _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
@@ -943,6 +948,7 @@ def _flydsl_stage1_wrapper(
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
+        scale_scheme=parsed.get("scale_scheme", ""),
     )
 
 
@@ -1012,6 +1018,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        scale_scheme=parsed.get("scale_scheme", ""),
     )
 
 
@@ -1841,7 +1848,9 @@ def fused_moe_2stages(
                 sorted_weights=sorted_weights,
             )
     elif hidden_states.dtype != q_dtype_a:
-        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+        if quant_type == QuantType.per_1x128 and getattr(
+            metadata.stage1, "func", metadata.stage1
+        ) in (asm_stage1, _flydsl_stage1_wrapper):
             quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,
@@ -1977,7 +1986,14 @@ def fused_moe_2stages(
         )
         a2 = a2_v
     else:
-        a2, a2_scale = quant_func(
+        a2_quant_func = quant_func
+        if (
+            quant_type == QuantType.per_1x128
+            and getattr(metadata.stage1, "func", metadata.stage1)
+            is _flydsl_stage1_wrapper
+        ):
+            a2_quant_func = functools.partial(a2_quant_func, transpose_scale=True)
+        a2, a2_scale = a2_quant_func(
             a2,
             scale=a2_scale,
             quant_dtype=q_dtype_a,

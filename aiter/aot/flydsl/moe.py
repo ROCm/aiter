@@ -39,7 +39,7 @@ from aiter.aot.flydsl.common import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
-    _ptr_view_safe,
+    _as_pointer,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
@@ -209,6 +209,7 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     swiglu_limit: float = 0.0,
+    scale_scheme: str = "",
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -231,7 +232,11 @@ def _precompile_to_cache(
     import torch
 
     dev = torch.device("cpu")
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    # fp8/fp8 defaults to per-1x128 blockscale; only the explicit mxfp8
+    # microscale scheme routes through the mixed (mx) pipeline.
+    use_mx_gemm = b_dtype == "fp4" or (
+        b_dtype == "fp8" and scale_scheme == "mxfp8_1x32_e8m0"
+    )
     is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
@@ -529,6 +534,23 @@ def _precompile_to_cache(
                     stream=0,
                 )
             else:
+                # Blockscale fp8/fp8 launcher always has an arg_out_scale_sorted
+                # slot (split-K included); other stage1 launchers don't. Mirror
+                # the runtime (moe_kernels.flydsl_moe_stage1): pass the real
+                # out_scale_sorted buffer when fused, a 1-byte placeholder for
+                # non-fused blockscale, None otherwise so _s1_args_std omits it.
+                _is_blockscale_s1 = a_dtype == "fp8" and b_dtype == "fp8"
+                if not _is_blockscale_s1:
+                    _s1_scale_arg = None
+                elif out_scale_sorted_flat.numel() > 0:
+                    _s1_scale_arg = out_scale_sorted_flat.view(-1)
+                else:
+                    _s1_scale_arg = torch.empty(1, dtype=torch.uint8, device=dev)
+                # Mirror runtime: bf16/int4 moe_gemm1 and fp8/fp8 blockscale
+                # moe_blockscale_gemm1 both take fx.Pointer (ptrtoint) args.
+                _s1_use_ptr = (
+                    a_dtype == "bf16" and b_dtype == "int4"
+                ) or _is_blockscale_s1
                 args = _s1_args_std(
                     _kernel_out.view(-1),
                     a.view(-1),
@@ -544,6 +566,8 @@ def _precompile_to_cache(
                     _k_in,
                     _grid_y,
                     stream=0,
+                    out_scale_sorted=_s1_scale_arg,
+                    use_ptr=_s1_use_ptr,
                 )
 
             exe = compile_flydsl_moe_stage1(
@@ -568,6 +592,7 @@ def _precompile_to_cache(
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
                 swiglu_limit=swiglu_limit,
+                scale_scheme=scale_scheme,
             )
             _run_compiled(exe, args)
 
@@ -593,13 +618,13 @@ def _precompile_to_cache(
                 _run_compiled(
                     silu_fused,
                     (
-                        _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
-                        _ptr_view_safe(out.view(-1).view(torch.uint8)),
-                        _ptr_view_safe(out_scale_sorted_flat),
-                        _ptr_view_safe(sorted_token_ids),
-                        _ptr_view_safe(num_valid_ids),
-                        _ptr_view_safe(sorted_token_ids.view(-1)),
-                        _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
+                        _as_pointer(tmp_out.view(-1, inter_dim * 2)),
+                        _as_pointer(out.view(-1).view(torch.uint8)),
+                        _as_pointer(out_scale_sorted_flat),
+                        _as_pointer(sorted_token_ids),
+                        _as_pointer(num_valid_ids),
+                        _as_pointer(sorted_token_ids.view(-1)),
+                        _as_pointer(torch.empty(0, device=dev, dtype=torch.float32)),
                         tokens,
                         sorted_token_ids.shape[0],
                         0,
@@ -702,6 +727,11 @@ def _precompile_to_cache(
                     stream=0,
                 )
             else:
+                # Mirror runtime: bf16/int4 moe_gemm2 and fp8/fp8 blockscale
+                # moe_gemm2 both take fx.Pointer (ptrtoint) args.
+                _s2_use_ptr = (a_dtype == "bf16" and b_dtype == "int4") or (
+                    a_dtype == "fp8" and b_dtype == "fp8"
+                )
                 args = _s2_args_std(
                     target,
                     a,
@@ -717,6 +747,7 @@ def _precompile_to_cache(
                     _k_in,
                     m_blocks,
                     stream=0,
+                    use_ptr=_s2_use_ptr,
                 )
 
             exe = compile_flydsl_moe_stage2(
@@ -740,6 +771,7 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
+                scale_scheme=scale_scheme,
             )
             _run_compiled(exe, args)
 
