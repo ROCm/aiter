@@ -176,6 +176,7 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
+            Case(4, 4, 8, 2, 1),
             Case(4, 4, 8, 8, 2),
             Case(4, 4, 8, 128, 4),
             Case(4, 1024, 3072, 128, 4),
@@ -278,16 +279,13 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        # print(f"Before swizzle w_scale_tri={w_scale_tri}")
         if arch_info.get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
             w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
-            # print(f"Post gfx1250 swizzle w_scale_tri={w_scale_tri}")
         else:
             assert arch_info.get_arch() == "gfx950"
             swizzle_mx_scale = "CDNA4_SCALE"
             w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
-            # print(f"Post gfx950 swizzle w_scale_tri={w_scale_tri}")
     else:
         swizzle_mx_scale = None
 

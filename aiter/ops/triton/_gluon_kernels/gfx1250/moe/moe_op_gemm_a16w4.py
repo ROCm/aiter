@@ -1,6 +1,5 @@
 import torch
 
-# import triton
 import triton.language as tl
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
@@ -156,10 +155,6 @@ def _moe_gemm_a16w4(
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
 ):
-    # gl.static_assert(
-    #    SWIZZLE_MX_SCALE is None,
-    #    "Gluon a16w4 path requires pre-expanded scales (SWIZZLE_MX_SCALE=None)",
-    # )
 
     gl.assume(stride_y_k >= 0)
     gl.assume(stride_y_m >= 0)
@@ -320,7 +315,6 @@ def _moe_gemm_a16w4(
         [[PACKED_BLOCK_K_W, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0]
     )
     SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        # [[BLOCK_K, 16]], [BLOCK_N, BLOCK_K], [1, 0]
         [[BLOCK_K, 16]],
         [SCALE_BLOCK_N, PACKED_MX_BLOCK],
         [1, 0],
@@ -356,7 +350,6 @@ def _moe_gemm_a16w4(
 
     ws_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=WMxScale,
-        # shape=(N, K),
         shape=(N // PRESHUFFLE_FACTOR, tl.cdiv(K, MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR),
         strides=(stride_w_mx_n, stride_w_mx_k),
         # block_shape=(BLOCK_N, BLOCK_K),
