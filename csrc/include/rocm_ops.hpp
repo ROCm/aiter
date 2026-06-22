@@ -1819,6 +1819,22 @@ namespace py = pybind11;
           py::arg("k_eps"),                                     \
           py::arg("q_out"),                                     \
           py::arg("k_out"));                                    \
+    m.def("minimax_qk_norm_rope",                               \
+          &aiter::minimax_qk_norm_rope,                         \
+          py::arg("qkv"),                                       \
+          py::arg("q_weight"),                                  \
+          py::arg("k_weight"),                                  \
+          py::arg("cos_sin_cache"),                             \
+          py::arg("position_ids"),                              \
+          py::arg("num_heads_q"),                               \
+          py::arg("num_heads_k"),                               \
+          py::arg("head_dim"),                                  \
+          py::arg("rotary_dim"),                                \
+          py::arg("eps"),                                       \
+          py::arg("is_neox"),                                   \
+          py::arg("q_out"),                                     \
+          py::arg("k_out"),                                     \
+          py::arg("v_out"));                                    \
     m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",         \
           &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle,   \
           py::arg("qkv"),                                       \
