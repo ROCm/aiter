@@ -108,7 +108,7 @@ def build_flash_attn_fp8_module(
     assert head_dim == 128, "v1 only supports head_dim=128"
 
     BLOCK_M = 256
-    BLOCK_N = 64
+    BLOCK_N = 128
     HEAD_DIM = head_dim
     NUM_HEADS = num_heads
     NUM_WAVES = 8
@@ -116,9 +116,11 @@ def build_flash_attn_fp8_module(
     ROWS_PER_WAVE = BLOCK_M // NUM_WAVES  # 32
     STRIDE_TOKEN = NUM_HEADS * HEAD_DIM
 
-    K_STEPS = HEAD_DIM // MFMA_K  # 2 head-dim chunks of 64
-    N_KV_TILES = BLOCK_N // MFMA_N  # 2 kv sub-tiles of 32
-    D_TILES = HEAD_DIM // MFMA_M  # 4 output d sub-tiles of 32
+    K_STEPS = HEAD_DIM // MFMA_K  # 2 head-dim chunks of 64 (QK contraction)
+    N_KV_TILES = BLOCK_N // MFMA_N  # 4 kv sub-tiles of 32 (GEMM1 N)
+    D_TILES = HEAD_DIM // MFMA_N  # 4 output d sub-tiles of 32
+    PV_K_STEPS = BLOCK_N // MFMA_K  # 2 kv K-steps of 64 (PV contraction)
+    P_PACK_WORDS = PV_K_STEPS * (A_FP8_PER_LANE // 4)  # 16 fp8 words for P B-operand
 
     if softmax_scale is None:
         softmax_scale = 1.0 / host_math.sqrt(head_dim)
@@ -271,8 +273,11 @@ def build_flash_attn_fp8_module(
         # ===================================================================
         VEC = 16
         THREADS_PER_ROW = HEAD_DIM // VEC  # 8
-        load_row = tid // THREADS_PER_ROW  # 0..63
+        load_row = tid // THREADS_PER_ROW  # 0..63 (one pass)
         load_col = (tid % THREADS_PER_ROW) * VEC  # 0,16,...,112
+        # BLOCK_SIZE=512 lanes cover 64 rows/pass; BLOCK_N=128 -> 2 passes.
+        ROWS_PER_PASS = BLOCK_SIZE // THREADS_PER_ROW  # 64
+        N_LOAD_PASSES = BLOCK_N // ROWS_PER_PASS  # 2
 
         def _load_global_i8x16(ptr, base_idx):
             gep = fx.buffer_ops.get_element_ptr(
@@ -283,14 +288,22 @@ def build_flash_attn_fp8_module(
         zero_vec16 = Vec.filled(VEC, 0, i8_dtype)
 
         def global_load_kv(kv_start, src_ptr):
-            # Issue the (latency-bound) global load for this lane's row chunk.
-            # Returns a register vec<16xi8>; OOB rows zeroed.
-            row_idx = kv_start + load_row
-            in_bounds = row_idx < seq_len_v
-            safe_row = fx.Index(ArithValue(in_bounds).select(row_idx, fx.Index(0)))
-            g_idx = global_idx(safe_row, load_col)
-            vec = _load_global_i8x16(src_ptr, g_idx)
-            return ArithValue(in_bounds).select(vec, zero_vec16.ir_value())
+            # Issue the (latency-bound) global loads for this lane's row chunks
+            # (N_LOAD_PASSES rows, 16 bytes each).  Returns a register
+            # vec<(16*N_LOAD_PASSES)xi8> = pass chunks concatenated; OOB zeroed.
+            chunks = []
+            for p in range_constexpr(N_LOAD_PASSES):
+                row_idx = kv_start + load_row + fx.Index(p * ROWS_PER_PASS)
+                in_bounds = row_idx < seq_len_v
+                safe_row = fx.Index(ArithValue(in_bounds).select(row_idx, fx.Index(0)))
+                g_idx = global_idx(safe_row, load_col)
+                vec = _load_global_i8x16(src_ptr, g_idx)
+                vec = ArithValue(in_bounds).select(vec, zero_vec16.ir_value())
+                chunks.append(Vec(vec))
+            out = chunks[0]
+            for p in range_constexpr(1, N_LOAD_PASSES):
+                out = out.shuffle(chunks[p], list(range(16 * (p + 1))))
+            return out
 
         def _k_swizzle(row_idx, col_idx):
             # Step 3: XOR swizzle at 16-element granularity, col ^ ((row&7)<<4),
@@ -299,24 +312,31 @@ def build_flash_attn_fp8_module(
             mask = (row_idx & fx.Index(0x7)) << fx.Index(4)
             return col_idx ^ mask
 
+        def _pass_chunk(vec, p):
+            return Vec(vec).shuffle(Vec(vec), list(range(p * 16, p * 16 + 16)))
+
         def store_k_lds(vec, lds_off):
-            # The cooperative store is exactly one 16-element block, so the
-            # swizzle just relocates the whole block (no split needed).
-            swz_col = _k_swizzle(load_row, load_col)
-            lds_idx = fx.Index(lds_off) + load_row * K_STRIDE + swz_col
-            Vec(vec).store(lds, [lds_idx])
+            # One 16-element block per pass; the swizzle relocates each whole
+            # block (no intra-block split needed).
+            for p in range_constexpr(N_LOAD_PASSES):
+                row = load_row + fx.Index(p * ROWS_PER_PASS)
+                swz_col = _k_swizzle(row, load_col)
+                lds_idx = fx.Index(lds_off) + row * K_STRIDE + swz_col
+                Vec(_pass_chunk(vec, p)).store(lds, [lds_idx])
 
         def store_v_lds_dblocked(vec, lds_off):
             # Step 2: store the lane's 16 contiguous d-values (one kv row) as a
             # single 16-byte vector into the d-block layout
-            #   Vlds[d_block][kv][d_in] : d_block = load_col//16, kv = load_row.
+            #   Vlds[d_block][kv][d_in] : d_block = load_col//16, kv = row.
             d_block = load_col // fx.Index(16)
-            v_idx = (
-                fx.Index(lds_off)
-                + d_block * fx.Index(V_DBLOCK_STRIDE)
-                + load_row * fx.Index(V_KV_STRIDE)
-            )
-            Vec(vec).store(lds, [v_idx])
+            for p in range_constexpr(N_LOAD_PASSES):
+                row = load_row + fx.Index(p * ROWS_PER_PASS)
+                v_idx = (
+                    fx.Index(lds_off)
+                    + d_block * fx.Index(V_DBLOCK_STRIDE)
+                    + row * fx.Index(V_KV_STRIDE)
+                )
+                Vec(_pass_chunk(vec, p)).store(lds, [v_idx])
 
         # ---- Preload Q packs (register resident) for this wave ----
         # A-operand for GEMM1 is K; B-operand is Q (Q^T).  But we keep Q in
@@ -361,12 +381,12 @@ def build_flash_attn_fp8_module(
         v_tr8_ty = Vec.make_type(2, fx.Int32)
         lo_in_grp = lo % fx.Index(16)
 
-        def read_v_pack(v_off, dt):
+        def read_v_pack(v_off, dt, ks):
             d_block = (lo // fx.Index(16)) + fx.Index(2 * dt)
             grp_db = fx.Index(lds_offset) + v_off + d_block * fx.Index(V_DBLOCK_STRIDE)
             reads = []
             for kc in range_constexpr(4):
-                kv0 = hi * fx.Index(32) + fx.Index(8 * kc)
+                kv0 = hi * fx.Index(32) + fx.Index(ks * 64 + 8 * kc)
                 byte_off = (
                     grp_db + kv0 * fx.Index(V_KV_STRIDE) + lo_in_grp * fx.Index(8)
                 )
@@ -377,80 +397,37 @@ def build_flash_attn_fp8_module(
             return ab.shuffle(cd, list(range(8)))
 
         def apply_pv(o_accs, l_acc, p_pack, corr, v_off):
-            # O,L *= corr ; then O += V^T@P and L += ones@P.  The PV/L MFMAs
-            # (matrix pipe) are issued next to the following tile's softmax
-            # exp2 (transcendental pipe) so the two pipes overlap (deferred PV).
+            # O,L *= corr ; then O += V^T@P and L += ones@P, summed over the
+            # PV_K_STEPS 64-kv K-steps that tile BLOCK_N.  The PV/L MFMAs (matrix
+            # pipe) are issued next to the following tile's softmax exp2
+            # (transcendental pipe) so the two pipes overlap (deferred PV).
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
             )
-            o2 = [_fmul(Vec(o_accs[dt]), corr_vec) for dt in range_constexpr(D_TILES)]
-            l2 = _fmul(Vec(l_acc), corr_vec)
-            l2 = mfma.call(ones_pack, p_pack, l2)
-            for dt in range_constexpr(D_TILES):
-                v_pack = read_v_pack(v_off, dt)
-                o2[dt] = mfma.call(v_pack, p_pack, o2[dt])
-            return o2, l2
+            # Scale O/L by corr in place on the first K-step (fold into the slot
+            # the MFMA accumulates into) so the rescaled and pre-rescale copies
+            # never co-exist as two full 64-VGPR lists.
+            o = list(o_accs)
+            l2 = l_acc
+            for ks in range_constexpr(PV_K_STEPS):
+                p_ks = Vec(p_pack).shuffle(Vec(p_pack), list(range(ks * 8, ks * 8 + 8)))
+                if const_expr(ks == 0):
+                    l2 = _fmul(Vec(l2), corr_vec)
+                l2 = mfma.call(ones_pack, p_ks, l2)
+                for dt in range_constexpr(D_TILES):
+                    v_pack = read_v_pack(v_off, dt, ks)
+                    if const_expr(ks == 0):
+                        o[dt] = _fmul(Vec(o[dt]), corr_vec)
+                    o[dt] = mfma.call(v_pack, p_ks, o[dt])
+            return o, l2
 
-        init_args = [c_neg_inf, Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)]
-        for _ in range_constexpr(D_TILES):
-            init_args.append(Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32))
-        # Carried state: buffer parity + prefetched K/V register vectors for the
-        # *current* tile + deferred-PV state P_prev/corr_prev (tile i-1's packed
-        # P and softmax correction, consumed by the next iteration's PV so the
-        # PV MFMAs overlap this iteration's softmax exp2).
-        init_args.append(fx.Index(0))  # buf parity
-        init_args.append(global_load_kv(fx.Index(0), k_ptr))  # K reg, tile 0
-        init_args.append(global_load_kv(fx.Index(0), v_ptr))  # V reg, tile 0
-        init_args.append(Vec.filled(A_FP8_PER_LANE // 4, 0, fx.Int32))  # P_prev=0
-        init_args.append(fx.Float32(1.0))  # corr_prev=1 (no-op rescale at i=0)
-
-        loop_results = init_args
-        for kv_start, iter_args in range(0, seq_len_v, BLOCK_N, init=init_args):
-            m_running = iter_args[0]
-            l_acc = iter_args[1]  # vec<16xf32>, ones-column L (Step 5)
-            o_accs = [iter_args[2 + i] for i in range_constexpr(D_TILES)]
-            buf = iter_args[2 + D_TILES]
-            k_reg = iter_args[3 + D_TILES]
-            v_reg = iter_args[4 + D_TILES]
-            p_prev = iter_args[5 + D_TILES]
-            corr_prev = iter_args[6 + D_TILES]
-
-            k_buf_off = fx.Index(LDS_K_OFF) + buf * fx.Index(LDS_K_TILE)
-            v_buf_off = fx.Index(LDS_V_OFF) + buf * fx.Index(LDS_V_TILE)
-            prev_buf = (buf + fx.Index(2)) % fx.Index(NUM_BUF)  # tile i-1
-            v_prev_off = fx.Index(LDS_V_OFF) + prev_buf * fx.Index(LDS_V_TILE)
-            next_buf = (buf + fx.Index(1)) % fx.Index(NUM_BUF)
-            next_kv = kv_start + fx.Index(BLOCK_N)
-
-            # ---- Triple-buffered: one barrier publishes tile i.  The buffer
-            #      written here (tile i-3) was last read in iteration i-2, so no
-            #      separate hazard barrier is needed. ----
-            store_k_lds(k_reg, k_buf_off)
-            store_v_lds_dblocked(v_reg, v_buf_off)
-            gpu.barrier()
-
-            # ---- Prefetch the NEXT tile's global loads (carried to next iter).
-            k_next = global_load_kv(next_kv, k_ptr)
-            v_next = global_load_kv(next_kv, v_ptr)
-
-            # ---- Deferred PV for tile i-1 (P_prev register-resident): its
-            #      PV/L MFMAs overlap tile i's softmax exp2 below.  At i=0,
-            #      P_prev=0 nullifies the read of the not-yet-filled buffer. ----
-            o_accs, l_acc = apply_pv(o_accs, l_acc, p_prev, corr_prev, v_prev_off)
-
-            # ===============================================================
-            # GEMM1: S[kv,q] = K @ Q^T  for each of the N_KV_TILES kv subtiles
-            #   A = K   : A_frag[L][v] = K[kv = lo (+ nt*32), d = ks*64+hi*32+v]
-            #   B = Q   : q_packs[ks]  (preloaded)
-            # ===============================================================
+        def do_qk(k_buf_off):
+            # GEMM1: S[kv,q] = K @ Q^T over N_KV_TILES kv subtiles.  Returns the
+            # list of N_KV_TILES accumulators (each vec<16xf32>).
             s_accs = []
             for nt in range_constexpr(N_KV_TILES):
                 s_acc = mfma.zero_value
                 for ks in range_constexpr(K_STEPS):
-                    # K A-operand: kv-row = lo + nt*32, d = ks*64 + hi*32 + v.
-                    # The swizzle is 16-granular, so the 32-byte operand is read
-                    # as two 16-byte blocks at separately-swizzled columns and
-                    # concatenated back into logical (d_base..d_base+31) order.
                     kv_row = lo + fx.Index(nt * 32)
                     d_base = fx.Index(ks * MFMA_K) + hi * 32
                     blk_lo = Vec(
@@ -478,123 +455,348 @@ def build_flash_attn_fp8_module(
                     k_pack = blk_lo.shuffle(blk_hi, list(range(8)))
                     s_acc = mfma.call(k_pack, q_packs[ks], s_acc)
                 s_accs.append(s_acc)
+            return s_accs
 
-            # ===============================================================
-            # Online softmax over the 64 kv positions of this tile.
-            # C-layout: value index v -> kv-row hi*4+(v%4)+8*(v//4); lane lo
-            # -> q.  s_accs[nt] covers kv in [nt*32, nt*32+32).  Reduce over
-            # the 16 values + the hi half (xor-32) -> per-q (lane) row max.
-            # ===============================================================
-            s_raw = [[None] * C_F32_PER_LANE for _ in range_constexpr(N_KV_TILES)]
-            for nt in range_constexpr(N_KV_TILES):
-                for r in range_constexpr(C_F32_PER_LANE):
-                    s_raw[nt][r] = Vec(s_accs[nt])[r]
-
-            local_max = s_raw[0][0]
+        def do_softmax(s_accs, m_running):
+            # Online softmax (VALU/transcendental only): returns (m_new, corr,
+            # p_pack) where p_pack is the PV B-operand (P_PACK_WORDS fp8 words).
+            # Pass 1: row max read directly off the carried S accumulators -- no
+            # 64-element s_raw list, so the extracted S scalars never co-exist
+            # with the 64 exp2 outputs (that overlap was the spill driver).
+            local_max = Vec(s_accs[0])[0]
             for nt in range_constexpr(N_KV_TILES):
                 for r in range_constexpr(C_F32_PER_LANE):
                     if const_expr(nt == 0 and r == 0):
                         continue
-                    local_max = _fmax(local_max, s_raw[nt][r])
-            # Combine the hi half (kv rows differ by hi) across the 32-lane split.
+                    local_max = _fmax(local_max, Vec(s_accs[nt])[r])
             peer_max = fx.Float32(local_max).shuffle_xor(
                 fx.Int32(32), fx.Int32(WARP_SIZE)
             )
             row_max_int = _fmax(local_max, peer_max)
-
-            # m / corr in *real* score domain handled via scale_log2e.
             m_new = _fmax(m_running, row_max_int)
             corr = ArithValue(_fmul(_fsub(m_running, m_new), scale_log2e)).exp2(
                 fastmath=fm_fast
             )
+            neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
+            n_groups = C_F32_PER_LANE // 4
 
-            scaled_m_new = _fmul(scale_log2e, m_new)
-            neg_scaled_m_new = _fsub(c_zero_f, scaled_m_new)
+            # Pass 2: exp2 -> P packed 4-at-a-time, so at most 4 exp outputs are
+            # live before they collapse into one fp8 i32 word.
+            def _p(nt, r):
+                e = _fadd(_fmul(Vec(s_accs[nt])[r], scale_log2e), neg_scaled_m_new)
+                return ArithValue(e).exp2(fastmath=fm_fast)
 
-            # P = exp2(scale_log2e * S_int - scale_log2e * m_new), packed fp8.
-            # (No VALU rowsum here: L is accumulated by the ones-column MFMA in
-            # the PV phase below, Step 5.)
-            p_vals = [[None] * C_F32_PER_LANE for _ in range_constexpr(N_KV_TILES)]
-            for nt in range_constexpr(N_KV_TILES):
-                for r in range_constexpr(C_F32_PER_LANE):
-                    e = _fadd(_fmul(s_raw[nt][r], scale_log2e), neg_scaled_m_new)
-                    p = ArithValue(e).exp2(fastmath=fm_fast)
-                    p_vals[nt][r] = p
-
-            # ---- Build the GEMM2 P B-operand directly in registers ----
-            # (Step 1: no LDS round-trip.)  In the GEMM1 C-layout a lane holds
-            # P[kv = hi*4 + (r%4) + 8*(r//4) + nt*32, q = lo].  The four values
-            # r = rg*4 + {0..3} land on CONTIGUOUS kv = hi*4 + 8*rg + nt*32 +
-            # {0..3}, so pack each group into one i32 (4 fp8 bytes): myword[nt][rg].
-            i32_dtype = fx.Int32
-            n_groups = C_F32_PER_LANE // 4  # 4
-            myword = [[None] * n_groups for _ in range_constexpr(N_KV_TILES)]
-            for nt in range_constexpr(N_KV_TILES):
-                for rg in range_constexpr(n_groups):
-                    base = rg * 4
-                    myword[nt][rg] = _f32x4_to_fp8_word(
-                        p_vals[nt][base + 0],
-                        p_vals[nt][base + 1],
-                        p_vals[nt][base + 2],
-                        p_vals[nt][base + 3],
+            myword = [
+                [
+                    _f32x4_to_fp8_word(
+                        _p(nt, rg * 4 + 0),
+                        _p(nt, rg * 4 + 1),
+                        _p(nt, rg * 4 + 2),
+                        _p(nt, rg * 4 + 3),
                     )
-            # peerword[nt][rg] = the hi-peer lane's myword[nt][rg], fetched via
-            # an intra-wave cross-lane shuffle (lane ^ 32 swaps hi=0 <-> hi=1).
-            peerword = [[None] * n_groups for _ in range_constexpr(N_KV_TILES)]
-            for nt in range_constexpr(N_KV_TILES):
-                for rg in range_constexpr(n_groups):
-                    peerword[nt][rg] = fx.Int32(myword[nt][rg]).shuffle_xor(
+                    for rg in range_constexpr(n_groups)
+                ]
+                for nt in range_constexpr(N_KV_TILES)
+            ]
+            peerword = [
+                [
+                    fx.Int32(myword[nt][rg]).shuffle_xor(
                         fx.Int32(32), fx.Int32(WARP_SIZE)
                     )
-
-            # ===============================================================
-            # GEMM2: O[d,q] += V^T @ P
-            #   A = V^T : A_frag[L][v] = V[kv = hi*32+v, d = lo + dt*32]
-            #   B = P   : B_frag[L][v] = P[kv = hi*32+v, q = lo]
-            # both read along kv = hi*32+v (contiguous 32 kv).
-            # ===============================================================
-            # B (P) word w covers kv = hi*32 + 4w .. +3.  Solving the C-layout
-            # map, the source is nt = hi, rg = w//2, hi_src = w%2:
-            #   - hi_src == hi -> this lane's myword[hi][w//2]
-            #   - hi_src != hi -> the hi-peer's word == peerword[hi][w//2]
-            # hi is runtime; (w%2) is compile-time, so the parity test collapses
-            # to a single select on (hi == 0) per word.
+                    for rg in range_constexpr(n_groups)
+                ]
+                for nt in range_constexpr(N_KV_TILES)
+            ]
             hi_is0 = hi < fx.Index(1)
             p_words = []
-            for w in range_constexpr(8):
-                rg = w // 2
-                if const_expr(w % 2 == 0):
-                    # hi==0 -> myword[0][rg]; hi==1 -> peerword[1][rg]
-                    sel = ArithValue(hi_is0).select(
-                        _raw(myword[0][rg]), _raw(peerword[1][rg])
-                    )
-                else:
-                    # hi==0 -> peerword[0][rg]; hi==1 -> myword[1][rg]
-                    sel = ArithValue(hi_is0).select(
-                        _raw(peerword[0][rg]), _raw(myword[1][rg])
-                    )
-                p_words.append(fx.Int32(sel))
-            p_pack = Vec.from_elements(p_words, i32_dtype)
+            for ks in range_constexpr(PV_K_STEPS):
+                for w in range_constexpr(8):
+                    rg = w // 2
+                    if const_expr(w % 2 == 0):
+                        sel = ArithValue(hi_is0).select(
+                            _raw(myword[2 * ks + 0][rg]), _raw(peerword[2 * ks + 1][rg])
+                        )
+                    else:
+                        sel = ArithValue(hi_is0).select(
+                            _raw(peerword[2 * ks + 0][rg]), _raw(myword[2 * ks + 1][rg])
+                        )
+                    p_words.append(fx.Int32(sel))
+            return m_new, corr, Vec.from_elements(p_words, fx.Int32)
 
-            # Defer this tile's PV: carry p_pack/corr to the next iteration so
-            # its PV/L MFMAs overlap the next tile's softmax exp2 (Step 7).
-            m_running = m_new
+        # ---- Shared init values (computed by all 512 lanes before the split) --
+        m_init = c_neg_inf
+        l_init = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+        o_init = [
+            Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+            for _ in range_constexpr(D_TILES)
+        ]
+        buf_init = fx.Index(0)
+        k_reg0 = global_load_kv(fx.Index(0), k_ptr)  # K reg, tile 0
+        v_reg0 = global_load_kv(fx.Index(0), v_ptr)  # V reg, tile 0
+        p_init = Vec.filled(P_PACK_WORDS, 0, fx.Int32)  # p_carry=0
+        corr_init = fx.Float32(1.0)  # no-op rescale at i=0
+        s_init = [
+            Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+            for _ in range_constexpr(N_KV_TILES)
+        ]
+        zero_p = Vec.filled(P_PACK_WORDS, 0, fx.Int32)
 
-            loop_results = yield (
-                [m_running, l_acc] + o_accs + [next_buf, k_next, v_next, p_pack, corr]
+        # Shared per-iteration prologue (BOTH groups, all 512 lanes): publish
+        # tile i to LDS, barrier, then prefetch tile i+1's global loads.  The
+        # cooperative load/store is workgroup-wide (each lane owns half the rows),
+        # so both groups must run it AND both must hit the publish barrier -- this
+        # keeps the per-group barrier count identical (2/iter), the invariant that
+        # makes the split safe against deadlock.
+        def _iter_prologue(kv_start, buf, k_reg, v_reg):
+            k_buf_off = fx.Index(LDS_K_OFF) + buf * fx.Index(LDS_K_TILE)
+            v_buf_off = fx.Index(LDS_V_OFF) + buf * fx.Index(LDS_V_TILE)
+            # tile i-1 buffer.  At iteration 0 there is no tile i-1: P_prev=0
+            # nullifies the contribution mathematically, but the PV MFMA still
+            # reads V -- and 0*NaN=NaN if that buffer is uninitialized LDS.  So at
+            # i=0 point the read at the just-written current buffer (finite).
+            is_first = kv_start < fx.Index(BLOCK_N)
+            prev_buf = fx.Index(
+                ArithValue(is_first).select(
+                    buf, (buf + fx.Index(2)) % fx.Index(NUM_BUF)
+                )
             )
+            v_prev_off = fx.Index(LDS_V_OFF) + prev_buf * fx.Index(LDS_V_TILE)
+            next_buf = (buf + fx.Index(1)) % fx.Index(NUM_BUF)
+            next_kv = kv_start + fx.Index(BLOCK_N)
+            # Triple-buffered: one barrier publishes tile i; the buffer written
+            # here (tile i-3) was last read in iteration i-2, no hazard barrier.
+            store_k_lds(k_reg, k_buf_off)
+            store_v_lds_dblocked(v_reg, v_buf_off)
+            gpu.barrier()
+            k_next = global_load_kv(next_kv, k_ptr)
+            v_next = global_load_kv(next_kv, v_ptr)
+            return k_buf_off, v_prev_off, next_buf, is_first, k_next, v_next
 
-        # ---- Epilogue: flush the final deferred PV (tile N-1), then
-        #      O = (O / l) * v_descale ; store bf16. ----
-        buf_final = loop_results[2 + D_TILES]  # = next_buf of last iter
-        o_carry = [loop_results[2 + dt] for dt in range_constexpr(D_TILES)]
-        l_carry = loop_results[1]
-        p_final = loop_results[5 + D_TILES]
-        corr_final = loop_results[6 + D_TILES]
-        # tile N-1's V lives in buffer (buf_final + NUM_BUF - 1) % NUM_BUF.
-        last_buf = (buf_final + fx.Index(NUM_BUF - 1)) % fx.Index(NUM_BUF)
-        v_last_off = fx.Index(LDS_V_OFF) + last_buf * fx.Index(LDS_V_TILE)
-        o_finals, l_vec = apply_pv(o_carry, l_carry, p_final, corr_final, v_last_off)
+        # Cross-wave role ping-pong, hoisted into TWO specialized loop bodies
+        # (option a).  The role split lives OUTSIDE the loop: G0 and G1 each run
+        # their own scf.for (built via scf_for_dispatch -- the lowering API the
+        # `for ... yield` sugar compiles to; we call it directly because a
+        # yield-loop cannot be nested in a runtime scf.if).  Because the two
+        # loops sit in mutually-exclusive scf.if regions, each group's S tile has
+        # a single live range and the allocator coalesces G0.S with G1.S (64
+        # VGPR, not 64+64).  G0 carries P across iterations (deferred PV) and
+        # produces/consumes S within one iteration; G1 carries S across
+        # iterations (its phase-B QK feeds the next phase-A softmax) with P
+        # intra-iteration.  Both bodies keep the identical 2-barriers/iter rhythm
+        # (one in the shared prologue, one between phases), so all 8 waves stay
+        # barrier-lockstep (s_barrier counts waves, not PCs).
+        is_g0 = wave_id < fx.Index(NUM_WAVES // 2)
+        loop_lo = fx.Int32(0)
+        loop_step = fx.Int32(BLOCK_N)
+        of0 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+        of1 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+        of2 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+        of3 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+        lf = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
+
+        if is_g0:
+            g0_names = [
+                "m_r",
+                "l_a",
+                "oo0",
+                "oo1",
+                "oo2",
+                "oo3",
+                "buf",
+                "k_reg",
+                "v_reg",
+                "p_c",
+                "corr_c",
+            ]
+            g0_init = [
+                m_init,
+                l_init,
+                o_init[0],
+                o_init[1],
+                o_init[2],
+                o_init[3],
+                buf_init,
+                k_reg0,
+                v_reg0,
+                p_init,
+                corr_init,
+            ]
+
+            def g0_body(
+                iv, _names, m_r, l_a, oo0, oo1, oo2, oo3, buf, k_reg, v_reg, p_c, corr_c
+            ):
+                kv_start = fx.Index(iv)
+                (
+                    k_buf_off,
+                    v_prev_off,
+                    next_buf,
+                    _isf,
+                    k_next,
+                    v_next,
+                ) = _iter_prologue(kv_start, buf, k_reg, v_reg)
+                # PHASE A: matrix -- deferred PV(i-1) then QK(i).
+                oA, lA = apply_pv([oo0, oo1, oo2, oo3], l_a, p_c, corr_c, v_prev_off)
+                sA = do_qk(k_buf_off)
+                gpu.barrier()
+                # PHASE B: softmax(i) -> P(i) carried to next iter's PV.
+                m_new, corr_new, p_new = do_softmax([sA[0], sA[1], sA[2], sA[3]], m_r)
+                return [
+                    m_new,
+                    lA,
+                    oA[0],
+                    oA[1],
+                    oA[2],
+                    oA[3],
+                    next_buf,
+                    k_next,
+                    v_next,
+                    p_new,
+                    corr_new,
+                ]
+
+            res = scf_for_dispatch(  # noqa: F821
+                loop_lo,
+                seq_len,
+                loop_step,
+                g0_body,
+                result_names=g0_names,
+                result_values=g0_init,
+            )
+            # G0 epilogue: still owes PV(N-1) (softmax(N-1) ran in last phase B).
+            m_e = res[0]
+            l_e = res[1]
+            oe0 = res[2]
+            oe1 = res[3]
+            oe2 = res[4]
+            oe3 = res[5]
+            buf_final = res[6]
+            p_e = res[9]
+            corr_e = res[10]
+            last_buf = (buf_final + fx.Index(NUM_BUF - 1)) % fx.Index(NUM_BUF)
+            v_last_off = fx.Index(LDS_V_OFF) + last_buf * fx.Index(LDS_V_TILE)
+            o_fin, l_vec_g = apply_pv(
+                [oe0, oe1, oe2, oe3], l_e, p_e, corr_e, v_last_off
+            )
+            of0 = o_fin[0]
+            of1 = o_fin[1]
+            of2 = o_fin[2]
+            of3 = o_fin[3]
+            lf = l_vec_g
+        else:
+            g1_names = [
+                "m_r",
+                "l_a",
+                "oo0",
+                "oo1",
+                "oo2",
+                "oo3",
+                "buf",
+                "k_reg",
+                "v_reg",
+                "ss0",
+                "ss1",
+                "ss2",
+                "ss3",
+            ]
+            g1_init = [
+                m_init,
+                l_init,
+                o_init[0],
+                o_init[1],
+                o_init[2],
+                o_init[3],
+                buf_init,
+                k_reg0,
+                v_reg0,
+                s_init[0],
+                s_init[1],
+                s_init[2],
+                s_init[3],
+            ]
+
+            def g1_body(
+                iv,
+                _names,
+                m_r,
+                l_a,
+                oo0,
+                oo1,
+                oo2,
+                oo3,
+                buf,
+                k_reg,
+                v_reg,
+                ss0,
+                ss1,
+                ss2,
+                ss3,
+            ):
+                kv_start = fx.Index(iv)
+                (
+                    k_buf_off,
+                    v_prev_off,
+                    next_buf,
+                    is_first,
+                    k_next,
+                    v_next,
+                ) = _iter_prologue(kv_start, buf, k_reg, v_reg)
+                # PHASE A: softmax(i-1) on carried S (iter 0 has none -> no-op).
+                m_sm, corr_sm, p_sm = do_softmax([ss0, ss1, ss2, ss3], m_r)
+                mA = ArithValue(is_first).select(m_r, m_sm)
+                corrA = ArithValue(is_first).select(fx.Float32(1.0), corr_sm)
+                pA = ArithValue(is_first).select(zero_p.ir_value(), _raw(p_sm))
+                gpu.barrier()
+                # PHASE B: matrix -- deferred PV(i-1) then QK(i) -> S(i) carried.
+                oB, lB = apply_pv([oo0, oo1, oo2, oo3], l_a, pA, corrA, v_prev_off)
+                sB = do_qk(k_buf_off)
+                return [
+                    mA,
+                    lB,
+                    oB[0],
+                    oB[1],
+                    oB[2],
+                    oB[3],
+                    next_buf,
+                    k_next,
+                    v_next,
+                    sB[0],
+                    sB[1],
+                    sB[2],
+                    sB[3],
+                ]
+
+            res = scf_for_dispatch(  # noqa: F821
+                loop_lo,
+                seq_len,
+                loop_step,
+                g1_body,
+                result_names=g1_names,
+                result_values=g1_init,
+            )
+            # G1 epilogue: owes BOTH softmax(N-1) (carried S) and PV(N-1).
+            m_e = res[0]
+            l_e = res[1]
+            oe0 = res[2]
+            oe1 = res[3]
+            oe2 = res[4]
+            oe3 = res[5]
+            buf_final = res[6]
+            sce0 = res[9]
+            sce1 = res[10]
+            sce2 = res[11]
+            sce3 = res[12]
+            last_buf = (buf_final + fx.Index(NUM_BUF - 1)) % fx.Index(NUM_BUF)
+            v_last_off = fx.Index(LDS_V_OFF) + last_buf * fx.Index(LDS_V_TILE)
+            _m_e, corrf, pf = do_softmax([sce0, sce1, sce2, sce3], m_e)
+            o_fin, l_vec_g = apply_pv([oe0, oe1, oe2, oe3], l_e, pf, corrf, v_last_off)
+            of0 = o_fin[0]
+            of1 = o_fin[1]
+            of2 = o_fin[2]
+            of3 = o_fin[3]
+            lf = l_vec_g
+
+        o_finals = [of0, of1, of2, of3]
+        l_vec = lf
 
         # l is the ones-column MFMA accumulator (Step 5): a vec<16xf32> whose
         # every value == L[q=lo] (the row sum is replicated over the dummy d
