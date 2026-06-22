@@ -1560,6 +1560,181 @@ def test_qk_norm_rope_1way(
     return ret
 
 
+def minimax_rms_norm_forward(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    input_dtype = x.dtype
+    variance = x.float().pow(2).mean(-1, keepdim=True)
+    x = x.float() * torch.rsqrt(variance + eps) * weight.float()
+    return x.to(input_dtype)
+
+
+@perftest()
+def run_torch_minimax_qk_norm_rope(
+    qkv: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    cos_sin: Tensor,
+    positions: Tensor,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    rotary_dim: int,
+    is_neox_style: bool,
+    eps: float,
+):
+    q_size = num_heads_q * head_size
+    kv_size = num_heads_k * head_size
+    q, k, v = qkv.view(num_tokens, q_size + 2 * kv_size).split(
+        [q_size, kv_size, kv_size], dim=-1
+    )
+
+    q = minimax_rms_norm_forward(q, q_weight, eps)
+    k = minimax_rms_norm_forward(k, k_weight, eps)
+
+    cos_sin = cos_sin.view(cos_sin.shape[0], rotary_dim)[positions]
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    q = apply_rotary_emb_dispatch(
+        q.view(num_tokens, num_heads_q, head_size),
+        cos,
+        sin,
+        is_neox_style,
+        rotary_dim,
+    ).reshape(num_tokens, q_size)
+    k = apply_rotary_emb_dispatch(
+        k.view(num_tokens, num_heads_k, head_size),
+        cos,
+        sin,
+        is_neox_style,
+        rotary_dim,
+    ).reshape(num_tokens, kv_size)
+    return q, k, v
+
+
+@perftest()
+def run_aiter_minimax_qk_norm_rope(
+    qkv: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    cos_sin: Tensor,
+    positions: Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    rotary_dim: int,
+    is_neox_style: bool,
+    eps: float,
+):
+    num_tokens = qkv.size(0)
+    q_out = torch.empty(
+        (num_tokens, num_heads_q * head_size), dtype=qkv.dtype, device=qkv.device
+    )
+    k_out = torch.empty(
+        (num_tokens, num_heads_k * head_size), dtype=qkv.dtype, device=qkv.device
+    )
+    v_out = torch.empty_like(k_out)
+    q_ret, k_ret, v_ret = aiter.minimax_qk_norm_rope(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        head_dim=head_size,
+        rotary_dim=rotary_dim,
+        eps=eps,
+        is_neox_style=is_neox_style,
+        q_out=q_out,
+        k_out=k_out,
+        v_out=v_out,
+    )
+    assert q_ret.data_ptr() == q_out.data_ptr()
+    assert k_ret.data_ptr() == k_out.data_ptr()
+    assert v_ret.data_ptr() == v_out.data_ptr()
+    return q_ret, k_ret, v_ret
+
+
+@benchmark()
+def test_minimax_qk_norm_rope(
+    dtype,
+    num_tokens,
+    num_heads_q,
+    num_heads_k,
+    head_size,
+    rotary_dim,
+    is_neox_style,
+    eps=1e-6,
+):
+    torch.manual_seed(0)
+    q_size = num_heads_q * head_size
+    kv_size = num_heads_k * head_size
+    max_positions = max(num_tokens * 2, 128)
+    qkv = torch.randn(
+        (num_tokens, q_size + 2 * kv_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    q_weight = torch.randn(q_size, dtype=torch.float32, device="cuda")
+    k_weight = torch.randn(kv_size, dtype=torch.float32, device="cuda")
+    cos_sin = torch.randn(
+        (max_positions, rotary_dim),
+        dtype=dtype,
+        device="cuda",
+    )
+    positions = torch.randint(
+        0, max_positions, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+
+    (q_ref, k_ref, v_ref), avg_torch = run_torch_minimax_qk_norm_rope(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        rotary_dim,
+        is_neox_style,
+        eps,
+    )
+    (q_out, k_out, v_out), avg_cu = run_aiter_minimax_qk_norm_rope(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        rotary_dim,
+        is_neox_style,
+        eps,
+    )
+
+    info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}"
+    info += f", head_size:{head_size}, rotary_dim:{rotary_dim}, is_neox_style:{is_neox_style}, eps:{eps}"
+    msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
+    checkAllclose(q_ref, q_out, msg="minimax q", rtol=1e-2, atol=0.05)
+    checkAllclose(k_ref, k_out, msg="minimax k", rtol=1e-2, atol=0.05)
+    checkAllclose(v_ref, v_out, msg="minimax v", rtol=1e-2, atol=0.05)
+    print(msg, flush=True)
+
+    ret = {}
+    ret["dtype"] = dtype
+    ret["num_tokens"] = num_tokens
+    ret["num_heads_q"] = num_heads_q
+    ret["num_heads_k"] = num_heads_k
+    ret["head_size"] = head_size
+    ret["rotary_dim"] = rotary_dim
+    ret["is_neox_style"] = "1" if is_neox_style else "0"
+    ret["avg_torch"] = avg_torch
+    ret["avg_cu"] = avg_cu
+    ret["speedup"] = avg_torch / avg_cu
+    return ret
+
+
 @benchmark()
 def test_qk_norm_rope_cache_block_quant(
     dtype,
@@ -3147,6 +3322,33 @@ if __name__ == "__main__":
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("qk_norm_rope_1way summary (markdown):\n%s", df_md)
+
+    # MiniMax TP1: q/k are normalized across the full flattened q/k vector.
+    df = []
+    minimax_heads_q = 8
+    minimax_heads_k = 2
+    for head_size in args.head_sizes:
+        for num_tokens in args.token:
+            rotary_dims = {head_size}
+            partial_rotary_dim = partial_rotary_configs.get(head_size)
+            if partial_rotary_dim is not None:
+                rotary_dims.add(partial_rotary_dim)
+            for rotary_dim in sorted(rotary_dims):
+                for is_neox_style in args.is_neox_styles:
+                    ret = test_minimax_qk_norm_rope(
+                        args.dtype,
+                        num_tokens,
+                        minimax_heads_q,
+                        minimax_heads_k,
+                        head_size,
+                        rotary_dim,
+                        is_neox_style,
+                        eps=1e-6,
+                    )
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("minimax_qk_norm_rope summary (markdown):\n%s", df_md)
 
     # partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
     df = []

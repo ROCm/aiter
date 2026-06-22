@@ -977,6 +977,36 @@ def flydsl_qk_norm_rope_quant(
         (q_out, kv_out, q_scale_or_None, kv_scale_or_None)
         Scales are ``None`` when ``quant=False``.
     """
+    # ---- gfx1250 dispatch (wave32) ----
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+
+    if _get_gfx() == "gfx1250":
+        from .qk_norm_rope_quant_gfx1250 import flydsl_qk_norm_rope_quant_gfx1250
+
+        return flydsl_qk_norm_rope_quant_gfx1250(
+            q=q,
+            kv=kv,
+            kv_weight=kv_weight,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            positions=positions,
+            num_q_heads=num_q_heads,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            q_weight=q_weight,
+            quant=quant,
+            quant_group_size=quant_group_size,
+            scale_dtype=scale_dtype,
+            q_out=q_out,
+            kv_out=kv_out,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            swa_kv=swa_kv,
+            state_slot_mapping=state_slot_mapping,
+            batch_id_per_token=batch_id_per_token,
+            stream=stream,
+        )
+
     # Validate user-facing inputs with raise (not assert) so the checks are
     # not stripped under ``python -O``. Internal codegen invariants inside
     # _build_kernel/_store_*_vec_g remain as asserts on purpose.
@@ -1020,7 +1050,7 @@ def flydsl_qk_norm_rope_quant(
     # Normalize Q to [T, H, D] (the kernel expects 3D).
     if q.dim() == 2:
         if q.shape[1] != H * D:
-            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H*D}]")
+            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H * D}]")
         if not q.is_contiguous():
             raise ValueError("2D q must be contiguous to .view as [T,H,D]")
         q_view = q.view(T_tok, H, D)
