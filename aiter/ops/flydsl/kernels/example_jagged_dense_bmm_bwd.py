@@ -167,12 +167,13 @@ def run_flydsl_bwd(which, jagged, dense, bias, d_out, seq_offsets, n_groups, max
 
     if "ddense" in which:
         d_dense = torch.zeros(n_groups, K, N, dtype=torch.bfloat16, device=device)
-        dense_partials = torch.zeros(n_groups, SPLIT, K, N, dtype=torch.float32, device=device)
+        # fp32 split-reduction scratch, viewed as (n_groups * SPLIT * K, N).
+        dense_partials = torch.zeros(n_groups * SPLIT * K, N, dtype=torch.float32, device=device)
         tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
         try:
             grad_dense(
-                d_dense, tJagged, tDOut, seq_offsets, n_groups, max_seq_len,
-                partials=dense_partials, split=SPLIT, stream=stream,
+                d_dense.view(n_groups * K, N), tJagged, tDOut, seq_offsets,
+                dense_partials, n_groups, max_seq_len, stream=stream,
             )
             torch.cuda.synchronize()
             results["ddense"] = d_dense

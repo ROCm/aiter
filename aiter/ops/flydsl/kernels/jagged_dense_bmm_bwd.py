@@ -47,6 +47,19 @@ SPLIT = 4
 KOUT_BLOCKS = K // BLOCK_N  # column-tiles of the (M, K) output (compile-time)
 NRED_TILES = N // BLOCK_K   # contraction tiles over N (compile-time)
 
+# dDense reduction tiling. The (K, N) output tile is owned by a 16x16 thread grid
+# (256 threads); each thread accumulates a (KPT, NPT) register sub-block over the
+# jagged axis. Rows are staged through LDS DDENSE_BM at a time.
+DDENSE_BM = 64
+DDENSE_TK = 16
+DDENSE_TN = 16
+KPT = K // DDENSE_TK  # 8
+NPT = N // DDENSE_TN  # 8
+DDENSE_THREADS = DDENSE_TK * DDENSE_TN  # 256
+_J_LDS_LOADS = (DDENSE_BM * K) // DDENSE_THREADS
+_D_LDS_LOADS = (DDENSE_BM * N) // DDENSE_THREADS
+_DDENSE_SMEM_BYTES = (DDENSE_BM * K + DDENSE_BM * N) * 2  # bf16 staging for J and dOut
+
 
 def _load_scalar(copy_atom, elem_dtype, divided_tensor, index):
     """Load one element at column `index` from a row already divided by (1, 1)."""
@@ -337,15 +350,131 @@ def grad_bias(
     )
 
 
-def grad_dense(
-    dDense: fx.Tensor,       # out    (n_groups, K, N)      bf16
-    JAGGED: fx.Tensor,       # jagged (L, K)                bf16
-    dOut: fx.Tensor,         # grad   (L, N)                bf16
+@flyc.kernel
+def grad_dense_partials_kernel(
+    PARTIALS: fx.Tensor,     # out    (n_groups * SPLIT * K, N)  fp32
+    JAGGED: fx.Tensor,       # jagged (L, K)                     bf16
+    DOUT: fx.Tensor,         # grad   (L, N)                     bf16
     SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
+):
+    # dDense[b][k,n] = sum_m Jagged[m,k] * dOut[m,n]. Split s reduces a strided
+    # subset of the group's BM-row tiles; each thread owns a (KPT, NPT) register
+    # block of the (K, N) output.
+    tid = fx.thread_idx.x
+    _, off_s, off_b = fx.block_idx
+    off_b = fx.Int32(off_b)
+    off_s = fx.Int32(off_s)
+    tk = tid // fx.Int32(DDENSE_TN)
+    tn = tid % fx.Int32(DDENSE_TN)
+
+    seq_rsrc = fx.buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
+    seq_start = fx.buffer_ops.buffer_load(seq_rsrc, off_b, vec_width=1, dtype=fx.T.i32())
+    seq_end = fx.buffer_ops.buffer_load(seq_rsrc, off_b + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
+    seq_start = fx.rocdl.readfirstlane(fx.T.i32(), seq_start)
+    seq_end = fx.rocdl.readfirstlane(fx.T.i32(), seq_end)
+    M_b = seq_end - seq_start
+
+    # Group-rebased buffers bounded to M_b rows: any local row >= M_b zero-fills
+    # (CDNA OOB-load == 0), so tail rows contribute 0 to the contraction.
+    j_rsrc = fx.buffer_ops.create_buffer_resource(
+        JAGGED,
+        max_size=False,
+        num_records_bytes=fx.Int64(fx.Int32(M_b) * fx.Int32(K) * fx.Int32(2)),
+        base_byte_offset=fx.Int32(seq_start) * fx.Int32(K) * fx.Int32(2),
+    )
+    d_rsrc = fx.buffer_ops.create_buffer_resource(
+        DOUT,
+        max_size=False,
+        num_records_bytes=fx.Int64(fx.Int32(M_b) * fx.Int32(N) * fx.Int32(2)),
+        base_byte_offset=fx.Int32(seq_start) * fx.Int32(N) * fx.Int32(2),
+    )
+
+    smem = fx.get_dyn_shared(fx.BFloat16)
+    sJ = fx.make_view(smem, fx.make_layout((DDENSE_BM, K), (K, 1)))
+    smem_d = fx.add_offset(smem, fx.make_int_tuple(DDENSE_BM * K))
+    sD = fx.make_view(smem_d, fx.make_layout((DDENSE_BM, N), (N, 1)))
+
+    acc = fx.make_rmem_tensor(fx.make_layout((KPT, NPT), (NPT, 1)), fx.Float32)
+    for ki in fx.range_constexpr(KPT):
+        for ni in fx.range_constexpr(NPT):
+            fx.memref_store(fx.Float32(0.0), acc, (ki, ni))
+
+    num_tiles = (M_b + fx.Int32(DDENSE_BM - 1)) // fx.Int32(DDENSE_BM)
+
+    for m_tile in range(off_s, num_tiles, fx.Int32(SPLIT)):
+        for i in fx.range_constexpr(_J_LDS_LOADS):
+            lin = tid + fx.Int32(i * DDENSE_THREADS)
+            lrow = lin // fx.Int32(K)
+            lcol = lin % fx.Int32(K)
+            joff = (m_tile * DDENSE_BM + lrow) * fx.Int32(K) + lcol
+            jval = fx.buffer_ops.buffer_load(j_rsrc, joff, vec_width=1, dtype=fx.T.bf16())
+            fx.memref_store(jval, sJ, (lrow, lcol))
+        for i in fx.range_constexpr(_D_LDS_LOADS):
+            lin = tid + fx.Int32(i * DDENSE_THREADS)
+            lrow = lin // fx.Int32(N)
+            lcol = lin % fx.Int32(N)
+            doff = (m_tile * DDENSE_BM + lrow) * fx.Int32(N) + lcol
+            dval = fx.buffer_ops.buffer_load(d_rsrc, doff, vec_width=1, dtype=fx.T.bf16())
+            fx.memref_store(dval, sD, (lrow, lcol))
+        fx.gpu.barrier()
+
+        a = [[fx.memref_load(acc, (ki, ni)) for ni in range(NPT)] for ki in range(KPT)]
+        for m in fx.range_constexpr(DDENSE_BM):
+            jv = [fx.memref_load(sJ, (m, tk * fx.Int32(KPT) + fx.Int32(ki))).to(fx.Float32) for ki in range(KPT)]
+            dv = [fx.memref_load(sD, (m, tn * fx.Int32(NPT) + fx.Int32(ni))).to(fx.Float32) for ni in range(NPT)]
+            for ki in fx.range_constexpr(KPT):
+                for ni in fx.range_constexpr(NPT):
+                    a[ki][ni] = a[ki][ni] + jv[ki] * dv[ni]
+        for ki in fx.range_constexpr(KPT):
+            for ni in fx.range_constexpr(NPT):
+                fx.memref_store(a[ki][ni], acc, (ki, ni))
+        fx.gpu.barrier()
+
+    part_rsrc = fx.buffer_ops.create_buffer_resource(PARTIALS, max_size=True)
+    base_part_row = (off_b * fx.Int32(SPLIT) + off_s) * fx.Int32(K)
+    for ki in fx.range_constexpr(KPT):
+        for ni in fx.range_constexpr(NPT):
+            row = base_part_row + tk * fx.Int32(KPT) + fx.Int32(ki)
+            off = row * fx.Int32(N) + tn * fx.Int32(NPT) + fx.Int32(ni)
+            fx.buffer_ops.buffer_store(fx.memref_load(acc, (ki, ni)), part_rsrc, off)
+
+
+@flyc.kernel
+def grad_dense_reduce_kernel(
+    DDENSE: fx.Tensor,    # out    (n_groups * K, N)          bf16
+    PARTIALS: fx.Tensor,  # in     (n_groups * SPLIT * K, N)  fp32
+):
+    # Sum this group's SPLIT fp32 (K, N) partials and write bf16 dDense[b]. Block
+    # (k-row, group); thread tid owns column n.
+    tid = fx.thread_idx.x
+    off_k = fx.Int32(fx.block_idx.x)
+    off_b = fx.Int32(fx.block_idx.y)
+
+    PART_buf = fx.rocdl.make_buffer_tensor(PARTIALS, max_size=True)
+    DD_buf = fx.rocdl.make_buffer_tensor(DDENSE, max_size=True)
+    copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    copy_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+
+    acc = fx.Float32(0.0)
+    for s in fx.range_constexpr(SPLIT):
+        part_row = (off_b * fx.Int32(SPLIT) + fx.Int32(s)) * fx.Int32(K) + off_k
+        row_div = fx.logical_divide(fx.slice(PART_buf, (part_row, None)), fx.make_layout(1, 1))
+        acc = acc + _load_scalar(copy_f32, fx.Float32, row_div, tid)
+
+    out_row = off_b * fx.Int32(K) + off_k
+    out_div = fx.logical_divide(fx.slice(DD_buf, (out_row, None)), fx.make_layout(1, 1))
+    _store_scalar(copy_bf16, fx.BFloat16, out_div, tid, acc.to(fx.BFloat16))
+
+
+@flyc.jit
+def grad_dense(
+    dDense: fx.Tensor,       # out    (n_groups * K, N)            bf16
+    JAGGED: fx.Tensor,       # jagged (L, K)                       bf16
+    dOut: fx.Tensor,         # grad   (L, N)                       bf16
+    SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
+    partials: fx.Tensor,     # fp32 scratch (n_groups * SPLIT * K, N)
     n_groups: int,
     max_seq_len: int,
-    partials: fx.Tensor = None,  # fp32 scratch (n_groups, split, K, N)
-    split: int = SPLIT,
     stream: fx.Stream = fx.Stream(None),
 ):
     """dDense[b] = Jagged[s:e, :].T @ dOut[s:e, :], per group.
@@ -354,4 +483,9 @@ def grad_dense(
     a partials pass accumulates fp32 (K, N) partials per (group, split) slot,
     then a reduce pass sums them into bf16 dDense.
     """
-    raise NotImplementedError("grad_dense kernels not yet implemented")
+    grad_dense_partials_kernel(partials, JAGGED, dOut, SEQ_OFFSETS).launch(
+        grid=(1, SPLIT, n_groups), block=(DDENSE_THREADS, 1, 1), smem=_DDENSE_SMEM_BYTES, stream=stream
+    )
+    grad_dense_reduce_kernel(dDense, partials).launch(
+        grid=(K, n_groups, 1), block=(N, 1, 1), stream=stream
+    )
