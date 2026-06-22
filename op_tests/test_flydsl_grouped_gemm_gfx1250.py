@@ -507,7 +507,7 @@ def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(layout, activation):
-    _sanity_check("a4w4", layout=layout, activation=activation, swiglu_limit=1.0)
+    run_moe("a4w4", layout=layout, activation=activation, swiglu_limit=1.0)
 
 
 # ---------------------------------------------------------------------------
