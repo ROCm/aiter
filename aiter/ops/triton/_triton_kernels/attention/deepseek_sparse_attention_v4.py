@@ -280,7 +280,7 @@ def sparse_mla_fwd_v4(q, kv, topk_indices, attn_sink=None, kv_lora_rank=512, sca
 # Backward — chunked_gather (only method ported to V4 for now)
 # =====================================================================
 def sparse_mla_bwd_v4(q, kv, o, do, topk_indices, lse, attn_sink=None,
-                      kv_lora_rank=512, scale=None):
+                      kv_lora_rank=512, scale=None, backend="triton"):
     """
     DeepSeek V4 sparse MLA backward (chunked_gather, atomic-free dKV).
 
@@ -300,12 +300,26 @@ def sparse_mla_bwd_v4(q, kv, o, do, topk_indices, lse, attn_sink=None,
         attn_sink:     [H] fp32 or None — must match what fwd was called with
         kv_lora_rank:  int, default 512
         scale:         float, default 1/sqrt(d_qk)
+        backend:       "triton" (default) or "gluon". "gluon" routes dQ and
+                       dKV-intermediate to hardware-controlled Gluon kernels
+                       (gfx950 / CDNA4 only; ~1.3-1.4x faster end-to-end). gather
+                       and preprocess stay Triton. Falls back to "triton" elsewhere.
 
     Returns:
         dq:     [T, H, d_qk] same dtype as q
         dkv:    [T, 1, d_qk] same dtype as kv
         d_sink: [H] fp32, or None if attn_sink was None
     """
+    if backend == "gluon":
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.dsa_bwd_v4_gluon import (
+            sparse_mla_bwd_v4_gluon,
+        )
+        return sparse_mla_bwd_v4_gluon(
+            q, kv, o, do, topk_indices, lse, attn_sink=attn_sink,
+            kv_lora_rank=kv_lora_rank, scale=scale,
+        )
+    assert backend == "triton", f"unknown backend {backend!r}"
+
     import torch as _torch  # local alias for clarity inside the wrapper
     assert q.is_contiguous()
     assert kv.is_contiguous()
