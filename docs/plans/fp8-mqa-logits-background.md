@@ -282,7 +282,7 @@ Example (`d_model=4096, H=32, d_head=128, L=1000`): you effectively compute **32
 
 During generation, tokens are produced one at a time. Re-computing K and V for *all*
 previous tokens at every step would be wasteful, so they are stored in a **KV cache**. Each
-new step:
+new token generation step:
 
 1. computes the new token's Q, K, V (one row each),
 2. **appends** the new K, V to the cache,
@@ -359,6 +359,42 @@ for each tile of queries Qi  (kept in SRAM):
 
 > *References: Dao et al., 2022 (FlashAttention); Dao, 2023 (FlashAttention-2).*
 
+#### Softmax vs. online softmax
+
+Standard softmax over a row of scores `s = [s₁, …, sₙ]` requires **two passes**: one to find
+the maximum (for numerical stability) and one to compute the exponentials and their sum:
+
+```
+m = max(s)
+p_i = exp(s_i - m)          # shift by max for stability
+softmax_i = p_i / sum(p)
+```
+
+This means you must see **all scores before writing any output** — impossible inside a tile
+loop where you process one block of keys at a time and want to avoid buffering the whole row.
+
+**Online softmax** (Milakov & Gimelshein, 2018) fuses both passes into one by maintaining
+a pair of running statistics `(m, ℓ)` — the running max and the running sum of shifted
+exponentials — and *correcting* the accumulator each time the max increases:
+
+```
+# process tile j of keys/values:
+m_new = max(m_old, max(s_j))
+ℓ_new = exp(m_old - m_new) * ℓ_old + exp(s_j - m_new)
+o_new = exp(m_old - m_new) * o_old + exp(s_j - m_new) · Vⱼ
+```
+
+The correction factor `exp(m_old − m_new)` rescales everything seen so far whenever a new,
+larger maximum is found. At the end, dividing by `ℓ` recovers the exact softmax — no
+buffering of the full score row needed. This is what allows FlashAttention to tile the KV
+dimension and keep the `[L, L]` score matrix off HBM entirely.
+
+> **Note for our kernel:** the FP8 MQA logits kernel does *not* compute a softmax —
+> it outputs raw logits for each `(query, KV position)` pair and the downstream top-k
+> selector consumes them. Online softmax is shown here because it is the key technique
+> that makes IO-aware attention kernels like FlashAttention work, and understanding it
+> is essential background for reading attention kernel literature.
+
 The relevance here is **structural**: our kernel follows the same playbook — tile the KV
 dimension (`BLOCK_KV`), keep partial results in registers/LDS, and stream the FP8 keys from
 memory once. We are writing a small, specialized attention-style kernel, so the same
@@ -372,6 +408,120 @@ per-head K/V on the fly via learned up-projection matrices (a decoupled RoPE com
 carries position). So the cache stores, say, a `[L, 512]` latent instead of a
 `[L, H·d_head]` = `[L, 16384]` K/V — a large reduction — while keeping quality close to MHA.
 DeepSeek-V3 scales this up (671B-param Mixture-of-Experts, trained in FP8).
+
+#### How the full K/V is recovered from the latent
+
+**Standard MHA** caches the full per-head K and V for every token:
+
+```
+K = X · W_K   →  [L, H·d_head]   (cached per layer)
+V = X · W_V   →  [L, H·d_head]   (cached per layer)
+```
+
+**MLA** instead learns a *down-projection* `W_DKV : [d_model, d_c]` with `d_c << H·d_head`
+and caches only the latent:
+
+```
+c = X · W_DKV   →  [L, d_c]      (cached — much smaller)
+```
+
+At query time two learned *up-projection* matrices reconstruct the full K and V on the fly:
+
+```
+K_content = c · W_UK   →  [L, H·d_head]
+V         = c · W_UV   →  [L, H·d_head]
+```
+
+`W_UK` and `W_UV` are fixed after training, so the up-projection is a cheap matmul. The
+compression ratio is `d_c / (H·d_head)` — with `d_c = 512` and `H·d_head = 128·128 = 16384`
+that is roughly **32× smaller** cache.
+
+#### The RoPE wrinkle — why there is a separate small key stream
+
+Standard **RoPE** (Rotary Position Embedding) rotates K by the *querying* token's relative
+position. This rotation changes per query, so it cannot be baked into the cached latent `c`
+before caching — the latent would need to be un-rotated differently for every future query that
+attends to it.
+
+MLA's solution is a **decoupled RoPE** stream. A separate small projection
+`W_KR : [d_model, d_head_R]` produces a narrow key `k_R` that *does* get RoPE-rotated and is
+cached alongside `c`. The final key used in attention concatenates both parts:
+
+```
+K = [ K_content | RoPE(k_R) ]
+```
+
+The `|` is a **column-wise (feature-axis) concatenation** — the two matrices are placed side by
+side along the last dimension (`torch.cat([K_content, RoPE(k_R)], dim=-1)`), no arithmetic.
+With DeepSeek-V2 concrete values:
+
+| Tensor | Shape | Notes |
+|--------|-------|-------|
+| `K_content = c · W_UK` | `[L, H·d_head]` = `[L, 16384]` | per-head content keys |
+| `RoPE(k_R)` | `[L, d_head_R]` = `[L, 64]` | positional key — small and **shared across all heads** |
+| `K = [K_content \| RoPE(k_R)]` | `[L, H·d_head + d_head_R]` = `[L, 16448]` | full key, left and right slices |
+
+#### Does `d_head` have to shrink to accommodate the RoPE tail?
+
+In principle, if you wanted to keep the total per-head key dimension (and therefore the
+`Q·K^T` compute cost) identical to standard MHA, you would set `d_h^K = d_head − d_head_R`
+to make room for the RoPE tail — and yes, the content head dim would then be smaller.
+In practice **DeepSeek-V2 does not do this.** They keep `d_h^K = 128` (same as a standard
+`d_head`) and accept a slightly wider key:
+
+```
+per-head key dim in MHA :  d_head           = 128
+per-head key dim in MLA :  d_h^K + d_head_R = 128 + 64 = 192
+```
+
+The extra width is an acceptable trade-off because the primary win in MLA is **cache
+compression** (storing latent `c` of dim 512 instead of full K/V of dim `H·d_head = 16384`),
+not reducing per-head dot-product cost. Keeping `d_h^K = d_head` preserves full content
+resolution without meaningfully affecting compute.
+
+The query `Q` has the same two-part split (`Q_content`, `Q_R`), so the dot product decomposes
+into two independent, width-matched terms:
+
+```
+score[h] = Q_content[h] · K_content[h]^T  +  Q_R[h] · RoPE(k_R)^T
+```
+
+So the cache stores `(c, k_R)` per token: `c` carries position-independent content, `k_R`
+carries positional information. `V` needs no positional treatment and comes purely from `c`.
+
+```
+Prefill / each new token:
+  X  ──W_DKV──▶  c       (d_c wide)       ──┐ cached
+  X  ──W_KR──▶   k_R     (d_head_R wide)  ──┘
+
+Query time:
+  c   ──W_UK──▶  K_content ──┐
+  k_R ──RoPE──▶  k_R_rotated ┘ concat → K  ──▶ attention
+  c   ──W_UV──▶  V                          ──▶ attention
+```
+
+#### K vs K_content — and why K_content is often never materialized
+
+`K_content` and `K` are **not the same tensor**:
+
+- `K_content = c · W_UK` — the *content* (position-independent) portion, shape `[L, H·d_head]`.
+- `K = [K_content | RoPE(k_R)]` — the *full* key used in attention, the column-wise concatenation
+  of the content part and the positional part. `K_content` is the left slice of `K`; `K` is
+  never stored anywhere.
+
+In practice `K_content` is often **never materialized** at all. Because `K_content = c · W_UK`,
+the attention score over the content part factors as:
+
+```
+Q_content · K_content^T  =  Q_content · (c · W_UK)^T
+                          =  (Q_content · W_UK^T) · c^T
+```
+
+`W_UK` can be **absorbed into the query projection** (fold `W_UK^T` into the `W_Q` weight), so
+the content-part attention is computed directly against the small cached `c` — skipping the
+`d_c → H·d_head` up-projection entirely. This is a key practical optimization in MLA
+implementations: the cache stores `c` and `k_R`; the full `K` (and `K_content`) are logical
+concepts, not tensors that ever live in memory.
 
 > *References: DeepSeek-V2 (2024); DeepSeek-V3 Technical Report (2024/2025).*
 
@@ -543,6 +693,11 @@ ReLU          : [ 6.0,  0.0 ]
 The window `[cu_starts[m], cu_ends[m])` is more general than a causal triangle, and the test
 data (`test_fp8_mqa_logits.py`) shows it carries **two** distinct meanings:
 
+> **Indexing convention.** KV positions are numbered **0 to `seq_len_kv − 1`** (0-based).
+> The window `[start, end)` is **half-open**: `start` is inclusive, `end` is exclusive — so
+> the window covers positions `start, start+1, …, end−1` and key at index `end` is *not*
+> included.
+
 **(a) Causal masking — the common case.** With no context parallelism, the test sets
 
 ```
@@ -550,10 +705,13 @@ cu_starts[m] = 0
 cu_ends[m]   = m + (seq_len_kv - seq_len)
 ```
 
-Each query `m` may see every key from position 0 up to its own (offset) position. When
-`seq_len_kv == seq_len` this is exactly the standard causal mask `end = m + 1` from §1.2. The
-offset `seq_len_kv - seq_len` handles the decoding case where the KV cache already holds some
-prefix tokens that *every* query is allowed to see.
+Each query `m` may see every key from position 0 up to (but not including) `end`. When
+`seq_len_kv == seq_len`, `end = m`, so query `m` sees keys `[0, m)` — it **cannot attend to
+itself** (key `m` is excluded). This is a strictly *past-only* causal mask. (Some formulations
+use `end = m + 1` to include self-attention; this kernel uses `end = m`.) The offset
+`seq_len_kv − seq_len` handles the decoding case where the KV cache already holds some prefix
+tokens that *every* query is allowed to see: query `m` then sees `[0, m + prefix_len)`,
+gaining full access to the prefix plus the `m` earlier tokens in the current batch.
 
 **(b) Context-parallel (CP) KV sharding — why it is a `[start, end)` *window*, not just an
 `end`.** In context parallelism the KV sequence is split across several devices ("CP ranks"),
