@@ -324,18 +324,57 @@ def build_flash_attn_fp8_module(
                 lds_idx = fx.Index(lds_off) + row * K_STRIDE + swz_col
                 Vec(_pass_chunk(vec, p)).store(lds, [lds_idx])
 
+        def _v_kv_slot(row):
+            # Permute the kv (row) on the V store so the canonical contiguous V
+            # read (read_v_pack, kv = hi*32 + v_a) yields V in the GEMM1 C-layout
+            # kv order -- matching the un-reshaped P B-operand (S->P with no
+            # hi-peer shuffle).  Mirrors the asm kernel, which absorbs the kv
+            # permutation in the V LDS store rather than reshaping P in registers.
+            #
+            # GEMM1 C-layout maps value r (0..15) of subtile to
+            #   kv_in_subtile = hi*4 + (r%4) + 8*(r//4) = 8*g + hi*4 + j
+            # (g = r//4, j = r%4).  The read slot for the matching B-byte
+            #   v_a = sub_local*16 + 4*g + j  is  hi*32 + ks*64 + v_a.
+            # So a globally-stored kv row decodes as:
+            #   row = ks*64 + sub_local*32 + 8*g + hi*4 + j
+            # and must land at slot = hi*32 + ks*64 + sub_local*16 + 4*g + j.
+            ks = row // fx.Index(64)
+            w64 = row % fx.Index(64)
+            sub_local = w64 // fx.Index(32)
+            w32 = w64 % fx.Index(32)
+            g = w32 // fx.Index(8)
+            r8 = w32 % fx.Index(8)
+            hi_v = r8 // fx.Index(4)
+            j = r8 % fx.Index(4)
+            return (
+                hi_v * fx.Index(32)
+                + ks * fx.Index(64)
+                + sub_local * fx.Index(16)
+                + g * fx.Index(4)
+                + j
+            )
+
+        # Per-pass V store base = d_block*STRIDE + slot*16.  Both d_block and slot
+        # depend only on tid (load_row/load_col), so this is loop-invariant -- hoist
+        # it OUT of the per-iteration prologue (mirrors the asm, which precomputes
+        # all addresses once and only increments in-loop).  Recomputing the
+        # _v_kv_slot div/mod chain every iteration was inflating in-loop pressure.
+        _v_d_block = load_col // fx.Index(16)
+        v_store_bases = [
+            _v_d_block * fx.Index(V_DBLOCK_STRIDE)
+            + _v_kv_slot(load_row + fx.Index(p * ROWS_PER_PASS)) * fx.Index(V_KV_STRIDE)
+            for p in range_constexpr(N_LOAD_PASSES)
+        ]
+
         def store_v_lds_dblocked(vec, lds_off):
             # Step 2: store the lane's 16 contiguous d-values (one kv row) as a
             # single 16-byte vector into the d-block layout
-            #   Vlds[d_block][kv][d_in] : d_block = load_col//16, kv = row.
-            d_block = load_col // fx.Index(16)
+            #   Vlds[d_block][slot][d_in] : d_block = load_col//16,
+            #   slot = _v_kv_slot(row) (kv permuted into C-layout order).
+            # Only the rotating buffer offset (lds_off) varies per iteration; the
+            # per-pass base is precomputed above.
             for p in range_constexpr(N_LOAD_PASSES):
-                row = load_row + fx.Index(p * ROWS_PER_PASS)
-                v_idx = (
-                    fx.Index(lds_off)
-                    + d_block * fx.Index(V_DBLOCK_STRIDE)
-                    + row * fx.Index(V_KV_STRIDE)
-                )
+                v_idx = fx.Index(lds_off) + v_store_bases[p]
                 Vec(_pass_chunk(vec, p)).store(lds, [v_idx])
 
         # ---- Preload Q packs (register resident) for this wave ----
@@ -498,29 +537,17 @@ def build_flash_attn_fp8_module(
                 ]
                 for nt in range_constexpr(N_KV_TILES)
             ]
-            peerword = [
-                [
-                    fx.Int32(myword[nt][rg]).shuffle_xor(
-                        fx.Int32(32), fx.Int32(WARP_SIZE)
-                    )
-                    for rg in range_constexpr(n_groups)
-                ]
+            # P stays in the GEMM1 C-layout: each lane packs ONLY its own 16
+            # C-values per subtile -- no hi-peer shuffle_xor.  The kv permutation
+            # (C-layout order vs canonical hi*32+v) is absorbed by the V LDS store
+            # (store_v_lds_dblocked) so the PV MMA still contracts correctly.
+            # p_pack is flat nt-major: K-step ks reads dwords [ks*8, ks*8+8) =
+            # subtiles 2ks, 2ks+1.
+            p_words = [
+                myword[nt][rg]
                 for nt in range_constexpr(N_KV_TILES)
+                for rg in range_constexpr(n_groups)
             ]
-            hi_is0 = hi < fx.Index(1)
-            p_words = []
-            for ks in range_constexpr(PV_K_STEPS):
-                for w in range_constexpr(8):
-                    rg = w // 2
-                    if const_expr(w % 2 == 0):
-                        sel = ArithValue(hi_is0).select(
-                            _raw(myword[2 * ks + 0][rg]), _raw(peerword[2 * ks + 1][rg])
-                        )
-                    else:
-                        sel = ArithValue(hi_is0).select(
-                            _raw(peerword[2 * ks + 0][rg]), _raw(myword[2 * ks + 1][rg])
-                        )
-                    p_words.append(fx.Int32(sel))
             return m_new, corr, Vec.from_elements(p_words, fx.Int32)
 
         # ---- Shared init values (computed by all 512 lanes before the split) --
