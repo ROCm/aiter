@@ -317,6 +317,26 @@
         "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_gemm/gen_instances.py --working_path {{0}} --tune_files {AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv:{AITER_ROOT_DIR}/aiter/configs/model_configs/*_bf16_tuned_gemm.csv --compiled_kids_sidecar={{0}}/../../compiled_kids_opus.json'"
     },
+    "module_opus_conv2d": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/opus_conv2d_implicit_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/opus_gemm/opus_conv2d_implicit.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-mllvm --amdgpu-mfma-vgpr-form'"
+        ],
+        "flags_extra_hip_per_source": {},
+        "md_name": "'module_opus_conv2d'",
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/opus_gemm/include'",
+            "f'{AITER_CSRC_DIR}/opus_gemm/include/gfx942'"
+        ],
+        "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False"
+    },
     "module_gemm_a8w8_bpreshuffle_cktile": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_cktile_pybind.cu'",
