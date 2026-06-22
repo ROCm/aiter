@@ -2215,7 +2215,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       const int64_t head_size = kv_lora_dim + pe_dim;
       int64_t size = num_heads * kv_lora_dim;
       static constexpr int32_t q_ooba_o = 4 / sizeof(query_t);
-      const int32_t q_oob_i             = (size + ooba_i - 1) / ooba_i * ooba_i;
+      const int64_t q_input_span        = (num_heads - 1) * static_cast<int64_t>(q_nope_stride_1) + kv_lora_dim;
+      const int64_t q_oob_i             = (q_input_span + ooba_i - 1) / ooba_i * ooba_i;
       const int32_t q_oob_o             = (num_heads * head_size + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
       auto const* q_ptr_i               = reinterpret_cast<scalar_t const*>(q_nope + token_idx * q_nope_stride_0);
 
@@ -2224,12 +2225,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       auto q_buffer_i = opus::make_gmem<scalar_t>(q_ptr_i, q_oob_i * sizeof(scalar_t));
       auto q_buffer_o = opus::make_gmem<query_t>(q_ptr_o, q_oob_o * sizeof(query_t));
       const int32_t num_vecs       = (size + vec_size_i - 1) / vec_size_i;
-      size_t q_vec_idx    = threadIdx.x;
       using opus_vec_q = opus::vector_t<query_t, vec_size_o>;
-      opus_vec_i vec_nxt;  // Changed from vec_i to opus_vec_i
-      opus_vec_i vec_cur;  // Changed from vec_i to opus_vec_i
-      size_t kv_lora_vec = kv_lora_dim / vec_size_o;
-      vec_cur = q_buffer_i.template load<vec_size_i>(q_vec_idx * vec_size_i);
+      const size_t kv_lora_vec = kv_lora_dim / vec_size_o;
       
       // Load and store k vector (only threads < k_num_vecs need to work)
       if (vec_idx < k_num_vecs)
@@ -2249,21 +2246,31 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       const scalar_t *cos_ptr = cos_cache + cos_sin_cache_offset;
       const scalar_t *sin_ptr = sin_cache + cos_sin_cache_offset;
 
-      const int embed_dim = 32;
+      for (size_t q_vec_idx = threadIdx.x; q_vec_idx < num_vecs; q_vec_idx += vec_stride)
+      {
+          const size_t head_idx = q_vec_idx / kv_lora_vec;
+          const size_t vec_dst_idx = q_vec_idx % kv_lora_vec;
+          const size_t q_load_offset = head_idx * q_nope_stride_1 + vec_dst_idx * vec_size_i;
+          const size_t q_store_offset = (head_idx * q_out_stride_1) + vec_dst_idx * vec_size_o + nope_offset;
+          opus_vec_i q_vec = q_buffer_i.template load<vec_size_i>(q_load_offset);
+          if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
+              q_buffer_o.template store<vec_size_o, opus_vec_q>(q_vec, q_store_offset);
+          } else {
+              opus_vec_q vec_q_converted = aiter::scaled_cast<query_t>(q_vec, inverted_qscale);
+              q_buffer_o.template store<vec_size_o, opus_vec_q>(vec_q_converted, q_store_offset);
+          }
+      }
 
+      const int embed_dim = 32;
       const int nq = num_heads * embed_dim;
       if constexpr (is_nope_first)
       {
         q_out += head_size - pe_dim;
       }
-      for (; q_vec_idx < nq; q_vec_idx += vec_stride)
+      for (int q_rot_idx = threadIdx.x; q_rot_idx < nq; q_rot_idx += vec_stride)
       {
-          vec_nxt = q_buffer_i.template load<vec_size_i>((q_vec_idx + vec_stride) * vec_size_i);
-          size_t cur_idx = q_vec_idx;
-          size_t head_idx = cur_idx / kv_lora_vec;
-          size_t vec_dst_idx = cur_idx % kv_lora_vec;
-          const int rot_offset = cur_idx % 32;//embed_dim;
-          // to opt -> vec
+          const int r_head_idx = q_rot_idx / embed_dim;
+          const int rot_offset = q_rot_idx % embed_dim;
           int x_index, y_index;
           scalar_t cos, sin;
           // GPT-NeoX style rotary embedding.
@@ -2284,19 +2291,11 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
             sin = *(sin_ptr + x_index / 2);
           }
 
-          const int r_head_idx = q_vec_idx / 32;//embed_dim;
           const int64_t token_head_in = token_idx * q_pe_stride_0 + r_head_idx * q_pe_stride_1;
           const scalar_t* q_pe_in = q_pe + token_head_in;
           const scalar_t x = q_pe_in[x_index];
           const scalar_t y = q_pe_in[y_index];
 
-          if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-              q_buffer_o.template store<vec_size_o, opus_vec_q>(vec_cur, (head_idx * q_out_stride_1) + vec_dst_idx * vec_size_o + nope_offset);
-          } else {
-              opus_vec_q vec_q_converted = aiter::scaled_cast<query_t>(vec_cur, inverted_qscale);
-              q_buffer_o.template store<vec_size_o, opus_vec_q>(vec_q_converted, (head_idx * q_out_stride_1) + vec_dst_idx * vec_size_o + nope_offset);
-          }
-          vec_cur = vec_nxt;
           const int64_t token_head = token_idx * q_out_stride_0 + r_head_idx * q_out_stride_1;
           query_t* q_out_rope = q_out + token_head;
           float f32_x = static_cast<float>(x);
@@ -2311,31 +2310,6 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
           } else {
               q_out_rope[x_index] = static_cast<query_t>(f32_x * f32_cos - f32_y * f32_sin);
               q_out_rope[y_index] = static_cast<query_t>(f32_y * f32_cos + f32_x * f32_sin);
-          }
-      }
-
-      for (q_vec_idx += vec_stride; q_vec_idx < num_vecs; q_vec_idx += vec_stride)
-      {
-          vec_nxt = q_buffer_i.template load<vec_size_i>(q_vec_idx * vec_size_i);
-          size_t head_idx = (q_vec_idx - vec_stride)  / kv_lora_vec;
-          size_t vec_dst_idx = (q_vec_idx - vec_stride) % kv_lora_vec;
-          if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-              q_buffer_o.template store<vec_size_o, opus_vec_q>(vec_cur, (head_idx * q_out_stride_1) + vec_dst_idx * vec_size_o + nope_offset);
-          } else {
-              opus_vec_q vec_q_converted = aiter::scaled_cast<query_t>(vec_cur, inverted_qscale);
-              q_buffer_o.template store<vec_size_o, opus_vec_q>(vec_q_converted, (head_idx * q_out_stride_1) + vec_dst_idx * vec_size_o + nope_offset);
-          }
-          vec_cur = vec_nxt;
-      }
-      if (q_vec_idx - vec_stride < num_vecs)
-      {
-          size_t head_idx = (q_vec_idx - vec_stride) / kv_lora_vec;
-          size_t vec_dst_idx = (q_vec_idx - vec_stride) % kv_lora_vec;
-          if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
-              q_buffer_o.template store<vec_size_o, opus_vec_q>(vec_cur, (head_idx * q_out_stride_1) + vec_dst_idx * vec_size_o + nope_offset);
-          } else {
-              opus_vec_q vec_q_converted = aiter::scaled_cast<query_t>(vec_cur, inverted_qscale);
-              q_buffer_o.template store<vec_size_o, opus_vec_q>(vec_q_converted, (head_idx * q_out_stride_1) + vec_dst_idx * vec_size_o + nope_offset);
           }
       }
     // apply rotary
