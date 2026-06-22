@@ -60,6 +60,80 @@ class kernelInstance:
             ]
         )
 
+@dataclass
+class tileKernelInstance:
+    M_Tile: int
+    N_Tile: int
+    K_Tile: int
+    M_Warp: int
+    N_Warp: int
+    K_Warp: int
+    M_Warp_Tile: int
+    N_Warp_Tile: int
+    K_Warp_Tile: int
+
+    Scheduler: str  # Default, Intrawave, Interwave
+
+    TiledMMAPermuteN: bool
+    TransposeC: bool
+    UsePersistentKernel: bool
+
+    BlockPerCu: int  # 1..BLOCK_PER_CU_MAX
+
+    # When True, 8-warp kernels read x_scale in row-major layout natively,
+    # skipping the host-side transpose.
+    AQRowMajor: bool = False
+
+    @property
+    def is_eight_warp(self) -> bool:
+        return self.M_Warp * self.N_Warp * self.K_Warp == 8 and self.K_Warp_Tile == 128
+
+    @property
+    def name(self) -> str:
+        """
+        Generate a unique name for the kernel instance based on its parameters.
+        """
+
+        parts = [
+            "a8w8_cktile",
+            ("x").join(
+                map(
+                    lambda x: str(x),
+                    [self.M_Tile, self.N_Tile, self.K_Tile],
+                )
+            ),
+            ("x").join(
+                map(
+                    lambda x: str(x),
+                    [self.M_Warp, self.N_Warp, self.K_Warp],
+                )
+            ),
+            ("x").join(
+                map(
+                    lambda x: str(x),
+                    [self.M_Warp_Tile, self.N_Warp_Tile, self.K_Warp_Tile],
+                )
+            ),
+            self.Scheduler.lower(),
+            ("x").join(
+                map(
+                    lambda x: str(int(x)),
+                    [
+                        self.TiledMMAPermuteN,
+                        self.TransposeC,
+                        self.UsePersistentKernel,
+                    ],
+                )
+            ),
+            str(self.BlockPerCu),
+        ]
+        if self.AQRowMajor:
+            parts.append("aqrm")
+        return "_".join(parts)
+
+
+BLOCK_PER_CU_MAX = 4
+
 
 # fmt: off
 kernels_list = {
@@ -101,6 +175,16 @@ default_kernels_dict = {
 }
 # fmt: on
 
+kernels_list_cktile = {
+    ######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
+    0:  tileKernelInstance(   128,     128,      128,     1,        4,       1,        32,            32,           128,      "Intrawave",        False,             True,           False,             1      ),
+
+}
+
+default_kernels_dict_cktile = {
+    #########################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
+    (-1):  tileKernelInstance(   128,     128,      128,     1,        4,       1,        32,            32,           128,      "Intrawave",        False,             True,           False,             1      ),
+}
 
 # Name-keyed reverse lookup so codegen can filter the tuned CSV by kernelName,
 # matching what the C++ runtime dispatcher uses.

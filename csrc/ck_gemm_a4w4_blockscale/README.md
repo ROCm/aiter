@@ -11,8 +11,9 @@
 
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build gemm_a4w4_blockscale_tune via jit:
-`GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH=/work/llvm-project/build/bin/ python3 csrc/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale_tune.py -i aiter/configs/a4w4_blockscale_untuned_gemm.csv -o aiter/configs/a4w4_blockscale_tuned_gemm.csv`
-You can find the results of the tuning in `aiter/configs/a4w4_blockscale_tuned_gemm.csv`, like this:
+`GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH=/work/llvm-project/build/bin/ python3 csrc/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale_tune.py -i aiter/configs/a4w4_blockscale_untuned_gemm.csv -o aiter/configs/a4w4_blockscale_tuned_gemm.csv --libtype all`
+You can find the results of the tuning in `aiter/configs/a4w4_blockscale_tuned_gemm.csv`:
+libtype can be `asm`, `ck`, `cktile` or `both`. We recommend to tune together by setting `--libtype all` to use all available backend implementations, then choose the best one, this will take more time but help to get better performance. You can find the results of the tuning in `aiter/configs/a8w8_tuned_gemm.csv`, like this:
     |**gfx**  |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
     |---------|----------|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
     |gfx942   |80        |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |

@@ -237,11 +237,41 @@ def gemm_a4w4_blockscale(
 
 
 @compile_ops(
+    "module_gemm_a4w4_blockscale_cktile", gen_fake=gen_gemm_a4w4_blockscale_fake_tensors
+)
+def gemm_a4w4_blockscale_cktile(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    splitK: int = 0,
+    kernelName: str = "",
+) -> Tensor: ...
+
+
+@compile_ops(
     "module_gemm_a4w4_blockscale_tune",
     fc_name="gemm_a4w4_blockscale_tune",
     gen_fake=gen_gemm_a4w4_blockscale_fake_tensors,
 )
 def gemm_a4w4_blockscale_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int,
+    splitK: int = 0,
+) -> Tensor: ...
+
+
+@compile_ops(
+    "module_gemm_a4w4_blockscale_cktile_tune",
+    fc_name="gemm_a4w4_blockscale_cktile_tune",
+    gen_fake=gen_gemm_a4w4_blockscale_fake_tensors,
+)
+def gemm_a4w4_blockscale_cktile_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
