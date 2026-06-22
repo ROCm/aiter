@@ -6,7 +6,6 @@ for the HND and 5D-SHUFFLE (asm) paged layouts, bf16 + fp16, with -1 padding.
 Runs the HIP kernel on the live GPU (incl. gfx1201 RDNA4)."""
 
 import torch
-import aiter
 import aiter.ops.cache as cache
 
 
