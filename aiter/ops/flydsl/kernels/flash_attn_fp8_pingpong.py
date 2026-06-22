@@ -144,16 +144,30 @@ def build_flash_attn_fp8_module(
     # giving exactly V[kv, d] for the A fragment.  4 reads (kc=0..3) per d-tile.
     K_STRIDE = HEAD_DIM
     V_KV_STRIDE = 16  # bytes per kv within a 16-wide d block
-    V_DBLOCK_STRIDE = BLOCK_N * V_KV_STRIDE
     N_DBLOCKS = HEAD_DIM // 16  # 8
+    # ---- LDS bank-conflict padding (asm-style, mi350_fmha_hd128_fp8) ----
+    # The asm kernel breaks LDS bank conflicts with PADDED strides rather than an
+    # XOR swizzle: its fundamental unit is 0x410 = 1024 data + 16 pad bytes.  The
+    # +16 (= 4 dwords) shifts successive units across the 32 LDS banks so the
+    # cooperative DMA write stays contiguous within a unit while the strided read
+    # is conflict-reduced.  We mirror that here:
+    #   K: pad every 8-kv-row unit (1024 data B, one wave's per-pass DMA chunk).
+    #   V: pad every 16-wide d-block (2048 data B).
+    PAD_K = 16
+    PAD_V = 16
+    K_UNIT_ROWS = 8  # one wave writes 8 contiguous kv rows per DMA pass
+    K_DATA = BLOCK_N * K_STRIDE  # 16384 unpadded K tile bytes
+    K_UNIT_STRIDE = K_UNIT_ROWS * K_STRIDE + PAD_K  # 1040
+    N_K_UNITS = BLOCK_N // K_UNIT_ROWS  # 16
+    V_DBLOCK_STRIDE = BLOCK_N * V_KV_STRIDE + PAD_V  # 2064 (padded)
     # DMA global->LDS pipeline (spec 8wave_fp8_zhuo): K^i is read only within
     # iteration i, so K double-buffers (i%2); V^i is read in iteration i+1
     # (deferred PV), so its buffer must survive V^{i-1} (read this iter) + V^i +
     # V^{i+1} (DMA'd this iter) -> V triple-buffers (i%3).
     NUM_BUF_K = 2
     NUM_BUF_V = 3
-    LDS_K_TILE = BLOCK_N * K_STRIDE
-    LDS_V_TILE = N_DBLOCKS * V_DBLOCK_STRIDE  # == HEAD_DIM * BLOCK_N
+    LDS_K_TILE = N_K_UNITS * K_UNIT_STRIDE  # 16640 (padded)
+    LDS_V_TILE = N_DBLOCKS * V_DBLOCK_STRIDE  # 16512 (padded)
     LDS_K_SIZE = NUM_BUF_K * LDS_K_TILE
     LDS_V_SIZE = NUM_BUF_V * LDS_V_TILE
     LDS_K_OFF = 0
@@ -279,9 +293,8 @@ def build_flash_attn_fp8_module(
         # ===================================================================
         DMA_BYTES = 16
         DMA_LANES = (NUM_WAVES // 2) * WARP_SIZE  # 256 (one 4-wave group)
-        DMA_PASSES = LDS_K_TILE // (DMA_LANES * DMA_BYTES)  # 4
-        WAVE_DMA_STRIDE = WARP_SIZE * DMA_BYTES  # 1024: per-wave LDS span/pass
-        PASS_DMA_STRIDE = DMA_LANES * DMA_BYTES  # 4096: per-pass LDS span
+        DMA_PASSES = K_DATA // (DMA_LANES * DMA_BYTES)  # 4 (unpadded data size)
+        WAVE_DMA_STRIDE = WARP_SIZE * DMA_BYTES  # 1024: one wave's 64-cell span
 
         # Per-(batch,head) buffer resources based at token 0, so the per-lane
         # voffset is just kv_abs*STRIDE_TOKEN + col (bytes; fp8 == 1 B/elem).
@@ -330,11 +343,12 @@ def build_flash_attn_fp8_module(
                 in_b = kv_abs < seq_len_v
                 kv_safe = fx.Index(ArithValue(in_b).select(kv_abs, fx.Index(0)))
                 voff = kv_safe * fx.Index(STRIDE_TOKEN) + d
+                # One wave-pass writes 8 contiguous kv rows == one padded K unit;
+                # unit index = p*4 + lwave.  HW adds lane*16 within the 1024B data.
                 lds_byte = (
                     fx.Index(lds_offset)
                     + k_buf_off
-                    + fx.Index(p * PASS_DMA_STRIDE)
-                    + lwave * fx.Index(WAVE_DMA_STRIDE)
+                    + (fx.Index(p * (NUM_WAVES // 2)) + lwave) * fx.Index(K_UNIT_STRIDE)
                 )
                 _dma_issue(k_rsrc, lds_byte, voff)
 
@@ -351,11 +365,15 @@ def build_flash_attn_fp8_module(
                 in_b = kv_abs < seq_len_v
                 kv_safe = fx.Index(ArithValue(in_b).select(kv_abs, fx.Index(0)))
                 voff = kv_safe * fx.Index(STRIDE_TOKEN) + d_block * fx.Index(16)
+                # Each wave-pass writes a 64-kv half of one d-block.  The d-block
+                # data span (2048B) is padded to V_DBLOCK_STRIDE; HW adds lane*16
+                # within the chosen 64-kv (1024B) half.
+                half = wave_id % fx.Index(2)
                 lds_byte = (
                     fx.Index(lds_offset)
                     + v_buf_off
-                    + fx.Index(p * PASS_DMA_STRIDE)
-                    + wave_id * fx.Index(WAVE_DMA_STRIDE)
+                    + d_block * fx.Index(V_DBLOCK_STRIDE)
+                    + half * fx.Index(WAVE_DMA_STRIDE)
                 )
                 _dma_issue(v_rsrc, lds_byte, voff)
 
@@ -453,18 +471,23 @@ def build_flash_attn_fp8_module(
                 for ks in range_constexpr(K_STEPS):
                     kv_row = lo + fx.Index(nt * 32)
                     d_base = fx.Index(ks * MFMA_K) + hi * 32
+                    # Padded K LDS: each 8-kv-row unit is K_UNIT_STRIDE apart, so
+                    # the row offset is kv_row*K_STRIDE + (kv_row//8)*PAD_K.
+                    row_off = kv_row * K_STRIDE + (
+                        kv_row // fx.Index(K_UNIT_ROWS)
+                    ) * fx.Index(PAD_K)
                     blk_lo = Vec(
                         Vec.load(
                             v_i8x16,
                             lds,
-                            [k_buf_off + kv_row * K_STRIDE + d_base],
+                            [k_buf_off + row_off + d_base],
                         )
                     ).bitcast(fx.Int32)
                     blk_hi = Vec(
                         Vec.load(
                             v_i8x16,
                             lds,
-                            [k_buf_off + kv_row * K_STRIDE + d_base + fx.Index(16)],
+                            [k_buf_off + row_off + d_base + fx.Index(16)],
                         )
                     ).bitcast(fx.Int32)
                     k_pack = blk_lo.shuffle(blk_hi, list(range(8)))
