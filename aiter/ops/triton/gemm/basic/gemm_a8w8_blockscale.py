@@ -208,26 +208,7 @@ def gemm_a8w8_blockscale_preshuffle(
     w_scale = w_scale.T  # (scale_k, scale_n)
 
     if config is None:
-        # Skinny M: split-K adds occupancy when N*K is large enough to amortize
-        # the reduce; otherwise fall back to the tuned json. MFMA size left to
-        # the compiler (32x32 or 16x16).
-        if M <= 256 and (N // 64) * (K // (128 * 3)) >= 256:
-            #  targets ~512 WGs (2 waves / 256 CUs)
-            BLOCK_SIZE_M = min(triton.next_power_of_2(M), 128)
-            m_blocks = triton.cdiv(M, BLOCK_SIZE_M)
-            config = {
-                "BLOCK_SIZE_M": BLOCK_SIZE_M,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 128,
-                "GROUP_SIZE_M": 1,
-                "num_warps": 4,
-                "num_stages": 3,
-                "waves_per_eu": 2,
-                "cache_modifier": ".cg",
-                "NUM_KSPLIT": max(1, 512 // (N // 64) // m_blocks),
-            }
-        else:
-            config, _ = _get_config(M, N, K, True)
+        config, _ = _get_config(M, N, K, True)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
