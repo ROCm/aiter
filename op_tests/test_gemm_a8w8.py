@@ -10,7 +10,7 @@ from aiter import dtypes
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import hipb_mm, hipb_create_extension
+from aiter import hipb_mm, hipb_create_extension, hipb_findallsols
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx, get_cu_num
 
 try:
@@ -73,19 +73,38 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_aiter_hip_bpreshuffle(inp, weights, scaleA, scaleB, dtype):
+def run_aiter_hip_bpreshuffle(
+    inp,
+    weights,
+    scaleA,
+    scaleB,
+    dtype,
+    bias=None,
+    use_gelu=False,
+    solution_index=-1,
+):
     if scaleB is not None:
         scaleB = scaleB.t()
     return hipb_mm(
         inp,
         weights.t(),
-        solution_index=-1,
-        bias=None,
+        solution_index=solution_index,
+        bias=bias,
         out_dtype=dtype,
         scaleA=scaleA,
         scaleB=scaleB,
         scaleOut=None,
         bpreshuffle=True,
+        use_gelu=use_gelu,
+    )
+
+
+def should_test_hipb_gelu(dtype, m, n, k, quantDtype):
+    return (
+        quantDtype == dtypes.fp8
+        and get_gfx() == "gfx942"
+        and dtype == dtypes.bf16
+        and (m, n, k) in {(32, 3072, 768), (4096, 3072, 768), (8192, 3072, 768)}
     )
 
 
@@ -198,6 +217,10 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         else:
             avg_d = None
 
+    avg_gelu = None
+    err_gelu = None
+    avg_gelu_sol = None
+    err_gelu_sol = None
     if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
         # hipb_mm bpreshuffle only supports bfloat16 as output type
         init_hipblas()
@@ -211,6 +234,84 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
             atol=1e-2,
             catastrophic_check=True,
         )
+
+        if should_test_hipb_gelu(dtype, m, n, k, quantDtype):
+            hipb_bias = torch.rand([n], dtype=dtype, device="cuda") * 10
+            base, _ = run_aiter_hip_bpreshuffle(
+                x, weightshuffle, x_scale, w_scale, dtype, bias=hipb_bias
+            )
+            ref = F.gelu(base.float()).to(dtype)
+            gelu, avg_gelu = run_aiter_hip_bpreshuffle(
+                x,
+                weightshuffle,
+                x_scale,
+                w_scale,
+                dtype,
+                bias=hipb_bias,
+                use_gelu=True,
+            )
+            err_gelu = checkAllclose(
+                ref,
+                gelu,
+                msg="hipmm gelu_bias: ",
+                rtol=5e-2,
+                atol=5e-2,
+                catastrophic_check=True,
+            )
+
+            scale_b = w_scale.t()
+            sols = hipb_findallsols(
+                x,
+                weightshuffle.t(),
+                bias=hipb_bias,
+                out_dtype=dtype,
+                scaleA=x_scale,
+                scaleB=scale_b,
+                scaleC=None,
+                bpreshuffle=True,
+                use_gelu=True,
+            )
+            if len(sols) == 0:
+                raise RuntimeError(
+                    "hipb_findallsols(use_gelu=True) returned no solutions"
+                )
+            gelu_sol, avg_gelu_sol = run_aiter_hip_bpreshuffle(
+                x,
+                weightshuffle,
+                x_scale,
+                w_scale,
+                dtype,
+                bias=hipb_bias,
+                use_gelu=True,
+                solution_index=sols[0],
+            )
+            err_gelu_sol = checkAllclose(
+                ref,
+                gelu_sol,
+                msg="hipmm gelu_bias selected sol: ",
+                rtol=5e-2,
+                atol=5e-2,
+                catastrophic_check=True,
+            )
+
+            try:
+                hipb_mm(
+                    x,
+                    weightshuffle.t(),
+                    solution_index=-1,
+                    bias=None,
+                    out_dtype=dtype,
+                    scaleA=x_scale,
+                    scaleB=scale_b,
+                    scaleOut=None,
+                    bpreshuffle=True,
+                    use_gelu=True,
+                )
+            except RuntimeError as exc:
+                if "requires bias" not in str(exc):
+                    raise
+            else:
+                raise AssertionError("hipb_mm(use_gelu=True) should require bias")
     else:
         avg_e = None
         err_e = None
@@ -223,6 +324,10 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         "asm err": err_d,
         "hipmm bpreshuffle us": avg_e,
         "hipmm bpreshuffle err": err_e,
+        "hipmm gelu_bias us": avg_gelu,
+        "hipmm gelu_bias err": err_gelu,
+        "hipmm gelu_bias selected sol us": avg_gelu_sol,
+        "hipmm gelu_bias selected sol err": err_gelu_sol,
     }
 
 
@@ -535,6 +640,10 @@ parser.add_argument(
         (4096, 8192, 1024),
         (8192, 8192, 1024),
         (16384, 8192, 1024),
+        # hipmm gelu_bias
+        (32, 3072, 768),
+        (4096, 3072, 768),
+        (8192, 3072, 768),
         # hipmm preshuffle
         (16, 7424, 8192),
         (32, 7424, 8192),
