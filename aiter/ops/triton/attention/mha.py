@@ -305,6 +305,15 @@ def _flash_attn_forward(
             USE_INT64_STRIDES=_USE_INT64_STRIDES,
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
+            # Soundness precondition: only set when every Q/K/V head-axis
+            # stride is a multiple of 8 elements. q_strides[1]/k_strides[1]/
+            # v_strides[1] are the head-axis strides in both thd and bshd
+            # layouts (see q_strides assembly above).
+            HEAD_STRIDE_ALIGNED_8=(
+                q_strides[1] % 8 == 0
+                and k_strides[1] % 8 == 0
+                and v_strides[1] % 8 == 0
+            ),
             **config,
         )
 
