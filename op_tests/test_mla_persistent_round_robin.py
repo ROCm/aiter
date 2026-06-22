@@ -700,7 +700,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[13, 23, 512, 3200, 4096],
+    default=[13, 23, 64, 256, 512, 1200, 3200, 5200, 8192],
     help="""Context length (global KV length).
     e.g.: -c 13""",
 )
@@ -709,7 +709,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[1, 10, 25, 128],
+    default=[1, 10, 32, 64, 128],
     help="""Batch size.
     e.g.: -b 1""",
 )
