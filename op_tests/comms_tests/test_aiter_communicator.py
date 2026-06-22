@@ -71,8 +71,8 @@ OPS = ["all_reduce", "all_gather"]
 # _build_communicator checks `.disabled` here.
 
 
-def _build_communicator(backend, group, device):
-    comm = make_communicator(group, device, backend=backend)
+def _build_communicator(backend, cpu_group, device_group, device):
+    comm = make_communicator(cpu_group, device_group, device, backend=backend)
     if comm.disabled:
         raise RuntimeError(f"{backend} communicator disabled")
     return comm
@@ -120,11 +120,12 @@ def run_comm(
     ensure_model_parallel_initialized(tp_size, pp_size)
     x = x.to(device)
 
+    cpu_group = get_tp_group().cpu_group
     group = get_tp_group().device_group
     dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
 
-    comm = _build_communicator(backend, group, device)
+    comm = _build_communicator(backend, cpu_group, group, device)
     op = _make_op(comm, op_name, x)
 
     # Warm up eagerly so first-call allocations (workspace, symmetric buffers)
@@ -260,11 +261,12 @@ def run_comm_vary(
     )
     ensure_model_parallel_initialized(tp_size, pp_size)
 
+    cpu_group = get_tp_group().cpu_group
     group = get_tp_group().device_group
     dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
 
-    comm = _build_communicator(backend, group, device)
+    comm = _build_communicator(backend, cpu_group, group, device)
 
     # Full deterministic input matrix on this device: every rank's input for
     # every replay. We need all ranks' inputs (not just ours) to build the

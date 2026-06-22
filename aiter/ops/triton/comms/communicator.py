@@ -76,8 +76,11 @@ class Communicator(ABC):
 class IrisCommunicator(Communicator):
     """Communicator using Iris CCL GPU-initiated communication.
 
-    API mirrors CustomAllreduce: __init__(group, device, max_size),
-    should_allreduce, all_reduce (out-of-place), capture, plus disabled.
+    API mirrors CustomAllreduce: __init__(cpu_group, device_group, device,
+    max_size), should_allreduce, all_reduce (out-of-place), capture, plus
+    disabled. Iris drives its own GPU-initiated CCL over a symmetric heap, so it
+    uses neither torch group for collectives; it accepts both for interface
+    parity with the other backends (and any future CPU-side coordination).
     """
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
@@ -87,12 +90,14 @@ class IrisCommunicator(Communicator):
 
     def __init__(
         self,
-        group: ProcessGroup,
+        cpu_group: ProcessGroup,
+        device_group: ProcessGroup,
         device: Union[int, str, torch.device],
         max_size: int = _DEFAULT_MAX_SIZE,
     ) -> None:
         self.disabled = True
-        self.group = group
+        self.cpu_group = cpu_group
+        self.device_group = device_group
         self.max_size = max_size
         self._IS_CAPTURING = False
         self._shmem = None
@@ -285,8 +290,9 @@ class TorchCommunicator(Communicator):
 
     Same output contract as IrisCommunicator: all_reduce returns a new SUM tensor
     (input untouched); all_gather returns the per-rank inputs concatenated along
-    ``dim``, rank-ordered. The collective runs over the process group it is given,
-    so the caller must pass the device (nccl/rccl) group, not a gloo cpu group.
+    ``dim``, rank-ordered. These are GPU-tensor collectives, so they run over the
+    ``device_group`` (nccl/rccl); the gloo ``cpu_group`` (for CPU-object/IPC-handle
+    handshakes) is accepted for interface parity but unused here.
 
     The should_* gates accept everything (torch.distributed is correct at any
     size/dtype), so this routes the same calls the iris path would plus the larger
@@ -297,7 +303,8 @@ class TorchCommunicator(Communicator):
 
     def __init__(
         self,
-        group: ProcessGroup,
+        cpu_group: ProcessGroup,
+        device_group: ProcessGroup,
         device: Union[int, str, torch.device],
         max_size: int = _DEFAULT_MAX_SIZE,
     ) -> None:
@@ -306,10 +313,11 @@ class TorchCommunicator(Communicator):
         elif isinstance(device, str):
             device = torch.device(device)
         assert isinstance(device, torch.device)
-        self.group = group
+        self.cpu_group = cpu_group
+        self.device_group = device_group
         self.device = device
         self.max_size = max_size
-        self.world_size = dist.get_world_size(group)
+        self.world_size = dist.get_world_size(device_group)
         self.disabled = False
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
@@ -320,7 +328,7 @@ class TorchCommunicator(Communicator):
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         out = inp.clone()
-        dist.all_reduce(out, group=self.group)  # SUM
+        dist.all_reduce(out, group=self.device_group)  # SUM
         return out
 
     def all_gather(self, inp: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -332,7 +340,7 @@ class TorchCommunicator(Communicator):
             dtype=inp.dtype,
             device=inp.device,
         )
-        dist.all_gather_into_tensor(out, inp.contiguous(), group=self.group)
+        dist.all_gather_into_tensor(out, inp.contiguous(), group=self.device_group)
         return out.movedim(0, dim).reshape(
             input_size[:dim]
             + (self.world_size * input_size[dim],)
@@ -346,12 +354,19 @@ class TorchCommunicator(Communicator):
 
 
 def make_communicator(
-    group: ProcessGroup,
+    cpu_group: ProcessGroup,
+    device_group: ProcessGroup,
     device: Union[int, str, torch.device],
     max_size: int = _DEFAULT_MAX_SIZE,
     backend: Optional[str] = None,
 ) -> Communicator:
     """Construct the TP collective backend at the one branching point.
+
+    Takes both of vLLM's process groups (mirroring DeviceCommunicatorBase): the
+    gloo ``cpu_group`` (CPU-object/IPC-handle handshakes) and the nccl/rccl
+    ``device_group`` (GPU tensor collectives). Each backend uses what it needs —
+    the torch reference runs its collectives over ``device_group``; iris uses
+    neither (its own symmetric-heap CCL).
 
     'iris' is the gluon GPU-initiated CCL; 'torch' is the torch.distributed
     reference/control. The caller (vLLM) stays backend-agnostic and passes
@@ -374,7 +389,7 @@ def make_communicator(
     backend = backend.lower()
     logger.info("aiter make_communicator: backend=%s", backend)
     if backend == "iris":
-        return IrisCommunicator(group, device, max_size)
+        return IrisCommunicator(cpu_group, device_group, device, max_size)
     if backend == "torch":
-        return TorchCommunicator(group, device, max_size)
+        return TorchCommunicator(cpu_group, device_group, device, max_size)
     raise ValueError(f"unknown communicator backend {backend!r}")
