@@ -1388,15 +1388,6 @@ def mxfp4_moe_run(
         # sorted_weights applied inside; scatter_reduce unnecessary.
         out_buf = atomic_output_buf
     else:
-        # -- MXFP4-intermediate path -- CSV-driven via a `_MXFP4OUT` g2 kernel --
-        # When the tuned CSV selects `..._BM128_NONATOMIC_MXFP4OUT`, gemm2 stages
-        # flat_out as packed fp4 + e8m0 (mxfp4-out epilog) so the scatter_reduce
-        # reads ~3.8x less -> ~2.25x on that kernel. The per-expert gemm2 output is
-        # quantized to 4-bit BEFORE the topk reduce (lossy), so the CSV only enables
-        # it for M buckets where the reduce win beats the gemm2 epilog overhead
-        # (cold full-MoE crossover ? M 8192 on Kimi -- the CSV is the M-gate). Only
-        # the codegen'd Kimi/DSR nonatomic shapes (NE?{257,385}, H=7168, E=512) have
-        # the gemm2-mxfp4out + scatter_reduce_q kernels.
         mxfp4out = p2.get("mxfp4out", False)
         _mx_shape_ok = (
             BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
@@ -1446,11 +1437,7 @@ def mxfp4_moe_run(
             return out
 
         # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
-        if (
-            mxfp4out
-            and _mx_shape_ok
-            and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
-        ):
+        if _mx_shape_ok and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1":
             flat_out_q = torch.empty(
                 (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device
             )
@@ -1860,15 +1847,6 @@ def _mxfp4_moe_run(
         # sorted_weights applied inside; scatter_reduce unnecessary.
         out_buf = atomic_output_buf
     else:
-        # -- MXFP4-intermediate path -- CSV-driven via a `_MXFP4OUT` g2 kernel --
-        # When the tuned CSV selects `..._BM128_NONATOMIC_MXFP4OUT`, gemm2 stages
-        # flat_out as packed fp4 + e8m0 (mxfp4-out epilog) so the scatter_reduce
-        # reads ~3.8x less -> ~2.25x on that kernel. The per-expert gemm2 output is
-        # quantized to 4-bit BEFORE the topk reduce (lossy), so the CSV only enables
-        # it for M buckets where the reduce win beats the gemm2 epilog overhead
-        # (cold full-MoE crossover ? M 8192 on Kimi -- the CSV is the M-gate). Only
-        # the codegen'd Kimi/DSR nonatomic shapes (NE?{257,385}, H=7168, E=512) have
-        # the gemm2-mxfp4out + scatter_reduce_q kernels.
         mxfp4out = p2.get("mxfp4out", False)
         # mxfp4-out (lossy fp4 intermediate) is validated only for the codegen'd
         # Kimi/DSR shapes. It does NOT transfer to non-Kimi INTER=256: at mid-M it
@@ -1922,11 +1900,7 @@ def _mxfp4_moe_run(
             return out
 
         # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
-        if (
-            mxfp4out
-            and _mx_shape_ok
-            and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
-        ):
+        if _mx_shape_ok and os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1":
             flat_out_q = torch.empty(
                 (max_sorted, D_HIDDEN // 2), dtype=torch.uint8, device=device
             )
