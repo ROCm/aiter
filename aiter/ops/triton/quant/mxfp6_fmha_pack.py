@@ -139,6 +139,70 @@ def quantize_fp6_lastdim(x: np.ndarray):
 
 
 # ---------------------------------------------------------------------------
+# K LDS-ORDER packer for the COALESCED cooperative load
+# ---------------------------------------------------------------------------
+# The default kernel cooperative K load reads token-strided (lane v0 -> token
+# (v0&31) at the 96B token stride), so each lane's 16B falls in its own cache
+# line (~25% L1 coalescing) -> the vL1D address-gen serializes under fp6's load
+# volume (the long vmcnt(0) wait). This packer PRE-ARRANGES K so the cooperative
+# load is a CONTIGUOUS, coalesced copy that lands byte-identically in the kernel's
+# chunk-major LDS image -- so the kernel's _K_COALESCED_LOAD path uses a plain
+# contiguous load and lds_read_K_data / the MFMA are unchanged. The transpose
+# becomes this one-time host op. (Stalled-on-Address 18.5%->0.7%, L1-L2 txns
+# 332M->241M, +1.3% end-to-end vs the token-strided load.)
+#
+# Permutation derived from the kernel's default chunk-major load addressing:
+#   tile (16384 B) LDS/HBM position P = w*1024 + i*4096 + v0*16 + byte  <-  the
+#   token-major byte v_K_base(v0)+C_i(w,i)+byte, with
+#   v_K_base = (v0&31)*96 + ((v0>>5)&1)*24  and  C_i: blk=w+(i&1)*4; half=blk&1;
+#   n=blk>>1; chunk=i>>1; C_i = n*32*96 + half*48 + chunk*16.
+def _k_lds_order_gather_index():
+    """Per-tile [16384] token-major byte index for each contiguous LDS-order position P."""
+    P = np.arange(16384)
+    byte = P & 15
+    r = P >> 4
+    v0 = r & 63
+    r2 = r >> 6
+    wv = r2 & 3
+    iv = r2 >> 2
+    v_k_base = (v0 & 31) * 96 + ((v0 >> 5) & 1) * 24
+    blk = wv + (iv & 1) * 4
+    half = blk & 1
+    n = blk >> 1
+    chunk = iv >> 1
+    c_i = n * 32 * 96 + half * 48 + chunk * 16
+    return (v_k_base + c_i + byte).astype(np.int64)
+
+
+def quantize_fp6_k_lds_order(k_thd: np.ndarray, tile: int = 128):
+    """Pack K -> LDS-order fp6 (for the kernel's _K_COALESCED_LOAD contiguous load) + per-(tok,32)
+    E8M0 scale. Numerically identical to quantize_fp6_lastdim; LAYOUT change only.
+
+    Input : k_thd f32 [b, sk, h, 128].
+    Output:
+      data  uint8 [b, h, n_tiles*16384]  (each tile = the 16384B chunk-major LDS image; the kernel's
+            contiguous coalesced load lands it byte-identically to the token-strided chunk-major load).
+            tile = 16384B over 128 tokens -> the kernel must see this view with seq stride 128.
+      scale uint8 [b, sk, h, 4]
+    """
+    k = np.asarray(k_thd)
+    b, sk, h, d = k.shape
+    assert d == 128 and tile == 128 and sk % tile == 0, (d, sk, tile)
+    nt = sk // tile
+    packed, scale = quantize_fp6_lastdim(k.astype(np.float64))  # [b,sk,h,96], [b,sk,h,4]
+    # token-major flat per (b,h): [b, h, sk*96]
+    km = np.ascontiguousarray(np.transpose(packed, (0, 2, 1, 3))).reshape(b, h, sk * 96)
+    idx = _k_lds_order_gather_index()  # [16384]
+    total = sk * 96
+    out = np.zeros((b, h, nt * 16384), np.uint8)
+    for t in range(nt):
+        g = t * 12288 + idx
+        valid = g < total
+        out[:, :, t * 16384:(t + 1) * 16384] = np.where(valid, km[:, :, np.where(valid, g, 0)], 0)
+    return np.ascontiguousarray(out).astype(np.uint8), scale.astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
 # V operand packer (proven "clean" / "operand" layout)
 # ---------------------------------------------------------------------------
 # tr8 within-32-block kv scramble (4-element chunk / 16-stride interleave). This

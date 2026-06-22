@@ -717,7 +717,7 @@ def make_torch_ref_runner(
     )
 
 
-# mxfp6 kernel (fp6 Q,K + fp6/fp8 V). Built offline by mi350_fmha_hd128_mxfp6.py
+# f6f6 kernel (double-FP6: fp6 Q,K + fp6 V). Built offline by mi350_fmha_hd128_f6f6.py
 # with its OWN symbol (_ZN5aiter28fmha_fwd_hd128_mxfp6_gfx950E) and OWN config row
 # (dtype "mxfp6bf16"), so it has a dedicated .co slot (fwd_hd128_mxfp6.co) and
 # coexists with aiter_mxfp4 -- no overlay. The C++ dispatch routes 96-wide
@@ -779,6 +779,7 @@ def _sage_quant_mxfp6(
     R=None,
     BLOCK_R=32,
     qk_packer=None,
+    k_colmajor_packer=None,
 ):
     """MXFP6-E2M3 QK quantize for the aiter_mxfp6 bench path.
 
@@ -838,7 +839,12 @@ def _sage_quant_mxfp6(
 
     if qk_packer is not None:
         q_fp4, q_scale = qk_packer(q)
-        k_fp4, k_scale = qk_packer(k)
+        if k_colmajor_packer is not None:
+            # Alternate K-operand layout (the coalesced LDS-order packer); the K
+            # scale stays on the existing separate gather.
+            k_fp4, k_scale = k_colmajor_packer(k)
+        else:
+            k_fp4, k_scale = qk_packer(k)
     else:
         q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
         k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
@@ -939,6 +945,77 @@ def _build_hostv_v_packer(device):
         v_view = buf.as_strided((b, sk, h_kv, d), (v_bs, 100, v_hs, 1))
         _cache[key] = v_view
         return v_view
+
+    return _packer
+
+
+# ---------------------------------------------------------------------------
+# Coalesced K-load packer (LDS-order): pre-arranges the fp6 K so the cooperative
+# load is a CONTIGUOUS (coalesced) copy that lands byte-identically in the kernel's
+# chunk-major LDS image (lds_read_K_data + MFMA unchanged). Drives the kernel's
+# coalesced K load; fixes the vL1D address-gen serialization (Stalled-on-Address
+# 18.5%->0.7%, L1-L2 txns 332M->241M, +1.3%). Permutation lives in the canonical
+# packer (mxfp6_fmha_pack.quantize_fp6_k_lds_order).
+# ---------------------------------------------------------------------------
+def _build_fp6_k_coalesced_packer(device):
+    """float K [b,sk,h,128] -> (LDS-order uint8 view [b,sk,h,96] over a [b,h,n_tiles*16384] buffer,
+    E8M0 scale [b,sk,h,4]). seq stride = 128 (16384/128) so the kernel's _s_k_Seqs=128 -> tile base =
+    token*128.
+
+    GPU PERMUTATION of the (Triton) base fp6 pack: byte-identical to the numpy
+    quantize_fp6_k_lds_order (LAYOUT-only gather) but runs entirely on-device, so the
+    full pack is seconds instead of the minutes the per-tile numpy CPU round-trip took
+    for long seqlens. Memoized per fixed do_bench tensor; the [n_tiles*16384] gather
+    index is built once on-device per (n_tiles, device)."""
+    hp = _load_host_fp6_pack()
+    base = _build_fp6_qk_packer(device)  # GPU (b,sk,h,96) packed + (b,sk,h,4) scale, byte-identical
+    # Per-tile [16384] token-major byte index (canonical), lifted to the device once.
+    idx16k = torch.as_tensor(
+        hp._k_lds_order_gather_index(), dtype=torch.long, device=device
+    )
+    _cache: dict = {}
+    _gidx: dict = {}
+
+    def _gather_index(nt: int, total: int):
+        # Full [nt*16384] gather index = tile_base(t*12288) + idx16k, OOB (>=total, the dup/overflow
+        # tail) clamped to 0 and masked to 0 -- exactly the numpy np.where(valid, ...) behaviour.
+        g = _gidx.get(nt)
+        if g is None:
+            full = (
+                torch.arange(nt, device=device, dtype=torch.long) * 12288
+            ).unsqueeze(1) + idx16k.unsqueeze(0)
+            full = full.reshape(-1)
+            valid = full < total
+            gc = torch.where(valid, full, torch.zeros_like(full))
+            g = (gc, valid)
+            _gidx[nt] = g
+        return g
+
+    def _packer(k_thd: torch.Tensor):
+        key = (k_thd.data_ptr(), tuple(k_thd.shape), k_thd.dtype)
+        hit = _cache.get(key)
+        if hit is not None:
+            return hit
+        b, sk, h, d = k_thd.shape
+        assert d == 128 and sk % 128 == 0, (d, sk)
+        nt = sk // 128
+        packed, scale = base(k_thd)  # GPU uint8 [b,sk,h,96], [b,sk,h,4]
+        total = sk * 96
+        # token-major flat per (b,h): [b, h, sk*96]
+        km = packed.permute(0, 2, 1, 3).reshape(b, h, total).contiguous()
+        gc, valid = _gather_index(nt, total)
+        out = km[:, :, gc]  # [b, h, nt*16384] on-device gather
+        out = torch.where(valid.view(1, 1, -1), out, torch.zeros_like(out))
+        k_hs = nt * 16384
+        k_bs = h * k_hs
+        data = out.reshape(-1)  # contiguous [b*h*nt*16384] = b*k_bs
+        buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=device)
+        buf[: data.numel()] = data
+        # seq stride 128 -> kernel _s_k_Seqs=128 -> tile base = token*128 (=tile*16384).
+        k_view = buf.as_strided((b, sk, h, 96), (k_bs, 128, k_hs, 1))
+        out_t = (k_view, scale)
+        _cache[key] = out_t
+        return out_t
 
     return _packer
 
@@ -1256,6 +1333,13 @@ def make_kernel_runner(
         # into the mxfp6 .co slot (the mxfp6bf16 C++ route has in_bpe=1 and reads
         # the V stride from the tensor, so an fp8 V flows through unchanged).
         _fp6fp8_mode = os.environ.get("AITER_FP6FP8", "0") != "0"
+        # AITER_KCOAL (default 1) packs K in LDS-order for the kernel's coalesced contiguous K load
+        # (the shipped path). Set AITER_KCOAL=0 ONLY to feed token-major K to an OLD token-strided
+        # .co for A/B. Routes through the k_colmajor_packer slot (the K-only alt-packer slot).
+        if os.environ.get("AITER_KCOAL", "1") != "0":
+            _k_colmajor = _build_fp6_k_coalesced_packer(q_bshd.device)
+        else:
+            _k_colmajor = None
 
         def _quantize_mxfp6():
             return _sage_quant_mxfp6(
@@ -1272,6 +1356,7 @@ def make_kernel_runner(
                 sm_scale=softmax_scale,
                 q_smoothing=args.qsmooth,
                 qk_packer=_mxfp6_qk_packer,
+                k_colmajor_packer=_k_colmajor,
             )
 
         def _run_aiter_mxfp6():
