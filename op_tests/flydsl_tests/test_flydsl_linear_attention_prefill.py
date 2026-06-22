@@ -59,6 +59,20 @@ except Exception:
     chunk_gated_delta_rule_fwd_h_vllm = None
     _HAS_VLLM_K5 = False
 
+# HIP/C++ K5 (chunk_gated_delta_rule_fwd_h.cu). JIT-compiled on first call.
+# Same public VK outputs as the FlyDSL / Triton opt_vk backends, but it
+# requires K=V=128 + bf16 inputs, so cases that violate that are skipped
+# in the correctness test and excluded from the perf launch.
+try:
+    from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+        chunk_gated_delta_rule_fwd_h_hip_fn,
+    )
+
+    _HAS_HIP_K5 = True
+except Exception:
+    chunk_gated_delta_rule_fwd_h_hip_fn = None
+    _HAS_HIP_K5 = False
+
 torch.set_default_device("cuda")
 
 
@@ -607,6 +621,69 @@ def _normalize_opt_v_new(vn_opt):
     return vn_opt.permute(0, 2, 1, 3).contiguous()
 
 
+def _hip_k5_supported(args: PrefillArgs) -> bool:
+    """The HIP K5 kernel only handles K=V=128, bf16 inputs, chunk_size=64."""
+    return (
+        _HAS_HIP_K5
+        and args.K == 128
+        and args.V == 128
+        and args.dtype == torch.bfloat16
+        and args.BT == 64
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_hip_k5(
+    k,
+    w,
+    u,
+    g=None,
+    initial_state=None,
+    output_final_state=False,
+    cu_seqlens=None,
+):
+    """HIP/C++ K5 host wrapper, adapted to this file's K5 calling convention.
+
+    Mirrors the FlyDSL / Triton ``opt_vk`` backends: takes the GQA-layout
+    ``k`` ([B, T, Hg, K]), head-major ``w`` / ``u`` ([B, H, T, K/V]), and a
+    head-major cumulative-gate ``g`` ([H, T_total] or [B, H, T_total]) in
+    natural-log space, and returns VK-ordered ``h`` ([B, NT, H, V, K]),
+    head-major ``v_new`` ([B, H, T, V]), and VK ``final_state``
+    ([N, H, V, K]) -- identical public outputs to the other backends, so
+    the shared ``_assert_k5_outputs_match_ref`` comparator applies directly.
+
+    The underlying kernel's ``USE_EXP2`` path expects log2-space gates, so we
+    pass ``use_exp2=False`` here to keep the natural-log-space ``g`` contract
+    shared with the PyTorch reference (the kernel then applies the LOG2E
+    scale internally).
+    """
+    B = w.shape[0]
+    H = w.shape[1]
+    T_flat = w.shape[2]
+
+    # The HIP wrapper wants a 3-D head-major g [B, H, T_flat]. This file
+    # produces a 2-D [H, T_total] gate for the B=1 varlen / dense cases.
+    if g is not None:
+        if g.dim() == 2:
+            g_hip = g.reshape(1, H, T_flat).contiguous()
+        else:
+            g_hip = g.contiguous()
+    else:
+        g_hip = None
+
+    return chunk_gated_delta_rule_fwd_h_hip_fn(
+        k,
+        w,
+        u,
+        g=g_hip,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=64,
+        cu_seqlens=cu_seqlens,
+        use_exp2=False,
+        g_head_major=True,
+    )
+
+
 # -- Performance benchmark ----------------------------------------------
 
 
@@ -617,10 +694,20 @@ _K5_KERNEL_PREFIXES = [
     "chunk_gated_delta_rule_fwd_kernel_h",
 ]
 
+# The HIP/C++ K5 kernel is a templated __global__ whose profiler symbol is
+# either the demangled ``...chunk_gated_delta_rule_fwd_h_hip_kernel<...>`` or
+# a mangled ``_ZN...`` form. Match it as a substring (the templated name never
+# appears at offset 0 after demangling because of the leading return type).
+_K5_KERNEL_SUBSTRINGS = [
+    "chunk_gated_delta_rule_fwd_h_hip_kernel",
+]
+
 
 def _is_k5_kernel(name: str) -> bool:
     """Return True if *name* is a K5 hidden-state recurrence kernel."""
-    return any(name.startswith(p) for p in _K5_KERNEL_PREFIXES)
+    if any(name.startswith(p) for p in _K5_KERNEL_PREFIXES):
+        return True
+    return any(s in name for s in _K5_KERNEL_SUBSTRINGS)
 
 
 def _bench_fn(fn, *args, **kwargs):
@@ -743,6 +830,55 @@ class TestCorrectness:
             fs_ref,
             output_final_state=args.output_final_state,
             label="flydsl",
+        )
+
+    @pytest.mark.skipif(not _HAS_HIP_K5, reason="HIP K5 kernel not importable")
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_hip(self, args: PrefillArgs):
+        """HIP/C++ K5 impl. Same public VK outputs as the baseline flydsl
+        path. The kernel only supports K=V=128 + bf16 + chunk_size=64, so
+        cases outside that envelope are skipped."""
+        if not _hip_k5_supported(args):
+            pytest.skip(
+                reason="HIP K5 kernel requires K=V=128, bfloat16, chunk_size=64"
+            )
+        # Pin the seed so the bf16 v_new comparison is reproducible: a few
+        # ``u - w @ h`` entries cancel to near-zero, where the rtol band is
+        # tiny and an unlucky random draw can push bf16 round-off past it.
+        torch.manual_seed(42)
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_hip, vn_hip, fs_hip = chunk_gated_delta_rule_fwd_h_hip_k5(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_hip,
+            vn_hip,
+            fs_hip,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="hip",
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
@@ -1349,6 +1485,22 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
+    # HIP/C++ K5. Same VK hidden-state layout as the flydsl backends, so it
+    # consumes the same h0 (fp32) and head-major w_c / u_c. Only valid for
+    # K=V=128 + bf16; gated by ``_hip_k5_supported`` below.
+    hip_supported = _hip_k5_supported(args)
+
+    def hip_launch():
+        chunk_gated_delta_rule_fwd_h_hip_k5(
+            k=k,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
     # Warmup FlyDSL once so its internal BV-autotune sweep does not
     # leak into the timed window. Triton's own ``triton.autotune`` is
     # already absorbed by ``_bench_fn``'s NUM_WARMUP=5 prelude, except
@@ -1366,6 +1518,8 @@ def _run_perf_comparison(args: PrefillArgs):
     flydsl_naive_opt_launch()
     if _HAS_VLLM_K5:
         vllm_launch()
+    if hip_supported:
+        hip_launch()
     torch.cuda.synchronize()
 
     us_fly = _bench_fn(flydsl_launch)
@@ -1378,11 +1532,16 @@ def _run_perf_comparison(args: PrefillArgs):
     us_triton_vk = _bench_fn(triton_vk_launch)
     us_triton_origin_opt = _bench_fn(triton_origin_opt_launch)
     us_vllm = _bench_fn(vllm_launch) if _HAS_VLLM_K5 else float("nan")
+    us_hip = _bench_fn(hip_launch) if hip_supported else float("nan")
 
     fly_vs_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
     fly_vs_origin_opt = us_triton_origin_opt / us_fly if us_fly > 0 else float("inf")
     fly_vs_vllm = (
         us_vllm / us_fly if (us_fly > 0 and us_vllm == us_vllm) else float("nan")
+    )
+    # HIP vs FlyDSL ratio (>1 means HIP is slower than the FlyDSL baseline).
+    hip_vs_fly = (
+        us_hip / us_fly if (us_fly > 0 and us_hip == us_hip) else float("nan")
     )
 
     _perf_results.append(
@@ -1405,9 +1564,11 @@ def _run_perf_comparison(args: PrefillArgs):
             "Triton_vk(us)": us_triton_vk,
             "Triton_origin_opt(us)": us_triton_origin_opt,
             "vLLM_vk(us)": us_vllm,
+            "HIP_vk(us)": us_hip,
             "flydsl_vs_vk": fly_vs_vk,
             "flydsl_vs_origin_opt": fly_vs_origin_opt,
             "flydsl_vs_vllm": fly_vs_vllm,
+            "hip_vs_flydsl": hip_vs_fly,
         }
     )
 
@@ -1514,18 +1675,16 @@ def _print_perf_table():
         ("var", "varlen", 3),
         ("fs", "final_st", 3),
         ("FlyDSL", "FlyDSL_vk(us)", 8),
-        ("FlyDSL_n", "FlyDSL_naive(us)", 9),
-        ("FlyDSL_no", "FlyDSL_naive_opt(us)", 10),
+        ("FlyDSL_n", "FlyDSL_naive(us)", 12),
+        ("FlyDSL_nopt", "FlyDSL_naive_opt(us)", 12),
         ("FlyDSL_kv", "FlyDSL_kv(us)", 9),
         ("FlyDSL_kvn", "FlyDSL_kvnaive(us)", 10),
-        ("FlyDSL_vkf", "FlyDSL_vkfork(us)", 10),
-        ("FlyDSL_vkn", "FlyDSL_vknaive(us)", 10),
         ("Tri_vk", "Triton_vk(us)", 8),
-        ("Tri_orig_opt", "Triton_origin_opt(us)", 12),
         ("vLLM", "vLLM_vk(us)", 8),
+        ("HIP", "HIP_vk(us)", 8),
         ("fly/vk", "flydsl_vs_vk", 7),
-        ("fly/o_opt", "flydsl_vs_origin_opt", 9),
         ("fly/vllm", "flydsl_vs_vllm", 8),
+        ("hip/fly", "hip_vs_flydsl", 8),
     ]
 
     def _fmt_cell(val, key, width):

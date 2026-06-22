@@ -309,9 +309,6 @@ def compile_chunk_gated_delta_h_naive(
         def _xor_swizzle(row, col):
             return col ^ ((row & fx.Int32(0x7)) << fx.Int32(3))
 
-        def _xor_swizzle_idx(row, col):
-            return col ^ ((row & fx.Index(0x7)) << fx.Index(3))
-
         # -- LDS vector read helpers (generates ds_read_b128 for 8xbf16) --
         v8bf16_type = T.vec(8, T.bf16)
         lds_w_memref = lds_w_ptr.get()
@@ -569,18 +566,26 @@ def compile_chunk_gated_delta_h_naive(
 
             K_STEPS_PER_BLOCK = 64 // WMMA_K
 
+            # GEMM1 swizzle is two-sided (DMA source col + this read). Hoist the
+            # loop-invariant runtime parts out of the kb/ks loop so the swizzle
+            # costs no extra VGPRs (matches the GEMM-kernel idiom):
+            #  - w_lds_row_idx (= wid*16 + lane_n) is invariant across kb/ks;
+            #  - swz_bits (= (row & 7) << 3) depends only on the row, so it is a
+            #    loop invariant too -- compute it ONCE and reuse the register.
+            # The per-iteration column is constexpr (kb*64 + ks*WMMA_K) plus the
+            # runtime lane_m_base*8; only a single constexpr-vs-invariant XOR
+            # remains inside the loop (no repeated and/shift on the row).
+            w_lds_row_idx = wid_idx * fx.Index(16) + lane_n_idx
+            w_lds_row_off = w_lds_row_idx * fx.Index(LDS_W_STRIDE)
+            swz_bits = (w_lds_row_idx & fx.Index(0x7)) << fx.Index(3)
+            lane_m_col_base = lane_m_base_idx * fx.Index(8)
+
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
-                    w_lds_row_idx = wid_idx * fx.Index(16) + lane_n_idx
-                    w_lds_col_idx = fx.Index(
-                        kb * 64 + ks * WMMA_K
-                    ) + lane_m_base_idx * fx.Index(8)
-                    # Both paths apply the same XOR swizzle on the LDS read:
-                    #  - non-DGL: ds_write placed data at the swizzled slot;
-                    #  - DGL: the source column was swizzled, so the row-major
-                    #    slot row*K+swz(col) holds w[row,col] -> symmetric.
-                    w_lds_col_idx = _xor_swizzle_idx(w_lds_row_idx, w_lds_col_idx)
-                    w_lds_idx = w_lds_row_idx * fx.Index(LDS_W_STRIDE) + w_lds_col_idx
+                    w_lds_col_idx = (
+                        fx.Index(kb * 64 + ks * WMMA_K) + lane_m_col_base
+                    ) ^ swz_bits
+                    w_lds_idx = w_lds_row_off + w_lds_col_idx
                     a_frag = _lds_vec_read_w_bf16x8(w_lds_idx)
 
                     global_ks = kb * K_STEPS_PER_BLOCK + ks
@@ -611,57 +616,21 @@ def compile_chunk_gated_delta_h_naive(
                 next_chunk_end, T_local
             ) - fx.Int32(1)
 
-            vn_frags = []
-            for nr in range_constexpr(N_REPEAT):
-                bv_val = bv_accs[nr]
-                u_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
-                u_f32_elems = []
-                for elem_i in range_constexpr(4):
-                    u_bt_row_raw = (
-                        i_t_i32 * fx.Int32(BT)
-                        + wid * fx.Int32(16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(elem_i)
-                    )
-                    safe_u_row = (u_bt_row_raw < T_local).select(
-                        u_bt_row_raw, fx.Int32(0)
-                    )
-                    u_off = v_base + safe_u_row * stride_v + u_col
-                    u_raw = v_[fx.Index(u_off)]
-                    u_bf16 = fx.BFloat16(u_raw)
-                    u_f32_elems.append(u_bf16.to(fx.Float32))
-                u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
-
-                vn_frags.append(u_f32 - bv_val)
-
             # ============================================================
-            # 5b. Store v_new (pre-gating) for output
+            # 5-7. v_new pipeline, FUSED per-nr to cap VGPR pressure.
             # ============================================================
-            if const_expr(SAVE_NEW_VALUE):
-                # Closure wrapper to hide ``vn_`` from FlyDSL's
-                # ReplaceIfWithDispatch ast rewriter (see baseline comment).
-                def _emit_vn_store(off, value):
-                    vn_[fx.Index(off)] = value
+            # The 5 (compute vn) / 5b (store v_new) / 6 (gate) / 7 (store to
+            # lds_vn) phases used to each loop over all N_REPEAT frags, which
+            # kept all N_REPEAT vn_frags (N_REPEAT * f32x4 = 4*4 = 16 VGPRs at
+            # BV=64) live simultaneously across the whole block -- a long
+            # live-range that pushes the kernel's peak VGPR up. GEMM2 below
+            # reads v_new back from lds_vn (NOT from these registers), so each
+            # frag is dead the moment it is stored to LDS. Fusing the phases
+            # into one per-nr loop keeps only ONE vn_frag (4 VGPRs) live at a
+            # time. The gate vector (row-only, nr-invariant) and the h_accs
+            # decay (nr/kb only) are hoisted out so the numerics are unchanged.
 
-                for nr in range_constexpr(N_REPEAT):
-                    vn_val = vn_frags[nr]
-                    vn_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
-                    for elem_i in range_constexpr(4):
-                        vn_bt_row = (
-                            i_t_i32 * fx.Int32(BT)
-                            + wid * fx.Int32(16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        if (vn_bt_row < T_local).ir_value():
-                            f32_v = vn_val[elem_i]
-                            bf16_v = f32_v.to(fx.BFloat16)
-                            vn_off = vn_base + vn_bt_row * fx.Int32(V) + vn_col
-                            _emit_vn_store(vn_off, bf16_v)
-
-            # ============================================================
-            # 6. Gating (g / gk loaded inline)
-            # ============================================================
+            # Gate vector + h_accs end-of-chunk decay (independent of vn_frags).
             if const_expr(USE_G):
                 g_last_off = i_h * T_flat + (bos + last_idx_raw)
                 g_last = g_[fx.Index(g_last_off)]
@@ -683,11 +652,7 @@ def compile_chunk_gated_delta_h_naive(
                     gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
                 gate_vec = vector.from_elements(T.f32x4, gate_elems)
 
-                for nr in range_constexpr(N_REPEAT):
-                    vn_frags[nr] = vn_frags[nr] * gate_vec
-
                 exp_g_last_vec = fx.full(4, fx.Float32(exp_g_last), fx.Float32)
-
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for nr in range_constexpr(N_REPEAT):
                         acc_idx = kb * N_REPEAT + nr
@@ -714,11 +679,54 @@ def compile_chunk_gated_delta_h_naive(
                         acc_idx = kb * N_REPEAT + nr
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * gk_vec
 
-            # ============================================================
-            # 7. Store gated v_new -> lds_vn
-            # ============================================================
+            # Closure wrapper to hide ``vn_`` from FlyDSL's
+            # ReplaceIfWithDispatch ast rewriter (see baseline comment).
+            def _emit_vn_store(off, value):
+                vn_[fx.Index(off)] = value
+
             for nr in range_constexpr(N_REPEAT):
-                vn_val = vn_frags[nr]
+                bv_val = bv_accs[nr]
+                u_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
+                u_f32_elems = []
+                for elem_i in range_constexpr(4):
+                    u_bt_row_raw = (
+                        i_t_i32 * fx.Int32(BT)
+                        + wid * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                        + fx.Int32(elem_i)
+                    )
+                    safe_u_row = (u_bt_row_raw < T_local).select(
+                        u_bt_row_raw, fx.Int32(0)
+                    )
+                    u_off = v_base + safe_u_row * stride_v + u_col
+                    u_raw = v_[fx.Index(u_off)]
+                    u_bf16 = fx.BFloat16(u_raw)
+                    u_f32_elems.append(u_bf16.to(fx.Float32))
+                u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
+
+                vn_val = u_f32 - bv_val
+
+                # 5b. Store pre-gating v_new for output.
+                if const_expr(SAVE_NEW_VALUE):
+                    vn_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
+                    for elem_i in range_constexpr(4):
+                        vn_bt_row = (
+                            i_t_i32 * fx.Int32(BT)
+                            + wid * fx.Int32(16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        if (vn_bt_row < T_local).ir_value():
+                            f32_v = vn_val[elem_i]
+                            bf16_v = f32_v.to(fx.BFloat16)
+                            vn_off = vn_base + vn_bt_row * fx.Int32(V) + vn_col
+                            _emit_vn_store(vn_off, bf16_v)
+
+                # 6. Apply gate (post v_new store, matching original order).
+                if const_expr(USE_G):
+                    vn_val = vn_val * gate_vec
+
+                # 7. Store gated v_new -> lds_vn (frag dead after this).
                 lds_col = fx.Int32(nr * 16) + lane_n
                 for elem_i in range_constexpr(4):
                     f32_v = vn_val[elem_i]
