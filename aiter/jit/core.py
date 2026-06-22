@@ -21,7 +21,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list  # noqa: E402
+from chip_info import get_gfx, get_gfx_list, get_gfx_runtime  # noqa: E402
 from cpp_extension import _jit_compile, executable_path, get_hip_version  # noqa: E402
 from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
@@ -596,15 +596,49 @@ def check_numa():
 __mds = {}
 
 
+def _so_offload_archs(so_path: str) -> set:
+    """Return the GPU code-object targets embedded in a built module .so,
+    parsed from its clang offload-bundle entry ids (e.g. the 'gfx942' in
+    'hipv4-amdgcn-amd-amdhsa--gfx942'). An empty set means the file has no
+    device code (host-only module) or could not be read."""
+    try:
+        with open(so_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return set()
+    return {m.decode() for m in re.findall(rb"amdhsa--(gfx[0-9a-f]+)", data)}
+
+
 @torch_compile_guard()
 def get_module_custom_op(md_name: str) -> None:
     global __mds
-    if md_name not in __mds:
-        if "AITER_JIT_DIR" in os.environ:
-            __mds[md_name] = importlib.import_module(md_name)
-        else:
-            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
-        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+    if md_name in __mds:
+        return
+    # Arch-coverage guard: a prebuilt .so is a valid *host* extension on any
+    # GPU, so importing one built for the wrong arch succeeds and only faults
+    # later at kernel launch (missing code object -> uncatchable device fault).
+    # Before importing, if the on-disk .so carries device code for other arches
+    # but NOT the running GPU, force a JIT rebuild for the native arch instead.
+    try:
+        run_arch = get_gfx_runtime()
+        so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+        archs = _so_offload_archs(so_path)
+        if archs and run_arch not in archs:
+            logger.warning(
+                f"[{md_name}] prebuilt .so targets {sorted(archs)} but not the "
+                f"running arch {run_arch}; rebuilding for {run_arch}"
+            )
+            raise ModuleNotFoundError(md_name)
+    except ModuleNotFoundError:
+        raise
+    except Exception:
+        # running arch undetectable (e.g. no GPU) -> fall back to normal import
+        pass
+    if "AITER_JIT_DIR" in os.environ:
+        __mds[md_name] = importlib.import_module(md_name)
+    else:
+        __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+    logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
     return
 
 
