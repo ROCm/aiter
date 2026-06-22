@@ -27,10 +27,6 @@ from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
-# When enabled (default), a prebuilt .so whose embedded GPU code objects do not
-# cover the GPU we are actually running on is treated as missing, so it gets
-# rebuilt for the current arch automatically (no need to set AITER_REBUILD=1).
-AITER_REBUILD_ON_NEW_ARCH = int(os.environ.get("AITER_REBUILD_ON_NEW_ARCH", "1")) != 0
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 AITER_DISABLE_KERNARG_PRELOAD = (
     int(os.environ.get("AITER_DISABLE_KERNARG_PRELOAD", "0")) != 0
@@ -635,8 +631,6 @@ def _needs_arch_rebuild(md_name):
     # built for the wrong arch succeeds and only faults later at kernel launch.
     # if the .so carries device code for other arches but NOT the running GPU,
     # force a JIT rebuild for the native arch instead.
-    if not AITER_REBUILD_ON_NEW_ARCH:
-        return False
     try:
         cur = get_gfx_runtime()
     except Exception:

@@ -52,7 +52,6 @@ def test_needs_arch_rebuild():
     with tempfile.TemporaryDirectory() as tmpdir:
         orig = _patch_jit_dir(tmpdir)
         orig_runtime = core.get_gfx_runtime
-        orig_flag = core.AITER_REBUILD_ON_NEW_ARCH
         try:
             so_path = os.path.join(tmpdir, "module_dummy.so")
             with open(so_path, "wb") as f:
@@ -60,7 +59,6 @@ def test_needs_arch_rebuild():
                     b"\x00ELF junk hipv4-amdgcn-amd-amdhsa--gfx942 more "
                     b"hipv4-amdgcn-amd-amdhsa--gfx950 tail"
                 )
-            core.AITER_REBUILD_ON_NEW_ARCH = True
 
             # Running on an arch the .so does NOT cover -> rebuild.
             core.get_gfx_runtime = lambda: "gfx1201"
@@ -70,17 +68,10 @@ def test_needs_arch_rebuild():
             core.get_gfx_runtime = lambda: "gfx942"
             assert core._needs_arch_rebuild("module_dummy") is False
 
-            # Toggle off -> never rebuild.
-            core.AITER_REBUILD_ON_NEW_ARCH = False
-            core.get_gfx_runtime = lambda: "gfx1201"
-            assert core._needs_arch_rebuild("module_dummy") is False
-
             # Unknown build archs (no manifest, no .so) -> no rebuild.
-            core.AITER_REBUILD_ON_NEW_ARCH = True
             assert core._needs_arch_rebuild("module_unknown") is False
         finally:
             core.get_gfx_runtime = orig_runtime
-            core.AITER_REBUILD_ON_NEW_ARCH = orig_flag
             _restore_jit_dir(orig)
 
 
