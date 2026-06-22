@@ -100,6 +100,8 @@ def jdbba_kernel(
         # --- Per-group rebasing ---
         # A / C: shift base down by seq_start rows so local tiling restarts at
         # the group's own row 0 (handles unaligned seq_start).
+
+        #@Sami: creating the view offsets for the different sequences in the batch
         a_row_off = fx.Int32(seq_start) * fx.Int32(K)
         c_row_off = fx.Int32(seq_start) * fx.Int32(N)
         A_g = fx.make_view(fx.add_offset(fx.get_iter(A), fx.make_int_tuple(a_row_off)), fx.get_layout(A))
@@ -108,6 +110,7 @@ def jdbba_kernel(
         b_row_off = fx.Int32(off_b) * fx.Int32(N) * fx.Int32(K)
         B_g = fx.make_view(fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)), fx.get_layout(B))
 
+        #@Sami: creating the buffer tensors for the input data at the DRAM level
         A_buf = fx.rocdl.make_buffer_tensor(A_g, max_size=True)
         B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
         # Bound C's descriptor to exactly M_b rows so the hardware OOB-drops any
@@ -116,47 +119,58 @@ def jdbba_kernel(
         # because the installed make_buffer_tensor has no num_records_bytes arg.
         C_buf = make_bounded_buffer_tensor(C_g, fx.Int64(fx.Int32(M_b) * fx.Int32(N) * fx.Int32(2)))
 
+        #@Sami: Start specifying the partition at the thread block level
         gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[None, None, block_m_idx, None]  # (BM, BK, k)
         gB_k = fx.flat_divide(B_buf, (BLOCK_N, BLOCK_K))[None, None, block_n_idx, None]  # (BN, BK, k)
         gC = fx.flat_divide(C_buf, (BLOCK_M, BLOCK_N))[None, None, block_m_idx, block_n_idx]  # (BM, BN)
 
         # Broadcast bias: group b's (N,) slice viewed as (BLOCK_M, N) with M-stride 0
         # (same vector for every row), then pick this block's N-tile.
+        #@Sami: Broadcast the bias for the different elements in the batch
         bias_elem_off = fx.Int32(off_b) * fx.Int32(N)
         BIAS_g = fx.make_view(fx.add_offset(fx.get_iter(BIAS), fx.make_int_tuple(bias_elem_off)), fx.get_layout(BIAS))
         BIAS_buf = fx.rocdl.make_buffer_tensor(BIAS_g, max_size=True)
         gBias2d = fx.make_view(fx.get_iter(BIAS_buf), fx.make_layout((BLOCK_M, N), (0, 1)))
         gBias = fx.flat_divide(gBias2d, (BLOCK_M, BLOCK_N))[None, None, 0, block_n_idx]  # (BM, BN)
 
+        #@Sami: Specifying the MFMA layout at the thread level
         thr_mma = tiled_mma.thr_slice(tid)
         thr_copy_g2s_A = tiled_copy_g2s_A.get_slice(tid)
 
+        #@Sami: Specify how the copy should be done
         uni_copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
         buffer_copy_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
 
+        #@Sami: Create the specification at the thread level based on the copy definition above
         thr_copy_s2r_A = fx.make_tiled_copy_A(buffer_copy_128b, tiled_mma).get_slice(tid)
         thr_copy_g2r_B = fx.make_tiled_copy_B(buffer_copy_128b, tiled_mma).get_slice(tid)
 
+        #@Sami: ???
         composed_layout_A = fx.make_composed_layout(
             fx.static(fx.SwizzleType.get(3, 3, 3)),
             fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2)),
         )
         sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)  # (BM, BK, STAGES_A)
 
+        #@Sami: Specify that we partition the data within the tile. Why are there two variants partition_S and partition_D?
         thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)  # (VA, VM, VK, k)
         thr_sA = thr_copy_g2s_A.partition_D(sA)      # (VA, VM, VK, STAGES_A)
         thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)  # (VA, VM, VK, STAGES_A)
         thr_gB_k = thr_copy_g2r_B.partition_S(gB_k)  # (VB, VN, VK, k)
 
+        #@Sami: Speficy how the layout at register level should be based on the tile partition defined above
         copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])
 
+        #@Sami: Specify the register level layout but for what???
         mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])
         mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)
         mma_frag_C = thr_mma.make_fragment_C(gC)
 
+        #@Sami: Update the layout for the thread copy based on the MMA layout for the operations (reshuffling???)
         mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
         mma_frag_B_retile = thr_copy_g2r_B.retile(mma_frag_B)
 
+        #@Sami: Get the stride at the block level
         gA_k_stride = fx.get_scalar(gA_k.stride[2])
         gB_k_stride = fx.get_scalar(gB_k.stride[2])
 
