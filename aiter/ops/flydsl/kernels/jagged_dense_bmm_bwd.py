@@ -288,7 +288,7 @@ def grad_bias_partials_kernel(
     acc0 = fx.Float32(0.0)
     for r, state in range(off_s, M_b, fx.Int32(SPLIT), init=[acc0]):
         acc = state[0]
-        row_view = fx.slice(DOUT_buf, (r, None))
+        row_view = fx.slice(DOUT_buf, (fx.Int32(r), None))
         row_div = fx.logical_divide(row_view, fx.make_layout(1, 1))
         val = _load_scalar(copy_bf16, fx.BFloat16, row_div, tid)
         acc = acc + val.to(fx.Float32)
@@ -418,10 +418,10 @@ def grad_dense_partials_kernel(
             fx.memref_store(dval, sD, (lrow, lcol))
         fx.gpu.barrier()
 
-        a = [[fx.memref_load(acc, (ki, ni)) for ni in range(NPT)] for ki in range(KPT)]
+        a = [[fx.Float32(fx.memref_load(acc, (ki, ni))) for ni in range(NPT)] for ki in range(KPT)]
         for m in fx.range_constexpr(DDENSE_BM):
-            jv = [fx.memref_load(sJ, (m, tk * fx.Int32(KPT) + fx.Int32(ki))).to(fx.Float32) for ki in range(KPT)]
-            dv = [fx.memref_load(sD, (m, tn * fx.Int32(NPT) + fx.Int32(ni))).to(fx.Float32) for ni in range(NPT)]
+            jv = [fx.Float32(fx.memref_load(sJ, (m, tk * fx.Int32(KPT) + fx.Int32(ki)))) for ki in range(KPT)]
+            dv = [fx.Float32(fx.memref_load(sD, (m, tn * fx.Int32(NPT) + fx.Int32(ni)))) for ni in range(NPT)]
             for ki in fx.range_constexpr(KPT):
                 for ni in fx.range_constexpr(NPT):
                     a[ki][ni] = a[ki][ni] + jv[ki] * dv[ni]
