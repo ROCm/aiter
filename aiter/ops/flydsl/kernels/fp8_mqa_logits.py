@@ -42,15 +42,6 @@ def _i32_add(a, b):
     return fx.Int32(arith.addi(_to_raw(a), _to_raw(b)))
 
 
-def _f32_from_raw(scalar):
-    """Extend a (raw) f32/bf16 scalar load to f32 via arith.extf-or-identity.
-
-    GTensor.load returns a raw ir.Value (the buffer_load result), which has no
-    ``.extf`` helper, so wrap it in ArithValue first.
-    """
-    return ArithValue(_to_raw(scalar)).extf(T.f32)
-
-
 def _fp8_byte_to_f32(byte_scalar):
     """Convert a raw i8 fp8-byte load to f32 via ``v_cvt_f32_fp8``.
 
