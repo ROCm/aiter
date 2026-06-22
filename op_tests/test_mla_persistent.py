@@ -477,6 +477,13 @@ def torch_mla_extend_split_kv(
         )
         or (
             get_gfx() == "gfx950"
+            and nheads == 32
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 1
+        )
+        or (
+            get_gfx() == "gfx950"
             and nheads == 8
             and is_fp8_q
             and is_fp8_kvc
@@ -1758,7 +1765,6 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
-
 args = parser.parse_args()
 for nhead, decode_qlen in args.nhead:
     df = []
