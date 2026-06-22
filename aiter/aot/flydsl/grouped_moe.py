@@ -13,13 +13,13 @@ import os
 import sys
 import time
 
-# Only when this module is run directly as the AOT compile driver do we hide
-# HIP devices and take aiter's AOT import path; importing it as a library must
-# not mutate the environment. __name__ is already "__main__" here, even though
-# this runs before the aiter imports below that read these variables.
-if __name__ == "__main__":
-    os.environ.setdefault("HIP_VISIBLE_DEVICES", "-1")
-    os.environ.setdefault("AITER_AOT_IMPORT", "1")
+# When running this module directly as the AOT compile driver, export these
+# BEFORE launching -- the module no longer sets them itself, so importing it
+# (as a library or as __main__) never mutates the environment as a side effect.
+# Both must be set before the aiter imports below that read them:
+#   HIP_VISIBLE_DEVICES=-1   hide HIP devices so the AOT path takes no GPU
+#   AITER_AOT_IMPORT=1       make the aiter imports below take the AOT path
+# e.g.: HIP_VISIBLE_DEVICES=-1 AITER_AOT_IMPORT=1 python -m aiter.aot.flydsl.grouped_moe
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
