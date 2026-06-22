@@ -415,6 +415,134 @@ def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Triton MoE baseline (for --compare_triton): the aiter Triton grouped-GEMM
+# MoE (moe_gemm_a8w4 / moe_gemm_a4w4, the matmul_ogs-style kernels), run as a
+# full two-stage MoE exactly like op_tests/op_benchmarks/triton/bench_moe_gemm_a8w4.py,
+# and timed with the SAME run_perftest(testGraph=True) the FlyDSL path uses so
+# the two us numbers are apples-to-apples.
+#
+#   stage1: x @ w1 (K=model_dim, N=2*inter) + swiglu  -> inter
+#   stage2: h @ w2 (K=inter,     N=model_dim)         -> model_dim
+#
+# Activation quant follows the data_format: a8w4 -> per-1x32 MXFP8 input
+# (matches the FlyDSL a8w4 path), a4w4 -> MXFP4 input. Weights are MXFP4 in
+# both. This is a perf-only baseline (random weights); no correctness check.
+# ---------------------------------------------------------------------------
+def _run_triton_moe_perf(
+    data_format: str,
+    *,
+    experts: int,
+    tokens: int,
+    topk: int,
+    model_dim: int,
+    inter_dim: int,
+    warmup: int = 5,
+    iters: int = 101,
+    seed: int = 0,
+) -> float:
+    """Time the aiter Triton two-stage MoE for one shape. Returns us (graph)."""
+    if data_format not in ("a4w4", "a8w4"):
+        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
+
+    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from aiter.test_common import run_perftest
+
+    dev = "cuda"
+    K = model_dim
+    N1 = 2 * inter_dim
+    fp8_dtype = torch.float8_e4m3fn
+
+    if data_format == "a8w4":
+        from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+            moe_gemm_a8w4 as _moe_gemm,
+            swizzle_scales_gfx1250 as _swizzle_gfx1250,
+        )
+
+        def _quant_act(t):
+            # per-1x32 MXFP8 along the contraction axis (matches FlyDSL a8w4).
+            return downcast_to_mxfp(t.to(torch.bfloat16), fp8_dtype, axis=-1)
+
+    else:  # a4w4
+        from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+            moe_gemm_a4w4 as _moe_gemm,
+            mxfp4_quant,
+        )
+
+        _swizzle_gfx1250 = None  # a4w4 scale swizzle is CDNA4 (gfx950) only
+
+        def _quant_act(t):
+            return mxfp4_quant(t.to(torch.bfloat16))
+
+    def _swz(scale, n_dim, k_dim):
+        # gfx1250 HBM scale swizzle requires n%32==0 and k%256==0; otherwise the
+        # kernel consumes the raw (un-swizzled) scale.
+        if (
+            _swizzle_gfx1250 is not None
+            and get_arch() == "gfx1250"
+            and n_dim % 32 == 0
+            and k_dim % (32 * 8) == 0
+        ):
+            return _swizzle_gfx1250(scale), "GFX1250_SCALE"
+        return scale, None
+
+    torch.manual_seed(seed)
+    # Triton weight layout is (E, k, n).
+    w1 = (torch.randn((experts, K, N1), device=dev, dtype=torch.bfloat16) * 0.1)
+    w2 = (torch.randn((experts, inter_dim, K), device=dev, dtype=torch.bfloat16) * 0.1)
+    w1_q, w1_s = downcast_to_mxfp(w1, torch.uint8, axis=1)
+    w2_q, w2_s = downcast_to_mxfp(w2, torch.uint8, axis=1)
+    w1_s, swz1 = _swz(w1_s, N1, K)
+    w2_s, swz2 = _swz(w2_s, K, inter_dim)
+    b1 = (torch.randn((experts, N1), device=dev, dtype=torch.float32) * 1e-3)
+    b2 = (torch.randn((experts, K), device=dev, dtype=torch.float32) * 1e-3)
+
+    x = (torch.randn((tokens, K), device=dev, dtype=torch.bfloat16) * 0.5)
+
+    # Routing is precomputed (data-dependent / host-syncing -> not graph-safe),
+    # matching the FlyDSL path which precomputes topk outside the timed call.
+    logits = torch.randn((tokens, experts), device=dev, dtype=torch.float16)
+    rdata, gather_indx, scatter_indx = routing(logits, topk)
+
+    def _call():
+        xq, xs = _quant_act(x)
+        h = _moe_gemm(
+            xq,
+            w1_q,
+            xs,
+            w1_s,
+            None,
+            None,
+            b1,
+            rdata,
+            gather_indx=gather_indx,
+            swizzle_mx_scale=swz1,
+            out_dtype=torch.bfloat16,
+            apply_swiglu=True,
+        )
+        hq, hs = _quant_act(h)
+        out = _moe_gemm(
+            hq,
+            w2_q,
+            hs,
+            w2_s,
+            None,
+            None,
+            b2,
+            rdata,
+            scatter_indx=scatter_indx,
+            swizzle_mx_scale=swz2,
+            out_dtype=torch.bfloat16,
+        )
+        return out
+
+    torch.cuda.synchronize()
+    _out, us = run_perftest(_call, num_warmup=warmup, num_iters=iters, testGraph=True)
+    return float(us)
+
+
+# ---------------------------------------------------------------------------
 # Pytest correctness suite
 # ---------------------------------------------------------------------------
 def run_moe(
@@ -624,6 +752,13 @@ def main() -> None:
         help="call the real grouped WMMA GEMM kernel. Default: True on gfx1250, "
         "False elsewhere (mock the GEMM so the tiny operators run on any arch).",
     )
+    parser.add_argument(
+        "--compare_triton",
+        action="store_true",
+        help="also time the aiter Triton MoE (moe_gemm_a8w4 / moe_gemm_a4w4, run "
+        "as a full two-stage MoE) for the same shape/format and report triton_us "
+        "+ speedup vs the FlyDSL grouped GEMM. Best used with --scenario bench.",
+    )
     args = parser.parse_args()
     if not args.real_gemm:
         _mock_grouped_gemm()
@@ -665,22 +800,56 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
         )
-        rows.append(
-            {
-                "data_format": args.data_format,
-                "layout": args.layout,
-                "act": args.act,
-                "experts": args.experts,
-                "tokens": _tok,
-                "topk": args.topk,
-                "model_dim": args.model_dim,
-                "inter_dim": args.inter_dim,
-                "logits_diff": metrics["logits_diff"],
-                "rel_l2": metrics["rel_l2"],
-                "pass": metrics["passed"],
-                "us": metrics.get("us"),
-            }
-        )
+        row = {
+            "data_format": args.data_format,
+            "layout": args.layout,
+            "act": args.act,
+            "experts": args.experts,
+            "tokens": _tok,
+            "topk": args.topk,
+            "model_dim": args.model_dim,
+            "inter_dim": args.inter_dim,
+            "logits_diff": metrics["logits_diff"],
+            "rel_l2": metrics["rel_l2"],
+            "pass": metrics["passed"],
+            "us": metrics.get("us"),
+        }
+
+        if args.compare_triton:
+            flydsl_us = metrics.get("us")
+            try:
+                triton_us = _run_triton_moe_perf(
+                    args.data_format,
+                    experts=args.experts,
+                    tokens=args.tokens,
+                    topk=args.topk,
+                    model_dim=args.model_dim,
+                    inter_dim=args.inter_dim,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                )
+            except Exception as exc:  # a4w4 triton may be gfx950-only, etc.
+                triton_us = None
+                print(f"[compare_triton {args.data_format}] FAILED: {exc}", flush=True)
+            # speedup > 1 => FlyDSL grouped GEMM is faster than Triton.
+            speedup = (
+                triton_us / flydsl_us
+                if (triton_us is not None and flydsl_us)
+                else None
+            )
+            row["flydsl_us"] = flydsl_us
+            row["triton_us"] = triton_us
+            row["speedup(triton/flydsl)"] = speedup
+            tu = f"{triton_us:.2f}" if triton_us is not None else "n/a"
+            fu = f"{flydsl_us:.2f}" if flydsl_us else "n/a"
+            su = f"{speedup:.2f}x" if speedup is not None else "n/a"
+            print(
+                f"[compare_triton {args.data_format}] tokens={_tok}: "
+                f"flydsl_us={fu} triton_us={tu} speedup(triton/flydsl)={su}",
+                flush=True,
+            )
+
+        rows.append(row)
 
     # Always print the summary table (verify and bench).
     summarize(rows)
