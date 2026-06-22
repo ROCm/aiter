@@ -136,9 +136,7 @@ def _validate_mxfp4_hidden_dim(n: int, element_size: int) -> None:
             f"(bf16/fp16: 2), got element_size={element_size}"
         )
     if n <= 0:
-        raise ValueError(
-            f"MXFP4 fused quant requires hidden_dim n > 0, got n={n}"
-        )
+        raise ValueError(f"MXFP4 fused quant requires hidden_dim n > 0, got n={n}")
     pack_size = 16 // element_size
     if n % 32 != 0:
         raise ValueError(f"MXFP4 fused quant requires n divisible by 32, got n={n}")
@@ -721,6 +719,14 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.reduce_scatter(input, output, dim, registered=True)
+            else:
+                # Warmup forward (pre-capture): run the REAL reduce_scatter via
+                # the copy-in path. Unlike custom_all_reduce, returning zeros
+                # here corrupts DeepSeek-V4 hash-routed MoE accuracy (~5pp GSM8K
+                # drop) — the warmup result feeds downstream state baked into the
+                # captured graph. Out-of-place collective, so allocation pattern
+                # still matches the captured all_gather_reg path.
+                return self.reduce_scatter(input, output, dim, registered=False)
         else:
             return self.reduce_scatter(input, output, dim, registered=False)
 
@@ -785,18 +791,18 @@ class CustomAllreduce:
         self, inp: torch.Tensor, dim: int = 0
     ) -> Optional[torch.Tensor]:
         orig_dtype = inp.dtype
-        view_dtype = self._INT_TO_FP_VIEW.get(orig_dtype)
-        if view_dtype is not None:
-            inp = inp.view(view_dtype)
+        view_dtype = self._INT_TO_FP_VIEW.get(orig_dtype) or orig_dtype
 
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                out = self.all_gather_reg(inp, dim=dim)
+                out = self.all_gather_reg(inp.view(view_dtype), dim=dim)
             else:
-                print("allgather capture hipgraph error")
-                out = torch.zeros_like(inp)
+                # Warmup forward (pre-capture): run the REAL all_gather via the
+                # copy-in (unreg) path. Returning zeros here corrupts V4 MoE
+                # accuracy — see custom_reduce_scatter for the rationale.
+                out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
         else:
-            out = self.all_gather_unreg(inp, dim=dim)
+            out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
 
         if view_dtype is not None and out is not None:
             out = out.view(orig_dtype)
@@ -816,6 +822,7 @@ class CustomAllreduce:
         use_1stage: bool = False,
         post_per_token_quant: bool = False,
         out_hidden_dim: int = 0,
+        gemma_norm: bool = False,
     ):
         valid_dim = w.numel()
         if res_out is None:
@@ -827,7 +834,9 @@ class CustomAllreduce:
         if not post_per_token_quant:
             if out is None:
                 out_dim = out_hidden_dim or inp.shape[-1]
-                out = torch.empty(inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device)
+                out = torch.empty(
+                    inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device
+                )
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             if inp.shape[-1] == valid_dim and out.shape[-1] == inp.shape[-1]:
                 ops.fused_allreduce_rmsnorm(
@@ -841,6 +850,7 @@ class CustomAllreduce:
                     reg,
                     reg_bytes,
                     use_1stage,
+                    gemma_norm,
                 )
             else:
                 ops.fused_allreduce_rmsnorm_pad(
@@ -854,6 +864,7 @@ class CustomAllreduce:
                     reg,
                     reg_bytes,
                     use_1stage,
+                    gemma_norm,
                 )
             return out, res_out
         else:
@@ -887,6 +898,7 @@ class CustomAllreduce:
         eps: float,
         use_1stage: bool,
         out_hidden_dim: int = 0,
+        gemma_norm: bool = False,
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -901,6 +913,7 @@ class CustomAllreduce:
                     registered=True,
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
+                    gemma_norm=gemma_norm,
                 )
             else:
                 out_dim = out_hidden_dim or input.shape[-1]
@@ -925,6 +938,7 @@ class CustomAllreduce:
                 registered=False,
                 use_1stage=use_1stage,
                 out_hidden_dim=out_hidden_dim,
+                gemma_norm=gemma_norm,
             )
 
     def custom_fused_ar_rms_packed_input(
@@ -936,6 +950,7 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         prefill_support: bool = False,
+        gemma_norm: bool = False,
     ) -> Optional[torch.Tensor]:
         # Let the C++ wrapper pack supported last-dim sliced views directly
         # into the registered IPC buffer so eager and graph paths both avoid
@@ -952,6 +967,7 @@ class CustomAllreduce:
                     registered=False,
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
+                    gemma_norm=gemma_norm,
                 )
             else:
                 out_dim = out_hidden_dim or input.shape[-1]
@@ -975,6 +991,7 @@ class CustomAllreduce:
             registered=False,
             use_1stage=use_1stage,
             out_hidden_dim=out_hidden_dim,
+            gemma_norm=gemma_norm,
         )
 
     def custom_fused_ar_rms_quant(
@@ -1291,7 +1308,9 @@ class CustomAllreduce:
                     input.shape[:-1] + (K // 2,), dtype=torch.uint8, device=input.device
                 )
                 dummy_scale = torch.zeros(
-                    input.shape[:-1] + (K // 32,), dtype=torch.uint8, device=input.device
+                    input.shape[:-1] + (K // 32,),
+                    dtype=torch.uint8,
+                    device=input.device,
                 )
                 if emit_bf16:
                     return (

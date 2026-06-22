@@ -178,7 +178,10 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                     work_info.kv_start = curr_kv_begin + (curr_kv_block * params.kv_granularity);
                     if(page_size == 1)
                     {
-                        int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
+                        // round-robin CP: no local-causal trim (full local kv per
+                        // work); kernel masks on global positions.
+                        int32_t batch_tail =
+                            params.is_cp_round_robin ? 0 : (num_qo_tiles - 1 - curr_qo_tile_idx);
                         if constexpr(!Traits::kIsSparse)
                         {
                             if(params.qk_batch_ratio != 1)
@@ -328,7 +331,10 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                             curr_kv_begin + (curr_kv_block * params.kv_granularity);
                         if(page_size == 1)
                         {
-                            int32_t batch_tail = (num_qo_tiles - 1 - curr_qo_tile_idx);
+                            // round-robin CP: no local-causal trim (see note above).
+                            int32_t batch_tail = params.is_cp_round_robin
+                                                     ? 0
+                                                     : (num_qo_tiles - 1 - curr_qo_tile_idx);
                             if constexpr(!Traits::kIsSparse)
                             {
                                 if(params.qk_batch_ratio != 1)
@@ -448,6 +454,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   const int32_t max_split_per_batch,
                                   const at::ScalarType q_dtype,
                                   const at::ScalarType kv_dtype,
+                                  const bool is_cp_round_robin,
                                   torch::Tensor& work_metadata_ptrs,
                                   torch::Tensor& work_info_set,
                                   torch::Tensor& work_indptr,
@@ -509,12 +516,12 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         (num_heads == 16) ||
         ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
          (max_seqlen_qo == 2)) ||
-        ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8)  ||
+        ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
-         (((num_heads == 32) && (max_seqlen_qo == 4)) || (num_heads == 64) || (num_heads == 128))) ||
+         (((num_heads == 32) && (max_seqlen_qo == 4)) || (num_heads == 64) ||
+          (num_heads == 128))) ||
         hk_mtp_experimental;
-
 
     if(!natively_supported && (num_heads % 16 == 0))
     {
@@ -531,7 +538,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
              !kv_is_fp8) ||
             ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
             ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
-             (((num_heads == 32) && (max_seqlen_qo == 4)) || (num_heads == 64) || (num_heads == 128))) ||
+             (((num_heads == 32) && (max_seqlen_qo == 4)) || (num_heads == 64) ||
+              (num_heads == 128))) ||
             hk_mtp_experimental,
         __func__,
         ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
@@ -563,6 +571,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.uni_seqlen_qo                = uni_seqlen_qo;
     params.ori_seqlen_qo                = ori_uni_seqlen_qo;
     params.is_causal                    = is_causal;
+    params.is_cp_round_robin            = is_cp_round_robin;
     params.topk                         = (topk < 0) ? topk : (topk + page_size - 1) / page_size;
     params.qk_batch_ratio               = qk_batch_ratio;
     params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
