@@ -157,8 +157,7 @@ void TileGemmComputeImpl(const HostArguments& args)
 
     constexpr ck_tile::QuantType QuantMode = ck_tile::QuantType::RowColQuant;
     constexpr bool eight_waves =
-        (GemmConfig::M_Warp_v * GemmConfig::N_Warp_v * GemmConfig::K_Warp_v == 8) &&
-        GemmConfig::K_Warp_Tile_v == 128;
+        (GemmConfig::M_Warp_v * GemmConfig::N_Warp_v * GemmConfig::K_Warp_v == 8);
 
     constexpr bool TransposeC = false;
 
