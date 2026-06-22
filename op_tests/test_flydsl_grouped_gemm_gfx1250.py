@@ -25,6 +25,7 @@ check (``--scenario verify``).
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import os
 import sys
 from typing import Optional
@@ -38,7 +39,7 @@ for _dep in reversed(_LOCAL_DEPS):
         sys.path.insert(0, _dep)
 
 from aiter import ActivationType, QuantType  # noqa: E402
-from aiter.aot.flydsl.common import fail_on_aot_cache_miss  # noqa: E402
+from aiter.aot.flydsl.common import run_only_env  # noqa: E402
 from aiter.fused_moe import (  # noqa: E402
     fused_moe,
     torch_moe_stage1,
@@ -47,7 +48,6 @@ from aiter.fused_moe import (  # noqa: E402
 from aiter.ops.flydsl.grouped_moe_gfx1250 import (  # noqa: E402
     _grouped_a8w4_prepare_scale_batch,
 )
-import aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 as _grouped_gk  # noqa: E402
 from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
 from aiter.ops.shuffle import shuffle_weight  # noqa: E402
@@ -548,17 +548,6 @@ def _invoke_grouped_fused_moe(fused_case):
     )
 
 
-# ---------------------------------------------------------------------------
-# AOT cache-coverage guards
-# ---------------------------------------------------------------------------
-_run_grouped_via_fused_moe_with_aot_cache_check = fail_on_aot_cache_miss(_grouped_gk)(
-    _run_grouped_via_fused_moe
-)
-_invoke_grouped_fused_moe_with_aot_cache_check = fail_on_aot_cache_miss(_grouped_gk)(
-    _invoke_grouped_fused_moe
-)
-
-
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     diff = (actual.float() - expected.float()).norm()
     base = expected.float().norm().clamp(min=1e-12)
@@ -592,30 +581,28 @@ def _sanity_check(
     should stay close when it uses the same MXFP4 quantization contract as
     the reference.
 
-    ``check_aot_cache=True`` additionally fails if the grouped GEMM JIT'd at
-    runtime instead of loading the AOT-precompiled artifact (see
+    ``check_aot_cache=True`` runs in FlyDSL run-only mode: kernels load the
+    AOT-precompiled artifact and never JIT-compile, so a cache miss raises
+    instead of silently masking missing precompiled coverage (see
     ``aiter/aot/flydsl/grouped_moe.py``).
     """
     _require_gfx1250()
-    run_grouped = (
-        _run_grouped_via_fused_moe_with_aot_cache_check
-        if check_aot_cache
-        else _run_grouped_via_fused_moe
-    )
-    out, ref = run_grouped(
-        experts=experts,
-        tokens=tokens,
-        topk=topk,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        data_format=data_format,
-        layout=layout,
-        activation=activation,
-        swiglu_limit=swiglu_limit,
-        use_bias=use_bias,
-        verify=True,
-        all_ones=all_ones,
-    )
+    run_only = run_only_env() if check_aot_cache else nullcontext()
+    with run_only:
+        out, ref = _run_grouped_via_fused_moe(
+            experts=experts,
+            tokens=tokens,
+            topk=topk,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            data_format=data_format,
+            layout=layout,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            use_bias=use_bias,
+            verify=True,
+            all_ones=all_ones,
+        )
     rel = _rel_l2(out, ref)
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
     tag = f"{data_format} {layout} {act}{' all_ones' if all_ones else ''}"
@@ -668,15 +655,17 @@ def _bench(args: argparse.Namespace) -> None:
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
         )
-        # Warmup / JIT. With --check-aot-cache, route the first invocation
-        # through the AOT-tracking wrapper so a runtime compile (cache miss)
-        # raises instead of silently masking missing precompiled coverage.
-        warmup_invoke = (
-            _invoke_grouped_fused_moe
+        # Warmup / JIT. By default run the first invocation in FlyDSL
+        # run-only mode so a runtime compile (cache miss) raises instead of
+        # silently masking missing precompiled coverage. The artifact loaded
+        # here is reused by the timed invocations below.
+        warmup_run_only = (
+            nullcontext()
             if getattr(args, "no_check_aot_cache", False)
-            else _invoke_grouped_fused_moe_with_aot_cache_check
+            else run_only_env()
         )
-        warmup_invoke(fused_case)
+        with warmup_run_only:
+            _invoke_grouped_fused_moe(fused_case)
         torch.cuda.synchronize()
 
         def _thunk():
@@ -810,9 +799,9 @@ def main() -> None:
         "--no-check-aot-cache",
         action="store_true",
         help="disable the default AOT cache-miss check. By default the test "
-        "fails if the grouped GEMM JIT-compiles at runtime instead of "
-        "loading the AOT-precompiled artifact. Pass this flag to allow "
-        "runtime JIT compilation.",
+        "runs in FlyDSL run-only mode (FLYDSL_RUNTIME_RUN_ONLY=1): kernels "
+        "load the AOT-precompiled artifact and never JIT-compile, so a cache "
+        "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
     args = parser.parse_args()
     if not args.real_gemm:
