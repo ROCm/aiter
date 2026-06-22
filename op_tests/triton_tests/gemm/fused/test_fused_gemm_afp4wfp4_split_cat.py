@@ -139,10 +139,14 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
     if shuffle:
         # CDNA4-only triton kernel -> always the gfx950 scale layout.
         if M >= 32:
-            x_scales_shuffled = shuffle_scale_gemm(x_scale, arch="gfx950")
+            x_scales_shuffled = shuffle_scale_gemm(
+                x_scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
         else:
             x_scales_shuffled = x_scale.contiguous()
-        w_scales_shuffled = shuffle_scale_gemm(w_scale, arch="gfx950")
+        w_scales_shuffled = shuffle_scale_gemm(
+            w_scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         use_int4 = False
         weight_shuffle_layout = (16, 16)
         w_shuffed = shuffle_weight(

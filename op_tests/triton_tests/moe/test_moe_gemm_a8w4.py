@@ -293,7 +293,9 @@ def test_op(
         else:
             assert get_arch() == "gfx950"
             swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = shuffle_scale_moe(w_scale_tri, arch="gfx950")
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
     else:
         swizzle_mx_scale = None
 

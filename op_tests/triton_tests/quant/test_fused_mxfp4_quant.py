@@ -75,7 +75,9 @@ def calculate_target_w_torch(
             (scaleM, scaleN), dtype=out1_scale.dtype, device=out1_scale.device
         )
         out1_scale_pad[:M, :scaleN_valid] = out1_scale[:M, :scaleN_valid]
-        out1_scale = shuffle_scale_gemm(out1_scale_pad, arch="gfx950")
+        out1_scale = shuffle_scale_gemm(
+            out1_scale_pad, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         out1_scale = out1_scale.view(out1_scale.shape[0] * 32, -1)
 
     if x3 is not None:
@@ -255,7 +257,9 @@ def run_torch_reduce_act_mul_mxfp4_group_quant(x, x2, activation, dtype, shuffle
             (scaleM, scaleN), dtype=out_scale.dtype, device=out_scale.device
         )
         out_scale_pad[:M, :scaleN] = out_scale[:M, :scaleN]
-        out_scale = shuffle_scale_gemm(out_scale_pad, arch="gfx950")
+        out_scale = shuffle_scale_gemm(
+            out_scale_pad, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         out_scale = out_scale.view(out_scale.shape[0] * 32, -1)
     return (out, out_scale), y2
 

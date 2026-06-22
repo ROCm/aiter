@@ -131,7 +131,9 @@ def compute_roofline(
 
 def check_and_shuffle_scales(scale, N, K):
     if N % 32 == 0 and K % (32 * 8) == 0:
-        scale = shuffle_scale_moe(scale, arch="gfx950")
+        scale = shuffle_scale_moe(
+            scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         return scale, "CDNA4_SCALE"
     else:
         return scale, None

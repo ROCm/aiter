@@ -49,7 +49,9 @@ def torch_act_mul_and_mxfp4_quant(
             (scaleM, scaleN), dtype=out_scale.dtype, device=out_scale.device
         )
         out_scale_pad[:M, :scaleN] = out_scale[:M, :scaleN]
-        out_scale = shuffle_scale_gemm(out_scale_pad, arch="gfx950")
+        out_scale = shuffle_scale_gemm(
+            out_scale_pad, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         out_scale = out_scale.view(out_scale.shape[0] * 32, -1)
     return out, out_scale
 

@@ -66,7 +66,9 @@ def generate_gemm_a16wfp4_inputs(
         )
 
         # CDNA4-only triton kernel -> always the gfx950 scale layout.
-        w_scales_shuffled = shuffle_scale_gemm(w_scales, arch="gfx950")
+        w_scales_shuffled = shuffle_scale_gemm(
+            w_scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
     else:
         w_shuffed = w
         w_scales_shuffled = w_scales

@@ -331,6 +331,28 @@ def _shuffle_scale_tile_gfx1250(scales, preshuffle_factor, scale_kwidth):
     return out.reshape(*batch, num_stripes, cols * preshuffle_factor)
 
 
+# --- shared gfx950 scale tile (GEMM + MoE) ---
+def _shuffle_scale_tile_gfx950(scales, preshuffle_factor, scale_kwidth):
+    """Shared gfx950 (CDNA4) scale tile-permute over the last two dims.
+
+    row = the output M/N axis, packed into stripes of ``preshuffle_factor`` lanes (split 2 x preshuffle_factor//2)
+    col = the scale-K axis (K_groups / K_SCALE), packed into ``scale_kwidth`` groups (split 2 x scale_kwidth//2)
+
+    Shared by the GEMM ((M, K_groups)) and MoE ((E, N, K_SCALE), transposed) gfx950 scale shuffles.
+    """
+    # rows and cols grab the last two dims, and *batch collects everything before them into a list (possibly empty)
+    *batch, rows, cols = scales.shape
+    num_stripes = rows // preshuffle_factor
+    num_kchunks = cols // scale_kwidth
+    x = scales.reshape(-1, rows, cols)  # fold batch/expert dims into one axis
+    x = x.view(
+        -1, num_stripes, 2, preshuffle_factor // 2, num_kchunks, 2, scale_kwidth // 2, 1
+    )
+    x = x.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
+    out = x.view(-1, num_stripes, cols * preshuffle_factor)
+    return out.reshape(*batch, num_stripes, cols * preshuffle_factor)
+
+
 # --- GEMM scales (afp4wfp4) ---
 
 
@@ -343,17 +365,15 @@ def shuffle_scale_gemm(
     """Arch-aware GEMM scale shuffle.
 
     Inverse: ``unshuffle_scale_gemm`` (gfx950 only).
+    gfx950: preshuffle_factor = 32, scale_kwidth = 8
+    gfx1250: preshuffle_factor = 16, scale_kwidth = 4
     """
     if (arch or get_arch()) == "gfx1250":
         return _shuffle_scale_tile_gfx1250(scales, preshuffle_factor, scale_kwidth)
 
-    # gfx950 implementation
-    scales_shuffled = scales.clone()
-    sm, sn = scales_shuffled.shape
-    scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-    scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
-    scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
-    return scales_shuffled
+    if (arch or get_arch()) == "gfx950":
+        return _shuffle_scale_tile_gfx950(scales, preshuffle_factor, scale_kwidth)
+    raise ValueError(f"Unsupported arch: {arch or get_arch()}")
 
 
 def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tensor:
@@ -381,6 +401,8 @@ def shuffle_scale_moe(
 
     Returns the shuffled scale tensor; the caller supplies the matching
     ``SWIZZLE_MX_SCALE`` label ("GFX1250_SCALE" for gfx1250, "CDNA4_SCALE" for gfx950).
+    gfx950: preshuffle_factor = 32, scale_kwidth = 8
+    gfx1250: preshuffle_factor = 32, scale_kwidth = 8
     """
 
     arch = arch or get_arch()
@@ -389,18 +411,11 @@ def shuffle_scale_moe(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
         return tiled.transpose(-1, -2)
-
-    # gfx950 (CDNA4) implementation
-    NON_K_PRESHUFFLE_BLOCK_SIZE = 32
-    block_shape = data.shape
-    SCALE_K = block_shape[-2]
-    N = block_shape[-1]
-    data = data.transpose(-1, -2)
-    data = data.view(-1, N // NON_K_PRESHUFFLE_BLOCK_SIZE, 2, 16, SCALE_K // 8, 2, 4, 1)
-    data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
-    E = block_shape[0]
-    data = data.reshape(E, N // 32, SCALE_K * 32)
-    return data.transpose(-1, -2)
+    if (arch or get_arch()) == "gfx950":
+        tiled = _shuffle_scale_tile_gfx950(
+            data.transpose(-1, -2), preshuffle_factor, scale_kwidth
+        )
+    return tiled.transpose(-1, -2)
 
 
 # --- batched scales (FP4 blockscale16, attention) ---
