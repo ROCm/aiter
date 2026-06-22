@@ -188,6 +188,32 @@ def get_GEMM_A16W16_config(
             default_config["libtype"] = "skinny"
             default_config["solidx"] = 2
             default_config["kernelName"] = ""
+        elif (
+            # Medium-M skinny bf16 GEMM fallback. Without this, the default
+            # torch path is used for shapes like the GLM-5 sparse MLA
+            # indexer's (N=32 or 256, K=6144) at M in the hundreds-to-
+            # thousands range, which is 50-100x slower than the
+            # ``bf16gemm_fp32bf16_tn_64x64_splitk_clean`` asm kernel and has
+            # MAF'd at M=16384 on gfx950 in practice. The asm kernel works
+            # for any M as long as K is 64-aligned. The ``N % 64 == 0``
+            # guard is essential: the chosen asm kernel has tileN=64 and
+            # the C++ heuristic rejects any N not a multiple of tileN.
+            eval(dtype) in (dtypes.bf16, dtypes.fp16)
+            and eval(otype) == dtypes.bf16
+            and not bias
+            and not scaleAB
+            and not bpreshuffle
+            and N <= 256
+            and N % 64 == 0
+            and K % 64 == 0
+            and M > 16
+        ):
+            default_config["libtype"] = "asm"
+            default_config["solidx"] = 5
+            default_config["splitK"] = max(1, K // 512)
+            default_config["kernelName"] = (
+                "_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE"
+            )
         if not default_config:
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
