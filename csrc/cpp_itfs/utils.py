@@ -16,6 +16,7 @@ import logging
 import time
 import inspect
 import json
+import re
 
 
 def get_git_commit_id_short():
@@ -51,44 +52,29 @@ AITER_REBUILD = int(os.environ.get("AITER_REBUILD", 0))
 
 HOME_PATH = os.environ.get("HOME")
 AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
+PREBUILD_META_FILE = "aiter_prebuild_meta.json"
 
 
-def _resolve_build_dir():
-    """Where cpp_itfs template ops (pa_ps, ...) are compiled to and loaded from.
+def _resolve_packaged_build_dir():
+    """Read-only fallback dir holding wheel-shipped cpp_itfs prebuilds (pa_ps, ...).
 
-    1. AITER_ROOT_DIR explicitly set  -> <AITER_ROOT_DIR>/build  (e.g. a persisted
-       JIT cache on a mounted volume; preserves the existing override behaviour).
-    2. Otherwise piggyback on the module-JIT dir (get_user_jit_dir()/build). This is
-       the same dir the module_* kernels build into, so prebuilt cpp_itfs .so (a) ship
-       inside the wheel via package_data and (b) are found at runtime with ZERO config
-       on a fresh container -- no more lazy hipcc JIT during the first inferences.
-       Tried via both import paths: aiter.jit.core (runtime) and jit.core (the path
-       setup.py puts on sys.path at build time).
-    3. Fall back to ~/.aiter/build if aiter's jit core cannot be imported.
+    This is get_user_jit_dir()/build -- the same dir module_* kernels build into and
+    where setup.py's prebuild_pa_ps() writes the AOT .so, so they (a) ship inside the
+    wheel via MANIFEST re-include and (b) are found at runtime with ZERO config on a
+    fresh container. It is ONLY ever read from, never written/cleared, so it does NOT
+    become the default cache location (see _resolve_writable_build_dir) -- that keeps
+    this change purely additive: no orphaned ~/.aiter caches, and AITER_REBUILD can
+    never delete shipped artifacts.
 
-    SCOPE / SIDE EFFECTS -- read before changing:
-      * This runs UNCONDITIONALLY at import time of this module. It is not gated by
-        PREBUILD_KERNELS / AITER_TRITON_ONLY / whether pa_ps is used, and BUILD_DIR
-        backs EVERY cpp_itfs template op (pa, pa_ps, mla, moe, sampling, ...), not
-        just pa_ps.
-      * Default move: with AITER_ROOT_DIR unset, the default cache dir changes from
-        the old ~/.aiter/build to get_user_jit_dir()/build. Any pre-upgrade cache
-        under ~/.aiter/build is thus orphaned -> the first run after upgrade triggers
-        a one-time JIT recompile into the new location for whatever cpp_itfs op gets
-        used (again, not only pa_ps).
-      * Import-time cost: case 2 imports aiter.jit.core, whose module body may
-        os.makedirs(bd_dir) and copytree the jit dir into ~/.aiter/jit if
-        site-packages isn't writable -- heavier than the old plain string join. There
-        is no circular import (aiter.jit.core does not import this module), and case 3
-        degrades gracefully to ~/.aiter/build if that import fails.
-      * Counterintuitive: setting AITER_ROOT_DIR (case 1) points BUILD_DIR at
-        <root>/build, which has NO wheel-prebuilt artifacts -> the prebuild benefit is
-        lost and the op JIT-recompiles there. compile_template_op logs a one-time
-        warning when it hits this so the loss isn't silent.
+    Tried lazily via both import paths: aiter.jit.core (runtime) and jit.core (the
+    path setup.py puts on sys.path at build time). Returns None if neither imports
+    (a minimal env with no aiter.jit) -- callers then just use the writable dir.
+
+    This is intentionally NOT called while importing this module: importing
+    aiter.jit.core may os.makedirs(bd_dir) and copytree the jit dir into ~/.aiter/jit
+    if site-packages isn't writable, so defer that cost until a packaged fallback is
+    actually checked.
     """
-    root = os.environ.get("AITER_ROOT_DIR")
-    if root:
-        return os.path.abspath(os.path.join(root, "build"))
     import importlib
 
     for mod_name in ("aiter.jit.core", "jit.core"):
@@ -97,17 +83,119 @@ def _resolve_build_dir():
             return os.path.abspath(os.path.join(get_user_jit_dir(), "build"))
         except Exception:
             continue
-    return os.path.abspath(os.path.join(f"{HOME_PATH}/.aiter", "build"))
+    return None
+
+
+def _resolve_writable_build_dir():
+    """Where cpp_itfs template ops are COMPILED to / where JIT writes / what
+    AITER_REBUILD clears. Preserves the historical default exactly:
+
+      * AITER_ROOT_DIR set -> <AITER_ROOT_DIR>/build  (e.g. a persisted volume).
+      * otherwise          -> ~/.aiter/build          (the pre-prebuild default).
+
+    Deliberately NOT get_user_jit_dir()/build: keeping the old default avoids
+    orphaning existing ~/.aiter caches and avoids writing JIT output into
+    site-packages. The wheel-shipped prebuilds live in the separate read-only
+    PACKAGED_BUILD_DIR, which _find_built() checks as a fallback -- so the prebuild
+    benefit is preserved even when AITER_ROOT_DIR points at a fresh volume.
+    """
+    root = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
+    return os.path.abspath(os.path.join(root, "build"))
+
+
+def _normalize_gpu_arch(arch):
+    return arch.strip().lower().split(":")[0]
+
+
+@lru_cache(maxsize=1)
+def _runtime_gpu_arch():
+    """Best-effort live GPU arch used to validate wheel-shipped prebuilds."""
+    arch = _normalize_gpu_arch(DEFAULT_GPU_ARCH)
+    if arch:
+        return arch
+
+    try:
+        result = subprocess.run(
+            "rocminfo", shell=True, capture_output=True, text=True, check=True
+        )
+        match = re.search(r"\b(gfx\w+)\b", result.stdout, re.IGNORECASE)
+        if match:
+            return _normalize_gpu_arch(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
+@lru_cache(maxsize=1)
+def _get_packaged_build_dir():
+    global PACKAGED_BUILD_DIR
+    if PACKAGED_BUILD_DIR is None:
+        PACKAGED_BUILD_DIR = _resolve_packaged_build_dir()
+    return PACKAGED_BUILD_DIR
+
+
+def _packaged_prebuild_matches_runtime(packaged_build_dir, folder):
+    """Return True only when packaged metadata proves this .so covers this GPU arch."""
+    meta_path = os.path.join(packaged_build_dir, folder, PREBUILD_META_FILE)
+    if not os.path.exists(meta_path):
+        logger.warning(
+            "skip packaged cpp_itfs prebuild %s: missing %s; falling back to JIT",
+            folder,
+            PREBUILD_META_FILE,
+        )
+        return False
+
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        built_archs = {
+            _normalize_gpu_arch(arch) for arch in metadata.get("gpu_archs", [])
+        }
+    except Exception as e:
+        logger.warning(
+            "skip packaged cpp_itfs prebuild %s: cannot read %s (%s); falling back to JIT",
+            folder,
+            PREBUILD_META_FILE,
+            e,
+        )
+        return False
+
+    runtime_arch = _runtime_gpu_arch()
+    if not runtime_arch:
+        logger.warning(
+            "skip packaged cpp_itfs prebuild %s: cannot detect runtime GPU arch; "
+            "falling back to JIT",
+            folder,
+        )
+        return False
+    if runtime_arch not in built_archs:
+        logger.warning(
+            "skip packaged cpp_itfs prebuild %s: built for %s, runtime GPU is %s; "
+            "falling back to JIT",
+            folder,
+            sorted(built_archs),
+            runtime_arch,
+        )
+        return False
+    return True
 
 
 # Kept for backward compat: external code may read utils.AITER_ROOT_DIR.
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
-BUILD_DIR = _resolve_build_dir()
+# Writable compile/JIT/rebuild target. BUILD_DIR keeps its historical meaning so all
+# write paths (compile_lib, compile_hsaco, the AITER_REBUILD purge below) are unchanged.
+BUILD_DIR = _resolve_writable_build_dir()
+# Read-only fallback holding wheel-shipped prebuilds (pa_ps). Resolved lazily by
+# _get_packaged_build_dir(); never written to or cleared by AITER_REBUILD.
+PACKAGED_BUILD_DIR = None
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
 if AITER_REBUILD >= 1:
+    # Only the writable dir is purged. The packaged prebuilds are read-only shipped
+    # artifacts and must survive; _find_built() ignores them while AITER_REBUILD is set
+    # so the op still recompiles natively into BUILD_DIR.
     subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
 
 if not os.path.exists(BUILD_DIR):
@@ -305,10 +393,33 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
 
 
 @lru_cache(maxsize=AITER_MAX_CACHE_SIZE)
+def _find_built(folder):
+    """Return the dir containing folder/lib.so, or None if it must be (re)compiled.
+
+    Prefers the writable dir (a freshly JIT-compiled or rebuilt .so) over the
+    read-only wheel-shipped prebuild, so user-built artifacts always win. The packaged
+    prebuild is skipped entirely while AITER_REBUILD is set, so a rebuild forces a
+    fresh native compile into BUILD_DIR (this is also the escape hatch for a shipped
+    .so whose baked arch doesn't match the running GPU).
+    """
+    if os.path.exists(f"{BUILD_DIR}/{folder}/lib.so"):
+        return BUILD_DIR
+    if not AITER_REBUILD:
+        packaged_build_dir = _get_packaged_build_dir()
+        if (
+            packaged_build_dir is not None
+            and os.path.exists(f"{packaged_build_dir}/{folder}/lib.so")
+            and _packaged_prebuild_matches_runtime(packaged_build_dir, folder)
+        ):
+            return packaged_build_dir
+    return None
+
+
 def run_lib(func_name, folder=None):
     if folder is None:
         folder = func_name
-    lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", os.RTLD_LAZY)
+    base = _find_built(folder) or BUILD_DIR
+    lib = ctypes.CDLL(f"{base}/{folder}/lib.so", os.RTLD_LAZY)
     return getattr(lib, func_name)
 
 
@@ -323,39 +434,7 @@ def get_default_func_name(md_name, args: tuple):
 
 
 def not_built(folder):
-    return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
-
-
-# Folders we've already warned about, so the bypass notice fires at most once each.
-_prebuild_bypass_warned = set()
-
-
-def _warn_if_prebuild_bypassed(folder):
-    """Loudly note when AITER_ROOT_DIR redirected BUILD_DIR past a shipped prebuild.
-
-    Setting AITER_ROOT_DIR points BUILD_DIR at <root>/build, which has no
-    wheel-prebuilt .so, so the op JIT-recompiles even though the wheel shipped one.
-    That loss is otherwise silent. We only reach here on the (rare) compile path and
-    only when AITER_ROOT_DIR is set, so the extra import/stat is cheap; aiter.jit.core
-    is already loaded by the time any op compiles at runtime.
-    """
-    if not os.environ.get("AITER_ROOT_DIR") or folder in _prebuild_bypass_warned:
-        return
-    _prebuild_bypass_warned.add(folder)
-    try:
-        import importlib
-
-        jit_dir = importlib.import_module("aiter.jit.core").get_user_jit_dir()
-        packaged = os.path.join(jit_dir, "build", folder, "lib.so")
-        if os.path.exists(packaged):
-            logger.warning(
-                f"AITER_ROOT_DIR is set, so BUILD_DIR={BUILD_DIR}; a wheel-prebuilt "
-                f"kernel exists at {packaged} but is being ignored -- JIT-recompiling "
-                f"into {BUILD_DIR}/{folder}. Unset AITER_ROOT_DIR to use the shipped "
-                f"prebuild and skip this compile."
-            )
-    except Exception:
-        pass
+    return _find_built(folder) is None
 
 
 def compile_template_op(
@@ -375,7 +454,6 @@ def compile_template_op(
         folder = func_name
 
     if not_built(folder):
-        _warn_if_prebuild_bypassed(folder)
         if includes is None:
             includes = []
         if sources is None:

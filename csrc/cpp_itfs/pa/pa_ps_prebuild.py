@@ -34,31 +34,64 @@ Coverage / caveats (a prebuilt variant is hit only on an EXACT signature match):
     sinks are fp32, say, hashes to a different folder and falls back to JIT.
   * context_partition_num {1..8} is complete *because* the gluon decode path caps
     it at 8 (get_recommended_splits); if that cap is raised, widen the recipe.
-  * Zero-config payoff requires AITER_ROOT_DIR to be UNSET at runtime. Unset ->
-    BUILD_DIR == the packaged jit dir, so these .so are found. If AITER_ROOT_DIR
-    is set (e.g. to a persistent volume), BUILD_DIR becomes <root>/build, which
-    has no prebuilt artifacts -> one JIT recompile into that volume. So setting
-    AITER_ROOT_DIR *disables* the wheel prebuild (counterintuitive but expected).
-  * Arch binding (same contract PREBUILD_KERNELS already imposes on module_*):
-    compile_lib bakes the target arch into the .so via --offload-arch= (from
-    GPU_ARCHS), but the folder name (md5 of the op signature) does NOT include the
-    arch, and at runtime not_built() only checks file existence -- never arch match.
-    So a .so prebuilt for e.g. gfx942 is loaded as-is on a gfx950 box without
-    recompiling. Pure JIT avoids this because GPU_ARCHS defaults to the running
-    GPU's native arch; a shipped .so is never re-validated. Safe ONLY when the
-    wheel's GPU_ARCHS covers the deployment arch (or is a multi-arch fat binary) --
-    keep this in mind for cross-arch wheel deployments.
+  * Found via a read-only fallback, independent of AITER_ROOT_DIR. The runtime
+    looks up a kernel in two places (csrc/cpp_itfs/utils.py::_find_built): the
+    writable BUILD_DIR (AITER_ROOT_DIR/build or ~/.aiter/build) first, then the
+    packaged dir (get_user_jit_dir()/build) where these .so ship. So the prebuild
+    is used with ZERO config whether or not AITER_ROOT_DIR is set -- pointing it at
+    a persistent volume no longer disables the prebuild (the volume just becomes the
+    preferred write/cache location, with the packaged .so as fallback).
+  * Arch binding: compile_lib bakes GPU_ARCHS into the .so via --offload-arch=.
+    The prebuild writes aiter_prebuild_meta.json next to every lib.so, and runtime
+    packaged fallback uses it to verify the live GPU arch before loading the .so.
+    If the wheel was built only for gfx942 and runs on gfx950, the packaged .so is
+    skipped and cpp_itfs falls back to native JIT into the writable BUILD_DIR. For
+    zero cold-start JIT across deployments, build a multi-arch/fat wheel whose
+    GPU_ARCHS covers every target arch.
 
-Packaging: these .so are written under {BUILD_DIR}/pa_ps_<hash>/lib.so, i.e.
-aiter/jit/build/..., which MANIFEST.in prunes. MANIFEST.in must re-include
-aiter/jit/build/pa_ps_*/lib.so or the wheel ships without them.
+Packaging: these .so and their arch metadata are written under the PACKAGED build dir
+get_user_jit_dir()/build/pa_ps_<hash>/, i.e. aiter/jit/build/... in the source tree
+(NOT the runtime-writable utils.BUILD_DIR == ~/.aiter/build; see _packaged_build_dir).
+MANIFEST.in prunes aiter/jit/build, so it must re-include both lib.so and
+aiter_prebuild_meta.json, and package_data names them too, or the wheel ships without
+usable pa_ps prebuilds.
 """
 
+import json
 import os
 import shutil
 
+import csrc.cpp_itfs.utils as cpp_utils
 from csrc.cpp_itfs.pa.pa_ps import compile as compile_pa_ps
-from csrc.cpp_itfs.utils import BUILD_DIR, get_default_func_name
+from csrc.cpp_itfs.utils import (
+    PREBUILD_META_FILE,
+    get_default_func_name,
+    validate_and_update_archs,
+)
+
+
+def _packaged_build_dir():
+    """The dir the wheel actually ships from: get_user_jit_dir()/build.
+
+    IMPORTANT -- at RUNTIME utils.BUILD_DIR is the *writable* JIT cache
+    (AITER_ROOT_DIR/build or ~/.aiter/build), and the wheel-shipped prebuilds live in
+    a SEPARATE read-only dir (utils.PACKAGED_BUILD_DIR == get_user_jit_dir()/build).
+    That split is exactly what fixed the review's BUILD_DIR-migration / AITER_REBUILD
+    concerns. The consequence for the build: we must write the AOT artifacts straight
+    into that packaged dir, because that is what MANIFEST.in / package_data /
+    setup.py's `bd = get_user_jit_dir()/build` package. Writing to the runtime
+    BUILD_DIR (~/.aiter/build) would leave the wheel EMPTY -- the runtime BUILD_DIR is
+    not under the source tree and is never packaged.
+    """
+    target = cpp_utils._resolve_packaged_build_dir()
+    if target is None:
+        raise RuntimeError(
+            "pa_ps prebuild: cannot resolve get_user_jit_dir()/build (aiter.jit.core "
+            "not importable), so artifacts cannot be placed where the wheel packages "
+            "them. Run inside the aiter source tree with jit on sys.path."
+        )
+    return target
+
 
 # Each recipe is one model/dtype family. context_partition_num is the only axis that
 # varies at runtime, and the gluon decode path caps it at 8 (see
@@ -98,12 +131,12 @@ def _iter_variants():
 
 
 def _clean_intermediates(folder):
-    """Keep only lib.so in a built folder -- drop .cpp/.o/include copies (~23M -> 22K)."""
-    d = os.path.join(BUILD_DIR, folder)
+    """Keep only runtime files in a built folder -- drop .cpp/.o/include copies."""
+    d = os.path.join(cpp_utils.BUILD_DIR, folder)
     if not os.path.isdir(d):
         return
     for entry in os.listdir(d):
-        if entry == "lib.so":
+        if entry in {"lib.so", PREBUILD_META_FILE}:
             continue
         p = os.path.join(d, entry)
         try:
@@ -112,33 +145,74 @@ def _clean_intermediates(folder):
             pass
 
 
+def _write_prebuild_metadata(folder):
+    d = os.path.join(cpp_utils.BUILD_DIR, folder)
+    metadata = {
+        "format_version": 1,
+        "kind": "cpp_itfs_prebuild",
+        "op": "pa_ps",
+        "gpu_archs": validate_and_update_archs(),
+    }
+    with open(os.path.join(d, PREBUILD_META_FILE), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, sort_keys=True)
+        f.write("\n")
+
+
 def prebuild_pa_ps():
-    """Compile every pa_ps variant in the recipes into BUILD_DIR (called from setup.py)."""
+    """Compile every pa_ps variant in the recipes into the packaged dir (from setup.py).
+
+    Writes into get_user_jit_dir()/build (the wheel-packaged dir), NOT the runtime
+    writable BUILD_DIR -- see _packaged_build_dir() for why. The cpp_itfs compile
+    machinery (compile_lib/run_lib/not_built/_find_built) all key off the module-global
+    utils.BUILD_DIR, so we point it at the packaged dir for the duration of the build
+    and restore it afterwards (so importing/calling this never corrupts a live
+    process's runtime cache location).
+    """
     variants = list(_iter_variants())
-    print(f"[aiter] prebuild pa_ps: {len(variants)} variant(s) -> {BUILD_DIR}")
+    target = _packaged_build_dir()
+    os.makedirs(target, exist_ok=True)
+    print(f"[aiter] prebuild pa_ps: {len(variants)} variant(s) -> {target}")
+
+    prev_build_dir = cpp_utils.BUILD_DIR
+    cpp_utils.BUILD_DIR = target
+    # compile() and _find_built() are lru_cached and read BUILD_DIR on a cache miss;
+    # clear so the redirect actually takes effect for already-touched folders.
+    if hasattr(compile_pa_ps, "cache_clear"):
+        compile_pa_ps.cache_clear()
+    if hasattr(cpp_utils._find_built, "cache_clear"):
+        cpp_utils._find_built.cache_clear()
+
     ok, errs = 0, []
-    for kw in variants:
-        # func_name == folder name; matches compile_template_op's hashing.
-        folder = get_default_func_name(
-            "pa_ps",
-            (
-                kw["head_size"],
-                kw["query_group_size"],
-                kw["context_partition_num"],
-                kw["out_dtype"],
-                kw["logits_dtype"],
-                kw["sink_dtype"],
-                kw["use_sinks"],
-            ),
-        )
-        try:
-            compile_pa_ps(**kw)
-            _clean_intermediates(folder)
-            ok += 1
-        except Exception as e:  # noqa: BLE001
-            # One bad variant must not abort the whole wheel build.
-            errs.append((kw, repr(e)))
-            print(f"[aiter] prebuild pa_ps FAILED {folder}: {e}")
+    try:
+        for kw in variants:
+            # func_name == folder name; matches compile_template_op's hashing.
+            folder = get_default_func_name(
+                "pa_ps",
+                (
+                    kw["head_size"],
+                    kw["query_group_size"],
+                    kw["context_partition_num"],
+                    kw["out_dtype"],
+                    kw["logits_dtype"],
+                    kw["sink_dtype"],
+                    kw["use_sinks"],
+                ),
+            )
+            try:
+                shutil.rmtree(os.path.join(target, folder), ignore_errors=True)
+                compile_pa_ps(**kw)
+                _write_prebuild_metadata(folder)
+                _clean_intermediates(folder)
+                ok += 1
+            except Exception as e:  # noqa: BLE001
+                # One bad variant must not abort the whole wheel build.
+                errs.append((kw, repr(e)))
+                print(f"[aiter] prebuild pa_ps FAILED {folder}: {e}")
+    finally:
+        cpp_utils.BUILD_DIR = prev_build_dir
+        if hasattr(cpp_utils._find_built, "cache_clear"):
+            cpp_utils._find_built.cache_clear()
+
     print(f"[aiter] prebuild pa_ps: {ok}/{len(variants)} built, {len(errs)} failed")
     if ok == 0 and variants:
         raise RuntimeError("pa_ps prebuild built nothing; check GPU_ARCHS / hipcc")
