@@ -955,9 +955,10 @@ def reduce_segments(
         )
         segm_output *= tl.math.exp2(segm_max - overall_max[:, None])[:, :, None]
         acc_sum = tl.sum(segm_output, axis=1)  # [BLOCK_QH_REDUCE, HEAD_SIZE_PADDED]
-        acc = tl.where(
-            overall_expsum[:, None] == 0.0, 0.0, acc_sum / overall_expsum[:, None]
-        )
+        # acc = tl.where(
+        #     overall_expsum[:, None] == 0.0, 0.0, acc_sum / overall_expsum[:, None]
+        # )
+        acc = acc_sum / overall_expsum[:, None]
 
         if out_scale_ptr is not None:
             out_scale = 1 / out_scale
