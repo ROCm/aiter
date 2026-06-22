@@ -261,6 +261,7 @@ def fused_qk_rope_cat_and_cache_mla(
         else:
             BLOCK_T = 1
 
+        # temporaily block off BLOCK version
         if BLOCK_T > 1:
             n_pid = triton.cdiv(b, BLOCK_T) * qh + triton.cdiv(b_slot - b, BLOCK_T) * kh
             _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK
@@ -545,14 +546,13 @@ def fused_qk_rope_reshape_and_cache(
     # kernel (no NVFP4 support in the 2D gluon kernel yet).
     if DEVICE_ARCH == "gfx1250" and kv_cache_dtype != torch.uint8:
         if t >= 2048:
-            BLOCK_T = 32
-            BLOCK_T_NUM_ITR = 1
-        elif t >= 8:
-            BLOCK_T = 8
+            BLOCK_T = 16
             BLOCK_T_NUM_ITR = 1
         else:
-            BLOCK_T = 4
+            BLOCK_T = 1
             BLOCK_T_NUM_ITR = 1
+
+        # temporaily block off LOOP version
         chunk = BLOCK_T * BLOCK_T_NUM_ITR
         n_pid = triton.cdiv(t, chunk) * qh + triton.cdiv(t_slot - t, chunk) * kh
         # Use the _LOOP variant only when we actually have an inner static

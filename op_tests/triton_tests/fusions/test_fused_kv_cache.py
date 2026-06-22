@@ -70,32 +70,14 @@ def split_unshuffle_nvfp4_kv_cache(key_or_value_cache):
     return key_or_value_cache_data, key_or_value_cache_scales
 
 
-# @pytest.mark.parametrize("T", [1, 8, 2048])
-# @pytest.mark.parametrize("QH_per_KH", [16])
-# @pytest.mark.parametrize("KH", [1])
-# @pytest.mark.parametrize("D_pe", [64])  # For now, D is power of 2. D >= 16
-# @pytest.mark.parametrize("D_lora", [512])
-# @pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
-# @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-# @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
-# @pytest.mark.parametrize(
-#     "cache_dtype, shuffled_kv_cache, block_size",
-#     [
-#         (torch.bfloat16, True, 64),
-#         (torch.bfloat16, False, 1),
-#         (e4m3_dtype, True, 64),
-#         (torch.uint8, True, 128),
-#     ],
-# )
-# @pytest.mark.parametrize("upcast_operand", [False, True])
-@pytest.mark.parametrize("T", [1, 8])
+@pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [1])
 @pytest.mark.parametrize("D_pe", [64])  # For now, D is power of 2. D >= 16
 @pytest.mark.parametrize("D_lora", [512])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [256])
-@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
-@pytest.mark.parametrize("reuse_freqs_front_part", [True])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
+@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize(
     "cache_dtype, shuffled_kv_cache, block_size",
     [
@@ -105,7 +87,7 @@ def split_unshuffle_nvfp4_kv_cache(key_or_value_cache):
         (torch.uint8, True, 128),
     ],
 )
-@pytest.mark.parametrize("upcast_operand", [False])
+@pytest.mark.parametrize("upcast_operand", [False, True])
 def test_fused_qk_rope_cat_and_cache_mla(
     T: int,
     QH_per_KH: int,
@@ -278,36 +260,13 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
-# @pytest.mark.parametrize("T", [1, 8, 2048])
-# @pytest.mark.parametrize("QH_per_KH", [16])
-# @pytest.mark.parametrize("KH", [8])
-# @pytest.mark.parametrize("D", [64])  # For now, D is power of 2. D >= 16
-# @pytest.mark.parametrize("num_blocks", [16384])
-# @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-# @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize(
-#     "cache_dtype, flash_layout, value_shuffle_layout, block_size",
-#     [
-#         (torch.bfloat16, True, False, 16),
-#         (torch.bfloat16, False, False, 16),
-#         (torch.bfloat16, False, True, 16),
-#         (e4m3_dtype, True, False, 16),
-#         (e4m3_dtype, False, False, 16),
-#         (e4m3_dtype, False, True, 16),
-#         (e4m3_dtype, False, True, 64),
-#         (torch.uint8, False, False, 128),
-#     ],
-# )
-# @pytest.mark.parametrize("offs", [False, True])
-# @pytest.mark.parametrize("upcast_operand", [False, True])
-@pytest.mark.parametrize("T", [8, 256])
-@pytest.mark.parametrize("QH_per_KH", [8])
+@pytest.mark.parametrize("T", [1, 8, 2048])
+@pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [8])
 @pytest.mark.parametrize("D", [64])  # For now, D is power of 2. D >= 16
-@pytest.mark.parametrize("num_blocks", [256])
-@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
-@pytest.mark.parametrize("reuse_freqs_front_part", [True])
+@pytest.mark.parametrize("num_blocks", [16384])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
+@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "cache_dtype, flash_layout, value_shuffle_layout, block_size",
@@ -319,11 +278,11 @@ def test_fused_qk_rope_cat_and_cache_mla(
         (e4m3_dtype, False, False, 16),
         (e4m3_dtype, False, True, 16),
         (e4m3_dtype, False, True, 64),
-        # (torch.uint8, False, False, 128),
+        (torch.uint8, False, False, 128),
     ],
 )
 @pytest.mark.parametrize("offs", [False, True])
-@pytest.mark.parametrize("upcast_operand", [False])
+@pytest.mark.parametrize("upcast_operand", [False, True])
 def test_fused_qk_rope_reshape_and_cache(
     T: int,
     QH_per_KH: int,

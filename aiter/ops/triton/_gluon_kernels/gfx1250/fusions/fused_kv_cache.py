@@ -1411,27 +1411,6 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 slot_mapping_ptr + t_offs, mask=t_mask, other=-1
             ).to(gl.int64)
 
-            k_desc = _make_tdm_desc_2d(
-                k_ptr + pid_hk * k_stride_h,
-                k_stride_t,
-                k_stride_d,
-                T,
-                BLOCK_D_pe,
-                BLOCK_T,
-                BLOCK_D_pe,
-                SH_2D,
-            )
-            v_desc = _make_tdm_desc_2d(
-                v_ptr + pid_hk * v_stride_h,
-                v_stride_t,
-                v_stride_d,
-                T,
-                BLOCK_D_pe,
-                BLOCK_T,
-                BLOCK_D_pe,
-                SH_2D,
-            )
-
             cos_desc = _make_tdm_desc_2d(
                 cos_ptr,
                 cos_stride_t,
@@ -1453,11 +1432,35 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 SH_2D,
             )
 
+            k_desc = _make_tdm_desc_2d(
+                k_ptr + pid_hk * k_stride_h,
+                k_stride_t,
+                k_stride_d,
+                T,
+                BLOCK_D_pe,
+                BLOCK_T,
+                BLOCK_D_pe,
+                SH_2D,
+            )
+            v_desc = _make_tdm_desc_2d(
+                v_ptr + pid_hk * v_stride_h,
+                v_stride_t,
+                v_stride_d,
+                T,
+                BLOCK_D_pe,
+                BLOCK_T,
+                BLOCK_D_pe,
+                SH_2D,
+            )
+
             if HAVE_POS:
                 pos = pos + offset
             pos = pos.to(gl.int32)
             _issue_tdm_gather_2d(cos_desc, pos, cos_smem)
             _issue_tdm_gather_2d(sin_desc, pos, sin_smem)
+
+            _issue_tdm_load_2d(k_desc, t_start, 0, k_smem)
+            _issue_tdm_load_2d(v_desc, t_start, 0, v_smem)
 
             # Pre-compute the KV-cache / k_out offsets and masks via the helper.
             (
@@ -1504,10 +1507,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     layout=L_T_PE,
                 )
 
-            gl.amd.gfx1250.tdm.async_wait(0)
-
-            _issue_tdm_load_2d(k_desc, t_start, 0, k_smem)
-            _issue_tdm_load_2d(v_desc, t_start, 0, v_smem)
+            gl.amd.gfx1250.tdm.async_wait(2)
 
             q_pe_in = q_smem.load(L_T_PE)
             cos = _freq_from_shared_2d(
@@ -1558,6 +1558,10 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             )
             gl.amd.gfx1250.tdm.async_store(q_out_desc, [t_start, 0], q_smem)
 
+            gl.amd.gfx1250.tdm.async_wait(1)
+            k_pe_in = k_smem.load(L_T_PE)
+            v_in = v_smem.load(L_T_PE)
+
             if HAVE_ZEROS:
                 zeros_smem.store(z)
                 zeros_desc = _make_tdm_desc_2d(
@@ -1571,12 +1575,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                     SH_2D,
                 )
                 gl.amd.gfx1250.tdm.async_store(zeros_desc, [t_start, 0], zeros_smem)
-                gl.amd.gfx1250.tdm.async_wait(2)
-            else:
-                gl.amd.gfx1250.tdm.async_wait(1)
 
             # 2D rope on k.
-            k_pe_in = k_smem.load(L_T_PE)
             k_pe = _rope_pe_2d(
                 k_pe_in,
                 cos,
@@ -1595,7 +1595,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             )
             # Scaled fp32 versions for cache stores.
             k_pe_scaled = k_pe.to(gl.float32) * k_scale_rcprl
-            v_scaled = v_smem.load(L_T_PE).to(gl.float32) * v_scale_rcprl
+            v_scaled = v_in.to(gl.float32) * v_scale_rcprl
             gl.amd.cdna4.buffer_store(
                 k_pe_scaled.to(key_cache_ptr.dtype.element_ty),
                 ptr=key_cache_ptr,
