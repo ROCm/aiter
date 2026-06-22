@@ -437,7 +437,10 @@ def sparse_mla_bwd_v4(q, kv, o, do, topk_indices, lse, attn_sink=None,
             R_CHUNK=R_CHUNK, BLOCK_H=bh, TILE_K=TILE_K_DQ,
             D_V=kv_lora_rank, D_ROPE=rope_rank,
             IS_FIRST_CHUNK=is_first,
-            HAS_SINK=has_sink,
+            HAS_SINK=False,  # d_sink computed via torch reduction below instead of the
+                             # in-kernel buffer_atomic_add_f32 (262k atomics -> [H]=64):
+                             # +0.6ms on CDNA4 but +35ms on gfx1250 (contended atomic
+                             # throughput). dQ/dS/P use the sink-inclusive lse only.
             num_warps=4, num_stages=2,
         )
 
@@ -468,4 +471,9 @@ def sparse_mla_bwd_v4(q, kv, o, do, topk_indices, lse, attn_sink=None,
         )
 
     dkv_out = dkv_acc.to(kv.dtype).unsqueeze(1)
+    if has_sink:
+        # d_sink[h] = -sum_t exp(sink[h] - lse[t,h]) * delta[t,h]  (torch reduction).
+        # Replaces the in-kernel atomic_add (HAS_SINK=False above) — identical result
+        # (validated rel ~1e-6) with no atomic contention.
+        d_sink = -(_torch.exp(attn_sink.unsqueeze(0) - lse) * delta).sum(0)
     return dq, dkv_out, (d_sink if has_sink else None)
