@@ -672,7 +672,7 @@ def build_flash_attn_fp8_module(
                 sA = do_qk(k_buf_off)
                 gpu.barrier()
                 m_new, corr_new, p_new, prowsum_new = do_softmax(
-                    [sA[0], sA[1], sA[2], sA[3]], m_init
+                    sA, m_init
                 )
                 dma_v(v_next, fx.Index(BLOCK_N))
                 waitcnt_barrier()
@@ -711,7 +711,7 @@ def build_flash_attn_fp8_module(
                 gpu.barrier()
                 # PHASE 2 (softmax phase): softmax(i) | DMA V^{i+1}.
                 m_new, corr_new, p_new, prowsum_new = do_softmax(
-                    [sA[0], sA[1], sA[2], sA[3]], m_r
+                    sA, m_r
                 )
                 dma_v(v_next, next_kv)
                 waitcnt_barrier()
