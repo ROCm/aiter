@@ -37,6 +37,58 @@
 #endif
 
 namespace aiter {
+static int validate_topk_output_contract(const torch::Tensor& topk_weights,
+                                         const torch::Tensor& topk_ids,
+                                         int num_fused_shared_experts,
+                                         int shared_expert_base)
+{
+    TORCH_CHECK(num_fused_shared_experts >= 0,
+                "num_fused_shared_experts must be non-negative, got ",
+                num_fused_shared_experts);
+    TORCH_CHECK(topk_ids.dim() == 2 && topk_weights.dim() == 2,
+                "topk output tensors must be rank-2 [num_tokens, topk], got topk_ids.dim()=",
+                topk_ids.dim(),
+                ", topk_weights.dim()=",
+                topk_weights.dim());
+    TORCH_CHECK(topk_ids.size(0) == topk_weights.size(0) &&
+                    topk_ids.size(1) == topk_weights.size(1),
+                "topk_ids and topk_weights must have the same shape, got topk_ids=(",
+                topk_ids.size(0),
+                ", ",
+                topk_ids.size(1),
+                "), topk_weights=(",
+                topk_weights.size(0),
+                ", ",
+                topk_weights.size(1),
+                ")");
+    TORCH_CHECK(topk_ids.stride(1) == 1 && topk_weights.stride(1) == 1,
+                "topk output tensors must have contiguous columns, got topk_ids.stride(1)=",
+                topk_ids.stride(1),
+                ", topk_weights.stride(1)=",
+                topk_weights.stride(1));
+
+    const int total_topk  = static_cast<int>(topk_ids.size(1));
+    const int routed_topk = total_topk - num_fused_shared_experts;
+    TORCH_CHECK(routed_topk >= 1,
+                "topk output must include at least one routed expert column, got total_topk=",
+                total_topk,
+                ", num_fused_shared_experts=",
+                num_fused_shared_experts);
+    TORCH_CHECK(topk_ids.stride(0) >= total_topk && topk_weights.stride(0) >= total_topk,
+                "topk output row stride must include all output columns, got topk_ids.stride(0)=",
+                topk_ids.stride(0),
+                ", topk_weights.stride(0)=",
+                topk_weights.stride(0),
+                ", total_topk=",
+                total_topk);
+    if(num_fused_shared_experts > 0)
+    {
+        TORCH_CHECK(shared_expert_base >= 0,
+                    "shared_expert_base must be provided when num_fused_shared_experts > 0");
+    }
+    return routed_topk;
+}
+
 namespace impl {
 // use this type for argsort
 template <typename KType, typename VType>
@@ -518,7 +570,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             }
             __syncthreads();
         }
-    
+
         for(int k = 0; k < topk_group; k++)
         {
             float max_val = -INFINITY;
@@ -705,7 +757,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             {
                 tmp2 = reinterpret_cast<vec_i const*>(correction_bias)[e];
             }
-            
+
 #pragma unroll
             for(size_t i = 0; i < vec_size; i++)
             {
@@ -976,7 +1028,6 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             float o_y = warp_bitonic_merge_sort_combine(o_t, o_r, threadIdx.x, (threadIdx.x / 16) & 1, opus::number<16>{}, opus::number<1>{});
             float o_q = __shfl(o_y, threadIdx.x ^ twi_1_);
 
-            
             float o_w = warp_swap_(o_q, threadIdx.x, opus::number<16>{});
             float o_o = warp_bitonic_merge_sort_combine(o_q, o_w, threadIdx.x, 0, opus::number<16>{}, is_descending_);
             // printf("[%2d] v:%f, o_x:%f, o_t:%f, o_r:%f o_y:%f, o_q:%f, o_w:%f, o_o:%f\n", threadIdx.x, v_, o_x, o_t, o_r, o_y, o_q, o_w, o_o);
@@ -1255,28 +1306,18 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
                          int num_expert_group,
                          int topk_grp,
                          bool need_renorm,
-                         const float routed_scaling_factor = 1.,
-                         int num_fused_shared_experts = 0,
+                         const float routed_scaling_factor               = 1.,
+                         int num_fused_shared_experts                    = 0,
                          const float fused_shared_experts_scaling_factor = 1.,
-                         int shared_expert_base = -1)
+                         int shared_expert_base                          = -1)
 {
     const bool isBiased = true;
     bool isSoftmax      = false;
     int num_tokens      = gating_output.size(0);
     int num_experts     = gating_output.size(1);
-    int total_topk      = topk_ids.size(1);
-    int topk            = total_topk - num_fused_shared_experts;
+    int topk            = aiter::validate_topk_output_contract(
+        topk_weights, topk_ids, num_fused_shared_experts, shared_expert_base);
     size_t stride_tk    = topk_ids.stride(0);
-    if(num_fused_shared_experts > 0)
-    {
-        TORCH_CHECK(shared_expert_base >= 0,
-                    "shared_expert_base must be provided when num_fused_shared_experts > 0");
-        TORCH_CHECK(topk >= 1,
-                    "topk output must include routed and shared expert columns: "
-                    "topk_ids.size(1) must be greater than num_fused_shared_experts");
-        TORCH_CHECK(static_cast<int64_t>(stride_tk) >= total_topk,
-                    "topk output row stride must include routed and shared expert columns");
-    }
     TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
                 topk_grp,
@@ -1290,8 +1331,8 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
 
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
-    size_t shared_mem_size =
-        (2 * num_experts * sizeof(float) + num_expert_group * sizeof(float)); // additional buf for sig_scores
+    size_t shared_mem_size = (2 * num_experts * sizeof(float) +
+                              num_expert_group * sizeof(float)); // additional buf for sig_scores
     shared_mem_size += !use_opt_sort
                            ? 0
                            : (num_expert_group * sizeof(int) /*group_map_idx*/
@@ -1315,30 +1356,20 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
                   int num_expert_group,
                   int topk_grp,
                   bool need_renorm,
-                  bool is_softmax                   = true,
-                  const float routed_scaling_factor = 1.,
-                  int num_fused_shared_experts = 0,
+                  bool is_softmax                                 = true,
+                  const float routed_scaling_factor               = 1.,
+                  int num_fused_shared_experts                    = 0,
                   const float fused_shared_experts_scaling_factor = 1.,
-                  int shared_expert_base = -1)
+                  int shared_expert_base                          = -1)
 {
-    const bool isBiased  = false;
-    bool isSoftmax       = is_softmax;
-    int num_tokens       = gating_output.size(0);
-    int num_experts      = gating_output.size(1);
-    int total_topk       = topk_ids.size(1);
-    int topk             = total_topk - num_fused_shared_experts;
+    const bool isBiased = false;
+    bool isSoftmax      = is_softmax;
+    int num_tokens      = gating_output.size(0);
+    int num_experts     = gating_output.size(1);
+    int topk            = aiter::validate_topk_output_contract(
+        topk_weights, topk_ids, num_fused_shared_experts, shared_expert_base);
     size_t stride_tk     = topk_ids.stride(0);
     auto correction_bias = topk_ids;
-    if(num_fused_shared_experts > 0)
-    {
-        TORCH_CHECK(shared_expert_base >= 0,
-                    "shared_expert_base must be provided when num_fused_shared_experts > 0");
-        TORCH_CHECK(topk >= 1,
-                    "topk output must include routed and shared expert columns: "
-                    "topk_ids.size(1) must be greater than num_fused_shared_experts");
-        TORCH_CHECK(static_cast<int64_t>(stride_tk) >= total_topk,
-                    "topk output row stride must include routed and shared expert columns");
-    }
     TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
                 topk_grp,
