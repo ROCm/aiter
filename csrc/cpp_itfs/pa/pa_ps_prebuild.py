@@ -27,8 +27,9 @@ context_partition_num growing with context length). To add another model, append
 a recipe dict below.
 
 Coverage / caveats (a prebuilt variant is hit only on an EXACT signature match):
-  * Scope is gpt-oss-120b only. Other head_size / query_group_size, or
-    use_sinks=False decode paths, are not covered and still JIT on first use.
+  * Covers gpt-oss-120b (head_size=64, group=8, sinks) and MiniMax-M3 EAGLE3
+    (head_size=128, no sinks, draft + ASM/gluon target group sizes). Other
+    head_size / query_group_size / dtype combos still JIT on first use.
   * All three runtime dtypes must be bf16: out_dtype (output), logits_dtype
     (the temporary per-partition output), and sink_dtype (sinks). A model whose
     sinks are fp32, say, hashes to a different folder and falls back to JIT.
@@ -113,21 +114,63 @@ PA_PS_PREBUILD_RECIPES = [
         "use_sinks": True,
         "context_partition_nums": range(1, 9),
     },
+    {
+        # MiniMax-M3 EAGLE3 DRAFT (LlamaForCausalLMEagle3): head_dim=128, MHA
+        # (num_attention_heads == num_key_value_heads == 64 -> per-rank ratio 1 at
+        # BOTH TP4 and TP8), bf16, NO attention sinks (tie_word_embeddings=false).
+        # The draft decodes via PagedAttentionImpl -> run_pa_decode_gluon -> cxx
+        # pa_ps reduce, where query_group_size = max_seqlen_q * (num_q/num_kv) and
+        # num_q/num_kv == 1, so group == max_seqlen_q:
+        #   * i>0 draft steps           : q == 1            -> group 1
+        #   * i==0 multi-token replay   : q == accepted+1   -> 1..num_spec+1
+        # --num-speculative-tokens 3 -> {1,2,3,4}. (Widen if you raise num_spec.)
+        "head_size": 128,
+        "query_group_size": [1, 2, 3, 4],
+        "out_dtype": "__hip_bfloat16",
+        "logits_dtype": "__hip_bfloat16",
+        "sink_dtype": "__hip_bfloat16",
+        "use_sinks": False,
+        "context_partition_nums": range(1, 9),
+    },
+    {
+        # MiniMax-M3 TARGET sparse attention via the ASM/gluon decode path
+        # (ATOM_M3_SPARSE_USE_ASM_PA=1 in the recipe): head_dim=128, bf16, no sinks.
+        # decode_asm kv-head-collapses so query_group_size = num_heads/num_kv_heads
+        # per rank, and the q>1 spec-verify expands the SEQ dim (max_seqlen_q stays
+        # 1) rather than the group -- so the group is just the per-rank GQA ratio
+        # (M3 target = 64 attn heads / 4 kv heads):
+        #   * TP4: 64/4               = 16
+        #   * TP8: 64 / max(1, 4//8)=1 = 8
+        # Covers both TPs we run. Harmless if a deployment uses the non-ASM Triton
+        # split-K decode instead (that path has its own reduce, not pa_ps).
+        "head_size": 128,
+        "query_group_size": [8, 16],
+        "out_dtype": "__hip_bfloat16",
+        "logits_dtype": "__hip_bfloat16",
+        "sink_dtype": "__hip_bfloat16",
+        "use_sinks": False,
+        "context_partition_nums": range(1, 9),
+    },
 ]
 
 
 def _iter_variants():
     for recipe in PA_PS_PREBUILD_RECIPES:
-        for cpn in recipe["context_partition_nums"]:
-            yield {
-                "head_size": recipe["head_size"],
-                "query_group_size": recipe["query_group_size"],
-                "context_partition_num": cpn,
-                "out_dtype": recipe["out_dtype"],
-                "logits_dtype": recipe["logits_dtype"],
-                "sink_dtype": recipe["sink_dtype"],
-                "use_sinks": recipe["use_sinks"],
-            }
+        # query_group_size may be a single int or an iterable of ints (a model
+        # whose draft + target hit several group sizes -- e.g. MiniMax-M3 EAGLE3).
+        qgs = recipe["query_group_size"]
+        qgs = [qgs] if isinstance(qgs, int) else list(qgs)
+        for query_group_size in qgs:
+            for cpn in recipe["context_partition_nums"]:
+                yield {
+                    "head_size": recipe["head_size"],
+                    "query_group_size": query_group_size,
+                    "context_partition_num": cpn,
+                    "out_dtype": recipe["out_dtype"],
+                    "logits_dtype": recipe["logits_dtype"],
+                    "sink_dtype": recipe["sink_dtype"],
+                    "use_sinks": recipe["use_sinks"],
+                }
 
 
 def _clean_intermediates(folder):
