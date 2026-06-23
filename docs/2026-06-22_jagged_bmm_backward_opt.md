@@ -261,16 +261,91 @@ banked as a strict improvement (1.2–1.34×, and it pays down the D=512 LDS blo
 
 ---
 
+## EXP-2026-06-23d — Phase 2: MFMA-ize `grad_dense_partials` (North Star B=1024, D=256)
+
+**Scope.** Replace the scalar fp32 LDS-FMA reduction in `grad_dense_partials` with
+a **bf16 MFMA** transposed GEMM, keeping the fp32 accumulate + two-pass
+split-reduction skeleton. Only `grad_dense_partials_kernel` (+ its launcher's
+`tiled_mma`) changed for the perf win; the reduce/bias kernels got an unrelated
+`block ≤ 256` col-tiling fix (see below). Evaluated at **B=1024, D=256** (D=K=N,
+`max_seq_len=512`); D set to 256 for measurement, repo default restored to 128.
+
+**Implementation.** `dDense[k,n] = Σ_m J[m,k]·dOut[m,n]` is the MFMA atom form
+`C[i,j]=Σ_l A[i,l]·B[j,l]` with `i=k, j=n, l=m`, so `A = J.T (k,m)` and
+`B = dOut.T (n,m)` — **both operands carry the reduction axis `m` as their
+contiguous fragment (K) axis.** This box is **gfx942 (CDNA3)**, which has **no**
+`ds_read` hardware transpose (that is gfx950/CDNA4), so the transpose is done **on
+the global→LDS store**: each m-tile is read coalesced along the contiguous global
+axis (k for J, n for dOut) and stored into LDS as `sJ(k,m)` / `sD(n,m)` (m
+contiguous), reusing the forward kernel's swizzle. The s2r feed + `fx.gemm` are the
+forward's `tiled_mma` (MFMA 16×16×16 bf16, atom-layout (1,4,1), (4,4,2)
+K-fragment). One fp32 MFMA C-fragment per thread is accumulated **in place across
+the dynamic, split-strided m-tile loop** (AGPR accumulate, no SSA carry). Output
+tiling (128×128 per WG) keeps LDS at 32 KB and the accumulator fixed at any D.
+
+### `grad_dense` results (bench wall-clock, partials+reduce; TF/s = 2·L·K·N / t)
+| shape | regime | T-1 (Phase-1b) | T (Phase-2 MFMA) | speedup |
+|---|---|--:|--:|--:|
+| **B=1024, D=256 (North Star)** | uniform | 4252.7 µs / 16.16 TF/s | **924.0 µs / 74.37 TF/s** | **4.60×** |
+| B=1024, D=256 | skew | 1780.6 µs / 5.87 TF/s | **686.8 µs / 15.23 TF/s** | **2.59×** |
+| B=64, D=128 (repo default) | uniform | 83.1 µs / 12.92 TF/s | 86.8 µs / 12.37 TF/s | ~1.0× (launch-bound) |
+
+(At B=64/D=128 the kernel is launch/occupancy-bound — only 256 WGs — so MFMA is
+neutral there, exactly as Phase 0 predicted. The win shows up once the GPU fills.)
+
+### `grad_dense_partials` counter deltas (rocprof `analyze` multi-`--path`, `-k 0`)
+Artifacts: `workloads/p2_t0_b1024_d256/` (T-1), `workloads/p2_t1_b1024_d256/` (T).
+| metric | T-1 | T (Phase-2) | Δ |
+|---|--:|--:|--:|
+| partials kernel duration | — | — | **−84.5% (≈6.4×)** |
+| MFMA Utilization | 0% | **15.95%** | MFMA on (gate ✓) |
+| MFMA bf16 instrs / kernel | 0 | **8.39 M** | — |
+| VALU FLOPs (F32) | 8634 Gflop/s | **0** | −100% (scalar path gone) |
+| Dependency-Wait cycles | 6.58 B | 0.45 B | **−93.1%** (Phase-1 bottleneck collapsed) |
+| Issue-Wait cycles | 0.21 B | 1.12 B | +434% (now memory/issue-bound) |
+| Wavefront occupancy | 2.64% | 4.07% | +54% |
+| LDS instrs / kernel | 25.2 M | 11.0 M | −56% |
+| LDS bank conflicts/access | 0 | 1.33 | transpose-store conflicts (minor; optimizable) |
+
+### Gate: **PASS → MFMA on, big TF/s jump, correctness green.**
+- **MFMA Utilization > 0** ✓ (0 → 15.95%); **correctness** cosine 0.999999, uniform
+  + skew, D=128 and D=256 ✓.
+- **Within ~2× of `grad_jagged`** ✓ at the kernel level: the MFMA partials kernel is
+  ~6.4× faster (rocprof), i.e. ~110 TF/s vs `grad_jagged` 176.6 TF/s (≈1.6×). The
+  *end-to-end* `grad_dense` bench (74 TF/s) is now dragged by the **reduce tail**,
+  which became the dominant fraction once partials sped up 6×. → **Phase 4** (fuse
+  bias into dDense partials / lighter reduce) is now the next lever, not the GEMM.
+- The kernel is now **HBM/issue-bound** (uniform 3050 GB/s ≈ 72% of the 4.21 TB/s
+  HBM ceiling), not compute- or dependency-bound. Further partials gains would come
+  from vectorizing the transpose-staging g2s and cutting fp32 partials traffic.
+
+### Side fix (enables D=512, was a separate blocker — not validated yet)
+`grad_bias_partials`, `grad_bias_reduce`, `grad_dense_reduce` launched `block=(N,1,1)`
+→ 512 threads > AMDGPU's 256 cap at D=512. Generalized them to a **col-tiled** grid
+(`NRED_COL_TILES` blocks of `NRED_BLK=min(N,256)` columns; `col = col_tile·NRED_BLK +
+tid`). No-regression verified at D=128 + D=256 (uniform+skew). Combined with the
+Phase-2 partials kernel (LDS now fixed 32 KB, no D² register block), this removes all
+known D=512 build blockers — but **D=512 end-to-end validation is deferred** per the
+earlier decision to keep D=256 as the North Star; greenlight to validate D=512.
+
+---
+
 ## Current status (2026-06-23)
-Tooling works end-to-end; baseline + Phase-0 sweep + production shapes (B=1024,
-D=256/512) characterized; **Phase 1 done** (EXP-2026-06-23c). `grad_dense_partials`
-got FMA fusion + output-tiling + loop-carried accumulators: **1.34× @ D=256 / 1.21×
-@ D=128**, correctness green, and LDS is now fixed at 32 KB (D=512 partials LDS
-blocker removed). Phase-1 gate (1.5×) **not met** — the kernel is now latency/
-dependency-bound on the scalar fp32 chain, exactly the Phase-0 verdict. Repo default
-restored to D=128. **Next: Phase 2 (MFMA-ize `grad_dense_partials`)**, plus the cheap
-`block ≤ 256` fixes for `grad_bias`/`grad_dense_reduce` to fully unlock D=512;
-`grad_jagged` (healthy, 235 TF/s @ D=512) occupancy is a later secondary win.
+Tooling works end-to-end; baseline + Phase-0 sweep + production shapes characterized;
+**Phase 1 done** (EXP-2026-06-23c, 1.34× @ D=256) and **Phase 2 done**
+(EXP-2026-06-23d). `grad_dense_partials` is now a **bf16 MFMA** transposed GEMM
+(`A=J.T, B=dOut.T`, contraction `m`, transpose-on-LDS-store since gfx942 has no HW
+transpose, fp32 MFMA accum across the dynamic split m-loop): **4.60× @ D=256 uniform
+/ 2.59× skew** end-to-end, **≈6.4×** on the partials kernel itself (MFMA util
+0→16%, VALU-F32→0, Dependency-Wait −93%), correctness green (uniform+skew, D=128 &
+D=256). The kernel is now **HBM/issue-bound** and the **reduce pass is the new
+dominant tail**. The `block ≤ 256` col-tiling fix for `grad_bias`/`grad_dense_reduce`
+is in (no D=128/256 regression); with the 32 KB-fixed MFMA partials it removes the
+known D=512 blockers, but **D=512 end-to-end validation is deferred** per the D=256
+North-Star decision. Repo default restored to D=128. **Next: Phase 4** (fuse dBias
+into dDense partials + lighter reduce tail — now the biggest remaining share), then
+Phase 3 (`grad_jagged` occupancy). Optional: vectorize the partials transpose-staging
+g2s (currently scalar) to push toward the HBM roofline.
 
 ---
 
@@ -321,7 +396,14 @@ Baseline to beat (EXP-2026-06-22a, b64/m512/uniform): `grad_dense_partials`
 - **Target:** MFMA Utilization > 0, large TF/s jump toward `grad_jagged`-class.
   **Gate:** `grad_dense_partials` within ~2× of `grad_jagged` TF/s; correctness
   (cosine > 0.999, uniform+skew) still passes via `example_…_bwd.py`.
-- [ ] MFMA partials  [ ] validate correctness  [ ] re-profile + EXP block
+- [x] MFMA partials  [x] validate correctness  [x] re-profile + EXP block
+  (EXP-2026-06-23d). **Result: GATE PASS.** Transposed GEMM `A=J.T, B=dOut.T`,
+  contraction `m` contiguous, transpose-on-LDS-store (gfx942 has no HW transpose),
+  fp32 MFMA accum in place over the dynamic split m-loop. **4.60× @ D=256 uniform /
+  2.59× skew end-to-end**; partials kernel **≈6.4×** (MFMA util 0→16%, VALU-F32→0,
+  Dependency-Wait −93%). Now HBM/issue-bound; the **reduce tail dominates** → Phase 4
+  is next. (Side fix: col-tiled bias/reduce kernels remove the D=512 thread-cap
+  blocker; D=512 validation deferred per the D=256 North-Star decision.)
 
 ### Phase 3 — `grad_jagged` throughput / occupancy
 - **Why:** MFMA already, but 1.06% occupancy, 139/304 CUs, ~12 µs → launch/tail
