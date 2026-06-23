@@ -15,8 +15,6 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_bf16 import (
 
 ############################################################
 
-# Batch size is hard coded for now.
-B = 2
 
 input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=3)
 
@@ -24,6 +22,8 @@ input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=
 # <generate input>
 dtype = torch.bfloat16
 M, N, K = input_shape
+# Batch size is hard coded for now.
+B = 1 if K == 4096 else 2
 x, weight, bias, y = generate_batched_gemm_a16w16_inputs(
     B,
     M,
