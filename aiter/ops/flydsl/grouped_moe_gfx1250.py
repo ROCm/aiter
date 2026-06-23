@@ -489,8 +489,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     n_warp1 = n_warp2 = 4
     tile_n1 = tile_n2 = None
     tile_k1 = tile_k2 = None
-    num_buffers1 = 4
-    num_buffers2 = 4
+    num_buffers1 = 2
+    num_buffers2 = 2
     split_k1 = 1
     split_k2 = 1
     cfg_row = _find_grouped_config(
@@ -548,8 +548,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     tile_k2 = tile_k2 if tile_k2 else 256
 
     tile_m = 16
-    tile_n1, tile_k1 = 64,  512
-    tile_n2, tile_k2 = 64, 512
+    tile_n1, tile_k1 = 128, 256
+    tile_n2, tile_k2 = 256, 256
     warp_tile_m = tile_m // m_warp
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
