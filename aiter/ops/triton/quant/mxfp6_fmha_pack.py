@@ -651,6 +651,16 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128):
     buf[: out.numel()] = out.reshape(-1)
     # seq stride = tile (=128) -> the kernel's _s_k_Seqs=128 -> tile base = token*128.
     k_view = buf.as_strided((b, sk, h, 96), (k_bs, tile, k_hs, 1))
+    # K-SCALE TRAILING PAD (gfx950 fwd_hd128_mxfp6 op_sel-shift-free K-scale path): the kernel's
+    # coalesced K-scale gather keeps a 2nd "Region B" pre-shifted LDS copy, gathered by reading each
+    # token's 4-byte E8M0 dword at a +1 BYTE source offset (so MFMA op_sel byte0/byte2 land dblk1/
+    # dblk3 directly, no runtime >>blk1*8 shift). On the final (token,head,batch) that +1 dword read
+    # runs 1 byte past the contiguous scale tensor -> re-home `scale` into a buffer with trailing
+    # slack so the read stays mapped. The pad byte is never consumed by the MFMA (op_sel ignores it).
+    sflat = scale.reshape(-1)
+    sbuf = torch.empty(sflat.numel() + 64, dtype=torch.uint8, device=scale.device)
+    sbuf[: sflat.numel()] = sflat
+    scale = sbuf[: sflat.numel()].view(b, sk, h, 4)
     return k_view, scale
 
 
