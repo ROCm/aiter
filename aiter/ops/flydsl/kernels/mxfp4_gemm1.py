@@ -221,6 +221,12 @@ def _silu_mul(g, u):
     return g * sig * u
 
 
+def _silu_mul_batch(gs, us):
+    e = [fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E)))) for g in gs]
+    sig = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
+    return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
+
+
 def _fabs_f32(x):
     """fabsf via bit-mask (FlyDSL has no arith.absf): clear the sign bit."""
     bits = _raw(x).bitcast(T.i32)
@@ -793,6 +799,7 @@ def _gemm1_body(
             )
 
     # ---- prologue: stages 0,1 (HIP 431-463) ----
+    _relax_prologue = (BM == 128) and not inline_quant
     if const_expr(not inline_quant):
         issue_a_scale_load()
     for K_C in range_constexpr(kStages):
@@ -809,9 +816,17 @@ def _gemm1_body(
             inline_quant_pack_write(K_C, scale_accum)
         else:
             issue_a_load_lds(K_C, K_C)
+            if const_expr(not _relax_prologue):
+                for j in range_constexpr(4):
+                    issue_b_load_j(b[K_C], K_C, j)
+        if const_expr(not _relax_prologue):
+            issue_b_scale_load(b_scale_v[K_C], K_C)
+    if const_expr(_relax_prologue):
+        rocdl.sched_barrier(0)
+        for K_C in range_constexpr(kStages):
             for j in range_constexpr(4):
                 issue_b_load_j(b[K_C], K_C, j)
-        issue_b_scale_load(b_scale_v[K_C], K_C)
+            issue_b_scale_load(b_scale_v[K_C], K_C)
 
     # ---- main loop: OFFSET in [0,26) (HIP 465-552 non-inline else) ----
     for OFFSET in range_constexpr(kUnroll):
@@ -819,9 +834,29 @@ def _gemm1_body(
         read_slot = OFFSET % kAStages
         write_slot = K_C % kAStages
         slot_b = OFFSET % kStages
-        gpu.barrier()  # __syncthreads (HIP 472)
-        a_cur = issue_a_ds_read(read_slot)
-        asc_cur = issue_a_scale_ds_read(K_C - kStages)
+        if const_expr(_relax_prologue and OFFSET == 0):
+            llvm.inline_asm(
+                res=None,
+                operands_=[],
+                asm_string=f"s_waitcnt vmcnt({10 * kStages})",
+                constraints="",
+                has_side_effects=True,
+            )
+            llvm.inline_asm(
+                res=None,
+                operands_=[],
+                asm_string="s_barrier",
+                constraints="",
+                has_side_effects=True,
+            )
+        else:
+            gpu.barrier()  # __syncthreads (HIP 472)
+        if const_expr(BM == 128):
+            asc_cur = issue_a_scale_ds_read(K_C - kStages)
+            a_cur = issue_a_ds_read(read_slot)
+        else:
+            a_cur = issue_a_ds_read(read_slot)
+            asc_cur = issue_a_scale_ds_read(K_C - kStages)
         if const_expr(not inline_quant):
             issue_a_load_lds(write_slot, K_C)
         # Inline path (HIP :523-528): pre-load the next K-tile's hidden into regs so
@@ -858,8 +893,12 @@ def _gemm1_body(
     for S in range_constexpr(kStages):
         kt = K_TILES_TOTAL - kStages + S
         gpu.barrier()
-        a_cur = issue_a_ds_read(kt % kAStages)
-        asc_cur = issue_a_scale_ds_read(kt)
+        if const_expr(BM == 128):
+            asc_cur = issue_a_scale_ds_read(kt)
+            a_cur = issue_a_ds_read(kt % kAStages)
+        else:
+            a_cur = issue_a_ds_read(kt % kAStages)
+            asc_cur = issue_a_scale_ds_read(kt)
         for J in range_constexpr(4):
             mfma_cluster(
                 b[kt % kStages], a_cur, asc_cur, b_scale_v[kt % kStages], J, init=False
@@ -906,16 +945,17 @@ def _gemm1_body(
         row_local = fx.Int32(mr * 16) + m_lane
 
         # read 8 gate + 8 up f32 from lds_acc (epilog 75-83).
-        result = [None] * 8
+        gate_vs = [None] * 8
+        up_vs = [None] * 8
         for ee in range_constexpr(8):
             col_in_grp = fx.Int32(8) * kk + fx.Int32(ee)
             gate_col = wave_grp * fx.Int32(32) + col_in_grp
             up_col = fx.Int32(128) + gate_col
             gate_off = (row_local * fx.Int32(BN) + gate_col) * fx.Int32(4)
             up_off = (row_local * fx.Int32(BN) + up_col) * fx.Int32(4)
-            gate_v = fx.Float32(llvm.load(T.f32, _gep3(lds_acc_base, gate_off)))
-            up_v = fx.Float32(llvm.load(T.f32, _gep3(lds_acc_base, up_off)))
-            result[ee] = _silu_mul(gate_v, up_v)
+            gate_vs[ee] = fx.Float32(llvm.load(T.f32, _gep3(lds_acc_base, gate_off)))
+            up_vs[ee] = fx.Float32(llvm.load(T.f32, _gep3(lds_acc_base, up_off)))
+        result = _silu_mul_batch(gate_vs, up_vs)
 
         # local amax over the 8 results (epilog 91-95).
         local_max = _fabs_f32(result[0])

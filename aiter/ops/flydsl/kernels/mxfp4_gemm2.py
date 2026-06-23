@@ -1111,7 +1111,6 @@ def _flat_mxfp4_epilog(
     n_lane = tid_i32 % fx.Int32(16)
     wave_grp = n_lane // fx.Int32(4)
     kk = n_lane % fx.Int32(4)
-    i7fff = _raw(fx.Int32(0x7FFFFFFF))
     _m_base = m_row + m_lane
     _q_row0 = fx.Int64(_m_base) * fx.Int64(N_OUT // 2)
     _s_row0 = fx.Int64(_m_base) * fx.Int64(N_OUT // 32)
@@ -1147,12 +1146,13 @@ def _flat_mxfp4_epilog(
             _r_next, _grp_next, _col0_next = _issue_load(*_blocks[_bi + 1])
         if True:
             # block amax over |r[0..7]| (positive-float bits) -> bf16-bits
-            maxb = arith.andi(arith.bitcast(T.i32, _raw(r[0])), i7fff)
+            amax_f = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(r[0])], [], [])
             for e in range_constexpr(1, 8):
-                maxb = arith.maxui(
-                    maxb, arith.andi(arith.bitcast(T.i32, _raw(r[e])), i7fff)
+                abs_e = llvm.call_intrinsic(
+                    T.f32, "llvm.fabs.f32", [_raw(r[e])], [], []
                 )
-            amax = arith.shrui(maxb, _raw(fx.Int32(16)))
+                amax_f = arith.maxnumf(amax_f, abs_e)
+            amax = arith.shrui(arith.bitcast(T.i32, amax_f), _raw(fx.Int32(16)))
             # DPP quad-amax (reduce across the 4 kk-lanes of the block)
             s1 = rocdl.update_dpp(T.i32, amax, amax, 0xB1, 0xF, 0xF, True)
             a = arith.maxui(amax, s1)
