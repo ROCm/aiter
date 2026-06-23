@@ -1283,7 +1283,10 @@ namespace py = pybind11;
           py::arg("need_renorm"),                                              \
           py::arg("is_softmax")            = true,                             \
           py::arg("routed_scaling_factor") = 1.0f,                             \
-          "Apply grouped topk softmax/sigmodd to the gating outputs.");        \
+          py::arg("num_fused_shared_experts") = 0,                             \
+          py::arg("fused_shared_experts_scaling_factor") = 1.0f,               \
+          py::arg("shared_expert_base") = -1,                                  \
+          "Apply grouped topk softmax/sigmoid to the gating outputs.");        \
     m.def("biased_grouped_topk",                                               \
           &biased_grouped_topk,                                                \
           py::arg("gating_output"),                                            \
@@ -1294,6 +1297,9 @@ namespace py = pybind11;
           py::arg("topk_grp"),                                                 \
           py::arg("need_renorm"),                                              \
           py::arg("routed_scaling_factor") = 1.0f,                             \
+          py::arg("num_fused_shared_experts") = 0,                             \
+          py::arg("fused_shared_experts_scaling_factor") = 1.0f,               \
+          py::arg("shared_expert_base") = -1,                                  \
           "Apply biased grouped topk softmax to the gating outputs.");         \
     m.def("moe_fused_gate",                                                    \
           &moe_fused_gate,                                                     \

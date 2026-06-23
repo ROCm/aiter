@@ -326,7 +326,10 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                     const int topk,
                     const int topk_group,
                     const int num_tokens,
-                    const float routed_scaling_factor)
+                    const float routed_scaling_factor,
+                    const int num_fused_shared_experts,
+                    const float fused_shared_experts_scaling_factor,
+                    const int shared_expert_base)
 {
     static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
     static constexpr int THREAD_PER_GRP = (WARP_SIZE + NUM_GRP - 1) / NUM_GRP;
@@ -612,6 +615,12 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         topk_weights[token_idx * stride_tk + k] = topk_value * sum;
         topk_ids[token_idx * stride_tk + k]     = topk_indice;
     }
+
+    for(int s = threadIdx.x; s < num_fused_shared_experts; s += blockDim.x)
+    {
+        topk_weights[token_idx * stride_tk + topk + s] = fused_shared_experts_scaling_factor;
+        topk_ids[token_idx * stride_tk + topk + s]     = shared_expert_base + s;
+    }
 }
 
 template <typename DTYPE_I,
@@ -630,7 +639,10 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                              const int topk,
                              const int topk_group,
                              const int num_tokens,
-                             const float routed_scaling_factor)
+                             const float routed_scaling_factor,
+                             const int num_fused_shared_experts,
+                             const float fused_shared_experts_scaling_factor,
+                             const int shared_expert_base)
 {
     static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
     // number of lanes responsible for a expert group
@@ -1092,6 +1104,13 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_i;
         }
 #endif
+        for(int shared_idx = threadIdx.x; shared_idx < num_fused_shared_experts;
+            shared_idx += blockDim.x)
+        {
+            topk_weights[token_idx * stride_tk + topk + shared_idx] =
+                fused_shared_experts_scaling_factor;
+            topk_ids[token_idx * stride_tk + topk + shared_idx] = shared_expert_base + shared_idx;
+        }
     }
 }
 } // namespace aiter
@@ -1170,7 +1189,10 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             topk,                                                                                  \
             topk_grp,                                                                              \
             num_tokens,                                                                            \
-            routed_scaling_factor);                                                                \
+            routed_scaling_factor,                                                                 \
+            num_fused_shared_experts,                                                              \
+            fused_shared_experts_scaling_factor,                                                   \
+            shared_expert_base);                                                                   \
     });
 
 #define LAUNCHER_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)             \
@@ -1191,7 +1213,10 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             topk,                                                                                  \
             topk_grp,                                                                              \
             num_tokens,                                                                            \
-            routed_scaling_factor);                                                                \
+            routed_scaling_factor,                                                                 \
+            num_fused_shared_experts,                                                              \
+            fused_shared_experts_scaling_factor,                                                   \
+            shared_expert_base);                                                                   \
     });
 
 #define LAUNCHER_biased_grouped_topk_opt_sort_kernel(                             \
@@ -1217,7 +1242,10 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                                topk,                                              \
                                topk_grp,                                          \
                                num_tokens,                                        \
-                               routed_scaling_factor);                            \
+                               routed_scaling_factor,                             \
+                               num_fused_shared_experts,                          \
+                               fused_shared_experts_scaling_factor,               \
+                               shared_expert_base);                               \
         });
 
 void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_experts]
@@ -1227,14 +1255,28 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
                          int num_expert_group,
                          int topk_grp,
                          bool need_renorm,
-                         const float routed_scaling_factor = 1.)
+                         const float routed_scaling_factor = 1.,
+                         int num_fused_shared_experts = 0,
+                         const float fused_shared_experts_scaling_factor = 1.,
+                         int shared_expert_base = -1)
 {
     const bool isBiased = true;
     bool isSoftmax      = false;
     int num_tokens      = gating_output.size(0);
     int num_experts     = gating_output.size(1);
-    int topk            = topk_ids.size(1);
+    int total_topk      = topk_ids.size(1);
+    int topk            = total_topk - num_fused_shared_experts;
     size_t stride_tk    = topk_ids.stride(0);
+    if(num_fused_shared_experts > 0)
+    {
+        TORCH_CHECK(shared_expert_base >= 0,
+                    "shared_expert_base must be provided when num_fused_shared_experts > 0");
+        TORCH_CHECK(topk >= 1,
+                    "topk output must include routed and shared expert columns: "
+                    "topk_ids.size(1) must be greater than num_fused_shared_experts");
+        TORCH_CHECK(static_cast<int64_t>(stride_tk) >= total_topk,
+                    "topk output row stride must include routed and shared expert columns");
+    }
     TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
                 topk_grp,
@@ -1274,15 +1316,29 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
                   int topk_grp,
                   bool need_renorm,
                   bool is_softmax                   = true,
-                  const float routed_scaling_factor = 1.)
+                  const float routed_scaling_factor = 1.,
+                  int num_fused_shared_experts = 0,
+                  const float fused_shared_experts_scaling_factor = 1.,
+                  int shared_expert_base = -1)
 {
     const bool isBiased  = false;
     bool isSoftmax       = is_softmax;
     int num_tokens       = gating_output.size(0);
     int num_experts      = gating_output.size(1);
-    int topk             = topk_ids.size(1);
+    int total_topk       = topk_ids.size(1);
+    int topk             = total_topk - num_fused_shared_experts;
     size_t stride_tk     = topk_ids.stride(0);
     auto correction_bias = topk_ids;
+    if(num_fused_shared_experts > 0)
+    {
+        TORCH_CHECK(shared_expert_base >= 0,
+                    "shared_expert_base must be provided when num_fused_shared_experts > 0");
+        TORCH_CHECK(topk >= 1,
+                    "topk output must include routed and shared expert columns: "
+                    "topk_ids.size(1) must be greater than num_fused_shared_experts");
+        TORCH_CHECK(static_cast<int64_t>(stride_tk) >= total_topk,
+                    "topk output row stride must include routed and shared expert columns");
+    }
     TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
                 topk_grp,
