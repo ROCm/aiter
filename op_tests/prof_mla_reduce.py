@@ -16,9 +16,9 @@ fout = torch.empty(T, H, Dv, dtype=torch.bfloat16, device="cuda")
 flse = torch.empty(T, H, dtype=torch.float32, device="cuda")
 
 for _ in range(10):  # warmup + JIT
-    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, fout, flse)
+    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, 0, fout, flse)
 torch.cuda.synchronize()
 for _ in range(int(os.environ.get("PROF_ITERS", 20))):
-    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, fout, flse)
+    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, 0, fout, flse)
 torch.cuda.synchronize()
 print("done")

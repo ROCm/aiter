@@ -44,12 +44,17 @@ def _mla_reduce_v1_dispatch(
     reduce_final_map,
     reduce_partial_map,
     max_seqlen_q,
+    num_kv_splits,
     final_output,
     final_lse,
 ):
     """Dispatch the MLA decode reduce to HIP (default) or FlyDSL (opt-in).
 
-    Signature mirrors ``aiter.mla_reduce_v1`` exactly so it is a drop-in swap.
+    Signature mirrors ``aiter.mla_reduce_v1`` exactly (num_kv_splits at slot 7,
+    between max_seqlen_q and final_output) so it is a drop-in swap. The HIP
+    kernel uses max(SM_count, num_kv_splits); 0 means "auto" (SM_count). The
+    FlyDSL port derives its grid from num_cu + CSR width, so it takes the arg
+    for parity but does not need it.
     """
     if _flydsl_mla_reduce_enabled():
         from aiter.ops.flydsl import flydsl_mla_reduce_v1
@@ -63,6 +68,7 @@ def _mla_reduce_v1_dispatch(
             max_seqlen_q,
             final_output,
             final_lse,
+            num_kv_splits=num_kv_splits,
         )
         return
     aiter.mla_reduce_v1(
@@ -72,6 +78,7 @@ def _mla_reduce_v1_dispatch(
         reduce_final_map,
         reduce_partial_map,
         max_seqlen_q,
+        num_kv_splits,
         final_output,
         final_lse,
     )

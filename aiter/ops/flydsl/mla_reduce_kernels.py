@@ -46,6 +46,7 @@ def flydsl_mla_reduce_v1(
     max_seqlen_q: int,
     final_output: torch.Tensor,  # bf16/fp16 [bs, H, Dv]
     final_lse: torch.Tensor | None = None,  # fp32 [bs, H] (optional)
+    num_kv_splits: int = 0,  # signature parity; grid derived from num_cu + CSR width
     *,
     stream: torch.cuda.Stream | None = None,
 ) -> None:
@@ -63,6 +64,8 @@ def flydsl_mla_reduce_v1(
         max_seqlen_q: kept for signature parity (unused; NTG=1 here).
         final_output: output tensor (bf16/fp16); strides are read at runtime.
         final_lse: optional merged LSE output (fp32).
+        num_kv_splits: kept for signature parity with the HIP kernel (unused; the
+            split count is read from the CSR map / num_cu, not this arg).
         stream: launch stream; defaults to the current stream of the device.
     """
     if reduce_indptr.numel() < 2:

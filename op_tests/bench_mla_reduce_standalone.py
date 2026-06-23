@@ -134,7 +134,7 @@ def main():
         pl = pl.to(_dt[args.partial_dtype])
 
     def run():
-        aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, fout, flse)
+        aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, 0, fout, flse)
 
     run()
     torch.cuda.synchronize()

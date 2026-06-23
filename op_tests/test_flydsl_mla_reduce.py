@@ -65,7 +65,7 @@ def hip_ref(po, pl, indptr, fmap, pmap, num_tiles, H, Dv, out_dtype):
     FlyDSL port replaces). Same input buffers as the FlyDSL launch."""
     ref_out = torch.empty(num_tiles, H, Dv, dtype=out_dtype, device=po.device)
     ref_lse = torch.empty(num_tiles, H, dtype=torch.float32, device=po.device)
-    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, ref_out, ref_lse)
+    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, 0, ref_out, ref_lse)
     torch.cuda.synchronize()
     return ref_out, ref_lse
 
