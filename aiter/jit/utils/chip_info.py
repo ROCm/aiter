@@ -413,7 +413,7 @@ def write_lookup_header(
     with open(output_path, "w") as f:
         f.write(lookup_head)
         for key, name in gen_lookup_header_map(kernels_dict, istune):
-            if isinstance(key[0], str):
+            if isinstance(key, tuple):
                 # 5-tuple key: (gfx, cu_num, M, N, K)
                 # 6-tuple key: (gfx, cu_num, B, M, N, K)
                 # key[0] is the gfx arch string; the remaining elements are ints.
