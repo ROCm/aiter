@@ -29,9 +29,12 @@ def _get_fwd_autotune_configs():
 
 
 def _fwd_prune_configs(configs, named_args, **kwargs):
+    # gfx1250 has large LDS — the K double-buffer at TILE_K=64 needs ~147 KB and runs
+    # fine. The old 65536 limit pruned every TILE_K>=32 config and fell back to a tiny
+    # BLOCK_H=16 config (3x slower). Use 163840 so TILE_K in {32,64} survive.
     D_V = kwargs.get("D_V", named_args.get("D_V"))
     D_ROPE = kwargs.get("D_ROPE", named_args.get("D_ROPE"))
-    pruned = [c for c in configs if (D_V + D_ROPE) * c.kwargs["TILE_K"] * 2 * 2 <= 65536]
+    pruned = [c for c in configs if (D_V + D_ROPE) * c.kwargs["TILE_K"] * 2 * 2 <= 163840]
     return pruned or [configs[0]]
 
 
