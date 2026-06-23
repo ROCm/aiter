@@ -99,15 +99,11 @@ If you happen to forget the `--recursive` during `clone`, you can use the follow
 git submodule sync && git submodule update --init --recursive
 ```
 
-### FlyDSL (Optional)
+### FlyDSL
 
-AITER's FusedMoE supports [FlyDSL](https://pypi.org/project/flydsl/)-based kernels for mixed-precision MOE (e.g., A4W4). FlyDSL is optional — when not installed, AITER automatically falls back to CK kernels.
+AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 setup.py develop`.
 
-```bash
-pip install --pre flydsl
-```
-
-Or install all optional dependencies at once:
+To install it manually:
 
 ```bash
 pip install -r requirements.txt
