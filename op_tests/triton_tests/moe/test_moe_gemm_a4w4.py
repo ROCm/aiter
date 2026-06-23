@@ -243,11 +243,11 @@ def test_op(
 
     if preshuffle_weights:
         if get_arch() != "gfx1250":
-            pytest.skip(f"Preshuffling weights is only supported on gfx1250")
+            pytest.skip("Preshuffling weights is only supported on gfx1250")
         if backend != "gluon":
-            pytest.skip(f"Preshuffling weights is only supported on gluon backend")
+            pytest.skip("Preshuffling weights is only supported on gluon backend")
         if n % 16 != 0 and k % 16 != 0:
-            pytest.skip(f"Preshuffling weights is only supported on shapes where n and k are divisible by 16")
+            pytest.skip("Preshuffling weights is only supported on shapes where n and k are divisible by 16")
 
     # skip gluon backend if not supported
     if backend == "gluon" and not is_gluon_supported():
