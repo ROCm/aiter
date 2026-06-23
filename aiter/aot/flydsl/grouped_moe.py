@@ -29,58 +29,6 @@ def _align_up(value: int, alignment: int) -> int:
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
 
 
-<<<<<<< HEAD
-=======
-def _preshuffled_scale_shape(
-    rows: int, k_dim: int, warp_tile: int, tile_k: int = _TILE_K
-) -> tuple[int, int]:
-    """Mirror moe_grouped_gemm_mxscale_gfx1250._preshuffled_scale_shape.
-
-    The grouped GEMM launchers validate an exact preshuffled E8M0 scale layout
-    (see tests.kernels.test_gemm_mxscale_gfx1250.preshuffle_e8m0_scale), so the
-    AOT dummy tensors must use the same shape, not the plain (rows, k//32) one.
-    """
-    k_scale = int(k_dim) // 32
-    scale_k_per_tile = int(tile_k) // 32
-    if k_scale % scale_k_per_tile != 0:
-        raise ValueError(
-            f"K scale columns must be divisible by tile_k/32, got {k_scale} and {scale_k_per_tile}"
-        )
-    wmma_rep = int(warp_tile) // 16
-    if wmma_rep < 1:
-        raise ValueError(f"warp_tile must be >= 16, got {warp_tile}")
-    if int(rows) % wmma_rep != 0:
-        raise ValueError(
-            f"scale rows must be divisible by wmma_rep={wmma_rep}, got {rows}"
-        )
-    return int(rows) // wmma_rep, k_scale * wmma_rep
-
-
-def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
-    """Mirror moe_grouped_gemm_mxscale_gfx1250._preshuffled_b_scale_shape.
-
-    Weight (B) scale uses the n32k4 layout (different from the activation/A
-    layout above): a 32-row super-block folds into the column dim, so 32 N-rows
-    collapse to one row and each k_scale column expands x32. The grouped GEMM
-    launchers validate scale_w against THIS shape, so the AOT dummy must match.
-    """
-    k_scale = int(k_dim) // 32
-    if k_scale % 4 != 0:
-        raise ValueError(
-            f"B-scale k columns (K//32) must be divisible by 4 (K%128==0), got {k_scale}"
-        )
-    if int(rows) % 32 != 0:
-        raise ValueError(f"B-scale rows must be divisible by 32, got {rows}")
-    return int(rows) // 32, k_scale * 32
-
-
-def _as_bool(value, default: bool = False) -> bool:
-    if value is None or str(value).strip() == "":
-        return default
-    return str(value).strip().lower() in ("1", "true", "yes")
-
-
->>>>>>> origin/main
 def _as_int(value, default: int | None = None) -> int | None:
     if value is None or str(value).strip() == "":
         return default
@@ -167,22 +115,6 @@ GROUPED_MOE_AOT_ARCH_DEFAULT = "gfx1250"
 def _compile_grouped_moe_aux_kernels(job, *, dtype, pack, warp_tile_m, max_m):
     """Precompile the non-GEMM FlyDSL kernels the run-only grouped MoE path
     launches around gemm1/gemm2.
-
-    On the production fast path (``_maybe_grouped_gfx1250_a8w4_moe``) each
-    grouped GEMM is bracketed by a set of small FlyDSL kernels:
-
-      * ``moe_route_maps``                 -- atomic-scatter route -> grouped row
-      * ``moe_scatter_copy_token``         -- payload route-gather
-      * ``moe_scatter_copy_preshuffle_scale`` (gather=True)  -- stage1 scale
-      * ``moe_scatter_copy_preshuffle_scale`` (gather=False) -- stage2 scale
-      * ``moe_gather_reduce``              -- token-order epilogue (bf16/f16)
-      * ``moe_contiguous_psum``            -- DeepGEMM contiguous-M prefix sum
-
-    Under ``FLYDSL_RUNTIME_RUN_ONLY`` any of these missing from the AOT cache
-    raises at first inference, so precompile them alongside the GEMMs. The
-    launch shapes only need correct dtype/rank -- each module's cache key is the
-    build-time geometry (row bytes / wmma_rep / model_dim / topk / out_dtype),
-    not the dynamic token/expert scalars passed at launch.
     """
     import torch
 
@@ -319,7 +251,6 @@ def compile_one_config(**job):
     )
 
     t0 = time.time()
-<<<<<<< HEAD
     try:
         dev = torch.device("cpu")
         dtype = torch.bfloat16 if job["out_dtype"] == "bf16" else torch.float16
@@ -328,52 +259,6 @@ def compile_one_config(**job):
             compile_moe_grouped_gemm1_mxfp4_masked
             if job["data_format"] == "fp4"
             else compile_moe_grouped_gemm1_a8w4_masked
-=======
-    dev = torch.device("cpu")
-    dtype = torch.bfloat16 if job["out_dtype"] == "bf16" else torch.float16
-    pack = 2 if job["data_format"] == "fp4" else 1
-    compiler1 = (
-        compile_moe_grouped_gemm1_mxfp4_masked
-        if job["data_format"] == "fp4"
-        else compile_moe_grouped_gemm1_a8w4_masked
-    )
-    compiler2 = (
-        compile_moe_grouped_gemm2_mxfp4_masked
-        if job["data_format"] == "fp4"
-        else compile_moe_grouped_gemm2_a8w4_masked
-    )
-    warp_tile_m = job["tile_m"] // job["m_warp"]
-    contiguous = bool(job.get("grouped_contiguous_m", False))
-    common = dict(
-        model_dim=job["model_dim"],
-        inter_dim=job["inter_dim"],
-        experts=job["experts"],
-        max_m=job["max_m"],
-        tile_m=job["tile_m"],
-        tile_n=job["tile_n"],
-        tile_k=job["tile_k"],
-        m_warp=job["m_warp"],
-        n_warp=job["n_warp"],
-        out_dtype=job["out_dtype"],
-        num_buffers=job["num_buffers"],
-        grouped_persistent_m=job["grouped_persistent_m"],
-        grouped_contiguous_m=contiguous,
-        persistent_workers=job["persistent_workers"],
-        expert_sched_mode=job["expert_sched_mode"],
-    )
-    if contiguous:
-        act_lead = 1
-        ub = job["token_num"] * job["topk"] + job["experts"] * (job["tile_m"] - 1)
-        rows = max(job["tile_m"], _align_up(ub, job["tile_m"]))
-    else:
-        act_lead = job["experts"]
-        rows = job["max_m"]
-    with compile_only_env(), override_env(
-        "FLYDSL_GPU_ARCH", aot_arch
-    ), FakeTensorMode():
-        masked_m = torch.full(
-            (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
->>>>>>> origin/main
         )
         compiler2 = (
             compile_moe_grouped_gemm2_mxfp4_masked
@@ -399,7 +284,6 @@ def compile_one_config(**job):
             persistent_workers=job["persistent_workers"],
             expert_sched_mode=job["expert_sched_mode"],
         )
-<<<<<<< HEAD
         if contiguous:
             act_lead = 1
             ub = job["token_num"] * job["topk"] + job["experts"] * (job["tile_m"] - 1)
@@ -559,109 +443,6 @@ def compile_one_config(**job):
     except Exception as e:
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
         return {**job, "compile_time": None, "compile_arch": aot_arch}
-=======
-        sx1 = torch.empty(
-            (act_lead, *_preshuffled_scale_shape(rows, job["model_dim"], warp_tile_m)),
-            dtype=torch.uint8,
-        )
-        sw1 = torch.empty(
-            (
-                job["experts"],
-                *_preshuffled_b_scale_shape(2 * job["inter_dim"], job["model_dim"]),
-            ),
-            dtype=torch.uint8,
-        )
-        y2 = torch.empty((act_lead, rows, job["model_dim"]), dtype=dtype)
-        x2 = torch.empty((act_lead, rows, job["inter_dim"] // pack), dtype=torch.uint8)
-        w2 = torch.empty(
-            (job["experts"], job["model_dim"], job["inter_dim"] // 2),
-            dtype=torch.uint8,
-        )
-        sx2 = torch.empty(
-            (act_lead, *_preshuffled_scale_shape(rows, job["inter_dim"], warp_tile_m)),
-            dtype=torch.uint8,
-        )
-        sw2 = torch.empty(
-            (
-                job["experts"],
-                *_preshuffled_b_scale_shape(job["model_dim"], job["inter_dim"]),
-            ),
-            dtype=torch.uint8,
-        )
-        exe1 = compiler1(
-            act=job["act"],
-            stage1_weight_layout=job["stage1_weight_layout"],
-            split_k=job["split_k1"],
-            **common,
-        )
-        exe1(
-            y1,
-            x1,
-            w1,
-            sx1,
-            sw1,
-            masked_m,
-            job["max_m"],
-            job["inter_dim"],
-            job["model_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-        )
-        # Bias-epilogue variant: runtime calls stage1(..., bias=...) when the model
-        # carries per-expert bias (e.g. gpt-oss), which triggers a distinct compiled
-        # kernel (gemm1_bias_* / finalize_act_bias). Precompile it alongside the
-        # bias-free kernel so neither path JITs at first inference.
-        bias1 = torch.empty((job["experts"], 2 * job["inter_dim"]), dtype=dtype)
-        exe1(
-            y1,
-            x1,
-            w1,
-            sx1,
-            sw1,
-            masked_m,
-            job["max_m"],
-            job["inter_dim"],
-            job["model_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-            bias=bias1,
-        )
-        exe2 = compiler2(split_k=job["split_k2"], **common)
-        exe2(
-            y2,
-            x2,
-            w2,
-            sx2,
-            sw2,
-            masked_m,
-            job["max_m"],
-            job["model_dim"],
-            job["inter_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-        )
-        # Bias-epilogue variant for stage2 (gemm2_bias_*); see stage1 note above.
-        bias2 = torch.empty((job["experts"], job["model_dim"]), dtype=dtype)
-        exe2(
-            y2,
-            x2,
-            w2,
-            sx2,
-            sw2,
-            masked_m,
-            job["max_m"],
-            job["model_dim"],
-            job["inter_dim"],
-            job["experts"],
-            stream=0,
-            _m_tile_map=contiguous_layout,
-            bias=bias2,
-        )
-    return {**job, "compile_time": time.time() - t0, "compile_arch": aot_arch}
->>>>>>> origin/main
 
 
 def main(argv=None):
