@@ -248,6 +248,10 @@ def get_exclude_ops():
         exclude_ops.extend(sorted(core._get_ck_exclude_modules()))
         return exclude_ops
 
+    # conv2d implicit GEMM kernel needs gfx942 pipeline adaptation (WIP);
+    # exclude from prebuild to avoid symbol-missing crash at runtime.
+    exclude_ops.append("module_opus_conv2d")
+
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
             # Exclude tune modules; for MHA keep only fmha_v3 fwd variants

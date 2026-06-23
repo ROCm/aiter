@@ -13,7 +13,13 @@
 // Tile: kid6 gfx942 — 512×128×128×64, VEC=(8,8,4)
 #pragma once
 
-#include "opus_gemm_pipeline_a16w16_kbuf1.cuh"
+#include "opus_gemm_traits_a16w16.cuh"
+
+// conv2d implicit GEMM kernel is WIP: pipeline helpers (make_layout_*_noscale,
+// phase_mma*, smem_padding) need porting from gfx950 naming to gfx942.
+// Emit a compile error so the JIT build fails cleanly (Python-catchable)
+// instead of producing a .so with missing device symbols (GPU abort).
+#error "opus_conv2d_implicit: kernel not yet ported to gfx942 kbuf1 pipeline — WIP"
 
 // ============================================================================
 // kargs — shared between device kernel and host launcher
@@ -378,4 +384,6 @@ void conv_implicit_gemm_kernel(conv_implicit_kargs kargs) {
 #endif // __gfx942__
 }
 
+#if defined(__gfx942__)
 template __global__ void conv_implicit_gemm_kernel<ConvImplicitTraits>(conv_implicit_kargs);
+#endif
