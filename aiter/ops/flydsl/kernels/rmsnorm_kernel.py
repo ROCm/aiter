@@ -225,7 +225,7 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EP
             _, sum_sq = block_reduce_add2(thread_dummy, thread_sumsq)
             mean_sq = sum_sq / n_float
             ms_eps = mean_sq + eps_c
-            rrms = ms_eps.rsqrt(fastmath=fm_fast)
+            rrms = fmath.rsqrt(ms_eps, fastmath=fm_fast)
 
             # Pass 2: normalize + gamma + store (reuse cached input)
             for tile_i in range_constexpr(num_tiles):
@@ -315,12 +315,13 @@ def _build_rmsnorm_large_m_small_n_module(M: int, N: int, dtype_str: str, eps: f
     BLOCK_THREADS_SPECIAL = BLOCK_M * THREADS_PER_ROW
     elem_bits = 32 if dtype_str == "f32" else 16
 
-    @flyc.kernel
+    @flyc.kernel(known_block_size=[BLOCK_THREADS_SPECIAL, 1, 1])
     def rmsnorm_large_m_small_n_kernel(
         Input: fx.Tensor,
         Gamma: fx.Tensor,
         _Unused: fx.Tensor,
         Output: fx.Tensor,
+        MIn: fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -329,7 +330,7 @@ def _build_rmsnorm_large_m_small_n_module(M: int, N: int, dtype_str: str, eps: f
         row_local = tid // THREADS_PER_ROW
         row = bid * fx.Int32(BLOCK_M) + row_local
 
-        if row < M:
+        if row < MIn:
             elem_dtype = dtype_to_elem_type(dtype_str)
             fm_fast = arith.FastMathFlags.fast
             eps_c = eps
@@ -395,9 +396,9 @@ def _build_rmsnorm_large_m_small_n_module(M: int, N: int, dtype_str: str, eps: f
         m_in: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        launcher = rmsnorm_large_m_small_n_kernel(Input, Gamma, Gamma, Output)
+        launcher = rmsnorm_large_m_small_n_kernel(Input, Gamma, Gamma, Output, m_in)
         launcher.launch(
-            grid=((M + BLOCK_M - 1) // BLOCK_M, 1, 1),
+            grid=((m_in + fx.Int32(BLOCK_M - 1)) // fx.Int32(BLOCK_M), 1, 1),
             block=(BLOCK_THREADS_SPECIAL, 1, 1),
             stream=stream,
         )
@@ -528,7 +529,7 @@ def build_fused_add_rmsnorm_module(M: int, N: int, dtype_str: str, eps: float = 
             _, sum_sq = block_reduce_add2(thread_dummy, thread_sumsq)
             mean_sq = sum_sq / n_float
             ms_eps = mean_sq + eps_c
-            rrms = ms_eps.rsqrt(fastmath=fm_fast)
+            rrms = fmath.rsqrt(ms_eps, fastmath=fm_fast)
 
             # Pass 2: normalize + gamma + store (reuse cached added values)
             for tile_i in range_constexpr(num_tiles):
@@ -787,7 +788,7 @@ def _build_rmsnorm_quant_module(
             _, sum_sq = block_reduce_add2(thread_dummy, thread_sumsq)
             mean_sq = sum_sq / n_float
             ms_eps = mean_sq + eps_c
-            rrms = ms_eps.rsqrt(fastmath=fm_fast)
+            rrms = fmath.rsqrt(ms_eps, fastmath=fm_fast)
 
             thread_row_max = c_zero_f
             y_local = []
@@ -1180,7 +1181,7 @@ def _build_fused_add_rmsnorm_quant_module(
             _, sum_sq = block_reduce_add2(thread_dummy, thread_sumsq)
             mean_sq = sum_sq / n_float
             ms_eps = mean_sq + eps_c
-            rrms = ms_eps.rsqrt(fastmath=fm_fast)
+            rrms = fmath.rsqrt(ms_eps, fastmath=fm_fast)
 
             thread_row_max = c_zero_f
             y_local = []
