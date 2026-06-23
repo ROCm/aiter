@@ -238,6 +238,9 @@ def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):
     # ---- GPU kernel (timed) ----
     gpu_out = p["final_output"]
     gpu_lse = p["final_lse"]
+    # num_kv_splits sizes the LDS scratch (kernel uses max(CU_count, num_kv_splits)),
+    # so it must be >= the largest per-tile split count.
+    num_kv_splits = max(splits_per_tile)
     _, us = run_perftest(
         aiter.mla_reduce_v1,
         p["partial_output"],
@@ -246,6 +249,7 @@ def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):
         p["reduce_final_map"],
         p["reduce_partial_map"],
         p["max_seqlen_q"],
+        num_kv_splits,
         gpu_out,
         gpu_lse,
     )
@@ -321,13 +325,9 @@ def main():
     out_dtype = dtypes.bf16 if args.dtype == "bf16" else dtypes.fp16
     head_dims = args.head_dim
 
-    # The kernel sizes its LDS scratch to `max_splits = multiProcessorCount`
-    # (see reduce.cu: params.max_splits = dev_prop.multiProcessorCount and the
-    # lds_size computation in dispatch_mla_reduce_v1). A reduce tile with more
-    # splits than the device CU count overflows LDS -> GPU memory fault. In real
-    # usage the metadata kernel guarantees num_splits per tile <= num_CU, so we
-    # mirror that invariant here and cap each tile's split count.
-    cu_count = torch.cuda.get_device_properties(0).multi_processor_count
+    # The kernel sizes its LDS scratch to max(CU_count, num_kv_splits), and the
+    # test passes num_kv_splits = max(per-tile splits), so any split count is
+    # safe regardless of device CU count.
 
     # (head_dim -> supported head counts from MLA_REDUCE_ROUTER in reduce.cu)
     heads_for_dim = {
@@ -338,24 +338,17 @@ def main():
     # Cover both kernel paths:
     #   num_splits in [2,3]  -> simple impl
     #   num_splits >= 4      -> massive impl (<=wave_size / <=4*wave_size buckets)
-    big = min(cu_count, 256)  # largest single-tile split count we can safely run
     split_configs = [
         [2],  # simple, single tile
         [3, 2],  # simple, multi tile
         [4],  # massive, exactly threshold
         [8, 5, 7],  # massive, ragged tiles
         [33],  # massive, single large tile
-        [big],  # massive, largest tile that fits LDS (CU-capped)
+        [300],  # massive, exercises the >4*wave_size LDS-spill bucket
         [2, 4, 16, 64],  # mixed: simple + massive tiles
     ] + [
         [6] * 40
     ]  # many tiles -> exercises persistent-grid path
-
-    # Drop any config whose per-tile split count exceeds the LDS capacity.
-    dropped = [c for c in split_configs if max(c) > cu_count]
-    if dropped:
-        print(f"NOTE: cu_count={cu_count}; skipping configs exceeding it: {dropped}")
-    split_configs = [c for c in split_configs if max(c) <= cu_count]
 
     all_ok = True
     df = []
