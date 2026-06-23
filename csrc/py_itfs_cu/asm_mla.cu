@@ -941,13 +941,20 @@ void mla_decode_stage1_asm_fwd(
         config_gqa_ratio = 64;
         args.s_MQA = gqa_ratio;
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
-               && ((gqa_ratio == 32 && max_seqlen_q == 4)
+               && ((gqa_ratio == 16 && max_seqlen_q == 4)
+                   || (gqa_ratio == 32 && max_seqlen_q == 4)
                    || (gqa_ratio == 64 && max_seqlen_q >= 2 && max_seqlen_q <= 4)
                    || (gqa_ratio == 128))){
-        config_max_seqlen_q = 4;
-        config_gqa_ratio = 32;
+        // v3 PS kernels read raw gqa_ratio from 0x80 and derive s_MQA = gqa_ratio * tile_qlen
+        if (gqa_ratio != 16) {
+            config_max_seqlen_q = 4;
+            config_gqa_ratio = 32;
+        }
         args.s_MQA = gqa_ratio;
     }
+    // fp8 qseqlen>1 nps (e.g. QH16 16mx4): kernel writes fp32 partials; stage2 reduces to bf16 o
+    if (!persistent && q_type == "fp8" && kv_type == "fp8" && max_seqlen_q > 1)
+        args.out_16_nosplit = 0;
     int lse_flag = (lse != nullptr) ? 1 : 0;
 
     int cprr_flag = (g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr) ? 1 : 0;

@@ -252,13 +252,16 @@ def mla_decode_fwd(
 
         if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
+        # fp8 qseqlen>1 nps writes fp32 partials; stage2 must softmax-reduce, not cast-copy
+        if q.dtype == dtypes.fp8 and max_seqlen_q > 1:
+            MAYBE_FINAL_OUT = False
 
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if (
                 num_kv_splits == 1
                 and (
-                    q.dtype == dtypes.fp8
+                    (q.dtype == dtypes.fp8 and max_seqlen_q == 1)
                     or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
                     or (
                         q.dtype == dtypes.bf16
@@ -310,7 +313,7 @@ def mla_decode_fwd(
         )
 
         if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8
+            (q.dtype == dtypes.fp8 and max_seqlen_q == 1)
             or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
             or (
                 q.dtype == dtypes.bf16
