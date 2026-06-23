@@ -1103,6 +1103,36 @@ def flydsl_hca_compress_attn(
     docstring). Override only when bench-sweeping; the default matches the
     production tuning used by ATOM's compressor.
     """
+    # ---- gfx1250 dispatch (wave32) ----
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+
+    if _get_gfx() == "gfx1250":
+        from .fused_compress_attn_hca_gfx1250 import flydsl_hca_compress_attn_gfx1250
+
+        return flydsl_hca_compress_attn_gfx1250(
+            kv_in=kv_in,
+            score_in=score_in,
+            kv_state=kv_state,
+            score_state=score_state,
+            state_slot_mapping=state_slot_mapping,
+            plan_gpu=plan_gpu,
+            ape=ape,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            k_per_block=k_per_block,
+            ratio=ratio,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            kv_compressed_scratch=kv_compressed_scratch,
+            k_split_num_waves=k_split_num_waves,
+            slice_size=slice_size,
+            stream=stream,
+        )
+
     if k_split_num_waves is None or slice_size is None:
         # Local import to avoid a circular import between the two HCA modules
         # at package init time.

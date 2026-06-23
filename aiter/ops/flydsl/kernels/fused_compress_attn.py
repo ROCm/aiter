@@ -2238,6 +2238,39 @@ def flydsl_fused_compress_attn(
     :func:`csa_ksplit_num_waves` and uses legacy elsewhere; when 1, forces
     legacy. K must be divisible by NW.
     """
+    # ---- gfx1250 dispatch (wave32) ----
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+
+    if _get_gfx() == "gfx1250":
+        from .fused_compress_attn_gfx1250 import flydsl_fused_compress_attn_gfx1250
+
+        return flydsl_fused_compress_attn_gfx1250(
+            kv_in=kv_in,
+            score_in=score_in,
+            kv_state=kv_state,
+            score_state=score_state,
+            plan_gpu=plan_gpu,
+            state_slot_mapping=state_slot_mapping,
+            ape=ape,
+            rms_weight=rms_weight,
+            rms_eps=rms_eps,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            k_per_block=k_per_block,
+            overlap=overlap,
+            ratio=ratio,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            quant=quant,
+            cache_scale=cache_scale,
+            use_ue8m0=use_ue8m0,
+            preshuffle=preshuffle,
+            k_split_num_waves=k_split_num_waves,
+            stream=stream,
+        )
+
     # ---- input validation ----
     plan_capacity = plan_gpu.shape[0]
     if plan_capacity == 0:

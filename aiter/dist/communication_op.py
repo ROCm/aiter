@@ -67,6 +67,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     eps: float,
     prefill_support: bool = False,
     x_pad_to_multiple: int = 0,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm")
     return get_tp_group().fused_allreduce_rmsnorm(
@@ -76,6 +77,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
         eps,
         prefill_support,
         x_pad_to_multiple=x_pad_to_multiple,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -159,6 +161,28 @@ def tensor_model_parallel_fused_qknorm_allreduce(
         qkv_in,
         q_w,
         k_w,
+        eps,
+    )
+
+
+def tensor_model_parallel_fused_qknorm_allreduce_rope(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+):
+    return get_tp_group().fused_qknorm_allreduce_rope(
+        qkv_in,
+        q_w,
+        k_w,
+        cos_sin_cache,
+        position_ids,
+        head_dim,
+        rotary_dim,
         eps,
     )
 
