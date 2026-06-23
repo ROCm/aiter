@@ -3,6 +3,7 @@
 
 # user interface
 
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -259,7 +260,62 @@ def grouped_topk_torch(
     return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
+@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_prefill")
+def _top_k_per_row_prefill(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: Optional[torch.Tensor],
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    workspace: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
 @compile_ops("module_top_k_per_row")
+def topk_mb_workspace_size(
+    numRows: int, stride0: int, k: int, is_decode: bool
+) -> int: ...
+
+
+@compile_ops("module_top_k_per_row")
+def topk_use_mulblocks(numRows: int, stride0: int) -> bool: ...
+
+
+@functools.lru_cache(maxsize=16)
+def _get_topk_mb_workspace_keyed(
+    device: torch.device, stream_id: int, size: int
+) -> torch.Tensor:
+    return torch.zeros(size, dtype=torch.uint8, device=device)
+
+
+def get_topk_mb_workspace(device: torch.device, size: int) -> torch.Tensor:
+    """Return a per-(device, stream, bucketed-size) zero-initialized workspace
+    for the multi-block radix top-k path.
+
+    The mb kernel uses cross-block atomic counters / histograms that must start
+    at zero; instead of a per-call ``hipMemset`` the kernel resets the scratch
+    back to zero after each launch, so a cached zeroed buffer can be reused.
+    Concurrent launches on different streams must not share the buffer, or their
+    atomic counters get mixed. Do not call from paths that violate the kernel's
+    self-reset invariant.
+
+    ``size`` is data-dependent (batch / seq_len / k), so it is rounded up to the
+    next power of two before keying/allocating. That bounds the number of
+    distinct cached buffers to ~log2(max_size) magnitudes (and the LRU cap of 16
+    bounds it further) instead of one buffer per exact shape, trading <=2x size
+    per buffer for far fewer retained buffers. The C++ side lays out its scratch
+    within the first ``size`` bytes, so a larger (rounded) buffer is fine.
+    """
+    # Round up to the next power of two (size >= 1) to bucket nearby shapes.
+    alloc = 1 if size <= 1 else 1 << (int(size) - 1).bit_length()
+    stream = torch.cuda.current_stream(device)
+    return _get_topk_mb_workspace_keyed(device, stream.cuda_stream, alloc)
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -270,7 +326,26 @@ def top_k_per_row_prefill(
     stride0: int,
     stride1: int,
     k: int = 2048,
-) -> None: ...
+) -> None:
+    """Per-row top-k (prefill). The multi-block path runs on a persistent,
+    zero-initialized workspace (memset-free; see get_topk_mb_workspace); the
+    one-block path allocates its own scratch internally."""
+    workspace = None
+    if topk_use_mulblocks(numRows, stride0):
+        size = topk_mb_workspace_size(numRows, stride0, k, False)
+        workspace = get_topk_mb_workspace(logits.device, size)
+    return _top_k_per_row_prefill(
+        logits,
+        rowStarts,
+        rowEnds,
+        indices,
+        values,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        workspace,
+    )
 
 
 @compile_ops("module_top_k_per_row", ffi_type="ctypes")
@@ -286,7 +361,20 @@ def top_k_per_row_prefill_fast(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", fc_name="top_k_per_row_decode")
+def _top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    workspace: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -296,7 +384,16 @@ def top_k_per_row_decode(
     stride0: int,
     stride1: int,
     k: int = 2048,
-) -> None: ...
+) -> None:
+    """Per-row top-k (decode). Multi-block path uses a persistent, zeroed
+    workspace (memset-free); one-block path allocates internally."""
+    workspace = None
+    if topk_use_mulblocks(numRows, stride0):
+        size = topk_mb_workspace_size(numRows, stride0, k, True)
+        workspace = get_topk_mb_workspace(logits.device, size)
+    return _top_k_per_row_decode(
+        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, workspace
+    )
 
 
 @compile_ops("module_top_k_per_row", ffi_type="ctypes")

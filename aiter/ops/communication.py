@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
 from typing import Optional
@@ -28,10 +28,17 @@ def init_dist_env(
     local_rank: int = -1,
     data_parallel_size: int = 1,
     data_parallel_rank: int = 0,
+    decode_context_parallel_size: int = 1,
+    prefill_context_model_parallel_size: int = 1,
 ):
     pipeline_model_parallel_size = 1
-    # world_size is TPxPP
-    world_size = pipeline_model_parallel_size * tensor_model_parallel_size
+    # world_size is TP x PP x PCP (PCP is an independent dimension that grows
+    # world_size; see initialize_model_parallel in dist/parallel_state.py).
+    world_size = (
+        pipeline_model_parallel_size
+        * tensor_model_parallel_size
+        * prefill_context_model_parallel_size
+    )
     set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
@@ -46,7 +53,9 @@ def init_dist_env(
     ensure_model_parallel_initialized(
         tensor_model_parallel_size,
         pipeline_model_parallel_size,
+        decode_context_model_parallel_size=decode_context_parallel_size,
         data_parallel_size=data_parallel_size,
+        prefill_context_model_parallel_size=prefill_context_model_parallel_size,
     )
 
     if tensor_model_parallel_size > 1:

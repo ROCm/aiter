@@ -66,10 +66,17 @@ def get_mhc_pre_splitk(m: int, hc_hidden_size: int) -> tuple[int, int]:
     prefetch_stages = 2
     tile_m = 16 * 4
     num_cu = get_cu_num()
-    tile_k_tg_dict = {
-        128: 2 * num_cu,
-        64: 4 * num_cu,
-    }
+    arch = get_gfx_runtime()
+    tile_k_tg_dict = (
+        {
+            128: 2 * num_cu,
+            64: 4 * num_cu,
+        }
+        if arch.startswith("gfx9")
+        else {
+            64: 4 * num_cu,
+        }
+    )
     selected_splitk = 1
     selected_tile_k = 64
     num_tg_m = (m + tile_m - 1) // tile_m
@@ -165,6 +172,43 @@ def _mhc_fused_config_gfx942_80(m, hidden_size, num_cu):
     return splitk, tile_m, tile_n, tile_k
 
 
+def _mhc_fused_config_gfx1250_256(m, hidden_size, num_cu):
+    tile_k = 32 if hidden_size % 32 == 0 else 64
+    valid = _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu)
+    if not valid:
+        return 1, 16, 32, tile_k
+
+    tile_n = 32
+    tile_m = 16 if m <= 512 else 32
+
+    # (m upper bound, target split_k) measured per (m, hidden) then merged; the
+    # target is snapped to a legal divisor below so it stays valid for any hidden.
+    if hidden_size >= 7168:
+        table = [
+            (128, 56),
+            (256, 56),
+            (512, 32),
+            (1024, 8),
+            (2048, 16),
+            (4096, 8),
+            (8192, 4),
+            (1 << 30, 2),
+        ]
+    else:
+        table = [
+            (256, 32),
+            (512, 64),
+            (1024, 16),
+            (2048, 16),
+            (4096, 16),
+            (8192, 4),
+            (1 << 30, 2),
+        ]
+    target = next(t for ub, t in table if m <= ub)
+    splitk = min(valid, key=lambda s: (abs(math.log(s) - math.log(target)), -s))
+    return splitk, tile_m, tile_n, tile_k
+
+
 def _mhc_fused_config_default(m, hidden_size, num_cu):
     """Generic fallback for untuned chips: pick (split_k, tile_k) by the occupancy
     scoring search (how many thread-groups fit vs. how many the device can run at
@@ -212,6 +256,7 @@ def _mhc_fused_config_default(m, hidden_size, num_cu):
 _MHC_FUSED_POST_PRE_CONFIG = {
     ("gfx950", 256): _mhc_fused_config_gfx950_256,
     ("gfx942", 80): _mhc_fused_config_gfx942_80,
+    ("gfx1250", 256): _mhc_fused_config_gfx1250_256,
 }
 
 
@@ -269,6 +314,7 @@ def mhc_pre(
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
+    large_m_splitk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -278,7 +324,10 @@ def mhc_pre(
         hc_mult3 == hc_mult and sinkhorn_repeat == 0
     )
     hc_hidden_size = hc_mult * hidden_size
-    selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_hidden_size)
+    if large_m_splitk:
+        selected_splitk, selected_tile_k = get_mhc_pre_splitk_large_m(m, hc_hidden_size)
+    else:
+        selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_hidden_size)
     device = residual.device
     out_pad = torch.empty(
         selected_splitk, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32, device=device
@@ -337,7 +386,15 @@ def mhc_post(
     residual: Tensor,
     post_layer_mix: Tensor,
     comb_res_mix: Tensor,
+    store_nt: int = -1,
 ) -> None: ...
+
+
+def get_mhc_pre_splitk_large_m(m: int, hc_hidden_size: int) -> tuple[int, int]:
+    """Split-K policy for gfx950 large-M post_pre kernel (M > 1024)."""
+    if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
+        return 8, 64
+    return get_mhc_pre_splitk(m, hc_hidden_size)
 
 
 @compile_ops("module_mhc")
@@ -385,6 +442,68 @@ def mhc_fused_post_pre_fake(
 
 
 @torch_compile_guard(gen_fake=mhc_fused_post_pre_fake)
+def mhc_fused_post_pre_large_m(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """gfx950 large-M post+pre (M > 1024): upstream ``mhc_post`` + ``mhc_pre``."""
+    m = residual_in.size(0)
+
+    if post_layer_mix.ndim == 3:
+        post_layer_mix = post_layer_mix.contiguous()
+    elif not post_layer_mix.is_contiguous():
+        post_layer_mix = post_layer_mix.contiguous()
+    if not comb_res_mix.is_contiguous():
+        comb_res_mix = comb_res_mix.contiguous()
+    if not residual_in.is_contiguous():
+        residual_in = residual_in.contiguous()
+    if not layer_input.is_contiguous():
+        layer_input = layer_input.contiguous()
+    if not fn.is_contiguous():
+        fn = fn.contiguous()
+    if norm_weight is not None and not norm_weight.is_contiguous():
+        norm_weight = norm_weight.contiguous()
+
+    next_residual = torch.empty_like(residual_in)
+    post_store_nt = 0 if m > 8 * get_cu_num() else -1
+    mhc_post(
+        next_residual,
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        post_store_nt,
+    )
+    post_mix, comb_mix, layer_input_out = mhc_pre(
+        next_residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
+        large_m_splitk=True,
+    )
+    return post_mix, comb_mix, layer_input_out, next_residual
+
+
+@torch_compile_guard(gen_fake=mhc_fused_post_pre_fake)
 def mhc_fused_post_pre(
     layer_input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -413,8 +532,8 @@ def mhc_fused_post_pre(
     folded layer input, and the new residual stream for the following layer's post.
 
     ``force_fused``: when True, always use the fused HIP kernel. When False (default),
-    only m<=64 uses the fused kernel; larger m falls back to the unfused
-    ``mhc_post`` + ``mhc_pre`` path (faster on this chip at large m).
+    use the fused path only for smaller ``m`` (threshold depends on the detected GPU arch);
+    larger ``m`` falls back to the unfused ``mhc_post`` + ``mhc_pre`` path.
     """
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
@@ -423,7 +542,8 @@ def mhc_fused_post_pre(
     fused_m_upper_bound = {
         "gfx950": 1024,
         "gfx942": 128,
-    }[arch]
+        "gfx1250": 256,
+    }.get(arch, 1024)
 
     if not force_fused and m >= fused_m_upper_bound:
         next_residual = torch.empty_like(residual_in)
@@ -448,6 +568,24 @@ def mhc_fused_post_pre(
             norm_eps,
         )
         return post_mix, comb_mix, layer_input_out, next_residual
+
+    if force_fused and arch == "gfx950" and m > fused_m_upper_bound:
+        return mhc_fused_post_pre_large_m(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
 
     assert layer_input.shape == (
         m,
