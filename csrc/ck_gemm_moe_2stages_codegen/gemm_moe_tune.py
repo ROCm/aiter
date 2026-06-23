@@ -25,6 +25,10 @@ from aiter.fused_moe import (
     torch_moe,
     cktile_moe_stage1,
     cktile_moe_stage2,
+    _mxfp4_a4w4_stage1_fw,
+    _mxfp4_a4w4_stage2_fw,
+    _parse_mxfp4_g1_kname,
+    _parse_mxfp4_g2_kname,
 )
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
@@ -569,6 +573,120 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 0),
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+        )
+
+    @staticmethod
+    def _mxfp4_port_g1_kname(ne, h, e, bm, use_nt, inline_quant):
+        # Build a gemm1 kernel name matching the mxfp4 codegen/CSV grammar
+        # (see aiter.fused_moe._parse_mxfp4_g1_kname). BM16 is inline-quant
+        # (bare = NT/read-once, _CACHED = cached); BM32 cshuffle uses _NT/_CACHED;
+        # BM128 takes no variant suffix.
+        name = f"mxfp4_moe_g1_a4w4_NE{ne}_H{h}_E{e}_BM{bm}"
+        if inline_quant:
+            name += "_INLINEQUANT" + ("" if use_nt else "_CACHED")
+        elif bm == 32:
+            name += "_NT" if use_nt else "_CACHED"
+        return name
+
+    @staticmethod
+    def _mxfp4_port_g2_kname(ne, h, e, topk, bm, use_nt, epilog):
+        # Build a gemm2 kernel name matching the mxfp4 codegen/CSV grammar
+        # (see aiter.fused_moe._parse_mxfp4_g2_kname). epilog in
+        # {atomic, nonatomic, nonatomic_mxfp4, nonatomic_cshuffle}. atomic carries
+        # the TOPK tag and an optional _NT; nonatomic drops TOPK and may add
+        # _MXFP4OUT or _CSHUFFLE.
+        if epilog == "atomic":
+            name = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_TOPK{topk}_BM{bm}_ATOMIC"
+            if use_nt:
+                name += "_NT"
+            return name
+        name = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_BM{bm}_NONATOMIC"
+        if epilog == "nonatomic_mxfp4":
+            name += "_MXFP4OUT"
+        elif epilog == "nonatomic_cshuffle":
+            name += "_CSHUFFLE"
+        return name
+
+    @staticmethod
+    def run_mxfp4_port_stage1_out(
+        input,
+        w1_qt,
+        w2_qt,
+        w1_scale,
+        topk_ids,
+        topk_weights,
+        dtype,
+        topk,
+        ne,
+        h,
+        e,
+        kernelName1,
+    ):
+        # Time gemm1 of the FlyDSL mxfp4 a4w4 port via its production stage entry
+        # (_mxfp4_a4w4_stage1_fw). Weights take the a16w4 layout the port expects
+        # (shuffle_weight_a16w4 / shuffle_scale_a16w4); the fused HIP sort emits the
+        # m_indices the port's gemm1 consumes.
+        BM = _parse_mxfp4_g1_kname(kernelName1)["BM"]
+        p2_atomic = False  # stage1 sort doesn't accumulate; BM-only sort layout
+        w1_a16 = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1s_a16 = shuffle_scale_a16w4(w1_scale, ne, True)
+        sti, sw, sei, nvi, moe_buf, aux = moe_sorting(
+            topk_ids, topk_weights, ne, h, dtype,
+            block_size=BM, accumulate=p2_atomic, fused_sort=True,
+        )
+        inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+            input, w1_a16, w2_qt, sti, sei, nvi, None, topk,
+            block_m=BM, w1_scale=w1s_a16, kernelName1=kernelName1,
+            m_indices=aux.m_indices, moe_buf=moe_buf,
+        )
+        return inter_q
+
+    @staticmethod
+    def run_mxfp4_port_stage2_out(
+        input,
+        w1_qt,
+        w2_qt,
+        w1_scale,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        dtype,
+        topk,
+        ne,
+        h,
+        e,
+        kernelName1,
+        kernelName2,
+    ):
+        # Time gemm2 of the FlyDSL mxfp4 a4w4 port. gemm2 consumes the gemm1
+        # intermediate, so run stage1 first (untimed setup is unavoidable here),
+        # then time stage2 (_mxfp4_a4w4_stage2_fw). reverse_sorted comes from the
+        # fused HIP sort and feeds the port's scatter_reduce.
+        BM = _parse_mxfp4_g2_kname(kernelName2)["BM"]
+        atomic = _parse_mxfp4_g2_kname(kernelName2)["atomic"]
+        BM1 = _parse_mxfp4_g1_kname(kernelName1)["BM"]
+        w1_a16 = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1s_a16 = shuffle_scale_a16w4(w1_scale, ne, True)
+        w2_a16 = shuffle_weight_a16w4(w2_qt, 16, False)
+        w2s_a16 = shuffle_scale_a16w4(w2_scale, ne, False)
+        M = input.shape[0]
+        sti, sw, sei, nvi, moe_buf, aux = moe_sorting(
+            topk_ids, topk_weights, ne, h, dtype,
+            block_size=BM, accumulate=atomic, fused_sort=True,
+        )
+        moe_out = (
+            moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
+        )
+        inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+            input, w1_a16, w2_a16, sti, sei, nvi, None, topk,
+            block_m=BM1, w1_scale=w1s_a16, kernelName1=kernelName1,
+            m_indices=aux.m_indices, moe_buf=moe_buf,
+        )
+        return _mxfp4_a4w4_stage2_fw(
+            inter_q, w1_a16, w2_a16, sti, sei, nvi, moe_out, topk,
+            w2_scale=w2s_a16, a2_scale=inter_s, block_m=BM,
+            sorted_weights=sw, kernelName2=kernelName2,
+            reverse_sorted=aux.reverse_sorted,
         )
 
     @staticmethod
@@ -2874,6 +2992,122 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
+    def gen_mxfp4_port_2stages_task(self, info, blockMs):
+        # Enumerate the FlyDSL mxfp4 a4w4 *port* (mxfp4_moe_g{1,2}_a4w4_*) as tuner
+        # candidates, alongside the generic flydsl_moe* engine. Only a4w4
+        # (per_1x32, fp4 act + fp4 weight) is served by the port. Candidates are
+        # timing-only (ref_func=None under fast_mode): correctness is covered by
+        # the standalone e2e tests (test_mxfp4_moe_*), and the port's sorted/a16w4
+        # intermediate layout doesn't line up with the torch stage reference for a
+        # cheap elementwise compare.
+        tasks_port = []
+        if not is_flydsl_available():
+            return tasks_port
+        (
+            gfx,
+            cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = info
+
+        if (
+            q_type != QuantType.per_1x32
+            or q_dtype_a != dtypes.fp4x2
+            or q_dtype_w != dtypes.fp4x2
+            or not use_g1u1
+        ):
+            return tasks_port
+
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as _G1_SUPPORTED
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as _G2_SUPPORTED
+
+        ne, h, e = expert, model_dim, inter_dim
+
+        # The port wants the raw mxfp4 inputs (bf16 hidden + clean fp4/e8m0
+        # weights), which the low-level generate_data returns directly -- unlike
+        # generate_data_2stages, whose a4w4 a1_qt is already fp4-quantized.
+        def _gen_args():
+            return (
+                token, model_dim, inter_dim, expert, topk, dtype,
+                q_dtype_a, q_dtype_w, q_type, use_g1u1, blockM,
+            )
+
+        for blockM in blockMs:
+            # ---- stage1 (gemm1) candidates ----
+            for bm, use_nt, inline_quant in sorted(_G1_SUPPORTED):
+                if bm != blockM:
+                    continue
+                kn1 = self._mxfp4_port_g1_kname(ne, h, e, bm, use_nt, inline_quant)
+                tasks_port.append(
+                    (
+                        (info, "stage1", kn1, blockM),
+                        FmoeTuner.generate_data,
+                        _gen_args(),
+                        FmoeTuner.run_mxfp4_port_stage1_out,
+                        (
+                            ["input", "w1_qt", "w2_qt", "w1_scale",
+                             "topk_ids", "topk_weights"],
+                            dtype, topk, ne, h, e, kn1,
+                        ),
+                        {},
+                        None,
+                        (),
+                        {},
+                        None,
+                        0.01,
+                        0.01,
+                        None,
+                    )
+                )
+
+            # ---- stage2 (gemm2) candidates ----
+            for bm, use_nt, epilog in sorted(_G2_SUPPORTED):
+                if bm != blockM:
+                    continue
+                # gemm1 for the stage2 setup: pick a supported g1 variant at this BM
+                # (BM16 -> inline_quant; BM32 -> cshuffle NT; BM128 -> plain).
+                g1_match = [
+                    (b, n, iq) for (b, n, iq) in _G1_SUPPORTED if b == bm
+                ]
+                if not g1_match:
+                    continue
+                b1, n1, iq1 = sorted(g1_match)[0]
+                kn1 = self._mxfp4_port_g1_kname(ne, h, e, b1, n1, iq1)
+                kn2 = self._mxfp4_port_g2_kname(ne, h, e, topk, bm, use_nt, epilog)
+                tasks_port.append(
+                    (
+                        (info, "stage2", kn2, blockM),
+                        FmoeTuner.generate_data,
+                        _gen_args(),
+                        FmoeTuner.run_mxfp4_port_stage2_out,
+                        (
+                            ["input", "w1_qt", "w2_qt", "w1_scale", "w2_scale",
+                             "topk_ids", "topk_weights"],
+                            dtype, topk, ne, h, e, kn1, kn2,
+                        ),
+                        {},
+                        None,
+                        (),
+                        {},
+                        None,
+                        0.01,
+                        0.01,
+                        None,
+                    )
+                )
+
+        return tasks_port
+
     def gen_flydsl_i4_2stages_task(self, info, blockMs):
         tasks_flydsl = []
         if not is_flydsl_available():
@@ -3451,6 +3685,7 @@ class FmoeTuner(TunerCommon):
             tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
             tasks_ck.extend(self.gen_2stages_task(info, blockMs))
             tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+            tasks_ck.extend(self.gen_mxfp4_port_2stages_task(info, blockMs))
             tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
             task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
