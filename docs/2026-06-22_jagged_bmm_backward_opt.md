@@ -106,9 +106,66 @@ are negligible tails.
 
 ---
 
-## Current status (2026-06-22)
-Tooling works end-to-end; baseline characterized. No kernel changes yet.
-Optimization plan below; start at Phase 0.
+## EXP-2026-06-23a — Phase 0: occupancy vs. algorithm (shape × regime sweep)
+
+- **No kernel changes** (same source as EXP-2026-06-22a). Goal: decide whether the
+  low %-of-roofline is "too little work" (occupancy) or "bad kernel" (algorithm)
+  before investing. Profiled the full sweep `{b64/m512, b128/m1024, b256/m2048} ×
+  {uniform, skew}`, full counters, `--iters 10 --warmup 3`, via the clean harness.
+- Run in `flydsl_venv` directly (rocprof-compute 3.4.0, torch 2.7.1+rocm7.2.2,
+  pandas 2.2.3 all present); empirical `roofline.csv` was reused across workloads.
+- Artifacts (`aiter/ops/flydsl/kernels/workloads/`):
+  - `bwd_full_all/` (b64/m512 uniform = baseline), `p0_b128_m1024_uniform/`,
+    `p0_b256_m2048_uniform/`, `p0_b64_m512_skew/`, `p0_b128_m1024_skew/`,
+    `p0_b256_m2048_skew/` — each `…/MI300X_A1/` has counters + roofline PDFs.
+  - Combined comparison reports (multi-`--path` analyze): `phase0_uniform_sweep_report.txt`
+    (current vs new), `phase0_full_sweep_report.txt` (+skew), and per-kernel
+    `phase0_uniform_k0_grad_dense_partials.txt`, `phase0_uniform_k2_grad_jagged.txt`.
+
+### Uniform size sweep (profiled µs/call, TFLOP/s = 2·L·K·N, occupancy, MFMA util)
+| kernel | metric | b64/m512 | b128/m1024 | b256/m2048 |
+|---|---|--:|--:|--:|
+| `grad_dense_partials` | µs/call | 79.3 | 283.0 | 1233.7 |
+|  | TFLOP/s | 13.5 | 15.2 | 13.9 |
+|  | occupancy | 3.59% | 4.08% | 3.39% |
+|  | VALU FLOP %peak | 8.3% | 9.3% | 8.5% |
+|  | MFMA util | 0% | 0% | 0% |
+|  | grid (WGs) / active CUs | 256 / 73% | 512 / 81% | 1024 / 85% |
+| `grad_jagged` | µs/call | 12.6 | 39.5 | 125.0 |
+|  | TFLOP/s | 85.0 | 108.6 | 137.5 |
+|  | occupancy | 1.06% | 1.77% | 2.97% |
+|  | MFMA bf16 util | 4.6% | 8.2% | 15.9% |
+|  | grid (WGs) | 256 | 1024 | 4096 |
+
+(`L` per shape: 32768 / 131072 / 524288. Skew shapes have much smaller `L`
+— 6130 / 21008 / 86945 — so every kernel is even more launch/latency-bound there;
+see `phase0_full_sweep_report.txt`. The doc's earlier 6.8 TF/s for dense_partials
+used a MAC count without the ×2; numbers here use the harness `2·L·K·N` convention.)
+
+### Gate decision → **algorithm-bound; go to Phase 2 (MFMA) next**
+- **`grad_dense_partials` (dominant, 58–80% of GPU time): does NOT scale with size.**
+  16× more work (b64→b256) costs 15.6× time; TFLOP/s is flat ~14, VALU FLOPs flat
+  ~8% of peak, MFMA=0. Occupancy is **stuck at ~3.5%** even when the grid grows to
+  1024 WGs and 85% of CUs are active — it is **register-capped** (128 VGPR + 256
+  AGPR/thread), not work-starved. Bigger shapes do not help → algorithm-bound.
+  Per the gate ("stays low → prioritize MFMA"), **Phase 2 is the lever.**
+- **`grad_jagged` (already MFMA): is partly occupancy-bound.** With size, occupancy
+  rises 1.06%→2.97%, MFMA util 4.6%→15.9%, throughput 85→137 TF/s (1.6×). It is
+  launch/tail-limited at small shapes and improves a lot when the GPU fills — but
+  even GPU-full it sits at ~29% of the empirical bf16 MFMA roofline. → Phase 3
+  (grid/occupancy) is a real but **secondary** win (small share of total time).
+- **Reorder note:** Phase 1 (FMA fusion on the scalar path) is now low value since
+  the path is being replaced; Phase 0 says it "may reorder everything" — **skip
+  straight to Phase 2 (MFMA-ize `grad_dense_partials`)**, then revisit Phase 3 for
+  `grad_jagged` occupancy. Phase 1b register/occupancy work folds into Phase 2.
+
+---
+
+## Current status (2026-06-23)
+Tooling works end-to-end; baseline + Phase-0 sweep characterized. No kernel changes
+yet. Phase-0 gate says the dominant kernel is algorithm-bound (occupancy caps at
+~3.5% regardless of size) → next action is **Phase 2 (MFMA-ize `grad_dense_partials`)**;
+`grad_jagged` occupancy (Phase 3) is a secondary, size-sensitive win.
 
 ---
 
@@ -129,7 +186,10 @@ Baseline to beat (EXP-2026-06-22a, b64/m512/uniform): `grad_dense_partials`
 - **Do:** profile a GPU-filling shape (b=256, m=2048) + a mid point; also skew.
 - **Gate:** if %-of-roofline rises a lot with size → prioritize occupancy
   (Phase 1b/3); if it stays low → algorithm-bound, prioritize MFMA (Phase 2).
-- [ ] EXP-…: shape sweep {b64/m512, b128/m1024, b256/m2048} × {uniform, skew}.
+- [x] EXP-2026-06-23a: shape sweep {b64/m512, b128/m1024, b256/m2048} × {uniform,
+  skew}. **Gate result:** dominant `grad_dense_partials` is algorithm-bound
+  (occupancy flat ~3.5% with size, MFMA=0) → **go to Phase 2**; `grad_jagged`
+  scales with size (occupancy 1.06%→2.97%) → secondary Phase 3. See EXP block above.
 
 ### Phase 1 — `grad_dense_partials` cheap wins (FMA + occupancy)
 - **Why:** `F32-FMA=0` (MUL+ADD unfused → 2× VALU instrs); 58% dependency-stall
