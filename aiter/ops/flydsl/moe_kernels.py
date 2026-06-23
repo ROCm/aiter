@@ -1756,6 +1756,156 @@ def flydsl_moe_fused_route_quant_scatter(
     )
 
 
+@functools.cache
+def _get_compiled_fused_route_psum_quant_scatter(
+    model_dim: int,
+    topk: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    """Compile and cache the fully-fused route+psum+quant+scatter kernel.
+
+    Same arch-derived conversion/scale selection as the non-psum variant; the
+    extra phases (count + tile-aligned prefix sum) are folded into one launch.
+    """
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_fused_route_psum_quant_scatter_module,
+    )
+
+    return build_moe_fused_route_psum_quant_scatter_module(
+        model_dim=model_dim,
+        topk=topk,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+    )
+
+
+def flydsl_moe_fused_route_psum_quant_scatter(
+    hidden_states: torch.Tensor,  # (token_num, model_dim) bf16
+    topk_ids: torch.Tensor,  # (token_num, topk) int32 local expert ids
+    E: int,
+    tile_m: int,
+    contiguous_m: int,
+    *,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    """Fully-fused DeepGEMM contiguous-M stage1 prep in a single kernel launch.
+
+    Folds ``torch.bincount`` + ``moe_contiguous_psum`` + the route+quant+scatter
+    kernel into one persistent kernel (see
+    ``build_moe_fused_route_psum_quant_scatter_module``). The kernel itself counts
+    per-expert rows (Phase 1), computes the tile-aligned exclusive prefix sum
+    (Phase 2, one block behind a global-atomic barrier), and routes + quantizes +
+    scatters into the single ``(1, contiguous_m)`` DeepGEMM buffer (Phase 3).
+
+    ``contiguous_m`` is the host-computed static upper bound on the packed buffer
+    size (no device->host sync; CUDAGraph-safe), and ``tile_m`` is the contiguous-M
+    tile that ``starts`` is aligned to. Returns
+    ``(grouped_a1, grouped_a1_scale, masked_m, topids_to_rows, starts, psum)``:
+
+      grouped_a1       : (1, contiguous_m, Pb)            uint8  payload
+      grouped_a1_scale : (1, contiguous_m//wmma_rep, Ws*wmma_rep)
+      masked_m         : (E,)                  int32  rows routed per expert (count)
+      topids_to_rows   : (token_num, topk)     int32  route -> global contiguous row
+      starts           : (E,)                  int32  tile-aligned prefix sum
+      psum             : (E,)                  int32  starts[e]+masked_m[e] (m_tile_map)
+    """
+    if quant_mode not in ("fp4", "fp8"):
+        raise NotImplementedError(
+            f"flydsl_moe_fused_route_psum_quant_scatter: quant_mode={quant_mode!r} "
+            "unsupported (expected 'fp4' or 'fp8')."
+        )
+    assert hidden_states.dtype == torch.bfloat16, (
+        "fused route+psum+quant kernel currently requires bf16 hidden_states "
+        f"(got {hidden_states.dtype})"
+    )
+    device = hidden_states.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    model_dim = hidden_states.shape[-1]
+    rows_per_tile = wmma_rep * 16
+    contiguous_m = int(contiguous_m)
+    assert contiguous_m % rows_per_tile == 0, (
+        f"contiguous_m ({contiguous_m}) must be a multiple of wmma_rep*16 "
+        f"({rows_per_tile})"
+    )
+    assert int(tile_m) % rows_per_tile == 0, (
+        f"tile_m ({tile_m}) must be a multiple of wmma_rep*16 ({rows_per_tile}) "
+        "so tile-aligned starts stay preshuffle-consistent"
+    )
+
+    payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
+    scale_bytes_per_row = model_dim // 32
+
+    # Per-expert scratch (count == masked_m / slot_counter / starts / psum) plus a
+    # 2-int barrier (arrival, release); all must be zero before launch.
+    count = torch.zeros(E, dtype=torch.int32, device=device)
+    slot_counter = torch.zeros(E, dtype=torch.int32, device=device)
+    # starts/psum are produced in-kernel by the cross-block prefix sum (Phase 2),
+    # but zero-init them defensively: if a Phase-3 warp ever reads ``starts``
+    # before the last-arriver block's write is visible, an uninitialized value
+    # would make ``grouped_row`` wild and OOB-fault the (unbounded, max_size)
+    # payload buffer. Zeroing bounds the worst case to grouped_row == slot.
+    starts = torch.zeros(E, dtype=torch.int32, device=device)
+    psum = torch.zeros(E, dtype=torch.int32, device=device)
+    barrier = torch.zeros(2, dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+
+    grouped_a1 = torch.empty(
+        (1, contiguous_m, payload_bytes_per_row),
+        dtype=torch.uint8,
+        device=device,
+    )
+    grouped_a1_scale = torch.empty(
+        (1, contiguous_m // wmma_rep, scale_bytes_per_row * wmma_rep),
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    # Persistent grid: exactly one workgroup per CU so all participants are
+    # co-resident -- required for the global-atomic spin barrier not to deadlock.
+    num_workers = int(get_cu_num())
+
+    hidden_flat = hidden_states.contiguous().view(-1)
+    topk_ids_i32 = topk_ids.to(torch.int32).reshape(-1)
+
+    launch = _get_compiled_fused_route_psum_quant_scatter(
+        model_dim=model_dim,
+        topk=topk,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+    )
+    launch(
+        topk_ids_i32,
+        count,
+        slot_counter,
+        starts,
+        psum,
+        barrier,
+        topids_to_rows,
+        hidden_flat,
+        grouped_a1.view(-1),
+        grouped_a1_scale.view(-1),
+        numel,
+        int(E),
+        int(tile_m),
+        num_workers,
+        num_workers,
+        stream=torch.cuda.current_stream(),
+    )
+    return (
+        grouped_a1,
+        grouped_a1_scale,
+        count,
+        topids_to_rows.view(token_num, topk),
+        starts,
+        psum,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fused grouped MXFP4/MXFP8 quant + scale-preshuffle (stage2 input prep)
 #

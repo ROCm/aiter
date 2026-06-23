@@ -25,6 +25,7 @@ import torch
 
 from aiter.ops.flydsl.moe_kernels import (
     flydsl_moe_fused_route_quant_scatter,
+    flydsl_moe_fused_route_psum_quant_scatter,
     flydsl_moe_fused_quant_preshuffle,
 )
 from aiter.ops.flydsl.grouped_moe_gfx1250 import _grouped_a8w4_preshuffle_e8m0_scale
@@ -261,6 +262,138 @@ def test_fused_quant_preshuffle(scale_k_per_tile, quant_mode, max_m, E, feat_dim
     )
 
 
+# ---------------------------------------------------------------------------
+# Fully-fused contiguous-M stage1 prep: count + tile-aligned prefix sum +
+# route + quant + scatter in ONE persistent kernel launch (global-atomic
+# barrier between phases). Validates the in-kernel count/starts/psum against the
+# torch reference and the payload/scale against the same scatter reference, into
+# the single (1, contiguous_m) DeepGEMM buffer the kernel chose.
+# ---------------------------------------------------------------------------
+def _ref_contiguous_psum(counts, tile_m):
+    """Reference tile-aligned exclusive prefix sum (matches moe_contiguous_psum)."""
+    aligned = ((counts + tile_m - 1) // tile_m) * tile_m
+    starts = torch.zeros_like(aligned)
+    if aligned.numel() > 1:
+        starts[1:] = torch.cumsum(aligned, 0)[:-1]
+    psum = starts + counts
+    return starts, psum
+
+
+@pytest.mark.parametrize("scale_k_per_tile", [4, 8])
+@pytest.mark.parametrize("quant_mode", ["fp4", "fp8"])
+@pytest.mark.parametrize("token_num", [8, 64, 257])
+@pytest.mark.parametrize("topk", [1, 2, 8])
+@pytest.mark.parametrize("E", [4, 8])
+@pytest.mark.parametrize("model_dim", [256, 512])
+@pytest.mark.parametrize("tile_m", [64, 128])
+def test_fused_route_psum_quant_scatter(
+    scale_k_per_tile, quant_mode, token_num, topk, E, model_dim, tile_m
+):
+    if not torch.cuda.is_available():
+        pytest.skip("needs GPU")
+    if topk > E:
+        pytest.skip("topk must be <= E (router picks distinct experts per token)")
+    if (model_dim // 32) % scale_k_per_tile != 0:
+        pytest.skip("model_dim//32 must be divisible by scale_k_per_tile")
+    torch.manual_seed(0)
+    dev = "cuda"
+    wmma_rep = 4
+    rows_per_tile = wmma_rep * 16  # 64
+    if tile_m % rows_per_tile != 0:
+        pytest.skip("tile_m must be a multiple of wmma_rep*16")
+
+    # Static contiguous_m upper bound, identical to the grouped orchestration.
+    ub = token_num * topk + E * (tile_m - 1)
+    contiguous_m = max(tile_m, ((ub + tile_m - 1) // tile_m) * tile_m)
+
+    hidden = torch.randn(token_num, model_dim, dtype=torch.bfloat16, device=dev)
+    scores = torch.rand(token_num, E, device=dev)
+    topk_ids = scores.topk(topk, dim=1).indices.to(torch.int32)
+
+    ga1, gas, masked_m, ttr, starts, psum = flydsl_moe_fused_route_psum_quant_scatter(
+        hidden, topk_ids, E, tile_m, contiguous_m, wmma_rep=wmma_rep, quant_mode=quant_mode
+    )
+
+    # 1. count == per-expert route counts.
+    ref_counts = torch.bincount(topk_ids.reshape(-1).to(torch.long), minlength=E).to(
+        torch.int32
+    )
+    assert torch.equal(masked_m.cpu(), ref_counts.cpu()), (
+        f"masked_m {masked_m.tolist()} != bincount {ref_counts.tolist()}"
+    )
+
+    # 2. starts/psum == tile-aligned prefix sum reference.
+    ref_starts, ref_psum = _ref_contiguous_psum(ref_counts, tile_m)
+    assert torch.equal(starts.cpu(), ref_starts.cpu()), (
+        f"starts {starts.tolist()} != ref {ref_starts.tolist()}"
+    )
+    assert torch.equal(psum.cpu(), ref_psum.cpu()), (
+        f"psum {psum.tolist()} != ref {ref_psum.tolist()}"
+    )
+
+    # 3. topids_to_rows: rows for expert e are a distinct subset of
+    #    [starts[e], starts[e] + counts[e]) in the single contiguous buffer.
+    ttr_flat = ttr.reshape(-1)
+    experts = topk_ids.reshape(-1)
+    for e in range(E):
+        rows_e = ttr_flat[experts == e]
+        n = ref_counts[e].item()
+        assert rows_e.numel() == n
+        s = ref_starts[e].item()
+        assert torch.equal(
+            torch.sort(rows_e).values,
+            torch.arange(s, s + n, device=dev, dtype=ttr.dtype),
+        ), f"expert {e}: rows {sorted(rows_e.tolist())} not contiguous from {s}"
+
+    # 4. payload + preshuffled scale match the reference scattered into the rows
+    #    the kernel chose (treat the (1, contiguous_m) buffer as E=1 / max_m=cm).
+    Pb = model_dim if quant_mode == "fp8" else model_dim // 2
+    Ws = model_dim // 32
+    a1q_u8, a1s_u8 = _ref_token_quant(hidden, quant_mode)
+    flat_rows = ttr_flat.to(torch.long)
+    flat_tokens = (
+        torch.arange(token_num * topk, device=dev, dtype=torch.long) // topk
+    )
+
+    ref_payload = torch.zeros(contiguous_m, Pb, dtype=torch.uint8, device=dev)
+    ref_payload[flat_rows] = a1q_u8[flat_tokens]
+    ref_scale_rm = torch.zeros(contiguous_m, Ws, dtype=torch.uint8, device=dev)
+    ref_scale_rm[flat_rows] = a1s_u8[flat_tokens]
+    ref_scale = _grouped_a8w4_preshuffle_e8m0_scale(
+        ref_scale_rm.view(1, contiguous_m, Ws),
+        warp_tile=wmma_rep * 16,
+        scale_k_per_tile=scale_k_per_tile,
+    ).reshape(1, contiguous_m // wmma_rep, Ws * wmma_rep)
+
+    # Valid-row mask over the contiguous buffer (rows actually routed to).
+    vmask = torch.zeros(contiguous_m, dtype=torch.bool, device=dev)
+    vmask[flat_rows] = True
+
+    got_payload = ga1.view(contiguous_m, Pb)
+    pay_eq = (got_payload == ref_payload)[vmask]
+    pay_match = pay_eq.float().mean().item()
+    assert pay_match > 0.99, f"payload match {pay_match:.4f} too low"
+
+    def _unshuffle(x):
+        # inverse of _grouped_a8w4_preshuffle_e8m0_scale for E=1 buffer.
+        k_groups = Ws // 4
+        g = x.view(1, contiguous_m // (wmma_rep * 16), 16, k_groups, 1, wmma_rep, 4)
+        g = g.permute(0, 1, 5, 2, 3, 4, 6).contiguous()
+        return g.reshape(contiguous_m, Ws)
+
+    got_rm = _unshuffle(gas.view(1, contiguous_m // wmma_rep, Ws * wmma_rep))
+    ref_rm = _unshuffle(ref_scale)
+    sc_eq = (got_rm == ref_rm)[vmask]
+    sc_match = sc_eq.float().mean().item()
+    assert sc_match > 0.99, f"scale match {sc_match:.4f} too low"
+
+    print(
+        f"OK psum-fused {quant_mode} skpt={scale_k_per_tile} T={token_num} "
+        f"topk={topk} E={E} md={model_dim} tile_m={tile_m} cm={contiguous_m} "
+        f"payload={pay_match:.4f} scale={sc_match:.4f}"
+    )
+
+
 if __name__ == "__main__":
     for skpt in (4, 8):
         for qm in ("fp4", "fp8"):
@@ -273,6 +406,20 @@ if __name__ == "__main__":
                             if (md // 32) % skpt != 0:
                                 continue
                             test_fused_route_quant_scatter(skpt, qm, tn, tk, E, md)
+    for skpt in (4, 8):
+        for qm in ("fp4", "fp8"):
+            for tn in (8, 64, 257):
+                for tk in (1, 2, 8):
+                    for E in (4, 8):
+                        if tk > E:
+                            continue
+                        for md in (256, 512):
+                            if (md // 32) % skpt != 0:
+                                continue
+                            for tile_m in (64, 128):
+                                test_fused_route_psum_quant_scatter(
+                                    skpt, qm, tn, tk, E, md, tile_m
+                                )
     for skpt in (4, 8):
         for qm in ("fp4", "fp8"):
             for E in (4, 8):

@@ -62,7 +62,7 @@ from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr, const_expr, rocdl, vector
+from flydsl.expr import arith, range_constexpr, const_expr, rocdl, vector, gpu
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -874,6 +874,433 @@ def build_moe_fused_quant_preshuffle_module(
             grouped_scale,
             n_rows,
             max_m,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_fused
+
+
+def build_moe_fused_route_psum_quant_scatter_module(
+    model_dim: int,
+    topk: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    """Return a JIT launcher for the *fully fused* DeepGEMM contiguous-M stage1 prep.
+
+    This is the single-kernel fusion of three previously-separate launches in the
+    contiguous-M path (see ``grouped_moe_gfx1250.py``):
+
+        1. ``torch.bincount(flat_experts)``        -> per-expert counts (masked_m)
+        2. ``moe_contiguous_psum``                 -> tile-aligned exclusive prefix
+                                                      sum (starts) + actual ends (psum)
+        3. ``moe_fused_route_quant_scatter``       -> route + MX quant + scatter +
+                                                      scale-preshuffle
+
+    A single persistent grid (``num_workers`` resident workgroups) runs three
+    phases separated by a hand-rolled grid-wide barrier (FlyDSL has no
+    ``grid.sync`` / cooperative launch; this mirrors the global-atomic spin in
+    ``splitk_hgemm.py``). Each worker owns a strided slice of the
+    ``numel = token_num*topk`` routes (warp-per-route, ``stride =
+    num_workers*warps_per_block``):
+
+        Phase 1 (all blocks): ``lane0: atomicAdd(count[expert], 1)`` -> count == masked_m.
+        Barrier A: every block-leader arrives on ``barrier[0]``; the last arriver
+                   runs Phase 2, the rest spin on the release flag ``barrier[1]``.
+        Phase 2 (last block, one thread): serial tile-aligned prefix sum over
+                   ``count`` -> ``starts``/``psum`` (logic lifted from
+                   ``moe_contiguous_psum``), then publishes ``barrier[1] = 1``.
+        Phase 3 (all blocks): ``lane0: slot = atomicAdd(slot_counter[expert], 1)``,
+                   ``grouped_row = starts[expert] + slot``, then the shared
+                   ``_emit_quant_block_loop`` quantizes + scatters + preshuffles.
+
+    The destination is always the DeepGEMM contiguous-M layout: a single
+    ``(1, contiguous_m)`` payload/scale buffer indexed by the global
+    ``grouped_row = starts[expert] + slot`` (every ``starts[e]`` is tile_m-aligned,
+    hence a multiple of ``wmma_rep*16``, so the preshuffle tiling is consistent).
+
+    Cross-block memory ordering uses ``syncscope="agent"`` atomics plus coherent
+    (``sc0 sc1``) global load/store + ``s_waitcnt(0)`` around the release flag, so
+    the prefix-sum reads of ``count`` and the Phase-3 reads of ``starts`` observe
+    the committed values.
+
+    Launcher signature::
+
+        (topk_ids, count, slot_counter, starts, psum, barrier, topids_to_rows,
+         hidden, grouped_payload, grouped_scale, numel, experts, tile_m,
+         num_workers, grid_blocks, stream=...)
+
+      topk_ids        : (numel,)               int32  flattened expert ids
+      count           : (E,)                   int32  in/out, init 0 (== masked_m)
+      slot_counter    : (E,)                   int32  in/out, init 0 (phase-3 slots)
+      starts          : (E,)                   int32  out  tile-aligned prefix sum
+      psum            : (E,)                   int32  out  starts[e]+count[e]
+      barrier         : (2,)                   int32  in/out, init 0 (arrival/release)
+      topids_to_rows  : (numel,)               int32  out  route -> grouped row
+      hidden          : (token_num*model_dim,) bf16   flat activations
+      grouped_payload : (contiguous_m*payload_bytes_per_row,) uint8  out MX payload
+      grouped_scale   : (contiguous_m*(model_dim//32),) uint8  out preshuffled e8m0
+      experts         : int32  number of experts E (matches count/slot/starts len)
+      tile_m          : int32  contiguous-M tile (starts aligned to this)
+      num_workers     : int32  resident workgroup count (== grid_blocks)
+    """
+    L = _quant_layout(model_dim, quant_mode, wmma_rep)
+    is_fp8 = L.is_fp8
+    use_native = L.use_native
+    use_pk8 = L.use_pk8
+    elems_per_lane = L.elems_per_lane
+    lanes_per_mx_block = L.lanes_per_mx_block
+    mx_dtype = L.mx_dtype
+    payload_bytes_per_row = L.payload_bytes_per_row
+    payload_bytes_per_block = L.payload_bytes_per_block
+    payload_bytes_per_lane = L.payload_bytes_per_lane
+    wave_size = L.wave_size
+    warps_per_block = L.warps_per_block
+    mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
+    mx_blocks_per_row = L.mx_blocks_per_row
+    scale_dwords_per_row = L.scale_dwords_per_row
+    rows_per_tile = L.rows_per_tile
+    dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
+    block_iters = L.block_iters
+    amax_shuffle_dists = L.amax_shuffle_dists
+
+    module_name = (
+        f"moe_fused_route_psum_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
+        f"_{quant_mode}_{L.native_tag}"
+    )
+
+    # gfx12 split the memory wait counters (s_wait_loadcnt / s_wait_storecnt);
+    # gfx9 uses the unified ``s_waitcnt``. The cross-block barrier publishes/reads
+    # its scratch (count / starts / psum / release flag) exclusively through
+    # agent-scope atomics + plain buffer loads, which is the only reliably
+    # L2-coherent cross-CU producer/consumer pattern on gfx1250 (hand-rolled
+    # inline-asm coherent global load/store miscompiles here).
+    _is_gfx12 = str(L.arch).startswith("gfx12")
+
+    @flyc.kernel(name=module_name)
+    def fused_kernel(
+        topk_ids: fx.Tensor,  # (numel,) int32
+        count: fx.Tensor,  # (E,) int32 in/out (init 0) -> masked_m
+        slot_counter: fx.Tensor,  # (E,) int32 in/out (init 0)
+        starts: fx.Tensor,  # (E,) int32 out
+        psum: fx.Tensor,  # (E,) int32 out
+        barrier: fx.Tensor,  # (2,) int32 in/out (init 0): [0]=arrival, [1]=release
+        topids_to_rows: fx.Tensor,  # (numel,) int32 out
+        hidden: fx.Tensor,  # (token_num*model_dim,) bf16
+        grouped_payload: fx.Tensor,  # (contiguous_m*payload_bytes_per_row,) uint8 out
+        grouped_scale: fx.Tensor,  # preshuffled e8m0 out
+        numel: Int32,
+        experts: Int32,
+        tile_m: Int32,
+        num_workers: Int32,
+    ):
+        i32 = T.i32
+        f32 = T.f32
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c4_i32 = arith.constant(4, type=i32)
+        c16_i32 = arith.constant(16, type=i32)
+        c23_i32 = arith.constant(23, type=i32)
+        c254_i32 = arith.constant(254, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+
+        c_wave = arith.constant(wave_size, type=i32)
+        c_warps_per_block = arith.constant(warps_per_block, type=i32)
+        c_topk = arith.constant(topk, type=i32)
+        c_model_dim = arith.constant(model_dim, type=i32)
+        c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
+        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
+        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
+        c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
+        c_wmma_rep = arith.constant(wmma_rep, type=i32)
+        c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
+        c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
+        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
+
+        # --- cross-block scratch access helpers (raw !llvm.ptr<1> at elem idx) ---
+        def _wait_mem():
+            # Drain outstanding global memory ops (loads + stores) so atomics /
+            # coherent writes are committed to the L2 coherence point.
+            if const_expr(_is_gfx12):
+                rocdl.s_wait_loadcnt(0)
+                rocdl.s_wait_storecnt(0)
+            else:
+                rocdl.s_waitcnt(0)
+
+        def _elem_ptr(tensor, elem_idx_i32):
+            base = buffer_ops.extract_base_index(tensor, address_space=1)
+            idx = arith.index_cast(T.index, elem_idx_i32)
+            addr = fx.Index(base) + idx * fx.Index(4)
+            p = buffer_ops.create_llvm_ptr(addr, address_space=1)
+            return p._value if hasattr(p, "_value") else p
+
+        def _atomic_add(tensor, elem_idx_i32, addend):
+            ptr = _elem_ptr(tensor, elem_idx_i32)
+            return ArithValue(
+                llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    ptr,
+                    addend,
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                ).result
+            )
+
+        tid = ArithValue(fx.thread_idx.x)
+        bid = ArithValue(fx.block_idx.x)
+
+        warp_in_block = tid // c_wave
+        lane = tid - warp_in_block * c_wave  # tid % wave_size
+        route0 = bid * c_warps_per_block + warp_in_block  # first route this warp owns
+        stride = ArithValue(num_workers) * c_warps_per_block
+
+        topk_ids_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
+        count_rsrc = buffer_ops.create_buffer_resource(count, max_size=True)
+
+        # ============================ Phase 1: count ============================
+        # Strided warp-per-route histogram into ``count`` (== masked_m). Loop bounds
+        # are warp-uniform (lane-independent) so the post-phase gpu.barrier() is hit
+        # by every thread of the block.
+        route0_idx = arith.index_cast(T.index, route0)
+        numel_idx = arith.index_cast(T.index, ArithValue(numel))
+        stride_idx = arith.index_cast(T.index, stride)
+        loop1 = scf.ForOp(route0_idx, numel_idx, stride_idx)
+        with ir.InsertionPoint(loop1.body):
+            route_i32 = arith.index_cast(i32, loop1.induction_variable)
+            expert = ArithValue(
+                buffer_ops.buffer_load(topk_ids_rsrc, route_i32, vec_width=1, dtype=i32)
+            )
+            if lane == 0:
+                _atomic_add(count, expert, c1_i32)
+            scf.YieldOp([])
+
+        # ===================== Barrier A + Phase 2: prefix sum ==================
+        gpu.barrier()
+        _wait_mem()
+        rocdl.sched_barrier(0)
+
+        is_block_leader = arith.cmpi(CmpIPredicate.eq, tid, c0_i32)
+        _if_leader = scf.IfOp(is_block_leader)
+        with ir.InsertionPoint(_if_leader.then_block):
+            my_arrival = _atomic_add(barrier, c0_i32, c1_i32)
+            nwm1 = ArithValue(num_workers) - c1_i32
+            is_last = arith.cmpi(CmpIPredicate.eq, my_arrival, nwm1)
+            is_not_last = arith.cmpi(CmpIPredicate.ne, my_arrival, nwm1)
+
+            # Last arriver: every block has bumped ``count`` (its atomics committed
+            # to L2 before its arrival atomic). Serial tile-aligned prefix sum,
+            # mirroring moe_contiguous_psum, reading ``count`` coherently.
+            _if_last = scf.IfOp(is_last)
+            with ir.InsertionPoint(_if_last.then_block):
+                tile_v = ArithValue(tile_m)
+                tile_minus_1 = tile_v - c1_i32
+                e_upper = arith.index_cast(T.index, ArithValue(experts))
+                c0_idx = arith.index(0)
+                c1_idx = arith.index(1)
+                ploop = scf.ForOp(c0_idx, e_upper, c1_idx, [c0_i32])
+                with ir.InsertionPoint(ploop.body):
+                    e = ploop.induction_variable
+                    cur = ploop.inner_iter_args[0]
+                    e_i32 = arith.index_cast(i32, e)
+                    # This serial prefix sum runs in a single thread of the global
+                    # last-arriver block, after the cross-block barrier guarantees
+                    # every block's count atomics are committed.
+                    #
+                    # ``count`` is read with a plain buffer load (the same path
+                    # Phase 1/3 use correctly): the hand-rolled inline-asm coherent
+                    # load miscompiles inside this loop -- it aliases the count read
+                    # with the just-written starts/psum accumulator, producing a
+                    # Fibonacci-shaped runaway prefix sum. The count values are
+                    # already L2-visible here (post-barrier) so no special load
+                    # coherence is needed.
+                    #
+                    # ``starts``/``psum`` are published with agent-scope atomics
+                    # (they are zero-initialised, so atomic-add == atomic write).
+                    # This mirrors the count path -- atomic write here + a plain
+                    # buffer load in Phase 3 -- which is the only cross-block
+                    # producer/consumer pattern that is reliably L2-coherent on
+                    # gfx1250; the inline-asm coherent store can linger in this
+                    # block's L0 and not be visible to Phase 3 readers in time.
+                    cnt = ArithValue(
+                        buffer_ops.buffer_load(
+                            count_rsrc, e_i32, vec_width=1, dtype=i32
+                        )
+                    )
+                    q = arith.divui(cnt + tile_minus_1, tile_v)
+                    aligned = ArithValue(q) * tile_v
+                    _atomic_add(starts, e_i32, _raw(cur))
+                    _atomic_add(psum, e_i32, _raw(ArithValue(cur) + cnt))
+                    next_cur = ArithValue(cur) + ArithValue(aligned)
+                    scf.YieldOp([next_cur])
+                # Ensure starts/psum land in L2 before the release flag is visible,
+                # then publish the release with an agent-scope atomic (the inline-asm
+                # coherent store/load barrier is unreliable on gfx1250 -- readers can
+                # observe the flag set before starts/psum are visible).
+                _wait_mem()
+                _atomic_add(barrier, c1_i32, c1_i32)
+                scf.YieldOp([])
+
+            # Other blocks: spin on the release flag until the last block publishes.
+            _if_nl = scf.IfOp(is_not_last)
+            with ir.InsertionPoint(_if_nl.then_block):
+                init_cur = arith.constant(0, type=i32)
+                w = scf.WhileOp([i32], [init_cur])
+                before = ir.Block.create_at_start(w.before, [i32])
+                after = ir.Block.create_at_start(w.after, [i32])
+                with ir.InsertionPoint(before):
+                    cur_w = before.arguments[0]
+                    need_wait = arith.cmpi(CmpIPredicate.eq, cur_w, c0_i32)
+                    scf.ConditionOp(need_wait, [cur_w])
+                with ir.InsertionPoint(after):
+                    # Coherent read via agent-scope atomic add of 0 (reliable on
+                    # gfx1250, unlike the inline-asm coherent load).
+                    rel = _atomic_add(barrier, c1_i32, c0_i32)
+                    scf.YieldOp([_raw(rel)])
+                scf.YieldOp([])
+            scf.YieldOp([])
+
+        # All threads converge here; the leader has observed the release flag, so
+        # ``starts`` is committed and visible to coherent reads in Phase 3.
+        gpu.barrier()
+        _wait_mem()
+        rocdl.sched_barrier(0)
+
+        # ===================== Phase 3: route + quant + scatter =================
+        # ``starts`` was published to L2 by the last-arriver block (coherent store
+        # + release flag). Read it back with a plain buffer load -- the inline-asm
+        # coherent load is unreliable here (same miscompile as the Phase 2 prefix
+        # sum: it can return a stale 0 instead of the published row base, which
+        # scatters the first route of an expert into row 0).
+        starts_rd_rsrc = buffer_ops.create_buffer_resource(starts, max_size=True)
+        hidden_rsrc = buffer_ops.create_buffer_resource(hidden, max_size=True)
+        payload_rsrc = buffer_ops.create_buffer_resource(grouped_payload, max_size=True)
+        scale_rsrc = buffer_ops.create_buffer_resource(grouped_scale, max_size=True)
+        topids_to_rows_rsrc = buffer_ops.create_buffer_resource(
+            topids_to_rows, max_size=True
+        )
+
+        loop3 = scf.ForOp(route0_idx, numel_idx, stride_idx)
+        with ir.InsertionPoint(loop3.body):
+            route_i32 = arith.index_cast(i32, loop3.induction_variable)
+            expert = ArithValue(
+                buffer_ops.buffer_load(topk_ids_rsrc, route_i32, vec_width=1, dtype=i32)
+            )
+
+            # lane 0 claims the within-expert slot and reads the (published) per-
+            # expert row base; both are warp-uniform, broadcast via readlane.
+            slot_on_lane0 = arith.constant(0, type=i32)
+            rowbase_on_lane0 = arith.constant(0, type=i32)
+            if lane == 0:
+                slot_on_lane0 = _atomic_add(slot_counter, expert, c1_i32)
+                rowbase_on_lane0 = buffer_ops.buffer_load(
+                    starts_rd_rsrc, _raw(expert), vec_width=1, dtype=i32
+                )
+            slot = ArithValue(
+                rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32))
+            )
+            row_base = ArithValue(
+                rocdl.readlane(i32, _raw(rowbase_on_lane0), _raw(c0_i32))
+            )
+            grouped_row = slot + row_base
+            token = arith.divui(route_i32, c_topk)
+
+            if lane == 0:
+                buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route_i32)
+
+            # per-row scale-preshuffle geometry from the global grouped_row.
+            scale_tile = arith.divui(grouped_row, c_rows_per_tile)
+            row_in_tile = grouped_row - scale_tile * c_rows_per_tile
+            wmma_row = arith.divui(row_in_tile, c16_i32)
+            row_lane16 = row_in_tile - wmma_row * c16_i32
+            out_row = scale_tile * c16_i32 + row_lane16
+            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+
+            payload_row_byte_base = grouped_row * c_payload_bytes_per_row
+            hidden_elem_base = token * c_model_dim
+
+            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            lane_in_block = lane - block_in_wave * c_lanes_per_block
+            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+
+            c = SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=block_iters,
+                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                mx_blocks_per_row=mx_blocks_per_row,
+                amax_shuffle_dists=amax_shuffle_dists,
+                is_fp8=is_fp8,
+                use_native=use_native,
+                use_pk8=use_pk8,
+                mx_dtype=mx_dtype,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                c4_i32=c4_i32,
+                c23_i32=c23_i32,
+                c254_i32=c254_i32,
+                c0_f32=c0_f32,
+                c_wave=c_wave,
+                c_elems_per_lane=c_elems_per_lane,
+                c_payload_bytes_per_block=c_payload_bytes_per_block,
+                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                c_wmma_rep=c_wmma_rep,
+                block_in_wave=block_in_wave,
+                lane_in_block=lane_in_block,
+                is_block_lead=is_block_lead,
+                payload_row_byte_base=payload_row_byte_base,
+                feat_elem_base=hidden_elem_base,
+                scale_row_dword_base=scale_row_dword_base,
+                hidden_rsrc=hidden_rsrc,
+                payload_rsrc=payload_rsrc,
+                scale_rsrc=scale_rsrc,
+            )
+            _emit_quant_block_loop(c)
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_fused(
+        topk_ids: fx.Tensor,
+        count: fx.Tensor,
+        slot_counter: fx.Tensor,
+        starts: fx.Tensor,
+        psum: fx.Tensor,
+        barrier: fx.Tensor,
+        topids_to_rows: fx.Tensor,
+        hidden: fx.Tensor,
+        grouped_payload: fx.Tensor,
+        grouped_scale: fx.Tensor,
+        numel: fx.Int32,
+        experts: fx.Int32,
+        tile_m: fx.Int32,
+        num_workers: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            pass
+
+        grid_x = arith.index_cast(T.index, grid_blocks)
+        fused_kernel(
+            topk_ids,
+            count,
+            slot_counter,
+            starts,
+            psum,
+            barrier,
+            topids_to_rows,
+            hidden,
+            grouped_payload,
+            grouped_scale,
+            numel,
+            experts,
+            tile_m,
+            num_workers,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_THREADS, 1, 1),

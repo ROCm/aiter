@@ -664,45 +664,68 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 "fused grouped stage1 prep requires bf16 hidden_states "
                 f"(got {hidden_states.dtype}); set AITER_GROUPED_GEMM_NAIVE=1"
             )
-        from aiter.ops.flydsl.moe_kernels import (
-            flydsl_moe_fused_route_quant_scatter,
-        )
-
-        expert_row_base = None
         if effective_grouped_contiguous_m:
-            # Precompute per-expert counts + tile-aligned starts so the fused
-            # kernel scatters straight into the (1, contiguous_m) DeepGEMM layout.
-            # contiguous_m is a static upper bound (no .item() sync), CUDAGraph-safe.
-            masked_m_pre = torch.bincount(
-                flat_experts.to(torch.long), minlength=E
-            ).to(torch.int32)
-            starts_t, psum_t, _ = contiguous_psum(masked_m_pre, E, tile_m)
+            # DeepGEMM contiguous-M: a single fully-fused kernel does the
+            # per-expert count, the tile-aligned prefix sum (starts/psum), and the
+            # route+quant+scatter into one (1, contiguous_m) buffer -- replacing the
+            # former torch.bincount + contiguous_psum + scatter triple launch (the
+            # in-kernel count == masked_m, so no redundant histogram). contiguous_m
+            # is still a static upper bound (no .item() sync), CUDAGraph-safe.
+            from aiter.ops.flydsl.moe_kernels import (
+                flydsl_moe_fused_route_psum_quant_scatter,
+            )
+
             ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
             contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
-            m_tile_map = psum_t
             route_E = 1
             route_max_m = int(contiguous_m)
-            expert_row_base = starts_t
 
-        _grouped_dbg(f"start fused route+quant+scatter ({fused_quant_mode})")
-        (
-            grouped_a1,
-            grouped_a1_scale,
-            masked_m,
-            topids_to_rows,
-        ) = flydsl_moe_fused_route_quant_scatter(
-            hidden_states,
-            topk_ids,
-            E,
-            max_m,
-            wmma_rep=warp_tile_m // 16,
-            quant_mode=fused_quant_mode,
-            expert_row_base=expert_row_base,
-            out_E=route_E,
-            out_max_m=route_max_m,
-        )
-        rows_to_tokens = None
-        _grouped_dbg("fused route+quant+scatter done")
+            _grouped_dbg(
+                f"start fused route+psum+quant+scatter ({fused_quant_mode})"
+            )
+            (
+                grouped_a1,
+                grouped_a1_scale,
+                masked_m,
+                topids_to_rows,
+                _starts_t,
+                psum_t,
+            ) = flydsl_moe_fused_route_psum_quant_scatter(
+                hidden_states,
+                topk_ids,
+                E,
+                tile_m,
+                contiguous_m,
+                wmma_rep=warp_tile_m // 16,
+                quant_mode=fused_quant_mode,
+            )
+            m_tile_map = psum_t
+            rows_to_tokens = None
+            _grouped_dbg("fused route+psum+quant+scatter done")
+        else:
+            from aiter.ops.flydsl.moe_kernels import (
+                flydsl_moe_fused_route_quant_scatter,
+            )
+
+            _grouped_dbg(f"start fused route+quant+scatter ({fused_quant_mode})")
+            (
+                grouped_a1,
+                grouped_a1_scale,
+                masked_m,
+                topids_to_rows,
+            ) = flydsl_moe_fused_route_quant_scatter(
+                hidden_states,
+                topk_ids,
+                E,
+                max_m,
+                wmma_rep=warp_tile_m // 16,
+                quant_mode=fused_quant_mode,
+                expert_row_base=None,
+                out_E=route_E,
+                out_max_m=route_max_m,
+            )
+            rows_to_tokens = None
+            _grouped_dbg("fused route+quant+scatter done")
 
     grouped_w1 = _grouped_weight_uint8(w1)
     grouped_w2 = _grouped_weight_uint8(w2)
