@@ -45,6 +45,9 @@ from .kernels.chunk_gated_delta_h_vk_naive import (
 from .kernels.chunk_gated_delta_h_kv_naive import (
     compile_chunk_gated_delta_h_kv_naive,
 )
+from .kernels.chunk_gated_delta_h_hipport import (
+    compile_chunk_gated_delta_h_hipport,
+)
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
@@ -777,6 +780,47 @@ def _get_or_compile_vk_naive(
 
 
 @functools.lru_cache(maxsize=None)
+def _get_or_compile_hipport(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the HIP-PORT K5 kernel: a detail-for-detail FlyDSL
+    replica of the hand-tuned HIP/C++ kernel's split-M scheme (K=16 mfma,
+    register h-state, software-pipeline panel prefetch). BV==64 only; other
+    shapes fall back to the baseline."""
+    return compile_chunk_gated_delta_h_hipport(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
+@functools.lru_cache(maxsize=None)
 def _get_or_compile_kv_naive(
     K,
     V,
@@ -924,7 +968,7 @@ def _resolve_state_dtype(initial_state, state_dtype):
 # maps to its own compiled kernel + cache namespace (see the dispatch in the
 # wrapper body). ``None`` (not listed here) means the baseline kernel.
 _K5_FORKS = frozenset(
-    {"kv", "vk", "kv_naive", "vk_naive", "naive", "naive_opt"}
+    {"kv", "vk", "kv_naive", "vk_naive", "naive", "naive_opt", "hipport"}
 )
 
 
@@ -1088,6 +1132,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     _kv_naive_active = (_fork == "kv_naive") and _vwarp_gate
     _vk_active = (_fork == "vk") and _vwarp_gate
     _vk_naive_active = (_fork == "vk_naive") and _vwarp_gate
+    _hipport_active = (_fork == "hipport") and _vwarp_gate
     _naive_active = _fork == "naive"
     _naive_opt_active = _fork == "naive_opt"
     # KV-class forks (h stored [..., K, V] -> host transposes to VK).
@@ -1100,6 +1145,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         _compile_fn = _get_or_compile_vk
     elif _vk_naive_active:
         _compile_fn = _get_or_compile_vk_naive
+    elif _hipport_active:
+        _compile_fn = _get_or_compile_hipport
     elif _naive_active:
         _compile_fn = _get_or_compile_naive
     elif _naive_opt_active:
@@ -1333,6 +1380,48 @@ def chunk_gated_delta_rule_fwd_h_flydsl_vk_naive(
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
         _fork="vk_naive",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_hipport(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """HIP-PORT FlyDSL K5 implementation: a detail-for-detail replica of the
+    hand-tuned HIP/C++ kernel (``csrc/kernels/chunk_gated_delta_rule_fwd_h.cu``)
+    -- "split-M" wave mapping (each wave owns one 16-row BT M-tile, loops over
+    BV), K=16 mfma, register h-state with a cooperative VK transpose store, and
+    the HIP software-pipeline panel prefetch. Same public VK outputs as the
+    other flydsl forks; used only when the chosen BV is 64, else it falls back
+    to the baseline."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="hipport",
     )
 
 

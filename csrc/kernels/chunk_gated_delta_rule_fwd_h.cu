@@ -681,6 +681,16 @@ __device__ __forceinline__ float run_gemm1_fulltile_bvp(
         }
     }
 
+    // ``gated_v_panel`` aliases ``h_state_panel1`` (same LDS region, reused to
+    // save shared memory). The accum loop above reads ``h_state_panel1`` and the
+    // store below overwrites the SAME bytes via ``gated_v_panel``. Without a
+    // barrier here, a fast wave can begin writing gated_v before a slow wave has
+    // finished reading the h-state, corrupting that wave's accum -> a
+    // non-deterministic v_new error that grows with workgroup concurrency
+    // (only observed at large varlen N). Synchronize so every wave is done
+    // consuming the h-state before any wave clobbers it with gated_v.
+    __syncthreads();
+
     const int row_base_local = row_base + row_group * 4;
     const int gated_row_block = row_base_local >> 2;
     float g_scale[4];
@@ -940,6 +950,12 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
         }
     }
     write_k_panels_to_lds(k_data, k_panel0, k_panel1);
+
+    // ``gated_v_panel`` aliases ``h_state_panel1``; the store below overwrites
+    // the bytes the accum loop just read. Barrier so all waves finish reading
+    // the h-state before any wave clobbers it with gated_v (same aliasing race
+    // as the full-tile GEMM1 path).
+    __syncthreads();
 
     const int row_base_local = row_base + row_group * 4;
     const int gated_row_block = row_base_local >> 2;
