@@ -876,7 +876,8 @@ namespace py = pybind11;
           py::arg("scaleA")      = std::nullopt,                                   \
           py::arg("scaleB")      = std::nullopt,                                   \
           py::arg("scaleOut")    = std::nullopt,                                   \
-          py::arg("bpreshuffle") = std::nullopt);                                  \
+          py::arg("bpreshuffle") = std::nullopt,                                   \
+          py::arg("use_gelu")    = std::nullopt);                                     \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
@@ -887,7 +888,8 @@ namespace py = pybind11;
           py::arg("scaleA")      = std::nullopt,                                   \
           py::arg("scaleB")      = std::nullopt,                                   \
           py::arg("scaleC")      = std::nullopt,                                   \
-          py::arg("bpreshuffle") = false);                                         \
+          py::arg("bpreshuffle") = false,                                          \
+          py::arg("use_gelu")    = false);                                            \
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 
 #define LIBMHA_BWD_PYBIND                         \
@@ -1975,7 +1977,8 @@ namespace py = pybind11;
           py::arg("scaleA")      = std::nullopt,                                   \
           py::arg("scaleB")      = std::nullopt,                                   \
           py::arg("scaleOut")    = std::nullopt,                                   \
-          py::arg("bpreshuffle") = std::nullopt);                                  \
+          py::arg("bpreshuffle") = std::nullopt,                                   \
+          py::arg("use_gelu")    = std::nullopt);                                     \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
@@ -1986,7 +1989,8 @@ namespace py = pybind11;
           py::arg("scaleA")      = std::nullopt,                                   \
           py::arg("scaleB")      = std::nullopt,                                   \
           py::arg("scaleC")      = std::nullopt,                                   \
-          py::arg("bpreshuffle") = false);                                         \
+          py::arg("bpreshuffle") = false,                                          \
+          py::arg("use_gelu")    = false);                                            \
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 
 #define ROCSOLGEMM_PYBIND                                                          \
