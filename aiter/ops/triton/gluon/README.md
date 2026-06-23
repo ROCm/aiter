@@ -28,10 +28,14 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>~1271<br>TFLOPS<br>(4Kx4Kx4K)</td><td>—</td><td>TBD</td>
 </tr>
 <tr>
-  <td rowspan="4"><code>mla_decode_gluon</code></td><td rowspan="4">MLA<br>Decode</td><td rowspan="4">CDNA4</td>
-  <td nowrap>(bh64)<br>Q: bf16, KV: bf16, Out: bf16<br>batch_size in {64, 128, 256}<br>nhead in {64, 128}<br>PAGE_SIZE=1<br>BLOCK_H=BLOCK_N=64</td>
+  <td rowspan="5"><code>mla_gluon</code></td><td rowspan="5">MLA</td><td rowspan="5">CDNA4</td>
+  <td rowspan="2" nowrap>(bh64)<br>Q: bf16, KV: bf16, Out: bf16<br>batch_size in {64, 128, 256}<br>nhead in {64, 128}<br>PAGE_SIZE=1<br>BLOCK_H=BLOCK_N=64</td>
   <td>python op_tests/test_mla.py \<br>-c 16384 -b 64 128 \<br>-n 64,1 128,1 \<br>-d bf16 -kvd bf16</td>
   <td>~563<br>TFLOPS</td><td>~477<br>TFLOPS</td><td>—</td>
+</tr>
+<tr>
+  <td>python op_tests/<br>test_sparse_attention_dsv4.py \<br>--cfgs 4096,128,4096,512<br>(sparse prefill)</td>
+  <td>~520<br>TFLOPS</td><td>—</td><td>—</td>
 </tr>
 <tr>
   <td nowrap>(bh16bn128)<br>Q: bf16, KV: fp8, Out: bf16<br>batch_size = 1<br>nhead &le; 16<br>PAGE_SIZE=1<br>BLOCK_H=16, BLOCK_N=128</td>
@@ -52,12 +56,6 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td nowrap>Q: fp8/bf16/fp16<br>KV: fp8/bf16/fp16<br>Out: bf16 or match<br>query_len &le; 4<br>query_len &times; group_size &le; 64<br>ctx_partition = 256</td>
   <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
   <td>TBD</td><td>TBD</td><td>TBD</td>
-</tr>
-<tr>
-  <td><code>sparse_attention_dsv4</code></td><td>Sparse Attn<br>Prefill</td><td>CDNA4</td>
-  <td nowrap>Q/Out: bf16/fp16<br>num_heads=128<br>head_dim=512 (NoPE 448 + RoPE 64)<br>Prefill KV: bf16 flat [N, D]</td>
-  <td>python op_tests/<br>test_sparse_attention_dsv4.py \<br>--cfgs 4096,128,4096,512</td>
-  <td>~520<br>TFLOPS</td><td>—</td><td>—</td>
 </tr>
 </table>
 </small>
@@ -157,19 +155,26 @@ python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
 
 ## Attention Kernels
 
-### `mla_decode_gluon.py` — MLA Decode
+### `mla_gluon.py` — MLA Decode + DeepSeek V4 Sparse Prefill
 
-**Function:** `mla_decode_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False)`
+A single public wrapper, **`mla_gluon(..., mode=...)`**, drives a single `@gluon.jit` backend kernel, **`_mla_gluon`**. Both modes share the kernel's explicit layouts, async-copy pipeline, and base-2 online-softmax epilogue; a `REGIME` constexpr (plus the `HAS_PE` / `EFF_ITER` knobs) gates the per-regime layouts, grid mapping, and the QK/PV math:
 
-**Description:** Multi-head Latent Attention (DeepSeek MLA) decode kernel with split-KV. Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles.
+- **`mode="decode"`** (default) — MLA decode (regimes `bh64`, `bh16bn128`, `bh16bn64`).
+- **`mode="prefill"`** — DeepSeek V4 sparse-attention prefill (regime `bh64` + `HAS_PE=False`).
 
-The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time regimes (single `@gluon.jit` kernel, REGIME constexpr gates layouts and grid mapping):
+The two share the same kernel because DSV4 sparse prefill is exactly MLA with the RoPE term folded into the latent (`HAS_PE=False`) and per-query ragged KV — i.e. the decode NoPE path over a 1-D VarLen index view.
+
+**Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, mode="decode", k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False)`
+
+**Description:** Multi-head Latent Attention (DeepSeek MLA) decode with split-KV. Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles. Returns `(o, final_lse)` (`final_lse` is None unless `return_lse=True`).
+
+Decode dispatches by `(nhead, kv_c.dtype)` to one of three regimes of the shared `_mla_gluon` kernel (the `bh64` regime is also reused by `mode="prefill"` with `HAS_PE=False` — see below):
 
 - **`bh64`** (`nhead in {64, 128}`): bf16 KV, BLOCK_H=64, BLOCK_N=64, multi-batch + XCD-aware 3-D grid. `NUM_KV_SPLITS` auto-picked &isin; {1, 2, 4} so the launch fills ~256 workgroups (one wave on MI350). When `NUM_KV_SPLITS == 1`, stage-1 writes the final attention output directly to `o` (no temp buffer, no reduce). When `NUM_KV_SPLITS > 1`, stage-1 writes per-split `(acc, fp32 lse)` and stage-2 (`_mla_softmax_reducev_kernel`) reduces them into `o`.
 - **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 2-D grid `(1, NUM_KV_SPLITS)` with token-bound `NUM_KV_SPLITS = max(1, min(256, min_kv_seq_len))` — 256 for the normal long-context path, reduced only for small kv (`min_kv_seq_len < 256`) so every split stays non-empty. Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1` (skipped via the fast path only at `min_kv_seq_len == 1`). Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
 - **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 2-D grid `(batch_size, NUM_KV_SPLITS)` with block-bound `NUM_KV_SPLITS = max(1, min(256 // batch_size, cdiv(min_kv_seq_len, BLOCK_N)))` — fills ~256 WGs but never splits a sequence into more than its 64-token block count, so small kv is supported and it collapses to 1 (one WG per batch over the whole sequence) when `min_kv_seq_len <= 64`. Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1, plus stage-2 reduce into `o` when `NUM_KV_SPLITS > 1`).
 
-All three regimes run the full decode. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_decode_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
+All three regimes run the full decode. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
 
 Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
 
@@ -264,50 +269,3 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | KV block sizes | 16, 64, 1024 (selected by kernel variant) |
 | Context partition | 256 (static_assert) |
 | Constraint | `query_length * query_group_size` &le; 64 |
-
-### `sparse_attention_dsv4.py` — DeepSeek V4 Sparse MLA (Prefill)
-
-**Functions:** `sparse_attn_prefill_gluon(q, kv, indices, indptr, out, scale, attn_sink=None`
-
-**Description:** DeepSeek V4 Compressed Sparse Attention. Each query token attends to a sparse, per-token set of KV positions supplied as CSR `(indices, indptr)` where `indices` are valid global KV slot ids in `[0, num_kv)`.
-
-- **Prefill** (`_sparse_attn_prefill_kernel`): bf16 KV in a flat `[N, D]` buffer, ragged per-query indices, optional per-head attention sink. One program per query token &times; `BLOCK_H` head block. The gathered KV tile is DMA'd global&rarr;LDS once via `async_copy` and read in both orientations (K^T for QK, V for PV) through a `permute` view of a single padded LDS buffer.
-
-| Parameter | Details |
-|-----------|---------|
-| Arch | gfx950 (CDNA4) only |
-| Q dtype | bf16 |
-| KV dtype | bf16 flat buffer |
-| Output | bf16 |
-| head_dim | 512 = nope_head_dim (448) + rope_head_dim (64), enforced |
-| Sparsity | CSR ragged `(indices, indptr)`; `-1` sentinels masked |
-| Attn sink | optional `[H]` fp32 per-head softmax-denominator bias |
-| MFMA | QK 16&times;16&times;32 (kWidth=8) |
-
-**Test** (prefill accuracy + perf vs a torch reference, gfx950):
-
-```
-# config is num_queries,num_heads,num_kv,topk
-python op_tests/test_sparse_attention_dsv4.py --cfgs 4096,128,4096,512
-
-# multiple shapes; add --sink to exercise the per-head attention-sink path
-python op_tests/test_sparse_attention_dsv4.py \
-    --cfgs 4096,128,4096,512 8192,128,8192,1024 --sink
-```
-
-Per-query ragged top-k indices keep a random count in `[topk//4, topk]` of
-unique slots; the test checks `checkAllclose` against a per-query masked-softmax
-torch reference and reports TFLOPS / GB/s.
-
-**Perf** (MI350, prefill, bf16, H=128):
-
-```
-python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py --shapes prefill
-```
-
-|    Q |   H |   Kv | topk | triton TFLOPS | gluon TFLOPS | speedup |
-| ---- | --- | ---- | ---- | ------------- | ------------ | ------- |
-| 4096 | 128 | 4096 |  512 |       192.035 |      400.964 |   2.09&times; |
-| 4096 | 128 | 4096 | 1024 |       209.629 |      520.291 |   2.48&times; |
-| 8192 | 128 | 8192 |  512 |       191.414 |      411.194 |   2.15&times; |
-| 8192 | 128 | 8192 | 1024 |       212.226 |      516.077 |   2.43&times; |

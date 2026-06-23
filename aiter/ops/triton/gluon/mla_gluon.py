@@ -54,7 +54,7 @@ from aiter.ops.triton.utils.device_info import get_num_xcds
 
 # fmt: off
 @gluon.jit
-def _mla_decode_gluon(
+def _mla_gluon(
     Q_nope,
     Q_pe,
     Kv_c_cache,
@@ -62,6 +62,7 @@ def _mla_decode_gluon(
     Req_to_tokens,
     B_seq_len,
     O,  # noqa: E741
+    Attn_sink,  # [NHEAD] fp32 per-head sink bias; unused unless HAS_ATTN_SINK
     sm_scale,
     kv_scale,
     stride_q_nope_bs,
@@ -94,6 +95,11 @@ def _mla_decode_gluon(
     NHEAD: gl.constexpr,
     REGIME: gl.constexpr,
     RETURN_LSE: gl.constexpr,
+    # --- prefill knobs (defaults reproduce the decode regimes) ---
+    HAS_PE: gl.constexpr,
+    HAS_ATTN_SINK: gl.constexpr, 
+    EFF_ITER: gl.constexpr,
+    NUM_BATCH: gl.constexpr,
 ):
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
     # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
@@ -105,6 +111,11 @@ def _mla_decode_gluon(
         cur_batch = gl.program_id(0)
         cur_head_id = 0
         split_kv_id = gl.program_id(1)
+
+    # The prefill 3-D grid rounds num_queries up to a multiple of NUM_XCDS; guard
+    # the tail. For the decode regimes NUM_BATCH == batch_size so this never fires.
+    if cur_batch >= NUM_BATCH:
+        return
 
     # USE_2D_VIEW=True: fixed len or max padded VarLen
     # Req_to_tokens = block_table[batch, max_seqlen], B_seq_len = cache_seqlens[batch]
@@ -140,9 +151,18 @@ def _mla_decode_gluon(
     num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
     start_n = split_kv_start
 
-    # early return with empty kv slice to save compute
-    if split_kv_start >= split_kv_end:
+    # early return with empty kv slice to save compute. 
+    # For prefill (EFF_ITER) an empty query row must still write zeros,
+    # so skip the early-out there.
+    if not EFF_ITER and split_kv_start >= split_kv_end:
         return
+    if EFF_ITER:
+        # Clamp to >=2 tiles. Without it num_iter==1 (kv_len<=64) skips both the
+        # loop and the runtime-guarded epilogue-1, leaving the async waitcnt state
+        # inconsistent on the epilogue-2-only path -> stale LDS reads -> NaN. The
+        # clamp routes short/empty kv through the proven 2-tile epilogue (trailing
+        # tiles score-masked to kv_len). No-op for num_iter>=2 (the benchmark path).
+        num_iter = gl.maximum(num_iter, 2)
 
     ######### layout setting begin #########
     # Q-side layouts + mfma_layout: switch by BLOCK_H.
@@ -328,25 +348,30 @@ def _mla_decode_gluon(
     mfma_layout_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
     dtype = Q_nope.type.element_ty
     kvtype = Kv_c_cache.type.element_ty
+    # Mask partial head-blocks. Equivalent to NHEAD<BLOCK_H for single-block decode,
+    # and additionally covers prefill's multi-block partial tail (num_heads%BLOCK_H).
+    MASK_HEADS: gl.constexpr = (NHEAD % BLOCK_H) != 0
     ######### layout setting end #########
 
     buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
-    buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
+    if HAS_PE:
+        buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
 
     # load q_nope
     offs_d_ckv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, blocked_q_nope))
     cur_head = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
     offs_q_nope = cur_batch * stride_q_nope_bs + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
-    ### For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O stores; wasted MFMA lanes are free (memory-bound).
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask = (cur_head < NHEAD)[:, None] if NHEAD < BLOCK_H else None)
+    ### For partial head-blocks, mask OOB heads to zero on Q load and skip OOB O stores; wasted MFMA lanes are free (memory-bound).
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask = (cur_head < NHEAD)[:, None] if MASK_HEADS else None)
     gl.amd.cdna4.async_copy.commit_group()
 
     # load q_pe
-    offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
-    cur_head_qpe = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
-    offs_q_pe = cur_batch * stride_q_pe_bs + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask = (cur_head_qpe < NHEAD)[:, None] if NHEAD < BLOCK_H else None)
-    gl.amd.cdna4.async_copy.commit_group()
+    if HAS_PE:
+        offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
+        cur_head_qpe = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
+        offs_q_pe = cur_batch * stride_q_pe_bs + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask = (cur_head_qpe < NHEAD)[:, None] if MASK_HEADS else None)
+        gl.amd.cdna4.async_copy.commit_group()
 
     e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
     e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
@@ -382,18 +407,21 @@ def _mla_decode_gluon(
     #### local load Q
     gl.amd.cdna4.async_copy.wait_group(2)
     q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_nope, mfma_layout_a)
-    q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
+    if HAS_PE:
+        q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
 
     #################### move here to work around allocate_shared_memory bug
     bufs_kv = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
-    bufs_kpe = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
+    if HAS_PE:
+        bufs_kpe = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
 
     #### global load K
     # local load page number
     gl.amd.cdna4.async_copy.wait_group(1)
-    kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(0), gl.SliceLayout(0, blocked_kpe))
-    # simplify for page_size 1
-    kv_loc_pe = kv_page_number_pe
+    if HAS_PE:
+        kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(0), gl.SliceLayout(0, blocked_kpe))
+        # simplify for page_size 1
+        kv_loc_pe = kv_page_number_pe
 
     # local load page number for slice 0
     bufs_page_0 = bufs_page.index(0).slice(0, BLOCK_N // 2, 0)
@@ -412,14 +440,15 @@ def _mla_decode_gluon(
     gl.amd.cdna4.async_copy.commit_group()
 
     # global load K_pe
-    offs_n_pe0 = split_kv_start + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
-    offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
-    offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
-    if WITHIN_2GB:
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(0), K_pe_cache, offs_k_pe, mask=offs_n_pe0[None, :] < split_kv_end)
-    else:
-        gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(0), K_pe_cache + offs_k_pe)
-    gl.amd.cdna4.async_copy.commit_group()
+    if HAS_PE:
+        offs_n_pe0 = split_kv_start + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
+        offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
+        offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
+        if WITHIN_2GB:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(0), K_pe_cache, offs_k_pe, mask=offs_n_pe0[None, :] < split_kv_end)
+        else:
+            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(0), K_pe_cache + offs_k_pe)
+        gl.amd.cdna4.async_copy.commit_group()
 
     # local load page number for slice 1
     bufs_page_1 = bufs_page.index(0).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
@@ -473,26 +502,27 @@ def _mla_decode_gluon(
             gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv0, Kv_c_cache + offs_k_c0)
         gl.amd.cdna4.async_copy.commit_group()
 
-        # local load page_number_pe
-        kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kpe))
-        kv_loc_pe = kv_page_number_pe
-        # global load K_pe
-        offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
-        offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
-        offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
-        if WITHIN_2GB:
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
-        else:
-            # No mask needed: loop iterations are in-bounds (see KV slice 0 comment).
-            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe)
-        gl.amd.cdna4.async_copy.commit_group()
+        # local load page_number_pe + global load K_pe
+        if HAS_PE:
+            kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kpe))
+            kv_loc_pe = kv_page_number_pe
+            offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
+            offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
+            offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
+            if WITHIN_2GB:
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
+            else:
+                # No mask needed: loop iterations are in-bounds (see KV slice 0 comment).
+                gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe)
+            gl.amd.cdna4.async_copy.commit_group()
 
         #### dot, softmax, dot (part0)
         k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_layout_b)
         zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
         qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
-        k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kpe.index(buf_idx), mfma_layout_b)
-        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
+        if HAS_PE:
+            k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kpe.index(buf_idx), mfma_layout_b)
+            qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
 
         # local load page number for slice 1
         bufs_page_1 = bufs_page.index(async_idx).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
@@ -541,11 +571,12 @@ def _mla_decode_gluon(
 
         #### global load K
         # local load page number
-        gl.amd.cdna4.async_copy.wait_group(3)
+        gl.amd.cdna4.async_copy.wait_group(3 if HAS_PE else 2)
         kv_page_number = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kv))
-        kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kpe))
         kv_loc = kv_page_number
-        kv_loc_pe = kv_page_number_pe
+        if HAS_PE:
+            kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kpe))
+            kv_loc_pe = kv_page_number_pe
         # global load K_nope
         offs_n_nope = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
         offs_d_ckv_1 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv))
@@ -557,23 +588,25 @@ def _mla_decode_gluon(
             gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache + offs_k_c)
         gl.amd.cdna4.async_copy.commit_group()
         # global load K_pe
-        offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
-        offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
-        offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
-        if WITHIN_2GB:
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
-        else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe)
-        gl.amd.cdna4.async_copy.commit_group()
+        if HAS_PE:
+            offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
+            offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
+            offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
+            if WITHIN_2GB:
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
+            else:
+                gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe)
+            gl.amd.cdna4.async_copy.commit_group()
 
         # dot, softmax, dot
-        gl.amd.cdna4.async_copy.wait_group(2)
+        gl.amd.cdna4.async_copy.wait_group(2 if HAS_PE else 1)
         k_c = bufs_kv.index(buf_idx).load(layout=mfma_layout_b)
         zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
         qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
 
-        k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
-        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
+        if HAS_PE:
+            k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
+            qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
         qk *= qk_scale
         offs_n_qk = split_kv_start + (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
         qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
@@ -601,8 +634,9 @@ def _mla_decode_gluon(
     zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
     qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
 
-    k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
-    qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
+    if HAS_PE:
+        k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
+        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
     qk *= qk_scale
     offs_n_qk = split_kv_start + (num_iter - 1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
     qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
@@ -623,10 +657,28 @@ def _mla_decode_gluon(
     cur_head_o = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
     offs_d_ckv_o = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
     offs_o = cur_batch * stride_o_b + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_s + offs_d_ckv_o[None, :]
+
+    if HAS_ATTN_SINK:
+        # Fold the optional per-head sink into the softmax denom (no V contribution).
+        # e_max/e_sum are natural-log units (the *LOG2E is inside exp2), so is sink.
+        if MASK_HEADS:
+            sink = gl.load(Attn_sink + cur_head_o, mask=cur_head_o < NHEAD, other=float("-inf")).to(gl.float32)
+        else:
+            sink = gl.load(Attn_sink + cur_head_o).to(gl.float32)
+        n_e_max = gl.maximum(e_max, sink)
+        re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
+        acc *= re_scale[:, None]
+        e_sum = e_sum * re_scale + gl.exp2((sink - n_e_max) * LOG2E)
+        e_max = n_e_max
+
     acc *= kv_scale
     rcp = 1.0 / e_sum
-    stored_value = (acc * rcp[:, None]).to(dtype)
-    if NHEAD < BLOCK_H:
+    out_f32 = acc * rcp[:, None]
+    if EFF_ITER:
+        # prefill: a query attending to no kv (e_sum==0) outputs zeros, not acc/0.
+        out_f32 = gl.where((e_sum > 0.0)[:, None], out_f32, 0.0)
+    stored_value = out_f32.to(dtype)
+    if MASK_HEADS:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
     else:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
@@ -727,171 +779,220 @@ def _mla_softmax_reducev_kernel(
 # fmt: on
 
 
-def mla_decode_gluon(
-    q_nope,  # [batch, nhead, kv_lora_rank]
-    q_pe,  # [batch, nhead, qk_rope_head_dim]
-    # Shared: kv_c=[N, kv_lora_rank+qk_rope_head_dim], k_pe=None,              kv_pe_offset=kv_lora_rank
-    # Split:  kv_c=[N, kv_lora_rank],                k_pe=[N,qk_rope_head_dim], kv_pe_offset=0
+def mla_gluon(
+    q_nope,
+    q_pe,
     kv_c,
-    # final output [batch, nhead, kv_lora_rank].
-    o,
-    page_table,  # 2D: block_table [batch, max_seqlen] | 1D: kv_indices [total_kv]
-    seq_info,  # 2D: cache_seqlens [batch]           | 1D: kv_indptr [batch+1]
+    o,  # noqa: E741
+    page_table,
+    seq_info,
     sm_scale,
+    mode="decode",  # "decode" | "prefill"
     k_pe=None,
     kv_pe_offset=512,
     use_2d_view=True,
     kv_scale=1.0,
     min_kv_seq_len=1,
     return_lse=False,
+    attn_sink=None,
 ):
+    """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
+
+    Both modes run the shared `_mla_gluon` @gluon.jit kernel; `mode` selects the
+    interface and the regime knobs.
+
+    mode="decode" (default): MLA decode with split-KV.
+        `q_nope` [B, H, 512], `q_pe` [B, H, 64], `kv_c` pool (+ optional
+        `k_pe` / `kv_pe_offset`). `(page_table, seq_info)` =
+        `(block_table, cache_seqlens)` when `use_2d_view=True` or
+        `(kv_indices, kv_indptr)` when `use_2d_view=False`. Regime is auto-picked
+        from `(nhead, kv_c.dtype)`: bh64 / bh16bn64 / bh16bn128. Returns
+        `(o, final_lse)` (`final_lse` is None unless `return_lse=True`).
+
+    mode="prefill": DeepSeek V4 sparse-attention prefill — the `bh64` regime with
+        `HAS_PE=False` and `EFF_ITER=True`, single split.
+        `q_nope` = combined-D query [T, H, 512] (RoPE folded into the latent, K==V),
+        `q_pe` ignored, `kv_c` = flat [N, 512] pool, `page_table` = ragged
+        `kv_indices`, `seq_info` = ragged `kv_indptr` (CSR), optional
+        `attn_sink` [H]. Writes `o` in place; returns `(o, None)`. The
+        `k_pe` / `kv_pe_offset` / `use_2d_view` / `kv_scale` /
+        `min_kv_seq_len` / `return_lse` arguments are ignored in this mode.
     """
-    Gluon MLA decode (gfx950 / CDNA4).
-
-    Always runs the full decode (stage-1 + stage-2 reduce, or the stage-1-only
-    fast path when NUM_KV_SPLITS==1) and writes the final attention into the
-    caller's `o` ([batch, nhead, kv_lora_rank]).
-
-    return_lse=False (default): returns (o, None).
-
-    return_lse=True: additionally returns the merged log-sum-exp, a separate
-        fp32 tensor [batch, nhead]
-    """
-    if k_pe is None:
-        k_pe = kv_c
-
-    batch_size, nhead, head_dim_ckv = q_nope.shape
-    head_dim_kpe = q_pe.shape[-1]
-
     assert (
         arch_info.get_arch() == "gfx950"
-    ), f"mla_decode_gluon requires gfx950 (CDNA4), got {arch_info.get_arch()}"
-    assert (
-        head_dim_ckv == 512
-    ), f"mla_decode_gluon requires head_dim_ckv=512, got {head_dim_ckv}"
-    assert (
-        head_dim_kpe == 64
-    ), f"mla_decode_gluon requires head_dim_kpe=64, got {head_dim_kpe}"
-
-    # Pick regime by (nhead, kv dtype).
-    if nhead in (64, 128):
-        REGIME = "bh64"
-    elif 1 <= nhead <= 16:
-        if kv_c.dtype == torch.bfloat16:
-            REGIME = "bh16bn64"
-        elif kv_c.dtype == torch.float8_e4m3fn:  # gfx950 fp8 (e4m3fn, not e4m3fnuz)
-            REGIME = "bh16bn128"
-        else:
-            raise AssertionError(
-                f"mla_decode_gluon[bh16*] requires kv_c.dtype in (bfloat16, float8_e4m3fn), got {kv_c.dtype}"
-            )
-    else:
-        raise AssertionError(
-            f"mla_decode_gluon requires nhead <= 16 [bh16bn128/bh16bn64] or nhead in (64,128) [bh64], got {nhead}"
-        )
+    ), f"mla_gluon requires gfx950 (CDNA4), got {arch_info.get_arch()}"
+    assert mode in ("decode", "prefill"), f"mla_gluon: unknown mode {mode!r}"
 
     PAGE_SIZE = 1
 
-    if REGIME == "bh64":
-        BLOCK_H, BLOCK_N = 64, 64
-        NUM_XCDS = get_num_xcds()
-        # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
-        # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
-        base_grid = NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * (batch_size // NUM_XCDS)
-        NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(256, base_grid)))
-
-        assert batch_size in (
+    if mode == "prefill":
+        # DSV4 sparse prefill: combined-D Q (RoPE folded in, K==V), per-query ragged
+        # CSR KV, no PE, single split. Reuses the bh64 layouts/grid with HAS_PE=False.
+        assert q_nope.ndim == 3, f"expected q=[T,H,D], got {tuple(q_nope.shape)}"
+        assert kv_c.ndim == 2, f"expected kv=[num_kv,D], got {tuple(kv_c.shape)}"
+        assert q_nope.is_cuda and kv_c.is_cuda, "q/kv must be on the GPU"
+        num_batch, nhead, head_dim_ckv = q_nope.shape
+        assert nhead in (
             64,
             128,
-            256,
-        ), f"mla_decode_gluon[bh64] requires batch_size in (64, 128, 256), got {batch_size}"
-        # gl.assume(num_iter > 3) inside the kernel requires every split to have
-        # > 3*BLOCK_N tokens. Smallest split (last) for batch length s is
-        # s - (k-1)*ceil(s/k); a sufficient bound is min_kv_seq_len > k*(3*BLOCK_N + k).
-        min_kv_seq_len_required = NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)
+        ), f"mla_gluon[prefill] requires nhead in (64, 128), got {nhead}"
         assert (
-            min_kv_seq_len > min_kv_seq_len_required
-        ), f"mla_decode_gluon[bh64] requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
+            head_dim_ckv == 512
+        ), f"mla_gluon[prefill] requires head_dim=512, got {head_dim_ckv}"
+        head_dim_kpe = 64
+        REGIME, BLOCK_H, BLOCK_N = "bh64", 64, 64
+        NUM_XCDS = get_num_xcds()
+        NUM_KV_SPLITS = 1
+        HAS_PE, EFF_ITER = False, True
+        kv_pe_offset = 0
+        use_2d_view = False
+        kv_scale = 1.0
+        return_lse = False
+        sm_scale = float(sm_scale)
+        # q_pe / k_pe are unused placeholders (HAS_PE=False) but must be valid ptrs.
+        q_pe = q_nope
+        k_pe = kv_c
+        has_attn_sink = attn_sink is not None
+        if attn_sink is None:
+            attn_sink = torch.empty(1, device=q_nope.device, dtype=torch.float32)
+        # one program per (query token, BLOCK_H head-block) on the XCD-pinned grid;
+        # the cdiv tail past num_batch is guarded by NUM_BATCH inside the kernel.
+        grid = (
+            NUM_XCDS,
+            triton.cdiv(nhead, BLOCK_H),
+            triton.cdiv(num_batch, NUM_XCDS),
+        )
+    else:
+        # MLA decode.
+        if k_pe is None:
+            k_pe = kv_c
+        num_batch, nhead, head_dim_ckv = q_nope.shape
+        head_dim_kpe = q_pe.shape[-1]
         assert (
-            q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
-        ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
+            head_dim_ckv == 512
+        ), f"mla_gluon requires head_dim_ckv=512, got {head_dim_ckv}"
         assert (
-            kv_c.dtype == torch.bfloat16 and k_pe.dtype == torch.bfloat16
-        ), f"kv_c/k_pe must be bf16, got {kv_c.dtype}/{k_pe.dtype}"
-    else:  # bh16bn128 (fp8 KV) or bh16bn64 (bf16 KV)
-        BLOCK_H = 16
-        BLOCK_N = 128 if REGIME == "bh16bn128" else 64
-        kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
-        NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # 2-D grid (batch, split). Both bh16 regimes support num_iter in {1, 2, ...}
-        # (no gl.assume(num_iter >= 3) in the kernel); the only correctness need is
-        # that every split is non-empty (floor split size = min_kv_seq_len //
-        # NUM_KV_SPLITS >= 1). Each clamp below keeps NUM_KV_SPLITS <= min_kv_seq_len,
-        if REGIME == "bh16bn128":
-            assert (
-                batch_size == 1
-            ), f"mla_decode_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
-            NUM_KV_SPLITS = max(1, min(256 // batch_size, min_kv_seq_len))
-        else:  # bh16bn64
-            # Fill ~256 WGs (total WGs = B * NUM_KV_SPLITS <= 256, one MI350 wave),
-            # but never split a sequence into more blocks than it has: bound by the
-            # shortest seq's block count so every split holds >= 1 block (no wasted
-            # partial-block MFMA). For min_kv_seq_len <= BLOCK_N this collapses to
-            # NUM_KV_SPLITS=1, i.e. one WG per batch computing the whole (short) seq.
-            NUM_KV_SPLITS = max(
-                1, min(256 // batch_size, triton.cdiv(min_kv_seq_len, BLOCK_N))
-            )
-        assert (
-            q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
-        ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
-        assert (
-            kv_c.dtype == kv_dtype and k_pe.dtype == kv_dtype
-        ), f"kv_c/k_pe must be {kv_dtype}, got {kv_c.dtype}/{k_pe.dtype}"
+            head_dim_kpe == 64
+        ), f"mla_gluon requires head_dim_kpe=64, got {head_dim_kpe}"
+        HAS_PE, EFF_ITER = True, False
+        has_attn_sink = False
+        attn_sink = torch.empty(1, device=o.device, dtype=torch.float32)  # dummy ptr
 
+        # Pick regime by (nhead, kv dtype).
+        if nhead in (64, 128):
+            REGIME = "bh64"
+        elif 1 <= nhead <= 16:
+            if kv_c.dtype == torch.bfloat16:
+                REGIME = "bh16bn64"
+            elif kv_c.dtype == torch.float8_e4m3fn:  # gfx950 fp8 (e4m3fn, not e4m3fnuz)
+                REGIME = "bh16bn128"
+            else:
+                raise AssertionError(
+                    f"mla_gluon[bh16*] requires kv_c.dtype in (bfloat16, float8_e4m3fn), got {kv_c.dtype}"
+                )
+        else:
+            raise AssertionError(
+                f"mla_gluon requires nhead <= 16 [bh16bn128/bh16bn64] or nhead in (64,128) [bh64], got {nhead}"
+            )
+
+        if REGIME == "bh64":
+            BLOCK_H, BLOCK_N = 64, 64
+            NUM_XCDS = get_num_xcds()
+            # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
+            # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
+            base_grid = NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * (num_batch // NUM_XCDS)
+            NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(256, base_grid)))
+
+            assert num_batch in (
+                64,
+                128,
+                256,
+            ), f"mla_gluon[bh64] requires batch_size in (64, 128, 256), got {num_batch}"
+            # gl.assume(num_iter > 3) inside the kernel requires every split to have
+            # > 3*BLOCK_N tokens. Smallest split (last) for batch length s is
+            # s - (k-1)*ceil(s/k); a sufficient bound is min_kv_seq_len > k*(3*BLOCK_N + k).
+            min_kv_seq_len_required = NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)
+            assert (
+                min_kv_seq_len > min_kv_seq_len_required
+            ), f"mla_gluon[bh64] requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
+            assert (
+                q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
+            ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
+            assert (
+                kv_c.dtype == torch.bfloat16 and k_pe.dtype == torch.bfloat16
+            ), f"kv_c/k_pe must be bf16, got {kv_c.dtype}/{k_pe.dtype}"
+        else:  # bh16bn128 (fp8 KV) or bh16bn64 (bf16 KV)
+            BLOCK_H = 16
+            BLOCK_N = 128 if REGIME == "bh16bn128" else 64
+            kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
+            NUM_XCDS = 1  # unused by 2-D split grid mapping
+            # 2-D grid (batch, split). Both bh16 regimes support num_iter in {1, 2, ...}
+            # (no gl.assume(num_iter >= 3) in the kernel); the only correctness need is
+            # that every split is non-empty (floor split size = min_kv_seq_len //
+            # NUM_KV_SPLITS >= 1). Each clamp below keeps NUM_KV_SPLITS <= min_kv_seq_len,
+            if REGIME == "bh16bn128":
+                assert (
+                    num_batch == 1
+                ), f"mla_gluon[bh16bn128] requires batch_size=1, got {num_batch}"
+                NUM_KV_SPLITS = max(1, min(256 // num_batch, min_kv_seq_len))
+            else:  # bh16bn64
+                # Fill ~256 WGs (total WGs = B * NUM_KV_SPLITS <= 256, one MI350 wave),
+                # but never split a sequence into more blocks than it has: bound by the
+                # shortest seq's block count so every split holds >= 1 block (no wasted
+                # partial-block MFMA). For min_kv_seq_len <= BLOCK_N this collapses to
+                # NUM_KV_SPLITS=1, i.e. one WG per batch computing the whole (short) seq.
+                NUM_KV_SPLITS = max(
+                    1, min(256 // num_batch, triton.cdiv(min_kv_seq_len, BLOCK_N))
+                )
+            assert (
+                q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
+            ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
+            assert (
+                kv_c.dtype == kv_dtype and k_pe.dtype == kv_dtype
+            ), f"kv_c/k_pe must be {kv_dtype}, got {kv_c.dtype}/{k_pe.dtype}"
+
+        if REGIME == "bh64":
+            grid = (
+                NUM_XCDS,
+                triton.cdiv(nhead, BLOCK_H),
+                (num_batch // NUM_XCDS) * NUM_KV_SPLITS,
+            )
+        else:
+            grid = (num_batch, NUM_KV_SPLITS)
+
+    # ---- shared launch + (optional) stage-2 reduce ----
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
-    max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
-    within_2gb = max_kv_bytes <= 0x80000000  # 2 GB
+    within_2gb = (kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()) <= 0x80000000
+    stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     if NUM_KV_SPLITS == 1:
         # Fast path: stage-1 writes the final attention (and lse) directly to o.
-        logits_buf = o.view(batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv)
+        logits_buf = o.view(num_batch, nhead, NUM_KV_SPLITS, head_dim_ckv)
         mid_lse = None
         stride_mid_lse_b, stride_mid_lse_h, stride_mid_lse_s = 0, 0, 0
     else:
         # stage-1 -> per-split (acc, lse); stage-2 reduces into o.
         logits_buf = torch.empty(
-            (batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv),
+            (num_batch, nhead, NUM_KV_SPLITS, head_dim_ckv),
             dtype=o.dtype,
             device=o.device,
         )
         mid_lse = torch.empty(
-            (batch_size, nhead, NUM_KV_SPLITS),
-            dtype=torch.float32,
-            device=o.device,
+            (num_batch, nhead, NUM_KV_SPLITS), dtype=torch.float32, device=o.device
         )
         stride_mid_lse_b, stride_mid_lse_h, stride_mid_lse_s = mid_lse.stride()
 
     if return_lse:
         final_lse = torch.empty(
-            (batch_size, nhead), dtype=torch.float32, device=q_nope.device
+            (num_batch, nhead), dtype=torch.float32, device=o.device
         )
         stride_final_lse_b, stride_final_lse_h = final_lse.stride()
     else:
         final_lse = None
         stride_final_lse_b, stride_final_lse_h = 0, 0
 
-    if REGIME == "bh64":
-        grid = (
-            NUM_XCDS,
-            triton.cdiv(nhead, BLOCK_H),
-            (batch_size // NUM_XCDS) * NUM_KV_SPLITS,
-        )
-    else:
-        grid = (batch_size, NUM_KV_SPLITS)
-    stride_page_bs = page_table.stride(0) if use_2d_view else 0
-
-    _mla_decode_gluon[grid](
+    _mla_gluon[grid](
         q_nope,
         q_pe,
         kv_c,
@@ -899,6 +1000,7 @@ def mla_decode_gluon(
         page_table,
         seq_info,
         logits_buf,
+        attn_sink,
         sm_scale,
         kv_scale,
         q_nope.stride(0),
@@ -931,6 +1033,10 @@ def mla_decode_gluon(
         NHEAD=nhead,
         REGIME=REGIME,
         RETURN_LSE=return_lse,
+        HAS_PE=HAS_PE,
+        HAS_ATTN_SINK=has_attn_sink,
+        EFF_ITER=EFF_ITER,
+        NUM_BATCH=num_batch,
     )
 
     if NUM_KV_SPLITS == 1:
@@ -938,7 +1044,7 @@ def mla_decode_gluon(
         return o, final_lse
 
     # Stage-2: reduce per-split (acc, lse) into o (and lse when return_lse).
-    grid_reduce = (batch_size, nhead)
+    grid_reduce = (num_batch, nhead)
     _mla_softmax_reducev_kernel[grid_reduce](
         logits_buf,
         mid_lse,

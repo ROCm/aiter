@@ -20,32 +20,24 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
 from aiter.ops.triton.utils._triton import arch_info
 
 # Gluon (CDNA4) variant — opt-in, gated on Triton ≥ 3.6 + arch=gfx950.
+# Prefill is served by the unified `mla_gluon(..., mode="prefill")` entry (HAS_PE=False
+# + 1-D VarLen + single-split fast path over the shared `_mla_gluon` kernel).
 _TRITON_VERSION = Version(triton.__version__)
 _TRITON_GE_36 = _TRITON_VERSION >= Version("3.6.0")
 _arch = arch_info.get_arch()
 _gluon_sparse_attn_prefill = None
 if _TRITON_GE_36 and _arch == "gfx950":
     try:
-        from aiter.ops.triton.gluon.sparse_attention_dsv4 import (
-            sparse_attn_prefill_gluon as _gluon_sparse_attn_prefill,
+        from aiter.ops.triton.gluon.mla_gluon import (
+            mla_gluon as _gluon_sparse_attn_prefill,
         )
     except ImportError:
         pass  # symbol stays None (set above)
 
-# Buffer-load resource descriptors are 32-bit byte-addressed; the Gluon kernels
-# keep all per-row offsets in int32, so they can only be used when the addressed
-# pool (bf16 KV buffer / fp8 paged cache) fits within 2 GiB.
-_BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 
-
-def _fits_buffer_descriptor(tensor: torch.Tensor) -> bool:
-    return tensor.numel() * tensor.element_size() < _BUFFER_LIMIT_BYTES
-
-
-def _use_gluon(gluon_fn, *pools: torch.Tensor) -> bool:
-    """Prefer the Gluon kernel when it is available and every addressed pool
-    fits the 32-bit buffer-load descriptor (< 2 GiB)."""
-    return gluon_fn is not None and all(_fits_buffer_descriptor(p) for p in pools)
+def _use_gluon(gluon_fn) -> bool:
+    """Prefer the Gluon kernel when it is available"""
+    return gluon_fn is not None
 
 
 def _bh_grid(num_queries: int, num_heads: int):
@@ -315,14 +307,16 @@ def _sparse_attn_prefill_ragged(
     block_d = triton.next_power_of_2(head_dim)
     out = torch.empty_like(q, dtype=torch.bfloat16)
 
-    if _use_gluon(_gluon_sparse_attn_prefill, kv):
+    if _use_gluon(_gluon_sparse_attn_prefill):
         _gluon_sparse_attn_prefill(
-            q,
-            kv,
-            indices,
-            indptr,
-            out,
+            q,  # q_nope = combined-D query (RoPE folded in)
+            None,  # q_pe unused in prefill mode
+            kv,  # kv_c
+            out,  # o (written in place)
+            indices,  # page_table = ragged kv_indices
+            indptr,  # seq_info = ragged kv_indptr
             float(scale),
+            mode="prefill",
             attn_sink=attn_sink if has_attn_sink else None,
         )
         return out

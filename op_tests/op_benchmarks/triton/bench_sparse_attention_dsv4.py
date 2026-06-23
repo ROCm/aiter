@@ -3,9 +3,11 @@
 
 """Benchmark for the DSV4 sparse MLA prefill kernels.
 
-Benchmarks both the Triton and the Gluon (CDNA4 / gfx950) prefill kernels and
-reports the Gluon speedup over Triton. When the Gluon kernel is unavailable
-(e.g. non-gfx950 arch, or Triton < 3.6), only the Triton perf is reported.
+Benchmarks the Triton prefill kernel against the Gluon (CDNA4 / gfx950) prefill
+backend and reports the speedup over Triton. The Gluon backend is the unified
+`mla_gluon(..., mode="prefill")` entry (HAS_PE=False over the shared `_mla_gluon`
+kernel) — the backend the production entrance uses. When Gluon is unavailable
+(non-gfx950 arch, or Triton < 3.6), only the Triton perf is reported.
 
 Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py
@@ -22,16 +24,14 @@ import torch
 import triton
 
 # The Gluon prefill kernel is opt-in (gfx950 + Triton >= 3.6). Probe it once at
-# import time; the benchmark falls back to Triton-only when it is unavailable.
+# import time; the benchmark falls back to Triton-only when unavailable.
 try:
-    from aiter.ops.triton.gluon.sparse_attention_dsv4 import (
-        sparse_attn_prefill_gluon,
-    )
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
     from aiter.jit.utils.chip_info import get_gfx
 
     HAS_GLUON = get_gfx() == "gfx950"
 except ImportError:
-    sparse_attn_prefill_gluon = None
+    mla_gluon = None
     HAS_GLUON = False
 
 
@@ -81,13 +81,15 @@ def _launch_prefill(
 ):
     block_d = triton.next_power_of_2(head_dim)
     if backend == "gluon":
-        sparse_attn_prefill_gluon(
-            q,
-            kv,
-            indices,
-            indptr,
-            out,
+        mla_gluon(
+            q,  # q_nope = combined-D query
+            None,  # q_pe unused in prefill mode
+            kv,  # kv_c
+            out,  # o
+            indices,  # page_table = ragged kv_indices
+            indptr,  # seq_info = ragged kv_indptr
             scale,
+            mode="prefill",
             attn_sink=attn_sink if has_sink else None,
         )
         return
@@ -296,7 +298,7 @@ def main():
     )
     print(f"Triton: {triton.__version__}")
     print(
-        "Backends: Triton + Gluon (gfx950)"
+        "Backends: Triton + Gluon MLA-decode prefill (gfx950)"
         if HAS_GLUON
         else "Backends: Triton only (Gluon kernel unavailable)"
     )
