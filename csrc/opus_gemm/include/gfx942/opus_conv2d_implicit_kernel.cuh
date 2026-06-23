@@ -13,7 +13,7 @@
 // Tile: kid6 gfx942 — 512×128×128×64, VEC=(8,8,4)
 #pragma once
 
-#include "opus_gemm_pipeline_a16w16.cuh"
+#include "opus_gemm_pipeline_a16w16_kbuf1.cuh"
 
 // ============================================================================
 // kargs — shared between device kernel and host launcher
