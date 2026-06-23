@@ -72,6 +72,7 @@ NONE_WRAPPED_OP = [
     # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
+    "compile_batched_gemm_bf16",
     "init_custom_qr",
     "qr_max_size",
     "qr_destroy",
