@@ -9,8 +9,12 @@ from aiter.ops.triton._triton_kernels.fusions.mhc import (
     _mhc_post_pre_split_kernel,
     _mhc_post_pre_reduce_apply_kernel,
 )
+from aiter.ops.triton._triton_kernels.fusions.lm_head_argmax import (
+    _local_argmax_pack_kernel,
+)
 
 __all__ = [
+    "_local_argmax_pack_kernel",
     "_mhc_fused_kernel",
     "_mhc_fused_split_kernel",
     "_mhc_reduce_apply_kernel",
