@@ -3,45 +3,28 @@
 
 """Prefill MQA Logits kernel — Q FP4, KV FP4, paged-direct (gfx950).
 
-Sibling of the decode kernel ``pa_mqa_logits_fp4.py``, ported to the
-ragged-prefill sparse-indexer path. The compute core is identical (native
-FP4 MFMA, ``mfma_scale_f32_16x16x128_f8f6f4`` with cbsz=4/blgp=4, relu *
-per-head weight, cross-lane head reduction); only the addressing /
-coordinate system differs:
-
-  decode:  one CTA  -> (batch, next_n); output row = batch*next_n + n;
-           columns = seq-local KV; mask = single upper bound ctx_len.
-  prefill: one CTA  -> (query_row, chunk); output row = query_row;
-           columns = seq-local KV of that row's sequence; mask = double-sided
-           window [local_start, local_end).
-
-By reading K straight from the paged cache via ``block_tables`` this removes
-the ``cp_gather_indexer_k_quant_cache`` staging + contiguous k_fp8/k_scale
-buffer that the FP8 prefill path needs.
+Ragged-prefill sibling of the decode kernel ``pa_mqa_logits_fp4.py``. Same
+compute core (FP4 MFMA ``mfma_scale_f32_16x16x128_f8f6f4`` cbsz=4/blgp=4, relu
+* per-head weight, cross-lane head reduction); differs in addressing: one CTA
+-> (query_row, chunk), output row = query_row, columns = seq-local KV, mask =
+window [local_start, local_end). Reads K straight from the paged cache via
+``block_tables``, removing the ``cp_gather_indexer_k_quant_cache`` staging the
+FP8 path needs.
 
 Data format:
-  q:        [total_tokens, H, D/2] uint8 (packed fp4 e2m1, natural layout)
-  q_scale:  host-side preshuffled uint8 layout
-            [total_tokens, K_TILES, 4, 16, QS_PAD], where
-            QS_PAD = ceil((H/16) / 4) * 4.
-  kv_cache: paged preshuffle fp4, [num_blocks, K_TILES, 4, kv_block_size, 16] uint8
+  q:        [total_tokens, H, D/2] uint8 (packed fp4 e2m1)
+  q_scale:  [total_tokens, K_TILES, 4, 16, QS_PAD] uint8, preshuffled host-side
+            (QS_PAD = ceil((H/16) / 4) * 4)
+  kv_cache: [num_blocks, K_TILES, 4, kv_block_size, 16] uint8 (paged preshuffle)
   kv_scale: [num_blocks, K_TILES, 4, kv_block_size] uint8 (e8m0fnu, NTPW-interleaved)
   block_tables: [bs, max_blocks_per_seq] int32
   weights:  [total_tokens, H] fp32
-  cta_info: [n_ctas, 6] int32
-            [row_id, batch_id, chunk_start, chunk_count, local_start, local_end]
+  cta_info: [n_ctas, 6] int32 (row_id, batch_id, chunk_start, chunk_count,
+            local_start, local_end)
   output:   [total_tokens, max_seq_len] fp32 (seq-local columns)
 
-Constraints (inherited from the decode kernel's pipelined inner loop, which
-hardcodes NTPW==4 / N_PHYS==1): block_k=256, num_warps=4, kv_block_size=64,
-heads multiple of 16 and <= 128, head_dim multiple of 128.
-
-This module is the aiter port of the FlyDSL standalone kernel
-``kernels/pa_mqa_logits_fp4_prefill.py``. The torch-free kernel build core
-(``build_pa_mqa_logits_fp4_prefill_module`` + ``compute_prefill_schedule``)
-is unchanged; ``compile_pa_mqa_logits_fp4_prefill`` (cached) and
-``flydsl_pa_mqa_logits_fp4_prefill`` (the public host op) follow the same
-layering used by the sibling flydsl ops (``qk_norm_rope_quant``, ``gdr``).
+Constraints (from the decode pipelined loop, NTPW==4 / N_PHYS==1): block_k=256,
+num_warps=4, kv_block_size=64, heads % 16 == 0 and <= 128, head_dim % 128 == 0.
 """
 
 from __future__ import annotations
@@ -80,18 +63,17 @@ def _pack_i32_pair_to_i64(a_i32, b_i32):
 def _pack_lo_i64x2_to_i32x8(x0, x1):
     undef0 = _llvm.mlir_undef(T.i64)
     undef1 = _llvm.mlir_undef(T.i64)
-    return fx.Vector.from_elements([x0, x1, undef0, undef1], dtype=fx.Int64).bitcast(fx.Int32)
+    return fx.Vector.from_elements([x0, x1, undef0, undef1], dtype=fx.Int64).bitcast(
+        fx.Int32
+    )
 
 
 allocator = None
 
 
-# ── Host-side schedule for ragged prefill + persistent CTA assignment ──────
-# Per query row r, work spans seq-local KV tokens [0, local_end[r]); that span
-# is chunked into ceil(local_end/block_k) block_k-chunks and split across CTAs
-# (<= `safe` chunks each). The store mask drops tokens outside
-# [local_start[r], local_end[r]). Mirrors the decode `compute_varctx_schedule`
-# but keyed per query row (not per batch) and carrying batch_id + window bounds.
+# Host-side persistent-grid schedule for ragged prefill. Per query row r, the
+# span [0, local_end[r]) is chunked into ceil(local_end/block_k) chunks split
+# across CTAs (<= `safe` each); the store mask drops tokens outside the window.
 
 
 def compute_prefill_schedule(
@@ -104,17 +86,12 @@ def compute_prefill_schedule(
     """Compute persistent-grid schedule for ragged prefill MQA logits.
 
     Args:
-        row_to_batch: int32 CUDA tensor [total_tokens], sequence id per query row.
-        local_starts: int32 CUDA tensor [total_tokens], inclusive seq-local lower bound.
-        local_ends:   int32 CUDA tensor [total_tokens], exclusive seq-local upper bound.
-        block_k:      chunk size in tokens.
+        row_to_batch: int32 [total_tokens], sequence id per query row.
+        local_starts/local_ends: int32 [total_tokens], seq-local window [lo, hi).
+        block_k: chunk size in tokens.
         parallel_unit_num: target CTA count (typically TotalCuCount * WavePerEU).
 
-    Returns:
-        safe_chunks_per_cta: int — chunks each CTA processes (<= this many).
-        cta_info: int32 CUDA tensor [n_ctas, 6] — packed CTA assignment
-                  [row_id, batch_id, chunk_start, chunk_count, local_start, local_end].
-        n_ctas: int — grid.x size.
+    Returns (safe_chunks_per_cta, cta_info [n_ctas, 6] int32, n_ctas).
     """
     import numpy as np
 
@@ -123,7 +100,7 @@ def compute_prefill_schedule(
     ls = local_starts.detach().to("cpu", torch.int64).numpy()
     le = local_ends.detach().to("cpu", torch.int64).numpy()
 
-    # Tokens covered per row = [0, local_end); chunk count = ceil(le / block_k).
+    # chunk count per row = ceil(le / block_k).
     chunks_per_row = np.maximum(0, (le + block_k - 1) // block_k)
     valid = np.nonzero(chunks_per_row > 0)[0]
 
@@ -134,10 +111,8 @@ def compute_prefill_schedule(
     cpr_valid = chunks_per_row[valid]
     max_chunks = int(cpr_valid.max())
 
-    # Smallest `safe` with sum(ceil(cpr/safe)) <= parallel_unit_num. ctas(safe)
-    # is monotone non-increasing in safe -> binary search. If even
-    # safe=max_chunks can't fit (too many rows), fall back to max_chunks
-    # (one CTA per row).
+    # Smallest `safe` with sum(ceil(cpr/safe)) <= parallel_unit_num via binary
+    # search (ctas(safe) is monotone non-increasing); falls back to max_chunks.
     lo, hi, safe = 1, max_chunks, max_chunks
     while lo <= hi:
         mid = (lo + hi) // 2
@@ -179,33 +154,28 @@ def build_pa_mqa_logits_fp4_prefill_module(
 ):
     """Build the ragged-prefill FP4 MQA logits kernel.
 
-    Returns (kernel_fn, allocator).
+    Returns (kernel_fn, allocator). Grid (n_ctas,) from
+    compute_prefill_schedule; block (num_warps * WARP_SIZE,).
+    `max_chunks_per_cta` is unused (kept for scheduler API symmetry).
 
-    Grid: (n_ctas,) from compute_prefill_schedule(...).
-    Block: (num_warps * WARP_SIZE,).
-
-    `max_chunks_per_cta`: accepted for API symmetry with the host scheduler;
-    unused inside the kernel (chunk loop bound is the per-CTA `chunk_count`).
-
-    Layout / pipeline constraints inherited from the decode kernel:
-      - block_k % MFMA_N == 0 and (block_k/16) % num_warps == 0
-      - N_TILES_PER_WARP must be 4 (pipelined-nt structure is hardcoded)
-      - kv_block_size % MFMA_N == 0 and block_k % kv_block_size == 0
-      - N_PHYS == 1 (all NTPW n-tiles of a warp share one paged block)
+    Constraints (from the decode pipelined loop):
+      - block_k % MFMA_N == 0, (block_k/16) % num_warps == 0, N_TILES_PER_WARP == 4
+      - kv_block_size % MFMA_N == 0, block_k % kv_block_size == 0, N_PHYS == 1
       - heads % 16 == 0, heads <= 128; head_dim % 128 == 0
     """
     block_threads_k = num_warps * WARP_SIZE
-    head_dim_packed = head_dim // 2
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128  # outer K-loop iters (MFMA K=128)
-    assert head_dim % 128 == 0, f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
+    assert head_dim % 128 == 0, (
+        f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
+    )
     assert heads % MFMA_M == 0, f"heads must be a multiple of {MFMA_M}, got {heads}"
     global allocator
 
     N_TILES = block_k // MFMA_N
-    assert (
-        N_TILES % num_warps == 0
-    ), f"block_k={block_k} -> N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
+    assert N_TILES % num_warps == 0, (
+        f"block_k={block_k} -> N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
+    )
     N_TILES_PER_WARP = N_TILES // num_warps
 
     assert kv_block_size % MFMA_N == 0, (
@@ -228,7 +198,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
     _stride_kvs_ktile = 4 * kv_block_size
     _stride_kvs_block = k_tiles * _stride_kvs_ktile
 
-    allocator = SmemAllocator(None, arch="gfx950", global_sym_name="mqa_fp4_prefill_smem")
+    allocator = SmemAllocator(
+        None, arch="gfx950", global_sym_name="mqa_fp4_prefill_smem"
+    )
     allocator.ptr = 16  # minimal, no LDS needed for this approach
 
     QS_DW = (m_tiles + 3) // 4
@@ -253,8 +225,10 @@ def build_pa_mqa_logits_fp4_prefill_module(
     else:
 
         def _phys_to_list(phys_v):
-            return [fx.Vector(phys_v)[nt // TILES_PER_BLOCK]
-                    for nt in range(N_TILES_PER_WARP)]
+            return [
+                fx.Vector(phys_v)[nt // TILES_PER_BLOCK]
+                for nt in range(N_TILES_PER_WARP)
+            ]
 
     @flyc.kernel
     def pa_mqa_logits_fp4_prefill_kernel(
@@ -276,13 +250,12 @@ def build_pa_mqa_logits_fp4_prefill_module(
         lane_mod_16 = lane_id & 15
         lane_div_16 = (lane_id >> 4) & 3
 
-        # ── Persistent CTA assignment lookup ────
-        # Layout per CTA: [row_id, batch_id, chunk_start, chunk_count,
-        # local_start, local_end]. First four via one dwordx4; the two window
-        # bounds via two scalar loads (kept off the dwordx4 critical path).
+        # Per-CTA assignment: first 4 fields via dwordx4, window bounds via 2 scalar loads.
         cta_info_rsrc = buffer_ops.create_buffer_resource(cta_info_ptr, max_size=True)
         cta_base = pid * fx.Int32(CTA_INFO_WIDTH)
-        cta_info_4xi32 = buffer_ops.buffer_load(cta_info_rsrc, cta_base, vec_width=4, dtype=T.i32)
+        cta_info_4xi32 = buffer_ops.buffer_load(
+            cta_info_rsrc, cta_base, vec_width=4, dtype=T.i32
+        )
         local_start = buffer_ops.buffer_load(
             cta_info_rsrc, cta_base + fx.Int32(4), vec_width=1, dtype=T.i32
         )
@@ -304,12 +277,13 @@ def build_pa_mqa_logits_fp4_prefill_module(
         chunk_start = cta_info_vec[2]
         chunk_count = cta_info_vec[3]
 
-        # ── Q load (HOISTED out of chunk loop) ──
-        # Q layout: [total_tokens, H, D/2] uint8. Per (k_tile, mi_idx) a thread
-        # loads its 16-byte FP4 chunk for head row mi_idx*16+lane_mod_16.
+        # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte FP4
+        # chunk for head row mi_idx*16+lane_mod_16. Q: [total_tokens, H, D/2] uint8.
         Q_buf = fx.rocdl.make_buffer_tensor(q_ptr)
         q_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 8)
-        q_reg_ty = fx.MemRefType.get(T.i8, fx.LayoutType.get(16, 1), fx.AddressSpace.Register)
+        q_reg_ty = fx.MemRefType.get(
+            T.i8, fx.LayoutType.get(16, 1), fx.AddressSpace.Register
+        )
         q_reg_lay = fx.make_layout(16, 1)
         q_a_ops = []
         for k_tile in range_constexpr(k_tiles):
@@ -327,28 +301,35 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 q_a_ops_kt.append(_pack_lo_i64x2_to_i32x8(q_i64_0, q_i64_1))
             q_a_ops.append(q_a_ops_kt)
 
-        # Q scale: pre-shuffled host-side as
-        # [total_tokens, K_TILES, K_chunks=4, lane_mod_16=16, mi_idx_padded=QS_PAD].
+        # Q scale: host-preshuffled [total_tokens, K_TILES, 4, 16, QS_PAD].
         assert m_tiles <= 8, f"m_tiles={m_tiles} > 8 not supported. Use heads <= 128."
         QS_buf = fx.rocdl.make_buffer_tensor(q_scale_ptr)
         qs_atom = fx.make_copy_atom(_make_qs_buf_copy(), 8)
-        qs_reg_ty = fx.MemRefType.get(T.i8, fx.LayoutType.get(qs_pad, 1), fx.AddressSpace.Register)
+        qs_reg_ty = fx.MemRefType.get(
+            T.i8, fx.LayoutType.get(qs_pad, 1), fx.AddressSpace.Register
+        )
         qs_reg_lay = fx.make_layout(qs_pad, 1)
         q_scale_ops = []
         for k_tile in range_constexpr(k_tiles):
-            row = fx.slice(QS_buf, (row_id, fx.Int32(k_tile), lane_div_16, lane_mod_16, None))
+            row = fx.slice(
+                QS_buf, (row_id, fx.Int32(k_tile), lane_div_16, lane_mod_16, None)
+            )
             r = fx.memref_alloca(qs_reg_ty, qs_reg_lay)
             fx.copy_atom_call(qs_atom, row, r)
             qs_dws_vec = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Int32)
             qs_dws = [qs_dws_vec[i] for i in range(QS_DW)]
-            q_scale_ops.append([qs_dws[mi // 4] >> fx.Int32(8 * (mi % 4)) for mi in range(m_tiles)])
+            q_scale_ops.append(
+                [qs_dws[mi // 4] >> fx.Int32(8 * (mi % 4)) for mi in range(m_tiles)]
+            )
 
-        # Weights (HOISTED). weights shape: [total_tokens, H] — addressed by row_id.
+        # Weights (hoisted): [total_tokens, H], addressed by row_id.
         W_buf = fx.rocdl.make_buffer_tensor(weights_ptr)
         w_row = fx.slice(W_buf, (row_id, None))
         w_tiled_mi = fx.logical_divide(w_row, fx.make_layout(MFMA_M, 1))
         w_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
-        w_reg_ty = fx.MemRefType.get(T.f32, fx.LayoutType.get(4, 1), fx.AddressSpace.Register)
+        w_reg_ty = fx.MemRefType.get(
+            T.f32, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
+        )
         w_reg_lay = fx.make_layout(4, 1)
         w_per_lane = []
         for mi_idx in range_constexpr(m_tiles):
@@ -369,8 +350,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
             )
             bi_base = token_local_base // kv_block_size
             phys_vec = buffer_ops.buffer_load(
-                bt_rsrc, batch_id * _stride_bt + bi_base,
-                vec_width=N_PHYS, dtype=T.i32)
+                bt_rsrc, batch_id * _stride_bt + bi_base, vec_width=N_PHYS, dtype=T.i32
+            )
             return _phys_to_list(phys_vec)
 
         def _prefetch_chunk(c_i32_arg, phys_list):
@@ -395,7 +376,11 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
             for nt in range_constexpr(N_TILES_PER_WARP):
                 ni_c = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
-                token_local_c = (chunk_start + c_i32_arg) * fx.Int32(block_k) + ni_c * fx.Int32(MFMA_N) + lane_mod_16
+                token_local_c = (
+                    (chunk_start + c_i32_arg) * fx.Int32(block_k)
+                    + ni_c * fx.Int32(MFMA_N)
+                    + lane_mod_16
+                )
                 token_in_block_c = token_local_c % kv_block_size
                 phys_block_c = phys_list[nt]
                 for k_tile in range_constexpr(k_tiles):
@@ -405,7 +390,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
                         + lane_div_16 * kv_block_size * _kv_chunk_bytes
                         + token_in_block_c * _kv_chunk_bytes
                     )
-                    kv_c = buffer_ops.buffer_load(kv_rsrc, kv_off_bytes_c // 4, vec_width=4, dtype=T.i32)
+                    kv_c = buffer_ops.buffer_load(
+                        kv_rsrc, kv_off_bytes_c // 4, vec_width=4, dtype=T.i32
+                    )
                     kv_list.append(kv_c)
 
             return kv_list, kvs_packed_list
@@ -416,7 +403,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 packed = kvs_packed_list_in[k_tile]
                 for nt in range_constexpr(N_TILES_PER_WARP):
                     shifted = arith.ArithValue(packed) >> fx.Int32(8 * nt)
-                    scales[nt][k_tile] = shifted & fx.Int32(0xff)
+                    scales[nt][k_tile] = shifted & fx.Int32(0xFF)
             return scales
 
         def _issue_nt_mfmas(kv_list_in, kvs_scales_per_nt, nt):
@@ -449,7 +436,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
             """relu + per-head weight + per-thread sum + bperm + windowed store."""
             zero = fx.Vector.filled(4, 0.0, fx.Float32)
             ni_warp = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
-            token_base = (chunk_start + c_i32_arg) * fx.Int32(block_k) + ni_warp * fx.Int32(MFMA_N)
+            token_base = (chunk_start + c_i32_arg) * fx.Int32(
+                block_k
+            ) + ni_warp * fx.Int32(MFMA_N)
 
             thread_sum = ZERO_F
             for mi_idx in range_constexpr(m_tiles):
@@ -471,9 +460,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
             thread_sum = _bperm_xor_add(thread_sum, 16)
             thread_sum = _bperm_xor_add(thread_sum, 32)
 
-            # Double-sided window: only [local_start, local_end) is written;
-            # everything else stays at the caller's -inf pre-fill. One writer
-            # lane per token (lane_div_16 == 0).
+            # Only [local_start, local_end) is written (one writer lane per
+            # token); the rest stays at the caller's -inf pre-fill.
             oob_off = fx.Int32(-1)
             is_writer = lane_div_16 < fx.Int32(1)
             out_token = token_base + lane_mod_16
@@ -485,7 +473,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
             assert N_TILES_PER_WARP == 4, (
-                "pipelined-nt structure currently hardcoded for NTPW=4")
+                "pipelined-nt structure currently hardcoded for NTPW=4"
+            )
 
             kvs_scales = _extract_kvs_scales(kvs_packed_list_in)
 
@@ -527,7 +516,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
         N_KVS = k_tiles
         chunk_count_minus_1_i32 = chunk_count - fx.Int32(1)
         chunk_count_minus_1_idx = fx.Index(chunk_count_minus_1_i32)
-        init_args = list(kv_pre) + list(kvs_pre) + list(phys_next_pre) + nt0_init_scalars
+        init_args = (
+            list(kv_pre) + list(kvs_pre) + list(phys_next_pre) + nt0_init_scalars
+        )
         for c_idx, state in range(0, chunk_count_minus_1_idx, 1, init=init_args):
             kv_cur_list = [state[i] for i in range(N_KV)]
             kvs_cur_list = [state[N_KV + i] for i in range(N_KVS)]
@@ -544,7 +535,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
             c_next_i32 = c_idx_i32 + fx.Int32(1)
             c_next_next_i32 = c_next_i32 + fx.Int32(1)
 
-            _compute_chunk(kv_cur_list, kvs_cur_list, c_idx_i32, nt0_accs_in=nt0_accs_cur)
+            _compute_chunk(
+                kv_cur_list, kvs_cur_list, c_idx_i32, nt0_accs_in=nt0_accs_cur
+            )
 
             kv_next, kvs_next = _prefetch_chunk(c_next_i32, phys_next_list)
 
@@ -577,7 +570,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
             )
             for mi in range(m_tiles)
         ]
-        _compute_chunk(kv_last_list, kvs_last_list, last_c_i32, nt0_accs_in=nt0_accs_last)
+        _compute_chunk(
+            kv_last_list, kvs_last_list, last_c_i32, nt0_accs_in=nt0_accs_last
+        )
 
     allocator.block_threads = block_threads_k
     return pa_mqa_logits_fp4_prefill_kernel, allocator
@@ -598,11 +593,10 @@ def compile_pa_mqa_logits_fp4_prefill(
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
 ):
-    """Build (and cache) the @flyc.jit launcher for a given config.
+    """Build (and cache) the @flyc.jit launcher, keyed by layout config.
 
-    Cache key is the full layout config. Returns ``(launcher, block_threads)``;
-    call the launcher directly if you've already allocated outputs and computed
-    the schedule, to avoid the per-call torch-side overhead in
+    Returns ``(launcher, block_threads)``. Call the launcher directly (with
+    outputs/schedule precomputed) to skip the per-call torch overhead in
     ``flydsl_pa_mqa_logits_fp4_prefill``.
     """
     kfn, alloc = build_pa_mqa_logits_fp4_prefill_module(
@@ -615,9 +609,8 @@ def compile_pa_mqa_logits_fp4_prefill(
     )
     block_threads = getattr(alloc, "block_threads", DEFAULT_BLOCK_THREADS)
 
-    # Name the launcher explicitly so the flydsl disk cache directory becomes
-    # `~/.flydsl/cache/launch_pa_mqa_logits_fp4_prefill_<hash>/` rather than the
-    # generic `launcher_<hash>/`.
+    # Named explicitly so the flydsl disk cache dir is
+    # `launch_pa_mqa_logits_fp4_prefill_<hash>/` not the generic `launcher_<hash>/`.
     @flyc.jit
     def launch_pa_mqa_logits_fp4_prefill(
         out,
@@ -668,15 +661,11 @@ def flydsl_pa_mqa_logits_fp4_prefill(
 ) -> torch.Tensor:
     """Ragged-prefill FP4 paged MQA logits (gfx950).
 
-    Computes, per query row ``r``, the sparse-indexer logits over its
-    sequence's seq-local KV window ``[local_start[r], local_end[r])``,
-    reading K straight from the paged FP4 cache via ``block_tables``.
-
-    All tensors must already be in the kernel ABI layout (see module
-    docstring). ``q_fp4``/``q_scale`` are produced by the host-side
-    preshuffle writers; ``kv_cache``/``kv_scale`` are the paged FP4 indexer
-    cache. The schedule (``cta_info``/``n_ctas``) is computed internally via
-    ``compute_prefill_schedule`` unless supplied.
+    Per query row ``r``, computes the sparse-indexer logits over its window
+    ``[local_start[r], local_end[r])``, reading K from the paged FP4 cache via
+    ``block_tables``. All tensors must be in the kernel ABI layout (see module
+    docstring); the schedule is computed via ``compute_prefill_schedule``
+    unless ``cta_info``/``n_ctas`` are supplied.
 
     Args:
         q_fp4: [total_tokens, H, D/2] uint8 packed fp4.
@@ -686,22 +675,16 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         block_tables: [bs, max_blocks_per_seq] int32.
         weights: [total_tokens, H] fp32.
         row_to_batch: [total_tokens] int32, sequence id per query row.
-        local_starts: [total_tokens] int32, inclusive seq-local lower bound.
-        local_ends: [total_tokens] int32, exclusive seq-local upper bound.
+        local_starts/local_ends: [total_tokens] int32, seq-local window [lo, hi).
         max_seq_len: number of seq-local output columns.
-        block_k: chunk size in tokens (default 256).
-        kv_block_size: paged block size (default 64).
-        num_warps: warps per CTA (default 4).
+        block_k/kv_block_size/num_warps: layout config (defaults 256/64/4).
         parallel_unit_num: target persistent-grid CTA count.
-        out: optional [total_tokens, max_seq_len] fp32 output. If None, a new
-            tensor pre-filled with ``-inf`` is allocated (cells outside the
-            ``[local_start, local_end)`` window are left at the pre-fill value).
-        cta_info, n_ctas: optional precomputed schedule (see
-            ``compute_prefill_schedule``); computed internally if omitted.
+        out: optional [total_tokens, max_seq_len] fp32 output (allocated and
+            pre-filled with -inf if None; out-of-window cells keep the pre-fill).
+        cta_info, n_ctas: optional precomputed schedule (both or neither).
         stream: optional CUDA stream (defaults to the current stream).
 
-    Returns:
-        out: [total_tokens, max_seq_len] fp32 logits.
+    Returns out: [total_tokens, max_seq_len] fp32 logits.
     """
     total_tokens, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
