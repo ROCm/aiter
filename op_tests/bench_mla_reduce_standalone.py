@@ -102,14 +102,36 @@ def main():
     ap.add_argument("--Dv", type=int, default=512)
     ap.add_argument("--tiles", type=int, default=256, help="num_reduce_tile (≈ batch)")
     ap.add_argument("--splits", type=int, default=8)
-    ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
+    ap.add_argument(
+        "--dtype",
+        choices=["bf16", "fp16", "fp8", "fp8_e5m2"],
+        default="bf16",
+        help="final_output dtype",
+    )
+    ap.add_argument(
+        "--partial-dtype",
+        choices=["fp32", "fp8", "fp8_e5m2"],
+        default="fp32",
+        help="partial_output/partial_lse dtype (kernel requires fp32)",
+    )
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
 
-    out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    _dt = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp8": torch.float8_e4m3fnuz,
+        "fp8_e5m2": torch.float8_e5m2fnuz,
+        "fp32": torch.float32,
+    }
+    out_dtype = _dt[args.dtype]
     H, Dv, T, S = args.H, args.Dv, args.tiles, args.splits
 
     (po, pl, indptr, fmap, pmap, fout, flse) = build_inputs(T, S, H, Dv, out_dtype)
+
+    if args.partial_dtype != "fp32":
+        po = po.to(_dt[args.partial_dtype])
+        pl = pl.to(_dt[args.partial_dtype])
 
     def run():
         aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, 1, fout, flse)
