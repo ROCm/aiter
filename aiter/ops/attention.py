@@ -392,7 +392,7 @@ def pa_ps_fwd_asm(
 
 
 # ---------------------------------------------------------------------------
-# pa_decode_bf16_asm (gfx1250) — persistent / split-KV paged-attention decode.
+# pa_decode_bf16_asm (gfx1250) -- persistent / split-KV paged-attention decode.
 #
 # Wraps the SP3 kernel PA_DECODE_D64_1TG_4W_PS (head_dim=64, page_size=256,
 # gqa=8).  FP8 Q **and** FP8 paged KV cache, bf16 output, **per-tensor** scalar
@@ -1108,8 +1108,23 @@ def get_mla_metadata_info_v1(
     )
 
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
-    max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
+    packed_qo_len = effective_seqlen_qo * num_head_qo
+    max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 16))
+
     if (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.bf16
+        and kv_dtype == dtypes.bf16
+        and packed_qo_len >= 64
+        and num_head_qo <= 64
+        and (packed_qo_len < 128 or num_head_qo == 48)
+    ):
+        if num_head_qo * 2 > 64:
+            # e.g. nhead=48: C++ does  `return seqlen_qo`  (not ceil)
+            max_qo_tiles_per_batch = effective_seqlen_qo
+        else:
+            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 64))
+    elif (
         num_head_qo == 16
         or (
             get_gfx() == "gfx942"
@@ -1136,10 +1151,10 @@ def get_mla_metadata_info_v1(
             )
         )
     ):
-        max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
+        max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
     elif (
         get_gfx() == "gfx950"
-        and ((num_head_qo * effective_seqlen_qo) >= 128 or num_head_qo > 64)
+        and (packed_qo_len >= 128 or num_head_qo > 64)
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
         and num_head_qo != 48
@@ -1147,9 +1162,7 @@ def get_mla_metadata_info_v1(
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
         else:
-            max_qo_tiles_per_batch = int(
-                math.ceil(effective_seqlen_qo * num_head_qo / 128)
-            )
+            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
 
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
