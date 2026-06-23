@@ -1855,9 +1855,9 @@ def compile_mxscale_gemm(
                     return grouped_accs_to_row_major(accs_in)
                 return accs_in
 
-            _effective_l2_pf = l2_prefetch_distance
-            if const_expr(use_cluster and l2_prefetch_distance > 0):
-                _effective_l2_pf = max(1, l2_prefetch_distance - 1)
+            _effective_l2_pf = num_buffers + 1
+            if const_expr(use_cluster and _effective_l2_pf > 0):
+                _effective_l2_pf = max(1, _effective_l2_pf - 1)
 
             def _l2_prefetch(k_base):
                 if const_expr(_effective_l2_pf <= 0):
