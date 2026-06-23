@@ -279,7 +279,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else (total_bytes <= self.world_size * 32 * 1024)
+            else (total_bytes * self.world_size <= 128 * 7168 * 2)
         )
         if (
             not use_general_path
