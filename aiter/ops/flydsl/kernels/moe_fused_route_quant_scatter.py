@@ -241,18 +241,26 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
 def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     """Emit one warp's per-MX-block quant + e8m0 scale-preshuffle loop.
 
-    ``c`` carries the layout flags, SSA constants/types, buffer resources, and
-    per-warp bases (``feat_elem_base``, ``payload_row_byte_base``,
-    ``scale_row_dword_base``, ``block_in_wave``, ``lane_in_block``,
-    ``is_block_lead``). Shared verbatim by the stage1 route kernel and the
-    stage2 grouped kernel -- only the preamble that computes the bases differs.
+    ``c`` carries the layout flags, SSA constants/types, buffer resources, the
+    source base (``feat_elem_base``), the intra-warp mapping (``block_in_wave``,
+    ``lane_in_block``, ``is_block_lead``), and ``c.dests``: a list of destination
+    namespaces, each with ``payload_row_byte_base`` and ``scale_row_dword_base``.
+    The current callers pass a single destination; keeping this as a list lets a
+    future caller experiment with multi-destination scattering without changing
+    the quant math. Shared verbatim by both stage1 and stage2; only the preamble
+    that computes ``c.dests`` differs.
     """
     i32 = c.i32
     f32 = c.f32
+    mx_group_base = getattr(c, "mx_group_base", None)
+    if mx_group_base is None:
+        mx_group_base = arith.constant(0, type=i32)
     for it in range_constexpr(c.block_iters):
         # MX block (along K) this lane works on this iteration.
         mx_block = (
-            arith.constant(it * c.mx_blocks_per_wave_iter, type=i32) + c.block_in_wave
+            (mx_group_base + arith.constant(it, type=i32))
+            * arith.constant(c.mx_blocks_per_wave_iter, type=i32)
+            + c.block_in_wave
         )
         block_in_range = arith.cmpi(
             CmpIPredicate.ult,
@@ -383,29 +391,49 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                         packed_byte = ArithValue(nib0) | (ArithValue(nib1) << c.c4_i32)
                         payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
 
-            # payload byte offset within grouped_payload. offset_is_bytes=True
-            # so the i8 (fp4) / i16 (fp8) / i32 (pk8) store does not rescale this
-            # already-byte offset by the data element size.
-            payload_byte_off = (
-                c.payload_row_byte_base
-                + mx_block * c.c_payload_bytes_per_block
-                + c.lane_in_block * c.c_payload_bytes_per_lane
-            )
-            buffer_ops.buffer_store(
-                payload_val, c.payload_rsrc, payload_byte_off, offset_is_bytes=True
-            )
+            # One quant result (payload_val + e8m0_scale) is written to every
+            # destination row in ``c.dests``. Current kernels pass one destination;
+            # the list keeps the store side generic without changing quant math.
+            # The block-scale's dword/byte position depends only on ``mx_block``.
+            scale_dword = arith.divui(mx_block, c.c4_i32)
+            byte_in_dword = mx_block - scale_dword * c.c4_i32
+            e8m0_byte = arith.trunci(T.i8, e8m0_scale)
+            for dst in c.dests:
+                # payload byte offset within grouped_payload. offset_is_bytes=True
+                # so the i8 (fp4) / i16 (fp8) / i32 (pk8) store does not rescale
+                # this already-byte offset by the data element size.
+                payload_byte_off = (
+                    dst.payload_row_byte_base
+                    + mx_block * c.c_payload_bytes_per_block
+                    + c.lane_in_block * c.c_payload_bytes_per_lane
+                )
+                buffer_ops.buffer_store(
+                    payload_val, c.payload_rsrc, payload_byte_off, offset_is_bytes=True
+                )
 
-            # one e8m0 byte per block, written by the block's lead lane.
-            _if_lead = scf.IfOp(c.is_block_lead)
-            with ir.InsertionPoint(_if_lead.then_block):
-                scale_dword = arith.divui(mx_block, c.c4_i32)
-                byte_in_dword = mx_block - scale_dword * c.c4_i32
-                dst_scale_dword = c.scale_row_dword_base + scale_dword * c.c_wmma_rep
-                dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
-                e8m0_byte = arith.trunci(T.i8, e8m0_scale)
-                buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)
-                scf.YieldOp([])
+                # one e8m0 byte per block, written by the block's lead lane.
+                _if_lead = scf.IfOp(c.is_block_lead)
+                with ir.InsertionPoint(_if_lead.then_block):
+                    dst_scale_dword = (
+                        dst.scale_row_dword_base + scale_dword * c.c_wmma_rep
+                    )
+                    dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
+                    buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)
+                    scf.YieldOp([])
             scf.YieldOp([])
+
+
+def _emit_quant_one_k_group(c: SimpleNamespace, mx_group) -> None:
+    """Emit exactly one K group of MX blocks for one warp.
+
+    ``mx_group`` indexes groups of ``mx_blocks_per_wave_iter`` MX blocks. This is
+    the K-split entry point used by small-token specializations; the original
+    full-row callers keep using ``_emit_quant_block_loop``.
+    """
+    d = vars(c).copy()
+    d["block_iters"] = 1
+    d["mx_group_base"] = mx_group
+    _emit_quant_block_loop(SimpleNamespace(**d))
 
 
 def build_moe_fused_route_quant_scatter_module(
@@ -476,6 +504,8 @@ def build_moe_fused_route_quant_scatter_module(
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
+    topk_is_pow2 = topk > 0 and (topk & (topk - 1)) == 0
+    topk_shift = topk.bit_length() - 1 if topk_is_pow2 else 0
 
     module_name = (
         f"moe_fused_route_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
@@ -506,6 +536,7 @@ def build_moe_fused_route_quant_scatter_module(
 
         c_wave = arith.constant(wave_size, type=i32)
         c_topk = arith.constant(topk, type=i32)
+        c_topk_shift = arith.constant(topk_shift, type=i32)
         c_model_dim = arith.constant(model_dim, type=i32)
         c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
@@ -525,6 +556,7 @@ def build_moe_fused_route_quant_scatter_module(
         route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
         route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
+        is_single_token = arith.cmpi(CmpIPredicate.eq, ArithValue(numel), c_topk)
         _if_route = scf.IfOp(route_in_range)
         with ir.InsertionPoint(_if_route.then_block):
             topk_ids_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
@@ -533,36 +565,71 @@ def build_moe_fused_route_quant_scatter_module(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
             )
 
-            # --- lane 0 claims the within-expert slot via atomicAdd, then
-            #     broadcasts it to the whole warp. Follows the readlane idiom in
-            #     FlyDSL/kernels/dispatch_combine_intranode_kernel.py:218-225:
-            #     init to 0, reassign on lane 0, readlane(...). ---
-            slot_on_lane0 = arith.constant(0, type=i32)
-            if lane == 0:
-                counter_base = buffer_ops.extract_base_index(counter, address_space=1)
-                expert_idx = arith.index_cast(T.index, expert)
-                counter_addr = (
-                    fx.Index(counter_base) + fx.Index(expert_idx) * fx.Index(4)
+            slot = c0_i32
+            if is_single_token:
+                # Single-token fast path: keep one warp per route, but avoid the
+                # route-counter atomic. The slot is the number of earlier topk ids
+                # equal to this route's expert; the final counter is the total
+                # number of equal topk ids. This stays correct even if topk_ids
+                # contains duplicate experts.
+                expert_count = c0_i32
+                for j in range_constexpr(topk):
+                    peer_route = arith.constant(j, type=i32)
+                    peer_expert = ArithValue(
+                        buffer_ops.buffer_load(
+                            topk_ids_rsrc, peer_route, vec_width=1, dtype=i32
+                        )
+                    )
+                    same_expert = arith.cmpi(CmpIPredicate.eq, peer_expert, expert)
+                    before_route = arith.cmpi(CmpIPredicate.ult, peer_route, route)
+                    prior_same = arith.andi(same_expert, before_route)
+                    slot = slot + arith.select(prior_same, c1_i32, c0_i32)
+                    expert_count = expert_count + arith.select(
+                        same_expert, c1_i32, c0_i32
+                    )
+                if lane == 0:
+                    counter_rsrc = buffer_ops.create_buffer_resource(
+                        counter, max_size=True
+                    )
+                    buffer_ops.buffer_store(expert_count, counter_rsrc, expert)
+            else:
+                # --- lane 0 claims the within-expert slot via atomicAdd, then
+                #     broadcasts it to the whole warp. Follows the readlane idiom in
+                #     FlyDSL/kernels/dispatch_combine_intranode_kernel.py:218-225:
+                #     init to 0, reassign on lane 0, readlane(...). ---
+                slot_on_lane0 = arith.constant(0, type=i32)
+                if lane == 0:
+                    counter_base = buffer_ops.extract_base_index(
+                        counter, address_space=1
+                    )
+                    expert_idx = arith.index_cast(T.index, expert)
+                    counter_addr = (
+                        fx.Index(counter_base) + fx.Index(expert_idx) * fx.Index(4)
+                    )
+                    counter_ptr = buffer_ops.create_llvm_ptr(
+                        counter_addr, address_space=1
+                    )
+                    counter_ptr = (
+                        counter_ptr._value
+                        if hasattr(counter_ptr, "_value")
+                        else counter_ptr
+                    )
+                    slot_on_lane0 = ArithValue(
+                        llvm.AtomicRMWOp(
+                            llvm.AtomicBinOp.add,
+                            counter_ptr,
+                            arith.constant(1, type=i32),
+                            llvm.AtomicOrdering.monotonic,
+                            syncscope="agent",
+                            alignment=4,
+                        ).result
+                    )
+                # readlane needs raw ir.Value operands in this FlyDSL build (the
+                # /workspace/FlyDSL example's auto-unwrap + T.i32() are a newer API).
+                slot = ArithValue(
+                    rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32))
                 )
-                counter_ptr = buffer_ops.create_llvm_ptr(counter_addr, address_space=1)
-                counter_ptr = (
-                    counter_ptr._value
-                    if hasattr(counter_ptr, "_value")
-                    else counter_ptr
-                )
-                slot_on_lane0 = ArithValue(
-                    llvm.AtomicRMWOp(
-                        llvm.AtomicBinOp.add,
-                        counter_ptr,
-                        arith.constant(1, type=i32),
-                        llvm.AtomicOrdering.monotonic,
-                        syncscope="agent",
-                        alignment=4,
-                    ).result
-                )
-            # readlane needs raw ir.Value operands in this FlyDSL build (the
-            # /workspace/FlyDSL example's auto-unwrap + T.i32() are a newer API).
-            slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
+            slot = ArithValue(slot)
 
             # Destination row = per-expert base + within-expert slot. The base
             # array selects the output layout: masked (base[e]=e*max_m, buffer
@@ -578,7 +645,10 @@ def build_moe_fused_route_quant_scatter_module(
                 buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
             )
             grouped_row = slot + row_base
-            token = arith.divui(route, c_topk)
+            if const_expr(topk_is_pow2):
+                token = route >> c_topk_shift
+            else:
+                token = arith.divui(route, c_topk)
 
             # topids_to_rows[route] = grouped_row (lane 0 only; warp-uniform value)
             if lane == 0:
@@ -610,7 +680,7 @@ def build_moe_fused_route_quant_scatter_module(
             )
             scale_rsrc = buffer_ops.create_buffer_resource(grouped_scale, max_size=True)
 
-            # this lane's position inside its 16-lane MX block group
+            # this lane's position inside its MX block group
             block_in_wave = arith.divui(lane, c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
             is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
@@ -640,9 +710,13 @@ def build_moe_fused_route_quant_scatter_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=is_block_lead,
-                payload_row_byte_base=payload_row_byte_base,
+                dests=[
+                    SimpleNamespace(
+                        payload_row_byte_base=payload_row_byte_base,
+                        scale_row_dword_base=scale_row_dword_base,
+                    )
+                ],
                 feat_elem_base=hidden_elem_base,
-                scale_row_dword_base=scale_row_dword_base,
                 hidden_rsrc=hidden_rsrc,
                 payload_rsrc=payload_rsrc,
                 scale_rsrc=scale_rsrc,
@@ -686,10 +760,225 @@ def build_moe_fused_route_quant_scatter_module(
     return launch_fused
 
 
+def build_moe_fused_route_quant_scatter_st_ksplit_module(
+    model_dim: int,
+    topk: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    """Single-token K-split stage1 route+quant+scatter+preshuffle kernel.
+
+    The generic stage1 kernel keeps one warp per route and lets that warp loop
+    over the full K row. For token_num == 1 this under-fills the GPU (only topk
+    active warps), so this specialization launches one warp per (route, K-group)
+    while keeping route-level parallelism. Production topk routing yields distinct
+    expert indices per token, so each route's within-expert slot is 0 and the
+    per-expert counter value is 1; this avoids both the route-counter atomic and
+    the repeated topk scan in every K group.
+    """
+    if topk <= 0 or (topk & (topk - 1)) != 0:
+        raise NotImplementedError("single-token K-split currently requires power-of-two topk")
+
+    L = _quant_layout(model_dim, quant_mode, wmma_rep)
+    if not L.use_pk8:
+        raise NotImplementedError("single-token K-split is currently enabled only for gfx1250 pk8")
+
+    is_fp8 = L.is_fp8
+    use_native = L.use_native
+    use_pk8 = L.use_pk8
+    elems_per_lane = L.elems_per_lane
+    lanes_per_mx_block = L.lanes_per_mx_block
+    mx_dtype = L.mx_dtype
+    payload_bytes_per_row = L.payload_bytes_per_row
+    payload_bytes_per_block = L.payload_bytes_per_block
+    payload_bytes_per_lane = L.payload_bytes_per_lane
+    wave_size = L.wave_size
+    # This specialization is used only for token_num == 1. Use exactly one warp
+    # per route in the block so topk < 8 does not leave half of a 256-thread block
+    # idle (e.g. topk=4 on wave32 -> 128-thread blocks).
+    warps_per_block = topk
+    block_threads = topk * wave_size
+    mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
+    mx_blocks_per_row = L.mx_blocks_per_row
+    rows_per_tile = L.rows_per_tile
+    dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
+    amax_shuffle_dists = L.amax_shuffle_dists
+    k_groups = L.block_iters
+
+    module_name = (
+        f"moe_fused_route_quant_scatter_stks_md{model_dim}_tk{topk}_r{wmma_rep}"
+        f"_{quant_mode}_{L.native_tag}"
+    )
+
+    @flyc.kernel(name=module_name)
+    def fused_kernel(
+        topk_ids: fx.Tensor,  # (topk,) int32
+        counter: fx.Tensor,  # (E,) int32 out
+        topids_to_rows: fx.Tensor,  # (topk,) int32 out
+        hidden: fx.Tensor,  # (model_dim,) bf16
+        grouped_payload: fx.Tensor,  # out
+        grouped_scale: fx.Tensor,  # out
+        expert_row_base: fx.Tensor,  # (E,) int32
+        numel: Int32,  # == topk for this specialization
+    ):
+        i32 = T.i32
+        f32 = T.f32
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c4_i32 = arith.constant(4, type=i32)
+        c16_i32 = arith.constant(16, type=i32)
+        c23_i32 = arith.constant(23, type=i32)
+        c254_i32 = arith.constant(254, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+
+        c_wave = arith.constant(wave_size, type=i32)
+        c_model_dim = arith.constant(model_dim, type=i32)
+        c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
+        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
+        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
+        c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
+        c_wmma_rep = arith.constant(wmma_rep, type=i32)
+        c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
+        c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
+        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
+
+        tid = ArithValue(fx.thread_idx.x)
+        bid = ArithValue(fx.block_idx.x)
+        k_group = ArithValue(fx.block_idx.y)
+
+        warp_in_block = tid // c_wave
+        lane = tid - warp_in_block * c_wave
+        route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+
+        route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
+        _if_route = scf.IfOp(route_in_range)
+        with ir.InsertionPoint(_if_route.then_block):
+            topk_ids_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
+            expert = ArithValue(
+                buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
+            )
+
+            # torch.topk over experts returns distinct expert indices for one
+            # token. Therefore each selected expert receives exactly one route:
+            # slot=0, counter[expert]=1. This is the key small-token fast path;
+            # the generic kernel remains available for non-single-token cases.
+            slot = ArithValue(c0_i32)
+
+            is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
+            is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
+            is_lane0_k0 = arith.andi(is_lane0, is_k0)
+            if is_lane0_k0:
+                counter_rsrc = buffer_ops.create_buffer_resource(counter, max_size=True)
+                buffer_ops.buffer_store(c1_i32, counter_rsrc, expert)
+
+            erb_rsrc = buffer_ops.create_buffer_resource(expert_row_base, max_size=True)
+            row_base = ArithValue(
+                buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
+            )
+            grouped_row = slot + row_base
+
+            if is_lane0_k0:
+                topids_to_rows_rsrc = buffer_ops.create_buffer_resource(
+                    topids_to_rows, max_size=True
+                )
+                buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
+
+            scale_tile = arith.divui(grouped_row, c_rows_per_tile)
+            row_in_tile = grouped_row - scale_tile * c_rows_per_tile
+            wmma_row = arith.divui(row_in_tile, c16_i32)
+            row_lane16 = row_in_tile - wmma_row * c16_i32
+            out_row = scale_tile * c16_i32 + row_lane16
+            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
+            payload_row_byte_base = grouped_row * c_payload_bytes_per_row
+
+            hidden_rsrc = buffer_ops.create_buffer_resource(hidden, max_size=True)
+            payload_rsrc = buffer_ops.create_buffer_resource(
+                grouped_payload, max_size=True
+            )
+            scale_rsrc = buffer_ops.create_buffer_resource(grouped_scale, max_size=True)
+
+            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            lane_in_block = lane - block_in_wave * c_lanes_per_block
+            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+
+            c = SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=1,
+                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                mx_blocks_per_row=mx_blocks_per_row,
+                amax_shuffle_dists=amax_shuffle_dists,
+                is_fp8=is_fp8,
+                use_native=use_native,
+                use_pk8=use_pk8,
+                mx_dtype=mx_dtype,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                c4_i32=c4_i32,
+                c23_i32=c23_i32,
+                c254_i32=c254_i32,
+                c0_f32=c0_f32,
+                c_wave=c_wave,
+                c_elems_per_lane=c_elems_per_lane,
+                c_payload_bytes_per_block=c_payload_bytes_per_block,
+                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                c_wmma_rep=c_wmma_rep,
+                block_in_wave=block_in_wave,
+                lane_in_block=lane_in_block,
+                is_block_lead=is_block_lead,
+                dests=[
+                    SimpleNamespace(
+                        payload_row_byte_base=payload_row_byte_base,
+                        scale_row_dword_base=scale_row_dword_base,
+                    )
+                ],
+                feat_elem_base=c0_i32,
+                hidden_rsrc=hidden_rsrc,
+                payload_rsrc=payload_rsrc,
+                scale_rsrc=scale_rsrc,
+            )
+            _emit_quant_one_k_group(c, k_group)
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_fused(
+        topk_ids: fx.Tensor,
+        counter: fx.Tensor,
+        topids_to_rows: fx.Tensor,
+        hidden: fx.Tensor,
+        grouped_payload: fx.Tensor,
+        grouped_scale: fx.Tensor,
+        expert_row_base: fx.Tensor,
+        numel: fx.Int32,
+        grid_route_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        grid_x = arith.index_cast(T.index, grid_route_blocks)
+        grid_y = arith.index_cast(T.index, arith.constant(k_groups, type=T.i32))
+        fused_kernel(
+            topk_ids,
+            counter,
+            topids_to_rows,
+            hidden,
+            grouped_payload,
+            grouped_scale,
+            expert_row_base,
+            numel,
+        ).launch(
+            grid=(grid_x, grid_y, 1),
+            block=(block_threads, 1, 1),
+            stream=stream,
+        )
+
+    return launch_fused
+
+
 def build_moe_fused_quant_preshuffle_module(
     feat_dim: int,
     wmma_rep: int,
     quant_mode: str = "fp4",
+    skip_padding: bool = False,
 ):
     """Return a JIT launcher for the fused (grouped) quant + scale-preshuffle kernel.
 
@@ -706,17 +995,25 @@ def build_moe_fused_quant_preshuffle_module(
                        multiple of 32.
     wmma_rep : int     ``warp_tile_m // 16`` (scale preshuffle tile geometry).
     quant_mode : str   ``"fp4"`` (payload feat_dim//2) or ``"fp8"`` (payload feat_dim).
+    skip_padding : bool  when True the kernel reads ``masked_m[expert]`` and skips
+                       padding rows (``slot >= masked_m[expert]``) entirely -- no
+                       hidden read, no quant, no store. Only valid for the masked
+                       ``(E, max_m)`` layout where ``expert = row // max_m``; the
+                       caller must pass a real ``masked_m``. When False every one
+                       of the ``E*max_m`` rows is quantized (padding included);
+                       ``masked_m`` is then ignored (a dummy may be passed).
 
     Launcher signature::
 
-        (grouped_in, grouped_payload, grouped_scale, n_rows, max_m, grid_blocks,
-         stream=...)
+        (grouped_in, grouped_payload, grouped_scale, masked_m, n_rows, max_m,
+         grid_blocks, stream=...)
 
       grouped_in      : (n_rows*feat_dim,) bf16   flat grouped activations
       grouped_payload : (n_rows*payload_bytes_per_row,) uint8  out: MX payload
       grouped_scale   : (E*(max_m//wmma_rep)*(feat_dim//32)*wmma_rep,) uint8
                         out: preshuffled e8m0 scale
-      n_rows          : E*max_m  (all rows are quantized; padding rows are unread)
+      masked_m        : (E,) int32  per-expert valid row count (read iff skip_padding)
+      n_rows          : E*max_m  (padding rows skipped iff skip_padding)
       max_m           : per-expert row capacity (for expert = row // max_m)
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
@@ -744,9 +1041,13 @@ def build_moe_fused_quant_preshuffle_module(
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
 
+    # skip_padding changes the emitted control flow (and the masked_m read), so it
+    # must be part of the JIT cache key via the module name -- otherwise the two
+    # variants (same feat_dim/wmma_rep/quant_mode) would collide on one binary.
+    skip_tag = "skip" if skip_padding else "all"
     module_name = (
         f"moe_fused_quant_preshuffle_fd{feat_dim}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}"
+        f"_{quant_mode}_{L.native_tag}_{skip_tag}"
     )
 
     @flyc.kernel(name=module_name)
@@ -754,6 +1055,7 @@ def build_moe_fused_quant_preshuffle_module(
         grouped_in: fx.Tensor,  # (n_rows*feat_dim,) bf16
         grouped_payload: fx.Tensor,  # (n_rows*payload_bytes_per_row,) uint8 out
         grouped_scale: fx.Tensor,  # preshuffled e8m0 out
+        masked_m: fx.Tensor,  # (E,) int32 valid row count (read iff skip_padding)
         n_rows: Int32,
         max_m: Int32,
     ):
@@ -797,20 +1099,216 @@ def build_moe_fused_quant_preshuffle_module(
             expert = ArithValue(arith.divui(row, m))
             slot = row - expert * m  # row within expert
 
-            # --- per-row scale-preshuffle geometry (uniform; row position == slot) ---
-            scale_tile = arith.divui(slot, c_rows_per_tile)
-            row_in_tile = slot - scale_tile * c_rows_per_tile
+            def _emit_row():
+                # --- per-row scale-preshuffle geometry (uniform; row pos == slot) ---
+                scale_tile = arith.divui(slot, c_rows_per_tile)
+                row_in_tile = slot - scale_tile * c_rows_per_tile
+                wmma_row = arith.divui(row_in_tile, c16_i32)
+                row_lane16 = row_in_tile - wmma_row * c16_i32
+                out_row = scale_tile * c16_i32 + row_lane16
+                scale_row_dword_base = (
+                    expert * (m * c_scale_dwords_per_row)
+                    + out_row * c_dst_scale_dwords_per_row
+                    + wmma_row
+                )
+
+                payload_row_byte_base = row * c_payload_bytes_per_row
+                feat_elem_base = row * c_feat_dim  # bf16 element base for this row
+
+                hidden_rsrc = buffer_ops.create_buffer_resource(
+                    grouped_in, max_size=True
+                )
+                payload_rsrc = buffer_ops.create_buffer_resource(
+                    grouped_payload, max_size=True
+                )
+                scale_rsrc = buffer_ops.create_buffer_resource(
+                    grouped_scale, max_size=True
+                )
+
+                block_in_wave = arith.divui(lane, c_lanes_per_block)
+                lane_in_block = lane - block_in_wave * c_lanes_per_block
+                is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+
+                c = SimpleNamespace(
+                    i32=i32,
+                    f32=f32,
+                    block_iters=block_iters,
+                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                    mx_blocks_per_row=mx_blocks_per_row,
+                    amax_shuffle_dists=amax_shuffle_dists,
+                    is_fp8=is_fp8,
+                    use_native=use_native,
+                    use_pk8=use_pk8,
+                    mx_dtype=mx_dtype,
+                    c0_i32=c0_i32,
+                    c1_i32=c1_i32,
+                    c4_i32=c4_i32,
+                    c23_i32=c23_i32,
+                    c254_i32=c254_i32,
+                    c0_f32=c0_f32,
+                    c_wave=c_wave,
+                    c_elems_per_lane=c_elems_per_lane,
+                    c_payload_bytes_per_block=c_payload_bytes_per_block,
+                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                    c_wmma_rep=c_wmma_rep,
+                    block_in_wave=block_in_wave,
+                    lane_in_block=lane_in_block,
+                    is_block_lead=is_block_lead,
+                    dests=[
+                        SimpleNamespace(
+                            payload_row_byte_base=payload_row_byte_base,
+                            scale_row_dword_base=scale_row_dword_base,
+                        )
+                    ],
+                    feat_elem_base=feat_elem_base,
+                    hidden_rsrc=hidden_rsrc,
+                    payload_rsrc=payload_rsrc,
+                    scale_rsrc=scale_rsrc,
+                )
+                _emit_quant_block_loop(c)
+
+            if const_expr(skip_padding):
+                # Skip padding rows: the masked GEMM never reads rows beyond
+                # masked_m[expert], so quantizing them is pure waste. With high
+                # capacity-factor padding this elides most of the work.
+                masked_rsrc = buffer_ops.create_buffer_resource(
+                    masked_m, max_size=True
+                )
+                valid = ArithValue(
+                    buffer_ops.buffer_load(masked_rsrc, expert, vec_width=1, dtype=i32)
+                )
+                slot_valid = arith.cmpi(CmpIPredicate.ult, slot, valid)
+                _if_valid = scf.IfOp(slot_valid)
+                with ir.InsertionPoint(_if_valid.then_block):
+                    _emit_row()
+                    scf.YieldOp([])
+            else:
+                _emit_row()
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_fused(
+        grouped_in: fx.Tensor,
+        grouped_payload: fx.Tensor,
+        grouped_scale: fx.Tensor,
+        masked_m: fx.Tensor,
+        n_rows: fx.Int32,
+        max_m: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        grid_x = arith.index_cast(T.index, grid_blocks)
+        fused_kernel(
+            grouped_in,
+            grouped_payload,
+            grouped_scale,
+            masked_m,
+            n_rows,
+            max_m,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_fused
+
+
+def build_moe_fused_quant_preshuffle_route_ksplit_module(
+    feat_dim: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    """Route-indexed K-split grouped quant+preshuffle for small token counts.
+
+    Instead of launching over every row in the (E, max_m) capacity buffer and
+    skipping padding, this kernel launches only over routed rows
+    (``topids_to_rows``) and K groups. It works for both masked and contiguous-M
+    layouts because ``topids_to_rows`` already contains the global row index in
+    the actual output/input buffer.
+    """
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    if not L.use_pk8:
+        raise NotImplementedError("route-indexed K-split is currently enabled only for gfx1250 pk8")
+
+    is_fp8 = L.is_fp8
+    use_native = L.use_native
+    use_pk8 = L.use_pk8
+    elems_per_lane = L.elems_per_lane
+    lanes_per_mx_block = L.lanes_per_mx_block
+    mx_dtype = L.mx_dtype
+    payload_bytes_per_row = L.payload_bytes_per_row
+    payload_bytes_per_block = L.payload_bytes_per_block
+    payload_bytes_per_lane = L.payload_bytes_per_lane
+    wave_size = L.wave_size
+    warps_per_block = L.warps_per_block
+    mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
+    mx_blocks_per_row = L.mx_blocks_per_row
+    rows_per_tile = L.rows_per_tile
+    dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
+    block_iters = L.block_iters
+    amax_shuffle_dists = L.amax_shuffle_dists
+
+    module_name = (
+        f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
+        f"_{quant_mode}_{L.native_tag}"
+    )
+
+    @flyc.kernel(name=module_name)
+    def fused_kernel(
+        grouped_in: fx.Tensor,  # flat grouped activations
+        grouped_payload: fx.Tensor,
+        grouped_scale: fx.Tensor,
+        topids_to_rows: fx.Tensor,  # (numel,) int32 global rows
+        numel: Int32,
+    ):
+        i32 = T.i32
+        f32 = T.f32
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c4_i32 = arith.constant(4, type=i32)
+        c16_i32 = arith.constant(16, type=i32)
+        c23_i32 = arith.constant(23, type=i32)
+        c254_i32 = arith.constant(254, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+
+        c_wave = arith.constant(wave_size, type=i32)
+        c_feat_dim = arith.constant(feat_dim, type=i32)
+        c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
+        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
+        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
+        c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
+        c_wmma_rep = arith.constant(wmma_rep, type=i32)
+        c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
+        c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
+        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
+
+        tid = ArithValue(fx.thread_idx.x)
+        bid = ArithValue(fx.block_idx.x)
+        k_group = ArithValue(fx.block_idx.y)
+
+        warp_in_block = tid // c_wave
+        lane = tid - warp_in_block * c_wave
+        route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+
+        route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
+        _if_route = scf.IfOp(route_in_range)
+        with ir.InsertionPoint(_if_route.then_block):
+            rows_rsrc = buffer_ops.create_buffer_resource(topids_to_rows, max_size=True)
+            row = ArithValue(
+                buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, dtype=i32)
+            )
+
+            scale_tile = arith.divui(row, c_rows_per_tile)
+            row_in_tile = row - scale_tile * c_rows_per_tile
             wmma_row = arith.divui(row_in_tile, c16_i32)
             row_lane16 = row_in_tile - wmma_row * c16_i32
             out_row = scale_tile * c16_i32 + row_lane16
-            scale_row_dword_base = (
-                expert * (m * c_scale_dwords_per_row)
-                + out_row * c_dst_scale_dwords_per_row
-                + wmma_row
-            )
+            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
 
             payload_row_byte_base = row * c_payload_bytes_per_row
-            feat_elem_base = row * c_feat_dim  # bf16 element base for this row
+            feat_elem_base = row * c_feat_dim
 
             hidden_rsrc = buffer_ops.create_buffer_resource(grouped_in, max_size=True)
             payload_rsrc = buffer_ops.create_buffer_resource(
@@ -825,7 +1323,7 @@ def build_moe_fused_quant_preshuffle_module(
             c = SimpleNamespace(
                 i32=i32,
                 f32=f32,
-                block_iters=block_iters,
+                block_iters=1,
                 mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
                 mx_blocks_per_row=mx_blocks_per_row,
                 amax_shuffle_dists=amax_shuffle_dists,
@@ -847,14 +1345,18 @@ def build_moe_fused_quant_preshuffle_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=is_block_lead,
-                payload_row_byte_base=payload_row_byte_base,
+                dests=[
+                    SimpleNamespace(
+                        payload_row_byte_base=payload_row_byte_base,
+                        scale_row_dword_base=scale_row_dword_base,
+                    )
+                ],
                 feat_elem_base=feat_elem_base,
-                scale_row_dword_base=scale_row_dword_base,
                 hidden_rsrc=hidden_rsrc,
                 payload_rsrc=payload_rsrc,
                 scale_rsrc=scale_rsrc,
             )
-            _emit_quant_block_loop(c)
+            _emit_quant_one_k_group(c, k_group)
             scf.YieldOp([])
 
     @flyc.jit
@@ -862,20 +1364,21 @@ def build_moe_fused_quant_preshuffle_module(
         grouped_in: fx.Tensor,
         grouped_payload: fx.Tensor,
         grouped_scale: fx.Tensor,
-        n_rows: fx.Int32,
-        max_m: fx.Int32,
-        grid_blocks: fx.Int32,
+        topids_to_rows: fx.Tensor,
+        numel: fx.Int32,
+        grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        grid_x = arith.index_cast(T.index, grid_blocks)
+        grid_x = arith.index_cast(T.index, grid_route_blocks)
+        grid_y = arith.index_cast(T.index, arith.constant(block_iters, type=T.i32))
         fused_kernel(
             grouped_in,
             grouped_payload,
             grouped_scale,
-            n_rows,
-            max_m,
+            topids_to_rows,
+            numel,
         ).launch(
-            grid=(grid_x, 1, 1),
+            grid=(grid_x, grid_y, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -1252,9 +1755,13 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=is_block_lead,
-                payload_row_byte_base=payload_row_byte_base,
+                dests=[
+                    SimpleNamespace(
+                        payload_row_byte_base=payload_row_byte_base,
+                        scale_row_dword_base=scale_row_dword_base,
+                    )
+                ],
                 feat_elem_base=hidden_elem_base,
-                scale_row_dword_base=scale_row_dword_base,
                 hidden_rsrc=hidden_rsrc,
                 payload_rsrc=payload_rsrc,
                 scale_rsrc=scale_rsrc,

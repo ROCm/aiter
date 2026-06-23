@@ -896,12 +896,19 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         # grouped_a2 is (route_E, route_max_m, inter_dim): masked (E, max_m) or
         # contiguous (1, contiguous_m). The fused kernel derives expert=row//max_m
         # so passing route_E/route_max_m yields the matching scale layout for both.
+        # Masked (E, max_m) layout: skip padding rows via masked_m (expert =
+        # row // max_m). Contiguous-M packs rows by a prefix sum so that
+        # row->expert map does not hold -- quantize all rows there (masked_m=None).
+        _fused_masked_m = None if effective_grouped_contiguous_m else masked_m
+        _fused_topids_to_rows = topids_to_rows if token_num == 1 else None
         grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
             grouped_a2,
             route_E,
             route_max_m,
             wmma_rep=warp_tile_m // 16,
             quant_mode=fused_quant_mode,
+            masked_m=_fused_masked_m,
+            topids_to_rows=_fused_topids_to_rows,
         )
         if _grouped_sync_dbg:
             torch.cuda.synchronize()

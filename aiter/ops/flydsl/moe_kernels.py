@@ -1709,6 +1709,25 @@ def _get_compiled_fused_route_quant_scatter(
     )
 
 
+@functools.cache
+def _get_compiled_fused_route_quant_scatter_st_ksplit(
+    model_dim: int,
+    topk: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_fused_route_quant_scatter_st_ksplit_module,
+    )
+
+    return build_moe_fused_route_quant_scatter_st_ksplit_module(
+        model_dim=model_dim,
+        topk=topk,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+    )
+
+
 def flydsl_moe_fused_route_quant_scatter(
     hidden_states: torch.Tensor,  # (token_num, model_dim) bf16
     topk_ids: torch.Tensor,  # (token_num, topk) int32 local expert ids
@@ -1820,12 +1839,21 @@ def flydsl_moe_fused_route_quant_scatter(
     # The kernel reads int32 expert ids (the router's only output dtype).
     topk_ids_i32 = topk_ids.to(torch.int32).reshape(-1)
 
-    launch = _get_compiled_fused_route_quant_scatter(
-        model_dim=model_dim,
-        topk=topk,
-        wmma_rep=wmma_rep,
-        quant_mode=quant_mode,
-    )
+    use_st_ksplit = token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0
+    if use_st_ksplit:
+        launch = _get_compiled_fused_route_quant_scatter_st_ksplit(
+            model_dim=model_dim,
+            topk=topk,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+        )
+    else:
+        launch = _get_compiled_fused_route_quant_scatter(
+            model_dim=model_dim,
+            topk=topk,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+        )
     launch(
         topk_ids_i32,
         counter,
@@ -2013,12 +2041,31 @@ def _get_compiled_fused_quant_preshuffle(
     feat_dim: int,
     wmma_rep: int,
     quant_mode: str = "fp4",
+    skip_padding: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_module,
     )
 
     return build_moe_fused_quant_preshuffle_module(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+        skip_padding=skip_padding,
+    )
+
+
+@functools.cache
+def _get_compiled_fused_quant_preshuffle_route_ksplit(
+    feat_dim: int,
+    wmma_rep: int,
+    quant_mode: str = "fp4",
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_fused_quant_preshuffle_route_ksplit_module,
+    )
+
+    return build_moe_fused_quant_preshuffle_route_ksplit_module(
         feat_dim=feat_dim,
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
@@ -2032,16 +2079,24 @@ def flydsl_moe_fused_quant_preshuffle(
     *,
     wmma_rep: int,
     quant_mode: str = "fp4",
+    masked_m: Optional[torch.Tensor] = None,  # (E,) int32 valid rows per expert
+    topids_to_rows: Optional[torch.Tensor] = None,  # route -> global row
     out_payload: Optional[torch.Tensor] = None,  # (E, max_m, Pb) uint8
     out_scale: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
-    ``grouped_in`` is already grouped row-major bf16 (stage2 input), so all
-    ``E*max_m`` rows are quantized (padding rows are unread by the masked GEMM).
+    ``grouped_in`` is already grouped row-major bf16 (stage2 input).
     ``quant_mode`` is ``"fp4"`` (payload feat_dim//2) or ``"fp8"`` (payload
     feat_dim). Returns ``(payload (E,max_m,Pb), scale_pre (E, max_m//wmma_rep,
     (feat_dim//32)*wmma_rep))`` -- the same layout the grouped GEMM consumes.
+
+    If ``masked_m`` (the per-expert valid row count, ``expert = row // max_m``) is
+    given, the kernel skips padding rows (``slot >= masked_m[expert]``) entirely --
+    no read, no quant, no store -- which removes the bulk of the work when the
+    capacity ``max_m`` is much larger than the routed rows. This is only valid for
+    the masked ``(E, max_m)`` layout; for the contiguous-M layout pass
+    ``masked_m=None`` (all ``E*max_m`` rows are quantized, the previous behaviour).
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
@@ -2069,19 +2124,51 @@ def flydsl_moe_fused_quant_preshuffle(
             (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
         )
 
+    skip_padding = masked_m is not None
+    if skip_padding:
+        masked_m = masked_m.to(device=device, dtype=torch.int32).reshape(-1)
+    else:
+        # Unused by the kernel (skip_padding=False); a tiny dummy keeps the launch
+        # signature uniform without allocating per-row scratch.
+        masked_m = torch.empty(max(E, 1), dtype=torch.int32, device=device)
+
     from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 
     wave_size = get_warp_size()
     warps_per_block = 256 // wave_size
+    if topids_to_rows is not None:
+        topids_to_rows_i32 = topids_to_rows.to(device=device, dtype=torch.int32).reshape(-1)
+        numel = int(topids_to_rows_i32.numel())
+        grid_blocks = (numel + warps_per_block - 1) // warps_per_block
+        launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
+            feat_dim=feat_dim,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+        )
+        launch(
+            grouped_in.contiguous().view(-1),
+            out_payload.view(-1),
+            out_scale.view(-1),
+            topids_to_rows_i32,
+            numel,
+            grid_blocks,
+            stream=torch.cuda.current_stream(),
+        )
+        return out_payload, out_scale
+
     grid_blocks = (n_rows + warps_per_block - 1) // warps_per_block
 
     launch = _get_compiled_fused_quant_preshuffle(
-        feat_dim=feat_dim, wmma_rep=wmma_rep, quant_mode=quant_mode
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+        skip_padding=skip_padding,
     )
     launch(
         grouped_in.contiguous().view(-1),
         out_payload.view(-1),
         out_scale.view(-1),
+        masked_m,
         n_rows,
         max_m,
         grid_blocks,
