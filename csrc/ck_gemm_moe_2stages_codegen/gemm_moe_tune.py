@@ -631,13 +631,29 @@ class FmoeTuner(TunerCommon):
         w1_a16 = shuffle_weight_a16w4(w1_qt, 16, True)
         w1s_a16 = shuffle_scale_a16w4(w1_scale, ne, True)
         sti, sw, sei, nvi, moe_buf, aux = moe_sorting(
-            topk_ids, topk_weights, ne, h, dtype,
-            block_size=BM, accumulate=p2_atomic, fused_sort=True,
+            topk_ids,
+            topk_weights,
+            ne,
+            h,
+            dtype,
+            block_size=BM,
+            accumulate=p2_atomic,
+            fused_sort=True,
         )
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
-            input, w1_a16, w2_qt, sti, sei, nvi, None, topk,
-            block_m=BM, w1_scale=w1s_a16, kernelName1=kernelName1,
-            m_indices=aux.m_indices, moe_buf=moe_buf,
+            input,
+            w1_a16,
+            w2_qt,
+            sti,
+            sei,
+            nvi,
+            None,
+            topk,
+            block_m=BM,
+            w1_scale=w1s_a16,
+            kernelName1=kernelName1,
+            m_indices=aux.m_indices,
+            moe_buf=moe_buf,
         )
         return inter_q
 
@@ -671,21 +687,45 @@ class FmoeTuner(TunerCommon):
         w2s_a16 = shuffle_scale_a16w4(w2_scale, ne, False)
         M = input.shape[0]
         sti, sw, sei, nvi, moe_buf, aux = moe_sorting(
-            topk_ids, topk_weights, ne, h, dtype,
-            block_size=BM, accumulate=atomic, fused_sort=True,
+            topk_ids,
+            topk_weights,
+            ne,
+            h,
+            dtype,
+            block_size=BM,
+            accumulate=atomic,
+            fused_sort=True,
         )
-        moe_out = (
-            moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
-        )
+        moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
-            input, w1_a16, w2_a16, sti, sei, nvi, None, topk,
-            block_m=BM1, w1_scale=w1s_a16, kernelName1=kernelName1,
-            m_indices=aux.m_indices, moe_buf=moe_buf,
+            input,
+            w1_a16,
+            w2_a16,
+            sti,
+            sei,
+            nvi,
+            None,
+            topk,
+            block_m=BM1,
+            w1_scale=w1s_a16,
+            kernelName1=kernelName1,
+            m_indices=aux.m_indices,
+            moe_buf=moe_buf,
         )
         return _mxfp4_a4w4_stage2_fw(
-            inter_q, w1_a16, w2_a16, sti, sei, nvi, moe_out, topk,
-            w2_scale=w2s_a16, a2_scale=inter_s, block_m=BM,
-            sorted_weights=sw, kernelName2=kernelName2,
+            inter_q,
+            w1_a16,
+            w2_a16,
+            sti,
+            sei,
+            nvi,
+            moe_out,
+            topk,
+            w2_scale=w2s_a16,
+            a2_scale=inter_s,
+            block_m=BM,
+            sorted_weights=sw,
+            kernelName2=kernelName2,
             reverse_sorted=aux.reverse_sorted,
         )
 
@@ -3038,8 +3078,17 @@ class FmoeTuner(TunerCommon):
         # generate_data_2stages, whose a4w4 a1_qt is already fp4-quantized.
         def _gen_args():
             return (
-                token, model_dim, inter_dim, expert, topk, dtype,
-                q_dtype_a, q_dtype_w, q_type, use_g1u1, blockM,
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                q_type,
+                use_g1u1,
+                blockM,
             )
 
         for blockM in blockMs:
@@ -3055,9 +3104,20 @@ class FmoeTuner(TunerCommon):
                         _gen_args(),
                         FmoeTuner.run_mxfp4_port_stage1_out,
                         (
-                            ["input", "w1_qt", "w2_qt", "w1_scale",
-                             "topk_ids", "topk_weights"],
-                            dtype, topk, ne, h, e, kn1,
+                            [
+                                "input",
+                                "w1_qt",
+                                "w2_qt",
+                                "w1_scale",
+                                "topk_ids",
+                                "topk_weights",
+                            ],
+                            dtype,
+                            topk,
+                            ne,
+                            h,
+                            e,
+                            kn1,
                         ),
                         {},
                         None,
@@ -3076,9 +3136,7 @@ class FmoeTuner(TunerCommon):
                     continue
                 # gemm1 for the stage2 setup: pick a supported g1 variant at this BM
                 # (BM16 -> inline_quant; BM32 -> cshuffle NT; BM128 -> plain).
-                g1_match = [
-                    (b, n, iq) for (b, n, iq) in _G1_SUPPORTED if b == bm
-                ]
+                g1_match = [(b, n, iq) for (b, n, iq) in _G1_SUPPORTED if b == bm]
                 if not g1_match:
                     continue
                 b1, n1, iq1 = sorted(g1_match)[0]
@@ -3091,9 +3149,22 @@ class FmoeTuner(TunerCommon):
                         _gen_args(),
                         FmoeTuner.run_mxfp4_port_stage2_out,
                         (
-                            ["input", "w1_qt", "w2_qt", "w1_scale", "w2_scale",
-                             "topk_ids", "topk_weights"],
-                            dtype, topk, ne, h, e, kn1, kn2,
+                            [
+                                "input",
+                                "w1_qt",
+                                "w2_qt",
+                                "w1_scale",
+                                "w2_scale",
+                                "topk_ids",
+                                "topk_weights",
+                            ],
+                            dtype,
+                            topk,
+                            ne,
+                            h,
+                            e,
+                            kn1,
+                            kn2,
                         ),
                         {},
                         None,

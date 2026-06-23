@@ -12,6 +12,7 @@ reduction's FP-reordering noise floor stays well under tolerance.
 
     python op_tests/test_mxfp4_moe_e192_chunk.py --tokens 512 --chunk 256
 """
+
 import argparse
 import torch
 from aiter import dtypes
@@ -32,21 +33,26 @@ KN2 = f"mxfp4_moe_g2_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_TOPK{TOPK}_BM32_ATOMIC"
 
 def make_weights(seed=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
+
     def u8(*s):
         return torch.randint(0, 256, s, dtype=torch.uint8, generator=g)
+
     # small e8m0 exponents -> small magnitudes -> tiny atomic noise floor
     def e8(*s):
         return torch.randint(118, 120, s, dtype=torch.uint8, generator=g)
+
     w1 = u8(NE, 2 * D_INTER, D_HIDDEN // 2)
     w1s = e8(NE, 2 * D_INTER, D_HIDDEN // 32)
-    w2 = u8(NE, D_HIDDEN, D_INTER // 2)      # K=192 (96 bytes); host pads to 256
+    w2 = u8(NE, D_HIDDEN, D_INTER // 2)  # K=192 (96 bytes); host pads to 256
     w2s = e8(NE, D_HIDDEN, D_INTER // 32)
     return w1, w2, w1s, w2s
 
 
 def make_routing(num_tokens, seed=1):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    topk_ids = torch.randint(0, NE - 1, (num_tokens, TOPK), dtype=torch.int32, generator=g)
+    topk_ids = torch.randint(
+        0, NE - 1, (num_tokens, TOPK), dtype=torch.int32, generator=g
+    )
     topk_ids[:, -1] = NE - 1
     topk_weight = torch.rand((num_tokens, TOPK), dtype=torch.float32, generator=g)
     return topk_ids, topk_weight
@@ -76,14 +82,35 @@ def run(hidden, topk_ids, topk_weight, w):
         moe_buf if moe_buf.numel() else torch.empty((M, D_HIDDEN), dtype=dtypes.bf16)
     )
     inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
-        hidden, w1, w2, sti, sei, nvi, None, TOPK,
-        block_m=BM, w1_scale=w1s, kernelName1=KN1,
-        m_indices=aux.m_indices, moe_buf=moe_buf,
+        hidden,
+        w1,
+        w2,
+        sti,
+        sei,
+        nvi,
+        None,
+        TOPK,
+        block_m=BM,
+        w1_scale=w1s,
+        kernelName1=KN1,
+        m_indices=aux.m_indices,
+        moe_buf=moe_buf,
     )
     return _mxfp4_a4w4_stage2_fw(
-        inter_q, w1, w2, sti, sei, nvi, moe_out, TOPK,
-        w2_scale=w2s, a2_scale=inter_s, block_m=BM,
-        sorted_weights=sw, kernelName2=KN2, reverse_sorted=aux.reverse_sorted,
+        inter_q,
+        w1,
+        w2,
+        sti,
+        sei,
+        nvi,
+        moe_out,
+        TOPK,
+        w2_scale=w2s,
+        a2_scale=inter_s,
+        block_m=BM,
+        sorted_weights=sw,
+        kernelName2=KN2,
+        reverse_sorted=aux.reverse_sorted,
     )
 
 
@@ -99,16 +126,23 @@ def main():
     print(f"E192: tokens={NT} chunk={CH} nchunks={NT // CH}")
 
     g = torch.Generator(device="cuda").manual_seed(2)
-    hidden = (torch.randn(NT, D_HIDDEN, dtype=torch.float32, generator=g) * 0.1).to(dtypes.bf16)
+    hidden = (torch.randn(NT, D_HIDDEN, dtype=torch.float32, generator=g) * 0.1).to(
+        dtypes.bf16
+    )
     topk_ids, topk_weight = make_routing(NT)
     w = make_weights()
 
     full = run(hidden, topk_ids, topk_weight, w)
     torch.cuda.synchronize()
-    chunks = [run(hidden[c * CH:(c + 1) * CH].contiguous(),
-                  topk_ids[c * CH:(c + 1) * CH].contiguous(),
-                  topk_weight[c * CH:(c + 1) * CH].contiguous(), w)
-              for c in range(NT // CH)]
+    chunks = [
+        run(
+            hidden[c * CH : (c + 1) * CH].contiguous(),
+            topk_ids[c * CH : (c + 1) * CH].contiguous(),
+            topk_weight[c * CH : (c + 1) * CH].contiguous(),
+            w,
+        )
+        for c in range(NT // CH)
+    ]
     chunked = torch.cat(chunks, dim=0)
     torch.cuda.synchronize()
 
@@ -116,9 +150,11 @@ def main():
     diff = (a - b).abs()
     bad = (diff > args.atol + args.rtol * b.abs()).any(dim=1)
     finite = bool(torch.isfinite(a).all() and torch.isfinite(b).all())
-    print(f"[E192 full vs chunk] mismatch rows={int(bad.sum())}/{NT} "
-          f"max|Δ|={diff.max().item():.4e} finite={finite} "
-          f"out_abs_mean={a.abs().mean().item():.4e}")
+    print(
+        f"[E192 full vs chunk] mismatch rows={int(bad.sum())}/{NT} "
+        f"max|Δ|={diff.max().item():.4e} finite={finite} "
+        f"out_abs_mean={a.abs().mean().item():.4e}"
+    )
     ok = int(bad.sum()) == 0 and finite and a.abs().mean().item() > 0
     print("RESULT:", "PASS ✅" if ok else "FAIL ❌")
     assert ok

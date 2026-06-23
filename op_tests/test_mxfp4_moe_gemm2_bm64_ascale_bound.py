@@ -46,34 +46,46 @@ print("[selfcheck] aiter pkg:", aiter.__file__)
 torch.set_default_device("cuda")
 
 NE = 385
-D_HIDDEN = 7168          # gemm2 N_OUT
-D_INTER = 512            # gemm2 K
+D_HIDDEN = 7168  # gemm2 N_OUT
+D_INTER = 512  # gemm2 K
 TOPK = 9
 KN = "mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_TOPK{tk}_BM{bm}_ATOMIC"
 
 
 def build(cumsum, M_logical, seed=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
+
     # fp4 nibbles forced NON-NEGATIVE (clear each nibble's sign bit, &0x77) so every
     # A*B product is >= 0: the per-token atomic sum has no cancellation, making it
     # order-insensitive (tiny FP noise) and the clipped-row signal unambiguous.
     def pos4(*s):
-        return (torch.randint(0, 256, s, dtype=torch.uint8, generator=g) & 0x77)
+        return torch.randint(0, 256, s, dtype=torch.uint8, generator=g) & 0x77
+
     def e8(*s):
         return torch.randint(126, 130, s, dtype=torch.uint8, generator=g)  # tame e8m0
+
     # gemm2 A_q (inter) and its 32-row-chunk e8m0 scale. Scale is over-allocated so
     # the DATA exists for every row — only the kernel's rsrc bound gates the read.
     inter_q = pos4(cumsum, D_INTER // 2)
-    inter_s = e8(cumsum, 512)                       # >> (cumsum/32)*kAS_per_chunk_dw*4 bytes
+    inter_s = e8(cumsum, 512)  # >> (cumsum/32)*kAS_per_chunk_dw*4 bytes
     w2 = pos4(NE, D_HIDDEN, D_INTER // 2)
     w2s = e8(NE, D_HIDDEN, D_INTER // 32)
     tok = torch.randint(0, M_logical, (cumsum,), dtype=torch.int32, generator=g)
     wts = torch.rand((cumsum,), dtype=torch.float32, generator=g)
     eid64 = torch.randint(0, NE, (cumsum // 64,), dtype=torch.int32, generator=g)
-    eid32 = eid64.repeat_interleave(2)             # per-row expert identical to BM=64
+    eid32 = eid64.repeat_interleave(2)  # per-row expert identical to BM=64
     cs = torch.tensor([cumsum], dtype=torch.int32)
-    return dict(inter_q=inter_q, inter_s=inter_s, w2=w2, w2s=w2s, tok=tok,
-                wts=wts, eid32=eid32, eid64=eid64, cs=cs)
+    return dict(
+        inter_q=inter_q,
+        inter_s=inter_s,
+        w2=w2,
+        w2s=w2s,
+        tok=tok,
+        wts=wts,
+        eid32=eid32,
+        eid64=eid64,
+        cs=cs,
+    )
 
 
 def run(d, bm, M_logical, cumsum):
@@ -110,9 +122,9 @@ def main():
     print(f"M_logical={M}  cumsum={C}  (BM=64 buggy bound clips rows >= ~max_sorted/2)")
 
     d = build(C, M)
-    ref_a = run(d, 32, M, C)     # correct reference
-    ref_b = run(d, 32, M, C)     # atomic-noise floor
-    test = run(d, 64, M, C)      # the bound under test
+    ref_a = run(d, 32, M, C)  # correct reference
+    ref_b = run(d, 32, M, C)  # atomic-noise floor
+    test = run(d, 64, M, C)  # the bound under test
     torch.cuda.synchronize()
 
     def bad(a, b):
@@ -124,17 +136,27 @@ def main():
     real = diff & ~noise
     di = (ref_a.float() - test.float()).abs()
     print(f"[BM32 vs BM32 noise] rows={int(noise.sum())}/{M}")
-    print(f"[BM32 vs BM64      ] rows={int(diff.sum())}/{M}  max|Δ|={di.max().item():.4e}")
+    print(
+        f"[BM32 vs BM64      ] rows={int(diff.sum())}/{M}  max|Δ|={di.max().item():.4e}"
+    )
     print(f"[REAL breaks (BM32 deterministic, yet != BM64)] = {int(real.sum())}/{M}")
     ok = int(real.sum()) == 0
     if not ok:
         idx = real.nonzero().flatten()[:8].tolist()
         r0 = idx[0]
         print(f"    rows: {idx}")
-        print(f"    e.g. token {r0}: |bm32|={ref_a.float()[r0].abs().mean():.3e} "
-              f"|bm64|={test.float()[r0].abs().mean():.3e} (collapsed if ~0)")
-    print("RESULT:", "PASS ✅ (BM64 A_scale bound matches BM32)"
-          if ok else "FAIL ❌ (BM64 rows collapse → A_scale bound too small)")
+        print(
+            f"    e.g. token {r0}: |bm32|={ref_a.float()[r0].abs().mean():.3e} "
+            f"|bm64|={test.float()[r0].abs().mean():.3e} (collapsed if ~0)"
+        )
+    print(
+        "RESULT:",
+        (
+            "PASS ✅ (BM64 A_scale bound matches BM32)"
+            if ok
+            else "FAIL ❌ (BM64 rows collapse → A_scale bound too small)"
+        ),
+    )
     raise SystemExit(0 if ok else 1)
 
 

@@ -324,8 +324,10 @@ def test_flydsl_gemm2_parametrized_k_numeric(D_INTER):
     # sort (KIMI shape -> HIP threestage sort)
     active = min(NE, M * TOPK)
     max_sorted = ((M * TOPK + active * (BM - 1) + BM - 1) // BM) * BM
+
     def eb():
         return torch.empty((0,), device=device, dtype=dtypes.bf16)
+
     sti = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
     sei = torch.empty((max_sorted // BM,), device=device, dtype=dtypes.i32)
     cumsum = torch.empty((2,), device=device, dtype=dtypes.i32)

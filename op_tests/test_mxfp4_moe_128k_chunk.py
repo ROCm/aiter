@@ -63,11 +63,13 @@ def make_weights(seed=0):
     """Random a4w4 weights + e8m0 scales, sized to exactly meet the kernels'
     buffer-resource byte bounds (B_q: NE*N_OUT*K/2 ; B_scale: per-expert e8m0)."""
     g = torch.Generator(device="cuda").manual_seed(seed)
+
     def u8(*s):
         return torch.randint(0, 256, s, dtype=torch.uint8, generator=g)
 
     def e8(*s):
         return torch.randint(126, 130, s, dtype=torch.uint8, generator=g)
+
     # gemm1: w12 = [E, 2*D_INTER, D_HIDDEN] mxfp4 (2 nibbles/byte) + e8m0 (1/32 along K)
     w1 = u8(NE, 2 * D_INTER, D_HIDDEN // 2)
     w1s = e8(NE, 2 * D_INTER, D_HIDDEN // 32)
@@ -81,7 +83,9 @@ def make_routing(num_tokens, seed=1):
     """Per-token routing, precomputed once and sliced so full & chunked are identical.
     Column TOPK-1 is pinned to the shared expert (NE-1), mirroring real usage."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    topk_ids = torch.randint(0, NE - 1, (num_tokens, TOPK), dtype=torch.int32, generator=g)
+    topk_ids = torch.randint(
+        0, NE - 1, (num_tokens, TOPK), dtype=torch.int32, generator=g
+    )
     topk_ids[:, -1] = NE - 1  # shared expert
     topk_weight = torch.rand((num_tokens, TOPK), dtype=torch.float32, generator=g)
     return topk_ids, topk_weight
@@ -110,14 +114,35 @@ def run(hidden, topk_ids, topk_weight, w):
         moe_buf if moe_buf.numel() else torch.empty((M, D_HIDDEN), dtype=dtypes.bf16)
     )
     inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
-        hidden, w1, w2, sti, sei, nvi, None, TOPK,
-        block_m=BM, w1_scale=w1s, kernelName1=KN1,
-        m_indices=aux.m_indices, moe_buf=moe_buf,
+        hidden,
+        w1,
+        w2,
+        sti,
+        sei,
+        nvi,
+        None,
+        TOPK,
+        block_m=BM,
+        w1_scale=w1s,
+        kernelName1=KN1,
+        m_indices=aux.m_indices,
+        moe_buf=moe_buf,
     )
     return _mxfp4_a4w4_stage2_fw(
-        inter_q, w1, w2, sti, sei, nvi, moe_out, TOPK,
-        w2_scale=w2s, a2_scale=inter_s, block_m=BM,
-        sorted_weights=sw, kernelName2=KN2, reverse_sorted=aux.reverse_sorted,
+        inter_q,
+        w1,
+        w2,
+        sti,
+        sei,
+        nvi,
+        moe_out,
+        TOPK,
+        w2_scale=w2s,
+        a2_scale=inter_s,
+        block_m=BM,
+        sorted_weights=sw,
+        kernelName2=KN2,
+        reverse_sorted=aux.reverse_sorted,
     )
 
 
@@ -127,19 +152,27 @@ def main():
     ap.add_argument("--chunk", type=int, default=8 * 1024)
     ap.add_argument("--atol", type=float, default=1e-2)
     ap.add_argument("--rtol", type=float, default=1e-2)
-    ap.add_argument("--noise-reps", type=int, default=4,
-                    help="full-run repeats used to estimate the FP-nondeterminism "
-                         "noise floor (a single sample misses sporadically-"
-                         "nondeterministic cancellation rows)")
+    ap.add_argument(
+        "--noise-reps",
+        type=int,
+        default=4,
+        help="full-run repeats used to estimate the FP-nondeterminism "
+        "noise floor (a single sample misses sporadically-"
+        "nondeterministic cancellation rows)",
+    )
     args = ap.parse_args()
     NT, CH = args.tokens, args.chunk
     assert NT % CH == 0, f"--tokens ({NT}) must be a multiple of --chunk ({CH})"
     nchunks = NT // CH
-    print(f"tokens={NT}  chunk={CH}  nchunks={nchunks}  "
-          f"(full max_sorted≈{NT*TOPK//1000}k rows vs chunk≈{CH*TOPK//1000}k)")
+    print(
+        f"tokens={NT}  chunk={CH}  nchunks={nchunks}  "
+        f"(full max_sorted≈{NT*TOPK//1000}k rows vs chunk≈{CH*TOPK//1000}k)"
+    )
 
     g = torch.Generator(device="cuda").manual_seed(2)
-    hidden = (torch.randn(NT, D_HIDDEN, dtype=torch.float32, generator=g) * 0.1).to(dtypes.bf16)
+    hidden = (torch.randn(NT, D_HIDDEN, dtype=torch.float32, generator=g) * 0.1).to(
+        dtypes.bf16
+    )
     topk_ids, topk_weight = make_routing(NT)
     w = make_weights()
 
@@ -151,9 +184,14 @@ def main():
     chunks = []
     for c in range(nchunks):
         sl = slice(c * CH, (c + 1) * CH)
-        chunks.append(run(hidden[sl].contiguous(),
-                          topk_ids[sl].contiguous(),
-                          topk_weight[sl].contiguous(), w))
+        chunks.append(
+            run(
+                hidden[sl].contiguous(),
+                topk_ids[sl].contiguous(),
+                topk_weight[sl].contiguous(),
+                w,
+            )
+        )
     chunked = torch.cat(chunks, dim=0)
     torch.cuda.synchronize()
 
@@ -175,22 +213,36 @@ def main():
 
     tol_rows = max(64, NT // 1000)  # 0.1% of rows; bug is ~50%, noise is <0.1‰
     n_real = int(real.sum())
-    print(f"[determinism full vs full ] noise rows={int(noise.sum())}/{NT}  "
-          f"max|Δ|={dn_max:.4e}  (union over {args.noise_reps} re-runs)")
-    print(f"[invariance  full vs chunk] mismatch rows={int(inv.sum())}/{NT}  "
-          f"max|Δ|={di.max().item():.4e}")
-    print(f"[REAL size-dependent breaks (deterministic rows only)] = {n_real}/{NT}  "
-          f"(tolerance {tol_rows}; max_sorted bug ⇒ ~{NT // 2})")
+    print(
+        f"[determinism full vs full ] noise rows={int(noise.sum())}/{NT}  "
+        f"max|Δ|={dn_max:.4e}  (union over {args.noise_reps} re-runs)"
+    )
+    print(
+        f"[invariance  full vs chunk] mismatch rows={int(inv.sum())}/{NT}  "
+        f"max|Δ|={di.max().item():.4e}"
+    )
+    print(
+        f"[REAL size-dependent breaks (deterministic rows only)] = {n_real}/{NT}  "
+        f"(tolerance {tol_rows}; max_sorted bug ⇒ ~{NT // 2})"
+    )
     if n_real:
         idx = real.nonzero().flatten()[:8].tolist()
         r0 = idx[0]
         col = di[r0].argmax().item()
         print(f"    rows: {idx}")
-        print(f"    e.g. row {r0} col {col}: full={full.float()[r0,col].item():.4e} "
-              f"chunked={chunked.float()[r0,col].item():.4e}")
+        print(
+            f"    e.g. row {r0} col {col}: full={full.float()[r0,col].item():.4e} "
+            f"chunked={chunked.float()[r0,col].item():.4e}"
+        )
     ok = n_real <= tol_rows
-    print("RESULT:", "PASS ✅ (chunk-invariant modulo kernel FP nondeterminism)"
-          if ok else "FAIL ❌ (bug-scale size-dependent divergence)")
+    print(
+        "RESULT:",
+        (
+            "PASS ✅ (chunk-invariant modulo kernel FP nondeterminism)"
+            if ok
+            else "FAIL ❌ (bug-scale size-dependent divergence)"
+        ),
+    )
     raise SystemExit(0 if ok else 1)
 
 

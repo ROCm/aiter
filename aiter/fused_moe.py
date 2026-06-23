@@ -56,6 +56,7 @@ def _log_mxfp4_backend_once(backend: str):
         _MXFP4_BACKEND_LOGGED.add(backend)
         logger.info(f"[fused_moe] mxfp4 a4w4 MoE gemm backend = {backend}")
 
+
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
@@ -94,6 +95,7 @@ def _moe_prepare_mxfp4_passthrough(topk_ids, topk_weights):
     # mxfp4_moe_run reads only topk_ids/weights; alias topk_ids into unused slots.
     return topk_ids, topk_weights, topk_ids, topk_ids, topk_ids
 
+
 @functools.lru_cache(maxsize=1)
 def _mxfp4_sort_shapes():
     try:
@@ -125,8 +127,14 @@ def _hip_sort_supported_shape(num_experts, topk, block_size, model_dim):
 
 
 def _use_hip_sort(
-    num_experts, topk, block_size, model_dim, dispatch_policy, expert_mask,
-    return_local_topk_ids, accumulate,
+    num_experts,
+    topk,
+    block_size,
+    model_dim,
+    dispatch_policy,
+    expert_mask,
+    return_local_topk_ids,
+    accumulate,
 ):
     if _MOE_SORT_BACKEND in ("opus", "ck"):
         return False
@@ -231,16 +239,36 @@ def _moe_sorting_impl(
 
     if fused_sort:
         return _hip_moe_sort(
-            topk_ids, topk_weights, num_experts, topk, block_size, model_dim,
-            atomic=accumulate, emit_aux=True, moebuf_dtype=moebuf_dtype,
+            topk_ids,
+            topk_weights,
+            num_experts,
+            topk,
+            block_size,
+            model_dim,
+            atomic=accumulate,
+            emit_aux=True,
+            moebuf_dtype=moebuf_dtype,
         )
     if _use_hip_sort(
-        num_experts, topk, block_size, model_dim, dispatch_policy, expert_mask,
-        return_local_topk_ids, accumulate,
+        num_experts,
+        topk,
+        block_size,
+        model_dim,
+        dispatch_policy,
+        expert_mask,
+        return_local_topk_ids,
+        accumulate,
     ):
         return _hip_moe_sort(
-            topk_ids, topk_weights, num_experts, topk, block_size, model_dim,
-            atomic=accumulate, emit_aux=False, moebuf_dtype=moebuf_dtype,
+            topk_ids,
+            topk_weights,
+            num_experts,
+            topk,
+            block_size,
+            model_dim,
+            atomic=accumulate,
+            emit_aux=False,
+            moebuf_dtype=moebuf_dtype,
         )
 
     # -- Opus / CK standard path --
@@ -1304,10 +1332,12 @@ def _tokenize_mxfp4_kname(kname: str, prefix: str, flag_tokens: set) -> dict:
     """
     kname = (kname or "").replace("_FLYDSL", "")
     if not kname.startswith(prefix):
-        raise ValueError(f"bad mxfp4 kernel name: {kname!r} (expected prefix {prefix!r})")
+        raise ValueError(
+            f"bad mxfp4 kernel name: {kname!r} (expected prefix {prefix!r})"
+        )
     nums: dict = {}
     flags: set = set()
-    for tok in kname[len(prefix):].split("_"):
+    for tok in kname[len(prefix) :].split("_"):
         if not tok:
             continue
         if tok in flag_tokens:
@@ -1322,9 +1352,7 @@ def _tokenize_mxfp4_kname(kname: str, prefix: str, flag_tokens: set) -> dict:
 
 
 def _parse_mxfp4_g1_kname(kname: str) -> dict:
-    parsed = _tokenize_mxfp4_kname(
-        kname, "mxfp4_moe_g1_a4w4_", _MXFP4_G1_FLAG_TOKENS
-    )
+    parsed = _tokenize_mxfp4_kname(kname, "mxfp4_moe_g1_a4w4_", _MXFP4_G1_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
     inline_quant = "INLINEQUANT" in flags
     if inline_quant:
@@ -1345,9 +1373,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
 
 
 def _parse_mxfp4_g2_kname(kname: str) -> dict:
-    parsed = _tokenize_mxfp4_kname(
-        kname, "mxfp4_moe_g2_a4w4_", _MXFP4_G2_FLAG_TOKENS
-    )
+    parsed = _tokenize_mxfp4_kname(kname, "mxfp4_moe_g2_a4w4_", _MXFP4_G2_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
     atomic = "ATOMIC" in flags
     mxfp4out = "MXFP4OUT" in flags
@@ -1454,9 +1480,7 @@ def _mxfp4_a4w4_stage1(
     inter_cols = D_INTER // 2
     inter_scale_cols = D_INTER // 32
     inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
-    inter_sorted_quant = _ia(
-        (max_sorted, inter_cols), device=device, dtype=torch.uint8
-    )
+    inter_sorted_quant = _ia((max_sorted, inter_cols), device=device, dtype=torch.uint8)
     inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
     inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
     inter_sorted_shuffled_scale = _ia(

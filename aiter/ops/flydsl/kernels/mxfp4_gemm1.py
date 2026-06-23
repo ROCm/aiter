@@ -648,12 +648,16 @@ def _gemm1_body(
         # stage 2: DPP quad-reduce, INTERLEAVED across rows (hide DPP latency)
         a = [fx.Int32(_raw(la[i])) for i in range_constexpr(n)]
         s1 = [
-            fx.Int32(dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0xB1, 0xF, 0xF, True))
+            fx.Int32(
+                dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0xB1, 0xF, 0xF, True)
+            )
             for i in range_constexpr(n)
         ]
         a = [_umax_i32(a[i], s1[i]) for i in range_constexpr(n)]
         s2 = [
-            fx.Int32(dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0x4E, 0xF, 0xF, True))
+            fx.Int32(
+                dpp_utils.update_dpp_i32(_raw(a[i]), _raw(a[i]), 0x4E, 0xF, 0xF, True)
+            )
             for i in range_constexpr(n)
         ]
         a = [_umax_i32(a[i], s2[i]) for i in range_constexpr(n)]
@@ -662,9 +666,7 @@ def _gemm1_body(
         # stage 4: cvt pack + LDS store + scale fold per row
         for i in range_constexpr(n):
             B128_IDX, SUB, _hv = specs[i]
-            qs_raw = _raw(
-                fx.Float32(_raw(e8[i] << fx.Int32(23)).bitcast(T.f32))
-            )
+            qs_raw = _raw(fx.Float32(_raw(e8[i] << fx.Int32(23)).bitcast(T.f32)))
             pk = _raw(fx.Int32(0))
             for j in range_constexpr(4):
                 src_bf16x2 = _raw(

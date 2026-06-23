@@ -16,9 +16,9 @@ from pathlib import Path
 # ── Supported shape tuples ─────────────────────────────────────────────────
 # (NE, D_HIDDEN, D_INTER, TOPK)
 SHAPES = [
-    (385,  7168,      512,      9),  # Kimi-K2.5 TP=4
-    (257,  7168,      512,      9),  # DSR
-    (385,  7168,      192,      9),  # Kimi-K2.5 TP=4, D_INTER=192
+    (385, 7168, 512, 9),  # Kimi-K2.5 TP=4
+    (257, 7168, 512, 9),  # DSR
+    (385, 7168, 192, 9),  # Kimi-K2.5 TP=4, D_INTER=192
 ]
 
 
@@ -72,10 +72,10 @@ extern "C" void {fn_name}(
 }}
 """
 
-AUX_INC_SORT_QUANT  = '#include "moe_aux/moe_sort_quant.cuh"'
-AUX_INC_3STAGE      = '#include "moe_aux/moe_3stage_sort.cuh"'
+AUX_INC_SORT_QUANT = '#include "moe_aux/moe_sort_quant.cuh"'
+AUX_INC_3STAGE = '#include "moe_aux/moe_3stage_sort.cuh"'
 AUX_INC_SORT_SCALES = '#include "moe_aux/moe_sort_scales.cuh"'
-AUX_INC_SCATTER     = '#include "moe_aux/moe_scatter_reduce.cuh"'
+AUX_INC_SCATTER = '#include "moe_aux/moe_scatter_reduce.cuh"'
 
 AUX_SORT_QUANT_PARAMS = """    int            M,
     const void*    a_input,
@@ -263,48 +263,66 @@ class mxfp4_moe_aux_codegen:
             for mb in (32,):
                 yield Instance(
                     f"aux_sort_quant_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
-                    "SortQuantFn", AUX_INC_SORT_QUANT, AUX_SORT_QUANT_PARAMS,
-                    _aux_sort_quant_body(ne, topk, mb, h))
+                    "SortQuantFn",
+                    AUX_INC_SORT_QUANT,
+                    AUX_SORT_QUANT_PARAMS,
+                    _aux_sort_quant_body(ne, topk, mb, h),
+                )
 
         # sort (threestage): MB in {32, 128}
         for ne, h, e, topk in SHAPES:
             for mb in (32, 128):
                 yield Instance(
                     f"aux_sort3s_NE{ne}_TOPK{topk}_MB{mb}",
-                    "Sort3StageFn", AUX_INC_3STAGE, AUX_3STAGE_PARAMS,
-                    _aux_3stage_body(ne, topk, mb))
+                    "Sort3StageFn",
+                    AUX_INC_3STAGE,
+                    AUX_3STAGE_PARAMS,
+                    _aux_3stage_body(ne, topk, mb),
+                )
 
         # sort (inline_quant + zero_init): MB=16
         for ne, h, e, topk in SHAPES:
             for mb in (16,):
                 yield Instance(
                     f"aux_sortzi_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
-                    "SortOnlyZiFn", AUX_INC_SORT_QUANT, AUX_SORT_ONLY_ZI_PARAMS,
-                    _aux_sort_only_zi_body(ne, topk, mb, h))
+                    "SortOnlyZiFn",
+                    AUX_INC_SORT_QUANT,
+                    AUX_SORT_ONLY_ZI_PARAMS,
+                    _aux_sort_only_zi_body(ne, topk, mb, h),
+                )
 
         # sort (inline_quant): MB=16
         for ne, h, e, topk in SHAPES:
             for mb in (16,):
                 yield Instance(
                     f"aux_sortonly_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
-                    "SortOnlyFn", AUX_INC_SORT_QUANT, AUX_SORT_ONLY_PARAMS,
-                    _aux_sort_only_body(ne, topk, mb, h))
+                    "SortOnlyFn",
+                    AUX_INC_SORT_QUANT,
+                    AUX_SORT_ONLY_PARAMS,
+                    _aux_sort_only_body(ne, topk, mb, h),
+                )
 
         # quant: MB in {32, 128}
         for ne, h, e, topk in SHAPES:
             for mb in (32, 128):
                 yield Instance(
                     f"aux_quant_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
-                    "QuantFn", AUX_INC_SORT_QUANT, AUX_QUANT_PARAMS,
-                    _aux_quant_body(ne, topk, mb, h))
+                    "QuantFn",
+                    AUX_INC_SORT_QUANT,
+                    AUX_QUANT_PARAMS,
+                    _aux_quant_body(ne, topk, mb, h),
+                )
 
         # sort_scales: BM in {32, 128} (MB=16 callers clamp to BM=32)
         for ne, h, e, topk in SHAPES:
             for bm in (32, 128):
                 yield Instance(
                     f"aux_sortscales_BM{bm}_NE{ne}_E{e}_H{h}",
-                    "SortScalesFn", AUX_INC_SORT_SCALES, AUX_SORT_SCALES_PARAMS,
-                    _aux_sort_scales_body(bm, ne, e, h))
+                    "SortScalesFn",
+                    AUX_INC_SORT_SCALES,
+                    AUX_SORT_SCALES_PARAMS,
+                    _aux_sort_scales_body(bm, ne, e, h),
+                )
 
         # scatter_reduce / scatter_reduce_q: keyed by (D_HIDDEN, TOPK, NT) only,
         # so dedup across shapes that share an (h, topk).
@@ -312,12 +330,18 @@ class mxfp4_moe_aux_codegen:
             for nt in (False, True):
                 yield Instance(
                     f"aux_scatter_H{h}_TOPK{topk}_NT{1 if nt else 0}",
-                    "ScatterReduceFn", AUX_INC_SCATTER, AUX_SCATTER_PARAMS,
-                    _aux_scatter_body(h, topk, nt))
+                    "ScatterReduceFn",
+                    AUX_INC_SCATTER,
+                    AUX_SCATTER_PARAMS,
+                    _aux_scatter_body(h, topk, nt),
+                )
                 yield Instance(
                     f"aux_scatterq_H{h}_TOPK{topk}_NT{1 if nt else 0}",
-                    "ScatterReduceQFn", AUX_INC_SCATTER, AUX_SCATTER_Q_PARAMS,
-                    _aux_scatter_q_body(h, topk, nt))
+                    "ScatterReduceQFn",
+                    AUX_INC_SCATTER,
+                    AUX_SCATTER_Q_PARAMS,
+                    _aux_scatter_q_body(h, topk, nt),
+                )
 
     def gen_instances(self, instances):
         inst_dir = self.working_path / "instances"
@@ -333,20 +357,22 @@ class mxfp4_moe_aux_codegen:
 
     # fn_type -> lookup-table macro name (one table per aux entry).
     _MACRO = {
-        "SortQuantFn":      "GENERATE_AUX_SORT_QUANT_LOOKUP_TABLE",
-        "Sort3StageFn":     "GENERATE_AUX_SORT3STAGE_LOOKUP_TABLE",
-        "SortOnlyZiFn":     "GENERATE_AUX_SORT_ONLY_ZI_LOOKUP_TABLE",
-        "SortOnlyFn":       "GENERATE_AUX_SORT_ONLY_LOOKUP_TABLE",
-        "QuantFn":          "GENERATE_AUX_QUANT_LOOKUP_TABLE",
-        "SortScalesFn":     "GENERATE_AUX_SORT_SCALES_LOOKUP_TABLE",
-        "ScatterReduceFn":  "GENERATE_AUX_SCATTER_REDUCE_LOOKUP_TABLE",
+        "SortQuantFn": "GENERATE_AUX_SORT_QUANT_LOOKUP_TABLE",
+        "Sort3StageFn": "GENERATE_AUX_SORT3STAGE_LOOKUP_TABLE",
+        "SortOnlyZiFn": "GENERATE_AUX_SORT_ONLY_ZI_LOOKUP_TABLE",
+        "SortOnlyFn": "GENERATE_AUX_SORT_ONLY_LOOKUP_TABLE",
+        "QuantFn": "GENERATE_AUX_QUANT_LOOKUP_TABLE",
+        "SortScalesFn": "GENERATE_AUX_SORT_SCALES_LOOKUP_TABLE",
+        "ScatterReduceFn": "GENERATE_AUX_SCATTER_REDUCE_LOOKUP_TABLE",
         "ScatterReduceQFn": "GENERATE_AUX_SCATTER_REDUCE_Q_LOOKUP_TABLE",
     }
 
     @staticmethod
     def _decl_extern_c(inst):
-        return (f'extern "C" void {inst.name}(\n'
-                f'    hipStream_t stream,\n{inst.params});')
+        return (
+            f'extern "C" void {inst.name}(\n'
+            f"    hipStream_t stream,\n{inst.params});"
+        )
 
     @staticmethod
     def _emit_map(out, macro, names):
@@ -382,14 +408,19 @@ class mxfp4_moe_aux_codegen:
         insts = list(self.enumerate_instances())
         self.gen_instances(insts)
         self.gen_lookup(insts)
-        print(f"mxfp4_moe aux codegen: {len(insts)} instances under "
-              f"{self.working_path}/instances/")
+        print(
+            f"mxfp4_moe aux codegen: {len(insts)} instances under "
+            f"{self.working_path}/instances/"
+        )
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--working_path", required=True,
-                    help="output dir for generated instances + lookup header")
+    ap.add_argument(
+        "--working_path",
+        required=True,
+        help="output dir for generated instances + lookup header",
+    )
     args = ap.parse_args()
     mxfp4_moe_aux_codegen(args.working_path).run()
 
