@@ -202,7 +202,7 @@ jobs:
     name: ${{ matrix.job_name }}
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         include: ${{ fromJson(needs.load-atom-models.outputs.models_json) }}
     runs-on: ${{ matrix.runner }}
