@@ -370,12 +370,25 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
     num_buffers = 3
 
-    block_n = 128
-    block_k = 512
-    num_warps = 4
-
     l2_prefetch_distance = 2
     x_scales_tdm = False
+
+    if block_m == 16:
+        block_n = 128
+        block_k = 512
+        num_warps = 4
+    elif block_m == 32:
+        block_k = 512
+        if n <= 1024:
+            block_n = 128
+            num_warps = 4
+        else:
+            block_n = 256
+            num_warps = 4
+    else:
+        block_n = 256
+        block_k = 256
+        num_warps = 4
 
     ret = {
         "block_m": block_m,
