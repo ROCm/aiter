@@ -557,12 +557,6 @@ def _verify_reference(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shap
     weaker check, and Triton (when present) is marked ``REF`` since it can't be
     graded against itself.
 
-    For the mixed ``fn/fnuz`` dtype combo, FlyDSL's gfx942 MFMA reinterprets
-    the FN Q bits as FNUZ (different value mapping). The torch reference is
-    rebuilt with the FNUZ-reinterpreted Q so it grades what the MFMA actually
-    computes.  Triton impls are graded against the original (FN-correct)
-    reference if they manage to run.
-
     Returns {impl_name: "PASS"|"FAIL"|"SKIP"|"PASS*"|"FAIL*"|"REF"|"OOM"|"ERR"}.
     """
     from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
@@ -570,13 +564,6 @@ def _verify_reference(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shap
         ref_fp8_mqa_logits,
     )
 
-    # Detect whether we need a separate FNUZ-reinterpreted reference for FlyDSL
-    # impls. This is the case when Q was cast to FN but the MFMA reads it as
-    # FNUZ (mixed fn/fnuz combo on gfx942).
-    combo = getattr(shape, "dtype_combo", "fnuz/fnuz")
-    need_reinterp_ref = (combo == "fn/fnuz" and q_fp8.dtype == torch.float8_e4m3fn)
-
-    # Build the standard reference from the bf16 q/kv (matches fnuz/fnuz).
     ref_is_triton = False
     ref = None
     try:
@@ -604,25 +591,6 @@ def _verify_reference(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shap
                 torch.cuda.empty_cache()
                 return {name: "OOM" for name in impls}
 
-    # Build the FNUZ-reinterpreted reference for FlyDSL: view the FN Q bytes as
-    # FNUZ, upcast to bf16, and rerun the torch ref with those values.
-    #
-    # Bit pattern 0x80 is -0.0 in FN but NaN in FNUZ. The gfx942 MFMA hardware
-    # with fast-math treats NaN operands as zero during accumulation, so we
-    # replace those NaN values with 0.0 in the reference to match HW behavior.
-    ref_reinterp = None
-    if need_reinterp_ref and ref is not None:
-        q_as_fnuz = q_fp8.view(torch.float8_e4m3fnuz).to(torch.bfloat16)
-        q_as_fnuz = q_as_fnuz.nan_to_num(nan=0.0)
-        try:
-            ref_reinterp, _ = ref_fp8_mqa_logits(
-                q=q_as_fnuz, kv=kv, weights=weights,
-                cu_seqlen_ks=ks, cu_seqlen_ke=ke
-            )
-        except torch.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            # Fall through: FlyDSL impls will get "OOM" for verify.
-
     suffix = "*" if ref_is_triton else ""
     status = {}
     for name, fn in impls.items():
@@ -641,31 +609,9 @@ def _verify_reference(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shap
             status[name] = "ERR"
             continue
 
-        # Pick the right reference: FlyDSL impls on a mixed-dtype combo use the
-        # FNUZ-reinterpreted Q reference; everything else uses the standard one.
-        use_ref = ref
-        reinterp = False
-        if need_reinterp_ref and _is_flydsl_impl(name):
-            if ref_reinterp is not None:
-                use_ref = ref_reinterp
-                reinterp = True
-            else:
-                status[name] = "OOM"
-                continue
-        m = (use_ref == float("-inf")) | (out == float("-inf"))
-        diff = calc_diff(out.masked_fill(m, 0), use_ref.masked_fill(m, 0))
-        if reinterp:
-            # The FN->FNUZ bit reinterpretation introduces ~3% systematic
-            # error (different exponent bias, NaN/zero encoding). Report the
-            # actual calc_diff so the user can judge; use a relaxed threshold
-            # since the error is inherent to the dtype remapping, not the
-            # kernel.  Suffix with "~" to flag the reinterpreted comparison.
-            if diff < 0.05:
-                status[name] = f"PASS~({diff:.4f})"
-            else:
-                status[name] = f"FAIL~({diff:.4f})"
-        else:
-            status[name] = ("PASS" if diff < 1e-3 else "FAIL") + suffix
+        m = (ref == float("-inf")) | (out == float("-inf"))
+        diff = calc_diff(out.masked_fill(m, 0), ref.masked_fill(m, 0))
+        status[name] = ("PASS" if diff < 1e-3 else "FAIL") + suffix
     return status
 
 

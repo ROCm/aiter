@@ -621,6 +621,24 @@ def flydsl_fp8_mqa_logits(
     cu_starts = cu_starts.reshape(seq_len)
     cu_ends = cu_ends.reshape(seq_len)
 
+    # A naive value-cast FN -> FNUZ would saturate any |x|>240.
+    # Instead, we halve before the cast: scaling by 0.5 only decrements the
+    # exponent, so the result is <= 224 < 240 — no saturation, no precision loss.
+    # The logit is linear in Q·K (ReLU is positive-homogeneous), so we undo the
+    # factor(s) by scaling kv_scales accordingly.
+    _fnuz = torch.float8_e4m3fnuz
+    scale_mul = 1.0
+    if Q.dtype != _fnuz:
+        assert Q.dtype == torch.float8_e4m3fn, f"Q must be e4m3fn, got {Q.dtype}"
+        Q = (Q.to(torch.float32) * 0.5).to(_fnuz)
+        scale_mul *= 2.0
+    if KV.dtype != _fnuz:
+        assert KV.dtype == torch.float8_e4m3fn, f"KV must be e4m3fn, got {KV.dtype}"
+        KV = (KV.to(torch.float32) * 0.5).to(_fnuz)
+        scale_mul *= 2.0
+    if scale_mul != 1.0:
+        kv_scales = kv_scales.to(torch.float32) * scale_mul
+
     variant = _resolve_variant(variant)
     launcher = compile_fp8_mqa_logits(
         num_heads=num_heads,
