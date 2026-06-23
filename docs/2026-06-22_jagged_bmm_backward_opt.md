@@ -161,11 +161,71 @@ used a MAC count without the ×2; numbers here use the harness `2·L·K·N` conv
 
 ---
 
+## EXP-2026-06-23b — Required production shapes B=1024, D=256/512
+
+**Mapping the request onto the kernels.** "B" = `n_groups` (number of jagged
+groups/sequences); "D" = the dense-weight feature/head dimension, which in these
+kernels is `K == N` (per-group `Dense[b]` is `(K, N)`, jagged is `(L, K)`, dOut is
+`(L, N)`). `D` is a **compile-time constant** (`N`, `K` in `jagged_dense_bmm.py`),
+so to benchmark D∈{256,512} I temporarily set `K=N=D`, ran, and reverted with git
+(net-zero source change). Seq length was **not** specified in the request, so I used
+`max_seq_len=512` (the established baseline) for both `uniform` and `skew`; `L` is
+D-independent (uniform `L=524288`, skew `L=79790`). Numbers are `--mode bench`
+wall-clock (warmup 10/iters 50; fewer for slow `ddense`), TF/s = `2·L·K·N / t`.
+
+### Results (B=1024, m=512; bench wall-clock)
+| grad | regime | D=256 µs/iter | D=256 TF/s | D=512 µs/iter | D=512 TF/s |
+|---|---|--:|--:|--:|--:|
+| `grad_jagged` (GEMM, MFMA) | uniform | 389.1 | **176.6** | 1169.0 | **235.1** |
+| `grad_jagged` | skew | 157.8 | 66.3 | 564.2 | 74.1 |
+| `grad_bias` (partials+reduce) | uniform | 104.0 | 1.29 | — | **FAILS** |
+| `grad_bias` | skew | 65.0 | 0.31 | — | **FAILS** |
+| `grad_dense` (partials+reduce) | uniform | 5396.1 | 12.7 | — | **FAILS** |
+| `grad_dense` | skew | 2305.0 | 4.54 | — | **FAILS** |
+
+(Empirical ceilings, this box: bf16 MFMA **479 TF/s**, HBM **4.21 TB/s**. So
+`grad_jagged` reaches ~37% of the MFMA roofline at D=256 uniform and **~49% at
+D=512 uniform** — it scales up nicely with D and the GPU-filling B=1024.
+`grad_bias` is memory-bound (D=256 uniform 2668 GB/s ≈ 63% of HBM).)
+
+### What works and what doesn't at these shapes
+- **D=256: all three gradients run.** `grad_jagged` is healthy (MFMA, 177→235
+  TF/s). `grad_dense` runs but is **catastrophically slow (12.7 TF/s, 5.4 ms)** and
+  the same flat ~13 TF/s seen in Phase 0 — *worse* now because its per-thread
+  accumulator is `(K/16)·(N/16) = 16·16 = 256` fp32 regs/thread at D=256 (vs 64 at
+  D=128), so it heavily **spills VGPRs**; its LDS is `2·64·256·2 = 64 KB` (right at
+  the MI300 limit). This is the scalar-FMA kernel Phase 0 already flagged as
+  algorithm-bound.
+- **D=512: only `grad_jagged` runs.** `grad_bias`/`grad_dense` **fail to launch**:
+  - `grad_bias_partials` and `grad_dense_reduce` launch `block=(N,1,1)` → 512
+    threads > AMDGPU default `max_flat_workgroup_size` of **256**
+    (`ValueError: ... Add known_block_size=[512,1,1]`).
+  - `grad_dense_partials` additionally needs `2·64·512·2 = 128 KB` LDS > the **64 KB**
+    MI300 LDS limit, and `(32·32)=1024` fp32 acc regs/thread (VGPR cap is 256).
+
+### Implications for the plan
+- These shapes **harden the Phase-0 verdict**: the dominant `grad_dense` path is the
+  blocker at scale. It is not just slow at D=256, it is structurally **unbuildable at
+  D=512**. **Phase 2 (MFMA-ize `grad_dense_partials`)** is now a hard requirement,
+  not just an optimization — the MFMA rewrite removes the `D²` per-thread register
+  block and the `O(D)` LDS staging that break D=512.
+- Cheap enabling fixes needed for D=512 regardless of Phase 2 (no algorithm change):
+  add `known_block_size` / cap threads ≤256 (tile the N axis) in `grad_bias_partials`,
+  `grad_bias_reduce`, and `grad_dense_reduce` so `block ≤ 256` at D≥512.
+- `grad_jagged` already meets these shapes well (235 TF/s @ D=512) — no action beyond
+  the secondary Phase-3 occupancy work.
+
+---
+
 ## Current status (2026-06-23)
-Tooling works end-to-end; baseline + Phase-0 sweep characterized. No kernel changes
-yet. Phase-0 gate says the dominant kernel is algorithm-bound (occupancy caps at
-~3.5% regardless of size) → next action is **Phase 2 (MFMA-ize `grad_dense_partials`)**;
-`grad_jagged` occupancy (Phase 3) is a secondary, size-sensitive win.
+Tooling works end-to-end; baseline + Phase-0 sweep + required production shapes
+(B=1024, D=256/512) characterized. No kernel changes yet. Phase-0 gate + EXP-…b both
+say the dominant `grad_dense` path is the blocker: algorithm-bound at D≤256 (flat
+~13 TF/s, occupancy ~3.5%) and **structurally unbuildable at D=512** (LDS 128 KB >
+64 KB, 1024 acc VGPRs, 512-thread reduce block). `grad_jagged` is healthy and scales
+to 235 TF/s @ D=512. Next action is **Phase 2 (MFMA-ize `grad_dense_partials`)**,
+plus the cheap `block ≤ 256` enabling fixes for `grad_bias`/`grad_dense_reduce` at
+D≥512; `grad_jagged` occupancy (Phase 3) remains a secondary win.
 
 ---
 
