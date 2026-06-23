@@ -848,6 +848,8 @@ def cmdGenFunc_mha_bwd(
     gen: Optional[Generator] = None,
     sink: Optional[Tensor] = None,
     d_sink: Optional[Tensor] = None,
+    is_v3_atomic_fp32: bool = True,
+    how_v3_bf16_cvt: int = 1,
 ):
     md_name = "mha_bwd"
     if not ENABLE_CK:
@@ -1005,6 +1007,8 @@ def gen_mha_bwd_fake_tensors(
     gen: Optional[Generator] = None,
     sink: Optional[Tensor] = None,
     d_sink: Optional[Tensor] = None,
+    is_v3_atomic_fp32: bool = True,
+    how_v3_bf16_cvt: int = 1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
@@ -1038,6 +1042,8 @@ def mha_bwd(
     gen: Optional[Generator] = None,
     sink: Optional[Tensor] = None,
     d_sink: Optional[Tensor] = None,
+    is_v3_atomic_fp32: bool = True,
+    how_v3_bf16_cvt: int = 1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -1885,6 +1891,8 @@ def _flash_attn_backward(
         None,
         sink,
         d_sink,
+        is_v3_atomic_fp32,
+        how_v3_bf16_cvt,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return softmax_d

@@ -923,7 +923,9 @@ namespace py = pybind11;
           py::arg("rng_state")    = std::nullopt, \
           py::arg("gen")          = std::nullopt, \
           py::arg("sink")         = std::nullopt, \
-          py::arg("d_sink")       = std::nullopt);
+          py::arg("d_sink")       = std::nullopt, \
+          py::arg("is_v3_atomic_fp32") = true,    \
+          py::arg("how_v3_bf16_cvt")   = 1);
 
 #define MHA_FWD_ASM_PYBIND                        \
     m.def("fmha_v3_fwd",                          \

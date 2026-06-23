@@ -7,33 +7,38 @@
 #include "mha_common.h"
 
 #include "mha_bwd.h"
+#include "torch/mha_bwd.h"
 
 namespace aiter {
 namespace torch_itfs {
 
+namespace detail {
+
 std::vector<at::Tensor>
-mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
-        const at::Tensor &q,            // [b, sq, hq, d]
-        const at::Tensor &k,            // [b, sk, hk, d]
-        const at::Tensor &v,            // [b, sk, hk, d_v]
-        const at::Tensor &out,          // [b, sq, hq, d_v]
-        const at::Tensor &softmax_lse,  // [b, hq, sq]
-        float p_dropout,
-        float softmax_scale,
-        bool is_causal,
-        int window_size_left,
-        int window_size_right,
-        bool deterministic,
-        std::optional<at::Tensor> dq_,                 // [b, sq, hq, d]
-        std::optional<at::Tensor> dk_,                 // [b, sk, hk, d]
-        std::optional<at::Tensor> dv_,                 // [b, sk, hk, d]
-        std::optional<at::Tensor> dbias_,              // [sq, sk]
-        std::optional<const at::Tensor> bias_,         // [sq, sk]
-        std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-        std::optional<const at::Tensor> rng_state_,
-        std::optional<at::Generator> gen_,
-        std::optional<const at::Tensor> sink_,         // [b, hq] log-space sink scores (float)
-        std::optional<at::Tensor> d_sink_)             // [hq] sink gradient output (float)
+mha_bwd_impl(const at::Tensor &dout,         // [b, sq, hq, d_v]
+             const at::Tensor &q,            // [b, sq, hq, d]
+             const at::Tensor &k,            // [b, sk, hk, d]
+             const at::Tensor &v,            // [b, sk, hk, d_v]
+             const at::Tensor &out,          // [b, sq, hq, d_v]
+             const at::Tensor &softmax_lse,  // [b, hq, sq]
+             float p_dropout,
+             float softmax_scale,
+             bool is_causal,
+             int window_size_left,
+             int window_size_right,
+             bool deterministic,
+             bool is_v3_atomic_fp32,
+             int how_v3_bf16_cvt,
+             std::optional<at::Tensor> dq_,                 // [b, sq, hq, d]
+             std::optional<at::Tensor> dk_,                 // [b, sk, hk, d]
+             std::optional<at::Tensor> dv_,                 // [b, sk, hk, d]
+             std::optional<at::Tensor> dbias_,              // [sq, sk]
+             std::optional<const at::Tensor> bias_,         // [sq, sk]
+             std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+             std::optional<const at::Tensor> rng_state_,
+             std::optional<at::Generator> gen_,
+             std::optional<const at::Tensor> sink_,         // [b, hq] log-space sink scores (float)
+             std::optional<at::Tensor> d_sink_)             // [hq] sink gradient output (float)
 {
     if (is_causal) { window_size_right = 0; }
 
@@ -127,6 +132,10 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size_v);
     } else {
         dv = torch::empty_like(v);
+    }
+    if (!is_v3_atomic_fp32) {
+        // The gfx942 a16 ASM DQ path accumulates into dq instead of overwriting it.
+        dq.zero_();
     }
 
     bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
@@ -315,8 +324,8 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
             }
 
             return mha_bwd_args{true, // use_v3
-                                true, // is_v3_atomic_fp32
-                                1, // how_v3_bf16_cvt
+                                is_v3_atomic_fp32, // is_v3_atomic_fp32
+                                how_v3_bf16_cvt, // how_v3_bf16_cvt
                                 false, // v3_api_check
 
                                 head_size_q,
@@ -425,6 +434,60 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     }
 
     return { dq, dk, dv, softmax_d };
+}
+
+} // namespace detail
+
+std::vector<at::Tensor>
+mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
+        const at::Tensor &q,            // [b, sq, hq, d]
+        const at::Tensor &k,            // [b, sk, hk, d]
+        const at::Tensor &v,            // [b, sk, hk, d_v]
+        const at::Tensor &out,          // [b, sq, hq, d_v]
+        const at::Tensor &softmax_lse,  // [b, hq, sq]
+        float p_dropout,
+        float softmax_scale,
+        bool is_causal,
+        int window_size_left,
+        int window_size_right,
+        bool deterministic,
+        std::optional<at::Tensor> dq_,                 // [b, sq, hq, d]
+        std::optional<at::Tensor> dk_,                 // [b, sk, hk, d]
+        std::optional<at::Tensor> dv_,                 // [b, sk, hk, d]
+        std::optional<at::Tensor> dbias_,              // [sq, sk]
+        std::optional<const at::Tensor> bias_,         // [sq, sk]
+        std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+        std::optional<const at::Tensor> rng_state_,
+        std::optional<at::Generator> gen_,
+        std::optional<const at::Tensor> sink_,         // [b, hq] log-space sink scores (float)
+        std::optional<at::Tensor> d_sink_,             // [hq] sink gradient output (float)
+        bool is_v3_atomic_fp32,
+        int how_v3_bf16_cvt)
+{
+    return detail::mha_bwd_impl(dout,
+                                q,
+                                k,
+                                v,
+                                out,
+                                softmax_lse,
+                                p_dropout,
+                                softmax_scale,
+                                is_causal,
+                                window_size_left,
+                                window_size_right,
+                                deterministic,
+                                is_v3_atomic_fp32,
+                                how_v3_bf16_cvt,
+                                dq_,
+                                dk_,
+                                dv_,
+                                dbias_,
+                                bias_,
+                                alibi_slopes_,
+                                rng_state_,
+                                gen_,
+                                sink_,
+                                d_sink_);
 }
 
 } // namespace torch_itfs
