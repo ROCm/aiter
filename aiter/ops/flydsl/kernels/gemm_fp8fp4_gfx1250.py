@@ -662,7 +662,7 @@ def compile_fp8fp4_gemm(
             layout_thr = fx.make_layout(
                 (m_warp, n_warp, 2, 16), (n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1)
             )
-        thr_coord = idx2crd(tx, layout_thr)
+        thr_coord = idx2crd(fx.Int32(tx), layout_thr)
         wave_m_idx, wave_n_idx, lane_kgrp, lane16 = (
             fx.get(thr_coord, 0),
             fx.get(thr_coord, 1),
@@ -681,12 +681,12 @@ def compile_fp8fp4_gemm(
             _bvs_a_rsrc = buffer_ops.create_buffer_resource(arg_a_scale, max_size=False)
             _bvs_b_rsrc = buffer_ops.create_buffer_resource(arg_b_scale, max_size=False)
             _bvs_Kt = K // tile_k  # total K-tiles
-            _bvs_mb_a = blk_m / arith.index(128) + wave_m_idx
-            _bvs_mb_b = blk_n / arith.index(128) + wave_n_idx
+            _bvs_mb_a = blk_m // arith.index(128) + wave_m_idx
+            _bvs_mb_b = blk_n // arith.index(128) + wave_n_idx
             _bvs_lane4 = lane16 * arith.index(4)
 
             def _bvs_load_scales(rsrc, mb, rep, k_base):
-                kt = k_base / arith.index(tile_k)
+                kt = k_base // arith.index(tile_k)
                 tile_i32 = (mb * arith.index(_bvs_Kt) + kt) * arith.index(128)
                 vals = []
                 for ld in range_constexpr(rep // 4):  # rep=8 -> 2 groups of 4 i32
@@ -707,13 +707,13 @@ def compile_fp8fp4_gemm(
                 return a, b
 
         m_idx = fx.Index(i32_m)
-        # Leading-dim strides arrive at runtime (strided A / C); the dense path
+        # Leading-dim strides arrive at runtime (strided A // C); the dense path
         # passes lda == K and ldc == N, giving byte-identical addressing. A's
         # stride is in packed-A elements (== lda for fp8 where PACK_FACTOR_A == 1).
         if const_expr(PACK_FACTOR_A == 1):
             lda_packed = fx.Index(i32_lda)
         else:
-            lda_packed = fx.Index(i32_lda) / arith.index(PACK_FACTOR_A)
+            lda_packed = fx.Index(i32_lda) // arith.index(PACK_FACTOR_A)
         n_stride = fx.Index(i32_ldc)
         c_nrec = m_idx * n_stride * arith.index(elem_bytes_d)
         c_rsrc = buffer_ops.create_buffer_resource(arg_c, num_records_bytes=c_nrec)
@@ -726,7 +726,7 @@ def compile_fp8fp4_gemm(
         ).result
 
         def make_desc_a(memref, k_base):
-            k_packed_off = k_base / arith.index(PACK_FACTOR_A)
+            k_packed_off = k_base // arith.index(PACK_FACTOR_A)
             return _make_tdm_desc(
                 global_ptr=arg_a,
                 lds_memref=memref,
@@ -745,11 +745,14 @@ def compile_fp8fp4_gemm(
             )
 
         def make_desc_b(memref, k_base):
-            k_packed_off = k_base / arith.index(PACK_FACTOR_B)
+            k_packed_off = k_base // arith.index(PACK_FACTOR_B)
             return _make_tdm_desc(
                 global_ptr=arg_b,
                 lds_memref=memref,
-                global_offset=(blk_n / arith.index(16), k_packed_off * arith.index(16)),
+                global_offset=(
+                    blk_n // arith.index(16),
+                    k_packed_off * arith.index(16),
+                ),
                 tensor_shape=(N // 16, K_packed_b * 16),
                 strides=(K_packed_b * 16, 1),
                 tile_shape=(tile_n // 16, packed_tile_k_b * 16),
@@ -764,7 +767,7 @@ def compile_fp8fp4_gemm(
 
         def make_desc_a_half(memref, k_base, m_half: int):
             row_start = m_half * ab_split_a_rows
-            k_packed_off = k_base / arith.index(PACK_FACTOR_A)
+            k_packed_off = k_base // arith.index(PACK_FACTOR_A)
             return _make_tdm_desc(
                 global_ptr=arg_a,
                 lds_memref=memref,
@@ -785,12 +788,12 @@ def compile_fp8fp4_gemm(
 
         def make_desc_b_half(memref, k_base, n_half: int):
             group_start = n_half * ab_split_b_groups
-            k_packed_off = k_base / arith.index(PACK_FACTOR_B)
+            k_packed_off = k_base // arith.index(PACK_FACTOR_B)
             return _make_tdm_desc(
                 global_ptr=arg_b,
                 lds_memref=memref,
                 global_offset=(
-                    blk_n / arith.index(16) + arith.index(group_start),
+                    blk_n // arith.index(16) + arith.index(group_start),
                     k_packed_off * arith.index(16),
                 ),
                 tensor_shape=(N // 16, K_packed_b * 16),
@@ -807,8 +810,8 @@ def compile_fp8fp4_gemm(
             )
 
         def make_desc_as(memref, k_base):
-            k_scale_off = k_base / arith.index(SCALE_BLOCK)
-            outer_off = blk_m / arith.index(wmma_m_rep)
+            k_scale_off = k_base // arith.index(SCALE_BLOCK)
+            outer_off = blk_m // arith.index(wmma_m_rep)
             inner_off = k_scale_off * arith.index(wmma_m_rep)
             return _make_tdm_desc(
                 global_ptr=arg_a_scale,
@@ -827,8 +830,8 @@ def compile_fp8fp4_gemm(
             )
 
         def make_desc_bs(memref, k_base):
-            k_scale_off = k_base / arith.index(SCALE_BLOCK)
-            outer_off = blk_n / arith.index(b_scale_load_rep)
+            k_scale_off = k_base // arith.index(SCALE_BLOCK)
+            outer_off = blk_n // arith.index(b_scale_load_rep)
             inner_off = k_scale_off * arith.index(b_scale_load_rep)
             return _make_tdm_desc(
                 global_ptr=arg_b_scale,
@@ -990,7 +993,7 @@ def compile_fp8fp4_gemm(
 
         def _precompute_scale_lane_bases(lds_ptr, warp_base, reps, interleaved_cols):
             """Precompute scale lane bases (byte offsets)."""
-            warp_lds_row = warp_base / arith.index(reps) + lane16
+            warp_lds_row = warp_base // arith.index(reps) + lane16
             base = warp_lds_row * arith.index(interleaved_cols)
             if const_expr(is_fp4 or is_a8w4):
                 # FP4/A8W4: always add lane_kgrp offset (no opsel on BScale)
@@ -2473,8 +2476,8 @@ def compile_fp8fp4_gemm(
             if const_expr(_effective_l2_pf <= 0):
                 return
             pf_k = k_base + arith.index(_effective_l2_pf * tile_k)
-            pf_k_packed_a = pf_k / arith.index(PACK_FACTOR_A)
-            pf_k_packed_b = pf_k / arith.index(PACK_FACTOR_B)
+            pf_k_packed_a = pf_k // arith.index(PACK_FACTOR_A)
+            pf_k_packed_b = pf_k // arith.index(PACK_FACTOR_B)
             tdm_ops.l2_prefetch_tile(
                 arg_a,
                 (blk_m, pf_k_packed_a),
@@ -2486,7 +2489,7 @@ def compile_fp8fp4_gemm(
             )
             tdm_ops.l2_prefetch_tile(
                 arg_b,
-                (blk_n / arith.index(16), pf_k_packed_b * arith.index(16)),
+                (blk_n // arith.index(16), pf_k_packed_b * arith.index(16)),
                 (tile_n // 16, packed_tile_k_b * 16),
                 (K_packed_b * 16, 1),
                 elem_bytes=1,
@@ -2586,9 +2589,9 @@ def compile_fp8fp4_gemm(
             # Match the TDM-store descriptor offsets to the compute wave mapping.
             if const_expr(use_fp8_deep_pipeline_schedule):
                 wave_m_sgpr = wave_id_idx % arith.index(m_warp)
-                wave_n_sgpr = wave_id_idx / arith.index(m_warp)
+                wave_n_sgpr = wave_id_idx // arith.index(m_warp)
             else:
-                wave_m_sgpr = wave_id_idx / arith.index(n_warp)
+                wave_m_sgpr = wave_id_idx // arith.index(n_warp)
                 wave_n_sgpr = wave_id_idx % arith.index(n_warp)
             d_warp_linear_sgpr = wave_m_sgpr * arith.index(n_warp) + wave_n_sgpr
             d_warp_off_sgpr = d_warp_linear_sgpr * arith.index(
