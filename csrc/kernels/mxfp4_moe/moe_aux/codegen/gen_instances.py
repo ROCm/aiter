@@ -18,7 +18,6 @@ from pathlib import Path
 SHAPES = [
     (385, 7168, 512, 9),  # Kimi-K2.5 TP=4
     (257, 7168, 512, 9),  # DSR
-    (385, 7168, 192, 9),  # Kimi-K2.5 TP=4, D_INTER=192
 ]
 
 
