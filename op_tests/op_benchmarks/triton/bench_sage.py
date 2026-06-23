@@ -76,6 +76,7 @@ KernelName = Literal[
     "aiter_i8fp8",
     "aiter_mxfp4",
     "aiter_mxfp6",
+    "aiter_fp6fp6",
     "aiter_bf16",
 ]
 
@@ -86,6 +87,7 @@ ALL_KERNELS: List[str] = [
     "aiter_i8fp8",
     "aiter_mxfp4",
     "aiter_mxfp6",
+    "aiter_fp6fp6",
     "aiter_bf16",
 ]
 
@@ -97,6 +99,7 @@ QUANT_KERNELS = {
     "aiter_i8fp8",
     "aiter_mxfp4",
     "aiter_mxfp6",
+    "aiter_fp6fp6",
 }
 
 
@@ -716,13 +719,13 @@ def make_torch_ref_runner(
     )
 
 
-# f6f6 kernel (double-FP6: fp6 Q,K + fp6 V). Built offline by mi350_fmha_hd128_f6f6.py
-# with its OWN symbol (_ZN5aiter28fmha_fwd_hd128_mxfp6_gfx950E) and OWN config row
-# (dtype "mxfp6bf16"), so it has a dedicated .co slot (fwd_hd128_mxfp6.co) and
-# coexists with aiter_mxfp4 -- no overlay. The C++ dispatch routes 96-wide
-# (fp6-packed) q/k to this slot automatically. The .co is loaded straight from the
-# AITER hsa dir like every other kernel; to swap kernels, copy your build over
-# hsa/gfx950/fmha_v3_fwd/fwd_hd128_mxfp6.co.
+# Two fp6-QK kernels, distinguished by V dtype (the C++ dispatch keys on it):
+#   • aiter_fp6fp6 = the f6f6 kernel (mi350_fmha_hd128_f6f6.py): native-fp6 V (fp6 on both matmuls),
+#     symbol _ZN5aiter28fmha_fwd_hd128_fp6fp6_gfx950E, dtype "fp6fp6bf16", slot fwd_hd128_fp6fp6.co.
+#   • aiter_mxfp6  = the f6f8 kernel (mi350_fmha_hd128_mxfp6.py): fp8 V (fp6-QK / fp8-PV),
+#     symbol _ZN5aiter28fmha_fwd_hd128_mxfp6_gfx950E, dtype "mxfp6bf16", slot fwd_hd128_mxfp6.co.
+# Both are built offline, have their own config row + .co slot, and coexist with aiter_mxfp4 -- no
+# overlay. To swap a kernel, copy your build over its slot in hsa/gfx950/fmha_v3_fwd/.
 
 
 def _deployed_mxfp4_co_path() -> str:
@@ -1284,12 +1287,11 @@ def make_kernel_runner(
         *packed, _delta_s = _quantize_mxfp4()
         return lambda: _kernel_mxfp4(*packed)
 
-    if args.kernel == "aiter_mxfp6":
-        # mxfp6 path: Q,K are packed fp6 [.,.,.,96] and V is packed to the
-        # kernel's native-fp6 d-major tile-flat layout. The C++ dispatch routes
-        # the fp6 q/k to the DEDICATED fwd_hd128_mxfp6.co slot (own symbol/config),
-        # loaded straight from the AITER hsa dir, so aiter_mxfp4 and aiter_mxfp6
-        # coexist with no overlay.
+    if args.kernel in ("aiter_mxfp6", "aiter_fp6fp6"):
+        # fp6 QK path: Q,K are packed fp6 [.,.,.,96]. The C++ dispatch keys on V's dtype to pick the
+        # slot: aiter_mxfp6 (the f6f8 kernel) passes V as raw fp8 (E4M3) -> fwd_hd128_mxfp6.co (the
+        # is_v_fp8 route); aiter_fp6fp6 (the f6f6 kernel) packs V to the native-fp6 d-major layout ->
+        # fwd_hd128_fp6fp6.co. Both have their own symbol/config and coexist with aiter_mxfp4.
         cfg = get_sage_fwd_configs_mxfp4()
         fp8_type = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_type).max
@@ -1311,12 +1313,11 @@ def make_kernel_runner(
         _mxfp6_q_packer = _build_fp6_qk_packer(q_bshd.device)
         _mxfp6_k_packer = _build_fp6_k_coalesced_packer(q_bshd.device)
         _mxfp6_v_packer = _build_hostv_v_packer(q_bshd.device)
-        # fp6fp8 validation mode: QK stays fp6 but V is passed as raw FP8 (E4M3)
-        # with a per-channel fp32 descale (the mxfp4/fp8 PV back-end), bypassing
-        # the native-fp6 V packer. Used to validate the fp6fp8 kernel deployed
-        # into the mxfp6 .co slot (the mxfp6bf16 C++ route has in_bpe=1 and reads
-        # the V stride from the tensor, so an fp8 V flows through unchanged).
-        _fp6fp8_mode = os.environ.get("AITER_FP6FP8", "0") != "0"
+        # V dtype selects the kernel/slot: aiter_mxfp6 (f6f8, fp6-QK/fp8-PV) passes V as raw fp8 (E4M3,
+        # per-channel fp32 descale) -> fwd_hd128_mxfp6.co; aiter_fp6fp6 (f6f6, fp6 on both matmuls)
+        # packs V to the native-fp6 d-major layout -> fwd_hd128_fp6fp6.co. The C++ dispatch keys on
+        # V's dtype (in_bpe=1, reads V stride from the tensor).
+        _use_fp8_v = args.kernel == "aiter_mxfp6"
 
         def _quantize_mxfp6():
             return _sage_quant_mxfp6(
@@ -1337,7 +1338,7 @@ def make_kernel_runner(
             )
 
         def _kernel_mxfp6(q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale):
-            v_arg = v_fp8 if _fp6fp8_mode else _mxfp6_v_packer(v_fp8)
+            v_arg = v_fp8 if _use_fp8_v else _mxfp6_v_packer(v_fp8)
             return flash_attn_mxfp4_func(
                 q_fp4,
                 k_fp4,
@@ -1536,6 +1537,7 @@ def benchmark_single_case(
         "aiter_i8fp8",
         "aiter_mxfp4",
         "aiter_mxfp6",
+        "aiter_fp6fp6",
         "sage_fp8",
         "sage_mxfp4",
     ):
@@ -1548,7 +1550,7 @@ def benchmark_single_case(
     v_elem_size = (
         1
         if args.kernel
-        in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "aiter_mxfp4", "aiter_mxfp6")
+        in ("fav3_fp8", "aiter_fp8", "aiter_i8fp8", "aiter_mxfp4", "aiter_mxfp6", "aiter_fp6fp6")
         else v.element_size()
     )
     mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
@@ -1745,12 +1747,13 @@ def validate_args(args: argparse.Namespace) -> None:
         "aiter_i8fp8",
         "aiter_mxfp4",
         "aiter_mxfp6",
+        "aiter_fp6fp6",
     )
 
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
-    if args.kernel not in ("sage_mxfp4", "aiter_mxfp4", "aiter_mxfp6", "all") and (
+    if args.kernel not in ("sage_mxfp4", "aiter_mxfp4", "aiter_mxfp6", "aiter_fp6fp6", "all") and (
         args.qsmooth or args.hadamard_rotate is False
     ):
         logger.warning(
@@ -2075,6 +2078,7 @@ def parse_args() -> argparse.Namespace:
             "aiter_i8fp8",
             "aiter_mxfp4",
             "aiter_mxfp6",
+            "aiter_fp6fp6",
             "aiter_bf16",
             "all",
         ],
