@@ -208,29 +208,42 @@ def _make_contiguous_psum_layout(
 ):
     """Build DeepGEMM-style psum layout: grouped_layout[e] = actual_end.
 
+    Uses a single fused kernel (psum + fill + remap) to minimize launch overhead.
     contiguous_m is a static upper bound (no .item() sync), so this is safe
     during CUDAGraph capture. Padding rows are never read by GEMM/gather.
     """
     device = masked_m.device
-
-    starts_t, psum_t, _ = contiguous_psum(masked_m, int(experts), int(tile_m))
     ub = int(token_num) * int(topk) + int(experts) * (int(tile_m) - 1)
     contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
+    numel = int(token_num) * int(topk)
 
-    old_flat = topids_to_rows.reshape(-1)
-    expert = torch.div(old_flat, int(max_m), rounding_mode="floor")
-    slot = old_flat - expert * int(max_m)
-    new_flat = starts_t[expert.to(torch.long)] + slot
-    remapped_topids = new_flat.to(torch.int32).view_as(topids_to_rows)
+    old_flat = topids_to_rows.reshape(-1).contiguous()
+    remapped_topids = torch.empty(numel, device=device, dtype=torch.int32)
+    remapped_rows = torch.empty(int(contiguous_m), device=device, dtype=torch.int32)
+    psum_t = torch.empty(int(experts), device=device, dtype=torch.int32)
 
-    # Inverse map (contiguous row -> source token) via one scatter.
-    remapped_rows = torch.full(
-        (int(contiguous_m),), -1, device=device, dtype=torch.int32
+    launch_fused = _get_compiled_contiguous_remap()
+    launch_fused(
+        masked_m[:int(experts)].to(torch.int32),
+        old_flat,
+        rows_to_tokens,
+        remapped_topids,
+        remapped_rows,
+        psum_t,
+        int(experts),
+        int(max_m),
+        int(tile_m),
+        numel,
+        int(contiguous_m),
+        stream=torch.cuda.current_stream(),
     )
-    src_tokens = rows_to_tokens[old_flat.to(torch.long)]
-    remapped_rows[new_flat.to(torch.long)] = src_tokens
 
-    return remapped_topids, remapped_rows, psum_t, int(contiguous_m)
+    return (
+        remapped_topids.view(token_num, topk),
+        remapped_rows,
+        psum_t,
+        int(contiguous_m),
+    )
 
 
 def _grouped_a8w4_preshuffle_e8m0_scale(
@@ -475,6 +488,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             return None
 
     _grouped_dbg("imports done")
+    if not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
     device = hidden_states.device
     token_num, topk = topk_ids.shape
     tile_m, tile_n, tile_k = 64, 256, 256
@@ -625,13 +640,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
         from aiter.ops.triton.quant import dynamic_mxfp8_quant
 
-        y, scale = dynamic_mxfp8_quant(
-            x.contiguous().view(-1, last_dim), quant_dtype=dtypes.fp8
-        )
-        payload = y.view(torch.uint8).contiguous().view(*x.shape)
-        scale_u8 = (
-            scale.view(*x.shape[:-1], last_dim // 32).view(torch.uint8).contiguous()
-        )
+        x_flat = x if x.is_contiguous() else x.contiguous()
+        x_flat = x_flat.view(-1, last_dim)
+        y, scale = dynamic_mxfp8_quant(x_flat, quant_dtype=dtypes.fp8)
+        payload = y.view(torch.uint8)
+        if not payload.is_contiguous():
+            payload = payload.contiguous()
+        payload = payload.view(*x.shape)
+        scale_u8 = scale.view(*x.shape[:-1], last_dim // 32).view(torch.uint8)
+        if not scale_u8.is_contiguous():
+            scale_u8 = scale_u8.contiguous()
         return payload, scale_u8
 
     if data_format == "fp4":
@@ -1063,6 +1081,16 @@ def _get_compiled_contiguous_psum():
     return build_moe_contiguous_psum_module()
 
 
+@functools.cache
+def _get_compiled_contiguous_remap():
+    """Compile and cache the fused psum+fill+remap kernel."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_remap_module,
+    )
+
+    return build_moe_contiguous_remap_module()
+
+
 def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
     """Tile-aligned exclusive prefix sum over per-expert counts in one FlyDSL
     kernel (no torch.cumsum / rocprim scan / D2D temp copy).
@@ -1170,7 +1198,8 @@ def flydsl_moe_gather_reduce(
         raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
 
     # Caller passes topids_to_rows int32 and gather_w bf16/f16 (both contiguous).
-    grouped_out_flat = grouped_out.contiguous().view(split_k * E * max_m, model_dim)
+    grouped_out_flat = grouped_out if grouped_out.is_contiguous() else grouped_out.contiguous()
+    grouped_out_flat = grouped_out_flat.view(split_k * E * max_m, model_dim)
     if out is None:
         out = torch.empty(
             (token_num, model_dim), dtype=grouped_out.dtype, device=device

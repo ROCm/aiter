@@ -2961,48 +2961,85 @@ def compile_mxscale_gemm(
                     layout_row = flat_m_tile * arith.index(tile_m)
                     layout_row_i32 = arith.index_cast(T.i32, layout_row)
                     c0_i32 = arith.constant(0, type=T.i32)
+                    c1_i32 = arith.constant(1, type=T.i32)
                     c_tile_m_i32 = arith.constant(tile_m, type=T.i32)
                     c_tile_m_minus_1_i32 = arith.constant(tile_m - 1, type=T.i32)
-                    c_false = arith.constant(0, type=ir.IntegerType.get_signless(1))
-                    c0_idx = arith.index(0)
-                    c1_idx = arith.index(1)
-                    e_loop = scf.ForOp(
-                        c0_idx,
-                        arith.index(batch_count),
-                        c1_idx,
-                        [c_false, c0_i32, c0_i32, c0_i32],
+                    c_batch_i32 = arith.constant(batch_count, type=T.i32)
+
+                    # Binary search in psum_t (monotonically non-decreasing):
+                    # find smallest e where layout_row_i32 < psum_t[e].
+                    # Iterations = ceil(log2(batch_count)), fully unrolled.
+                    _bsearch_iters = (
+                        (batch_count - 1).bit_length() if batch_count > 1 else 1
                     )
-                    e_ip = ir.InsertionPoint(e_loop.body)
-                    e_ip.__enter__()
-                    e = e_loop.induction_variable
-                    found = e_loop.inner_iter_args[0]
-                    found_group = e_loop.inner_iter_args[1]
-                    cur_start = e_loop.inner_iter_args[2]
-                    found_start = e_loop.inner_iter_args[3]
-                    e_i32 = arith.index_cast(T.i32, e)
-                    actual_end = buffer_ops.buffer_load(
-                        layout_rsrc, e, vec_width=1, dtype=T.i32
+                    bs_lo = c0_i32
+                    bs_hi = c_batch_i32
+                    for _ in range_constexpr(_bsearch_iters):
+                        bs_mid = (bs_lo + bs_hi) >> c1_i32
+                        mid_end = buffer_ops.buffer_load(
+                            layout_rsrc,
+                            arith.index_cast(T.index, bs_mid),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                        go_left = arith.cmpi(
+                            arith.CmpIPredicate.slt,
+                            layout_row_i32,
+                            mid_end,
+                        )
+                        bs_hi = arith.select(go_left, bs_mid, bs_hi)
+                        bs_lo = arith.select(go_left, bs_lo, bs_mid + c1_i32)
+
+                    batch_i32 = bs_lo
+
+                    # Compute group_start = starts[e]:
+                    #   starts[0] = 0
+                    #   starts[e>0] = ceil_align(psum_t[e-1], tile_m)
+                    is_first_expert = arith.cmpi(
+                        arith.CmpIPredicate.eq, batch_i32, c0_i32
+                    )
+                    safe_prev_idx = arith.select(
+                        is_first_expert, c0_i32, batch_i32 - c1_i32
+                    )
+                    prev_end = buffer_ops.buffer_load(
+                        layout_rsrc,
+                        arith.index_cast(T.index, safe_prev_idx),
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                    aligned_prev_end = (
+                        (prev_end + c_tile_m_minus_1_i32) // c_tile_m_i32
+                    ) * c_tile_m_i32
+                    group_start_i32 = arith.select(
+                        is_first_expert, c0_i32, aligned_prev_end
+                    )
+
+                    # Validate tile is within [group_start, psum_t[e])
+                    expert_in_bounds = arith.cmpi(
+                        arith.CmpIPredicate.slt, batch_i32, c_batch_i32
+                    )
+                    cur_end = buffer_ops.buffer_load(
+                        layout_rsrc,
+                        arith.index_cast(
+                            T.index,
+                            arith.select(expert_in_bounds, batch_i32, c0_i32),
+                        ),
+                        vec_width=1,
+                        dtype=T.i32,
                     )
                     row_ge_start = arith.cmpi(
-                        arith.CmpIPredicate.sge, layout_row_i32, cur_start
+                        arith.CmpIPredicate.sge,
+                        layout_row_i32,
+                        group_start_i32,
                     )
                     row_lt_end = arith.cmpi(
-                        arith.CmpIPredicate.slt, layout_row_i32, actual_end
+                        arith.CmpIPredicate.slt, layout_row_i32, cur_end
                     )
-                    row_in_group = arith.andi(row_ge_start, row_lt_end)
-                    not_found = arith.cmpi(arith.CmpIPredicate.eq, found, c_false)
-                    take_group = arith.andi(not_found, row_in_group)
-                    next_found = arith.ori(found, take_group)
-                    next_group = arith.select(take_group, e_i32, found_group)
-                    next_found_start = arith.select(take_group, cur_start, found_start)
-                    next_start = (
-                        (actual_end + c_tile_m_minus_1_i32) // c_tile_m_i32
-                    ) * c_tile_m_i32
-                    scf.YieldOp([next_found, next_group, next_start, next_found_start])
-                    e_ip.__exit__(None, None, None)
-                    group_active = e_loop.results[0]
-                    batch_i32 = e_loop.results[1]
-                    group_start_i32 = e_loop.results[3]
+                    group_active = arith.andi(
+                        expert_in_bounds,
+                        arith.andi(row_ge_start, row_lt_end),
+                    )
+
                     batch_idx = arith.index_cast(T.index, batch_i32)
                     local_row_i32 = layout_row_i32 - group_start_i32
                     bx_local = arith.index_cast(T.index, local_row_i32 // c_tile_m_i32)
