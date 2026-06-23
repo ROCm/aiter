@@ -542,14 +542,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             cfg_row.get("num_buffers2"), _shared_nbuf if _shared_nbuf else num_buffers2
         )
         _grouped_dbg(f"using grouped CSV config: {cfg_row}")
+
     tile_n1 = tile_n1 if tile_n1 else int(n_warp1) * 64
     tile_n2 = tile_n2 if tile_n2 else int(n_warp2) * 64
     tile_k1 = tile_k1 if tile_k1 else 256
     tile_k2 = tile_k2 if tile_k2 else 256
-
-    tile_m = 16
-    tile_n1, tile_k1 = 128, 256
-    tile_n2, tile_k2 = 256, 256
     warp_tile_m = tile_m // m_warp
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
@@ -610,11 +607,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     else:
         raw_max_m = _as_int(cfg_row.get("max_m"), token_num) if cfg_row else token_num
     _grouped_dbg(f"routing cfg_row={cfg_row} raw_max_m={raw_max_m}")
-    print("raw_max_m", raw_max_m)
-    raw_max_m = 16
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
     )
+    max_m = 16
     _grouped_dbg(f"routing max_m={max_m}")
 
     # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
