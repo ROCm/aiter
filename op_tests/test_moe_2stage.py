@@ -259,9 +259,9 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a16w4 / a8w4 / a4w4 — all use the gate-up-interleaved a16w4 weight layout
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
@@ -368,31 +368,6 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    _is_a4w4 = (
-        qType == aiter.QuantType.per_1x32
-        and AQDType == dtypes.fp4x2
-        and WQDType == dtypes.fp4x2
-    )
-    if os.environ.get("AITER_FORCE_FLYDSL_MOE") and _is_a4w4:
-        # opt-in: route the a4w4 MoE through the FlyDSL port kernels
-        # (mxfp4_gemm{1,2}_a4w4_port) instead of fused_moe's default CK dispatch.
-        # The port expects the mxfp4_moe weight layout (shuffle_weight_a16w4 /
-        # shuffle_scale_a16w4), but a4w4's default prep above used
-        # shuffle_weight((16,16)) -> wrong layout for the port (logits_diff ~0.99).
-        # Rebuild EXACTLY like bench_up_moe_v1.build_weights: re-quantize the original
-        # bf16 weights and apply the a16w4 weight/scale shuffles (avoids the subtle
-        # layout drift from the a4w4 default prep's .view + shuffle_weight((16,16))).
-        _w1q, _w1s = torch_quant(w1, quant_dtype=dtypes.fp4x2)
-        _w2q, _w2s = torch_quant(w2, quant_dtype=dtypes.fp4x2)
-        w1_qt_aiter = shuffle_weight_a16w4(_w1q, 16, True)
-        w2_qt_aiter = shuffle_weight_a16w4(_w2q, 16, False)
-        w1_scale_aiter = shuffle_scale_a16w4(_w1s, E, True)
-        w2_scale_aiter = shuffle_scale_a16w4(_w2s, E, False)
-        # gemm{1,2}_backend="flydsl" routes both a4w4 MoE GEMMs through the FlyDSL
-        # engines: fused_moe finds the tuned HIP mxfp4 row for this shape and then
-        # re-routes it to _mxfp4_moe_run, running gemm1/gemm2 on FlyDSL.
-        w1_qt_aiter.gemm1_backend = "flydsl"
-        w2_qt_aiter.gemm2_backend = "flydsl"
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
