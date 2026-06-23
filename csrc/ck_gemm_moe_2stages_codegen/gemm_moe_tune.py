@@ -510,6 +510,7 @@ class FmoeTuner(TunerCommon):
             a_scale_one=a_scale_one,
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+            k_wave=kparams.get("k_wave", 1),
         )
         if isinstance(result, tuple):
             out_raw = result[0]
