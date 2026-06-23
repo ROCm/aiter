@@ -4481,8 +4481,8 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
         vec_pairs >>= 1;
 
     // Fall back to smaller VP if not enough waves to saturate the GPU.
-    const int32_t gpu_capacity  = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
-    constexpr int32_t warp_size = 64;
+    const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
+    const int32_t warp_size    = static_cast<int32_t>(get_warp_size_func());
     while(vec_pairs > 1)
     {
         const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
@@ -7707,14 +7707,16 @@ __device__ __forceinline__ int64_t get_shuffle_layout_k_base(const int64_t slot_
                                                              const int num_heads_k,
                                                              const int head_id_k,
                                                              const int access_id_in_head,
-                                                             const int x)
+                                                             const int x,
+                                                             const int64_t k_block_stride)
 {
     // Shuffle layout: [num_blocks, num_kv_heads, head_size // x, block_size, x]
     const int block_id      = static_cast<int>(slot_id / block_size);
     const int block_offset  = static_cast<int>(slot_id % block_size);
     const int k_head_stride = HEAD_SIZE * block_size;
-    const int64_t dst_base =
-        static_cast<int64_t>(block_id) * num_heads_k * k_head_stride + head_id_k * k_head_stride;
+    const int64_t k_per_block =
+        (k_block_stride != 0) ? k_block_stride : static_cast<int64_t>(num_heads_k) * k_head_stride;
+    const int64_t dst_base = static_cast<int64_t>(block_id) * k_per_block + head_id_k * k_head_stride;
     // Pre-compute K base offset: since VEC_SIZE <= x, all elements are in the same
     // chunk
     const int chunk_id     = access_id_in_head / x;
@@ -7730,14 +7732,16 @@ __device__ __forceinline__ int64_t get_shuffle_layout_v_base(const int64_t slot_
                                                              const int num_heads_v,
                                                              const int head_id_v,
                                                              const int access_id_in_head,
-                                                             const int x)
+                                                             const int x,
+                                                             const int64_t v_block_stride)
 {
     // Shuffle layout: [num_blocks, num_kv_heads, block_size // x, head_size, x]
     const int block_id      = static_cast<int>(slot_id / block_size);
     const int block_offset  = static_cast<int>(slot_id % block_size);
     const int v_head_stride = (block_size / x) * HEAD_SIZE * x;
-    const int64_t dst_base =
-        static_cast<int64_t>(block_id) * num_heads_v * v_head_stride + head_id_v * v_head_stride;
+    const int64_t v_per_block =
+        (v_block_stride != 0) ? v_block_stride : static_cast<int64_t>(num_heads_v) * v_head_stride;
+    const int64_t dst_base = static_cast<int64_t>(block_id) * v_per_block + head_id_v * v_head_stride;
     // Pre-compute V base offset (fixed for this token)
     const int v_slot_chunk    = block_offset / x;
     const int v_slot_in_chunk = block_offset % x;
@@ -7777,7 +7781,9 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           bool use_shuffle_layout  = false,
                                           int block_size           = 0,
                                           int x                    = 0,
-                                          int rotary_dim           = 0)
+                                          int rotary_dim           = 0,
+                                          int64_t k_block_stride   = 0,
+                                          int64_t v_block_stride   = 0)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -7990,13 +7996,31 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             if(use_shuffle_layout)
             {
                 int64_t k_base = get_shuffle_layout_k_base<HEAD_SIZE>(
-                    slot_id, block_size, num_heads_k, head_id_k, access_id_in_head, x);
+                    slot_id, block_size, num_heads_k, head_id_k, access_id_in_head, x, k_block_stride);
                 out_kv_vec.store(k_cache + k_base);
             }
             else
             {
-                const int64_t offset =
-                    (slot_id * num_heads_k + head_id_k) * HEAD_SIZE + access_id_in_head;
+                // block_size == 0 => non-paged cache (flat [num_slots, num_heads_k, HEAD_SIZE]):
+                // index directly by slot. Otherwise the cache is paged and K/V are interleaved
+                // per block, so index with the cache's real per-block stride (k_block_stride):
+                // offset = block_id*block_stride + block_offset*slot_size + head*HEAD_SIZE + elem
+                const int64_t slot_size = static_cast<int64_t>(num_heads_k) * HEAD_SIZE;
+                int64_t offset;
+                if(block_size == 0)
+                {
+                    offset = slot_id * slot_size + head_id_k * HEAD_SIZE + access_id_in_head;
+                }
+                else
+                {
+                    const int block_id         = static_cast<int>(slot_id / block_size);
+                    const int block_offset     = static_cast<int>(slot_id % block_size);
+                    const int64_t block_stride = (k_block_stride != 0)
+                                                     ? k_block_stride
+                                                     : static_cast<int64_t>(block_size) * slot_size;
+                    offset = block_id * block_stride + block_offset * slot_size +
+                             head_id_k * HEAD_SIZE + access_id_in_head;
+                }
                 out_kv_vec.store(k_cache + offset);
             }
             if(k_out != nullptr)
@@ -8021,7 +8045,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         if(use_shuffle_layout)
         {
             int64_t v_base = get_shuffle_layout_v_base<HEAD_SIZE>(
-                slot_id, block_size, num_heads_v, head_id_v, access_id_in_head, x);
+                slot_id, block_size, num_heads_v, head_id_v, access_id_in_head, x, v_block_stride);
 #pragma unroll
             for(int i = 0; i < VEC_SIZE; ++i)
             {
@@ -8031,8 +8055,24 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         }
         else
         {
-            const int64_t offset =
-                (slot_id * num_heads_v + head_id_v) * HEAD_SIZE + access_id_in_head;
+            // Same scheme as the K path above, for the V cache.
+            // block_size == 0 => non-paged cache, index directly by slot.
+            const int64_t slot_size = static_cast<int64_t>(num_heads_v) * HEAD_SIZE;
+            int64_t offset;
+            if(block_size == 0)
+            {
+                offset = slot_id * slot_size + head_id_v * HEAD_SIZE + access_id_in_head;
+            }
+            else
+            {
+                const int block_id         = static_cast<int>(slot_id / block_size);
+                const int block_offset     = static_cast<int>(slot_id % block_size);
+                const int64_t block_stride = (v_block_stride != 0)
+                                                 ? v_block_stride
+                                                 : static_cast<int64_t>(block_size) * slot_size;
+                offset                     = block_id * block_stride + block_offset * slot_size +
+                         head_id_v * HEAD_SIZE + access_id_in_head;
+            }
             out_kv_vec.store(v_cache + offset);
         }
         if(v_out != nullptr)
@@ -8045,6 +8085,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
     }
 }
 
+// mrope-3D launcher: intentionally relies on the default-0 (contiguous) block stride
+// in fused_mrope_rms_kv_kernel; the stride-aware path is the pts launcher below.
 template <typename T, int M, typename KVT>
 void fused_mrope_rms_set_kv(const T* qkv,
                             const T* q_w,
@@ -8202,7 +8244,9 @@ void fused_rope_rms_set_kv(const T* qkv,
                            bool use_shuffle_layout  = false,
                            int64_t block_size       = 0,
                            int64_t x                = 0,
-                           int64_t rotary_dim       = 0)
+                           int64_t rotary_dim       = 0,
+                           int64_t k_block_stride   = 0,
+                           int64_t v_block_stride   = 0)
 {
     TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int THREAD_BLOCK_SIZE = 256;
@@ -8241,7 +8285,9 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,  \
                                                         block_size,          \
                                                         x,                   \
-                                                        (int)rotary_dim);    \
+                                                        (int)rotary_dim,     \
+                                                        k_block_stride,      \
+                                                        v_block_stride);     \
     }                                                                        \
     else                                                                     \
     {                                                                        \
@@ -8271,7 +8317,9 @@ void fused_rope_rms_set_kv(const T* qkv,
                                                         use_shuffle_layout,  \
                                                         block_size,          \
                                                         x,                   \
-                                                        (int)rotary_dim);    \
+                                                        (int)rotary_dim,     \
+                                                        k_block_stride,      \
+                                                        v_block_stride);     \
     }
 
     switch(head_size)

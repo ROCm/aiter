@@ -4,6 +4,7 @@
 import torch
 from torch import Tensor
 from ..jit.core import compile_ops
+from ..utility.dtypes import get_dtype_fp8
 from typing import Optional
 
 
@@ -95,6 +96,80 @@ def _fused_qk_rmsnorm_kernel(
     q_out: Tensor,
     k_out: Tensor,
 ) -> None: ...
+
+
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="minimax_qk_norm_rope",
+    develop=True,
+)
+def _minimax_qk_norm_rope_kernel(
+    qkv: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    cos_sin_cache: Tensor,
+    positions: Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    is_neox_style: bool,
+    q_out: Tensor,
+    k_out: Tensor,
+    v_out: Tensor,
+) -> None: ...
+
+
+def minimax_qk_norm_rope(
+    qkv: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    cos_sin_cache: Tensor,
+    positions: Tensor,
+    *,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    is_neox_style: bool,
+    q_out: Optional[Tensor] = None,
+    k_out: Optional[Tensor] = None,
+    v_out: Optional[Tensor] = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """MiniMax TP1 qkv split with full-vector q/k RMSNorm and RoPE.
+
+    Unlike the generic qk-norm RoPE kernels, MiniMax normalizes Q across
+    num_heads_q * head_dim and K across num_heads_k * head_dim.
+    """
+    num_tokens = qkv.size(0)
+    q_size = num_heads_q * head_dim
+    kv_size = num_heads_k * head_dim
+    if q_out is None:
+        q_out = torch.empty((num_tokens, q_size), dtype=qkv.dtype, device=qkv.device)
+    if k_out is None:
+        k_out = torch.empty((num_tokens, kv_size), dtype=qkv.dtype, device=qkv.device)
+    if v_out is None:
+        v_out = torch.empty((num_tokens, kv_size), dtype=qkv.dtype, device=qkv.device)
+
+    _minimax_qk_norm_rope_kernel(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        num_heads_q,
+        num_heads_k,
+        head_dim,
+        rotary_dim,
+        eps,
+        is_neox_style,
+        q_out,
+        k_out,
+        v_out,
+    )
+    return q_out, k_out, v_out
 
 
 _FUSED_QK_FALLBACK_M = 16384
@@ -233,3 +308,170 @@ def fused_qk_norm_rope_1way(
     fp32 rope multiply). Passing bf16/fp16 cos_sin will raise inside the kernel.
     """
     ...
+
+
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="fused_qk_norm_rope_2way_fp8_perhead_quant",
+    develop=True,
+)
+def _fused_qk_norm_rope_2way_fp8_perhead_quant_kernel(
+    q0: Tensor,
+    k0: Tensor,
+    q1: Tensor,
+    k1: Tensor,
+    w_q0: Tensor,
+    w_k0: Tensor,
+    w_q1: Tensor,
+    w_k1: Tensor,
+    cos_sin0: Tensor,
+    cos_sin1: Tensor,
+    batch_size: int,
+    num_tokens0: int,
+    num_tokens1: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    q_fp8: Tensor,
+    k_fp8: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    q_unquantized: Tensor,
+    k_unquantized: Tensor,
+) -> None: ...
+
+
+def fused_qk_norm_rope_2way_fp8_perhead_quant(
+    q0: Tensor,
+    k0: Tensor,
+    q1: Tensor,
+    k1: Tensor,
+    w_q0: Tensor,
+    w_k0: Tensor,
+    w_q1: Tensor,
+    w_k1: Tensor,
+    cos_sin0: Tensor,
+    cos_sin1: Tensor,
+    batch_size: int,
+    num_tokens0: int,
+    num_tokens1: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    out_q01: Optional[Tensor] = None,
+    out_k01: Optional[Tensor] = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Same as the pertensor variant, but with per-(batch, head) descales.
+
+    Returns (q_fp8, k_fp8, q_descale, k_descale, q_bf16, k_bf16) where
+    q_descale.shape == (batch_size, num_heads_q) and
+    k_descale.shape == (batch_size, num_heads_k). These shapes match what
+    CK FP8 flash attention accepts natively.
+    """
+    want_bf16 = out_q01 is not None or out_k01 is not None
+    total_tokens = num_tokens0 + num_tokens1
+    fp8_dtype = get_dtype_fp8()
+
+    q_fp8 = torch.empty(
+        (batch_size, total_tokens, num_heads_q, head_size),
+        dtype=fp8_dtype,
+        device=q0.device,
+    )
+    k_fp8 = torch.empty(
+        (batch_size, total_tokens, num_heads_k, head_size),
+        dtype=fp8_dtype,
+        device=k0.device,
+    )
+    q_descale = torch.empty(
+        (batch_size, num_heads_q), dtype=torch.float32, device=q0.device
+    )
+    k_descale = torch.empty(
+        (batch_size, num_heads_k), dtype=torch.float32, device=k0.device
+    )
+    q_unquantized = (
+        out_q01
+        if out_q01 is not None
+        else torch.empty(
+            (batch_size, total_tokens, num_heads_q, head_size),
+            dtype=q0.dtype,
+            device=q0.device,
+        )
+    )
+    k_unquantized = (
+        out_k01
+        if out_k01 is not None
+        else torch.empty(
+            (batch_size, total_tokens, num_heads_k, head_size),
+            dtype=k0.dtype,
+            device=k0.device,
+        )
+    )
+
+    _fused_qk_norm_rope_2way_fp8_perhead_quant_kernel(
+        q0,
+        k0,
+        q1,
+        k1,
+        w_q0,
+        w_k0,
+        w_q1,
+        w_k1,
+        cos_sin0,
+        cos_sin1,
+        batch_size,
+        num_tokens0,
+        num_tokens1,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        is_interleaved,
+        eps,
+        q_fp8,
+        k_fp8,
+        q_descale,
+        k_descale,
+        q_unquantized,
+        k_unquantized,
+    )
+
+    if not want_bf16:
+        q_unquantized = torch.empty(0, dtype=q0.dtype, device=q0.device)
+        k_unquantized = torch.empty(0, dtype=k0.dtype, device=k0.device)
+
+    return q_fp8, k_fp8, q_descale, k_descale, q_unquantized, k_unquantized
+
+
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    fc_name="v_2way_per_head_fp8_quant",
+    develop=True,
+)
+def _v_2way_per_head_fp8_quant_kernel(
+    v0: Tensor,
+    v1: Tensor,
+    v_fp8: Tensor,
+    v_descale: Tensor,
+) -> None: ...
+
+
+def v_2way_per_head_fp8_quant(v0: Tensor, v1: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-(batch, head) FP8 quant for concatenated [v0, v1] without bf16 cat."""
+    batch_size = v0.size(0)
+    num_heads = v0.size(2)
+    head_size = v0.size(3)
+    total_tokens = v0.size(1) + v1.size(1)
+    fp8_dtype = get_dtype_fp8()
+    v_fp8 = torch.empty(
+        (batch_size, total_tokens, num_heads, head_size),
+        dtype=fp8_dtype,
+        device=v0.device,
+    )
+    v_descale = torch.empty(
+        (batch_size, num_heads), dtype=torch.float32, device=v0.device
+    )
+    _v_2way_per_head_fp8_quant_kernel(v0, v1, v_fp8, v_descale)
+    return v_fp8, v_descale

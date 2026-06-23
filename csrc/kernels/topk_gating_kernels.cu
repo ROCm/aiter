@@ -37,8 +37,13 @@ enum { SCORE_SQRTSOFTPLUS = 0, SCORE_SIGMOID = 1, SCORE_SOFTMAX = 2 };
 __device__ __forceinline__ void warpReduceMax_softplus(float& val_o, int& idx)
 {
     float max_val   = multithread_reduce_max_dpp<WARP_SIZE>(val_o);
+#if defined(__GFX9__)
     uint64_t mask   = __ballot(val_o == max_val);
     int win_lane    = (mask != 0) ? __builtin_ctzll(mask) : 0;
+#else
+    unsigned mask   = static_cast<unsigned>(__ballot(val_o == max_val));
+    int win_lane    = (mask != 0) ? __builtin_ctz(mask) : 0;
+#endif
     idx             = __builtin_amdgcn_readlane(idx, win_lane);
     val_o           = max_val;
 }

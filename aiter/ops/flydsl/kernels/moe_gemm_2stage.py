@@ -61,6 +61,7 @@ from .mfma_preshuffle_pipeline import (
     crd2idx,
 )
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
+from .tensor_shim import _run_compiled
 
 
 @contextmanager
@@ -679,10 +680,10 @@ def compile_moe_gemm1(
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
-                coord_wl = fx.idx2crd(tx, layout_tx_wave_lane)
+                coord_wl = fx.idx2crd(fx.Int32(tx), layout_tx_wave_lane)
                 wave_id = fx.get(coord_wl, 0)
                 lane_id = fx.get(coord_wl, 1)
-                coord_l16 = fx.idx2crd(lane_id, layout_lane16)
+                coord_l16 = fx.idx2crd(fx.Int32(lane_id), layout_lane16)
                 lane_div_16 = fx.get(coord_l16, 0)
                 lane_mod_16 = fx.get(coord_l16, 1)
 
@@ -727,11 +728,11 @@ def compile_moe_gemm1(
                     row_gate = expert_off_idx + col_g
                     row_up = row_gate + inter_idx
 
-                    coord_gate = fx.idx2crd(row_gate, layout_n_blk_intra)
+                    coord_gate = fx.idx2crd(fx.Int32(row_gate), layout_n_blk_intra)
                     n_blk_gate.append(fx.get(coord_gate, 0))
                     n_intra_gate.append(fx.get(coord_gate, 1))
 
-                    coord_up = fx.idx2crd(row_up, layout_n_blk_intra)
+                    coord_up = fx.idx2crd(fx.Int32(row_up), layout_n_blk_intra)
                     n_blk_up.append(fx.get(coord_up, 0))
                     n_intra_up.append(fx.get(coord_up, 1))
 
@@ -898,7 +899,9 @@ def compile_moe_gemm1(
                         if elem_bytes == 1
                         else (col_base_swz_bytes // arith.index(int(elem_bytes)))
                     )
-                    idx_a16 = crd2idx((curr_row_a_lds, col_base_swz), layout_lds)
+                    idx_a16 = crd2idx(
+                        (fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds
+                    )
                     idx_a16 = idx_a16 + lds_base
                     loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
                     a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)
@@ -2547,10 +2550,10 @@ def compile_moe_gemm2(
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
-                coord_wl = fx.idx2crd(tx, layout_tx_wave_lane)
+                coord_wl = fx.idx2crd(fx.Int32(tx), layout_tx_wave_lane)
                 wave_id = fx.get(coord_wl, 0)
                 lane_id = fx.get(coord_wl, 1)
-                coord_l16 = fx.idx2crd(lane_id, layout_lane16)
+                coord_l16 = fx.idx2crd(fx.Int32(lane_id), layout_lane16)
                 lane_div_16 = fx.get(coord_l16, 0)
                 lane_mod_16 = fx.get(coord_l16, 1)
 
@@ -2586,7 +2589,7 @@ def compile_moe_gemm2(
                     col_g_list.append(col_g)
 
                     row_w = expert_off_idx + col_g
-                    coord_w = fx.idx2crd(row_w, layout_n_blk_intra)
+                    coord_w = fx.idx2crd(fx.Int32(row_w), layout_n_blk_intra)
                     n_blk_list.append(fx.get(coord_w, 0))
                     n_intra_list.append(fx.get(coord_w, 1))
 
@@ -2750,7 +2753,9 @@ def compile_moe_gemm2(
                         if elem_bytes == 1
                         else (col_base_swz_bytes // arith.index(int(elem_bytes)))
                     )
-                    idx_a16 = crd2idx((curr_row_a_lds, col_base_swz), layout_lds)
+                    idx_a16 = crd2idx(
+                        (fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds
+                    )
                     idx_a16 = idx_a16 + lds_base
                     loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
                     a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)
@@ -3593,15 +3598,19 @@ def compile_moe_reduction(
     model_dim: int,
     dtype_str: str = "f16",
     use_mask: bool = False,
+    num_experts: int = 0,
 ):
     """Compile a reduction kernel that sums over the topk dimension.
 
     Input:  X [tokens, topk, model_dim]
-            valid_mask [tokens, topk] (optional, if use_mask=True)
+            expert_mask [num_experts] i32 (optional, if use_mask=True)
+            topk_ids   [tokens, topk] i32 (optional, if use_mask=True)
     Output: Y [tokens, model_dim]
 
-    This kernel performs: Y[t, d] = sum(X[t, :, d]) for all t, d.
-    When use_mask=True, only sums slots where valid_mask[t,k]=1.
+    This kernel performs: Y[t, d] = sum_k(X[t, k, d]) for all t, d.
+    When use_mask=True, the kernel fuses the EP validity gather:
+        valid[t, k] = expert_mask[topk_ids[t, k]] != 0
+    and only accumulates X[t, k, :] when valid[t, k] is true.
     Used in conjunction with compile_moe_gemm2(accumulate=False) to avoid atomic contention.
     """
     get_hip_arch()
@@ -3637,41 +3646,77 @@ def compile_moe_reduction(
         )
         return ty() if callable(ty) else ty
 
+    module_name = (
+        f"moe_reduction_kernel_{'masked' if use_mask else 'plain'}"
+        f"_{dtype_str}_topk{topk}_md{model_dim}"
+    )
+
+    elem_bytes_c = (32 if dtype_str == "f32" else 16) // 8
+
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(name=module_name)
         def moe_reduction_kernel(
             X: fx.Pointer,
             Y: fx.Pointer,
-            valid_mask: fx.Pointer,
+            expert_mask: fx.Pointer,
+            topk_ids: fx.Pointer,
             i32_m_tokens: fx.Int32,
         ):
             m_tokens = fx.Index(i32_m_tokens)
             c_topk = fx.Index(topk)
             c_model_dim = fx.Index(model_dim)
-            mask_nbytes_idx = m_tokens * c_topk
             elem_bits = 32 if dtype_str == "f32" else 16
             copy_vec_width = 128 // elem_bits  # 8 for f16/bf16, 4 for f32
             n_sub = VEC_WIDTH // copy_vec_width  # 1 for f16/bf16, 2 for f32
-            elem_nbytes_idx = fx.Index(4 if dtype_str == "f32" else 2)
 
-            def _ptr_buffer_resource(ptr, num_records_bytes):
+            def _ptr_buffer_resource_off(ptr, num_records_bytes, byte_off_i64=None):
+                # Build a buffer resource from a raw pointer, optionally folding
+                # a per-WG i64 byte offset into the descriptor's 48-bit base.
                 addr = fx.ptrtoint(ptr)
                 addr_i64 = arith.index_cast(T.i64, addr)
+                if byte_off_i64 is not None:
+                    addr_i64 = addr_i64 + byte_off_i64
                 return buffer_ops.create_buffer_resource_from_addr(
                     addr_i64, num_records_bytes=num_records_bytes
                 )
 
-            x_nbytes = fx.Int64(m_tokens * c_topk * c_model_dim * elem_nbytes_idx)
-            y_nbytes = fx.Int64(m_tokens * c_model_dim * elem_nbytes_idx)
-            mask_nbytes = fx.Int64(mask_nbytes_idx)
-            x_rsrc = _ptr_buffer_resource(X, x_nbytes)
-            y_rsrc = _ptr_buffer_resource(Y, y_nbytes)
-            mask_rsrc = _ptr_buffer_resource(valid_mask, mask_nbytes)
-
             token_idx = gpu.block_id("x")
             tile_idx = gpu.block_id("y")
             tid = gpu.thread_id("x")
+
+            # ── 64-bit base-offset folding ─────────────────────────────────
+            # X is [m_tokens, topk, model_dim]; total bytes can exceed 4 GiB
+            # for large batches (e.g. 131072 * 6 * 4096 * 2 = 6 GiB), which
+            # overflows the i32 voffset used by buffer_load. To stay i32-safe,
+            # fold the per-WG token byte offset into the descriptor's 48-bit
+            # base address (computed in i64). The in-kernel voffsets then only
+            # need to address one token's slab.
+            slab_elems_x = c_topk * c_model_dim
+            x_slab_nbytes = slab_elems_x * fx.Index(elem_bytes_c)
+            y_slab_nbytes = c_model_dim * fx.Index(elem_bytes_c)
+            x_base_off_i64 = fx.Int64(token_idx * x_slab_nbytes)
+            y_base_off_i64 = fx.Int64(token_idx * c_model_dim * fx.Index(elem_bytes_c))
+
+            x_rsrc = _ptr_buffer_resource_off(
+                X, fx.Int64(x_slab_nbytes), x_base_off_i64
+            )
+            y_rsrc = _ptr_buffer_resource_off(
+                Y, fx.Int64(y_slab_nbytes), y_base_off_i64
+            )
+
+            if const_expr(use_mask):
+                tk_slab_nbytes = c_topk * fx.Index(4)
+                tk_base_off_i64 = fx.Int64(token_idx * tk_slab_nbytes)
+                topk_ids_rsrc = _ptr_buffer_resource_off(
+                    topk_ids, fx.Int64(tk_slab_nbytes), tk_base_off_i64
+                )
+                # expert_mask: [num_experts] i32. Caller supplies num_experts
+                # at compile time so we can size the descriptor exactly.
+                em_nbytes = fx.Index(num_experts * 4)
+                expert_mask_rsrc = _ptr_buffer_resource_off(
+                    expert_mask, fx.Int64(em_nbytes), None
+                )
 
             # Guard: token in range (Index is unsigned → auto ult)
             tok_ok = token_idx < m_tokens
@@ -3691,6 +3736,10 @@ def compile_moe_reduction(
                     end_ok = col_base + c_vecw <= c_model_dim
                     _if_full = scf.IfOp(end_ok, has_else=True)
                     with _if_then(_if_full):
+                        # ── Vector path via direct buffer_load ──
+                        # Use buffer_load with vec_width=copy_vec_width
+                        # (8 elems for bf16/f16 = 128b; 4 elems for f32 = 128b).
+                        # n_sub iterations cover the full VEC_WIDTH stride.
                         vec_type_c = T.vec(copy_vec_width, compute_type())
                         vec_type_e = T.vec(copy_vec_width, elem_type())
 
@@ -3700,22 +3749,36 @@ def compile_moe_reduction(
                         ]
 
                         for k in range_constexpr(topk):
+                            # X slab base for this (token, k) — within one token's
+                            # slab, k indexes the topk dim with stride model_dim.
+                            # elem offset = k*model_dim + col_base + si*copy_vec_width
+                            k_off_elems = fx.Index(k) * c_model_dim + col_base
+
                             if const_expr(use_mask):
-                                m_idx_i32 = fx.Int32(token_idx * c_topk + fx.Index(k))
-                                mv = buffer_ops.buffer_load(
-                                    mask_rsrc, m_idx_i32, vec_width=1, dtype=i8_type()
+                                # Fused EP gather: valid = expert_mask[topk_ids[token, k]] != 0
+                                # topk_ids_rsrc is already shifted by token_idx*topk
+                                tk_idx_i32 = fx.Int32(fx.Index(k))
+                                eid_i32 = buffer_ops.buffer_load(
+                                    topk_ids_rsrc,
+                                    tk_idx_i32,
+                                    vec_width=1,
+                                    dtype=i32_type(),
                                 )
-                                mv_ok = mv != fx.Int8(0)
+                                valid_i32 = buffer_ops.buffer_load(
+                                    expert_mask_rsrc,
+                                    eid_i32,
+                                    vec_width=1,
+                                    dtype=i32_type(),
+                                )
+                                mv_ok = valid_i32 != fx.Int32(0)
 
                             for si in range_constexpr(n_sub):
-                                x_idx_i32 = fx.Int32(
-                                    (token_idx * c_topk + fx.Index(k)) * c_model_dim
-                                    + col_base
-                                    + fx.Index(si * copy_vec_width)
+                                off_elems_i32 = fx.Int32(
+                                    k_off_elems + fx.Index(si * copy_vec_width)
                                 )
                                 vec_e = buffer_ops.buffer_load(
                                     x_rsrc,
-                                    x_idx_i32,
+                                    off_elems_i32,
                                     vec_width=copy_vec_width,
                                     dtype=elem_type(),
                                 )
@@ -3738,37 +3801,38 @@ def compile_moe_reduction(
                             out_vec = acc_vecs[si]
                             if const_expr(elem_bits < 32):
                                 out_vec = out_vec.truncf(vec_type_e)
-
-                            y_idx_i32 = fx.Int32(
-                                token_idx * c_model_dim
-                                + col_base
-                                + fx.Index(si * copy_vec_width)
+                            y_off_elems_i32 = fx.Int32(
+                                col_base + fx.Index(si * copy_vec_width)
                             )
-                            buffer_ops.buffer_store(out_vec, y_rsrc, y_idx_i32)
+                            buffer_ops.buffer_store(out_vec, y_rsrc, y_off_elems_i32)
 
                     with _if_else(_if_full):
-                        # Tail path: scalar load/store per lane.
+                        # Tail path: scalar load/store per lane. All offsets
+                        # are now slab-local (token_idx folded into base ptr).
                         for lane in range_constexpr(VEC_WIDTH):
                             col = col_base + fx.Index(lane)
                             lane_ok = col < c_model_dim
                             _if_lane = scf.IfOp(lane_ok)
                             with _if_then(_if_lane):
                                 a = arith.constant(0.0, type=compute_type())
-                                token_base = token_idx * c_topk
                                 for k in range_constexpr(topk):
                                     k_idx = fx.Index(k)
-                                    x_idx_i32 = fx.Int32(
-                                        (token_base + k_idx) * c_model_dim + col
-                                    )
+                                    x_idx_i32 = fx.Int32(k_idx * c_model_dim + col)
                                     if const_expr(use_mask):
-                                        m_idx_i32 = fx.Int32(token_base + k_idx)
-                                        mv = buffer_ops.buffer_load(
-                                            mask_rsrc,
-                                            m_idx_i32,
+                                        tk_idx_i32 = fx.Int32(k_idx)
+                                        eid_i32 = buffer_ops.buffer_load(
+                                            topk_ids_rsrc,
+                                            tk_idx_i32,
                                             vec_width=1,
-                                            dtype=i8_type(),
+                                            dtype=i32_type(),
                                         )
-                                        v = (mv != fx.Int8(0)).select(
+                                        valid_i32 = buffer_ops.buffer_load(
+                                            expert_mask_rsrc,
+                                            eid_i32,
+                                            vec_width=1,
+                                            dtype=i32_type(),
+                                        )
+                                        v = (valid_i32 != fx.Int32(0)).select(
                                             buffer_ops.buffer_load(
                                                 x_rsrc,
                                                 x_idx_i32,
@@ -3791,7 +3855,7 @@ def compile_moe_reduction(
                                 out = a
                                 if const_expr(dtype_str in ("f16", "bf16")):
                                     out = out.truncf(elem_type())
-                                y_idx_i32 = fx.Int32(token_idx * c_model_dim + col)
+                                y_idx_i32 = fx.Int32(col)
                                 buffer_ops.buffer_store(out, y_rsrc, y_idx_i32)
 
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
@@ -3802,12 +3866,13 @@ def compile_moe_reduction(
     def launch_moe_reduction(
         X: fx.Pointer,
         Y: fx.Pointer,
-        valid_mask: fx.Pointer,
+        expert_mask: fx.Pointer,
+        topk_ids: fx.Pointer,
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
         gx = fx.Index(i32_m_tokens)
-        moe_reduction_kernel(X, Y, valid_mask, i32_m_tokens).launch(
+        moe_reduction_kernel(X, Y, expert_mask, topk_ids, i32_m_tokens).launch(
             grid=(gx, gy_static, 1),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
@@ -3878,12 +3943,15 @@ class _MoeGemm2ReduceWrapper:
         n_in,
         k_in,
         size_expert_ids_in,
-        valid_mask=None,
+        expert_mask=None,
+        topk_ids=None,
         stream=None,
     ):
-        """Execute GEMM2 + reduce.
+        """Execute GEMM2 + masked reduce.
 
         Args match moe_gemm2 kernel signature (see compile_moe_gemm2).
+        When self._use_mask is True, expert_mask + topk_ids are required and
+        the reduction fuses ``valid = expert_mask[topk_ids[t, k]] != 0``.
         """
         import torch
 
@@ -3897,17 +3965,29 @@ class _MoeGemm2ReduceWrapper:
         )
         if self._zero_intermediate and not self._use_mask:
             intermediate.zero_()
+
+        import flydsl.compiler as flyc
+        import flydsl.expr as fx
+
+        def _ptr_arg(t):
+            type_name = type(t).__name__
+            module_name = type(t).__module__
+            if type_name == "FakeTensor" or "fake_tensor" in module_name:
+                return flyc.from_c_void_p(fx.Uint8, 0)
+            return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
         # Phase 1: GEMM2 (no atomics) -> [tokens*topk, model_dim]
-        self._gemm2_exe(
-            intermediate.view(-1),
-            arg_x,
-            arg_w,
-            arg_scale_x,
-            arg_scale_w,
-            arg_sorted_token_ids,
-            arg_expert_ids,
-            arg_sorted_weights,
-            arg_num_valid_ids,
+        _run_compiled(
+            self._gemm2_exe,
+            _ptr_arg(intermediate.view(-1)),
+            _ptr_arg(arg_x),
+            _ptr_arg(arg_w),
+            _ptr_arg(arg_scale_x),
+            _ptr_arg(arg_scale_w),
+            _ptr_arg(arg_sorted_token_ids),
+            _ptr_arg(arg_expert_ids),
+            _ptr_arg(arg_sorted_weights),
+            _ptr_arg(arg_num_valid_ids),
             tokens_in,
             n_in,
             k_in,
@@ -3917,26 +3997,23 @@ class _MoeGemm2ReduceWrapper:
         # Phase 2: Reduce over topk -> [tokens, model_dim]
         X = intermediate.view(tokens_in, self._topk, self._model_dim)
         Y = arg_out.view(tokens_in, self._model_dim)
-        if not self._use_mask:
-            if valid_mask is not None:
-                logging.warning(
-                    "valid_mask provided but use_mask=False; ignoring valid_mask"
+        if self._use_mask:
+            if expert_mask is None or topk_ids is None:
+                raise ValueError(
+                    "expert_mask and topk_ids are required when use_mask=True"
                 )
-            valid_mask = torch.empty(
-                (0, self._topk), device=arg_out.device, dtype=torch.uint8
-            )
-
-        def _ptr_arg(t):
-            type_name = type(t).__name__
-            module_name = type(t).__module__
-            if type_name == "FakeTensor" or "fake_tensor" in module_name:
-                return flyc.from_c_void_p(fx.Uint8, 0)
-            return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-
-        self._reduce_exe(
+            em = expert_mask.to(torch.int32).contiguous()
+            tk = topk_ids.to(torch.int32).contiguous()
+        else:
+            # Placeholders; kernel ignores them when use_mask=False (compile-time).
+            em = torch.empty(0, device=arg_out.device, dtype=torch.int32)
+            tk = torch.empty(0, device=arg_out.device, dtype=torch.int32)
+        _run_compiled(
+            self._reduce_exe,
             _ptr_arg(X),
             _ptr_arg(Y),
-            _ptr_arg(valid_mask),
+            _ptr_arg(em),
+            _ptr_arg(tk),
             tokens_in,
             stream,
         )
@@ -3963,7 +4040,7 @@ def compile_moe_gemm2_ex(
     use_cshuffle_epilog: bool | None = None,
     # Extended parameters for mode control
     mode: str = MoeGemm2Mode.ATOMIC,
-    valid_mask=None,
+    use_mask: bool = False,
     zero_intermediate: bool = True,
     scale_is_bf16: bool = False,
 ):
@@ -3976,6 +4053,10 @@ def compile_moe_gemm2_ex(
             - "atomic": Use atomic accumulation (original behavior)
             - "reduce": Use non-atomic write + reduce kernel
 
+        use_mask: If True, the reduction kernel fuses the EP gather
+            ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums
+            valid slots. Caller must pass expert_mask + topk_ids at call time.
+
         zero_intermediate: If all output slots are valid,
             set False to increase performance
 
@@ -3984,9 +4065,6 @@ def compile_moe_gemm2_ex(
     """
     # Compile based on mode
     if mode == MoeGemm2Mode.REDUCE:
-        # Determine if we need masked reduction
-        use_mask = valid_mask is not None
-
         # Compile GEMM2 with accumulate=False
         gemm2_exe = compile_moe_gemm2(
             model_dim=model_dim,
@@ -4017,6 +4095,7 @@ def compile_moe_gemm2_ex(
             model_dim=model_dim,
             dtype_str=dtype_str,
             use_mask=use_mask,
+            num_experts=experts,
         )
         return _MoeGemm2ReduceWrapper(
             gemm2_exe=gemm2_exe,

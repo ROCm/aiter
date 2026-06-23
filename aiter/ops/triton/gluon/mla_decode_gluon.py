@@ -16,22 +16,19 @@
 #                        and O store.
 #   REGIME='bh16bn64'  - bf16 Q + bf16 KV, BLOCK_H=16, BLOCK_N=64,
 #                        nhead <= 16, batch_size >= 1, 2-D (batch, split) grid,
-#                        NUM_KV_SPLITS = max(1, 256 // batch_size). Two modes:
-#                          - return_lse=False: full decode (stage-1 + stage-2
-#                            reduce into the final O).
-#                          - return_lse=True: stage-1 only (Decode-Context-
-#                            Parallel) - writes per-split (acc, fp32 lse) and
-#                            skips stage-2; host does the cross-GPU merge.
+#                        NUM_KV_SPLITS = max(1, 256 // batch_size). Full decode
+#                        (stage-1 + stage-2 reduce into the final O).
 #                        NHEAD < BLOCK_H masks OOB heads on Q load and O store.
 #
 # The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
-# only bh64 assumes >= 3. See RETURN_LSE / epilogue-1 handling below.
+# only bh64 assumes >= 3. See epilogue-1 handling below.
 #
 # Wrapper dispatch: nhead in {64,128} -> bh64; nhead <= 16 routes by KV dtype
 # (bf16 -> bh16bn64, fp8 -> bh16bn128).
 #
-# For full decode with NUM_KV_SPLITS>1 each program writes per-split (acc, lse)
-# to a temp buffer and stage-2 (_mla_softmax_reducev_kernel) combines them.
+# Full decode for all regimes. For NUM_KV_SPLITS>1 stage-1 writes per-split acc +
+# fp32 lse; stage-2 (_mla_softmax_reducev_kernel) reduces into O. RETURN_LSE also
+# returns the merged fp32 lse [B, H] (stage-2 for splits>1, else stage-1).
 #
 # 3-stage software pipeline (double-buffered, BLOCK_N with 2x(BLOCK_N/2) KV slices):
 #   AC = async_copy (global->LDS), LL = load (LDS->reg), P = page, K = K-cache, V = V-cache
@@ -77,10 +74,13 @@ def _mla_decode_gluon(
     stride_o_b,
     stride_o_h,
     stride_o_s,
-    Lse,  # RETURN_LSE only; separate fp32 tensor (else pass None)
-    stride_lse_b,
-    stride_lse_h,
-    stride_lse_s,
+    Mid_lse,  # split>1: per-split fp32 lse [B, H, NUM_KV_SPLITS] (else None)
+    stride_mid_lse_b,
+    stride_mid_lse_h,
+    stride_mid_lse_s,
+    Final_lse,  # RETURN_LSE only: merged fp32 lse [B, H] (else None)
+    stride_final_lse_b,
+    stride_final_lse_h,
     BLOCK_H: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
@@ -116,6 +116,33 @@ def _mla_decode_gluon(
     else:
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
+
+    # split-KV: each program covers [split_kv_start, split_kv_end).
+    # OLD: ceil-based per_split. The LAST split could be empty (num_iter=0),
+    # which breaks the unconditional epilogue-2 consume. Kept here as commented
+    # reference; remove in cleanup.
+    # kv_len_per_split = gl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    # split_kv_start = kv_len_per_split * split_kv_id
+    # split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    #
+    # NEW: floor per_split with the last split absorbing the remainder
+    # (remainder = seq mod NUM_KV_SPLITS, in [0, NUM_KV_SPLITS)). Combined with
+    # the wrapper bound min_kv_seq_len >= NUM_KV_SPLITS this guarantees every
+    # split is non-empty (split_len >= floor >= 1, hence num_iter >= 1); bh64
+    # additionally bounds min_kv_seq_len so num_iter >= 3 for its gl.assume.
+    # Trade-off: at seqs just above the wrapper minimum the last CU does up to
+    # ~(floor + NUM_KV_SPLITS - 1)/floor more work than the others.
+    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = split_kv_start + kv_len_per_split
+    if split_kv_id == NUM_KV_SPLITS - 1:
+        split_kv_end = cur_batch_seq_len
+    num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
+    start_n = split_kv_start
+
+    # early return with empty kv slice to save compute
+    if split_kv_start >= split_kv_end:
+        return
 
     ######### layout setting begin #########
     # Q-side layouts + mfma_layout: switch by BLOCK_H.
@@ -324,29 +351,6 @@ def _mla_decode_gluon(
     e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
     e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
     acc = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout)
-
-    # split-KV: each program covers [split_kv_start, split_kv_end).
-    # OLD: ceil-based per_split. The LAST split could be empty (num_iter=0),
-    # which breaks the unconditional epilogue-2 consume. Kept here as commented
-    # reference; remove in cleanup.
-    # kv_len_per_split = gl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
-    # split_kv_start = kv_len_per_split * split_kv_id
-    # split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    #
-    # NEW: floor per_split with the last split absorbing the remainder
-    # (remainder = seq mod NUM_KV_SPLITS, in [0, NUM_KV_SPLITS)). Combined with
-    # the wrapper bound min_kv_seq_len >= NUM_KV_SPLITS this guarantees every
-    # split is non-empty (split_len >= floor >= 1, hence num_iter >= 1); bh64
-    # additionally bounds min_kv_seq_len so num_iter >= 3 for its gl.assume.
-    # Trade-off: at seqs just above the wrapper minimum the last CU does up to
-    # ~(floor + NUM_KV_SPLITS - 1)/floor more work than the others.
-    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
-    split_kv_start = kv_len_per_split * split_kv_id
-    split_kv_end = split_kv_start + kv_len_per_split
-    if split_kv_id == NUM_KV_SPLITS - 1:
-        split_kv_end = cur_batch_seq_len
-    num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
-    start_n = split_kv_start
 
     # Fold KV dequant scale into the QK temperature. For fp8 KV the real
     # logits are (Q @ K_fp8^T) * kv_scale * sm_scale; softmax is shift- but
@@ -626,23 +630,28 @@ def _mla_decode_gluon(
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
     else:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
-    if RETURN_LSE:
-        # Stage-1-only: separate fp32 Lse tensor [B, H, NUM_KV_SPLITS] for the
-        # host cross-GPU merge (works even at NUM_KV_SPLITS == 1).
-        offs_lse = cur_batch * stride_lse_b + cur_head_o * stride_lse_h + split_kv_id * stride_lse_s
+
+    ### store lse
+    blocked_lse: gl.constexpr = gl.BlockedLayout(size_per_thread=[1], threads_per_warp=[64], warps_per_cta=[4], order=[0])
+    cur_head_lse = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=blocked_lse)
+    if RETURN_LSE and NUM_KV_SPLITS == 1:
+        # split==1: single split is the whole sequence, so its lse is the final lse.
+        offs_final_lse = cur_batch * stride_final_lse_b + cur_head_lse * stride_final_lse_h
         lse = e_max + gl.log(e_sum)
+        lse = gl.convert_layout(lse, blocked_lse)
         if NHEAD < BLOCK_H:
-            gl.amd.cdna4.buffer_store(lse, ptr=Lse, offsets=offs_lse, mask=(cur_head_o < NHEAD))
+            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_lse < NHEAD))
         else:
-            gl.amd.cdna4.buffer_store(lse, ptr=Lse, offsets=offs_lse)
+            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
     elif NUM_KV_SPLITS > 1:
-        # Full-decode: per-split lse packed into O at the trailing slot for stage-2 reduce.
-        offs_o_lse = cur_batch * stride_o_b + cur_head_o * stride_o_h + split_kv_id * stride_o_s + HEAD_DIM_CKV
+        # per-split lse for stage-2 reduce.
+        offs_mid_lse = cur_batch * stride_mid_lse_b + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_s
         lse = e_max + gl.log(e_sum)
+        lse = gl.convert_layout(lse, blocked_lse)
         if NHEAD < BLOCK_H:
-            gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o_lse, mask=(cur_head_o < NHEAD))
+            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
         else:
-            gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o_lse)
+            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
 # fmt: on
 
 
@@ -650,63 +659,71 @@ def _mla_decode_gluon(
 @triton.jit
 def _mla_softmax_reducev_kernel(
     Logits,
-    B_seq_len,
+    Mid_lse,
     O,  # noqa: E741
+    Final_lse,
+    B_seq_len,  # same seq_info as the decode kernel to derive empty kv splits
     stride_l_b,
     stride_l_h,
     stride_l_s,
+    stride_ml_b,
+    stride_ml_h,
+    stride_ml_s,
     stride_o_b,
     stride_o_h,
+    stride_fl_b,
+    stride_fl_h,
     NUM_KV_SPLITS: tl.constexpr,
     HEAD_DIM_CKV: tl.constexpr,
+    HAS_FINAL_LSE: tl.constexpr,
     USE_2D_VIEW: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
 
+    # Recompute this batch's seq len exactly as the decode kernel did, so we can
+    # rederive which splits are empty. Stage-1 early-returns on empty splits
+    # (num_iter == 0) and writes nothing, so their logits_buf / mid_lse slots hold
+    # raw, uninitialised memory - they cannot be loaded or reduced.
+    if USE_2D_VIEW:
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+    else:
+        batch_page_start = tl.load(B_seq_len + cur_batch)
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
+    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
+
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
     offs_l = cur_batch * stride_l_b + cur_head * stride_l_h + offs_d_ckv
-    offs_l_1 = cur_batch * stride_l_b + cur_head * stride_l_h + HEAD_DIM_CKV
+    offs_ml = cur_batch * stride_ml_b + cur_head * stride_ml_h
 
     e_sum = 0.0
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
-    # OLD: conditional empty-split skip, needed because stage-1's ceil split
-    # could produce empty trailing splits. Kept here as commented reference;
-    # remove in cleanup. The B_seq_len arg is no longer read by this kernel.
-    # if not ALL_SPLITS_NONEMPTY:
-    #     if USE_2D_VIEW:
-    #         cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
-    #     else:
-    #         cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - tl.load(
-    #             B_seq_len + cur_batch
-    #         )
-        # if not ALL_SPLITS_NONEMPTY:
-        #     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
-        #     split_kv_start = kv_len_per_split * split_kv_id
-        #     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-        #     if split_kv_end <= split_kv_start:
-        #         continue
-
-    for split_kv_id in range(0, NUM_KV_SPLITS):
-
+    LOOP_START = NUM_KV_SPLITS - 1 if kv_len_per_split == 0 else 0
+    for split_kv_id in range(LOOP_START, NUM_KV_SPLITS):
         logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
-        logits_1 = tl.load(Logits + offs_l_1 + split_kv_id * stride_l_s)
+        logits_1 = tl.load(Mid_lse + offs_ml + split_kv_id * stride_ml_s)
 
         n_e_max = tl.maximum(logits_1, e_max)
-        old_scale = tl.exp(e_max - n_e_max)
+        old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
         acc *= old_scale
-        exp_logic = tl.exp(logits_1 - n_e_max)
+        exp_logic = tl.where(logits_1 == -float("inf"), 0.0, tl.exp(logits_1 - n_e_max))
         acc += exp_logic * logits
 
         e_sum = e_sum * old_scale + exp_logic
         e_max = n_e_max
 
+    out = acc / e_sum if e_sum > 0.0 else tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
     tl.store(
         O + cur_batch * stride_o_b + cur_head * stride_o_h + offs_d_ckv,
-        acc / e_sum,
+        out,
     )
+    if HAS_FINAL_LSE:
+        tl.store(
+            Final_lse + cur_batch * stride_fl_b + cur_head * stride_fl_h,
+            e_max + tl.log(e_sum),
+        )
 # fmt: on
 
 
@@ -716,8 +733,7 @@ def mla_decode_gluon(
     # Shared: kv_c=[N, kv_lora_rank+qk_rope_head_dim], k_pe=None,              kv_pe_offset=kv_lora_rank
     # Split:  kv_c=[N, kv_lora_rank],                k_pe=[N,qk_rope_head_dim], kv_pe_offset=0
     kv_c,
-    # return_lse=False: final output [batch, nhead, kv_lora_rank].
-    # return_lse=True:  per-split logits [batch, nhead, NUM_KV_SPLITS, kv_lora_rank].
+    # final output [batch, nhead, kv_lora_rank].
     o,
     page_table,  # 2D: block_table [batch, max_seqlen] | 1D: kv_indices [total_kv]
     seq_info,  # 2D: cache_seqlens [batch]           | 1D: kv_indptr [batch+1]
@@ -732,18 +748,14 @@ def mla_decode_gluon(
     """
     Gluon MLA decode (gfx950 / CDNA4).
 
-    return_lse=False (default): full decode. Runs stage-1 + stage-2 reduce and
-        writes the final attention into the caller's `o` ([batch, nhead,
-        kv_lora_rank]); returns (o, None).
+    Always runs the full decode (stage-1 + stage-2 reduce, or the stage-1-only
+    fast path when NUM_KV_SPLITS==1) and writes the final attention into the
+    caller's `o` ([batch, nhead, kv_lora_rank]).
 
-    return_lse=True: stage-1 only, for the Decode-Context-Parallel (DCP)
-        workload where the KV cache is sharded across GPUs and the host does
-        the cross-GPU softmax merge. Only the bh16bn64 regime (nhead<=16, bf16
-        KV) supports it. The stage-2 reduce is skipped; the caller's `o` is the
-        per-split logits buffer [batch, nhead, NUM_KV_SPLITS, kv_lora_rank]
-        (bf16), and a per-split fp32 lse [batch, nhead, NUM_KV_SPLITS] is
-        allocated here and returned: (o, lse). Tuned for batch*ctx_len in the
-        10K..100K total-token range; NUM_KV_SPLITS = max(1, 256 // batch_size).
+    return_lse=False (default): returns (o, None).
+
+    return_lse=True: additionally returns the merged log-sum-exp, a separate
+        fp32 tensor [batch, nhead]
     """
     if k_pe is None:
         k_pe = kv_c
@@ -780,10 +792,6 @@ def mla_decode_gluon(
 
     PAGE_SIZE = 1
 
-    assert not (
-        return_lse and REGIME != "bh16bn64"
-    ), f"mla_decode_gluon: return_lse=True is only supported for the bh16bn64 regime (nhead<=16, bf16 KV), got REGIME={REGIME}"
-
     if REGIME == "bh64":
         BLOCK_H, BLOCK_N = 64, 64
         NUM_XCDS = get_num_xcds()
@@ -815,22 +823,24 @@ def mla_decode_gluon(
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # 2-D grid (batch, split); float-floor keeps total WGs = B * NUM_KV_SPLITS
-        # <= 256 (one MI350 wave). For batch_size=1 this is 256, matching the
-        # original single-batch layout.
-        NUM_KV_SPLITS = max(1, 256 // batch_size)
+        # 2-D grid (batch, split). Both bh16 regimes support num_iter in {1, 2, ...}
+        # (no gl.assume(num_iter >= 3) in the kernel); the only correctness need is
+        # that every split is non-empty (floor split size = min_kv_seq_len //
+        # NUM_KV_SPLITS >= 1). Each clamp below keeps NUM_KV_SPLITS <= min_kv_seq_len,
         if REGIME == "bh16bn128":
-            # fp8 path is not generalized to multi-batch.
             assert (
                 batch_size == 1
             ), f"mla_decode_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
-        # The bh16 regimes support the general case num_iter in {1, 2, ...} (no
-        # gl.assume(num_iter >= 3) in the kernel), so the only requirement is that
-        # every split is non-empty: floor split size >= 1, i.e. min_kv_seq_len >=
-        # NUM_KV_SPLITS. Holds for both full-decode and return_lse modes.
-        assert (
-            min_kv_seq_len >= NUM_KV_SPLITS
-        ), f"mla_decode_gluon[{REGIME}] requires min_kv_seq_len >= NUM_KV_SPLITS (= max(1, 256//B) = {NUM_KV_SPLITS}), got {min_kv_seq_len}"
+            NUM_KV_SPLITS = max(1, min(256 // batch_size, min_kv_seq_len))
+        else:  # bh16bn64
+            # Fill ~256 WGs (total WGs = B * NUM_KV_SPLITS <= 256, one MI350 wave),
+            # but never split a sequence into more blocks than it has: bound by the
+            # shortest seq's block count so every split holds >= 1 block (no wasted
+            # partial-block MFMA). For min_kv_seq_len <= BLOCK_N this collapses to
+            # NUM_KV_SPLITS=1, i.e. one WG per batch computing the whole (short) seq.
+            NUM_KV_SPLITS = max(
+                1, min(256 // batch_size, triton.cdiv(min_kv_seq_len, BLOCK_N))
+            )
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
@@ -843,41 +853,33 @@ def mla_decode_gluon(
     max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
     within_2gb = max_kv_bytes <= 0x80000000  # 2 GB
 
-    if return_lse:
-        # Stage-1-only: the caller's `o` IS the per-split logits buffer; no temp,
-        # no reduce. lse is a separate fp32 tensor, allocated here and returned.
-        assert o.shape == (
-            batch_size,
-            nhead,
-            NUM_KV_SPLITS,
-            head_dim_ckv,
-        ), f"return_lse=True requires o of shape [{batch_size}, {nhead}, {NUM_KV_SPLITS}, {head_dim_ckv}], got {tuple(o.shape)}"
-        assert (
-            o.dtype == torch.bfloat16
-        ), f"return_lse=True requires o bf16, got {o.dtype}"
-        logits_buf = o
-        lse = torch.empty(
-            (batch_size, nhead, NUM_KV_SPLITS),
-            dtype=torch.float32,
-            device=q_nope.device,
-        )
-        stride_lse_b, stride_lse_h, stride_lse_s = lse.stride()
-    elif NUM_KV_SPLITS == 1:
-        # Fast path: stage-1 writes the final attention output directly to o,
-        # no temp buffer, no reduce.
+    if NUM_KV_SPLITS == 1:
+        # Fast path: stage-1 writes the final attention (and lse) directly to o.
         logits_buf = o.view(batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv)
-        lse = None
-        stride_lse_b, stride_lse_h, stride_lse_s = 0, 0, 0
+        mid_lse = None
+        stride_mid_lse_b, stride_mid_lse_h, stride_mid_lse_s = 0, 0, 0
     else:
-        # Stage-1 writes per-split (acc, lse) to a temp buffer; the trailing
-        # slot at index head_dim_ckv holds the per-split lse.
+        # stage-1 -> per-split (acc, lse); stage-2 reduces into o.
         logits_buf = torch.empty(
-            (batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv + 1),
+            (batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv),
             dtype=o.dtype,
             device=o.device,
         )
-        lse = None
-        stride_lse_b, stride_lse_h, stride_lse_s = 0, 0, 0
+        mid_lse = torch.empty(
+            (batch_size, nhead, NUM_KV_SPLITS),
+            dtype=torch.float32,
+            device=o.device,
+        )
+        stride_mid_lse_b, stride_mid_lse_h, stride_mid_lse_s = mid_lse.stride()
+
+    if return_lse:
+        final_lse = torch.empty(
+            (batch_size, nhead), dtype=torch.float32, device=q_nope.device
+        )
+        stride_final_lse_b, stride_final_lse_h = final_lse.stride()
+    else:
+        final_lse = None
+        stride_final_lse_b, stride_final_lse_h = 0, 0
 
     if REGIME == "bh64":
         grid = (
@@ -909,10 +911,13 @@ def mla_decode_gluon(
         logits_buf.stride(0),
         logits_buf.stride(1),
         logits_buf.stride(2),
-        lse,
-        stride_lse_b,
-        stride_lse_h,
-        stride_lse_s,
+        mid_lse,
+        stride_mid_lse_b,
+        stride_mid_lse_h,
+        stride_mid_lse_s,
+        final_lse,
+        stride_final_lse_b,
+        stride_final_lse_h,
         BLOCK_H=BLOCK_H,
         BLOCK_N=BLOCK_N,
         NUM_KV_SPLITS=NUM_KV_SPLITS,
@@ -928,29 +933,33 @@ def mla_decode_gluon(
         RETURN_LSE=return_lse,
     )
 
-    if return_lse:
-        # Host does the cross-GPU softmax merge over splits.
-        return o, lse
+    if NUM_KV_SPLITS == 1:
+        # Fast path: stage-1 already wrote o (and lse) directly.
+        return o, final_lse
 
-    if NUM_KV_SPLITS > 1:
-        # Stage-2: combine per-split (acc, lse) into the final attention in o.
-        # Stage-1's floor-with-remainder-on-last split scheme guarantees every
-        # split is non-empty, so the empty-split skip (and its ALL_SPLITS_NONEMPTY
-        # constexpr) is no longer needed in stage-2.
-        grid_reduce = (batch_size, nhead)
-        _mla_softmax_reducev_kernel[grid_reduce](
-            logits_buf,
-            seq_info,
-            o,
-            logits_buf.stride(0),
-            logits_buf.stride(1),
-            logits_buf.stride(2),
-            o.stride(0),
-            o.stride(1),
-            NUM_KV_SPLITS=NUM_KV_SPLITS,
-            HEAD_DIM_CKV=head_dim_ckv,
-            USE_2D_VIEW=use_2d_view,
-            num_warps=8,
-        )
+    # Stage-2: reduce per-split (acc, lse) into o (and lse when return_lse).
+    grid_reduce = (batch_size, nhead)
+    _mla_softmax_reducev_kernel[grid_reduce](
+        logits_buf,
+        mid_lse,
+        o,
+        final_lse,
+        seq_info,
+        logits_buf.stride(0),
+        logits_buf.stride(1),
+        logits_buf.stride(2),
+        stride_mid_lse_b,
+        stride_mid_lse_h,
+        stride_mid_lse_s,
+        o.stride(0),
+        o.stride(1),
+        stride_final_lse_b,
+        stride_final_lse_h,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
+        HEAD_DIM_CKV=head_dim_ckv,
+        HAS_FINAL_LSE=return_lse,
+        USE_2D_VIEW=use_2d_view,
+        num_warps=8,
+    )
 
-    return o, None
+    return o, final_lse
