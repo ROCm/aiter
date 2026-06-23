@@ -217,15 +217,60 @@ D=512 uniform** — it scales up nicely with D and the GPU-filling B=1024.
 
 ---
 
+## EXP-2026-06-23c — Phase 1 cheap wins on `grad_dense_partials` (North Star B=1024, D=256)
+
+**Scope.** Phase 1 (1a FMA fusion + 1b occupancy/register/LDS) on the dominant
+`grad_dense_partials` kernel, evaluated at the **production shape B=1024, D=256**
+(D=K=N; `max_seq_len=512`). Kernel edits live in `jagged_dense_bmm_bwd.py`; D was
+set to 256 for measurement then reverted (repo default stays D=128). All T-1↔T deltas
+are from `rocprof-compute analyze` with **multiple `--path`** (raw counters), kernel
+`-k 0` = `grad_dense_partials`.
+
+**Changes (all kept; correctness `cos≈1.0`, uniform+skew, D=128 and D=256):**
+- **1a — FMA fusion.** Inner contraction now uses explicit `fx.math.fma(j, d, acc)`
+  instead of `acc + j*d`, which was lowering to unfused mul+add. → `F32-FMA` 0 →
+  268M, VALU instrs −31%.
+- **1b — output-tiling.** Each workgroup now owns one `DDENSE_BK×DDENSE_BN = 128×128`
+  output sub-tile of the `(K,N)` block (grid gains a `NK·NN` factor), so per-thread
+  accumulators stay fixed at `8×8` and **LDS is fixed at 32 KB regardless of D**
+  (was 64 KB @ D=256, 128 KB @ D=512). This already removes the *partials* kernel's
+  D=512 LDS blocker (the bias/reduce 256-thread blocker is separate, still open).
+- **1b — loop-carried accumulators.** Removed the per-m-tile `acc` rmem load/store
+  round-trip; accumulators are carried through the dynamic m-tile loop. Cleaner,
+  perf-neutral (VGPR pinned at 128 either way → kernel is not VGPR-alloc-bound).
+
+### `grad_dense_partials` results (rocprof mean µs/call)
+| shape | T-1 | T(1a) | T(1b, final) | speedup | artifacts |
+|---|--:|--:|--:|--:|---|
+| **B=1024, D=256 (North Star)** | 5263.6 | 4537.0 | **3930.3** | **1.34×** | `phase1_t0/t1a/t1b_b1024_d256/`, `phase1_cmp_*` |
+| B=64, D=128 (repo default) | 79.3 | — | **65.8** | **1.21×** | `bwd_full_all` vs `phase1_t1b_b64_d128/`, `phase1_cmp_d128_*` |
+
+Supporting counters @ D=256 (T-1 → T1b): VALU instrs 881M → **516M (−41%)**;
+VALU FLOPs 8.0% → **10.7%** of peak; `F32-FMA` 0 → 268M; Dependency-Wait **+20%**;
+Wavefront occupancy 4.38% → **2.68%**; VGPR 128 → 128.
+
+### Gate: **1.34× < 1.5× target → cheap wins do not clear the bar → go to Phase 2.**
+The diagnosis is now unambiguous and matches the Phase-0 verdict: with the MULs fused
+and registers/LDS bounded, the kernel is **dependency-wait / latency-bound** on the
+loop-carried *scalar fp32* accumulation (Dependency-Wait rose to dominate; occupancy
+fell yet runtime improved → not occupancy-bound, not VALU-throughput-bound). The only
+remaining lever is replacing the scalar FMA reduction with **bf16 MFMA (Phase 2)**,
+which both raises the compute ceiling 16× and breaks the dependency chain. Phase 1 is
+banked as a strict improvement (1.2–1.34×, and it pays down the D=512 LDS blocker);
+**proceed to Phase 2.**
+
+---
+
 ## Current status (2026-06-23)
-Tooling works end-to-end; baseline + Phase-0 sweep + required production shapes
-(B=1024, D=256/512) characterized. No kernel changes yet. Phase-0 gate + EXP-…b both
-say the dominant `grad_dense` path is the blocker: algorithm-bound at D≤256 (flat
-~13 TF/s, occupancy ~3.5%) and **structurally unbuildable at D=512** (LDS 128 KB >
-64 KB, 1024 acc VGPRs, 512-thread reduce block). `grad_jagged` is healthy and scales
-to 235 TF/s @ D=512. Next action is **Phase 2 (MFMA-ize `grad_dense_partials`)**,
-plus the cheap `block ≤ 256` enabling fixes for `grad_bias`/`grad_dense_reduce` at
-D≥512; `grad_jagged` occupancy (Phase 3) remains a secondary win.
+Tooling works end-to-end; baseline + Phase-0 sweep + production shapes (B=1024,
+D=256/512) characterized; **Phase 1 done** (EXP-2026-06-23c). `grad_dense_partials`
+got FMA fusion + output-tiling + loop-carried accumulators: **1.34× @ D=256 / 1.21×
+@ D=128**, correctness green, and LDS is now fixed at 32 KB (D=512 partials LDS
+blocker removed). Phase-1 gate (1.5×) **not met** — the kernel is now latency/
+dependency-bound on the scalar fp32 chain, exactly the Phase-0 verdict. Repo default
+restored to D=128. **Next: Phase 2 (MFMA-ize `grad_dense_partials`)**, plus the cheap
+`block ≤ 256` fixes for `grad_bias`/`grad_dense_reduce` to fully unlock D=512;
+`grad_jagged` (healthy, 235 TF/s @ D=512) occupancy is a later secondary win.
 
 ---
 
@@ -260,7 +305,12 @@ Baseline to beat (EXP-2026-06-22a, b64/m512/uniform): `grad_dense_partials`
   workgroups and/or raise `SPLIT`; cut register pressure to lift occupancy.
 - **Target metrics:** F32-FMA>0 & VALU instrs ~halved; Dependency-Wait ↓;
   occupancy ↑; µs ↓. **Gate:** ≥1.5× on `grad_dense_partials` TF/s.
-- [ ] 1a FMA fusion  [ ] 1b output-tiling/SPLIT + regs  [ ] re-profile + EXP block
+- [x] 1a FMA fusion  [x] 1b output-tiling + loop-carried acc (fixed regs/LDS)
+  [x] re-profile + EXP block (EXP-2026-06-23c). **Result: 1.34× @ D=256 / 1.21×
+  @ D=128 — below the 1.5× gate.** F32-FMA achieved & VALU −41%, but Dependency-Wait
+  *rose* and occupancy *fell* while runtime dropped → confirmed **latency/dep-bound on
+  the scalar fp32 chain**, not VALU/occupancy. Cheap wins exhausted → **go to Phase 2**.
+  (Side benefit: output-tiling bounds partials LDS to 32 KB → D=512 LDS blocker gone.)
 
 ### Phase 2 — MFMA-ize `grad_dense_partials` (the big lever)
 - **Why:** `MFMA Instr=0`; scalar fp32 ceiling (81.7 TF/s) is 16× below bf16 MFMA
