@@ -2,9 +2,8 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
-#include <optional>
-#include <torch/extension.h>
 #include "aiter_tensor.h"
+#include <optional>
 
 namespace aiter {
 
@@ -41,7 +40,7 @@ void gated_rmsnorm_fp8_group_quant(
     double epsilon,
     int group_size,
     bool transpose_scale = false,
-    std::optional<torch::Tensor> gemm_out_zero_init = std::nullopt);
+    std::optional<aiter_tensor_t> gemm_out_zero_init = std::nullopt);
 
 
 } // namespace aiter

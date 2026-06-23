@@ -323,7 +323,7 @@ void gated_rmsnorm_fp8_group_quant(
     double epsilon,
     int group_size,
     bool transpose_scale,
-    std::optional<torch::Tensor> gemm_out_zero_init)
+    std::optional<aiter_tensor_t> gemm_out_zero_init)
 {
     // Validate input types
     AITER_CHECK(x.is_gpu(), "Input x must be on CUDA device");
@@ -337,21 +337,28 @@ void gated_rmsnorm_fp8_group_quant(
     // SplitK GEMM zero-init fusion: optional buffer to zero-init in this kernel
     void* zero_init_ptr = nullptr;
     int64_t zero_init_num_uint4 = 0;
-    if (gemm_out_zero_init.has_value() && gemm_out_zero_init->defined())
+    if(gemm_out_zero_init.has_value())
     {
-        const auto& y = gemm_out_zero_init.value();
-        TORCH_CHECK(y.is_cuda(), "gemm_out_zero_init must be on CUDA device");
-        TORCH_CHECK(y.device() == x.device(),
-                    "gemm_out_zero_init must be on the same device as inputs");
-        TORCH_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
-                    "gemm_out_zero_init must be 16-byte aligned");
-        TORCH_CHECK(y.is_contiguous(), "gemm_out_zero_init must be contiguous");
+        const aiter_tensor_t& y = *gemm_out_zero_init;
+        AITER_CHECK(y.is_gpu(),
+                    __func__,
+                    " gemm_out_zero_init must be on GPU");
+        AITER_CHECK(gemm_out_zero_init->device_id == x.device_id,
+                    __func__,
+                    " gemm_out_zero_init must be on the same device as inputs");
+        AITER_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
+                    __func__,
+                    " gemm_out_zero_init base pointer must be 16-byte aligned");
+        AITER_CHECK(y.is_contiguous(),
+                    __func__,
+                    " gemm_out_zero_init must be contiguous");
         const int64_t total_bytes = y.numel() * y.element_size();
-        TORCH_CHECK(total_bytes % 16 == 0,
-                    "gemm_out_zero_init total bytes must be a multiple of 16, got ",
+        AITER_CHECK(total_bytes % 16 == 0,
+                    __func__,
+                    " gemm_out_zero_init total bytes must be a multiple of 16, got ",
                     total_bytes);
-        zero_init_ptr        = y.data_ptr();
-        zero_init_num_uint4  = total_bytes / 16;
+        zero_init_ptr       = y.data_ptr();
+        zero_init_num_uint4 = total_bytes / 16;
     }
 
     // Dispatch based on input/output types
