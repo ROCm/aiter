@@ -521,6 +521,9 @@ def compile_flydsl_moe_stage1(
                 group_size=32,
                 out_dtype=out_dtype,
                 use_cshuffle_epilog=_use_cshuffle,
+                # bf16 E8M0 block scale (lossless for power-of-two) halves weight-
+                # scale HBM traffic vs f32. fp4_bf16 only; a8w4 handles scale at load.
+                scale_is_bf16=(_decode_in_dtype == "fp4_bf16"),
                 k_batch=k_batch,
             )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
@@ -635,6 +638,8 @@ def compile_flydsl_moe_stage2(
                 group_size=32,
                 out_dtype=out_dtype,
                 accumulate=accumulate,
+                # bf16 E8M0 block scale halves scale HBM traffic; fp4_bf16 only.
+                scale_is_bf16=(_decode_in_dtype == "fp4_bf16"),
             )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 

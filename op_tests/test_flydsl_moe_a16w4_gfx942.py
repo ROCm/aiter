@@ -1,21 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FlyDSL MX-FP4 a16w4 fused-MoE correctness test (Track A).
+"""gfx942 FlyDSL a16w4 fused-MoE correctness test (Track A).
 
-a16w4 = bf16 activation x MX-FP4 (E2M1, per-1x32 E8M0 block scale) weight.
+Supported weight dtypes for ``--bench``:
 
-On gfx942 (CDNA3) there is no scaled MX-FP4 MFMA, so the FlyDSL path
-dequantizes the FP4 weight to bf16 in-kernel (``dequant_fp4_to_bf16``) and runs
-the legacy bf16 MFMA hot loop -- the ``moe_gemm_2stage`` ``in_dtype="fp4_bf16"``
-kernels.  This test exercises those (re-synced) vendored kernels directly and
-validates both stages against a torch reference that decodes the E2M1 codes via
-the canonical LUT and applies the per-32 power-of-two block scale.
+* ``fp4_bf16`` (default) -- bf16 activation x MX-FP4 (E2M1, per-1x32 E8M0 block
+  scale) weight.  On gfx942 there is no scaled MX-FP4 MFMA, so the FlyDSL path
+  dequantizes FP4 to bf16 in-kernel and runs the ``in_dtype="fp4_bf16"`` kernels.
+* ``int4_bf16`` -- bf16 activation x packed int4 weight with per-32 bf16 groupwise
+  scale (``in_dtype="int4_bf16"``, ``scale_is_bf16=True``).
+
+Pytest coverage remains fp4-only.  Bench runs one dtype per invocation (no
+side-by-side compare).
 
 Usage:
     python op_tests/test_flydsl_moe_a16w4_gfx942.py
-    python op_tests/test_flydsl_moe_a16w4_gfx942.py --bench
-    python op_tests/test_flydsl_moe_a16w4_gfx942.py --bench --no-verify
+    python op_tests/test_flydsl_moe_a16w4_gfx942.py --bench --dtype fp4_bf16
+    python op_tests/test_flydsl_moe_a16w4_gfx942.py --bench --dtype int4_bf16
+    python op_tests/test_flydsl_moe_a16w4_gfx942.py --bench --dtype int4_bf16 --no-verify
     pytest op_tests/test_flydsl_moe_a16w4_gfx942.py
 """
 
@@ -25,6 +28,7 @@ import pytest
 import torch
 
 import flydsl.compiler as flyc
+from aiter import pertoken_quant
 from aiter.fused_moe import moe_sorting
 from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
     compile_moe_gemm1,
@@ -36,6 +40,8 @@ from aiter.ops.shuffle import shuffle_weight, shuffle_scale_for_int4
 # Canonical MX-FP4 (E2M1) code -> magnitude LUT (matches fp4_utils.mxfp4_to_f32).
 _E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
              -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+_BENCH_DTYPES = ("fp4_bf16", "int4_bf16")
 
 
 def _is_gfx942() -> bool:
@@ -60,6 +66,28 @@ def _pack_shuffled_int8_to_packed_int4_no_perm(x_shuf_i8: torch.Tensor) -> torch
     out[:, 2] = u[:, 2] | (u[:, 6] << 4)
     out[:, 3] = u[:, 3] | (u[:, 7] << 4)
     return out.view(-1).to(torch.int8)
+
+
+def _bridge_dtypes(dtype: str) -> dict:
+    """Map bench dtype label to flydsl_moe_stage* a_dtype/b_dtype kwargs."""
+    if dtype == "fp4_bf16":
+        return dict(a_dtype="bf16", b_dtype="fp4")
+    if dtype == "int4_bf16":
+        return dict(a_dtype="bf16", b_dtype="int4")
+    raise ValueError(f"unsupported bench dtype {dtype!r}; expected one of {_BENCH_DTYPES}")
+
+
+def _decode_int4_w(w_int: torch.Tensor, scale_groups: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Decode packed-int4 int8 codes [E, N, K] with per-group bf16 scale.
+
+    scale_groups: [E, K//group_size, N] (Opt 0 layout, matches shuffle_scale_for_int4).
+    Returns decoded weights as f32 [E, N, K].
+    """
+    w = w_int.to(torch.float32)
+    E, N, K = w.shape
+    sc = scale_groups.permute(0, 2, 1).reshape(E, N, K // group_size)
+    sc = sc.repeat_interleave(group_size, dim=2)
+    return w * sc.float()
 
 
 def _decode_w(codes_i8: torch.Tensor, scale_groups: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -135,29 +163,59 @@ def _prep_w4(codes_i8: torch.Tensor):
     return packed
 
 
-def _gen_w1(dev, experts, inter_dim, model_dim, group_size):
-    """Random MX-FP4 stage1 weight: E2M1 codes + per-32 pow2 (E8M0) group scale."""
+def _gen_w1(dev, experts, inter_dim, model_dim, group_size, dtype: str = "fp4_bf16"):
+    """Random stage1 weight for fp4_bf16 (MX-FP4) or int4_bf16 (packed int4)."""
     N1 = 2 * inter_dim
-    codes = torch.randint(0, 16, (experts, N1, model_dim), device=dev, dtype=torch.int8)
-    exps = torch.randint(-2, 3, (experts, model_dim // group_size, N1), device=dev)
-    scale_groups = torch.pow(2.0, exps.to(torch.float32))
+    if dtype == "fp4_bf16":
+        codes = torch.randint(0, 16, (experts, N1, model_dim), device=dev, dtype=torch.int8)
+        exps = torch.randint(-2, 3, (experts, model_dim // group_size, N1), device=dev)
+        # bf16 E8M0 scale (lossless: power-of-two fits bf16's 8 exp bits) -- halves
+        # weight-scale HBM traffic vs f32, matching the int4 path's scale_is_bf16.
+        scale_groups = torch.pow(2.0, exps.to(torch.float32)).to(torch.bfloat16)
+    elif dtype == "int4_bf16":
+        w_fp32 = torch.randn((experts, N1, model_dim), device=dev, dtype=torch.float32) * 0.05
+        codes, _ = pertoken_quant(w_fp32, quant_dtype=torch.int8, dtypeMax=7)
+        scale_groups = (
+            torch.rand(experts, model_dim // group_size, N1, device=dev, dtype=torch.float32) * 0.05 + 0.005
+        ).to(torch.bfloat16)
+    else:
+        raise ValueError(f"unsupported weight dtype {dtype!r}")
     kernel = _prep_w4(codes)
     scale_1d = shuffle_scale_for_int4(scale_groups, group_size=group_size).view(-1).contiguous()
     return codes, scale_groups, kernel, scale_1d
 
 
-def _gen_w2(dev, experts, inter_dim, model_dim, group_size):
-    codes = torch.randint(0, 16, (experts, model_dim, inter_dim), device=dev, dtype=torch.int8)
-    exps = torch.randint(-2, 3, (experts, inter_dim // group_size, model_dim), device=dev)
-    scale_groups = torch.pow(2.0, exps.to(torch.float32))
+def _gen_w2(dev, experts, inter_dim, model_dim, group_size, dtype: str = "fp4_bf16"):
+    if dtype == "fp4_bf16":
+        codes = torch.randint(0, 16, (experts, model_dim, inter_dim), device=dev, dtype=torch.int8)
+        exps = torch.randint(-2, 3, (experts, inter_dim // group_size, model_dim), device=dev)
+        # bf16 E8M0 scale (lossless: power-of-two fits bf16's 8 exp bits) -- halves
+        # weight-scale HBM traffic vs f32, matching the int4 path's scale_is_bf16.
+        scale_groups = torch.pow(2.0, exps.to(torch.float32)).to(torch.bfloat16)
+    elif dtype == "int4_bf16":
+        w_fp32 = torch.randn((experts, model_dim, inter_dim), device=dev, dtype=torch.float32) * 0.05
+        codes, _ = pertoken_quant(w_fp32, quant_dtype=torch.int8, dtypeMax=7)
+        scale_groups = (
+            torch.rand(experts, inter_dim // group_size, model_dim, device=dev, dtype=torch.float32) * 0.05 + 0.005
+        ).to(torch.bfloat16)
+    else:
+        raise ValueError(f"unsupported weight dtype {dtype!r}")
     kernel = _prep_w4(codes)
     scale_1d = shuffle_scale_for_int4(scale_groups, group_size=group_size).view(-1).contiguous()
     return codes, scale_groups, kernel, scale_1d
 
 
-def _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, group_size):
+def _decode_stage_w(w_codes, scale_groups, group_size, dtype: str) -> torch.Tensor:
+    if dtype == "fp4_bf16":
+        return _decode_w(w_codes, scale_groups, group_size)
+    if dtype == "int4_bf16":
+        return _decode_int4_w(w_codes, scale_groups, group_size)
+    raise ValueError(f"unsupported weight dtype {dtype!r}")
+
+
+def _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, group_size, dtype: str = "fp4_bf16"):
     dev = g["dev"]
-    w1_scaled = _decode_w(w1_codes, scale_w1_groups, group_size).to(torch.bfloat16)
+    w1_scaled = _decode_stage_w(w1_codes, scale_w1_groups, group_size, dtype).to(torch.bfloat16)
     x = g["x"]
     tokens, topk = x.shape[0], g["topk_ids"].shape[1]
     ref = torch.empty((tokens, topk, inter_dim), device=dev, dtype=torch.float32)
@@ -170,9 +228,9 @@ def _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, group_size):
     return ref
 
 
-def _ref_stage2(g, a2, w2_codes, scale_w2_groups, model_dim, group_size):
+def _ref_stage2(g, a2, w2_codes, scale_w2_groups, model_dim, group_size, dtype: str = "fp4_bf16"):
     dev = g["dev"]
-    w2_scaled = _decode_w(w2_codes, scale_w2_groups, group_size).to(torch.bfloat16)
+    w2_scaled = _decode_stage_w(w2_codes, scale_w2_groups, group_size, dtype).to(torch.bfloat16)
     tokens, topk = a2.shape[0], a2.shape[1]
     # doweight off / unit weights (topk=1): kernel sums slot down-projections.
     ref = torch.zeros((tokens, model_dim), device=dev, dtype=torch.float32)
@@ -198,7 +256,7 @@ def _run_stage1(tokens, model_dim, inter_dim, experts, topk, tile_m, tile_n, til
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage1=False,
         in_dtype="fp4_bf16", group_size=group_size, out_dtype="bf16",
-        use_cshuffle_epilog=False, scale_is_bf16=False,
+        use_cshuffle_epilog=False, scale_is_bf16=True,
     )
     # Pass tensors directly (memref-typed) -- matches the moe_gemm launcher
     # signature: out, a, w, a_scale, w_scale, sorted_ids, sorted_eids,
@@ -232,7 +290,7 @@ def _run_stage2(g, a2, tokens, model_dim, inter_dim, experts, topk,
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage2=True,
         in_dtype="fp4_bf16", group_size=group_size, out_dtype="bf16",
-        accumulate=True, scale_is_bf16=False,
+        accumulate=True, scale_is_bf16=True,
     )
     args = (
         target, a2.reshape(tokens * topk, inter_dim), w2_kernel, empty_a_scale, scale_w2_1d,
@@ -351,8 +409,8 @@ def _main():
     return 0 if (ok1 and ok2 and ok3 and ok4) else 1
 
 
-def _bench(shape, num_iters=50, num_warmup=10, verify=True):
-    """Time the public-bridge stage1/stage2 decode kernels and report TFLOPS.
+def _bench(shape, dtype: str = "fp4_bf16", num_iters=50, num_warmup=10, verify=True):
+    """Time the public-bridge stage1/stage2 kernels and report TFLOPS.
 
     When ``verify`` is True (default), runs one correctness pass at the bench
     shape via ``_check`` against the torch ref for stage1 and stage2 *before*
@@ -360,11 +418,18 @@ def _bench(shape, num_iters=50, num_warmup=10, verify=True):
     failure, timing is skipped. Pass ``verify=False`` (``--no-verify``) to
     benchmark only.
 
+    ``dtype`` selects the weight path: ``fp4_bf16`` (MX-FP4 a16w4) or
+    ``int4_bf16`` (packed int4 + bf16 groupwise scale). One dtype per run.
+
     Weights/scales are built once so run_perftest times the kernel launch, not
     the input preparation. Stage2 re-zeros its output each call (atomic mode),
     so repeated timing iterations do not over-accumulate.
     """
     from aiter.test_common import run_perftest
+
+    if dtype not in _BENCH_DTYPES:
+        raise ValueError(f"unsupported bench dtype {dtype!r}; expected one of {_BENCH_DTYPES}")
+    bridge = _bridge_dtypes(dtype)
 
     tokens, model_dim, inter_dim = shape["tokens"], shape["model_dim"], shape["inter_dim"]
     experts, topk, gsize = shape["experts"], shape["topk"], 32
@@ -373,10 +438,10 @@ def _bench(shape, num_iters=50, num_warmup=10, verify=True):
     g = _gen_common(tokens, model_dim, inter_dim, experts, topk, tile_m)
     dev = g["dev"]
     w1_codes, scale_w1_groups, w1_kernel, scale_w1_1d = _gen_w1(
-        dev, experts, inter_dim, model_dim, gsize
+        dev, experts, inter_dim, model_dim, gsize, dtype=dtype
     )
     w2_codes, scale_w2_groups, w2_kernel, scale_w2_1d = _gen_w2(
-        dev, experts, inter_dim, model_dim, gsize
+        dev, experts, inter_dim, model_dim, gsize, dtype=dtype
     )
     w1 = w1_kernel.view(experts, 2 * inter_dim, model_dim // 2)
     w2 = w2_kernel.view(experts, model_dim, inter_dim // 2)
@@ -387,12 +452,13 @@ def _bench(shape, num_iters=50, num_warmup=10, verify=True):
             sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
             num_valid_ids=g["num_valid_ids"], topk=topk,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", act="silu",
+            out_dtype="bf16", act="silu",
             w1_scale=scale_w1_1d, a1_scale=None, sorted_weights=None,
+            **bridge,
         )
         torch.cuda.synchronize()
-        ref1 = _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, gsize)
-        if not _check(ref1, out1.reshape(ref1.shape), "bench_stage1_a16w4_bridge"):
+        ref1 = _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, gsize, dtype=dtype)
+        if not _check(ref1, out1.reshape(ref1.shape), f"bench_stage1_{dtype}_bridge"):
             print("[bench] stage1 CORRECTNESS FAILED -- not timing")
             return 1
         a2 = out1.reshape(tokens, topk, inter_dim).to(torch.bfloat16)
@@ -402,12 +468,13 @@ def _bench(shape, num_iters=50, num_warmup=10, verify=True):
             sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
             num_valid_ids=g["num_valid_ids"], out=out2, topk=topk,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", mode="atomic",
+            out_dtype="bf16", mode="atomic",
             w2_scale=scale_w2_1d, a2_scale=None, sorted_weights=None,
+            **bridge,
         )
         torch.cuda.synchronize()
-        ref2 = _ref_stage2(g, a2, w2_codes, scale_w2_groups, model_dim, gsize)
-        if not _check(ref2, out2, "bench_stage2_a16w4_bridge"):
+        ref2 = _ref_stage2(g, a2, w2_codes, scale_w2_groups, model_dim, gsize, dtype=dtype)
+        if not _check(ref2, out2, f"bench_stage2_{dtype}_bridge"):
             print("[bench] stage2 CORRECTNESS FAILED -- not timing")
             return 1
 
@@ -417,8 +484,9 @@ def _bench(shape, num_iters=50, num_warmup=10, verify=True):
             sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
             num_valid_ids=g["num_valid_ids"], topk=topk,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", act="silu",
+            out_dtype="bf16", act="silu",
             w1_scale=scale_w1_1d, a1_scale=None, sorted_weights=None,
+            **bridge,
         )
 
     out1, us1 = run_perftest(_s1, num_iters=num_iters, num_warmup=num_warmup)
@@ -431,8 +499,9 @@ def _bench(shape, num_iters=50, num_warmup=10, verify=True):
             sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
             num_valid_ids=g["num_valid_ids"], out=out, topk=topk,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", mode="atomic",
+            out_dtype="bf16", mode="atomic",
             w2_scale=scale_w2_1d, a2_scale=None, sorted_weights=None,
+            **bridge,
         )
 
     _, us2 = run_perftest(_s2, num_iters=num_iters, num_warmup=num_warmup)
@@ -441,7 +510,7 @@ def _bench(shape, num_iters=50, num_warmup=10, verify=True):
     f1 = 2 * tokens * topk * (2 * inter_dim) * model_dim
     f2 = 2 * tokens * topk * inter_dim * model_dim
     print(
-        f"\na16w4 decode (gfx942)  tokens={tokens} model_dim={model_dim} "
+        f"\na16w4 {dtype} (gfx942)  tokens={tokens} model_dim={model_dim} "
         f"inter_dim={inter_dim} E={experts} topk={topk} "
         f"tile={tile_m}x{tile_n}x{tile_k}"
     )
@@ -456,6 +525,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--bench", action="store_true",
                    help="report kernel time + TFLOPS instead of correctness")
+    p.add_argument("--dtype", choices=_BENCH_DTYPES, default="fp4_bf16",
+                   help="weight dtype for --bench: fp4_bf16 (MX-FP4) or int4_bf16 (packed int4)")
     p.add_argument("--no-verify", action="store_true",
                    help="(bench only) skip torch-ref correctness check before timing")
     p.add_argument("-t", "--tokens", type=int, default=4096)
@@ -475,5 +546,5 @@ if __name__ == "__main__":
             tokens=args.tokens, model_dim=args.model_dim, inter_dim=args.inter_dim,
             experts=args.experts, topk=1,
             tile_m=args.tile_m, tile_n=args.tile_n, tile_k=args.tile_k,
-        ), verify=not args.no_verify))
+        ), dtype=args.dtype, verify=not args.no_verify))
     sys.exit(_main())
