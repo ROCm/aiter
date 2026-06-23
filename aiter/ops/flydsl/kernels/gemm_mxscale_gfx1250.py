@@ -1865,15 +1865,16 @@ def compile_mxscale_gemm(
                 pf_k = k_base + arith.index(_effective_l2_pf * tile_k)
                 pf_k_packed_a = pf_k / arith.index(PACK_FACTOR_A)
                 pf_k_packed_b = pf_k / arith.index(PACK_FACTOR_B)
-                tdm_ops.l2_prefetch_tile(
-                    arg_a,
-                    (flat_m_base, pf_k_packed_a),
-                    (tile_m, packed_tile_k_a),
-                    (K_packed_a, 1),
-                    elem_bytes=1,
-                    thread_id=tx,
-                    block_threads=block_threads,
-                )
+                # A L2 prefetch disabled (only B is prefetched).
+                # tdm_ops.l2_prefetch_tile(
+                #     arg_a,
+                #     (flat_m_base, pf_k_packed_a),
+                #     (tile_m, packed_tile_k_a),
+                #     (K_packed_a, 1),
+                #     elem_bytes=1,
+                #     thread_id=tx,
+                #     block_threads=block_threads,
+                # )
                 tdm_ops.l2_prefetch_tile(
                     arg_b,
                     (
