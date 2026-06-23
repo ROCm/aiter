@@ -911,7 +911,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage2 tokens={token_num} max_m={max_m} E={E}")
-    stage2(
+    grouped_out = stage2(
         grouped_out,
         grouped_a2_payload,
         grouped_w2,
@@ -998,13 +998,28 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
 # --- Functions moved from moe_kernels.py for grouped gemm ---
 @functools.cache
-def _get_compiled_gather_reduce(model_dim: int, topk: int, out_dtype: str):
+def _get_compiled_gather_reduce(
+    model_dim: int,
+    topk: int,
+    out_dtype: str,
+    split_k: int = 1,
+    vec_dwords: int = 2,
+):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
         build_moe_gather_reduce_module,
     )
 
-    return build_moe_gather_reduce_module(model_dim, topk, out_dtype)
+    return build_moe_gather_reduce_module(
+        model_dim, topk, out_dtype, split_k, vec_dwords
+    )
+
+
+def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
+    """Prefer CTA parallelism first; use wider vec only once CTA count is ample."""
+    out_dwords = int(model_dim) // 2
+    n_iters_v4 = (out_dwords + 256 * 4 - 1) // (256 * 4)
+    return 4 if int(token_num) * n_iters_v4 >= 256 else 2
 
 
 def build_topids_to_rows(
@@ -1128,7 +1143,7 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
 
 
 def flydsl_moe_gather_reduce(
-    grouped_out: torch.Tensor,  # (E, max_m, model_dim) bf16/f16
+    grouped_out: torch.Tensor,  # (E,max_m,D) or (split_k,E,max_m,D) bf16/f16
     topids_to_rows: torch.Tensor,  # (token_num, topk) int32 grouped flat rows
     gather_w: torch.Tensor,  # (token_num, topk) weight, bf16/f16 (== grouped_out dtype)
     out: Optional[torch.Tensor] = None,
@@ -1140,7 +1155,11 @@ def flydsl_moe_gather_reduce(
     argsort-free) and may share it with the route-gather step; this wrapper does
     no host-side map building. ``grouped_out`` and ``gather_w`` must be bf16 or
     f16 (the kernel extends the weight to f32 internally for accumulation)."""
-    E, max_m, model_dim = grouped_out.shape
+    if grouped_out.dim() == 4:
+        split_k, E, max_m, model_dim = grouped_out.shape
+    else:
+        split_k = 1
+        E, max_m, model_dim = grouped_out.shape
     token_num, topk = topids_to_rows.shape
     device = grouped_out.device
     if grouped_out.dtype == torch.bfloat16:
@@ -1151,19 +1170,24 @@ def flydsl_moe_gather_reduce(
         raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
 
     # Caller passes topids_to_rows int32 and gather_w bf16/f16 (both contiguous).
-    grouped_out_flat = grouped_out.contiguous().view(E * max_m, model_dim)
+    grouped_out_flat = grouped_out.contiguous().view(split_k * E * max_m, model_dim)
     if out is None:
         out = torch.empty(
             (token_num, model_dim), dtype=grouped_out.dtype, device=device
         )
 
-    launch = _get_compiled_gather_reduce(model_dim, topk, out_dtype)
+    gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
+    launch = _get_compiled_gather_reduce(
+        model_dim, topk, out_dtype, split_k, gather_vec
+    )
+    slice_stride_dw = E * max_m * (model_dim // 2)
     launch(
         grouped_out_flat,
         topids_to_rows,
         gather_w,
         out,
         token_num,
+        slice_stride_dw,
         stream=torch.cuda.current_stream(),
     )
     return out
