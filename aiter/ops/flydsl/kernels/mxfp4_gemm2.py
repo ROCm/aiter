@@ -12,7 +12,7 @@ The port mirrors gemm2_a4w4.cuh's atomic path instruction-for-instruction:
   * 4 ``make.buffer.rsrc`` (A_q, A_scale, B_q, B_scale) with exact num_bytes.
   * A -> LDS via ``raw.ptr.buffer.load.lds`` (2 slots), swizzled (BM16: 2 waves).
   * B / scales via ``raw.ptr.buffer.load.v4i32`` / ``.i32`` (NT: B aux=2).
-  * ``s_waitcnt vmcnt(23/22)`` + ``s_barrier`` cross-wave fences.
+  * ``gpu.barrier`` cross-wave fences (the compiler inserts the vmcnt).
   * K=512 = 2 K-tiles fully unrolled; 32 (BM32) / 16 (BM16) MFMAs.
   * atomic bf16 epilog: LDS cshuffle -> ``global.atomic.fadd.v2bf16`` * topk weight.
 
@@ -212,18 +212,6 @@ def _gep3(base_ptr, byte_off_i32):
     )
 
 
-def _s_barrier_bare():
-    """Bare ``s_barrier`` (no surrounding memory fence), matching HIP's K-loop
-    ``__builtin_amdgcn_s_barrier()`` cross-wave fence after the vmcnt wait."""
-    llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="s_barrier",
-        constraints="",
-        has_side_effects=True,
-    )
-
-
 def _global_base_ptr1(addr_i64):
     """One ptr<1> base from a raw i64 device address.
 
@@ -306,7 +294,6 @@ def compile_gemm2_a4w4_port(
         f"BM={BM} use_nt={use_nt} NE={NE} N_OUT={N_OUT} epilog={epilog} D_INTER={D_INTER}",
         flush=True,
     )
-    _atomic = epilog == "atomic"
     # K = contraction dim = inter_dim. Parametrized; defaults to KIMI/DSR's 512.
     # For a non-256-aligned shard (dsv4 TP8: real inter=384) the caller pads weights/
     # inter/scales to D_INTER (the next %256, e.g. 512) and passes D_INTER_REAL=384;
@@ -512,7 +499,7 @@ def compile_gemm2_a4w4_port(
                 wu = fx.Int32(iv)
                 # iter-boundary fence: prev tile's LDS reads must finish before
                 # this tile overwrites the s_Aq slots (persistent-grid reuse race).
-                rocdl.barrier()
+                gpu.barrier()
                 # setattr (not `saq._view_cache = None`): an `=` assignment would make
                 # the AST for-rewriter treat saq (a SmemPtr, active before the loop) as
                 # a loop-carried iter_arg, which only MLIR values can be.
@@ -621,7 +608,6 @@ def _gemm2_body(
     D_INTER_REAL=None,
     aStages=kStages,
 ):
-    _atomic = epilog == "atomic"
     _aStages = aStages
     _kMChunks = kmchunks(BM)
     _slot_bytes = saq_slot_bytes(BM)
@@ -853,26 +839,8 @@ def _gemm2_body(
                             [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
                         )
 
-    # -- K-loop fence helper (shared by fast + streaming paths) ---------------
-    # `S` selects the atomic path's hand-tuned vmcnt (23 on the first drained tile,
-    # 22 after). For the streaming main loop there is an extra in-flight A->LDS
-    # store per iter (the next tile), so the vmcnt budget shifts -- pass vmcnt_atomic
-    # explicitly there.
-    def _kloop_fence(vmcnt_atomic):
-        if const_expr(_atomic):
-            # atomic: explicit vmcnt-tuned cross-wave fence (loads land before ds_read).
-            llvm.inline_asm(
-                res=None,
-                operands_=[],
-                asm_string=f"s_waitcnt vmcnt({vmcnt_atomic})",
-                constraints="",
-                has_side_effects=True,
-            )
-            _s_barrier_bare()
-        else:
-            # nonatomic: plain barrier (== HIP __syncthreads); the backend inserts
-            # the buffer_load_lds->ds_read vmcnt wait.
-            rocdl.barrier()
+    def _kloop_fence():
+        gpu.barrier()
 
     if const_expr(_K_TILES_TOTAL <= kStages):
         # -- KIMI/DSR fast path: K_TILES_TOTAL <= 2 (D_INTER <= 512), fully
@@ -888,21 +856,7 @@ def _gemm2_body(
         for S in range_constexpr(_K_TILES_TOTAL):
             kt = S
             slot = kt % kStages
-            # K_TILES_TOTAL==1 (D_INTER==256): the KIMI-tuned vmcnt(23) assumes two
-            # preloaded tiles' loads are still outstanding; with a single tile that
-            # count is already satisfied, so it under-waits and the A ds_read can
-            # race the buffer_load_lds under memory pressure (correct at tiny M,
-            # silent-wrong at M>=32). Wait for all loads (vmcnt 0) for the 1-tile case.
-            if const_expr(_K_TILES_TOTAL == 1):
-                _kloop_fence(0)
-            elif const_expr(_K_REAL < _K):
-                # Pad-tail skip (TP8): fewer B loads are issued than the 23/22 tuning
-                # assumes, so that hand-tuned vmcnt under-waits and the A ds_read can
-                # race the A->LDS load. Wait for all loads (vmcnt 0) -- correctness
-                # over the small fence overhead.
-                _kloop_fence(0)
-            else:
-                _kloop_fence(23 if S == 0 else 22)
+            _kloop_fence()
             a = issue_a_ds_read(slot)
             a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
             mfma_cluster(b[slot], a, a_scale_sub, b_scale_v[slot], init=(S == 0), kt=kt)
@@ -929,7 +883,7 @@ def _gemm2_body(
             slot = kt % _aStages
             next_kt = kStages + OFFSET
             write_slot = next_kt % _aStages
-            _kloop_fence(23 if OFFSET == 0 else 22)
+            _kloop_fence()
             a = issue_a_ds_read(slot)
             # stream next tile's A into the freed slot (overlaps with the mfma).
             issue_a_load_lds(write_slot, next_kt)
@@ -940,7 +894,7 @@ def _gemm2_body(
         for S in range_constexpr(kStages):
             kt = _K_TILES_TOTAL - kStages + S
             slot = kt % _aStages
-            _kloop_fence(22)
+            _kloop_fence()
             a = issue_a_ds_read(slot)
             a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
             mfma_cluster(b[kt], a, a_scale_sub, b_scale_v[kt], init=False)
@@ -1045,7 +999,7 @@ def _cshuffle_flat_bf16_epilog(
     col_start = n_lane * fx.Int32(2)
     out_base = _global_base_ptr1(arg_out)
 
-    rocdl.barrier()  # pre-store fence (K-loop s_Aq reads done; lds_acc union reuse)
+    gpu.barrier()  # pre-store fence (K-loop s_Aq reads done; lds_acc union reuse)
     for i in range_constexpr(_iC):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
         for J in range_constexpr(4):
@@ -1054,15 +1008,7 @@ def _cshuffle_flat_bf16_epilog(
             for v in range_constexpr(4):
                 idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
                 llvm.StoreOp(_raw(bf4[v]), _gep3(lds_base, idx * fx.Int32(2)))
-    # drain the LDS cshuffle stores (s_barrier alone does NOT) before readback.
-    llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="s_waitcnt lgkmcnt(0)",
-        constraints="",
-        has_side_effects=True,
-    )
-    rocdl.barrier()
+    gpu.barrier()
     for mr in range_constexpr(_REPS):
         row_local = fx.Int32(mr * 8) + m_lane
         sorted_row = m_row + row_local
@@ -1104,7 +1050,7 @@ def _flat_mxfp4_epilog(
             for v in range_constexpr(4):
                 idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
                 llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
-    rocdl.barrier()
+    gpu.barrier()
 
     NBLK = BN // 32  # 8
     m_lane = tid_i32 // fx.Int32(16)
@@ -1245,7 +1191,7 @@ def _atomic_bf16_epilog(
         )
 
     # pre-store fence+barrier (HIP run_one __syncthreads() before the epilog).
-    rocdl.barrier()
+    gpu.barrier()
 
     # write accm -> lds_acc cshuffle (scalar f32 stores, as HIP does)
     for i in range_constexpr(_kMChunks):
@@ -1257,7 +1203,7 @@ def _atomic_bf16_epilog(
                 idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
                 llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
 
-    rocdl.barrier()
+    gpu.barrier()
 
     # read back + weighted atomic add (token_id / weight prefetched above)
     for mr in range_constexpr(M_REPS):
