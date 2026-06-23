@@ -184,26 +184,17 @@ def _build_inverted_topk_slice(topk_indices_slice, r_start, R_CHUNK):
         inv_data: [valid_entries] int32 — flat indices q*R_CHUNK+local_r, sorted by KV token
     """
     T, RC = topk_indices_slice.shape
-    device = topk_indices_slice.device
+    flat_kv = topk_indices_slice.reshape(-1).long()   # [T*R_CHUNK]; -1 marks invalid
 
-    flat_idx = torch.arange(T * RC, dtype=torch.int32, device=device)  # q*RC + local_r
-    flat_kv = topk_indices_slice.reshape(-1).long()   # [T*R_CHUNK] KV token indices
-
-    # Exclude invalid entries (kv_token == -1)
-    valid_mask = flat_kv >= 0
-    valid_flat_kv = flat_kv[valid_mask]
-    valid_flat_idx = flat_idx[valid_mask]
-
-    # Sort valid entries by KV token
-    order = torch.argsort(valid_flat_kv, stable=True)
-    inv_data = valid_flat_idx[order].to(torch.int32)
-
-    counts = torch.zeros(T, dtype=torch.int32, device=device)
-    counts.scatter_add_(0, valid_flat_kv,
-                        torch.ones(valid_flat_kv.shape[0], dtype=torch.int32, device=device))
-
-    inv_ptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
-    torch.cumsum(counts, dim=0, out=inv_ptr[1:])
+    # Sort ALL entries by KV token. argsort returns the flat positions (q*RC+r) in
+    # KV-token order; invalid (-1) entries sort to the FRONT and are never referenced
+    # because inv_ptr[0] starts past them. This avoids the boolean-mask `nonzero`
+    # + per-element `scatter_add` + extra `index` gathers of the previous version
+    # (all slow torch ops, especially on gfx1250 where they dominated the bwd).
+    inv_data = torch.argsort(flat_kv, stable=True).to(torch.int32)     # [T*R_CHUNK]
+    # bincount of (kv+1): bin 0 = #invalid, bins 1..T = per-KV counts.
+    counts = torch.bincount(flat_kv + 1, minlength=T + 1)              # [T+1]
+    inv_ptr = torch.cumsum(counts, dim=0).to(torch.int32)             # [T+1]; inv_ptr[0]=#invalid
 
     return inv_ptr, inv_data
 
