@@ -70,6 +70,67 @@ per-block work is a full `(K, N)` accumulation:
   rows.
 - The reduce pass sums the `SPLIT` fp32 `(K, N)` partials into bf16 `dDense[b]`.
 
+## Why one kernel for `dJagged` but two for `dDense` / `dBias`
+
+The asymmetry comes down to **what axis each gradient reduces over**, and whether
+that reduction can be owned by a single block without serializing.
+
+### `dJagged`: no reduction over the jagged axis → one kernel
+
+`dJagged[m,k] = sum_n dOut[m,n] · Dense[b][k,n]` sums over `n`, the **static** `N`
+axis (= 128, known at compile time). Each output element depends only on **one
+row** `m` of `dOut`, so different output rows are completely independent. The work
+parallelizes cleanly across the `(m, k)` output grid, and each tile reduces over a
+small, fixed `N` entirely **inside** its own MFMA accumulator. There's no
+cross-block reduction to coordinate, so a single GEMM-style kernel writes the
+final answer directly. The output `(L, K)` is the same size as the jagged input,
+and every block owns a disjoint slice.
+
+### `dDense` / `dBias`: reduction over the dynamic `m` axis → two kernels
+
+Both contract over `m`, the **dynamic** (variable-length, per-group) sequence
+axis:
+
+```
+dDense[b][k,n] = sum_m Jagged[m,k] · dOut[m,n]
+dBias[b][n]    = sum_m dOut[m,n]
+```
+
+The defining difference: **every row `m` in the group contributes to the same
+output element.** The output `dDense[b]` is only `(K, N)` per group and `dBias[b]`
+only `(N,)` — tiny and fixed-size, independent of how many rows `M_b` the group
+has (which can be large and varies per group at runtime). That creates a reduction
+problem with two options:
+
+1. **One block reduces the whole group serially.** Works, but throws away
+   parallelism: with few groups and long sequences, most of the GPU sits idle
+   while a handful of blocks grind through long serial reductions on the critical
+   path.
+2. **Split the reduction across blocks, then combine** (what the code does, with
+   `SPLIT = 4`). The partials kernel launches `SPLIT` blocks per group that each
+   sum a strided subset of rows into their own fp32 scratch slot in parallel; the
+   reduce kernel then sums those partials into the final bf16 output.
+
+The second kernel is needed precisely *because* the first produces multiple
+partial results that must be combined — and they can't be combined within the
+partials kernel, since they're computed by **different blocks** with no cheap
+global synchronization (GPU blocks can't barrier with each other mid-kernel). A
+separate kernel launch is the synchronization point.
+
+Two reasons make the split worth it over the serial option:
+
+- **Parallelism / occupancy.** The output is tiny and the reduction axis is huge
+  and dynamic; splitting gives more independent blocks to fill the machine.
+- **fp32 accuracy.** Partials accumulate and are stored in fp32 scratch; only the
+  final reduce truncates to bf16. This keeps the long `m`-reduction numerically
+  stable regardless of sequence length.
+
+| Gradient | Contraction axis | Reduction across blocks? | Kernels |
+|----------|------------------|--------------------------|---------|
+| `dJagged` | static `N` | No — each output row independent, reduces inside one tile | 1 (GEMM) |
+| `dDense`  | dynamic `m` | Yes — all rows hit the same `(K,N)` output | 2 (partials + reduce) |
+| `dBias`   | dynamic `m` | Yes — all rows hit the same `(N,)` output | 2 (partials + reduce) |
+
 ## Cross-cutting details
 
 - **Group resolution**: every kernel reads `SEQ_OFFSETS[b]` and
