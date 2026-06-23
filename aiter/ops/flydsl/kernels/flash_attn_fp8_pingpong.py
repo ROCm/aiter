@@ -47,10 +47,9 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as _fly
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import scf
-from flydsl.expr.numeric import _wrap_like
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_dsl_value
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
@@ -122,7 +121,6 @@ def build_flash_attn_fp8_module(
     N_KV_TILES = BLOCK_N // MFMA_N  # 4 kv sub-tiles of 32 (GEMM1 N)
     D_TILES = HEAD_DIM // MFMA_N  # 4 output d sub-tiles of 32
     PV_K_STEPS = BLOCK_N // MFMA_K  # 2 kv K-steps of 64 (PV contraction)
-    P_PACK_WORDS = PV_K_STEPS * (A_FP8_PER_LANE // 4)  # 16 fp8 words for P B-operand
 
     if softmax_scale is None:
         softmax_scale = 1.0 / host_math.sqrt(head_dim)
@@ -605,14 +603,6 @@ def build_flash_attn_fp8_module(
             Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
             for _ in range_constexpr(D_TILES)
         ]
-        p_init = Vec.filled(P_PACK_WORDS, 0, fx.Int32)  # p_carry=0
-        prowsum_init = c_zero_f
-        corr_init = fx.Float32(1.0)  # no-op rescale at i=0
-        s_init = [
-            Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
-            for _ in range_constexpr(N_KV_TILES)
-        ]
-        zero_p = Vec.filled(P_PACK_WORDS, 0, fx.Int32)
 
         def _bufs(kv_start):
             # Derive the K (double) / V (triple) buffer offsets from the iteration
@@ -652,7 +642,6 @@ def build_flash_attn_fp8_module(
         # G0 carries P (deferred PV); G1 carries S (its phase-2 QK feeds the next
         # iter's phase-1 softmax).  Both bodies hit 2 s_barriers/iter so all 8
         # waves stay barrier-lockstep.
-        loop_lo = fx.Int32(0)
         loop_step = fx.Int32(BLOCK_N)
         num_iters = (seq_len_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)
         last_i = num_iters - fx.Index(1)
@@ -671,15 +660,19 @@ def build_flash_attn_fp8_module(
                 _, k_buf_off, _, _, v_next = _bufs(fx.Index(0))
                 sA = do_qk(k_buf_off)
                 gpu.barrier()
-                m_new, corr_new, p_new, prowsum_new = do_softmax(
-                    sA, m_init
-                )
+                m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_init)
                 dma_v(v_next, fx.Index(BLOCK_N))
                 waitcnt_barrier()
                 return (
-                    m_new, l_init,
-                    o_init[0], o_init[1], o_init[2], o_init[3],
-                    p_new, prowsum_new, corr_new,
+                    m_new,
+                    l_init,
+                    o_init[0],
+                    o_init[1],
+                    o_init[2],
+                    o_init[3],
+                    p_new,
+                    prowsum_new,
+                    corr_new,
                 )
 
             # ---- Epilogue: apply deferred PV(N-1). ----
@@ -691,13 +684,15 @@ def build_flash_attn_fp8_module(
             # ---- Main loop: tiles 1..N-1 (apply_pv + QK + softmax + DMA). ----
             g0_carry = list(g0_iter0())
             for_op = scf.ForOp(
-                _raw(loop_step), _raw(seq_len), _raw(loop_step),
+                _raw(loop_step),
+                _raw(seq_len),
+                _raw(loop_step),
                 [_raw(v) for v in g0_carry],
             )
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
                 m_r, l_a, oo0, oo1, oo2, oo3, p_c, prowsum_c, corr_c = [
-                    _wrap_like(a, ex)
+                    as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g0_carry)
                 ]
                 kv_start = fx.Index(iv)
@@ -710,20 +705,25 @@ def build_flash_attn_fp8_module(
                 sA = do_qk(k_buf_off)
                 gpu.barrier()
                 # PHASE 2 (softmax phase): softmax(i) | DMA V^{i+1}.
-                m_new, corr_new, p_new, prowsum_new = do_softmax(
-                    sA, m_r
-                )
+                m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_r)
                 dma_v(v_next, next_kv)
                 waitcnt_barrier()
-                scf.YieldOp([
-                    _raw(m_new), _raw(lA),
-                    _raw(oA[0]), _raw(oA[1]), _raw(oA[2]), _raw(oA[3]),
-                    _raw(p_new), _raw(prowsum_new), _raw(corr_new),
-                ])
+                scf.YieldOp(
+                    [
+                        _raw(m_new),
+                        _raw(lA),
+                        _raw(oA[0]),
+                        _raw(oA[1]),
+                        _raw(oA[2]),
+                        _raw(oA[3]),
+                        _raw(p_new),
+                        _raw(prowsum_new),
+                        _raw(corr_new),
+                    ]
+                )
 
             m_e, l_e, oe0, oe1, oe2, oe3, p_e, prowsum_e, corr_e = [
-                _wrap_like(r, ex)
-                for r, ex in zip(for_op.results, g0_carry)
+                as_dsl_value(r, ex) for r, ex in zip(for_op.results, g0_carry)
             ]
             o_fin, l_fin_g = g0_epilogue(
                 m_e, l_e, oe0, oe1, oe2, oe3, p_e, prowsum_e, corr_e
@@ -744,9 +744,16 @@ def build_flash_attn_fp8_module(
                 sB = do_qk(k_buf_off)
                 gpu.barrier()
                 return (
-                    m_init, l_init,
-                    o_init[0], o_init[1], o_init[2], o_init[3],
-                    sB[0], sB[1], sB[2], sB[3],
+                    m_init,
+                    l_init,
+                    o_init[0],
+                    o_init[1],
+                    o_init[2],
+                    o_init[3],
+                    sB[0],
+                    sB[1],
+                    sB[2],
+                    sB[3],
                 )
 
             # ---- Epilogue: softmax(N-1) then apply deferred PV(N-1). ----
@@ -759,13 +766,15 @@ def build_flash_attn_fp8_module(
             # ---- Main loop: tiles 1..N-1 (softmax + DMA K + apply_pv + QK). ----
             g1_carry = list(g1_iter0())
             for_op = scf.ForOp(
-                _raw(loop_step), _raw(seq_len), _raw(loop_step),
+                _raw(loop_step),
+                _raw(seq_len),
+                _raw(loop_step),
                 [_raw(v) for v in g1_carry],
             )
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
                 m_r, l_a, oo0, oo1, oo2, oo3, ss0, ss1, ss2, ss3 = [
-                    _wrap_like(a, ex)
+                    as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g1_carry)
                 ]
                 kv_start = fx.Index(iv)
@@ -781,15 +790,23 @@ def build_flash_attn_fp8_module(
                 )
                 sB = do_qk(k_buf_off)
                 gpu.barrier()
-                scf.YieldOp([
-                    _raw(m_sm), _raw(lB),
-                    _raw(oB[0]), _raw(oB[1]), _raw(oB[2]), _raw(oB[3]),
-                    _raw(sB[0]), _raw(sB[1]), _raw(sB[2]), _raw(sB[3]),
-                ])
+                scf.YieldOp(
+                    [
+                        _raw(m_sm),
+                        _raw(lB),
+                        _raw(oB[0]),
+                        _raw(oB[1]),
+                        _raw(oB[2]),
+                        _raw(oB[3]),
+                        _raw(sB[0]),
+                        _raw(sB[1]),
+                        _raw(sB[2]),
+                        _raw(sB[3]),
+                    ]
+                )
 
             m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3 = [
-                _wrap_like(r, ex)
-                for r, ex in zip(for_op.results, g1_carry)
+                as_dsl_value(r, ex) for r, ex in zip(for_op.results, g1_carry)
             ]
             o_fin, l_fin_g = g1_epilogue(
                 m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3
