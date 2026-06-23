@@ -559,6 +559,22 @@ namespace py = pybind11;
           py::arg("eps"),                                                                       \
           py::arg("reg_ptr"),                                                                   \
           py::arg("reg_bytes"));                                                                \
+    m.def("fused_qknorm_allreduce_rope",                                                        \
+          &aiter::fused_qknorm_allreduce_rope,                                                  \
+          py::arg("_fa"),                                                                       \
+          py::arg("qkv_in"),                                                                    \
+          py::arg("q_w"),                                                                       \
+          py::arg("k_w"),                                                                       \
+          py::arg("q_out"),                                                                     \
+          py::arg("k_out"),                                                                     \
+          py::arg("v_out"),                                                                     \
+          py::arg("cos_sin_cache"),                                                             \
+          py::arg("position_ids"),                                                              \
+          py::arg("head_dim"),                                                                  \
+          py::arg("rotary_dim"),                                                                \
+          py::arg("eps"),                                                                       \
+          py::arg("reg_ptr"),                                                                   \
+          py::arg("reg_bytes"));                                                                \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \
@@ -860,7 +876,8 @@ namespace py = pybind11;
           py::arg("scaleA")      = std::nullopt,                                   \
           py::arg("scaleB")      = std::nullopt,                                   \
           py::arg("scaleOut")    = std::nullopt,                                   \
-          py::arg("bpreshuffle") = std::nullopt);                                  \
+          py::arg("bpreshuffle") = std::nullopt,                                   \
+          py::arg("use_gelu")    = std::nullopt);                                     \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
@@ -871,7 +888,8 @@ namespace py = pybind11;
           py::arg("scaleA")      = std::nullopt,                                   \
           py::arg("scaleB")      = std::nullopt,                                   \
           py::arg("scaleC")      = std::nullopt,                                   \
-          py::arg("bpreshuffle") = false);                                         \
+          py::arg("bpreshuffle") = false,                                          \
+          py::arg("use_gelu")    = false);                                            \
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 
 #define LIBMHA_BWD_PYBIND                         \
@@ -1756,12 +1774,14 @@ namespace py = pybind11;
           py::arg("index_k_norm_weight"),                  \
           py::arg("num_index_heads"),                       \
           py::arg("slot_mapping"),                         \
-          py::arg("kv_cache"),                             \
+          py::arg("kv_cache_k"),                           \
+          py::arg("kv_cache_v"),                           \
           py::arg("index_cache"),                          \
           py::arg("block_size"),                           \
           py::arg("q_out"),                                \
           py::arg("index_q_out"),                          \
-          py::arg("index_slot_mapping"));                   \
+          py::arg("index_slot_mapping"),                   \
+          py::arg("asm_layout")    = false);                \
     m.def("fused_qknorm_idxrqknorm_fp8",     \
           &aiter::fused_qknorm_idxrqknorm_fp8, \
           py::arg("qkv"),                                  \
@@ -1777,7 +1797,8 @@ namespace py = pybind11;
           py::arg("index_k_norm_weight"),                  \
           py::arg("num_index_heads"),                       \
           py::arg("slot_mapping"),                         \
-          py::arg("kv_cache"),                             \
+          py::arg("kv_cache_k"),                           \
+          py::arg("kv_cache_v"),                           \
           py::arg("index_cache"),                          \
           py::arg("block_size"),                           \
           py::arg("q_out"),                                \
@@ -1785,7 +1806,8 @@ namespace py = pybind11;
           py::arg("index_slot_mapping"),                   \
           py::arg("kv_cache_dtype"),                       \
           py::arg("k_scale"),                              \
-          py::arg("v_scale"))
+          py::arg("v_scale"),                              \
+          py::arg("asm_layout")    = false)
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",             \
@@ -1819,6 +1841,22 @@ namespace py = pybind11;
           py::arg("k_eps"),                                     \
           py::arg("q_out"),                                     \
           py::arg("k_out"));                                    \
+    m.def("minimax_qk_norm_rope",                               \
+          &aiter::minimax_qk_norm_rope,                         \
+          py::arg("qkv"),                                       \
+          py::arg("q_weight"),                                  \
+          py::arg("k_weight"),                                  \
+          py::arg("cos_sin_cache"),                             \
+          py::arg("position_ids"),                              \
+          py::arg("num_heads_q"),                               \
+          py::arg("num_heads_k"),                               \
+          py::arg("head_dim"),                                  \
+          py::arg("rotary_dim"),                                \
+          py::arg("eps"),                                       \
+          py::arg("is_neox"),                                   \
+          py::arg("q_out"),                                     \
+          py::arg("k_out"),                                     \
+          py::arg("v_out"));                                    \
     m.def("fused_qk_norm_rope_cache_pts_quant_shuffle",         \
           &aiter::fused_qk_norm_rope_cache_pts_quant_shuffle,   \
           py::arg("qkv"),                                       \
@@ -1943,7 +1981,8 @@ namespace py = pybind11;
           py::arg("scaleA")      = std::nullopt,                                   \
           py::arg("scaleB")      = std::nullopt,                                   \
           py::arg("scaleOut")    = std::nullopt,                                   \
-          py::arg("bpreshuffle") = std::nullopt);                                  \
+          py::arg("bpreshuffle") = std::nullopt,                                   \
+          py::arg("use_gelu")    = std::nullopt);                                     \
     m.def("hipb_findallsols",                                                      \
           &hipb_findallsols,                                                       \
           "hipb_findallsols",                                                      \
@@ -1954,7 +1993,8 @@ namespace py = pybind11;
           py::arg("scaleA")      = std::nullopt,                                   \
           py::arg("scaleB")      = std::nullopt,                                   \
           py::arg("scaleC")      = std::nullopt,                                   \
-          py::arg("bpreshuffle") = false);                                         \
+          py::arg("bpreshuffle") = false,                                          \
+          py::arg("use_gelu")    = false);                                            \
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 
 #define ROCSOLGEMM_PYBIND                                                          \

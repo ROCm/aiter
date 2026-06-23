@@ -2,10 +2,9 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "aiter_hip_common.h"
-#include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
-#include "dispatch_utils.h"
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "aiter_stream.h"
+#include "gated_rmsnorm_quant.h"
 
 namespace aiter {
 
@@ -194,11 +193,11 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
  */
 template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE, int BLOCK_SIZE, bool TRANSPOSE_SCALE>
 void gated_rmsnorm_fp8_group_quant_launcher_impl(
-    torch::Tensor& out,
-    torch::Tensor& scale,
-    torch::Tensor const& x,
-    torch::Tensor const& z,
-    torch::Tensor const& weight,
+    aiter_tensor_t& out,
+    aiter_tensor_t& scale,
+    const aiter_tensor_t& x,
+    const aiter_tensor_t& z,
+    const aiter_tensor_t& weight,
     double epsilon,
     int num_tokens,
     int num_heads,
@@ -214,7 +213,7 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
     dim3 grid(num_tokens, (num_heads + groups_per_block - 1) / groups_per_block);
     dim3 block(BLOCK_SIZE);
 
-    hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    hipStream_t stream = aiter::getCurrentHIPStream();
 
     // Strides for x and z (token, head). The inner head_dim is required to be
     // unit-stride (validated by the caller) so we don't need to thread it through.
@@ -243,32 +242,32 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
 
 template <typename DTYPE_I, typename DTYPE_O>
 void gated_rmsnorm_fp8_group_quant_launcher(
-    torch::Tensor& out,           // [num_tokens, num_heads * head_dim]
-    torch::Tensor& scale,          // [num_heads, num_tokens] (transposed)
-    torch::Tensor const& x,        // [num_tokens, num_heads, head_dim] - input to normalize
-    torch::Tensor const& z,        // [num_tokens, num_heads, head_dim] - gating tensor
-    torch::Tensor const& weight,   // [head_dim] - RMSNorm weight
+    aiter_tensor_t& out,           // [num_tokens, num_heads * head_dim]
+    aiter_tensor_t& scale,          // [num_heads, num_tokens] (transposed)
+    const aiter_tensor_t& x,        // [num_tokens, num_heads, head_dim] - input to normalize
+    const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim] - gating tensor
+    const aiter_tensor_t& weight,   // [head_dim] - RMSNorm weight
     double epsilon,
     int group_size,
     bool transpose_scale)
 {
     // Validate constraints
-    TORCH_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
-    TORCH_CHECK(z.dim() == 3, "Input z must be 3D: [num_tokens, num_heads, head_dim]");
+    AITER_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
+    AITER_CHECK(z.dim() == 3, "Input z must be 3D: [num_tokens, num_heads, head_dim]");
     const int num_tokens = x.size(0);
     const int num_heads = x.size(1);
     const int head_dim = x.size(2);
 
-    TORCH_CHECK(z.size(0) == num_tokens && z.size(1) == num_heads && z.size(2) == head_dim,
+    AITER_CHECK(z.size(0) == num_tokens && z.size(1) == num_heads && z.size(2) == head_dim,
                 "Gating tensor z must have same shape as x");
-    TORCH_CHECK(head_dim == 128, "ONLY head_dim=128 is supported, got ", head_dim);
-    TORCH_CHECK(group_size == 128, "ONLY group_size=128 is supported, got ", group_size);
-    TORCH_CHECK(weight.size(0) == head_dim, "Weight size must match head_dim");
+    AITER_CHECK(head_dim == 128, "ONLY head_dim=128 is supported, got ", head_dim);
+    AITER_CHECK(group_size == 128, "ONLY group_size=128 is supported, got ", group_size);
+    AITER_CHECK(weight.size(0) == head_dim, "Weight size must match head_dim");
 
     // x and z may be strided slices on the token/head dims, but the inner head_dim
     // must be unit-stride for vectorized loads.
-    TORCH_CHECK(x.stride(2) == 1, "x.stride(2) must be 1 (head_dim contiguous), got ", x.stride(2));
-    TORCH_CHECK(z.stride(2) == 1, "z.stride(2) must be 1 (head_dim contiguous), got ", z.stride(2));
+    AITER_CHECK(x.stride(2) == 1, "x.stride(2) must be 1 (head_dim contiguous), got ", x.stride(2));
+    AITER_CHECK(z.stride(2) == 1, "z.stride(2) must be 1 (head_dim contiguous), got ", z.stride(2));
 
 
     // Use THREAD_DATA_SIZE=16 (8 groups/warp) for best bandwidth
@@ -286,34 +285,34 @@ void gated_rmsnorm_fp8_group_quant_launcher(
  * Python interface
  */
 void gated_rmsnorm_fp8_group_quant(
-    torch::Tensor& out,           // [num_tokens, num_heads * head_dim]
-    torch::Tensor& scale,          // [num_heads, num_tokens] (transposed)
-    torch::Tensor const& x,        // [num_tokens, num_heads, head_dim] - input to normalize
-    torch::Tensor const& z,        // [num_tokens, num_heads, head_dim] - gating tensor
-    torch::Tensor const& weight,   // [head_dim] - RMSNorm weight
+    aiter_tensor_t& out,           // [num_tokens, num_heads * head_dim]
+    aiter_tensor_t& scale,          // [num_heads, num_tokens] (transposed)
+    const aiter_tensor_t& x,        // [num_tokens, num_heads, head_dim] - input to normalize
+    const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim] - gating tensor
+    const aiter_tensor_t& weight,   // [head_dim] - RMSNorm weight
     double epsilon,
     int group_size,
     bool transpose_scale)
 {
     // Validate input types
-    TORCH_CHECK(x.is_cuda(), "Input x must be on CUDA device");
-    TORCH_CHECK(z.is_cuda(), "Input z must be on CUDA device");
-    TORCH_CHECK(weight.is_cuda(), "Weight must be on CUDA device");
-    TORCH_CHECK(out.is_cuda(), "Output must be on CUDA device");
-    TORCH_CHECK(scale.is_cuda(), "Scale must be on CUDA device");
+    AITER_CHECK(x.is_gpu(), "Input x must be on CUDA device");
+    AITER_CHECK(z.is_gpu(), "Input z must be on CUDA device");
+    AITER_CHECK(weight.is_gpu(), "Weight must be on CUDA device");
+    AITER_CHECK(out.is_gpu(), "Output must be on CUDA device");
+    AITER_CHECK(scale.is_gpu(), "Scale must be on CUDA device");
+
+    HipDeviceGuard device_guard(x.device_id);
 
     // Dispatch based on input/output types
-    if (x.scalar_type() == at::ScalarType::BFloat16 &&
-        (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
+    if (x.dtype() == AITER_DTYPE_bf16 && out.dtype() == AITER_DTYPE_fp8) {
         gated_rmsnorm_fp8_group_quant_launcher<opus::bf16_t, opus::fp8_t>(
             out, scale, x, z, weight, epsilon, group_size, transpose_scale);
-    } else if (x.scalar_type() == at::ScalarType::Half &&
-               (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
+    } else if (x.dtype() == AITER_DTYPE_fp16 && out.dtype() == AITER_DTYPE_fp8) {
         gated_rmsnorm_fp8_group_quant_launcher<opus::fp16_t, opus::fp8_t>(
             out, scale, x, z, weight, epsilon, group_size, transpose_scale);
     } else {
-        TORCH_CHECK(false, "Unsupported dtype combination. Input: ", x.scalar_type(),
-                    ", Output: ", out.scalar_type());
+        AITER_CHECK(false, "Unsupported dtype combination. Input: ", AiterDtype_to_str(x.dtype()),
+                    ", Output: ", AiterDtype_to_str(out.dtype()));
     }
 }
 
