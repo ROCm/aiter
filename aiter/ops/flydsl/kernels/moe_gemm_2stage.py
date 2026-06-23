@@ -1193,18 +1193,19 @@ def compile_moe_gemm1(
                                             sc_u,
                                         )
                                     elif const_expr(is_w4_fp4):
-                                        # gfx942 MX-FP4: pure-ALU E2M1->bf16 dequant. Defer the
-                                        # per-32 E8M0 block scale to a post-MFMA FMA on the f32
-                                        # partial (4 lanes) instead of folding it into every weight
-                                        # element. Exact since E8M0 is a power of two and constant
-                                        # across the block's K reduction. (a8w4 shares this weight
-                                        # path; its fp8 activation + A-scale are handled at load.)
-                                        bg0, bg1 = dequant_fp4_to_bf16(packed_g, arith, vector, scale_val=None)
-                                        tmp_g = mfma_k64(zero_f32_acc, a0, a1, bg0, bg1)
-                                        gate_list[acc_idx] = _acc_scaled_f32(gate_list[acc_idx], tmp_g, sc_g)
-                                        bu0, bu1 = dequant_fp4_to_bf16(packed_u, arith, vector, scale_val=None)
-                                        tmp_u = mfma_k64(zero_f32_acc, a0, a1, bu0, bu1)
-                                        up_list[acc_idx] = _acc_scaled_f32(up_list[acc_idx], tmp_u, sc_u)
+                                        # gfx942 MX-FP4: fold the per-32 E8M0 block scale into the
+                                        # fast E2M1->bf16 dequant and chain the MFMA straight into
+                                        # the accumulator (mirroring the int4 path below). Exact:
+                                        # E8M0 is a power of two and constant across the block's K
+                                        # reduction, so the exponent-only multiply on the f32 temps
+                                        # leaves the lshr-16 bf16 truncation exact. Avoids the extra
+                                        # zero_f32_acc + tmp partials that pushed AccumVGPR over the
+                                        # occupancy cliff. (a8w4 shares this weight path; its fp8
+                                        # activation + A-scale are handled at load.)
+                                        bg0, bg1 = dequant_fp4_to_bf16(packed_g, arith, vector, scale_val=sc_g)
+                                        gate_list[acc_idx] = mfma_k64(gate_list[acc_idx], a0, a1, bg0, bg1)
+                                        bu0, bu1 = dequant_fp4_to_bf16(packed_u, arith, vector, scale_val=sc_u)
+                                        up_list[acc_idx] = mfma_k64(up_list[acc_idx], a0, a1, bu0, bu1)
                                     else:
                                         bg0, bg1 = unpack_b_w4a16(
                                             packed_g,
@@ -3181,13 +3182,14 @@ def compile_moe_gemm2(
                                             acc_list[p_idx] = _acc_scaled_f32(acc_list[p_idx], p_tmp, p_sc)
                                         _pending_acc = (acc_idx, tmp, sc)
                                     elif const_expr(is_w4_fp4):
-                                        # gfx942 MX-FP4: pure-ALU E2M1->bf16 dequant. Defer the
-                                        # per-32 E8M0 block scale to a post-MFMA FMA on the f32
-                                        # partial instead of folding it per weight element.
-                                        # (a8w4 shares this; its fp8 A + A-scale handled at load.)
-                                        b0, b1 = dequant_fp4_to_bf16(packed, arith, vector, scale_val=None)
-                                        tmp = mfma_k64(zero_f32_acc, a0, a1, b0, b1)
-                                        acc_list[acc_idx] = _acc_scaled_f32(acc_list[acc_idx], tmp, sc)
+                                        # gfx942 MX-FP4: fold the per-32 E8M0 block scale into the
+                                        # fast E2M1->bf16 dequant and chain the MFMA straight into
+                                        # the accumulator (mirroring the int4 path below). Exact:
+                                        # E8M0 is a power of two and constant across the block's K
+                                        # reduction. (a8w4 shares this; its fp8 A + A-scale handled
+                                        # at load.)
+                                        b0, b1 = dequant_fp4_to_bf16(packed, arith, vector, scale_val=sc)
+                                        acc_list[acc_idx] = mfma_k64(acc_list[acc_idx], a0, a1, b0, b1)
                                     else:
                                         b0, b1 = unpack_b_w4a16(
                                             packed,

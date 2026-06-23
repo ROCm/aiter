@@ -614,7 +614,7 @@ def scale_fp8x8_i64(fp8_i64, scale_val, arith, vector):
     return vector.extract(out64, static_position=[0], dynamic_position=[])
 
 
-def _fp4x4_in_i32_to_bf16x4_i64_via_fp8(nib_i32, arith, vector):
+def _fp4x4_in_i32_to_bf16x4_i64_via_fp8(nib_i32, arith, vector, scale_val=None):
     """Fast E2M1->bf16 for 4 nibbles (low nibble of each byte of ``nib_i32``).
 
     Builds the E4M3FNUZ fp8 byte for all 4 nibbles with branchless SWAR integer
@@ -644,6 +644,8 @@ def _fp4x4_in_i32_to_bf16x4_i64_via_fp8(nib_i32, arith, vector):
         vector.extract(hi, static_position=[0], dynamic_position=[]),
         vector.extract(hi, static_position=[1], dynamic_position=[]),
     ]
+    if scale_val is not None:
+        f = [arith.ArithValue(_arith._to_raw(fv)) * scale_val for fv in f]
     bits = [arith.bitcast(T.i32, _arith._to_raw(fv)) for fv in f]
     c16 = fx.Int32(16)
     c_ffff0000 = fx.Int32(0xFFFF0000)
@@ -671,13 +673,12 @@ def dequant_fp4_to_bf16(packed32, arith, vector, scale_val=None):
     c_0f0f = fx.Int32(0x0F0F0F0F)
     even = packed32 & c_0f0f
     odd = (packed32 >> fx.Int32(4)) & c_0f0f
-    if scale_val is None:
-        # Fast path (gfx942): SWAR fp8-byte build + hardware cvt_pk_f32_fp8.
-        b0 = _fp4x4_in_i32_to_bf16x4_i64_via_fp8(even, arith, vector)
-        b1 = _fp4x4_in_i32_to_bf16x4_i64_via_fp8(odd, arith, vector)
-        return (b0, b1)
-    b0 = _fp4x4_in_i32_to_bf16x4_i64(even, arith, vector, scale_val=scale_val)
-    b1 = _fp4x4_in_i32_to_bf16x4_i64(odd, arith, vector, scale_val=scale_val)
+    # Fast path (gfx942): SWAR fp8-byte build + hardware cvt_pk_f32_fp8. The E8M0
+    # block scale (power of two) is folded into the f32 temps inside the fast
+    # decode -- exact (exponent-only, low 16 f32 bits stay zero) -- so the scaled
+    # case no longer needs the slower per-nibble IEEE-bit path.
+    b0 = _fp4x4_in_i32_to_bf16x4_i64_via_fp8(even, arith, vector, scale_val=scale_val)
+    b1 = _fp4x4_in_i32_to_bf16x4_i64_via_fp8(odd, arith, vector, scale_val=scale_val)
     return (b0, b1)
 
 
