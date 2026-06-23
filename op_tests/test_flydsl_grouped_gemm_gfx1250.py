@@ -271,7 +271,6 @@ def _run_grouped_via_fused_moe(
     seed: int = 0,
     warmup: int = 5,
     iters: int = 101,
-    gu_interleave: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[float]]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -291,8 +290,6 @@ def _run_grouped_via_fused_moe(
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
     if layout not in ("gguu", "gugu"):
         raise ValueError(f"layout must be gguu or gugu, got {layout!r}")
-    if gu_interleave and layout != "gugu":
-        raise ValueError("gu_interleave requires layout='gugu'")
 
     K = model_dim
     inter = inter_dim
@@ -324,22 +321,20 @@ def _run_grouped_via_fused_moe(
     # has no GUGU/GGUU concept (single N=hidden GEMM).
     if layout == "gugu":
         w1_phys = _gguu_to_gugu_rows(w1_logical)
-        w1_scale_phys = _gguu_to_gugu_rows(w1_scale_raw)
         bias1_phys = _gguu_to_gugu_rows(bias1)
         gate_mode = GateMode.INTERLEAVE
     else:
         w1_phys = w1_logical
-        w1_scale_phys = w1_scale_raw
         bias1_phys = bias1
         gate_mode = GateMode.SEPARATED
 
     w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
     w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
-    if gu_interleave:
-        # Production GUGU B-scale path: feed the RAW GGUU scale to
-        # moe_shuffle_scale(is_guinterleave=True), which interleaves gate/up rows
-        # then folds n32k4 -- exercising aiter.ops.shuffle end to end (vs. the
-        # default path that pre-interleaves rows with _gguu_to_gugu_rows).
+    if layout == "gugu":
+        # GUGU B-scale is always built the production way: feed the RAW GGUU
+        # scale to moe_shuffle_scale(is_guinterleave=True), which interleaves
+        # gate/up rows then folds n32k4 (aiter.ops.shuffle.shuffle_scale_n32k4
+        # end to end) -- the weights/bias are row-interleaved above.
         w1_scale = moe_shuffle_scale(
             w1_scale_raw.contiguous(),
             experts_cnt=experts,
@@ -347,7 +342,7 @@ def _run_grouped_via_fused_moe(
             gate_up=True,
         )
     else:
-        w1_scale = moe_shuffle_scale(w1_scale_phys.contiguous(), experts_cnt=experts)
+        w1_scale = moe_shuffle_scale(w1_scale_raw.contiguous(), experts_cnt=experts)
     w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
 
     if data_format == "a4w4":
@@ -449,7 +444,6 @@ def run_moe(
     bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
-    gu_interleave: bool = False,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
     validated path: bench checks (and times) the CUDA-graph production path;
@@ -478,7 +472,6 @@ def run_moe(
         bench=bench,
         warmup=warmup,
         iters=iters,
-        gu_interleave=gu_interleave,
     )
     mode = "graph" if bench else "eager"
     ld = _logits_diff(out, ref)
@@ -649,14 +642,6 @@ def main() -> None:
         help="run with zero stage1/stage2 bias tensors",
     )
     parser.add_argument(
-        "--gu-interleave",
-        action="store_true",
-        help="GUGU only: shuffle the stage1 B-scale via the production "
-        "moe_shuffle_scale(is_guinterleave=True) path (raw GGUU scale -> n32k4) "
-        "instead of pre-interleaving rows. Use with --layout gugu --scenario verify "
-        "to validate aiter.ops.shuffle.shuffle_scale_n32k4 end to end.",
-    )
-    parser.add_argument(
         "--wst",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -674,8 +659,6 @@ def main() -> None:
         "False elsewhere (mock the GEMM so the tiny operators run on any arch).",
     )
     args = parser.parse_args()
-    if args.gu_interleave and args.layout != "gugu":
-        raise SystemExit("--gu-interleave requires --layout gugu")
     # Toggle wave-specialized TDM for the grouped gemm1 and gemm2 (read by
     # grouped_moe; applied where valid).
     _wst = "1" if args.wst else "0"
@@ -720,7 +703,6 @@ def main() -> None:
             bench=args.scenario == "bench",
             warmup=args.warmup,
             iters=args.iters,
-            gu_interleave=args.gu_interleave,
         )
         rows.append(
             {
