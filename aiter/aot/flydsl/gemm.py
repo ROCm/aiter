@@ -36,14 +36,6 @@ import sys
 import time
 from typing import Dict, Optional
 
-# When running this module directly as the AOT compile driver, export these
-# BEFORE launching -- the module no longer sets them itself, so importing it
-# (as a library or as __main__) never mutates the environment as a side effect.
-# Both must be set before the aiter imports below that read them:
-#   HIP_VISIBLE_DEVICES=-1   hide HIP devices so the AOT path takes no GPU
-#   AITER_AOT_IMPORT=1       make the aiter imports below take the AOT path
-# e.g.: HIP_VISIBLE_DEVICES=-1 AITER_AOT_IMPORT=1 python -m aiter.aot.flydsl.gemm
-
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
