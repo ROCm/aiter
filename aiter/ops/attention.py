@@ -491,7 +491,7 @@ def pa_decode_bf16_asm(
         # produce inf/NaN in the in-kernel sink merge.
         sink = torch.full((q_head_num,), -1.0e30, dtype=torch.float32, device=device)
     else:
-        sink = sink.to(torch.float32).contiguous()
+        assert sink.dtype == torch.float32, "sink must be in fp32 for pa ASM"
 
     _pa_decode_bf16_asm(
         Q,
