@@ -14,10 +14,8 @@ from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     mxfp4_quant,
     moe_gemm_a4w4,
     moe_gemm_torch,
-    swizzle_scales_gfx950,
-    swizzle_scales_gfx1250,
-    preshuffle_weights_gfx1250,
 )
+from aiter.ops.shuffle import shuffle_scale_moe, shuffle_weight
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -286,16 +284,28 @@ def test_op(
     if hbm_swizzling:
         if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
-            w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
+            )
         elif get_arch() == "gfx950":
             swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
+            w_scale_tri = shuffle_scale_moe(
+                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            )
         else:
             assert False, "Unsupported architecture"
     else:
         swizzle_mx_scale = None
     if preshuffle_weights:
-        w_tri = preshuffle_weights_gfx1250(w_tri)
+        # shuffle_weight (gfx1250) returns the (E, K_packed, N) WMMA layout; reshape to
+        # the (E, K_packed*16, N//16) column-major view the kernel consumes (equivalent
+        # to the previous preshuffle_weights_gfx1250).
+        n_experts, packed_k, n_cols = w_tri.shape
+        w_tri = (
+            shuffle_weight(w_tri, arch="gfx1250")
+            .view(n_experts, n_cols // 16, packed_k * 16)
+            .transpose(-1, -2)
+        )
 
     x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
     x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)

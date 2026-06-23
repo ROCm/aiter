@@ -113,19 +113,6 @@ def get_kernel_config(m, n, k, routing_data):
     return ret
 
 
-def swizzle_scales(data):
-    NON_K_PRESHUFFLE_BLOCK_SIZE = 32
-    block_shape = data.shape
-    SCALE_K = block_shape[-2]
-    N = block_shape[-1]
-    data = data.transpose(-1, -2)
-    data = data.view(-1, N // NON_K_PRESHUFFLE_BLOCK_SIZE, 2, 16, SCALE_K // 8, 2, 4, 1)
-    data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
-    E = block_shape[0]
-    data = data.reshape(E, N // 32, SCALE_K * 32)
-    return data.transpose(-1, -2)
-
-
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
@@ -149,7 +136,7 @@ def moe_gemm_a8w8(
     apply_swiglu=False,
     alpha=1.0,
     limit=1.0,
-    add_residual=True,
+    swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
 ):
@@ -267,7 +254,7 @@ def moe_gemm_a8w8(
         alpha,
         limit,
         reduction_n_matmul,
-        add_residual,
+        swiglu_add_residual,
         routing_data.n_expts_act,
         config["block_m"],
         config["block_n"],
@@ -301,7 +288,7 @@ def moe_gemm_a8w8(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
     return y_final
 

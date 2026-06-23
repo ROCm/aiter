@@ -56,7 +56,8 @@ void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size 
                          const int32_t max_split_per_batch,
                          const bool intra_batch_mode,
                          const std::optional<at::ScalarType> dtype_q,
-                         const std::optional<at::ScalarType> dtype_kv);
+                         const std::optional<at::ScalarType> dtype_kv,
+                         const bool is_cp_round_robin = false);
 
 std::vector<torch::Tensor>
 get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
@@ -72,6 +73,7 @@ void mla_reduce_v1(const torch::Tensor& partial_output,
                    const std::optional<torch::Tensor>& reduce_final_map,
                    const torch::Tensor& reduce_partial_map,
                    const int max_seqlen_q,
+                   const int num_kv_splits,
                    torch::Tensor& final_output,
                    std::optional<torch::Tensor>& final_lse);
 

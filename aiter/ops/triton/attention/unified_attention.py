@@ -10,7 +10,44 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
 )
 
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_3d import (
+        _unified_attention_gluon_kernel_3d,
+    )
+except:  # noqa: E722
+    _unified_attention_gluon_kernel_3d = None
+
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_2d import (
+        _unified_attention_gluon_kernel_2d,
+    )
+except:  # noqa: E722
+    _unified_attention_gluon_kernel_2d = None
+
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+
+DEVICE_ARCH = arch_info.get_arch()
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
+
+
+def is_2d_gluon_available(
+    q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
+):
+    use_gluon_2d = (
+        IS_DEVICE_ARCH_GFX12
+        and _unified_attention_gluon_kernel_2d is not None
+        and not softcap
+        and not use_qq_bias
+        and not use_alibi_slopes
+        and q_dtype != torch.uint8
+        and kv_cache_dtype != torch.uint8
+        and q_dtype == kv_cache_dtype
+    )
+    return use_gluon_2d
 
 
 def select_2d_config(
@@ -22,6 +59,9 @@ def select_2d_config(
     max_seqlen_k,
     num_queries_per_kv,
     num_2d_prgms,
+    q_dtype,
+    kv_cache_dtype,
+    shuffled_kv_cache,
 ):
     arch = get_arch()
 
@@ -54,6 +94,16 @@ def select_2d_config(
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
 
+    # fix TILE_SIZE to block_size if shuffled_kv_cache is True
+    if shuffled_kv_cache:
+        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            assert (
+                block_size >= 32
+            ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+        TILE_SIZE = block_size
+    elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+        TILE_SIZE = max(32, TILE_SIZE)
+
     return {
         "BLOCK_M": BLOCK_M,
         "BLOCK_Q": BLOCK_Q,
@@ -65,33 +115,122 @@ def select_2d_config(
 
 
 def select_3d_config(
-    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
+    head_size,
+    block_size,
+    max_seqlen_k,
+    target_num_prgms,
+    num_2d_prgms,
+    q_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    shuffled_kv_cache: bool = False,
+    NUM_BLOCKS_GATHER_PER_TILE: int = 1,
 ):
+    # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
+    # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
+    assert kv_cache_dtype in (
+        torch.bfloat16,
+        e4m3_dtype,
+    ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
-    # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-    num_segments = math.ceil(target_num_prgms / num_2d_prgms)
-    num_segments = triton.next_power_of_2(num_segments)
-    num_segments = min(num_segments, 128)
-    MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
-    num_segments = max(num_segments, MIN_SEGMENTS)
-    if num_segments == MIN_SEGMENTS:
-        reduce_num_warps = 1
+    waves_per_eu = 2
+    num_segments = 0
+    attn_stages = 2
+    if IS_DEVICE_ARCH_GFX12:
+        attn_warps = 1
+        TILE_SIZE = block_size
+        if shuffled_kv_cache and head_size < 128:
+            if kv_cache_dtype == torch.bfloat16:
+                if block_size <= 64:
+                    waves_per_eu = 2
+                else:
+                    waves_per_eu = 1
+            elif kv_cache_dtype == e4m3_dtype:
+                if block_size <= 128:
+                    waves_per_eu = 2
+                else:
+                    waves_per_eu = 1
+            else:
+                assert block_size == 128, "FP4 KV cache only supports block_size 128"
+                waves_per_eu = 2
+        else:
+            # GFX12 fallback
+            waves_per_eu = 1
+
+        occ = waves_per_eu * 4 // attn_warps
+        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
+        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
+        num_segments = min(MAX_SEGMENTS, num_segments)
+        num_segments = triton.next_power_of_2(num_segments)
+
+        # # this section increases the num_warps if the occ is too high
+        # total_num_wg = num_2d_prgms * num_segments
+        # if total_num_wg < occ * target_num_prgms:
+        #     # occ too high, increase attn_warps to relax occ
+        #     attn_warps = (waves_per_eu * 4) // max(
+        #         1, triton.next_power_of_2(total_num_wg // target_num_prgms)
+        #     )
+        #     attn_warps = max(attn_warps, 1)
+        #     attn_warps = min(attn_warps, 4)
+    else:
+        occ = waves_per_eu * 4 // attn_warps
+        target_num_prgms = target_num_prgms * occ
+
+        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+
+        MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+        MIN_SEGMENTS = min(8, MAX_SEGMENTS)
+        if num_segments == 0:
+            num_segments = math.ceil(target_num_prgms / num_2d_prgms)
+            num_segments = min(num_segments, MAX_SEGMENTS)
+            num_segments = triton.next_power_of_2(num_segments)
+            num_segments = min(num_segments, 128)
+            num_segments = max(num_segments, MIN_SEGMENTS)
+
+        if num_segments == MIN_SEGMENTS:
+            reduce_num_warps = 1
+
+        if shuffled_kv_cache:
+            if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+                assert (
+                    block_size >= 32
+                ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+            TILE_SIZE = block_size
+        elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            TILE_SIZE = max(32, TILE_SIZE)
+
+    if NUM_BLOCKS_GATHER_PER_TILE > 1:
+        # force gather mode
+        assert NUM_BLOCKS_GATHER_PER_TILE in [
+            4,
+            8,
+        ], "Only NUM_BLOCKS_GATHER_PER_TILE = 4 or 8 is supported"
+        attn_warps = 2
+        waves_per_eu = 1
+        num_segments = max(1, num_segments // NUM_BLOCKS_GATHER_PER_TILE)
+        TILE_SIZE = block_size * NUM_BLOCKS_GATHER_PER_TILE
+    elif TILE_SIZE > block_size:
+        assert (
+            TILE_SIZE % block_size == 0
+        ), "TILE_SIZE needs to be divisible by block_size"
+        NUM_BLOCKS_GATHER_PER_TILE = TILE_SIZE // block_size
+
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
-        "num_stages": 1,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves_per_eu,
+        "num_stages": attn_stages,
     }
+
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": reduce_num_warps,
-        "num_stages": 1,
         "waves_per_eu": 2,
+        "num_stages": 1,
     }
+
     return attn_config, reduce_config
 
 
@@ -104,6 +243,10 @@ def use_2d_kernel(
     target_num_prgms,
     num_2d_prgms,
 ):
+    # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
+    if IS_DEVICE_ARCH_GFX12:
+        return (sliding_window > 0) or (not all_decode)
+
     return (
         (sliding_window > 0)
         or (max_seqlen_k <= 512)
@@ -128,27 +271,67 @@ def unified_attention(
     q_descale,
     k_descale,
     v_descale,
+    q_scales=None,
     alibi_slopes=None,
     output_scale=None,
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    shuffled_kv_cache: bool = False,
+    skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
-
-    if sinks is not None:
-        assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-    block_size = v.shape[1]
+    q_dtype = q.dtype
+    kv_cache_dtype = k.dtype
+    num_tokens, num_query_heads, head_size = q.shape
+
+    if sinks is not None:
+        assert sinks.shape[0] == num_query_heads, "Sinks must be num_query_heads size"
+
+    BLOCK_SCALES_SIZE = 16
+    if q_dtype == torch.uint8:
+        # A4W4
+        assert q_scales is not None and q_scales.dtype == e4m3_dtype
+        head_size = head_size * 2
+        QUERY_DTYPE = "nvfp4"
+    elif q_dtype == e4m3_dtype:
+        QUERY_DTYPE = "fp8"
+    else:
+        QUERY_DTYPE = "bf16"
+
+    if kv_cache_dtype == torch.uint8:
+        KV_CACHE_DTYPE = "nvfp4"
+    elif kv_cache_dtype == e4m3_dtype:
+        KV_CACHE_DTYPE = "fp8"
+    else:
+        KV_CACHE_DTYPE = "bf16"
+
+    if shuffled_kv_cache:
+        SCALE_K_WIDTH = 4
+        if kv_cache_dtype == torch.uint8:
+            num_blocks, num_kv_heads, block_size, _ = k.shape
+            K_WIDTH = 16
+            SCALE_K = head_size // 16
+            SCALE_K_WIDTH = (
+                min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
+            )
+        else:
+            # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
+            # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
+            num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
+    else:
+        # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
+        num_blocks, block_size, num_kv_heads, _ = k.shape
+        K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
+        SCALE_K_WIDTH = 4
+
     num_seqs = len(seqused_k)
-    num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    head_size = q.shape[2]
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -165,8 +348,12 @@ def unified_attention(
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     cu_count = get_num_sms()
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
+    ALL_DECODE = max_seqlen_q == 1
+    if ALL_DECODE:
+        total_num_q_blocks = num_seqs
+    else:
+        total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
     # if batch contains a prefill
@@ -179,149 +366,280 @@ def unified_attention(
         target_num_prgms,
         num_2d_prgms,
     ):
-        config = select_2d_config(
-            block_size,
-            head_size,
-            SLIDING_WINDOW,
-            ALL_DECODE,
-            max_seqlen_q,
-            max_seqlen_k,
-            num_queries_per_kv,
-            num_2d_prgms,
-        )
-        assert config["BLOCK_Q"] >= 1
-        total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
-        kernel_unified_attention_2d[
-            (
-                num_kv_heads,
-                total_num_q_blocks,
-            )
-        ](
-            output_ptr=out,
-            query_ptr=q,
-            key_cache_ptr=k,
-            value_cache_ptr=v,
-            sink_ptr=sinks,
-            block_tables_ptr=block_table,
-            seq_lens_ptr=seqused_k,
-            alibi_slopes_ptr=alibi_slopes,
-            qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            q_descale_ptr=q_descale,
-            k_descale_ptr=k_descale,
-            v_descale_ptr=v_descale,
-            out_scale_ptr=output_scale,
-            softcap=softcap,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
-            SLIDING_WINDOW=SLIDING_WINDOW,
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            num_seqs=num_seqs,
-            ALL_DECODE=ALL_DECODE,
-            **config,
+        # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
+        # sinks / output_scale / shuffled_kv_cache)
+        use_gluon_2d = is_2d_gluon_available(
+            q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
         )
+        if use_gluon_2d:
+            _gfx1250_unified_attention_2d(
+                q,
+                k,
+                v,
+                out,
+                cu_seqlens_q,
+                seqused_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+                window_size,
+                block_table,
+                softcap,
+                q_descale,
+                k_descale,
+                v_descale,
+                sinks,
+                output_scale=output_scale,
+                shuffled_kv_cache=shuffled_kv_cache,
+            )
+        else:
+            config = select_2d_config(
+                block_size,
+                head_size,
+                SLIDING_WINDOW,
+                ALL_DECODE,
+                max_seqlen_q,
+                max_seqlen_k,
+                num_queries_per_kv,
+                num_2d_prgms,
+                q_dtype,
+                kv_cache_dtype,
+                shuffled_kv_cache,
+            )
+            assert config["BLOCK_Q"] >= 1
+            if ALL_DECODE:
+                total_num_q_blocks = num_seqs
+            else:
+                total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
+
+            kernel_unified_attention_2d[
+                (
+                    num_kv_heads,
+                    total_num_q_blocks,
+                )
+            ](
+                output_ptr=out,
+                query_ptr=q,
+                key_cache_ptr=k,
+                value_cache_ptr=v,
+                sink_ptr=sinks,
+                block_tables_ptr=block_table,
+                seq_lens_ptr=seqused_k,
+                alibi_slopes_ptr=alibi_slopes,
+                qq_bias_ptr=qq_bias,
+                scale=softmax_scale,
+                q_descale_ptr=q_descale,
+                k_descale_ptr=k_descale,
+                v_descale_ptr=v_descale,
+                out_scale_ptr=output_scale,
+                softcap=softcap,
+                num_query_heads=num_query_heads,
+                num_queries_per_kv=num_queries_per_kv,
+                block_table_stride=block_table.stride(0),
+                query_stride_0=q.stride(0),
+                query_stride_1=q.stride(1),
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+                BLOCK_SIZE=block_size,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                USE_ALIBI_SLOPES=use_alibi_slopes,
+                USE_QQ_BIAS=use_qq_bias,
+                USE_SOFTCAP=(softcap > 0),
+                USE_SINKS=(sinks is not None),
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                stride_k_cache_0=k.stride(0),
+                stride_k_cache_1=k.stride(1),
+                stride_k_cache_2=k.stride(2),
+                stride_k_cache_3=k.stride(3),
+                stride_v_cache_0=v.stride(0),
+                stride_v_cache_1=v.stride(1),
+                stride_v_cache_2=v.stride(2),
+                stride_v_cache_3=v.stride(3),
+                query_start_len_ptr=cu_seqlens_q,
+                num_seqs=num_seqs,
+                ALL_DECODE=ALL_DECODE,
+                SHUFFLED_KV_CACHE=shuffled_kv_cache,
+                K_WIDTH=K_WIDTH,
+                **config,
+            )
+        return out
 
     else:
+        NUM_BLOCKS_GATHER_PER_TILE = 1
         attn_config, reduce_config = select_3d_config(
             head_size,
             block_size,
-            q.element_size(),
             max_seqlen_k,
             target_num_prgms,
             num_2d_prgms,
+            q_dtype,
+            kv_cache_dtype,
+            shuffled_kv_cache,
+            NUM_BLOCKS_GATHER_PER_TILE,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
-        segm_output = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            NUM_SEGMENTS,
-            triton.next_power_of_2(head_size),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        segm_max = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            NUM_SEGMENTS,
-            dtype=torch.float32,
-            device=q.device,
-        )
-        segm_expsum = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            NUM_SEGMENTS,
-            dtype=torch.float32,
-            device=q.device,
-        )
+        if NUM_SEGMENTS > 1:
+            segm_output = torch.empty(
+                q.shape[0],
+                num_query_heads,
+                NUM_SEGMENTS,
+                triton.next_power_of_2(head_size),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            segm_max = torch.empty(
+                q.shape[0],
+                num_query_heads,
+                NUM_SEGMENTS,
+                dtype=torch.float32,
+                device=q.device,
+            )
+            segm_expsum = torch.empty(
+                q.shape[0],
+                num_query_heads,
+                NUM_SEGMENTS,
+                dtype=torch.float32,
+                device=q.device,
+            )
+        else:
+            segm_output = out
+            segm_max = out  # dummy ptr
+            segm_expsum = out  # dummy ptr
 
-        kernel_unified_attention_3d[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
-            segm_output_ptr=segm_output,
-            segm_max_ptr=segm_max,
-            segm_expsum_ptr=segm_expsum,
-            query_ptr=q,
-            key_cache_ptr=k,
-            value_cache_ptr=v,
-            sink_ptr=sinks,
-            block_tables_ptr=block_table,
-            seq_lens_ptr=seqused_k,
-            alibi_slopes_ptr=alibi_slopes,
-            qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            q_descale_ptr=q_descale,
-            k_descale_ptr=k_descale,
-            v_descale_ptr=v_descale,
-            softcap=softcap,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
-            SLIDING_WINDOW=SLIDING_WINDOW,
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
-            ALL_DECODE=ALL_DECODE,
-            **attn_config,
-        )
+        if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache:
+            _unified_attention_gluon_kernel_3d[
+                (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
+            ](
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                query_ptr=q,
+                query_scales_ptr=q_scales,
+                key_cache_ptr=k,
+                value_cache_ptr=v,
+                sink_ptr=sinks,
+                block_tables_ptr=block_table,
+                seq_lens_ptr=seqused_k,
+                alibi_slopes_ptr=alibi_slopes,
+                qq_bias_ptr=qq_bias,
+                q_scale_ptr=q_descale,
+                k_scale_ptr=k_descale,
+                v_scale_ptr=v_descale,
+                out_scale_ptr=(
+                    output_scale
+                    if (output_scale is not None and NUM_SEGMENTS == 1)
+                    else None
+                ),
+                softcap=softcap,
+                num_seqs=num_seqs,
+                num_blocks=num_blocks,
+                block_table_stride=block_table.stride(0),
+                max_num_blocks_per_seq=block_table.shape[1],
+                query_stride_0=q.stride(0),
+                query_stride_1=q.stride(1),
+                query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
+                query_scales_stride_1=q_scales.stride(1) if q_scales is not None else 0,
+                qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+                BLOCK_SIZE=block_size,
+                HEAD_SIZE=head_size,
+                USE_ALIBI_SLOPES=use_alibi_slopes,
+                USE_QQ_BIAS=use_qq_bias,
+                USE_SOFTCAP=(softcap > 0),
+                USE_SINKS=(sinks is not None),
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                stride_k_cache_0=k.stride(0),
+                stride_k_cache_1=k.stride(1),
+                stride_k_cache_2=k.stride(2),
+                stride_k_cache_3=k.stride(3),
+                stride_v_cache_0=v.stride(0),
+                stride_v_cache_1=v.stride(1),
+                stride_v_cache_2=v.stride(2),
+                stride_v_cache_3=v.stride(3),
+                query_start_len_ptr=cu_seqlens_q,
+                SCALE=softmax_scale,
+                NUM_QUERY_HEADS=num_query_heads,
+                NUM_KV_HEADS=num_kv_heads,
+                BLOCK_Q=BLOCK_Q,
+                BLOCK_M=BLOCK_M,
+                ALL_DECODE=ALL_DECODE,
+                SHUFFLED_KV_CACHE=shuffled_kv_cache,
+                K_WIDTH=K_WIDTH,
+                SCALE_K_WIDTH=SCALE_K_WIDTH,
+                WARP_SIZE=WARP_SIZE,
+                NUM_BLOCKS_GATHER_PER_TILE=NUM_BLOCKS_GATHER_PER_TILE,
+                QUERY_DTYPE=QUERY_DTYPE,
+                KV_CACHE_DTYPE=KV_CACHE_DTYPE,
+                BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
+                **attn_config,
+            )
+        else:
+            kernel_unified_attention_3d[
+                (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
+            ](
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                query_ptr=q,
+                key_cache_ptr=k,
+                value_cache_ptr=v,
+                sink_ptr=sinks,
+                block_tables_ptr=block_table,
+                seq_lens_ptr=seqused_k,
+                alibi_slopes_ptr=alibi_slopes,
+                qq_bias_ptr=qq_bias,
+                scale=softmax_scale,
+                q_descale_ptr=q_descale,
+                k_descale_ptr=k_descale,
+                v_descale_ptr=v_descale,
+                out_scale_ptr=(
+                    output_scale
+                    if (output_scale is not None and NUM_SEGMENTS == 1)
+                    else None
+                ),
+                softcap=softcap,
+                num_query_heads=num_query_heads,
+                num_queries_per_kv=num_queries_per_kv,
+                block_table_stride=block_table.stride(0),
+                query_stride_0=q.stride(0),
+                query_stride_1=q.stride(1),
+                qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+                BLOCK_SIZE=block_size,
+                HEAD_SIZE=head_size,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                USE_ALIBI_SLOPES=use_alibi_slopes,
+                USE_QQ_BIAS=use_qq_bias,
+                USE_SOFTCAP=(softcap > 0),
+                USE_SINKS=(sinks is not None),
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                stride_k_cache_0=k.stride(0),
+                stride_k_cache_1=k.stride(1),
+                stride_k_cache_2=k.stride(2),
+                stride_k_cache_3=k.stride(3),
+                stride_v_cache_0=v.stride(0),
+                stride_v_cache_1=v.stride(1),
+                stride_v_cache_2=v.stride(2),
+                stride_v_cache_3=v.stride(3),
+                query_start_len_ptr=cu_seqlens_q,
+                BLOCK_Q=BLOCK_Q,
+                num_seqs=num_seqs,
+                BLOCK_M=BLOCK_M,
+                ALL_DECODE=ALL_DECODE,
+                SHUFFLED_KV_CACHE=shuffled_kv_cache,
+                K_WIDTH=K_WIDTH,
+                IS_Q_FP8=(q_dtype == e4m3_dtype),
+                IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
+                **attn_config,
+            )
+
+        if NUM_SEGMENTS == 1:
+            return segm_output
+        elif skip_reduce:
+            return segm_output, segm_max, segm_expsum
+
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=segm_output,
@@ -340,3 +658,187 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             **reduce_config,
         )
+
+        return out
+
+
+def _gfx1250_unified_attention_2d(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    seqused_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+    window_size,
+    block_table,
+    softcap,
+    q_descale,
+    k_descale,
+    v_descale,
+    sinks,
+    output_scale=None,
+    shuffled_kv_cache=False,
+    loop_variant=None,
+):
+    """
+    Internal wrapper for the gfx1250 gluon kernel.
+
+    Args:
+        See main wrapper for other args.
+        loop_variant:
+            0=plain double buffered version,
+            1=2-stage version,
+            2=4-stage version
+    """
+    # useful for debugging when needed
+    remove_indirect_access = False
+    NUM_SEQS = len(seqused_k)
+    NUM_Q_HEADS = q.shape[1]
+    HEAD_SIZE = q.shape[2]
+    num_blocks = k.shape[0]
+    Q_FP8 = q.element_size() == 1
+    KV_FP8 = k.element_size() == 1
+    ARCH_NAME = arch_info.get_arch()
+    assert loop_variant in [
+        None,
+        0,
+        1,
+        2,
+    ], "Only [None, 0, 1, 2] supported as loop_variant"
+    assert ARCH_NAME == "gfx1250", "unified_attention_2d_gfx1250 only supports gfx1250"
+    assert softcap == 0, "Softcap is not supported"
+    if shuffled_kv_cache:
+        # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
+        # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
+        num_blocks, NUM_KV_HEADS, _, BLOCK_SIZE, K_WIDTH = k.shape
+        # TILE_SIZE must be a multiple of the page size. Default to 128 so that
+        # small pages pack several blocks per tile, but grow it to BLOCK_SIZE
+        # when the page is larger (e.g. --block-size 256) so the invariant
+        # TILE_SIZE >= BLOCK_SIZE still holds.
+        TILE_SIZE = max(128, BLOCK_SIZE)
+        num_kv_blocks = TILE_SIZE // BLOCK_SIZE
+        assert (
+            TILE_SIZE >= BLOCK_SIZE
+        ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
+    else:
+        BLOCK_SIZE = k.shape[1]
+        NUM_KV_HEADS = k.shape[2]
+        TILE_SIZE = BLOCK_SIZE
+        num_kv_blocks = 1
+    assert (
+        num_kv_blocks & (num_kv_blocks - 1) == 0
+    ), "num_kv_blocks must be a power of 2"
+
+    SLIDING_WINDOW = 1 + window_size[0]
+    ALL_DECODE = max_seqlen_q == 1
+    NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
+    num_warps = 4
+    BLOCK_M = 128
+    waves_per_eu = 1
+    SLIDING_WINDOW = 1 + window_size[0]
+    ALL_DECODE = max_seqlen_q == 1
+    NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
+    num_warps = 4
+    BLOCK_M = 128
+    waves_per_eu = 1
+    if SLIDING_WINDOW > 0:
+        sel_loop_variant = 0
+    elif shuffled_kv_cache or TILE_SIZE > 32:
+        sel_loop_variant = 2
+    else:
+        sel_loop_variant = 0
+    if ALL_DECODE:
+        sel_loop_variant = 0
+        BLOCK_M = (
+            16
+            if NUM_QUERIES_PER_KV <= 16
+            else triton.next_power_of_2(NUM_QUERIES_PER_KV)
+        )
+        if Q_FP8 and KV_FP8:
+            num_warps = 1
+            waves_per_eu = 2
+            TILE_SIZE = 256
+        else:
+            num_warps = 1
+            waves_per_eu = 2
+
+    # auto mode, otherwise use the provided variant
+    if loop_variant is None:
+        loop_variant = sel_loop_variant
+
+    assert (
+        TILE_SIZE >= BLOCK_SIZE
+    ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
+
+    BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
+    # Upper bound on masked tiles. +1 because the causal diagonal isnt
+    # tile-aligned, the query_span-wide band sits at an arbitrary key offset
+    # and can spill into one extra tile
+    query_span = (BLOCK_M - 1) // NUM_QUERIES_PER_KV + 1
+    max_mask_tiles = (query_span + TILE_SIZE - 1) // TILE_SIZE + 1
+    # other variants do at most 2 masking at the end of loop
+    if max_mask_tiles > 2:
+        loop_variant = 0
+    total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
+    NUM_WARPS = num_warps
+    num_buffers = 2 if loop_variant == 0 else 3
+
+    kv_size = k.nelement() * k.element_size()
+    MAX_INT32 = 2**31 - 1
+    USE_LOAD_BUFFER_OP = ARCH_NAME != "gfx1250" and kv_size <= MAX_INT32
+    USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
+    grid = (NUM_KV_HEADS, total_query_blocks)
+    _unified_attention_gluon_kernel_2d[grid](
+        query_ptr=q,
+        key_cache_ptr=k,
+        value_cache_ptr=v,
+        sink_ptr=sinks,
+        output_ptr=out,
+        block_tables_ptr=block_table,
+        seq_lens_ptr=seqused_k,
+        query_start_len_ptr=cu_seqlens_q,
+        query_stride_0=q.stride(0),
+        query_stride_1=q.stride(1),
+        output_stride_0=out.stride(0),
+        output_stride_1=out.stride(1),
+        k_descale_ptr=k_descale,
+        v_descale_ptr=v_descale,
+        q_descale_ptr=q_descale,
+        out_scale_ptr=output_scale,
+        USE_SINKS=(sinks is not None),
+        SLIDING_WINDOW=SLIDING_WINDOW,
+        num_blocks=num_blocks,
+        stride_k_cache_0=k.stride(0),
+        stride_k_cache_1=k.stride(1),
+        stride_k_cache_2=k.stride(2),
+        stride_k_cache_3=k.stride(3),
+        stride_v_cache_0=v.stride(0),
+        stride_v_cache_1=v.stride(1),
+        stride_v_cache_2=v.stride(2),
+        stride_v_cache_3=v.stride(3),
+        block_table_stride=block_table.stride(0),
+        num_seqs=NUM_SEQS,
+        SCALE=softmax_scale,
+        NUM_QUERY_HEADS=NUM_Q_HEADS,
+        NUM_KV_HEADS=NUM_KV_HEADS,
+        BLOCK_SIZE=BLOCK_SIZE,
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE=HEAD_SIZE,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_M=BLOCK_M,
+        ARCH_NAME=ARCH_NAME,
+        waves_per_eu=waves_per_eu,
+        USE_LOAD_BUFFER_OP=USE_LOAD_BUFFER_OP,
+        USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
+        num_warps=NUM_WARPS,
+        ALL_DECODE=ALL_DECODE,
+        SHUFFLED_KV_CACHE=shuffled_kv_cache,
+        CAUSAL=causal,
+        REMOVE_INDIRECT_ACCESS=remove_indirect_access,
+        NUM_BUFFERS=num_buffers,
+        LOOP_VARIANT=loop_variant,
+    )

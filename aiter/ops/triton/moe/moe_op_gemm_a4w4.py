@@ -393,44 +393,6 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     return ret
 
 
-def swizzle_scales_gfx950(data):
-    NON_K_PRESHUFFLE_BLOCK_SIZE = 32
-    block_shape = data.shape
-    SCALE_K = block_shape[-2]
-    N = block_shape[-1]
-    data = data.transpose(-1, -2)
-    data = data.view(-1, N // NON_K_PRESHUFFLE_BLOCK_SIZE, 2, 16, SCALE_K // 8, 2, 4, 1)
-    data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
-    E = block_shape[0]
-    data = data.reshape(E, N // 32, SCALE_K * 32)
-    return data.transpose(-1, -2)
-
-
-def swizzle_scales_gfx1250(data):
-    E, K_SCALE, N = data.shape
-    preshuffle_factor = 32
-    num_chunk_n = N // preshuffle_factor
-    SCALE_KWIDTH = 8
-    num_chunk_k = K_SCALE // SCALE_KWIDTH
-
-    data = data.transpose(-1, -2)
-    data = data.view(E, num_chunk_n, 32, num_chunk_k, SCALE_KWIDTH)
-    data = data.permute(0, 1, 3, 2, 4).contiguous()
-    data = data.view(E, N // preshuffle_factor, K_SCALE * preshuffle_factor)
-    data = data.transpose(-1, -2)
-
-    return data
-
-
-def preshuffle_weights_gfx1250(data):
-    E, K, N = data.shape
-    data = data.transpose(-1, -2)  # [E, N, K]
-    data = data.view(E, N // 16, 16, K // 16, 16)  # [E, N // 16, 16, K // 16, 16]
-    data = data.permute(0, 1, 3, 2, 4).contiguous()  # [E, N // 16, K // 16, 16, 16]
-    data = data.view(E, N // 16, K * 16)  # [E, N // 16, K * 16]
-    return data.transpose(-1, -2)
-
-
 # -----------------------------------------------------------------------------
 # Triton Implementation
 # -----------------------------------------------------------------------------
@@ -509,7 +471,7 @@ def moe_gemm_a4w4(
     apply_swiglu=False,
     alpha=1.0,
     limit=1.0,
-    add_residual=True,
+    swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
     config=None,
@@ -656,7 +618,7 @@ def moe_gemm_a4w4(
             alpha,
             limit,
             reduction_n_matmul,
-            add_residual,
+            swiglu_add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
@@ -713,7 +675,7 @@ def moe_gemm_a4w4(
             alpha,
             limit,
             reduction_n_matmul,
-            add_residual,
+            swiglu_add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
@@ -748,7 +710,7 @@ def moe_gemm_a4w4(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
 
     return y_final
