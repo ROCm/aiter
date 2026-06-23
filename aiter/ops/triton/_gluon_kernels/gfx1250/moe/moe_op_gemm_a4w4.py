@@ -1,6 +1,7 @@
 import torch
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
 
@@ -243,29 +244,21 @@ def _moe_gemm_a4w4_gfx1250(
 
     # get program id
     pid = gl.program_id(0)
-    if ExptOffsSum is not None and XCD_SWIZZLE > 1:
-        # Determine how much padding there is on the expert data. This allows us to
-        # know the true grid size and avoid processing padding tiles.
-        padding_m = grid_m - gl.load(ExptOffsSum)
-    else:
-        padding_m: gl.constexpr = 0
-
     index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
-
-    # get unpadded grid size
-    unpadded_m = grid_m - padding_m
-    gl.assume(unpadded_m >= 0)
-    total_actual_tiles = unpadded_m * grid_n
-    if padding_m > 0 and pid >= total_actual_tiles:
-        return
-
-    # swizzle program ids
-    pid_mn = pid % (unpadded_m * grid_n)
-    pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, 1)
-
+    if XCD_SWIZZLE != 1:
+        padding_m = grid_m - gl.load(ExptOffsSum)
+        unpadded_m = grid_m - padding_m
+        total_actual_tiles = unpadded_m * grid_n
+        if padding_m > 0 and pid >= total_actual_tiles:
+            return
+        pid = remap_xcd(pid, total_actual_tiles, XCD_SWIZZLE)
+    else:
+        unpadded_m = grid_m
+    pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, 1)
+    
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)
-    if expt_data == -1:
+    if XCD_SWIZZLE == 1 and expt_data == -1:
         return
     expt_id = expt_data & 0x0000FFFF
     block_id = expt_data >> 16
