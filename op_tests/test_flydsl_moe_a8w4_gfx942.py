@@ -88,14 +88,23 @@ def _decode_a(a_fp8: torch.Tensor, a_scale_groups: torch.Tensor, group_size: int
     return a * sc
 
 
-def _check(ref: torch.Tensor, out: torch.Tensor, label: str, rel_l2_max: float = 0.08):
+def _check(ref: torch.Tensor, out: torch.Tensor, label: str, rel_l2_max: float = 0.08,
+           *, quiet_on_pass: bool = False):
     """Relative-L2 gate -- robust to MX dynamic range (single-element fp4/fp8 error
-    is large, but the aggregate direction is tight)."""
+    is large, but the aggregate direction is tight).
+
+    When ``quiet_on_pass`` is True, success prints only ``[label] PASS`` (used by
+    the ``--bench`` verify path). Failures always emit rel_L2, shapes, and sample
+    ref/out values for debugging.
+    """
     ref = ref.float()
     out = out.float()
     max_delta = (ref - out).abs().max().item()
     rel_l2 = ((out - ref).norm() / ref.norm().clamp_min(1e-30)).item()
     passed = rel_l2 <= rel_l2_max
+    if passed and quiet_on_pass:
+        print(f"[{label}] PASS")
+        return passed
     print(f"[{label}] rel_L2={rel_l2:.4f} (<= {rel_l2_max})  max_delta={max_delta:.3f} "
           f"-> {'PASS' if passed else 'FAIL'}")
     print(f"    ref : {ref.reshape(-1)[:6].tolist()}")
@@ -505,20 +514,79 @@ def _main():
     return 0 if (ok1 and ok2 and ok3 and ok4) else 1
 
 
-def _bench(shape, num_iters=50, num_warmup=10):
-    """Time the public-bridge a8w4 stage1/stage2 decode kernels and report TFLOPS."""
+def _bench(shape, num_iters=50, num_warmup=10, verify=True):
+    """Time the public-bridge a8w4 stage1/stage2 decode kernels and report TFLOPS.
+
+    When ``verify`` is True (default), runs one correctness pass at the bench
+    shape via ``_check`` against the torch ref for stage1 and stage2 *before*
+    timing (same gate as the pytest tests). On failure, timing is skipped. Pass
+    ``verify=False`` (``--no-verify``) to benchmark only.
+
+    The B1/B2 path is selected by the ``AITER_FLYDSL_A8W4_FP8`` env var inside the
+    bridge dispatch (``fp8`` native-fp8 MFMA when ==1, else ``bf16``-decode). The
+    torch reference (fp8 act x MX-FP4 weight) is identical for both, so one ref
+    validates whichever path is active; the active mode is reflected in the tag.
+
+    Weights/scales are built once so run_perftest times the kernel launch, not
+    the input preparation. Stage2 re-zeros its output each call (atomic mode),
+    so repeated timing iterations do not over-accumulate.
+    """
+    import os
+
     from aiter.test_common import run_perftest
 
     tokens, model_dim, inter_dim = shape["tokens"], shape["model_dim"], shape["inter_dim"]
     experts, topk, gsize = shape["experts"], shape["topk"], 32
     tile_m, tile_n, tile_k = shape["tile_m"], shape["tile_n"], shape["tile_k"]
 
+    mode = "fp8" if os.environ.get("AITER_FLYDSL_A8W4_FP8", "0") == "1" else "bf16"
+
     g = _gen_common(tokens, model_dim, inter_dim, experts, topk, tile_m, gsize)
     dev = g["dev"]
-    _, _, w1_kernel, scale_w1_1d = _gen_w1(dev, experts, inter_dim, model_dim, gsize)
-    _, _, w2_kernel, scale_w2_1d = _gen_w2(dev, experts, inter_dim, model_dim, gsize)
+    w1_codes, scale_w1_groups, w1_kernel, scale_w1_1d = _gen_w1(
+        dev, experts, inter_dim, model_dim, gsize
+    )
+    w2_codes, scale_w2_groups, w2_kernel, scale_w2_1d = _gen_w2(
+        dev, experts, inter_dim, model_dim, gsize
+    )
     w1 = w1_kernel.view(experts, 2 * inter_dim, model_dim // 2)
     w2 = w2_kernel.view(experts, model_dim, inter_dim // 2)
+
+    if verify:
+        out1 = flydsl_moe_stage1(
+            a=g["a_fp8"], w1=w1,
+            sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
+            num_valid_ids=g["num_valid_ids"], topk=topk,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            a_dtype="fp8", b_dtype="fp4", out_dtype="bf16", act="silu",
+            w1_scale=scale_w1_1d, a1_scale=g["a_scale_1d"], sorted_weights=None,
+        )
+        torch.cuda.synchronize()
+        ref1 = _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, gsize)
+        if not _check(ref1, out1.reshape(ref1.shape),
+                      f"bench_stage1_a8w4_{mode}_bridge", quiet_on_pass=True):
+            print("[bench] stage1 CORRECTNESS FAILED -- not timing")
+            return 1
+
+        a2_fp8, a2_scale = _quant_a2(out1.reshape(tokens, topk, inter_dim).float(), gsize)
+        a2_scale_1d = a2_scale.view(-1).contiguous()
+        out2 = torch.zeros((tokens, model_dim), device=dev, dtype=torch.bfloat16)
+        out2 = flydsl_moe_stage2(
+            inter_states=a2_fp8, w2=w2,
+            sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
+            num_valid_ids=g["num_valid_ids"], out=out2, topk=topk,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            a_dtype="fp8", b_dtype="fp4", out_dtype="bf16", mode="atomic",
+            w2_scale=scale_w2_1d, a2_scale=a2_scale_1d, sorted_weights=None,
+        )
+        torch.cuda.synchronize()
+        ref2 = _ref_stage2(
+            g, a2_fp8, a2_scale_groups_from_1d(a2_scale_1d, tokens * topk, inter_dim, gsize),
+            w2_codes, scale_w2_groups, model_dim, gsize,
+        )
+        if not _check(ref2, out2, f"bench_stage2_a8w4_{mode}_bridge", quiet_on_pass=True):
+            print("[bench] stage2 CORRECTNESS FAILED -- not timing")
+            return 1
 
     def _s1():
         return flydsl_moe_stage1(
@@ -550,7 +618,7 @@ def _bench(shape, num_iters=50, num_warmup=10):
     f1 = 2 * tokens * topk * (2 * inter_dim) * model_dim
     f2 = 2 * tokens * topk * inter_dim * model_dim
     print(
-        f"\na8w4 decode (gfx942)  tokens={tokens} model_dim={model_dim} "
+        f"\na8w4 {mode} decode (gfx942)  tokens={tokens} model_dim={model_dim} "
         f"inter_dim={inter_dim} E={experts} topk={topk} "
         f"tile={tile_m}x{tile_n}x{tile_k}"
     )
@@ -565,6 +633,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--bench", action="store_true",
                    help="report kernel time + TFLOPS instead of correctness")
+    p.add_argument("--no-verify", action="store_true",
+                   help="(bench only) skip torch-ref correctness check before timing")
     p.add_argument("-t", "--tokens", type=int, default=4096)
     p.add_argument("--model-dim", type=int, default=4096)
     p.add_argument("--inter-dim", type=int, default=1536)
@@ -582,5 +652,5 @@ if __name__ == "__main__":
             tokens=args.tokens, model_dim=args.model_dim, inter_dim=args.inter_dim,
             experts=args.experts, topk=1,
             tile_m=args.tile_m, tile_n=args.tile_n, tile_k=args.tile_k,
-        )))
+        ), verify=not args.no_verify))
     sys.exit(_main())
