@@ -116,6 +116,7 @@ def compile_mxscale_gemm(
     out_dtype: str = "f32",
     inst_prefetch: bool = False,
     wave_specialized_tdm: bool = False,
+    tdm_as_in_prologue: bool = False,
     split_k: int = 1,
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
@@ -296,6 +297,10 @@ def compile_mxscale_gemm(
         # The WST B-split (wave0+wave1=B, wave2=A, wave3=Bs) has no spare wave
         # for the second (gate) B/Bs stream that dual-B requires.
         raise ValueError("wave_specialized_tdm is incompatible with stage1_dual_b")
+    if tdm_as_in_prologue and stage1_dual_b:
+        # Untested combination; the prologue As path is validated for single-B
+        # only (wst gugu / non-fused). Guard it off until dual-B is exercised.
+        raise ValueError("tdm_as_in_prologue is not supported with stage1_dual_b")
     B_TOTAL_N = N if stage1_act_interleave else (N * 2 if stage1_dual_b else N)
     C_N = N // 2 if stage1_act_interleave else N
 
@@ -401,10 +406,13 @@ def compile_mxscale_gemm(
     # dedicate one loader wave to each tensor (A/B/A_scale/B_scale), so each
     # active loader wave must issue a full-tile descriptor by itself.
     tdm_desc_num_warps = 1 if wave_specialized_tdm else num_warps
-    # WST B-split: in wave-specialized mode B is loaded cooperatively by two
-    # waves (wave0 + wave1), so its descriptor partitions the tile across 2
-    # warps. A / B-scale stay single-wave (num_warps=1); A-scale is not loaded.
-    b_desc_num_warps = 2 if wave_specialized_tdm else tdm_desc_num_warps
+    # WST B-split: only when A-scale is hoisted to the prologue (tdm_as_in_prologue)
+    # does the As loader wave free up, letting B be loaded cooperatively by two
+    # waves (wave0 + wave1) with a 2-warp descriptor. Otherwise B stays single
+    # (wst) / cooperative-by-all (non-wst).
+    b_desc_num_warps = (
+        2 if (wave_specialized_tdm and tdm_as_in_prologue) else tdm_desc_num_warps
+    )
 
     # All pipeline stages share the same intra-stage layout. Keep that layout
     # unchanged and only remap each logical stage to a physical base inside one
@@ -457,6 +465,21 @@ def compile_mxscale_gemm(
         stage_base_off[logical_i] = phys_i * stage_pitch_bytes
     arena_alloc.ptr = stage_pitch_bytes * num_buffers
     arena_total_bytes = arena_alloc.ptr
+
+    # tdm_as_in_prologue: a single resident A-scale buffer holding this K-chunk's
+    # entire A-scale, loaded once by wave0 in the prologue. Same 2D layout as the
+    # global tile -- (WMMA_M*m_warp) super-rows, num_k_tiles tiles side by side,
+    # so the row stride is num_k_tiles * interleaved_scale_cols_a. Placed after
+    # the stage arena; the epilogue D-store may alias it (As is dead by then).
+    as_full_row_stride = num_k_tiles * interleaved_scale_cols_a
+    _as_lds_cols = as_full_row_stride if tdm_as_in_prologue else interleaved_scale_cols_a
+    lds_a_scale_full_bytes = tile_m * scale_k_per_tile * num_k_tiles + _scale_guard_bytes
+    if tdm_as_in_prologue:
+        as_full_rel_off = _align_up(arena_alloc.ptr, 16)
+        arena_alloc.ptr = as_full_rel_off + lds_a_scale_full_bytes
+        arena_total_bytes = arena_alloc.ptr
+    else:
+        as_full_rel_off = 0
     epilogue_fence_threshold_bytes = tdm_epilogue_fence_threshold_bytes(
         stage_base_off=stage_base_off,
         tail_plan=_base_tail_plan,
@@ -503,8 +526,15 @@ def compile_mxscale_gemm(
 
     # TENSORcnt is tracked per-wave in hardware. The regular path issues four
     # tensor ops per wave per K-stage, while the wave-specialized path issues
-    # only one tensor op from each dedicated loader wave.
-    TDM_LOADS_PER_STEP = 1 if wave_specialized_tdm else (6 if stage1_dual_b else 4)
+    # only one tensor op from each dedicated loader wave. When A-scale is hoisted
+    # to the prologue (tdm_as_in_prologue), the non-wst loop drops the per-step As
+    # load (4->3, dual-B 6->5); the wst loop still issues one op per wave (the
+    # freed As wave now carries the second B half).
+    TDM_LOADS_PER_STEP = (
+        1
+        if wave_specialized_tdm
+        else ((6 if stage1_dual_b else 4) - (1 if tdm_as_in_prologue else 0))
+    )
     tail_plan = [
         (ls, cs, o * TDM_LOADS_PER_STEP // 2 if o > 0 else o)
         for ls, cs, o in _base_tail_plan
@@ -778,6 +808,40 @@ def compile_mxscale_gemm(
                     atomic_barrier_enable=atomic_barrier_enable,
                 )
 
+            def make_desc_as_prologue(memref, k_base):
+                # One-shot resident A-scale load for tdm_as_in_prologue: a single
+                # wave (num_warps=1, issued from wave0) brings the whole K-chunk's
+                # A-scale tile (full width = as_full_row_stride) into LDS, matching
+                # the global 2D layout so the compute reads it with the same
+                # within-tile interleave, just a wider row stride.
+                k_scale_off = k_base / arith.index(SCALE_BLOCK)
+                outer_off = blk_m / arith.index(wmma_m_rep)
+                inner_off = k_scale_off * arith.index(wmma_m_rep)
+                a_scale_row_base = batch_as_base + outer_off
+                if flat_m_base_override is not None:
+                    a_scale_row_base = flat_m_base / arith.index(wmma_m_rep)
+                return tdm_ops.make_tensor_descriptor_2d(
+                    global_ptr=arg_a_scale,
+                    lds_memref=memref,
+                    global_offset=(a_scale_row_base, inner_off),
+                    tensor_shape=(
+                        (
+                            c_rows / arith.index(wmma_m_rep)
+                            if const_expr(grouped_contiguous_m)
+                            else batch_count * (M // wmma_m_rep)
+                        ),
+                        K_scale * wmma_m_rep,
+                    ),
+                    strides=(wmma_m_rep * K_scale, 1),
+                    tile_shape=(WMMA_M * m_warp, as_full_row_stride),
+                    elem_bytes=1,
+                    pad_interval=0,
+                    pad_amount=0,
+                    num_warps=1,
+                    workgroup_mask=a_mcast_mask,
+                    atomic_barrier_enable=atomic_barrier_enable,
+                )
+
             def make_desc_bs(memref, k_base, n_offset=0):
                 # n32k4 gmem: (batch*(N//32) super-rows, K_scale*32 cols); each tile
                 # is (tile_n//32) super-rows x (scale_k_per_tile*32) cols.
@@ -809,32 +873,59 @@ def compile_mxscale_gemm(
 
             if const_expr(wave_specialized_tdm):
                 tdm_wave_id = rocdl.wave_id()
-                # WST split: B is loaded cooperatively by wave0 + wave1 (the B
-                # descriptor is built with num_warps=2, so each of the two waves
-                # already has its own half baked into the global/LDS offsets),
-                # wave2 loads A, wave3 loads B-scale. A-scale (As) is not loaded
-                # at all -- the WMMA is fed a constant E8M0 scale of 1.0 instead.
-                tdm_wave_is_b = arith.ori(
-                    arith.cmpi(
+                if const_expr(tdm_as_in_prologue):
+                    # A-scale is resident from the prologue, so the As loader wave
+                    # is repurposed: B is loaded cooperatively by wave0 + wave1
+                    # (the B descriptor is built with num_warps=2, so each wave
+                    # has its own half baked into the global/LDS offsets), wave2
+                    # loads A, wave3 loads B-scale. As is not loaded in the loop.
+                    tdm_wave_is_b = arith.ori(
+                        arith.cmpi(
+                            arith.CmpIPredicate.eq,
+                            tdm_wave_id,
+                            arith.constant(0, type=T.i32),
+                        ),
+                        arith.cmpi(
+                            arith.CmpIPredicate.eq,
+                            tdm_wave_id,
+                            arith.constant(1, type=T.i32),
+                        ),
+                    )
+                    tdm_wave_is_a = arith.cmpi(
+                        arith.CmpIPredicate.eq,
+                        tdm_wave_id,
+                        arith.constant(2, type=T.i32),
+                    )
+
+                    def _select_wave_tdm_value(a_value, b_value, as_value, bs_value):
+                        # wave2 -> A, default (wave3) -> Bs; as_value is unused.
+                        result = arith.select(tdm_wave_is_a, a_value, bs_value)
+                        # wave0, wave1 -> B (per-wave half already baked in).
+                        return arith.select(tdm_wave_is_b, b_value, result)
+
+                else:
+                    # Original wst: one tensor per wave -- wave0=A, wave1=B,
+                    # wave2=A-scale, wave3=B-scale.
+                    tdm_wave_is_a = arith.cmpi(
                         arith.CmpIPredicate.eq,
                         tdm_wave_id,
                         arith.constant(0, type=T.i32),
-                    ),
-                    arith.cmpi(
+                    )
+                    tdm_wave_is_b = arith.cmpi(
                         arith.CmpIPredicate.eq,
                         tdm_wave_id,
                         arith.constant(1, type=T.i32),
-                    ),
-                )
-                tdm_wave_is_a = arith.cmpi(
-                    arith.CmpIPredicate.eq, tdm_wave_id, arith.constant(2, type=T.i32)
-                )
+                    )
+                    tdm_wave_is_as = arith.cmpi(
+                        arith.CmpIPredicate.eq,
+                        tdm_wave_id,
+                        arith.constant(2, type=T.i32),
+                    )
 
-                def _select_wave_tdm_value(a_value, b_value, as_value, bs_value):
-                    # wave2 -> A, default (wave3) -> Bs; as_value is unused.
-                    result = arith.select(tdm_wave_is_a, a_value, bs_value)
-                    # wave0, wave1 -> B (per-wave half already baked in).
-                    return arith.select(tdm_wave_is_b, b_value, result)
+                    def _select_wave_tdm_value(a_value, b_value, as_value, bs_value):
+                        result = arith.select(tdm_wave_is_as, as_value, bs_value)
+                        result = arith.select(tdm_wave_is_b, b_value, result)
+                        return arith.select(tdm_wave_is_a, a_value, result)
 
             elem_ty_lds = T.f16
 
@@ -997,17 +1088,25 @@ def compile_mxscale_gemm(
                     results.append(vi)
                 return results
 
+            # Runtime byte offset into the resident full-As LDS buffer for the
+            # tile currently being computed (set by the compute loop before each
+            # compute_tile call). Only used when tdm_as_in_prologue is on.
+            _as_full_base_off = [arith.index(0)]
+
             def _load_a_scales(as_buf, as_bases, reps, ks=0):
                 """A-scale fragments for one K-subtile.
 
-                In wave-specialized mode the A-scale (As) is not loaded from LDS
-                at all; the WMMA is fed a constant E8M0 scale of 1.0. Each packed
-                i32 holds 4 E8M0 bytes; 127 (0x7F) encodes 2^0 = 1.0, so the
-                constant is 0x7F7F7F7F regardless of which byte the HW selects.
+                Default: load the current stage's A-scale tile from the rotating
+                LDS ring (load_scale_b128).
+
+                tdm_as_in_prologue: the entire A-scale was loaded once in the
+                prologue into a single full-size LDS buffer; read this tile's
+                slice via a runtime base offset (_as_full_base_off) into it.
                 """
-                if const_expr(wave_specialized_tdm):
-                    one = arith.constant(0x7F7F7F7F, type=T.i32)
-                    return [one for _ in range_constexpr(reps)]
+                if const_expr(tdm_as_in_prologue):
+                    return load_scale_b128(
+                        as_buf, as_bases[0] + _as_full_base_off[0], reps, ks
+                    )
                 return load_scale_b128(as_buf, as_bases[0], reps, ks)
 
             is_full_n32k4 = is_fp4 or b_opsel_on  # warp covers a full 32-row super-row
@@ -1203,7 +1302,7 @@ def compile_mxscale_gemm(
                 a_buf, a_bases = _precompute_a_lane_bases(lds_a)
                 b_buf, b_bases = _precompute_b_lane_bases(lds_b)
                 as_buf, as_bases = _precompute_scale_lane_bases(
-                    lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
+                    lds_as, warp_m_base, wmma_m_rep, _as_lds_cols
                 )
                 bs_buf, bs_bases = _precompute_b_scale_n32k4_base(lds_bs, warp_n_base)
 
@@ -1272,7 +1371,7 @@ def compile_mxscale_gemm(
                 a_buf, a_bases = _precompute_a_lane_bases(lds_a)
                 b_buf, b_bases = _precompute_b_lane_bases(lds_b)
                 as_buf, as_bases = _precompute_scale_lane_bases(
-                    lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
+                    lds_as, warp_m_base, wmma_m_rep, _as_lds_cols
                 )
                 bs_buf, bs_bases = _precompute_b_scale_n32k4_base(lds_bs, warp_n_base)
                 _b_half_scale_loads = _b_scale_ds_loads_half
@@ -2020,6 +2119,18 @@ def compile_mxscale_gemm(
                 for i in range_constexpr(num_buffers)
             ]
 
+            # tdm_as_in_prologue: single resident full-chunk A-scale buffer.
+            if const_expr(tdm_as_in_prologue):
+                lds_a_scale_full_f16 = lds_a_scale_full_bytes // 2
+                as_full = SmemPtr(
+                    arena_base_ptr,
+                    as_full_rel_off,
+                    elem_ty_lds,
+                    shape=(lds_a_scale_full_f16,),
+                )
+                as_full_mem = as_full.get()
+                as_full_idx = extract_lds_base_idx(as_full)
+
             if const_expr(use_tdm_store and not needs_grouped_row_masked_store):
                 d_lds_base_ptr = arena_base_ptr
                 d_lds_f16_count = total_d_bytes // 2
@@ -2248,6 +2359,17 @@ def compile_mxscale_gemm(
                     # Clean i64 carry-add (no select) -> stays uniform/SGPR.
                     return tdm_ops.add_addr_with_carry(lo, hi, adv)
 
+            # tdm_as_in_prologue: load this K-chunk's ENTIRE A-scale once, from
+            # wave0 only (issue_tdm_loads wave_specialized=True -> descriptor index
+            # 0 -> wave0), then fully drain (tensor_wait 0) + barrier so it is
+            # LDS-visible to every wave before the main loop. As is tiny and
+            # one-shot; the main loop never loads it again, and the drain keeps it
+            # out of the data-prologue fence accounting below.
+            if const_expr(tdm_as_in_prologue):
+                _as_desc = make_desc_as_prologue(as_full_mem, split_k_base)
+                issue_tdm_loads(_as_desc, wave_specialized=True)
+                pipeline_fence(outstanding=0, use_cluster=use_cluster)
+
             # Prologue
             if const_expr(wave_specialized_tdm):
                 for i in range_constexpr(pre_loaded):
@@ -2300,11 +2422,17 @@ def compile_mxscale_gemm(
                             ],
                         )
 
-                    issue_tdm_loads(
+                    _prologue_descs = [
                         tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
                         tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b),
-                        tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as),
-                        tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs),
+                    ]
+                    if const_expr(not tdm_as_in_prologue):
+                        _prologue_descs.append(
+                            tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as)
+                        )
+                    _prologue_descs.append(tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs))
+                    issue_tdm_loads(
+                        *_prologue_descs,
                         wave_specialized=wave_specialized_tdm,
                     )
                     if const_expr(stage1_dual_b):
@@ -2387,12 +2515,23 @@ def compile_mxscale_gemm(
                                 _ab[0] = arith.addi(_ab[0], active_adv_i32)
                                 _l2_prefetch(_k_off)
 
+                            if const_expr(tdm_as_in_prologue):
+                                _as_full_base_off[0] = (
+                                    loop_iter
+                                    * arith.index(num_buffers * interleaved_scale_cols_a)
+                                    + arith.index(buf_idx * interleaved_scale_cols_a)
+                                )
+                            _as_idx = (
+                                as_full_idx
+                                if tdm_as_in_prologue
+                                else stages_as_idx[buf_idx]
+                            )
                             rocdl.sched_barrier(0)
                             accs_in = compute_tile_scheduled(
                                 accs_in,
                                 stages_a_idx[buf_idx],
                                 stages_b_idx[buf_idx],
-                                stages_as_idx[buf_idx],
+                                _as_idx,
                                 stages_bs_idx[buf_idx],
                                 mid_compute_callback=_mid_tdm_ws,
                             )
@@ -2553,11 +2692,19 @@ def compile_mxscale_gemm(
                                             _ab[5][1],
                                         ],
                                     )
-                                issue_tdm_loads(
+                                _loop_descs = [
                                     tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a),
                                     tdm_ops.TDMDescriptor2D(dg0_b, dgroup1_b),
-                                    tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as),
-                                    tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs),
+                                ]
+                                if const_expr(not tdm_as_in_prologue):
+                                    _loop_descs.append(
+                                        tdm_ops.TDMDescriptor2D(dg0_as, dgroup1_as)
+                                    )
+                                _loop_descs.append(
+                                    tdm_ops.TDMDescriptor2D(dg0_bs, dgroup1_bs)
+                                )
+                                issue_tdm_loads(
+                                    *_loop_descs,
                                     wave_specialized=wave_specialized_tdm,
                                 )
                                 if const_expr(stage1_dual_b):
@@ -2597,12 +2744,23 @@ def compile_mxscale_gemm(
                                     )
                                 _l2_prefetch(_k_off)
 
+                            if const_expr(tdm_as_in_prologue):
+                                _as_full_base_off[0] = (
+                                    loop_iter
+                                    * arith.index(num_buffers * interleaved_scale_cols_a)
+                                    + arith.index(buf_idx * interleaved_scale_cols_a)
+                                )
+                            _as_idx = (
+                                as_full_idx
+                                if tdm_as_in_prologue
+                                else stages_as_idx[buf_idx]
+                            )
                             rocdl.sched_barrier(0)
                             accs_in = compute_tile_scheduled(
                                 accs_in,
                                 stages_a_idx[buf_idx],
                                 stages_b_idx[buf_idx],
-                                stages_as_idx[buf_idx],
+                                _as_idx,
                                 stages_bs_idx[buf_idx],
                                 mid_compute_callback=_mid_tdm_nws,
                             )
@@ -2612,7 +2770,7 @@ def compile_mxscale_gemm(
                                     accs_up_in,
                                     stages_a_idx[buf_idx],
                                     stages_b_up_idx[buf_idx],
-                                    stages_as_idx[buf_idx],
+                                    _as_idx,
                                     stages_bs_up_idx[buf_idx],
                                 )
                             cur_lo_a = addr_boxes[0][0]
@@ -2700,7 +2858,24 @@ def compile_mxscale_gemm(
                 gpu.cluster_barrier()
             epi_addrs_box = [None]
             _tail_had_load = False
-            for _load_stage, _compute_stage, _outstanding in tail_plan:
+            for _tail_i, (_load_stage, _compute_stage, _outstanding) in enumerate(
+                tail_plan
+            ):
+                # tdm_as_in_prologue: tail computes the last `steps` tiles in
+                # order, so this step's absolute k-tile (compile-time) is
+                # loop_iters*num_buffers + _tail_i. Point the resident-As read at
+                # that slot.
+                if const_expr(tdm_as_in_prologue):
+                    _as_full_base_off[0] = arith.index(
+                        (loop_iters * num_buffers + _tail_i) * interleaved_scale_cols_a
+                    )
+                _tail_as_idx = (
+                    as_full_idx if tdm_as_in_prologue else None
+                )
+
+                def _as_idx_for(cs):
+                    return _tail_as_idx if tdm_as_in_prologue else stages_as_idx[cs]
+
                 if const_expr(_outstanding == -1):
                     if const_expr(_tail_had_load):
                         pipeline_fence(outstanding=0, use_cluster=use_cluster)
@@ -2709,7 +2884,7 @@ def compile_mxscale_gemm(
                             accs,
                             stages_a_idx[_compute_stage],
                             stages_b_idx[_compute_stage],
-                            stages_as_idx[_compute_stage],
+                            _as_idx_for(_compute_stage),
                             stages_bs_idx[_compute_stage],
                         )
                     else:
@@ -2721,7 +2896,7 @@ def compile_mxscale_gemm(
                             accs,
                             stages_a_idx[_compute_stage],
                             stages_b_idx[_compute_stage],
-                            stages_as_idx[_compute_stage],
+                            _as_idx_for(_compute_stage),
                             stages_bs_idx[_compute_stage],
                             emit_filler=_emit_epi_addrs,
                         )
@@ -2730,7 +2905,7 @@ def compile_mxscale_gemm(
                                 accs_up,
                                 stages_a_idx[_compute_stage],
                                 stages_b_up_idx[_compute_stage],
-                                stages_as_idx[_compute_stage],
+                                _as_idx_for(_compute_stage),
                                 stages_bs_up_idx[_compute_stage],
                             )
                 else:
@@ -2792,9 +2967,6 @@ def compile_mxscale_gemm(
                                     _desc_b_up = make_desc_b(
                                         stages_b_up_mem[_ls], _tail_load_k, N
                                     )
-                                _desc_as = make_desc_as(
-                                    stages_as_mem[_ls], _tail_load_k
-                                )
                                 _desc_bs = make_desc_bs(
                                     stages_bs_mem[_ls], _tail_load_k
                                 )
@@ -2802,11 +2974,14 @@ def compile_mxscale_gemm(
                                     _desc_bs_up = make_desc_bs(
                                         stages_bs_up_mem[_ls], _tail_load_k, N
                                     )
+                                _tail_descs = [_desc_a, _desc_b]
+                                if const_expr(not tdm_as_in_prologue):
+                                    _tail_descs.append(
+                                        make_desc_as(stages_as_mem[_ls], _tail_load_k)
+                                    )
+                                _tail_descs.append(_desc_bs)
                                 issue_tdm_loads(
-                                    _desc_a,
-                                    _desc_b,
-                                    _desc_as,
-                                    _desc_bs,
+                                    *_tail_descs,
                                     wave_specialized=wave_specialized_tdm,
                                 )
                                 if const_expr(stage1_dual_b):
@@ -2820,7 +2995,7 @@ def compile_mxscale_gemm(
                         accs,
                         stages_a_idx[_compute_stage],
                         stages_b_idx[_compute_stage],
-                        stages_as_idx[_compute_stage],
+                        _as_idx_for(_compute_stage),
                         stages_bs_idx[_compute_stage],
                         mid_compute_callback=_tail_mid_cb,
                     )
@@ -2830,7 +3005,7 @@ def compile_mxscale_gemm(
                             accs_up,
                             stages_a_idx[_compute_stage],
                             stages_b_up_idx[_compute_stage],
-                            stages_as_idx[_compute_stage],
+                            _as_idx_for(_compute_stage),
                             stages_bs_up_idx[_compute_stage],
                         )
 

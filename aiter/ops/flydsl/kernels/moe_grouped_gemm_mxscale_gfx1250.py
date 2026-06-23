@@ -60,6 +60,7 @@ class _GroupedA8W4Config:
     cluster_n: int
     use_scale_opsel: bool
     expert_sched_mode: bool
+    tdm_as_in_prologue: bool = False
     grouped_persistent_m: bool = True
     grouped_contiguous_m: bool = False
     persistent_workers: Optional[int] = None
@@ -760,6 +761,7 @@ def _compile_base_a8w4_gemm(
         # (6 streams) and is excluded.
         wave_specialized_tdm=cfg.wave_specialized_tdm
         and (is_non_fused or stage1_weight_layout == "gugu"),
+        tdm_as_in_prologue=cfg.tdm_as_in_prologue,
         split_k=cfg.split_k,
         cluster_m=cfg.cluster_m,
         cluster_n=cfg.cluster_n,
@@ -795,6 +797,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     use_tdm_store: bool = True,
     inst_prefetch: bool = False,
     wave_specialized_tdm: bool = False,
+    tdm_as_in_prologue: bool = False,
     split_k: int = 1,
     cluster_m: int = 1,
     cluster_n: int = 1,
@@ -823,6 +826,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         use_tdm_store=bool(use_tdm_store),
         inst_prefetch=bool(inst_prefetch),
         wave_specialized_tdm=bool(wave_specialized_tdm),
+        tdm_as_in_prologue=bool(tdm_as_in_prologue),
         split_k=int(split_k),
         cluster_m=int(cluster_m),
         cluster_n=int(cluster_n),
@@ -1194,6 +1198,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     use_tdm_store: bool = True,
     inst_prefetch: bool = False,
     wave_specialized_tdm: bool = False,
+    tdm_as_in_prologue: bool = False,
     split_k: int = 1,
     cluster_m: int = 1,
     cluster_n: int = 1,
@@ -1220,6 +1225,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         use_tdm_store=bool(use_tdm_store),
         inst_prefetch=bool(inst_prefetch),
         wave_specialized_tdm=bool(wave_specialized_tdm),
+        tdm_as_in_prologue=bool(tdm_as_in_prologue),
         split_k=int(split_k),
         cluster_m=int(cluster_m),
         cluster_n=int(cluster_n),

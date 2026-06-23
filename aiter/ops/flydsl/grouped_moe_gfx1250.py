@@ -798,6 +798,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             and os.environ.get("AITER_GROUPED_GEMM1_WAVE_SPECIALIZED", "0")
             in _TRUTHY_ENV
         ),
+        tdm_as_in_prologue=(
+            os.environ.get("AITER_GROUPED_GEMM_AS_PROLOGUE", "0") in _TRUTHY_ENV
+        ),
     )
     _grouped_dbg("stage1 compile done; start launch")
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
@@ -937,6 +940,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             (m_warp * n_warp) == 4
             and os.environ.get("AITER_GROUPED_GEMM2_WAVE_SPECIALIZED", "0")
             in _TRUTHY_ENV
+        ),
+        tdm_as_in_prologue=(
+            os.environ.get("AITER_GROUPED_GEMM_AS_PROLOGUE", "0") in _TRUTHY_ENV
         ),
     )
     _grouped_dbg("stage2 compile done; start launch")
