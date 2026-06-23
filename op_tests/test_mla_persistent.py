@@ -605,7 +605,7 @@ def torch_mla_extend_split_kv(
             partial_lse[loc : loc + n] = lse.transpose(0, 1).to(torch.float32)
     else:
         partial_o = torch.empty(
-            0, nheads, qk_rope_head_dim, dtype=torch.float32, device=dev
+            0, nheads, kv_lora_rank, dtype=torch.float32, device=dev
         )
         partial_lse = torch.empty(0, nheads, dtype=torch.float32, device=dev)
     partial_o = torch.where(
@@ -1146,8 +1146,8 @@ def test_mla(
     # """ test code for decode_update_mla_metadata_v1 """
     # torch.set_printoptions(linewidth=200)
     # print(f"{kv_indptr=}")
-    print(f"{work_indptr=}")
-    print(f"{work_info_set[:32]}")
+    # print(f"{work_indptr=}")
+    # print(f"{work_info_set[:32]}")
     # print(f"{reduce_indptr=}")
     # print(f"{reduce_final_map=}")
     # print(f"{reduce_partial_map=}")
