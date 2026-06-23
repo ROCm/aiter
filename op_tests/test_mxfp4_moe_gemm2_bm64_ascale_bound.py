@@ -57,8 +57,10 @@ def build(cumsum, M_logical, seed=0):
     # fp4 nibbles forced NON-NEGATIVE (clear each nibble's sign bit, &0x77) so every
     # A*B product is >= 0: the per-token atomic sum has no cancellation, making it
     # order-insensitive (tiny FP noise) and the clipped-row signal unambiguous.
-    pos4 = lambda *s: (torch.randint(0, 256, s, dtype=torch.uint8, generator=g) & 0x77)
-    e8 = lambda *s: torch.randint(126, 130, s, dtype=torch.uint8, generator=g)  # tame e8m0
+    def pos4(*s):
+        return (torch.randint(0, 256, s, dtype=torch.uint8, generator=g) & 0x77)
+    def e8(*s):
+        return torch.randint(126, 130, s, dtype=torch.uint8, generator=g)  # tame e8m0
     # gemm2 A_q (inter) and its 32-row-chunk e8m0 scale. Scale is over-allocated so
     # the DATA exists for every row — only the kernel's rsrc bound gates the read.
     inter_q = pos4(cumsum, D_INTER // 2)

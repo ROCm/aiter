@@ -38,8 +38,7 @@ Run (needs module_moe_mxfp4_aux + module_moe_mxfp4_gemm built, MI350X/gfx950):
 import argparse
 import torch
 
-import aiter
-from aiter import ActivationType, QuantType, dtypes
+from aiter import dtypes
 from aiter.fused_moe import (
     moe_sorting,
     _mxfp4_a4w4_stage1_fw,
@@ -64,9 +63,11 @@ def make_weights(seed=0):
     """Random a4w4 weights + e8m0 scales, sized to exactly meet the kernels'
     buffer-resource byte bounds (B_q: NE*N_OUT*K/2 ; B_scale: per-expert e8m0)."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    u8 = lambda *s: torch.randint(0, 256, s, dtype=torch.uint8, generator=g)
+    def u8(*s):
+        return torch.randint(0, 256, s, dtype=torch.uint8, generator=g)
 
-    e8 = lambda *s: torch.randint(126, 130, s, dtype=torch.uint8, generator=g)
+    def e8(*s):
+        return torch.randint(126, 130, s, dtype=torch.uint8, generator=g)
     # gemm1: w12 = [E, 2*D_INTER, D_HIDDEN] mxfp4 (2 nibbles/byte) + e8m0 (1/32 along K)
     w1 = u8(NE, 2 * D_INTER, D_HIDDEN // 2)
     w1s = e8(NE, 2 * D_INTER, D_HIDDEN // 32)

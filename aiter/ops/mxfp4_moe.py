@@ -18,7 +18,6 @@
 #              `inter_dim` convention. Not the expert count.)
 #   MB       = block_m (sort/gemm block size, ∈ {16, 32, 64, 128})
 
-import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops

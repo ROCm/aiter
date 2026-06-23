@@ -14,7 +14,7 @@ reduction's FP-reordering noise floor stays well under tolerance.
 """
 import argparse
 import torch
-from aiter import ActivationType, QuantType, dtypes
+from aiter import dtypes
 from aiter.fused_moe import (
     moe_sorting,
     _mxfp4_a4w4_stage1_fw,
@@ -32,9 +32,11 @@ KN2 = f"mxfp4_moe_g2_a4w4_NE{NE}_H{D_HIDDEN}_E{D_INTER}_TOPK{TOPK}_BM32_ATOMIC"
 
 def make_weights(seed=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    u8 = lambda *s: torch.randint(0, 256, s, dtype=torch.uint8, generator=g)
+    def u8(*s):
+        return torch.randint(0, 256, s, dtype=torch.uint8, generator=g)
     # small e8m0 exponents -> small magnitudes -> tiny atomic noise floor
-    e8 = lambda *s: torch.randint(118, 120, s, dtype=torch.uint8, generator=g)
+    def e8(*s):
+        return torch.randint(118, 120, s, dtype=torch.uint8, generator=g)
     w1 = u8(NE, 2 * D_INTER, D_HIDDEN // 2)
     w1s = e8(NE, 2 * D_INTER, D_HIDDEN // 32)
     w2 = u8(NE, D_HIDDEN, D_INTER // 2)      # K=192 (96 bytes); host pads to 256

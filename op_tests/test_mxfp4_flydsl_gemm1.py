@@ -315,7 +315,7 @@ def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
     torch (the HIP kernel is H-locked to 7168). Validated bit-for-bit at H=7168:
     feeding this reconstruction to gemm1 reproduces the HIP-prologue result."""
     device = asc.device
-    A_SCALE_COLS = H // 32
+    H // 32
     MN_PACK = 2
     K_PACK = BK // 128
     C_M1 = BM // (16 * MN_PACK)
@@ -422,7 +422,8 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK):
     # shapes use the torch replica (validated vs HIP at the KIMI shape: identical
     # sti/sei/cumsum/m_indices). Both produce the exact layout gemm1 consumes.
     if (NE, topk) == (385, 9):
-        eb = lambda: torch.empty((0,), device=device, dtype=dtypes.bf16)
+        def eb():
+            return torch.empty((0,), device=device, dtype=dtypes.bf16)
         sti = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
         sei = torch.empty((max_sorted // BM,), device=device, dtype=dtypes.i32)
         cumsum = torch.empty((2,), device=device, dtype=dtypes.i32)
