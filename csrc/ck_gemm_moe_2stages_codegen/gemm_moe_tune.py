@@ -186,6 +186,24 @@ class FmoeTuner(TunerCommon):
         except ImportError:
             pass
 
+    @staticmethod
+    def _ensure_gate_mode_col(df):
+        """Default a missing ``gate_mode`` column to ``separated`` (legacy CSVs)."""
+        if "gate_mode" not in df.columns:
+            df = df.copy()
+            df["gate_mode"] = "separated"
+        return df
+
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        return self._ensure_gate_mode_col(
+            super().get_untuned_gemm_list(untuned_gemm_file)
+        )
+
+    def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
+        return self._ensure_gate_mode_col(
+            super().get_tuned_gemm_list(tuned_gemm_file, columns)
+        )
+
     def _setup_specific_arguments(self):
 
         self.parser.add_argument(
@@ -1938,6 +1956,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            gate_mode,
         ) = key
         if us == self.INVALID_TIME or us == self.INF_TIME:
             return 0, 0
@@ -2049,6 +2068,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            gate_mode,
         ) = info
         ## asm moe 1 stage tuning
         get_gfx()
@@ -2276,6 +2296,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            gate_mode,
         ) = info
         kernels_list_csv = f"{get_asm_dir()}/fmoe_2stages/fmoe_stage1_bf16_pertoken{{quantDtype}}{{extraInfo}}_g1u1.csv"
         extraInfo = ""
@@ -2388,6 +2409,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            gate_mode,
         ) = info
 
         _is_a8w4 = (
@@ -2623,6 +2645,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            gate_mode,
         ) = info
 
         _gen_data_args_s1 = (
@@ -2783,6 +2806,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            gate_mode,
         ) = info
 
         if q_type != QuantType.per_1x32 or q_dtype_w not in (
@@ -3059,6 +3083,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            gate_mode,
         ) = info
 
         if (
@@ -3093,6 +3118,11 @@ class FmoeTuner(TunerCommon):
             )
 
         for blockM in blockMs:
+            # BM64 has no codegen'd 3-stage sort instance (aux_sort3s_*_MB64; see
+            # moe_aux/codegen/gen_instances.py), so its candidates fault at sort
+            # time. Skip them instead of letting the fault crash the tuner worker.
+            if blockM == 64:
+                continue
             # ---- stage1 (gemm1) candidates ----
             for bm, use_nt, inline_quant in sorted(_G1_SUPPORTED):
                 if bm != blockM:
@@ -3199,6 +3229,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             use_g1u1,
             doweight_stage1,
+            gate_mode,
         ) = info
 
         if not (q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2):
@@ -3724,6 +3755,7 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
+                gate_mode,
             ) = line
             dtype = eval(dtype)
             q_dtype_a = eval(q_dtype_a)
@@ -3753,13 +3785,18 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
+                gate_mode,
             )
-            tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
-            tasks_ck.extend(self.gen_2stages_task(info, blockMs))
-            tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
-            tasks_ck.extend(self.gen_mxfp4_port_2stages_task(info, blockMs))
-            tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
-            task_1stage.extend(self.gen_1stage_asm_task(info))
+            if gate_mode == "interleave":
+                # interleave (gate-up gugu) is served only by the mxfp4 a4w4 port;
+                # restricting candidates keeps stage1/stage2 within one backend.
+                tasks_ck.extend(self.gen_mxfp4_port_2stages_task(info, blockMs))
+            else:
+                tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
+                tasks_ck.extend(self.gen_2stages_task(info, blockMs))
+                tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+                tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
+                task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
                 continue
@@ -3915,6 +3952,7 @@ class FmoeTuner(TunerCommon):
                 q_type,
                 use_g1u1,
                 doweight_stage1,
+                gate_mode,
             ) = key
             import re
 
@@ -3947,6 +3985,7 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
+                        gate_mode,
                         block_m,
                         row_ksplit,
                         us,
@@ -4070,6 +4109,7 @@ class FmoeTuner(TunerCommon):
                     "q_type",
                     "use_g1u1",
                     "doweight_stage1",
+                    "gate_mode",
                     "block_m",
                 ],
                 how="inner",
@@ -4099,6 +4139,7 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
+                        gate_mode,
                         0,
                         0,
                         self.INVALID_TIME,
@@ -4882,8 +4923,9 @@ if __name__ == "__main__":
         "q_type",
         "use_g1u1",
         "doweight_stage1",
+        "gate_mode",
     ]
-    grouped_key = key + ["gate_mode"]
+    grouped_key = key
     resultList = [
         "block_m",
         "ksplit",
