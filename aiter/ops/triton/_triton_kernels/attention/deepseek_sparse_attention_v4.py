@@ -325,10 +325,18 @@ def sparse_mla_bwd_v4(q, kv, o, do, topk_indices, lse, attn_sink=None,
         d_sink: [H] fp32, or None if attn_sink was None
     """
     if backend == "gluon":
-        from aiter.ops.triton._gluon_kernels.gfx950.attention.dsa_bwd_v4_gluon import (
-            sparse_mla_bwd_v4_gluon,
-        )
-        return sparse_mla_bwd_v4_gluon(
+        # Route to the gluon kernels by arch: gfx1250 (WMMA) vs gfx950/CDNA4 (MFMA).
+        import torch as _t
+        arch = _t.cuda.get_device_properties(q.device).gcnArchName
+        if "gfx1250" in arch:
+            from aiter.ops.triton._gluon_kernels.gfx1250.attention.dsa_bwd_v4_gluon import (
+                sparse_mla_bwd_v4_gluon_gfx1250 as _bwd_gluon,
+            )
+        else:
+            from aiter.ops.triton._gluon_kernels.gfx950.attention.dsa_bwd_v4_gluon import (
+                sparse_mla_bwd_v4_gluon as _bwd_gluon,
+            )
+        return _bwd_gluon(
             q, kv, o, do, topk_indices, lse, attn_sink=attn_sink,
             kv_lora_rank=kv_lora_rank, scale=scale,
         )
