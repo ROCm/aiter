@@ -491,7 +491,7 @@ def pa_decode_bf16_asm(
         # produce inf/NaN in the in-kernel sink merge.
         sink = torch.full((q_head_num,), -1.0e30, dtype=torch.float32, device=device)
     else:
-        sink = sink.to(torch.float32).contiguous()
+        assert sink.dtype == torch.float32, "sink must be in fp32 for pa ASM"
 
     _pa_decode_bf16_asm(
         Q,
@@ -1164,12 +1164,19 @@ def get_mla_metadata_info_v1(
         max_split_tiles = tile_cnt * cu_num
 
     # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
-    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). A single tile can in
-    # the worst case absorb the entire global budget, so reduce_partial_map must
-    # hold up to tile_cnt * per_tile_cap entries.
+    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). This is a GLOBAL
+    # budget shared across all tiles, so the total number of partial reduce
+    # entries is bounded by the base tiles (one per tile) plus at most the global
+    # split budget of EXTRA splits distributed across them:
+    #     reduce_partial_map <= tile_cnt + per_tile_cap
+    # The previous `tile_cnt * per_tile_cap` assumed every tile could individually
+    # absorb the whole global budget simultaneously, which the shared budget
+    # forbids. With cudagraph batch_size >> cu_num that product collapsed to
+    # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
+    # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
     if max_split_per_batch > 0:
         per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
-        max_split_tiles = max(max_split_tiles, tile_cnt * per_tile_cap)
+        max_split_tiles = max(max_split_tiles, tile_cnt + per_tile_cap)
 
     if not intra_batch_mode:
         return (
