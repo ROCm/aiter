@@ -14,6 +14,8 @@ the canonical LUT and applies the per-32 power-of-two block scale.
 
 Usage:
     python op_tests/test_flydsl_moe_a16w4_gfx942.py
+    python op_tests/test_flydsl_moe_a16w4_gfx942.py --bench
+    python op_tests/test_flydsl_moe_a16w4_gfx942.py --bench --no-verify
     pytest op_tests/test_flydsl_moe_a16w4_gfx942.py
 """
 
@@ -77,18 +79,30 @@ def _decode_w(codes_i8: torch.Tensor, scale_groups: torch.Tensor, group_size: in
 
 
 def _check(ref: torch.Tensor, out: torch.Tensor, label: str,
-           rel_l2_max: float = 0.06):
+           rel_l2_max: float = 0.06, *, quiet_on_pass: bool = True):
     """Relative-L2 gate -- robust to MX-FP4's wide dynamic range (the elementwise
-    error of a single fp4 weight is large, but the aggregate direction is tight)."""
+    error of a single fp4 weight is large, but the aggregate direction is tight).
+
+    When ``quiet_on_pass`` is True (default), success prints only ``[label] PASS``.
+    Failures always emit rel_L2, shapes, and sample ref/out values for debugging.
+    """
     ref = ref.float()
     out = out.float()
     max_delta = (ref - out).abs().max().item()
     rel_l2 = ((out - ref).norm() / ref.norm().clamp_min(1e-30)).item()
     passed = rel_l2 <= rel_l2_max
-    print(f"[{label}] rel_L2={rel_l2:.4f} (<= {rel_l2_max})  max_delta={max_delta:.3f} "
-          f"-> {'PASS' if passed else 'FAIL'}")
-    print(f"    ref : {ref.reshape(-1)[:6].tolist()}")
-    print(f"    out : {out.reshape(-1)[:6].tolist()}")
+    if passed:
+        if quiet_on_pass:
+            print(f"[{label}] PASS")
+        else:
+            print(f"[{label}] rel_L2={rel_l2:.4f} (<= {rel_l2_max})  max_delta={max_delta:.3f} -> PASS")
+            print(f"    ref : {ref.reshape(-1)[:6].tolist()}")
+            print(f"    out : {out.reshape(-1)[:6].tolist()}")
+    else:
+        print(f"[{label}] FAIL  rel_L2={rel_l2:.4f} (<= {rel_l2_max})  max_delta={max_delta:.3f}")
+        print(f"    shapes: ref={tuple(ref.shape)} out={tuple(out.shape)}")
+        print(f"    ref : {ref.reshape(-1)[:6].tolist()}")
+        print(f"    out : {out.reshape(-1)[:6].tolist()}")
     return passed
 
 
@@ -337,10 +351,15 @@ def _main():
     return 0 if (ok1 and ok2 and ok3 and ok4) else 1
 
 
-def _bench(shape, num_iters=50, num_warmup=10):
+def _bench(shape, num_iters=50, num_warmup=10, verify=True):
     """Time the public-bridge stage1/stage2 decode kernels and report TFLOPS.
 
-    Correctness is covered by the tests above; this only measures kernel time.
+    When ``verify`` is True (default), runs one correctness pass at the bench
+    shape via ``_check`` against the torch ref for stage1 and stage2 *before*
+    timing (same gate as the pytest tests and the scratch MoE benches). On
+    failure, timing is skipped. Pass ``verify=False`` (``--no-verify``) to
+    benchmark only.
+
     Weights/scales are built once so run_perftest times the kernel launch, not
     the input preparation. Stage2 re-zeros its output each call (atomic mode),
     so repeated timing iterations do not over-accumulate.
@@ -353,10 +372,44 @@ def _bench(shape, num_iters=50, num_warmup=10):
 
     g = _gen_common(tokens, model_dim, inter_dim, experts, topk, tile_m)
     dev = g["dev"]
-    _, _, w1_kernel, scale_w1_1d = _gen_w1(dev, experts, inter_dim, model_dim, gsize)
-    _, _, w2_kernel, scale_w2_1d = _gen_w2(dev, experts, inter_dim, model_dim, gsize)
+    w1_codes, scale_w1_groups, w1_kernel, scale_w1_1d = _gen_w1(
+        dev, experts, inter_dim, model_dim, gsize
+    )
+    w2_codes, scale_w2_groups, w2_kernel, scale_w2_1d = _gen_w2(
+        dev, experts, inter_dim, model_dim, gsize
+    )
     w1 = w1_kernel.view(experts, 2 * inter_dim, model_dim // 2)
     w2 = w2_kernel.view(experts, model_dim, inter_dim // 2)
+
+    if verify:
+        out1 = flydsl_moe_stage1(
+            a=g["x"], w1=w1,
+            sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
+            num_valid_ids=g["num_valid_ids"], topk=topk,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", act="silu",
+            w1_scale=scale_w1_1d, a1_scale=None, sorted_weights=None,
+        )
+        torch.cuda.synchronize()
+        ref1 = _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, gsize)
+        if not _check(ref1, out1.reshape(ref1.shape), "bench_stage1_a16w4_bridge"):
+            print("[bench] stage1 CORRECTNESS FAILED -- not timing")
+            return 1
+        a2 = out1.reshape(tokens, topk, inter_dim).to(torch.bfloat16)
+        out2 = torch.zeros((tokens, model_dim), device=dev, dtype=torch.bfloat16)
+        out2 = flydsl_moe_stage2(
+            inter_states=a2, w2=w2,
+            sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
+            num_valid_ids=g["num_valid_ids"], out=out2, topk=topk,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", mode="atomic",
+            w2_scale=scale_w2_1d, a2_scale=None, sorted_weights=None,
+        )
+        torch.cuda.synchronize()
+        ref2 = _ref_stage2(g, a2, w2_codes, scale_w2_groups, model_dim, gsize)
+        if not _check(ref2, out2, "bench_stage2_a16w4_bridge"):
+            print("[bench] stage2 CORRECTNESS FAILED -- not timing")
+            return 1
 
     def _s1():
         return flydsl_moe_stage1(
@@ -403,6 +456,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--bench", action="store_true",
                    help="report kernel time + TFLOPS instead of correctness")
+    p.add_argument("--no-verify", action="store_true",
+                   help="(bench only) skip torch-ref correctness check before timing")
     p.add_argument("-t", "--tokens", type=int, default=4096)
     p.add_argument("--model-dim", type=int, default=4096)
     p.add_argument("--inter-dim", type=int, default=1536)
@@ -420,5 +475,5 @@ if __name__ == "__main__":
             tokens=args.tokens, model_dim=args.model_dim, inter_dim=args.inter_dim,
             experts=args.experts, topk=1,
             tile_m=args.tile_m, tile_n=args.tile_n, tile_k=args.tile_k,
-        )))
+        ), verify=not args.no_verify))
     sys.exit(_main())
