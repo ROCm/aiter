@@ -5,26 +5,45 @@ from typing import Optional
 from torch import Tensor
 
 
-def gen_groupnorm_fake_tensors(
+# JIT-compiled binding to the C++ kernel. Output `y` and scratch `workspace`
+# are allocated by the Python wrapper below and passed in; the kernel writes
+# into them in-place and returns None.
+@compile_ops("module_groupnorm", fc_name="_groupnorm_run", develop=True)
+def _groupnorm_run(
+    y: Tensor,
+    workspace: Tensor,
+    input: Tensor,
+    num_groups: int,
+    weight: Tensor,
+    bias: Tensor,
+    eps: float,
+) -> None: ...
+
+
+def groupnorm_run(
     input: Tensor,
     num_groups: int,
     weight: Tensor,
     bias: Tensor,
     eps: float,
 ) -> Tensor:
-    return torch.empty_like(input)
+    """Group Normalization. Allocates output and scratch workspace, then calls
+    the HIP kernel. Returns the normalized output tensor."""
+    input = input.contiguous()
+    weight = weight.contiguous()
+    bias = bias.contiguous()
 
+    y = torch.empty_like(input)
 
-@compile_ops(
-    "module_groupnorm", fc_name="_groupnorm_run", gen_fake=gen_groupnorm_fake_tensors
-)
-def _groupnorm_run(
-    input: Tensor,
-    num_groups: int,
-    weight: Tensor,
-    bias: Tensor,
-    eps: float,
-) -> Tensor: ...
+    # Workspace upper bound that matches the C-side grid cap (see groupnorm.cu):
+    # num_acc_slots = gridx * outer, with gridx <= ceil(4096 / outer);
+    # the kernel needs 2 * num_acc_slots float32 slots.
+    outer = input.shape[0] * num_groups
+    ws_slots = 2 * ((4096 + outer - 1) // outer * outer)
+    workspace = torch.empty(ws_slots, dtype=torch.float32, device=input.device)
+
+    _groupnorm_run(y, workspace, input, num_groups, weight, bias, eps)
+    return y
 
 
 class GroupNorm(torch.nn.Module):
@@ -64,4 +83,4 @@ class GroupNorm(torch.nn.Module):
                 eps=self.eps,
             )
         else:
-            return _groupnorm_run(x, self.num_groups, self.weight, self.bias, self.eps)
+            return groupnorm_run(x, self.num_groups, self.weight, self.bias, self.eps)
