@@ -2141,6 +2141,7 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false); \
     m.def("add_rmsnorm",                     \
@@ -2150,7 +2151,8 @@ namespace py = pybind11;
           py::arg("residual_in"),            \
           py::arg("residual_out"),           \
           py::arg("weight"),                 \
-          py::arg("epsilon"));               \
+          py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false);    \
     m.def("rmsnorm_quant",                   \
           &aiter::rmsnorm_quant,             \
           py::arg("out"),                    \
@@ -2158,6 +2160,7 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false); \
     m.def("rmsnorm",                         \
@@ -2165,7 +2168,8 @@ namespace py = pybind11;
           py::arg("out"),                    \
           py::arg("input"),                  \
           py::arg("weight"),                 \
-          py::arg("epsilon"));
+          py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false);    \
 
 #define GATED_RMSNORM_QUANT_PYBIND               \
     m.def("gated_rmsnorm_fp8_group_quant",       \
