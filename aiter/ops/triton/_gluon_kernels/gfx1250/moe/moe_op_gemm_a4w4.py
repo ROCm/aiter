@@ -255,7 +255,7 @@ def _moe_gemm_a4w4_gfx1250(
     else:
         unpadded_m = grid_m
     pid_m, pid_n = pid_grid(pid, unpadded_m, grid_n, 1)
-    
+
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)
     if XCD_SWIZZLE == 1 and expt_data == -1:
