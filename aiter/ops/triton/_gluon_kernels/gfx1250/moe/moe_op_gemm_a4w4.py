@@ -1,7 +1,7 @@
 import torch
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
 
@@ -60,31 +60,6 @@ def matmul_launch_metadata(grid, kernel, args):
     ret["bytes"] = int(n_x_bytes + n_y_bytes + n_w_bytes)
 
     return ret
-
-
-@gluon.jit
-def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: gl.constexpr = 1):
-    """
-    Maps 1D pid to 2D grid coords (pid_m, pid_n).
-
-    Args:
-        - pid: 1D pid
-        - num_pid_m: grid m size
-        - num_pid_n: grid n size
-        - GROUP_SIZE_M: default is 1
-    """
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        gl.assume(group_size_m >= 0)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
-    return pid_m, pid_n
 
 
 @gluon.jit
