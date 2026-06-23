@@ -112,6 +112,139 @@ def parse_csv(csv_path: str):
 GROUPED_MOE_AOT_ARCH_DEFAULT = "gfx1250"
 
 
+def _compile_grouped_moe_aux_kernels(job, *, dtype, pack, warp_tile_m, max_m):
+    """Precompile the non-GEMM FlyDSL kernels the run-only grouped MoE path
+    launches around gemm1/gemm2.
+
+    On the production fast path (``_maybe_grouped_gfx1250_a8w4_moe``) each
+    grouped GEMM is bracketed by a set of small FlyDSL kernels:
+
+      * ``moe_route_maps``                 -- atomic-scatter route -> grouped row
+      * ``moe_scatter_copy_token``         -- payload route-gather
+      * ``moe_scatter_copy_preshuffle_scale`` (gather=True)  -- stage1 scale
+      * ``moe_scatter_copy_preshuffle_scale`` (gather=False) -- stage2 scale
+      * ``moe_gather_reduce``              -- token-order epilogue (bf16/f16)
+      * ``moe_contiguous_psum``            -- DeepGEMM contiguous-M prefix sum
+
+    Under ``FLYDSL_RUNTIME_RUN_ONLY`` any of these missing from the AOT cache
+    raises at first inference, so precompile them alongside the GEMMs. The
+    launch shapes only need correct dtype/rank -- each module's cache key is the
+    build-time geometry (row bytes / wmma_rep / model_dim / topk / out_dtype),
+    not the dynamic token/expert scalars passed at launch.
+    """
+    import torch
+
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_module,
+    )
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        build_moe_gather_reduce_module,
+    )
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        build_moe_route_maps_module,
+    )
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_preshuffle_scale import (
+        build_moe_scatter_copy_preshuffle_scale_module,
+    )
+    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
+        build_moe_scatter_copy_token_module,
+    )
+
+    dev = torch.device("cpu")
+    i32 = torch.int32
+    u8 = torch.uint8
+    E = job["experts"]
+    topk = job["topk"]
+    model_dim = job["model_dim"]
+    inter_dim = job["inter_dim"]
+    token_num = max(1, job["token_num"])
+    out_dtype = job["out_dtype"]
+
+    numel = token_num * topk
+    num_dst = E * max_m
+    wmma_rep = warp_tile_m // 16
+    scale_k_per_tile = _TILE_K // 32
+    tiles_per_expert = max_m // (wmma_rep * 16)
+    grid_blocks = (numel + 255) // 256
+
+    # Route -> grouped-row maps (no build-time params).
+    route_maps = build_moe_route_maps_module()
+    route_maps(
+        torch.empty((numel,), dtype=i32, device=dev),
+        torch.empty((E,), dtype=i32, device=dev),
+        torch.empty((numel,), dtype=i32, device=dev),
+        torch.empty((num_dst,), dtype=i32, device=dev),
+        numel,
+        topk,
+        max_m,
+        grid_blocks,
+        stream=0,
+    )
+
+    # Payload route-gather (row width = model_dim // pack).
+    row_bytes = model_dim // pack
+    scatter_copy = build_moe_scatter_copy_token_module(row_bytes)
+    scatter_copy(
+        torch.empty((numel, row_bytes), dtype=u8, device=dev),
+        torch.empty((num_dst, row_bytes), dtype=u8, device=dev),
+        torch.empty((num_dst,), dtype=i32, device=dev),
+        num_dst,
+        stream=0,
+    )
+
+    # Stage1 scale: route-gather + WMMA preshuffle (gather=True).
+    ws1 = model_dim // 32
+    preshuffle1 = build_moe_scatter_copy_preshuffle_scale_module(
+        ws1, wmma_rep, scale_k_per_tile, gather=True
+    )
+    preshuffle1(
+        torch.empty((numel, ws1), dtype=u8, device=dev),
+        torch.empty((E * (max_m // wmma_rep), ws1 * wmma_rep), dtype=u8, device=dev),
+        torch.empty((num_dst,), dtype=i32, device=dev),
+        max_m,
+        E,
+        tiles_per_expert,
+        stream=0,
+    )
+
+    # Stage2 scale: already grouped, pure preshuffle (gather=False).
+    ws2 = inter_dim // 32
+    preshuffle2 = build_moe_scatter_copy_preshuffle_scale_module(
+        ws2, wmma_rep, scale_k_per_tile, gather=False
+    )
+    preshuffle2(
+        torch.empty((num_dst, ws2), dtype=u8, device=dev),
+        torch.empty((E * (max_m // wmma_rep), ws2 * wmma_rep), dtype=u8, device=dev),
+        max_m,
+        E,
+        tiles_per_expert,
+        stream=0,
+    )
+
+    # Token-order gather-reduce epilogue (fast path is bf16/f16 only).
+    gather_reduce = build_moe_gather_reduce_module(model_dim, topk, out_dtype)
+    gather_reduce(
+        torch.empty((num_dst, model_dim), dtype=dtype, device=dev),
+        torch.empty((token_num, topk), dtype=i32, device=dev),
+        torch.empty((token_num, topk), dtype=dtype, device=dev),
+        torch.empty((token_num, model_dim), dtype=dtype, device=dev),
+        token_num,
+        stream=0,
+    )
+
+    # DeepGEMM contiguous-M tile-aligned prefix sum (no build-time params).
+    contiguous_psum = build_moe_contiguous_psum_module()
+    contiguous_psum(
+        torch.empty((E,), dtype=i32, device=dev),
+        torch.empty((E,), dtype=i32, device=dev),
+        torch.empty((E,), dtype=i32, device=dev),
+        torch.empty((1,), dtype=i32, device=dev),
+        E,
+        job["tile_m"],
+        stream=0,
+    )
+
+
 def compile_one_config(**job):
     import torch
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -174,9 +307,11 @@ def compile_one_config(**job):
         else:
             act_lead = job["experts"]
             rows = job["max_m"]
-        with compile_only_env(), override_env(
-            "FLYDSL_GPU_ARCH", aot_arch
-        ), FakeTensorMode():
+        with (
+            compile_only_env(),
+            override_env("FLYDSL_GPU_ARCH", aot_arch),
+            FakeTensorMode(),
+        ):
             masked_m = torch.full(
                 (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
             )
@@ -305,6 +440,18 @@ def compile_one_config(**job):
                 stream=0,
                 _m_tile_map=contiguous_layout,
                 bias=bias2,
+            )
+            # Non-GEMM auxiliary kernels the run-only fast path launches around
+            # the GEMMs (route maps, scatter-copy, scale preshuffle,
+            # gather-reduce, contiguous prefix-sum). They are
+            # scheduler-variant-independent, so the second variant just hits the
+            # on-disk AOT cache.
+            _compile_grouped_moe_aux_kernels(
+                job,
+                dtype=dtype,
+                pack=pack,
+                warp_tile_m=warp_tile_m,
+                max_m=job["max_m"],
             )
         elapsed = time.time() - t0
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
