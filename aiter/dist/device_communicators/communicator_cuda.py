@@ -241,6 +241,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
         x_pad_to_multiple: int = 0,
+        gemma_norm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from aiter.dist.device_communicators.custom_all_reduce import (
             can_pack_2d_last_dim_slice,
@@ -279,7 +280,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else (total_bytes <= 128 * 1024)
+            else (total_bytes <= self.world_size * 32 * 1024)
         )
         if (
             not use_general_path
@@ -293,6 +294,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 eps,
                 use_1stage,
                 out_hidden_dim=out_n,
+                gemma_norm=gemma_norm,
             )
             assert out is not None
             assert res_out is not None
@@ -313,6 +315,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 use_1stage,
                 out_hidden_dim=out_n,
                 prefill_support=prefill_support,
+                gemma_norm=gemma_norm,
             )
             assert out is not None
             assert res_out is not None
@@ -338,9 +341,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
             ar_out_2d = ar_out.reshape(-1, ar_out.shape[-1])
             res_inp_2d = res_inp_.reshape(-1, res_inp_.shape[-1])
+            norm_weight = weight_ + 1.0 if gemma_norm else weight_
             out_2d, residual_out_2d = fused_add_rmsnorm_pad(
                 ar_out_2d,
-                weight_,
+                norm_weight,
                 eps,
                 res_inp_2d,
                 x_pad_to_multiple=x_pad_to_multiple,
@@ -354,12 +358,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
 
+        norm_weight = weight_ + 1.0 if gemma_norm else weight_
         rmsnorm2d_fwd_with_add(
             out,
             ar_out,
             res_inp_,
             residual_out,
-            weight_,
+            norm_weight,
             eps,
             0,
         )
@@ -499,6 +504,32 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar(qkv_in, q_w, k_w, eps)
+        assert q_out is not None
+        assert k_out is not None
+        assert v_out is not None
+        return q_out, k_out, v_out
+
+    def fused_qknorm_allreduce_rope(
+        self,
+        qkv_in,
+        q_w,
+        k_w,
+        cos_sin_cache,
+        position_ids,
+        head_dim,
+        rotary_dim,
+        eps,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar_rope(
+            qkv_in,
+            q_w,
+            k_w,
+            cos_sin_cache,
+            position_ids,
+            head_dim,
+            rotary_dim,
+            eps,
+        )
         assert q_out is not None
         assert k_out is not None
         assert v_out is not None
