@@ -255,7 +255,16 @@ def check_topk_softmax_allclose(
 
 @aiter.test_common.benchmark()
 def test_biased_grouped_topk(
-    token, expert, group, topk, topk_group, need_renorm, dtype, scale_factor=1.0
+    token,
+    expert,
+    group,
+    topk,
+    topk_group,
+    need_renorm,
+    dtype,
+    scale_factor=1.0,
+    num_iters=101,
+    num_warmup=2,
 ):
     ret = {}
     gating_output = torch.randn((token, expert), dtype=dtype)
@@ -286,6 +295,8 @@ def test_biased_grouped_topk(
         topk_group,
         need_renorm,
         scale_factor,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
     )
 
     # use a special function to check result. The HIP topk may using sort algorithm
@@ -595,6 +606,24 @@ parser.add_argument(
     help="""Number of topk.
     e.g.: -k 8""",
 )
+parser.add_argument(
+    "-i",
+    "--iters",
+    type=int,
+    default=101,
+    help="""Number of timed iterations per measurement (grouped/biased topk).
+    Raise this to reduce per-measurement noise.
+    e.g.: -i 500""",
+)
+parser.add_argument(
+    "-w",
+    "--warmup",
+    type=int,
+    default=2,
+    help="""Number of warmup iterations before timing (grouped/biased topk).
+    Raise this to stabilize GPU clocks for latency-bound (small-token) shapes.
+    e.g.: -w 50""",
+)
 
 args = parser.parse_args()
 
@@ -618,12 +647,48 @@ for token in args.token:
     dtype = dtypes.bf16
     need_renorm = True
     ret = test_biased_grouped_topk(
-        token, expert, group, topk, topk_group, need_renorm, dtype
+        token,
+        expert,
+        group,
+        topk,
+        topk_group,
+        need_renorm,
+        dtype,
+        num_iters=args.iters,
+        num_warmup=args.warmup,
     )
     df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moeTopkSoftmax_biased_grouped_topk summary (markdown):\n%s", df_md)
+
+df = []
+for token in args.token:
+    # Kimi-K2.5 shapes
+    topk = 8
+    group = 1
+    topk_group = 1
+    expert = 384
+    dtype = dtypes.bf16
+    need_renorm = True
+    ret = test_biased_grouped_topk(
+        token,
+        expert,
+        group,
+        topk,
+        topk_group,
+        need_renorm,
+        dtype,
+        scale_factor=2.827,
+        num_iters=args.iters,
+        num_warmup=args.warmup,
+    )
+    df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_biased_grouped_topk_kimi_k25 summary (markdown):\n%s", df_md
+)
 
 df = []
 for token in args.token:

@@ -8,12 +8,15 @@
 
 // Split-barrier a16w16 traits
 
+// Unified gfx942 a16w16 traits.
+// LDS_DEPTH_ selects half-tile ping-pong (2) or full-tile single LDS (1).
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
         typename VEC_,
         typename TILE_,
-        typename WAVE_>
+        typename WAVE_,
+        int LDS_DEPTH_ = 2>
 struct opus_gemm_a16w16_traits {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
@@ -22,6 +25,7 @@ struct opus_gemm_a16w16_traits {
     using WAVE  = opus::remove_cvref_t<WAVE_>;
 
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
+    static constexpr int LDS_DEPTH = LDS_DEPTH_;
 
     static constexpr int B_M = opus::get<0>(BLOCK{});
     static constexpr int B_N = opus::get<1>(BLOCK{});
@@ -38,22 +42,23 @@ struct opus_gemm_a16w16_traits {
     static constexpr int T_K = opus::get<2>(TILE{});
 
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N * T_K);
-    static_assert(T_K == 1);
+    // T_K > 1 is used by the wave-K-coop pipeline; splitK/SB paths use T_K=1.
 
     static constexpr int W_M = opus::get<0>(WAVE{});
     static constexpr int W_N = opus::get<1>(WAVE{});
     static constexpr int W_K = opus::get<2>(WAVE{});
 
-    static constexpr int HALF_B_M = B_M / 2;
-    static constexpr int HALF_B_N = B_N / 2;
+    // Effective per-buffer tile = full tile / LDS_DEPTH.
+    static constexpr int HALF_B_M = B_M / LDS_DEPTH;
+    static constexpr int HALF_B_N = B_N / LDS_DEPTH;
 
     static_assert(HALF_B_M % (W_M * T_M) == 0);
     static_assert(HALF_B_N % (W_N * T_N) == 0);
-    static_assert(B_K % (W_K * T_K) == 0);
+    static_assert(B_K % W_K == 0);
 
     static constexpr int E_M = HALF_B_M / (W_M * T_M);
     static constexpr int E_N = HALF_B_N / (W_N * T_N);
-    static constexpr int E_K = B_K / (W_K * T_K);
+    static constexpr int E_K = B_K / W_K;
 
     static constexpr int VEC_A = opus::get<0>(VEC{});
     static constexpr int VEC_B = opus::get<1>(VEC{});
@@ -73,7 +78,7 @@ struct opus_gemm_a16w16_traits {
 
 #ifndef OPUS_GEMM_NOSCALE_KARGS_DEFINED
 #define OPUS_GEMM_NOSCALE_KARGS_DEFINED
-// Shared kargs struct between a16w16 nosplit launchers (kbuf1_large_tile / kbuf1 / kbuf3 / kbuf2v /
+// Shared kargs struct between a16w16 nosplit launchers (kbuf1_large_tile / kbuf1 / kbuf2v /
 // kbuf2v_bk128) and a8w8 noscal...
 struct opus_gemm_noscale_kargs {
     const void* __restrict__ ptr_a;
@@ -96,11 +101,19 @@ struct opus_gemm_noscale_kargs {
 
 #ifndef OPUS_GEMM_SPLITK_KARGS_GFX942_DEFINED
 #define OPUS_GEMM_SPLITK_KARGS_GFX942_DEFINED
+#ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
+#define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
+struct opus_splitk_ws_handle {
+    void*         ptr;
+    unsigned long bytes;
+};
+#endif
+
 // Shared kargs for splitK pipelines (splitk / splitk_p1 / splitk_legacy / splitk_p1_bk128).
 struct opus_gemm_splitk_kargs {
     const void* __restrict__ ptr_a;         // bf16 [B, M, K]
     const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
-    void*       __restrict__ ptr_workspace; // fp32 [split_k, B, padded_M, padded_N]
+    const opus_splitk_ws_handle* __restrict__ ws_handle; // deref at kernel entry
     void*       __restrict__ ptr_c;         // bf16 [B, M, N] final output (reduce kernel writes)
     const void* __restrict__ ptr_bias;      // unused (reserved)
     int m;
@@ -117,36 +130,5 @@ struct opus_gemm_splitk_kargs {
     int stride_ws_batch;    // = padded_M * padded_N
     int stride_c_batch;
     int stride_bias_batch;
-};
-#endif
-
-#ifndef OPUS_GEMM_SPLITK_FUSED_KARGS_GFX942_DEFINED
-#define OPUS_GEMM_SPLITK_FUSED_KARGS_GFX942_DEFINED
-// Fused splitK (single-kernel atomic-style reduce via cooperative tile flags).
-// Extends opus_gemm_splitk_kargs with ptr_flags + cooperative_reduce mode.
-struct opus_gemm_splitk_fused_kargs {
-    const void* __restrict__ ptr_a;         // bf16 [B, M, K]
-    const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
-    void*       __restrict__ ptr_workspace; // fp32 [split_k, B, padded_M, padded_N]
-    void*       __restrict__ ptr_c;         // bf16 [B, M, N] output
-    const void* __restrict__ ptr_bias;      // unused (reserved for future bias fusion)
-    unsigned int* __restrict__ ptr_flags;   // [B * num_tiles_m * num_tiles_n], init to 0
-    int m;
-    int n;
-    int k;
-    int batch;
-    int split_k;
-    int stride_a;
-    int stride_b;
-    int stride_ws;          // = padded_N
-    int stride_c;           // = N
-    int stride_a_batch;
-    int stride_b_batch;
-    int stride_ws_batch;    // = padded_M * padded_N
-    int stride_c_batch;
-    int stride_bias_batch;
-    // 1 = all split_k WGs of each tile cooperate on the reduce (each WG handles a slice of REDUCE_ITERS);
-    // requires grid_total_wgs <= ...
-    int cooperative_reduce;
 };
 #endif

@@ -118,7 +118,9 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
 }
 
 static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
-                            int64_t size, AiterDtype dtype)
+                            int m, int n, int k,
+                            aiter::ReduceScatterSplitDim split_dim,
+                            AiterDtype dtype)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -128,14 +130,14 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
         fa->dispatchReduceScatter<opus::fp32_t>(stream,
                                      reinterpret_cast<opus::fp32_t*>(inp),
                                      reinterpret_cast<opus::fp32_t*>(out),
-                                     size);
+                                     m, n, k, split_dim);
         break;
     }
     case AITER_DTYPE_fp16: {
         fa->dispatchReduceScatter<opus::fp16_t>(stream,
                                     reinterpret_cast<opus::fp16_t*>(inp),
                                     reinterpret_cast<opus::fp16_t*>(out),
-                                    size);
+                                    m, n, k, split_dim);
         break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -143,7 +145,7 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
         fa->dispatchReduceScatter<opus::bf16_t>(stream,
                                               reinterpret_cast<opus::bf16_t*>(inp),
                                               reinterpret_cast<opus::bf16_t*>(out),
-                                              size);
+                                              m, n, k, split_dim);
         break;
     }
 #endif
@@ -194,7 +196,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      void* scale_out, void* w,
                                      AiterDtype dtype, float eps,
                                      int m, int input_n, int n, int out_n,
-                                     bool use_1stage)
+                                     bool use_1stage,
+                                     bool gemma_norm)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -215,7 +218,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             input_n,                                             \
             n,                                                   \
             out_n,                                               \
-            use_1stage);                                         \
+            use_1stage,                                          \
+            gemma_norm);                                         \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -436,13 +440,15 @@ void all_reduce(fptr_t _fa,
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
+                    int64_t m, int64_t n, int64_t k,
+                    int64_t split_dim,
                     int64_t reg_ptr, int64_t reg_bytes)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
-    auto dtype     = inp.dtype();
-    int64_t inp_numel  = inp.numel();
-    int64_t data_bytes = inp_numel * inp.element_size();
+    auto dtype         = inp.dtype();
+    int64_t data_bytes = inp.numel() * inp.element_size();
+    auto sd            = static_cast<aiter::ReduceScatterSplitDim>(split_dim);
 
     if(reg_ptr != 0)
     {
@@ -450,11 +456,15 @@ void reduce_scatter(fptr_t _fa,
             throw std::runtime_error("registered buffer is too small to contain the input");
         HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
                                 hipMemcpyDeviceToDevice, stream));
-        _reduce_scatter(_fa, (void*)reg_ptr, out.data_ptr(), inp_numel, dtype);
+        _reduce_scatter(_fa, (void*)reg_ptr, out.data_ptr(),
+                        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                        sd, dtype);
     }
     else
     {
-        _reduce_scatter(_fa, inp.data_ptr(), out.data_ptr(), inp_numel, dtype);
+        _reduce_scatter(_fa, inp.data_ptr(), out.data_ptr(),
+                        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                        sd, dtype);
     }
 }
 
@@ -497,7 +507,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& w,
                              double eps,
                              int64_t reg_ptr, int64_t reg_bytes,
-                             bool use_1stage)
+                             bool use_1stage,
+                             bool gemma_norm)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -524,14 +535,14 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
     }
 }
 
@@ -543,7 +554,8 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  const aiter_tensor_t& w,
                                  double eps,
                                  int64_t reg_ptr, int64_t reg_bytes,
-                                 bool use_1stage)
+                                 bool use_1stage,
+                                 bool gemma_norm)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -569,14 +581,14 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
     }
 }
 
@@ -609,14 +621,14 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false);
     }
 }
 
@@ -795,7 +807,7 @@ void fused_qknorm_allreduce(fptr_t _fa,
 
 #define DISPATCH_AR_FUSION(DTYPE)                                                           \
     {                                                                                       \
-        fa->dispatchFusedQKNormAllReduce<DTYPE>(stream,                                     \
+        fa->dispatchFusedQKNormAllReduce<DTYPE, false>(stream,                              \
                                                 reinterpret_cast<DTYPE*>(inp_ptr),          \
                                                 reinterpret_cast<DTYPE*>(q_w.data_ptr()),   \
                                                 reinterpret_cast<DTYPE*>(k_w.data_ptr()),   \
@@ -806,7 +818,11 @@ void fused_qknorm_allreduce(fptr_t _fa,
                                                 hidden_dim_q,                               \
                                                 hidden_dim_k,                               \
                                                 hidden_dim_v,                               \
-                                                eps);                                       \
+                                                eps,                                        \
+                                                nullptr,                                    \
+                                                nullptr,                                    \
+                                                0,                                          \
+                                                0);                                         \
     }
 
     switch(dtype)
@@ -829,6 +845,90 @@ void fused_qknorm_allreduce(fptr_t _fa,
         throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
     }
 #undef DISPATCH_AR_FUSION
+}
+
+void fused_qknorm_allreduce_rope(fptr_t _fa,
+                                 const aiter_tensor_t& qkv_in,
+                                 const aiter_tensor_t& q_w,
+                                 const aiter_tensor_t& k_w,
+                                 const aiter_tensor_t& q_out,
+                                 const aiter_tensor_t& k_out,
+                                 const aiter_tensor_t& v_out,
+                                 const aiter_tensor_t& cos_sin_cache,
+                                 const aiter_tensor_t& position_ids,
+                                 int64_t head_dim,
+                                 int64_t rotary_dim,
+                                 double eps,
+                                 int64_t reg_ptr,
+                                 int64_t reg_bytes)
+{
+    HipDeviceGuard device_guard(qkv_in.device_id);
+    hipStream_t stream   = aiter::getCurrentHIPStream();
+    auto dtype           = qkv_in.dtype();
+    int64_t hidden_dim_q = q_w.numel();
+    int64_t hidden_dim_k = k_w.numel();
+    int64_t token_num    = qkv_in.size(0);
+    int64_t hidden_dim_v = qkv_in.size(1) - (hidden_dim_q + hidden_dim_k);
+    auto fa              = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int64_t data_bytes   = qkv_in.numel() * qkv_in.element_size();
+    void* inp_ptr        = qkv_in.data_ptr();
+
+    if(qkv_in.dtype() != cos_sin_cache.dtype())
+        throw std::runtime_error("fused_qknorm_allreduce_rope requires cos_sin_cache dtype to match qkv_in dtype");
+    if(position_ids.dtype() != AITER_DTYPE_i64)
+        throw std::runtime_error("fused_qknorm_allreduce_rope requires int64 position_ids");
+    if(cos_sin_cache.dim() != 2 || cos_sin_cache.size(1) < rotary_dim)
+        throw std::runtime_error("fused_qknorm_allreduce_rope expects cos_sin_cache shape [max_pos, rotary_dim]");
+
+    if(reg_ptr != 0)
+    {
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_ptr, qkv_in.data_ptr(), data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        inp_ptr = (void*)reg_ptr;
+    }
+
+#define DISPATCH_AR_ROPE_FUSION(DTYPE)                                                               \
+    {                                                                                                \
+        fa->dispatchFusedQKNormAllReduce<DTYPE, true>(stream,                                        \
+                                                reinterpret_cast<DTYPE*>(inp_ptr),                   \
+                                                reinterpret_cast<DTYPE*>(q_w.data_ptr()),            \
+                                                reinterpret_cast<DTYPE*>(k_w.data_ptr()),            \
+                                                reinterpret_cast<DTYPE*>(q_out.data_ptr()),          \
+                                                reinterpret_cast<DTYPE*>(k_out.data_ptr()),          \
+                                                reinterpret_cast<DTYPE*>(v_out.data_ptr()),          \
+                                                token_num,                                           \
+                                                hidden_dim_q,                                        \
+                                                hidden_dim_k,                                        \
+                                                hidden_dim_v,                                        \
+                                                eps,                                                 \
+                                                reinterpret_cast<DTYPE*>(cos_sin_cache.data_ptr()),  \
+                                                reinterpret_cast<int64_t*>(position_ids.data_ptr()), \
+                                                head_dim,                                            \
+                                                rotary_dim);                                         \
+    }
+
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32: {
+        DISPATCH_AR_ROPE_FUSION(opus::fp32_t)
+        break;
+    }
+    case AITER_DTYPE_fp16: {
+        DISPATCH_AR_ROPE_FUSION(opus::fp16_t)
+        break;
+    }
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: {
+        DISPATCH_AR_ROPE_FUSION(opus::bf16_t)
+        break;
+    }
+#endif
+    default:
+        throw std::runtime_error("custom allreduce rope only supports float32, float16 and bfloat16");
+    }
+#undef DISPATCH_AR_ROPE_FUSION
 }
 
 } // namespace aiter

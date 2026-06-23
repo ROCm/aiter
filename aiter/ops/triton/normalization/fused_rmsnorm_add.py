@@ -1,22 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Tuple
+
 import torch
 import triton
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
+    _gluon_fused_rms_kernel,
+)
+from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (
+    _triton_fused_rms_kernel,
+)
 
 
-def fused_rmsnorm_add(x, weight, epsilon, res1=None):
-    """RMSNorm over the last dim of a 2D tensor, with an optional residual add.
+def _fused_rmsnorm_add_core(x, weight, epsilon, res1):
+    """Shared RMSNorm (+ optional residual add) launcher.
 
-    x:      (M, N) tensor (bf16/fp16). Made contiguous if it isn't already.
-    weight: (N,) tensor.
-    res1:   optional (M, N) residual; when given, computes x += res1 first and
-            returns (out, out_res1) where out_res1 is the pre-norm sum.
-    Returns out (M, N) if res1 is None, else (out, out_res1).
-
-    Dispatches to a gfx1250 Gluon kernel when running on gfx1250, otherwise
-    falls back to a portable Triton kernel.
+    Returns ``(out, out_res1)`` where ``out_res1`` is ``None`` when ``res1`` is
+    ``None``. The two guarded entry points below wrap this with a *fixed* return
+    type each, so they can register as torch custom ops (a single op cannot have
+    a Tensor-or-tuple return schema). Dispatches to the gfx1250 Gluon kernel on
+    gfx1250, otherwise a portable Triton kernel.
     """
     assert x.dim() == 2, "fused_rmsnorm_add expects a 2D tensor"
     M, N = x.shape
@@ -52,9 +58,6 @@ def fused_rmsnorm_add(x, weight, epsilon, res1=None):
         out_res1_stride_m = out_res1.stride(0)
 
     if get_arch() == "gfx1250":
-        from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
-            _gluon_fused_rms_kernel,
-        )
 
         BLOCK_SIZE_M = 1
         grid = (triton.cdiv(M, BLOCK_SIZE_M),)
@@ -76,9 +79,6 @@ def fused_rmsnorm_add(x, weight, epsilon, res1=None):
             FIRST_INPUT_RES=(res1 is not None),
         )
     else:
-        from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (
-            _triton_fused_rms_kernel,
-        )
 
         grid = (M,)
         _triton_fused_rms_kernel[grid](
@@ -98,6 +98,53 @@ def fused_rmsnorm_add(x, weight, epsilon, res1=None):
             FIRST_INPUT_RES=(res1 is not None),
         )
 
-    if res1 is not None:
-        return out1, out_res1
+    return out1, out_res1
+
+
+def _fused_rmsnorm_fake(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@torch_compile_guard(gen_fake=_fused_rmsnorm_fake)
+def _fused_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> torch.Tensor:
+    out1, _ = _fused_rmsnorm_add_core(x, weight, epsilon, None)
     return out1
+
+
+def _fused_rmsnorm_add_fake(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float, res1: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(x)
+
+
+@torch_compile_guard(gen_fake=_fused_rmsnorm_add_fake)
+def _fused_rmsnorm_add(
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float, res1: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    out1, out_res1 = _fused_rmsnorm_add_core(x, weight, epsilon, res1)
+    return out1, out_res1
+
+
+def fused_rmsnorm_add(x, weight, epsilon, res1=None):
+    """RMSNorm over the last dim of a 2D tensor, with an optional residual add.
+
+    x:      (M, N) tensor (bf16/fp16). Made contiguous if it isn't already.
+    weight: (N,) tensor.
+    res1:   optional (M, N) residual; when given, computes x += res1 first and
+            returns (out, out_res1) where out_res1 is the pre-norm sum.
+    Returns out (M, N) if res1 is None, else (out, out_res1).
+
+    Dispatches to a gfx1250 Gluon kernel when running on gfx1250, otherwise
+    falls back to a portable Triton kernel. The actual compute is registered as
+    two torch custom ops (``_fused_rmsnorm`` / ``_fused_rmsnorm_add``) so the
+    path is safe under torch.compile / CUDAGraph capture; this thin dispatcher
+    selects the right one based on whether a residual was supplied (a static
+    branch at trace time).
+    """
+    if res1 is None:
+        return _fused_rmsnorm(x, weight, epsilon)
+    return _fused_rmsnorm_add(x, weight, epsilon, res1)

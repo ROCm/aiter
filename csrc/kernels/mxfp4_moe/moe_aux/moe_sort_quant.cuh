@@ -272,10 +272,18 @@ __device__ __forceinline__ void quant_impl(int bid_q, int M,
         const float qs = __uint_as_float((uint32_t)scale << 23);
 
         uint32_t pk = 0;
+#if defined(__gfx950__)
         pk = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(pk, *reinterpret_cast<const bf16x2_t *>(&h[0]), qs, 0);
         pk = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(pk, *reinterpret_cast<const bf16x2_t *>(&h[1]), qs, 1);
         pk = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(pk, *reinterpret_cast<const bf16x2_t *>(&h[2]), qs, 2);
         pk = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(pk, *reinterpret_cast<const bf16x2_t *>(&h[3]), qs, 3);
+#else
+        // The scalef32 fp4-cvt builtins need fp4-cvt-scale-insts (gfx950-only).
+        // This mxfp4 MoE is gfx950-only at runtime; emit a trap on other targets
+        // so the TU still compiles in a multi-arch build but never silently runs.
+        __builtin_trap();
+        (void)qs;
+#endif
 
         const int b_off = lane_in_block * 4;
         *reinterpret_cast<uint32_t *>(&a_quant[(size_t)my_block * 16 + b_off]) = pk;

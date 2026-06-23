@@ -10,7 +10,7 @@ from aiter.int4_utils import (
     rearrange_4bit_elements,
     convert_int8_to_uint32_int4,
 )
-from aiter.ops.quant import per_1x32_i4_quant
+from aiter.ops.quant import per_1x32_i4_quant, per_1x32_f8_scale_f8_quant
 from aiter.utility import fp4_utils
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx, get_cu_num
@@ -79,6 +79,12 @@ def test_fmoe(
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
     torch_quant = aiter.get_torch_quant(qType)
+    # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
+    is_mxfp8 = (
+        qType == aiter.QuantType.per_1x32
+        and AQDType == dtypes.fp8
+        and WQDType == dtypes.fp8
+    )
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
@@ -125,6 +131,13 @@ def test_fmoe(
         w1_qt = w1_qt.view(dtypes.i4x2)
         w2_qt, w2_scale = per_1x32_i4_quant(w2)
         w2_qt = w2_qt.view(dtypes.i4x2)
+    elif is_mxfp8:  # mxfp8: fp8 weights, per-1x32 e8m0 scale
+        w1_qt, w1_scale = per_1x32_f8_scale_f8_quant(
+            w1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        w2_qt, w2_scale = per_1x32_f8_scale_f8_quant(
+            w2, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
     elif qType == aiter.QuantType.per_128x128:
 
         def weight_per_128x128_quant(weight, quant_dtype):
@@ -159,7 +172,12 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
-    if qType == aiter.QuantType.per_1x32 and WQDType != dtypes.i4x2:
+    if qType == aiter.QuantType.per_1x32 and WQDType not in (
+        dtypes.i4x2,
+        dtypes.fp8,
+    ):
+        # fp4x2 weights pack 2 nibbles/byte -> halved last dim. fp8 (mxfp8) and
+        # i4x2 keep their stored shape.
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
     else:
@@ -177,7 +195,7 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and WQDType == dtypes.fp4x2
-    ):  # a16w4 & a8w4
+    ) or is_mxfp8:  # a16w4 & a8w4 & mxfp8
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     elif qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
@@ -241,13 +259,18 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a16w4 / a8w4 / a4w4 — all use the gate-up-interleaved a16w4 weight layout
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+    elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
@@ -318,7 +341,7 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4 & a8w4
+    ) or is_mxfp8:  # a16w4 & a8w4 & mxfp8
         a2_qt = out1_ref
         a2_scale = None
     elif (
@@ -345,31 +368,6 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    _is_a4w4 = (
-        qType == aiter.QuantType.per_1x32
-        and AQDType == dtypes.fp4x2
-        and WQDType == dtypes.fp4x2
-    )
-    if os.environ.get("AITER_FORCE_FLYDSL_MOE") and _is_a4w4:
-        # opt-in: route the a4w4 MoE through the FlyDSL port kernels
-        # (mxfp4_gemm{1,2}_a4w4_port) instead of fused_moe's default CK dispatch.
-        # The port expects the mxfp4_moe weight layout (shuffle_weight_a16w4 /
-        # shuffle_scale_a16w4), but a4w4's default prep above used
-        # shuffle_weight((16,16)) -> wrong layout for the port (logits_diff ~0.99).
-        # Rebuild EXACTLY like bench_up_moe_v1.build_weights: re-quantize the original
-        # bf16 weights and apply the a16w4 weight/scale shuffles (avoids the subtle
-        # layout drift from the a4w4 default prep's .view + shuffle_weight((16,16))).
-        _w1q, _w1s = torch_quant(w1, quant_dtype=dtypes.fp4x2)
-        _w2q, _w2s = torch_quant(w2, quant_dtype=dtypes.fp4x2)
-        w1_qt_aiter = shuffle_weight_a16w4(_w1q, 16, True)
-        w2_qt_aiter = shuffle_weight_a16w4(_w2q, 16, False)
-        w1_scale_aiter = shuffle_scale_a16w4(_w1s, E, True)
-        w2_scale_aiter = shuffle_scale_a16w4(_w2s, E, False)
-        # gemm{1,2}_backend="flydsl" routes both a4w4 MoE GEMMs through the FlyDSL
-        # engines: fused_moe finds the tuned HIP mxfp4 row for this shape and then
-        # re-routes it to _mxfp4_moe_run, running gemm1/gemm2 on FlyDSL.
-        w1_qt_aiter.gemm1_backend = "flydsl"
-        w2_qt_aiter.gemm2_backend = "flydsl"
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -391,6 +389,15 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+    # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
+    # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
+    # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
+    # masked by atomic-reduction noise, so detect NaN explicitly and deterministically.
+    has_nan = out2_ck.isnan().any().item()
+    if has_nan:
+        logging.error(
+            "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
+        )
     err = checkAllclose(
         out2_ref,
         out2_ck,
@@ -409,9 +416,12 @@ def test_fmoe(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
     if strict_accuracy:
+        assert not has_nan, "accuracy check failed: output contains NaN"
         assert not (
             err != 0 and logits_diff > 0.01
         ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+    elif has_nan:
+        logging.warning("accuracy check failed (non-strict): output contains NaN")
     elif err != 0 and logits_diff > 0.01:
         logging.warning(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
@@ -433,6 +443,7 @@ l_quant = [
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16wi4
+    (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp8),  # mxfp8 (a8w8)
 ]
 
 
@@ -498,7 +509,8 @@ parser.add_argument(
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
     6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
     7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,
-    8: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2,  # a16wi4,""",
+    8: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2,  # a16wi4,
+    9: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp8,  # mxfp8 (a8w8),""",
 )
 
 parser.add_argument(
@@ -721,6 +733,9 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
     # ATOM_MOE_GU_ITLV=1. Include fp4x2 activations (true a4w4) so op_tests reach
     # the HIP a4w4 backend instead of falling through to the separated default.
     if aq_dtype in [dtypes.fp8, dtypes.bf16, dtypes.fp4x2] and wq_dtype == dtypes.fp4x2:
+        return GateMode.INTERLEAVE.value
+    # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
+    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
         return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
 
