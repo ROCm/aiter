@@ -332,6 +332,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Split Aiter Tests (8 shards)
         run: ./.github/scripts/split_tests.sh --shards 8 --test-type aiter
