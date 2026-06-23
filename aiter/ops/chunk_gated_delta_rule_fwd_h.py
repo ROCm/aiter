@@ -17,15 +17,7 @@ _BV_FIXED_LDS_BYTES = 32 * 1024
 _BV_LDS_BYTES_PER_BV = 512
 _BV_RESIDENT_WGS_CAP = 2
 _BV_CANDIDATES = (64, 32, 16)
-# Occupancy thresholds for the BV selector: pick a BV only if its parallel
-# workgroup count fills at least this fraction of the GPU's resident-WG
-# capacity. The two cut points sit in the empty gaps measured across the known
-# K5 shapes (64-vs-32 best/non-best occ gap [0.375, 0.50]; 32-vs-16 gap
-# [0.50, 0.75]), so each threshold is the midpoint of a real margin rather than
-# fitted to a single shape.
-_BV_OCC_THRESHOLD_64 = 7.0 / 16.0  # ~0.44
-_BV_OCC_THRESHOLD_32 = 5.0 / 8.0   # 0.625
-_BV_CACHE: dict[tuple[int, int, int], int] = {}
+_BV_CACHE: dict[tuple[int, int, int, int], int] = {}
 
 
 def _device_idx(device: torch.device) -> int:
@@ -54,43 +46,32 @@ def _get_shared_memory_per_cu(props: object) -> int:
 
 def _compute_bv(
     device: torch.device,
-    n_seqs: int,
+    total_chunks: int,
+    max_seq_chunks: int,
     num_heads: int,
 ) -> int:
-    """Pick the V-tile width (BV) by GPU occupancy.
-
-    The kernel walks each sequence's chunks recursively inside a single
-    workgroup, so the *parallel* workgroup count is ``(128 / bv) * num_heads *
-    n_seqs`` (segment count ``n_seqs``, NOT total/per-segment chunk counts --
-    those are the serial recurrence depth and do not add parallelism). A larger
-    BV means fewer V-tiles per (seq, head) and thus fewer workgroups; we only
-    take it when those workgroups still fill enough of the GPU's resident-WG
-    capacity (``num_cus * resident``). Otherwise we shrink BV to spawn more
-    V-tile workgroups and recover occupancy.
-    """
     props = torch.cuda.get_device_properties(device)
     num_cus = props.multi_processor_count
     lds_per_cu = _get_shared_memory_per_cu(props)
 
-    for bv, occ_threshold in (
-        (64, _BV_OCC_THRESHOLD_64),
-        (32, _BV_OCC_THRESHOLD_32),
-    ):
+    for bv in _BV_CANDIDATES:
         lds_per_wg = _BV_FIXED_LDS_BYTES + _BV_LDS_BYTES_PER_BV * bv
         resident = min(max(1, lds_per_cu // lds_per_wg), _BV_RESIDENT_WGS_CAP)
-        capacity = num_cus * resident
-        parallel_wgs = (128 // bv) * num_heads * n_seqs
-        if capacity > 0 and parallel_wgs / capacity >= occ_threshold:
+        total_wgs = (128 // bv) * num_heads * total_chunks
+        threshold = max(1, (num_cus * resident) // 2) * max_seq_chunks
+        if total_wgs >= threshold:
             return bv
     return 16
 
 
-def _select_bv(device: torch.device, num_heads: int, n_seqs: int) -> int:
-    key = (_device_idx(device), num_heads, n_seqs)
+def _select_bv(
+    device: torch.device, num_heads: int, total_chunks: int, max_seq_chunks: int
+) -> int:
+    key = (_device_idx(device), num_heads, total_chunks, max_seq_chunks)
     cached = _BV_CACHE.get(key)
     if cached is not None:
         return cached
-    bv = _compute_bv(device, n_seqs, num_heads)
+    bv = _compute_bv(device, total_chunks, max_seq_chunks, num_heads)
     _BV_CACHE[key] = bv
     return bv
 
@@ -98,12 +79,15 @@ def _select_bv(device: torch.device, num_heads: int, n_seqs: int) -> int:
 def _select_bv_for_dense(
     batch_size: int, seq_len: int, chunk_size: int, num_heads: int, device: torch.device
 ) -> int:
-    return _select_bv(device, num_heads, batch_size)
+    nt = (seq_len + chunk_size - 1) // chunk_size
+    return _select_bv(device, num_heads, batch_size * nt, nt)
 
 
 def _select_bv_for_varlen(chunk_offsets: torch.Tensor, num_heads: int) -> int:
-    n_seqs = chunk_offsets.numel() - 1
-    return _select_bv(chunk_offsets.device, num_heads, int(n_seqs))
+    offsets = chunk_offsets.tolist()
+    total_chunks = offsets[-1]
+    max_seq_chunks = max(offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1))
+    return _select_bv(chunk_offsets.device, num_heads, total_chunks, max_seq_chunks)
 
 
 @compile_ops(MD_NAME, develop=True)
