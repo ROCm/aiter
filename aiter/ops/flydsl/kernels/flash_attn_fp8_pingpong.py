@@ -46,6 +46,8 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as _fly
 from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import scf
+from flydsl.expr.numeric import _wrap_like
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -663,36 +665,45 @@ def build_flash_attn_fp8_module(
         lf = c_zero_f
 
         if is_g0:
-            g0_names = [
-                "m_r",
-                "l_a",
-                "oo0",
-                "oo1",
-                "oo2",
-                "oo3",
-                "p_c",
-                "prowsum_c",
-                "corr_c",
-            ]
-            g0_init = [
-                m_init,
-                l_init,
-                o_init[0],
-                o_init[1],
-                o_init[2],
-                o_init[3],
-                p_init,
-                prowsum_init,
-                corr_init,
-            ]
+            # ---- Tile 0: QK(0) + softmax(0) + DMA V^1. ----
+            # apply_pv(P=0) would be a no-op; skip it and seed the carry directly.
+            def g0_iter0():
+                _, k_buf_off, _, _, v_next = _bufs(fx.Index(0))
+                sA = do_qk(k_buf_off)
+                gpu.barrier()
+                m_new, corr_new, p_new, prowsum_new = do_softmax(
+                    [sA[0], sA[1], sA[2], sA[3]], m_init
+                )
+                dma_v(v_next, fx.Index(BLOCK_N))
+                waitcnt_barrier()
+                return (
+                    m_new, l_init,
+                    o_init[0], o_init[1], o_init[2], o_init[3],
+                    p_new, prowsum_new, corr_new,
+                )
 
-            def g0_body(
-                iv, _names, m_r, l_a, oo0, oo1, oo2, oo3, p_c, prowsum_c, corr_c
-            ):
+            # ---- Epilogue: apply deferred PV(N-1). ----
+            def g0_epilogue(m_r, l_a, oo0, oo1, oo2, oo3, p_c, prowsum_c, corr_c):
+                return apply_pv(
+                    [oo0, oo1, oo2, oo3], l_a, p_c, prowsum_c, corr_c, v_last_off
+                )
+
+            # ---- Main loop: tiles 1..N-1 (apply_pv + QK + softmax + DMA). ----
+            g0_carry = list(g0_iter0())
+            for_op = scf.ForOp(
+                _raw(loop_step), _raw(seq_len), _raw(loop_step),
+                [_raw(v) for v in g0_carry],
+            )
+            with ir.InsertionPoint(for_op.body):
+                iv = for_op.induction_variable
+                m_r, l_a, oo0, oo1, oo2, oo3, p_c, prowsum_c, corr_c = [
+                    _wrap_like(a, ex)
+                    for a, ex in zip(for_op.inner_iter_args, g0_carry)
+                ]
                 kv_start = fx.Index(iv)
-                _isf, k_buf_off, v_prev_off, _kn, v_next = _bufs(kv_start)
+                _, k_buf_off, v_prev_off, _, v_next = _bufs(kv_start)
                 next_kv = kv_start + fx.Index(BLOCK_N)
-                # PHASE 1 (mfma phase): matrix -- deferred PV(i-1) then QK(i).
+                # PHASE 1 (mfma phase): deferred PV(i-1) then QK(i).
                 oA, lA = apply_pv(
                     [oo0, oo1, oo2, oo3], l_a, p_c, prowsum_c, corr_c, v_prev_off
                 )
@@ -704,38 +715,18 @@ def build_flash_attn_fp8_module(
                 )
                 dma_v(v_next, next_kv)
                 waitcnt_barrier()
-                return [
-                    m_new,
-                    lA,
-                    oA[0],
-                    oA[1],
-                    oA[2],
-                    oA[3],
-                    p_new,
-                    prowsum_new,
-                    corr_new,
-                ]
+                scf.YieldOp([
+                    _raw(m_new), _raw(lA),
+                    _raw(oA[0]), _raw(oA[1]), _raw(oA[2]), _raw(oA[3]),
+                    _raw(p_new), _raw(prowsum_new), _raw(corr_new),
+                ])
 
-            res = scf_for_dispatch(  # noqa: F821
-                loop_lo,
-                seq_len,
-                loop_step,
-                g0_body,
-                result_names=g0_names,
-                result_values=g0_init,
-            )
-            # G0 epilogue: still owes PV(N-1) (softmax(N-1) ran in last phase 2).
-            m_e = res[0]  # noqa: F841
-            l_e = res[1]
-            oe0 = res[2]
-            oe1 = res[3]
-            oe2 = res[4]
-            oe3 = res[5]
-            p_e = res[6]
-            prowsum_e = res[7]
-            corr_e = res[8]
-            o_fin, l_fin_g = apply_pv(
-                [oe0, oe1, oe2, oe3], l_e, p_e, prowsum_e, corr_e, v_last_off
+            m_e, l_e, oe0, oe1, oe2, oe3, p_e, prowsum_e, corr_e = [
+                _wrap_like(r, ex)
+                for r, ex in zip(for_op.results, g0_carry)
+            ]
+            o_fin, l_fin_g = g0_epilogue(
+                m_e, l_e, oe0, oe1, oe2, oe3, p_e, prowsum_e, corr_e
             )
             of0 = o_fin[0]
             of1 = o_fin[1]
@@ -743,84 +734,65 @@ def build_flash_attn_fp8_module(
             of3 = o_fin[3]
             lf = l_fin_g
         else:
-            g1_names = [
-                "m_r",
-                "l_a",
-                "oo0",
-                "oo1",
-                "oo2",
-                "oo3",
-                "ss0",
-                "ss1",
-                "ss2",
-                "ss3",
-            ]
-            g1_init = [
-                m_init,
-                l_init,
-                o_init[0],
-                o_init[1],
-                o_init[2],
-                o_init[3],
-                s_init[0],
-                s_init[1],
-                s_init[2],
-                s_init[3],
-            ]
+            # ---- Tile 0: DMA K^1 + QK(0). ----
+            # do_softmax(ss=0) and apply_pv(P=0) are both no-ops; skip them and
+            # eliminate the is_first selects from the main loop body.
+            def g1_iter0():
+                _, k_buf_off, _, k_next, _ = _bufs(fx.Index(0))
+                dma_k(k_next, fx.Index(BLOCK_N))
+                waitcnt_barrier()
+                sB = do_qk(k_buf_off)
+                gpu.barrier()
+                return (
+                    m_init, l_init,
+                    o_init[0], o_init[1], o_init[2], o_init[3],
+                    sB[0], sB[1], sB[2], sB[3],
+                )
 
-            def g1_body(iv, _names, m_r, l_a, oo0, oo1, oo2, oo3, ss0, ss1, ss2, ss3):
+            # ---- Epilogue: softmax(N-1) then apply deferred PV(N-1). ----
+            def g1_epilogue(m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3):
+                _m_e, corrf, pf, prowsumf = do_softmax([sce0, sce1, sce2, sce3], m_e)
+                return apply_pv(
+                    [oe0, oe1, oe2, oe3], l_e, pf, prowsumf, corrf, v_last_off
+                )
+
+            # ---- Main loop: tiles 1..N-1 (softmax + DMA K + apply_pv + QK). ----
+            g1_carry = list(g1_iter0())
+            for_op = scf.ForOp(
+                _raw(loop_step), _raw(seq_len), _raw(loop_step),
+                [_raw(v) for v in g1_carry],
+            )
+            with ir.InsertionPoint(for_op.body):
+                iv = for_op.induction_variable
+                m_r, l_a, oo0, oo1, oo2, oo3, ss0, ss1, ss2, ss3 = [
+                    _wrap_like(a, ex)
+                    for a, ex in zip(for_op.inner_iter_args, g1_carry)
+                ]
                 kv_start = fx.Index(iv)
-                is_first, k_buf_off, v_prev_off, k_next, _vn = _bufs(kv_start)
+                _, k_buf_off, v_prev_off, k_next, _ = _bufs(kv_start)
                 next_kv = kv_start + fx.Index(BLOCK_N)
                 # PHASE 1 (mfma phase): softmax(i-1) | DMA K^{i+1}.
                 m_sm, corr_sm, p_sm, prowsum_sm = do_softmax([ss0, ss1, ss2, ss3], m_r)
-                mA = ArithValue(is_first).select(m_r, m_sm)
-                corrA = ArithValue(is_first).select(fx.Float32(1.0), corr_sm)
-                pA = ArithValue(is_first).select(zero_p.ir_value(), _raw(p_sm))
-                prowsumA = ArithValue(is_first).select(_raw(c_zero_f), prowsum_sm)
                 dma_k(k_next, next_kv)
                 waitcnt_barrier()
-                # PHASE 2 (softmax phase): matrix -- deferred PV(i-1), QK(i)->S.
+                # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
                 oB, lB = apply_pv(
-                    [oo0, oo1, oo2, oo3], l_a, pA, prowsumA, corrA, v_prev_off
+                    [oo0, oo1, oo2, oo3], l_a, p_sm, prowsum_sm, corr_sm, v_prev_off
                 )
                 sB = do_qk(k_buf_off)
                 gpu.barrier()
-                return [
-                    mA,
-                    lB,
-                    oB[0],
-                    oB[1],
-                    oB[2],
-                    oB[3],
-                    sB[0],
-                    sB[1],
-                    sB[2],
-                    sB[3],
-                ]
+                scf.YieldOp([
+                    _raw(m_sm), _raw(lB),
+                    _raw(oB[0]), _raw(oB[1]), _raw(oB[2]), _raw(oB[3]),
+                    _raw(sB[0]), _raw(sB[1]), _raw(sB[2]), _raw(sB[3]),
+                ])
 
-            res = scf_for_dispatch(  # noqa: F821
-                loop_lo,
-                seq_len,
-                loop_step,
-                g1_body,
-                result_names=g1_names,
-                result_values=g1_init,
-            )
-            # G1 epilogue: owes BOTH softmax(N-1) (carried S) and PV(N-1).
-            m_e = res[0]
-            l_e = res[1]
-            oe0 = res[2]
-            oe1 = res[3]
-            oe2 = res[4]
-            oe3 = res[5]
-            sce0 = res[6]
-            sce1 = res[7]
-            sce2 = res[8]
-            sce3 = res[9]
-            _m_e, corrf, pf, prowsumf = do_softmax([sce0, sce1, sce2, sce3], m_e)
-            o_fin, l_fin_g = apply_pv(
-                [oe0, oe1, oe2, oe3], l_e, pf, prowsumf, corrf, v_last_off
+            m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3 = [
+                _wrap_like(r, ex)
+                for r, ex in zip(for_op.results, g1_carry)
+            ]
+            o_fin, l_fin_g = g1_epilogue(
+                m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3
             )
             of0 = o_fin[0]
             of1 = o_fin[1]
