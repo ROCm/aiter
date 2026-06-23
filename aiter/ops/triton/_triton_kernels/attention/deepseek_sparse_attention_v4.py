@@ -236,10 +236,17 @@ def sparse_mla_fwd_v4(q, kv, topk_indices, attn_sink=None, kv_lora_rank=512, sca
              denominator (so backward can recompute P_j = exp(S_j - lse) directly).
     """
     if backend == "gluon":
-        from aiter.ops.triton._gluon_kernels.gfx950.attention.dsa_fwd_v4_gluon import (
-            sparse_mla_fwd_v4_gluon,
-        )
-        return sparse_mla_fwd_v4_gluon(
+        import torch as _t
+        arch = _t.cuda.get_device_properties(q.device).gcnArchName
+        if "gfx1250" in arch:
+            from aiter.ops.triton._gluon_kernels.gfx1250.attention.dsa_fwd_v4_gluon import (
+                sparse_mla_fwd_v4_gluon_gfx1250 as _fwd_gluon,
+            )
+        else:
+            from aiter.ops.triton._gluon_kernels.gfx950.attention.dsa_fwd_v4_gluon import (
+                sparse_mla_fwd_v4_gluon as _fwd_gluon,
+            )
+        return _fwd_gluon(
             q, kv, topk_indices, attn_sink=attn_sink,
             kv_lora_rank=kv_lora_rank, scale=scale,
         )
