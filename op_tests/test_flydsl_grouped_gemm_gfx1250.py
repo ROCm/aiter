@@ -129,6 +129,14 @@ def _torch_moe_ref(
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
 
+    # When wave-specialized TDM (wst) is enabled, the gfx1250 grouped kernels do
+    # NOT load the activation scale (As); they feed the WMMA a constant E8M0
+    # scale of 1.0. Mirror that here so the reference matches: drop the A-scale
+    # from the activation dequant (a8w4) / force a1/a2 scale to 1.0 (a4w4).
+    _wst_as_one = os.environ.get(
+        "AITER_GROUPED_GEMM1_WAVE_SPECIALIZED", "0"
+    ) in ("1", "true", "True", "yes", "YES")
+
     def _per_1x32_fp8_dequant(x: torch.Tensor) -> torch.Tensor:
         """Mirror grouped a8w4's per-block-32 MXFP8 input quant, then dequant."""
         block = 32
@@ -146,7 +154,10 @@ def _torch_moe_ref(
         scale_f32[scale_f32 == 0] = 1.0
         q_f32 = (blk / scale_f32.unsqueeze(1)).clamp(min=-dtype_max, max=dtype_max)
         q = q_f32.contiguous().to(dtypes.fp8).to(torch.float32).view_as(blk)
-        return (q * scale_f32.unsqueeze(1)).view(x_shape).to(x.dtype)
+        # wst: kernel applies As=1.0, so the activation is used at unit scale
+        # (the fp8-rounded q) instead of being scaled back by scale_f32.
+        out_blk = q if _wst_as_one else (q * scale_f32.unsqueeze(1))
+        return out_blk.view(x_shape).to(x.dtype)
 
     w1_scale = w1_scale_raw.view(dtypes.fp8_e8m0)
     w2_scale = w2_scale_raw.view(dtypes.fp8_e8m0)
@@ -155,6 +166,9 @@ def _torch_moe_ref(
         stage1_hidden, stage1_hidden_scale = per_1x32_f4_quant(
             hidden, quant_dtype=dtypes.fp4x2, shuffle=False
         )
+        if _wst_as_one:
+            # As=1.0: keep the fp4-rounded values, force the block scale to 2^0.
+            stage1_hidden_scale.view(torch.uint8).fill_(DEFAULT_SCALE_BYTE)
     else:
         # Match grouped a8w4: stage1 input is MXFP8 with per-1x32 e8m0 scale.
         stage1_hidden, stage1_hidden_scale = _per_1x32_fp8_dequant(hidden), None
@@ -184,6 +198,9 @@ def _torch_moe_ref(
             quant_dtype=dtypes.fp4x2,
             shuffle=False,
         )
+        if _wst_as_one:
+            # As=1.0 for stage2 too (gemm2 wst also skips the A-scale load).
+            a2_scale.view(torch.uint8).fill_(DEFAULT_SCALE_BYTE)
         a2 = a2_q.view(T, topk, inter // 2)
     else:
         # Match grouped a8w4 stage2: per-block-32 MXFP8 quant + dequant.

@@ -292,6 +292,10 @@ def compile_mxscale_gemm(
         stage1_act_mode is not None and stage1_weight_layout_mode == "gugu"
     )
     stage1_dual_b = stage1_act_mode is not None and not stage1_act_interleave
+    if wave_specialized_tdm and stage1_dual_b:
+        # The WST B-split (wave0+wave1=B, wave2=A, wave3=Bs) has no spare wave
+        # for the second (gate) B/Bs stream that dual-B requires.
+        raise ValueError("wave_specialized_tdm is incompatible with stage1_dual_b")
     B_TOTAL_N = N if stage1_act_interleave else (N * 2 if stage1_dual_b else N)
     C_N = N // 2 if stage1_act_interleave else N
 
@@ -397,6 +401,10 @@ def compile_mxscale_gemm(
     # dedicate one loader wave to each tensor (A/B/A_scale/B_scale), so each
     # active loader wave must issue a full-tile descriptor by itself.
     tdm_desc_num_warps = 1 if wave_specialized_tdm else num_warps
+    # WST B-split: in wave-specialized mode B is loaded cooperatively by two
+    # waves (wave0 + wave1), so its descriptor partitions the tile across 2
+    # warps. A / B-scale stay single-wave (num_warps=1); A-scale is not loaded.
+    b_desc_num_warps = 2 if wave_specialized_tdm else tdm_desc_num_warps
 
     # All pipeline stages share the same intra-stage layout. Keep that layout
     # unchanged and only remap each logical stage to a physical base inside one
@@ -736,7 +744,7 @@ def compile_mxscale_gemm(
                     elem_bytes=1,
                     pad_interval=0,
                     pad_amount=0,
-                    num_warps=tdm_desc_num_warps,
+                    num_warps=b_desc_num_warps,
                     workgroup_mask=b_mcast_mask,
                     atomic_barrier_enable=atomic_barrier_enable,
                 )
@@ -801,20 +809,32 @@ def compile_mxscale_gemm(
 
             if const_expr(wave_specialized_tdm):
                 tdm_wave_id = rocdl.wave_id()
+                # WST split: B is loaded cooperatively by wave0 + wave1 (the B
+                # descriptor is built with num_warps=2, so each of the two waves
+                # already has its own half baked into the global/LDS offsets),
+                # wave2 loads A, wave3 loads B-scale. A-scale (As) is not loaded
+                # at all -- the WMMA is fed a constant E8M0 scale of 1.0 instead.
+                tdm_wave_is_b = arith.ori(
+                    arith.cmpi(
+                        arith.CmpIPredicate.eq,
+                        tdm_wave_id,
+                        arith.constant(0, type=T.i32),
+                    ),
+                    arith.cmpi(
+                        arith.CmpIPredicate.eq,
+                        tdm_wave_id,
+                        arith.constant(1, type=T.i32),
+                    ),
+                )
                 tdm_wave_is_a = arith.cmpi(
-                    arith.CmpIPredicate.eq, tdm_wave_id, arith.constant(0, type=T.i32)
-                )
-                tdm_wave_is_b = arith.cmpi(
-                    arith.CmpIPredicate.eq, tdm_wave_id, arith.constant(1, type=T.i32)
-                )
-                tdm_wave_is_as = arith.cmpi(
                     arith.CmpIPredicate.eq, tdm_wave_id, arith.constant(2, type=T.i32)
                 )
 
                 def _select_wave_tdm_value(a_value, b_value, as_value, bs_value):
-                    result = arith.select(tdm_wave_is_as, as_value, bs_value)
-                    result = arith.select(tdm_wave_is_b, b_value, result)
-                    return arith.select(tdm_wave_is_a, a_value, result)
+                    # wave2 -> A, default (wave3) -> Bs; as_value is unused.
+                    result = arith.select(tdm_wave_is_a, a_value, bs_value)
+                    # wave0, wave1 -> B (per-wave half already baked in).
+                    return arith.select(tdm_wave_is_b, b_value, result)
 
             elem_ty_lds = T.f16
 
@@ -977,6 +997,19 @@ def compile_mxscale_gemm(
                     results.append(vi)
                 return results
 
+            def _load_a_scales(as_buf, as_bases, reps, ks=0):
+                """A-scale fragments for one K-subtile.
+
+                In wave-specialized mode the A-scale (As) is not loaded from LDS
+                at all; the WMMA is fed a constant E8M0 scale of 1.0. Each packed
+                i32 holds 4 E8M0 bytes; 127 (0x7F) encodes 2^0 = 1.0, so the
+                constant is 0x7F7F7F7F regardless of which byte the HW selects.
+                """
+                if const_expr(wave_specialized_tdm):
+                    one = arith.constant(0x7F7F7F7F, type=T.i32)
+                    return [one for _ in range_constexpr(reps)]
+                return load_scale_b128(as_buf, as_bases[0], reps, ks)
+
             is_full_n32k4 = is_fp4 or b_opsel_on  # warp covers a full 32-row super-row
             _bs_row_bytes = scale_k_per_tile * BS_N32K4_BLOCK_N  # LDS super-row width
 
@@ -1017,7 +1050,7 @@ def compile_mxscale_gemm(
                 ]
                 _n_units = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
                 b_scales = _load_b_scale_n32k4(bs_buf, bs_bases[0], ks, 0, _n_units)
-                a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
+                a_scales_all = _load_a_scales(as_buf, as_bases, wmma_m_rep, ks)
                 if const_expr(use_scale_opsel):
                     a_scales = a_scales_all[::2]
                 else:
@@ -1332,7 +1365,7 @@ def compile_mxscale_gemm(
 
                 for ks in range_constexpr(k_wmma_steps):
                     is_last_ks = ks == k_wmma_steps - 1
-                    a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
+                    a_scales_all = _load_a_scales(as_buf, as_bases, wmma_m_rep, ks)
 
                     a_top_frags = _load_a_group(0, _bank_half_wm, ks)
                     a_bottom_frags = _load_a_group(_bank_half_wm, _bank_half_wm, ks)
