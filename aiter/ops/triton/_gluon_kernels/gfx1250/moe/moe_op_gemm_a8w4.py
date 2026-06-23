@@ -238,6 +238,12 @@ def _moe_gemm_a8w4_decode(
     off_w_n = pid_n * PACKED_BLOCK_N_W
     W += expt_id * stride_w_e
 
+    # TDM block pointer offsets must be int32; downcast from int64 when
+    # UPCAST_INDICES is active (the values are block-local and always small).
+    off_x_m = off_x_m.to(tl.int32)
+    off_w_n = off_w_n.to(tl.int32)
+    off_w_n_scale = off_w_n_scale.to(tl.int32)
+
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0]
     )
@@ -265,10 +271,16 @@ def _moe_gemm_a8w4_decode(
             [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
         )
 
+    # TDM descriptors require int32 shape/strides.  M and num_tokens are
+    # runtime Triton values (may be int64 when UPCAST_INDICES); strides and
+    # N/K are specialized Python ints and already fit int32.
+    M_i32 = M.to(tl.int32)
+    num_tokens_i32 = num_tokens.to(tl.int32)
+
     if GatherIndx is None:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X,
-            shape=(M, K),
+            shape=(M_i32, K),
             strides=(stride_x_m, stride_x_k),
             block_shape=(BLOCK_M, BLOCK_K),
             layout=SHARED_LAYOUT_X,
@@ -276,7 +288,7 @@ def _moe_gemm_a8w4_decode(
     else:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X,
-            shape=(num_tokens, K),
+            shape=(num_tokens_i32, K),
             strides=(stride_x_m, stride_x_k),
             block_shape=(BLOCK_M, BLOCK_K),
             layout=SHARED_LAYOUT_X,
@@ -307,7 +319,7 @@ def _moe_gemm_a8w4_decode(
             XMxScale += start_m * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
-                shape=(M, tl.cdiv(K, MX_PACK_DIVISOR)),
+                shape=(M_i32, tl.cdiv(K, MX_PACK_DIVISOR)),
                 strides=(stride_x_mx_m, stride_x_mx_k),
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
@@ -315,7 +327,7 @@ def _moe_gemm_a8w4_decode(
         else:
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
-                shape=(num_tokens, tl.cdiv(K, MX_PACK_DIVISOR)),
+                shape=(num_tokens_i32, tl.cdiv(K, MX_PACK_DIVISOR)),
                 strides=(stride_x_mx_m, stride_x_mx_k),
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
@@ -500,7 +512,7 @@ def _moe_gemm_a8w4_decode(
         )
         gl.amd.gfx1250.tdm.async_load(
             bias_desc,
-            [0, pid_n * BLOCK_N],
+            [0, off_w_n],
             bias_buffer,
         )
         TDM_BIAS_WAIT: gl.constexpr = 1
@@ -599,14 +611,14 @@ def _moe_gemm_a8w4_decode(
     )
     y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=Y,
-        shape=(M, yN),
+        shape=(M_i32, yN),
         strides=(stride_y_m, stride_y_n),
         block_shape=(BLOCK_M, OUT_BLOCK_N),
         layout=SHARED_LAYOUT_Y,
     )
     y_buffer.store(out)
     gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        y_desc, [off_x_m, (pid_n * OUT_BLOCK_N).to(tl.int32)], y_buffer
     )
     gl.amd.gfx1250.tdm.async_wait(0)
 
@@ -761,6 +773,12 @@ def _moe_gemm_a8w4_prefill(
     off_w_n = pid_n * PACKED_BLOCK_N_W
     W += expt_id * stride_w_e
 
+    # TDM block pointer offsets must be int32; downcast from int64 when
+    # UPCAST_INDICES is active (the values are block-local and always small).
+    off_x_m = off_x_m.to(tl.int32)
+    off_w_n = off_w_n.to(tl.int32)
+    off_w_n_scale = off_w_n_scale.to(tl.int32)
+
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0]
     )
@@ -788,10 +806,16 @@ def _moe_gemm_a8w4_prefill(
             [[OUT_BLOCK_N, 8]], [BLOCK_M, OUT_BLOCK_N], [1, 0]
         )
 
+    # TDM descriptors require int32 shape/strides.  M and num_tokens are
+    # runtime Triton values (may be int64 when UPCAST_INDICES); strides and
+    # N/K are specialized Python ints and already fit int32.
+    M_i32 = M.to(tl.int32)
+    num_tokens_i32 = num_tokens.to(tl.int32)
+
     if GatherIndx is None:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X,
-            shape=(M, K),
+            shape=(M_i32, K),
             strides=(stride_x_m, stride_x_k),
             block_shape=(BLOCK_M, BLOCK_K),
             layout=SHARED_LAYOUT_X,
@@ -799,7 +823,7 @@ def _moe_gemm_a8w4_prefill(
     else:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=X,
-            shape=(num_tokens, K),
+            shape=(num_tokens_i32, K),
             strides=(stride_x_m, stride_x_k),
             block_shape=(BLOCK_M, BLOCK_K),
             layout=SHARED_LAYOUT_X,
@@ -830,7 +854,7 @@ def _moe_gemm_a8w4_prefill(
             XMxScale += start_m * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
-                shape=(M, tl.cdiv(K, MX_PACK_DIVISOR)),
+                shape=(M_i32, tl.cdiv(K, MX_PACK_DIVISOR)),
                 strides=(stride_x_mx_m, stride_x_mx_k),
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
@@ -838,7 +862,7 @@ def _moe_gemm_a8w4_prefill(
         else:
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
-                shape=(num_tokens, tl.cdiv(K, MX_PACK_DIVISOR)),
+                shape=(num_tokens_i32, tl.cdiv(K, MX_PACK_DIVISOR)),
                 strides=(stride_x_mx_m, stride_x_mx_k),
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
@@ -1051,7 +1075,7 @@ def _moe_gemm_a8w4_prefill(
         )
         gl.amd.gfx1250.tdm.async_load(
             bias_desc,
-            [0, pid_n * BLOCK_N],
+            [0, off_w_n],
             bias_buffer,
         )
         TDM_BIAS_WAIT: gl.constexpr = 1
@@ -1158,13 +1182,13 @@ def _moe_gemm_a8w4_prefill(
     )
     y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=Y,
-        shape=(M, yN),
+        shape=(M_i32, yN),
         strides=(stride_y_m, stride_y_n),
         block_shape=(BLOCK_M, OUT_BLOCK_N),
         layout=SHARED_LAYOUT_Y,
     )
     y_buffer.store(out)
     gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
+        y_desc, [off_x_m, (pid_n * OUT_BLOCK_N).to(tl.int32)], y_buffer
     )
     gl.amd.gfx1250.tdm.async_wait(0)

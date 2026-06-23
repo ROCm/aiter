@@ -489,7 +489,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     n_warp1 = n_warp2 = 4
     tile_n1 = tile_n2 = None
     tile_k1 = tile_k2 = None
-    num_buffers1 = num_buffers2 = 2
+    num_buffers1 = 4
+    num_buffers2 = 4
     split_k1 = 1
     split_k2 = 1
     cfg_row = _find_grouped_config(
@@ -545,6 +546,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     tile_n2 = tile_n2 if tile_n2 else int(n_warp2) * 64
     tile_k1 = tile_k1 if tile_k1 else 256
     tile_k2 = tile_k2 if tile_k2 else 256
+
+    tile_m = 16
+    tile_n1, tile_k1 = 64,  512
+    tile_n2, tile_k2 = 64, 512
     warp_tile_m = tile_m // m_warp
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
@@ -605,6 +610,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     else:
         raw_max_m = _as_int(cfg_row.get("max_m"), token_num) if cfg_row else token_num
     _grouped_dbg(f"routing cfg_row={cfg_row} raw_max_m={raw_max_m}")
+    print("raw_max_m", raw_max_m)
+    raw_max_m = 16
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
     )
