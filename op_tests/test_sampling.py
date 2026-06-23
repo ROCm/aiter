@@ -356,6 +356,243 @@ def test_top_k_top_p_statistical_distribution(batch_size, vocab_size, k, p):
             )
 
 
+# ---------------------------------------------------------------------------
+# Regression: HSA OOB caused by uninitialized `temp_storage.last_valid_id`.
+#
+# When every thread in a block fails the predicate `x > low` on the first
+# iteration of the kernel's do-while loop (e.g. an all-zero or all-NaN probs
+# row), `max_valid` from the BlockReduce is -1, so the guarded write
+# `temp_storage.last_valid_id = max_valid` is skipped.  The recovery path
+# `sampled_id = temp_storage.last_valid_id` then reads uninitialized shared
+# memory and the subsequent `probs[row_idx * d + sampled_id]` faults at a
+# page boundary.  Reproduced as a page-aligned `Memory access fault by GPU`
+# inside TopKTopPSamplingFromProbKernel on Qwen3.6-A3B-FP8 (vocab=248320).
+#
+# These tests must produce only in-range token ids (and not segfault) for
+# both kernels (TopP-only and joint TopK+TopP).
+# ---------------------------------------------------------------------------
+
+
+def _make_degenerate_probs(batch_size, vocab_size, mode):
+    """Build a probs tensor whose first row triggers the all-fail-predicate
+    path; remaining rows are valid normalized distributions.
+
+    "zero" / "nan" are the OOB-triggering rows: the predicate `x > low` is
+    satisfied by NO thread on the first iter (`0 > 0` / `NaN > 0` are both
+    false), so `max_valid` stays -1, the guarded write to `last_valid_id` is
+    skipped, and the unfixed kernel reads uninitialized smem -> OOB.
+    """
+    probs = torch.rand(batch_size, vocab_size, device="cuda")
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    if mode == "zero":
+        probs[0] = 0.0
+    elif mode == "nan":
+        probs[0] = float("nan")
+    else:
+        raise ValueError(mode)
+    return probs
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+# Include 248320 (Qwen3.6 — original crash) and 128256 (Llama-3) which both
+# satisfy vocab %% (BLOCK_THREADS * VEC_SIZE) != 0, where the last block has
+# fewer active threads and the bug surfaces most reliably.
+@pytest.mark.parametrize("vocab_size", [32000, 128256, 248320])
+@pytest.mark.parametrize("mode", ["zero", "nan"])
+def test_top_p_sampling_degenerate_row(batch_size, vocab_size, mode):
+    """Regression: TopPSamplingFromProbKernel must not OOB on degenerate rows."""
+    probs = _make_degenerate_probs(batch_size, vocab_size, mode)
+    p = 0.95
+    for _ in range(50):
+        samples = torch.ops.aiter.top_p_sampling_from_probs(
+            probs, None, *_to_tensor_scalar_tuple(p), deterministic=True
+        )
+        assert torch.all(samples >= 0) and torch.all(samples < vocab_size), (
+            f"OOB id from TopPSamplingFromProbKernel "
+            f"(mode={mode}, vocab={vocab_size}): {samples.tolist()}"
+        )
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("vocab_size", [32000, 128256, 248320])
+@pytest.mark.parametrize("mode", ["zero", "nan"])
+@pytest.mark.parametrize("k,p", [(20, 0.95), (1, 1.0), (50, 0.5)])
+def test_top_k_top_p_sampling_degenerate_row(batch_size, vocab_size, mode, k, p):
+    """Regression: TopKTopPSamplingFromProbKernel must not OOB on degenerate rows."""
+    probs = _make_degenerate_probs(batch_size, vocab_size, mode)
+    for _ in range(50):
+        samples = torch.ops.aiter.top_k_top_p_sampling_from_probs(
+            probs,
+            None,
+            *_to_tensor_scalar_tuple(k),
+            *_to_tensor_scalar_tuple(p),
+            deterministic=True,
+        )
+        assert torch.all(samples >= 0) and torch.all(samples < vocab_size), (
+            f"OOB id from TopKTopPSamplingFromProbKernel "
+            f"(mode={mode}, vocab={vocab_size}, k={k}, p={p}): {samples.tolist()}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# "top-k first" fast path (aiter port of flashinfer PR #3461).
+#
+# For a SCALAR top_k (maybe_top_k_arr=None) that is modest (<=256) over a large
+# vocab (>=65536), `top_k_top_p_sampling_from_probs` routes through a Python fast
+# path: parallel top-k -> renorm over the k survivors -> top-p over k elements
+# -> gather back to the global index. It must stay distribution-equivalent to
+# the fused full-vocab kernel.
+#
+# NOTE: the existing joint tests pass top_k as a TENSOR, which does NOT trigger
+# the fast path. These tests pass top_k as a Python int to exercise it.
+# ---------------------------------------------------------------------------
+
+
+def _joint_mask(normalized_prob, k, p, eps=1e-4):
+    """aiter joint semantics: top-k count mask AND top-p ORIGINAL-mass mask."""
+    batch_size, vocab_size = normalized_prob.shape
+    # top-p mask (cumulative over ORIGINAL probs, matches the fused kernel)
+    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask_top_p = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda")
+    mask_top_p.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
+    # top-k mask
+    sorted_prob_desc, _ = torch.sort(normalized_prob, descending=True)
+    pivot = sorted_prob_desc[:, k - 1]
+    mask_top_k = (normalized_prob >= pivot.unsqueeze(-1)).int()
+    return torch.minimum(mask_top_p, mask_top_k)
+
+
+# Real-world vocab sizes that exceed the fast-path threshold (>= 65536):
+#   128256 Llama-3 / Llama-3.1
+#   129280 DeepSeek-V3/R1
+#   151936 Qwen2.5 / Qwen3
+#   248320 Qwen3.6-A3B
+#   256000 Gemma-2/3
+_COMMON_VOCABS = [128256, 129280, 151936, 248320, 256000]
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("vocab_size", _COMMON_VOCABS)
+@pytest.mark.parametrize("k", [10, 50, 200])  # all <= 256 (fast path)
+@pytest.mark.parametrize("p", [0.5, 0.9])
+def test_top_k_top_p_fast_path_validity(batch_size, vocab_size, k, p):
+    """Every fast-path sample must lie inside the fused kernel's valid set.
+
+    The fast path is (by construction) never looser than the original mask, so
+    this is a strict containment check.
+    """
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    mask = _joint_mask(normalized_prob, k, p)
+
+    for _ in range(200):
+        # scalar k + scalar p -> triggers the fast path
+        samples = torch.ops.aiter.top_k_top_p_sampling_from_probs(
+            normalized_prob,
+            None,
+            None,  # maybe_top_k_arr -> scalar path
+            k,
+            None,  # maybe_top_p_arr -> scalar path
+            p,
+            deterministic=True,
+        )
+        assert torch.all(samples >= 0) and torch.all(samples < vocab_size)
+        assert torch.all(
+            mask[torch.arange(batch_size, device="cuda"), samples.long()] == 1
+        ), normalized_prob[torch.arange(batch_size, device="cuda"), samples.long()]
+
+
+@pytest.mark.parametrize("vocab_size", [131072])
+@pytest.mark.parametrize("k,p", [(50, 0.9), (10, 0.5)])
+def test_top_k_top_p_fast_path_distribution(vocab_size, k, p):
+    """Fast-path empirical distribution must match the theoretical (fused)
+    distribution: total-variation distance should be small (cf. flashinfer
+    TV ~ 0.007)."""
+    torch.manual_seed(7)
+    batch_size = 4
+    num_samples = 20000
+
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda")
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    expected = _compute_expected_distribution(probs.cpu(), k, p)  # original semantics
+
+    samples = []
+    for _ in range(num_samples):
+        s = torch.ops.aiter.top_k_top_p_sampling_from_probs(
+            probs, None, None, k, None, p, deterministic=True
+        )
+        samples.append(s)
+    observed_freq = _compute_frequencies(samples, vocab_size, batch_size).cpu()
+    observed = observed_freq / observed_freq.sum(dim=-1, keepdim=True)
+
+    for b in range(batch_size):
+        tv = 0.5 * (observed[b] - expected[b].cpu()).abs().sum().item()
+        if tv >= 0.05:
+            warnings.warn(
+                f"Fast-path distribution warning for batch {b}: TV distance "
+                f"{tv:.4f} >= 0.05 (cf. flashinfer ~0.007). This is a statistical "
+                f"test - occasional warnings are expected due to random chance. "
+                f"Consistent warnings across multiple runs indicate a real "
+                f"distribution bug. Test params: vocab_size={vocab_size}, "
+                f"k={k}, p={p}, num_samples={num_samples}.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+
+@pytest.mark.parametrize("vocab_size", [131072])
+@pytest.mark.parametrize("k,p", [(50, 0.9), (10, 0.5)])
+def test_top_k_top_p_fast_path_vs_core_equivalence(vocab_size, k, p):
+    """The scalar (fast) path and the tensor (fused core) path should produce
+    statistically equivalent samples on the same input."""
+    torch.manual_seed(123)
+    batch_size = 4
+    num_samples = 20000
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda")
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    top_k_tensor = torch.full((batch_size,), k, device="cuda")
+    top_p_tensor = torch.full((batch_size,), float(p), device="cuda")
+
+    fast, core = [], []
+    for _ in range(num_samples):
+        fast.append(
+            torch.ops.aiter.top_k_top_p_sampling_from_probs(
+                probs, None, None, k, None, p, deterministic=True
+            )
+        )
+        # tensor args -> NOT applicable -> fused core kernel
+        core.append(
+            torch.ops.aiter.top_k_top_p_sampling_from_probs(
+                probs,
+                None,
+                *_to_tensor_scalar_tuple(top_k_tensor),
+                *_to_tensor_scalar_tuple(top_p_tensor),
+                deterministic=True,
+            )
+        )
+    f_freq = _compute_frequencies(fast, vocab_size, batch_size).cpu()
+    c_freq = _compute_frequencies(core, vocab_size, batch_size).cpu()
+    f = f_freq / f_freq.sum(dim=-1, keepdim=True)
+    c = c_freq / c_freq.sum(dim=-1, keepdim=True)
+    for b in range(batch_size):
+        tv = 0.5 * (f[b] - c[b]).abs().sum().item()
+        if tv >= 0.05:
+            warnings.warn(
+                f"Fast-path vs core warning for batch {b}: TV distance {tv:.4f} "
+                f">= 0.05. This is a statistical test - occasional warnings are "
+                f"expected due to random chance. Consistent warnings across "
+                f"multiple runs indicate the fast path diverges from the fused "
+                f"kernel. Test params: vocab_size={vocab_size}, k={k}, p={p}, "
+                f"num_samples={num_samples}.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+
 if __name__ == "__main__":
     test_top_k_top_p_joint_sampling_from_probs(40, 129280, 0.6, 20)
     # test_top_k_top_p_statistical_distribution(10, 10000, 5, 0.3)
