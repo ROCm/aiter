@@ -17,6 +17,29 @@ Backward math/plan: `docs/2026-06-18_backward_bmm.md`.
 - `flydsl_venv`: torch **2.12.1+rocm7.2** (hip 7.2.53211). **Do not modify.**
 - Profiler: **rocprof-compute 3.4.0** (`rocprofiler-compute` apt pkg).
 
+## North Star shape (production target — fully specified)
+
+The optimization target is the production HSTU-class shape:
+
+| axis | value | kernel/driver knob | HSTU bench name |
+|---|--:|---|---|
+| groups (batch) | **B = 1024** | `n_groups` (`-b 1024`) | `B` |
+| dense feature dim | **D = 256** (`K = N = 256`) | `K`, `N` in `jagged_dense_bmm.py` | `D` (= `Kout`, square) |
+| max sequence length | **Mi = 7680** | `max_seq_len` (`-m 7680`) | `Mi` |
+
+`Mi = 7680` is fixed to match the **reference HSTU Triton forward benchmark default**
+(`op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py`, `-mi 7680`), so our
+backward numbers are directly comparable to that baseline's envelope.
+
+> **Caveat on existing results (append-only policy).** The EXP blocks dated
+> 2026-06-23b/c/d were collected **before** `Mi` was pinned, at the placeholder
+> **`max_seq_len = 512`** (see EXP-2026-06-23b). Their absolute µs/TFLOP/s therefore
+> reflect a much smaller, more launch-bound envelope than the now-canonical
+> `Mi = 7680`; the *relative* speedups (e.g. Phase 2's 4.60×) still hold, but the
+> headline numbers must be **re-measured at `Mi = 7680`** before being quoted as
+> the fully-specified North Star. Those blocks are left intact (numbers tagged
+> `Mi=512`) rather than overwritten; a fresh EXP block should capture `Mi = 7680`.
+
 ## Tooling (how to reproduce)
 
 Three helpers live next to the kernels:
@@ -217,7 +240,7 @@ D=512 uniform** — it scales up nicely with D and the GPU-filling B=1024.
 
 ---
 
-## EXP-2026-06-23c — Phase 1 cheap wins on `grad_dense_partials` (North Star B=1024, D=256)
+## EXP-2026-06-23c — Phase 1 cheap wins on `grad_dense_partials` (B=1024, D=256, Mi=512 — pre-spec North Star)
 
 **Scope.** Phase 1 (1a FMA fusion + 1b occupancy/register/LDS) on the dominant
 `grad_dense_partials` kernel, evaluated at the **production shape B=1024, D=256**
@@ -242,7 +265,7 @@ are from `rocprof-compute analyze` with **multiple `--path`** (raw counters), ke
 ### `grad_dense_partials` results (rocprof mean µs/call)
 | shape | T-1 | T(1a) | T(1b, final) | speedup | artifacts |
 |---|--:|--:|--:|--:|---|
-| **B=1024, D=256 (North Star)** | 5263.6 | 4537.0 | **3930.3** | **1.34×** | `phase1_t0/t1a/t1b_b1024_d256/`, `phase1_cmp_*` |
+| **B=1024, D=256, Mi=512** | 5263.6 | 4537.0 | **3930.3** | **1.34×** | `phase1_t0/t1a/t1b_b1024_d256/`, `phase1_cmp_*` |
 | B=64, D=128 (repo default) | 79.3 | — | **65.8** | **1.21×** | `bwd_full_all` vs `phase1_t1b_b64_d128/`, `phase1_cmp_d128_*` |
 
 Supporting counters @ D=256 (T-1 → T1b): VALU instrs 881M → **516M (−41%)**;
@@ -261,7 +284,7 @@ banked as a strict improvement (1.2–1.34×, and it pays down the D=512 LDS blo
 
 ---
 
-## EXP-2026-06-23d — Phase 2: MFMA-ize `grad_dense_partials` (North Star B=1024, D=256)
+## EXP-2026-06-23d — Phase 2: MFMA-ize `grad_dense_partials` (B=1024, D=256, Mi=512 — pre-spec North Star)
 
 **Scope.** Replace the scalar fp32 LDS-FMA reduction in `grad_dense_partials` with
 a **bf16 MFMA** transposed GEMM, keeping the fp32 accumulate + two-pass
@@ -286,8 +309,8 @@ tiling (128×128 per WG) keeps LDS at 32 KB and the accumulator fixed at any D.
 ### `grad_dense` results (bench wall-clock, partials+reduce; TF/s = 2·L·K·N / t)
 | shape | regime | T-1 (Phase-1b) | T (Phase-2 MFMA) | speedup |
 |---|---|--:|--:|--:|
-| **B=1024, D=256 (North Star)** | uniform | 4252.7 µs / 16.16 TF/s | **924.0 µs / 74.37 TF/s** | **4.60×** |
-| B=1024, D=256 | skew | 1780.6 µs / 5.87 TF/s | **686.8 µs / 15.23 TF/s** | **2.59×** |
+| **B=1024, D=256, Mi=512** | uniform | 4252.7 µs / 16.16 TF/s | **924.0 µs / 74.37 TF/s** | **4.60×** |
+| B=1024, D=256, Mi=512 | skew | 1780.6 µs / 5.87 TF/s | **686.8 µs / 15.23 TF/s** | **2.59×** |
 | B=64, D=128 (repo default) | uniform | 83.1 µs / 12.92 TF/s | 86.8 µs / 12.37 TF/s | ~1.0× (launch-bound) |
 
 (At B=64/D=128 the kernel is launch/occupancy-bound — only 256 WGs — so MFMA is
@@ -342,7 +365,11 @@ D=256). The kernel is now **HBM/issue-bound** and the **reduce pass is the new
 dominant tail**. The `block ≤ 256` col-tiling fix for `grad_bias`/`grad_dense_reduce`
 is in (no D=128/256 regression); with the 32 KB-fixed MFMA partials it removes the
 known D=512 blockers, but **D=512 end-to-end validation is deferred** per the D=256
-North-Star decision. Repo default restored to D=128. **Next: Phase 4** (fuse dBias
+North-Star decision. Repo default restored to D=128. **North Star now fully specified:
+B=1024, D=256, Mi=7680** (matching the reference HSTU bench default; see "North Star
+shape" section). All Phase-0…2 numbers above were collected at the pre-spec
+`Mi=512` — the **next EXP block should re-measure the Phase-2 kernel at Mi=7680**
+before quoting fully-specified North-Star figures. **Next: Phase 4** (fuse dBias
 into dDense partials + lighter reduce tail — now the biggest remaining share), then
 Phase 3 (`grad_jagged` occupancy). Optional: vectorize the partials transpose-staging
 g2s (currently scalar) to push toward the HBM roofline.
