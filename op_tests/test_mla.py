@@ -238,8 +238,14 @@ def test_mla(
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
         and ctx_lens <= 16384
     ):
-        us_aiter = test_normal_prefill()
-        ret["prefill:ck_192"] = us_aiter
+        try:
+            us_aiter = test_normal_prefill()
+            ret["prefill:ck_192"] = us_aiter
+        except ImportError as e:
+            # Prefill baseline (flash_attn_varlen_func) needs optional deps
+            # (e.g. flydsl) not present in every env; skip it without aborting
+            # the decode benchmark we actually care about.
+            aiter.logger.warning("skip prefill baseline (missing dep): %s", e)
 
     torch.cuda.empty_cache()
     # absorb init
@@ -537,8 +543,17 @@ def test_mla(
         from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
-        q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
+        # MTP (decode_qlen>1): q is [total_q=batch*qlen, nhead, qk]; reshape to
+        # 4-D [batch, qlen, nhead, dim] so the kernel runs its causal tail path.
+        if decode_qlen > 1:
+            q4 = q.view(batch_size, decode_qlen, nhead, qk_head_dim)
+            q_nope = q4[..., :v_head_dim]
+            q_pe = q4[..., v_head_dim:]
+            o_arg = out_gluon.view(batch_size, decode_qlen, nhead, v_head_dim)
+        else:
+            q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
+            q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
+            o_arg = out_gluon.view(batch_size, nhead, v_head_dim)
 
         kv_c = kv_buffer.view(-1, qk_head_dim)
         if name == "bh16bn128":
@@ -558,7 +573,7 @@ def test_mla(
             q_nope,
             q_pe,
             kv_c,
-            out_gluon.view(batch_size, nhead, v_head_dim),
+            o_arg,
             page_table,
             seq_info,
             sm_scale,
@@ -611,6 +626,9 @@ def test_mla(
     ret["decode:bytes"] = bytes
     ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
     ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
+    # Per-token throughput (Mtok/s) for the ASM baseline; same metric as gluon's
+    # below so MTP throughput can be compared directly. total_q = batch*qlen.
+    ret["decode:Mtok/s"] = total_q / us_asm_decode
 
     # Gluon MLA decode test
     # Example: -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
@@ -643,6 +661,10 @@ def test_mla(
             ret["decode:gluon_576"] = us_gluon_decode
             ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
             ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+        # Per-token throughput (Mtok/s): the MTP figure-of-merit. Implementation-
+        # agnostic (unlike TB/s, which under-counts v1's qlen KV re-reads, and
+        # TFLOPS, which over-counts via the decode_qlen factor). total_q = batch*qlen.
+        ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn128 decode test
     # Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
@@ -663,6 +685,10 @@ def test_mla(
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+        # Per-token throughput (Mtok/s): the MTP figure-of-merit. Implementation-
+        # agnostic (unlike TB/s, which under-counts v1's qlen KV re-reads, and
+        # TFLOPS, which over-counts via the decode_qlen factor). total_q = batch*qlen.
+        ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn64 decode test
     # Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 [-lse]
@@ -671,7 +697,7 @@ def test_mla(
         and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
         and nhead <= 16
-        and decode_qlen == 1
+        and 1 <= decode_qlen <= 17  # MTP: qlen>1 uses the causal tail path
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
@@ -683,6 +709,10 @@ def test_mla(
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+        # Per-token throughput (Mtok/s): the MTP figure-of-merit. Implementation-
+        # agnostic (unlike TB/s, which under-counts v1's qlen KV re-reads, and
+        # TFLOPS, which over-counts via the decode_qlen factor). total_q = batch*qlen.
+        ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     return ret
 
@@ -775,21 +805,18 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[
-        (4, 1),
-        (8, 1),
-        (12, 1),
-        (16, 1),
-        (16, 2),
-        (16, 4),
-        (32, 1),
-        (32, 2),
-        (32, 4),
-        (64, 1),
-        (128, 1),
-        (128, 2),
-        (128, 4),
-    ],
+    choices=(
+        [(nh, q) for nh in (4, 8, 12, 16) for q in range(1, 18)]
+        + [
+            (32, 1),
+            (32, 2),
+            (32, 4),
+            (64, 1),
+            (128, 1),
+            (128, 2),
+            (128, 4),
+        ]
+    ),
     nargs="*",
     const=None,
     default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
