@@ -24,6 +24,7 @@ Each work item = (head, q-pos-group, reduce-tile). A block of 128 threads (2 wav
 owns one (seq, head) output row; thread t owns ``VEC = Dv // 128`` contiguous floats.
 """
 
+import enum
 import functools
 import math
 
@@ -87,22 +88,26 @@ def _as_list(state, n):
 
 
 # Massive-path sub-tiers (mirror MlaReduceProblemSize, reduce.cu:121).
-#   simple : register online-softmax, num_splits in {2,3}
-#   m64    : <=64 splits, 1 LSE per lane in warp0
-#   m256   : <=256 splits, up to 4 LSE per lane in warp0
-#   mlds   : >256 splits, 4 in regs + overflow in LDS
-_TIER_NLSE = {"simple": 0, "m64": 1, "m256": 4, "mlds": None}
+class Tier(enum.Enum):
+    SIMPLE = "simple"  # register online-softmax, num_splits in {2,3}
+    M64 = "m64"  # <=64 splits, 1 LSE per lane in warp0
+    M256 = "m256"  # <=256 splits, up to 4 LSE per lane in warp0
+    MLDS = "mlds"  # >256 splits, 4 in regs + overflow in LDS
+
+
+# LSE registers per warp0 lane (None = LDS-backed overflow).
+_TIER_NLSE = {Tier.SIMPLE: 0, Tier.M64: 1, Tier.M256: 4, Tier.MLDS: None}
 LDS_MAX_SPLITS = 304  # >= MI300X CU count; compile-time LDS cap
 
 
-def select_tier(num_splits: int) -> str:
+def select_tier(num_splits: int) -> Tier:
     if num_splits < MASSIVE_THR:
-        return "simple"
+        return Tier.SIMPLE
     if num_splits <= 64:
-        return "m64"
+        return Tier.M64
     if num_splits <= 256:
-        return "m256"
-    return "mlds"
+        return Tier.M256
+    return Tier.MLDS
 
 
 @functools.lru_cache(maxsize=256)
@@ -111,7 +116,7 @@ def compile_mla_reduce(
     H: int,
     Dv: int,
     out_dtype: str = "bf16",
-    tier: str = "simple",
+    tier: Tier = Tier.SIMPLE,
     persistent: bool = False,
     output_lse: bool = False,
     use_reduce_final_map: bool = True,
@@ -129,8 +134,8 @@ def compile_mla_reduce(
     assert Dv % NUM_THREADS == 0, "Dv must be divisible by 128"
     assert tier in _TIER_NLSE, f"bad tier {tier}"
     VEC = Dv // NUM_THREADS
-    is_massive = tier != "simple"
-    if tier == "mlds":
+    is_massive = tier != Tier.SIMPLE
+    if tier == Tier.MLDS:
         NLSE = (LDS_MAX_SPLITS + WARP - 1) // WARP
     else:
         NLSE = _TIER_NLSE[tier]
@@ -143,11 +148,13 @@ def compile_mla_reduce(
     local_lse_off = 0
     if is_massive:
         allocator = SmemAllocator(
-            None, arch=GPU_ARCH, global_sym_name=f"mla_reduce_smem_{tier}_{Dv}_{H}"
+            None,
+            arch=GPU_ARCH,
+            global_sym_name=f"mla_reduce_smem_{tier.value}_{Dv}_{H}",
         )
         lse_scale_off = allocator._align(allocator.ptr, 16)
         allocator.ptr = lse_scale_off + LDS_MAX_SPLITS * 4
-        if tier == "mlds":
+        if tier == Tier.MLDS:
             local_lse_off = allocator._align(allocator.ptr, 16)
             overflow_slots = max(0, LDS_MAX_SPLITS - 256)
             allocator.ptr = local_lse_off + overflow_slots * 4
