@@ -188,9 +188,7 @@ def paged_attention_rocm(
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
     v_shuffle = value_cache.dim() == 5
 
-    key_scale = _normalize_hip_fp8_scale(
-        key_scale, key_cache, block_size, num_kv_heads
-    )
+    key_scale = _normalize_hip_fp8_scale(key_scale, key_cache, block_size, num_kv_heads)
     value_scale = _normalize_hip_fp8_scale(
         value_scale, key_cache, block_size, num_kv_heads
     )
