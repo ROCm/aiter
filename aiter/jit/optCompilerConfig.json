@@ -1519,6 +1519,25 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_mha_fwd_native_splitkv": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mha_fwd_native_splitkv_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/mha_fwd_native_splitkv.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk0_split.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk1_split.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_combine.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-mllvm -enable-post-misched=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/mha_native'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_fused_split_gdr_update": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_split_gdr_update_pybind.cu'",
