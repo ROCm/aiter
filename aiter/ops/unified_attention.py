@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 import os
 from typing import Optional
 
@@ -460,7 +461,30 @@ def _pick_num_splits(
     pow2_splits = 1
     while pow2_splits < raw_splits:
         pow2_splits <<= 1
-    return max(1, min(hard_cap, pow2_splits))
+    pow2_splits = max(1, min(hard_cap, pow2_splits))
+
+    # XCD load-balance floor (decode grid only). The WG dispatcher round-robins
+    # workgroups over the 8 XCDs by GLOBAL linear workgroup id % 8 (verified by
+    # per-XCD SQ_WAVES, decode_pipeline_research_plan.md §15). The decode grid
+    # launches N = num_kv_heads * num_splits * num_seqs workgroups in one
+    # contiguous id range, so the split across XCDs is perfectly even iff
+    # N % 8 == 0, otherwise the (N mod 8) lowest XCDs run one extra full-length
+    # block while the rest idle for a whole block-time at the tail. num_seqs
+    # (batch) is a runtime value we must not branch on (CUDA-graph-capture safe),
+    # so we force num_splits to a multiple of 8 / gcd(num_kv_heads, 8), which
+    # makes num_kv_heads * num_splits % 8 == 0 hence N % 8 == 0 for ANY batch.
+    # For num_kv_heads % 8 == 0 the factor is 1 (no-op): the decode head swizzle
+    # already pins XCD = head-in-group so every num_splits is balanced. 8/gcd is
+    # a power of two, so the floor keeps pow2_splits a power of two. The occupancy
+    # heuristic above already lands well above this floor for the measured shapes
+    # (per §15 the regressing decode shapes are balanced at their picked splits);
+    # the floor is a safety net for awkward num_kv_heads at low split counts.
+    avg_rows    = avg_q * num_qpkv
+    hdim        = query.shape[2]
+    decode_grid = (avg_rows <= 32) if hdim == 128 else (avg_rows <= 64) if hdim == 64 else False
+    if decode_grid:
+        pow2_splits = max(pow2_splits, 8 // math.gcd(num_kv_heads, 8))
+    return pow2_splits
 
 
 def _combine_splits(

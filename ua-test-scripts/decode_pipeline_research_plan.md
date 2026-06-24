@@ -637,3 +637,97 @@ Correctness PASS across split counts, dtypes (bf16/fp8), d64/d128, GQA-1/8, and 
 fixtures (empty-split masking) at forced 1024 splits. b=8 is unchanged by this work (128
 splits before and after) and remains a pre-existing CK main-kernel gap vs Triton at high
 batch — orthogonal to the combine.
+
+---
+
+## 15. IMPLEMENTED (2026-06-23): XCD-balanced decode grid swizzle + split floor (§6 realized, profiled)
+
+Implements the §6 swizzle and, crucially, the XCD **load-balance** half of it, then verifies
+both with a per-XCD rocprofv3 measurement. The MI355X (gfx950) has **8 XCDs**; the workgroup
+dispatcher round-robins blocks over them by **GLOBAL linear workgroup id % 8** (per-WG, mod 8).
+
+**Grid (`GridSizeDecode`, `unified_attention_kernel.hpp`).** Decode grid changed from
+`dim3(num_kv_heads, num_seqs, num_splits)` to the swizzled
+`dim3(g8, num_splits, num_head_groups * num_seqs)` with `kv_head = head_group*g8 + x`:
+- `num_kv_heads % 8 == 0` → `g8 = 8`, `num_head_groups = num_kv_heads/8`. Because `gridDim.x = 8`,
+  `XCD = (x + 8*(...)) % 8 = x`, i.e. **XCD == head-in-group**: every split & seq of a head lands
+  on that head's XCD. Balanced for any `num_splits`, and each XCD streams ONE head's KV in order
+  (the §6 L2 win). `num_splits` is the 2nd-fastest dim so a head's adjacent splits co-schedule.
+- otherwise → `g8 = num_kv_heads`, one group (head-in-x). `XCD = (x + nKV*y + nKV*nSplits*z) % 8`;
+  since `gcd(nKV,8)≠8` the splits spread a head across XCDs, and balance becomes a divisibility
+  condition (below).
+- A new `bool use_decode_grid` + `index_t num_head_groups` in `Kargs` disambiguate the layout
+  (the old `gridDim.y>1` test aliased the 2D grid once split moved to `y`).
+
+**The corrected balance invariant (this is the subtlety).** The grid is one contiguous
+`N = num_kv_heads * num_splits * num_seqs` workgroup-id range, dispatched `id % 8`. So each XCD
+gets `floor(N/8)` or `ceil(N/8)` blocks; balance is perfect **iff `N % 8 == 0`** — it is a
+property of the **total** grid, NOT of the per-sequence `nKV*num_splits` plane (an earlier draft
+of the comments got this wrong). `num_seqs` (batch) is a runtime, CUDA-graph-capture-unsafe
+value, so `_pick_num_splits` makes the batch-independent factor divisible: **`num_splits` a
+multiple of `8 / gcd(num_kv_heads, 8)`** ⇒ `nKV*num_splits ≡ 0 (mod 8)` ⇒ `N ≡ 0` for *any*
+batch. For `nKV % 8 == 0` the factor is 1 (the head swizzle already balances).
+
+**Measurement method (per-XCD, the deliverable).** rocprofv3 1.1.0 `--pmc` sums a counter over
+all hardware instances, hiding per-XCD spread. The `DIMENSION_XCC[0:7]` dimension is exposed
+though, so we define 16 **custom derived counters** in a `counter_defs.yaml` pointed to by
+`ROCPROFILER_METRICS_PATH` (`ua-test-scripts/analysis/xcd_metrics/`), e.g.
+`SQ_BUSY_XCC3 = reduce(select(SQ_BUSY_CYCLES,[DIMENSION_XCC=[3]]),sum)` (sum the 4 SEs of XCC3)
+and the same for `SQ_WAVES`. A torch-free driver (`xcd_probe_driver.py`) calls the production
+`unified_attention_fwd` in a loop (the standalone `ua_trace` hand-rolls a now-stale grid, so it
+is NOT used); parsed by `xcd_parse.py`. `SQ_WAVES`/XCD = workgroups dispatched to that XCD;
+`SQ_BUSY_CYCLES`/XCD = wall cycles that XCD had ≥1 active wave (its busy/idle tail).
+
+**Results (MI355X, fp8 d128 sk=75600, b=4; waves & busy are per-XCD):**
+
+| config | grid `N` | min..max waves/XCD | busy max/min | busy CV | verdict |
+|---|---|---|---|---|---|
+| GQA-8 swizzle, splits=32 | 1024 | 128..128 | 1.006× | 0.2% | **balanced** |
+| GQA-5 floor OFF, **splits=1** | **20** | **2..3** | **1.50×** | **20%** | **IMBALANCED (control)** |
+
+The `splits=1` control is the smoking gun: `N=20`, so X0–X3 get 3 blocks and X4–X7 get 2.
+Per-XCD busy = **22.1M cyc (X0–3) vs 14.7M cyc (X4–7)** — the four lagging XCDs grind a 3rd
+full-context block while the other four **idle ~33% of the kernel**; the busiest XCD runs **50%
+longer** than the least-loaded. That is exactly the "someone idling while others finish their
+workgroups" failure, and it confirms (a) the per-XCD counter genuinely detects imbalance and
+(b) the floor does real work whenever batch isn't itself a multiple of 8. With the floor / swizzle
+on, every shipped config is flat to ≤1% busy spread.
+
+**Is `num_cus*4 = 1024` CTAs the optimum, IF balanced? (2026-06-24 follow-up)** A first-cut
+rewrite of `_pick_num_splits` (a fixed 4-wave / 1024-CTA target on the *exact* `nKV*num_seqs`
+base) **regressed GQA-5 decode** vs origin while GQA-8 was unchanged. Hypothesis under test: the
+regressing GQA-5 picks were secretly *imbalanced*, and origin's higher split count was winning
+only because it accidentally restored balance. Direct per-XCD profiling **refutes** that — every
+GQA-5 b=4 split count is perfectly XCD-balanced, yet the *balanced* timing is non-monotonic and
+optimal far above 1024 CTAs:
+
+| GQA-5 b=4 | splits | CTAs (`5·4·s`) | waves/CU | waves/XCD | busy CV | per-XCD busy avg | e2e |
+|---|---|---|---|---|---|---|---|
+| | 32 | 640 | 2.5 | 80..80 | 0.2% | 1,046,554 | 0.123 ms |
+| (rewrite pick) | 64 | 1280 | 5.0 | 160..160 | 0.4% | 1,106,787 | 0.128 ms |
+| **(origin pick)** | **128** | **2560** | **10.0** | **320..320** | **0.3%** | **921,145** | **0.108 ms** |
+
+All three are flat across XCDs (`SQ_WAVES` exactly equal), so balance is **not** the differentiator;
+the per-XCD busy-cycle average tracks e2e, and the fastest config is the deepest (10 waves), not
+1024 CTAs. Contrast GQA-8 b=4 (`qpkv=8`), which *does* sit on 1024 CTAs / 4 waves and is optimal.
+The difference is CTA **thickness**: a GQA-8 CTA issues 8 query rows of MFMA per KV-tile load
+(compute fills the 4 SIMDs at 4 waves), whereas a GQA-5 CTA issues 1 row and is HBM-latency-bound
+on a long serial K-traversal — it needs a deeper in-flight queue (~10 waves) to hide that latency.
+**So `1024 = num_cus*4` is the balanced optimum only for compute-dense (high-`qpkv`) CTAs; thin
+`qpkv=1` CTAs want more splits.** Balance is necessary but not sufficient; depth is a second,
+`qpkv`-dependent axis.
+
+**Decision.** Because the regression was a split-*count* (depth) effect and not a balance failure,
+the swizzle grid + balance floor are kept, but `_pick_num_splits` is **left as origin's adaptive
+2/4-wave, `q_tiles`-based selector** (which already gives thin GQA CTAs the deep queue they want).
+The floor (`num_splits` a multiple of `8/gcd(nKV,8)`, decode grid only) is a no-op for every
+measured shape — GQA-5 b=4→128, b=64→32, GQA-8→32/2 all already clear it — and exists purely to
+guarantee XCD-evenness for awkward `nKV` at low split counts. Re-validated after the revert: GQA-5
+decode b=4 back to **128 splits / 0.1108 ms** (was 0.128 ms under the rewrite), GQA-8 decode b=4
+**32 splits / 1.03× Triton**; no regression vs origin (the b=64 picks are byte-identical to origin).
+
+**Net.** Balance is correct and verified end-to-end (≤1% busy spread on every shipped config).
+The split-count selector is origin's; the XCD work is purely additive (grid swizzle for L2 locality
++ a balance-floor safety net), with zero perf regression vs origin.
+
+Artifacts: `ua-test-scripts/analysis/{xcd_metrics/counter_defs.yaml, xcd_probe_driver.py, xcd_parse.py}`.
