@@ -1827,7 +1827,16 @@ struct gmem {
         else if constexpr (sizeof(vector_type<vec>) == 2)  { __builtin_amdgcn_raw_buffer_store_b16 (__builtin_bit_cast(i16_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 4)  { __builtin_amdgcn_raw_buffer_store_b32 (__builtin_bit_cast(i32_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(i32x2_t, x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 16) { __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux); }
+        else if constexpr (sizeof(vector_type<vec>) == 16) {
+#if defined(__gfx1250__) && (__clang_major__ <= 22)
+            // clang<=22 (HIP<=7.2) miscompiles bounded b128 store under high C-store reg expansion (large gfx1250 clusterlaunch tiles, e.g. 128x128): sinks the uniform voffset part into the buffer BASE via readfirstlane, corrupting high address bits and bypassing the num_records bound -> OOB fault. Inline-asm barrier keeps voffset opaque so the full offset stays in the bounds-checked VGPR. Fixed in clang-23/HIP 7.14, where this branch compiles out.
+            int vo_ = v_os;
+            asm volatile("" : "+v"(vo_));
+            __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, vo_, s_os, aux);
+#else
+            __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux);
+#endif
+        }
     }
 
     // CAS-loop fallback: emulate a packed fp16/bf16 atomic-add on the 32-bit word at (vo,s_os) when the arch lacks native pk_add -- read the word, add in fp32, write back via cmpswap, retry until the compare succeeds. add_pk is the increment as an fp32x2 (lo,hi lanes).

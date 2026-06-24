@@ -19,10 +19,11 @@
 // Tiles whose per-TDM direct-copy request count (rows*B_K*2/256) hits the 256
 // SIMD-pair limit on some operand are NOT generated (e.g. 32x256x128) so the
 // heuristic must not return them. All returned kids are no-cluster prefetch-3.
-//   tileN (B_M=16): 20000=16x32, 20024=16x64, 20032=16x128
-//   tileM (B_M=32): 20040=32x32, 20048=32x64, 20056=32x128
-// MUST stay in sync with opus_gemm_common.py :: gfx1250_kernels_list and
-// GFX1250_BASE_KIDS (regenerated; kid numbers are NOT contiguous).
+//   tileN (B_M=16): 20000=16x32, 20003=16x64, 20004=16x128
+//   tileM (B_M=32): 20005=32x32, 20006=32x64, 20007=32x128
+// (One P=3 kid per tile in the contiguous plain band [20000,20100).)
+// MUST stay in sync with opus_gemm_common.py :: gfx1250_kernels_list (the plain
+// kids are assigned contiguously from 20000 in _GFX1250_CTDM_TILES order).
 inline int opus_a16w16_heuristic_kid_gfx1250(int M, int N, int K, bool has_bias)
 {
     (void)K;
@@ -33,15 +34,15 @@ inline int opus_a16w16_heuristic_kid_gfx1250(int M, int N, int K, bool has_bias)
     // fall through to the B_M=16 tileN family for N % 256 == 0.)
     if (M % 32 == 0)
     {
-        if (N % 128 == 0) return 20056;  // 32x128x128
-        if (N % 64 == 0)  return 20048;  // 32x64x128
-        if (N % 32 == 0)  return 20040;  // 32x32x128
+        if (N % 128 == 0) return 20007;  // 32x128x128
+        if (N % 64 == 0)  return 20006;  // 32x64x128
+        if (N % 32 == 0)  return 20005;  // 32x32x128
     }
 
     // Small M (or N not tileM-friendly) -> tileN family (B_M=16). Ragged M/N is
     // handled by the TDM row/col clamp + padded workspace, so the smallest
     // 16x32 tile is always a valid fallback.
-    if (N % 128 == 0) return 20032;  // 16x128x128
-    if (N % 64 == 0)  return 20024;  // 16x64x128
+    if (N % 128 == 0) return 20004;  // 16x128x128
+    if (N % 64 == 0)  return 20003;  // 16x64x128
     return 20000;                    // 16x32x128
 }

@@ -23,22 +23,29 @@ PIPELINE_HEADER_MAP = {
     "a16w16_cluster_tdm_splitk_ws": (
         "gfx1250/opus_gemm_pipeline_a16w16_cluster_tdm_splitk_ws_gfx1250.cuh"
     ),
+    "a16w16_clusterlaunch_tdm_splitk_ws": (
+        "gfx1250/opus_gemm_pipeline_a16w16_clusterlaunch_tdm_splitk_ws_gfx1250.cuh"
+    ),
 }
 
 TRAITS_HEADER_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
+    "a16w16_clusterlaunch_tdm_splitk_ws": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
 }
 
 KERNEL_FUNC_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250",
+    "a16w16_clusterlaunch_tdm_splitk_ws": "gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250",
 }
 
 TRAITS_NAME_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "opus_cluster_tdm_splitk_ws_traits_gfx1250",
+    "a16w16_clusterlaunch_tdm_splitk_ws": "opus_cluster_tdm_splitk_ws_traits_gfx1250",
 }
 
 KARGS_NAME_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "opus_gemm_cluster_tdm_ws_kargs_gfx1250",
+    "a16w16_clusterlaunch_tdm_splitk_ws": "opus_gemm_cluster_tdm_ws_kargs_gfx1250",
 }
 
 
@@ -102,6 +109,51 @@ def gen_cluster_tdm_splitk_ws_instance(
     has_oob_str = "true" if k.has_oob else "false"
     enable_bias_str = "true" if getattr(k, "enable_bias", False) else "false"
 
+    # CLUSTER-LAUNCH variant: __cluster_dims__(CWM, CWN, 1) multicast TDM. The
+    # plain (no-cluster) variant leaves these empty so it is unchanged.
+    is_clusterlaunch = k.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_ws"
+    cwm = getattr(k, "cluster_wg_m", 4)
+    cwn = getattr(k, "cluster_wg_n", 4)
+    # Extra traits template args (CLUSTER_WG_M, CLUSTER_WG_N) appended only for the
+    # clusterlaunch tag; the plain base keeps the 11-arg form (defaults apply).
+    cluster_traits_args = f",\n    {cwm}, {cwn}" if is_clusterlaunch else ""
+    # __cluster_dims__ attribute on the host-side forward-decl stub so the <<<>>>
+    # launch sets the cluster geometry (must match the kernel definition).
+    cluster_dims_attr = (
+        f"__cluster_dims__({cwm}, {cwn}, 1)\n" if is_clusterlaunch else ""
+    )
+    # Host-pass expansion of __cluster_dims__: the kernel DEFINITION (device TU)
+    # gets the cluster_dims attribute via the gfx1250-gated hip_minimal macro, but
+    # the fused HOST TU (where the <<<>>> launch lives) includes <hip/hip_runtime.h>
+    # (not hip_minimal), so the macro is not in scope there and the launch site
+    # would NOT carry the cluster geometry -> WG cluster never forms -> TDM
+    # multicast degrades to per-load timeout (correct but ~5x slow). Define it
+    # here for the host pass so the forward-decl's attribute actually expands and
+    # the launch applies the cluster dims (matches the single-file standalone).
+    cluster_dims_host_def = (
+        "#ifndef __cluster_dims__\n"
+        "#define __cluster_dims__(...) __attribute__((cluster_dims(__VA_ARGS__)))\n"
+        "#endif\n"
+        if is_clusterlaunch
+        else ""
+    )
+    # Strict cluster-fill check emitted before the grid launch (the multicast mask
+    # names every WG of the cluster -> the grid must fill it exactly).
+    cluster_fill_check = ""
+    if is_clusterlaunch:
+        cluster_fill_check = (
+            f"    // CLUSTER-LAUNCH: the multicast mask names EVERY WG of the "
+            f"{cwm}x{cwn} cluster,\n"
+            f"    // so ceil(M/B_M) and ceil(N/B_N) MUST be multiples of the "
+            f"cluster dims\n"
+            f"    // (no OOB tail WG, else the multicast + cluster barrier stalls).\n"
+            f"    AITER_CHECK(num_tiles_m % {cwm} == 0 && num_tiles_n % {cwn} == 0,\n"
+            f'        "gfx1250 clusterlaunch kid {cwm}x{cwn}: ceil(M/B_M)=", '
+            f"num_tiles_m,\n"
+            f'        " and ceil(N/B_N)=", num_tiles_n,\n'
+            f'        " must both fill the cluster (divisible by {cwm}/{cwn})");\n'
+        )
+
     # gfx1250-specific bias validation (does NOT use the shared BIAS_HOST_VALIDATE,
     # which forces bias.dtype == Y.dtype). The main kernel always writes an fp32
     # workspace and the reduce kernel folds bias in fp32 before the final cast to
@@ -149,7 +201,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     {layout_int},
     {da}, {db}, D_C, fp32_t,
     {enable_bias_str},
-    {num_slots}, {wg_per_cu}>;
+    {num_slots}, {wg_per_cu}{cluster_traits_args}>;
 """
 
     INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
@@ -162,11 +214,12 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 #endif
 #ifdef OPUS_FUSED_HOST_TU
 #include "{traits_header}"
-// Forward declaration for the host-side <<<>>> launch stub. Must match the
-// kernel's __launch_bounds__.
+{cluster_dims_host_def}// Forward declaration for the host-side <<<>>> launch stub. Must match the
+// kernel's __launch_bounds__ (and __cluster_dims__ for the clusterlaunch tag, so
+// the <<<>>> launch sets the cluster geometry).
 template<typename Traits>
 __global__ __launch_bounds__(128, 1)
-void {kernel_func}({kargs_name} kargs);
+{cluster_dims_attr}void {kernel_func}({kargs_name} kargs);
 #else
 #include "{pipeline_header}"
 #endif
@@ -234,6 +287,8 @@ void
     int padded_N    = num_tiles_n * {k.B_N};
 
     extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
+    extern const opus_splitk_ws_handle* opus_splitk_ws_device_handle(hipStream_t, bool);
+    extern void opus_splitk_ws_sync_to_device(hipStream_t);
     auto stream = aiter::getCurrentHIPStream();
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
     HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
@@ -258,9 +313,19 @@ void
         }}}}
         ws_handle_->ptr = new_ptr;
         ws_handle_->bytes = grow_bytes;
+        // Mirror the new buffer pointer into the device-resident handle that the
+        // kernels dereference (grow is eager-only; safe synchronous H2D copy).
+        opus_splitk_ws_sync_to_device(stream);
     }}}}
 
-    dim3 grid_main(num_tiles_m, num_tiles_n, split_k);
+    // The kernels read the handle on-device: use the hipMalloc'd device mirror
+    // (L2-cached) rather than the host shadow (per-workgroup PCIe coherent read,
+    // ~5x slower). Address is stable, so a captured HIP graph stays valid across
+    // a post-capture grow (which only updates the mirror's contents in place).
+    const opus_splitk_ws_handle* ws_dev_ =
+        opus_splitk_ws_device_handle(stream, /*allow_create=*/!capturing);
+
+{cluster_fill_check}    dim3 grid_main(num_tiles_m, num_tiles_n, split_k);
     dim3 block_main({k.BLOCK_SIZE});
 
     constexpr int REDUCE_VEC = 16;
@@ -276,7 +341,7 @@ void
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a     = XQ.data_ptr();
     kargs.ptr_b     = WQ.data_ptr();
-    kargs.ws_handle = ws_handle_;
+    kargs.ws_handle = ws_dev_;
     kargs.ptr_c     = Y.data_ptr();
     kargs.ptr_bias  = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = 1; kargs.split_k = split_k;
@@ -299,29 +364,29 @@ void
             // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
             splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                    ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                     reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else if (ptr_bias_) {{{{
             splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                    ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                     reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
             splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
+                    ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
     }}}} else {{{{
         float* y_ptr = reinterpret_cast<float*>(Y.data_ptr());
         if (ptr_bias_) {{{{
             splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
+                    ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                     reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
             splitk_reduce_kernel_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    ws_handle_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
+                    ws_dev_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
     }}}}
 }}}}
@@ -355,4 +420,9 @@ void
 # ---------- Self-register at import time ----------
 register_emit(
     "gfx1250", "a16w16_cluster_tdm_splitk_ws", gen_cluster_tdm_splitk_ws_instance
+)
+# CLUSTER-LAUNCH variant shares the same emit (it branches on k.kernel_tag to add
+# __cluster_dims__, the cluster-fill check, and the CLUSTER_WG_M/N traits args).
+register_emit(
+    "gfx1250", "a16w16_clusterlaunch_tdm_splitk_ws", gen_cluster_tdm_splitk_ws_instance
 )

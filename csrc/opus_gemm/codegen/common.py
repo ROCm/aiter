@@ -38,6 +38,8 @@ _A16W16_TAGS = (
     "a16w16_mono_tile",
     # gfx1250 cluster/TDM split-K (fp32 workspace + reduce kernel).
     "a16w16_cluster_tdm_splitk_ws",
+    # gfx1250 CLUSTER-LAUNCH (multicast) TDM split-K (fp32 workspace + reduce).
+    "a16w16_clusterlaunch_tdm_splitk_ws",
 ) + _GFX942_A16W16_TAGS
 
 EMIT_REGISTRY = {}

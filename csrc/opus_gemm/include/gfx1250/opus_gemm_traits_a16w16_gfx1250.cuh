@@ -90,7 +90,9 @@ template<int BLOCK_SIZE_,
          typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
          bool ENABLE_BIAS_ = false,
          int NUM_SLOTS_ = 3,
-         int WG_PER_CU_ = 2>
+         int WG_PER_CU_ = 2,
+         int CLUSTER_WG_M_ = 4,    // cluster-launch variant: WGs per cluster in M
+         int CLUSTER_WG_N_ = 4>    //                         WGs per cluster in N
 struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;   // 128 (4 waves x 32)
     static constexpr int B_M = B_M_;
@@ -200,6 +202,21 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     // on the 320 KB/CU budget), avoiding fragile occupancy attributes.
     static constexpr int kWgPerCu = WG_PER_CU_;
     static_assert(kWgPerCu == 1 || kWgPerCu == 2, "kWgPerCu must be 1 or 2");
+
+    // Cluster-launch variant geometry: a kClusterWgM x kClusterWgN grid of WGs
+    // per cluster (used by the clusterlaunch pipeline's __cluster_dims__ +
+    // CLUSTER_LOAD_ASYNC multicast). Ignored by the plain-grid pipeline.
+    static constexpr int kClusterWgM = CLUSTER_WG_M_;
+    static constexpr int kClusterWgN = CLUSTER_WG_N_;
+    // TDM multicast fans out to AT MOST 5 WGs per group: A is shared by the
+    // kClusterWgN WGs of a column, B by the kClusterWgM WGs of a row, so neither
+    // cluster dim may exceed 5. The total cluster WG count is also capped at 16
+    // (the 16-bit per-cluster workgroup_mask).
+    static_assert(kClusterWgM >= 1 && kClusterWgN >= 1 &&
+                  kClusterWgM <= 5 && kClusterWgN <= 5 &&
+                  kClusterWgM * kClusterWgN <= 16,
+                  "cluster dims must be 1..5 per side (TDM multicast <= 5 WGs) "
+                  "and kClusterWgM*kClusterWgN <= 16 (16-bit workgroup_mask)");
     static constexpr int kSlotBytesA = kSlotElemsA * (int)sizeof(DataA);
     static constexpr int kSlotBytesB = kSlotElemsB * (int)sizeof(DataB);
 

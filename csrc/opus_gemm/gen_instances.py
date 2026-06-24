@@ -149,6 +149,7 @@ NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
 SPLITK_TAGS = {
     "a16w16_flatmm_splitk",
     "a16w16_cluster_tdm_splitk_ws",
+    "a16w16_clusterlaunch_tdm_splitk_ws",
     *_SPLITK,
 }
 

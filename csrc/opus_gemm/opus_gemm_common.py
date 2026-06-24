@@ -79,6 +79,12 @@ class OpusGemmInstance:
     # two WGs never oversubscribe a SIMD-pair's 256-request direct-copy budget.
     wg_per_cu: int = 2
 
+    # gfx1250 clusterlaunch (multicast) cluster geometry: WGs per cluster in M/N
+    # (__cluster_dims__(cluster_wg_m, cluster_wg_n, 1)). Only consumed by the
+    # a16w16_clusterlaunch_tdm_splitk_ws tag; ignored by every other pipeline.
+    cluster_wg_m: int = 4
+    cluster_wg_n: int = 4
+
     @property
     def name(self) -> str:
         parts = [
@@ -112,6 +118,14 @@ class OpusGemmInstance:
             parts.insert(tag_at, "splitk_cluster_tdm_ws")
             # Prefetch depth P and WG/CU occupancy make each (tile, P, wg) symbol
             # unique (the producer + LDS-pad differ by these).
+            parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
+        elif self.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_ws":
+            # gfx1250 CLUSTER-LAUNCH (multicast) split-K. Same "splitk_" segment so
+            # the reduce-TU arch detection (keys on "opus_gemm_<arch>_splitk_")
+            # buckets it like the other gfx1250 splitk kids. The cluster geometry
+            # cCWMxCWN plus pPwW keep each (tile, cluster, P, wg) symbol unique.
+            parts.insert(tag_at, "splitk_clusterlaunch_tdm_ws")
+            parts.append(f"c{self.cluster_wg_m}x{self.cluster_wg_n}")
             parts.append(f"p{self.num_slots}w{self.wg_per_cu}")
         elif self.name_tag:
             parts.insert(tag_at, self.name_tag)
@@ -812,6 +826,10 @@ def _ctdm_pick_configs(bm, bn, bk):
 # per-TDM request count hits the 256 direct-copy limit on some operand (e.g.
 # 32x256x128, 32x128x256) yield no config and are dropped automatically.
 _GFX1250_CTDM_TILES = [
+    # -- ORIGINAL 11 tiles: KEEP THIS ORDER (indices 0..10) -- the C++ heuristic
+    #    opus_a16w16_heuristic_kid_gfx1250() hardcodes kids 20000/20024/20032
+    #    (16x32/64/128, idx 0/3/4) and 20040/20048/20056 (32x32/64/128, idx
+    #    5/6/7), and tuned CSVs reference these numbers. Do NOT reorder/insert.
     # tileN family (B_M=16)
     (16, 32, 128, "tileN"),
     (16, 32, 256, "tileN"),
@@ -825,40 +843,158 @@ _GFX1250_CTDM_TILES = [
     (32, 64, 256, "tileM"),
     (64, 16, 128, "tileM"),
     (64, 64, 128, "tileM"),
+    # -- APPENDED (idx 11+): the remaining no-spill tiles from the offline
+    #    LDS/VGPR sweep, so the plain (no-cluster) pipeline covers the same tile
+    #    set as the clusterlaunch sweep. Layout: B_M==16 -> tileN else tileM.
+    #    _ctdm_pick_configs() still drops any tile whose per-TDM direct-copy
+    #    request hits the 256-request limit (those deadlock the no-cluster TDM
+    #    engine -- they remain available only via the multicast clusterlaunch
+    #    variant). New kids are 20088+ (idx*8), clear of the clusterlaunch band.
+    (16, 64, 256, "tileN"),
+    (16, 128, 256, "tileN"),
+    (16, 256, 128, "tileN"),
+    (32, 32, 256, "tileM"),
+    (32, 128, 256, "tileM"),
+    (32, 256, 128, "tileM"),
+    (64, 32, 128, "tileM"),
+    (64, 32, 256, "tileM"),
+    (64, 64, 256, "tileM"),
+    (64, 128, 128, "tileM"),
+    (64, 128, 256, "tileM"),
+    (64, 256, 128, "tileM"),
+    (128, 32, 128, "tileM"),
+    (128, 32, 256, "tileM"),
+    (128, 64, 128, "tileM"),
+    (128, 64, 256, "tileM"),
+    (128, 128, 128, "tileM"),
 ]
 
-# Deterministic kid numbering: base 20000 + tile_index*8 + config_index. Each
-# tile contributes up to 2 configs (P=3, P=2). Stride 8 keeps room.
+# Kid numbering (clean, contiguous; heuristic / tuned-CSV back-compat dropped):
+#   plain (no-cluster) kids occupy [20000, 20100), ONE P=3 kid per tile (P=2 is
+#   dropped -- unvalidated). Tiles the picker rejects (>=256-request TDM
+#   direct-copy, now FIXED) fall back to P=3, 1 WG/CU so every no-spill tile still
+#   emits a plain kid (LDS(P=3) <= 320 KB for this set). The C++ heuristic
+#   constants in opus_gemm_heuristic_dispatch_gfx1250.cuh are regenerated to match.
+#
+# The consumer kExpN stability guard (previously _GFX1250_MAX_KEXPN=8) is removed.
 gfx1250_kernels_list = {}
+GFX1250_PLAIN_KID_OF = {}   # (B_M,B_N,B_K) -> kid (P=3; for tuner + heuristic regen)
 _GFX1250_KID_BASE = 20000
-_GFX1250_KID_STRIDE = 8
-# Stability gate on the consumer N-register-expansion kExpN = B_N/(16*kTileN).
-# Two compounding hazards on high-expansion tiles, both now fixed in the consumer:
-#  (1) WMMA-source WAR (MI400 SPG 4.6.12.1): v_wmma_*_16x16x32_bf16 reads its
-#      Matrix A/B over 16 passes; an instruction overwriting those source VGPRs
-#      within ~8 co-exec slots corrupts. The compiler only inserts the required
-#      gap for VALU/XDL writers, NOT for ds_load (VMEM) writers, so a next-round
-#      ds_load overwriting the source silently raced.
-#  (2) DScnt overflow: a 2-round-overlap prefetch keeps 2 rounds of ds in flight
-#      (up to 72 > the 6-bit DScnt limit of 63 for kExpN=8).
-# Fix: round-granular ping-pong prefetch -- load round i+1 into the OTHER buffer
-# BEFORE round i's WMMA (distinct VGPRs => no WAR), but DRAIN each round's ds
-# immediately (<=1 round = <=36 in flight => no DScnt overflow). Stress-verified
-# 8/8 at the hardest config (splitK=4,K=2880) for kExpN up to 8 (32x128 incl.).
-# Guard kept as a safety valve; current tiles top out at kExpN=8.
-_GFX1250_MAX_KEXPN = 8
-for _ti, (_bm, _bn, _bk, _layout) in enumerate(_GFX1250_CTDM_TILES):
-    _ktile_n = 1 if _layout == "tileM" else 2
-    _kexp_n = _bn // (16 * _ktile_n)
-    if _kexp_n > _GFX1250_MAX_KEXPN:
-        continue  # unstable high-expansion tile: skip (kids disabled)
-    for _ci, (_P, _wg) in enumerate(_ctdm_pick_configs(_bm, _bn, _bk)):
-        _kid = _GFX1250_KID_BASE + _ti * _GFX1250_KID_STRIDE + _ci
-        gfx1250_kernels_list[_kid] = _a16w16_cluster_tdm_splitk_ws_gfx1250(
+_p_kid = _GFX1250_KID_BASE
+for _bm, _bn, _bk, _layout in _GFX1250_CTDM_TILES:
+    # P=3 only (P=2 kids removed -- not validated); fall back to (P=3, 1 WG/CU)
+    # for the high-request tiles the picker drops.
+    _cfgs = [c for c in _ctdm_pick_configs(_bm, _bn, _bk) if c[0] == 3] or [(3, 1)]
+    for _P, _wg in _cfgs:
+        gfx1250_kernels_list[_p_kid] = _a16w16_cluster_tdm_splitk_ws_gfx1250(
             _bm, _bn, _bk, _layout, num_slots=_P, wg_per_cu=_wg
         )
+        GFX1250_PLAIN_KID_OF[(_bm, _bn, _bk)] = _p_kid
+        _p_kid += 1
+assert _p_kid <= 20100, f"plain gfx1250 kids overflow the [20000,20100) band: {_p_kid}"
 
 GFX1250_BASE_KIDS = frozenset(gfx1250_kernels_list.keys())
+
+
+# -- gfx1250 CLUSTER-LAUNCH (multicast) variant ------------------------------
+# Same 4-wave TDM split-K + fp32 workspace + reduce kernel, but launched as a
+# (cluster_wg_m x cluster_wg_n x 1) workgroup CLUSTER: peers co-reside and share
+# A/B TDM loads via CLUSTER_LOAD_ASYNC multicast (named-barrier producer/consumer
+# handshake, same as the plain base). The host launcher rounds the grid up to the
+# cluster dims and asserts an exact cluster fill (no OOB tail WG). Distinct kid
+# band (20500+) so it never collides with the no-cluster base kids (20000..20087).
+def _a16w16_clusterlaunch_tdm_splitk_ws_gfx1250(
+    bm, bn, bk, layout, cwm, cwn, num_slots=3, wg_per_cu=2
+):
+    from dataclasses import replace
+
+    inst = _a16w16_cluster_tdm_splitk_ws_gfx1250(
+        bm, bn, bk, layout, num_slots=num_slots, wg_per_cu=wg_per_cu
+    )
+    return replace(
+        inst,
+        kernel_tag="a16w16_clusterlaunch_tdm_splitk_ws",
+        cluster_wg_m=cwm,
+        cluster_wg_n=cwn,
+    )
+
+
+# Full clusterlaunch sweep = {no-spill tile} x {valid cluster dim}.
+#
+# Tiles: the LDS/VGPR-no-spill (B_M, B_N, B_K, wg_per_cu) set from the offline
+# sweep (all P=3). wg_per_cu per tile = 2 WG/CU when the P=3 LDS <= 160 KB AND
+# VGPR <= 512 (both 2-WG-co-residency limits hold), else 1 WG/CU. Layout follows
+# the base rule: B_M==16 -> tileN (consumers split N), B_M>=32 -> tileM.
+#   #  B_M  B_N  B_K  LDS(KB)  VGPR  -> wg
+#   (see the agent-provided table; wg derived as above)
+_GFX1250_CLUSTERLAUNCH_TILES = [
+    # B_M=16 (tileN)
+    (16, 32, 128, 2), (16, 32, 256, 2), (16, 64, 128, 2), (16, 64, 256, 2),
+    (16, 128, 128, 2), (16, 128, 256, 1), (16, 256, 128, 1),
+    # B_M=32 (tileM)
+    (32, 32, 128, 2), (32, 32, 256, 2), (32, 64, 128, 2), (32, 64, 256, 2),
+    (32, 128, 128, 2), (32, 128, 256, 1), (32, 256, 128, 1),
+    # B_M=64 (tileM)
+    (64, 32, 128, 2), (64, 32, 256, 2), (64, 64, 128, 2), (64, 64, 256, 1),
+    (64, 128, 128, 2), (64, 128, 256, 1), (64, 256, 128, 1),
+    # B_M=128 (tileM)
+    (128, 32, 128, 2), (128, 32, 256, 1), (128, 64, 128, 2), (128, 64, 256, 1),
+    (128, 128, 128, 1),
+]
+_GFX1250_CLUSTERLAUNCH_P = 3            # all tiles use prefetch depth P=3
+# Clusterlaunch kids occupy [20100, 21000) (plain uses [20000, 20100)).
+_GFX1250_CLUSTERLAUNCH_KID_BASE = 20100
+_GFX1250_MAX_MULTICAST_WG = 5          # TDM multicast fan-out limit (WGs per group)
+
+
+def _gfx1250_valid_cluster_dims():
+    """Valid (cwm, cwn) cluster dims, shared across all clusterlaunch tiles.
+
+    Constraints:
+      * cwm in 1..4, cwn in 1..5 (the requested sweep range).
+      * Each side <= 5: TDM multicast fans out to at most 5 WGs (A shared by the
+        cwn column peers, B by the cwm row peers).
+      * cwm*cwn <= 16: the per-cluster workgroup_mask is 16-bit (also drops the
+        cwn==5 & cwm==4 corner -> "cwn==5 => cwm<=3").
+      * exclude (1,1): a degenerate 1-WG cluster has no multicast peers (self
+        mask) and hangs at runtime.
+    """
+    dims = []
+    for cwn in range(1, 6):       # cwn = 1..5
+        for cwm in range(1, 5):   # cwm = 1..4
+            if cwm == 1 and cwn == 1:
+                continue
+            if cwm > _GFX1250_MAX_MULTICAST_WG or cwn > _GFX1250_MAX_MULTICAST_WG:
+                continue
+            if cwm * cwn > 16:
+                continue
+            dims.append((cwm, cwn))
+    return dims
+
+
+# Deterministic kid numbering: 20500 + running index over (tile outer, then
+# cluster dim (cwn outer, cwm inner)). Kid numbers are provisional -- a global
+# renumber is pending. The kExpN stability guard has been removed, so ALL 26
+# no-spill tiles are expanded (incl. B_N=256 tileM -> kExpN=16). The multicast
+# clusterlaunch path is not bound by the no-cluster 256-request TDM limit, so no
+# per-TDM request drop is applied here.
+gfx1250_clusterlaunch_kernels_list = {}
+GFX1250_CLUSTERLAUNCH_KID_OF = {}   # (B_M,B_N,B_K,cwm,cwn) -> kid (for tuner)
+_cl_kid = _GFX1250_CLUSTERLAUNCH_KID_BASE
+for _bm, _bn, _bk, _wg in _GFX1250_CLUSTERLAUNCH_TILES:
+    _layout = "tileN" if _bm == 16 else "tileM"
+    for _cwm, _cwn in _gfx1250_valid_cluster_dims():
+        gfx1250_clusterlaunch_kernels_list[_cl_kid] = (
+            _a16w16_clusterlaunch_tdm_splitk_ws_gfx1250(
+                _bm, _bn, _bk, _layout, _cwm, _cwn,
+                num_slots=_GFX1250_CLUSTERLAUNCH_P, wg_per_cu=_wg,
+            )
+        )
+        GFX1250_CLUSTERLAUNCH_KID_OF[(_bm, _bn, _bk, _cwm, _cwn)] = _cl_kid
+        _cl_kid += 1
+
+assert _cl_kid <= 21000, f"clusterlaunch gfx1250 kids overflow [20100,21000): {_cl_kid}"
+GFX1250_CLUSTERLAUNCH_KIDS = frozenset(gfx1250_clusterlaunch_kernels_list.keys())
 
 # combined list (used by production gen_instances / dispatch)
 kernels_list = {
@@ -883,6 +1019,7 @@ kernels_list = {
     **a16w16_mono_tile_kernels_list_4g_safe,
     **gfx942_kernels_list,
     **gfx1250_kernels_list,
+    **gfx1250_clusterlaunch_kernels_list,
 }
 
 default_kernels_dict = {
@@ -901,6 +1038,7 @@ SPLITK_KIDS = (
     | frozenset(a16w16_flatmm_splitk_kernels_list_nooob.keys())
     | frozenset(gfx942_splitk_kernels_list.keys())
     | frozenset(gfx1250_kernels_list.keys())
+    | frozenset(gfx1250_clusterlaunch_kernels_list.keys())
 )
 
 # Non-splitk a16w16-family kids: split-barrier 4..9 + cpol/nooob mirrors, persistent 300..315 +
@@ -995,7 +1133,21 @@ HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
 # gfx1250 has no shape-heuristic dispatch yet (tune-id entry only). This set
 # is used purely to keep the kid in the subset-compile set S so the tune-id
 # path can always reach it.
-HEURISTIC_DEFAULT_KIDS_GFX1250 = frozenset(gfx1250_kernels_list.keys())
+# Only the kids the C++ heuristic (opus_a16w16_heuristic_kid_gfx1250) can return
+# must be force-compiled as the always-available (M,N,K) fallback. Every other
+# plain kid and ALL clusterlaunch kids are compiled on demand by the tuner
+# (candidate selection + sidecar expansion), so default builds stay small.
+HEURISTIC_DEFAULT_KIDS_GFX1250 = frozenset(
+    GFX1250_PLAIN_KID_OF[_t]
+    for _t in (
+        (16, 32, 128),
+        (16, 64, 128),
+        (16, 128, 128),
+        (32, 32, 128),
+        (32, 64, 128),
+        (32, 128, 128),
+    )
+)
 
 HEURISTIC_DEFAULT_KIDS = (
     HEURISTIC_DEFAULT_KIDS_GFX950
