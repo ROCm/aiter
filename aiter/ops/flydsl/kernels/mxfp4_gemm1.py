@@ -355,6 +355,7 @@ def _gemm1_body(
     NUM_N_BLOCKS=NUM_N_BLOCKS,
     OUT_AS_PER_CHUNK_DW=OUT_AS_PER_CHUNK_DW,
     K_G2_HALF=K_G2_HALF,
+    interleave=True,
 ):
     # All K- and INTER/NE-derived sizes arrive as params (KIMI defaults bound from
     # the module globals above so the default call path is unchanged).
@@ -440,14 +441,21 @@ def _gemm1_body(
             )
 
     # -- b_load_s_base[j] (HIP 412-416), readfirstlane'd uniform per wave ------
+    N0_HALF = N_OUT // 32
     b_load_s_base = []
     for j in range_constexpr(4):
-        v = (
-            e * fx.Int32(N_OUT)
-            + n_block_idx * fx.Int32(BN)
-            + wave * fx.Int32(BN // 4)
-            + fx.Int32(j * 16)
-        ) * fx.Int32(K_HALF)
+        if const_expr(interleave):
+            col = (
+                n_block_idx * fx.Int32(BN)
+                + wave * fx.Int32(BN // 4)
+                + fx.Int32(j * 16)
+            )
+        else:
+            tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
+            g = tile_il & fx.Int32(1)
+            n0 = tile_il >> fx.Int32(1)
+            col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
+        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
@@ -1060,11 +1068,12 @@ def compile_gemm1_a4w4_port(
     D_INTER=INTER,
     NE=NE,
     TOPK=TOPK,
+    interleave=True,
 ):
     print(
         f"[PORT-FLYDSL-GEMM1] compile_gemm1_a4w4_port ENTERED "
         f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} "
-        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE}",
+        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE} interleave={interleave}",
         flush=True,
     )
     # Supported Phase 2 combos.
@@ -1112,7 +1121,8 @@ def compile_gemm1_a4w4_port(
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}"
+    gu_tag = "il" if interleave else "sep"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name=f"gemm1port_smem_{name_suffix}"
@@ -1187,6 +1197,7 @@ def compile_gemm1_a4w4_port(
                 NUM_N_BLOCKS=_NUM_N_BLOCKS,
                 OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
                 K_G2_HALF=_K_G2_HALF,
+                interleave=interleave,
             )
 
     @flyc.jit
