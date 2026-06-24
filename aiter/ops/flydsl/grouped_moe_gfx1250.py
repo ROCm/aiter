@@ -533,9 +533,19 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             split_k2,
             stage1_weight_layout,
         )
-    tile_n = int(n_warp) * 64
-    tile_k = 256
+    # gemm1 (stage1) tiles: tile_{m,n,k} read straight from the CSV, defaulting
+    # to n_warp*64 / 256 when the column is absent.
+    tile_n = _as_int(cfg_row.get("tile_n"), int(n_warp) * 64) if cfg_row else int(n_warp) * 64
+    tile_k = _as_int(cfg_row.get("tile_k"), 256) if cfg_row else 256
     warp_tile_m = tile_m // m_warp
+    # gemm2 (stage2) tiles: tile_{m,n,k}2, each defaulting to the shared gemm1
+    # tile_{m,n,k} above. Absent columns keep the old behavior. max_m / routing
+    # use the shared tile_m; correctness of any non-default override is the
+    # caller's responsibility.
+    tile_m2 = _as_int(cfg_row.get("tile_m2"), tile_m) if cfg_row else tile_m
+    tile_n2 = _as_int(cfg_row.get("tile_n2"), tile_n) if cfg_row else tile_n
+    tile_k2 = _as_int(cfg_row.get("tile_k2"), tile_k) if cfg_row else tile_k
+    warp_tile_m2 = tile_m2 // m_warp
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
@@ -896,7 +906,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
     if _use_naive:
         grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
-            a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
+            a2_scale_raw, warp_tile=warp_tile_m2, scale_k_per_tile=tile_k2 // 32
         )
     else:
         # a2_scale_raw is already grouped row-major (no route-gather), so use the
@@ -906,8 +916,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             a2_scale_raw,
             route_E,
             route_max_m,
-            wmma_rep=warp_tile_m // 16,
-            scale_k_per_tile=tile_k // 32,
+            wmma_rep=warp_tile_m2 // 16,
+            scale_k_per_tile=tile_k2 // 32,
         )
     _grouped_dbg("a2 scale layout done")
     grouped_out = torch.empty(
@@ -924,9 +934,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         inter_dim=inter_dim,
         experts=E,
         max_m=max_m,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
+        tile_m=tile_m2,
+        tile_n=tile_n2,
+        tile_k=tile_k2,
         m_warp=m_warp,
         n_warp=n_warp,
         out_dtype=out_dtype_str,
