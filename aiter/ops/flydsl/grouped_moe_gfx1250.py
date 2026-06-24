@@ -501,7 +501,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_contiguous_m = True
     # Switch to DeepGEMM-style contiguous-M at large batches (env-overridable).
     _contig_token_threshold = _as_int(
-        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 512
+        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 16
     )
     if token_num > _contig_token_threshold:
         grouped_contiguous_m = True

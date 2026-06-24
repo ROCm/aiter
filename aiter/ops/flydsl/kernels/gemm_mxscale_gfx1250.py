@@ -326,9 +326,6 @@ def compile_mxscale_gemm(
             f"warp_tile_n={warp_tile_n} must be a multiple of {WMMA_N_EFF}"
         )
 
-    if split_k > 1 and use_tdm_store:
-        raise ValueError("split_k > 1 currently requires use_tdm_store=False")
-
     num_k_tiles = split_k_chunk // tile_k
     if num_k_tiles < num_buffers:
         raise ValueError(
@@ -627,9 +624,15 @@ def compile_mxscale_gemm(
             batch_b_base = batch_idx * arith.index(B_TOTAL_N // 16)
             batch_as_base = batch_idx * arith.index(M // wmma_m_rep)
             batch_bs_base = batch_idx * arith.index(B_TOTAL_N // BS_N32K4_BLOCK_N)
-            flat_m_base = batch_m_base + blk_m
+            m_idx = arith.index_cast(T.index, i32_m.ir_value())
+            if const_expr(grouped_contiguous_m):
+                split_k_m_offset = bz * m_idx
+            else:
+                split_k_m_offset = bz * arith.index(batch_count * M)
+            flat_m_base_input = batch_m_base + blk_m
             if flat_m_base_override is not None:
-                flat_m_base = flat_m_base_override
+                flat_m_base_input = flat_m_base_override
+            flat_m_base = split_k_m_offset + flat_m_base_input
             tile_valid = arith.constant(1, type=ir.IntegerType.get_signless(1))
             valid_m_i32 = i32_m.ir_value()
             if const_expr(grouped_masked_m):
@@ -681,14 +684,13 @@ def compile_mxscale_gemm(
             warp_m_base = wave_m_idx * arith.index(warp_tile_m)
             warp_n_base = wave_n_idx * arith.index(warp_tile_n)
 
-            m_idx = arith.index_cast(T.index, i32_m.ir_value())
             n_stride = arith.index(C_N)
             if const_expr(grouped_contiguous_m):
-                c_rows = m_idx
+                c_rows = m_idx * arith.index(split_k)
             elif const_expr(batch_count > 1):
-                c_rows = arith.index(batch_count * M)
+                c_rows = arith.index(split_k * batch_count * M)
             else:
-                c_rows = m_idx
+                c_rows = m_idx * arith.index(split_k)
             c_nrec = c_rows * n_stride * arith.index(elem_bytes_d)
             c_rsrc = buffer_ops.create_buffer_resource(arg_c, num_records_bytes=c_nrec)
             if const_expr(epilogue_bias_mode):
@@ -700,9 +702,9 @@ def compile_mxscale_gemm(
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_a,
                     lds_memref=memref,
-                    global_offset=(flat_m_base, k_packed_off),
+                    global_offset=(flat_m_base_input, k_packed_off),
                     tensor_shape=(
-                        c_rows if const_expr(grouped_contiguous_m) else batch_count * M,
+                        m_idx if const_expr(grouped_contiguous_m) else batch_count * M,
                         K_packed_a,
                     ),
                     strides=(K_packed_a, 1),
@@ -742,14 +744,14 @@ def compile_mxscale_gemm(
                 inner_off = k_scale_off * arith.index(wmma_m_rep)
                 a_scale_row_base = batch_as_base + outer_off
                 if flat_m_base_override is not None:
-                    a_scale_row_base = flat_m_base / arith.index(wmma_m_rep)
+                    a_scale_row_base = flat_m_base_input / arith.index(wmma_m_rep)
                 return tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_a_scale,
                     lds_memref=memref,
                     global_offset=(a_scale_row_base, inner_off),
                     tensor_shape=(
                         (
-                            c_rows / arith.index(wmma_m_rep)
+                            m_idx / arith.index(wmma_m_rep)
                             if const_expr(grouped_contiguous_m)
                             else batch_count * (M // wmma_m_rep)
                         ),
@@ -1862,7 +1864,7 @@ def compile_mxscale_gemm(
                 pf_k_packed_b = pf_k / arith.index(PACK_FACTOR_B)
                 tdm_ops.l2_prefetch_tile(
                     arg_a,
-                    (flat_m_base, pf_k_packed_a),
+                    (flat_m_base_input, pf_k_packed_a),
                     (tile_m, packed_tile_k_a),
                     (K_packed_a, 1),
                     elem_bytes=1,
@@ -2013,7 +2015,7 @@ def compile_mxscale_gemm(
                         flat_m_base + warp_m_off_sgpr,
                         blk_n + warp_n_off_sgpr,
                     ),
-                    tensor_shape=(batch_count * M, N),
+                    tensor_shape=(split_k * batch_count * M, N),
                     strides=(N, 1),
                     tile_shape=(warp_tile_m, warp_tile_n),
                     elem_bytes=elem_bytes_d,
@@ -2834,8 +2836,6 @@ def compile_mxscale_gemm(
                     epilogue_stage1_act_stores(accs, accs_up, epi_addrs_box[0])
                 elif const_expr(stage1_act_interleave):
                     epilogue_stage1_act_interleaved_stores(accs)
-                elif const_expr(split_k > 1):
-                    epilogue_atomic_adds(accs, epi_addrs_box[0])
                 else:
                     epilogue_stores(accs, epi_addrs_box[0])
 
@@ -2961,84 +2961,45 @@ def compile_mxscale_gemm(
                     layout_row = flat_m_tile * arith.index(tile_m)
                     layout_row_i32 = arith.index_cast(T.i32, layout_row)
                     c0_i32 = arith.constant(0, type=T.i32)
-                    c1_i32 = arith.constant(1, type=T.i32)
                     c_tile_m_i32 = arith.constant(tile_m, type=T.i32)
                     c_tile_m_minus_1_i32 = arith.constant(tile_m - 1, type=T.i32)
-                    c_batch_i32 = arith.constant(batch_count, type=T.i32)
+                    c0_idx = arith.index(0)
+                    c1_idx = arith.index(1)
 
-                    # Binary search in psum_t (monotonically non-decreasing):
-                    # find smallest e where layout_row_i32 < psum_t[e].
-                    # Iterations = ceil(log2(batch_count)), fully unrolled.
-                    _bsearch_iters = (
-                        (batch_count - 1).bit_length() if batch_count > 1 else 1
-                    )
-                    bs_lo = c0_i32
-                    bs_hi = c_batch_i32
-                    for _ in range_constexpr(_bsearch_iters):
-                        bs_mid = (bs_lo + bs_hi) >> c1_i32
+                    import math
+                    _bisect_iters = max(1, math.ceil(math.log2(batch_count)))
+                    lo = c0_i32
+                    hi = arith.constant(batch_count, type=T.i32)
+                    for _step in range_constexpr(_bisect_iters):
+                        mid = (lo + hi) >> arith.constant(1, type=T.i32)
+                        mid_idx = arith.index_cast(T.index, mid)
                         mid_end = buffer_ops.buffer_load(
-                            layout_rsrc,
-                            arith.index_cast(T.index, bs_mid),
-                            vec_width=1,
-                            dtype=T.i32,
+                            layout_rsrc, mid_idx, vec_width=1, dtype=T.i32
                         )
-                        go_left = arith.cmpi(
-                            arith.CmpIPredicate.slt,
-                            layout_row_i32,
-                            mid_end,
+                        go_right = arith.cmpi(
+                            arith.CmpIPredicate.sle, mid_end, layout_row_i32
                         )
-                        bs_hi = arith.select(go_left, bs_mid, bs_hi)
-                        bs_lo = arith.select(go_left, bs_lo, bs_mid + c1_i32)
+                        lo = arith.select(go_right, mid + arith.constant(1, type=T.i32), lo)
+                        hi = arith.select(go_right, hi, mid)
 
-                    batch_i32 = bs_lo
-
-                    # Compute group_start = starts[e]:
-                    #   starts[0] = 0
-                    #   starts[e>0] = ceil_align(psum_t[e-1], tile_m)
-                    is_first_expert = arith.cmpi(
+                    batch_i32 = lo
+                    group_active = arith.cmpi(
+                        arith.CmpIPredicate.slt, batch_i32,
+                        arith.constant(batch_count, type=T.i32)
+                    )
+                    batch_is_zero = arith.cmpi(
                         arith.CmpIPredicate.eq, batch_i32, c0_i32
                     )
-                    safe_prev_idx = arith.select(
-                        is_first_expert, c0_i32, batch_i32 - c1_i32
+                    prev_idx = arith.index_cast(
+                        T.index, batch_i32 - arith.constant(1, type=T.i32)
                     )
                     prev_end = buffer_ops.buffer_load(
-                        layout_rsrc,
-                        arith.index_cast(T.index, safe_prev_idx),
-                        vec_width=1,
-                        dtype=T.i32,
+                        layout_rsrc, prev_idx, vec_width=1, dtype=T.i32
                     )
-                    aligned_prev_end = (
+                    prev_aligned = (
                         (prev_end + c_tile_m_minus_1_i32) // c_tile_m_i32
                     ) * c_tile_m_i32
-                    group_start_i32 = arith.select(
-                        is_first_expert, c0_i32, aligned_prev_end
-                    )
-
-                    # Validate tile is within [group_start, psum_t[e])
-                    expert_in_bounds = arith.cmpi(
-                        arith.CmpIPredicate.slt, batch_i32, c_batch_i32
-                    )
-                    cur_end = buffer_ops.buffer_load(
-                        layout_rsrc,
-                        arith.index_cast(
-                            T.index,
-                            arith.select(expert_in_bounds, batch_i32, c0_i32),
-                        ),
-                        vec_width=1,
-                        dtype=T.i32,
-                    )
-                    row_ge_start = arith.cmpi(
-                        arith.CmpIPredicate.sge,
-                        layout_row_i32,
-                        group_start_i32,
-                    )
-                    row_lt_end = arith.cmpi(
-                        arith.CmpIPredicate.slt, layout_row_i32, cur_end
-                    )
-                    group_active = arith.andi(
-                        expert_in_bounds,
-                        arith.andi(row_ge_start, row_lt_end),
-                    )
+                    group_start_i32 = arith.select(batch_is_zero, c0_i32, prev_aligned)
                     batch_idx = arith.index_cast(T.index, batch_i32)
                     local_row_i32 = layout_row_i32 - group_start_i32
                     bx_local = arith.index_cast(T.index, local_row_i32 // c_tile_m_i32)
