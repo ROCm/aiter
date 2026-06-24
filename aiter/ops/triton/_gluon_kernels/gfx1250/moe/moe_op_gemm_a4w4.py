@@ -442,17 +442,24 @@ def _moe_gemm_a4w4_gfx1250(
                     x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 )
         else:
+            x_desc_gather = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                x_desc, add_offsets=[0, idx_x], pred=True, clamp_bounds=True
+            )
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                x_desc_gather,
                 offs_x_m,
-                idx_x,
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
             if X_SCALES_TDM:
-                gl.amd.gfx1250.tdm.async_gather(
+                x_scales_desc_gather = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     x_scales_desc,
+                    add_offsets=[0, idx_x_scales],
+                    pred=True,
+                    clamp_bounds=True,
+                )
+                gl.amd.gfx1250.tdm.async_gather(
+                    x_scales_desc_gather,
                     offs_x_m,
-                    idx_x_scales,
                     x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 )
         gl.amd.gfx1250.tdm.async_load(
@@ -556,17 +563,24 @@ def _moe_gemm_a4w4_gfx1250(
                     x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 )
         else:
+            x_desc_gather = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                x_desc, add_offsets=[0, idx_x], pred=True, clamp_bounds=True
+            )
             gl.amd.gfx1250.tdm.async_gather(
-                x_desc,
+                x_desc_gather,
                 offs_x_m,
-                idx_x,
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
             if X_SCALES_TDM:
-                gl.amd.gfx1250.tdm.async_gather(
+                x_scales_desc_gather = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     x_scales_desc,
+                    add_offsets=[0, idx_x_scales],
+                    pred=True,
+                    clamp_bounds=True,
+                )
+                gl.amd.gfx1250.tdm.async_gather(
+                    x_scales_desc_gather,
                     offs_x_m,
-                    idx_x_scales,
                     x_scales_buffer.index(load_idx % NUM_BUFFERS),
                 )
         gl.amd.gfx1250.tdm.async_load(
