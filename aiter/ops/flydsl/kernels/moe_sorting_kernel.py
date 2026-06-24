@@ -43,6 +43,11 @@ BLOCK_SIZE = 256
 UNIT_SIZE = 32  # GEMM tile-M, aka block_size in CK
 WARP_SIZE = get_warp_size()
 
+# P23 block-size policy: E in (256, 512] (e.g. DSV4 E=385) uses 512-thread blocks
+# when T <= threshold to avoid per-block serial prefix extension (E > K4_BLOCK).
+# Above threshold, 256-thread blocks match OPUS mesh-scan geometry at large T.
+P23_LARGE_T_THRESHOLD = 8192
+
 # DPP constants for prefix sum (used by oneshot and multiphase)
 DPP_ROW_SHR_1 = 0x111
 DPP_ROW_SHR_2 = 0x112
@@ -800,6 +805,18 @@ def _compile_moe_sorting_oneshot(
 # ---------------------------------------------------------------------------
 # FlyDSL GPU kernels — multiphase path (2 or 4 kernels, large T via HBM workspace)
 # ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=64)
+def _p23_block_size(num_experts: int, tokens: int) -> int:
+    """Runtime P23 block size: balance E>256 prefix path vs large-T mesh scan."""
+    if num_experts <= 256:
+        return 256
+    if tokens > P23_LARGE_T_THRESHOLD:
+        return 256
+    if num_experts <= 512:
+        return 512
+    return 256
+
+
 @functools.lru_cache(maxsize=256)
 def _compile_moe_sorting_multiphase(
     *,
@@ -807,6 +824,7 @@ def _compile_moe_sorting_multiphase(
     topk: int,
     unit_size: int = UNIT_SIZE,
     has_mask: bool = False,
+    k4_block: int = 256,
 ):
     """Compile the multiphase MoE sorting kernels (2 or 4 kernels via HBM workspace).
 
@@ -1399,7 +1417,8 @@ def _compile_moe_sorting_multiphase(
     # Parallel design (matching CK P23): each block [0, E) independently
     # computes the SAME prefix sum, then scatters ONLY for expert blockIdx.x.
     # No inter-block barrier needed — redundant prefix sums are deterministic.
-    K4_BLOCK = 256 if E <= 256 else 512
+    # P23 thread-block width (256 or 512). See _p23_block_size().
+    K4_BLOCK = k4_block
 
     # LDS: cumsum[E+1] for prefix sums + cross-wave scratch for DPP scan
     K4_NUM_WAVES = K4_BLOCK // WARP_SIZE
@@ -1826,7 +1845,13 @@ def moe_sorting_get_workspace_size(M, num_experts, topk, unit_size=UNIT_SIZE):
 
 
 def compile_moe_sorting(
-    *, num_experts, topk, max_tokens=128, unit_size=UNIT_SIZE, has_mask=False
+    *,
+    num_experts,
+    topk,
+    max_tokens=128,
+    unit_size=UNIT_SIZE,
+    has_mask=False,
+    k4_block=256,
 ):
     """Compile MoE sorting kernels for all paths (oneshot + multiphase).
 
@@ -1841,7 +1866,11 @@ def compile_moe_sorting(
         has_mask=has_mask,
     )
     _, _, _, _, _, launch_p0v2_p23, launch_4k_fused = _compile_moe_sorting_multiphase(
-        num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask
+        num_experts=num_experts,
+        topk=topk,
+        unit_size=unit_size,
+        has_mask=has_mask,
+        k4_block=k4_block,
     )
     return launch_oneshot, launch_p0v2_p23, launch_4k_fused
 
@@ -1962,8 +1991,13 @@ def moe_sorting_flydsl(
                 f"workspace too small: need {ws_total} i32 elements, got {workspace.numel()}"
             )
 
+        k4_block = _p23_block_size(num_experts, M)
         _, launch_p0v2_p23, launch_4k_fused = compile_moe_sorting(
-            num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask
+            num_experts=num_experts,
+            topk=topk,
+            unit_size=unit_size,
+            has_mask=has_mask,
+            k4_block=k4_block,
         )
         stream = torch.cuda.current_stream(device)
         n_zero_blocks = min(
