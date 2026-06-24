@@ -12,17 +12,19 @@ import torch
 
 import aiter
 
-# from aiter import get_torch_quant as get_quant
-from aiter import (
-    ActivationType,
-    QuantType,
-    dtypes,
+# Import from defining modules (not the aiter namespace re-exports): under
+# AITER_AOT_IMPORT the top-level aiter/__init__.py skips its `from .ops.* import *`
+# block, so these names are not bound on the package — only direct-source imports
+# resolve during the AOT collection in setup.py.
+from aiter import logger
+from aiter.ops.enum import ActivationType, QuantType
+from aiter.utility import dtypes
+from aiter.ops.quant import (
     fused_dynamic_mxfp4_quant_moe_sort,
     fused_dynamic_mxfp8_quant_moe_sort,
-    logger,
     mxfp4_moe_sort_fwd,
 )
-from aiter import get_hip_quant as get_quant
+from aiter.ops.quant import get_hip_quant as get_quant
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import (
     get_cu_num,
