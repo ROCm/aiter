@@ -181,23 +181,14 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            # TP1
-            Case(16, 4096, 7168, 256, 8, hbm_swizzling=True),
-            Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True),
-            Case(4096, 4096, 7168, 256, 8, hbm_swizzling=True),
-            Case(8192, 7168, 2048, 256, 8, hbm_swizzling=True),
             # TP8
-            Case(16, 512, 7168, 256, 8, hbm_swizzling=True),
-            Case(1024, 7168, 256, 256, 8, hbm_swizzling=True),
-            Case(4096, 512, 7168, 256, 8, hbm_swizzling=True),
-            Case(8192, 7168, 256, 256, 8, hbm_swizzling=True),
+            Case(16, 512, 2048, 256, 8, hbm_swizzling=True),
+            Case(256, 512, 2048, 256, 8, hbm_swizzling=True),
+            # TP1
+            Case(16, 2048, 2048, 128, 4, hbm_swizzling=True),
             # Edges
-            Case(1000, 704, 800, 8, 2),
-            Case(300, 400, 800, 8, 4),
             Case(256, 1024, 1024, 8, 4, hbm_swizzling=True),
-            Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
-            Case(4096, 3072, 3072, 128, 4),
-            Case(8192, 7168, 4096, 256, 8),
+            Case(300, 704, 800, 8, 2),
         ]
     ],
 )

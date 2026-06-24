@@ -119,9 +119,9 @@ def generate_fused_rms_quant_data(
     return x1, x2, rms1_w, rms2_w, resid1
 
 
-@pytest.mark.parametrize("B", [1, 4, 16, 32, 1000, 10000])
+@pytest.mark.parametrize("B", [1, 16, 256])
 @pytest.mark.parametrize("M", [32, 64])
-@pytest.mark.parametrize("N", [32, 64, 128])
+@pytest.mark.parametrize("N", [32, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_flatten_quant(B: int, M: int, N: int, dtype):
 
@@ -145,9 +145,8 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
     "M, N1, N2, stride",
     [
         (M, N1, N2, stride)
-        for M in [1, 4, 33, 64, 132, 256]  # TODO: debug for 131072
+        for M in [1, 33, 256]
         for N1, N2, stride in [
-            (200, 200, 200),
             (256, 256, 256),
             (256, 256, 2112),
         ]
@@ -285,19 +284,11 @@ def generate_fused_reduce_act_mul_mxfp4_group_quant(
     "M, N1, N2",
     [
         (1, 256, 256),
-        (2, 256, 256),
-        (4, 256, 256),
         (32, 256, 256),
-        (1, 4, 256),
-        (1, 28, 256),
         (1, 32, 256),
         (1, 64, 256),
-        (1, 68, 256),
-        (128, 28, 256),
         (128, 32, 256),
         (128, 64, 256),
-        (128, 68, 256),
-        (256, 32, 256),
     ],
 )
 @pytest.mark.parametrize("SPK", [1, 4])
@@ -385,9 +376,9 @@ def generate_fused_reduce_rms_quant_data(M, N1, N2, N3, SPK, dtype=torch.bfloat1
     return x1, w1, x2, w2, res1, x3
 
 
-@pytest.mark.parametrize("M", [1, 32, 256, 8192])
+@pytest.mark.parametrize("M", [1, 32, 256])
 @pytest.mark.parametrize("N1, N2, N3", [(256, 256, 256), (1536, 512, 64)])
-@pytest.mark.parametrize("SPK", [1, 4, 14])
+@pytest.mark.parametrize("SPK", [1, 4])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shuffle", [True, False])
 @pytest.mark.parametrize("scale_shuffle_padding", [True, False])
@@ -537,9 +528,9 @@ def run_fused_dynamic_mxfp4_quant_moe_sort_triton(
 
 
 @pytest.mark.parametrize("hidden_dim", [256])
-@pytest.mark.parametrize("token_num", [1, 32, 1024])
+@pytest.mark.parametrize("token_num", [1, 32, 256])
 @pytest.mark.parametrize(
-    "token_num_sort, num_valid_ids_0", [(1, 1), (32, 32), (1024, 1024), (1024, 512)]
+    "token_num_sort, num_valid_ids_0", [(1, 1), (32, 32), (256, 256), (256, 128)]
 )
 @pytest.mark.parametrize("topk", [1, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

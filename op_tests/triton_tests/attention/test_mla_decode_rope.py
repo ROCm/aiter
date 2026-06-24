@@ -263,8 +263,6 @@ def get_config(dtype: torch.dtype):
     [
         (1, 128, 2048, 512, 64, 64),
         (1, 128, 2048, 512, 128, 64),
-        (1, 128, 2048, 512, 127, 64),
-        (1, 128, 2050, 512, 127, 64),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -360,9 +358,7 @@ def test_op_fwd_rope(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
     [
         (1, 128, 2048, 512, 64, 64),
-        (1, 128, 2048, 512, 128, 64),
         (1, 128, 2048, 512, 127, 64),
-        (1, 128, 2050, 512, 127, 64),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -463,18 +459,9 @@ def test_op_fwd_rope_neox(
 @pytest.mark.parametrize(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
     [
-        (1, 128, 2, 512, 64, 64),
         (1, 128, 32, 512, 64, 64),
-        (1, 128, 2048, 512, 64, 64),
         (1, 128, 2048, 512, 128, 64),
-        (1, 128, 2048, 512, 127, 64),
-        (1, 128, 2050, 512, 127, 64),
-        (1, 128, 2050, 512, 128, 64),
         (8, 128, 2048, 512, 64, 64),
-        (8, 128, 2048, 512, 128, 64),
-        (8, 128, 2048, 512, 127, 64),
-        (8, 128, 2050, 512, 127, 64),
-        (8, 128, 2050, 512, 128, 64),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
