@@ -311,8 +311,8 @@ parser.add_argument(
     help="""moe_sorting backend(s) to validate against the CPU reference.
     Each is checked independently so coverage is explicit per backend and does
     not depend on which backend the build happens to default to.
-    Default: validate FlyDSL when it is available in the build (skipped
-    otherwise), so the FlyDSL path is always exercised when present.
+    Default: validate FlyDSL and OPUS when FlyDSL is available in the build
+    (FlyDSL skipped otherwise; OPUS always validated).
     e.g.: -b flydsl opus    # validate both
           -b auto           # whatever the build defaults to""",
 )
@@ -320,8 +320,10 @@ parser.add_argument(
 args = parser.parse_args()
 
 if args.backend is None:
-    backends = ["flydsl"] if is_flydsl_available() else ["auto"]
-    if not is_flydsl_available():
+    if is_flydsl_available():
+        backends = ["flydsl", "opus"]
+    else:
+        backends = ["auto"]
         print("FlyDSL not available in this build; validating default backend (auto)")
 else:
     backends = args.backend

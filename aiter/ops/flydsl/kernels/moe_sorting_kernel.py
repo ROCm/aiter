@@ -37,6 +37,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from .kernels_common import get_warp_size
+from .tensor_shim import _run_compiled
 
 BLOCK_SIZE = 256
 UNIT_SIZE = 32  # GEMM tile-M, aka block_size in CK
@@ -186,18 +187,6 @@ def _lds_store_raw(raw_mr, val, idx):
     memref_ops.store(v, raw_mr, [raw_idx])
 
 
-# ---------------------------------------------------------------------------
-# AOT-compiled dispatch caches — keyed by constexpr values.
-# After the first JIT call (which compiles the kernel), flyc.compile()
-# returns a CompiledFunction whose __call__ skips inspect.Signature.bind,
-# _make_cache_key, and dict lookup, reducing dispatch from ~70 us to ~5 us.
-# ---------------------------------------------------------------------------
-_oneshot_cf_cache = (
-    {}
-)  # (num_experts, topk, max_tokens, unit_size, has_mask, device) -> CompiledFunction
-_multiphase_cf_cache = (
-    {}
-)  # (num_experts, topk, unit_size, kernel_name, *constexpr_vals) -> CompiledFunction
 _dummy_mask_cache = {}  # device -> torch.Tensor(1, dtype=i32, value=1)
 
 
@@ -1857,18 +1846,6 @@ def compile_moe_sorting(
     return launch_oneshot, launch_p0v2_p23, launch_4k_fused
 
 
-def _launch_cached(cache, key, launch_fn, args, stream):
-    """AOT-compiled dispatch: first call JITs, subsequent calls use cached CompiledFunction."""
-    cf = cache.get(key)
-    stream_arg = fx.Stream(stream)
-    if cf is not None:
-        cf(*args, stream_arg)
-    else:
-        launch_fn(*args, stream=stream)
-        cf = flyc.compile(launch_fn, *args, stream_arg)
-        cache[key] = cf
-
-
 def moe_sorting_flydsl(
     topk_ids,
     topk_weights,
@@ -1968,13 +1945,10 @@ def moe_sorting_flydsl(
             moe_buf_elems,
             n_grid_blocks,
         )
-        cache_key = (num_experts, topk, max_tokens, unit_size, has_mask, device.index)
-        _launch_cached(
-            _oneshot_cf_cache,
-            cache_key,
+        _run_compiled(
             launch_oneshot,
-            oneshot_args,
-            torch.cuda.current_stream(device),
+            *oneshot_args,
+            fx.Stream(torch.cuda.current_stream(device)),
         )
     else:
         mesh_stride = ((M + unit_size - 1) // unit_size) * unit_size
@@ -1996,8 +1970,6 @@ def moe_sorting_flydsl(
             (moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy
         )
         k4_grid = num_experts + n_zero_blocks
-        base_key = (num_experts, topk, unit_size, has_mask, device.index)
-
         if M <= 2048:
             p0v2_args = (
                 topk_ids,
@@ -2015,13 +1987,7 @@ def moe_sorting_flydsl(
                 moe_buf_elems,
                 k4_grid,
             )
-            _launch_cached(
-                _multiphase_cf_cache,
-                base_key + ("p0v2_p23",),
-                launch_p0v2_p23,
-                p0v2_args,
-                stream,
-            )
+            _run_compiled(launch_p0v2_p23, *p0v2_args, fx.Stream(stream))
         else:
             k1_grid = (ws_total + 1023) // 1024
             k2_grid = num_cu * target_occupancy
@@ -2048,12 +2014,6 @@ def moe_sorting_flydsl(
                 k2_grid,
                 k4_grid,
             )
-            _launch_cached(
-                _multiphase_cf_cache,
-                base_key + ("4k_fused",),
-                launch_4k_fused,
-                k4_args,
-                stream,
-            )
+            _run_compiled(launch_4k_fused, *k4_args, fx.Stream(stream))
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
