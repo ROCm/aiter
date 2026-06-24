@@ -440,6 +440,190 @@ def get_flydsl_stage2_kernels_fp4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_a8w4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for gfx942 a8w4 (fp8 x MX-FP4) stage1.
+
+    Decode path: dequant fp8->bf16 + FP4->bf16, legacy bf16 MFMA. Tile set and
+    LDS guard mirror ``fp4_bf16``; ``block_m`` in fused_moe must match ``tile_m``.
+    """
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+    k_batches = [1, 2, 4, 7, 14]
+    gate_modes = [("separated", ""), ("interleave", "_gui")]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for kb in k_batches:
+                    if (
+                        _fp4_bf16_lds_total_bytes(tm, tn, tk, kb, out_dtype)
+                        > _GFX942_LDS_BYTES
+                    ):
+                        continue
+                    for gm, suffix in gate_modes:
+                        name = flydsl_kernel_name(
+                            1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                        )
+                        if kb != 1:
+                            name += f"_kb{kb}"
+                        name += suffix
+                        kernels[name] = {
+                            "stage": 1,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": tn,
+                            "tile_k": tk,
+                            "MPerBlock": tm,
+                            "in_dtype": "a8w4_bf16",
+                            "k_batch": kb,
+                            "gate_mode": gm,
+                            "b_nt": 0,
+                        }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_a8w4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for gfx942 a8w4 (fp8 x MX-FP4) stage2."""
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    if (
+                        _fp4_bf16_lds_total_bytes(tm, tn, tk, 1, out_dtype)
+                        > _GFX942_LDS_BYTES
+                    ):
+                        continue
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "a8w4_bf16",
+                        "b_nt": 0,
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {
+                        **base_params,
+                        "persist": True,
+                    }
+    return kernels
+
+
+def get_flydsl_stage1_kernels_a8w4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for gfx942 a8w4 (fp8 x MX-FP4) stage1.
+
+    Same LDS guard as ``fp4_bf16`` (A is decoded to bf16 in LDS). Registers both
+    separated and interleave (``_gui``) names so ``block_m == tile_m`` sorting
+   matches the compiled kernel grid.
+    """
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+    k_batches = [1]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for kb in k_batches:
+                    if (
+                        _fp4_bf16_lds_total_bytes(tm, tn, tk, kb, out_dtype)
+                        > _GFX942_LDS_BYTES
+                    ):
+                        continue
+                    base_name = flydsl_kernel_name(
+                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                    )
+                    if kb != 1:
+                        base_name += f"_kb{kb}"
+                    base_params = {
+                        "stage": 1,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "in_dtype": "a8w4_bf16",
+                        "k_batch": kb,
+                        "gate_mode": "separated",
+                        "b_nt": 0,
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_gui"] = {
+                        **base_params,
+                        "gate_mode": "interleave",
+                    }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_a8w4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for gfx942 a8w4 (fp8 x MX-FP4) stage2."""
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    if (
+                        _fp4_bf16_lds_total_bytes(tm, tn, tk, 1, out_dtype)
+                        > _GFX942_LDS_BYTES
+                    ):
+                        continue
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "a8w4_bf16",
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {
+                        **base_params,
+                        "persist": True,
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -455,6 +639,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_fp4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_fp4_bf16(out))
+    # a8w4_bf16 (gfx942 fp8-act decode) configs, LDS-guarded
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_a8w4_bf16(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_a8w4_bf16(out))
 
 
 _register_all_configs()
@@ -522,8 +710,9 @@ def compile_flydsl_moe_stage1(
                 out_dtype=out_dtype,
                 use_cshuffle_epilog=_use_cshuffle,
                 # bf16 E8M0 block scale (lossless for power-of-two) halves weight-
-                # scale HBM traffic vs f32. fp4_bf16 only; a8w4 handles scale at load.
-                scale_is_bf16=(_decode_in_dtype == "fp4_bf16"),
+                # scale HBM traffic vs f32. gfx942 fp4_bf16 and a8w4_bf16 both use
+                # shuffle_scale_for_int4(bf16) from repack_mxfp4_for_gfx942_fp4_bf16.
+                scale_is_bf16=(_decode_in_dtype in ("fp4_bf16", "a8w4_bf16", "a8w4_fp8")),
                 k_batch=k_batch,
             )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
@@ -638,8 +827,8 @@ def compile_flydsl_moe_stage2(
                 group_size=32,
                 out_dtype=out_dtype,
                 accumulate=accumulate,
-                # bf16 E8M0 block scale halves scale HBM traffic; fp4_bf16 only.
-                scale_is_bf16=(_decode_in_dtype == "fp4_bf16"),
+                # bf16 E8M0 block scale halves scale HBM traffic; fp4_bf16 and a8w4_bf16.
+                scale_is_bf16=(_decode_in_dtype in ("fp4_bf16", "a8w4_bf16", "a8w4_fp8")),
             )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
@@ -1334,8 +1523,10 @@ def flydsl_moe_stage1(
     a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
     model_dim and inter_dim INCLUDE padding (model_dim_pad, inter_dim_pad).
     bias: optional (E, 2*inter_dim) f32 bias added before activation.
-    For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as
+    For fp4 stage1 on gfx950 mixed-MFMA paths, `w1`/`w1_scale` use
     `shuffle_weight_a16w4(w1, 16, True)` and `shuffle_scale_a16w4(w1_scale, E, True)`.
+    On gfx942 ``fp4_bf16`` decode, use ``repack_mxfp4_for_gfx942_fp4_bf16`` (int4-style
+    preshuffle + ``shuffle_scale_for_int4``).
 
     When fuse_quant=True, the kernel fuses quantization (fp4/fp8, inferred from
     out_dtype) and writes e8m0 scales in sorted tiled layout directly.

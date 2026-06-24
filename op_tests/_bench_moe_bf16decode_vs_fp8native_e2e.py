@@ -45,7 +45,7 @@ def _build_stage1(in_dtype, g, tokens, model_dim, inter_dim, experts, topk,
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage1=False,
         in_dtype=in_dtype, group_size=group_size, out_dtype="bf16",
-        use_cshuffle_epilog=False, scale_is_bf16=False,
+        use_cshuffle_epilog=False, scale_is_bf16=True,
     )
     args = (
         out, g["a_fp8"], w1_kernel, g["a_scale_1d"], scale_w1_1d,
@@ -77,7 +77,7 @@ def _build_stage2(in_dtype, g, a2_fp8, a2_scale_1d, tokens, model_dim, inter_dim
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage2=True,
         in_dtype=in_dtype, group_size=group_size, out_dtype="bf16",
-        accumulate=True, scale_is_bf16=False,
+        accumulate=True, scale_is_bf16=True,
     )
     args = (
         target, a2_fp8.reshape(tokens * topk, inter_dim), w2_kernel, a2_scale_1d, scale_w2_1d,

@@ -155,7 +155,11 @@ def _gen_w1(dev, experts, inter_dim, model_dim, group_size, fp8native: bool = Fa
     # K stripe the 16x16 preshuffle already produces; only the in-kernel scale
     # wiring differs.
     kernel = _prep_w4(codes)
-    scale_1d = shuffle_scale_for_int4(scale_groups, group_size=group_size).view(-1).contiguous()
+    scale_1d = (
+        shuffle_scale_for_int4(scale_groups.to(torch.bfloat16), group_size=group_size)
+        .view(-1)
+        .contiguous()
+    )
     return codes, scale_groups, kernel, scale_1d
 
 
@@ -164,7 +168,11 @@ def _gen_w2(dev, experts, inter_dim, model_dim, group_size, fp8native: bool = Fa
     exps = torch.randint(-2, 3, (experts, inter_dim // group_size, model_dim), device=dev)
     scale_groups = torch.pow(2.0, exps.to(torch.float32))
     kernel = _prep_w4(codes)
-    scale_1d = shuffle_scale_for_int4(scale_groups, group_size=group_size).view(-1).contiguous()
+    scale_1d = (
+        shuffle_scale_for_int4(scale_groups.to(torch.bfloat16), group_size=group_size)
+        .view(-1)
+        .contiguous()
+    )
     return codes, scale_groups, kernel, scale_1d
 
 
@@ -224,7 +232,7 @@ def _run_stage1(tokens, model_dim, inter_dim, experts, topk, tile_m, tile_n, til
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage1=False,
         in_dtype="a8w4_bf16", group_size=group_size, out_dtype="bf16",
-        use_cshuffle_epilog=False, scale_is_bf16=False,
+        use_cshuffle_epilog=False, scale_is_bf16=True,
     )
     args = (
         out, g["a_fp8"], w1_kernel, g["a_scale_1d"], scale_w1_1d,
@@ -261,7 +269,7 @@ def _run_stage1_fp8native(tokens, model_dim, inter_dim, experts, topk, tile_m, t
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage1=False,
         in_dtype="a8w4_fp8", group_size=group_size, out_dtype="bf16",
-        use_cshuffle_epilog=False, scale_is_bf16=False,
+        use_cshuffle_epilog=False, scale_is_bf16=True,
     )
     args = (
         out, g["a_fp8"], w1_kernel, g["a_scale_1d"], scale_w1_1d,
@@ -289,7 +297,7 @@ def _run_stage2(g, a2_fp8, a2_scale_1d, tokens, model_dim, inter_dim, experts, t
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage2=True,
         in_dtype="a8w4_bf16", group_size=group_size, out_dtype="bf16",
-        accumulate=True, scale_is_bf16=False,
+        accumulate=True, scale_is_bf16=True,
     )
     args = (
         target, a2_fp8.reshape(tokens * topk, inter_dim), w2_kernel, a2_scale_1d, scale_w2_1d,
@@ -329,7 +337,7 @@ def _run_stage2_fp8native(g, a2_fp8, a2_scale_1d, tokens, model_dim, inter_dim, 
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage2=True,
         in_dtype="a8w4_fp8", group_size=group_size, out_dtype="bf16",
-        accumulate=True, scale_is_bf16=False,
+        accumulate=True, scale_is_bf16=True,
     )
     args = (
         target, a2_fp8.reshape(tokens * topk, inter_dim), w2_kernel, a2_scale_1d, scale_w2_1d,

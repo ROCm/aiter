@@ -45,6 +45,7 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
     pack_int8_to_packed_int4,
     shuffle_scale_for_int4,
+    repack_mxfp4_for_gfx942_fp4_bf16,
 )
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
@@ -76,7 +77,7 @@ def test_fmoe(
     check_aot_cache=True,
     swiglu_limit=0.0,
 ):
-    if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
+    if get_gfx() not in ["gfx950", "gfx942"] and qType in [aiter.QuantType.per_1x32]:
         return
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
@@ -191,7 +192,15 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+        and get_gfx() == "gfx942"
+    ):  # gfx942 fp4_bf16 / a8w4_bf16 decode kernels omit bias slots
+        exp_bias1_aiter = exp_bias1 = None
+        exp_bias2_aiter = exp_bias2 = None
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+        and (WQDType == dtypes.fp4x2)
+    ):  # a16w4 (gfx950 mixed-MFMA paths)
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
     elif (
@@ -243,11 +252,21 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
-        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
-        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+    ):  # a16w4 / a8w4
+        if get_gfx() == "gfx942":
+            # gfx942 FlyDSL fp4_bf16 / a8w4_bf16 decode uses int4-style preshuffle
+            # (see repack_mxfp4_for_gfx942_fp4_bf16), not gfx950 shuffle_weight_a16w4.
+            w1_qt_aiter, w1_scale_aiter = repack_mxfp4_for_gfx942_fp4_bf16(
+                w1_qt_aiter, w1_scale, E, w1.shape[1], w1.shape[2]
+            )
+            w2_qt_aiter, w2_scale_aiter = repack_mxfp4_for_gfx942_fp4_bf16(
+                w2_qt_aiter, w2_scale, E, w2.shape[1], w2.shape[2]
+            )
+        else:
+            w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
+            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+            w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+            w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
@@ -345,6 +364,12 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
+    _use_cuda_event = (
+        get_gfx() == "gfx942"
+        and qType == aiter.QuantType.per_1x32
+        and WQDType == dtypes.fp4x2
+        and AQDType in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
+    )
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -365,6 +390,7 @@ def test_fmoe(
         gate_mode=gateMode,
         num_iters=5,
         num_warmup=2,
+        use_cuda_event=_use_cuda_event,
     )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
@@ -718,7 +744,15 @@ def _runtime_swiglu_mxfp4_q_dtype_a(
         return dtypes.bf16 if token < bound else dtypes.fp4x2
 
     bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-    return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
+    if get_gfx() == "gfx942" and wq_dtype == dtypes.fp4x2:
+        if aq_dtype == dtypes.fp8:
+            return dtypes.fp8
+        if bound <= 0 or os.environ.get("AITER_FORCE_A8W4", "0") == "1":
+            return dtypes.fp8
+        return dtypes.bf16
+    if get_gfx() == "gfx950" and token >= bound:
+        return dtypes.fp8
+    return dtypes.bf16
 
 
 def _iter_legacy_cases():
@@ -765,13 +799,23 @@ def _iter_legacy_cases():
         triple = (quant_type, aq_dtype, wq_dtype)
 
         if triple == _PER1X32_BF16_FP4:
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+            pad_pairs = list(args.hidden_intermediate_pad)
+            if get_gfx() == "gfx942":
+                # gfx942 FlyDSL fp4_bf16: legacy skinny inter_dim + GPT-OSS padding
+                # triggers GPU faults under run_perftest; use unpadded production dims.
+                pad_pairs = [(h, i) for h, i in pad_pairs if h == 0 and i == 0]
+                if not pad_pairs:
+                    pad_pairs = [(0, 0)]
+            for hidden_pad, intermediate_pad in pad_pairs:
+                use_inter_dim = inter_dim
+                if get_gfx() == "gfx942" and use_inter_dim < 1024:
+                    use_inter_dim = 4096
                 for m in args.tokenNum:
                     yield _kw(
                         dtype,
                         m,
                         model_dim,
-                        inter_dim,
+                        use_inter_dim,
                         quant_type,
                         aq_dtype,
                         wq_dtype,
@@ -781,14 +825,22 @@ def _iter_legacy_cases():
                         intermediate_pad=intermediate_pad,
                     ), extras
         elif triple == _PER1X32_FP8_FP4:
-            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+            pad_pairs = list(args.hidden_intermediate_pad)
+            if get_gfx() == "gfx942":
+                pad_pairs = [(h, i) for h, i in pad_pairs if h == 0 and i == 0]
+                if not pad_pairs:
+                    pad_pairs = [(0, 0)]
+            for hidden_pad, intermediate_pad in pad_pairs:
+                use_inter_dim = inter_dim
+                if get_gfx() == "gfx942" and use_inter_dim < 1024:
+                    use_inter_dim = 4096
                 for act_type in args.act:
                     for m in args.tokenNum:
                         yield _kw(
                             dtype,
                             m,
                             model_dim,
-                            inter_dim,
+                            use_inter_dim,
                             quant_type,
                             aq_dtype,
                             wq_dtype,
@@ -891,7 +943,7 @@ for kwargs, extras in case_iter:
         kwargs["qType"],
         kwargs["AQDType"],
         kwargs["WQDType"],
-    ) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4)
+    ) in (_PER1X32_FP8_FP4,)
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:

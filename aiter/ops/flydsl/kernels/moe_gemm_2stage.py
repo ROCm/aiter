@@ -730,6 +730,8 @@ def compile_moe_gemm1(
                 col_offset_base_bytes = (
                     col_offset_base if elem_bytes == 1 else (col_offset_base * arith.index(int(elem_bytes)))
                 )
+                # Native-fp8 A LDS read base: one 8-byte MX block per lane group (klane*8).
+                col_offset_base_fp8native = lane_div_16 * arith.index(8)
 
                 # Dynamic N tiling within block (same as existing kernels)
                 by_n = by * fx.Index(tile_n)
@@ -800,19 +802,18 @@ def compile_moe_gemm1(
                       (packs0[ni], packs1[ni], scales0[ni], scales1[ni])
                     """
                     if const_expr(is_a8w4_fp8):
-                        # Native-fp8: each K64 micro-step (ku) spans TWO MX-FP4 blocks
-                        # (one for A-pack a0, one for a1). Load both packed32 (raw FP4) via
-                        # the fp8 K32 loader's addressing (co-designed with the fp8 A LDS
-                        # layout) + their f32 block scales; defer the E2M1->fp8 decode and
-                        # per-block weight scale to compute_tile. Per ni entry: (p0,s0,p1,s1).
+                        # Native-fp8 (BLOCK-MAJOR): same B addressing as stage2 so each
+                        # K32 MFMA consumes exactly one MX block's 8 weight bytes.
+                        klane_half = lane_div_16 % fx.Index(2)
+                        klane_div2 = lane_div_16 // fx.Index(2)
                         raw_data = []
                         for ku in range_constexpr(k_unroll):
                             raw_ku = []
                             for ni in range_constexpr(num_acc_n):
                                 sub = []
-                                for j in range_constexpr(2):
-                                    ki_step = ku * 2 + j
-                                    p_j = load_b_pack_k32(
+                                for b in range_constexpr(2):
+                                    klane_ovr = fx.Index(b * 2) + klane_div2
+                                    p_b = load_b_pack_k32(
                                         buffer_ops,
                                         arith,
                                         vector,
@@ -820,7 +821,7 @@ def compile_moe_gemm1(
                                         b_rsrc=w_rsrc,
                                         layout_b=layout_b,
                                         base_k=base_k,
-                                        ki_step=ki_step,
+                                        ki_step=ku * 2,
                                         n_blk=blk_list[ni],
                                         n_intra=intra_list[ni],
                                         lane_div_16=lane_div_16,
@@ -828,27 +829,24 @@ def compile_moe_gemm1(
                                         kpack_bytes=kpack_bytes,
                                         elem_bytes=w_elem_bytes,
                                         return_raw_packed32=True,
+                                        klane_override=klane_ovr,
+                                        half_override=klane_half,
                                     )
-                                    # Each MFMA lane group (lane_div_16=klane) owns the
-                                    # contiguous K stripe [ku*64 + klane*16 .. +15], which
-                                    # lies entirely in ONE MX-FP4 block (group = .../32). The
-                                    # weight block scale must therefore be keyed by klane, not
-                                    # by ki_step (both ki_steps of a lane share the same block).
-                                    k_pos_j = base_k + fx.Index(ku * 64) + lane_div_16 * fx.Index(16)
-                                    s_j = _load_groupwise_scale(
+                                    k_pos_b = base_k + fx.Index(ku * 64 + b * 32)
+                                    s_b = _load_groupwise_scale(
                                         buffer_ops,
                                         arith,
                                         scale_rsrc=sw_rsrc,
                                         expert_offset=expert_off_idx,
                                         n_blk=blk_list[ni],
                                         n_intra=intra_list[ni],
-                                        k_pos=k_pos_j,
+                                        k_pos=k_pos_b,
                                         num_groups=num_groups,
                                         group_size=group_size,
                                         n_per_expert=2 * inter_dim,
                                         scale_dtype=scale_dtype,
                                     )
-                                    sub.append((p_j, s_j))
+                                    sub.append((p_b, s_b))
                                 raw_ku.append((sub[0][0], sub[0][1], sub[1][0], sub[1][1]))
                             raw_data.append(raw_ku)
                         return raw_data
@@ -988,6 +986,29 @@ def compile_moe_gemm1(
                     a1 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
                     return a0, a1
 
+                def _lds_load_8b_i64(curr_row_a_lds, col_bytes, lds_base):
+                    col_swz_bytes = swizzle_xor16(curr_row_a_lds, col_bytes, k_blocks16)
+                    col_swz = (
+                        col_swz_bytes if elem_bytes == 1 else (col_swz_bytes // arith.index(int(elem_bytes)))
+                    )
+                    idx_a8 = crd2idx((fx.Int32(curr_row_a_lds), fx.Int32(col_swz)), layout_lds)
+                    idx_a8 = idx_a8 + lds_base
+                    loaded_a8 = vector.load_op(vec8_x, lds_x, [idx_a8])
+                    a_i64 = vector.bitcast(T.vec(1, T.i64), loaded_a8)
+                    return vector.extract(a_i64, static_position=[0], dynamic_position=[])
+
+                def lds_load_packs_k64_fp8native(curr_row_a_lds, ku_col_base_bytes, lds_base):
+                    a_blk0 = _lds_load_8b_i64(curr_row_a_lds, ku_col_base_bytes, lds_base)
+                    a_blk1 = _lds_load_8b_i64(
+                        curr_row_a_lds, ku_col_base_bytes + arith.index(32), lds_base
+                    )
+                    return a_blk0, a_blk1
+
+                def _a_prefetch(curr_row_a_lds, lds_base):
+                    if const_expr(is_a8w4_fp8):
+                        return lds_load_packs_k64_fp8native(curr_row_a_lds, col_offset_base_fp8native, lds_base)
+                    return lds_load_packs_k64(curr_row_a_lds, col_offset_base_bytes, lds_base)
+
                 def compute_tile(
                     acc_gate_in,
                     acc_up_in,
@@ -1103,7 +1124,7 @@ def compile_moe_gemm1(
                             b_gate_raw = b_gate_tile_in[ku]
                             b_up_raw = b_up_tile_in[ku]
                             ki64 = arith.index(ku * 64)
-                            col_base = col_offset_base_bytes + ki64
+                            col_base_fp8native = col_offset_base_fp8native + ki64
 
                             for mi in range_constexpr(m_repeat):
                                 mi_val = arith.index(mi * 16)
@@ -1112,12 +1133,17 @@ def compile_moe_gemm1(
                                 if const_expr((a0_prefetch is not None) and (ku == 0) and (mi == 0)):
                                     a0, a1 = a0_prefetch
                                 else:
-                                    a0, a1 = lds_load_packs_k64(curr_row_a_lds, col_base, lds_base)
+                                    a0, a1 = lds_load_packs_k64_fp8native(curr_row_a_lds, col_base_fp8native, lds_base)
 
                                 for ni in range_constexpr(num_acc_n):
                                     acc_idx = mi * num_acc_n + ni
                                     pg0, sg0, pg1, sg1 = b_gate_raw[ni]
                                     pu0, su0, pu1, su1 = b_up_raw[ni]
+                                    if const_expr(_scale_is_bf16):
+                                        sg0 = extract_bf16_scale(arith, sg0, ku * 2)
+                                        sg1 = extract_bf16_scale(arith, sg1, ku * 2 + 1)
+                                        su0 = extract_bf16_scale(arith, su0, ku * 2)
+                                        su1 = extract_bf16_scale(arith, su1, ku * 2 + 1)
                                     # gate: fold the lane's weight block scale into fp8, then
                                     # two K32 MFMAs (a0/a1) accumulate into the running f32 acc.
                                     bg0 = scale_fp8x8_i64(dequant_fp4_to_fp8(pg0, arith, vector), sg0, arith, vector)
@@ -1316,7 +1342,7 @@ def compile_moe_gemm1(
 
                 # Cross-tile A0 LDS prefetch (default-on): prefetch the first A-pack (K64) for the
                 # tile we are about to compute from LDS, to overlap with upcoming VMEM.
-                a0_prefetch_pong = lds_load_packs_k64(row_a_lds, col_offset_base_bytes, lds_base_pong)
+                a0_prefetch_pong = _a_prefetch(row_a_lds, lds_base_pong)
 
                 # Ping-pong main loop (2 tiles per iteration), leaving 2 tail tiles.
                 # Uses scf.for with loop-carried accumulators, B-tile prefetch, and A0 LDS prefetch.
@@ -1438,7 +1464,7 @@ def compile_moe_gemm1(
                     hot_loop_scheduler()
                     gpu.barrier()
 
-                    _a0pf_ping = lds_load_packs_k64(row_a_lds, col_offset_base_bytes, lds_base_ping)
+                    _a0pf_ping = _a_prefetch(row_a_lds, lds_base_ping)
 
                     # ---- stage 1: prefetch+store pong, compute ping ----
                     next_k2 = k_iv + c_tile_k + c_tile_k
@@ -1458,7 +1484,7 @@ def compile_moe_gemm1(
                     hot_loop_scheduler()
                     gpu.barrier()
 
-                    _a0pf_new = lds_load_packs_k64(row_a_lds, col_offset_base_bytes, lds_base_pong)
+                    _a0pf_new = _a_prefetch(row_a_lds, lds_base_pong)
 
                     loop_results = yield (
                         list(_ag) + list(_au) + _flatten_b_tile(_bg_next) + _flatten_b_tile(_bu_next) + list(_a0pf_new)
@@ -1491,7 +1517,7 @@ def compile_moe_gemm1(
                 gpu.barrier()
 
                 # Cross-tile prefetch for the final ping tile.
-                a0_prefetch_ping = lds_load_packs_k64(row_a_lds, col_offset_base_bytes, lds_base_ping)
+                a0_prefetch_ping = _a_prefetch(row_a_lds, lds_base_ping)
 
                 # Epilogue: compute last tile with epilogue scale prefetch to overlap loads with MFMA.
                 acc_gate, acc_up, epilogue_pf = compute_tile(
@@ -3128,6 +3154,9 @@ def compile_moe_gemm2(
                                 for ni in range_constexpr(num_acc_n):
                                     acc_idx = mi * num_acc_n + ni
                                     b0, b1, s0, s1 = b_decoded[ni]
+                                    if const_expr(_scale_is_bf16):
+                                        s0 = extract_bf16_scale(arith, s0, ku * 2)
+                                        s1 = extract_bf16_scale(arith, s1, ku * 2 + 1)
                                     # block ku*2 : ONE full K32 MFMA (all 4 lane groups).
                                     p_lo = mfma_fn(mfma_res_ty, [a_blk0, b0, zero_f32_acc, 0, 0, 0])
                                     # block ku*2+1 : ONE full K32 MFMA.

@@ -246,3 +246,44 @@ def shuffle_scale_for_int4(scale: torch.Tensor, group_size: int = 32) -> torch.T
         return scale.view(E, G // 2, 2, N).permute(0, 1, 3, 2).contiguous()
 
     return scale.contiguous()
+
+
+def fp4x2_to_e2m1_codes_i8(w_fp4x2: torch.Tensor) -> torch.Tensor:
+    """Unpack packed MX-FP4 (E2M1) weights to int8 codes in 0..15."""
+    u8 = w_fp4x2.view(torch.uint8)
+    low = (u8 & 0xF).to(torch.int8)
+    high = (u8 >> 4).to(torch.int8)
+    return torch.stack((low, high), dim=-1).reshape(*w_fp4x2.shape[:-1], -1)
+
+
+def repack_mxfp4_for_gfx942_fp4_bf16(
+    w_fp4x2: torch.Tensor,
+    scale: torch.Tensor,
+    experts: int,
+    out_features: int,
+    in_features: int,
+):
+    """Preshuffle MX-FP4 weights/scales for gfx942 ``fp4_bf16`` FlyDSL MoE kernels.
+
+    gfx942 has no scaled MX-FP4 MFMA; FlyDSL dequantizes E2M1 to bf16 in-kernel
+    using the same int4-style preshuffle layout as ``int4_bf16`` (not
+    ``shuffle_weight_a16w4`` used on gfx950 mixed-MFMA paths).
+    """
+    if getattr(w_fp4x2, "is_gfx942_fp4_bf16", False):
+        return w_fp4x2, scale
+
+    from aiter.utility import fp4_utils
+
+    codes = fp4x2_to_e2m1_codes_i8(w_fp4x2)
+    shuf = shuffle_weight(codes.view(torch.int8), layout=(16, 16))
+    packed = pack_int8_to_packed_int4(shuf)
+    w_out = packed.view(experts, out_features, in_features // 2).view(w_fp4x2.dtype)
+    w_out.is_shuffled = True
+    w_out.is_gfx942_fp4_bf16 = True
+
+    g = in_features // 32
+    sc = scale.view(experts, out_features, g).permute(0, 2, 1).contiguous()
+    sc_bf16 = fp4_utils.e8m0_to_f32(sc.view(torch.uint8)).to(torch.bfloat16)
+    scale_out = shuffle_scale_for_int4(sc_bf16, group_size=32).view(-1).contiguous()
+    scale_out.is_gfx942_fp4_bf16 = True
+    return w_out, scale_out

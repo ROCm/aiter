@@ -232,12 +232,12 @@ def _ref_stage2(g, a2, w2_codes, scale_w2_groups, model_dim, group_size, dtype: 
     dev = g["dev"]
     w2_scaled = _decode_stage_w(w2_codes, scale_w2_groups, group_size, dtype).to(torch.bfloat16)
     tokens, topk = a2.shape[0], a2.shape[1]
-    # doweight off / unit weights (topk=1): kernel sums slot down-projections.
     ref = torch.zeros((tokens, model_dim), device=dev, dtype=torch.float32)
     for t in range(tokens):
         for j in range(topk):
             e = int(g["topk_ids"][t, j])
-            ref[t] += a2[t, j].float() @ w2_scaled[e].float().t()
+            w = float(g["topk_weights"][t, j])
+            ref[t] += w * (a2[t, j].float() @ w2_scaled[e].float().t())
     return ref
 
 
@@ -445,6 +445,8 @@ def _bench(shape, dtype: str = "fp4_bf16", num_iters=50, num_warmup=10, verify=T
     )
     w1 = w1_kernel.view(experts, 2 * inter_dim, model_dim // 2)
     w2 = w2_kernel.view(experts, model_dim, inter_dim // 2)
+    # Match fused_moe (doweight_stage1=False): stage2 applies sorted top-k weights.
+    stage2_sorted_weights = g["sorted_weights"]
 
     if verify:
         out1 = flydsl_moe_stage1(
@@ -469,7 +471,7 @@ def _bench(shape, dtype: str = "fp4_bf16", num_iters=50, num_warmup=10, verify=T
             num_valid_ids=g["num_valid_ids"], out=out2, topk=topk,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
             out_dtype="bf16", mode="atomic",
-            w2_scale=scale_w2_1d, a2_scale=None, sorted_weights=None,
+            w2_scale=scale_w2_1d, a2_scale=None, sorted_weights=stage2_sorted_weights,
             **bridge,
         )
         torch.cuda.synchronize()
@@ -500,7 +502,7 @@ def _bench(shape, dtype: str = "fp4_bf16", num_iters=50, num_warmup=10, verify=T
             num_valid_ids=g["num_valid_ids"], out=out, topk=topk,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
             out_dtype="bf16", mode="atomic",
-            w2_scale=scale_w2_1d, a2_scale=None, sorted_weights=None,
+            w2_scale=scale_w2_1d, a2_scale=None, sorted_weights=stage2_sorted_weights,
             **bridge,
         )
 
@@ -516,6 +518,7 @@ def _bench(shape, dtype: str = "fp4_bf16", num_iters=50, num_warmup=10, verify=T
     )
     print(f"[stage1 gate+up] {us1:9.2f} us   {f1 / us1 / 1e6:8.1f} TFLOPS")
     print(f"[stage2 down   ] {us2:9.2f} us   {f2 / us2 / 1e6:8.1f} TFLOPS")
+    print(f"[stage1+2 total] {us1 + us2:9.2f} us  (kernels only; excludes moe_sorting)")
     return 0
 
 
@@ -533,6 +536,8 @@ if __name__ == "__main__":
     p.add_argument("--model-dim", type=int, default=4096)
     p.add_argument("--inter-dim", type=int, default=1536)
     p.add_argument("-e", "--experts", type=int, default=32)
+    p.add_argument("-k", "--topk", type=int, default=1,
+                   help="experts per token (use 8 to match test_moe_2stage -k 8)")
     p.add_argument("--tile-m", type=int, default=64)
     p.add_argument("--tile-n", type=int, default=128)
     p.add_argument("--tile-k", type=int, default=128)
@@ -544,7 +549,7 @@ if __name__ == "__main__":
             sys.exit(0)
         sys.exit(_bench(dict(
             tokens=args.tokens, model_dim=args.model_dim, inter_dim=args.inter_dim,
-            experts=args.experts, topk=1,
+            experts=args.experts, topk=args.topk,
             tile_m=args.tile_m, tile_n=args.tile_n, tile_k=args.tile_k,
         ), dtype=args.dtype, verify=not args.no_verify))
     sys.exit(_main())
