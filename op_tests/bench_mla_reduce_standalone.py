@@ -129,7 +129,7 @@ def main():
     out_dtype = _dt[args.dtype]
     H, Dv, T, S = args.H, args.Dv, args.tiles, args.splits
 
-    (po, pl, indptr, fmap, pmap, fout, flse) = build_inputs(T, S, H, Dv, out_dtype)
+    po, pl, indptr, fmap, pmap, fout, flse = build_inputs(T, S, H, Dv, out_dtype)
 
     if args.partial_dtype != "fp32":
         po = po.to(_dt[args.partial_dtype])
