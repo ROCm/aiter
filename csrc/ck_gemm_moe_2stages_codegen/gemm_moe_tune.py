@@ -27,6 +27,8 @@ from aiter.fused_moe import (
     cktile_moe_stage2,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
+)
+from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
 )

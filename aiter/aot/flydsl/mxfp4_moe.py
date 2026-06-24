@@ -65,7 +65,7 @@ def parse_csv(csv_path: str):
     mxfp4 a4w4 port names emit a job per stage. Non-mxfp4 names (the CSV mixes
     fp4 backends) are skipped -- those belong to moe.py's driver.
     """
-    from aiter.fused_moe import (
+    from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
