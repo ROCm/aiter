@@ -1710,7 +1710,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2), (16, 8), (64, 17)],
+    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )
