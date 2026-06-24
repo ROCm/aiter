@@ -185,9 +185,13 @@ def topk(
       - "sqrtsoftplus": pre-transform `scores = sqrt(softplus(logits))` before
         adding the optional `bias` and running topk. Selected weights are the
         UNBIASED sqrt(softplus(logits)). DeepSeek-V4 noaux_tc router.
+      - "sigmoid": pre-transform `scores = sigmoid(logits)` before adding the
+        optional `bias` and running topk. Selected weights are the UNBIASED
+        sigmoid(logits). DeepSeek sigmoid router.
 
     bias (fp32, [n_expts_tot]): added to scores for selection only, not for
-    returned weights. Only meaningful with score_mode='sqrtsoftplus'.
+    returned weights. Only meaningful with score_mode='sqrtsoftplus' or
+    'sigmoid'.
 
     renorm: renormalize weights to sum=1 per row before multiplying by
     routed_scaling_factor.
@@ -205,8 +209,9 @@ def topk(
     assert return_bitmatrix
     assert score_mode in (
         "softmax",
+        "sigmoid",
         "sqrtsoftplus",
-    ), f"score_mode must be 'softmax' or 'sqrtsoftplus', got {score_mode!r}"
+    ), f"score_mode must be 'softmax', 'sigmoid' or 'sqrtsoftplus', got {score_mode!r}"
     if score_mode != "softmax":
         assert not apply_softmax, "apply_softmax only valid with score_mode='softmax'"
     has_bias = bias is not None
@@ -214,9 +219,10 @@ def topk(
         assert bias.dim() == 1
         assert bias.shape[0] == x.shape[-1]
         assert bias.dtype == torch.float32
-        assert (
-            score_mode == "sqrtsoftplus"
-        ), "bias currently only supported with score_mode='sqrtsoftplus'"
+        assert score_mode in (
+            "sqrtsoftplus",
+            "sigmoid",
+        ), "bias only supported with score_mode='sqrtsoftplus' or 'sigmoid'"
     dev = x.device
     # scratchpad tensors
     # NOTE: these are not returned

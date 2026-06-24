@@ -169,6 +169,8 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
 def _score_transform_torch(logits, score_mode):
     if score_mode == "sqrtsoftplus":
         return torch.sqrt(F.softplus(logits.to(torch.float32))).to(logits.dtype)
+    if score_mode == "sigmoid":
+        return torch.sigmoid(logits.to(torch.float32)).to(logits.dtype)
     # "softmax" mode in the kernel means "no pre-transform" (identity)
     return logits
 
@@ -383,6 +385,9 @@ def _check_routing_data_bucket(
         ("sqrtsoftplus", True, True, 2.5),  # full V4 noaux_tc path
         ("sqrtsoftplus", True, False, 1.0),  # bias, no renorm
         ("sqrtsoftplus", False, True, 1.0),  # no bias
+        ("sigmoid", True, True, 2.5),  # sigmoid router, bias + renorm + scale
+        ("sigmoid", True, False, 1.0),  # sigmoid, bias, no renorm
+        ("sigmoid", False, True, 1.0),  # sigmoid, no bias
         ("softmax", False, False, 1.0),  # identity transform, no renorm
     ],
 )
