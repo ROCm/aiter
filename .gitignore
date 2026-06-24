@@ -88,3 +88,9 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
+
+# AI cli
+.claude
+.codex
+.cline_storage
+

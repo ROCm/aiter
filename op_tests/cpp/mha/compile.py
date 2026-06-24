@@ -13,31 +13,44 @@ from jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_META_DIR  # noqa
 FWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}"]
 BWD_CODEGEN_CMD = [f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}"]
 
+# Native hand-written HIP D64 BF16 split-K kernels (gfx942). No CK dependency,
+# so they can coexist with both ck_exclude=True (fwd_v3) and ck_exclude=False (fwd).
+NATIVE_SRCS = [
+    f"{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk0_split.cu",
+    f"{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk1_split.cu",
+    f"{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_combine.cu",
+]
+
 
 def cmdGenFunc_mha_fwd(ck_exclude: bool):
     if ck_exclude:
-        srcs = [f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu"]
+        srcs = [f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu"] + NATIVE_SRCS
         blob_gen_cmd = []
+        extra_include = [f"{AITER_CSRC_DIR}/kernels/mha_native"]
+        flag_use_v3 = "-DFAV3_ON=1 -DFAV_NATIVE_ON=1 -DENABLE_CK=0"
     else:
         srcs = [
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu",
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cu",
             f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cu",
-        ]
+        ] + NATIVE_SRCS
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}",
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}",
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}",
         ]
+        extra_include = [
+            f"{CK_DIR}/example/ck_tile/01_fmha",
+            f"{AITER_CSRC_DIR}/kernels/mha_native",
+        ]
+        flag_use_v3 = "-DFAV3_ON=1 -DFAV2_ON=1 -DFAV_NATIVE_ON=1"
     blob_gen_cmd.extend(FWD_CODEGEN_CMD)
-    flag_use_v3 = (
-        "-DFAV3_ON=1 -DENABLE_CK=0" if ck_exclude else "-DFAV3_ON=1 -DFAV2_ON=1"
-    )
     return {
         "srcs": srcs,
         "md_name": "libmha_fwd",
         "blob_gen_cmd": blob_gen_cmd,
         "flags_extra_cc": [flag_use_v3],
+        "extra_include": extra_include,
         "torch_exclude": True,
         "is_python_module": False,
     }

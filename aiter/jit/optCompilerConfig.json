@@ -1150,19 +1150,26 @@
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_fwd_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_fwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk0_split.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk1_split.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_combine.cu'"
         ],
         "flags_extra_cc": [
-            "'-DFAV2_ON=1'"
+            "'-DFAV2_ON=1'",
+            "'-DFAV_NATIVE_ON=1'"
         ],
         "flags_extra_hip": [
             "'-fbracket-depth=1024'",
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "'-DFAV_NATIVE_ON=1'",
+            "'-mllvm -enable-post-misched=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native'"
         ],
         "verbose": "False",
         "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
@@ -1331,17 +1338,25 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_split.cu'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cu'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk0_split.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_msk1_split.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native/fmha_fwd_d64_bf16_combine.cu'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DFAV_NATIVE_ON=1'"
+        ],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
-            "'-DCK_TILE_FMHA_FWD_SPLITKV_API=1'"
+            "'-DCK_TILE_FMHA_FWD_SPLITKV_API=1'",
+            "'-DFAV_NATIVE_ON=1'",
+            "'-mllvm -enable-post-misched=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha'",
+            "f'{AITER_CSRC_DIR}/kernels/mha_native'"
         ],
         "verbose": "False",
         "is_python_module": "False",
