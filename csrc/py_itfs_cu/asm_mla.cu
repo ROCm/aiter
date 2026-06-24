@@ -841,15 +841,8 @@ void mla_decode_stage1_asm_fwd(
         sub_Q = 128;
         if (q_type == "bf16" && kv_type == "bf16"){
             if(persistent){
-                // gfx950 only: qSeqLen=4 -> coex0 (q=1/2/3), qSeqLen=0 -> qseqlen4 (q=4)
-                if (arch_id == "gfx950"){
-                    if (max_seqlen_q == 4){
-                        config_max_seqlen_q = 0;
-                    } else if (max_seqlen_q <= 3){
-                        config_max_seqlen_q = 4;
-                    }
-                } else if (max_seqlen_q <= 4){
-                    config_max_seqlen_q = 4;
+                if (max_seqlen_q <= 4){
+                    config_max_seqlen_q = 4; // padding it
                 }
             }else{
                 if(max_seqlen_q == 1){
@@ -943,7 +936,7 @@ void mla_decode_stage1_asm_fwd(
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
-    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio > 16) && (gqa_ratio * max_seqlen_q != 32) && (gqa_ratio * max_seqlen_q != 64)){
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 64 || gqa_ratio >= 16)){
         config_max_seqlen_q = 1;
         config_gqa_ratio = 64;
         args.s_MQA = gqa_ratio;
