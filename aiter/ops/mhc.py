@@ -172,6 +172,43 @@ def _mhc_fused_config_gfx942_80(m, hidden_size, num_cu):
     return splitk, tile_m, tile_n, tile_k
 
 
+def _mhc_fused_config_gfx1250_256(m, hidden_size, num_cu):
+    tile_k = 32 if hidden_size % 32 == 0 else 64
+    valid = _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu)
+    if not valid:
+        return 1, 16, 32, tile_k
+
+    tile_n = 32
+    tile_m = 16 if m <= 512 else 32
+
+    # (m upper bound, target split_k) measured per (m, hidden) then merged; the
+    # target is snapped to a legal divisor below so it stays valid for any hidden.
+    if hidden_size >= 7168:
+        table = [
+            (128, 56),
+            (256, 56),
+            (512, 32),
+            (1024, 8),
+            (2048, 16),
+            (4096, 8),
+            (8192, 4),
+            (1 << 30, 2),
+        ]
+    else:
+        table = [
+            (256, 32),
+            (512, 64),
+            (1024, 16),
+            (2048, 16),
+            (4096, 16),
+            (8192, 4),
+            (1 << 30, 2),
+        ]
+    target = next(t for ub, t in table if m <= ub)
+    splitk = min(valid, key=lambda s: (abs(math.log(s) - math.log(target)), -s))
+    return splitk, tile_m, tile_n, tile_k
+
+
 def _mhc_fused_config_default(m, hidden_size, num_cu):
     """Generic fallback for untuned chips: pick (split_k, tile_k) by the occupancy
     scoring search (how many thread-groups fit vs. how many the device can run at
@@ -219,6 +256,7 @@ def _mhc_fused_config_default(m, hidden_size, num_cu):
 _MHC_FUSED_POST_PRE_CONFIG = {
     ("gfx950", 256): _mhc_fused_config_gfx950_256,
     ("gfx942", 80): _mhc_fused_config_gfx942_80,
+    ("gfx1250", 256): _mhc_fused_config_gfx1250_256,
 }
 
 
@@ -504,6 +542,7 @@ def mhc_fused_post_pre(
     fused_m_upper_bound = {
         "gfx950": 1024,
         "gfx942": 128,
+        "gfx1250": 256,
     }.get(arch, 1024)
 
     if not force_fused and m >= fused_m_upper_bound:

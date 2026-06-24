@@ -44,6 +44,7 @@ from aiter.aot.flydsl.common import (
     cu_num_to_arch,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.gemm_kernels import (
@@ -372,9 +373,10 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env(
-            "FLYDSL_GPU_ARCH", aot_arch
-        ), FakeTensorMode():
+        with (
+            override_env("FLYDSL_GPU_ARCH", aot_arch),
+            FakeTensorMode(),
+        ):
             if kind == "hgemm":
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
@@ -437,19 +439,11 @@ def main():
     print("=" * 72)
 
     total_t0 = time.time()
-    results = []
 
-    if hgemm_jobs:
-        print(f"\n--- HGEMM ({len(hgemm_jobs)} kernels) ---")
-        for i, job in enumerate(hgemm_jobs, 1):
-            print(f"\n[{i}/{len(hgemm_jobs)}] ", end="")
-            results.append(compile_one_config(**job))
-
-    if preshuffle_jobs:
-        print(f"\n--- Preshuffle GEMM ({len(preshuffle_jobs)} kernels) ---")
-        for i, job in enumerate(preshuffle_jobs, 1):
-            print(f"\n[{i}/{len(preshuffle_jobs)}] ", end="")
-            results.append(compile_one_config(**job))
+    # HGEMM and preshuffle kernels are independent compiles, so they share
+    # one pool for maximum fan-out instead of two serial passes.
+    print(f"\n--- Compiling {len(all_jobs)} kernels (hgemm + preshuffle) ---")
+    results = run_jobs_parallel(compile_one_config, hgemm_jobs + preshuffle_jobs)
 
     total_elapsed = time.time() - total_t0
 
