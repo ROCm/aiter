@@ -6,7 +6,7 @@
 # (aiter/ops/flydsl/mxfp4_gemm{1,2}*.py); only these shared aux ops stay in HIP.
 #
 # Each function is a thin @compile_ops binding to a C++ host entry in
-# csrc/kernels/mxfp4_moe/mxfp4_moe_aux.cu. The codegen'd dispatch switches on
+# csrc/kernels/mxfp4_moe/moe_mxfp4_aux.cu. The codegen'd dispatch switches on
 # (NE, TOPK, D_HIDDEN, D_INTER, MB) to pick the right template instantiation.
 #
 # Shape-parameter glossary (uppercase params on the host-side wrappers):

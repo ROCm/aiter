@@ -9,7 +9,7 @@
 #undef __HIP_NO_HALF_OPERATORS__
 #endif
 
-#include "mxfp4_moe.h"
+#include "moe_mxfp4_aux.h"
 
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>

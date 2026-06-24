@@ -524,8 +524,8 @@
     },
     "module_moe_mxfp4_aux": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/kernels/mxfp4_moe/mxfp4_moe_aux.cu'",
-            "f'{AITER_CSRC_DIR}/pybind/mxfp4_moe_aux_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/mxfp4_moe/moe_mxfp4_aux.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/moe_mxfp4_aux_pybind.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
