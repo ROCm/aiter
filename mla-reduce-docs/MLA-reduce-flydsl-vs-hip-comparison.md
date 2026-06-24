@@ -8,12 +8,16 @@ container. Sources:
 - HIP baseline: `MLA-reduce-HIP-kernel-benchmark-report.md`
 - FlyDSL: `MLA-reduce-flydsl-benchmark-report.md`
 - Design: `MLA-reduce-HIP-kernel-dissection.md`, `MLA-reduce-flydsl-moe-reduction-dissection.md`
+- Multi-token fix: `MLA-reduce-flydsl-multitoken-decode-fix-report.md`
+
+**Updated:** 2026-06-24 — re-run after multi-token decode fix; partial inputs model stage-1
+fp32 outputs (bf16/fp8 upstream).
 
 **Bottom line:** the FlyDSL port reaches the same HBM-bandwidth band as HIP
-(**~3.5–3.8 TB/s, 65–72% of peak**) with bit-comparable accuracy. Both are at the reduction
-byte floor — parity was the goal, and it is met. Both sides are now measured with **kernel-only
-device time** (aiter's `run_perftest` + a CUDA-graph cross-check), so the tables compare kernels
-directly with no host-overhead artifact; the old ~230 µs FlyDSL-harness floor is gone.
+(**~3.2–3.7 TB/s, 60–70% of peak**) with bit-comparable accuracy. Both are at the reduction
+byte floor. Both sides use **kernel-only device time** (aiter's `run_perftest` + CUDA-graph
+cross-check). End-to-end stage-1 → reduce paths (bf16/fp8, qlen 1–4) are stress-validated
+with FlyDSL on (72/72 clean).
 
 ---
 
@@ -26,14 +30,15 @@ directly with no host-overhead artifact; the old ~230 µs FlyDSL-harness floor i
 | ROCm / Python / PyTorch | 7.2.0 / 3.10.12 / 2.9.1+rocm7.2.0 |
 | flydsl | 0.2.0 |
 | Timing | 25 warmup / 100 iters, **kernel-only device time** (`run_perftest` `self_device_time_total` + CUDA-graph `cuda.Event` cross-check); same traffic model |
+| Inputs | fp32 partial `O`/`LSE` in stage-1 output layout (synthetic fill in standalone sweeps; real stage-1 ASM in e2e) |
 
 ---
 
 ## 2. Correctness
 
-The FlyDSL matrix is now checked **directly against the HIP `kn_mla_reduce_v1` kernel** (same
-input buffers, kernel-vs-kernel) rather than against a torch model — so this is the tightest
-possible equivalence test. 48/48 configs pass.
+The FlyDSL matrix is checked **directly against the HIP `kn_mla_reduce_v1` kernel** (same
+input buffers, kernel-vs-kernel). **156/156 configs pass** (144 well-formed × `M∈{1,2,4}` +
+12 degenerate empty-tile guard cases for qlen>1).
 
 | metric | FlyDSL vs HIP |
 |---|---|
@@ -41,35 +46,36 @@ possible equivalence test. 48/48 configs pass.
 | output max_abs_err (fp16) | ≤ 1.95e-3 |
 | LSE max_abs_err | ≤ 9.5e-7 |
 | supported `(H,Dv)` | (128,512),(16,512),(128,128) — same three |
+| e2e stage-1 input (FlyDSL on) | bf16/fp8 qlen 1–4, 72/72 clean (`stress_flydsl_mla_reduce.sh`) |
 | reference | HIP `kn_mla_reduce_v1` (torch fp64 ref also available) |
 
-**LSE (fp32) matches to ~1e-7.** The bf16 output diff is exactly one bf16 ULP: both kernels
-accumulate in fp32 and round the final result to bf16 independently, so near-equal fp32 values
-can fall on adjacent bf16 codes. This is rounding, not a behavioral difference — the two
-kernels are bit-equivalent up to output-dtype rounding.
+**LSE (fp32) matches to ~1e-7.** The bf16 output diff is exactly one bf16 ULP. Production
+multi-token decode uses **`M = 1` with more reduce tiles** (not wider `max_seqlen_q`); the
+empty-tile guard skips degenerate `n_splits = 0` tiles that stage-1/metadata can emit.
 
 ---
 
 ## 3. Bandwidth — split-count sweep (H=128, Dv=512, bf16)
 
 HIP at tiles=256; FlyDSL at tiles=256 (splits=256 row at tiles=64 for both).
+Partials: fp32 stage-1 layout.
 
 | splits | path | HIP kernel | HIP BW | FlyDSL kernel | FlyDSL BW | notes |
 |---|---|---|---|---|---|---|
-| 2 | simple | 49.7 µs | 3.38 TB/s | 36.5 µs | **4.61 TB/s** | FlyDSL faster on simple path |
-| 3 | simple | 66.1 µs | 3.56 TB/s | 48.6 µs | **4.84 TB/s** | FlyDSL faster |
-| 4 | massive | 78.5 µs | 3.86 TB/s | 83.2 µs | 3.64 TB/s | ~parity |
-| 8 | massive | 176.7 µs | 3.24 TB/s | 153.3 µs | 3.73 TB/s | ~parity |
-| 16 | massive | 357.6 µs | 3.10 TB/s | 328.3 µs | 3.38 TB/s | ~parity |
-| 32 | massive | 661.2 µs | 3.31 TB/s | 642.8 µs | 3.40 TB/s | ~parity |
-| 64 | massive | 1255.7 µs | 3.45 TB/s | 1270.1 µs | 3.42 TB/s | ~parity |
-| 128 | massive | 2501.0 µs | 3.46 TB/s | 2458.7 µs | 3.51 TB/s | ~parity |
-| 256 | massive (t=64) | 1167.9 µs | 3.69 TB/s | 1200.3 µs | 3.59 TB/s | ~parity |
+| 2 | simple | 49.4 µs | 3.40 TB/s | 36.7 µs | **4.58 TB/s** | FlyDSL faster on simple path |
+| 3 | simple | 66.3 µs | 3.55 TB/s | 50.7 µs | **4.65 TB/s** | FlyDSL faster |
+| 4 | massive | 78.8 µs | 3.84 TB/s | 78.0 µs | 3.88 TB/s | ~parity |
+| 8 | massive | 177.1 µs | 3.23 TB/s | 161.9 µs | 3.53 TB/s | FlyDSL slightly ahead |
+| 16 | massive | 350.8 µs | 3.16 TB/s | 404.4 µs | 2.74 TB/s | FlyDSL slower (mid-split pipeline) |
+| 32 | massive | 668.0 µs | 3.27 TB/s | 700.8 µs | 3.12 TB/s | ~parity |
+| 64 | massive | 1282.0 µs | 3.38 TB/s | 1267.4 µs | 3.42 TB/s | ~parity |
+| 128 | massive | 2519.2 µs | 3.43 TB/s | 2405.4 µs | 3.59 TB/s | ~parity |
+| 256 | massive (t=64) | 1195.2 µs | 3.61 TB/s | 1164.3 µs | 3.70 TB/s | ~parity |
 
-With both sides on kernel-only device time, **they track within a few percent across the whole
-sweep** — the FlyDSL port matches HIP byte-for-byte on the massive path. On the **simple path
-(splits 2–3) FlyDSL is actually faster** (4.6–4.8 vs 3.4–3.6 TB/s). The old large low-split gap
-was purely the FlyDSL standalone harness's host floor and has now disappeared.
+Both track within a few percent across most of the sweep. FlyDSL remains faster on the **simple
+path (splits 2–3)** and at high split counts; mid-split (splits=16) shows a FlyDSL pipeline
+overhead bump that is worth deeper prefetch tuning. fp8 upstream (stage-1 input) does not change
+reduce traffic — partials stay fp32.
 
 ---
 
@@ -77,23 +83,19 @@ was purely the FlyDSL standalone harness's host floor and has now disappeared.
 
 | tiles | HIP kernel | HIP BW | FlyDSL kernel | FlyDSL BW | regime |
 |---|---|---|---|---|---|
-| 1 | 4.7 µs | 474 GB/s | 4.7 µs | 480 GB/s | latency-bound |
-| 4 | 4.5 µs | 1.98 TB/s | 4.8 µs | 1.87 TB/s | latency-bound |
-| 16 | 8.2 µs | **4.39 TB/s** | 6.8 µs | **5.25 TB/s** | near peak (cache) |
-| 64 | 45.7 µs | 3.13 TB/s | 33.1 µs | 4.32 TB/s | saturating |
-| 128 | 74.1 µs | 3.86 TB/s | 59.3 µs | 4.82 TB/s | saturating |
-| 256 | 175.8 µs | 3.25 TB/s | 150.0 µs | 3.81 TB/s | kernel-dominated |
-| 512 | 337.2 µs | 3.39 TB/s | 316.2 µs | 3.62 TB/s | kernel-dominated |
-| 1024 | 683.2 µs | 3.35 TB/s | 608.3 µs | **3.76 TB/s** | kernel-dominated |
-| 2048 | — | — | 1211.7 µs | 3.77 TB/s | kernel-dominated |
-| 4096 | — | — | 2472.2 µs | 3.70 TB/s | kernel-dominated |
+| 1 | 4.4 µs | 504 GB/s | 5.4 µs | 415 GB/s | latency-bound |
+| 4 | 4.6 µs | 1.94 TB/s | 5.5 µs | 1.63 TB/s | latency-bound |
+| 16 | 7.8 µs | **4.58 TB/s** | 8.1 µs | **4.39 TB/s** | near peak (cache) |
+| 64 | 46.1 µs | 3.10 TB/s | 34.9 µs | 4.09 TB/s | saturating |
+| 128 | 73.5 µs | 3.89 TB/s | 65.6 µs | 4.35 TB/s | saturating |
+| 256 | 174.4 µs | 3.28 TB/s | 164.5 µs | 3.48 TB/s | kernel-dominated |
+| 512 | 341.9 µs | 3.34 TB/s | 335.9 µs | 3.40 TB/s | kernel-dominated |
+| 1024 | 687.2 µs | 3.33 TB/s | 670.6 µs | 3.41 TB/s | kernel-dominated |
+| 2048 | — | — | 1338.9 µs | 3.42 TB/s | kernel-dominated |
+| 4096 | — | — | 2688.3 µs | 3.40 TB/s | kernel-dominated |
 
-With both sides on kernel-only device time, the two **track closely at every tile count**, and
-FlyDSL is **equal to or slightly faster than HIP** across the saturating/kernel-dominated range
-(e.g. 3.62–3.77 vs 3.35–3.39 TB/s at tiles 512–1024). Both are latency-bound only at tiles 1–4,
-and both touch peak near tiles≈16 (a small-footprint cache effect). The dramatic low-tile gap
-seen in earlier reports was entirely the FlyDSL standalone harness's ~230 µs host-call floor;
-with device timing it is gone. **The kernels are at parity (FlyDSL marginally ahead).**
+Both are latency-bound only at tiles 1–4 and touch peak near tiles≈16. In the streaming
+regime (tiles ≥ 256) both settle at **~3.3–3.5 TB/s** — parity at the byte floor.
 
 ---
 
@@ -108,16 +110,14 @@ with device timing it is gone. **The kernels are at parity (FlyDSL marginally ah
 | massive path (≥4) | warp-0 LSE + LDS scale + 2-way pipeline | warp-0 shuffle LSE + LDS `lse_scale` + barrier |
 | tiers | runtime template (≤64/≤256/>256 spill) | compile-time tier (m64/m256/mlds), host-selected |
 | simple↔massive | runtime | runtime `scf.IfOp` (within one compiled tier) |
+| empty tile (n_splits≤1) | skip guards (`reduce.cu:691,743`) | `has_work`/`ub_seq` clamp (qlen>1 fix) |
 | LDS | gather map + lse_scale (no O data) | same; tiny by design (preserve occ-8) |
 | launch | grid-launch + persistent grid-stride | grid-launch (persistent deferred) |
 | exp / log | `exp2`/native | `rocdl.exp2(x·log2e)` / `mlir_math.log` |
+| stage-1 contract | fp32 partial `O`/`LSE` gather | same pointers/layout |
 
-**Functional structure is a faithful 1:1 port.** Two intentional deltas, both perf-neutral at
-the byte floor: (a) FlyDSL selects the split-tier at **compile time** (one kernel per tier)
-because loop-carried tuple arity must be static at trace time — HIP does it via runtime C++
-template; (b) the **persistent grid-stride launcher** is not yet ported — grid-launch already
-saturates HBM, so it is parity-neutral here (it remains the next increment for strict host
-fidelity).
+**Functional structure is a faithful 1:1 port.** FlyDSL selects the split-tier at compile time;
+persistent grid-stride launcher deferred (parity-neutral at the byte floor).
 
 ---
 
@@ -125,10 +125,11 @@ fidelity).
 
 | question | answer |
 |---|---|
-| Correct vs HIP? | **Yes** — validated directly against the HIP kernel (48/48): LSE to 9.5e-7, output within one bf16/fp16 ULP, same 3 shapes. |
-| HBM parity? | **Yes** — 3.6–3.8 TB/s where kernel-dominated, equal-to-slightly-ahead of HIP and within HIP's own band; FlyDSL faster on the simple path (low splits). |
-| Faster? | At parity (FlyDSL marginally ahead) — both at the reduction byte floor (~99% of time is HBM traffic per the HIP rocprofv3 profile). Parity was the bar. |
-| Caveats | None on timing — both sides now use kernel-only device time, so the old ~230 µs host-floor artifact is gone and low-work BW is meaningful. Persistent launcher deferred (parity-neutral at the byte floor). Production wiring is an opt-in fallback: `aiter/mla.py` routes to `flydsl_mla_reduce_v1` only when `AITER_MLA_REDUCE_FLYDSL=1`; default is still HIP `aiter.mla_reduce_v1`. ||
+| Correct vs HIP? | **Yes** — 156/156 standalone + 72/72 e2e (bf16/fp8 qlen 1–4, real stage-1 input) |
+| HBM parity? | **Yes** — ~3.3–3.7 TB/s streaming, equal-to-slightly-ahead except mid-split bump |
+| Faster? | At parity — simple path and high splits slightly favor FlyDSL; both at byte floor |
+| fp8 stage-1 input? | **Same reduce BW** — stage-1 emits fp32 partials; fp8 delta is upstream quant only |
+| Caveats | Mid-split (splits≈16) FlyDSL pipeline overhead; persistent launcher deferred. Production wiring opt-in: `AITER_MLA_REDUCE_FLYDSL=1` |
 
 **The FlyDSL prototype achieves its goal: a native, correct, HBM-parity replacement for the
-HIP MLA decode-reduce on gfx942.**
+HIP MLA decode-reduce on gfx942, including multi-token decode with real stage-1 partial inputs.**
