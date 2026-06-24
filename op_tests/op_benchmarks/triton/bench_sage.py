@@ -68,6 +68,7 @@ KernelName = Literal[
     "fav3_fp8",
     "aiter_fp8",
     "aiter_fp8_flydsl",
+    "aiter_fp8_flydsl_v2",
     "aiter_i8fp8",
     "aiter_bf16",
 ]
@@ -86,6 +87,7 @@ FP8_CHECK_KERNELS = {
     "fav3_fp8",
     "aiter_fp8",
     "aiter_fp8_flydsl",
+    "aiter_fp8_flydsl_v2",
     "aiter_i8fp8",
 }
 
@@ -794,6 +796,44 @@ def make_kernel_runner(
 
         return _run_aiter_fp8_flydsl
 
+    if args.kernel == "aiter_fp8_flydsl_v2":
+        from aiter.ops.flydsl.kernels.flash_attn_fp8_symmetric import (
+            build_flash_attn_fp8_module,
+        )
+
+        B, S, H, D = q_bshd.shape
+        if k_bshd.shape[2] != H:
+            raise ValueError(
+                "aiter_fp8_flydsl_v2: GQA (hk != hq) not supported yet; run with hk == hq"
+            )
+
+        q_fp8, k_fp8, v_fp8, q_ds, k_ds, v_ds = fp8_quantize(q_bshd, k_bshd, v_bshd)
+        exe = build_flash_attn_fp8_module(num_heads=H, head_dim=D)
+        q_flat = q_fp8.view(torch.int8).contiguous().view(-1)
+        k_flat = k_fp8.view(torch.int8).contiguous().view(-1)
+        v_flat = v_fp8.view(torch.int8).contiguous().view(-1)
+        o_flat = torch.empty(B * S * H * D, dtype=torch.bfloat16, device=q_bshd.device)
+        q_dsf = float(q_ds.reshape(-1)[0])
+        k_dsf = float(k_ds.reshape(-1)[0])
+        v_dsf = float(v_ds.reshape(-1)[0])
+
+        def _run_aiter_fp8_flydsl_v2():
+            exe(
+                q_flat,
+                k_flat,
+                v_flat,
+                o_flat,
+                q_dsf,
+                k_dsf,
+                v_dsf,
+                B,
+                S,
+                torch.cuda.current_stream(),
+            )
+            return o_flat.view(B, S, H, D)
+
+        return _run_aiter_fp8_flydsl_v2
+
     if args.kernel == "aiter_i8fp8":
         q_clip = args.q_clip if args.q_clip is not None else args.qk_clip
         k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
@@ -1004,6 +1044,7 @@ def benchmark_single_case(
         "fav3_fp8",
         "aiter_fp8",
         "aiter_fp8_flydsl",
+        "aiter_fp8_flydsl_v2",
         "aiter_i8fp8",
         "sage_fp8",
         "sage_mxfp4",
@@ -1016,7 +1057,14 @@ def benchmark_single_case(
 
     v_elem_size = (
         1
-        if args.kernel in ("fav3_fp8", "aiter_fp8", "aiter_fp8_flydsl", "aiter_i8fp8")
+        if args.kernel
+        in (
+            "fav3_fp8",
+            "aiter_fp8",
+            "aiter_fp8_flydsl",
+            "aiter_fp8_flydsl_v2",
+            "aiter_i8fp8",
+        )
         else v.element_size()
     )
     mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
@@ -1211,6 +1259,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "fav3_fp8",
         "aiter_fp8",
         "aiter_fp8_flydsl",
+        "aiter_fp8_flydsl_v2",
         "aiter_i8fp8",
     )
 
@@ -1538,6 +1587,7 @@ def parse_args() -> argparse.Namespace:
             "fav3_fp8",
             "aiter_fp8",
             "aiter_fp8_flydsl",
+            "aiter_fp8_flydsl_v2",
             "aiter_i8fp8",
             "aiter_bf16",
             "all",
