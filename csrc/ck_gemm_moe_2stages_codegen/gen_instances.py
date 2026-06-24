@@ -3,7 +3,11 @@
 import os
 import argparse
 import itertools
-from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
+from gemm_moe_ck2stages_common import (
+    ACT_OP_MAP,
+    get_gemm1_kernels_list,
+    get_gemm2_kernels_list,
+)
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -926,9 +930,7 @@ class ck_moe_2stage_gemm_codegen:
                             Nswizzle=str(self.nswizzle).lower(),
                             Quant=self.quant_type,
                             ActOP=(
-                                int(self.activation == "silu")
-                                if kernel.stage == 1
-                                else 0
+                                ACT_OP_MAP[self.activation] if kernel.stage == 1 else 0
                             ),
                             Stage=kernel.stage,
                             BlockSize=kernel.BLOCK_SIZE,
@@ -958,7 +960,7 @@ class ck_moe_2stage_gemm_codegen:
                     CDEElementOp=kernel.CDEElementOp,
                     Nswizzle=str(self.nswizzle).lower(),
                     Quant=self.quant_type,
-                    ActOP=int(self.activation == "silu") if kernel.stage == 1 else 0,
+                    ActOP=ACT_OP_MAP[self.activation] if kernel.stage == 1 else 0,
                     Stage=kernel.stage,
                     BlockSize=kernel.BLOCK_SIZE,
                     MPerBlock=kernel.MPerBlock,
@@ -989,7 +991,7 @@ class ck_moe_2stage_gemm_codegen:
                 CDEElementOp=kernel_list[0].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
-                ActOP=str(int(self.activation == "silu")),
+                ActOP=str(ACT_OP_MAP[self.activation]),
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
                 Preshuffle=str(self.preshuffle).lower(),
             )
@@ -1071,7 +1073,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu"],
+        choices=["silu", "gelu", "swiglu"],
         help="select activation",
     )
 
@@ -1200,6 +1202,43 @@ if __name__ == "__main__":
                 act,
                 routed_weight,
                 preshuffle_mode,
+                False,  # splitk
+            )
+            codegen.generate_instance_and_lookUpTable()
+
+        # swiglu (OAI swiglu_oai) plain-f8 quant moe (per_tensor / per_token = PTPC).
+        # The general quant loop above (acts=["silu","gelu"]) covers silu/gelu x
+        # {per_tensor, per_token} but excludes swiglu, so build-all (AOT/wheel
+        # prebuild) ships 0 swiglu x plain-f8 instances. Runtime JIT (Path B,
+        # gen_func passes -b f8) already generates them on demand (GPU-verified
+        # cos 0.999993), so this loop only extends the AOT prebuild set + removes
+        # the ~first-run cold compile -- it is NOT required for correctness.
+        # Mirrors the general loop's plain-f8 path: f8 x f8, per_token=2 / per_tensor=1
+        # are not in QuantType_list=[3,4] -> tag=a8w8, CDEElementOp=MulABScale, plain
+        # gridwise_moe_gemm.hpp cuh (same path as silu/gelu, no tag/cuh mismatch).
+        # act="swiglu" -> CK ActOP=3. preshuffle forced True for plain f8 (matches
+        # the general loop's `preshuffle_mode if quant=="per_1x32" else True`).
+        # Independent loop so existing silu/gelu/no-quant coverage is untouched.
+        swiglu_plain_c_dtypes = ["f16", "b16"]
+        swiglu_plain_quant_l = ["per_tensor", "per_token"]
+        for (
+            c_dtype,
+            routed_weight,
+            quant,
+        ) in itertools.product(
+            swiglu_plain_c_dtypes,
+            routed_weight_l,
+            swiglu_plain_quant_l,
+        ):
+            codegen = ck_moe_2stage_gemm_codegen(
+                args.working_path,
+                "f8",  # a_dtype
+                "f8",  # b_dtype
+                c_dtype,
+                quant_dict[quant],
+                "swiglu",
+                routed_weight,
+                True,  # preshuffle (plain f8 forced True, mirrors general loop)
                 False,  # splitk
             )
             codegen.generate_instance_and_lookUpTable()
