@@ -267,6 +267,12 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         else:
             block_n = 256
             num_warps = 4
+    
+    elif block_m == 64:
+        block_n = 256
+        block_k = 512
+        num_stages = 2
+        num_warps = 4
 
     else:
         block_n = 256
