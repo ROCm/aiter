@@ -12,9 +12,9 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
-    preshuffle_weights_gfx1250,
 )
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from aiter.ops.shuffle import shuffle_weight_gfx1250
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -291,7 +291,7 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if preshuffled:
-        w_tri = preshuffle_weights_gfx1250(w_tri)
+        w_tri = shuffle_weight_gfx1250(w_tri)
     if hbm_swizzling:
         if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
