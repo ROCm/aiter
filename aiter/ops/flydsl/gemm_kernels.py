@@ -732,6 +732,43 @@ def _check_split_k_semaphore_capacity(
         )
 
 
+# ── Preshuffle (mxfp8) split-K counter pool ───────────────────────────────────
+# Dedicated, self-contained semaphore/signal pool for the preshuffle atomic
+# split-K path. Kept SEPARATE from the hgemm SPLIT_K_GLOBAL_* pool and helpers
+# above so that changes to the hgemm split-K machinery cannot silently affect
+# the mxfp8 split-K reduction (no shared mutable state, no dependency on the
+# hgemm-private helpers). The kernel self-resets these counters to zero on the
+# last arrival, so the cached zeroed buffers are reused across calls.
+PRESHUFFLE_SPLIT_K_MAX_TILES = 256
+
+
+@functools.lru_cache(maxsize=128)
+def _get_preshuffle_split_k_tensors(
+    device: torch.device,
+    stream: torch.cuda.Stream,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    semaphore = torch.zeros(
+        (PRESHUFFLE_SPLIT_K_MAX_TILES,), dtype=torch.int32, device=device
+    )
+    signal = torch.zeros(
+        (PRESHUFFLE_SPLIT_K_MAX_TILES,), dtype=torch.int32, device=device
+    )
+    return semaphore, signal
+
+
+def _check_preshuffle_split_k_capacity(
+    m: int, n: int, tile_m: int, tile_n: int, split_k: int
+) -> None:
+    if split_k <= 1:
+        return
+    required = ((m + tile_m - 1) // tile_m) * (n // tile_n)
+    if required > PRESHUFFLE_SPLIT_K_MAX_TILES:
+        raise ValueError(
+            "Preshuffle split-K tile count exceeds counter pool: "
+            f"requires {required}, max is {PRESHUFFLE_SPLIT_K_MAX_TILES}"
+        )
+
+
 @functools.lru_cache(maxsize=16384)
 def _compile_flydsl_hgemm(
     dtype: str,
@@ -1055,6 +1092,10 @@ def flydsl_preshuffle_gemm_a8(
     # epilogue != "none"). Pass an empty tensor as a placeholder for the
     # default epilogue="none" path.
     _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
+    # arg_semaphore / arg_signal are only used by split-K (this path is
+    # single-pass); pass 1-element placeholders.
+    _dummy_semaphore = torch.empty(1, dtype=torch.int32, device=Out.device)
+    _dummy_signal = torch.empty(1, dtype=torch.int32, device=Out.device)
     _run_compiled(
         exe,
         _ptr_view_safe(out_contig.view(-1)),
@@ -1063,9 +1104,138 @@ def flydsl_preshuffle_gemm_a8(
         _ptr_view_safe(x_scale.contiguous().view(-1)),
         _ptr_view_safe(w_scale.contiguous().view(-1)),
         _ptr_view_safe(_dummy_bias),
+        _ptr_view_safe(_dummy_semaphore.view(-1)),
+        _ptr_view_safe(_dummy_signal.view(-1)),
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),
+    )
+    if out_contig is not Out:
+        Out.copy_(out_contig)
+
+    return Out
+
+
+def flydsl_preshuffle_gemm_mxfp8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    lds_stage: int = 2,
+    use_cshuffle_epilog: int = 0,
+    use_async_copy: int = 0,
+    waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
+    split_k: int = 1,
+) -> Tensor:
+    """Compile (cached) and run a FlyDSL mxfp8 preshuffle GEMM (gfx950).
+
+    mxfp8 = fp8 (E4M3) activations AND fp8 weights, both with per-1x32 e8m0
+    microscales applied in-MMA (mfma_scale_f32_16x16x128_f8f6f4).
+
+    Args:
+        XQ:      [M, K]   fp8 activations (row-major, NOT preshuffled).
+        WQ:      [N, K]   fp8 weights, preshuffled via shuffle_weight((16, 16)).
+        x_scale: [M, K//32] e8m0 (uint8) activation scales, e8m0_shuffle'd.
+        w_scale: [N, K//32] e8m0 (uint8) weight scales, e8m0_shuffle'd.
+        Out:     [M, N]   bf16 / fp16 output.
+        split_k: split the K reduction across `split_k` workgroups (grid.z).
+                 Each workgroup bf16-atomic-adds its partial into the single
+                 [M, N] output, which the kernel zeroes in-kernel first (matches
+                 ck_gemm_a8w8_blockscale). split_k == 1 is the single-pass GEMM.
+    """
+    compile_fn = _get_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("[FlyDSL] compile function not available")
+
+    m, k = XQ.shape[0], XQ.shape[-1]
+    n = WQ.shape[0]
+    split_k = int(split_k)
+
+    if n % tile_n != 0:
+        raise RuntimeError(
+            f"[FlyDSL] N ({n}) is not a multiple of tile_n ({tile_n}). "
+            f"Arguments not supported! Skipping gemm!"
+        )
+    if k % tile_k != 0:
+        raise RuntimeError(
+            f"[FlyDSL] K ({k}) is not a multiple of tile_k ({tile_k}). "
+            f"Arguments not supported! Skipping gemm!"
+        )
+    if split_k > 1 and (k % split_k != 0 or (k // split_k) % tile_k != 0):
+        raise RuntimeError(
+            f"[FlyDSL] split_k ({split_k}) requires K ({k}) % split_k == 0 and "
+            f"K//split_k % tile_k ({tile_k}) == 0."
+        )
+
+    wpe = None if waves_per_eu <= 0 else waves_per_eu
+
+    if Out.dtype == torch.bfloat16:
+        out_dtype = "bf16"
+    elif Out.dtype == torch.float16:
+        out_dtype = "fp16"
+    else:
+        raise ValueError(
+            f"[FlyDSL] unsupported output dtype {Out.dtype}; expected bfloat16 or float16"
+        )
+
+    exe = compile_fn(
+        N=n,
+        K=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        in_dtype="mxfp8",
+        out_dtype=out_dtype,
+        lds_stage=lds_stage,
+        use_cshuffle_epilog=bool(use_cshuffle_epilog),
+        use_async_copy=bool(use_async_copy),
+        waves_per_eu=wpe,
+        xcd_swizzle=int(xcd_swizzle),
+        split_k=split_k,
+    )
+
+    def _as_i8_view(t):
+        # fp8 data and e8m0 scales are both 1-byte; pass the raw bytes as int8.
+        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+    # split-K: every K-slice block bf16-atomic-adds its partial directly into the
+    # single [M, N] output (matching ck_gemm_a8w8_blockscale's bf16 atomic
+    # reduction) — no [split_k, M, N] scratch buffer. The kernel zeroes the
+    # output in-kernel before the atomic adds (signal-coordinated).
+    out_contig = Out.contiguous()
+    c_arg = out_contig.view(-1)
+
+    # split-K: persistent per-(m,n)-tile semaphore + signal counters (the kernel
+    # self-resets them, so the cached zeroed buffers are reused across calls;
+    # the kernel zeroes the actual output C in-kernel). Uses a DEDICATED pool
+    # (not the hgemm one) so the two split-K paths stay fully decoupled.
+    launch_stream = torch.cuda.current_stream()
+    if split_k > 1:
+        _check_preshuffle_split_k_capacity(m, n, tile_m, tile_n, split_k)
+        semaphore, signal = _get_preshuffle_split_k_tensors(Out.device, launch_stream)
+    else:
+        semaphore = torch.empty(1, dtype=torch.int32, device=Out.device)
+        signal = torch.empty(1, dtype=torch.int32, device=Out.device)
+
+    _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
+    _run_compiled(
+        exe,
+        _ptr_view_safe(c_arg),
+        _ptr_view_safe(_as_i8_view(XQ.contiguous()).view(-1)),
+        _ptr_view_safe(_as_i8_view(WQ.contiguous()).view(-1)),
+        _ptr_view_safe(_as_i8_view(x_scale.contiguous()).view(-1)),
+        _ptr_view_safe(_as_i8_view(w_scale.contiguous()).view(-1)),
+        _ptr_view_safe(_dummy_bias),
+        _ptr_view_safe(semaphore.view(-1)),
+        _ptr_view_safe(signal.view(-1)),
+        m,
+        n,
+        fx.Stream(launch_stream),
     )
     if out_contig is not Out:
         Out.copy_(out_contig)

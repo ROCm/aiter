@@ -324,6 +324,10 @@ def _compile_preshuffle_to_cache(
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
     bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
+    # arg_semaphore / arg_signal placeholders (only used by split-K; AOT
+    # compiles split_k=1).
+    semaphore = torch.empty(1, device=dev, dtype=torch.int32)
+    signal = torch.empty(1, device=dev, dtype=torch.int32)
     stream = fx.Stream(0)
 
     exe = compile_preshuffle_gemm_a8(
@@ -348,6 +352,8 @@ def _compile_preshuffle_to_cache(
         _ptr_view_safe(scale_a),
         _ptr_view_safe(scale_b),
         _ptr_view_safe(bias),
+        _ptr_view_safe(semaphore),
+        _ptr_view_safe(signal),
         m,
         n,
         stream,
