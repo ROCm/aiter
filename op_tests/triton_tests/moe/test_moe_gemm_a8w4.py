@@ -239,6 +239,12 @@ def test_op(
     if preshuffled and get_arch() != "gfx1250":
         pytest.skip("Preshuffled weights are only supported on gfx1250.")
 
+    if preshuffled and ((k // 2) % 32 != 0 or n % 16 != 0):
+        pytest.skip(
+            f"Preshuffle requires (k//2) divisible by 32 and N divisible by 16, "
+            f"got k//2={k // 2}, N={n}."
+        )
+
     if get_arch() == "gfx1250":
         # if act_dtype_str == "mxfloat8_e4m3fn":
         #     pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
