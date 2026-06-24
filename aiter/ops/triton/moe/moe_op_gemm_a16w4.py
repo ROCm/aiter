@@ -153,7 +153,7 @@ def moe_gemm_a16w4(
     apply_swiglu=False,
     alpha=1.0,
     limit=1.0,
-    add_residual=True,
+    swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
 ):
@@ -254,7 +254,7 @@ def moe_gemm_a16w4(
         alpha,
         limit,
         reduction_n_matmul,
-        add_residual,
+        swiglu_add_residual,
         routing_data.n_expts_act,
         config["block_m"],
         config["block_n"],
@@ -289,7 +289,7 @@ def moe_gemm_a16w4(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
 
     return y_final
@@ -355,6 +355,7 @@ def moe_gemm_torch(
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=x.device)
         else:
+            gather_indx = gather_indx.to(torch.int32)
             idx = gather_indx[lo:hi] // n_expts_act
         out = torch.matmul(x[idx, :].float(), w[i].float())
         if bias is not None:
@@ -368,6 +369,7 @@ def moe_gemm_torch(
         return y
 
     # accumulate output from all experts
+    scatter_indx = scatter_indx.to(torch.int32)
     n_rows = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows, y.shape[-1]), dtype=torch.float32, device=x.device)
     src_idx = scatter_indx.view(-1, n_expts_act)

@@ -857,6 +857,24 @@ def rope_rotate_activation(
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
+def rope_rotate_activation_fp8quant(
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    group_size: int = 128,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate, then
+    fp8-quantize: ``out`` is fp8 and ``scale`` (``[m, dim // group_size]`` fp32)
+    receives the per-(row, ``1 x group_size``) block scales
+    ``scale = absMax / fp8_max``. Symmetric to ``rope_rotate_activation_fp4quant``."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
 def rmsnorm_rope_rotate_activation_fp4quant_kvcache(
     kvcache: torch.Tensor,
     scale: torch.Tensor,

@@ -1458,6 +1458,16 @@ namespace py = pybind11;
           py::arg("sin"),                                                \
           py::arg("positions"),                                          \
           py::arg("rope_dim"));                                          \
+    m.def("rope_rotate_activation_fp8quant",                             \
+          &aiter::rope_rotate_activation_fp8quant,                       \
+          py::arg("out"),                                                \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("rope_dim"),                                           \
+          py::arg("group_size") = 128);                                  \
     m.def("rmsnorm_rope_rotate_activation_fp4quant_kvcache",             \
           &aiter::rmsnorm_rope_rotate_activation_fp4quant_kvcache,       \
           py::arg("kvcache"),                                            \

@@ -10,7 +10,7 @@ from aiter.int4_utils import (
     rearrange_4bit_elements,
     convert_int8_to_uint32_int4,
 )
-from aiter.ops.quant import per_1x32_i4_quant
+from aiter.ops.quant import per_1x32_i4_quant, per_1x32_f8_scale_f8_quant
 from aiter.utility import fp4_utils
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx, get_cu_num
@@ -30,6 +30,13 @@ from aiter.fused_moe import (
 from aiter.aot.flydsl.common import fail_on_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
 import aiter.ops.flydsl.moe_kernels as _aiter_mk
+
+try:
+    from tuned_op_bench_utils import append_tuned_op_bench_rows
+except ModuleNotFoundError as e:
+    if e.name != "tuned_op_bench_utils":
+        raise
+    from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 
 
 from aiter.ops.shuffle import (
@@ -72,11 +79,18 @@ def test_fmoe(
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
     torch_quant = aiter.get_torch_quant(qType)
+    # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
+    is_mxfp8 = (
+        qType == aiter.QuantType.per_1x32
+        and AQDType == dtypes.fp8
+        and WQDType == dtypes.fp8
+    )
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
-        if hidden_pad != 0 and intermediate_pad != 0:
+        if hidden_pad != 0:
             w1[:, :, -hidden_pad:] = 0
+        if intermediate_pad != 0:
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
         exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
@@ -84,8 +98,9 @@ def test_fmoe(
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
-    if hidden_pad != 0 and intermediate_pad != 0:
+    if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
+    if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if AITER_MOE_EXPERT_BALANCE:
@@ -116,6 +131,13 @@ def test_fmoe(
         w1_qt = w1_qt.view(dtypes.i4x2)
         w2_qt, w2_scale = per_1x32_i4_quant(w2)
         w2_qt = w2_qt.view(dtypes.i4x2)
+    elif is_mxfp8:  # mxfp8: fp8 weights, per-1x32 e8m0 scale
+        w1_qt, w1_scale = per_1x32_f8_scale_f8_quant(
+            w1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        w2_qt, w2_scale = per_1x32_f8_scale_f8_quant(
+            w2, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
     elif qType == aiter.QuantType.per_128x128:
 
         def weight_per_128x128_quant(weight, quant_dtype):
@@ -150,7 +172,12 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
-    if qType == aiter.QuantType.per_1x32 and WQDType != dtypes.i4x2:
+    if qType == aiter.QuantType.per_1x32 and WQDType not in (
+        dtypes.i4x2,
+        dtypes.fp8,
+    ):
+        # fp4x2 weights pack 2 nibbles/byte -> halved last dim. fp8 (mxfp8) and
+        # i4x2 keep their stored shape.
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
     else:
@@ -168,7 +195,7 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and WQDType == dtypes.fp4x2
-    ):  # a16w4 & a8w4
+    ) or is_mxfp8:  # a16w4 & a8w4 & mxfp8
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     elif qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
@@ -239,6 +266,11 @@ def test_fmoe(
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+    elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
@@ -309,7 +341,7 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4 & a8w4
+    ) or is_mxfp8:  # a16w4 & a8w4 & mxfp8
         a2_qt = out1_ref
         a2_scale = None
     elif (
@@ -357,6 +389,15 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
+    # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
+    # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
+    # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
+    # masked by atomic-reduction noise, so detect NaN explicitly and deterministically.
+    has_nan = out2_ck.isnan().any().item()
+    if has_nan:
+        logging.error(
+            "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
+        )
     err = checkAllclose(
         out2_ref,
         out2_ck,
@@ -375,9 +416,12 @@ def test_fmoe(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
     if strict_accuracy:
+        assert not has_nan, "accuracy check failed: output contains NaN"
         assert not (
             err != 0 and logits_diff > 0.01
         ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+    elif has_nan:
+        logging.warning("accuracy check failed (non-strict): output contains NaN")
     elif err != 0 and logits_diff > 0.01:
         logging.warning(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
@@ -399,6 +443,7 @@ l_quant = [
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2),  # a16wi4
+    (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp8),  # mxfp8 (a8w8)
 ]
 
 
@@ -464,7 +509,8 @@ parser.add_argument(
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
     6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
     7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,
-    8: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2,  # a16wi4,""",
+    8: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2,  # a16wi4,
+    9: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp8,  # mxfp8 (a8w8),""",
 )
 
 parser.add_argument(
@@ -671,6 +717,9 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 def _effective_gate_mode(aq_dtype, wq_dtype):
     if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
+    # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
+    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
+        return GateMode.INTERLEAVE.value
     return GateMode.SEPARATED.value
 
 
@@ -743,7 +792,7 @@ def _iter_legacy_cases():
     ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
         triple = (quant_type, aq_dtype, wq_dtype)
 
-        if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+        if triple == _PER1X32_BF16_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for m in args.tokenNum:
                     yield _kw(
@@ -759,6 +808,23 @@ def _iter_legacy_cases():
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
                     ), extras
+        elif triple == _PER1X32_FP8_FP4:
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+                for act_type in args.act:
+                    for m in args.tokenNum:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                        ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:
@@ -816,6 +882,28 @@ if not args.no_legacy:
     _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
 
+_csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
+
+
+def _write_bench_csv(rows):
+    if not _csv_out or len(rows) == 0:
+        return
+    row = rows[-1]
+    if row.get("model") == "legacy":
+        return
+    written = append_tuned_op_bench_rows(
+        _csv_out,
+        [row],
+        op_name="moe_2stage",
+        metric_cols=("us",),
+        default_impl="fused_moe",
+    )
+    if written:
+        aiter.logger.info(
+            "moe_2stage: appended %d tuned op bench row(s) to %s", written, _csv_out
+        )
+
+
 df = []
 seen = 0
 for kwargs, extras in case_iter:
@@ -851,6 +939,7 @@ for kwargs, extras in case_iter:
         continue
     ret.update(extras)
     df.append(ret)
+    _write_bench_csv(df)
 
 aiter.logger.info(
     "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",

@@ -17,12 +17,17 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
+from chip_info import (  # noqa: E402
+    build_tune_dict,
+    write_lookup_header,
+    write_name_keyed_lookup_header,
+)
 
 from gemm_a4w4_blockscale_common import (  # noqa: E402
     default_kernels_dict,
     kernelInstance,
     kernels_list,
+    kernels_by_name,
 )
 
 """
@@ -147,7 +152,16 @@ template torch::Tensor
             ).write_text(INSTANCE_dFP32_eFP16)
 
     def gen_lookup_dict(self, kernels_dict):
-        LOOKUP_head = """#pragma once
+        """Generate the dispatch lookup header.
+
+        - Tune mode: kernelId-keyed table for *_tune.cu (unchanged).
+        - Non-tune mode: name-keyed registry for the Python-driven dispatch
+          in gemm_a4w4_blockscale.cu.
+        """
+        output_path = os.path.join(self.working_path, "gemm_a4w4_blockscale_lookup.h")
+
+        if self.istune:
+            LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -156,23 +170,49 @@ template torch::Tensor
 #define GENERATE_LOOKUP_TABLE(CTYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
-        LOOKUP_template = """
+            LOOKUP_template = """
        {{{MNK},                                                                                                       \\
         {kernel_name}<CTYPE>}},                       \\"""
 
-        LOOKUP_end = """
+            LOOKUP_end = """
    }
 
 #endif // USE_ROCM
 """
-        write_lookup_header(
-            os.path.join(self.working_path, "gemm_a4w4_blockscale_lookup.h"),
-            kernels_dict,
-            LOOKUP_head,
-            LOOKUP_template,
-            LOOKUP_end,
-            self.istune,
-        )
+            write_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+                self.istune,
+            )
+        else:
+            LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(CTYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+            LOOKUP_template = """
+       {{"{kernel_name}",                                                                                                       \\
+        {kernel_name}<CTYPE>}},                       \\"""
+
+            LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+            write_name_keyed_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+            )
 
     def gen_manifest_head(self, kernels_dict):
         MAINFEST_head = """#pragma once
@@ -226,8 +266,20 @@ torch::Tensor
 
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
+        df = pd.read_csv(tune_dict_csv)
+        # The a4w4 tuned CSV mixes CK kernels and ASM kernels in one file with
+        # no libtype column.  The Python dispatcher in
+        # aiter/ops/gemm_op_a4w4.py routes ASM rows by
+        # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
+        # apply the same filter here so the CK codegen sees only CK rows and
+        # build_tune_dict's strict validation stays effective on genuine CK
+        # references.
+        df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
         return build_tune_dict(
-            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list
+            df,
+            default_kernels_dict,
+            kernels_list,
+            kernels_by_name=kernels_by_name,
         )
     return default_kernels_dict
 
