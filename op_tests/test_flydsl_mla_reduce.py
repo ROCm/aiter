@@ -24,7 +24,9 @@ def build_inputs(num_tiles, num_splits, H, Dv, out_dtype, M=1, device="cuda", se
         num_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
     )
     partial_lse = (
-        torch.randn(num_partial_rows, H, dtype=torch.float32, device=device, generator=g)
+        torch.randn(
+            num_partial_rows, H, dtype=torch.float32, device=device, generator=g
+        )
         * 2.0
     )
     # CSR over splits is independent of M: each tile has `num_splits` entries.
@@ -65,7 +67,9 @@ def build_degenerate_inputs(num_tiles, H, Dv, out_dtype, device="cuda", seed=0):
     -> GPU illegal memory access. Returns the same 7-tuple as build_inputs."""
     g = torch.Generator(device=device).manual_seed(seed)
     # Valid single-row partial buffers: the guard must make these unreachable.
-    partial_output = torch.randn(1, H, Dv, dtype=torch.float32, device=device, generator=g)
+    partial_output = torch.randn(
+        1, H, Dv, dtype=torch.float32, device=device, generator=g
+    )
     partial_lse = torch.randn(1, H, dtype=torch.float32, device=device, generator=g)
     # Every tile has zero splits: indptr[t+1] - indptr[t] == 0.
     reduce_indptr = torch.zeros(num_tiles + 1, dtype=torch.int32, device=device)
@@ -134,20 +138,36 @@ def hip_ref(po, pl, indptr, fmap, pmap, num_tiles, H, Dv, out_dtype, M=1):
     return ref_out, ref_lse
 
 
-def make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, output_lse, M=1):
+def make_runner(
+    po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, output_lse, M=1
+):
     """Precompile + bind args; return a zero-overhead closure for the timed loop."""
     num_tiles = fmap.shape[0]
     max_splits = torch.cuda.get_device_properties(0).multi_processor_count
     splits = int(indptr[1].item() - indptr[0].item())  # CSR row-0 width
     tier = select_tier(splits)
     kernel = compile_mla_reduce(
-        H=H, Dv=Dv, out_dtype=out_dtype_str, tier=tier,
-        persistent=False, output_lse=output_lse, use_reduce_final_map=True,
+        H=H,
+        Dv=Dv,
+        out_dtype=out_dtype_str,
+        tier=tier,
+        persistent=False,
+        output_lse=output_lse,
+        use_reduce_final_map=True,
     )
     head = (
-        po, pl, indptr, pmap, fmap, fout, flse,
-        int(fout.stride(0)), int(fout.stride(1)),
-        int(max_splits), int(num_tiles), int(M),
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        fout,
+        flse,
+        int(fout.stride(0)),
+        int(fout.stride(1)),
+        int(max_splits),
+        int(num_tiles),
+        int(M),
     )
 
     def run():
@@ -158,8 +178,12 @@ def make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, ou
     return run
 
 
-def run_flydsl(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, output_lse, M=1):
-    make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, output_lse, M)()
+def run_flydsl(
+    po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, output_lse, M=1
+):
+    make_runner(
+        po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, output_lse, M
+    )()
 
 
 def bench_cudagraph(fn, num_warmup=25, num_iters=100):
@@ -200,7 +224,9 @@ def check_one(H, Dv, T_, S, dtype_str, output_lse, atol=None, ltol=1e-3, M=1):
     po, pl, indptr, fmap, pmap, fout, flse = build_inputs(T_, S, H, Dv, out_dtype, M=M)
     fout.zero_()
     flse.zero_()
-    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dtype_str, output_lse, M)
+    run = make_runner(
+        po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dtype_str, output_lse, M
+    )
     run()
     torch.cuda.synchronize()
     ref_out, ref_lse = hip_ref(po, pl, indptr, fmap, pmap, T_, H, Dv, out_dtype, M)
@@ -266,7 +292,9 @@ def main():
     ap.add_argument("--Dv", type=int, default=512)
     ap.add_argument("--tiles", type=int, default=4)
     ap.add_argument("--splits", type=int, default=2)
-    ap.add_argument("--M", type=int, default=1, help="max_seqlen_q (q-positions per token group)")
+    ap.add_argument(
+        "--M", type=int, default=1, help="max_seqlen_q (q-positions per token group)"
+    )
     ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     ap.add_argument("--lse", action="store_true")
     ap.add_argument("--bench", action="store_true")

@@ -24,7 +24,9 @@ def build_inputs(num_tiles, num_splits, H, Dv, out_dtype, device="cuda", seed=0)
     )
     # LSEs in a realistic range so exp() doesn't blow up
     partial_lse = (
-        torch.randn(num_partial_rows, H, dtype=torch.float32, device=device, generator=g)
+        torch.randn(
+            num_partial_rows, H, dtype=torch.float32, device=device, generator=g
+        )
         * 2.0
     )
 

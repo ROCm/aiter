@@ -224,7 +224,8 @@ def compile_mla_reduce(
             base = allocator.get_base()
             lds_scale = STensor(
                 SmemPtr(base, lse_scale_off, T.f32, shape=(LDS_MAX_SPLITS,)),
-                dtype=T.f32, shape=(LDS_MAX_SPLITS,),
+                dtype=T.f32,
+                shape=(LDS_MAX_SPLITS,),
             )
 
         # NTG (number of q-position groups) = grid-y, read at runtime so one
@@ -257,8 +258,9 @@ def compile_mla_reduce(
         def store_lse(seq, max_lse, sum_e):
             if const_expr(output_lse):
                 bad = arith.ori(
-                    arith.cmpf(arith.CmpFPredicate.OEQ, sum_e,
-                               arith.constant(0.0, type=T.f32)),
+                    arith.cmpf(
+                        arith.CmpFPredicate.OEQ, sum_e, arith.constant(0.0, type=T.f32)
+                    ),
                     arith.cmpf(arith.CmpFPredicate.UNO, sum_e, sum_e),
                 )
                 lse_val = _log(sum_e) + max_lse
@@ -292,8 +294,9 @@ def compile_mla_reduce(
                 init += [_to_raw(lse0), _to_raw(arith.constant(1.0, type=T.f32))]
 
                 results = init
-                for s, state in range(fx.Index(1), fx.Index(n_splits),
-                                      fx.Index(1), init=init):
+                for s, state in range(
+                    fx.Index(1), fx.Index(n_splits), fx.Index(1), init=init
+                ):
                     regs = [state[i] for i in range_constexpr(VEC)]
                     max_lse = state[VEC]
                     sum_e = state[VEC + 1]
@@ -308,7 +311,8 @@ def compile_mla_reduce(
                         for i in range_constexpr(VEC)
                     ]
                     results = yield new_regs + [
-                        _to_raw(new_max), _to_raw(sum_e * old + new)
+                        _to_raw(new_max),
+                        _to_raw(sum_e * old + new),
                     ]
 
                 regs = [results[i] for i in range_constexpr(VEC)]
@@ -328,7 +332,8 @@ def compile_mla_reduce(
                     for j in range_constexpr(NLSE):
                         split_idx = lane + fx.Int32(j * WARP)
                         in_rng = arith.cmpi(
-                            arith.CmpIPredicate.slt, split_idx, n_splits)
+                            arith.CmpIPredicate.slt, split_idx, n_splits
+                        )
                         safe = in_rng.select(split_idx, fx.Int32(0))
                         rs = gather_row(safe, local_seq)
                         lse_j = g_pl[rs, fx.Index(head)]
@@ -339,7 +344,8 @@ def compile_mla_reduce(
                         peer = mlir_gpu.ShuffleOp(
                             _to_raw(max_lse),
                             _to_raw(arith.constant(off, type=T.i32)),
-                            width_i32, mode="xor",
+                            width_i32,
+                            mode="xor",
                         ).shuffleResult
                         max_lse = arith.maximumf(max_lse, peer)
                     sum_e = arith.constant(0.0, type=T.f32)
@@ -349,12 +355,16 @@ def compile_mla_reduce(
                         peer = mlir_gpu.ShuffleOp(
                             _to_raw(sum_e),
                             _to_raw(arith.constant(off, type=T.i32)),
-                            width_i32, mode="xor",
+                            width_i32,
+                            mode="xor",
                         ).shuffleResult
                         sum_e = sum_e + peer
                     bad = arith.ori(
-                        arith.cmpf(arith.CmpFPredicate.OEQ, sum_e,
-                                   arith.constant(0.0, type=T.f32)),
+                        arith.cmpf(
+                            arith.CmpFPredicate.OEQ,
+                            sum_e,
+                            arith.constant(0.0, type=T.f32),
+                        ),
                         arith.cmpf(arith.CmpFPredicate.UNO, sum_e, sum_e),
                     )
                     inf = arith.constant(float("inf"), type=T.f32)
@@ -362,7 +372,8 @@ def compile_mla_reduce(
                     for j in range_constexpr(NLSE):
                         split_idx = lane + fx.Int32(j * WARP)
                         in_rng = arith.cmpi(
-                            arith.CmpIPredicate.slt, split_idx, n_splits)
+                            arith.CmpIPredicate.slt, split_idx, n_splits
+                        )
                         if_s = scf.IfOp(in_rng, results_=[], has_else=False)
                         with ir.InsertionPoint(if_s.then_block):
                             sc = _exp(local_lses[j] - global_lse, use_exp2)
@@ -379,11 +390,14 @@ def compile_mla_reduce(
 
                 gpu.barrier()
 
-                acc0 = [_to_raw(arith.constant(0.0, type=T.f32))
-                        for _ in range_constexpr(VEC)]
+                acc0 = [
+                    _to_raw(arith.constant(0.0, type=T.f32))
+                    for _ in range_constexpr(VEC)
+                ]
                 accr = acc0
-                for s, state in range(fx.Index(0), fx.Index(n_splits),
-                                      fx.Index(1), init=acc0):
+                for s, state in range(
+                    fx.Index(0), fx.Index(n_splits), fx.Index(1), init=acc0
+                ):
                     regs = _as_list(state, VEC)
                     rs = gather_row(fx.Int32(s), local_seq)
                     os = load_o_elems(g_po, rs, fx.Index(head), col)

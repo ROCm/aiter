@@ -1,4 +1,5 @@
 """Single fixed launch of kn_mla_reduce_v1 for rocprofv3 counter collection."""
+
 import os
 import torch
 import aiter
@@ -12,8 +13,13 @@ po = torch.randn(N, H, Dv, dtype=torch.float32, device="cuda", generator=g)
 pl = torch.randn(N, H, dtype=torch.float32, device="cuda", generator=g) * 2
 indptr = torch.arange(0, N + 1, S, dtype=torch.int32, device="cuda")
 pmap = torch.arange(N, dtype=torch.int32, device="cuda")
-fmap = torch.stack([torch.arange(T, dtype=torch.int32, device="cuda"),
-                    torch.arange(1, T + 1, dtype=torch.int32, device="cuda")], 1).contiguous()
+fmap = torch.stack(
+    [
+        torch.arange(T, dtype=torch.int32, device="cuda"),
+        torch.arange(1, T + 1, dtype=torch.int32, device="cuda"),
+    ],
+    1,
+).contiguous()
 fout = torch.empty(T, H, Dv, dtype=torch.bfloat16, device="cuda")
 flse = torch.empty(T, H, dtype=torch.float32, device="cuda")
 

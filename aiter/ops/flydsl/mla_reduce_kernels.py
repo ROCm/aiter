@@ -79,7 +79,9 @@ def flydsl_mla_reduce_v1(
     output_lse = final_lse is not None
     use_reduce_final_map = reduce_final_map is not None
 
-    num_cu = torch.cuda.get_device_properties(final_output.device.index).multi_processor_count
+    num_cu = torch.cuda.get_device_properties(
+        final_output.device.index
+    ).multi_processor_count
 
     # Tier from the observed split count = CSR row-0 width (indptr[1] - indptr[0]),
     # matching the in-kernel `n_splits = indptr[tile+1] - indptr[tile]`. The old
@@ -100,9 +102,7 @@ def flydsl_mla_reduce_v1(
     if final_lse is None:
         final_lse = torch.empty(1, dtype=torch.float32, device=final_output.device)
     if reduce_final_map is None:
-        reduce_final_map = torch.empty(
-            1, dtype=torch.int32, device=final_output.device
-        )
+        reduce_final_map = torch.empty(1, dtype=torch.int32, device=final_output.device)
 
     if stream is None:
         stream = torch.cuda.current_stream(final_output.device)
