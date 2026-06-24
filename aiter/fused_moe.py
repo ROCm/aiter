@@ -285,6 +285,14 @@ def fused_moe(
     splitk=0,
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    # Host-side scheduling hint: an *estimate* of the per-local-expert token
+    # count. Only meaningful for Mori low-latency dispatch, where the dispatched
+    # hidden_states / topk_ids are padded so topk_ids.shape[0] is the padded
+    # buffer size and tells nothing about the real workload. When given, it is
+    # used as the num_token for kernel-config tier lookup instead of the padded
+    # shape; it MUST be identical for every call sharing the same HIP graph (one
+    # graph key -> one fixed expected_m). None -> bit-identical to old behavior.
+    expected_m: Optional[int] = None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -312,6 +320,7 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        expected_m=expected_m,
     )
 
 
@@ -341,6 +350,7 @@ def fused_moe_fake(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    expected_m: Optional[int] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -377,6 +387,7 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    expected_m: Optional[int] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -476,8 +487,17 @@ def fused_moe_(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
+    # Mori low-latency dispatch hands in padded hidden_states / topk_ids, so
+    # M = topk_ids.shape[0] is the padded buffer size and pegs get_padded_M at
+    # the worst tier. When the caller supplies expected_m (a host-side estimate
+    # of the per-local-expert token count) use it as the M for kernel-config
+    # tier lookup ONLY; the real M still drives moe_sorting and the kernels
+    # below. The topk dimension of the key is handled by is_ep (the +1 fake-mask
+    # slot is removed inside get_2stage_cfgs). expected_m is None -> the M used
+    # for lookup is unchanged, i.e. bit-identical to before.
+    M_for_schedule = expected_m if expected_m is not None else M
     metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
+        get_padded_M(M_for_schedule),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
@@ -600,6 +620,7 @@ def fused_moe_(
             swiglu_limit=swiglu_limit,
             gate_mode=gate_mode,
             expert_mask=expert_mask,
+            expected_m=expected_m,
         )
 
 
@@ -1167,10 +1188,6 @@ def get_2stage_cfgs(
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
     keys = (
         gfx,
         cu_num,
@@ -1763,6 +1780,7 @@ def fused_moe_2stages(
     swiglu_limit=0.0,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
+    expected_m: Optional[int] = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -1773,8 +1791,16 @@ def fused_moe_2stages(
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    # Mirror fused_moe_: this second lookup picks the stage1/stage2 kernels
+    # actually executed below, so it must use the same schedule key. Under EP
+    # low-latency dispatch token_num is the padded buffer size; expected_m
+    # overrides the M for tier lookup only (the +1 fake-mask slot on topk is
+    # handled by is_ep inside get_2stage_cfgs). Without this the second lookup
+    # pegs the worst tier and falls back to the slow default kernel (~2x decode
+    # regression). expected_m is None -> bit-identical to before.
+    M_for_schedule = expected_m if expected_m is not None else token_num
     metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
+        get_padded_M(M_for_schedule),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
