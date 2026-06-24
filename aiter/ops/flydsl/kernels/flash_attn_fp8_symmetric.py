@@ -342,17 +342,28 @@ def build_flash_attn_fp8_module(
                 None, [], f"s_waitcnt vmcnt({count})", "", has_side_effects=True
             )
 
-        def waitcnt_barrier():
-            # Before the publishing barrier, EVERY wave drains both:
-            #   vmcnt(0)   -> its next-tile global->LDS DMA writes (publish), and
-            #   lgkmcnt(0) -> its LDS reads of buf i%2 this iteration.
-            # The lgkmcnt drain is the WAR guard: next iteration the OTHER group
-            # DMA-overwrites buf i%2, so all waves (not just the issuing one) must
-            # have finished reading it before the barrier lets anyone proceed.
+        def publish_barrier():
+            # Mid-iteration (between softmax and apply_pv): drain this
+            # iteration's next-tile DMA (vmcnt) and make it visible to all waves
+            # (s_barrier) so apply_pv's K^{i+1} preload -- and the next
+            # iteration's reads -- see the just-published K^{i+1}/V^{i+1}.
             llvm.InlineAsmOp(
                 None,
                 [],
-                "s_waitcnt vmcnt(0)\n\ts_waitcnt lgkmcnt(0)\n\ts_barrier",
+                "s_waitcnt vmcnt(0)\n\ts_barrier",
+                "",
+                has_side_effects=True,
+            )
+
+        def war_barrier():
+            # Loop top: drain the PRIOR iteration's apply_pv LDS reads -- the
+            # V^{i-1} reads of buf (i+1)%2 and the carried K-unit preload
+            # (lgkmcnt) -- then s_barrier so NO wave is still reading buf
+            # (i+1)%2 when this iteration's DMA overwrites it (cross-wave WAR).
+            llvm.InlineAsmOp(
+                None,
+                [],
+                "s_waitcnt lgkmcnt(0)\n\ts_barrier",
                 "",
                 has_side_effects=True,
             )
@@ -489,14 +500,16 @@ def build_flash_attn_fp8_module(
         # All-ones FP8 E4M3 A-operand for the ones-column row-sum MFMAs.
         ones_pack = Vec.filled(A_FP8_PER_LANE // 4, 0x38383838, fx.Int32)
 
-        def apply_pv(o_accs, l_acc, p_pack, p_rowsum, corr, v_off, preloaded_vw):
+        def apply_pv(
+            o_accs, l_acc, p_pack, p_rowsum, corr, v_off, preloaded_vw, k_buf_off
+        ):
             # O *= corr ; then O += V^T@P over the PV_K_STEPS 64-kv K-steps.
             # L is a scalar VALU online update L = L*corr + rowsum.
             # 4-window rotating buffer: vw[u%4] consumed at MFMA u.
             # preloaded_vw[0..1] seed from the preceding do_qk dead windows.
-            # No cross-iteration K preload (K^{i+1} not yet published); the
-            # next do_qk's K units are preloaded at the loop top after the
-            # barrier instead.
+            # Last 2 dead windows (u=6,7) preload K^{i+1} units 0,1 (published
+            # by this iteration's publish barrier) for the NEXT iteration's
+            # do_qk -- returned as kw_prime and threaded through the carry.
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
             )
@@ -507,6 +520,7 @@ def build_flash_attn_fp8_module(
             ]
             PV_UNITS = D_TILES * PV_K_STEPS  # 8
             vw = [None] * 4
+            kw_prime = [None] * PREFETCH_DEPTH
             for u in range_constexpr(PREFETCH_DEPTH):
                 vw[u] = preloaded_vw[u]
             o = list(o_accs)
@@ -521,9 +535,13 @@ def build_flash_attn_fp8_module(
                         v_off, un // PV_K_STEPS, un % PV_K_STEPS
                     )
                     rocdl.sched_group_barrier(rocdl.mask_dsrd, 4, 0)
+                else:
+                    ki = u - (PV_UNITS - PREFETCH_DEPTH)
+                    kw_prime[ki] = _load_k_unit(k_buf_off, ki // K_STEPS, ki % K_STEPS)
+                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 2, 0)
                 o[dt] = mfma.call(vw[u % 4], p_ks_list[ks], o[dt])
                 rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
-            return o, l2
+            return o, l2, kw_prime
 
         # ---- Shared init values ----
         m_init = c_neg_inf
@@ -542,7 +560,14 @@ def build_flash_attn_fp8_module(
             dma_v(fx.Index(0), fx.Index(0))
 
         _wait_vmcnt()
-        gpu.barrier()
+
+        # Prologue K preload: prime the first 2 K^0 units 0,1 (buf 0, just
+        # published) for the first do_qk.  Subsequent iterations get their K
+        # units from the preceding apply_pv (threaded via the carry).
+        kvw0 = [
+            _load_k_unit(fx.Index(LDS_K_OFF), u // K_STEPS, u % K_STEPS)
+            for u in range_constexpr(PREFETCH_DEPTH)
+        ]
 
         of0 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
         of1 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
@@ -552,12 +577,24 @@ def build_flash_attn_fp8_module(
 
         loop_step = fx.Int32(BLOCK_N)
         zero_i32 = fx.Int32(0)
-        init_carry = [m_init, l_init, o_init[0], o_init[1], o_init[2], o_init[3]]
+        init_carry = [
+            m_init,
+            l_init,
+            o_init[0],
+            o_init[1],
+            o_init[2],
+            o_init[3],
+            kvw0[0],
+            kvw0[1],
+        ]
+        gpu.barrier()
 
-        def loop_body(iv, iter_args, is_k_dma):
+        def loop_body(iv, iter_args, is_g0):
             # Symmetric per-iteration pipeline run by ALL waves; only the
-            # next-tile DMA call differs between groups.
-            m_r, l_a, oo0, oo1, oo2, oo3 = iter_args
+            # next-tile DMA call differs between groups.  Carry threads the
+            # next do_qk's first 2 K units (kwp), preloaded by the prior
+            # apply_pv (or the prologue for iteration 0).
+            m_r, l_a, oo0, oo1, oo2, oo3, kwp0, kwp1 = iter_args
             kv_start = fx.Index(iv)
             i = kv_start // fx.Index(BLOCK_N)
             k_cur = i % fx.Index(NUM_BUF_K)
@@ -568,26 +605,37 @@ def build_flash_attn_fp8_module(
             # INDICES (they multiply by the tile size internally).
             k_buf = fx.Index(LDS_K_OFF) + k_cur * fx.Index(LDS_K_TILE)
             v_buf = fx.Index(LDS_V_OFF) + v_cur * fx.Index(LDS_V_TILE)
+            k_next_buf = fx.Index(LDS_K_OFF) + k_nxt * fx.Index(LDS_K_TILE)
             next_kv = kv_start + fx.Index(BLOCK_N)
-            # WAR is handled by the lgkmcnt drain inside the prior iteration's
-            # waitcnt_barrier (all waves finished reading buf i%2 before this
-            # iteration's DMA can overwrite it).
-            if is_k_dma:
+            # WAR guard: drain the prior iteration's apply_pv reads (incl. the
+            # carried K preload) and cross-wave sync before the DMA overwrites
+            # buf (i+1)%2.
+            # war_barrier()
+            if is_g0:
                 dma_k(k_nxt, next_kv)
             else:
                 dma_v(v_nxt, next_kv)
-            # Preload K^i units 0,1 (published by the previous barrier).
-            kvw = [
-                _load_k_unit(k_buf, u // K_STEPS, u % K_STEPS)
-                for u in range_constexpr(PREFETCH_DEPTH)
-            ]
-            sA, vwp = do_qk(k_buf, preloaded_kw=kvw, v_off=v_buf)
+            _wait_lgkmcnt()
+            sA, vwp = do_qk(k_buf, preloaded_kw=[kwp0, kwp1], v_off=v_buf)
+            if not is_g0 or not is_first:
+                gpu.barrier()
             m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_r)
-            oA, lA = apply_pv(
-                [oo0, oo1, oo2, oo3], l_a, p_new, prowsum_new, corr_new, v_buf, vwp
+            gpu.barrier()
+            # Publish K^{i+1}/V^{i+1} before apply_pv preloads K^{i+1}.
+            # publish_barrier()
+            _wait_lgkmcnt()
+            oA, lA, kwp_new = apply_pv(
+                [oo0, oo1, oo2, oo3],
+                l_a,
+                p_new,
+                prowsum_new,
+                corr_new,
+                v_buf,
+                vwp,
+                k_next_buf,
             )
-            waitcnt_barrier()
-            return [m_new, lA, oA[0], oA[1], oA[2], oA[3]]
+            # gpu.barrier()
+            return [m_new, lA, oA[0], oA[1], oA[2], oA[3], kwp_new[0], kwp_new[1]]
 
         if is_g0:
             for_op = scf.ForOp(
@@ -602,7 +650,7 @@ def build_flash_attn_fp8_module(
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, init_carry)
                 ]
-                res = loop_body(iv, args, is_k_dma=True)
+                res = loop_body(iv, args, is_g0=True)
                 scf.YieldOp([_raw(r) for r in res])
             fin = [as_dsl_value(r, ex) for r, ex in zip(for_op.results, init_carry)]
             of0, of1, of2, of3 = fin[2], fin[3], fin[4], fin[5]
@@ -620,7 +668,7 @@ def build_flash_attn_fp8_module(
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, init_carry)
                 ]
-                res = loop_body(iv, args, is_k_dma=False)
+                res = loop_body(iv, args, is_g0=False)
                 scf.YieldOp([_raw(r) for r in res])
             fin = [as_dsl_value(r, ex) for r, ex in zip(for_op.results, init_carry)]
             of0, of1, of2, of3 = fin[2], fin[3], fin[4], fin[5]
