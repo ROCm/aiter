@@ -19,6 +19,7 @@ drop-in interchangeable in tests and benchmarks.
 # real objects. (Matches the note in qk_norm_rope_quant.py.)
 
 import os
+import re
 from functools import lru_cache
 
 import torch
@@ -239,25 +240,21 @@ def _build_kernel(*, num_heads: int, head_size: int, block_kv: int):
     return launch_fp8_mqa_logits
 
 
-def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
-                         rows_per_block: int = 2,
-                         convert_q_fn: bool = False, convert_kv_fn: bool = False):
-    """Multi-row MFMA kernel: ``rows_per_block`` query rows share one KV tile load.
+def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
+                           rows_per_block: int, waves_per_block: int,
+                           convert_q_fn: bool = False, convert_kv_fn: bool = False):
+    """Multi-row, multi-wave MFMA kernel.
 
-    Preload Q frags and weights for all ``rows_per_block`` rows before the KV tile loop, 
-    then inside the tile loop load each KV tile B-frags **once** and reuse them across
-    all rows via the inner ``range_constexpr(RPB)`` loop.  This cuts KV global
-    traffic by ``rows_per_block``.
+    ``rows_per_block`` query rows share one KV tile load (cuts KV traffic by RPB).
+    ``waves_per_block`` waves execute per block; each wave owns a disjoint slice of
+    the BKV column tiles (``N_TILES // WPB`` tiles per wave), so all WPB waves can
+    execute in parallel with no cross-wave LDS or barrier.
 
-    Verified CDNA3 ``16x16x32_fp8_fp8`` fragment layout (from preshuffle_gemm):
-      * A operand: lane ``l`` -> ``A[row = l%16, k = (l//16)*8 + 0..7]``
-      * B operand: lane ``l`` -> ``B[k = (l//16)*8 + 0..7, col = l%16]``
-      * acc ``vec<4 x f32>`` element ``ii`` -> ``row = (l//16)*4 + ii``,
-        ``col = l%16``.
-    The head axis lands on the MFMA M dimension, so summing over heads needs an
-    in-register sum over ``ii`` and the ``mi`` row-tiles plus a cross-lane
-    xor-shuffle over the ``l//16`` groups (offsets 16, 32). With a single wave
-    there is no cross-wave LDS pass.
+    Thread decomposition:
+      * ``tid = wave * 64 + lane``  (tid: 0..MR_BLOCK_THREADS-1)
+      * Wave ``w`` owns n-tiles ``[w*N_TILES_PER_WAVE, (w+1)*N_TILES_PER_WAVE)``
+        within each BKV tile.
+      * A-operand (Q) layout and head-reduce are per-lane within the wave (width 64).
 
     Grid: ``(ceil(seq_len / RPB), 1, 1)``.  The host wrapper pads ``seq_len`` to
     a multiple of ``RPB`` so every block owns exactly ``RPB`` valid rows.
@@ -266,13 +263,21 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
     D = head_size
     BKV = block_kv
     RPB = rows_per_block
+    WPB = waves_per_block
+    MR_BLOCK_THREADS = 64 * WPB
+
     assert H % 16 == 0, f"num_heads={H} must be a multiple of 16 for MFMA"
     assert BKV % 16 == 0, f"block_kv={BKV} must be a multiple of 16 for MFMA"
     assert D % 32 == 0, f"head_size={D} must be a multiple of 32 for MFMA K32"
     assert RPB >= 1, f"rows_per_block must be >= 1"
-    M_TILES = H // 16       # head row-tiles
-    N_TILES = BKV // 16     # KV column-tiles
-    K_STEPS = D // 32       # K32 MFMA steps over the head dim
+    assert WPB >= 1, f"waves_per_block must be >= 1"
+    N_TILES = BKV // 16                       # total column-tiles per BKV block
+    assert N_TILES % WPB == 0, (
+        f"BKV/16={N_TILES} must be divisible by waves_per_block={WPB}"
+    )
+    M_TILES = H // 16                         # head row-tiles
+    K_STEPS = D // 32                         # K32 MFMA steps over the head dim
+    N_TILES_PER_WAVE = N_TILES // WPB         # column-tiles per wave
 
     fm_fast = arith.FastMathFlags.fast
     mfma_fn = rocdl.mfma_f32_16x16x32_fp8_fp8
@@ -282,16 +287,16 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
         _cvt_tag += "_cq"
     if convert_kv_fn:
         _cvt_tag += "_ck"
-    _kname = f"fp8_mqa_logits_H{H}_D{D}_bkv{BKV}_mfma_r{RPB}{_cvt_tag}_flydsl"
+    _kname = f"fp8_mqa_logits_H{H}_D{D}_bkv{BKV}_mfma_r{RPB}_w{WPB}{_cvt_tag}_flydsl"
 
-    @flyc.kernel(name=_kname, known_block_size=[BLOCK_THREADS, 1, 1])
+    @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
     def kernel(
-        Q: fx.Tensor,            # [seq_len, H, D]      fp8 (any variant; bytes passed raw)
-        KV: fx.Tensor,           # [seq_len_kv, D]      fp8 (any variant; bytes passed raw)
-        kv_scales: fx.Tensor,    # [seq_len_kv]         f32
-        weights: fx.Tensor,      # [seq_len, H]         f32
-        cu_starts: fx.Tensor,    # [seq_len]            i32
-        cu_ends: fx.Tensor,      # [seq_len]            i32
+        Q: fx.Tensor,            # [seq_len, H, D]       fp8 (bytes passed raw)
+        KV: fx.Tensor,           # [seq_len_kv, D]       fp8 (bytes passed raw)
+        kv_scales: fx.Tensor,    # [seq_len_kv]          f32
+        weights: fx.Tensor,      # [seq_len, H]          f32
+        cu_starts: fx.Tensor,    # [seq_len]             i32
+        cu_ends: fx.Tensor,      # [seq_len]             i32
         logits: fx.Tensor,       # [seq_len, seq_len_kv] f32
         seq_len: fx.Int32,       # padded to a multiple of RPB
         seq_len_kv: fx.Int32,
@@ -309,14 +314,15 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
             _to_raw(fx.Int32(RPB)),
         ))
 
-        lane = fx.Int32(tid)
+        # Decompose tid into wave index and in-wave lane.
+        wave = fx.Int32(arith.divui(_to_raw(tid), _to_raw(fx.Int32(64))))
+        lane = fx.Int32(arith.remui(_to_raw(tid), _to_raw(fx.Int32(64))))
         lane_div_16 = fx.Int32(arith.divui(_to_raw(lane), _to_raw(fx.Int32(16))))
         lane_mod_16 = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(16))))
         lane8 = fx.Int32(arith.muli(_to_raw(lane_div_16), _to_raw(fx.Int32(8))))
 
-        # fp8 operands are read 8 bytes at a time as 2 i32 dwords (a direct
-        # v8i8 buffer_load fails to lower on gfx942), bitcast to one i64 =
-        # vec<8 x fp8> for the MFMA. Flat i32 views, indexed in dword units.
+        # fp8 operands are read 8 bytes at a time as 2 i32 dwords (v8i8
+        # buffer_load fails to lower on gfx942), bitcast to i64 for the MFMA.
         q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
         kv_i32 = GTensor(KV, dtype=T.i32, shape=(-1,))
         sc_t = GTensor(kv_scales, dtype=T.f32, shape=(-1,))
@@ -331,8 +337,6 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
         )
 
         def _load_pack_i64(i32_view, byte_off_i32):
-            # byte_off_i32: element offset in fp8 bytes (multiple of 4). Load 2
-            # dwords, bitcast vec<2 x i32> -> i64.
             dword_off = fx.Int32(
                 arith.divui(_to_raw(byte_off_i32), _to_raw(fx.Int32(4)))
             )
@@ -340,36 +344,13 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
             return Vec(v2).bitcast(fx.Int64)[0].ir_value()
 
         # ---- FN -> FNUZ in-kernel byte conversion ----
-        #
-        # For all 256 byte values, the FN and FNUZ encodings satisfy
-        # FNUZ_value(byte) == FN_value(byte) / 2 exactly — so the raw FN
-        # bytes can be passed directly to the FNUZ MFMA and the 2x factor
-        # compensated via kv_scales. The conversion is thus an identity
-        # for 253/256 byte patterns.
-        #
-        # The one exception is byte 0x80:
-        #   FN:   0x80 = negative zero (-0.0)  ->  mathematically zero
-        #   FNUZ: 0x80 = NaN                   ->  corrupts MFMA output
-        #
-        # A single NaN in the 128-element dot product poisons the entire
-        # accumulator element.
-        #
-        # Fix: map 0x80 -> 0x00 (FNUZ +0). For all other bytes the identity
-        # mapping is correct. This is done per i32 (4 bytes at a time) with
-        # byte-lane arithmetic to avoid branches.
         def _fn_to_fnuz_i64(raw_i64):
-            """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes.
-
-            Implementation: extract each byte, compare to 0x80, select 0x00
-            if equal, else keep original. Rebuild the i64 from 8 cleaned
-            bytes.
-            """
+            """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes."""
             lo_i32 = arith.TruncIOp(T.i32, raw_i64).result
             hi_i64 = arith.ShRUIOp(raw_i64, arith.constant(32, type=T.i64)).result
             hi_i32 = arith.TruncIOp(T.i32, hi_i64).result
 
             def _fix_i32(src):
-                """Fix 0x80 bytes in one i32 (4 fp8 bytes)."""
                 result = arith.constant(0, type=T.i32)
                 for byte_idx in range_constexpr(4):
                     shift = arith.constant(byte_idx * 8, type=T.i32)
@@ -397,6 +378,8 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
             return arith.OrIOp(lo_64, hi_64).result
 
         # ---- Preload per-row metadata, Q frags, and weights for all RPB rows ----
+        # All WPB waves preload all RPB rows' Q frags. A-operand layout is per
+        # in-wave lane (lane_mod_16, lane8), so `lane` (not `tid`) is used here.
         starts = [None] * RPB
         ends = [None] * RPB
         a_packs = [None] * RPB
@@ -409,7 +392,7 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
             starts[j] = fx.Int32(arith.maxsi(_to_raw(s), _to_raw(fx.Int32(0))))
             ends[j] = fx.Int32(arith.minsi(_to_raw(e), _to_raw(fx.Int32(seq_len_kv))))
 
-            # lane l -> Q[row, h = mi*16 + lane%16, d = kk*32 + (lane//16)*8 + 0..7]
+            # lane -> Q[row, h = mi*16 + lane%16, d = kk*32 + (lane//16)*8 + 0..7]
             row_a = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
             for mi in range_constexpr(M_TILES):
                 h_a = _i32_add(fx.Int32(mi * 16), lane_mod_16)
@@ -421,8 +404,7 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
                     row_a[mi][kk] = _fn_to_fnuz_i64(raw) if convert_q_fn else raw
             a_packs[j] = row_a
 
-            # weights[row, h] preloaded per (mi, ii) head owned by this lane.
-            # head = mi*16 + lane_div_16*4 + ii
+            # weights[row, h] preloaded per (mi, ii): head = mi*16 + lane_div_16*4 + ii
             row_w = [[None] * 4 for _ in range_constexpr(M_TILES)]
             for mi in range_constexpr(M_TILES):
                 for ii in range_constexpr(4):
@@ -455,16 +437,19 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
         with ir.InsertionPoint(tile_loop.body):
             col0 = fx.Int32(arith.index_cast(T.i32, tile_loop.induction_variable))
 
-            # ---- Load B-frags once per tile (reused across all RPB rows) ----
-            # preload B (KV) operands: per (ni, kk) one i64 of 8 fp8 along D.
-            # lane l -> K[n = col0 + ni*16 + lane%16, d = kk*32 + (l//16)*8 + 0..7]
-            # Columns past `end` are clamped so the load stays in-bounds; the
-            # store below masks them out.
-            b_packs = [[None] * K_STEPS for _ in range_constexpr(N_TILES)]
-            kv_scales_tile = [None] * N_TILES
-            cols = [None] * N_TILES
-            for ni in range_constexpr(N_TILES):
-                col = _i32_add(_i32_add(col0, fx.Int32(ni * 16)), lane_mod_16)
+            # ---- Load B-frags: each wave loads its own N_TILES_PER_WAVE columns ----
+            # wave w owns absolute n-tiles [w*N_TILES_PER_WAVE, (w+1)*N_TILES_PER_WAVE).
+            # No cross-wave sharing; each wave's column addresses are disjoint.
+            wave_ni_base = fx.Int32(arith.muli(_to_raw(wave), _to_raw(fx.Int32(N_TILES_PER_WAVE))))
+            b_packs = [[None] * K_STEPS for _ in range_constexpr(N_TILES_PER_WAVE)]
+            kv_scales_tile = [None] * N_TILES_PER_WAVE
+            cols = [None] * N_TILES_PER_WAVE
+            for ni in range_constexpr(N_TILES_PER_WAVE):
+                abs_ni = _i32_add(wave_ni_base, fx.Int32(ni))
+                col = _i32_add(
+                    _i32_add(col0, fx.Int32(arith.muli(_to_raw(abs_ni), _to_raw(fx.Int32(16))))),
+                    lane_mod_16,
+                )
                 cols[ni] = col
                 col_clamped = fx.Int32(
                     arith.minsi(_to_raw(col), _to_raw(fx.Int32(seq_len_kv) - fx.Int32(1)))
@@ -479,7 +464,7 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
             # ---- Per-row MFMA + epilogue (inner loop over RPB rows) ----
             for j in range_constexpr(RPB):
                 row = _i32_add(r0, fx.Int32(j))
-                for ni in range_constexpr(N_TILES):
+                for ni in range_constexpr(N_TILES_PER_WAVE):
                     col = cols[ni]
                     kv_scale = kv_scales_tile[ni]
                     col_sum = _to_raw(f32_0)
@@ -497,9 +482,9 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
                             wsc = arith.MulFOp(relu, w_frag[j][mi][ii], fastmath=fm_fast).result
                             col_sum = arith.AddFOp(col_sum, wsc, fastmath=fm_fast).result
 
-                    # Head-reduce across lane_div_16 groups (offsets 16, 32).
+                    # Head-reduce within the wave (width=64): shuffle_xor offsets 16, 32.
                     for sh in [16, 32]:
-                        peer = _to_raw(ArithValue(col_sum).shuffle_xor(sh, BLOCK_THREADS))
+                        peer = _to_raw(ArithValue(col_sum).shuffle_xor(sh, 64))
                         col_sum = arith.AddFOp(col_sum, peer, fastmath=fm_fast).result
 
                     # lane_div_16 == 0 lanes own the 16 distinct columns of this tile.
@@ -522,7 +507,7 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
             scf.YieldOp([])
 
     @flyc.jit
-    def launch_fp8_mqa_logits_mfma_r(
+    def launch_fp8_mqa_logits_mfma_r_w(
         Q: fx.Tensor,
         KV: fx.Tensor,
         kv_scales: fx.Tensor,
@@ -551,34 +536,33 @@ def _build_kernel_mfma_r(*, num_heads: int, head_size: int, block_kv: int,
             seq_len,
             seq_len_kv,
             stride_logits_s,
-        ).launch(grid=(gx, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        ).launch(grid=(gx, 1, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
 
-    return launch_fp8_mqa_logits_mfma_r
+    return launch_fp8_mqa_logits_mfma_r_w
 
 
 # --------------------------------------------------------------------------- #
 # Kernel-variant registry.
 #
-# Each entry maps a variant *tag* (the version label used by callers/benchmarks)
-# to its ``_build_*`` factory. To add a new version of the indexer kernel, write
-# a ``_build_kernel_<name>`` factory with the same ``(*, num_heads, head_size,
-# block_kv)`` signature and register it here -- it then becomes selectable via
-# ``variant="<name>"`` everywhere (public API, tests, the A/B benchmark) without
-# touching the call sites.
-#
-# ``"mfma_r1"`` is the current default/baseline; ``"scalar"`` is the slow
-# correctness-first fallback.
+# Variant tags follow the scheme ``"mfma_r<N>_w<M>"`` where N = rows per block
+# and M = waves per block. ``"scalar"`` is the slow correctness-first fallback.
+# To add a new variant, register a lambda below; no other call sites need
+# changing (tests and benchmarks use the env var / ``variant=`` arg).
 # --------------------------------------------------------------------------- #
 _VARIANT_BUILDERS = {
-    "scalar":   _build_kernel,
-    "mfma_r1":  lambda **kw: _build_kernel_mfma_r(**kw, rows_per_block=1),
-    "mfma_r2":  lambda **kw: _build_kernel_mfma_r(**kw, rows_per_block=2),
-    "mfma_r4":  lambda **kw: _build_kernel_mfma_r(**kw, rows_per_block=4),
+    "scalar":       _build_kernel,
+    "mfma_r1_w1":   lambda **kw: _build_kernel_mfma_r_w(**kw, rows_per_block=1, waves_per_block=1),
+    "mfma_r2_w1":   lambda **kw: _build_kernel_mfma_r_w(**kw, rows_per_block=2, waves_per_block=1),
+    "mfma_r4_w1":   lambda **kw: _build_kernel_mfma_r_w(**kw, rows_per_block=4, waves_per_block=1),
+    "mfma_r1_w4":   lambda **kw: _build_kernel_mfma_r_w(**kw, rows_per_block=1, waves_per_block=4),
+    "mfma_r2_w2":   lambda **kw: _build_kernel_mfma_r_w(**kw, rows_per_block=2, waves_per_block=2),
+    "mfma_r2_w4":   lambda **kw: _build_kernel_mfma_r_w(**kw, rows_per_block=2, waves_per_block=4),
+    "mfma_r4_w2":   lambda **kw: _build_kernel_mfma_r_w(**kw, rows_per_block=4, waves_per_block=2),
 }
 
 # Order matters: the first available tag is the default.
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
-DEFAULT_VARIANT = "mfma_r1"
+DEFAULT_VARIANT = "mfma_r1_w1"
 
 
 def _resolve_variant(variant=None, *, use_mfma=None):
@@ -591,7 +575,7 @@ def _resolve_variant(variant=None, *, use_mfma=None):
     if variant is not None:
         tag = variant
     elif use_mfma is not None:
-        tag = "mfma_r1" if use_mfma else "scalar"  # legacy use_mfma=True
+        tag = "mfma_r1_w1" if use_mfma else "scalar"  # legacy use_mfma=True
     else:
         env_variant = os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
         if env_variant:
@@ -633,9 +617,9 @@ def compile_fp8_mqa_logits(
     paged : bool
         Reserved for the Phase-2 paged variant. Must be False for now.
     variant : str
-        Which kernel version to build (see ``KERNEL_VARIANTS``). ``"mfma_r1"`` is the
-        fp8-MFMA matrix-core baseline; ``"scalar"`` is the ``v_cvt_f32_fp8``
-        correctness-first fallback.
+        Which kernel version to build (see ``KERNEL_VARIANTS``). Tags follow
+        ``"mfma_r<N>_w<M>"`` (N rows/block, M waves/block); ``"scalar"`` is the
+        ``v_cvt_f32_fp8`` correctness-first fallback.
     convert_q_fn : bool
         If True, Q data is in FP8 FN encoding and the kernel converts bytes
         to FNUZ in-register before the MFMA (only applies to ``"mfma_r*"`` variants).
@@ -654,7 +638,7 @@ def compile_fp8_mqa_logits(
         )
     builder = _VARIANT_BUILDERS[variant]
     # mfma_r* builders accept convert flags; scalar does not.
-    if variant in ("mfma_r1", "mfma_r2", "mfma_r4"):
+    if variant.startswith("mfma_r"):
         launcher = builder(
             num_heads=num_heads, head_size=head_size, block_kv=block_kv,
             convert_q_fn=convert_q_fn, convert_kv_fn=convert_kv_fn,
@@ -743,8 +727,7 @@ def flydsl_fp8_mqa_logits(
     variant = _resolve_variant(variant)
 
     # Variants with in-kernel FN -> FNUZ support; others fall back to host-side conversion.
-    _mfma_variants = ("mfma_r1", "mfma_r2", "mfma_r4")
-    if variant not in _mfma_variants and (convert_q_fn or convert_kv_fn):
+    if not variant.startswith("mfma_r") and (convert_q_fn or convert_kv_fn):
         if convert_q_fn:
             Q = (Q.to(torch.float32) * 0.5).to(_fnuz)
         if convert_kv_fn:
@@ -766,7 +749,9 @@ def flydsl_fp8_mqa_logits(
     # every block owns exactly RPB rows.  Padded rows get empty windows (start ==
     # end == 0) so the kernel writes nothing for them; the output is sliced back
     # to the original seq_len after the launch.
-    _RPB = {"mfma_r2": 2, "mfma_r4": 4}.get(variant, 1)
+    # Parse RPB from variant tag "mfma_r<N>_w<M>" -> N.
+    _rpb_match = re.match(r"mfma_r(\d+)", variant)
+    _RPB = int(_rpb_match.group(1)) if _rpb_match else 1
     seq_len_padded = ((seq_len + _RPB - 1) // _RPB) * _RPB
     if seq_len_padded != seq_len:
         pad = seq_len_padded - seq_len
