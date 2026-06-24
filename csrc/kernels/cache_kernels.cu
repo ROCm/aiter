@@ -2465,7 +2465,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       const float inverted_qscale = 1.0f / *q_scale;
       const int32_t size = num_heads * kv_lora_dim;
       static constexpr int32_t q_ooba_o = 4 / sizeof(query_t);
-      const int32_t q_oob_i = (size + ooba_i - 1) / ooba_i * ooba_i;
+      const int64_t q_input_span = (num_heads - 1) * static_cast<int64_t>(q_nope_stride_1) + kv_lora_dim;
+      const int64_t q_oob_i = (q_input_span + ooba_i - 1) / ooba_i * ooba_i;
       const int32_t q_oob_o = (num_heads * head_size + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
       
       // Use opus::make_gmem for Q buffers, size in BYTES
@@ -2498,7 +2499,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       if (has_data) {
         // Calculate offset considering stride(1) for non-contiguous tensors
         uint32_t kv_c_offset = head_idx * kv_c_stride_1 + in_head_idx * vec_size_i;
-        uint32_t q_nope_offset = head_idx * q_nope_stride_1 + in_head_idx * vec_size_i;
+        size_t q_nope_offset = head_idx * static_cast<size_t>(q_nope_stride_1) + in_head_idx * vec_size_i;
         vec_cur = buffer_i.template load<vec_size_i>(kv_c_offset);  // K data in vec_cur initially
         vec_nxt = q_buffer_i.template load<vec_size_i>(q_nope_offset); // Q data in vec_nxt
       }
@@ -2514,7 +2515,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         uint32_t next_head_idx = next_idx / kv_lora_vec;
         uint32_t next_in_head_idx = next_idx % kv_lora_vec;
         uint32_t next_kv_c_offset = next_head_idx * kv_c_stride_1 + next_in_head_idx * vec_size_i;
-        uint32_t next_q_nope_offset = next_head_idx * q_nope_stride_1 + next_in_head_idx * vec_size_i;
+        size_t next_q_nope_offset = next_head_idx * static_cast<size_t>(q_nope_stride_1) + next_in_head_idx * vec_size_i;
         opus_vec_i k_nxt = buffer_i.template load<vec_size_i>(next_kv_c_offset);
         opus_vec_i q_nxt = q_buffer_i.template load<vec_size_i>(next_q_nope_offset);
         
@@ -2569,7 +2570,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       
       // Load first Q vector if in range (num_heads > num_kv_heads case)
       if (q_vec_idx < num_vecs) {
-        uint32_t q_nope_offset = q_head_idx * q_nope_stride_1 + q_in_head_idx * vec_size_i;
+        size_t q_nope_offset = q_head_idx * static_cast<size_t>(q_nope_stride_1) + q_in_head_idx * vec_size_i;
         vec_cur = q_buffer_i.template load<vec_size_i>(q_nope_offset);
       }
       
@@ -2579,7 +2580,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         // Calculate next indices for prefetch
         uint32_t next_head_idx = next_q_idx / kv_lora_vec;
         uint32_t next_in_head_idx = next_q_idx % kv_lora_vec;
-        uint32_t next_q_nope_offset = next_head_idx * q_nope_stride_1 + next_in_head_idx * vec_size_i;
+        size_t next_q_nope_offset = next_head_idx * static_cast<size_t>(q_nope_stride_1) + next_in_head_idx * vec_size_i;
         vec_nxt = q_buffer_i.template load<vec_size_i>(next_q_nope_offset);
         
         // Calculate store offset using current q_head_idx and q_in_head_idx
@@ -2778,7 +2779,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       const float inverted_qscale = 1.0f / *q_scale;
       const int32_t size = num_heads * kv_lora_dim;
       static constexpr int32_t q_ooba_o = 4 / sizeof(query_t);
-      const int32_t q_oob_i = (size + ooba_i - 1) / ooba_i * ooba_i;
+      const int64_t q_input_span = (num_heads - 1) * static_cast<int64_t>(q_nope_stride_1) + kv_lora_dim;
+      const int64_t q_oob_i = (q_input_span + ooba_i - 1) / ooba_i * ooba_i;
       const int32_t q_oob_o = (num_heads * head_size + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
       
       auto q_buffer_i = opus::make_gmem<scalar_t>(q_nope + token_idx * q_nope_stride_0, q_oob_i * sizeof(scalar_t));
@@ -2811,7 +2813,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       if (has_data) {
         // Calculate offset considering stride(1) for non-contiguous tensors
         uint32_t kv_c_offset = head_idx * kv_c_stride_1 + in_head_idx * vec_size_i;
-        uint32_t q_nope_offset = head_idx * q_nope_stride_1 + in_head_idx * vec_size_i;
+        size_t q_nope_offset = head_idx * static_cast<size_t>(q_nope_stride_1) + in_head_idx * vec_size_i;
         vec_cur = buffer_i.template load<vec_size_i>(kv_c_offset);  // K data
         vec_nxt = q_buffer_i.template load<vec_size_i>(q_nope_offset); // Q data
       }
@@ -2827,7 +2829,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         uint32_t next_head_idx = next_idx / kv_lora_vec;
         uint32_t next_in_head_idx = next_idx % kv_lora_vec;
         uint32_t next_kv_c_offset = next_head_idx * kv_c_stride_1 + next_in_head_idx * vec_size_i;
-        uint32_t next_q_nope_offset = next_head_idx * q_nope_stride_1 + next_in_head_idx * vec_size_i;
+        size_t next_q_nope_offset = next_head_idx * static_cast<size_t>(q_nope_stride_1) + next_in_head_idx * vec_size_i;
         opus_vec_i k_nxt = buffer_i.template load<vec_size_i>(next_kv_c_offset);
         opus_vec_i q_nxt = q_buffer_i.template load<vec_size_i>(next_q_nope_offset);
         
@@ -2876,7 +2878,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
       uint32_t q_in_head_idx = q_vec_idx % kv_lora_vec;
       
       if (q_vec_idx < num_vecs) {
-        uint32_t q_nope_offset = q_head_idx * q_nope_stride_1 + q_in_head_idx * vec_size_i;
+        size_t q_nope_offset = q_head_idx * static_cast<size_t>(q_nope_stride_1) + q_in_head_idx * vec_size_i;
         vec_cur = q_buffer_i.template load<vec_size_i>(q_nope_offset);
       }
       
@@ -2885,7 +2887,7 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         // Calculate next indices for prefetch
         uint32_t next_head_idx = next_q_idx / kv_lora_vec;
         uint32_t next_in_head_idx = next_q_idx % kv_lora_vec;
-        uint32_t next_q_nope_offset = next_head_idx * q_nope_stride_1 + next_in_head_idx * vec_size_i;
+        size_t next_q_nope_offset = next_head_idx * static_cast<size_t>(q_nope_stride_1) + next_in_head_idx * vec_size_i;
         vec_nxt = q_buffer_i.template load<vec_size_i>(next_q_nope_offset);
         
         // Calculate store offset using current q_head_idx and q_in_head_idx
