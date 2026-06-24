@@ -110,9 +110,9 @@ def _quant_dtype_max(dtype_str: str) -> float:
     raise ValueError(f"unsupported quant dtype: {dtype_str!r} (expected 'i8' or 'int8')")
 
 
-def build_rmsnorm_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EPS):
-    if M > 8192 and N <= 2048:
-        return _build_rmsnorm_large_m_small_n_module(M, N, dtype_str, eps=eps)
+def build_rmsnorm_module(N: int, dtype_str: str, eps: float = DEFAULT_EPS):
+    if N <= 2048:
+        return _build_rmsnorm_large_m_small_n_module(N, dtype_str, eps=eps)
 
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
@@ -308,7 +308,7 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EP
     return launch_rmsnorm
 
 
-def _build_rmsnorm_large_m_small_n_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EPS):
+def _build_rmsnorm_large_m_small_n_module(N: int, dtype_str: str, eps: float = DEFAULT_EPS):
     BLOCK_N = 1 << (N - 1).bit_length()
     BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
     THREADS_PER_ROW = min(WARP_SIZE, 1024 // BLOCK_M)
@@ -406,7 +406,7 @@ def _build_rmsnorm_large_m_small_n_module(M: int, N: int, dtype_str: str, eps: f
     return launch_rmsnorm_large_m_small_n
 
 
-def build_fused_add_rmsnorm_module(M: int, N: int, dtype_str: str, eps: float = DEFAULT_EPS):
+def build_fused_add_rmsnorm_module(N: int, dtype_str: str, eps: float = DEFAULT_EPS):
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
 
@@ -621,7 +621,6 @@ def build_fused_add_rmsnorm_module(M: int, N: int, dtype_str: str, eps: float = 
 
 
 def _build_rmsnorm_quant_module(
-    M: int,
     N: int,
     dtype_str: str,
     *,
@@ -966,14 +965,12 @@ def _build_rmsnorm_quant_module(
 
 
 def build_rmsnorm_dynamicquant_module(
-    M: int,
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
     eps: float = DEFAULT_EPS,
 ):
     return _build_rmsnorm_quant_module(
-        M,
         N,
         dtype_str,
         is_smooth=False,
@@ -983,14 +980,12 @@ def build_rmsnorm_dynamicquant_module(
 
 
 def build_rmsnorm_smoothquant_module(
-    M: int,
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
     eps: float = DEFAULT_EPS,
 ):
     return _build_rmsnorm_quant_module(
-        M,
         N,
         dtype_str,
         is_smooth=True,
@@ -1000,7 +995,6 @@ def build_rmsnorm_smoothquant_module(
 
 
 def _build_fused_add_rmsnorm_quant_module(
-    M: int,
     N: int,
     dtype_str: str,
     *,
@@ -1375,14 +1369,12 @@ def _build_fused_add_rmsnorm_quant_module(
 
 
 def build_fused_add_rmsnorm_dynamicquant_module(
-    M: int,
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
     eps: float = DEFAULT_EPS,
 ):
     return _build_fused_add_rmsnorm_quant_module(
-        M,
         N,
         dtype_str,
         is_smooth=False,
@@ -1392,14 +1384,12 @@ def build_fused_add_rmsnorm_dynamicquant_module(
 
 
 def build_fused_add_rmsnorm_smoothquant_module(
-    M: int,
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
     eps: float = DEFAULT_EPS,
 ):
     return _build_fused_add_rmsnorm_quant_module(
-        M,
         N,
         dtype_str,
         is_smooth=True,

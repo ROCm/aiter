@@ -160,25 +160,23 @@ def _run_launcher(device: torch.device, launcher, *args, stream=None) -> None:
 
 
 @lru_cache(maxsize=64)
-def _compile_rmsnorm(m: int, n: int, dtype_str: str, eps: float):
-    return build_rmsnorm_module(m, n, dtype_str, eps=eps)
+def _compile_rmsnorm(n: int, dtype_str: str, eps: float):
+    return build_rmsnorm_module(n, dtype_str, eps=eps)
 
 
 @lru_cache(maxsize=64)
-def _compile_add_rmsnorm(m: int, n: int, dtype_str: str, eps: float):
-    return build_fused_add_rmsnorm_module(m, n, dtype_str, eps=eps)
+def _compile_add_rmsnorm(n: int, dtype_str: str, eps: float):
+    return build_fused_add_rmsnorm_module(n, dtype_str, eps=eps)
 
 
 @lru_cache(maxsize=64)
 def _compile_rmsnorm_dynamicquant(
-    m: int,
     n: int,
     dtype_str: str,
     quant_dtype: str,
     eps: float,
 ):
     return build_rmsnorm_dynamicquant_module(
-        m,
         n,
         dtype_str,
         quant_dtype_str=quant_dtype,
@@ -188,14 +186,12 @@ def _compile_rmsnorm_dynamicquant(
 
 @lru_cache(maxsize=64)
 def _compile_rmsnorm_smoothquant(
-    m: int,
     n: int,
     dtype_str: str,
     quant_dtype: str,
     eps: float,
 ):
     return build_rmsnorm_smoothquant_module(
-        m,
         n,
         dtype_str,
         quant_dtype_str=quant_dtype,
@@ -205,14 +201,12 @@ def _compile_rmsnorm_smoothquant(
 
 @lru_cache(maxsize=64)
 def _compile_add_rmsnorm_dynamicquant(
-    m: int,
     n: int,
     dtype_str: str,
     quant_dtype: str,
     eps: float,
 ):
     return build_fused_add_rmsnorm_dynamicquant_module(
-        m,
         n,
         dtype_str,
         quant_dtype_str=quant_dtype,
@@ -222,14 +216,12 @@ def _compile_add_rmsnorm_dynamicquant(
 
 @lru_cache(maxsize=64)
 def _compile_add_rmsnorm_smoothquant(
-    m: int,
     n: int,
     dtype_str: str,
     quant_dtype: str,
     eps: float,
 ):
     return build_fused_add_rmsnorm_smoothquant_module(
-        m,
         n,
         dtype_str,
         quant_dtype_str=quant_dtype,
@@ -238,25 +230,23 @@ def _compile_add_rmsnorm_smoothquant(
 
 
 @lru_cache(maxsize=64)
-def _compile_layernorm(m: int, n: int, dtype_str: str, eps: float):
-    return build_layernorm_module(m, n, dtype_str, eps=eps)
+def _compile_layernorm(n: int, dtype_str: str, eps: float):
+    return build_layernorm_module(n, dtype_str, eps=eps)
 
 
 @lru_cache(maxsize=64)
-def _compile_add_layernorm(m: int, n: int, dtype_str: str, eps: float):
-    return build_fused_add_layernorm_module(m, n, dtype_str, eps=eps)
+def _compile_add_layernorm(n: int, dtype_str: str, eps: float):
+    return build_fused_add_layernorm_module(n, dtype_str, eps=eps)
 
 
 @lru_cache(maxsize=64)
 def _compile_layernorm_dynamicquant(
-    m: int,
     n: int,
     dtype_str: str,
     quant_dtype: str,
     eps: float,
 ):
     return build_layernorm_dynamicquant_module(
-        m,
         n,
         dtype_str,
         quant_dtype_str=quant_dtype,
@@ -266,14 +256,12 @@ def _compile_layernorm_dynamicquant(
 
 @lru_cache(maxsize=64)
 def _compile_layernorm_smoothquant(
-    m: int,
     n: int,
     dtype_str: str,
     quant_dtype: str,
     eps: float,
 ):
     return build_layernorm_smoothquant_module(
-        m,
         n,
         dtype_str,
         quant_dtype_str=quant_dtype,
@@ -283,14 +271,12 @@ def _compile_layernorm_smoothquant(
 
 @lru_cache(maxsize=64)
 def _compile_add_layernorm_dynamicquant(
-    m: int,
     n: int,
     dtype_str: str,
     quant_dtype: str,
     eps: float,
 ):
     return build_fused_add_layernorm_dynamicquant_module(
-        m,
         n,
         dtype_str,
         quant_dtype_str=quant_dtype,
@@ -300,14 +286,12 @@ def _compile_add_layernorm_dynamicquant(
 
 @lru_cache(maxsize=64)
 def _compile_add_layernorm_smoothquant(
-    m: int,
     n: int,
     dtype_str: str,
     quant_dtype: str,
     eps: float,
 ):
     return build_fused_add_layernorm_smoothquant_module(
-        m,
         n,
         dtype_str,
         quant_dtype_str=quant_dtype,
@@ -325,7 +309,7 @@ def flydsl_rmsnorm(
 ) -> Tensor:
     m, n, dtype_str, device = _check_norm_input(input, weight)
     out = _check_optional_out("out", out, input)
-    launcher = _compile_rmsnorm(m, n, dtype_str, float(epsilon))
+    launcher = _compile_rmsnorm(n, dtype_str, float(epsilon))
     _run_launcher(device, launcher, input, weight, out, m, stream=stream)
     return out
 
@@ -344,7 +328,7 @@ def flydsl_add_rmsnorm(
     _check_2d_like("residual_in", residual_in, tuple(input.shape), input.dtype, device)
     out = _check_optional_out("out", out, input)
     residual_out = _check_optional_out("residual_out", residual_out, input)
-    launcher = _compile_add_rmsnorm(m, n, dtype_str, float(epsilon))
+    launcher = _compile_add_rmsnorm(n, dtype_str, float(epsilon))
     _run_launcher(
         device,
         launcher,
@@ -373,7 +357,7 @@ def flydsl_rmsnorm_dynamicquant(
     quant_dtype = _normalize_quant_dtype(quant_dtype)
     out = _check_optional_out("out", out, input, dtype=torch.int8)
     yscale = _check_optional_yscale(yscale, m, device)
-    launcher = _compile_rmsnorm_dynamicquant(m, n, dtype_str, quant_dtype, float(epsilon))
+    launcher = _compile_rmsnorm_dynamicquant(n, dtype_str, quant_dtype, float(epsilon))
     _run_launcher(device, launcher, input, weight, out, yscale, m, stream=stream)
     return out, yscale
 
@@ -394,7 +378,7 @@ def flydsl_rmsnorm_smoothquant(
     quant_dtype = _normalize_quant_dtype(quant_dtype)
     out = _check_optional_out("out", out, input, dtype=torch.int8)
     yscale = _check_optional_yscale(yscale, m, device)
-    launcher = _compile_rmsnorm_smoothquant(m, n, dtype_str, quant_dtype, float(epsilon))
+    launcher = _compile_rmsnorm_smoothquant(n, dtype_str, quant_dtype, float(epsilon))
     _run_launcher(device, launcher, input, weight, xscale, out, yscale, m, stream=stream)
     return out, yscale
 
@@ -418,7 +402,6 @@ def flydsl_add_rmsnorm_dynamicquant(
     residual_out = _check_optional_out("residual_out", residual_out, input)
     yscale = _check_optional_yscale(yscale, m, device)
     launcher = _compile_add_rmsnorm_dynamicquant(
-        m,
         n,
         dtype_str,
         quant_dtype,
@@ -460,7 +443,6 @@ def flydsl_add_rmsnorm_smoothquant(
     residual_out = _check_optional_out("residual_out", residual_out, input)
     yscale = _check_optional_yscale(yscale, m, device)
     launcher = _compile_add_rmsnorm_smoothquant(
-        m,
         n,
         dtype_str,
         quant_dtype,
@@ -494,7 +476,7 @@ def flydsl_layernorm(
     m, n, dtype_str, device = _check_norm_input(input, weight)
     _check_vector("bias", bias, n, input.dtype, device)
     out = _check_optional_out("out", out, input)
-    launcher = _compile_layernorm(m, n, dtype_str, float(epsilon))
+    launcher = _compile_layernorm(n, dtype_str, float(epsilon))
     _run_launcher(device, launcher, input, weight, bias, out, m, stream=stream)
     return out
 
@@ -515,7 +497,7 @@ def flydsl_add_layernorm(
     _check_2d_like("residual_in", residual_in, tuple(input.shape), input.dtype, device)
     out = _check_optional_out("out", out, input)
     residual_out = _check_optional_out("residual_out", residual_out, input)
-    launcher = _compile_add_layernorm(m, n, dtype_str, float(epsilon))
+    launcher = _compile_add_layernorm(n, dtype_str, float(epsilon))
     _run_launcher(
         device,
         launcher,
@@ -548,7 +530,6 @@ def flydsl_layernorm_dynamicquant(
     out = _check_optional_out("out", out, input, dtype=torch.int8)
     yscale = _check_optional_yscale(yscale, m, device)
     launcher = _compile_layernorm_dynamicquant(
-        m,
         n,
         dtype_str,
         quant_dtype,
@@ -577,7 +558,6 @@ def flydsl_layernorm_smoothquant(
     out = _check_optional_out("out", out, input, dtype=torch.int8)
     yscale = _check_optional_yscale(yscale, m, device)
     launcher = _compile_layernorm_smoothquant(
-        m,
         n,
         dtype_str,
         quant_dtype,
@@ -619,7 +599,6 @@ def flydsl_add_layernorm_dynamicquant(
     residual_out = _check_optional_out("residual_out", residual_out, input)
     yscale = _check_optional_yscale(yscale, m, device)
     launcher = _compile_add_layernorm_dynamicquant(
-        m,
         n,
         dtype_str,
         quant_dtype,
@@ -664,7 +643,6 @@ def flydsl_add_layernorm_smoothquant(
     residual_out = _check_optional_out("residual_out", residual_out, input)
     yscale = _check_optional_yscale(yscale, m, device)
     launcher = _compile_add_layernorm_smoothquant(
-        m,
         n,
         dtype_str,
         quant_dtype,
