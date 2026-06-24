@@ -223,10 +223,10 @@ def test_rotate_fp4quant(M, head_num, N, dtype=torch.bfloat16, shuffle_scale=Fal
     y = torch.empty((*x.shape[:-1], N // 2), dtype=dtypes.fp4x2, device="cuda")
     scale = torch.empty_like(scale_ref)
     _, us = run_perftest(
-        aiter.rotate_activation_fp4quant,
+        aiter.rotate_activation,
         y,
-        scale,
         x,
+        scale=scale,
         group_size=32,
         shuffle_scale=shuffle_scale,
     )
@@ -279,14 +279,14 @@ def test_rope_rotate_fp4quant(
     y = torch.empty((*x.shape[:-1], N // 2), dtype=dtypes.fp4x2, device="cuda")
     scale = torch.empty_like(scale_ref)
     _, us = run_perftest(
-        aiter.rope_rotate_activation_fp4quant,
+        aiter.rope_rotate_activation,
         y,
-        scale,
         x,
         cos,
         sin,
         positions,
         rope_dim,
+        scale=scale,
         group_size=32,
         shuffle_scale=shuffle_scale,
     )
@@ -486,14 +486,14 @@ def test_rope_rotate_fp8quant(M, head_num, N, dtype=torch.bfloat16):
     q_fp8 = torch.empty_like(x, dtype=dtypes.fp8)
     q_scale = torch.empty((M * head_num, g), dtype=torch.float32, device="cuda")
     _, us = run_perftest(
-        aiter.rope_rotate_activation_fp8quant,
+        aiter.rope_rotate_activation,
         q_fp8,
-        q_scale,
         x,
         cos,
         sin,
         positions,
         rope_dim,
+        scale=q_scale,
         group_size=group_size,
     )
 

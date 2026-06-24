@@ -805,20 +805,20 @@ def partial_transpose(
 ) -> None: ...
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rotate_activation_fp4quant(
+@compile_ops("module_dsv4_rotate_quant", fc_name="rotate_activation_fp4quant", develop=True)
+def _rotate_activation_fp4quant(
     out: torch.Tensor,
     scale: torch.Tensor,
     input: torch.Tensor,
     group_size: int = 32,
     shuffle_scale: bool = True,
 ) -> None:
-    """Hadamard-rotate activation, FP4-quantize, then dequantize back to BF16 in-place."""
+    """Hadamard-rotate activation, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
     ...
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rotate_activation(
+@compile_ops("module_dsv4_rotate_quant", fc_name="rotate_activation", develop=True)
+def _rotate_activation_bf16(
     out: torch.Tensor,
     input: torch.Tensor,
 ) -> None:
@@ -826,8 +826,36 @@ def rotate_activation(
     ...
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rope_rotate_activation_fp4quant(
+def rotate_activation(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    group_size: Optional[int] = None,
+    shuffle_scale: bool = True,
+) -> None:
+    """Walsh-Hadamard transform along the last dim (1/sqrt(N) scaling),
+    dispatching on ``out.dtype``:
+
+    - bf16/fp16 ``out``: plain hadamard rotate in place (``scale`` ignored).
+    - ``fp4x2`` ``out``: hadamard-rotate then FP4-quantize into packed ``out``
+      + e8m0 ``scale`` (``scale`` required; ``group_size`` defaults to 32).
+      ``shuffle_scale`` selects the dsv4 preshuffled scale layout.
+    """
+    if out.dtype == dtypes.fp4x2:
+        assert scale is not None, "fp4 rotate_activation requires `scale`"
+        _rotate_activation_fp4quant(
+            out,
+            scale,
+            input,
+            group_size=32 if group_size is None else group_size,
+            shuffle_scale=shuffle_scale,
+        )
+    else:
+        _rotate_activation_bf16(out, input)
+
+
+@compile_ops("module_dsv4_rotate_quant", fc_name="rope_rotate_activation_fp4quant", develop=True)
+def _rope_rotate_activation_fp4quant(
     out: torch.Tensor,
     scale: torch.Tensor,
     input: torch.Tensor,
@@ -839,12 +867,12 @@ def rope_rotate_activation_fp4quant(
     shuffle_scale: bool = True,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``,
-    Hadamard-rotate, FP4-quantize, then dequantize back to BF16."""
+    Hadamard-rotate, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
     ...
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rope_rotate_activation(
+@compile_ops("module_dsv4_rotate_quant", fc_name="rope_rotate_activation", develop=True)
+def _rope_rotate_activation_bf16(
     out: torch.Tensor,
     input: torch.Tensor,
     cos: torch.Tensor,
@@ -856,8 +884,8 @@ def rope_rotate_activation(
     ...
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rope_rotate_activation_fp8quant(
+@compile_ops("module_dsv4_rotate_quant", fc_name="rope_rotate_activation_fp8quant", develop=True)
+def _rope_rotate_activation_fp8quant(
     out: torch.Tensor,
     scale: torch.Tensor,
     input: torch.Tensor,
@@ -869,9 +897,58 @@ def rope_rotate_activation_fp8quant(
 ) -> None:
     """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate, then
     fp8-quantize: ``out`` is fp8 and ``scale`` (``[m, dim // group_size]`` fp32)
-    receives the per-(row, ``1 x group_size``) block scales
-    ``scale = absMax / fp8_max``. Symmetric to ``rope_rotate_activation_fp4quant``."""
+    receives the per-(row, ``1 x group_size``) block scales ``scale = absMax / fp8_max``."""
     ...
+
+
+def rope_rotate_activation(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    scale: Optional[torch.Tensor] = None,
+    group_size: Optional[int] = None,
+    shuffle_scale: bool = True,
+) -> None:
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
+    Hadamard-rotate, dispatching on ``out.dtype``:
+
+    - bf16/fp16 ``out``: plain rope+hadamard in place (``scale`` ignored).
+    - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
+      (``scale`` required; ``group_size`` defaults to 32). ``shuffle_scale``
+      selects the dsv4 preshuffled scale layout.
+    - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
+      ``scale`` (``scale`` required; ``group_size`` defaults to 128).
+    """
+    if out.dtype == dtypes.fp4x2:
+        assert scale is not None, "fp4 rope_rotate_activation requires `scale`"
+        _rope_rotate_activation_fp4quant(
+            out,
+            scale,
+            input,
+            cos,
+            sin,
+            positions,
+            rope_dim,
+            group_size=32 if group_size is None else group_size,
+            shuffle_scale=shuffle_scale,
+        )
+    elif out.dtype == dtypes.fp8:
+        assert scale is not None, "fp8 rope_rotate_activation requires `scale`"
+        _rope_rotate_activation_fp8quant(
+            out,
+            scale,
+            input,
+            cos,
+            sin,
+            positions,
+            rope_dim,
+            group_size=128 if group_size is None else group_size,
+        )
+    else:
+        _rope_rotate_activation_bf16(out, input, cos, sin, positions, rope_dim)
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
