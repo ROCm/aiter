@@ -14,9 +14,12 @@ _GFX942_KERNEL_NAME_TAGS = {
     "a16w16_kbuf2v_bk128_sk": "splitk_p1_bk128",
     "a16w16_em3en4_lds1_pgr2_sk": "splitk_em3en4_lds1_pgr2",
     "a16w16_wave_k_coop": "wkc",
+    "a16w16_wave_k_coop_accum": "wkc_accum",
     "a16w16_kbuf2v": "p1",
     "a16w16_kbuf2v_bk128": "p1_bk128",
     "a16w16_kbuf1": "legacy",
+    "a16w16_quad_mfma32_kbuf1": "quad_mfma32",
+    "a16w16_quad_mfma32_kbuf1_sk": "splitk_quad_mfma32_bf16ws",
 }
 
 
@@ -498,6 +501,38 @@ def _a16w16_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     )
 
 
+def _a16w16_quad_mfma32_gfx942(bs, bm, bn, bk, tm, tn, wm, wn, wk):
+    """gfx942 quad MFMA32 path."""
+    vec = 16 // 2  # bf16
+    return OpusGemmInstance(
+        bs, bm, bn, bk,
+        tm, tn,
+        wm, wn, wk,
+        vec, vec, 4,
+        0, 0, 0,
+        "a16w16_quad_mfma32_kbuf1",
+        ["bf16_t"],
+        arch_prefix="gfx942",
+    )
+
+
+def _a16w16_quad_mfma32_sk_bf16ws_gfx942(bs, bm, bn, bk, tm, tn, wm, wn, wk, group_m=0):
+    """gfx942 quad MFMA32 splitK path with bf16 workspace."""
+    vec = 16 // 2  # bf16
+    inst = OpusGemmInstance(
+        bs, bm, bn, bk,
+        tm, tn,
+        wm, wn, wk,
+        vec, vec, 4,
+        group_m, 0, 0,
+        "a16w16_quad_mfma32_kbuf1_sk",
+        ["fp32_t"],
+        arch_prefix="gfx942",
+    )
+    inst.splitk_workspace_dtype = "bf16_t"
+    return inst
+
+
 def _a16w16_splitk_tag_gfx942(bs, bm, bn, bk, tn, wm, wn, wk, tag):
     """Factory for gfx942 splitK kids that write fp32 workspace + reduce."""
     vec = 16 // 2  # bf16
@@ -531,6 +566,18 @@ def _a16w16_kbuf1_sk_bf16ws_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     """SplitK 4-phase split-barrier with bf16 workspace."""
     inst = _a16w16_kbuf1_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk)
     return _with_bf16_splitk_workspace(inst, "splitk_legacy_bf16ws")
+
+
+def _a16w16_kbuf2v_sk_bf16ws_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """SplitK P1 with bf16 workspace."""
+    inst = _a16w16_kbuf2v_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk)
+    return _with_bf16_splitk_workspace(inst, "splitk_p1_bf16ws")
+
+
+def _a16w16_kbuf2v_bk128_sk_bf16ws_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """SplitK P1 B_K=128 with bf16 workspace."""
+    inst = _a16w16_kbuf2v_bk128_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk)
+    return _with_bf16_splitk_workspace(inst, "splitk_p1_bk128_bf16ws")
 
 
 # gfx942 P1-family non-splitK factories (siblings of corresponding splitK kids).
@@ -588,6 +635,15 @@ def _a16w16_wave_k_coop_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     )
 
 
+def _a16w16_wave_k_coop_accum_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
+    """Wave-K-cooperative splitK atomic accumulate path."""
+    vec = 16 // 2
+    return OpusGemmInstance(
+        bs, bm, bn, bk, 1, tn, wm, wn, wk, vec, vec, 4, 0, 0, 0,
+        "a16w16_wave_k_coop_accum", ["bf16_t"], arch_prefix="gfx942",
+    )
+
+
 def _a16w16_em3en4_lds1_pgr2_sk_gfx942(bs, bm, bn, bk, tn, wm, wn, wk):
     """SplitK EM3EN4: host 128x96, device 96x128 LDSB1."""
     vec = 16 // 2
@@ -604,10 +660,17 @@ gfx942_nosplit_kernels_list = {
     10001: _a16w16_p1_gfx942     (256,  64,  64,  64,    2, 16, 16, 16),   # P1 depth=2 sibling of 10201
     10002: _a16w16_kbuf1_gfx942 (256, 128,  64,  64,    2, 16, 16, 16),   # legacy 4-phase E_M=2 sibling of 10202
     10003: _a16w16_kbuf2v_bk128_gfx942(256, 64,  64, 128,    2, 16, 16, 16),   # P1 B_K=128 sibling of 10203
+    10006: _a16w16_quad_mfma32_gfx942(256, 256, 256, 32, 2, 2, 32, 32, 8), # quad MFMA32 pipeline
     10300: _a16w16_wave_k_coop_gfx942(512, 16, 16, 64,    1, 16, 16, 16),  # wave-K-coop 16x16, T_K=8
     10301: _a16w16_wave_k_coop_gfx942(512, 16, 32, 32,    1, 16, 16, 16),  # WKC 16x32, B_K=32
     10302: _a16w16_wave_k_coop_gfx942(512, 32, 16, 64,    1, 16, 16, 16),  # WKC 32x16, aliased partial
     10303: _a16w16_wave_k_coop_gfx942(256, 32, 32, 64,    1, 16, 16, 16),  # WKC 32x32, T_K=4
+    10305: _a16w16_wave_k_coop_gfx942(512, 16, 32, 64,    1, 16, 16, 16),  # WKC 16x32, B_K=64
+    10310: _a16w16_wave_k_coop_accum_gfx942(256, 16, 16, 64, 1, 16, 16, 16),  # WKC 16x16 split8 atomic accumulate
+    10311: _a16w16_wave_k_coop_accum_gfx942(512, 16, 32, 32, 1, 16, 16, 16),  # WKC 16x32 split8 atomic accumulate
+    10312: _a16w16_wave_k_coop_accum_gfx942(512, 32, 16, 64, 1, 16, 16, 16),  # WKC 32x16 split8 atomic accumulate
+    10313: _a16w16_wave_k_coop_accum_gfx942(256, 32, 32, 64, 1, 16, 16, 16),  # WKC 32x32 split8 atomic accumulate
+    10314: _a16w16_wave_k_coop_accum_gfx942(256, 64, 16, 64, 1, 16, 16, 16),  # WKC 64x16 split8 atomic accumulate
 }
 
 gfx942_splitk_kernels_list = {
@@ -618,6 +681,9 @@ gfx942_splitk_kernels_list = {
     10204: _a16w16_em3en4_lds1_pgr2_sk_gfx942 (256, 128,  96, 128,    2, 16, 16, 16),                # EM3EN4 LDS1/PGR2 hipb-orientation (host 128M x 96N)
     10205: _a16w16_kbuf1_sk_gfx942      (512,  64, 128,  64,    4, 16, 16, 16),                # legacy 4-phase M64 x N128
     10210: _a16w16_kbuf1_sk_bf16ws_gfx942(512, 128, 128,  64,    4, 16, 16, 16),                # legacy 4-phase large tile + bf16 workspace
+    10211: _a16w16_kbuf2v_sk_bf16ws_gfx942(256,  64,  64,  64,    2, 16, 16, 16),                # P1 depth=2 + bf16 workspace
+    10213: _a16w16_kbuf2v_bk128_sk_bf16ws_gfx942(256, 64,  64, 128,    2, 16, 16, 16),           # P1 B_K=128 + bf16 workspace
+    10216: _a16w16_quad_mfma32_sk_bf16ws_gfx942(256, 256, 256, 32, 2, 2, 32, 32, 8, group_m=6),  # 10006 bf16 splitK sibling, group-M=6
 }
 
 # NOTE: 10402 (a16w16_naive_64x64) was removed -- 32.85us never matched WKC's
@@ -745,10 +811,13 @@ HEURISTIC_DEFAULT_KIDS_GFX942 = frozenset(
         10204,  # gfx942 splitk_em3en4_lds1_pgr2 256x128x96x128 hipb-orientation
         10205,  # gfx942 splitk_legacy    512x64x128x64 16x16x16
         10210,  # gfx942 splitk_legacy_bf16ws 512x128x128x64
+        10211,  # gfx942 splitk_p1_bf16ws 256x64x64x64
+        10213,  # gfx942 splitk_p1_bk128_bf16ws 256x64x64x128
         10300,  # gfx942 wave_k_coop     512x16x16x64 T_K=8
         10301,  # gfx942 wave_k_coop     512x16x32x32 T_K=8
         10302,  # gfx942 wave_k_coop     512x32x16x64 T_K=8
         10303,  # gfx942 wave_k_coop     256x32x32x64 T_K=4
+        10305,  # gfx942 wave_k_coop     512x16x32x64 T_K=8
     }
 )
 
