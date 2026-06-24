@@ -266,6 +266,37 @@ def test_flydsl_gemm1_parametrized_shape_compiles(NE, H, INTER, TOPK):
         assert callable(launch)
 
 
+@_GFX950
+@pytest.mark.parametrize(
+    "NE,H,INTER,TOPK",
+    [
+        (385, 7168, 512, 9),  # KIMI
+        (256, 3072, 768, 8),  # minimax
+    ],
+)
+def test_flydsl_gemm1_separated_compiles(NE, H, INTER, TOPK):
+    from aiter.ops.flydsl.kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
+
+    assert (2 * INTER) % 256 == 0 and H % 256 == 0
+    for BM, nt, iq in [
+        (32, True, False),
+        (32, False, False),
+        (128, False, False),
+        (16, True, True),
+    ]:
+        launch = compile_gemm1_a4w4_port(
+            BM=BM,
+            use_nt=nt,
+            inline_quant=iq,
+            D_HIDDEN=H,
+            D_INTER=INTER,
+            NE=NE,
+            TOPK=TOPK,
+            interleave=False,
+        )
+        assert callable(launch)
+
+
 def _torch_threestage_sort(topk_ids, topk_weight, M, NE, TOPK, BM, max_sorted):
     """Torch replica of moe_3stage_sort.cuh (stable expert-grouped sort, each
     expert region padded up to a multiple of BM). The HIP threestage sort is
@@ -358,6 +389,9 @@ def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
 
 @_GFX950
 @pytest.mark.parametrize(
+    "interleave", [True, False], ids=["interleave", "separated"]
+)
+@pytest.mark.parametrize(
     "NE,H,INTER,TOPK",
     [
         (385, 7168, 512, 9),  # KIMI (known-good; ~0.88 fp4-output-quant ceiling)
@@ -366,7 +400,7 @@ def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
         (256, 3072, 768, 8),  # minimax: parametrized INTER/NE/TOPK + K
     ],
 )
-def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK):
+def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave):
     """Standalone numeric check of the parametrized gemm1 (BM32 non-inline).
 
     Uses the (shape-independent) threestage sort + torch per_1x32 A-quant + a torch
@@ -391,7 +425,7 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK):
     torch.manual_seed(seed)
     w1 = torch.randn((NE, 2 * INTER, H), dtype=dtypes.bf16, device=device) / 10
     w1q, w1s = tq(w1, quant_dtype=dtypes.fp4x2)
-    w1u8 = shuffle_weight_a16w4(w1q, 16, True)
+    w1u8 = shuffle_weight_a16w4(w1q, 16, interleave)
     w1_scale = shuffle_scale_a16w4(w1s, NE, True)
     if w1u8.element_size() == 1 and w1u8.dtype != torch.uint8:
         w1u8 = w1u8.view(torch.uint8)
@@ -489,6 +523,7 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK):
         D_HIDDEN=H,
         D_INTER=D_INTER,
         topk=topk,
+        interleave=interleave,
     )
     torch.cuda.synchronize()
 
@@ -515,12 +550,13 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK):
         ).item()
         cnt += 1
     mean_cos = cossum / cnt
+    mode = "interleave" if interleave else "separated"
     print(
-        f"[gemm1 numeric] NE={NE} H={H} INTER={INTER} TOPK={TOPK} "
+        f"[gemm1 numeric] NE={NE} H={H} INTER={INTER} TOPK={TOPK} mode={mode} "
         f"mean_row_cos={mean_cos:.4f} (cnt={cnt})"
     )
     # 0.85 floor: the fp4 output-quant ceiling (~0.88) holds for KIMI too.
     assert mean_cos > 0.85, (
-        f"NE={NE} H={H} INTER={INTER} TOPK={TOPK} "
+        f"NE={NE} H={H} INTER={INTER} TOPK={TOPK} mode={mode} "
         f"mean_row_cos={mean_cos:.4f} (cnt={cnt})"
     )
