@@ -12,6 +12,10 @@ import functools
 
 import torch
 
+# Shared low-overhead launch helper (flyc.compile + cached CompiledFunction).
+# Imported as a module so the AOT cache-miss gate's monkeypatch is seen here.
+from aiter.ops.flydsl import moe_kernels as _moe_kernels
+
 # Supported (BM, use_nt, inline_quant) variant combinations.
 _SUPPORTED = {
     (32, True, False),
@@ -105,18 +109,21 @@ def flydsl_mxfp4_gemm1(
     # gemm1 only needs base pointers (it assumes contiguity + derives sizes
     # from n_tokens / compile-time consts), so pass raw data_ptr() addresses
     # instead of full memref descriptors -> contiguous, coalescible kernargs.
-    launch(
-        a_quant.data_ptr(),
-        a_scale_sorted_shuffled.data_ptr(),
-        w1_u8.data_ptr(),
-        w1_scale_u8.data_ptr(),
-        sorted_expert_ids.data_ptr(),
-        cumsum_tensor.data_ptr(),
-        m_indices.data_ptr(),
-        n_tokens,
-        grid,
-        inter_sorted_quant.data_ptr(),
-        inter_sorted_shuffled_scale.data_ptr(),
-        hidden_states.data_ptr(),
-        torch.cuda.current_stream(),
+    _moe_kernels._run_compiled(
+        launch,
+        (
+            a_quant.data_ptr(),
+            a_scale_sorted_shuffled.data_ptr(),
+            w1_u8.data_ptr(),
+            w1_scale_u8.data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            cumsum_tensor.data_ptr(),
+            m_indices.data_ptr(),
+            n_tokens,
+            grid,
+            inter_sorted_quant.data_ptr(),
+            inter_sorted_shuffled_scale.data_ptr(),
+            hidden_states.data_ptr(),
+            torch.cuda.current_stream(),
+        ),
     )

@@ -18,6 +18,10 @@ import functools
 
 import torch
 
+# Shared low-overhead launch helper (see mxfp4_gemm1_kernels); imported as a
+# module so the AOT cache-miss gate's monkeypatch is seen here.
+from aiter.ops.flydsl import moe_kernels as _moe_kernels
+
 # Supported (BM, use_nt, epilog) combinations (mirrors the prebuilt HIP set).
 _SUPPORTED = {
     # atomic: BM in {16,32,64} x {ATOMIC, NT}
@@ -160,18 +164,21 @@ def flydsl_mxfp4_gemm2(
     # gemm2 only needs base pointers (assumes contiguity + derives sizes from
     # compile-time consts), so pass raw data_ptr() addresses instead of full
     # memref descriptors -> contiguous, coalescible kernargs (ported from gemm1).
-    launch(
-        inter_sorted_quant.data_ptr(),
-        inter_sorted_shuffled_scale.data_ptr(),
-        w2_u8.data_ptr(),
-        w2_scale_u8.data_ptr(),
-        sorted_expert_ids.data_ptr(),
-        cumsum_tensor.data_ptr(),
-        sorted_token_ids.data_ptr(),
-        sorted_weights.data_ptr(),
-        M_logical,
-        max_m_blocks,
-        flat_out.data_ptr(),
-        out_scale.data_ptr(),
-        torch.cuda.current_stream(),
+    _moe_kernels._run_compiled(
+        launch,
+        (
+            inter_sorted_quant.data_ptr(),
+            inter_sorted_shuffled_scale.data_ptr(),
+            w2_u8.data_ptr(),
+            w2_scale_u8.data_ptr(),
+            sorted_expert_ids.data_ptr(),
+            cumsum_tensor.data_ptr(),
+            sorted_token_ids.data_ptr(),
+            sorted_weights.data_ptr(),
+            M_logical,
+            max_m_blocks,
+            flat_out.data_ptr(),
+            out_scale.data_ptr(),
+            torch.cuda.current_stream(),
+        ),
     )
