@@ -421,9 +421,9 @@ def _compile_stage1_finalize_act(
         if_elem = scf.IfOp(in_range, results_=[], has_else=False)
         with ir.InsertionPoint(if_elem.then_block):
             out_dw_base = linear_vec * arith.index(VEC_DW)
-            flat_row = out_dw_base / arith.index(out_dw_per_row)
+            flat_row = out_dw_base // arith.index(out_dw_per_row)
             col_dw = out_dw_base - flat_row * arith.index(out_dw_per_row)
-            e = flat_row / arith.index(max_m)
+            e = flat_row // arith.index(max_m)
             row = flat_row - e * arith.index(max_m)
 
             valid_m = buffer_ops.buffer_load(
@@ -699,7 +699,7 @@ def _compile_stage1_finalize_act(
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
-        gx = (arith.index(total_vecs) + arith.index(block_threads - 1)) / arith.index(
+        gx = (arith.index(total_vecs) + arith.index(block_threads - 1)) // arith.index(
             block_threads
         )
         launcher = stage1_finalize_act_kernel(arg_y, arg_tmp, arg_masked_m)
@@ -768,9 +768,9 @@ def _compile_stage1_finalize_act_bias(
 
         if_elem = scf.IfOp(in_range, results_=[], has_else=False)
         with ir.InsertionPoint(if_elem.then_block):
-            e = linear / arith.index(out_stride_e)
+            e = linear // arith.index(out_stride_e)
             rem0 = linear - e * arith.index(out_stride_e)
-            row = rem0 / arith.index(inter_dim)
+            row = rem0 // arith.index(inter_dim)
             col = rem0 - row * arith.index(inter_dim)
 
             valid_m = buffer_ops.buffer_load(
@@ -870,7 +870,7 @@ def _compile_stage1_finalize_act_bias(
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
-        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) / arith.index(
+        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) // arith.index(
             block_threads
         )
         launcher = stage1_finalize_act_bias_kernel(
