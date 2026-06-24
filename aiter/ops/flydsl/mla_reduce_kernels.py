@@ -70,7 +70,7 @@ def flydsl_mla_reduce_v1(
         stream: launch stream; defaults to the current stream of the device.
     """
     if reduce_indptr.numel() < 2:
-        return  # no reduce tiles -- nothing to do (matches num_reduce_tile > 0)
+        return
 
     H = partial_output.size(-2)
     Dv = final_output.size(-1)
@@ -97,8 +97,6 @@ def flydsl_mla_reduce_v1(
         use_reduce_final_map=use_reduce_final_map,
     )
 
-    # The kernel always dereferences the final_lse / reduce_final_map pointers
-    # (guarded by the compile-time flags), so pass valid dummies when absent.
     if final_lse is None:
         final_lse = torch.empty(1, dtype=torch.float32, device=final_output.device)
     if reduce_final_map is None:
