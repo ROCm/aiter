@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 import functools
 import inspect
@@ -270,6 +270,50 @@ def _affinity_aware_cpu_count() -> int:
     return max(n, 1)
 
 
+def _resolve_max_workers(num_jobs: int) -> int:
+    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
+    if workers_env is not None:
+        try:
+            max_workers = max(int(workers_env), 1)
+        except ValueError as e:
+            raise ValueError(
+                f"AITER_FLYDSL_AOT_WORKERS must be an integer, got {workers_env!r}"
+            ) from e
+    else:
+        max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
+    return max(min(max_workers, num_jobs), 1)
+
+
+def run_jobs_parallel(
+    worker: Callable[..., dict[str, Any]],
+    jobs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not jobs:
+        return []
+    max_workers = _resolve_max_workers(len(jobs))
+    total = len(jobs)
+    print(
+        f"[aiter] FlyDSL AOT: {total} kernels, {max_workers} worker processes",
+        flush=True,
+    )
+    results: list[dict[str, Any]] = []
+    pool = ProcessPoolExecutor(max_workers=max_workers)
+    try:
+        futures = {pool.submit(worker, **job): job for job in jobs}
+        for done, future in enumerate(as_completed(futures), 1):
+            try:
+                results.append(future.result())
+            except Exception as worker_err:
+                job = futures[future]
+                name = job.get("kernel_name") or job.get("kernelName") or repr(job)
+                print(f"  [FAIL] worker crashed: {name}: {worker_err}", flush=True)
+                results.append({"kernel_name": name, "compile_time": None})
+            print(f"  ... {done}/{total} complete", flush=True)
+    finally:
+        pool.shutdown(wait=True)
+    return results
+
+
 def start_aot(
     cache_dir: str,
 ) -> tuple[ProcessPoolExecutor | None, dict[Future, JobLabel]]:
@@ -293,17 +337,6 @@ def start_aot(
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
-    if workers_env is not None:
-        try:
-            max_workers = max(int(workers_env), 1)
-        except ValueError as e:
-            raise ValueError(
-                f"AITER_FLYDSL_AOT_WORKERS must be an integer, got {workers_env!r}"
-            ) from e
-    else:
-        max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
-
     all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
     for kind in OpKind:
         for job in _collect_aot_jobs_for(kind):
@@ -313,7 +346,7 @@ def start_aot(
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
         return None, {}
 
-    max_workers = min(max_workers, len(all_jobs))
+    max_workers = _resolve_max_workers(len(all_jobs))
     print(
         f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
         f"({'+'.join(k.name for k in OpKind)}), "
