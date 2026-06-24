@@ -836,23 +836,7 @@ def _gemm1_body(
         read_slot = OFFSET % kAStages
         write_slot = K_C % kAStages
         slot_b = OFFSET % kStages
-        if const_expr(_relax_prologue and OFFSET == 0):
-            llvm.inline_asm(
-                res=None,
-                operands_=[],
-                asm_string=f"s_waitcnt vmcnt({10 * kStages})",
-                constraints="",
-                has_side_effects=True,
-            )
-            llvm.inline_asm(
-                res=None,
-                operands_=[],
-                asm_string="s_barrier",
-                constraints="",
-                has_side_effects=True,
-            )
-        else:
-            gpu.barrier()  # __syncthreads (HIP 472)
+        gpu.barrier()  # __syncthreads (HIP 472)
         if const_expr(BM == 128):
             asc_cur = issue_a_scale_ds_read(K_C - kStages)
             a_cur = issue_a_ds_read(read_slot)

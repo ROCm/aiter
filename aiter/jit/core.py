@@ -910,11 +910,6 @@ def build_module(
             if not any("ASM_DEBUG" in f for f in flags_extra_hip):
                 flags_hip.append("-DASM_DEBUG")
 
-        if int(os.environ.get("AITER_DEBUG_LINEINFO", "0")):
-            # line-table-only DWARF: source:line mapping in the HSACO for ATT
-            # traces, without -g's full debug bloat / codegen regressions.
-            flags_hip += ["-gline-tables-only"]
-            flags_cc += ["-gline-tables-only"]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
