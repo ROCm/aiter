@@ -276,8 +276,6 @@ def compile_mxscale_gemm(
     gather_index_size = 32
     gather_max_rows_per_sub = 8
     if grouped_gather_m_mode:
-        if not grouped_contiguous_m:
-            raise ValueError("grouped_gather_m requires grouped_contiguous_m=True")
         if wave_specialized_tdm:
             raise ValueError(
                 "grouped_gather_m is incompatible with wave_specialized_tdm"
@@ -545,9 +543,7 @@ def compile_mxscale_gemm(
     # unchanged.
     _a_tdm_ops = gather_subops if grouped_gather_m_mode else 1
     TDM_LOADS_PER_STEP = (
-        1
-        if wave_specialized_tdm
-        else ((5 if stage1_dual_b else 3) + _a_tdm_ops)
+        1 if wave_specialized_tdm else ((5 if stage1_dual_b else 3) + _a_tdm_ops)
     )
     tail_plan = [
         (ls, cs, o * TDM_LOADS_PER_STEP // 2 if o > 0 else o)
@@ -777,6 +773,27 @@ def compile_mxscale_gemm(
                         + wid_idx * arith.index(gather_rows_per_wave)
                         + arith.index(gather_sub * gather_rows_per_sub)
                     )
+                    # MoE grouped rows are prefix-valid within each expert tile.
+                    # Tell TDM exactly how many rows in this sub-descriptor are
+                    # live instead of relying on many -1 padding indices to OOB.
+                    sub_local_row0 = (
+                        blk_m
+                        + wid_idx * arith.index(gather_rows_per_wave)
+                        + arith.index(gather_sub * gather_rows_per_sub)
+                    )
+                    sub_local_i32 = arith.index_cast(T.i32, sub_local_row0)
+                    remaining_i32 = arith.subi(valid_m_i32, sub_local_i32)
+                    c0_i32 = arith.constant(0, type=T.i32)
+                    c_sub_rows_i32 = arith.constant(gather_rows_per_sub, type=T.i32)
+                    gt_zero = arith.cmpi(arith.CmpIPredicate.sgt, remaining_i32, c0_i32)
+                    lt_sub_rows = arith.cmpi(
+                        arith.CmpIPredicate.slt, remaining_i32, c_sub_rows_i32
+                    )
+                    valid_rows_i32 = arith.select(
+                        gt_zero,
+                        arith.select(lt_sub_rows, remaining_i32, c_sub_rows_i32),
+                        c0_i32,
+                    )
                     row_indices = []
                     for _gi in range_constexpr(gather_rows_per_sub):
                         ridx = buffer_ops.buffer_load(
@@ -786,11 +803,10 @@ def compile_mxscale_gemm(
                             dtype=T.i32,
                         )
                         row_indices.append(_raw(ridx))
-                    lds_byte_off = (
-                        wid_idx * arith.index(gather_rows_per_wave * lds_a_stride_bytes)
-                        + arith.index(
-                            gather_sub * gather_rows_per_sub * lds_a_stride_bytes
-                        )
+                    lds_byte_off = wid_idx * arith.index(
+                        gather_rows_per_wave * lds_a_stride_bytes
+                    ) + arith.index(
+                        gather_sub * gather_rows_per_sub * lds_a_stride_bytes
                     )
                     return tdm_ops.make_tensor_gather_descriptor(
                         global_ptr=arg_a,
@@ -804,6 +820,7 @@ def compile_mxscale_gemm(
                         pad_interval=packed_tile_k_a,
                         pad_amount=LDS_PAD_A_BYTES,
                         index_size=gather_index_size,
+                        gather_tile_dim1=valid_rows_i32,
                         lds_byte_offset=lds_byte_off,
                         global_byte_offset=k_packed_off,
                         workgroup_mask=a_mcast_mask,
@@ -3257,7 +3274,7 @@ def compile_mxscale_gemm(
     # Bump this when changing generated IR in ways not otherwise reflected in
     # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
     # reusing a previously compiled kernel after source-only descriptor fixes.
-    tdm_store_descriptor_version = 32
+    tdm_store_descriptor_version = 33
 
     # M/N are compile-time constants used throughout the generated IR
     # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
@@ -3714,10 +3731,17 @@ def compile_mxscale_gemm(
             arena_alloc.finalized = False
             arena_alloc.finalize()
 
+        idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
-        gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
-        gy = arith.index(1)
+        n_tiles = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
+        if const_expr(grouped_contiguous_m):
+            gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
+            gy = arith.index(1)
+        else:
+            gx = _raw((idx_m + arith.index(tile_m - 1)) // arith.index(tile_m))
+            if const_expr(batch_count > 1):
+                gx = gx * batch_count
+            gy = _raw(n_tiles)
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3782,10 +3806,17 @@ def compile_mxscale_gemm(
             arena_alloc.finalized = False
             arena_alloc.finalize()
 
+        idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        n_tiles = (idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)
-        gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
-        gy = arith.index(1)
+        n_tiles = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
+        if const_expr(grouped_contiguous_m):
+            gx = arith.index_cast(T.index, i32_m_tile_bound.ir_value()) * n_tiles
+            gy = arith.index(1)
+        else:
+            gx = _raw((idx_m + arith.index(tile_m - 1)) // arith.index(tile_m))
+            if const_expr(batch_count > 1):
+                gx = gx * batch_count
+            gy = _raw(n_tiles)
         gz = split_k
 
         launcher = kernel_mxscale_gemm(

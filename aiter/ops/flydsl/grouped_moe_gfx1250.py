@@ -516,11 +516,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
     # Gather MoE: read stage1 activations directly from token order via TDM
-    # gather instead of physically route-copying them. Requires the contiguous
-    # (DeepGEMM-style) scheduler, so force it on when requested.
+    # gather instead of physically route-copying them. This is orthogonal to the
+    # M scheduler; contiguous-M remains controlled by CSV/env/threshold below.
     _want_gather_moe = os.environ.get("AITER_USE_GATHER_MOE", "0") in _TRUTHY_ENV
-    if _want_gather_moe:
-        grouped_contiguous_m = True
     # Switch to DeepGEMM-style contiguous-M at large batches (env-overridable).
     _contig_token_threshold = _as_int(
         os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 512
@@ -537,11 +535,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # topk_ids is already an integer tensor; keep one flattened view for routing.
     flat_experts = topk_ids.reshape(-1)
     # [crash-probe] syncs are debug-only; gated by AITER_GROUPED_DEBUG.
-    _grouped_sync_dbg = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
-        "",
-        "0",
-        "false",
-        "False",
+    _grouped_sync_dbg = (
+        os.environ.get("AITER_GROUPED_DEBUG", "0")
+        not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        and not torch.cuda.is_current_stream_capturing()
     )
     # Expert-id range validation is a debug-only safety check: at decode sizes it
     # issues ~6 tiny launches/iter (lt+ge compare_scalar, two any() reductions)
@@ -628,18 +630,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         route_E = 1
         route_max_m = int(contiguous_m)
 
-    # Gather MoE is only wired for the fast (non-naive) contiguous path. When
-    # active, stage1 reads activations from the token-order buffer via TDM
-    # gather using ``rows_to_tokens`` (contiguous grouped row -> source token),
-    # so the physical payload route-copy is skipped (scale still gathered +
-    # preshuffled on the host -- payload_only scope).
-    use_gather_moe = bool(
-        _want_gather_moe and effective_grouped_contiguous_m and not _use_naive
-    )
+    # Gather MoE is wired for the fast (non-naive) grouped path. When active,
+    # stage1 reads activations from the token-order buffer via TDM gather using
+    # ``rows_to_tokens`` (grouped row -> source token), so the physical payload
+    # route-copy is skipped. Scale still uses the host scatter+preshuffle path.
+    use_gather_moe = bool(_want_gather_moe and not _use_naive)
     if _want_gather_moe and not use_gather_moe:
         logger.warning(
             "[grouped_a8w4] AITER_USE_GATHER_MOE requested but unsupported in "
-            "this path (needs fast contiguous scheduler); falling back to copy."
+            "this path (needs fast grouped scheduler); falling back to copy."
         )
 
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
@@ -822,7 +821,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         # A is the token-order activation buffer; the kernel gathers the rows it
         # needs via ``rows_to_tokens`` (contiguous grouped row -> source token).
         stage1_a = a1_payload.view(1, int(token_num), -1)
-        _gather_idx_arg = rows_to_tokens.clamp(min=0)
+        # Keep padding rows as -1: TDM treats them as OOB and zero-fills LDS.
+        _gather_idx_arg = rows_to_tokens
     else:
         stage1_a = grouped_a1
         _gather_idx_arg = None
@@ -930,9 +930,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         # Decisive: run the GATHER kernel on the scattered grouped buffer with an
         # identity index. This must reproduce the 2D result exactly; if not, the
         # in-gemm gather path itself is broken (vs the payload/index mapping).
-        _ident = torch.arange(
-            route_max_m * route_E, dtype=torch.int32, device=device
-        )
+        _ident = torch.arange(route_max_m * route_E, dtype=torch.int32, device=device)
         _ident_a2 = torch.empty_like(grouped_a2)
         stage1(
             _ident_a2,
@@ -973,9 +971,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _valid = _rt >= 0
         _g = torch.zeros_like(_ref_grouped_a1.view(route_max_m * route_E, -1))
         _g[_valid] = _a_view[_rt[_valid].to(torch.long)]
-        _gd = (
-            _g.int() - _ref_grouped_a1.view(route_max_m * route_E, -1).int()
-        ).abs()
+        _gd = (_g.int() - _ref_grouped_a1.view(route_max_m * route_E, -1).int()).abs()
         print(
             f"[gather-AB] torch a1[rows_to_tokens] vs scatter grouped_a1: "
             f"max={int(_gd.max())} nbad={int((_gd>0).sum())}",
