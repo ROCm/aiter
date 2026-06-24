@@ -65,7 +65,9 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
     # f4out/cshuffle are nonatomic-only; atomic sizes a different output buffer.
     if atomic and (mxfp4out or cshuffle):
         bad = "f4out" if mxfp4out else "cshuffle"
-        raise ValueError(f"illegal mxmoe g2 name {kname!r}: atomic incompatible with {bad}")
+        raise ValueError(
+            f"illegal mxmoe g2 name {kname!r}: atomic incompatible with {bad}"
+        )
     return {
         "BM": nums["BM"],
         "splitk": "kSplitK" in nums,
