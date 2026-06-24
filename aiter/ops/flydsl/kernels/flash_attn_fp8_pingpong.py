@@ -564,47 +564,33 @@ def build_flash_attn_fp8_module(
             neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
             n_groups = C_F32_PER_LANE // 4
 
-            # Pass 2a: per-element  P = exp2(S * scale_log2e + bias).  P is carried
-            # as flat scalar SSA values (one extractelement off S per element, then
-            # the P scalar overwrites that VGPR) -- no vector round-trip.
-            p_vals = []
-            for nt in range_constexpr(N_KV_TILES):
-                row = []
-                for r in range_constexpr(C_F32_PER_LANE):
-                    e = _fadd(_fmul(Vec(s_accs[nt])[r], scale_log2e), neg_scaled_m_new)
-                    row.append(ArithValue(e).exp2(fastmath=fm_fast))
-                p_vals.append(row)
-
-            # Pass 2b: row sum + fp8 pack, reading the P scalars directly (no
-            # extractelement -- the scalars never went back into a vector).
+            # Pass 2: exp2 + row-sum + fp8 pack in one fused loop.  Processing
+            # one rg group (4 elements) at a time keeps at most 4 live P scalars
+            # instead of all 64.  p_words is built in-order for the C-layout
+            # B-operand (no hi-peer shuffle_xor needed -- see dma_v / read_v_pack).
             row_sum = c_zero_f
-            myword = []
+            p_words = []
             for nt in range_constexpr(N_KV_TILES):
-                words = []
                 for rg in range_constexpr(n_groups):
-                    p0 = p_vals[nt][rg * 4 + 0]
-                    p1 = p_vals[nt][rg * 4 + 1]
-                    p2 = p_vals[nt][rg * 4 + 2]
-                    p3 = p_vals[nt][rg * 4 + 3]
-                    row_sum = _fadd(row_sum, _fadd(_fadd(p0, p1), _fadd(p2, p3)))
-                    words.append(_f32x4_to_fp8_word(p0, p1, p2, p3))
-                myword.append(words)
+                    ps = [
+                        ArithValue(
+                            _fadd(
+                                _fmul(Vec(s_accs[nt])[rg * 4 + i], scale_log2e),
+                                neg_scaled_m_new,
+                            )
+                        ).exp2(fastmath=fm_fast)
+                        for i in range_constexpr(4)
+                    ]
+                    row_sum = _fadd(
+                        row_sum, _fadd(_fadd(ps[0], ps[1]), _fadd(ps[2], ps[3]))
+                    )
+                    p_words.append(_f32x4_to_fp8_word(*ps))
             # This lane holds 64 of the 128 kv for q = lo; the hi-peer holds the
             # other 64 -> combine via shuffle_xor(32) for the full row sum.
             peer_sum = fx.Float32(row_sum).shuffle_xor(
                 fx.Int32(32), fx.Int32(WARP_SIZE)
             )
             p_rowsum = _fadd(row_sum, peer_sum)
-
-            # Pack P words directly from the C-layout myword: no shuffle_xor(32)
-            # hi-peer exchange needed because dma_v stores V in LDS with the
-            # matching C-layout kv permutation, and read_v_pack fetches it with
-            # the permuted kv0 addressing so A and B operands align without any
-            # cross-lane P word exchange.
-            p_words = []
-            for nt in range_constexpr(N_KV_TILES):
-                for rg in range_constexpr(n_groups):
-                    p_words.append(myword[nt][rg])
             return m_new, corr, Vec.from_elements(p_words, fx.Int32), p_rowsum
 
         # ---- Shared init values (computed by all 512 lanes before the split) --
