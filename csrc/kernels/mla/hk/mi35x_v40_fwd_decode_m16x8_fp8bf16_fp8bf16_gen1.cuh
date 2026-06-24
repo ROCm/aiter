@@ -48,25 +48,32 @@ struct HkMlaV40Regs
     static constexpr uint32_t k_o_sz      = 128;
     static constexpr uint32_t k_p_comp_sz = 8;
     static constexpr uint32_t k_p_mfma_sz = 4;
-    static constexpr uint32_t k_q_vgpr_sz = 32;
+    static constexpr uint32_t k_q_vgpr_sz = 64; // full Q block (512 cols)
     static constexpr uint32_t mfma_tile_sz = 4; // one 16x32 bf16 base tile
+
+    // # of QK col-tiles whose Q comes from the contiguous q_vgpr block (the rest
+    // come from LDS). = 2 * (# NoPE chunks in VGPR). Single knob for the
+    // incremental NoPE->VGPR migration: 10 (0:320), 12 (0:384), 14 (all NoPE).
+    static constexpr uint32_t kQkGemmTiles = 10;
 
     static constexpr uint32_t k_o_end        = 255;
     static constexpr uint32_t k_o_begin      = k_o_end - k_o_sz + 1;             // 128
-    static constexpr uint32_t k_p_comp_end   = k_o_begin - 1;                    // 127
-    static constexpr uint32_t k_p_comp_begin = k_p_comp_end - k_p_comp_sz + 1;   // 120
-    static constexpr uint32_t k_p_mfma_begin = k_p_comp_begin + 0;              // 120 (overlay)
-    static constexpr uint32_t k_p_mfma_end   = k_p_mfma_begin + k_p_mfma_sz - 1; // 123
-    static constexpr uint32_t k_v0_begin     = k_p_comp_begin + 4;              // 124
-    static constexpr uint32_t k_v0_end       = k_v0_begin + mfma_tile_sz - 1;      // 127
-    static constexpr uint32_t k_q_vgpr_end   = k_p_comp_begin - 1;              // 119
-    static constexpr uint32_t k_q_vgpr_begin = k_q_vgpr_end - k_q_vgpr_sz + 1;  // 88
-    static constexpr uint32_t k_k0_begin     = k_q_vgpr_begin - mfma_tile_sz;      // 84
-    static constexpr uint32_t k_k1_begin     = k_k0_begin - mfma_tile_sz;          // 80
-    static constexpr uint32_t k_k2_begin     = k_k1_begin - mfma_tile_sz;          // 76
-    static constexpr uint32_t k_q_lds_1_begin = k_k2_begin - mfma_tile_sz;          // 72
-    static constexpr uint32_t k_q_lds_0_begin = k_q_lds_1_begin - mfma_tile_sz;     // 68
-    static constexpr uint32_t k_q_lds_begin   = k_q_lds_0_begin; // 68
+    static constexpr uint32_t k_q_vgpr_end   = k_o_begin - 1;                    // 127
+    static constexpr uint32_t k_q_vgpr_begin = k_q_vgpr_end - k_q_vgpr_sz + 1;   // 64
+    static constexpr uint32_t k_p_comp_end   = k_q_vgpr_begin - 1;               // 63
+    static constexpr uint32_t k_p_comp_begin = k_p_comp_end - k_p_comp_sz + 1;   // 56
+    static constexpr uint32_t k_p_mfma_begin = k_p_comp_begin + 0;              // 56 (overlay)
+    static constexpr uint32_t k_p_mfma_end   = k_p_mfma_begin + k_p_mfma_sz - 1; // 59
+    static constexpr uint32_t k_v0_begin     = k_p_comp_begin + 4;              // 60
+    static constexpr uint32_t k_v0_end       = k_v0_begin + mfma_tile_sz - 1;      // 63
+    static constexpr uint32_t k_k0_begin     = k_p_comp_begin - mfma_tile_sz;      // 52
+    static constexpr uint32_t k_k1_begin     = k_k0_begin - mfma_tile_sz;          // 48
+    static constexpr uint32_t k_k2_begin     = k_k1_begin - mfma_tile_sz;          // 44
+    // q_lds (Phase-B Q-from-LDS scratch) reuses the unused top of q_vgpr, right
+    // after the kQkGemmTiles VGPR col-tiles: v[64 + 4*kQkGemmTiles .. +7].
+    static constexpr uint32_t k_q_lds_begin   = k_q_vgpr_begin + 4u * kQkGemmTiles;
+    static constexpr uint32_t k_q_lds_0_begin = k_q_lds_begin;
+    static constexpr uint32_t k_q_lds_1_begin = k_q_lds_begin + mfma_tile_sz;
 
     using q_vgpr_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_vgpr_begin, k_q_vgpr_end>>, 4>;
@@ -94,9 +101,8 @@ struct HkMlaV40Regs
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k1_begin, k_k1_begin + 3>>, 4>;
     using q_lds_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_lds_begin, k_q_lds_begin + 7>>, 4>;
-
     // art tile types (stage functions reconstruct these from the shared ranges).
-    using q_vgpr_t = hk::art<mfma_ab_t, T::kTileM, 256, hk::row_l, hk::rt_16x32_s, q_vgpr_ranges>;
+    using q_vgpr_t = hk::art<mfma_ab_t, T::kTileM, 512, hk::row_l, hk::rt_16x32_s, q_vgpr_ranges>;
     using p_comp_t = hk::art<comp_t, T::kBlockN, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_ranges>;
     using p_comp_lo_t =
         hk::art<comp_t, 16, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_lo_ranges>;
@@ -299,26 +305,14 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     }
 
     // ---- VGPR layout (per-lane) ----
-    // Compiler is constrained to v0..v63 for scratch via amdgpu_num_vgpr(64) on
-    // the __global__ -- without this, scratch leaks into v64..v255 and clobbers
-    // the hand-pinned tiles below. v0..v63 = free/scratch (cvt staging, scale
-    // dwords, ds_read_b64_tr, etc.). The lowest pinned tile is now q_lds_0 at v68,
-    // so v64..v67 are an unused gap (room to grow scratch to amdgpu_num_vgpr(68)
-    // later if register pressure demands).
-    //
-    // Tightened pinned VGPR map (3-register QK K + overlay reuse):
+    // Compiler scratch constrained to v0..v43 (budget=44 on the __global__).
+    // Full-Q-VGPR map (chunks 0-4 populated this step):
     //   255:128 oaccu
-    //   127:120 p_comp (124:127 = p_comp HI half, dead after the bf16 pack ->
-    //           reused as PV V tile v_0); 120:123 p_mfma overlays p_comp lo
-    //   119: 88 q_vgpr (Q[:,0:256], 32 VGPRs)
-    //    87: 84 k_0   (also PV V tile v_1)
-    //    83: 80 k_1
-    //    79: 76 k_2
-    //    75: 68 q_lds (Phase-B Q-from-LDS: q_lds_0=71:68, q_lds_1=75:72)
-    // QK K uses 3 tiles (k_0/k_1/k_2); PV V uses v_0 (p_comp-hi 124:127) +
-    // v_1 (k_0 slot 84:87), both dead in the other phase. Frees the old
-    // k_kv (8) + pv_v_aux (8) and tucks q_lds below the k tiles vs the prior
-    // 112-range layout, leaving v64..v67 fully unpinned.
+    //   127: 64 q_vgpr (full Q; v64..v103 = chunks 0-4, v104..v111 = q_lds scratch)
+    //    63: 56 p_comp (60:63 = HI half -> PV V tile v_0); 56:59 p_mfma overlay
+    //    55: 52 k_0    (also PV V tile v_1)
+    //    51: 48 k_1
+    //    47: 44 k_2
     // Register layout single source of truth (see HkMlaV40Regs at file scope).
     // Re-alias the constants/ranges locally so the body below keeps its existing
     // k_* / *_ranges names; both orchestrators + every stage bind the same regs.
@@ -576,7 +570,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         // (softmax_scale_p -> softmax_mask_p) and its log2e multiply
         // (softmax_p1 -> softmax_p1_prescaled). Scores then arrive in log2 units.
         const float q_scale_log2 = params.softmax_scale * static_cast<float>(log2e);
-        q_manager.template load_q<k_q_vgpr_begin>(params.p_query,
+        q_manager.template load_q<k_q_vgpr_begin, R::kQkGemmTiles / 2u>(params.p_query,
                                                   params.p_query_rope,
                                                   num_qheads,
                                                   warp_idx,
@@ -719,245 +713,52 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
-            // ---- QK GEMM ----
-            constexpr uint32_t kNumQkVgprIter = 8;
+            // ---- QK GEMM (simple generic full-drain; correctness-first) ----
+            // One mfma-pair per global col-tile gct in [0,16): K both row-halves
+            // from KV-LDS, Q from q_vgpr (gct < kQkGemmTiles) or from Q-LDS
+            // (gct >= kQkGemmTiles). Full lgkmcnt(0) drain before each pair -> no
+            // round-robin / wait tuning. kQkGemmTiles is the only migration knob.
+            constexpr uint32_t kQkGemmTiles = R::kQkGemmTiles;
             if constexpr(kSkipCompute == false)
             {
-                // Phase A: 16 QK mfmas over Q[:, 0:256] (pinned in q_vgpr),
-                // K streamed from LDS into the 3-deep round-robin k_0/k_1/k_2.
-                // K-read R_n -> k_{n%3}; mfma M_i consumes k_{i%3}, then R_{i+3}
-                // refills that same tile (distance-3 reuse). At most 3 reads in
-                // flight, so each mfma waits lgkmcnt(2). Preload R0/R1/R2 fills
-                // the 3 tiles before M0.
-                constexpr uint32_t kBK = T::kBlockK;
-
-                // ===== Phase A: QK over Q[:,0:256] (VGPR Q), 3-register K =====
-                // Each outer iter idx pairs mfma_lo (i=2*idx, p_comp_lo,
-                // k_{(2*idx)%3}) and mfma_hi (i=2*idx+1, p_comp_hi,
-                // k_{(2*idx+1)%3}) over the same Q tile idx. Reload rows simplify:
-                // lo reload row=16 (2*idx+3 always odd), sub=idx+1;
-                // hi reload row=0 (2*idx+4 always even), sub=idx+2.
-                //
-                // Phase A tail also issues Phase B's prologue reads (q0, R'0, R'1,
-                // q1, R'2) to hide LDS latency under the last Phase A mfmas. Each
-                // is placed only after the Phase A mfma that frees its tile:
-                //   k_1 free after M13 (idx=6 hi), k_2 after M14 (idx=7 lo),
-                //   k_0 after M15 (idx=7 hi). Phase B's round-robin is rotated by
-                //   +1 (M'0 reads k_1) so R'0/R'1/R'2 -> k_1/k_2/k_0 respectively.
-
-                // Phase B Q-from-LDS tiles (declared here so the Phase A tail can
-                // issue the q0/q1 prologue reads into them).
-                constexpr uint32_t kQLds0 = k_q_lds_begin + 0;
-                constexpr uint32_t kQLds1 = k_q_lds_begin + 4;
-                using q_lds_range_0 =
-                    hkdart::split_many_t<hkdart::type_list<hkdart::range<kQLds0, kQLds0 + 3u>>, 4>;
-                using q_lds_range_1 =
-                    hkdart::split_many_t<hkdart::type_list<hkdart::range<kQLds1, kQLds1 + 3u>>, 4>;
+                constexpr uint32_t kBK             = T::kBlockK;
+                constexpr uint32_t kNumColTilesAll = T::kQkHeadDim / T::kBlockK; // 16
+                using q_lds_range_0 = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<k_q_lds_begin, k_q_lds_begin + 3u>>, 4>;
                 hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_lds_range_0>
                     q_lds_0;
-                hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_lds_range_1>
-                    q_lds_1;
-                (void)q_lds_1;
 
-                // Preload R0->k_0, R1->k_1, R2->k_2.
-                kv_manager.template load_k_to_gpr<0u, 0u * kBK>(k_0, p_lds_kv_curr);
-                kv_manager.template load_k_to_gpr<16u, 0u * kBK>(k_1, p_lds_kv_curr);
-                kv_manager.template load_k_to_gpr<0u, 1u * kBK>(k_2, p_lds_kv_curr);
-
-                opus::static_for<8>([&](auto idx_) {
-                    constexpr uint32_t idx       = idx_.value;
-                    constexpr uint32_t kmod_lo = (2u * idx) % 3u;
-                    constexpr uint32_t kmod_hi = (2u * idx + 1u) % 3u;
-
-                    // Q tile shared by both mfmas in this iter.
-                    constexpr uint32_t q_base = k_q_vgpr_begin + idx * 4u;
-                    using q_range = hkdart::split_many_t<
-                        hkdart::type_list<hkdart::range<q_base, q_base + 3u>>,
-                        4>;
-                    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range>
-                        q_tile;
-
-                    // ---- mfma_lo (i=2*idx, p_comp_lo) ----
-                    // Steady state: drain the operand (oldest of 3 in flight) -> 2.
-                    // idx=7: FIFO=[R14,R15,q0], drain R14 -> 2 as well.
-                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
-                    auto do_mma_lo = [&]<typename KT>(KT& k) {
-                        if constexpr(idx == 0) hk::mma_ABt(p_comp_lo, k, q_tile);
-                        else hk::mma_ABt(p_comp_lo, k, q_tile, p_comp_lo);
-                    };
-                    if constexpr(kmod_lo == 0) do_mma_lo(k_0);
-                    else if constexpr(kmod_lo == 1) do_mma_lo(k_1);
-                    else do_mma_lo(k_2);
-
-                    if constexpr(idx == 0) __builtin_amdgcn_s_setprio(3);
-
-                    // Reload R_{2*idx+3} -> k_{kmod_lo}: row=16, sub=idx+1.
-                    if constexpr(idx <= 6)
+                opus::static_for<kNumColTilesAll>([&](auto g_) {
+                    constexpr uint32_t gct = g_.value;
+                    kv_manager.template load_k_to_gpr<0u, gct * kBK>(k_0, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<16u, gct * kBK>(k_1, p_lds_kv_curr);
+                    if constexpr(gct < kQkGemmTiles)
                     {
-                        if constexpr(kmod_lo == 0)
+                        constexpr uint32_t q_base = k_q_vgpr_begin + gct * 4u;
+                        using q_range = hkdart::split_many_t<
+                            hkdart::type_list<hkdart::range<q_base, q_base + 3u>>, 4>;
+                        hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range>
+                            q_tile;
+                        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, -1));
+                        if constexpr(gct == 0u)
                         {
-                            kv_manager.template load_k_to_gpr<16u, (idx + 1u) * kBK>(
-                                k_0, p_lds_kv_curr);
-                        }
-                        else if constexpr(kmod_lo == 1)
-                        {
-                            kv_manager.template load_k_to_gpr<16u, (idx + 1u) * kBK>(
-                                k_1, p_lds_kv_curr);
+                            hk::mma_ABt(p_comp_lo, k_0, q_tile);
+                            hk::mma_ABt(p_comp_hi, k_1, q_tile);
                         }
                         else
                         {
-                            kv_manager.template load_k_to_gpr<16u, (idx + 1u) * kBK>(
-                                k_2, p_lds_kv_curr);
+                            hk::mma_ABt(p_comp_lo, k_0, q_tile, p_comp_lo);
+                            hk::mma_ABt(p_comp_hi, k_1, q_tile, p_comp_hi);
                         }
                     }
-                    else if constexpr(idx == 7)
+                    else
                     {
-                        // Phase B prologue R'0->k_1 (free since M13), R'1->k_2
-                        // (just freed by M14). Rotated targets: M'0 reads k_1.
-                        kv_manager.template load_k_to_gpr<0u, (kNumQkVgprIter + 0u) * kBK>(
-                            k_1, p_lds_kv_curr);
-                        kv_manager.template load_k_to_gpr<16u, (kNumQkVgprIter + 0u) * kBK>(
-                            k_2, p_lds_kv_curr);
-                    }
-
-                    // ---- mfma_hi (i=2*idx+1, p_comp_hi) ----
-                    // Steady state: 2. idx=7: FIFO=[R15,q0,R'0,R'1], drain R15 -> 3.
-                    // R'0/R'1 land in k_1/k_2 (rotated), not k_0, so M15's read of
-                    // k_0=R15 has no WAR hazard from the in-flight prologue reads.
-                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt((idx <= 6) ? 2 : 3, -1));
-                    auto do_mma_hi = [&]<typename KT>(KT& k) {
-                        if constexpr(idx == 0) hk::mma_ABt(p_comp_hi, k, q_tile);
-                        else hk::mma_ABt(p_comp_hi, k, q_tile, p_comp_hi);
-                    };
-                    if constexpr(kmod_hi == 0) do_mma_hi(k_0);
-                    else if constexpr(kmod_hi == 1) do_mma_hi(k_1);
-                    else do_mma_hi(k_2);
-
-                    // Reload R_{2*idx+4} -> k_{kmod_hi}: row=0, sub=idx+2.
-                    // idx=6: i=13 > 12, no K reload. idx=7: no K reload.
-                    if constexpr(idx <= 5)
-                    {
-                        if constexpr(kmod_hi == 0)
-                        {
-                            kv_manager.template load_k_to_gpr<0u, (idx + 2u) * kBK>(
-                                k_0, p_lds_kv_curr);
-                        }
-                        else if constexpr(kmod_hi == 1)
-                        {
-                            kv_manager.template load_k_to_gpr<0u, (idx + 2u) * kBK>(
-                                k_1, p_lds_kv_curr);
-                        }
-                        else
-                        {
-                            kv_manager.template load_k_to_gpr<0u, (idx + 2u) * kBK>(
-                                k_2, p_lds_kv_curr);
-                        }
-                    }
-                    else if constexpr(idx == 6)
-                    {
-                        // Phase B prologue q0 (q_lds tiles never collide with k_*).
-                        q_manager.template load_q_lds_to_gpr<0u>(q_lds_0, p_lds_q, warp_idx);
-                    }
-                    else if constexpr(idx == 7)
-                    {
-                        // Phase B prologue R'2->k_0 (just freed by M15) and q1.
-                        // Issue order q0,R'0,R'1,R'2,q1 matches the old inline
-                        // prologue, so Phase B's wait schedule is unchanged.
-                        kv_manager.template load_k_to_gpr<0u, (kNumQkVgprIter + 1u) * kBK>(
-                            k_0, p_lds_kv_curr);
-                        q_manager.template load_q_lds_to_gpr<1u>(q_lds_1, p_lds_q, warp_idx);
+                        q_manager.template load_q_lds_to_gpr<gct - 8u>(q_lds_0, p_lds_q, warp_idx);
+                        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, -1));
+                        hk::mma_ABt(p_comp_lo, k_0, q_lds_0, p_comp_lo);
+                        hk::mma_ABt(p_comp_hi, k_1, q_lds_0, p_comp_hi);
                     }
                 });
-
-                // ===== Phase B: QK over Q[:,256:512] (Q from LDS), 3-register K
-                // q and K reads share one lgkmcnt FIFO. Waits
-                // 3,3,2,3,2,3,2,3,2,3,2,3,2,3,1,0 (precomputed from issue order).
-                // Prologue [q0, R'0->k_1, R'1->k_2, R'2->k_0, q1] is issued in the
-                // Phase A tail (idx=6/7); round-robin is rotated +1 (M'0 reads k_1).
-
-                // M'0 k_1 q_lds_0; reload R'3->k_1
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(3, -1));
-                hk::mma_ABt(p_comp_lo, k_1, q_lds_0, p_comp_lo);
-                kv_manager.template load_k_to_gpr<16u, (kNumQkVgprIter + 1u) * kBK>(k_1,
-                                                                                   p_lds_kv_curr);
-                // M'1 k_2 q_lds_0; reload R'4->k_2
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(3, -1));
-                hk::mma_ABt(p_comp_hi, k_2, q_lds_0, p_comp_hi);
-                kv_manager.template load_k_to_gpr<0u, (kNumQkVgprIter + 2u) * kBK>(k_2,
-                                                                                  p_lds_kv_curr);
-                // M'2 k_0 q_lds_1; reload R'5->k_0; prefetch q_lds_0(pair1)
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
-                hk::mma_ABt(p_comp_lo, k_0, q_lds_1, p_comp_lo);
-                kv_manager.template load_k_to_gpr<16u, (kNumQkVgprIter + 2u) * kBK>(k_0,
-                                                                                   p_lds_kv_curr);
-                q_manager.template load_q_lds_to_gpr<2u>(q_lds_0, p_lds_q, warp_idx);
-                // M'3 k_1 q_lds_1; reload R'6->k_1; prefetch q_lds_1(pair1)
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(3, -1));
-                hk::mma_ABt(p_comp_hi, k_1, q_lds_1, p_comp_hi);
-                kv_manager.template load_k_to_gpr<0u, (kNumQkVgprIter + 3u) * kBK>(k_1,
-                                                                                  p_lds_kv_curr);
-                q_manager.template load_q_lds_to_gpr<3u>(q_lds_1, p_lds_q, warp_idx);
-
-                // M'4 k_2 q_lds_0; reload R'7->k_2
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
-                hk::mma_ABt(p_comp_lo, k_2, q_lds_0, p_comp_lo);
-                kv_manager.template load_k_to_gpr<16u, (kNumQkVgprIter + 3u) * kBK>(k_2,
-                                                                                   p_lds_kv_curr);
-                // M'5 k_0 q_lds_0; reload R'8->k_0
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(3, -1));
-                hk::mma_ABt(p_comp_hi, k_0, q_lds_0, p_comp_hi);
-                kv_manager.template load_k_to_gpr<0u, (kNumQkVgprIter + 4u) * kBK>(k_0,
-                                                                                  p_lds_kv_curr);
-                // M'6 k_1 q_lds_1; reload R'9->k_1; prefetch q_lds_0(pair2)
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
-                hk::mma_ABt(p_comp_lo, k_1, q_lds_1, p_comp_lo);
-                kv_manager.template load_k_to_gpr<16u, (kNumQkVgprIter + 4u) * kBK>(k_1,
-                                                                                   p_lds_kv_curr);
-                q_manager.template load_q_lds_to_gpr<4u>(q_lds_0, p_lds_q, warp_idx);
-                // M'7 k_2 q_lds_1; reload R'10->k_2; prefetch q_lds_1(pair2)
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(3, -1));
-                hk::mma_ABt(p_comp_hi, k_2, q_lds_1, p_comp_hi);
-                kv_manager.template load_k_to_gpr<0u, (kNumQkVgprIter + 5u) * kBK>(k_2,
-                                                                                  p_lds_kv_curr);
-                q_manager.template load_q_lds_to_gpr<5u>(q_lds_1, p_lds_q, warp_idx);
-
-                // M'8 k_0 q_lds_0; reload R'11->k_0
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
-                hk::mma_ABt(p_comp_lo, k_0, q_lds_0, p_comp_lo);
-                kv_manager.template load_k_to_gpr<16u, (kNumQkVgprIter + 5u) * kBK>(k_0,
-                                                                                   p_lds_kv_curr);
-                // M'9 k_1 q_lds_0; reload R'12->k_1
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(3, -1));
-                hk::mma_ABt(p_comp_hi, k_1, q_lds_0, p_comp_hi);
-                kv_manager.template load_k_to_gpr<0u, (kNumQkVgprIter + 6u) * kBK>(k_1,
-                                                                                  p_lds_kv_curr);
-                // M'10 k_2 q_lds_1; reload R'13->k_2; prefetch q_lds_0(pair3)
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
-                hk::mma_ABt(p_comp_lo, k_2, q_lds_1, p_comp_lo);
-                kv_manager.template load_k_to_gpr<16u, (kNumQkVgprIter + 6u) * kBK>(k_2,
-                                                                                   p_lds_kv_curr);
-                q_manager.template load_q_lds_to_gpr<6u>(q_lds_0, p_lds_q, warp_idx);
-                // M'11 k_0 q_lds_1; reload R'14->k_0; prefetch q_lds_1(pair3)
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(3, -1));
-                hk::mma_ABt(p_comp_hi, k_0, q_lds_1, p_comp_hi);
-                kv_manager.template load_k_to_gpr<0u, (kNumQkVgprIter + 7u) * kBK>(k_0,
-                                                                                  p_lds_kv_curr);
-                q_manager.template load_q_lds_to_gpr<7u>(q_lds_1, p_lds_q, warp_idx);
-
-                // M'12 k_1 q_lds_0; reload R'15->k_1
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(2, -1));
-                hk::mma_ABt(p_comp_lo, k_1, q_lds_0, p_comp_lo);
-                kv_manager.template load_k_to_gpr<16u, (kNumQkVgprIter + 7u) * kBK>(k_1,
-                                                                                   p_lds_kv_curr);
-                // M'13 k_2 q_lds_0
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(3, -1));
-                hk::mma_ABt(p_comp_hi, k_2, q_lds_0, p_comp_hi);
-                // M'14 k_0 q_lds_1
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(1, -1));
-                hk::mma_ABt(p_comp_lo, k_0, q_lds_1, p_comp_lo);
-                // M'15 k_1 q_lds_1
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(0, -1));
-                hk::mma_ABt(p_comp_hi, k_1, q_lds_1, p_comp_hi);
             }
 
             // ---- Phase B+C: wait + cvt + store NEXT tile to LDS ----
@@ -1590,7 +1391,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 }
 
 template <typename T>
-__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgpu_num_vgpr(64)))
+__global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgpu_num_vgpr(44)))
 void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T>
                                                                                    params)
 {
