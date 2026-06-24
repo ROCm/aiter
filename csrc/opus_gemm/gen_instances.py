@@ -129,7 +129,8 @@ A16W16_TUNE_TAGS = set(_A16W16_TAGS)
 # NOSCALE: 3-arg launchers (a16w16 family + a8w8 non-scale).
 NOSCALE_TAGS = A16W16_TUNE_TAGS | {"a8w8"}
 
-# Splitk tags forced to <fp32_t> in lookup (main kernel writes fp32 workspace).
+# SplitK tags live in the <fp32_t> dispatch slot; each instance's traits pick
+# the actual workspace dtype and the reduce launcher writes the requested Y.
 SPLITK_TAGS = {
     "a16w16_flatmm_splitk",
     *_SPLITK,
@@ -267,6 +268,7 @@ class opus_gemm_codegen:
         from codegen.gen_instances_gfx942 import (
             _validate_a16w16_em3en4_gfx942,
             _validate_a16w16_gfx942,
+            _validate_a16w16_quad_mfma32_gfx942,
             _validate_a16w16_wave_k_coop_gfx942,
         )
         from codegen.gen_instances_gfx950 import (
@@ -290,7 +292,12 @@ class opus_gemm_codegen:
         elif k.kernel_tag in _GFX942_A16W16_TAGS:
             if k.kernel_tag == "a16w16_em3en4_lds1_pgr2_sk":
                 info = _validate_a16w16_em3en4_gfx942(k)
-            elif k.kernel_tag == "a16w16_wave_k_coop":
+            elif k.kernel_tag in (
+                "a16w16_quad_mfma32_kbuf1",
+                "a16w16_quad_mfma32_kbuf1_sk",
+            ):
+                info = _validate_a16w16_quad_mfma32_gfx942(k)
+            elif k.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
                 info = _validate_a16w16_wave_k_coop_gfx942(k)
             else:
                 info = _validate_a16w16_gfx942(k)
@@ -445,9 +452,9 @@ class opus_gemm_codegen:
 // Same (M,N,K) can resolve to different kernels in the BF16 vs FP32
 // tables because get_tune_dict keys winners on (M, N, K, outdtype_str)
 // and gen_lookup_dict buckets the rows into per-CTYPE macros below.
-// splitk kids appear in either table with their main-kernel template
-// forced to <fp32_t> (the reduce kernel handles the final Y cast at
-// launch time).
+// splitk kids appear in either table with their dispatch template forced
+// to <fp32_t>; their traits pick the workspace dtype and the reduce
+// launcher writes the requested Y dtype.
 //
 // Lookup is std::lower_bound on the lex-ordered (M, N, K) key. See
 // opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
