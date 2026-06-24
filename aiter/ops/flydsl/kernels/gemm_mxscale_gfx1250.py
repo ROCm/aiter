@@ -2368,7 +2368,15 @@ def compile_mxscale_gemm(
             if const_expr(tdm_as_in_prologue):
                 _as_desc = make_desc_as_prologue(as_full_mem, split_k_base)
                 issue_tdm_loads(_as_desc, wave_specialized=True)
-                pipeline_fence(outstanding=0, use_cluster=use_cluster)
+                # At num_buffers==2 every downstream fence drains tensorcnt to 0,
+                # so As is drained + made visible there (As writes as_full, the
+                # pre-load writes the stage buffers -- disjoint, no WAR, and
+                # nothing reads As before the first compute). The separate As
+                # drain is redundant. At nb>=3 the entry/loop fence keeps
+                # `outstanding`>0 loads in flight, so As must be drained here to
+                # stay out of that count.
+                if const_expr(num_buffers != 2):
+                    pipeline_fence(outstanding=0, use_cluster=use_cluster)
 
             # Prologue
             if const_expr(wave_specialized_tdm):
@@ -2464,10 +2472,15 @@ def compile_mxscale_gemm(
                             addr_lo_bs_up, addr_hi_bs_up, adv_bs_i32
                         )
 
-            pipeline_fence(
-                outstanding=TDM_LOADS_PER_STEP * (num_buffers - 2),
-                use_cluster=use_cluster,
-            )
+            # Entry fence: only needed when there is NO main loop (loop_iters==0,
+            # everything runs in the tail). When loop_iters>0 the main loop's
+            # first pipeline_fence_signal uses the same `outstanding` immediately
+            # after, with no TDM/compute/LDS-write in between, so this is redundant.
+            if const_expr(loop_iters == 0):
+                pipeline_fence(
+                    outstanding=TDM_LOADS_PER_STEP * (num_buffers - 2),
+                    use_cluster=use_cluster,
+                )
 
             # Main loop -- acc_mixed style: fence at top, TDM_load mid-compute.
             # This overlaps TDM DMA with the remaining WMMA instructions,
