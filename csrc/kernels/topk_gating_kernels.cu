@@ -17,7 +17,6 @@
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include "hip_reduce.h"
-#include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
 #include <hip/hip_runtime.h>
 #include <type_traits>
