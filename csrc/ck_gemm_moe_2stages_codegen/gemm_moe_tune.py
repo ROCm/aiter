@@ -601,14 +601,13 @@ class FmoeTuner(TunerCommon):
         # Build a gemm1 kernel name in the FlyDSL style (see
         # aiter.ops.flydsl.mxfp4_kname._parse_mxfp4_g1_kname): flydsl_ prefix,
         # lowercase, tile=<BM>x256x256 (BN=BK=256, fixed by the port kernel). The
-        # shape (ne/h/e) is carried by the CSV columns, not the name. BM16 is
-        # inline-quant (bare = NT/read-once, _cached = cached); BM32 cshuffle uses
-        # _nt/_cached; BM128 takes no variant suffix.
+        # shape (ne/h/e) is carried by the CSV columns, not the name. Uniform load
+        # policy: _nt = non-temporal, absence = cached (so cached needs no flag).
         name = f"flydsl_mxfp4_g1_a4w4_{bm}x256x256"
         if inline_quant:
-            name += "_inlinequant" + ("" if use_nt else "_cached")
-        elif bm == 32:
-            name += "_nt" if use_nt else "_cached"
+            name += "_inlinequant"
+        if use_nt:
+            name += "_nt"
         return name
 
     @staticmethod

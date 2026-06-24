@@ -51,9 +51,11 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
     """
     kname = (kname or "").replace("_FLYDSL", "")
     body = None
-    for pfx in _MXFP4_PREFIXES[stage]:
+    legacy = False
+    for i, pfx in enumerate(_MXFP4_PREFIXES[stage]):
         if kname.startswith(pfx):
             body = kname[len(pfx) :]
+            legacy = i == 1  # index 1 == the legacy mxfp4_moe_ alias
             break
     if body is None:
         raise ValueError(
@@ -78,18 +80,19 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
         if field is None:
             raise ValueError(f"bad mxfp4 kernel name {kname!r}: unknown token {tok!r}")
         nums[field] = int(m.group(2))
-    return {"nums": nums, "flags": flags}
+    return {"nums": nums, "flags": flags, "legacy": legacy}
 
 
 def _parse_mxfp4_g1_kname(kname: str) -> dict:
     parsed = _tokenize_mxfp4_kname(kname, 1, _MXFP4_G1_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
     inline_quant = "INLINEQUANT" in flags
-    if inline_quant:
-        # bare _inlinequant = NT (read-once); _inlinequant_cached = cached.
-        use_nt = "CACHED" not in flags
-    else:
-        use_nt = "NT" in flags  # BM=32 cshuffle: _nt vs _cached
+    # Uniform rule: _nt = non-temporal, absence = cached. Legacy mxfp4_moe_ names
+    # wrote a bare _INLINEQUANT to mean nt (and _CACHED for cached), so honor that
+    # for the legacy inline form only.
+    use_nt = "NT" in flags or (
+        parsed["legacy"] and inline_quant and "CACHED" not in flags
+    )
     # NE / H / D_INTER are not encoded in FlyDSL names (they come from the CSV
     # shape columns); .get() keeps legacy shape-bearing names working.
     return {
