@@ -18,7 +18,7 @@ import os
 import sys
 import time
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env
+from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
 from aiter.jit.core import AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
@@ -202,7 +202,13 @@ def compile_one_config(**job):
 
     t0 = time.time()
     try:
-        with compile_only_env():
+        # mxfp4 a4w4 kernels are gfx950-only (scaled-MFMA f8f6f4 intrinsics,
+        # SmemAllocator(arch="gfx950")). Under the GPU-free AOT build,
+        # flyc.compile -> get_rocm_arch() falls back to hardware detection
+        # and yields gfx942, so the gfx950 intrinsics fail to select and
+        # LLVM aborts the worker. Pin FLYDSL_GPU_ARCH so the compile targets
+        # gfx950 regardless of (absent) build-host hardware.
+        with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
             if stage == 1:
                 _compile_stage1(job)
             else:
