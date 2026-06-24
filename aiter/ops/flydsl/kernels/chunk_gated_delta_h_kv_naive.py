@@ -156,10 +156,9 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_K_ELEMS = K * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
-    LDS_VN_PAD = 4
-    LDS_VN_STRIDE = BV + LDS_VN_PAD
-    LDS_VN_ELEMS = BT * LDS_VN_STRIDE
-    LDS_VN_BYTES = LDS_VN_ELEMS * 2
+    # NOTE: lds_vn removed -- GEMM2 now feeds v_new (B operand) straight from
+    # the vn_frags registers (vn-direct), so there is no gated-v_new LDS
+    # round-trip. This frees BT*(BV+pad)*2 bytes of LDS.
 
     # OPT-C(g): tiny staging buffer for this chunk's per-row g gate values
     # (one f32 per BT row). g depends only on the BT row, not on V/lane/wid, so
@@ -169,7 +168,7 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_G_ELEMS = BT
     LDS_G_BYTES = LDS_G_ELEMS * 4
 
-    _K5_KERNEL_REVISION = 201  # EXP vn-direct v2: k[K,BT] std-A + vn register direct (numpy-verified)
+    _K5_KERNEL_REVISION = 209  # fix: GEMM2 k-load missing i_t*BT chunk offset
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -181,8 +180,6 @@ def compile_chunk_gated_delta_h_kv_naive(
     allocator.ptr = lds_w_offset + LDS_W_BYTES
     lds_k_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_k_offset + LDS_K_BYTES
-    lds_vn_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_vn_offset + LDS_VN_BYTES
     lds_g_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_g_offset + LDS_G_BYTES
 
@@ -241,8 +238,6 @@ def compile_chunk_gated_delta_h_kv_naive(
         lds_w = STensor(lds_w_ptr, dtype=T.bf16, shape=(LDS_W_ELEMS,))
         lds_k_ptr = SmemPtr(lds_base_ptr, lds_k_offset, T.bf16, shape=(LDS_K_ELEMS,))
         lds_k = STensor(lds_k_ptr, dtype=T.bf16, shape=(LDS_K_ELEMS,))
-        lds_vn_ptr = SmemPtr(lds_base_ptr, lds_vn_offset, T.bf16, shape=(LDS_VN_ELEMS,))
-        lds_vn = STensor(lds_vn_ptr, dtype=T.bf16, shape=(LDS_VN_ELEMS,))
         lds_g_ptr = SmemPtr(lds_base_ptr, lds_g_offset, T.f32, shape=(LDS_G_ELEMS,))
         lds_g = STensor(lds_g_ptr, dtype=T.f32, shape=(LDS_G_ELEMS,))
 
@@ -445,7 +440,11 @@ def compile_chunk_gated_delta_h_kv_naive(
                 k_row = fx.Int32(batch * K_ROWS_PER_BATCH) + k_load_krow
                 abs_tok = i_t_i32 * fx.Int32(BT) + k_load_tokbase
                 in_b = abs_tok < T_local
-                k_off = k_base + k_row * T_flat + k_load_tokbase
+                # k is [B, Hg, K, T_flat] (token innermost); the absolute token
+                # within the sequence is i_t*BT + tokbase. The chunk offset
+                # i_t*BT MUST be in the address (previously only used for the
+                # bounds check -> chunks i_t>0 read chunk-0's k -> GEMM2 wrong).
+                k_off = k_base + k_row * T_flat + abs_tok
                 k_off = in_b.select(k_off, k_base)
                 k_vec = k_.vec_load((fx.Index(k_off),), LOAD_VEC_WIDTH)
                 k_lds_off = k_row * fx.Int32(LDS_K_STRIDE) + k_load_tokbase
@@ -565,21 +564,13 @@ def compile_chunk_gated_delta_h_kv_naive(
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_s
 
             # ============================================================
-            # 7. Store gated v_new -> lds_vn
+            # 7. Cross-chunk WAR barrier. GEMM2 below feeds vn straight from
+            # registers (vn_frags) -- no lds_vn round-trip -- so there is no
+            # vn LDS publish to wait on. This barrier still guards the lds_w
+            # WAR hazard: the current chunk's GEMM1 reads of lds_w must finish
+            # before the NEXT chunk's cooperative w-load overwrites lds_w.
+            # (lds_k's WAR is covered by the post-w-load barrier.)
             # ============================================================
-            for m_bt in range_constexpr(N_REPEAT):
-                vn_val = vn_frags[m_bt]
-                lds_col = wid * fx.Int32(16) + lane_n
-                lds_bt_tile = fx.Int32(m_bt * 16)
-                for elem_i in range_constexpr(4):
-                    f32_v = vn_val[elem_i]
-                    bf16_v = f32_v.to(fx.BFloat16)
-                    lds_row = (
-                        lds_bt_tile + lane_m_base * fx.Int32(4) + fx.Int32(elem_i)
-                    )
-                    lds_idx = lds_row * fx.Int32(LDS_VN_STRIDE) + lds_col
-                    lds_vn[fx.Index(lds_idx)] = bf16_v
-
             gpu.barrier()
 
             # ============================================================
@@ -602,8 +593,6 @@ def compile_chunk_gated_delta_h_kv_naive(
                         h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
                             k_a, vn_b, h_accs_in[acc_idx]
                         )
-
-            gpu.barrier()
 
             results = yield [_to_raw(v) for v in h_accs_in]
 

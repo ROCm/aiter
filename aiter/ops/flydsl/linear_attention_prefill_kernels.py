@@ -1223,7 +1223,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
     # EXPERIMENT (vn-direct, kv_naive only): pre-transpose k
     # [B, T_flat, Hg, K] -> [B, Hg, K, T_flat] so GEMM2 sees BT row-contiguous.
-    if _fork == "kv_naive":
+    # ONLY when the kv_naive VWARP kernel is actually selected (BV==64). When
+    # BV!=64 the fork falls back to the baseline ``_get_or_compile`` kernel,
+    # which expects the ORIGINAL [B, T_flat, Hg, K] layout -- transposing there
+    # would feed it mis-laid-out k and silently corrupt the result.
+    if _kv_naive_active:
         k = k.permute(0, 2, 3, 1).contiguous()
 
     h = k.new_empty(h_shape)
