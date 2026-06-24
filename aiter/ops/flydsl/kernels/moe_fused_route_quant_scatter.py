@@ -513,7 +513,6 @@ def build_moe_fused_route_quant_scatter_module(
     warps_per_block = L.warps_per_block
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
     mx_blocks_per_row = L.mx_blocks_per_row
-    scale_dwords_per_row = L.scale_dwords_per_row
     rows_per_tile = L.rows_per_tile
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters
@@ -556,7 +555,6 @@ def build_moe_fused_route_quant_scatter_module(
         c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
-        c_scale_dwords_per_row = arith.constant(scale_dwords_per_row, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
@@ -821,7 +819,6 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         c0_f32 = arith.constant(0.0, type=f32)
 
         c_wave = arith.constant(wave_size, type=i32)
-        c_model_dim = arith.constant(model_dim, type=i32)
         c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
@@ -1029,7 +1026,6 @@ def build_moe_fused_quant_preshuffle_module(
     warps_per_block = L.warps_per_block
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
     mx_blocks_per_row = L.mx_blocks_per_row
-    scale_dwords_per_row = L.scale_dwords_per_row
     rows_per_tile = L.rows_per_tile
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters

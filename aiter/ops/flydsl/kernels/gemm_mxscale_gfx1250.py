@@ -2963,8 +2963,6 @@ def compile_mxscale_gemm(
                     c0_i32 = arith.constant(0, type=T.i32)
                     c_tile_m_i32 = arith.constant(tile_m, type=T.i32)
                     c_tile_m_minus_1_i32 = arith.constant(tile_m - 1, type=T.i32)
-                    c0_idx = arith.index(0)
-                    c1_idx = arith.index(1)
 
                     import math
 
