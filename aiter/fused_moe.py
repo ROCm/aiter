@@ -2035,8 +2035,11 @@ def get_2stage_cfgs(
     # (sort+gemm1+gemm2+scatter), NOT fused_moe_1stage. Build it from the CSV
     # kernelName HERE, before the run_1stage early-return below -- otherwise the
     # run_1stage path returns pipeline=None and fused_moe silently discards the
-    # tuned kernelName the CSV selected.
-    if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
+    # tuned kernelName the CSV selected. The mxmoe port is interleave-only, so
+    # gate it on INTERLEAVE; anything else falls through to the other engines.
+    if (_is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2)) and (
+        gate_mode == GateMode.INTERLEAVE
+    ):
         try:
             _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
         except ValueError:
