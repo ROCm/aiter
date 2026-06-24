@@ -146,9 +146,7 @@ def build_moe_topids_to_rows_module():
         stream: fx.Stream = fx.Stream(None),
     ):
         gx = arith.index_cast(T.index, grid_blocks)
-        route_kernel(
-            topk_ids, atomic_buffer, topids_to_rows, numel, max_m
-        ).launch(
+        route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m).launch(
             grid=(gx, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,

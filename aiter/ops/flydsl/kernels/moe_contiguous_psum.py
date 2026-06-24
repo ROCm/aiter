@@ -22,7 +22,6 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels.tensor_shim import STensor
 
-
 MAX_EXPERTS_PER_BLOCK = 512
 
 

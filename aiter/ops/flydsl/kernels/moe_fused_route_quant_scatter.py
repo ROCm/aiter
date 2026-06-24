@@ -177,7 +177,9 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
     lanes_per_mx_block = 32 // elems_per_lane
 
     if is_fp8:
-        mx_dtype = _MxDtype.FP8_E4M3_FNUZ if arch.startswith("gfx942") else _MxDtype.FP8_E4M3
+        mx_dtype = (
+            _MxDtype.FP8_E4M3_FNUZ if arch.startswith("gfx942") else _MxDtype.FP8_E4M3
+        )
         payload_bytes_per_row = feat_dim
         payload_bytes_per_block = 32
         payload_bytes_per_lane = elems_per_lane
@@ -257,11 +259,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         mx_group_base = arith.constant(0, type=i32)
     for it in range_constexpr(c.block_iters):
         # MX block (along K) this lane works on this iteration.
-        mx_block = (
-            (mx_group_base + arith.constant(it, type=i32))
-            * arith.constant(c.mx_blocks_per_wave_iter, type=i32)
-            + c.block_in_wave
-        )
+        mx_block = (mx_group_base + arith.constant(it, type=i32)) * arith.constant(
+            c.mx_blocks_per_wave_iter, type=i32
+        ) + c.block_in_wave
         block_in_range = arith.cmpi(
             CmpIPredicate.ult,
             mx_block,
@@ -290,9 +290,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 # shuffle_xor across the block's 4 lanes.
                 block_amax = c.c0_f32
                 for j in range_constexpr(8):
-                    xj = vector.extract(
-                        f32x8, static_position=[j], dynamic_position=[]
-                    )
+                    xj = vector.extract(f32x8, static_position=[j], dynamic_position=[])
                     absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj], [], [])
                     block_amax = arith.maximumf(block_amax, absj)
                 for dist in c.amax_shuffle_dists:
@@ -356,36 +354,46 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 # multiplies by the reciprocal 2^(127-e8m0) then converts.
                 if const_expr(c.is_fp8):
                     if const_expr(c.use_native):
-                        block_scale_f32 = (
-                            ArithValue(e8m0_scale) << c.c23_i32
-                        ).bitcast(f32)
+                        block_scale_f32 = (ArithValue(e8m0_scale) << c.c23_i32).bitcast(
+                            f32
+                        )
                         packed = rocdl.cvt_scalef32_pk_fp8_f32(
-                            i32, _raw(c.c0_i32), _raw(x0), _raw(x1),
-                            _raw(block_scale_f32), 0,
+                            i32,
+                            _raw(c.c0_i32),
+                            _raw(x0),
+                            _raw(x1),
+                            _raw(block_scale_f32),
+                            0,
                         )
                     else:
-                        recip_scale = (
-                            (c.c254_i32 - e8m0_scale) << c.c23_i32
-                        ).bitcast(f32)
+                        recip_scale = ((c.c254_i32 - e8m0_scale) << c.c23_i32).bitcast(
+                            f32
+                        )
                         scaled0 = ArithValue(x0) * recip_scale
                         scaled1 = ArithValue(x1) * recip_scale
                         # v_cvt_pk_fp8_f32: 2 f32 -> 2 fp8 bytes in word 0.
-                        packed = rocdl.cvt_pk_fp8_f32(i32, scaled0, scaled1, c.c0_i32, 0)
+                        packed = rocdl.cvt_pk_fp8_f32(
+                            i32, scaled0, scaled1, c.c0_i32, 0
+                        )
                     payload_val = arith.trunci(T.i16, ArithValue(packed))  # 2 fp8 B
                 else:
                     if const_expr(c.use_native):
-                        block_scale_f32 = (
-                            ArithValue(e8m0_scale) << c.c23_i32
-                        ).bitcast(f32)
+                        block_scale_f32 = (ArithValue(e8m0_scale) << c.c23_i32).bitcast(
+                            f32
+                        )
                         packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                            i32, _raw(c.c0_i32), _raw(x0), _raw(x1),
-                            _raw(block_scale_f32), 0,
+                            i32,
+                            _raw(c.c0_i32),
+                            _raw(x0),
+                            _raw(x1),
+                            _raw(block_scale_f32),
+                            0,
                         )
                         payload_val = arith.trunci(T.i8, ArithValue(packed))
                     else:
-                        recip_scale = (
-                            (c.c254_i32 - e8m0_scale) << c.c23_i32
-                        ).bitcast(f32)
+                        recip_scale = ((c.c254_i32 - e8m0_scale) << c.c23_i32).bitcast(
+                            f32
+                        )
                         nib0 = emit_f32_to_e2m1(ArithValue(x0) * recip_scale)
                         nib1 = emit_f32_to_e2m1(ArithValue(x1) * recip_scale)
                         packed_byte = ArithValue(nib0) | (ArithValue(nib1) << c.c4_i32)
@@ -578,18 +586,16 @@ def build_moe_fused_route_quant_scatter_module(
             # branch here.
             slot_on_lane0 = arith.constant(0, type=i32)
             if lane == 0:
-                counter_base = buffer_ops.extract_base_index(
-                    counter, address_space=1
-                )
+                counter_base = buffer_ops.extract_base_index(counter, address_space=1)
                 expert_idx = arith.index_cast(T.index, expert)
-                counter_addr = (
-                    fx.Index(counter_base) + fx.Index(expert_idx) * fx.Index(4)
+                counter_addr = fx.Index(counter_base) + fx.Index(expert_idx) * fx.Index(
+                    4
                 )
-                counter_ptr = buffer_ops.create_llvm_ptr(
-                    counter_addr, address_space=1
-                )
+                counter_ptr = buffer_ops.create_llvm_ptr(counter_addr, address_space=1)
                 counter_ptr = (
-                    counter_ptr._value if hasattr(counter_ptr, "_value") else counter_ptr
+                    counter_ptr._value
+                    if hasattr(counter_ptr, "_value")
+                    else counter_ptr
                 )
                 slot_on_lane0 = ArithValue(
                     llvm.AtomicRMWOp(
@@ -641,9 +647,7 @@ def build_moe_fused_route_quant_scatter_module(
             row_lane16 = row_in_tile - wmma_row * c16_i32
             out_row = scale_tile * c16_i32 + row_lane16
             # dst dword base for out_row; scale_dword*wmma_rep added per block.
-            scale_row_dword_base = (
-                out_row * c_dst_scale_dwords_per_row + wmma_row
-            )
+            scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
 
             payload_row_byte_base = grouped_row * c_payload_bytes_per_row
             hidden_elem_base = token * c_model_dim  # bf16 element base for this token
@@ -754,13 +758,17 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
     the repeated topk scan in every K group.
     """
     if topk <= 0 or (topk & (topk - 1)) != 0:
-        raise NotImplementedError("single-token K-split currently requires power-of-two topk")
+        raise NotImplementedError(
+            "single-token K-split currently requires power-of-two topk"
+        )
     if not use_expert_row_base and max_m <= 0:
         raise ValueError("max_m must be positive when expert_row_base is fused")
 
     L = _quant_layout(model_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
-        raise NotImplementedError("single-token K-split is currently enabled only for gfx1250 pk8")
+        raise NotImplementedError(
+            "single-token K-split is currently enabled only for gfx1250 pk8"
+        )
 
     is_fp8 = L.is_fp8
     use_native = L.use_native
@@ -1062,9 +1070,7 @@ def build_moe_fused_quant_preshuffle_module(
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_scale_dwords_per_row = arith.constant(scale_dwords_per_row, type=i32)
-        c_dst_scale_dwords_per_row = arith.constant(
-            dst_scale_dwords_per_row, type=i32
-        )
+        c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
@@ -1157,9 +1163,7 @@ def build_moe_fused_quant_preshuffle_module(
                 # Skip padding rows: the masked GEMM never reads rows beyond
                 # masked_m[expert], so quantizing them is pure waste. With high
                 # capacity-factor padding this elides most of the work.
-                masked_rsrc = buffer_ops.create_buffer_resource(
-                    masked_m, max_size=True
-                )
+                masked_rsrc = buffer_ops.create_buffer_resource(masked_m, max_size=True)
                 valid = ArithValue(
                     buffer_ops.buffer_load(masked_rsrc, expert, vec_width=1, dtype=i32)
                 )
@@ -1217,7 +1221,9 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
-        raise NotImplementedError("route-indexed K-split is currently enabled only for gfx1250 pk8")
+        raise NotImplementedError(
+            "route-indexed K-split is currently enabled only for gfx1250 pk8"
+        )
 
     is_fp8 = L.is_fp8
     use_native = L.use_native
@@ -1300,10 +1306,17 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 m = ArithValue(route_max_m)
                 expert = ArithValue(arith.divui(row, m))
                 slot = row - expert * m
-                starts_rsrc = buffer_ops.create_buffer_resource(row_starts, max_size=True)
-                row = ArithValue(
-                    buffer_ops.buffer_load(starts_rsrc, expert, vec_width=1, dtype=i32)
-                ) + slot
+                starts_rsrc = buffer_ops.create_buffer_resource(
+                    row_starts, max_size=True
+                )
+                row = (
+                    ArithValue(
+                        buffer_ops.buffer_load(
+                            starts_rsrc, expert, vec_width=1, dtype=i32
+                        )
+                    )
+                    + slot
+                )
                 is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
                 is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
                 _if_store = scf.IfOp(arith.andi(is_lane0, is_k0))
@@ -1725,9 +1738,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 rowbase_on_lane0 = buffer_ops.buffer_load(
                     starts_rd_rsrc, _raw(expert), vec_width=1, dtype=i32
                 )
-            slot = ArithValue(
-                rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32))
-            )
+            slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
             row_base = ArithValue(
                 rocdl.readlane(i32, _raw(rowbase_on_lane0), _raw(c0_i32))
             )
@@ -1837,4 +1848,3 @@ def build_moe_fused_route_psum_quant_scatter_module(
         )
 
     return launch_fused
-

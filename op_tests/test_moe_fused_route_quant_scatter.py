@@ -87,9 +87,7 @@ def _ref_grouped(
     a1q_u8, a1s_u8 = _ref_token_quant(hidden, quant_mode)
 
     flat_rows = topids_to_rows.reshape(-1).to(torch.long)
-    flat_tokens = (
-        torch.arange(token_num * topk, device=dev, dtype=torch.long) // topk
-    )
+    flat_tokens = torch.arange(token_num * topk, device=dev, dtype=torch.long) // topk
 
     ref_payload = torch.zeros(E * max_m, Pb, dtype=torch.uint8, device=dev)
     ref_payload[flat_rows] = a1q_u8[flat_tokens]
@@ -135,7 +133,9 @@ def test_fused_route_quant_scatter(
     warp_tile_m = wmma_rep * 16  # 64
     # static upper bound on per-expert rows (matches grouped path default):
     # each token routes at most one row per expert, so count[e] <= token_num.
-    max_m = max(warp_tile_m, ((token_num + warp_tile_m - 1) // warp_tile_m) * warp_tile_m)
+    max_m = max(
+        warp_tile_m, ((token_num + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
+    )
 
     hidden = torch.randn(token_num, model_dim, dtype=torch.bfloat16, device=dev)
     # Distinct experts per token (top-k of random scores), matching a real router
@@ -151,9 +151,9 @@ def test_fused_route_quant_scatter(
     ref_counts = torch.bincount(topk_ids.reshape(-1).to(torch.long), minlength=E).to(
         torch.int32
     )
-    assert torch.equal(masked_m.cpu(), ref_counts.cpu()), (
-        f"masked_m {masked_m.tolist()} != bincount {ref_counts.tolist()}"
-    )
+    assert torch.equal(
+        masked_m.cpu(), ref_counts.cpu()
+    ), f"masked_m {masked_m.tolist()} != bincount {ref_counts.tolist()}"
 
     # 2. topids_to_rows is a valid per-expert argsort: rows for expert e are a
     #    distinct subset of [e*max_m, e*max_m + counts[e]).
@@ -187,6 +187,7 @@ def test_fused_route_quant_scatter(
     # scale: compare on valid rows. The preshuffle scatters a grouped row's Ws
     # bytes across the dst; rebuild a row-major view to mask by valid row.
     got_scale = gas.view(E, max_m // wmma_rep, Ws * wmma_rep)
+
     # Un-preshuffle both to row-major (E, max_m, Ws) for a row-masked compare.
     def _unshuffle(x):
         # inverse of _grouped_a8w4_preshuffle_e8m0_scale (scale_k_per_tile=4 ->
@@ -220,7 +221,9 @@ def test_fused_route_quant_scatter(
 @pytest.mark.parametrize("max_m", [64, 128])
 @pytest.mark.parametrize("E", [4, 8])
 @pytest.mark.parametrize("feat_dim", [256, 512])
-def test_fused_quant_preshuffle(masked, scale_k_per_tile, quant_mode, max_m, E, feat_dim):
+def test_fused_quant_preshuffle(
+    masked, scale_k_per_tile, quant_mode, max_m, E, feat_dim
+):
     if not torch.cuda.is_available():
         pytest.skip("needs GPU")
     if (feat_dim // 32) % scale_k_per_tile != 0:
@@ -238,12 +241,15 @@ def test_fused_quant_preshuffle(masked, scale_k_per_tile, quant_mode, max_m, E, 
     # from the compare via the valid-row mask. Otherwise every row is quantized.
     masked_m = None
     if masked:
-        masked_m = torch.randint(
-            1, max_m + 1, (E,), dtype=torch.int32, device=dev
-        )
+        masked_m = torch.randint(1, max_m + 1, (E,), dtype=torch.int32, device=dev)
 
     payload, scale_pre = flydsl_moe_fused_quant_preshuffle(
-        grouped_in, E, max_m, wmma_rep=wmma_rep, quant_mode=quant_mode, masked_m=masked_m
+        grouped_in,
+        E,
+        max_m,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+        masked_m=masked_m,
     )
 
     Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
@@ -266,6 +272,7 @@ def test_fused_quant_preshuffle(masked, scale_k_per_tile, quant_mode, max_m, E, 
         got_pay = payload.view(E * max_m, Pb)
         pay_match = (got_pay == ref_payload.view(E * max_m, Pb))[vmask].float().mean()
         pay_match = pay_match.item()
+
         # Scale: un-preshuffle both to row-major (E*max_m, Ws) then row-mask.
         def _unshuffle(x):
             k_groups = Ws // 4
@@ -306,9 +313,7 @@ def test_fused_quant_preshuffle_route_ksplit(quant_mode, topk):
     grouped_in = torch.randn(E, max_m, feat_dim, dtype=torch.bfloat16, device=dev)
     # One routed row per expert prefix; these are the only rows the route-indexed
     # K-split kernel writes, matching the token=1 stage2 production path.
-    topids_to_rows = (
-        torch.arange(topk, dtype=torch.int32, device=dev) * max_m
-    )
+    topids_to_rows = torch.arange(topk, dtype=torch.int32, device=dev) * max_m
     payload, scale_pre = flydsl_moe_fused_quant_preshuffle(
         grouped_in,
         E,
@@ -331,7 +336,9 @@ def test_fused_quant_preshuffle_route_ksplit(quant_mode, topk):
     ).reshape(E, max_m // wmma_rep, Ws * wmma_rep)
 
     rows = topids_to_rows.to(torch.long)
-    pay_match = (payload.view(E * max_m, Pb)[rows] == ref_payload[rows]).float().mean().item()
+    pay_match = (
+        (payload.view(E * max_m, Pb)[rows] == ref_payload[rows]).float().mean().item()
+    )
 
     def _unshuffle(x):
         k_groups = Ws // 4
@@ -395,25 +402,31 @@ def test_fused_route_psum_quant_scatter(
     topk_ids = scores.topk(topk, dim=1).indices.to(torch.int32)
 
     ga1, gas, masked_m, ttr, starts, psum = flydsl_moe_fused_route_psum_quant_scatter(
-        hidden, topk_ids, E, tile_m, contiguous_m, wmma_rep=wmma_rep, quant_mode=quant_mode
+        hidden,
+        topk_ids,
+        E,
+        tile_m,
+        contiguous_m,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
     )
 
     # 1. count == per-expert route counts.
     ref_counts = torch.bincount(topk_ids.reshape(-1).to(torch.long), minlength=E).to(
         torch.int32
     )
-    assert torch.equal(masked_m.cpu(), ref_counts.cpu()), (
-        f"masked_m {masked_m.tolist()} != bincount {ref_counts.tolist()}"
-    )
+    assert torch.equal(
+        masked_m.cpu(), ref_counts.cpu()
+    ), f"masked_m {masked_m.tolist()} != bincount {ref_counts.tolist()}"
 
     # 2. starts/psum == tile-aligned prefix sum reference.
     ref_starts, ref_psum = _ref_contiguous_psum(ref_counts, tile_m)
-    assert torch.equal(starts.cpu(), ref_starts.cpu()), (
-        f"starts {starts.tolist()} != ref {ref_starts.tolist()}"
-    )
-    assert torch.equal(psum.cpu(), ref_psum.cpu()), (
-        f"psum {psum.tolist()} != ref {ref_psum.tolist()}"
-    )
+    assert torch.equal(
+        starts.cpu(), ref_starts.cpu()
+    ), f"starts {starts.tolist()} != ref {ref_starts.tolist()}"
+    assert torch.equal(
+        psum.cpu(), ref_psum.cpu()
+    ), f"psum {psum.tolist()} != ref {ref_psum.tolist()}"
 
     # 3. topids_to_rows: rows for expert e are a distinct subset of
     #    [starts[e], starts[e] + counts[e]) in the single contiguous buffer.
@@ -435,9 +448,7 @@ def test_fused_route_psum_quant_scatter(
     Ws = model_dim // 32
     a1q_u8, a1s_u8 = _ref_token_quant(hidden, quant_mode)
     flat_rows = ttr_flat.to(torch.long)
-    flat_tokens = (
-        torch.arange(token_num * topk, device=dev, dtype=torch.long) // topk
-    )
+    flat_tokens = torch.arange(token_num * topk, device=dev, dtype=torch.long) // topk
 
     ref_payload = torch.zeros(contiguous_m, Pb, dtype=torch.uint8, device=dev)
     ref_payload[flat_rows] = a1q_u8[flat_tokens]

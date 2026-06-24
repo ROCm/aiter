@@ -512,15 +512,18 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if grouped_contiguous_m:
         _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
 
-
     flat_experts = topk_ids.reshape(-1)
 
-    _grouped_sync_dbg = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
-        "",
-        "0",
-        "false",
-        "False",
-    ) and not torch.cuda.is_current_stream_capturing()
+    _grouped_sync_dbg = (
+        os.environ.get("AITER_GROUPED_DEBUG", "0")
+        not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        and not torch.cuda.is_current_stream_capturing()
+    )
 
     if _grouped_sync_dbg:
         if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
@@ -824,9 +827,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _fused_masked_m = None if effective_grouped_contiguous_m else masked_m
         _route_rows = int(token_num) * int(topk)
         _capacity_rows = int(route_E) * int(route_max_m)
-        _fused_topids_to_rows = (
-            topids_to_rows if _route_rows < _capacity_rows else None
-        )
+        _fused_topids_to_rows = topids_to_rows if _route_rows < _capacity_rows else None
         grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
             grouped_a2,
             route_E,

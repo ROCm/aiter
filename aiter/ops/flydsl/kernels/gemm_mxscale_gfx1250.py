@@ -2967,6 +2967,7 @@ def compile_mxscale_gemm(
                     c1_idx = arith.index(1)
 
                     import math
+
                     _bisect_iters = max(1, math.ceil(math.log2(batch_count)))
                     lo = c0_i32
                     hi = arith.constant(batch_count, type=T.i32)
@@ -2979,13 +2980,16 @@ def compile_mxscale_gemm(
                         go_right = arith.cmpi(
                             arith.CmpIPredicate.sle, mid_end, layout_row_i32
                         )
-                        lo = arith.select(go_right, mid + arith.constant(1, type=T.i32), lo)
+                        lo = arith.select(
+                            go_right, mid + arith.constant(1, type=T.i32), lo
+                        )
                         hi = arith.select(go_right, hi, mid)
 
                     batch_i32 = lo
                     group_active = arith.cmpi(
-                        arith.CmpIPredicate.slt, batch_i32,
-                        arith.constant(batch_count, type=T.i32)
+                        arith.CmpIPredicate.slt,
+                        batch_i32,
+                        arith.constant(batch_count, type=T.i32),
                     )
                     batch_is_zero = arith.cmpi(
                         arith.CmpIPredicate.eq, batch_i32, c0_i32

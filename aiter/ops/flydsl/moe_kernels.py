@@ -1661,7 +1661,9 @@ def flydsl_moe_stage2(
         )
     return out
 
+
 # Fused route-map + MX quant + scatter-copy + scale-preshuffle kernels
+
 
 @functools.cache
 def _get_compiled_fused_route_quant_scatter(
@@ -1743,7 +1745,6 @@ def flydsl_moe_topids_to_rows(
     return counter, topids_to_rows.view(token_num, topk)
 
 
-
 def flydsl_moe_fused_route_quant_scatter(
     hidden_states: torch.Tensor,  # (token_num, model_dim) bf16
     topk_ids: torch.Tensor,  # (token_num, topk) int32 local expert ids
@@ -1797,10 +1798,7 @@ def flydsl_moe_fused_route_quant_scatter(
         expert_row_base = expert_row_base.to(device=device, dtype=torch.int32)
 
     use_routeks_stage1 = (
-        token_num > 1
-        and topk > 1
-        and quant_mode == "fp4"
-        and not use_expert_row_base
+        token_num > 1 and topk > 1 and quant_mode == "fp4" and not use_expert_row_base
     )
     route_grid = (numel + 255) // 256
     counter = torch.zeros(E, dtype=torch.int32, device=device)
@@ -1826,7 +1824,9 @@ def flydsl_moe_fused_route_quant_scatter(
 
     hidden_flat = hidden_states.contiguous().view(-1)
     topk_ids_i32 = topk_ids.to(torch.int32).reshape(-1)
-    expert_row_base_arg = expert_row_base.reshape(-1) if use_expert_row_base else counter
+    expert_row_base_arg = (
+        expert_row_base.reshape(-1) if use_expert_row_base else counter
+    )
 
     if use_routeks_stage1:
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
@@ -2124,7 +2124,9 @@ def flydsl_moe_fused_quant_preshuffle(
     wave_size = get_warp_size()
     warps_per_block = 256 // wave_size
     if topids_to_rows is not None:
-        topids_to_rows_i32 = topids_to_rows.to(device=device, dtype=torch.int32).reshape(-1)
+        topids_to_rows_i32 = topids_to_rows.to(
+            device=device, dtype=torch.int32
+        ).reshape(-1)
         numel = int(topids_to_rows_i32.numel())
         grid_blocks = (numel + warps_per_block - 1) // warps_per_block
         remap_rows = row_starts is not None
@@ -2132,7 +2134,9 @@ def flydsl_moe_fused_quant_preshuffle(
             row_starts_i32 = row_starts.to(device=device, dtype=torch.int32).reshape(-1)
             route_max_m_arg = int(route_max_m)
             if route_max_m_arg <= 0:
-                raise ValueError("route_max_m must be positive when row_starts is provided")
+                raise ValueError(
+                    "route_max_m must be positive when row_starts is provided"
+                )
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
