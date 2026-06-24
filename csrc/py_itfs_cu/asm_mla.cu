@@ -125,21 +125,6 @@ struct __attribute__((packed)) MlaMi400KernelArgs
 
 static_assert(sizeof(MlaMi400KernelArgs) == 288, "MLA mi400 packed args must be 18*16=288B");
 
-
-static std::string find_mla_kernel_key(CFG* cfgs,
-                                       const std::string& arch_id,
-                                       const std::string& knl_name)
-{
-    for(const auto& el : *cfgs)
-    {
-        if(el.first.find(arch_id) != 0)
-            continue;
-        if(el.second.knl_name == knl_name)
-            return el.first;
-    }
-    return "";
-}
-
 std::string get_heuristic_kernel_mla(std::string q_type,
                                      std::string kv_type,
                                      int gqa,
@@ -856,8 +841,11 @@ void mla_decode_stage1_asm_fwd(
         sub_Q = 128;
         if (q_type == "bf16" && kv_type == "bf16"){
             if(persistent){
-                if (max_seqlen_q <= 4){
-                    config_max_seqlen_q = 4; // padding it
+                // csv: qSeqLen=4 -> coex0 (q=1/2/3), qSeqLen=0 -> qseqlen4 (q=4)
+                if (max_seqlen_q == 4){
+                    config_max_seqlen_q = 0;
+                } else if (max_seqlen_q <= 3){
+                    config_max_seqlen_q = 4;
                 }
             }else{
                 if(max_seqlen_q == 1){
@@ -973,21 +961,7 @@ void mla_decode_stage1_asm_fwd(
     int lse_flag = (lse != nullptr) ? 1 : 0;
 
     int cprr_flag = (g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr) ? 1 : 0;
-    std::string kernelName;
-    // q=1/2/3: coex0_mask1 PS via csv qSeqLen=4 + padding; q=4: qseqlen4 PS (>4GB fix).
-    if(arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && gqa_ratio == 16
-       && max_seqlen_q == 4)
-    {
-        const char* knl = lse_flag
-            ? "_ZN5aiter42mla_a16w16_qh16_qseqlen4_gqaratio16_lse_psE"
-            : "_ZN5aiter38mla_a16w16_qh16_qseqlen4_gqaratio16_psE";
-        kernelName = find_mla_kernel_key(config_map, arch_id, knl);
-    }
-    else
-    {
-        kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal,
-                                              config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
-    }
+    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;
