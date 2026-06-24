@@ -664,7 +664,6 @@ def build_flash_attn_fp8_module(
         kvw = [None] * PREFETCH_DEPTH
         for u in range_constexpr(PREFETCH_DEPTH):
             kvw[u] = _load_k_unit(fx.Index(0), u // K_STEPS, u % K_STEPS)
-        _wait_lgkmcnt()  ## 4. waitcnt lgkmcnt(0) to drain the ds_reads above
 
         # Cross-wave role ping-pong, hoisted into TWO specialized loop bodies.
         # The role split lives OUTSIDE the loop: G0 and G1 each run their own
@@ -687,6 +686,7 @@ def build_flash_attn_fp8_module(
         of3 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
         lf = c_zero_f
 
+        _wait_lgkmcnt()  ## 4. waitcnt lgkmcnt(0) to drain the ds_reads above
         if is_g0:
             # ---- Tile 0: QK(0) + softmax(0) + DMA V^1. ----
             # apply_pv(P=0) would be a no-op; skip it and seed the carry directly.
@@ -696,7 +696,7 @@ def build_flash_attn_fp8_module(
                 _, k_buf_off, _, _, v_next = _bufs(fx.Index(0))
                 v0_off = fx.Index(LDS_V_OFF)  # V^0 buf = LDSV[0]
                 sA, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v0_off)
-                gpu.barrier()
+                #gpu.barrier()
                 m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_init)
                 dma_v(v_next, fx.Index(BLOCK_N))
                 waitcnt_barrier()
@@ -770,7 +770,7 @@ def build_flash_attn_fp8_module(
                 )
                 # Preload V^i units 0,1 in the last 2 dead windows for next apply_pv.
                 sA, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
-                gpu.barrier()
+                #gpu.barrier()
                 # PHASE 2 (softmax phase): softmax(i) | DMA V^{i+1}.
                 m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_r)
                 dma_v(v_next, next_kv)
@@ -811,10 +811,11 @@ def build_flash_attn_fp8_module(
             def g1_iter0():
                 _, k_buf_off, _, k_next, _ = _bufs(fx.Index(0))
                 dma_k(k_next, fx.Index(BLOCK_N))
-                waitcnt_barrier()
+                #waitcnt_barrier()
                 v0_off = fx.Index(LDS_V_OFF)  # V^0 buf = LDSV[0]
                 sB, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v0_off)
-                gpu.barrier()
+                #gpu.barrier()
+                waitcnt_barrier()
                 return (
                     m_init,
                     l_init,
@@ -873,7 +874,7 @@ def build_flash_attn_fp8_module(
                 # PHASE 1 (mfma phase): softmax(i-1) | DMA K^{i+1}.
                 m_sm, corr_sm, p_sm, prowsum_sm = do_softmax([ss0, ss1, ss2, ss3], m_r)
                 dma_k(k_next, next_kv)
-                waitcnt_barrier()
+                #waitcnt_barrier()
                 # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
                 # V units 0,1 were preloaded in prior do_qk dead windows.
                 # K units 0,1 for this iter's do_qk are preloaded in apply_pv
@@ -890,7 +891,8 @@ def build_flash_attn_fp8_module(
                 )
                 # Preload V^i units 0,1 in the last 2 dead windows for next apply_pv.
                 sB, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
-                gpu.barrier()
+                #gpu.barrier()
+                waitcnt_barrier()
                 scf.YieldOp(
                     [
                         _raw(m_sm),
