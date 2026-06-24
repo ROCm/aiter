@@ -1026,6 +1026,7 @@ def build_moe_fused_quant_preshuffle_module(
     warps_per_block = L.warps_per_block
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
     mx_blocks_per_row = L.mx_blocks_per_row
+    scale_dwords_per_row = L.scale_dwords_per_row
     rows_per_tile = L.rows_per_tile
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters
@@ -1495,7 +1496,6 @@ def build_moe_fused_route_psum_quant_scatter_module(
     warps_per_block = L.warps_per_block
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
     mx_blocks_per_row = L.mx_blocks_per_row
-    scale_dwords_per_row = L.scale_dwords_per_row
     rows_per_tile = L.rows_per_tile
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters
