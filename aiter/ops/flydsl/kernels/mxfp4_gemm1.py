@@ -326,6 +326,7 @@ def _gemm1_body(
     wave,
     use_nt,
     i32_ntok,
+    i32_total_m_blocks,
     *,
     BM,
     kAStages,
@@ -379,8 +380,12 @@ def _gemm1_body(
     aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num_records
     )
+    _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
+    ascale_num = arith.index_cast(T.index, _raw(i32_total_m_blocks)) * fx.Index(
+        _asc_per_mb
+    )
     ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_ascale)), num_records_bytes=ASCALE_BYTES
+        _raw(fx.Int64(arg_ascale)), num_records_bytes=ascale_num
     )
     bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_bq)), num_records_bytes=BQ_BYTES
@@ -1159,6 +1164,7 @@ def compile_gemm1_a4w4_port(
                 wave,
                 use_nt,
                 i32_ntok,
+                total_m_blocks,
                 BM=BM,
                 kAStages=kAStages,
                 kSubBlocks=kSubBlocks,
