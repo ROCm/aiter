@@ -9,11 +9,79 @@ import torch
 import triton
 import triton.language as tl
 
+import os
+
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_mla_reduce_enabled() -> bool:
+    """Opt-in gate for the FlyDSL MLA reduce fallback.
+
+    Default behavior is unchanged: production calls the HIP ``aiter.mla_reduce_v1``.
+    Set ``AITER_MLA_REDUCE_FLYDSL=1`` to route through the FlyDSL port instead
+    (a native grid-launch reduce that hits HBM parity with the HIP kernel).
+    Falls back silently to HIP if FlyDSL is not installed/compatible.
+    """
+    if os.environ.get("AITER_MLA_REDUCE_FLYDSL", "0") != "1":
+        return False
+    try:
+        from aiter.ops.flydsl import is_flydsl_available
+
+        return is_flydsl_available()
+    except Exception:
+        return False
+
+
+def _mla_reduce_v1_dispatch(
+    partial_output,
+    partial_lse,
+    reduce_indptr,
+    reduce_final_map,
+    reduce_partial_map,
+    max_seqlen_q,
+    num_kv_splits,
+    final_output,
+    final_lse,
+):
+    """Dispatch the MLA decode reduce to HIP (default) or FlyDSL (opt-in).
+
+    Signature mirrors ``aiter.mla_reduce_v1`` exactly (num_kv_splits at slot 7,
+    between max_seqlen_q and final_output) so it is a drop-in swap. The HIP
+    kernel uses max(SM_count, num_kv_splits); 0 means "auto" (SM_count). The
+    FlyDSL port derives its grid from num_cu + CSR width, so it takes the arg
+    for parity but does not need it.
+    """
+    if _flydsl_mla_reduce_enabled():
+        from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+        flydsl_mla_reduce_v1(
+            partial_output,
+            partial_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            max_seqlen_q,
+            final_output,
+            final_lse,
+            num_kv_splits=num_kv_splits,
+        )
+        return
+    aiter.mla_reduce_v1(
+        partial_output,
+        partial_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        max_seqlen_q,
+        num_kv_splits,
+        final_output,
+        final_lse,
+    )
 
 
 @triton.jit
@@ -534,7 +602,7 @@ def mla_decode_fwd(
                 cp_rank,
             )
 
-        aiter.mla_reduce_v1(
+        _mla_reduce_v1_dispatch(
             logits,
             attn_lse,
             reduce_indptr,
@@ -690,7 +758,7 @@ def mla_prefill_ps_fwd(
         v_scale,
     )
 
-    aiter.mla_reduce_v1(
+    _mla_reduce_v1_dispatch(
         logits,
         attn_lse,
         reduce_indptr,
