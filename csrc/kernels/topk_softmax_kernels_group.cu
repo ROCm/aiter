@@ -67,6 +67,23 @@ static int validate_topk_output_contract(const torch::Tensor& topk_weights,
                 ", topk_weights.stride(1)=",
                 topk_weights.stride(1));
 
+    TORCH_CHECK(topk_ids.scalar_type() == at::kInt,
+                "topk_ids must be int32 to match the kernel's int* output contract, got ",
+                topk_ids.scalar_type());
+    TORCH_CHECK(topk_weights.scalar_type() == at::kFloat,
+                "topk_weights must be float32 to match the kernel's float* output contract, got ",
+                topk_weights.scalar_type());
+    TORCH_CHECK(topk_ids.is_cuda() && topk_weights.is_cuda(),
+                "topk output tensors must reside on the GPU, got topk_ids.device()=",
+                topk_ids.device(),
+                ", topk_weights.device()=",
+                topk_weights.device());
+    TORCH_CHECK(topk_ids.device() == topk_weights.device(),
+                "topk_ids and topk_weights must be on the same device, got topk_ids.device()=",
+                topk_ids.device(),
+                ", topk_weights.device()=",
+                topk_weights.device());
+
     const int total_topk  = static_cast<int>(topk_ids.size(1));
     const int routed_topk = total_topk - num_fused_shared_experts;
     TORCH_CHECK(routed_topk >= 1,
