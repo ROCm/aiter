@@ -12,15 +12,14 @@
 //   topk_softplus_kernel_opt  — register-only, sort+merge (64/128/256/384 experts)
 //   topk_softplus_kernel      — shared-memory fallback (any expert count)
 
+#include "aiter_dispatch.h"
 #include "aiter_hip_common.h"
+#include "aiter_stream.h"
+#include "aiter_tensor.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_runtime.h>
-#include <hipcub/hipcub.hpp>
-#include <torch/all.h>
 #include <type_traits>
 
 namespace aiter {
@@ -375,7 +374,8 @@ __global__ void topk_softplus_kernel(
         dim3(grid), dim3(block), shared_mem_size, stream,                                        \
         reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
         has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
-        topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),                            \
+        reinterpret_cast<float*>(topk_weights.data_ptr()),                                       \
+        reinterpret_cast<int*>(topk_indices.data_ptr()),                                         \
         stride_tk, num_experts, topk, num_tokens, routed_scaling_factor);
 
 #define LAUNCH_TOPK_KERNEL_OPT(NE, RENORM, SF)                                                  \
@@ -384,7 +384,8 @@ __global__ void topk_softplus_kernel(
         dim3(grid), dim3(block), 0, stream,                                                      \
         reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
         has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
-        topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),                            \
+        reinterpret_cast<float*>(topk_weights.data_ptr()),                                       \
+        reinterpret_cast<int*>(topk_indices.data_ptr()),                                         \
         stride_tk, topk, num_tokens, routed_scaling_factor);
 
 // ---------------------------------------------------------------------------
@@ -402,10 +403,10 @@ static inline int parse_score_func(const std::string& s)
     return SCORE_SQRTSOFTPLUS;  // unreachable
 }
 
-void topk_softplus(torch::Tensor& topk_weights,
-                   torch::Tensor& topk_indices,
-                   torch::Tensor& gating_output,
-                   torch::Tensor& correction_bias,
+void topk_softplus(aiter_tensor_t& topk_weights,
+                   aiter_tensor_t& topk_indices,
+                   aiter_tensor_t& gating_output,
+                   aiter_tensor_t& correction_bias,
                    bool need_renorm,
                    float routed_scaling_factor,
                    const std::string& score_func)
@@ -438,17 +439,10 @@ void topk_softplus(torch::Tensor& topk_weights,
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
 
-    // Use PyTorch's current stream so that the kernel runs on the same stream
-    // as the surrounding torch ops (avoids race conditions and works with CUDA
-    // graph capture).
-    // TODO: when this op is migrated to aiter_tensor_t (and @compile_ops uses
-    //       develop=True), switch to aiter::getCurrentHIPStream() — the wrapper
-    //       will then sync torch.cuda.current_stream() before each call.
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const auto gating_st = gating_output.scalar_type();
-    const auto bias_st   = has_bias ? correction_bias.scalar_type() : gating_st;
+    const auto gating_st = gating_output.dtype();
+    const auto bias_st   = has_bias ? correction_bias.dtype() : gating_st;
 
     // Three-level compile-time dispatch: gating dtype → bias dtype → score_func.
     auto dispatch = [&](auto gating_tag, auto bias_tag, auto sf_tag) {
@@ -504,18 +498,18 @@ void topk_softplus(torch::Tensor& topk_weights,
     auto dispatch_bias = [&](auto gating_tag) {
         switch(bias_st)
         {
-        case at::kFloat:    dispatch_sf(gating_tag, float{});        break;
-        case at::kHalf:     dispatch_sf(gating_tag, __half{});       break;
-        case at::kBFloat16: dispatch_sf(gating_tag, hip_bfloat16{}); break;
+        case AITER_DTYPE_fp32: dispatch_sf(gating_tag, float{});        break;
+        case AITER_DTYPE_fp16: dispatch_sf(gating_tag, __half{});       break;
+        case AITER_DTYPE_bf16: dispatch_sf(gating_tag, hip_bfloat16{}); break;
         default: AITER_CHECK(false, "unsupported correction_bias dtype"); break;
         }
     };
 
     switch(gating_st)
     {
-    case at::kFloat:    dispatch_bias(float{});        break;
-    case at::kHalf:     dispatch_bias(__half{});       break;
-    case at::kBFloat16: dispatch_bias(hip_bfloat16{}); break;
+    case AITER_DTYPE_fp32: dispatch_bias(float{});        break;
+    case AITER_DTYPE_fp16: dispatch_bias(__half{});       break;
+    case AITER_DTYPE_bf16: dispatch_bias(hip_bfloat16{}); break;
     default: AITER_CHECK(false, "unsupported gating_output dtype"); break;
     }
 }

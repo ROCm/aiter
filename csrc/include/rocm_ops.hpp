@@ -1314,12 +1314,6 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND                                      \
-    m.def("topk_sigmoid",                                    \
-          &aiter::topk_sigmoid,                              \
-          py::arg("topk_weights"),                           \
-          py::arg("topk_indices"),                           \
-          py::arg("gating_output"),                          \
-          "Apply topk sigmoid to the gating outputs.");      \
     m.def("topk_softplus",                                   \
           &aiter::topk_softplus,                             \
           py::arg("topk_weights"),                           \
@@ -1330,6 +1324,14 @@ namespace py = pybind11;
           py::arg("routed_scaling_factor") = 1.0,            \
           py::arg("score_func")            = "sqrtsoftplus", \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
+
+#define MOE_TOPK_CK_PYBIND                                   \
+    m.def("topk_sigmoid",                                    \
+          &aiter::topk_sigmoid,                              \
+          py::arg("topk_weights"),                           \
+          py::arg("topk_indices"),                           \
+          py::arg("gating_output"),                          \
+          "Apply topk sigmoid to the gating outputs.");
 
 #define MOE_SORTING_PYBIND                             \
     m.def("moe_sorting_fwd",                           \
