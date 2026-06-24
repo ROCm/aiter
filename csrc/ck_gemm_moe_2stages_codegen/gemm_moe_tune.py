@@ -598,35 +598,25 @@ class FmoeTuner(TunerCommon):
 
     @staticmethod
     def _mxfp4_port_g1_kname(ne, h, e, bm, use_nt, inline_quant):
-        # Build a gemm1 kernel name in the FlyDSL style (see
-        # aiter.ops.flydsl.mxfp4_kname._parse_mxfp4_g1_kname): flydsl_ prefix,
-        # lowercase, tile=<BM>x256x256 (BN=BK=256, fixed by the port kernel). The
-        # shape (ne/h/e) is carried by the CSV columns, not the name. Uniform load
-        # policy: _nt = non-temporal, absence = cached (so cached needs no flag).
-        name = f"flydsl_mxfp4_g1_a4w4_{bm}x256x256"
+        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
+        name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
         if inline_quant:
-            name += "_inlinequant"
+            name += "_f16in"
         if use_nt:
             name += "_nt"
         return name
 
     @staticmethod
     def _mxfp4_port_g2_kname(ne, h, e, topk, bm, use_nt, epilog):
-        # Build a gemm2 kernel name in the FlyDSL style (see
-        # aiter.ops.flydsl.mxfp4_kname._parse_mxfp4_g2_kname): flydsl_ prefix,
-        # lowercase, tile=<BM>x256x256. epilog in
-        # {atomic, nonatomic, nonatomic_mxfp4, nonatomic_cshuffle}. atomic carries
-        # the topk tag and an optional _nt; nonatomic drops topk and may add
-        # _mxfp4out or _cshuffle.
-        tile = f"{bm}x256x256"
+        # flydsl_mxmoe_g2_a4w4_<BM>x256x256[_atomic[_nt] | _f4out | _cshuffle];
+        # nonatomic is the bare default. See mxfp4_kname.py.
+        name = f"flydsl_mxmoe_g2_a4w4_{bm}x256x256"
         if epilog == "atomic":
-            name = f"flydsl_mxfp4_g2_a4w4_{tile}_topk{topk}_atomic"
+            name += "_atomic"
             if use_nt:
                 name += "_nt"
-            return name
-        name = f"flydsl_mxfp4_g2_a4w4_{tile}_nonatomic"
-        if epilog == "nonatomic_mxfp4":
-            name += "_mxfp4out"
+        elif epilog == "nonatomic_mxfp4":
+            name += "_f4out"
         elif epilog == "nonatomic_cshuffle":
             name += "_cshuffle"
         return name
@@ -3063,7 +3053,7 @@ class FmoeTuner(TunerCommon):
         return tasks_flydsl
 
     def gen_mxfp4_port_2stages_task(self, info, blockMs):
-        # Enumerate the FlyDSL mxfp4 a4w4 *port* (mxfp4_moe_g{1,2}_a4w4_*) as tuner
+        # Enumerate the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as tuner
         # candidates, alongside the generic flydsl_moe* engine. Only a4w4
         # (per_1x32, fp4 act + fp4 weight) is served by the port. Candidates are
         # timing-only (ref_func=None under fast_mode): correctness is covered by
