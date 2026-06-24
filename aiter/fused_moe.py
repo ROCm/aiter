@@ -1492,9 +1492,9 @@ def _mxfp4_a4w4_stage2(
             )
             return out
 
-        # `_MXFP4OUT` requested on an unsupported shape -> drop it, run bf16.
+        # `_f4out` requested on an unsupported shape -> drop it, run bf16.
         if mxfp4out:
-            kernelName2 = kernelName2.replace("_MXFP4OUT", "")
+            kernelName2 = kernelName2.replace("_f4out", "")
 
         # Non-atomic bf16: per-sorted-row staging; scatter_reduce afterwards.
         out_buf = torch.empty((max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
