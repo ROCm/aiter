@@ -17,6 +17,7 @@ from aiter.aot.flydsl.common import (
     compile_only_env,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 
@@ -216,9 +217,11 @@ def compile_one_config(**job):
     else:
         act_lead = job["experts"]
         rows = job["max_m"]
-    with compile_only_env(), override_env(
-        "FLYDSL_GPU_ARCH", aot_arch
-    ), FakeTensorMode():
+    with (
+        compile_only_env(),
+        override_env("FLYDSL_GPU_ARCH", aot_arch),
+        FakeTensorMode(),
+    ):
         masked_m = torch.full(
             (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
         )
@@ -342,8 +345,18 @@ def main(argv=None):
     parser.add_argument("--csv", nargs="+", default=DEFAULT_CSVS)
     args = parser.parse_args(argv)
     jobs = collect_aot_jobs(args.csv, parse_csv)
-    for job in jobs:
-        print(compile_one_config(**job))
+
+    total_t0 = time.time()
+    print(f"--- Compiling {len(jobs)} grouped-MoE kernels ---")
+    results = run_jobs_parallel(compile_one_config, jobs)
+    total_elapsed = time.time() - total_t0
+
+    ok = sum(1 for r in results if r.get("compile_time") is not None)
+    fail = len(results) - ok
+    print(
+        f"\nSummary: {ok} ok, {fail} failed in {total_elapsed:.1f}s",
+    )
+    sys.exit(1 if fail > 0 else 0)
 
 
 if __name__ == "__main__":
