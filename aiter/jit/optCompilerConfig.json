@@ -1443,7 +1443,7 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-ffast-math'"
+            "'-ffast-math -save-temps=obj'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
