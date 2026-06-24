@@ -411,6 +411,13 @@ void topk_softplus(aiter_tensor_t& topk_weights,
                    float routed_scaling_factor,
                    const std::string& score_func)
 {
+    AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
+                "topk_weights must be float32");
+    AITER_CHECK(topk_indices.dtype() == AITER_DTYPE_i32,
+                "topk_indices must be int32");
+
+    HipDeviceGuard device_guard(gating_output.device_id);
+
     const int sf_code      = parse_score_func(score_func);
     const int num_tokens   = gating_output.size(0);
     const int num_experts  = gating_output.size(1);
@@ -418,19 +425,11 @@ void topk_softplus(aiter_tensor_t& topk_weights,
     const size_t stride_tk = topk_indices.stride(0);
     const bool has_bias    = correction_bias.numel() > 0;
 
-    // Both kernels assign one lane per top-K winner during writeout
-    // (`if (lane == k) topk_value = ...`), so topk must fit in a single warp
-    // and cannot exceed the number of routable experts.  Fail fast with a
-    // clear error rather than silently producing partial / wrong output.
     AITER_CHECK(topk <= static_cast<int>(WARP_SIZE),
                 "topk (", topk, ") exceeds WARP_SIZE (", WARP_SIZE, ")");
     AITER_CHECK(topk <= num_experts,
                 "topk (", topk, ") exceeds num_experts (", num_experts, ")");
 
-    // Softmax outputs are already a probability distribution that sums to 1
-    // across the routed top-K (post-selection); a second renorm would distort
-    // those weights.  Enforce here so direct C++ callers behave the same as
-    // the Python topk_gating() wrapper (which already forces this).
     if(sf_code == SCORE_SOFTMAX)
     {
         need_renorm = false;
