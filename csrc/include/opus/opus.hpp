@@ -1125,12 +1125,22 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 // Template constexpr (packed variants, OPUS_CAST_DEFINE) survives because the check is deferred to instantiation.
 // TODO: we may remove constexpr from cast in the future
 OPUS_D auto fp32_to_fp8(const fp32_t& x) {
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+    // RDNA3/3.5 (gfx1100/gfx115x) lack fp8-conversion-insts; compile-only
+    // stub so headers build. BF16 code paths never invoke fp8 conversion.
+    (void)x; return __builtin_bit_cast(fp8_t, static_cast<signed char>(0));
+#else
     int w; w = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, /*sel=lo*/0);
     return __builtin_bit_cast(fp8_t, static_cast<signed char>(w));
+#endif
 }
 OPUS_D auto fp8_to_fp32(const fp8_t& x) {
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+    (void)x; return fp32_t(0.0f);
+#else
     int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
     return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
+#endif
 }
 OPUS_D constexpr auto fp32_to_fp32(const fp32_t& x) { return x; }
 OPUS_D constexpr auto fp32_to_i8(const fp32_t& x) { return static_cast<i8_t>(x); }
