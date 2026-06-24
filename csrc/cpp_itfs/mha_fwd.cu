@@ -5,6 +5,7 @@
 #endif
 #include <memory>
 #include <string>
+#include <cstdlib>
 
 namespace aiter {
 #if FAV3_ON
@@ -260,6 +261,31 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
     auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
+
+    // ---- Persistent-kernel override (opt-in via AITER_FMHA_PERSISTENT=P) ----
+    // Launch only P workgroups that grid-stride over the gdx*gdy*gdz tiles via a
+    // device atomic counter. The asm kernel reads the counter ptr from the (unused
+    // in this path) ptr_lse slot and total_tiles from s_lse; total==0 keeps the
+    // original one-workgroup-per-tile behaviour. Restricted to the batch, non-causal
+    // mxfp6 gfx950 path that implements the in-kernel loop.
+    static const int persist_p = []() {
+        const char* e = getenv("AITER_FMHA_PERSISTENT");
+        return e ? atoi(e) : 0;
+    }();
+    if(persist_p > 0 && !a.is_group_mode && a.mask_type == 0 &&
+       a.data_type == "mxfp6bf16" && arch_id == "gfx950")
+    {
+        long long total = (long long)gdx * gdy * gdz;
+        static uint32_t* g_counter = nullptr;
+        if(g_counter == nullptr)
+            (void)hipMalloc(reinterpret_cast<void**>(&g_counter), sizeof(uint32_t));
+        (void)hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(g_counter), 0, 1, s.stream_id_);
+        args.ptr_lse = g_counter;          // counter ptr (kernel @0x40)
+        args.s_lse   = static_cast<unsigned int>(total);  // total tiles (kernel @0x100)
+        gdx          = (persist_p < total) ? persist_p : static_cast<int>(total);
+        gdy          = 1;
+        gdz          = 1;
+    }
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
         // Explicit assignment forces evaluation order and prevents compiler from
