@@ -587,11 +587,9 @@ def build_flash_attn_fp8_module(
             neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
             n_groups = C_F32_PER_LANE // 4
 
-            # Pass 2: exp2 + row-sum + fp8 pack in one fused loop.  Processing
-            # one rg group (4 elements) at a time keeps at most 4 live P scalars
-            # instead of all 64.  p_words is built in-order for the C-layout
-            # B-operand (no hi-peer shuffle_xor needed -- see dma_v / read_v_pack).
-            row_sum = c_zero_f
+            # Pass 2: exp2 + fp8 pack.  One rg group (4 elems) at a time keeps
+            # at most 4 live P scalars instead of all 64.  p_words is built in
+            # C-layout B-operand order (no hi-peer shuffle_xor on P needed).
             p_words = []
             for nt in range_constexpr(N_KV_TILES):
                 for rg in range_constexpr(n_groups):
@@ -604,17 +602,24 @@ def build_flash_attn_fp8_module(
                         ).exp2(fastmath=fm_fast)
                         for i in range_constexpr(4)
                     ]
-                    row_sum = _fadd(
-                        row_sum, _fadd(_fadd(ps[0], ps[1]), _fadd(ps[2], ps[3]))
-                    )
                     p_words.append(_f32x4_to_fp8_word(*ps))
-            # This lane holds 64 of the 128 kv for q = lo; the hi-peer holds the
-            # other 64 -> combine via shuffle_xor(32) for the full row sum.
-            peer_sum = fx.Float32(row_sum).shuffle_xor(
-                fx.Int32(32), fx.Int32(WARP_SIZE)
-            )
-            p_rowsum = _fadd(row_sum, peer_sum)
-            return m_new, corr, Vec.from_elements(p_words, fx.Int32), p_rowsum
+            p_pack = Vec.from_elements(p_words, fx.Int32)
+            # Row sum via ones-column MFMAs: ones(A) @ P(B) -> lr(C).
+            # The K-contraction spans hi=0 and hi=1 halves covering all 128 kv,
+            # so no shuffle_xor(32) cross-lane combine is needed.
+            p_ks_list = [
+                Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
+                for r in range_constexpr(PV_K_STEPS)
+            ]
+            lr = mfma.zero_value
+            for ks in range_constexpr(PV_K_STEPS):
+                lr = mfma.call(ones_pack, p_ks_list[ks], lr)
+            p_rowsum = Vec(lr)[0]
+            return m_new, corr, p_pack, p_rowsum
+
+        # All-ones FP8 E4M3 A-operand for the ones-column row-sum MFMAs.
+        # 1.0 in E4M3 = 0x38; packed 4 per i32 word -> 0x38383838.
+        ones_pack = Vec.filled(A_FP8_PER_LANE // 4, 0x38383838, fx.Int32)
 
         # ---- Shared init values (computed by all 512 lanes before the split) --
         m_init = c_neg_inf
@@ -696,7 +701,7 @@ def build_flash_attn_fp8_module(
                 _, k_buf_off, _, _, v_next = _bufs(fx.Index(0))
                 v0_off = fx.Index(LDS_V_OFF)  # V^0 buf = LDSV[0]
                 sA, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v0_off)
-                #gpu.barrier()
+                # gpu.barrier()
                 m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_init)
                 dma_v(v_next, fx.Index(BLOCK_N))
                 waitcnt_barrier()
@@ -770,7 +775,7 @@ def build_flash_attn_fp8_module(
                 )
                 # Preload V^i units 0,1 in the last 2 dead windows for next apply_pv.
                 sA, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
-                #gpu.barrier()
+                # gpu.barrier()
                 # PHASE 2 (softmax phase): softmax(i) | DMA V^{i+1}.
                 m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_r)
                 dma_v(v_next, next_kv)
@@ -811,10 +816,10 @@ def build_flash_attn_fp8_module(
             def g1_iter0():
                 _, k_buf_off, _, k_next, _ = _bufs(fx.Index(0))
                 dma_k(k_next, fx.Index(BLOCK_N))
-                #waitcnt_barrier()
+                # waitcnt_barrier()
                 v0_off = fx.Index(LDS_V_OFF)  # V^0 buf = LDSV[0]
                 sB, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v0_off)
-                #gpu.barrier()
+                # gpu.barrier()
                 waitcnt_barrier()
                 return (
                     m_init,
@@ -874,7 +879,7 @@ def build_flash_attn_fp8_module(
                 # PHASE 1 (mfma phase): softmax(i-1) | DMA K^{i+1}.
                 m_sm, corr_sm, p_sm, prowsum_sm = do_softmax([ss0, ss1, ss2, ss3], m_r)
                 dma_k(k_next, next_kv)
-                #waitcnt_barrier()
+                # waitcnt_barrier()
                 # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
                 # V units 0,1 were preloaded in prior do_qk dead windows.
                 # K units 0,1 for this iter's do_qk are preloaded in apply_pv
@@ -891,7 +896,7 @@ def build_flash_attn_fp8_module(
                 )
                 # Preload V^i units 0,1 in the last 2 dead windows for next apply_pv.
                 sB, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
-                #gpu.barrier()
+                # gpu.barrier()
                 waitcnt_barrier()
                 scf.YieldOp(
                     [
