@@ -861,6 +861,7 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
                                                                         DTYPE_I const* __restrict__ cos,
                                                                         DTYPE_I const* __restrict__ sin,
                                                                         int64_t const* __restrict__ positions,
+                                                                        int64_t const* __restrict__ slot_mapping,
                                                                         const float epsilon,
                                                                         const int32_t m,
                                                                         const int32_t head_num,
@@ -896,7 +897,20 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
     const int32_t safe_row_idx = row_idx < m ? row_idx : m - 1;
     const int32_t token_id     = safe_row_idx >> log2_head_num;
     const int32_t head_idx     = safe_row_idx - (token_id << log2_head_num);
-    const int64_t cache_slot   = static_cast<int64_t>(token_id);
+    // Paged scatter: the destination KV slot is the (possibly non-contiguous)
+    // flat paged slot for this token; the physical block / in-block offset are
+    // derived from it the same way the cache_kernels.cu writers do
+    // (slot / kv_block_size, slot % kv_block_size). A negative slot marks a
+    // padded token whose writes are skipped.
+    const int64_t cache_slot   = slot_mapping[token_id];
+    // Padded token: skip the whole row. The slot is uniform across a row's
+    // lanes (all share `token_id`), and every cross-lane reduction below is
+    // confined to one row's aligned lane group, so the row's lanes exit
+    // together — no surviving lane ever shuffle-reads from an exited one.
+    if(cache_slot < 0)
+    {
+        return;
+    }
     const int64_t block_idx    = cache_slot / kv_block_size;
     const int32_t pos_in_block = static_cast<int32_t>(cache_slot % kv_block_size);
     auto g_a = opus::make_gmem<DTYPE_I>(input + row_offset, stride * sizeof(DTYPE_I) * m_oob);
@@ -1042,7 +1056,7 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
                 const int32_t groups_per_row = dim >> log2_group_size;
                 store_scale_e8m0(scale,
                                  scale_e8m0,
-                                 token_id,
+                                 static_cast<int32_t>(cache_slot),
                                  1,
                                  groups_per_row,
                                  scale_group_idx,
@@ -1065,8 +1079,7 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
             }
             else
             {
-                const int64_t byte_offset =
-                    static_cast<int64_t>(token_id) * (dim / 2) + store_offset;
+                const int64_t byte_offset = cache_slot * (dim / 2) + store_offset;
                 store_kv_fp4_vector<vec_size>(kvcache_u8, af, byte_offset, scale_f32);
             }
         }
@@ -1091,6 +1104,7 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
                                                         reinterpret_cast<DTYPE_I const*>(cos.data_ptr()), \
                                                         reinterpret_cast<DTYPE_I const*>(sin.data_ptr()), \
                                                         reinterpret_cast<int64_t const*>(positions.data_ptr()), \
+                                                        slot_mapping_ptr, \
                                                         epsilon, \
                                                         m, \
                                                         head_num, \
@@ -1116,6 +1130,7 @@ void rmsnorm_rope_rotate_activation_fp4quant_kvcache(aiter_tensor_t& kvcache,
                                                      const aiter_tensor_t& cos,
                                                      const aiter_tensor_t& sin,
                                                      const aiter_tensor_t& positions,
+                                                     const aiter_tensor_t& slot_mapping,
                                                      const float epsilon,
                                                      const int32_t rope_dim,
                                                      const int32_t kv_block_size,
@@ -1174,8 +1189,19 @@ void rmsnorm_rope_rotate_activation_fp4quant_kvcache(aiter_tensor_t& kvcache,
     const int32_t stride     = input.stride(-2);
     const int32_t m = input.numel() / dim;
     AITER_CHECK(m % head_num == 0, "num rows must be divisible by head_num");
-    AITER_CHECK(positions.numel() >= static_cast<size_t>(m / head_num),
+    const int32_t num_tokens = m / head_num;
+    AITER_CHECK(positions.numel() >= static_cast<size_t>(num_tokens),
                 "positions must contain at least one entry per token");
+
+    // Paged scatter: slot_mapping[token] gives the flat paged KV slot
+    // (physical_block * kv_block_size + offset); a negative entry marks a padded
+    // token whose writes are skipped.
+    AITER_CHECK(slot_mapping.dtype() == AITER_DTYPE_i64, "slot_mapping must be int64");
+    AITER_CHECK(slot_mapping.stride(-1) == 1, "slot_mapping must be contiguous in last dim");
+    AITER_CHECK(slot_mapping.numel() >= static_cast<size_t>(num_tokens),
+                "slot_mapping must contain at least one entry per token");
+    int64_t const* slot_mapping_ptr =
+        reinterpret_cast<int64_t const*>(slot_mapping.data_ptr());
 
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();

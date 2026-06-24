@@ -144,32 +144,37 @@ def kv_fp4_preshuffle_layout(
     kv_fp4_dense: torch.Tensor,
     kv_scale_dense: torch.Tensor,
     kv_block_size: int,
+    slot_mapping: torch.Tensor,
+    num_blocks: int,
 ):
-    """Match flydsl create_paged_preshuffle_kv_fp4 permute for dense token rows."""
+    """Scatter dense per-token FP4 rows into the paged preshuffle KV layout.
+
+    Each token ``t`` is written to flat paged slot ``slot_mapping[t]``
+    (``block = slot // kv_block_size``, ``pos = slot % kv_block_size``); a
+    negative slot marks a padded token that is skipped. Matches the kernel's
+    ``kv_fp4_preshuffle_offset`` / ``kv_scale_preshuffle_offset`` addressing.
+    """
     num_tokens, d_packed = kv_fp4_dense.shape
     d = d_packed * 2
     k_tiles = d // 128
-    d_scales = d // 32
-    t_blocks = (num_tokens + kv_block_size - 1) // kv_block_size
-    t_max = t_blocks * kv_block_size
 
-    kv_fp4 = torch.nn.functional.pad(kv_fp4_dense, (0, 0, 0, t_max - num_tokens)).view(
-        1, t_blocks, kv_block_size, k_tiles, 4, 16
+    kv_cache = torch.zeros(
+        num_blocks, k_tiles, 4, kv_block_size, 16, dtype=torch.uint8, device="cuda"
     )
-    kv_scale = torch.nn.functional.pad(
-        kv_scale_dense, (0, 0, 0, t_max - num_tokens)
-    ).view(1, t_blocks, kv_block_size, k_tiles, 4)
+    kv_scale = torch.zeros(
+        num_blocks, k_tiles, 4, kv_block_size, dtype=torch.uint8, device="cuda"
+    )
 
-    kv_cache = (
-        kv_fp4.permute(0, 1, 3, 4, 2, 5)
-        .contiguous()
-        .view(t_blocks, k_tiles, 4, kv_block_size, 16)
-    )
-    kv_scale = (
-        kv_scale.permute(0, 1, 3, 4, 2)
-        .contiguous()
-        .view(t_blocks, k_tiles, 4, kv_block_size)
-    )
+    valid = slot_mapping >= 0
+    sm = slot_mapping[valid].long()
+    if sm.numel() == 0:
+        return kv_cache, kv_scale
+    fp4_v = kv_fp4_dense[valid].view(-1, k_tiles, 4, 16)
+    scale_v = kv_scale_dense[valid].view(-1, k_tiles, 4)
+    block = sm // kv_block_size
+    pos = sm % kv_block_size
+    kv_cache[block, :, :, pos, :] = fp4_v
+    kv_scale[block, :, :, pos] = scale_v
     return kv_cache, kv_scale
 
 
@@ -181,6 +186,8 @@ def rmsnorm_rope_rotate_fp4quant_torch(
     positions: torch.Tensor,
     rope_dim: int,
     epsilon: float,
+    slot_mapping: torch.Tensor = None,
+    num_blocks: int = 0,
     block_size: int = 32,
     shuffle_scale: bool = False,
     do_rotate_act: bool = False,
@@ -198,6 +205,8 @@ def rmsnorm_rope_rotate_fp4quant_torch(
             x_q.view(torch.uint8).reshape(num_tokens, -1),
             scale.view(torch.uint8).reshape(num_tokens, -1),
             kv_block_size,
+            slot_mapping,
+            num_blocks,
         )
     return x_q, scale
 
@@ -327,13 +336,30 @@ def test_rmsnorm_rope_rotate_fp4quant_kvcache(
     rope_dim = 64
     max_pos = 2048
     k_tiles = N // 128
-    num_blocks = (M + kv_block_size - 1) // kv_block_size
     x = torch.randn((M, head_num, N), dtype=dtype, device="cuda")
     norm_weight = torch.randn((N,), dtype=dtype, device="cuda")
     positions = torch.randint(0, max_pos, (M,), dtype=torch.int64, device="cuda")
     freqs = torch.randn((max_pos, rope_dim // 2), dtype=torch.float32, device="cuda")
     cos = torch.cos(freqs).to(dtype)
     sin = torch.sin(freqs).to(dtype)
+
+    # Build the paged slot_mapping. The shuffle path exercises a real paged
+    # scatter: an extra block of headroom, a randomly permuted slot per token,
+    # and the last token marked as padding (slot = -1, skipped). The dense
+    # (non-shuffle) path keeps an identity mapping (slot == token row).
+    if shuffle_scale:
+        num_blocks = (M + kv_block_size - 1) // kv_block_size + 1
+        total_slots = num_blocks * kv_block_size
+        g = torch.Generator(device="cuda").manual_seed(0)
+        slot_mapping = torch.randperm(total_slots, generator=g, device="cuda")[:M].to(
+            torch.int64
+        )
+        if M > 1:
+            slot_mapping[-1] = -1  # padded token: must be skipped
+    else:
+        num_blocks = (M + kv_block_size - 1) // kv_block_size
+        slot_mapping = torch.arange(M, dtype=torch.int64, device="cuda")
+
     kvcache_ref, scale_ref = rmsnorm_rope_rotate_fp4quant_torch(
         x.clone(),
         norm_weight,
@@ -342,15 +368,19 @@ def test_rmsnorm_rope_rotate_fp4quant_kvcache(
         positions,
         rope_dim,
         epsilon,
+        slot_mapping=slot_mapping,
+        num_blocks=num_blocks,
         block_size=32,
         shuffle_scale=shuffle_scale,
         do_rotate_act=do_rotate_act,
         kv_block_size=kv_block_size,
     )
     if shuffle_scale:
+        # fp4x2 can't be fill_'d directly; allocate uint8 zeros and reinterpret
+        # (both are 1 byte/elem, packing two fp4 nibbles per byte).
         kvcache = torch.zeros(
             num_blocks, k_tiles, 4, kv_block_size, 16, dtype=torch.uint8, device="cuda"
-        )
+        ).view(dtypes.fp4x2)
         scale = torch.zeros(
             num_blocks, k_tiles, 4, kv_block_size, dtype=torch.uint8, device="cuda"
         )
@@ -366,6 +396,7 @@ def test_rmsnorm_rope_rotate_fp4quant_kvcache(
         cos,
         sin,
         positions,
+        slot_mapping,
         epsilon,
         rope_dim,
         kv_block_size,

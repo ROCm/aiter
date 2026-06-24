@@ -1467,6 +1467,7 @@ namespace py = pybind11;
           py::arg("cos"),                                                \
           py::arg("sin"),                                                \
           py::arg("positions"),                                          \
+          py::arg("slot_mapping"),                                       \
           py::arg("epsilon"),                                            \
           py::arg("rope_dim"),                                           \
           py::arg("kv_block_size") = 16,                                 \

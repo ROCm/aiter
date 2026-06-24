@@ -865,6 +865,7 @@ def rmsnorm_rope_rotate_activation_fp4quant_kvcache(
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
     epsilon: float,
     rope_dim: int,
     kv_block_size: int = 16,
@@ -877,5 +878,9 @@ def rmsnorm_rope_rotate_activation_fp4quant_kvcache(
     When ``shuffle_scale`` is True, writes FlyDSL KV preshuffle layout:
     kvcache [num_blocks, k_tiles, 4, kv_block_size, 16],
     scale [num_blocks, k_tiles, 4, kv_block_size].
+
+    ``slot_mapping`` (int64 [num_tokens]) scatters each token to its paged KV
+    slot ``slot_mapping[token]`` (= physical_block * kv_block_size + offset); a
+    negative entry marks a padded token whose write is skipped.
     """
     ...
