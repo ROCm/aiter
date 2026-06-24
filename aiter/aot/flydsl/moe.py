@@ -35,6 +35,7 @@ from aiter.aot.flydsl.common import (
     cu_num_to_arch,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
@@ -798,9 +799,10 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env(
-            "FLYDSL_GPU_ARCH", aot_arch
-        ), FakeTensorMode():
+        with (
+            override_env("FLYDSL_GPU_ARCH", aot_arch),
+            FakeTensorMode(),
+        ):
             _precompile_to_cache(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
@@ -861,21 +863,12 @@ def main():
     print("=" * 72)
 
     total_t0 = time.time()
-    results = []
 
-    if stage1_jobs:
-        print(f"\n--- Stage 1 ({len(stage1_jobs)} kernels) ---")
-        for i, job in enumerate(stage1_jobs, 1):
-            print(f"\n[{i}/{len(stage1_jobs)}] ", end="")
-            r = compile_one_config(**job)
-            results.append(r)
-
-    if stage2_jobs:
-        print(f"\n--- Stage 2 ({len(stage2_jobs)} kernels) ---")
-        for i, job in enumerate(stage2_jobs, 1):
-            print(f"\n[{i}/{len(stage2_jobs)}] ", end="")
-            r = compile_one_config(**job)
-            results.append(r)
+    # Stage1 and stage2 kernels are independent compiles (each writes its
+    # own artifact to cache; stage2 does not read stage1's output), so they
+    # share a single pool for maximum fan-out instead of two serial passes.
+    print(f"\n--- Compiling {len(all_jobs)} kernels (stage1 + stage2) ---")
+    results = run_jobs_parallel(compile_one_config, stage1_jobs + stage2_jobs)
 
     total_elapsed = time.time() - total_t0
 
