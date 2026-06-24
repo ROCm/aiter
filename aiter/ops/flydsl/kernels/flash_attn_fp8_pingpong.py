@@ -12,10 +12,10 @@ ping-pong fp8 FMHA kernel.  It deliberately keeps things simple:
   reused from :mod:`aiter.ops.flydsl.rocdl_mfma_fp8`.
 - SageAttention per-tensor recipe: exact softmax in the log2 domain
   (``exp2``), online over KV tiles, with scalar Q/K/V descales.
-- ``P`` is register-resident (Step 1): the GEMM1 C-layout is reshaped to
-  the GEMM2 B-operand via an intra-wave hi-peer ``shuffle_xor`` (no LDS).
-- ``V`` is stored row-major in 16-wide d-blocks and read with HW transpose
-  ``ds_read_tr8_b64`` (Step 2) for the PV A-operand (no scatter store).
+- ``P`` is register-resident (Step 1): the GEMM1 C-layout myword packing is
+  used directly as the GEMM2 B-operand (no hi-peer shuffle_xor needed).
+- ``V`` is stored in LDS with a C-layout kv permutation (Step 2) so that
+  ``ds_read_tr8_b64`` delivers A-operand data in the same kv order as P.
 
 Layout: Q/K/V/O are 1D flattened from BSHD (batch, seq, heads, head_dim).
 Grid:   (num_q_tiles * batch * num_heads,)  with num_q_tiles = seq/BLOCK_M.
@@ -127,21 +127,21 @@ def build_flash_attn_fp8_module(
 
     # ---- LDS layout (fp8 element type) ----
     # K tile : [BLOCK_N kv][HEAD_DIM d]          row-major
-    # V tile : [d_block(8)][BLOCK_N kv][d_in(16)] row-major (Step 2)
+    # V tile : [d_block(8)][BLOCK_N kv_perm][d_in(16)]  kv-permuted (Step 2)
     #
     # P is NOT in LDS (Step 1, register-resident): the GEMM1 C-layout P is
-    # packed to fp8 in registers and reshaped into the GEMM2 B-operand via an
-    # intra-wave cross-lane shuffle (hi-peer exchange), so no LDS round-trip.
+    # packed to fp8 as myword[nt][rg] and used DIRECTLY as the GEMM2 B-operand
+    # without any hi-peer shuffle_xor exchange.
     #
-    # V layout (Step 2, HW-transpose read): V is stored row-major in 16-wide
-    # d blocks so the cooperative load is a clean 16-byte vector store (no
-    # scatter).  The GEMM2 A-operand
-    #   A_frag[L][8*kc + r] = V[kv = hi*32 + 8*kc + r, d = lo + dt*32]
-    # is produced by ds_read_tr8_b64 (HW transpose-on-read): for a 16-lane
-    # group the atom returns result[lane][r] = LDS[group_base + lane%16 + 16*r]
-    # (an 8x16 byte transpose).  With the d-block layout the per-(dt,kc) group
-    # base = d_block*(BLOCK_N*16) + (hi*32+8*kc)*16 and d_block = lo//16 + 2*dt,
-    # giving exactly V[kv, d] for the A fragment.  4 reads (kc=0..3) per d-tile.
+    # V layout (Step 2, HW-transpose read): V is stored in LDS with a C-layout
+    # kv permutation so that ds_read_tr8_b64 delivers A-operand data in the same
+    # kv order as the B-operand (P in C-layout).  LDS kv position p maps to
+    # actual kv row: blk*32 + hi_group*4 + grp*8 + fine, where blk=p//32,
+    # hi_group=(p%32)//16, grp=(p%16)//4, fine=p%4.  read_v_pack uses
+    #   kv0 = hi*16 + ks*64 + (kc//2)*32 + (kc%2)*8
+    # as the LDS position start for kc-th ds_read_tr8 (covers 8 consecutive
+    # positions, matching kv_perm(8*kc..8*kc+7) for this ks/hi/kc).  4 reads
+    # (kc=0..3) per d-tile.
     K_STRIDE = HEAD_DIM
     V_KV_STRIDE = 16  # bytes per kv within a 16-wide d block
     N_DBLOCKS = HEAD_DIM // 16  # 8
@@ -353,14 +353,30 @@ def build_flash_attn_fp8_module(
                 _dma_issue(k_rsrc, lds_byte, voff)
 
         def dma_v(buf, kv_start):
-            # V into the canonical d-block layout in LDSV[buf], cooperatively by
-            # G0 (waves 0-3).  group-local cell c = p*256 + tid maps to
-            # d_block = c//128, kv = c%128; LDS byte = c*16 = d_block*2048+kv*16.
+            # V into the C-layout-permuted d-block LDS layout in LDSV[buf],
+            # cooperatively by G0 (waves 0-3).  LDS position p = c%BLOCK_N maps
+            # to actual kv row kv_actual(p) = blk*32 + hi_group*4 + grp*8 + fine,
+            # where blk=p//32, hi_group=(p%32)//16, grp=(p%16)//4, fine=p%4.
+            # This permutation lets the ds_read_tr8_b64 in read_v_pack deliver
+            # V data in exactly the kv order required by the C-layout P B-operand,
+            # eliminating the shuffle_xor(32) hi-peer exchange in do_softmax.
             v_buf_off = fx.Index(LDS_V_OFF) + buf * fx.Index(LDS_V_TILE)
             for p in range_constexpr(DMA_PASSES):
                 c = fx.Index(p * DMA_LANES) + tid
                 d_block = c // fx.Index(BLOCK_N)
-                kv = c % fx.Index(BLOCK_N)
+                kv_lds_pos = c % fx.Index(BLOCK_N)
+                # Inverse permutation: given LDS position, find actual kv row.
+                blk = kv_lds_pos // fx.Index(32)
+                rem = kv_lds_pos % fx.Index(32)
+                hi_group = (rem // fx.Index(16)) % fx.Index(2)
+                grp = (rem // fx.Index(4)) % fx.Index(4)
+                fine = rem % fx.Index(4)
+                kv = (
+                    blk * fx.Index(32)
+                    + hi_group * fx.Index(4)
+                    + grp * fx.Index(8)
+                    + fine
+                )
                 kv_abs = kv_start + kv
                 in_b = kv_abs < seq_len_v
                 kv_safe = fx.Index(ArithValue(in_b).select(kv_abs, fx.Index(0)))
@@ -430,7 +446,13 @@ def build_flash_attn_fp8_module(
             grp_db = fx.Index(lds_offset) + v_off + d_block * fx.Index(V_DBLOCK_STRIDE)
             reads = []
             for kc in range_constexpr(4):
-                kv0 = hi * fx.Index(32) + fx.Index(ks * 64 + 8 * kc)
+                # Permuted kv0: matches the C-layout kv order baked into
+                # do_softmax's myword packing (no shuffle_xor needed on P).
+                # Derived: kv0 = nt_kc*32 + hi*16 + rg_kc*4, where
+                # nt_kc = 2*ks + kc//2, rg_kc = (kc%2)*2.
+                kv0 = hi * fx.Index(16) + fx.Index(
+                    ks * 64 + (kc // 2) * 32 + (kc % 2) * 8
+                )
                 byte_off = (
                     grp_db + kv0 * fx.Index(V_KV_STRIDE) + lo_in_grp * fx.Index(8)
                 )
@@ -538,25 +560,32 @@ def build_flash_attn_fp8_module(
             corr = ArithValue(_fmul(_fsub(m_running, m_new), scale_log2e)).exp2(
                 fastmath=fm_fast
             )
+
             neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
             n_groups = C_F32_PER_LANE // 4
 
-            def _p(nt, r):
-                e = _fadd(_fmul(Vec(s_accs[nt])[r], scale_log2e), neg_scaled_m_new)
-                return ArithValue(e).exp2(fastmath=fm_fast)
+            # Pass 2a: per-element  P = exp2(S * scale_log2e + bias).  P is carried
+            # as flat scalar SSA values (one extractelement off S per element, then
+            # the P scalar overwrites that VGPR) -- no vector round-trip.
+            p_vals = []
+            for nt in range_constexpr(N_KV_TILES):
+                row = []
+                for r in range_constexpr(C_F32_PER_LANE):
+                    e = _fadd(_fmul(Vec(s_accs[nt])[r], scale_log2e), neg_scaled_m_new)
+                    row.append(ArithValue(e).exp2(fastmath=fm_fast))
+                p_vals.append(row)
 
-            # Pass 2: exp2 -> P packed 4-at-a-time (at most 4 exp outputs live
-            # before they collapse into one fp8 i32 word), accumulating the exact
-            # f32 row sum for the VALU L normalizer as we go.
+            # Pass 2b: row sum + fp8 pack, reading the P scalars directly (no
+            # extractelement -- the scalars never went back into a vector).
             row_sum = c_zero_f
             myword = []
             for nt in range_constexpr(N_KV_TILES):
                 words = []
                 for rg in range_constexpr(n_groups):
-                    p0 = _p(nt, rg * 4 + 0)
-                    p1 = _p(nt, rg * 4 + 1)
-                    p2 = _p(nt, rg * 4 + 2)
-                    p3 = _p(nt, rg * 4 + 3)
+                    p0 = p_vals[nt][rg * 4 + 0]
+                    p1 = p_vals[nt][rg * 4 + 1]
+                    p2 = p_vals[nt][rg * 4 + 2]
+                    p3 = p_vals[nt][rg * 4 + 3]
                     row_sum = _fadd(row_sum, _fadd(_fadd(p0, p1), _fadd(p2, p3)))
                     words.append(_f32x4_to_fp8_word(p0, p1, p2, p3))
                 myword.append(words)
@@ -567,33 +596,15 @@ def build_flash_attn_fp8_module(
             )
             p_rowsum = _fadd(row_sum, peer_sum)
 
-            # Reshape P from the GEMM1 C-layout to the GEMM2 B-operand: a 32-kv
-            # subtile's rows are split across the hi peers, so lane hi=0 needs the
-            # 16 rows physically held by its hi=1 peer (and vice versa) ->
-            # shuffle_xor(32).  p_pack K-step ks reads dwords [ks*8, ks*8+8).
-            peerword = [
-                [
-                    fx.Int32(myword[nt][rg]).shuffle_xor(
-                        fx.Int32(32), fx.Int32(WARP_SIZE)
-                    )
-                    for rg in range_constexpr(n_groups)
-                ]
-                for nt in range_constexpr(N_KV_TILES)
-            ]
-            hi_is0 = hi < fx.Index(1)
+            # Pack P words directly from the C-layout myword: no shuffle_xor(32)
+            # hi-peer exchange needed because dma_v stores V in LDS with the
+            # matching C-layout kv permutation, and read_v_pack fetches it with
+            # the permuted kv0 addressing so A and B operands align without any
+            # cross-lane P word exchange.
             p_words = []
-            for ks in range_constexpr(PV_K_STEPS):
-                for w in range_constexpr(8):
-                    rg = w // 2
-                    if const_expr(w % 2 == 0):
-                        sel = ArithValue(hi_is0).select(
-                            _raw(myword[2 * ks + 0][rg]), _raw(peerword[2 * ks + 1][rg])
-                        )
-                    else:
-                        sel = ArithValue(hi_is0).select(
-                            _raw(peerword[2 * ks + 0][rg]), _raw(myword[2 * ks + 1][rg])
-                        )
-                    p_words.append(fx.Int32(sel))
+            for nt in range_constexpr(N_KV_TILES):
+                for rg in range_constexpr(n_groups):
+                    p_words.append(myword[nt][rg])
             return m_new, corr, Vec.from_elements(p_words, fx.Int32), p_rowsum
 
         # ---- Shared init values (computed by all 512 lanes before the split) --
