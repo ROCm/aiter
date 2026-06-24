@@ -472,15 +472,26 @@ def build_flash_attn_fp8_module(
             cd = reads[2].shuffle(reads[3], list(range(4)))
             return ab.shuffle(cd, list(range(8)))
 
-        def apply_pv(o_accs, l_acc, p_pack, p_rowsum, corr, v_off, preloaded_vw=None):
+        def apply_pv(
+            o_accs,
+            l_acc,
+            p_pack,
+            p_rowsum,
+            corr,
+            v_off,
+            preloaded_vw=None,
+            k_buf_off=None,
+        ):
             # O *= corr ; then O += V^T@P over the PV_K_STEPS 64-kv K-steps that
             # tile BLOCK_N.  L is a scalar VALU online update L = L*corr + rowsum
             # (rowsum computed in do_softmax).  The PV MFMAs (matrix pipe) overlap
             # the following tile's softmax exp2 (transcendental pipe) -- deferred.
             #
-            # When preloaded_vw is provided (iter0), vw[0..1] are seeded from the
-            # V units preloaded in the preceding do_qk dead windows; otherwise prime
-            # them now (existing software-pipeline path).
+            # 4-window rotating register buffer: vw[u%4] consumed at MFMA u.
+            # When preloaded_vw is provided, vw[0..1] are seeded from the V units
+            # preloaded in the preceding do_qk dead windows; otherwise prime them now.
+            # When k_buf_off is provided, the last 2 dead windows (u=6,7) preload
+            # K units 0,1 for the next do_qk, returned as kw_prime.
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
             )
@@ -489,12 +500,9 @@ def build_flash_attn_fp8_module(
                 Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
                 for r in range_constexpr(PV_K_STEPS)
             ]
-            # Software-pipelined PV (spec order: d-tile outer, kv K-step inner):
-            # prime PREFETCH_DEPTH V units (from preloaded_vw if available), then
-            # issue each future ds_read_tr8 one window ahead.
-            # O is rescaled by corr in place on the first K-step.
             PV_UNITS = D_TILES * PV_K_STEPS  # 8
-            vw = [None] * PV_UNITS
+            vw = [None] * 4
+            kw_prime = [None] * PREFETCH_DEPTH
             if const_expr(preloaded_vw is not None):
                 for u in range_constexpr(PREFETCH_DEPTH):
                     vw[u] = preloaded_vw[u]
@@ -507,13 +515,24 @@ def build_flash_attn_fp8_module(
                 ks = u % PV_K_STEPS
                 if const_expr(ks == 0):
                     o[dt] = _fmul(Vec(o[dt]), corr_vec)
-                o[dt] = mfma.call(vw[u], p_ks_list[ks], o[dt])
-                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
+                # Issue prefetch BEFORE the MFMA so the scheduler can overlap them.
                 if const_expr(u + PREFETCH_DEPTH < PV_UNITS):
+                    # V prefetch: load into dead window (u+PREFETCH_DEPTH)%4.
                     un = u + PREFETCH_DEPTH
-                    vw[un] = read_v_pack(v_off, un // PV_K_STEPS, un % PV_K_STEPS)
-                    # 4 ds_read_tr8 per V unit, scheduled to overlap this MFMA.
+                    vw[(u + PREFETCH_DEPTH) % 4] = read_v_pack(
+                        v_off, un // PV_K_STEPS, un % PV_K_STEPS
+                    )
                     rocdl.sched_group_barrier(rocdl.mask_dsrd, 4, 0)
+                elif const_expr(k_buf_off is not None):
+                    # K prefetch in dead windows for the next do_qk.
+                    # u=6 -> ki=0 (nt=0, ks=0); u=7 -> ki=1 (nt=0, ks=1).
+                    ki = u - (PV_UNITS - PREFETCH_DEPTH)
+                    kw_prime[ki] = _load_k_unit(k_buf_off, ki // K_STEPS, ki % K_STEPS)
+                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 2, 0)
+                o[dt] = mfma.call(vw[u % 4], p_ks_list[ks], o[dt])
+                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
+            if const_expr(k_buf_off is not None):
+                return o, l2, kw_prime
             return o, l2
 
         # GEMM1 K-unit = K^i_{nt,ks}: one 32x64 MFMA A-fragment (8 i32 / lane),
@@ -674,7 +693,6 @@ def build_flash_attn_fp8_module(
         # ensures the data is visible in LDS before any wave issues ds_reads below.
         gpu.barrier()
 
-        ## TODO:
         ## 1. Create four windows of VGPRs, each window has a space of one K or V unit;
         ## 2. Prefetch two K units from LDS (where the data is already landed) to the first two windows, the two K units will be used in do_qk function so we don't need to first prefetch two units before the first mfma.
         ## 3. Step 2 should be before the following waitcnt_barrier, which means LDS prefetch via dma_v and dma_k, and global to VGPR prefetch for the two K units are all done at this point before going to the next steps.
@@ -770,8 +788,10 @@ def build_flash_attn_fp8_module(
                     i_cur % fx.Index(NUM_BUF_V)
                 ) * fx.Index(LDS_V_TILE)
                 # PHASE 1 (mfma phase): deferred PV(i-1) then QK(i).
-                # V units 0,1 were preloaded in the prior iter's do_qk dead windows.
-                oA, lA = apply_pv(
+                # V units 0,1 were preloaded in prior do_qk dead windows.
+                # K units 0,1 for this iter's do_qk are preloaded in apply_pv
+                # dead windows and returned as kw_prime.
+                oA, lA, kw_prime = apply_pv(
                     [oo0, oo1, oo2, oo3],
                     l_a,
                     p_c,
@@ -779,9 +799,10 @@ def build_flash_attn_fp8_module(
                     corr_c,
                     v_prev_off,
                     preloaded_vw=[vwp0, vwp1],
+                    k_buf_off=k_buf_off,
                 )
-                # Preload V^i units 0,1 for next iter's apply_pv in the last 2 dead windows.
-                sA, vwp_new = do_qk(k_buf_off, v_off=v_cur_off)
+                # Preload V^i units 0,1 in the last 2 dead windows for next apply_pv.
+                sA, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
                 gpu.barrier()
                 # PHASE 2 (softmax phase): softmax(i) | DMA V^{i+1}.
                 m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_r)
@@ -884,8 +905,10 @@ def build_flash_attn_fp8_module(
                 dma_k(k_next, next_kv)
                 waitcnt_barrier()
                 # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
-                # V units 0,1 were preloaded in the prior iter's do_qk dead windows.
-                oB, lB = apply_pv(
+                # V units 0,1 were preloaded in prior do_qk dead windows.
+                # K units 0,1 for this iter's do_qk are preloaded in apply_pv
+                # dead windows and returned as kw_prime.
+                oB, lB, kw_prime = apply_pv(
                     [oo0, oo1, oo2, oo3],
                     l_a,
                     p_sm,
@@ -893,9 +916,10 @@ def build_flash_attn_fp8_module(
                     corr_sm,
                     v_prev_off,
                     preloaded_vw=[vwp0, vwp1],
+                    k_buf_off=k_buf_off,
                 )
-                # Preload V^i units 0,1 for next iter's apply_pv in the last 2 dead windows.
-                sB, vwp_new = do_qk(k_buf_off, v_off=v_cur_off)
+                # Preload V^i units 0,1 in the last 2 dead windows for next apply_pv.
+                sB, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
                 gpu.barrier()
                 scf.YieldOp(
                     [
