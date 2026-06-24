@@ -184,6 +184,16 @@ def build_flash_attn_fp8_module(
 
     bf16_dtype = fx.BFloat16
 
+    # ---- Scheduling A/B knobs (instruction-interleave tuning) ----
+    # USE_MANUAL_SCHED: emit the per-MFMA/per-ds_read sched_group_barrier hints.
+    # USE_IGLP: emit rocdl.iglp_opt(IGLP_VARIANT) at the top of each loop body.
+    # iglp_opt and sched_group_barrier conflict, so toggle them mutually.
+    USE_MANUAL_SCHED = True
+    USE_IGLP = False
+    IGLP_VARIANT = 1
+    # s_setprio bias for the softmax-role (transcendental) wave; 0 disables.
+    SOFTMAX_PRIO = 1
+
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fp8_attn_kernel(
         Q: fx.Tensor,
@@ -221,6 +231,14 @@ def build_flash_attn_fp8_module(
 
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
+
+        def _sched(mask, n):
+            if USE_MANUAL_SCHED:
+                rocdl.sched_group_barrier(mask, n, 0)
+
+        def _iglp():
+            if USE_IGLP:
+                rocdl.iglp_opt(IGLP_VARIANT)
 
         def _f32_to_fp8_byte(f):
             # arith.truncf cannot lower f32 -> fp8 on this target; use the
@@ -504,13 +522,13 @@ def build_flash_attn_fp8_module(
                     vw[(u + PREFETCH_DEPTH) % 4] = read_v_pack(
                         v_off, un // PV_K_STEPS, un % PV_K_STEPS
                     )
-                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 4, 0)
+                    _sched(rocdl.mask_dsrd, 4)
                 else:
                     ki = u - (PV_UNITS - PREFETCH_DEPTH)
                     kw_prime[ki] = _load_k_unit(k_buf_off, ki // K_STEPS, ki % K_STEPS)
-                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 2, 0)
+                    _sched(rocdl.mask_dsrd, 2)
                 o[dt] = mfma.call(vw[u % 4], p_ks_list[ks], o[dt])
-                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
+                _sched(rocdl.mask_mfma, 1)
             return o, l2, kw_prime
 
         # GEMM1 K-unit = K^i_{nt,ks}: one 32x64 MFMA A-fragment (8 i32 / lane),
@@ -554,13 +572,13 @@ def build_flash_attn_fp8_module(
                     kw[(u + PREFETCH_DEPTH) % 4] = _load_k_unit(
                         k_buf_off, un // K_STEPS, un % K_STEPS
                     )
-                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 2, 0)
+                    _sched(rocdl.mask_dsrd, 2)
                 else:
                     vi = u - (QK_UNITS - PREFETCH_DEPTH)
                     vw_prime[vi] = read_v_pack(v_off, vi // PV_K_STEPS, vi % PV_K_STEPS)
-                    rocdl.sched_group_barrier(rocdl.mask_dsrd, 4, 0)
+                    _sched(rocdl.mask_dsrd, 4)
                 s_accs[nt] = mfma.call(kw[u % 4], q_packs[ks], s_accs[nt])
-                rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
+                _sched(rocdl.mask_mfma, 1)
             return s_accs, vw_prime
 
         def do_softmax(s_accs, m_running):
@@ -569,6 +587,8 @@ def build_flash_attn_fp8_module(
             # Pass 1: row max read directly off the carried S accumulators -- no
             # 64-element s_raw list, so the extracted S scalars never co-exist
             # with the 64 exp2 outputs (that overlap was the spill driver).
+            if const_expr(SOFTMAX_PRIO != 0):
+                rocdl.s_setprio(SOFTMAX_PRIO)
             local_max = Vec(s_accs[0])[0]
             for nt in range_constexpr(N_KV_TILES):
                 for r in range_constexpr(C_F32_PER_LANE):
@@ -615,6 +635,8 @@ def build_flash_attn_fp8_module(
             for ks in range_constexpr(PV_K_STEPS):
                 lr = mfma.call(ones_pack, p_ks_list[ks], lr)
             p_rowsum = Vec(lr)[0]
+            if const_expr(SOFTMAX_PRIO != 0):
+                rocdl.s_setprio(0)
             return m_new, corr, p_pack, p_rowsum
 
         # All-ones FP8 E4M3 A-operand for the ones-column row-sum MFMAs.
@@ -746,6 +768,7 @@ def build_flash_attn_fp8_module(
             )
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
+                _iglp()
                 m_r, l_a, oo0, oo1, oo2, oo3, p_c, prowsum_c, corr_c, vwp0, vwp1 = [
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g0_carry)
@@ -864,6 +887,7 @@ def build_flash_attn_fp8_module(
             )
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
+                _iglp()
                 m_r, l_a, oo0, oo1, oo2, oo3, ss0, ss1, ss2, ss3, vwp0, vwp1 = [
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g1_carry)
