@@ -230,8 +230,20 @@ def compile_mla_reduce(
                 dtype=T.f32, shape=(LDS_MAX_SPLITS,),
             )
 
-        # Loop over the seq positions this block owns (NTG stride).
+        # NTG (number of q-position groups) = grid-y, read at runtime so one
+        # compiled kernel is correct for any grid-y in [1, max_seqlen_q]. Mirrors
+        # the HIP kernel's `seq += kNumThreadGroupPerBh` stride (reduce.cu:496).
+        ntg = fx.Int32(fx.grid_dim.y)
         seq0 = q_start + fx.Int32(block_idx)
+
+        # Skip empty/degenerate tiles (n_splits <= 1). The real decode metadata
+        # can hand us reduce_indptr rows of width 0 (no partials for this tile)
+        # whose reduce_final_map q-range is uninitialized garbage; HIP guards this
+        # with `reduce_tile_start == last` and `num_splits > 1` (reduce.cu:691,743).
+        # Clamp the loop's upper bound to its lower bound so a no-work tile runs
+        # zero iterations and never dereferences that garbage q-range / stores OOB.
+        has_work = arith.cmpi(arith.CmpIPredicate.sgt, n_splits, fx.Int32(1))
+        ub_seq = has_work.select(q_end, seq0)
 
         def gather_row(split_i32, local_seq):
             pmap = fx.Int32(g_pmap[fx.Index(t0 + split_i32)])
@@ -262,10 +274,16 @@ def compile_mla_reduce(
                     g_flse[fx.Index(lse_off)] = final_lse_val
                     scf.YieldOp([])
 
-        seq = seq0
-        valid_seq = arith.cmpi(arith.CmpIPredicate.slt, seq, q_end)
-        if_seq = scf.IfOp(valid_seq, results_=[], has_else=False)
-        with ir.InsertionPoint(if_seq.then_block):
+        # Strided loop over the seq positions this block owns: for seq in
+        # range(q_start + blockIdx.y, q_end, ntg). Built as a raw scf.ForOp (not
+        # the AST `for` rewriter) to match this file's raw-builder idiom and to
+        # avoid auto iter_args inference on a store-only (no-carry) body.
+        lb = arith.index_cast(ir.IndexType.get(), _to_raw(seq0))
+        ub = arith.index_cast(ir.IndexType.get(), _to_raw(ub_seq))
+        st = arith.index_cast(ir.IndexType.get(), _to_raw(ntg))
+        for_seq = scf.ForOp(lb, ub, st)
+        with ir.InsertionPoint(for_seq.body):
+            seq = fx.Int32(for_seq.induction_variable)
             local_seq = seq - q_start
 
             if const_expr(not is_massive):
@@ -406,6 +424,7 @@ def compile_mla_reduce(
         stride_h_o: fx.Int32,
         max_splits: fx.Int32,
         num_reduce_tile: fx.Int32,
+        max_seqlen_q: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         if const_expr(is_massive):
@@ -416,7 +435,10 @@ def compile_mla_reduce(
 
         idx_tiles = arith.index_cast(T.index, num_reduce_tile)
         idx_H = fx.Index(H)
-        idx_ntg = fx.Index(1)
+        # grid-y = max_seqlen_q: one block per q-position (NTG). The kernel reads
+        # this stride back from grid_dim.y, so it stays correct if grid-y is later
+        # clamped below max_seqlen_q for occupancy. Mirrors HIP's gridDim.y.
+        idx_ntg = arith.index_cast(T.index, _to_raw(max_seqlen_q))
         mla_reduce_kernel(
             partial_output,
             partial_lse,

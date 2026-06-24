@@ -61,7 +61,8 @@ def flydsl_mla_reduce_v1(
         reduce_final_map: optional [tile, 2] {q_start, q_end}; when ``None`` the
             q-range is derived from the partial map (uniform qo-len), mirroring
             the HIP ``use_reduce_final_map = false`` path.
-        max_seqlen_q: kept for signature parity (unused; NTG=1 here).
+        max_seqlen_q: number of q-positions per decode token group; drives grid-y
+            (NTG), so multi-token decode (decode_qlen > 1) is handled correctly.
         final_output: output tensor (bf16/fp16); strides are read at runtime.
         final_lse: optional merged LSE output (fp32).
         num_kv_splits: kept for signature parity with the HIP kernel (unused; the
@@ -80,9 +81,11 @@ def flydsl_mla_reduce_v1(
 
     num_cu = torch.cuda.get_device_properties(final_output.device.index).multi_processor_count
 
-    # Tier from the observed split count (CSR row 0 width). All tiles share the
-    # same tier here, exactly as the standalone test harness assumes.
-    num_splits = reduce_partial_map.numel() // num_reduce_tile
+    # Tier from the observed split count = CSR row-0 width (indptr[1] - indptr[0]),
+    # matching the in-kernel `n_splits = indptr[tile+1] - indptr[tile]`. The old
+    # `reduce_partial_map.numel() // num_reduce_tile` miscounts once partial rows
+    # carry a q-dimension (decode_qlen > 1), so derive it from indptr directly.
+    num_splits = int(reduce_indptr[1].item() - reduce_indptr[0].item())
     tier = select_tier(num_splits)
 
     kernel = compile_mla_reduce(
@@ -118,5 +121,6 @@ def flydsl_mla_reduce_v1(
         int(final_output.stride(-2)),
         int(num_cu),
         int(num_reduce_tile),
+        int(max_seqlen_q),
         stream,
     )
