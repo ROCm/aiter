@@ -1104,17 +1104,20 @@ def _flat_mxfp4_epilog(
             a = arith.maxui(amax, s1)
             s2 = rocdl.update_dpp(T.i32, a, a, 0x4E, 0xF, 0xF, True)
             amax_dpp = arith.maxui(a, s2)
-            # encode e8m0: bexp = ((amax<<16)+0x200000>>23)&0xFF ; e8 = clamp(bexp-2,0,254)
+            # encode e8m0 RoundUp: e8 = ceil_pow2(amax/6)
             f32b = arith.shli(amax_dpp, _raw(fx.Int32(16)))
+            working_i = arith.bitcast(
+                T.i32, arith.mulf(arith.bitcast(T.f32, f32b), _raw(fx.Float32(1.0 / 6.0)))
+            )
             bexp = arith.andi(
                 arith.shrui(
-                    arith.addi(f32b, _raw(fx.Int32(0x200000))), _raw(fx.Int32(23))
+                    arith.addi(working_i, _raw(fx.Int32(0x7FFFFF))), _raw(fx.Int32(23))
                 ),
                 _raw(fx.Int32(0xFF)),
             )
             e8 = arith.minsi(
                 _raw(fx.Int32(254)),
-                arith.maxsi(_raw(fx.Int32(0)), arith.subi(bexp, _raw(fx.Int32(2)))),
+                arith.maxsi(_raw(fx.Int32(0)), bexp),
             )
             qscale = arith.bitcast(T.f32, arith.shli(e8, _raw(fx.Int32(23))))
             packed = _raw(fx.Int32(0))

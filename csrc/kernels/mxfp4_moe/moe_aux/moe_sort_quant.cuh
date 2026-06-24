@@ -267,8 +267,9 @@ __device__ __forceinline__ void quant_impl(int bid_q, int M,
         const uint16_t amax = (uint16_t)a32;
 
         const uint32_t f32bits = (uint32_t)amax << 16;
-        const int bexp = (int)(((f32bits + 0x200000u) >> 23) & 0xFFu);
-        const uint8_t scale = (uint8_t)min(254, max(0, bexp - 2));
+        const uint32_t wbits = __float_as_uint(__uint_as_float(f32bits) * (1.0f / 6.0f));
+        const int bexp = (int)(((wbits + 0x7FFFFFu) >> 23) & 0xFFu);
+        const uint8_t scale = (uint8_t)min(254, max(0, bexp));
         const float qs = __uint_as_float((uint32_t)scale << 23);
 
         uint32_t pk = 0;
