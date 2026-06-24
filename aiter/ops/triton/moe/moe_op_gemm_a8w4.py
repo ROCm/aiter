@@ -253,12 +253,9 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     if block_m == 16:
         block_k = 512
         num_warps = 4
-        if get_arch() == "gfx1250":
-            # decode (block_m==16): NUM_BUFFERS=3 + block_n=128 restores the
-            # software-pipelined expert GEMM; the #3504 decode kernel's
-            # block_n=256/NUM_BUFFERS=1 regressed conc-1 decode on gfx1250.
+        if n <= 3072:
             block_n = 128
-            num_stages = 3
+            num_stages = 2
         else:
             block_n = 256
             num_stages = 1
@@ -270,6 +267,12 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         else:
             block_n = 256
             num_warps = 4
+    
+    elif block_m == 64:
+        block_n = 256
+        block_k = 512
+        num_stages = 2
+        num_warps = 4
 
     else:
         block_n = 256
@@ -518,7 +521,7 @@ def moe_gemm_a8w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=config["num_stages"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            MASK_K_LIMIT=K % config["block_k"],
+            EVEN_K=K % config["block_k"] == 0,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
@@ -570,7 +573,7 @@ def moe_gemm_a8w4(
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=config["num_stages"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            MASK_K_LIMIT=K % config["block_k"],
+            EVEN_K=K % config["block_k"] == 0,
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
