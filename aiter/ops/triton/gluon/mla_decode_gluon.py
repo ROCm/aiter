@@ -125,9 +125,6 @@ def _mla_decode_gluon(
     REGIME: gl.constexpr,
     RETURN_LSE: gl.constexpr,
     IS_CAUSAL: gl.constexpr,  # MTP: True when QLEN>1 (per-q_pos causal tail mask)
-    QLEN_PACK: gl.constexpr,  # M-pack: # of q_pos unrolled in-kernel (KV loaded once,
-                              # shared across QLEN_PACK queries). 1 => grid-axis q_pos
-                              # (identical to plain decode / grid-axis MTP).
 ):
     # M-pack Phase-2 (true MFMA M-dim packing): the qlen query positions are packed
     # into the MFMA M dimension instead of an in-kernel unroll (Phase-1) or a grid
@@ -212,16 +209,13 @@ def _mla_decode_gluon(
     # upper bound for valid KV scores. For QLEN==1 this equals split_kv_end
     # (causal_bound == seq_len >= split_kv_end), so IS_CAUSAL=False keeps the
     # original code path untouched.
-    # Per packed query position j (absolute q_pos = q_pos + j; q_pos is the grid
-    # base, 0 in M-pack mode). Row at absolute q_pos may attend KV
-    # [0, seq_len-QLEN+q_pos]. score_end[j] is its per-position valid-score bound.
-    # tl.static_range => pure python unroll, so the lists below work normally.
-    score_end = ()
-    for j in tl.static_range(QLEN_PACK):
-        if IS_CAUSAL:
-            score_end = score_end + (gl.minimum(split_kv_end, cur_batch_seq_len - QLEN + (q_pos + j) + 1),)
-        else:
-            score_end = score_end + (split_kv_end,)
+    # Grid-axis path: q_pos is the actual query position; its row may attend KV
+    # [0, seq_len-QLEN+q_pos], so score_end is that per-program valid-score bound.
+    # (Unused in M-pack mode, which uses the per-row score_end_m below.)
+    if IS_CAUSAL:
+        score_end = gl.minimum(split_kv_end, cur_batch_seq_len - QLEN + q_pos + 1)
+    else:
+        score_end = split_kv_end
 
     ######### layout setting begin #########
     # Q-side layouts + mfma_layout: switch by BLOCK_H.
@@ -412,59 +406,49 @@ def _mla_decode_gluon(
     kvtype = Kv_c_cache.type.element_ty
     ######### layout setting end #########
 
-    # M-pack: one Q (nope+pe) shared buffer per packed query position. All
-    # QLEN_PACK async-copies share a single commit_group, so the downstream
-    # wait_group depths are identical to the single-Q (QLEN_PACK==1) case.
-    buf_q_nope = ()
-    buf_q_pe = ()
-    for _ in tl.static_range(QLEN_PACK):
-        buf_q_nope = buf_q_nope + (gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope),)
-        buf_q_pe = buf_q_pe + (gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe),)
+    # One Q (nope+pe) shared buffer. M-pack packs the q_pos into the M dimension,
+    # so a single [BLOCK_H, .] buffer holds all packed (q_pos, head) rows.
+    buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
+    buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
 
-    # load q_nope (all packed positions -> one group)
+    # load q_nope
     # M-pack: M-row -> (q_pos = row // BLOCK_H_PER_Q, head = row % BLOCK_H_PER_Q);
     # rows with q_pos>=QLEN or head>=NHEAD are masked. Grid-axis: row -> head, q_pos
-    # from the grid (q_pos + j).
+    # from the grid.
     offs_d_ckv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, blocked_q_nope))
     row_m_qn = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
     cur_head = cur_head_id * BLOCK_H + row_m_qn
     ### For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O stores; wasted MFMA lanes are free (memory-bound).
-    for j in tl.static_range(QLEN_PACK):
-        if M_PACK:
-            qpos_qn = mpack_qpos_base + row_m_qn // BLOCK_H_PER_Q
-            head_qn = row_m_qn % BLOCK_H_PER_Q
-            offs_q_nope = cur_batch * stride_q_nope_bs + qpos_qn[:, None] * stride_q_nope_s + head_qn[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
-            mask_qn = ((qpos_qn < QLEN) & (head_qn < NHEAD))[:, None]
-        else:
-            offs_q_nope = cur_batch * stride_q_nope_bs + (q_pos + j) * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
-            mask_qn = (cur_head < NHEAD)[:, None] if NHEAD < BLOCK_H else None
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope[j], Q_nope, offs_q_nope, mask=mask_qn)
+    if M_PACK:
+        qpos_qn = mpack_qpos_base + row_m_qn // BLOCK_H_PER_Q
+        head_qn = row_m_qn % BLOCK_H_PER_Q
+        offs_q_nope = cur_batch * stride_q_nope_bs + qpos_qn[:, None] * stride_q_nope_s + head_qn[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
+        mask_qn = ((qpos_qn < QLEN) & (head_qn < NHEAD))[:, None]
+    else:
+        offs_q_nope = cur_batch * stride_q_nope_bs + q_pos * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
+        mask_qn = (cur_head < NHEAD)[:, None] if NHEAD < BLOCK_H else None
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask=mask_qn)
     gl.amd.cdna4.async_copy.commit_group()
 
-    # load q_pe (all packed positions -> one group)
+    # load q_pe
     offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
     row_m_qpe = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
     cur_head_qpe = cur_head_id * BLOCK_H + row_m_qpe
-    for j in tl.static_range(QLEN_PACK):
-        if M_PACK:
-            qpos_qpe = mpack_qpos_base + row_m_qpe // BLOCK_H_PER_Q
-            head_qpe = row_m_qpe % BLOCK_H_PER_Q
-            offs_q_pe = cur_batch * stride_q_pe_bs + qpos_qpe[:, None] * stride_q_pe_s + head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-            mask_qpe = ((qpos_qpe < QLEN) & (head_qpe < NHEAD))[:, None]
-        else:
-            offs_q_pe = cur_batch * stride_q_pe_bs + (q_pos + j) * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-            mask_qpe = (cur_head_qpe < NHEAD)[:, None] if NHEAD < BLOCK_H else None
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe[j], Q_pe, offs_q_pe, mask=mask_qpe)
+    if M_PACK:
+        qpos_qpe = mpack_qpos_base + row_m_qpe // BLOCK_H_PER_Q
+        head_qpe = row_m_qpe % BLOCK_H_PER_Q
+        offs_q_pe = cur_batch * stride_q_pe_bs + qpos_qpe[:, None] * stride_q_pe_s + head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
+        mask_qpe = ((qpos_qpe < QLEN) & (head_qpe < NHEAD))[:, None]
+    else:
+        offs_q_pe = cur_batch * stride_q_pe_bs + q_pos * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
+        mask_qpe = (cur_head_qpe < NHEAD)[:, None] if NHEAD < BLOCK_H else None
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask=mask_qpe)
     gl.amd.cdna4.async_copy.commit_group()
 
-    # Per-position online-softmax state (lists of length QLEN_PACK).
-    e_max = ()
-    e_sum = ()
-    acc = ()
-    for _ in tl.static_range(QLEN_PACK):
-        e_max = e_max + (gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf"),)
-        e_sum = e_sum + (gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)),)
-        acc = acc + (gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout),)
+    # Online-softmax state (M-pack: all packed rows share one [BLOCK_H, .] tile).
+    e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
+    e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
+    acc = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout)
 
     # M-pack per-row causal bound: row -> q_pos = row // BLOCK_H_PER_Q, so each row's
     # valid-KV upper bound is min(split_kv_end, seq_len - QLEN + q_pos + 1). Built as
@@ -504,13 +488,10 @@ def _mla_decode_gluon(
     gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_page.index(1), Req_to_tokens, offs_page, offs_n_page < split_kv_end)
     gl.amd.cdna4.async_copy.commit_group()
 
-    #### local load Q (one register tile per packed position)
+    #### local load Q (one register tile, M holds all packed (q_pos, head) rows)
     gl.amd.cdna4.async_copy.wait_group(2)
-    q_nope = ()
-    q_pe = ()
-    for j in tl.static_range(QLEN_PACK):
-        q_nope = q_nope + (gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_nope[j], mfma_layout_a),)
-        q_pe = q_pe + (gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe[j], mfma_layout_a),)
+    q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_nope, mfma_layout_a)
+    q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
 
     #################### move here to work around allocate_shared_memory bug
     bufs_kv = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
@@ -620,12 +601,9 @@ def _mla_decode_gluon(
         k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kpe.index(buf_idx), mfma_layout_b)
         k_c_d = k_c.to(dtype)
         k_pe_d = k_pe.to(dtype)
-        qk = ()
-        for j in tl.static_range(QLEN_PACK):
-            zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-            qkj = gl.amd.cdna4.mfma(q_nope[j], k_c_d, zeros)
-            qkj = gl.amd.cdna4.mfma(q_pe[j], k_pe_d, qkj)
-            qk = qk + (qkj,)
+        zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+        qk = gl.amd.cdna4.mfma(q_nope, k_c_d, zeros)
+        qk = gl.amd.cdna4.mfma(q_pe, k_pe_d, qk)
 
         # local load page number for slice 1
         bufs_page_1 = bufs_page.index(async_idx).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
@@ -648,34 +626,25 @@ def _mla_decode_gluon(
         v_c = v_c.to(dtype)
         v_c = gl.permute(v_c, [1, 0])
         v_c = gl.convert_layout(v_c, mfma_layout_b)
-        new_e_max = ()
-        new_e_sum = ()
-        new_acc = ()
-        for j in tl.static_range(QLEN_PACK):
-            qkj = qk[j] * qk_scale
-            if M_PACK:
-                qkj = gl.where(offs_n_qk[None, :] < score_end_m[:, None], qkj, float("-inf"))
-            else:
-                qkj = gl.where(offs_n_qk[None, :] < score_end[j], qkj, float("-inf"))
-            n_e_max = gl.maximum(gl.max(qkj, 1), e_max[j])
-            re_scale = gl.exp2((e_max[j] - n_e_max) * LOG2E)
-            p = gl.exp2((qkj - n_e_max[:, None]) * LOG2E)
-            if IS_CAUSAL:
-                # MTP: a leading/whole fully-masked split keeps e_max=n_e_max=-inf,
-                # making re_scale/p NaN. Force them to 0 so the split cleanly yields
-                # e_sum=0 -> lse=-inf, which stage-2 drops.
-                re_scale = gl.where(e_max[j] == float("-inf"), 0.0, re_scale)
-                p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
-            e_sum_j = e_sum[j] * re_scale + gl.sum(p, 1)
-            p = p.to(dtype)
-            p = gl.convert_layout(p, mfma_layout_a)
-            acc_j = gl.amd.cdna4.mfma(p, v_c, acc[j] * re_scale[:, None])
-            new_e_max = new_e_max + (n_e_max,)
-            new_e_sum = new_e_sum + (e_sum_j,)
-            new_acc = new_acc + (acc_j,)
-        e_max = new_e_max
-        e_sum = new_e_sum
-        acc = new_acc
+        qk = qk * qk_scale
+        if M_PACK:
+            qk = gl.where(offs_n_qk[None, :] < score_end_m[:, None], qk, float("-inf"))
+        else:
+            qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+        n_e_max = gl.maximum(gl.max(qk, 1), e_max)
+        re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
+        p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
+        if IS_CAUSAL:
+            # MTP: a leading/whole fully-masked split keeps e_max=n_e_max=-inf,
+            # making re_scale/p NaN. Force them to 0 so the split cleanly yields
+            # e_sum=0 -> lse=-inf, which stage-2 drops.
+            re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
+            p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
+        e_sum = e_sum * re_scale + gl.sum(p, 1)
+        p = p.to(dtype)
+        p = gl.convert_layout(p, mfma_layout_a)
+        acc = gl.amd.cdna4.mfma(p, v_c, acc * re_scale[:, None])
+        e_max = n_e_max
 
         start_n += BLOCK_N
         buf_idx = (buf_idx + 1) % 2
@@ -727,34 +696,25 @@ def _mla_decode_gluon(
         v_c = v_c.to(dtype)
         v_c = gl.permute(v_c, [1, 0])
         v_c = gl.convert_layout(v_c, mfma_layout_b)
-        new_e_max = ()
-        new_e_sum = ()
-        new_acc = ()
-        for j in tl.static_range(QLEN_PACK):
-            zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-            qkj = gl.amd.cdna4.mfma(q_nope[j], k_c_d, zeros)
-            qkj = gl.amd.cdna4.mfma(q_pe[j], k_pe_d, qkj)
-            qkj *= qk_scale
-            if M_PACK:
-                qkj = gl.where(offs_n_qk[None, :] < score_end_m[:, None], qkj, float("-inf"))
-            else:
-                qkj = gl.where(offs_n_qk[None, :] < score_end[j], qkj, float("-inf"))
-            n_e_max = gl.maximum(gl.max(qkj, 1), e_max[j])
-            re_scale = gl.exp2((e_max[j] - n_e_max) * LOG2E)
-            p = gl.exp2((qkj - n_e_max[:, None]) * LOG2E)
-            if IS_CAUSAL:
-                re_scale = gl.where(e_max[j] == float("-inf"), 0.0, re_scale)
-                p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
-            e_sum_j = e_sum[j] * re_scale + gl.sum(p, 1)
-            p = p.to(dtype)
-            p = gl.convert_layout(p, mfma_layout_a)
-            acc_j = gl.amd.cdna4.mfma(p, v_c, acc[j] * re_scale[:, None])
-            new_e_max = new_e_max + (n_e_max,)
-            new_e_sum = new_e_sum + (e_sum_j,)
-            new_acc = new_acc + (acc_j,)
-        e_max = new_e_max
-        e_sum = new_e_sum
-        acc = new_acc
+        zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+        qk = gl.amd.cdna4.mfma(q_nope, k_c_d, zeros)
+        qk = gl.amd.cdna4.mfma(q_pe, k_pe_d, qk)
+        qk *= qk_scale
+        if M_PACK:
+            qk = gl.where(offs_n_qk[None, :] < score_end_m[:, None], qk, float("-inf"))
+        else:
+            qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+        n_e_max = gl.maximum(gl.max(qk, 1), e_max)
+        re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
+        p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
+        if IS_CAUSAL:
+            re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
+            p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
+        e_sum = e_sum * re_scale + gl.sum(p, 1)
+        p = p.to(dtype)
+        p = gl.convert_layout(p, mfma_layout_a)
+        acc = gl.amd.cdna4.mfma(p, v_c, acc * re_scale[:, None])
+        e_max = n_e_max
 
         start_n += BLOCK_N
         buf_idx = (buf_idx + 1) % 2
@@ -771,36 +731,27 @@ def _mla_decode_gluon(
     v_c = v_c.to(dtype)
     v_c = gl.permute(v_c, [1, 0])
     v_c = gl.convert_layout(v_c, mfma_layout_b)
-    new_e_max = ()
-    new_e_sum = ()
-    new_acc = ()
-    for j in tl.static_range(QLEN_PACK):
-        zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-        qkj = gl.amd.cdna4.mfma(q_nope[j], k_c_d, zeros)
-        qkj = gl.amd.cdna4.mfma(q_pe[j], k_pe_d, qkj)
-        qkj *= qk_scale
-        if M_PACK:
-            qkj = gl.where(offs_n_qk[None, :] < score_end_m[:, None], qkj, float("-inf"))
-        else:
-            qkj = gl.where(offs_n_qk[None, :] < score_end[j], qkj, float("-inf"))
-        n_e_max = gl.maximum(gl.max(qkj, 1), e_max[j])
-        re_scale = gl.exp2((e_max[j] - n_e_max) * LOG2E)
-        p = gl.exp2((qkj - n_e_max[:, None]) * LOG2E)
-        if IS_CAUSAL:
-            re_scale = gl.where(e_max[j] == float("-inf"), 0.0, re_scale)
-            p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
-        e_sum_j = e_sum[j] * re_scale + gl.sum(p, 1)
-        p = p.to(dtype)
-        p = gl.convert_layout(p, mfma_layout_a)
-        acc_j = gl.amd.cdna4.mfma(p, v_c, acc[j] * re_scale[:, None])
-        new_e_max = new_e_max + (n_e_max,)
-        new_e_sum = new_e_sum + (e_sum_j,)
-        new_acc = new_acc + (acc_j,)
-    e_max = new_e_max
-    e_sum = new_e_sum
-    acc = new_acc
+    zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
+    qk = gl.amd.cdna4.mfma(q_nope, k_c_d, zeros)
+    qk = gl.amd.cdna4.mfma(q_pe, k_pe_d, qk)
+    qk *= qk_scale
+    if M_PACK:
+        qk = gl.where(offs_n_qk[None, :] < score_end_m[:, None], qk, float("-inf"))
+    else:
+        qk = gl.where(offs_n_qk[None, :] < score_end, qk, float("-inf"))
+    n_e_max = gl.maximum(gl.max(qk, 1), e_max)
+    re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
+    p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
+    if IS_CAUSAL:
+        re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
+        p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
+    e_sum = e_sum * re_scale + gl.sum(p, 1)
+    p = p.to(dtype)
+    p = gl.convert_layout(p, mfma_layout_a)
+    acc = gl.amd.cdna4.mfma(p, v_c, acc * re_scale[:, None])
+    e_max = n_e_max
 
-    #### store O (and lse) for each packed position
+    #### store O (and lse) for the packed (q_pos, head) rows
     # M-pack: M-row -> (q_pos = row // BLOCK_H_PER_Q, head = row % BLOCK_H_PER_Q),
     # so the O/lse store address uses per-row q_pos and head, masked to valid
     # (q_pos < QLEN, head < NHEAD). Grid-axis: row -> head, q_pos from the grid.
@@ -817,50 +768,49 @@ def _mla_decode_gluon(
         qpos_lse = mpack_qpos_base + row_lse // BLOCK_H_PER_Q
         head_lse = row_lse % BLOCK_H_PER_Q
         valid_lse = (qpos_lse < QLEN) & (head_lse < NHEAD)
-    for j in tl.static_range(QLEN_PACK):
-        if M_PACK:
-            offs_o = cur_batch * stride_o_b + qpos_o[:, None] * stride_o_s + head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
-        else:
-            offs_o = cur_batch * stride_o_b + (q_pos + j) * stride_o_s + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
-        acc_j = acc[j] * kv_scale
-        rcp = 1.0 / e_sum[j]
-        stored_value = (acc_j * rcp[:, None]).to(dtype)
-        if M_PACK:
-            gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=valid_o[:, None])
-        elif NHEAD < BLOCK_H:
-            gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
-        else:
-            gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
+    if M_PACK:
+        offs_o = cur_batch * stride_o_b + qpos_o[:, None] * stride_o_s + head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
+    else:
+        offs_o = cur_batch * stride_o_b + q_pos * stride_o_s + cur_head_o[:, None] * stride_o_h + split_kv_id * stride_o_split + offs_d_ckv_o[None, :]
+    acc = acc * kv_scale
+    rcp = 1.0 / e_sum
+    stored_value = (acc * rcp[:, None]).to(dtype)
+    if M_PACK:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=valid_o[:, None])
+    elif NHEAD < BLOCK_H:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
+    else:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
 
-        ### store lse
-        if RETURN_LSE and NUM_KV_SPLITS == 1:
-            # split==1: single split is the whole sequence, so its lse is the final lse.
-            if M_PACK:
-                offs_final_lse = cur_batch * stride_final_lse_b + qpos_lse * stride_final_lse_s + head_lse * stride_final_lse_h
-            else:
-                offs_final_lse = cur_batch * stride_final_lse_b + (q_pos + j) * stride_final_lse_s + cur_head_lse * stride_final_lse_h
-            lse = e_max[j] + gl.log(e_sum[j])
-            lse = gl.convert_layout(lse, blocked_lse)
-            if M_PACK:
-                gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=valid_lse)
-            elif NHEAD < BLOCK_H:
-                gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_lse < NHEAD))
-            else:
-                gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
-        elif NUM_KV_SPLITS > 1:
-            # per-split lse for stage-2 reduce.
-            if M_PACK:
-                offs_mid_lse = cur_batch * stride_mid_lse_b + qpos_lse * stride_mid_lse_s + head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
-            else:
-                offs_mid_lse = cur_batch * stride_mid_lse_b + (q_pos + j) * stride_mid_lse_s + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
-            lse = e_max[j] + gl.log(e_sum[j])
-            lse = gl.convert_layout(lse, blocked_lse)
-            if M_PACK:
-                gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=valid_lse)
-            elif NHEAD < BLOCK_H:
-                gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
-            else:
-                gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
+    ### store lse
+    if RETURN_LSE and NUM_KV_SPLITS == 1:
+        # split==1: single split is the whole sequence, so its lse is the final lse.
+        if M_PACK:
+            offs_final_lse = cur_batch * stride_final_lse_b + qpos_lse * stride_final_lse_s + head_lse * stride_final_lse_h
+        else:
+            offs_final_lse = cur_batch * stride_final_lse_b + q_pos * stride_final_lse_s + cur_head_lse * stride_final_lse_h
+        lse = e_max + gl.log(e_sum)
+        lse = gl.convert_layout(lse, blocked_lse)
+        if M_PACK:
+            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=valid_lse)
+        elif NHEAD < BLOCK_H:
+            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_lse < NHEAD))
+        else:
+            gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
+    elif NUM_KV_SPLITS > 1:
+        # per-split lse for stage-2 reduce.
+        if M_PACK:
+            offs_mid_lse = cur_batch * stride_mid_lse_b + qpos_lse * stride_mid_lse_s + head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
+        else:
+            offs_mid_lse = cur_batch * stride_mid_lse_b + q_pos * stride_mid_lse_s + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
+        lse = e_max + gl.log(e_sum)
+        lse = gl.convert_layout(lse, blocked_lse)
+        if M_PACK:
+            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=valid_lse)
+        elif NHEAD < BLOCK_H:
+            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
+        else:
+            gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
 # fmt: on
 
 
@@ -1068,10 +1018,9 @@ def mla_decode_gluon(
 
     PAGE_SIZE = 1
 
-    # Phase-2 packs q_pos into the M dimension, so QLEN_PACK stays 1 (no in-kernel
-    # unroll tuples). Grid axis 2 carries: the full qlen (grid-axis path), or the
-    # qblock count cdiv(qlen, QPOS_PER_BLOCK) in M-pack mode (4 positions per block).
-    QLEN_PACK = 1
+    # Phase-2 packs q_pos into the MFMA M dimension (no in-kernel q_pos unroll).
+    # Grid axis 2 carries: the full qlen (grid-axis path), or the qblock count
+    # cdiv(qlen, QPOS_PER_BLOCK) in M-pack mode (4 positions per block).
     MPACK_QPOS_PER_BLOCK = 4  # BLOCK_H(64) // BLOCK_H_PER_Q(16); keep in sync w/ kernel
     # grid axis 2 size: qblocks in M-pack mode, else one program per q_pos.
     split_qlen = triton.cdiv(qlen, MPACK_QPOS_PER_BLOCK) if USE_MPACK else qlen
@@ -1292,7 +1241,6 @@ def mla_decode_gluon(
         REGIME=REGIME,
         RETURN_LSE=return_lse,
         IS_CAUSAL=IS_CAUSAL,
-        QLEN_PACK=QLEN_PACK,
     )
 
     if NUM_KV_SPLITS == 1:
