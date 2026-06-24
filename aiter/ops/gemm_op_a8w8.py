@@ -20,7 +20,15 @@ from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
-from ..ops.flydsl.utils import is_flydsl_available
+
+
+def is_flydsl_available():
+    try:
+        from ..ops.flydsl.utils import is_flydsl_available as _is_flydsl_available
+    except ImportError:
+        return False
+    return _is_flydsl_available()
+
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -649,10 +657,7 @@ def gemm_a8w8_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[-1]
     w_k = WQ.shape[-1]
-    if w_k > k:
-        XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
-        k = XQ.shape[-1]
-    elif w_k < k:
+    if w_k < k:
         raise RuntimeError(
             f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, " f"XQ K={k}"
         )
@@ -678,6 +683,14 @@ def gemm_a8w8_bpreshuffle(
         dtypes.fp8,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     )
+    if config is None and w_k > k:
+        config = get_GEMM_config_with_quant_type(
+            m,
+            n,
+            w_k,
+            dtypes.fp8,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+        )
     if config is not None:
         libtype = config["libtype"]
         splitK = int(config["splitK"])
@@ -686,6 +699,8 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl" and is_flydsl_available():
+            if w_k > k:
+                XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
     if get_gfx() == "gfx1250" and is_flydsl_available():
@@ -704,10 +719,14 @@ def gemm_a8w8_bpreshuffle(
                 f"[gfx1250] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
                 f"falling back to flydsl kernel '{ki.name}'."
             )
+            if w_k > k:
+                XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
             )
     try:
+        if w_k > k:
+            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, 0)
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
     except RuntimeError as e:
         raise RuntimeError(
