@@ -458,6 +458,19 @@ Baseline to beat (EXP-2026-06-22a, b64/m512/uniform): `grad_dense_partials`
 - [ ] autotune  [ ] example timing  [ ] style gate
 
 ## Backlog (not yet scheduled)
+- **Relax the `K == N == D` constraint (support non-square `D != Kout`).** The
+  backward kernels currently collapse the dense reduction dim and output dim into a
+  single compile-time constant (`K == N`), so they only cover *square* shapes. The
+  reference HSTU bench (`bench_jagged_dense_bmm_perf.py`) separates `D` (= reduction
+  `K`) from `Kout` (= output `N`) and can drive non-square shapes; our backward
+  cannot express those. **Do:** split the single `D` constant into independent `K`
+  (reduction) and `N` (output) in `jagged_dense_bmm_bwd.py` (and the example/profile
+  harnesses), audit every tile/grid/LDS size that assumed `K == N` (the MFMA partials
+  output-tiling `NK_TILES`/`NN_TILES`, the col-tiled reduce/bias `NRED_*`, scratch
+  layout `(n_groups*SPLIT*K, N)`), and validate `K != N` (e.g. `D=256, Kout=512`)
+  in `uniform`+`skew`. **Gate:** correctness (cosine > 0.999) at a non-square shape
+  with no regression at the square North Star. Enables apples-to-apples coverage of
+  the full HSTU bench config space, not just the square headline shapes.
 - Tall `dDense` `(n_groups*N, K)` layout (revisit `2026-06-18` A2) if it removes a
   host transpose on the hot path.
 - Port `dJagged` tweaks back to the forward kernel if shared.
