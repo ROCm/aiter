@@ -403,31 +403,16 @@ void pa_fp8_main_kernel_v2(
         }
     };
 
-    // ── Reverse-order KV iteration (FlyDSL-aligned) ─────────────────────
-    // When kReverseKV=true the per-CTA kblock loop walks kbi from
-    // `kbi_stop-1` down to `kbi_start` (instead of forward).  In decode the
-    // most-recent tokens (highest kbi) tend to carry the largest QK scores,
-    // so processing them first makes the online-softmax running max
-    // (`m_running`) start near the partition max — the sink-prone first
-    // block is consumed last.  Iteration count, prefetch depth (1 ahead),
-    // double-buffering and MFMA work are all unchanged, so this is
-    // instruction-count / perf neutral; only the numerical accumulation
-    // order changes.  Flip to false to A/B against the original forward
-    // order.  Mirrors FlyDSL pa_decode_fp8.py (`block_idx = last - ib`).
-    constexpr bool kReverseKV = true;
-    const int last_kbi  = kbi_stop - 1;
-    const int first_kbi = kReverseKV ? last_kbi : kbi_start;
-
     if constexpr (EnablePrefetch) {
-        // PROLOGUE: stage the FIRST-processed kblock's block table to LDS,
-        // then issue its K + K-scale buffer_loads BEFORE the Q load.
+        // PROLOGUE: stage iter 0's block table to LDS, then issue
+        // K(kbi_start) + K-scale(kbi_start) buffer_loads BEFORE the Q load.
         // The one-shot barrier here is amortised over the whole CTA; the K
         // HBM latency (~400 cy) then overlaps with the Q load + Q LDS staging
         // + Q register prep that follows (~500-800 cy on the bf16-Q path),
         // so iter 0's QK MFMA finds K already in VGPR with no extra wait.
-        stage_bt_to_lds(first_kbi);
+        stage_bt_to_lds(kbi_start);
         __syncthreads();
-        stage_kbi_prefetch(first_kbi);
+        stage_kbi_prefetch(kbi_start);
     }
 
     {
@@ -536,17 +521,11 @@ void pa_fp8_main_kernel_v2(
     // iter start below (no prologue).
     constexpr unsigned int kVBytesPerVhe = (unsigned int)(kNWarps * 16 * kBlockSize);
 
-    const int n_iters = kbi_stop - kbi_start;
-    for (int it = 0; it < n_iters; it++)
+    for (int kbi = kbi_start; kbi < kbi_stop; kbi++)
     {
-        // Forward induction var `it`; remap to the actual kblock index so
-        // reverse order needs no negative-step loop (matches FlyDSL).
-        const int kbi = kReverseKV ? (last_kbi - it) : (kbi_start + it);
         const int partition_start_token_idx = kbi * kTParSize;
 
-        // Skip the inter-iter barrier on the FIRST processed iteration only
-        // (it == 0), independent of iteration direction.
-        if (it != 0) __syncthreads();
+        if (kbi != kbi_start) __syncthreads();
 
         // Baseline path: K + K-scale are NOT prefetched cross-kbi.  Issue
         // the buffer_loads here at iter start (compiler inserts implicit
@@ -770,13 +749,9 @@ void pa_fp8_main_kernel_v2(
         // no new barrier is introduced.  Clamp mirrors the K-prefetch's
         // `kbi_safe` so the final iter re-stages the current kbi harmlessly.
         if constexpr (EnablePrefetch) {
-            // Next processed kblock: kbi-1 under reverse, kbi+1 under
-            // forward.  Clamp into [kbi_start, kbi_stop-1] so the FINAL
-            // iter's prefetch harmlessly re-stages an in-range block.
-            const int kbi_bt_next = kReverseKV ? (kbi - 1) : (kbi + 1);
-            const int kbi_bt_safe = kReverseKV
-                ? ((kbi_bt_next >= kbi_start) ? kbi_bt_next : kbi_start)
-                : ((kbi_bt_next <  kbi_stop)  ? kbi_bt_next : (kbi_stop - 1));
+            const int kbi_bt_next = kbi + 1;
+            const int kbi_bt_safe = (kbi_bt_next < kbi_stop)
+                                        ? kbi_bt_next : (kbi_stop - 1);
             stage_bt_to_lds(kbi_bt_safe);
         }
         __syncthreads();
@@ -802,12 +777,9 @@ void pa_fp8_main_kernel_v2(
         // `V_wide` and `P_lo/P_hi_per_g` (unrelated VGPRs), so K's old
         // values are dead.
         if constexpr (EnablePrefetch) {
-            // Next processed kblock: kbi-1 under reverse, kbi+1 under
-            // forward.  Same clamp rationale as the block-table stage above.
-            const int kbi_next = kReverseKV ? (kbi - 1) : (kbi + 1);
-            const int kbi_safe = kReverseKV
-                ? ((kbi_next >= kbi_start) ? kbi_next : kbi_start)
-                : ((kbi_next <  kbi_stop)  ? kbi_next : (kbi_stop - 1));
+            const int kbi_next = kbi + 1;
+            const int kbi_safe = (kbi_next < kbi_stop)
+                                     ? kbi_next : (kbi_stop - 1);
             stage_kbi_prefetch(kbi_safe);
         }
 
