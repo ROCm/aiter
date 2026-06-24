@@ -242,6 +242,14 @@ def build_flash_attn_fp8_module(
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
 
+        def _wave_or(pred_i1):
+            # OR a per-lane i1 predicate across all 64 lanes -> wave-uniform i1.
+            g = ArithValue(pred_i1).select(fx.Int32(1), fx.Int32(0))
+            for st in (1, 2, 4, 8, 16, 32):
+                peer = fx.Int32(g).shuffle_xor(fx.Int32(st), fx.Int32(WARP_SIZE))
+                g = arith.ori(_raw(g), _raw(peer))
+            return arith.cmpi(arith.CmpIPredicate.ne, _raw(g), _raw(fx.Int32(0)))
+
         def _sched(mask, n):
             if USE_MANUAL_SCHED:
                 rocdl.sched_group_barrier(mask, n, 0)
@@ -536,7 +544,43 @@ def build_flash_attn_fp8_module(
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
             )
-            l2 = _fadd(_fmul(l_acc, corr), p_rowsum)
+            # Speculative rollback: O*=corr and L=L*corr+rowsum only matter when
+            # some lane's running max grew this tile (corr<1).  corr==exp2(0)==1.0
+            # exactly when no lane grew, so skipping the 64-fmul O-rescale + the
+            # L-mul is EXACT (not approximate).  Branch on a wave-uniform OR of the
+            # per-lane (corr<1) predicate so the wave never diverges.
+            grew = arith.cmpf(
+                arith.CmpFPredicate.OLT, _raw(corr), _raw(fx.Float32(1.0))
+            )
+            any_grew = _wave_or(grew)
+            o_vt = Vec.make_type(C_F32_PER_LANE, fx.Float32)
+            resc_if = scf.IfOp(
+                any_grew, results_=[o_vt, o_vt, o_vt, o_vt, T.f32], has_else=True
+            )
+            with ir.InsertionPoint(resc_if.then_block):
+                _ro = [
+                    _fmul(Vec(o_accs[dt]), corr_vec) for dt in range_constexpr(D_TILES)
+                ]
+                _rl = _fadd(_fmul(l_acc, corr), p_rowsum)
+                scf.YieldOp(
+                    [_raw(_ro[0]), _raw(_ro[1]), _raw(_ro[2]), _raw(_ro[3]), _raw(_rl)]
+                )
+            with ir.InsertionPoint(resc_if.else_block):
+                _nl = _fadd(_raw(l_acc), _raw(p_rowsum))
+                scf.YieldOp(
+                    [
+                        _raw(o_accs[0]),
+                        _raw(o_accs[1]),
+                        _raw(o_accs[2]),
+                        _raw(o_accs[3]),
+                        _raw(_nl),
+                    ]
+                )
+            o_accs = [
+                as_dsl_value(resc_if.results[dt], o_accs[dt])
+                for dt in range_constexpr(D_TILES)
+            ]
+            l2 = as_dsl_value(resc_if.results[4], l_acc)
             p_ks_list = [
                 Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
                 for r in range_constexpr(PV_K_STEPS)
@@ -550,8 +594,6 @@ def build_flash_attn_fp8_module(
             for u in range_constexpr(PV_UNITS):
                 dt = u // PV_K_STEPS
                 ks = u % PV_K_STEPS
-                if const_expr(ks == 0):
-                    o[dt] = _fmul(Vec(o[dt]), corr_vec)
                 if const_expr(u + PREFETCH_DEPTH < PV_UNITS):
                     un = u + PREFETCH_DEPTH
                     vw[(u + PREFETCH_DEPTH) % 4] = read_v_pack(
