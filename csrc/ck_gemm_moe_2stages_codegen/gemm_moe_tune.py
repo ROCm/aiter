@@ -598,34 +598,38 @@ class FmoeTuner(TunerCommon):
 
     @staticmethod
     def _mxfp4_port_g1_kname(ne, h, e, bm, use_nt, inline_quant):
-        # Build a gemm1 kernel name matching the mxfp4 codegen/CSV grammar
-        # (see aiter.fused_moe._parse_mxfp4_g1_kname). BM16 is inline-quant
-        # (bare = NT/read-once, _CACHED = cached); BM32 cshuffle uses _NT/_CACHED;
-        # BM128 takes no variant suffix.
-        name = f"mxfp4_moe_g1_a4w4_NE{ne}_H{h}_E{e}_BM{bm}"
+        # Build a gemm1 kernel name in the FlyDSL style (see
+        # aiter.ops.flydsl.mxfp4_kname._parse_mxfp4_g1_kname): flydsl_ prefix,
+        # lowercase, tile=<BM>x256x256 (BN=BK=256, fixed by the port kernel). The
+        # shape (ne/h/e) is carried by the CSV columns, not the name. BM16 is
+        # inline-quant (bare = NT/read-once, _cached = cached); BM32 cshuffle uses
+        # _nt/_cached; BM128 takes no variant suffix.
+        name = f"flydsl_mxfp4_g1_a4w4_{bm}x256x256"
         if inline_quant:
-            name += "_INLINEQUANT" + ("" if use_nt else "_CACHED")
+            name += "_inlinequant" + ("" if use_nt else "_cached")
         elif bm == 32:
-            name += "_NT" if use_nt else "_CACHED"
+            name += "_nt" if use_nt else "_cached"
         return name
 
     @staticmethod
     def _mxfp4_port_g2_kname(ne, h, e, topk, bm, use_nt, epilog):
-        # Build a gemm2 kernel name matching the mxfp4 codegen/CSV grammar
-        # (see aiter.fused_moe._parse_mxfp4_g2_kname). epilog in
+        # Build a gemm2 kernel name in the FlyDSL style (see
+        # aiter.ops.flydsl.mxfp4_kname._parse_mxfp4_g2_kname): flydsl_ prefix,
+        # lowercase, tile=<BM>x256x256. epilog in
         # {atomic, nonatomic, nonatomic_mxfp4, nonatomic_cshuffle}. atomic carries
-        # the TOPK tag and an optional _NT; nonatomic drops TOPK and may add
-        # _MXFP4OUT or _CSHUFFLE.
+        # the topk tag and an optional _nt; nonatomic drops topk and may add
+        # _mxfp4out or _cshuffle.
+        tile = f"{bm}x256x256"
         if epilog == "atomic":
-            name = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_TOPK{topk}_BM{bm}_ATOMIC"
+            name = f"flydsl_mxfp4_g2_a4w4_{tile}_topk{topk}_atomic"
             if use_nt:
-                name += "_NT"
+                name += "_nt"
             return name
-        name = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_BM{bm}_NONATOMIC"
+        name = f"flydsl_mxfp4_g2_a4w4_{tile}_nonatomic"
         if epilog == "nonatomic_mxfp4":
-            name += "_MXFP4OUT"
+            name += "_mxfp4out"
         elif epilog == "nonatomic_cshuffle":
-            name += "_CSHUFFLE"
+            name += "_cshuffle"
         return name
 
     @staticmethod
