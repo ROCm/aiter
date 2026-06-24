@@ -477,12 +477,22 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("imports done")
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    tile_m, tile_n, tile_k = 64, 256, 256
-    m_warp, n_warp = 1, 4
-    num_buffers = 2
+    # gemm1 (N=2*inter_dim, K=model_dim) and gemm2 (N=model_dim, K=inter_dim)
+    # have different shapes, so their N/K tiling, warp counts, buffering and
+    # split_k are tuned *independently* (suffix 1/2). Only the M-tiling
+    # (tile_m / m_warp) is shared: it drives max_m padding and the per-row scale
+    # layout, which both stages read from the same grouped buffers.
+    tile_m = 64
+    m_warp = 1
+    grouped_contiguous_m = False
+    # Per-stage defaults (n_warp=4 -> tile_n=256; tile_k=256; num_buffers=2).
+    n_warp1 = n_warp2 = 4
+    tile_n1 = tile_n2 = None
+    tile_k1 = tile_k2 = None
+    num_buffers1 = 2
+    num_buffers2 = 2
     split_k1 = 1
     split_k2 = 1
-    grouped_contiguous_m = False
     cfg_row = _find_grouped_config(
         token_num=_get_padded_M(token_num),
         model_dim=model_dim,
@@ -496,10 +506,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         quant_type=quant_type,
         gate_mode=gate_mode,
     )
+    # Per-stage columns (tile_n1/tile_k1/n_warp1/num_buffers1 and the *2 set)
+    # fall back to the legacy shared columns (tile_n/tile_k/n_warp/num_buffers)
+    # and then to the derived defaults, so single-config CSV rows that omit the
+    # per-stage columns keep their exact previous behaviour.
     if cfg_row is not None:
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
-        n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
-        num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
+        m_warp = _as_int(cfg_row.get("m_warp"), m_warp)
         split_k1 = _as_int(cfg_row.get("split_k1"), split_k1)
         split_k2 = _as_int(cfg_row.get("split_k2"), split_k2)
         grouped_contiguous_m = _as_bool(
@@ -508,9 +521,32 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stage1_weight_layout = (
             cfg_row.get("stage1_weight_layout") or stage1_weight_layout
         )
+        _shared_n_warp = _as_int(cfg_row.get("n_warp"), None)
+        _shared_tile_n = _as_int(cfg_row.get("tile_n"), None)
+        _shared_tile_k = _as_int(cfg_row.get("tile_k"), None)
+        _shared_nbuf = _as_int(cfg_row.get("num_buffers"), None)
+        n_warp1 = _as_int(
+            cfg_row.get("n_warp1"), _shared_n_warp if _shared_n_warp else n_warp1
+        )
+        n_warp2 = _as_int(
+            cfg_row.get("n_warp2"), _shared_n_warp if _shared_n_warp else n_warp2
+        )
+        tile_n1 = _as_int(cfg_row.get("tile_n1"), _shared_tile_n)
+        tile_n2 = _as_int(cfg_row.get("tile_n2"), _shared_tile_n)
+        tile_k1 = _as_int(cfg_row.get("tile_k1"), _shared_tile_k)
+        tile_k2 = _as_int(cfg_row.get("tile_k2"), _shared_tile_k)
+        num_buffers1 = _as_int(
+            cfg_row.get("num_buffers1"), _shared_nbuf if _shared_nbuf else num_buffers1
+        )
+        num_buffers2 = _as_int(
+            cfg_row.get("num_buffers2"), _shared_nbuf if _shared_nbuf else num_buffers2
+        )
         _grouped_dbg(f"using grouped CSV config: {cfg_row}")
-    tile_n = int(n_warp) * 64
-    tile_k = 256
+
+    tile_n1 = tile_n1 if tile_n1 else int(n_warp1) * 64
+    tile_n2 = tile_n2 if tile_n2 else int(n_warp2) * 64
+    tile_k1 = tile_k1 if tile_k1 else 256
+    tile_k2 = tile_k2 if tile_k2 else 256
     warp_tile_m = tile_m // m_warp
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
@@ -704,7 +740,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             route_E,
             route_max_m,
             wmma_rep=warp_tile_m // 16,
-            scale_k_per_tile=tile_k // 32,
+            scale_k_per_tile=tile_k1 // 32,
         )
         _grouped_dbg("route gather + scale preshuffle done")
     else:
@@ -722,7 +758,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             route_weights.dtype
         )
         grouped_a1_scale = _grouped_a8w4_preshuffle_e8m0_scale(
-            a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
+            a1_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k1 // 32
         )
         _grouped_dbg("route gather done")
 
@@ -755,12 +791,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         experts=E,
         max_m=max_m,
         tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
+        tile_n=tile_n1,
+        tile_k=tile_k1,
         m_warp=m_warp,
-        n_warp=n_warp,
+        n_warp=n_warp1,
         out_dtype=out_dtype_str,
-        num_buffers=num_buffers,
+        num_buffers=num_buffers1,
         split_k=split_k1,
         expert_sched_mode=False,
         grouped_persistent_m=False,
@@ -863,7 +899,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
     if _use_naive:
         grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
-            a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
+            a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k2 // 32
         )
     else:
         # a2_scale_raw is already grouped row-major (no route-gather), so use the
@@ -874,7 +910,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             route_E,
             route_max_m,
             wmma_rep=warp_tile_m // 16,
-            scale_k_per_tile=tile_k // 32,
+            scale_k_per_tile=tile_k2 // 32,
         )
     _grouped_dbg("a2 scale layout done")
     grouped_out = torch.empty(
@@ -892,12 +928,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         experts=E,
         max_m=max_m,
         tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
+        tile_n=tile_n2,
+        tile_k=tile_k2,
         m_warp=m_warp,
-        n_warp=n_warp,
+        n_warp=n_warp2,
         out_dtype=out_dtype_str,
-        num_buffers=num_buffers,
+        num_buffers=num_buffers2,
         split_k=split_k2,
         expert_sched_mode=False,
         grouped_persistent_m=False,
