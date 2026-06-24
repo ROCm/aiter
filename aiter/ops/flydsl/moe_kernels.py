@@ -1850,6 +1850,8 @@ def flydsl_moe_fused_route_quant_scatter(
             grouped_a1.view(-1),
             grouped_a1_scale.view(-1),
             topids_to_rows,
+            counter,  # dummy row_starts; unused because remap_rows=False
+            1,
             numel,
             grid_blocks,
             stream=torch.cuda.current_stream(),

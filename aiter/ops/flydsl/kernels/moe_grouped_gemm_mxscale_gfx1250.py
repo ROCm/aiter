@@ -1586,6 +1586,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 device=y.device,
                 dtype=y.dtype,
             )
+            gemm_out.zero_()
             gemm_arg = gemm_out.view(
                 cfg.split_k * cfg.experts, cfg.max_m, cfg.model_dim
             )
