@@ -2368,15 +2368,6 @@ def compile_mxscale_gemm(
             if const_expr(tdm_as_in_prologue):
                 _as_desc = make_desc_as_prologue(as_full_mem, split_k_base)
                 issue_tdm_loads(_as_desc, wave_specialized=True)
-                # At num_buffers==2 every downstream fence drains tensorcnt to 0,
-                # so As is drained + made visible there (As writes as_full, the
-                # pre-load writes the stage buffers -- disjoint, no WAR, and
-                # nothing reads As before the first compute). The separate As
-                # drain is redundant. At nb>=3 the entry/loop fence keeps
-                # `outstanding`>0 loads in flight, so As must be drained here to
-                # stay out of that count.
-                if const_expr(num_buffers != 2):
-                    pipeline_fence(outstanding=0, use_cluster=use_cluster)
 
             # Prologue
             if const_expr(wave_specialized_tdm):
