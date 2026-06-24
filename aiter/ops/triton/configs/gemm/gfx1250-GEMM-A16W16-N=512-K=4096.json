@@ -8,11 +8,19 @@
         "kernel_type": "bandwidth_bound"
     },
     "any": {
-        "BLOCK_M": 16,
-        "BLOCK_N": 16,
+        "BLOCK_M": 32,
+        "BLOCK_N": 64,
         "BLOCK_K": 512,
         "NUM_BUFFERS": 3,
-        "num_warps": 2,
-        "kernel_type": "bandwidth_bound"
+        "num_warps": 4,
+        "kernel_type": "compute_bound"
+    },
+    "M_LEQ_1024": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 3,
+        "num_warps": 4,
+        "kernel_type": "compute_bound"
     }
 }
