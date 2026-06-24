@@ -47,6 +47,7 @@ class gemm_a8w8_fwd_codegen:
                 pd.read_csv(self.tune_file),
                 default_kernels_dict_cktile,
                 kernels_list_cktile,
+                libtype="cktile",
             )
         return default_kernels_dict_cktile
 
