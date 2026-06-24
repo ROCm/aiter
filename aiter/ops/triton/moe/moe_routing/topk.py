@@ -174,7 +174,11 @@ def topk(
     bias=None,
     renorm: bool = False,
     routed_scaling_factor: float = 1.0,
+    pop_out=None,
 ):
+    # FlashMoE Fusion-1: if `pop_out` (a pre-zeroed [n_expts_tot] int32 tensor) is
+    # given, _topk atomic-accumulates the per-expert popularity into it — folding the
+    # downstream popularity sum into this launch. Default (None) is unchanged.
     """Top-k expert selection with bitmatrix.
 
     score_mode:
@@ -273,6 +277,8 @@ def topk(
         HAS_BIAS=has_bias,
         APPLY_RENORM=renorm,
         ROUTED_SCALING=routed_scaling_factor,
+        Pop=pop_out,
+        WRITE_POP=pop_out is not None,
     )
     bitmatrix_shape = [n_rows, n_cols_words * 32]
     bitmatrix = Bitmatrix(
