@@ -223,7 +223,6 @@ def rope_norm_store_kv(
         eps=eps,
         num_rows=num_rows,
         total_num_kv_cache_tokens=num_blocks * block_size,
-        max_seq_len=cos_sin.shape[0],
         stride_qkv_t=qkv.stride(0),
         stride_qkv_d=qkv.stride(1),
         stride_cos_t=cos_sin.stride(0),

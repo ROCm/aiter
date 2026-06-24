@@ -39,7 +39,6 @@ def _rope_norm_store_kv_compute_pos_slot_kernel(
     seq_len = tl.load(num_seqlen_per_req_ptr + req).to(tl.int32)
 
     num_rows_req = end - start
-    valid_req = seq_len > 0
     pos_offset = seq_len - end
 
     num_chunks = tl.cdiv(num_rows_req, BLOCK_R)
@@ -52,12 +51,12 @@ def _rope_norm_store_kv_compute_pos_slot_kernel(
         block_row = token_pos % BLOCK_SIZE
         phys_block = tl.load(
             kvcache_indices_ptr + req * stride_kvi_r + block_idx * stride_kvi_b,
-            mask=mask & valid_req,
+            mask=mask,
             other=0,
         ).to(tl.int64)
         slot = phys_block * BLOCK_SIZE + block_row.to(tl.int64)
-        tl.store(positions_ptr + row, tl.where(valid_req, token_pos, 0), mask=mask)
-        tl.store(slot_indices_ptr + row, tl.where(valid_req, slot, -1), mask=mask)
+        tl.store(positions_ptr + row, token_pos, mask=mask)
+        tl.store(slot_indices_ptr + row, slot, mask=mask)
 
 
 @triton.jit
@@ -76,7 +75,6 @@ def _rope_norm_store_kv_kernel(
     eps,
     num_rows,
     total_num_kv_cache_tokens: tl.int64,
-    max_seq_len,
     # strides
     stride_qkv_t, stride_qkv_d,
     stride_cos_t, stride_cos_d,
@@ -124,17 +122,10 @@ def _rope_norm_store_kv_kernel(
     d = tl.arange(0, QK_HEAD_DIM)
     d_mod = d % QK_HEAD_DIM_HALF  # NeoX: cos/sin[d] = table[d % half]
 
-    # Guard against out-of-range positions (uninitialized/padding rows or a
-    # cos_sin table shorter than the served positions): clamp the index so the
-    # address stays in-bounds and mask the load (identity rotation cos=1/sin=0).
-    pos_in_range = (positions >= 0) & (positions < max_seq_len)
-    safe_positions = tl.where(pos_in_range, positions, 0)
-    cos_sin_mask = t_mask[:, None] & pos_in_range[:, None]
-
-    cos_offs = safe_positions[:, None] * stride_cos_t + d_mod[None, :] * stride_cos_d
+    cos_offs = positions[:, None] * stride_cos_t + d_mod[None, :] * stride_cos_d
     sin_offs = cos_offs + QK_HEAD_DIM_HALF * stride_cos_d
-    cos_full = tl.load(cos_sin_ptr + cos_offs, mask=cos_sin_mask, other=1.0)
-    sin_full = tl.load(cos_sin_ptr + sin_offs, mask=cos_sin_mask, other=0.0)
+    cos_full = tl.load(cos_sin_ptr + cos_offs, mask=t_mask[:, None], other=1.0)
+    sin_full = tl.load(cos_sin_ptr + sin_offs, mask=t_mask[:, None], other=0.0)
 
     qk_rotated_mask = (d < QK_HEAD_DIM_HALF)[None, :]
 
