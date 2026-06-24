@@ -104,8 +104,8 @@ def _build_kernel(*, num_heads: int, head_size: int, block_kv: int):
 
     @flyc.kernel(name=_kname)
     def kernel(
-        Q: fx.Tensor,  # [seq_len, H, D]      fp8
-        KV: fx.Tensor,  # [seq_len_kv, D]      fp8
+        Q: fx.Tensor,  # [seq_len, H, D]      fp8 (any variant; bytes passed raw)
+        KV: fx.Tensor,  # [seq_len_kv, D]      fp8 (any variant; bytes passed raw)
         kv_scales: fx.Tensor,  # [seq_len_kv]         f32
         weights: fx.Tensor,  # [seq_len, H]         f32
         cu_starts: fx.Tensor,  # [seq_len]            i32
@@ -240,7 +240,8 @@ def _build_kernel(*, num_heads: int, head_size: int, block_kv: int):
 
 
 # MFMA based direct port of the Triton kernel.
-def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int):
+def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int,
+                       convert_q_fn: bool = False, convert_kv_fn: bool = False):
     """MFMA-based kernel: fp8 ``v_mfma_f32_16x16x32_fp8_fp8`` Q.K.
 
     One wave64 per query row (grid ``(seq_len,)``), reverse row order. For each
@@ -268,16 +269,20 @@ def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int):
     N_TILES = BKV // 16        # KV column-tiles
     K_STEPS = D // 32          # K32 MFMA steps over the head dim
 
-    fp8_dt = _fp8_dtype()
     fm_fast = arith.FastMathFlags.fast
     mfma_fn = rocdl.mfma_f32_16x16x32_fp8_fp8
 
-    _kname = f"fp8_mqa_logits_H{H}_D{D}_bkv{BKV}_mfma_flydsl"
+    _cvt_tag = ""
+    if convert_q_fn:
+        _cvt_tag += "_cq"
+    if convert_kv_fn:
+        _cvt_tag += "_ck"
+    _kname = f"fp8_mqa_logits_H{H}_D{D}_bkv{BKV}_mfma{_cvt_tag}_flydsl"
 
     @flyc.kernel(name=_kname, known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
-        Q: fx.Tensor,  # [seq_len, H, D]      fp8
-        KV: fx.Tensor,  # [seq_len_kv, D]      fp8
+        Q: fx.Tensor,  # [seq_len, H, D]      fp8 (any variant; bytes passed raw)
+        KV: fx.Tensor,  # [seq_len_kv, D]      fp8 (any variant; bytes passed raw)
         kv_scales: fx.Tensor,  # [seq_len_kv]         f32
         weights: fx.Tensor,  # [seq_len, H]         f32
         cu_starts: fx.Tensor,  # [seq_len]            i32
@@ -330,6 +335,63 @@ def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int):
             v2 = i32_view.vec_load((dword_off,), vec_size=2)
             return Vec(v2).bitcast(fx.Int64)[0].ir_value()
 
+        # ---- FN -> FNUZ in-kernel byte conversion ----
+        #
+        # For all 256 byte values, the FN and FNUZ encodings satisfy
+        # FNUZ_value(byte) == FN_value(byte) / 2 exactly — so the raw FN
+        # bytes can be passed directly to the FNUZ MFMA and the 2x factor
+        # compensated via kv_scales. The conversion is thus an identity
+        # for 253/256 byte patterns.
+        #
+        # The one exception is byte 0x80:
+        #   FN:   0x80 = negative zero (-0.0)  ->  mathematically zero
+        #   FNUZ: 0x80 = NaN                   ->  corrupts MFMA output
+        #
+        # A single NaN in the 128-element dot product poisons the entire
+        # accumulator element.
+        #
+        # Fix: map 0x80 -> 0x00 (FNUZ +0). For all other bytes the identity
+        # mapping is correct. This is done per i32 (4 bytes at a time) with
+        # byte-lane arithmetic to avoid branches.
+        def _fn_to_fnuz_i64(raw_i64):
+            """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes.
+
+            Implementation: extract each byte, compare to 0x80, select 0x00
+            if equal, else keep original. Rebuild the i64 from 8 cleaned
+            bytes.
+            """
+            lo_i32 = arith.TruncIOp(T.i32, raw_i64).result
+            hi_i64 = arith.ShRUIOp(raw_i64, arith.constant(32, type=T.i64),).result
+            hi_i32 = arith.TruncIOp(T.i32, hi_i64).result
+
+            def _fix_i32(src):
+                """Fix 0x80 bytes in one i32 (4 fp8 bytes)."""
+                result = arith.constant(0, type=T.i32)
+                for byte_idx in range_constexpr(4):
+                    shift = arith.constant(byte_idx * 8, type=T.i32)
+                    byte_val = arith.andi(
+                        arith.shrui(src, shift),
+                        arith.constant(0xFF, type=T.i32),
+                    )
+                    is_0x80 = arith.cmpi(
+                        arith.CmpIPredicate.eq,
+                        byte_val,
+                        arith.constant(0x80, type=T.i32),
+                    )
+                    cleaned = arith.select(
+                        is_0x80,
+                        arith.constant(0, type=T.i32),
+                        byte_val,
+                    )
+                    result = arith.ori(result, arith.shli(cleaned, shift))
+                return result
+
+            lo_fix = _fix_i32(lo_i32)
+            hi_fix = _fix_i32(hi_i32)
+            lo_64 = arith.ExtUIOp(T.i64, lo_fix).result
+            hi_64 = arith.ShLIOp(arith.ExtUIOp(T.i64, hi_fix).result, arith.constant(32, type=T.i64),).result
+            return arith.OrIOp(lo_64, hi_64).result
+
         # ---- preload A (Q) operands: per (mi, kk) one i64 of 8 fp8 along D ----
         # lane l -> Q[row, h = mi*16 + lane%16, d = kk*32 + (lane//16)*8 + 0..7]
         a_packs = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
@@ -340,7 +402,8 @@ def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int):
             base_b = fx.Int32(arith.muli(_to_raw(row_h), _to_raw(fx.Int32(D))))
             for kk in range_constexpr(K_STEPS):
                 d_a = _i32_add(fx.Int32(kk * 32), lane8)
-                a_packs[mi][kk] = _load_pack_i64(q_i32, _i32_add(base_b, d_a))
+                raw = _load_pack_i64(q_i32, _i32_add(base_b, d_a))
+                a_packs[mi][kk] = _fn_to_fnuz_i64(raw) if convert_q_fn else raw
 
         # weights[row, h] preloaded per (mi, ii) head owned by this lane.
         # head = mi*16 + lane_div_16*4 + ii
@@ -382,7 +445,8 @@ def _build_kernel_mfma(*, num_heads: int, head_size: int, block_kv: int):
                 base_b = fx.Int32(arith.muli(_to_raw(n_b), _to_raw(fx.Int32(D))))
                 for kk in range_constexpr(K_STEPS):
                     d_b = _i32_add(fx.Int32(kk * 32), lane8)
-                    b_packs[ni][kk] = _load_pack_i64(kv_i32, _i32_add(base_b, d_b))
+                    raw = _load_pack_i64(kv_i32, _i32_add(base_b, d_b))
+                    b_packs[ni][kk] = _fn_to_fnuz_i64(raw) if convert_kv_fn else raw
 
             # MFMA: acc[mi][ni] = sum_kk A[mi][kk] . B[ni][kk]
             for ni in range_constexpr(N_TILES):
@@ -540,6 +604,8 @@ def compile_fp8_mqa_logits(
     block_kv: int = 128,
     paged: bool = False,
     variant: str = DEFAULT_VARIANT,
+    convert_q_fn: bool = False,
+    convert_kv_fn: bool = False,
 ):
     """Return a cached, compiled FlyDSL launcher for the given shape config.
 
@@ -557,6 +623,12 @@ def compile_fp8_mqa_logits(
         Which kernel version to build (see ``KERNEL_VARIANTS``). ``"mfma"`` is the
         fp8-MFMA matrix-core baseline; ``"scalar"`` is the ``v_cvt_f32_fp8``
         correctness-first fallback.
+    convert_q_fn : bool
+        If True, Q data is in FP8 FN encoding and the kernel converts bytes
+        to FNUZ in-register before the MFMA (only applies to ``"mfma"``).
+    convert_kv_fn : bool
+        If True, KV data is in FP8 FN encoding and the kernel converts bytes
+        to FNUZ in-register before the MFMA (only applies to ``"mfma"``).
     """
     if paged:
         raise NotImplementedError(
@@ -568,9 +640,16 @@ def compile_fp8_mqa_logits(
             f"available: {list(KERNEL_VARIANTS)}"
         )
     builder = _VARIANT_BUILDERS[variant]
-    launcher = builder(
-        num_heads=num_heads, head_size=head_size, block_kv=block_kv
-    )
+    # Only the mfma builder accepts convert flags; others ignore them.
+    if variant == "mfma":
+        launcher = builder(
+            num_heads=num_heads, head_size=head_size, block_kv=block_kv,
+            convert_q_fn=convert_q_fn, convert_kv_fn=convert_kv_fn,
+        )
+    else:
+        launcher = builder(
+            num_heads=num_heads, head_size=head_size, block_kv=block_kv,
+        )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
 
@@ -621,31 +700,53 @@ def flydsl_fp8_mqa_logits(
     cu_starts = cu_starts.reshape(seq_len)
     cu_ends = cu_ends.reshape(seq_len)
 
-    # A naive value-cast FN -> FNUZ would saturate any |x|>240.
-    # Instead, we halve before the cast: scaling by 0.5 only decrements the
-    # exponent, so the result is <= 224 < 240 — no saturation, no precision loss.
-    # The logit is linear in Q·K (ReLU is positive-homogeneous), so we undo the
-    # factor(s) by scaling kv_scales accordingly.
+    # The gfx942 fp8 MFMA (v_mfma_f32_16x16x32_fp8_fp8) always interprets
+    # operands as e4m3 FNUZ (bias 8). When Q or KV arrive in e4m3 FN (OCP,
+    # bias 7, max 448), two corrections are needed:
+    #   1. In-kernel byte conversion: dequant-as-FNUZ × 2 -> requant-to-FNUZ
+    #      recovers the true FN value in FNUZ encoding for 255/256 byte patterns
+    #      (only 0x80 = FN -0 -> FNUZ NaN differs; values > 240 saturate).
+    #   2. kv_scales compensation: multiply by 2 per FN operand. Since
+    #      logits = sum_h ReLU(QK x scale) x w and ReLU is pos-homogeneous,
+    #      this compensates the systematic 2x factor from the FN/FNUZ bias diff.
+    # Combined, in-kernel conversion handles the per-byte encoding while
+    # kv_scales compensation handles the overall numeric factor.
+    # The 'mfma' lernel variant does in-kernel halve-and-requant:
+    # dequant-as-FNUZ (= FN_value/2) * 0.5 → requant-to-FNUZ, keeping all
+    # values ≤ 120 < 240 (safely within FNUZ range). The 2x factor per FN
+    # operand is compensated via kv_scales. Non-mfma variants fall back to
+    # the host-side halve-before-cast.
     _fnuz = torch.float8_e4m3fnuz
+    convert_q_fn = Q.dtype != _fnuz
+    convert_kv_fn = KV.dtype != _fnuz
     scale_mul = 1.0
-    if Q.dtype != _fnuz:
-        assert Q.dtype == torch.float8_e4m3fn, f"Q must be e4m3fn, got {Q.dtype}"
-        Q = (Q.to(torch.float32) * 0.5).to(_fnuz)
+    if convert_q_fn:
         scale_mul *= 2.0
-    if KV.dtype != _fnuz:
-        assert KV.dtype == torch.float8_e4m3fn, f"KV must be e4m3fn, got {KV.dtype}"
-        KV = (KV.to(torch.float32) * 0.5).to(_fnuz)
+    if convert_kv_fn:
         scale_mul *= 2.0
     if scale_mul != 1.0:
         kv_scales = kv_scales.to(torch.float32) * scale_mul
 
     variant = _resolve_variant(variant)
+
+    # For non-mfma variants (e.g. scalar), fall back to host-side conversion
+    # since they don't have in-kernel FN→FNUZ support.
+    if variant != "mfma" and (convert_q_fn or convert_kv_fn):
+        if convert_q_fn:
+            Q = (Q.to(torch.float32) * 0.5).to(_fnuz)
+        if convert_kv_fn:
+            KV = (KV.to(torch.float32) * 0.5).to(_fnuz)
+        convert_q_fn = False
+        convert_kv_fn = False
+
     launcher = compile_fp8_mqa_logits(
         num_heads=num_heads,
         head_size=head_size,
         block_kv=128,
         paged=False,
         variant=variant,
+        convert_q_fn=convert_q_fn,
+        convert_kv_fn=convert_kv_fn,
     )
 
     # Match the Triton launcher's -inf-prefill / padding behavior so the two
