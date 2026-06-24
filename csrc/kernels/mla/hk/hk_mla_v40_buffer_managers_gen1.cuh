@@ -495,7 +495,10 @@ class QManager8to16bitsV1
     // RoPE region. Unlike NoPE (cvt-at-store from fp8), RoPE is already bf16,
     // but we must fold the softmax temperature (sm_scale*log2e) in, so this
     // can no longer be a direct vmem->LDS copy: load to VGPR, scale each bf16
-    // pair, then ds_write_b128 to the same swizzled LDS slots.
+    // pair, then ds_write_b128 to the same swizzled LDS slots. (The scale is
+    // folded HERE, in the stage, not at the prologue VGPR read -- a scale-at-read
+    // path was tried and perturbed the kernel schedule enough to re-expose a
+    // latent split_out race, so it was dropped.)
     __device__ __forceinline__ static void p2_load_rope_chunk(const q_rope_t* p_q_rope_warp,
                                                               const uintptr_t p_lds_q,
                                                               const uint32_t warp_idx,
@@ -509,25 +512,16 @@ class QManager8to16bitsV1
         const uint32_t row_in_warp = lane_idx >> 2; // 0..15
         const uint32_t col_quad    = lane_idx & 3u; // 0..3
 
-        constexpr uint32_t kVStride = kSubBlockCols * sizeof(q_rope_t); // 64
-
         // Row-conditional half-swap (vmem-load side, RoPE): swap col_quad
         // halves (XOR bit 1) on sub-tile-rows 1 & 3 (rows 4..7 and 12..15).
-        // buffer_load_lds has HW-fixed LDS dst, so RoPE must do Method 2
-        // (vmem-side swap) even though the NoPE writer uses Method 1 -- both
-        // still target the same swizzle row pattern.
         const uint32_t col_quad_swz = col_quad ^ (((row_in_warp >> 2) & 1u) << 1);
 
-        // Sub-tile-of-8 perm [0,2,4,6,1,3,5,7] (vmem-src side, since the LDS
-        // dst is HW-fixed by buffer_load_lds). LDS layout maps (sb_in_chunk,
-        // col_quad) -> LDS sub-tile sb*4 + col_quad. Under the perm we want
-        //   LDS sub-tile k  <-  data sub-tile perm^{-1}(k)
-        // which means (sb=0, q) <- data sub-tile 2q (cols 16q..+7) and
-        //             (sb=1, q) <- data sub-tile 2q+1 (cols 16q+8..+15).
-        // Both lo & hi share v_off base = row*kRopeStride + col_quad*32 B;
-        // hi adds +16 B in the gmem source. With an explicit ds_write (vs the
-        // old buffer_load_lds) the LDS dst is addressed directly, so the +16
-        // is applied only to the gmem offset (s_os) and the two halves land at
+        // Sub-tile-of-8 perm [0,2,4,6,1,3,5,7] (vmem-src side). LDS sub-tile k
+        // <- data sub-tile perm^{-1}(k): (sb=0, q) <- data cols 16q..+7,
+        // (sb=1, q) <- data cols 16q+8..+15. Both lo & hi share v_off base =
+        // row*kRopeStride + col_quad_swz*32 B; the hi half adds +16 B in the gmem
+        // source. The explicit ds_write addresses the LDS dst directly, so the
+        // +16 applies only to the gmem offset (s_os) and the two halves land at
         // their natural swizzled LDS slots.
         const uint32_t v_off_lo = row_in_warp * kRopeStride + col_quad_swz * 32u;
 
@@ -536,12 +530,10 @@ class QManager8to16bitsV1
         const uintptr_t p_dst_lo = p_lds_q + sub_block_byte_offset(warp_idx, kColTileLo) + lds_off;
         const uintptr_t p_dst_hi = p_lds_q + sub_block_byte_offset(warp_idx, kColTileHi) + lds_off;
 
-        // Process each 16-B half independently (load -> scale -> ds_write)
-        // before touching the next, so only one u32x4 + its fp32 temps are live
-        // at a time -- keeps the compiler scratch footprint inside the
-        // amdgpu_num_vgpr(64) budget (this runs in load_q, outside the pinned
-        // hot loop, but its scratch still shares v0..v63). Byte-addressed gmem
-        // (uint8) so v_off_lo / the +16 stay in bytes; load<16> pulls 16 B.
+        // Process each 16-B half independently (load -> scale -> ds_write) before
+        // touching the next, so only one u32x4 + its fp32 temps are live at a
+        // time. Byte-addressed gmem (uint8) so v_off_lo / the +16 stay in bytes;
+        // load<16> pulls 16 B.
         auto g_q_rope =
             opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_rope_warp));
         auto scale_and_store = [&](uint32_t s_os, uintptr_t p_dst) {
@@ -732,6 +724,7 @@ class QManager8to16bitsV1
         const uintptr_t p_lds_q_lane = p_lds_q + warp_idx * kWarpFinalBytes + in_sb_byte;
         hkm::ds_read_b128<range_type::lo>(static_cast<uint32_t>(p_lds_q_lane), kColTileBytes);
     }
+
 };
 
 // V4.0 KV manager: per-token VMEM layout = NoPE 448 B FP8 + dup-E8M0 16 B

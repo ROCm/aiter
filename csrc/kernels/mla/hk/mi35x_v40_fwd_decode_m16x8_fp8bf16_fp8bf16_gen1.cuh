@@ -18,17 +18,16 @@ using namespace hk_mla;
 // boundary-checked prefetch). Comment out to fall back to the full ladder.
 #define MLA_SLIM_DISPATCH 1
 
-// Warp-index group. The 8 warps pair onto 4 SIMDs as (w, w+4) -- i.e. SIMD
-// pairs are {0,4},{1,5},{2,6},{3,7}. To stagger each SIMD's two warps (one
-// PV-at-end, one PV-deferred) we split by HALF, not parity. The DEFERRED path
-// goes to the Lo half (warps 0-3, all NoPE) so the RoPE owners' buffer_load_lds
-// never lands in a deferred PV's vmcnt window; the Hi half (4-7, incl RoPE 5,7)
-// keeps PV at call end. See kPvAtEnd for the path mapping.
+// Warp-index group. PV is always at call end for every warp; the only
+// compile-time distinction that matters is whether the warp is a RoPE owner
+// (warps 5,7) -- those run the buffer_load_lds RoPE prefetch path. The NoPE
+// split (Lo/Hi) is vestigial but kept so the per-warp-type dispatch and the
+// SIMD-pairing comments stay stable.
 enum class WarpType : uint8_t
 {
-    LoNoPEWarp, // warps 0-3: PV-deferred path, all NoPE
-    HiNoPEWarp, // warps 4,6: PV-at-end path, NoPE
-    HiRoPEWarp  // warps 5,7: PV-at-end path, RoPE owner
+    LoNoPEWarp, // warps 0-3: NoPE
+    HiNoPEWarp, // warps 4,6: NoPE
+    HiRoPEWarp  // warps 5,7: RoPE owner
 };
 
 // ---- Shared pinned-VGPR register map (per-lane) ----
@@ -52,9 +51,17 @@ struct HkMlaV40Regs
     static constexpr uint32_t mfma_tile_sz = 4; // one 16x32 bf16 base tile
 
     // # of QK col-tiles whose Q comes from the contiguous q_vgpr block (the rest
-    // come from LDS). = 2 * (# NoPE chunks in VGPR). Single knob for the
-    // incremental NoPE->VGPR migration: 10 (0:320), 12 (0:384), 14 (all NoPE).
-    static constexpr uint32_t kQkGemmTiles = 10;
+    // come from LDS). Migration knob: 10 (0:320), 12 (0:384), 14 (all NoPE),
+    // 16 (all NoPE + RoPE -> NOTHING from LDS in the QK loop).
+    static constexpr uint32_t kQkGemmTiles = 16;
+    // # of 64-col NoPE chunks loaded into VGPR by load_q (cols 0:448 = 7 chunks).
+    // Decoupled from kQkGemmTiles because chunk 7 (col-tiles 14,15) is RoPE: a
+    // separate bf16 tensor, staged to LDS then read into VGPR in the prologue
+    // (not via load_q's fp8 p1 path).
+    static constexpr uint32_t kNumNopeVgprChunks = 7;
+    // RoPE (col-tiles 14,15 / cols 448:512) lives in VGPR (read from Q-LDS in the
+    // prologue) iff the QK loop sources all 16 col-tiles from VGPR.
+    static constexpr bool kRopeInVgpr = (kQkGemmTiles >= 16u);
 
     static constexpr uint32_t k_o_end        = 255;
     static constexpr uint32_t k_o_begin      = k_o_end - k_o_sz + 1;             // 128
@@ -123,14 +130,14 @@ struct HkMlaV40Regs
     using oaccu_t = hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges>;
 };
 
-// ---- PV GEMM stage (extracted so even/odd orchestrators share one body) ----
+// ---- PV GEMM stage ----
 //
 // O = P @ V computed as oaccu^T = V^T @ P^T via mma_ABt(oaccu, V, p_mfma).
 // V streams as 32 base tiles S_0..S_31 through a 3-deep round-robin
 // pv_v_0/pv_v_1/pv_v_2 (S_j -> slot j%3, 6 ds_read_b64 in flight). p_lds_v is
-// the V pong (curr for the even path; the prior call's next-pong for the rotated
-// odd path). kDoRescale folds the online-softmax oaccu rescale; kIsFirstIter
-// inits oaccu fresh (3-arg mma) and never rescales.
+// the V pong (curr-pong; PV runs at call end). kDoRescale folds the
+// online-softmax oaccu rescale; kIsFirstIter inits oaccu fresh (3-arg mma) and
+// never rescales.
 template <bool kIsFirstIter, bool kDoRescale, typename T>
 __device__ __forceinline__ void
 hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v, const float rescale)
@@ -285,13 +292,6 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
     // Compile-time warp type (chosen by the __global__ wrapper's entry divergence).
     constexpr bool kIsRopeWarp = (kWarpType == WarpType::HiRoPEWarp);
-    // kPvAtEnd: Hi group (warps 4-7, incl RoPE owners 5,7) keeps PV at call end;
-    // Lo group (warps 0-3, all NoPE) defers PV by one tile so its prefetch+SALU
-    // overlaps the Hi sibling's PV. The deferred path is given to Lo (NoPE-only)
-    // so the RoPE warps' buffer_load_lds never collides with a deferred PV in the
-    // prefetch's vmcnt window. SIMD pairs (w, w+4) still get one of each path.
-    constexpr bool kPvAtEnd = (kWarpType != WarpType::LoNoPEWarp);
-    (void)kPvAtEnd;
 
     constexpr comp_t log2e = 1.4426950408889634;
 
@@ -524,11 +524,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         comp_t row_max;
         comp_t row_sum_e;
         // rescale / do_rescale are produced by each tile's softmax and consumed
-        // by its PV. Hoisted to work-item scope so the ODD (rotated) path can
-        // read the PREVIOUS tile's values in the next call's deferred PV; the
-        // softmax assigns (not declares) them, so the deferred PV reads the prior
-        // tile's values before the current softmax overwrites them. Even path:
-        // set + used in the same call, so the hoist is inert.
+        // by its PV at call end (same call), so these could be call-local; kept
+        // at work-item scope for stable codegen.
         comp_t rescale  = 1.0f;
         bool do_rescale = false;
 
@@ -570,7 +567,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         // (softmax_scale_p -> softmax_mask_p) and its log2e multiply
         // (softmax_p1 -> softmax_p1_prescaled). Scores then arrive in log2 units.
         const float q_scale_log2 = params.softmax_scale * static_cast<float>(log2e);
-        q_manager.template load_q<k_q_vgpr_begin, R::kQkGemmTiles / 2u>(params.p_query,
+        q_manager.template load_q<k_q_vgpr_begin, R::kNumNopeVgprChunks>(params.p_query,
                                                   params.p_query_rope,
                                                   num_qheads,
                                                   warp_idx,
@@ -578,6 +575,33 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                                                   p_lds_q,
                                                   q_scale_log2);
         __builtin_amdgcn_sched_barrier(0);
+
+        // ---- RoPE (col-tiles 14,15) -> pinned q_vgpr (v120:127), prologue read ----
+        // load_q staged RoPE (cols 448:512) into Q-LDS slots 6,7 (same swizzled
+        // P2 layout as the NoPE LDS chunks), with sm_scale*log2e already folded
+        // in. Read it ONCE here into the top of the q_vgpr block so the QK loop
+        // sources all 16 col-tiles from VGPR with no per-tile Q-LDS traffic. RoPE
+        // Q-LDS is wave-private, so an lgkmcnt drain (not a cross-wave barrier)
+        // orders the p2_load_rope_chunk ds_writes before these ds_reads.
+        if constexpr(R::kRopeInVgpr)
+        {
+            __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
+            __builtin_amdgcn_sched_barrier(0);
+            constexpr uint32_t q_rope_0_base = k_q_vgpr_begin + 14u * 4u; // 120
+            constexpr uint32_t q_rope_1_base = k_q_vgpr_begin + 15u * 4u; // 124
+            using q_rope_0_range = hkdart::split_many_t<
+                hkdart::type_list<hkdart::range<q_rope_0_base, q_rope_0_base + 3u>>, 4>;
+            using q_rope_1_range = hkdart::split_many_t<
+                hkdart::type_list<hkdart::range<q_rope_1_base, q_rope_1_base + 3u>>, 4>;
+            hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_rope_0_range>
+                q_rope_0;
+            hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_rope_1_range>
+                q_rope_1;
+            q_manager.template load_q_lds_to_gpr<6u>(q_rope_0, p_lds_q, warp_idx);
+            q_manager.template load_q_lds_to_gpr<7u>(q_rope_1, p_lds_q, warp_idx);
+            __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
+            __builtin_amdgcn_sched_barrier(0);
+        }
 
         // Prologue: prefetch + cvt+store the first KV tile into the curr pong.
         // kCheckBoundary is true when the tile straddles the batch tail.
@@ -623,21 +647,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             constexpr bool kIsGlobalLast = kSkipCompute || kDoEpilogue;
             (void)kv_tile_end;
 
-            // ODD (rotated) path: PV is deferred one tile so this call's
-            // prefetch+SALU overlaps the EVEN sibling wave's PV on the shared
-            // SIMD. A deferred PV (of the PREVIOUS tile) runs at call start for
-            // every call that has a not-yet-PV'd prior tile -- all but the
-            // warp's first compute call and the fully-idle skip call.
-            constexpr bool kHasPv = (!kPvAtEnd) && (!kIsFirstIter) &&
-                                    ((!kSkipCompute) || kDoEpilogue);
-            // The deferred first PV uses the accumulate path (3-arg init is
-            // even-only), so the odd path zeroes oaccu once on its first compute
-            // call instead of relying on PV's init. row_max/row_sum_e are still
-            // initialised by the kIsFirstIter softmax below, shared with even.
-            if constexpr((!kPvAtEnd) && kIsFirstIter)
-            {
-                hk::zero(oaccu);
-            }
+            // PV is always at call end (deferred-PV rotation removed). All warps
+            // use the 3-arg init mfma on the first compute iter (no oaccu zero).
 
             static_assert((kSkipCompute == false) || (kIsFirstIter == false),
                           "A skipped iter cannot be the warp's first compute iter.");
@@ -650,15 +661,6 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             if constexpr(kIsGlobalLast == false)
             {
                 row_kv_ld_next = row_kv_ld_next_next;
-                // Deferred-PV (Lo) group: hoist the page-table resolve for the
-                // tile AFTER next to call start (only needs kv_tile_start, no QK
-                // result) so its buffer_load overlaps this call's deferred PV +
-                // QK and the NEXT call's prefetch reads the row without a stall.
-                // PV-at-end (Hi) group keeps it late (below).
-                if constexpr(!kPvAtEnd)
-                {
-                    row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
-                }
             }
 
             // ---- Phase A: prefetch NEXT tile into the next-pong ----
@@ -686,18 +688,6 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                     warp_idx, params.p_kv_buffer, row_kv_ld_next, p1);
             }
 
-            // ---- ODD deferred PV (of the PREVIOUS tile) ----
-            // Issued AFTER this call's prefetch so the prefetch+SALU lands while
-            // the even sibling wave is mid-PV. Reads the previous tile's V from
-            // p_lds_kv_next (left there by the prior call's swap, still alive --
-            // this call's cvt+store has not run yet) and the previous tile's
-            // p_mfma / rescale / do_rescale (pinned regs + hoisted scalars, not
-            // yet overwritten by this call's QK/softmax). Accumulate path only.
-            if constexpr(kHasPv)
-            {
-                hk_mla_v40_pv_stage<false, T>(kv_manager, p_lds_kv_next, rescale, do_rescale);
-            }
-
             // Drain the NoPE prefetches enough to leave only this iter's own
             // prologue loads pending, then cross-warp barrier so KV LDS
             // sub-blocks are visible to QK reads. RoPE-owner waves issued 2
@@ -723,8 +713,16 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             {
                 constexpr uint32_t kBK             = T::kBlockK;
                 constexpr uint32_t kNumColTilesAll = T::kQkHeadDim / T::kBlockK; // 16
+                // Q-from-LDS scratch tile (used by the else branch when some
+                // col-tiles still source from LDS). At kQkGemmTiles==16 EVERY
+                // col-tile is in VGPR so the else branch is dead (dependent-
+                // discarded, never instantiated) and this art is unused -- base
+                // it at k_q_vgpr_begin then so it can't alias oaccu (the natural
+                // k_q_lds_begin==128 would).
+                constexpr uint32_t q_lds_art_base =
+                    (kQkGemmTiles < kNumColTilesAll) ? k_q_lds_begin : k_q_vgpr_begin;
                 using q_lds_range_0 = hkdart::split_many_t<
-                    hkdart::type_list<hkdart::range<k_q_lds_begin, k_q_lds_begin + 3u>>, 4>;
+                    hkdart::type_list<hkdart::range<q_lds_art_base, q_lds_art_base + 3u>>, 4>;
                 hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_lds_range_0>
                     q_lds_0;
 
@@ -825,12 +823,11 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             __builtin_amdgcn_s_setprio(2);
 
             // ---- Update row_kv_ld_next_next for the call AFTER this one ----
-            // PV-at-end (Hi) group only: resolve here, just after the QK phase;
-            // its buffer_load overlaps softmax + the end-PV before the next
-            // call's prefetch. The deferred (Lo) group already resolved at call
-            // start (above). resolve_row_kv_ld returns -1 past the global end --
-            // the subsequent boundary-checked prefetch suppresses that load.
-            if constexpr((kIsGlobalLast == false) && kPvAtEnd)
+            // Resolve here, just after the QK phase; its buffer_load overlaps
+            // softmax + the end-PV before the next call's prefetch.
+            // resolve_row_kv_ld returns -1 past the global end -- the subsequent
+            // boundary-checked prefetch suppresses that load.
+            if constexpr(kIsGlobalLast == false)
             {
                 row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
             }
@@ -914,13 +911,6 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 // forward unscaled.
                 softmax_p1_prescaled<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
 
-                if constexpr(kPvAtEnd == false)
-                {
-                    __builtin_amdgcn_sched_barrier(0);
-                    __builtin_amdgcn_s_setprio(0);
-                    __builtin_amdgcn_sched_barrier(0);
-                }
-
                 // ---- fp32->bf16 pack (p_comp -> p_mfma overlay) ----
                 // 8 fp32 (v120..v127) -> 4 bf16x2 dwords (v120..v123 overlay).
                 // Low-to-high pack order is hazard-free: each v_cvt_pk_bf16_f32
@@ -957,9 +947,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // Rescale schedule (kDoRescale only): prologue pk_mul_pair scales
             // iter 0's 8 oaccu vgprs; in-loop iter i scales iter (i+1)'s 8 vgprs
             // as 4 mul_pair hidden under the V-tile load latency.
-            // EVEN path: PV of THIS tile at call end (reads its own curr-pong V).
-            // Odd defers PV to the next call's start (above) / the epilogue.
-            if constexpr(kPvAtEnd && (kSkipCompute == false))
+            // PV of THIS tile at call end (reads its own curr-pong V).
+            if constexpr(kSkipCompute == false)
             {
                 hk_mla_v40_pv_stage<kIsFirstIter, T>(kv_manager, p_lds_kv_curr, rescale,
                                                      do_rescale);
@@ -977,17 +966,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // work_idx's KV prologue writes to p_lds_kv_curr).
             if constexpr(kDoEpilogue)
             {
-                // ODD path drain: on the global-last call that ran a QK
-                // (!kSkipCompute), THIS tile's PV is still pending (the rotation
-                // defers PV by one). Do it now, reading V from p_lds_kv_curr
-                // (this tile; no swap on the global last). The kSkipCompute
-                // global-last case already drained the warp's last real tile via
-                // the deferred PV at call start (kHasPv), so it needs nothing
-                // here. Even path: PV already ran at call end.
-                if constexpr((!kPvAtEnd) && (kSkipCompute == false))
-                {
-                    hk_mla_v40_pv_stage<false, T>(kv_manager, p_lds_kv_curr, rescale, do_rescale);
-                }
+                // PV already ran at call end (above).
 
                 // ---- Attention-sink fold ----
                 // Apply on OutputFinal (single-split == global) OR on the
@@ -1398,10 +1377,9 @@ void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdPar
     const uint32_t warp_idx = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
 
     // Diverge on warp type ONCE at kernel entry so each type compiles as its own
-    // body (compile-time kWarpType, no runtime warp-idx branches inside). Split
-    // by HALF (warps 0-3 = Lo / PV-at-end, warps 4-7 = Hi / PV-deferred) so each
-    // SIMD's (w, w+4) pair gets one of each path and the PVs stagger. RoPE
-    // owners are 5,7 (both Hi).
+    // body (compile-time kWarpType, no runtime warp-idx branches inside). PV is
+    // at call end for every warp; the only functional split is RoPE-owner
+    // (warps 5,7) vs NoPE. The Lo/Hi NoPE split is vestigial.
     if(warp_idx < 4u)
     {
         mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpType::LoNoPEWarp>(params,
