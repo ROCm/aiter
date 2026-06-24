@@ -74,11 +74,21 @@ static int validate_topk_output_contract(const torch::Tensor& topk_weights,
                 total_topk,
                 ", num_fused_shared_experts=",
                 num_fused_shared_experts);
-    TORCH_CHECK(topk_ids.stride(0) >= total_topk && topk_weights.stride(0) >= total_topk,
-                "topk output row stride must include all output columns, got topk_ids.stride(0)=",
+    TORCH_CHECK(routed_topk <= static_cast<int>(WARP_SIZE),
+                "routed_topk (",
+                routed_topk,
+                ") exceeds WARP_SIZE (",
+                WARP_SIZE,
+                "); the grouped_topk kernels write one routed expert per lane and cannot "
+                "support more routed columns than a single warp");
+    TORCH_CHECK(topk_ids.stride(0) == topk_weights.stride(0),
+                "topk_ids and topk_weights must have the same row stride, got topk_ids.stride(0)=",
                 topk_ids.stride(0),
                 ", topk_weights.stride(0)=",
-                topk_weights.stride(0),
+                topk_weights.stride(0));
+    TORCH_CHECK(topk_ids.stride(0) >= total_topk,
+                "topk output row stride must include all output columns, got stride(0)=",
+                topk_ids.stride(0),
                 ", total_topk=",
                 total_topk);
     if(num_fused_shared_experts > 0)
@@ -1317,6 +1327,12 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
     int num_experts     = gating_output.size(1);
     int topk            = aiter::validate_topk_output_contract(
         topk_weights, topk_ids, num_fused_shared_experts, shared_expert_base);
+    TORCH_CHECK(topk <= num_experts,
+                "routed_topk (",
+                topk,
+                ") exceeds num_experts (",
+                num_experts,
+                ")");
     size_t stride_tk    = topk_ids.stride(0);
     TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
@@ -1368,6 +1384,12 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
     int num_experts     = gating_output.size(1);
     int topk            = aiter::validate_topk_output_contract(
         topk_weights, topk_ids, num_fused_shared_experts, shared_expert_base);
+    TORCH_CHECK(topk <= num_experts,
+                "routed_topk (",
+                topk,
+                ") exceeds num_experts (",
+                num_experts,
+                ")");
     size_t stride_tk     = topk_ids.stride(0);
     auto correction_bias = topk_ids;
     TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
