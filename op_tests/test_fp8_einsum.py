@@ -96,10 +96,7 @@ def build_inputs(H, D, R, B, dev, seed=0):
     sx_pow2 = torch.ldexp(torch.ones_like(sx_amax), sx_byte - 127)
     x_f32 = x_bf16.float().view(B, H, R // 128, 128)
     x_fp8 = (
-        (x_f32 / sx_pow2.unsqueeze(-1))
-        .clamp(-448, 448)
-        .to(dtypes.fp8)
-        .view(B, H, R)
+        (x_f32 / sx_pow2.unsqueeze(-1)).clamp(-448, 448).to(dtypes.fp8).view(B, H, R)
     )
     sx_i32 = _pack_ue8m0(sx_byte)
     x_ref = (x_fp8.float().view(B, H, R // 128, 128) * sx_pow2.unsqueeze(-1)).view(
