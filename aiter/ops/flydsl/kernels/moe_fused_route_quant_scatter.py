@@ -744,6 +744,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
     *,
     use_expert_row_base: bool = True,
     max_m: int = 0,
+    emit_m_tile_map: bool = False,
 ):
     """Single-token K-split stage1 route+quant+scatter+preshuffle kernel.
 
@@ -791,9 +792,10 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
     k_groups = L.block_iters
 
     base_tag = "baseptr" if use_expert_row_base else f"basem{max_m}"
+    map_tag = "mtmap" if emit_m_tile_map else "nomap"
     module_name = (
         f"moe_fused_route_quant_scatter_stks_md{model_dim}_tk{topk}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{base_tag}"
+        f"_{quant_mode}_{L.native_tag}_{base_tag}_{map_tag}"
     )
 
     @flyc.kernel(name=module_name)
@@ -805,6 +807,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         grouped_payload: fx.Tensor,  # out
         grouped_scale: fx.Tensor,  # out
         expert_row_base: fx.Tensor,  # (E,) int32
+        m_tile_map: fx.Tensor,  # compact active tile map, optional
         numel: Int32,  # == topk for this specialization
     ):
         i32 = T.i32
@@ -857,6 +860,13 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             if is_lane0_k0:
                 counter_rsrc = buffer_ops.create_buffer_resource(counter, max_size=True)
                 buffer_ops.buffer_store(c1_i32, counter_rsrc, expert)
+                if const_expr(emit_m_tile_map):
+                    map_rsrc = buffer_ops.create_buffer_resource(
+                        m_tile_map, max_size=True
+                    )
+                    # token_num==1 + topk from topk() => selected experts are
+                    # distinct, each active expert owns exactly one M tile.
+                    buffer_ops.buffer_store(expert * c_max_m, map_rsrc, route)
 
             if const_expr(use_expert_row_base):
                 erb_rsrc = buffer_ops.create_buffer_resource(
@@ -941,6 +951,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         grouped_payload: fx.Tensor,
         grouped_scale: fx.Tensor,
         expert_row_base: fx.Tensor,
+        m_tile_map: fx.Tensor,
         numel: fx.Int32,
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -955,6 +966,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             grouped_payload,
             grouped_scale,
             expert_row_base,
+            m_tile_map,
             numel,
         ).launch(
             grid=(grid_x, grid_y, 1),

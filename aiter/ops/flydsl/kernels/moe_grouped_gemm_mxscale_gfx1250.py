@@ -61,6 +61,7 @@ class _GroupedA8W4Config:
     use_scale_opsel: bool
     expert_sched_mode: bool
     grouped_persistent_m: bool = True
+    grouped_compact_m: bool = False
     grouped_contiguous_m: bool = False
     persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
@@ -111,6 +112,10 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
             raise ValueError(
                 "grouped_contiguous_m currently requires cluster_m=cluster_n=1"
             )
+    if cfg.grouped_compact_m and (
+        cfg.grouped_persistent_m or cfg.grouped_contiguous_m
+    ):
+        raise ValueError("grouped_compact_m requires non-persistent masked mode")
 
 
 def _to_int(value) -> int:
@@ -996,6 +1001,7 @@ def _compile_base_a8w4_gemm(
         batch_count=cfg.experts,
         grouped_masked_m=True,
         grouped_persistent_m=cfg.grouped_persistent_m,
+        grouped_compact_m=cfg.grouped_compact_m,
         grouped_contiguous_m=cfg.grouped_contiguous_m,
         persistent_workers=cfg.persistent_workers,
         stage1_act=stage1_act,
@@ -1029,6 +1035,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     grouped_persistent_m: bool = True,
+    grouped_compact_m: bool = False,
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     act: str = "silu",
@@ -1057,6 +1064,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         use_scale_opsel=bool(use_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode),
         grouped_persistent_m=bool(grouped_persistent_m),
+        grouped_compact_m=bool(grouped_compact_m),
         grouped_contiguous_m=bool(grouped_contiguous_m),
         persistent_workers=persistent_workers,
         data_format=str(data_format),
@@ -1169,6 +1177,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _gemm_events=None,
         _m_tile_prefix=None,
         _m_tile_map=None,
+        _m_tile_bound=None,
         _tmp=None,
         _skip_epilogue=False,
         bias=None,
@@ -1226,12 +1235,10 @@ def compile_moe_grouped_gemm1_a8w4_masked(
             else tmp
         )
         if cfg.grouped_persistent_m:
-            m_tile_prefix = _m_tile_prefix
-            if m_tile_prefix is None:
-                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
-            m_tile_map = _m_tile_map
-            if m_tile_map is None:
-                m_tile_map = _make_m_tile_map(masked_m, cfg, m_tile_prefix)
+            # DeepGemm persistent: kernel loads all masked_m once into SSA
+            # prefix values. No host preprocessing or scratch allocation.
+            m_tile_prefix = masked_m
+            _unused_map = masked_m
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if use_fused_gemm:
@@ -1246,7 +1253,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         bias,
                         masked_m,
                         m_tile_prefix,
-                        m_tile_map,
+                        _unused_map,
                         cfg.max_m,
                         fused_n,
                         stream,
@@ -1261,7 +1268,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         scale_w,
                         masked_m,
                         m_tile_prefix,
-                        m_tile_map,
+                        _unused_map,
                         cfg.max_m,
                         fused_n,
                         stream,
@@ -1278,7 +1285,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         bias,
                         masked_m,
                         m_tile_prefix,
-                        m_tile_map,
+                        _unused_map,
                         cfg.max_m,
                         2 * cfg.inter_dim,
                         stream,
@@ -1293,7 +1300,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         scale_w,
                         masked_m,
                         m_tile_prefix,
-                        m_tile_map,
+                        _unused_map,
                         cfg.max_m,
                         2 * cfg.inter_dim,
                         stream,
@@ -1380,8 +1387,86 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
+        elif cfg.grouped_compact_m and _m_tile_map is not None and _m_tile_bound is not None:
+            # Route-fused compact masked schedule: route kernel already filled
+            # m_tile_map, and active tile count is known from routes.
+            _unused_m_tile_prefix = masked_m
+            active_m_tiles = int(_m_tile_bound)
+            if _gemm_events is not None:
+                _gemm_events[0].record(stream)
+            if use_fused_gemm:
+                if bias is not None:
+                    _run_compiled(
+                        fused_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        bias,
+                        masked_m,
+                        _unused_m_tile_prefix,
+                        _m_tile_map,
+                        active_m_tiles,
+                        cfg.max_m,
+                        fused_n,
+                        stream,
+                    )
+                else:
+                    _run_compiled(
+                        fused_gemm,
+                        y,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        masked_m,
+                        _unused_m_tile_prefix,
+                        _m_tile_map,
+                        active_m_tiles,
+                        cfg.max_m,
+                        fused_n,
+                        stream,
+                    )
+            else:
+                if bias is not None:
+                    _run_compiled(
+                        _get_raw_base_bias(),
+                        gemm_tmp,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        bias,
+                        masked_m,
+                        _unused_m_tile_prefix,
+                        _m_tile_map,
+                        active_m_tiles,
+                        cfg.max_m,
+                        2 * cfg.inter_dim,
+                        stream,
+                    )
+                else:
+                    _run_compiled(
+                        _get_raw_base(),
+                        gemm_tmp,
+                        x,
+                        w,
+                        scale_x,
+                        scale_w,
+                        masked_m,
+                        _unused_m_tile_prefix,
+                        _m_tile_map,
+                        active_m_tiles,
+                        cfg.max_m,
+                        2 * cfg.inter_dim,
+                        stream,
+                    )
+            if _gemm_events is not None:
+                _gemm_events[1].record(stream)
         else:
-            # Dense mode: prefix/map unused, pass placeholders for ABI compat.
+            # Dense non-persistent masked mode: no preprocessing. The kernel
+            # skips invalid expert tiles internally.
             _unused_m_tile_prefix = masked_m
             _unused_m_tile_map = masked_m
             if _gemm_events is not None:
@@ -1492,6 +1577,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
     grouped_persistent_m: bool = True,
+    grouped_compact_m: bool = False,
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     data_format: str = "a8w4",
@@ -1518,6 +1604,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         use_scale_opsel=bool(use_scale_opsel),
         expert_sched_mode=bool(expert_sched_mode),
         grouped_persistent_m=bool(grouped_persistent_m),
+        grouped_compact_m=bool(grouped_compact_m),
         grouped_contiguous_m=bool(grouped_contiguous_m),
         persistent_workers=persistent_workers,
         data_format=str(data_format),
@@ -1563,6 +1650,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         _gemm_events=None,
         _m_tile_prefix=None,
         _m_tile_map=None,
+        _m_tile_bound=None,
         bias=None,
     ):
         """If `_gemm_events=(start, end)` is given, record around the GEMM
@@ -1594,12 +1682,10 @@ def compile_moe_grouped_gemm2_a8w4_masked(
             gemm_arg = y
         gemm = _get_base_bias() if bias is not None else _get_base()
         if cfg.grouped_persistent_m:
-            m_tile_prefix = _m_tile_prefix
-            if m_tile_prefix is None:
-                m_tile_prefix = _make_m_tile_prefix(masked_m, cfg)
-            m_tile_map = _m_tile_map
-            if m_tile_map is None:
-                m_tile_map = _make_m_tile_map(masked_m, cfg, m_tile_prefix)
+            # DeepGemm persistent: kernel loads all masked_m once into SSA
+            # prefix values. No host preprocessing or scratch allocation.
+            m_tile_prefix = masked_m
+            _unused_map = masked_m
             if _gemm_events is not None:
                 _gemm_events[0].record(stream)
             if bias is not None:
@@ -1613,7 +1699,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     bias,
                     masked_m,
                     m_tile_prefix,
-                    m_tile_map,
+                    _unused_map,
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
@@ -1628,7 +1714,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     scale_w,
                     masked_m,
                     m_tile_prefix,
-                    m_tile_map,
+                    _unused_map,
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
@@ -1679,8 +1765,49 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
+        elif cfg.grouped_compact_m and _m_tile_map is not None and _m_tile_bound is not None:
+            _unused_m_tile_prefix = masked_m
+            active_m_tiles = int(_m_tile_bound)
+            if _gemm_events is not None:
+                _gemm_events[0].record(stream)
+            if bias is not None:
+                _run_compiled(
+                    gemm,
+                    gemm_arg,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    bias,
+                    masked_m,
+                    _unused_m_tile_prefix,
+                    _m_tile_map,
+                    active_m_tiles,
+                    cfg.max_m,
+                    cfg.model_dim,
+                    stream,
+                )
+            else:
+                _run_compiled(
+                    gemm,
+                    gemm_arg,
+                    x,
+                    w,
+                    scale_x,
+                    scale_w,
+                    masked_m,
+                    _unused_m_tile_prefix,
+                    _m_tile_map,
+                    active_m_tiles,
+                    cfg.max_m,
+                    cfg.model_dim,
+                    stream,
+                )
+            if _gemm_events is not None:
+                _gemm_events[1].record(stream)
         else:
-            # Dense mode: prefix/map unused, pass placeholders for ABI compat.
+            # Dense non-persistent masked mode: no preprocessing. The kernel
+            # skips invalid expert tiles internally.
             _unused_m_tile_prefix = masked_m
             _unused_m_tile_map = masked_m
             if _gemm_events is not None:

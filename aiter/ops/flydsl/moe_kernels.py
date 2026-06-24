@@ -1697,6 +1697,7 @@ def _get_compiled_fused_route_quant_scatter_st_ksplit(
     quant_mode: str = "fp4",
     use_expert_row_base: bool = True,
     max_m: int = 0,
+    emit_m_tile_map: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_route_quant_scatter_st_ksplit_module,
@@ -1709,6 +1710,7 @@ def _get_compiled_fused_route_quant_scatter_st_ksplit(
         quant_mode=quant_mode,
         use_expert_row_base=use_expert_row_base,
         max_m=max_m,
+        emit_m_tile_map=emit_m_tile_map,
     )
 
 
@@ -1760,6 +1762,7 @@ def flydsl_moe_fused_route_quant_scatter(
     grouped_a1_scale: Optional[
         torch.Tensor
     ] = None,  # (out_E, out_max_m//wmma_rep, (model_dim//32)*wmma_rep) uint8 out
+    return_m_tile_map: bool = False,
 ):
     """Fused route+MX-quant+scatter+preshuffle in one pass.
 
@@ -1827,6 +1830,13 @@ def flydsl_moe_fused_route_quant_scatter(
     expert_row_base_arg = (
         expert_row_base.reshape(-1) if use_expert_row_base else counter
     )
+    use_st_ksplit = token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0
+    emit_m_tile_map = bool(return_m_tile_map and use_st_ksplit and not use_expert_row_base)
+    m_tile_map = (
+        torch.empty(numel, dtype=torch.int32, device=device)
+        if emit_m_tile_map
+        else counter
+    )
 
     if use_routeks_stage1:
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
@@ -1861,9 +1871,14 @@ def flydsl_moe_fused_route_quant_scatter(
             grouped_a1_scale,
             counter,
             topids_to_rows.view(token_num, topk),
+            None,
+        ) if return_m_tile_map else (
+            grouped_a1,
+            grouped_a1_scale,
+            counter,
+            topids_to_rows.view(token_num, topk),
         )
 
-    use_st_ksplit = token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0
     if use_st_ksplit:
         launch = _get_compiled_fused_route_quant_scatter_st_ksplit(
             model_dim=model_dim,
@@ -1872,6 +1887,7 @@ def flydsl_moe_fused_route_quant_scatter(
             quant_mode=quant_mode,
             use_expert_row_base=use_expert_row_base,
             max_m=max_m,
+            emit_m_tile_map=emit_m_tile_map,
         )
     else:
         launch = _get_compiled_fused_route_quant_scatter(
@@ -1890,16 +1906,20 @@ def flydsl_moe_fused_route_quant_scatter(
         grouped_a1.view(-1),
         grouped_a1_scale.view(-1),
         expert_row_base_arg,
+        m_tile_map,
         numel,
         grid_blocks,
         stream=torch.cuda.current_stream(),
     )
-    return (
+    result = (
         grouped_a1,
         grouped_a1_scale,
         counter,
         topids_to_rows.view(token_num, topk),
     )
+    if return_m_tile_map:
+        return (*result, m_tile_map if emit_m_tile_map else None)
+    return result
 
 
 @functools.cache

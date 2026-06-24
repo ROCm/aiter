@@ -512,6 +512,22 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if grouped_contiguous_m:
         _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
 
+    # DeepGemm-style persistent scheduler for masked_m layout: persistent
+    # workers stride through all (m_tiles * n_tiles) with swizzle locality.
+    # Enable via AITER_GROUPED_PERSISTENT=1 or CSV grouped_persistent_m=1.
+    # Only applies to the masked (non-contiguous) path.
+    grouped_persistent_m = False
+    if cfg_row is not None:
+        grouped_persistent_m = _as_bool(
+            cfg_row.get("grouped_persistent_m"), grouped_persistent_m
+        )
+    if os.environ.get("AITER_GROUPED_PERSISTENT", "0") in _TRUTHY_ENV:
+        grouped_persistent_m = True
+    if grouped_persistent_m and grouped_contiguous_m:
+        grouped_persistent_m = False
+    if grouped_persistent_m:
+        _grouped_dbg("DeepGEMM persistent masked_m scheduler enabled")
+
     flat_experts = topk_ids.reshape(-1)
 
     _grouped_sync_dbg = (
@@ -549,6 +565,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
     m_tile_prefix = None
     m_tile_map = None
+    m_tile_bound = None
     route_E = E
     route_max_m = max_m
     effective_grouped_contiguous_m = (not _use_naive) and bool(grouped_contiguous_m)
@@ -681,6 +698,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 grouped_a1_scale,
                 masked_m,
                 topids_to_rows,
+                route_m_tile_map,
             ) = flydsl_moe_fused_route_quant_scatter(
                 hidden_states,
                 topk_ids,
@@ -691,7 +709,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 expert_row_base=None,
                 out_E=route_E,
                 out_max_m=route_max_m,
+                return_m_tile_map=True,
             )
+            if route_m_tile_map is not None:
+                m_tile_map = route_m_tile_map
+                m_tile_bound = int(token_num) * int(topk)
             rows_to_tokens = None
             _grouped_dbg("fused route+quant+scatter done")
 
@@ -707,6 +729,17 @@ def _maybe_grouped_gfx1250_a8w4_moe(
 
     grouped_a2 = torch.empty(
         (route_E, route_max_m, inter_dim), dtype=dtype, device=device
+    )
+    effective_grouped_persistent_m = (
+        (not _use_naive) and bool(grouped_persistent_m)
+        and not effective_grouped_contiguous_m
+    )
+    effective_grouped_compact_m = (
+        (not _use_naive)
+        and (not effective_grouped_persistent_m)
+        and (not effective_grouped_contiguous_m)
+        and (m_tile_map is not None)
+        and (m_tile_bound is not None)
     )
     stage1_compiler = (
         compile_moe_grouped_gemm1_mxfp4_masked
@@ -728,7 +761,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers=num_buffers,
         split_k=split_k1,
         expert_sched_mode=False,
-        grouped_persistent_m=False,
+        grouped_persistent_m=effective_grouped_persistent_m,
+        grouped_compact_m=effective_grouped_compact_m,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
@@ -755,6 +789,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stream=torch.cuda.current_stream(),
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
+        _m_tile_bound=m_tile_bound,
         bias=_bias1_arg,
     )
     if _grouped_sync_dbg:
@@ -891,7 +926,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         num_buffers=num_buffers,
         split_k=split_k2,
         expert_sched_mode=False,
-        grouped_persistent_m=False,
+        grouped_persistent_m=effective_grouped_persistent_m,
+        grouped_compact_m=effective_grouped_compact_m,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
     )
@@ -916,6 +952,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stream=torch.cuda.current_stream(),
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
+        _m_tile_bound=m_tile_bound,
         bias=_bias2_arg,
     )
     if _grouped_sync_dbg:
