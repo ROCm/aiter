@@ -167,7 +167,7 @@ def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
     end_inds = end_inds.to("cpu").numpy()
     total_flops = 0.0
     for i in range(len(start_inds)):
-        total_flops += 2.0 * num_heads_q * head_dim * (end_inds[i] - start_inds[i])
+        total_flops += 2.0 * num_heads_q * head_dim * max(0, end_inds[i] - start_inds[i])
     return total_flops / (time_s * 1e12)
 
 
@@ -275,14 +275,19 @@ def _median_ms(result):
 PRESET_SHAPES = [
     # H = 64
     (1, 1024, 1024, 64, 128),
-    # (1, 2048, 2048, 64, 128),
-    # (1, 4096, 4096, 64, 128),
-    # (1, 1024, 4096, 64, 128),
-    # (1, 4096, 16384, 64, 128),
-    # (1, 4096, 16000, 64, 128),  # non-aligned s_kv (tail)
+    # (1, 1024, 1000, 64, 128),
+    # (1, 1000, 1024, 64, 128),
+    (1, 2048, 2048, 64, 128),
+    (1, 4096, 4096, 64, 128),
+    (1, 1024, 4096, 64, 128),
+    (1, 4096, 1024, 64, 128),
+    #(1, 4096, 16384, 64, 128),
+    #(1, 4096, 16000, 64, 128),  # non-aligned s_kv (tail)
     # H = 64, long-ISL prefill (square; run without --verify, see note above)
-    # (1, 8192, 8192, 64, 128),
-    # (1, 16384, 16384, 64, 128),
+    (1, 4096, 8192, 64, 128),
+    (1, 8192, 4096, 64, 128),
+    (1, 8192, 8192, 64, 128),
+    #(1, 16384, 16384, 64, 128),
     #(1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
     # H = 128
     # (1, 1024, 1024, 128, 128),
