@@ -684,14 +684,18 @@ def main() -> None:
 
     # Always print the summary table (verify and bench).
     summarize(rows)
-    # Preserve CI semantics: non-zero exit if any verify case missed the gate.
-    if args.scenario == "verify":
-        failed = [r for r in rows if not r["pass"]]
-        if failed:
-            raise SystemExit(
-                f"{len(failed)}/{len(rows)} verify case(s) exceeded "
-                f"logits_diff gate {LOGITS_DIFF_TOL}"
-            )
+    # Preserve CI semantics: non-zero exit if any case missed the accuracy gate.
+    failed = [r for r in rows if not r["pass"]]
+    if failed:
+        details = "; ".join(
+            f"tokens={r['tokens']} layout={r['layout']} act={r['act']} "
+            f"logits_diff={r['logits_diff']:.4e} rel_l2={r['rel_l2']:.4e}"
+            for r in failed
+        )
+        assert not failed, (
+            f"{len(failed)}/{len(rows)} case(s) exceeded logits_diff "
+            f"gate {LOGITS_DIFF_TOL}: {details}"
+        )
 
 
 if __name__ == "__main__":
