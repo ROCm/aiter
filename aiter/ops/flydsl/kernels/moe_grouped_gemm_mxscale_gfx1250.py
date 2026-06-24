@@ -267,6 +267,24 @@ def _preshuffled_scale_shape(
     return int(rows) // wmma_rep, k_scale * wmma_rep
 
 
+def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
+    """Weight (B) scale shape in the n32k4 layout: (rows//32, (k_dim//32)*32).
+
+    Matches ``aiter.ops.shuffle.shuffle_scale_n32k4``: a 32-row super-block folds
+    into the column dim (col = remain_k*128 + row32*4 + r), so 32 N-rows collapse
+    to one row and each k_scale column expands x32.
+    """
+    k_scale = int(k_dim) // 32
+    if k_scale % 4 != 0:
+        raise ValueError(
+            f"B-scale k columns (K//32) must be divisible by 4 (K%128==0), "
+            f"got {k_scale}"
+        )
+    if int(rows) % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {rows}")
+    return int(rows) // 32, k_scale * 32
+
+
 def _check_stage1_args(
     y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Config
 ) -> None:
@@ -311,7 +329,6 @@ def _check_stage1_args(
             f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
-    warp_tile_n = cfg.tile_n // cfg.n_warp
     if cfg.grouped_gather_m:
         # Scale stays in grouped contiguous layout (host scatter+preshuffle),
         # so it is sized by the grouped output rows, not the token-order x.
@@ -323,9 +340,7 @@ def _check_stage1_args(
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.model_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        2 * cfg.inter_dim, cfg.model_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(2 * cfg.inter_dim, cfg.model_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
@@ -400,9 +415,9 @@ def _compile_stage1_finalize_act(
 
         if_elem = scf.IfOp(in_range, results_=[], has_else=False)
         with ir.InsertionPoint(if_elem.then_block):
-            e = linear / arith.index(out_stride_e)
+            e = linear // arith.index(out_stride_e)
             rem0 = linear - e * arith.index(out_stride_e)
-            row = rem0 / arith.index(inter_dim)
+            row = rem0 // arith.index(inter_dim)
             col = rem0 - row * arith.index(inter_dim)
 
             valid_m = buffer_ops.buffer_load(
@@ -478,7 +493,7 @@ def _compile_stage1_finalize_act(
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
-        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) / arith.index(
+        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) // arith.index(
             block_threads
         )
         launcher = stage1_finalize_act_kernel(arg_y, arg_tmp, arg_masked_m)
@@ -545,9 +560,9 @@ def _compile_stage1_finalize_act_bias(
 
         if_elem = scf.IfOp(in_range, results_=[], has_else=False)
         with ir.InsertionPoint(if_elem.then_block):
-            e = linear / arith.index(out_stride_e)
+            e = linear // arith.index(out_stride_e)
             rem0 = linear - e * arith.index(out_stride_e)
-            row = rem0 / arith.index(inter_dim)
+            row = rem0 // arith.index(inter_dim)
             col = rem0 - row * arith.index(inter_dim)
 
             valid_m = buffer_ops.buffer_load(
@@ -641,7 +656,7 @@ def _compile_stage1_finalize_act_bias(
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
-        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) / arith.index(
+        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) // arith.index(
             block_threads
         )
         launcher = stage1_finalize_act_bias_kernel(
@@ -692,14 +707,11 @@ def _check_stage2_args(
             f"w shape must be {(cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
-    warp_tile_n = cfg.tile_n // cfg.n_warp
     scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.inter_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        cfg.model_dim, cfg.inter_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(cfg.model_dim, cfg.inter_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
