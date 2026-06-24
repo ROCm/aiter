@@ -1241,11 +1241,13 @@ def compile_mxscale_gemm(
                                 b_scales,
                             )
 
-                # Issue the next-stage TDM as early as possible: its global->LDS
-                # DMA then overlaps the ENTIRE WMMA body (front + back rows), not
-                # just the back rows. The TDM target is barrier-cleared at the
-                # step top and is independent of the A-fragment ds_loads / WMMAs.
-                if const_expr(mid_compute_callback is not None):
+                # WST + as_prologue issues a single (per-wave) next-stage TDM, so
+                # issue it as early as possible -- its global->LDS DMA then overlaps
+                # the ENTIRE WMMA body (front + back rows). For the other paths the
+                # callback issues several TDMs (e.g. non-WST = 6) whose addresses
+                # would bloat register pressure if hoisted, so keep them mid-compute.
+                _cb_early = wave_specialized_tdm and tdm_as_in_prologue
+                if const_expr(mid_compute_callback is not None and _cb_early):
                     rocdl.sched_barrier(0)
                     mid_compute_callback()
                     rocdl.sched_barrier(0)
@@ -1271,6 +1273,10 @@ def compile_mxscale_gemm(
                     rocdl.s_wait_dscnt(0)
 
                 _emit_rows(0, a_frags_front)
+
+                if const_expr(mid_compute_callback is not None and not _cb_early):
+                    rocdl.sched_barrier(0)
+                    mid_compute_callback()
 
                 if const_expr(_back_wm > 0):
                     a_frags_back = [
