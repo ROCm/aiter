@@ -1,0 +1,186 @@
+name: FFM Aiter UT
+
+run-name: FFM aiter UT on ${{ inputs.runner || 'aiter-1gpu-runner' }}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - "aiter/ops/triton/**"
+      - "op_tests/triton_tests/**"
+      - ".github/workflows/ffm-bringup.yaml"
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Self-hosted MI350 runner label to use for the FFM UT.
+        required: true
+        default: aiter-1gpu-runner
+        type: string
+      docker_image:
+        description: FFM image to pull and test.
+        required: true
+        default: rocm/ffm-dev:latest
+        type: string
+      test_ref:
+        description: Git branch containing the FFM Triton test suite.
+        required: true
+        default: shared/reduced_tests_for_FFM_CI
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'aiter-1gpu-runner' }}
+  cancel-in-progress: true
+
+env:
+  FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
+  FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
+  FFM_TEST: op_tests/triton_tests
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait for Checks workflow
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
+  ffm-aiter-ut:
+    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }})
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    needs: [check-signal]
+    runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Load FFM Triton test suite
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin \
+            "refs/heads/${FFM_TEST_SOURCE_REF}:refs/remotes/origin/${FFM_TEST_SOURCE_REF}"
+          ffm_test_source_commit="$(git rev-parse "refs/remotes/origin/${FFM_TEST_SOURCE_REF}")"
+          echo "FFM test source commit: ${ffm_test_source_commit}"
+          rm -rf "${FFM_TEST}"
+          git checkout "refs/remotes/origin/${FFM_TEST_SOURCE_REF}" -- "${FFM_TEST}"
+          test_count="$(find "${FFM_TEST}" -type f -name 'test*.py' | wc -l | tr -d ' ')"
+          echo "Loaded ${test_count} FFM Triton test files from ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+          if [ "${test_count}" -eq 0 ]; then
+            echo "::error::No FFM Triton test files found in ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+            exit 1
+          fi
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKER_PASSWORD}" ]; then
+            echo "::error::Missing DOCKER_PASSWORD secret required to pull ${FFM_IMAGE}"
+            exit 1
+          fi
+          DOCKER_USER="${DOCKERHUB_USERNAME:-rocmshared}"
+          for attempt in 1 2 3; do
+            if echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USER}" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "::error::Docker login failed after 3 attempts"
+          exit 1
+
+      - name: Pull FFM image
+        run: |
+          set -euo pipefail
+          docker pull "${FFM_IMAGE}"
+
+      - name: Run aiter FFM unit test
+        run: |
+          set -euo pipefail
+
+          DEVICE_FLAG="--device /dev/dri"
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG="$(cat /etc/podinfo/gha-render-devices)"
+          fi
+
+          GROUP_FLAGS=""
+          for group in video render; do
+            gid="$(getent group "${group}" | cut -d: -f3 || true)"
+            if [ -n "${gid}" ]; then
+              GROUP_FLAGS="${GROUP_FLAGS} --group-add ${gid}"
+            fi
+          done
+
+          docker run --rm \
+            --device /dev/kfd ${DEVICE_FLAG} \
+            ${GROUP_FLAGS} \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --shm-size=16gb \
+            -e FFM_TEST="${FFM_TEST}" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /tmp \
+            "${FFM_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              source /ffm/ffmlite_env.sh
+              echo "==== Runtime context ===="
+              echo "initial pwd: $(pwd)"
+              echo "FFM_TEST=${FFM_TEST}"
+              echo "PATH=${PATH}"
+              echo "PYTHONPATH=${PYTHONPATH:-}"
+              cd /root/aiter
+              echo "aiter root pwd: $(pwd)"
+              git config --global --add safe.directory /root/aiter
+              echo "==== Image test suite info ===="
+              find "${FFM_TEST}" -type f -name "test*.py" | wc -l
+              export ENABLE_CK=0
+              echo "ENABLE_CK=${ENABLE_CK}"
+              python3 -m pip show amd-aiter
+              echo "==== Check FFM image Aiter git version ===="
+              if [ -d /root/aiter/.git ]; then
+                git -C /root/aiter rev-parse HEAD
+                git -C /root/aiter branch --show-current || true
+                git -C /root/aiter log -1 --oneline
+                git -C /root/aiter status --short --branch
+              else
+                echo "/root/aiter is not a git checkout"
+              fi
+              echo "==== Check expected Aiter APIs ===="
+              grep -R "dynamic_nvfp4_quant" -n /root/aiter/aiter/ops/triton/quant || true
+              grep -R "is_2d_gluon_available" -n /root/aiter/aiter/ops/triton/attention || true
+              grep -R "shuffle_weight_gfx1250" -n /root/aiter/aiter/ops || true
+              grep -R "routing_from_hash" -n /root/aiter/aiter/ops/triton/moe || true
+              echo "[SKIP] Keeping Triton from the FFM image."
+              python3 -m pip show amd-triton triton || true
+              echo "==== Check Aiter core module ===="
+              python3 -c "from pathlib import Path; import aiter; aiter_dir = Path(aiter.__file__).resolve().parent; jit_dir = aiter_dir / \"jit\"; print(f\"aiter module: {aiter.__file__}\"); print(f\"aiter dir: {aiter_dir}\"); core_modules = sorted(jit_dir.glob(\"**/*core*.so\")); print(f\"FOUND {len(core_modules)} core module(s):\" if core_modules else f\"NOT FOUND: no *core*.so under {jit_dir}\"); [print(path) for path in core_modules]"
+              python3 -c "import aiter; print(f\"aiter module: {aiter.__file__}\")"
+              python3 -m pip uninstall -y pylama || true
+              python3 -m pytest -v "${FFM_TEST}"
+            '
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker logout 2>/dev/null || true
+          docker rmi "${FFM_IMAGE}" 2>/dev/null || true
