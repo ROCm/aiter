@@ -36,9 +36,9 @@ BlockwiseKernel blockwise_dispatch(int id)
   static const auto lookup = []
   {
     if constexpr (std::is_same_v<CDataType, TILE_FP16>) {
-        return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(TILE_FP16, false)};
+        return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(TILE_FP16)};
     } else if constexpr (std::is_same_v<CDataType, TILE_BF16>) {
-        return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(TILE_BF16, false)};
+        return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(TILE_BF16)};
     } else {
         static_assert(false, "blockwise_dispatch used with unsupported dtype!");
     } }();
@@ -67,12 +67,6 @@ torch::Tensor gemm_a4w4_blockscale_cktile_tune(
   TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
   TORCH_CHECK( x_scale.dtype() == w_scale.dtype(),
               "Scales should have the same dtype!");
-  std::optional<torch::Tensor> bias = std::nullopt;
-
-  int M = XQ.size(0);
-  int N = WQ.size(0);
-  int K = XQ.size(1);
-  int KBatch = std::pow(2, splitK);
 
   if (Y.dtype() == at::ScalarType::Half)
   {

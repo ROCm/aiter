@@ -166,7 +166,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             default="all",
             choices=["ck", "cktile", "all", "both"],
             required=False,
-            help="CK gemm a8w8 type to tune: ck, cktile, both or all (covers all supported backends across standard/preshuffleB modes)",
+            help="CK gemm a4w4 type to tune: ck, cktile, both or all (covers all supported backends across standard/preshuffleB modes)",
         )
 
         self.parser.add_argument(
@@ -364,9 +364,9 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     kernel.KPerBLOCK,
                 )
                 if useSplitK
-                else 0
+                else 1
             )
-            for splitK in range(maxsplitK + 1):
+            for splitK in range(1, maxsplitK + 1):
                 info = ((gfx, cu_num, M, N, K), kernel_idx, splitK, "", "cktile")
                 tasks_cktile.append(
                     (
@@ -488,9 +488,9 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         block_per_cu = args.blockPerCu
         from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
-        # if get_gfx() not in ["gfx950"]:
-        #     print(f"tuning is not supported in this chip {get_gfx()}")
-        #     return []
+        if get_gfx() not in ["gfx950"]:
+            print(f"tuning is not supported in this chip {get_gfx()}")
+            return []
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
         task = []

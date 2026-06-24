@@ -107,7 +107,7 @@ class gemm_a4w4_blockscale_codegen:
 
 #include "gemm_a4w4_blockscale_cktile_common.cuh"
 
-template <typename CDataType, bool HasBias>
+template <typename CDataType>
 torch::Tensor
 {k.name}(
     torch::Tensor &XQ,
@@ -143,7 +143,7 @@ torch::Tensor
             {str(k.AQRowMajor).lower()}>;
 
         // Run kernel instance.
-        return gemm_a4w4_blockscale_cktile_impl<CDataType, HasBias, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK);
+        return gemm_a4w4_blockscale_cktile_impl<CDataType, TileGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK);
 """
 
         TILE_INSTANCE_IMPL_str = TILE_INSTANCE_IMPL.replace(
@@ -173,17 +173,17 @@ template torch::Tensor
         if self.istune:
             Path(
                 os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")
-            ).write_text(INSTANCE_template.format(name=k.name, dtypes="TILE_BF16, false"))
+            ).write_text(INSTANCE_template.format(name=k.name, dtypes="TILE_BF16"))
             Path(
                 os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
-            ).write_text(INSTANCE_template.format(name=k.name, dtypes="TILE_FP16, false"))
+            ).write_text(INSTANCE_template.format(name=k.name, dtypes="TILE_FP16"))
         else:
             Path(
                 os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
-            ).write_text(INSTANCE_template.format(name=k.name, dtypes="TILE_BF16, true"))
+            ).write_text(INSTANCE_template.format(name=k.name, dtypes="TILE_BF16"))
             Path(
                 os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
-            ).write_text(INSTANCE_template.format(name=k.name, dtypes="TILE_FP16, true"))
+            ).write_text(INSTANCE_template.format(name=k.name, dtypes="TILE_FP16"))
 
     def gen_lookup_dict(self, kernels_dict):
         """Generate the dispatch lookup header.
@@ -202,12 +202,12 @@ template torch::Tensor
 
 #ifdef USE_ROCM
 
-#define GENERATE_LOOKUP_TABLE(CTYPE, HasBias)                                                                                      \\
+#define GENERATE_LOOKUP_TABLE(CTYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
             LOOKUP_template = """
        {{{MNK},                                                                                                       \\
-        {kernel_name}<CTYPE, HasBias>}},                       \\"""
+        {kernel_name}<CTYPE>}},                       \\"""
 
             LOOKUP_end = """
    }
@@ -229,12 +229,12 @@ template torch::Tensor
 
 #ifdef USE_ROCM
 
-#define GENERATE_LOOKUP_TABLE(CTYPE, HasBias)                                                                                      \\
+#define GENERATE_LOOKUP_TABLE(CTYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
             LOOKUP_template = """
        {{"{kernel_name}",                                                                                                       \\
-        {kernel_name}<CTYPE, HasBias>}},                       \\"""
+        {kernel_name}<CTYPE>}},                       \\"""
 
             LOOKUP_end = """
    }
@@ -261,7 +261,7 @@ template torch::Tensor
 #include <torch/extension.h>
 """
         MAINFEST_template = """
-template <typename CDataType, bool HasBias>
+template <typename CDataType>
 torch::Tensor
 {kernel_name}(
     torch::Tensor &XQ,
