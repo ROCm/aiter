@@ -40,13 +40,13 @@ from flydsl.runtime.device import get_rocm_arch
 
 from .tensor_shim import GTensor, STensor, _to_raw
 
-_LOG2E = math.log2(math.e)  # 1.4426950408889634
+_LOG2E = math.log2(math.e)
 fm_fast = arith.FastMathFlags.fast
 
 # Matches MlaReduceKernelV1Traits (reduce.cu:13)
 NUM_THREADS = 128
 WARP = 64
-NUM_WAVES = NUM_THREADS // WARP  # 2
+NUM_WAVES = NUM_THREADS // WARP
 OCC = 8
 MASSIVE_THR = 4  # kMassiveThreshold
 
@@ -128,7 +128,7 @@ def compile_mla_reduce(
     """
     assert Dv % NUM_THREADS == 0, "Dv must be divisible by 128"
     assert tier in _TIER_NLSE, f"bad tier {tier}"
-    VEC = Dv // NUM_THREADS  # fp32 elements per thread (4 for Dv=512)
+    VEC = Dv // NUM_THREADS
     is_massive = tier != "simple"
     if tier == "mlds":
         NLSE = (LDS_MAX_SPLITS + WARP - 1) // WARP
@@ -190,10 +190,9 @@ def compile_mla_reduce(
 
         tid = fx.thread_idx.x
         head = fx.block_idx.x
-        block_idx = fx.block_idx.y  # q-pos group (NTG); 0 when NTG=1
+        block_idx = fx.block_idx.y  # q-pos group (NTG)
         tile = fx.block_idx.z
 
-        # GTensors: addressing in ELEMENTS via shape/stride.
         g_po = GTensor(partial_output, dtype=T.f32, shape=(-1, H, Dv))
         g_pl = GTensor(partial_lse, dtype=T.f32, shape=(-1, H))
         g_indptr = GTensor(reduce_indptr, dtype=T.i32, shape=(-1,))
@@ -204,9 +203,8 @@ def compile_mla_reduce(
 
         t0 = fx.Int32(g_indptr[tile])
         t1 = fx.Int32(g_indptr[tile + fx.Index(1)])
-        n_splits = t1 - t0  # runtime i32
+        n_splits = t1 - t0
 
-        # Final q-range for this tile.
         if const_expr(use_reduce_final_map):
             q_start = fx.Int32(g_fmap[tile, fx.Index(0)])
             q_end = fx.Int32(g_fmap[tile, fx.Index(1)])
@@ -217,12 +215,11 @@ def compile_mla_reduce(
             q_start = fx.Int32(tile) * qo_len
             q_end = (fx.Int32(tile) + fx.Int32(1)) * qo_len
 
-        col = tid * c_VEC  # this thread's element offset within Dv
+        col = tid * c_VEC
         lane = tid % fx.Int32(WARP)
         wave = tid // fx.Int32(WARP)
         width_i32 = _to_raw(arith.constant(WARP, type=T.i32))
 
-        # LDS views (massive only).
         if const_expr(is_massive):
             base = allocator.get_base()
             lds_scale = STensor(
@@ -287,7 +284,6 @@ def compile_mla_reduce(
             local_seq = seq - q_start
 
             if const_expr(not is_massive):
-                # ---- simple online-softmax path (num_splits in {2,3}) ----
                 row0 = gather_row(fx.Int32(0), local_seq)
                 o0 = load_o_elems(g_po, row0, fx.Index(head), col)
                 lse0 = g_pl[row0, fx.Index(head)]
@@ -323,13 +319,10 @@ def compile_mla_reduce(
                 store_result(seq, out_elems)
                 store_lse(seq, max_lse, sum_e)
             else:
-                # ---- massive path (num_splits >= 4) ----
-                # Phase A (warp0): per-split LSE -> global LSE -> lse_scale[] in LDS.
                 neg_inf = arith.constant(float("-inf"), type=T.f32)
                 is_wave0 = arith.cmpi(arith.CmpIPredicate.eq, wave, fx.Int32(0))
                 if_w0 = scf.IfOp(is_wave0, results_=[], has_else=False)
                 with ir.InsertionPoint(if_w0.then_block):
-                    # Each lane loads up to NLSE LSEs (stride WARP), tracks local max.
                     local_lses = []
                     max_lse = neg_inf
                     for j in range_constexpr(NLSE):
@@ -342,7 +335,6 @@ def compile_mla_reduce(
                         lse_j = in_rng.select(lse_j, neg_inf)
                         local_lses.append(lse_j)
                         max_lse = arith.maximumf(max_lse, lse_j)
-                    # warp max-reduce
                     for off in [32, 16, 8, 4, 2, 1]:
                         peer = mlir_gpu.ShuffleOp(
                             _to_raw(max_lse),
@@ -350,7 +342,6 @@ def compile_mla_reduce(
                             width_i32, mode="xor",
                         ).shuffleResult
                         max_lse = arith.maximumf(max_lse, peer)
-                    # sum exp(lse - max)
                     sum_e = arith.constant(0.0, type=T.f32)
                     for j in range_constexpr(NLSE):
                         sum_e = sum_e + _exp(local_lses[j] - max_lse, use_exp2)
@@ -368,7 +359,6 @@ def compile_mla_reduce(
                     )
                     inf = arith.constant(float("inf"), type=T.f32)
                     global_lse = bad.select(inf, _log(sum_e) + max_lse)
-                    # write normalized scale per split to LDS
                     for j in range_constexpr(NLSE):
                         split_idx = lane + fx.Int32(j * WARP)
                         in_rng = arith.cmpi(
@@ -378,7 +368,6 @@ def compile_mla_reduce(
                             sc = _exp(local_lses[j] - global_lse, use_exp2)
                             lds_scale[fx.Index(split_idx)] = sc
                             scf.YieldOp([])
-                    # lane0 writes final_lse
                     if const_expr(output_lse):
                         is_l0 = arith.cmpi(arith.CmpIPredicate.eq, lane, fx.Int32(0))
                         if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
@@ -390,7 +379,6 @@ def compile_mla_reduce(
 
                 gpu.barrier()
 
-                # Phase B (all threads): reg_out = sum_s lse_scale[s] * O_s.
                 acc0 = [_to_raw(arith.constant(0.0, type=T.f32))
                         for _ in range_constexpr(VEC)]
                 accr = acc0
@@ -410,7 +398,6 @@ def compile_mla_reduce(
             scf.YieldOp([])
         return
 
-    # ---- host launcher ----------------------------------------------------
     @flyc.jit
     def launch_mla_reduce(
         partial_output: fx.Pointer,
@@ -435,9 +422,6 @@ def compile_mla_reduce(
 
         idx_tiles = arith.index_cast(T.index, num_reduce_tile)
         idx_H = fx.Index(H)
-        # grid-y = max_seqlen_q: one block per q-position (NTG). The kernel reads
-        # this stride back from grid_dim.y, so it stays correct if grid-y is later
-        # clamped below max_seqlen_q for occupancy. Mirrors HIP's gridDim.y.
         idx_ntg = arith.index_cast(T.index, _to_raw(max_seqlen_q))
         mla_reduce_kernel(
             partial_output,

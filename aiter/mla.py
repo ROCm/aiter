@@ -266,11 +266,6 @@ def mla_decode_fwd(
     intra_batch_mode=False,
     return_logits=False,
     return_lse=False,
-    # round-robin context-parallel (CP): when cp_world_size > 1 the local KV is a
-    # round-robin shard of a global sequence (global pos p -> rank p % W). The
-    # kernel maps a local kv index j back to its global position g(j)=j*W+r to
-    # apply the causal mask on GLOBAL positions. g_kv_indptr carries the GLOBAL
-    # per-request kv_indptr (global KV length). cp_world_size==1 disables it.
     g_kv_indptr=None,
     cp_world_size=1,
     cp_rank=0,
