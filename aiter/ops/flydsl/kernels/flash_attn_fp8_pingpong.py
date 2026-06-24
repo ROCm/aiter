@@ -701,9 +701,9 @@ def build_flash_attn_fp8_module(
                 _, k_buf_off, _, _, v_next = _bufs(fx.Index(0))
                 v0_off = fx.Index(LDS_V_OFF)  # V^0 buf = LDSV[0]
                 sA, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v0_off)
+                dma_v(v_next, fx.Index(BLOCK_N))
                 # gpu.barrier()
                 m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_init)
-                dma_v(v_next, fx.Index(BLOCK_N))
                 waitcnt_barrier()
                 return (
                     m_new,
@@ -773,12 +773,12 @@ def build_flash_attn_fp8_module(
                     preloaded_vw=[vwp0, vwp1],
                     k_buf_off=k_buf_off,
                 )
+                dma_v(v_next, next_kv)
                 # Preload V^i units 0,1 in the last 2 dead windows for next apply_pv.
                 sA, vwp_new = do_qk(k_buf_off, preloaded_kw=kw_prime, v_off=v_cur_off)
                 # gpu.barrier()
                 # PHASE 2 (softmax phase): softmax(i) | DMA V^{i+1}.
                 m_new, corr_new, p_new, prowsum_new = do_softmax(sA, m_r)
-                dma_v(v_next, next_kv)
                 waitcnt_barrier()
                 scf.YieldOp(
                     [
@@ -815,10 +815,10 @@ def build_flash_attn_fp8_module(
             # windows for the first apply_pv (which consumes V^0 = v_prev_off at i=1).
             def g1_iter0():
                 _, k_buf_off, _, k_next, _ = _bufs(fx.Index(0))
-                dma_k(k_next, fx.Index(BLOCK_N))
                 # waitcnt_barrier()
                 v0_off = fx.Index(LDS_V_OFF)  # V^0 buf = LDSV[0]
                 sB, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v0_off)
+                dma_k(k_next, fx.Index(BLOCK_N))
                 # gpu.barrier()
                 waitcnt_barrier()
                 return (
@@ -877,8 +877,8 @@ def build_flash_attn_fp8_module(
                     i_cur % fx.Index(NUM_BUF_V)
                 ) * fx.Index(LDS_V_TILE)
                 # PHASE 1 (mfma phase): softmax(i-1) | DMA K^{i+1}.
-                m_sm, corr_sm, p_sm, prowsum_sm = do_softmax([ss0, ss1, ss2, ss3], m_r)
                 dma_k(k_next, next_kv)
+                m_sm, corr_sm, p_sm, prowsum_sm = do_softmax([ss0, ss1, ss2, ss3], m_r)
                 # waitcnt_barrier()
                 # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
                 # V units 0,1 were preloaded in prior do_qk dead windows.
