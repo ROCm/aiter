@@ -491,13 +491,20 @@ def build_flash_attn_fp8_module(
             return ab.shuffle(cd, list(range(8)))
 
         def apply_pv(
-            o_accs, l_acc, p_pack, p_rowsum, corr, v_off, preloaded_vw, k_buf_off
+            o_accs,
+            l_acc,
+            p_pack,
+            p_rowsum,
+            corr,
+            v_off,
+            preloaded_vw,
+            k_buf_off,
         ):
             # O *= corr ; then O += V^T@P over the PV_K_STEPS 64-kv K-steps that
             # tile BLOCK_N.  L is a scalar VALU online update L = L*corr + rowsum.
             # 4-window rotating buffer: vw[u%4] consumed at MFMA u.
-            # preloaded_vw[0..1] seed from the preceding do_qk dead windows.
-            # Last 2 dead windows (u=6,7) preload K units 0,1 for the next do_qk.
+            # preloaded_vw[0..D-1] seed from the preceding do_qk dead windows.
+            # The last PREFETCH_DEPTH dead windows preload K units for next do_qk.
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
             )
@@ -536,9 +543,11 @@ def build_flash_attn_fp8_module(
         QK_UNITS = N_KV_TILES * K_STEPS  # 8 (nt outer, ks inner)
         # Prefetch depth for the register-window software pipeline: prime this
         # many units, then issue each future ds_read one+ window ahead of the
-        # consuming MFMA.  Depth 2 measured best (depth 3 over-prefetches and the
-        # extra live windows cost more than the latency they hide).
-        PREFETCH_DEPTH = 2
+        # consuming MFMA.  Depth 1 measured best (~1366 vs ~1358 at depth 2,
+        # 234 VGPR / 0 spill vs 248); depth 3 over-prefetches and spills (16,
+        # 1344).  The kernel is VALU-bound, so extra live DS windows cost more
+        # register pressure than the ds_read latency they hide.
+        PREFETCH_DEPTH = 1
 
         def _load_k_unit(k_buf_off, nt, ks):
             kv_row = lo + fx.Index(nt * 32)
@@ -737,14 +746,11 @@ def build_flash_attn_fp8_module(
                     p_new,
                     prowsum_new,
                     corr_new,
-                    vwp[0],
-                    vwp[1],
+                    *vwp[:PREFETCH_DEPTH],
                 )
 
             # ---- Epilogue: apply deferred PV(N-1). ----
-            def g0_epilogue(
-                m_r, l_a, oo0, oo1, oo2, oo3, p_c, prowsum_c, corr_c, vwp0, vwp1
-            ):
+            def g0_epilogue(m_r, l_a, oo0, oo1, oo2, oo3, p_c, prowsum_c, corr_c, *vwp):
                 _, k_buf_off_e, _, _, _ = _bufs(last_i * fx.Index(BLOCK_N))
                 o, l2, _ = apply_pv(
                     [oo0, oo1, oo2, oo3],
@@ -753,7 +759,7 @@ def build_flash_attn_fp8_module(
                     prowsum_c,
                     corr_c,
                     v_last_off,
-                    [vwp0, vwp1],
+                    list(vwp),
                     k_buf_off_e,
                 )
                 return o, l2
@@ -769,10 +775,12 @@ def build_flash_attn_fp8_module(
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
                 _iglp()
-                m_r, l_a, oo0, oo1, oo2, oo3, p_c, prowsum_c, corr_c, vwp0, vwp1 = [
+                _g0_args = [
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g0_carry)
                 ]
+                m_r, l_a, oo0, oo1, oo2, oo3, p_c, prowsum_c, corr_c = _g0_args[:9]
+                vwp = _g0_args[9:]
                 kv_start = fx.Index(iv)
                 _, k_buf_off, v_prev_off, _, v_next = _bufs(kv_start)
                 next_kv = kv_start + fx.Index(BLOCK_N)
@@ -793,7 +801,7 @@ def build_flash_attn_fp8_module(
                     prowsum_c,
                     corr_c,
                     v_prev_off,
-                    preloaded_vw=[vwp0, vwp1],
+                    preloaded_vw=vwp,
                     k_buf_off=k_buf_off,
                 )
                 dma_v(v_next, next_kv)
@@ -814,17 +822,12 @@ def build_flash_attn_fp8_module(
                         _raw(p_new),
                         _raw(prowsum_new),
                         _raw(corr_new),
-                        _raw(vwp_new[0]),
-                        _raw(vwp_new[1]),
+                        *[_raw(w) for w in vwp_new[:PREFETCH_DEPTH]],
                     ]
                 )
 
-            m_e, l_e, oe0, oe1, oe2, oe3, p_e, prowsum_e, corr_e, vwpe0, vwpe1 = [
-                as_dsl_value(r, ex) for r, ex in zip(for_op.results, g0_carry)
-            ]
-            o_fin, l_fin_g = g0_epilogue(
-                m_e, l_e, oe0, oe1, oe2, oe3, p_e, prowsum_e, corr_e, vwpe0, vwpe1
-            )
+            _g0_res = [as_dsl_value(r, ex) for r, ex in zip(for_op.results, g0_carry)]
+            o_fin, l_fin_g = g0_epilogue(*_g0_res)
             of0 = o_fin[0]
             of1 = o_fin[1]
             of2 = o_fin[2]
@@ -855,14 +858,11 @@ def build_flash_attn_fp8_module(
                     sB[1],
                     sB[2],
                     sB[3],
-                    vwp[0],
-                    vwp[1],
+                    *vwp[:PREFETCH_DEPTH],
                 )
 
             # ---- Epilogue: softmax(N-1) then apply deferred PV(N-1). ----
-            def g1_epilogue(
-                m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3, vwp0, vwp1
-            ):
+            def g1_epilogue(m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3, *vwp):
                 _m_e, corrf, pf, prowsumf = do_softmax([sce0, sce1, sce2, sce3], m_e)
                 _, k_buf_off_e, _, _, _ = _bufs(last_i * fx.Index(BLOCK_N))
                 o, l2, _ = apply_pv(
@@ -872,7 +872,7 @@ def build_flash_attn_fp8_module(
                     prowsumf,
                     corrf,
                     v_last_off,
-                    [vwp0, vwp1],
+                    list(vwp),
                     k_buf_off_e,
                 )
                 return o, l2
@@ -888,10 +888,12 @@ def build_flash_attn_fp8_module(
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
                 _iglp()
-                m_r, l_a, oo0, oo1, oo2, oo3, ss0, ss1, ss2, ss3, vwp0, vwp1 = [
+                _g1_args = [
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g1_carry)
                 ]
+                m_r, l_a, oo0, oo1, oo2, oo3, ss0, ss1, ss2, ss3 = _g1_args[:10]
+                vwp = _g1_args[10:]
                 kv_start = fx.Index(iv)
                 _, k_buf_off, v_prev_off, k_next, _ = _bufs(kv_start)
                 next_kv = kv_start + fx.Index(BLOCK_N)
@@ -915,7 +917,7 @@ def build_flash_attn_fp8_module(
                     prowsum_sm,
                     corr_sm,
                     v_prev_off,
-                    preloaded_vw=[vwp0, vwp1],
+                    preloaded_vw=vwp,
                     k_buf_off=k_buf_off,
                 )
                 # Preload V^i units 0,1 in the last 2 dead windows for next apply_pv.
@@ -934,17 +936,12 @@ def build_flash_attn_fp8_module(
                         _raw(sB[1]),
                         _raw(sB[2]),
                         _raw(sB[3]),
-                        _raw(vwp_new[0]),
-                        _raw(vwp_new[1]),
+                        *[_raw(w) for w in vwp_new[:PREFETCH_DEPTH]],
                     ]
                 )
 
-            m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3, vwpe0, vwpe1 = [
-                as_dsl_value(r, ex) for r, ex in zip(for_op.results, g1_carry)
-            ]
-            o_fin, l_fin_g = g1_epilogue(
-                m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3, vwpe0, vwpe1
-            )
+            _g1_res = [as_dsl_value(r, ex) for r, ex in zip(for_op.results, g1_carry)]
+            o_fin, l_fin_g = g1_epilogue(*_g1_res)
             of0 = o_fin[0]
             of1 = o_fin[1]
             of2 = o_fin[2]
