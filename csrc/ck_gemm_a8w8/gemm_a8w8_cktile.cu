@@ -105,7 +105,7 @@ torch::Tensor gemm_a8w8_cktile(torch::Tensor& XQ,
               "Scales should have the same dtype!");
   if (bias != std::nullopt)
     TORCH_CHECK(bias.value().dtype() == Y.dtype(),
-                "Out amd bias should have the same dtype!");
+                "Out and bias should have the same dtype!");
 
   int M = XQ.size(0);
   int N = WQ.size(0);

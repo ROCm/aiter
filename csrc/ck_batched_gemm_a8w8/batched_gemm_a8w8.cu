@@ -151,7 +151,7 @@ torch::Tensor batched_gemm_a8w8(
               "Scales should have the same dtype!");
   if (bias != std::nullopt)
     TORCH_CHECK(bias.value().dtype() == Y.dtype(),
-                "Out amd bias should have the same dtype!");
+                "Out and bias should have the same dtype!");
 
   int B = XQ.size(0);
   int M = XQ.size(1);

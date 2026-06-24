@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from chip_info import get_gfx  # noqa: E402
 
+
 @dataclass
 class kernelInstance:
     BLOCK_SIZE: int

@@ -138,9 +138,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         else:
             return None
 
-        if kernelId >= len(kernels) or kernelId < 0:
-            return None
-        return kernels[kernelId].name
+        return kernels.get(kernelId).name
 
     def get_gemm_a8w8_ck_tune_task(
         self,
@@ -155,7 +153,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         ref_keys = ["x", "weight", "x_scale", "w_scale"]
         tasks_ck = []
 
-        for j, kernel in enumerate(kernels_list):
+        for kernel_id, kernel in kernels_list.items():
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
@@ -169,14 +167,14 @@ class GemmA8W8Tuner(GemmCommonTuner):
                 else 0
             )
             for splitK in range(maxsplitK + 1):
-                info = (info_keys, j, splitK, "", "ck")
+                info = (info_keys, kernel_id, splitK, "", "ck")
                 tasks_ck.append(
                     (
                         info,
                         generate_data,
                         (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
                         run_gemm_a8w8,
-                        (gemm_keys, j, splitK),
+                        (gemm_keys, kernel_id, splitK),
                         run_kwargs,
                         gemm_a8w8_ref,
                         (ref_keys, dtypes.bf16, eval(q_dtype_w)),
@@ -208,28 +206,28 @@ class GemmA8W8Tuner(GemmCommonTuner):
         ref_keys = ["x", "weight", "x_scale", "w_scale"]
         tasks_cktile = []
 
-        for j, kernel in enumerate(kernel_list):
+        for kernel_id, kernel in kernel_list.items():
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,
                     N,
                     K,
-                    kernel.MPerBLOCK,
-                    kernel.NPerBLOCK,
-                    kernel.KPerBLOCK,
+                    kernel.M_Tile,
+                    kernel.N_Tile,
+                    kernel.K_Tile,
                 )
                 if useSplitK
                 else 0
             )
             for splitK in range(maxsplitK + 1):
-                info = (info_keys, j, splitK, "", "cktile")
+                info = (info_keys, kernel_id, splitK, "", "cktile")
                 tasks_cktile.append(
                     (
                         info,
                         generate_data,
                         (M, N, K, seed, dtypes.bf16, eval(q_dtype_w)),
                         run_gemm_a8w8_cktile,
-                        (gemm_keys, j, splitK),
+                        (gemm_keys, kernel_id, splitK),
                         run_kwargs,
                         gemm_a8w8_ref,
                         (ref_keys, dtypes.bf16, eval(q_dtype_w)),
@@ -409,7 +407,6 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
         resultdf = pd.DataFrame(columns=self.columns)
         for el in results:
-            print(el)
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName, libtype = info
             kernelName = (
