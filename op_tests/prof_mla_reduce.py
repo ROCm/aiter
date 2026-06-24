@@ -1,5 +1,7 @@
 """Single fixed launch of kn_mla_reduce_v1 for rocprofv3 counter collection."""
-import os, torch, aiter
+import os
+import torch
+import aiter
 
 T = int(os.environ.get("PROF_TILES", 256))
 S = int(os.environ.get("PROF_SPLITS", 8))
