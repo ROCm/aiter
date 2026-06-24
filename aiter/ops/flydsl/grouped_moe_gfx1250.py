@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""gfx1250 grouped MoE GEMM (a8w4 default / a4w4).
+"""gfx1250 grouped MoE GEMM (a8w4 / a4w4) via FlyDSL.
 
-This module owns the FlyDSL grouped-GEMM path so the generic ``fused_moe``
-dispatcher does not carry gfx1250-specific implementation details.
-
-Optional **DeepGEMM-style contiguous M-tile** scheduler: set environment
-``AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1`` or CSV column ``grouped_contiguous_m=1``.
-Block swizzle matches ``deep_gemm::Scheduler::get_swizzled_block_idx`` in
-DeepGEMM's ``scheduler.cuh``; optional override ``AITER_DEEPGEMM_NUM_1D_BLOCKS=8|16``.
+Supports optional DeepGEMM-style contiguous-M scheduler
+(AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
 """
 
 import os
@@ -33,13 +28,7 @@ _GROUPED_WEIGHT_CACHE = {}
 
 
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
-    """Return a contiguous uint8 view of a (static) MoE weight, cached by buffer.
-
-    Weights don't change across decode/bench steps, so this turns a potential
-    per-call ``.contiguous()`` D2D copy into a one-time cost. Keyed by
-    ``data_ptr`` (weights stay alive, so no buffer-reuse aliasing in practice);
-    the cache is bounded and cleared if it grows unexpectedly.
-    """
+    """Contiguous uint8 view of a static MoE weight, cached by data_ptr."""
     key = (w.data_ptr(), tuple(w.shape), tuple(w.stride()), str(w.dtype))
     cached = _GROUPED_WEIGHT_CACHE.get(key)
     if cached is not None:
@@ -206,11 +195,7 @@ def _make_contiguous_psum_layout(
     token_num: int,
     topk: int,
 ):
-    """Build DeepGEMM-style psum layout: grouped_layout[e] = actual_end.
-
-    contiguous_m is a static upper bound (no .item() sync), so this is safe
-    during CUDAGraph capture. Padding rows are never read by GEMM/gather.
-    """
+    """Build DeepGEMM psum layout. contiguous_m is a static upper bound (CUDAGraph-safe)."""
     device = masked_m.device
 
     starts_t, psum_t, _ = contiguous_psum(masked_m, int(experts), int(tile_m))
@@ -278,10 +263,6 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
-# The weight (B) scale n32k4 preshuffle now lives in aiter.ops.shuffle as
-# shuffle_scale_n32k4 (dispatched on gfx1250 via moe_shuffle_scale).  Production consumes
-# weights that are already preshuffled, so the grouped path only reshapes them
-# (see grouped_w1_scale below); the producer is the shuffle.py helper.
 def _build_route_maps_naive(topk_ids: torch.Tensor, E: int, max_m: int):
     """Torch fallback for route -> grouped-row maps."""
     import torch.nn.functional as F
@@ -498,6 +479,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     if cfg_row is not None:
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
+        tile_n = _as_int(cfg_row.get("tile_n"), tile_n)
+        tile_k = _as_int(cfg_row.get("tile_k"), tile_k)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
         split_k1 = _as_int(cfg_row.get("split_k1"), split_k1)
@@ -509,8 +492,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             cfg_row.get("stage1_weight_layout") or stage1_weight_layout
         )
         _grouped_dbg(f"using grouped CSV config: {cfg_row}")
-    tile_n = int(n_warp) * 64
-    tile_k = 256
+    # tile_n = int(n_warp) * 64
+    # tile_k = 256
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
 
@@ -529,46 +512,21 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if grouped_contiguous_m:
         _grouped_dbg("DeepGEMM contiguous M scheduler enabled")
 
-    # topk_ids is already an integer tensor; keep one flattened view for routing.
+
     flat_experts = topk_ids.reshape(-1)
-    # [crash-probe] syncs are debug-only; gated by AITER_GROUPED_DEBUG. They are
-    # also force-disabled during CUDAGraph capture: torch.cuda.synchronize() and
-    # the torch.any() range check below issue dynamic control flow / device->host
-    # syncs that HIP forbids while a stream is capturing.
+
     _grouped_sync_dbg = os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
         "",
         "0",
         "false",
         "False",
     ) and not torch.cuda.is_current_stream_capturing()
-    # Expert-id range validation is a debug-only safety check: at decode sizes it
-    # issues ~6 tiny launches/iter (lt+ge compare_scalar, two any() reductions)
-    # plus a device->host sync from the `or` -- a real hotspot relative to the
-    # tiny grouped work. Gate it behind AITER_GROUPED_DEBUG so production skips it
-    # (topk_ids is already produced in-range by the router); set the env to 1 to
-    # re-enable the check when diagnosing bad route ids. Skip entirely during
-    # CUDAGraph capture (dynamic control flow / sync).
+
     if _grouped_sync_dbg:
         if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
             raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
     counts = None
-    # Per-expert row capacity. A single expert can receive up to token_num*topk
-    # routes (worst case: every token routes all topk slots to it), so token_num
-    # alone is too small under imbalanced routing -- the slot then overflows the
-    # `expert*max_m + slot` stride in build_route_maps, corrupting the route maps
-    # and the contiguous-M `// max_m` decode (out-of-bounds GPU access).
-    #
-    # The capacity differs by scheduler (grouped_contiguous_m is already final
-    # here -- it is decided at the token-count threshold above):
-    #   * contiguous-M: max_m is only the routing-encode stride; the physical
-    #     grouped buffer is contiguous_m, decoupled from max_m. It MUST be at
-    #     least token_num*topk (the worst-case per-expert load), so clamp the
-    #     tuned-config value UP to that bound -- a stale/too-small CSV max_m would
-    #     otherwise overflow the `expert*max_m + slot` stride and crash. Free: no
-    #     extra GEMM VRAM, just the E*max_m int32 routing buffer; no host sync.
-    #   * masked: max_m IS the physical per-expert capacity (E*max_m rows), so
-    #     token_num*topk would inflate VRAM by topk. Keep token_num (this path is
-    #     only used for small token counts, below the contiguous-M threshold).
+
     if grouped_contiguous_m:
         _cfg_max_m = _as_int(cfg_row.get("max_m"), 0) if cfg_row else 0
         raw_max_m = max(_cfg_max_m, token_num * topk)
@@ -580,18 +538,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     _grouped_dbg(f"routing max_m={max_m}")
 
-    # Stage1 input prep. The fast (non-naive) path is the fused warp-per-route
-    # kernel: build_route_maps + per_1x32 MX quant + scatter_copy + scale
-    # preshuffle in a single launch (fp4 a4w4 / fp8 a8w4, quant_mode from
-    # data_format). It is the *sole* router on this path, so its
-    # topids_to_rows/masked_m feed both the GEMM and the gather-reduce. The naive
-    # path (AITER_GROUPED_GEMM_NAIVE=1) keeps a deterministic torch fallback for
-    # tests/debug and is the only path supporting doweight_stage1 / non-bf16.
+    # Fast path: fused route+quant+scatter; naive path: torch fallback for debug.
     _use_naive = os.environ.get("AITER_GROUPED_GEMM_NAIVE", "0") == "1"
     fused_quant_mode = "fp4" if data_format == "fp4" else "fp8"
-    # Both branches produce grouped_a1 / grouped_a1_scale / masked_m /
-    # topids_to_rows. The naive path additionally builds counts / route_tokens /
-    # route_weights for its torch epilogues.
     grouped_a1 = None
     grouped_a1_scale = None
     out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
@@ -599,10 +548,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     m_tile_map = None
     route_E = E
     route_max_m = max_m
-    # The DeepGEMM contiguous-M scheduler packs every expert's rows into one
-    # (1, contiguous_m) buffer. The fused kernel handles it directly by scattering
-    # into per-expert tile-aligned ``starts`` offsets (no post-hoc remap); only
-    # the non-naive fast path supports it.
     effective_grouped_contiguous_m = (not _use_naive) and bool(grouped_contiguous_m)
 
     def _quantize_mxfp8_payload(x: torch.Tensor, last_dim: int):
@@ -618,16 +563,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         return payload, scale_u8
 
     if _use_naive:
-        # Deterministic torch fallback: route maps + per-token MX quant +
-        # route-gather + scale preshuffle, all in torch. Also the only path
-        # supporting doweight_stage1 / non-bf16 hidden.
         if counts is None:
             counts = torch.bincount(flat_experts.to(torch.long), minlength=E)
         topids_to_rows, rows_to_tokens, masked_m = _build_route_maps_naive(
             topk_ids, E, max_m
         )
         route_tokens = rows_to_tokens.view(E, max_m).to(torch.long)
-        # Per-token MX quant (fp4 torch ref / a8w4 MXFP8).
         if data_format == "fp4":
             from aiter.ops.quant import per_1x32_f4_quant
 
@@ -648,12 +589,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             grouped_a1 = torch.empty(
                 (E, max_m, model_dim), dtype=torch.uint8, device=device
             )
-        # Padding rows decode with scale=1.0.
         a1_scale_raw = torch.empty(
             (E, max_m, model_dim // 32), dtype=torch.uint8, device=device
         )
 
-        # Route-gather + scale preshuffle (torch).
         _grouped_dbg("start route gather (naive)")
         flat_routes = torch.arange(token_num * topk, device=device, dtype=torch.long)
         flat_tokens = flat_routes // topk
@@ -661,7 +600,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_a1.view(E * max_m, -1)[flat_rows] = a1_payload[flat_tokens]
         if a1_scale_token_u8 is not None:
             a1_scale_raw.view(E * max_m, -1)[flat_rows] = a1_scale_token_u8[flat_tokens]
-        # Only the naive epilogue needs grouped row weights.
         route_weights = torch.empty((E, max_m), dtype=dtype, device=device)
         route_weights.view(-1)[topids_to_rows.reshape(-1)] = topk_weight.reshape(-1).to(
             route_weights.dtype
@@ -671,12 +609,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
         _grouped_dbg("route gather done")
     else:
-        # Fast path: one fused warp-per-route kernel does build_route_maps +
-        # per_1x32 MX quant + scatter_copy + scale preshuffle (fp4 a4w4 / fp8
-        # a8w4). It is the *sole* router, feeding both the GEMM and the
-        # gather-reduce. It supports only what the warp-per-route quant expresses
-        # today; fall back to the naive path (AITER_GROUPED_GEMM_NAIVE=1)
-        # otherwise.
         if doweight_stage1:
             raise NotImplementedError(
                 "doweight_stage1 is only supported on the grouped NAIVE path; "
@@ -694,14 +626,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 f"(got {hidden_states.dtype}); set AITER_GROUPED_GEMM_NAIVE=1"
             )
         if effective_grouped_contiguous_m:
-            # DeepGEMM contiguous-M: a single fully-fused kernel does the
-            # per-expert count, the tile-aligned prefix sum (starts/psum), and the
-            # route+quant+scatter into one (1, contiguous_m) buffer -- replacing the
-            # former torch.bincount + contiguous_psum + scatter triple launch (the
-            # in-kernel count == masked_m, so no redundant histogram). contiguous_m
-            # is still a static upper bound (no .item() sync), CUDAGraph-safe.
             from aiter.ops.flydsl.moe_kernels import (
-                flydsl_moe_fused_route_psum_quant_scatter,
+                flydsl_moe_fused_quant_preshuffle,
+                flydsl_moe_topids_to_rows,
             )
 
             ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
@@ -709,28 +636,37 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             route_E = 1
             route_max_m = int(contiguous_m)
 
-            _grouped_dbg(
-                f"start fused route+psum+quant+scatter ({fused_quant_mode})"
-            )
+            _grouped_dbg(f"start route ({fused_quant_mode})")
             (
-                grouped_a1,
-                grouped_a1_scale,
                 masked_m,
                 topids_to_rows,
-                _starts_t,
-                psum_t,
-            ) = flydsl_moe_fused_route_psum_quant_scatter(
-                hidden_states,
+            ) = flydsl_moe_topids_to_rows(
                 topk_ids,
                 E,
-                tile_m,
-                contiguous_m,
-                wmma_rep=warp_tile_m // 16,
-                quant_mode=fused_quant_mode,
+                max_m,
+            )
+            _grouped_dbg("route done, start psum+remap")
+            _starts_t, psum_t, _ = contiguous_psum_remap(
+                masked_m, topids_to_rows, E, max_m, tile_m
             )
             m_tile_map = psum_t
             rows_to_tokens = None
-            _grouped_dbg("fused route+psum+quant+scatter done")
+            _grouped_dbg("psum+remap done")
+
+            _grouped_dbg(f"start route-indexed quant+preshuffle ({fused_quant_mode})")
+            grouped_a1, grouped_a1_scale = flydsl_moe_fused_quant_preshuffle(
+                hidden_states.reshape(1, token_num, model_dim),
+                route_E,
+                route_max_m,
+                wmma_rep=warp_tile_m // 16,
+                quant_mode=fused_quant_mode,
+                masked_m=None,
+                topids_to_rows=topids_to_rows,
+                source_topk=topk,
+                row_starts=None,
+                route_max_m=0,
+            )
+            _grouped_dbg("route-indexed quant+preshuffle done")
         else:
             from aiter.ops.flydsl.moe_kernels import (
                 flydsl_moe_fused_route_quant_scatter,
@@ -759,15 +695,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     grouped_w1 = _grouped_weight_uint8(w1)
     grouped_w2 = _grouped_weight_uint8(w2)
     _grouped_dbg("weight layout done")
-    # Weight scales are already preshuffled per expert (n32k4 B-scale layout:
-    # rows N -> N//32 super-rows, k_scale cols -> k_scale*32 folded cols; see
-    # aiter.ops.shuffle.shuffle_scale_n32k4).
     grouped_w1_scale = w1_scale.reshape(
         E, (2 * inter_dim) // 32, (model_dim // 32) * 32
     )
     grouped_w2_scale = w2_scale.reshape(E, model_dim // 32, (inter_dim // 32) * 32)
 
-    # grouped_a1_scale already produced above (fast or naive path).
     _grouped_dbg("scale layout done")
 
     grouped_a2 = torch.empty(
@@ -858,7 +790,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 grouped_a2[e, :n].mul_(route_weights[e, :n].view(-1, 1))
 
     if _use_naive:
-        # Deterministic torch fallback: per-row MX quant + torch preshuffle.
         if data_format == "fp4":
             from aiter.ops.quant import per_1x32_f4_quant as _a2_f4_quant
 
@@ -887,20 +818,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
         )
     else:
-        # Fast path: one fused kernel does the grouped MX quant AND writes the
-        # preshuffled e8m0 scale (the stage2 analog of the fused stage1 input
-        # prep). grouped_a2 is already grouped row-major, so no route-gather.
         from aiter.ops.flydsl.moe_kernels import flydsl_moe_fused_quant_preshuffle
 
         _grouped_dbg("start a2 fused quant+preshuffle")
-        # grouped_a2 is (route_E, route_max_m, inter_dim): masked (E, max_m) or
-        # contiguous (1, contiguous_m). The fused kernel derives expert=row//max_m
-        # so passing route_E/route_max_m yields the matching scale layout for both.
-        # Masked (E, max_m) layout: skip padding rows via masked_m (expert =
-        # row // max_m). Contiguous-M packs rows by a prefix sum so that
-        # row->expert map does not hold -- quantize all rows there (masked_m=None).
         _fused_masked_m = None if effective_grouped_contiguous_m else masked_m
-        _fused_topids_to_rows = topids_to_rows if token_num == 1 else None
+        _route_rows = int(token_num) * int(topk)
+        _capacity_rows = int(route_E) * int(route_max_m)
+        _fused_topids_to_rows = (
+            topids_to_rows if _route_rows < _capacity_rows else None
+        )
         grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
             grouped_a2,
             route_E,
@@ -1016,10 +942,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
 
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
-    # Fast epilogue gathers/reduces grouped rows back to token order.
     if (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
         _grouped_dbg("start gather-reduce output")
-        # Reuse the route map; the kernel accumulates in f32.
         gather_w = (
             torch.ones((token_num, topk), dtype=dtype, device=device)
             if doweight_stage1
@@ -1029,7 +953,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _grouped_dbg("gather-reduce output done")
     else:
         _grouped_dbg("start scatter output")
-        # Naive fallback: per-expert D2D loop (slow). Warn once outside capture.
         global _WARNED_NAIVE_EPILOGUE
         if not _WARNED_NAIVE_EPILOGUE:
             _WARNED_NAIVE_EPILOGUE = True
@@ -1040,7 +963,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 "flydsl_moe_gather_reduce path.",
                 E,
             )
-        # Naive fallback epilogue.
         if counts is None:
             counts = torch.bincount(flat_experts, minlength=E)
         for e in range(E):
@@ -1091,15 +1013,7 @@ def build_topids_to_rows(
     max_m: int,
     E: int,
 ) -> torch.Tensor:
-    """Per-token gather map: ``topids_to_rows[t,k] = topk_ids[t,k]*max_m + slot``, where
-    ``slot`` is token ``t``'s within-expert position in token-major route order
-    (matching how the route-gather fills each expert). Returns (token_num, topk)
-    int32.
-
-    Argsort-free: the within-expert ``slot`` is a one-hot cumsum (running count
-    per expert in route order). Build this once and share it with the
-    route-gather (scatter-copy) step instead of recomputing.
-    """
+    """Argsort-free per-token gather map: topids_to_rows[t,k] = expert*max_m + slot."""
     import torch.nn.functional as F
 
     token_num, topk = topk_ids.shape
@@ -1127,16 +1041,18 @@ def _get_compiled_contiguous_psum():
     return build_moe_contiguous_psum_module()
 
 
-def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
-    """Tile-aligned exclusive prefix sum over per-expert counts in one FlyDSL
-    kernel (no torch.cumsum / rocprim scan / D2D temp copy).
+@functools.cache
+def _get_compiled_contiguous_psum_remap():
+    """Compile and cache the contiguous prefix-sum + row-remap kernel."""
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
+        build_moe_contiguous_psum_remap_module,
+    )
 
-    Returns ``(starts, psum, contiguous_m_t)``:
-      starts        : (E,) int32  exclusive prefix sum of ceil-aligned counts
-      psum          : (E,) int32  starts[e] + masked_m[e] (actual ends)
-      contiguous_m_t: (1,) int32  max(tile_m, sum(aligned)); read ``.item()``
-                      once on the host for the grouped-buffer shape.
-    """
+    return build_moe_contiguous_psum_remap_module()
+
+
+def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
+    """Tile-aligned exclusive prefix sum over per-expert counts."""
     device = masked_m.device
     experts = int(experts)
     masked_m_i32 = masked_m[:experts].to(torch.int32)
@@ -1156,35 +1072,43 @@ def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
     return starts, psum, contiguous_m_t
 
 
+def contiguous_psum_remap(
+    masked_m: torch.Tensor,
+    topids_to_rows: torch.Tensor,
+    experts: int,
+    route_max_m: int,
+    tile_m: int,
+):
+    """Tile-aligned psum and in-place masked-row -> contiguous-row remap."""
+    device = masked_m.device
+    experts = int(experts)
+    masked_m_i32 = masked_m[:experts].to(torch.int32)
+    starts = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    contiguous_m_t = torch.empty(1, dtype=torch.int32, device=device)
+    topids_flat = topids_to_rows.reshape(-1)
+    launch = _get_compiled_contiguous_psum_remap()
+    launch(
+        masked_m_i32,
+        topids_flat,
+        starts,
+        psum,
+        contiguous_m_t,
+        int(topids_flat.numel()),
+        experts,
+        int(route_max_m),
+        int(tile_m),
+        stream=torch.cuda.current_stream(),
+    )
+    return starts, psum, contiguous_m_t
+
+
 def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
-    """Per-token route maps via a single atomic-scatter kernel (SGLang-style),
-    no host-side argsort / nonzero / one-hot. Returns
-    ``(topids_to_rows, rows_to_tokens, masked_m)``:
-
-      topids_to_rows : (token_num, topk) int32  -- route -> grouped row
-                 = ``topk_ids[t,k]*max_m + slot`` (gather-reduce input)
-      rows_to_tokens  : (E*max_m,)        int32  -- grouped row -> source token
-                 (-1 for unused padding rows; scatter-copy input)
-      masked_m        : (E,)              int32  -- rows routed to each expert
-                 (== bincount(topk_ids), the per-expert GEMM mask)
-
-    The within-expert ``slot`` is claimed by ``atomicAdd(1)`` on a per-expert
-    counter initialized to 0; the kernel forms the grouped row in-place as
-    ``slot + e*max_m`` (one int mul-add per thread, hidden behind the atomic).
-    It writes both maps in one pass (topids_to_rows + its inverse
-    rows_to_tokens), and the final counter value is exactly ``counts[e]`` -- so
-    ``masked_m`` is the counter itself, no bincount and no host-side
-    ``arange``/``clone``/``sub`` to build or strip an offset. Order within an
-    expert is atomic-race order (nondeterministic) but self-consistent -- both
-    maps come from the same run, and the grouped GEMM is order-agnostic per
-    expert.
-    """
+    """Atomic-scatter route maps. Returns (topids_to_rows, rows_to_tokens, masked_m)."""
     device = topk_ids.device
     token_num, topk = topk_ids.shape
     numel = token_num * topk
     topk_ids_i32 = topk_ids.reshape(-1).to(torch.int32).contiguous()
-    # Per-expert counter starts at 0; the kernel applies the e*max_m offset, so
-    # after the run this buffer holds counts[e] directly == masked_m.
     atomic_buffer = torch.zeros(E, dtype=torch.int32, device=device)
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
     rows_to_tokens = torch.full((E * max_m,), -1, dtype=torch.int32, device=device)
@@ -1201,7 +1125,6 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
         grid_blocks,
         stream=torch.cuda.current_stream(),
     )
-    # atomic_buffer[e] == counts[e] now; it is masked_m, no further math.
     masked_m = atomic_buffer
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
 
@@ -1212,13 +1135,7 @@ def flydsl_moe_gather_reduce(
     gather_w: torch.Tensor,  # (token_num, topk) weight, bf16/f16 (== grouped_out dtype)
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """One-pass gather-reduce epilogue. Thin launcher over a *precomputed* gather
-    map: ``out[t] = sum_k gather_w[t,k] * grouped_out_flat[topids_to_rows[t,k]]``.
-
-    The caller builds ``topids_to_rows`` once (see ``build_topids_to_rows``,
-    argsort-free) and may share it with the route-gather step; this wrapper does
-    no host-side map building. ``grouped_out`` and ``gather_w`` must be bf16 or
-    f16 (the kernel extends the weight to f32 internally for accumulation)."""
+    """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]]."""
     if grouped_out.dim() == 4:
         split_k, E, max_m, model_dim = grouped_out.shape
     else:
@@ -1233,7 +1150,6 @@ def flydsl_moe_gather_reduce(
     else:
         raise ValueError(f"unsupported dtype {grouped_out.dtype}; need bf16/f16")
 
-    # Caller passes topids_to_rows int32 and gather_w bf16/f16 (both contiguous).
     grouped_out_flat = grouped_out.contiguous().view(split_k * E * max_m, model_dim)
     if out is None:
         out = torch.empty(
@@ -1257,22 +1173,7 @@ def flydsl_moe_gather_reduce(
     return out
 
 
-# ---------------------------------------------------------------------------
-# MoE route-gather (scatter-copy) input layout
-#
-# Pre-stage1 step: copy each token's quantized payload (and per-token scale)
-# from the flat per-token layout into the grouped per-expert layout::
-#
-#     for e in range(E):
-#         toks = tokens routed to expert e        # n = counts[e]
-#         grouped[e, :n] = a_payload[toks]
-#
-# ``flydsl_moe_scatter_copy_token`` does the heavy row copies in one kernel pass
-# (one block per grouped row, gathered from its source token via a precomputed
-# dst->src map) and fills route_tokens/route_weights with cheap host ops. The
-# reference loop it is validated against lives in
-# ``op_tests/test_moe_scatter_copy_token.py``.
-# ---------------------------------------------------------------------------
+# MoE route-gather (scatter-copy) input layout helpers
 
 
 @functools.cache
@@ -1294,17 +1195,7 @@ def flydsl_moe_scatter_copy_token(
     grouped_a1: Optional[torch.Tensor] = None,  # (E, max_m, Wp) uint8 out
     a1_scale_raw: Optional[torch.Tensor] = None,  # (E, max_m, Ws) uint8 out
 ):
-    """Copy each token's payload (and per-token scale) into the grouped layout,
-    driven by ``rows_to_tokens`` (grouped row -> source token, -1 for padding)
-    from ``build_route_maps``. Pure copy -- one kernel per tensor.
-
-    route_tokens/route_weights are NOT produced here: they are needed only by the
-    naive epilogue (built in that loop) and, for doweight_stage1, derived on
-    demand by the caller from topk_weight + topids_to_rows.
-
-    Output tensors may be passed in (the kernel writes only the mapped/valid
-    rows, leaving any pre-existing padding untouched -- e.g. an a1_scale_raw
-    pre-filled with 127). When omitted they are allocated zero-filled.
+    """Copy token payload/scale into grouped layout via rows_to_tokens map.
 
     Returns (grouped_a1, a1_scale_raw)."""
     device = a1_payload.device
@@ -1364,14 +1255,7 @@ def flydsl_moe_scatter_preshuffle_scale(
         torch.Tensor
     ] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
-    """Route-gather each token's e8m0 scale row AND preshuffle it into the WMMA
-    layout in a single kernel pass -- fusing ``flydsl_moe_scatter_copy_token``'s
-    scale copy with ``_grouped_a8w4_preshuffle_e8m0_scale``.
-
-    ``max_m`` must be a multiple of ``wmma_rep*16`` (the grouped path pads it to
-    a multiple of ``warp_tile_m``). Padding rows (``rows_to_tokens == -1``) are
-    left untouched -- the masked GEMM never reads them, matching the previous
-    uninitialized ``a1_scale_raw`` behaviour. Returns ``grouped_a1_scale``."""
+    """Fused route-gather + WMMA preshuffle for e8m0 scale rows. Returns grouped_a1_scale."""
     device = a1_scale_token_u8.device
     Ws = a1_scale_token_u8.shape[1]
     rows_per_tile = wmma_rep * 16
@@ -1409,10 +1293,7 @@ def flydsl_moe_preshuffle_scale(
     scale_k_per_tile: int,
     out: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
-    """Preshuffle an already-grouped row-major e8m0 scale into the WMMA layout in
-    one kernel pass -- the in-kernel equivalent of the torch
-    ``_grouped_a8w4_preshuffle_e8m0_scale`` permute (used by stage2, where the
-    scale is already grouped so no route-gather is needed). Returns ``out``."""
+    """Preshuffle grouped row-major e8m0 scale into WMMA layout. Returns out."""
     device = scale_grouped_u8.device
     Ws = scale_grouped_u8.shape[-1]
     rows_per_tile = wmma_rep * 16

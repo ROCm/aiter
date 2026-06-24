@@ -701,9 +701,7 @@ def _s2_args_std(
 
 
 def _run_compiled(exe, args):
-    """First call: JIT-compile via flyc.compile (compiles + executes + returns CompiledFunction).
-    Subsequent calls: fast dispatch via the cached CompiledFunction.
-    """
+    """JIT-compile on first call, then dispatch via cached CompiledFunction."""
     import flydsl.compiler as flyc
 
     cf = getattr(exe, "_cf", None)
@@ -738,16 +736,7 @@ def _run_moe_reduction(
     topk_ids=None,
     stream=None,
 ):
-    """Topk reduction epilogue for stage2 reduce mode.
-
-    Shared by the runtime stage2 path and the AOT precompile so both derive the
-    identical compile-time params (dtype_str / use_mask / num_experts) and thus
-    the identical JIT cache key. AOT must call this helper (not a hand-copied
-    variant) or the precompiled artifact will not match the runtime lookup.
-
-    ``stream`` defaults to the current CUDA stream; AOT passes ``stream=0`` since
-    it runs on CPU / FakeTensor under COMPILE_ONLY.
-    """
+    """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
     if use_mask and topk_ids is None:
         raise ValueError(
@@ -1672,17 +1661,7 @@ def flydsl_moe_stage2(
         )
     return out
 
-# ---------------------------------------------------------------------------
-# Fused MoE route-map + MXFP4 quant + scatter-copy + scale-preshuffle
-#
-# One warp-per-route kernel that replaces the four-step stage1-input prep
-# (build_route_maps -> per_1x32_f4_quant -> scatter_copy_token ->
-# scatter_preshuffle_scale). Each warp claims its grouped row via atomicAdd,
-# quantizes its token's activations straight into the grouped fp4 payload, and
-# writes the e8m0 block scales into the preshuffled WMMA layout -- no per-token
-# intermediates, no rows_to_tokens round trip. See
-# ``kernels/moe_fused_route_quant_scatter.py`` for the layout/index math.
-# ---------------------------------------------------------------------------
+# Fused route-map + MX quant + scatter-copy + scale-preshuffle kernels
 
 @functools.cache
 def _get_compiled_fused_route_quant_scatter(
@@ -1690,13 +1669,10 @@ def _get_compiled_fused_route_quant_scatter(
     topk: int,
     wmma_rep: int,
     quant_mode: str = "fp4",
+    use_expert_row_base: bool = True,
+    max_m: int = 0,
 ):
-    """Compile and cache the fused route+quant+scatter+preshuffle kernel.
-
-    Both the payload conversion path (native vs portable) and the FP8 e8m0 dtype
-    are selected inside the kernel builder from the current arch -- not caller
-    arguments.
-    """
+    """Compile and cache the fused route+quant+scatter+preshuffle kernel."""
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_route_quant_scatter_module,
     )
@@ -1706,6 +1682,8 @@ def _get_compiled_fused_route_quant_scatter(
         topk=topk,
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
+        use_expert_row_base=use_expert_row_base,
+        max_m=max_m,
     )
 
 
@@ -1715,6 +1693,8 @@ def _get_compiled_fused_route_quant_scatter_st_ksplit(
     topk: int,
     wmma_rep: int,
     quant_mode: str = "fp4",
+    use_expert_row_base: bool = True,
+    max_m: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_route_quant_scatter_st_ksplit_module,
@@ -1725,7 +1705,43 @@ def _get_compiled_fused_route_quant_scatter_st_ksplit(
         topk=topk,
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
+        use_expert_row_base=use_expert_row_base,
+        max_m=max_m,
     )
+
+
+@functools.cache
+def _get_compiled_topids_to_rows():
+    from aiter.ops.flydsl.kernels.moe_route_maps import build_moe_topids_to_rows_module
+
+    return build_moe_topids_to_rows_module()
+
+
+def flydsl_moe_topids_to_rows(
+    topk_ids: torch.Tensor,
+    E: int,
+    max_m: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build masked-layout route rows and per-expert counts."""
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    counter = torch.zeros(E, dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+
+    route_grid = (numel + 255) // 256
+    topids_to_rows_kernel = _get_compiled_topids_to_rows()
+    topids_to_rows_kernel(
+        topk_ids.to(torch.int32).reshape(-1),
+        counter,
+        topids_to_rows,
+        numel,
+        int(max_m),
+        route_grid,
+        stream=torch.cuda.current_stream(),
+    )
+    return counter, topids_to_rows.view(token_num, topk)
+
 
 
 def flydsl_moe_fused_route_quant_scatter(
@@ -1744,39 +1760,9 @@ def flydsl_moe_fused_route_quant_scatter(
         torch.Tensor
     ] = None,  # (out_E, out_max_m//wmma_rep, (model_dim//32)*wmma_rep) uint8 out
 ):
-    """Fused route-map + MXFP4 quant + scatter-copy + scale-preshuffle in one pass.
+    """Fused route+MX-quant+scatter+preshuffle in one pass.
 
-    Replaces ``build_route_maps`` + ``per_1x32_f4_quant`` / MXFP8 quant +
-    ``flydsl_moe_scatter_copy_token`` + ``flydsl_moe_scatter_preshuffle_scale``
-    for the grouped a8w4/fp4 stage1 input. One warp per route ``i = t*topk + k``:
-    lane 0 claims the within-expert slot via ``atomicAdd`` on a per-expert
-    counter (init 0), broadcasts it to the warp, and the warp quantizes token
-    ``t``'s activations straight into ``grouped_a1[row]`` (fp4 e2m1 or fp8 e4m3)
-    and the preshuffled ``grouped_a1_scale`` (e8m0). Padding rows are left
-    untouched (the masked GEMM never reads them).
-
-    The destination row is ``expert_row_base[expert] + slot``, which selects the
-    output layout:
-
-      * masked (default)        : ``expert_row_base`` = ``arange(E)*max_m`` and
-        ``(out_E, out_max_m) = (E, max_m)`` -> grouped (E, max_m) buffers.
-      * DeepGEMM contiguous-M    : pass ``expert_row_base = starts`` (the
-        tile_m-aligned exclusive prefix sum of masked_m) with
-        ``(out_E, out_max_m) = (1, contiguous_m)`` -> a single packed
-        (1, contiguous_m) buffer, and ``topids_to_rows`` already holds the global
-        contiguous rows (no separate remap).
-
-    ``hidden_states`` must be bf16. ``out_max_m`` (and ``max_m``) must be a
-    multiple of ``wmma_rep*16``, and every ``expert_row_base`` entry must be too
-    (``e*max_m`` and tile_m-aligned ``starts`` both are). ``quant_mode`` is
-    ``"fp4"`` (payload model_dim//2) or ``"fp8"`` (payload model_dim). The payload
-    conversion path is chosen inside the kernel by arch -- not a caller argument.
-    Returns ``(grouped_a1, grouped_a1_scale, masked_m, topids_to_rows)``:
-
-      grouped_a1       : (out_E, out_max_m, Pb)  uint8  payload (Pb=md//2 / md)
-      grouped_a1_scale : (out_E, out_max_m//wmma_rep, (model_dim//32)*wmma_rep)
-      masked_m         : (E,)                    int32  rows routed per expert
-      topids_to_rows   : (token_num, topk)       int32  route -> grouped row
+    Returns (grouped_a1, grouped_a1_scale, masked_m, topids_to_rows).
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
@@ -1806,14 +1792,17 @@ def flydsl_moe_fused_route_quant_scatter(
     payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
     scale_bytes_per_row = model_dim // 32
 
-    if expert_row_base is None:
-        # Masked layout: row = e*max_m + slot.
-        expert_row_base = (
-            torch.arange(E, dtype=torch.int32, device=device) * max_m
-        )
-    else:
+    use_expert_row_base = expert_row_base is not None
+    if use_expert_row_base:
         expert_row_base = expert_row_base.to(device=device, dtype=torch.int32)
 
+    use_routeks_stage1 = (
+        token_num > 1
+        and topk > 1
+        and quant_mode == "fp4"
+        and not use_expert_row_base
+    )
+    route_grid = (numel + 255) // 256
     counter = torch.zeros(E, dtype=torch.int32, device=device)
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
     if grouped_a1 is None:
@@ -1836,8 +1825,41 @@ def flydsl_moe_fused_route_quant_scatter(
     grid_blocks = (numel + warps_per_block - 1) // warps_per_block
 
     hidden_flat = hidden_states.contiguous().view(-1)
-    # The kernel reads int32 expert ids (the router's only output dtype).
     topk_ids_i32 = topk_ids.to(torch.int32).reshape(-1)
+    expert_row_base_arg = expert_row_base.reshape(-1) if use_expert_row_base else counter
+
+    if use_routeks_stage1:
+        topids_to_rows_kernel = _get_compiled_topids_to_rows()
+        topids_to_rows_kernel(
+            topk_ids_i32,
+            counter,
+            topids_to_rows,
+            numel,
+            max_m,
+            route_grid,
+            stream=torch.cuda.current_stream(),
+        )
+        launch_routeks = _get_compiled_fused_quant_preshuffle_route_ksplit(
+            feat_dim=model_dim,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+            source_topk=topk,
+        )
+        launch_routeks(
+            hidden_flat,
+            grouped_a1.view(-1),
+            grouped_a1_scale.view(-1),
+            topids_to_rows,
+            numel,
+            grid_blocks,
+            stream=torch.cuda.current_stream(),
+        )
+        return (
+            grouped_a1,
+            grouped_a1_scale,
+            counter,
+            topids_to_rows.view(token_num, topk),
+        )
 
     use_st_ksplit = token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0
     if use_st_ksplit:
@@ -1846,6 +1868,8 @@ def flydsl_moe_fused_route_quant_scatter(
             topk=topk,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
+            use_expert_row_base=use_expert_row_base,
+            max_m=max_m,
         )
     else:
         launch = _get_compiled_fused_route_quant_scatter(
@@ -1853,6 +1877,8 @@ def flydsl_moe_fused_route_quant_scatter(
             topk=topk,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
+            use_expert_row_base=use_expert_row_base,
+            max_m=max_m,
         )
     launch(
         topk_ids_i32,
@@ -1861,12 +1887,11 @@ def flydsl_moe_fused_route_quant_scatter(
         hidden_flat,
         grouped_a1.view(-1),
         grouped_a1_scale.view(-1),
-        expert_row_base.reshape(-1),
+        expert_row_base_arg,
         numel,
         grid_blocks,
         stream=torch.cuda.current_stream(),
     )
-    # counter[e] == masked_m[e] after the run.
     return (
         grouped_a1,
         grouped_a1_scale,
@@ -1882,11 +1907,7 @@ def _get_compiled_fused_route_psum_quant_scatter(
     wmma_rep: int,
     quant_mode: str = "fp4",
 ):
-    """Compile and cache the fully-fused route+psum+quant+scatter kernel.
-
-    Same arch-derived conversion/scale selection as the non-psum variant; the
-    extra phases (count + tile-aligned prefix sum) are folded into one launch.
-    """
+    """Compile and cache the fully-fused route+psum+quant+scatter kernel."""
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_route_psum_quant_scatter_module,
     )
@@ -1909,26 +1930,9 @@ def flydsl_moe_fused_route_psum_quant_scatter(
     wmma_rep: int,
     quant_mode: str = "fp4",
 ):
-    """Fully-fused DeepGEMM contiguous-M stage1 prep in a single kernel launch.
+    """Fully-fused route+psum+quant+scatter for DeepGEMM contiguous-M layout.
 
-    Folds ``torch.bincount`` + ``moe_contiguous_psum`` + the route+quant+scatter
-    kernel into one persistent kernel (see
-    ``build_moe_fused_route_psum_quant_scatter_module``). The kernel itself counts
-    per-expert rows (Phase 1), computes the tile-aligned exclusive prefix sum
-    (Phase 2, one block behind a global-atomic barrier), and routes + quantizes +
-    scatters into the single ``(1, contiguous_m)`` DeepGEMM buffer (Phase 3).
-
-    ``contiguous_m`` is the host-computed static upper bound on the packed buffer
-    size (no device->host sync; CUDAGraph-safe), and ``tile_m`` is the contiguous-M
-    tile that ``starts`` is aligned to. Returns
-    ``(grouped_a1, grouped_a1_scale, masked_m, topids_to_rows, starts, psum)``:
-
-      grouped_a1       : (1, contiguous_m, Pb)            uint8  payload
-      grouped_a1_scale : (1, contiguous_m//wmma_rep, Ws*wmma_rep)
-      masked_m         : (E,)                  int32  rows routed per expert (count)
-      topids_to_rows   : (token_num, topk)     int32  route -> global contiguous row
-      starts           : (E,)                  int32  tile-aligned prefix sum
-      psum             : (E,)                  int32  starts[e]+masked_m[e] (m_tile_map)
+    Returns (grouped_a1, grouped_a1_scale, masked_m, topids_to_rows, starts, psum).
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
@@ -1957,15 +1961,9 @@ def flydsl_moe_fused_route_psum_quant_scatter(
     payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
     scale_bytes_per_row = model_dim // 32
 
-    # Per-expert scratch (count == masked_m / slot_counter / starts / psum) plus a
-    # 2-int barrier (arrival, release); all must be zero before launch.
     count = torch.zeros(E, dtype=torch.int32, device=device)
     slot_counter = torch.zeros(E, dtype=torch.int32, device=device)
-    # starts/psum are produced in-kernel by the cross-block prefix sum (Phase 2),
-    # but zero-init them defensively: if a Phase-3 warp ever reads ``starts``
-    # before the last-arriver block's write is visible, an uninitialized value
-    # would make ``grouped_row`` wild and OOB-fault the (unbounded, max_size)
-    # payload buffer. Zeroing bounds the worst case to grouped_row == slot.
+    # Zero-init defensively; in-kernel prefix sum writes these.
     starts = torch.zeros(E, dtype=torch.int32, device=device)
     psum = torch.zeros(E, dtype=torch.int32, device=device)
     barrier = torch.zeros(2, dtype=torch.int32, device=device)
@@ -1984,8 +1982,6 @@ def flydsl_moe_fused_route_psum_quant_scatter(
 
     from aiter.jit.utils.chip_info import get_cu_num
 
-    # Persistent grid: exactly one workgroup per CU so all participants are
-    # co-resident -- required for the global-atomic spin barrier not to deadlock.
     num_workers = int(get_cu_num())
 
     hidden_flat = hidden_states.contiguous().view(-1)
@@ -2025,15 +2021,7 @@ def flydsl_moe_fused_route_psum_quant_scatter(
     )
 
 
-# ---------------------------------------------------------------------------
-# Fused grouped MXFP4/MXFP8 quant + scale-preshuffle (stage2 input prep)
-#
-# The stage2 analog of flydsl_moe_fused_route_quant_scatter: the input is already
-# grouped row-major (E, max_m, feat_dim) (the stage1 GEMM output), so there is no
-# route map / scatter -- one warp per grouped row quantizes that row into the
-# grouped MX payload and writes the preshuffled e8m0 scale in one pass. Replaces
-# per_1x32_f4_quant / MXFP8 quant + flydsl_moe_preshuffle_scale.
-# ---------------------------------------------------------------------------
+# Fused grouped MX quant + scale-preshuffle (stage2 input prep)
 
 
 @functools.cache
@@ -2060,6 +2048,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     feat_dim: int,
     wmma_rep: int,
     quant_mode: str = "fp4",
+    source_topk: int = 0,
+    remap_rows: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2069,6 +2059,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         feat_dim=feat_dim,
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
+        source_topk=source_topk,
+        remap_rows=remap_rows,
     )
 
 
@@ -2081,22 +2073,15 @@ def flydsl_moe_fused_quant_preshuffle(
     quant_mode: str = "fp4",
     masked_m: Optional[torch.Tensor] = None,  # (E,) int32 valid rows per expert
     topids_to_rows: Optional[torch.Tensor] = None,  # route -> global row
+    source_topk: int = 0,  # when >0, routeks reads source row = route // source_topk
+    row_starts: Optional[torch.Tensor] = None,  # remap masked rows to starts[e]+slot
+    route_max_m: int = 0,
     out_payload: Optional[torch.Tensor] = None,  # (E, max_m, Pb) uint8
     out_scale: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
-    ``grouped_in`` is already grouped row-major bf16 (stage2 input).
-    ``quant_mode`` is ``"fp4"`` (payload feat_dim//2) or ``"fp8"`` (payload
-    feat_dim). Returns ``(payload (E,max_m,Pb), scale_pre (E, max_m//wmma_rep,
-    (feat_dim//32)*wmma_rep))`` -- the same layout the grouped GEMM consumes.
-
-    If ``masked_m`` (the per-expert valid row count, ``expert = row // max_m``) is
-    given, the kernel skips padding rows (``slot >= masked_m[expert]``) entirely --
-    no read, no quant, no store -- which removes the bulk of the work when the
-    capacity ``max_m`` is much larger than the routed rows. This is only valid for
-    the masked ``(E, max_m)`` layout; for the contiguous-M layout pass
-    ``masked_m=None`` (all ``E*max_m`` rows are quantized, the previous behaviour).
+    Returns (payload, scale_preshuffle). Pass masked_m to skip padding rows.
     """
     if quant_mode not in ("fp4", "fp8"):
         raise NotImplementedError(
@@ -2140,16 +2125,29 @@ def flydsl_moe_fused_quant_preshuffle(
         topids_to_rows_i32 = topids_to_rows.to(device=device, dtype=torch.int32).reshape(-1)
         numel = int(topids_to_rows_i32.numel())
         grid_blocks = (numel + warps_per_block - 1) // warps_per_block
+        remap_rows = row_starts is not None
+        if remap_rows:
+            row_starts_i32 = row_starts.to(device=device, dtype=torch.int32).reshape(-1)
+            route_max_m_arg = int(route_max_m)
+            if route_max_m_arg <= 0:
+                raise ValueError("route_max_m must be positive when row_starts is provided")
+        else:
+            row_starts_i32 = masked_m
+            route_max_m_arg = 1
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
+            source_topk=source_topk,
+            remap_rows=remap_rows,
         )
         launch(
             grouped_in.contiguous().view(-1),
             out_payload.view(-1),
             out_scale.view(-1),
             topids_to_rows_i32,
+            row_starts_i32,
+            route_max_m_arg,
             numel,
             grid_blocks,
             stream=torch.cuda.current_stream(),
