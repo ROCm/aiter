@@ -395,8 +395,8 @@ if PREBUILD_KERNELS != 0:
             from aiter.aot.flydsl.common import start_aot, wait_aot
 
             flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            pool, futures = start_aot(flydsl_cache_dir)
-            wait_aot(pool, futures)
+            plan = start_aot(flydsl_cache_dir)
+            wait_aot(plan)
         finally:
             if _prev_aot_import is None:
                 os.environ.pop("AITER_AOT_IMPORT", None)

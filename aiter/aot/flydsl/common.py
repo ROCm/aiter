@@ -5,10 +5,14 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import contextmanager
 import functools
 import inspect
+import json
+import multiprocessing
+from multiprocessing.connection import wait as wait_for_sentinels
+import shutil
+import time
 from dataclasses import dataclass
 import enum
 import os
@@ -20,12 +24,23 @@ from typing import Any, Callable, Iterator
 # text just needs enough to point at the problem.
 _MAX_ERRORS_IN_MSG = 10
 
-# Default ceiling for the FlyDSL AOT process pool, applied on top of
-# affinity-aware CPU count. Each worker re-imports torch + FlyDSL
-# (~1.5-2.5 GB RSS), so 64 x 2 GB ~= 128 GB -- fits comfortably on a
-# typical 64+ core build host with >=256 GB RAM, but containers with
-# tighter cgroup memory caps may want to lower via AITER_FLYDSL_AOT_WORKERS.
+# Upper bound on concurrent AOT worker processes, capping the affinity-aware
+# CPU count. Each worker holds torch + FlyDSL resident (~1.5-2.5 GB): under
+# the default fork start method that is copy-on-write shared with the parent,
+# but under spawn/forkserver each worker re-imports it outright, so 64 workers
+# can approach ~128 GB. Comfortable on a 64+ core host with >=256 GB RAM;
+# lower via AITER_FLYDSL_AOT_WORKERS under tighter cgroup memory caps.
 _DEFAULT_MAX_WORKERS = 64
+
+# Per-kernel wall-clock cap, in seconds. This is NOT a deadlock backstop --
+# the deadlock is gone by construction (see run_aot). It only bounds a
+# worker that is genuinely stuck *alive* (e.g. an infinite loop in FlyDSL's
+# Python tracing stage); the LLVM codegen subprocess already self-caps at
+# 600s. A worker that *dies* (OOM-kill, segfault) is detected immediately
+# via its process sentinel and needs no timeout at all. The cap is generous
+# so a slow-but-live compile is never killed. Override via
+# AITER_FLYDSL_AOT_TIMEOUT (seconds; "0" disables the per-kernel cap).
+_DEFAULT_KERNEL_TIMEOUT = 1200.0
 
 
 class OpKind(enum.Enum):
@@ -237,9 +252,10 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 
 
 def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, Any]]:
-    """Per-kernel worker -- runs in a ProcessPoolExecutor child process.
-    Top-level so it's picklable. Imports compile_one_config lazily so
-    the pickle wire payload is just (kind, job-dict)."""
+    """Per-kernel worker -- runs in a child process. Top-level so it's
+    picklable under the spawn/forkserver start methods. Imports
+    compile_one_config lazily so the pickle wire payload is just
+    (kind, job-dict)."""
     if kind is OpKind.MOE:
         from .moe import compile_one_config
     elif kind is OpKind.GEMM:
@@ -255,14 +271,34 @@ def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, A
     return kind, compile_one_config(**job)
 
 
+def _compile_one_to_file(kind: OpKind, job: dict[str, Any], out_path: str) -> None:
+    """Child-process entry point. Runs the compile and writes its result
+    dict to ``out_path`` as JSON -- the child's *private* return channel.
+
+    This is the crux of the deadlock-free design: results never travel
+    through a result queue shared with sibling workers, so there is no
+    cross-process write lock (POSIX semaphore) to leak when this process is
+    OOM-killed mid-write. Each child owns its own file; siblings are
+    completely decoupled. A crash here leaves the file absent or partial,
+    which the parent treats as a failure (it only trusts the file on a clean
+    exit code) -- never a hang.
+
+    Write-then-rename so the parent never observes a torn file even if we
+    are killed between open() and the final bytes."""
+    _, result = _compile_one(kind, job)
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(result, f)
+    os.replace(tmp_path, out_path)
+
+
 def _affinity_aware_cpu_count() -> int:
     """Return the number of CPUs this process is actually allowed to
     use. ``os.cpu_count()`` reports host CPUs and ignores cgroup /
     cpuset constraints common in CI containers; ``sched_getaffinity``
     is the right answer where available (Linux). Fallback to
-    ``cpu_count`` otherwise. Clamped to >=1 -- empty-affinity-set or
-    None-from-cpu_count would otherwise yield 0 and break the
-    ``ProcessPoolExecutor(max_workers=0)`` call site."""
+    ``cpu_count`` otherwise. Clamped to >=1 -- an empty affinity set or
+    None-from-cpu_count would otherwise yield a 0 concurrency cap."""
     try:
         n = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
@@ -270,25 +306,65 @@ def _affinity_aware_cpu_count() -> int:
     return max(n, 1)
 
 
-def start_aot(
-    cache_dir: str,
-) -> tuple[ProcessPoolExecutor | None, dict[Future, JobLabel]]:
-    """Start FlyDSL AOT compilation in background processes.
+@dataclass
+class AotPlan:
+    """Everything ``wait_aot`` needs to run the compile fleet, produced by
+    ``start_aot``. No worker processes are live yet -- they are spawned and
+    reaped entirely inside ``wait_aot``, so there is no shared pool object
+    (and crucially no shared result queue) that could outlive an exception
+    or wedge the parent."""
 
-    Submits one task per kernel (across all OpKind members) to a single
-    shared ProcessPoolExecutor. Pool size is configurable via env:
+    jobs: list[tuple[OpKind, dict[str, Any]]]
+    max_workers: int
+    kernel_timeout: float
+    start_method: str | None
+    result_dir: str
 
-      AITER_FLYDSL_AOT_WORKERS -- explicit worker count. Non-integer
-                                 values raise ValueError; "0" / negatives
-                                 are clamped to 1.
-                                 default: min(_affinity_aware_cpu_count(),
-                                 _DEFAULT_MAX_WORKERS) -- affinity/cpuset-
-                                 aware count capped at the module
-                                 constant.
 
-    Returns (pool, futures_dict) -- caller must call ``wait_aot``
-    to collect results and raise on failure. If there are no jobs to
-    compile, returns (None, {}) and ``wait_aot`` becomes a no-op.
+def _resolve_start_method() -> str | None:
+    """Validate AITER_FLYDSL_AOT_START_METHOD if set. None -> the platform
+    default (fork on Linux), which is fastest and -- now that results no
+    longer flow through a shared queue -- carries no extra deadlock risk."""
+    sm = os.environ.get("AITER_FLYDSL_AOT_START_METHOD")
+    if not sm:
+        return None
+    valid = multiprocessing.get_all_start_methods()
+    if sm not in valid:
+        raise ValueError(
+            f"AITER_FLYDSL_AOT_START_METHOD={sm!r} not available; choose from {valid}"
+        )
+    return sm
+
+
+def _kernel_timeout() -> float:
+    """Per-kernel wall-clock cap in seconds. Env override is validated;
+    "0" (or negative) disables the cap. See ``_DEFAULT_KERNEL_TIMEOUT``."""
+    env = os.environ.get("AITER_FLYDSL_AOT_TIMEOUT")
+    if env is None:
+        return _DEFAULT_KERNEL_TIMEOUT
+    try:
+        return max(float(env), 0.0)
+    except ValueError as e:
+        raise ValueError(
+            f"AITER_FLYDSL_AOT_TIMEOUT must be a number of seconds, got {env!r}"
+        ) from e
+
+
+def start_aot(cache_dir: str) -> AotPlan | None:
+    """Plan FlyDSL AOT compilation. Collects one job per kernel (across all
+    OpKind members) and resolves the run configuration; ``wait_aot`` does the
+    actual spawning. Returns None (and ``wait_aot`` becomes a no-op) when
+    there are no kernels to compile.
+
+    Env:
+      AITER_FLYDSL_AOT_WORKERS      -- max concurrent worker processes.
+                                       Non-integer -> ValueError; "0"/negative
+                                       clamped to 1. Default:
+                                       min(affinity-aware CPU count,
+                                       _DEFAULT_MAX_WORKERS).
+      AITER_FLYDSL_AOT_TIMEOUT      -- per-kernel wall-clock cap, seconds
+                                       ("0" disables). See _DEFAULT_KERNEL_TIMEOUT.
+      AITER_FLYDSL_AOT_START_METHOD -- fork (default) / forkserver / spawn.
     """
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
@@ -311,69 +387,135 @@ def start_aot(
 
     if not all_jobs:
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
-        return None, {}
+        return None
 
     max_workers = min(max_workers, len(all_jobs))
+    start_method = _resolve_start_method()
+
+    # Per-child result files live here -- recreated fresh so stale results
+    # from a previous (e.g. crashed) build can never be mistaken for this
+    # run's output.
+    result_dir = os.path.join(cache_dir, ".aot_results")
+    shutil.rmtree(result_dir, ignore_errors=True)
+    os.makedirs(result_dir, exist_ok=True)
+
     print(
         f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
         f"({'+'.join(k.name for k in OpKind)}), "
-        f"{max_workers} worker processes (cache: {cache_dir})"
+        f"{max_workers} worker processes "
+        f"(start={start_method or 'fork'}, cache: {cache_dir})"
+    )
+    return AotPlan(
+        jobs=all_jobs,
+        max_workers=max_workers,
+        kernel_timeout=_kernel_timeout(),
+        start_method=start_method,
+        result_dir=result_dir,
     )
 
-    # Default fork start method is fine here: _compile_one immediately
-    # delegates to compile_one_config, which shells out to the FlyDSL
-    # compiler subprocess. The child never re-enters torch / FlyDSL /
-    # sccache-client Python in a way that would acquire an inherited
-    # mutex, so the classic fork-after-import deadlock pattern (parent
-    # thread holds lock at fork time -> child tries to acquire same lock
-    # -> deadlock) doesn't apply. Validated empirically at 64 workers
-    # (test job 299597), no hangs.
-    pool = ProcessPoolExecutor(max_workers=max_workers)
-    futures: dict[Future, JobLabel] = {}
-    for kind, job in all_jobs:
-        f = pool.submit(_compile_one, kind, job)
-        futures[f] = JobLabel(kind=kind, kernel_name=str(job.get("kernel_name", "?")))
-    return pool, futures
 
+def wait_aot(plan: AotPlan | None) -> None:
+    """Run the AOT compile fleet and raise on any failure.
 
-def wait_aot(pool: ProcessPoolExecutor | None, futures: dict[Future, JobLabel]) -> None:
-    """Wait for FlyDSL AOT workers and raise on any failure.
+    Deadlock-free by construction. Each kernel runs in its *own* independent
+    worker process that returns its result through its *own* file -- there is
+    no result queue shared across workers, hence no cross-process write lock
+    (POSIX semaphore) that an OOM-killed worker could leak to its siblings.
+    That leaked-semaphore wedge was the root cause of the multi-hour hang;
+    removing the shared channel removes the failure mode entirely.
 
-    Aggregates per-kernel results back to per-kind tallies for log
-    parity with the previous run_aot_worker output."""
-    if pool is None or not futures:
+    A worker that *dies* (OOM-kill -> exitcode -9, segfault -> -11) is noticed
+    immediately via its process sentinel and recorded as a failure -- never a
+    hang. The only timeout is a generous *per-kernel* cap for a worker stuck
+    *alive* (an infinite loop in the Python tracing stage); it has nothing to
+    do with deadlock recovery."""
+    if plan is None or not plan.jobs:
         return
-    try:
-        ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
-        errors: list[str] = []
-        for future in futures:
-            label = futures[future]
+
+    ctx = multiprocessing.get_context(plan.start_method or "fork")
+    timeout = plan.kernel_timeout
+
+    ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
+    fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
+    errors: list[str] = []
+
+    # Submission order preserved: pop() takes from the tail, so reverse.
+    queue: list[tuple[int, tuple[OpKind, dict[str, Any]]]] = list(enumerate(plan.jobs))
+    queue.reverse()
+    # proc -> (kind, label, out_path, deadline|None)
+    running: dict[Any, tuple[OpKind, JobLabel, str, float | None]] = {}
+
+    def launch() -> None:
+        while queue and len(running) < plan.max_workers:
+            idx, (kind, job) = queue.pop()
+            label = JobLabel(kind=kind, kernel_name=str(job.get("kernel_name", "?")))
+            out_path = os.path.join(plan.result_dir, f"k{idx}.json")
+            proc = ctx.Process(target=_compile_one_to_file, args=(kind, job, out_path))
+            proc.start()
+            deadline = (time.monotonic() + timeout) if timeout > 0 else None
+            running[proc] = (kind, label, out_path, deadline)
+
+    def reap(proc: Any) -> None:
+        kind, label, out_path, _ = running.pop(proc)
+        if proc.exitcode == 0 and os.path.isfile(out_path):
             try:
-                kind, result = future.result()
-                if result.get("compile_time") is not None:
-                    ok_by_kind[kind] += 1
-                else:
-                    fail_by_kind[kind] += 1
-                    # A None compile_time means compile_one_config returned
-                    # cleanly but didn't produce a kernel -- still a
-                    # failure that the original wait_aot raised on.
-                    errors.append(f"FlyDSL {label} produced no kernel")
-            except Exception as worker_err:
-                # Use the JobLabel's kind directly -- no string parsing,
-                # so a future OpKind addition won't silently misattribute.
-                fail_by_kind[label.kind] += 1
-                errors.append(f"FlyDSL {label} AOT worker crashed: {worker_err}")
+                with open(out_path) as f:
+                    result = json.load(f)
+            except Exception:
+                result = None
+            if result is not None and result.get("compile_time") is not None:
+                ok_by_kind[kind] += 1
+            else:
+                # Clean exit but no kernel produced (compile_one_config
+                # caught a compile error and returned compile_time=None).
+                fail_by_kind[kind] += 1
+                errors.append(f"FlyDSL {label} produced no kernel")
+        else:
+            # Non-zero/None exit or missing file == the worker died (OOM-kill,
+            # segfault) or could not write its result. exitcode < 0 is the
+            # negated signal number (-9 = SIGKILL, -11 = SIGSEGV).
+            fail_by_kind[kind] += 1
+            errors.append(f"FlyDSL {label} worker crashed (exitcode={proc.exitcode})")
+
+    try:
+        launch()
+        while running:
+            # Block until a worker exits, or until the nearest per-kernel
+            # deadline so a stuck-but-alive worker can be killed.
+            if timeout > 0:
+                nearest = min(d for (_, _, _, d) in running.values() if d is not None)
+                wait_timeout: float | None = max(0.0, nearest - time.monotonic())
+            else:
+                wait_timeout = None
+            wait_for_sentinels([p.sentinel for p in running], timeout=wait_timeout)
+
+            for proc in list(running):
+                if not proc.is_alive():
+                    proc.join()
+                    reap(proc)
+
+            if timeout > 0:
+                now = time.monotonic()
+                for proc in list(running):
+                    kind, label, _, deadline = running[proc]
+                    if deadline is not None and now > deadline and proc.is_alive():
+                        proc.kill()
+                        proc.join()
+                        running.pop(proc)
+                        fail_by_kind[kind] += 1
+                        errors.append(
+                            f"FlyDSL {label} exceeded per-kernel timeout "
+                            f"({timeout:.0f}s); killed"
+                        )
+
+            launch()  # refill freed slots
+
         for kind in OpKind:
             print(
                 f"[aiter] FlyDSL {kind.name} AOT: "
                 f"compiled {ok_by_kind[kind]} ok, {fail_by_kind[kind]} failed"
             )
         if errors:
-            # Dedupe before truncating: a BrokenProcessPool cascades to
-            # every remaining future.result() call with the SAME message,
-            # which would otherwise fill the cap with copies of one
-            # symptom and bury the actual first crash.
             seen: set[str] = set()
             unique_errors = [e for e in errors if not (e in seen or seen.add(e))]
             head = unique_errors[:_MAX_ERRORS_IN_MSG]
@@ -387,4 +529,13 @@ def wait_aot(pool: ProcessPoolExecutor | None, futures: dict[Future, JobLabel]) 
                 f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
             )
     finally:
-        pool.shutdown(wait=False)
+        # Kill any survivors (e.g. on an unexpected exception) so we never
+        # leave orphaned compilers blocking the build's exit, then drop the
+        # per-child result files.
+        for proc in list(running):
+            try:
+                if proc.is_alive():
+                    proc.kill()
+            except Exception:
+                pass
+        shutil.rmtree(plan.result_dir, ignore_errors=True)
