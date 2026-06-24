@@ -400,17 +400,21 @@ def grad_dense_partials_kernel(
 
     # Group-rebased buffers bounded to M_b rows: any local row >= M_b zero-fills
     # (CDNA OOB-load == 0), so tail rows contribute 0 to the contraction.
+    # base_byte_offset MUST be computed in int64: at the North-Star shape seq_start
+    # reaches ~L ≈ 7.86M rows, so seq_start*K*2 ≈ 4 GB overflows int32 (silently
+    # wrapping the descriptor base). num_records_bytes stays in-range (per-group,
+    # M_b ≤ Mi) so an int32 product is fine there.
     j_rsrc = fx.buffer_ops.create_buffer_resource(
         JAGGED,
         max_size=False,
         num_records_bytes=fx.Int64(fx.Int32(M_b) * fx.Int32(K) * fx.Int32(2)),
-        base_byte_offset=fx.Int32(seq_start) * fx.Int32(K) * fx.Int32(2),
+        base_byte_offset=fx.Int64(seq_start) * fx.Int64(K * 2),
     )
     d_rsrc = fx.buffer_ops.create_buffer_resource(
         DOUT,
         max_size=False,
         num_records_bytes=fx.Int64(fx.Int32(M_b) * fx.Int32(N) * fx.Int32(2)),
-        base_byte_offset=fx.Int32(seq_start) * fx.Int32(N) * fx.Int32(2),
+        base_byte_offset=fx.Int64(seq_start) * fx.Int64(N * 2),
     )
 
     # LDS staging tiles, both (out_dim, m) with m (the contraction) contiguous so
