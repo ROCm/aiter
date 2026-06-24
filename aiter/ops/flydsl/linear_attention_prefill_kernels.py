@@ -45,9 +45,12 @@ from .kernels.chunk_gated_delta_h_vk_naive import (
 from .kernels.chunk_gated_delta_h_kv_naive import (
     compile_chunk_gated_delta_h_kv_naive,
 )
-from .kernels.chunk_gated_delta_h_hipport import (
-    compile_chunk_gated_delta_h_hipport,
-)
+try:
+    from .kernels.chunk_gated_delta_h_hipport import (
+        compile_chunk_gated_delta_h_hipport,
+    )
+except ModuleNotFoundError:
+    compile_chunk_gated_delta_h_hipport = None
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
@@ -1217,6 +1220,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         gk = gk.contiguous()
         if g_log2_scaled:
             gk = gk * _RCP_LN2
+
+    # EXPERIMENT (vn-direct, kv_naive only): pre-transpose k
+    # [B, T_flat, Hg, K] -> [B, Hg, K, T_flat] so GEMM2 sees BT row-contiguous.
+    if _fork == "kv_naive":
+        k = k.permute(0, 2, 3, 1).contiguous()
 
     h = k.new_empty(h_shape)
     v_new_buf = k.new_empty(vn_shape, dtype=vn_dtype)

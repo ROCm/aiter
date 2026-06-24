@@ -152,8 +152,8 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_W_BYTES = LDS_W_ELEMS * 2
 
     LDS_K_PAD = 8
-    LDS_K_STRIDE = K + LDS_K_PAD
-    LDS_K_ELEMS = BT * LDS_K_STRIDE
+    LDS_K_STRIDE = BT + LDS_K_PAD   # EXPERIMENT (vn-direct): lds_k = [K, BT]
+    LDS_K_ELEMS = K * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
     LDS_VN_PAD = 4
@@ -169,7 +169,7 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_G_ELEMS = BT
     LDS_G_BYTES = LDS_G_ELEMS * 4
 
-    _K5_KERNEL_REVISION = 2  # naive KV fork + OPT-C(g) g-LDS-stage (distinct cache namespace)
+    _K5_KERNEL_REVISION = 201  # EXP vn-direct v2: k[K,BT] std-A + vn register direct (numpy-verified)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -252,11 +252,15 @@ def compile_chunk_gated_delta_h_kv_naive(
 
         v8bf16_type = T.vec(8, T.bf16)
         lds_w_memref = lds_w_ptr.get()
+        lds_k_memref = lds_k_ptr.get()
 
         v4bf16_w_type = T.vec(4, T.bf16)
 
         def _lds_vec_read_w_bf16x4(elem_idx):
             return vector.load_op(v4bf16_w_type, lds_w_memref, [elem_idx])
+
+        def _lds_vec_read_k_bf16x4(elem_idx):  # EXPERIMENT (vn-direct) std-A read from lds_k[K,BT]
+            return vector.load_op(v4bf16_w_type, lds_k_memref, [elem_idx])
 
         v4bf16_type = T.vec(4, T.bf16)
 
@@ -289,8 +293,9 @@ def compile_chunk_gated_delta_h_kv_naive(
         stride_h = fx.Int32(H * V * K)
 
         gqa_ratio = H // Hg
-        k_base = (bos * fx.Int32(Hg) + i_h // fx.Int32(gqa_ratio)) * fx.Int32(K)
-        stride_k = fx.Int32(Hg * K)
+        # EXPERIMENT (vn-direct): k pre-transposed to [B, Hg, K, T_flat].
+        i_hg_kv = i_h // fx.Int32(gqa_ratio)
+        k_base = i_hg_kv * fx.Int32(K) * T_flat + bos
 
         if const_expr(WU_CONTIGUOUS):
             if const_expr(IS_VARLEN):
@@ -427,21 +432,24 @@ def compile_chunk_gated_delta_h_kv_naive(
             gpu.barrier()
 
             # ============================================================
-            # 3. Load k -> lds_k (NO prefetch; before GEMM2 use)
+            # 3. Load k (pre-transposed [B,Hg,K,T_flat]) -> lds_k [K, BT].
+            # Each thread loads 8 contiguous tokens (BT, row-contiguous) for
+            # one K row, stores them contiguously into lds_k's [K, BT].
             # ============================================================
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                    abs_row = i_t_i32 * fx.Int32(BT) + row
-                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    k_off = (
-                        k_base + safe_row * stride_k + fx.Int32(kb * 64) + load_col_base
-                    )
-                    k_vec = k_.vec_load((fx.Index(k_off),), LOAD_VEC_WIDTH)
-                    k_lds_off = (
-                        row * fx.Int32(LDS_K_STRIDE) + fx.Int32(kb * 64) + load_col_base
-                    )
-                    lds_k.vec_store((fx.Index(k_lds_off),), k_vec, LOAD_VEC_WIDTH)
+            K_TOK_THREADS = BT // LOAD_VEC_WIDTH               # 8
+            K_ROWS_PER_BATCH = BLOCK_THREADS // K_TOK_THREADS  # 32
+            K_LOAD_BATCHES = K // K_ROWS_PER_BATCH             # 4
+            k_load_krow = tid // fx.Int32(K_TOK_THREADS)
+            k_load_tokbase = (tid % fx.Int32(K_TOK_THREADS)) * fx.Int32(LOAD_VEC_WIDTH)
+            for batch in range_constexpr(K_LOAD_BATCHES):
+                k_row = fx.Int32(batch * K_ROWS_PER_BATCH) + k_load_krow
+                abs_tok = i_t_i32 * fx.Int32(BT) + k_load_tokbase
+                in_b = abs_tok < T_local
+                k_off = k_base + k_row * T_flat + k_load_tokbase
+                k_off = in_b.select(k_off, k_base)
+                k_vec = k_.vec_load((fx.Index(k_off),), LOAD_VEC_WIDTH)
+                k_lds_off = k_row * fx.Int32(LDS_K_STRIDE) + k_load_tokbase
+                lds_k.vec_store((fx.Index(k_lds_off),), k_vec, LOAD_VEC_WIDTH)
 
             gpu.barrier()
 
@@ -575,40 +583,24 @@ def compile_chunk_gated_delta_h_kv_naive(
             gpu.barrier()
 
             # ============================================================
-            # 8. GEMM2: h += k^T @ v_new_gated. VWARP.
+            # 8. GEMM2: h[K,V] += k[K,BT] @ v_new_gated[BT,V]. VWARP.
+            # EXPERIMENT (vn-direct): mirror GEMM1 -- A=k standard read from
+            # lds_k[K,BT] (BT reduction row-contiguous), B=vn fed straight from
+            # registers (vn_frags, standard B). Reduction over BT split into
+            # BT_MTILES 16-row tiles; vn_frags[m_bt] is each reduction tile.
+            # (numpy-verified index formulas, err ~1e-5.)
             # ============================================================
-            BT_STEPS = BT // WMMA_K
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for bt_s in range_constexpr(BT_STEPS):
-                    bt_row_tr = (
-                        fx.Int32(bt_s * WMMA_K) + lane_m_base * fx.Int32(8) + tr_k_group
-                    )
-                    vn_v_col = wid * fx.Int32(16) + tr_col_sub * fx.Int32(4)
-                    vn_lds_elem = bt_row_tr * fx.Int32(LDS_VN_STRIDE) + vn_v_col
-                    vn_lds_byte = vn_lds_elem * fx.Int32(2) + fx.Int32(lds_vn_offset)
-                    vn_b_lo = _ds_read_tr_bf16x4(vn_lds_byte)
-                    vn_b_hi = _ds_read_tr_bf16x4(
-                        vn_lds_byte + fx.Int32(4 * LDS_VN_STRIDE * 2)
-                    )
-
-                    for slot in range_constexpr(K_SUB_PER_BLOCK):
-                        k_col = fx.Int32(slot * 16) + tr_col_sub * fx.Int32(4)
-                        k_lds_elem = (
-                            bt_row_tr * fx.Int32(LDS_K_STRIDE)
-                            + fx.Int32(kb * 64)
-                            + k_col
-                        )
-                        k_lds_byte = k_lds_elem * fx.Int32(2) + fx.Int32(lds_k_offset)
-                        k_a_lo = _ds_read_tr_bf16x4(k_lds_byte)
-                        k_a_hi = _ds_read_tr_bf16x4(
-                            k_lds_byte + fx.Int32(4 * LDS_K_STRIDE * 2)
-                        )
-                        acc_idx = kb * N_REPEAT + slot
+                for slot in range_constexpr(N_REPEAT):
+                    acc_idx = kb * N_REPEAT + slot
+                    for m_bt in range_constexpr(BT_MTILES):
+                        k_lds_row = fx.Index(kb * 64 + slot * 16) + lane_n_idx
+                        k_lds_col = fx.Index(m_bt * 16) + lane_m_base_idx * fx.Index(4)
+                        k_lds_idx = k_lds_row * fx.Index(LDS_K_STRIDE) + k_lds_col
+                        k_a = _lds_vec_read_k_bf16x4(k_lds_idx)
+                        vn_b = vn_frags[m_bt].to(fx.BFloat16)
                         h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
-                            k_a_lo, vn_b_lo, h_accs_in[acc_idx]
-                        )
-                        h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
-                            k_a_hi, vn_b_hi, h_accs_in[acc_idx]
+                            k_a, vn_b, h_accs_in[acc_idx]
                         )
 
             gpu.barrier()
