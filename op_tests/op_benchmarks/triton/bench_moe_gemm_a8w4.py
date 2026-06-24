@@ -13,8 +13,8 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     swizzle_scales_gfx950,
     swizzle_scales_gfx1250,
-    preshuffle_weights_gfx1250,
 )
+from aiter.ops.shuffle import shuffle_weight_gfx1250
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
 from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8, downcast_to_mxfp
@@ -204,8 +204,8 @@ def bench_mlp_single_weight_init(
         w2_scale, dim1, dim2 // TP // 2
     )
     if preshuffle:
-        w1 = preshuffle_weights_gfx1250(w1)
-        w2 = preshuffle_weights_gfx1250(w2)
+        w1 = shuffle_weight_gfx1250(w1)
+        w2 = shuffle_weight_gfx1250(w2)
 
     # -- benchmark --
     x_dtype_str = x_dtype

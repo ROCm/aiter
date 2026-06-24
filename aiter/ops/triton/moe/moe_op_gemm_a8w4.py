@@ -79,21 +79,6 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def preshuffle_weights_gfx1250(w: torch.Tensor) -> torch.Tensor:
-    assert w.ndim == 3, f"Expected 3D weight tensor (E, K, N), got {w.ndim}"
-    E, K, N = w.shape
-    assert K % 16 == 0, f"K ({K}) must be divisible by 16 for MFMA preshuffling"
-    assert N % 16 == 0, f"N ({N}) must be divisible by 16 for MFMA preshuffling"
-
-    w = w.transpose(1, 2)
-    w = w.view(E, N // 16, 16, K // 16, 16)
-    w = w.permute(0, 1, 3, 2, 4).contiguous()
-    w = w.view(E, N // 16, K * 16)
-    w = w.transpose(1, 2)
-
-    return w
-
-
 def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     block_m = routing_data.block_m
     group_m = 4
