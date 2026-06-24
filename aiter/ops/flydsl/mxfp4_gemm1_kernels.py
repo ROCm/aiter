@@ -84,6 +84,7 @@ def flydsl_mxfp4_gemm1(
     D_HIDDEN,
     D_INTER,
     topk,
+    stream=None,
 ):
     """Run the FlyDSL port gemm1, writing inter_sorted_quant / inter_sorted_shuffled_scale.
 
@@ -124,6 +125,6 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
-            torch.cuda.current_stream(),
+            torch.cuda.current_stream() if stream is None else stream,
         ),
     )

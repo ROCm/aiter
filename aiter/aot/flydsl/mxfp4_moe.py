@@ -136,9 +136,11 @@ def parse_csv(csv_path: str):
 def _dummy(nbytes=256):
     import torch
 
+    # CPU tensor on purpose: AOT precompile must be GPU-free (the build host may
+    # have no gfx950 device, and fork-based pool workers cannot re-init CUDA).
     # Only .data_ptr() / .device are read by the port entry points; values and
     # exact sizes are irrelevant under COMPILE_ONLY (no kernel actually runs).
-    return torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
+    return torch.zeros(nbytes, dtype=torch.uint8, device="cpu")
 
 
 def _compile_stage1(job):
@@ -170,6 +172,7 @@ def _compile_stage1(job):
         D_HIDDEN=job["D_HIDDEN"],
         D_INTER=job["D_INTER"],
         topk=job["topk"],
+        stream=0,  # GPU-free AOT: COMPILE_ONLY never dispatches, so no real stream
     )
 
 
@@ -203,6 +206,7 @@ def _compile_stage2(job):
         flat_out_scale=_dummy() if mxfp4out else None,
         cshuffle=epilog == "nonatomic_cshuffle",
         D_INTER_REAL=job["D_INTER_REAL"],
+        stream=0,  # GPU-free AOT: COMPILE_ONLY never dispatches, so no real stream
     )
 
 

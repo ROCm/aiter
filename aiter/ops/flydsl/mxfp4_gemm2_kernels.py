@@ -68,8 +68,8 @@ def _get_compiled_mxfp4_gemm2_port(
 
 
 @functools.cache
-def _dummy_out_scale(device_index):
-    return torch.empty(1, dtype=torch.uint8, device=torch.device("cuda", device_index))
+def _dummy_out_scale(device):
+    return torch.empty(1, dtype=torch.uint8, device=device)
 
 
 def _assert_supported(
@@ -130,6 +130,7 @@ def flydsl_mxfp4_gemm2(
     flat_out_scale=None,
     cshuffle=False,
     D_INTER_REAL=None,
+    stream=None,
 ):
     """Run the FlyDSL port gemm2, writing flat_out (plus flat_out_scale when mxfp4out).
 
@@ -159,7 +160,7 @@ def flydsl_mxfp4_gemm2(
 
     # Only the mxfp4 epilog writes a scale; pass a dummy out_scale otherwise so the
     # launch signature stays uniform.
-    out_scale = flat_out_scale if mxfp4out else _dummy_out_scale(flat_out.device.index)
+    out_scale = flat_out_scale if mxfp4out else _dummy_out_scale(flat_out.device)
 
     # gemm2 only needs base pointers (assumes contiguity + derives sizes from
     # compile-time consts), so pass raw data_ptr() addresses instead of full
@@ -179,6 +180,6 @@ def flydsl_mxfp4_gemm2(
             max_m_blocks,
             flat_out.data_ptr(),
             out_scale.data_ptr(),
-            torch.cuda.current_stream(),
+            torch.cuda.current_stream() if stream is None else stream,
         ),
     )
