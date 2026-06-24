@@ -105,6 +105,25 @@ def validate_paged_attention_rocm_buffers(
         )
 
 
+def _normalize_hip_fp8_scale(scale, key_cache, block_size, num_kv_heads):
+    """Convert vLLM block-major scales to HIP head-major layout."""
+    if scale is None:
+        return scale
+    num_kv_blocks = key_cache.size(0)
+    if (
+        scale.dim() == 3
+        and scale.size(0) == num_kv_blocks
+        and scale.size(1) == num_kv_heads
+        and scale.size(2) == block_size
+    ):
+        return (
+            scale.permute(1, 0, 2)
+            .contiguous()
+            .view(num_kv_heads, num_kv_blocks * block_size)
+        )
+    return scale
+
+
 def paged_attention_rocm(
     out,
     exp_sums,
@@ -161,12 +180,20 @@ def paged_attention_rocm(
     head_size = query.size(2)
     q_stride = query.stride(0)
     max_num_blocks_per_seq = block_tables.size(1)
+    num_kv_blocks = key_cache.size(0)
     kv_block_stride = key_cache.stride(0)
     kv_head_stride = key_cache.stride(1)
     gqa_ratio = int(num_heads / num_kv_heads)
     max_num_partitions = int(math.ceil(max_context_len / partition_size))
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
     v_shuffle = value_cache.dim() == 5
+
+    key_scale = _normalize_hip_fp8_scale(
+        key_scale, key_cache, block_size, num_kv_heads
+    )
+    value_scale = _normalize_hip_fp8_scale(
+        value_scale, key_cache, block_size, num_kv_heads
+    )
 
     quant_method = "vllm::Fp8QuantMethod::kPerTensor"
     if key_scale is not None:
@@ -276,6 +303,7 @@ def paged_attention_rocm(
         num_kv_heads,
         num_heads,
         max_num_blocks_per_seq,
+        num_kv_blocks,
         q_stride,
         kv_block_stride,
         kv_head_stride,
