@@ -193,6 +193,16 @@ def build_flash_attn_fp8_module(
     IGLP_VARIANT = 1
     # s_setprio bias for the softmax-role (transcendental) wave; 0 disables.
     SOFTMAX_PRIO = 1
+    # USE_SCHRAUDOLPH: replace the per-element quarter-rate v_exp_f32 in the P
+    # exp2 with the Schraudolph linear-mantissa bit trick (full-rate VALU).  The
+    # P output is quantized to fp8 E4M3 (~6% precision) so the ~2% approx error
+    # is below the quantization floor.  corr (the O-rescale) stays exact.
+    USE_SCHRAUDOLPH = True
+    # EXP2_SHIFT: scale all Schraudolph P up by 2^SHIFT.  A global P scale cancels
+    # in the softmax normalization (O and L both scale), so this only repositions
+    # P (range [2^-9,1]) within fp8 E4M3 -- a few bits up lifts small P out of the
+    # subnormal range and improves quantization accuracy for free.
+    EXP2_SHIFT = 4.0
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fp8_attn_kernel(
@@ -298,6 +308,24 @@ def build_flash_attn_fp8_module(
         scale_log2e = _fmul(qk_scale, c_log2e)
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
+
+        # Schraudolph base-2 exp constants: 2^y ~= bitcast_f32(floor(2^23*y + B))
+        # with B = (127 - c)*2^23.  c ~= 0.0426 centers the linear-mantissa
+        # interpolation error of 2^frac around 0 (peak |err| ~2%).
+        c_2p23 = fx.Float32(float(1 << 23))
+        # EXP2_SHIFT lifts all P up by 2^SHIFT (global scale cancels in softmax
+        # normalization; only repositions P within fp8 E4M3, out of subnormals).
+        c_exp2_bias = fx.Float32((127.0 - 0.0426 + EXP2_SHIFT) * float(1 << 23))
+
+        def _schraudolph(s, scale_x2p23, m_term):
+            # 2^(s*scale_log2e - m_new*scale_log2e) via the Schraudolph bit trick,
+            # fused: biased = s*(scale_log2e*2^23) + (-m_new*scale_log2e*2^23 + B).
+            # The mul+add contracts to a single FMA under fastmath, so the whole
+            # exp2 is FMA + max + fptosi + (free) bitcast == 3 full-rate ops,
+            # vs the original mul+add+v_exp_f32 (~6 incl. the quarter-rate exp).
+            # Clamp >= 0 so deep-negative exponents (P underflow) map to 0.0.
+            biased = _fmax(_fadd(_fmul(s, scale_x2p23), m_term), c_zero_f)
+            return arith.bitcast(T.f32, arith.fptosi(T.i32, _raw(biased)))
 
         # ===================================================================
         # DMA global->LDS (raw_ptr_buffer_load_lds): each lane streams a 16-byte
@@ -620,17 +648,30 @@ def build_flash_attn_fp8_module(
             # at most 4 live P scalars instead of all 64.  p_words is built in
             # C-layout B-operand order (no hi-peer shuffle_xor on P needed).
             p_words = []
+            if const_expr(USE_SCHRAUDOLPH):
+                # Fold scale_log2e and the 2^23 / bias affine into per-tile coeffs
+                # so each element's exp2 is one FMA + max + fptosi.
+                scale_x2p23 = _fmul(scale_log2e, c_2p23)
+                m_term = _fadd(_fmul(neg_scaled_m_new, c_2p23), c_exp2_bias)
             for nt in range_constexpr(N_KV_TILES):
                 for rg in range_constexpr(n_groups):
-                    ps = [
-                        ArithValue(
-                            _fadd(
-                                _fmul(Vec(s_accs[nt])[rg * 4 + i], scale_log2e),
-                                neg_scaled_m_new,
+                    if const_expr(USE_SCHRAUDOLPH):
+                        ps = [
+                            _schraudolph(
+                                Vec(s_accs[nt])[rg * 4 + i], scale_x2p23, m_term
                             )
-                        ).exp2(fastmath=fm_fast)
-                        for i in range_constexpr(4)
-                    ]
+                            for i in range_constexpr(4)
+                        ]
+                    else:
+                        ps = [
+                            ArithValue(
+                                _fadd(
+                                    _fmul(Vec(s_accs[nt])[rg * 4 + i], scale_log2e),
+                                    neg_scaled_m_new,
+                                )
+                            ).exp2(fastmath=fm_fast)
+                            for i in range_constexpr(4)
+                        ]
                     p_words.append(_f32x4_to_fp8_word(*ps))
             p_pack = Vec.from_elements(p_words, fx.Int32)
             # Row sum via ones-column MFMAs: ones(A) @ P(B) -> lr(C).
