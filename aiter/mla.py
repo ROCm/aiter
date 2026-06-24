@@ -9,8 +9,6 @@ import torch
 import triton
 import triton.language as tl
 
-import os
-
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
@@ -27,11 +25,15 @@ def _flydsl_mla_reduce_enabled() -> bool:
     (a native grid-launch reduce that hits HBM parity with the HIP kernel).
     Falls back silently to HIP if FlyDSL is not installed/compatible.
     """
-    if os.environ.get("AITER_MLA_REDUCE_FLYDSL", "0") != "1":
-        return False
     try:
+        from flydsl.utils.env import EnvManager, OptBool
         from aiter.ops.flydsl import is_flydsl_available
 
+        class _Env(EnvManager):
+            enabled = OptBool(False, env_var="AITER_MLA_REDUCE_FLYDSL")
+
+        if not _Env().enabled:
+            return False
         return is_flydsl_available()
     except Exception:
         return False
