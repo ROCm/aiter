@@ -610,6 +610,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     max_m = max(
         warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
     )
+    max_m = 16
     _grouped_dbg(f"routing max_m={max_m}")
 
     # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
