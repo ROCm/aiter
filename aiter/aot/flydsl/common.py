@@ -18,29 +18,11 @@ import enum
 import os
 from typing import Any, Callable, Iterator
 
-# Cap on the entries embedded in the AssertionError message -- beyond
-# this we append a "(... N more)" suffix. Per-kernel diagnostics still
-# go to stdout from compile_one_config's [FAIL] prints; the exception
-# text just needs enough to point at the problem.
-_MAX_ERRORS_IN_MSG = 10
-
-# Upper bound on concurrent AOT worker processes, capping the affinity-aware
-# CPU count. Each worker holds torch + FlyDSL resident (~1.5-2.5 GB): under
-# the default fork start method that is copy-on-write shared with the parent,
-# but under spawn/forkserver each worker re-imports it outright, so 64 workers
-# can approach ~128 GB. Comfortable on a 64+ core host with >=256 GB RAM;
-# lower via AITER_FLYDSL_AOT_WORKERS under tighter cgroup memory caps.
-_DEFAULT_MAX_WORKERS = 64
-
-# Per-kernel wall-clock cap, in seconds. This is NOT a deadlock backstop --
-# the deadlock is gone by construction (see run_aot). It only bounds a
-# worker that is genuinely stuck *alive* (e.g. an infinite loop in FlyDSL's
-# Python tracing stage); the LLVM codegen subprocess already self-caps at
-# 600s. A worker that *dies* (OOM-kill, segfault) is detected immediately
-# via its process sentinel and needs no timeout at all. The cap is generous
-# so a slow-but-live compile is never killed. Override via
-# AITER_FLYDSL_AOT_TIMEOUT (seconds; "0" disables the per-kernel cap).
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
+_DEFAULT_MAX_WORKERS = 64
+_DEFAULT_MAX_RETRIES = 2
+_DEFAULT_MEM_PER_WORKER_GB = 2.0
+_MAX_ERRORS_IN_MSG = 10
 
 
 class OpKind(enum.Enum):
@@ -55,10 +37,7 @@ class OpKind(enum.Enum):
 
 @dataclass(frozen=True)
 class JobLabel:
-    """Diagnostic label attached to a submitted future. Replaces the
-    earlier string-formatted label that wait_aot had to parse back into
-    a kind via ``label.startswith(OpKind.MOE.name)`` -- a heuristic that
-    silently misattributed crashes if a future OpKind member was added."""
+    """Diagnostic label attached to a submitted future."""
 
     kind: OpKind
     kernel_name: str
@@ -252,10 +231,9 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 
 
 def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, Any]]:
-    """Per-kernel worker -- runs in a child process. Top-level so it's
-    picklable under the spawn/forkserver start methods. Imports
-    compile_one_config lazily so the pickle wire payload is just
-    (kind, job-dict)."""
+    """Per-kernel worker -- runs in a forked child process. Imports
+    compile_one_config lazily so the import cost is paid once in the
+    child rather than in the parent."""
     if kind is OpKind.MOE:
         from .moe import compile_one_config
     elif kind is OpKind.GEMM:
@@ -293,12 +271,9 @@ def _compile_one_to_file(kind: OpKind, job: dict[str, Any], out_path: str) -> No
 
 
 def _affinity_aware_cpu_count() -> int:
-    """Return the number of CPUs this process is actually allowed to
-    use. ``os.cpu_count()`` reports host CPUs and ignores cgroup /
-    cpuset constraints common in CI containers; ``sched_getaffinity``
-    is the right answer where available (Linux). Fallback to
-    ``cpu_count`` otherwise. Clamped to >=1 -- an empty affinity set or
-    None-from-cpu_count would otherwise yield a 0 concurrency cap."""
+    """Number of CPUs this process may actually use (respects cgroup /
+    cpuset limits via ``sched_getaffinity``, unlike ``os.cpu_count()``).
+    Falls back to ``cpu_count`` and is clamped to >=1."""
     try:
         n = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
@@ -317,26 +292,11 @@ class AotPlan:
     jobs: list[tuple[OpKind, dict[str, Any]]]
     max_workers: int
     kernel_timeout: float
-    start_method: str | None
+    max_retries: int
     result_dir: str
 
 
-def _resolve_start_method() -> str | None:
-    """Validate AITER_FLYDSL_AOT_START_METHOD if set. None -> the platform
-    default (fork on Linux), which is fastest and -- now that results no
-    longer flow through a shared queue -- carries no extra deadlock risk."""
-    sm = os.environ.get("AITER_FLYDSL_AOT_START_METHOD")
-    if not sm:
-        return None
-    valid = multiprocessing.get_all_start_methods()
-    if sm not in valid:
-        raise ValueError(
-            f"AITER_FLYDSL_AOT_START_METHOD={sm!r} not available; choose from {valid}"
-        )
-    return sm
-
-
-def _kernel_timeout() -> float:
+def get_kernel_timeout() -> float:
     """Per-kernel wall-clock cap in seconds. Env override is validated;
     "0" (or negative) disables the cap. See ``_DEFAULT_KERNEL_TIMEOUT``."""
     env = os.environ.get("AITER_FLYDSL_AOT_TIMEOUT")
@@ -350,25 +310,55 @@ def _kernel_timeout() -> float:
         ) from e
 
 
-def start_aot(cache_dir: str) -> AotPlan | None:
-    """Plan FlyDSL AOT compilation. Collects one job per kernel (across all
-    OpKind members) and resolves the run configuration; ``wait_aot`` does the
-    actual spawning. Returns None (and ``wait_aot`` becomes a no-op) when
-    there are no kernels to compile.
+def get_max_retries() -> int:
+    """Retries for a worker that died abnormally. Env override validated;
+    "0" disables retries. See ``_DEFAULT_MAX_RETRIES``."""
+    env = os.environ.get("AITER_FLYDSL_AOT_MAX_RETRIES")
+    if env is None:
+        return _DEFAULT_MAX_RETRIES
+    try:
+        return max(int(env), 0)
+    except ValueError as e:
+        raise ValueError(
+            f"AITER_FLYDSL_AOT_MAX_RETRIES must be an integer, got {env!r}"
+        ) from e
 
-    Env:
-      AITER_FLYDSL_AOT_WORKERS      -- max concurrent worker processes.
-                                       Non-integer -> ValueError; "0"/negative
-                                       clamped to 1. Default:
-                                       min(affinity-aware CPU count,
-                                       _DEFAULT_MAX_WORKERS).
-      AITER_FLYDSL_AOT_TIMEOUT      -- per-kernel wall-clock cap, seconds
-                                       ("0" disables). See _DEFAULT_KERNEL_TIMEOUT.
-      AITER_FLYDSL_AOT_START_METHOD -- fork (default) / forkserver / spawn.
-    """
-    os.makedirs(cache_dir, exist_ok=True)
-    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
+def _memory_worker_cap(default_workers: int) -> int:
+    """Cap concurrency by available memory so the OOM-killer never fires.
+
+    A worker SIGKILLed mid-result by the OOM-killer was the original deadlock
+    trigger; the cleanest defense is to not run out of memory at all. Assumes
+    ``AITER_FLYDSL_AOT_MEM_PER_WORKER_GB`` (default
+    ``_DEFAULT_MEM_PER_WORKER_GB``) resident per worker. If psutil is
+    unavailable the cap is skipped."""
+    env = os.environ.get("AITER_FLYDSL_AOT_MEM_PER_WORKER_GB")
+    try:
+        per_gb = float(env) if env else _DEFAULT_MEM_PER_WORKER_GB
+    except ValueError as e:
+        raise ValueError(
+            f"AITER_FLYDSL_AOT_MEM_PER_WORKER_GB must be a number, got {env!r}"
+        ) from e
+    if per_gb <= 0:
+        return default_workers
+    try:
+        import psutil
+
+        avail_gb = psutil.virtual_memory().available / (1024**3)
+    except Exception:
+        return default_workers
+    return min(default_workers, max(1, int(avail_gb / per_gb)))
+
+
+def get_max_workers(num_jobs: int) -> int:
+    """Resolve the concurrent AOT worker-process cap.
+
+    ``AITER_FLYDSL_AOT_WORKERS``, if set, is honored verbatim (non-integer ->
+    ValueError; "0"/negative clamped to 1) and bypasses the memory cap -- an
+    explicit setting is the caller's deliberate choice. Otherwise the cap is
+    ``min(affinity-aware CPU count, _DEFAULT_MAX_WORKERS)`` further bounded by
+    available memory so the OOM-killer never fires. Either way the result never
+    exceeds ``num_jobs`` -- spawning more workers than kernels is pointless."""
     workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
     if workers_env is not None:
         try:
@@ -379,6 +369,41 @@ def start_aot(cache_dir: str) -> AotPlan | None:
             ) from e
     else:
         max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
+        # Auto path only: also bound by memory so we never trip the OOM-killer.
+        max_workers = _memory_worker_cap(max_workers)
+    return min(max_workers, num_jobs)
+
+
+def start_aot(cache_dir: str) -> AotPlan | None:
+    """Plan FlyDSL AOT compilation. Collects one job per kernel (across all
+    OpKind members) and resolves the run configuration; ``wait_aot`` does the
+    actual spawning. Returns None (and ``wait_aot`` becomes a no-op) when
+    there are no kernels to compile.
+
+    Env:
+      AITER_FLYDSL_AOT_WORKERS         -- max concurrent worker processes.
+                                          Non-integer -> ValueError;
+                                          "0"/negative clamped to 1. Default:
+                                          min(affinity-aware CPU count,
+                                          _DEFAULT_MAX_WORKERS), then capped by
+                                          available memory (see below).
+      AITER_FLYDSL_AOT_MEM_PER_WORKER_GB -- assumed GiB/worker for the auto
+                                          memory cap ("0" disables it). Only
+                                          applies when AITER_FLYDSL_AOT_WORKERS
+                                          is not set explicitly.
+      AITER_FLYDSL_AOT_TIMEOUT         -- per-kernel wall-clock cap, seconds
+                                          ("0" disables). See
+                                          _DEFAULT_KERNEL_TIMEOUT.
+      AITER_FLYDSL_AOT_MAX_RETRIES     -- retries for an abnormally-dead worker
+                                          ("0" disables). See
+                                          _DEFAULT_MAX_RETRIES.
+
+    Workers are always created with the fork start method: fork+COW lets each
+    of the (one-per-kernel) children share the parent's already-imported torch
+    / FlyDSL for free, which is what makes process-per-kernel affordable.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
     all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
     for kind in OpKind:
@@ -389,8 +414,7 @@ def start_aot(cache_dir: str) -> AotPlan | None:
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
         return None
 
-    max_workers = min(max_workers, len(all_jobs))
-    start_method = _resolve_start_method()
+    max_workers = get_max_workers(len(all_jobs))
 
     # Per-child result files live here -- recreated fresh so stale results
     # from a previous (e.g. crashed) build can never be mistaken for this
@@ -402,14 +426,13 @@ def start_aot(cache_dir: str) -> AotPlan | None:
     print(
         f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
         f"({'+'.join(k.name for k in OpKind)}), "
-        f"{max_workers} worker processes "
-        f"(start={start_method or 'fork'}, cache: {cache_dir})"
+        f"{max_workers} worker processes (cache: {cache_dir})"
     )
     return AotPlan(
         jobs=all_jobs,
         max_workers=max_workers,
-        kernel_timeout=_kernel_timeout(),
-        start_method=start_method,
+        kernel_timeout=get_kernel_timeout(),
+        max_retries=get_max_retries(),
         result_dir=result_dir,
     )
 
@@ -425,38 +448,59 @@ def wait_aot(plan: AotPlan | None) -> None:
     removing the shared channel removes the failure mode entirely.
 
     A worker that *dies* (OOM-kill -> exitcode -9, segfault -> -11) is noticed
-    immediately via its process sentinel and recorded as a failure -- never a
-    hang. The only timeout is a generous *per-kernel* cap for a worker stuck
-    *alive* (an infinite loop in the Python tracing stage); it has nothing to
-    do with deadlock recovery."""
+    immediately via its process sentinel; a worker stuck *alive* is bounded by a
+    generous per-kernel timeout. Either abnormal exit is *retried* up to
+    ``plan.max_retries`` times -- OOM-kills and probabilistic fork wedges are
+    transient, and the FlyDSL cache persists each artifact as produced, so a
+    retry re-runs almost nothing. A clean compile error (exit 0, no kernel) is
+    deterministic and never retried."""
     if plan is None or not plan.jobs:
         return
 
-    ctx = multiprocessing.get_context(plan.start_method or "fork")
+    ctx = multiprocessing.get_context("fork")
     timeout = plan.kernel_timeout
+    max_retries = plan.max_retries
 
     ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
     fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
     errors: list[str] = []
+    retries_used = 0
 
-    # Submission order preserved: pop() takes from the tail, so reverse.
-    queue: list[tuple[int, tuple[OpKind, dict[str, Any]]]] = list(enumerate(plan.jobs))
+    # work item: (idx, attempt, kind, job). Submission order preserved: pop()
+    # takes from the tail, so reverse. Retries are appended and run next.
+    queue: list[tuple[int, int, OpKind, dict[str, Any]]] = [
+        (idx, 0, kind, job) for idx, (kind, job) in enumerate(plan.jobs)
+    ]
     queue.reverse()
-    # proc -> (kind, label, out_path, deadline|None)
-    running: dict[Any, tuple[OpKind, JobLabel, str, float | None]] = {}
+    # proc -> (idx, attempt, kind, job, label, out_path, deadline|None)
+    running: dict[Any, tuple] = {}
 
     def launch() -> None:
         while queue and len(running) < plan.max_workers:
-            idx, (kind, job) = queue.pop()
+            idx, attempt, kind, job = queue.pop()
             label = JobLabel(kind=kind, kernel_name=str(job.get("kernel_name", "?")))
             out_path = os.path.join(plan.result_dir, f"k{idx}.json")
             proc = ctx.Process(target=_compile_one_to_file, args=(kind, job, out_path))
             proc.start()
             deadline = (time.monotonic() + timeout) if timeout > 0 else None
-            running[proc] = (kind, label, out_path, deadline)
+            running[proc] = (idx, attempt, kind, job, label, out_path, deadline)
+
+    def on_abnormal(
+        idx: int, attempt: int, kind: OpKind, job: dict, label: JobLabel, reason: str
+    ) -> None:
+        """An abnormal worker death (crash or timeout-kill): retry or record."""
+        nonlocal retries_used
+        if attempt < max_retries:
+            retries_used += 1
+            queue.append((idx, attempt + 1, kind, job))
+            print(f"[aiter] FlyDSL {label} {reason}; retry {attempt + 1}/{max_retries}")
+        else:
+            fail_by_kind[kind] += 1
+            tries = f" after {attempt + 1} attempts" if attempt else ""
+            errors.append(f"FlyDSL {label} {reason}{tries}")
 
     def reap(proc: Any) -> None:
-        kind, label, out_path, _ = running.pop(proc)
+        idx, attempt, kind, job, label, out_path, _ = running.pop(proc)
         if proc.exitcode == 0 and os.path.isfile(out_path):
             try:
                 with open(out_path) as f:
@@ -466,16 +510,24 @@ def wait_aot(plan: AotPlan | None) -> None:
             if result is not None and result.get("compile_time") is not None:
                 ok_by_kind[kind] += 1
             else:
-                # Clean exit but no kernel produced (compile_one_config
-                # caught a compile error and returned compile_time=None).
+                # Clean exit but no kernel produced (compile_one_config caught a
+                # compile error and returned compile_time=None). Deterministic,
+                # so not retried.
                 fail_by_kind[kind] += 1
                 errors.append(f"FlyDSL {label} produced no kernel")
         else:
             # Non-zero/None exit or missing file == the worker died (OOM-kill,
             # segfault) or could not write its result. exitcode < 0 is the
-            # negated signal number (-9 = SIGKILL, -11 = SIGSEGV).
-            fail_by_kind[kind] += 1
-            errors.append(f"FlyDSL {label} worker crashed (exitcode={proc.exitcode})")
+            # negated signal number (-9 = SIGKILL, -11 = SIGSEGV). Transient ->
+            # retry.
+            on_abnormal(
+                idx,
+                attempt,
+                kind,
+                job,
+                label,
+                f"worker crashed (exitcode={proc.exitcode})",
+            )
 
     try:
         launch()
@@ -483,7 +535,7 @@ def wait_aot(plan: AotPlan | None) -> None:
             # Block until a worker exits, or until the nearest per-kernel
             # deadline so a stuck-but-alive worker can be killed.
             if timeout > 0:
-                nearest = min(d for (_, _, _, d) in running.values() if d is not None)
+                nearest = min(d for (*_, d) in running.values() if d is not None)
                 wait_timeout: float | None = max(0.0, nearest - time.monotonic())
             else:
                 wait_timeout = None
@@ -497,19 +549,27 @@ def wait_aot(plan: AotPlan | None) -> None:
             if timeout > 0:
                 now = time.monotonic()
                 for proc in list(running):
-                    kind, label, _, deadline = running[proc]
+                    idx, attempt, kind, job, label, _, deadline = running[proc]
                     if deadline is not None and now > deadline and proc.is_alive():
                         proc.kill()
                         proc.join()
                         running.pop(proc)
-                        fail_by_kind[kind] += 1
-                        errors.append(
-                            f"FlyDSL {label} exceeded per-kernel timeout "
-                            f"({timeout:.0f}s); killed"
+                        on_abnormal(
+                            idx,
+                            attempt,
+                            kind,
+                            job,
+                            label,
+                            f"exceeded per-kernel timeout ({timeout:.0f}s); killed",
                         )
 
-            launch()  # refill freed slots
+            launch()  # refill freed slots (including any just-requeued retries)
 
+        if retries_used:
+            print(
+                f"[aiter] FlyDSL AOT: {retries_used} retr"
+                f"{'y' if retries_used == 1 else 'ies'} after abnormal worker exits"
+            )
         for kind in OpKind:
             print(
                 f"[aiter] FlyDSL {kind.name} AOT: "
