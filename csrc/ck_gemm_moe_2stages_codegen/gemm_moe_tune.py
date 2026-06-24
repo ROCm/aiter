@@ -3788,8 +3788,6 @@ class FmoeTuner(TunerCommon):
                 gate_mode,
             )
             if gate_mode == "interleave":
-                # interleave (gate-up gugu) is served only by the mxfp4 a4w4 port;
-                # restricting candidates keeps stage1/stage2 within one backend.
                 tasks_ck.extend(self.gen_mxfp4_port_2stages_task(info, blockMs))
             else:
                 tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
