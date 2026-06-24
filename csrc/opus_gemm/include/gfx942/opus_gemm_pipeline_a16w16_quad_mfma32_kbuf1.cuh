@@ -3,6 +3,7 @@
 #pragma once
 
 #include "opus_gemm_traits_a16w16.cuh"
+#include "splitk_reduce_gfx942.cuh"
 
 #ifdef __HIP_DEVICE_COMPILE__
 
