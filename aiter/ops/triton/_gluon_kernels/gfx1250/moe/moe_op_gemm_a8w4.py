@@ -750,6 +750,7 @@ def _moe_gemm_a8w4_prefill(
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
                 0, gl.BlockedLayout([1, 16], [32, 1], [1, num_warps], [0, 1])
             )
+            oob_idx = num_tokens.to(gl.uint16)
         else:
             gl.static_assert(
                 GatherIndx.dtype.element_ty == gl.int32,
@@ -758,10 +759,13 @@ def _moe_gemm_a8w4_prefill(
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
                 0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
             )
+            oob_idx = num_tokens
         offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
+        mask_idx = offs_x_m < M
         offs_x_m = offs_x_m % M
         GatherIndx += start_m
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+        offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
 
     W_K_DIVISOR: gl.constexpr = 2
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // W_K_DIVISOR
