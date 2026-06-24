@@ -54,6 +54,16 @@ NRED_COL_TILES = (N + NRED_BLK - 1) // NRED_BLK
 KOUT_BLOCKS = K // BLOCK_N  # column-tiles of the (M, K) output (compile-time)
 NRED_TILES = N // BLOCK_K   # contraction tiles over N (compile-time)
 
+# M-coarsening for grad_jagged. At the production shape (B=1024, Mi=7680) the
+# per-row dJagged GEMM launches a huge grid of *tiny* workgroups (each WG does only
+# NRED_TILES=4 MFMA K-steps), so it is dispatch/latency-bound: profiling shows ~4%
+# achieved wavefront occupancy and ~82% workgroup-manager (SPI) utilization, with
+# issue-wait dominating. Coarsening makes each WG process COARSEN_M consecutive
+# BLOCK_M output tiles (grid M-dim shrinks by COARSEN_M), so WGs live longer, the
+# MFMA pipeline amortizes its prologue/epilogue, and the SPI dispatches fewer WGs.
+# COARSEN_M=1 reproduces the original kernel/grid exactly.
+COARSEN_M = 2
+
 # dDense partials tiling. The contraction dDense[k,n] = sum_m J[m,k]*dOut[m,n] is
 # a transposed GEMM C[k,n] = sum_m A[k,m]*B[n,m] with A = J.T and B = dOut.T, i.e.
 # the reduction axis m is the *contiguous* fragment axis of both operands. Each
@@ -109,132 +119,140 @@ def grad_jagged_kernel(
     pid_mn, _, off_b = fx.block_idx
     off_b = fx.Int32(off_b)
 
-    block_m_idx = pid_mn // KOUT_BLOCKS
+    # One workgroup owns COARSEN_M consecutive BLOCK_M output row-tiles (all sharing
+    # the same K-column tile / Dense slice). group_mn indexes the coarsened m-group;
+    # the per-tile work below runs once per sub-tile. Group resolution is recomputed
+    # per sub-tile (cheap scalar/SGPR work) to keep every value the scf.if branch
+    # touches defined inside the branch (the rewriter downcasts hoisted copy slices).
+    group_mn = pid_mn // KOUT_BLOCKS
     block_n_idx = pid_mn % KOUT_BLOCKS
 
-    # Device group resolution; scalarize to keep group-derived values uniform.
-    seq_rsrc = fx.buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-    seq_start = fx.buffer_ops.buffer_load(seq_rsrc, fx.Int32(off_b), vec_width=1, dtype=fx.T.i32())
-    seq_end = fx.buffer_ops.buffer_load(seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
-    seq_start = fx.rocdl.readfirstlane(fx.T.i32(), seq_start)
-    seq_end = fx.rocdl.readfirstlane(fx.T.i32(), seq_end)
-    M_b = seq_end - seq_start
-    start_m = fx.Int32(block_m_idx) * fx.Int32(BLOCK_M)
+    for m_sub in fx.range_constexpr(COARSEN_M):
+        block_m_idx = group_mn * fx.Int32(COARSEN_M) + fx.Int32(m_sub)
 
-    # Runtime early-exit: tail tile fell off the end of a short group.
-    if start_m < M_b:
-        # Rebase A (dOut, N cols/row) and C (dJagged, K cols/row) to this group's
-        # local row 0; select B's (K, N) slice for group off_b.
-        a_row_off = fx.Int32(seq_start) * fx.Int32(N)
-        c_row_off = fx.Int32(seq_start) * fx.Int32(K)
-        A_g = fx.make_view(fx.add_offset(fx.get_iter(A), fx.make_int_tuple(a_row_off)), fx.get_layout(A))
-        C_g = fx.make_view(fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_row_off)), fx.get_layout(C))
-        b_row_off = fx.Int32(off_b) * fx.Int32(K) * fx.Int32(N)
-        B_g = fx.make_view(fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)), fx.get_layout(B))
+        # Device group resolution; scalarize to keep group-derived values uniform.
+        seq_rsrc = fx.buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
+        seq_start = fx.buffer_ops.buffer_load(seq_rsrc, fx.Int32(off_b), vec_width=1, dtype=fx.T.i32())
+        seq_end = fx.buffer_ops.buffer_load(seq_rsrc, fx.Int32(off_b) + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
+        seq_start = fx.rocdl.readfirstlane(fx.T.i32(), seq_start)
+        seq_end = fx.rocdl.readfirstlane(fx.T.i32(), seq_end)
+        M_b = seq_end - seq_start
+        start_m = block_m_idx * fx.Int32(BLOCK_M)
 
-        A_buf = fx.rocdl.make_buffer_tensor(A_g, max_size=True)
-        B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
-        # Bound C to exactly M_b rows (K cols, bf16=2B) so partial tail-tile
-        # stores are HW-dropped instead of corrupting the next group's rows.
-        C_buf = make_bounded_buffer_tensor(C_g, fx.Int64(fx.Int32(M_b) * fx.Int32(K) * fx.Int32(2)))
+        # Runtime early-exit: tail tile fell off the end of a short group.
+        if start_m < M_b:
+            # Rebase A (dOut, N cols/row) and C (dJagged, K cols/row) to this group's
+            # local row 0; select B's (K, N) slice for group off_b.
+            a_row_off = fx.Int32(seq_start) * fx.Int32(N)
+            c_row_off = fx.Int32(seq_start) * fx.Int32(K)
+            A_g = fx.make_view(fx.add_offset(fx.get_iter(A), fx.make_int_tuple(a_row_off)), fx.get_layout(A))
+            C_g = fx.make_view(fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_row_off)), fx.get_layout(C))
+            b_row_off = fx.Int32(off_b) * fx.Int32(K) * fx.Int32(N)
+            B_g = fx.make_view(fx.add_offset(fx.get_iter(B), fx.make_int_tuple(b_row_off)), fx.get_layout(B))
 
-        gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[None, None, block_m_idx, None]  # (BM, BK, n)
-        gB_k = fx.flat_divide(B_buf, (BLOCK_N, BLOCK_K))[None, None, block_n_idx, None]  # (BN, BK, n)
-        gC = fx.flat_divide(C_buf, (BLOCK_M, BLOCK_N))[None, None, block_m_idx, block_n_idx]  # (BM, BN)
+            A_buf = fx.rocdl.make_buffer_tensor(A_g, max_size=True)
+            B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
+            # Bound C to exactly M_b rows (K cols, bf16=2B) so partial tail-tile
+            # stores are HW-dropped instead of corrupting the next group's rows.
+            C_buf = make_bounded_buffer_tensor(C_g, fx.Int64(fx.Int32(M_b) * fx.Int32(K) * fx.Int32(2)))
 
-        thr_mma = tiled_mma.thr_slice(tid)
-        thr_copy_g2s_A = tiled_copy_g2s_A.get_slice(tid)
+            gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[None, None, block_m_idx, None]  # (BM, BK, n)
+            gB_k = fx.flat_divide(B_buf, (BLOCK_N, BLOCK_K))[None, None, block_n_idx, None]  # (BN, BK, n)
+            gC = fx.flat_divide(C_buf, (BLOCK_M, BLOCK_N))[None, None, block_m_idx, block_n_idx]  # (BM, BN)
 
-        uni_copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
-        buffer_copy_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+            thr_mma = tiled_mma.thr_slice(tid)
+            thr_copy_g2s_A = tiled_copy_g2s_A.get_slice(tid)
 
-        thr_copy_s2r_A = fx.make_tiled_copy_A(buffer_copy_128b, tiled_mma).get_slice(tid)
-        thr_copy_g2r_B = fx.make_tiled_copy_B(buffer_copy_128b, tiled_mma).get_slice(tid)
+            uni_copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+            buffer_copy_128b = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
 
-        composed_layout_A = fx.make_composed_layout(
-            fx.static(fx.SwizzleType.get(3, 3, 3)),
-            fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2)),
-        )
-        sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)  # (BM, BK, STAGES_A)
+            thr_copy_s2r_A = fx.make_tiled_copy_A(buffer_copy_128b, tiled_mma).get_slice(tid)
+            thr_copy_g2r_B = fx.make_tiled_copy_B(buffer_copy_128b, tiled_mma).get_slice(tid)
 
-        thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)  # (VA, VM, VK, n)
-        thr_sA = thr_copy_g2s_A.partition_D(sA)      # (VA, VM, VK, STAGES_A)
-        thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)  # (VA, VM, VK, STAGES_A)
-        thr_gB_k = thr_copy_g2r_B.partition_S(gB_k)  # (VB, VN, VK, n)
+            composed_layout_A = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(3, 3, 3)),
+                fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2)),
+            )
+            sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)  # (BM, BK, STAGES_A)
 
-        copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])
+            thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)  # (VA, VM, VK, n)
+            thr_sA = thr_copy_g2s_A.partition_D(sA)      # (VA, VM, VK, STAGES_A)
+            thr_sA_s2r = thr_copy_s2r_A.partition_S(sA)  # (VA, VM, VK, STAGES_A)
+            thr_gB_k = thr_copy_g2r_B.partition_S(gB_k)  # (VB, VN, VK, n)
 
-        mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])
-        mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)
-        mma_frag_C = thr_mma.make_fragment_C(gC)
+            copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])
 
-        mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
-        mma_frag_B_retile = thr_copy_g2r_B.retile(mma_frag_B)
+            mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])
+            mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)
+            mma_frag_C = thr_mma.make_fragment_C(gC)
 
-        gA_k_stride = fx.get_scalar(gA_k.stride[2])
-        gB_k_stride = fx.get_scalar(gB_k.stride[2])
+            mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
+            mma_frag_B_retile = thr_copy_g2r_B.retile(mma_frag_B)
 
-        def run_pipeline_stage(read_stage, next_k, read_next=True):
-            write_stage = read_stage ^ 1
-            if fx.const_expr(read_next):
-                next_k = fx.Int32(next_k)
-                fx.copy(
-                    buffer_copy_128b,
-                    thr_gA_k[None, None, None, 0],
-                    copy_frag_A,
-                    soffset=next_k * gA_k_stride,
-                )
-                fx.copy(
-                    buffer_copy_128b,
-                    thr_gB_k[None, None, None, 0],
-                    mma_frag_B_retile[None, None, None, write_stage],
-                    soffset=next_k * gB_k_stride,
-                )
+            gA_k_stride = fx.get_scalar(gA_k.stride[2])
+            gB_k_stride = fx.get_scalar(gB_k.stride[2])
 
-            for block_k_iter in fx.range_constexpr(BLOCK_K // 32):
-                fx.copy(
-                    uni_copy_128b,
-                    thr_sA_s2r[None, None, block_k_iter, read_stage],
-                    mma_frag_A_retile[None, None, block_k_iter],
-                )
-                fx.gemm(
-                    tiled_mma,
-                    mma_frag_C,
-                    mma_frag_A[None, None, (None, block_k_iter)],
-                    mma_frag_B[None, None, (None, block_k_iter), read_stage],
-                    mma_frag_C,
-                    traversal_order=fx.GemmTraversalOrder.KNM,
-                )
+            def run_pipeline_stage(read_stage, next_k, read_next=True):
+                write_stage = read_stage ^ 1
+                if fx.const_expr(read_next):
+                    next_k = fx.Int32(next_k)
+                    fx.copy(
+                        buffer_copy_128b,
+                        thr_gA_k[None, None, None, 0],
+                        copy_frag_A,
+                        soffset=next_k * gA_k_stride,
+                    )
+                    fx.copy(
+                        buffer_copy_128b,
+                        thr_gB_k[None, None, None, 0],
+                        mma_frag_B_retile[None, None, None, write_stage],
+                        soffset=next_k * gB_k_stride,
+                    )
 
-            fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, write_stage])
+                for block_k_iter in fx.range_constexpr(BLOCK_K // 32):
+                    fx.copy(
+                        uni_copy_128b,
+                        thr_sA_s2r[None, None, block_k_iter, read_stage],
+                        mma_frag_A_retile[None, None, block_k_iter],
+                    )
+                    fx.gemm(
+                        tiled_mma,
+                        mma_frag_C,
+                        mma_frag_A[None, None, (None, block_k_iter)],
+                        mma_frag_B[None, None, (None, block_k_iter), read_stage],
+                        mma_frag_C,
+                        traversal_order=fx.GemmTraversalOrder.KNM,
+                    )
+
+                fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, write_stage])
+                fx.gpu.barrier()
+
+            # Prologue: load contraction-tile 0 into the read buffer.
+            fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
+            fx.copy(buffer_copy_128b, thr_gB_k[None, None, None, 0], mma_frag_B_retile[None, None, None, 0])
+            mma_frag_C.fill(0)
+            fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
             fx.gpu.barrier()
 
-        # Prologue: load contraction-tile 0 into the read buffer.
-        fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
-        fx.copy(buffer_copy_128b, thr_gB_k[None, None, None, 0], mma_frag_B_retile[None, None, None, 0])
-        mma_frag_C.fill(0)
-        fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
-        fx.gpu.barrier()
+            # Main loop over the N contraction (double-buffered over N // BLOCK_K tiles).
+            for k_iter in range(0, NRED_TILES - 2, 2):
+                run_pipeline_stage(read_stage=0, next_k=k_iter + 1)
+                run_pipeline_stage(read_stage=1, next_k=k_iter + 2)
+            run_pipeline_stage(read_stage=0, next_k=NRED_TILES - 1)
+            run_pipeline_stage(read_stage=1, next_k=None, read_next=False)
 
-        # Main loop over the N contraction (double-buffered over N // BLOCK_K tiles).
-        for k_iter in range(0, NRED_TILES - 2, 2):
-            run_pipeline_stage(read_stage=0, next_k=k_iter + 1)
-            run_pipeline_stage(read_stage=1, next_k=k_iter + 2)
-        run_pipeline_stage(read_stage=0, next_k=NRED_TILES - 1)
-        run_pipeline_stage(read_stage=1, next_k=None, read_next=False)
+            # Epilogue: fp32 accumulators -> bf16, masked store (no bias in backward).
+            mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
+            thr_copy_r2g_C = fx.make_tiled_copy_C(
+                fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), tiled_mma
+            ).get_slice(tid)
+            mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C_bf16)
+            thr_gC = thr_copy_r2g_C.partition_S(gC)
 
-        # Epilogue: fp32 accumulators -> bf16, masked store (no bias in backward).
-        mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
-        thr_copy_r2g_C = fx.make_tiled_copy_C(
-            fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), tiled_mma
-        ).get_slice(tid)
-        mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C_bf16)
-        thr_gC = thr_copy_r2g_C.partition_S(gC)
-
-        mma_frag_C_bf16.store(
-            fx.arith.trunc_f(fx.T.VectorType.get([64], fx.T.bf16()), mma_frag_C.load())
-        )
-        fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), mma_frag_C_retile, thr_gC)
+            mma_frag_C_bf16.store(
+                fx.arith.trunc_f(fx.T.VectorType.get([64], fx.T.bf16()), mma_frag_C.load())
+            )
+            fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), mma_frag_C_retile, thr_gC)
 
 
 @flyc.jit
@@ -267,8 +285,9 @@ def grad_jagged(
     )
 
     bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
+    bm_coarse = (bm + COARSEN_M - 1) // COARSEN_M  # M row-tiles per WG = COARSEN_M
     grad_jagged_kernel(dJagged, dOut, DENSE, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A).launch(
-        grid=(bm * KOUT_BLOCKS, 1, n_groups), block=(256, 1, 1), smem=32768, stream=stream
+        grid=(bm_coarse * KOUT_BLOCKS, 1, n_groups), block=(256, 1, 1), smem=32768, stream=stream
     )
 
 

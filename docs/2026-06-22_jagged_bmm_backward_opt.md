@@ -353,6 +353,130 @@ earlier decision to keep D=256 as the North Star; greenlight to validate D=512.
 
 ---
 
+## EXP-2026-06-24a — North-Star head-to-head vs Triton (B=1024, D=256, Mi=7680) + int32 overflow fix
+
+**Scope.** First fully-specified North-Star measurement (`B=1024, D=256, Kout=256,
+Mi=7680`) and the first *head-to-head* FlyDSL-vs-Triton run for the backward. Two
+infra changes plus one correctness fix:
+- **Wired the FlyDSL provider into `bench_jagged_dense_bmm_bwd_perf.py`** (was
+  Triton-only). The bench now scores `flydsl` and `triton` side-by-side via
+  `triton.testing.do_bench` (CUDA-event, L2-flushed). `--flydsl-only` /
+  `--triton-only` added; the FlyDSL path asserts the requested `D,Kout` match the
+  compile-time `K,N`.
+- **Set `K=N=256`** in `jagged_dense_bmm.py` for the measurement (North-Star D;
+  repo default is 128 — restore after the session, same temp-edit practice as the
+  earlier EXP blocks).
+- **Correctness fix (`grad_dense_partials_kernel`): int32 → int64 buffer
+  `base_byte_offset`.** The group-rebased J/dOut buffer descriptors computed
+  `base_byte_offset = seq_start * K * 2` in **int32**. At the North Star `seq_start`
+  reaches ≈ `L = 1024·7680 = 7.86M` rows, so the byte offset ≈ **4.0 GB overflows
+  int32** and silently wraps the descriptor base → `grad_dense` garbage. This was
+  invisible before because every prior EXP ran at `Mi=512` (offset ≈ 268 MB) and
+  skew has a much smaller `L`. Fixed by computing the product in int64
+  (`fx.Int64(seq_start) * fx.Int64(K*2)`); `num_records_bytes` stays int32 (per-group,
+  `≤ Mi`). Validated `cos=1.0000` at the North Star, both regimes.
+  - **Perf impact of int64: none (verified, not assumed).** Concern was added VGPR
+    pressure / hot-loop cost. A/B at `B=1024, D=256, Mi=512` (where int32 does *not*
+    overflow, so both are correct and timing is comparable), `grad_dense` bench
+    wall-clock: uniform **int64 905.9 µs vs int32 904.3 µs (+0.17%, in noise)**; skew
+    **int64 673.2 µs vs int32 678.8 µs (int64 marginally faster)**. Reason: `seq_start`
+    is `readfirstlane`'d → **uniform/scalar**, so the i64 offset multiply is a
+    once-per-workgroup **SGPR** op in the prologue; it never enters the per-thread
+    VGPR accumulator fragment or the inner m-tile loop. No VGPR-pressure regression.
+
+### Head-to-head (do_bench wall-clock; TF/s = 2·L·D·N / t). Empirical ceilings: bf16 MFMA 479 TF/s, HBM 4.21 TB/s.
+| component | regime | FlyDSL | Triton | result |
+|---|---|--:|--:|---|
+| `jagged` (dJagged) | uniform | **4.97 ms / 207.9 TF/s** | 6.26 ms / 165.0 TF/s | **FlyDSL 1.26×** |
+| `jagged` | skew | **0.99 ms / 156.5 TF/s** | 1.28 ms / 123.4 TF/s | **FlyDSL 1.27×** |
+| `dense_bias` (dDense+dBias) | uniform | **7.53 ms / 133.1 TF/s** | 8.76 ms / 117.1 TF/s | **FlyDSL 1.16×** |
+| `dense_bias` | skew | 2.24 ms / 69.6 TF/s | **1.56 ms / 101.2 TF/s** | **Triton 1.45× (FlyDSL loses)** |
+
+(`L`: uniform = 7,864,320; skew ≈ 1.5M. Component mapping: FlyDSL `grad_jagged` vs
+Triton `bwd_jagged`; FlyDSL `grad_dense`+`grad_bias` vs Triton `bwd_dense_bias`.)
+
+### Findings that reframe the plan
+- **FlyDSL already beats Triton in 3 of 4 cases at the North Star.** `grad_jagged`
+  wins by ~1.27× in both regimes; `dense_bias` wins by 1.16× uniform.
+- **Phase 3's premise (grad_jagged occupancy) is obsolete at the North Star.** The
+  Phase-3 motivation was a 256-WG grid at `b64/m512` (1.06% occupancy, launch/tail
+  bound). At `B=1024, Mi=7680` the `grad_jagged` grid is `ceil(7680/128)·(K/128)·B =
+  60·2·1024 = 122,880 WGs` — the GPU is saturated. The kernel runs at **207.9 TF/s
+  ≈ 43% of the 479 TF/s MFMA roofline** (uniform); remaining headroom is
+  memory/MFMA-tiling, **not** occupancy. So "raise grid/occupancy" no longer applies
+  here; any further `grad_jagged` win is a roofline-push (g2s vectorization, tiling).
+- **The only Triton loss is `dense_bias` skew (Triton 1.45× faster).** This is the
+  real gap-to-North-Star. Likely the split-reduction partials/reduce tail behaves
+  badly under skew (many empty/short groups → wasted `SPLIT` blocks + launch
+  overhead on the reduce pass), where Triton's dense_bias path is leaner.
+
+## EXP-2026-06-24b — Phase 3: `grad_jagged` profile + M-coarsening (B=1024, D=256, Mi=7680)
+
+**Scope.** Phase 3 on `grad_jagged` at the *fully-specified* North Star. Note this
+**re-scopes Phase 3**: the plan text (raise WG count / occupancy) was written for the
+old `b64/m512` regime where the grid was launch-*starved* (256 WGs, 1.06% occ). At
+the North Star `grad_jagged` already beats Triton (EXP-2026-06-24a) and the grid is
+huge, so the lever is the **opposite** of "raise WG count".
+
+**Profile (rocprof-compute full counters, `workloads/p3_djagged_b1024_m7680_uniform/`).**
+`grad_jagged` at the North Star is **dispatch/latency-bound, not occupancy-resource-bound**:
+- Achieved **Wavefront Occupancy 4.32%** (420/9728) — far below even the LDS-capped
+  ceiling (32 KB/WG → 2 WG/CU ≈ 25%). Resource limiters are all clear: VGPR 36 +
+  AGPR 74, "Insufficient SIMD VGPRs/SGPRs" 0%, "Reached CU Workgroup Limit" 0%.
+- **Workgroup-Manager (SPI) utilization 81.8%**, Scheduler-pipe not-scheduled 15.8%
+  → the SPI struggles to dispatch the ~123k *tiny* WGs.
+- Each WG does only `NRED_TILES = N/BLOCK_K = 4` MFMA K-steps, so prologue/epilogue
+  dominate; **Issue-Wait 6.26 B cycles > Dependency-Wait 3.54 B** (latency unhidden).
+- (Profiler rates are serialized/counter-inflated — MFMA util shows 12.6%; trust the
+  clean `do_bench` wall-clock for absolute speed, the counters for *ratios*.)
+
+**Change: M-coarsening (`COARSEN_M`).** One workgroup now processes `COARSEN_M`
+consecutive `BLOCK_M` output row-tiles (same K-column/Dense slice); the launch grid
+M-dim shrinks by `COARSEN_M`. WGs live longer (amortize prologue/epilogue), the SPI
+dispatches fewer WGs. Implemented as a `range_constexpr(COARSEN_M)` wrap of the
+existing per-tile body (group resolution recomputed per sub-tile — cheap SGPR work;
+needed because the `scf.if` rewriter downcasts copy-slice objects hoisted across the
+branch). `COARSEN_M=1` reproduces the original kernel/grid exactly.
+
+### `grad_jagged` sweep (do_bench, FlyDSL-only, ms; lower is better)
+| COARSEN_M | uniform | skew |
+|---|--:|--:|
+| 1 (orig) | 4.976 | 1.001 |
+| **2 (chosen)** | **4.813** | **0.996** |
+| 3 | 4.957 | 1.102 |
+| 4 | 4.994 | 1.000 |
+
+### Result (chosen `COARSEN_M=2`, validated head-to-head, cos=1.0000)
+| regime | FlyDSL (was→now) | Triton | speedup vs Triton |
+|---|--:|--:|--:|
+| uniform | 4.97 → **4.81 ms** (−3.3%) | 6.27 ms | 1.26× → **1.31×** |
+| skew | 0.99 → **0.98 ms** | 1.28 ms | 1.29× → **1.31×** |
+
+**Gate: PASS (measurable TF/s gain, no correctness regression).** Modest (~3%
+uniform) — `grad_jagged` was already well-tuned at this shape; coarsening claws back
+dispatch overhead but the kernel is not *severely* dispatch-bound at the wall-clock
+level (the profiler's serialized SPI pressure overstates it). `COARSEN_M>2` loses to
+reduced parallelism (skew especially). No-regression re-validated at the repo-default
+**D=128** (uniform+skew, all three gradients cos=0.999999). Further `grad_jagged`
+headroom (still ~44% of MFMA roofline) would need bigger structural changes
+(merge the two K-column output tiles to reuse the shared dOut A-fragment; vectorize
+staging) — diminishing returns vs the `dense_bias`-skew deficit (see Backlog).
+
+## Current status (2026-06-24)
+
+Phase 3 done (EXP-2026-06-24b): `grad_jagged` M-coarsening (`COARSEN_M=2`) →
+**1.31× vs Triton, both regimes** (was 1.26×/1.29×). North-Star head-to-head
+established (EXP-2026-06-24a). **FlyDSL beats Triton on
+`grad_jagged` (1.27×, both regimes) and on `dense_bias` uniform (1.16×); it loses
+`dense_bias` skew (Triton 1.45×).** A latent **int32 byte-offset overflow** in
+`grad_dense_partials` (only triggered at the North Star's `L≈7.86M`) was found and
+fixed. The FlyDSL provider is now wired into the backward bench. **Reframing:**
+Phase 3 (grad_jagged occupancy) was written for the old `b64/m512` launch-bound
+regime — at the North Star the grad_jagged grid is ~123k WGs and the GPU is full,
+so grad_jagged is already winning and is roofline-bound (~43% MFMA), not
+occupancy-bound. The standing North-Star deficit is **`dense_bias` under skew**.
+(`K=N` temporarily 256 in `jagged_dense_bmm.py` for measurement; restore to 128.)
+
 ## Current status (2026-06-23)
 Tooling works end-to-end; baseline + Phase-0 sweep + production shapes characterized;
 **Phase 1 done** (EXP-2026-06-23c, 1.34× @ D=256) and **Phase 2 done**
@@ -440,7 +564,13 @@ Baseline to beat (EXP-2026-06-22a, b64/m512/uniform): `grad_dense_partials`
   pipeline is actually overlapping here.
 - **Target:** occupancy ↑, CUs active ↑, TF/s ↑. **Gate:** measurable TF/s gain
   without correctness regression. (May be size-limited — Phase 0 informs this.)
-- [ ] grid/tiling change  [ ] re-profile + EXP block
+- [x] grid/tiling change  [x] re-profile + EXP block (EXP-2026-06-24b).
+  **Re-scoped at the North Star:** the original "raise WG count" premise was for the
+  old launch-starved `b64/m512`; at `B=1024, Mi=7680` `grad_jagged` already beats
+  Triton and is **dispatch/latency-bound** (4.3% occ, SPI 82%, ~123k tiny WGs), so
+  the fix was the opposite — **M-coarsening** (`COARSEN_M=2`, fewer/longer WGs).
+  **Result: 1.26×→1.31× vs Triton (uniform), 1.29×→1.31× (skew); GATE PASS**, no
+  D=128 regression. Diminishing returns beyond `COARSEN_M=2`.
 
 ### Phase 4 — Fuse dBias into dDense partials + reduce-tail cleanup
 - **Why:** `grad_bias_partials`/reduce are tiny tails reducing over the same `m`
@@ -458,6 +588,19 @@ Baseline to beat (EXP-2026-06-22a, b64/m512/uniform): `grad_dense_partials`
 - [ ] autotune  [ ] example timing  [ ] style gate
 
 ## Backlog (not yet scheduled)
+- **`dense_bias` under skew is the one North-Star case we lose to Triton (Triton
+  1.45× faster — EXP-2026-06-24a: FlyDSL 2.24 ms / 69.6 TF/s vs Triton 1.56 ms /
+  101.2 TF/s).** Everywhere else FlyDSL wins (jagged 1.27× both regimes; dense_bias
+  uniform 1.16×). The deficit is skew-specific: our two-pass split-reduction
+  (`grad_dense_partials`→`grad_dense_reduce`, `grad_bias_*`) launches a fixed
+  `SPLIT=4 × n_groups` grid regardless of per-group length, so skew's ~20% empty +
+  many short groups waste partials blocks and pay full launch + reduce-pass overhead
+  on tiny work, while Triton's dense_bias path stays leaner. **Do (ideas):**
+  length-aware / dynamic `SPLIT` (fewer splits for short groups), skip empty groups,
+  or fuse the reduce tail; possibly fuse dBias into the dDense partials (Phase 4).
+  **Gate:** beat Triton at `dense_bias` skew without regressing uniform or `jagged`.
+  Measure with `bench_jagged_dense_bmm_bwd_perf.py --component dense_bias --regime
+  skew -b 1024 -d 256 -kout 256 -mi 7680`.
 - **Relax the `K == N == D` constraint (support non-square `D != Kout`).** The
   backward kernels currently collapse the dense reduction dim and output dim into a
   single compile-time constant (`K == N`), so they only cover *square* shapes. The

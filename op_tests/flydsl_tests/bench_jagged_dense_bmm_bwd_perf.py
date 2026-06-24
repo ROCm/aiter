@@ -40,10 +40,40 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import torch
 import triton
+
+# The FlyDSL backward kernels (jagged_dense_bmm_bwd.py) use *bare* sibling imports
+# (`from jagged_dense_bmm import ...`), so the kernels dir must be on sys.path and
+# the modules imported by their bare names -- exactly how the example/profile
+# drivers next to them do it. Importing as aiter.ops.flydsl.kernels.* would break
+# those sibling imports.
+_KERNELS_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "..", "aiter", "ops", "flydsl", "kernels"
+)
+_KERNELS_DIR = os.path.abspath(_KERNELS_DIR)
+if _KERNELS_DIR not in sys.path:
+    sys.path.insert(0, _KERNELS_DIR)
+
+try:
+    import flydsl.compiler as flyc  # noqa: E402
+    from jagged_dense_bmm import BLOCK_M as _FLY_BLOCK_M  # noqa: E402
+    from jagged_dense_bmm import K as _FLY_K  # noqa: E402
+    from jagged_dense_bmm import N as _FLY_N  # noqa: E402
+    from jagged_dense_bmm_bwd import (  # noqa: E402
+        SPLIT as _FLY_SPLIT,
+        grad_bias as _fly_grad_bias,
+        grad_dense as _fly_grad_dense,
+        grad_jagged as _fly_grad_jagged,
+    )
+
+    _HAS_FLYDSL = True
+except Exception as _fexc:  # pragma: no cover - environment dependent
+    _HAS_FLYDSL = False
+    _FLYDSL_ERR = _fexc
 
 try:
     from generative_recommenders.ops.triton.triton_jagged import (
@@ -122,6 +152,62 @@ def _triton_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
         return triton_jagged_dense_bmm_add_bwd_dense_bias(
             Mi, so64, jagged, torch.empty_like(dense), B, K, N, d_out, False
         )
+
+    if component == "jagged":
+        return run_jagged
+    if component == "dense_bias":
+        return run_dense_bias
+
+    def run_all():
+        dj = run_jagged()
+        dd, db = run_dense_bias()
+        return dj, dd, db
+
+    return run_all
+
+
+def _flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
+    """Build the do_bench closure for the FlyDSL backward component(s).
+
+    Mirrors the host wiring in example_jagged_dense_bmm_bwd.py. The FlyDSL kernels
+    take N/K as *compile-time* constants (jagged_dense_bmm.py), so the requested
+    D (=K) and Kout (=N) must match the compiled values -- assert loudly otherwise.
+    """
+    if (K, N) != (_FLY_K, _FLY_N):
+        raise ValueError(
+            f"FlyDSL kernels are compiled for K={_FLY_K}, N={_FLY_N} but the bench "
+            f"shape needs K={K}, N={N}. Set K/N in "
+            f"aiter/ops/flydsl/kernels/jagged_dense_bmm.py to match this shape."
+        )
+
+    device = jagged.device
+    total_rows = jagged.shape[0]
+    stream = torch.cuda.current_stream()
+    tDOut = flyc.from_dlpack(d_out).mark_layout_dynamic(leading_dim=1, divisibility=8)
+
+    # dJagged: RHS is Dense[b] in its plain (K, N) layout, flattened tall.
+    dense_kn = dense.reshape(B * K, N).contiguous()
+    d_jagged = torch.zeros(total_rows + _FLY_BLOCK_M, K, dtype=torch.bfloat16, device=device)
+    tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+
+    def run_jagged():
+        _fly_grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, B, Mi, stream=stream)
+        return d_jagged[:total_rows]
+
+    # dDense (+ dBias) split-reduction scratch + outputs.
+    d_dense = torch.zeros(B, K, N, dtype=torch.bfloat16, device=device)
+    d_dense_v = d_dense.view(B * K, N)
+    dense_partials = torch.zeros(B * _FLY_SPLIT * K, N, dtype=torch.float32, device=device)
+    d_bias = torch.zeros(B, N, dtype=torch.bfloat16, device=device)
+    bias_partials = torch.zeros(B * _FLY_SPLIT, N, dtype=torch.float32, device=device)
+    tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+
+    def run_dense_bias():
+        _fly_grad_dense(
+            d_dense_v, tJagged, tDOut, seq_offsets, dense_partials, B, Mi, stream=stream
+        )
+        _fly_grad_bias(d_bias, tDOut, seq_offsets, bias_partials, B, Mi, stream=stream)
+        return d_dense, d_bias
 
     if component == "jagged":
         return run_jagged
@@ -220,7 +306,9 @@ def _run_one_regime(custom, args, regime, providers, unit):
 
         if provider == "triton":
             fn = _triton_fn(jagged, dense, d_out, seq_offsets, B, MI, N, K, args.component)
-        else:  # pragma: no cover - flydsl wired up in a follow-up step
+        elif provider == "flydsl":
+            fn = _flydsl_fn(jagged, dense, d_out, seq_offsets, B, MI, N, K, args.component)
+        else:
             raise ValueError(f"Unknown provider: {provider}")
 
         if args.test:
@@ -251,9 +339,10 @@ def _run_one_regime(custom, args, regime, providers, unit):
 
 def run_benchmark(custom, args):
     providers = []
-    if _HAS_TRITON:
+    if _HAS_FLYDSL and not args.triton_only:
+        providers.append("flydsl")
+    if _HAS_TRITON and not args.flydsl_only:
         providers.append("triton")
-    # FlyDSL backward provider is hooked up in a follow-up step.
     if not providers:
         print("No providers selected / available.")
         return
@@ -283,6 +372,8 @@ def parse_args(argv=None):
     p.add_argument("--rep", type=int, default=100, help="do_bench rep ms")
     p.add_argument("-test", action="store_true", help="correctness check vs torch eager")
     p.add_argument("-o", action="store_true", help="save CSV/plot")
+    p.add_argument("--flydsl-only", action="store_true", help="score only the FlyDSL provider")
+    p.add_argument("--triton-only", action="store_true", help="score only the Triton provider")
     return p.parse_args(argv)
 
 
@@ -290,6 +381,8 @@ def main(argv=None):
     args = parse_args(argv)
     if not _HAS_TRITON:
         print(f"WARNING: upstream Triton kernel unavailable: {_TRITON_ERR}")
+    if not _HAS_FLYDSL:
+        print(f"WARNING: FlyDSL backward kernels unavailable: {_FLYDSL_ERR}")
     custom = bool(args.b or args.d or args.kout)
     if custom:
         assert args.b and args.d and args.kout, "custom shape needs -b, -d, -kout"
