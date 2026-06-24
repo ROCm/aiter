@@ -222,11 +222,22 @@ def compile_preshuffle_gemm_a8(
     if is_fp4 and int(tile_k) == 128 and lds_stage != 2:
         raise NotImplementedError("FP4 tile_k=128 currently only supports lds_stage=2")
     if is_mxfp8:
-        # One scaled MFMA covers 128 K (fp8); microscale grouping packs pack_K=2
-        # MFMAs per scale i32, so a tile needs an even number of 128-K MFMAs.
-        if (int(tile_k) % 256) != 0:
+        # One scaled MFMA covers 128 K (fp8); the microscale grouping packs
+        # pack_K=2 MFMAs per scale i32, so a tile spanning >=256 K has an even
+        # number of 128-K MFMAs (tile_k % 256 == 0). tile_k=128 is the special
+        # single-MFMA-per-tile case: two consecutive 128-K tiles are paired to
+        # share one 256-K scale i32 (opsel selects the upper/lower half),
+        # mirroring the fp4 tile_k=128 path. This lets K be a multiple of 128
+        # (e.g. K=384) instead of only a multiple of 256.
+        if int(tile_k) == 128:
+            if int(lds_stage) != 2:
+                raise NotImplementedError(
+                    "mxfp8 tile_k=128 currently only supports lds_stage=2"
+                )
+        elif (int(tile_k) % 256) != 0:
             raise ValueError(
-                f"mxfp8 requires tile_k divisible by 256, got tile_k={tile_k}"
+                f"mxfp8 requires tile_k == 128 or tile_k divisible by 256, "
+                f"got tile_k={tile_k}"
             )
 
     # ── split-K (in-kernel bf16 atomic) ───────────────────────────────────────
@@ -245,6 +256,10 @@ def compile_preshuffle_gemm_a8(
             )
         if int(lds_stage) != 2:
             raise NotImplementedError("split_k > 1 currently requires lds_stage=2")
+        if is_mxfp8 and int(tile_k) == 128:
+            raise NotImplementedError(
+                "mxfp8 tile_k=128 does not support split_k > 1 yet"
+            )
         if use_cshuffle_epilog:
             raise NotImplementedError(
                 "split_k > 1 uses the direct (atomic) epilog; cshuffle is unsupported"
@@ -553,7 +568,11 @@ def compile_preshuffle_gemm_a8(
         if const_expr(not is_f16_or_bf16):
             if const_expr(use_micro_scale):
                 _scale_a_rows = (c_m + fx.Index(31)) // fx.Index(32)
-                _scale_a_stride_elems = fx.Index((K // (32 * 4 * 2)) * 64)
+                # ceil(K/256): shuffle_scale() pads the e8m0 scale's K dim up to
+                # a multiple of 256 (K//32 padded to a multiple of 8), so the
+                # per-row stride must count ceil(K/256) 256-K chunks, not floor.
+                # (K % 256 == 0 -> ceil == floor, no change for aligned K.)
+                _scale_a_stride_elems = fx.Index(((K + 255) // 256) * 64)
                 _scale_a_nrec = fx.Int64(
                     _scale_a_rows * _scale_a_stride_elems * fx.Index(4)
                 )
@@ -1061,6 +1080,10 @@ def compile_preshuffle_gemm_a8(
 
         # ── FP4 scale pre-fetch (outside compute_tile for latency hiding) ──
         _fp4_tilek128 = False
+        _mxfp8_tilek128 = False
+        # Unified "two 128-K tiles share one 256-K scale i32" path, used by both
+        # fp4 and mxfp8 when tile_k == 128 (lets K be a multiple of 128, not 256).
+        _tilek128 = False
 
         def load_fp4_scale_chunk(_base_k):
             raise RuntimeError("load_fp4_scale_chunk called when use_micro_scale=False")
@@ -1070,14 +1093,19 @@ def compile_preshuffle_gemm_a8(
             _fp4_pack_N_outer = 2
             _fp4_pack_K_outer = 2
             _fp4_tilek128 = is_fp4 and int(tile_k) == 128
+            _mxfp8_tilek128 = is_mxfp8 and int(tile_k) == 128
+            _tilek128 = _fp4_tilek128 or _mxfp8_tilek128
             # Number of 128-K scaled MFMAs spanned by this tile's K-unroll.
             # fp4 packs 2 elems/byte so one k64 == one 128-K MFMA; fp8 is
             # 1 byte/elem so each 128-K MFMA consumes two k64 packs.
             _micro_mma_k = k_unroll if is_fp4 else (k_unroll // 2)
             _fp4_scale_chunk_k = 32 * 4 * _fp4_pack_K_outer
-            _K1_outer = K // (32 * 4 * _fp4_pack_K_outer)
+            # ceil(K/256) to match shuffle_scale()'s K-dim padding (see above).
+            _K1_outer = (K + 32 * 4 * _fp4_pack_K_outer - 1) // (
+                32 * 4 * _fp4_pack_K_outer
+            )
             _k_unroll_packed_outer = (
-                1 if _fp4_tilek128 else (_micro_mma_k // _fp4_pack_K_outer)
+                1 if _tilek128 else (_micro_mma_k // _fp4_pack_K_outer)
             )
             _m_repeat_packed_outer = m_repeat // _fp4_pack_M_outer
             _num_acc_n_packed_outer = num_acc_n // _fp4_pack_N_outer
@@ -1195,7 +1223,10 @@ def compile_preshuffle_gemm_a8(
                 # Number of 128-K scaled MFMAs in this K-unroll (see scale setup).
                 _micro_mma_k = k_unroll if is_fp4 else (k_unroll // 2)
                 _K1 = (
-                    K // (_quant_block_size * 4 * _fp4_pack_K) if use_micro_scale else 1
+                    (K + _quant_block_size * 4 * _fp4_pack_K - 1)
+                    // (_quant_block_size * 4 * _fp4_pack_K)
+                    if use_micro_scale
+                    else 1
                 )
                 _k_unroll_packed = _micro_mma_k // _fp4_pack_K
                 _m_repeat_packed = m_repeat // _fp4_pack_M
@@ -1285,24 +1316,36 @@ def compile_preshuffle_gemm_a8(
                     # mxfp8: fp8 data operands (full 256-bit, 2 k64 packs per
                     # 128-K MFMA) with the SAME e8m0 microscale layout + opsel
                     # scheme as fp4 (pack_M/N/K=2). cbsz=blgp=0 select fp8.
+                    # tile_k=128 special case: only one 128-K MFMA in this tile
+                    # (ku128/ikxdl collapse to a single iteration), and the scale
+                    # i32 byte is selected by fp4_scale_half (this tile's half of
+                    # the paired 256-K scale group) instead of ikxdl.
                     _mx_a_sc, _mx_b_sc = fp4_scales if fp4_scales else ([], [])
-                    for ku128 in range_constexpr(_k_unroll_packed):
+                    _mx_ku128_iters = 1 if _mxfp8_tilek128 else _k_unroll_packed
+                    _mx_ikxdl_iters = 1 if _mxfp8_tilek128 else _fp4_pack_K
+                    for ku128 in range_constexpr(_mx_ku128_iters):
                         a_scale_base = ku128 * _m_repeat_packed
                         b_scale_base = ku128 * _num_acc_n_packed
                         for mi_p in range_constexpr(_m_repeat_packed):
                             a_scale_val = _mx_a_sc[a_scale_base + mi_p]
                             for ni_p in range_constexpr(_num_acc_n_packed):
                                 b_scale_val = _mx_b_sc[b_scale_base + ni_p]
-                                for ikxdl in range_constexpr(_fp4_pack_K):
+                                for ikxdl in range_constexpr(_mx_ikxdl_iters):
                                     # MMA index along K; each MMA = 2 k64 packs.
-                                    k_idx = ku128 * _fp4_pack_K + ikxdl
+                                    k_idx = (
+                                        0
+                                        if _mxfp8_tilek128
+                                        else (ku128 * _fp4_pack_K + ikxdl)
+                                    )
                                     k64_lo = k_idx * 2
                                     k64_hi = k64_lo + 1
                                     b_lo0, b_lo1 = b_tile_in[k64_lo]
                                     b_hi0, b_hi1 = b_tile_in[k64_hi]
                                     col_base0 = col_offset_base_bytes + (k64_lo * 64)
                                     col_base1 = col_offset_base_bytes + (k64_hi * 64)
-                                    scale_k_sel = ikxdl
+                                    scale_k_sel = (
+                                        fp4_scale_half if _mxfp8_tilek128 else ikxdl
+                                    )
                                     for imxdl in range_constexpr(_fp4_pack_M):
                                         mi_idx = mi_p * _fp4_pack_M + imxdl
                                         curr_row_a_lds = row_a_lds + (mi_idx * 16)
@@ -1861,7 +1904,7 @@ def compile_preshuffle_gemm_a8(
             *,
             _unpack_state,
             _unflatten_b_tile,
-            _fp4_tilek128,
+            _tilek128,
             tile_k,
             use_async_copy,
             prefetch_a_to_lds,
@@ -1902,7 +1945,7 @@ def compile_preshuffle_gemm_a8(
             )
             b_tile_pong_in = _unflatten_b_tile(bt_flat_in)
 
-            if const_expr(_fp4_tilek128):
+            if const_expr(_tilek128):
                 next_k1 = k_iv + tile_k
                 if const_expr(use_async_copy):
                     prefetch_a_to_lds(
@@ -2082,7 +2125,7 @@ def compile_preshuffle_gemm_a8(
             final_accs = 1
             scales = 1
             num_tiles = K_EFF // tile_k
-            if const_expr(_fp4_tilek128):
+            if const_expr(_tilek128):
                 if const_expr((num_tiles % 2) == 1):
                     c_k_main = K_EFF - tile_k
                     init_state = _pack_state(
@@ -2099,7 +2142,7 @@ def compile_preshuffle_gemm_a8(
                             inner,
                             _unpack_state=_unpack_state,
                             _unflatten_b_tile=_unflatten_b_tile,
-                            _fp4_tilek128=_fp4_tilek128,
+                            _tilek128=_tilek128,
                             tile_k=tile_k,
                             use_async_copy=use_async_copy,
                             prefetch_a_to_lds=prefetch_a_to_lds,
@@ -2164,7 +2207,7 @@ def compile_preshuffle_gemm_a8(
                             inner,
                             _unpack_state=_unpack_state,
                             _unflatten_b_tile=_unflatten_b_tile,
-                            _fp4_tilek128=_fp4_tilek128,
+                            _tilek128=_tilek128,
                             tile_k=tile_k,
                             use_async_copy=use_async_copy,
                             prefetch_a_to_lds=prefetch_a_to_lds,
@@ -2259,7 +2302,7 @@ def compile_preshuffle_gemm_a8(
                         inner,
                         _unpack_state=_unpack_state,
                         _unflatten_b_tile=_unflatten_b_tile,
-                        _fp4_tilek128=_fp4_tilek128,
+                        _tilek128=_tilek128,
                         tile_k=tile_k,
                         use_async_copy=use_async_copy,
                         prefetch_a_to_lds=prefetch_a_to_lds,
@@ -2323,7 +2366,7 @@ def compile_preshuffle_gemm_a8(
                         inner,
                         _unpack_state=_unpack_state,
                         _unflatten_b_tile=_unflatten_b_tile,
-                        _fp4_tilek128=_fp4_tilek128,
+                        _tilek128=_tilek128,
                         tile_k=tile_k,
                         use_async_copy=use_async_copy,
                         prefetch_a_to_lds=prefetch_a_to_lds,

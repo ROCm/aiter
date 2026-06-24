@@ -716,6 +716,126 @@ def gemm_a8w8_bpreshuffle(
         ) from e
 
 
+def gemm_a8w8_bpreshuffle_mxfp8_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    splitK: int = 0,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+) -> Tensor:
+    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+def _mxfp8_default_tile(m: int, n: int, k: int):
+    """Pick a safe (tile_m, tile_n, tile_k) for the mxfp8 preshuffle kernel.
+
+    No tuning catalog exists for mxfp8 yet, so default to divisor-respecting
+    tiles from the hardware-verified set. tile_k must divide K and be a
+    multiple of 128 (each mxfp8 MFMA consumes 128 K). tile_n must divide N.
+    tile_m * tile_n is a multiple of 2048 (the split-K zero-tile constraint)
+    for every (tile_m in {64,128,256}) x (tile_n in {32,64,128,256}) pair below.
+    """
+    if k % 256 == 0:
+        tk = 256
+    elif k % 128 == 0:
+        tk = 128
+    else:
+        raise RuntimeError(
+            f"[mxfp8] K ({k}) must be a multiple of 128 for the preshuffle GEMM"
+        )
+    tn = None
+    for cand in (128, 256, 64, 32):
+        if n % cand == 0:
+            tn = cand
+            break
+    if tn is None:
+        raise RuntimeError(
+            f"[mxfp8] N ({n}) must be a multiple of 32 for the preshuffle GEMM"
+        )
+    if m >= 256:
+        tm = 256
+    elif m >= 128:
+        tm = 128
+    else:
+        tm = 64
+    return tm, tn, tk
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_mxfp8_fake)
+def gemm_a8w8_bpreshuffle_mxfp8(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    splitK: int = 0,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+) -> Tensor:
+    """mxfp8 (fp8 E4M3 data + per-1x32 e8m0 microscale) a8w8 bpreshuffle GEMM.
+
+    gfx950-only (mfma_scale_f32_16x16x128_f8f6f4). Inputs follow the same
+    pre-shuffled convention as the other ``*_bpreshuffle`` ops: the CALLER must
+    pre-shuffle the weight and the microscales before calling.
+
+        XQ:      [M, K]      fp8 (E4M3) activations, row-major, NOT shuffled.
+        WQ:      [N, K]      fp8 weights, ``shuffle_weight(w, layout=(16, 16))``.
+        x_scale: [M, K//32]  e8m0 activation scales, ``fp4_utils.e8m0_shuffle``'d.
+        w_scale: [N, K//32]  e8m0 weight scales, ``fp4_utils.e8m0_shuffle``'d.
+        dtype:   bf16 / fp16 output.
+        splitK:  K-split factor (0 -> 1 == single pass). splitK > 1 uses the
+                 in-kernel bf16 atomic reduction; needs K % splitK == 0 and
+                 (K // splitK) % tile_k == 0.
+        tile_m / tile_n / tile_k: optional tile override (0 -> auto-pick).
+
+    Returns the freshly-allocated [M, N] output.
+    """
+    if get_gfx() != "gfx950":
+        raise RuntimeError(
+            f"gemm_a8w8_bpreshuffle_mxfp8 requires gfx950, got {get_gfx()}"
+        )
+    if not is_flydsl_available():
+        raise RuntimeError(
+            "gemm_a8w8_bpreshuffle_mxfp8 requires the FlyDSL backend, which is "
+            "not available in this environment"
+        )
+    assert dtype in [
+        dtypes.bf16,
+        dtypes.fp16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8_bpreshuffle_mxfp8"
+
+    from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_mxfp8
+
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[-1]
+
+    dtm, dtn, dtk = _mxfp8_default_tile(m, n, k)
+    tm = tile_m if tile_m > 0 else dtm
+    tn = tile_n if tile_n > 0 else dtn
+    tk = tile_k if tile_k > 0 else dtk
+    spk = splitK if splitK and splitK > 0 else 1
+
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    flydsl_preshuffle_gemm_mxfp8(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Y,
+        tile_m=tm,
+        tile_n=tn,
+        tile_k=tk,
+        split_k=spk,
+    )
+    return Y
+
+
 def gemm_a8w8_blockscale_fake(
     XQ: Tensor,
     WQ: Tensor,
