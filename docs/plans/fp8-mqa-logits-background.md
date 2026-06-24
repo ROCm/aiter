@@ -844,6 +844,82 @@ The consequence: the kernel is **bandwidth/issue-bound**, and the optimization l
 KV-load width and an efficient cross-head reduce — not raw MFMA throughput. This is why the
 plan emphasizes pinning the MFMA fragment→lane layout and using wide FP8 loads.
 
+#### Benchmark parameters as GEMM dimensions
+
+The kernel contains **two chained GEMMs** per query row (window size `W = end − start`):
+
+**GEMM 1 — FP8 dot product (dominant cost):**
+```
+Q_row [H, D]  ×  K_window^T [D, W]  →  scores [H, W]
+```
+
+**GEMM 2 — weight head-reduction (epilogue, cheap):**
+```
+weights[m] [1, H]  ×  relu(scores · kv_scale) [H, W]  →  logits[m] [1, W]
+```
+
+`weights[m]` is a single row vector — one scalar weight per head for this query row — so
+**M = 1 trivially**. GEMM 2 degenerates to a **vector-matrix product**, not a proper
+matrix-matrix multiply. Across all `s_q` rows it becomes a batched sequence of `s_q`
+independent `[1,H]×[H,W]` products, but not a single fused GEMM because the right-hand
+matrix `A[m] = relu(scores_m · kv_scale)` differs per row (it depends on `Q[m]` and that
+row's KV window).
+
+The four benchmark parameters map onto these as:
+
+| Parameter | GEMM 1 role | GEMM 2 role |
+|-----------|-------------|-------------|
+| `num_heads_q` (H) | M — output rows (heads) | K — contraction depth (heads to sum over) |
+| `head_dim` (D) | K — contraction depth (FP8 dot) | — (not involved) |
+| `seq_kv_l` | N — output cols (KV window ≈ W) | N — output cols |
+| `seq_q_l` | batch — one pair per query row | batch |
+| *(implicit)* | — | M = 1 (one weight row per query row) |
+
+The `calculate_tflops` formula (`2 · H · D · W` per row) counts **GEMM 1 only**. GEMM 2
+costs `2 · H · W`; since `H (64) << D (128)`, GEMM 2 is **128× cheaper** than GEMM 1 at the
+same window size and is omitted from the denominator.
+
+Total FLOPs across all `s_q = batch × seq_q_l` rows depend on window shape:
+- **Rectangular** (`seq_kv_l >> seq_q_l`): each row sees ≈ full `seq_kv_l` →
+  `total ≈ 2 · H · D · s_q · seq_kv_l`
+- **Square causal** (`seq_kv_l = seq_q_l`): the bench sets `ke[m] = m + 1` (self-inclusive),
+  so windows grow as `1, 2, …, s_q` → `total ≈ H · D · s_q²` (triangular sum)
+
+The TFLOP/s number therefore measures how efficiently the GPU executes GEMM 1 — the FP8
+`[H, D] × [D, W]` multiply. The epilogue (GEMM 2 + ReLU + kv_scale) is real work but is not
+in the denominator, so reported TFLOP/s is a lower bound on the kernel's true arithmetic
+throughput.
+
+#### CTA count, work imbalance, and why rectangular shapes matter
+
+The kernel grid is `(s_q,)` = `(batch_size × seq_q_l,)` — **one CTA per query row** — so
+`seq_q_l` directly sets the CTA count (with `batch_size=1` in all presets). Each CTA runs
+both GEMMs **fused**: it iterates its KV window in `BLOCK_KV=128` chunks, and for each chunk
+executes GEMM 1 + scale + ReLU + GEMM 2 in a single pass. There is no separate GEMM 2
+dispatch.
+
+**GEMM 1 per tile is also thin.** With `H=64` and `BLOCK_KV=128`, each tile is a
+`[64,128]×[128,128]` workload — 128 MFMA instructions (`4` head-row-tiles × `8` KV-col-tiles
+× `4` K-steps). Modest but non-trivial per tile.
+
+**The causal case makes CTA work highly unequal.** With `ke[m] = m + 1` (self-inclusive),
+CTA `m` sweeps `m+1` keys: CTA 0 does 1 key's worth of work, CTA `s_q−1` does `s_q` keys.
+The first half of the grid does only ¼ of total work. This is the **tail effect** — and
+why the kernel processes rows in reverse (heavy CTAs first) and why small square shapes are
+latency-bound:
+
+| Preset shape | CTAs | Avg keys/CTA (causal) | Character |
+|---|---|---|---|
+| `1024²` | 1024 | ≈512 | latency-bound, unequal |
+| `4096²` | 4096 | ≈2048 | still unequal but more work |
+| `1024×4096` | 1024 | 4096 (full, rectangular) | all CTAs equal, peak throughput |
+| `4096×16384` | 4096 | 16384 (full, rectangular) | largest sustained throughput |
+
+**Rectangular shapes** (`seq_kv_l >> seq_q_l`) are the best case: every CTA sweeps the
+full `seq_kv_l`-wide window with no causal triangle imbalance, so all CTAs do equal, large
+work. The preset sweep includes these shapes (`(1,1024,4096,…)`, `(1,4096,16384,…)`)
+precisely to expose peak throughput unclouded by causal imbalance.
+
 ### 4.6 Relationship to DeepGEMM, and how the kernel is validated
 
 DeepSeek's **DeepGEMM** library (FP8 GEMM with fine-grained scaling) added "scoring kernels
@@ -880,6 +956,44 @@ masks) before comparing values — so masking/windowing must be bit-correct even
 in-window values only need to match approximately.
 
 > *Reference: DeepGEMM (github.com/deepseek-ai/DeepGEMM).*
+
+### 4.7 Multi-row blocking: covering more than one query row per CTA
+
+#### KV tile reuse
+
+`K[tile]` does not depend on the query row index `m` — it is the same tensor for every
+row. If one CTA covers `ROWS_PER_BLOCK` rows:
+
+```
+1 row/CTA:              load K[tile] once per row  →  R loads of K for R rows
+ROWS_PER_BLOCK = R/CTA: load K[tile] once, reuse across R rows  →  1 load of K for R rows
+```
+
+This cuts KV HBM bandwidth by `ROWS_PER_BLOCK×` and raises arithmetic intensity
+correspondingly. GEMM 1 per tile also becomes more efficient: instead of `[H,D]×[D,BLOCK_KV]`
+you compute `[R·H, D]×[D, BLOCK_KV]` — more output tiles amortize the K load. This is the
+same principle as FlashAttention's query tiling, applied to the head-reduction kernel.
+
+#### The complication: diverging causal windows
+
+Under the causal mask, row `m` has window `[0, m+1)` and row `m+1` has `[0, m+2)` — they
+share all tiles except the very last. Interior tiles can be processed jointly with no masking;
+only the tail diverges. A correct multi-row implementation must handle:
+
+1. **Full overlap tiles** — both rows active, process jointly.
+2. **Partial overlap at the tail** — row `m` finished, row `m+1` still has tiles; continue
+   with predicated mask for the longer row only.
+
+This tail logic is the main implementation complexity versus single-row.
+
+#### Trade-offs
+
+| | Benefit | Cost |
+|---|---|---|
+| More rows/CTA | KV bandwidth ÷ ROWS; more MFMA per K load | More register pressure (R×Q fragments + R×accumulators); complex tail masking |
+| Fewer CTAs | Less grid launch overhead | Coarser load balancing under causal imbalance |
+
+The sweet spot is typically ROWS=2 or 4; beyond that register spill erases the gain.
 
 ---
 
@@ -949,6 +1063,13 @@ in-window values only need to match approximately.
 - **Dequantization scale** — higher-precision multiplier restoring an FP8 value's magnitude.
 - **MFMA** — AMD Matrix Fused Multiply-Add (matrix-core) instruction.
 - **CDNA3 / CDNA4** — AMD GPU architectures: gfx942 (MI300X) / gfx950 (MI355).
+- **CTA** (Cooperative Thread Array) — a thread block: the group of threads that execute
+  together on one Compute Unit, share LDS, and can barrier-synchronize. Equivalent to a
+  CUDA "block" or OpenCL "work-group." In this kernel one CTA handles one query row (256
+  threads = 4 waves × 64 lanes).
+- **Wave / warp** — the smallest unit of lock-step execution on a GPU; 64 threads on AMD
+  (CDNA), 32 on NVIDIA. One CTA contains multiple waves that share LDS but execute
+  independently (no intra-wave barrier needed for register operations).
 - **LDS** — Local Data Share; AMD on-chip shared memory (the "SRAM" FlashAttention uses).
 - **HBM** — High-Bandwidth Memory; the GPU's large but slower DRAM.
 - **BLOCK_KV** — the KV-tile width processed per inner-loop iteration (128 here).
