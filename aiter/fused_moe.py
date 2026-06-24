@@ -843,16 +843,8 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 
 cfg_2stages = None
-_DIRECT_STAGE1_QUANT_A1 = None
-_DIRECT_STAGE1_QUANT_SCALE = None
-_DIRECT_STAGE1_QUANT_AMAX = None
-_DIRECT_STAGE2_QUANT_A2 = None
-_DIRECT_STAGE2_QUANT_SCALE = None
-_DIRECT_STAGE2_QUANT_AMAX = None
 _DIRECT_DUMMY_SORTED_EXPERT_IDS = None
 _DIRECT_DUMMY_NUM_VALID_IDS = None
-_DIRECT_STAGE1_OUT_A2 = None
-_DIRECT_MOE_OUT_BUF = None
 _DIRECT_GRAPH_CACHE: dict = {}  # key: (token_num, model_dim, inter_dim, topk) -> (graph, static_hidden, static_out)
 _DIRECT_GRAPH_ENABLED = os.environ.get("AITER_DIRECT_HIP_GRAPH", "0") == "1"
 _FUSED_1K_ENABLED = os.environ.get("AITER_FUSED_1K", "1") == "1"
@@ -963,19 +955,11 @@ def _direct_dummy_sort_tensors(device):
 
 
 def _direct_stage1_out_buffer(token_num, topk, inter_dim, dtype, device):
-    global _DIRECT_STAGE1_OUT_A2
-    _DIRECT_STAGE1_OUT_A2 = _cached_empty(
-        _DIRECT_STAGE1_OUT_A2, (token_num, topk, inter_dim), dtype, device
-    )
-    return _DIRECT_STAGE1_OUT_A2
+    return torch.empty((token_num, topk, inter_dim), dtype=dtype, device=device)
 
 
 def _direct_moe_out_buffer(token_num, model_dim, dtype, device):
-    global _DIRECT_MOE_OUT_BUF
-    _DIRECT_MOE_OUT_BUF = _cached_empty(
-        _DIRECT_MOE_OUT_BUF, (token_num, model_dim), dtype, device
-    )
-    return _DIRECT_MOE_OUT_BUF
+    return torch.empty((token_num, model_dim), dtype=dtype, device=device)
 
 
 def _fused_1kernel_2stage(
@@ -1072,36 +1056,30 @@ def _direct_2stage_with_graph(
 
 
 def _direct_stage1_per_tensor_quant(hidden_states, scale, quant_dtype):
-    """Quantize direct stage1 input into a cached activation buffer."""
-    global _DIRECT_STAGE1_QUANT_A1, _DIRECT_STAGE1_QUANT_SCALE, _DIRECT_STAGE1_QUANT_AMAX
-    _DIRECT_STAGE1_QUANT_A1, _DIRECT_STAGE1_QUANT_SCALE, _DIRECT_STAGE1_QUANT_AMAX, out_scale = (
-        _direct_per_tensor_quant_cached(
-            hidden_states,
-            scale,
-            quant_dtype,
-            _DIRECT_STAGE1_QUANT_A1,
-            _DIRECT_STAGE1_QUANT_SCALE,
-            _DIRECT_STAGE1_QUANT_AMAX,
-        )
+    """Quantize direct stage1 input without cross-call tensor reuse."""
+    a1, _, _, out_scale = _direct_per_tensor_quant_cached(
+        hidden_states,
+        scale,
+        quant_dtype,
+        None,
+        None,
+        None,
     )
-    return _DIRECT_STAGE1_QUANT_A1, out_scale
+    return a1, out_scale
 
 
 def _direct_stage2_per_tensor_quant(a2, scale, quant_dtype):
-    """Quantize direct stage1 output into a cached stage2 activation buffer."""
-    global _DIRECT_STAGE2_QUANT_A2, _DIRECT_STAGE2_QUANT_SCALE, _DIRECT_STAGE2_QUANT_AMAX
-    _DIRECT_STAGE2_QUANT_A2, _DIRECT_STAGE2_QUANT_SCALE, _DIRECT_STAGE2_QUANT_AMAX, out_scale = (
-        _direct_per_tensor_quant_cached(
-            a2,
-            scale,
-            quant_dtype,
-            _DIRECT_STAGE2_QUANT_A2,
-            _DIRECT_STAGE2_QUANT_SCALE,
-            _DIRECT_STAGE2_QUANT_AMAX,
-            flatten_last_dim=True,
-        )
+    """Quantize direct stage1 output without cross-call tensor reuse."""
+    a2_quant, _, _, out_scale = _direct_per_tensor_quant_cached(
+        a2,
+        scale,
+        quant_dtype,
+        None,
+        None,
+        None,
+        flatten_last_dim=True,
     )
-    return _DIRECT_STAGE2_QUANT_A2, out_scale
+    return a2_quant, out_scale
 
 
 # fmt: off
