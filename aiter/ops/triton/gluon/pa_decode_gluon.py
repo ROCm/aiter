@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import lru_cache
+import threading
 
 import torch
 
@@ -103,6 +104,11 @@ def get_occupancy():
     return 2
 
 
+# Upper bound on the partition count get_recommended_splits returns at runtime;
+# also the set of variants the flydsl PS-reduce path eagerly precompiles.
+PA_DECODE_MAX_SPLITS = 8
+
+
 def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count * get_occupancy()
@@ -110,7 +116,7 @@ def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
         num_sm, num_sequences * num_kv_heads * split_kv_blocks
     )
     max_context_partition_num *= split_kv_blocks
-    return min(max_context_partition_num, 8)
+    return min(max_context_partition_num, PA_DECODE_MAX_SPLITS)
 
 
 DS_WRITE = gl.constexpr(0x200)
@@ -4982,6 +4988,81 @@ def compile_pa_decode_ps_reduce_flydsl(
     }
 
 
+# Config signatures whose full partition-variant set has already been eagerly
+# compiled, so the precompile pass in launch_pa_decode_ps_reduce_flydsl runs at
+# most once per config. Guarded by a lock so concurrent first calls don't both
+# do the work (the lock only protects the tiny test-and-add, not compilation).
+_PS_REDUCE_PRECOMPILED_SIGS = set()
+_PS_REDUCE_PRECOMPILE_LOCK = threading.Lock()
+
+
+def _precompile_ps_reduce_sibling_variants(
+    compile_kwargs,
+    skip_n,
+    output_dtype,
+    logits_dtype,
+    sink_dtype,
+    device,
+    stream,
+):
+    """Compile every partition variant in 1..PA_DECODE_MAX_SPLITS except skip_n.
+
+    Each variant is triggered by actually launching it once on small throwaway
+    buffers sized for that partition count. This avoids the process-global
+    COMPILE_ONLY env (which could make a concurrent real launch on another thread
+    skip execution) -- the cost is a handful of discarded dummy kernel runs on
+    the first call for a config. Tensor shapes are not in the FlyDSL cache key,
+    so these tiny launches produce the same artifacts later real calls hit.
+    """
+    qlen = compile_kwargs["query_seq_len"]
+    group = compile_kwargs["query_group_size"]
+    head_size = compile_kwargs["head_size"]
+    use_sinks = compile_kwargs["use_sinks"]
+    eq_group = qlen * group
+
+    for n in range(1, PA_DECODE_MAX_SPLITS + 1):
+        if n == skip_n:
+            continue
+        # Minimal valid shapes for partition count n (batch=1, num_kv_heads=1).
+        output = torch.empty(
+            1, qlen, 1, group, head_size, device=device, dtype=output_dtype
+        )
+        exp_sums = torch.zeros(1, 1, n, eq_group, device=device, dtype=torch.float32)
+        max_logits = torch.zeros(1, 1, n, eq_group, device=device, dtype=torch.float32)
+        temporary_output = torch.zeros(
+            1, 1, n, eq_group, head_size, device=device, dtype=logits_dtype
+        )
+        sink = (
+            torch.empty(group, device=device, dtype=sink_dtype)
+            if use_sinks
+            else torch.empty(0, device=device, dtype=output_dtype)
+        )
+        compiled = compile_pa_decode_ps_reduce_flydsl(
+            max_context_partition_num=n, **compile_kwargs
+        )
+        compiled["launch"](
+            output,
+            exp_sums,
+            max_logits,
+            temporary_output,
+            sink,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            output.stride(3),
+            exp_sums.stride(0),
+            exp_sums.stride(1),
+            exp_sums.stride(2),
+            temporary_output.stride(0),
+            temporary_output.stride(1),
+            temporary_output.stride(2),
+            temporary_output.stride(3),
+            output.shape[0],
+            output.shape[2],
+            stream,
+        )
+
+
 def launch_pa_decode_ps_reduce_flydsl(
     output_ptr,
     exp_sums_ptr,
@@ -5009,8 +5090,7 @@ def launch_pa_decode_ps_reduce_flydsl(
             "FlyDSL PS reduce fallback: only bf16/fp16/fp32 logits supported"
         )
 
-    compiled = compile_pa_decode_ps_reduce_flydsl(
-        max_context_partition_num=context_partition_num,
+    compile_kwargs = dict(
         query_seq_len=query_seq_len,
         query_group_size=query_group_size,
         head_size=head_size,
@@ -5026,27 +5106,56 @@ def launch_pa_decode_ps_reduce_flydsl(
         sink_token_ptr = torch.empty(
             0, dtype=output_ptr.dtype, device=output_ptr.device
         )
-    compiled["launch"](
-        output_ptr,
-        exp_sums_ptr,
-        max_logits_ptr,
-        logits_ptr,
-        sink_token_ptr,
-        stride_output_bs,
-        stride_output_len,
-        stride_output_kv_head,
-        stride_output_group_size,
-        stride_exp_sums_seq,
-        stride_exp_sums_head,
-        stride_exp_sums_part,
-        stride_logits_seq,
-        stride_logits_head,
-        stride_logits_part,
-        stride_logits_group,
-        output_ptr.shape[0],
-        output_ptr.shape[2],
-        torch.cuda.current_stream(output_ptr.device),
-    )
+    stream = torch.cuda.current_stream(output_ptr.device)
+
+    def _launch(n):
+        compiled = compile_pa_decode_ps_reduce_flydsl(
+            max_context_partition_num=n, **compile_kwargs
+        )
+        compiled["launch"](
+            output_ptr,
+            exp_sums_ptr,
+            max_logits_ptr,
+            logits_ptr,
+            sink_token_ptr,
+            stride_output_bs,
+            stride_output_len,
+            stride_output_kv_head,
+            stride_output_group_size,
+            stride_exp_sums_seq,
+            stride_exp_sums_head,
+            stride_exp_sums_part,
+            stride_logits_seq,
+            stride_logits_head,
+            stride_logits_part,
+            stride_logits_group,
+            output_ptr.shape[0],
+            output_ptr.shape[2],
+            stream,
+        )
+
+    # Real launch for the partition count this call actually needs.
+    _launch(context_partition_num)
+
+    # First time we see this config, eagerly compile the sibling partition
+    # variants so a later call landing on a different get_recommended_splits value
+    # hits the cache instead of JIT-compiling mid-run. Thread-safe: no global env
+    # toggling, and the test-and-add is locked so only one thread does the work.
+    sig = tuple(sorted(compile_kwargs.items()))
+    with _PS_REDUCE_PRECOMPILE_LOCK:
+        do_precompile = sig not in _PS_REDUCE_PRECOMPILED_SIGS
+        if do_precompile:
+            _PS_REDUCE_PRECOMPILED_SIGS.add(sig)
+    if do_precompile:
+        _precompile_ps_reduce_sibling_variants(
+            compile_kwargs,
+            context_partition_num,
+            output_ptr.dtype,
+            logits_ptr.dtype,
+            sink_token_ptr.dtype,
+            output_ptr.device,
+            stream,
+        )
 
 
 def _paged_attention_decode_v2_reduce_kernel_wrapper(
