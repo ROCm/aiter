@@ -280,7 +280,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else (total_bytes <= self.world_size * 32 * 1024)
+            else (total_bytes * self.world_size <= 128 * 7168 * 2)
         )
         if (
             not use_general_path
@@ -358,14 +358,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
 
-        norm_weight = weight_ + 1.0 if gemma_norm else weight_
         rmsnorm2d_fwd_with_add(
             out,
             ar_out,
             res_inp_,
             residual_out,
-            norm_weight,
+            weight_,
             eps,
+            gemma_norm,
             0,
         )
         return out, residual_out
