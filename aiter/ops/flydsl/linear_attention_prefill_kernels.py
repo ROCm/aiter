@@ -37,6 +37,9 @@ from .kernels.chunk_gated_delta_h_naive import compile_chunk_gated_delta_h_naive
 from .kernels.chunk_gated_delta_h_naive_opt import (
     compile_chunk_gated_delta_h_naive_opt,
 )
+# KV forks: ``kv`` is the WITH-lds_g variant (OPT-C(g) g-staging), ``kv_naive``
+# is the stripped no-lds_g variant (gating reads g inline from HBM). File names,
+# symbol names and the host ``_fork`` selector all agree.
 from .kernels.chunk_gated_delta_h_kv import compile_chunk_gated_delta_h_kv
 from .kernels.chunk_gated_delta_h_vk import compile_chunk_gated_delta_h_vk
 from .kernels.chunk_gated_delta_h_vk_naive import (
@@ -1076,13 +1079,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     resolved_state_dtype = _resolve_state_dtype(initial_state, state_dtype)
     state_bf16 = resolved_state_dtype is torch.bfloat16
 
-    # The kv_naive fork consumes k pre-transposed to [B, Hg, K, T_flat] (K
-    # major, T innermost so GEMM2 sees each BT row contiguous). This is now the
-    # fork's REQUIRED input layout -- the caller (upstream / tests) owns the
-    # transpose, the host does NOT permute. Every other fork keeps the original
-    # token-major [B, T_flat, Hg, K] layout.
-    _kv_naive_k_pretransposed = _fork == "kv_naive"
-    if _kv_naive_k_pretransposed:
+    # The KV forks ("kv" and "kv_naive") consume k pre-transposed to
+    # [B, Hg, K, T_flat] (K major, T innermost so GEMM2 sees each BT row
+    # contiguous). This is now their REQUIRED input layout -- the caller
+    # (upstream / tests) owns the transpose, the host does NOT permute. Every
+    # other fork keeps the original token-major [B, T_flat, Hg, K] layout.
+    _kv_k_pretransposed = _fork in ("kv", "kv_naive")
+    if _kv_k_pretransposed:
         B, Hg, K, T = k.shape
     else:
         B, T, Hg, K = k.shape
@@ -1130,14 +1133,15 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             f"{sorted(_K5_FORKS)} or None (baseline)."
         )
 
-    # kv_naive is a BV==64-only kernel. Pin BV=64 directly (ignore the
-    # heuristic) so it never silently falls back to the baseline kernel -- the
-    # baseline expects token-major k, which would mis-read the [B, Hg, K, T]
-    # layout kv_naive requires. V must be a multiple of 64 for this to be legal.
-    if _fork == "kv_naive":
+    # The KV forks ("kv" and "kv_naive") are BV==64-only kernels. Pin BV=64
+    # directly (ignore the heuristic) so they never silently fall back to the
+    # baseline kernel -- the baseline expects token-major k, which would
+    # mis-read the [B, Hg, K, T] layout the KV forks require. V must be a
+    # multiple of 64 for this to be legal.
+    if _fork in ("kv", "kv_naive"):
         if V % 64 != 0:
             raise ValueError(
-                f"FlyDSL K5 kv_naive: requires V % 64 == 0 (BV=64-only fork); "
+                f"FlyDSL K5 {_fork}: requires V % 64 == 0 (BV=64-only fork); "
                 f"got V={V}."
             )
         BV = 64
@@ -1309,10 +1313,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl_kv(
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Separate KV-layout K5 implementation (VWARP 16x16x16 + 3-wave +
-    coalesced KV h-store). API-identical to ``chunk_gated_delta_rule_fwd_h_flydsl``;
-    the KV kernel is used only when the chosen BV is 64, else it falls back to
-    the baseline. The returned h is the usual VK layout (transposed view)."""
+    """Separate KV-layout K5 implementation (VWARP 16x16x16 + coalesced KV
+    h-store). NOTE: the KV kernel is now the un-pipelined, no-lds_g variant
+    (the previous software-pipelined implementation was overwritten).
+
+    BV is pinned to 64 (BV==64-only fork; it never falls back to the baseline).
+    ``k`` MUST be passed PRE-TRANSPOSED to ``[B, Hg, K, T_flat]`` (K major, T
+    innermost) -- the caller owns the transpose so GEMM2 reads each BT row
+    contiguously with no host-side permute. (All other flydsl forks except
+    kv_naive take the token-major ``[B, T_flat, Hg, K]`` layout instead.)
+    The returned h is the usual VK layout (transposed view)."""
     return chunk_gated_delta_rule_fwd_h_flydsl(
         k,
         w,

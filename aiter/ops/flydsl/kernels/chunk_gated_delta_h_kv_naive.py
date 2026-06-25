@@ -2,23 +2,22 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Gated Delta Net K5 hidden-state recurrence kernel -- NAIVE / un-pipelined KV fork.
+Gated Delta Net K5 hidden-state recurrence kernel -- stripped (no-lds_g) KV fork.
 
-This is a deliberately stripped-down variant of ``chunk_gated_delta_h_kv.py``
-with ALL prefetch / software-pipeline scheduling removed, so a trace shows the
-raw bottleneck structure before any hand-scheduling is layered back on:
+Exports ``compile_chunk_gated_delta_h_kv_naive`` / emits
+``chunk_gdn_fwd_h_flydsl_kv_naive`` and backs the host ``_fork="kv_naive"`` path.
+This is the NO-lds_g variant (gating reads g inline from HBM per lane). Its
+sibling ``chunk_gated_delta_h_kv.py`` is the with-lds_g variant (``_fork="kv"``).
+
+ALL prefetch / software-pipeline scheduling is removed, AND the per-chunk g LDS
+staging (lds_g) is removed -- gating reads g inline from HBM per lane. A trace
+therefore shows the raw bottleneck structure with no hand-scheduling and no
+g-staging tweak:
 
   * NO cross-chunk w prefetch (no init=/yield carry of w).
   * NO OPT-K k-prefetch interleave (k is loaded straight to LDS before GEMM1).
   * NO OPT-W next-w interleave into GEMM2.
-
-One traffic-reducing tweak IS applied (does not reorder phases / add barriers):
-  * OPT-C(g): the chunk's per-row g is staged once into a tiny LDS buffer
-    (branchless, published on the existing w-barrier) and read from LDS in
-    gating, instead of having all 256 lanes redundantly re-load the same 64 g
-    values from HBM. Cuts buffer_load count / VMEM-wait; +256 B LDS, 3-wave
-    safe. Other reorder-only tweaks (h-store move, barrier merge, u prefetch)
-    were measured net-neutral/regressive on this access-bound kernel.
+  * NO lds_g g-staging: each lane re-loads its g values from HBM during gating.
 
 What is KEPT (these are layout/correctness, not pipeline scheduling):
   * OPT-VWARP layout (wid -> one 16-wide V-tile, full K). VWARP-only file:
@@ -103,7 +102,7 @@ def compile_chunk_gated_delta_h_kv_naive(
     STATE_DTYPE_BF16: bool = False,
     G_IS_LOG2_SCALED: bool = False,
 ):
-    """Compile the NAIVE (un-pipelined) GDN K5 KV-fork kernel.
+    """Compile the NAIVE (un-pipelined, no lds_g) GDN K5 KV-fork kernel.
 
     VWARP-only: requires BV == 64, K % 64 == 0, not USE_GK. The host wrapper
     only routes BV==64 to this kernel; other shapes fall back to the baseline.
@@ -145,7 +144,7 @@ def compile_chunk_gated_delta_h_kv_naive(
     # (SQ_LDS_BANK_CONFLICT) on K128/BT64/BV64: lds_w pad=4 + lds_k pad=8 gives
     # 67.6M conflict cycles vs 470M unpadded (-86%); they are coupled (lds_w's
     # pad shifts lds_k's bank alignment), and conflict is non-monotonic in the
-    # pad value, so these are tuned for this shape. LDS cost is ~1.5 KB total.
+    # pad value, so these are tuned for this shape.
     LDS_W_PAD = 4
     LDS_W_STRIDE = K + LDS_W_PAD
     LDS_W_ELEMS = BT * LDS_W_STRIDE
@@ -159,29 +158,21 @@ def compile_chunk_gated_delta_h_kv_naive(
     # NOTE: lds_vn removed -- GEMM2 now feeds v_new (B operand) straight from
     # the vn_frags registers (vn-direct), so there is no gated-v_new LDS
     # round-trip. This frees BT*(BV+pad)*2 bytes of LDS.
+    # NOTE: lds_g removed -- gating reads g inline from HBM per lane (no g
+    # staging buffer / no extra w-barrier publish dependency).
 
-    # OPT-C(g): tiny staging buffer for this chunk's per-row g gate values
-    # (one f32 per BT row). g depends only on the BT row, not on V/lane/wid, so
-    # loading it inline per lane made all 256 lanes re-load the same 64 values.
-    # Stage once into LDS -> read from LDS in gating. BT*4 = 256 B (negligible
-    # vs the 53.3 KB = 64KB/3 LDS budget for 3 waves).
-    LDS_G_ELEMS = BT
-    LDS_G_BYTES = LDS_G_ELEMS * 4
-
-    _K5_KERNEL_REVISION = 209  # fix: GEMM2 k-load missing i_t*BT chunk offset
+    _K5_KERNEL_REVISION = 210  # remove lds_g g-staging (inline g from HBM)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_kv_naive_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_kv_naive_nolds_g_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
     lds_k_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_k_offset + LDS_K_BYTES
-    lds_g_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_g_offset + LDS_G_BYTES
 
     # Cooperative load parameters
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
@@ -238,8 +229,6 @@ def compile_chunk_gated_delta_h_kv_naive(
         lds_w = STensor(lds_w_ptr, dtype=T.bf16, shape=(LDS_W_ELEMS,))
         lds_k_ptr = SmemPtr(lds_base_ptr, lds_k_offset, T.bf16, shape=(LDS_K_ELEMS,))
         lds_k = STensor(lds_k_ptr, dtype=T.bf16, shape=(LDS_K_ELEMS,))
-        lds_g_ptr = SmemPtr(lds_base_ptr, lds_g_offset, T.f32, shape=(LDS_G_ELEMS,))
-        lds_g = STensor(lds_g_ptr, dtype=T.f32, shape=(LDS_G_ELEMS,))
 
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
@@ -408,22 +397,6 @@ def compile_chunk_gated_delta_h_kv_naive(
                     w_lds_off = row * fx.Int32(LDS_W_STRIDE) + col
                     lds_w.vec_store((fx.Index(w_lds_off),), w_vec, LOAD_VEC_WIDTH)
 
-            # OPT-C(g): cooperatively stage this chunk's per-row g into lds_g.
-            # BRANCHLESS: every thread maps to a row via ``tid % BT`` and stores
-            # that slot unconditionally (threads mapping to the same slot write
-            # the SAME value -> benign race). No ``if tid < BT`` -> no scf.if in
-            # the dynamic chunk loop. The w-barrier below publishes it; gating
-            # then reads g from LDS instead of from HBM in every lane.
-            if const_expr(USE_G):
-                g_stage_row = tid % fx.Int32(BT)
-                g_stage_abs = i_t_i32 * fx.Int32(BT) + g_stage_row
-                g_stage_in_bounds = g_stage_abs < T_local
-                g_stage_safe = g_stage_in_bounds.select(g_stage_abs, fx.Int32(0))
-                g_stage_off = i_h * T_flat + (bos + g_stage_safe)
-                g_stage_val = g_[fx.Index(g_stage_off)]
-                g_stage_val = g_stage_in_bounds.select(g_stage_val, fx.Float32(0.0))
-                lds_g[fx.Index(g_stage_row)] = g_stage_val
-
             gpu.barrier()
 
             # ============================================================
@@ -527,7 +500,7 @@ def compile_chunk_gated_delta_h_kv_naive(
                             _emit_vn_store(vn_off, bf16_v)
 
             # ============================================================
-            # 6. Gating (g loaded inline)
+            # 6. Gating (g loaded INLINE from HBM per lane -- no lds_g)
             # ============================================================
             next_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
             last_idx_raw = (next_chunk_end < T_local).select(
@@ -535,10 +508,10 @@ def compile_chunk_gated_delta_h_kv_naive(
             ) - fx.Int32(1)
 
             if const_expr(USE_G):
-                # OPT-C(g): read g from the staged lds_g (published at the
-                # w-barrier) instead of re-loading it from HBM per lane.
-                g_last_in_chunk = last_idx_raw - i_t_i32 * fx.Int32(BT)
-                g_last = lds_g[fx.Index(g_last_in_chunk)]
+                # Inline g: load g_last (the chunk's last in-bounds row) and
+                # each row's g directly from HBM. g is head-major [H, T_flat];
+                # the absolute index is i_h*T_flat + (bos + abs_row).
+                g_last = g_[fx.Index(i_h * T_flat + bos + last_idx_raw)]
                 exp_g_last = _fast_exp(g_last)
 
                 for m_bt in range_constexpr(BT_MTILES):
@@ -551,7 +524,8 @@ def compile_chunk_gated_delta_h_kv_naive(
                         )
                         abs_row = i_t_i32 * fx.Int32(BT) + in_chunk_row
                         in_bounds = abs_row < T_local
-                        g_row = lds_g[fx.Index(in_chunk_row)]
+                        safe_abs_row = in_bounds.select(abs_row, fx.Int32(0))
+                        g_row = g_[fx.Index(i_h * T_flat + bos + safe_abs_row)]
                         gate = _fast_exp(g_last - g_row)
                         gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
                     gate_vec = vector.from_elements(T.f32x4, gate_elems)

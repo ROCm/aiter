@@ -969,16 +969,19 @@ class TestCorrectness:
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_correctness_flydsl_kv(self, args: PrefillArgs):
-        """Separate KV-layout FlyDSL K5 impl (VWARP 16x16x16 + 3-wave +
-        coalesced KV h-store). Same VK public outputs as the baseline flydsl
-        path; only the BV==64 configs exercise the KV kernel, others fall back."""
+        """Separate KV-layout FlyDSL K5 impl (VWARP 16x16x16 + coalesced KV
+        h-store). BV is pinned to 64; k must be pre-transposed to [B, Hg, K, T].
+        Same VK public outputs as the baseline flydsl path."""
         context_lens = args.resolve_context_lens()
         k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
             context_lens, args=args
         )
 
+        # kv fork now consumes k PRE-TRANSPOSED to [B, Hg, K, T] (caller owns
+        # the transpose); the reference still takes token-major [B, T, Hg, K].
+        k_kv = k.permute(0, 2, 3, 1).contiguous()
         h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_kv(
-            k,
+            k_kv,
             w_c,
             u_c,
             g=g,
@@ -1585,10 +1588,10 @@ def _run_perf_comparison(args: PrefillArgs):
         else None
     )
 
-    # kv_naive requires k pre-transposed to [B, Hg, K, T]. Do it ONCE outside
-    # the timed window (the caller owns the transpose now), so the benchmarked
-    # kv_naive time reflects the kernel alone -- matching the other forks which
-    # consume the token-major k without a host permute.
+    # Both KV forks (kv, kv_naive) require k pre-transposed to [B, Hg, K, T].
+    # Do it ONCE outside the timed window (the caller owns the transpose now),
+    # so the benchmarked KV-fork time reflects the kernel alone -- matching the
+    # other forks which consume the token-major k without a host permute.
     k_kvn = k.permute(0, 2, 3, 1).contiguous()
 
     # K5 launch closures: each invokes the K5 host wrapper of its backend.
@@ -1605,7 +1608,7 @@ def _run_perf_comparison(args: PrefillArgs):
 
     def flydsl_kv_launch():
         chunk_gated_delta_rule_fwd_h_flydsl_kv(
-            k=k,
+            k=k_kvn,
             w=w_c,
             u=u_c,
             g=g,
