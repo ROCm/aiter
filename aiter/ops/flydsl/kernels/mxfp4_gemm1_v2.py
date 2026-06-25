@@ -5,34 +5,32 @@
 Variants: ``(BM=32, inline_quant=False, interleave=True)`` for BOTH ``use_nt``
 values (kSubBlocks=1, kMChunks=2, kAStages=3, kStages=2, kUnroll=26). ``use_nt``
 selects the B-load cache policy, matching the tuned config's BM32_NT vs
-BM32_CACHED kernelName1:
-  * ``use_nt=True``  (BM32_NT)     -> non-temporal raw buffer_load B (decode/small M)
-  * ``use_nt=False`` (BM32_CACHED) -> cached layout-API fx.copy B    (prefill/large M)
+BM32_CACHED kernelName1 -- BOTH go through the layout API now, differing only in
+the copy atom's cache modifier:
+  * ``use_nt=True``  (BM32_NT)     -> fx.copy w/ BufferCopy128b(cache_modifier=2)  (decode)
+  * ``use_nt=False`` (BM32_CACHED) -> fx.copy w/ BufferCopy128b(cache_modifier=0)  (prefill)
 
-This is a **hybrid** kernel, exactly like the proven layout-API reference
-``/root/FlyDSL/kernels/preshuffle_gemm_v2.py``: the inner microscaled MMA stays on
-the raw ``rocdl.mfma_scale_f32_16x16x128_f8f6f4`` intrinsic (the layout API cannot
-express mxfp4 per-block microscaling -- it has no scale-fragment partitioning and
-freezes opsel at atom-construction time, whereas mxfp4 needs *runtime* per-K-block
-scale operands + opsel). Everything the layout API *can* express is converted:
-
-CONVERTED to the layout API (the deliverable's point):
+CONVERTED to the layout API (the deliverable):
   * **B-weight load** -> a hierarchical ``fx.make_layout`` preshuffle view over the
-    bq buffer (mirroring v2 lines 470-485, adapted to this kernel's 5-D CK layout
-    + per-expert base offset), loaded via ``make_tiled_copy_B`` partitions and a
-    layout-API ``fx.copy`` into fragments that feed the raw mfma.
-  * **Accumulators** -> ``thr_mma.make_fragment_C`` (one fragment, indexed per
-    (i,J) when calling the raw mfma) instead of the python list-of-vec4.
+    bq buffer (adapted to this kernel's 5-D CK layout + per-expert base offset),
+    loaded via a layout-API ``fx.copy`` into register fragments. The non-temporal
+    (nt) decode policy rides on the copy atom's ``cache_modifier`` (FlyDSL
+    ``BufferCopy128b(cache_modifier=2)``), so there is NO raw buffer_load fallback.
+  * **Scaled MMA** -> the FlyDSL cdna4 ``MFMA_Scale`` atom driven via
+    ``fly.mma_atom_call_ssa``: per-K-block e8m0 scales ride on the atom STATE
+    (``set_value`` scale_a/scale_b) and the runtime per-K opsel is handled by
+    selecting one of the pre-built opsel-specialized atoms (opsel is a type param).
+    Bit-identical to the prior raw ``mfma_scale_f32_16x16x128_f8f6f4`` intrinsic.
+  * **Accumulators** -> ``thr_mma.make_fragment_C`` (SSA chain mid-loop, stored
+    into the fragment-of-record) instead of a python list-of-vec4.
 
 KEPT RAW (reused by importing from the v1 module ``mxfp4_gemm1`` -- not duplicated):
   * all math / quant helpers (``_silu_mul_batch``, ``_e8m0_*``, ``_fabs_f32``,
     ``_lds_swizzle_mask``, ``_raw``, ``_global_base_ptr1``, ``_gep1``, ``_gep3``,
     ``_lds_base_ptr3``, ``gemm1_grid``, the ``*_for(...)`` size helpers + consts).
-  * the microscaled ``mfma_scale_f32_16x16x128_f8f6f4`` cluster (operated on the
-    layout-API A/B/C fragments).
   * the A-side LDS stage + ds-read + A-scale machinery (the e8m0 byte layout that
     feeds the mfma scale operands) -- the swizzle/byte layout is delicate and the
-    raw path is the bit-exact spec; converting it is Phase-2 polish.
+    raw path is the bit-exact spec; converting it is later polish.
   * the A-side gather (rows via m_indices) base-offset computation.
   * the SwiGLU + fp4/e8m0 requant epilogue MATH (reuses helpers).
 
@@ -43,6 +41,7 @@ scores ~0.874 on this case).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
@@ -247,9 +246,10 @@ def _gemm1_body_v2(
     # ============================================================
     # Accumulators -- LAYOUT API (the second non-negotiable core conversion).
     #
-    # The raw mfma_scale intrinsic produces/consumes plain vector<4xf32> SSA values
-    # (it cannot write to a fragment slot mid-chain), so the MMA accumulation chain
-    # is necessarily SSA-threaded. We make the layout-API fragment the
+    # The scaled-MMA atom call (mma_atom_call_ssa) produces/consumes plain
+    # vector<4xf32> SSA values (it cannot write to a fragment slot mid-chain), so the
+    # MMA accumulation chain is necessarily SSA-threaded. We make the layout-API
+    # fragment the
     # accumulator-OF-RECORD: thr_mma.make_fragment_C(tC) allocates the register
     # storage (32 f32 for this BM32 tile = kMChunks(2) * 4 J * 4 elems, exactly the
     # v2 reference's acc_size), the final MMA results are STOREd into it, and the
@@ -485,42 +485,54 @@ def _gemm1_body_v2(
                 soffset_bytes=s_off,
             )
 
-    # -- MFMA cluster (KEPT RAW; operates on layout-API A/B/C fragments) -------
+    # -- MFMA cluster -- LAYOUT API (the scaled MMA via fx.mma_atom_call) -------
+    # The microscaled mfma is driven through the FlyDSL layout-API scaled-MMA atom
+    # (cdna4 MFMA_Scale) instead of a raw rocdl intrinsic. The per-K-block e8m0
+    # scales ride on the atom STATE (set_value scale_a/scale_b), and the runtime
+    # per-K opsel is handled by selecting an opsel-specialized atom (opsel is a type
+    # parameter, so one atom instance per (opselA,opselB) pair -- built once, <=8).
+    # mma_atom_call_ssa keeps the SSA accumulator-chain form the mfma requires.
+    # cbsz/blgp (=4 for fp4) are inferred by the atom from the Float4E2M1FN operand
+    # types -- equivalent to the raw call's explicit 4,4.
     mfma_ty = T.f32x4
     zero4 = Vec.filled(4, 0.0, fx.Float32)
 
-    # accm is built as views into the layout-API fragment (see below).
+    # accm holds the SSA accumulator vec4 mid-chain; stored into frag_C at the end.
     accm = [[None] * 4 for _ in range(kMChunks)]
 
+    # Build the opsel-specialized scaled-MMA atoms ONCE (opsel is a type param, so
+    # one atom per (opselA,opselB) pair). All 16 combos -- cheap, built at trace time.
+    _scale_mma_atoms = {
+        (osa, osb): fx.make_mma_atom(
+            fx.rocdl.cdna4.MFMA_Scale(
+                16, 16, 128, Float4E2M1FN, opsel_a=osa, opsel_b=osb
+            )
+        )
+        for osa in range_constexpr(4)
+        for osb in range_constexpr(4)
+    }
+
+    def _scaled_mma(a_vec, b_vec, c_vec, opsel_a, opsel_b, sa, sb):
+        # per-K-block e8m0 scales -> atom state; opsel -> pre-built atom selection.
+        atom = _scale_mma_atoms[(opsel_a, opsel_b)].set_value(
+            {"scale_a": sa, "scale_b": sb}
+        )
+        return Vec(fly_dialect.mma_atom_call_ssa([mfma_ty], atom, a_vec, b_vec, c_vec))
+
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, init):
-        mni = J // 2
         in_b = J % 2
-        sb = bs_slot[mni]
+        sb = bs_slot[J // 2]
         bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
         for sub in range_constexpr(kSubBlocks):
             i0 = sub * 2 + 0
             i1 = sub * 2 + 1
             sa = a_scale[sub]
-            if const_expr(init):
-                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i0][0], bJ0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
-                )
-                accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i1][0], bJ0, zero4, 4, 4, 1, sa, 0 + in_b, sb]
-                )
-            else:
-                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i0][0], bJ0, accm[i0][J], 4, 4, 0, sa, 0 + in_b, sb]
-                )
-                accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i1][0], bJ0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb]
-                )
-            accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                mfma_ty, [a[i0][1], bJ1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb]
-            )
-            accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                mfma_ty, [a[i1][1], bJ1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb]
-            )
+            c0 = zero4 if const_expr(init) else accm[i0][J]
+            c1 = zero4 if const_expr(init) else accm[i1][J]
+            accm[i0][J] = _scaled_mma(a[i0][0], bJ0, c0, 0, 0 + in_b, sa, sb)
+            accm[i1][J] = _scaled_mma(a[i1][0], bJ0, c1, 1, 0 + in_b, sa, sb)
+            accm[i0][J] = _scaled_mma(a[i0][1], bJ1, accm[i0][J], 2, 2 + in_b, sa, sb)
+            accm[i1][J] = _scaled_mma(a[i1][1], bJ1, accm[i1][J], 3, 2 + in_b, sa, sb)
 
     # ---- prologue: stages 0,1 ----
     issue_a_scale_load()
