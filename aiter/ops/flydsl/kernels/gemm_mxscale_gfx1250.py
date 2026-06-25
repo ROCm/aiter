@@ -127,7 +127,6 @@ def compile_mxscale_gemm(
     grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
-    swiglu_limit: float | None = None,
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
     kernel_tag: str = "gemm",
@@ -580,6 +579,7 @@ def compile_mxscale_gemm(
         i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        f32_swiglu_limit: fx.Float32,
     ):
         # Enable back-to-back WMMA issue (SCHED_MODE bit[4] = DISABLE_VALU_STALL)
         rocdl.disable_xdl_arb_stall()
@@ -1627,13 +1627,14 @@ def compile_mxscale_gemm(
             def _stage1_act_mul_scalar(g, u):
                 one = arith.constant(1.0, type=T.f32)
                 alpha = arith.constant(1.702, type=T.f32)
-                _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
-                limit = arith.constant(_lim, type=T.f32)
-                neg_limit = arith.constant(-_lim, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
+                # Runtime clamp bound: host passes the limit (7.0 default for
+                # swiglu) or +inf to disable clamping (silu without a limit).
+                # min(x, lim) == -max(-x, -lim), expressed via wrapped maximumf.
+                neg_lim = -f32_swiglu_limit
+                g = -((-g).maximumf(neg_lim))
+                u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                 if const_expr(stage1_act_mode == "swiglu"):
-                    g = arith.minimumf(g, limit)
-                    u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [g * alpha * neg_log2e], [], []
                     )
@@ -1641,9 +1642,6 @@ def compile_mxscale_gemm(
                         T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
                     )
                     return g * sig * (u + one)
-                if const_expr(swiglu_limit is not None):
-                    g = arith.minimumf(g, limit)
-                    u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                 return _stage1_silu_elem(g) * u
 
             def _stage1_act_mul_vec8(gate_v8, up_v8):
@@ -3135,6 +3133,7 @@ def compile_mxscale_gemm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
+        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3163,6 +3162,7 @@ def compile_mxscale_gemm(
             i32_m,
             i32_m,
             i32_n,
+            swiglu_limit_f,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3200,6 +3200,7 @@ def compile_mxscale_gemm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
+        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3233,6 +3234,7 @@ def compile_mxscale_gemm(
             i32_m_tile_bound,
             i32_m,
             i32_n,
+            swiglu_limit_f,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3269,6 +3271,7 @@ def compile_mxscale_gemm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
+        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3294,6 +3297,7 @@ def compile_mxscale_gemm(
             i32_m,
             i32_m,
             i32_n,
+            swiglu_limit_f,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3322,6 +3326,7 @@ def compile_mxscale_gemm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
+        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3350,6 +3355,7 @@ def compile_mxscale_gemm(
             i32_m,
             i32_m,
             i32_n,
+            swiglu_limit_f,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3388,6 +3394,7 @@ def compile_mxscale_gemm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
+        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3421,6 +3428,7 @@ def compile_mxscale_gemm(
             i32_m_tile_bound,
             i32_m,
             i32_n,
+            swiglu_limit_f,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(
@@ -3458,6 +3466,7 @@ def compile_mxscale_gemm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
+        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3483,6 +3492,7 @@ def compile_mxscale_gemm(
             i32_m,
             i32_m,
             i32_n,
+            swiglu_limit_f,
         )
         for op in ctx.gpu_module_body.operations:
             if const_expr(

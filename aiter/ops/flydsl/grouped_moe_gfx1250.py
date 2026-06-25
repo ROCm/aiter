@@ -768,7 +768,6 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
-        swiglu_limit=swiglu_limit,
         stage1_weight_layout=stage1_weight_layout,
     )
     _grouped_dbg("stage1 compile done; start launch")
@@ -790,6 +789,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         model_dim,
         E,
         stream=torch.cuda.current_stream(),
+        swiglu_limit=swiglu_limit,
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
         bias=_bias1_arg,

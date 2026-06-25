@@ -653,9 +653,8 @@ def _row_to_kwargs(row):
         hidden_pad=0,
         intermediate_pad=0,
         preshuffle=True,
-        swiglu_limit=(
-            _row_swiglu_limit(row)
-            or _effective_swiglu_limit(q_type, aq_dtype, wq_dtype, args.swiglu_limit)
+        swiglu_limit=_effective_swiglu_limit(
+            q_type, aq_dtype, wq_dtype, args.swiglu_limit
         ),
     )
 
@@ -732,21 +731,6 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
         return swiglu_limit
     return None
-
-
-def _row_swiglu_limit(row):
-    """Parse a CSV row's swiglu_limit. Empty / NaN / 0 all mean no clamp (None),
-    matching the reference's `if swiglu_limit:` truthiness and the AOT build."""
-    value = row.get("swiglu_limit") if hasattr(row, "get") else None
-    if value is None:
-        return None
-    try:
-        limit = float(value)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(limit) or limit == 0.0:
-        return None
-    return limit
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(

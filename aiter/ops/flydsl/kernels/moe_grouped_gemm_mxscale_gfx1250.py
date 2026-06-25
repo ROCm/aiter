@@ -362,7 +362,6 @@ def _compile_stage1_finalize_act(
     inter_dim: int,
     out_dtype: str,
     act: str,
-    swiglu_limit: float | None = None,
     stage1_weight_layout: str = "gguu",
 ):
     if out_dtype not in ("f16", "bf16"):
@@ -388,6 +387,7 @@ def _compile_stage1_finalize_act(
         arg_y: fx.Tensor,
         arg_tmp: fx.Tensor,
         arg_masked_m: fx.Tensor,
+        swiglu_limit_f: fx.Float32,
     ):
         elem_ty = T.bf16 if out_dtype == "bf16" else T.f16
         tx = arith.index_cast(T.index, _raw(gpu.thread_id("x")))
@@ -446,13 +446,14 @@ def _compile_stage1_finalize_act(
                 u = up_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
-                _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
+                # Runtime clamp bound: host passes the limit (7.0 default for
+                # swiglu) or +inf to disable clamping (silu without a limit).
+                # min(x, lim) == -max(-x, -lim), expressed via wrapped maximumf.
+                neg_lim = -swiglu_limit_f
+                g = -((-g).maximumf(neg_lim))
+                u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                 if const_expr(act == "swiglu"):
-                    limit = arith.constant(_lim, type=T.f32)
-                    neg_limit = arith.constant(-_lim, type=T.f32)
                     alpha = arith.constant(1.702, type=T.f32)
-                    g = arith.minimumf(g, limit)
-                    u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * alpha * neg_log2e
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -462,11 +463,6 @@ def _compile_stage1_finalize_act(
                     )
                     out_f = g * sig * (u + one)
                 else:
-                    if const_expr(swiglu_limit is not None):
-                        limit = arith.constant(_lim, type=T.f32)
-                        neg_limit = arith.constant(-_lim, type=T.f32)
-                        g = arith.minimumf(g, limit)
-                        u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * neg_log2e
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -485,6 +481,7 @@ def _compile_stage1_finalize_act(
         arg_y: fx.Tensor,
         arg_tmp: fx.Tensor,
         arg_masked_m: fx.Tensor,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
@@ -493,7 +490,9 @@ def _compile_stage1_finalize_act(
         gx = (arith.index(total_elems) + arith.index(block_threads - 1)) // arith.index(
             block_threads
         )
-        launcher = stage1_finalize_act_kernel(arg_y, arg_tmp, arg_masked_m)
+        launcher = stage1_finalize_act_kernel(
+            arg_y, arg_tmp, arg_masked_m, swiglu_limit_f
+        )
         launcher.launch(
             grid=(_raw(gx), 1, 1),
             block=(block_threads, 1, 1),
@@ -511,7 +510,6 @@ def _compile_stage1_finalize_act_bias(
     inter_dim: int,
     out_dtype: str,
     act: str,
-    swiglu_limit: float | None = None,
     stage1_weight_layout: str = "gguu",
 ):
     if out_dtype not in ("f16", "bf16"):
@@ -539,6 +537,7 @@ def _compile_stage1_finalize_act_bias(
         arg_tmp: fx.Tensor,
         arg_bias: fx.Tensor,
         arg_masked_m: fx.Tensor,
+        swiglu_limit_f: fx.Float32,
     ):
         elem_ty = T.bf16 if out_dtype == "bf16" else T.f16
         tx = arith.index_cast(T.index, _raw(gpu.thread_id("x")))
@@ -615,13 +614,14 @@ def _compile_stage1_finalize_act_bias(
                 u = up_h.extf(T.f32) + up_bias_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
-                _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
+                # Runtime clamp bound: host passes the limit (7.0 default for
+                # swiglu) or +inf to disable clamping (silu without a limit).
+                # min(x, lim) == -max(-x, -lim), expressed via wrapped maximumf.
+                neg_lim = -swiglu_limit_f
+                g = -((-g).maximumf(neg_lim))
+                u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                 if const_expr(act == "swiglu"):
-                    limit = arith.constant(_lim, type=T.f32)
-                    neg_limit = arith.constant(-_lim, type=T.f32)
                     alpha = arith.constant(1.702, type=T.f32)
-                    g = arith.minimumf(g, limit)
-                    u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * alpha * neg_log2e
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -631,11 +631,6 @@ def _compile_stage1_finalize_act_bias(
                     )
                     out_f = g * sig * (u + one)
                 else:
-                    if const_expr(swiglu_limit is not None):
-                        limit = arith.constant(_lim, type=T.f32)
-                        neg_limit = arith.constant(-_lim, type=T.f32)
-                        g = arith.minimumf(g, limit)
-                        u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * neg_log2e
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -655,6 +650,7 @@ def _compile_stage1_finalize_act_bias(
         arg_tmp: fx.Tensor,
         arg_bias: fx.Tensor,
         arg_masked_m: fx.Tensor,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
@@ -664,7 +660,7 @@ def _compile_stage1_finalize_act_bias(
             block_threads
         )
         launcher = stage1_finalize_act_bias_kernel(
-            arg_y, arg_tmp, arg_bias, arg_masked_m
+            arg_y, arg_tmp, arg_bias, arg_masked_m, swiglu_limit_f
         )
         launcher.launch(
             grid=(_raw(gx), 1, 1),
@@ -785,7 +781,6 @@ def _compile_base_a8w4_gemm(
         grouped_contiguous_m=cfg.grouped_contiguous_m,
         persistent_workers=cfg.persistent_workers,
         stage1_act=stage1_act,
-        swiglu_limit=cfg.swiglu_limit,
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
         kernel_tag=kernel_tag,
@@ -819,7 +814,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     act: str = "silu",
-    swiglu_limit: float | None = None,
     stage1_weight_layout: str = "gguu",
     data_format: str = "a8w4",
 ):
@@ -849,7 +843,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         persistent_workers=persistent_workers,
         data_format=str(data_format),
         act=str(act),
-        swiglu_limit=(None if swiglu_limit is None else float(swiglu_limit)),
         stage1_weight_layout=str(stage1_weight_layout),
     )
     _validate_common(cfg)
@@ -913,7 +906,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 inter_dim=cfg.inter_dim,
                 out_dtype=cfg.out_dtype,
                 act=cfg.act,
-                swiglu_limit=cfg.swiglu_limit,
                 stage1_weight_layout=cfg.stage1_weight_layout,
             )
         return _lazy["finalize_act"]
@@ -926,7 +918,6 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 inter_dim=cfg.inter_dim,
                 out_dtype=cfg.out_dtype,
                 act=cfg.act,
-                swiglu_limit=cfg.swiglu_limit,
                 stage1_weight_layout=cfg.stage1_weight_layout,
             )
         return _lazy["finalize_act_bias"]
@@ -944,6 +935,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         experts_arg,
         *,
         stream=None,
+        swiglu_limit=None,
         _gemm_events=None,
         _m_tile_prefix=None,
         _m_tile_map=None,
@@ -980,6 +972,12 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _check_bias_args("bias", bias, (cfg.experts, 2 * cfg.inter_dim), y)
         if stream is None:
             stream = torch.cuda.current_stream()
+        # Runtime clamp bound passed to the act epilogue / finalize kernels.
+        # swiglu defaults to 7.0; silu without a limit uses +inf (no clamp).
+        if cfg.act == "swiglu":
+            _swiglu_lim_rt = float(swiglu_limit) if swiglu_limit else 7.0
+        else:
+            _swiglu_lim_rt = float(swiglu_limit) if swiglu_limit else float("inf")
         fused_gemm = _get_fused_base_bias() if bias is not None else _get_fused_base()
         use_fused_gemm = (
             fused_gemm is not None
@@ -1025,6 +1023,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
                 else:
                     _run_compiled(
@@ -1040,6 +1039,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
             else:
                 _run_compiled(
@@ -1085,6 +1085,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         contiguous_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
                 else:
                     _run_compiled(
@@ -1101,6 +1102,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         contiguous_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
             else:
                 _run_compiled(
@@ -1143,6 +1145,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
                 else:
                     _run_compiled(
@@ -1159,6 +1162,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
             else:
                 _run_compiled(
@@ -1187,9 +1191,19 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         if _skip_epilogue:
             return tmp
         if bias is not None:
-            _run_compiled(_get_finalize_act_bias(), y, tmp, bias, masked_m, stream)
+            _run_compiled(
+                _get_finalize_act_bias(),
+                y,
+                tmp,
+                bias,
+                masked_m,
+                _swiglu_lim_rt,
+                stream,
+            )
         else:
-            _run_compiled(_get_finalize_act(), y, tmp, masked_m, stream)
+            _run_compiled(
+                _get_finalize_act(), y, tmp, masked_m, _swiglu_lim_rt, stream
+            )
         return y
 
     return launch

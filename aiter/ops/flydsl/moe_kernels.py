@@ -367,7 +367,6 @@ def compile_flydsl_moe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: Optional[float] = None,
     k_wave: int = 1,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
@@ -399,7 +398,6 @@ def compile_flydsl_moe_stage1(
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
-            swiglu_limit=swiglu_limit,
             k_wave=k_wave,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
@@ -541,6 +539,19 @@ def _ptr_view_safe(t: torch.Tensor):
     return flyc.from_c_void_p(fx.Uint8, view.data_ptr())
 
 
+def runtime_swiglu_limit(swiglu_limit: Optional[float], act: str) -> float:
+    """Normalize swiglu_limit into the runtime f32 clamp bound passed to kernels.
+
+    The kernels always clamp using this value, so "no clamp" is encoded as +inf:
+      - swiglu: defaults to 7.0 when unset (matches the reference ``swiglu()``).
+      - silu:   clamps only when a positive limit is configured, else +inf
+                (matches the reference's ``if swiglu_limit:`` truthiness).
+    """
+    if act == "swiglu":
+        return float(swiglu_limit) if swiglu_limit else 7.0
+    return float(swiglu_limit) if swiglu_limit else float("inf")
+
+
 def _s1_args_fp4(
     out,
     a,
@@ -559,6 +570,7 @@ def _s1_args_fp4(
     dev,
     bias=None,
     stream=None,
+    swiglu_limit=float("inf"),
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
@@ -580,6 +592,7 @@ def _s1_args_fp4(
         n_in,
         k_in,
         size_expert_ids_in,
+        float(swiglu_limit),
         stream,
     )
 
@@ -1012,7 +1025,6 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    swiglu_limit: Optional[float] = None,
 ):
     """Compile and cache the fused gate activation + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
@@ -1024,7 +1036,6 @@ def _get_compiled_silu_fused(
         gui_layout,
         act=act,
         enable_bias=enable_bias,
-        swiglu_limit=swiglu_limit,
     )
 
 
@@ -1098,6 +1109,7 @@ def flydsl_silu_and_mul_interleaved(
             _ptr_view_safe(empty_f32),
             token_num,
             num_sorted_rows,
+            float("inf"),
             torch.cuda.current_stream(),
         ),
     )
@@ -1260,6 +1272,7 @@ def flydsl_moe_stage1(
     use_mx_gemm = b_dtype in ("fp4", "fp8")
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
+    _swiglu_limit_val = runtime_swiglu_limit(swiglu_limit, act)
 
     if use_mx_gemm:
         args = _s1_args_fp4(
@@ -1283,6 +1296,7 @@ def flydsl_moe_stage1(
                 if kernel_bias is not None
                 else torch.empty(0, device=dev)
             ),
+            swiglu_limit=_swiglu_limit_val,
         )
     else:
         args = _s1_args_std(
@@ -1325,7 +1339,6 @@ def flydsl_moe_stage1(
         enable_bias=(kernel_bias is not None),
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
-        swiglu_limit=swiglu_limit,
         k_wave=k_wave,
     )
     _run_compiled(exe, args)
@@ -1359,7 +1372,6 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            swiglu_limit=swiglu_limit,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1373,6 +1385,7 @@ def flydsl_moe_stage1(
                 _ptr_view_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
         )
@@ -1384,7 +1397,6 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            swiglu_limit=swiglu_limit,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1398,6 +1410,7 @@ def flydsl_moe_stage1(
                 _ptr_view_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
         )
@@ -1407,7 +1420,6 @@ def flydsl_moe_stage1(
             topk,
             act=act,
             enable_bias=use_splitk_bias,
-            swiglu_limit=swiglu_limit,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1421,6 +1433,7 @@ def flydsl_moe_stage1(
                 _ptr_view_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
         )

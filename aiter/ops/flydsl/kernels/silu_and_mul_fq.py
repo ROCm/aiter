@@ -49,7 +49,6 @@ def build_silu_and_mul_fq_module(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    swiglu_limit: float | None = None,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -124,6 +123,7 @@ def build_silu_and_mul_fq_module(
         topk_ids: fx.Pointer,
         bias: fx.Pointer,
         token_num: Int32,
+        swiglu_limit_f: fx.Float32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -277,12 +277,16 @@ def build_silu_and_mul_fq_module(
                     swiglu_neg_alpha_log2e = arith.constant(
                         -1.4426950408889634 * 1.702, type=f32
                     )
-                    if const_expr(swiglu_limit is not None):
-                        _limit = arith.constant(float(swiglu_limit), type=f32)
-                        _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
-                    else:
-                        _limit = arith.constant(7.0, type=f32)
-                        _neg_limit = arith.constant(-7.0, type=f32)
+                    # ``swiglu_limit`` is a runtime f32 scalar.  The host passes the
+                    # clamp bound (7.0 default for swiglu) or +inf to disable the
+                    # clamp (silu without a configured limit).  ``min(x, lim)`` is
+                    # expressed via the wrapped ``maximumf`` + negation so the kernel
+                    # never bakes the limit as a compile-time constant.
+                    _neg_limit = -swiglu_limit_f
+
+                    def _fmin(x):
+                        # min(x, lim) == -max(-x, -lim)
+                        return -((-x).maximumf(_neg_limit))
 
                     act_vals = []
                     for vi in range_constexpr(VEC):
@@ -299,19 +303,13 @@ def build_silu_and_mul_fq_module(
                             u = u + _load_bias_scalar(
                                 bias_row + inter_dim_i32 + bias_col
                             )
-                        gate = g
-                        linear = u
-                        t = gate * neg_log2e
+                        # gate: upper-clamped only; linear: clamped to [-lim, lim].
+                        gate = _fmin(g)
+                        linear = _fmin(u).maximumf(_neg_limit)
                         if const_expr(act == "swiglu"):
-                            gate = arith.minimumf(gate, _limit)
-                            linear = arith.minimumf(linear, _limit)
-                            linear = arith.maximumf(linear, _neg_limit)
                             t = gate * swiglu_neg_alpha_log2e
-                        elif const_expr(swiglu_limit is not None and act != "swiglu"):
-                            gate = arith.minimumf(gate, _limit)
-                            linear = arith.minimumf(linear, _limit)
-                            linear = arith.maximumf(linear, _neg_limit)
-                            t = gate * swiglu_neg_alpha_log2e
+                        else:
+                            t = gate * neg_log2e
 
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -556,6 +554,7 @@ def build_silu_and_mul_fq_module(
         bias: fx.Pointer,
         token_num: fx.Int32,
         num_sorted_rows: fx.Int32,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -572,6 +571,7 @@ def build_silu_and_mul_fq_module(
             topk_ids,
             bias,
             token_num,
+            swiglu_limit_f,
         )
         launcher.launch(
             grid=(idx_rows, 1, 1),

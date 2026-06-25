@@ -95,7 +95,6 @@ def compile_mixed_moe_gemm1(
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: float | None = None,
     k_wave: int = 1,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
@@ -389,6 +388,7 @@ def compile_mixed_moe_gemm1(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            f32_swiglu_limit: fx.Float32,
         ):
 
             tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
@@ -397,6 +397,11 @@ def compile_mixed_moe_gemm1(
             size_expert_ids_in = arith.index_cast(
                 ir.IndexType.get(), i32_size_expert_ids_in.ir_value()
             )
+            # Runtime clamp bound for the activation.  Host passes the configured
+            # swiglu_limit (7.0 default for swiglu) or +inf to disable clamping.
+            # ``-lim`` is precomputed once; ``min(x, lim) == -max(-x, -lim)`` so
+            # the kernel uses only the wrapped maximumf/negation ops.
+            swiglu_neg_limit = -f32_swiglu_limit
 
             x_elem = T.f8
             f32 = T.f32
@@ -1899,15 +1904,22 @@ def compile_mixed_moe_gemm1(
                     sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
                     return g * sig
 
+                def _clamp_gate(x):
+                    # min(x, lim) == -max(-x, -lim); upper bound only.
+                    return -((-x).maximumf(swiglu_neg_limit))
+
+                def _clamp_lin(x):
+                    # clamp to [-lim, lim].
+                    return (-((-x).maximumf(swiglu_neg_limit))).maximumf(
+                        swiglu_neg_limit
+                    )
+
                 def silu_mul_vec4(gate_v4, up_v4):
                     """Element-wise silu(gate) * up on vec4_f32.
-                    When swiglu_limit is set, clamp gate <= limit and
-                    -limit <= up <= limit before applying silu(gate) * up.
+                    Clamp gate <= limit and -limit <= up <= limit (runtime limit;
+                    +inf disables the clamp) before applying silu(gate) * up.
                     """
                     result_elems = []
-                    if const_expr(swiglu_limit is not None):
-                        limit = arith.constant(float(swiglu_limit), type=f32)
-                        neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     for ei in range_constexpr(4):
                         g = vector.extract(
                             gate_v4, static_position=[ei], dynamic_position=[]
@@ -1915,29 +1927,21 @@ def compile_mixed_moe_gemm1(
                         u = vector.extract(
                             up_v4, static_position=[ei], dynamic_position=[]
                         )
-                        if const_expr(swiglu_limit is not None):
-                            g = arith.minimumf(g, limit)
-                            u = arith.minimumf(u, limit)
-                            u = arith.maximumf(u, neg_limit)
+                        g = _clamp_gate(g)
+                        u = _clamp_lin(u)
                         result_elems.append(silu_elem(g) * u)
                     return vector.from_elements(vec4_f32, result_elems)
 
                 def swiglu_mul_vec4(gate_v4, up_v4):
                     """Element-wise swiglu(gate, up) on vec4_f32.
                     swiglu(g, u) = g * sigmoid(alpha * g) * (u + 1)
-                    When swiglu_limit is set, clamp gate <= limit and
-                    -limit <= up <= limit before the activation.
+                    Clamp gate <= limit and -limit <= up <= limit (runtime limit,
+                    7.0 default) before the activation.
                     """
                     result_elems = []
                     alpha = arith.constant(1.702, type=f32)
                     one = arith.constant(1.0, type=f32)
                     neg_log2e = arith.constant(-1.4426950408889634, type=f32)
-                    if const_expr(swiglu_limit is not None):
-                        limit = arith.constant(float(swiglu_limit), type=f32)
-                        neg_limit = arith.constant(-float(swiglu_limit), type=f32)
-                    else:
-                        limit = arith.constant(float(7.0), type=f32)
-                        neg_limit = arith.constant(-float(7.0), type=f32)
 
                     for ei in range_constexpr(4):
                         g = vector.extract(
@@ -1946,9 +1950,8 @@ def compile_mixed_moe_gemm1(
                         u = vector.extract(
                             up_v4, static_position=[ei], dynamic_position=[]
                         )
-                        g = arith.minimumf(g, limit)
-                        u = arith.minimumf(u, limit)
-                        u = arith.maximumf(u, neg_limit)
+                        g = _clamp_gate(g)
+                        u = _clamp_lin(u)
                         t = g * alpha * neg_log2e
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -1975,16 +1978,8 @@ def compile_mixed_moe_gemm1(
                         alpha = arith.constant(1.702, type=f32)
                         one = arith.constant(1.0, type=f32)
                         neg_log2e = arith.constant(-1.4426950408889634, type=f32)
-                        lim = arith.constant(
-                            float(swiglu_limit) if swiglu_limit != 0 else 7.0, type=f32
-                        )
-                        nlim = arith.constant(
-                            -float(swiglu_limit) if swiglu_limit != 0 else -7.0,
-                            type=f32,
-                        )
-                        g = arith.minimumf(g, lim)
-                        u = arith.minimumf(u, lim)
-                        u = arith.maximumf(u, nlim)
+                        g = _clamp_gate(g)
+                        u = _clamp_lin(u)
                         t = g * alpha * neg_log2e
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -1995,12 +1990,8 @@ def compile_mixed_moe_gemm1(
                         )
                         return g * sig * (u + one)
                     else:
-                        if const_expr(swiglu_limit != 0):
-                            lim = arith.constant(float(swiglu_limit), type=f32)
-                            nlim = arith.constant(-float(swiglu_limit), type=f32)
-                            g = arith.minimumf(g, lim)
-                            u = arith.minimumf(u, lim)
-                            u = arith.maximumf(u, nlim)
+                        g = _clamp_gate(g)
+                        u = _clamp_lin(u)
                         return silu_elem(g) * u
 
                 kwave_fused = const_expr(
@@ -2854,6 +2845,7 @@ def compile_mixed_moe_gemm1(
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
+        f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
     ):
         _ = cache_tag
@@ -2908,6 +2900,7 @@ def compile_mixed_moe_gemm1(
             i32_inter_in,
             i32_k_in,
             i32_size_expert_ids_in,
+            f32_swiglu_limit,
         ).launch(grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream)
 
     return launch_mixed_moe_gemm1
