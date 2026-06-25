@@ -27,6 +27,7 @@ from torch.distributed import ProcessGroup
 # from vllm import _custom_ops as ops
 import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
+from aiter.dist.utils import get_cuda_visible_devices
 from aiter import logger
 from aiter.utility.dtypes import fp8
 
@@ -37,6 +38,32 @@ except Exception as e:
     # For CPUs
     custom_ar = False
     logger.warning(f"Custom allreduce is disabled: {e}")
+
+
+def is_full_xgmi(physical_device_ids: List[int]) -> bool:
+    # Custom IPC all-reduce requires every GPU pair to share a single-hop XGMI
+    # (Infinity Fabric) link; otherwise the caller falls back to RCCL.
+    from amdsmi import (
+        amdsmi_init,
+        amdsmi_shut_down,
+        amdsmi_get_processor_handles,
+        amdsmi_topo_get_link_type,
+    )
+
+    amdsmi_init()
+    handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
+
+    def linked(a, b):
+        t = amdsmi_topo_get_link_type(a, b)
+        return t["hops"] == 1 and t["type"] == 2  # type 2 == XGMI
+
+    full = all(
+        linked(handles[i], handles[j])
+        for i in range(len(handles))
+        for j in range(i + 1, len(handles))
+    )
+    amdsmi_shut_down()
+    return full
 
 
 def is_weak_contiguous(inp: torch.Tensor):
@@ -408,22 +435,15 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        # device_ids = get_cuda_visible_devices()
-
-        # physical_device_id = device_ids[device.index]
-        # tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        # gather_list = [
-        #     torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-        # ]
-        # dist.all_gather(gather_list, tensor, group=self.group)
-        # physical_device_ids = [t.item() for t in gather_list]
-
-        # test nvlink first, this will filter out most of the cases
-        # where custom allreduce is not supported
-        # this checks hardware and driver support for NVLink
-        # assert current_platform.is_cuda() or current_platform.is_rocm()
-        # fully_connected = current_platform.is_full_nvlink(physical_device_ids)
-        fully_connected = True
+        device_ids = get_cuda_visible_devices()
+        physical_device_id = device_ids[device.index]
+        tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
+        gather_list = [
+            torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
+        ]
+        dist.all_gather(gather_list, tensor, group=self.group)
+        physical_device_ids = [t.item() for t in gather_list]
+        fully_connected = is_full_xgmi(physical_device_ids)
         if world_size > 2 and not fully_connected:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"

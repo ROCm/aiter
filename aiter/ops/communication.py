@@ -62,13 +62,16 @@ def init_dist_env(
         # hack custom_allreduce
         tp_grp = get_tp_group()
         ca_comm = tp_grp.device_communicator.ca_comm
-        # signal
-        signal = torch.zeros(
-            tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
-        )
-        ca_comm.signal = signal
-        ca_comm.register_input_buffer(signal)
-        ca_comm.buffer = ca_comm._pool["input"].tensor
+        # Only wire up the IPC input buffer when custom all-reduce is live. On
+        # non-XGMI (PCIe) boxes ca_comm is disabled and never allocated its IPC
+        # pool
+        if ca_comm is not None and not ca_comm.disabled:
+            signal = torch.zeros(
+                tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
+            )
+            ca_comm.signal = signal
+            ca_comm.register_input_buffer(signal)
+            ca_comm.buffer = ca_comm._pool["input"].tensor
     logger.debug(f"RANK: {rankID}/{tensor_model_parallel_size} init_dist_env...")
 
 
