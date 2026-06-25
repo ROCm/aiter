@@ -4,6 +4,7 @@
 
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
+#include <optional>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -1781,7 +1782,8 @@ namespace py = pybind11;
           py::arg("q_out"),                                \
           py::arg("index_q_out"),                          \
           py::arg("index_slot_mapping"),                   \
-          py::arg("asm_layout")    = false);                \
+          py::arg("asm_layout")    = false,                 \
+          py::arg("index_qk")      = std::nullopt);         \
     m.def("fused_qknorm_idxrqknorm_fp8",     \
           &aiter::fused_qknorm_idxrqknorm_fp8, \
           py::arg("qkv"),                                  \
@@ -1807,7 +1809,8 @@ namespace py = pybind11;
           py::arg("kv_cache_dtype"),                       \
           py::arg("k_scale"),                              \
           py::arg("v_scale"),                              \
-          py::arg("asm_layout")    = false)
+          py::arg("asm_layout")    = false,                 \
+          py::arg("index_qk")      = std::nullopt)
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",             \

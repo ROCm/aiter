@@ -206,6 +206,7 @@ template <typename scalar_t,
           bool kAsmLayout>
 __global__ void fusedQKNormIdxrQKNormKernel(
     scalar_t* __restrict__ qkv,
+    scalar_t* __restrict__ index_qk,
     scalar_t* __restrict__ q_out,
     scalar_t* __restrict__ index_q_out,
     const scalar_t* __restrict__ q_norm_w,
@@ -281,7 +282,10 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     }
 
     const int dim_base = lane_id * kElemsPerLane;
-    const int qkv_row = (nq + 2 * nkv + (kIsSparse ? (niq + 1) : 0)) * kHeadDim;
+    const int qkv_row =
+        (nq + 2 * nkv + ((kIsSparse && index_qk == nullptr) ? (niq + 1) : 0)) *
+        kHeadDim;
+    const int index_qk_row = (niq + 1) * kHeadDim;
 
     scalar_t* row_ptr = nullptr;
     const scalar_t* norm_w = nullptr;
@@ -308,12 +312,20 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     else if(is_iq)
     {
         const int ih = slot - iq_begin;
-        row_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row + (nq + 2 * nkv + ih) * kHeadDim;
+        row_ptr = index_qk == nullptr
+                      ? qkv + static_cast<int64_t>(token_idx) * qkv_row +
+                            (nq + 2 * nkv + ih) * kHeadDim
+                      : index_qk + static_cast<int64_t>(token_idx) * index_qk_row +
+                            ih * kHeadDim;
         norm_w = iq_norm_w;
     }
     else
     {
-        row_ptr = qkv + static_cast<int64_t>(token_idx) * qkv_row + (nq + 2 * nkv + niq) * kHeadDim;
+        row_ptr = index_qk == nullptr
+                      ? qkv + static_cast<int64_t>(token_idx) * qkv_row +
+                            (nq + 2 * nkv + niq) * kHeadDim
+                      : index_qk + static_cast<int64_t>(token_idx) * index_qk_row +
+                            niq * kHeadDim;
         norm_w = ik_norm_w;
     }
 
@@ -482,6 +494,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 void launchFusedQKNormIdxrQKNorm(
     scalar_t* qkv,
+    scalar_t* index_qk,
     scalar_t* q_out,
     scalar_t* index_q_out,
     const scalar_t* q_norm_w,
@@ -532,6 +545,7 @@ void launchFusedQKNormIdxrQKNorm(
 #define LAUNCH(IS_SPARSE, INSERT, ASM)                                                      \
     fusedQKNormIdxrQKNormKernel<scalar_t, cache_t, kv_dt, IS_SPARSE, INSERT, ASM>      \
         <<<grid, kBlockSize, 0, stream>>>(qkv,                                               \
+                                          index_qk,                                          \
                                           q_out,                                             \
                                           index_q_out,                                       \
                                           q_norm_w,                                          \
@@ -628,7 +642,8 @@ static void fused_qknorm_idxrqknorm_impl(
     const std::string& kv_cache_dtype,
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
-    bool asm_layout)
+    bool asm_layout,
+    std::optional<aiter_tensor_t> index_qk)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
 
@@ -666,12 +681,15 @@ static void fused_qknorm_idxrqknorm_impl(
     const bool insert_kv = kv_cache_k.has_value();
     const bool fp8_kv_cache =
         insert_kv && kv_cache_dtype.rfind("fp8", 0) == 0;
-    const int expected_row = (nq + 2 * nkv + (has_index ? niq + 1 : 0)) * kHeadDim;
+    const bool separate_index_qk = index_qk.has_value();
+    const int expected_row =
+        (nq + 2 * nkv + ((has_index && !separate_index_qk) ? niq + 1 : 0)) *
+        kHeadDim;
     AITER_CHECK(positions.dim() == 1 && positions.size(0) >= num_tokens,
                 "positions must be 1D with at least num_tokens elements");
     AITER_CHECK(qkv.dim() == 2 && qkv.size(1) == expected_row,
                 "qkv must be [num_tokens, (num_heads + 2*num_kv_heads"
-                " + optional index heads) * 128]");
+                " + optional packed index heads) * 128]");
     if(has_index)
     {
         AITER_CHECK(index_q_norm_weight.has_value() && index_k_norm_weight.has_value(),
@@ -686,6 +704,16 @@ static void fused_qknorm_idxrqknorm_impl(
         AITER_CHECK(index_q_norm_weight->numel() == kHeadDim &&
                         index_k_norm_weight->numel() == kHeadDim,
                     "index norm weights must have 128 elements");
+        if(separate_index_qk)
+        {
+            AITER_CHECK(index_qk->is_gpu() && index_qk->is_contiguous(),
+                        "index_qk must be contiguous CUDA");
+            AITER_CHECK(index_qk->dtype() == qkv.dtype(),
+                        "index_qk dtype must match qkv");
+            AITER_CHECK(index_qk->dim() == 2 && index_qk->size(0) == num_tokens &&
+                            index_qk->size(1) == (niq + 1) * kHeadDim,
+                        "index_qk must be [num_tokens, (num_index_heads + 1) * 128]");
+        }
     }
 
     // page-128 K/V cache strides ([num_blocks, block_size, num_kv_heads, head_dim]);
@@ -879,6 +907,7 @@ static void fused_qknorm_idxrqknorm_impl(
         {
             launchFusedQKNormIdxrQKNorm<T, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
+                separate_index_qk ? reinterpret_cast<T*>(index_qk->data_ptr()) : nullptr,
                 q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
                 index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
                                         : nullptr,
@@ -922,6 +951,7 @@ static void fused_qknorm_idxrqknorm_impl(
         {
             launchFusedQKNormIdxrQKNorm<T, T, vllm::Fp8KVCacheDataType::kAuto>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
+                separate_index_qk ? reinterpret_cast<T*>(index_qk->data_ptr()) : nullptr,
                 q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
                 index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
                                         : nullptr,
@@ -985,7 +1015,8 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> q_out,
     std::optional<aiter_tensor_t> index_q_out,
     std::optional<aiter_tensor_t> index_slot_mapping,
-    bool asm_layout)
+    bool asm_layout,
+    std::optional<aiter_tensor_t> index_qk)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
@@ -1010,7 +1041,8 @@ void fused_qknorm_idxrqknorm(
                                                 "auto",
                                                 std::nullopt,
                                                 std::nullopt,
-                                                asm_layout);
+                                                asm_layout,
+                                                index_qk);
 }
 
 void fused_qknorm_idxrqknorm_fp8(
@@ -1037,7 +1069,8 @@ void fused_qknorm_idxrqknorm_fp8(
     const std::string& kv_cache_dtype,
     const aiter_tensor_t& k_scale,
     const aiter_tensor_t& v_scale,
-    bool asm_layout)
+    bool asm_layout,
+    std::optional<aiter_tensor_t> index_qk)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
@@ -1062,7 +1095,8 @@ void fused_qknorm_idxrqknorm_fp8(
                                                 kv_cache_dtype,
                                                 k_scale,
                                                 v_scale,
-                                                asm_layout);
+                                                asm_layout,
+                                                index_qk);
 }
 
 } // namespace aiter

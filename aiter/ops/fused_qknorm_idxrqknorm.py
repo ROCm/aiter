@@ -35,6 +35,7 @@ def _fused_qknorm_idxrqknorm_hip(
     index_q_out: Optional[Tensor],
     index_slot_mapping: Optional[Tensor],
     asm_layout: bool = False,
+    index_qk: Optional[Tensor] = None,
 ) -> None:
     pass
 
@@ -69,6 +70,7 @@ def _fused_qknorm_idxrqknorm_fp8_hip(
     k_scale: Tensor,
     v_scale: Tensor,
     asm_layout: bool = False,
+    index_qk: Optional[Tensor] = None,
 ) -> None:
     pass
 
@@ -98,6 +100,7 @@ def fused_qknorm_idxrqknorm(
     k_scale: Optional[Tensor] = None,
     v_scale: Optional[Tensor] = None,
     asm_layout: bool = False,
+    index_qk: Optional[Tensor] = None,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
@@ -146,6 +149,7 @@ def fused_qknorm_idxrqknorm(
             k_scale,
             v_scale,
             asm_layout,
+            index_qk,
         )
         return
 
@@ -171,4 +175,5 @@ def fused_qknorm_idxrqknorm(
         index_q_out,
         index_slot_mapping,
         asm_layout,
+        index_qk,
     )
