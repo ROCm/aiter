@@ -753,7 +753,13 @@ def _compile_base_a8w4_gemm(
         num_buffers=eff_num_buffers,
         waves_per_eu=cfg.waves_per_eu,
         out_dtype=cfg.out_dtype,
-        use_tdm_store=cfg.use_tdm_store and cfg.split_k == 1 and is_non_fused,
+        # TDM-store is valid for non-fused gemm1 and for the fused gugu
+        # (interleaved single-B) layout, whose de-interleaved swiglu output is
+        # staged to a C_N LDS tile then tensor_store'd. gguu (dual-B) still
+        # requires buffer_store.
+        use_tdm_store=cfg.use_tdm_store
+        and cfg.split_k == 1
+        and (is_non_fused or stage1_weight_layout == "gugu"),
         inst_prefetch=cfg.inst_prefetch,
         # Wave-specialized TDM (4 streams A,B,As,Bs -> 4 loader waves) is valid for
         # any single-B GEMM: the non-fused path (is_non_fused) and the gugu

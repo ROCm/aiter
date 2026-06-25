@@ -34,6 +34,8 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     issue_tdm_loads,
     lds_load_b128_raw,
     lds_load_b32_raw,
+    lds_store_b64,
+    lds_store_b128,
     pipeline_fence,
     pipeline_fence_signal,
     pipeline_fence_wait,
@@ -209,9 +211,13 @@ def compile_mxscale_gemm(
             )
         if split_k != 1:
             raise ValueError("stage1_act GEMM epilogue fuse requires split_k == 1")
-        if use_tdm_store:
+        if use_tdm_store and stage1_weight_layout_mode != "gugu":
+            # TDM-store of the fused-activation output is supported only for the
+            # gugu (interleaved single-B) layout. gguu (dual-B) still requires
+            # use_tdm_store=False (buffer_store).
             raise ValueError(
-                "stage1_act GEMM epilogue fuse requires use_tdm_store=False"
+                "stage1_act TDM-store epilogue supports only the gugu layout; "
+                "gguu (dual-B) requires use_tdm_store=False"
             )
         if wave_specialized_tdm and stage1_weight_layout_mode != "gugu":
             # gguu is dual-B: gate+up are separate weights -> 6 TDM streams
@@ -509,15 +515,24 @@ def compile_mxscale_gemm(
     if use_tdm_store:
         # TDM store copies the LDS tile as described; it does not de-pad rows.
         # Keep the output LDS tile tightly packed so the store extent is exactly
-        # warp_tile_n columns. Padding here turns a 32-col warp store into a
-        # 40-col store and can fault on the last N tile.
-        lds_d_row_stride = warp_tile_n * elem_bytes_d
+        # the per-warp column count. gugu (stage1_act_interleave) writes the
+        # de-interleaved swiglu output (C_N = N/2), so each warp stores
+        # warp_tile_n/2 columns; otherwise the raw warp_tile_n columns.
+        _tdm_store_warp_n = (
+            warp_tile_n // 2 if stage1_act_interleave else warp_tile_n
+        )
+        lds_d_row_stride = _tdm_store_warp_n * elem_bytes_d
         warp_d_bytes = warp_tile_m * lds_d_row_stride
         total_d_bytes = num_warps * warp_d_bytes
         d_output_off = 0
         _lds_d_stride_elems = lds_d_row_stride // 2
         _warp_d_elems = warp_d_bytes // 2
-        _n_col_d_elems = WMMA_N * elem_bytes_d // 2
+        # per-WMMA-N column stride and per-lane-kgrp stride in bf16 elements.
+        # gugu de-interleaves (raw 2 cols -> 1 output col), so both halve.
+        _n_col_d_elems = (
+            (WMMA_N // 2 if stage1_act_interleave else WMMA_N) * elem_bytes_d // 2
+        )
+        _kgrp_d_elems = 4 if stage1_act_interleave else (4 * elem_bytes_d)
         d_need_epilogue_fence = total_d_bytes > epilogue_fence_threshold_bytes
         if total_d_bytes > arena_total_bytes:
             arena_total_bytes = total_d_bytes
@@ -1909,6 +1924,39 @@ def compile_mxscale_gemm(
                             )
                         scf.YieldOp([])
 
+            def epilogue_stage1_act_interleaved_lds_stores(final_accs, d_buf, d_base):
+                # Same de-interleave + swiglu as the buffer-store path, but write
+                # the 4 activated outputs per sub-tile into the C_N-wide LDS output
+                # tile (de-interleaved layout) for a subsequent tensor_store_2d.
+                # No per-row mask here: the TDM-store path is gated on
+                # not needs_grouped_row_masked_store.
+                for acc_idx, vec_base, m_off, wn in _sub_tiles:
+                    raw_sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
+                    raw_sub8 = _add_bias_vec8(raw_sub8, wn)
+                    out_vals = []
+                    for pair in range_constexpr(4):
+                        g = vector.extract(
+                            raw_sub8, static_position=[pair * 2], dynamic_position=[]
+                        )
+                        u = vector.extract(
+                            raw_sub8,
+                            static_position=[pair * 2 + 1],
+                            dynamic_position=[],
+                        )
+                        out_vals.append(_stage1_act_mul_scalar(g, u))
+                    off = d_base + arith.index(
+                        m_off * _lds_d_stride_elems + wn * _n_col_d_elems
+                    )
+                    if const_expr(_bf16_out):
+                        h_vec = vector.from_elements(
+                            T.vec(4, _out_elem_local),
+                            [arith.trunc_f(_out_elem_local, v) for v in out_vals],
+                        )
+                        lds_store_b64(d_buf, off, h_vec)
+                    else:
+                        f_vec = vector.from_elements(T.vec(4, T.f32), out_vals)
+                        lds_store_b128(d_buf, off, f_vec)
+
             def epilogue_lds_stores(final_accs, d_buf, d_base):
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
                     sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
@@ -2155,7 +2203,7 @@ def compile_mxscale_gemm(
                 d_lane_base = (
                     warp_lds_off
                     + lane16 * arith.index(_lds_d_stride_elems)
-                    + lane_kgrp * arith.index(4 * elem_bytes_d)
+                    + lane_kgrp * arith.index(_kgrp_d_elems)
                 )
                 # Keep the TDM store descriptor in the same block-local warp
                 # coordinate system as the LDS stores above.  Using the raw
@@ -2166,17 +2214,26 @@ def compile_mxscale_gemm(
                     warp_d_bytes
                 ) + arith.index(d_output_off)
                 warp_m_off_sgpr = wave_m_idx * arith.index(warp_tile_m)
-                warp_n_off_sgpr = wave_n_idx * arith.index(warp_tile_n)
+                # gugu output is de-interleaved (C_N = N/2): the store tile, global
+                # N extent, stride and per-warp N offset all halve.
+                _store_N = (C_N if stage1_act_interleave else N)
+                _store_warp_n = (
+                    warp_tile_n // 2 if stage1_act_interleave else warp_tile_n
+                )
+                warp_n_off_sgpr = wave_n_idx * arith.index(_store_warp_n)
+                _store_blk_n = (
+                    blk_n / arith.index(2) if stage1_act_interleave else blk_n
+                )
                 d_desc = tdm_ops.make_tensor_descriptor_2d(
                     global_ptr=arg_c,
                     lds_memref=d_lds_base_ptr,
                     global_offset=(
                         flat_m_base + warp_m_off_sgpr,
-                        blk_n + warp_n_off_sgpr,
+                        _store_blk_n + warp_n_off_sgpr,
                     ),
-                    tensor_shape=(batch_count * M, N),
-                    strides=(N, 1),
-                    tile_shape=(warp_tile_m, warp_tile_n),
+                    tensor_shape=(batch_count * M, _store_N),
+                    strides=(_store_N, 1),
+                    tile_shape=(warp_tile_m, _store_warp_n),
                     elem_bytes=elem_bytes_d,
                     pad_interval=0,
                     pad_amount=0,
@@ -3049,7 +3106,13 @@ def compile_mxscale_gemm(
                 if const_expr(d_need_epilogue_fence):
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
                 rocdl.sched_barrier(0)
-                epilogue_lds_stores(accs, d_lds_buffer, d_lane_base)
+                if const_expr(stage1_act_interleave):
+                    # gugu: de-interleave + swiglu into the C_N LDS tile, then TDM-store.
+                    epilogue_stage1_act_interleaved_lds_stores(
+                        accs, d_lds_buffer, d_lane_base
+                    )
+                else:
+                    epilogue_lds_stores(accs, d_lds_buffer, d_lane_base)
                 rocdl.s_wait_dscnt(0)
                 tdm_ops.tensor_store_2d(d_desc)
                 tdm_ops.tensor_wait(0)
