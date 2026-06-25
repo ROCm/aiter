@@ -970,7 +970,9 @@ def mla_decode_gluon(
     # BLOCK_H=64 packs 4 q_pos; for qlen>4 the positions tile over cdiv(qlen,4)
     # qblocks (grid axis 2), so KV is re-read cdiv(qlen,4) times (e.g. 2x for qlen
     # 5-8, 5x for qlen 17) vs qlen times for grid-axis. Supported for qlen in [2, 17].
-    mpack_supported = (1 <= nhead <= 16) and (kv_c.dtype == torch.bfloat16) and (2 <= qlen <= 17)
+    mpack_supported = (
+        (1 <= nhead <= 16) and (kv_c.dtype == torch.bfloat16) and (2 <= qlen <= 17)
+    )
     if _MPACK_MODE == "1":
         USE_MPACK = mpack_supported
     elif _MPACK_MODE == "0":
@@ -991,10 +993,12 @@ def mla_decode_gluon(
         USE_MPACK = mpack_supported and (
             batch_size * qlen > 256
             or (batch_size * qlen == 256 and min_kv_seq_len >= 2048)
-            or (min_kv_seq_len >= 12288 and (
-                (batch_size >= 4 and qlen >= 5)
-                or (batch_size >= 2 and qlen >= 12)
-            ))
+            or (
+                min_kv_seq_len >= 12288
+                and (
+                    (batch_size >= 4 and qlen >= 5) or (batch_size >= 2 and qlen >= 12)
+                )
+            )
         )
 
     # Pick regime by (nhead, kv dtype).
@@ -1030,7 +1034,9 @@ def mla_decode_gluon(
         NUM_XCDS = get_num_xcds()
         # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
         # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
-        base_grid = NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * qlen * (batch_size // NUM_XCDS)
+        base_grid = (
+            NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * qlen * (batch_size // NUM_XCDS)
+        )
         NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(256, base_grid)))
 
         assert batch_size in (
@@ -1065,7 +1071,8 @@ def mla_decode_gluon(
         # shortest seq's block count so every split holds >= 1 block. Each qblock is a
         # separate WG (grid axis 2), so the split budget divides by split_qlen (qblocks).
         NUM_KV_SPLITS = max(
-            1, min(256 // (batch_size * split_qlen), triton.cdiv(min_kv_seq_len, BLOCK_N))
+            1,
+            min(256 // (batch_size * split_qlen), triton.cdiv(min_kv_seq_len, BLOCK_N)),
         )
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
@@ -1086,7 +1093,9 @@ def mla_decode_gluon(
             assert (
                 batch_size == 1
             ), f"mla_decode_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
-            NUM_KV_SPLITS = max(1, min(256 // (batch_size * split_qlen), min_kv_seq_len))
+            NUM_KV_SPLITS = max(
+                1, min(256 // (batch_size * split_qlen), min_kv_seq_len)
+            )
         else:  # bh16bn64
             # NUM_KV_SPLITS for the small-batch / small-ctx (occupancy-bound) regime.
             # The old formula split 1-per-block (cdiv(ctx,BLOCK_N)), which OVER-splits:
@@ -1142,9 +1151,17 @@ def mla_decode_gluon(
         stride_q_pe_bs, stride_q_pe_s, stride_q_pe_h = q_pe.stride()[:3]
         stride_o_b_final, stride_o_s_final, stride_o_h_final = o.stride()[:3]
     else:
-        stride_q_nope_bs, stride_q_nope_s, stride_q_nope_h = q_nope.stride(0), 0, q_nope.stride(1)
+        stride_q_nope_bs, stride_q_nope_s, stride_q_nope_h = (
+            q_nope.stride(0),
+            0,
+            q_nope.stride(1),
+        )
         stride_q_pe_bs, stride_q_pe_s, stride_q_pe_h = q_pe.stride(0), 0, q_pe.stride(1)
-        stride_o_b_final, stride_o_s_final, stride_o_h_final = o.stride(0), 0, o.stride(1)
+        stride_o_b_final, stride_o_s_final, stride_o_h_final = (
+            o.stride(0),
+            0,
+            o.stride(1),
+        )
 
     if NUM_KV_SPLITS == 1:
         # Fast path: stage-1 writes the final attention (and lse) directly to o.
@@ -1154,7 +1171,9 @@ def mla_decode_gluon(
         else:
             logits_buf = o.view(batch_size, 1, nhead, NUM_KV_SPLITS, head_dim_ckv)
         mid_lse = None
-        stride_mid_lse_b = stride_mid_lse_s = stride_mid_lse_h = stride_mid_lse_split = 0
+        stride_mid_lse_b = stride_mid_lse_s = stride_mid_lse_h = (
+            stride_mid_lse_split
+        ) = 0
     else:
         # stage-1 -> per-split (acc, lse); stage-2 reduces into o.
         logits_buf = torch.empty(
@@ -1167,7 +1186,9 @@ def mla_decode_gluon(
             dtype=torch.float32,
             device=o.device,
         )
-        stride_mid_lse_b, stride_mid_lse_s, stride_mid_lse_h, stride_mid_lse_split = mid_lse.stride()
+        stride_mid_lse_b, stride_mid_lse_s, stride_mid_lse_h, stride_mid_lse_split = (
+            mid_lse.stride()
+        )
 
     # logits_buf is [batch, qlen, nhead, split, dim] in both paths; reuse its
     # strides for stage-1's O write (fast path aliases o, so this stays correct).

@@ -552,7 +552,9 @@ def test_mla(
             o_arg = out_gluon.view(batch_size, decode_qlen, nhead, v_head_dim)
         else:
             q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
-            q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
+            q_pe = q[:, :, v_head_dim:].view(
+                batch_size, nhead, qk_head_dim - v_head_dim
+            )
             o_arg = out_gluon.view(batch_size, nhead, v_head_dim)
 
         kv_c = kv_buffer.view(-1, qk_head_dim)
