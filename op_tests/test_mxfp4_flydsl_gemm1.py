@@ -426,7 +426,7 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
     w1 = torch.randn((NE, 2 * INTER, H), dtype=dtypes.bf16, device=device) / 10
     w1q, w1s = tq(w1, quant_dtype=dtypes.fp4x2)
     w1u8 = shuffle_weight_a16w4(w1q, 16, interleave)
-    w1_scale = shuffle_scale_a16w4(w1s, NE, True)
+    w1_scale = shuffle_scale_a16w4(w1s, NE, interleave)
     if w1u8.element_size() == 1 and w1u8.dtype != torch.uint8:
         w1u8 = w1u8.view(torch.uint8)
     w1_scale_u8 = (

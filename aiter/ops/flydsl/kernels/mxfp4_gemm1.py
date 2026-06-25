@@ -455,12 +455,17 @@ def _gemm1_body(
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
-    mni_base = n_block_idx * fx.Int32(BN // 16 // 2) + wave * fx.Int32(BN // 64 // 2)
+    if const_expr(interleave):
+        mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
+        np_list = [mni_base, mni_base + fx.Int32(1)]
+    else:
+        np_gate = n_block_idx * fx.Int32(BN // 64) + wave
+        np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(2):
         base = (
             e * fx.Int32(kBS_per_expert_dw)
-            + (mni_base + fx.Int32(mw)) * fx.Int32(kBS_stride_n0_dw)
+            + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
         ) * fx.Int32(4)
         base = rocdl.readfirstlane(T.i32, base)
         b_scale_s_base.append(base)
@@ -757,8 +762,12 @@ def _gemm1_body(
     # Unlike gemm2's internal J-loop, gemm1 issues one J per call so the K-loop
     # pipeline can interleave issue_b_load_j between J iterations (HIP run_one 465-552).
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, init):
-        mni = J // 2
-        in_b = J % 2
+        if const_expr(interleave):
+            mni = J // 2
+            in_b = J % 2
+        else:
+            mni = J % 2
+            in_b = J // 2
         sb = bs_slot[mni]
         bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
         # BM16 single-chunk (HIP :338-345): kMChunks=1, only i0 exists. Two mfma on
