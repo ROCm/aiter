@@ -112,6 +112,7 @@ def compile_moe_gemm1(
     k_batch: int = 1,
     gate_mode: str = "separated",
     swiglu_limit: float = 0.0,
+    act: str = "silu",
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -333,6 +334,8 @@ def compile_moe_gemm1(
             "gate_mode='interleave' is only supported for in_dtype='fp4_bf16'"
         )
 
+    _use_swiglu = act == "swiglu"
+
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
     # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
@@ -340,11 +343,12 @@ def compile_moe_gemm1(
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
     _gui_tag = "_gui" if gate_up_interleave else ""
+    _act_tag = "_swiglu" if _use_swiglu else ""
     (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_gs_tag}{scale_tag}{_split_k_tag}{_gui_tag}"
-        f"_abi6"  # v6: swiglu_apply with alpha=1.702 for fp4_bf16 activation
+        f"{_gs_tag}{scale_tag}{_split_k_tag}{_gui_tag}{_act_tag}"
+        f"_abi7"
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -1953,10 +1957,10 @@ def compile_moe_gemm1(
 
                     gpu.barrier()
 
-                    # Pass 2: up (offset=inter_dim)
+                    # Pass 2: up
                     _split_k_acc[0] = acc_up
                     _split_k_sw_vals[0] = sw_up_vals
-                    _split_k_n_offset[0] = inter_dim
+                    _split_k_n_offset[0] = 0 if gate_up_interleave else inter_dim
                     c_shuffle_epilog(
                         arith=arith,
                         vector=vector,
@@ -2061,7 +2065,10 @@ def compile_moe_gemm1(
                                     static_position=[ii],
                                     dynamic_position=[],
                                 )
-                                y = silu(vg * sx) * (vu * sx)
+                                if const_expr(_use_swiglu):
+                                    y = swiglu_apply(vg * sx, vu * sx)
+                                else:
+                                    y = silu(vg * sx) * (vu * sx)
                                 if const_expr(doweight_stage1):
                                     y = y * tw
                                 y16 = arith.trunc_f(T.f16, y)
@@ -2092,7 +2099,10 @@ def compile_moe_gemm1(
                                 vg = vg * sx * sw_gate
                                 vu = vu * sx * sw_up
 
-                                y = silu(vg) * vu
+                                if const_expr(_use_swiglu):
+                                    y = swiglu_apply(vg, vu)
+                                else:
+                                    y = silu(vg) * vu
                                 if const_expr(doweight_stage1):
                                     y = y * tw
                                 y16 = arith.trunc_f(T.f16, y)
@@ -2227,7 +2237,7 @@ def compile_moe_gemm1(
                                     static_position=[ii],
                                     dynamic_position=[],
                                 )
-                                if const_expr(is_fp4_bf16):
+                                if const_expr(_use_swiglu):
                                     y = swiglu_apply(vg * sx, vu * sx)
                                 else:
                                     y = silu(vg * sx) * (vu * sx)
@@ -2259,7 +2269,7 @@ def compile_moe_gemm1(
                                 vg = vg * sx * sw_gate
                                 vu = vu * sx * sw_up
 
-                                if const_expr(is_fp4_bf16):
+                                if const_expr(_use_swiglu):
                                     y = swiglu_apply(vg, vu)
                                 else:
                                     y = silu(vg) * vu

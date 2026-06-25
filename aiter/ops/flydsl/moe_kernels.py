@@ -454,6 +454,7 @@ def compile_flydsl_moe_stage1(
             k_batch=k_batch,
             gate_mode=gate_mode,
             swiglu_limit=swiglu_limit,
+            act=act,
         )
     else:
         raise ValueError(
