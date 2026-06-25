@@ -416,6 +416,7 @@ def test_mla(
             sm_scale,
             num_kv_splits=split_per_batch,
             return_lse=return_lse,
+            is_causal=is_causal,
         )
 
         err = checkAllclose(
