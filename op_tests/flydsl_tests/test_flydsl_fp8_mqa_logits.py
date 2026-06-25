@@ -9,6 +9,7 @@ metric used by the Triton test) over the DeepSeek dims and window shapes.
 Run with:
     python3 -m pytest op_tests/flydsl_tests/test_flydsl_fp8_mqa_logits.py -q
 """
+
 import pytest
 import torch
 
@@ -319,13 +320,13 @@ def test_auto_num_splits_unit(monkeypatch) -> None:
     monkeypatch.setattr(kmod, "_device_cu_count", lambda idx: 304)
     f = kmod._auto_num_splits
 
-    assert f(1024, 2048, 2, 0) == 1     # window too short (< 4096)
-    assert f(64, 4095, 2, 0) == 1       # just under the length threshold
-    assert f(0, 8192, 2, 0) == 1        # grid_x == 0 guard (no ZeroDivisionError)
-    assert f(4096, 8192, 2, 0) == 1     # row grid already saturates (2048 >= 1216)
-    assert f(64, 4096, 2, 0) == 4       # tiny grid; capped by max_splits=4
-    assert f(2, 4096, 2, 0) == 4        # grid_x=1; still capped by max_splits=4
-    assert f(512, 65536, 2, 0) == 5     # ceil(1216/256)=5 < max_splits=64
+    assert f(1024, 2048, 2, 0) == 1  # window too short (< 4096)
+    assert f(64, 4095, 2, 0) == 1  # just under the length threshold
+    assert f(0, 8192, 2, 0) == 1  # grid_x == 0 guard (no ZeroDivisionError)
+    assert f(4096, 8192, 2, 0) == 1  # row grid already saturates (2048 >= 1216)
+    assert f(64, 4096, 2, 0) == 4  # tiny grid; capped by max_splits=4
+    assert f(2, 4096, 2, 0) == 4  # grid_x=1; still capped by max_splits=4
+    assert f(512, 65536, 2, 0) == 5  # ceil(1216/256)=5 < max_splits=64
     # Never returns < 1 for any plausible shape.
     for slp in (0, 1, 64, 512, 4096, 200000):
         for slk in (1, 2048, 4096, 131072, 200000):
@@ -334,7 +335,9 @@ def test_auto_num_splits_unit(monkeypatch) -> None:
 
 @pytest.mark.parametrize("clean_logits", [True, False])
 @torch.inference_mode()
-def test_flydsl_fp8_mqa_logits_adaptive_split_organic(clean_logits, monkeypatch) -> None:
+def test_flydsl_fp8_mqa_logits_adaptive_split_organic(
+    clean_logits, monkeypatch
+) -> None:
     """End-to-end small-M / large-N shape that trips ``_auto_num_splits > 1``
     organically (heuristic NOT monkeypatched), so the real adaptive grid.y path
     runs and is graded against the reference."""

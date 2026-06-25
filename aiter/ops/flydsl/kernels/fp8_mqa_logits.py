@@ -63,8 +63,9 @@ def _device_cu_count(device_index: int) -> int:
         return 304
 
 
-def _auto_num_splits(seq_len_padded: int, seq_len_kv: int, rpb: int,
-                     device_index: int) -> int:
+def _auto_num_splits(
+    seq_len_padded: int, seq_len_kv: int, rpb: int, device_index: int
+) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
 
     For small-M / large-N shapes the ``ceil(seq_len/RPB)`` row grid leaves the
@@ -83,9 +84,16 @@ def _auto_num_splits(seq_len_padded: int, seq_len_kv: int, rpb: int,
     return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
 
 
-def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
-                           rows_per_block: int, waves_per_block: int,
-                           convert_q_fn: bool = False, convert_kv_fn: bool = False):
+def _build_kernel_mfma_r_w(
+    *,
+    num_heads: int,
+    head_size: int,
+    block_kv: int,
+    rows_per_block: int,
+    waves_per_block: int,
+    convert_q_fn: bool = False,
+    convert_kv_fn: bool = False,
+):
     """Multi-row, multi-wave MFMA kernel.
 
     ``rows_per_block`` query rows share one KV tile load (cuts KV traffic by RPB).
@@ -116,13 +124,13 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
     assert D % 32 == 0, f"head_size={D} must be a multiple of 32 for MFMA K32"
     assert RPB >= 1, "rows_per_block must be >= 1"
     assert WPB >= 1, "waves_per_block must be >= 1"
-    N_TILES = BKV // 16                       # total column-tiles per BKV block
-    assert N_TILES % WPB == 0, (
-        f"BKV/16={N_TILES} must be divisible by waves_per_block={WPB}"
-    )
-    M_TILES = H // 16                         # head row-tiles
-    K_STEPS = D // 32                         # K32 MFMA steps over the head dim
-    N_TILES_PER_WAVE = N_TILES // WPB         # column-tiles per wave
+    N_TILES = BKV // 16  # total column-tiles per BKV block
+    assert (
+        N_TILES % WPB == 0
+    ), f"BKV/16={N_TILES} must be divisible by waves_per_block={WPB}"
+    M_TILES = H // 16  # head row-tiles
+    K_STEPS = D // 32  # K32 MFMA steps over the head dim
+    N_TILES_PER_WAVE = N_TILES // WPB  # column-tiles per wave
 
     fm_fast = arith.FastMathFlags.fast
     mfma_fn = rocdl.mfma_f32_16x16x32_fp8_fp8
@@ -136,17 +144,17 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
     def kernel(
-        Q: fx.Tensor,            # [seq_len, H, D]       fp8 (bytes passed raw)
-        KV: fx.Tensor,           # [seq_len_kv, D]       fp8 (bytes passed raw)
-        kv_scales: fx.Tensor,    # [seq_len_kv]          f32
-        weights: fx.Tensor,      # [seq_len, H]          f32
-        cu_starts: fx.Tensor,    # [seq_len]             i32
-        cu_ends: fx.Tensor,      # [seq_len]             i32
-        logits: fx.Tensor,       # [seq_len, seq_len_kv] f32
-        seq_len: fx.Int32,       # padded to a multiple of RPB
+        Q: fx.Tensor,  # [seq_len, H, D]       fp8 (bytes passed raw)
+        KV: fx.Tensor,  # [seq_len_kv, D]       fp8 (bytes passed raw)
+        kv_scales: fx.Tensor,  # [seq_len_kv]          f32
+        weights: fx.Tensor,  # [seq_len, H]          f32
+        cu_starts: fx.Tensor,  # [seq_len]             i32
+        cu_ends: fx.Tensor,  # [seq_len]             i32
+        logits: fx.Tensor,  # [seq_len, seq_len_kv] f32
+        seq_len: fx.Int32,  # padded to a multiple of RPB
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
-        num_splits: fx.Int32,    # grid.y KV-column splits (1 == no split)
+        num_splits: fx.Int32,  # grid.y KV-column splits (1 == no split)
     ):
         f32_0 = arith.constant(0.0, type=T.f32)
         mfma_res_ty = Vec.make_type(4, fx.Float32)
@@ -155,10 +163,12 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
         bid = fx.block_idx.x
         # Block bid (reversed) owns rows [r0, r0+RPB).
         n_blocks = fx.Int32(arith.ceildivui(_to_raw(seq_len), _to_raw(fx.Int32(RPB))))
-        r0 = fx.Int32(arith.muli(
-            _to_raw(n_blocks - bid - fx.Int32(1)),
-            _to_raw(fx.Int32(RPB)),
-        ))
+        r0 = fx.Int32(
+            arith.muli(
+                _to_raw(n_blocks - bid - fx.Int32(1)),
+                _to_raw(fx.Int32(RPB)),
+            )
+        )
 
         # Decompose tid into wave index and in-wave lane.
         wave = fx.Int32(arith.divui(_to_raw(tid), _to_raw(fx.Int32(64))))
@@ -175,12 +185,22 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
         w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
         cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
         ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
-        out_t = GTensor(
-            logits,
-            dtype=T.f32,
-            shape=(-1, -1),
-            stride=(stride_logits_s, fx.Int32(1)),
-        )
+        # Per-row 1-D output view: the row's i64 byte offset goes into the base
+        # pointer so the remaining column offset stays in i32. A 2-D (row, col)
+        # view computes row * stride + col in i32 and overflows past 2^31
+        # (~46k-square dense outputs), silently mis-writing.
+        _stride_i64 = arith.extui(T.i64, _to_raw(stride_logits_s))
+
+        def _make_out_row_t(row_i32):
+            """1-D output GTensor for row_i32; byte base computed in i64."""
+            _ri64 = arith.extui(T.i64, _to_raw(row_i32))
+            _byte = arith.muli(
+                arith.muli(_ri64, _stride_i64), arith.constant(4, type=T.i64)
+            )
+            _idx = arith.index_cast(T.index, _byte)
+            return GTensor(
+                logits, dtype=T.f32, shape=(-1,), static_bytes_offset_i64=_idx
+            )
 
         def _load_pack_i64(i32_view, byte_off_i32):
             dword_off = fx.Int32(
@@ -242,7 +262,9 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
             row_a = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
             for mi in range_constexpr(M_TILES):
                 h_a = _i32_add(fx.Int32(mi * 16), lane_mod_16)
-                row_h = _i32_add(fx.Int32(arith.muli(_to_raw(row), _to_raw(fx.Int32(H)))), h_a)
+                row_h = _i32_add(
+                    fx.Int32(arith.muli(_to_raw(row), _to_raw(fx.Int32(H)))), h_a
+                )
                 base_a = fx.Int32(arith.muli(_to_raw(row_h), _to_raw(fx.Int32(D))))
                 for kk in range_constexpr(K_STEPS):
                     d_a = _i32_add(fx.Int32(kk * 32), lane8)
@@ -257,7 +279,9 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                     h_w = _i32_add(
                         fx.Int32(mi * 16),
                         _i32_add(
-                            fx.Int32(arith.muli(_to_raw(lane_div_16), _to_raw(fx.Int32(4)))),
+                            fx.Int32(
+                                arith.muli(_to_raw(lane_div_16), _to_raw(fx.Int32(4)))
+                            ),
                             fx.Int32(ii),
                         ),
                     )
@@ -301,22 +325,31 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
 
             # ---- Load B-frags: wave w owns its own disjoint slice of n-tiles
             # [w*N_TILES_PER_WAVE, (w+1)*N_TILES_PER_WAVE) (no cross-wave sharing). ----
-            wave_ni_base = fx.Int32(arith.muli(_to_raw(wave), _to_raw(fx.Int32(N_TILES_PER_WAVE))))
+            wave_ni_base = fx.Int32(
+                arith.muli(_to_raw(wave), _to_raw(fx.Int32(N_TILES_PER_WAVE)))
+            )
             b_packs = [[None] * K_STEPS for _ in range_constexpr(N_TILES_PER_WAVE)]
             kv_scales_tile = [None] * N_TILES_PER_WAVE
             cols = [None] * N_TILES_PER_WAVE
             for ni in range_constexpr(N_TILES_PER_WAVE):
                 abs_ni = _i32_add(wave_ni_base, fx.Int32(ni))
                 col = _i32_add(
-                    _i32_add(col0, fx.Int32(arith.muli(_to_raw(abs_ni), _to_raw(fx.Int32(16))))),
+                    _i32_add(
+                        col0,
+                        fx.Int32(arith.muli(_to_raw(abs_ni), _to_raw(fx.Int32(16)))),
+                    ),
                     lane_mod_16,
                 )
                 cols[ni] = col
                 col_clamped = fx.Int32(
-                    arith.minsi(_to_raw(col), _to_raw(fx.Int32(seq_len_kv) - fx.Int32(1)))
+                    arith.minsi(
+                        _to_raw(col), _to_raw(fx.Int32(seq_len_kv) - fx.Int32(1))
+                    )
                 )
                 kv_scales_tile[ni] = _to_raw(fx.Float32(sc_t[col_clamped]))
-                base_b = fx.Int32(arith.muli(_to_raw(col_clamped), _to_raw(fx.Int32(D))))
+                base_b = fx.Int32(
+                    arith.muli(_to_raw(col_clamped), _to_raw(fx.Int32(D)))
+                )
                 for kk in range_constexpr(K_STEPS):
                     d_b = _i32_add(fx.Int32(kk * 32), lane8)
                     raw = _load_pack_i64(kv_i32, _i32_add(base_b, d_b))
@@ -325,6 +358,7 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
             # ---- Per-row MFMA + epilogue (inner loop over RPB rows) ----
             for j in range_constexpr(RPB):
                 row = _i32_add(r0, fx.Int32(j))
+                out_row_t = _make_out_row_t(row)
                 for ni in range_constexpr(N_TILES_PER_WAVE):
                     col = cols[ni]
                     kv_scale = kv_scales_tile[ni]
@@ -343,8 +377,12 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                         for ii in range_constexpr(4):
                             score = Vec(acc)[ii].ir_value()
                             relu = arith.maximumf(score, _to_raw(f32_0))
-                            wsc = arith.MulFOp(relu, w_frag[j][mi][ii], fastmath=fm_fast).result
-                            col_sum = arith.AddFOp(col_sum, wsc, fastmath=fm_fast).result
+                            wsc = arith.MulFOp(
+                                relu, w_frag[j][mi][ii], fastmath=fm_fast
+                            ).result
+                            col_sum = arith.AddFOp(
+                                col_sum, wsc, fastmath=fm_fast
+                            ).result
                     col_sum = arith.MulFOp(col_sum, kv_scale, fastmath=fm_fast).result
 
                     # Head-reduce within the wave (width=64): shuffle_xor offsets 16, 32.
@@ -357,27 +395,33 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                     # below `start`, so it guards the pre-filled -inf in
                     # [aligned_start, start).
                     in_window = arith.andi(
-                        _to_raw(arith.cmpi(
-                            arith.CmpIPredicate.sge,
-                            _to_raw(col),
-                            _to_raw(starts[j]),
-                        )),
-                        _to_raw(arith.cmpi(
-                            arith.CmpIPredicate.slt,
-                            _to_raw(col),
-                            _to_raw(ends[j]),
-                        )),
+                        _to_raw(
+                            arith.cmpi(
+                                arith.CmpIPredicate.sge,
+                                _to_raw(col),
+                                _to_raw(starts[j]),
+                            )
+                        ),
+                        _to_raw(
+                            arith.cmpi(
+                                arith.CmpIPredicate.slt,
+                                _to_raw(col),
+                                _to_raw(ends[j]),
+                            )
+                        ),
                     )
                     is_writer = arith.andi(
-                        _to_raw(arith.cmpi(
-                            arith.CmpIPredicate.eq,
-                            _to_raw(lane_div_16),
-                            _to_raw(fx.Int32(0)),
-                        )),
+                        _to_raw(
+                            arith.cmpi(
+                                arith.CmpIPredicate.eq,
+                                _to_raw(lane_div_16),
+                                _to_raw(fx.Int32(0)),
+                            )
+                        ),
                         in_window,
                     )
                     with ir.InsertionPoint(scf.IfOp(is_writer).then_block):
-                        out_t[row, col] = fx.Float32(col_sum)
+                        out_row_t[col] = fx.Float32(col_sum)
                         scf.YieldOp([])
 
             scf.YieldOp([])
@@ -397,9 +441,7 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
         num_splits: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        n_blocks = arith.ceildivui(
-            _to_raw(seq_len), _to_raw(fx.Int32(RPB))
-        )
+        n_blocks = arith.ceildivui(_to_raw(seq_len), _to_raw(fx.Int32(RPB)))
         gx = arith.index_cast(T.index, n_blocks)
         gy = arith.index_cast(T.index, _to_raw(num_splits))
         kernel._func.__name__ = _kname
@@ -425,13 +467,12 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
 # WPB must divide the column-tile count BKV/16 (=8 at the default BKV=128).
 def _mk_builder(rpb, wpb):
     return lambda **kw: _build_kernel_mfma_r_w(
-        **kw, rows_per_block=rpb, waves_per_block=wpb)
+        **kw, rows_per_block=rpb, waves_per_block=wpb
+    )
 
 
 _VARIANT_BUILDERS = {
-    f"mfma_r{r}_w{w}": _mk_builder(r, w)
-    for r in (1, 2, 4)
-    for w in (1, 2, 4)
+    f"mfma_r{r}_w{w}": _mk_builder(r, w) for r in (1, 2, 4) for w in (1, 2, 4)
 }
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
 DEFAULT_VARIANT = "mfma_r2_w4"
@@ -447,8 +488,11 @@ def _auto_variant(seq_len, seq_len_kv):
 
 def _resolve_variant(variant, seq_len, seq_len_kv):
     """Effective variant: explicit ``variant=`` > env var > shape-adaptive."""
-    tag = variant or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT") \
+    tag = (
+        variant
+        or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
         or _auto_variant(seq_len, seq_len_kv)
+    )
     if tag not in _VARIANT_BUILDERS:
         raise ValueError(
             f"unknown fp8_mqa_logits variant {tag!r}; "
@@ -486,8 +530,11 @@ def compile_fp8_mqa_logits(
             f"available: {list(KERNEL_VARIANTS)}"
         )
     launcher = _VARIANT_BUILDERS[variant](
-        num_heads=num_heads, head_size=head_size, block_kv=block_kv,
-        convert_q_fn=convert_q_fn, convert_kv_fn=convert_kv_fn,
+        num_heads=num_heads,
+        head_size=head_size,
+        block_kv=block_kv,
+        convert_q_fn=convert_q_fn,
+        convert_kv_fn=convert_kv_fn,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
@@ -546,9 +593,10 @@ def flydsl_fp8_mqa_logits(
     # logits = sum_h ReLU(QK*scale)*w is preserved.
     _fnuz = torch.float8_e4m3fnuz
     _fn = torch.float8_e4m3fn
-    assert Q.dtype in (_fnuz, _fn) and KV.dtype in (_fnuz, _fn), (
-        f"Q/KV must be e4m3 fp8 (fnuz or fn); got {Q.dtype}, {KV.dtype}"
-    )
+    assert Q.dtype in (_fnuz, _fn) and KV.dtype in (
+        _fnuz,
+        _fn,
+    ), f"Q/KV must be e4m3 fp8 (fnuz or fn); got {Q.dtype}, {KV.dtype}"
     convert_q_fn = Q.dtype != _fnuz
     convert_kv_fn = KV.dtype != _fnuz
     scale_mul = (2.0 if convert_q_fn else 1.0) * (2.0 if convert_kv_fn else 1.0)
@@ -583,13 +631,12 @@ def flydsl_fp8_mqa_logits(
         cu_ends = torch.cat([cu_ends, cu_ends.new_zeros(pad)], dim=0)
 
     # Match the Triton launcher's -inf-prefill / padding behavior so the two
-    # produce identically-shaped, identically-masked outputs. The kernel indexes
-    # logits with i32, so seq_len_padded * stride must stay < 2^31 (dense output
-    # ceiling ~46k square); real serving never materializes logits that large.
+    # produce identically-shaped, identically-masked outputs. The kernel writes
+    # the output through a per-row i64 byte-offset view, so the row*stride*4
+    # element offset no longer has to fit in i32 (the prior ~46k-square ceiling
+    # is gone); only the per-row column offset stays in i32.
     aligned_size = 256
-    seq_len_kv_aligned = (
-        (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
-    )
+    seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
     if clean_logits:
         logits = torch.full(
             (seq_len_padded, seq_len_kv_aligned),
