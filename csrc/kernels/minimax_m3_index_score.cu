@@ -8,6 +8,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cmath>
+#include <cstdint>
 
 #include "aiter_dispatch.h"
 #include "aiter_hip_common.h"
@@ -17,36 +18,54 @@ namespace aiter {
 namespace minimax_m3_index_score_ops {
 
 constexpr int kHeadDim = 128;
-constexpr int kNumLanes = 32;
-constexpr int kNumWaves = 8;
+constexpr int kNumLanes = 64;
+constexpr int kNumWaves = 4;
 constexpr int kElemsPerLane = kHeadDim / kNumLanes;
 
 __device__ __forceinline__ float warpReduceSum(float val)
 {
 #pragma unroll
-    for(int mask = 16; mask > 0; mask >>= 1)
+    for(int mask = kNumLanes / 2; mask > 0; mask >>= 1)
     {
-        val += __shfl_xor(val, mask, 32);
+        val += __shfl_xor(val, mask, kNumLanes);
     }
     return val;
 }
 
 template <typename scalar_t>
-__device__ __forceinline__ void load4Vec(const scalar_t* __restrict__ src,
-                                         float (&dst)[kElemsPerLane])
+__device__ __forceinline__ void loadVec(const scalar_t* __restrict__ src,
+                                        float (&dst)[kElemsPerLane])
 {
-    static_assert(kElemsPerLane == 4);
-    union Vec4
+    if constexpr(kElemsPerLane == 4)
     {
-        uint2 raw;
-        scalar_t vals[kElemsPerLane];
-    };
-    Vec4 tmp;
-    tmp.raw = *reinterpret_cast<const uint2*>(src);
+        union Vec
+        {
+            uint2 raw;
+            scalar_t vals[kElemsPerLane];
+        };
+        Vec tmp;
+        tmp.raw = *reinterpret_cast<const uint2*>(src);
 #pragma unroll
-    for(int i = 0; i < kElemsPerLane; ++i)
+        for(int i = 0; i < kElemsPerLane; ++i)
+        {
+            dst[i] = static_cast<float>(tmp.vals[i]);
+        }
+    }
+    else
     {
-        dst[i] = static_cast<float>(tmp.vals[i]);
+        static_assert(kElemsPerLane == 2);
+        union Vec
+        {
+            uint32_t raw;
+            scalar_t vals[kElemsPerLane];
+        };
+        Vec tmp;
+        tmp.raw = *reinterpret_cast<const uint32_t*>(src);
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
+        {
+            dst[i] = static_cast<float>(tmp.vals[i]);
+        }
     }
 }
 
@@ -105,7 +124,7 @@ __global__ void decodeIndexScoreKernel(
     const int dim0 = lane * kElemsPerLane;
 
     float q_vals[kElemsPerLane];
-    load4Vec(q + pid_t * stride_q_n + pid_h * stride_q_h + dim0 * stride_q_d, q_vals);
+    loadVec(q + pid_t * stride_q_n + pid_h * stride_q_h + dim0 * stride_q_d, q_vals);
 
     const int32_t* __restrict__ bt_row = block_table + pid_b * stride_bt_b;
     __shared__ float wave_scores[kNumWaves];
@@ -137,7 +156,7 @@ __global__ void decodeIndexScoreKernel(
                 break;
             }
             float k_vals[kElemsPerLane];
-            load4Vec(k_blk + off * stride_k_pos, k_vals);
+            loadVec(k_blk + off * stride_k_pos, k_vals);
             float dot = 0.0f;
 #pragma unroll
             for(int i = 0; i < kElemsPerLane; ++i)
