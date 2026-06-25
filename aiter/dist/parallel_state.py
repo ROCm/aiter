@@ -223,6 +223,33 @@ def fused_qknorm_allreduce_fake(
     )
 
 
+def fused_qknorm_allreduce_rope_fake(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dtype = qkv_in.dtype
+    return (
+        torch.empty(
+            (qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device
+        ),
+        torch.empty(
+            (qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device
+        ),
+        torch.empty(
+            (qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]),
+            dtype=dtype,
+            device=qkv_in.device,
+        ),
+    )
+
+
 @torch_compile_guard(gen_fake=fused_qknorm_allreduce_fake)
 def fused_qknorm_allreduce_(
     qkv_in: torch.Tensor,
@@ -236,6 +263,34 @@ def fused_qknorm_allreduce_(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_qknorm_allreduce_out_place(qkv_in, q_w, k_w, eps)
+
+
+@torch_compile_guard(gen_fake=fused_qknorm_allreduce_rope_fake)
+def fused_qknorm_allreduce_rope_(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_qknorm_allreduce_rope_out_place(
+        qkv_in,
+        q_w,
+        k_w,
+        cos_sin_cache,
+        position_ids,
+        head_dim,
+        rotary_dim,
+        eps,
+    )
 
 
 if supports_custom_op():
@@ -564,6 +619,48 @@ class GroupCoordinator:
             group_name=self.unique_name,
         )
 
+    def fused_qknorm_allreduce_rope(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        position_ids: torch.Tensor,
+        head_dim: int,
+        rotary_dim: int,
+        eps: float,
+    ):
+        return fused_qknorm_allreduce_rope_(
+            qkv_in,
+            q_w,
+            k_w,
+            cos_sin_cache,
+            position_ids,
+            head_dim,
+            rotary_dim,
+            eps,
+            group_name=self.unique_name,
+        )
+
+    def fused_allreduce_rmsnorm_mxfp4_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+    ):
+        return self.fused_allreduce_rmsnorm_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
+            quant_type="mxfp4",
+            emit_bf16=emit_bf16,
+        )
+
     def _fused_allreduce_rmsnorm_out_place(
         self,
         input_: torch.Tensor,
@@ -617,6 +714,30 @@ class GroupCoordinator:
             qkv_in,
             q_w,
             k_w,
+            eps,
+        )
+
+    def _fused_qknorm_allreduce_rope_out_place(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        position_ids: torch.Tensor,
+        head_dim: int,
+        rotary_dim: int,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_qknorm_allreduce_rope(
+            qkv_in,
+            q_w,
+            k_w,
+            cos_sin_cache,
+            position_ids,
+            head_dim,
+            rotary_dim,
             eps,
         )
 
