@@ -99,7 +99,6 @@ def _gluon_fused_reduce_rms_mxfp4_quant_kernel(
     sharedLayout2D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
     sharedLayoutN: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
 
-
     gLayoutN3_2: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gLayout3d_spk))
     gLayout2d_x2: gl.constexpr = gl.SliceLayout(0, gLayout3d_spk)
     gLayoutN2: gl.constexpr = gl.SliceLayout(0, gLayout2d_x2)
