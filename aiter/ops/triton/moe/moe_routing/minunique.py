@@ -1,19 +1,3 @@
-"""FlashMoE min-unique routing (gpt-oss flat-topk path).
-
-Take top-(k+1) per token, then drop each token's least-batch-popular candidate so
-the union of experts across the decode batch shrinks (~21% fewer unique experts at
-conc-64) -> fewer expert-weight tiles loaded -> faster weight-bound decode, while
-each token keeps a valid top-k softmax-renormalized selection (accuracy-neutral).
-
-Same kernel count as baseline routing (3 kernels), via two fusions:
-  topk(k+1, pop_out=...) : streaming top-(k+1) + atomic popularity   (Fusion-1)
-  _keepk_sort0           : per-token drop+compact + atomic hist + atomic
-                           cross-block prefix offsets (no bitmatrix/sum) (Fusion-2)
-  _combined_routing      : offsets + block_pid_map + gather/scatter (aiter sort1)
-
-Drop-in for `routing(logits, n_expts_act, score_mode=None)`; returns
-(RoutingData, gather_indx, scatter_indx).
-"""
 import torch
 import triton
 
@@ -28,8 +12,9 @@ from aiter.ops.triton.moe.moe_routing.routing import (
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 
-def keepk_sort0(expt_scal, expt_indx, pop, hist, part, n_expts_tot, k,
-                apply_softmax, HIST_BLOCK_M):
+def keepk_sort0(
+    expt_scal, expt_indx, pop, hist, part, n_expts_tot, k, apply_softmax, HIST_BLOCK_M
+):
     """Fusion-2 driver: (k+1) candidates + popularity -> kept-k (Vout/Iout) +
     post-drop histogram + cross-block prefix offsets. `hist`/`part` are PRE-ZEROED."""
     M, KP1 = expt_scal.shape
@@ -39,13 +24,25 @@ def keepk_sort0(expt_scal, expt_indx, pop, hist, part, n_expts_tot, k,
     Vout = torch.empty((M, k), dtype=expt_scal.dtype, device=dev)
     Iout = torch.empty((M, k), dtype=torch.int16, device=dev)
     _keepk_sort0[(M,)](
-        expt_scal, expt_indx, expt_scal.stride(0),
+        expt_scal,
+        expt_indx,
+        expt_scal.stride(0),
         pop,
-        Vout, Iout, Vout.stride(0),
-        hist, part, part.stride(0), part.stride(1),
-        M, n_expts_tot,
-        HIST_BLOCK_M=HIST_BLOCK_M, NUM_BLOCKS=num_blocks,
-        KP1=KP1, K=k, KP1_PAD=KP1_PAD, APPLY_SOFTMAX=apply_softmax,
+        Vout,
+        Iout,
+        Vout.stride(0),
+        hist,
+        part,
+        part.stride(0),
+        part.stride(1),
+        M,
+        n_expts_tot,
+        HIST_BLOCK_M=HIST_BLOCK_M,
+        NUM_BLOCKS=num_blocks,
+        KP1=KP1,
+        K=k,
+        KP1_PAD=KP1_PAD,
+        APPLY_SOFTMAX=apply_softmax,
         num_warps=1,
     )
     return Vout, Iout
@@ -65,20 +62,32 @@ def routing_minunique(logits, n_expts_act, *, sm_first=False):
 
     # One combined zero-buffer: pop[E] | hist[E] | partials[num_blocks, E].
     # pop is filled by topk's atomics; hist/partials by _keepk_sort0's atomics.
-    z = torch.zeros(2 * n_expts_tot + num_blocks * n_expts_tot,
-                    dtype=torch.int32, device=logits.device)
+    z = torch.zeros(
+        2 * n_expts_tot + num_blocks * n_expts_tot,
+        dtype=torch.int32,
+        device=logits.device,
+    )
     pop = z[:n_expts_tot]
-    hist = z[n_expts_tot:2 * n_expts_tot]
-    partials = z[2 * n_expts_tot:].view(num_blocks, n_expts_tot)
+    hist = z[n_expts_tot : 2 * n_expts_tot]
+    partials = z[2 * n_expts_tot :].view(num_blocks, n_expts_tot)
 
     # Fusion-1: top-(k+1) + atomic popularity (no separate sum).
     expt_scal, expt_indx, _bitmatrix = topk(
-        logits, k + 1, apply_softmax=False, HIST_BLOCK_M=HIST_BLOCK_M, pop_out=pop)
+        logits, k + 1, apply_softmax=False, HIST_BLOCK_M=HIST_BLOCK_M, pop_out=pop
+    )
 
     # Fusion-2: per-token drop -> kept-k + hist + cross-block prefix offsets.
     expt_scal2, expt_indx2 = keepk_sort0(
-        expt_scal, expt_indx, pop, hist, partials, n_expts_tot, k,
-        apply_softmax=(not sm_first), HIST_BLOCK_M=HIST_BLOCK_M)
+        expt_scal,
+        expt_indx,
+        pop,
+        hist,
+        partials,
+        n_expts_tot,
+        k,
+        apply_softmax=(not sm_first),
+        HIST_BLOCK_M=HIST_BLOCK_M,
+    )
 
     # sort1: aiter _combined_routing, fed our hist + partials.
     n_gates = num_tokens * k
@@ -92,18 +101,36 @@ def routing_minunique(logits, n_expts_act, *, sm_first=False):
     topk_indx = combined_indx[:n_gates]
     gate_indx = combined_indx[n_gates:]
     gate_scal = torch.empty(n_gates, dtype=dtype, device=dev)
-    (token_offs_raw, token_offs_pad, block_pid_map,
-     blocks1a, BLOCK_A, block_m_log2) = _compute_expt_data_internal(
-        n_expts_tot, n_gates, block_m, dev)
+    token_offs_raw, token_offs_pad, block_pid_map, blocks1a, BLOCK_A, block_m_log2 = (
+        _compute_expt_data_internal(n_expts_tot, n_gates, block_m, dev)
+    )
     blocks1b = triton.cdiv(num_tokens, HIST_BLOCK_M)
     _combined_routing[(blocks1a + blocks1b,)](
-        topk_indx, gate_indx, gate_scal, expt_scal2, expt_indx2,
-        partials, partials.stride(0), partials.stride(1),
-        n_gates, HIST_BLOCK_M, num_tokens % HIST_BLOCK_M == 0, k, n_expts_act_pad,
-        hist, n_expts_tot, token_offs_raw, token_offs_pad, blocks1a,
-        block_pid_map, block_pid_map.shape[0], block_m_log2,
-        BLOCK_A=BLOCK_A, EQUAL_A=(hist.shape[0] == BLOCK_A),
-        USE_TDM=is_tdm_avail(), num_warps=1,
+        topk_indx,
+        gate_indx,
+        gate_scal,
+        expt_scal2,
+        expt_indx2,
+        partials,
+        partials.stride(0),
+        partials.stride(1),
+        n_gates,
+        HIST_BLOCK_M,
+        num_tokens % HIST_BLOCK_M == 0,
+        k,
+        n_expts_act_pad,
+        hist,
+        n_expts_tot,
+        token_offs_raw,
+        token_offs_pad,
+        blocks1a,
+        block_pid_map,
+        block_pid_map.shape[0],
+        block_m_log2,
+        BLOCK_A=BLOCK_A,
+        EQUAL_A=(hist.shape[0] == BLOCK_A),
+        USE_TDM=is_tdm_avail(),
+        num_warps=1,
     )
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
     routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, k, expt_data)

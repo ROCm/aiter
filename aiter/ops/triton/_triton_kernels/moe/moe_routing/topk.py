@@ -172,8 +172,8 @@ def _topk(
     HAS_BIAS: tl.constexpr = False,
     APPLY_RENORM: tl.constexpr = False,
     ROUTED_SCALING: tl.constexpr = 1.0,
-    Pop=None,                          # FlashMoE: optional [n_expts_tot] int32 popularity (pre-zeroed)
-    WRITE_POP: tl.constexpr = False,   # FlashMoE Fusion-1: atomic-accumulate popularity here
+    Pop=None,                          # optional [n_expts_tot] int32 popularity (pre-zeroed)
+    WRITE_POP: tl.constexpr = False,   # atomic-accumulate popularity here
 ):
     # Backward-compat sanity. APPLY_SOFTMAX = post-selection softmax over the
     # K selected logits (legacy behavior). It only makes sense when no
@@ -263,7 +263,7 @@ def _topk(
     Yi_ptrs = Yi + offs_m[:, None] * stride_ym + offs_y_n[None, :]
     tl.store(Yi_ptrs, y_indices, mask=mask)
 
-    # FlashMoE Fusion-1: fold the per-expert popularity histogram into topk via
+    # fold the per-expert popularity histogram into topk via
     # atomics, eliminating a separate _sum_bitmatrix_rows launch downstream.
     # Gated by WRITE_POP (constexpr) -> default callers are byte-for-byte identical.
     if WRITE_POP:

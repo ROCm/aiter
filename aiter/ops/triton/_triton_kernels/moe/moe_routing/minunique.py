@@ -1,14 +1,3 @@
-"""FlashMoE min-unique routing — internal Triton kernel.
-
-Fusion-2 (keepk + sort0): a single per-token kernel that drops each token's
-least-batch-popular of its (k+1) candidates, compacts to k + softmax-renorms,
-and produces the per-expert histogram AND the cross-block prefix offsets via
-atomics — eliminating the separate bitmatrix + _sum_bitmatrix_rows reduction.
-
-The drop is (min popularity, tiebreak min logit, tiebreak min col), NaN/inf-safe
-and clamped, so EXACTLY k experts are kept per token => sum(hist) == n_tokens*k
-always (no phantom block_pid_map tiles -> cudagraph-capture-safe).
-"""
 import triton
 import triton.language as tl
 
@@ -17,15 +6,15 @@ import triton.language as tl
 def _keepk_sort0(
     Vin,
     Iin,
-    stride_in,            # [M, KP1] candidate weights / expert ids (int16)
-    Pop,                  # [n_expts_tot] int32 popularity over the (k+1) selection
+    stride_in,  # [M, KP1] candidate weights / expert ids (int16)
+    Pop,  # [n_expts_tot] int32 popularity over the (k+1) selection
     Vout,
     Iout,
-    stride_out,           # [M, K] compacted kept weights / expert ids
-    Hist,                 # [n_expts_tot] int32 post-drop histogram (PRE-ZEROED) — atomic
+    stride_out,  # [M, K] compacted kept weights / expert ids
+    Hist,  # [n_expts_tot] int32 post-drop histogram (PRE-ZEROED) — atomic
     Part,
     stride_pm,
-    stride_pn,            # [NUM_BLOCKS, n_expts_tot] cross-block prefix (PRE-ZEROED) — atomic
+    stride_pn,  # [NUM_BLOCKS, n_expts_tot] cross-block prefix (PRE-ZEROED) — atomic
     n_rows,
     n_expts_tot,
     HIST_BLOCK_M: tl.constexpr,
