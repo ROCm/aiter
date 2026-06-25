@@ -970,13 +970,14 @@ def _compile_base_a8w4_gemm(
         )
     compiler = compile_mxfp4_gemm if cfg.data_format == "fp4" else compile_a8w4_gemm
     # The TDM store epilogue now fuses the stage1 activation for the dual-B
-    # "gguu" layout, so keep TDM store on even when an activation is fused.  The
-    # "gugu" interleaved layout (halved output columns) and split_k > 1 are not
-    # supported by the TDM store path yet and fall back to buffer stores.
+    # "gguu" layout, so keep TDM store on even when an activation is fused.
+    # split_k > 1 also uses TDM store: each split slice writes its partial sum
+    # to its own output region (the descriptor encodes the split-k row offset)
+    # and the separate finalize/reduce step sums them.  Only the "gugu"
+    # interleaved layout (halved output columns) still falls back to buffer
+    # stores.
     stage1_interleave = stage1_act is not None and stage1_weight_layout == "gugu"
-    tdm_store_enabled = (
-        cfg.use_tdm_store and cfg.split_k == 1 and not stage1_interleave
-    )
+    tdm_store_enabled = cfg.use_tdm_store and not stage1_interleave
     return compiler(
         M=cfg.max_m,
         N=N,
