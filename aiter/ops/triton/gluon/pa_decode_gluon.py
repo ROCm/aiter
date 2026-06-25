@@ -103,6 +103,11 @@ def get_occupancy():
     return 2
 
 
+# Upper bound on the partition count get_recommended_splits returns at runtime;
+# also the default set of variants the FlyDSL PS-reduce AOT precompiles.
+PA_DECODE_MAX_SPLITS = 8
+
+
 def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count * get_occupancy()
@@ -110,7 +115,7 @@ def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
         num_sm, num_sequences * num_kv_heads * split_kv_blocks
     )
     max_context_partition_num *= split_kv_blocks
-    return min(max_context_partition_num, 8)
+    return min(max_context_partition_num, PA_DECODE_MAX_SPLITS)
 
 
 DS_WRITE = gl.constexpr(0x200)
