@@ -358,14 +358,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
 
-        norm_weight = weight_ + 1.0 if gemma_norm else weight_
         rmsnorm2d_fwd_with_add(
             out,
             ar_out,
             res_inp_,
             residual_out,
-            norm_weight,
+            weight_,
             eps,
+            gemma_norm,
             0,
         )
         return out, residual_out
