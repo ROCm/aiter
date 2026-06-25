@@ -21,6 +21,28 @@ def _get_dtypes():
     return dtypes
 
 
+def _compile_only() -> bool:
+    """True when running under AOT precompile (``COMPILE_ONLY=1``)."""
+    return os.environ.get("COMPILE_ONLY", "0") == "1"
+
+
+def _launch_stream():
+    """Stream used for kernel launch.
+
+    Under ``COMPILE_ONLY`` (AOT precompile) no kernel is actually launched and
+    we may be running without a live CUDA context (CPU / FakeTensor), so return
+    ``0`` instead of touching ``torch.cuda.current_stream()``. This keeps the
+    runtime stage1/stage2 path callable in compile-only mode, which lets AOT
+    drive the *same* runtime code instead of re-implementing its host logic.
+
+    At inference (``COMPILE_ONLY`` unset) this is exactly the previous default
+    of ``torch.cuda.current_stream()`` — behavior is unchanged.
+    """
+    if _compile_only():
+        return 0
+    return torch.cuda.current_stream()
+
+
 _SUFFIX_RE = re.compile(
     r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
 )
@@ -564,7 +586,7 @@ def _s1_args_fp4(
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _launch_stream()
     return (
         ptr_arg(out),
         ptr_arg(a),
@@ -603,7 +625,7 @@ def _s1_args_std(
     stream=None,
 ):
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _launch_stream()
     return (
         ptr_arg(out),
         ptr_arg(a),
@@ -646,7 +668,7 @@ def _s2_args_fp4(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _launch_stream()
     return (
         ptr_arg(target),
         ptr_arg(a),
@@ -683,7 +705,7 @@ def _s2_args_std(
     stream=None,
 ):
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _launch_stream()
     return (
         ptr_arg(target),
         ptr_arg(a),
@@ -783,7 +805,7 @@ def _run_moe_reduction(
         em = torch.empty(0, device=out.device, dtype=torch.int32)
         tk = torch.empty(0, device=out.device, dtype=torch.int32)
     if stream is None:
-        stream = torch.cuda.current_stream()
+        stream = _launch_stream()
     _run_compiled(
         reduce_exe,
         (
@@ -1043,7 +1065,7 @@ def flydsl_swiglu_and_mul_interleaved(
             input,
             out,
             num_rows,
-            torch.cuda.current_stream(),
+            _launch_stream(),
         ),
     )
 
@@ -1088,8 +1110,335 @@ def flydsl_silu_and_mul_interleaved(
             token_num,
             num_sorted_rows,
             float("inf"),
-            torch.cuda.current_stream(),
+            _launch_stream(),
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# AOT compile-input builders
+#
+# These construct the *top-level* inputs to flydsl_moe_stage1 / flydsl_moe_stage2
+# for a given config, so AOT precompile can drive the SAME runtime code instead
+# of re-deriving the internal buffers / arg packing / compile call. Under
+# COMPILE_ONLY + FakeTensor the stage functions compile (and persist) the
+# artifact without launching, and because they execute the real host logic the
+# resulting JIT cache key is identical to the one inference looks up.
+#
+# Only the *input* shapes (activations, weights, scales, routing) live here —
+# everything downstream of the stage entry point (out_scale_sorted_flat, arg
+# packing via _s1_args_*, the compile call, split-K secondary kernels, the
+# reduction epilogue) is owned solely by flydsl_moe_stage1/2.
+# ---------------------------------------------------------------------------
+
+
+def moe_sorting_shape(tokens: int, topk: int, num_experts: int, block_m: int):
+    """Single source of truth for moe-sorting padded sizes.
+
+    Mirrors the allocation in ``aiter.fused_moe.moe_sorting``:
+        max_num_tokens_padded = tokens*topk + num_experts*block_m - topk
+    Returns ``(max_num_tokens_padded, max_num_m_blocks)``.
+    """
+    max_num_tokens_padded = tokens * topk + num_experts * block_m - topk
+    max_num_m_blocks = (max_num_tokens_padded + block_m - 1) // block_m
+    return max_num_tokens_padded, max_num_m_blocks
+
+
+def _moe_storage_dtype(dtype: str):
+    """Map a FlyDSL dtype tag to its torch storage dtype."""
+    if dtype in ("fp4", "fp8"):
+        return torch.uint8
+    if dtype in ("fp16", "f16"):
+        return torch.float16
+    if dtype == "bf16":
+        return torch.bfloat16
+    if dtype == "int4":
+        return torch.int4 if hasattr(torch, "int4") else torch.uint8
+    return torch.int8
+
+
+def _moe_empty(shape, dtype, dev):
+    # torch.zeros doesn't support sub-byte dtypes (int4); use empty for those.
+    # Cache key only depends on shape+dtype+strides — values don't matter.
+    if dtype == getattr(torch, "int4", None):
+        return torch.empty(shape, device=dev, dtype=dtype)
+    return torch.zeros(shape, device=dev, dtype=dtype)
+
+
+def build_stage1_compile_inputs(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    a_dtype: str = "fp4",
+    b_dtype: str = "fp4",
+    out_dtype: str = "bf16",
+    act: str = "silu",
+    doweight_stage1: bool = False,
+    waves_per_eu: Optional[int] = None,
+    k_batch: int = 1,
+    b_nt: int = 2,
+    gate_mode: str = "separated",
+    sort_block_m: int = 0,
+    token_num: int = 0,
+    block_m: int = 0,
+    a_scale_one: bool = False,
+    xcd_swizzle: int = 0,
+    enable_bias: bool = False,
+    swiglu_limit: float = 0.0,
+    k_wave: int = 1,
+    dev=None,
+    **_ignored,
+) -> dict:
+    """Build the kwargs to drive ``flydsl_moe_stage1`` for AOT precompile.
+
+    The returned dict mirrors the activation/weight/scale/routing shapes that
+    ``fused_moe_2stages`` feeds into ``flydsl_moe_stage1`` at inference, so the
+    JIT cache key written under COMPILE_ONLY matches the runtime lookup.
+    """
+    dev = dev if dev is not None else torch.device("cpu")
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    is_int4_weight = b_dtype == "int4"
+    tokens = token_num if token_num > 0 else tile_m
+    E = experts
+    _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
+    _block_m_for_sort = block_m if block_m > 0 else _sort_block_m
+    max_num_tokens_padded, max_num_m_blocks = moe_sorting_shape(
+        tokens, topk, E, _block_m_for_sort
+    )
+
+    # user-level activation / weight shapes (storage dtype)
+    a_shape = (tokens, model_dim // 2) if a_dtype == "fp4" else (tokens, model_dim)
+    if b_dtype in ("fp4", "int4"):
+        w1_shape = (E, 2 * inter_dim, model_dim // 2)
+    else:
+        w1_shape = (E, 2 * inter_dim, model_dim)
+
+    a = _moe_empty(a_shape, _moe_storage_dtype(a_dtype), dev)
+    w1 = _moe_empty(w1_shape, _moe_storage_dtype(b_dtype), dev)
+
+    sorted_token_ids = torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.int32)
+    sorted_expert_ids = torch.zeros(max_num_m_blocks, device=dev, dtype=torch.int32)
+    num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
+
+    # a1_scale mirrors fused_moe_2stages' per_1x32 activation-scale construction.
+    a1_scale = None
+    if use_mx_gemm:
+        if a_dtype == "fp8":
+            if a_scale_one:
+                a1_scale = torch.empty(0, dtype=torch.uint8, device=dev)
+            else:
+                a1_scale = torch.ones(
+                    [max_num_tokens_padded, model_dim // 32],
+                    dtype=torch.uint8,
+                    device=dev,
+                )
+        elif a_dtype == "bf16":
+            a1_scale = torch.ones(
+                [max_num_tokens_padded, model_dim // 32], dtype=torch.uint8, device=dev
+            )
+        elif a_dtype == "fp4":
+            rows = (max_num_tokens_padded + 31) // 32 * 32
+            cols = (model_dim + 31) // 32
+            a1_scale = torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
+
+    # w1_scale: per-32 group along K (mxfp4/fp8) or groupwise bf16 (a16wi4).
+    if use_mx_gemm:
+        w1_scale = torch.zeros(
+            E * 2 * inter_dim * (model_dim // 32), dtype=torch.uint8, device=dev
+        )
+    elif is_int4_weight:
+        w1_scale = torch.zeros(
+            E * (model_dim // 32) * (2 * inter_dim), device=dev, dtype=torch.bfloat16
+        )
+    else:
+        w1_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+
+    sorted_weights = (
+        torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.float32)
+        if doweight_stage1
+        else None
+    )
+    bias = (
+        torch.zeros(E * inter_dim * 2, device=dev, dtype=torch.float32)
+        if enable_bias
+        else None
+    )
+    # split-K bias path needs topk_ids; harmless for other paths (unused).
+    topk_ids = (
+        torch.zeros((tokens, topk), device=dev, dtype=torch.int32)
+        if enable_bias
+        else None
+    )
+
+    return dict(
+        a=a,
+        w1=w1,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=None,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        act=act,
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        sorted_weights=sorted_weights,
+        use_async_copy=True,
+        k_batch=k_batch,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
+        gate_mode=gate_mode,
+        bias=bias,
+        topk_ids=topk_ids,
+        a_scale_one=a_scale_one,
+        xcd_swizzle=xcd_swizzle,
+        swiglu_limit=swiglu_limit,
+        k_wave=k_wave,
+    )
+
+
+def build_stage2_compile_inputs(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    a_dtype: str = "fp4",
+    b_dtype: str = "fp4",
+    out_dtype: str = "bf16",
+    doweight_stage1: bool = False,
+    waves_per_eu: Optional[int] = None,
+    b_nt: int = 2,
+    mode: str = "atomic",
+    persist=None,
+    sort_block_m: int = 0,
+    token_num: int = 0,
+    block_m: int = 0,
+    xcd_swizzle: int = 0,
+    enable_bias: bool = False,
+    stage1_fuse_quant=None,
+    swiglu_limit: float = 0.0,
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
+    act: str = "silu",
+    dev=None,
+    **_ignored,
+) -> dict:
+    """Build the kwargs to drive ``flydsl_moe_stage2`` for AOT precompile."""
+    dev = dev if dev is not None else torch.device("cpu")
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    is_int4_weight = b_dtype == "int4"
+    tokens = token_num if token_num > 0 else tile_m
+    E = experts
+    _block_m_for_sort = block_m if block_m > 0 else (sort_block_m or tile_m)
+    max_num_tokens_padded, max_num_m_blocks = moe_sorting_shape(
+        tokens, topk, E, _block_m_for_sort
+    )
+
+    a_shape = (
+        (tokens, topk, inter_dim // 2)
+        if a_dtype == "fp4"
+        else (tokens, topk, inter_dim)
+    )
+    if b_dtype in ("fp4", "int4"):
+        w2_shape = (E, model_dim, inter_dim // 2)
+    else:
+        w2_shape = (E, model_dim, inter_dim)
+
+    inter_states = _moe_empty(a_shape, _moe_storage_dtype(a_dtype), dev)
+    w2 = _moe_empty(w2_shape, _moe_storage_dtype(b_dtype), dev)
+
+    sorted_token_ids = torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.int32)
+    sorted_expert_ids = torch.zeros(max_num_m_blocks, device=dev, dtype=torch.int32)
+    num_valid_ids = torch.zeros(2, device=dev, dtype=torch.int32)
+
+    # a2_scale mirrors fused_moe_2stages stage2 activation-scale construction.
+    a2_scale = None
+    if use_mx_gemm:
+        if stage1_fuse_quant in ("fp4", "fp8"):
+            _sorted_size = max(max_num_tokens_padded, max_num_m_blocks * tile_m)
+            _padded_rows = (_sorted_size + 255) // 256 * 256
+            _padded_cols = ((inter_dim // 32) + 7) // 8 * 8
+            a2_scale = torch.zeros(
+                _padded_rows * _padded_cols, dtype=torch.uint8, device=dev
+            )
+        elif a_dtype == "fp8":
+            if act == "silu" and swiglu_limit == 0.0:
+                rows = (max_num_tokens_padded + 31) // 32 * 32
+                cols = (inter_dim + 31) // 32
+                a2_scale = torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
+            else:
+                a2_scale = torch.ones(
+                    [max_num_tokens_padded, model_dim // 32],
+                    dtype=torch.uint8,
+                    device=dev,
+                )
+        elif a_dtype == "fp4":
+            rows = (max_num_tokens_padded + 31) // 32 * 32
+            cols = (inter_dim + 31) // 32
+            a2_scale = torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
+
+    if use_mx_gemm:
+        w2_scale = torch.zeros(
+            E * model_dim * (inter_dim // 32), dtype=torch.uint8, device=dev
+        )
+    elif is_int4_weight:
+        w2_scale = torch.zeros(
+            E * (inter_dim // 32) * model_dim, device=dev, dtype=torch.bfloat16
+        )
+    else:
+        w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+
+    sorted_weights = (
+        torch.zeros(max_num_tokens_padded, device=dev, dtype=torch.float32)
+        if not doweight_stage1
+        else None
+    )
+    bias = (
+        torch.zeros(E * model_dim, device=dev, dtype=torch.float32)
+        if enable_bias
+        else None
+    )
+
+    return dict(
+        inter_states=inter_states,
+        w2=w2,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=None,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        mode=mode,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        sorted_weights=sorted_weights,
+        sort_block_m=sort_block_m,
+        persist=persist,
+        waves_per_eu=waves_per_eu,
+        use_async_copy=use_async_copy,
+        cu_num_mul=cu_num_mul,
+        b_nt=b_nt,
+        xcd_swizzle=xcd_swizzle,
+        bias=bias,
     )
 
 
@@ -1364,7 +1713,7 @@ def flydsl_moe_stage1(
                 token_num,
                 num_sorted_rows,
                 _swiglu_limit_val,
-                torch.cuda.current_stream(),
+                _launch_stream(),
             ),
         )
     elif _gui_sk:
@@ -1389,7 +1738,7 @@ def flydsl_moe_stage1(
                 token_num,
                 num_sorted_rows,
                 _swiglu_limit_val,
-                torch.cuda.current_stream(),
+                _launch_stream(),
             ),
         )
     elif _splitk_fp4:
@@ -1412,10 +1761,14 @@ def flydsl_moe_stage1(
                 token_num,
                 num_sorted_rows,
                 _swiglu_limit_val,
-                torch.cuda.current_stream(),
+                _launch_stream(),
             ),
         )
-    elif _is_splitk:
+    elif _is_splitk and not _compile_only():
+        # Plain split-K post-op is a CK activation kernel (not a FlyDSL kernel),
+        # so there is no artifact to precompile here. Skip under COMPILE_ONLY —
+        # the only FlyDSL kernel on this path (the split-K GEMM) was already
+        # compiled above via _run_compiled.
         from aiter.ops.activation import (
             silu_and_mul,
             silu_and_mul_bias,
@@ -1781,15 +2134,14 @@ def flydsl_moe_fused_route_quant_scatter(
     numel = token_num * topk
     model_dim = hidden_states.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     out_E = E if out_E is None else int(out_E)
     out_max_m = max_m if out_max_m is None else int(out_max_m)
     assert out_max_m % rows_per_tile == 0, (
-        f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 "
-        f"({rows_per_tile})"
+        f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
     )
 
     payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
@@ -2093,15 +2445,14 @@ def flydsl_moe_fused_quant_preshuffle(
             "unsupported (expected 'fp4' or 'fp8')."
         )
     assert grouped_in.dtype == torch.bfloat16, (
-        "fused grouped quant+preshuffle requires bf16 input "
-        f"(got {grouped_in.dtype})"
+        f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
     )
     device = grouped_in.device
     feat_dim = grouped_in.shape[-1]
     rows_per_tile = wmma_rep * 16
-    assert (
-        max_m % rows_per_tile == 0
-    ), f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    assert max_m % rows_per_tile == 0, (
+        f"max_m ({max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
+    )
 
     n_rows = E * max_m
     Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
