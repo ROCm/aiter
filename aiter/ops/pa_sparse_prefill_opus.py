@@ -225,8 +225,10 @@ def pa_sparse_prefill_fp8_opus(
       ``out`` (``[T, H, 512]`` bf16).
     """
     gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        raise RuntimeError(f"pa_sparse_prefill_fp8_opus requires gfx950, got {gfx}")
+    if gfx not in ("gfx950", "gfx1250"):
+        raise RuntimeError(
+            f"pa_sparse_prefill_fp8_opus requires gfx950 or gfx1250, got {gfx}"
+        )
 
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(
@@ -245,7 +247,20 @@ def pa_sparse_prefill_fp8_opus(
             f"expected shape={(t, h, 512)} dtype={torch.bfloat16}"
         )
 
-    pa_sparse_prefill_fp8_opus_fwd(
+    # gfx950 uses the in-file MFMA kernel; gfx1250 dispatches to the separate
+    # wave32/WMMA module. Lazy JIT means only the invoked module is ever built
+    # for the running arch (the gfx950 kernel never compiles on gfx1250 and vice
+    # versa).
+    if gfx == "gfx1250":
+        from .pa_sparse_prefill_fp8_opus_gfx1250 import (
+            pa_sparse_prefill_fp8_opus_gfx1250_fwd,
+        )
+
+        fwd = pa_sparse_prefill_fp8_opus_gfx1250_fwd
+    else:
+        fwd = pa_sparse_prefill_fp8_opus_fwd
+
+    fwd(
         q_nope,
         q_rope,
         unified_kv_nope,

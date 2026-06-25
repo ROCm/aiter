@@ -94,12 +94,16 @@ def _get_gpu_arch() -> Optional[str]:
     return None
 
 
-def _skip_if_unsupported(d: int) -> bool:
+def _skip_if_unsupported(d: int, prec: str = "fp8") -> bool:
     if not torch.cuda.is_available():
         return _skip("CUDA/HIP device not available")
     arch = _get_gpu_arch()
-    if arch != "gfx950":
-        return _skip(f"pa_sparse_prefill_opus requires gfx950, found {arch}")
+    if arch not in ("gfx950", "gfx1250"):
+        return _skip(f"pa_sparse_prefill_opus requires gfx950/gfx1250, found {arch}")
+    # Only the split-precision fp8 variant is ported to gfx1250 (wave32/WMMA);
+    # the bf16/fp16 single-tensor kernel is gfx950-only.
+    if arch == "gfx1250" and prec != "fp8":
+        return _skip(f"gfx1250 only supports the fp8 variant, not {prec}")
     if d != 512:
         return _skip(f"Only D=512 is compiled, requested D={d}")
     return False
@@ -541,7 +545,7 @@ def run_pa_sparse_prefill_opus(
     bench: bool = True,
 ) -> Optional[dict]:
     assert prec in _PRECS, f"unknown prec {prec!r}"
-    if _skip_if_unsupported(d=d):
+    if _skip_if_unsupported(d=d, prec=prec):
         return None
 
     softmax_scale = 1.0 / math.sqrt(d)
