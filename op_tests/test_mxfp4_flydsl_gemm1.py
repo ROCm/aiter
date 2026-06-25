@@ -4,24 +4,18 @@ import torch
 
 
 def test_port_module_imports_and_constants():
-    """Port module imports cleanly and exposes the compile fn / grid + the *_for
-    helpers that derive the Kimi sizes (NE/K/INTER/TOPK/BN/BK are compile args now)."""
     from aiter.ops.flydsl.kernels import mxfp4_gemm1 as port
 
     assert callable(port.compile_gemm1_a4w4_port)
     assert callable(port.gemm1_grid)
-    # KIMI: INTER=512 -> N_OUT=1024, num_n_blocks=4 (BN=256); K=7168 -> 28 K-tiles.
     assert port.n_out_for(512) == 1024
     assert port.num_n_blocks_for(512, 256) == 4
     assert port.k_tiles_total_for(7168, 256) == 28
 
 
 def test_guard_accepts_non_kimi_ne_inter_topk():
-    """OUTPUT side (NE/INTER/TOPK) is now parametrized: non-KIMI but
-    divisibility-legal shapes (e.g. minimax NE=256/INTER=768/TOPK=8) are accepted."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
-    # minimax: NE=256, H=3072, INTER=768, TOPK=8 (2*768=1536 % 256 == 0).
     _assert_supported(
         NE=256,
         D_HIDDEN=3072,
@@ -31,7 +25,6 @@ def test_guard_accepts_non_kimi_ne_inter_topk():
         use_nt=True,
         inline_quant=False,
     )
-    # arbitrary NE / TOPK are fine as long as divisibility holds.
     _assert_supported(
         NE=257,
         D_HIDDEN=7168,
@@ -44,14 +37,13 @@ def test_guard_accepts_non_kimi_ne_inter_topk():
 
 
 def test_guard_rejects_bad_inter():
-    """2*D_INTER (= N_OUT) must be a multiple of 256 (i.e. D_INTER % 128 == 0)."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     with pytest.raises(NotImplementedError, match="N_OUT|D_INTER"):
         _assert_supported(
             NE=385,
             D_HIDDEN=7168,
-            D_INTER=500,  # 2*500=1000, not a multiple of 256
+            D_INTER=500,
             topk=9,
             BM=32,
             use_nt=True,
@@ -60,7 +52,6 @@ def test_guard_rejects_bad_inter():
 
 
 def test_guard_rejects_non_256_multiple_k():
-    """K (= D_HIDDEN) must be a multiple of 256; otherwise the guard rejects it."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     with pytest.raises(NotImplementedError, match="256"):
@@ -76,7 +67,6 @@ def test_guard_rejects_non_256_multiple_k():
 
 
 def test_guard_accepts_parametrized_k():
-    """Non-7168 K values that are multiples of 256 are accepted (parametrized K)."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     for H in (3072, 4096, 7168):
@@ -92,7 +82,6 @@ def test_guard_accepts_parametrized_k():
 
 
 def test_guard_rejects_bad_variant():
-    """An unsupported variant fails loud."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     with pytest.raises(NotImplementedError, match="variant"):
@@ -108,7 +97,6 @@ def test_guard_rejects_bad_variant():
 
 
 def test_guard_accepts_supported():
-    """Kimi shape + supported (BM, nt, inline_quant) combos pass the guard."""
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     for BM, nt, iq in [
@@ -152,8 +140,6 @@ def _build_kimi_mx(device, M, seed=2, H=7168):
     from aiter import QuantType, dtypes
     from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
-    # NE/INTER/TOPK stay at the KIMI values; H (= D_HIDDEN, the gemm1 contraction
-    # dim K) is parametrized to exercise the K-parametrized FlyDSL gemm1 port.
     NE, INTER, TOPK = 385, 512, 9
     torch.manual_seed(seed)
     tq = aiter.get_torch_quant(QuantType.per_1x32)
@@ -217,13 +203,6 @@ def test_flydsl_gemm1_matches_hip_end_to_end(M):
 @_GFX950
 @pytest.mark.parametrize("H", [3072, 4096])
 def test_flydsl_gemm1_parametrized_k_compiles(H):
-    """K-parametrization: every supported variant must COMPILE for a non-7168 H.
-
-    The full fused_moe end-to-end path can't drive a non-KIMI H (the tuned CSV has
-    no mxfp4 pipeline row for model_dim!=7168, so fused_moe rejects the weight before
-    gemm1), and the HIP gemm1/quant/sort_scales reference kernels are hard-templated
-    to H=7168 -- so end-to-end / HIP-reference comparison is impossible for new H.
-    Compile coverage + the standalone numeric test below are the achievable checks."""
     from aiter.ops.flydsl.kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
     assert H % 256 == 0
@@ -249,13 +228,11 @@ def test_flydsl_gemm1_parametrized_k_compiles(H):
 @pytest.mark.parametrize(
     "NE,H,INTER,TOPK",
     [
-        (385, 7168, 512, 9),  # KIMI (sanity: still compiles all 4 variants)
-        (256, 3072, 768, 8),  # minimax: non-KIMI NE/INTER/TOPK + parametrized K
+        (385, 7168, 512, 9),
+        (256, 3072, 768, 8),
     ],
 )
 def test_flydsl_gemm1_parametrized_shape_compiles(NE, H, INTER, TOPK):
-    """INTER/NE/TOPK-parametrization: every supported variant must COMPILE for a
-    non-KIMI OUTPUT shape (minimax NE=256/H=3072/INTER=768/TOPK=8)."""
     from aiter.ops.flydsl.kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
     assert (2 * INTER) % 256 == 0 and H % 256 == 0
@@ -278,14 +255,9 @@ def test_flydsl_gemm1_parametrized_shape_compiles(NE, H, INTER, TOPK):
 
 
 def _torch_threestage_sort(topk_ids, topk_weight, M, NE, TOPK, BM, max_sorted):
-    """Torch replica of moe_3stage_sort.cuh (stable expert-grouped sort, each
-    expert region padded up to a multiple of BM). The HIP threestage sort is
-    hard-templated to KIMI (NE=385/TOPK=9) only, so non-KIMI shapes need this to
-    build the gemm1 inputs. Validated against the HIP sort at the KIMI shape (same
-    sti/sei/cumsum/m_indices). Returns (sti, sei, cumsum, mind)."""
     device = topk_ids.device
-    flat_e = topk_ids.reshape(-1)  # (M*TOPK,) expert per (token,topk) pair, row-major
-    counts = torch.bincount(flat_e, minlength=NE)  # tokens per expert
+    flat_e = topk_ids.reshape(-1)
+    counts = torch.bincount(flat_e, minlength=NE)
     padded = ((counts + BM - 1) // BM) * BM
     starts = torch.zeros(NE + 1, dtype=torch.int64, device=device)
     starts[1:] = torch.cumsum(padded, 0)
@@ -297,14 +269,12 @@ def _torch_threestage_sort(topk_ids, topk_weight, M, NE, TOPK, BM, max_sorted):
     cumsum = torch.tensor([total], dtype=torch.int32, device=device)
     sei = torch.zeros(max_sorted // BM, dtype=torch.int32, device=device)
 
-    # sorted_expert_ids per BM-block (mirror sort_cumsum: blocks in [start/BM, end/BM)).
     for e in range(NE):
         b0 = int(starts[e].item()) // BM
         b1 = int(starts[e + 1].item()) // BM
         sei[b0:b1] = e
 
-    # stable placement: iterate pairs in linear order, append into each expert's run.
-    fill = starts[:NE].clone()  # next write position per expert
+    fill = starts[:NE].clone()
     flat_e_c = flat_e.cpu().tolist()
     fill_c = fill.cpu().tolist()
     sti_c = sti.cpu()
@@ -322,9 +292,6 @@ def _torch_threestage_sort(topk_ids, topk_weight, M, NE, TOPK, BM, max_sorted):
 
 
 def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=256):
-    """Reconstruct a_scale_sorted_shuffled exactly as moe_sort_scales.cuh does, in
-    torch (the HIP kernel is H-locked to 7168). Validated bit-for-bit at H=7168:
-    feeding this reconstruction to gemm1 reproduces the HIP-prologue result."""
     device = asc.device
     H // 32
     MN_PACK = 2
@@ -371,22 +338,13 @@ def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
 @pytest.mark.parametrize(
     "NE,H,INTER,TOPK",
     [
-        (385, 7168, 512, 9),  # KIMI (known-good; ~0.88 fp4-output-quant ceiling)
-        (385, 3072, 512, 9),  # parametrized K only
-        (385, 4096, 512, 9),  # parametrized K only
-        (256, 3072, 768, 8),  # minimax: parametrized INTER/NE/TOPK + K
+        (385, 7168, 512, 9),
+        (385, 3072, 512, 9),
+        (385, 4096, 512, 9),
+        (256, 3072, 768, 8),
     ],
 )
 def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK):
-    """Standalone numeric check of the parametrized gemm1 (BM32 non-inline).
-
-    Uses the (shape-independent) threestage sort + torch per_1x32 A-quant + a torch
-    reconstruction of a_scale_sorted_shuffled (the HIP quant/sort_scales kernels are
-    H-locked). Compares each sorted output row (dequantized fp4) against a torch
-    silu_mul reference on the SAME dequantized A/w1. The ~0.88 mean-row-cosine
-    ceiling is the per-row fp4 OUTPUT-quant error, not a kernel defect: KIMI
-    (the known-good shape) scores the same, so a comparable score at a new
-    (NE,H,INTER,TOPK) validates the parametrized N/contraction handling."""
     import aiter
     from aiter import QuantType, dtypes
     from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
@@ -429,11 +387,7 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK):
 
     active = min(NE, M * topk)
     max_sorted = ((M * topk + active * (BM - 1) + BM - 1) // BM) * BM
-    # The HIP threestage sort is hard-templated to KIMI (NE=385/TOPK=9). For other
-    # shapes use the torch replica (validated vs HIP at the KIMI shape: identical
-    # sti/sei/cumsum/m_indices). Both produce the exact layout gemm1 consumes.
     if (NE, topk) == (385, 9):
-
         def eb():
             return torch.empty((0,), device=device, dtype=dtypes.bf16)
 
@@ -530,7 +484,6 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK):
         f"[gemm1 numeric] NE={NE} H={H} INTER={INTER} TOPK={TOPK} "
         f"mean_row_cos={mean_cos:.4f} (cnt={cnt})"
     )
-    # 0.85 floor: the fp4 output-quant ceiling (~0.88) holds for KIMI too.
     assert mean_cos > 0.85, (
         f"NE={NE} H={H} INTER={INTER} TOPK={TOPK} "
         f"mean_row_cos={mean_cos:.4f} (cnt={cnt})"
