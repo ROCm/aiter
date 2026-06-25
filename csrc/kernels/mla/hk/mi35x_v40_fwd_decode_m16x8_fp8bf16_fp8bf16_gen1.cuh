@@ -713,49 +713,78 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             {
                 constexpr uint32_t kBK             = T::kBlockK;
                 constexpr uint32_t kNumColTilesAll = T::kQkHeadDim / T::kBlockK; // 16
-                // Q-from-LDS scratch tile (used by the else branch when some
-                // col-tiles still source from LDS). At kQkGemmTiles==16 EVERY
-                // col-tile is in VGPR so the else branch is dead (dependent-
-                // discarded, never instantiated) and this art is unused -- base
-                // it at k_q_vgpr_begin then so it can't alias oaccu (the natural
-                // k_q_lds_begin==128 would).
-                constexpr uint32_t q_lds_art_base =
-                    (kQkGemmTiles < kNumColTilesAll) ? k_q_lds_begin : k_q_vgpr_begin;
-                using q_lds_range_0 = hkdart::split_many_t<
-                    hkdart::type_list<hkdart::range<q_lds_art_base, q_lds_art_base + 3u>>, 4>;
-                hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_lds_range_0>
-                    q_lds_0;
+                // All 16 col-tiles of Q are in VGPR (kQkGemmTiles==16), so every
+                // QK A-operand is read straight from the pinned q_vgpr block and
+                // lgkmcnt counts ONLY the K ds_reads below.
+                static_assert(kQkGemmTiles == kNumColTilesAll,
+                              "QK loop assumes all col-tiles in VGPR (kQkGemmTiles==16).");
 
-                opus::static_for<kNumColTilesAll>([&](auto g_) {
-                    constexpr uint32_t gct = g_.value;
-                    kv_manager.template load_k_to_gpr<0u, gct * kBK>(k_0, p_lds_kv_curr);
-                    kv_manager.template load_k_to_gpr<16u, gct * kBK>(k_1, p_lds_kv_curr);
-                    if constexpr(gct < kQkGemmTiles)
+                // 3-deep software-pipelined QK over the 32 K sub-tiles (16
+                // col-tiles x {lo rows 0:16, hi rows 16:32}). Sub-tile S -> col
+                // c=S/2, half h=S%2: ds_read_b128 K into a 3-slot ring
+                // (k_0/k_1/k_2), then mma into p_comp_lo (h=0) / p_comp_hi (h=1)
+                // against q_vgpr[c]. Preload 3 ds_reads, then wait only down to
+                // lgkmcnt(2) so 2 reads stay in flight under each mma -- hides LDS
+                // latency vs the old wait(0)-per-pair (zero overlap). 3 slots fit
+                // the existing pinned K region (v44:55); no register-map change.
+                constexpr uint32_t kNumSub = 2u * kNumColTilesAll; // 32
+                constexpr uint32_t kDepth  = 3u;
+
+                auto k_ring_base = [](uint32_t s) constexpr -> uint32_t {
+                    return (s % 3u == 0u) ? R::k_k0_begin
+                           : (s % 3u == 1u) ? R::k_k1_begin
+                                            : R::k_k2_begin;
+                };
+                auto issue_k = [&]<uint32_t S>() {
+                    constexpr uint32_t c    = S / 2u;
+                    constexpr uint32_t h    = S % 2u;
+                    constexpr uint32_t base = k_ring_base(S);
+                    using kr = hkdart::split_many_t<
+                        hkdart::type_list<hkdart::range<base, base + 3u>>, 4>;
+                    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kr> kt;
+                    kv_manager.template load_k_to_gpr<h * 16u, c * kBK>(kt, p_lds_kv_curr);
+                };
+                auto mma_k = [&]<uint32_t S>() {
+                    constexpr uint32_t c    = S / 2u;
+                    constexpr uint32_t h    = S % 2u;
+                    constexpr uint32_t base = k_ring_base(S);
+                    using kr = hkdart::split_many_t<
+                        hkdart::type_list<hkdart::range<base, base + 3u>>, 4>;
+                    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kr> kt;
+                    constexpr uint32_t qb = k_q_vgpr_begin + c * 4u;
+                    using qr = hkdart::split_many_t<
+                        hkdart::type_list<hkdart::range<qb, qb + 3u>>, 4>;
+                    hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, qr> qt;
+                    if constexpr(S < 2u) // first touch of p_comp_{lo,hi} -> init (3-arg)
                     {
-                        constexpr uint32_t q_base = k_q_vgpr_begin + gct * 4u;
-                        using q_range = hkdart::split_many_t<
-                            hkdart::type_list<hkdart::range<q_base, q_base + 3u>>, 4>;
-                        hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range>
-                            q_tile;
-                        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, -1));
-                        if constexpr(gct == 0u)
-                        {
-                            hk::mma_ABt(p_comp_lo, k_0, q_tile);
-                            hk::mma_ABt(p_comp_hi, k_1, q_tile);
-                        }
+                        if constexpr(h == 0u)
+                            hk::mma_ABt(p_comp_lo, kt, qt);
                         else
-                        {
-                            hk::mma_ABt(p_comp_lo, k_0, q_tile, p_comp_lo);
-                            hk::mma_ABt(p_comp_hi, k_1, q_tile, p_comp_hi);
-                        }
+                            hk::mma_ABt(p_comp_hi, kt, qt);
                     }
                     else
                     {
-                        q_manager.template load_q_lds_to_gpr<gct - 8u>(q_lds_0, p_lds_q, warp_idx);
-                        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, -1));
-                        hk::mma_ABt(p_comp_lo, k_0, q_lds_0, p_comp_lo);
-                        hk::mma_ABt(p_comp_hi, k_1, q_lds_0, p_comp_hi);
+                        if constexpr(h == 0u)
+                            hk::mma_ABt(p_comp_lo, kt, qt, p_comp_lo);
+                        else
+                            hk::mma_ABt(p_comp_hi, kt, qt, p_comp_hi);
                     }
+                };
+
+                // Prologue: preload kDepth ds_reads.
+                opus::static_for<kDepth>(
+                    [&](auto p_) { issue_k.template operator()<p_.value>(); });
+                // Steady + drain: wait until sub-tile S is the oldest still queued
+                // (lgkmcnt = min(reads-behind-S, kDepth-1)), mma it, then refill
+                // its slot with S+kDepth.
+                opus::static_for<kNumSub>([&](auto s_) {
+                    constexpr uint32_t S    = s_.value;
+                    constexpr uint32_t tail = kNumSub - 1u - S;
+                    constexpr uint32_t w    = (tail < kDepth - 1u) ? tail : (kDepth - 1u);
+                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/w, -1));
+                    mma_k.template operator()<S>();
+                    if constexpr(S + kDepth < kNumSub)
+                        issue_k.template operator()<S + kDepth>();
                 });
             }
 
