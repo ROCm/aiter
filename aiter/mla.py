@@ -21,8 +21,7 @@ def _flydsl_mla_reduce_enabled() -> bool:
     """Opt-in gate for the FlyDSL MLA reduce fallback.
 
     Default behavior is unchanged: production calls the HIP ``aiter.mla_reduce_v1``.
-    Set ``AITER_MLA_REDUCE_FLYDSL=1`` to route through the FlyDSL port instead
-    (a native grid-launch reduce that hits HBM parity with the HIP kernel).
+    Set ``AITER_MLA_REDUCE_FLYDSL=1`` to route through the FlyDSL port instead.
     Falls back silently to HIP if FlyDSL is not installed/compatible.
     """
     try:

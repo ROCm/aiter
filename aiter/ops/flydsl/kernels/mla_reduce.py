@@ -8,9 +8,6 @@ Faithful port of the HIP kernel ``kn_mla_reduce_v1`` / ``kn_mla_reduce_v1_ps``
 partial outputs ``O_i`` (fp32) weighted by ``exp(LSE_i - LSE_max)`` (online softmax)
 into the final output (bf16/fp16), and optionally the merged LSE.
 
-This is a pure reduction (no MFMA), HBM-bandwidth bound. See the design dissection
-docs for the algorithm and the build/verify plan.
-
 Layout / contract (matches the HIP kernel):
   partial_output : fp32 [max_partial_row, H, Dv]  contiguous
   partial_lse    : fp32 [max_partial_row, H]       contiguous
@@ -264,7 +261,9 @@ def compile_mla_reduce(
             if fx.const_expr(output_lse):
                 bad = fx.arith.ori(
                     fx.arith.cmpf(
-                        fx.arith.CmpFPredicate.OEQ, sum_e, fx.arith.constant(0.0, type=T.f32)
+                        fx.arith.CmpFPredicate.OEQ,
+                        sum_e,
+                        fx.arith.constant(0.0, type=T.f32),
                     ),
                     fx.arith.cmpf(fx.arith.CmpFPredicate.UNO, sum_e, sum_e),
                 )
@@ -385,7 +384,9 @@ def compile_mla_reduce(
                             lds_scale[fx.Index(split_idx)] = sc
                             scf.YieldOp([])
                     if fx.const_expr(output_lse):
-                        is_l0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, lane, fx.Int32(0))
+                        is_l0 = fx.arith.cmpi(
+                            fx.arith.CmpIPredicate.eq, lane, fx.Int32(0)
+                        )
                         if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
                         with ir.InsertionPoint(if_l0.then_block):
                             lse_off = fx.Int32(seq) * fx.Int32(H) + fx.Int32(head)

@@ -13,7 +13,7 @@ from the observed ``num_splits`` (``select_tier``) and launches one workgroup pe
 
 This is an OPT-IN fallback. Production code (``aiter/mla.py``) keeps calling the
 HIP ``aiter.mla_reduce_v1`` by default; set ``AITER_MLA_REDUCE_FLYDSL=1`` to route
-through this wrapper instead. See mla-reduce-docs/ for the design comparison.
+through this wrapper instead.
 """
 
 from __future__ import annotations
