@@ -150,7 +150,7 @@ def _moe_gemm_a8w4_decode(
     SWIZZLE_MX_SCALE: gl.constexpr,
     X_SCALE_TDM: gl.constexpr,
     PRESHUFFLED: gl.constexpr,
-    MASK_K_LIMIT: gl.constexpr,
+    CLAMP_BOUNDS: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
@@ -159,15 +159,10 @@ def _moe_gemm_a8w4_decode(
     is_x_microscaled: gl.constexpr = XMxScale is not None
     MX_PACK_DIVISOR: gl.constexpr = 32
 
-    EVEN_K: gl.constexpr = MASK_K_LIMIT == 0
-    CLAMP_BOUNDS: gl.constexpr = False if EVEN_K else True
-
-    if GatherIndx is None:
-        NUM_TDM_OPS: gl.constexpr = 1  # async_loads fuse into 1 TDM op
-    elif X_SCALE_TDM:
-        NUM_TDM_OPS: gl.constexpr = 5  # x + x_scales int16 TDM gathers
+    if is_x_microscaled and X_SCALE_TDM:
+        NUM_TDM_OPS: gl.constexpr = 4
     else:
-        NUM_TDM_OPS: gl.constexpr = 3  # x_scales use async_copy
+        NUM_TDM_OPS: gl.constexpr = 3
     w_type: gl.constexpr = W.dtype.element_ty
     gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8 or fp8")
     gl.static_assert(
@@ -763,7 +758,7 @@ def _moe_gemm_a8w4_prefill(
     SWIZZLE_MX_SCALE: gl.constexpr,
     X_SCALE_TDM: gl.constexpr,
     PRESHUFFLED: gl.constexpr,
-    MASK_K_LIMIT: gl.constexpr,
+    CLAMP_BOUNDS: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
@@ -772,15 +767,12 @@ def _moe_gemm_a8w4_prefill(
     is_x_microscaled: gl.constexpr = XMxScale is not None
     MX_PACK_DIVISOR: gl.constexpr = 32
 
-    EVEN_K: gl.constexpr = MASK_K_LIMIT == 0
-    CLAMP_BOUNDS: gl.constexpr = False if EVEN_K else True
-
-    if GatherIndx is None:
-        NUM_TDM_OPS: gl.constexpr = 1  # async_loads fuse into 1 TDM op
-    elif X_SCALE_TDM:
-        NUM_TDM_OPS: gl.constexpr = 5  # x + x_scales int16 TDM gathers
+    if is_x_microscaled and X_SCALE_TDM:
+        # w + w_scales + x + x_scales, all via TDM
+        NUM_TDM_OPS: gl.constexpr = 4
     else:
-        NUM_TDM_OPS: gl.constexpr = 3  # x_scales use async_copy
+        # w + w_scales + x; x_scales absent or loaded via async_copy
+        NUM_TDM_OPS: gl.constexpr = 3
     w_type: gl.constexpr = W.dtype.element_ty
     gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8 or fp8")
     gl.static_assert(
