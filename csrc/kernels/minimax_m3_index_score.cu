@@ -18,7 +18,7 @@ namespace minimax_m3_index_score_ops {
 
 constexpr int kHeadDim = 128;
 constexpr int kNumLanes = 32;
-constexpr int kNumWaves = 4;
+constexpr int kNumWaves = 8;
 constexpr int kElemsPerLane = kHeadDim / kNumLanes;
 
 __device__ __forceinline__ float warpReduceSum(float val)
@@ -113,34 +113,41 @@ __global__ void decodeIndexScoreKernel(
     {
         const bool is_init = blk < init_blocks;
         const bool is_local = blk >= local_start && blk < num_blocks;
+        if(is_init || is_local)
+        {
+            if(threadIdx.x == 0)
+            {
+                score[pid_h * stride_s_h + pid_t * stride_s_n + blk * stride_s_k] =
+                    is_local ? 1.0e29f : 1.0e30f;
+            }
+            continue;
+        }
+
         float wave_score = -INFINITY;
 
-        if(!(is_init || is_local))
-        {
-            const int64_t page = static_cast<int64_t>(bt_row[blk]);
-            const scalar_t* __restrict__ k_blk =
-                index_kv_cache + page * stride_k_blk + dim0 * stride_k_d;
+        const int64_t page = static_cast<int64_t>(bt_row[blk]);
+        const scalar_t* __restrict__ k_blk =
+            index_kv_cache + page * stride_k_blk + dim0 * stride_k_d;
 
-            for(int64_t off = wave; off < block_size; off += kNumWaves)
+        for(int64_t off = wave; off < block_size; off += kNumWaves)
+        {
+            const int64_t pos = blk * block_size + off;
+            if(pos >= causal_len)
             {
-                const int64_t pos = blk * block_size + off;
-                if(pos >= causal_len)
-                {
-                    break;
-                }
-                float k_vals[kElemsPerLane];
-                load4Vec(k_blk + off * stride_k_pos, k_vals);
-                float dot = 0.0f;
+                break;
+            }
+            float k_vals[kElemsPerLane];
+            load4Vec(k_blk + off * stride_k_pos, k_vals);
+            float dot = 0.0f;
 #pragma unroll
-                for(int i = 0; i < kElemsPerLane; ++i)
-                {
-                    dot += q_vals[i] * k_vals[i];
-                }
-                dot = warpReduceSum(dot) * sm_scale_log2e;
-                if(lane == 0)
-                {
-                    wave_score = fmaxf(wave_score, dot);
-                }
+            for(int i = 0; i < kElemsPerLane; ++i)
+            {
+                dot += q_vals[i] * k_vals[i];
+            }
+            dot = warpReduceSum(dot) * sm_scale_log2e;
+            if(lane == 0)
+            {
+                wave_score = fmaxf(wave_score, dot);
             }
         }
 
@@ -158,8 +165,7 @@ __global__ void decodeIndexScoreKernel(
             {
                 block_score = fmaxf(block_score, wave_scores[i]);
             }
-            const float forced_score = is_local ? 1.0e29f : (is_init ? 1.0e30f : block_score);
-            score[pid_h * stride_s_h + pid_t * stride_s_n + blk * stride_s_k] = forced_score;
+            score[pid_h * stride_s_h + pid_t * stride_s_n + blk * stride_s_k] = block_score;
         }
         __syncthreads();
     }
