@@ -6,7 +6,9 @@ once kernels or shapes change. Mark superseded results ~~struck~~ or move them t
 "Archived". Date = day the data was collected.
 
 Kernels under study: `aiter/aiter/ops/flydsl/kernels/jagged_dense_bmm_bwd.py`
-(`grad_jagged`, `grad_dense` = partials+reduce, `grad_bias` = partials+reduce).
+(`grad_jagged` = GEMM; `grad_dense_bias` = one fused MFMA partials pass writing both
+dDense and dBias partials + two reduce passes — see EXP-2026-06-25a; `grad_dense`/
+`grad_bias` were separate before Phase 4).
 Backward math/plan: `docs/2026-06-18_backward_bmm.md`.
 
 ---
@@ -69,8 +71,9 @@ bash aiter/aiter/ops/flydsl/kernels/profile_roofline.sh --only all -b 64 -m 512
 # full counters (~13 passes) for the detailed report:
 bash aiter/aiter/ops/flydsl/kernels/profile_roofline.sh --only all --full \
   -b 64 -m 512 --iters 10 --warmup 3 --name bwd_full_all
-# per-kernel report (kernel ids: 0=dense_partials 1=bias_partials 2=jagged
-#                                 3=dense_reduce 5=bias_reduce):
+# per-kernel report (kernel ids shift after Phase 4 dropped grad_bias_partials;
+#  now: grad_dense_partials [fused dDense+dBias], grad_jagged, grad_dense_reduce,
+#  grad_bias_reduce — confirm ids with `analyze --list-kernels`):
 rocprof_venv/bin/python /opt/rocm/libexec/rocprofiler-compute/rocprof-compute \
   analyze -p workloads/bwd_full_all -k 0 --kernel-verbose 1
 # roofline table + PNG:
@@ -462,6 +465,91 @@ headroom (still ~44% of MFMA roofline) would need bigger structural changes
 (merge the two K-column output tiles to reuse the shared dOut A-fragment; vectorize
 staging) — diminishing returns vs the `dense_bias`-skew deficit (see Backlog).
 
+## EXP-2026-06-25a — Phase 4: fuse dBias into the dDense partials pass (B=1024, D=256, Mi=7680)
+
+**Scope.** Phase 4 at the *fully-specified* North Star. `dDense[b][k,n]=Σ_m J[m,k]·dOut[m,n]`
+and `dBias[b][n]=Σ_m dOut[m,n]` both reduce over the dynamic sequence axis `m`, and the
+dDense partials kernel already streams **every** dOut element through LDS. Before Phase 4,
+`grad_bias` was an independent two-pass kernel that **re-read all of dOut from HBM** purely
+to sum it — pure memory traffic with no reuse of the dDense pass.
+
+**Profiled motivation (pre-Phase-4 breakdown, profile `--mode bench`, `dense_bias` split
+into `ddense` vs `dbias`):**
+| regime | ddense (partials+reduce) | dbias (partials+reduce) | dbias share | dbias BW / AI |
+|---|--:|--:|--:|--:|
+| uniform | 5265 µs | **1721 µs** | **25%** | 2344 GB/s · AI 0.50 |
+| skew | 1366 µs | **754 µs** | **36%** | 828 GB/s · AI 0.49 |
+
+`dbias` is almost entirely the `grad_bias_partials` re-read of dOut (`L·N·2` ≈ 4.0 GB uniform;
+the reduce is a few µs). This is exactly the standing North-Star deficit (`dense_bias` skew,
+EXP-2026-06-24a) — skew spends an even larger fraction in the bias re-read.
+
+**Change.** Folded the dBias column-sums into `grad_dense_partials_kernel` and dropped
+`grad_bias_partials_kernel` entirely; the launcher is now a single fused `grad_dense_bias`
+(one MFMA partials pass + `grad_dense_reduce` + `grad_bias_reduce`), **4 launches → 3**.
+- In the dOut global→LDS transpose-staging the kernel already loads, each thread sums the
+  dOut elements it loads into one fp32 register carried as a loop iter_arg (the tail rows
+  beyond `M_b` zero-fill via the bounded descriptor, so they add 0). In that staging map
+  thread `tid` always owns output column `n = tid % DDENSE_BN` and each column is co-owned
+  by `DDENSE_THREADS/DDENSE_BN = 2` threads, so the per-thread partials are combined once
+  through LDS at the end (reusing the now-dead sJ/sD staging region as fp32 scratch — **no
+  extra smem, occupancy unchanged at 32 KB/WG**). Only the k-tile-0 workgroups (`k_off==0`)
+  emit a column's bias partial, so each N-tile is written exactly once regardless of K-tiling.
+- `dBias` partials scratch layout `(n_groups*SPLIT, N)` and `grad_bias_reduce_kernel` are
+  unchanged; the split-`s` partition of rows over the m-tile loop differs from the old
+  row-strided one but the per-(group) sum over all SPLIT partials is identical.
+
+### `dense_bias` results (do_bench wall-clock; TF/s = 2·L·D·N / t)
+| regime | T-1 (Phase-3 tree) | T (Phase-4 fused) | speedup | profile µs (was→now) |
+|---|--:|--:|--:|--:|
+| **uniform** | 6.94 ms / 148.6 TF/s | **5.52 ms / 186.7 TF/s** | **1.26×** | 6986 → **5592** (−20%) |
+| **skew** | 2.10 ms / 74.9 TF/s | **1.45 ms / 108.5 TF/s** | **1.45×** | 2120 → **1455** (−31%) |
+
+The fused partials pass costs only **+327 µs uniform / +89 µs skew** (the bias adds + the
+one LDS combine) while removing the **1721 µs / 754 µs** dOut re-read — a net 1.25–1.46×.
+
+### Head-to-head vs Triton (same run, `-test` cos=1.0000 both regimes)
+| regime | FlyDSL (was→now) | Triton | result |
+|---|--:|--:|---|
+| uniform | 6.94 → **5.54 ms** | 7.76 ms | **FlyDSL 1.40×** (was 1.26×) |
+| skew | 2.24 → **~1.45 ms** | ~1.41 ms | **near-tie** (Triton ~1.03×, was Triton **1.45×**) |
+
+(Skew is stable across 3 samples: FlyDSL 1.450–1.468 ms vs Triton 1.402–1.433 ms. The one
+North-Star case FlyDSL was *losing* by 1.45× is now within ~3% of Triton — effectively closed.
+Triton's own `dense_bias` numbers here (uniform 7.76, skew ~1.42) differ a little from
+EXP-2026-06-24a's 8.76/1.56 — run-to-run / machine-state variance — so the headline is the
+same-run delta, not the cross-session absolute.)
+
+### Gate: **PASS — fewer launches (4→3), no regression, correctness green.**
+- **Correctness** cosine 0.999999 (example) / 1.0000 (bench `-test`) at **D=128 and D=256,
+  uniform + skew** (empty/short skew groups → exact-0 bias via the never-entered m-loop).
+- **dense_bias** 1.26×/1.45× end-to-end vs the Phase-3 tree; **uniform 1.40× vs Triton**,
+  **skew now a near-tie** (the standing deficit). `grad_jagged` untouched.
+- Kernel is still HBM-bound (uniform 1850 GB/s on the combined traffic; the fused pass trades
+  a separate 2.3 TB/s dOut streaming pass for ~0 extra reads). Remaining `dense_bias` headroom
+  is the fp32 partials round-trip through HBM (the `grad_dense_reduce` 1 GB read/write tail),
+  now the dominant non-GEMM cost → a length-aware / smaller-`SPLIT` reduce is the next lever
+  (Backlog), not the bias.
+
+(Repo default restored to **D=128** after the session; `K=N` was temporarily 256 in
+`jagged_dense_bmm.py` for the North-Star measurement, same temp-edit practice as prior EXP
+blocks. The forward kernel's int64 `a_row_off/c_row_off` guard from EXP-2026-06-24a remains
+in the working tree.)
+
+## Current status (2026-06-25)
+
+**Phase 4 done (EXP-2026-06-25a): dBias fused into the dDense partials pass.** The separate
+`grad_bias_partials` kernel (a full HBM re-read of dOut) is gone; a single `grad_dense_bias`
+launcher now runs one bf16-MFMA partials pass — writing **both** the fp32 dDense and dBias
+partials by summing the dOut it already streams — plus two light reduce passes (**4 launches
+→ 3**). **`dense_bias` 1.26× (uniform) / 1.45× (skew)** vs the Phase-3 build; vs Triton this is
+now **1.40× uniform** and a **near-tie on skew** (~1.03× Triton), closing the one North-Star
+case FlyDSL was losing (was Triton 1.45×, EXP-2026-06-24a). Correctness green at D=128 + D=256,
+uniform + skew. The new dominant non-GEMM cost is the `grad_dense_reduce` fp32 partials
+round-trip (≈1 GB). **Next: Phase 5** (autotune `SPLIT` / a length-aware reduce to cut the
+partials tail — also the remaining `dense_bias`-skew lever in the Backlog — then example timing
++ style gate). (`K=N` restored to 128; D=256 is the measurement North Star.)
+
 ## Current status (2026-06-24)
 
 Phase 3 done (EXP-2026-06-24b): `grad_jagged` M-coarsening (`COARSEN_M=2`) →
@@ -578,7 +666,15 @@ Baseline to beat (EXP-2026-06-22a, b64/m512/uniform): `grad_dense_partials`
 - **Do:** fold bias partial-sums into the dDense partials kernel; revisit a
   2-level reduction tree if `SPLIT` grew in Phase 1b.
 - **Gate:** fewer kernels/launches, no regression; correctness holds.
-- [ ] fuse bias  [ ] reduce tree (if needed)  [ ] re-profile + EXP block
+- [x] fuse bias  [x] reduce tree (not needed — `SPLIT` stayed 4)  [x] re-profile + EXP
+  block (EXP-2026-06-25a). **Result: GATE PASS.** dBias column-sums folded into
+  `grad_dense_partials_kernel` (each thread sums the dOut it already stages; per-thread
+  column partials combined once through LDS, k-tile-0 WGs only); `grad_bias_partials`
+  removed; single fused `grad_dense_bias` launcher (**4→3 launches**). **dense_bias
+  1.26× uniform / 1.45× skew** vs the Phase-3 build; **1.40× vs Triton uniform** and a
+  **near-tie on skew** (closes the EXP-2026-06-24a deficit). Correctness cos 0.999999 at
+  D=128 + D=256, uniform + skew. New dominant tail = the `grad_dense_reduce` fp32
+  partials round-trip → Phase 5 / Backlog.
 
 ### Phase 5 — Autotune & integrate
 - **Do:** autotune `SPLIT` / block sizes over the seq-length distribution; wire a
@@ -588,19 +684,17 @@ Baseline to beat (EXP-2026-06-22a, b64/m512/uniform): `grad_dense_partials`
 - [ ] autotune  [ ] example timing  [ ] style gate
 
 ## Backlog (not yet scheduled)
-- **`dense_bias` under skew is the one North-Star case we lose to Triton (Triton
-  1.45× faster — EXP-2026-06-24a: FlyDSL 2.24 ms / 69.6 TF/s vs Triton 1.56 ms /
-  101.2 TF/s).** Everywhere else FlyDSL wins (jagged 1.27× both regimes; dense_bias
-  uniform 1.16×). The deficit is skew-specific: our two-pass split-reduction
-  (`grad_dense_partials`→`grad_dense_reduce`, `grad_bias_*`) launches a fixed
-  `SPLIT=4 × n_groups` grid regardless of per-group length, so skew's ~20% empty +
-  many short groups waste partials blocks and pay full launch + reduce-pass overhead
-  on tiny work, while Triton's dense_bias path stays leaner. **Do (ideas):**
-  length-aware / dynamic `SPLIT` (fewer splits for short groups), skip empty groups,
-  or fuse the reduce tail; possibly fuse dBias into the dDense partials (Phase 4).
-  **Gate:** beat Triton at `dense_bias` skew without regressing uniform or `jagged`.
-  Measure with `bench_jagged_dense_bmm_bwd_perf.py --component dense_bias --regime
-  skew -b 1024 -d 256 -kout 256 -mi 7680`.
+- **`dense_bias` under skew — MOSTLY CLOSED by Phase 4 (EXP-2026-06-25a).** Was the one
+  North-Star case FlyDSL lost (Triton 1.45× — EXP-2026-06-24a). Fusing dBias into the
+  dDense partials pass removed the redundant dOut re-read and brought skew to a **near-tie**
+  (FlyDSL ~1.45 ms vs Triton ~1.41 ms, ~1.03× Triton). The *remaining* gap is the fixed
+  `SPLIT=4 × n_groups` partials/reduce grid: skew's ~20% empty + many short groups still
+  launch full `SPLIT` blocks and round-trip ~1 GB of fp32 dDense partials through HBM
+  (`grad_dense_reduce`) on tiny work. **Do (ideas):** length-aware / dynamic `SPLIT` (fewer
+  splits for short groups), skip empty groups, or a 2-level / fused reduce to cut the
+  partials round-trip. **Gate:** beat Triton at `dense_bias` skew without regressing uniform
+  or `jagged`. Measure with `bench_jagged_dense_bmm_bwd_perf.py --component dense_bias
+  --regime skew -b 1024 -d 256 -kout 256 -mi 7680`.
 - **Relax the `K == N == D` constraint (support non-square `D != Kout`).** The
   backward kernels currently collapse the dense reduction dim and output dim into a
   single compile-time constant (`K == N`), so they only cover *square* shapes. The

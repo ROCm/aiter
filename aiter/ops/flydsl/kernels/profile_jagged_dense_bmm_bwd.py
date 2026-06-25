@@ -38,9 +38,11 @@ import flydsl.compiler as flyc
 # Sibling imports (script dir is on sys.path[0]); avoids importing the aiter pkg.
 from example_jagged_dense_bmm_bwd import make_inputs
 from jagged_dense_bmm import BLOCK_M, K, N
-from jagged_dense_bmm_bwd import SPLIT, grad_bias, grad_dense, grad_jagged
+from jagged_dense_bmm_bwd import SPLIT, grad_dense_bias, grad_jagged
 
-GRADS = ("djagged", "ddense", "dbias")
+# dDense and dBias share one fused launcher (grad_dense_bias), so they are profiled
+# together as the "dense_bias" target (mirrors the bench component of the same name).
+GRADS = ("djagged", "dense_bias")
 
 # roctx range markers (torch maps the nvtx API onto roctx on ROCm). Optional:
 # used only to annotate hip-trace / timeline captures, guarded so a missing
@@ -75,24 +77,17 @@ def _prep(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq_len):
 
         return launch
 
-    if which == "dbias":
-        d_bias = torch.zeros(n_groups, N, dtype=torch.bfloat16, device=device)
-        bias_partials = torch.zeros(n_groups * SPLIT, N, dtype=torch.float32, device=device)
-
-        def launch():
-            grad_bias(d_bias, tDOut, seq_offsets, bias_partials, n_groups, max_seq_len, stream=stream)
-
-        return launch
-
-    if which == "ddense":
+    if which == "dense_bias":
         d_dense = torch.zeros(n_groups, K, N, dtype=torch.bfloat16, device=device)
+        d_bias = torch.zeros(n_groups, N, dtype=torch.bfloat16, device=device)
         dense_partials = torch.zeros(n_groups * SPLIT * K, N, dtype=torch.float32, device=device)
+        bias_partials = torch.zeros(n_groups * SPLIT, N, dtype=torch.float32, device=device)
         tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
         d_dense_v = d_dense.view(n_groups * K, N)
 
         def launch():
-            grad_dense(d_dense_v, tJagged, tDOut, seq_offsets, dense_partials,
-                       n_groups, max_seq_len, stream=stream)
+            grad_dense_bias(d_dense_v, d_bias, tJagged, tDOut, seq_offsets, dense_partials,
+                            bias_partials, n_groups, max_seq_len, stream=stream)
 
         return launch
 
@@ -107,16 +102,17 @@ def _flops_bytes(which, total_rows, n_groups):
         # dJagged[s:e] = dOut[s:e] @ Dense[b].T -> 2*L*N*K MACs.
         flops = 2 * L * N * K
         bytes_ = L * N * 2 + n_groups * K * N * 2 + L * K * 2
-    elif which == "ddense":
-        # partials: dDense[b] = Jagged[s:e].T @ dOut[s:e] -> 2*L*K*N MACs.
+    elif which == "dense_bias":
+        # Fused dDense (+ dBias). dDense[b] = Jagged[s:e].T @ dOut[s:e] -> 2*L*K*N MACs
+        # dominates; the dBias reduction (~L*N adds) now piggybacks on the same dOut
+        # reads. partials kernel reads Jagged+dOut, writes dDense+dBias fp32 partials;
+        # the two reduce passes read those partials and write bf16 dDense+dBias.
         flops = 2 * L * K * N
-        part = n_groups * SPLIT * K * N * 4
-        bytes_ = (L * K * 2 + L * N * 2 + part) + (part + n_groups * K * N * 2)
-    elif which == "dbias":
-        # dBias[b] = sum_m dOut -> ~L*N adds; memory bound.
-        flops = L * N
-        part = n_groups * SPLIT * N * 4
-        bytes_ = L * N * 2 + part + part + n_groups * N * 2
+        dpart = n_groups * SPLIT * K * N * 4
+        bpart = n_groups * SPLIT * N * 4
+        bytes_ = (L * K * 2 + L * N * 2 + dpart + bpart) + (
+            dpart + n_groups * K * N * 2 + bpart + n_groups * N * 2
+        )
     else:
         raise ValueError(which)
     return flops, bytes_
@@ -161,7 +157,7 @@ def main(argv=None):
     p.add_argument("-m", "--max-seq-len", type=int, default=512)
     p.add_argument("--regime", choices=["uniform", "skew"], default="uniform")
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--only", default="all", help="comma list of {djagged,ddense,dbias} or 'all'")
+    p.add_argument("--only", default="all", help="comma list of {djagged,dense_bias} or 'all'")
     p.add_argument("--mode", choices=["bench", "profile"], default="bench")
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=50)

@@ -18,9 +18,10 @@
 # The upstream Triton path splits this across two functions:
 #   triton_jagged_dense_bmm_add_bwd_jagged       -> dJagged
 #   triton_jagged_dense_bmm_add_bwd_dense_bias   -> (dDense, dBias)
-# which map onto the FlyDSL grad_jagged and grad_dense + grad_bias kernels
-# respectively. The --component flag selects which piece(s) to score so each
-# FlyDSL kernel can be compared against its exact Triton counterpart.
+# which map onto the FlyDSL grad_jagged and the fused grad_dense_bias launcher
+# (dBias is folded into the dDense partials pass) respectively. The --component flag
+# selects which piece(s) to score so each FlyDSL kernel can be compared against its
+# exact Triton counterpart.
 #
 # HSTU (B,D,K,N) bench naming -> GEMM dims: reduction K = bench D, output N =
 # bench K (here Kout), grid M-envelope = bench N (max_seq_len, here Mi cap).
@@ -65,8 +66,7 @@ try:
     from jagged_dense_bmm import N as _FLY_N  # noqa: E402
     from jagged_dense_bmm_bwd import (  # noqa: E402
         SPLIT as _FLY_SPLIT,
-        grad_bias as _fly_grad_bias,
-        grad_dense as _fly_grad_dense,
+        grad_dense_bias as _fly_grad_dense_bias,
         grad_jagged as _fly_grad_jagged,
     )
 
@@ -203,10 +203,10 @@ def _flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
     tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
 
     def run_dense_bias():
-        _fly_grad_dense(
-            d_dense_v, tJagged, tDOut, seq_offsets, dense_partials, B, Mi, stream=stream
+        _fly_grad_dense_bias(
+            d_dense_v, d_bias, tJagged, tDOut, seq_offsets, dense_partials,
+            bias_partials, B, Mi, stream=stream
         )
-        _fly_grad_bias(d_bias, tDOut, seq_offsets, bias_partials, B, Mi, stream=stream)
         return d_dense, d_bias
 
     if component == "jagged":

@@ -35,7 +35,7 @@ import flydsl.compiler as flyc
 # Sibling imports (script dir is on sys.path[0]); avoids importing the aiter pkg.
 from example_jagged_dense_bmm import make_seq_offsets
 from jagged_dense_bmm import BLOCK_M, K, N
-from jagged_dense_bmm_bwd import SPLIT, grad_bias, grad_dense, grad_jagged
+from jagged_dense_bmm_bwd import SPLIT, grad_dense_bias, grad_jagged
 
 GRADS = ("djagged", "ddense", "dbias")
 
@@ -154,31 +154,28 @@ def run_flydsl_bwd(which, jagged, dense, bias, d_out, seq_offsets, n_groups, max
         except NotImplementedError as ex:
             print(f"  [skip] grad_jagged: {ex}")
 
-    if "dbias" in which:
-        d_bias = torch.zeros(n_groups, N, dtype=torch.bfloat16, device=device)
-        # fp32 split-reduction scratch, viewed as (n_groups * SPLIT, N).
-        bias_partials = torch.zeros(n_groups * SPLIT, N, dtype=torch.float32, device=device)
-        try:
-            grad_bias(d_bias, tDOut, seq_offsets, bias_partials, n_groups, max_seq_len, stream=stream)
-            torch.cuda.synchronize()
-            results["dbias"] = d_bias
-        except NotImplementedError as ex:
-            print(f"  [skip] grad_bias: {ex}")
-
-    if "ddense" in which:
+    # dDense and dBias are produced by a single fused launcher: the dBias column-sums
+    # piggyback on the dDense partials pass (both reduce over m). Run it once if either
+    # gradient is requested, then hand back whichever pieces were asked for.
+    if ("ddense" in which) or ("dbias" in which):
         d_dense = torch.zeros(n_groups, K, N, dtype=torch.bfloat16, device=device)
-        # fp32 split-reduction scratch, viewed as (n_groups * SPLIT * K, N).
+        d_bias = torch.zeros(n_groups, N, dtype=torch.bfloat16, device=device)
+        # fp32 split-reduction scratch: dDense (n_groups*SPLIT*K, N), dBias (n_groups*SPLIT, N).
         dense_partials = torch.zeros(n_groups * SPLIT * K, N, dtype=torch.float32, device=device)
+        bias_partials = torch.zeros(n_groups * SPLIT, N, dtype=torch.float32, device=device)
         tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
         try:
-            grad_dense(
-                d_dense.view(n_groups * K, N), tJagged, tDOut, seq_offsets,
-                dense_partials, n_groups, max_seq_len, stream=stream,
+            grad_dense_bias(
+                d_dense.view(n_groups * K, N), d_bias, tJagged, tDOut, seq_offsets,
+                dense_partials, bias_partials, n_groups, max_seq_len, stream=stream,
             )
             torch.cuda.synchronize()
-            results["ddense"] = d_dense
+            if "ddense" in which:
+                results["ddense"] = d_dense
+            if "dbias" in which:
+                results["dbias"] = d_bias
         except NotImplementedError as ex:
-            print(f"  [skip] grad_dense: {ex}")
+            print(f"  [skip] grad_dense_bias: {ex}")
 
     return results
 

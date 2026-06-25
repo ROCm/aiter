@@ -85,6 +85,18 @@ _J_LDS_LOADS = (DDENSE_BM * DDENSE_BK) // DDENSE_THREADS  # 32
 _D_LDS_LOADS = (DDENSE_BM * DDENSE_BN) // DDENSE_THREADS  # 32
 _DDENSE_SMEM_BYTES = (DDENSE_BK * DDENSE_BM + DDENSE_BN * DDENSE_BM) * 2  # bf16 staging
 
+# dBias[b][n] = sum_m dOut[m,n] reduces over the same dynamic m axis as dDense, and
+# the dDense partials kernel already streams every dOut element through LDS, so the
+# bias column-sums are folded into that pass instead of re-reading dOut in a separate
+# kernel. In the dOut global->LDS staging map, thread tid always loads output column
+# n = tid % DDENSE_BN (DDENSE_THREADS is a multiple of DDENSE_BN), so each column is
+# co-owned by DDENSE_NROW_GROUPS threads {c, c+DDENSE_BN, ...}; each accumulates its
+# rows into one fp32 register and the owners are combined once through LDS at the end.
+# Only the k-tile-0 workgroups (k_off == 0) emit a column's bias partial, so every
+# N-tile is written exactly once regardless of the K-tiling.
+assert DDENSE_THREADS % DDENSE_BN == 0, "dOut staging map assumes DDENSE_THREADS % DDENSE_BN == 0"
+DDENSE_NROW_GROUPS = DDENSE_THREADS // DDENSE_BN
+
 
 def _load_scalar(copy_atom, elem_dtype, divided_tensor, index):
     """Load one element at column `index` from a row already divided by (1, 1)."""
@@ -298,54 +310,6 @@ def grad_jagged(
 
 
 @flyc.kernel
-def grad_bias_partials_kernel(
-    PARTIALS: fx.Tensor,     # out    (n_groups * SPLIT, N)  fp32
-    DOUT: fx.Tensor,         # grad   (L, N)                 bf16
-    SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
-):
-    # dBias[b][n] = sum_m dOut[m,n]. This pass sums one split's strided subset of
-    # the group's rows; thread `tid` owns column n. Split s accumulates local rows
-    # r = s, s + SPLIT, s + 2*SPLIT, ... < M_b, so the SPLIT blocks together cover
-    # every row exactly once.
-    tid = fx.thread_idx.x
-    col_tile, off_s, off_b = fx.block_idx
-    off_b = fx.Int32(off_b)
-    off_s = fx.Int32(off_s)
-    col = fx.Int32(col_tile) * fx.Int32(NRED_BLK) + tid  # output column n
-
-    seq_rsrc = fx.buffer_ops.create_buffer_resource(SEQ_OFFSETS, max_size=True)
-    seq_start = fx.buffer_ops.buffer_load(seq_rsrc, off_b, vec_width=1, dtype=fx.T.i32())
-    seq_end = fx.buffer_ops.buffer_load(seq_rsrc, off_b + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
-    seq_start = fx.rocdl.readfirstlane(fx.T.i32(), seq_start)
-    seq_end = fx.rocdl.readfirstlane(fx.T.i32(), seq_end)
-    M_b = seq_end - seq_start
-
-    # Rebase dOut to this group's local row 0; loop bound M_b keeps reads in-range.
-    # int64 element offset: seq_start*N overflows int32 for large L once N ≥ 512
-    # (see grad_jagged_kernel / grad_dense_partials_kernel for the same guard).
-    a_row_off = fx.Int64(seq_start) * fx.Int64(N)
-    DOUT_g = fx.make_view(fx.add_offset(fx.get_iter(DOUT), fx.make_int_tuple(a_row_off)), fx.get_layout(DOUT))
-    DOUT_buf = fx.rocdl.make_buffer_tensor(DOUT_g, max_size=True)
-    copy_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
-
-    acc0 = fx.Float32(0.0)
-    for r, state in range(off_s, M_b, fx.Int32(SPLIT), init=[acc0]):
-        acc = state[0]
-        row_view = fx.slice(DOUT_buf, (fx.Int32(r), None))
-        row_div = fx.logical_divide(row_view, fx.make_layout(1, 1))
-        val = _load_scalar(copy_bf16, fx.BFloat16, row_div, col)
-        acc = acc + val.to(fx.Float32)
-        results = yield [acc]
-    acc_final = results
-
-    PART_buf = fx.rocdl.make_buffer_tensor(PARTIALS, max_size=True)
-    part_row = off_b * fx.Int32(SPLIT) + off_s
-    part_div = fx.logical_divide(fx.slice(PART_buf, (part_row, None)), fx.make_layout(1, 1))
-    copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-    _store_scalar(copy_f32, fx.Float32, part_div, col, acc_final)
-
-
-@flyc.kernel
 def grad_bias_reduce_kernel(
     DBIAS: fx.Tensor,     # out    (n_groups, N)          bf16
     PARTIALS: fx.Tensor,  # in     (n_groups * SPLIT, N)  fp32
@@ -372,35 +336,13 @@ def grad_bias_reduce_kernel(
     _store_scalar(copy_bf16, fx.BFloat16, out_div, col, acc.to(fx.BFloat16))
 
 
-@flyc.jit
-def grad_bias(
-    dBias: fx.Tensor,        # out    (n_groups, N)            bf16
-    dOut: fx.Tensor,         # grad   (L, N)                   bf16
-    SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
-    partials: fx.Tensor,     # fp32 scratch (n_groups * SPLIT, N)
-    n_groups: int,
-    max_seq_len: int,
-    stream: fx.Stream = fx.Stream(None),
-):
-    """dBias[b] = sum_m dOut[s:e, :], per group.
-
-    Two-pass split-reduction over m: a partials pass writes SPLIT fp32 partial
-    row-sums per group, then a reduce pass sums them into bf16 dBias.
-    """
-    grad_bias_partials_kernel(partials, dOut, SEQ_OFFSETS).launch(
-        grid=(NRED_COL_TILES, SPLIT, n_groups), block=(NRED_BLK, 1, 1), stream=stream
-    )
-    grad_bias_reduce_kernel(dBias, partials).launch(
-        grid=(NRED_COL_TILES, n_groups, 1), block=(NRED_BLK, 1, 1), stream=stream
-    )
-
-
 @flyc.kernel
 def grad_dense_partials_kernel(
-    PARTIALS: fx.Tensor,     # out    (n_groups * SPLIT * K, N)  fp32
-    JAGGED: fx.Tensor,       # jagged (L, K)                     bf16
-    DOUT: fx.Tensor,         # grad   (L, N)                     bf16
-    SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
+    PARTIALS: fx.Tensor,      # out    (n_groups * SPLIT * K, N)  fp32
+    BIAS_PARTIALS: fx.Tensor, # out    (n_groups * SPLIT, N)      fp32  (fused dBias)
+    JAGGED: fx.Tensor,        # jagged (L, K)                     bf16
+    DOUT: fx.Tensor,          # grad   (L, N)                     bf16
+    SEQ_OFFSETS: fx.Tensor,   # (n_groups + 1,) int32
     tiled_mma: fx.TiledMma,
 ):
     # dDense[b][k,n] = sum_m Jagged[m,k] * dOut[m,n]. Written as the MFMA atom form
@@ -483,9 +425,14 @@ def grad_dense_partials_kernel(
     num_tiles = (M_b + fx.Int32(DDENSE_BM - 1)) // fx.Int32(DDENSE_BM)
 
     # fp32 MFMA accumulator carried in place across the dynamic, split-strided
-    # m-tile loop (AGPR accumulate; no SSA carry needed).
+    # m-tile loop (AGPR accumulate; no SSA carry needed). The fused dBias column
+    # partial is carried as an fp32 loop iter_arg: each thread sums the dOut elements
+    # it already loads for the transpose-staging (one running fp32 per thread), so the
+    # bias reduction piggybacks on the dDense dOut traffic at no extra global reads.
     mma_frag_C.fill(0)
-    for m_tile in range(off_s, num_tiles, fx.Int32(SPLIT)):
+    bias_acc0 = fx.Float32(0.0)
+    for m_tile, _carry in range(off_s, num_tiles, fx.Int32(SPLIT), init=[bias_acc0]):
+        bias_acc = fx.Float32(_carry[0])
         mt = fx.Int32(m_tile)
         # Transpose-stage this m-tile: read coalesced along the contiguous global
         # axis (k for J, n for dOut), store into LDS with m contiguous.
@@ -496,6 +443,7 @@ def grad_dense_partials_kernel(
             joff = (mt * fx.Int32(DDENSE_BM) + m_local) * fx.Int32(K) + (k_off + k_local)
             jval = fx.buffer_ops.buffer_load(j_rsrc, joff, vec_width=1, dtype=fx.T.bf16())
             fx.memref_store(jval, sJ, (k_local, m_local))
+        tile_sum = fx.Float32(0.0)
         for i in fx.range_constexpr(_D_LDS_LOADS):
             lin = tid + fx.Int32(i * DDENSE_THREADS)
             m_local = lin // fx.Int32(DDENSE_BN)
@@ -503,6 +451,9 @@ def grad_dense_partials_kernel(
             doff = (mt * fx.Int32(DDENSE_BM) + m_local) * fx.Int32(N) + (n_off + n_local)
             dval = fx.buffer_ops.buffer_load(d_rsrc, doff, vec_width=1, dtype=fx.T.bf16())
             fx.memref_store(dval, sD, (n_local, m_local))
+            # Tail rows (m >= M_b) zero-fill via the bounded descriptor, so they add 0.
+            tile_sum = tile_sum + fx.Float32(dval)
+        bias_acc = bias_acc + tile_sum
         fx.gpu.barrier()
 
         for block_k_iter in fx.range_constexpr(DDENSE_BM // 32):
@@ -517,6 +468,8 @@ def grad_dense_partials_kernel(
                 traversal_order=fx.GemmTraversalOrder.KNM,
             )
         fx.gpu.barrier()
+        _carry_out = yield [bias_acc]
+    bias_acc_final = _carry_out
 
     # Epilogue: write the fp32 accumulator straight to the fp32 partials scratch
     # (no bf16 cast; the reduce pass does the final fp32 -> bf16).
@@ -526,6 +479,27 @@ def grad_dense_partials_kernel(
     mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C)
     thr_gPart = thr_copy_r2g_C.partition_S(gPart)
     fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32), mma_frag_C_retile, thr_gPart)
+
+    # Fused dBias epilogue: combine the per-thread column partials through LDS (the
+    # sJ/sD staging region is dead now, so reuse it as fp32 scratch -> no extra smem,
+    # occupancy unchanged) and write one fp32 bias partial per output column for this
+    # (group, split). Only the k-tile-0 workgroups emit it so each N-tile is written
+    # once. M_b == 0 groups never enter the m-loop, so bias_acc stays 0 -> 0 bias.
+    if k_off == fx.Int32(0):
+        smem_f32 = fx.get_dyn_shared(fx.Float32)
+        bias_lds = fx.make_view(smem_f32, fx.make_layout((DDENSE_THREADS,), (1,)))
+        fx.gpu.barrier()
+        fx.memref_store(bias_acc_final, bias_lds, (tid,))
+        fx.gpu.barrier()
+        if tid < fx.Int32(DDENSE_BN):
+            col_sum = fx.Float32(fx.memref_load(bias_lds, (tid,)))
+            for r in fx.range_constexpr(1, DDENSE_NROW_GROUPS):
+                col_sum = col_sum + fx.Float32(fx.memref_load(bias_lds, (tid + fx.Int32(r * DDENSE_BN),)))
+            BP_buf = fx.rocdl.make_buffer_tensor(BIAS_PARTIALS, max_size=True)
+            part_row = off_b * fx.Int32(SPLIT) + off_s
+            bp_div = fx.logical_divide(fx.slice(BP_buf, (part_row, None)), fx.make_layout(1, 1))
+            copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            _store_scalar(copy_f32, fx.Float32, bp_div, n_off + tid, col_sum)
 
 
 @flyc.kernel
@@ -558,21 +532,26 @@ def grad_dense_reduce_kernel(
 
 
 @flyc.jit
-def grad_dense(
-    dDense: fx.Tensor,       # out    (n_groups * K, N)            bf16
-    JAGGED: fx.Tensor,       # jagged (L, K)                       bf16
-    dOut: fx.Tensor,         # grad   (L, N)                       bf16
-    SEQ_OFFSETS: fx.Tensor,  # (n_groups + 1,) int32
-    partials: fx.Tensor,     # fp32 scratch (n_groups * SPLIT * K, N)
+def grad_dense_bias(
+    dDense: fx.Tensor,        # out    (n_groups * K, N)            bf16
+    dBias: fx.Tensor,         # out    (n_groups, N)               bf16
+    JAGGED: fx.Tensor,        # jagged (L, K)                       bf16
+    dOut: fx.Tensor,          # grad   (L, N)                       bf16
+    SEQ_OFFSETS: fx.Tensor,   # (n_groups + 1,) int32
+    partials: fx.Tensor,      # fp32 scratch (n_groups * SPLIT * K, N)
+    bias_partials: fx.Tensor, # fp32 scratch (n_groups * SPLIT, N)
     n_groups: int,
     max_seq_len: int,
     stream: fx.Stream = fx.Stream(None),
 ):
-    """dDense[b] = Jagged[s:e, :].T @ dOut[s:e, :], per group.
+    """dDense[b] = Jagged[s:e, :].T @ dOut[s:e, :] and dBias[b] = sum_m dOut[s:e, :].
 
-    Contraction is over the dynamic sequence axis m. Two-pass split-reduction:
-    a partials pass accumulates fp32 (K, N) partials per (group, split) slot via
-    bf16 MFMA on the transposed GEMM, then a reduce pass sums them into bf16 dDense.
+    Both reduce over the dynamic sequence axis m, so the dBias column-sums are fused
+    into the dDense partials pass (which already streams dOut through LDS) instead of
+    re-reading dOut in a separate kernel. Three launches: one bf16-MFMA partials pass
+    writes both the fp32 (K, N) dDense partials and the fp32 (N,) dBias partials per
+    (group, split), then two light reduce passes sum the SPLIT partials into bf16
+    dDense and dBias respectively.
     """
     # Same MFMA atom + tiling as the forward GEMM: 16x16x16 bf16, 4 N-atoms per
     # 256-thread workgroup, natural (4,4,2) K-fragment ordering. Here the operands
@@ -582,10 +561,13 @@ def grad_dense(
         fx.make_layout((1, 4, 1), (0, 1, 0)),
         fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
     )
-    grad_dense_partials_kernel(partials, JAGGED, dOut, SEQ_OFFSETS, tiled_mma).launch(
+    grad_dense_partials_kernel(partials, bias_partials, JAGGED, dOut, SEQ_OFFSETS, tiled_mma).launch(
         grid=(NK_TILES * NN_TILES, SPLIT, n_groups), block=(DDENSE_THREADS, 1, 1),
         smem=_DDENSE_SMEM_BYTES, stream=stream
     )
     grad_dense_reduce_kernel(dDense, partials).launch(
         grid=(NRED_COL_TILES, K, n_groups), block=(NRED_BLK, 1, 1), stream=stream
+    )
+    grad_bias_reduce_kernel(dBias, bias_partials).launch(
+        grid=(NRED_COL_TILES, n_groups, 1), block=(NRED_BLK, 1, 1), stream=stream
     )
