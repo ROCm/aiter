@@ -1115,7 +1115,8 @@ def _flat_mxfp4_epilog(
             # encode e8m0 RoundUp: e8 = ceil_pow2(amax/6)
             f32b = arith.shli(amax_dpp, _raw(fx.Int32(16)))
             working_i = arith.bitcast(
-                T.i32, arith.mulf(arith.bitcast(T.f32, f32b), _raw(fx.Float32(1.0 / 6.0)))
+                T.i32,
+                arith.mulf(arith.bitcast(T.f32, f32b), _raw(fx.Float32(1.0 / 6.0))),
             )
             bexp = arith.andi(
                 arith.shrui(

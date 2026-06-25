@@ -442,9 +442,7 @@ def _gemm1_body(
     for j in range_constexpr(4):
         if const_expr(interleave):
             col = (
-                n_block_idx * fx.Int32(BN)
-                + wave * fx.Int32(BN // 4)
-                + fx.Int32(j * 16)
+                n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
             )
         else:
             tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
@@ -464,8 +462,7 @@ def _gemm1_body(
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(2):
         base = (
-            e * fx.Int32(kBS_per_expert_dw)
-            + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
+            e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
         ) * fx.Int32(4)
         base = rocdl.readfirstlane(T.i32, base)
         b_scale_s_base.append(base)

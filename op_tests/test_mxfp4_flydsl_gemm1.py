@@ -388,9 +388,7 @@ def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
 
 
 @_GFX950
-@pytest.mark.parametrize(
-    "interleave", [True, False], ids=["interleave", "separated"]
-)
+@pytest.mark.parametrize("interleave", [True, False], ids=["interleave", "separated"])
 @pytest.mark.parametrize(
     "NE,H,INTER,TOPK",
     [
