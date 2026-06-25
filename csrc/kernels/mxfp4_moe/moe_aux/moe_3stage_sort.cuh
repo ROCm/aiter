@@ -42,7 +42,6 @@ template <int NE, int N_SORT_CTAS, int MB, int THREADS_PER_CTA>
 __global__ void sort_cumsum_kernel_impl(
     int M,
     int32_t *__restrict__ block_offsets,
-    int32_t *__restrict__ masked_m,
     int32_t *__restrict__ real_counts,
     int32_t *__restrict__ cumsum_tensor,
     int32_t *__restrict__ sorted_expert_ids) {
@@ -64,7 +63,6 @@ __global__ void sort_cumsum_kernel_impl(
         total_count[e]     = sum;
         padded_count[e]    = round_up(sum, MB);
         real_counts[e]     = sum;
-        masked_m[e]        = padded_count[e];
     }
     __syncthreads();
 
@@ -163,7 +161,7 @@ inline void launch(
     const int32_t *topk_ids, const float *topk_weight,
     int32_t *sorted_token_ids, int32_t *sorted_expert_ids, int32_t *cumsum_tensor,
     int32_t *reverse_sorted, float *sorted_weights,
-    int32_t *masked_m, int32_t *m_indices,
+    int32_t *m_indices,
     int32_t *block_offsets,
     int32_t *real_counts)
 {
@@ -173,7 +171,7 @@ inline void launch(
 
     sort_cumsum_kernel_impl<NE, N_SORT_CTAS, MB, THREADS_PER_CTA>
         <<<1, THREADS_PER_CTA, 0, stream>>>(
-            M, block_offsets, masked_m, real_counts, cumsum_tensor, sorted_expert_ids);
+            M, block_offsets, real_counts, cumsum_tensor, sorted_expert_ids);
 
     sort_place_pad_kernel_impl<NE, TOPK, N_SORT_CTAS, MB, THREADS_PER_CTA>
         <<<N_SORT_CTAS, THREADS_PER_CTA, 0, stream>>>(

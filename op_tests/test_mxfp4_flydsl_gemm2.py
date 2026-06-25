@@ -321,7 +321,7 @@ def test_flydsl_gemm2_parametrized_k_numeric(D_INTER):
     topk_ids = torch.cat([sid, rid], 1).to(torch.int32)
     topk_weight = torch.cat([sw, rw], 1).to(torch.float32)
 
-    # sort (KIMI shape -> HIP threestage sort)
+    # sort (KIMI shape -> adaptive threestage sort)
     active = min(NE, M * TOPK)
     max_sorted = ((M * TOPK + active * (BM - 1) + BM - 1) // BM) * BM
 
@@ -333,7 +333,6 @@ def test_flydsl_gemm2_parametrized_k_numeric(D_INTER):
     cumsum = torch.empty((2,), device=device, dtype=dtypes.i32)
     rev = torch.empty((M * TOPK,), device=device, dtype=dtypes.i32)
     swt = torch.empty((max_sorted,), device=device, dtype=dtypes.fp32)
-    mm = torch.empty((NE,), device=device, dtype=dtypes.i32)
     mind = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
     aiter.mxfp4_moe_sort(
         topk_ids=topk_ids,
@@ -343,7 +342,6 @@ def test_flydsl_gemm2_parametrized_k_numeric(D_INTER):
         cumsum_tensor=cumsum,
         reverse_sorted=rev,
         sorted_weights=swt,
-        masked_m=mm,
         m_indices=mind,
         bf16_zero_out=eb(),
         bf16_zero_workspace=eb(),

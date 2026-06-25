@@ -99,7 +99,6 @@ AUX_SORT_QUANT_PARAMS = """    int            M,
     float*         sorted_weights,
     void*          a_quant,
     void*          a_scale,
-    int32_t*       masked_m,
     int32_t*       m_indices,
     void*          bf16_zero_ptr"""
 
@@ -111,7 +110,6 @@ AUX_3STAGE_PARAMS = """    int            M,
     int32_t*       cumsum,
     int32_t*       reverse_sorted,
     float*         sorted_weights,
-    int32_t*       masked_m,
     int32_t*       m_indices,
     int32_t*       block_offsets,
     int32_t*       real_counts"""
@@ -124,7 +122,6 @@ AUX_SORT_ONLY_ZI_PARAMS = """    int            M,
     int32_t*       cumsum,
     int32_t*       reverse_sorted,
     float*         sorted_weights,
-    int32_t*       masked_m,
     int32_t*       m_indices,
     void*          bf16_zero_ptr,
     void*          bf16_zero_ws_ptr,
@@ -138,7 +135,6 @@ AUX_SORT_ONLY_PARAMS = """    int            M,
     int32_t*       cumsum,
     int32_t*       reverse_sorted,
     float*         sorted_weights,
-    int32_t*       masked_m,
     int32_t*       m_indices"""
 
 AUX_QUANT_PARAMS = """    int            M,
@@ -178,7 +174,7 @@ def _aux_sort_quant_body(ne, topk, mb, h):
         f"            cumsum, reverse_sorted, sorted_weights,\n"
         f"            reinterpret_cast<uint8_t*>(a_quant),\n"
         f"            reinterpret_cast<uint8_t*>(a_scale),\n"
-        f"            masked_m, m_indices,\n"
+        f"            m_indices,\n"
         f"            reinterpret_cast<__hip_bfloat16*>(bf16_zero_ptr));"
     )
 
@@ -190,7 +186,7 @@ def _aux_3stage_body(ne, topk, mb):
         f"            stream, M,\n"
         f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
         f"            cumsum, reverse_sorted, sorted_weights,\n"
-        f"            masked_m, m_indices, block_offsets, real_counts);"
+        f"            m_indices, block_offsets, real_counts);"
     )
 
 
@@ -201,7 +197,7 @@ def _aux_sort_only_zi_body(ne, topk, mb, h):
         f"            stream, M,\n"
         f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
         f"            cumsum, reverse_sorted, sorted_weights,\n"
-        f"            masked_m, m_indices,\n"
+        f"            m_indices,\n"
         f"            reinterpret_cast<__hip_bfloat16*>(bf16_zero_ptr),\n"
         f"            bf16_zero_ws_ptr, workspace_bytes);"
     )
@@ -214,7 +210,7 @@ def _aux_sort_only_body(ne, topk, mb, h):
         f"            stream, M,\n"
         f"            topk_ids, topk_weight, sorted_token_ids, sorted_expert_ids,\n"
         f"            cumsum, reverse_sorted, sorted_weights,\n"
-        f"            masked_m, m_indices);"
+        f"            m_indices);"
     )
 
 

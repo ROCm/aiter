@@ -299,9 +299,9 @@ def test_flydsl_gemm1_separated_compiles(NE, H, INTER, TOPK):
 
 def _torch_threestage_sort(topk_ids, topk_weight, M, NE, TOPK, BM, max_sorted):
     """Torch replica of moe_3stage_sort.cuh (stable expert-grouped sort, each
-    expert region padded up to a multiple of BM). The HIP threestage sort is
+    expert region padded up to a multiple of BM). The adaptive threestage sort is
     hard-templated to KIMI (NE=385/TOPK=9) only, so non-KIMI shapes need this to
-    build the gemm1 inputs. Validated against the HIP sort at the KIMI shape (same
+    build the gemm1 inputs. Validated against the adaptive sort at the KIMI shape (same
     sti/sei/cumsum/m_indices). Returns (sti, sei, cumsum, mind)."""
     device = topk_ids.device
     flat_e = topk_ids.reshape(-1)  # (M*TOPK,) expert per (token,topk) pair, row-major
@@ -450,7 +450,7 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
 
     active = min(NE, M * topk)
     max_sorted = ((M * topk + active * (BM - 1) + BM - 1) // BM) * BM
-    # The HIP threestage sort is hard-templated to KIMI (NE=385/TOPK=9). For other
+    # The adaptive threestage sort is hard-templated to KIMI (NE=385/TOPK=9). For other
     # shapes use the torch replica (validated vs HIP at the KIMI shape: identical
     # sti/sei/cumsum/m_indices). Both produce the exact layout gemm1 consumes.
     if (NE, topk) == (385, 9):
@@ -463,7 +463,6 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
         cumsum = torch.empty((2,), device=device, dtype=dtypes.i32)
         rev = torch.empty((M * topk,), device=device, dtype=dtypes.i32)
         swt = torch.empty((max_sorted,), device=device, dtype=dtypes.fp32)
-        mm = torch.empty((NE,), device=device, dtype=dtypes.i32)
         mind = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
         aiter.mxfp4_moe_sort(
             topk_ids=topk_ids,
@@ -473,7 +472,6 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
             cumsum_tensor=cumsum,
             reverse_sorted=rev,
             sorted_weights=swt,
-            masked_m=mm,
             m_indices=mind,
             bf16_zero_out=eb(),
             bf16_zero_workspace=eb(),

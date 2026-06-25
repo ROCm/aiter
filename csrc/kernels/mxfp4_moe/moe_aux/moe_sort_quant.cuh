@@ -193,7 +193,7 @@ template <int NUM_EXPERTS, int TOPK, int M_PER_BLOCK, int THREADS_PER_CTA>
 __device__ __forceinline__ void
 sort_subkernel(const int32_t *topk_ids, const float *topk_weight, int32_t *sorted_token_ids, int32_t *sorted_expert_ids,
                float *sorted_weights, int32_t *cumsum_tensor, int32_t *reverse_sorted,
-               int32_t *masked_m, int32_t *m_indices, int M) {
+               int32_t *m_indices, int M) {
     __shared__ int count[std::max(NUM_EXPERTS, THREADS_PER_CTA)];
     __shared__ int cumsum[NUM_EXPERTS + 1];
     __shared__ int counter[NUM_EXPERTS];
@@ -205,10 +205,6 @@ sort_subkernel(const int32_t *topk_ids, const float *topk_weight, int32_t *sorte
     parallel_cumsum<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(count, cumsum, counter);
     place_tokens<TOPK, THREADS_PER_CTA>(cumsum, counter, topk_ids, topk_weight, sorted_token_ids, sorted_weights, reverse_sorted, m_indices, total_pairs);
     fill_padding_gaps<NUM_EXPERTS, THREADS_PER_CTA, M_PER_BLOCK>(count, cumsum, sorted_token_ids, sorted_expert_ids, m_indices, sorted_weights, M);
-
-    for (int e = tid; e < NUM_EXPERTS; e += THREADS_PER_CTA) {
-        masked_m[e] = cumsum[e + 1] - cumsum[e];
-    }
 
     if (tid == 0) {
         cumsum_tensor[0] = cumsum[NUM_EXPERTS];
@@ -323,7 +319,7 @@ __global__ void sort_quant_kernel_impl(
     int32_t *__restrict__ cumsum_tensor, int32_t *__restrict__ reverse_sorted,
     float *__restrict__ sorted_weights,
     uint8_t *__restrict__ a_quant, uint8_t *__restrict__ a_scale,
-    int32_t *__restrict__ masked_m, int32_t *__restrict__ m_indices,
+    int32_t *__restrict__ m_indices,
     __hip_bfloat16 *__restrict__ bf16_zero_out = nullptr,
     void *__restrict__ bf16_zero_workspace = nullptr,
     long long workspace_bytes = 0) {
@@ -332,7 +328,7 @@ __global__ void sort_quant_kernel_impl(
             sort_subkernel<NUM_EXPERTS, TOPK, M_PER_BLOCK, THREADS_PER_CTA>(topk_ids, topk_weight, sorted_token_ids,
                                                                             sorted_expert_ids, sorted_weights,
                                                                             cumsum_tensor, reverse_sorted,
-                                                                            masked_m, m_indices, M);
+                                                                            m_indices, M);
         }
     } else if constexpr (!kSkipQuant) {
         quant_subkernel<N_CTAS - 1, THREADS_PER_CTA, D_HIDDEN>(hidden_states, a_quant, a_scale, M);
@@ -352,14 +348,14 @@ inline void launch(
     int32_t *sorted_token_ids, int32_t *sorted_expert_ids, int32_t *cumsum,
     int32_t *reverse_sorted, float *sorted_weights,
     uint8_t *a_quant, uint8_t *a_scale,
-    int32_t *masked_m, int32_t *m_indices,
+    int32_t *m_indices,
     __hip_bfloat16 *bf16_zero_out)
 {
     sort_quant_kernel_impl<NE, TOPK, MB, D_HIDDEN, N_CTAS, THREADS_PER_CTA>
         <<<N_CTAS, THREADS_PER_CTA, 0, stream>>>(
             M, hidden, topk_ids, topk_w,
             sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
-            a_quant, a_scale, masked_m, m_indices,
+            a_quant, a_scale, m_indices,
             bf16_zero_out);
 }
 
@@ -369,7 +365,7 @@ inline void launch_sort_only_impl(
     const int32_t *topk_ids, const float *topk_w,
     int32_t *sorted_token_ids, int32_t *sorted_expert_ids, int32_t *cumsum,
     int32_t *reverse_sorted, float *sorted_weights,
-    int32_t *masked_m, int32_t *m_indices)
+    int32_t *m_indices)
 {
     constexpr int N = FullGrid ? N_CTAS : 1;
     sort_quant_kernel_impl<NE, TOPK, MB, D_HIDDEN, N, THREADS_PER_CTA, /*kSkipQuant=*/true>
@@ -377,7 +373,7 @@ inline void launch_sort_only_impl(
             M, /*hidden=*/nullptr, topk_ids, topk_w,
             sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
             /*a_quant=*/nullptr, /*a_scale=*/nullptr,
-            masked_m, m_indices);
+            m_indices);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int THREADS_PER_CTA>
@@ -386,12 +382,12 @@ inline void launch_sort_only(
     const int32_t *topk_ids, const float *topk_w,
     int32_t *sorted_token_ids, int32_t *sorted_expert_ids, int32_t *cumsum,
     int32_t *reverse_sorted, float *sorted_weights,
-    int32_t *masked_m, int32_t *m_indices)
+    int32_t *m_indices)
 {
     launch_sort_only_impl<NE, TOPK, MB, D_HIDDEN, /*N_CTAS=*/1, THREADS_PER_CTA, /*FullGrid=*/false>(
         stream, M, topk_ids, topk_w,
         sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
-        masked_m, m_indices);
+        m_indices);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA>
@@ -400,7 +396,7 @@ inline void launch_sort_only_with_zero_init(
     const int32_t *topk_ids, const float *topk_w,
     int32_t *sorted_token_ids, int32_t *sorted_expert_ids, int32_t *cumsum,
     int32_t *reverse_sorted, float *sorted_weights,
-    int32_t *masked_m, int32_t *m_indices,
+    int32_t *m_indices,
     __hip_bfloat16 *bf16_zero_out,
     void *bf16_zero_workspace,
     long long workspace_bytes)
@@ -410,7 +406,7 @@ inline void launch_sort_only_with_zero_init(
             M, /*hidden=*/nullptr, topk_ids, topk_w,
             sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
             /*a_quant=*/nullptr, /*a_scale=*/nullptr,
-            masked_m, m_indices, bf16_zero_out,
+            m_indices, bf16_zero_out,
             bf16_zero_workspace, workspace_bytes);
 }
 
@@ -420,13 +416,13 @@ inline void launch_sort_only_with_zero_init_small_grid(
     const int32_t *topk_ids, const float *topk_w,
     int32_t *sorted_token_ids, int32_t *sorted_expert_ids, int32_t *cumsum,
     int32_t *reverse_sorted, float *sorted_weights,
-    int32_t *masked_m, int32_t *m_indices,
+    int32_t *m_indices,
     __hip_bfloat16 *bf16_zero_out)
 {
     launch_sort_only_with_zero_init<NE, TOPK, MB, D_HIDDEN, /*N_CTAS=*/1, THREADS_PER_CTA>(
         stream, M, topk_ids, topk_w,
         sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
-        masked_m, m_indices, bf16_zero_out);
+        m_indices, bf16_zero_out);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA>
@@ -435,12 +431,12 @@ inline void launch_sort_only_full_grid(
     const int32_t *topk_ids, const float *topk_w,
     int32_t *sorted_token_ids, int32_t *sorted_expert_ids, int32_t *cumsum,
     int32_t *reverse_sorted, float *sorted_weights,
-    int32_t *masked_m, int32_t *m_indices)
+    int32_t *m_indices)
 {
     launch_sort_only_impl<NE, TOPK, MB, D_HIDDEN, N_CTAS, THREADS_PER_CTA, /*FullGrid=*/true>(
         stream, M, topk_ids, topk_w,
         sorted_token_ids, sorted_expert_ids, cumsum, reverse_sorted, sorted_weights,
-        masked_m, m_indices);
+        m_indices);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA>
@@ -456,7 +452,7 @@ inline void launch_quant_only(
             /*sti=*/nullptr, /*sei=*/nullptr, /*cumsum=*/nullptr,
             /*rs=*/nullptr, /*sw=*/nullptr,
             a_quant, a_scale,
-            /*masked_m=*/nullptr, /*m_indices=*/nullptr);
+            /*m_indices=*/nullptr);
 }
 
 template <int NE, int TOPK, int MB, int D_HIDDEN, int N_CTAS, int THREADS_PER_CTA>
