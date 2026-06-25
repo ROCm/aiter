@@ -21,6 +21,7 @@ constexpr int kGroupLanes = 16;
 constexpr int kGroupsPerWarp = kWarpSize / kGroupLanes;
 constexpr int kNumWarps = 8;
 constexpr int kNumTokenGroups = kNumWarps * kGroupsPerWarp;
+constexpr int kHeadsPerCta = 2;
 constexpr int kElemsPerLane = kHeadDim / kGroupLanes;
 
 __device__ __forceinline__ float groupReduceSum(float val)
@@ -60,6 +61,7 @@ __global__ void decodeIndexScoreKernel(
     const int32_t* __restrict__ block_table,
     const int32_t* __restrict__ seq_lens,
     int64_t total_q,
+    int64_t num_idx_heads,
     int64_t init_blocks,
     int64_t local_blocks,
     float sm_scale_log2e,
@@ -83,7 +85,7 @@ __global__ void decodeIndexScoreKernel(
     const int lane = warp_lane & (kGroupLanes - 1);
     const int token_group = warp_id * kGroupsPerWarp + group_in_warp;
     const int64_t pid_tc = blockIdx.x;
-    const int64_t pid_h = blockIdx.y;
+    const int64_t pid_h_base = blockIdx.y * kHeadsPerCta;
     const int64_t pid_t = pid_tc % total_q;
     const int64_t pid_c = pid_tc / total_q;
     const int64_t pid_b = pid_t / max_query_len;
@@ -109,43 +111,65 @@ __global__ void decodeIndexScoreKernel(
     const int64_t local_start = (num_blocks > local_blocks) ? (num_blocks - local_blocks) : 0;
     const int dim0 = lane * kElemsPerLane;
 
-    __shared__ float q_shared[kHeadDim];
+    __shared__ float q_shared[kHeadsPerCta][kHeadDim];
     if(threadIdx.x < kGroupLanes)
     {
-        float q_load[kElemsPerLane];
-        load8Vec(q + pid_t * stride_q_n + pid_h * stride_q_h + dim0 * stride_q_d, q_load);
-#pragma unroll
-        for(int i = 0; i < kElemsPerLane; ++i)
+        for(int h = 0; h < kHeadsPerCta; ++h)
         {
-            q_shared[dim0 + i] = q_load[i];
+            const int64_t pid_h = pid_h_base + h;
+            if(pid_h < num_idx_heads)
+            {
+                float q_load[kElemsPerLane];
+                load8Vec(q + pid_t * stride_q_n + pid_h * stride_q_h + dim0 * stride_q_d,
+                         q_load);
+#pragma unroll
+                for(int i = 0; i < kElemsPerLane; ++i)
+                {
+                    q_shared[h][dim0 + i] = q_load[i];
+                }
+            }
         }
     }
     __syncthreads();
 
-    float q_vals[kElemsPerLane];
+    float q_vals[kHeadsPerCta][kElemsPerLane];
 #pragma unroll
-    for(int i = 0; i < kElemsPerLane; ++i)
+    for(int h = 0; h < kHeadsPerCta; ++h)
     {
-        q_vals[i] = q_shared[dim0 + i];
+        const bool valid_h = (pid_h_base + h) < num_idx_heads;
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
+        {
+            q_vals[h][i] = valid_h ? q_shared[h][dim0 + i] : 0.0f;
+        }
     }
 
     const int32_t* __restrict__ bt_row = block_table + pid_b * stride_bt_b;
-    __shared__ float wave_scores[kNumTokenGroups];
+    __shared__ float wave_scores[kHeadsPerCta][kNumTokenGroups];
     for(int64_t blk = chunk_start; blk < chunk_end; ++blk)
     {
         const bool is_init = blk < init_blocks;
         const bool is_local = blk >= local_start && blk < num_blocks;
         if(is_init || is_local)
         {
-            if(threadIdx.x == 0)
+            if(threadIdx.x < kHeadsPerCta)
             {
-                score[pid_h * stride_s_h + pid_t * stride_s_n + blk * stride_s_k] =
-                    is_local ? 1.0e29f : 1.0e30f;
+                const int64_t pid_h = pid_h_base + threadIdx.x;
+                if(pid_h < num_idx_heads)
+                {
+                    score[pid_h * stride_s_h + pid_t * stride_s_n + blk * stride_s_k] =
+                        is_local ? 1.0e29f : 1.0e30f;
+                }
             }
             continue;
         }
 
-        float wave_score = -INFINITY;
+        float wave_score[kHeadsPerCta];
+#pragma unroll
+        for(int h = 0; h < kHeadsPerCta; ++h)
+        {
+            wave_score[h] = -INFINITY;
+        }
 
         const int64_t page = static_cast<int64_t>(bt_row[blk]);
         const scalar_t* __restrict__ k_blk =
@@ -160,34 +184,49 @@ __global__ void decodeIndexScoreKernel(
             }
             float k_vals[kElemsPerLane];
             load8Vec(k_blk + off * stride_k_pos, k_vals);
-            float dot = 0.0f;
 #pragma unroll
-            for(int i = 0; i < kElemsPerLane; ++i)
+            for(int h = 0; h < kHeadsPerCta; ++h)
             {
-                dot += q_vals[i] * k_vals[i];
-            }
-            dot = groupReduceSum(dot) * sm_scale_log2e;
-            if(lane == 0)
-            {
-                wave_score = fmaxf(wave_score, dot);
+                const bool valid_h = (pid_h_base + h) < num_idx_heads;
+                float dot = 0.0f;
+#pragma unroll
+                for(int i = 0; i < kElemsPerLane; ++i)
+                {
+                    dot += q_vals[h][i] * k_vals[i];
+                }
+                dot = groupReduceSum(dot) * sm_scale_log2e;
+                if(lane == 0 && valid_h)
+                {
+                    wave_score[h] = fmaxf(wave_score[h], dot);
+                }
             }
         }
 
         if(lane == 0)
         {
-            wave_scores[token_group] = wave_score;
+#pragma unroll
+            for(int h = 0; h < kHeadsPerCta; ++h)
+            {
+                wave_scores[h][token_group] = wave_score[h];
+            }
         }
         __syncthreads();
 
-        if(threadIdx.x == 0)
+        if(threadIdx.x < kHeadsPerCta)
         {
-            float block_score = wave_scores[0];
-#pragma unroll
-            for(int i = 1; i < kNumTokenGroups; ++i)
+            const int h = threadIdx.x;
+            const int64_t pid_h = pid_h_base + h;
+            if(pid_h < num_idx_heads)
             {
-                block_score = fmaxf(block_score, wave_scores[i]);
+                float block_score = wave_scores[h][0];
+#pragma unroll
+                for(int i = 1; i < kNumTokenGroups; ++i)
+                {
+                    block_score = fmaxf(block_score, wave_scores[h][i]);
+                }
+                score[pid_h * stride_s_h + pid_t * stride_s_n + blk * stride_s_k] =
+                    block_score;
             }
-            score[pid_h * stride_s_h + pid_t * stride_s_n + blk * stride_s_k] = block_score;
         }
         __syncthreads();
     }
@@ -220,7 +259,8 @@ void launchDecodeIndexScore(const aiter_tensor_t& idx_q,
 
     const int64_t num_idx_heads = idx_q.size(1);
     const dim3 grid(static_cast<unsigned int>(total_q * num_kv_chunks),
-                    static_cast<unsigned int>(num_idx_heads));
+                    static_cast<unsigned int>((num_idx_heads + kHeadsPerCta - 1) /
+                                              kHeadsPerCta));
     const dim3 block(kWarpSize * kNumWarps);
     const float sm_scale_log2e = static_cast<float>(sm_scale) * 1.4426950409f;
 
@@ -235,6 +275,7 @@ void launchDecodeIndexScore(const aiter_tensor_t& idx_q,
                        reinterpret_cast<const int32_t*>(block_table.data_ptr()),
                        reinterpret_cast<const int32_t*>(seq_lens.data_ptr()),
                        total_q,
+                       num_idx_heads,
                        init_blocks,
                        local_blocks,
                        sm_scale_log2e,
