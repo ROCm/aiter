@@ -11,9 +11,13 @@ from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
 # FlashMoE: when AITER_TRITON_FLASH_MOE is set, the flat-topk routing path uses
 # the fused min-unique routing (top-(k+1) -> drop least-batch-popular -> keep-k)
-# for decode-sized batches (M <= AITER_TRITON_FLASH_MOE_MAX_M, default 128).
-# Unset -> original top-k routing. Prefill / large M always falls through to stock.
+# for decode-sized batches in the window
+# [AITER_TRITON_FLASH_MOE_MIN_M (default 16), AITER_TRITON_FLASH_MOE_MAX_M (default 128)].
+# Below MIN_M the per-batch expert union can't shrink (e.g. M=1 returns the same
+# top-k as stock) so the fused-kernel/atomic overhead would be pure cost; above
+# MAX_M is prefill. Unset -> original top-k routing. Outside the window falls through.
 _FLASH_MOE = os.environ.get("AITER_TRITON_FLASH_MOE", "") not in ("", "0", "false", "False")
+_FLASH_MOE_MIN_M = int(os.environ.get("AITER_TRITON_FLASH_MOE_MIN_M", "16"))
 _FLASH_MOE_MAX_M = int(os.environ.get("AITER_TRITON_FLASH_MOE_MAX_M", "128"))
 
 
@@ -304,7 +308,7 @@ def routing(
     if score_mode is None:
         # FlashMoE: env-gated fused min-unique routing (decode-sized batches only;
         # prefill / large M falls through to the stock top-k path below).
-        if _FLASH_MOE and num_tokens <= _FLASH_MOE_MAX_M:
+        if _FLASH_MOE and _FLASH_MOE_MIN_M <= num_tokens <= _FLASH_MOE_MAX_M:
             from .minunique import routing_minunique
 
             return routing_minunique(logits, n_expts_act, sm_first=sm_first)
