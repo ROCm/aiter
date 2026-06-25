@@ -41,7 +41,6 @@ from .tensor_shim import GTensor, _run_compiled, _to_raw
 
 Vec = fx.Vector
 
-
 # --------------------------------------------------------------------------- #
 # MfmaAtom — bundles all MFMA-shape-derived constants and the rocdl functor.
 #
@@ -105,7 +104,7 @@ def _mfma32x32x16_fp8_fp8_wrapper(result_type, operands, *, loc=None, ip=None):
 #: 16×16 output tile, K=32 fp8 elements/step.  Acc: vec<4 x f32>.
 #: Fragment layout: lane l → A[row=l%16, k=(l//16)*8+0..7], col=l%16.
 #: Writer: lane//16 == 0 (16 distinct output columns per tile).
-#: Acc layout (empirically verified on gfx942): acc[ii] at group g -> head g*4+ii.
+#: Acc layout: acc[ii] at group g -> head g*4+ii.
 _MFMA16 = MfmaAtom(
     name="16x16x32",
     MFMA_M=16, MFMA_N=16, MFMA_K=32,
@@ -119,7 +118,7 @@ _MFMA16 = MfmaAtom(
 #: 32×32 output tile, K=16 fp8 elements/step.  Acc: vec<16 x f32>.
 #: Fragment layout: lane l → A[row=l%32, k=(l//32)*8+0..7], col=l%32.
 #: Writer: lane//32 == 0 (32 distinct output columns per tile).
-#: Acc layout (empirically verified on gfx942): acc[ii] at group g ->
+#: Acc layout: acc[ii] at group g ->
 #:   head (ii//4)*8 + g*4 + ii%4.  static_offsets = ii%4 + (ii//4)*8.
 _MFMA32 = MfmaAtom(
     name="32x32x16",
@@ -141,47 +140,10 @@ def _i32_add(a, b):
     """Add two fx.Int32 scalars -> fx.Int32 (i32 arithmetic)."""
     return fx.Int32(arith.addi(_to_raw(a), _to_raw(b)))
 
-
-def _fp8_byte_to_f32(byte_scalar):
-    """Convert a raw i8 fp8-byte load to f32 via ``v_cvt_f32_fp8``.
-
-    ``rocdl.raw.ptr.buffer.load`` cannot return an fp8 scalar (the result type
-    must be LLVM-compatible) and ``arith.extf`` does not lower for fp8, so fp8
-    tensors are loaded as i8 bytes, zero-extended into the low byte of an i32,
-    and converted with the native gfx942 fp8->f32 instruction (byteSel=0). On
-    CDNA3 this instruction uses the E4M3 *FNUZ* interpretation, matching the
-    host fp8 cast.
-    """
-    src_i32 = _to_raw(ArithValue(_to_raw(byte_scalar)).extui(T.i32))
-    return rocdl.cvt_f32_fp8(T.f32, src_i32, 0)
-
-
-# 1 wave64 per query row. Each lane strides over the KV window.
-BLOCK_THREADS = 64
-
-# Vector width for the head-dim (D) inner load (fp8 elements per chunk).
-# D in {64, 128} are both multiples of 8, so the dot over D is a whole
-# number of VEC-wide chunks.
-VEC_D = 8
-
 _DEFAULT_COMPILE_HINTS = {
     "waves_per_eu": 2,
     "fast_fp_math": True,
 }
-
-
-def _fp8_dtype():
-    """fp8 element type for the current arch (matches preshuffle_gemm).
-
-    gfx942 / CDNA3 ships e4m3 *FNUZ*; gfx950 / CDNA4 and gfx12 ship OCP
-    e4m3 *FN*. The two are NOT bit-compatible, so the kernel must read the
-    fp8 bytes with the same format the host cast them to.
-    """
-    arch = str(get_hip_arch())
-    if arch == "gfx942":
-        return fx.Float8E4M3FNUZ
-    return fx.Float8E4M3FN
-
 
 def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                            rows_per_block: int, waves_per_block: int,
