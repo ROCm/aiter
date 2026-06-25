@@ -306,7 +306,22 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
             ).result
 
         def global_atomic_load_i32_acquire(elem_i32):
-            return global_atomic_add_i32(elem_i32, c_zero, llvm.AtomicOrdering.acquire)
+            # True acquire load of the slot rather than an atomicAdd(slot, 0)
+            # read-modify-write. The RMW form carried wave-reduce scaffolding
+            # (mbcnt / readfirstlane / exec-mask toggling) on every spin
+            # iteration; a plain acquire load (matching the AITER HIP
+            # __atomic_load_n(..., __ATOMIC_ACQUIRE) spin) reads the L2-coherent
+            # value without it. Kept volatile + agent-scoped acquire so it is not
+            # hoisted/cached and still establishes the cross-CTA happens-before
+            # with the release publish below.
+            return llvm.LoadOp(
+                T.i32,
+                global_i32_ptr(elem_i32),
+                alignment=4,
+                volatile_=True,
+                ordering=llvm.AtomicOrdering.acquire,
+                syncscope="agent",
+            ).result
 
         def lds_atomic_add_i32(base, elem_i32, value):
             return llvm.AtomicRMWOp(
@@ -337,7 +352,6 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
         def row_barrier(token: int):
             token_value = fx.Int32(token)
             target_arrivals = ArithValue(token_value) * ArithValue(active_parts)
-            rocdl.s_waitcnt(0)
             gpu.barrier()
             if tid == ArithValue(c_zero):
                 prev = global_atomic_add_i32(
