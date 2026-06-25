@@ -5,6 +5,7 @@ import functools
 import os
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Optional
 
 import aiter
@@ -22,8 +23,20 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.ops.flydsl.moe_common import GateMode
+
+try:
+    from aiter.ops.flydsl.utils import is_flydsl_available
+    from aiter.ops.flydsl.moe_common import GateMode
+except ImportError:
+
+    class GateMode(Enum):
+        SEPARATED = "separated"
+        INTERLEAVE = "interleave"
+
+    def is_flydsl_available():
+        return False
+
+
 from aiter import (
     fused_dynamic_mxfp4_quant_moe_sort,
     fused_dynamic_mxfp8_quant_moe_sort,
@@ -425,35 +438,41 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-        _maybe_grouped_gfx1250_a8w4_moe,
-    )
+    grouped_a8w4_out = None
+    if is_flydsl_available():
+        try:
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                _maybe_grouped_gfx1250_a8w4_moe,
+            )
+        except ImportError:
+            _maybe_grouped_gfx1250_a8w4_moe = None
 
-    grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        E=E,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        dtype=dtype,
-        activation=activation,
-        quant_type=quant_type,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
-        isG1U1=isG1U1,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        expert_mask=expert_mask,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        gate_mode=gate_mode,
-    )
+        if _maybe_grouped_gfx1250_a8w4_moe is not None:
+            grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                E=E,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                dtype=dtype,
+                activation=activation,
+                quant_type=quant_type,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                isG1U1=isG1U1,
+                doweight_stage1=doweight_stage1,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                expert_mask=expert_mask,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                gate_mode=gate_mode,
+            )
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
