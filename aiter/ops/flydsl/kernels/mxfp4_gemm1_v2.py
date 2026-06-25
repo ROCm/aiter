@@ -9,13 +9,14 @@ policy (tuned config BM32_NT vs BM32_CACHED): True -> non-temporal, False -> cac
 changes the B-load column, the B-scale n-pack base, and the mfma opsel (the epilogue
 gate/up split is the same for both, since accm[J] holds the same logical (g/u, n0)).
 
-Layout-API pieces:
-  * B load -> preshuffle ``fx.make_layout`` view + ``fx.copy`` into register
-    fragments; the nt/cached policy rides on the copy atom's ``cache_modifier``.
-  * B-scale load -> same ``fx.make_layout`` view + ``fx.copy`` (32b, cached) into
-    per-stage i32 fragments; the per-K-tile offset rides the voffset (no hi/lo split).
-  * MMA -> one ``fx.gemm`` per mfma over rank-1 register fragments (A/B/C), with
-    per-K-block e8m0 scales via ``scale_a=/scale_b=`` kwargs and a pre-built
+Layout-API pieces (the B/B-scale views, copy atoms, and the scaled-MFMA atom set +
+``gemm_mma`` are shared with gemm2 via ``mxfp4_moe_layout``):
+  * B load -> ``ml.bq_view`` + ``fx.copy`` into register fragments; the nt/cached
+    policy rides on the copy atom's ``cache_modifier``.
+  * B-scale load -> ``ml.bscale_view`` + ``fx.copy`` (32b, cached) into per-stage i32
+    fragments; the per-K-tile offset rides the voffset (no hi/lo split).
+  * MMA -> one ``ml.gemm_mma`` (fx.gemm) per mfma over rank-1 register fragments
+    (A/B/C), with per-K-block e8m0 scales via ``scale_a=/scale_b=`` and a pre-built
     opsel-specialized ``MFMA_Scale`` atom per (opselA,opselB). C accumulates in
     place (d == c). mem2reg folds the fragment plumbing -> ISA == the raw intrinsic.
 
@@ -31,10 +32,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Float4E2M1FN
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+
+from . import mxfp4_moe_layout as ml
 
 # ---- constants (KIMI defaults; per-shape values come from compile args) ------
 NE_DEFAULT, K_DEFAULT, INTER_DEFAULT, TOPK_DEFAULT = 385, 7168, 512, 9
@@ -305,68 +307,38 @@ def _gemm1_body_v2(
     # and the per-lane (klane,nlane) are layout axes -> a VGPR voffset at copy time.
     # nt/cached rides on the copy atom's cache_modifier (2=nt/0=cached).
     KH4 = K_HALF // 4  # i32 stride for the col axis
-    _b_copy_atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy128b(2 if b_nontemporal else 0), 32  # 4x i32 = 128b
-    )
-    # B-scale is small and reused across blocks -> always cached (cache_modifier=0),
-    # matching v1's plain buffer_load; 1x i32 = 32b per (lane, K-tile, n-pack).
-    _bs_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), 32)
+    _b_copy_atom = ml.b_copy_atom(b_nontemporal)
+    _bs_copy_atom = ml.bscale_copy_atom()
 
     N0_HALF = N_OUT // 32  # separate-mode gate/up column split
 
+    # B-load view per j-tile (shared layout primitive). interleave / separated only
+    # change which logical N-row `col` maps to; the view layout is identical.
     def _make_bq_view_for_jtile(j):
         if const_expr(interleave):
             col = n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
         else:
             tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
             col = ((tile_il & fx.Int32(1)) * fx.Int32(N0_HALF) + (tile_il >> fx.Int32(1))) * fx.Int32(16)
-        col_base = rocdl.readfirstlane(T.i32, (e * fx.Int32(N_OUT) + col) * fx.Int32(KH4))
-        i32_ptr_ty = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=16
-        )
-        # zext col_base BEFORE *4: the byte offset can exceed a signed i32.
-        off_i64 = fx.Int64(arith.ExtUIOp(T.i64, _raw(col_base)).result)
-        base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_bq) + off_i64 * fx.Int64(4))
-        # i32 strides: klane[0,4)->64, nlane[0,16)->4, K_C->512, half[0,2)->256, kpack4->1
-        view = fx.Tensor(
-            fx.make_view(
-                base_iter,
-                fx.make_layout((4, 16, K_TILES_TOTAL, 2, 4), (64, 4, 512, 256, 1)),
-            )
-        )
-        return fx.rocdl.make_buffer_tensor(view, max_size=False)
+        return ml.bq_view(arg_bq, e * fx.Int32(N_OUT) + col, KH4, K_TILES_TOTAL)
 
     _bq_views = [_make_bq_view_for_jtile(j) for j in range_constexpr(4)]
 
-    # B-scale view (mirrors the B payload): uniform per-(wave,mw) expert/n-pack base,
-    # with the per-lane (klane,nlane) and the K-tile as layout axes -> a VGPR voffset
-    # at copy time. v1 split K into hi/lo to keep its raw soffset uniform; here the
-    # full K_C rides the voffset, so one view per mw covers all K-tiles.
-    def _make_bscale_view(mw):
-        base_dw = rocdl.readfirstlane(
-            T.i32,
+    # B-scale view per n-pack word (shared layout primitive).
+    _bscale_views = [
+        ml.bscale_view(
+            arg_bscale,
             e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw),
+            K_TILES_TOTAL,
+            k0_stride_dw=kBS_stride_k0_dw,
         )
-        i32_ptr_ty = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        off_i64 = fx.Int64(arith.ExtUIOp(T.i64, _raw(base_dw)).result)
-        base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_bscale) + off_i64 * fx.Int64(4))
-        # i32 strides: klane[0,4)->16, nlane[0,16)->1, K_C->64, unit->1
-        view = fx.Tensor(
-            fx.make_view(
-                base_iter,
-                fx.make_layout((4, 16, K_TILES_TOTAL, 1), (16, 1, kBS_stride_k0_dw, 1)),
-            )
-        )
-        return fx.rocdl.make_buffer_tensor(view, max_size=False)
-
-    _bscale_views = [_make_bscale_view(mw) for mw in range_constexpr(2)]
+        for mw in range_constexpr(2)
+    ]
 
     # All MMA operands are register fragments for fx.gemm (rank-1 -> one MmaAtomCall).
     # i32<4:1> (16B = 32 fp4) for A/B; f32<4:1> (vec4) for C. B is PER-STAGE (kStages)
     # to hold the prefetch pipeline; A is refilled per K iter; C accumulates in place.
-    _frag_tmpl = _bq_views[0][0, 0, 0, 0, None]  # i32<4:1>
+    _frag_tmpl = ml.bq_frag_tmpl(_bq_views[0])  # i32<4:1>
     _bq_frags = [
         [
             [fx.make_fragment_like(_frag_tmpl) for _ in range_constexpr(2)]
@@ -386,7 +358,7 @@ def _gemm1_body_v2(
         for _ in range_constexpr(kMChunks)
     ]
     # B-scale fragments: i32<1:1>, PER-STAGE (kStages) double-buffer like _bq_frags.
-    _bs_frag_tmpl = _bscale_views[0][0, 0, 0, None]  # i32<1:1>
+    _bs_frag_tmpl = ml.bscale_frag_tmpl(_bscale_views[0])  # i32<1:1>
     _bs_frags = [
         [fx.make_fragment_like(_bs_frag_tmpl) for _ in range_constexpr(2)]
         for _ in range_constexpr(kStages)
@@ -409,24 +381,14 @@ def _gemm1_body_v2(
                 _bs_frags[stage][mw],
             )
 
-    # MMA -- one fx.gemm per mfma over rank-1 fragments (-> one scaled MmaAtomCall).
-    # Scales ride on the atom state via scale_a=/scale_b= kwargs; per-mfma opsel is a
-    # type param, so pre-build one atom per (opselA,opselB) (all 16, at trace time).
-    # cbsz/blgp(=4 for fp4) are inferred from Float4E2M1FN. C accumulates in place (d==c).
+    # MMA -- one fx.gemm per mfma over rank-1 fragments (shared layout primitive).
+    # Scales ride scale_a=/scale_b=; the (opselA,opselB) atom set is pre-built once.
+    # C accumulates in place (d == c).
     zero4 = Vec.filled(4, 0.0, fx.Float32)
-    _scale_mma_atoms = {
-        (osa, osb): fx.make_mma_atom(
-            fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, Float4E2M1FN, opsel_a=osa, opsel_b=osb)
-        )
-        for osa in range_constexpr(4)
-        for osb in range_constexpr(4)
-    }
+    _scale_mma_atoms = ml.scale_mma_atoms()
 
     def _gemm_mma(a_frag, b_frag, c_frag, opsel_a, opsel_b, sa, sb):
-        fx.gemm(
-            _scale_mma_atoms[(opsel_a, opsel_b)], c_frag, a_frag, b_frag, c_frag,
-            scale_a=sa, scale_b=sb,
-        )
+        ml.gemm_mma(_scale_mma_atoms, a_frag, b_frag, c_frag, opsel_a, opsel_b, sa, sb)
 
     def mfma_cluster(stage, a_scale, J):
         # interleave: mni=J//2 (n0), in_b=J%2 (gate/up); separate: swapped.

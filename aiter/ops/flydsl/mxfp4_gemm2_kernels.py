@@ -15,6 +15,7 @@ kernelName2:
 """
 
 import functools
+import os
 
 import torch
 
@@ -54,7 +55,16 @@ def _epilog_of(atomic, mxfp4out, cshuffle=False):
 def _get_compiled_mxfp4_gemm2_port(
     BM, use_nt, NE, N_OUT, epilog, D_INTER, D_INTER_REAL=None
 ):
-    from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
+    # Backend switch: AITER_MXFP4_GEMM2_V2=1 selects the layout-API v2 port for the
+    # (BM=32, atomic) variant (both use_nt; fast + streaming K-loop). Any other
+    # variant (or the env unset) keeps the byte-exact raw v1 kernel.
+    if (
+        os.environ.get("AITER_MXFP4_GEMM2_V2") == "1"
+        and (BM, epilog) == (32, "atomic")
+    ):
+        from .kernels.mxfp4_gemm2_v2 import compile_gemm2_a4w4_port
+    else:
+        from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
 
     return compile_gemm2_a4w4_port(
         BM=BM,
