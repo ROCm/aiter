@@ -2924,8 +2924,16 @@ def compile_mxscale_gemm(
                         addr_hi_bs = results[n_accs + 7]
 
             # Tail -- same acc_mixed pattern: fence at top, TDM mid-compute.
+            # With a main loop, the tail seamlessly continues the software
+            # pipeline: the first tail step's own pipeline_fence_signal (Fence Y)
+            # drains to the correct per-step level, so this separate tail-entry
+            # drain (Fence X) is redundant. The ONLY exception is when the first
+            # tail step is terminal (outstanding==-1, e.g. extra==0/steps==1): it
+            # carries no fence of its own, so X is the sole drain and must stay.
+            _skip_tail_entry_fence = bool(tail_plan) and tail_plan[0][2] != -1
             if const_expr(loop_iters > 0):
-                pipeline_fence(outstanding=0, use_cluster=use_cluster)
+                if const_expr(not _skip_tail_entry_fence):
+                    pipeline_fence(outstanding=0, use_cluster=use_cluster)
             elif const_expr(use_cluster):
                 gpu.cluster_barrier()
             epi_addrs_box = [None]
