@@ -99,16 +99,9 @@ def _gluon_fused_reduce_rms_mxfp4_quant_kernel(
     sharedLayout2D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
     sharedLayoutN: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
 
-    # layout descriptors for the second input
-    gLayout3d_spk2: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 2],
-        [1, 1, 32],
-        [1, 1, 4],
-        [2, 1, 0],
-    )
 
-    gLayoutN3_2: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gLayout3d_spk2))
-    gLayout2d_x2: gl.constexpr = gl.SliceLayout(0, gLayout3d_spk2)
+    gLayoutN3_2: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(1, gLayout3d_spk))
+    gLayout2d_x2: gl.constexpr = gl.SliceLayout(0, gLayout3d_spk)
     gLayoutN2: gl.constexpr = gl.SliceLayout(0, gLayout2d_x2)
 
     # TDM descriptor for main branch
@@ -150,20 +143,6 @@ def _gluon_fused_reduce_rms_mxfp4_quant_kernel(
             [BLOCK_SIZE_M, BLOCK_SIZE_N],
             sharedLayout2D,
         )
-    w2_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        w2_ptr,
-        [N2],
-        [1],
-        [BLOCK_SIZE_N2],
-        sharedLayoutN,
-    )
-    out2_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        out2_ptr,
-        [M, N2],
-        [out2_stride_m, 1],
-        [BLOCK_SIZE_M, BLOCK_SIZE_N2],
-        sharedLayout2D,
-    )
     if HAS_SPLITK:
         out3_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             out3_ptr,
@@ -202,16 +181,6 @@ def _gluon_fused_reduce_rms_mxfp4_quant_kernel(
             sharedLayout2D,
         )
 
-    smemW2 = gl.allocate_shared_memory(
-        w2_ptr.dtype.element_ty,
-        [BLOCK_SIZE_N2],
-        sharedLayoutN,
-    )
-    smemOut2 = gl.allocate_shared_memory(
-        out2_ptr.dtype.element_ty,
-        [BLOCK_SIZE_M, BLOCK_SIZE_N2],
-        sharedLayout2D,
-    )
     if HAS_SPLITK:
         smemOut3 = gl.allocate_shared_memory(
             out3_ptr.dtype.element_ty,
@@ -275,6 +244,30 @@ def _gluon_fused_reduce_rms_mxfp4_quant_kernel(
     if start_pid >= num_pid_m:
         start_pid -= num_pid_m
         if HAS_SECOND_INPUT:
+            w2_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                w2_ptr,
+                [N2],
+                [1],
+                [BLOCK_SIZE_N2],
+                sharedLayoutN,
+            )
+            out2_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                out2_ptr,
+                [M, N2],
+                [out2_stride_m, 1],
+                [BLOCK_SIZE_M, BLOCK_SIZE_N2],
+                sharedLayout2D,
+            )
+            smemW2 = gl.allocate_shared_memory(
+                w2_ptr.dtype.element_ty,
+                [BLOCK_SIZE_N2],
+                sharedLayoutN,
+            )
+            smemOut2 = gl.allocate_shared_memory(
+                out2_ptr.dtype.element_ty,
+                [BLOCK_SIZE_M, BLOCK_SIZE_N2],
+                sharedLayout2D,
+            )
             if HAS_SPLITK:
                 spk_offs = gl.arange(0, NUM_SPLITK_POW2, layout=gLayoutSPK)
             x_offs_m = start_pid * BLOCK_SIZE_M + gl.arange(
@@ -408,7 +401,6 @@ def _gluon_fused_reduce_rms_mxfp4_quant_kernel(
             ".cg",
         ).to(gl.float32)
 
-    # placeholder
     gl.amd.gfx1250.tdm.async_wait(0)
     if FIRST_INPUT_RES:
         res1 = smemRes1.load(gLayout2d).to(gl.float32)
