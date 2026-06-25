@@ -5023,44 +5023,59 @@ def _precompile_ps_reduce_sibling_variants(
     for n in range(1, PA_DECODE_MAX_SPLITS + 1):
         if n == skip_n:
             continue
-        # Minimal valid shapes for partition count n (batch=1, num_kv_heads=1).
-        output = torch.empty(
-            1, qlen, 1, group, head_size, device=device, dtype=output_dtype
-        )
-        exp_sums = torch.zeros(1, 1, n, eq_group, device=device, dtype=torch.float32)
-        max_logits = torch.zeros(1, 1, n, eq_group, device=device, dtype=torch.float32)
-        temporary_output = torch.zeros(
-            1, 1, n, eq_group, head_size, device=device, dtype=logits_dtype
-        )
-        sink = (
-            torch.empty(group, device=device, dtype=sink_dtype)
-            if use_sinks
-            else torch.empty(0, device=device, dtype=output_dtype)
-        )
-        compiled = compile_pa_decode_ps_reduce_flydsl(
-            max_context_partition_num=n, **compile_kwargs
-        )
-        compiled["launch"](
-            output,
-            exp_sums,
-            max_logits,
-            temporary_output,
-            sink,
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            output.stride(3),
-            exp_sums.stride(0),
-            exp_sums.stride(1),
-            exp_sums.stride(2),
-            temporary_output.stride(0),
-            temporary_output.stride(1),
-            temporary_output.stride(2),
-            temporary_output.stride(3),
-            output.shape[0],
-            output.shape[2],
-            stream,
-        )
+        # Best-effort: a failure here (compile error, OOM, ...) must not break the
+        # already-completed real launch. Skip this variant and let a later real
+        # call JIT-compile it on demand.
+        try:
+            # Minimal valid shapes for partition count n (batch=1, num_kv_heads=1).
+            output = torch.empty(
+                1, qlen, 1, group, head_size, device=device, dtype=output_dtype
+            )
+            exp_sums = torch.zeros(
+                1, 1, n, eq_group, device=device, dtype=torch.float32
+            )
+            max_logits = torch.zeros(
+                1, 1, n, eq_group, device=device, dtype=torch.float32
+            )
+            temporary_output = torch.zeros(
+                1, 1, n, eq_group, head_size, device=device, dtype=logits_dtype
+            )
+            sink = (
+                torch.empty(group, device=device, dtype=sink_dtype)
+                if use_sinks
+                else torch.empty(0, device=device, dtype=output_dtype)
+            )
+            compiled = compile_pa_decode_ps_reduce_flydsl(
+                max_context_partition_num=n, **compile_kwargs
+            )
+            compiled["launch"](
+                output,
+                exp_sums,
+                max_logits,
+                temporary_output,
+                sink,
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                output.stride(3),
+                exp_sums.stride(0),
+                exp_sums.stride(1),
+                exp_sums.stride(2),
+                temporary_output.stride(0),
+                temporary_output.stride(1),
+                temporary_output.stride(2),
+                temporary_output.stride(3),
+                output.shape[0],
+                output.shape[2],
+                stream,
+            )
+        except Exception as e:
+            aiter.logger.warning(
+                "pa_decode flydsl PS-reduce: best-effort precompile of partition "
+                "variant n=%d failed (%s); it will JIT-compile on demand if needed.",
+                n,
+                e,
+            )
 
 
 def launch_pa_decode_ps_reduce_flydsl(
