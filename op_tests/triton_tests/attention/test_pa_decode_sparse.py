@@ -416,11 +416,19 @@ def test_pa_decode_sparse_blocked_vs_reference(
 
     if isinstance(result, tuple):
         # skip_reduce with split-K active: combine partials in torch. The split
-        # unit is one block, so the segment math uses block_k=1; the blocked
-        # kernel is triton-only, so the partials are base-2 (use_exp2=True).
+        # unit is one block, so the segment math uses block_k=1. On gfx1250 the
+        # gluon kernel emits natural-exp partials (use_exp2=False); other arches
+        # use the triton kernel which emits base-2 partials (use_exp2=True).
         acc_partial, m_partial, l_partial = result
+        use_exp2 = arch_info.get_arch() != "gfx1250"
         out = _reduce_partials_torch(
-            acc_partial, m_partial, l_partial, sink, indptr, block_k=1, use_exp2=True
+            acc_partial,
+            m_partial,
+            l_partial,
+            sink,
+            indptr,
+            block_k=1,
+            use_exp2=use_exp2,
         ).to(q.dtype)
     else:
         out = result

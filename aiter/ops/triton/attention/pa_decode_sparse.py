@@ -25,6 +25,7 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse as gluon_pa_decode_sparse,
+    _pa_decode_sparse_blocked as gluon_pa_decode_sparse_blocked,
 )
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -398,10 +399,14 @@ def pa_decode_sparse_blocked(
     h_padded = n_head_blocks * block_h
     block_d = triton.next_power_of_2(D)
 
-    # No gluon path for the blocked variant: always the triton kernel, so the
-    # partials live in the base-2 domain (USE_EXP2=True).
-    attn_num_warps = 4
-    max_num_wg = 256
+    use_gluon = DEVICE_ARCH == "gfx1250"
+
+    if use_gluon:
+        attn_num_warps = 2
+        max_num_wg = 512
+    else:
+        attn_num_warps = 4
+        max_num_wg = 256
     num_stages = 2
     waves_per_eu = 1
     reduce_num_warps = 4
@@ -442,8 +447,13 @@ def pa_decode_sparse_blocked(
         ks_stride_b_arg = 1
         num_groups_arg = 1
 
+    if use_gluon:
+        blocked_impl = gluon_pa_decode_sparse_blocked
+    else:
+        blocked_impl = triton_pa_decode_sparse_blocked
+
     grid_attn = (T, n_head_blocks, kv_splits)
-    triton_pa_decode_sparse_blocked[grid_attn](
+    blocked_impl[grid_attn](
         q,
         unified_kv,
         kv_scales_arg,
@@ -525,7 +535,7 @@ def pa_decode_sparse_blocked(
         kv_splits,
         BLOCK_H=block_h_reduce,
         BLOCK_D=block_d,
-        USE_EXP2=True,
+        USE_EXP2=not use_gluon,
         num_warps=reduce_num_warps,
     )
     return out
