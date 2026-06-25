@@ -16,16 +16,19 @@ namespace aiter {
 namespace minimax_m3_index_score_ops {
 
 constexpr int kHeadDim = 128;
-constexpr int kNumLanes = 16;
-constexpr int kNumWaves = 16;
-constexpr int kElemsPerLane = kHeadDim / kNumLanes;
+constexpr int kWarpSize = 32;
+constexpr int kGroupLanes = 16;
+constexpr int kGroupsPerWarp = kWarpSize / kGroupLanes;
+constexpr int kNumWarps = 8;
+constexpr int kNumTokenGroups = kNumWarps * kGroupsPerWarp;
+constexpr int kElemsPerLane = kHeadDim / kGroupLanes;
 
-__device__ __forceinline__ float warpReduceSum(float val)
+__device__ __forceinline__ float groupReduceSum(float val)
 {
 #pragma unroll
-    for(int mask = kNumLanes / 2; mask > 0; mask >>= 1)
+    for(int mask = kGroupLanes / 2; mask > 0; mask >>= 1)
     {
-        val += __shfl_xor(val, mask, kNumLanes);
+        val += __shfl_xor(val, mask, kGroupLanes);
     }
     return val;
 }
@@ -74,8 +77,11 @@ __global__ void decodeIndexScoreKernel(
     int64_t stride_s_k,
     int64_t stride_bt_b)
 {
-    const int lane = threadIdx.x & (kNumLanes - 1);
-    const int wave = threadIdx.x / kNumLanes;
+    const int warp_id = threadIdx.x / kWarpSize;
+    const int warp_lane = threadIdx.x & (kWarpSize - 1);
+    const int group_in_warp = warp_lane / kGroupLanes;
+    const int lane = warp_lane & (kGroupLanes - 1);
+    const int token_group = warp_id * kGroupsPerWarp + group_in_warp;
     const int64_t pid_tc = blockIdx.x;
     const int64_t pid_h = blockIdx.y;
     const int64_t pid_t = pid_tc % total_q;
@@ -107,7 +113,7 @@ __global__ void decodeIndexScoreKernel(
     load8Vec(q + pid_t * stride_q_n + pid_h * stride_q_h + dim0 * stride_q_d, q_vals);
 
     const int32_t* __restrict__ bt_row = block_table + pid_b * stride_bt_b;
-    __shared__ float wave_scores[kNumWaves];
+    __shared__ float wave_scores[kNumTokenGroups];
     for(int64_t blk = chunk_start; blk < chunk_end; ++blk)
     {
         const bool is_init = blk < init_blocks;
@@ -128,7 +134,7 @@ __global__ void decodeIndexScoreKernel(
         const scalar_t* __restrict__ k_blk =
             index_kv_cache + page * stride_k_blk + dim0 * stride_k_d;
 
-        for(int64_t off = wave; off < block_size; off += kNumWaves)
+        for(int64_t off = token_group; off < block_size; off += kNumTokenGroups)
         {
             const int64_t pos = blk * block_size + off;
             if(pos >= causal_len)
@@ -143,7 +149,7 @@ __global__ void decodeIndexScoreKernel(
             {
                 dot += q_vals[i] * k_vals[i];
             }
-            dot = warpReduceSum(dot) * sm_scale_log2e;
+            dot = groupReduceSum(dot) * sm_scale_log2e;
             if(lane == 0)
             {
                 wave_score = fmaxf(wave_score, dot);
@@ -152,7 +158,7 @@ __global__ void decodeIndexScoreKernel(
 
         if(lane == 0)
         {
-            wave_scores[wave] = wave_score;
+            wave_scores[token_group] = wave_score;
         }
         __syncthreads();
 
@@ -160,7 +166,7 @@ __global__ void decodeIndexScoreKernel(
         {
             float block_score = wave_scores[0];
 #pragma unroll
-            for(int i = 1; i < kNumWaves; ++i)
+            for(int i = 1; i < kNumTokenGroups; ++i)
             {
                 block_score = fmaxf(block_score, wave_scores[i]);
             }
@@ -198,7 +204,7 @@ void launchDecodeIndexScore(const aiter_tensor_t& idx_q,
     const int64_t num_idx_heads = idx_q.size(1);
     const dim3 grid(static_cast<unsigned int>(total_q * num_kv_chunks),
                     static_cast<unsigned int>(num_idx_heads));
-    const dim3 block(kNumLanes * kNumWaves);
+    const dim3 block(kWarpSize * kNumWarps);
     const float sm_scale_log2e = static_cast<float>(sm_scale) * 1.4426950409f;
 
     hipLaunchKernelGGL((decodeIndexScoreKernel<scalar_t>),
