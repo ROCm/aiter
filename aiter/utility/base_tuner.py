@@ -372,6 +372,8 @@ class TunerCommon:
                 untunedf = untunedf[target_mask]
             self.untunedf = untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
+                self.tunedf["gfx"] = gfx
 
             untunedf_cols = self.untunedf.columns
             mask = (
@@ -412,9 +414,11 @@ class TunerCommon:
             "_tmp_key"
         ].tolist()
         for key in matched_keys:
-            df_old.loc[df_old.index[df_old["_tmp_key"] == key][0]] = df_updates.loc[
-                df_updates["_tmp_key"] == key
-            ].values[0]
+            old_idx = df_old.index[df_old["_tmp_key"] == key][0]
+            update_row = df_updates.loc[df_updates["_tmp_key"] == key].iloc[0]
+            # Assign by column name so migrated legacy CSVs with newly inserted
+            # columns (for example gfx) do not corrupt rows by positional shift.
+            df_old.loc[old_idx, df_updates.columns] = update_row
         if unmatched_keys:
             unmatched_rows = df_updates[
                 df_updates["_tmp_key"].isin(unmatched_keys)
@@ -1337,6 +1341,9 @@ class TunerCommon:
             tunedf = self.get_tuned_gemm_list(run_config_file)
             if not tunedf.empty and self.keys[0] in tunedf.columns:
                 cu = self.get_cu_num()
+                gfx = self.get_gfx()
+                if "gfx" in tunedf.columns:
+                    tunedf = tunedf[tunedf["gfx"].astype(str) == str(gfx)]
                 if "cu_num" in tunedf.columns:
                     tunedf = tunedf[tunedf["cu_num"] == cu]
                 self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
