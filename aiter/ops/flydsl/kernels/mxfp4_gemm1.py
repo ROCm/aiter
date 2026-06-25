@@ -140,6 +140,7 @@ def _gemm1_body(
     NUM_N_BLOCKS,
     OUT_AS_PER_CHUNK_DW,
     K_G2_HALF,
+    interleave=True,
 ):
     BN_INT = BN // 2
     b_aux = 2 if use_nt else 0
@@ -197,22 +198,33 @@ def _gemm1_body(
                 llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
             )
 
+    # -- b_load_s_base[j] (HIP 412-416), readfirstlane'd uniform per wave ------
+    N0_HALF = N_OUT // 32
     b_load_s_base = []
     for j in range_constexpr(4):
-        v = (
-            e * fx.Int32(N_OUT)
-            + n_block_idx * fx.Int32(BN)
-            + wave * fx.Int32(BN // 4)
-            + fx.Int32(j * 16)
-        ) * fx.Int32(K_HALF)
+        if const_expr(interleave):
+            col = (
+                n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
+            )
+        else:
+            tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
+            g = tile_il & fx.Int32(1)
+            n0 = tile_il >> fx.Int32(1)
+            col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
+        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
-    mni_base = n_block_idx * fx.Int32(BN // 16 // 2) + wave * fx.Int32(BN // 64 // 2)
+    # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
+    if const_expr(interleave):
+        mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
+        np_list = [mni_base, mni_base + fx.Int32(1)]
+    else:
+        np_gate = n_block_idx * fx.Int32(BN // 64) + wave
+        np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(2):
         base = (
-            e * fx.Int32(kBS_per_expert_dw)
-            + (mni_base + fx.Int32(mw)) * fx.Int32(kBS_stride_n0_dw)
+            e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
         ) * fx.Int32(4)
         base = rocdl.readfirstlane(T.i32, base)
         b_scale_s_base.append(base)
@@ -475,8 +487,12 @@ def _gemm1_body(
     zero4 = Vec.filled(4, 0.0, fx.Float32)
 
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, init):
-        mni = J // 2
-        in_b = J % 2
+        if const_expr(interleave):
+            mni = J // 2
+            in_b = J % 2
+        else:
+            mni = J % 2
+            in_b = J // 2
         sb = bs_slot[mni]
         bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
         if const_expr(kMChunks == 1):
@@ -739,11 +755,12 @@ def compile_gemm1_a4w4_port(
     TOPK,
     BN=256,
     BK=256,
+    interleave=True,
 ):
     print(
         f"[PORT-FLYDSL-GEMM1] compile_gemm1_a4w4_port ENTERED "
         f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} "
-        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE}",
+        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE} interleave={interleave}",
         flush=True,
     )
     if (BM, use_nt, inline_quant) not in {
@@ -784,7 +801,10 @@ def compile_gemm1_a4w4_port(
     )
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}"
+    # Tag with H/INTER/NE so different shape specializations get distinct
+    # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
+    gu_tag = "il" if interleave else "sep"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name=f"gemm1port_smem_{name_suffix}"
@@ -857,6 +877,7 @@ def compile_gemm1_a4w4_port(
                 NUM_N_BLOCKS=_NUM_N_BLOCKS,
                 OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
                 K_G2_HALF=_K_G2_HALF,
+                interleave=interleave,
             )
 
     @flyc.jit

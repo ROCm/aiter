@@ -55,18 +55,29 @@ from aiter.utility.base_tuner import TunerCommon
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
+try:
+    from aiter.ops.flydsl.utils import is_flydsl_available
+except ImportError:
 
-from aiter.ops.flydsl.utils import is_flydsl_available
+    def is_flydsl_available():
+        return False
+
 
 if is_flydsl_available():
-    from aiter.ops.flydsl.moe_kernels import (
-        get_flydsl_stage1_kernels,
-        get_flydsl_stage2_kernels,
-        get_flydsl_stage1_kernels_int4_bf16,
-        get_flydsl_stage2_kernels_int4_bf16,
-        flydsl_moe_stage1,
-        flydsl_moe_stage2,
-    )
+    try:
+        from aiter.ops.flydsl.moe_kernels import (
+            get_flydsl_stage1_kernels,
+            get_flydsl_stage2_kernels,
+            get_flydsl_stage1_kernels_int4_bf16,
+            get_flydsl_stage2_kernels_int4_bf16,
+            flydsl_moe_stage1,
+            flydsl_moe_stage2,
+        )
+    except ImportError:
+
+        def is_flydsl_available():
+            return False
+
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
@@ -598,34 +609,27 @@ class FmoeTuner(TunerCommon):
 
     @staticmethod
     def _mxfp4_port_g1_kname(ne, h, e, bm, use_nt, inline_quant):
-        # Build a gemm1 kernel name matching the mxfp4 codegen/CSV grammar
-        # (see aiter.fused_moe._parse_mxfp4_g1_kname). BM16 is inline-quant
-        # (bare = NT/read-once, _CACHED = cached); BM32 cshuffle uses _NT/_CACHED;
-        # BM128 takes no variant suffix.
-        name = f"mxfp4_moe_g1_a4w4_NE{ne}_H{h}_E{e}_BM{bm}"
+        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
+        name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
         if inline_quant:
-            name += "_INLINEQUANT" + ("" if use_nt else "_CACHED")
-        elif bm == 32:
-            name += "_NT" if use_nt else "_CACHED"
+            name += "_f16in"
+        if use_nt:
+            name += "_nt"
         return name
 
     @staticmethod
     def _mxfp4_port_g2_kname(ne, h, e, topk, bm, use_nt, epilog):
-        # Build a gemm2 kernel name matching the mxfp4 codegen/CSV grammar
-        # (see aiter.fused_moe._parse_mxfp4_g2_kname). epilog in
-        # {atomic, nonatomic, nonatomic_mxfp4, nonatomic_cshuffle}. atomic carries
-        # the TOPK tag and an optional _NT; nonatomic drops TOPK and may add
-        # _MXFP4OUT or _CSHUFFLE.
+        # flydsl_mxmoe_g2_a4w4_<BM>x256x256[_atomic[_nt] | _f4out | _cshuffle];
+        # nonatomic is the bare default. See mxfp4_kname.py.
+        name = f"flydsl_mxmoe_g2_a4w4_{bm}x256x256"
         if epilog == "atomic":
-            name = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_TOPK{topk}_BM{bm}_ATOMIC"
+            name += "_atomic"
             if use_nt:
-                name += "_NT"
-            return name
-        name = f"mxfp4_moe_g2_a4w4_NE{ne}_H{h}_E{e}_BM{bm}_NONATOMIC"
-        if epilog == "nonatomic_mxfp4":
-            name += "_MXFP4OUT"
+                name += "_nt"
+        elif epilog == "nonatomic_mxfp4":
+            name += "_f4out"
         elif epilog == "nonatomic_cshuffle":
-            name += "_CSHUFFLE"
+            name += "_cshuffle"
         return name
 
     @staticmethod
@@ -3060,7 +3064,7 @@ class FmoeTuner(TunerCommon):
         return tasks_flydsl
 
     def gen_mxfp4_port_2stages_task(self, info, blockMs):
-        # Enumerate the FlyDSL mxfp4 a4w4 *port* (mxfp4_moe_g{1,2}_a4w4_*) as tuner
+        # Enumerate the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as tuner
         # candidates, alongside the generic flydsl_moe* engine. Only a4w4
         # (per_1x32, fp4 act + fp4 weight) is served by the port. Candidates are
         # timing-only (ref_func=None under fast_mode): correctness is covered by

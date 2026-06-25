@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 import importlib.util
+from enum import Enum
 from typing import Callable, Optional
 
 import torch
@@ -31,8 +32,20 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.flydsl.utils import is_flydsl_available
+
+try:
+    from aiter.ops.flydsl.utils import is_flydsl_available
+    from aiter.ops.flydsl.moe_common import GateMode
+except ImportError:
+
+    class GateMode(Enum):
+        SEPARATED = "separated"
+        INTERLEAVE = "interleave"
+
+    def is_flydsl_available():
+        return False
+
+
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
@@ -620,35 +633,41 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-        _maybe_grouped_gfx1250_a8w4_moe,
-    )
+    grouped_a8w4_out = None
+    if is_flydsl_available():
+        try:
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                _maybe_grouped_gfx1250_a8w4_moe,
+            )
+        except ImportError:
+            _maybe_grouped_gfx1250_a8w4_moe = None
 
-    grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        E=E,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        dtype=dtype,
-        activation=activation,
-        quant_type=quant_type,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
-        isG1U1=isG1U1,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        expert_mask=expert_mask,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        gate_mode=gate_mode,
-    )
+        if _maybe_grouped_gfx1250_a8w4_moe is not None:
+            grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                E=E,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                dtype=dtype,
+                activation=activation,
+                quant_type=quant_type,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                isG1U1=isG1U1,
+                doweight_stage1=doweight_stage1,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                expert_mask=expert_mask,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                gate_mode=gate_mode,
+            )
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
@@ -1492,9 +1511,9 @@ def _mxfp4_a4w4_stage2(
             )
             return out
 
-        # `_MXFP4OUT` requested on an unsupported shape -> drop it, run bf16.
+        # `_f4out` requested on an unsupported shape -> drop it, run bf16.
         if mxfp4out:
-            kernelName2 = kernelName2.replace("_MXFP4OUT", "")
+            kernelName2 = kernelName2.replace("_f4out", "")
 
         # Non-atomic bf16: per-sorted-row staging; scatter_reduce afterwards.
         out_buf = torch.empty((max_sorted, D_HIDDEN), dtype=dtypes.bf16, device=device)
@@ -2035,8 +2054,11 @@ def get_2stage_cfgs(
     # (sort+gemm1+gemm2+scatter), NOT fused_moe_1stage. Build it from the CSV
     # kernelName HERE, before the run_1stage early-return below -- otherwise the
     # run_1stage path returns pipeline=None and fused_moe silently discards the
-    # tuned kernelName the CSV selected.
-    if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
+    # tuned kernelName the CSV selected. The mxmoe port is interleave-only, so
+    # gate it on INTERLEAVE; anything else falls through to the other engines.
+    if (_is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2)) and (
+        gate_mode == GateMode.INTERLEAVE
+    ):
         try:
             _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
         except ValueError:

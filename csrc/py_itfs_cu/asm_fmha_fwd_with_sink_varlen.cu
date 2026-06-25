@@ -246,9 +246,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int sub_Q        = 128;   // ts_qo
     const int wv_tg        = 4;
     const int bdx          = (wv_tg == 4) ? 128 : 256;
-    const int tg_div       = 1;     // double_q = 0
-    const int q_tile_count = (max_seqlen_q + sub_Q - 1) / sub_Q;
-    const int gdx          = (q_tile_count + tg_div - 1) / tg_div;
+    const bool double_q    = (args.opt & 0x2) != 0;  // bit1 of s_opt
+    const int  tg_div      = double_q ? 2 : 1;
+    const int  q_tile_count = (max_seqlen_q + sub_Q - 1) / sub_Q;
+    const int  gdx          = (q_tile_count + tg_div - 1) / tg_div;
     const int gdy          = q_head_num;
     const int gdz          = batch;
 
