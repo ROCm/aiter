@@ -1314,12 +1314,6 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND                                      \
-    m.def("topk_sigmoid",                                    \
-          &aiter::topk_sigmoid,                              \
-          py::arg("topk_weights"),                           \
-          py::arg("topk_indices"),                           \
-          py::arg("gating_output"),                          \
-          "Apply topk sigmoid to the gating outputs.");      \
     m.def("topk_softplus",                                   \
           &aiter::topk_softplus,                             \
           py::arg("topk_weights"),                           \
@@ -1330,6 +1324,14 @@ namespace py = pybind11;
           py::arg("routed_scaling_factor") = 1.0,            \
           py::arg("score_func")            = "sqrtsoftplus", \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
+
+#define MOE_TOPK_CK_PYBIND                                   \
+    m.def("topk_sigmoid",                                    \
+          &aiter::topk_sigmoid,                              \
+          py::arg("topk_weights"),                           \
+          py::arg("topk_indices"),                           \
+          py::arg("gating_output"),                          \
+          "Apply topk sigmoid to the gating outputs.");
 
 #define MOE_SORTING_PYBIND                             \
     m.def("moe_sorting_fwd",                           \
@@ -2149,6 +2151,7 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false); \
     m.def("add_rmsnorm",                     \
@@ -2158,7 +2161,8 @@ namespace py = pybind11;
           py::arg("residual_in"),            \
           py::arg("residual_out"),           \
           py::arg("weight"),                 \
-          py::arg("epsilon"));               \
+          py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false);    \
     m.def("rmsnorm_quant",                   \
           &aiter::rmsnorm_quant,             \
           py::arg("out"),                    \
@@ -2166,6 +2170,7 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false); \
     m.def("rmsnorm",                         \
@@ -2173,7 +2178,8 @@ namespace py = pybind11;
           py::arg("out"),                    \
           py::arg("input"),                  \
           py::arg("weight"),                 \
-          py::arg("epsilon"));
+          py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false);    \
 
 #define GATED_RMSNORM_QUANT_PYBIND               \
     m.def("gated_rmsnorm_fp8_group_quant",       \
