@@ -356,11 +356,20 @@ def _gemm1_body(
     OUT_AS_PER_CHUNK_DW=OUT_AS_PER_CHUNK_DW,
     K_G2_HALF=K_G2_HALF,
     interleave=True,
+    a_dtype="fp4",
 ):
     # All K- and INTER/NE-derived sizes arrive as params (KIMI defaults bound from
     # the module globals above so the default call path is unchanged).
     b_aux = 2 if use_nt else 0  # NT: B_q loads carry aux=2 (non-temporal hint)
     M_REPS = BM // 16
+    # A activation dtype: fp4 (packed 2/byte) or fp8 (1 byte/elem). Only the A
+    # payload path differs; weight + all scale (per_1x32 e8m0) paths are identical.
+    is_f8_a = a_dtype == "fp8"
+    a_pack = 1 if is_f8_a else 2  # logical A elems per stored byte
+    am = 2 // a_pack  # A byte multiplier vs fp4 (fp8=2, fp4=1)
+    KH_TILE_A = BK // a_pack  # bytes per K-tile A row in LDS (fp8=256, fp4=128)
+    K_BYTES = K // a_pack  # a_quant row stride in bytes (= K_HALF for fp4)
+    cbsz_a = 0 if is_f8_a else 4  # mfma A-format selector (fp8=0, fp4=4)
 
     # block -> (m_block_idx, n_block_idx) ; e = sorted_expert_ids[m_block_idx]
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
@@ -385,7 +394,7 @@ def _gemm1_body(
     # count = n_tokens * K_HALF (a_quant is uint8, 1 byte/elem).
     # args arrive as raw i64 device addresses (data_ptr()); build buffer resources
     # straight from the address -- no memref descriptor needed (see _global_base_ptr1).
-    aq_num_records = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K_HALF)))
+    aq_num_records = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K_BYTES)))
     aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num_records
     )
@@ -409,10 +418,10 @@ def _gemm1_body(
 
     # -- LDS views (s_aq / s_asc, union-overlapping lds_acc) ------------------
     lds_base = allocator.get_base()
-    s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE,))  # 12288
+    s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE_A,))
     s_asc = SmemPtr(
         lds_base,
-        lds_off + kAStages * BM * KH_TILE,
+        lds_off + kAStages * BM * KH_TILE_A,
         T.i8,
         shape=(kSubBlocks * K_TILES_TOTAL * 256,),
     )
@@ -434,11 +443,22 @@ def _gemm1_body(
             llvm.load(T.i32, _global_ptr1(arg_mind, (m_row + rcls) * fx.Int32(4)))
         ]
     else:
+        # buffer_load_lds fills 64*16B/wave: fp4 -> 8 rows x 128B (lane//8), fp8 ->
+        # 4 rows x 256B (lane//16); fp8 needs `am` calls per 8-row sub.
+        lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
+        rows_per_call = 64 // lanes_per_row  # 8 (fp4) / 4 (fp8)
+        lane_row = lane // fx.Int32(lanes_per_row)
         for sub in range_constexpr(kSubBlocks):
-            idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
-            cached_actual_row.append(
-                llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
-            )
+            for h in range_constexpr(am):
+                idx = (
+                    m_row
+                    + wave * fx.Int32(BM // 4)
+                    + fx.Int32(sub * 8 + h * rows_per_call)
+                    + lane_row
+                )
+                cached_actual_row.append(
+                    llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
+                )
 
     # -- b_load_s_base[j] (HIP 412-416), readfirstlane'd uniform per wave ------
     N0_HALF = N_OUT // 32
@@ -482,40 +502,73 @@ def _gemm1_body(
 
     # -- A-side data movement helpers (HIP 121-195) ---------------------------
     def issue_a_load_lds(slot, kt):
+        # lane L -> LDS[base+L*16]: fp4 8 rows x 128B (lane//8,lane%8), fp8 4 rows
+        # x 256B (lane//16,lane%16); fp8 splits each 8-row sub into am row-groups.
+        lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
+        rows_per_call = 64 // lanes_per_row  # 8 (fp4) / 4 (fp8)
+        lane_row = lane // fx.Int32(lanes_per_row)
+        lane_col = (lane % fx.Int32(lanes_per_row)) * fx.Int32(16)
+        base_i32 = fx.Int32(
+            memref_dialect.extract_aligned_pointer_as_index(s_aq.get())
+        )
         for sub in range_constexpr(kSubBlocks):
-            lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
-            mask = _lds_swizzle_mask(lds_row + lane_div_8)  # ROW_BYTES=BK/2=128
-            voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
-                sub
-            ] * fx.Int32(K_HALF)
-            base_i32 = fx.Int32(
-                memref_dialect.extract_aligned_pointer_as_index(s_aq.get())
-            )
-            off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-            rocdl.raw_ptr_buffer_load_lds(
-                aq_rsrc,
-                _lds_ptr3(base_i32, off),
-                fx.Int32(16),
-                voffset,
-                fx.Int32(kt * KH_TILE),
-                fx.Int32(0),
-                fx.Int32(0),
-            )
+            for h in range_constexpr(am):
+                lds_row = (
+                    wave * fx.Int32(BM // 4) + fx.Int32(sub * 8 + h * rows_per_call)
+                )
+                mask = (
+                    fx.Int32(0)
+                    if is_f8_a
+                    else _lds_swizzle_mask(lds_row + lane_div_8)
+                )
+                voffset = (lane_col ^ mask) + cached_actual_row[
+                    sub * am + h
+                ] * fx.Int32(K_BYTES)
+                off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * fx.Int32(
+                    KH_TILE_A
+                )
+                rocdl.raw_ptr_buffer_load_lds(
+                    aq_rsrc,
+                    _lds_ptr3(base_i32, off),
+                    fx.Int32(16),
+                    voffset,
+                    fx.Int32(kt * KH_TILE_A),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                )
 
     def issue_a_ds_read(slot):
-        mask = _lds_swizzle_mask(lane_mod_16)
+        # fp4 mfma frag = 32 contiguous K (Vec4) at col g*16+k*64. fp8 frag splits a
+        # lane's 32 K into two 16-K halves 64B apart -> Vec8 [col g*16+k*128 | +64].
         base_ptr = _lds_base_ptr3(s_aq.get())
         a = [[None, None] for _ in range(kMChunks)]
         for k in range_constexpr(2):
-            lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
             for i in range_constexpr(kMChunks):
                 lds_row = lane_mod_16 + fx.Int32(i * 16)
-                off = (
-                    fx.Int32(slot * (BM * KH_TILE))
-                    + lds_row * fx.Int32(KH_TILE)
-                    + lds_col
+                row_off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * fx.Int32(
+                    KH_TILE_A
                 )
-                a[i][k] = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, off))
+                if const_expr(is_f8_a):
+                    col_lo = lane_div_16 * fx.Int32(16) + fx.Int32(k * 128)
+                    lo = Vec(
+                        llvm.load(
+                            T.vec(2, T.i64), _gep3(base_ptr, row_off + col_lo)
+                        )
+                    )
+                    hi = Vec(
+                        llvm.load(
+                            T.vec(2, T.i64),
+                            _gep3(base_ptr, row_off + col_lo + fx.Int32(64)),
+                        )
+                    )
+                    a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
+                    a[i][k] = _raw(a64.bitcast(fx.Int32))
+                else:
+                    mask = _lds_swizzle_mask(lane_mod_16)
+                    lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
+                    a[i][k] = llvm.load(
+                        T.vec(4, T.i32), _gep3(base_ptr, row_off + lds_col)
+                    )
         return a
 
     def issue_a_scale_load():
@@ -591,10 +644,50 @@ def _gemm1_body(
         )
         return Vec(frag)
 
+    def _inline_cvt_write(h_dw, qs_raw, B128_IDX, SUB, slot):
+        """Quantize the lane's 8 bf16 (h_dw) to the A LDS tile. fp4: 8->4 bytes
+        (1 dword) at the swizzled fp4 column. fp8: 8->8 bytes (2 dwords) written
+        contiguous in logical-K order (no swizzle) to match issue_a_ds_read."""
+        r = fx.Int32(SUB * 16) + r_in_chunk
+        aq_base = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_aq.get()))
+        row_off = fx.Int32(slot * (BM * KH_TILE_A)) + r * fx.Int32(KH_TILE_A)
+        if const_expr(is_f8_a):
+            # cvt_scalef32_pk_fp8_bf16 packs 2 bf16 -> 2 fp8 into one 16-bit half
+            # of a vector<2xi16> (dst_lo_hi_sel picks lo/hi). 8 bf16 -> 2 dwords.
+            v2i16 = T.vec(2, T.i16)
+
+            def _cvt_pk2(h_a, h_b):
+                v = _raw(Vec.filled(2, 0, fx.Int16))
+                sa = _raw(Vec.from_elements([h_a], fx.Int32).bitcast(fx.BFloat16))
+                v = rocdl.cvt_scalef32_pk_fp8_bf16(v2i16, v, sa, qs_raw, False)
+                sb = _raw(Vec.from_elements([h_b], fx.Int32).bitcast(fx.BFloat16))
+                v = rocdl.cvt_scalef32_pk_fp8_bf16(v2i16, v, sb, qs_raw, True)
+                return v
+
+            pk0 = _cvt_pk2(h_dw[0], h_dw[1])
+            pk1 = _cvt_pk2(h_dw[2], h_dw[3])
+            col = (
+                fx.Int32(B128_IDX * 128)
+                + lane_shr2_and3 * fx.Int32(32)
+                + lib * fx.Int32(8)
+            )
+            off = row_off + col
+            llvm.StoreOp(pk0, _lds_ptr3(aq_base, off))
+            llvm.StoreOp(pk1, _lds_ptr3(aq_base, off + fx.Int32(4)))
+        else:
+            pk = _raw(fx.Int32(0))
+            for j in range_constexpr(4):
+                src = _raw(Vec.from_elements([h_dw[j]], fx.Int32).bitcast(fx.BFloat16))
+                pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, src, qs_raw, j)
+            kb_in_kt = fx.Int32(B128_IDX * 4) + lane_shr2_and3
+            mask_r = _lds_swizzle_mask(r)
+            off = row_off + ((kb_in_kt * fx.Int32(16)) ^ mask_r) + lib * fx.Int32(4)
+            llvm.StoreOp(_raw(fx.Int32(pk)), _lds_ptr3(aq_base, off))
+
     def _inline_quant_core(B128_IDX, SUB, slot, kt, h_v, scale_accum):
         """Shared body of inline_quant_kt / inline_quant_finish_kt (HIP :209-310).
-        h_v is a Vec(4,i32). Quantizes 8 bf16 -> 4 packed-fp4 bytes (1 dword) and
-        writes to s_Aq[slot]; folds the e8m0 scale into scale_accum (packed path)."""
+        h_v is a Vec(4,i32). Quantizes 8 bf16 -> packed fp4/fp8 and writes to
+        s_Aq[slot]; folds the e8m0 scale into scale_accum (packed path)."""
         h_dw = [fx.Int32(_raw(h_v[j])) for j in range_constexpr(4)]
         # 0x7FFF7FFF clears both bf16 sign bits in the packed dword (-> |bf16|).
         hm = [h_dw[j] & fx.Int32(0x7FFF7FFF) for j in range_constexpr(4)]
@@ -609,29 +702,7 @@ def _gemm1_body(
         qs = fx.Float32(
             _raw(e8m0 << fx.Int32(23)).bitcast(T.f32)
         )  # uint_as_float(e8m0<<23)
-        # pack 8 bf16 -> 4 fp4 bytes (1 u32) via cvt_scalef32_pk_fp4_bf16.
-        # src is vector<2xbf16>: build from each i32 dword via a vector bitcast.
-        pk = _raw(fx.Int32(0))
-        qs_raw = _raw(qs)
-        for j in range_constexpr(4):
-            src_bf16x2 = _raw(
-                Vec.from_elements([h_dw[j]], fx.Int32).bitcast(fx.BFloat16)
-            )
-            pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, src_bf16x2, qs_raw, j)
-        pk = fx.Int32(pk)
-        # write pk -> s_Aq[slot][r][((kb_in_kt*16)^mask_r)+b_off] (HIP :247-248).
-        r = fx.Int32(SUB * 16) + r_in_chunk
-        kb_in_kt = fx.Int32(B128_IDX * 4) + lane_shr2_and3
-        mask_r = _lds_swizzle_mask(r)
-        b_off = lib * fx.Int32(4)
-        aq_base = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_aq.get()))
-        off = (
-            fx.Int32(slot * (BM * KH_TILE))
-            + r * fx.Int32(KH_TILE)
-            + ((kb_in_kt * fx.Int32(16)) ^ mask_r)
-            + b_off
-        )
-        llvm.StoreOp(_raw(pk), _lds_ptr3(aq_base, off))
+        _inline_cvt_write(h_dw, _raw(qs), B128_IDX, SUB, slot)
         # packed-scale path: fold e8m0 into the accumulated dword (BM16 only path).
         pack_byte = B128_IDX * 2 + SUB
         scale_accum[0] = scale_accum[0] | (e8m0 << fx.Int32(pack_byte * 8))
@@ -680,27 +751,7 @@ def _gemm1_body(
         for i in range_constexpr(n):
             B128_IDX, SUB, _hv = specs[i]
             qs_raw = _raw(fx.Float32(_raw(e8[i] << fx.Int32(23)).bitcast(T.f32)))
-            pk = _raw(fx.Int32(0))
-            for j in range_constexpr(4):
-                src_bf16x2 = _raw(
-                    Vec.from_elements([h_dw[i][j]], fx.Int32).bitcast(fx.BFloat16)
-                )
-                pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, src_bf16x2, qs_raw, j)
-            pk = fx.Int32(pk)
-            r = fx.Int32(SUB * 16) + r_in_chunk
-            kb_in_kt = fx.Int32(B128_IDX * 4) + lane_shr2_and3
-            mask_r = _lds_swizzle_mask(r)
-            b_off = lib * fx.Int32(4)
-            aq_base = fx.Int32(
-                memref_dialect.extract_aligned_pointer_as_index(s_aq.get())
-            )
-            off = (
-                fx.Int32(slot * (BM * KH_TILE))
-                + r * fx.Int32(KH_TILE)
-                + ((kb_in_kt * fx.Int32(16)) ^ mask_r)
-                + b_off
-            )
-            llvm.StoreOp(_raw(pk), _lds_ptr3(aq_base, off))
+            _inline_cvt_write(h_dw[i], qs_raw, B128_IDX, SUB, slot)
             pack_byte = B128_IDX * 2 + SUB
             scale_accum[0] = scale_accum[0] | (e8[i] << fx.Int32(pack_byte * 8))
 
@@ -780,14 +831,14 @@ def _gemm1_body(
             sa = a_scale[0]
             if const_expr(init):
                 accm[0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[0][0], bJ0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
+                    mfma_ty, [a[0][0], bJ0, zero4, cbsz_a, 4, 0, sa, 0 + in_b, sb]
                 )
             else:
                 accm[0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[0][0], bJ0, accm[0][J], 4, 4, 0, sa, 0 + in_b, sb]
+                    mfma_ty, [a[0][0], bJ0, accm[0][J], cbsz_a, 4, 0, sa, 0 + in_b, sb]
                 )
             accm[0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                mfma_ty, [a[0][1], bJ1, accm[0][J], 4, 4, 2, sa, 2 + in_b, sb]
+                mfma_ty, [a[0][1], bJ1, accm[0][J], cbsz_a, 4, 2, sa, 2 + in_b, sb]
             )
             return
         # Per sub: i0=sub*2, i1=sub*2+1; sa=a_scale[sub]. op_sel_a is the FIXED
@@ -798,23 +849,23 @@ def _gemm1_body(
             sa = a_scale[sub]
             if const_expr(init):
                 accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i0][0], bJ0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
+                    mfma_ty, [a[i0][0], bJ0, zero4, cbsz_a, 4, 0, sa, 0 + in_b, sb]
                 )
                 accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i1][0], bJ0, zero4, 4, 4, 1, sa, 0 + in_b, sb]
+                    mfma_ty, [a[i1][0], bJ0, zero4, cbsz_a, 4, 1, sa, 0 + in_b, sb]
                 )
             else:
                 accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i0][0], bJ0, accm[i0][J], 4, 4, 0, sa, 0 + in_b, sb]
+                    mfma_ty, [a[i0][0], bJ0, accm[i0][J], cbsz_a, 4, 0, sa, 0 + in_b, sb]
                 )
                 accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i1][0], bJ0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb]
+                    mfma_ty, [a[i1][0], bJ0, accm[i1][J], cbsz_a, 4, 1, sa, 0 + in_b, sb]
                 )
             accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                mfma_ty, [a[i0][1], bJ1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb]
+                mfma_ty, [a[i0][1], bJ1, accm[i0][J], cbsz_a, 4, 2, sa, 2 + in_b, sb]
             )
             accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                mfma_ty, [a[i1][1], bJ1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb]
+                mfma_ty, [a[i1][1], bJ1, accm[i1][J], cbsz_a, 4, 3, sa, 2 + in_b, sb]
             )
 
     # ---- prologue: stages 0,1 (HIP 431-463) ----
@@ -1051,18 +1102,19 @@ def _gemm1_body(
                 )
 
 
-def _bm_constants(BM, K_TILES_TOTAL=K_TILES_TOTAL):
+def _bm_constants(BM, K_TILES_TOTAL=K_TILES_TOTAL, KH_TILE_A=KH_TILE):
     """BM-derived compile-time constants (mirror gemm1_a4w4.cuh:49-72).
 
     s_Ascale (and thus the LDS union) depends on K via K_TILES_TOTAL, so K is a
     param (KIMI default keeps the old sizes: BM32->32768, BM128->131072, BM16->16384).
+    KH_TILE_A is the A K-tile byte width (128 for fp4, 256 for fp8 activation).
     """
     kAStages = 2 if BM == 128 else 3
     kSubBlocks = 1 if BM < 32 else BM // 32  # HIP :61
     kMChunks = BM // 16  # HIP :62
-    # LDS union (bytes): max(s_Aq[kAStages][BM][KH_TILE] + s_Ascale[kSubBlocks*K_TILES_TOTAL*256],
+    # LDS union (bytes): max(s_Aq[kAStages][BM][KH_TILE_A] + s_Ascale[kSubBlocks*K_TILES_TOTAL*256],
     #                        lds_acc[BM*BN] f32).
-    s_aq_bytes = kAStages * BM * KH_TILE
+    s_aq_bytes = kAStages * BM * KH_TILE_A
     s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
     lds_acc_bytes = BM * BN * 4
     lds_bytes = max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
@@ -1078,13 +1130,18 @@ def compile_gemm1_a4w4_port(
     NE=NE,
     TOPK=TOPK,
     interleave=True,
+    a_dtype="fp4",
 ):
     print(
         f"[PORT-FLYDSL-GEMM1] compile_gemm1_a4w4_port ENTERED "
         f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} "
-        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE} interleave={interleave}",
+        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE} interleave={interleave} "
+        f"a_dtype={a_dtype}",
         flush=True,
     )
+    if a_dtype not in ("fp4", "fp8"):
+        raise ValueError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
+    _KH_TILE_A = BK // (1 if a_dtype == "fp8" else 2)  # 256 (fp8) / 128 (fp4)
     # Supported Phase 2 combos.
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
@@ -1125,13 +1182,16 @@ def compile_gemm1_a4w4_port(
     _OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(_INTER)
     _K_G2_HALF = k_g2_half_for(_INTER)
 
-    kAStages, kSubBlocks, kMChunks, lds_bytes = _bm_constants(BM, _K_TILES_TOTAL)
+    kAStages, kSubBlocks, kMChunks, lds_bytes = _bm_constants(
+        BM, _K_TILES_TOTAL, _KH_TILE_A
+    )
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    adt_tag = "a8w4" if a_dtype == "fp8" else "a4w4"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}_{adt_tag}"
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name=f"gemm1port_smem_{name_suffix}"
@@ -1207,6 +1267,7 @@ def compile_gemm1_a4w4_port(
                 OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
                 K_G2_HALF=_K_G2_HALF,
                 interleave=interleave,
+                a_dtype=a_dtype,
             )
 
     @flyc.jit

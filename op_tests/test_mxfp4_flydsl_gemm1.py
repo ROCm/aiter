@@ -388,6 +388,7 @@ def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
 
 
 @_GFX950
+@pytest.mark.parametrize("a_dtype", ["fp4", "fp8"])
 @pytest.mark.parametrize(
     "interleave", [True, False], ids=["interleave", "separated"]
 )
@@ -400,7 +401,7 @@ def _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
         (256, 3072, 768, 8),  # minimax: parametrized INTER/NE/TOPK + K
     ],
 )
-def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave):
+def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave, a_dtype):
     """Standalone numeric check of the parametrized gemm1 (BM32 non-inline).
 
     Uses the (shape-independent) threestage sort + torch per_1x32 A-quant + a torch
@@ -494,8 +495,16 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
         )
     n = int(cumsum[0].item())
 
-    aq, asc = tq(hidden, quant_dtype=dtypes.fp4x2)
-    aq = aq.view(torch.uint8).view(M, H // 2).contiguous()
+    if a_dtype == "fp8":
+        from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+
+        aq, asc = per_1x32_f8_scale_f8_quant(
+            hidden, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        aq = aq.view(torch.uint8).view(M, H).contiguous()
+    else:
+        aq, asc = tq(hidden, quant_dtype=dtypes.fp4x2)
+        aq = aq.view(torch.uint8).view(M, H // 2).contiguous()
     asc = asc.view(torch.uint8).view(M, H // 32).contiguous()
     assh = _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=BM)
 
@@ -524,10 +533,14 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
         D_INTER=D_INTER,
         topk=topk,
         interleave=interleave,
+        a_dtype=a_dtype,
     )
     torch.cuda.synchronize()
 
-    A = mxfp4_to_f32(aq.view(torch.uint8))
+    if a_dtype == "fp8":
+        A = aq.view(torch.float8_e4m3fn).float()
+    else:
+        A = mxfp4_to_f32(aq.view(torch.uint8))
     Asc = e8m0_to_f32(asc.view(torch.uint8))
     A = (A.view(M, H // 32, 32) * Asc.unsqueeze(-1)).view(M, H)
     W = mxfp4_to_f32(w1q.view(torch.uint8))
@@ -552,11 +565,11 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
     mean_cos = cossum / cnt
     mode = "interleave" if interleave else "separated"
     print(
-        f"[gemm1 numeric] NE={NE} H={H} INTER={INTER} TOPK={TOPK} mode={mode} "
-        f"mean_row_cos={mean_cos:.4f} (cnt={cnt})"
+        f"[gemm1 numeric] NE={NE} H={H} INTER={INTER} TOPK={TOPK} a={a_dtype} "
+        f"mode={mode} mean_row_cos={mean_cos:.4f} (cnt={cnt})"
     )
     # 0.85 floor: the fp4 output-quant ceiling (~0.88) holds for KIMI too.
     assert mean_cos > 0.85, (
-        f"NE={NE} H={H} INTER={INTER} TOPK={TOPK} mode={mode} "
+        f"NE={NE} H={H} INTER={INTER} TOPK={TOPK} a={a_dtype} mode={mode} "
         f"mean_row_cos={mean_cos:.4f} (cnt={cnt})"
     )
