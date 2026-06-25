@@ -89,7 +89,6 @@ void mxfp4_moe_sort_quant_kernel(
     torch::Tensor& sorted_weights,
     torch::Tensor& a_quant,
     torch::Tensor& a_scale,
-    torch::Tensor& masked_m,
     torch::Tensor& m_indices,
     torch::Tensor& bf16_zero_out,
     int64_t NE,
@@ -114,7 +113,7 @@ void mxfp4_moe_sort_quant_kernel(
         cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
         sorted_weights.data_ptr<float>(),
         a_quant.data_ptr(), a_scale.data_ptr(),
-        masked_m.data_ptr<int32_t>(), m_indices.data_ptr<int32_t>(),
+        m_indices.data_ptr<int32_t>(),
         bf16_zero_ptr);
 }
 
@@ -127,7 +126,6 @@ void mxfp4_moe_sort_kernel(
     torch::Tensor& cumsum_tensor,
     torch::Tensor& reverse_sorted,
     torch::Tensor& sorted_weights,
-    torch::Tensor& masked_m,
     torch::Tensor& m_indices,
     torch::Tensor& bf16_zero_out,
     torch::Tensor& bf16_zero_workspace,
@@ -167,7 +165,7 @@ void mxfp4_moe_sort_kernel(
             sorted_token_ids.data_ptr<int32_t>(), sorted_expert_ids.data_ptr<int32_t>(),
             cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
             sorted_weights.data_ptr<float>(),
-            masked_m.data_ptr<int32_t>(), m_indices.data_ptr<int32_t>(),
+            m_indices.data_ptr<int32_t>(),
             block_offsets, real_counts);
         return;
     }
@@ -184,7 +182,7 @@ void mxfp4_moe_sort_kernel(
             sorted_token_ids.data_ptr<int32_t>(), sorted_expert_ids.data_ptr<int32_t>(),
             cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
             sorted_weights.data_ptr<float>(),
-            masked_m.data_ptr<int32_t>(), m_indices.data_ptr<int32_t>(),
+            m_indices.data_ptr<int32_t>(),
             bf16_zero_ptr, bf16_zero_ws_ptr, workspace_bytes);
     } else {
         const std::string key = "aux_sortonly_NE" + std::to_string(NE)
@@ -196,7 +194,7 @@ void mxfp4_moe_sort_kernel(
             sorted_token_ids.data_ptr<int32_t>(), sorted_expert_ids.data_ptr<int32_t>(),
             cumsum_tensor.data_ptr<int32_t>(), reverse_sorted.data_ptr<int32_t>(),
             sorted_weights.data_ptr<float>(),
-            masked_m.data_ptr<int32_t>(), m_indices.data_ptr<int32_t>());
+            m_indices.data_ptr<int32_t>());
     }
 }
 

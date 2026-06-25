@@ -649,13 +649,13 @@ class FmoeTuner(TunerCommon):
     ):
         # Time gemm1 of the FlyDSL mxfp4 a4w4 port via its production stage entry
         # (_mxfp4_a4w4_stage1_fw). Weights take the a16w4 layout the port expects
-        # (shuffle_weight_a16w4 / shuffle_scale_a16w4); the fused HIP sort emits the
-        # m_indices the port's gemm1 consumes.
+        # (shuffle_weight_a16w4 / shuffle_scale_a16w4); the fused adaptive sort emits
+        # the m_indices the port's gemm1 consumes.
         BM = _parse_mxfp4_g1_kname(kernelName1)["BM"]
         p2_atomic = False  # stage1 sort doesn't accumulate; BM-only sort layout
         w1_a16 = shuffle_weight_a16w4(w1_qt, 16, True)
         w1s_a16 = shuffle_scale_a16w4(w1_scale, ne, True)
-        sti, sw, sei, nvi, moe_buf, aux = moe_sorting(
+        sti, sw, sei, nvi, moe_buf, sort_m_indices, _ = moe_sorting(
             topk_ids,
             topk_weights,
             ne,
@@ -663,7 +663,7 @@ class FmoeTuner(TunerCommon):
             dtype,
             block_size=BM,
             accumulate=p2_atomic,
-            fused_sort=True,
+            output_aux=True,
         )
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
             input,
@@ -677,7 +677,7 @@ class FmoeTuner(TunerCommon):
             block_m=BM,
             w1_scale=w1s_a16,
             kernelName1=kernelName1,
-            m_indices=aux.m_indices,
+            m_indices=sort_m_indices,
             moe_buf=moe_buf,
         )
         return inter_q
@@ -702,7 +702,7 @@ class FmoeTuner(TunerCommon):
         # Time gemm2 of the FlyDSL mxfp4 a4w4 port. gemm2 consumes the gemm1
         # intermediate, so run stage1 first (untimed setup is unavoidable here),
         # then time stage2 (_mxfp4_a4w4_stage2_fw). reverse_sorted comes from the
-        # fused HIP sort and feeds the port's scatter_reduce.
+        # fused adaptive sort and feeds the port's scatter_reduce.
         BM = _parse_mxfp4_g2_kname(kernelName2)["BM"]
         atomic = _parse_mxfp4_g2_kname(kernelName2)["atomic"]
         BM1 = _parse_mxfp4_g1_kname(kernelName1)["BM"]
@@ -711,7 +711,7 @@ class FmoeTuner(TunerCommon):
         w2_a16 = shuffle_weight_a16w4(w2_qt, 16, False)
         w2s_a16 = shuffle_scale_a16w4(w2_scale, ne, False)
         M = input.shape[0]
-        sti, sw, sei, nvi, moe_buf, aux = moe_sorting(
+        sti, sw, sei, nvi, moe_buf, sort_m_indices, sort_reverse_sorted = moe_sorting(
             topk_ids,
             topk_weights,
             ne,
@@ -719,7 +719,7 @@ class FmoeTuner(TunerCommon):
             dtype,
             block_size=BM,
             accumulate=atomic,
-            fused_sort=True,
+            output_aux=True,
         )
         moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
@@ -734,7 +734,7 @@ class FmoeTuner(TunerCommon):
             block_m=BM1,
             w1_scale=w1s_a16,
             kernelName1=kernelName1,
-            m_indices=aux.m_indices,
+            m_indices=sort_m_indices,
             moe_buf=moe_buf,
         )
         return _mxfp4_a4w4_stage2_fw(
@@ -751,7 +751,7 @@ class FmoeTuner(TunerCommon):
             block_m=BM,
             sorted_weights=sw,
             kernelName2=kernelName2,
-            reverse_sorted=aux.reverse_sorted,
+            reverse_sorted=sort_reverse_sorted,
         )
 
     @staticmethod

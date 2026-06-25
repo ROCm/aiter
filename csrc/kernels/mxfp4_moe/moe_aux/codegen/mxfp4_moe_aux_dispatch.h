@@ -37,7 +37,6 @@ using SortQuantFn = void (*)(
     float*         sorted_weights,
     void*          a_quant,
     void*          a_scale,
-    int32_t*       masked_m,
     int32_t*       m_indices,
     void*          bf16_zero_ptr);
 
@@ -51,7 +50,6 @@ using Sort3StageFn = void (*)(
     int32_t*       cumsum,
     int32_t*       reverse_sorted,
     float*         sorted_weights,
-    int32_t*       masked_m,
     int32_t*       m_indices,
     int32_t*       block_offsets,
     int32_t*       real_counts);
@@ -66,7 +64,6 @@ using SortOnlyZiFn = void (*)(
     int32_t*       cumsum,
     int32_t*       reverse_sorted,
     float*         sorted_weights,
-    int32_t*       masked_m,
     int32_t*       m_indices,
     void*          bf16_zero_ptr,
     void*          bf16_zero_ws_ptr,
@@ -82,7 +79,6 @@ using SortOnlyFn = void (*)(
     int32_t*       cumsum,
     int32_t*       reverse_sorted,
     float*         sorted_weights,
-    int32_t*       masked_m,
     int32_t*       m_indices);
 
 using QuantFn = void (*)(

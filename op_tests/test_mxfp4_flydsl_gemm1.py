@@ -437,7 +437,6 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
         cumsum = torch.empty((2,), device=device, dtype=dtypes.i32)
         rev = torch.empty((M * topk,), device=device, dtype=dtypes.i32)
         swt = torch.empty((max_sorted,), device=device, dtype=dtypes.fp32)
-        mm = torch.empty((NE,), device=device, dtype=dtypes.i32)
         mind = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
         aiter.mxfp4_moe_sort(
             topk_ids=topk_ids,
@@ -447,7 +446,6 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
             cumsum_tensor=cumsum,
             reverse_sorted=rev,
             sorted_weights=swt,
-            masked_m=mm,
             m_indices=mind,
             bf16_zero_out=eb(),
             bf16_zero_workspace=eb(),

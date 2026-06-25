@@ -1369,7 +1369,9 @@ namespace py = pybind11;
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("workspace")         = std::nullopt, \
           py::arg("dispatch_policy")   = 0,            \
-          py::arg("local_topk_ids")    = std::nullopt);
+          py::arg("local_topk_ids")    = std::nullopt, \
+          py::arg("m_indices")         = std::nullopt, \
+          py::arg("reverse_sorted")    = std::nullopt);
 
 #define PA_SPARSE_PREFILL_OPUS_PYBIND   \
     m.def("pa_sparse_prefill_opus_fwd", \
@@ -2355,7 +2357,6 @@ namespace py = pybind11;
           py::arg("sorted_weights"),                                      \
           py::arg("a_quant"),                                             \
           py::arg("a_scale"),                                             \
-          py::arg("masked_m"),                                            \
           py::arg("m_indices"),                                           \
           py::arg("bf16_zero_out"),                                       \
           py::arg("NE"),                                                  \
@@ -2371,7 +2372,6 @@ namespace py = pybind11;
           py::arg("cumsum_tensor"),                                       \
           py::arg("reverse_sorted"),                                      \
           py::arg("sorted_weights"),                                      \
-          py::arg("masked_m"),                                            \
           py::arg("m_indices"),                                           \
           py::arg("bf16_zero_out"),                                       \
           py::arg("bf16_zero_workspace"),                                 \
