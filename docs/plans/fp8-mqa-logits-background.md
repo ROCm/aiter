@@ -865,6 +865,128 @@ independent `[1,H]×[H,W]` products, but not a single fused GEMM because the rig
 matrix `A[m] = relu(scores_m · kv_scale)` differs per row (it depends on `Q[m]` and that
 row's KV window).
 
+#### GEMM 2 is not implemented as a matrix instruction — it is a per-lane scalar loop + wave butterfly
+
+In the FlyDSL kernel (`fp8_mqa_logits.py`, the inner epilogue loop), GEMM 2 is implemented
+in three steps, **none of which use an MFMA instruction**.
+
+##### MFMA output axes: rows = heads, columns = KV positions
+
+Before examining the lane layout it is important to establish what the MFMA output axes mean
+in this kernel. GEMM 1 computes `scores[H, BLOCK_KV] = Q[H, D] × K^T[D, BLOCK_KV]`, tiled
+onto MFMA as a `(M_TILES × N_TILES)` grid of 16×16 sub-tiles:
+
+| MFMA axis | Kernel meaning | Size | Tiling |
+|---|---|---|---|
+| **M (rows)** | **heads** | H=64 | M_TILES = H/16 = 4 tiles |
+| **N (columns)** | **KV positions** | BLOCK_KV=128 | N_TILES = BLOCK_KV/16 = 8 tiles |
+| **K (contraction)** | head_dim | D=128 | K_STEPS = D/32 = 4 steps |
+
+So the output tile (scores[H, BLOCK_KV]) has **heads along rows** and **KV positions along
+columns**. The head reduction (`logits[m,n] = Σ_h scores[h,n]`) is therefore a **row
+reduction** — summing the M dimension. This is the awkward direction for MFMA's lane layout:
+each lane directly owns one specific column (`lane_mod_16`), but rows are spread across
+`lane_div_16` groups, so the full row-sum requires the butterfly across 4 lanes. Reducing
+along columns (the N dimension) would have been free per-lane, but the problem's head axis
+is the M dimension — we cannot choose otherwise.
+
+##### What column and heads does each lane own?
+
+The MFMA `16×16×32` instruction distributes its 16×16 fp32 output tile across the 64 lanes
+of a wave as 4 registers per lane. For lane `l` (0–63):
+
+```
+lane_mod_16  = l % 16          # 0–15: which output column within the 16-wide tile
+lane_div_16  = l // 16         # 0–3:  which "head-row group" of 4
+```
+
+- **Column owned:** `lane_mod_16` — lane `l` always produces results for the single output
+  column `l % 16` within the current MFMA tile. All 64 lanes of the wave collectively cover
+  16 distinct columns (0–15), with 4 lanes per column.
+
+- **Heads owned:** each MFMA accumulator register `acc[ii]` (ii=0..3) corresponds to head
+  `mi*16 + lane_div_16*4 + ii` (for M-tile `mi`). With `M_TILES = H/16 = 4` (for H=64),
+  lane `l` owns `4 tiles × 4 registers = 16` heads spread as:
+
+```
+M_TILE 0: heads  0–15  →  lane l owns heads { lane_div_16*4 + ii : ii=0..3 } = heads  {d, d+1, d+2, d+3}
+M_TILE 1: heads 16–31  →  heads {16+d .. 16+d+3}
+M_TILE 2: heads 32–47  →  heads {32+d .. 32+d+3}
+M_TILE 3: heads 48–63  →  heads {48+d .. 48+d+3}
+
+where d = lane_div_16 * 4  (0, 4, 8, or 12 for lane_div_16 = 0, 1, 2, 3)
+```
+
+So for H=64 the 64 lanes split 16 heads each, and **4 lanes share each output column** —
+lanes `{c, c+16, c+32, c+48}` all produce results for column `c`:
+
+```
+column c:  lane c      → heads { 0, 1, 2, 3, 16,17,18,19, 32,33,34,35, 48,49,50,51 }
+           lane c+16   → heads { 4, 5, 6, 7, 20,21,22,23, 36,37,38,39, 52,53,54,55 }
+           lane c+32   → heads { 8, 9,10,11, 24,25,26,27, 40,41,42,43, 56,57,58,59 }
+           lane c+48   → heads {12,13,14,15, 28,29,30,31, 44,45,46,47, 60,61,62,63 }
+```
+
+Together the 4 lanes cover all 64 heads for column `c`. To get the final logit for that
+column they must sum their four partial head-sums — that is the butterfly's job.
+
+##### Step 1 — per-lane scalar accumulation
+
+Each lane loops over its `M_TILES × 4 = 16` owned MFMA output elements, applies
+`× kv_scale → ReLU → × weight[head]` elementwise, and accumulates into a single scalar
+`col_sum`. After this loop lane `l` holds:
+
+```
+col_sum_l = Σ_{h ∈ owned_heads(l)}  ReLU( acc[h, lane_mod_16] * kv_scale ) * weights[h]
+```
+
+This is a *partial* head-sum — correct only for lane `l`'s 16 heads, not the full H=64.
+
+##### Step 2 — intra-wave XOR butterfly
+
+`shuffle_xor(val, offset, width)` swaps `val` between lane `l` and lane `l XOR offset`
+(within a group of `width` consecutive lanes). Adding the swapped value to the local value
+merges the two lanes' partial sums.
+
+With offsets 16 and 32, two passes reduce across the 4 lanes `{c, c+16, c+32, c+48}`:
+
+```
+After pass 1 (xor 16):  lanes c, c+16 exchange → each now holds heads of {c} ∪ {c+16} = 32 heads
+                         lanes c+32, c+48 exchange → each now holds heads of {c+32} ∪ {c+48} = 32 heads
+
+After pass 2 (xor 32):  lanes c, c+32 exchange → each now holds all 64 heads = full logit
+                         lanes c+16, c+48 exchange → same result
+```
+
+Concretely for column `c = 0` (lanes 0, 16, 32, 48):
+
+```
+         lane 0           lane 16          lane 32          lane 48
+start:   heads 0-3,16-19  heads 4-7,20-23  heads 8-11,24-27 heads 12-15,28-31
+         32-35,48-51       36-39,52-55      40-43,56-59      44-47,60-63
+
+xor-16:  (lane 0 ↔ lane 16 exchange and add)
+         (lane 32 ↔ lane 48 exchange and add)
+→ lane 0: heads 0-7, 16-23, 32-39, 48-55   (32 heads)
+→ lane 32: heads 8-15, 24-31, 40-47, 56-63  (32 heads)
+
+xor-32:  (lane 0 ↔ lane 32 exchange and add)
+→ lane 0, 16, 32, 48: all 64 heads  ✓ full logit for column 0
+```
+
+No LDS or cross-wave traffic needed — all 4 lanes sharing a column are within the same wave.
+
+##### Step 3 — predicated store
+
+After the butterfly all 4 lanes sharing column `c` hold the identical correct logit, but
+only **lane `c` itself** (`lane_div_16 == 0`, i.e. `l < 16`) writes to memory. The 48
+lanes with `lane_div_16 ∈ {1,2,3}` simply discard their result. Lane `c` writes to
+`logits[row, col0 + abs_ni*16 + c]` — the exact output column it was assigned.
+
+The result: GEMM 2 costs **16 scalar multiply-adds per lane** (one per owned head element)
+plus **two `shuffle_xor` instructions**, with zero MFMA calls. This is precisely why it is
+negligible compared to GEMM 1's 128 MFMA instructions per KV tile.
+
 The four benchmark parameters map onto these as:
 
 | Parameter | GEMM 1 role | GEMM 2 role |
