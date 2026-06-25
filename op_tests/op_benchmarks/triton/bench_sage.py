@@ -32,6 +32,7 @@ from aiter.ops.mha import (
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.fav3_sage import (
+    build_attention_lut,
     fav3_sage_func,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
@@ -216,6 +217,7 @@ def make_asm_sparse_vfa_runner(
     k_bshd: torch.Tensor,
     v_bshd: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    freeze_softmax_max_count: Optional[int] = None,
 ) -> Any:
     """Runner factory for the hand-written ASM sparse Sage VFA ("frozen-max") kernel.
 
@@ -270,7 +272,13 @@ def make_asm_sparse_vfa_runner(
 
     softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
 
-    freeze_count = getattr(args, "freeze_count", 1)
+    # A LUT built by build_attention_lut (--sparge) returns the exact freeze count
+    # (n_sample + text blocks); use it over the standalone --freeze-count arg.
+    freeze_count = (
+        freeze_softmax_max_count
+        if freeze_softmax_max_count is not None
+        else getattr(args, "freeze_count", 1)
+    )
 
     def _run() -> torch.Tensor:
         return flash_attn_i8fp8_sparse_vfa_pertensor_func(
@@ -369,6 +377,7 @@ def make_asm_sparse_vfa_fp8_runner(
     k_bshd: torch.Tensor,
     v_bshd: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    freeze_softmax_max_count: Optional[int] = None,
 ) -> Any:
     """Runner factory for the hand-written ASM all-fp8 Sage VFA ("frozen-max") kernel.
 
@@ -420,7 +429,13 @@ def make_asm_sparse_vfa_fp8_runner(
 
     softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
 
-    freeze_count = getattr(args, "freeze_count", 1)
+    # A LUT built by build_attention_lut (--sparge) returns the exact freeze count
+    # (n_sample + text blocks); use it over the standalone --freeze-count arg.
+    freeze_count = (
+        freeze_softmax_max_count
+        if freeze_softmax_max_count is not None
+        else getattr(args, "freeze_count", 1)
+    )
 
     def _run() -> torch.Tensor:
         return flash_attn_fp8_sparse_vfa_pertensor_func(
@@ -906,6 +921,47 @@ def maybe_expand_mask(
     return out.clone()
 
 
+def use_vfa(args: argparse.Namespace) -> bool:
+    """Whether this run exercises the VFA running-max freeze (the fp8 VFA kernels)."""
+    return args.kernel in ("aiter_asm_sparse_vfa", "aiter_asm_sparse_vfa_fp8")
+
+
+def builds_qk_lut(args: argparse.Namespace) -> bool:
+    """True iff --sparge: build the block LUT from Q/K via build_attention_lut."""
+    return bool(getattr(args, "sparge", False))
+
+
+def build_attn_mode_lut(
+    args: argparse.Namespace,
+    q_bhsd: torch.Tensor,
+    k_bhsd: torch.Tensor,
+    device: torch.device,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], int]:
+    """Build a Sparge (+ optional VFA) ragged LUT (+ freeze count) from bhsd Q/K.
+
+    Plain --sparge builds a SpargeAttn-selected LUT (ascending block order,
+    freeze=-1); the VFA kernels additionally front-load the top --n-sample blocks
+    per segment and the returned freeze count is n_sample (+ text blocks). Mirrors
+    the tianxing/sage_vfa bench wiring. Returns ``(block_lut, freeze_count)``.
+    """
+    _, hq, _, _ = q_bhsd.shape
+    block_m, block_n = kernel_block_sizes(args.kernel)
+    simthreshd1 = torch.full((hq,), args.simthreshd1, device=device, dtype=torch.float32)
+    cdfthreshd = torch.full((hq,), args.cdfthreshd, device=device, dtype=torch.float32)
+    block_lut, freeze = build_attention_lut(
+        q_bhsd,
+        k_bhsd,
+        simthreshd1=simthreshd1,
+        cdfthreshd=cdfthreshd,
+        use_vfa=use_vfa(args),
+        n_sample=args.n_sample,
+        is_causal=args.causal,
+        block_m=block_m,
+        block_n=block_n,
+    )
+    return block_lut, freeze
+
+
 def build_block_mask(
     args: argparse.Namespace,
     shape: ShapeSpec,
@@ -1159,6 +1215,7 @@ def make_kernel_runner(
     k: torch.Tensor,
     v: torch.Tensor,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    freeze_softmax_max_count: Optional[int] = None,
 ) -> Any:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
@@ -1390,12 +1447,12 @@ def make_kernel_runner(
 
     if args.kernel == "aiter_asm_sparse_vfa":
         return make_asm_sparse_vfa_runner(
-            args, q_bshd, k_bshd, v_bshd, block_lut
+            args, q_bshd, k_bshd, v_bshd, block_lut, freeze_softmax_max_count
         )
 
     if args.kernel == "aiter_asm_sparse_vfa_fp8":
         return make_asm_sparse_vfa_fp8_runner(
-            args, q_bshd, k_bshd, v_bshd, block_lut
+            args, q_bshd, k_bshd, v_bshd, block_lut, freeze_softmax_max_count
         )
 
     raise ValueError(f"Unsupported kernel: {args.kernel}")
@@ -1522,6 +1579,7 @@ def benchmark_single_case(
     explicit_block_attn_mask: Optional[torch.Tensor] = None,
 ) -> float:
     shape = infer_shape_spec(q, v, args.layout)
+    freeze_softmax_max_count: Optional[int] = None
     block_attn_mask = (
         explicit_block_attn_mask
         if explicit_block_attn_mask is not None
@@ -1539,15 +1597,32 @@ def benchmark_single_case(
         "aiter_asm_sparse_vfa",
         "aiter_asm_sparse_vfa_fp8",
     )
-    block_lut = (
-        block_attn_mask_to_ragged_lut(
+    if block_attn_mask is not None:
+        # Static mask (explicit / --block-mask-file / random --block-sparsity)
+        # takes precedence over the --sparge Q/K-derived LUT.
+        block_lut = block_attn_mask_to_ragged_lut(
             block_attn_mask, return_none_if_dense=_return_none_if_dense
         )
-        if block_attn_mask is not None
-        else None
-    )
+        if use_vfa(args) and block_lut is not None:
+            # Static mask isn't reordered, so just exercise the freeze with the
+            # configured sample count (keep the existing --freeze-count default).
+            freeze_softmax_max_count = args.n_sample
+    elif builds_qk_lut(args):
+        # --sparge: build the ragged LUT (+ freeze count) from Q/K via
+        # build_attention_lut, replacing the random-mask LUT path.
+        q_bhsd, k_bhsd, _ = layout_preprocess(
+            q, k, v, layout=args.layout, target_layout="bhsd"
+        )
+        block_lut, freeze_softmax_max_count = build_attn_mode_lut(
+            args, q_bhsd, k_bhsd, q.device
+        )
+    else:
+        block_lut = None
 
-    fn = make_kernel_runner(args, q, k, v, block_lut=block_lut)
+    fn = make_kernel_runner(
+        args, q, k, v, block_lut=block_lut,
+        freeze_softmax_max_count=freeze_softmax_max_count,
+    )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
     if args.compare_to_ref:
@@ -1814,10 +1889,11 @@ def validate_args(args: argparse.Namespace) -> None:
         "aiter_asm_sparse_vfa",
         "aiter_asm_sparse_vfa_fp8",
     ):
-        if args.block_sparsity is None and not args.block_mask_file:
+        if args.block_sparsity is None and not args.block_mask_file and not args.sparge:
             raise ValueError(
-                f"--kernel={args.kernel} requires --block-sparsity or "
-                "--block-mask-file (the hand-written kernel has no dense path)."
+                f"--kernel={args.kernel} requires --block-sparsity, "
+                "--block-mask-file, or --sparge (the hand-written kernel has no "
+                "dense path)."
             )
         if args.causal:
             raise ValueError(
@@ -2301,6 +2377,39 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="With random block sparsity: run repeated masks and report quantiles",
+    )
+    parser.add_argument(
+        "--sparge",
+        action="store_true",
+        help=(
+            "Build the block-sparse LUT from Q/K with build_attention_lut "
+            "(SpargeAttn meansim selection) instead of a random --block-sparsity "
+            "mask. For aiter_asm_sparse_vfa_fp8 it also front-loads the top "
+            "--n-sample blocks and uses the returned freeze count (overriding "
+            "--freeze-count). Ignored when a static mask (--block-sparsity / "
+            "--block-mask-file) is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--simthreshd1",
+        type=float,
+        default=0.1,
+        help="(--sparge) SpargeAttn intra-block self-similarity threshold",
+    )
+    parser.add_argument(
+        "--cdfthreshd",
+        type=float,
+        default=0.9,
+        help="(--sparge) SpargeAttn cumulative-probability block-keep threshold",
+    )
+    parser.add_argument(
+        "--n-sample",
+        type=int,
+        default=16,
+        help=(
+            "(--sparge + VFA) number of top-scored blocks front-loaded per segment; "
+            "also the freeze_softmax_max_count for the VFA running-max freeze"
+        ),
     )
 
     parser.add_argument(

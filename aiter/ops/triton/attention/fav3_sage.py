@@ -15,6 +15,10 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
 
 from aiter.ops.triton.utils._triton import arch_info
 
+# Backport of the SpargeAttn/VFA ragged-LUT builder (vendored on this branch).
+# Re-exported here so callers can use the same import path as tianxing/sage_vfa.
+from aiter.ops.triton.attention.block_sparse import build_attention_lut  # noqa: F401
+
 
 def get_sage_fwd_configs():
     arch = arch_info.get_arch()
