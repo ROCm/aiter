@@ -34,7 +34,6 @@ from .mxfp4_gemm_common import (
     k_half_for,
     k_tiles_total_for,
     kunroll_for,
-    kas_c_k1_for,
     kbs_stride_n0_dw_for,
     kas_per_chunk_dw_for,
     num_n_blocks_for,
@@ -180,9 +179,7 @@ def _gemm1_body(
         T.i8,
         shape=(kSubBlocks * K_TILES_TOTAL * 256,),
     )
-    lds_acc = SmemPtr(
-        lds_base, lds_off, T.f32, shape=(BM * BN,)
-    )
+    lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,))
 
     cached_actual_row = []
     cached_row_inline = []
@@ -351,9 +348,7 @@ def _gemm1_body(
         local_amax = _umax_i32(lo, hi)
         amax_u32 = _inline_dpp_quad_amax(local_amax)
         e8m0 = _inline_e8m0(amax_u32)
-        qs = fx.Float32(
-            _raw(e8m0 << fx.Int32(23)).bitcast(T.f32)
-        )
+        qs = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
         pk = _raw(fx.Int32(0))
         qs_raw = _raw(qs)
         for j in range_constexpr(4):
@@ -470,9 +465,7 @@ def _gemm1_body(
     def issue_b_scale_load(bs_slot, K_C):
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
         K_C_HI = K_C // 16
-        imm = (K_C - K_C_HI * 16) * (
-            kBS_stride_k0_dw * 4
-        )
+        imm = (K_C - K_C_HI * 16) * (kBS_stride_k0_dw * 4)
         for mw in range_constexpr(2):
             s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
             bs_slot[mw] = buffer_ops.buffer_load(
@@ -618,9 +611,7 @@ def _gemm1_body(
     s_asc._view_cache = None
     lds_acc._view_cache = None
 
-    wave_n = (
-        wave
-    )
+    wave_n = wave
     lds_acc_base = _lds_base_ptr3(lds_acc.get())
 
     for i in range_constexpr(kMChunks):
@@ -810,9 +801,7 @@ def compile_gemm1_a4w4_port(
         None, arch="gfx950", global_sym_name=f"gemm1port_smem_{name_suffix}"
     )
     lds_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = (
-        lds_off + lds_bytes
-    )
+    allocator.ptr = lds_off + lds_bytes
 
     @flyc.kernel(name=f"gemm1_a4w4_port_{name_suffix}", known_block_size=[256, 1, 1])
     def gemm1_kernel(

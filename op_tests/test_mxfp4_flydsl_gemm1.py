@@ -429,6 +429,7 @@ def test_flydsl_gemm1_parametrized_shape_numeric(NE, H, INTER, TOPK, interleave)
     active = min(NE, M * topk)
     max_sorted = ((M * topk + active * (BM - 1) + BM - 1) // BM) * BM
     if (NE, topk) == (385, 9):
+
         def eb():
             return torch.empty((0,), device=device, dtype=dtypes.bf16)
 
