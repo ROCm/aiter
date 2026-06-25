@@ -111,7 +111,7 @@ void gemm_a16w16_kbuf2v_bk128_kernel(Kargs kargs) {
 
     auto g_c = [&]() {
         if constexpr (IS_SPLITK) {
-            return make_gmem(reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
+            return make_gmem(opus_splitk_ws_ptr<D_C>(kargs.ws_handle)
                              + (size_t)split_id  * kargs.batch * kargs.stride_ws_batch
                              + (size_t)batch_id  * kargs.stride_ws_batch
                              + (size_t)row       * kargs.stride_ws
