@@ -1253,6 +1253,11 @@ OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x4(const S& s) {
     auto x = __builtin_amdgcn_cvt_pk_f32_fp8(bitwise, 0); auto y = __builtin_amdgcn_cvt_pk_f32_fp8(bitwise, 1);
     return fp32x4_t{x[0], x[1], y[0], y[1]};
 }
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_bf8_packed_x2(const S& s, number<sel> = {}) {
+    int w ; w = __builtin_amdgcn_cvt_pk_bf8_f32(s[0], s[1], w, sel);
+    return __builtin_bit_cast(bf8x2_t, static_cast<short>(w));
+}
 
 namespace impl {
 template<typename S, index_t... Xs>     OPUS_D constexpr decltype(auto) fold_as_tuple_of_vec(const S& s, seq<Xs...>) {
@@ -1340,7 +1345,23 @@ OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 
     return value.fp4_pack[0];
 }
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
-OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(s, scale, sel); }
+OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(__builtin_bit_cast(u8_t, s), scale, sel); }
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp16x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp16_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
+    u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, s, scale, sel);
+    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>(w));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp16x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp16_to_fp4_packed_x4(const S& s, float scale = 1.0f) {
+    u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[0], s[1]}, scale, 0); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[2], s[3]}, scale, 1);
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(w));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp16x8_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp16_to_fp4_packed_x8(const S& s, float scale = 1.0f) {
+    u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[0], s[1]}, scale, 0); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[2], s[3]}, scale, 1);
+    w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[4], s[5]}, scale, 2); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[6], s[7]}, scale, 3);
+    return __builtin_bit_cast(array<fp4_t, 4>, w);
+}
 #elif defined(__gfx1250__)
 // gfx1250: pk8 builtins convert 8 fp4 <-> 8 f32 at once
 // f32->fp4: __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v8f32 src, float scale) -> i32
@@ -1385,11 +1406,14 @@ OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 
     fp32x8_t r = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(static_cast<i32_t>(__builtin_bit_cast(u32_t, s)), scale_e8m0, 0);
     return fp32x8_t{r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]};
 }
-// bf16<->fp4 stubs for gfx1250 (no pk bf16<->fp4 builtins available)
+// bf16<->fp4 and fp16->fp4 stubs for gfx1250 (no pk bf16<->fp4 / fp16->fp4 builtins available)
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return fp4_t{}; }
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return bf16x2_t{}; }
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp16x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return array<fp4_t, 1>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp16x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp16_to_fp4_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp16x8_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp16_to_fp4_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 4>{}; }
 #else
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 1>{}; }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
@@ -1399,6 +1423,9 @@ template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> 
 template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x8_t{}; }
 template<typename S, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return fp4_t{}; }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return bf16x2_t{}; }
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp16x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return array<fp4_t, 1>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp16x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp16_to_fp4_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp16x8_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp16_to_fp4_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 4>{}; }
 #endif
 #pragma clang diagnostic pop
 

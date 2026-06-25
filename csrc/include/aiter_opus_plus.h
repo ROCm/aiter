@@ -53,13 +53,9 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
     float a = tmp[0], b = tmp[1];
 #if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
     defined(__gfx1201__) || defined(__gfx1250__)
-    int w;
-    asm volatile("v_med3_f32 %1, %1, %3, %4\n"
-                 "v_med3_f32 %2, %2, %3, %4\n"
-                 "v_cvt_pk_fp8_f32 %0, %1, %2"
-                 : "=v"(w), "+v"(a), "+v"(b)
-                 : "v"(lo), "v"(hi));
-    return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+    a = med3<float>(a, lo, hi);
+    b = med3<float>(b, lo, hi);
+    return fp32_to_fp8_packed_x2(fp32x2_t{a, b});
 #else
     // Arches without packed fp8-cvt (RDNA3/3.5, host): compile-only stub.
     // fp8 KV-cache is unused on these arches; never executed at runtime.
@@ -85,13 +81,9 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
     float a = tmp[0], b = tmp[1];
 #if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
     defined(__gfx1201__) || defined(__gfx1250__)
-    int w;
-    asm volatile("v_med3_f32 %1, %1, %3, %4\n"
-                 "v_med3_f32 %2, %2, %3, %4\n"
-                 "v_cvt_pk_bf8_f32 %0, %1, %2"
-                 : "=v"(w), "+v"(a), "+v"(b)
-                 : "v"(lo), "v"(hi));
-    return __builtin_bit_cast(bf8x2_t, static_cast<int16_t>(w));
+    a = med3<float>(a, lo, hi);
+    b = med3<float>(b, lo, hi);
+    return fp32_to_bf8_packed_x2(fp32x2_t{a, b});
 #else
     (void)a; (void)b; (void)lo; (void)hi; return bf8x2_t{};
 #endif
@@ -127,50 +119,22 @@ OPUS_D decltype(auto) fp32_to_i8_scaled_x4(const S& s, float inverted_scale)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // fp16x2 -> fp4 with scale (v_cvt_scalef32_pk_fp4_f16, gfx950 only)
-// opus.hpp has fp32->fp4 and bf16->fp4 but NOT fp16->fp4
-#if defined(__gfx950__)
+// delegates to opus fp16_to_fp4_packed_x2/x4/x8 (arch handling lives in opus)
 template <typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp16x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x2(const S& s, float scale, number<sel> = {})
 {
-    u32_t w;
-    w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, s, scale, sel);
-    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>(w));
+    return fp16_to_fp4_packed_x2(s, scale, number<sel>{});
 }
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x4(const S& s, float scale)
 {
-    u32_t w;
-    w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[0], s[1]}, scale, 0);
-    w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[2], s[3]}, scale, 1);
-    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(w));
+    return fp16_to_fp4_packed_x4(s, scale);
 }
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x8_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x8(const S& s, float scale)
 {
-    u32_t w;
-    w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[0], s[1]}, scale, 0);
-    w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[2], s[3]}, scale, 1);
-    w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[4], s[5]}, scale, 2);
-    w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f16(w, fp16x2_t{s[6], s[7]}, scale, 3);
-    return __builtin_bit_cast(array<fp4_t, 4>, w);
+    return fp16_to_fp4_packed_x8(s, scale);
 }
-#else
-template <typename S, std::enable_if_t<std::is_same_v<S, fp16x2_t>, bool> = true>
-OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x2(const S&, float)
-{
-    return array<fp4_t, 1>{};
-}
-template <typename S, std::enable_if_t<std::is_same_v<S, fp16x4_t>, bool> = true>
-OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x4(const S&, float)
-{
-    return array<fp4_t, 2>{};
-}
-template <typename S, std::enable_if_t<std::is_same_v<S, fp16x8_t>, bool> = true>
-OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x8(const S&, float)
-{
-    return array<fp4_t, 4>{};
-}
-#endif
 
 // bf16 -> fp4 larger vectors (bf16x4/x8) using opus bf16_to_fp4_packed_x2
 template <typename S, std::enable_if_t<std::is_same_v<S, bf16x4_t>, bool> = true>
