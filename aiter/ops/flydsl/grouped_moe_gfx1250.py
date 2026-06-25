@@ -483,6 +483,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     split_k1 = 1
     split_k2 = 1
     grouped_contiguous_m = False
+    # WST / As-prologue requests, applied to BOTH gemm1 and gemm2. Precedence:
+    # env var (if set) > CSV column > default(off). CSV sets the per-row default;
+    # an explicitly-set env var overrides it.
+    wave_specialized_tdm_req = False
+    tdm_as_in_prologue_req = False
     cfg_row = _find_grouped_config(
         token_num=_get_padded_M(token_num),
         model_dim=model_dim,
@@ -508,6 +513,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stage1_weight_layout = (
             cfg_row.get("stage1_weight_layout") or stage1_weight_layout
         )
+        wave_specialized_tdm_req = _as_bool(
+            cfg_row.get("wave_specialized_tdm"), wave_specialized_tdm_req
+        )
+        tdm_as_in_prologue_req = _as_bool(
+            cfg_row.get("tdm_as_in_prologue"), tdm_as_in_prologue_req
+        )
         _grouped_dbg(f"using grouped CSV config: {cfg_row}")
     else:
         logger.info(
@@ -532,6 +543,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             split_k1,
             split_k2,
             stage1_weight_layout,
+        )
+    # Env vars override the CSV when explicitly set (presence check, so an env
+    # value of "0" also overrides a CSV "1").
+    if "AITER_GROUPED_GEMM_WAVE_SPECIALIZED" in os.environ:
+        wave_specialized_tdm_req = (
+            os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] in _TRUTHY_ENV
+        )
+    if "AITER_GROUPED_GEMM_AS_PROLOGUE" in os.environ:
+        tdm_as_in_prologue_req = (
+            os.environ["AITER_GROUPED_GEMM_AS_PROLOGUE"] in _TRUTHY_ENV
         )
     # gemm1 (stage1) tiles: tile_{m,n,k} read straight from the CSV, defaulting
     # to n_warp*64 / 256 when the column is absent.
@@ -805,12 +826,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         wave_specialized_tdm=(
             stage1_weight_layout == "gugu"
             and (m_warp * n_warp) == 4
-            and os.environ.get("AITER_GROUPED_GEMM1_WAVE_SPECIALIZED", "0")
-            in _TRUTHY_ENV
+            and wave_specialized_tdm_req
         ),
-        tdm_as_in_prologue=(
-            os.environ.get("AITER_GROUPED_GEMM_AS_PROLOGUE", "0") in _TRUTHY_ENV
-        ),
+        tdm_as_in_prologue=tdm_as_in_prologue_req,
     )
     _grouped_dbg("stage1 compile done; start launch")
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
@@ -946,14 +964,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
-        wave_specialized_tdm=(
-            (m_warp * n_warp) == 4
-            and os.environ.get("AITER_GROUPED_GEMM2_WAVE_SPECIALIZED", "0")
-            in _TRUTHY_ENV
-        ),
-        tdm_as_in_prologue=(
-            os.environ.get("AITER_GROUPED_GEMM_AS_PROLOGUE", "0") in _TRUTHY_ENV
-        ),
+        wave_specialized_tdm=((m_warp * n_warp) == 4 and wave_specialized_tdm_req),
+        tdm_as_in_prologue=tdm_as_in_prologue_req,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None

@@ -647,7 +647,7 @@ def main() -> None:
         default=False,
         help="enable/disable wave-specialized TDM (WST) for the grouped gemm1 "
         "and gemm2 (4 TDM streams -> 4 loader waves). --wst enables, --no-wst "
-        "disables (default). Sets AITER_GROUPED_GEMM1/2_WAVE_SPECIALIZED. Applies "
+        "disables (default). Sets AITER_GROUPED_GEMM_WAVE_SPECIALIZED. Applies "
         "where valid: gemm2 (non-fused single-B) always; gemm1 only for gugu "
         "(gguu is dual-B and ignores it).",
     )
@@ -662,8 +662,7 @@ def main() -> None:
     # Toggle wave-specialized TDM for the grouped gemm1 and gemm2 (read by
     # grouped_moe; applied where valid).
     _wst = "1" if args.wst else "0"
-    os.environ["AITER_GROUPED_GEMM1_WAVE_SPECIALIZED"] = _wst
-    os.environ["AITER_GROUPED_GEMM2_WAVE_SPECIALIZED"] = _wst
+    os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] = _wst
     if not args.real_gemm:
         _mock_grouped_gemm()
     if args.model_dim < 512 or args.inter_dim < 512:
