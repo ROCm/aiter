@@ -142,12 +142,12 @@ jobs:
           - model: amd/MiniMax-M3-MXFP4
             kv_cache_dtype: default_kvcache
             tp: 4
-            extra_args: ""
+            extra_args: --block-size 128
             extra_env_args: ""
           - model: amd/MiniMax-M3-MXFP4
             kv_cache_dtype: default_kvcache
             tp: 8
-            extra_args: ""
+            extra_args: --block-size 128
             extra_env_args: ""
         
     steps:
