@@ -276,13 +276,19 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
        a.data_type == "mxfp6bf16" && arch_id == "gfx950")
     {
         long long total = (long long)gdx * gdy * gdz;
+        // WG i is pre-assigned linear tile i by its program id; the device counter therefore
+        // starts at the launched-WG count (the first NOT-pre-assigned tile), and the kernel's
+        // atomic only hands out the overflow tiles [launch_wgs, total). Counter==0 + kernel
+        // pid-skip would double-process tiles [0, launch_wgs); they MUST stay consistent.
+        const int launch_wgs = (persist_p < total) ? persist_p : static_cast<int>(total);
         static uint32_t* g_counter = nullptr;
         if(g_counter == nullptr)
             (void)hipMalloc(reinterpret_cast<void**>(&g_counter), sizeof(uint32_t));
-        (void)hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(g_counter), 0, 1, s.stream_id_);
+        (void)hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(g_counter),
+                                static_cast<unsigned int>(launch_wgs), 1, s.stream_id_);
         args.ptr_lse = g_counter;          // counter ptr (kernel @0x40)
         args.s_lse   = static_cast<unsigned int>(total);  // total tiles (kernel @0x100)
-        gdx          = (persist_p < total) ? persist_p : static_cast<int>(total);
+        gdx          = launch_wgs;
         gdy          = 1;
         gdz          = 1;
     }
