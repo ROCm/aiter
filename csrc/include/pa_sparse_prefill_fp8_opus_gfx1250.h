@@ -194,14 +194,19 @@ __device__ inline void stage_row_bf16(typename T::D_ROPE* dst,
     }
 }
 
-// Accumulate one KV segment (prefix or extend) into the LDS O accumulator
-// (o_lds, f32 [Q_TILE, D_HEAD]) and per-row online-softmax state (m_lds, l_lds).
+// M1: register-resident O accumulator + register PV C-fragment, no LDS O
+// round-trip, no scalar per-element O rescale. Softmax still uses the LDS S
+// staging path (lane=query-row) to update m/l and produce P, but the O
+// accumulator v_o (PV WMMA C fragment) lives in registers across tiles and is
+// rescaled in registers via the per-element query-row map o_row[].
 //   s_q  : [Q_TILE, SMEM_Q_ROW]   bf16  (Q, staged once, read-only here)
 //   s_kv : [KV_TILE, SMEM_KV_ROW] bf16  (K/V tile; K and V are the same data)
-//   s_p  : [Q_TILE, SMEM_P_ROW]   f32   (scores/probs scratch) then bf16 P region
-//   o_lds: [Q_TILE, D_HEAD]       f32   (running output accumulator)
-//   m_lds,l_lds: [Q_TILE]         f32
-template <class Traits, class MMA0, class MMA1, class VQ>
+//   s_p  : [Q_TILE, SMEM_P_ROW]   f32   (scores/probs scratch)
+//   s_pb : [Q_TILE, SMEM_P_ROW]   bf16  (P, contiguous for A fragment)
+//   m_lds,l_lds: [Q_TILE]         f32   online-softmax state
+//   v_o  : MMA1 C fragment (registers), running output accumulator
+//   o_row: per-element query-row map for v_o (registers)
+template <class Traits, class MMA0, class MMA1, class VQ, class VO>
 __device__ void accum_segment(
         const pa_fp8_gfx1250_kargs& kargs,
         const void* kv_nope_ptr, const void* kv_rope_ptr,
@@ -209,7 +214,8 @@ __device__ void accum_segment(
         MMA0& mma0, MMA1& mma1,
         typename Traits::D_ROPE* s_q, typename Traits::D_ROPE* s_kv,
         float* s_p, typename Traits::D_ROPE* s_pb,
-        float* o_lds, float* m_lds, float* l_lds,
+        float* m_lds, float* l_lds, float* rescale_lds,
+        VO& v_o, const int* o_row,
         const VQ& v_q, float temperature_scale, int lane_id) {
     using namespace opus;
     using T = Traits;
@@ -221,6 +227,7 @@ __device__ void accum_segment(
     auto s_pb_mem = make_smem(s_pb);
 
     typename MMA0::vtype_c v_s;
+    constexpr index_t o_len = vector_traits<VO>::size();
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
         const int tile_base = tile_idx * T::KV_TILE_SIZE;
@@ -263,6 +270,7 @@ __device__ void accum_segment(
         __builtin_amdgcn_s_barrier();
 
         // ---- Per-row online softmax (lane = query row, lanes 0..Q_TILE-1) ----
+        // Publishes rescale_lds[qr] so the register O accumulator can be rescaled.
         if (lane_id < T::Q_TILE_SIZE) {
             const int qr = lane_id;
             float* prow = s_p + qr * T::SMEM_P_ROW;
@@ -284,11 +292,12 @@ __device__ void accum_segment(
             }
             m_lds[qr] = new_m;
             l_lds[qr] = l_lds[qr] * rescale + psum;
-            // rescale the running O accumulator row in LDS.
-            float* orow = o_lds + qr * T::D_HEAD_SIZE;
-            for (int d = 0; d < T::D_HEAD_SIZE; ++d) orow[d] *= rescale;
+            rescale_lds[qr] = rescale;
         }
         __builtin_amdgcn_s_barrier();
+
+        // ---- Rescale the register O accumulator (per element's query row) ----
+        static_for<o_len>([&](auto i){ v_o[i.value] *= rescale_lds[o_row[i.value]]; });
 
         // ---- Repack P (f32) -> bf16 contiguous for A fragment ----
         for (int idx = lane_id; idx < T::Q_TILE_SIZE * T::SMEM_P_ROW; idx += T::WARP_SIZE)
@@ -301,7 +310,7 @@ __device__ void accum_segment(
         s_wait_dscnt(0_I);
         __builtin_amdgcn_s_barrier();
 
-        // ---- GEMM1: dO = P @ V (V = same s_kv, transposed via strides) ----
+        // ---- GEMM1: O += P @ V (V = same s_kv, transposed via strides) ----
         auto la = mma1.template layout_a<0>(
             tuple{number<T::SMEM_P_ROW>{}, 1_I},
             tuple{0, lane_id % T::W_M, 0, lane_id / T::W_M});
@@ -312,26 +321,8 @@ __device__ void accum_segment(
             tuple{0, lane_id % T::W_N, 0, lane_id / T::W_N});
         auto v_v = load(s_kv_mem, lvb);
         s_wait_dscnt(0_I);
-        typename MMA1::vtype_c v_do;
-        clear(v_do);
-        v_do = mma1(v_p, v_v, v_do);
-
-        // ---- Accumulate dO into o_lds (C layout [m, d]) ----
-        // Store dO to s_p (reused f32 scratch) in C layout, then add to o_lds.
-        __builtin_amdgcn_s_barrier();
-        auto lc_do = mma1.template layout_c<0>(
-            tuple{number<T::D_HEAD_SIZE>{}, 1_I},
-            tuple{0, lane_id % T::W_N, 0, lane_id / T::W_N});
-        // o_lds is [Q_TILE, D_HEAD] contiguous (stride D_HEAD). Use a fresh smem
-        // view to store dO additively: store to a temp region then add. We add via
-        // a per-lane store to a scratch o2, then accumulate. Simplest: store dO to
-        // s_p f32 (large enough: Q_TILE*D_HEAD floats <= s_p capacity), add to o_lds.
-        auto o2_mem = make_smem(s_p);
-        store(o2_mem, v_do, lc_do);
-        s_wait_dscnt(0_I);
-        __builtin_amdgcn_s_barrier();
-        for (int idx = lane_id; idx < T::Q_TILE_SIZE * T::D_HEAD_SIZE; idx += T::WARP_SIZE)
-            o_lds[idx] += s_p[idx];
+        // Accumulate directly into the register C fragment (no LDS round-trip).
+        v_o = mma1(v_p, v_v, v_o);
         __builtin_amdgcn_s_barrier();
     }
 }
@@ -360,10 +351,10 @@ void pa_prefill_fp8_gfx1250_kernel(pa_fp8_gfx1250_kargs kargs) {
     __shared__ D_ROPE s_q [T::Q_TILE_SIZE  * T::SMEM_Q_ROW];    // Q bf16
     __shared__ D_ROPE s_kv[T::KV_TILE_SIZE * T::SMEM_KV_ROW];   // K/V bf16
     __shared__ D_ROPE s_pb[T::Q_TILE_SIZE  * T::SMEM_P_ROW];    // P bf16
-    __shared__ float  s_p [T::Q_TILE_SIZE  * T::D_HEAD_SIZE];   // scores/dO f32 scratch (32KB)
-    __shared__ float  o_lds[T::Q_TILE_SIZE * T::D_HEAD_SIZE];   // O accumulator f32 (32KB)
+    __shared__ float  s_p [T::Q_TILE_SIZE  * T::D_HEAD_SIZE];   // scores f32 scratch / probe
     __shared__ float  m_lds[T::Q_TILE_SIZE];
     __shared__ float  l_lds[T::Q_TILE_SIZE];
+    __shared__ float  rescale_lds[T::Q_TILE_SIZE];
 
     // ---- Stage Q tile (dequant NoPE + RoPE) into LDS bf16 [Q_TILE, dhead] ----
     for (int h = 0; h < T::Q_TILE_SIZE; ++h) {
@@ -403,13 +394,44 @@ void pa_prefill_fp8_gfx1250_kernel(pa_fp8_gfx1250_kargs kargs) {
     auto v_q = load(s_q_mem, la_q);
     s_wait_dscnt(0_I);
 
-    // ---- Init online state + O accumulator in LDS ----
+    // ---- Register-resident O accumulator (PV C fragment) ----
+    typename decltype(mma1)::vtype_c v_o;
+    clear(v_o);
+    constexpr index_t o_len = vector_traits<decltype(v_o)>::size();
+
+    // ---- Per-element query-row map for v_o (empirical, store-probe) ----
+    // Store a fragment where element i carries a unique tag (lane_id*1024 + i) through
+    // the SAME layout_c used for the final O store; each LDS slot s_p[m*D_HEAD+d] then
+    // holds the tag of the (lane, element) that wrote it. This lane scans for its own
+    // tags to learn m = slot/D_HEAD for each of its fragment elements. Runs once.
+    auto lc_o = mma1.template layout_c<0>(
+        tuple{number<T::D_HEAD_SIZE>{}, 1_I},
+        tuple{0, lane_id % T::W_N, 0, lane_id / T::W_N});
+    int o_row[o_len];
+    {
+        auto s_probe = make_smem(s_p);
+        typename decltype(mma1)::vtype_c v_probe;
+        static_for<o_len>([&](auto i){ v_probe[i.value] = (float)(lane_id * 1024 + i.value); });
+        store(s_probe, v_probe, lc_o);
+        s_wait_dscnt(0_I);
+        __builtin_amdgcn_s_barrier();
+        static_for<o_len>([&](auto i){ o_row[i.value] = 0; });
+        const int my_lo = lane_id * 1024;
+        for (int p = 0; p < T::Q_TILE_SIZE * T::D_HEAD_SIZE; ++p) {
+            int tag = (int)s_p[p];
+            if (tag >= my_lo && tag < my_lo + 1024) {
+                int e = tag - my_lo;
+                o_row[e] = p / T::D_HEAD_SIZE;
+            }
+        }
+        __builtin_amdgcn_s_barrier();
+    }
+
+    // ---- Init online softmax state ----
     for (int i = lane_id; i < T::Q_TILE_SIZE; i += T::WARP_SIZE) {
         m_lds[i] = -opus::numeric_limits<float>::infinity();
         l_lds[i] = 0.0f;
     }
-    for (int i = lane_id; i < T::Q_TILE_SIZE * T::D_HEAD_SIZE; i += T::WARP_SIZE)
-        o_lds[i] = 0.0f;
     __builtin_amdgcn_s_barrier();
 
     // ---- Prefix segment ----
@@ -420,8 +442,8 @@ void pa_prefill_fp8_gfx1250_kernel(pa_fp8_gfx1250_kargs kargs) {
         const int ntiles = ceil_div_g(valid, T::KV_TILE_SIZE);
         accum_segment<T>(kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr,
                          kargs.kv_indices_prefix, pb, valid, ntiles,
-                         mma0, mma1, s_q, s_kv, s_p, s_pb, o_lds, m_lds, l_lds,
-                         v_q, temperature_scale, lane_id);
+                         mma0, mma1, s_q, s_kv, s_p, s_pb, m_lds, l_lds, rescale_lds,
+                         v_o, o_row, v_q, temperature_scale, lane_id);
     }
     // ---- Extend segment ----
     {
@@ -431,26 +453,43 @@ void pa_prefill_fp8_gfx1250_kernel(pa_fp8_gfx1250_kargs kargs) {
         const int ntiles = ceil_div_g(valid, T::KV_TILE_SIZE);
         accum_segment<T>(kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr,
                          kargs.kv_indices_extend, pb, valid, ntiles,
-                         mma0, mma1, s_q, s_kv, s_p, s_pb, o_lds, m_lds, l_lds,
-                         v_q, temperature_scale, lane_id);
+                         mma0, mma1, s_q, s_kv, s_p, s_pb, m_lds, l_lds, rescale_lds,
+                         v_o, o_row, v_q, temperature_scale, lane_id);
     }
 
-    // ---- Sink finalization + normalize + store ----
+    // ---- Sink finalization + normalize (registers) + store O from registers ----
+    // Compute per-row o_scale into rescale_lds (reused), then scale v_o per element.
+    if (lane_id < T::Q_TILE_SIZE) {
+        const int m = lane_id;
+        const int head = h_block_start + m;
+        float o_scale = 0.0f;
+        if (head < kargs.H) {
+            float sink_log2 = reinterpret_cast<const float*>(kargs.attn_sink_ptr)[head] * LOG2_E;
+            float m_final = max(m_lds[m], sink_log2);
+            float alpha   = __builtin_amdgcn_exp2f(m_lds[m] - m_final);
+            float l_final = l_lds[m] * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
+            o_scale = (l_final > 0.0f) ? (alpha / l_final) : 0.0f;
+        }
+        rescale_lds[m] = o_scale;
+    }
+    __builtin_amdgcn_s_barrier();
+    static_for<o_len>([&](auto i){ v_o[i.value] *= rescale_lds[o_row[i.value]]; });
+
+    // Stage normalized O to LDS (s_p, f32 [Q_TILE, D_HEAD]) via the proven C layout,
+    // then write to gmem with a simple per-row loop (matches the baseline store path).
+    auto s_o_mem = make_smem(s_p);
+    store(s_o_mem, v_o, lc_o);
+    s_wait_dscnt(0_I);
+    __builtin_amdgcn_s_barrier();
+
     const int64_t o_base = (int64_t)q_token_idx * kargs.stride_o_n
                            + (int64_t)h_block_start * kargs.stride_o_h;
-    // Per query row finalize + store to gmem.
     for (int m = lane_id; m < T::Q_TILE_SIZE; m += T::WARP_SIZE) {
         const int head = h_block_start + m;
         if (head >= kargs.H) continue;
-        float sink_log2 = reinterpret_cast<const float*>(kargs.attn_sink_ptr)[head] * LOG2_E;
-        float m_final = max(m_lds[m], sink_log2);
-        float alpha   = __builtin_amdgcn_exp2f(m_lds[m] - m_final);
-        float l_final = l_lds[m] * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
-        float o_scale = (l_final > 0.0f) ? (alpha / l_final) : 0.0f;
         for (int d = 0; d < T::D_HEAD_SIZE; ++d) {
-            float ov = o_lds[m * T::D_HEAD_SIZE + d] * o_scale;
             reinterpret_cast<D_OUT*>(kargs.out_ptr)[o_base + (int64_t)m * kargs.stride_o_h + d]
-                = static_cast<D_OUT>(ov);
+                = static_cast<D_OUT>(s_p[m * T::D_HEAD_SIZE + d]);
         }
     }
 }
