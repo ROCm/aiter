@@ -5084,6 +5084,33 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         All parameters from the reduction kernel plus execution grid configuration
     """
     if PS:
+        if FLYDSL_PS_REDUCE_AVAILABLE:
+            try:
+                launch_pa_decode_ps_reduce_flydsl(
+                    output_ptr,
+                    exp_sums_ptr,
+                    max_logits_ptr,
+                    logits_ptr,
+                    sink_token_ptr,
+                    stride_output_bs,
+                    stride_output_len,
+                    stride_output_kv_head,
+                    stride_output_group_size,
+                    stride_exp_sums_seq,
+                    stride_exp_sums_head,
+                    stride_exp_sums_part,
+                    stride_logits_seq,
+                    stride_logits_head,
+                    stride_logits_part,
+                    stride_logits_group,
+                    query_seq_len=query_seq_len,
+                    query_group_size=query_group_size,
+                    head_size=head_size,
+                    context_partition_num=context_partition_num,
+                )
+                return
+            except ImportError:
+                pass
         if CXX_PS_REDUCE_AVAILABLE:
             try:
                 launch_pa_decode_ps_reduce_cxx(
@@ -5111,56 +5138,31 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 return
             except ImportError:
                 pass
-        try:
-            launch_pa_decode_ps_reduce_flydsl(
-                output_ptr,
-                exp_sums_ptr,
-                max_logits_ptr,
-                logits_ptr,
-                sink_token_ptr,
-                stride_output_bs,
-                stride_output_len,
-                stride_output_kv_head,
-                stride_output_group_size,
-                stride_exp_sums_seq,
-                stride_exp_sums_head,
-                stride_exp_sums_part,
-                stride_logits_seq,
-                stride_logits_head,
-                stride_logits_part,
-                stride_logits_group,
-                query_seq_len=query_seq_len,
-                query_group_size=query_group_size,
-                head_size=head_size,
-                context_partition_num=context_partition_num,
-            )
-            return
-        except ImportError:
-            ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
-            paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
-                output_ptr,
-                exp_sums_ptr,
-                max_logits_ptr,
-                logits_ptr,
-                sink_token_ptr,
-                stride_output_bs,
-                stride_output_len,
-                stride_output_kv_head,
-                stride_output_group_size,
-                stride_exp_sums_seq,
-                stride_exp_sums_head,
-                stride_exp_sums_part,
-                stride_logits_seq,
-                stride_logits_head,
-                stride_logits_part,
-                stride_logits_group,
-                query_group_size=query_group_size,
-                head_size=head_size,
-                context_partition_num=context_partition_num,
-                HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
-                USE_SINKS=sink_token_ptr is not None,
-                MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
-            )
+        ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
+        paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
+            output_ptr,
+            exp_sums_ptr,
+            max_logits_ptr,
+            logits_ptr,
+            sink_token_ptr,
+            stride_output_bs,
+            stride_output_len,
+            stride_output_kv_head,
+            stride_output_group_size,
+            stride_exp_sums_seq,
+            stride_exp_sums_head,
+            stride_exp_sums_part,
+            stride_logits_seq,
+            stride_logits_head,
+            stride_logits_part,
+            stride_logits_group,
+            query_group_size=query_group_size,
+            head_size=head_size,
+            context_partition_num=context_partition_num,
+            HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
+            USE_SINKS=sink_token_ptr is not None,
+            MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
+        )
     else:
         paged_attention_decode_v2_reduce_kernel[grid](
             output_ptr,
