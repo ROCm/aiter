@@ -143,8 +143,14 @@ def grad_jagged_kernel(
         if start_m < M_b:
             # Rebase A (dOut, N cols/row) and C (dJagged, K cols/row) to this group's
             # local row 0; select B's (K, N) slice for group off_b.
-            a_row_off = fx.Int32(seq_start) * fx.Int32(N)
-            c_row_off = fx.Int32(seq_start) * fx.Int32(K)
+            # int64 element offsets: at the North-Star shape (B=1024, Mi=7680)
+            # seq_start reaches ~L ≈ 7.86M, so seq_start*K (or *N) ≈ 4G overflows
+            # int32 once K/N ≥ 512, silently wrapping the (d)Jagged/dOut base pointer
+            # (the masked store then writes to a wrong/read-only page). seq_start*K
+            # at K=256 squeaks under 2^31, which is why 256 shapes never tripped it.
+            # Mirrors the int64 base_byte_offset in grad_dense_partials_kernel.
+            a_row_off = fx.Int64(seq_start) * fx.Int64(N)
+            c_row_off = fx.Int64(seq_start) * fx.Int64(K)
             A_g = fx.make_view(fx.add_offset(fx.get_iter(A), fx.make_int_tuple(a_row_off)), fx.get_layout(A))
             C_g = fx.make_view(fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_row_off)), fx.get_layout(C))
             b_row_off = fx.Int32(off_b) * fx.Int32(K) * fx.Int32(N)
@@ -315,7 +321,9 @@ def grad_bias_partials_kernel(
     M_b = seq_end - seq_start
 
     # Rebase dOut to this group's local row 0; loop bound M_b keeps reads in-range.
-    a_row_off = fx.Int32(seq_start) * fx.Int32(N)
+    # int64 element offset: seq_start*N overflows int32 for large L once N ≥ 512
+    # (see grad_jagged_kernel / grad_dense_partials_kernel for the same guard).
+    a_row_off = fx.Int64(seq_start) * fx.Int64(N)
     DOUT_g = fx.make_view(fx.add_offset(fx.get_iter(DOUT), fx.make_int_tuple(a_row_off)), fx.get_layout(DOUT))
     DOUT_buf = fx.rocdl.make_buffer_tensor(DOUT_g, max_size=True)
     copy_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
