@@ -47,7 +47,9 @@ def bench_gemm_fn(
     mem_write = (M * N) * x.element_size()
     mem = mem_read + mem_write
 
-    bench_fn = triton.testing.do_bench_cudagraph if cudagraph else triton.testing.do_bench
+    bench_fn = (
+        triton.testing.do_bench_cudagraph if cudagraph else triton.testing.do_bench
+    )
     bench_kwargs = {} if cudagraph else {"warmup": 25, "rep": 100}
 
     if atomic:
@@ -139,7 +141,16 @@ def run_shape_benchmark(args, backend):
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, backend, atomic=args.atomic, cudagraph=args.cudagraph)
+        return bench_gemm_fn(
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            backend,
+            atomic=args.atomic,
+            cudagraph=args.cudagraph,
+        )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
