@@ -1639,13 +1639,13 @@ def attention_loop_tensor_subtile_split(
         # --- S1: QK sub 0 + SM1-A ---
         qk0 = pgm.compute_qk_subtile(k0_s)
         if MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3:
-            kv_loader.load_v_to_shared(
-                next2_physical_block_idx, buffer_id=buf_tile_next2
-            )
             # N=3: K store slot is distinct from live ds_reads, so issue early
             kv_loader.load_k_to_shared(
                 next3_physical_block_idx,
                 buffer_id=buf_tile_cur if cfg.NUM_BUFFERS == 3 else buf_tile_next,
+            )
+            kv_loader.load_v_to_shared(
+                next2_physical_block_idx, buffer_id=buf_tile_next2
             )
         v = kv_loader.load_v_from_shared(
             wait_count=2,
@@ -2298,14 +2298,14 @@ def unified_attention(
     shuffled_kv_cache=False,
     loop_variant=None,
     # Config knobs routed from collect_data_lds.sh (None => inline auto-selection).
-    num_splits=None,
+    num_splits=1,
     num_warps=None,
     tile_size=None,
     waves_per_eu=None,
     remove_indirect_access = False,
     block_m=None,
     num_buffers=None,
-    reduce=True,
+    reduce=False,
 ):
     """
     Internal wrapper for the gfx1250 gluon kernel.
@@ -2353,12 +2353,12 @@ def unified_attention(
             else triton.next_power_of_2(NUM_QUERIES_PER_KV)
         )
         auto_num_warps = 1
-        auto_waves_per_eu = 1
+        auto_waves_per_eu = 2
         auto_tile_size = 128 if (Q_FP8 and KV_FP8) else 64
         target_num_prgs = 256
         auto_num_splits = target_num_prgs // (NUM_SEQS * NUM_KV_HEADS)
         auto_num_splits = max(1, auto_num_splits)
-        auto_num_splits = 2
+        auto_num_splits = 1
         # we shouldnt split further than this
         # min_kv_per_split = 1024
         # auto_num_splits = min(auto_num_splits, max_seqlen_k // min_kv_per_split)
@@ -2379,6 +2379,7 @@ def unified_attention(
         auto_waves_per_eu = 2
         auto_tile_size =  128 if (Q_FP8 and KV_FP8) else 64
         auto_num_splits = 1
+        num_buffers = 2
 
     num_warps = auto_num_warps if num_warps is None else num_warps
     waves_per_eu = auto_waves_per_eu if waves_per_eu is None else waves_per_eu
@@ -2389,11 +2390,10 @@ def unified_attention(
     # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page
     if not shuffled_kv_cache:
         TILE_SIZE = BLOCK_SIZE
-    # tile size cannot be bigger than block size
-    elif TILE_SIZE > BLOCK_SIZE:
+    # tile size cannot be less than block size
+    elif TILE_SIZE < BLOCK_SIZE:
         TILE_SIZE = BLOCK_SIZE
             
-
     num_kv_blocks = TILE_SIZE // BLOCK_SIZE if shuffled_kv_cache else 1
     assert TILE_SIZE < 512 and TILE_SIZE > 32, "TILE_SIZE must be in [32, 256]"
     assert (
@@ -2521,7 +2521,7 @@ def unified_attention(
         setattr(unified_attention, "print", True)
         #print_irs_to_files(attn_kernel, "unif_attention_2d")
 
-        print_irs_to_files(kernel, f"unified_attention_2d_q_fp8_{Q_FP8}_kv_fp8_{KV_FP8}_causal_{causal}_loop_{loop_variant}_buf_{num_buffers}_remove_indirect_{int(remove_indirect_access)}_gluon_wpeu_{waves_per_eu}_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{int(shuffled_kv_cache)}")
+        print_irs_to_files(kernel, f"unified_attention_2d_q_fp8_{Q_FP8}_kv_fp8_{KV_FP8}_causal_{causal}_loop_{loop_variant}_buf_{num_buffers}_remove_indirect_{int(remove_indirect_access)}_gluon_wpeu_{waves_per_eu}_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{int(shuffled_kv_cache)}_sp_{num_splits}")
     return out
 
 
