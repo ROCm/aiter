@@ -281,7 +281,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         total_bytes_limit = (
             self._ar_1stage_max_kb
             if self._ar_1stage_max_kb >= 0
-            else self.world_size * 32 * 1024
+            else 128 * 7168 * 2 // self.world_size
         )
         use_1stage = (
             self._ar_1stage_override
@@ -364,14 +364,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
 
-        norm_weight = weight_ + 1.0 if gemma_norm else weight_
         rmsnorm2d_fwd_with_add(
             out,
             ar_out,
             res_inp_,
             residual_out,
-            norm_weight,
+            weight_,
             eps,
+            gemma_norm,
             0,
         )
         return out, residual_out
