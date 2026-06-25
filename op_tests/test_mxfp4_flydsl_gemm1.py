@@ -4,13 +4,16 @@ import torch
 
 
 def test_port_module_imports_and_constants():
-    """Port module imports cleanly and exposes the compile fn / grid + the Kimi constants."""
+    """Port module imports cleanly and exposes the compile fn / grid + the *_for
+    helpers that derive the Kimi sizes (NE/K/INTER/TOPK/BN/BK are compile args now)."""
     from aiter.ops.flydsl.kernels import mxfp4_gemm1 as port
 
     assert callable(port.compile_gemm1_a4w4_port)
     assert callable(port.gemm1_grid)
-    assert (port.NE, port.K, port.INTER, port.TOPK) == (385, 7168, 512, 9)
-    assert port.N_OUT == 1024
+    # KIMI: INTER=512 -> N_OUT=1024, num_n_blocks=4 (BN=256); K=7168 -> 28 K-tiles.
+    assert port.n_out_for(512) == 1024
+    assert port.num_n_blocks_for(512, 256) == 4
+    assert port.k_tiles_total_for(7168, 256) == 28
 
 
 def test_guard_accepts_non_kimi_ne_inter_topk():
@@ -230,7 +233,15 @@ def test_flydsl_gemm1_parametrized_k_compiles(H):
         (128, False, False),
         (16, True, True),
     ]:
-        launch = compile_gemm1_a4w4_port(BM=BM, use_nt=nt, inline_quant=iq, D_HIDDEN=H)
+        launch = compile_gemm1_a4w4_port(
+            BM=BM,
+            use_nt=nt,
+            inline_quant=iq,
+            D_HIDDEN=H,
+            D_INTER=512,
+            NE=385,
+            TOPK=9,
+        )
         assert callable(launch)
 
 

@@ -28,7 +28,7 @@ _SUPPORTED = {
 
 @functools.cache
 def _get_compiled_mxfp4_gemm1_port(
-    BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk
+    BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, BN, BK
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -40,22 +40,26 @@ def _get_compiled_mxfp4_gemm1_port(
         D_INTER=D_INTER,
         NE=NE,
         TOPK=topk,
+        BN=BN,
+        BK=BK,
     )
 
 
-def _assert_supported(*, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, inline_quant):
+def _assert_supported(
+    *, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, inline_quant, BN=256, BK=256
+):
     # K (= D_HIDDEN, contraction), INTER (= D_INTER, output) and NE/TOPK are all
     # parametrized now. Only the real divisibility / variant constraints remain:
     #   * K must be a multiple of BK (256)
     #   * 2*D_INTER (= N_OUT) must be a multiple of BN (256), i.e. D_INTER % 128 == 0
-    if D_HIDDEN % 256 != 0:
+    if D_HIDDEN % BK != 0:
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % 256 == 0, got H={D_HIDDEN}"
+            f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % {BK} == 0, got H={D_HIDDEN}"
         )
-    if (2 * D_INTER) % 256 != 0:
+    if (2 * D_INTER) % BN != 0:
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm1 requires 2*D_INTER (N_OUT) % 256 == 0 "
-            f"(i.e. D_INTER % 128 == 0), got D_INTER={D_INTER}"
+            f"flydsl mxfp4 gemm1 requires 2*D_INTER (N_OUT) % {BN} == 0, "
+            f"got D_INTER={D_INTER}"
         )
     if (BM, use_nt, inline_quant) not in _SUPPORTED:
         raise NotImplementedError(
@@ -84,6 +88,8 @@ def flydsl_mxfp4_gemm1(
     D_HIDDEN,
     D_INTER,
     topk,
+    BN=256,
+    BK=256,
     stream=None,
 ):
     """Run the FlyDSL port gemm1, writing inter_sorted_quant / inter_sorted_shuffled_scale.
@@ -100,13 +106,15 @@ def flydsl_mxfp4_gemm1(
         BM=BM,
         use_nt=use_nt,
         inline_quant=inline_quant,
+        BN=BN,
+        BK=BK,
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
-        BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk
+        BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, BN, BK
     )
-    grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER)
+    grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     # gemm1 only needs base pointers (it assumes contiguity + derives sizes
     # from n_tokens / compile-time consts), so pass raw data_ptr() addresses
     # instead of full memref descriptors -> contiguous, coalescible kernargs.

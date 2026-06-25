@@ -52,7 +52,7 @@ def _epilog_of(atomic, mxfp4out, cshuffle=False):
 
 @functools.cache
 def _get_compiled_mxfp4_gemm2_port(
-    BM, use_nt, NE, N_OUT, epilog, D_INTER, D_INTER_REAL=None
+    BM, use_nt, NE, N_OUT, epilog, D_INTER, D_INTER_REAL=None, BN=256, BK=256
 ):
     from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
 
@@ -64,6 +64,8 @@ def _get_compiled_mxfp4_gemm2_port(
         epilog=epilog,
         D_INTER=D_INTER,
         D_INTER_REAL=D_INTER_REAL,
+        BN=BN,
+        BK=BK,
     )
 
 
@@ -73,19 +75,28 @@ def _dummy_out_scale(device):
 
 
 def _assert_supported(
-    *, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, atomic, mxfp4out, cshuffle=False
+    *,
+    NE,
+    D_HIDDEN,
+    D_INTER,
+    topk,
+    BM,
+    use_nt,
+    atomic,
+    mxfp4out,
+    cshuffle=False,
+    BN=256,
+    BK=256,
 ):
-    from .kernels import mxfp4_gemm2 as port
-
     # gemm2 contraction K = inter_dim = D_INTER. The kernel (BK=256) supports any
     # D_INTER % 256 == 0 (KIMI/DSR 512 keeps the original fully-unrolled fast path;
     # >512 uses the streaming K-loop). D_HIDDEN (= model_dim / output) must equal the
     # prebuilt HIP H=7168, and NE in {257,385}, TOPK=9 -- fail-loud otherwise.
-    if D_INTER % port.BK != 0:
+    if D_INTER % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm2 contraction D_INTER (=inter_dim) must be a "
-            f"multiple of {port.BK}; D_INTER not divisible by {port.BK} (e.g. "
-            f"384/192) is not supported by this BK={port.BK} kernel "
+            f"multiple of {BK}; D_INTER not divisible by {BK} (e.g. "
+            f"384/192) is not supported by this BK={BK} kernel "
             f"(got D_INTER={D_INTER})"
         )
     # N_OUT (= D_HIDDEN = model_dim) and NE are compile-parametrized; gemm2's real
@@ -93,9 +104,9 @@ def _assert_supported(
     # (Was KIMI/DSR-gated to NE in (257,385), H=7168 -- relaxed to match gemm1's
     # _assert. Pipeline-level routing limits, e.g. mxfp4_moe_sort's NE/TOPK gating,
     # are enforced by those components, not here.)
-    if D_HIDDEN % 256 != 0:
+    if D_HIDDEN % BN != 0:
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm2 requires D_HIDDEN (=N_OUT=model_dim) % 256 == 0, "
+            f"flydsl mxfp4 gemm2 requires D_HIDDEN (=N_OUT=model_dim) % {BN} == 0, "
             f"got H={D_HIDDEN}"
         )
     epilog = _epilog_of(atomic, mxfp4out, cshuffle)
@@ -130,6 +141,8 @@ def flydsl_mxfp4_gemm2(
     flat_out_scale=None,
     cshuffle=False,
     D_INTER_REAL=None,
+    BN=256,
+    BK=256,
     stream=None,
 ):
     """Run the FlyDSL port gemm2, writing flat_out (plus flat_out_scale when mxfp4out).
@@ -148,10 +161,12 @@ def flydsl_mxfp4_gemm2(
         atomic=atomic,
         mxfp4out=mxfp4out,
         cshuffle=cshuffle,
+        BN=BN,
+        BK=BK,
     )
     epilog = _epilog_of(atomic, mxfp4out, cshuffle)
     launch = _get_compiled_mxfp4_gemm2_port(
-        BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL
+        BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL, BN, BK
     )
 
     # grid size = max_m_blocks (an upper bound; the kernel reads the true active

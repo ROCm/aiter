@@ -40,16 +40,6 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 # -- shape constants (BM-independent) -----------------------------------------
-NE = 385
-K = 512  # gemm2 contraction = inter_dim (DEFAULT / KIMI; per-shape value comes
-#          from the compile arg D_INTER. All K-derived sizes are computed from the
-#          arg via the *_for() helpers below; these module globals are the KIMI
-#          defaults so existing importers (and the test) keep working unchanged.)
-N_OUT = 7168  # default gemm2 output dim = model_dim (per-shape value comes from the compile arg)
-
-BN = 256
-BK = 256
-KH_TILE = BK // 2  # 128 packed bytes per K-tile (BK-derived, K-independent)
 kStages = 2
 NUM_CU = 256  # persistent-grid workgroup count (matches gemm2_a4w4.cuh NUM_CU).
 # XCD remap mode for the persistent (cshuffle/nonatomic) grid, read at build time.
@@ -74,16 +64,16 @@ def k_half_for(k):
     return k // 2  # packed-fp4 bytes along K (KIMI: 256)
 
 
-def k_tiles_total_for(k):
+def k_tiles_total_for(k, BK):
     return k // BK  # KIMI: 2
 
 
-def kunroll_for(k):
+def kunroll_for(k, BK):
     # streaming main-loop trip count (K_TILES_TOTAL>2 path): prologue issues kStages
     # tiles, the main loop processes tiles [0, kUnroll) while streaming tiles
     # [kStages, kStages+kUnroll), and the drain processes the final kStages tiles.
     # Full gap-free coverage requires EXACTLY kUnroll = K_TILES_TOTAL - kStages.
-    return k_tiles_total_for(k) - kStages
+    return k_tiles_total_for(k, BK) - kStages
 
 
 def kbs_c_k1_for(k):
@@ -104,38 +94,32 @@ def kas_per_chunk_dw_for(k):
 
 # -- shape-parametrized sizes (NE/N_OUT/K vary per instance) --
 # N_OUT must be a multiple of 256 (BN).
-def num_n_blocks_for(n_out):
-    return n_out // 256
+def num_n_blocks_for(n_out, BN):
+    return n_out // BN
 
 
-def kbs_per_expert_dw_for(n_out, k=K):
+def kbs_per_expert_dw_for(n_out, k):
     # depends on BOTH N_OUT (via N_OUT//16//2) AND K (via kBS_stride_n0_dw).
     return (n_out // 16 // 2) * kbs_stride_n0_dw_for(k)
 
 
-def aq_bytes_for(max_m, k=K):
+def aq_bytes_for(max_m, k):
     return max_m * k_half_for(k)
 
 
-def bq_bytes_for(ne, n_out, k=K):
+def bq_bytes_for(ne, n_out, k):
     return ne * n_out * k_half_for(k)
 
 
-def bscale_bytes_for(ne, n_out, k=K):
+def bscale_bytes_for(ne, n_out, k):
     return ne * kbs_per_expert_dw_for(n_out, k) * 4
 
 
-# KIMI default kept as a module global (used as a param default below). All other
-# K-derived sizes are computed per-shape from the compile arg via the *_for(K)
-# helpers (local _K_* in compile_gemm2_a4w4_port), so they need no module globals.
-K_HALF = k_half_for(K)  # 256
-
-
-def saq_slot_bytes(BM):
+def saq_slot_bytes(BM, KH_TILE):
     return BM * KH_TILE  # s_Aq[slot] = BM rows x KH_TILE bytes
 
 
-def lds_bytes(BM):
+def lds_bytes(BM, BN):
     return BM * BN * 4  # union max: lds_acc[BM*BN] f32 (>= 2*saq_slot_bytes)
 
 
@@ -219,7 +203,7 @@ def _lds_swizzle_mask(row):
 
 
 def _issue_a_load_lds(
-    aq_rsrc, saq, slot, kt, car, lane, slot_bytes, lds_row, k_half=K_HALF
+    aq_rsrc, saq, slot, kt, car, lane, slot_bytes, lds_row, KH_TILE, k_half
 ):
     """Issue one A->LDS chunk load (one wave's 8 rows for one (K-tile=slot,
     M-subblock)) via ``raw.ptr.buffer.load.lds`` into s_Aq[slot][lds_row]. ``car``
@@ -247,11 +231,14 @@ def _issue_a_load_lds(
 def compile_gemm2_a4w4_port(
     BM=32,
     use_nt=False,
-    NE=NE,
-    N_OUT=N_OUT,
+    *,
+    NE,
+    N_OUT,
     epilog="atomic",
-    D_INTER=K,
+    D_INTER,
     D_INTER_REAL=None,
+    BN=256,
+    BK=256,
 ):
     """Compile the gemm2 a4w4 port for a given shape / specialization / epilog.
 
@@ -278,6 +265,8 @@ def compile_gemm2_a4w4_port(
     # inter/scales to D_INTER (the next %256, e.g. 512) and passes D_INTER_REAL=384;
     # the K-loop tiles over the padded _K but skips loading/MFMA-ing the pad-tail
     # 128-K half-steps (k >= _K_REAL) -> the real ~25% weight bandwidth is not read.
+    assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
+    KH_TILE = BK // 2  # 128 packed bytes per K-tile (BK-derived, K-independent)
     _K = D_INTER
     _K_REAL = D_INTER if D_INTER_REAL is None else D_INTER_REAL
     assert _K % BK == 0, (
@@ -289,7 +278,7 @@ def compile_gemm2_a4w4_port(
         _K_REAL % 128 == 0 and 0 < _K_REAL <= _K
     ), f"D_INTER_REAL={_K_REAL} must be a multiple of 128 and in (0, {_K}]"
     _K_HALF = k_half_for(_K)
-    _K_TILES_TOTAL = k_tiles_total_for(_K)
+    _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
     # The BM128 non-atomic epilogs use a hybrid persistent grid (one-shot for small
     # launches, NUM_CU workgroups grid-striding for large). Even though the heavy
     # mxfp4-out epilog is LDS-bound to 1 block/CU (no occupancy slack), persistence
@@ -299,7 +288,7 @@ def compile_gemm2_a4w4_port(
     # epilog. This mirrors the prebuilt HIP gemm2 (256 persistent WGs); profiling
     # showed the old one-shot mxfp4out path ~8-9% slower than HIP at M>=16384.
     _persistent = epilog in ("nonatomic", "nonatomic_mxfp4")
-    _slot_bytes = saq_slot_bytes(BM)
+    _slot_bytes = saq_slot_bytes(BM, KH_TILE)
     # Number of LDS A-slots (s_Aq stages). The K_TILES_TOTAL==2 fast path preloads
     # all 2 tiles into 2 slots (double buffer). The streaming K_TILES_TOTAL>2 path
     # uses 3 slots (triple buffer) so the per-iteration read-slot (tile kt) and
@@ -312,11 +301,11 @@ def compile_gemm2_a4w4_port(
     # cshuffles in 64-row passes -> only min(BM,64)*BN f32 (BM128 -> 64KB not 128KB).
     _acc_rows = min(BM, 64) if epilog == "nonatomic_cshuffle" else BM
     _lds_bytes = (
-        max(lds_bytes(_acc_rows), _aStages * _slot_bytes)
+        max(lds_bytes(_acc_rows, BN), _aStages * _slot_bytes)
         if epilog != "nonatomic"
         else _aStages * _slot_bytes
     )
-    _num_n_blocks = num_n_blocks_for(N_OUT)
+    _num_n_blocks = num_n_blocks_for(N_OUT, BN)
     _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(
         BM
     )  # BM16/32:1, BM64:2, BM128:4
@@ -391,6 +380,7 @@ def compile_gemm2_a4w4_port(
                         lane,
                         _slot_bytes,
                         lds_row,
+                        KH_TILE=KH_TILE,
                         k_half=_K_HALF,
                     )
 
@@ -420,6 +410,9 @@ def compile_gemm2_a4w4_port(
                 D_INTER=_K,
                 D_INTER_REAL=_K_REAL,
                 aStages=_aStages,
+                BN=BN,
+                BK=BK,
+                KH_TILE=KH_TILE,
             )
 
         # total_m_blocks = cumsum[0] / BM ; bound = total_m_blocks * _num_n_blocks
@@ -587,18 +580,21 @@ def _gemm2_body(
     epilog,
     *,
     aq_rsrc=None,
-    D_INTER=K,
+    D_INTER,
     D_INTER_REAL=None,
     aStages=kStages,
+    BN,
+    BK,
+    KH_TILE,
 ):
     _aStages = aStages
     _kMChunks = kmchunks(BM)
-    _slot_bytes = saq_slot_bytes(BM)
+    _slot_bytes = saq_slot_bytes(BM, KH_TILE)
     _lds_acc_floats = (min(BM, 64) if epilog == "nonatomic_cshuffle" else BM) * BN
     # K-derived sizes (parametrized over the contraction dim K = inter_dim = D_INTER).
     _K = D_INTER
     _K_HALF = k_half_for(_K)
-    _K_TILES_TOTAL = k_tiles_total_for(_K)  # KIMI: 2
+    _K_TILES_TOTAL = k_tiles_total_for(_K, BK)  # KIMI: 2
     # Real (unpadded) contraction. For a non-256-aligned shard (dsv4 TP8: 384) the
     # weights/inter/scales are zero-padded to D_INTER (=512) so the layout/shuffle
     # is the proven %256 one, but the last 128-K MFMA half-step(s) that fall in the
@@ -609,7 +605,7 @@ def _gemm2_body(
     _n_real_half = (
         _K_REAL + 127
     ) // 128  # valid 128-K MFMA half-steps (512->4, 384->3)
-    _kUnroll = kunroll_for(_K)  # streaming main-loop trips (KIMI: 0)
+    _kUnroll = kunroll_for(_K, BK)  # streaming main-loop trips (KIMI: 0)
     _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
     _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
     _asc_chunk_div = 16 if const_expr(BM == 16) else 32
@@ -617,7 +613,7 @@ def _gemm2_body(
     _bq_bytes = bq_bytes_for(NE, N_OUT, _K)
     _bscale_bytes = bscale_bytes_for(NE, N_OUT, _K)
     _kbs_per_expert_dw = kbs_per_expert_dw_for(N_OUT, _K)
-    _num_n_blocks = num_n_blocks_for(N_OUT)
+    _num_n_blocks = num_n_blocks_for(N_OUT, BN)
     _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(
         BM
     )  # BM16/32:1, BM64:2, BM128:4
@@ -750,7 +746,16 @@ def _gemm2_body(
             lds_row = wave * fx.Int32(_rows_per_wave) + fx.Int32(sub * 8)
             car = m_row + lds_row + (lane // fx.Int32(8))
             _issue_a_load_lds(
-                aq_rsrc, saq, slot, kt, car, lane, _slot_bytes, lds_row, k_half=_K_HALF
+                aq_rsrc,
+                saq,
+                slot,
+                kt,
+                car,
+                lane,
+                _slot_bytes,
+                lds_row,
+                KH_TILE=KH_TILE,
+                k_half=_K_HALF,
             )
 
     # -- ds_read(slot) -> a[i][k] (i32x4) ; i in [0,kMChunks) -----------------
@@ -891,7 +896,7 @@ def _gemm2_body(
         # separate scatter_reduce sums the TOPK contributions per token.
         out_base = _global_base_ptr1(arg_out)
         _flat_bf16_epilog(
-            accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, _kMChunks
+            accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, BN, _kMChunks
         )
     elif epilog == "nonatomic_cshuffle":
         # cshuffle -> coalesced flat per-sorted-row bf16 write (BM<=64); scatter
@@ -899,7 +904,7 @@ def _gemm2_body(
         # to avoid the lds_acc reuse race.
         lds_acc._view_cache = None
         _cshuffle_flat_bf16_epilog(
-            lds_acc, accm, arg_out, m_row, n_block_idx, wave, lane, BM, N_OUT
+            lds_acc, accm, arg_out, m_row, n_block_idx, wave, lane, BM, N_OUT, BN
         )
     elif epilog == "nonatomic_mxfp4":
         # flat per-sorted-row fp4 (packed q + e8m0 scale) write.
@@ -916,6 +921,7 @@ def _gemm2_body(
             lane,
             tid_i32,
             N_OUT,
+            BN,
             lds_acc,
             _kMChunks,
         )
@@ -934,10 +940,13 @@ def _gemm2_body(
             i32_M,
             BM,
             N_OUT,
+            BN,
         )
 
 
-def _flat_bf16_epilog(accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, kMChunks):
+def _flat_bf16_epilog(
+    accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, BN, kMChunks
+):
     """Nonatomic flat epilog (BM128): write each computed sorted-row element
     directly to flat_out[(m_row+row)*N_OUT + gn] as bf16 -- no LDS cshuffle, no
     atomic, no sorted_weights (a later scatter_reduce sums the TOPK rows per
@@ -959,7 +968,7 @@ def _flat_bf16_epilog(accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, kMC
 
 
 def _cshuffle_flat_bf16_epilog(
-    lds_acc, accm, arg_out, m_row, n_block_idx, wave, lane, BM, N_OUT
+    lds_acc, accm, arg_out, m_row, n_block_idx, wave, lane, BM, N_OUT, BN
 ):
     """Nonatomic flat epilog WITH cshuffle: cshuffle accm -> lds_acc (the SAME reorg
     the atomic epilog does) so the flat_out write is a COALESCED <2xbf16> store, then
@@ -1017,6 +1026,7 @@ def _flat_mxfp4_epilog(
     lane,
     tid_i32,
     N_OUT,
+    BN,
     lds_acc,
     kMChunks,
 ):
@@ -1145,6 +1155,7 @@ def _atomic_bf16_epilog(
     i32_M,
     BM,
     N_OUT,
+    BN,
 ):
     _kMChunks = kmchunks(BM)
     M_REPS = BM // 8  # BM32: 4, BM16: 2

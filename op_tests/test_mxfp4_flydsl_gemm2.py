@@ -4,15 +4,15 @@ import torch
 
 
 def test_port_module_imports_and_constants():
-    """Port module imports cleanly and exposes the compile fn + the Kimi constants."""
+    """Port module imports cleanly and exposes the compile fn + the *_for helpers
+    that derive the Kimi sizes (NE/K/N_OUT/BN/BK are compile args now)."""
     from aiter.ops.flydsl.kernels import mxfp4_gemm2 as port
 
     assert callable(port.compile_gemm2_a4w4_port)
-    # gemm2 contraction K=512 (= inter_dim); N_OUT = model_dim = 7168.
-    assert (port.NE, port.K, port.N_OUT) == (385, 512, 7168)
-    # KIMI-default K-derived sizes via the *_for(512) helpers (byte-for-byte).
-    assert port.K_HALF == port.k_half_for(512) == 256
-    assert port.k_tiles_total_for(512) == 2
+    # KIMI: K=512 (= inter_dim) -> K_HALF=256, 2 K-tiles; N_OUT=7168 -> 28 N-blocks.
+    assert port.k_half_for(512) == 256
+    assert port.k_tiles_total_for(512, 256) == 2
+    assert port.num_n_blocks_for(7168, 256) == 28
     assert port.kas_per_chunk_dw_for(512) == 128
     assert port.kbs_stride_n0_dw_for(512) == 128
 
@@ -22,10 +22,10 @@ def test_k_parametrized_helpers():
     from aiter.ops.flydsl.kernels import mxfp4_gemm2 as port
 
     # 768 -> 3 K-tiles (streaming); 2048 -> 8 tiles.
-    assert port.k_tiles_total_for(768) == 3
-    assert port.k_tiles_total_for(2048) == 8
-    assert port.kunroll_for(768) == 1  # K_TILES_TOTAL - kStages
-    assert port.kunroll_for(2048) == 6
+    assert port.k_tiles_total_for(768, 256) == 3
+    assert port.k_tiles_total_for(2048, 256) == 8
+    assert port.kunroll_for(768, 256) == 1  # K_TILES_TOTAL - kStages
+    assert port.kunroll_for(2048, 256) == 6
     assert port.k_half_for(768) == 384
     # B/scale byte sizes scale with K.
     assert port.bq_bytes_for(385, 7168, 768) == 385 * 7168 * 384
@@ -245,13 +245,13 @@ def test_flydsl_gemm2_parametrized_k_compiles(D_INTER):
     assert D_INTER % 256 == 0
     for BM, nt in [(16, False), (32, False), (32, True), (64, False)]:
         launch = compile_gemm2_a4w4_port(
-            BM=BM, use_nt=nt, epilog="atomic", D_INTER=D_INTER
+            BM=BM, use_nt=nt, NE=385, N_OUT=7168, epilog="atomic", D_INTER=D_INTER
         )
         assert callable(launch)
     # nonatomic (BM128) bf16 + mxfp4 flat epilogs also must compile for new K.
     for epilog in ("nonatomic", "nonatomic_mxfp4"):
         launch = compile_gemm2_a4w4_port(
-            BM=128, use_nt=False, epilog=epilog, D_INTER=D_INTER
+            BM=128, use_nt=False, NE=385, N_OUT=7168, epilog=epilog, D_INTER=D_INTER
         )
         assert callable(launch)
 
