@@ -19,19 +19,33 @@ Backward math/plan: `docs/2026-06-18_backward_bmm.md`.
 - `flydsl_venv`: torch **2.12.1+rocm7.2** (hip 7.2.53211). **Do not modify.**
 - Profiler: **rocprof-compute 3.4.0** (`rocprofiler-compute` apt pkg).
 
-## North Star shape (production target — fully specified)
+## North Star shape (production target — a binary constellation)
 
-The optimization target is the production HSTU-class shape:
+The optimization target is the production HSTU-class shape. It is **two stars in one
+system**: the same `B = 1024, Mi = 7680` envelope at **two dense feature widths,
+`D = 256` and `D = 512`** (both square, `K = N = D`). Both must be correct and beat the
+Triton baseline; `D` is a compile-time constant (`K`, `N` in `jagged_dense_bmm.py`), so
+each is built and measured separately (set `K=N=D`, measure, restore — the temp-edit
+practice used throughout the EXP blocks).
 
 | axis | value | kernel/driver knob | HSTU bench name |
 |---|--:|---|---|
 | groups (batch) | **B = 1024** | `n_groups` (`-b 1024`) | `B` |
-| dense feature dim | **D = 256** (`K = N = 256`) | `K`, `N` in `jagged_dense_bmm.py` | `D` (= `Kout`, square) |
+| dense feature dim | **D ∈ {256, 512}** (`K = N = D`) | `K`, `N` in `jagged_dense_bmm.py` | `D` (= `Kout`, square) |
 | max sequence length | **Mi = 7680** | `max_seq_len` (`-m 7680`) | `Mi` |
 
 `Mi = 7680` is fixed to match the **reference HSTU Triton forward benchmark default**
 (`op_tests/flydsl_tests/bench_jagged_dense_bmm_perf.py`, `-mi 7680`), so our
 backward numbers are directly comparable to that baseline's envelope.
+
+> **Two stars, one knob caveat.** `D = 512` quadruples the partials base grid
+> (`(D/128)² · n_groups`) and the `D²`-sized fp32 partials slot vs `D = 256`, so the two
+> stars want **different tuning** — most notably `SPLIT` (D=256→2, D=512→1; see
+> EXP-2026-06-25b/c). Since `D` is compile-time, `SPLIT` is set as a function of `D` in
+> source. Always re-measure both stars after a kernel change. `D = 512` also only became
+> reachable after the int32→int64 offset fixes and the `block ≤ 256` col-tiling / 32 KB-
+> fixed-LDS partials work (EXP-2026-06-23d, -24a); it was build-validated then but
+> **end-to-end validated for the first time in EXP-2026-06-25c**.
 
 > **Caveat on existing results (append-only policy).** The EXP blocks dated
 > 2026-06-23b/c/d were collected **before** `Mi` was pinned, at the placeholder
@@ -82,8 +96,10 @@ rocprof_venv/bin/python aiter/aiter/ops/flydsl/kernels/roofline_report.py \
 ```
 
 Tile constants at time of writing (from `jagged_dense_bmm_bwd.py`):
-`BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, K=N=128, SPLIT=4`; dDense partials use an
-LDS-staged scalar-FMA reduction `DDENSE_BM=64, 16×16 threads, KPT=NPT=8` (no MFMA).
+`BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, K=N=128`. **`SPLIT` was tuned 4 → 2 in Phase 5
+(EXP-2026-06-25b).** dDense partials are now a **bf16 MFMA** transposed GEMM
+(`DDENSE_BM=64, DDENSE_BK=DDENSE_BN=128, 256 threads`) with dBias fused in
+(EXP-2026-06-25a) — *not* the original scalar-FMA reduction.
 
 ---
 
@@ -536,6 +552,155 @@ same-run delta, not the cross-session absolute.)
 blocks. The forward kernel's int64 `a_row_off/c_row_off` guard from EXP-2026-06-24a remains
 in the working tree.)
 
+## EXP-2026-06-25b — Phase 5: tune `SPLIT` + wire example timing (B=1024, D=256, Mi=7680)
+
+**Scope.** Phase 5 tuning at the North Star. After Phase 4 the dominant non-GEMM cost is
+the `grad_dense_reduce` fp32 partials round-trip, whose size is `n_groups·SPLIT·K·N·4`
+— **linear in `SPLIT`**. `SPLIT` trades partials-pass m-parallelism / long-group load
+balance (higher) against that reduce round-trip + wasted blocks on short/empty groups
+(lower). At the GPU-filling North Star the partials base grid
+(`NK_TILES·NN_TILES·n_groups = 4·1024 = 4096` WGs at D=256) already saturates without any
+split, so the split only serves the per-output-tile m-reduction — pointing to a *small*
+`SPLIT`. Also wired a `--bench` timing/TFLOP-s summary into `example_jagged_dense_bmm_bwd.py`
+(per the 2026-06-18 Phase 4 integration item).
+
+### `SPLIT` sweep (`dense_bias`, profile `--mode bench` µs/iter, FlyDSL-only)
+| SPLIT | uniform µs | skew µs |
+|--:|--:|--:|
+| 1 | 5478 | 1288 |
+| **2 (chosen)** | **5351** | **1233** |
+| 3 | 5410 | 1327 |
+| 4 (was) | 5531 | 1446 |
+| 6 | 5832 | 1706 |
+| 8 | 6063 | 1957 |
+| 16 | 7472 | 3070 |
+
+**`SPLIT=2` is fastest in both regimes** — uniform 5531→5351 (1.03×), skew 1446→1233
+(**1.17×**). Monotone worse above 2 (the reduce round-trip and AI degrade as predicted:
+uniform AI 99.7→61 from SPLIT 4→16). `SPLIT=1` is a touch slower (slightly under-parallel on
+the long groups). **Shape caveat:** smaller, launch-bound shapes prefer a *larger* split to
+fill the GPU (b64/m512: SPLIT=4 best at 146 µs, SPLIT=2 a noisy 404 µs; b256/m2048: SPLIT=1
+best, 435 µs) — but those are sub-ms, non-production envelopes (Phase 0 flagged b64/m512 as
+launch-bound). `SPLIT=2` is the production-target choice; left as a plain constant with the
+shape-dependence documented in source (shape-adaptive `SPLIT` is a Backlog item).
+
+### Block-size probe (`DDENSE_BM`, at SPLIT=2, North Star)
+| DDENSE_BM | uniform | skew | note |
+|--:|--:|--:|---|
+| 32 | — | — | **build fails** — incompatible with the (4,4,2) MFMA K-fragment (needs ≥64) |
+| **64 (kept)** | **5405** | **1260** | LDS 32 KB, 2 WG/CU |
+| 128 | 36155 | 8639 | LDS 64 KB → 1 WG/CU, **~7× slower** |
+`DDENSE_BM=64` is already optimal; the block sizes need no change.
+
+### Head-to-head vs Triton at `SPLIT=2` (do_bench, `-test` cos=1.0000 both regimes)
+| regime | FlyDSL (SPLIT 4 → 2) | Triton | result |
+|---|--:|--:|---|
+| uniform | 5.54 → **5.35 ms** | 6.79 ms | **FlyDSL 1.27×** |
+| skew | ~1.45 → **1.24 ms** | ~1.41 ms | **FlyDSL 1.15×** (was a near-tie) |
+
+(Skew is rock-stable across 4 samples: FlyDSL 1.240–1.244 ms vs Triton 1.40–1.62 ms. The
+`dense_bias`-skew case — Triton **1.45× ahead** at Phase 3 — is now a **FlyDSL win** at every
+sample. `grad_jagged` is untouched by `SPLIT` and unchanged.)
+
+### Example timing summary (new `--bench`)
+`example_jagged_dense_bmm_bwd.py --bench` now prints per-target µs/iter + TFLOP/s
+(`djagged`, fused `dense_bias`; both scored `2·L·K·N`) after the correctness lines, so the
+example doubles as a quick local perf check.
+
+### Gate: **PASS — best `SPLIT` picked, both regimes green, example timing wired.**
+- `SPLIT=2` is the per-regime optimum at the North Star (uniform + skew); correctness
+  cos 0.999999 at **D=128 and D=256, uniform + skew**.
+- vs Triton: **uniform 1.27×, skew 1.15×** — FlyDSL now wins **all four** North-Star cases
+  (`jagged` ×2 from Phase 3, `dense_bias` ×2 here). The long-standing `dense_bias`-skew
+  deficit is closed.
+- `--bench` timing summary added; style/lint: files compile clean (repo has no ruff/flake8
+  in-venv and no `scripts/check_python_style.sh` in this checkout; line widths match the
+  file's existing style). Repo default restored to **D=128**.
+
+## EXP-2026-06-25c — Second star: validate + tune D=512 (B=1024, Mi=7680)
+
+**Scope.** Bring the `D = 512` companion of the North-Star constellation online: first
+**end-to-end** validation (prior EXP blocks only *build*-validated it, then deferred), then
+a tuning round. `D = 512` quadruples the partials base grid (`(D/128)²·n_groups = 16·1024 =
+16,384` WGs vs 4,096 at D=256) and quadruples the `D²` fp32 partials slot, so the Phase-5
+`SPLIT` choice had to be re-derived here.
+
+**Correctness (first end-to-end run at D=512).** All three gradients pass at **cos 0.999999**
+(example) / **1.0000** (bench `-test`), **uniform + skew**, small shapes and the North Star.
+No new blockers — the int64 offsets (EXP-2026-06-24a) and the `block ≤ 256` col-tiled
+reduce / 32 KB-fixed-LDS MFMA partials (EXP-2026-06-23d) carry D=512 cleanly; the Phase-4
+fused-dBias epilogue also holds at D=512 (`NN_TILES = 4`, each of the 512 columns emitted
+once by a k-tile-0 workgroup).
+
+### `SPLIT` sweep at D=512 (`dense_bias`, profile `--mode bench` µs/iter, FlyDSL-only)
+| SPLIT | uniform µs | skew µs |
+|--:|--:|--:|
+| **1 (chosen for D=512)** | **20145** | **3971** |
+| 2 (D=256's pick) | 21130 | 4205 |
+| 3 | 20832 | 4671 |
+| 4 | 22253 | 5819 |
+
+**`SPLIT=1` is fastest at D=512 in both regimes** (vs 2: uniform 1.05×, skew 1.06×). This
+*differs* from D=256 (which wants 2): with 16k base WGs the GPU is saturated without any
+split, and each extra split now round-trips a 4×-larger `D²` fp32 partials slab. The split
+therefore only helps when the base grid is *not* already full — which at B=1024 happens at
+D=256 (4k WGs, marginal win from 2) but not D=512.
+
+**Decision — make `SPLIT` compile-time D-aware:** `SPLIT = 2 if K <= 256 else 1`. D is a
+compile-time constant, so this picks each star's optimum with no runtime cost; verified the
+example prints `split=2` at D=256 and `split=1` at D=512, both correct. (`DDENSE_BM=64`
+re-confirmed from EXP-2026-06-25b — unchanged by D since output-tiling fixes LDS at 32 KB.)
+
+### Head-to-head vs Triton at D=512 (do_bench, final D-aware SPLIT, `-test` cos=1.0000)
+| component | regime | FlyDSL | Triton | result |
+|---|---|--:|--:|---|
+| `jagged` (dJagged) | uniform | **15.06 ms / 274 TF/s** | 16.15 ms | **FlyDSL 1.07×** |
+| `jagged` | skew | **2.68 ms** | 3.20 ms | **FlyDSL 1.20×** |
+| `dense_bias` (dDense+dBias) | uniform | **20.20 ms / 204 TF/s** | 25.21 ms | **FlyDSL 1.25×** |
+| `dense_bias` | skew | **3.99 ms** | 4.68 ms | **FlyDSL 1.17×** |
+| **full backward (all)** | uniform | **~35.3 ms** | ~41.4 ms | **FlyDSL ~1.17×** |
+| **full backward (all)** | skew | **~6.7 ms** | ~7.9 ms | **FlyDSL ~1.18×** |
+
+(`L`: uniform 7,864,320; skew ≈ 1.5M. `SPLIT=1` lifted `dense_bias` from 20.54→20.20 (uniform)
+/ 4.24→3.99 (skew) vs SPLIT=2. `grad_jagged` is `SPLIT`-independent. `grad_jagged` uniform is
+the tightest case at 1.07× — D=512's per-WG MFMA work is large so the GEMM is near Triton's
+own MFMA throughput; still a win, and the bigger lever, `dense_bias`, wins comfortably.)
+
+### Gate: **PASS — second star online and winning all four components, both regimes.**
+- **D=512 end-to-end validated** for the first time (cos 0.999999 / 1.0000, uniform + skew).
+- **FlyDSL beats Triton on all four D=512 cases** (jagged 1.07×/1.20×, dense_bias 1.25×/1.17×)
+  → full backward ~1.17–1.18×. Combined with the D=256 star (jagged 1.31×, dense_bias
+  1.27×/1.15×), **FlyDSL now wins every component × regime across the whole constellation.**
+- `SPLIT` is now D-aware (2 @ D≤256, 1 @ D≥512), each star's measured optimum; no D=256
+  regression (still `split=2`, correctness green). Repo default restored to **D=128**.
+- Remaining headroom: `grad_jagged` @ D=512 uniform (~1.07×) is the tightest — a roofline
+  push (g2s vectorization / merged K-column tiles) is the lever there, not `SPLIT`.
+
+## Current status (2026-06-25c)
+
+**Second North-Star star (D=512) is online, tuned, and winning (EXP-2026-06-25c).** D=512 was
+**end-to-end validated for the first time** (cos 0.999999 / 1.0000, uniform + skew, all three
+gradients) — prior blocks had only build-validated it. Tuning: the best `SPLIT` is
+**D-dependent** (D=512's 16k-WG base grid is saturated without splitting and each split
+round-trips a 4×-larger `D²` partials slab → `SPLIT=1`; D=256 still wants 2), so `SPLIT` is now
+the compile-time-D-aware `2 if K<=256 else 1`. **vs Triton at D=512: jagged 1.07×/1.20×,
+dense_bias 1.25×/1.17× (uniform/skew) — FlyDSL wins all four**, full backward ~1.17–1.18×.
+**Across the whole constellation (D∈{256,512} × {uniform,skew} × {jagged,dense_bias}) FlyDSL
+now beats Triton in every case.** Tightest remaining case is `grad_jagged` @ D=512 uniform
+(1.07×, roofline-bound). Repo default restored to D=128.
+
+## Current status (2026-06-25b)
+
+**Phase 5 done (EXP-2026-06-25b): `SPLIT` tuned 4 → 2; example `--bench` timing wired.**
+At the North Star the partials base grid already fills the GPU, so the split only serves the
+long-group reduction — a small split minimizes the fp32 partials round-trip that became the
+dominant tail after Phase 4. `SPLIT=2` is fastest in **both** regimes (uniform 1.03×, skew
+1.17× vs SPLIT=4). `DDENSE_BM=64` confirmed already optimal. **vs Triton at the North Star:
+uniform 1.27×, skew 1.15× — FlyDSL now wins all four `dense_bias`/`jagged` × uniform/skew
+cases**, closing the last deficit. Correctness green at D=128 + D=256, both regimes. Remaining
+headroom is roofline-pushing the GEMMs (`grad_jagged` ~44% MFMA; partials g2s vectorization)
+and the open Backlog items (shape-adaptive `SPLIT`, non-square `K≠N`). (`K=N` restored to 128.)
+
 ## Current status (2026-06-25)
 
 **Phase 4 done (EXP-2026-06-25a): dBias fused into the dDense partials pass.** The separate
@@ -681,20 +846,47 @@ Baseline to beat (EXP-2026-06-22a, b64/m512/uniform): `grad_dense_partials`
   timing+TFLOPs summary into `example_jagged_dense_bmm_bwd.py` (`2026-06-18`
   Phase 4); run the style gate.
 - **Gate:** best config picked per regime; both `uniform`+`skew` green.
-- [ ] autotune  [ ] example timing  [ ] style gate
+- [x] autotune (`SPLIT` 4→2; `DDENSE_BM=64` confirmed optimal)  [x] example timing
+  (`--bench` summary)  [x] style gate (compiles clean; no ruff/flake8 or style script in
+  this checkout) — EXP-2026-06-25b. **Result: GATE PASS.** `SPLIT=2` is the per-regime
+  optimum at the North Star (uniform 1.03×, skew 1.17× vs SPLIT=4); **vs Triton uniform
+  1.27×, skew 1.15× — FlyDSL now wins all four North-Star cases**, closing the last
+  `dense_bias`-skew deficit. Correctness cos 0.999999 at D=128 + D=256, both regimes.
+  Shape-adaptive `SPLIT` (small launch-bound shapes prefer a larger split) left to Backlog.
+
+### Phase 6 — Second North-Star star: D=512
+- **Why:** the production target is a *constellation* — the same `B=1024, Mi=7680` envelope
+  at `D=512` as well as `D=256`. `D=512` was build-unblocked earlier (int64 offsets, `block
+  ≤ 256` col-tiling, 32 KB-fixed-LDS MFMA partials) but **never end-to-end validated**, and
+  its 4×-larger base grid / `D²` partials slab change the tuning.
+- **Do:** validate all three gradients at `D=512` (uniform + skew); re-tune `SPLIT` (and
+  re-confirm block sizes) for the larger shape; head-to-head vs Triton; make any
+  shape-dependent knob compile-time-`D`-aware.
+- **Gate:** correctness (cos > 0.999) both regimes; beat Triton on every component without
+  regressing the `D=256` star.
+- [x] validate D=512  [x] re-tune `SPLIT` (→ `SPLIT = 2 if K<=256 else 1`)  [x] head-to-head
+  + EXP block (EXP-2026-06-25c). **Result: GATE PASS.** D=512 end-to-end validated (cos
+  0.999999/1.0000, uniform+skew); `SPLIT=1` optimal at D=512 (base grid already saturated,
+  partials round-trip 4× heavier) → D-aware `SPLIT`. **vs Triton: jagged 1.07×/1.20×,
+  dense_bias 1.25×/1.17× — wins all four; no D=256 regression.** Tightest case `grad_jagged`
+  @ D=512 uniform (1.07×, roofline-bound).
 
 ## Backlog (not yet scheduled)
-- **`dense_bias` under skew — MOSTLY CLOSED by Phase 4 (EXP-2026-06-25a).** Was the one
-  North-Star case FlyDSL lost (Triton 1.45× — EXP-2026-06-24a). Fusing dBias into the
-  dDense partials pass removed the redundant dOut re-read and brought skew to a **near-tie**
-  (FlyDSL ~1.45 ms vs Triton ~1.41 ms, ~1.03× Triton). The *remaining* gap is the fixed
-  `SPLIT=4 × n_groups` partials/reduce grid: skew's ~20% empty + many short groups still
-  launch full `SPLIT` blocks and round-trip ~1 GB of fp32 dDense partials through HBM
-  (`grad_dense_reduce`) on tiny work. **Do (ideas):** length-aware / dynamic `SPLIT` (fewer
-  splits for short groups), skip empty groups, or a 2-level / fused reduce to cut the
-  partials round-trip. **Gate:** beat Triton at `dense_bias` skew without regressing uniform
-  or `jagged`. Measure with `bench_jagged_dense_bmm_bwd_perf.py --component dense_bias
-  --regime skew -b 1024 -d 256 -kout 256 -mi 7680`.
+- **`dense_bias` under skew — CLOSED by Phase 4 + 5 (EXP-2026-06-25a/b).** Was the one
+  North-Star case FlyDSL lost (Triton 1.45× — EXP-2026-06-24a). Phase 4 fused dBias into the
+  dDense partials pass (removed the redundant dOut re-read → near-tie); Phase 5's `SPLIT=2`
+  cut the fp32 partials round-trip → **FlyDSL 1.15× ahead** of Triton on skew (1.24 vs ~1.41
+  ms), winning at every sample. No longer a deficit; further skew gains fold into the
+  shape-adaptive-`SPLIT` item below.
+- **Shape-adaptive `SPLIT`.** Phase 5 fixed `SPLIT=2` as the North-Star (B=1024, Mi=7680)
+  optimum, but the best split is shape-dependent: small launch-bound shapes want a *larger*
+  split to fill the GPU (b64/m512 prefers 4), mid shapes prefer 1–2. A host-side heuristic
+  could pick `SPLIT` from `n_groups`/`max_seq_len` (e.g. smallest split whose partials grid
+  `NK_TILES·NN_TILES·n_groups·SPLIT` comfortably exceeds the CU count, capped to bound the
+  reduce round-trip), compiling the needed kernel variant (`@flyc.jit` already keys on the
+  constant). **Gate:** ≥ current speed at the North Star *and* recover the small/mid-shape
+  optima, no correctness regression. **Do:** sweep is in EXP-2026-06-25b; turn the table into
+  a heuristic + a couple of validation shapes.
 - **Relax the `K == N == D` constraint (support non-square `D != Kout`).** The
   backward kernels currently collapse the dense reduction dim and output dim into a
   single compile-time constant (`K == N`), so they only cover *square* shapes. The

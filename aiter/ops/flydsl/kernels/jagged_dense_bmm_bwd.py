@@ -38,8 +38,18 @@ from jagged_dense_bmm import (  # noqa: F401
 )
 
 # Split factor over the jagged (m) axis for the dDense / dBias reductions. Each
-# (group, split) block owns one fp32 scratch slot; the reduce pass sums them.
-SPLIT = 4
+# (group, split) block owns one fp32 scratch slot; the reduce pass sums them. SPLIT
+# trades partials-pass m-parallelism / long-group load balance (higher) against the
+# fp32 partials round-trip the reduce pass streams + wasted blocks on short/empty
+# groups (lower). It is tuned per output width D (= K = N, a compile-time constant):
+# the partials base grid is NK_TILES*NN_TILES*n_groups = (D/128)^2 * n_groups, so it
+# grows with D^2 and, at the B=1024 North Star, already saturates the GPU on its own.
+# The split then only serves the long-group reduction, and since the partials slot is
+# D^2 fp32 the round-trip cost of each extra split scales with D^2 too — so the best
+# SPLIT shrinks as D grows: D=256 is fastest at 2, D=512 at 1 (both uniform + skew;
+# see the optimization log). Smaller, launch-bound shapes (e.g. b64/m512) prefer a
+# larger split to fill the GPU (Backlog: shape-adaptive / n_groups-aware SPLIT).
+SPLIT = 2 if K <= 256 else 1
 
 # The bias/reduce passes use one thread per output column n. AMDGPU caps a
 # workgroup at 256 threads, so for N > 256 the N axis is tiled into NRED_COL_TILES

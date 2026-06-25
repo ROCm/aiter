@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 import torch
 
@@ -38,6 +39,10 @@ from jagged_dense_bmm import BLOCK_M, K, N
 from jagged_dense_bmm_bwd import SPLIT, grad_dense_bias, grad_jagged
 
 GRADS = ("djagged", "ddense", "dbias")
+
+# Timing targets map the launchers onto the two distinct kernels: dJagged is a GEMM,
+# while dDense + dBias share the single fused grad_dense_bias launcher.
+BENCH_TARGETS = ("djagged", "dense_bias")
 
 
 def make_inputs(n_groups, max_seq_len, regime, seed, device):
@@ -180,6 +185,72 @@ def run_flydsl_bwd(which, jagged, dense, bias, d_out, seq_offsets, n_groups, max
     return results
 
 
+def _bench_launchers(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq_len):
+    """Build zero-arg launch closures for the requested timing target(s).
+
+    Buffers are allocated once; the closure issues only the kernel(s) under test so a
+    warmup + timed loop measures steady-state kernel cost (compile happens in warmup).
+    """
+    device = jagged.device
+    total_rows = jagged.shape[0]
+    stream = torch.cuda.current_stream()
+    tDOut = flyc.from_dlpack(d_out).mark_layout_dynamic(leading_dim=1, divisibility=8)
+    launchers = {}
+
+    if "djagged" in which:
+        dense_kn = dense.reshape(n_groups * K, N).contiguous()
+        d_jagged = torch.zeros(total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device)
+        tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+
+        def run_djagged():
+            grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream)
+
+        launchers["djagged"] = run_djagged
+
+    if "dense_bias" in which:
+        d_dense = torch.zeros(n_groups, K, N, dtype=torch.bfloat16, device=device)
+        d_bias = torch.zeros(n_groups, N, dtype=torch.bfloat16, device=device)
+        dense_partials = torch.zeros(n_groups * SPLIT * K, N, dtype=torch.float32, device=device)
+        bias_partials = torch.zeros(n_groups * SPLIT, N, dtype=torch.float32, device=device)
+        tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+        d_dense_v = d_dense.view(n_groups * K, N)
+
+        def run_dense_bias():
+            grad_dense_bias(d_dense_v, d_bias, tJagged, tDOut, seq_offsets, dense_partials,
+                            bias_partials, n_groups, max_seq_len, stream=stream)
+
+        launchers["dense_bias"] = run_dense_bias
+
+    return launchers
+
+
+def bench_flydsl_bwd(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq_len,
+                     warmup=10, iters=50):
+    """Time each FlyDSL backward target and print us/iter + TFLOP/s.
+
+    dJagged and dDense are each a 2*L*K*N GEMM; the fused dense_bias target's dBias
+    sum (~L*N adds) is negligible against the dDense GEMM, so both targets are scored
+    on 2*L*K*N. L = packed rows (sum of M_b), so skew is scored on the work it does.
+    """
+    L = jagged.shape[0]
+    launchers = _bench_launchers(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq_len)
+    print(f"timing (warmup={warmup}, iters={iters}):")
+    for name in BENCH_TARGETS:
+        if name not in launchers:
+            continue
+        launch = launchers[name]
+        for _ in range(warmup):
+            launch()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            launch()
+        torch.cuda.synchronize()
+        dt = (time.perf_counter() - t0) / iters
+        tflops = (2.0 * L * K * N) / dt / 1e12
+        print(f"  {name:<11} {dt * 1e6:9.2f} us/iter   {tflops:8.2f} TFLOP/s")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="jagged_dense_bmm backward: validate references + kernels")
     p.add_argument("-b", "--n-groups", type=int, default=64, help="number of groups (batch)")
@@ -187,6 +258,9 @@ def main(argv=None):
     p.add_argument("--regime", choices=["uniform", "skew"], default="uniform")
     p.add_argument("--seed", type=int, default=1234, help="skew RNG seed")
     p.add_argument("--only", default="all", help="comma list of {djagged,ddense,dbias} or 'all'")
+    p.add_argument("--bench", action="store_true", help="after validation, time each kernel + report TFLOP/s")
+    p.add_argument("--warmup", type=int, default=10, help="bench warmup iterations")
+    p.add_argument("--iters", type=int, default=50, help="bench timed iterations")
     args = p.parse_args(argv)
 
     if not torch.cuda.is_available():
@@ -240,6 +314,18 @@ def main(argv=None):
         kernel_ok &= report(name_map[g], refs[g], got[g])
     if not any_run:
         print("  (no kernels implemented yet)")
+
+    # --- Optional timing/TFLOPs summary -------------------------------------------
+    if args.bench and any_run:
+        bench_which = tuple(
+            t for t in BENCH_TARGETS
+            if (t == "djagged" and "djagged" in which)
+            or (t == "dense_bias" and (("ddense" in which) or ("dbias" in which)))
+        )
+        bench_flydsl_bwd(
+            bench_which, jagged, dense, d_out, seq_offsets, args.n_groups, args.max_seq_len,
+            warmup=args.warmup, iters=args.iters,
+        )
 
     return 0 if (ref_ok and kernel_ok) else 1
 
