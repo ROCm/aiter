@@ -648,8 +648,8 @@ def _gemm1_body(
         local_max = _fabs_f32(result[0])
         for ee in range_constexpr(1, 8):
             local_max = local_max.maximumf(_fabs_f32(result[ee]))
-        local_max = local_max.maximumf(local_max.shuffle_xor(fx.Int32(1), fx.Int32(64)))
-        local_max = local_max.maximumf(local_max.shuffle_xor(fx.Int32(2), fx.Int32(64)))
+        lm_i = _inline_dpp_quad_amax(fx.Int32(_raw(local_max).bitcast(T.i32)))
+        local_max = fx.Float32(_raw(lm_i).bitcast(T.f32))
 
         e8m0, qscale = _e8m0_from_amax(local_max)
         scales_per_mr[mr] = e8m0
