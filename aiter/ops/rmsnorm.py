@@ -239,9 +239,9 @@ def add_rmsnorm_quant(
     scale: Tensor,
     weight: Tensor,
     epsilon: float,
-    gemma_norm: bool = False,
     group_size: int = 0,
     shuffle_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -264,9 +264,9 @@ def rmsnorm_quant(
     scale: Tensor,
     weight: Tensor,
     epsilon: float,
-    gemma_norm: bool = False,
     group_size: int = 0,
     shuffle_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
