@@ -39,6 +39,7 @@ env:
   FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
   FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
   FFM_TEST: op_tests/triton_tests
+  FFM_TRITON_VERSION: "3.6.0"
 
 jobs:
   check-signal:
@@ -137,6 +138,7 @@ jobs:
             --security-opt seccomp=unconfined \
             --shm-size=16gb \
             -e FFM_TEST="${FFM_TEST}" \
+            -e FFM_TRITON_VERSION="${FFM_TRITON_VERSION}" \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /tmp \
             "${FFM_IMAGE}" \
@@ -170,8 +172,26 @@ jobs:
               grep -R "is_2d_gluon_available" -n /root/aiter/aiter/ops/triton/attention || true
               grep -R "shuffle_weight_gfx1250" -n /root/aiter/aiter/ops || true
               grep -R "routing_from_hash" -n /root/aiter/aiter/ops/triton/moe || true
-              echo "[SKIP] Keeping Triton from the FFM image."
-              python3 -m pip show amd-triton triton || true
+              echo "==== Pin Triton ===="
+              python3 -m pip show amd-triton triton triton-kernels || true
+              TRITON_DEFAULT_ROCM_VERSION="${TRITON_DEFAULT_ROCM_VERSION:-7.2.0}"
+              TRITON_INDEX_URL="https://pypi.amd.com/triton/release_/rocm-${TRITON_DEFAULT_ROCM_VERSION}/simple/"
+              ROCM_VERSION="$(dpkg -l rocm-core 2>/dev/null | awk '\''/^ii/{print $3}'\'' || true)"
+              if [ -z "${ROCM_VERSION}" ]; then
+                ROCM_VERSION="$(rpm -q --queryformat '\''%{VERSION}'\'' rocm-core 2>/dev/null || true)"
+              fi
+              if [ -n "${ROCM_VERSION}" ]; then
+                ROCM_MAJOR_MINOR="$(echo "${ROCM_VERSION}" | cut -d. -f1,2)"
+                TRITON_INDEX_URL="https://pypi.amd.com/triton/release_/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
+              else
+                echo "rocm-core not found; using default ROCm version ${TRITON_DEFAULT_ROCM_VERSION}"
+              fi
+              echo "Installing triton==${FFM_TRITON_VERSION} from ${TRITON_INDEX_URL}"
+              export PIP_BREAK_SYSTEM_PACKAGES=1
+              python3 -m pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
+              python3 -m pip install --break-system-packages --index-url "${TRITON_INDEX_URL}" "triton==${FFM_TRITON_VERSION}"
+              python3 -m pip show amd-triton triton triton-kernels || true
+              python3 -c "import triton; print(f\"triton version after pin: {triton.__version__}\")"
               echo "==== Check Aiter core module ===="
               python3 -c "from pathlib import Path; import aiter; aiter_dir = Path(aiter.__file__).resolve().parent; jit_dir = aiter_dir / \"jit\"; print(f\"aiter module: {aiter.__file__}\"); print(f\"aiter dir: {aiter_dir}\"); core_modules = sorted(jit_dir.glob(\"**/*core*.so\")); print(f\"FOUND {len(core_modules)} core module(s):\" if core_modules else f\"NOT FOUND: no *core*.so under {jit_dir}\"); [print(path) for path in core_modules]"
               python3 -c "import aiter; print(f\"aiter module: {aiter.__file__}\")"
