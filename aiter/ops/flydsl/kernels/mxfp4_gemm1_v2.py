@@ -2,44 +2,21 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """FlyDSL **layout-API** port of aiter ``gemm1_a4w4`` (MXFP4 MoE up/gate-proj).
 
-Variants: ``(BM=32, inline_quant=False, interleave=True)`` for BOTH ``use_nt``
-values (kSubBlocks=1, kMChunks=2, kAStages=3, kStages=2, kUnroll=26). ``use_nt``
-selects the B-load cache policy, matching the tuned config's BM32_NT vs
-BM32_CACHED kernelName1 -- BOTH go through the layout API now, differing only in
-the copy atom's cache modifier:
-  * ``use_nt=True``  (BM32_NT)     -> fx.copy w/ BufferCopy128b(cache_modifier=2)  (decode)
-  * ``use_nt=False`` (BM32_CACHED) -> fx.copy w/ BufferCopy128b(cache_modifier=0)  (prefill)
+Variant: ``(BM=32, inline_quant=False, interleave=True)`` for both ``use_nt``
+(kSubBlocks=1, kMChunks=2, kAStages=3, kStages=2). ``use_nt`` is the B-load cache
+policy (tuned config BM32_NT vs BM32_CACHED): True -> non-temporal, False -> cached.
 
-CONVERTED to the layout API (the deliverable):
-  * **B-weight load** -> a hierarchical ``fx.make_layout`` preshuffle view over the
-    bq buffer (adapted to this kernel's 5-D CK layout + per-expert base offset),
-    loaded via a layout-API ``fx.copy`` into register fragments. The non-temporal
-    (nt) decode policy rides on the copy atom's ``cache_modifier`` (FlyDSL
-    ``BufferCopy128b(cache_modifier=2)``), so there is NO raw buffer_load fallback.
-  * **Scaled MMA** -> ``fx.gemm`` over rank-1 register fragments (A/B/C), one
-    fx.gemm per mfma (each lowers to a single fly MmaAtomCall ->
-    rocdl.mfma.scale.f32.16x16x128.f8f6f4). Per-K-block e8m0 scales ride on the
-    atom STATE via fx.gemm ``scale_a=/scale_b=`` kwargs; the runtime per-K opsel
-    selects one of the pre-built opsel-specialized atoms (opsel is a type param).
-    Bit-identical ISA to the prior raw intrinsic (mem2reg folds the fragment
-    alloca/store/load; 448 mfma_scale, no scratch/spill).
-  * **Accumulators** -> C register fragments updated IN PLACE (fx.gemm d == c),
-    one per (i,J); the epilogue loads them. A and B are likewise register
-    fragments (A refilled per K iter from ds_read; B per-stage for the pipeline).
+Layout-API pieces:
+  * B load -> preshuffle ``fx.make_layout`` view + ``fx.copy`` into register
+    fragments; the nt/cached policy rides on the copy atom's ``cache_modifier``.
+  * MMA -> one ``fx.gemm`` per mfma over rank-1 register fragments (A/B/C), with
+    per-K-block e8m0 scales via ``scale_a=/scale_b=`` kwargs and a pre-built
+    opsel-specialized ``MFMA_Scale`` atom per (opselA,opselB). C accumulates in
+    place (d == c). mem2reg folds the fragment plumbing -> ISA == the raw intrinsic.
 
-KEPT RAW (reused by importing from the v1 module ``mxfp4_gemm1`` -- not duplicated):
-  * all math / quant helpers (``_silu_mul_batch``, ``_e8m0_*``, ``_fabs_f32``,
-    ``_lds_swizzle_mask``, ``_raw``, ``_global_base_ptr1``, ``_gep1``, ``_gep3``,
-    ``_lds_base_ptr3``, ``gemm1_grid``, the ``*_for(...)`` size helpers + consts).
-  * the A-side LDS stage + ds-read addressing + A-scale machinery (the e8m0 byte
-    layout that feeds the mfma scale operands) -- the swizzle/byte layout is
-    delicate and the raw path is the bit-exact spec; the ds-read result is stored
-    into layout-API A fragments. Converting the addressing itself is later polish.
-  * the A-side gather (rows via m_indices) base-offset computation.
-  * the SwiGLU + fp4/e8m0 requant epilogue MATH (reuses helpers).
-
-Acceptance is the KIMI BM32 interleave numeric gate (mean_row_cos > 0.85; v1
-scores ~0.874 on this case).
+Kept raw (self-contained helpers below): math/quant/pointer helpers, the A-side
+LDS stage + ds-read addressing + A-scale machinery, and the epilogue math.
+Acceptance: KIMI BM32 interleave numeric gate (mean_row_cos > 0.85).
 """
 
 import flydsl.compiler as flyc
@@ -53,50 +30,89 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-# --- reuse ALL the raw math / size / pointer helpers from the v1 module ---
-from .mxfp4_gemm1 import (
-    BK,
-    BN,
-    KH_TILE,
-    _e8m0_from_amax,
-    _fabs_f32,
-    _gep1,
-    _gep3,
-    _global_base_ptr1,
-    _global_ptr1,
-    _lds_base_ptr3,
-    _lds_ptr3,
-    _lds_swizzle_mask,
-    _raw,
-    _silu_mul_batch,
-    bq_bytes_for,
-    ascale_bytes_for,
-    bscale_bytes_for,
-    gemm1_grid,  # noqa: F401  (re-exported for parity with v1's public surface)
-    k_g2_half_for,
-    k_half_for,
-    k_tiles_total_for,
-    kas_per_chunk_dw_for,
-    kbs_per_expert_dw_for,
-    kbs_stride_n0_dw_for,
-    kBS_stride_k0_dw,
-    kunroll_for,
-    n_out_for,
-    num_n_blocks_for,
-    out_as_per_chunk_dw_for,
-)
-from .mxfp4_gemm1 import INTER as INTER_DEFAULT
-from .mxfp4_gemm1 import K as K_DEFAULT
-from .mxfp4_gemm1 import NE as NE_DEFAULT
-from .mxfp4_gemm1 import TOPK as TOPK_DEFAULT
-from .mxfp4_gemm1 import kStages as kStages
+# ---- constants (KIMI defaults; per-shape values come from compile args) ------
+NE_DEFAULT, K_DEFAULT, INTER_DEFAULT, TOPK_DEFAULT = 385, 7168, 512, 9
+BN = BK = 256
+KH_TILE = BK // 2  # 128 packed bytes per K-tile
+kStages = 2
+kBS_stride_k0_dw = 64
+LOG2E = 1.4426950408889634
+_PTR3 = "!llvm.ptr<3>"
 
-# BM32_NT path: these are fixed for the single supported variant.
+# BM32 path: fixed for the single supported variant.
 _BM = 32
 _kAStages = 3
 _kSubBlocks = 1
 _kMChunks = 2  # = BM // 16
 _BN_INT = BN // 2  # 128
+
+
+# ---- self-contained math / pointer / size helpers ---------------------------
+def _raw(v):
+    """Unwrap an fx value to a raw ir.Value."""
+    if not isinstance(v, ir.Value) and hasattr(v, "ir_value"):
+        return v.ir_value()
+    return v
+
+
+def _lds_ptr3(base_i32, byte_off_i32):
+    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(fx.Int64(base_i32 + byte_off_i32)))
+
+
+def _lds_base_ptr3(lds_view):
+    base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(lds_view))
+    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(fx.Int64(base_i32)))
+
+
+def _gep3(base_ptr, byte_off_i32):
+    return buffer_ops.get_element_ptr(base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8)
+
+
+def _global_base_ptr1(addr_i64):
+    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
+
+
+def _gep1(base_ptr, byte_off_i32):
+    return buffer_ops.get_element_ptr(base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8)
+
+
+def _global_ptr1(arg, byte_off_i32):
+    return _gep1(_global_base_ptr1(arg), byte_off_i32)
+
+
+def _lds_swizzle_mask(row):
+    """lds_swizzle_mask<ROW_BYTES=128>(row) = (row & 14) << 3."""
+    return (row & fx.Int32(14)) << fx.Int32(3)
+
+
+def _silu_mul_batch(gs, us):
+    """silu(g)*u via exp2/rcp (matches HIP silu_mul_fast)."""
+    e = [fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E)))) for g in gs]
+    sig = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
+    return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
+
+
+def _fabs_f32(x):
+    """fabsf via sign-bit clear (FlyDSL has no arith.absf)."""
+    abs_bits = _raw(x).bitcast(T.i32) & _raw(fx.Int32(0x7FFFFFFF))
+    return fx.Float32(abs_bits.bitcast(T.f32))
+
+
+def _e8m0_from_amax(amax_f32):
+    """(e8m0_i32, quant_scale_f32) = ceil_pow2(amax/6) clamped to 254."""
+    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(T.i32))
+    bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
+    lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(bexp), _raw(fx.Int32(254)))
+    e8m0 = fx.Int32(arith.select(lt, _raw(bexp), _raw(fx.Int32(254))))
+    qscale = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
+    return e8m0, qscale
+
+
+def gemm1_grid(n_tokens, BM=32, NE=NE_DEFAULT, TOPK=TOPK_DEFAULT, INTER=INTER_DEFAULT):
+    """Host-side grid size (BM=32 active-experts bound)."""
+    active = min(n_tokens * TOPK, NE)
+    max_m_blocks = (n_tokens * TOPK + active * (BM - 1) + BM - 1) // BM
+    return max_m_blocks * ((2 * INTER) // 256)
 
 
 @flyc.jit
@@ -117,21 +133,17 @@ def _gemm1_body_v2(
     i32_ntok,
     i32_total_m_blocks,
     *,
-    K,
     K_HALF,
     K_TILES_TOTAL,
     kUnroll,
     kAS_per_chunk_dw,
     kBS_stride_n0_dw,
     kBS_per_expert_dw,
-    BQ_BYTES,
-    ASCALE_BYTES,
     BSCALE_BYTES,
     N_OUT,
     NUM_N_BLOCKS,
     OUT_AS_PER_CHUNK_DW,
     K_G2_HALF,
-    interleave,
     b_nontemporal,
 ):
     BM = _BM
@@ -153,7 +165,7 @@ def _gemm1_body_v2(
     lane_div_8 = lane // fx.Int32(8)
     lane_mod_8 = lane % fx.Int32(8)
 
-    # -- buffer resources (exact num_bytes) -- (KEPT RAW: A-gather + scales) --
+    # buffer resources (A-gather + scales)
     aq_num_records = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K_HALF)))
     aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num_records
@@ -169,44 +181,7 @@ def _gemm1_body_v2(
         _raw(fx.Int64(arg_bscale)), num_records_bytes=BSCALE_BYTES
     )
 
-    # ============================================================
-    # B-weight load -- LAYOUT API (the non-negotiable core conversion).
-    #
-    # v1 raw addressing (issue_b_load_j, interleave=True): the global BYTE address
-    # of one B element for (expert e, n-tile col, lane, K-tile K_C, half) is
-    #   (e*N_OUT + col)*K_HALF
-    #     + lane_div_16*256 + lane_mod_16*16 + K_C*2048 + half*1024
-    # with col = n_block_idx*BN + wave*(BN/4) + j*16,  j in [0,4).
-    # The vec4-i32 load consumes 16 contiguous bytes from that base.
-    #
-    # This is exactly the CK 5-D preshuffle layout. We encode it as a hierarchical
-    # fx.make_layout over the bq buffer (mirroring preshuffle_gemm_v2 lines 470-485)
-    # and read it via make_tiled_copy_B partitions + fx.copy into B fragments that
-    # feed the raw mfma. The per-expert base offset e*N_OUT*K_HALF is folded into
-    # the buffer-tensor base pointer (a uniform per-block address, readfirstlane'd).
-    #
-    # CK preshuffle byte layout (bytes, fp4x2 => 1 byte per 2 fp4 along K):
-    #   col index    -> n0 = col // 16, nlane = col % 16   (16-row n-lanes)
-    #   K byte index -> within a (klane=4, kpack=16) tile at K_C granularity:
-    #     base K byte for K_C = K_C * 2048  (= 4*16*32 ? see below) ... we mirror
-    #     v1's exact integer offsets rather than re-deriving, so it is bit-exact.
-    #
-    # Concretely, per (lane, K_C, half) the 16-byte fragment base is:
-    #   off = lane_div_16*256 + lane_mod_16*16 + K_C*2048 + half*1024
-    # which decomposes as a layout with axes
-    #   (klane=lane_div_16 in [0,4) -> stride 256),
-    #   (nlane=lane_mod_16 in [0,16) -> stride 16),
-    #   (K_C in [0,K_TILES_TOTAL) -> stride 2048),
-    #   (half in [0,2) -> stride 1024),
-    #   (kpack byte in [0,16) -> stride 1),
-    # plus the per-n-tile column stride (col -> *K_HALF) folded via the tile base.
-    # ============================================================
-
-    # The B preshuffle layout view + tiled-copy load is constructed below
-    # (issue_b_load_j_layout). A plain buffer resource over bq is also kept for the
-    # B-scale path parity (scales stay raw).
-
-    # -- LDS views (s_aq / s_asc, union-overlapping lds_acc) -- (KEPT RAW) -----
+    # LDS views (s_aq / s_asc, union-overlapping lds_acc)
     lds_base = allocator.get_base()
     s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE,))
     s_asc = SmemPtr(
@@ -217,7 +192,7 @@ def _gemm1_body_v2(
     )
     lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,))
 
-    # -- cached A rows (KEPT RAW: A-gather base offset) -----------------------
+    # cached A rows (A-gather base offset)
     cached_actual_row = []
     for sub in range_constexpr(kSubBlocks):
         idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
@@ -225,16 +200,7 @@ def _gemm1_body_v2(
             llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
         )
 
-    # -- b_load_s_base[j] (per-jtile column base offset) ----------------------
-    b_load_s_base = []
-    for j in range_constexpr(4):
-        col = (
-            n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
-        )
-        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
-        b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
-
-    # -- b_scale_s_base / _hi (KEPT RAW) --------------------------------------
+    # b_scale_s_base / _hi
     mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
     np_list = [mni_base, mni_base + fx.Int32(1)]
     b_scale_s_base, b_scale_s_base_hi = [], []
@@ -246,11 +212,8 @@ def _gemm1_body_v2(
         b_scale_s_base.append(base)
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
-    # Per-stage B-scale (Vec, cheap to double-buffer as SSA). A/B/C register
-    # fragments for fx.gemm are built below (after the preshuffle views).
-    b_scale_v = [[None, None] for _ in range(kStages)]
+    b_scale_v = [[None, None] for _ in range(kStages)]  # per-stage, SSA double-buffer
 
-    # raw A LDS helpers (KEPT RAW) -------------------------------------------
     def issue_a_load_lds(slot, kt):
         for sub in range_constexpr(kSubBlocks):
             lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
@@ -273,8 +236,7 @@ def _gemm1_body_v2(
             )
 
     def issue_a_ds_read(slot):
-        # ds_read the A tile from LDS and STORE into the A register fragments that
-        # feed fx.gemm (raw llvm.load addressing kept; the value lands in a fragment).
+        # ds_read A from LDS (raw addressing) into the A register fragments for fx.gemm.
         mask = _lds_swizzle_mask(lane_mod_16)
         base_ptr = _lds_base_ptr3(s_aq.get())
         for k in range_constexpr(2):
@@ -338,89 +300,43 @@ def _gemm1_body_v2(
             out.append(llvm.load(T.i32, _gep3(base_ptr, lds_dw * fx.Int32(4))))
         return out
 
-    # ============================================================
-    # B-weight load -- LAYOUT API (the non-negotiable core conversion).
-    #
-    # The B preshuffle is encoded as a hierarchical fx.make_layout VIEW over the bq
-    # buffer (mirroring preshuffle_gemm_v2 lines 470-485), adapted to this kernel's
-    # CK 5-D layout. v1's raw 16-byte (vec4-i32) fragment byte address for
-    # (expert e, n-tile col, lane, K-tile K_C, half) is:
-    #   (e*N_OUT + col)*K_HALF
-    #     + lane_div_16*256 + lane_mod_16*16 + K_C*2048 + half*1024
-    # In i32 (4-byte) units, with klane=lane_div_16, nlane=lane_mod_16:
-    #   base_i32 = (e*N_OUT + col)*(K_HALF/4)        # per-jtile, uniform per wave
-    #            + klane*64 + nlane*4                # per-lane, folded into base
-    #   view axes:  (K_C -> stride 512, half -> stride 256, kpack4 -> stride 1)
-    # We build one buffer-tensor VIEW per jtile carrying those axes, and load each
-    # 16-byte fragment with a layout-API fx.copy (BufferCopy128b) into a register
-    # fragment; the fragment's vec4 feeds the raw mfma cluster.
-    #
-    # cache_modifier carries the B-load policy THROUGH the layout API:
-    #   use_nt=True  -> cache_modifier=2 (nt, non-temporal -> decode)
-    #   use_nt=False -> cache_modifier=0 (cached            -> prefill)
-    # Both paths are now layout-API fx.copy; the nt aux hint rides on the copy atom
-    # type (FlyDSL BufferCopy128b(cache_modifier=...)), no raw buffer_load fallback.
+    # B-weight load -- LAYOUT API. The CK preshuffle is encoded as a hierarchical
+    # fx.make_layout view over bq; v1's raw byte address for (e, col, lane, K_C, half)
+    # = (e*N_OUT+col)*K_HALF + lane_div_16*256 + lane_mod_16*16 + K_C*2048 + half*1024.
+    # The descriptor base MUST stay UNIFORM per wave -- folding the per-lane part into
+    # it makes make_buffer_tensor emit a per-lane WATERFALL (~14x slower). So the base
+    # is the uniform col offset and the per-lane (klane,nlane) are LAYOUT AXES indexed
+    # at copy time -> a VGPR voffset. The nt/cached policy rides on the copy atom's
+    # cache_modifier (2=nt / 0=cached); both paths are fx.copy, no raw fallback.
     KH4 = K_HALF // 4  # i32 stride for the col axis
-    _b_cache_mod = 2 if b_nontemporal else 0
     _b_copy_atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy128b(_b_cache_mod), 32
-    )  # 4x i32 = 128b
+        fx.rocdl.BufferCopy128b(2 if b_nontemporal else 0), 32  # 4x i32 = 128b
+    )
 
     def _make_bq_view_for_jtile(j):
-        # The buffer-descriptor base MUST be UNIFORM across the wave -- otherwise
-        # make_buffer_tensor emits a per-lane WATERFALL loop (the real 14x killer:
-        # ~900 readfirstlane + s_and_saveexec + s_cbranch per B load). v1 keeps the
-        # descriptor base uniform (bq_rsrc) and carries the per-lane part as the
-        # buffer_load voffset. We mirror that: anchor the view at the UNIFORM
-        # per-(wave,jtile) col base, and express the per-lane (klane, nlane) offset
-        # as LAYOUT AXES so indexing turns them into a VGPR voffset, not a divergent
-        # descriptor base.
-        col = (
-            n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
-        )
-        col_base = rocdl.readfirstlane(
-            T.i32, (e * fx.Int32(N_OUT) + col) * fx.Int32(KH4)
-        )  # uniform i32 element offset from bq base
-        # global i32 pointer anchored at the UNIFORM per-wave fragment-region start.
+        col = n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
+        col_base = rocdl.readfirstlane(T.i32, (e * fx.Int32(N_OUT) + col) * fx.Int32(KH4))
         i32_ptr_ty = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=16
         )
-        # absolute byte address = bq_base + col_base*4. Extend to i64 BEFORE *4:
-        # the byte offset reaches ~BQ_BYTES (~1.4e9) which overflows a signed i32.
+        # zext col_base BEFORE *4: the byte offset can exceed a signed i32.
         off_i64 = fx.Int64(arith.ExtUIOp(T.i64, _raw(col_base)).result)
-        addr_i64 = fx.Int64(arg_bq) + off_i64 * fx.Int64(4)
-        base_iter = fx.inttoptr(i32_ptr_ty, addr_i64)
-        # hierarchical preshuffle view, i32 element strides:
-        #   klane  = lane_div_16 in [0,4)  -> 64   (= 256 bytes)
-        #   nlane  = lane_mod_16 in [0,16) -> 4    (= 16 bytes)
-        #   K_C    in [0,K_TILES_TOTAL)    -> 512  (= 2048 bytes)
-        #   half   in [0,2)                -> 256  (= 1024 bytes)
-        #   kpack4 in [0,4)                -> 1
-        # The K-structure AND the per-lane structure are both expressed AS A LAYOUT.
+        base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_bq) + off_i64 * fx.Int64(4))
+        # i32 strides: klane[0,4)->64, nlane[0,16)->4, K_C->512, half[0,2)->256, kpack4->1
         view = fx.Tensor(
             fx.make_view(
                 base_iter,
-                fx.make_layout(
-                    (4, 16, K_TILES_TOTAL, 2, 4),
-                    (64, 4, 512, 256, 1),
-                ),
+                fx.make_layout((4, 16, K_TILES_TOTAL, 2, 4), (64, 4, 512, 256, 1)),
             )
         )
         return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
-    # Build the preshuffle VIEWS once, hoisted out of the K-loop (both nt + cached
-    # paths use the layout API now -- they differ only in the copy atom's cache mod).
     _bq_views = [_make_bq_view_for_jtile(j) for j in range_constexpr(4)]
 
-    # All MMA operands are register FRAGMENTS feeding fx.gemm (rank-1 -> one
-    # MmaAtomCall each). Element type i32<4:1> (=16B=32 fp4) for A/B; f32<4:1> (vec4
-    # accumulator) for C, via make_fragment_like(dtype=f32).
+    # All MMA operands are register fragments for fx.gemm (rank-1 -> one MmaAtomCall).
+    # i32<4:1> (16B = 32 fp4) for A/B; f32<4:1> (vec4) for C. B is PER-STAGE (kStages)
+    # to hold the prefetch pipeline; A is refilled per K iter; C accumulates in place.
     _frag_tmpl = _bq_views[0][0, 0, 0, 0, None]  # i32<4:1>
-
-    # B fragments are PER-STAGE (kStages): the K-loop prefetches B one+ stage ahead
-    # (slot_b = OFFSET % kStages), so each stage needs its own fragment to hold data
-    # from load (iter N) until consumed (iter N+kStages) -- mirrors the old per-stage
-    # Vec double-buffering.
     _bq_frags = [
         [
             [fx.make_fragment_like(_frag_tmpl) for _ in range_constexpr(2)]
@@ -428,8 +344,6 @@ def _gemm1_body_v2(
         ]
         for _ in range_constexpr(kStages)
     ]
-    # A fragments: one set, refilled from ds_read each K iter (used by all 4 J in
-    # that iter before the next ds_read). C accumulators: in-place across the K loop.
     _a_frags = [
         [fx.make_fragment_like(_frag_tmpl) for _ in range_constexpr(2)]
         for _ in range_constexpr(kMChunks)
@@ -443,9 +357,6 @@ def _gemm1_body_v2(
     ]
 
     def issue_b_load_j(stage, K_C, j):
-        # LAYOUT-API B load: preshuffle view -> fx.copy into the stage's B fragment
-        # (cache modifier on _b_copy_atom selects nt vs cached). No Vec extraction;
-        # fx.gemm reads the fragment directly at MMA time.
         view = _bq_views[j]
         for half in range_constexpr(2):
             fx.copy(
@@ -468,38 +379,23 @@ def _gemm1_body_v2(
                 soffset_bytes=s_off,
             )
 
-    # -- MFMA cluster -- LAYOUT API via fx.gemm -------------------------------
-    # Each microscaled mfma is one fx.gemm over rank-1 register fragments (A/B/C),
-    # which lowers to a single fly MmaAtomCall -> rocdl.mfma.scale.f32.16x16x128.
-    # The per-K-block e8m0 scales ride on the atom STATE (fx.gemm **kwargs ->
-    # set_value scale_a/scale_b); the runtime per-K opsel is a type param, so we
-    # select a pre-built opsel-specialized atom per (opselA,opselB) pair. cbsz/blgp
-    # (=4 for fp4) are inferred from the Float4E2M1FN operand types. The accumulator
-    # is the C fragment updated IN PLACE (d == c), so no SSA acc chain is threaded.
+    # MMA -- one fx.gemm per mfma over rank-1 fragments (-> one scaled MmaAtomCall).
+    # Scales ride on the atom state via scale_a=/scale_b= kwargs; per-mfma opsel is a
+    # type param, so pre-build one atom per (opselA,opselB) (all 16, at trace time).
+    # cbsz/blgp(=4 for fp4) are inferred from Float4E2M1FN. C accumulates in place (d==c).
     zero4 = Vec.filled(4, 0.0, fx.Float32)
-
-    # Build the opsel-specialized scaled-MMA atoms ONCE (opsel is a type param, so
-    # one atom per (opselA,opselB) pair). All 16 combos -- cheap, built at trace time.
     _scale_mma_atoms = {
         (osa, osb): fx.make_mma_atom(
-            fx.rocdl.cdna4.MFMA_Scale(
-                16, 16, 128, Float4E2M1FN, opsel_a=osa, opsel_b=osb
-            )
+            fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, Float4E2M1FN, opsel_a=osa, opsel_b=osb)
         )
         for osa in range_constexpr(4)
         for osb in range_constexpr(4)
     }
 
     def _gemm_mma(a_frag, b_frag, c_frag, opsel_a, opsel_b, sa, sb):
-        # one fx.gemm = one MmaAtomCall (rank-1 fragments). d == c -> in-place accum.
         fx.gemm(
-            _scale_mma_atoms[(opsel_a, opsel_b)],
-            c_frag,
-            a_frag,
-            b_frag,
-            c_frag,
-            scale_a=sa,
-            scale_b=sb,
+            _scale_mma_atoms[(opsel_a, opsel_b)], c_frag, a_frag, b_frag, c_frag,
+            scale_a=sa, scale_b=sb,
         )
 
     def mfma_cluster(stage, a_scale, bs_slot, J):
@@ -515,12 +411,12 @@ def _gemm1_body_v2(
             _gemm_mma(_a_frags[i0][1], bJ1, _c_frags[i0][J], 2, 2 + in_b, sa, sb)
             _gemm_mma(_a_frags[i1][1], bJ1, _c_frags[i1][J], 3, 2 + in_b, sa, sb)
 
-    # ---- zero the C accumulator fragments (in-place accumulate thereafter) ----
+    # zero C (accumulate in place thereafter)
     for i in range_constexpr(kMChunks):
         for J in range_constexpr(4):
             _c_frags[i][J].store(zero4)
 
-    # ---- prologue: stages 0,1 ----
+    # prologue: stages 0,1
     issue_a_scale_load()
     for K_C in range_constexpr(kStages):
         issue_a_load_lds(K_C, K_C)
@@ -528,7 +424,8 @@ def _gemm1_body_v2(
             issue_b_load_j(K_C, K_C, j)
         issue_b_scale_load(b_scale_v[K_C], K_C)
 
-    # ---- main loop: OFFSET in [0,kUnroll) ----
+    # main loop. sched_barrier/s_setprio fence the mfma chain from the B loads (mirror
+    # v1's BM!=128 hints) so it stays dense -- closes the small-M gap.
     for OFFSET in range_constexpr(kUnroll):
         K_C = kStages + OFFSET
         read_slot = OFFSET % kAStages
@@ -539,10 +436,6 @@ def _gemm1_body_v2(
         asc_cur = issue_a_scale_ds_read(K_C - kStages)
         issue_a_load_lds(write_slot, K_C)
         for J in range_constexpr(4):
-            # Scheduler hints mirror v1's BM!=128 path: fence the mfma cluster from
-            # the surrounding loads (sched_barrier) and raise its priority
-            # (s_setprio) so the backend keeps the mfma chain dense instead of
-            # interleaving the B buffer_loads into it. Closes the small-M gap.
             rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
             mfma_cluster(slot_b, asc_cur, b_scale_v[slot_b], J)
@@ -552,7 +445,7 @@ def _gemm1_body_v2(
             rocdl.sched_barrier(0)
         issue_b_scale_load(b_scale_v[slot_b], K_C)
 
-    # ---- drain: S in [0,kStages) ----
+    # drain: last kStages
     for S in range_constexpr(kStages):
         kt = K_TILES_TOTAL - kStages + S
         gpu.barrier()
@@ -566,7 +459,7 @@ def _gemm1_body_v2(
     s_asc._view_cache = None
     lds_acc._view_cache = None
 
-    # -- epilog: cshuffle -> SwiGLU -> fp4 + e8m0 requant (KEPT RAW math) -----
+    # epilog: cshuffle -> SwiGLU -> fp4 + e8m0 requant (raw math)
     wave_n = wave
     lds_acc_base = _lds_base_ptr3(lds_acc.get())
 
@@ -692,48 +585,34 @@ def compile_gemm1_a4w4_port(
     TOPK=TOPK_DEFAULT,
     interleave=True,
 ):
-    # use_nt IS the B-load cache policy (matches v1's `b_aux = 2 if use_nt else 0`
-    # and the tuned config's BM32_NT vs BM32_CACHED kernelName1):
-    #   use_nt=True  -> BM32_NT     : non-temporal raw buffer_load (decode/small M)
-    #   use_nt=False -> BM32_CACHED : cached layout-API fx.copy   (prefill/large M)
+    # use_nt IS the B-load cache policy (v1's `b_aux = 2 if use_nt else 0`;
+    # tuned config BM32_NT vs BM32_CACHED): True -> nt (decode), False -> cached.
     b_nontemporal = use_nt
-    print(
-        f"[PORT-FLYDSL-GEMM1-V2] compile_gemm1_a4w4_port ENTERED "
-        f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} "
-        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE} interleave={interleave} "
-        f"b_nontemporal={b_nontemporal}",
-        flush=True,
-    )
     if (BM, inline_quant) != (32, False):
         raise AssertionError(
-            f"mxfp4_gemm1_v2 supports only (BM=32, inline_quant=False) for either "
-            f"use_nt; got (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
+            f"mxfp4_gemm1_v2 supports only (BM=32, inline_quant=False); "
+            f"got (BM={BM}, inline_quant={inline_quant})"
         )
     if not interleave:
-        raise AssertionError(
-            "mxfp4_gemm1_v2 Phase 1 supports interleave=True only "
-            "(separated gate/up is a later phase; v1 handles it)."
-        )
+        raise AssertionError("mxfp4_gemm1_v2 supports interleave=True only (v1 handles sep).")
 
-    _K = D_HIDDEN
+    _K, _INTER, _NE = D_HIDDEN, D_INTER, NE
     assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
-    _INTER = D_INTER
-    _N_OUT = n_out_for(_INTER)
+    _N_OUT = 2 * _INTER
     assert _N_OUT % BN == 0, f"2*D_INTER (N_OUT) must be a multiple of {BN}, got {_N_OUT}"
-    _NE = NE
 
-    _K_HALF = k_half_for(_K)
-    _K_TILES_TOTAL = k_tiles_total_for(_K)
-    _kUnroll = kunroll_for(_K)
-    _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
-    _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
-    _kBS_per_expert_dw = kbs_per_expert_dw_for(_K, _INTER)
-    _BQ_BYTES = bq_bytes_for(_K, _INTER, _NE)
-    _ASCALE_BYTES = ascale_bytes_for(_K)
-    _BSCALE_BYTES = bscale_bytes_for(_K, _INTER, _NE)
-    _NUM_N_BLOCKS = num_n_blocks_for(_INTER)
-    _OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(_INTER)
-    _K_G2_HALF = k_g2_half_for(_INTER)
+    # K-/INTER-derived sizes (inlined; were the v1 *_for helpers).
+    _kc = (_K // 32) // 4 // 2
+    _K_HALF = _K // 2
+    _K_TILES_TOTAL = _K // BK
+    _kUnroll = _K_TILES_TOTAL - kStages
+    _kAS_per_chunk_dw = _kc * 64
+    _kBS_stride_n0_dw = _kc * 64
+    _kBS_per_expert_dw = (_N_OUT // 16 // 2) * _kBS_stride_n0_dw
+    _BSCALE_BYTES = _NE * _kBS_per_expert_dw * 4
+    _NUM_N_BLOCKS = _N_OUT // 256
+    _OUT_AS_PER_CHUNK_DW = ((_INTER // 32) // 4 // 2) * 64
+    _K_G2_HALF = _INTER // 2
 
     lds_bytes = _lds_bytes_for(_K_TILES_TOTAL)
 
@@ -787,21 +666,17 @@ def compile_gemm1_a4w4_port(
                 wave,
                 i32_ntok,
                 total_m_blocks,
-                K=_K,
                 K_HALF=_K_HALF,
                 K_TILES_TOTAL=_K_TILES_TOTAL,
                 kUnroll=_kUnroll,
                 kAS_per_chunk_dw=_kAS_per_chunk_dw,
                 kBS_stride_n0_dw=_kBS_stride_n0_dw,
                 kBS_per_expert_dw=_kBS_per_expert_dw,
-                BQ_BYTES=_BQ_BYTES,
-                ASCALE_BYTES=_ASCALE_BYTES,
                 BSCALE_BYTES=_BSCALE_BYTES,
                 N_OUT=_N_OUT,
                 NUM_N_BLOCKS=_NUM_N_BLOCKS,
                 OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
                 K_G2_HALF=_K_G2_HALF,
-                interleave=interleave,
                 b_nontemporal=b_nontemporal,
             )
 
