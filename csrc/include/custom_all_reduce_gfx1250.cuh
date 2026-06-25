@@ -57,7 +57,7 @@ namespace aiter {
 // ---------------------------------------------------------------------------
 // Constants & data structures
 // ---------------------------------------------------------------------------
-constexpr int kMaxBlocks = 256;
+constexpr int kMaxBlocks = 512;
 
 struct Signal
 {
@@ -225,6 +225,122 @@ __global__ void __launch_bounds__(256, 2) ar_gfx1250_naive_unroll4(
 }
 
 // ---------------------------------------------------------------------------
+// gfx1250 allgather kernel
+// ---------------------------------------------------------------------------
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 2) ag_gfx1250_naive_unroll4(
+    RankData* _input_dp,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int unroll    = 4;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    int index    = blockIdx.x * blockDim.x * unroll + threadIdx.x;
+    int stride  = blockDim.x * gridDim.x * unroll;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        ptrs[i] = (const P*)_input_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for (int idx = index; idx + blockDim.x * (unroll - 1) < size; idx += stride)
+    {
+#pragma unroll
+      for (int i = 0; i < ngpus; ++i)
+      {
+        int rank_idx = (rank + i) % ngpus;
+#pragma unroll
+        for (int j = 0; j < unroll; ++j)
+        {
+          *(reinterpret_cast<P*>(result) + size * rank_idx + idx + j * blockDim.x) = ptrs[rank_idx][idx + j * blockDim.x];
+        }
+      }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(256, 2) ag_gfx1250_warpsplit_unroll4(
+    RankData* _input_dp,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    constexpr int unroll    = 4;
+    constexpr int tnum_gpu = 256 / ngpus;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    int warp_id = threadIdx.x / tnum_gpu;
+    int lane_id = threadIdx.x % tnum_gpu;
+    int index    = blockIdx.x * tnum_gpu * unroll + lane_id;
+    int stride  = blockDim.x * tnum_gpu * unroll;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        ptrs[i] = (const P*)_input_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for (int idx = index; idx + tnum_gpu * (unroll - 1) < size; idx += stride)
+    {
+#pragma unroll
+      for (int i = 0; i < unroll; ++i)
+      {
+        P* rslt_addr = reinterpret_cast<P*>(result) + warp_id * size + idx + tnum_gpu * i;
+        *rslt_addr = ptrs[warp_id][idx + i * tnum_gpu];
+      }
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
+// ---------------------------------------------------------------------------
+// gfx1250 bandwidth test kernel
+// ---------------------------------------------------------------------------
+template <typename T, int unroll>
+__global__ void  p2p_bandwidth_test_kernel(
+    RankData* _input_dp,
+    RankSignals sg,
+    Signal* self_sg,
+    T* __restrict__ result,
+    int rank,
+    int size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    int index    = blockIdx.x * blockDim.x * unroll + threadIdx.x;
+    int stride  = blockDim.x * gridDim.x * unroll;
+    const P* ptrs[2];
+#pragma unroll
+    for(int i = 0; i < 2; i++)
+    {
+        ptrs[i] = (const P*)_input_dp->ptrs[i];
+    }
+    start_sync<2>(sg, self_sg, rank);
+    for (int idx = index; idx < size; idx += stride)
+    {
+      P reg[unroll];
+#pragma unroll
+      for (int i = 0; i < unroll; ++i)
+      {
+        reg[i] = ptrs[(rank + 1) % 2][idx + i * blockDim.x];
+      }
+#pragma unroll
+      for (int i = 0; i < unroll; ++i)
+      {
+        *(reinterpret_cast<P*>(result) + idx + i * blockDim.x) = reg[i];
+      }
+    }
+    // end_sync<2, true>(sg, self_sg, rank);
+}
+
+// ---------------------------------------------------------------------------
 // CustomAllreduce class (gfx1250-only, simplified)
 // ---------------------------------------------------------------------------
 // gfx1250: hipIpc is not available. Buffer sharing uses torch's
@@ -385,6 +501,76 @@ public:
         d_rank_data_base_ += total_buffers;
         graph_unreg_input_buffers_.clear();
         graph_unreg_output_buffers_.clear();
+    }
+
+    template <typename T>
+    void allgather_naive(hipStream_t stream,
+                         T* input,
+                         T* output,
+                         int size)
+    {
+        auto d = 16 / sizeof(T);
+        if(size % d != 0)
+            throw std::runtime_error(
+                "allgather requires input length to be multiple of " + std::to_string(d));
+
+        RankData* input_ptrs = get_buffer_RD(stream, input);
+        size /= d;
+
+        constexpr int threads = 256;
+        int blocks = std::min(kMaxBlocks,
+                              (size + threads * 4 - 1) / (threads * 4));
+        if(world_size_ == 2)
+            ag_gfx1250_naive_unroll4<T, 2><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size);
+        else
+            ag_gfx1250_naive_unroll4<T, 4><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size);
+    }
+
+    template <typename T>
+    void allgather_warpsplit(hipStream_t stream,
+                             T* input,
+                             T* output,
+                             int size)
+    {
+        auto d = 16 / sizeof(T);
+        if(size % d != 0)
+            throw std::runtime_error(
+                "allgather requires input length to be multiple of " + std::to_string(d));
+
+        RankData* input_ptrs = get_buffer_RD(stream, input);
+        size /= d;
+
+        constexpr int threads = 256;
+        int blocks = std::min(kMaxBlocks,
+                              (size + threads * 4 - 1) / (threads * 4));
+        if(world_size_ == 2)
+            ag_gfx1250_warpsplit_unroll4<T, 2><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size);
+        else
+            ag_gfx1250_warpsplit_unroll4<T, 4><<<blocks, threads, 0, stream>>>(
+                input_ptrs, sg_, self_sg_, output, rank_, size);
+    }
+
+    template <typename T, int unroll>
+    void p2p_bw_test(hipStream_t stream,
+                     T* input,
+                     T* output,
+                     int size,
+                     int threads,
+                     int blocks)
+    {
+        auto d = 16 / sizeof(T);
+        if(size % d != 0)
+            throw std::runtime_error(
+                "p2p_bw_test requires input length to be multiple of " + std::to_string(d));
+
+        RankData* input_ptrs = get_buffer_RD(stream, input);
+        size /= d;
+
+        p2p_bandwidth_test_kernel<T, unroll><<<blocks, threads, 0, stream>>>(
+            input_ptrs, sg_, self_sg_, output, rank_, size);
     }
 
     template <typename T>

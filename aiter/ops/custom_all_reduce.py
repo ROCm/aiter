@@ -240,6 +240,30 @@ def all_reduce_gfx1250(
 ) -> None: ...
 
 
+@compile_ops(GFX1250_MD_NAME, fc_name="all_gather", develop=True)
+def all_gather_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    kernel_type: int,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="p2p_bw_test", develop=True)
+def p2p_bw_test_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    unroll: int,
+    threads: int,
+    blocks: int,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="dispose", develop=True)
 def dispose_gfx1250(_fa: int) -> None: ...
 

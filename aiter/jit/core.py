@@ -57,19 +57,23 @@ def mp_lock(
     Using FileBaton for multiprocessing.
     """
     baton = FileBaton(lockPath)
-    if baton.try_acquire():
-        try:
-            ret = MainFunc()
-        finally:
-            if FinalFunc is not None:
-                FinalFunc()
-            baton.release()
-    else:
-        baton.wait()
-        if WaitFunc is not None:
-            ret = WaitFunc()
-        ret = None
-    return ret
+    while True:
+        if baton.try_acquire():
+            try:
+                ret = MainFunc()
+            finally:
+                if FinalFunc is not None:
+                    FinalFunc()
+                baton.release()
+            return ret
+        # Could not acquire: another process holds the lock. Wait for it.
+        # wait() returns True if the holder released normally (work done),
+        # or False if it broke a stale lock left by a dead/abandoned holder —
+        # in which case we loop and try to acquire + build ourselves.
+        if baton.wait():
+            if WaitFunc is not None:
+                return WaitFunc()
+            return None
 
 
 logger = logging.getLogger("aiter")

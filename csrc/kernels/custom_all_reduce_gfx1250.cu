@@ -141,7 +141,133 @@ void register_graph_buffers(fptr_t _fa,
     fa->register_graph_buffers(per_rank.data());
 }
 
-// ---- Public collective API ----
+// ---- Allgather dispatch helpers ----
+
+static void _all_gather(fptr_t _fa, void* inp, void* out,
+                        int64_t numel, AiterDtype dtype, int kernel_type)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+
+#define AG_DISPATCH(T, method)                             \
+    fa->method<T>(stream,                                  \
+                  reinterpret_cast<T*>(inp),                \
+                  reinterpret_cast<T*>(out), numel);        \
+    break
+
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp16:
+        if(kernel_type == 0) { AG_DISPATCH(opus::fp16_t, allgather_naive); }
+        else                 { AG_DISPATCH(opus::fp16_t, allgather_warpsplit); }
+    case AITER_DTYPE_bf16:
+        if(kernel_type == 0) { AG_DISPATCH(opus::bf16_t, allgather_naive); }
+        else                 { AG_DISPATCH(opus::bf16_t, allgather_warpsplit); }
+    case AITER_DTYPE_fp32:
+        if(kernel_type == 0) { AG_DISPATCH(opus::fp32_t, allgather_naive); }
+        else                 { AG_DISPATCH(opus::fp32_t, allgather_warpsplit); }
+    default:
+        throw std::runtime_error("gfx1250 allgather only supports fp32, fp16 and bf16");
+    }
+#undef AG_DISPATCH
+}
+
+// ---- P2P bandwidth test dispatch ----
+
+static void _p2p_bw_test(fptr_t _fa, void* inp, void* out,
+                          int64_t numel, AiterDtype dtype,
+                          int unroll, int threads, int blocks)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+
+#define BW_DISPATCH(T, U)                                     \
+    fa->p2p_bw_test<T, U>(stream,                             \
+        reinterpret_cast<T*>(inp),                             \
+        reinterpret_cast<T*>(out), numel, threads, blocks);    \
+    return
+
+#define BW_UNROLL(T)                           \
+    switch(unroll) {                           \
+    case 2: BW_DISPATCH(T, 2);                 \
+    case 4: BW_DISPATCH(T, 4);                 \
+    case 8: BW_DISPATCH(T, 8);                 \
+    default: throw std::runtime_error(         \
+        "p2p_bw_test: unroll must be 2, 4 or 8"); \
+    }
+
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp16: BW_UNROLL(opus::fp16_t);
+    case AITER_DTYPE_bf16: BW_UNROLL(opus::bf16_t);
+    case AITER_DTYPE_fp32: BW_UNROLL(opus::fp32_t);
+    default:
+        throw std::runtime_error("p2p_bw_test only supports fp32, fp16, bf16");
+    }
+#undef BW_DISPATCH
+#undef BW_UNROLL
+}
+
+void p2p_bw_test(fptr_t _fa,
+                  const aiter_tensor_t& inp,
+                  const aiter_tensor_t& out,
+                  int64_t unroll,
+                  int64_t threads,
+                  int64_t blocks,
+                  int64_t reg_inp_ptr,
+                  int64_t reg_inp_bytes)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto dtype     = inp.dtype();
+    int64_t numel  = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+
+    void* actual_inp = inp.data_ptr();
+    void* actual_out = out.data_ptr();
+
+    if(reg_inp_ptr != 0)
+    {
+        if(data_bytes > reg_inp_bytes)
+            throw std::runtime_error("registered buffer is too small");
+        HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        actual_inp = (void*)reg_inp_ptr;
+    }
+
+    _p2p_bw_test(_fa, actual_inp, actual_out, numel, dtype,
+                  unroll, threads, blocks);
+}
+
+// ---- Public collective APIs ----
+
+void all_gather(fptr_t _fa,
+                const aiter_tensor_t& inp,
+                const aiter_tensor_t& out,
+                int64_t kernel_type,
+                int64_t reg_inp_ptr,
+                int64_t reg_inp_bytes)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto dtype     = inp.dtype();
+    int64_t numel  = inp.numel();
+    int64_t data_bytes = numel * inp.element_size();
+
+    void* actual_inp = inp.data_ptr();
+    void* actual_out = out.data_ptr();
+
+    if(reg_inp_ptr != 0)
+    {
+        if(data_bytes > reg_inp_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync((void*)reg_inp_ptr, actual_inp, data_bytes,
+                                hipMemcpyDeviceToDevice, stream));
+        actual_inp = (void*)reg_inp_ptr;
+    }
+
+    _all_gather(_fa, actual_inp, actual_out, numel, dtype, kernel_type);
+}
 
 void all_reduce(fptr_t _fa,
                 const aiter_tensor_t& inp,

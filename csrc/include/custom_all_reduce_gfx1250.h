@@ -39,6 +39,20 @@ void all_reduce(fptr_t _fa,
                 bool open_fp8_quant,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes);
+void all_gather(fptr_t _fa,
+                const aiter_tensor_t& inp,
+                const aiter_tensor_t& out,
+                int64_t kernel_type,
+                int64_t reg_inp_ptr,
+                int64_t reg_inp_bytes);
+void p2p_bw_test(fptr_t _fa,
+                  const aiter_tensor_t& inp,
+                  const aiter_tensor_t& out,
+                  int64_t unroll,
+                  int64_t threads,
+                  int64_t blocks,
+                  int64_t reg_inp_ptr,
+                  int64_t reg_inp_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 // register_input/output_buffer receive direct device pointers per rank.
