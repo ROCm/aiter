@@ -218,7 +218,12 @@ def _time_modes(closure, modes, cfg, quiet_probe=False):
     ``"PROBE-FAIL"`` (graph capture failed -- e.g. a NULL-stream launcher or
     allocation during capture). One eager probe call first surfaces
     NotImplementedError / compile errors before timing.
+
+    ``closure=None`` means the variant is not supported for this shape (e.g.
+    geak_v4 with H=128); all modes return ``None``.
     """
+    if closure is None:
+        return {m: None for m in modes}
     try:
         closure()  # probe: surface NotImplementedError / compile errors
     except NotImplementedError:
@@ -287,19 +292,19 @@ PRESET_SHAPES = [
     (1, 4096, 8192, 64, 128),
     (1, 8192, 4096, 64, 128),
     (1, 8192, 8192, 64, 128),
-    #(1, 16384, 16384, 64, 128),
-    #(1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
+    (1, 16384, 16384, 64, 128),
+    (1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
     # H = 128
-    # (1, 1024, 1024, 128, 128),
-    # (1, 2048, 2048, 128, 128),
-    # (1, 4096, 4096, 128, 128),
-    # (1, 1024, 4096, 128, 128),
-    # (1, 4096, 16384, 128, 128),
-    # (1, 4096, 16000, 128, 128),  # non-aligned s_kv (tail)
+    (1, 1024, 1024, 128, 128),
+    (1, 2048, 2048, 128, 128),
+    (1, 4096, 4096, 128, 128),
+    (1, 1024, 4096, 128, 128),
+    #(1, 4096, 16384, 128, 128),
+    #(1, 4096, 16000, 128, 128),  # non-aligned s_kv (tail)
     # H = 128, long-ISL prefill (mirrors the H=64 long-ISL group above)
-    # (1, 8192, 8192, 128, 128),
-    # (1, 16384, 16384, 128, 128),
-    # (1, 32768, 32768, 128, 128),
+    (1, 8192, 8192, 128, 128),
+    (1, 16384, 16384, 128, 128),
+    (1, 32768, 32768, 128, 128),
 ]
 
 
@@ -446,6 +451,9 @@ def _make_closure(name, fn, shape, q_fp8, kv_fp8, scales, weights, ks, ke):
     other impls (triton, flydsl:* variants) take the standard 7 args.
     """
     if name == GEAK_IMPL_NAME:
+        # GEAK cannot support H=128, return None in this case
+        if shape.num_heads_q == 128:
+            return None
         # Geak v4 has a 6-arg ABI (no clean_logits); it always prefills with -inf.
         def closure():
             fn(q_fp8, kv_fp8, scales, weights, ks, ke)
@@ -604,6 +612,9 @@ def _verify_reference(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shap
             continue
         try:
             if name == GEAK_IMPL_NAME:
+                if _make_closure(name, fn, shape, q_fp8, kv_fp8, scales, weights, ks, ke) is None:
+                    status[name] = "SKIP"
+                    continue
                 out = fn(q_fp8, kv_fp8, scales, weights, ks, ke)
             else:
                 out = fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)
@@ -655,6 +666,9 @@ def _verify_vs_triton(impls, q_fp8, kv_fp8, scales, weights, ks, ke, shape):
             continue
         try:
             if name == GEAK_IMPL_NAME:
+                if _make_closure(name, fn, shape, q_fp8, kv_fp8, scales, weights, ks, ke) is None:
+                    status[name] = "SKIP"
+                    continue
                 out = fn(q_fp8, kv_fp8, scales, weights, ks, ke)
             else:
                 out = fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)

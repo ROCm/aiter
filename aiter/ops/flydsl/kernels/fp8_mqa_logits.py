@@ -232,14 +232,18 @@ def _build_kernel(*, num_heads: int, head_size: int, block_kv: int):
         w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
         cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
         ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
-        # logits row stride is runtime (256-aligned, then sliced), so pass it
-        # explicitly rather than deriving it from a runtime shape (the
-        # TensorView stride helper can't cumprod a runtime dim).
-        out_t = GTensor(
+        # Build a 1-D row-slice output view with i64 byte offset to avoid i32
+        # overflow for large tensors (row * stride * 4 > 2^31-1 at S>=32768).
+        _row_i64       = arith.extui(T.i64, _to_raw(row))
+        _stride_i64    = arith.extui(T.i64, _to_raw(stride_logits_s))
+        _row_byte_off  = arith.muli(arith.muli(_row_i64, _stride_i64),
+                                    arith.constant(4, type=T.i64))
+        _row_byte_idx  = arith.index_cast(T.index, _row_byte_off)
+        out_row_t = GTensor(
             logits,
             dtype=T.f32,
-            shape=(-1, -1),
-            stride=(stride_logits_s, fx.Int32(1)),
+            shape=(-1,),
+            static_bytes_offset_i64=_row_byte_idx,
         )
 
         # Window for this row, clamped to [0, seq_len_kv).
@@ -304,7 +308,7 @@ def _build_kernel(*, num_heads: int, head_size: int, block_kv: int):
                 acc_out = arith.AddFOp(acc_in, wscaled, fastmath=fm_fast).result
                 scf.YieldOp([acc_out])
 
-            out_t[row, n] = fx.Float32(h_loop.results[0])
+            out_row_t[n] = fx.Float32(h_loop.results[0])
             scf.YieldOp([])
 
     @flyc.jit
@@ -451,12 +455,19 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
         w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
         cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
         ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
-        out_t = GTensor(
-            logits,
-            dtype=T.f32,
-            shape=(-1, -1),
-            stride=(stride_logits_s, fx.Int32(1)),
-        )
+        # out_t is built per-row inside the epilogue to avoid i32 byte-offset
+        # overflow (row * stride * 4 > 2^31-1 for S >= 32768).
+        # Each out_row_t is a 1-D view shifted by the row's i64 byte offset.
+        _stride_i64_mfma = arith.extui(T.i64, _to_raw(stride_logits_s))
+
+        def _make_out_row_t(row_i32):
+            """1-D output GTensor for row_i32; byte base computed in i64."""
+            _ri64 = arith.extui(T.i64, _to_raw(row_i32))
+            _byte = arith.muli(arith.muli(_ri64, _stride_i64_mfma),
+                               arith.constant(4, type=T.i64))
+            _idx  = arith.index_cast(T.index, _byte)
+            return GTensor(logits, dtype=T.f32, shape=(-1,),
+                           static_bytes_offset_i64=_idx)
 
         def _load_pack_i64(i32_view, byte_off_i32):
             dword_off = fx.Int32(
@@ -603,6 +614,9 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
             # ---- Per-row MFMA + epilogue (inner loop over RPB rows) ----
             for j in range_constexpr(RPB):
                 row = _i32_add(r0, fx.Int32(j))
+                # 1-D output view for this row; base pointer shifted by row's
+                # i64 byte offset so column offset stays safely in i32.
+                out_row_t = _make_out_row_t(row)
                 for ni in range_constexpr(N_TILES_PER_WAVE):
                     col      = cols[ni]
                     kv_scale = kv_scales_tile[ni]
@@ -646,7 +660,7 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                         )),
                     )
                     with ir.InsertionPoint(scf.IfOp(is_writer).then_block):
-                        out_t[row, col] = fx.Float32(col_sum)
+                        out_row_t[col] = fx.Float32(col_sum)
                         scf.YieldOp([])
 
             scf.YieldOp([])

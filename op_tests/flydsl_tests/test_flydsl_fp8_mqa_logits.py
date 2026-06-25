@@ -135,3 +135,98 @@ def test_flydsl_fp8_mqa_logits(
             tri_logits.masked_fill(tri_neginf_mask, 0),
         )
         assert diff_tri < 1e-3, f"FlyDSL vs Triton {diff_tri=}"
+
+
+# ---------------------------------------------------------------------------
+# i32 byte-offset overflow regression test
+#
+# For row*stride*sizeof(f32) > 2^31-1 (i.e. row*stride > 536870912), the
+# output element offset computation overflows signed i32 in buffer_store,
+# causing silent writes to the wrong address.  The minimum shape that
+# triggers this has s_q=16385, s_kv=32768 (stride=32768): the element at
+# [16384, 32767] has byte offset 16384*32768*4 = 2147483648 = 2^31, which
+# overflows i32.  The output tensor is ~2.1 GB; the test is skipped if
+# insufficient GPU memory is available.
+# ---------------------------------------------------------------------------
+
+_OVERFLOW_MIN_FREE_GB = 3.0  # headroom above the 2.15 GB tensor itself
+
+
+def _has_enough_vram(gb: float) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    free, _ = torch.cuda.mem_get_info()
+    return free >= gb * 1e9
+
+
+@pytest.mark.skipif(
+    not _has_enough_vram(_OVERFLOW_MIN_FREE_GB),
+    reason=f"requires >{_OVERFLOW_MIN_FREE_GB} GB free GPU VRAM",
+)
+@pytest.mark.parametrize("num_heads,head_dim", [(64, 128)])
+@torch.inference_mode()
+def test_flydsl_fp8_mqa_logits_i32_overflow(num_heads: int, head_dim: int) -> None:
+    """Regression: i32 byte-offset overflow for row*stride*4 > 2^31-1.
+
+    Uses the minimum shape that overflows (s_q=16385, s_kv=32768) and checks
+    that the at-risk element [s_q-1, s_kv-1] is written correctly.
+    """
+    flydsl_fp8_mqa_logits = _flydsl_fp8_mqa_logits()
+
+    # s_kv=32768 → stride=32768 (256-aligned); row=16384 → row*stride*4=2^31 (overflow).
+    s_q, s_kv = 16385, 32768
+    torch.manual_seed(42)
+
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv_ref = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+
+    # Causal-style window: row i covers KV [0, i+1).  The last row (16384)
+    # covers the full [0, 32768) range, so col=32767 must be written.
+    # But that row's KV window is [0, 16385), clamped by the causal rule:
+    # use ke[i] = min(i + 1 + (s_kv - s_q), s_kv) = i + (s_kv - s_q + 1).
+    ks = torch.zeros(s_q, dtype=torch.int32, device="cuda")
+    ke = torch.clamp(
+        torch.arange(s_q, dtype=torch.int32, device="cuda") + (s_kv - s_q + 1),
+        max=s_kv,
+    )
+    # Verify the last row reaches col s_kv-1.
+    assert ke[-1].item() == s_kv, f"last ke={ke[-1].item()}, expected {s_kv}"
+
+    q_fp8 = q.to(e4m3_type)
+
+    # Use Triton as reference — it handles large shapes without materializing
+    # the full [H, s_q, s_kv] intermediate that ref_fp8_mqa_logits would need.
+    tri_logits = triton_logits(q_fp8, kv_fp8, scales, weights, ks, ke,
+                               clean_logits=True)
+
+    try:
+        logits = flydsl_fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke,
+                                        clean_logits=True)
+    except NotImplementedError as exc:
+        pytest.xfail(f"FlyDSL kernel not implemented yet: {exc}")
+
+    # Primary check: the at-risk element (last row, last col) must not be -inf
+    # and must match Triton.  Before the fix this position was silently written
+    # to the wrong address and remained -inf (the clean_logits pre-fill value).
+    at_risk_tri = tri_logits[-1, -1].item()
+    at_risk_got = logits[-1, -1].item()
+    assert at_risk_got != float("-inf"), (
+        "i32 overflow regression: logits[-1, -1] is -inf (element not written)"
+    )
+    assert abs(at_risk_got - at_risk_tri) / (abs(at_risk_tri) + 1e-6) < 1e-2, (
+        f"i32 overflow regression: logits[-1,-1]={at_risk_got:.4f} "
+        f"triton={at_risk_tri:.4f}"
+    )
+
+    # Broader check: full output matches Triton within tolerance.
+    # Mask -inf positions (outside each row's window) before calc_diff to avoid
+    # NaN from inf arithmetic inside the similarity formula.
+    neginf_mask = tri_logits == float("-inf")
+    diff = calc_diff(
+        logits.masked_fill(neginf_mask, 0),
+        tri_logits.masked_fill(neginf_mask, 0),
+    )
+    assert diff < 1e-3, f"i32 overflow shape: calc_diff vs Triton={diff:.2e}"
