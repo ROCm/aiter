@@ -2,9 +2,12 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """FlyDSL **layout-API** port of aiter ``gemm1_a4w4`` (MXFP4 MoE up/gate-proj).
 
-Variant: ``(BM=32, inline_quant=False, interleave=True)`` for both ``use_nt``
+Variant: ``(BM=32, inline_quant=False)`` for both ``use_nt`` and both gate modes
 (kSubBlocks=1, kMChunks=2, kAStages=3, kStages=2). ``use_nt`` is the B-load cache
 policy (tuned config BM32_NT vs BM32_CACHED): True -> non-temporal, False -> cached.
+``interleave`` picks the gate/up layout (True=interleaved, False=separated); it only
+changes the B-load column, the B-scale n-pack base, and the mfma opsel (the epilogue
+gate/up split is the same for both, since accm[J] holds the same logical (g/u, n0)).
 
 Layout-API pieces:
   * B load -> preshuffle ``fx.make_layout`` view + ``fx.copy`` into register
@@ -24,7 +27,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float4E2M1FN
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -137,6 +140,7 @@ def _gemm1_body_v2(
     K,
     INTER,
     NE,
+    interleave,
     b_nontemporal,
 ):
     # K-/INTER-derived sizes (compile-time Python ints; were the v1 *_for helpers).
@@ -201,9 +205,13 @@ def _gemm1_body_v2(
             llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
         )
 
-    # b_scale_s_base / _hi
-    mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
-    np_list = [mni_base, mni_base + fx.Int32(1)]
+    # b_scale_s_base / _hi (n-pack words; gate/up split differs by mode)
+    if const_expr(interleave):
+        mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
+        np_list = [mni_base, mni_base + fx.Int32(1)]
+    else:
+        np_gate = n_block_idx * fx.Int32(BN // 64) + wave
+        np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
     b_scale_s_base, b_scale_s_base_hi = [], []
     for mw in range_constexpr(2):
         base = (
@@ -311,8 +319,14 @@ def _gemm1_body_v2(
         fx.rocdl.BufferCopy128b(2 if b_nontemporal else 0), 32  # 4x i32 = 128b
     )
 
+    N0_HALF = N_OUT // 32  # separate-mode gate/up column split
+
     def _make_bq_view_for_jtile(j):
-        col = n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
+        if const_expr(interleave):
+            col = n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
+        else:
+            tile_il = n_block_idx * fx.Int32(16) + wave * fx.Int32(4) + fx.Int32(j)
+            col = ((tile_il & fx.Int32(1)) * fx.Int32(N0_HALF) + (tile_il >> fx.Int32(1))) * fx.Int32(16)
         col_base = rocdl.readfirstlane(T.i32, (e * fx.Int32(N_OUT) + col) * fx.Int32(KH4))
         i32_ptr_ty = fx.PointerType.get(
             T.i32, address_space=fx.AddressSpace.Global, alignment=16
@@ -397,8 +411,12 @@ def _gemm1_body_v2(
         )
 
     def mfma_cluster(stage, a_scale, bs_slot, J):
-        in_b = J % 2
-        sb = bs_slot[J // 2]
+        # interleave: mni=J//2 (n0), in_b=J%2 (gate/up); separate: swapped.
+        if const_expr(interleave):
+            mni, in_b = J // 2, J % 2
+        else:
+            mni, in_b = J % 2, J // 2
+        sb = bs_slot[mni]
         bJ0, bJ1 = _bq_frags[stage][J][0], _bq_frags[stage][J][1]
         for sub in range_constexpr(kSubBlocks):
             i0 = sub * 2 + 0
@@ -591,8 +609,6 @@ def compile_gemm1_a4w4_port(
             f"mxfp4_gemm1_v2 supports only (BM=32, inline_quant=False); "
             f"got (BM={BM}, inline_quant={inline_quant})"
         )
-    if not interleave:
-        raise AssertionError("mxfp4_gemm1_v2 supports interleave=True only (v1 handles sep).")
 
     _K, _INTER, _NE = D_HIDDEN, D_INTER, NE
     assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
@@ -654,6 +670,7 @@ def compile_gemm1_a4w4_port(
                 K=_K,
                 INTER=_INTER,
                 NE=_NE,
+                interleave=interleave,
                 b_nontemporal=b_nontemporal,
             )
 
