@@ -121,6 +121,7 @@ else:
     from .ops.fused_qknorm_idxrqknorm import (  # noqa: F401,E402
         fused_qknorm_idxrqknorm,
     )
+    from .ops.minimax_m3_index_score import *  # noqa: F403,E402
     from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
     from .ops.fused_qk_rmsnorm_group_quant import *  # noqa: F403,E402
     from .ops.groupnorm import *  # noqa: F403,E402

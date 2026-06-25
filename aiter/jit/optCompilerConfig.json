@@ -1078,6 +1078,18 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_minimax_m3_index_score": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/minimax_m3_index_score_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/minimax_m3_index_score.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_fused_qk_norm_rope_cache_quant_shuffle": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_qk_norm_rope_cache_quant_pybind.cu'",
