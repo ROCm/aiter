@@ -742,6 +742,72 @@ def _bench_fn(fn, *args, **kwargs):
 # -- Correctness tests ---------------------------------------------------
 
 
+def _assert_mean_abs_within(out, ref, *, mean_atol, label):
+    """Guard the *mean* absolute error, not just the per-element worst case.
+
+    ``torch.testing.assert_close``'s ``atol`` only bounds the single worst
+    element, which for bf16 K5 over a long chunked recurrence sits close to
+    the 5e-2 element tolerance (a few outlier tokens at the tail of the
+    33-segment chain). The mean abs error, by contrast, is ~2-3e-3 in
+    practice and is what actually moves when an implementation regresses the
+    *whole* distribution (e.g. a gating / accumulation bug) without yet
+    tripping any single element past 5e-2. Bound it here.
+    """
+    mean_abs = (out.float() - ref.float()).abs().mean().item()
+    assert mean_abs <= mean_atol, (
+        f"{label}: mean abs error {mean_abs:.3e} exceeds mean_atol "
+        f"{mean_atol:.3e} (per-element atol may still pass; this guards "
+        f"whole-distribution drift)"
+    )
+
+
+def _assert_close_lowmem(
+    a, b, *, atol, rtol, msg, chunk_rows=1 << 22
+):
+    """Memory-frugal elementwise ``|a-b| <= atol + rtol*|b|`` check.
+
+    Equivalent in semantics to ``torch.testing.assert_close(a, b, atol, rtol)``
+    but streams over a flattened view in row chunks so it never materialises
+    more than one chunk-sized fp32 temporary. Used for the kv_naive/triton_vk
+    consistency check, where the h / v_new tensors at long context are
+    multi-GiB and the stock ``assert_close`` (which up-casts both whole tensors
+    and builds a full mismatch report) OOMs on a 256 GiB card. On mismatch it
+    reports the worst element's abs error / allowed tol rather than dumping the
+    entire tensor.
+    """
+    assert a.shape == b.shape, f"{msg}: shape {tuple(a.shape)} vs {tuple(b.shape)}"
+    af = a.reshape(-1)
+    bf = b.reshape(-1)
+    n = af.numel()
+    worst_abs = 0.0
+    worst_allowed = 0.0
+    worst_idx = -1
+    n_bad = 0
+    for s in range(0, n, chunk_rows):
+        e = min(s + chunk_rows, n)
+        ac = af[s:e].float()
+        bc = bf[s:e].float()
+        abs_e = (ac - bc).abs()
+        allowed = atol + rtol * bc.abs()
+        bad = abs_e > allowed
+        nb = int(bad.sum().item())
+        if nb:
+            n_bad += nb
+            # track the single worst (abs - allowed) margin in this chunk
+            margin = abs_e - allowed
+            mi = int(margin.argmax().item())
+            if abs_e[mi].item() - allowed[mi].item() > worst_abs - worst_allowed:
+                worst_abs = abs_e[mi].item()
+                worst_allowed = allowed[mi].item()
+                worst_idx = s + mi
+        del ac, bc, abs_e, allowed, bad
+    assert n_bad == 0, (
+        f"{msg}: {n_bad}/{n} elements exceed atol={atol:g}+rtol={rtol:g}*|b|. "
+        f"Worst @ flat idx {worst_idx}: abs_err={worst_abs:.3e} > "
+        f"allowed={worst_allowed:.3e}."
+    )
+
+
 def _assert_k5_outputs_match_ref(
     h_out,
     vn_out,
@@ -754,6 +820,7 @@ def _assert_k5_outputs_match_ref(
     label,
     atol=5e-2,
     rtol=5e-2,
+    mean_atol=5e-3,
 ):
     """Compare a K5 backend's outputs against the PyTorch FP32 reference.
 
@@ -766,28 +833,45 @@ def _assert_k5_outputs_match_ref(
     f32-state is one ``truncf`` on the final_state, which stays well within
     bf16 ULP for sane inputs and never exceeds the historical f32-state
     margins.
+
+    Two complementary bounds are enforced per output:
+      * ``atol`` / ``rtol`` (5e-2): the per-element worst case.
+      * ``mean_atol`` (5e-3): the mean abs error, which catches a regression
+        that shifts the whole distribution before any single element trips
+        the looser element tolerance. Measured mean abs is ~2-3e-3 on the
+        varlen-32k-aws shape, so 5e-3 leaves ~2x headroom over bf16 noise.
     """
+    h_out_f = h_out.float()
+    vn_out_f = _normalize_opt_v_new(vn_out).float()
     torch.testing.assert_close(
-        h_out.float(),
+        h_out_f,
         h_ref.float(),
         atol=atol,
         rtol=rtol,
         msg=f"{label}: h mismatch",
     )
+    _assert_mean_abs_within(h_out_f, h_ref, mean_atol=mean_atol, label=f"{label} h")
     torch.testing.assert_close(
-        _normalize_opt_v_new(vn_out).float(),
+        vn_out_f,
         vn_ref.float(),
         atol=atol,
         rtol=rtol,
         msg=f"{label}: v_new mismatch",
     )
+    _assert_mean_abs_within(
+        vn_out_f, vn_ref, mean_atol=mean_atol, label=f"{label} v_new"
+    )
     if output_final_state:
+        fs_out_f = fs_out.float()
         torch.testing.assert_close(
-            fs_out.float(),
+            fs_out_f,
             fs_ref.float(),
             atol=atol,
             rtol=rtol,
             msg=f"{label}: final_state mismatch",
+        )
+        _assert_mean_abs_within(
+            fs_out_f, fs_ref, mean_atol=mean_atol, label=f"{label} final_state"
         )
     else:
         assert fs_out is None, f"{label}: expected None final_state"
@@ -1146,8 +1230,12 @@ class TestCorrectness:
             context_lens, args=args
         )
 
+        # kv_naive consumes k PRE-TRANSPOSED to [B, Hg, K, T] (the caller owns
+        # the transpose; the host no longer permutes). The reference still
+        # takes the original token-major [B, T, Hg, K] k.
+        k_kvn = k.permute(0, 2, 3, 1).contiguous()
         h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
-            k,
+            k_kvn,
             w_c,
             u_c,
             g=g,
@@ -1216,6 +1304,75 @@ class TestCorrectness:
             label="triton_vk",
         )
 
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_consistency_kv_naive_vs_triton_vk(self, args: PrefillArgs):
+        """Direct kv_naive <-> triton_vk consistency (NOT vs the FP32 ref).
+
+        Both backends consume identical inputs (k / w_c / u_c / g / h0 / cu)
+        and return VK-ordered outputs, and they implement the same bf16 +
+        exp2 VK-layout K5 recurrence -- so they should agree almost bit for
+        bit. Measured on varlen-32k-aws: h max ~1e-4, v_new max ~1e-3,
+        final_state bit-identical. This is a *far* tighter regression guard
+        than the 5e-2 element tolerance against the FP32 reference (which is
+        dominated by shared bf16 round-off): a real bug in either kernel that
+        the loose ref tolerance would wave through shows up here as a >1e-3
+        divergence between the two backends. Tolerance is set to 2e-3 to
+        absorb only the residual bf16 last-bit ordering noise in v_new.
+        """
+        if args.ssm_state_dtype != torch.float32:
+            pytest.skip("Triton VK reference only supports f32 SSM state.")
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        # kv_naive needs k pre-transposed to [B, Hg, K, T]; triton_vk keeps the
+        # original token-major [B, T, Hg, K] layout.
+        k_kvn = k.permute(0, 2, 3, 1).contiguous()
+        h_kvn, vn_kvn, fs_kvn = chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
+            k_kvn,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_vk, vn_vk, fs_vk = chunk_gated_delta_rule_fwd_h_opt_vk(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        atol = rtol = 2e-3
+        # Compare directly in the backends' native layout/dtype. The big h /
+        # v_new tensors at long context (e.g. Hv64 T=128000, NT~2000 chunks)
+        # are multi-GiB each; ``assert_close(a.float(), b.float())`` would
+        # alloc several extra full-size fp32 copies (plus more inside
+        # assert_close's mismatch-report path) and OOM. ``_assert_close_lowmem``
+        # streams the ``|a-b| <= atol + rtol*|b|`` check in chunks instead.
+        _assert_close_lowmem(
+            h_kvn, h_vk, atol=atol, rtol=rtol,
+            msg="kv_naive vs triton_vk: h mismatch",
+        )
+        # v_new is head-major [B,H,T,V] in both backends; compare as-is (the
+        # shared permutation to [B,T,H,V] is a no-op for an elementwise check).
+        _assert_close_lowmem(
+            vn_kvn, vn_vk, atol=atol, rtol=rtol,
+            msg="kv_naive vs triton_vk: v_new mismatch",
+        )
+        if args.output_final_state:
+            _assert_close_lowmem(
+                fs_kvn, fs_vk, atol=atol, rtol=rtol,
+                msg="kv_naive vs triton_vk: final_state mismatch",
+            )
+        else:
+            assert fs_kvn is None and fs_vk is None
+
     @pytest.mark.skipif(
         not _HAS_VLLM_K5,
         reason="vllm.model_executor.layers.fla.ops.chunk_delta_h not importable",
@@ -1278,7 +1435,7 @@ class TestCorrectness:
         # K5 returned ``v_new`` in head-major [B, H, T, V] layout (aiter's
         # convention). ``h`` and ``final_state`` follow the same vk layout as
         # the aiter ``opt_vk`` path, so we compare them directly.
-        atol, rtol = 5e-2, 5e-2
+        atol, rtol, mean_atol = 5e-2, 5e-2, 5e-3
         torch.testing.assert_close(
             h_vllm.float(),
             h_ref.float(),
@@ -1286,12 +1443,16 @@ class TestCorrectness:
             rtol=rtol,
             msg="vllm: h mismatch",
         )
+        _assert_mean_abs_within(h_vllm, h_ref, mean_atol=mean_atol, label="vllm h")
         torch.testing.assert_close(
             vn_vllm.float(),
             vn_ref.float(),
             atol=atol,
             rtol=rtol,
             msg="vllm: v_new mismatch",
+        )
+        _assert_mean_abs_within(
+            vn_vllm, vn_ref, mean_atol=mean_atol, label="vllm v_new"
         )
         if args.output_final_state:
             torch.testing.assert_close(
@@ -1300,6 +1461,9 @@ class TestCorrectness:
                 atol=atol,
                 rtol=rtol,
                 msg="vllm: final_state mismatch",
+            )
+            _assert_mean_abs_within(
+                fs_vllm, fs_ref, mean_atol=mean_atol, label="vllm final_state"
             )
         else:
             assert fs_vllm is None, "vllm: expected None final_state"
@@ -1353,13 +1517,16 @@ class TestCorrectness:
             else None
         )
 
-        atol, rtol = 5e-2, 5e-2
+        atol, rtol, mean_atol = 5e-2, 5e-2, 5e-3
         torch.testing.assert_close(
             h_origin_opt_vk.float(),
             h_ref.float(),
             atol=atol,
             rtol=rtol,
             msg="triton_origin_opt: h mismatch",
+        )
+        _assert_mean_abs_within(
+            h_origin_opt_vk, h_ref, mean_atol=mean_atol, label="triton_origin_opt h"
         )
         torch.testing.assert_close(
             vn_origin_opt.float(),
@@ -1368,6 +1535,10 @@ class TestCorrectness:
             rtol=rtol,
             msg="triton_origin_opt: v_new mismatch",
         )
+        _assert_mean_abs_within(
+            vn_origin_opt, vn_ref, mean_atol=mean_atol,
+            label="triton_origin_opt v_new",
+        )
         if args.output_final_state:
             torch.testing.assert_close(
                 fs_origin_opt_vk.float(),
@@ -1375,6 +1546,10 @@ class TestCorrectness:
                 atol=atol,
                 rtol=rtol,
                 msg="triton_origin_opt: final_state mismatch",
+            )
+            _assert_mean_abs_within(
+                fs_origin_opt_vk, fs_ref, mean_atol=mean_atol,
+                label="triton_origin_opt final_state",
             )
 
 
@@ -1409,6 +1584,12 @@ def _run_perf_comparison(args: PrefillArgs):
         if h0_triton_vk is not None
         else None
     )
+
+    # kv_naive requires k pre-transposed to [B, Hg, K, T]. Do it ONCE outside
+    # the timed window (the caller owns the transpose now), so the benchmarked
+    # kv_naive time reflects the kernel alone -- matching the other forks which
+    # consume the token-major k without a host permute.
+    k_kvn = k.permute(0, 2, 3, 1).contiguous()
 
     # K5 launch closures: each invokes the K5 host wrapper of its backend.
     def flydsl_launch():
@@ -1457,7 +1638,7 @@ def _run_perf_comparison(args: PrefillArgs):
 
     def flydsl_kv_naive_launch():
         chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
-            k=k,
+            k=k_kvn,
             w=w_c,
             u=u_c,
             g=g,
@@ -1835,12 +2016,21 @@ class TestStateDtypeBF16:
         # length) for sane inputs.
         atol = 5e-2
         rtol = 5e-2
+        # bf16-state only diverges from f32-state by one bf16 trunc on the SSM
+        # state (h / v_new are bit-identical; final_state mean abs ~1.6e-5,
+        # max ~2.4e-4 in practice). A 1e-3 mean bound -- far tighter than the
+        # 5e-3 used against the FP32 ref -- guards this feature's narrow
+        # numeric envelope without false positives.
+        mean_atol = 1e-3
         torch.testing.assert_close(
             h_bf16.float(),
             h_f32.float(),
             atol=atol,
             rtol=rtol,
             msg="bf16-state vs f32-state: h mismatch",
+        )
+        _assert_mean_abs_within(
+            h_bf16, h_f32, mean_atol=mean_atol, label="bf16-state vs f32-state h"
         )
         if vn_f32 is not None:
             torch.testing.assert_close(
@@ -1850,6 +2040,10 @@ class TestStateDtypeBF16:
                 rtol=rtol,
                 msg="bf16-state vs f32-state: v_new mismatch",
             )
+            _assert_mean_abs_within(
+                vn_bf16, vn_f32, mean_atol=mean_atol,
+                label="bf16-state vs f32-state v_new",
+            )
         if args.output_final_state:
             torch.testing.assert_close(
                 fs_bf16.float(),
@@ -1857,6 +2051,10 @@ class TestStateDtypeBF16:
                 atol=atol,
                 rtol=rtol,
                 msg="bf16-state vs f32-state: final_state mismatch",
+            )
+            _assert_mean_abs_within(
+                fs_bf16, fs_f32, mean_atol=mean_atol,
+                label="bf16-state vs f32-state final_state",
             )
 
     @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)

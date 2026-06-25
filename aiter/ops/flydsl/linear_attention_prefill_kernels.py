@@ -1076,7 +1076,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     resolved_state_dtype = _resolve_state_dtype(initial_state, state_dtype)
     state_bf16 = resolved_state_dtype is torch.bfloat16
 
-    B, T, Hg, K = k.shape
+    # The kv_naive fork consumes k pre-transposed to [B, Hg, K, T_flat] (K
+    # major, T innermost so GEMM2 sees each BT row contiguous). This is now the
+    # fork's REQUIRED input layout -- the caller (upstream / tests) owns the
+    # transpose, the host does NOT permute. Every other fork keeps the original
+    # token-major [B, T_flat, Hg, K] layout.
+    _kv_naive_k_pretransposed = _fork == "kv_naive"
+    if _kv_naive_k_pretransposed:
+        B, Hg, K, T = k.shape
+    else:
+        B, T, Hg, K = k.shape
     H = w.shape[1]
     V = u.shape[-1]
     T_flat = w.shape[2]
@@ -1120,6 +1129,18 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             f"FlyDSL K5: unknown ``_fork`` {_fork!r}; expected one of "
             f"{sorted(_K5_FORKS)} or None (baseline)."
         )
+
+    # kv_naive is a BV==64-only kernel. Pin BV=64 directly (ignore the
+    # heuristic) so it never silently falls back to the baseline kernel -- the
+    # baseline expects token-major k, which would mis-read the [B, Hg, K, T]
+    # layout kv_naive requires. V must be a multiple of 64 for this to be legal.
+    if _fork == "kv_naive":
+        if V % 64 != 0:
+            raise ValueError(
+                f"FlyDSL K5 kv_naive: requires V % 64 == 0 (BV=64-only fork); "
+                f"got V={V}."
+            )
+        BV = 64
 
     # Fork routing. Each fork maps to its OWN compiled kernel (distinct
     # ``_get_or_compile*`` cache namespace) -- no shared flag dispatch:
@@ -1221,15 +1242,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         if g_log2_scaled:
             gk = gk * _RCP_LN2
 
-    # EXPERIMENT (vn-direct, kv_naive only): pre-transpose k
-    # [B, T_flat, Hg, K] -> [B, Hg, K, T_flat] so GEMM2 sees BT row-contiguous.
-    # ONLY when the kv_naive VWARP kernel is actually selected (BV==64). When
-    # BV!=64 the fork falls back to the baseline ``_get_or_compile`` kernel,
-    # which expects the ORIGINAL [B, T_flat, Hg, K] layout -- transposing there
-    # would feed it mis-laid-out k and silently corrupt the result.
-    if _kv_naive_active:
-        k = k.permute(0, 2, 3, 1).contiguous()
-
+    # kv_naive (vn-direct): k already arrives pre-transposed as
+    # [B, Hg, K, T_flat] (the caller owns the transpose), so GEMM2 sees each BT
+    # row contiguous with no host-side permute/contiguous. The kernel is pinned
+    # to BV=64 above, so there is no baseline fallback that would expect the
+    # original token-major layout.
     h = k.new_empty(h_shape)
     v_new_buf = k.new_empty(vn_shape, dtype=vn_dtype)
     final_state = (
@@ -1457,8 +1474,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
     coalesced KV h-store (h in [..., K, V], host returns a transposed VK view)
     as ``chunk_gated_delta_rule_fwd_h_flydsl_kv``, but with all prefetch /
     software-pipeline scheduling removed -- used to baseline the raw bottleneck
-    structure in a trace before re-designing the pipeline. Used only when the
-    chosen BV is 64, else it falls back to the baseline."""
+    structure in a trace before re-designing the pipeline.
+
+    BV is pinned to 64 (this is a BV==64-only fork; it never falls back to the
+    baseline). ``k`` MUST be passed PRE-TRANSPOSED to ``[B, Hg, K, T_flat]``
+    (K major, T innermost) -- the caller owns the transpose so GEMM2 reads each
+    BT row contiguously with no host-side permute. (All other flydsl forks take
+    the token-major ``[B, T_flat, Hg, K]`` layout instead.)"""
     return chunk_gated_delta_rule_fwd_h_flydsl(
         k,
         w,
