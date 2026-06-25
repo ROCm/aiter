@@ -127,6 +127,7 @@ def compile_mxscale_gemm(
     grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
+    swiglu_limit: float | None = None,
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
     kernel_tag: str = "gemm",
@@ -1634,8 +1635,9 @@ def compile_mxscale_gemm(
             def _stage1_act_mul_scalar(g, u):
                 one = arith.constant(1.0, type=T.f32)
                 alpha = arith.constant(1.702, type=T.f32)
-                limit = arith.constant(7.0, type=T.f32)
-                neg_limit = arith.constant(-7.0, type=T.f32)
+                _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
+                limit = arith.constant(_lim, type=T.f32)
+                neg_limit = arith.constant(-_lim, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
                 if const_expr(stage1_act_mode == "swiglu"):
                     g = arith.minimumf(g, limit)
@@ -1647,6 +1649,9 @@ def compile_mxscale_gemm(
                         T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
                     )
                     return g * sig * (u + one)
+                if const_expr(swiglu_limit is not None):
+                    g = arith.minimumf(g, limit)
+                    u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                 return _stage1_silu_elem(g) * u
 
             def _stage1_act_mul_vec8(gate_v8, up_v8):

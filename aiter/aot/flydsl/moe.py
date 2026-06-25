@@ -70,8 +70,14 @@ def _parse_optional_float(value, source: str) -> float | None:
         raise ValueError(f"{source} must be a float, got {value!r}") from e
 
 
-def _row_swiglu_limit(row: dict[str, str]) -> float:
-    return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
+def _row_swiglu_limit(row: dict[str, str]) -> float | None:
+    limit = _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit")
+    # Treat 0.0 (and the merge fill default) the same as None: a 0 clamp is
+    # meaningless and matches the reference's `if swiglu_limit:` truthiness,
+    # so "no column", empty, and 0 all mean "no clamp".
+    if limit == 0.0:
+        return None
+    return limit
 
 
 def parse_csv(csv_path: str):
@@ -209,7 +215,7 @@ def _precompile_to_cache(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     stage1_fuse_quant=None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float | None = None,
     k_wave: int = 1,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
@@ -356,7 +362,7 @@ def _precompile_to_cache(
                 _padded_rows * _padded_cols, dtype=torch.uint8, device=dev
             )
         if a_dtype == "fp8":
-            if act == "silu" and swiglu_limit == 0.0:
+            if act == "silu" and swiglu_limit is None:
                 # fused_moe_2stages uses fused_quant_fp8_sort for this path.
                 rows = (max_num_tokens_padded + 31) // 32 * 32
                 cols = (inter_dim + 31) // 32

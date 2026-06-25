@@ -95,7 +95,7 @@ def compile_mixed_moe_gemm1(
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float | None = None,
     k_wave: int = 1,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
@@ -1901,11 +1901,11 @@ def compile_mixed_moe_gemm1(
 
                 def silu_mul_vec4(gate_v4, up_v4):
                     """Element-wise silu(gate) * up on vec4_f32.
-                    When swiglu_limit != 0, clamp gate <= limit and
+                    When swiglu_limit is set, clamp gate <= limit and
                     -limit <= up <= limit before applying silu(gate) * up.
                     """
                     result_elems = []
-                    if const_expr(swiglu_limit != 0):
+                    if const_expr(swiglu_limit is not None):
                         limit = arith.constant(float(swiglu_limit), type=f32)
                         neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     for ei in range_constexpr(4):
@@ -1915,7 +1915,7 @@ def compile_mixed_moe_gemm1(
                         u = vector.extract(
                             up_v4, static_position=[ei], dynamic_position=[]
                         )
-                        if const_expr(swiglu_limit != 0):
+                        if const_expr(swiglu_limit is not None):
                             g = arith.minimumf(g, limit)
                             u = arith.minimumf(u, limit)
                             u = arith.maximumf(u, neg_limit)
@@ -1925,14 +1925,14 @@ def compile_mixed_moe_gemm1(
                 def swiglu_mul_vec4(gate_v4, up_v4):
                     """Element-wise swiglu(gate, up) on vec4_f32.
                     swiglu(g, u) = g * sigmoid(alpha * g) * (u + 1)
-                    When swiglu_limit != 0, clamp gate <= limit and
+                    When swiglu_limit is set, clamp gate <= limit and
                     -limit <= up <= limit before the activation.
                     """
                     result_elems = []
                     alpha = arith.constant(1.702, type=f32)
                     one = arith.constant(1.0, type=f32)
                     neg_log2e = arith.constant(-1.4426950408889634, type=f32)
-                    if const_expr(swiglu_limit != 0):
+                    if const_expr(swiglu_limit is not None):
                         limit = arith.constant(float(swiglu_limit), type=f32)
                         neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     else:

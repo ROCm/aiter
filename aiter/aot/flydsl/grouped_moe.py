@@ -85,6 +85,12 @@ def _as_int(value, default: int | None = None) -> int | None:
     return int(value)
 
 
+def _as_swiglu_limit(value) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return float(value)
+
+
 def _scheduler_variants(row, base_job):
     # Production dispatch (grouped_moe_gfx1250._maybe_grouped_gfx1250_a8w4_moe)
     # hardcodes grouped_persistent_m=False and expert_sched_mode=False; the only
@@ -147,6 +153,7 @@ def parse_csv(csv_path: str):
                 "persistent_workers": _as_int(row.get("persistent_workers"), None),
                 "stage1_weight_layout": row.get("stage1_weight_layout") or "gguu",
                 "act": "swiglu" if "Swiglu" in row.get("act_type", "") else "silu",
+                "swiglu_limit": _as_swiglu_limit(row.get("swiglu_limit")),
                 "data_format": (
                     "fp4" if "float4" in row.get("q_dtype_a", "") else "a8w4"
                 ),
@@ -267,6 +274,7 @@ def compile_one_config(**job):
         )
         exe1 = compiler1(
             act=job["act"],
+            swiglu_limit=job["swiglu_limit"],
             stage1_weight_layout=job["stage1_weight_layout"],
             split_k=job["split_k1"],
             **common,

@@ -49,7 +49,7 @@ def build_silu_and_mul_fq_module(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float | None = None,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -277,7 +277,7 @@ def build_silu_and_mul_fq_module(
                     swiglu_neg_alpha_log2e = arith.constant(
                         -1.4426950408889634 * 1.702, type=f32
                     )
-                    if const_expr(swiglu_limit != 0):
+                    if const_expr(swiglu_limit is not None):
                         _limit = arith.constant(float(swiglu_limit), type=f32)
                         _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     else:
@@ -307,7 +307,7 @@ def build_silu_and_mul_fq_module(
                             linear = arith.minimumf(linear, _limit)
                             linear = arith.maximumf(linear, _neg_limit)
                             t = gate * swiglu_neg_alpha_log2e
-                        elif const_expr(swiglu_limit != 0 and act != "swiglu"):
+                        elif const_expr(swiglu_limit is not None and act != "swiglu"):
                             gate = arith.minimumf(gate, _limit)
                             linear = arith.minimumf(linear, _limit)
                             linear = arith.maximumf(linear, _neg_limit)
