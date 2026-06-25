@@ -864,6 +864,7 @@ def compile_sparse_mla_prefill_paged(
     v_dim: int = 512,
     cache_layout: str = "fp8_ds_mla",
     scale_mode: str = "none",
+    block_n: int = 32,
 ):
     """Build a paged sparse MLA prefill launcher (gfx942).
 
@@ -905,11 +906,49 @@ def compile_sparse_mla_prefill_paged(
         raise NotImplementedError(f"v_dim must be 512, got {V_HEAD_DIM}")
     if QK_HEAD_DIM % KV_NUM_COLS != 0 or QK_HEAD_DIM % Q_ELEM_PER_ROW != 0:
         raise NotImplementedError(f"head_dim must be a multiple of 64, got {QK_HEAD_DIM}")
+
+    # ---- BLOCK_N (KV tile rows) as a compile-time constant ----
+    # All KV / V^T / softmax LDS constants below shadow the module-level (=32)
+    # defaults so the kernel body (a closure) picks them up.  The gfx942 V2
+    # software-transpose KV layout (KvManagerV2 + VtManagerV1) is hardwired to
+    # KV_ROWS_PER_SUB == 4 (i.e. BLOCK_N == 32): the per-warp row mapping, the
+    # K/V LDS readers, and the 4x8 register transpose all assume 4 rows/sub
+    # split across two 16-row MFMA sub-tiles.  Other BLOCK_N values are gated
+    # below (see docs/issues/sparse-mla-prefill-blockn).
+    BLOCK_N = int(block_n)
+    if BLOCK_N % NUM_WARPS != 0:
+        raise NotImplementedError(f"block_n must be divisible by NUM_WARPS={NUM_WARPS}, got {BLOCK_N}")
+    if BLOCK_N % MFMA_N != 0:
+        raise NotImplementedError(f"block_n must be divisible by MFMA_N={MFMA_N}, got {BLOCK_N}")
+    KV_ROWS_PER_SUB = BLOCK_N // NUM_WARPS
+    KV_NUM_SUBS = BLOCK_N // KV_ROWS_PER_SUB  # == NUM_WARPS
+    KV_SUB_BYTES = KV_ROWS_PER_SUB * KV_BYTES_PER_ROW + KV_PAD_DW * 4
+    KV_BLOCK_BYTES = KV_SUB_BYTES * KV_NUM_SUBS
+    P_VALS_PER_THR = (BLOCK_N * MFMA_M) // WARP_SIZE
+    SZ_LDS_VT = VT_NUM_SUB_BLKS * ((BLOCK_N // VT_NUM_SUB_BLKS) * V_HEAD_DIM + 16 * 4)
+    P_LDS_VT = 0
+    P_LDS_Q = SZ_LDS_VT
+
     KV_NUM_BLOCKS = QK_HEAD_DIM // KV_NUM_COLS  # 8 (512) or 9 (576)
     SZ_LDS_KV = KV_BLOCK_BYTES * KV_NUM_BLOCKS
     P_LDS_KV_0 = P_LDS_Q + SZ_LDS_Q
     TOTAL_LDS_BYTES = P_LDS_KV_0 + SZ_LDS_KV
-    assert TOTAL_LDS_BYTES <= 65536, f"gfx942 LDS cap: need {TOTAL_LDS_BYTES} B"
+    # BLOCK_N=64 @ head_dim=576 lands here (TOTAL_LDS_BYTES=79424 > 65536).
+    if TOTAL_LDS_BYTES > 65536:
+        raise NotImplementedError(
+            f"block_n={BLOCK_N} needs {TOTAL_LDS_BYTES} B LDS > 65536 B gfx942 cap "
+            f"(head_dim={QK_HEAD_DIM}); larger tiles require gfx950 HW V-transpose."
+        )
+    assert SZ_LDS_O16 <= SZ_LDS_KV, "Output LDS must fit in the KV buffer region"
+    # The V2 software-transpose data layout is only correct for 4 rows/sub.
+    if KV_ROWS_PER_SUB != 4:
+        raise NotImplementedError(
+            f"block_n={BLOCK_N} (KV_ROWS_PER_SUB={KV_ROWS_PER_SUB}) is unsupported on the "
+            "gfx942 V2 software-transpose path, which hardwires 4 rows/sub (BLOCK_N=32). "
+            "BLOCK_N=16 needs a KvManagerV2 row-mapping + V-transpose redesign; "
+            "BLOCK_N=64 needs gfx950 ds_read_b64_tr_b8. "
+            "See docs/issues/sparse-mla-prefill-blockn."
+        )
     Q_NUM_PASSES = QK_HEAD_DIM // Q_ELEM_PER_ROW
     NUM_NOPE_ITERS = QK_HEAD_DIM // (MFMA_K * 2)
     # Flat (GLM) rows have no scale region and store rope as fp8, so the row
@@ -1779,12 +1818,12 @@ def compile_sparse_mla_prefill(
         raise NotImplementedError(f"requires v_dim={V_HEAD_DIM}, got {v_dim}")
     if head_dim not in (512, 576):
         raise NotImplementedError(f"requires head_dim in (512, 576), got {head_dim}")
-    if block_n != BLOCK_N:
-        raise NotImplementedError(f"block_n must be {BLOCK_N}")
     if split_kv:
         raise NotImplementedError("split_kv is Phase C")
 
     if not packed:
+        if block_n != BLOCK_N:
+            raise NotImplementedError(f"flat (Phase A) path supports block_n={BLOCK_N} only")
         if head_dim != QK_HEAD_DIM:
             raise NotImplementedError("flat (Phase A) path supports head_dim=512 only; use packed=True")
         if num_regions != 1 or has_sink or qk_split:
@@ -1835,4 +1874,5 @@ def compile_sparse_mla_prefill(
         v_dim=v_dim,
         cache_layout=cache_layout,
         scale_mode=scale_mode,
+        block_n=block_n,
     )

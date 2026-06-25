@@ -268,6 +268,7 @@ def flydsl_sparse_mla_prefill(
     q_req: torch.Tensor | None = None,  # [num_queries] int32 (only if single_request=False)
     num_kv_rows: int | None = None,
     single_request: bool = True,
+    block_n: int = 32,  # KV tile rows (compile-time); gfx942 V2 path supports 32 only
     stream: torch.cuda.Stream | None = None,
 ) -> None:
     """Run sparse MLA prefill in-place into ``out``.
@@ -303,7 +304,7 @@ def flydsl_sparse_mla_prefill(
         exe = _get_kernel(
             head_dim=head_dim, v_dim=v_dim, num_regions=1, has_sink=False,
             r0_dtype="fp8", r0_fnuz=True, r1_dtype="fp8", r1_fnuz=True,
-            qk_split=False, block_n=32, block_h=16, split_kv=False, packed=False, scale_mode="none",
+            qk_split=False, block_n=block_n, block_h=16, split_kv=False, packed=False, scale_mode="none",
             softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=True,
             cache_layout="fp8_ds_mla",
         )
@@ -342,7 +343,7 @@ def flydsl_sparse_mla_prefill(
     exe = _get_kernel(
         head_dim=head_dim, v_dim=v_dim, num_regions=1, has_sink=has_sink,
         r0_dtype="fp8", r0_fnuz=True, r1_dtype="fp8", r1_fnuz=True,
-        qk_split=not is_glm, block_n=32, block_h=16, split_kv=False, packed=True,
+        qk_split=not is_glm, block_n=block_n, block_h=16, split_kv=False, packed=True,
         scale_mode=kernel_scale_mode,
         softmax_scale=base_scale, single_request=single_request,
         cache_layout=cache_layout,
