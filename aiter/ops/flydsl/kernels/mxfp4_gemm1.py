@@ -217,7 +217,7 @@ def _lds_swizzle_mask_f8(row):
     column by (row & 7); spreads a 16-lane group's 128-bit ds_reads across all 32
     banks (8-cycle optimum vs 16-cycle unswizzled). +16-invariant like the fp4
     mask, so the read can key on lane_mod_16 across all M-chunks."""
-    return (row & fx.Int32(7)) << fx.Int32(4)
+    return (row & fx.Int32(15)) << fx.Int32(4)
 
 
 # -- epilog math helpers (HIP mxfp4_epilogs.hpp 87-122 + mxfp4_gemm_common.hpp) -
