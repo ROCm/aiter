@@ -9,7 +9,7 @@ def test_port_module_imports_and_constants():
     assert callable(port.compile_gemm1_a4w4_port)
     assert callable(port.gemm1_grid)
     assert port.n_out_for(512) == 1024
-    assert port.num_n_blocks_for(512, 256) == 4
+    assert port.num_n_blocks_for(port.n_out_for(512), 256) == 4
     assert port.k_tiles_total_for(7168, 256) == 28
 
 

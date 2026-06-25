@@ -12,87 +12,51 @@ from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, roc
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from .mxfp4_gemm_common import (
+    kStages,
+    kBS_stride_k0_dw,
+    _raw,
+    _lds_ptr3,
+    _lds_base_ptr3,
+    _gep3,
+    _global_base_ptr1,
+    _gep1,
+    _global_ptr1,
+    _buffer_rsrc,
+    _lds_swizzle_mask,
+    _fabs_f32,
+    _e8m0_from_amax,
+    _inline_dpp_quad_amax,
+    kmchunks_for,
+    lds_acc_bytes_for,
+    k_half_for,
+    k_tiles_total_for,
+    kunroll_for,
+    kas_c_k1_for,
+    kbs_stride_n0_dw_for,
+    kas_per_chunk_dw_for,
+    num_n_blocks_for,
+    kbs_per_expert_dw_for,
+    bq_bytes_for,
+    bscale_bytes_for,
+)
 
-kStages = 2
 NUM_CU = 256
 PORT_XCD_SWIZZLE = int(os.environ.get("PORT_XCD_SWIZZLE", "-1"))
-
-kBS_stride_k0_dw = 64
-
-
-def k_half_for(k):
-    return k // 2
-
-
-def k_tiles_total_for(k, BK):
-    return k // BK
-
-
-def kunroll_for(k, BK):
-    return k_tiles_total_for(k, BK) - kStages
-
-
-def kbs_c_k1_for(k):
-    return (k // 32) // 4 // 2
-
-
-def kbs_stride_n0_dw_for(k):
-    return kbs_c_k1_for(k) * 64
-
-
-def kas_c_k1_for(k):
-    return (k // 32) // 4 // 2
-
-
-def kas_per_chunk_dw_for(k):
-    return kas_c_k1_for(k) * 64
-
-
-def num_n_blocks_for(n_out, BN):
-    return n_out // BN
-
-
-def kbs_per_expert_dw_for(n_out, k):
-    return (n_out // 16 // 2) * kbs_stride_n0_dw_for(k)
 
 
 def aq_bytes_for(max_m, k):
     return max_m * k_half_for(k)
 
 
-def bq_bytes_for(ne, n_out, k):
-    return ne * n_out * k_half_for(k)
-
-
-def bscale_bytes_for(ne, n_out, k):
-    return ne * kbs_per_expert_dw_for(n_out, k) * 4
-
-
 def saq_slot_bytes(BM, KH_TILE):
     return BM * KH_TILE
-
-
-def lds_bytes(BM, BN):
-    return BM * BN * 4
-
-
-def kmchunks(BM):
-    return 1 if const_expr(BM == 16) else BM // 16
 
 
 def tiling(BM):
     n_load_waves = min(4, BM // 8)
     rows_per_wave = BM // n_load_waves
     return n_load_waves, rows_per_wave, rows_per_wave // 8
-
-
-_PTR3 = "!llvm.ptr<3>"
-
-
-def _raw(v):
-    if not isinstance(v, ir.Value) and hasattr(v, "ir_value"):
-        return v.ir_value()
-    return v
 
 
 def _udiv(a, c):
@@ -103,40 +67,6 @@ def _udiv(a, c):
 def _umod(a, c):
     cc = fx.Int32(c) if isinstance(c, int) else c
     return fx.Int32(arith.remui(_raw(a), _raw(cc)))
-
-
-def _lds_ptr3(base_i32, byte_off_i32):
-    addr_i64 = fx.Int64(base_i32 + byte_off_i32)
-    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(addr_i64))
-
-
-def _lds_base_ptr3(lds_view):
-    base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(lds_view))
-    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(fx.Int64(base_i32)))
-
-
-def _gep3(base_ptr, byte_off_i32):
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
-
-
-def _global_base_ptr1(addr_i64):
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
-
-
-def _gep1(base_ptr, byte_off_i32):
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
-
-
-def _global_ptr1(arg, byte_off_i32):
-    return _gep1(_global_base_ptr1(arg), byte_off_i32)
-
-
-def _lds_swizzle_mask(row):
-    return (row & fx.Int32(14)) << fx.Int32(3)
 
 
 def _issue_a_load_lds(
@@ -195,7 +125,7 @@ def compile_gemm2_a4w4_port(
     _aStages = kStages if _K_TILES_TOTAL <= kStages else 3
     _acc_rows = min(BM, 64) if epilog == "nonatomic_cshuffle" else BM
     _lds_bytes = (
-        max(lds_bytes(_acc_rows, BN), _aStages * _slot_bytes)
+        max(lds_acc_bytes_for(_acc_rows, BN), _aStages * _slot_bytes)
         if epilog != "nonatomic"
         else _aStages * _slot_bytes
     )
@@ -245,9 +175,7 @@ def compile_gemm2_a4w4_port(
         _aq_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(
             BM * _K_HALF
         )
-        aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _raw(fx.Int64(arg_aq)), num_records_bytes=_aq_num
-        )
+        aq_rsrc = _buffer_rsrc(arg_aq, _aq_num)
         saq = SmemPtr(
             allocator.get_base(), lds_off, T.i8, shape=(_aStages * _slot_bytes,)
         )
@@ -444,7 +372,7 @@ def _gemm2_body(
     KH_TILE,
 ):
     _aStages = aStages
-    _kMChunks = kmchunks(BM)
+    _kMChunks = kmchunks_for(BM)
     _slot_bytes = saq_slot_bytes(BM, KH_TILE)
     _lds_acc_floats = (min(BM, 64) if epilog == "nonatomic_cshuffle" else BM) * BN
     _K = D_INTER
@@ -475,15 +403,9 @@ def _gemm2_body(
     m_row = m_block_idx * fx.Int32(BM)
 
     _asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(_asc_per_mb)
-    ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_ascale)), num_records_bytes=_asc_num
-    )
-    bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_bq)), num_records_bytes=fx.Index(_bq_bytes)
-    )
-    bscale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_bscale)), num_records_bytes=fx.Index(_bscale_bytes)
-    )
+    ascale_rsrc = _buffer_rsrc(arg_ascale, _asc_num)
+    bq_rsrc = _buffer_rsrc(arg_bq, fx.Index(_bq_bytes))
+    bscale_rsrc = _buffer_rsrc(arg_bscale, fx.Index(_bscale_bytes))
 
     lds_base = allocator.get_base()
     saq = SmemPtr(lds_base, lds_off, T.i8, shape=(_aStages * _slot_bytes,))
@@ -851,32 +773,16 @@ def _flat_mxfp4_epilog(
         if _bi + 1 < len(_blocks):
             _r_next, _grp_next, _col0_next = _issue_load(*_blocks[_bi + 1])
         if True:
-            amax_f = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(r[0])], [], [])
+            amax_f = _raw(_fabs_f32(r[0]))
             for e in range_constexpr(1, 8):
-                abs_e = llvm.call_intrinsic(
-                    T.f32, "llvm.fabs.f32", [_raw(r[e])], [], []
-                )
+                abs_e = _raw(_fabs_f32(r[e]))
                 amax_f = arith.maxnumf(amax_f, abs_e)
             amax = arith.shrui(arith.bitcast(T.i32, amax_f), _raw(fx.Int32(16)))
-            s1 = rocdl.update_dpp(T.i32, amax, amax, 0xB1, 0xF, 0xF, True)
-            a = arith.maxui(amax, s1)
-            s2 = rocdl.update_dpp(T.i32, a, a, 0x4E, 0xF, 0xF, True)
-            amax_dpp = arith.maxui(a, s2)
+            amax_dpp = _raw(_inline_dpp_quad_amax(amax))
             f32b = arith.shli(amax_dpp, _raw(fx.Int32(16)))
-            working_i = arith.bitcast(
-                T.i32, arith.mulf(arith.bitcast(T.f32, f32b), _raw(fx.Float32(1.0 / 6.0)))
-            )
-            bexp = arith.andi(
-                arith.shrui(
-                    arith.addi(working_i, _raw(fx.Int32(0x7FFFFF))), _raw(fx.Int32(23))
-                ),
-                _raw(fx.Int32(0xFF)),
-            )
-            e8 = arith.minsi(
-                _raw(fx.Int32(254)),
-                arith.maxsi(_raw(fx.Int32(0)), bexp),
-            )
-            qscale = arith.bitcast(T.f32, arith.shli(e8, _raw(fx.Int32(23))))
+            e8m0, qscale_f = _e8m0_from_amax(fx.Float32(arith.bitcast(T.f32, f32b)))
+            e8 = _raw(e8m0)
+            qscale = _raw(qscale_f)
             packed = _raw(fx.Int32(0))
             packed = rocdl.cvt_scalef32_pk_fp4_f32(
                 T.i32, packed, _raw(r[0]), _raw(r[1]), qscale, 0
@@ -919,7 +825,7 @@ def _atomic_bf16_epilog(
     N_OUT,
     BN,
 ):
-    _kMChunks = kmchunks(BM)
+    _kMChunks = kmchunks_for(BM)
     M_REPS = BM // 8
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)

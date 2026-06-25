@@ -12,22 +12,40 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from . import dpp_utils
-
-kStages = 2
-
-kBS_stride_k0_dw = 64
+from .mxfp4_gemm_common import (
+    kStages,
+    kBS_stride_k0_dw,
+    _raw,
+    _lds_ptr3,
+    _lds_base_ptr3,
+    _gep3,
+    _global_base_ptr1,
+    _gep1,
+    _global_ptr1,
+    _buffer_rsrc,
+    _lds_swizzle_mask,
+    _fabs_f32,
+    _e8m0_roundup,
+    _e8m0_from_amax,
+    _umax_i32,
+    _inline_dpp_quad_amax,
+    kmchunks_for,
+    lds_acc_bytes_for,
+    k_half_for,
+    k_tiles_total_for,
+    kunroll_for,
+    kas_c_k1_for,
+    kbs_stride_n0_dw_for,
+    kas_per_chunk_dw_for,
+    num_n_blocks_for,
+    kbs_per_expert_dw_for,
+    bq_bytes_for,
+    bscale_bytes_for,
+)
 
 
 def n_out_for(inter):
     return 2 * inter
-
-
-def num_n_blocks_for(inter, BN):
-    return n_out_for(inter) // BN
-
-
-def kbs_c_n1_for(inter):
-    return n_out_for(inter) // 16 // 2
 
 
 def out_as_per_chunk_dw_for(inter):
@@ -38,90 +56,7 @@ def k_g2_half_for(inter):
     return inter // 2
 
 
-def k_half_for(k):
-    return k // 2
-
-
-def k_tiles_total_for(k, BK):
-    return k // BK
-
-
-def kunroll_for(k, BK):
-    return k_tiles_total_for(k, BK) - kStages
-
-
-def kas_c_k1_for(k):
-    return (k // 32) // 4 // 2
-
-
-def kas_per_chunk_dw_for(k):
-    return 1 * kas_c_k1_for(k) * 64
-
-
-def kbs_c_k1_for(k):
-    return (k // 32) // 4 // 2
-
-
-def kbs_stride_n0_dw_for(k):
-    return kbs_c_k1_for(k) * 64
-
-
-def kbs_per_expert_dw_for(k, inter):
-    return kbs_c_n1_for(inter) * kbs_stride_n0_dw_for(k)
-
-
-def bq_bytes_for(k, inter, ne):
-    return ne * n_out_for(inter) * k_half_for(k)
-
-
-def bscale_bytes_for(k, inter, ne):
-    return ne * kbs_per_expert_dw_for(k, inter) * 4
-
-
 LOG2E = 1.4426950408889634
-
-
-_PTR3 = "!llvm.ptr<3>"
-
-
-def _raw(v):
-    if not isinstance(v, ir.Value) and hasattr(v, "ir_value"):
-        return v.ir_value()
-    return v
-
-
-def _lds_ptr3(base_i32, byte_off_i32):
-    addr_i64 = fx.Int64(base_i32 + byte_off_i32)
-    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(addr_i64))
-
-
-def _lds_base_ptr3(lds_view):
-    base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(lds_view))
-    return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(fx.Int64(base_i32)))
-
-
-def _gep3(base_ptr, byte_off_i32):
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
-
-
-def _global_base_ptr1(addr_i64):
-    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
-
-
-def _gep1(base_ptr, byte_off_i32):
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
-
-
-def _global_ptr1(arg, byte_off_i32):
-    return _gep1(_global_base_ptr1(arg), byte_off_i32)
-
-
-def _lds_swizzle_mask(row):
-    return (row & fx.Int32(14)) << fx.Int32(3)
 
 
 def _silu_mul(g, u):
@@ -136,25 +71,6 @@ def _silu_mul_batch(gs, us):
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
 
 
-def _fabs_f32(x):
-    bits = _raw(x).bitcast(T.i32)
-    abs_bits = bits & _raw(fx.Int32(0x7FFFFFFF))
-    return fx.Float32(abs_bits.bitcast(T.f32))
-
-
-def _e8m0_roundup(amax_f32):
-    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(T.i32))
-    bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
-    lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(bexp), _raw(fx.Int32(254)))
-    return fx.Int32(arith.select(lt, _raw(bexp), _raw(fx.Int32(254))))
-
-
-def _e8m0_from_amax(amax_f32):
-    e8m0 = _e8m0_roundup(amax_f32)
-    qscale = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
-    return e8m0, qscale
-
-
 def _pkmax_u16(a_i32, b_i32):
     _v2i16 = ir.Type.parse("vector<2xi16>")
     va = llvm.BitcastOp(_v2i16, _raw(a_i32)).result
@@ -162,19 +78,6 @@ def _pkmax_u16(a_i32, b_i32):
     vm = arith.MaxUIOp(va, vb).result
     out = llvm.BitcastOp(T.i32, vm).result
     return fx.Int32(out)
-
-
-def _inline_dpp_quad_amax(a32):
-    a32 = fx.Int32(_raw(a32))
-    s1 = fx.Int32(dpp_utils.update_dpp_i32(_raw(a32), _raw(a32), 0xB1, 0xF, 0xF, True))
-    a32 = _umax_i32(a32, s1)
-    s2 = fx.Int32(dpp_utils.update_dpp_i32(_raw(a32), _raw(a32), 0x4E, 0xF, 0xF, True))
-    return _umax_i32(a32, s2)
-
-
-def _umax_i32(a, b):
-    is_gt = arith.cmpi(arith.CmpIPredicate.ugt, _raw(a), _raw(b))
-    return fx.Int32(arith.select(is_gt, _raw(a), _raw(b)))
 
 
 def _inline_e8m0(amax_u16_i32):
@@ -187,7 +90,7 @@ def _inline_e8m0(amax_u16_i32):
 
 
 def gemm1_grid(n_tokens, BM, *, NE, TOPK, INTER, BN=256):
-    num_n_blocks = num_n_blocks_for(INTER, BN)
+    num_n_blocks = num_n_blocks_for(n_out_for(INTER), BN)
     if BM == 128:
         max_m_blocks = (n_tokens * TOPK + NE * (BM - 1) + BM - 1) // BM
     else:
@@ -255,28 +158,18 @@ def _gemm1_body(
     lane_mod_8 = lane % fx.Int32(8)
 
     aq_num_records = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K_HALF)))
-    aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num_records
-    )
+    aq_rsrc = _buffer_rsrc(arg_aq, aq_num_records)
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
     ascale_num = arith.index_cast(T.index, _raw(i32_total_m_blocks)) * fx.Index(
         _asc_per_mb
     )
-    ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_ascale)), num_records_bytes=ascale_num
-    )
-    bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_bq)), num_records_bytes=BQ_BYTES
-    )
-    bscale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_bscale)), num_records_bytes=BSCALE_BYTES
-    )
+    ascale_rsrc = _buffer_rsrc(arg_ascale, ascale_num)
+    bq_rsrc = _buffer_rsrc(arg_bq, BQ_BYTES)
+    bscale_rsrc = _buffer_rsrc(arg_bscale, BSCALE_BYTES)
     hidden_rsrc = None
     if const_expr(inline_quant):
         hidden_num = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K * 2)))
-        hidden_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _raw(fx.Int64(arg_hidden)), num_records_bytes=hidden_num
-        )
+        hidden_rsrc = _buffer_rsrc(arg_hidden, hidden_num)
 
     lds_base = allocator.get_base()
     s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE,))
@@ -599,31 +492,31 @@ def _gemm1_body(
             accm[0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                 mfma_ty, [a[0][1], bJ1, accm[0][J], 4, 4, 2, sa, 2 + in_b, sb]
             )
-            return
-        for sub in range_constexpr(kSubBlocks):
-            i0 = sub * 2 + 0
-            i1 = sub * 2 + 1
-            sa = a_scale[sub]
-            if const_expr(init):
+        else:
+            for sub in range_constexpr(kSubBlocks):
+                i0 = sub * 2 + 0
+                i1 = sub * 2 + 1
+                sa = a_scale[sub]
+                if const_expr(init):
+                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_ty, [a[i0][0], bJ0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
+                    )
+                    accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_ty, [a[i1][0], bJ0, zero4, 4, 4, 1, sa, 0 + in_b, sb]
+                    )
+                else:
+                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_ty, [a[i0][0], bJ0, accm[i0][J], 4, 4, 0, sa, 0 + in_b, sb]
+                    )
+                    accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_ty, [a[i1][0], bJ0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb]
+                    )
                 accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i0][0], bJ0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
+                    mfma_ty, [a[i0][1], bJ1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb]
                 )
                 accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i1][0], bJ0, zero4, 4, 4, 1, sa, 0 + in_b, sb]
+                    mfma_ty, [a[i1][1], bJ1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb]
                 )
-            else:
-                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i0][0], bJ0, accm[i0][J], 4, 4, 0, sa, 0 + in_b, sb]
-                )
-                accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                    mfma_ty, [a[i1][0], bJ0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb]
-                )
-            accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                mfma_ty, [a[i0][1], bJ1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb]
-            )
-            accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                mfma_ty, [a[i1][1], bJ1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb]
-            )
 
     _relax_prologue = (BM == 128) and not inline_quant
     if const_expr(not inline_quant):
@@ -827,10 +720,10 @@ def _gemm1_body(
 def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
     kAStages = 2 if BM == 128 else 3
     kSubBlocks = 1 if BM < 32 else BM // 32
-    kMChunks = BM // 16
+    kMChunks = kmchunks_for(BM)
     s_aq_bytes = kAStages * BM * KH_TILE
     s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
-    lds_acc_bytes = BM * BN * 4
+    lds_acc_bytes = lds_acc_bytes_for(BM, BN)
     lds_bytes = max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
@@ -879,10 +772,10 @@ def compile_gemm1_a4w4_port(
     _kUnroll = kunroll_for(_K, BK)
     _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
     _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
-    _kBS_per_expert_dw = kbs_per_expert_dw_for(_K, _INTER)
-    _BQ_BYTES = bq_bytes_for(_K, _INTER, _NE)
-    _BSCALE_BYTES = bscale_bytes_for(_K, _INTER, _NE)
-    _NUM_N_BLOCKS = num_n_blocks_for(_INTER, BN)
+    _kBS_per_expert_dw = kbs_per_expert_dw_for(_N_OUT, _K)
+    _BQ_BYTES = bq_bytes_for(_NE, _N_OUT, _K)
+    _BSCALE_BYTES = bscale_bytes_for(_NE, _N_OUT, _K)
+    _NUM_N_BLOCKS = num_n_blocks_for(_N_OUT, BN)
     _OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(_INTER)
     _K_G2_HALF = k_g2_half_for(_INTER)
 
