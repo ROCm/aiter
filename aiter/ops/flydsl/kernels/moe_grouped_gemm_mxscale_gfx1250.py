@@ -1055,6 +1055,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     cfg.max_m,
                     2 * cfg.inter_dim,
                     stream,
+                    _swiglu_lim_rt,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1119,6 +1120,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     contiguous_m,
                     2 * cfg.inter_dim,
                     stream,
+                    _swiglu_lim_rt,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1179,6 +1181,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     cfg.max_m,
                     2 * cfg.inter_dim,
                     stream,
+                    _swiglu_lim_rt,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1324,6 +1327,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         if cfg.split_k > 1:
             y.zero_()
         gemm = _get_base_bias() if bias is not None else _get_base()
+        _no_act_swiglu_lim = float("inf")
         if cfg.grouped_persistent_m:
             m_tile_prefix = _m_tile_prefix
             if m_tile_prefix is None:
@@ -1348,6 +1352,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             else:
                 _run_compiled(
@@ -1363,6 +1368,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1391,6 +1397,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     contiguous_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             else:
                 _run_compiled(
@@ -1407,6 +1414,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     contiguous_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1432,6 +1440,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             else:
                 _run_compiled(
@@ -1448,6 +1457,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
