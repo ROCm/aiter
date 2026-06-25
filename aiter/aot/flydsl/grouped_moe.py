@@ -17,6 +17,7 @@ from aiter.aot.flydsl.common import (
     compile_only_env,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 
@@ -52,6 +53,24 @@ def _preshuffled_scale_shape(
             f"scale rows must be divisible by wmma_rep={wmma_rep}, got {rows}"
         )
     return int(rows) // wmma_rep, k_scale * wmma_rep
+
+
+def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
+    """Mirror moe_grouped_gemm_mxscale_gfx1250._preshuffled_b_scale_shape.
+
+    Weight (B) scale uses the n32k4 layout (different from the activation/A
+    layout above): a 32-row super-block folds into the column dim, so 32 N-rows
+    collapse to one row and each k_scale column expands x32. The grouped GEMM
+    launchers validate scale_w against THIS shape, so the AOT dummy must match.
+    """
+    k_scale = int(k_dim) // 32
+    if k_scale % 4 != 0:
+        raise ValueError(
+            f"B-scale k columns (K//32) must be divisible by 4 (K%128==0), got {k_scale}"
+        )
+    if int(rows) % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {rows}")
+    return int(rows) // 32, k_scale * 32
 
 
 def _as_bool(value, default: bool = False) -> bool:
@@ -180,7 +199,6 @@ def compile_one_config(**job):
         else compile_moe_grouped_gemm2_a8w4_masked
     )
     warp_tile_m = job["tile_m"] // job["m_warp"]
-    warp_tile_n = job["tile_n"] // job["n_warp"]
     contiguous = bool(job.get("grouped_contiguous_m", False))
     common = dict(
         model_dim=job["model_dim"],
@@ -206,9 +224,11 @@ def compile_one_config(**job):
     else:
         act_lead = job["experts"]
         rows = job["max_m"]
-    with compile_only_env(), override_env(
-        "FLYDSL_GPU_ARCH", aot_arch
-    ), FakeTensorMode():
+    with (
+        compile_only_env(),
+        override_env("FLYDSL_GPU_ARCH", aot_arch),
+        FakeTensorMode(),
+    ):
         masked_m = torch.full(
             (job["experts"],), job["max_m"], dtype=torch.int32, device=dev
         )
@@ -231,9 +251,7 @@ def compile_one_config(**job):
         sw1 = torch.empty(
             (
                 job["experts"],
-                *_preshuffled_scale_shape(
-                    2 * job["inter_dim"], job["model_dim"], warp_tile_n
-                ),
+                *_preshuffled_b_scale_shape(2 * job["inter_dim"], job["model_dim"]),
             ),
             dtype=torch.uint8,
         )
@@ -250,9 +268,7 @@ def compile_one_config(**job):
         sw2 = torch.empty(
             (
                 job["experts"],
-                *_preshuffled_scale_shape(
-                    job["model_dim"], job["inter_dim"], warp_tile_n
-                ),
+                *_preshuffled_b_scale_shape(job["model_dim"], job["inter_dim"]),
             ),
             dtype=torch.uint8,
         )
@@ -337,8 +353,18 @@ def main(argv=None):
     parser.add_argument("--csv", nargs="+", default=DEFAULT_CSVS)
     args = parser.parse_args(argv)
     jobs = collect_aot_jobs(args.csv, parse_csv)
-    for job in jobs:
-        print(compile_one_config(**job))
+
+    total_t0 = time.time()
+    print(f"--- Compiling {len(jobs)} grouped-MoE kernels ---")
+    results = run_jobs_parallel(compile_one_config, jobs)
+    total_elapsed = time.time() - total_t0
+
+    ok = sum(1 for r in results if r.get("compile_time") is not None)
+    fail = len(results) - ok
+    print(
+        f"\nSummary: {ok} ok, {fail} failed in {total_elapsed:.1f}s",
+    )
+    sys.exit(1 if fail > 0 else 0)
 
 
 if __name__ == "__main__":
