@@ -2,9 +2,12 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """FlyDSL **layout-API** port of aiter ``gemm1_a4w4`` (MXFP4 MoE up/gate-proj).
 
-Phase 1: ONE variant only -- ``(BM=32, use_nt=True, inline_quant=False)`` (the
-Kimi-K2.5 BM32_NT path: kSubBlocks=1, kMChunks=2, kAStages=3, kStages=2,
-kUnroll=26, b_aux=2, interleave=True).
+Variants: ``(BM=32, inline_quant=False, interleave=True)`` for BOTH ``use_nt``
+values (kSubBlocks=1, kMChunks=2, kAStages=3, kStages=2, kUnroll=26). ``use_nt``
+selects the B-load cache policy, matching the tuned config's BM32_NT vs
+BM32_CACHED kernelName1:
+  * ``use_nt=True``  (BM32_NT)     -> non-temporal raw buffer_load B (decode/small M)
+  * ``use_nt=False`` (BM32_CACHED) -> cached layout-API fx.copy B    (prefill/large M)
 
 This is a **hybrid** kernel, exactly like the proven layout-API reference
 ``/root/FlyDSL/kernels/preshuffle_gemm_v2.py``: the inner microscaled MMA stays on
@@ -127,6 +130,7 @@ def _gemm1_body_v2(
     OUT_AS_PER_CHUNK_DW,
     K_G2_HALF,
     interleave,
+    b_nontemporal,
 ):
     BM = _BM
     kAStages = _kAStages
@@ -162,6 +166,13 @@ def _gemm1_body_v2(
     bscale_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_bscale)), num_records_bytes=BSCALE_BYTES
     )
+    # Uniform B buffer resource for the NON-TEMPORAL path only (see issue_b_load_j):
+    # the layout-API BufferCopy atom cannot carry the nt aux hint, so small-M
+    # (decode) uses a raw buffer_load(cache_modifier=2) over this resource instead.
+    if const_expr(b_nontemporal):
+        bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _raw(fx.Int64(arg_bq)), num_records_bytes=BQ_BYTES
+        )
 
     # ============================================================
     # B-weight load -- LAYOUT API (the non-negotiable core conversion).
@@ -426,23 +437,48 @@ def _gemm1_body_v2(
         )
         return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
-    # Build the preshuffle VIEWS once, hoisted out of the K-loop.
-    _bq_views = [_make_bq_view_for_jtile(j) for j in range_constexpr(4)]
+    # The layout-API views/fragments are only used by the cached (non-nt) path.
+    if const_expr(not b_nontemporal):
+        # Build the preshuffle VIEWS once, hoisted out of the K-loop.
+        _bq_views = [_make_bq_view_for_jtile(j) for j in range_constexpr(4)]
 
-    # Persistent per-(j, half) B register fragments, allocated ONCE (mirroring the
-    # v2 reference's frag_B_0/frag_B_1 hoisted outside the loop). Inside the K-loop
-    # we fx.copy the (klane,nlane,K_C,half) slice of the preshuffle view DIRECTLY
-    # into these registers (a uniform-descriptor buffer_load with per-lane voffset),
-    # then read .load() for the raw mfma.
-    _bq_frags = [
-        [
-            fx.make_fragment_like(_bq_views[j][0, 0, 0, half, None])
-            for half in range_constexpr(2)
+        # Persistent per-(j, half) B register fragments, allocated ONCE (mirroring
+        # the v2 reference's frag_B_0/frag_B_1 hoisted outside the loop). Inside the
+        # K-loop we fx.copy the (klane,nlane,K_C,half) slice of the preshuffle view
+        # DIRECTLY into these registers (a uniform-descriptor buffer_load with
+        # per-lane voffset), then read .load() for the raw mfma.
+        _bq_frags = [
+            [
+                fx.make_fragment_like(_bq_views[j][0, 0, 0, half, None])
+                for half in range_constexpr(2)
+            ]
+            for j in range_constexpr(4)
         ]
-        for j in range_constexpr(4)
-    ]
 
     def issue_b_load_j(b_slot, K_C, j):
+        if const_expr(b_nontemporal):
+            # NON-TEMPORAL path (small M / decode): raw buffer_load with the nt aux
+            # hint (cache_modifier=2), which the layout-API copy atom cannot express.
+            # At small M there is little cross-block B reuse, so streaming B past L2
+            # (nt) beats caching it. Byte-identical addressing to v1's issue_b_load_j.
+            v = (
+                (lane_div_16 * fx.Int32(256))
+                + (lane_mod_16 * fx.Int32(16))
+                + fx.Int32(K_C * 2048)
+            )
+            for half in range_constexpr(2):
+                frag = buffer_ops.buffer_load(
+                    bq_rsrc,
+                    (v + fx.Int32(half * 1024)) // fx.Int32(4),
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=2,
+                    soffset_bytes=b_load_s_base[j],
+                )
+                b_slot[j][half] = Vec(frag)
+            return
+        # CACHED path (large M / prefill): layout-API preshuffle view + fx.copy. At
+        # large M many blocks reuse the same expert weights -> caching B (no nt) wins.
         view = _bq_views[j]
         for half in range_constexpr(2):
             frag = _bq_frags[j][half]
@@ -692,16 +728,22 @@ def compile_gemm1_a4w4_port(
     TOPK=TOPK_DEFAULT,
     interleave=True,
 ):
+    # use_nt IS the B-load cache policy (matches v1's `b_aux = 2 if use_nt else 0`
+    # and the tuned config's BM32_NT vs BM32_CACHED kernelName1):
+    #   use_nt=True  -> BM32_NT     : non-temporal raw buffer_load (decode/small M)
+    #   use_nt=False -> BM32_CACHED : cached layout-API fx.copy   (prefill/large M)
+    b_nontemporal = use_nt
     print(
         f"[PORT-FLYDSL-GEMM1-V2] compile_gemm1_a4w4_port ENTERED "
         f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} "
-        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE} interleave={interleave}",
+        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE} interleave={interleave} "
+        f"b_nontemporal={b_nontemporal}",
         flush=True,
     )
-    if (BM, use_nt, inline_quant) != (32, True, False):
+    if (BM, inline_quant) != (32, False):
         raise AssertionError(
-            f"mxfp4_gemm1_v2 supports only (BM=32,use_nt=True,inline_quant=False); "
-            f"got (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
+            f"mxfp4_gemm1_v2 supports only (BM=32, inline_quant=False) for either "
+            f"use_nt; got (BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
         )
     if not interleave:
         raise AssertionError(
@@ -732,7 +774,8 @@ def compile_gemm1_a4w4_port(
     lds_bytes = _lds_bytes_for(_K_TILES_TOTAL)
 
     gu_tag = "il" if interleave else "sep"
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_nt_{gu_tag}_v2"
+    bnt_tag = "nt" if b_nontemporal else "cached"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{bnt_tag}_{gu_tag}_v2"
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name=f"gemm1port_v2_smem_{name_suffix}"
@@ -795,6 +838,7 @@ def compile_gemm1_a4w4_port(
                 OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
                 K_G2_HALF=_K_G2_HALF,
                 interleave=interleave,
+                b_nontemporal=b_nontemporal,
             )
 
     @flyc.jit

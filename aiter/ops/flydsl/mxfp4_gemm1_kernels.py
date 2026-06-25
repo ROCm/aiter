@@ -31,13 +31,16 @@ _SUPPORTED = {
 def _get_compiled_mxfp4_gemm1_port(
     BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, interleave=True
 ):
-    # Backend switch: AITER_MXFP4_GEMM1_V2=1 selects the layout-API v2 port for
-    # the Phase-1 variant ONLY -- (BM=32, use_nt=True, inline_quant=False) with
-    # interleave=True. Any other variant/mode (or the env unset) keeps the
-    # byte-exact raw v1 kernel. Non-invasive + default-off.
+    # Backend switch: AITER_MXFP4_GEMM1_V2=1 selects the layout-API v2 port for the
+    # BM32 variants -- (BM=32, inline_quant=False) with interleave=True, for BOTH
+    # use_nt values: use_nt=True is the BM32_NT (non-temporal B load, decode) tuned
+    # config; use_nt=False is BM32_CACHED (cached layout-API B load, prefill). The
+    # tuned config's kernelName1 carries the NT flag per token bucket, so use_nt
+    # already routes the right cache policy here -- no separate knob/threshold.
+    # Any other variant/mode (or the env unset) keeps the byte-exact raw v1 kernel.
     if (
         os.environ.get("AITER_MXFP4_GEMM1_V2") == "1"
-        and (BM, use_nt, inline_quant) == (32, True, False)
+        and (BM, inline_quant) == (32, False)
         and interleave
     ):
         from .kernels.mxfp4_gemm1_v2 import compile_gemm1_a4w4_port

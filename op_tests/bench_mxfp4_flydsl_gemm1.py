@@ -16,7 +16,7 @@ from op_tests.test_mxfp4_flydsl_gemm1 import (
 )
 
 
-def _setup(M, NE=385, H=7168, INTER=512, TOPK=9, BM=32, interleave=True, seed=2):
+def _setup(M, NE=385, H=7168, INTER=512, TOPK=9, BM=32, interleave=True, seed=2, use_nt=True):
     import aiter
     from aiter import QuantType, dtypes
     from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
@@ -59,7 +59,7 @@ def _setup(M, NE=385, H=7168, INTER=512, TOPK=9, BM=32, interleave=True, seed=2)
         a_quant=aq, a_scale_sorted_shuffled=assh, w1_u8=w1u8, w1_scale_u8=w1_scale_u8,
         sorted_expert_ids=sei, cumsum_tensor=cumsum, m_indices=mind,
         inter_sorted_quant=isq, inter_sorted_shuffled_scale=iss, hidden_states=hidden,
-        n_tokens=M, BM=BM, use_nt=True, inline_quant=False, NE=NE, D_HIDDEN=H,
+        n_tokens=M, BM=BM, use_nt=use_nt, inline_quant=False, NE=NE, D_HIDDEN=H,
         D_INTER=INTER, topk=TOPK, interleave=interleave,
     )
 
@@ -69,11 +69,15 @@ def main():
     ap.add_argument("--M", type=int, default=256)
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=30)
+    ap.add_argument(
+        "--use_nt", type=int, default=1,
+        help="1=BM32_NT (non-temporal B load); 0=BM32_CACHED (cached layout-API B)",
+    )
     args = ap.parse_args()
 
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
-    kw = _setup(args.M)
+    kw = _setup(args.M, use_nt=bool(args.use_nt))
     for _ in range(args.warmup):
         flydsl_mxfp4_gemm1(**kw)
     torch.cuda.synchronize()
