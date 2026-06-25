@@ -6,11 +6,11 @@ Times Triton plus one or more FlyDSL kernel *variants* (kernel versions) on
 identical inputs and prints one table per shape, with each variant as a row
 (columns: time_us, TFLOPs, verify, vs_triton ratio).
 
-The FlyDSL kernel ships several versions, registered in
-``aiter.ops.flydsl.kernels.fp8_mqa_logits`` (``KERNEL_VARIANTS``): ``"mfma"`` is
-the baseline, ``"scalar"`` the correctness-first fallback, and new versions can
-be added there. Pick which to benchmark with ``--flydsl-variants`` (default:
-all registered variants). Each becomes its own row, e.g. ``fly:mfma``.
+The FlyDSL kernel ships several variants, registered in
+``aiter.ops.flydsl.kernels.fp8_mqa_logits`` (``KERNEL_VARIANTS``) and tagged
+``"mfma_r<RPB>_w<WPB>"`` (RPB query rows per block, WPB waves per block). Pick
+which to benchmark with ``--flydsl-variants`` (default: all registered
+variants). Each becomes its own row, e.g. ``fly:mfma_r2_w4``.
 
 Operand-dtype control (``--dtype-combo``):
 
@@ -24,8 +24,8 @@ Examples:
 
     # compare two FlyDSL variants against Triton on a custom shape, with parity
     python .../bench_flydsl_vs_triton_fp8_mqa_logits.py \
-        --flydsl-variants mfma,scalar \
-        --seq_q_l 1024 --seq_kv_l 4096 --num_heads_q 64 --head_dim 128 \
+        --flydsl-variants mfma_r2_w2,mfma_r2_w4 \
+        --batch_size 1 --seq_q_l 1024 --seq_kv_l 4096 --num_heads_q 64 --head_dim 128 \
         --verification reference
 
     # verify FlyDSL against Triton output directly (lighter, no torch ref OOM)
@@ -65,21 +65,6 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 from triton.runtime.errors import OutOfResources as TritonOutOfResources
 from aiter.ops.flydsl import is_flydsl_available
 
-# Import the standalone GEAK v4 kernel.
-_GEAK_V4_PATH = os.path.join(
-    _REPO_ROOT,
-    "aiter", "ops", "flydsl", "kernels", "fp8_mqa_logits_flydsl_geak_v4.py",
-)
-_geak_v4_mod = None
-if os.path.exists(_GEAK_V4_PATH):
-    import importlib.util as _imputil
-    _spec = _imputil.spec_from_file_location("fp8_mqa_logits_flydsl_geak_v4", _GEAK_V4_PATH)
-    _geak_v4_mod = _imputil.module_from_spec(_spec)
-    try:
-        _spec.loader.exec_module(_geak_v4_mod)
-    except Exception as _e:
-        print(f"[warn] failed to load geak_v4 kernel: {_e}", file=sys.stderr)
-        _geak_v4_mod = None
 
 def _triton_logits_fallback(Q, KV, kv_scales, weights, cu_starts, cu_ends,
                             clean_logits=True, block_kv=64):
@@ -258,57 +243,23 @@ def _median_ms(result):
     return result.median_us * 1e-3
 
 
-# Perf-oriented preset sweep (DeepSeek-style square + rectangular shapes).
-# Each entry: (batch_size, seq_q_l, seq_kv_l, num_heads_q, head_dim).
-# Covers both head counts the ticket calls out (H in {64, 128}) at D=128,
-# square + rectangular windows, plus a non-aligned s_kv "tail" shape.
-#
-# Caveats for the long-ISL shapes:
-#   * The torch reference OOMs (it materializes a dense [s_q, s_kv, H] tensor:
-#     256 GiB at 32k), so --verify automatically falls back to grading against
-#     the Triton kernel (itself validated vs torch where torch fits). Those
-#     grades are suffixed "*" (e.g. PASS*) and Triton is shown as "REF".
-#   * The geak variant indexes with int32 and writes a dense logits buffer, so it
-#     is limited to outputs with < 2^31 elements (~32k square is the practical
-#     ceiling); larger square shapes overflow FlyDSL's argument packing. In real
-#     serving the dense logits are never materialized at once.
+# Perf preset sweep, each entry (batch_size, seq_q_l, seq_kv_l, num_heads_q,
+# head_dim). For long-ISL shapes the torch reference OOMs (dense [s_q, s_kv, H]
+# is 256 GiB at 32k), so --verify falls back to grading against Triton and those
+# grades are suffixed "*". Other shapes/head counts go through --shape flags.
 PRESET_SHAPES = [
-    # H = 64
     (1, 1024, 1024, 64, 128),
-    # (1, 1024, 1000, 64, 128),
-    # (1, 1000, 1024, 64, 128),
     (1, 2048, 2048, 64, 128),
     (1, 4096, 4096, 64, 128),
     (1, 1024, 4096, 64, 128),
     (1, 4096, 1024, 64, 128),
-    #(1, 4096, 16384, 64, 128),
-    #(1, 4096, 16000, 64, 128),  # non-aligned s_kv (tail)
-    # H = 64, long-ISL prefill (square; run without --verify, see note above)
     (1, 4096, 8192, 64, 128),
     (1, 8192, 4096, 64, 128),
     (1, 8192, 8192, 64, 128),
-    #(1, 16384, 16384, 64, 128),
-    #(1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
-    # H = 128
-    # (1, 1024, 1024, 128, 128),
-    # (1, 2048, 2048, 128, 128),
-    # (1, 4096, 4096, 128, 128),
-    # (1, 1024, 4096, 128, 128),
-    # (1, 4096, 16384, 128, 128),
-    # (1, 4096, 16000, 128, 128),  # non-aligned s_kv (tail)
-    # H = 128, long-ISL prefill (mirrors the H=64 long-ISL group above)
-    # (1, 8192, 8192, 128, 128),
-    # (1, 16384, 16384, 128, 128),
-    # (1, 32768, 32768, 128, 128),
 ]
 
 
 FLYDSL_PREFIX = "flydsl:"
-GEAK_IMPL_NAME = "geak_v4"
-
-
-def _is_flydsl_impl(name):
-    return name.startswith(FLYDSL_PREFIX) or name == GEAK_IMPL_NAME
 
 
 def _flydsl_variant_of(name):
@@ -320,8 +271,6 @@ def _impl_label(name):
     """Short, column-friendly label for an impl name (e.g. 'triton', 'fly:mfma')."""
     if name == "triton":
         return "triton"
-    if name == GEAK_IMPL_NAME:
-        return "flydsl:" + GEAK_IMPL_NAME
     if name.startswith(FLYDSL_PREFIX):
         return "flydsl:" + _flydsl_variant_of(name)
     return name
@@ -331,7 +280,6 @@ def _available_variants():
     """Return ``(tuple_of_variant_tags, default_tag)`` or ``(None, None)``.
 
     ``None`` when FlyDSL isn't importable (so the bench can still run Triton-only).
-    The standalone "geak_v4" variant is appended if the v4 module loaded.
     """
     if not is_flydsl_available():
         return None, None
@@ -340,10 +288,7 @@ def _available_variants():
         FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
 
-    variants = list(FP8_MQA_LOGITS_VARIANTS)
-    if _geak_v4_mod is not None:
-        variants.append("geak_v4")
-    return tuple(variants), FP8_MQA_LOGITS_DEFAULT_VARIANT
+    return tuple(FP8_MQA_LOGITS_VARIANTS), FP8_MQA_LOGITS_DEFAULT_VARIANT
 
 
 def _select_impls(which, flydsl_variants):
@@ -352,8 +297,7 @@ def _select_impls(which, flydsl_variants):
     ``which`` is the impl-family selection ('all'/'triton'/'flydsl').
     ``flydsl_variants`` is the resolved list of FlyDSL kernel-version tags to
     benchmark; each becomes its own impl named ``flydsl:<variant>`` bound to that
-    variant via ``functools.partial``. The special ``"geak"`` tag maps to the
-    standalone v4 module (imported at the top of this file).
+    variant via ``functools.partial``.
     """
     flydsl_fn = None
     available_variants = ()
@@ -364,10 +308,7 @@ def _select_impls(which, flydsl_variants):
         )
 
         flydsl_fn = flydsl_fp8_mqa_logits
-        available_variants = list(FP8_MQA_LOGITS_VARIANTS)
-        if _geak_v4_mod is not None:
-            available_variants.append("geak_v4")
-        available_variants = tuple(available_variants)
+        available_variants = tuple(FP8_MQA_LOGITS_VARIANTS)
 
     want_triton = which in ("all", "triton")
     want_flydsl = which in ("all", "flydsl")
@@ -385,14 +326,6 @@ def _select_impls(which, flydsl_variants):
         impls["triton"] = triton_logits
     if want_flydsl:
         for v in flydsl_variants:
-            if v == "geak_v4":
-                if _geak_v4_mod is None:
-                    raise SystemExit(
-                        f"[error] geak variant requested but {_GEAK_V4_PATH} "
-                        f"failed to load."
-                    )
-                impls[GEAK_IMPL_NAME] = _geak_v4_mod.flydsl_fp8_mqa_logits
-                continue
             if v not in available_variants:
                 raise SystemExit(
                     f"[error] unknown FlyDSL variant {v!r}; available: "
@@ -440,18 +373,7 @@ def run(args):
 
 
 def _make_closure(name, fn, shape, q_fp8, kv_fp8, scales, weights, ks, ke):
-    """Build a timed closure for one impl.
-
-    The geak v4 standalone kernel has a 6-arg ABI (no ``clean_logits``); all
-    other impls (triton, flydsl:* variants) take the standard 7 args.
-    """
-    if name == GEAK_IMPL_NAME:
-        # Geak v4 has a 6-arg ABI (no clean_logits); it always prefills with -inf.
-        def closure():
-            fn(q_fp8, kv_fp8, scales, weights, ks, ke)
-        return closure
-
-    # All other impls (triton, flydsl:* variants) take 7 args.
+    """Build a timed closure for one impl (triton + flydsl:* share the 7-arg ABI)."""
     def closure():
         fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)
     return closure
@@ -603,10 +525,7 @@ def _verify_reference(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shap
             status[name] = "REF"
             continue
         try:
-            if name == GEAK_IMPL_NAME:
-                out = fn(q_fp8, kv_fp8, scales, weights, ks, ke)
-            else:
-                out = fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)
+            out = fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)
         except NotImplementedError:
             status[name] = "SKIP"
             continue
@@ -623,13 +542,9 @@ def _verify_reference(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shap
 def _verify_vs_triton(impls, q_fp8, kv_fp8, scales, weights, ks, ke, shape):
     """Grade every non-Triton implementation against the Triton kernel output.
 
-    Uses the external script's verification approach: assert all inf/NaN
-    positions match, then compute max relative error on finite values only.
-    Triton itself is marked ``REF``.
-
-    This mode is useful when the torch reference OOMs or when you want to
-    directly compare kernel outputs without worrying about the bf16 reference
-    round-trip.
+    Asserts all inf/NaN positions match, then computes max relative error on
+    finite values only; Triton itself is marked ``REF``. Useful when the torch
+    reference OOMs or to compare kernel outputs without the bf16 round-trip.
 
     Returns {impl_name: "PASS"|"FAIL"|"SKIP"|"REF"|"ERR"
              | "PASS(rel=X.Xe-Y)" | "FAIL(rel=X.Xe-Y)"}.
@@ -654,10 +569,7 @@ def _verify_vs_triton(impls, q_fp8, kv_fp8, scales, weights, ks, ke, shape):
         if name == "triton":
             continue
         try:
-            if name == GEAK_IMPL_NAME:
-                out = fn(q_fp8, kv_fp8, scales, weights, ks, ke)
-            else:
-                out = fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)
+            out = fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)
         except NotImplementedError:
             status[name] = "SKIP"
             continue
@@ -665,7 +577,7 @@ def _verify_vs_triton(impls, q_fp8, kv_fp8, scales, weights, ks, ke, shape):
             status[name] = "ERR"
             continue
 
-        # Check that inf positions match (mirroring external script's inf_ok).
+        # Check that inf positions match.
         inf_ok = (torch.isinf(out) == torch.isinf(ref)).all().item()
 
         # Max relative error on finite values only.
@@ -1002,10 +914,6 @@ def main():
         help="graph replays bracketed per sample (MeasureConfig.graph_replay_iters)",
     )
     p.add_argument(
-        "--replay-iters", type=int, default=50,
-        help="graph replays bracketed per sample (MeasureConfig.replay_iters)",
-    )
-    p.add_argument(
         "--verification",
         choices=["none", "reference", "triton"],
         default="none",
@@ -1075,9 +983,8 @@ def main():
         return
 
     # Resolve the requested FlyDSL variants (comma list), defaulting to all
-    # registered variants so new entries (e.g. "geak") appear automatically.
-    # Validation against what's actually registered happens in _select_impls so
-    # an unavailable-FlyDSL run still works for --impl triton.
+    # registered variants. Validation against what's registered happens in
+    # _select_impls so an unavailable-FlyDSL run still works for --impl triton.
     if args.flydsl_variants:
         args.flydsl_variants = [
             v.strip() for v in args.flydsl_variants.split(",") if v.strip()
