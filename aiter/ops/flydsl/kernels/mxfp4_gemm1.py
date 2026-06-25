@@ -24,7 +24,6 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from . import dpp_utils
 
 # -- compile-time constants (BM-independent; BM-derived ones live in _bm_constants) --
-MAX_M = 655360
 NE = 385  # experts (DEFAULT / KIMI; per-shape value comes from the compile arg NE.
 #           Threaded through the body so non-KIMI expert counts work; these module
 #           globals are the KIMI defaults so existing importers keep working.)
@@ -131,10 +130,6 @@ def bq_bytes_for(k, inter=INTER, ne=NE):
     return ne * n_out_for(inter) * k_half_for(k)  # KIMI: 1412956160
 
 
-def ascale_bytes_for(k, max_m=MAX_M):
-    return (max_m // 32) * kas_per_chunk_dw_for(k) * 4  # KIMI: 146800640
-
-
 def bscale_bytes_for(k, inter=INTER, ne=NE):
     return ne * kbs_per_expert_dw_for(k, inter) * 4  # KIMI: 88309760
 
@@ -147,7 +142,6 @@ kAS_per_chunk_dw = kas_per_chunk_dw_for(K)  # 1792
 kBS_stride_n0_dw = kbs_stride_n0_dw_for(K)  # 1792
 kBS_per_expert_dw = kbs_per_expert_dw_for(K)  # 57344
 BQ_BYTES = bq_bytes_for(K)  # 1412956160
-ASCALE_BYTES = ascale_bytes_for(K)  # 146800640
 BSCALE_BYTES = bscale_bytes_for(K)  # 88309760
 # (K_G2_HALF/BN_INT/OUT_AS_PER_CHUNK_DW are the INTER-derived globals
 #  defined above; the gemm2-A-scale epilog layout lives with the OUTPUT-side block.)
@@ -341,7 +335,6 @@ def _gemm1_body(
     kBS_stride_n0_dw=kBS_stride_n0_dw,
     kBS_per_expert_dw=kBS_per_expert_dw,
     BQ_BYTES=BQ_BYTES,
-    ASCALE_BYTES=ASCALE_BYTES,
     BSCALE_BYTES=BSCALE_BYTES,
     N_OUT=N_OUT,
     NUM_N_BLOCKS=NUM_N_BLOCKS,
@@ -1097,7 +1090,6 @@ def compile_gemm1_a4w4_port(
     # on INTER and NE too; the OUTPUT-side block is purely INTER-derived).
     _kBS_per_expert_dw = kbs_per_expert_dw_for(_K, _INTER)
     _BQ_BYTES = bq_bytes_for(_K, _INTER, _NE)
-    _ASCALE_BYTES = ascale_bytes_for(_K)
     _BSCALE_BYTES = bscale_bytes_for(_K, _INTER, _NE)
     _NUM_N_BLOCKS = num_n_blocks_for(_INTER)
     _OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(_INTER)
@@ -1178,7 +1170,6 @@ def compile_gemm1_a4w4_port(
                 kBS_stride_n0_dw=_kBS_stride_n0_dw,
                 kBS_per_expert_dw=_kBS_per_expert_dw,
                 BQ_BYTES=_BQ_BYTES,
-                ASCALE_BYTES=_ASCALE_BYTES,
                 BSCALE_BYTES=_BSCALE_BYTES,
                 N_OUT=_N_OUT,
                 NUM_N_BLOCKS=_NUM_N_BLOCKS,

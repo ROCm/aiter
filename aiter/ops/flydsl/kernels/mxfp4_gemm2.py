@@ -40,7 +40,6 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 # -- shape constants (BM-independent) -----------------------------------------
-MAX_M = 655360
 NE = 385
 K = 512  # gemm2 contraction = inter_dim (DEFAULT / KIMI; per-shape value comes
 #          from the compile arg D_INTER. All K-derived sizes are computed from the
@@ -103,7 +102,7 @@ def kas_per_chunk_dw_for(k):
     return kas_c_k1_for(k) * 64  # KIMI: 128
 
 
-# -- shape-parametrized sizes (NE/N_OUT/MAX_M/K vary per instance) --
+# -- shape-parametrized sizes (NE/N_OUT/K vary per instance) --
 # N_OUT must be a multiple of 256 (BN).
 def num_n_blocks_for(n_out):
     return n_out // 256
@@ -124,25 +123,6 @@ def bq_bytes_for(ne, n_out, k=K):
 
 def bscale_bytes_for(ne, n_out, k=K):
     return ne * kbs_per_expert_dw_for(n_out, k) * 4
-
-
-def ascale_bytes(BM, max_m=MAX_M, k=K):
-    """A_scale buffer-resource num_bytes.
-
-    The A_scale read stride is one ``kAS_per_chunk_dw*4`` chunk per ``chunk_div``
-    A rows, where ``chunk_div = 16 if BM==16 else 32`` (see the
-    ``chunk_base = m_row // chunk_div`` addressing in ``_gemm2_body``). The
-    resource bound MUST divide ``max_m`` by that read granularity -- NOT by BM.
-
-    For BM in {64,128} the chunk granularity (32) is smaller than BM, so the
-    old ``max_m // BM`` under-sized the resource by ``BM/32x`` and clamped
-    A_scale reads (-> 0) for every sorted row past ``max_m*32/BM``. That
-    silently zeroed the gemm2 output of the trailing sorted rows -- i.e. the
-    high-id experts incl. the always-on shared expert -- so large-M MoE
-    (BM128 nonatomic / mxfp4out) lost accuracy (e.g. KIMI cos 0.68 @ M=16384,
-    0.05 @ M=32768) while smaller M that stayed under the bound looked fine."""
-    chunk_div = 16 if const_expr(BM == 16) else 32
-    return (max_m // chunk_div) * kas_per_chunk_dw_for(k) * 4
 
 
 # KIMI default kept as a module global (used as a param default below). All other
@@ -269,7 +249,6 @@ def compile_gemm2_a4w4_port(
     use_nt=False,
     NE=NE,
     N_OUT=N_OUT,
-    MAX_M=MAX_M,
     epilog="atomic",
     D_INTER=K,
     D_INTER_REAL=None,
@@ -277,7 +256,7 @@ def compile_gemm2_a4w4_port(
     """Compile the gemm2 a4w4 port for a given shape / specialization / epilog.
 
     Shape params (TOPK is upstream and not used in the gemm2 body):
-      NE (experts), N_OUT (model_dim, %256), MAX_M,
+      NE (experts), N_OUT (model_dim, %256),
       D_INTER (= contraction dim K = inter_dim, %BK(256); KIMI/DSR default 512).
     For D_INTER==512 (K_TILES_TOTAL==2) the original fully-unrolled all-tiles-
     preloaded fast path is used (byte-for-byte identical). For D_INTER>512 the
@@ -436,7 +415,6 @@ def compile_gemm2_a4w4_port(
                 use_nt,
                 NE,
                 N_OUT,
-                MAX_M,
                 epilog,
                 aq_rsrc=aq_rsrc,
                 D_INTER=_K,
@@ -606,7 +584,6 @@ def _gemm2_body(
     use_nt,
     NE,
     N_OUT,
-    MAX_M,
     epilog,
     *,
     aq_rsrc=None,
