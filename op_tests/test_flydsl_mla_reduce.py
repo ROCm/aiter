@@ -1,6 +1,6 @@
 """Standalone correctness + bench harness for the FlyDSL MLA reduce kernel.
 
-Reuses the input builder / torch reference shape from bench_mla_reduce_standalone.py.
+Reuses the input builder / torch reference shape from op_benchmarks/hip/bench_mla_reduce.py.
 Runs the compiled FlyDSL kernel directly (bypasses aiter's flydsl __init__ version gate).
 """
 

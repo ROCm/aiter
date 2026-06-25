@@ -31,8 +31,6 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, gpu, vector, rocdl
-from flydsl.expr import range_constexpr, const_expr
 from flydsl.expr.typing import T
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf, math as mlir_math, gpu as mlir_gpu
@@ -42,7 +40,7 @@ from flydsl.runtime.device import get_rocm_arch
 from .tensor_shim import GTensor, STensor, _to_raw
 
 _LOG2E = math.log2(math.e)
-fm_fast = arith.FastMathFlags.fast
+fm_fast = fx.arith.FastMathFlags.fast
 
 # Matches MlaReduceKernelV1Traits (reduce.cu:13)
 NUM_THREADS = 128
@@ -63,8 +61,8 @@ def _out_t(out_dtype: str):
 
 def _exp(x, use_exp2=True):
     """exp(x) via the hardware v_exp_f32 (exp2(x*log2e))."""
-    if const_expr(use_exp2):
-        return rocdl.exp2(T.f32, x * _LOG2E)
+    if fx.const_expr(use_exp2):
+        return fx.rocdl.exp2(T.f32, x * _LOG2E)
     return mlir_math.exp(x, fastmath=fm_fast)
 
 
@@ -179,20 +177,20 @@ def compile_mla_reduce(
 
         def load_o_elems(g, row_idx, head_idx, col_idx):
             """Load VEC fp32 elements as a python list of scalars."""
-            if const_expr(VEC == 1):
+            if fx.const_expr(VEC == 1):
                 return [g[row_idx, head_idx, col_idx]]
             v = g.vec_load((row_idx, head_idx, col_idx), VEC)
             return [
-                vector.extract(v, static_position=[i], dynamic_position=[])
-                for i in range_constexpr(VEC)
+                fx.vector.extract(v, static_position=[i], dynamic_position=[])
+                for i in fx.range_constexpr(VEC)
             ]
 
         def store_o_elems(g, off_idx, elems_f32):
             """Cast VEC fp32 scalars to out_t and store."""
-            if const_expr(VEC == 1):
+            if fx.const_expr(VEC == 1):
                 g[off_idx] = elems_f32[0].truncf(out_t)
                 return
-            ov = vector.from_elements(acc_vt, [_to_raw(e) for e in elems_f32])
+            ov = fx.vector.from_elements(acc_vt, [_to_raw(e) for e in elems_f32])
             g.vec_store((off_idx,), ov.truncf(out_vt), VEC)
 
         tid = fx.thread_idx.x
@@ -212,7 +210,7 @@ def compile_mla_reduce(
         t1 = fx.Int32(g_indptr[tile + fx.Index(1)])
         n_splits = t1 - t0
 
-        if const_expr(use_reduce_final_map):
+        if fx.const_expr(use_reduce_final_map):
             q_start = fx.Int32(g_fmap[tile, fx.Index(0)])
             q_end = fx.Int32(g_fmap[tile, fx.Index(1)])
         else:
@@ -225,9 +223,9 @@ def compile_mla_reduce(
         col = tid * c_VEC
         lane = tid % fx.Int32(WARP)
         wave = tid // fx.Int32(WARP)
-        width_i32 = _to_raw(arith.constant(WARP, type=T.i32))
+        width_i32 = _to_raw(fx.arith.constant(WARP, type=T.i32))
 
-        if const_expr(is_massive):
+        if fx.const_expr(is_massive):
             base = allocator.get_base()
             lds_scale = STensor(
                 SmemPtr(base, lse_scale_off, T.f32, shape=(LDS_MAX_SPLITS,)),
@@ -247,7 +245,7 @@ def compile_mla_reduce(
         # with `reduce_tile_start == last` and `num_splits > 1` (reduce.cu:691,743).
         # Clamp the loop's upper bound to its lower bound so a no-work tile runs
         # zero iterations and never dereferences that garbage q-range / stores OOB.
-        has_work = arith.cmpi(arith.CmpIPredicate.sgt, n_splits, fx.Int32(1))
+        has_work = fx.arith.cmpi(fx.arith.CmpIPredicate.sgt, n_splits, fx.Int32(1))
         ub_seq = has_work.select(q_end, seq0)
 
         def gather_row(split_i32, local_seq):
@@ -263,17 +261,17 @@ def compile_mla_reduce(
             store_o_elems(g_fo, fx.Index(store_off), out_elems)
 
         def store_lse(seq, max_lse, sum_e):
-            if const_expr(output_lse):
-                bad = arith.ori(
-                    arith.cmpf(
-                        arith.CmpFPredicate.OEQ, sum_e, arith.constant(0.0, type=T.f32)
+            if fx.const_expr(output_lse):
+                bad = fx.arith.ori(
+                    fx.arith.cmpf(
+                        fx.arith.CmpFPredicate.OEQ, sum_e, fx.arith.constant(0.0, type=T.f32)
                     ),
-                    arith.cmpf(arith.CmpFPredicate.UNO, sum_e, sum_e),
+                    fx.arith.cmpf(fx.arith.CmpFPredicate.UNO, sum_e, sum_e),
                 )
                 lse_val = _log(sum_e) + max_lse
-                inf = arith.constant(float("inf"), type=T.f32)
+                inf = fx.arith.constant(float("inf"), type=T.f32)
                 final_lse_val = bad.select(inf, lse_val)
-                is_lane0 = arith.cmpi(arith.CmpIPredicate.eq, tid, fx.Int32(0))
+                is_lane0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, tid, fx.Int32(0))
                 if_lane0 = scf.IfOp(is_lane0, results_=[], has_else=False)
                 with ir.InsertionPoint(if_lane0.then_block):
                     lse_off = fx.Int32(seq) * fx.Int32(H) + fx.Int32(head)
@@ -284,110 +282,110 @@ def compile_mla_reduce(
         # range(q_start + blockIdx.y, q_end, ntg). Built as a raw scf.ForOp (not
         # the AST `for` rewriter) to match this file's raw-builder idiom and to
         # avoid auto iter_args inference on a store-only (no-carry) body.
-        lb = arith.index_cast(ir.IndexType.get(), _to_raw(seq0))
-        ub = arith.index_cast(ir.IndexType.get(), _to_raw(ub_seq))
-        st = arith.index_cast(ir.IndexType.get(), _to_raw(ntg))
+        lb = fx.arith.index_cast(ir.IndexType.get(), _to_raw(seq0))
+        ub = fx.arith.index_cast(ir.IndexType.get(), _to_raw(ub_seq))
+        st = fx.arith.index_cast(ir.IndexType.get(), _to_raw(ntg))
         for_seq = scf.ForOp(lb, ub, st)
         with ir.InsertionPoint(for_seq.body):
             seq = fx.Int32(for_seq.induction_variable)
             local_seq = seq - q_start
 
-            if const_expr(not is_massive):
+            if fx.const_expr(not is_massive):
                 row0 = gather_row(fx.Int32(0), local_seq)
                 o0 = load_o_elems(g_po, row0, fx.Index(head), col)
                 lse0 = g_pl[row0, fx.Index(head)]
 
-                init = [_to_raw(o0[i]) for i in range_constexpr(VEC)]
-                init += [_to_raw(lse0), _to_raw(arith.constant(1.0, type=T.f32))]
+                init = [_to_raw(o0[i]) for i in fx.range_constexpr(VEC)]
+                init += [_to_raw(lse0), _to_raw(fx.arith.constant(1.0, type=T.f32))]
 
                 results = init
                 for s, state in range(
                     fx.Index(1), fx.Index(n_splits), fx.Index(1), init=init
                 ):
-                    regs = [state[i] for i in range_constexpr(VEC)]
+                    regs = [state[i] for i in fx.range_constexpr(VEC)]
                     max_lse = state[VEC]
                     sum_e = state[VEC + 1]
                     rs = gather_row(fx.Int32(s), local_seq)
                     os = load_o_elems(g_po, rs, fx.Index(head), col)
                     lse = g_pl[rs, fx.Index(head)]
-                    new_max = arith.maximumf(max_lse, lse)
+                    new_max = fx.arith.maximumf(max_lse, lse)
                     old = _exp(max_lse - new_max, use_exp2)
                     new = _exp(lse - new_max, use_exp2)
                     new_regs = [
                         _to_raw(regs[i] * old + os[i] * new)
-                        for i in range_constexpr(VEC)
+                        for i in fx.range_constexpr(VEC)
                     ]
                     results = yield new_regs + [
                         _to_raw(new_max),
                         _to_raw(sum_e * old + new),
                     ]
 
-                regs = [results[i] for i in range_constexpr(VEC)]
+                regs = [results[i] for i in fx.range_constexpr(VEC)]
                 max_lse = results[VEC]
                 sum_e = results[VEC + 1]
-                inv = rocdl.rcp(T.f32, sum_e)
-                out_elems = [regs[i] * inv for i in range_constexpr(VEC)]
+                inv = fx.rocdl.rcp(T.f32, sum_e)
+                out_elems = [regs[i] * inv for i in fx.range_constexpr(VEC)]
                 store_result(seq, out_elems)
                 store_lse(seq, max_lse, sum_e)
             else:
-                neg_inf = arith.constant(float("-inf"), type=T.f32)
-                is_wave0 = arith.cmpi(arith.CmpIPredicate.eq, wave, fx.Int32(0))
+                neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
+                is_wave0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, wave, fx.Int32(0))
                 if_w0 = scf.IfOp(is_wave0, results_=[], has_else=False)
                 with ir.InsertionPoint(if_w0.then_block):
                     local_lses = []
                     max_lse = neg_inf
-                    for j in range_constexpr(NLSE):
+                    for j in fx.range_constexpr(NLSE):
                         split_idx = lane + fx.Int32(j * WARP)
-                        in_rng = arith.cmpi(
-                            arith.CmpIPredicate.slt, split_idx, n_splits
+                        in_rng = fx.arith.cmpi(
+                            fx.arith.CmpIPredicate.slt, split_idx, n_splits
                         )
                         safe = in_rng.select(split_idx, fx.Int32(0))
                         rs = gather_row(safe, local_seq)
                         lse_j = g_pl[rs, fx.Index(head)]
                         lse_j = in_rng.select(lse_j, neg_inf)
                         local_lses.append(lse_j)
-                        max_lse = arith.maximumf(max_lse, lse_j)
+                        max_lse = fx.arith.maximumf(max_lse, lse_j)
                     for off in [32, 16, 8, 4, 2, 1]:
                         peer = mlir_gpu.ShuffleOp(
                             _to_raw(max_lse),
-                            _to_raw(arith.constant(off, type=T.i32)),
+                            _to_raw(fx.arith.constant(off, type=T.i32)),
                             width_i32,
                             mode="xor",
                         ).shuffleResult
-                        max_lse = arith.maximumf(max_lse, peer)
-                    sum_e = arith.constant(0.0, type=T.f32)
-                    for j in range_constexpr(NLSE):
+                        max_lse = fx.arith.maximumf(max_lse, peer)
+                    sum_e = fx.arith.constant(0.0, type=T.f32)
+                    for j in fx.range_constexpr(NLSE):
                         sum_e = sum_e + _exp(local_lses[j] - max_lse, use_exp2)
                     for off in [32, 16, 8, 4, 2, 1]:
                         peer = mlir_gpu.ShuffleOp(
                             _to_raw(sum_e),
-                            _to_raw(arith.constant(off, type=T.i32)),
+                            _to_raw(fx.arith.constant(off, type=T.i32)),
                             width_i32,
                             mode="xor",
                         ).shuffleResult
                         sum_e = sum_e + peer
-                    bad = arith.ori(
-                        arith.cmpf(
-                            arith.CmpFPredicate.OEQ,
+                    bad = fx.arith.ori(
+                        fx.arith.cmpf(
+                            fx.arith.CmpFPredicate.OEQ,
                             sum_e,
-                            arith.constant(0.0, type=T.f32),
+                            fx.arith.constant(0.0, type=T.f32),
                         ),
-                        arith.cmpf(arith.CmpFPredicate.UNO, sum_e, sum_e),
+                        fx.arith.cmpf(fx.arith.CmpFPredicate.UNO, sum_e, sum_e),
                     )
-                    inf = arith.constant(float("inf"), type=T.f32)
+                    inf = fx.arith.constant(float("inf"), type=T.f32)
                     global_lse = bad.select(inf, _log(sum_e) + max_lse)
-                    for j in range_constexpr(NLSE):
+                    for j in fx.range_constexpr(NLSE):
                         split_idx = lane + fx.Int32(j * WARP)
-                        in_rng = arith.cmpi(
-                            arith.CmpIPredicate.slt, split_idx, n_splits
+                        in_rng = fx.arith.cmpi(
+                            fx.arith.CmpIPredicate.slt, split_idx, n_splits
                         )
                         if_s = scf.IfOp(in_rng, results_=[], has_else=False)
                         with ir.InsertionPoint(if_s.then_block):
                             sc = _exp(local_lses[j] - global_lse, use_exp2)
                             lds_scale[fx.Index(split_idx)] = sc
                             scf.YieldOp([])
-                    if const_expr(output_lse):
-                        is_l0 = arith.cmpi(arith.CmpIPredicate.eq, lane, fx.Int32(0))
+                    if fx.const_expr(output_lse):
+                        is_l0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, lane, fx.Int32(0))
                         if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
                         with ir.InsertionPoint(if_l0.then_block):
                             lse_off = fx.Int32(seq) * fx.Int32(H) + fx.Int32(head)
@@ -395,11 +393,11 @@ def compile_mla_reduce(
                             scf.YieldOp([])
                     scf.YieldOp([])
 
-                gpu.barrier()
+                fx.gpu.barrier()
 
                 acc0 = [
-                    _to_raw(arith.constant(0.0, type=T.f32))
-                    for _ in range_constexpr(VEC)
+                    _to_raw(fx.arith.constant(0.0, type=T.f32))
+                    for _ in fx.range_constexpr(VEC)
                 ]
                 accr = acc0
                 for s, state in range(
@@ -410,11 +408,11 @@ def compile_mla_reduce(
                     os = load_o_elems(g_po, rs, fx.Index(head), col)
                     sc = lds_scale[fx.Index(s)]
                     new_regs = [
-                        _to_raw(regs[i] + os[i] * sc) for i in range_constexpr(VEC)
+                        _to_raw(regs[i] + os[i] * sc) for i in fx.range_constexpr(VEC)
                     ]
                     accr = yield new_regs
                 accr = _as_list(accr, VEC)
-                out_elems = [accr[i] for i in range_constexpr(VEC)]
+                out_elems = [accr[i] for i in fx.range_constexpr(VEC)]
                 store_result(seq, out_elems)
             scf.YieldOp([])
         return
@@ -435,15 +433,15 @@ def compile_mla_reduce(
         max_seqlen_q: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        if const_expr(is_massive):
+        if fx.const_expr(is_massive):
             allocator.finalized = False
             ctx = CompilationContext.get_current()
             with ir.InsertionPoint(ctx.gpu_module_body):
                 allocator.finalize()
 
-        idx_tiles = arith.index_cast(T.index, num_reduce_tile)
+        idx_tiles = fx.arith.index_cast(T.index, num_reduce_tile)
         idx_H = fx.Index(H)
-        idx_ntg = arith.index_cast(T.index, _to_raw(max_seqlen_q))
+        idx_ntg = fx.arith.index_cast(T.index, _to_raw(max_seqlen_q))
         mla_reduce_kernel(
             partial_output,
             partial_lse,
