@@ -212,6 +212,14 @@ def _lds_swizzle_mask(row):
     return (row & fx.Int32(14)) << fx.Int32(3)
 
 
+def _lds_swizzle_mask_f8(row):
+    """Bank-conflict swizzle for the 256-byte fp8 A row. XOR's the 16-byte chunk
+    column by (row & 7); spreads a 16-lane group's 128-bit ds_reads across all 32
+    banks (8-cycle optimum vs 16-cycle unswizzled). +16-invariant like the fp4
+    mask, so the read can key on lane_mod_16 across all M-chunks."""
+    return (row & fx.Int32(7)) << fx.Int32(4)
+
+
 # -- epilog math helpers (HIP mxfp4_epilogs.hpp 87-122 + mxfp4_gemm_common.hpp) -
 def _silu_mul(g, u):
     """silu(g)*u, matching HIP silu_mul_fast (mxfp4_gemm_common.hpp:62-65):
@@ -517,7 +525,7 @@ def _gemm1_body(
                     wave * fx.Int32(BM // 4) + fx.Int32(sub * 8 + h * rows_per_call)
                 )
                 mask = (
-                    fx.Int32(0)
+                    _lds_swizzle_mask_f8(lds_row + lane_row)
                     if is_f8_a
                     else _lds_swizzle_mask(lds_row + lane_div_8)
                 )
@@ -549,7 +557,10 @@ def _gemm1_body(
                     KH_TILE_A
                 )
                 if const_expr(is_f8_a):
-                    col_lo = lane_div_16 * fx.Int32(16) + fx.Int32(k * 128)
+                    mask = _lds_swizzle_mask_f8(lane_mod_16)
+                    col0 = lane_div_16 * fx.Int32(16) + fx.Int32(k * 128)
+                    col_lo = col0 ^ mask
+                    col_hi = (col0 + fx.Int32(64)) ^ mask
                     lo = Vec(
                         llvm.load(
                             T.vec(2, T.i64), _gep3(base_ptr, row_off + col_lo)
@@ -557,8 +568,7 @@ def _gemm1_body(
                     )
                     hi = Vec(
                         llvm.load(
-                            T.vec(2, T.i64),
-                            _gep3(base_ptr, row_off + col_lo + fx.Int32(64)),
+                            T.vec(2, T.i64), _gep3(base_ptr, row_off + col_hi)
                         )
                     )
                     a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
@@ -670,7 +680,7 @@ def _gemm1_body(
                 fx.Int32(B128_IDX * 128)
                 + lane_shr2_and3 * fx.Int32(32)
                 + lib * fx.Int32(8)
-            )
+            ) ^ _lds_swizzle_mask_f8(r)
             off = row_off + col
             llvm.StoreOp(pk0, _lds_ptr3(aq_base, off))
             llvm.StoreOp(pk1, _lds_ptr3(aq_base, off + fx.Int32(4)))
