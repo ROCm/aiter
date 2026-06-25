@@ -134,6 +134,38 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     return tuple(int(m.group(i)) for i in range(1, 9))
 
 
+def _parse_flydsl_mxfp8_kernel_name(kernel_name: str):
+    """Parse an mxfp8 flydsl kernelName into a config dict, or None.
+
+    Format: ``flydsl_bpreshuflle_{tm}x{tn}x{tk}_MXF8_MXF8_{OUT}_
+    {lds}x{csh}x{acp}x{wpe}x{xcd}_{sched}[_spk{N}]``. Returns all the knobs the
+    mxfp8 kernel needs (tile + lds/cshuffle/async/waves_per_eu/xcd + split_k) so
+    the tuned config drives the launch, not just the tile.
+    """
+    import re
+
+    m = re.match(
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_MXF8_MXF8_\w+_"
+        r"(\d+)x(\d+)x(\d+)x(\d+)x(\d+)_[A-Za-z][A-Za-z0-9]*"
+        r"(?:_spk(\d+))?$",
+        kernel_name,
+    )
+    if m is None:
+        return None
+    g = m.groups()
+    return {
+        "tile_m": int(g[0]),
+        "tile_n": int(g[1]),
+        "tile_k": int(g[2]),
+        "lds_stage": int(g[3]),
+        "use_cshuffle_epilog": int(g[4]),
+        "use_async_copy": int(g[5]),
+        "waves_per_eu": int(g[6]),
+        "xcd_swizzle": int(g[7]),
+        "split_k": int(g[8]) if g[8] else 1,
+    }
+
+
 def gemm_a8w8_bpreshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
@@ -735,9 +767,11 @@ def _mxfp8_default_tile(m: int, n: int, k: int):
 
     No tuning catalog exists for mxfp8 yet, so default to divisor-respecting
     tiles from the hardware-verified set. tile_k must divide K and be a
-    multiple of 128 (each mxfp8 MFMA consumes 128 K). tile_n must divide N.
-    tile_m * tile_n is a multiple of 2048 (the split-K zero-tile constraint)
-    for every (tile_m in {64,128,256}) x (tile_n in {32,64,128,256}) pair below.
+    multiple of 128 (each mxfp8 MFMA consumes 128 K). tile_n must divide N AND
+    be a multiple of 128 -- the microscale MMA packs N by 2, so tile_n in
+    {32, 64, 192, ...} produce wrong/zero output (verified on gfx950). tile_m *
+    tile_n is a multiple of 2048 (the split-K zero-tile constraint) for every
+    (tile_m in {64,128,256}) x (tile_n in {128,256}) pair below.
     """
     if k % 256 == 0:
         tk = 256
@@ -748,13 +782,14 @@ def _mxfp8_default_tile(m: int, n: int, k: int):
             f"[mxfp8] K ({k}) must be a multiple of 128 for the preshuffle GEMM"
         )
     tn = None
-    for cand in (128, 256, 64, 32):
+    for cand in (256, 128):
         if n % cand == 0:
             tn = cand
             break
     if tn is None:
         raise RuntimeError(
-            f"[mxfp8] N ({n}) must be a multiple of 32 for the preshuffle GEMM"
+            f"[mxfp8] N ({n}) must be a multiple of 128 for the preshuffle GEMM "
+            f"(tile_n must be a multiple of 128; got N={n})"
         )
     if m >= 256:
         tm = 256
@@ -789,9 +824,22 @@ def gemm_a8w8_bpreshuffle_mxfp8(
         w_scale: [N, K//32]  e8m0 weight scales, ``fp4_utils.e8m0_shuffle``'d.
         dtype:   bf16 / fp16 output.
         splitK:  K-split factor (0 -> 1 == single pass). splitK > 1 uses the
-                 in-kernel bf16 atomic reduction; needs K % splitK == 0 and
-                 (K // splitK) % tile_k == 0.
+                 in-kernel bf16 atomic reduction (see constraints below).
         tile_m / tile_n / tile_k: optional tile override (0 -> auto-pick).
+
+    Constraints (mxfp8 preshuffle, gfx950):
+      * K must be a multiple of 128 (each scaled MFMA consumes 128 K). K a
+        multiple of 256 uses tile_k=256; K a multiple of 128 but NOT 256
+        (e.g. K=384) forces tile_k=128.
+      * N must be a multiple of tile_n; tile_n must be a multiple of 128
+        (the microscale MMA packs N by 2), so the auto-pick tries 256 then 128.
+      * split-K (splitK > 1):
+          - requires K % splitK == 0 and (K // splitK) % tile_k == 0;
+          - is NOT supported with tile_k=128 (K a multiple of 128 but not 256)
+            -- pass splitK=0/1 for those shapes.
+      * This op always runs the kernel with lds_stage=2 and cshuffle disabled,
+        so the kernel-level lds_stage/cshuffle restrictions for tile_k=128 and
+        split-K are satisfied automatically (those knobs are not exposed here).
 
     Returns the freshly-allocated [M, N] output.
     """
@@ -815,11 +863,60 @@ def gemm_a8w8_bpreshuffle_mxfp8(
     n = WQ.shape[0]
     k = XQ.shape[-1]
 
+    # Resolve the kernel config. Precedence: explicit tile/splitK args > tuned
+    # CSV (mirrors how gemm_a8w8_bpreshuffle drives the WMMA path from its tuned
+    # CSV) > the divisor-respecting heuristic. The tuned config also carries the
+    # lds/cshuffle/async/waves_per_eu/xcd knobs, so a tuned shape launches the
+    # exact winning kernel, not just its tile.
+    cfg = None
+    if not (tile_m and tile_n and tile_k):
+        try:
+            cfg = get_GEMM_config_with_quant_type(
+                m,
+                n,
+                k,
+                "mxfp8",
+                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_MXFP8_FILE,
+            )
+        except (FileNotFoundError, OSError):
+            cfg = None
+    parsed = (
+        _parse_flydsl_mxfp8_kernel_name(str(cfg.get("kernelName", ""))) if cfg else None
+    )
+
     dtm, dtn, dtk = _mxfp8_default_tile(m, n, k)
+    # Kernel knobs: defaults match flydsl_preshuffle_gemm_mxfp8's own defaults
+    # (lds_stage=2, everything else off); a tuned config overrides them.
+    lds_stage, use_csh, use_acp, wpe, xcd = 2, 0, 0, 0, 0
+    cspk = 0
+    if parsed is not None:
+        dtm, dtn, dtk = parsed["tile_m"], parsed["tile_n"], parsed["tile_k"]
+        lds_stage = parsed["lds_stage"]
+        use_csh = parsed["use_cshuffle_epilog"]
+        use_acp = parsed["use_async_copy"]
+        wpe = parsed["waves_per_eu"]
+        xcd = parsed["xcd_swizzle"]
+        cspk = parsed["split_k"]
+
     tm = tile_m if tile_m > 0 else dtm
     tn = tile_n if tile_n > 0 else dtn
     tk = tile_k if tile_k > 0 else dtk
-    spk = splitK if splitK and splitK > 0 else 1
+    spk = splitK if splitK and splitK > 0 else (cspk if cspk > 0 else 1)
+
+    # Surface the split-K constraints here (clearer than the deep compile-time
+    # error), since the auto-tile may silently pick tile_k=128 for K that is a
+    # multiple of 128 but not 256 -- which cannot do split-K.
+    if spk > 1:
+        if tk == 128:
+            raise RuntimeError(
+                f"[mxfp8] splitK>1 is not supported with tile_k=128 (K={k} is a "
+                f"multiple of 128 but not 256); pass splitK=0/1 for this shape."
+            )
+        if k % spk != 0 or (k // spk) % tk != 0:
+            raise RuntimeError(
+                f"[mxfp8] invalid splitK={spk}: needs K ({k}) % splitK == 0 and "
+                f"(K // splitK) % tile_k ({tk}) == 0."
+            )
 
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     flydsl_preshuffle_gemm_mxfp8(
@@ -831,6 +928,11 @@ def gemm_a8w8_bpreshuffle_mxfp8(
         tile_m=tm,
         tile_n=tn,
         tile_k=tk,
+        lds_stage=lds_stage,
+        use_cshuffle_epilog=use_csh,
+        use_async_copy=use_acp,
+        waves_per_eu=wpe,
+        xcd_swizzle=xcd,
         split_k=spk,
     )
     return Y

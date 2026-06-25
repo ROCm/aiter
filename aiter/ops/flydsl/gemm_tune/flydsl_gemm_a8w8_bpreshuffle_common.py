@@ -26,6 +26,7 @@ def get_gfx():
 _DTYPE_SHORT = {
     "fp8": "F8",
     "int8": "I8",
+    "mxfp8": "MXF8",
     "bf16": "B16",
     "fp16": "F16",
 }
@@ -45,13 +46,17 @@ class kernelInstance:
     waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
     sScheduler: str  # "Default"
     xcd_swizzle: int = 0  # 0=off, >0=group size for XCD remap
+    split_k: int = 1  # 1=single-pass; >1=in-kernel bf16-atomic split-K (mxfp8)
 
     @property
     def name(self) -> str:
         qa = _DTYPE_SHORT.get(self.q_dtype_a, self.q_dtype_a.upper())
         qw = _DTYPE_SHORT.get(self.q_dtype_w, self.q_dtype_w.upper())
         dt = _DTYPE_SHORT.get(self.dtype, self.dtype.upper())
-        return "_".join(
+        # split_k == 1 emits no suffix, so single-pass names are byte-for-byte
+        # identical to the legacy format (and the AOT/runtime parsers stay
+        # backward compatible). split_k > 1 appends "_spk{N}".
+        name = "_".join(
             [
                 "flydsl",
                 "bpreshuflle",
@@ -74,6 +79,9 @@ class kernelInstance:
                 self.sScheduler.lower(),
             ]
         )
+        if int(self.split_k) > 1:
+            name += f"_spk{int(self.split_k)}"
+        return name
 
 
 def _ki(
@@ -89,6 +97,7 @@ def _ki(
     q_dtype_a="fp8",
     q_dtype_w="fp8",
     dtype="bf16",
+    split_k=1,
 ):
     return kernelInstance(
         tile_m,
@@ -103,6 +112,7 @@ def _ki(
         waves_per_eu,
         scheduler,
         xcd_swizzle,
+        split_k,
     )
 
 
@@ -136,7 +146,9 @@ def preshuffle_gemm_estimated_lds_bytes(
     instances that exceed AMDGPU per-kernel LDS limits (e.g. 64 KiB on gfx942).
     """
     is_fp4 = in_dtype == "fp4"
-    elem_bytes = 1 if in_dtype in ("fp8", "int8", "int4", "fp4") else 2
+    # mxfp8 carries 1-byte fp8 data (the e8m0 microscale is applied in-MMA, not
+    # staged in LDS), so it sizes like fp8, not like a 2-byte type.
+    elem_bytes = 1 if in_dtype in ("fp8", "int8", "int4", "fp4", "mxfp8") else 2
     a_elem_vec_pack = 2 if is_fp4 else 1
     tile_k_bytes = int(tile_k) * elem_bytes
     lds_tile_bytes = int(tile_m) * tile_k_bytes // a_elem_vec_pack
@@ -333,3 +345,140 @@ if arch == "gfx942":
 else:
     kernels_list = kernels_list_950
     default_kernels_dict = default_kernels_dict_950
+
+
+# ---------------------------------------------------------------------------
+# mxfp8 (fp8 E4M3 data + per-1x32 e8m0 microscale) -- gfx950 only
+# ---------------------------------------------------------------------------
+# mxfp8 reuses the SAME tile/combo sweep as the plain-fp8 list above, with two
+# differences: (1) the dtype is "mxfp8", and (2) split_k is swept (the in-kernel
+# bf16-atomic reduction helps the skinny-M / huge-K shapes, e.g. dsv4 M=1). The
+# fp8 ``kernels_list`` is left byte-for-byte unchanged -- this is a separate dict
+# with its own kernel ids so the two paths never collide.
+#
+# mxfp8 tile_k must be 128 or a multiple of 256 (each scaled MFMA spans 128 K;
+# pairs of 128-K MFMAs share one 256-K e8m0 scale). split_k > 1 needs lds_stage=2,
+# no cshuffle, and tile_k != 128 (mirrors preshuffle_gemm.py's kernel guards).
+# Mirror of the runtime cap in gemm_kernels.PRESHUFFLE_SPLIT_K_MAX_TILES (kept as
+# a local literal so this tune-side module stays import-light).
+_MXFP8_SPLIT_K_MAX_TILES = 256
+# split_k sweep is DISABLED for now (single-pass only). On gfx950 the mxfp8
+# split-K path currently (1) drifts 5-11% from the fp32 reference for skinny-M /
+# huge-K shapes -- inherent to its bf16 atomic reduction, which exceeds the
+# tuner's error gate -- and (2) hits a GPU memory fault for at least one config
+# (32x128x256, split_k=4). The instance/fits/validity machinery below still
+# handles split_k > 1, so re-enable by widening this tuple once the kernel
+# split-K path is hardened and the tuner compares split_k>1 against the
+# split_k=1 output (not the fp32 ref).
+_MXFP8_SPLIT_K_OPTIONS = (1,)
+
+
+def _mxfp8_tile_k_ok(tk: int) -> bool:
+    return int(tk) == 128 or (int(tk) % 256) == 0
+
+
+def _mxfp8_tile_n_ok(tn: int) -> bool:
+    # Root cause: the microscale path packs N by 2 (pack_N=2) via INTEGER
+    # division -- preshuffle_gemm.py computes num_acc_n = tile_n // 64 (4 waves x
+    # 16-wide MFMA) then _num_acc_n_packed = num_acc_n // 2. If num_acc_n is odd
+    # the kernel silently drops the trailing acc_n (no error), so that slice of N
+    # is never written -> wrong/zero output. num_acc_n must be even, i.e. tile_n
+    # must be a multiple of 128. (plain fp8 uses pack_N=1, so tile_n % 64 is
+    # enough -- that's why fp8 supports tile_n=64 but mxfp8 does not.)
+    # Verified gfx950: tile_n=64 -> all-zero, 96 -> wrong, 192 -> ~mismatch.
+    return (int(tn) % 128) == 0
+
+
+def _mxfp8_tile_m_ok(tm: int) -> bool:
+    # Root cause (same mechanism as _mxfp8_tile_n_ok, M side): the microscale path
+    # packs M by 2 (pack_M=2) via integer division -- m_repeat = tile_m // 16 then
+    # _m_repeat_packed = m_repeat // 2. m_repeat must be even, i.e. tile_m must be
+    # a multiple of 32. Verified gfx950: tile_m=16 -> all-zero, tile_m=48 -> ~48%
+    # mismatch.
+    return (int(tm) % 32) == 0
+
+
+def _build_mxfp8_kernels_list(tiles_lds2, tiles_lds1, total_vgpr=512):
+    """Mirror of ``_build_kernels_list`` for mxfp8 (dtype + split_k sweep)."""
+    tiles_by_lds = {2: tiles_lds2, 1: tiles_lds1}
+    kl = {}
+    idx = 0
+    for wpe in _WAVES_PER_EU:
+        for csh in _CSHUFFLE_VALS:
+            for acp in _ASYNC_COPY_VALS:
+                for xcd in _XCD_SWIZZLE_VALS:
+                    for lds in _LDS_STAGES:
+                        for tm, tn, tk in tiles_by_lds[lds]:
+                            if not _mxfp8_tile_k_ok(tk):
+                                continue
+                            if not _mxfp8_tile_n_ok(tn):
+                                continue
+                            if not _mxfp8_tile_m_ok(tm):
+                                continue
+                            if tk == 128 and lds != 2:
+                                # mxfp8 tile_k=128 requires lds_stage=2.
+                                continue
+                            if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
+                                continue
+                            for spk in _MXFP8_SPLIT_K_OPTIONS:
+                                if spk > 1 and (lds != 2 or csh != 0 or tk == 128):
+                                    # split_k>1: lds=2, no cshuffle, tile_k!=128.
+                                    continue
+                                kl[idx] = _ki(
+                                    tm, tn, tk, lds, csh, acp, wpe, xcd,
+                                    q_dtype_a="mxfp8", q_dtype_w="mxfp8",
+                                    dtype="bf16", split_k=spk,
+                                )
+                                idx += 1
+    return kl
+
+
+# fmt: off
+kernels_list_mxfp8_950 = _build_mxfp8_kernels_list(
+    _base_tiles_lds2_common + _base_tiles_lds2_950_extra, _base_tiles_lds1,
+    total_vgpr=_vgpr_per_simd("gfx950"))
+# fmt: on
+
+# mxfp8 is gfx950-only (mfma_scale_f32_16x16x128_f8f6f4); no gfx942 list.
+kernels_list_mxfp8 = kernels_list_mxfp8_950
+
+
+def mxfp8_instance_valid(ki: kernelInstance) -> bool:
+    """Shape-independent validity of an mxfp8 kernelInstance config.
+
+    Encodes the kernel's internal constraints (tile_k, split_k vs lds/cshuffle,
+    LDS budget) so an invalid instance is never emitted into the candidate pool.
+    """
+    if ki.q_dtype_a != "mxfp8" or ki.q_dtype_w != "mxfp8":
+        return False
+    if not _mxfp8_tile_k_ok(ki.tile_k):
+        return False
+    if not _mxfp8_tile_n_ok(ki.tile_n):
+        return False
+    if not _mxfp8_tile_m_ok(ki.tile_m):
+        return False
+    if ki.tile_k == 128 and ki.lds_stage != 2:
+        return False
+    if int(ki.split_k) > 1:
+        if ki.lds_stage != 2 or ki.use_cshuffle_epilog != 0 or ki.tile_k == 128:
+            return False
+    if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
+        return False
+    return True
+
+
+def mxfp8_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+    """Shape-dependent fit: N % tile_n, K % tile_k, split-K divisibility + pool cap.
+
+    M may be ragged (the kernel OOB-clips along M), so no M divisibility needed.
+    """
+    spk = int(ki.split_k)
+    if N % ki.tile_n != 0 or K % ki.tile_k != 0:
+        return False
+    if spk > 1:
+        if K % spk != 0 or (K // spk) % ki.tile_k != 0:
+            return False
+        n_tiles = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+        if n_tiles > _MXFP8_SPLIT_K_MAX_TILES:
+            return False
+    return True

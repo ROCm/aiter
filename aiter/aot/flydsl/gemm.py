@@ -12,7 +12,8 @@ way as runtime JIT config lookup.
 
 Supported kernel families:
   - ``flydsl_gemm2_*``           split-K HGEMM kernels
-  - ``flydsl_bpreshuflle_*``     a8w8 preshuffle GEMM kernels
+  - ``flydsl_bpreshuflle_*``     a8w8 / mxfp8 preshuffle GEMM kernels
+                                 (incl. in-kernel split-K, ``..._spk{N}`` suffix)
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -47,6 +48,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.gemm_kernels import (
+    PRESHUFFLE_SPLIT_K_MAX_TILES,
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_splitk_hgemm_kernel_params,
 )
@@ -72,11 +74,13 @@ _PRESHUFFLE_RE = re.compile(
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
     r"(?P<lds_stage>\d+)x(?P<cshuffle>\d+)x(?P<async_copy>\d+)x"
     r"(?P<waves_per_eu>\d+)x(?P<xcd_swizzle>\d+)_"
-    r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)$"
+    r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
+    r"(?:_spk(?P<split_k>\d+))?$"
 )
 _SHORT_DTYPE = {
     "F8": "fp8",
     "I8": "int8",
+    "MXF8": "mxfp8",
     "B16": "bf16",
     "F16": "fp16",
 }
@@ -110,6 +114,9 @@ def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
             f"Unsupported mixed preshuffle input dtypes in {name!r}: {qa} vs {qw}"
         )
 
+    # Optional "_spk{N}" suffix: in-kernel bf16-atomic split-K. Absent → 1.
+    split_k = int(m.group("split_k")) if m.group("split_k") else 1
+
     return {
         "kind": "preshuffle",
         "tile_m": int(m.group("tile_m")),
@@ -123,6 +130,7 @@ def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
         "waves_per_eu": int(m.group("waves_per_eu")),
         "scheduler": m.group("scheduler"),
         "xcd_swizzle": int(m.group("xcd_swizzle")),
+        "split_k": split_k,
     }
 
 
@@ -308,6 +316,7 @@ def _compile_preshuffle_to_cache(
     use_async_copy: int,
     waves_per_eu: int,
     xcd_swizzle: int = 0,
+    split_k: int = 1,
     **kwargs,
 ):
     del kwargs
@@ -316,18 +325,25 @@ def _compile_preshuffle_to_cache(
 
     dev = torch.device("cpu")
     out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
+    split_k = int(split_k)
 
-    # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
+    # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8/mxfp8
+    # data; mxfp8 also reads per-1x32 e8m0 (1-byte) microscales. Exact tensor
+    # sizes do not affect the compiled kernel (compilation keys on K / tiles /
+    # in_dtype / split_k); they only need valid pointers for the compile-only
+    # launch.
     a = torch.empty((m * k,), device=dev, dtype=torch.int8)
     b = torch.empty((n * k,), device=dev, dtype=torch.int8)
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
     bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
-    # arg_semaphore / arg_signal placeholders (only used by split-K; AOT
-    # compiles split_k=1).
-    semaphore = torch.empty(1, device=dev, dtype=torch.int32)
-    signal = torch.empty(1, device=dev, dtype=torch.int32)
+    # arg_semaphore / arg_signal: split_k == 1 is a no-op (single element is
+    # enough); split_k > 1 uses the dedicated per-(m,n)-tile counter pool, sized
+    # to match the runtime allocation in _get_preshuffle_split_k_tensors.
+    counter_len = PRESHUFFLE_SPLIT_K_MAX_TILES if split_k > 1 else 1
+    semaphore = torch.zeros(counter_len, device=dev, dtype=torch.int32)
+    signal = torch.zeros(counter_len, device=dev, dtype=torch.int32)
     stream = fx.Stream(0)
 
     exe = compile_preshuffle_gemm_a8(
@@ -343,6 +359,7 @@ def _compile_preshuffle_to_cache(
         use_async_copy=bool(use_async_copy),
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         xcd_swizzle=xcd_swizzle,
+        split_k=split_k,
     )
     _compile_executable_to_cache(
         exe,

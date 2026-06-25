@@ -26,6 +26,8 @@ try:
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
         kernel_instance_estimated_lds_bytes,
         kernels_list as kernels_list_flydsl,
+        kernels_list_mxfp8 as kernels_list_flydsl_mxfp8,
+        mxfp8_fits_shape,
         max_lds_bytes_for_tune,
     )
 except ImportError:
@@ -33,9 +35,13 @@ except ImportError:
         "[FlyDSL] flydsl_gemm_a8w8_bpreshuffle_common.py not found, flydsl tuning disabled"
     )
     kernels_list_flydsl = {}
+    kernels_list_flydsl_mxfp8 = {}
 
     def kernel_instance_estimated_lds_bytes(_ki):
         return 0
+
+    def mxfp8_fits_shape(_ki, _M, _N, _K):
+        return False
 
     def max_lds_bytes_for_tune():
         return 1 << 30
@@ -44,7 +50,10 @@ except ImportError:
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 if is_flydsl_available():
-    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+    from aiter.ops.flydsl.gemm_kernels import (
+        flydsl_preshuffle_gemm_a8,
+        flydsl_preshuffle_gemm_mxfp8,
+    )
 
 
 def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
@@ -183,6 +192,83 @@ def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_id)
     return out
 
 
+def run_gemm_flydsl_mxfp8(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+    ki = kernels_list_flydsl_mxfp8[kernel_id]
+    flydsl_preshuffle_gemm_mxfp8(
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out,
+        tile_m=ki.tile_m,
+        tile_n=ki.tile_n,
+        tile_k=ki.tile_k,
+        lds_stage=ki.lds_stage,
+        use_cshuffle_epilog=ki.use_cshuffle_epilog,
+        use_async_copy=ki.use_async_copy,
+        waves_per_eu=ki.waves_per_eu,
+        xcd_swizzle=getattr(ki, "xcd_swizzle", 0),
+        split_k=int(ki.split_k),
+    )
+    return out
+
+
+def run_torch_mxfp8(x_fp8, weight_fp8, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+    """fp32 reference for mxfp8: dequant A/W with e8m0 microscales, then matmul."""
+    from aiter.utility import fp4_utils
+
+    block = 32
+    M, K = x_fp8.shape
+    N = weight_fp8.shape[0]
+    x_sf = fp4_utils.e8m0_to_f32(x_scale).float()  # [M, K//32]
+    w_sf = fp4_utils.e8m0_to_f32(w_scale).float()  # [N, K//32]
+    a = (x_fp8.float().view(M, K // block, block) * x_sf.view(M, K // block, 1)).view(
+        M, K
+    )
+    b = (weight_fp8.float().view(N, K // block, block) * w_sf.view(N, K // block, 1)).view(
+        N, K
+    )
+    out = a @ b.t()
+    if bias is not None:
+        out = out + bias
+    return out.to(dtype)
+
+
+def generate_data_mxfp8(m, n, k, seed, dtype=dtypes.bf16, device="cuda"):
+    """mxfp8 data: fp8 (E4M3) A/W quantized per-1x32 with e8m0 microscales.
+
+    Returns the un-shuffled fp8 tensors + e8m0 scales for the reference, and the
+    shuffled weight + e8m0_shuffle'd scales for the kernel (matches the runtime
+    pre-shuffle convention of gemm_a8w8_bpreshuffle_mxfp8).
+    """
+    from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+    from aiter.utility import fp4_utils
+
+    torch.manual_seed(seed)
+    x = torch.randn((m, k), dtype=dtype, device=device)
+    weight = torch.randn((n, k), dtype=dtype, device=device)
+    x_fp8, x_scale = per_1x32_f8_scale_f8_quant(
+        x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    w_fp8, w_scale = per_1x32_f8_scale_f8_quant(
+        weight, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    weight_shuffle = shuffle_weight(w_fp8, layout=(16, 16))
+    return {
+        "x": x_fp8,
+        "weight_shuffle": weight_shuffle,
+        "x_scale": fp4_utils.e8m0_shuffle(x_scale),
+        "w_scale": fp4_utils.e8m0_shuffle(w_scale),
+        "out": torch.empty(m, n, dtype=dtype, device=device),
+        # reference inputs (un-shuffled data + raw e8m0 scales)
+        "weight": w_fp8,
+        "x_ref": x_fp8,
+        "x_scale_ref": x_scale,
+        "w_scale_ref": w_scale,
+        "bias_f32": None,
+    }
+
+
 def generate_data(
     m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, is_asm=False, device="cuda"
 ):
@@ -276,6 +362,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             if kernelId not in kernels_list_flydsl:
                 return None
             return kernels_list_flydsl[kernelId].name
+        elif libtype == "flydsl_mxfp8":
+            if kernelId not in kernels_list_flydsl_mxfp8:
+                return None
+            return kernels_list_flydsl_mxfp8[kernelId].name
         else:
             return None
         return kernelList[kernelId].name
@@ -300,6 +390,8 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     def get_asm_gemm_i8_tasks(self, info_keys, useSplitK, kernel_id_start, seed=0):
         task = []
         gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        if str(q_dtype_w).strip() == "mxfp8":
+            return task  # mxfp8 is a FlyDSL-only path; no ASM i8 kernels
         if eval(q_dtype_w) != dtypes.i8:
             return task
         asm_kernel_list_csv = f"{get_asm_dir()}/i8gemm/i8gemm_bf16_perTokenI8.csv"
@@ -364,6 +456,8 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         seed,
     ):
         gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        if str(q_dtype_w).strip() == "mxfp8":
+            return []  # mxfp8 is a FlyDSL-only path; CKTile does not handle it
         if eval(q_dtype_w) != dtypes.fp8:
             print(
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
@@ -430,6 +524,8 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         seed,
     ):
         gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        if str(q_dtype_w).strip() == "mxfp8":
+            return []  # mxfp8 is a FlyDSL-only path; CK does not handle it
         if eval(q_dtype_w) != dtypes.fp8:
             print(
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
@@ -492,6 +588,9 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         seed,
     ):
         gfx, cu_num, M, N, K, q_dtype_w = info_keys
+
+        if str(q_dtype_w).strip() == "mxfp8":
+            return self._get_flydsl_tune_task_mxfp8(info_keys, seed)
 
         if gfx == "gfx1250":
             return self._get_flydsl_tune_task_gfx1250(info_keys, seed)
@@ -615,6 +714,83 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                         "num_iters": args.iters,
                     },
                     run_torch,
+                    (
+                        ref_keys,
+                        dtypes.bf16,
+                    ),
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                    None,
+                    None,
+                    ("out",),
+                )
+            )
+        return tasks
+
+    def _get_flydsl_tune_task_mxfp8(self, info_keys, seed):
+        """gfx950 mxfp8 (fp8 + e8m0 microscale) tuning tasks for the FlyDSL libtype.
+
+        Candidate instances come from ``kernels_list_mxfp8`` (the fp8 MFMA tile
+        sweep with dtype=mxfp8); the data/ref use the e8m0 microscale path. Reuses
+        the same per-shape perf pruning as the plain-fp8 flydsl tasks.
+        """
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        if not is_flydsl_available() or "flydsl_preshuffle_gemm_mxfp8" not in globals():
+            return []
+        if not kernels_list_flydsl_mxfp8:
+            return []
+        # mxfp8 is gfx950-only; skip on other arches.
+        if gfx not in ("gfx950",):
+            print(f"[FlyDSL] mxfp8 tuning is gfx950-only, skipping gfx={gfx}")
+            return []
+
+        gemm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
+        ref_keys = ["x_ref", "weight", "x_scale_ref", "w_scale_ref", "bias_f32"]
+        tasks = []
+        lds_limit = max_lds_bytes_for_tune()
+        padded_m = _get_padded_m(M)
+        min_ctas = max(4, min(16, N // 64))
+        for i in sorted(kernels_list_flydsl_mxfp8.keys()):
+            ki = kernels_list_flydsl_mxfp8[i]
+            if kernel_instance_estimated_lds_bytes(ki) > lds_limit:
+                continue
+            if not mxfp8_fits_shape(ki, M, N, K):
+                continue
+            # M may be ragged (the kernel OOB-clips along M), so do NOT require
+            # padded_m % tile_m == 0 -- that would starve skinny-M + tile_k=128
+            # shapes (e.g. M=1, K=384), whose only valid tiles have tile_m >= 32.
+            # Allow over-tiling up to tile_m=64 so those shapes still get
+            # candidates without picking wastefully large tiles for tiny M.
+            if ki.tile_m > padded_m and ki.tile_m > 64:
+                continue
+            num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+            if num_ctas < min_ctas:
+                continue
+            # mxfp8 tile_m is always a multiple of 32 (pack_M=2), so the fp8
+            # pruning rules keyed on tile_m == 16 / tile_m < 32 never fire and are
+            # omitted here. Only the tile_m=32-vs-large-M prune stays live.
+            if M >= 8192 and ki.tile_m < 64:
+                continue
+            if getattr(ki, "xcd_swizzle", 0) > 0 and num_ctas < 64:
+                continue
+            info = (info_keys, i, int(ki.split_k), ki.name, "flydsl_mxfp8")
+            tasks.append(
+                (
+                    info,
+                    generate_data_mxfp8,
+                    (M, N, K, seed, dtypes.bf16),
+                    run_gemm_flydsl_mxfp8,
+                    (
+                        gemm_keys,
+                        i,
+                    ),
+                    {
+                        "num_warmup": args.warmup,
+                        "num_iters": args.iters,
+                    },
+                    run_torch_mxfp8,
                     (
                         ref_keys,
                         dtypes.bf16,

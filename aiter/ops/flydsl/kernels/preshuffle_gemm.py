@@ -240,6 +240,27 @@ def compile_preshuffle_gemm_a8(
                 f"got tile_k={tile_k}"
             )
 
+    if use_micro_scale:
+        # The microscale MMA (fp4 / mxfp8) packs M and N by 2 (pack_M=pack_N=2).
+        # compute_tile forms m_repeat = tile_m // 16 and num_acc_n = tile_n // 64
+        # (4 waves x 16-wide MFMA), then HALVES each via integer division for the
+        # pack (_m_repeat_packed = m_repeat // 2, _num_acc_n_packed = num_acc_n //
+        # 2). If either is odd the kernel SILENTLY drops the trailing half-tile
+        # (that M/N slice is never written -> wrong/zero output, no error). Reject
+        # such tiles at compile time instead. Require tile_m % 32 == 0 (m_repeat
+        # even) and tile_n % 128 == 0 (num_acc_n even). (plain fp8/int8 use
+        # pack=1, so they are unaffected and may use tile_n=64 / tile_m=16.)
+        if (int(tile_m) % 32) != 0:
+            raise ValueError(
+                f"{in_dtype} (microscale) requires tile_m % 32 == 0 "
+                f"(pack_M=2 needs tile_m // 16 even), got tile_m={tile_m}"
+            )
+        if (int(tile_n) % 128) != 0:
+            raise ValueError(
+                f"{in_dtype} (microscale) requires tile_n % 128 == 0 "
+                f"(pack_N=2 needs tile_n // 64 even), got tile_n={tile_n}"
+            )
+
     # ── split-K (in-kernel bf16 atomic) ───────────────────────────────────────
     # grid.z = split_k; block bz reduces the K-slice [bz*K_EFF, (bz+1)*K_EFF) and
     # bf16-atomic-adds its partial into the single [M, N] output (zeroed in-kernel
