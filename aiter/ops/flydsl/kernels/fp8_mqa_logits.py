@@ -183,166 +183,6 @@ def _fp8_dtype():
     return fx.Float8E4M3FN
 
 
-def _build_kernel(*, num_heads: int, head_size: int, block_kv: int):
-    """Build the @flyc.kernel + @flyc.jit launcher for one shape config.
-
-    Correctness-first design (no MFMA yet): grid ``(seq_len,)``, one wave64
-    per query row. Lane ``t`` owns KV columns ``start + t, +64, +128, ...``
-    across the row's window and, for each, computes the full
-    ``sum_h ReLU(dot * kv_scale) * weight`` reduction with a vectorized
-    inner dot over the head dim.
-    """
-    H = num_heads
-    D = head_size
-    assert D % VEC_D == 0, f"head_size={D} must be a multiple of VEC_D={VEC_D}"
-    ND = D // VEC_D  # number of VEC_D-wide chunks along the head dim
-
-    fp8_dt = _fp8_dtype()
-    fm_fast = arith.FastMathFlags.fast
-
-    _kname = f"fp8_mqa_logits_H{H}_D{D}_bkv{block_kv}_flydsl"
-
-    @flyc.kernel(name=_kname)
-    def kernel(
-        Q: fx.Tensor,  # [seq_len, H, D]      fp8 (any variant; bytes passed raw)
-        KV: fx.Tensor,  # [seq_len_kv, D]      fp8 (any variant; bytes passed raw)
-        kv_scales: fx.Tensor,  # [seq_len_kv]         f32
-        weights: fx.Tensor,  # [seq_len, H]         f32
-        cu_starts: fx.Tensor,  # [seq_len]            i32
-        cu_ends: fx.Tensor,  # [seq_len]            i32
-        logits: fx.Tensor,  # [seq_len, seq_len_kv] f32
-        seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
-        stride_logits_s: fx.Int32,  # logits row stride (f32 elements)
-    ):
-        f32_0 = arith.constant(0.0, type=T.f32)
-        vec_f32_t = T.vec(VEC_D, T.f32)
-
-        tid = fx.thread_idx.x
-        bid = fx.block_idx.x
-        # Process rows from last to first to even out the triangular window
-        # work across waves (matches the Triton kernel's reverse ordering).
-        row = fx.Int32(seq_len) - bid - fx.Int32(1)
-
-        # fp8 tensors are read as raw i8 bytes (buffer_load can't return an fp8
-        # scalar) and reinterpreted to fp8 -> f32 in registers.
-        q_t = GTensor(Q, dtype=T.i8, shape=(-1, H, D))
-        kv_t = GTensor(KV, dtype=T.i8, shape=(-1, D))
-        sc_t = GTensor(kv_scales, dtype=T.f32, shape=(-1,))
-        w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
-        cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
-        ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
-        # Build a 1-D row-slice output view with i64 byte offset to avoid i32
-        # overflow for large tensors (row * stride * 4 > 2^31-1 at S>=32768).
-        _row_i64       = arith.extui(T.i64, _to_raw(row))
-        _stride_i64    = arith.extui(T.i64, _to_raw(stride_logits_s))
-        _row_byte_off  = arith.muli(arith.muli(_row_i64, _stride_i64),
-                                    arith.constant(4, type=T.i64))
-        _row_byte_idx  = arith.index_cast(T.index, _row_byte_off)
-        out_row_t = GTensor(
-            logits,
-            dtype=T.f32,
-            shape=(-1,),
-            static_bytes_offset_i64=_row_byte_idx,
-        )
-
-        # Window for this row, clamped to [0, seq_len_kv).
-        start = fx.Int32(cs_t[row])
-        end = fx.Int32(ce_t[row])
-        start = arith.maxsi(_to_raw(start), _to_raw(fx.Int32(0)))
-        end = arith.minsi(_to_raw(end), _to_raw(fx.Int32(seq_len_kv)))
-        start = fx.Int32(start)
-        end = fx.Int32(end)
-
-        # Runtime loop bounds (Index type) reused by the inner scf.for loops.
-        h_lo = _to_raw(fx.Index(fx.Int32(0)))
-        h_hi = _to_raw(fx.Index(fx.Int32(H)))
-        h_step = _to_raw(fx.Index(fx.Int32(1)))
-        d_lo = _to_raw(fx.Index(fx.Int32(0)))
-        d_hi = _to_raw(fx.Index(fx.Int32(D)))
-        d_step = _to_raw(fx.Index(fx.Int32(1)))
-
-        # Lane t handles columns start + t, start + t + 64, ...  The h/d
-        # reductions are *runtime* scf.for loops (not compile-time unrolled):
-        # with H=64, D=128 the fully-unrolled body is ~8k ops per column and
-        # makes MLIR canonicalization pathologically slow, so keep it small and
-        # let the loop carry the f32 accumulators. fp8 bytes are converted to
-        # f32 on the fly with v_cvt_f32_fp8 (no fp8 vector types).
-        col0 = _i32_add(start, tid)
-        n_iter = scf.ForOp(
-            _to_raw(fx.Index(col0)),
-            _to_raw(fx.Index(end)),
-            _to_raw(fx.Index(fx.Int32(BLOCK_THREADS))),
-            [],
-        )
-        with ir.InsertionPoint(n_iter.body):
-            n_idx = n_iter.induction_variable
-            n = fx.Int32(arith.index_cast(T.i32, n_idx))
-            kv_scale = _to_raw(fx.Float32(sc_t[n]))
-
-            # acc = sum_h ReLU(<Q[row,h], K[n]> * kv_scale) * weights[row,h]
-            h_loop = scf.ForOp(h_lo, h_hi, h_step, [_to_raw(f32_0)])
-            with ir.InsertionPoint(h_loop.body):
-                h = fx.Int32(arith.index_cast(T.i32, h_loop.induction_variable))
-                acc_in = h_loop.inner_iter_args[0]
-
-                # dot = <Q[row,h,:], K[n,:]> over the head dim.
-                d_loop = scf.ForOp(d_lo, d_hi, d_step, [_to_raw(f32_0)])
-                with ir.InsertionPoint(d_loop.body):
-                    d = fx.Int32(
-                        arith.index_cast(T.i32, d_loop.induction_variable)
-                    )
-                    dot_in = d_loop.inner_iter_args[0]
-                    qf = _fp8_byte_to_f32(q_t[row, h, d])
-                    kf = _fp8_byte_to_f32(kv_t[n, d])
-                    prod = arith.MulFOp(qf, kf, fastmath=fm_fast).result
-                    dot_out = arith.AddFOp(dot_in, prod, fastmath=fm_fast).result
-                    scf.YieldOp([dot_out])
-                dot = d_loop.results[0]
-
-                # ReLU(dot * kv_scale) * weights[row,h], accumulated over heads.
-                w_h = _to_raw(fx.Float32(w_t[row, h]))
-                scaled = arith.MulFOp(dot, kv_scale, fastmath=fm_fast).result
-                relu = arith.maximumf(scaled, _to_raw(f32_0))
-                wscaled = arith.MulFOp(relu, w_h, fastmath=fm_fast).result
-                acc_out = arith.AddFOp(acc_in, wscaled, fastmath=fm_fast).result
-                scf.YieldOp([acc_out])
-
-            out_row_t[n] = fx.Float32(h_loop.results[0])
-            scf.YieldOp([])
-
-    @flyc.jit
-    def launch_fp8_mqa_logits(
-        Q: fx.Tensor,
-        KV: fx.Tensor,
-        kv_scales: fx.Tensor,
-        weights: fx.Tensor,
-        cu_starts: fx.Tensor,
-        cu_ends: fx.Tensor,
-        logits: fx.Tensor,
-        seq_len: fx.Int32,
-        seq_len_kv: fx.Int32,
-        stride_logits_s: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        gx = arith.index_cast(T.index, _to_raw(seq_len))
-        kernel._func.__name__ = _kname
-        kernel(
-            Q,
-            KV,
-            kv_scales,
-            weights,
-            cu_starts,
-            cu_ends,
-            logits,
-            seq_len,
-            seq_len_kv,
-            stride_logits_s,
-        ).launch(grid=(gx, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
-
-    return launch_fp8_mqa_logits
-
-
 def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                            rows_per_block: int, waves_per_block: int,
                            mfma: MfmaAtom,
@@ -714,8 +554,7 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
 #
 # Note: each MFMA-variant lambda hardcodes ``block_kv`` (bkv is part of the
 # tag), overriding whatever ``block_kv`` the caller passed to
-# ``compile_fp8_mqa_logits``.  The ``scalar`` variant (not listed here, but
-# kept as ``_build_kernel``) is accessible via the env toggle only.
+# ``compile_fp8_mqa_logits``.
 # --------------------------------------------------------------------------- #
 
 def _mfma16_bkv(bkv, r, w):
@@ -760,26 +599,15 @@ def _resolve_variant(variant=None, *, use_mfma=None):
     """Resolve the effective variant tag from the (variant, use_mfma, env) inputs.
 
     Precedence: explicit ``variant=`` > legacy ``use_mfma=`` > env var
-    ``FLYDSL_FP8_MQA_LOGITS_VARIANT`` > legacy env ``FLYDSL_FP8_MQA_LOGITS_MFMA``
-    > ``DEFAULT_VARIANT``.
+    ``FLYDSL_FP8_MQA_LOGITS_VARIANT`` > ``DEFAULT_VARIANT``.
     """
     if variant is not None:
         tag = variant
     elif use_mfma is not None:
-        # Legacy use_mfma=True -> single-row 16x16x32 bkv128.
-        tag = "mfma16x16x32_bkv128_r1_w1" if use_mfma else "scalar"
+        # Legacy use_mfma=True -> single-row 16x16x32 bkv128; False -> default.
+        tag = "mfma16x16x32_bkv128_r1_w1" if use_mfma else DEFAULT_VARIANT
     else:
-        env_variant = os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
-        if env_variant:
-            tag = env_variant
-        else:
-            # Legacy boolean env toggle (kept for back-compat): "0" -> scalar.
-            if os.environ.get("FLYDSL_FP8_MQA_LOGITS_MFMA", "1") == "0":
-                tag = "scalar"
-            else:
-                tag = DEFAULT_VARIANT
-    if tag == "scalar":
-        return tag  # scalar kept for legacy env toggle; not in _VARIANT_BUILDERS
+        tag = os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT", DEFAULT_VARIANT)
     if tag not in _VARIANT_BUILDERS:
         raise ValueError(
             f"unknown fp8_mqa_logits variant {tag!r}; "
@@ -793,7 +621,6 @@ def compile_fp8_mqa_logits(
     *,
     num_heads: int,
     head_size: int,
-    block_kv: int = 128,
     paged: bool = False,
     variant: str = DEFAULT_VARIANT,
     convert_q_fn: bool = False,
@@ -807,16 +634,11 @@ def compile_fp8_mqa_logits(
         Number of indexer query heads (compile-time constant, power of two).
     head_size : int
         Head dimension D (compile-time constant, power of two; D in {64, 128}).
-    block_kv : int
-        Passed to ``_build_kernel`` for the ``"scalar"`` variant only.  For all
-        MFMA variants the block_kv is encoded in the variant tag and the lambda
-        overrides this value.
     paged : bool
         Reserved for the Phase-2 paged variant. Must be False for now.
     variant : str
         Which kernel version to build (see ``KERNEL_VARIANTS``). Tags follow
-        ``"mfma<MxNxK>_bkv<B>_r<RPB>_w<WPB>"``; ``"scalar"`` is the legacy
-        correctness-first fallback (not in ``KERNEL_VARIANTS`` but still accepted).
+        ``"mfma<MxNxK>_bkv<B>_r<RPB>_w<WPB>"``.
     convert_q_fn : bool
         If True, Q bytes are FP8 FN and the kernel converts them to FNUZ
         in-register before the MFMA (applies to all ``mfma*`` variants).
@@ -828,20 +650,15 @@ def compile_fp8_mqa_logits(
         raise NotImplementedError(
             "Paged FlyDSL fp8_mqa_logits is Phase 2 and not implemented yet."
         )
-    if variant == "scalar":
-        launcher = _build_kernel(
-            num_heads=num_heads, head_size=head_size, block_kv=block_kv,
-        )
-    elif variant in _VARIANT_BUILDERS:
-        launcher = _VARIANT_BUILDERS[variant](
-            num_heads=num_heads, head_size=head_size, block_kv=block_kv,
-            convert_q_fn=convert_q_fn, convert_kv_fn=convert_kv_fn,
-        )
-    else:
+    if variant not in _VARIANT_BUILDERS:
         raise ValueError(
             f"unknown fp8_mqa_logits variant {variant!r}; "
             f"available: {list(KERNEL_VARIANTS)}"
         )
+    launcher = _VARIANT_BUILDERS[variant](
+        num_heads=num_heads, head_size=head_size,
+        convert_q_fn=convert_q_fn, convert_kv_fn=convert_kv_fn,
+    )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
 
@@ -870,9 +687,8 @@ def flydsl_fp8_mqa_logits(
                   those positions and the caller owns whatever is left there.
     stream:       optional HIP stream; defaults to the current stream.
     variant:      optional kernel-version tag (see ``KERNEL_VARIANTS``). If None,
-                  resolved from the ``FLYDSL_FP8_MQA_LOGITS_VARIANT`` env var
-                  (or the legacy ``FLYDSL_FP8_MQA_LOGITS_MFMA`` toggle), defaulting
-                  to ``DEFAULT_VARIANT`` (``"mfma16x16x32_bkv128_r2_w2"``).
+                  resolved from the ``FLYDSL_FP8_MQA_LOGITS_VARIANT`` env var,
+                  defaulting to ``DEFAULT_VARIANT`` (``"mfma16x16x32_bkv128_r2_w2"``).
 
     Returns
     -------
@@ -904,10 +720,9 @@ def flydsl_fp8_mqa_logits(
     # Combined, in-kernel conversion handles the per-byte encoding while
     # kv_scales compensation handles the overall numeric factor.
     # The 'mfma' lernel variant does in-kernel halve-and-requant:
-    # dequant-as-FNUZ (= FN_value/2) * 0.5 → requant-to-FNUZ, keeping all
-    # values ≤ 120 < 240 (safely within FNUZ range). The 2x factor per FN
-    # operand is compensated via kv_scales. Non-mfma variants fall back to
-    # the host-side halve-before-cast.
+    # dequant-as-FNUZ (= FN_value/2) * 0.5 -> requant-to-FNUZ, keeping all
+    # values <= 120 < 240 (safely within FNUZ range). The 2x factor per FN
+    # operand is compensated via kv_scales.
     _fnuz = torch.float8_e4m3fnuz
     convert_q_fn = Q.dtype != _fnuz
     convert_kv_fn = KV.dtype != _fnuz
@@ -921,26 +736,16 @@ def flydsl_fp8_mqa_logits(
 
     variant = _resolve_variant(variant)
 
-    # Variants with in-kernel FN -> FNUZ support; others fall back to host-side conversion.
-    if not variant.startswith("mfma") and (convert_q_fn or convert_kv_fn):
-        if convert_q_fn:
-            Q = (Q.to(torch.float32) * 0.5).to(_fnuz)
-        if convert_kv_fn:
-            KV = (KV.to(torch.float32) * 0.5).to(_fnuz)
-        convert_q_fn = False
-        convert_kv_fn = False
-
     launcher = compile_fp8_mqa_logits(
         num_heads=num_heads,
         head_size=head_size,
-        block_kv=128,
         paged=False,
         variant=variant,
         convert_q_fn=convert_q_fn,
         convert_kv_fn=convert_kv_fn,
     )
 
-    # mfma_r* kernels require seq_len padded to a multiple of rows_per_block so
+    # mfma*_r* kernels require seq_len padded to a multiple of rows_per_block so
     # every block owns exactly RPB rows.  Padded rows get empty windows (start ==
     # end == 0) so the kernel writes nothing for them; the output is sliced back
     # to the original seq_len after the launch.
