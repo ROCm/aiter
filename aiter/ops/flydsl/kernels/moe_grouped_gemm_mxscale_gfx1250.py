@@ -950,6 +950,8 @@ def _compile_base_a8w4_gemm(
     epilogue_bias: bool = False,
     stage1_weight_layout: str = "gguu",
     kernel_tag: str = "gemm",
+    lds_prefetch: bool | None = None,
+    pf_depth_ks: int | None = None,
 ):
     split_k_chunk = K // int(cfg.split_k)
     tile_k_i = int(cfg.tile_k)
@@ -1002,6 +1004,8 @@ def _compile_base_a8w4_gemm(
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
         kernel_tag=kernel_tag,
+        lds_prefetch=lds_prefetch,
+        pf_depth_ks=pf_depth_ks,
     )
 
 
@@ -1486,6 +1490,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     use_tdm_store: bool = True,
     inst_prefetch: bool = False,
     wave_specialized_tdm: bool = False,
+    lds_prefetch: bool | None = None,
+    pf_depth_ks: int | None = None,
     split_k: int = 1,
     cluster_m: int = 1,
     cluster_n: int = 1,
@@ -1533,6 +1539,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 N=cfg.model_dim,
                 cfg=cfg,
                 kernel_tag=f"gemm2_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}",
+                lds_prefetch=lds_prefetch,
+                pf_depth_ks=pf_depth_ks,
             )
         return _lazy2["base"]
 
@@ -1544,6 +1552,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 cfg=cfg,
                 epilogue_bias=True,
                 kernel_tag=f"gemm2_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}",
+                lds_prefetch=lds_prefetch,
+                pf_depth_ks=pf_depth_ks,
             )
         return _lazy2["base_bias"]
 

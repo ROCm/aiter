@@ -29,6 +29,7 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
+    WGP_BARRIER_ID,
     extract_lds_base_idx,
     get_lds_memref,
     issue_tdm_loads,
@@ -116,6 +117,8 @@ def compile_mxscale_gemm(
     out_dtype: str = "f32",
     inst_prefetch: bool = False,
     wave_specialized_tdm: bool = False,
+    lds_prefetch: bool | None = None,
+    pf_depth_ks: int | None = None,
     split_k: int = 1,
     use_scale_opsel: bool = False,
     expert_sched_mode: bool = True,
@@ -816,124 +819,74 @@ def compile_mxscale_gemm(
             elem_ty_lds = T.f16
 
             def _precompute_a_lane_bases(lds_ptr):
-                """Precompute per-wm A fragment lane base addresses (byte offsets)."""
+                """Single lane-dependent A base; per-wm and per-ks offsets go into ds_load imm."""
                 row_base = (warp_m_base + lane16) * arith.index(lds_a_stride_bytes)
-                # K-dimension interleaving: kgrp0/kgrp1 read alternating 128-bit chunks
-                # All formats: kgrp offset = 16 bytes (one ds_load_b128 width)
                 k_half_off = lane_kgrp * arith.index(16)
-                bases = []
-                for wm in range_constexpr(wmma_m_rep):
-                    base = (
-                        row_base
-                        + arith.index(wm * WMMA_M * lds_a_stride_bytes)
-                        + k_half_off
-                    )
-                    bases.append(base)
-                return lds_ptr, bases
+                base = row_base + k_half_off
+                return lds_ptr, base
 
-            def load_a_frag(lds_buffer, a_lane_base, ks):
+            def load_a_frag(lds_buffer, a_lane_base, wm, ks):
                 """Load one A-fragment from LDS.
 
-                FP4: vec<8xi32> via 2 x ds_load_b128 (32 bytes per lane).
-                FP8/A8W4: vec<16xi32> via 4 x ds_load_b128 (64 bytes per lane).
-                  Interleaved K layout:
-                  kgrp0 reads bytes [0:15],[32:47],[64:79],[96:111] (stride=32)
-                  kgrp1 reads bytes [16:31],[48:63],[80:95],[112:127] (stride=32)
+                wm and ks are folded into ds_load immediates — no VALU offset arithmetic.
+                FP4: vec<8xi32> via 2 x ds_load_b128.
+                FP8/A8W4: vec<16xi32> via 4 x ds_load_b128.
                 """
-                k_byte_off = arith.index(ks * WMMA_K // PACK_FACTOR_A)
-                byte_off = a_lane_base + k_byte_off
-                v0 = lds_load_b128_raw(lds_buffer, byte_off)
+                imm = wm * WMMA_M * lds_a_stride_bytes + ks * (WMMA_K // PACK_FACTOR_A)
+                v0 = lds_load_b128_raw(lds_buffer, a_lane_base, imm)
                 if const_expr(is_fp4):
-                    # Interleaved stride=32: +0, +32
-                    v1 = lds_load_b128_raw(lds_buffer, byte_off + arith.index(32))
+                    v1 = lds_load_b128_raw(lds_buffer, a_lane_base, imm + 32)
                     return vector.shuffle(v0, v1, list(range(8)))
                 else:
-                    # Interleaved stride=32: +0, +32, +64, +96
-                    v1 = lds_load_b128_raw(lds_buffer, byte_off + arith.index(32))
-                    v2 = lds_load_b128_raw(lds_buffer, byte_off + arith.index(64))
-                    v3 = lds_load_b128_raw(lds_buffer, byte_off + arith.index(96))
+                    v1 = lds_load_b128_raw(lds_buffer, a_lane_base, imm + 32)
+                    v2 = lds_load_b128_raw(lds_buffer, a_lane_base, imm + 64)
+                    v3 = lds_load_b128_raw(lds_buffer, a_lane_base, imm + 96)
                     v01 = vector.shuffle(v0, v1, list(range(8)))
                     v23 = vector.shuffle(v2, v3, list(range(8)))
                     return vector.shuffle(v01, v23, list(range(16)))
 
+            _ngroup_stride = packed_tile_k_b * 16
+
             def _precompute_b_lane_bases(lds_ptr):
-                """Precompute per-wn B fragment lane base addresses (byte offsets).
-
-                FP4: 2 bases per wn (32-col WMMA = 2 N-groups of 16).
-                FP8: 1 base per wn (16-col WMMA = 1 N-group).
-                A8W4: 1 base per wn (16-col WMMA, FP4 packed weight).
-
-                K-dimension interleaving for FP8/A8W4:
-                  kgrp0 and kgrp1 read alternating 16x16 tiles (stride = 2 tiles).
-                  kgrp offset = 1 tile = 256 bytes.
-                """
-                _ngroup_stride = packed_tile_k_b * 16
+                """Single lane-dependent B base; per-wn and per-ks offsets go into ds_load imm."""
                 _n_group_base = arith.index(warp_tile_n // 16) * wave_n_idx
                 row_off = lane16 * arith.index(16)
-                # All formats: interleaved -- kgrp offset = 1 tile = 256 bytes
                 k_tile_off = lane_kgrp * arith.index(256)
-                bases = []
-                if const_expr(is_fp4):
-                    for wn_half in range_constexpr(wmma_n_rep * 2):
-                        ngroup_off = _n_group_base * arith.index(
-                            _ngroup_stride
-                        ) + arith.index(wn_half * _ngroup_stride)
-                        bases.append(ngroup_off + row_off + k_tile_off)
-                else:
-                    # FP8 and A8W4: 1 base per wn (16-col WMMA)
-                    for wn in range_constexpr(wmma_n_rep):
-                        ngroup_off = _n_group_base * arith.index(
-                            _ngroup_stride
-                        ) + arith.index(wn * _ngroup_stride)
-                        bases.append(ngroup_off + row_off + k_tile_off)
-                return lds_ptr, bases
+                base = _n_group_base * arith.index(_ngroup_stride) + row_off + k_tile_off
+                return lds_ptr, base
 
-            def load_b_frag(lds_buffer, b_lane_bases, wn, ks):
+            def load_b_frag(lds_buffer, b_lane_base, wn, ks):
                 """Load one B-fragment from preshuffled LDS.
 
-                FP4: 32x128 -> vec<16xi32> from 2 N-groups (bases[wn*2], bases[wn*2+1]).
-                FP8: 16x128 -> vec<16xi32> from 1 N-group (bases[wn]).
-                A8W4: 16x128 FP4 -> vec<8xi32> from 1 N-group (bases[wn]).
-
-                K-dimension interleaving (FP8/A8W4):
-                  Stride = 2 tiles = 512 bytes between loads.
-                  kgrp0 reads tiles 0,2,4,6; kgrp1 reads tiles 1,3,5,7.
+                wn and ks are folded into ds_load immediates — no VALU offset arithmetic.
+                FP4: 32x128 -> vec<16xi32> from 2 N-groups.
+                FP8: 16x128 -> vec<16xi32> from 1 N-group.
+                A8W4: 16x128 FP4 -> vec<8xi32> from 1 N-group.
                 """
                 if const_expr(is_fp4):
-                    # FP4: 2 N-groups per wn, 4 tiles per N-group
-                    # Interleaved stride=512 (2 tiles): kgrp0->tiles 0,2; kgrp1->tiles 1,3
-                    _num_tiles = (
-                        WMMA_K // PACK_FACTOR_B // 16
-                    )  # 4 tiles total per N-group
-                    k_subtile_off = arith.index(ks * _num_tiles * 256)
-                    base0 = b_lane_bases[wn * 2] + k_subtile_off
-                    v0 = lds_load_b128_raw(lds_buffer, base0)
-                    v1 = lds_load_b128_raw(lds_buffer, base0 + arith.index(512))
-                    base1 = b_lane_bases[wn * 2 + 1] + k_subtile_off
-                    v2 = lds_load_b128_raw(lds_buffer, base1)
-                    v3 = lds_load_b128_raw(lds_buffer, base1 + arith.index(512))
+                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16
+                    imm0 = wn * 2 * _ngroup_stride + ks * _num_tiles * 256
+                    imm1 = (wn * 2 + 1) * _ngroup_stride + ks * _num_tiles * 256
+                    v0 = lds_load_b128_raw(lds_buffer, b_lane_base, imm0)
+                    v1 = lds_load_b128_raw(lds_buffer, b_lane_base, imm0 + 512)
+                    v2 = lds_load_b128_raw(lds_buffer, b_lane_base, imm1)
+                    v3 = lds_load_b128_raw(lds_buffer, b_lane_base, imm1 + 512)
                     v01 = vector.shuffle(v0, v1, list(range(8)))
                     v23 = vector.shuffle(v2, v3, list(range(8)))
                     return vector.shuffle(v01, v23, list(range(16)))
                 elif const_expr(is_a8w4):
-                    # A8W4: FP4 weight, 4 tiles per N-group
-                    # Interleaved stride=512: kgrp0->tiles 0,2; kgrp1->tiles 1,3
-                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16  # 4 tiles total
-                    k_subtile_off = arith.index(ks * _num_tiles * 256)
-                    base0 = b_lane_bases[wn] + k_subtile_off
-                    v0 = lds_load_b128_raw(lds_buffer, base0)
-                    v1 = lds_load_b128_raw(lds_buffer, base0 + arith.index(512))
+                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16
+                    imm = wn * _ngroup_stride + ks * _num_tiles * 256
+                    v0 = lds_load_b128_raw(lds_buffer, b_lane_base, imm)
+                    v1 = lds_load_b128_raw(lds_buffer, b_lane_base, imm + 512)
                     return vector.shuffle(v0, v1, list(range(8)))
                 else:
-                    # FP8: 8 tiles per N-group
-                    # Interleaved stride=512: kgrp0->tiles 0,2,4,6; kgrp1->tiles 1,3,5,7
-                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16  # 8 tiles total
-                    k_subtile_off = arith.index(ks * _num_tiles * 256)
-                    base0 = b_lane_bases[wn] + k_subtile_off
-                    v0 = lds_load_b128_raw(lds_buffer, base0)
-                    v1 = lds_load_b128_raw(lds_buffer, base0 + arith.index(512))
-                    v2 = lds_load_b128_raw(lds_buffer, base0 + arith.index(1024))
-                    v3 = lds_load_b128_raw(lds_buffer, base0 + arith.index(1536))
+                    _num_tiles = WMMA_K // PACK_FACTOR_B // 16
+                    imm = wn * _ngroup_stride + ks * _num_tiles * 256
+                    v0 = lds_load_b128_raw(lds_buffer, b_lane_base, imm)
+                    v1 = lds_load_b128_raw(lds_buffer, b_lane_base, imm + 512)
+                    v2 = lds_load_b128_raw(lds_buffer, b_lane_base, imm + 1024)
+                    v3 = lds_load_b128_raw(lds_buffer, b_lane_base, imm + 1536)
                     v01 = vector.shuffle(v0, v1, list(range(8)))
                     v23 = vector.shuffle(v2, v3, list(range(8)))
                     return vector.shuffle(v01, v23, list(range(16)))
@@ -941,31 +894,26 @@ def compile_mxscale_gemm(
             def _precompute_scale_lane_bases(
                 lds_ptr, warp_base, reps, interleaved_cols
             ):
-                """Precompute scale lane bases (byte offsets)."""
+                """Single lane-dependent scale base; ks/rep offsets go into ds_load imm."""
                 warp_lds_row = warp_base / arith.index(reps) + lane16
                 base = warp_lds_row * arith.index(interleaved_cols)
                 if const_expr(is_fp4 or is_a8w4):
-                    # FP4/A8W4: always add lane_kgrp offset (no opsel on BScale)
                     base = base + lane_kgrp * arith.index(SCALES_PER_WMMA)
                 else:
-                    # FP8: conditional on opsel
                     if const_expr(use_scale_opsel):
                         base = base + lane_kgrp * arith.index(SCALES_PER_WMMA)
-                return lds_ptr, [base]
+                return lds_ptr, base
 
             def load_scale_b128(lds_buffer, scale_base, reps, ks=0):
-                """Load all wmma_rep scales via ds_load_b128(s) for K-subtile *ks*."""
+                """Load all wmma_rep scales via ds_load_b128(s) for K-subtile *ks*.
+
+                ks offset is a pure Python integer folded into ds_load imm — no VALU.
+                """
                 ks_byte_off = ks * reps * SCALES_PER_WMMA
-                eff_base = (
-                    scale_base
-                    if ks_byte_off == 0
-                    else scale_base + arith.index(ks_byte_off)
-                )
                 num_loads = (reps + 3) // 4
                 vecs = []
                 for ld in range_constexpr(num_loads):
-                    off = eff_base if ld == 0 else eff_base + arith.index(ld * 16)
-                    vecs.append(lds_load_b128_raw(lds_buffer, off))
+                    vecs.append(lds_load_b128_raw(lds_buffer, scale_base, ks_byte_off + ld * 16))
                 results = []
                 for i in range_constexpr(reps):
                     vi = vector.extract(
@@ -991,7 +939,7 @@ def compile_mxscale_gemm(
                     # = low half, odd = high half (mirrors per-pair's lane_kgrp).
                     warp_half = wave_n_idx % arith.index(2)
                     base = base + warp_half * arith.index(BS_N32K4_HALF_BYTES)
-                return lds_ptr, [base]
+                return lds_ptr, base
 
             def _load_b_scale_n32k4(lds_buffer, scale_base, ks, wn_start, wn_count):
                 # per-pair: wn picks the super-row; per-tile: wn is always 0 (single
@@ -1013,8 +961,8 @@ def compile_mxscale_gemm(
                     for wn in range_constexpr(wmma_n_rep)
                 ]
                 _n_units = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
-                b_scales = _load_b_scale_n32k4(bs_buf, bs_bases[0], ks, 0, _n_units)
-                a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
+                b_scales = _load_b_scale_n32k4(bs_buf, bs_bases, ks, 0, _n_units)
+                a_scales_all = load_scale_b128(as_buf, as_bases, wmma_m_rep, ks)
                 if const_expr(use_scale_opsel):
                     a_scales = a_scales_all[::2]
                 else:
@@ -1075,12 +1023,20 @@ def compile_mxscale_gemm(
                 emit_filler=None,
                 next_bs_info=None,
                 mid_compute_callback=None,
+                pf_a_frags=None,
+                skip_wait=False,
             ):
                 """Half-based A-streaming with zigzag wn ordering.
 
                 When *next_bs_info* is provided, the next K-subtile's B+scale
                 loads are issued BEFORE the s_wait_dscnt so they overlap with
                 the current WMMA execution (partial drain pattern).
+
+                When *pf_a_frags* is provided the A ds_loads for this k-step are
+                skipped — the pre-fetched VGPR values from the previous tile's
+                interleaved post-fetch are used directly.  Combined with
+                *skip_wait*, the current-tile WMMAs run on loop-carried VGPRs
+                while the next tile's ds_loads stay in flight.
                 """
                 next_result = None
                 _front_wm = (wmma_m_rep + 1) // 2
@@ -1106,10 +1062,13 @@ def compile_mxscale_gemm(
                                 b_scales,
                             )
 
-                a_frags_front = [
-                    load_a_frag(a_buf, a_bases[wm], ks)
-                    for wm in range_constexpr(_front_wm)
-                ]
+                if const_expr(pf_a_frags is not None):
+                    a_frags_front = pf_a_frags[:_front_wm]
+                else:
+                    a_frags_front = [
+                        load_a_frag(a_buf, a_bases, wm, ks)
+                        for wm in range_constexpr(_front_wm)
+                    ]
 
                 _use_partial_drain = (
                     next_bs_info is not None and _front_wm * wmma_n_rep >= 4
@@ -1123,6 +1082,9 @@ def compile_mxscale_gemm(
                         nb_buf, nb_bases, nbs_buf, nbs_bases, nas_buf, nas_bases, n_ks
                     )
                     rocdl.s_wait_dscnt(_bs_ds_loads)
+                elif const_expr(skip_wait):
+                    _n_pf_per_ks = _bs_ds_loads + wmma_m_rep * DS_LOADS_PER_A_FRAG
+                    rocdl.s_wait_dscnt(_n_pf_per_ks // 2)
                 else:
                     rocdl.s_wait_dscnt(0)
 
@@ -1133,12 +1095,16 @@ def compile_mxscale_gemm(
                     mid_compute_callback()
 
                 if const_expr(_back_wm > 0):
-                    a_frags_back = [
-                        load_a_frag(a_buf, a_bases[_front_wm + h], ks)
-                        for h in range_constexpr(_back_wm)
-                    ]
-                    _back_drain = _bs_ds_loads if _use_partial_drain else 0
-                    rocdl.s_wait_dscnt(_back_drain)
+                    if const_expr(pf_a_frags is not None):
+                        a_frags_back = pf_a_frags[_front_wm : _front_wm + _back_wm]
+                    else:
+                        a_frags_back = [
+                            load_a_frag(a_buf, a_bases, _front_wm + h, ks)
+                            for h in range_constexpr(_back_wm)
+                        ]
+                    if const_expr(not skip_wait):
+                        _back_drain = _bs_ds_loads if _use_partial_drain else 0
+                        rocdl.s_wait_dscnt(_back_drain)
                     _emit_rows(_front_wm, a_frags_back)
 
                 if const_expr(_use_partial_drain):
@@ -1153,6 +1119,38 @@ def compile_mxscale_gemm(
                     return accs, next_result
                 return accs
 
+            def _issue_pf_all_ks(lds_a, lds_b, lds_bs, lds_as, depth=None):
+                """Issue ds_loads for the first *depth* k-steps of one LDS tile.
+
+                *depth* defaults to ``k_wmma_steps`` (full tile). A smaller value
+                reduces the loop-carried VGPR count at the cost of issuing the
+                remaining k-steps' ds_loads at compute time (normal wait path).
+
+                Returns a list[(a_frags, b_frags, b_scales, a_scales)] with
+                exactly *depth* entries.
+                """
+                _d = k_wmma_steps if depth is None else min(depth, k_wmma_steps)
+                _a_buf, _a_bases = _precompute_a_lane_bases(lds_a)
+                _b_buf, _b_bases = _precompute_b_lane_bases(lds_b)
+                _as_buf, _as_bases = _precompute_scale_lane_bases(
+                    lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
+                )
+                _bs_buf, _bs_bases = _precompute_b_scale_n32k4_base(
+                    lds_bs, warp_n_base
+                )
+                pf = []
+                for ks in range_constexpr(_d):
+                    _b_ks, _bs_ks, _as_ks = _load_b_and_scales(
+                        _b_buf, _b_bases, _bs_buf, _bs_bases,
+                        _as_buf, _as_bases, ks
+                    )
+                    _a_ks = [
+                        load_a_frag(_a_buf, _a_bases, wm, ks)
+                        for wm in range_constexpr(wmma_m_rep)
+                    ]
+                    pf.append((_a_ks, _b_ks, _bs_ks, _as_ks))
+                return pf
+
             # -- Compute on one LDS buffer --
             def compute_tile(
                 accs_in,
@@ -1162,6 +1160,12 @@ def compile_mxscale_gemm(
                 lds_bs,
                 emit_filler=None,
                 mid_compute_callback=None,
+                pf_all_ks=None,
+                next_lds_a=None,
+                next_lds_b=None,
+                next_lds_bs=None,
+                next_lds_as=None,
+                pf_depth=None,
             ):
                 current_accs = list(accs_in)
                 a_buf, a_bases = _precompute_a_lane_bases(lds_a)
@@ -1170,6 +1174,104 @@ def compile_mxscale_gemm(
                     lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
                 )
                 bs_buf, bs_bases = _precompute_b_scale_n32k4_base(lds_bs, warp_n_base)
+
+                _has_pf = pf_all_ks is not None
+                _has_next = next_lds_b is not None
+                _pf_d = k_wmma_steps if pf_depth is None else pf_depth
+
+                if const_expr(_has_next):
+                    nxt_a_buf, nxt_a_bases = _precompute_a_lane_bases(next_lds_a)
+                    nxt_b_buf, nxt_b_bases = _precompute_b_lane_bases(next_lds_b)
+                    nxt_as_buf, nxt_as_bases = _precompute_scale_lane_bases(
+                        next_lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
+                    )
+                    nxt_bs_buf, nxt_bs_bases = _precompute_b_scale_n32k4_base(
+                        next_lds_bs, warp_n_base
+                    )
+
+                if const_expr(_has_pf and _has_next):
+                    nxt_pf = []
+                    for ks in range_constexpr(k_wmma_steps):
+                        _mid_cb = mid_compute_callback if ks == 0 else None
+                        _filler = emit_filler if ks == k_wmma_steps - 1 else None
+                        if const_expr(ks < _pf_d):
+                            pf_a_ks, pf_b_ks, pf_bs_ks, pf_as_ks = pf_all_ks[ks]
+                            nxt_b_ks, nxt_bs_ks, nxt_as_ks = _load_b_and_scales(
+                                nxt_b_buf, nxt_b_bases, nxt_bs_buf, nxt_bs_bases,
+                                nxt_as_buf, nxt_as_bases, ks,
+                            )
+                            nxt_a_ks = [
+                                load_a_frag(nxt_a_buf, nxt_a_bases, wm, ks)
+                                for wm in range_constexpr(wmma_m_rep)
+                            ]
+                            nxt_pf.append((nxt_a_ks, nxt_b_ks, nxt_bs_ks, nxt_as_ks))
+                            current_accs = _a_streaming_compute(
+                                current_accs,
+                                a_buf,
+                                a_bases,
+                                pf_b_ks,
+                                pf_bs_ks,
+                                pf_as_ks,
+                                ks,
+                                emit_filler=_filler,
+                                mid_compute_callback=_mid_cb,
+                                pf_a_frags=pf_a_ks,
+                                skip_wait=True,
+                            )
+                        else:
+                            cur_b, cur_bs, cur_as = _load_b_and_scales(
+                                b_buf, b_bases, bs_buf, bs_bases,
+                                as_buf, as_bases, ks,
+                            )
+                            current_accs = _a_streaming_compute(
+                                current_accs,
+                                a_buf,
+                                a_bases,
+                                cur_b,
+                                cur_bs,
+                                cur_as,
+                                ks,
+                                emit_filler=_filler,
+                                mid_compute_callback=_mid_cb,
+                            )
+                    return current_accs, nxt_pf
+
+                if const_expr(_has_pf):
+                    for ks in range_constexpr(k_wmma_steps):
+                        _mid_cb = mid_compute_callback if ks == 0 else None
+                        _filler = emit_filler if ks == k_wmma_steps - 1 else None
+                        if const_expr(ks < _pf_d):
+                            pf_a_ks, pf_b_ks, pf_bs_ks, pf_as_ks = pf_all_ks[ks]
+                            current_accs = _a_streaming_compute(
+                                current_accs,
+                                a_buf,
+                                a_bases,
+                                pf_b_ks,
+                                pf_bs_ks,
+                                pf_as_ks,
+                                ks,
+                                emit_filler=_filler,
+                                mid_compute_callback=_mid_cb,
+                                pf_a_frags=pf_a_ks,
+                                skip_wait=True,
+                            )
+                        else:
+                            cur_b, cur_bs, cur_as = _load_b_and_scales(
+                                b_buf, b_bases, bs_buf, bs_bases,
+                                as_buf, as_bases, ks,
+                            )
+                            current_accs = _a_streaming_compute(
+                                current_accs,
+                                a_buf,
+                                a_bases,
+                                cur_b,
+                                cur_bs,
+                                cur_as,
+                                ks,
+                                emit_filler=_filler,
+                                mid_compute_callback=_mid_cb,
+                            )
+                    return current_accs
 
                 if const_expr(k_wmma_steps == 1):
                     b_frags, b_scales, a_scales = _load_b_and_scales(
@@ -1248,7 +1350,7 @@ def compile_mxscale_gemm(
 
                 def _load_a_group(wm_base, wm_count, ks):
                     return [
-                        load_a_frag(a_buf, a_bases[wm_base + wm_local], ks)
+                        load_a_frag(a_buf, a_bases, wm_base + wm_local, ks)
                         for wm_local in range_constexpr(wm_count)
                     ]
 
@@ -1262,7 +1364,7 @@ def compile_mxscale_gemm(
                     b_frags = _load_b_half(wn_base, ks)
                     b_scales = _load_b_scale_n32k4(
                         bs_buf,
-                        bs_bases[0],
+                        bs_bases,
                         ks,
                         rep_start // _bank_half_b_scale_rep,
                         _bank_half_wn,
@@ -1329,7 +1431,7 @@ def compile_mxscale_gemm(
 
                 for ks in range_constexpr(k_wmma_steps):
                     is_last_ks = ks == k_wmma_steps - 1
-                    a_scales_all = load_scale_b128(as_buf, as_bases[0], wmma_m_rep, ks)
+                    a_scales_all = load_scale_b128(as_buf, as_bases, wmma_m_rep, ks)
 
                     a_top_frags = _load_a_group(0, _bank_half_wm, ks)
                     a_bottom_frags = _load_a_group(_bank_half_wm, _bank_half_wm, ks)
@@ -1461,6 +1563,12 @@ def compile_mxscale_gemm(
                 lds_bs,
                 emit_filler=None,
                 mid_compute_callback=None,
+                pf_all_ks=None,
+                next_lds_a=None,
+                next_lds_b=None,
+                next_lds_bs=None,
+                next_lds_as=None,
+                pf_depth=None,
             ):
                 if const_expr(compute_schedule_kind == COMPUTE_SCHEDULE_FP4_COL_BAND):
                     return compute_tile_fp4_bank_friendly(
@@ -1480,6 +1588,12 @@ def compile_mxscale_gemm(
                     lds_bs,
                     emit_filler=emit_filler,
                     mid_compute_callback=mid_compute_callback,
+                    pf_all_ks=pf_all_ks,
+                    next_lds_a=next_lds_a,
+                    next_lds_b=next_lds_b,
+                    next_lds_bs=next_lds_bs,
+                    next_lds_as=next_lds_as,
+                    pf_depth=pf_depth,
                 )
 
             def hot_loop_scheduler_scheduled():
@@ -2310,64 +2424,197 @@ def compile_mxscale_gemm(
             # This overlaps TDM DMA with the remaining WMMA instructions,
             _fence_outstanding = TDM_LOADS_PER_STEP * (num_buffers - 2)
 
+            _lds_pf_on = (
+                lds_prefetch if lds_prefetch is not None
+                else os.environ.get("AITER_GROUPED_LDS_PF", "1") == "1"
+            )
+            _use_lds_pf = (
+                wave_specialized_tdm
+                and compute_schedule_kind == COMPUTE_SCHEDULE_ROW_MAJOR_STREAMING
+                and _lds_pf_on
+            )
+
+            if const_expr(_use_lds_pf):
+                _pf_ks_depth_raw = (
+                    pf_depth_ks if pf_depth_ks is not None
+                    else int(os.environ.get("AITER_PF_DEPTH_KS", str(k_wmma_steps)))
+                )
+                _pf_ks_depth = max(1, min(_pf_ks_depth_raw, k_wmma_steps))
+
+                _n_pf_a_per_ks = wmma_m_rep
+                _n_pf_b_per_ks = wmma_n_rep
+                # b_scales count: matches _load_b_and_scales's _n_units
+                _n_pf_bs_per_ks = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
+                # a_scales count: matches _load_b_and_scales's opsel slicing
+                if const_expr(use_scale_opsel):
+                    _n_pf_as_per_ks = (wmma_m_rep + 1) // 2
+                else:
+                    _n_pf_as_per_ks = wmma_m_rep
+                _n_pf_per_ks = (
+                    _n_pf_a_per_ks
+                    + _n_pf_b_per_ks
+                    + _n_pf_bs_per_ks
+                    + _n_pf_as_per_ks
+                )
+                _n_pf_total = _pf_ks_depth * _n_pf_per_ks
+
+                def _pf_all_ks_to_flat(pf_all_ks):
+                    flat = []
+                    for (a_frags, b_frags, b_scales, a_scales) in pf_all_ks:
+                        flat.extend(a_frags)
+                        flat.extend(b_frags)
+                        flat.extend(b_scales)
+                        flat.extend(a_scales)
+                    return flat
+
+                def _flat_to_pf_all_ks(state, base):
+                    result = []
+                    idx = base
+                    for _ in range_constexpr(_pf_ks_depth):
+                        a_frags = list(state[idx : idx + _n_pf_a_per_ks])
+                        idx += _n_pf_a_per_ks
+                        b_frags = list(state[idx : idx + _n_pf_b_per_ks])
+                        idx += _n_pf_b_per_ks
+                        b_scales = list(state[idx : idx + _n_pf_bs_per_ks])
+                        idx += _n_pf_bs_per_ks
+                        a_scales = list(state[idx : idx + _n_pf_as_per_ks])
+                        idx += _n_pf_as_per_ks
+                        result.append((a_frags, b_frags, b_scales, a_scales))
+                    return result
+
+            _tail_pf_all_ks = None
+
             if const_expr(loop_iters > 0):
                 if const_expr(wave_specialized_tdm):
-                    init_args = list(accs) + [active_addr_lo]
+                    if const_expr(_use_lds_pf):
+                        rocdl.s_wait_tensorcnt(0)
+                        rocdl.s_barrier_signal(WGP_BARRIER_ID)
+                        rocdl.s_barrier_wait(WGP_BARRIER_ID)
+                        _pf_init = _issue_pf_all_ks(
+                            stages_a_idx[0],
+                            stages_b_idx[0],
+                            stages_bs_idx[0],
+                            stages_as_idx[0],
+                            depth=_pf_ks_depth,
+                        )
+                        _pf_init_flat = _pf_all_ks_to_flat(_pf_init)
+                    else:
+                        _pf_init_flat = []
+
+                    init_args = list(accs) + [active_addr_lo] + _pf_init_flat
 
                     for loop_iter, state in range(0, loop_iters, 1, init=init_args):
                         accs_in = list(state[:n_accs])
                         cur_addr_lo = state[n_accs]
 
+                        if const_expr(_use_lds_pf):
+                            _pf_base = n_accs + 1
+                            _cur_pf_all_ks = _flat_to_pf_all_ks(state, _pf_base)
+                        else:
+                            _cur_pf_all_ks = None
+
                         for buf_idx in range_constexpr(num_buffers):
                             load_stage = (buf_idx + num_buffers - 1) % num_buffers
+                            next_buf = (buf_idx + 1) % num_buffers
 
-                            pipeline_fence_signal(
-                                outstanding=_fence_outstanding, use_cluster=use_cluster
-                            )
-                            pipeline_fence_wait(use_cluster=use_cluster)
-
-                            addr_box = [cur_addr_lo]
-
-                            def _mid_tdm_ws(
-                                _ls=load_stage,
-                                _ab=addr_box,
-                                _k_off=(
+                            if const_expr(_use_lds_pf):
+                                _k_off_tdm = (
                                     split_k_base
                                     + loop_iter * arith.index(num_buffers * tile_k)
                                     + arith.index(buf_idx * tile_k)
-                                ),
-                            ):
+                                )
                                 dg0 = vector.from_elements(
                                     T.vec(4, T.i32),
                                     [
                                         pred_const,
-                                        active_stage_lds_addr[_ls],
-                                        _ab[0],
+                                        active_stage_lds_addr[load_stage],
+                                        cur_addr_lo,
                                         active_addr_hi,
                                     ],
                                 )
                                 tdm_ops.tensor_load_2d(
                                     tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
                                 )
-                                _ab[0] = arith.addi(_ab[0], active_adv_i32)
-                                _l2_prefetch(_k_off)
+                                cur_addr_lo = arith.addi(cur_addr_lo, active_adv_i32)
+                                _l2_prefetch(_k_off_tdm)
 
-                            rocdl.sched_barrier(0)
-                            accs_in = compute_tile_scheduled(
-                                accs_in,
-                                stages_a_idx[buf_idx],
-                                stages_b_idx[buf_idx],
-                                stages_as_idx[buf_idx],
-                                stages_bs_idx[buf_idx],
-                                mid_compute_callback=_mid_tdm_ws,
-                            )
-                            cur_addr_lo = addr_box[0]
+                                pipeline_fence_signal(
+                                    outstanding=_fence_outstanding,
+                                    use_cluster=use_cluster,
+                                )
+                                pipeline_fence_wait(use_cluster=use_cluster)
+
+                                rocdl.sched_barrier(0)
+                                accs_in, _cur_pf_all_ks = compute_tile_scheduled(
+                                    accs_in,
+                                    stages_a_idx[buf_idx],
+                                    stages_b_idx[buf_idx],
+                                    stages_as_idx[buf_idx],
+                                    stages_bs_idx[buf_idx],
+                                    pf_all_ks=_cur_pf_all_ks,
+                                    next_lds_a=stages_a_idx[next_buf],
+                                    next_lds_b=stages_b_idx[next_buf],
+                                    next_lds_bs=stages_bs_idx[next_buf],
+                                    next_lds_as=stages_as_idx[next_buf],
+                                    pf_depth=_pf_ks_depth,
+                                )
+                            else:
+                                pipeline_fence_signal(
+                                    outstanding=_fence_outstanding,
+                                    use_cluster=use_cluster,
+                                )
+                                pipeline_fence_wait(use_cluster=use_cluster)
+
+                                addr_box = [cur_addr_lo]
+
+                                def _mid_tdm_ws(
+                                    _ls=load_stage,
+                                    _ab=addr_box,
+                                    _k_off=(
+                                        split_k_base
+                                        + loop_iter * arith.index(num_buffers * tile_k)
+                                        + arith.index(buf_idx * tile_k)
+                                    ),
+                                ):
+                                    dg0 = vector.from_elements(
+                                        T.vec(4, T.i32),
+                                        [
+                                            pred_const,
+                                            active_stage_lds_addr[_ls],
+                                            _ab[0],
+                                            active_addr_hi,
+                                        ],
+                                    )
+                                    tdm_ops.tensor_load_2d(
+                                        tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
+                                    )
+                                    _ab[0] = arith.addi(_ab[0], active_adv_i32)
+                                    _l2_prefetch(_k_off)
+
+                                rocdl.sched_barrier(0)
+                                accs_in = compute_tile_scheduled(
+                                    accs_in,
+                                    stages_a_idx[buf_idx],
+                                    stages_b_idx[buf_idx],
+                                    stages_as_idx[buf_idx],
+                                    stages_bs_idx[buf_idx],
+                                    mid_compute_callback=_mid_tdm_ws,
+                                )
+                                cur_addr_lo = addr_box[0]
                             hot_loop_scheduler_scheduled()
 
-                        results = yield list(accs_in) + [cur_addr_lo]
+                        if const_expr(_use_lds_pf):
+                            _pf_yield = _pf_all_ks_to_flat(_cur_pf_all_ks)
+                        else:
+                            _pf_yield = []
+                        results = yield list(accs_in) + [cur_addr_lo] + _pf_yield
 
                     accs = list(results[:n_accs])
                     active_addr_lo = results[n_accs]
+                    if const_expr(_use_lds_pf):
+                        _tail_pf_all_ks = _flat_to_pf_all_ks(results, _pf_base)
+                    else:
+                        _tail_pf_all_ks = None
                 else:
                     if const_expr(stage1_dual_b):
                         init_args = (
@@ -2658,6 +2905,18 @@ def compile_mxscale_gemm(
                         addr_lo_bs = results[n_accs + 6]
                         addr_hi_bs = results[n_accs + 7]
 
+            if const_expr(loop_iters == 0 and _use_lds_pf):
+                rocdl.s_wait_tensorcnt(0)
+                rocdl.s_barrier_signal(WGP_BARRIER_ID)
+                rocdl.s_barrier_wait(WGP_BARRIER_ID)
+                _tail_pf_all_ks = _issue_pf_all_ks(
+                    stages_a_idx[0],
+                    stages_b_idx[0],
+                    stages_bs_idx[0],
+                    stages_as_idx[0],
+                    depth=_pf_ks_depth,
+                )
+
             # Tail -- same acc_mixed pattern: fence at top, TDM mid-compute.
             if const_expr(loop_iters > 0):
                 pipeline_fence(outstanding=0, use_cluster=use_cluster)
@@ -2665,10 +2924,28 @@ def compile_mxscale_gemm(
                 gpu.cluster_barrier()
             epi_addrs_box = [None]
             _tail_had_load = False
-            for _load_stage, _compute_stage, _outstanding in tail_plan:
+
+            _tail_plan_ext = []
+            _tail_plan_active_cs = [cs for ls, cs, out in tail_plan if out != -1]
+            for ls, cs, out in tail_plan:
+                _next_cs = None
+                if out != -1:
+                    _apos = _tail_plan_active_cs.index(cs)
+                    if _apos + 1 < len(_tail_plan_active_cs):
+                        _next_cs = _tail_plan_active_cs[_apos + 1]
+                _tail_plan_ext.append((ls, cs, out, _next_cs))
+
+            for _load_stage, _compute_stage, _outstanding, _tail_next_cs in (
+                _tail_plan_ext
+            ):
                 if const_expr(_outstanding == -1):
                     if const_expr(_tail_had_load):
                         pipeline_fence(outstanding=0, use_cluster=use_cluster)
+                    _last_pf = (
+                        _tail_pf_all_ks
+                        if (_use_lds_pf and _tail_pf_all_ks is not None)
+                        else None
+                    )
                     if const_expr(use_tdm_store):
                         accs = compute_tile_scheduled(
                             accs,
@@ -2676,6 +2953,8 @@ def compile_mxscale_gemm(
                             stages_b_idx[_compute_stage],
                             stages_as_idx[_compute_stage],
                             stages_bs_idx[_compute_stage],
+                            pf_all_ks=_last_pf,
+                            pf_depth=_pf_ks_depth if _last_pf is not None else None,
                         )
                     else:
 
@@ -2689,6 +2968,8 @@ def compile_mxscale_gemm(
                             stages_as_idx[_compute_stage],
                             stages_bs_idx[_compute_stage],
                             emit_filler=_emit_epi_addrs,
+                            pf_all_ks=_last_pf,
+                            pf_depth=_pf_ks_depth if _last_pf is not None else None,
                         )
                         if const_expr(stage1_dual_b):
                             accs_up = compute_tile_scheduled(
@@ -2781,14 +3062,44 @@ def compile_mxscale_gemm(
                             _tail_mid_cb = _tail_mid_nws
 
                     rocdl.sched_barrier(0)
-                    accs = compute_tile_scheduled(
-                        accs,
-                        stages_a_idx[_compute_stage],
-                        stages_b_idx[_compute_stage],
-                        stages_as_idx[_compute_stage],
-                        stages_bs_idx[_compute_stage],
-                        mid_compute_callback=_tail_mid_cb,
-                    )
+                    _use_tail_pf = _use_lds_pf and _tail_pf_all_ks is not None
+                    _has_tail_next = _tail_next_cs is not None
+                    if const_expr(_use_tail_pf and _has_tail_next):
+                        accs, _tail_pf_all_ks = compute_tile_scheduled(
+                            accs,
+                            stages_a_idx[_compute_stage],
+                            stages_b_idx[_compute_stage],
+                            stages_as_idx[_compute_stage],
+                            stages_bs_idx[_compute_stage],
+                            mid_compute_callback=_tail_mid_cb,
+                            pf_all_ks=_tail_pf_all_ks,
+                            next_lds_a=stages_a_idx[_tail_next_cs],
+                            next_lds_b=stages_b_idx[_tail_next_cs],
+                            next_lds_bs=stages_bs_idx[_tail_next_cs],
+                            next_lds_as=stages_as_idx[_tail_next_cs],
+                            pf_depth=_pf_ks_depth,
+                        )
+                    elif const_expr(_use_tail_pf):
+                        accs = compute_tile_scheduled(
+                            accs,
+                            stages_a_idx[_compute_stage],
+                            stages_b_idx[_compute_stage],
+                            stages_as_idx[_compute_stage],
+                            stages_bs_idx[_compute_stage],
+                            mid_compute_callback=_tail_mid_cb,
+                            pf_all_ks=_tail_pf_all_ks,
+                            pf_depth=_pf_ks_depth,
+                        )
+                        _tail_pf_all_ks = None
+                    else:
+                        accs = compute_tile_scheduled(
+                            accs,
+                            stages_a_idx[_compute_stage],
+                            stages_b_idx[_compute_stage],
+                            stages_as_idx[_compute_stage],
+                            stages_bs_idx[_compute_stage],
+                            mid_compute_callback=_tail_mid_cb,
+                        )
                     if const_expr(stage1_dual_b):
                         hot_loop_scheduler_scheduled()
                         accs_up = compute_tile_scheduled(

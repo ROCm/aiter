@@ -29,6 +29,7 @@ import os
 import sys
 from typing import Optional
 
+import numpy as np
 import pytest
 import torch
 
@@ -65,6 +66,126 @@ VERIFY_TOL_A8W4 = 0.02
 # logits_diff = ||x-y||^2 / (||x||^2 + ||y||^2).  rel_l2 is kept as an
 # informational print only; logits_diff < 0.01 is the actual pass/fail gate.
 LOGITS_DIFF_TOL = 0.01
+
+
+# ---------------------------------------------------------------------------
+# Graph benchmark with cuda.Event (profiler-free, stable on ROCm/HIP)
+# ---------------------------------------------------------------------------
+def _gemm_bandwidth_report(prof, num_iters: int) -> None:
+    """Parse profiler events for MoE GEMM kernels and print bandwidth.
+
+    Kernel name convention (FlyDSL grouped):
+      kernel_mxscale_gemm{1|2}_{tile_m}_{N}_{K}_{E}_{tile}_{...}_a8w4_...
+
+    Data moved per GEMM call (weight-bound at decode):
+      weight:  E * N * K / 2  bytes  (mxfp4, 4-bit packed)
+      scale:   E * N * (K / 32)  bytes  (e8m0, 1 byte per 32 elements)
+      act_in:  M * K * act_bytes  (fp8=1 or bf16=2)
+      act_out: M * N_out * 2     (bf16 output; N_out = N/2 for gemm1 with silu)
+    """
+    import re
+
+    pat = re.compile(
+        r"kernel_mxscale_gemm(\d+)_(\d+)_(\d+)_(\d+)_(\d+)_"
+    )
+    # Build per-kernel-name aggregate from raw event list (each raw event is
+    # one kernel dispatch, not pre-aggregated).
+    from collections import defaultdict
+    kernel_stats = defaultdict(lambda: {"total_us": 0.0, "cnt": 0})
+    for ev in prof.events():
+        if "CUDA" not in str(getattr(ev, "device_type", "")):
+            continue
+        kernel_stats[ev.name]["total_us"] += ev.self_device_time_total
+        kernel_stats[ev.name]["cnt"] += 1
+
+    seen = {}
+    for name, stats in kernel_stats.items():
+        m = pat.match(name)
+        if not m:
+            continue
+        stage = int(m.group(1))
+        if stage in seen:
+            continue
+        tile_m = int(m.group(2))
+        N = int(m.group(3))
+        K = int(m.group(4))
+        E = int(m.group(5))
+        is_a8w4 = "a8w4" in name
+        act_bytes = 1 if is_a8w4 else 0.5  # fp8 or mxfp4
+
+        cnt = stats["cnt"]
+        if cnt == 0:
+            continue
+        per_call_us = stats["total_us"] / cnt
+
+        has_silu = "act_silu" in name or "act_swiglu" in name
+        N_out = N // 2 if has_silu else N
+
+        w_bytes = E * N * K // 2  # mxfp4 packed
+        s_bytes = E * N * (K // SCALE_BLOCK)  # e8m0 scale
+        act_in_bytes = tile_m * E * K * act_bytes  # upper bound
+        act_out_bytes = tile_m * E * N_out * 2  # bf16
+        w_total = w_bytes + s_bytes
+        rw_total = w_total + act_in_bytes + act_out_bytes
+
+        w_bw_gb_s = w_total / (per_call_us * 1e3)  # bytes/us -> GB/s
+        rw_bw_gb_s = rw_total / (per_call_us * 1e3)
+
+        seen[stage] = True
+        print(
+            f"  [bw gemm{stage}] N={N} K={K} E={E} "
+            f"w={w_total / 1e6:.1f}MB "
+            f"time={per_call_us:.1f}us "
+            f"w_bw={w_bw_gb_s:.0f}GB/s "
+            f"rw_bw={rw_bw_gb_s:.0f}GB/s",
+            flush=True,
+        )
+
+
+def _graph_bench_cuda_event(fn, *, warmup=10, iters=101):
+    """Graph-capture *fn*, then time replay with cuda.Event.
+
+    ROCm's torch.profiler sometimes misses or double-counts kernels inside
+    hipGraph replay, producing 15-30% CV.  cuda.Event timing on graph replay
+    gives CV < 1%.  Returns ``(output, median_us)``.
+
+    When ``AITER_LOG_MORE=1``, an eager profiler pass is run first to print
+    per-kernel breakdown and GEMM bandwidth (informational only; the returned
+    ``us`` always comes from the stable cuda.Event path).
+    """
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    if int(os.environ.get("AITER_LOG_MORE", 0)):
+        from aiter.test_common import get_trace_perf
+        import torch.profiler as tpf
+
+        with tpf.profile(
+            activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+        ) as prof:
+            for _ in range(iters):
+                fn()
+            torch.cuda.synchronize()
+        get_trace_perf(prof, iters)
+        _gemm_bandwidth_report(prof, iters)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fn()
+    for _ in range(warmup):
+        graph.replay()
+    torch.cuda.synchronize()
+    latencies = []
+    for _ in range(iters):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        graph.replay()
+        e.record()
+        e.synchronize()
+        latencies.append(s.elapsed_time(e) * 1000)  # ms -> us
+    return out, float(np.median(latencies))
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +343,25 @@ def init_weight_scales(experts: int, rows: int, n_blocks: int) -> torch.Tensor:
     return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
 
 
+def _gating_score(
+    tokens: int, experts: int, topk: int, device: torch.device | str = "cuda"
+) -> torch.Tensor:
+    """Gating logits used by both backends. Round-robin **balanced** when
+    ``AITER_MOE_EXPERT_BALANCE`` is set (deterministic, identical per-expert
+    occupancy every run -> stable grouped-GEMM timing), else random. Sharing
+    this between the FlyDSL and Triton paths keeps their routing/occupancy the
+    same, which is what makes their us numbers comparable."""
+    if AITER_MOE_EXPERT_BALANCE:
+        score = torch.zeros((tokens, experts), dtype=torch.float32, device=device)
+        start_col, end_col = 0, topk
+        for token_id in range(tokens):
+            score[token_id, start_col:end_col] = 1.0
+            start_col = end_col % experts
+            end_col = start_col + topk
+        return score
+    return torch.randn((tokens, experts), dtype=torch.float32, device=device)
+
+
 def _make_topk(
     hidden_states: torch.Tensor, experts: int, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -230,15 +370,7 @@ def _make_topk(
     op_tests/test_moe_2stage.py). Returns ``(topk_ids, topk_weights)`` on the
     same device as ``hidden_states``."""
     tokens = hidden_states.shape[0]
-    if AITER_MOE_EXPERT_BALANCE:
-        score = torch.zeros((tokens, experts), dtype=torch.float32)
-        start_col, end_col = 0, topk
-        for token_id in range(tokens):
-            score[token_id, start_col:end_col] = 1.0
-            start_col = end_col % experts
-            end_col = start_col + topk
-    else:
-        score = torch.randn((tokens, experts), dtype=torch.float32)
+    score = _gating_score(tokens, experts, topk, hidden_states.device)
     topk_w, topk_id = fused_topk(hidden_states, score, topk, True)
     return topk_id.to(torch.int32), topk_w
 
@@ -271,6 +403,7 @@ def _run_grouped_via_fused_moe(
     seed: int = 0,
     warmup: int = 5,
     iters: int = 101,
+    inputs_sink: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[float]]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -315,6 +448,22 @@ def _run_grouped_via_fused_moe(
     # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
     topk_id, topk_w = _make_topk(hidden, experts, topk)
     topk_w = topk_w.to(torch.bfloat16)
+
+    # Expose the exact built tensors so a comparison backend (--compare_triton)
+    # can reuse the SAME hidden / weights / scales / bias / routing instead of
+    # generating its own -- keeps both backends' inputs identical.
+    if inputs_sink is not None:
+        inputs_sink.update(
+            hidden=hidden,
+            w1_logical=w1_logical,
+            w2_logical=w2_logical,
+            w1_scale_raw=w1_scale_raw,
+            w2_scale_raw=w2_scale_raw,
+            bias1=bias1,
+            bias2=bias2,
+            topk_id=topk_id,
+            topk_w=topk_w,
+        )
 
     # ---- prep grouped GEMM inputs ----
     # Stage1 weight/scale/bias get rearranged to physical ``layout``; stage2
@@ -362,13 +511,7 @@ def _run_grouped_via_fused_moe(
 
     torch.cuda.synchronize()
     if bench:
-        # Bench: validate + time the CUDA-graph (production) path. The returned
-        # data is the graph-captured output.
-        from aiter.test_common import run_perftest
-
-        out, us = run_perftest(
-            _call, num_warmup=warmup, num_iters=iters, testGraph=True
-        )
+        out, us = _graph_bench_cuda_event(_call, warmup=warmup, iters=iters)
     else:
         # Verify: validate the eager (graph-off) path; no timing.
         out = _call()
@@ -415,6 +558,148 @@ def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Triton MoE baseline (for --compare_triton): the aiter Triton grouped-GEMM
+# MoE (moe_gemm_a8w4 / moe_gemm_a4w4, the matmul_ogs-style kernels), run as a
+# full two-stage MoE exactly like op_tests/op_benchmarks/triton/bench_moe_gemm_a8w4.py,
+# and timed with the SAME run_perftest(testGraph=True) the FlyDSL path uses so
+# the two us numbers are apples-to-apples.
+#
+#   stage1: x @ w1 (K=model_dim, N=2*inter) + swiglu  -> inter
+#   stage2: h @ w2 (K=inter,     N=model_dim)         -> model_dim
+#
+# INPUTS ARE SHARED with the FlyDSL run (passed in via ``inputs_sink``): the
+# same ``hidden`` activations, the same packed-mxfp4 weight/scale bytes (just
+# transposed into the Triton (E, k, n) layout -- no fresh random tensors) and
+# the same fp32 biases. Routing uses the inherited Triton ``routing()`` on the
+# shared gating score (``_gating_score``), so per-expert occupancy matches.
+# Activation quant follows the format: a8w4 -> per-1x32 MXFP8, a4w4 -> MXFP4.
+# Perf-only baseline; no correctness check.
+# ---------------------------------------------------------------------------
+def _run_triton_moe_perf(
+    data_format: str,
+    *,
+    hidden: torch.Tensor,  # (tokens, K) bf16  -- shared with FlyDSL
+    w1_logical: torch.Tensor,  # (E, 2*inter, K/2) uint8 packed mxfp4 (GGUU)
+    w2_logical: torch.Tensor,  # (E, K, inter/2) uint8 packed mxfp4
+    w1_scale_raw: torch.Tensor,  # (E, 2*inter, K/32) uint8 e8m0
+    w2_scale_raw: torch.Tensor,  # (E, K, inter/32) uint8 e8m0
+    bias1: torch.Tensor,  # (E, 2*inter) fp32
+    bias2: torch.Tensor,  # (E, K) fp32
+    experts: int,
+    topk: int,
+    activation: ActivationType = ActivationType.Silu,
+    swiglu_limit: float = 7.0,
+    use_bias: bool = True,
+    warmup: int = 5,
+    iters: int = 101,
+) -> tuple[torch.Tensor, float]:
+    """Run and time the aiter Triton two-stage MoE on the SHARED FlyDSL inputs.
+    Returns (output, us) where output is the eager Triton result and us is the
+    CUDA-graph median latency. Reuses the same hidden/weights/bias; only
+    transposes the weight/scale bytes into the Triton (E, k, n) layout."""
+    if data_format not in ("a4w4", "a8w4"):
+        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
+
+    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    tokens, K = hidden.shape
+    N1 = w1_logical.shape[1]  # 2*inter (GGUU rows)
+    inter = w2_logical.shape[2] * 2  # w2_logical is (E, K, inter/2) -> unpacked inter
+    fp8_dtype = torch.float8_e4m3fn
+
+    if data_format == "a8w4":
+        from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+            moe_gemm_a8w4 as _moe_gemm,
+            swizzle_scales_gfx1250 as _swizzle_gfx1250,
+        )
+
+        def _quant_act(t):
+            # per-1x32 MXFP8 along the contraction axis (matches FlyDSL a8w4).
+            return downcast_to_mxfp(t.to(torch.bfloat16), fp8_dtype, axis=-1)
+
+    else:  # a4w4
+        from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+            moe_gemm_a4w4 as _moe_gemm,
+            mxfp4_quant,
+        )
+
+        _swizzle_gfx1250 = None  # a4w4 scale swizzle is CDNA4 (gfx950) only
+
+        def _quant_act(t):
+            return mxfp4_quant(t.to(torch.bfloat16))
+
+    def _swz(scale, n_dim, k_dim):
+        # gfx1250 HBM scale swizzle requires n%32==0 and k%256==0; otherwise the
+        # kernel consumes the raw (un-swizzled) scale.
+        if (
+            _swizzle_gfx1250 is not None
+            and get_arch() == "gfx1250"
+            and n_dim % 32 == 0
+            and k_dim % (32 * 8) == 0
+        ):
+            return _swizzle_gfx1250(scale), "GFX1250_SCALE"
+        return scale, None
+
+    # Reuse the SAME packed weight/scale bytes; the Triton GEMM wants
+    # column-major weights: shape (E, K, N) with stride(-2)==1, i.e. the K
+    # dimension contiguous.  w1_logical is (E, N, K_pack) contiguous, so a
+    # plain .transpose(1,2) (no .contiguous()) gives the right strides.
+    w1_q = w1_logical.transpose(1, 2)   # (E, K/2, N1), column-major
+    w2_q = w2_logical.transpose(1, 2)   # (E, inter/2, K), column-major
+    w1_s, swz1 = _swz(w1_scale_raw.transpose(1, 2), N1, K)
+    w2_s, swz2 = _swz(w2_scale_raw.transpose(1, 2), K, inter)
+
+    # Routing: inherited Triton routing() on the SAME gating score the FlyDSL
+    # path used (balanced when AITER_MOE_EXPERT_BALANCE) -> identical occupancy.
+    # Precomputed outside the timed call (data-dependent / host-syncing).
+    score = _gating_score(tokens, experts, topk, hidden.device)
+    rdata, gather_indx, scatter_indx = routing(score.to(torch.float16), topk)
+
+
+    def _call():
+        xq, xs = _quant_act(hidden)
+        h = _moe_gemm(
+            xq,
+            w1_q,
+            xs,
+            w1_s,
+            None,
+            None,
+            bias1 if use_bias else None,
+            rdata,
+            gather_indx=gather_indx,
+            swizzle_mx_scale=swz1,
+            out_dtype=torch.bfloat16,
+            apply_swiglu=True,
+        )
+        hq, hs = _quant_act(h)
+        out = _moe_gemm(
+            hq,
+            w2_q,
+            hs,
+            w2_s,
+            None,
+            None,
+            bias2 if use_bias else None,
+            rdata,
+            scatter_indx=scatter_indx,
+            swizzle_mx_scale=swz2,
+            out_dtype=torch.bfloat16,
+        )
+        return out
+
+    # Eager precision run first (graph replay may reuse static buffers whose
+    # contents are not representative for a precision check).
+    precision_out = _call().clone()
+    torch.cuda.synchronize()
+
+    _graph_out, us = _graph_bench_cuda_event(_call, warmup=warmup, iters=iters)
+    return precision_out, float(us)
+
+
+# ---------------------------------------------------------------------------
 # Pytest correctness suite
 # ---------------------------------------------------------------------------
 def run_moe(
@@ -423,8 +708,8 @@ def run_moe(
     experts: int = 4,
     tokens: int = 8,
     topk: int = 2,
-    model_dim: int = 512,
-    inter_dim: int = 512,
+    model_dim: int = 256,
+    inter_dim: int = 256,
     layout: str = "gguu",
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
@@ -434,6 +719,7 @@ def run_moe(
     bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
+    inputs_sink: Optional[dict] = None,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
     validated path: bench checks (and times) the CUDA-graph production path;
@@ -462,6 +748,7 @@ def run_moe(
         bench=bench,
         warmup=warmup,
         iters=iters,
+        inputs_sink=inputs_sink,
     )
     mode = "graph" if bench else "eager"
     ld = _logits_diff(out, ref)
@@ -624,9 +911,33 @@ def main() -> None:
         help="call the real grouped WMMA GEMM kernel. Default: True on gfx1250, "
         "False elsewhere (mock the GEMM so the tiny operators run on any arch).",
     )
+    parser.add_argument(
+        "--compare_triton",
+        action="store_true",
+        help="also time the aiter Triton MoE (moe_gemm_a8w4 / moe_gemm_a4w4, run "
+        "as a full two-stage MoE) on the SAME inputs (shared hidden/weights/bias/"
+        "routing) and report triton_us + speedup vs the FlyDSL grouped GEMM. "
+        "Implies --expert-balance so both backends see identical occupancy. "
+        "Best used with --scenario bench.",
+    )
+    parser.add_argument(
+        "--expert-balance",
+        action="store_true",
+        help="round-robin balanced routing (deterministic, identical per-expert "
+        "occupancy every run). Stabilises the grouped-GEMM timing; auto-enabled "
+        "by --compare_triton so both backends are comparable.",
+    )
     args = parser.parse_args()
     if not args.real_gemm:
         _mock_grouped_gemm()
+
+    # Balanced routing makes the FlyDSL grouped GEMM timing stable (its time is
+    # occupancy-dependent) and gives both backends the same per-expert load, so
+    # --compare_triton turns it on by default.
+    global AITER_MOE_EXPERT_BALANCE
+    if args.expert_balance or args.compare_triton:
+        AITER_MOE_EXPERT_BALANCE = True
+    os.environ["AITER_MOE_EXPERT_BALANCE"] = "1" if AITER_MOE_EXPERT_BALANCE else "0"
     if args.model_dim < 512 or args.inter_dim < 512:
         raise SystemExit(
             f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
@@ -646,6 +957,9 @@ def main() -> None:
         if len(token_list) > 1:
             print(f"\n===== tokens={_tok} =====", flush=True)
         tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
+        # When comparing, capture the exact built inputs so the Triton baseline
+        # reuses them (identical hidden/weights/bias/routing).
+        sink = {} if args.compare_triton else None
         # raise_on_fail=False so one out-of-gate token does not abort the
         # sweep; the failure is recorded and reported after the table.
         metrics = run_moe(
@@ -664,23 +978,81 @@ def main() -> None:
             bench=args.scenario == "bench",
             warmup=args.warmup,
             iters=args.iters,
+            inputs_sink=sink,
         )
-        rows.append(
-            {
-                "data_format": args.data_format,
-                "layout": args.layout,
-                "act": args.act,
-                "experts": args.experts,
-                "tokens": _tok,
-                "topk": args.topk,
-                "model_dim": args.model_dim,
-                "inter_dim": args.inter_dim,
-                "logits_diff": metrics["logits_diff"],
-                "rel_l2": metrics["rel_l2"],
-                "pass": metrics["passed"],
-                "us": metrics.get("us"),
-            }
-        )
+        row = {
+            "data_format": args.data_format,
+            "layout": args.layout,
+            "act": args.act,
+            "experts": args.experts,
+            "tokens": _tok,
+            "topk": args.topk,
+            "model_dim": args.model_dim,
+            "inter_dim": args.inter_dim,
+            "logits_diff": metrics["logits_diff"],
+            "rel_l2": metrics["rel_l2"],
+            "pass": metrics["passed"],
+            "us": metrics.get("us"),
+        }
+
+        if args.compare_triton:
+            flydsl_us = metrics.get("us")
+            triton_out = None
+            try:
+                triton_out, triton_us = _run_triton_moe_perf(
+                    args.data_format,
+                    hidden=sink["hidden"],
+                    w1_logical=sink["w1_logical"],
+                    w2_logical=sink["w2_logical"],
+                    w1_scale_raw=sink["w1_scale_raw"],
+                    w2_scale_raw=sink["w2_scale_raw"],
+                    bias1=sink["bias1"],
+                    bias2=sink["bias2"],
+                    experts=args.experts,
+                    topk=args.topk,
+                    activation=activation,
+                    swiglu_limit=args.swiglu_limit,
+                    use_bias=not args.no_bias,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                )
+            except Exception as exc:  # a4w4 triton may be gfx950-only, etc.
+                triton_us = None
+                print(f"[compare_triton {args.data_format}] FAILED: {exc}", flush=True)
+            # Triton precision vs the FlyDSL PyTorch fp32 reference.
+            # NOTE: the Triton and FlyDSL paths use different routing
+            # implementations (Triton routing() vs fused_topk) and different
+            # reduce/weighting, so the outputs are NOT directly comparable.
+            # We report the Triton output norm as a sanity check — it should be
+            # non-zero and in a similar order of magnitude to the FlyDSL output.
+            if triton_out is not None:
+                triton_norm = float(triton_out.float().norm())
+                flydsl_norm = metrics.get("grouped_norm", 0)
+                print(
+                    f"[triton sanity {args.data_format}] "
+                    f"triton_norm={triton_norm:.4e} "
+                    f"flydsl_norm={flydsl_norm:.4e}",
+                    flush=True,
+                )
+            # speedup > 1 => FlyDSL grouped GEMM is faster than Triton.
+            speedup = (
+                triton_us / flydsl_us
+                if (triton_us is not None and flydsl_us)
+                else None
+            )
+            row["flydsl_us"] = flydsl_us
+            row["triton_us"] = triton_us
+            row["speedup(triton/flydsl)"] = speedup
+            tu = f"{triton_us:.2f}" if triton_us is not None else "n/a"
+            fu = f"{flydsl_us:.2f}" if flydsl_us else "n/a"
+            su = f"{speedup:.2f}x" if speedup is not None else "n/a"
+            print(
+                f"[compare_triton {args.data_format}] tokens={_tok}: "
+                f"flydsl_us={fu} triton_us={tu} speedup(triton/flydsl)={su}",
+                flush=True,
+            )
+
+        rows.append(row)
 
     # Always print the summary table (verify and bench).
     summarize(rows)

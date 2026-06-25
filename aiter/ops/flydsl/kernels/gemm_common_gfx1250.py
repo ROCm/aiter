@@ -84,17 +84,23 @@ def _raw_lds_ptr(lds_base_idx, byte_offset):
     return _llvm.inttoptr(lds_ptr_ty, addr_i32)
 
 
-def lds_load_b128_raw(lds_base_idx, byte_offset):
+def lds_load_b128_raw(lds_base_idx, byte_offset, imm_byte_offset: int = 0):
     """Load 16 bytes from LDS using a pre-extracted base index (raw LLVM).
 
     Args:
-        lds_base_idx: Index value from ``extract_lds_base_idx``.
-        byte_offset: Byte offset (index-type) relative to the base.
+        lds_base_idx:    Index value from ``extract_lds_base_idx``.
+        byte_offset:     Byte offset (index-type) relative to the base.
+        imm_byte_offset: Compile-time immediate byte offset applied via GEP
+                         AFTER ``byte_offset``.  LLVM folds this into the
+                         ``ds_load_b128 ... offset:N`` immediate field,
+                         eliminating the per-element v_add_nc_u32 instruction.
+                         Must be a Python int; must fit in 16 bits (0–65535).
     """
     ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(
-        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val
-    )
+    if imm_byte_offset:
+        from flydsl.expr.buffer_ops import get_element_ptr as _gep
+        ptr_val = _gep(ptr_val, static_byte_offset=int(imm_byte_offset))
+    return llvm_dialect.load(ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val)
 
 
 def lds_load_b32_raw(lds_base_idx, byte_offset):
@@ -171,12 +177,25 @@ def pipeline_fence_wait(use_cluster=False):
         cluster.cluster_wait()
 
 
-def issue_tdm_loads(*descs, wave_specialized=False, wave_id=None):
-    """Emit one or more TDM loads, optionally one descriptor per loader wave."""
+def issue_tdm_loads(*descs, wave_specialized=False, wave_id=None, cache_policies=None, enabled=None):
+    """Emit one or more TDM loads, optionally one descriptor per loader wave.
+
+    Args:
+        cache_policies: Optional per-descriptor cache policy list.  When given,
+            ``cache_policies[i]`` is forwarded to ``tensor_load_2d`` for the
+            *i*-th descriptor (e.g. ``1`` = ``TH_NT`` non-temporal hint on
+            gfx12+).  ``None`` (default) uses cache_policy 0 for every load.
+        enabled: Optional compile-time per-descriptor bool list. When given,
+            descriptor ``i`` is only emitted if ``enabled[i]`` is truthy. Used
+            by the cooperative-path tdm_load_only ablation to skip a tensor's
+            load entirely. ``None`` (default) emits every descriptor.
+    """
     if wave_specialized:
         if wave_id is None:
             wave_id = rocdl.wave_id()
         for idx, desc in enumerate(descs):
+            if enabled is not None and not enabled[idx]:
+                continue
             is_loader_wave = arith.cmpi(
                 arith.CmpIPredicate.eq,
                 wave_id,
@@ -184,12 +203,16 @@ def issue_tdm_loads(*descs, wave_specialized=False, wave_id=None):
             )
             if_op = scf.IfOp(is_loader_wave)
             with ir.InsertionPoint(if_op.then_block):
-                tdm_ops.tensor_load_2d(desc)
+                cp = cache_policies[idx] if cache_policies else 0
+                tdm_ops.tensor_load_2d(desc, cache_policy=cp)
                 scf.YieldOp([])
         return
 
-    for desc in descs:
-        tdm_ops.tensor_load_2d(desc)
+    for idx, desc in enumerate(descs):
+        if enabled is not None and not enabled[idx]:
+            continue
+        cp = cache_policies[idx] if cache_policies else 0
+        tdm_ops.tensor_load_2d(desc, cache_policy=cp)
 
 
 def store_acc_vec8_to_lds(memref, base_elem_off, imm_elem_off, acc_vec8, out_elem=None):
