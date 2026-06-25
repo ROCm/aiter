@@ -476,14 +476,12 @@ def _moe_gemm_a8w4_decode(
                 
         write_idx += 1
 
-        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS * NUM_TDM_OPS - 1)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
         cur_w = (
             w_buffer.index(read_idx % NUM_BUFFERS)
             .permute((1, 0))
             .load(layout=DOT_LAYOUT_W)
         )
-
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
         cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":

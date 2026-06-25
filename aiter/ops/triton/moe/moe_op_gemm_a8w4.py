@@ -271,7 +271,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     elif block_m == 64:
         block_n = 256
         block_k = 512
-        num_stages = 2
+        num_stages = 3
         num_warps = 4
 
     else:
@@ -475,7 +475,7 @@ def moe_gemm_a8w4(
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    if use_gluon and block_m == 16:
+    if use_gluon and block_m <= 64:
         _moe_gemm_a8w4_decode_gluon[(grid,)](
             y,
             y.stride(1),
