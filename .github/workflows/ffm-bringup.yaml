@@ -186,10 +186,12 @@ jobs:
               else
                 echo "rocm-core not found; using default ROCm version ${TRITON_DEFAULT_ROCM_VERSION}"
               fi
-              echo "Installing triton==${FFM_TRITON_VERSION} from ${TRITON_INDEX_URL}"
+              echo "Installing triton==${FFM_TRITON_VERSION} from PyPI with AMD index fallback ${TRITON_INDEX_URL}"
               export PIP_BREAK_SYSTEM_PACKAGES=1
-              python3 -m pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
-              python3 -m pip install --break-system-packages --index-url "${TRITON_INDEX_URL}" "triton==${FFM_TRITON_VERSION}"
+              python3 -m pip install --break-system-packages \
+                --index-url https://pypi.org/simple \
+                --extra-index-url "${TRITON_INDEX_URL}" \
+                "triton==${FFM_TRITON_VERSION}"
               python3 -m pip show amd-triton triton triton-kernels || true
               python3 -c "import triton; print(f\"triton version after pin: {triton.__version__}\")"
               echo "==== Check Aiter core module ===="
