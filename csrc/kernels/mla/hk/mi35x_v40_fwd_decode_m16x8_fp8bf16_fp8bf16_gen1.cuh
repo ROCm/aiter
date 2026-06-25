@@ -106,6 +106,11 @@ struct HkMlaV40Regs
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k0_begin, k_k0_begin + 3>>, 4>;
     using pv_v_2_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k1_begin, k_k1_begin + 3>>, 4>;
+    // 4th PV V slot reuses the k_2 regs (v44:47) -- free during PV -- so the
+    // round-robin refill ds_read can target a different reg than the MFMA it is
+    // issued behind (breaks the ds_read-dst == mfma-src WAR stall).
+    using pv_v_3_ranges =
+        hkdart::split_many_t<hkdart::type_list<hkdart::range<k_k2_begin, k_k2_begin + 3>>, 4>;
     using q_lds_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_q_lds_begin, k_q_lds_begin + 7>>, 4>;
     // art tile types (stage functions reconstruct these from the shared ranges).
@@ -125,6 +130,8 @@ struct HkMlaV40Regs
         hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_1_ranges>;
     using pv_v_2_t =
         hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_2_ranges>;
+    using pv_v_3_t =
+        hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, pv_v_3_ranges>;
     using p_mfma_t =
         hk::art<mfma_ab_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges>;
     using oaccu_t = hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges>;
@@ -148,10 +155,12 @@ hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
     constexpr uint32_t k_v0_begin  = R::k_v0_begin;
     constexpr uint32_t k_k0_begin  = R::k_k0_begin;
     constexpr uint32_t k_k1_begin  = R::k_k1_begin;
+    constexpr uint32_t k_k2_begin  = R::k_k2_begin;
     typename R::p_mfma_t p_mfma;
     typename R::pv_v_0_t pv_v_0;
     typename R::pv_v_1_t pv_v_1;
     typename R::pv_v_2_t pv_v_2;
+    typename R::pv_v_3_t pv_v_3;
 
     constexpr uint32_t num_pv_iter = T::kVoHeadDim / T::kBlockN; // 16
     constexpr uint32_t kNumVTiles  = 2u * num_pv_iter;          // 32 = S_0..S_31
@@ -169,10 +178,12 @@ hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
         asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 1), "v"(r));
     };
 
-    // Issue both ds_read_b64 for base tile S_jj into round-robin slot.
+    // Issue both ds_read_b64 for base tile S_jj into round-robin slot (4 slots).
     auto load_S = [&]<uint32_t jj, uint32_t slot>() {
-        constexpr uint32_t base =
-            (slot == 0u) ? k_v0_begin : (slot == 1u) ? k_k0_begin : k_k1_begin;
+        constexpr uint32_t base = (slot == 0u)   ? k_v0_begin
+                                  : (slot == 1u) ? k_k0_begin
+                                  : (slot == 2u) ? k_k1_begin
+                                                 : k_k2_begin;
         kv_manager.template load_transposed_v_to_gpr<0u, jj * 16u, base + 0>(p_lds_v);
         kv_manager.template load_transposed_v_to_gpr<16u, jj * 16u, base + 2>(p_lds_v);
     };
@@ -184,7 +195,8 @@ hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
         };
         if constexpr(slot == 0u) run(pv_v_0);
         else if constexpr(slot == 1u) run(pv_v_1);
-        else run(pv_v_2);
+        else if constexpr(slot == 2u) run(pv_v_2);
+        else run(pv_v_3);
     };
 
     if constexpr(kDoRescale)
@@ -206,8 +218,11 @@ hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
         constexpr uint32_t next_oaccu_base = k_o_begin + (iter + 1u) * 8u;
         constexpr uint32_t j_lo            = 2u * iter;      // flat mfma idx (a)
         constexpr uint32_t j_hi            = 2u * iter + 1u; // flat mfma idx (b)
-        constexpr uint32_t slot_lo         = j_lo % 3u;
-        constexpr uint32_t slot_hi         = j_hi % 3u;
+        // 4-slot round-robin (tile T -> slot T%4). Reading slot j%4 while
+        // refilling slot (j+3)%4 keeps the refill ds_read's dst != the mfma's
+        // src reg, so it isn't serialized behind the mfma's operand read.
+        constexpr uint32_t slot_lo         = j_lo % 4u;
+        constexpr uint32_t slot_hi         = j_hi % 4u;
 
         constexpr uint32_t oaccu_base = k_o_begin + iter * 8u;
         using oaccu_a_r               = hkdart::split_many_t<
@@ -221,11 +236,11 @@ hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
 
         // ---- mfma_a (flat j_lo, reads slot_lo) ----
         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(has_next ? 4 : 2, -1));
-        do_mma.template operator()<slot_lo>(oaccu_a);
         if constexpr(j_lo + 3u < kNumVTiles)
         {
-            load_S.template operator()<j_lo + 3u, slot_lo>();
+            load_S.template operator()<j_lo + 3u, (j_lo + 3u) % 4u>();
         }
+        do_mma.template operator()<slot_lo>(oaccu_a);
         if constexpr(kDoRescale && has_next)
         {
             mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 0>{});
@@ -234,15 +249,15 @@ hk_mla_v40_pv_gemm(KvManager8to16bitsV1<T>& kv_manager, const uintptr_t p_lds_v,
 
         // ---- mfma_b (flat j_hi, reads slot_hi) ----
         __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(has_next ? 4 : 0, -1));
+        if constexpr(j_hi + 3u < kNumVTiles)
+        {
+            load_S.template operator()<j_hi + 3u, (j_hi + 3u) % 4u>();
+        }
         do_mma.template operator()<slot_hi>(oaccu_b);
         if constexpr(kDoRescale && has_next)
         {
             mul_pair(rescale, opus::number<next_oaccu_base + 0 * 4 + 2>{});
             mul_pair(rescale, opus::number<next_oaccu_base + 1 * 4 + 2>{});
-        }
-        if constexpr(j_hi + 3u < kNumVTiles)
-        {
-            load_S.template operator()<j_hi + 3u, slot_hi>();
         }
     });
 }
