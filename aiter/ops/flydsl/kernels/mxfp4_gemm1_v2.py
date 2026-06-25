@@ -16,21 +16,25 @@ CONVERTED to the layout API (the deliverable):
     loaded via a layout-API ``fx.copy`` into register fragments. The non-temporal
     (nt) decode policy rides on the copy atom's ``cache_modifier`` (FlyDSL
     ``BufferCopy128b(cache_modifier=2)``), so there is NO raw buffer_load fallback.
-  * **Scaled MMA** -> the FlyDSL cdna4 ``MFMA_Scale`` atom driven via
-    ``fly.mma_atom_call_ssa``: per-K-block e8m0 scales ride on the atom STATE
-    (``set_value`` scale_a/scale_b) and the runtime per-K opsel is handled by
-    selecting one of the pre-built opsel-specialized atoms (opsel is a type param).
-    Bit-identical to the prior raw ``mfma_scale_f32_16x16x128_f8f6f4`` intrinsic.
-  * **Accumulators** -> ``thr_mma.make_fragment_C`` (SSA chain mid-loop, stored
-    into the fragment-of-record) instead of a python list-of-vec4.
+  * **Scaled MMA** -> ``fx.gemm`` over rank-1 register fragments (A/B/C), one
+    fx.gemm per mfma (each lowers to a single fly MmaAtomCall ->
+    rocdl.mfma.scale.f32.16x16x128.f8f6f4). Per-K-block e8m0 scales ride on the
+    atom STATE via fx.gemm ``scale_a=/scale_b=`` kwargs; the runtime per-K opsel
+    selects one of the pre-built opsel-specialized atoms (opsel is a type param).
+    Bit-identical ISA to the prior raw intrinsic (mem2reg folds the fragment
+    alloca/store/load; 448 mfma_scale, no scratch/spill).
+  * **Accumulators** -> C register fragments updated IN PLACE (fx.gemm d == c),
+    one per (i,J); the epilogue loads them. A and B are likewise register
+    fragments (A refilled per K iter from ds_read; B per-stage for the pipeline).
 
 KEPT RAW (reused by importing from the v1 module ``mxfp4_gemm1`` -- not duplicated):
   * all math / quant helpers (``_silu_mul_batch``, ``_e8m0_*``, ``_fabs_f32``,
     ``_lds_swizzle_mask``, ``_raw``, ``_global_base_ptr1``, ``_gep1``, ``_gep3``,
     ``_lds_base_ptr3``, ``gemm1_grid``, the ``*_for(...)`` size helpers + consts).
-  * the A-side LDS stage + ds-read + A-scale machinery (the e8m0 byte layout that
-    feeds the mfma scale operands) -- the swizzle/byte layout is delicate and the
-    raw path is the bit-exact spec; converting it is later polish.
+  * the A-side LDS stage + ds-read addressing + A-scale machinery (the e8m0 byte
+    layout that feeds the mfma scale operands) -- the swizzle/byte layout is
+    delicate and the raw path is the bit-exact spec; the ds-read result is stored
+    into layout-API A fragments. Converting the addressing itself is later polish.
   * the A-side gather (rows via m_indices) base-offset computation.
   * the SwiGLU + fp4/e8m0 requant epilogue MATH (reuses helpers).
 
@@ -41,7 +45,6 @@ scores ~0.874 on this case).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
@@ -243,43 +246,8 @@ def _gemm1_body_v2(
         b_scale_s_base.append(base)
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
-    # ============================================================
-    # Accumulators -- LAYOUT API (the second non-negotiable core conversion).
-    #
-    # The scaled-MMA atom call (mma_atom_call_ssa) produces/consumes plain
-    # vector<4xf32> SSA values (it cannot write to a fragment slot mid-chain), so the
-    # MMA accumulation chain is necessarily SSA-threaded. We make the layout-API
-    # fragment the
-    # accumulator-OF-RECORD: thr_mma.make_fragment_C(tC) allocates the register
-    # storage (32 f32 for this BM32 tile = kMChunks(2) * 4 J * 4 elems, exactly the
-    # v2 reference's acc_size), the final MMA results are STOREd into it, and the
-    # cshuffle epilogue LOADs from it (instead of from a python list-of-vec4).
-    #
-    # tC is a synthetic (BM, BN) tile only used for the fragment's layout/shape --
-    # its backing memory is never touched (a fragment is register-resident). We
-    # build it from arg_aqout reinterpreted as f32 via flat_divide, exactly the v2
-    # idiom (flat_divide(make_buffer_tensor(...), make_tile(BM, BN))).
-    _scale_atom = fx.make_mma_atom(
-        fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, Float4E2M1FN)
-    )
-    _tiled_mma = fx.make_tiled_mma(
-        _scale_atom,
-        fx.make_layout((1, 4, 1), (0, 1, 0)),
-        fx.make_tile(None, None, fx.make_layout((32, 4), (1, 32))),
-    )
-    _tid_idx = arith.index_cast(T.index, _raw(lane + wave * fx.Int32(64)))
-    _thr_mma = _tiled_mma.thr_slice(_tid_idx)
-    # Build an f32 global iter from the raw aqout address (inttoptr -> make_view),
-    # the same idiom fp8_gemm_utils/G2SLoader use for raw-address pointer views.
-    _c_ptr_ty = fx.PointerType.get(
-        fx.Float32.ir_type, address_space=fx.AddressSpace.Global, alignment=16
-    )
-    _c_iter = fx.inttoptr(_c_ptr_ty, fx.Int64(arg_aqout))
-    _gC = fx.Tensor(fx.make_view(_c_iter, fx.make_layout((BM, BN), (BN, 1))))
-    _tC = fx.flat_divide(_gC, fx.make_tile(BM, BN))[None, None, 0, 0]
-    frag_C = _thr_mma.make_fragment_C(_tC)
-
-    b = [[[None, None] for _ in range(4)] for _ in range(kStages)]
+    # Per-stage B-scale (Vec, cheap to double-buffer as SSA). A/B/C register
+    # fragments for fx.gemm are built below (after the preshuffle views).
     b_scale_v = [[None, None] for _ in range(kStages)]
 
     # raw A LDS helpers (KEPT RAW) -------------------------------------------
@@ -305,9 +273,10 @@ def _gemm1_body_v2(
             )
 
     def issue_a_ds_read(slot):
+        # ds_read the A tile from LDS and STORE into the A register fragments that
+        # feed fx.gemm (raw llvm.load addressing kept; the value lands in a fragment).
         mask = _lds_swizzle_mask(lane_mod_16)
         base_ptr = _lds_base_ptr3(s_aq.get())
-        a = [[None, None] for _ in range(kMChunks)]
         for k in range_constexpr(2):
             lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
             for i in range_constexpr(kMChunks):
@@ -317,8 +286,8 @@ def _gemm1_body_v2(
                     + lds_row * fx.Int32(KH_TILE)
                     + lds_col
                 )
-                a[i][k] = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, off))
-        return a
+                vec = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, off))
+                _a_frags[i][k].store(Vec(vec))
 
     def issue_a_scale_load():
         chunk_base = m_row // fx.Int32(32)
@@ -443,33 +412,47 @@ def _gemm1_body_v2(
     # paths use the layout API now -- they differ only in the copy atom's cache mod).
     _bq_views = [_make_bq_view_for_jtile(j) for j in range_constexpr(4)]
 
-    # Persistent per-(j, half) B register fragments, allocated ONCE (mirroring the
-    # v2 reference's frag_B_0/frag_B_1 hoisted outside the loop). Inside the K-loop
-    # we fx.copy the (klane,nlane,K_C,half) slice of the preshuffle view DIRECTLY
-    # into these registers (a uniform-descriptor buffer_load with per-lane voffset),
-    # then read .load() for the raw mfma.
+    # All MMA operands are register FRAGMENTS feeding fx.gemm (rank-1 -> one
+    # MmaAtomCall each). Element type i32<4:1> (=16B=32 fp4) for A/B; f32<4:1> (vec4
+    # accumulator) for C, via make_fragment_like(dtype=f32).
+    _frag_tmpl = _bq_views[0][0, 0, 0, 0, None]  # i32<4:1>
+
+    # B fragments are PER-STAGE (kStages): the K-loop prefetches B one+ stage ahead
+    # (slot_b = OFFSET % kStages), so each stage needs its own fragment to hold data
+    # from load (iter N) until consumed (iter N+kStages) -- mirrors the old per-stage
+    # Vec double-buffering.
     _bq_frags = [
         [
-            fx.make_fragment_like(_bq_views[j][0, 0, 0, half, None])
-            for half in range_constexpr(2)
+            [fx.make_fragment_like(_frag_tmpl) for _ in range_constexpr(2)]
+            for _ in range_constexpr(4)
         ]
-        for j in range_constexpr(4)
+        for _ in range_constexpr(kStages)
+    ]
+    # A fragments: one set, refilled from ds_read each K iter (used by all 4 J in
+    # that iter before the next ds_read). C accumulators: in-place across the K loop.
+    _a_frags = [
+        [fx.make_fragment_like(_frag_tmpl) for _ in range_constexpr(2)]
+        for _ in range_constexpr(kMChunks)
+    ]
+    _c_frags = [
+        [
+            fx.make_fragment_like(_frag_tmpl, dtype=fx.Float32.ir_type)
+            for _ in range_constexpr(4)
+        ]
+        for _ in range_constexpr(kMChunks)
     ]
 
-    def issue_b_load_j(b_slot, K_C, j):
-        # Single LAYOUT-API path for both policies: preshuffle view + fx.copy with
-        # the cache-modifier-parameterized atom (_b_copy_atom carries nt vs cached).
+    def issue_b_load_j(stage, K_C, j):
+        # LAYOUT-API B load: preshuffle view -> fx.copy into the stage's B fragment
+        # (cache modifier on _b_copy_atom selects nt vs cached). No Vec extraction;
+        # fx.gemm reads the fragment directly at MMA time.
         view = _bq_views[j]
         for half in range_constexpr(2):
-            frag = _bq_frags[j][half]
-            # copy global preshuffle-view slice -> persistent register fragment.
-            # lane_div_16 / lane_mod_16 are runtime per-lane indices -> voffset.
             fx.copy(
                 _b_copy_atom,
                 view[lane_div_16, lane_mod_16, K_C, half, None],
-                frag,
+                _bq_frags[stage][j][half],
             )
-            b_slot[j][half] = Vec(fx.memref_load_vec(frag))
 
     def issue_b_scale_load(bs_slot, K_C):
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
@@ -485,20 +468,15 @@ def _gemm1_body_v2(
                 soffset_bytes=s_off,
             )
 
-    # -- MFMA cluster -- LAYOUT API (the scaled MMA via fx.mma_atom_call) -------
-    # The microscaled mfma is driven through the FlyDSL layout-API scaled-MMA atom
-    # (cdna4 MFMA_Scale) instead of a raw rocdl intrinsic. The per-K-block e8m0
-    # scales ride on the atom STATE (set_value scale_a/scale_b), and the runtime
-    # per-K opsel is handled by selecting an opsel-specialized atom (opsel is a type
-    # parameter, so one atom instance per (opselA,opselB) pair -- built once, <=8).
-    # mma_atom_call_ssa keeps the SSA accumulator-chain form the mfma requires.
-    # cbsz/blgp (=4 for fp4) are inferred by the atom from the Float4E2M1FN operand
-    # types -- equivalent to the raw call's explicit 4,4.
-    mfma_ty = T.f32x4
+    # -- MFMA cluster -- LAYOUT API via fx.gemm -------------------------------
+    # Each microscaled mfma is one fx.gemm over rank-1 register fragments (A/B/C),
+    # which lowers to a single fly MmaAtomCall -> rocdl.mfma.scale.f32.16x16x128.
+    # The per-K-block e8m0 scales ride on the atom STATE (fx.gemm **kwargs ->
+    # set_value scale_a/scale_b); the runtime per-K opsel is a type param, so we
+    # select a pre-built opsel-specialized atom per (opselA,opselB) pair. cbsz/blgp
+    # (=4 for fp4) are inferred from the Float4E2M1FN operand types. The accumulator
+    # is the C fragment updated IN PLACE (d == c), so no SSA acc chain is threaded.
     zero4 = Vec.filled(4, 0.0, fx.Float32)
-
-    # accm holds the SSA accumulator vec4 mid-chain; stored into frag_C at the end.
-    accm = [[None] * 4 for _ in range(kMChunks)]
 
     # Build the opsel-specialized scaled-MMA atoms ONCE (opsel is a type param, so
     # one atom per (opselA,opselB) pair). All 16 combos -- cheap, built at trace time.
@@ -512,34 +490,42 @@ def _gemm1_body_v2(
         for osb in range_constexpr(4)
     }
 
-    def _scaled_mma(a_vec, b_vec, c_vec, opsel_a, opsel_b, sa, sb):
-        # per-K-block e8m0 scales -> atom state; opsel -> pre-built atom selection.
-        atom = _scale_mma_atoms[(opsel_a, opsel_b)].set_value(
-            {"scale_a": sa, "scale_b": sb}
+    def _gemm_mma(a_frag, b_frag, c_frag, opsel_a, opsel_b, sa, sb):
+        # one fx.gemm = one MmaAtomCall (rank-1 fragments). d == c -> in-place accum.
+        fx.gemm(
+            _scale_mma_atoms[(opsel_a, opsel_b)],
+            c_frag,
+            a_frag,
+            b_frag,
+            c_frag,
+            scale_a=sa,
+            scale_b=sb,
         )
-        return Vec(fly_dialect.mma_atom_call_ssa([mfma_ty], atom, a_vec, b_vec, c_vec))
 
-    def mfma_cluster(b_slot, a, a_scale, bs_slot, J, init):
+    def mfma_cluster(stage, a_scale, bs_slot, J):
         in_b = J % 2
         sb = bs_slot[J // 2]
-        bJ0, bJ1 = b_slot[J][0], b_slot[J][1]
+        bJ0, bJ1 = _bq_frags[stage][J][0], _bq_frags[stage][J][1]
         for sub in range_constexpr(kSubBlocks):
             i0 = sub * 2 + 0
             i1 = sub * 2 + 1
             sa = a_scale[sub]
-            c0 = zero4 if const_expr(init) else accm[i0][J]
-            c1 = zero4 if const_expr(init) else accm[i1][J]
-            accm[i0][J] = _scaled_mma(a[i0][0], bJ0, c0, 0, 0 + in_b, sa, sb)
-            accm[i1][J] = _scaled_mma(a[i1][0], bJ0, c1, 1, 0 + in_b, sa, sb)
-            accm[i0][J] = _scaled_mma(a[i0][1], bJ1, accm[i0][J], 2, 2 + in_b, sa, sb)
-            accm[i1][J] = _scaled_mma(a[i1][1], bJ1, accm[i1][J], 3, 2 + in_b, sa, sb)
+            _gemm_mma(_a_frags[i0][0], bJ0, _c_frags[i0][J], 0, 0 + in_b, sa, sb)
+            _gemm_mma(_a_frags[i1][0], bJ0, _c_frags[i1][J], 1, 0 + in_b, sa, sb)
+            _gemm_mma(_a_frags[i0][1], bJ1, _c_frags[i0][J], 2, 2 + in_b, sa, sb)
+            _gemm_mma(_a_frags[i1][1], bJ1, _c_frags[i1][J], 3, 2 + in_b, sa, sb)
+
+    # ---- zero the C accumulator fragments (in-place accumulate thereafter) ----
+    for i in range_constexpr(kMChunks):
+        for J in range_constexpr(4):
+            _c_frags[i][J].store(zero4)
 
     # ---- prologue: stages 0,1 ----
     issue_a_scale_load()
     for K_C in range_constexpr(kStages):
         issue_a_load_lds(K_C, K_C)
         for j in range_constexpr(4):
-            issue_b_load_j(b[K_C], K_C, j)
+            issue_b_load_j(K_C, K_C, j)
         issue_b_scale_load(b_scale_v[K_C], K_C)
 
     # ---- main loop: OFFSET in [0,kUnroll) ----
@@ -549,7 +535,7 @@ def _gemm1_body_v2(
         write_slot = K_C % kAStages
         slot_b = OFFSET % kStages
         gpu.barrier()
-        a_cur = issue_a_ds_read(read_slot)
+        issue_a_ds_read(read_slot)
         asc_cur = issue_a_scale_ds_read(K_C - kStages)
         issue_a_load_lds(write_slot, K_C)
         for J in range_constexpr(4):
@@ -559,12 +545,10 @@ def _gemm1_body_v2(
             # interleaving the B buffer_loads into it. Closes the small-M gap.
             rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
-            mfma_cluster(
-                b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(OFFSET == 0)
-            )
+            mfma_cluster(slot_b, asc_cur, b_scale_v[slot_b], J)
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
-            issue_b_load_j(b[slot_b], K_C, J)
+            issue_b_load_j(slot_b, K_C, J)
             rocdl.sched_barrier(0)
         issue_b_scale_load(b_scale_v[slot_b], K_C)
 
@@ -572,22 +556,10 @@ def _gemm1_body_v2(
     for S in range_constexpr(kStages):
         kt = K_TILES_TOTAL - kStages + S
         gpu.barrier()
-        a_cur = issue_a_ds_read(kt % kAStages)
+        issue_a_ds_read(kt % kAStages)
         asc_cur = issue_a_scale_ds_read(kt)
         for J in range_constexpr(4):
-            mfma_cluster(
-                b[kt % kStages], a_cur, asc_cur, b_scale_v[kt % kStages], J, init=False
-            )
-
-    # -- Accumulators -> layout-API fragment: store all (i,J) vec4 results into
-    # frag_C (the accumulator-of-record), flat slot order [i*16 + J*4 + v]. --
-    _acc_elems = []
-    for i in range_constexpr(kMChunks):
-        for J in range_constexpr(4):
-            vec = Vec(accm[i][J])
-            for v in range_constexpr(4):
-                _acc_elems.append(fx.Float32(vec[v]))
-    frag_C.store(Vec.from_elements(_acc_elems, fx.Float32))
+            mfma_cluster(kt % kStages, asc_cur, b_scale_v[kt % kStages], J)
 
     gpu.barrier()
     s_aq._view_cache = None
@@ -598,11 +570,11 @@ def _gemm1_body_v2(
     wave_n = wave
     lds_acc_base = _lds_base_ptr3(lds_acc.get())
 
-    # Read accumulators back from the layout-API fragment (same flat slot order).
-    _acc_vec = Vec(frag_C.load())
+    # Read accumulators back from the C register fragments (flat slot [i,J,v]).
+    _acc_vecs = [[Vec(_c_frags[i][J].load()) for J in range(4)] for i in range(kMChunks)]
 
     def _acc(i, J, v):
-        return _acc_vec[i * 16 + J * 4 + v]
+        return _acc_vecs[i][J][v]
 
     for i in range_constexpr(kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
