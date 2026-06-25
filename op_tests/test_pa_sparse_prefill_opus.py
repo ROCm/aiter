@@ -98,8 +98,8 @@ def _skip_if_unsupported(d: int) -> bool:
     if not torch.cuda.is_available():
         return _skip("CUDA/HIP device not available")
     arch = _get_gpu_arch()
-    if arch not in ("gfx950", "gfx1250"):
-        return _skip(f"pa_sparse_prefill_opus requires gfx950/gfx1250, found {arch}")
+    if arch != "gfx950":
+        return _skip(f"pa_sparse_prefill_opus requires gfx950, found {arch}")
     if d != 512:
         return _skip(f"Only D=512 is compiled, requested D={d}")
     return False

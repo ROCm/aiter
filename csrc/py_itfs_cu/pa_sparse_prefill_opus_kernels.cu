@@ -264,17 +264,7 @@ void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
 
     const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M);
     dim3 grid(N, num_h_blocks, 1);
-    // The block holds Traits::NUM_WARPS wavefronts. The device wavefront size is
-    // arch-dependent (64 on gfx950, 32 on gfx1250) and is not visible to this
-    // host translation unit, so query it at runtime rather than using
-    // Traits::BLOCK_SIZE (which reflects the host-pass WARP_SIZE).
-    int warp_size = 64;
-    {
-        hipDeviceProp_t props;
-        if(hipGetDeviceProperties(&props, q_nope.device_id) == hipSuccess && props.warpSize > 0)
-            warp_size = props.warpSize;
-    }
-    dim3 block(Traits::NUM_WARPS * warp_size);
+    dim3 block(Traits::BLOCK_SIZE);
     pa_prefill_16mx1_16nx4_fp8_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
     HIP_CALL_LAUNCH(hipGetLastError());
 }

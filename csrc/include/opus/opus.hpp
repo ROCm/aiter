@@ -1910,10 +1910,6 @@ struct smem {
         else if constexpr (elem_bits == 4)  { asm volatile("ds_read_b64_tr_b4 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
         else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); }
         return __builtin_bit_cast(type, raw);
-#elif defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__)
-        // TODO(gfx1250): needs real transpose load (ds_read_tr not available here).
-        // Compile-only fallback: plain non-transposing load. Numerically wrong.
-        return _load<vec>(v_os + imm_offset);
 #elif defined(__HIP_DEVICE_COMPILE__)
         static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__");
         return _load<vec>(v_os + imm_offset);
@@ -2902,21 +2898,6 @@ struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b) {
         return base::operator()(b, a, c, scale_a, scale_b);
     }
-
-    // 7-arg scaled overloads (BX32 / BX16) with trailing opsel selectors.
-    // swap a<->b and scale_a<->scale_b and the selectors, then forward to base.
-    // TODO(gfx1250): opsel/scale distribution not yet correct
-    template<typename VA, typename VB, typename VC, index_t sel_a, index_t sel_b>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b,
-                                     number<sel_a>, number<sel_b>) {
-        return base::operator()(b, a, c, scale_b, scale_a, number<sel_b>{}, number<sel_a>{});
-    }
-
-    template<typename VA, typename VB, typename VC, index_t sel_a, index_t sel_b>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b,
-                                     number<sel_a>, number<sel_b>) {
-        return base::operator()(b, a, c, scale_b, scale_a, number<sel_b>{}, number<sel_a>{});
-    }
 };
 } // namespace impl (wmma_adaptor)
 
@@ -2995,13 +2976,9 @@ struct tiled_mma_adaptor : public MMA_ {
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
                     std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
-        // TODO(gfx1250): wave32 WMMA per-lane element counts differ from wave64 MFMA;
-        // host-side tile vectors are still MFMA-sized, so relax size checks on gfx1250 (compile-only).
-#if !defined(__gfx1250__)
         static_assert(size<VA>() == tile_a_len);
         static_assert(size<VB>() == tile_b_len);
         static_assert(size<VC>() == tile_c_len);
-#endif
 
         constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
@@ -3143,12 +3120,9 @@ struct tiled_mma_adaptor : public MMA_ {
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
         static_assert(STEP_K < EXPAND_K);
-        // TODO(gfx1250): wave32 WMMA element counts differ from wave64 MFMA; relax size checks (compile-only).
-#if !defined(__gfx1250__)
         static_assert(size<VA>() == tile_a_len);
         static_assert(size<VB>() == tile_b_len);
         static_assert(size<VC>() == tile_c_len);
-#endif
 
         constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
