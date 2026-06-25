@@ -12,13 +12,16 @@ gate/up split is the same for both, since accm[J] holds the same logical (g/u, n
 Layout-API pieces:
   * B load -> preshuffle ``fx.make_layout`` view + ``fx.copy`` into register
     fragments; the nt/cached policy rides on the copy atom's ``cache_modifier``.
+  * B-scale load -> same ``fx.make_layout`` view + ``fx.copy`` (32b, cached) into
+    per-stage i32 fragments; the per-K-tile offset rides the voffset (no hi/lo split).
   * MMA -> one ``fx.gemm`` per mfma over rank-1 register fragments (A/B/C), with
     per-K-block e8m0 scales via ``scale_a=/scale_b=`` kwargs and a pre-built
     opsel-specialized ``MFMA_Scale`` atom per (opselA,opselB). C accumulates in
     place (d == c). mem2reg folds the fragment plumbing -> ISA == the raw intrinsic.
 
 Kept raw (self-contained helpers below): math/quant/pointer helpers, the A-side
-LDS stage + ds-read addressing + A-scale machinery, and the epilogue math.
+LDS stage + ds-read addressing + A-scale machinery, and the epilogue math. (B and
+B-scale now both ride the layout API; only the A path and epilogue stay raw.)
 Acceptance: KIMI BM32 interleave numeric gate (mean_row_cos > 0.85).
 """
 
@@ -152,7 +155,6 @@ def _gemm1_body_v2(
     kBS_stride_n0_dw = _kc * 64
     N_OUT = 2 * INTER
     kBS_per_expert_dw = (N_OUT // 16 // 2) * kBS_stride_n0_dw
-    BSCALE_BYTES = NE * kBS_per_expert_dw * 4
     NUM_N_BLOCKS = N_OUT // 256
     OUT_AS_PER_CHUNK_DW = ((INTER // 32) // 4 // 2) * 64
     K_G2_HALF = INTER // 2
@@ -182,9 +184,6 @@ def _gemm1_body_v2(
     ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_ascale)), num_records_bytes=ascale_num
     )
-    bscale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_bscale)), num_records_bytes=BSCALE_BYTES
-    )
 
     # LDS views (s_aq / s_asc, union-overlapping lds_acc)
     lds_base = allocator.get_base()
@@ -205,23 +204,14 @@ def _gemm1_body_v2(
             llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
         )
 
-    # b_scale_s_base / _hi (n-pack words; gate/up split differs by mode)
+    # B-scale n-pack words (gate/up split differs by mode); the per-(wave,mw) base
+    # is uniform, the per-lane + per-K-tile parts become layout axes (see views below).
     if const_expr(interleave):
         mni_base = n_block_idx * fx.Int32(BN // 32) + wave * fx.Int32(BN // 128)
         np_list = [mni_base, mni_base + fx.Int32(1)]
     else:
         np_gate = n_block_idx * fx.Int32(BN // 64) + wave
         np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
-    b_scale_s_base, b_scale_s_base_hi = [], []
-    for mw in range_constexpr(2):
-        base = (
-            e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw)
-        ) * fx.Int32(4)
-        base = rocdl.readfirstlane(T.i32, base)
-        b_scale_s_base.append(base)
-        b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
-
-    b_scale_v = [[None, None] for _ in range(kStages)]  # per-stage, SSA double-buffer
 
     def issue_a_load_lds(slot, kt):
         for sub in range_constexpr(kSubBlocks):
@@ -318,6 +308,9 @@ def _gemm1_body_v2(
     _b_copy_atom = fx.make_copy_atom(
         fx.rocdl.BufferCopy128b(2 if b_nontemporal else 0), 32  # 4x i32 = 128b
     )
+    # B-scale is small and reused across blocks -> always cached (cache_modifier=0),
+    # matching v1's plain buffer_load; 1x i32 = 32b per (lane, K-tile, n-pack).
+    _bs_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), 32)
 
     N0_HALF = N_OUT // 32  # separate-mode gate/up column split
 
@@ -345,6 +338,31 @@ def _gemm1_body_v2(
 
     _bq_views = [_make_bq_view_for_jtile(j) for j in range_constexpr(4)]
 
+    # B-scale view (mirrors the B payload): uniform per-(wave,mw) expert/n-pack base,
+    # with the per-lane (klane,nlane) and the K-tile as layout axes -> a VGPR voffset
+    # at copy time. v1 split K into hi/lo to keep its raw soffset uniform; here the
+    # full K_C rides the voffset, so one view per mw covers all K-tiles.
+    def _make_bscale_view(mw):
+        base_dw = rocdl.readfirstlane(
+            T.i32,
+            e * fx.Int32(kBS_per_expert_dw) + np_list[mw] * fx.Int32(kBS_stride_n0_dw),
+        )
+        i32_ptr_ty = fx.PointerType.get(
+            T.i32, address_space=fx.AddressSpace.Global, alignment=4
+        )
+        off_i64 = fx.Int64(arith.ExtUIOp(T.i64, _raw(base_dw)).result)
+        base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_bscale) + off_i64 * fx.Int64(4))
+        # i32 strides: klane[0,4)->16, nlane[0,16)->1, K_C->64, unit->1
+        view = fx.Tensor(
+            fx.make_view(
+                base_iter,
+                fx.make_layout((4, 16, K_TILES_TOTAL, 1), (16, 1, kBS_stride_k0_dw, 1)),
+            )
+        )
+        return fx.rocdl.make_buffer_tensor(view, max_size=False)
+
+    _bscale_views = [_make_bscale_view(mw) for mw in range_constexpr(2)]
+
     # All MMA operands are register fragments for fx.gemm (rank-1 -> one MmaAtomCall).
     # i32<4:1> (16B = 32 fp4) for A/B; f32<4:1> (vec4) for C. B is PER-STAGE (kStages)
     # to hold the prefetch pipeline; A is refilled per K iter; C accumulates in place.
@@ -367,6 +385,12 @@ def _gemm1_body_v2(
         ]
         for _ in range_constexpr(kMChunks)
     ]
+    # B-scale fragments: i32<1:1>, PER-STAGE (kStages) double-buffer like _bq_frags.
+    _bs_frag_tmpl = _bscale_views[0][0, 0, 0, None]  # i32<1:1>
+    _bs_frags = [
+        [fx.make_fragment_like(_bs_frag_tmpl) for _ in range_constexpr(2)]
+        for _ in range_constexpr(kStages)
+    ]
 
     def issue_b_load_j(stage, K_C, j):
         view = _bq_views[j]
@@ -377,18 +401,12 @@ def _gemm1_body_v2(
                 _bq_frags[stage][j][half],
             )
 
-    def issue_b_scale_load(bs_slot, K_C):
-        v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
-        K_C_HI = K_C // 16
-        imm = (K_C - K_C_HI * 16) * (kBS_stride_k0_dw * 4)
+    def issue_b_scale_load(stage, K_C):
         for mw in range_constexpr(2):
-            s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
-            bs_slot[mw] = buffer_ops.buffer_load(
-                bscale_rsrc,
-                (v + fx.Int32(imm)) // fx.Int32(4),
-                vec_width=1,
-                dtype=T.i32,
-                soffset_bytes=s_off,
+            fx.copy(
+                _bs_copy_atom,
+                _bscale_views[mw][lane_div_16, lane_mod_16, K_C, None],
+                _bs_frags[stage][mw],
             )
 
     # MMA -- one fx.gemm per mfma over rank-1 fragments (-> one scaled MmaAtomCall).
@@ -410,13 +428,13 @@ def _gemm1_body_v2(
             scale_a=sa, scale_b=sb,
         )
 
-    def mfma_cluster(stage, a_scale, bs_slot, J):
+    def mfma_cluster(stage, a_scale, J):
         # interleave: mni=J//2 (n0), in_b=J%2 (gate/up); separate: swapped.
         if const_expr(interleave):
             mni, in_b = J // 2, J % 2
         else:
             mni, in_b = J % 2, J // 2
-        sb = bs_slot[mni]
+        sb = _raw(Vec(_bs_frags[stage][mni].load())[0])
         bJ0, bJ1 = _bq_frags[stage][J][0], _bq_frags[stage][J][1]
         for sub in range_constexpr(kSubBlocks):
             i0 = sub * 2 + 0
@@ -438,7 +456,7 @@ def _gemm1_body_v2(
         issue_a_load_lds(K_C, K_C)
         for j in range_constexpr(4):
             issue_b_load_j(K_C, K_C, j)
-        issue_b_scale_load(b_scale_v[K_C], K_C)
+        issue_b_scale_load(K_C, K_C)
 
     # main loop. sched_barrier/s_setprio fence the mfma chain from the B loads (mirror
     # v1's BM!=128 hints) so it stays dense -- closes the small-M gap.
@@ -454,12 +472,12 @@ def _gemm1_body_v2(
         for J in range_constexpr(4):
             rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
-            mfma_cluster(slot_b, asc_cur, b_scale_v[slot_b], J)
+            mfma_cluster(slot_b, asc_cur, J)
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             issue_b_load_j(slot_b, K_C, J)
             rocdl.sched_barrier(0)
-        issue_b_scale_load(b_scale_v[slot_b], K_C)
+        issue_b_scale_load(slot_b, K_C)
 
     # drain: last kStages
     for S in range_constexpr(kStages):
@@ -468,7 +486,7 @@ def _gemm1_body_v2(
         issue_a_ds_read(kt % kAStages)
         asc_cur = issue_a_scale_ds_read(kt)
         for J in range_constexpr(4):
-            mfma_cluster(kt % kStages, asc_cur, b_scale_v[kt % kStages], J)
+            mfma_cluster(kt % kStages, asc_cur, J)
 
     gpu.barrier()
     s_aq._view_cache = None
