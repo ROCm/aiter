@@ -2437,8 +2437,33 @@ def compile_mxscale_gemm(
                 _as_desc = make_desc_as_prologue(as_full_mem, split_k_base)
                 issue_tdm_loads(_as_desc, wave_specialized=True)
 
+            # Deferred-TDM (WST, num_buffers>=3): issue each stage's TDM one step
+            # LATE, inside the next step's split-barrier shadow. Safe only with
+            # >=3 buffers (the deferred load targets a buffer freed >=2 steps ago,
+            # already barrier-cleared and not currently read; >=1 step lead remains
+            # so the data still lands before its compute).
+            wst_defer = wave_specialized_tdm and num_buffers >= 3
+
             # Prologue
-            if const_expr(wave_specialized_tdm):
+            if const_expr(wst_defer):
+                # Issue pre_loaded-1 stages; defer the last one (seed the pending
+                # TDM that the main loop's first shadow will issue).
+                for i in range_constexpr(pre_loaded - 1):
+                    dg0 = vector.from_elements(
+                        T.vec(4, T.i32),
+                        [
+                            pred_const,
+                            active_stage_lds_addr[i],
+                            active_addr_lo,
+                            active_addr_hi,
+                        ],
+                    )
+                    tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0, active_dgroup1))
+                    active_addr_lo = arith.addi(active_addr_lo, active_adv_i32)
+                # seed: stage (pre_loaded-1) at this addr, not yet issued
+                _defer_pend_lo = active_addr_lo
+                active_addr_lo = arith.addi(active_addr_lo, active_adv_i32)
+            elif const_expr(wave_specialized_tdm):
                 for i in range_constexpr(pre_loaded):
                     dg0 = vector.from_elements(
                         T.vec(4, T.i32),
@@ -2546,7 +2571,97 @@ def compile_mxscale_gemm(
             _fence_outstanding = TDM_LOADS_PER_STEP * (num_buffers - 2)
 
             if const_expr(loop_iters > 0):
-                if const_expr(wave_specialized_tdm):
+                if const_expr(wst_defer):
+                    # cur_lo = running addr of the NEXT TDM to record;
+                    # pend_lo = addr of the deferred TDM to issue in this shadow.
+                    # Deferring the issue by one step removes one in-flight TDM at
+                    # each wait point, so the drain target is one tighter than the
+                    # non-deferred path: outstanding = TDM*(num_buffers-3).
+                    _defer_outstanding = TDM_LOADS_PER_STEP * (num_buffers - 3)
+                    init_args = list(accs) + [active_addr_lo, _defer_pend_lo]
+
+                    for loop_iter, state in range(0, loop_iters, 1, init=init_args):
+                        accs_in = list(state[:n_accs])
+                        cur_lo = state[n_accs]
+                        pend_lo = state[n_accs + 1]
+
+                        for buf_idx in range_constexpr(num_buffers):
+                            # the pending TDM (recorded one step earlier) targets
+                            # load_stage(prev) = (buf_idx-2) % nb  (compile-time).
+                            pend_ls = (buf_idx - 2) % num_buffers
+                            _k_off = (
+                                split_k_base
+                                + loop_iter * arith.index(num_buffers * tile_k)
+                                + arith.index(buf_idx * tile_k)
+                            )
+                            pipeline_fence_signal(
+                                outstanding=_defer_outstanding, use_cluster=use_cluster
+                            )
+                            # split-barrier shadow: issue the DEFERRED TDM (its
+                            # target buffer was freed >=2 steps ago -> WAR-safe,
+                            # and no wave reads it now) + the L2 prefetch.
+                            _dg = vector.from_elements(
+                                T.vec(4, T.i32),
+                                [
+                                    pred_const,
+                                    active_stage_lds_addr[pend_ls],
+                                    pend_lo,
+                                    active_addr_hi,
+                                ],
+                            )
+                            tdm_ops.tensor_load_2d(
+                                tdm_ops.TDMDescriptor2D(_dg, active_dgroup1)
+                            )
+                            _l2_prefetch(_k_off)
+                            pipeline_fence_wait(use_cluster=use_cluster)
+
+                            # record THIS step's TDM as the new pending (issued
+                            # next step's shadow); advance the running addr.
+                            pend_lo = cur_lo
+                            cur_lo = arith.addi(cur_lo, active_adv_i32)
+
+                            if const_expr(tdm_as_in_prologue):
+                                _as_full_base_off[0] = (
+                                    loop_iter
+                                    * arith.index(num_buffers * interleaved_scale_cols_a)
+                                    + arith.index(buf_idx * interleaved_scale_cols_a)
+                                )
+                            _as_idx = (
+                                as_full_idx
+                                if tdm_as_in_prologue
+                                else stages_as_idx[buf_idx]
+                            )
+                            rocdl.sched_barrier(0)
+                            accs_in = compute_tile_scheduled(
+                                accs_in,
+                                stages_a_idx[buf_idx],
+                                stages_b_idx[buf_idx],
+                                _as_idx,
+                                stages_bs_idx[buf_idx],
+                            )
+                            hot_loop_scheduler_scheduled()
+
+                        results = yield list(accs_in) + [cur_lo, pend_lo]
+
+                    accs = list(results[:n_accs])
+                    cur_addr_lo = results[n_accs]
+                    _final_pend_lo = results[n_accs + 1]
+                    # flush the final pending TDM (= last main-loop load) so the
+                    # tail sees the same state as the non-deferred path.
+                    _dg = vector.from_elements(
+                        T.vec(4, T.i32),
+                        [
+                            pred_const,
+                            active_stage_lds_addr[(num_buffers - 2) % num_buffers],
+                            _final_pend_lo,
+                            active_addr_hi,
+                        ],
+                    )
+                    tdm_ops.tensor_load_2d(
+                        tdm_ops.TDMDescriptor2D(_dg, active_dgroup1)
+                    )
+                    active_addr_lo = cur_addr_lo
+                elif const_expr(wave_specialized_tdm):
                     init_args = list(accs) + [active_addr_lo]
 
                     for loop_iter, state in range(0, loop_iters, 1, init=init_args):
