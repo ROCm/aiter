@@ -824,6 +824,7 @@ def mla_decode_stage1_asm_fwd(
     g_kv_indptr: Optional[torch.Tensor] = None,
     cp_world_size: int = 1,
     cp_rank: int = 0,
+    is_causal: int = 0,
 ) -> None: ...
 
 

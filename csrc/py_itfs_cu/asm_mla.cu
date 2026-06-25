@@ -643,8 +643,9 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* g_kv_indptr,          //   [batch_size+1] GLOBAL kv_indptr for round-robin CP (nullable)
     int cp_world_size,                    //   round-robin CP world size (1 == disabled)
     int cp_rank,                          //   round-robin CP rank id
+    int is_causal,                        //   causal masking flag
     hipStream_t stream)
-{    
+{
     int batch           = qo_indptr->size(0) - 1;
     int num_heads       = Q->size(1);
     int head_size       = Q->size(2);
@@ -825,7 +826,7 @@ void mla_decode_stage1_asm_fwd(
     
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
-    int causal = 0;
+    int causal = is_causal ? 1 : 0;
     int config_max_seqlen_q = max_seqlen_q;
     int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value

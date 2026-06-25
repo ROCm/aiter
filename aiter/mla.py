@@ -206,6 +206,7 @@ def mla_decode_fwd(
     g_kv_indptr=None,
     cp_world_size=1,
     cp_rank=0,
+    is_causal=0,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -316,6 +317,7 @@ def mla_decode_fwd(
             g_kv_indptr,
             cp_world_size,
             cp_rank,
+            int(is_causal),
         )
 
         if num_kv_splits == 1 and (
@@ -537,6 +539,7 @@ def mla_decode_fwd(
                 g_kv_indptr,
                 cp_world_size,
                 cp_rank,
+                int(is_causal),
             )
 
         aiter.mla_reduce_v1(
