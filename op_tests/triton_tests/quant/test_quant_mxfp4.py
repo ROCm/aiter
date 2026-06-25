@@ -3,6 +3,7 @@
 
 import torch
 import pytest
+import triton
 
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter.ops.triton.quant import dynamic_nvfp4_quant
@@ -16,6 +17,37 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 DEVICE_ARCH = arch_info.get_arch()
 
 DEBUG_MODE = False
+
+
+def batched_swizzle_scales_gfx1250(data, scale_k_width=None):
+    """
+    Batched swizzle scales for FP4 blockscale16 format.
+       https://github.com/triton-lang/triton/blob/main/third_party/amd/python/examples/gluon/mxfp_gemm_gfx1250.py#L1014
+    """
+    data_shape = data.shape
+    N = data_shape[-2]
+    SCALE_K = data_shape[-1]
+    PRESHUFFLE_FACTOR = 128
+    if scale_k_width is None:
+        SCALE_KWIDTH = (
+            min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
+        )
+    else:
+        assert scale_k_width in [4, 8, 16]
+        SCALE_KWIDTH = scale_k_width if SCALE_K >= 4 else SCALE_K
+    data = data.view(
+        -1,
+        N // PRESHUFFLE_FACTOR,
+        4,
+        PRESHUFFLE_FACTOR // 4,
+        SCALE_K // SCALE_KWIDTH,
+        SCALE_KWIDTH,
+    )
+    data = data.permute(0, 1, 4, 3, 2, 5).contiguous()
+    data = data.view(
+        *data_shape[:-2], N // PRESHUFFLE_FACTOR, SCALE_K * PRESHUFFLE_FACTOR
+    )
+    return data
 
 
 def torch_dynamic_mxfp4_quant(
