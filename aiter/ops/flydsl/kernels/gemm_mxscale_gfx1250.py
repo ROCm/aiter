@@ -208,9 +208,15 @@ def compile_mxscale_gemm(
             )
         if split_k != 1:
             raise ValueError("stage1_act GEMM epilogue fuse requires split_k == 1")
-        if use_tdm_store:
+        # TDM store fuses the stage1 activation by spilling the (already
+        # activated) D tile through LDS before the 2D store.  The dual-B "gguu"
+        # layout keeps the output tile width == warp_tile_n, so the existing
+        # store descriptor applies unchanged.  The "gugu" interleaved layout
+        # halves the output columns and is not wired into the TDM store path
+        # yet, so it must keep using the buffer-store epilogue.
+        if use_tdm_store and stage1_weight_layout_mode == "gugu":
             raise ValueError(
-                "stage1_act GEMM epilogue fuse requires use_tdm_store=False"
+                "stage1_act gugu interleaved fuse requires use_tdm_store=False"
             )
         if wave_specialized_tdm:
             raise ValueError(
@@ -1772,6 +1778,23 @@ def compile_mxscale_gemm(
                         d_buf, d_base, imm, sub8, out_elem=_out_elem_local
                     )
 
+            def epilogue_lds_stores_act_dual_b(gate_accs, up_accs, d_buf, d_base):
+                # Fused stage1 activation for the TDM store path: mirrors
+                # `epilogue_lds_stores` but writes silu/swiglu(gate) * up into the
+                # D LDS tile instead of the raw accumulator.  Valid only for the
+                # dual-B "gguu" layout, where the output tile width equals
+                # warp_tile_n so the 2D store descriptor is shared.
+                for acc_idx, vec_base, m_off, wn in _sub_tiles:
+                    gate_sub8 = _get_acc_sub8(gate_accs, acc_idx, vec_base)
+                    up_sub8 = _get_acc_sub8(up_accs, acc_idx, vec_base)
+                    gate_sub8 = _add_bias_vec8(gate_sub8, wn)
+                    up_sub8 = _add_bias_vec8(up_sub8, wn, N)
+                    out_sub8 = _stage1_act_mul_vec8(gate_sub8, up_sub8)
+                    imm = m_off * _lds_d_stride_elems + wn * _n_col_d_elems
+                    store_acc_vec8_to_lds(
+                        d_buf, d_base, imm, out_sub8, out_elem=_out_elem_local
+                    )
+
             def _atomic_add_acc_vec8_to_buffer(acc_vec8, addr):
                 if const_expr(_bf16_out):
                     h_vec = arith.trunc_f(T.vec(8, _out_elem_local), acc_vec8)
@@ -2677,6 +2700,16 @@ def compile_mxscale_gemm(
                             stages_as_idx[_compute_stage],
                             stages_bs_idx[_compute_stage],
                         )
+                        if const_expr(stage1_dual_b):
+                            # Fused dual-B activation also needs the up-projection
+                            # accumulator before the LDS spill / TDM store.
+                            accs_up = compute_tile_scheduled(
+                                accs_up,
+                                stages_a_idx[_compute_stage],
+                                stages_b_up_idx[_compute_stage],
+                                stages_as_idx[_compute_stage],
+                                stages_bs_up_idx[_compute_stage],
+                            )
                     else:
 
                         def _emit_epi_addrs():
@@ -2824,7 +2857,12 @@ def compile_mxscale_gemm(
                 if const_expr(d_need_epilogue_fence):
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
                 rocdl.sched_barrier(0)
-                epilogue_lds_stores(accs, d_lds_buffer, d_lane_base)
+                if const_expr(stage1_dual_b):
+                    epilogue_lds_stores_act_dual_b(
+                        accs, accs_up, d_lds_buffer, d_lane_base
+                    )
+                else:
+                    epilogue_lds_stores(accs, d_lds_buffer, d_lane_base)
                 rocdl.s_wait_dscnt(0)
                 tdm_ops.tensor_store_2d(d_desc)
                 tdm_ops.tensor_wait(0)

@@ -969,6 +969,14 @@ def _compile_base_a8w4_gemm(
             "use tile_k=128 if it divides K/split_k, or lower split_k."
         )
     compiler = compile_mxfp4_gemm if cfg.data_format == "fp4" else compile_a8w4_gemm
+    # The TDM store epilogue now fuses the stage1 activation for the dual-B
+    # "gguu" layout, so keep TDM store on even when an activation is fused.  The
+    # "gugu" interleaved layout (halved output columns) and split_k > 1 are not
+    # supported by the TDM store path yet and fall back to buffer stores.
+    stage1_interleave = stage1_act is not None and stage1_weight_layout == "gugu"
+    tdm_store_enabled = (
+        cfg.use_tdm_store and cfg.split_k == 1 and not stage1_interleave
+    )
     return compiler(
         M=cfg.max_m,
         N=N,
@@ -981,13 +989,9 @@ def _compile_base_a8w4_gemm(
         num_buffers=eff_num_buffers,
         waves_per_eu=cfg.waves_per_eu,
         out_dtype=cfg.out_dtype,
-        use_tdm_store=cfg.use_tdm_store
-        and stage1_act is None
-        and cfg.grouped_contiguous_m,
+        use_tdm_store=tdm_store_enabled,
         inst_prefetch=cfg.inst_prefetch,
-        wave_specialized_tdm=cfg.wave_specialized_tdm
-        and stage1_act is None
-        and cfg.grouped_contiguous_m,
+        wave_specialized_tdm=cfg.wave_specialized_tdm and stage1_act is None,
         split_k=cfg.split_k,
         cluster_m=cfg.cluster_m,
         cluster_n=cfg.cluster_n,
