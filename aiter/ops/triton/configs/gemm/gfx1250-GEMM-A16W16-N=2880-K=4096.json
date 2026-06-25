@@ -5,7 +5,7 @@
         "BLOCK_K": 256,
         "NUM_BUFFERS": 4,
         "num_warps": 4,
-        "kernel_type": "bandwidth_bound"
+        "kernel_type": "compute_bound"
     },
     "M_LEQ_256": {
         "BLOCK_M": 64,

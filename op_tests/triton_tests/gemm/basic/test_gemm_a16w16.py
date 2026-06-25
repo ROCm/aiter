@@ -6,25 +6,12 @@ import torch.nn.functional as F
 import pytest
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16, _is_gluon_available
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
 def is_gluon_supported():
     """gluon a16w16 kernels are only available on supported archs (gfx1250)."""
     return _is_gluon_available()
-
-
-def _skip_if_gluon_unaligned_k(backend, M, N, K):
-    """The gluon a16w16 kernels require K to be a multiple of BLOCK_K (no host
-    K-padding); triton handles any K, so only skip the gluon backend."""
-    if backend != "gluon":
-        return
-    cfg, _ = get_gemm_config("GEMM-A16W16", M, N, K)
-    if K % cfg["BLOCK_K"] != 0:
-        pytest.skip(
-            f"gluon a16w16 requires K % BLOCK_K == 0 (K={K}, BLOCK_K={cfg['BLOCK_K']})"
-        )
 
 
 def _skip_if_triton_on_gfx1250(backend):
@@ -91,7 +78,6 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
     _skip_if_triton_on_gfx1250(backend)
-    _skip_if_gluon_unaligned_k(backend, M, N, K)
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
@@ -134,7 +120,6 @@ def test_gemm_a16_w16_activation(
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
     _skip_if_triton_on_gfx1250(backend)
-    _skip_if_gluon_unaligned_k(backend, M, N, K)
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
@@ -176,7 +161,6 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_typ
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
     _skip_if_triton_on_gfx1250(backend)
-    _skip_if_gluon_unaligned_k(backend, M, N, K)
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
