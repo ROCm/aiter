@@ -171,6 +171,18 @@ def pipeline_fence_wait(use_cluster=False):
         cluster.cluster_wait()
 
 
+def _issue_one_tdm_load(desc):
+    """Dispatch a single TDM load based on descriptor type.
+
+    A ``TDMGatherDescriptor`` (groups 2/3 carry row indices) is issued via the
+    gather intrinsic; a plain 2D descriptor uses the contiguous-tile load.
+    """
+    if isinstance(desc, tdm_ops.TDMGatherDescriptor):
+        tdm_ops.tensor_load_gather(desc)
+    else:
+        tdm_ops.tensor_load_2d(desc)
+
+
 def issue_tdm_loads(*descs, wave_specialized=False, wave_id=None):
     """Emit one or more TDM loads, optionally one descriptor per loader wave."""
     if wave_specialized:
@@ -184,12 +196,12 @@ def issue_tdm_loads(*descs, wave_specialized=False, wave_id=None):
             )
             if_op = scf.IfOp(is_loader_wave)
             with ir.InsertionPoint(if_op.then_block):
-                tdm_ops.tensor_load_2d(desc)
+                _issue_one_tdm_load(desc)
                 scf.YieldOp([])
         return
 
     for desc in descs:
-        tdm_ops.tensor_load_2d(desc)
+        _issue_one_tdm_load(desc)
 
 
 def store_acc_vec8_to_lds(memref, base_elem_off, imm_elem_off, acc_vec8, out_elem=None):
