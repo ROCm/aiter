@@ -3,7 +3,6 @@
 
 import torch
 import itertools
-import math
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest

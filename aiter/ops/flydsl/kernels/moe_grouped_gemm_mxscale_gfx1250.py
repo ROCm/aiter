@@ -1204,9 +1204,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 stream,
             )
         else:
-            _run_compiled(
-                _get_finalize_act(), y, tmp, masked_m, _swiglu_lim_rt, stream
-            )
+            _run_compiled(_get_finalize_act(), y, tmp, masked_m, _swiglu_lim_rt, stream)
         return y
 
     return launch

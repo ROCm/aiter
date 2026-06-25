@@ -3130,7 +3130,6 @@ def compile_mixed_moe_gemm2(
             i32 = T.i32
             i64 = T.i64
             vec4_f32 = T.vec(4, f32)
-            vec4_i32 = T.vec(4, i32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
             vec8_elems = 8 if a_elem_bytes == 1 else 4
             vec4_elems = 4 if a_elem_bytes == 1 else 2
