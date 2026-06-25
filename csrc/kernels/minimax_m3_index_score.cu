@@ -110,6 +110,8 @@ __global__ void decodeIndexScoreKernel(
 
     const int64_t local_start = (num_blocks > local_blocks) ? (num_blocks - local_blocks) : 0;
     const int dim0 = lane * kElemsPerLane;
+    const bool valid_head[kHeadsPerCta] = {pid_h_base < num_idx_heads,
+                                           (pid_h_base + 1) < num_idx_heads};
 
     __shared__ float q_shared[kHeadsPerCta][kHeadDim];
     if(threadIdx.x < kGroupLanes)
@@ -117,7 +119,7 @@ __global__ void decodeIndexScoreKernel(
         for(int h = 0; h < kHeadsPerCta; ++h)
         {
             const int64_t pid_h = pid_h_base + h;
-            if(pid_h < num_idx_heads)
+            if(valid_head[h])
             {
                 float q_load[kElemsPerLane];
                 load8Vec(q + pid_t * stride_q_n + pid_h * stride_q_h + dim0 * stride_q_d,
@@ -136,11 +138,10 @@ __global__ void decodeIndexScoreKernel(
 #pragma unroll
     for(int h = 0; h < kHeadsPerCta; ++h)
     {
-        const bool valid_h = (pid_h_base + h) < num_idx_heads;
 #pragma unroll
         for(int i = 0; i < kElemsPerLane; ++i)
         {
-            q_vals[h][i] = valid_h ? q_shared[h][dim0 + i] : 0.0f;
+            q_vals[h][i] = valid_head[h] ? q_shared[h][dim0 + i] : 0.0f;
         }
     }
 
@@ -155,7 +156,7 @@ __global__ void decodeIndexScoreKernel(
             if(threadIdx.x < kHeadsPerCta)
             {
                 const int64_t pid_h = pid_h_base + threadIdx.x;
-                if(pid_h < num_idx_heads)
+                if(valid_head[threadIdx.x])
                 {
                     score[pid_h * stride_s_h + pid_t * stride_s_n + blk * stride_s_k] =
                         is_local ? 1.0e29f : 1.0e30f;
@@ -187,7 +188,6 @@ __global__ void decodeIndexScoreKernel(
 #pragma unroll
             for(int h = 0; h < kHeadsPerCta; ++h)
             {
-                const bool valid_h = (pid_h_base + h) < num_idx_heads;
                 float dot = 0.0f;
 #pragma unroll
                 for(int i = 0; i < kElemsPerLane; ++i)
@@ -195,7 +195,7 @@ __global__ void decodeIndexScoreKernel(
                     dot += q_vals[h][i] * k_vals[i];
                 }
                 dot = groupReduceSum(dot) * sm_scale_log2e;
-                if(lane == 0 && valid_h)
+                if(lane == 0 && valid_head[h])
                 {
                     wave_score[h] = fmaxf(wave_score[h], dot);
                 }
@@ -216,7 +216,7 @@ __global__ void decodeIndexScoreKernel(
         {
             const int h = threadIdx.x;
             const int64_t pid_h = pid_h_base + h;
-            if(pid_h < num_idx_heads)
+            if(valid_head[h])
             {
                 float block_score = wave_scores[h][0];
 #pragma unroll
