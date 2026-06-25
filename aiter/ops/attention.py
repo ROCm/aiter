@@ -826,6 +826,7 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size] scratch for gfx1250 packed MLA kernels
     valid_split_count: Optional[torch.Tensor] = None,
     use_valid_split_count_reduce: int = 0,
+    is_causal: int = 0,
 ) -> None: ...
 
 
