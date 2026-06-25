@@ -35,6 +35,7 @@ from aiter.aot.flydsl.common import (
     cu_num_to_arch,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
@@ -209,6 +210,7 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     swiglu_limit: float = 0.0,
+    k_wave: int = 1,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -231,7 +233,7 @@ def _precompile_to_cache(
     import torch
 
     dev = torch.device("cpu")
-    is_fp4_weight = b_dtype == "fp4"
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
     is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
@@ -299,7 +301,7 @@ def _precompile_to_cache(
 
     def _make_a1_scale():
         """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
-        if not is_fp4_weight:
+        if not use_mx_gemm:
             if is_int4_weight:
                 # a16wi4: bf16 activations, int4 weights — no activation scale.
                 return None
@@ -336,7 +338,7 @@ def _precompile_to_cache(
         buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
         its own input and the resulting sorted scale uses 32-row alignment.
         """
-        if not is_fp4_weight:
+        if not use_mx_gemm:
             return None
         if stage1_fuse_quant in ("fp4", "fp8"):
             # mirror flydsl_moe_stage1's out_scale_sorted_flat allocation:
@@ -454,7 +456,7 @@ def _precompile_to_cache(
 
             a1_scale = _make_a1_scale()
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
-            if is_fp4_weight:
+            if use_mx_gemm:
                 w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
             elif is_int4_weight:
                 # a16wi4: bf16 groupwise scale over (E, K//32, N).
@@ -491,7 +493,7 @@ def _precompile_to_cache(
             _grid_y = min(max_num_m_blocks, tokens * topk)
             _kernel_out = tmp_out if _is_splitk else out
             kernel_bias = None if _is_splitk else bias
-            _n_in = inter_dim * 2 if is_fp4_weight else inter_dim
+            _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
             _k_in = model_dim
 
             scale_cols = inter_dim // 32
@@ -504,7 +506,7 @@ def _precompile_to_cache(
                 else torch.empty(0, dtype=torch.uint8, device=dev)
             )
 
-            if is_fp4_weight:
+            if use_mx_gemm:
                 args = _s1_args_fp4(
                     _kernel_out.view(-1),
                     a.view(-1),
@@ -568,6 +570,7 @@ def _precompile_to_cache(
                 a_scale_one=a_scale_one,
                 xcd_swizzle=xcd_swizzle,
                 swiglu_limit=swiglu_limit,
+                k_wave=k_wave,
             )
             _run_compiled(exe, args)
 
@@ -617,7 +620,7 @@ def _precompile_to_cache(
             w2 = _alloc(w2_shape, _storage_dtype(b_dtype))
 
             a2_scale = _make_a2_scale_for_stage2()
-            if is_fp4_weight:
+            if use_mx_gemm:
                 w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
             elif is_int4_weight:
                 w2_scale = torch.zeros(
@@ -682,7 +685,7 @@ def _precompile_to_cache(
             _n_in = model_dim
             _k_in = inter_dim
 
-            if is_fp4_weight:
+            if use_mx_gemm:
                 args = _s2_args_fp4(
                     target,
                     a,
@@ -796,9 +799,10 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env(
-            "FLYDSL_GPU_ARCH", aot_arch
-        ), FakeTensorMode():
+        with (
+            override_env("FLYDSL_GPU_ARCH", aot_arch),
+            FakeTensorMode(),
+        ):
             _precompile_to_cache(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
@@ -859,21 +863,12 @@ def main():
     print("=" * 72)
 
     total_t0 = time.time()
-    results = []
 
-    if stage1_jobs:
-        print(f"\n--- Stage 1 ({len(stage1_jobs)} kernels) ---")
-        for i, job in enumerate(stage1_jobs, 1):
-            print(f"\n[{i}/{len(stage1_jobs)}] ", end="")
-            r = compile_one_config(**job)
-            results.append(r)
-
-    if stage2_jobs:
-        print(f"\n--- Stage 2 ({len(stage2_jobs)} kernels) ---")
-        for i, job in enumerate(stage2_jobs, 1):
-            print(f"\n[{i}/{len(stage2_jobs)}] ", end="")
-            r = compile_one_config(**job)
-            results.append(r)
+    # Stage1 and stage2 kernels are independent compiles (each writes its
+    # own artifact to cache; stage2 does not read stage1's output), so they
+    # share a single pool for maximum fan-out instead of two serial passes.
+    print(f"\n--- Compiling {len(all_jobs)} kernels (stage1 + stage2) ---")
+    results = run_jobs_parallel(compile_one_config, stage1_jobs + stage2_jobs)
 
     total_elapsed = time.time() - total_t0
 
