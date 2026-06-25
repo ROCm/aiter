@@ -232,9 +232,6 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 
 
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
-    """Resolve the per-kind ``compile_one_config`` callable, imported lazily so
-    only the kinds actually present get pulled in. Used by ``wait_aot`` to build
-    a uniform ``worker(**job)`` task list across all OpKinds."""
     if kind is OpKind.MOE:
         from .moe import compile_one_config
     elif kind is OpKind.GEMM:
@@ -253,18 +250,6 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
 def _run_one_to_file(
     worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
 ) -> None:
-    """Child-process entry point. Runs ``worker(**kwargs)`` and writes its result
-    dict to ``out_path`` as JSON -- the child's *private* return channel.
-
-    This is the crux of the deadlock-free design: results never travel through a
-    result queue shared with sibling workers, so there is no cross-process write
-    lock (POSIX semaphore) to leak when this process is OOM-killed mid-write.
-    Each child owns its own file; siblings are completely decoupled. A crash
-    here leaves the file absent or partial, which the parent treats as a failure
-    (it only trusts the file on a clean exit code) -- never a hang.
-
-    Write-then-rename so the parent never observes a torn file even if we are
-    killed between open() and the final bytes."""
     result = worker(**kwargs)
     tmp_path = out_path + ".tmp"
     with open(tmp_path, "w") as f:
@@ -283,24 +268,7 @@ def _affinity_aware_cpu_count() -> int:
     return max(n, 1)
 
 
-@dataclass
-class AotPlan:
-    """Everything ``wait_aot`` needs to run the compile fleet, produced by
-    ``start_aot``. No worker processes are live yet -- they are spawned and
-    reaped entirely inside ``wait_aot``, so there is no shared pool object
-    (and crucially no shared result queue) that could outlive an exception
-    or wedge the parent."""
-
-    jobs: list[tuple[OpKind, dict[str, Any]]]
-    max_workers: int
-    kernel_timeout: float
-    max_retries: int
-    result_dir: str
-
-
 def get_kernel_timeout() -> float:
-    """Per-kernel wall-clock cap in seconds. Env override is validated;
-    "0" (or negative) disables the cap. See ``_DEFAULT_KERNEL_TIMEOUT``."""
     env = os.environ.get("AITER_FLYDSL_AOT_TIMEOUT")
     if env is None:
         return _DEFAULT_KERNEL_TIMEOUT
@@ -313,8 +281,6 @@ def get_kernel_timeout() -> float:
 
 
 def get_max_retries() -> int:
-    """Retries for a worker that died abnormally. Env override validated;
-    "0" disables retries. See ``_DEFAULT_MAX_RETRIES``."""
     env = os.environ.get("AITER_FLYDSL_AOT_MAX_RETRIES")
     if env is None:
         return _DEFAULT_MAX_RETRIES
@@ -327,13 +293,6 @@ def get_max_retries() -> int:
 
 
 def _memory_worker_cap(default_workers: int) -> int:
-    """Cap concurrency by available memory so the OOM-killer never fires.
-
-    A worker SIGKILLed mid-result by the OOM-killer was the original deadlock
-    trigger; the cleanest defense is to not run out of memory at all. Assumes
-    ``AITER_FLYDSL_AOT_MEM_PER_WORKER_GB`` (default
-    ``_DEFAULT_MEM_PER_WORKER_GB``) resident per worker. If psutil is
-    unavailable the cap is skipped."""
     env = os.environ.get("AITER_FLYDSL_AOT_MEM_PER_WORKER_GB")
     try:
         per_gb = float(env) if env else _DEFAULT_MEM_PER_WORKER_GB
@@ -353,14 +312,6 @@ def _memory_worker_cap(default_workers: int) -> int:
 
 
 def get_max_workers(num_jobs: int) -> int:
-    """Resolve the concurrent AOT worker-process cap.
-
-    ``AITER_FLYDSL_AOT_WORKERS``, if set, is honored verbatim (non-integer ->
-    ValueError; "0"/negative clamped to 1) and bypasses the memory cap -- an
-    explicit setting is the caller's deliberate choice. Otherwise the cap is
-    ``min(affinity-aware CPU count, _DEFAULT_MAX_WORKERS)`` further bounded by
-    available memory so the OOM-killer never fires. Either way the result never
-    exceeds ``num_jobs`` -- spawning more workers than kernels is pointless."""
     workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
     if workers_env is not None:
         try:
@@ -383,27 +334,13 @@ def _run_file_pool(
     max_retries: int,
     result_dir: str,
 ) -> list[dict[str, Any] | None]:
-    """Deadlock-free fork pool -- the shared engine behind ``run_jobs_parallel``
-    and ``wait_aot``.
-
-    ``specs`` is a list of ``(worker, kwargs, label)``; each runs
-    ``worker(**kwargs)`` in its OWN forked process whose result dict goes to a
-    private file (``label`` is only used for log lines -- a str or JobLabel).
-    Returns a list aligned to ``specs``: each entry is the result dict (possibly
-    with ``compile_time=None`` for a clean compile error), or ``None`` if the
-    worker died abnormally (crash / per-kernel-timeout kill) after exhausting
-    ``max_retries``.
-
-    There is no shared queue or lock, so a SIGKILLed (e.g. OOM-killed) worker
-    can only break its own file -- the leaked-semaphore deadlock cannot occur.
-    Liveness is tracked via each process's sentinel; a worker stuck *alive* is
-    bounded by ``kernel_timeout``. Both are always created with the fork start
-    method (fork+COW keeps one-process-per-kernel cheap)."""
     ctx = multiprocessing.get_context("fork")
     n = len(specs)
     results: list[dict[str, Any] | None] = [None] * n
     attempts = [0] * n
     retries_used = 0
+    completed = 0
+    progress_stride = max(1, n // 20)
 
     queue = list(range(n))
     queue.reverse()  # pop() from the tail -> submission order; retries appended
@@ -425,8 +362,17 @@ def _run_file_pool(
             )
             running[proc] = (idx, deadline)
 
+    def note_done() -> None:
+        """Mark one spec as finalized (succeeded or definitively failed) and emit
+        a throttled overall-progress line."""
+        nonlocal completed
+        completed += 1
+        if completed % progress_stride == 0 or completed == n:
+            print(f"  ... {completed}/{n} kernels done", flush=True)
+
     def retry_or_drop(idx: int, reason: str) -> None:
-        """Abnormal death: requeue for retry, or give up (leave results[idx]=None)."""
+        """Abnormal exit: requeue for retry, or -- once retries are exhausted --
+        give up, leaving results[idx]=None to mark the worker as dead/killed."""
         nonlocal retries_used
         if attempts[idx] < max_retries:
             attempts[idx] += 1
@@ -437,28 +383,36 @@ def _run_file_pool(
                 f"retry {attempts[idx]}/{max_retries}",
                 flush=True,
             )
+        else:
+            note_done()  # terminal: results[idx] stays None (== died/killed)
 
     def reap(proc: Any) -> None:
         idx, _ = running.pop(proc)
         out_path = os.path.join(result_dir, f"k{idx}.json")
-        if proc.exitcode == 0 and os.path.isfile(out_path):
+        if proc.exitcode != 0:
+            # Worker died abnormally (OOM-kill -9, segfault -11, ...) before
+            # writing its result. Transient -> retry (terminal once retries run
+            # out, leaving results[idx]=None).
+            retry_or_drop(idx, f"worker crashed (exitcode={proc.exitcode})")
+            return
+        # Clean exit (exitcode 0): deterministic, never retried.
+        result: dict[str, Any] | None = None
+        if os.path.isfile(out_path):
             try:
                 with open(out_path) as f:
-                    results[idx] = json.load(f)
+                    result = json.load(f)
             except Exception:
-                results[idx] = None
-            # Clean exit -> done. A compile_time=None result is a deterministic
-            # compile error, NOT retried.
-        else:
-            # exitcode != 0 / missing file == worker died (OOM-kill -9, segfault
-            # -11, ...) before writing. Transient -> retry.
-            retry_or_drop(idx, f"worker crashed (exitcode={proc.exitcode})")
+                result = None
+        if result is None:
+            label = specs[idx][2]
+            name = label.kernel_name if isinstance(label, JobLabel) else str(label)
+            result = {"kernel_name": name, "compile_time": None}
+        results[idx] = result
+        note_done()
 
     try:
         launch()
         while running:
-            # Block until a worker exits, or until the nearest per-kernel
-            # deadline so a stuck-but-alive worker can be killed.
             if kernel_timeout > 0:
                 nearest = min(d for (_, d) in running.values() if d is not None)
                 wait_timeout: float | None = max(0.0, nearest - time.monotonic())
@@ -508,14 +462,6 @@ def run_jobs_parallel(
     worker: Callable[..., dict[str, Any]],
     jobs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Compile ``jobs`` by running ``worker(**job)`` for each -- one forked
-    process per job, results returned through private files (deadlock-free; see
-    ``_run_file_pool``).
-
-    Returns one result dict per job in input order. A job whose worker died
-    abnormally (after retries) yields ``{"kernel_name": ..., "compile_time":
-    None}`` so callers can tally failures uniformly via ``compile_time``. Does
-    not raise -- the caller decides what a failure means."""
     if not jobs:
         return []
     max_workers = get_max_workers(len(jobs))
@@ -542,34 +488,7 @@ def run_jobs_parallel(
     return out
 
 
-def start_aot(cache_dir: str) -> AotPlan | None:
-    """Plan FlyDSL AOT compilation. Collects one job per kernel (across all
-    OpKind members) and resolves the run configuration; ``wait_aot`` does the
-    actual spawning. Returns None (and ``wait_aot`` becomes a no-op) when
-    there are no kernels to compile.
-
-    Env:
-      AITER_FLYDSL_AOT_WORKERS         -- max concurrent worker processes.
-                                          Non-integer -> ValueError;
-                                          "0"/negative clamped to 1. Default:
-                                          min(affinity-aware CPU count,
-                                          _DEFAULT_MAX_WORKERS), then capped by
-                                          available memory (see below).
-      AITER_FLYDSL_AOT_MEM_PER_WORKER_GB -- assumed GiB/worker for the auto
-                                          memory cap ("0" disables it). Only
-                                          applies when AITER_FLYDSL_AOT_WORKERS
-                                          is not set explicitly.
-      AITER_FLYDSL_AOT_TIMEOUT         -- per-kernel wall-clock cap, seconds
-                                          ("0" disables). See
-                                          _DEFAULT_KERNEL_TIMEOUT.
-      AITER_FLYDSL_AOT_MAX_RETRIES     -- retries for an abnormally-dead worker
-                                          ("0" disables). See
-                                          _DEFAULT_MAX_RETRIES.
-
-    Workers are always created with the fork start method: fork+COW lets each
-    of the (one-per-kernel) children share the parent's already-imported torch
-    / FlyDSL for free, which is what makes process-per-kernel affordable.
-    """
+def run_aot(cache_dir: str) -> None:
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
@@ -580,7 +499,7 @@ def start_aot(cache_dir: str) -> AotPlan | None:
 
     if not all_jobs:
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
-        return None
+        return
 
     max_workers = get_max_workers(len(all_jobs))
 
@@ -596,34 +515,6 @@ def start_aot(cache_dir: str) -> AotPlan | None:
         f"({'+'.join(k.name for k in OpKind)}), "
         f"{max_workers} worker processes (cache: {cache_dir})"
     )
-    return AotPlan(
-        jobs=all_jobs,
-        max_workers=max_workers,
-        kernel_timeout=get_kernel_timeout(),
-        max_retries=get_max_retries(),
-        result_dir=result_dir,
-    )
-
-
-def wait_aot(plan: AotPlan | None) -> None:
-    """Run the AOT compile fleet and raise on any failure.
-
-    Deadlock-free by construction. Each kernel runs in its *own* independent
-    worker process that returns its result through its *own* file -- there is
-    no result queue shared across workers, hence no cross-process write lock
-    (POSIX semaphore) that an OOM-killed worker could leak to its siblings.
-    That leaked-semaphore wedge was the root cause of the multi-hour hang;
-    removing the shared channel removes the failure mode entirely.
-
-    A worker that *dies* (OOM-kill -> exitcode -9, segfault -> -11) is noticed
-    immediately via its process sentinel; a worker stuck *alive* is bounded by a
-    generous per-kernel timeout. Either abnormal exit is *retried* up to
-    ``plan.max_retries`` times -- OOM-kills and probabilistic fork wedges are
-    transient, and the FlyDSL cache persists each artifact as produced, so a
-    retry re-runs almost nothing. A clean compile error (exit 0, no kernel) is
-    deterministic and never retried."""
-    if plan is None or not plan.jobs:
-        return
 
     # One uniform task per kernel: worker = the kind's compile_one_config.
     specs = [
@@ -632,22 +523,22 @@ def wait_aot(plan: AotPlan | None) -> None:
             job,
             JobLabel(kind=kind, kernel_name=str(job.get("kernel_name", "?"))),
         )
-        for kind, job in plan.jobs
+        for kind, job in all_jobs
     ]
 
     try:
         raw = _run_file_pool(
             specs,
-            plan.max_workers,
-            plan.kernel_timeout,
-            plan.max_retries,
-            plan.result_dir,
+            max_workers,
+            get_kernel_timeout(),
+            get_max_retries(),
+            result_dir,
         )
 
         ok_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
         fail_by_kind: dict[OpKind, int] = {k: 0 for k in OpKind}
         errors: list[str] = []
-        for (kind, _job), result, spec in zip(plan.jobs, raw, specs):
+        for (kind, _job), result, spec in zip(all_jobs, raw, specs):
             label = spec[2]
             if result is not None and result.get("compile_time") is not None:
                 ok_by_kind[kind] += 1
@@ -679,4 +570,4 @@ def wait_aot(plan: AotPlan | None) -> None:
                 f"[aiter] FlyDSL AOT failures ({tally}): " + "; ".join(head) + suffix
             )
     finally:
-        shutil.rmtree(plan.result_dir, ignore_errors=True)
+        shutil.rmtree(result_dir, ignore_errors=True)
