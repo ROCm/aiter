@@ -29,29 +29,33 @@ _SUPPORTED = {
 
 @functools.cache
 def _get_compiled_mxfp4_gemm1_port(
-    BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, interleave=True
+    BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, interleave=True, a_dtype="fp4"
 ):
     # Backend switch: AITER_MXFP4_GEMM1_V2=1 selects the layout-API v2 port for the
     # BM32 variants -- (BM=32, inline_quant=False) -- for BOTH use_nt (BM32_NT vs
-    # BM32_CACHED cache policy) and BOTH gate modes (interleave / separate). Any other
-    # variant (or the env unset) keeps the byte-exact raw v1 kernel.
+    # BM32_CACHED cache policy), BOTH gate modes (interleave / separate), and BOTH A
+    # dtypes (a4w4 / a8w4). Any other variant (or the env unset) keeps the v1 kernel.
     if (
         os.environ.get("AITER_MXFP4_GEMM1_V2") == "1"
         and (BM, inline_quant) == (32, False)
     ):
         from .kernels.mxfp4_gemm1_v2 import compile_gemm1_a4w4_port
-    else:
-        from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
+
+        return compile_gemm1_a4w4_port(
+            BM, use_nt, inline_quant, D_HIDDEN=D_HIDDEN, D_INTER=D_INTER,
+            NE=NE, TOPK=topk, interleave=interleave, a_dtype=a_dtype,
+        )
+    # v1 (this branch) is a4w4-only -- it has no a_dtype param.
+    if a_dtype != "fp4":
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 a_dtype={a_dtype!r} requires the v2 backend "
+            f"(AITER_MXFP4_GEMM1_V2=1, BM=32, inline_quant=False)"
+        )
+    from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
     return compile_gemm1_a4w4_port(
-        BM,
-        use_nt,
-        inline_quant,
-        D_HIDDEN=D_HIDDEN,
-        D_INTER=D_INTER,
-        NE=NE,
-        TOPK=topk,
-        interleave=interleave,
+        BM, use_nt, inline_quant, D_HIDDEN=D_HIDDEN, D_INTER=D_INTER,
+        NE=NE, TOPK=topk, interleave=interleave,
     )
 
 
@@ -97,6 +101,7 @@ def flydsl_mxfp4_gemm1(
     D_INTER,
     topk,
     interleave=True,
+    a_dtype="fp4",
     stream=None,
 ):
     """Run the FlyDSL port gemm1, writing inter_sorted_quant / inter_sorted_shuffled_scale.
@@ -117,7 +122,7 @@ def flydsl_mxfp4_gemm1(
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
-        BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, interleave
+        BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, interleave, a_dtype
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER)
     # gemm1 only needs base pointers (it assumes contiguity + derives sizes

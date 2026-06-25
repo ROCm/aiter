@@ -90,8 +90,13 @@ def _global_ptr1(arg, byte_off_i32):
 
 
 def _lds_swizzle_mask(row):
-    """lds_swizzle_mask<ROW_BYTES=128>(row) = (row & 14) << 3."""
+    """lds_swizzle_mask<ROW_BYTES=128>(row) = (row & 14) << 3 (fp4 A tile)."""
     return (row & fx.Int32(14)) << fx.Int32(3)
+
+
+def _lds_swizzle_mask_f8(row):
+    """lds_swizzle_mask<ROW_BYTES=256>(row) = (row & 15) << 4 (fp8 A tile)."""
+    return (row & fx.Int32(15)) << fx.Int32(4)
 
 
 def _silu_mul_batch(gs, us):
@@ -147,10 +152,21 @@ def _gemm1_body_v2(
     NE,
     interleave,
     b_nontemporal,
+    a_dtype,
 ):
+    # A activation dtype: fp4 (packed 2/byte) or fp8 (1 byte/elem). Only the A
+    # payload path differs (LDS tile size, ds-read gather, mfma A-format); the weight
+    # + all e8m0 scale paths are identical. fp8 A uses the raw mfma_scale intrinsic
+    # (cbsz=0); fp4 A keeps the fx.gemm fragment path.
+    is_f8_a = a_dtype == "fp8"
+    a_pack = 1 if is_f8_a else 2  # logical A elems per stored byte
+    am = 2 // a_pack  # A row-group calls per 8-row sub (fp8=2, fp4=1)
+    KH_TILE_A = BK // a_pack  # A bytes per K-tile row in LDS (fp8=256, fp4=128)
+    cbsz_a = 0 if is_f8_a else 4  # mfma A-format selector (fp8=0, fp4=4)
     # K-/INTER-derived sizes (compile-time Python ints; were the v1 *_for helpers).
     _kc = (K // 32) // 4 // 2
     K_HALF = K // 2
+    K_BYTES = K // a_pack  # a_quant row stride in bytes (= K_HALF for fp4)
     K_TILES_TOTAL = K // BK
     kUnroll = K_TILES_TOTAL - kStages
     kAS_per_chunk_dw = _kc * 64
@@ -171,11 +187,9 @@ def _gemm1_body_v2(
 
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
-    lane_div_8 = lane // fx.Int32(8)
-    lane_mod_8 = lane % fx.Int32(8)
 
     # buffer resources (A-gather + scales)
-    aq_num_records = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K_HALF)))
+    aq_num_records = arith.index_cast(T.index, _raw(i32_ntok * fx.Int32(K_BYTES)))
     aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num_records
     )
@@ -189,22 +203,32 @@ def _gemm1_body_v2(
 
     # LDS views (s_aq / s_asc, union-overlapping lds_acc)
     lds_base = allocator.get_base()
-    s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE,))
+    s_aq = SmemPtr(lds_base, lds_off, T.i8, shape=(kAStages * BM * KH_TILE_A,))
     s_asc = SmemPtr(
         lds_base,
-        lds_off + kAStages * BM * KH_TILE,
+        lds_off + kAStages * BM * KH_TILE_A,
         T.i8,
         shape=(kSubBlocks * K_TILES_TOTAL * 256,),
     )
     lds_acc = SmemPtr(lds_base, lds_off, T.f32, shape=(BM * BN,))
 
-    # cached A rows (A-gather base offset)
+    # cached A rows (A-gather base offset). buffer_load_lds fills 64*16B/wave: fp4 ->
+    # 8 rows x 128B (lane//8), fp8 -> 4 rows x 256B (lane//16); fp8 needs `am` calls.
+    lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
+    rows_per_call = 64 // lanes_per_row  # 8 (fp4) / 4 (fp8)
+    a_lane_row = lane // fx.Int32(lanes_per_row)
     cached_actual_row = []
     for sub in range_constexpr(kSubBlocks):
-        idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
-        cached_actual_row.append(
-            llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
-        )
+        for h in range_constexpr(am):
+            idx = (
+                m_row
+                + wave * fx.Int32(BM // 4)
+                + fx.Int32(sub * 8 + h * rows_per_call)
+                + a_lane_row
+            )
+            cached_actual_row.append(
+                llvm.load(T.i32, _global_ptr1(arg_mind, idx * fx.Int32(4)))
+            )
 
     # B-scale n-pack words (gate/up split differs by mode); the per-(wave,mw) base
     # is uniform, the per-lane + per-K-tile parts become layout axes (see views below).
@@ -216,41 +240,55 @@ def _gemm1_body_v2(
         np_list = [np_gate, np_gate + fx.Int32(N_OUT // 64)]
 
     def issue_a_load_lds(slot, kt):
+        # lane L -> LDS[base+L*16]: fp4 8 rows x 128B (lane//8,lane%8), fp8 4 rows x
+        # 256B (lane//16,lane%16); fp8 splits each 8-row sub into `am` row-groups.
+        lane_col = (lane % fx.Int32(lanes_per_row)) * fx.Int32(16)
+        base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(s_aq.get()))
         for sub in range_constexpr(kSubBlocks):
-            lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
-            mask = _lds_swizzle_mask(lds_row + lane_div_8)
-            voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
-                sub
-            ] * fx.Int32(K_HALF)
-            base_i32 = fx.Int32(
-                memref_dialect.extract_aligned_pointer_as_index(s_aq.get())
-            )
-            off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-            rocdl.raw_ptr_buffer_load_lds(
-                aq_rsrc,
-                _lds_ptr3(base_i32, off),
-                fx.Int32(16),
-                voffset,
-                fx.Int32(kt * KH_TILE),
-                fx.Int32(0),
-                fx.Int32(0),
-            )
+            for h in range_constexpr(am):
+                lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8 + h * rows_per_call)
+                mask = (
+                    _lds_swizzle_mask_f8(lds_row + a_lane_row)
+                    if const_expr(is_f8_a)
+                    else _lds_swizzle_mask(lds_row + a_lane_row)
+                )
+                voffset = (lane_col ^ mask) + cached_actual_row[sub * am + h] * fx.Int32(
+                    K_BYTES
+                )
+                off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * fx.Int32(KH_TILE_A)
+                rocdl.raw_ptr_buffer_load_lds(
+                    aq_rsrc,
+                    _lds_ptr3(base_i32, off),
+                    fx.Int32(16),
+                    voffset,
+                    fx.Int32(kt * KH_TILE_A),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                )
 
     def issue_a_ds_read(slot):
-        # ds_read A from LDS (raw addressing) into the A register fragments for fx.gemm.
-        mask = _lds_swizzle_mask(lane_mod_16)
+        # fp4: 32 contiguous K (Vec4 i32) at col g*16+k*64 -> A fragment for fx.gemm.
+        # fp8: a lane's 32 K split into two 16-K halves 64B apart -> Vec8 i32 (raw,
+        # for the mfma_scale intrinsic; cbsz=0).
         base_ptr = _lds_base_ptr3(s_aq.get())
         for k in range_constexpr(2):
-            lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
             for i in range_constexpr(kMChunks):
                 lds_row = lane_mod_16 + fx.Int32(i * 16)
-                off = (
-                    fx.Int32(slot * (BM * KH_TILE))
-                    + lds_row * fx.Int32(KH_TILE)
-                    + lds_col
-                )
-                vec = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, off))
-                _a_frags[i][k].store(Vec(vec))
+                row_off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * fx.Int32(KH_TILE_A)
+                if const_expr(is_f8_a):
+                    mask = _lds_swizzle_mask_f8(lane_mod_16)
+                    col0 = lane_div_16 * fx.Int32(16) + fx.Int32(k * 128)
+                    col_lo = col0 ^ mask
+                    col_hi = (col0 + fx.Int32(64)) ^ mask
+                    lo = Vec(llvm.load(T.vec(2, T.i64), _gep3(base_ptr, row_off + col_lo)))
+                    hi = Vec(llvm.load(T.vec(2, T.i64), _gep3(base_ptr, row_off + col_hi)))
+                    a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
+                    _a_vals[i][k] = _raw(a64.bitcast(fx.Int32))
+                else:
+                    mask = _lds_swizzle_mask(lane_mod_16)
+                    lds_col = (lane_div_16 * fx.Int32(16) + fx.Int32(k * 64)) ^ mask
+                    vec = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, row_off + lds_col))
+                    _a_frags[i][k].store(Vec(vec))
 
     def issue_a_scale_load():
         chunk_base = m_row // fx.Int32(32)
@@ -335,9 +373,8 @@ def _gemm1_body_v2(
         for mw in range_constexpr(2)
     ]
 
-    # All MMA operands are register fragments for fx.gemm (rank-1 -> one MmaAtomCall).
-    # i32<4:1> (16B = 32 fp4) for A/B; f32<4:1> (vec4) for C. B is PER-STAGE (kStages)
-    # to hold the prefetch pipeline; A is refilled per K iter; C accumulates in place.
+    # B is loaded via fx.copy into i32<4:1> fragments (16B = 32 fp4) regardless of A
+    # dtype. PER-STAGE (kStages) prefetch double-buffer.
     _frag_tmpl = ml.bq_frag_tmpl(_bq_views[0])  # i32<4:1>
     _bq_frags = [
         [
@@ -346,17 +383,25 @@ def _gemm1_body_v2(
         ]
         for _ in range_constexpr(kStages)
     ]
-    _a_frags = [
-        [fx.make_fragment_like(_frag_tmpl) for _ in range_constexpr(2)]
-        for _ in range_constexpr(kMChunks)
-    ]
-    _c_frags = [
-        [
-            fx.make_fragment_like(_frag_tmpl, dtype=fx.Float32.ir_type)
-            for _ in range_constexpr(4)
+    # A / C: fp4 uses fx.gemm register fragments (A refilled per K iter, C accumulates
+    # in place). fp8 uses the raw mfma_scale intrinsic, so A is a per-iter Vec8 i32
+    # value (_a_vals) and C is a raw f32x4 accumulator (accm, init to zero).
+    zero4 = Vec.filled(4, 0.0, fx.Float32)
+    if const_expr(is_f8_a):
+        _a_vals = [[None, None] for _ in range(kMChunks)]
+        accm = [[zero4 for _ in range(4)] for _ in range(kMChunks)]
+    else:
+        _a_frags = [
+            [fx.make_fragment_like(_frag_tmpl) for _ in range_constexpr(2)]
+            for _ in range_constexpr(kMChunks)
         ]
-        for _ in range_constexpr(kMChunks)
-    ]
+        _c_frags = [
+            [
+                fx.make_fragment_like(_frag_tmpl, dtype=fx.Float32.ir_type)
+                for _ in range_constexpr(4)
+            ]
+            for _ in range_constexpr(kMChunks)
+        ]
     # B-scale fragments: i32<1:1>, PER-STAGE (kStages) double-buffer like _bq_frags.
     _bs_frag_tmpl = ml.bscale_frag_tmpl(_bscale_views[0])  # i32<1:1>
     _bs_frags = [
@@ -381,11 +426,10 @@ def _gemm1_body_v2(
                 _bs_frags[stage][mw],
             )
 
-    # MMA -- one fx.gemm per mfma over rank-1 fragments (shared layout primitive).
-    # Scales ride scale_a=/scale_b=; the (opselA,opselB) atom set is pre-built once.
-    # C accumulates in place (d == c).
-    zero4 = Vec.filled(4, 0.0, fx.Float32)
-    _scale_mma_atoms = ml.scale_mma_atoms()
+    # MMA. fp4: one fx.gemm per mfma over rank-1 fragments (shared layout primitive),
+    # scales ride scale_a=/scale_b=, C accumulates in place. fp8: the raw scaled-MFMA
+    # intrinsic (cbsz=0, A is the Vec8 i32 from ds-read), C accumulates via accm.
+    _scale_mma_atoms = ml.scale_mma_atoms() if const_expr(not is_f8_a) else None
 
     def _gemm_mma(a_frag, b_frag, c_frag, opsel_a, opsel_b, sa, sb):
         ml.gemm_mma(_scale_mma_atoms, a_frag, b_frag, c_frag, opsel_a, opsel_b, sa, sb)
@@ -397,20 +441,28 @@ def _gemm1_body_v2(
         else:
             mni, in_b = J % 2, J // 2
         sb = _raw(Vec(_bs_frags[stage][mni].load())[0])
-        bJ0, bJ1 = _bq_frags[stage][J][0], _bq_frags[stage][J][1]
-        for sub in range_constexpr(kSubBlocks):
-            i0 = sub * 2 + 0
-            i1 = sub * 2 + 1
-            sa = a_scale[sub]
-            _gemm_mma(_a_frags[i0][0], bJ0, _c_frags[i0][J], 0, 0 + in_b, sa, sb)
-            _gemm_mma(_a_frags[i1][0], bJ0, _c_frags[i1][J], 1, 0 + in_b, sa, sb)
-            _gemm_mma(_a_frags[i0][1], bJ1, _c_frags[i0][J], 2, 2 + in_b, sa, sb)
-            _gemm_mma(_a_frags[i1][1], bJ1, _c_frags[i1][J], 3, 2 + in_b, sa, sb)
+        sa = a_scale[0]  # kSubBlocks == 1
+        if const_expr(is_f8_a):
+            bJ0 = Vec(_bq_frags[stage][J][0].load())
+            bJ1 = Vec(_bq_frags[stage][J][1].load())
+            for osa, k, i in ((0, 0, 0), (1, 0, 1), (2, 1, 0), (3, 1, 1)):
+                bJ = bJ0 if k == 0 else bJ1
+                osb = (0 if k == 0 else 2) + in_b
+                accm[i][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    T.f32x4, [_a_vals[i][k], bJ, accm[i][J], cbsz_a, 4, osa, sa, osb, sb]
+                )
+        else:
+            bJ0, bJ1 = _bq_frags[stage][J][0], _bq_frags[stage][J][1]
+            _gemm_mma(_a_frags[0][0], bJ0, _c_frags[0][J], 0, 0 + in_b, sa, sb)
+            _gemm_mma(_a_frags[1][0], bJ0, _c_frags[1][J], 1, 0 + in_b, sa, sb)
+            _gemm_mma(_a_frags[0][1], bJ1, _c_frags[0][J], 2, 2 + in_b, sa, sb)
+            _gemm_mma(_a_frags[1][1], bJ1, _c_frags[1][J], 3, 2 + in_b, sa, sb)
 
-    # zero C (accumulate in place thereafter)
-    for i in range_constexpr(kMChunks):
-        for J in range_constexpr(4):
-            _c_frags[i][J].store(zero4)
+    # zero C (fp4 fragments accumulate in place thereafter; fp8 accm pre-init above).
+    if const_expr(not is_f8_a):
+        for i in range_constexpr(kMChunks):
+            for J in range_constexpr(4):
+                _c_frags[i][J].store(zero4)
 
     # prologue: stages 0,1
     issue_a_scale_load()
@@ -459,8 +511,11 @@ def _gemm1_body_v2(
     wave_n = wave
     lds_acc_base = _lds_base_ptr3(lds_acc.get())
 
-    # Read accumulators back from the C register fragments (flat slot [i,J,v]).
-    _acc_vecs = [[Vec(_c_frags[i][J].load()) for J in range(4)] for i in range(kMChunks)]
+    # Read accumulators (flat slot [i,J,v]): fp4 from the C fragments, fp8 from accm.
+    if const_expr(is_f8_a):
+        _acc_vecs = [[Vec(accm[i][J]) for J in range(4)] for i in range(kMChunks)]
+    else:
+        _acc_vecs = [[Vec(_c_frags[i][J].load()) for J in range(4)] for i in range(kMChunks)]
 
     def _acc(i, J, v):
         return _acc_vecs[i][J][v]
@@ -564,8 +619,8 @@ def _gemm1_body_v2(
             )
 
 
-def _lds_bytes_for(K_TILES_TOTAL):
-    s_aq_bytes = kAStages * BM * KH_TILE
+def _lds_bytes_for(K_TILES_TOTAL, KH_TILE_A=KH_TILE):
+    s_aq_bytes = kAStages * BM * KH_TILE_A  # fp8 A tile is 2x (256B vs 128B)
     s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
     lds_acc_bytes = BM * BN * 4
     return max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
@@ -580,6 +635,7 @@ def compile_gemm1_a4w4_port(
     NE=NE_DEFAULT,
     TOPK=TOPK_DEFAULT,
     interleave=True,
+    a_dtype="fp4",
 ):
     # use_nt IS the B-load cache policy (v1's `b_aux = 2 if use_nt else 0`;
     # tuned config BM32_NT vs BM32_CACHED): True -> nt (decode), False -> cached.
@@ -589,17 +645,21 @@ def compile_gemm1_a4w4_port(
             f"mxfp4_gemm1_v2 supports only (BM=32, inline_quant=False); "
             f"got (BM={BM}, inline_quant={inline_quant})"
         )
+    if a_dtype not in ("fp4", "fp8"):
+        raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
 
     _K, _INTER, _NE = D_HIDDEN, D_INTER, NE
     assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
     _N_OUT = 2 * _INTER
     assert _N_OUT % BN == 0, f"2*D_INTER (N_OUT) must be a multiple of {BN}, got {_N_OUT}"
 
-    lds_bytes = _lds_bytes_for(_K // BK)  # K_TILES_TOTAL
+    _KH_TILE_A = BK // (1 if a_dtype == "fp8" else 2)
+    lds_bytes = _lds_bytes_for(_K // BK, _KH_TILE_A)  # K_TILES_TOTAL
 
     gu_tag = "il" if interleave else "sep"
     bnt_tag = "nt" if b_nontemporal else "cached"
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{bnt_tag}_{gu_tag}_v2"
+    a_tag = "a8" if a_dtype == "fp8" else "a4"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{bnt_tag}_{gu_tag}_{a_tag}_v2"
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name=f"gemm1port_v2_smem_{name_suffix}"
@@ -652,6 +712,7 @@ def compile_gemm1_a4w4_port(
                 NE=_NE,
                 interleave=interleave,
                 b_nontemporal=b_nontemporal,
+                a_dtype=a_dtype,
             )
 
     @flyc.jit
