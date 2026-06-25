@@ -513,8 +513,11 @@
             "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_sparse_prefill_opus_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/pa_sparse_prefill_opus_pybind.cu'"
         ],
-        "flags_extra_cc": [],
+        "flags_extra_cc": [
+            "'-DENABLE_CK=0'"
+        ],
         "flags_extra_hip": [
+            "'-DENABLE_CK=0'",
             "'-ffast-math'",
             "'-mllvm -enable-post-misched=1'"
         ],

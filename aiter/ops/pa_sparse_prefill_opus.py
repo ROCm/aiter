@@ -103,8 +103,10 @@ def pa_sparse_prefill_opus(
       ``out`` (``[T, H, D]`` same dtype as ``q``).
     """
     gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        raise RuntimeError(f"pa_sparse_prefill_opus requires gfx950, got {gfx}")
+    if gfx not in ("gfx950", "gfx1250"):
+        raise RuntimeError(
+            f"pa_sparse_prefill_opus requires gfx950 or gfx1250, got {gfx}"
+        )
 
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_sparse_prefill_opus expects fp16/bf16 q, got {q.dtype}")
@@ -225,8 +227,10 @@ def pa_sparse_prefill_fp8_opus(
       ``out`` (``[T, H, 512]`` bf16).
     """
     gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        raise RuntimeError(f"pa_sparse_prefill_fp8_opus requires gfx950, got {gfx}")
+    if gfx not in ("gfx950", "gfx1250"):
+        raise RuntimeError(
+            f"pa_sparse_prefill_fp8_opus requires gfx950 or gfx1250, got {gfx}"
+        )
 
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(

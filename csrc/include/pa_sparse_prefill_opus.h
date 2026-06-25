@@ -289,7 +289,14 @@ struct pa_16mx1_16nx4_fp8_traits
     static constexpr int D_TILE_SIZE  = D_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
 
-    static constexpr int WARP_SIZE  = 64; // AMD wavefront size
+    // Wavefront size: 64 on gfx950 (CDNA/MFMA), 32 on gfx1250 (RDNA/WMMA).
+    // This is the *device-pass* value (correct per arch). The host launcher must
+    // size the thread block from the runtime warp size, not this constant.
+#if defined(__gfx1250__)
+    static constexpr int WARP_SIZE  = 32;
+#else
+    static constexpr int WARP_SIZE  = 64;
+#endif
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
 
     // Packed DSA hdim split
@@ -360,8 +367,10 @@ __global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs kargs);
 template <class Traits>
 __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs);
 
-// Pull in the device kernel template bodies only on the gfx950 device pass.
-#if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
+// Pull in the device kernel template bodies on the gfx950 (MFMA/wave64) and
+// gfx1250 (WMMA/wave32) device passes. The bf16/fp16 16mx8/16mx1 variants are
+// gfx950-only; the split-precision fp8 variant compiles for both arches.
+#if !defined(__HIP_DEVICE_COMPILE__) || !(defined(__gfx950__) || defined(__gfx1250__))
 template <class Traits>
 __global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs)
 {
@@ -383,6 +392,11 @@ __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs)
 #include <bit>
 
 using opus::operator""_I;
+
+// The bf16/fp16 16mx8_32nx1 and 16mx1_16nx4 variants are wave64 MFMA kernels;
+// they are compiled on gfx950 only. gfx1250 gets empty stubs for these symbols
+// (see below), and only the split-precision fp8 variant is ported to wave32 WMMA.
+#if defined(__gfx950__)
 
 // =============================================================================
 // Variant 16mx8_32nx1 (T_M=NUM_WARPS, T_N=1) — used when H > 32.
@@ -593,8 +607,10 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s) {
         row_max = max(row_max, v_s[i.value]);
     });
     // swap lanes 32 apart (i <-> i+32).
+#if !defined(__gfx1250__)
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     row_max = max(std::bit_cast<float>(res32.x), std::bit_cast<float>(res32.y));
+#endif // TODO(gfx1250): wave32 has no lanes 32 apart; permlane32_swap omitted (reduction layout differs).
     // swap lanes 16 apart (i <-> i+16).
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     return max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
@@ -625,8 +641,10 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s) {
         row_sum += v_s[i.value];
     });
     // swap lanes 32 apart (i <-> i+32).
+#if !defined(__gfx1250__)
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     row_sum = std::bit_cast<float>(res32.x) + std::bit_cast<float>(res32.y);
+#endif // TODO(gfx1250): wave32 has no lanes 32 apart; permlane32_swap omitted (reduction layout differs).
     // swap lanes 16 apart (i <-> i+16).
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     return std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
@@ -1686,8 +1704,10 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s, S& s_m, int warp_
         row_max = max(row_max, v_s[i.value]);
     });
     // swap lanes 32 apart (i <-> i+32).
+#if !defined(__gfx1250__)
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     row_max = max(std::bit_cast<float>(res32.x), std::bit_cast<float>(res32.y));
+#endif // TODO(gfx1250): wave32 has no lanes 32 apart; permlane32_swap omitted (reduction layout differs).
     // swap lanes 16 apart (i <-> i+16).
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     row_max = max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
@@ -1729,8 +1749,10 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s, S& s_l, int warp_
         row_sum += v_s[i.value];
     });
     // swap lanes 32 apart (i <-> i+32).
+#if !defined(__gfx1250__)
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     row_sum = std::bit_cast<float>(res32.x) + std::bit_cast<float>(res32.y);
+#endif // TODO(gfx1250): wave32 has no lanes 32 apart; permlane32_swap omitted (reduction layout differs).
     // swap lanes 16 apart (i <-> i+16).
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     row_sum = std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
@@ -1963,10 +1985,34 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
 
+#else  // !__gfx950__ (gfx1250): bf16/fp16 variants not ported — empty stubs.
+template <class Traits>
+__global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs) {}
+template <class Traits>
+__global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs) {}
+#endif // __gfx950__
+
 // =============================================================================
 // Variant 16mx1_16nx4 fp8 (T_M=1, T_N=NUM_WARPS) — split NoPE fp8 / RoPE bf16.
 // =============================================================================
 namespace pa_16mx1_16nx4_fp8 {
+
+// MMA operand adaptor: the swap-A/B adaptor differs by matrix core. gfx950 uses
+// the MFMA adaptor; gfx1250 uses the WMMA adaptor (wave32, 256b WMMA builtins).
+#if defined(__gfx1250__)
+using fp8_mma_swap_ab = opus::wmma_adaptor_swap_ab;
+
+// gfx1250 splits the combined s_waitcnt into separate counters. Provide the
+// gfx9-style names the kernel uses, mapped onto the split instructions:
+//   vmcnt   -> loadcnt  (global/vector memory loads)
+//   lgkmcnt -> dscnt    (LDS read/write; this kernel only uses lgkmcnt for LDS)
+template <opus::index_t cnt>
+__device__ inline void s_waitcnt_vmcnt(opus::number<cnt> = {}) { opus::s_wait_loadcnt(opus::number<cnt>{}); }
+template <opus::index_t cnt>
+__device__ inline void s_waitcnt_lgkmcnt(opus::number<cnt> = {}) { opus::s_wait_dscnt(opus::number<cnt>{}); }
+#else
+using fp8_mma_swap_ab = opus::mfma_adaptor_swap_ab;
+#endif
 
 template<class T>
 __device__ inline auto make_layout_q_nope(int lane_id) {
@@ -2176,8 +2222,10 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s, S& s_m, int warp_
         row_max = max(row_max, v_s[i.value]);
     });
     // swap lanes 32 apart (i <-> i+32).
+#if !defined(__gfx1250__)
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     row_max = max(std::bit_cast<float>(res32.x), std::bit_cast<float>(res32.y));
+#endif // TODO(gfx1250): wave32 has no lanes 32 apart; permlane32_swap omitted (reduction layout differs).
     // swap lanes 16 apart (i <-> i+16).
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_max), std::bit_cast<opus::u32_t>(row_max), false, true);
     row_max = max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
@@ -2219,8 +2267,10 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s, S& s_l, int warp_
         row_sum += v_s[i.value];
     });
     // swap lanes 32 apart (i <-> i+32).
+#if !defined(__gfx1250__)
     opus::vector_t<opus::u32_t, 2> res32 = __builtin_amdgcn_permlane32_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     row_sum = std::bit_cast<float>(res32.x) + std::bit_cast<float>(res32.y);
+#endif // TODO(gfx1250): wave32 has no lanes 32 apart; permlane32_swap omitted (reduction layout differs).
     // swap lanes 16 apart (i <-> i+16).
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     row_sum = std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
@@ -2325,17 +2375,17 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_NOPE_E_K>{},
         seq<T::T_M, T::T_N, T::T_K>{},
         seq<T::W_M, T::W_N, T::W_K_NOPE>{},
-        mfma_adaptor_swap_ab{});
+        fp8_mma_swap_ab{});
     auto mma0_rope = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
         seq<T::GEMM0_E_M, T::GEMM0_E_N, T::GEMM0_ROPE_E_K>{},
         seq<T::T_M, T::T_N, T::T_K>{},
         seq<T::W_M, T::W_N, T::W_K_ROPE>{},
-        mfma_adaptor_swap_ab{});
+        fp8_mma_swap_ab{});
     auto mma1 = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
         seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
         seq<T::T_M, T::T_N, T::T_K>{},
         seq<T::W_M, T::W_N, T::W_K_ROPE>{},
-        mfma_adaptor_swap_ab{});
+        fp8_mma_swap_ab{});
 
     auto u_rk_nope    = make_layout_rk_nope<T>(lane_id);
     auto u_rk_rope    = make_layout_rk_rope<T>(lane_id);
@@ -2408,8 +2458,21 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
             constexpr int rept = (d.value / 4) % 2;  // K-rept half  (0/1)
             const u32_t e8m0   = (((rept == 0) ? k_scl_r0 : k_scl_r1) >> (8 * ek)) & 0xFFu;
             const float scale  = std::bit_cast<float>(e8m0 << 23);
+#if defined(__gfx1250__)
+            // TODO(gfx1250): cvt_scalef32_pk_bf16_fp8 (fp8-cvt-scale-insts) not available here.
+            // Compile-only fallback: unscaled cvt_pk_f32_fp8 + manual scale + bf16 cast. Numerics not validated.
+            const u32_t w = k_nope_w[d.value];
+            auto f2lo = __builtin_amdgcn_cvt_pk_f32_fp8(w, 0);  // bytes 0,1
+            auto f2hi = __builtin_amdgcn_cvt_pk_f32_fp8(w, 1);  // bytes 2,3
+            vector_t<D_ROPE, 2> rlo, rhi;
+            rlo[0] = static_cast<D_ROPE>(f2lo[0] * scale); rlo[1] = static_cast<D_ROPE>(f2lo[1] * scale);
+            rhi[0] = static_cast<D_ROPE>(f2hi[0] * scale); rhi[1] = static_cast<D_ROPE>(f2hi[1] * scale);
+            k_nope_bf16_pk[d.value * 2 + 0] = rlo;
+            k_nope_bf16_pk[d.value * 2 + 1] = rhi;
+#else
             k_nope_bf16_pk[d.value * 2 + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(k_nope_w[d.value], scale, false);
             k_nope_bf16_pk[d.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(k_nope_w[d.value], scale, true);
+#endif
         });
 
         // ──── GEMM0: S = Q·Kᵀ  (RoPE bf16) ────
