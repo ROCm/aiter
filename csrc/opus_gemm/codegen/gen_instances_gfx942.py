@@ -21,11 +21,11 @@ from codegen.common import (
 # gfx942 pipeline header helper. Paired splitK tags reuse their nosplit
 # sibling's .cuh; kbuf1_sk is splitK-only but keeps the kbuf1 pipeline name.
 def _gfx942_pipeline(tag):
-    return f"gfx942/opus_gemm_pipeline_{tag}.cuh"
+    return f"gfx942/a16w16/opus_gemm_pipeline_{tag}.cuh"
 
 
 # Traits header carries the traits struct + kargs struct definitions for a given pipeline tag.
-GFX942_TRAITS_HEADER = "gfx942/opus_gemm_traits_a16w16.cuh"
+GFX942_TRAITS_HEADER = "gfx942/a16w16/opus_gemm_traits_a16w16.cuh"
 
 # gfx942 a16w16 tags all share one traits class name (no arch suffix).
 GFX942_TRAITS_NAME = "opus_gemm_a16w16_traits"
@@ -883,7 +883,7 @@ for _tag in _GFX942_NOSPLIT_TAGS:
 
 # ---------------- gfx942 a16w16 validator ----------------
 # Coverage: basic physical limits only. Detailed LDS depth / layout checks
-# live in gfx942/opus_gemm_traits_a16w16.cuh static_asserts (hipcc enforces).
+# live in gfx942/a16w16/opus_gemm_traits_a16w16.cuh static_asserts (hipcc enforces).
 
 # gfx942 (CDNA3 / MI300X) hardware LDS budget per WG.
 _GFX942_LDS_PER_WG_BYTES = 64 * 1024

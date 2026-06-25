@@ -75,7 +75,7 @@ SPLITK_REDUCE_ABI_MAP = {
         "baseline_has_oob": (True, False),
     },
     "gfx942": {
-        "forward_decl_include": '#include "gfx942/opus_gemm_traits_a16w16.cuh"\n',
+        "forward_decl_include": '#include "gfx942/a16w16/opus_gemm_traits_a16w16.cuh"\n',
         "kernel": "splitk_reduce_kernel_fallback",
         "ws_arg": "const opus_splitk_ws_handle* ws_handle",
         "ws_type": "const opus_splitk_ws_handle*",
@@ -794,7 +794,11 @@ void
 
         # Emit one reduce device TU per arch.
         for reduce_arch in sorted(present_archs):
-            reduce_header = f"{reduce_arch}/splitk_reduce_{reduce_arch}.cuh"
+            reduce_header = (
+                "gfx942/a16w16/splitk_reduce_gfx942.cuh"
+                if reduce_arch == "gfx942"
+                else f"{reduce_arch}/splitk_reduce_{reduce_arch}.cuh"
+            )
             reduce_abi = SPLITK_REDUCE_ABI_MAP[reduce_arch]
             ws_ptr_type = reduce_abi["ws_type"]
             reduce_kernel = reduce_abi["kernel"]
