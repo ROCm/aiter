@@ -109,8 +109,25 @@ __global__ void decodeIndexScoreKernel(
     const int64_t local_start = (num_blocks > local_blocks) ? (num_blocks - local_blocks) : 0;
     const int dim0 = lane * kElemsPerLane;
 
+    __shared__ float q_shared[kHeadDim];
+    if(threadIdx.x < kGroupLanes)
+    {
+        float q_load[kElemsPerLane];
+        load8Vec(q + pid_t * stride_q_n + pid_h * stride_q_h + dim0 * stride_q_d, q_load);
+#pragma unroll
+        for(int i = 0; i < kElemsPerLane; ++i)
+        {
+            q_shared[dim0 + i] = q_load[i];
+        }
+    }
+    __syncthreads();
+
     float q_vals[kElemsPerLane];
-    load8Vec(q + pid_t * stride_q_n + pid_h * stride_q_h + dim0 * stride_q_d, q_vals);
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        q_vals[i] = q_shared[dim0 + i];
+    }
 
     const int32_t* __restrict__ bt_row = block_table + pid_b * stride_bt_b;
     __shared__ float wave_scores[kNumTokenGroups];
