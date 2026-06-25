@@ -32,6 +32,8 @@ import torch
 DSV4_TOPK_MAIN = 512
 DSV4_TOPK_EXTRA = 128
 DSV4_TOPK_B1 = 128  # B1 SWA-only single-region layers (compress_ratio <= 1)
+# GLM-5 / DSv3.2: single global top-k over a flat fp8 576 latent cache.
+GLM_TOPK = 2048
 T_SWEEP_DEFAULT: tuple[int, ...] = (4096, 8192, 16384)
 
 _AITER_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
@@ -41,17 +43,23 @@ if os.path.isdir(os.path.join(_AITER_ROOT, "aiter")) and _AITER_ROOT not in sys.
 _flydsl_root = os.path.join(_DEV, "FlyDSL")
 
 from op_tests.flydsl_tests.sparse_mla_prefill_ref import (  # noqa: E402
+    GLM_HEAD_DIM,
+    GLM_V_DIM,
     H_PROD,
     NOPE_HEAD_DIM,
     PACKED_HEAD_DIM,
     ROPE_HEAD_DIM,
     default_scale,
+    default_scale_glm,
     gen_kv,
+    gen_kv_glm,
     gen_q,
+    gen_q_glm,
     gen_ragged_rows,
     identity_block_table,
     merge_two_region_csrs,
     pack_fp8_ds_mla_cache,
+    pack_glm_fp8_cache,
     ragged_from_rows,
 )
 from op_tests.flydsl_tests.sparse_mla_prefill_triton_baseline import (  # noqa: E402
@@ -392,6 +400,72 @@ def build_b2_inputs(
     )
 
 
+@dataclass
+class BenchInputsGLM:
+    q: torch.Tensor
+    cache: torch.Tensor
+    indices: torch.Tensor
+    indptr: torch.Tensor
+    block_table: torch.Tensor
+    block_size: int
+    scale: float
+    kv_scale: float
+    out: torch.Tensor
+
+
+def build_glm_inputs(
+    T: int,
+    topk: int,
+    num_tokens: int,
+    block_size: int,
+    seed: int,
+    kv_scale: float = 1.0,
+    device: str = "cuda",
+) -> BenchInputsGLM:
+    kv = gen_kv_glm(num_tokens, seed=seed)
+    cache = pack_glm_fp8_cache(kv, block_size, kv_scale=kv_scale)
+    rows = gen_ragged_rows(T, topk, num_tokens, seed=seed + 1)
+    indices, indptr = ragged_from_rows(rows, torch.device(device))
+    q = gen_q_glm(T, H_PROD, seed=seed + 2)
+    out = torch.empty(T, H_PROD, GLM_V_DIM, dtype=torch.bfloat16, device=device)
+    return BenchInputsGLM(
+        q=q,
+        cache=cache,
+        indices=indices,
+        indptr=indptr,
+        block_table=identity_block_table(num_tokens, block_size, torch.device(device)),
+        block_size=block_size,
+        scale=default_scale_glm(),
+        kv_scale=kv_scale,
+        out=out,
+    )
+
+
+def bench_flydsl_glm(inp: BenchInputsGLM, warmup: int, iters: int) -> TimingResult:
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    def run_once():
+        timer = StageTimer()
+        timer.begin("flydsl_kernel")
+        flydsl_sparse_mla_prefill(
+            inp.q,
+            inp.cache,
+            inp.indices,
+            inp.indptr,
+            inp.out,
+            block_table=inp.block_table,
+            block_size=inp.block_size,
+            packed=True,
+            scale_mode="per_tensor",
+            kv_scale=torch.tensor([inp.kv_scale], dtype=torch.float32, device=inp.q.device),
+        )
+        return timer.finish()
+
+    run_once()
+    med, stages = _median_ms(run_once, warmup, iters)
+    return TimingResult("flydsl_glm_e2e", med, stages, notes="native flat-576 fp8, fused, per-tensor scale")
+
+
 def bench_flydsl_b1(inp: BenchInputsB1, warmup: int, iters: int) -> TimingResult:
     from aiter.ops.flydsl import flydsl_sparse_mla_prefill
 
@@ -670,6 +744,29 @@ def run_bench(args: argparse.Namespace, T: int) -> None:
     print()
 
 
+def run_bench_glm(args: argparse.Namespace, T: int) -> None:
+    print(
+        f"sparse_mla_prefill bench  gfx942  preset=glm  T={T}  "
+        f"block_size={args.block_size}  warmup={args.warmup} iters={args.iters}"
+    )
+    print()
+    print(
+        f"=== GLM/DSv3.2 single-region (head_dim={GLM_HEAD_DIM}, topk={args.topk}, "
+        f"num_tokens={args.num_tokens}, kv_scale={args.kv_scale}) ==="
+    )
+    glm = build_glm_inputs(
+        T, args.topk, args.num_tokens, args.block_size, args.seed, args.kv_scale
+    )
+    fly_glm = bench_flydsl_glm(glm, args.warmup, args.iters)
+    _print_result(fly_glm, None)
+    print()
+    print(
+        "Triton bf16 baseline is DSv4-only (nope=448/rope=64); head_dim=576 "
+        "GLM has no vendored Triton prefill peer in this harness."
+    )
+    print()
+
+
 def _parse_T_sweep(raw: str | None) -> tuple[int, ...]:
     if raw is None:
         return T_SWEEP_DEFAULT
@@ -709,10 +806,23 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--preset",
+        choices=("dsv4", "dsv32", "glm"),
+        default="dsv4",
+        help="dsv4: B1 (topk=128) + B2 two-region. glm/dsv32: single-region flat fp8 head_dim=576, topk=2048.",
+    )
+    parser.add_argument(
         "--topk",
         type=int,
-        default=DSV4_TOPK_B1,
-        help="CSR length per query for B1 SWA-only (DSv4 sliding_window=128)",
+        default=None,
+        help="CSR length per query for the single-region run "
+        "(default: 128 for dsv4 B1, 2048 for glm/dsv32)",
+    )
+    parser.add_argument(
+        "--kv-scale",
+        type=float,
+        default=1.0,
+        help="GLM per-tensor KV dequant scalar (layer._k_scale); glm/dsv32 preset only",
     )
     parser.add_argument(
         "--topk-main",
@@ -744,15 +854,20 @@ def main() -> None:
 
     _ensure_flydsl()
 
+    is_glm = args.preset in ("glm", "dsv32")
+    if args.topk is None:
+        args.topk = GLM_TOPK if is_glm else DSV4_TOPK_B1
+    bench_fn = run_bench_glm if is_glm else run_bench
+
     if args.T_sweep is not None:
         Ts = _parse_T_sweep(args.T_sweep if args.T_sweep else None)
         for i, T in enumerate(Ts):
             if i:
                 print("=" * 72)
                 print()
-            run_bench(args, T)
+            bench_fn(args, T)
     else:
-        run_bench(args, args.T)
+        bench_fn(args, args.T)
 
 
 if __name__ == "__main__":

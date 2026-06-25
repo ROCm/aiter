@@ -14,6 +14,17 @@ H_PROD = 128
 _FNUZ = torch.float8_e4m3fnuz
 _OCP = torch.float8_e4m3fn
 
+# ---- GLM-5 / DeepSeek-V3.2 (ROCM_AITER_MLA_SPARSE) flat fp8 cache ----------
+# Per docs/sparse-mla-prefill/01 + vLLM rocm_aiter_mla_sparse.get_kv_cache_shape:
+# cache is a flat [num_blocks, block_size, 576] tensor, both the 512-d latent
+# and the 64-d rope stored as fp8 with a single per-tensor scale (layer._k_scale,
+# kept outside the cache).  The kernel reads the bytes straight to LDS and folds
+# the per-tensor scale into the QK softmax scale and the output.
+GLM_LATENT_DIM = 512
+GLM_ROPE_DIM = 64
+GLM_HEAD_DIM = GLM_LATENT_DIM + GLM_ROPE_DIM  # 576
+GLM_V_DIM = GLM_LATENT_DIM  # 512
+
 
 def pack_fp8_ds_mla_cache(
     kv: torch.Tensor,
@@ -107,3 +118,86 @@ def merge_two_region_csrs(
 
 def default_scale() -> float:
     return PACKED_HEAD_DIM ** -0.5
+
+
+# ---------------------------------------------------------------------------
+# GLM-5 / DeepSeek-V3.2 helpers (flat 576 fp8 cache, per-tensor scale)
+# ---------------------------------------------------------------------------
+def pack_glm_fp8_cache(
+    kv: torch.Tensor,
+    block_size: int,
+    *,
+    kv_scale: float = 1.0,
+) -> torch.Tensor:
+    """Pack [num_tokens, 576] bf16 "true" KV into a flat fnuz fp8 cache.
+
+    Stores ``f = round_fnuz(kv / kv_scale)`` so the kernel's effective value
+    ``kv_scale * f`` reproduces ``kv`` (modulo fp8 rounding).  Returns an
+    e4m3fnuz tensor ``[num_blocks, block_size, 576]`` (gfx942 native fp8).
+    """
+    assert kv.shape[-1] == GLM_HEAD_DIM
+    num_tokens = kv.shape[0]
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    cache = torch.zeros((num_blocks, block_size, GLM_HEAD_DIM), dtype=_FNUZ, device=kv.device)
+    f = (kv.to(torch.float32) / float(kv_scale)).to(_FNUZ)
+    cache.view(num_blocks * block_size, GLM_HEAD_DIM)[:num_tokens] = f
+    return cache
+
+
+def gen_kv_glm(num_tokens: int, seed: int, device: str = "cuda", scale: float = 0.125) -> torch.Tensor:
+    g = torch.Generator(device=device).manual_seed(seed)
+    return torch.randn(num_tokens, GLM_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * scale
+
+
+def gen_q_glm(sq: int, h: int, seed: int, device: str = "cuda", scale: float = 0.125) -> torch.Tensor:
+    g = torch.Generator(device=device).manual_seed(seed)
+    return torch.randn(sq, h, GLM_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * scale
+
+
+def default_scale_glm() -> float:
+    return GLM_HEAD_DIM ** -0.5
+
+
+def _glm_cache_as_fp8(cache: torch.Tensor) -> torch.Tensor:
+    if cache.dtype == _FNUZ:
+        return cache
+    if cache.dtype == torch.uint8:
+        return cache.view(_FNUZ)
+    raise TypeError(f"glm cache must be fnuz fp8 or uint8, got {cache.dtype}")
+
+
+def ref_prefill_glm(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    rows: list[list[int]],
+    scale: float,
+    block_size: int,
+    *,
+    q_scale: float = 1.0,
+    kv_scale: float = 1.0,
+    attn_sink: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """f32 oracle for the GLM flat fp8 cache, reproducing the kernel's fp8 rounding.
+
+    q: [sq, H, 576] bf16. ``rows[qi]`` = valid slot ids for query qi (caller
+    pre-filters invalid slots). Returns [sq, H, 512] bf16.
+    """
+    sq, H, D = q.shape
+    assert D == GLM_HEAD_DIM
+    q_eff = (q.to(torch.float32) / float(q_scale)).to(_FNUZ).to(torch.float32)
+    qk_scale = scale * float(q_scale) * float(kv_scale)
+    flat = _glm_cache_as_fp8(cache).reshape(-1, GLM_HEAD_DIM)
+    out = torch.zeros(sq, H, GLM_V_DIM, dtype=torch.float32, device=q.device)
+    for qi in range(sq):
+        if not rows[qi]:
+            continue
+        kv = torch.stack([flat[int(s)].to(torch.float32) for s in rows[qi]])  # fp8 dequant, no kv_scale
+        for h in range(H):
+            scores = torch.mv(kv, q_eff[qi, h]) * qk_scale
+            if attn_sink is not None:
+                scores_s = torch.cat([scores, attn_sink[h].float().reshape(1)])
+                probs = torch.softmax(scores_s, dim=0)[:-1]
+            else:
+                probs = torch.softmax(scores, dim=0)
+            out[qi, h] = torch.sum(probs[:, None] * kv[:, :GLM_V_DIM], dim=0) * float(kv_scale)
+    return out.to(torch.bfloat16)

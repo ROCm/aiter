@@ -573,6 +573,150 @@ def test_b2_multitile():
     assert cos_mean > 0.97, f"cosine too low: {cos_mean}"
 
 
+# ===========================================================================
+# GLM-5 / DeepSeek-V3.2 (ROCM_AITER_MLA_SPARSE): single-region flat fp8 cache,
+# head_dim=576 (512 latent + 64 rope, both fp8), per-tensor scale, no sink.
+# Oracle helpers live in sparse_mla_prefill_ref.py (shared with the bench).
+# ===========================================================================
+from op_tests.flydsl_tests.sparse_mla_prefill_ref import (  # noqa: E402
+    GLM_HEAD_DIM,
+    GLM_V_DIM,
+    default_scale_glm,
+    gen_kv_glm,
+    gen_q_glm,
+    pack_glm_fp8_cache,
+    ref_prefill_glm,
+)
+
+
+def test_glm576_paged_basic():
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    scale = default_scale_glm()
+    num_tokens = 600
+    kv = gen_kv_glm(num_tokens, seed=71)
+    cache = pack_glm_fp8_cache(kv, block_size)  # kv_scale=1.0
+    rows = [[5, 200, 7, 400, 63, 64, 599, 128], [0, 1, 2, 3], [300, 301, 302, 303, 304]]
+    sq = len(rows)
+    q = gen_q_glm(sq, H, seed=72)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, H, GLM_V_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill(
+        q, cache, indices, indptr, out,
+        block_table=block_table, block_size=block_size, packed=True,
+        scale_mode="per_tensor",
+    )
+    ref = ref_prefill_glm(q, cache, rows, scale, block_size)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[glm576_basic] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert out.shape[-1] == GLM_V_DIM
+    assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
+
+
+def test_glm576_per_tensor_scale():
+    """Non-trivial per-tensor kv_scale (!= 1) folded into QK scale + output."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    device = "cuda"
+    block_size = 32
+    H = 128
+    scale = default_scale_glm()
+    kv_scale = 2.0
+    num_tokens = 300
+    # Larger true values; packer stores kv/kv_scale to keep fp8 in range.
+    kv = gen_kv_glm(num_tokens, seed=81, scale=0.25)
+    cache = pack_glm_fp8_cache(kv, block_size, kv_scale=kv_scale)
+    rows = [[5, 200, 7, 64, 63, 31, 32, 33], [10, 11, 12, 13, 14, 15, 16]]
+    sq = len(rows)
+    q = gen_q_glm(sq, H, seed=82, scale=0.25)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, H, GLM_V_DIM, dtype=torch.bfloat16, device=device)
+    kv_scale_t = torch.tensor([kv_scale], dtype=torch.float32, device=device)
+    flydsl_sparse_mla_prefill(
+        q, cache, indices, indptr, out,
+        block_table=block_table, block_size=block_size, packed=True,
+        scale_mode="per_tensor", kv_scale=kv_scale_t,
+    )
+    ref = ref_prefill_glm(q, cache, rows, scale, block_size, kv_scale=kv_scale)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[glm576_pertensor] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
+
+
+def test_glm576_q_scale():
+    """Non-trivial per-tensor q_scale applied during bf16->fp8 Q quant."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    device = "cuda"
+    block_size = 32
+    H = 128
+    scale = default_scale_glm()
+    q_scale = 1.5
+    num_tokens = 256
+    kv = gen_kv_glm(num_tokens, seed=91, scale=0.2)
+    cache = pack_glm_fp8_cache(kv, block_size)
+    rows = [[5, 20, 40, 60, 80], [1, 2, 3, 4, 5, 6]]
+    sq = len(rows)
+    q = gen_q_glm(sq, H, seed=92, scale=0.2)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, H, GLM_V_DIM, dtype=torch.bfloat16, device=device)
+    q_scale_t = torch.tensor([q_scale], dtype=torch.float32, device=device)
+    flydsl_sparse_mla_prefill(
+        q, cache, indices, indptr, out,
+        block_table=block_table, block_size=block_size, packed=True,
+        scale_mode="per_tensor", q_scale=q_scale_t,
+    )
+    ref = ref_prefill_glm(q, cache, rows, scale, block_size, q_scale=q_scale)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[glm576_qscale] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
+
+
+def test_glm576_edge_empty_invalid():
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    scale = default_scale_glm()
+    num_tokens = 200
+    kv = gen_kv_glm(num_tokens, seed=91)
+    cache = pack_glm_fp8_cache(kv, block_size)
+    # q0 normal, q1 empty, q2 all-invalid, q3 mixed valid/invalid (>= num_tokens)
+    rows_full = [[5, 7, 9, 64, 65], [], [-1, -1, -1], [10, -1, 11, 199, 5000]]
+    sq = len(rows_full)
+    q = gen_q_glm(sq, H, seed=92)
+    indices, indptr = _ragged_from_rows(rows_full, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.full((sq, H, GLM_V_DIM), 7.0, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill(
+        q, cache, indices, indptr, out,
+        block_table=block_table, block_size=block_size, packed=True,
+        scale_mode="per_tensor",
+    )
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert out[1].abs().max().item() == 0.0, "empty query must be zero"
+    assert out[2].abs().max().item() == 0.0, "all-invalid query must be zero"
+    rows_valid = [[s for s in r if 0 <= s < num_tokens] for r in rows_full]
+    ref = ref_prefill_glm(q, cache, rows_valid, scale, block_size)
+    cos_mean, cos_min, max_abs = _metrics(out[[0, 3]], ref[[0, 3]])
+    print(f"[glm576_edge] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
+
+
 def _main():
     if not _HAS_FLYDSL:
         print("[SKIP] flydsl not importable")
@@ -592,6 +736,11 @@ def _main():
     # Phase B2
     test_b2_two_region()
     test_b2_multitile()
+    # GLM-5 / DSv3.2 (single-region, head_dim=576, per-tensor scale)
+    test_glm576_paged_basic()
+    test_glm576_per_tensor_scale()
+    test_glm576_q_scale()
+    test_glm576_edge_empty_invalid()
     print("ALL TESTS PASSED")
     return 0
 

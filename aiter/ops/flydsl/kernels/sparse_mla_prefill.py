@@ -860,14 +860,28 @@ def compile_sparse_mla_prefill_paged(
     waves_per_eu: int = 2,
     softmax_scale: float | None = None,
     single_request: bool = True,
+    head_dim: int = 512,
+    v_dim: int = 512,
+    cache_layout: str = "fp8_ds_mla",
+    scale_mode: str = "none",
 ):
-    """Build a paged fp8_ds_mla sparse MLA prefill launcher (gfx942).
+    """Build a paged sparse MLA prefill launcher (gfx942).
 
-    num_regions: 1 (B1 SWA-only) or 2 (B2 compressed + SWA).
+    num_regions: 1 (B1 SWA-only / GLM) or 2 (B2 compressed + SWA).
     has_sink:    fold a per-head virtual key into the softmax denominator.
     r0_convert:  region0 uses the register-staged convert load (needed when
                  UE8M0 != 1 or region0 is OCP); else the fast DMA path.
     r0_is_ocp / r1_is_ocp: per-region NoPE fp8 convention (fnuz vs OCP).
+    head_dim:    512 (DSv4: 448 nope + 64 rope) or 576 (GLM/DSv3.2:
+                 512 latent + 64 rope).  v_dim is always 512.
+    cache_layout:
+       "fp8_ds_mla" -- DSv4 584-byte packed rows (448 fp8 nope + 128 B bf16
+                       rope + 8 B UE8M0 scale region).
+       "glm_flat576" -- GLM/DSv3.2 flat fp8 rows (``head_dim`` fp8 bytes per
+                       token, latent+rope both fp8, per-tensor scale, no scale
+                       region).  Single region only.
+    scale_mode:  ``per_tensor`` enables runtime ``q_scale`` / ``kv_scale`` f32
+                 launch args (GLM).  DSv4 UE8M0 scales stay in the cache bytes.
     """
     NREG = int(num_regions)
     HAS_SINK = bool(has_sink)
@@ -875,7 +889,37 @@ def compile_sparse_mla_prefill_paged(
     R0_OCP = bool(r0_is_ocp)
     R1_OCP = bool(r1_is_ocp)
     SINGLE_REQUEST = bool(single_request)
-    SOFTMAX_SCALE = fx.Float32(QK_HEAD_DIM ** -0.5 if softmax_scale is None else float(softmax_scale))
+
+    # ---- head-dim-dependent constants (shadow the module 512 defaults) ----
+    GLM_FLAT = cache_layout == "glm_flat576"
+    USE_PT_SCALE = scale_mode == "per_tensor"
+    if cache_layout not in ("fp8_ds_mla", "glm_flat576"):
+        raise NotImplementedError(f"unknown cache_layout {cache_layout!r}")
+    if GLM_FLAT and NREG != 1:
+        raise NotImplementedError("glm_flat576 is single-region only")
+    if GLM_FLAT and not USE_PT_SCALE:
+        raise NotImplementedError("glm_flat576 requires scale_mode='per_tensor'")
+    QK_HEAD_DIM = int(head_dim)
+    V_HEAD_DIM = int(v_dim)
+    if V_HEAD_DIM != 512:
+        raise NotImplementedError(f"v_dim must be 512, got {V_HEAD_DIM}")
+    if QK_HEAD_DIM % KV_NUM_COLS != 0 or QK_HEAD_DIM % Q_ELEM_PER_ROW != 0:
+        raise NotImplementedError(f"head_dim must be a multiple of 64, got {QK_HEAD_DIM}")
+    KV_NUM_BLOCKS = QK_HEAD_DIM // KV_NUM_COLS  # 8 (512) or 9 (576)
+    SZ_LDS_KV = KV_BLOCK_BYTES * KV_NUM_BLOCKS
+    P_LDS_KV_0 = P_LDS_Q + SZ_LDS_Q
+    TOTAL_LDS_BYTES = P_LDS_KV_0 + SZ_LDS_KV
+    assert TOTAL_LDS_BYTES <= 65536, f"gfx942 LDS cap: need {TOTAL_LDS_BYTES} B"
+    Q_NUM_PASSES = QK_HEAD_DIM // Q_ELEM_PER_ROW
+    NUM_NOPE_ITERS = QK_HEAD_DIM // (MFMA_K * 2)
+    # Flat (GLM) rows have no scale region and store rope as fp8, so the row
+    # stride equals head_dim bytes; DSv4 packed rows are 584 B with a 576 B
+    # data sub-region.
+    PK_TOKEN_BYTES = QK_HEAD_DIM if GLM_FLAT else 576
+    PK_CACHE_ROW = QK_HEAD_DIM if GLM_FLAT else 584
+
+    base_scale = (QK_HEAD_DIM ** -0.5) if softmax_scale is None else float(softmax_scale)
+    SOFTMAX_SCALE = fx.Float32(base_scale)
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def kn_sparse_mla_prefill_paged(
@@ -891,6 +935,8 @@ def compile_sparse_mla_prefill_paged(
         q_req: fx.Tensor,            # i32 [nq] query -> request id (ignored if SINGLE_REQUEST)
         sink_buf: fx.Tensor,         # f32 [128] (ignored if not HAS_SINK)
         final_output: fx.Tensor,     # [nq*128, 512] bf16
+        q_scale_buf: fx.Tensor,      # f32 [1] (ignored unless USE_PT_SCALE)
+        kv_scale_buf: fx.Tensor,     # f32 [1] (ignored unless USE_PT_SCALE)
         softmax_scale: fx.Float32,
         main_num_rows: fx.Int32,
         extra_num_rows: fx.Int32,
@@ -962,6 +1008,26 @@ def compile_sparse_mla_prefill_paged(
             q_req_rsrc = buffer_ops.create_buffer_resource(q_req)
         if const_expr(HAS_SINK):
             sink_rsrc = buffer_ops.create_buffer_resource(sink_buf)
+        if const_expr(USE_PT_SCALE):
+            q_scale_rsrc = buffer_ops.create_buffer_resource(q_scale_buf)
+            kv_scale_rsrc = buffer_ops.create_buffer_resource(kv_scale_buf)
+            q_sc = _f32(
+                rocdl.readfirstlane(
+                    T.f32,
+                    buffer_ops.buffer_load(q_scale_rsrc, c_zero_i32, vec_width=1, dtype=T.f32),
+                )
+            )
+            kv_sc = _f32(
+                rocdl.readfirstlane(
+                    T.f32,
+                    buffer_ops.buffer_load(kv_scale_rsrc, c_zero_i32, vec_width=1, dtype=T.f32),
+                )
+            )
+            q_sc = _fmax(q_sc, fx.Float32(1e-30))
+            q_sc_inv = _f32(rocdl.rcp(T.f32, _raw(q_sc)))
+            qk_softmax_scale = _fmul(_fmul(softmax_scale, q_sc), kv_sc)
+        else:
+            qk_softmax_scale = softmax_scale
 
         q_idx = gpu.block_idx.x
         tid = gpu.thread_id("x")
@@ -1077,6 +1143,23 @@ def compile_sparse_mla_prefill_paged(
                 w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(bf[2]), _raw(bf[3]), w, 1)
                 _ptr_store(w, _lds_ptr_from_i32(dst_addr), alignment=4)
 
+        # ---- GLM flat fp8 load: whole row is fp8 (latent+rope), row stride =
+        # head_dim bytes; DMA all KV_NUM_BLOCKS 64-col blocks straight to LDS.
+        # The per-tensor scale is folded in the softmax/output, not here.
+        def _load_flat_dma(cache_rsrc, p_lds_kv_warp, token_base_i32):
+            for blk in range_constexpr(KV_NUM_BLOCKS):
+                lds_adjust = blk * KV_BLOCK_BYTES - blk * KV_NUM_COLS
+                lds_base_i32 = _i32(ArithValue(p_lds_kv_warp) + lds_adjust)
+                is_oob = ArithValue(token_base_i32) == -1
+                if is_oob:
+                    lds_addr = _i32(ArithValue(lds_base_i32) + blk * KV_NUM_COLS + _i32(lane_idx) * 4)
+                    _ptr_store(c_zero_i32, _lds_ptr_from_i32(lds_addr), alignment=4)
+                else:
+                    voff = _i32(ArithValue(token_base_i32) + kv_ld_col_base)
+                    rocdl.buffer_load_to_lds(
+                        cache_rsrc, _lds_ptr_from_i32(lds_base_i32), voff, offset=blk * KV_NUM_COLS
+                    )
+
         # ---- K/V LDS readers (identical to Phase A KvManagerV2 layout) ----
         k_row_in_mfma = lane_idx % MFMA_M
         k_row_phy = (k_row_in_mfma / 2) * 4 + k_row_in_mfma % 2
@@ -1188,7 +1271,12 @@ def compile_sparse_mla_prefill_paged(
 
         def _bf16x4dw_to_fp8x2dw(i32x4_bf16):
             f = Vec(Vec(i32x4_bf16).bitcast(fx.BFloat16)).to(fx.Float32)
-            fr = [_raw(f[j]) for j in range(8)]
+            fr = []
+            for j in range_constexpr(8):
+                if const_expr(USE_PT_SCALE):
+                    fr.append(_fmul(_f32(f[j]), q_sc_inv))
+                else:
+                    fr.append(_raw(f[j]))
             w0 = rocdl.cvt_pk_fp8_f32(T.i32, fr[0], fr[1], c_zero_i32, 0)
             w0 = rocdl.cvt_pk_fp8_f32(T.i32, fr[2], fr[3], w0, 1)
             w1 = rocdl.cvt_pk_fp8_f32(T.i32, fr[4], fr[5], c_zero_i32, 0)
@@ -1234,7 +1322,7 @@ def compile_sparse_mla_prefill_paged(
         def _softmax_scale_p(idx_rsrc, num_rows_i32, p_vals, col_0_start, kv_end_i32):
             result = [None] * P_VALS_PER_THR
             for i in range_constexpr(P_VALS_PER_THR):
-                result[i] = _f32(p_vals[i]) * softmax_scale
+                result[i] = _f32(p_vals[i]) * qk_softmax_scale
             kv_end = _idx(kv_end_i32)
             skv = ArithValue(num_rows_i32)
             for i in range_constexpr(P_VALS_PER_THR):
@@ -1416,6 +1504,8 @@ def compile_sparse_mla_prefill_paged(
             denom = _fmax(l_fin, fx.Float32(1e-30))
             reci = rocdl.rcp(T.f32, _raw(denom))
             scl = _fmul(alpha, reci) if const_expr(HAS_SINK) else _f32(reci)
+            if const_expr(USE_PT_SCALE):
+                scl = _fmul(scl, kv_sc)
             scl_vec = _raw(Vec.filled(4, _f32(scl), fx.Float32))
             _barrier(lgkmcnt=0)
             for pv in range_constexpr(NUM_PV_ITERS):
@@ -1459,14 +1549,17 @@ def compile_sparse_mla_prefill_paged(
                 main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
                 kv_tile_start_i32, main_end,
             )
-            if const_expr(R0_CONVERT):
-                _load_nope_convert(
-                    main_cache_rsrc, p_lds_kv_0_warp, tb, sb,
-                    fx.Float32(1.0) if R0_OCP else fx.Float32(0.0),
-                )
+            if const_expr(GLM_FLAT):
+                _load_flat_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
             else:
-                _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
-            _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
+                if const_expr(R0_CONVERT):
+                    _load_nope_convert(
+                        main_cache_rsrc, p_lds_kv_0_warp, tb, sb,
+                        fx.Float32(1.0) if R0_OCP else fx.Float32(0.0),
+                    )
+                else:
+                    _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
+                _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
             rm_n, rse_n, p_pack, rescale = _process_tile_gemm1(
@@ -1621,6 +1714,8 @@ def compile_sparse_mla_prefill_paged(
         q_req: fx.Tensor,
         sink_buf: fx.Tensor,
         final_output: fx.Tensor,
+        q_scale: fx.Tensor,
+        kv_scale: fx.Tensor,
         num_queries: fx.Int32,
         main_num_rows: fx.Int32,
         extra_num_rows: fx.Int32,
@@ -1634,7 +1729,7 @@ def compile_sparse_mla_prefill_paged(
         kn_sparse_mla_prefill_paged(
             query, main_cache, main_indices, main_indptr, main_block_table,
             extra_cache, extra_indices, extra_indptr, extra_block_table,
-            q_req, sink_buf, final_output, SOFTMAX_SCALE,
+            q_req, sink_buf, final_output, q_scale, kv_scale, SOFTMAX_SCALE,
             main_num_rows, extra_num_rows, main_block_size, extra_block_size,
             main_max_blocks, extra_max_blocks,
         ).launch(grid=(grid_x, 1, 1), block=(NUM_THREADS, 1, 1), smem=0, stream=stream)
@@ -1665,23 +1760,33 @@ def compile_sparse_mla_prefill(
     scale_mode: str = "none",
     softmax_scale: float | None = None,
     single_request: bool = True,
+    cache_layout: str = "fp8_ds_mla",
 ):
     """Return the compiled launcher for the sparse MLA prefill kernel.
 
-    ``packed=False`` (default) returns the Phase A flat-cache launcher. With
-    ``packed=True`` it returns the Phase B paged fp8_ds_mla launcher
-    (single/two region, optional sink, UE8M0/OCP via the convert load path).
+    ``packed=False`` (default) returns the Phase A flat-cache launcher (512
+    only). With ``packed=True`` it returns the paged launcher:
+
+      - DSv4 (``head_dim=512``, ``cache_layout='fp8_ds_mla'``): single/two
+        region, optional sink, UE8M0/OCP via the convert load path.
+      - GLM/DSv3.2 (``head_dim=576``, ``cache_layout='glm_flat576'``):
+        single-region flat fp8 cache, ``scale_mode='per_tensor'`` (runtime
+        ``q_scale`` / ``kv_scale`` f32 [1] launch args), no sink.
     """
     if num_q_heads != NUM_QO_HEADS:
         raise NotImplementedError(f"requires num_q_heads={NUM_QO_HEADS}, got {num_q_heads}")
-    if head_dim != QK_HEAD_DIM or v_dim != V_HEAD_DIM:
-        raise NotImplementedError(f"requires head_dim={QK_HEAD_DIM}, v_dim={V_HEAD_DIM}")
+    if v_dim != V_HEAD_DIM:
+        raise NotImplementedError(f"requires v_dim={V_HEAD_DIM}, got {v_dim}")
+    if head_dim not in (512, 576):
+        raise NotImplementedError(f"requires head_dim in (512, 576), got {head_dim}")
     if block_n != BLOCK_N:
         raise NotImplementedError(f"block_n must be {BLOCK_N}")
     if split_kv:
         raise NotImplementedError("split_kv is Phase C")
 
     if not packed:
+        if head_dim != QK_HEAD_DIM:
+            raise NotImplementedError("flat (Phase A) path supports head_dim=512 only; use packed=True")
         if num_regions != 1 or has_sink or qk_split:
             raise NotImplementedError("Phase A flat path: num_regions=1, has_sink=False, qk_split=False")
         if region0_dtype != "fp8":
@@ -1707,7 +1812,15 @@ def compile_sparse_mla_prefill(
 
     if num_regions not in (1, 2):
         raise NotImplementedError("packed path supports num_regions in {1, 2}")
-    # region0 (SWA) is fnuz; UE8M0 != 1 forces the convert load path.
+    if cache_layout == "glm_flat576":
+        if head_dim != 576 or num_regions != 1 or has_sink:
+            raise NotImplementedError("glm_flat576: head_dim=576, single-region, no sink")
+        if scale_mode != "per_tensor":
+            raise NotImplementedError("glm_flat576 requires scale_mode='per_tensor'")
+    elif head_dim != 512:
+        raise NotImplementedError("fp8_ds_mla cache_layout requires head_dim=512")
+    # region0 (SWA) is fnuz; UE8M0 != 1 forces the convert load path. GLM flat
+    # rows are read straight to LDS (no per-block convert).
     r0_convert = (scale_mode == "ue8m0") or (not region0_is_fnuz)
     return compile_sparse_mla_prefill_paged(
         num_regions=num_regions,
@@ -1718,4 +1831,8 @@ def compile_sparse_mla_prefill(
         waves_per_eu=waves_per_eu,
         softmax_scale=softmax_scale,
         single_request=single_request,
+        head_dim=head_dim,
+        v_dim=v_dim,
+        cache_layout=cache_layout,
+        scale_mode=scale_mode,
     )

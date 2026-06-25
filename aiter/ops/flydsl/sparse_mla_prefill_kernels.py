@@ -25,8 +25,12 @@ from .kernels.tensor_shim import _run_compiled
 __all__ = ["flydsl_sparse_mla_prefill", "flydsl_sparse_mla_prefill_2region"]
 
 NUM_HEADS = 128
-HEAD_DIM = 512
+HEAD_DIM = 512  # DSv4 (448 nope + 64 rope)
+GLM_HEAD_DIM = 576  # GLM/DSv3.2 (512 latent + 64 rope)
+V_DIM = 512
+SUPPORTED_HEAD_DIMS = (HEAD_DIM, GLM_HEAD_DIM)
 DEFAULT_SOFTMAX_SCALE = HEAD_DIM**-0.5
+GLM_CACHE_ROW = GLM_HEAD_DIM  # flat fp8 row stride (bytes) for glm_flat576
 
 # Launch stubs for kernel parameters that stay in the ABI but are unused when
 # ``single_request=True`` or ``has_sink=False`` at compile time.  Created once.
@@ -44,6 +48,13 @@ def _stub_sink(device: torch.device) -> torch.Tensor:
     key = ("sink", str(device))
     if key not in _STUB:
         _STUB[key] = torch.zeros(NUM_HEADS, dtype=torch.float32, device=device)
+    return _STUB[key]
+
+
+def _stub_f32_one(device: torch.device) -> torch.Tensor:
+    key = ("f32_one", str(device))
+    if key not in _STUB:
+        _STUB[key] = torch.ones(1, dtype=torch.float32, device=device)
     return _STUB[key]
 
 
@@ -65,6 +76,7 @@ def _get_kernel(
     scale_mode: str,
     softmax_scale: float,
     single_request: bool,
+    cache_layout: str,
 ):
     return compile_sparse_mla_prefill(
         head_dim=head_dim,
@@ -83,6 +95,7 @@ def _get_kernel(
         scale_mode=scale_mode,
         softmax_scale=softmax_scale,
         single_request=single_request,
+        cache_layout=cache_layout,
     )
 
 
@@ -154,9 +167,9 @@ def _validate_qout(q: torch.Tensor, out: torch.Tensor) -> tuple[int, int, int, i
     out_sq, out_h, v_dim = out.shape
     if (out_sq, out_h) != (num_queries, num_heads):
         raise ValueError("q and out must share (num_queries, num_heads)")
-    if num_heads != NUM_HEADS or head_dim != HEAD_DIM or v_dim != HEAD_DIM:
+    if num_heads != NUM_HEADS or head_dim not in SUPPORTED_HEAD_DIMS or v_dim != V_DIM:
         raise NotImplementedError(
-            f"requires H={NUM_HEADS}, head_dim={HEAD_DIM}, v_dim={HEAD_DIM}; "
+            f"requires H={NUM_HEADS}, head_dim in {SUPPORTED_HEAD_DIMS}, v_dim={V_DIM}; "
             f"got H={num_heads}, head_dim={head_dim}, v_dim={v_dim}"
         )
     return num_queries, num_heads, head_dim, v_dim
@@ -170,6 +183,28 @@ def _packed_cache_u8(cache: torch.Tensor, block_size: int) -> tuple[torch.Tensor
         raise ValueError(f"cache block_size {blk} != block_size arg {block_size}")
     if not cache.is_contiguous():
         raise ValueError("packed cache must be contiguous")
+    num_rows = num_blocks * block_size
+    cache_u8 = cache.view(torch.uint8).reshape(-1)
+    return cache_u8, num_rows, num_blocks
+
+
+def _glm_cache_u8(cache: torch.Tensor, block_size: int) -> tuple[torch.Tensor, int, int]:
+    """GLM/DSv3.2 flat fp8 cache [num_blocks, block_size, 576] (fp8 or uint8).
+
+    The whole row is fp8 (512 latent + 64 rope); the per-tensor scale lives
+    outside the cache and is folded into the kernel scale.
+    """
+    if cache.dim() != 3 or cache.shape[-1] != GLM_CACHE_ROW:
+        raise ValueError(
+            f"glm cache must be [num_blocks, block_size, {GLM_CACHE_ROW}], got {tuple(cache.shape)}"
+        )
+    num_blocks, blk, _ = cache.shape
+    if blk != block_size:
+        raise ValueError(f"cache block_size {blk} != block_size arg {block_size}")
+    if not cache.is_contiguous():
+        raise ValueError("glm cache must be contiguous")
+    if cache.element_size() != 1:
+        raise ValueError("glm cache must be a 1-byte dtype (fp8 or uint8)")
     num_rows = num_blocks * block_size
     cache_u8 = cache.view(torch.uint8).reshape(-1)
     return cache_u8, num_rows, num_blocks
@@ -202,6 +237,20 @@ def _resolve_sink(
     return _require_f32_1d(attn_sink, "attn_sink", numel=NUM_HEADS)
 
 
+def _resolve_f32_scalar(
+    scale: torch.Tensor | float | None,
+    name: str,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a contiguous f32 [1] tensor (vLLM ``layer._q_scale`` / ``_k_scale``)."""
+    if scale is None:
+        return _stub_f32_one(device)
+    if isinstance(scale, float):
+        return torch.tensor([scale], dtype=torch.float32, device=device)
+    return _require_f32_1d(scale, name, numel=1)
+
+
 def flydsl_sparse_mla_prefill(
     q: torch.Tensor,  # [num_queries, 128, 512] bf16 contiguous
     kv: torch.Tensor,  # flat fp8 [num_kv_rows, 1, 512] (Phase A) OR packed cache (packed=True)
@@ -213,7 +262,9 @@ def flydsl_sparse_mla_prefill(
     block_table: torch.Tensor | None = None,  # [num_reqs, max_blocks] int32 contiguous (packed)
     block_size: int = 1,
     packed: bool = False,
-    scale_mode: str = "none",  # "none" | "ue8m0"
+    scale_mode: str = "none",  # "none" | "ue8m0" (DSv4) | "per_tensor" (GLM)
+    q_scale: torch.Tensor | float | None = None,  # f32 [1], layer._q_scale
+    kv_scale: torch.Tensor | float | None = None,  # f32 [1], layer._k_scale
     q_req: torch.Tensor | None = None,  # [num_queries] int32 (only if single_request=False)
     num_kv_rows: int | None = None,
     single_request: bool = True,
@@ -221,8 +272,12 @@ def flydsl_sparse_mla_prefill(
 ) -> None:
     """Run sparse MLA prefill in-place into ``out``.
 
-    Softmax scale is fixed at compile time (``1/sqrt(512)``).  All tensor args
-    must already match kernel dtype/layout; this entry point validates only.
+    Supports DSv4 (``head_dim=512``) and GLM/DSv3.2 (``head_dim=576``, inferred
+    from ``q``).  GLM uses a flat fp8 cache ``[num_blocks, block_size, 576]``
+    with ``scale_mode='per_tensor'`` and runtime ``q_scale`` / ``kv_scale``
+    f32 [1] launch args (mirrors ``mla_decode_fwd``).  Softmax scale is
+    ``1/sqrt(head_dim)`` at compile time.  All tensor args must already match
+    kernel dtype/layout.
     """
     _require_cuda(q, kv, indices, indptr, out)
     _check_gfx942(q.device)
@@ -231,8 +286,12 @@ def flydsl_sparse_mla_prefill(
     indices_i32 = _require_int32_1d(indices, "indices")
     q_flat = _flat_bf16(q, "q")
     out_flat = _flat_bf16(out, "out")
+    is_glm = head_dim == GLM_HEAD_DIM
+    base_scale = head_dim ** -0.5
 
     if not packed:
+        if is_glm:
+            raise NotImplementedError("head_dim=576 (GLM) requires packed=True")
         if attn_sink is not None:
             raise NotImplementedError("attn_sink is the packed (B1) path; pass packed=True")
         if kv.dim() != 3 or kv.shape[1] != 1 or kv.shape[2] != head_dim:
@@ -246,6 +305,7 @@ def flydsl_sparse_mla_prefill(
             r0_dtype="fp8", r0_fnuz=True, r1_dtype="fp8", r1_fnuz=True,
             qk_split=False, block_n=32, block_h=16, split_kv=False, packed=False, scale_mode="none",
             softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=True,
+            cache_layout="fp8_ds_mla",
         )
         with torch.cuda.device(q.device.index):
             _run_compiled(
@@ -256,7 +316,18 @@ def flydsl_sparse_mla_prefill(
 
     if block_table is None:
         raise ValueError("packed=True requires block_table [num_reqs, max_blocks] int32")
-    cache_u8, default_rows, _ = _packed_cache_u8(kv, block_size)
+    if is_glm:
+        if attn_sink is not None:
+            raise NotImplementedError("GLM/DSv3.2 single-region path has no attn_sink")
+        if scale_mode not in ("per_tensor", "none"):
+            raise ValueError(f"GLM head_dim=576 requires scale_mode='per_tensor', got {scale_mode!r}")
+        cache_layout = "glm_flat576"
+        kernel_scale_mode = "per_tensor"
+        cache_u8, default_rows, _ = _glm_cache_u8(kv, block_size)
+    else:
+        cache_layout = "fp8_ds_mla"
+        kernel_scale_mode = scale_mode
+        cache_u8, default_rows, _ = _packed_cache_u8(kv, block_size)
     n_kv_rows = int(num_kv_rows) if num_kv_rows is not None else default_rows
     if block_table.dim() != 2:
         raise ValueError(f"block_table must be 2D [num_reqs, max_blocks], got {tuple(block_table.shape)}")
@@ -265,12 +336,16 @@ def flydsl_sparse_mla_prefill(
     has_sink = attn_sink is not None
     q_req_t = _resolve_q_req(q_req, num_queries=num_queries, single_request=single_request, device=q.device)
     sink_t = _resolve_sink(attn_sink, has_sink=has_sink, device=q.device)
+    q_sc_t = _resolve_f32_scalar(q_scale, "q_scale", device=q.device)
+    kv_sc_t = _resolve_f32_scalar(kv_scale, "kv_scale", device=q.device)
 
     exe = _get_kernel(
         head_dim=head_dim, v_dim=v_dim, num_regions=1, has_sink=has_sink,
         r0_dtype="fp8", r0_fnuz=True, r1_dtype="fp8", r1_fnuz=True,
-        qk_split=True, block_n=32, block_h=16, split_kv=False, packed=True, scale_mode=scale_mode,
-        softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=single_request,
+        qk_split=not is_glm, block_n=32, block_h=16, split_kv=False, packed=True,
+        scale_mode=kernel_scale_mode,
+        softmax_scale=base_scale, single_request=single_request,
+        cache_layout=cache_layout,
     )
     with torch.cuda.device(q.device.index):
         _run_compiled(
@@ -287,6 +362,8 @@ def flydsl_sparse_mla_prefill(
             q_req_t,
             sink_t,
             out_flat,
+            q_sc_t,
+            kv_sc_t,
             int(num_queries),
             int(n_kv_rows),
             int(n_kv_rows),
@@ -351,11 +428,16 @@ def flydsl_sparse_mla_prefill_2region(
     q_flat = _flat_bf16(q, "q")
     out_flat = _flat_bf16(out, "out")
 
+    if head_dim != HEAD_DIM:
+        raise NotImplementedError("two-region path is DSv4-only (head_dim=512); GLM is single-region")
+    q_sc_t = _stub_f32_one(q.device)
+    kv_sc_t = _stub_f32_one(q.device)
     exe = _get_kernel(
         head_dim=head_dim, v_dim=v_dim, num_regions=2, has_sink=has_sink,
         r0_dtype="fp8", r0_fnuz=main_is_fnuz, r1_dtype="fp8", r1_fnuz=extra_is_fnuz,
         qk_split=True, block_n=32, block_h=16, split_kv=False, packed=True, scale_mode="none",
         softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=single_request,
+        cache_layout="fp8_ds_mla",
     )
     with torch.cuda.device(q.device.index):
         _run_compiled(
@@ -372,6 +454,8 @@ def flydsl_sparse_mla_prefill_2region(
             q_req_t,
             sink_t,
             out_flat,
+            q_sc_t,
+            kv_sc_t,
             int(num_queries),
             int(m_rows),
             int(e_rows),
