@@ -337,6 +337,9 @@ def compile_gemm2_a4w4_port(
             arg_out_scale,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
+    if BM == 16:
+        launch_gemm2.compile_hints["llvm_options"] = {"enable-post-misched": False}
+
     return launch_gemm2
 
 
