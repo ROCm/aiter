@@ -9,6 +9,7 @@ JitFunction handles argument marshalling).
 """
 
 import functools
+import os
 
 import torch
 
@@ -30,7 +31,18 @@ _SUPPORTED = {
 def _get_compiled_mxfp4_gemm1_port(
     BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, interleave=True
 ):
-    from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
+    # Backend switch: AITER_MXFP4_GEMM1_V2=1 selects the layout-API v2 port for
+    # the Phase-1 variant ONLY -- (BM=32, use_nt=True, inline_quant=False) with
+    # interleave=True. Any other variant/mode (or the env unset) keeps the
+    # byte-exact raw v1 kernel. Non-invasive + default-off.
+    if (
+        os.environ.get("AITER_MXFP4_GEMM1_V2") == "1"
+        and (BM, use_nt, inline_quant) == (32, True, False)
+        and interleave
+    ):
+        from .kernels.mxfp4_gemm1_v2 import compile_gemm1_a4w4_port
+    else:
+        from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
     return compile_gemm1_a4w4_port(
         BM,
