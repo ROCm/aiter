@@ -337,7 +337,6 @@ def compile_gemm2_a4w4_port(
         if epilog != "nonatomic"
         else _aStages * _slot_bytes
     )
-    _aq_bytes = aq_bytes_for(MAX_M, _K)
     _num_n_blocks = num_n_blocks_for(N_OUT)
     _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(
         BM
@@ -371,6 +370,7 @@ def compile_gemm2_a4w4_port(
         arg_stids: fx.Int64,
         arg_sweights: fx.Int64,
         i32_M: fx.Int32,
+        i32_max_m_blocks: fx.Int32,
         arg_out: fx.Int64,
         arg_out_scale: fx.Int64,  # flat_out_scale (mxfp4 epilog only; dummy otherwise)
     ):
@@ -382,8 +382,11 @@ def compile_gemm2_a4w4_port(
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))  # wave == wave_n
 
+        _aq_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(
+            BM * _K_HALF
+        )
         aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _raw(fx.Int64(arg_aq)), num_records_bytes=fx.Index(_aq_bytes)
+            _raw(fx.Int64(arg_aq)), num_records_bytes=_aq_num
         )
         saq = SmemPtr(
             allocator.get_base(), lds_off, T.i8, shape=(_aStages * _slot_bytes,)
@@ -423,6 +426,7 @@ def compile_gemm2_a4w4_port(
                 arg_stids,
                 arg_sweights,
                 i32_M,
+                i32_max_m_blocks,
                 arg_out,
                 arg_out_scale,
                 tile_i32,
@@ -573,6 +577,7 @@ def compile_gemm2_a4w4_port(
             arg_stids,
             arg_sweights,
             i32_M,
+            i32_max_m_blocks,
             arg_out,
             arg_out_scale,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
@@ -591,6 +596,7 @@ def _gemm2_body(
     arg_stids,
     arg_sweights,
     i32_M,
+    i32_max_m_blocks,
     arg_out,
     arg_out_scale,
     bx_i32,
@@ -629,7 +635,8 @@ def _gemm2_body(
     _kUnroll = kunroll_for(_K)  # streaming main-loop trips (KIMI: 0)
     _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
     _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
-    _ascale_bytes = ascale_bytes(BM, MAX_M, _K)
+    _asc_chunk_div = 16 if const_expr(BM == 16) else 32
+    _asc_per_mb = (BM // _asc_chunk_div) * _kAS_per_chunk_dw * 4
     _bq_bytes = bq_bytes_for(NE, N_OUT, _K)
     _bscale_bytes = bscale_bytes_for(NE, N_OUT, _K)
     _kbs_per_expert_dw = kbs_per_expert_dw_for(N_OUT, _K)
@@ -648,8 +655,9 @@ def _gemm2_body(
 
     # -- buffer resources (exact num_bytes) ----------------------------------
     # (A_q resource + A->LDS loads are issued by the kernel before the branch.)
+    _asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(_asc_per_mb)
     ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_ascale)), num_records_bytes=fx.Index(_ascale_bytes)
+        _raw(fx.Int64(arg_ascale)), num_records_bytes=_asc_num
     )
     bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_bq)), num_records_bytes=fx.Index(_bq_bytes)
@@ -1104,17 +1112,20 @@ def _flat_mxfp4_epilog(
             a = arith.maxui(amax, s1)
             s2 = rocdl.update_dpp(T.i32, a, a, 0x4E, 0xF, 0xF, True)
             amax_dpp = arith.maxui(a, s2)
-            # encode e8m0: bexp = ((amax<<16)+0x200000>>23)&0xFF ; e8 = clamp(bexp-2,0,254)
+            # encode e8m0 RoundUp: e8 = ceil_pow2(amax/6)
             f32b = arith.shli(amax_dpp, _raw(fx.Int32(16)))
+            working_i = arith.bitcast(
+                T.i32, arith.mulf(arith.bitcast(T.f32, f32b), _raw(fx.Float32(1.0 / 6.0)))
+            )
             bexp = arith.andi(
                 arith.shrui(
-                    arith.addi(f32b, _raw(fx.Int32(0x200000))), _raw(fx.Int32(23))
+                    arith.addi(working_i, _raw(fx.Int32(0x7FFFFF))), _raw(fx.Int32(23))
                 ),
                 _raw(fx.Int32(0xFF)),
             )
             e8 = arith.minsi(
                 _raw(fx.Int32(254)),
-                arith.maxsi(_raw(fx.Int32(0)), arith.subi(bexp, _raw(fx.Int32(2)))),
+                arith.maxsi(_raw(fx.Int32(0)), bexp),
             )
             qscale = arith.bitcast(T.f32, arith.shli(e8, _raw(fx.Int32(23))))
             packed = _raw(fx.Int32(0))

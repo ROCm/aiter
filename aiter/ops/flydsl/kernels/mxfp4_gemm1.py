@@ -234,17 +234,18 @@ def _fabs_f32(x):
     return fx.Float32(abs_bits.bitcast(T.f32))
 
 
+def _e8m0_roundup(amax_f32):
+    """RoundUp e8m0 = ceil_pow2(amax / 6), clamped to 254."""
+    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(T.i32))
+    bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
+    lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(bexp), _raw(fx.Int32(254)))
+    return fx.Int32(arith.select(lt, _raw(bexp), _raw(fx.Int32(254))))
+
+
 def _e8m0_from_amax(amax_f32):
-    """epilog 103-106: quant_scale = uint_as_float(amax_i32 + 0x200000) * 0.25;
-    sb_raw = float_as_uint(quant_scale) >> 23; e8m0 = min(sb_raw, 254u).
-    Returns (e8m0_i32, quant_scale_f32)."""
-    amax_i = _raw(amax_f32).bitcast(T.i32)
-    qscale_bits = amax_i + _raw(fx.Int32(0x200000))
-    qscale = fx.Float32(qscale_bits.bitcast(T.f32)) * fx.Float32(0.25)
-    sb_raw = fx.Int32(_raw(qscale).bitcast(T.i32)).shrui(fx.Int32(23))  # logical >>23
-    # unsigned min(sb_raw, 254): sb_raw is a small non-negative exponent.
-    is_lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(sb_raw), _raw(fx.Int32(254)))
-    e8m0 = fx.Int32(arith.select(is_lt, _raw(sb_raw), _raw(fx.Int32(254))))
+    """Returns (e8m0_i32, quant_scale_f32)."""
+    e8m0 = _e8m0_roundup(amax_f32)
+    qscale = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
     return e8m0, qscale
 
 
@@ -283,23 +284,13 @@ def _umax_i32(a, b):
 
 
 def _inline_e8m0(amax_u16_i32):
-    """inline_quant_encode_e8m0 (mxfp4_gemm_common.hpp:76-79). DISTINCT from the
-    epilog's _e8m0_from_amax: the ``-2``/clamp variant matching moe_sort_quant.
-      f32bits = amax_u16 << 16
-      bexp    = ((f32bits + 0x200000) >> 23) & 0xFF
-      e8m0    = min(254, max(0, bexp - 2))
-    Returns e8m0 as i32 (0..254)."""
-    f32bits = (fx.Int32(_raw(amax_u16_i32)) & fx.Int32(0xFFFF)) << fx.Int32(
-        16
-    )  # u16 << 16
-    bexp = (f32bits + fx.Int32(0x200000)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
-    # max(0, bexp - 2)
-    bm2 = bexp - fx.Int32(2)
-    ge0 = arith.cmpi(arith.CmpIPredicate.sgt, _raw(bm2), _raw(fx.Int32(0)))
-    bm2 = fx.Int32(arith.select(ge0, _raw(bm2), _raw(fx.Int32(0))))
-    # min(254, .)
-    lt = arith.cmpi(arith.CmpIPredicate.slt, _raw(bm2), _raw(fx.Int32(254)))
-    return fx.Int32(arith.select(lt, _raw(bm2), _raw(fx.Int32(254))))
+    """RoundUp e8m0 from a packed u16 (bf16) amax. Returns e8m0 as i32 (0..254)."""
+    f32 = fx.Float32(
+        _raw((fx.Int32(_raw(amax_u16_i32)) & fx.Int32(0xFFFF)) << fx.Int32(16)).bitcast(
+            T.f32
+        )
+    )
+    return _e8m0_roundup(f32)
 
 
 def gemm1_grid(n_tokens, BM=32, NE=NE, TOPK=TOPK, INTER=INTER):
@@ -335,6 +326,7 @@ def _gemm1_body(
     wave,
     use_nt,
     i32_ntok,
+    i32_total_m_blocks,
     *,
     BM,
     kAStages,
@@ -389,8 +381,12 @@ def _gemm1_body(
     aq_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_aq)), num_records_bytes=aq_num_records
     )
+    _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
+    ascale_num = arith.index_cast(T.index, _raw(i32_total_m_blocks)) * fx.Index(
+        _asc_per_mb
+    )
     ascale_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        _raw(fx.Int64(arg_ascale)), num_records_bytes=ASCALE_BYTES
+        _raw(fx.Int64(arg_ascale)), num_records_bytes=ascale_num
     )
     bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_bq)), num_records_bytes=BQ_BYTES
@@ -1178,6 +1174,7 @@ def compile_gemm1_a4w4_port(
                 wave,
                 use_nt,
                 i32_ntok,
+                total_m_blocks,
                 BM=BM,
                 kAStages=kAStages,
                 kSubBlocks=kSubBlocks,
