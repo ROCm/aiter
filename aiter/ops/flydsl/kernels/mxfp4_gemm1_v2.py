@@ -166,13 +166,6 @@ def _gemm1_body_v2(
     bscale_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_bscale)), num_records_bytes=BSCALE_BYTES
     )
-    # Uniform B buffer resource for the NON-TEMPORAL path only (see issue_b_load_j):
-    # the layout-API BufferCopy atom cannot carry the nt aux hint, so small-M
-    # (decode) uses a raw buffer_load(cache_modifier=2) over this resource instead.
-    if const_expr(b_nontemporal):
-        bq_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _raw(fx.Int64(arg_bq)), num_records_bytes=BQ_BYTES
-        )
 
     # ============================================================
     # B-weight load -- LAYOUT API (the non-negotiable core conversion).
@@ -392,8 +385,17 @@ def _gemm1_body_v2(
     # We build one buffer-tensor VIEW per jtile carrying those axes, and load each
     # 16-byte fragment with a layout-API fx.copy (BufferCopy128b) into a register
     # fragment; the fragment's vec4 feeds the raw mfma cluster.
+    #
+    # cache_modifier carries the B-load policy THROUGH the layout API:
+    #   use_nt=True  -> cache_modifier=2 (nt, non-temporal -> decode)
+    #   use_nt=False -> cache_modifier=0 (cached            -> prefill)
+    # Both paths are now layout-API fx.copy; the nt aux hint rides on the copy atom
+    # type (FlyDSL BufferCopy128b(cache_modifier=...)), no raw buffer_load fallback.
     KH4 = K_HALF // 4  # i32 stride for the col axis
-    _b_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)  # 4x i32 = 128b
+    _b_cache_mod = 2 if b_nontemporal else 0
+    _b_copy_atom = fx.make_copy_atom(
+        fx.rocdl.BufferCopy128b(_b_cache_mod), 32
+    )  # 4x i32 = 128b
 
     def _make_bq_view_for_jtile(j):
         # The buffer-descriptor base MUST be UNIFORM across the wave -- otherwise
@@ -437,48 +439,26 @@ def _gemm1_body_v2(
         )
         return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
-    # The layout-API views/fragments are only used by the cached (non-nt) path.
-    if const_expr(not b_nontemporal):
-        # Build the preshuffle VIEWS once, hoisted out of the K-loop.
-        _bq_views = [_make_bq_view_for_jtile(j) for j in range_constexpr(4)]
+    # Build the preshuffle VIEWS once, hoisted out of the K-loop (both nt + cached
+    # paths use the layout API now -- they differ only in the copy atom's cache mod).
+    _bq_views = [_make_bq_view_for_jtile(j) for j in range_constexpr(4)]
 
-        # Persistent per-(j, half) B register fragments, allocated ONCE (mirroring
-        # the v2 reference's frag_B_0/frag_B_1 hoisted outside the loop). Inside the
-        # K-loop we fx.copy the (klane,nlane,K_C,half) slice of the preshuffle view
-        # DIRECTLY into these registers (a uniform-descriptor buffer_load with
-        # per-lane voffset), then read .load() for the raw mfma.
-        _bq_frags = [
-            [
-                fx.make_fragment_like(_bq_views[j][0, 0, 0, half, None])
-                for half in range_constexpr(2)
-            ]
-            for j in range_constexpr(4)
+    # Persistent per-(j, half) B register fragments, allocated ONCE (mirroring the
+    # v2 reference's frag_B_0/frag_B_1 hoisted outside the loop). Inside the K-loop
+    # we fx.copy the (klane,nlane,K_C,half) slice of the preshuffle view DIRECTLY
+    # into these registers (a uniform-descriptor buffer_load with per-lane voffset),
+    # then read .load() for the raw mfma.
+    _bq_frags = [
+        [
+            fx.make_fragment_like(_bq_views[j][0, 0, 0, half, None])
+            for half in range_constexpr(2)
         ]
+        for j in range_constexpr(4)
+    ]
 
     def issue_b_load_j(b_slot, K_C, j):
-        if const_expr(b_nontemporal):
-            # NON-TEMPORAL path (small M / decode): raw buffer_load with the nt aux
-            # hint (cache_modifier=2), which the layout-API copy atom cannot express.
-            # At small M there is little cross-block B reuse, so streaming B past L2
-            # (nt) beats caching it. Byte-identical addressing to v1's issue_b_load_j.
-            v = (
-                (lane_div_16 * fx.Int32(256))
-                + (lane_mod_16 * fx.Int32(16))
-                + fx.Int32(K_C * 2048)
-            )
-            for half in range_constexpr(2):
-                frag = buffer_ops.buffer_load(
-                    bq_rsrc,
-                    (v + fx.Int32(half * 1024)) // fx.Int32(4),
-                    vec_width=4,
-                    dtype=T.i32,
-                    cache_modifier=2,
-                    soffset_bytes=b_load_s_base[j],
-                )
-                b_slot[j][half] = Vec(frag)
-            return
-        # CACHED path (large M / prefill): layout-API preshuffle view + fx.copy. At
-        # large M many blocks reuse the same expert weights -> caching B (no nt) wins.
+        # Single LAYOUT-API path for both policies: preshuffle view + fx.copy with
+        # the cache-modifier-parameterized atom (_b_copy_atom carries nt vs cached).
         view = _bq_views[j]
         for half in range_constexpr(2):
             frag = _bq_frags[j][half]
