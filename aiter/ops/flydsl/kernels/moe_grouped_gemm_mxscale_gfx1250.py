@@ -65,6 +65,7 @@ class _GroupedA8W4Config:
     persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
     act: str = "silu"
+    swiglu_limit: float | None = None
     stage1_weight_layout: str = "gguu"
 
 
@@ -262,6 +263,24 @@ def _preshuffled_scale_shape(
     return int(rows) // wmma_rep, k_scale * wmma_rep
 
 
+def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
+    """Weight (B) scale shape in the n32k4 layout: (rows//32, (k_dim//32)*32).
+
+    Matches ``aiter.ops.shuffle.shuffle_scale_n32k4``: a 32-row super-block folds
+    into the column dim (col = remain_k*128 + row32*4 + r), so 32 N-rows collapse
+    to one row and each k_scale column expands x32.
+    """
+    k_scale = int(k_dim) // 32
+    if k_scale % 4 != 0:
+        raise ValueError(
+            f"B-scale k columns (K//32) must be divisible by 4 (K%128==0), "
+            f"got {k_scale}"
+        )
+    if int(rows) % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {rows}")
+    return int(rows) // 32, k_scale * 32
+
+
 def _check_stage1_args(
     y, x, w, scale_x, scale_w, masked_m, cfg: _GroupedA8W4Config
 ) -> None:
@@ -298,14 +317,11 @@ def _check_stage1_args(
             f"w shape must be {(cfg.experts, 2 * cfg.inter_dim, cfg.model_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
-    warp_tile_n = cfg.tile_n // cfg.n_warp
     scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.model_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        2 * cfg.inter_dim, cfg.model_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(2 * cfg.inter_dim, cfg.model_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
@@ -321,11 +337,20 @@ def _check_stage1_args(
         )
 
 
-def _apply_gate_up(gate: torch.Tensor, up: torch.Tensor, act: str) -> torch.Tensor:
+def _apply_gate_up(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    act: str,
+    swiglu_limit: float | None = None,
+) -> torch.Tensor:
+    _lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
     if act == "swiglu":
-        gate = gate.clamp(max=7.0)
-        up = up.clamp(min=-7.0, max=7.0)
+        gate = gate.clamp(max=_lim)
+        up = up.clamp(min=-_lim, max=_lim)
         return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=_lim)
+        up = up.clamp(min=-_lim, max=_lim)
     return torch.nn.functional.silu(gate) * up
 
 
@@ -362,6 +387,7 @@ def _compile_stage1_finalize_act(
         arg_y: fx.Tensor,
         arg_tmp: fx.Tensor,
         arg_masked_m: fx.Tensor,
+        swiglu_limit_f: fx.Float32,
     ):
         elem_ty = T.bf16 if out_dtype == "bf16" else T.f16
         tx = arith.index_cast(T.index, _raw(gpu.thread_id("x")))
@@ -380,9 +406,9 @@ def _compile_stage1_finalize_act(
 
         if_elem = scf.IfOp(in_range, results_=[], has_else=False)
         with ir.InsertionPoint(if_elem.then_block):
-            e = linear / arith.index(out_stride_e)
+            e = linear // arith.index(out_stride_e)
             rem0 = linear - e * arith.index(out_stride_e)
-            row = rem0 / arith.index(inter_dim)
+            row = rem0 // arith.index(inter_dim)
             col = rem0 - row * arith.index(inter_dim)
 
             valid_m = buffer_ops.buffer_load(
@@ -420,12 +446,14 @@ def _compile_stage1_finalize_act(
                 u = up_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
+                # Runtime clamp bound: host passes the limit (7.0 default for
+                # swiglu) or +inf to disable clamping (silu without a limit).
+                # min(x, lim) == -max(-x, -lim), expressed via wrapped maximumf.
+                neg_lim = -swiglu_limit_f
+                g = -((-g).maximumf(neg_lim))
+                u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                 if const_expr(act == "swiglu"):
-                    limit = arith.constant(7.0, type=T.f32)
-                    neg_limit = arith.constant(-7.0, type=T.f32)
                     alpha = arith.constant(1.702, type=T.f32)
-                    g = arith.minimumf(g, limit)
-                    u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * alpha * neg_log2e
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -453,15 +481,18 @@ def _compile_stage1_finalize_act(
         arg_y: fx.Tensor,
         arg_tmp: fx.Tensor,
         arg_masked_m: fx.Tensor,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
-        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) / arith.index(
+        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) // arith.index(
             block_threads
         )
-        launcher = stage1_finalize_act_kernel(arg_y, arg_tmp, arg_masked_m)
+        launcher = stage1_finalize_act_kernel(
+            arg_y, arg_tmp, arg_masked_m, swiglu_limit_f
+        )
         launcher.launch(
             grid=(_raw(gx), 1, 1),
             block=(block_threads, 1, 1),
@@ -506,6 +537,7 @@ def _compile_stage1_finalize_act_bias(
         arg_tmp: fx.Tensor,
         arg_bias: fx.Tensor,
         arg_masked_m: fx.Tensor,
+        swiglu_limit_f: fx.Float32,
     ):
         elem_ty = T.bf16 if out_dtype == "bf16" else T.f16
         tx = arith.index_cast(T.index, _raw(gpu.thread_id("x")))
@@ -525,9 +557,9 @@ def _compile_stage1_finalize_act_bias(
 
         if_elem = scf.IfOp(in_range, results_=[], has_else=False)
         with ir.InsertionPoint(if_elem.then_block):
-            e = linear / arith.index(out_stride_e)
+            e = linear // arith.index(out_stride_e)
             rem0 = linear - e * arith.index(out_stride_e)
-            row = rem0 / arith.index(inter_dim)
+            row = rem0 // arith.index(inter_dim)
             col = rem0 - row * arith.index(inter_dim)
 
             valid_m = buffer_ops.buffer_load(
@@ -582,12 +614,14 @@ def _compile_stage1_finalize_act_bias(
                 u = up_h.extf(T.f32) + up_bias_h.extf(T.f32)
                 one = arith.constant(1.0, type=T.f32)
                 neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
+                # Runtime clamp bound: host passes the limit (7.0 default for
+                # swiglu) or +inf to disable clamping (silu without a limit).
+                # min(x, lim) == -max(-x, -lim), expressed via wrapped maximumf.
+                neg_lim = -swiglu_limit_f
+                g = -((-g).maximumf(neg_lim))
+                u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                 if const_expr(act == "swiglu"):
-                    limit = arith.constant(7.0, type=T.f32)
-                    neg_limit = arith.constant(-7.0, type=T.f32)
                     alpha = arith.constant(1.702, type=T.f32)
-                    g = arith.minimumf(g, limit)
-                    u = arith.maximumf(arith.minimumf(u, limit), neg_limit)
                     t = g * alpha * neg_log2e
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -616,16 +650,17 @@ def _compile_stage1_finalize_act_bias(
         arg_tmp: fx.Tensor,
         arg_bias: fx.Tensor,
         arg_masked_m: fx.Tensor,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
-        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) / arith.index(
+        gx = (arith.index(total_elems) + arith.index(block_threads - 1)) // arith.index(
             block_threads
         )
         launcher = stage1_finalize_act_bias_kernel(
-            arg_y, arg_tmp, arg_bias, arg_masked_m
+            arg_y, arg_tmp, arg_bias, arg_masked_m, swiglu_limit_f
         )
         launcher.launch(
             grid=(_raw(gx), 1, 1),
@@ -672,14 +707,11 @@ def _check_stage2_args(
             f"w shape must be {(cfg.experts, cfg.model_dim, cfg.inter_dim // pack_b)}, got {tuple(w.shape)}"
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
-    warp_tile_n = cfg.tile_n // cfg.n_warp
     scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
     scale_x_shape = _preshuffled_scale_shape(
         scale_x_rows, cfg.inter_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_scale_shape(
-        cfg.model_dim, cfg.inter_dim, warp_tile_n, cfg.tile_k
-    )
+    scale_w_shape = _preshuffled_b_scale_shape(cfg.model_dim, cfg.inter_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
@@ -903,6 +935,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         experts_arg,
         *,
         stream=None,
+        swiglu_limit=None,
         _gemm_events=None,
         _m_tile_prefix=None,
         _m_tile_map=None,
@@ -939,6 +972,12 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         _check_bias_args("bias", bias, (cfg.experts, 2 * cfg.inter_dim), y)
         if stream is None:
             stream = torch.cuda.current_stream()
+        # Runtime clamp bound passed to the act epilogue / finalize kernels.
+        # swiglu defaults to 7.0; silu without a limit uses +inf (no clamp).
+        if cfg.act == "swiglu":
+            _swiglu_lim_rt = float(swiglu_limit) if swiglu_limit else 7.0
+        else:
+            _swiglu_lim_rt = float(swiglu_limit) if swiglu_limit else float("inf")
         fused_gemm = _get_fused_base_bias() if bias is not None else _get_fused_base()
         use_fused_gemm = (
             fused_gemm is not None
@@ -984,6 +1023,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
                 else:
                     _run_compiled(
@@ -999,6 +1039,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
             else:
                 _run_compiled(
@@ -1014,6 +1055,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     cfg.max_m,
                     2 * cfg.inter_dim,
                     stream,
+                    _swiglu_lim_rt,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1044,6 +1086,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         contiguous_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
                 else:
                     _run_compiled(
@@ -1060,6 +1103,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         contiguous_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
             else:
                 _run_compiled(
@@ -1076,6 +1120,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     contiguous_m,
                     2 * cfg.inter_dim,
                     stream,
+                    _swiglu_lim_rt,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1102,6 +1147,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
                 else:
                     _run_compiled(
@@ -1118,6 +1164,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         fused_n,
                         stream,
+                        _swiglu_lim_rt,
                     )
             else:
                 _run_compiled(
@@ -1134,6 +1181,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     cfg.max_m,
                     2 * cfg.inter_dim,
                     stream,
+                    _swiglu_lim_rt,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1146,9 +1194,17 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         if _skip_epilogue:
             return tmp
         if bias is not None:
-            _run_compiled(_get_finalize_act_bias(), y, tmp, bias, masked_m, stream)
+            _run_compiled(
+                _get_finalize_act_bias(),
+                y,
+                tmp,
+                bias,
+                masked_m,
+                _swiglu_lim_rt,
+                stream,
+            )
         else:
-            _run_compiled(_get_finalize_act(), y, tmp, masked_m, stream)
+            _run_compiled(_get_finalize_act(), y, tmp, masked_m, _swiglu_lim_rt, stream)
         return y
 
     return launch
@@ -1269,6 +1325,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         if cfg.split_k > 1:
             y.zero_()
         gemm = _get_base_bias() if bias is not None else _get_base()
+        _no_act_swiglu_lim = float("inf")
         if cfg.grouped_persistent_m:
             m_tile_prefix = _m_tile_prefix
             if m_tile_prefix is None:
@@ -1293,6 +1350,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             else:
                 _run_compiled(
@@ -1308,6 +1366,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1336,6 +1395,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     contiguous_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             else:
                 _run_compiled(
@@ -1352,6 +1412,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     contiguous_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1377,6 +1438,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             else:
                 _run_compiled(
@@ -1393,6 +1455,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.model_dim,
                     stream,
+                    _no_act_swiglu_lim,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)

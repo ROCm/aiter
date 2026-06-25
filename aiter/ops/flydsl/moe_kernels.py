@@ -19,7 +19,9 @@ def _get_dtypes():
     return dtypes
 
 
-_SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
+_SUFFIX_RE = re.compile(
+    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
+)
 
 
 def flydsl_kernel_name(
@@ -45,7 +47,7 @@ def flydsl_kernel_name(
 def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
     """Lookup kernel params by name.
 
-    Strips ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
+    Strips ``_kw{N}`` / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
     """
     params = _KERNEL_PARAMS.get(name)
     if params is not None:
@@ -56,6 +58,8 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
         params = _KERNEL_PARAMS.get(base_name)
         if params is not None:
             extra: Dict = {}
+            if m.group("kw") is not None:
+                extra["k_wave"] = int(m.group("kw"))
             if m.group("fp4"):
                 extra["out_dtype"] = "fp4"
             if m.group("fp8"):
@@ -98,44 +102,66 @@ def get_flydsl_stage1_kernels(
                             )
                             for go in gate_onlys:
                                 for xcd in xcd_swizzles:
-                                    name = flydsl_kernel_name(
+                                    base = flydsl_kernel_name(
                                         1, a_dtype, b_dtype, out_dtype, tm, tn, tk
                                     )
                                     if wpe != 1:
-                                        name += f"_w{wpe}"
+                                        base += f"_w{wpe}"
                                     if kb != 1:
-                                        name += f"_kb{kb}"
+                                        base += f"_kb{kb}"
                                     if bnt != 2:
-                                        name += f"_bnt{bnt}"
+                                        base += f"_bnt{bnt}"
                                     if go:
-                                        name += "_go"
+                                        base += "_go"
                                     if a_dtype == "fp8":
-                                        name += "_gui"
+                                        base += "_gui"
                                     if xcd > 0:
-                                        name += f"_xcd{xcd}"
-                                    kernels[name] = {
-                                        "stage": 1,
-                                        "a_dtype": a_dtype,
-                                        "b_dtype": b_dtype,
-                                        "out_dtype": out_dtype,
-                                        "tile_m": tm,
-                                        "tile_n": tn,
-                                        "tile_k": tk,
-                                        "MPerBlock": tm,
-                                        "waves_per_eu": wpe,
-                                        "k_batch": kb,
-                                        "b_nt": bnt,
-                                        "gate_mode": (
-                                            "mock_gate_only"
-                                            if go
-                                            else (
-                                                "interleave"
-                                                if a_dtype == "fp8"
-                                                else "separated"
-                                            )
-                                        ),
-                                        "xcd_swizzle": xcd,
-                                    }
+                                        base += f"_xcd{xcd}"
+                                    # k_wave (intra-block K-slice): only for the
+                                    # small-M tile (tile_m==32), no split-K/mock,
+                                    # and capped to <=8 total waves (<=512 threads).
+                                    num_n_waves = min(4, tn // 32)
+                                    k_waves = (
+                                        [1, 2, 4]
+                                        if (tm == 32 and kb == 1 and not go)
+                                        else [1]
+                                    )
+                                    for kw in k_waves:
+                                        if num_n_waves * kw > 8:
+                                            continue
+                                        if kw > 1 and 4 * tn > tk:
+                                            continue
+                                        if (
+                                            kw > 1
+                                            and a_dtype == "fp8"
+                                            and num_n_waves < 2
+                                        ):
+                                            continue
+                                        name = base + (f"_kw{kw}" if kw > 1 else "")
+                                        kernels[name] = {
+                                            "stage": 1,
+                                            "a_dtype": a_dtype,
+                                            "b_dtype": b_dtype,
+                                            "out_dtype": out_dtype,
+                                            "tile_m": tm,
+                                            "tile_n": tn,
+                                            "tile_k": tk,
+                                            "MPerBlock": tm,
+                                            "waves_per_eu": wpe,
+                                            "k_batch": kb,
+                                            "b_nt": bnt,
+                                            "gate_mode": (
+                                                "mock_gate_only"
+                                                if go
+                                                else (
+                                                    "interleave"
+                                                    if a_dtype == "fp8"
+                                                    else "separated"
+                                                )
+                                            ),
+                                            "xcd_swizzle": xcd,
+                                            "k_wave": kw,
+                                        }
     return kernels
 
 
@@ -145,11 +171,12 @@ def get_flydsl_stage2_kernels(
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
+    is_fp8 = b_dtype == "fp8"
     tile_ns = [128, 256] if is_fp4 else [128]
     # fp4 stage2 supports tile_k=128 (pack_K=1 scale sub-group shift path) as
     # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
     # whose inter_dim is a multiple of 128 but not 256 (e.g. MiniMax TP4=384).
-    tile_ks = [128, 256] if is_fp4 else [128]
+    tile_ks = [128, 256] if (is_fp4 or is_fp8) else [128]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
 
@@ -195,22 +222,9 @@ def get_flydsl_stage2_kernels(
 def _register_production_variants_stage2(
     kernels: Dict[str, Dict], a_dtype: str, b_dtype: str, out_dtype: str
 ) -> None:
-    """Append hand-tuned stage2 variants to ``kernels`` in-place.
-
-    Pulled out of the 6-deep tile/mode/bnt/xcd cartesian product in
-    ``get_flydsl_stage2_kernels`` so we don't pay a ``base_name == "..."``
-    string special-case on every iteration. Each entry pins a specific
-    shape (tile/mode/dtype) and applies a hand-tuned override dict.
-    """
+    """Append hand-tuned stage2 variants to ``kernels`` in-place."""
     # (a, b, out, tile_m, tile_n, tile_k, mode, suffix, overrides)
     PRODUCTION_VARIANTS = (
-        # EP4 DeepSeek prefill on MI355X (M=49152, model_dim=7168, inter_dim=2048):
-        #   use_async_copy=True  -- async X DMA in prologue overlaps with B/scale VMEM
-        #   cu_num_mul=3         -- persistent grid 3x CU count fills in-flight
-        #                           slack from small per-WG M tile counts;
-        #                           cu_num_mul=4 regresses ~2.4% on the same shape
-        #   waves_per_eu=4       -- best on EP4 prefill at cu_num_mul=3;
-        #                           wpe=5/6 underperform here
         (
             "fp4",
             "fp4",
@@ -316,6 +330,10 @@ def _register_all_configs():
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
                 _KERNEL_PARAMS.update(get_flydsl_stage2_kernels(a, b, out))
+    # mxfp8 (a8w8): fp8 activation + fp8 weight, per-1x32 e8m0 microscale.
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels("fp8", "fp8", out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels("fp8", "fp8", out))
     # int4_bf16 (a16wi4) configs
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
@@ -349,10 +367,10 @@ def compile_flydsl_moe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: float = 0.0,
+    k_wave: int = 1,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    if b_dtype == "fp4":
+    if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
 
@@ -380,7 +398,7 @@ def compile_flydsl_moe_stage1(
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
-            swiglu_limit=swiglu_limit,
+            k_wave=k_wave,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -436,7 +454,7 @@ def compile_flydsl_moe_stage2(
     enable_bias: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
-    if b_dtype == "fp4":
+    if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
         return compile_mixed_moe_gemm2(
@@ -521,6 +539,19 @@ def _ptr_view_safe(t: torch.Tensor):
     return flyc.from_c_void_p(fx.Uint8, view.data_ptr())
 
 
+def runtime_swiglu_limit(swiglu_limit: Optional[float], act: str) -> float:
+    """Normalize swiglu_limit into the runtime f32 clamp bound passed to kernels.
+
+    The kernels always clamp using this value, so "no clamp" is encoded as +inf:
+      - swiglu: defaults to 7.0 when unset (matches the reference ``swiglu()``).
+      - silu:   clamps only when a positive limit is configured, else +inf
+                (matches the reference's ``if swiglu_limit:`` truthiness).
+    """
+    if act == "swiglu":
+        return float(swiglu_limit) if swiglu_limit else 7.0
+    return float(swiglu_limit) if swiglu_limit else float("inf")
+
+
 def _s1_args_fp4(
     out,
     a,
@@ -539,6 +570,7 @@ def _s1_args_fp4(
     dev,
     bias=None,
     stream=None,
+    swiglu_limit=float("inf"),
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
@@ -560,6 +592,7 @@ def _s1_args_fp4(
         n_in,
         k_in,
         size_expert_ids_in,
+        float(swiglu_limit),
         stream,
     )
 
@@ -992,7 +1025,6 @@ def _get_compiled_silu_fused(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    swiglu_limit: float = 0.0,
 ):
     """Compile and cache the fused gate activation + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
@@ -1004,7 +1036,6 @@ def _get_compiled_silu_fused(
         gui_layout,
         act=act,
         enable_bias=enable_bias,
-        swiglu_limit=swiglu_limit,
     )
 
 
@@ -1078,6 +1109,7 @@ def flydsl_silu_and_mul_interleaved(
             _ptr_view_safe(empty_f32),
             token_num,
             num_sorted_rows,
+            float("inf"),
             torch.cuda.current_stream(),
         ),
     )
@@ -1117,7 +1149,8 @@ def flydsl_moe_stage1(
     topk_ids: Optional[torch.Tensor] = None,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
+    k_wave: int = 1,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1235,11 +1268,13 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    is_fp4 = b_dtype == "fp4"
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    # fp4 and fp8 weights both use the MX gemm kernel (bias/out_scale arg builder).
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
+    _swiglu_limit_val = runtime_swiglu_limit(swiglu_limit, act)
 
-    if is_fp4:
+    if use_mx_gemm:
         args = _s1_args_fp4(
             _kernel_out.view(-1),
             a.view(-1),
@@ -1261,6 +1296,7 @@ def flydsl_moe_stage1(
                 if kernel_bias is not None
                 else torch.empty(0, device=dev)
             ),
+            swiglu_limit=_swiglu_limit_val,
         )
     else:
         args = _s1_args_std(
@@ -1303,7 +1339,7 @@ def flydsl_moe_stage1(
         enable_bias=(kernel_bias is not None),
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
-        swiglu_limit=swiglu_limit,
+        k_wave=k_wave,
     )
     _run_compiled(exe, args)
 
@@ -1336,7 +1372,6 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            swiglu_limit=swiglu_limit,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1350,6 +1385,7 @@ def flydsl_moe_stage1(
                 _ptr_view_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
         )
@@ -1361,7 +1397,6 @@ def flydsl_moe_stage1(
             gui_layout=True,
             act=act,
             enable_bias=use_splitk_bias,
-            swiglu_limit=swiglu_limit,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1375,6 +1410,7 @@ def flydsl_moe_stage1(
                 _ptr_view_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
         )
@@ -1384,7 +1420,6 @@ def flydsl_moe_stage1(
             topk,
             act=act,
             enable_bias=use_splitk_bias,
-            swiglu_limit=swiglu_limit,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1398,6 +1433,7 @@ def flydsl_moe_stage1(
                 _ptr_view_safe(bias_arg),
                 token_num,
                 num_sorted_rows,
+                _swiglu_limit_val,
                 torch.cuda.current_stream(),
             ),
         )
@@ -1560,7 +1596,8 @@ def flydsl_moe_stage2(
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
-    is_fp4 = b_dtype == "fp4"
+    # fp4 and fp8 weights both use the MX gemm kernel (bias arg builder).
+    use_mx_gemm = b_dtype in ("fp4", "fp8")
     _n_in = model_dim
     _k_in = inter_dim
 
@@ -1575,7 +1612,7 @@ def flydsl_moe_stage2(
                 dtype=out.dtype,
             )
 
-    if is_fp4:
+    if use_mx_gemm:
         args = _s2_args_fp4(
             target,
             inter_states,
