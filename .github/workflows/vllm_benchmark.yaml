@@ -137,27 +137,31 @@ jobs:
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
     needs: [build_aiter_wheel, prepare_triton_wheel]
-    runs-on: aiter-8gpu-runner
+    runs-on: linux-aiter-do-mi350x-8
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
         include:
-          - model: openai/gpt-oss-120b
+          - model: deepseek-ai/DeepSeek-V4-Pro
             kv_cache_dtype: fp8_kvcache
             tp: 8
-            extra_args: --gpu-memory-utilization 0.3
+            extra_args: >-
+              --quantization deepseek_v4_fp8
+              --moe-backend triton_unfused
+              --tokenizer-mode deepseek_v4
+              --reasoning-parser deepseek_v4
             extra_env_args: ""
-          - model: deepseek-ai/DeepSeek-R1-0528
+          - model: amd/MiniMax-M3-MXFP4
+            kv_cache_dtype: default_kvcache
+            tp: 4
+            extra_args: ""
+            extra_env_args: ""
+          - model: amd/MiniMax-M3-MXFP4
             kv_cache_dtype: default_kvcache
             tp: 8
-            extra_args: --block-size 1
+            extra_args: ""
             extra_env_args: ""
-          - model: moonshotai/Kimi-K2.5
-            kv_cache_dtype: default_kvcache
-            tp: 8
-            extra_args: --block-size 1 --trust-remote-code
-            extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
         
     steps:
       - name: Checkout Docker pull retry helper

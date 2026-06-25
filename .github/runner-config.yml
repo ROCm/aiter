@@ -25,3 +25,7 @@ runners:
   linux-aiter-mi35x-8:
     gpu_arch: MI35X
     gpu_count: 8
+
+  linux-aiter-do-mi350x-8:
+    gpu_arch: MI350X
+    gpu_count: 8
