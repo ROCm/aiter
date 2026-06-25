@@ -29,13 +29,6 @@ from flydsl.expr import arith, rocdl
 from flydsl.expr.typing import Float4E2M1FN
 from flydsl.expr.typing import T
 
-# i32 layout strides (BK=256-derived, K-independent; bytes/4):
-#   B payload : klane[0,4)->64, nlane[0,16)->4, K_tile->512, half[0,2)->256, kpack4->1
-#   B scale   : klane[0,4)->16, nlane[0,16)->1, K_tile->kBS_stride_k0_dw, unit->1
-_BQ_LAYOUT_SHAPE = (4, 16, None, 2, 4)  # K_tile filled in per call
-_BQ_LAYOUT_STRIDE = (64, 4, 512, 256, 1)
-_BS_LAYOUT_STRIDE = (16, 1, None, 1)  # K_tile stride filled in per call
-
 
 def _raw(v):
     """Unwrap an fx value to a raw ir.Value."""
@@ -70,8 +63,9 @@ def bq_view(arg_bq, row_elems, KH4, K_TILES_TOTAL):
     )
     off_i64 = fx.Int64(arith.ExtUIOp(T.i64, _raw(col_base)).result)
     base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_bq) + off_i64 * fx.Int64(4))
+    # i32 strides: klane[0,4)->64, nlane[0,16)->4, K_tile->512, half[0,2)->256, kpack4->1
     shape = (4, 16, K_TILES_TOTAL, 2, 4)
-    view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, _BQ_LAYOUT_STRIDE)))
+    view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, (64, 4, 512, 256, 1))))
     return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
