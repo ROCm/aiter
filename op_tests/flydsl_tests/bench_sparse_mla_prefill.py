@@ -34,6 +34,11 @@ DSV4_TOPK_EXTRA = 128
 DSV4_TOPK_B1 = 128  # B1 SWA-only single-region layers (compress_ratio <= 1)
 # GLM-5 / DSv3.2: single global top-k over a flat fp8 576 latent cache.
 GLM_TOPK = 2048
+# Per-batch split cap for the persistent MLA sparse decode metadata. Mirrors
+# test_mla_sparse.py's `max_split_per_batch=32`; bounds the number of partial
+# reduce tiles so the decode's `logits`/`reduce_partial_map` buffers stay sized
+# correctly (an unbounded split count overflows them -> HIP illegal access).
+GLM_MAX_SPLIT_PER_BATCH = 32
 T_SWEEP_DEFAULT: tuple[int, ...] = (4096, 8192, 16384)
 
 _AITER_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
@@ -466,6 +471,269 @@ def bench_flydsl_glm(inp: BenchInputsGLM, warmup: int, iters: int) -> TimingResu
     return TimingResult("flydsl_glm_e2e", med, stages, notes="native flat-576 fp8, fused, per-tensor scale")
 
 
+# ---------------------------------------------------------------------------
+# Production aiter MLA sparse decode path (matches vLLM rocm_aiter_mla_sparse:
+# forward_mqa -> q fp8 quant -> _forward_mla -> aiter.mla.mla_decode_fwd with
+# pre-built persistent split+reduce metadata).
+#
+# The aiter MLA decode kernel always runs with page_size=1 internally: the
+# kv cache is flattened to [num_slots, 1, 1, 576] and CSR indices are global
+# slot ids (see vllm rocm_aiter_mla.py "always operates with page_size=1").
+# The persistent work-split / reduce metadata is a function of the bench shape,
+# so it is built ONCE here (NOT timed) — the steady-state analogue of vLLM's
+# fingerprint-cached metadata in ROCMAiterMLASparseMetadataBuilder.build().
+# ---------------------------------------------------------------------------
+@dataclass
+class GlmDecodeState:
+    kv_buffer: torch.Tensor  # [num_slots, 1, 1, 576] fp8 (flat view of inp.cache)
+    qo_indptr: torch.Tensor  # [T+1] int32, arange (qseqlen=1 per token)
+    kv_indptr: torch.Tensor  # [T+1] int32, per-query CSR lengths (= inp.indptr)
+    kv_indices: torch.Tensor  # [nnz] int32, global slot ids (= inp.indices)
+    kv_last_page_lens: torch.Tensor  # [T] int32, ones
+    q_fp8: torch.Tensor  # [T, H, 576] fp8 reusable quant output buffer
+    q_scale: torch.Tensor  # [1] f32
+    kv_scale: torch.Tensor  # [1] f32
+    out_asm: torch.Tensor  # [T, H, 512] bf16
+    sm_scale: float
+    nhead: int
+    quant_backend: str
+    num_kv_splits: int  # per-batch split cap (mla_decode_fwd + metadata must agree)
+    # persistent split+reduce metadata (built once, reused every forward)
+    work_meta_data: torch.Tensor
+    work_indptr: torch.Tensor
+    work_info_set: torch.Tensor
+    reduce_indptr: torch.Tensor
+    reduce_final_map: torch.Tensor
+    reduce_partial_map: torch.Tensor
+
+
+def _quant_q_fp8(q: torch.Tensor, q_scale: torch.Tensor, out_fp8: torch.Tensor, backend: str) -> None:
+    """Static per-tensor fp8 quant of q, matching vLLM ``scaled_fp8_quant(q.flatten(-2), q_scale)``.
+
+    Writes into the pre-allocated ``out_fp8`` ([T, H, 576] fp8). ``backend`` is
+    resolved once in :func:`build_glm_decode_state` ("aiter" fused kernel, else
+    a torch ``(q / scale).to(fp8)`` fallback).
+    """
+    T = q.shape[0]
+    q_flat = q.reshape(T, -1)
+    out_flat = out_fp8.reshape(T, -1)
+    if backend == "aiter":
+        from aiter.ops.quant import static_per_tensor_quant
+
+        static_per_tensor_quant(out_flat, q_flat, q_scale)
+    else:
+        out_flat.copy_((q_flat.to(torch.float32) / q_scale).to(out_fp8.dtype))
+
+
+def build_glm_decode_state(
+    inp: BenchInputsGLM, topk: int, *, q_scale: float = 1.0
+) -> GlmDecodeState:
+    import aiter
+    from aiter import dtypes
+
+    device = inp.q.device
+    T, nhead, head_dim = inp.q.shape
+    assert head_dim == GLM_HEAD_DIM, f"GLM decode expects head_dim={GLM_HEAD_DIM}, got {head_dim}"
+    assert nhead % 8 == 0, f"aiter MLA metadata requires nhead % 8 == 0, got {nhead}"
+
+    num_slots = inp.cache.shape[0] * inp.cache.shape[1]
+    # Flatten cache to the page_size=1 layout the kernel expects (mirrors the
+    # vLLM wrapper's kv_buffer.view(-1, 1, 1, H)).
+    kv_buffer = inp.cache.reshape(num_slots, GLM_HEAD_DIM).view(num_slots, 1, 1, GLM_HEAD_DIM)
+
+    qo_indptr = torch.arange(T + 1, dtype=torch.int32, device=device)
+    kv_indptr = inp.indptr.to(device=device, dtype=torch.int32)
+    kv_indices = inp.indices.to(device=device, dtype=torch.int32)
+    kv_last_page_lens = torch.ones(T, dtype=torch.int32, device=device)
+
+    q_fp8 = torch.empty((T, nhead, head_dim), dtype=dtypes.fp8, device=device)
+    q_scale_t = torch.tensor([q_scale], dtype=torch.float32, device=device)
+    kv_scale_t = torch.tensor([inp.kv_scale], dtype=torch.float32, device=device)
+    out_asm = torch.empty((T, nhead, GLM_V_DIM), dtype=torch.bfloat16, device=device)
+
+    # Resolve the q-quant backend once (fused aiter kernel if it builds/runs).
+    quant_backend = "torch"
+    try:
+        from aiter.ops.quant import static_per_tensor_quant
+
+        static_per_tensor_quant(q_fp8.reshape(T, -1), inp.q.reshape(T, -1), q_scale_t)
+        quant_backend = "aiter"
+    except Exception:
+        quant_backend = "torch"
+
+    # ---- persistent split+reduce metadata buffers (allocated + filled once) ----
+    # The decode runs the sparse top-k MLA path (mirrors test_mla_sparse.py): the
+    # metadata MUST be built in sparse mode (topk set) with a per-batch split cap,
+    # and the buffer-sizing query MUST use the same cap so reduce_partial_map (and
+    # the decode's logits buffer derived from it) is large enough. Omitting topk /
+    # max_split_per_batch sizes the buffers for ~1 split per batch but then lets the
+    # metadata kernel emit up to `num_clusters` splits, overflowing them and
+    # triggering a HIP illegal memory access in the stage1 ASM kernel.
+    num_kv_splits = GLM_MAX_SPLIT_PER_BATCH
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_mla_metadata_info_v1(
+        T,
+        1,
+        nhead,
+        dtypes.fp8,
+        dtypes.fp8,
+        is_sparse=True,
+        fast_mode=True,
+        num_kv_splits=num_kv_splits,
+        max_split_per_batch=num_kv_splits,
+    )
+    work_meta_data = torch.empty(work_meta_data_size, dtype=work_meta_data_type, device=device)
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
+    work_info_set = torch.empty(work_info_set_size, dtype=work_info_set_type, device=device)
+    reduce_indptr = torch.empty(reduce_indptr_size, dtype=reduce_indptr_type, device=device)
+    reduce_final_map = torch.empty(reduce_final_map_size, dtype=reduce_final_map_type, device=device)
+    reduce_partial_map = torch.empty(
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
+    )
+
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        kv_last_page_lens,
+        nhead,  # num_heads_per_head_k
+        1,  # num_heads_k
+        True,  # is_causal
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        page_size=1,
+        kv_granularity=16,
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
+        fast_mode=True,
+        topk=topk,
+        max_split_per_batch=num_kv_splits,
+        dtype_q=dtypes.fp8,
+        dtype_kv=dtypes.fp8,
+    )
+
+    return GlmDecodeState(
+        kv_buffer=kv_buffer,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        q_fp8=q_fp8,
+        q_scale=q_scale_t,
+        kv_scale=kv_scale_t,
+        out_asm=out_asm,
+        sm_scale=inp.scale,
+        nhead=nhead,
+        quant_backend=quant_backend,
+        num_kv_splits=num_kv_splits,
+        work_meta_data=work_meta_data,
+        work_indptr=work_indptr,
+        work_info_set=work_info_set,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+    )
+
+
+def _run_mla_decode_once(inp: BenchInputsGLM, state: GlmDecodeState, timer: StageTimer | None = None) -> None:
+    """One production forward: q fp8 quant + persistent split decode ASM + reduce."""
+    import aiter
+
+    if timer is not None:
+        timer.begin("q_quant")
+    _quant_q_fp8(inp.q, state.q_scale, state.q_fp8, state.quant_backend)
+    if timer is not None:
+        timer.begin("mla_decode_fwd")
+    aiter.mla.mla_decode_fwd(
+        state.q_fp8,
+        state.kv_buffer,
+        state.out_asm,
+        state.qo_indptr,
+        state.kv_indptr,
+        state.kv_indices,
+        state.kv_last_page_lens,
+        1,  # max_seqlen_q
+        page_size=1,
+        nhead_kv=1,
+        sm_scale=state.sm_scale,
+        num_kv_splits=state.num_kv_splits,
+        q_scale=state.q_scale,
+        kv_scale=state.kv_scale,
+        work_meta_data=state.work_meta_data,
+        work_indptr=state.work_indptr,
+        work_info_set=state.work_info_set,
+        reduce_indptr=state.reduce_indptr,
+        reduce_final_map=state.reduce_final_map,
+        reduce_partial_map=state.reduce_partial_map,
+        return_lse=False,
+    )
+    if timer is not None:
+        timer.end()
+
+
+def bench_mla_decode_fwd_glm(
+    inp: BenchInputsGLM, state: GlmDecodeState, warmup: int, iters: int
+) -> TimingResult:
+    def run_once():
+        timer = StageTimer()
+        _run_mla_decode_once(inp, state, timer=timer)
+        return timer.finish()
+
+    # First call JIT-compiles the decode ASM; do it before the timed loop.
+    run_once()
+    med, stages = _median_ms(run_once, warmup, iters)
+    return TimingResult(
+        "aiter_mla_decode_glm_e2e",
+        med,
+        stages,
+        notes=(
+            f"prod path: q fp8 quant ({state.quant_backend}) + persistent "
+            "split decode ASM + reduce (metadata pre-built)"
+        ),
+    )
+
+
+def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    af = a.reshape(-1).to(torch.float32)
+    bf = b.reshape(-1).to(torch.float32)
+    return torch.nn.functional.cosine_similarity(af, bf, dim=0).item()
+
+
+def check_glm_paths(inp: BenchInputsGLM, state: GlmDecodeState) -> float:
+    """Run flydsl and the decode path once on identical inputs; return cosine.
+
+    Both paths read the SAME bf16 q, SAME fp8 cache and SAME CSR; only the
+    output buffers differ. flydsl consumes bf16 q directly while the decode
+    path quantizes q to fp8 first, so a small divergence is expected.
+    """
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    fly_out = torch.empty_like(inp.out)
+    flydsl_sparse_mla_prefill(
+        inp.q,
+        inp.cache,
+        inp.indices,
+        inp.indptr,
+        fly_out,
+        block_table=inp.block_table,
+        block_size=inp.block_size,
+        packed=True,
+        scale_mode="per_tensor",
+        kv_scale=state.kv_scale,
+    )
+    _run_mla_decode_once(inp, state)
+    return _cosine(fly_out, state.out_asm)
+
+
 def bench_flydsl_b1(inp: BenchInputsB1, warmup: int, iters: int) -> TimingResult:
     from aiter.ops.flydsl import flydsl_sparse_mla_prefill
 
@@ -759,11 +1027,39 @@ def run_bench_glm(args: argparse.Namespace, T: int) -> None:
     )
     fly_glm = bench_flydsl_glm(glm, args.warmup, args.iters)
     _print_result(fly_glm, None)
+
+    if args.skip_aiter_decode:
+        print()
+        print("(aiter mla_decode_fwd skipped via --skip-aiter-decode)")
+        print()
+        return
+
+    try:
+        state = build_glm_decode_state(glm, args.topk, q_scale=args.q_scale)
+    except Exception as exc:  # ASM JIT / arch / metadata build failure
+        print()
+        print(f"aiter mla_decode_fwd unavailable, skipping decode peer: {exc}")
+        print()
+        return
+
+    try:
+        cos = check_glm_paths(glm, state)
+        tag = "WARNING: paths diverge" if cos < 0.90 else "ok"
+        print(f"correctness  flydsl vs mla_decode_fwd cosine={cos:.4f}  [{tag}]")
+    except Exception as exc:
+        print(f"correctness  check skipped: {exc}")
+
+    dec_glm = bench_mla_decode_fwd_glm(glm, state, args.warmup, args.iters)
+    _print_result(dec_glm, fly_glm.total_ms)
     print()
     print(
-        "Triton bf16 baseline is DSv4-only (nope=448/rope=64); head_dim=576 "
-        "GLM has no vendored Triton prefill peer in this harness."
+        "flydsl_glm_e2e          = fused gather/dequant/attn (bf16 q in, fp8 cache)."
     )
+    print(
+        "aiter_mla_decode_glm_e2e = production path (vLLM rocm_aiter_mla_sparse): "
+        "q fp8 quant + persistent split decode ASM + reduce; metadata pre-built."
+    )
+    print("Ratio shown for the decode row is decode_total / flydsl_total (<1 => decode faster).")
     print()
 
 
@@ -823,6 +1119,18 @@ def main() -> None:
         type=float,
         default=1.0,
         help="GLM per-tensor KV dequant scalar (layer._k_scale); glm/dsv32 preset only",
+    )
+    parser.add_argument(
+        "--q-scale",
+        type=float,
+        default=1.0,
+        help="GLM q fp8 quant scalar (layer._q_scale); glm/dsv32 decode peer only "
+        "(matches FlyDSL default q_scale=1.0)",
+    )
+    parser.add_argument(
+        "--skip-aiter-decode",
+        action="store_true",
+        help="glm/dsv32: skip the production aiter.mla.mla_decode_fwd peer",
     )
     parser.add_argument(
         "--topk-main",
