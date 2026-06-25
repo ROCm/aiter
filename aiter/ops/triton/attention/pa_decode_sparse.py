@@ -18,6 +18,8 @@ import triton
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
     _pa_decode_sparse_reduce,
+    _pa_decode_sparse_blocked as triton_pa_decode_sparse_blocked,
+    _pa_decode_sparse_blocked_reduce,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -289,6 +291,241 @@ def pa_decode_sparse(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         USE_EXP2=not use_gluon,
+        num_warps=reduce_num_warps,
+    )
+    return out
+
+
+def pa_decode_sparse_blocked(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_block_pages: torch.Tensor,
+    kv_block_masks: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    kv_scales: Optional[torch.Tensor] = None,
+    block_h: Optional[int] = None,
+    kv_splits: Optional[int] = None,
+    skip_reduce: Optional[bool] = False,
+) -> torch.Tensor:
+    """Block-table variant of :func:`pa_decode_sparse`.
+
+    Same split-K + widened-BLOCK_H sparse decode, but the KV pool is
+    block-structured (``unified_kv[total_pages, B, D]``) and each per-token
+    entry is a ``(page_id, mask)`` block-table pair rather than a single slot
+    id. The kernel gathers a whole ``[B, D]`` page per entry in one coalesced
+    load and a B-bit ``mask`` selects the valid rows — the win for contiguous
+    spans (e.g. the V4 SWA window) where one block replaces up to B scattered
+    single-row gathers.
+
+    Args:
+        q: ``[N, H, D]`` decode queries, bf16/fp16.
+        unified_kv: ``[total_pages, B, D]`` block-structured KV pool, same dtype
+            as ``q`` (or fp8 when ``kv_scales`` is given).
+        kv_block_pages: ``[total_blocks]`` int32 — per-token page lists, flat.
+            Token ``t``'s blocks live in
+            ``kv_block_pages[kv_indptr[t] : kv_indptr[t+1]]``.
+        kv_block_masks: ``[total_blocks]`` int32 — per-block B-bit validity
+            bitmap (bit ``b`` ⇔ row ``page*B + b`` is a valid key). A 0 mask is a
+            no-op block.
+        kv_indptr: ``[N+1]`` int32 — prefix sum over *block* entries per token.
+        attn_sink: ``[H]`` per-head softmax-denom bias (fp32).
+        softmax_scale: scalar softmax scale.
+        block_h / kv_splits / skip_reduce: as in :func:`pa_decode_sparse`.
+
+    Returns:
+        ``[N, H, D]`` output (or the ``(acc, m, l)`` partials when
+        ``skip_reduce`` and ``kv_splits > 1``), same conventions as
+        :func:`pa_decode_sparse`.
+    """
+    if not q.is_cuda:
+        raise RuntimeError("pa_decode_sparse_blocked requires CUDA/HIP tensors")
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        raise RuntimeError(
+            f"pa_decode_sparse_blocked expects fp16/bf16 q, got {q.dtype}"
+        )
+    if unified_kv.dim() != 3:
+        raise RuntimeError(
+            f"unified_kv must be [total_pages, B, D], got {tuple(unified_kv.shape)}"
+        )
+
+    total_pages, B, D = unified_kv.shape
+
+    quant_kv = kv_scales is not None
+    if quant_kv:
+        assert unified_kv.dtype == _FP8_DTYPE, (
+            f"kv_scales supplied but unified_kv is {unified_kv.dtype}, "
+            f"expected {_FP8_DTYPE}"
+        )
+        assert (
+            kv_scales.dtype == torch.float32
+        ), f"kv_scales must be fp32, got {kv_scales.dtype}"
+        assert (
+            D % _FP8_GROUP_SIZE == 0
+        ), f"D={D} must be divisible by GROUP_SIZE={_FP8_GROUP_SIZE}"
+        expected_g = D // _FP8_GROUP_SIZE
+        assert kv_scales.shape == (total_pages, B, expected_g), (
+            f"kv_scales shape {tuple(kv_scales.shape)} does not match "
+            f"expected ({total_pages}, {B}, {expected_g})"
+        )
+    else:
+        if unified_kv.dtype != q.dtype:
+            raise RuntimeError(
+                f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
+            )
+
+    T, H, Dq = q.shape
+    assert Dq == D, f"q D={Dq} != unified_kv D={D}"
+    _LOGGER.info(
+        f"PA_DECODE_SPARSE_BLOCKED T={T} H={H} D={D} B={B} "
+        f"total_blocks={kv_block_pages.shape[0]}"
+    )
+
+    out = torch.empty_like(q)
+    assert kv_block_pages.dtype == torch.int32 and kv_block_pages.is_contiguous()
+    assert kv_block_masks.dtype == torch.int32 and kv_block_masks.is_contiguous()
+    assert kv_block_pages.shape == kv_block_masks.shape
+    assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
+
+    if block_h is None:
+        block_h = triton.next_power_of_2(min(H, 16))
+    else:
+        block_h = triton.next_power_of_2(block_h)
+    block_h = max(block_h, 16)  # AMD MFMA min tile
+
+    n_head_blocks = triton.cdiv(H, block_h)
+    h_padded = n_head_blocks * block_h
+    block_d = triton.next_power_of_2(D)
+
+    # No gluon path for the blocked variant: always the triton kernel, so the
+    # partials live in the base-2 domain (USE_EXP2=True).
+    attn_num_warps = 4
+    max_num_wg = 256
+    num_stages = 2
+    waves_per_eu = 1
+    reduce_num_warps = 4
+
+    # Infer KV_SPLITS. The split unit is one block (B keys), so the upper bound
+    # is the total number of block entries (loose, mirrors pa_decode_sparse).
+    if kv_splits is None:
+        max_kv_splits = max(1, kv_block_pages.shape[0])
+        kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
+        kv_splits = min(max_kv_splits, kv_splits)
+        kv_splits = triton.next_power_of_2(kv_splits)
+
+    if kv_splits == 1:
+        m_partial = l_partial = acc_partial = out  # unused inside the kernel
+        mp_strides = (0, 0, 0)
+        lp_strides = (0, 0, 0)
+        ap_strides = (0, 0, 0, 0)
+    else:
+        m_partial = torch.empty(
+            (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
+        )
+        l_partial = torch.empty_like(m_partial)
+        acc_partial = torch.empty(
+            (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
+        )
+        mp_strides = m_partial.stride()
+        lp_strides = l_partial.stride()
+        ap_strides = acc_partial.stride()
+
+    if quant_kv:
+        kv_scales_arg = kv_scales
+        ks_stride_n_arg = kv_scales.stride(0)
+        ks_stride_b_arg = kv_scales.stride(1)
+        num_groups_arg = D // _FP8_GROUP_SIZE
+    else:
+        kv_scales_arg = q.new_empty(1, dtype=torch.float32)
+        ks_stride_n_arg = 1
+        ks_stride_b_arg = 1
+        num_groups_arg = 1
+
+    grid_attn = (T, n_head_blocks, kv_splits)
+    triton_pa_decode_sparse_blocked[grid_attn](
+        q,
+        unified_kv,
+        kv_scales_arg,
+        kv_block_pages,
+        kv_block_masks,
+        kv_indptr,
+        m_partial,
+        l_partial,
+        acc_partial,
+        attn_sink,
+        out,
+        total_pages,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        unified_kv.stride(0),
+        unified_kv.stride(1),
+        unified_kv.stride(2),
+        ks_stride_n_arg,
+        ks_stride_b_arg,
+        mp_strides[0],
+        mp_strides[1],
+        mp_strides[2],
+        lp_strides[0],
+        lp_strides[1],
+        lp_strides[2],
+        ap_strides[0],
+        ap_strides[1],
+        ap_strides[2],
+        ap_strides[3],
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H,
+        D,
+        kv_splits,
+        float(softmax_scale),
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        B=B,
+        QUANT_KV=quant_kv,
+        GROUP_SIZE=_FP8_GROUP_SIZE,
+        NUM_GROUPS=num_groups_arg,
+        num_warps=attn_num_warps,
+        num_stages=num_stages,
+        waves_per_eu=waves_per_eu,
+    )
+
+    if kv_splits == 1:
+        return out
+
+    if skip_reduce:
+        return acc_partial, m_partial, l_partial
+
+    block_h_reduce = 1
+    grid_reduce = (T, triton.cdiv(H, block_h_reduce))
+    _pa_decode_sparse_blocked_reduce[grid_reduce](
+        m_partial,
+        l_partial,
+        acc_partial,
+        attn_sink,
+        kv_indptr,
+        out,
+        m_partial.stride(0),
+        m_partial.stride(1),
+        m_partial.stride(2),
+        l_partial.stride(0),
+        l_partial.stride(1),
+        l_partial.stride(2),
+        acc_partial.stride(0),
+        acc_partial.stride(1),
+        acc_partial.stride(2),
+        acc_partial.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H,
+        D,
+        kv_splits,
+        BLOCK_H=block_h_reduce,
+        BLOCK_D=block_d,
+        USE_EXP2=True,
         num_warps=reduce_num_warps,
     )
     return out

@@ -7,7 +7,10 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+from aiter.ops.triton.attention.pa_decode_sparse import (
+    pa_decode_sparse,
+    pa_decode_sparse_blocked,
+)
 from aiter.ops.triton.utils._triton import arch_info
 
 
@@ -272,6 +275,154 @@ def test_pa_decode_sparse_vs_reference(
     else:
         # kv_splits == 1 (skip_reduce is a no-op) or skip_reduce=False: the
         # wrapper already returns the final output.
+        out = result
+
+    torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
+
+
+# ---------------------------------------------------------------------------
+# Blocked (block-table) variant: unified_kv is [total_pages, B, D] and each
+# per-token entry is a (page_id, B-bit mask) pair. The reference expands every
+# entry into its valid flat slot ids (page*B + b for each set bit) and reuses
+# the trusted flat reference above.
+# ---------------------------------------------------------------------------
+
+
+def _to_i32_mask(mask_u: int) -> int:
+    """Wrap an unsigned B-bit mask to its int32 storage value (bit 31 → negative)."""
+    return mask_u - (1 << 32) if (mask_u & (1 << 31)) else mask_u
+
+
+def _make_blocked_inputs(
+    T: int,
+    H: int,
+    D: int,
+    B: int,
+    max_blocks: int,
+    total_pages: int,
+    dtype=torch.bfloat16,
+    seed: int = 0,
+    variable_len: bool = False,
+):
+    """Build blocked inputs. Per token: distinct pages (so no flat slot is double
+    counted) and random non-trivial masks, with a few edge masks injected
+    (full / single high bit / a 0 dead-block)."""
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    rng = torch.Generator(device="cpu").manual_seed(seed)
+
+    q = torch.randn(T, H, D, dtype=dtype, device=device) * 0.5
+    unified_kv = torch.randn(total_pages, B, D, dtype=dtype, device=device) * 0.5
+    attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
+
+    full_mask = (1 << B) - 1
+    edge_masks = [full_mask, 1 << (B - 1), 1, 0]
+
+    pages_all, masks_all, counts = [], [], []
+    for t in range(T):
+        if variable_len:
+            nb = int(torch.randint(1, max_blocks + 1, (1,), generator=rng).item())
+        else:
+            nb = max_blocks
+        assert nb <= total_pages, "need total_pages >= max_blocks for distinct pages"
+        pages = torch.randperm(total_pages, generator=rng)[:nb].tolist()
+        masks = []
+        for i in range(nb):
+            # Sprinkle edge masks deterministically; rest are random nonzero.
+            if i < len(edge_masks) and (t + i) % 3 == 0:
+                m = edge_masks[(t + i) % len(edge_masks)]
+            else:
+                m = int(torch.randint(1, full_mask + 1, (1,), generator=rng).item())
+            masks.append(m)
+        # Guarantee each token has >=1 valid key overall (avoid the all-dead
+        # token degenerate, covered separately) by forcing the first mask hot.
+        if all(m == 0 for m in masks):
+            masks[0] = 1
+        pages_all.extend(pages)
+        masks_all.extend(_to_i32_mask(m) for m in masks)
+        counts.append(nb)
+
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
+    indptr[1:] = torch.tensor(counts, dtype=torch.int32).cumsum(0)
+    kv_block_pages = torch.tensor(pages_all, dtype=torch.int32, device=device)
+    kv_block_masks = torch.tensor(masks_all, dtype=torch.int32, device=device)
+    softmax_scale = float(D) ** -0.5
+    return (
+        q,
+        unified_kv,
+        kv_block_pages,
+        kv_block_masks,
+        indptr,
+        attn_sink,
+        softmax_scale,
+    )
+
+
+def pa_decode_sparse_blocked_reference(
+    q, unified_kv, kv_block_pages, kv_block_masks, kv_indptr, attn_sink, softmax_scale
+):
+    """Expand the block-table to flat slot ids and reuse the flat reference."""
+    total_pages, B, D = unified_kv.shape
+    flat_kv = unified_kv.reshape(total_pages * B, D)
+    T = q.size(0)
+    indptr = kv_indptr.to(torch.int64).tolist()
+    pages = kv_block_pages.tolist()
+    masks = kv_block_masks.tolist()
+
+    per_token = []
+    for t in range(T):
+        slots = []
+        for e in range(indptr[t], indptr[t + 1]):
+            page = pages[e]
+            mask_u = masks[e] & 0xFFFFFFFF  # int32 → unsigned bit pattern
+            for b in range(B):
+                if (mask_u >> b) & 1:
+                    slots.append(page * B + b)
+        per_token.append(slots)
+
+    counts = [len(s) for s in per_token]
+    flat_indptr = torch.zeros(T + 1, dtype=torch.int32, device=q.device)
+    flat_indptr[1:] = torch.tensor(counts, dtype=torch.int32).cumsum(0)
+    flat_idx = torch.tensor(
+        [s for slots in per_token for s in slots], dtype=torch.int32, device=q.device
+    )
+    return pa_decode_sparse_reference(
+        q, flat_kv, flat_idx, flat_indptr, attn_sink, softmax_scale
+    )
+
+
+@pytest.mark.parametrize("T", [1, 8, 256])
+@pytest.mark.parametrize("H", [1, 16])
+@pytest.mark.parametrize("D", [512])
+@pytest.mark.parametrize("B", [16, 32])
+@pytest.mark.parametrize("max_blocks", [4, 64])
+@pytest.mark.parametrize("var_len", [True, False])
+@pytest.mark.parametrize("skip_reduce", [True, False])
+def test_pa_decode_sparse_blocked_vs_reference(
+    T, H, D, B, max_blocks, var_len, skip_reduce
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    total_pages = max_blocks + 8  # > max_blocks so per-token pages stay distinct
+    q, ukv, pages, masks, indptr, sink, scale = _make_blocked_inputs(
+        T, H, D, B, max_blocks, total_pages, variable_len=var_len
+    )
+
+    ref = pa_decode_sparse_blocked_reference(q, ukv, pages, masks, indptr, sink, scale)
+    result = pa_decode_sparse_blocked(
+        q, ukv, pages, masks, indptr, sink, scale, skip_reduce=skip_reduce
+    )
+
+    if isinstance(result, tuple):
+        # skip_reduce with split-K active: combine partials in torch. The split
+        # unit is one block, so the segment math uses block_k=1; the blocked
+        # kernel is triton-only, so the partials are base-2 (use_exp2=True).
+        acc_partial, m_partial, l_partial = result
+        out = _reduce_partials_torch(
+            acc_partial, m_partial, l_partial, sink, indptr, block_k=1, use_exp2=True
+        ).to(q.dtype)
+    else:
         out = result
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)

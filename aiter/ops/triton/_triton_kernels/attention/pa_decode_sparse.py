@@ -402,3 +402,338 @@ def _pa_decode_sparse_reduce(
         out.to(out_ptr.dtype.element_ty),
         mask=h_mask[:, None] & d_mask[None, :],
     )
+
+
+_pa_decode_sparse_blocked_repr = make_kernel_repr(
+    "_pa_decode_sparse_blocked",
+    [
+        "BLOCK_H",
+        "BLOCK_D",
+        "B",
+        "H",
+        "D",
+        "KV_SPLITS",
+    ],
+)
+
+
+@triton.jit(repr=_pa_decode_sparse_blocked_repr)
+def _pa_decode_sparse_blocked(
+    q_ptr,  # [N, H, D]
+    unified_kv_ptr,  # [total_pages, B, D] bf16/fp16, or fp8 when QUANT_KV
+    kv_scales_ptr,  # [total_pages, B, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
+    kv_block_pages_ptr,  # [total_blocks] int32 — per-token page (block) lists, flat
+    kv_block_masks_ptr,  # [total_blocks] int32 — per-block B-bit validity bitmap
+    kv_indptr_ptr,  # [N+1] int32 — prefix sum over BLOCK entries per token
+    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32 (unused when KV_SPLITS==1)
+    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32 (unused when KV_SPLITS==1)
+    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32 (unused when KV_SPLITS==1)
+    attn_sink_ptr,  # [H] (only used when KV_SPLITS==1)
+    out_ptr,  # [N, H, D] (only used when KV_SPLITS==1)
+    total_pages,
+    q_stride_t: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    kv_stride_n: tl.constexpr,  # page stride
+    kv_stride_b: tl.constexpr,  # within-block (row) stride
+    kv_stride_d: tl.constexpr,
+    ks_stride_n: tl.constexpr,  # kv_scales page stride
+    ks_stride_b: tl.constexpr,  # kv_scales within-block stride
+    mp_stride_t: tl.constexpr,
+    mp_stride_k: tl.constexpr,
+    mp_stride_h: tl.constexpr,
+    lp_stride_t: tl.constexpr,
+    lp_stride_k: tl.constexpr,
+    lp_stride_h: tl.constexpr,
+    ap_stride_t: tl.constexpr,
+    ap_stride_k: tl.constexpr,
+    ap_stride_h: tl.constexpr,
+    ap_stride_d: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    B: tl.constexpr,
+    QUANT_KV: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    num_warps: tl.constexpr,
+):
+    """Block-table variant of ``_pa_decode_sparse``. Grid: (N, ceil(H/BLOCK_H), KV_SPLITS).
+
+    Functionally identical online-softmax + split-K + sink fold; the only
+    difference is the KV gather. ``kv_indices`` is replaced by a *block-table*:
+    each per-token entry is a ``(page_id, mask)`` pair where ``page_id`` indexes
+    the block-structured pool ``unified_kv[total_pages, B, D]`` and ``mask`` is a
+    B-bit bitmap (bit ``b`` set ⇔ row ``page_id*B + b`` is a valid key). Each
+    loop iteration gathers one page's ``[B, D]`` rows in one coalesced load
+    (vs ``BLOCK_K`` scattered single-row gathers), masking invalid rows out of
+    the softmax. The split axis tiles the token's *blocks* (B keys each) across
+    ``KV_SPLITS`` instead of ``BLOCK_K``-slot tiles.
+    """
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+
+    q = tl.load(
+        q_ptr
+        + t * q_stride_t
+        + h_offs[:, None] * q_stride_h
+        + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    # Fold softmax_scale AND log2(e) into q once (see _pa_decode_sparse).
+    LOG2E = 1.4426950408889634
+    q = (q.to(tl.float32) * (softmax_scale * LOG2E)).to(q_ptr.dtype.element_ty)
+
+    kv_start = tl.load(kv_indptr_ptr + t)
+    kv_end = tl.load(kv_indptr_ptr + t + 1)
+    n_blocks = kv_end - kv_start
+
+    # Same tiles_per_segment pattern, but the tile unit is one block (B keys),
+    # so there is no BLOCK_K factor: the split axis partitions the blocks.
+    tiles_per_segment = tl.cdiv(n_blocks, KV_SPLITS)
+    if pid_k * tiles_per_segment >= n_blocks:
+        return
+
+    blk_start = pid_k * tiles_per_segment
+    blk_end = tl.minimum((pid_k + 1) * tiles_per_segment, n_blocks)
+
+    if KV_SPLITS == 1:
+        sink = (
+            tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
+                tl.float32
+            )
+            * LOG2E
+        )
+        m_i = sink
+        l_i = tl.exp2(sink - m_i)
+    else:
+        m_i = tl.full((BLOCK_H,), float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
+    b_rows = tl.arange(0, B)
+    if QUANT_KV:
+        g_idx_per_d = d_offs // GROUP_SIZE
+    for j in tl.range(blk_start, blk_end, num_stages=2):
+        page = tl.load(kv_block_pages_ptr + kv_start + j)
+        mask = tl.load(kv_block_masks_ptr + kv_start + j)
+        # bit b of mask → row b of this page is a valid key. `& 1` isolates the
+        # low bit, so an arithmetic right-shift of a sign-set mask (bit B-1==31)
+        # is still correct.
+        valid = ((mask >> b_rows) & 1) != 0  # [B]
+
+        kv_raw = tl.load(
+            unified_kv_ptr
+            + page * kv_stride_n
+            + b_rows[:, None] * kv_stride_b
+            + d_offs[None, :] * kv_stride_d,
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        )  # [B, D]
+        if QUANT_KV:
+            scales_full = tl.load(
+                kv_scales_ptr
+                + page * ks_stride_n
+                + b_rows[:, None] * ks_stride_b
+                + g_idx_per_d[None, :],
+                mask=valid[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+            kv = (kv_raw.to(tl.float32) * scales_full).to(q_ptr.dtype.element_ty)
+        else:
+            kv = kv_raw
+
+        scores = tl.dot(q, tl.trans(kv))  # [BLOCK_H, B]
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, float("-inf"))
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        # A block with no valid key leaves m_new == -inf → exp2(-inf+inf)=NaN;
+        # treat as a no-op (see _pa_decode_sparse).
+        alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
+        p = tl.exp2(scores - m_new[:, None])
+        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        m_i = m_new
+        l_i = l_new
+
+    if KV_SPLITS == 1:
+        denom = tl.maximum(l_i, 1.0e-30)
+        out = tl.where(l_i[:, None] > 0.0, acc / denom[:, None], 0.0)
+        tl.store(
+            out_ptr
+            + t * out_stride_t
+            + h_offs[:, None] * out_stride_h
+            + d_offs[None, :] * out_stride_d,
+            out.to(out_ptr.dtype.element_ty),
+            mask=h_mask[:, None] & d_mask[None, :],
+        )
+    else:
+        m_base = t * mp_stride_t + pid_k * mp_stride_k
+        tl.store(
+            m_partial_ptr + m_base + h_offs * mp_stride_h,
+            m_i,
+            mask=h_mask,
+        )
+        l_base = t * lp_stride_t + pid_k * lp_stride_k
+        tl.store(
+            l_partial_ptr + l_base + h_offs * lp_stride_h,
+            l_i,
+            mask=h_mask,
+        )
+        a_base = t * ap_stride_t + pid_k * ap_stride_k
+        tl.store(
+            acc_partial_ptr
+            + a_base
+            + h_offs[:, None] * ap_stride_h
+            + d_offs[None, :] * ap_stride_d,
+            acc,
+            mask=h_mask[:, None] & d_mask[None, :],
+        )
+
+
+_pa_decode_sparse_blocked_reduce_repr = make_kernel_repr(
+    "_pa_decode_sparse_blocked_reduce",
+    [
+        "BLOCK_H",
+        "BLOCK_D",
+        "H",
+        "D",
+        "KV_SPLITS",
+    ],
+)
+
+
+@triton.jit(repr=_pa_decode_sparse_blocked_reduce_repr)
+def _pa_decode_sparse_blocked_reduce(
+    m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
+    l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
+    acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
+    attn_sink_ptr,  # [H]
+    kv_indptr_ptr,  # [N+1] int32 — used to derive per-token n_blocks
+    out_ptr,  # [N, H, D]
+    mp_stride_t: tl.constexpr,
+    mp_stride_k: tl.constexpr,
+    mp_stride_h: tl.constexpr,
+    lp_stride_t: tl.constexpr,
+    lp_stride_k: tl.constexpr,
+    lp_stride_h: tl.constexpr,
+    ap_stride_t: tl.constexpr,
+    ap_stride_k: tl.constexpr,
+    ap_stride_h: tl.constexpr,
+    ap_stride_d: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+):
+    """Combine KV_SPLITS partials, fold in attn_sink, write final output.
+
+    Identical to ``_pa_decode_sparse_reduce`` except the split axis tiles the
+    token's blocks (B keys each), so the stale-slot masking derives
+    ``act_num_segments`` from ``n_blocks`` directly (no ``BLOCK_K`` factor):
+    ``tiles_per_segment = cdiv(n_blocks, KV_SPLITS)`` and
+    ``act_num_segments = cdiv(n_blocks, tiles_per_segment)``.
+    """
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    k_offs = tl.arange(0, KV_SPLITS)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+
+    kv_start = tl.load(kv_indptr_ptr + t)
+    kv_end = tl.load(kv_indptr_ptr + t + 1)
+    n_blocks = kv_end - kv_start
+    tiles_per_segment = tl.cdiv(n_blocks, KV_SPLITS)
+    act_num_segments = tl.cdiv(n_blocks, tiles_per_segment)
+    segm_mask = k_offs < act_num_segments
+
+    m_p = tl.load(
+        m_partial_ptr
+        + t * mp_stride_t
+        + k_offs[:, None] * mp_stride_k
+        + h_offs[None, :] * mp_stride_h,
+        mask=segm_mask[:, None] & h_mask[None, :],
+        other=float("-inf"),
+    )  # [KV_SPLITS, BLOCK_H]
+    l_p = tl.load(
+        l_partial_ptr
+        + t * lp_stride_t
+        + k_offs[:, None] * lp_stride_k
+        + h_offs[None, :] * lp_stride_h,
+        mask=segm_mask[:, None] & h_mask[None, :],
+        other=0.0,
+    )  # [KV_SPLITS, BLOCK_H]
+    a_p = tl.load(
+        acc_partial_ptr
+        + t * ap_stride_t
+        + k_offs[:, None, None] * ap_stride_k
+        + h_offs[None, :, None] * ap_stride_h
+        + d_offs[None, None, :] * ap_stride_d,
+        mask=segm_mask[:, None, None] & h_mask[None, :, None] & d_mask[None, None, :],
+        other=0.0,
+    )  # [KV_SPLITS, BLOCK_H, BLOCK_D]
+
+    LOG2E = 1.4426950408889634
+    sink_scale = LOG2E if USE_EXP2 else 1.0
+
+    m_max = tl.max(m_p, axis=0)  # [BLOCK_H]
+    if USE_EXP2:
+        alpha_split = tl.where(
+            m_p == float("-inf"), 0.0, tl.exp2(m_p - m_max[None, :])
+        )  # [KV_SPLITS, BLOCK_H]
+    else:
+        alpha_split = tl.where(m_p == float("-inf"), 0.0, tl.exp(m_p - m_max[None, :]))
+    is_dead = m_p == float("-inf")  # [KV_SPLITS, BLOCK_H]
+    l_combined = tl.sum(tl.where(is_dead, 0.0, l_p * alpha_split), axis=0)  # [BLOCK_H]
+    acc_combined = tl.sum(
+        tl.where(is_dead[:, :, None], 0.0, a_p * alpha_split[:, :, None]), axis=0
+    )  # [BLOCK_H, BLOCK_D]
+
+    sink = (
+        tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(tl.float32)
+        * sink_scale
+    )
+    m_final = tl.maximum(m_max, sink)
+    if USE_EXP2:
+        alpha_kv = tl.exp2(m_max - m_final)
+        alpha_sink = tl.exp2(sink - m_final)
+    else:
+        alpha_kv = tl.exp(m_max - m_final)
+        alpha_sink = tl.exp(sink - m_final)
+    l_final = l_combined * alpha_kv + alpha_sink
+    acc_final = acc_combined * alpha_kv[:, None]
+
+    denom = tl.maximum(l_final, 1.0e-30)
+    out = tl.where(l_final[:, None] > 0.0, acc_final / denom[:, None], 0.0)
+    tl.store(
+        out_ptr
+        + t * out_stride_t
+        + h_offs[:, None] * out_stride_h
+        + d_offs[None, :] * out_stride_d,
+        out.to(out_ptr.dtype.element_ty),
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
