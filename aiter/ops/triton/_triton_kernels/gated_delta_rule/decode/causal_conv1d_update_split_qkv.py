@@ -79,7 +79,7 @@ def _causal_conv1d_update_split_qkv_kernel(
         if conv_state_batch_coord == pad_slot_id:
             return
 
-    # STEP 1: READ init_state data
+    # Load the current convolution state.
     conv_states_base = (
         conv_state_ptr
         + (conv_state_batch_coord * stride_conv_state_seq)
@@ -98,7 +98,7 @@ def _causal_conv1d_update_split_qkv_kernel(
         conv_states_ptrs = prior_tokens + 2 * stride_conv_state_tok
         col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
 
-    # STEP 2: Update conv state (same as original)
+    # Update the convolution state with the incoming tokens.
     idx_tokens = tl.arange(0, NP2_STATELEN)
 
     conv_state_ptrs_source = (
@@ -140,7 +140,7 @@ def _causal_conv1d_update_split_qkv_kernel(
     mask_store = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
     tl.store(conv_state_ptrs_target, new_conv_state, mask_store)
 
-    # STEP 3: init accumulator
+    # Initialize the accumulator.
     if HAS_BIAS:
         bias = bias_ptr + idx_feats
         mask_bias = idx_feats < dim
@@ -148,7 +148,7 @@ def _causal_conv1d_update_split_qkv_kernel(
     else:
         acc_preload = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-    # STEP 4: PRE-LOAD WEIGHTS
+    # Load convolution weights.
     w_base = w_ptr + (idx_feats * stride_w_dim)
     mask_w = idx_feats < dim
     if KERNEL_WIDTH >= 2:
@@ -166,7 +166,7 @@ def _causal_conv1d_update_split_qkv_kernel(
     x_base_1d = x_base
     mask_x_1d = idx_feats < dim
 
-    # STEP 5: compute each token and write to split buffers
+    # Compute each token and write to split buffers.
     for idx_token in tl.static_range(seqlen):
         acc = acc_preload
 
@@ -211,7 +211,7 @@ def _causal_conv1d_update_split_qkv_kernel(
             col1 = col2
             col2 = matrix_x
 
-        # Apply activation
+        # Apply activation.
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
 
@@ -341,7 +341,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
     USE_PAD_SLOT: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
-    """Gluon version of causal_conv1d_update_split_qkv kernel (original)."""
+    """Gluon causal_conv1d_update_split_qkv kernel using tuple state."""
 
     blocked: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[2],
@@ -368,7 +368,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
         if conv_state_batch_coord == pad_slot_id:
             return
 
-    # STEP 1: READ initial conv_state data
+    # Load the current convolution state.
     conv_states_base = (
         conv_state_ptr
         + (conv_state_batch_coord * stride_conv_state_seq)
@@ -389,7 +389,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
         + (idx_feats * stride_conv_state_dim)
     )
 
-    # STEP 3: init accumulator
+    # Initialize the accumulator.
     if HAS_BIAS:
         bias = bias_ptr + idx_feats
         mask_bias = idx_feats < dim
@@ -397,7 +397,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
     else:
         acc_preload = gl.zeros((BLOCK_N,), dtype=gl.float32, layout=blocked)
 
-    # STEP 4: PRE-LOAD WEIGHTS
+    # Load convolution weights.
     w_base = w_ptr + (idx_feats * stride_w_dim)
     mask_w = idx_feats < dim
     w_vecs = ()
@@ -409,7 +409,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
     x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
     mask_x_1d = idx_feats < dim
 
-    # STEP 5: compute each token and split to q/k/v
+    # Compute each token and split to q/k/v.
     for idx_token in gl.static_range(seqlen):
         acc = acc_preload
 
@@ -424,13 +424,13 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
 
         conv_state_vecs = conv_state_vecs[1:]
 
-        # Apply activation
+        # Apply activation.
         if SILU_ACTIVATION:
             acc = acc / (1 + gl.exp(-acc))
 
         mask_feat = (idx_token < seqlen) & (idx_feats < dim)
 
-        # Split and store to q, k, v
+        # Split and store to q, k, v.
         # Query: idx_feats in [0, key_dim)
         is_query = idx_feats < key_dim
         q_feat_idx = idx_feats
@@ -464,7 +464,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel(
         )
         gl.store(v_ptrs, acc, mask=mask_feat & is_value)
 
-    # Store final conv_state
+    # Store the final convolution state.
     for idx in gl.static_range(state_len):
         gl.store(
             conv_state_base + idx * stride_conv_state_tok,
@@ -522,12 +522,10 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
     USE_PAD_SLOT: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
-    """Gluon version of causal_conv1d_update_split_qkv kernel (optimized v2).
+    """Gluon causal_conv1d_update_split_qkv kernel using explicit state vectors.
 
-    Key optimizations:
-    - Eliminates tuple operations in hot loop (tuple_combine, tuple slicing)
-    - Uses explicit variables like Triton version for better register allocation
-    - Reduces memory allocation overhead in inner loop
+    The state and weight vectors are held in named variables to reduce tuple
+    manipulation in the inner loop.
     """
 
     blocked: gl.constexpr = gl.BlockedLayout(
@@ -555,7 +553,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
         if conv_state_batch_coord == pad_slot_id:
             return
 
-    # STEP 1: READ initial conv_state data (use explicit variables instead of tuple)
+    # Load the current convolution state into explicit variables.
     conv_states_base = (
         conv_state_ptr
         + (conv_state_batch_coord * stride_conv_state_seq)
@@ -564,7 +562,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
     mask_w = idx_feats < dim
 
     prior_tokens = conv_states_base
-    # Use explicit variables like Triton version - avoid tuple operations
+    # Keep state vectors in named variables through the token loop.
     if KERNEL_WIDTH >= 2:
         conv_states_ptrs = prior_tokens
         col0 = gl.load(conv_states_ptrs, mask_w, 0.0)
@@ -581,7 +579,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
         + (idx_feats * stride_conv_state_dim)
     )
 
-    # STEP 3: init accumulator
+    # Initialize the accumulator.
     if HAS_BIAS:
         bias = bias_ptr + idx_feats
         mask_bias = idx_feats < dim
@@ -589,7 +587,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
     else:
         acc_preload = gl.zeros((BLOCK_N,), dtype=gl.float32, layout=blocked)
 
-    # STEP 4: PRE-LOAD WEIGHTS (use explicit variables)
+    # Load convolution weights into explicit variables.
     w_base = w_ptr + (idx_feats * stride_w_dim)
     mask_w = idx_feats < dim
     if KERNEL_WIDTH >= 2:
@@ -607,8 +605,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
     x_base_1d = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
     mask_x_1d = idx_feats < dim
 
-    # STEP 5: compute each token and split to q/k/v
-    # Use explicit variable updates like Triton version - NO tuple operations in loop!
+    # Compute each token and split to q/k/v.
     for idx_token in gl.static_range(seqlen):
         acc = acc_preload
 
@@ -616,7 +613,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
         matrix_w = w_col0
         matrix_x = col0
 
-        # Compute convolution using explicit conditionals (like Triton)
+        # Compute convolution using explicit conditionals.
         for j in gl.static_range(KERNEL_WIDTH):
             if KERNEL_WIDTH == 2:
                 if j == 1:
@@ -645,7 +642,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
 
             acc += matrix_x * matrix_w
 
-        # Update sliding window with simple variable assignments (like Triton)
+        # Update the sliding window state.
         if KERNEL_WIDTH == 2:
             col0 = matrix_x
         elif KERNEL_WIDTH == 3:
@@ -656,13 +653,13 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
             col1 = col2
             col2 = matrix_x
 
-        # Apply activation
+        # Apply activation.
         if SILU_ACTIVATION:
             acc = acc / (1 + gl.exp(-acc))
 
         mask_feat = (idx_token < seqlen) & (idx_feats < dim)
 
-        # Split and store to q, k, v
+        # Split and store to q, k, v.
         # Query: idx_feats in [0, key_dim)
         is_query = idx_feats < key_dim
         q_feat_idx = idx_feats
@@ -696,7 +693,7 @@ def gluon_causal_conv1d_update_split_qkv_kernel_notuple(
         )
         gl.store(v_ptrs, acc, mask=mask_feat & is_value)
 
-    # Store final conv_state using explicit variables
+    # Store the final convolution state.
     if KERNEL_WIDTH >= 2:
         gl.store(conv_state_base + 0 * stride_conv_state_tok, col0, idx_feats < dim)
     if KERNEL_WIDTH >= 3:

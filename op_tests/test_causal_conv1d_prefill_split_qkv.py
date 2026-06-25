@@ -138,9 +138,7 @@ def _call_backend(
     seq_lens_cpu,
     activation="silu",
 ):
-    """Pattern-3 dispatch: each backend lives in its own namespace and the
-    caller (here, the test) picks one explicitly. There is no in-library
-    auto-dispatcher anymore."""
+    """Dispatch to the requested backend namespace for comparison tests."""
     if backend == "hip":
         from aiter.ops.causal_conv1d_fwd_split_qkv import (
             causal_conv1d_split_qkv_hip_fn,

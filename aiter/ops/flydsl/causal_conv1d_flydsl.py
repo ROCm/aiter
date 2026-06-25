@@ -591,7 +591,7 @@ def causal_conv1d_split_qkv_flydsl_fn(
             query_start_loc.numel() - 1, dtype=torch.bool, device=x.device
         )
 
-    # chunk schedule (reuse harness metadata when provided)
+    # Reuse precomputed chunk schedule metadata when provided.
     if (
         metadata is not None
         and hasattr(metadata, "nums_dict")

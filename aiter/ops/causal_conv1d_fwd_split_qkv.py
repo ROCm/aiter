@@ -42,7 +42,7 @@ def causal_conv1d_fwd_split_qkv_hip(
 ) -> None: ...
 
 
-# Token-tile auto-dispatch thresholds. Each pair is
+# Token-tile selection thresholds. Each pair is
 # ``(avg_seqlen_upper_bound, TM)``; the first match wins, else TM=64. The tile
 # is picked so that ``TM ~= avg seqlen``, minimizing both the masked-out waste
 # of an oversized tile and the per-chunk fixed cost of an undersized one.
@@ -141,7 +141,7 @@ def causal_conv1d_split_qkv_hip_fn(
 
     nums_dict = getattr(metadata, "nums_dict", None) if metadata is not None else None
     if nums_dict is not None and bm in nums_dict:
-        # Precomputed schedule for the chosen tile: reuse it (zero extra cost).
+        # Reuse the precomputed schedule for the selected tile.
         entry = nums_dict[bm]
         tot = int(entry["tot"])
         batch_ptr = entry["batch_ptr"]
@@ -151,9 +151,8 @@ def causal_conv1d_split_qkv_hip_fn(
             token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
     else:
         # Build the chosen tile's schedule once. When structured metadata is
-        # present, memoize it back into the shared ``nums_dict`` so sibling
-        # layers in this step reuse it instead of rebuilding (an auto-picked
-        # TM=16/32 typically is not in the caller's precomputed list).
+        # present, memoize it back into the shared ``nums_dict`` so later calls
+        # in the same step can reuse it instead of rebuilding.
         tot, batch_ptr, token_chunk_offset_ptr = _build_chunk_metadata(
             query_start_loc, bm
         )

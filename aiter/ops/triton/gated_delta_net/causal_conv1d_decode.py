@@ -54,7 +54,6 @@ def causal_conv1d_update_split_qkv(
     Returns:
         Tuple of (query, key, value) tensors
     """
-    # Validate and prepare
     if isinstance(activation, bool):
         activation = "silu" if activation is True else None
     elif activation is not None:
@@ -86,7 +85,6 @@ def causal_conv1d_update_split_qkv(
         device=x.device,
     )
 
-    # Kernel launch
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
     )
@@ -96,7 +94,6 @@ def causal_conv1d_update_split_qkv(
     BLOCK_N = 256
     grid = (batch, triton.cdiv(dim, BLOCK_N))
 
-    # Select kernel based on flags
     if use_gluon:
         kernel_fn = (
             gluon_causal_conv1d_update_split_qkv_kernel_notuple

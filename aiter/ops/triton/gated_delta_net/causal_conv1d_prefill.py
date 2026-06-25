@@ -5,14 +5,13 @@
 
 This is the public Triton namespace for the Gated-Delta-Rule (GDR / Mamba)
 prefill front-end depthwise conv. It exposes two interchangeable Triton kernels;
-the upper-layer framework selects which one to call (there is no in-library
-auto-dispatch across HIP / FlyDSL / Triton):
+the upper-layer framework selects the backend explicitly:
 
 * ``causal_conv1d_split_qkv_triton_fn``      -- 1D per-token kernel (portable; any width).
 * ``causal_conv1d_split_qkv_triton_tile_fn`` -- 2D-tiled kernel (vectorized over both
   feature and token axes; requires conv width in {2, 3, 4}).
 
-The sibling backends live in their own namespaces:
+The other backends live in their own namespaces:
 
 * HIP    : ``aiter.ops.causal_conv1d_fwd_split_qkv.causal_conv1d_split_qkv_hip_fn``
 * FlyDSL : ``aiter.ops.flydsl.causal_conv1d_flydsl.causal_conv1d_split_qkv_flydsl_fn``
@@ -208,9 +207,8 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     if has_initial_state is None:
         has_initial_state = torch.zeros(n_seqs, dtype=torch.bool, device=x.device)
 
-    # (sequence, chunk) schedule for the chosen BLOCK_M, with optional memoize
-    # into a shared ``metadata.nums_dict`` (reused across sibling layers / the
-    # HIP backend) keyed per BLOCK_M.
+    # (sequence, chunk) schedule for the chosen BLOCK_M, optionally memoized
+    # in ``metadata.nums_dict`` and shared with the HIP backend.
     nums_dict = getattr(metadata, "nums_dict", None) if metadata is not None else None
     if nums_dict is not None and BLOCK_M in nums_dict:
         entry = nums_dict[BLOCK_M]
