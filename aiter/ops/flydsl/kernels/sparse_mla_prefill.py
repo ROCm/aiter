@@ -932,7 +932,8 @@ def compile_sparse_mla_prefill_paged(
     KV_NUM_BLOCKS = QK_HEAD_DIM // KV_NUM_COLS  # 8 (512) or 9 (576)
     SZ_LDS_KV = KV_BLOCK_BYTES * KV_NUM_BLOCKS
     P_LDS_KV_0 = P_LDS_Q + SZ_LDS_Q
-    TOTAL_LDS_BYTES = P_LDS_KV_0 + SZ_LDS_KV
+    P_LDS_KV_1 = P_LDS_KV_0 + SZ_LDS_KV
+    TOTAL_LDS_BYTES = P_LDS_KV_1 + SZ_LDS_KV
     # BLOCK_N=64 @ head_dim=576 lands here (TOTAL_LDS_BYTES=79424 > 65536).
     if TOTAL_LDS_BYTES > 65536:
         raise NotImplementedError(
@@ -1199,6 +1200,24 @@ def compile_sparse_mla_prefill_paged(
                         cache_rsrc, _lds_ptr_from_i32(lds_base_i32), voff, offset=blk * KV_NUM_COLS
                     )
 
+        def _prefetch_flat_tile_asm(cache_rsrc, p_lds_kv_warp, token_base_i32, block_idx_const):
+            lds_adjust = block_idx_const * KV_BLOCK_BYTES - block_idx_const * KV_NUM_COLS
+            lds_base_i32 = _i32(ArithValue(p_lds_kv_warp) + lds_adjust)
+
+            def _emit_normal_load():
+                voff = _i32(ArithValue(token_base_i32) + kv_ld_col_base)
+                col_off_imm = block_idx_const * KV_NUM_COLS
+                lds_base_sgpr = _uniform_i32(lds_base_i32)
+                asm_str = "s_mov_b32 m0, $0\n" "s_nop 0\n" f"buffer_load_dword $1, $2, 0 offen offset:{col_off_imm} lds"
+                _inline_asm_void([lds_base_sgpr, voff, _raw(cache_rsrc)], asm_str, "s,v,s")
+
+            is_oob = ArithValue(token_base_i32) == -1
+            if is_oob:
+                lds_addr = _i32(ArithValue(lds_base_i32) + block_idx_const * KV_NUM_COLS + _i32(lane_idx) * 4)
+                _inline_asm_void([lds_addr, _raw(c_zero_i32)], "ds_write_b32 $0, $1", "v,v")
+            else:
+                _emit_normal_load()
+
         # ---- K/V LDS readers (identical to Phase A KvManagerV2 layout) ----
         k_row_in_mfma = lane_idx % MFMA_M
         k_row_phy = (k_row_in_mfma / 2) * 4 + k_row_in_mfma % 2
@@ -1414,8 +1433,29 @@ def compile_sparse_mla_prefill_paged(
             rv = _raw(Vec.filled(4, _f32(rescale), fx.Float32))
             return [_f32(oaccu[i]) * rv for i in range_constexpr(len(oaccu))]
 
-        def _process_tile_gemm1(idx_rsrc, num_rows_i32, p_lds_kv_base, kv_tile_start_i32, kv_end_i32, q_nope, rm_in, rse_in, is_first):
+        def _process_tile_gemm1(
+            idx_rsrc,
+            num_rows_i32,
+            p_lds_kv_base,
+            kv_tile_start_i32,
+            kv_end_i32,
+            q_nope,
+            rm_in,
+            rse_in,
+            is_first,
+            p_lds_kv_next_warp=None,
+            prefetch_cache_rsrc=None,
+            token_base_next=None,
+        ):
             k_base_i32 = _i32(ArithValue(p_lds_kv_base) + k_lds_lane_offset)
+            do_prefetch = GLM_FLAT and p_lds_kv_next_warp is not None
+
+            def _maybe_prefetch(block_idx):
+                if const_expr(not do_prefetch):
+                    return
+                _prefetch_flat_tile_asm(prefetch_cache_rsrc, p_lds_kv_next_warp, token_base_next, block_idx)
+
+            _maybe_prefetch(0)
             P_COMP_SUBS = BLOCK_N // MFMA_N
             p_comp = [c_zero_v4f32] * P_COMP_SUBS
             for nope_pair in range_constexpr(NUM_NOPE_ITERS):
@@ -1423,6 +1463,8 @@ def compile_sparse_mla_prefill_paged(
                 tile_1 = nope_pair * 2 + 1
                 k0 = [_load_k_from_lds(k_base_i32, 16 * h, tile_0 * BLOCK_K) for h in range_constexpr(P_COMP_SUBS)]
                 k1 = [_load_k_from_lds(k_base_i32, 16 * h, tile_1 * BLOCK_K) for h in range_constexpr(P_COMP_SUBS)]
+                if const_expr(nope_pair + 1 < KV_NUM_BLOCKS):
+                    _maybe_prefetch(nope_pair + 1)
                 rocdl.sched_barrier(0)
                 rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=P_COMP_SUBS))
                 q_0 = q_nope[tile_0]
@@ -1555,12 +1597,14 @@ def compile_sparse_mla_prefill_paged(
                 _store_oaccu_pair_bf16(a0, a1, pv, p_lds_o, row_base_idx)
 
         p_lds_kv_0_base = lds_base_idx + P_LDS_KV_0
+        p_lds_kv_1_base = lds_base_idx + P_LDS_KV_1
 
         def _kv_warp_lds_base(p_lds_kv_base):
             warp_offset = _raw(ArithValue(_uniform_i32(warp_idx)) * KV_SUB_BYTES)
             return _raw(ArithValue(_i32(p_lds_kv_base)) + warp_offset)
 
         p_lds_kv_0_warp = _kv_warp_lds_base(p_lds_kv_0_base)
+        p_lds_kv_1_warp = _kv_warp_lds_base(p_lds_kv_1_base)
 
         # ---- CSR ranges ----
         main_rng = Vec(buffer_ops.buffer_load(main_indptr_rsrc, q_idx, vec_width=2, dtype=T.i32))
@@ -1668,7 +1712,94 @@ def compile_sparse_mla_prefill_paged(
                 )
             return rm_n, rse_n, pp, rescale
 
-        if const_expr(NREG == 1):
+        if const_expr(NREG == 1 and GLM_FLAT):
+            tb_first, _sb_first = _row_addrs(
+                main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
+                main_start, main_end,
+            )
+            _load_flat_dma(main_cache_rsrc, p_lds_kv_0_warp, tb_first)
+            has_multi = ArithValue(n0_tiles) > 1
+
+            def _multi_tile_path_glm():
+                kv_tile1_start = _raw(ArithValue(main_start) + BLOCK_N)
+                tb_tile1, _sb_tile1 = _row_addrs(
+                    main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
+                    kv_tile1_start, main_end,
+                )
+                _barrier(vmcnt=0, lgkmcnt=0)
+                rocdl.sched_barrier(0)
+                rm_first, rse_first, p_pack_first, _rescale_first = _process_tile_gemm1(
+                    main_indices_rsrc, main_num_rows, p_lds_kv_0_base, main_start, main_end,
+                    q_nope_packs, c_neg_large, c_zero_f32, True,
+                    p_lds_kv_next_warp=p_lds_kv_1_warp,
+                    prefetch_cache_rsrc=main_cache_rsrc,
+                    token_base_next=tb_tile1,
+                )
+                oaccu_first = _gemm2_first_iter(p_pack_first, _vt_base_i32())
+
+                num_tiles_m1 = _raw(ArithValue(n0_tiles) - 1)
+                init_args = [rm_first, rse_first] + oaccu_first
+                for tile_iv, state in range(_idx(1), _idx(num_tiles_m1), _idx(1), init=init_args):
+                    tile_i32_a = ArithValue(fx.Int32(tile_iv))
+                    kv_ts = _raw(ArithValue(main_start) + tile_i32_a * BLOCK_N)
+                    kv_next = _raw(ArithValue(kv_ts) + BLOCK_N)
+                    tb_next, _sb_next = _row_addrs(
+                        main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
+                        kv_next, main_end,
+                    )
+                    rm_c = state[0]
+                    rse_c = state[1]
+                    oaccu_c = [state[2 + i] for i in range(NUM_PV_ITERS * 2)]
+                    is_odd = (tile_i32_a & 1) != 0
+                    curr_base = ArithValue(is_odd).select(p_lds_kv_1_base, p_lds_kv_0_base)
+                    next_warp = ArithValue(is_odd).select(p_lds_kv_0_warp, p_lds_kv_1_warp)
+                    _barrier(vmcnt=0, lgkmcnt=0)
+                    rocdl.sched_barrier(0)
+                    rm_n, rse_n, pp, rescale = _process_tile_gemm1(
+                        main_indices_rsrc, main_num_rows, curr_base, kv_ts, main_end,
+                        q_nope_packs, rm_c, rse_c, False,
+                        p_lds_kv_next_warp=next_warp,
+                        prefetch_cache_rsrc=main_cache_rsrc,
+                        token_base_next=tb_next,
+                    )
+                    oaccu_n = _gemm2_with_rescale(pp, rescale, oaccu_c, _vt_base_i32())
+                    results = yield [rm_n, rse_n] + oaccu_n
+
+                rm_mid = results[0]
+                rse_mid = results[1]
+                oaccu_mid = [results[2 + i] for i in range(NUM_PV_ITERS * 2)]
+                last_tile_i32 = _raw(ArithValue(n0_tiles) - 1)
+                kv_last_start = _raw(ArithValue(main_start) + ArithValue(last_tile_i32) * BLOCK_N)
+                last_is_odd = (ArithValue(last_tile_i32) & 1) != 0
+                last_curr_base = ArithValue(last_is_odd).select(p_lds_kv_1_base, p_lds_kv_0_base)
+                _barrier(vmcnt=0, lgkmcnt=0)
+                rocdl.sched_barrier(0)
+                rm_l, rse_l, pp_l, rescale_l = _process_tile_gemm1(
+                    main_indices_rsrc, main_num_rows, last_curr_base, kv_last_start, main_end,
+                    q_nope_packs, rm_mid, rse_mid, False,
+                )
+                oaccu_l = _gemm2_with_rescale(pp_l, rescale_l, oaccu_mid, _vt_base_i32())
+                _normalize_and_store(oaccu_l, rm_l, rse_l, row_base)
+
+            def _single_tile_path_glm():
+                _barrier(vmcnt=0, lgkmcnt=0)
+                rocdl.sched_barrier(0)
+                rm_first, rse_first, p_pack_first, _rescale_first = _process_tile_gemm1(
+                    main_indices_rsrc, main_num_rows, p_lds_kv_0_base, main_start, main_end,
+                    q_nope_packs, c_neg_large, c_zero_f32, True,
+                )
+                oaccu_first = _gemm2_first_iter(p_pack_first, _vt_base_i32())
+                _normalize_and_store(oaccu_first, rm_first, rse_first, row_base)
+
+            @flyc.jit
+            def _dispatch_glm():
+                if has_multi:
+                    _multi_tile_path_glm()
+                else:
+                    _single_tile_path_glm()
+
+            _dispatch_glm()
+        elif const_expr(NREG == 1):
             # First tile is always region0 tile 0 (handles all-empty -> masked
             # -> zero output, and initialises the shared softmax state).
             rm_first, rse_first, oaccu_first = _attend_region0(
