@@ -18,14 +18,22 @@ It covers three layers:
   3. End-to-end correctness sweep against the reference, now covering
      every supported power-of-two ``group_size`` on a canonical shape
      set, in addition to the full-shape sweep at ``group_size=128``.
+     Both scale layouts are exercised: row-major (default) and column-major
+     (``transpose_scale=True``, what ``gemm_a8w8_blockscale_preshuffle``
+     consumes). The test asserts the returned scale's storage stride matches
+     the requested layout AND that the dequant still reproduces the
+     reference, proving each group's scale landed in the correct slot.
 
 Usage:
-    # default: full-shape sweep at group_size=128, TP=8
+    # default: full-shape sweep at group_size=128, TP=8, both scale layouts
     python test_fused_ar_rms_per_group_quant.py
 
     # single-shape check with a specific group_size / TP
     python test_fused_ar_rms_per_group_quant.py -t 8 -s 64,4096
     python test_fused_ar_rms_per_group_quant.py -t 4 --group-size 128
+
+    # pin a single scale layout (0 = row-major, 1 = column-major)
+    python test_fused_ar_rms_per_group_quant.py -t 8 --transpose-scale 1
 
     # sweep all supported group_sizes {32,64,128,256,512} on a canonical
     # shape set at the given TP
@@ -195,12 +203,20 @@ def fused_ar_rmsnorm_per_group_quant(
     withGraph=False,
     distributed_init_method: Optional[str] = None,
     emit_bf16: bool = False,
+    transpose_scale: bool = False,
 ):
     """Run fused AR+RMSNorm+per-group-quant on a single rank.
 
     When ``emit_bf16=True`` the kernel ALSO writes the pre-quantization
     bf16/fp16 normed output; we cross-check that bf16 output against the
     fp8+scale dequant to verify the two outputs agree to FP8 precision.
+
+    When ``transpose_scale=True`` the kernel writes the per-group scale in
+    column-major layout ``(num_groups, M)`` viewed as ``(M, num_groups)``
+    (what ``gemm_a8w8_blockscale_preshuffle`` expects). The returned tensor
+    keeps the logical ``(M, num_groups)`` shape but column-major storage, so
+    the dequant must still reproduce the reference -- proving the kernel wrote
+    each group's scale to the correct transposed slot.
     """
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -232,6 +248,7 @@ def fused_ar_rmsnorm_per_group_quant(
             quant_type="per_group",
             group_size=group_size,
             emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
         )
         if emit_bf16:
             out, res_out, scale_out, bf16_out = res
@@ -245,6 +262,28 @@ def fused_ar_rmsnorm_per_group_quant(
     else:
         out_fp8, scale_out, res_out = result
         bf16_out = None
+
+    # The returned scale carries the logical (M, num_groups) shape for both
+    # layouts; only the storage stride differs:
+    #   transpose_scale=False -> row-major,    stride (num_groups, 1)
+    #   transpose_scale=True  -> column-major, stride (1, M) -- storage
+    #       (num_groups, M) viewed transposed; this is what
+    #       gemm_a8w8_blockscale_preshuffle consumes (and what inductor
+    #       re-strides the fused op output to). In both cases reading
+    #       scale[t, g] yields the correct per-(token, group) scale, so the
+    #       dequant below is layout-agnostic.
+    M_local, num_groups_local = scale_out.shape
+    if transpose_scale:
+        assert scale_out.stride() == (1, M_local), (
+            f"transpose_scale: expected column-major stride (1, {M_local}), "
+            f"got {scale_out.stride()} for shape {tuple(scale_out.shape)}"
+        )
+    else:
+        assert scale_out.stride() == (num_groups_local, 1), (
+            f"row-major: expected stride ({num_groups_local}, 1), "
+            f"got {scale_out.stride()} for shape {tuple(scale_out.shape)}"
+        )
+
     dequant = out_fp8.float() * scale_out.repeat_interleave(group_size, dim=-1)
 
     # When requesting bf16 output, verify it matches the fp8+scale dequant
@@ -255,12 +294,17 @@ def fused_ar_rmsnorm_per_group_quant(
     if bf16_out is not None:
         bf16_vs_fp8_diff = (bf16_out.float() - dequant).abs().max().item()
 
+    # Capture shape/stride as plain Python tuples before teardown frees the
+    # device tensors.
+    scale_shape = tuple(scale_out.shape)
+    scale_stride = scale_out.stride()
+
     if dist.is_initialized():
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
 
-    return dequant.to(x.dtype), us, scale_out.shape, bf16_vs_fp8_diff
+    return dequant.to(x.dtype), us, scale_shape, bf16_vs_fp8_diff, scale_stride
 
 
 @benchmark()
@@ -273,6 +317,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
     withGraph=False,
     distributed_init_method: Optional[str] = None,
     emit_bf16: bool = False,
+    transpose_scale: bool = False,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -300,6 +345,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
                     withGraph,
                     distributed_init_method,
                     emit_bf16,
+                    transpose_scale,
                 ),
             )
         )
@@ -316,9 +362,10 @@ def test_fused_ar_rmsnorm_per_group_quant(
         cpu_rslt.append(host_normed)
 
     rets = [el.get() for el in rets]
-    all_us = [us for _, us, _, _ in rets]
-    scale_shapes = [ss for _, _, ss, _ in rets]
-    bf16_diffs = [bd for _, _, _, bd in rets if bd is not None]
+    all_us = [us for _, us, _, _, _ in rets]
+    scale_shapes = [ss for _, _, ss, _, _ in rets]
+    bf16_diffs = [bd for _, _, _, bd, _ in rets if bd is not None]
+    scale_strides = [st for _, _, _, _, st in rets]
 
     M, K = shape
     expected_scale_shape = (M, K // group_size)
@@ -327,14 +374,27 @@ def test_fused_ar_rmsnorm_per_group_quant(
             ss == expected_scale_shape
         ), f"Scale shape mismatch: got {ss}, expected {expected_scale_shape}"
 
+    # The fused kernel's scale layout must match what the downstream GEMM (and
+    # inductor's re-layout of the op output) expects: column-major stride (1, M)
+    # when transpose_scale=True, else row-major stride (num_groups, 1). Combined
+    # with the value-level checkAllclose below, this guarantees each group's
+    # scale landed in the correct slot.
+    num_groups = K // group_size
+    expected_stride = (1, M) if transpose_scale else (num_groups, 1)
+    for st in scale_strides:
+        assert st == expected_stride, (
+            f"Scale stride mismatch (transpose_scale={transpose_scale}): "
+            f"got {st}, expected {expected_stride}"
+        )
+
     atol = 5e-2
     rtol = 5e-2
     max_err = 0.0
-    for dequant_out, us, _, _ in rets:
+    for dequant_out, us, _, _, _ in rets:
         msg = (
             f"test_fused_ar_rmsnorm_per_group_quant: "
             f"{shape=} {dtype=} {group_size=} {withGraph=} "
-            f"{emit_bf16=} {us:>8.2f}"
+            f"{emit_bf16=} {transpose_scale=} {us:>8.2f}"
         )
         err = checkAllclose(
             cpu_rslt[dequant_out.device.index],
@@ -356,6 +416,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
 
     return {
         "emit_bf16": emit_bf16,
+        "transpose_scale": transpose_scale,
         "per_group_min_us": min(all_us),
         "per_group_max_us": max(all_us),
         "per_group_err": max_err,
@@ -407,6 +468,10 @@ l_group_size = [128]
 # Cover both the fp8-only output (keep_bf16=False, std-attention layers)
 # and the fp8+bf16 dual-output (keep_bf16=True, GDN-style layers).
 l_emit_bf16 = [False, True]
+# Cover both scale layouts: row-major (non-preshuffle GEMM, default) and
+# column-major (transpose_scale=True, what gemm_a8w8_blockscale_preshuffle
+# consumes). Both must reproduce the same reference dequant.
+l_transpose_scale = [False, True]
 
 parser = argparse.ArgumentParser(
     description="Test fused AR+RMSNorm+per-group FP8 quant"
@@ -475,6 +540,18 @@ parser.add_argument(
     action="store_true",
     help="Skip the non-distributed _validate_per_group_size unit test.",
 )
+parser.add_argument(
+    "--transpose-scale",
+    type=int,
+    choices=[0, 1],
+    nargs="?",
+    const=None,
+    default=None,
+    help=(
+        "Pin the scale layout: 0 = row-major only, 1 = column-major "
+        "(transpose_scale) only. Default sweeps both."
+    ),
+)
 
 if __name__ == "__main__":
     freeze_support()
@@ -500,6 +577,8 @@ if __name__ == "__main__":
         l_graph = [args.graphon]
     if args.group_size is not None:
         l_group_size = [args.group_size]
+    if args.transpose_scale is not None:
+        l_transpose_scale = [bool(args.transpose_scale)]
 
     # ``--sweep-group-size`` replaces the default matrix with the cross
     # product of every supported group_size (power-of-two tpg on bf16)
@@ -513,8 +592,24 @@ if __name__ == "__main__":
         l_emit_bf16 = [False, True]
 
     df = []
-    for dtype, shape, tp, pp, graph_on, gs, emit_bf16 in itertools.product(
-        l_dtype, l_shape, l_tp, l_pp, l_graph, l_group_size, l_emit_bf16
+    for (
+        dtype,
+        shape,
+        tp,
+        pp,
+        graph_on,
+        gs,
+        emit_bf16,
+        transpose_scale,
+    ) in itertools.product(
+        l_dtype,
+        l_shape,
+        l_tp,
+        l_pp,
+        l_graph,
+        l_group_size,
+        l_emit_bf16,
+        l_transpose_scale,
     ):
         ret = test_fused_ar_rmsnorm_per_group_quant(
             tp,
@@ -527,6 +622,7 @@ if __name__ == "__main__":
                 get_ip(), get_open_port()
             ),
             emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
         )
         df.append(ret)
 
@@ -538,6 +634,7 @@ if __name__ == "__main__":
         "group_size",
         "withGraph",
         "emit_bf16",
+        "transpose_scale",
         "per_group_min_us",
         "per_group_max_us",
         "per_group_err",

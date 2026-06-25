@@ -200,6 +200,65 @@ def fused_allreduce_rmsnorm_quant_(
     )
 
 
+def fused_allreduce_rmsnorm_quant_per_group_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Meta/fake for the fused AR+RMSNorm+per-group-FP8-quant op.
+
+    Returns ``(out_fp8, residual_out, scale)``. The scale stride MUST match what
+    the real op returns AND what inductor lays out for the downstream preshuffle
+    GEMM consumer:
+      - transpose_scale=False: row-major (M, num_groups), stride (num_groups, 1)
+      - transpose_scale=True : column-major -- storage (num_groups, M) viewed
+        transposed to (M, num_groups), stride (1, M). This is the layout
+        ``gemm_a8w8_blockscale_preshuffle`` consumes, and (because the op has no
+        needs_fixed_stride_order tag on torch>=2.8) is also the layout inductor
+        re-strides the op output to; the fake must declare it to avoid an
+        assert_size_stride failure.
+    """
+    from aiter.utility.dtypes import fp8
+
+    M = inp.shape[0]
+    K = inp.shape[-1]
+    num_groups = K // group_size
+    out = torch.empty_like(inp, dtype=fp8)
+    res_out = torch.empty_like(res_inp)
+    if transpose_scale:
+        scale = torch.empty(
+            (num_groups, M), dtype=torch.float32, device=inp.device
+        ).transpose(0, 1)
+    else:
+        scale = torch.empty((M, num_groups), dtype=torch.float32, device=inp.device)
+    return out, res_out, scale
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_per_group_fake)
+def fused_allreduce_rmsnorm_quant_per_group_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_per_group_out_place(
+        inp, res_inp, w, eps, group_size, prefill_support, transpose_scale
+    )
+
+
 def fused_qknorm_allreduce_fake(
     qkv_in: torch.Tensor,
     q_w: torch.Tensor,
@@ -559,6 +618,7 @@ class GroupCoordinator:
         quant_type: Any = "per_token",
         group_size: int = 128,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         if quant_type == "per_token" and group_size == 128 and not emit_bf16:
             return fused_allreduce_rmsnorm_quant_(
@@ -580,6 +640,7 @@ class GroupCoordinator:
             quant_type=quant_type,
             group_size=group_size,
             emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -591,9 +652,29 @@ class GroupCoordinator:
         group_size: int = 128,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        # The 3-output (fp8, residual, scale) case goes through a
+        # torch.library-registered op so it is traceable under torch.compile /
+        # inductor (mirrors the per_token fast-path in
+        # fused_allreduce_rmsnorm_quant). Without this, the per_group call is a
+        # plain Python -> pybind chain that Dynamo cannot trace, so the fused op
+        # never lowers into the compiled graph and the model silently falls back
+        # to the plain AllReduce+RMSNorm path. The emit_bf16 case returns a 4th
+        # tensor and is rare/eager-only, so it stays on the direct path.
+        # if not emit_bf16:
+        #     return fused_allreduce_rmsnorm_quant_per_group_(
+        #         input_,
+        #         residual_inp_,
+        #         weight_,
+        #         eps,
+        #         group_name=self.unique_name,
+        #         group_size=group_size,
+        #         prefill_support=prefill_support,
+        #         transpose_scale=transpose_scale,
+        #     )
         return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
             input_,
             residual_inp_,
@@ -602,6 +683,7 @@ class GroupCoordinator:
             group_size,
             prefill_support,
             emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
         )
 
     def fused_qknorm_allreduce(
@@ -699,6 +781,28 @@ class GroupCoordinator:
             weight_,
             eps,
             prefill_support,
+        )
+
+    def _fused_allreduce_rmsnorm_quant_per_group_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        prefill_support: bool = False,
+        transpose_scale: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_size=group_size,
+            prefill_support=prefill_support,
+            transpose_scale=transpose_scale,
         )
 
     def _fused_qknorm_allreduce_out_place(
