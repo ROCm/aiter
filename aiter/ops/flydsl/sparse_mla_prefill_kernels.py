@@ -9,7 +9,9 @@
 - ``flydsl_sparse_mla_prefill_2region``: Phase B2 two-region native path
   (compressed OCP pool + SWA fnuz cache, shared online softmax).
 
-See ``docs/sparse-mla-prefill/`` and ``aiter/ops/flydsl/kernels/sparse_mla_prefill.py``.
+Callers must supply tensors in the layout/dtype the kernel expects.  This module
+does **not** cast, copy, or allocate per-forward scratch (except one-time launch
+stubs for compile-time-disabled optional kernel inputs).
 """
 
 from functools import lru_cache
@@ -21,6 +23,28 @@ from .kernels.sparse_mla_prefill import compile_sparse_mla_prefill
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = ["flydsl_sparse_mla_prefill", "flydsl_sparse_mla_prefill_2region"]
+
+NUM_HEADS = 128
+HEAD_DIM = 512
+DEFAULT_SOFTMAX_SCALE = HEAD_DIM**-0.5
+
+# Launch stubs for kernel parameters that stay in the ABI but are unused when
+# ``single_request=True`` or ``has_sink=False`` at compile time.  Created once.
+_STUB: dict[tuple, torch.Tensor] = {}
+
+
+def _stub_i32(device: torch.device) -> torch.Tensor:
+    key = ("i32", str(device))
+    if key not in _STUB:
+        _STUB[key] = torch.zeros(1, dtype=torch.int32, device=device)
+    return _STUB[key]
+
+
+def _stub_sink(device: torch.device) -> torch.Tensor:
+    key = ("sink", str(device))
+    if key not in _STUB:
+        _STUB[key] = torch.zeros(NUM_HEADS, dtype=torch.float32, device=device)
+    return _STUB[key]
 
 
 @lru_cache(maxsize=64)
@@ -39,6 +63,8 @@ def _get_kernel(
     split_kv: bool,
     packed: bool,
     scale_mode: str,
+    softmax_scale: float,
+    single_request: bool,
 ):
     return compile_sparse_mla_prefill(
         head_dim=head_dim,
@@ -55,6 +81,8 @@ def _get_kernel(
         split_kv=split_kv,
         packed=packed,
         scale_mode=scale_mode,
+        softmax_scale=softmax_scale,
+        single_request=single_request,
     )
 
 
@@ -72,143 +100,217 @@ def _fx_stream(device, stream):
     return Stream(launch_stream)
 
 
-def _validate_qout(q, out):
+def _require_cuda(*tensors: torch.Tensor) -> None:
+    for t in tensors:
+        if not t.is_cuda:
+            raise ValueError("flydsl_sparse_mla_prefill requires CUDA/HIP tensors")
+
+
+def _require_int32_contiguous(t: torch.Tensor, name: str) -> torch.Tensor:
+    if t.dtype != torch.int32:
+        raise TypeError(f"{name} must be int32, got {t.dtype}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    return t
+
+
+def _require_int32_1d(t: torch.Tensor, name: str, *, numel: int | None = None) -> torch.Tensor:
+    t = _require_int32_contiguous(t, name)
+    if t.dim() != 1:
+        raise ValueError(f"{name} must be 1D, got shape {tuple(t.shape)}")
+    if numel is not None and t.numel() != numel:
+        raise ValueError(f"{name} must have {numel} elements, got {t.numel()}")
+    return t
+
+
+def _require_f32_1d(t: torch.Tensor, name: str, *, numel: int) -> torch.Tensor:
+    if t.dtype != torch.float32:
+        raise TypeError(f"{name} must be float32, got {t.dtype}")
+    if t.dim() != 1:
+        raise ValueError(f"{name} must be 1D, got shape {tuple(t.shape)}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if t.numel() != numel:
+        raise ValueError(f"{name} must have {numel} elements, got {t.numel()}")
+    return t
+
+
+def _require_bf16_contiguous(t: torch.Tensor, name: str) -> torch.Tensor:
+    if t.dtype != torch.bfloat16:
+        raise TypeError(f"{name} must be bfloat16, got {t.dtype}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    return t
+
+
+def _flat_bf16(t: torch.Tensor, name: str) -> torch.Tensor:
+    return _require_bf16_contiguous(t, name).view(-1)
+
+
+def _validate_qout(q: torch.Tensor, out: torch.Tensor) -> tuple[int, int, int, int]:
     if q.dim() != 3 or out.dim() != 3:
         raise ValueError(f"q/out must be 3D [s_q, H, D], got q={tuple(q.shape)} out={tuple(out.shape)}")
     num_queries, num_heads, head_dim = q.shape
     out_sq, out_h, v_dim = out.shape
     if (out_sq, out_h) != (num_queries, num_heads):
         raise ValueError("q and out must share (num_queries, num_heads)")
-    if num_heads != 128 or head_dim != 512 or v_dim != 512:
+    if num_heads != NUM_HEADS or head_dim != HEAD_DIM or v_dim != HEAD_DIM:
         raise NotImplementedError(
-            f"requires H=128, head_dim=512, v_dim=512; got H={num_heads}, head_dim={head_dim}, v_dim={v_dim}"
+            f"requires H={NUM_HEADS}, head_dim={HEAD_DIM}, v_dim={HEAD_DIM}; "
+            f"got H={num_heads}, head_dim={head_dim}, v_dim={v_dim}"
         )
-    if q.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
-        raise ValueError(f"q/out must be bf16, got q={q.dtype} out={out.dtype}")
     return num_queries, num_heads, head_dim, v_dim
 
 
-def _packed_cache_meta(cache, block_size):
-    """Return (cache_u8_flat, num_rows, num_blocks) for a packed fp8_ds_mla cache."""
+def _packed_cache_u8(cache: torch.Tensor, block_size: int) -> tuple[torch.Tensor, int, int]:
     if cache.dim() != 3 or cache.shape[-1] != 584:
         raise ValueError(f"packed cache must be [num_blocks, block_size, 584], got {tuple(cache.shape)}")
     num_blocks, blk, _ = cache.shape
     if blk != block_size:
         raise ValueError(f"cache block_size {blk} != block_size arg {block_size}")
+    if not cache.is_contiguous():
+        raise ValueError("packed cache must be contiguous")
     num_rows = num_blocks * block_size
-    cache_u8 = cache.contiguous().view(torch.uint8).reshape(-1)
+    cache_u8 = cache.view(torch.uint8).reshape(-1)
     return cache_u8, num_rows, num_blocks
 
 
-def flydsl_sparse_mla_prefill(
-    q: torch.Tensor,  # [num_queries, 128, 512] bf16
-    kv: torch.Tensor,  # flat fp8 [num_kv_rows, 1, 512] (Phase A) OR packed cache (packed=True)
-    indices: torch.Tensor,  # flat int32 CSR values
-    indptr: torch.Tensor,  # [num_queries + 1] int32 CSR offsets
-    out: torch.Tensor,  # [num_queries, 128, 512] bf16 (in place)
+def _resolve_q_req(
+    q_req: torch.Tensor | None,
     *,
-    scale: float,
-    attn_sink: torch.Tensor | None = None,  # [128] f32 (packed path only)
-    block_table: torch.Tensor | None = None,  # [num_reqs, max_blocks] int32 (packed)
+    num_queries: int,
+    single_request: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    if single_request:
+        return _stub_i32(device)
+    if q_req is None:
+        raise ValueError("q_req [num_queries] int32 is required when single_request=False")
+    return _require_int32_1d(q_req, "q_req", numel=num_queries)
+
+
+def _resolve_sink(
+    attn_sink: torch.Tensor | None,
+    *,
+    has_sink: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    if not has_sink:
+        return _stub_sink(device)
+    if attn_sink is None:
+        raise ValueError("attn_sink [128] float32 is required for this kernel specialization")
+    return _require_f32_1d(attn_sink, "attn_sink", numel=NUM_HEADS)
+
+
+def flydsl_sparse_mla_prefill(
+    q: torch.Tensor,  # [num_queries, 128, 512] bf16 contiguous
+    kv: torch.Tensor,  # flat fp8 [num_kv_rows, 1, 512] (Phase A) OR packed cache (packed=True)
+    indices: torch.Tensor,  # flat int32 CSR values, contiguous
+    indptr: torch.Tensor,  # [num_queries + 1] int32, contiguous
+    out: torch.Tensor,  # [num_queries, 128, 512] bf16 contiguous (in place)
+    *,
+    attn_sink: torch.Tensor | None = None,  # [128] f32 contiguous (packed + has_sink)
+    block_table: torch.Tensor | None = None,  # [num_reqs, max_blocks] int32 contiguous (packed)
     block_size: int = 1,
     packed: bool = False,
     scale_mode: str = "none",  # "none" | "ue8m0"
-    q_req: torch.Tensor | None = None,  # [num_queries] int32 -> request id
+    q_req: torch.Tensor | None = None,  # [num_queries] int32 (only if single_request=False)
     num_kv_rows: int | None = None,
+    single_request: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> None:
     """Run sparse MLA prefill in-place into ``out``.
 
-    Phase A (``packed=False``): flat fp8 e4m3fnuz cache, single region, no sink.
-    Phase B1 (``packed=True``): paged ``fp8_ds_mla`` cache, single region,
-    optional UE8M0 (``scale_mode="ue8m0"``) and ``attn_sink``.
+    Softmax scale is fixed at compile time (``1/sqrt(512)``).  All tensor args
+    must already match kernel dtype/layout; this entry point validates only.
     """
-    if not (q.is_cuda and kv.is_cuda and indices.is_cuda and indptr.is_cuda and out.is_cuda):
-        raise ValueError("flydsl_sparse_mla_prefill requires CUDA/HIP tensors")
+    _require_cuda(q, kv, indices, indptr, out)
     _check_gfx942(q.device)
     num_queries, num_heads, head_dim, v_dim = _validate_qout(q, out)
-    if indptr.numel() != num_queries + 1:
-        raise ValueError(f"indptr must have num_queries+1={num_queries + 1} elems, got {indptr.numel()}")
-
-    indices_i32 = indices.reshape(-1).to(torch.int32).contiguous()
-    indptr_i32 = indptr.reshape(-1).to(torch.int32).contiguous()
-    scale_t = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    _require_int32_1d(indptr, "indptr", numel=num_queries + 1)
+    indices_i32 = _require_int32_1d(indices, "indices")
+    q_flat = _flat_bf16(q, "q")
+    out_flat = _flat_bf16(out, "out")
 
     if not packed:
         if attn_sink is not None:
             raise NotImplementedError("attn_sink is the packed (B1) path; pass packed=True")
-        kv2d = kv.reshape(kv.shape[0], -1)
-        if kv2d.shape[1] != head_dim:
-            raise ValueError(f"kv last dim must be head_dim={head_dim}, got {kv2d.shape[1]}")
-        n_kv_rows = kv2d.shape[0]
-        kv_u8 = kv2d.view(torch.uint8) if kv2d.dtype != torch.uint8 else kv2d
+        if kv.dim() != 3 or kv.shape[1] != 1 or kv.shape[2] != head_dim:
+            raise ValueError(f"flat kv must be [num_kv_rows, 1, {head_dim}], got {tuple(kv.shape)}")
+        if not kv.is_contiguous():
+            raise ValueError("kv must be contiguous")
+        kv_u8 = kv.view(torch.uint8).reshape(-1)
+        n_kv_rows = kv.shape[0]
         exe = _get_kernel(
             head_dim=head_dim, v_dim=v_dim, num_regions=1, has_sink=False,
             r0_dtype="fp8", r0_fnuz=True, r1_dtype="fp8", r1_fnuz=True,
             qk_split=False, block_n=32, block_h=16, split_kv=False, packed=False, scale_mode="none",
+            softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=True,
         )
         with torch.cuda.device(q.device.index):
             _run_compiled(
-                exe, q.contiguous().reshape(-1), kv_u8.contiguous().reshape(-1),
-                indices_i32, indptr_i32, out.reshape(-1), scale_t,
+                exe, q_flat, kv_u8, indices_i32, indptr, out_flat,
                 int(num_queries), int(n_kv_rows), _fx_stream(q.device, stream),
             )
         return
 
-    # ---- packed B1 path ----
     if block_table is None:
         raise ValueError("packed=True requires block_table [num_reqs, max_blocks] int32")
-    cache_u8, default_rows, _ = _packed_cache_meta(kv, block_size)
+    cache_u8, default_rows, _ = _packed_cache_u8(kv, block_size)
     n_kv_rows = int(num_kv_rows) if num_kv_rows is not None else default_rows
-    bt = block_table.to(torch.int32).contiguous()
-    max_blocks = bt.shape[1]
-    bt_flat = bt.reshape(-1)
-    if q_req is None:
-        q_req_t = torch.zeros(num_queries, dtype=torch.int32, device=q.device)
-    else:
-        q_req_t = q_req.to(torch.int32).reshape(-1).contiguous()
+    if block_table.dim() != 2:
+        raise ValueError(f"block_table must be 2D [num_reqs, max_blocks], got {tuple(block_table.shape)}")
+    bt_flat = _require_int32_contiguous(block_table, "block_table").view(-1)
+    max_blocks = block_table.shape[1]
     has_sink = attn_sink is not None
-    if has_sink:
-        sink_t = attn_sink.to(torch.float32).reshape(-1).contiguous()
-    else:
-        sink_t = torch.zeros(num_heads, dtype=torch.float32, device=q.device)
+    q_req_t = _resolve_q_req(q_req, num_queries=num_queries, single_request=single_request, device=q.device)
+    sink_t = _resolve_sink(attn_sink, has_sink=has_sink, device=q.device)
 
     exe = _get_kernel(
         head_dim=head_dim, v_dim=v_dim, num_regions=1, has_sink=has_sink,
         r0_dtype="fp8", r0_fnuz=True, r1_dtype="fp8", r1_fnuz=True,
         qk_split=True, block_n=32, block_h=16, split_kv=False, packed=True, scale_mode=scale_mode,
+        softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=single_request,
     )
     with torch.cuda.device(q.device.index):
         _run_compiled(
             exe,
-            q.contiguous().reshape(-1),
+            q_flat,
             cache_u8,
-            indices_i32, indptr_i32, bt_flat,
-            cache_u8, indices_i32, indptr_i32, bt_flat,  # extra_* dummies (unused, NREG==1)
-            q_req_t, sink_t,
-            out.reshape(-1), scale_t,
+            indices_i32,
+            indptr,
+            bt_flat,
+            cache_u8,
+            indices_i32,
+            indptr,
+            bt_flat,
+            q_req_t,
+            sink_t,
+            out_flat,
             int(num_queries),
-            int(n_kv_rows), int(n_kv_rows),
-            int(block_size), int(block_size),
-            int(max_blocks), int(max_blocks),
+            int(n_kv_rows),
+            int(n_kv_rows),
+            int(block_size),
+            int(block_size),
+            int(max_blocks),
+            int(max_blocks),
             _fx_stream(q.device, stream),
         )
 
 
 def flydsl_sparse_mla_prefill_2region(
-    q: torch.Tensor,  # [num_queries, 128, 512] bf16
-    out: torch.Tensor,  # [num_queries, 128, 512] bf16 (in place)
-    main_cache: torch.Tensor,  # packed fp8_ds_mla SWA cache (fnuz on gfx942)
+    q: torch.Tensor,
+    out: torch.Tensor,
+    main_cache: torch.Tensor,
     main_indices: torch.Tensor,
     main_indptr: torch.Tensor,
     main_block_table: torch.Tensor,
-    extra_cache: torch.Tensor,  # packed fp8_ds_mla compressed pool (OCP)
+    extra_cache: torch.Tensor,
     extra_indices: torch.Tensor,
     extra_indptr: torch.Tensor,
     extra_block_table: torch.Tensor,
     *,
     block_size: int,
-    scale: float,
     attn_sink: torch.Tensor | None = None,
     extra_block_size: int | None = None,
     main_num_rows: int | None = None,
@@ -216,64 +318,71 @@ def flydsl_sparse_mla_prefill_2region(
     q_req: torch.Tensor | None = None,
     main_is_fnuz: bool = True,
     extra_is_fnuz: bool = False,
+    single_request: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> None:
-    """Phase B2: two-region native sparse MLA prefill (compressed + SWA).
-
-    Region 0 (main / SWA) and region 1 (extra / compressed) run through one
-    shared online-softmax state. ``main_is_fnuz`` / ``extra_is_fnuz`` select the
-    per-region NoPE fp8 convention (gfx942: SWA fnuz, compressed OCP).
-    """
-    if not (q.is_cuda and out.is_cuda and main_cache.is_cuda and extra_cache.is_cuda):
-        raise ValueError("flydsl_sparse_mla_prefill_2region requires CUDA/HIP tensors")
+    """Phase B2: two-region native sparse MLA prefill (compressed + SWA)."""
+    _require_cuda(q, out, main_cache, extra_cache, main_indices, main_indptr, extra_indices, extra_indptr)
     _check_gfx942(q.device)
     num_queries, num_heads, head_dim, v_dim = _validate_qout(q, out)
-    if main_indptr.numel() != num_queries + 1 or extra_indptr.numel() != num_queries + 1:
-        raise ValueError("main/extra indptr must have num_queries+1 elems")
+    _require_int32_1d(main_indptr, "main_indptr", numel=num_queries + 1)
+    _require_int32_1d(extra_indptr, "extra_indptr", numel=num_queries + 1)
 
     e_block_size = block_size if extra_block_size is None else extra_block_size
-    m_cache_u8, m_default_rows, _ = _packed_cache_meta(main_cache, block_size)
-    e_cache_u8, e_default_rows, _ = _packed_cache_meta(extra_cache, e_block_size)
+    m_cache_u8, m_default_rows, _ = _packed_cache_u8(main_cache, block_size)
+    e_cache_u8, e_default_rows, _ = _packed_cache_u8(extra_cache, e_block_size)
     m_rows = int(main_num_rows) if main_num_rows is not None else m_default_rows
     e_rows = int(extra_num_rows) if extra_num_rows is not None else e_default_rows
 
-    m_idx = main_indices.reshape(-1).to(torch.int32).contiguous()
-    m_iptr = main_indptr.reshape(-1).to(torch.int32).contiguous()
-    e_idx = extra_indices.reshape(-1).to(torch.int32).contiguous()
-    e_iptr = extra_indptr.reshape(-1).to(torch.int32).contiguous()
-    m_bt = main_block_table.to(torch.int32).contiguous()
-    e_bt = extra_block_table.to(torch.int32).contiguous()
-    m_max_blocks = m_bt.shape[1]
-    e_max_blocks = e_bt.shape[1]
+    m_idx = _require_int32_1d(main_indices, "main_indices")
+    m_iptr = _require_int32_1d(main_indptr, "main_indptr", numel=num_queries + 1)
+    e_idx = _require_int32_1d(extra_indices, "extra_indices")
+    e_iptr = _require_int32_1d(extra_indptr, "extra_indptr", numel=num_queries + 1)
+    if main_block_table.dim() != 2 or extra_block_table.dim() != 2:
+        raise ValueError("main_block_table and extra_block_table must be 2D [num_reqs, max_blocks]")
+    m_bt = _require_int32_contiguous(main_block_table, "main_block_table").view(-1)
+    e_bt = _require_int32_contiguous(extra_block_table, "extra_block_table").view(-1)
+    m_max_blocks = main_block_table.shape[1]
+    e_max_blocks = extra_block_table.shape[1]
 
-    if q_req is None:
-        q_req_t = torch.zeros(num_queries, dtype=torch.int32, device=q.device)
-    else:
-        q_req_t = q_req.to(torch.int32).reshape(-1).contiguous()
     has_sink = attn_sink is not None
-    sink_t = (
-        attn_sink.to(torch.float32).reshape(-1).contiguous()
-        if has_sink
-        else torch.zeros(num_heads, dtype=torch.float32, device=q.device)
-    )
-    scale_t = torch.tensor([float(scale)], dtype=torch.float32, device=q.device)
+    q_req_t = _resolve_q_req(q_req, num_queries=num_queries, single_request=single_request, device=q.device)
+    sink_t = _resolve_sink(attn_sink, has_sink=has_sink, device=q.device)
+    q_flat = _flat_bf16(q, "q")
+    out_flat = _flat_bf16(out, "out")
 
     exe = _get_kernel(
         head_dim=head_dim, v_dim=v_dim, num_regions=2, has_sink=has_sink,
         r0_dtype="fp8", r0_fnuz=main_is_fnuz, r1_dtype="fp8", r1_fnuz=extra_is_fnuz,
         qk_split=True, block_n=32, block_h=16, split_kv=False, packed=True, scale_mode="none",
+        softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=single_request,
     )
     with torch.cuda.device(q.device.index):
         _run_compiled(
             exe,
-            q.contiguous().reshape(-1),
-            m_cache_u8, m_idx, m_iptr, m_bt.reshape(-1),
-            e_cache_u8, e_idx, e_iptr, e_bt.reshape(-1),
-            q_req_t, sink_t,
-            out.reshape(-1), scale_t,
+            q_flat,
+            m_cache_u8,
+            m_idx,
+            m_iptr,
+            m_bt,
+            e_cache_u8,
+            e_idx,
+            e_iptr,
+            e_bt,
+            q_req_t,
+            sink_t,
+            out_flat,
             int(num_queries),
-            int(m_rows), int(e_rows),
-            int(block_size), int(e_block_size),
-            int(m_max_blocks), int(e_max_blocks),
+            int(m_rows),
+            int(e_rows),
+            int(block_size),
+            int(e_block_size),
+            int(m_max_blocks),
+            int(e_max_blocks),
             _fx_stream(q.device, stream),
         )
+
+
+from .kernels.tensor_shim import _run_compiled
+
+__all__ = ["flydsl_sparse_mla_prefill", "flydsl_sparse_mla_prefill_2region"]

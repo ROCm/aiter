@@ -247,8 +247,7 @@ def kn_sparse_mla_prefill(
     # --- outputs ---
     final_output: fx.Tensor,  # [num_queries * num_heads, v_dim]  (bf16)
     # --- parameters ---
-    scale_buffer: fx.Tensor,  # [1] f32 softmax scale (passed as a tensor; the
-    #                           fp32 fast-dispatch path rejects a raw float arg)
+    softmax_scale: fx.Float32,
     num_kv_rows: fx.Int32,
 ):
     """Sparse MLA prefill: one CTA per query token, 8 warps over 128 heads."""
@@ -311,10 +310,6 @@ def kn_sparse_mla_prefill(
     indices_rsrc = buffer_ops.create_buffer_resource(indices)
     indptr_rsrc = buffer_ops.create_buffer_resource(indptr)
     final_output_rsrc = buffer_ops.create_buffer_resource(final_output)
-    scale_rsrc = buffer_ops.create_buffer_resource(scale_buffer)
-    softmax_scale = fx.Float32(
-        rocdl.readfirstlane(T.f32, buffer_ops.buffer_load(scale_rsrc, 0, vec_width=1, dtype=T.f32))
-    )
 
     # ---- Thread indices ----
     q_idx = gpu.block_idx.x
@@ -817,7 +812,7 @@ def launch_sparse_mla_prefill(
     indices: fx.Tensor,
     indptr: fx.Tensor,
     final_output: fx.Tensor,
-    scale_buffer: fx.Tensor,
+    softmax_scale: fx.Float32,
     num_queries: fx.Int32,
     num_kv_rows: fx.Int32,
     stream: fx.Stream = fx.Stream(None),
@@ -829,7 +824,7 @@ def launch_sparse_mla_prefill(
         indices,
         indptr,
         final_output,
-        scale_buffer,
+        softmax_scale,
         num_kv_rows,
     ).launch(
         grid=(grid_x, 1, 1),
@@ -863,6 +858,8 @@ def compile_sparse_mla_prefill_paged(
     r0_is_ocp: bool = False,
     r1_is_ocp: bool = True,
     waves_per_eu: int = 2,
+    softmax_scale: float | None = None,
+    single_request: bool = True,
 ):
     """Build a paged fp8_ds_mla sparse MLA prefill launcher (gfx942).
 
@@ -877,6 +874,8 @@ def compile_sparse_mla_prefill_paged(
     R0_CONVERT = bool(r0_convert)
     R0_OCP = bool(r0_is_ocp)
     R1_OCP = bool(r1_is_ocp)
+    SINGLE_REQUEST = bool(single_request)
+    SOFTMAX_SCALE = fx.Float32(QK_HEAD_DIM ** -0.5 if softmax_scale is None else float(softmax_scale))
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def kn_sparse_mla_prefill_paged(
@@ -889,10 +888,10 @@ def compile_sparse_mla_prefill_paged(
         extra_indices: fx.Tensor,
         extra_indptr: fx.Tensor,
         extra_block_table: fx.Tensor,
-        q_req: fx.Tensor,            # i32 [nq] query -> request id
-        sink_buf: fx.Tensor,         # f32 [128] (dummy if not HAS_SINK)
+        q_req: fx.Tensor,            # i32 [nq] query -> request id (ignored if SINGLE_REQUEST)
+        sink_buf: fx.Tensor,         # f32 [128] (ignored if not HAS_SINK)
         final_output: fx.Tensor,     # [nq*128, 512] bf16
-        scale_buffer: fx.Tensor,     # f32 [1]
+        softmax_scale: fx.Float32,
         main_num_rows: fx.Int32,
         extra_num_rows: fx.Int32,
         main_block_size: fx.Int32,
@@ -958,20 +957,23 @@ def compile_sparse_mla_prefill_paged(
         extra_indices_rsrc = buffer_ops.create_buffer_resource(extra_indices)
         extra_indptr_rsrc = buffer_ops.create_buffer_resource(extra_indptr)
         extra_bt_rsrc = buffer_ops.create_buffer_resource(extra_block_table)
-        q_req_rsrc = buffer_ops.create_buffer_resource(q_req)
-        sink_rsrc = buffer_ops.create_buffer_resource(sink_buf)
         final_output_rsrc = buffer_ops.create_buffer_resource(final_output)
-        scale_rsrc = buffer_ops.create_buffer_resource(scale_buffer)
-        softmax_scale = fx.Float32(
-            rocdl.readfirstlane(T.f32, buffer_ops.buffer_load(scale_rsrc, 0, vec_width=1, dtype=T.f32))
-        )
+        if const_expr(not SINGLE_REQUEST):
+            q_req_rsrc = buffer_ops.create_buffer_resource(q_req)
+        if const_expr(HAS_SINK):
+            sink_rsrc = buffer_ops.create_buffer_resource(sink_buf)
 
         q_idx = gpu.block_idx.x
         tid = gpu.thread_id("x")
         warp_idx = tid / WARP_SIZE
         lane_idx = tid % WARP_SIZE
 
-        req_id = rocdl.readfirstlane(T.i32, buffer_ops.buffer_load(q_req_rsrc, q_idx, vec_width=1, dtype=T.i32))
+        if const_expr(SINGLE_REQUEST):
+            req_id = c_zero_i32
+        else:
+            req_id = rocdl.readfirstlane(
+                T.i32, buffer_ops.buffer_load(q_req_rsrc, q_idx, vec_width=1, dtype=T.i32)
+            )
 
         kv_ld_row_base = lane_idx / 32 * 16 + (lane_idx / 16) % 2 + warp_idx * 2
         kv_ld_col_base = _i32((lane_idx % 16) * 4)
@@ -1619,7 +1621,6 @@ def compile_sparse_mla_prefill_paged(
         q_req: fx.Tensor,
         sink_buf: fx.Tensor,
         final_output: fx.Tensor,
-        scale_buffer: fx.Tensor,
         num_queries: fx.Int32,
         main_num_rows: fx.Int32,
         extra_num_rows: fx.Int32,
@@ -1633,7 +1634,7 @@ def compile_sparse_mla_prefill_paged(
         kn_sparse_mla_prefill_paged(
             query, main_cache, main_indices, main_indptr, main_block_table,
             extra_cache, extra_indices, extra_indptr, extra_block_table,
-            q_req, sink_buf, final_output, scale_buffer,
+            q_req, sink_buf, final_output, SOFTMAX_SCALE,
             main_num_rows, extra_num_rows, main_block_size, extra_block_size,
             main_max_blocks, extra_max_blocks,
         ).launch(grid=(grid_x, 1, 1), block=(NUM_THREADS, 1, 1), smem=0, stream=stream)
@@ -1662,6 +1663,8 @@ def compile_sparse_mla_prefill(
     waves_per_eu: int = 2,
     packed: bool = False,
     scale_mode: str = "none",
+    softmax_scale: float | None = None,
+    single_request: bool = True,
 ):
     """Return the compiled launcher for the sparse MLA prefill kernel.
 
@@ -1683,7 +1686,24 @@ def compile_sparse_mla_prefill(
             raise NotImplementedError("Phase A flat path: num_regions=1, has_sink=False, qk_split=False")
         if region0_dtype != "fp8":
             raise NotImplementedError("Phase A: region0_dtype must be 'fp8' (native fp8 MFMA)")
-        return launch_sparse_mla_prefill
+        sm = fx.Float32(QK_HEAD_DIM ** -0.5 if softmax_scale is None else float(softmax_scale))
+
+        @flyc.jit
+        def launch_flat(
+            query: fx.Tensor,
+            kv_buffer: fx.Tensor,
+            indices: fx.Tensor,
+            indptr: fx.Tensor,
+            final_output: fx.Tensor,
+            num_queries: fx.Int32,
+            num_kv_rows: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            launch_sparse_mla_prefill(
+                query, kv_buffer, indices, indptr, final_output, sm, num_queries, num_kv_rows, stream
+            )
+
+        return launch_flat
 
     if num_regions not in (1, 2):
         raise NotImplementedError("packed path supports num_regions in {1, 2}")
@@ -1696,4 +1716,6 @@ def compile_sparse_mla_prefill(
         r0_is_ocp=(not region0_is_fnuz),
         r1_is_ocp=(not region1_is_fnuz),
         waves_per_eu=waves_per_eu,
+        softmax_scale=softmax_scale,
+        single_request=single_request,
     )
