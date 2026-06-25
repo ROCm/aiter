@@ -24,7 +24,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float4E2M1FN
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -40,11 +40,12 @@ LOG2E = 1.4426950408889634
 _PTR3 = "!llvm.ptr<3>"
 
 # BM32 path: fixed for the single supported variant.
-_BM = 32
-_kAStages = 3
-_kSubBlocks = 1
-_kMChunks = 2  # = BM // 16
-_BN_INT = BN // 2  # 128
+BM = 32
+kAStages = 3
+kSubBlocks = 1
+kMChunks = 2  # BM // 16
+M_REPS = BM // 16
+BN_INT = BN // 2  # 128
 
 
 # ---- self-contained math / pointer / size helpers ---------------------------
@@ -133,24 +134,24 @@ def _gemm1_body_v2(
     i32_ntok,
     i32_total_m_blocks,
     *,
-    K_HALF,
-    K_TILES_TOTAL,
-    kUnroll,
-    kAS_per_chunk_dw,
-    kBS_stride_n0_dw,
-    kBS_per_expert_dw,
-    BSCALE_BYTES,
-    N_OUT,
-    NUM_N_BLOCKS,
-    OUT_AS_PER_CHUNK_DW,
-    K_G2_HALF,
+    K,
+    INTER,
+    NE,
     b_nontemporal,
 ):
-    BM = _BM
-    kAStages = _kAStages
-    kSubBlocks = _kSubBlocks
-    kMChunks = _kMChunks
-    M_REPS = BM // 16
+    # K-/INTER-derived sizes (compile-time Python ints; were the v1 *_for helpers).
+    _kc = (K // 32) // 4 // 2
+    K_HALF = K // 2
+    K_TILES_TOTAL = K // BK
+    kUnroll = K_TILES_TOTAL - kStages
+    kAS_per_chunk_dw = _kc * 64
+    kBS_stride_n0_dw = _kc * 64
+    N_OUT = 2 * INTER
+    kBS_per_expert_dw = (N_OUT // 16 // 2) * kBS_stride_n0_dw
+    BSCALE_BYTES = NE * kBS_per_expert_dw * 4
+    NUM_N_BLOCKS = N_OUT // 256
+    OUT_AS_PER_CHUNK_DW = ((INTER // 32) // 4 // 2) * 64
+    K_G2_HALF = INTER // 2
 
     # block -> (m_block_idx, n_block_idx) ; e = sorted_expert_ids[m_block_idx]
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
@@ -300,14 +301,11 @@ def _gemm1_body_v2(
             out.append(llvm.load(T.i32, _gep3(base_ptr, lds_dw * fx.Int32(4))))
         return out
 
-    # B-weight load -- LAYOUT API. The CK preshuffle is encoded as a hierarchical
-    # fx.make_layout view over bq; v1's raw byte address for (e, col, lane, K_C, half)
-    # = (e*N_OUT+col)*K_HALF + lane_div_16*256 + lane_mod_16*16 + K_C*2048 + half*1024.
-    # The descriptor base MUST stay UNIFORM per wave -- folding the per-lane part into
-    # it makes make_buffer_tensor emit a per-lane WATERFALL (~14x slower). So the base
-    # is the uniform col offset and the per-lane (klane,nlane) are LAYOUT AXES indexed
-    # at copy time -> a VGPR voffset. The nt/cached policy rides on the copy atom's
-    # cache_modifier (2=nt / 0=cached); both paths are fx.copy, no raw fallback.
+    # B load: CK preshuffle as an fx.make_layout view over bq. The descriptor base
+    # MUST stay uniform per wave (folding the per-lane part in makes make_buffer_tensor
+    # emit a per-lane WATERFALL, ~14x slower), so the base is the uniform col offset
+    # and the per-lane (klane,nlane) are layout axes -> a VGPR voffset at copy time.
+    # nt/cached rides on the copy atom's cache_modifier (2=nt/0=cached).
     KH4 = K_HALF // 4  # i32 stride for the col axis
     _b_copy_atom = fx.make_copy_atom(
         fx.rocdl.BufferCopy128b(2 if b_nontemporal else 0), 32  # 4x i32 = 128b
@@ -531,7 +529,7 @@ def _gemm1_body_v2(
         packed = fx.Int32(packed_i32)
 
         byte_pos = (
-            n_block_idx * fx.Int32(_BN_INT // 2)
+            n_block_idx * fx.Int32(BN_INT // 2)
             + wave_grp * fx.Int32(16)
             + kk * fx.Int32(4)
         )
@@ -569,9 +567,9 @@ def _gemm1_body_v2(
 
 
 def _lds_bytes_for(K_TILES_TOTAL):
-    s_aq_bytes = _kAStages * _BM * KH_TILE
-    s_asc_bytes = _kSubBlocks * K_TILES_TOTAL * 256
-    lds_acc_bytes = _BM * BN * 4
+    s_aq_bytes = kAStages * BM * KH_TILE
+    s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
+    lds_acc_bytes = BM * BN * 4
     return max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
 
 
@@ -601,20 +599,7 @@ def compile_gemm1_a4w4_port(
     _N_OUT = 2 * _INTER
     assert _N_OUT % BN == 0, f"2*D_INTER (N_OUT) must be a multiple of {BN}, got {_N_OUT}"
 
-    # K-/INTER-derived sizes (inlined; were the v1 *_for helpers).
-    _kc = (_K // 32) // 4 // 2
-    _K_HALF = _K // 2
-    _K_TILES_TOTAL = _K // BK
-    _kUnroll = _K_TILES_TOTAL - kStages
-    _kAS_per_chunk_dw = _kc * 64
-    _kBS_stride_n0_dw = _kc * 64
-    _kBS_per_expert_dw = (_N_OUT // 16 // 2) * _kBS_stride_n0_dw
-    _BSCALE_BYTES = _NE * _kBS_per_expert_dw * 4
-    _NUM_N_BLOCKS = _N_OUT // 256
-    _OUT_AS_PER_CHUNK_DW = ((_INTER // 32) // 4 // 2) * 64
-    _K_G2_HALF = _INTER // 2
-
-    lds_bytes = _lds_bytes_for(_K_TILES_TOTAL)
+    lds_bytes = _lds_bytes_for(_K // BK)  # K_TILES_TOTAL
 
     gu_tag = "il" if interleave else "sep"
     bnt_tag = "nt" if b_nontemporal else "cached"
@@ -648,7 +633,7 @@ def compile_gemm1_a4w4_port(
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
         cumsum0 = llvm.load(T.i32, _global_ptr1(arg_cumsum, fx.Int32(0)))
         total_m_blocks = cumsum0 // fx.Int32(BM)
-        bound = total_m_blocks * fx.Int32(_NUM_N_BLOCKS)
+        bound = total_m_blocks * fx.Int32(_N_OUT // 256)  # * NUM_N_BLOCKS
         if fx.Int32(bx_i32) < bound:
             _gemm1_body_v2(
                 allocator,
@@ -666,17 +651,9 @@ def compile_gemm1_a4w4_port(
                 wave,
                 i32_ntok,
                 total_m_blocks,
-                K_HALF=_K_HALF,
-                K_TILES_TOTAL=_K_TILES_TOTAL,
-                kUnroll=_kUnroll,
-                kAS_per_chunk_dw=_kAS_per_chunk_dw,
-                kBS_stride_n0_dw=_kBS_stride_n0_dw,
-                kBS_per_expert_dw=_kBS_per_expert_dw,
-                BSCALE_BYTES=_BSCALE_BYTES,
-                N_OUT=_N_OUT,
-                NUM_N_BLOCKS=_NUM_N_BLOCKS,
-                OUT_AS_PER_CHUNK_DW=_OUT_AS_PER_CHUNK_DW,
-                K_G2_HALF=_K_G2_HALF,
+                K=_K,
+                INTER=_INTER,
+                NE=_NE,
                 b_nontemporal=b_nontemporal,
             )
 
