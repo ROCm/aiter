@@ -1034,6 +1034,9 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     q_smem = gl.allocate_shared_memory(
         q_ptr.dtype.element_ty, [BLOCK_T, BLOCK_D_pe], SH_2D
     )
+    q_smem_out = gl.allocate_shared_memory(
+        q_out_ptr.dtype.element_ty, [BLOCK_T, BLOCK_D_pe], SH_2D
+    )
     k_smem = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty, [BLOCK_T, BLOCK_D_pe], SH_2D
     )
@@ -1229,7 +1232,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
 
             # Stage q_pe into LDS and TDM-async-store to q_out (descriptor
             # shape acts as the implicit t-bounds mask, same pattern as MLA).
-            q_smem.store(q_pe.to(q_out_ptr.dtype.element_ty))
+            q_smem_out.store(q_pe.to(q_out_ptr.dtype.element_ty))
             q_out_desc = _make_tdm_desc_2d(
                 q_out_ptr + pid_hq * q_out_stride_h,
                 q_out_stride_t,
@@ -1240,7 +1243,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 BLOCK_D_pe,
                 SH_2D,
             )
-            gl.amd.gfx1250.tdm.async_store(q_out_desc, [t_start, 0], q_smem)
+            gl.amd.gfx1250.tdm.async_store(q_out_desc, [t_start, 0], q_smem_out)
 
             gl.amd.gfx1250.tdm.async_wait(1)
             k_pe_in = k_smem.load(L_T_PE)
@@ -1387,7 +1390,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             )
 
             # Stage q_pe into LDS and TDM-async-store to q_out.
-            q_smem.store(q_pe.to(q_out_ptr.dtype.element_ty))
+            q_smem_out.store(q_pe.to(q_out_ptr.dtype.element_ty))
             q_out_desc = _make_tdm_desc_2d(
                 q_out_ptr + pid_hq * q_out_stride_h,
                 q_out_stride_t,
@@ -1398,7 +1401,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 BLOCK_D_pe,
                 SH_2D,
             )
-            gl.amd.gfx1250.tdm.async_store(q_out_desc, [t_start, 0], q_smem)
+            gl.amd.gfx1250.tdm.async_store(q_out_desc, [t_start, 0], q_smem_out)
 
             if HAVE_ZEROS:
                 zeros_smem.store(z)
