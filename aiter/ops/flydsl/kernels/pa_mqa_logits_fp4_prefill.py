@@ -1,31 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Prefill MQA Logits kernel — Q FP4, KV FP4, paged-direct (gfx950).
-
-Ragged-prefill sibling of the decode kernel ``pa_mqa_logits_fp4.py``. Same
-compute core (FP4 MFMA ``mfma_scale_f32_16x16x128_f8f6f4`` cbsz=4/blgp=4, relu
-* per-head weight, cross-lane head reduction); differs in addressing: one CTA
--> (query_row, chunk), output row = query_row, columns = seq-local KV, mask =
-window [local_start, local_end). Reads K straight from the paged cache via
-``block_tables``, removing the ``cp_gather_indexer_k_quant_cache`` staging the
-FP8 path needs.
-
-Data format:
-  q:        [total_tokens, H, D/2] uint8 (packed fp4 e2m1)
-  q_scale:  [total_tokens, K_TILES, 4, 16, QS_PAD] uint8, preshuffled host-side
-            (QS_PAD = ceil((H/16) / 4) * 4)
-  kv_cache: [num_blocks, K_TILES, 4, kv_block_size, 16] uint8 (paged preshuffle)
-  kv_scale: [num_blocks, K_TILES, 4, kv_block_size] uint8 (e8m0fnu, NTPW-interleaved)
-  block_tables: [bs, max_blocks_per_seq] int32
-  weights:  [total_tokens, H] fp32
-  cta_info: [n_ctas, 6] int32 (row_id, batch_id, chunk_start, chunk_count,
-            local_start, local_end)
-  output:   [total_tokens, max_seq_len] fp32 (seq-local columns)
-
-Constraints (from the decode pipelined loop, NTPW==4 / N_PHYS==1): block_k=256,
-num_warps=4, kv_block_size=64, heads % 16 == 0 and <= 128, head_dim % 128 == 0.
-"""
 
 from __future__ import annotations
 
@@ -71,76 +46,75 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
 allocator = None
 
 
-# Host-side persistent-grid schedule for ragged prefill. Per query row r, the
-# span [0, local_end[r]) is chunked into ceil(local_end/block_k) chunks split
-# across CTAs (<= `safe` each); the store mask drops tokens outside the window.
-
-
 def compute_prefill_schedule(
     row_to_batch,
     local_starts,
     local_ends,
     block_k,
     parallel_unit_num,
+    max_seq_len,
 ):
-    """Compute persistent-grid schedule for ragged prefill MQA logits.
-
-    Args:
-        row_to_batch: int32 [total_tokens], sequence id per query row.
-        local_starts/local_ends: int32 [total_tokens], seq-local window [lo, hi).
-        block_k: chunk size in tokens.
-        parallel_unit_num: target CTA count (typically TotalCuCount * WavePerEU).
-
-    Returns (safe_chunks_per_cta, cta_info [n_ctas, 6] int32, n_ctas).
+    """Compute the persistent-grid schedule for ragged-prefill MQA logits.
     """
-    import numpy as np
-
     device = local_ends.device
-    rb = row_to_batch.detach().to("cpu", torch.int64).numpy()
-    ls = local_starts.detach().to("cpu", torch.int64).numpy()
-    le = local_ends.detach().to("cpu", torch.int64).numpy()
+    P = parallel_unit_num
+    T = local_ends.shape[0]  # fixed total_tokens (rows)
 
-    # chunk count per row = ceil(le / block_k).
-    chunks_per_row = np.maximum(0, (le + block_k - 1) // block_k)
-    valid = np.nonzero(chunks_per_row > 0)[0]
+    rb = row_to_batch.to(torch.int32)
+    ls = local_starts.to(torch.int32)
+    le = local_ends.to(torch.int32)
 
-    if valid.size == 0:
-        cta_info = torch.zeros((1, CTA_INFO_WIDTH), dtype=torch.int32, device=device)
-        return 1, cta_info, 1
+    # chunk count per row = ceil(le / block_k); le<=0 → 0 chunks.
+    chunks_per_row = torch.clamp((le + (block_k - 1)) // block_k, min=0)  # [T]
 
-    cpr_valid = chunks_per_row[valid]
-    max_chunks = int(cpr_valid.max())
+    s_max = max(1, (max_seq_len + block_k - 1) // block_k)
+    s_cand = torch.arange(1, s_max + 1, device=device, dtype=torch.int32)  # [s_max]
+    ctas_per_r_s = (chunks_per_row[None, :] + (s_cand[:, None] - 1)) // s_cand[
+        :, None
+    ]  # [s_max, T]
+    total_ctas_s = ctas_per_r_s.sum(dim=1)  # [s_max]
+    feasible = total_ctas_s <= P  # [s_max] bool, monotonic False..True
+    max_chunks = torch.clamp(chunks_per_row.max(), min=1).to(torch.int32)
+    # smallest feasible s, via arithmetic (no tensor gather → no capture sync).
+    first_feasible_s = torch.clamp((~feasible).to(torch.int32).sum() + 1, max=s_max)
+    safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(torch.int32)
 
-    # Smallest `safe` with sum(ceil(cpr/safe)) <= parallel_unit_num via binary
-    # search (ctas(safe) is monotone non-increasing); falls back to max_chunks.
-    lo, hi, safe = 1, max_chunks, max_chunks
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        n = int(np.ceil(cpr_valid / mid).sum())
-        if n <= parallel_unit_num:
-            safe = mid
-            hi = mid - 1
-        else:
-            lo = mid + 1
+    # ── per-row number of CTAs (chunk-splits); 0 for empty rows ──
+    ctas_r = (chunks_per_row + (safe - 1)) // safe  # [T]
+    incl = torch.cumsum(ctas_r, dim=0, dtype=torch.int32)  # [T] inclusive prefix sum
+    excl = incl - ctas_r  # exclusive prefix sum
+    total_splits = incl[-1]  # 0-dim; total valid (row, split) slots
 
-    rows = []
-    for r in valid.tolist():
-        n_chunks = int(chunks_per_row[r])
-        ctas_r = (n_chunks + safe - 1) // safe
-        ls_r = int(ls[r])
-        le_r = int(le[r])
-        b_r = int(rb[r])
-        for split in range(ctas_r):
-            start = split * safe
-            count = min(safe, n_chunks - start)
-            rows.append([r, b_r, start, count, ls_r, le_r])
+    # ── map each fixed slot → (row, split_within_row) via searchsorted ──
+    slot = torch.arange(P, device=device, dtype=torch.int32)  # [P]
+    row_of_slot = torch.searchsorted(incl, slot, right=True)  # [P], in [0, T]
+    valid = slot < total_splits  # [P] bool
+    safe_row = torch.clamp(row_of_slot, max=T - 1)  # avoid OOB gather
+    split_within = slot - excl[safe_row]  # [P]
+    start = split_within * safe  # [P]
+    n_chunks_slot = chunks_per_row[safe_row]  # [P]
+    count = torch.clamp(torch.minimum(safe, n_chunks_slot - start), min=0)  # [P]
+
+    row_sel = safe_row
+    batch_sel = rb[safe_row]
+    ls_sel = ls[safe_row]
+    le_sel = le[safe_row]
+
+    valid_i = valid.to(torch.int32)
+    row_id = row_sel * valid_i
+    batch_id = batch_sel * valid_i
+    start = start * valid_i
+    count = torch.where(valid, count, torch.ones_like(count))
+    ls_out = ls_sel * valid_i
+    le_out = le_sel * valid_i
 
     cta_info = (
-        torch.tensor(rows, dtype=torch.int32, device=device)
-        .reshape(-1, CTA_INFO_WIDTH)
+        torch.stack([row_id, batch_id, start, count, ls_out, le_out], dim=-1)
+        .reshape(P, CTA_INFO_WIDTH)
+        .to(torch.int32)
         .contiguous()
     )
-    return safe, cta_info, len(rows)
+    return safe, cta_info, P
 
 
 def build_pa_mqa_logits_fp4_prefill_module(
@@ -153,15 +127,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
     head_dim=DEFAULT_HEAD_DIM,
 ):
     """Build the ragged-prefill FP4 MQA logits kernel.
-
-    Returns (kernel_fn, allocator). Grid (n_ctas,) from
-    compute_prefill_schedule; block (num_warps * WARP_SIZE,).
-    `max_chunks_per_cta` is unused (kept for scheduler API symmetry).
-
-    Constraints (from the decode pipelined loop):
-      - block_k % MFMA_N == 0, (block_k/16) % num_warps == 0, N_TILES_PER_WARP == 4
-      - kv_block_size % MFMA_N == 0, block_k % kv_block_size == 0, N_PHYS == 1
-      - heads % 16 == 0, heads <= 128; head_dim % 128 == 0
     """
     block_threads_k = num_warps * WARP_SIZE
     m_tiles = heads // MFMA_M
@@ -660,31 +625,6 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
     """Ragged-prefill FP4 paged MQA logits (gfx950).
-
-    Per query row ``r``, computes the sparse-indexer logits over its window
-    ``[local_start[r], local_end[r])``, reading K from the paged FP4 cache via
-    ``block_tables``. All tensors must be in the kernel ABI layout (see module
-    docstring); the schedule is computed via ``compute_prefill_schedule``
-    unless ``cta_info``/``n_ctas`` are supplied.
-
-    Args:
-        q_fp4: [total_tokens, H, D/2] uint8 packed fp4.
-        q_scale: [total_tokens, K_TILES, 4, 16, QS_PAD] uint8 preshuffled.
-        kv_cache: [num_blocks, K_TILES, 4, kv_block_size, 16] uint8.
-        kv_scale: [num_blocks, K_TILES, 4, kv_block_size] uint8 (e8m0).
-        block_tables: [bs, max_blocks_per_seq] int32.
-        weights: [total_tokens, H] fp32.
-        row_to_batch: [total_tokens] int32, sequence id per query row.
-        local_starts/local_ends: [total_tokens] int32, seq-local window [lo, hi).
-        max_seq_len: number of seq-local output columns.
-        block_k/kv_block_size/num_warps: layout config (defaults 256/64/4).
-        parallel_unit_num: target persistent-grid CTA count.
-        out: optional [total_tokens, max_seq_len] fp32 output (allocated and
-            pre-filled with -inf if None; out-of-window cells keep the pre-fill).
-        cta_info, n_ctas: optional precomputed schedule (both or neither).
-        stream: optional CUDA stream (defaults to the current stream).
-
-    Returns out: [total_tokens, max_seq_len] fp32 logits.
     """
     total_tokens, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
@@ -692,9 +632,15 @@ def flydsl_pa_mqa_logits_fp4_prefill(
 
     if (cta_info is None) != (n_ctas is None):
         raise ValueError("Pass both cta_info and n_ctas, or neither.")
-    if cta_info is None:
+    schedule_internal = cta_info is None
+    if schedule_internal:
         _, cta_info, n_ctas = compute_prefill_schedule(
-            row_to_batch, local_starts, local_ends, block_k, parallel_unit_num
+            row_to_batch,
+            local_starts,
+            local_ends,
+            block_k,
+            parallel_unit_num,
+            max_seq_len,
         )
 
     if out is None:
@@ -704,6 +650,8 @@ def flydsl_pa_mqa_logits_fp4_prefill(
             dtype=torch.float32,
             device=q_fp4.device,
         )
+    elif schedule_internal:
+        out.fill_(float("-inf"))
 
     launcher, _ = compile_pa_mqa_logits_fp4_prefill(
         block_k=block_k,

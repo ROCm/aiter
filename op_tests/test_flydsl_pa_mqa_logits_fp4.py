@@ -3,24 +3,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """aiter op-test + benchmark for ``flydsl_pa_mqa_logits_fp4`` (decode / varctx).
-
-aiter port of the FlyDSL standalone test
-``tests/kernels/test_pa_mqa_logits_fp4.py``. Validates the decode FP4 paged
-MQA logits kernel (gfx950) against a pure-torch reference and benchmarks it
-against a torch-bf16 matmul baseline.
-
-Both Q and KV are FP4 (host-side quantized) and the MFMA runs natively on FP4
-operands (cbsz=4, blgp=4). The reference dequants both back to fp32 and does
-the matmul in torch. Each (batch, next_n) query owns its sequence's paged FP4
-KV cache window ``[0, context_len[batch])`` (read straight from
-``block_tables``); for ``next_n > 1`` each MTP row ``n`` gets the causal-tail
-cut ``k <= context_len - next_n + n``.
-
-The kernel-build core (``build_pa_mqa_logits_fp4_module`` +
-``compute_varctx_schedule``) is exercised through the cached public host op
-``flydsl_pa_mqa_logits_fp4`` — the schedule is precomputed once so the bench
-times only the kernel launch.
-
 Usage:
     python op_tests/test_flydsl_pa_mqa_logits_fp4.py
     python op_tests/test_flydsl_pa_mqa_logits_fp4.py --batch 8 --ctx 131072 --next_n 1
@@ -368,7 +350,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import compute_varctx_schedule
 
     safe, cta_info, total_ctas = compute_varctx_schedule(
-        context_lens, block_k, parallel_unit_num, next_n=next_n
+        context_lens, block_k, parallel_unit_num, t_max, next_n=next_n
     )
     print(
         f"  schedule: parallel_unit={parallel_unit_num} num_warps={num_warps} "
