@@ -105,14 +105,20 @@ def _tflops(flop, ms):
 
 
 def run_batch_test(
-    B, S_q, S_k, H, causal=False, return_lse=False, warmup=1, repeat=5
+    B, S_q, S_k, H, causal=False, return_lse=False, warmup=1, repeat=5,
+    random_value=True,
 ):
     device = torch.device("cuda")
-    torch.manual_seed(42)
 
-    q = torch.randn(B, S_q, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-    k = torch.randn(B, S_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-    v = torch.randn(B, S_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
+    if random_value:
+        torch.manual_seed(42)
+        q = torch.randn(B, S_q, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+        k = torch.randn(B, S_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+        v = torch.randn(B, S_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
+    else:
+        q = torch.full((B, S_q, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
+        k = torch.full((B, S_k, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
+        v = torch.full((B, S_k, H, HEAD_DIM_V), 0.25, dtype=torch.bfloat16, device=device)
 
     scale = 1.0 / math.sqrt(HEAD_DIM_QK)
 
@@ -234,6 +240,13 @@ if __name__ == "__main__":
         "--cmp-triton", action="store_true",
         help="Also time Triton for each case and print speedup.",
     )
+    parser.add_argument(
+        "--random-value",
+        type=str,
+        default="true",
+        help="Use random input data (default true). Set false to use fixed 0.25.\n"
+        "e.g.: --random-value false",
+    )
     args = parser.parse_args()
 
     def _parse_bool(s):
@@ -311,6 +324,7 @@ if __name__ == "__main__":
                 return_lse=return_lse,
                 warmup=args.warmup,
                 repeat=args.repeat,
+                random_value=_parse_bool(args.random_value),
             )
             if args.cmp_triton:
                 device = torch.device("cuda")
