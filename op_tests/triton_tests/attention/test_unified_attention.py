@@ -609,8 +609,6 @@ def test_triton_unified_attn(
         pytest.skip("skip shuffled_kv_cache, 2d gluon not available")
     query_lens = [x[0] for x in seq_lens]
     kv_lens_list = [x[1] for x in seq_lens]
-    print("kv dtype: ", kv_dtype)
-    print("q dtype: ", q_dtype)
     (
         query,
         key_cache_orig,
