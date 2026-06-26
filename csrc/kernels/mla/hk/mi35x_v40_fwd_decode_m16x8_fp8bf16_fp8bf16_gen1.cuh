@@ -54,11 +54,6 @@ struct HkMlaV40Regs
     // come from LDS). Migration knob: 10 (0:320), 12 (0:384), 14 (all NoPE),
     // 16 (all NoPE + RoPE -> NOTHING from LDS in the QK loop).
     static constexpr uint32_t kQkGemmTiles = 16;
-    // # of 64-col NoPE chunks loaded into VGPR by load_q (cols 0:448 = 7 chunks).
-    // Decoupled from kQkGemmTiles because chunk 7 (col-tiles 14,15) is RoPE: a
-    // separate bf16 tensor, staged to LDS then read into VGPR in the prologue
-    // (not via load_q's fp8 p1 path).
-    static constexpr uint32_t kNumNopeVgprChunks = 7;
     // RoPE (col-tiles 14,15 / cols 448:512) lives in VGPR (read from Q-LDS in the
     // prologue) iff the QK loop sources all 16 col-tiles from VGPR.
     static constexpr bool kRopeInVgpr = (kQkGemmTiles >= 16u);
@@ -437,23 +432,23 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
     // O bounce         : overlays p_lds_kv_next (the next pong is DEAD on the
     //                    global last iter, where the epilogue runs, since the
     //                    swap is a no-op). Per-warp strides differ between
-    //                    QManager (8 KB) and OManager V3 (2112 B bf16 /
-    //                    4352 B fp32), so placing the O bounce inside p_lds_q
-    //                    creates cross-warp aliasing with the next work_idx's
-    //                    load_q -- racy when a fast warp's load_q lands while
-    //                    a slow warp's epilogue is still in flight. Overlaying
-    //                    KV-next instead keeps the O bounce in a region whose
-    //                    next consumer (next work_idx's KV prologue) writes to
-    //                    p_lds_kv_curr, not next.
-    // p_lds_q          : 64 KB - QManager region. Placed AFTER both KV pongs +
-    //                    max(O, KV) so the O bounce never overlaps with Q,
-    //                    and so warp 0's Phase-1 staging (at p_lds_q + 0)
-    //                    starts well above 0 in m0 -- this lets
+    //                    QManager and OManager V3 (2112 B bf16 / 4352 B fp32),
+    //                    so placing the O bounce inside p_lds_q creates
+    //                    cross-warp aliasing with the next work_idx's load_q --
+    //                    racy when a fast warp's load_q lands while a slow warp's
+    //                    epilogue is still in flight. Overlaying KV-next instead
+    //                    keeps the O bounce in a region whose next consumer (next
+    //                    work_idx's KV prologue) writes to p_lds_kv_curr, not next.
+    // p_lds_q          : 16 KB - QManager region (NoPE all in VGPR -> the final
+    //                    LDS holds RoPE only, reusing the staging bytes). Placed
+    //                    AFTER both KV pongs + max(O, KV) so the O bounce never
+    //                    overlaps Q, and so warp 0's Phase-1 staging (at p_lds_q
+    //                    + 0) starts well above 0 in m0 -- this lets
     //                    p1_vmem_to_staging_chunk pre-subtract up to 192 B
     //                    (kColInRecord = 0/64/128/192) from the LDS dst without
     //                    m0 underflowing mod 2^32.
     //
-    // Total (occupancy=1): KvLds + max(KvLds, O) + 64 KB Q.
+    // Total (occupancy=1): KvLds + max(KvLds, O) + 16 KB Q.
     extern __shared__ int32_t p_lds[];
 
     // opus::max is device-only / non-constexpr; use inline ternary in constexpr
@@ -594,7 +589,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         // (softmax_scale_p -> softmax_mask_p) and its log2e multiply
         // (softmax_p1 -> softmax_p1_prescaled). Scores then arrive in log2 units.
         const float q_scale_log2 = params.softmax_scale * static_cast<float>(log2e);
-        q_manager.template load_q<k_q_vgpr_begin, R::kNumNopeVgprChunks>(params.p_query,
+        q_manager.template load_q<k_q_vgpr_begin>(params.p_query,
                                                   params.p_query_rope,
                                                   num_qheads,
                                                   warp_idx,
@@ -604,12 +599,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         __builtin_amdgcn_sched_barrier(0);
 
         // ---- RoPE (col-tiles 14,15) -> pinned q_vgpr (v120:127), prologue read ----
-        // load_q staged RoPE (cols 448:512) into Q-LDS slots 6,7 (same swizzled
-        // P2 layout as the NoPE LDS chunks), with sm_scale*log2e already folded
-        // in. Read it ONCE here into the top of the q_vgpr block so the QK loop
-        // sources all 16 col-tiles from VGPR with no per-tile Q-LDS traffic. RoPE
-        // Q-LDS is wave-private, so an lgkmcnt drain (not a cross-wave barrier)
-        // orders the p2_load_rope_chunk ds_writes before these ds_reads.
+        // load_q staged RoPE into Q-LDS col-tiles 0,1; read it ONCE into q_vgpr so
+        // the QK loop is all-VGPR. lgkmcnt drain orders the stage's ds_writes here.
         if constexpr(R::kRopeInVgpr)
         {
             __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
@@ -624,8 +615,10 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 q_rope_0;
             hk::art<mfma_ab_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_rope_1_range>
                 q_rope_1;
-            q_manager.template load_q_lds_to_gpr<6u>(q_rope_0, p_lds_q, warp_idx);
-            q_manager.template load_q_lds_to_gpr<7u>(q_rope_1, p_lds_q, warp_idx);
+            q_manager.template load_q_lds_to_gpr<QManager8to16bitsV1<T>::kRopeColTileLo>(
+                q_rope_0, p_lds_q, warp_idx);
+            q_manager.template load_q_lds_to_gpr<QManager8to16bitsV1<T>::kRopeColTileHi>(
+                q_rope_1, p_lds_q, warp_idx);
             __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
             __builtin_amdgcn_sched_barrier(0);
         }

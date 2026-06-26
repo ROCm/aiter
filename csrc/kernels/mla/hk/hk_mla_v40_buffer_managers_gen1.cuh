@@ -111,6 +111,7 @@ class QManager8to16bitsV1
     static_assert(T::kNumWarps == 8, "QManager8to16bitsV1: requires 8 warps.");
     static_assert(T::kTileM == 16, "QManager8to16bitsV1: kTileM must be 16.");
 
+    public:
     // Sub-block geometry (16 rows x 32 bf16 cols = 1024 B). This is the unit
     // ds_read_b128 grabs for a QK A-tile.
     static constexpr uint32_t kSubBlockRows  = 16;
@@ -127,55 +128,61 @@ class QManager8to16bitsV1
     static_assert(kLdsHalfNopeCols + kLdsHalfRopeCols == kLdsHalfCols,
                   "QManager8to16bitsV1: LDS half geometry mismatch.");
 
-    static constexpr uint32_t kFinalLdsRows     = T::kBlockM;                    // 128
-    static constexpr uint32_t kFinalLdsRowTiles = kFinalLdsRows / kSubBlockRows; // 8
-    static constexpr uint32_t kFinalLdsColTiles = kLdsHalfCols / kSubBlockCols;  // 8
-    static constexpr uint32_t kFinalLdsBytes =
-        kFinalLdsRows * kLdsHalfCols * sizeof(hk::bf16); // 64 KB
-    // Wave-major contiguous layout: each wave owns 16 rows x 256 cols of bf16
-    // = 8 KB exclusively, contiguous within the 64 KB final region. This is the
-    // KEY invariant for race-freedom: wave w's Phase 1 staging aliases the
-    // first 2 KB of wave w's OWN 8 KB final region, so Phase 2 stores from
-    // OTHER waves never touch wave w's staging bytes (and vice versa).
-    // No inter-wave barrier needed between Phase 1 (staging) and Phase 2 (final).
-    static constexpr uint32_t kWarpFinalBytes = kFinalLdsColTiles * kSubBlockBytes; // 8192
-
-    // Phase 1 chunking (VGPR half, 4 chunks of 64 cols each).
+    // Phase 1 chunking: ALL NoPE (cols 0:448 = 7 chunks of 64) is relayed
+    // vmem -> staging -> VGPR. NoPE is never kept in LDS for the QK loop.
     static constexpr uint32_t kP1ChunkCols = 64;
-    static constexpr uint32_t kP1NumChunks = kVgprHalfCols / kP1ChunkCols; // 4
+    static constexpr uint32_t kP1NumChunks = kVgprHalfCols / kP1ChunkCols;     // 4
+    static constexpr uint32_t kP1MaxChunks = T::kQkNopeHeadDim / kP1ChunkCols; // 7
+
     static constexpr uint32_t kP1StagingBytesPerWarp =
-        T::kTileM * kP1ChunkCols * sizeof(q_nope_t);    // 1024
+        T::kTileM * kP1ChunkCols * sizeof(q_nope_t);   // 1024
     static constexpr uint32_t kP1NumStagingBuffers = 2; // double-buffer
     static constexpr uint32_t kP1StagingBytesPerWarpTotal =
         kP1NumStagingBuffers * kP1StagingBytesPerWarp; // 2048
+
+    // RoPE (cols 448:512) is one 64-col chunk.
+    static constexpr uint32_t kP2ChunkCols = 64;
+    static_assert(kLdsHalfRopeCols == kP2ChunkCols,
+                  "QManager8to16bitsV1: RoPE chunk currently assumed to be one full chunk.");
+
+    // Phase-2 "final" LDS region: holds RoPE ONLY (all NoPE is in VGPR), as two
+    // 16x32 bf16 sub-block tiles at col-tiles 0,1. RoPE reuses the staging bytes
+    // (consumed to VGPR first; load_q drains lgkmcnt before the RoPE ds_write),
+    // so the region is just the staging footprint -> 2 col-tiles = 16 KB (the old
+    // NoPE-in-LDS layout needed all 8 tiles / 64 KB).
+    static constexpr uint32_t kRopeColTileLo = 0u;
+    static constexpr uint32_t kRopeColTileHi = 1u;
+
+    static constexpr uint32_t kFinalLdsRows     = T::kBlockM;                        // 128
+    static constexpr uint32_t kFinalLdsRowTiles = kFinalLdsRows / kSubBlockRows;     // 8
+    static constexpr uint32_t kFinalLdsColTiles = kLdsHalfRopeCols / kSubBlockCols;  // 2 (RoPE only)
+    static constexpr uint32_t kWarpFinalBytes   = kFinalLdsColTiles * kSubBlockBytes; // 2048
+    static constexpr uint32_t kFinalLdsBytes    = T::kNumWarps * kWarpFinalBytes;     // 16 KB
+    // Wave-major: each wave owns kWarpFinalBytes exclusively (no inter-wave barrier
+    // between staging and the RoPE store). The RoPE-reuses-staging overwrite is
+    // intra-wave only, sequenced by program order + the lgkmcnt drain in load_q.
     static_assert(kWarpFinalBytes >= kP1StagingBytesPerWarpTotal,
                   "QManager8to16bitsV1: per-warp Phase 1 staging must fit within the "
                   "wave's OWN Phase 2 final region (wave-major contiguous layout).");
-
-    // Phase 2 chunking (LDS half, 3 NoPE chunks of 64 cols + 1 RoPE chunk of 64 cols).
-    static constexpr uint32_t kP2ChunkCols     = 64;
-    static constexpr uint32_t kP2NumNopeChunks = kLdsHalfNopeCols / kP2ChunkCols; // 3
-    static_assert(kLdsHalfRopeCols == kP2ChunkCols,
-                  "QManager8to16bitsV1: RoPE chunk currently assumed to be one full chunk.");
 
     // Per-row record byte stride for the packed fp8 NoPE + scale + pad input.
     static constexpr uint32_t kPackedNopeStride = T::kQkPackedNopeQElems * sizeof(q_nope_t); // 512
     static constexpr uint32_t kRopeStride       = T::kQkRopeHeadDim * sizeof(q_rope_t);      // 128
     static constexpr uint32_t kScaleBaseOff     = 448u; // E8M0 scales start at byte 448 of record.
 
-    // Sub-block byte offset inside the 64 KB final region (wave-major layout).
-    // Wave w owns the contiguous 8 KB region [w*8192, (w+1)*8192); inside that,
-    // col_tile c occupies [c*1024, (c+1)*1024). Signature takes warp_idx (not
-    // row_tile) because row_tile == warp_idx everywhere this is called: each
+    private:
+    // Sub-block byte offset inside the final region (wave-major layout). Wave w
+    // owns the contiguous kWarpFinalBytes region [w*kWarpFinalBytes, ...); inside
+    // that, col_tile c occupies [c*1024, (c+1)*1024). Signature takes warp_idx
+    // (not row_tile) because row_tile == warp_idx everywhere this is called: each
     // warp owns one of the 8 row-tiles of the 128-row Q block.
     __device__ __forceinline__ static constexpr uint32_t sub_block_byte_offset(uint32_t warp_idx,
                                                                                uint32_t col_tile)
     { return warp_idx * kWarpFinalBytes + col_tile * kSubBlockBytes; }
 
-    // Per-warp staging base. Aliases the first 2 KB of the wave's OWN 8 KB
-    // final region. After Phase 2 begins overwriting these bytes (with the
-    // bf16-cvt'd cols 256..512 of Q), no other wave touches them -- so the
-    // intra-wave overwrite is safely sequenced by per-wave program order.
+    // Per-warp staging base = the wave's OWN final region (kWarpFinalBytes).
+    // RoPE (Phase 2) later overwrites these same bytes; no other wave touches
+    // them, so the intra-wave overwrite is sequenced by per-wave program order.
     __device__ __forceinline__ static uintptr_t p1_warp_staging_base(uintptr_t p_lds_q,
                                                                      uint32_t warp_idx)
     { return p_lds_q + warp_idx * kWarpFinalBytes; }
@@ -398,83 +405,6 @@ class QManager8to16bitsV1
         cvt_scalef32_pk_bf16_fp8_pinned<kVgprChunkBase + 7u, true>(fp8[3], scale_f);
     }
 
-    // ---- Phase 2: NoPE fp8 chunk -> bf16 LDS (for chunks NOT in VGPR) ----
-    template <uint32_t kChunkIdx>
-    __device__ __forceinline__ static void
-    p2_vmem_to_vgpr_nope_chunk(const q_nope_t* p_q_warp, hk::u32x4& nope_dw, uint32_t& scale_dw)
-    {
-        static_assert(kChunkIdx < kP2NumNopeChunks, "p2_vmem_to_vgpr_nope_chunk: bad kChunkIdx.");
-        constexpr uint32_t kColInRecord = kVgprHalfCols + kChunkIdx * kP2ChunkCols; // 256,320,384
-        constexpr uint32_t kScaleByteBase =
-            kScaleBaseOff + kColInRecord / kSubBlockCols; // 456,458,460
-
-        uint32_t lane_idx = opus::lane_id();
-        asm volatile("" : "+v"(lane_idx)); // break-CSE
-        const uint32_t row_in_warp = lane_idx >> 2; // 0..15
-        const uint32_t col_group   = lane_idx & 3u; // 0..3
-
-        const uint32_t v_off_nope  = row_in_warp * kPackedNopeStride + col_group * 16u;
-        const uint32_t v_off_scale = row_in_warp * kPackedNopeStride + (col_group >> 1); // +0/+1
-
-        auto g_q_nope = opus::make_gmem<uint8_t>(reinterpret_cast<const uint8_t*>(p_q_warp));
-        auto raw      = g_q_nope.template load<16>(v_off_nope, /*s_os=*/kColInRecord);
-        nope_dw       = __builtin_bit_cast(hk::u32x4, raw);
-        scale_dw      = static_cast<uint32_t>(
-            g_q_nope.template load<1>(v_off_scale, /*s_os=*/kScaleByteBase)[0]);
-    }
-
-    template <uint32_t kChunkIdx>
-    __device__ __forceinline__ static void p2_cvt_store_nope_chunk(const uintptr_t p_lds_q,
-                                                                   const uint32_t warp_idx,
-                                                                   const hk::u32x4& nope_dw,
-                                                                   const uint32_t scale_dw,
-                                                                   const float q_scale_log2)
-    {
-        static_assert(kChunkIdx < kP2NumNopeChunks, "p2_cvt_store_nope_chunk: bad kChunkIdx.");
-        constexpr uint32_t kColInLds    = kChunkIdx * kP2ChunkCols;  // 0,64,128
-        constexpr uint32_t kColTileBase = kColInLds / kSubBlockCols; // 0,2,4
-
-        uint32_t lane_idx = opus::lane_id();
-        asm volatile("" : "+v"(lane_idx)); // break-CSE
-        const uint32_t row_in_warp = lane_idx >> 2; // 0..15
-        const uint32_t col_group   = lane_idx & 3u; // 0..3
-
-        // sb8 perm [0,2,4,6,1,3,5,7] on LDS dst: lo_dw -> col_tile kColTileBase,
-        // hi_dw -> kColTileBase+1. Site-C row-XOR composes on a disjoint bit.
-        const uint32_t byte_in_sb = col_group << 4; // 0/16/32/48
-
-        const float scale_f = hk_mla::e8m0_to_f32(scale_dw) * q_scale_log2;
-
-        using bf16x2_v = __attribute__((__vector_size__(4))) short;
-        hk::u32x4 lo_dw, hi_dw;
-        bf16x2_v r;
-        r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[0], scale_f, false);
-        lo_dw[0] = __builtin_bit_cast(uint32_t, r);
-        r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[0], scale_f, true);
-        lo_dw[1] = __builtin_bit_cast(uint32_t, r);
-        r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[1], scale_f, false);
-        lo_dw[2] = __builtin_bit_cast(uint32_t, r);
-        r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[1], scale_f, true);
-        lo_dw[3] = __builtin_bit_cast(uint32_t, r);
-        r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[2], scale_f, false);
-        hi_dw[0] = __builtin_bit_cast(uint32_t, r);
-        r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[2], scale_f, true);
-        hi_dw[1] = __builtin_bit_cast(uint32_t, r);
-        r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[3], scale_f, false);
-        hi_dw[2] = __builtin_bit_cast(uint32_t, r);
-        r        = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(nope_dw[3], scale_f, true);
-        hi_dw[3] = __builtin_bit_cast(uint32_t, r);
-
-        const uint32_t row_bank_swap  = ((row_in_warp >> 2) & 1u) << 5;
-        const uint32_t byte_in_sb_swz = byte_in_sb ^ row_bank_swap;
-        const uintptr_t p_dst_lane    = p_lds_q + sub_block_byte_offset(warp_idx, kColTileBase) +
-                                        row_in_warp * (kSubBlockCols * sizeof(hk::bf16)) +
-                                        byte_in_sb_swz;
-        const uint32_t addr = static_cast<uint32_t>(p_dst_lane);
-        hkm::ds_write_b128(lo_dw, addr, 0);
-        hkm::ds_write_b128(hi_dw, addr, kSubBlockBytes);
-    }
-
     // Scale one bf16x2 dword by an fp32 scalar: unpack each bf16 to fp32
     // (bf16 = high 16 bits of fp32, so element k -> bits<<16), multiply, then
     // repack with v_cvt_pk_bf16_f32 (element 0 -> low half, element 1 -> high).
@@ -504,8 +434,8 @@ class QManager8to16bitsV1
                                                               const uint32_t warp_idx,
                                                               const float q_scale_log2)
     {
-        constexpr uint32_t kColTileLo = kLdsHalfNopeCols / kSubBlockCols; // 6
-        constexpr uint32_t kColTileHi = kColTileLo + 1u;                  // 7
+        constexpr uint32_t kColTileLo = kRopeColTileLo; // 0 when all NoPE in VGPR
+        constexpr uint32_t kColTileHi = kRopeColTileHi; // 1 when all NoPE in VGPR
 
         uint32_t lane_idx    = opus::lane_id();
         asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
@@ -561,9 +491,8 @@ class QManager8to16bitsV1
 
     __device__ QManager8to16bitsV1() {}
 
-    // Total LDS footprint = max(Phase 1 staging, Phase 2 final). Since the
-    // staging region is overlapped with (and overwritten by) the final region,
-    // the manager's persistent footprint is just kFinalLdsBytes = 64 KB.
+    // Total LDS footprint = the per-warp staging region, reused by RoPE. With all
+    // NoPE in VGPR the final region holds RoPE only -> kFinalLdsBytes = 16 KB.
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     { return kFinalLdsBytes; }
 
@@ -576,11 +505,10 @@ class QManager8to16bitsV1
     //                           [GPR_NOPE_VGPR_START + 8*chunk + 4*iter + i]
     //                         = bf16 mfma A-tile for QK iter (2*chunk + iter).
     //   p_lds_q             : start of the 64 KB bf16 LDS region. Phase 1 also
-    //                         uses the first 16 KB as per-warp staging, then
-    //                         Phase 2 overwrites the whole region.
-    // kNumVgprNopeChunks: # of 64-col NoPE chunks (0..6) loaded into VGPR via p1;
-    // the remaining NoPE chunks go to LDS via p2. RoPE always goes to LDS.
-    template <uint32_t GPR_NOPE_VGPR_START, uint32_t kNumVgprNopeChunks>
+    //                         uses the per-warp staging, then RoPE reuses it.
+    // All kP1MaxChunks NoPE chunks (cols 0:448) go to VGPR via p1; RoPE goes
+    // through the (reused) staging LDS then to VGPR in the prologue.
+    template <uint32_t GPR_NOPE_VGPR_START>
     __device__ __forceinline__ void load_q(const q_nope_t* p_q_buffer_nope,
                                            const q_rope_t* p_q_buffer_rope,
                                            const int32_t num_qheads,
@@ -643,13 +571,10 @@ class QManager8to16bitsV1
         __builtin_amdgcn_sched_barrier(0);
         p1_staging_to_vgpr_chunk<3, 1, GPR_NOPE_VGPR_START>(p_lds_warp_staging, s_3, q_scale_log2);
 
-        static_assert(kNumVgprNopeChunks >= 4u && kNumVgprNopeChunks <= 7u,
-                      "load_q: kNumVgprNopeChunks must be in [4,7] (chunks 0-3 always VGPR).");
-
-        // ---- Hi NoPE chunks 4..kNumVgprNopeChunks-1 (Q[:,256:...]) -> VGPR via p1 ----
+        // ---- Hi NoPE chunks 4..kP1MaxChunks-1 (Q[:,256:448]) -> VGPR via p1 ----
         // chunk c lands at GPR_NOPE_VGPR_START + 8*c. Each reuses staging buf c%2;
         // drain prior buf reads + its own vmem load before consume.
-        opus::static_for<kNumVgprNopeChunks - 4u>([&](auto cc) {
+        opus::static_for<kP1MaxChunks - 4u>([&](auto cc) {
             constexpr uint32_t c   = 4u + cc.value;
             constexpr uint32_t buf = c % 2u;
             uint32_t s_c;
@@ -662,24 +587,12 @@ class QManager8to16bitsV1
                 p_lds_warp_staging, s_c, q_scale_log2);
         });
 
-        // ---- Remaining NoPE chunks -> LDS via p2; then RoPE -> LDS ----
-        // p2 chunk j = overall NoPE chunk 4+j (cols 256+64j). In LDS iff that
-        // chunk is not in VGPR. The QK reads them from Q-LDS col-tiles 2j,2j+1.
+        // ---- RoPE -> LDS (reusing the now-consumed staging region) -> VGPR ----
+        // RoPE's ds_write lands in the same per-warp bytes p1 staging just used,
+        // so drain the last staging ds_read (lgkmcnt=0) before overwriting them.
         const uint32_t warp_idx_u = static_cast<uint32_t>(warp_idx);
-        if constexpr(kNumVgprNopeChunks < 6u) // chunk 5 (cols 320:384)
-        {
-            hk::u32x4 d;
-            uint32_t s;
-            p2_vmem_to_vgpr_nope_chunk<1>(p_q_warp, d, s);
-            p2_cvt_store_nope_chunk<1>(p_lds_q, warp_idx_u, d, s, q_scale_log2);
-        }
-        if constexpr(kNumVgprNopeChunks < 7u) // chunk 6 (cols 384:448)
-        {
-            hk::u32x4 d;
-            uint32_t s;
-            p2_vmem_to_vgpr_nope_chunk<2>(p_q_warp, d, s);
-            p2_cvt_store_nope_chunk<2>(p_lds_q, warp_idx_u, d, s, q_scale_log2);
-        }
+        __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/-1));
+        __builtin_amdgcn_sched_barrier(0);
         p2_load_rope_chunk(p_q_rope_warp, p_lds_q, warp_idx_u, q_scale_log2);
     }
 
@@ -903,7 +816,8 @@ class KvManager8to16bitsV1
         constexpr uint32_t kTileIdx = kColOffset / kTileCols;
         constexpr bool kIsNoPEPath = (kTileIdx == 0u) || (kIsRopeWarp == false);
 
-        const uint32_t lane_idx         = opus::lane_id();
+        uint32_t lane_idx = opus::lane_id();
+        asm volatile("" : "+v"(lane_idx)); // break-CSE: shorten lane-derived live ranges
         const uint32_t col_group        = lane_idx & 3u; // 0..3
         const uint32_t col_tile_in_tile = wave_col_tile_in_tile(warp_idx);
         const bool in_bounds            = (kCheckBoundary == false) || (row_kv_ld >= 0);
