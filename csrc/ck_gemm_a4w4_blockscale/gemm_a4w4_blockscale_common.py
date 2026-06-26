@@ -95,7 +95,7 @@ class tileKernelInstance:
         """
 
         parts = [
-            "a8w8_cktile",
+            "a4w4_blockscale_cktile",
             ("x").join(
                 map(
                     lambda x: str(x),
@@ -177,13 +177,12 @@ default_kernels_dict = {
 
 kernels_list_cktile = {
     ######################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
-    0:  tileKernelInstance(   128,     128,      128,     1,        4,       1,        32,            32,           128,      "Intrawave",        False,             True,           False,             1      ),
-
+    0:  tileKernelInstance(   128,     512,      256,     1,        4,       1,        16,            16,           128,      "Default",        False,             False,           False,             1      ),
 }
 
 default_kernels_dict_cktile = {
     #########################| M_Tile | N_Tile | K_Tile | M_Warp | N_Warp | K_Warp | M_Warp_Tile | N_Warp_Tile | K_Warp_Tile |   Scheduler   | TiledMMAPermuteN |  TransposeC | UsePersistentKernel | BlockPerCu |
-    (-1):  tileKernelInstance(   128,     128,      128,     1,        4,       1,        32,            32,           128,      "Intrawave",        False,             True,           False,             1      ),
+    (-1):  tileKernelInstance(   128,     512,      256,     1,        4,       1,        16,            16,           128,      "Default",        False,             False,           False,             1      ),
 }
 
 # Name-keyed reverse lookup so codegen can filter the tuned CSV by kernelName,

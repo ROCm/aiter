@@ -121,7 +121,7 @@ torch::Tensor
     // The smallest kernel we have available. Works well for memory bound shapes.
 
     // Check if this input needs to be padded.
-    int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+    int M = XQ.numel() / XQ.size(-1);
     int N = WQ.size(0);
     int K = WQ.size(1);
 

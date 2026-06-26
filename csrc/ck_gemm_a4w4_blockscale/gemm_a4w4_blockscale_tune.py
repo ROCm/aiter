@@ -164,7 +164,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             "--libtype",
             type=str,
             default="all",
-            choices=["ck", "cktile", "all", "both"],
+            choices=["ck", "cktile", "asm", "all", "both"],
             required=False,
             help="CK gemm a4w4 type to tune: ck, cktile, both or all (covers all supported backends across standard/preshuffleB modes)",
         )
@@ -354,19 +354,8 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         tasks_cktile = []
 
         for kernel_idx, kernel in enumerate(kernel_list):
-            maxsplitK = (
-                aiter.compute_gemm_SplitK(
-                    M,
-                    N,
-                    K,
-                    kernel.MPerBLOCK,
-                    kernel.NPerBLOCK,
-                    kernel.KPerBLOCK,
-                )
-                if useSplitK
-                else 1
-            )
-            for splitK in range(1, maxsplitK + 1):
+            maxsplitK = 0 # preshuffleB true
+            for splitK in range(maxsplitK + 1):
                 info = ((gfx, cu_num, M, N, K), kernel_idx, splitK, "", "cktile")
                 tasks_cktile.append(
                     (
@@ -419,9 +408,8 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         ]
         ref_keys = ["x", "w", "x_scales", "w_scales"]
         task_asm = []
-
-        ### asm kernels
-        asm_kernels_id = ck_kernels_num + 1
+        asm_kernels_id = 0
+        
         asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
         asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
         asm_tiles = [key for key in asm_kernels.keys()]
@@ -440,7 +428,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 maxsplitK = 0
             for splitK in range(maxsplitK + 1):
                 kernel_name = kernelName[0]
-                info = ((gfx, cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
+                info = ((gfx, cu_num, M, N, K), asm_kernels_id, splitK, kernel_name, "asm")
                 task_asm.append(
                     (
                         info,
@@ -472,7 +460,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                         ("out_ck",),
                     )
                 )
-                asm_kernels_id = asm_kernels_id + 1
+                asm_kernels_id += 1
         return task_asm
 
     def tune(
@@ -524,7 +512,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 task.extend(
                     self.get_gemm_a4w4_cktile_tune_task(
                         info_keys,
-                        useSplitK,
+                        False,
                         seed,
                         block_per_cu,
                         run_kwargs,
