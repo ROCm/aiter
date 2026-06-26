@@ -1517,25 +1517,50 @@ def get_2stage_cfgs(
             # a16w4: bf16 activation x MX-FP4 weight (fp4_bf16 decode path).
             _a_type = "bf16"
             _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
-            _tile_n = 128
+            # Per-stage tile_n. Stage1 (gate+up) output N=2*inter_dim is small, so
+            # a narrow tile_n=64 wastes far less work at decode (measured 18-30%
+            # faster across inter_dim=256/1024/2048 at M<=32); at prefill the wide
+            # tile_n=128 wins by a few %, so tie tile_n to the same token threshold
+            # as tile_m. Stage2 (down) only has tile_n=128 registered for fp4_bf16
+            # and its large N=model_dim prefers it anyway, so keep 128 there.
+            _tile_n1 = 64 if _tile_m == 16 else 128
+            _tile_n2 = 128
             _tile_k = 128
-            _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
-            kn1 = flydsl_kernel_name(
-                1, _a_type, "fp4", _out_type, _tile_m, _tile_n, _tile_k
+            _raw_ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
+            _base_kn1 = flydsl_kernel_name(
+                1, _a_type, "fp4", _out_type, _tile_m, _tile_n1, _tile_k
             )
-            if _ksplit > 1:
-                kn1 += f"_kb{_ksplit}"
+            # The shared get_ksplit heuristic (built for the a8w8/a8w4 paths) can
+            # return a split-K factor that has no compiled fp4_bf16 kernel (e.g.
+            # 16) or 0/1. The original code then stripped the _kb suffix and fell
+            # back to the *plain* (non-split) kernel while leaving _ksplit stale,
+            # and the fp4_bf16 plain path is incorrect in the fused pipeline. So
+            # snap to a *registered* split-K (>=2) that divides model_dim: prefer
+            # the heuristic's magnitude, capped to the nearest available factor;
+            # use the smallest split when it asks for none. (sweep: kb4 fastest at
+            # small M, kb2 best at larger M; plain kb1 is currently broken here.)
+            _splitk_candidates = sorted(
+                kb
+                for kb in (2, 4)
+                if model_dim % kb == 0
+                and (model_dim // kb) % _tile_k == 0
+                and get_flydsl_kernel_params(f"{_base_kn1}_kb{kb}") is not None
+            )
+            if _splitk_candidates:
+                if _raw_ksplit >= 2:
+                    _le = [kb for kb in _splitk_candidates if kb <= _raw_ksplit]
+                    _ksplit = max(_le) if _le else min(_splitk_candidates)
+                else:
+                    _ksplit = min(_splitk_candidates)
+                kn1 = f"{_base_kn1}_kb{_ksplit}"
+            else:
+                # No registered split-K kernel for this tile -> keep plain, but
+                # make _ksplit consistent so metadata.ksplit carries no stale split.
+                _ksplit = 0
+                kn1 = _base_kn1
             kn2 = flydsl_kernel_name(
-                2, _a_type, "fp4", _out_type, _tile_m, _tile_n, _tile_k, "atomic"
+                2, _a_type, "fp4", _out_type, _tile_m, _tile_n2, _tile_k, "atomic"
             )
-            if get_flydsl_kernel_params(kn1) is None:
-                kn1 = flydsl_kernel_name(
-                    1, _a_type, "fp4", _out_type, _tile_m, _tile_n, _tile_k
-                )
-            if get_flydsl_kernel_params(kn2) is None:
-                kn2 = flydsl_kernel_name(
-                    2, _a_type, "fp4", _out_type, _tile_m, _tile_n, _tile_k, "atomic"
-                )
         else:
             # a8w4: fp8 activation x MX-FP4 weight (a8w4_bf16 decode path).
             _a_type = "fp8"
