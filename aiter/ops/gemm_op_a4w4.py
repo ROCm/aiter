@@ -250,3 +250,48 @@ def gemm_a4w4_blockscale_tune(
     kernelId: int,
     splitK: int = 0,
 ) -> Tensor: ...
+
+
+def gemm_a4w4_bpreshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    """Dense MXFP4 GEMM on the FlyDSL preshuffle kernel.
+
+    The MXFP4 sibling of ``gemm_a8w8_bpreshuffle_flydsl``. Operands use the OCP
+    microscaling format: E2M1 elements packed two-per-byte with one E8M0 scale
+    per 32-element K block. Inputs must already be quantized and preshuffled by
+    the caller (``per_1x32_f4_quant_hip`` for A; ``shuffle_weight`` +
+    ``e8m0_shuffle`` for B) -- this op only selects the tiling and launches the
+    kernel. Tiling is taken from ``config["kernelName"]``.
+    """
+    from .gemm_op_a8w8 import _parse_flydsl_kernel_name
+    from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    parsed = _parse_flydsl_kernel_name(str(config.get("kernelName", "")))
+    if parsed is None:
+        raise ValueError(
+            "[FlyDSL] gemm_a4w4_bpreshuffle_flydsl: config['kernelName'] "
+            "did not parse to a valid FlyDSL tiling"
+        )
+    tile_m, tile_n, tile_k, lds, csh, acp, wpe, xcd = parsed
+    flydsl_preshuffle_gemm_a8(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Out,
+        tile_m,
+        tile_n,
+        tile_k,
+        lds,
+        csh,
+        acp,
+        wpe,
+        xcd,
+    )
+    return Out

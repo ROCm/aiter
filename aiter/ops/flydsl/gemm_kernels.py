@@ -1002,6 +1002,9 @@ def flydsl_preshuffle_gemm_a8(
 
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0]
+    # packed MXFP4 stores two E2M1 values per byte -> last dim is K/2.
+    if "float4" in str(XQ.dtype):
+        k *= 2
 
     if n % tile_n != 0:
         raise RuntimeError(
@@ -1018,6 +1021,9 @@ def flydsl_preshuffle_gemm_a8(
         in_dtype = "fp8"
     elif XQ.dtype == torch.int8:
         in_dtype = "int8"
+    elif "float4" in str(XQ.dtype):
+        # packed MXFP4: E2M1 elements (x2/byte) with E8M0 per-32 block scales
+        in_dtype = "fp4"
     else:
         raise ValueError(f"[FlyDSL] unsupported input dtype {XQ.dtype}")
 
@@ -1048,7 +1054,11 @@ def flydsl_preshuffle_gemm_a8(
     )
 
     def _as_i8(t):
-        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+        return (
+            t.view(torch.int8)
+            if ("float8" in str(t.dtype) or "float4" in str(t.dtype))
+            else t
+        )
 
     out_contig = Out.contiguous()
     # FlyDSL's preshuffle kernel requires an arg_bias slot (used only when
