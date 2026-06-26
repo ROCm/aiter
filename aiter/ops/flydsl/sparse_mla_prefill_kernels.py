@@ -4,8 +4,7 @@
 """Host wrappers for the FlyDSL sparse MLA prefill kernel (gfx942).
 
 - ``flydsl_sparse_mla_prefill``        : Phase A flat fp8 cache, and (with
-  ``packed=True``) the Phase B1 paged ``fp8_ds_mla`` single-region path
-  (UE8M0 + sink + block_table).
+  ``packed=True``) the paged ``fp8_ds_mla`` / flat576 single-region path.
 - ``flydsl_sparse_mla_prefill_2region``: Phase B2 two-region native path
   (compressed OCP pool + SWA fnuz cache, shared online softmax).
 
@@ -294,7 +293,7 @@ def flydsl_sparse_mla_prefill(
         if is_glm:
             raise NotImplementedError("head_dim=576 (GLM) requires packed=True")
         if attn_sink is not None:
-            raise NotImplementedError("attn_sink is the packed (B1) path; pass packed=True")
+            raise NotImplementedError("attn_sink requires packed=True")
         if kv.dim() != 3 or kv.shape[1] != 1 or kv.shape[2] != head_dim:
             raise ValueError(f"flat kv must be [num_kv_rows, 1, {head_dim}], got {tuple(kv.shape)}")
         if not kv.is_contiguous():

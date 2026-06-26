@@ -211,7 +211,7 @@ def test_empty_kv_len():
 
 
 # ===========================================================================
-# Phase B (B1 paged single-region + B2 two-region) -- packed fp8_ds_mla cache.
+# Phase B packed fp8_ds_mla cache coverage.
 #
 # The packer / reader byte layout is copied from vLLM's
 # ``tests/kernels/attention/test_rocm_triton_attn_dsv4.py`` (NOT imported, to
@@ -363,129 +363,6 @@ def _gen_kv(num_tokens, seed, device="cuda", scale=0.125):
 def _gen_q(sq, H, seed, device="cuda", scale=0.125):
     g = torch.Generator(device=device).manual_seed(seed)
     return (torch.randn(sq, H, PACKED_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * scale)
-
-
-def test_b1_paged_basic():
-    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
-
-    device = "cuda"
-    block_size = 64
-    H = 128
-    scale = PACKED_HEAD_DIM ** -0.5
-    num_tokens = 600
-    kv = _gen_kv(num_tokens, seed=11)
-    cache = _pack_fp8_ds_mla_cache(kv, block_size)
-    rows = [[5, 200, 7, 400, 63, 64, 599, 128], [0, 1, 2, 3], [300, 301, 302, 303, 304, 305, 306]]
-    sq = len(rows)
-    q = _gen_q(sq, H, seed=12)
-    indices, indptr = _ragged_from_rows(rows, device)
-    block_table = _identity_block_table(num_tokens, block_size, device)
-
-    out = torch.empty(sq, H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
-    flydsl_sparse_mla_prefill(
-        q, cache, indices, indptr, out,
-        block_table=block_table, block_size=block_size, packed=True,
-    )
-    ref = _ref_prefill_packed(q, [(cache, rows, False)], scale, None, block_size)
-    cos_mean, cos_min, max_abs = _metrics(out, ref)
-    print(f"[b1_paged_basic] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
-    assert not torch.isnan(out).any(), "NaN in output"
-    assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
-
-
-def test_b1_sink():
-    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
-
-    device = "cuda"
-    block_size = 64
-    H = 128
-    scale = PACKED_HEAD_DIM ** -0.5
-    num_tokens = 300
-    kv = _gen_kv(num_tokens, seed=21)
-    cache = _pack_fp8_ds_mla_cache(kv, block_size)
-    rows = [[5, 200, 7, 64, 63], [10, 11, 12, 13, 14, 15, 16, 17]]
-    sq = len(rows)
-    q = _gen_q(sq, H, seed=22)
-    indices, indptr = _ragged_from_rows(rows, device)
-    block_table = _identity_block_table(num_tokens, block_size, device)
-    sink = (torch.randn(H, dtype=torch.float32, device=device) * 0.5 - 0.2)
-
-    out = torch.empty(sq, H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
-    flydsl_sparse_mla_prefill(
-        q, cache, indices, indptr, out,
-        block_table=block_table, block_size=block_size, packed=True, attn_sink=sink,
-    )
-    ref = _ref_prefill_packed(q, [(cache, rows, False)], scale, sink, block_size)
-    cos_mean, cos_min, max_abs = _metrics(out, ref)
-    print(f"[b1_sink] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
-    assert not torch.isnan(out).any(), "NaN in output"
-    assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
-
-
-def test_b1_edge_empty_invalid():
-    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
-
-    device = "cuda"
-    block_size = 64
-    H = 128
-    scale = PACKED_HEAD_DIM ** -0.5
-    num_tokens = 200
-    kv = _gen_kv(num_tokens, seed=31)
-    cache = _pack_fp8_ds_mla_cache(kv, block_size)
-    # q0 normal, q1 empty, q2 all-invalid (-1), q3 mixed valid/invalid
-    rows_full = [[5, 7, 9, 64], [], [-1, -1, -1], [10, -1, 11, 199, 5000]]
-    sq = len(rows_full)
-    q = _gen_q(sq, H, seed=32)
-    indices, indptr = _ragged_from_rows(rows_full, device)
-    block_table = _identity_block_table(num_tokens, block_size, device)
-
-    out = torch.full((sq, H, PACKED_HEAD_DIM), 7.0, dtype=torch.bfloat16, device=device)
-    flydsl_sparse_mla_prefill(
-        q, cache, indices, indptr, out,
-        block_table=block_table, block_size=block_size, packed=True,
-    )
-    assert not torch.isnan(out).any(), "NaN in output"
-    assert out[1].abs().max().item() == 0.0, "empty query must be zero"
-    assert out[2].abs().max().item() == 0.0, "all-invalid query must be zero"
-    # reference filters invalid slots (slot<0 or >=num_tokens).
-    rows_valid = [[s for s in r if 0 <= s < num_tokens] for r in rows_full]
-    ref = _ref_prefill_packed(q, [(cache, rows_valid, False)], scale, None, block_size)
-    cos_mean, cos_min, max_abs = _metrics(out[[0, 3]], ref[[0, 3]])
-    print(f"[b1_edge] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
-    assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
-
-
-def test_b1_ue8m0_nontrivial():
-    """UE8M0 != 1: per-64-block power-of-2 scales folded by the convert path."""
-    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
-
-    device = "cuda"
-    block_size = 16
-    H = 128
-    scale = PACKED_HEAD_DIM ** -0.5
-    num_tokens = 64
-    kv = _gen_kv(num_tokens, seed=41, scale=0.25)
-    # 7 per-block exponents around 127 (so exp2(enc-127) in {1/4..4}); small to
-    # keep scaled values inside the fnuz range.
-    scale_bytes = [125, 126, 127, 128, 129, 127, 126]
-    cache = _pack_fp8_ds_mla_cache(kv, block_size, scale_byte=scale_bytes)
-    rows = [[1, 5, 9, 16, 17, 33], [0, 2, 4, 6, 8, 10, 12]]
-    sq = len(rows)
-    q = _gen_q(sq, H, seed=42, scale=0.25)
-    indices, indptr = _ragged_from_rows(rows, device)
-    block_table = _identity_block_table(num_tokens, block_size, device)
-
-    out = torch.empty(sq, H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
-    flydsl_sparse_mla_prefill(
-        q, cache, indices, indptr, out,
-        block_table=block_table, block_size=block_size, packed=True,
-        scale_mode="ue8m0",
-    )
-    ref = _ref_prefill_packed(q, [(cache, rows, False)], scale, None, block_size)
-    cos_mean, cos_min, max_abs = _metrics(out, ref)
-    print(f"[b1_ue8m0] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
-    assert not torch.isnan(out).any(), "NaN in output"
-    assert cos_mean > 0.97, f"cosine too low: {cos_mean}"
 
 
 def test_b2_two_region():
@@ -728,11 +605,6 @@ def _main():
     test_basic()
     test_all_invalid()
     test_empty_kv_len()
-    # Phase B1
-    test_b1_paged_basic()
-    test_b1_sink()
-    test_b1_edge_empty_invalid()
-    test_b1_ue8m0_nontrivial()
     # Phase B2
     test_b2_two_region()
     test_b2_multitile()

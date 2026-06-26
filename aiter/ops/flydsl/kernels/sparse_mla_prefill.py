@@ -890,7 +890,7 @@ def compile_sparse_mla_prefill_paged(
 ):
     """Build a paged sparse MLA prefill launcher (gfx942).
 
-    num_regions: 1 (B1 SWA-only / GLM) or 2 (B2 compressed + SWA).
+    num_regions: 1 (single-region / GLM) or 2 (compressed + SWA).
     has_sink:    fold a per-head virtual key into the softmax denominator.
     r0_convert:  region0 uses the register-staged convert load (needed when
                  UE8M0 != 1 or region0 is OCP); else the fast DMA path.
@@ -1158,7 +1158,8 @@ def compile_sparse_mla_prefill_paged(
         # ---- NoPE convert load (OCP and/or UE8M0), blocks 0..6 ----
         # ``bias_f32`` is the OCP->fnuz exponent correction (1.0 for OCP bytes,
         # 0.0 for fnuz) added on top of the UE8M0 (enc-127) per-block exponent.
-        # It may be a compile-time constant (B1) or a runtime select (B2).
+        # It may be a compile-time constant for single-region kernels or a
+        # runtime select for two-region kernels.
         def _load_nope_convert(cache_rsrc, p_lds_kv_warp, token_base_i32, scale_base_i32, bias_f32):
             for blk in range_constexpr(PK_NOPE_BLOCKS):
                 dst_addr = _i32(ArithValue(p_lds_kv_warp) + blk * KV_BLOCK_BYTES + _i32(lane_idx) * 4)
@@ -1653,7 +1654,7 @@ def compile_sparse_mla_prefill_paged(
         row_base = _idx(q_idx) * NUM_QO_HEADS + warp_idx * 16
         q_nope_packs = _load_q_to_regs(q_idx)
 
-        # ---- region-0 attend body (B1 single-region: const-fixed resources) ----
+        # ---- region-0 attend body (single-region: const-fixed resources) ----
         def _attend_region0(kv_tile_start_i32, rm_in, rse_in, oaccu_in, is_first):
             tb, sb = _row_addrs(
                 main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,

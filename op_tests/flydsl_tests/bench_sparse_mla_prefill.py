@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""End-to-end benchmark: FlyDSL sparse MLA prefill (B1/B2) vs Triton baselines.
+"""End-to-end benchmark: FlyDSL sparse MLA prefill (B2/GLM) vs Triton baselines.
 
 Fair comparison rule: report **total wall time** for each path, including all
 prep kernels the production stack runs before the core attention op.  The FlyDSL
 native path fuses gather/dequant/attn; the Triton production prefill path does
 not — so ``triton_prefill_e2e`` times dequant + attention, not attention alone.
 
-Run (gfx942, DSv4 defaults: B1 topk=128 SWA-only, B2 main=512 + extra=128):
+Run (gfx942, dsv4 preset: B2 main=512 + extra=128):
 
     cd /home/AMD/samremes/dev/aiter
     python op_tests/flydsl_tests/bench_sparse_mla_prefill.py
@@ -28,10 +28,9 @@ from typing import Callable
 
 import torch
 
-# DSv4 sparse MLA prefill shapes (index_topk=512 compressed, sliding_window=128 SWA).
+# dsv4 sparse MLA prefill shapes (index_topk=512 compressed, sliding_window=128 SWA).
 DSV4_TOPK_MAIN = 512
 DSV4_TOPK_EXTRA = 128
-DSV4_TOPK_B1 = 128  # B1 SWA-only single-region layers (compress_ratio <= 1)
 # GLM-5 / DSv3.2: single global top-k over a flat fp8 576 latent cache.
 GLM_TOPK = 2048
 # Per-batch split cap for the persistent MLA sparse decode metadata. Mirrors
@@ -294,20 +293,6 @@ def dequant_cache_to_bf16(
 # Benchmark cases
 # ---------------------------------------------------------------------------
 @dataclass
-class BenchInputsB1:
-    q: torch.Tensor
-    cache: torch.Tensor
-    indices: torch.Tensor
-    indptr: torch.Tensor
-    block_table: torch.Tensor
-    block_size: int
-    sink: torch.Tensor
-    scale: float
-    out: torch.Tensor
-    unique_slots: torch.Tensor
-
-
-@dataclass
 class BenchInputsB2:
     q: torch.Tensor
     main_cache: torch.Tensor
@@ -328,35 +313,6 @@ class BenchInputsB2:
     merged_indptr: torch.Tensor
     main_unique_slots: torch.Tensor
     extra_unique_slots: torch.Tensor
-
-
-def build_b1_inputs(
-    T: int,
-    topk: int,
-    num_tokens: int,
-    block_size: int,
-    seed: int,
-    device: str = "cuda",
-) -> BenchInputsB1:
-    kv = gen_kv(num_tokens, seed=seed)
-    cache = pack_fp8_ds_mla_cache(kv, block_size, is_extra=False)
-    rows = gen_ragged_rows(T, topk, num_tokens, seed=seed + 1)
-    indices, indptr = ragged_from_rows(rows, torch.device(device))
-    q = gen_q(T, H_PROD, seed=seed + 2)
-    sink = torch.randn(H_PROD, dtype=torch.float32, device=device) * 0.3
-    out = torch.empty(T, H_PROD, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
-    return BenchInputsB1(
-        q=q,
-        cache=cache,
-        indices=indices,
-        indptr=indptr,
-        block_table=identity_block_table(num_tokens, block_size, torch.device(device)),
-        block_size=block_size,
-        sink=sink,
-        scale=default_scale(),
-        out=out,
-        unique_slots=indices.unique(),
-    )
 
 
 def build_b2_inputs(
@@ -734,99 +690,6 @@ def check_glm_paths(inp: BenchInputsGLM, state: GlmDecodeState) -> float:
     return _cosine(fly_out, state.out_asm)
 
 
-def bench_flydsl_b1(inp: BenchInputsB1, warmup: int, iters: int) -> TimingResult:
-    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
-
-    def run_once():
-        timer = StageTimer()
-        timer.begin("flydsl_kernel")
-        flydsl_sparse_mla_prefill(
-            inp.q,
-            inp.cache,
-            inp.indices,
-            inp.indptr,
-            inp.out,
-            block_table=inp.block_table,
-            block_size=inp.block_size,
-            packed=True,
-            scale_mode="ue8m0",
-            attn_sink=inp.sink,
-        )
-        return timer.finish()
-
-    # compile warmup
-    run_once()
-    med, stages = _median_ms(run_once, warmup, iters)
-    return TimingResult("flydsl_b1_e2e", med, stages, notes="native paged fp8, fused")
-
-
-def bench_triton_prefill_e2e_b1(
-    inp: BenchInputsB1, warmup: int, iters: int, *, csr_dequant: bool
-) -> TimingResult:
-    slots = inp.unique_slots if csr_dequant else None
-
-    def run_once():
-        timer = StageTimer()
-        kv_bf16 = dequant_cache_to_bf16(
-            inp.cache, inp.block_size, is_extra=False, timer=timer, slots=slots
-        )
-        timer.begin("triton_prefill")
-        rocm_sparse_attn_prefill_ragged_triton(
-            q=inp.q,
-            kv=kv_bf16,
-            indices=inp.indices,
-            indptr=inp.indptr,
-            scale=inp.scale,
-            attn_sink=inp.sink,
-            nope_head_dim=NOPE_HEAD_DIM,
-            rope_head_dim=ROPE_HEAD_DIM,
-        )
-        return timer.finish()
-
-    run_once()
-    med, stages = _median_ms(run_once, warmup, iters)
-    return TimingResult(
-        "triton_prefill_e2e_b1",
-        med,
-        stages,
-        notes=(
-            "CSR-slot dequant + bf16 ragged prefill (prod-like)"
-            if csr_dequant
-            else "full-cache dequant + bf16 ragged prefill (pessimistic)"
-        ),
-    )
-
-
-def bench_triton_prefill_attn_only_b1(
-    inp: BenchInputsB1, warmup: int, iters: int
-) -> TimingResult:
-    kv_bf16 = dequant_cache_to_bf16(inp.cache, inp.block_size, is_extra=False)
-
-    def run_once():
-        timer = StageTimer()
-        timer.begin("triton_prefill")
-        rocm_sparse_attn_prefill_ragged_triton(
-            q=inp.q,
-            kv=kv_bf16,
-            indices=inp.indices,
-            indptr=inp.indptr,
-            scale=inp.scale,
-            attn_sink=inp.sink,
-            nope_head_dim=NOPE_HEAD_DIM,
-            rope_head_dim=ROPE_HEAD_DIM,
-        )
-        return timer.finish()
-
-    run_once()
-    med, stages = _median_ms(run_once, warmup, iters)
-    return TimingResult(
-        "triton_prefill_attn_only_b1",
-        med,
-        stages,
-        notes="UNFAIR: bf16 KV pre-built outside timed loop",
-    )
-
-
 def bench_flydsl_b2(inp: BenchInputsB2, warmup: int, iters: int) -> TimingResult:
     from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
 
@@ -968,24 +831,6 @@ def run_bench(args: argparse.Namespace, T: int) -> None:
     )
     print()
 
-    # ---- B1 ----
-    print(f"=== B1 single-region (topk={args.topk}, num_tokens={args.num_tokens}) ===")
-    b1 = build_b1_inputs(
-        T, args.topk, args.num_tokens, args.block_size, args.seed
-    )
-    fly_b1 = bench_flydsl_b1(b1, args.warmup, args.iters)
-    _print_result(fly_b1, None)
-    if not args.skip_triton:
-        triton_e2e = bench_triton_prefill_e2e_b1(b1, args.warmup, args.iters, csr_dequant=csr_dequant)
-        _print_result(triton_e2e, fly_b1.total_ms)
-        triton_attn = bench_triton_prefill_attn_only_b1(b1, args.warmup, args.iters)
-        _print_result(triton_attn, fly_b1.total_ms)
-    print()
-
-    if args.skip_b2:
-        return
-
-    # ---- B2 ----
     print(
         f"=== B2 two-region (topk_main={topk_main}, topk_extra={topk_extra}, "
         f"main_tokens={args.main_tokens}, extra_tokens={args.extra_tokens}) ==="
@@ -1105,14 +950,13 @@ def main() -> None:
         "--preset",
         choices=("dsv4", "dsv32", "glm"),
         default="dsv4",
-        help="dsv4: B1 (topk=128) + B2 two-region. glm/dsv32: single-region flat fp8 head_dim=576, topk=2048.",
+        help="dsv4: B2 two-region only. glm/dsv32: single-region flat fp8 head_dim=576, topk=2048.",
     )
     parser.add_argument(
         "--topk",
         type=int,
         default=None,
-        help="CSR length per query for the single-region run "
-        "(default: 128 for dsv4 B1, 2048 for glm/dsv32)",
+        help="CSR length per query for glm/dsv32 single-region runs (default: 2048)",
     )
     parser.add_argument(
         "--kv-scale",
@@ -1144,14 +988,13 @@ def main() -> None:
         default=DSV4_TOPK_EXTRA,
         help="B2 extra-region CSR length per query (DSv4 default: 128)",
     )
-    parser.add_argument("--num-tokens", type=int, default=65536, help="B1 cache slots")
+    parser.add_argument("--num-tokens", type=int, default=65536, help="glm/dsv32 cache slots")
     parser.add_argument("--main-tokens", type=int, default=65536, help="B2 SWA cache slots")
     parser.add_argument("--extra-tokens", type=int, default=32768, help="B2 compressed cache slots")
     parser.add_argument("--block-size", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--skip-b2", action="store_true")
     parser.add_argument("--skip-triton", action="store_true")
     parser.add_argument(
         "--full-cache-dequant",
@@ -1164,7 +1007,9 @@ def main() -> None:
 
     is_glm = args.preset in ("glm", "dsv32")
     if args.topk is None:
-        args.topk = GLM_TOPK if is_glm else DSV4_TOPK_B1
+        args.topk = GLM_TOPK
+    elif not is_glm:
+        parser.error("--topk is only used with --preset glm/dsv32; use --topk-main/--topk-extra")
     bench_fn = run_bench_glm if is_glm else run_bench
 
     if args.T_sweep is not None:
