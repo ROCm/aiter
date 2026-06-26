@@ -480,6 +480,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     tile_m, tile_n, tile_k = 64, 256, 256
     m_warp, n_warp = 1, 4
     num_buffers = 2
+    num_buffer_stage2 = None  # None -> fall back to num_buffers below
     split_k1 = 1
     split_k2 = 1
     grouped_contiguous_m = False
@@ -505,6 +506,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
+        # stage2 buffer count; absent column -> keep None so it inherits num_buffers
+        num_buffer_stage2 = _as_int(cfg_row.get("num_buffer_stage2"), num_buffer_stage2)
         split_k1 = _as_int(cfg_row.get("split_k1"), split_k1)
         split_k2 = _as_int(cfg_row.get("split_k2"), split_k2)
         grouped_contiguous_m = _as_bool(
@@ -566,6 +569,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     tile_m2 = _as_int(cfg_row.get("tile_m2"), tile_m) if cfg_row else tile_m
     tile_n2 = _as_int(cfg_row.get("tile_n2"), tile_n) if cfg_row else tile_n
     tile_k2 = _as_int(cfg_row.get("tile_k2"), tile_k) if cfg_row else tile_k
+    # stage2 buffer count: dedicated column if present, else inherit gemm1's.
+    if num_buffer_stage2 is None:
+        num_buffer_stage2 = num_buffers
     warp_tile_m2 = tile_m2 // m_warp
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
@@ -958,7 +964,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         m_warp=m_warp,
         n_warp=n_warp,
         out_dtype=out_dtype_str,
-        num_buffers=num_buffers,
+        num_buffers=num_buffer_stage2,
         split_k=split_k2,
         expert_sched_mode=False,
         grouped_persistent_m=False,

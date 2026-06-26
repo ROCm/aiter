@@ -597,11 +597,14 @@ def compile_mxscale_gemm(
     )
     needs_grouped_row_masked_store = grouped_masked_m and (M % tile_m != 0)
     kernel_tag_mode = str(kernel_tag).replace("-", "_")
-    # Kernel symbol carries the data format + tile shape so profiles/dumps can
-    # tell configs apart (e.g. stage1 vs stage2, different tile_m/n/k).
+    # Kernel symbol carries the data format + tile shape + buffer count so
+    # profiles/dumps can tell configs apart (e.g. stage1 vs stage2, different
+    # tile_m/n/k, or the same tile with a different num_buffers). This is the
+    # single canonical place for the tile shape -- callers must NOT also embed
+    # it in kernel_tag, or it shows up twice in the symbol.
     module_name = (
         f"kernel_mxscale_{kernel_tag_mode}_{data_format}"
-        f"_t{tile_m}x{tile_n}x{tile_k}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_b{num_buffers}"
     ).replace("-", "_")
 
     if use_fp4_bank_friendly_schedule:

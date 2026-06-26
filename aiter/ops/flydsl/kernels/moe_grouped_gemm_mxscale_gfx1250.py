@@ -864,7 +864,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     cfg=cfg,
                     stage1_act=cfg.act,
                     stage1_weight_layout=cfg.stage1_weight_layout,
-                    kernel_tag=f"gemm1_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
+                    kernel_tag=f"gemm1_{max_m}_{model_dim}_{inter_dim}_{experts}_act_{act}_mode{grouped_contiguous_m}",
                 )
                 if cfg.split_k == 1
                 else None
@@ -881,7 +881,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                     stage1_act=cfg.act,
                     epilogue_bias=True,
                     stage1_weight_layout=cfg.stage1_weight_layout,
-                    kernel_tag=f"gemm1_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
+                    kernel_tag=f"gemm1_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_act_{act}_mode{grouped_contiguous_m}",
                 )
                 if cfg.split_k == 1
                 else None
@@ -894,7 +894,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                 K=cfg.model_dim,
                 N=2 * cfg.inter_dim,
                 cfg=cfg,
-                kernel_tag=f"gemm1_raw_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_act_{act}_mode{grouped_contiguous_m}",
+                kernel_tag=f"gemm1_raw_{max_m}_{model_dim}_{inter_dim}_{experts}_act_{act}_mode{grouped_contiguous_m}",
             )
         return _lazy["raw_base"]
 
@@ -1252,7 +1252,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 K=cfg.inter_dim,
                 N=cfg.model_dim,
                 cfg=cfg,
-                kernel_tag=f"gemm2_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}",
+                kernel_tag=f"gemm2_{max_m}_{model_dim}_{inter_dim}_{experts}_mode{grouped_contiguous_m}",
             )
         return _lazy2["base"]
 
@@ -1263,7 +1263,7 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                 N=cfg.model_dim,
                 cfg=cfg,
                 epilogue_bias=True,
-                kernel_tag=f"gemm2_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_{tile_m}x{tile_n}x{tile_k}_mode{grouped_contiguous_m}",
+                kernel_tag=f"gemm2_bias_{max_m}_{model_dim}_{inter_dim}_{experts}_mode{grouped_contiguous_m}",
             )
         return _lazy2["base_bias"]
 
