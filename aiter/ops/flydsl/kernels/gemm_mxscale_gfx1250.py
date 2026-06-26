@@ -2563,6 +2563,10 @@ def compile_mxscale_gemm(
 
                             addr_box = [cur_addr_lo]
 
+                            # Order: tensorcnt(signal) -> TDM -> L2 prefetch. The
+                            # prefetch is issued AFTER the TDM, so the next step's
+                            # s_wait_tensorcnt (which only counts TDMs) drains the
+                            # TDM while the L2 prefetch (not counted) keeps running.
                             def _mid_tdm_ws(
                                 _ls=load_stage,
                                 _ab=addr_box,
