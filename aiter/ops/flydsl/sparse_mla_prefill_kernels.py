@@ -76,6 +76,7 @@ def _get_kernel(
     softmax_scale: float,
     single_request: bool,
     cache_layout: str,
+    rope_bf16: bool = False,
 ):
     return compile_sparse_mla_prefill(
         head_dim=head_dim,
@@ -95,6 +96,7 @@ def _get_kernel(
         softmax_scale=softmax_scale,
         single_request=single_request,
         cache_layout=cache_layout,
+        rope_bf16=rope_bf16,
     )
 
 
@@ -268,6 +270,7 @@ def flydsl_sparse_mla_prefill(
     num_kv_rows: int | None = None,
     single_request: bool = True,
     block_n: int = 32,  # KV tile rows (compile-time); gfx942 V2 path supports 32 only
+    rope_bf16: bool = False,  # DSv4 only: dot the 64 RoPE dims in bf16 (not fp8 re-quant)
     stream: torch.cuda.Stream | None = None,
 ) -> None:
     """Run sparse MLA prefill in-place into ``out``.
@@ -288,6 +291,11 @@ def flydsl_sparse_mla_prefill(
     out_flat = _flat_bf16(out, "out")
     is_glm = head_dim == GLM_HEAD_DIM
     base_scale = head_dim ** -0.5
+
+    if rope_bf16 and (not packed or is_glm):
+        raise NotImplementedError(
+            "rope_bf16 is only supported on the packed DSv4 fp8_ds_mla path (head_dim=512)"
+        )
 
     if not packed:
         if is_glm:
@@ -345,7 +353,7 @@ def flydsl_sparse_mla_prefill(
         qk_split=not is_glm, block_n=block_n, block_h=16, split_kv=False, packed=True,
         scale_mode=kernel_scale_mode,
         softmax_scale=base_scale, single_request=single_request,
-        cache_layout=cache_layout,
+        cache_layout=cache_layout, rope_bf16=rope_bf16,
     )
     with torch.cuda.device(q.device.index):
         _run_compiled(
@@ -395,10 +403,42 @@ def flydsl_sparse_mla_prefill_2region(
     q_req: torch.Tensor | None = None,
     main_is_fnuz: bool = True,
     extra_is_fnuz: bool = False,
+    main_scale_mode: str = "none",
+    rope_bf16: bool = False,
     single_request: bool = True,
+    validate_regions: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> None:
-    """Phase B2: two-region native sparse MLA prefill (compressed + SWA)."""
+    """Phase B2: two-region native sparse MLA prefill (compressed + SWA).
+
+    Region roles are positional, not semantic: ``main_*`` is region0 and
+    ``extra_*`` is region1.  The kernel attends region0 tile 0 first to seed the
+    shared online-softmax state and derives the per-query tile count from
+    region0, so **region0 (main) must be non-empty for every query**: an empty
+    per-query region0 segment silently drops region1 (wrong answer) and a fully
+    empty ``main_indices`` buffer faults.  region1 (extra) may be empty.  The
+    caller therefore MUST map whichever production pool is guaranteed non-empty
+    onto ``main_*`` and keep the mapping consistent across format, scale, block
+    table, and order (the two pools differ: e.g. compressed top-k vs
+    sliding-window, with different fp8 conventions).  ``main_is_fnuz`` /
+    ``extra_is_fnuz`` set each region's NoPE fp8 convention (region0 defaults
+    fnuz, region1 OCP); pass them explicitly to match the cache you supply.
+    ``validate_regions=True`` (default) enforces the region0 non-empty invariant
+    host-side (one device reduction + sync); set it ``False`` only when the
+    caller guarantees it.
+
+    ``main_scale_mode`` controls region0 per-64-block UE8M0 scale handling:
+    ``"none"`` (default) takes the fast DMA path and assumes unity scale bytes;
+    ``"ue8m0"`` routes region0 through the register-staged convert load so the
+    cache's per-block UE8M0 scale bytes are folded in.  region1 always reads its
+    UE8M0 scale bytes via the convert path.
+
+    ``rope_bf16`` selects the QK RoPE precision: ``False`` (default) re-quantizes
+    the bf16 RoPE tail to fp8 (faster, ~2-4%); ``True`` dots the 64 RoPE dims in
+    bf16 to match the vLLM NoPE-fp8 / RoPE-bf16 contract.
+    """
+    if main_scale_mode not in ("none", "ue8m0"):
+        raise ValueError(f"main_scale_mode must be 'none' or 'ue8m0', got {main_scale_mode!r}")
     _require_cuda(q, out, main_cache, extra_cache, main_indices, main_indptr, extra_indices, extra_indptr)
     _check_gfx942(q.device)
     num_queries, num_heads, head_dim, v_dim = _validate_qout(q, out)
@@ -415,6 +455,24 @@ def flydsl_sparse_mla_prefill_2region(
     m_iptr = _require_int32_1d(main_indptr, "main_indptr", numel=num_queries + 1)
     e_idx = _require_int32_1d(extra_indices, "extra_indices")
     e_iptr = _require_int32_1d(extra_indptr, "extra_indptr", numel=num_queries + 1)
+
+    # ---- Region-0 (main / SWA) non-empty contract (see docstring) ----------
+    # An empty region0 either faults (fully empty main_indices) or silently
+    # drops region1 (empty per-query span), so enforce the invariant here.
+    if m_idx.numel() == 0:
+        raise ValueError(
+            "flydsl_sparse_mla_prefill_2region: region0 (main_indices) must be non-empty; "
+            "the kernel seeds shared softmax state from region0 tile 0"
+        )
+    if validate_regions:
+        main_lens = m_iptr[1:] - m_iptr[:-1]
+        if bool((main_lens < 1).any().item()):
+            raise ValueError(
+                "flydsl_sparse_mla_prefill_2region requires every query's region0 (main) "
+                "segment to be non-empty (region0 is the always-present sliding window); "
+                "pass validate_regions=False to skip this check when the contract is guaranteed"
+            )
+
     if main_block_table.dim() != 2 or extra_block_table.dim() != 2:
         raise ValueError("main_block_table and extra_block_table must be 2D [num_reqs, max_blocks]")
     m_bt = _require_int32_contiguous(main_block_table, "main_block_table").view(-1)
@@ -435,9 +493,10 @@ def flydsl_sparse_mla_prefill_2region(
     exe = _get_kernel(
         head_dim=head_dim, v_dim=v_dim, num_regions=2, has_sink=has_sink,
         r0_dtype="fp8", r0_fnuz=main_is_fnuz, r1_dtype="fp8", r1_fnuz=extra_is_fnuz,
-        qk_split=True, block_n=32, block_h=16, split_kv=False, packed=True, scale_mode="none",
+        qk_split=True, block_n=32, block_h=16, split_kv=False, packed=True,
+        scale_mode=main_scale_mode,
         softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=single_request,
-        cache_layout="fp8_ds_mla",
+        cache_layout="fp8_ds_mla", rope_bf16=rope_bf16,
     )
     with torch.cuda.device(q.device.index):
         _run_compiled(
@@ -465,8 +524,3 @@ def flydsl_sparse_mla_prefill_2region(
             int(e_max_blocks),
             _fx_stream(q.device, stream),
         )
-
-
-from .kernels.tensor_shim import _run_compiled
-
-__all__ = ["flydsl_sparse_mla_prefill", "flydsl_sparse_mla_prefill_2region"]

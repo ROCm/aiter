@@ -349,6 +349,66 @@ def _ref_prefill_packed(q, regions, scale, attn_sink, block_size):
     return out.to(torch.bfloat16)
 
 
+def _dequant_row_bf16_rope(cache, slot, block_size, is_extra=False):
+    """bf16-RoPE contract dequant (vLLM-faithful for the QK dot).
+
+    Returns ``(kv_score, kv_value)`` f32 [512]:
+      - ``kv_score`` feeds the QK dot: NoPE is fp8-rounded (kernel fp8 MFMA), but
+        the 64 RoPE dims stay **bf16** (NOT re-quantized to fp8) -- the P0.2 fix.
+      - ``kv_value`` feeds P@V (output): identical NoPE, and the RoPE tail is the
+        fp8 re-quant the kernel still keeps in cache block 7 for the V read.
+    """
+    cache_flat = cache.view(torch.uint8).flatten()
+    block_idx = slot // block_size
+    pos = slot % block_size
+    block_base = block_idx * cache.stride(0)
+    token_base = block_base + pos * 576
+    scale_base = block_base + block_size * 576 + pos * 8
+
+    nope_u8 = cache_flat[token_base : token_base + NOPE_HEAD_DIM]
+    nope = (nope_u8.view(_OCP) if is_extra else nope_u8.view(_FNUZ)).to(torch.float32)
+    enc = cache_flat[scale_base : scale_base + 7].to(torch.float32)
+    blk_scale = torch.exp2(enc - 127.0)
+    nope = nope * blk_scale.repeat_interleave(64)
+    nope = nope.to(_FNUZ).to(torch.float32)  # kernel re-encodes NoPE to fnuz in LDS
+
+    rope_u8 = cache_flat[token_base + NOPE_HEAD_DIM : token_base + NOPE_HEAD_DIM + ROPE_HEAD_DIM * 2]
+    rope_bf16 = rope_u8.view(torch.bfloat16).to(torch.float32)  # QK dot: stays bf16
+    rope_fp8 = rope_bf16.to(_FNUZ).to(torch.float32)  # V read: kernel keeps fp8 block 7
+    return torch.cat([nope, rope_bf16]), torch.cat([nope, rope_fp8])
+
+
+def _ref_prefill_packed_bf16rope(q, regions, scale, attn_sink, block_size):
+    """bf16-RoPE oracle: QK dots the RoPE tail in bf16 (Q RoPE stays bf16 too),
+    NoPE in fp8; P@V uses the fp8-rope V (matching the kernel's unchanged GEMM2).
+    """
+    sq, H, D = q.shape
+    q_nope = q[:, :, :NOPE_HEAD_DIM].to(_FNUZ).to(torch.float32)  # Q NoPE -> fp8
+    q_rope = q[:, :, NOPE_HEAD_DIM:].to(torch.float32)  # Q RoPE stays bf16
+    q_score = torch.cat([q_nope, q_rope], dim=-1)
+    out = torch.zeros(sq, H, D, dtype=torch.float32, device=q.device)
+    for qi in range(sq):
+        kv_score, kv_value = [], []
+        for cache, rows_list, is_extra in regions:
+            for slot in rows_list[qi]:
+                ks, kv = _dequant_row_bf16_rope(cache, int(slot), block_size, is_extra)
+                kv_score.append(ks)
+                kv_value.append(kv)
+        if not kv_score:
+            continue
+        ks = torch.stack(kv_score).to(q.device)  # [k, 512]
+        kvv = torch.stack(kv_value).to(q.device)
+        for h in range(H):
+            scores = torch.mv(ks, q_score[qi, h]) * scale
+            if attn_sink is not None:
+                scores_s = torch.cat([scores, attn_sink[h].float().reshape(1)])
+                probs = torch.softmax(scores_s, dim=0)[:-1]
+            else:
+                probs = torch.softmax(scores, dim=0)
+            out[qi, h] = torch.sum(probs[:, None] * kvv, dim=0)
+    return out.to(torch.bfloat16)
+
+
 def _identity_block_table(num_slots, block_size, device):
     """block_table[req=0][b] = b (logical block == physical block)."""
     num_blocks = (num_slots + block_size - 1) // block_size
@@ -403,6 +463,91 @@ def test_b2_two_region():
     assert cos_mean > 0.97, f"cosine too low: {cos_mean}"
 
 
+def test_b2_ue8m0_non_unity():
+    """Non-unity per-64-block UE8M0 scale bytes in each region.  region0 (fnuz
+    SWA) needs ``main_scale_mode='ue8m0'`` to route through the convert load;
+    region1 (OCP compressed) always reads its scale bytes via convert."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    scale = PACKED_HEAD_DIM ** -0.5
+    main_tokens, extra_tokens = 300, 300
+    main_kv = _gen_kv(main_tokens, seed=81, scale=0.0625)
+    extra_kv = _gen_kv(extra_tokens, seed=82, scale=0.0625)
+    # per-64-block scale bytes that differ across the 7 NoPE blocks (UE8M0 != 1)
+    region0_scales = [127, 128, 126, 128, 127, 125, 128]
+    region1_scales = [128, 126, 127, 128, 127, 128, 126]
+    main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size, is_extra=False, scale_byte=region0_scales)
+    extra_cache = _pack_fp8_ds_mla_cache(extra_kv, block_size, is_extra=True, scale_byte=region1_scales)
+    main_rows = [[5, 6, 7, 64, 200], [1, 2, 3]]
+    extra_rows = [[10, 11, 12, 70], [50, 51]]
+    sq = len(main_rows)
+    q = _gen_q(sq, H, seed=83, scale=0.0625)
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(extra_tokens, block_size, device)
+
+    out = torch.empty(sq, H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_2region(
+        q, out,
+        main_cache, main_indices, main_indptr, main_bt,
+        extra_cache, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size, main_scale_mode="ue8m0",
+    )
+    ref = _ref_prefill_packed(
+        q, [(main_cache, main_rows, False), (extra_cache, extra_rows, True)], scale, None, block_size
+    )
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[b2_ue8m0] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.97, f"cosine too low: {cos_mean}"
+
+
+def test_b2_region0_empty_rejected():
+    """Region0 (main/SWA) must be non-empty per query: the B2 kernel seeds the
+    shared softmax state from region0 tile 0, so an empty region0 either faults
+    (fully empty main_indices) or silently skips region1.  The host wrapper must
+    reject both rather than launch."""
+    import pytest
+
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    main_tokens = extra_tokens = 400
+    main_kv = _gen_kv(main_tokens, seed=71)
+    extra_kv = _gen_kv(extra_tokens, seed=72)
+    main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size, is_extra=False)
+    extra_cache = _pack_fp8_ds_mla_cache(extra_kv, block_size, is_extra=True)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(extra_tokens, block_size, device)
+
+    def _run(main_rows, extra_rows):
+        sq = len(main_rows)
+        q = _gen_q(sq, H, seed=73)
+        m_idx, m_iptr = _ragged_from_rows(main_rows, device)
+        e_idx, e_iptr = _ragged_from_rows(extra_rows, device)
+        out = torch.empty(sq, H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+        flydsl_sparse_mla_prefill_2region(
+            q, out,
+            main_cache, m_idx, m_iptr, main_bt,
+            extra_cache, e_idx, e_iptr, extra_bt,
+            block_size=block_size,
+        )
+
+    # fully empty region0 buffer (would fault on the GPU)
+    with pytest.raises(ValueError):
+        _run([[]], [[10, 11, 12, 13]])
+    # per-query empty region0 segment with a non-empty buffer (would drop region1)
+    with pytest.raises(ValueError):
+        _run([[], [5, 6]], [[10, 11, 12], []])
+    print("[b2_region0_empty_rejected] host guard OK")
+
+
 def test_b2_multitile():
     """B2 where BOTH regions span multiple tiles (>32 entries each), so the
     per-tile region select exercises region0 tiles [1, n0) AND region1 tiles."""
@@ -448,6 +593,157 @@ def test_b2_multitile():
     print(f"[b2_multitile] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
     assert not torch.isnan(out).any(), "NaN in output"
     assert cos_mean > 0.97, f"cosine too low: {cos_mean}"
+
+
+# ===========================================================================
+# P0.2 fix: bf16-RoPE split QK dot.  NoPE (448) stays fp8 MFMA; the 64 RoPE
+# dims are dotted in bf16 (Q RoPE stays bf16, K RoPE read from the bf16 cache
+# tail -- NOT re-quantized to fp8).  Gated behind the non-default ``rope_bf16``
+# compile flag, so all the fp8-RoPE tests above are unchanged.  These tests use
+# a vLLM-contract reference (``_ref_prefill_packed_bf16rope``) that does NOT
+# re-quantize RoPE, and a RoPE-dominant adversary so the difference is visible.
+# ===========================================================================
+
+
+def _abs_metrics(out, ref):
+    o = out.float().reshape(-1)
+    r = ref.float().reshape(-1)
+    return (o - r).abs().max().item(), (o - r).abs().mean().item()
+
+
+def test_b1_rope_bf16():
+    """Single-region DSv4 packed path with rope_bf16=True vs the bf16-RoPE
+    reference.  RoPE-dominant adversary (near-zero NoPE) so the bf16-vs-fp8 RoPE
+    contract difference dominates the score."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    scale = PACKED_HEAD_DIM ** -0.5
+    num_tokens = 320
+
+    g = torch.Generator(device=device).manual_seed(401)
+    kv = torch.empty(num_tokens, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv[:, :NOPE_HEAD_DIM] = torch.randn(num_tokens, NOPE_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * 0.004
+    kv[:, NOPE_HEAD_DIM:] = torch.randn(num_tokens, ROPE_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * 1.2
+    q = torch.empty(3, H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    q[:, :, :NOPE_HEAD_DIM] = torch.randn(3, H, NOPE_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * 0.004
+    q[:, :, NOPE_HEAD_DIM:] = torch.randn(3, H, ROPE_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * 1.2
+
+    cache = _pack_fp8_ds_mla_cache(kv, block_size, is_extra=False)
+    # Moderate KV-row counts: softmax is selective enough that the systematic
+    # fp8-RoPE rounding bias shifts weights (separating the two references),
+    # but not so one-hot that per-element output error blows past the envelope.
+    rows = [
+        torch.randint(0, num_tokens, (12,), generator=g, device=device).tolist(),
+        torch.randint(0, num_tokens, (10,), generator=g, device=device).tolist(),
+        torch.randint(0, num_tokens, (11,), generator=g, device=device).tolist(),
+    ]
+    sq = len(rows)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill(
+        q, cache, indices, indptr, out,
+        block_table=block_table, block_size=block_size, packed=True, rope_bf16=True,
+    )
+    regions = [(cache, rows, False)]
+    ref_bf16 = _ref_prefill_packed_bf16rope(q, regions, scale, None, block_size)
+    ref_fp8 = _ref_prefill_packed(q, regions, scale, None, block_size)
+
+    cos_mean, cos_min, _ = _metrics(out, ref_bf16)
+    max_abs_bf16, mean_abs_bf16 = _abs_metrics(out, ref_bf16)
+    max_abs_fp8, mean_abs_fp8 = _abs_metrics(out, ref_fp8)
+    ref_div_max, ref_div_mean = _abs_metrics(ref_fp8, ref_bf16)
+    print(
+        f"[b1_rope_bf16] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} "
+        f"mean_abs(vs bf16-ref)={mean_abs_bf16:.5f} mean_abs(vs fp8-ref)={mean_abs_fp8:.5f} "
+        f"| fp8-vs-bf16 ref divergence: max={ref_div_max:.4f} mean={ref_div_mean:.5f}"
+    )
+    assert not torch.isnan(out).any(), "NaN in output"
+    # Contract (assert_close, not cosine-only): the bf16 kernel tracks the
+    # bf16-RoPE reference within the fp8/bf16 output envelope of a deliberately
+    # RoPE-dominant adversary (mean error ~1e-3; a few elements at fp8 step).
+    torch.testing.assert_close(out.float(), ref_bf16.float(), atol=6.0e-2, rtol=5.0e-2)
+    # Primary discriminating gate: the kernel is closer to the bf16-RoPE
+    # reference than to the old fp8-RoPE reference (proves it does NOT requant
+    # RoPE to fp8), and the adversary genuinely separates the two contracts.
+    assert mean_abs_bf16 < mean_abs_fp8, (
+        f"rope_bf16 kernel not closer to bf16 ref ({mean_abs_bf16}) than fp8 ref ({mean_abs_fp8})"
+    )
+    assert ref_div_mean > 5e-4, "adversary failed to separate fp8 vs bf16 RoPE references"
+
+
+def test_b2_rope_bf16():
+    """Two-region (SWA fnuz + compressed OCP) with rope_bf16=True vs the
+    bf16-RoPE reference, including attn_sink and a RoPE-dominant adversary."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    scale = PACKED_HEAD_DIM ** -0.5
+    main_tokens, extra_tokens = 400, 300
+
+    def _adv_kv(n, seed):
+        g = torch.Generator(device=device).manual_seed(seed)
+        kv = torch.empty(n, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+        kv[:, :NOPE_HEAD_DIM] = torch.randn(n, NOPE_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * 0.005
+        kv[:, NOPE_HEAD_DIM:] = torch.randn(n, ROPE_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * 1.2
+        return kv
+
+    main_kv = _adv_kv(main_tokens, 451)
+    extra_kv = _adv_kv(extra_tokens, 452)
+    main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size, is_extra=False)
+    extra_cache = _pack_fp8_ds_mla_cache(extra_kv, block_size, is_extra=True)
+    g = torch.Generator(device=device).manual_seed(453)
+    main_rows = [
+        torch.randint(0, main_tokens, (10,), generator=g, device=device).tolist(),
+        torch.randint(0, main_tokens, (8,), generator=g, device=device).tolist(),
+    ]
+    extra_rows = [
+        torch.randint(0, extra_tokens, (6,), generator=g, device=device).tolist(),
+        torch.randint(0, extra_tokens, (12,), generator=g, device=device).tolist(),
+    ]
+    sq = len(main_rows)
+    q = torch.empty(sq, H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    q[:, :, :NOPE_HEAD_DIM] = torch.randn(sq, H, NOPE_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * 0.005
+    q[:, :, NOPE_HEAD_DIM:] = torch.randn(sq, H, ROPE_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * 1.2
+
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(extra_tokens, block_size, device)
+    sink = (torch.randn(H, dtype=torch.float32, device=device) * 0.3)
+
+    out = torch.empty(sq, H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_2region(
+        q, out,
+        main_cache, main_indices, main_indptr, main_bt,
+        extra_cache, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size, attn_sink=sink, rope_bf16=True,
+    )
+    regions = [(main_cache, main_rows, False), (extra_cache, extra_rows, True)]
+    ref_bf16 = _ref_prefill_packed_bf16rope(q, regions, scale, sink, block_size)
+    ref_fp8 = _ref_prefill_packed(q, regions, scale, sink, block_size)
+
+    cos_mean, cos_min, _ = _metrics(out, ref_bf16)
+    max_abs_bf16, mean_abs_bf16 = _abs_metrics(out, ref_bf16)
+    max_abs_fp8, mean_abs_fp8 = _abs_metrics(out, ref_fp8)
+    ref_div_max, ref_div_mean = _abs_metrics(ref_fp8, ref_bf16)
+    print(
+        f"[b2_rope_bf16] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} "
+        f"mean_abs(vs bf16-ref)={mean_abs_bf16:.5f} mean_abs(vs fp8-ref)={mean_abs_fp8:.5f} "
+        f"| fp8-vs-bf16 ref divergence: max={ref_div_max:.4f} mean={ref_div_mean:.5f}"
+    )
+    assert not torch.isnan(out).any(), "NaN in output"
+    torch.testing.assert_close(out.float(), ref_bf16.float(), atol=6.0e-2, rtol=5.0e-2)
+    assert mean_abs_bf16 < mean_abs_fp8, (
+        f"rope_bf16 kernel not closer to bf16 ref ({mean_abs_bf16}) than fp8 ref ({mean_abs_fp8})"
+    )
+    assert ref_div_mean > 5e-4, "adversary failed to separate fp8 vs bf16 RoPE references"
 
 
 # ===========================================================================
@@ -561,6 +857,44 @@ def test_glm576_q_scale():
     assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
 
 
+def test_glm576_two_tile():
+    """Exactly two tiles per query (BLOCK_N=32 -> 33..64 entries).  The GLM
+    multi-tile path's first/last tile handling must work when the middle loop
+    has zero iterations (n0_tiles == 2)."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    scale = default_scale_glm()
+    num_tokens = 700
+    kv = gen_kv_glm(num_tokens, seed=171)
+    cache = pack_glm_fp8_cache(kv, block_size)
+    g = torch.Generator(device=device).manual_seed(172)
+    # row lengths landing in (BLOCK_N, 2*BLOCK_N] -> exactly two 32-row tiles
+    rows = [
+        torch.randint(0, num_tokens, (33,), generator=g, device=device).tolist(),
+        torch.randint(0, num_tokens, (64,), generator=g, device=device).tolist(),
+        torch.randint(0, num_tokens, (40,), generator=g, device=device).tolist(),
+    ]
+    sq = len(rows)
+    q = gen_q_glm(sq, H, seed=173)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, H, GLM_V_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill(
+        q, cache, indices, indptr, out,
+        block_table=block_table, block_size=block_size, packed=True,
+        scale_mode="per_tensor",
+    )
+    ref = ref_prefill_glm(q, cache, rows, scale, block_size)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[glm576_two_tile] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
+
+
 def test_glm576_edge_empty_invalid():
     from aiter.ops.flydsl import flydsl_sparse_mla_prefill
 
@@ -608,10 +942,16 @@ def _main():
     # Phase B2
     test_b2_two_region()
     test_b2_multitile()
+    test_b2_ue8m0_non_unity()
+    test_b2_region0_empty_rejected()
+    # P0.2 bf16-RoPE split dot (non-default rope_bf16 flag)
+    test_b1_rope_bf16()
+    test_b2_rope_bf16()
     # GLM-5 / DSv3.2 (single-region, head_dim=576, per-tensor scale)
     test_glm576_paged_basic()
     test_glm576_per_tensor_scale()
     test_glm576_q_scale()
+    test_glm576_two_tile()
     test_glm576_edge_empty_invalid()
     print("ALL TESTS PASSED")
     return 0

@@ -887,6 +887,7 @@ def compile_sparse_mla_prefill_paged(
     cache_layout: str = "fp8_ds_mla",
     scale_mode: str = "none",
     block_n: int = 32,
+    rope_bf16: bool = False,
 ):
     """Build a paged sparse MLA prefill launcher (gfx942).
 
@@ -912,6 +913,7 @@ def compile_sparse_mla_prefill_paged(
     R0_OCP = bool(r0_is_ocp)
     R1_OCP = bool(r1_is_ocp)
     SINGLE_REQUEST = bool(single_request)
+    ROPE_BF16 = bool(rope_bf16)
 
     # ---- head-dim-dependent constants (shadow the module 512 defaults) ----
     GLM_FLAT = cache_layout == "glm_flat576"
@@ -922,6 +924,12 @@ def compile_sparse_mla_prefill_paged(
         raise NotImplementedError("glm_flat576 is single-region only")
     if GLM_FLAT and not USE_PT_SCALE:
         raise NotImplementedError("glm_flat576 requires scale_mode='per_tensor'")
+    # bf16 RoPE split-dot is DSv4-only (448 fp8 NoPE + 64 bf16 RoPE). GLM stores
+    # the whole 576 row as fp8, so its rope is genuinely fp8 (no bf16 tail).
+    if ROPE_BF16 and (GLM_FLAT or int(head_dim) != 512):
+        raise NotImplementedError(
+            "rope_bf16 requires the DSv4 fp8_ds_mla layout (head_dim=512, 448 NoPE + 64 RoPE)"
+        )
     QK_HEAD_DIM = int(head_dim)
     V_HEAD_DIM = int(v_dim)
     if V_HEAD_DIM != 512:
@@ -974,6 +982,23 @@ def compile_sparse_mla_prefill_paged(
         )
     Q_NUM_PASSES = QK_HEAD_DIM // Q_ELEM_PER_ROW
     NUM_NOPE_ITERS = QK_HEAD_DIM // (MFMA_K * 2)
+    # ---- bf16 RoPE split-dot layout (DSv4 only) ------------------------------
+    # When ROPE_BF16, the QK dot computes NoPE (448, blocks 0..6) in fp8 MFMA as
+    # before, but the 64-d RoPE tail is dotted in bf16 via mfma_f32_16x16x16bf16
+    # (K=16, RBF_NUM_STEPS steps) accumulating into the SAME f32 p_comp[h] tile
+    # (identical 16x16 C lane layout -> merge is exact). The bf16 RoPE K tile is
+    # a shared [BLOCK_N][PK_ROPE_DIM] bf16 array kept in the otherwise-dead
+    # second KV buffer (P_LDS_KV_1; DSv4 never double-buffers), so LDS is
+    # unchanged. V (GEMM2) still reads the fp8 rope (block 7) untouched.
+    RBF_KSTEP = MFMA_M  # 16 (bf16 1k MFMA K)
+    RBF_NUM_STEPS = PK_ROPE_DIM // RBF_KSTEP  # 64 / 16 = 4
+    NUM_FP8_QK_ITERS = (NUM_NOPE_ITERS - 1) if ROPE_BF16 else NUM_NOPE_ITERS
+    RBF_ROW_PAD = 4  # bf16 padding per kv-row to spread LDS banks
+    RBF_ROW_STRIDE = (PK_ROPE_DIM + RBF_ROW_PAD) * 2  # bytes per kv-row
+    if ROPE_BF16:
+        assert BLOCK_N * RBF_ROW_STRIDE <= SZ_LDS_KV, (
+            f"bf16 RoPE K tile {BLOCK_N * RBF_ROW_STRIDE} B exceeds dead KV buffer {SZ_LDS_KV} B"
+        )
     # Flat (GLM) rows have no scale region and store rope as fp8, so the row
     # stride equals head_dim bytes; DSv4 packed rows are 584 B with a 576 B
     # data sub-region.
@@ -1018,6 +1043,15 @@ def compile_sparse_mla_prefill_paged(
 
         def _mfma_fp8(result_type, operands, **kw):
             return rocdl.mfma_f32_16x16x32_fp8_fp8(result_type, operands, **kw)
+
+        def _mfma_bf16(c_acc, a_i16x4, b_i16x4):
+            # gfx942 v_mfma_f32_16x16x16bf16_1k: A/B are vector<4xi16> (4 bf16);
+            # 16x16 f32x4 output uses the SAME lane layout as the fp8 16x16x32
+            # MFMA, so it accumulates straight into the shared p_comp[h] tile.
+            return rocdl.mfma_f32_16x16x16bf16_1k(T.f32x4, [a_i16x4, b_i16x4, _raw(c_acc), 0, 0, 0])
+
+        def _bits_to_i16x4(val_i32x2):
+            return _raw(Vec(Vec(val_i32x2).bitcast(fx.Int16)))
 
         def _fadd(a, b):
             return arith.addf(_raw(a), _raw(b), fastmath=fm_no_inf)
@@ -1191,16 +1225,32 @@ def compile_sparse_mla_prefill_paged(
                     _ptr_store(w, _lds_ptr_from_i32(dst_addr), alignment=4)
 
         # ---- RoPE tail (block 7): bf16 cache -> fnuz fp8 ----
+        # When ROPE_BF16, the raw bf16 rope bytes are ALSO staged into the
+        # shared [BLOCK_N][PK_ROPE_DIM] bf16 K tile (in the dead P_LDS_KV_1
+        # region) for the bf16 QK dot; the fp8 block 7 is still written so the
+        # V/GEMM2 path is unchanged.  Row = logical kv-tile row (kv_ld_row_base),
+        # cols = (lane%16)*4 .. +3 -> a clean row-major bf16 array.
         def _load_rope_block(cache_rsrc, p_lds_kv_warp, token_base_i32):
             dst_addr = _i32(ArithValue(p_lds_kv_warp) + PK_ROPE_BLOCK * KV_BLOCK_BYTES + _i32(lane_idx) * 4)
             is_oob = ArithValue(token_base_i32) == -1
+            if const_expr(ROPE_BF16):
+                rbf_addr = _i32(
+                    ArithValue(_i32(lds_base_idx + P_LDS_KV_1))
+                    + ArithValue(_i32(kv_ld_row_base)) * RBF_ROW_STRIDE
+                    + ArithValue(kv_ld_col_base) * 2
+                )
             if is_oob:
                 _ptr_store(c_zero_i32, _lds_ptr_from_i32(dst_addr), alignment=4)
+                if const_expr(ROPE_BF16):
+                    zero2 = Vec.from_elements([c_zero_i32, c_zero_i32], fx.Int32)
+                    _ptr_store(zero2, _lds_ptr_from_i32(rbf_addr), alignment=8)
             else:
                 byte_off = ArithValue(token_base_i32) + PK_NOPE_BYTES + kv_ld_col_base * 2
                 pair = buffer_ops.buffer_load(
                     cache_rsrc, _i32(byte_off.with_signedness(False) // 4), vec_width=2, dtype=T.i32
                 )
+                if const_expr(ROPE_BF16):
+                    _ptr_store(pair, _lds_ptr_from_i32(rbf_addr), alignment=8)
                 bf = Vec(Vec(pair).bitcast(fx.BFloat16)).to(fx.Float32)  # 4 f32
                 w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(bf[0]), _raw(bf[1]), c_zero_i32, 0)
                 w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(bf[2]), _raw(bf[3]), w, 1)
@@ -1405,6 +1455,29 @@ def compile_sparse_mla_prefill_paged(
                 q_nope_packs.append(q_regs[p][1])
             return q_nope_packs
 
+        # ---- Q RoPE bf16 B-operands (DSv4 split dot) -------------------------
+        # Load the 64 rope dims of Q straight as bf16 in the 16x16x16 MFMA B
+        # layout: lane L, step s -> head = warp*16 + L%16, dims =
+        # PK_NOPE_DIM + s*16 + (L/16)*4 .. +3 (4 contiguous bf16 -> one i64).
+        # No LDS round-trip needed (the 4 dims are contiguous within a head row).
+        def _load_q_rope_bf16(q_idx_val):
+            head = warp_idx * 16 + (lane_idx % 16)
+            base_elem = (
+                (_idx(q_idx_val) * NUM_QO_HEADS + head) * QK_HEAD_DIM
+                + PK_NOPE_DIM
+                + (lane_idx / 16) * 4
+            )
+            base_dword = _i32(ArithValue(base_elem) // 2)
+            pairs = []
+            for s in range_constexpr(RBF_NUM_STEPS):
+                pairs.append(
+                    buffer_ops.buffer_load(
+                        query_rsrc, _raw(ArithValue(base_dword) + s * 8), vec_width=2, dtype=T.i32
+                    )
+                )
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+            return [_bits_to_i16x4(p) for p in pairs]
+
         def _softmax_scale_p(idx_rsrc, num_rows_i32, p_vals, col_0_start, kv_end_i32):
             result = [None] * P_VALS_PER_THR
             for i in range_constexpr(P_VALS_PER_THR):
@@ -1474,6 +1547,7 @@ def compile_sparse_mla_prefill_paged(
             p_lds_kv_next_warp=None,
             prefetch_cache_rsrc=None,
             token_base_next=None,
+            q_rope_b=None,
         ):
             k_base_i32 = _i32(ArithValue(p_lds_kv_base) + k_lds_lane_offset)
             do_prefetch = GLM_FLAT and p_lds_kv_next_warp is not None
@@ -1486,7 +1560,7 @@ def compile_sparse_mla_prefill_paged(
             _maybe_prefetch(0)
             P_COMP_SUBS = BLOCK_N // MFMA_N
             p_comp = [c_zero_v4f32] * P_COMP_SUBS
-            for nope_pair in range_constexpr(NUM_NOPE_ITERS):
+            for nope_pair in range_constexpr(NUM_FP8_QK_ITERS):
                 tile_0 = nope_pair * 2
                 tile_1 = nope_pair * 2 + 1
                 k0 = [_load_k_from_lds(k_base_i32, 16 * h, tile_0 * BLOCK_K) for h in range_constexpr(P_COMP_SUBS)]
@@ -1506,6 +1580,27 @@ def compile_sparse_mla_prefill_paged(
                 rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
                 for h in range_constexpr(P_COMP_SUBS):
                     p_comp[h] = _mfma_fp8(T.f32x4, [k1[h], q_1, p_comp[h], 0, 0, 0])
+            # bf16 RoPE split dot: accumulate the 64-d rope tail into p_comp[h]
+            # using mfma_f32_16x16x16bf16 (NoPE stayed fp8 above). A operand =
+            # the shared bf16 K tile in P_LDS_KV_1; B operand = q_rope_b.
+            if const_expr(ROPE_BF16):
+                rbf_lane_base = _i32(
+                    ArithValue(_i32(lds_base_idx + P_LDS_KV_1))
+                    + ArithValue(_i32(lane_idx % 16)) * RBF_ROW_STRIDE
+                    + ArithValue(_i32(lane_idx / 16)) * (4 * 2)
+                )
+                ka = [[None] * RBF_NUM_STEPS for _ in range(P_COMP_SUBS)]
+                for h in range_constexpr(P_COMP_SUBS):
+                    for s in range_constexpr(RBF_NUM_STEPS):
+                        koff = h * MFMA_M * RBF_ROW_STRIDE + s * (RBF_KSTEP * 2)
+                        ka[h][s] = _bits_to_i16x4(
+                            _lds_load_volatile(rbf_lane_base, T.i32x2, byte_offset=koff)
+                        )
+                rocdl.sched_barrier(0)
+                rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+                for h in range_constexpr(P_COMP_SUBS):
+                    for s in range_constexpr(RBF_NUM_STEPS):
+                        p_comp[h] = _mfma_bf16(p_comp[h], ka[h][s], q_rope_b[s])
             p_vals = []
             for sub in range_constexpr(P_COMP_SUBS):
                 pv = Vec(p_comp[sub])
@@ -1653,6 +1748,7 @@ def compile_sparse_mla_prefill_paged(
 
         row_base = _idx(q_idx) * NUM_QO_HEADS + warp_idx * 16
         q_nope_packs = _load_q_to_regs(q_idx)
+        q_rope_packs = _load_q_rope_bf16(q_idx) if const_expr(ROPE_BF16) else None
 
         # ---- region-0 attend body (single-region: const-fixed resources) ----
         def _attend_region0(kv_tile_start_i32, rm_in, rse_in, oaccu_in, is_first):
@@ -1675,7 +1771,7 @@ def compile_sparse_mla_prefill_paged(
             rocdl.sched_barrier(0)
             rm_n, rse_n, p_pack, rescale = _process_tile_gemm1(
                 main_indices_rsrc, main_num_rows, p_lds_kv_0_base, kv_tile_start_i32, main_end,
-                q_nope_packs, rm_in, rse_in, is_first,
+                q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
             )
             if const_expr(is_first):
                 oaccu_n = _gemm2_first_iter(p_pack, _vt_base_i32())
@@ -1716,7 +1812,7 @@ def compile_sparse_mla_prefill_paged(
                 rocdl.sched_barrier(0)
                 rm_n, rse_n, pp, rescale = _process_tile_gemm1(
                     extra_indices_rsrc, extra_num_rows, p_lds_kv_0_base, kv_ts, extra_end,
-                    q_nope_packs, rm_in, rse_in, is_first,
+                    q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
                 )
             else:
                 kv_ts = _raw(ArithValue(main_start) + ArithValue(global_t_i32) * BLOCK_N)
@@ -1736,7 +1832,7 @@ def compile_sparse_mla_prefill_paged(
                 rocdl.sched_barrier(0)
                 rm_n, rse_n, pp, rescale = _process_tile_gemm1(
                     main_indices_rsrc, main_num_rows, p_lds_kv_0_base, kv_ts, main_end,
-                    q_nope_packs, rm_in, rse_in, is_first,
+                    q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
                 )
             return rm_n, rse_n, pp, rescale
 
@@ -1959,6 +2055,7 @@ def compile_sparse_mla_prefill(
     softmax_scale: float | None = None,
     single_request: bool = True,
     cache_layout: str = "fp8_ds_mla",
+    rope_bf16: bool = False,
 ):
     """Return the compiled launcher for the sparse MLA prefill kernel.
 
@@ -1979,6 +2076,11 @@ def compile_sparse_mla_prefill(
         raise NotImplementedError(f"requires head_dim in (512, 576), got {head_dim}")
     if split_kv:
         raise NotImplementedError("split_kv is Phase C")
+
+    if rope_bf16 and (not packed or cache_layout != "fp8_ds_mla" or head_dim != 512):
+        raise NotImplementedError(
+            "rope_bf16 requires the packed DSv4 fp8_ds_mla path (head_dim=512)"
+        )
 
     if not packed:
         if block_n != BLOCK_N:
@@ -2034,4 +2136,5 @@ def compile_sparse_mla_prefill(
         cache_layout=cache_layout,
         scale_mode=scale_mode,
         block_n=block_n,
+        rope_bf16=rope_bf16,
     )
