@@ -721,15 +721,6 @@ def _run_one_point(
         # so the heuristic doesn't over-split (bs=64/gqa=128 -> 2, not 4).
         num_heads = NUM_KV_HEADS * gqa_ratio
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
-        # max_splits mirrors the wrapper: small-batch long-context shapes may
-        # exceed V3's default cap of 16. Bound by (1) the v4 nm 32n kernel's
-        # SUB_KV=32 KV tile (floor(kv/32) splits max) and (2) ~2x CU occupancy.
-        from aiter.jit.utils.chip_info import get_cu_num as _get_cu_num
-
-        cu_num = _get_cu_num()
-        tile_cap = max(1, kv_seq_lens // 32)
-        occ_cap = max(1, (2 * cu_num) // max(1, batch * tg_factor))
-        max_splits = max(16, min(tile_cap, occ_cap))
         num_kv_splits, _ = aiter.mla.get_meta_param(
             None,
             batch,
@@ -738,12 +729,11 @@ def _run_one_point(
             q_seq_logical,
             dtypes.fp8,
             tg_factor,
-            max_splits,
         )
         num_kv_splits = int(num_kv_splits)
         print(
             f"[v4 nm] auto-selected num_kv_splits={num_kv_splits} "
-            f"(tg_factor={tg_factor}, max_splits={max_splits})"
+            f"(tg_factor={tg_factor})"
         )
 
     # out_16_nosplit=1 is the kernel's single-pass packed-BF16 direct path; it
@@ -1338,6 +1328,19 @@ def test_v4_nm_sink():
 if __name__ == "__main__":
     import argparse
     import itertools
+    import sys
+
+    # The v4 nm kernel ships only for gfx950 (mi350). CI runs every op_tests
+    # file via `python3 <file>` (not pytest), which bypasses the per-test
+    # @needs_gfx950 skipif marker and would execute this driver — loading the
+    # gfx950-only .co — on a gfx942 (mi300) runner and fail. Guard the driver
+    # so it cleanly no-ops (exit 0) anywhere that isn't gfx950.
+    if not torch.cuda.is_available() or not _on_gfx950():
+        print(
+            "[v4 nm] skip: shipped only for gfx950 (mi350); "
+            "current device is not gfx950. Exiting 0."
+        )
+        sys.exit(0)
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,

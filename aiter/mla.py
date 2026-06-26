@@ -117,14 +117,7 @@ def _fwd_kernel_stage2_asm(
 
 @functools.lru_cache()
 def get_meta_param(
-    num_kv_splits,
-    bs,
-    total_kv,
-    nhead,
-    max_seqlen_q,
-    dtype,
-    tg_factor=1,
-    max_splits=None,
+    num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype, tg_factor=1
 ):
     # tg_factor: number of thread-groups (workgroups) the kernel launches per
     # (seq, kv-split) along the head dim. Default 1. For variants that synthesize
@@ -132,15 +125,7 @@ def get_meta_param(
     # path runs gdx=ceil(128/64)=2 WGs per (seq, split) — the GPU's CU occupancy
     # is driven by `bs * tg_factor * num_kv_splits`, not `bs * num_kv_splits`.
     # Only the occupancy term scales; avg_kv, the fp8 block cap, and the indptr
-    # all stay keyed on the real `bs`.
-    #
-    # max_splits: inclusive upper bound of the auto-search range. Default None
-    # keeps the historical V3 cap of 16 (so V3 callers are unaffected). Callers
-    # that know a larger physical ceiling — e.g. v4 nm 32n, whose min KV tile
-    # is 32 so a context_len=4096 single seq admits up to 4096/32=128 splits —
-    # pass a bigger value to let the heuristic explore it. The occupancy term still
-    # self-limits the choice once bs*tg_factor*split saturates the CUs, and the
-    # fp8 block cap below independently bounds it for numerical correctness.
+    # all stay keyed on the real `bs`. The auto-search keeps V3's cap of 16.
     if num_kv_splits is None:
         cu_num = get_cu_num()
         avg_kv = total_kv / bs
@@ -157,7 +142,6 @@ def get_meta_param(
         is_gfx1250 = get_gfx() == "gfx1250"
         wg_per_split = 2 if nhead == 128 and is_gfx1250 else 1
         bs_occ = bs * max(tg_factor, wg_per_split)
-        search_hi = 16 if max_splits is None else max(1, int(max_splits))
         tmp = [
             (
                 bs_occ
@@ -167,7 +151,7 @@ def get_meta_param(
                 / (avg_kv + overhead * i),
                 i,
             )
-            for i in range(1, search_hi + 1)
+            for i in range(1, 17)
         ]
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
@@ -1196,12 +1180,6 @@ def mla_decode_fwd_v4_nm(
         # bs*tg_factor*splits workgroups and stops over-splitting (e.g.
         # bs=64/gqa=128 picks splits=2, not 4).
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
-        cu_num = get_cu_num()
-        min_kv = total_kv // num_seqs if num_seqs > 0 else total_kv
-        tile_cap = max(1, min_kv // 32)
-        occ_cap = max(1, (2 * cu_num) // max(1, num_seqs * tg_factor))
-        max_splits = max(16, min(tile_cap, occ_cap))
-
         num_kv_splits, meta_split_indptr = get_meta_param(
             None,
             num_seqs,
@@ -1210,7 +1188,6 @@ def mla_decode_fwd_v4_nm(
             max_seqlen_q,
             q.dtype,
             tg_factor,
-            max_splits,
         )
         if split_indptr is None:
             split_indptr = meta_split_indptr.to(device=q.device, dtype=torch.int32)
