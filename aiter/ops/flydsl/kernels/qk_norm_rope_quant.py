@@ -954,10 +954,10 @@ def flydsl_qk_norm_rope_quant(
         (q_out, kv_out, q_scale_or_None, kv_scale_or_None)
         Scales are ``None`` when ``quant=False``.
     """
-    # ---- gfx1250 dispatch (wave32) ----
+    # ---- RDNA wave32 dispatch ----
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    if _get_gfx() == "gfx1250":
+    if _get_gfx() in ("gfx1201", "gfx1250"):
         from .qk_norm_rope_quant_gfx1250 import flydsl_qk_norm_rope_quant_gfx1250
 
         return flydsl_qk_norm_rope_quant_gfx1250(

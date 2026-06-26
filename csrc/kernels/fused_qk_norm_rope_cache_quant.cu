@@ -4185,8 +4185,9 @@ namespace aiter {
             // Compiler folds to a shift since GROUP_SIZE / vec_size_i is power-of-2.
             const int group_id = tid / reduce_thread_size;  // 0..num_nope_groups-1
             auto* tmp = reinterpret_cast<uint8_t*>(ptr_o + nope_dim);
-            tmp[group_id * 2]     = s.byte;
-            tmp[group_id * 2 + 1] = s.byte;
+            const uint16_t scale_pair =
+                static_cast<uint16_t>(s.byte) | (static_cast<uint16_t>(s.byte) << 8);
+            *reinterpret_cast<uint16_t*>(tmp + group_id * 2) = scale_pair;
           }
           inv_scale = is_nope_thread ? (1.0f / s.dq_scale) : 0.0f;
         } else {
@@ -4308,6 +4309,7 @@ namespace aiter {
       // (4 B/elem -> worse cache-line utilization), so gate on 2-byte dtypes only, matching the
       // activation-kernel convention (see GROUP_NT in aiter_opus_plus.h).
       constexpr int32_t IN_LOAD_AUX = (sizeof(scalar_t) < 4) ? GROUP_NT : 0;
+      constexpr int32_t in_chunk_bytes = (vec_size_i * sizeof(scalar_t)) % 16 == 0 ? 16 : 8;
       // K nope_scale_buff layout (v4 nm asm reader, 512B entry for head_dim=512):
       //   [nope fp8 nope_dim B][e8m0 scale 2*(nope_dim/64) B, each tile-scale x2][pad -> 512].
       // The rotated K-PE goes to a SEPARATE rope_buff (k_pe_out), bf16.
@@ -4411,8 +4413,9 @@ namespace aiter {
         // (Tried vLLM-style 2-deep prefetch of the next head here -- measured neutral:
         // the compiler already pipelines the loop load, and the extra live vec_q_next
         // costs VGPR/occupancy, so it's a wash. Kept the simple single-buffer load.)
-        opus_vec_i vec_q = q_buf.template load<vec_size_i, IN_LOAD_AUX>(
-            tid * vec_size_i, q_head_idx * params.q_stride_1);
+        opus_vec_i vec_q =
+            load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes, IN_LOAD_AUX>(
+                q_buf, tid * vec_size_i + q_head_idx * params.q_stride_1);
 
         float sum_sq = 0.0f;
         #pragma unroll
@@ -4496,8 +4499,9 @@ namespace aiter {
               // Q_GROUP_SIZE (the compiler folds to a shift since Q_REDUCE is a power of 2).
               const int group_id = tid / Q_REDUCE;  // 0..Q_NUM_GROUPS-1
               auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
-              qs[group_id * 2]     = qs_scale.byte;
-              qs[group_id * 2 + 1] = qs_scale.byte;
+              const uint16_t scale_pair =
+                  static_cast<uint16_t>(qs_scale.byte) | (static_cast<uint16_t>(qs_scale.byte) << 8);
+              *reinterpret_cast<uint16_t*>(qs + group_id * 2) = scale_pair;
             }
             const uint32_t nope_out_offset = tid * vec_size_i;  // nope-first
             opus_vec_q vec_out;
@@ -4651,6 +4655,7 @@ namespace aiter {
       // Streaming (read-once) inputs -> NT/SLC|GLC to bypass L2 (same as the coarse
       // kernel). Measured neutral here vs plain cached loads, kept for consistency.
       constexpr int32_t IN_LOAD_AUX = (sizeof(scalar_t) < 4) ? GROUP_NT : 0;
+      constexpr int32_t in_chunk_bytes = (vec_size_i * sizeof(scalar_t)) % 16 == 0 ? 16 : 8;
 
       using opus_vec_i = opus::vector_t<scalar_t, vec_size_i>;
       using opus_vec_o = opus::vector_t<cache_t, vec_size_o>;
@@ -4676,7 +4681,9 @@ namespace aiter {
         const bool is_nope_thread = (tid < static_cast<int32_t>(nope_vec));
         constexpr bool K_QUANT = (kv_dt != vllm::Fp8KVCacheDataType::kAuto);
 
-        opus_vec_i vec_kv = buffer_kv.template load<vec_size_i, IN_LOAD_AUX>(tid * vec_size_i);
+        opus_vec_i vec_kv =
+            load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes, IN_LOAD_AUX>(
+                buffer_kv, tid * vec_size_i);
         opus_vec_i vec_k_weight = *reinterpret_cast<const opus_vec_i*>(&k_weight[tid * vec_size_i]);
 
         // Per-thread partials: sum(x^2) over the row, and (quant only) amax(|x*w|)
@@ -4718,8 +4725,9 @@ namespace aiter {
               // 14-byte format); use the generic tid/reduce_thread_size to avoid a magic >>6.
               const int group_id = tid / reduce_thread_size;
               auto* tmp = reinterpret_cast<uint8_t*>(ptr_o + nope_dim);
-              tmp[group_id * 2]     = s.byte;
-              tmp[group_id * 2 + 1] = s.byte;
+              const uint16_t scale_pair =
+                  static_cast<uint16_t>(s.byte) | (static_cast<uint16_t>(s.byte) << 8);
+              *reinterpret_cast<uint16_t*>(tmp + group_id * 2) = scale_pair;
             }
             factor = rms_scale / s.dq_scale;
           } else {
@@ -4797,7 +4805,9 @@ namespace aiter {
 
       const scalar_t* q_ptr = q + token_q_base + q_head_idx * params.q_stride_1;
       auto q_buf = opus::make_gmem<scalar_t>(q_ptr, oob_i * sizeof(scalar_t));
-      opus_vec_i vec_q = q_buf.template load<vec_size_i, IN_LOAD_AUX>(tid * vec_size_i);
+      opus_vec_i vec_q =
+          load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes, IN_LOAD_AUX>(
+              q_buf, tid * vec_size_i);
 
       opus_vec_i vec_q_weight;
       if constexpr (HAS_Q_WEIGHT) {
@@ -4842,8 +4852,9 @@ namespace aiter {
             // Q_GROUP_SIZE (folds to a shift since Q_REDUCE is a power of 2).
             const int group_id = tid / Q_REDUCE;
             auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
-            qs[group_id * 2]     = qs_scale.byte;
-            qs[group_id * 2 + 1] = qs_scale.byte;
+            const uint16_t scale_pair =
+                static_cast<uint16_t>(qs_scale.byte) | (static_cast<uint16_t>(qs_scale.byte) << 8);
+            *reinterpret_cast<uint16_t*>(qs + group_id * 2) = scale_pair;
           }
           opus_vec_q vec_out;
           #pragma unroll
