@@ -888,9 +888,12 @@ void mla_decode_stage1_asm_fwd(
             } else if((max_seqlen_q == 2) && persistent){
                 config_max_seqlen_q = 2;
                 sub_Q = 128;
+            } else if((max_seqlen_q == 1) && persistent){
+                config_max_seqlen_q = 1;
+                sub_Q = 32;
             } else {
                 AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=32 only supports non-persistent decode_qlen=1 or persistent decode_qlen=2,4");
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1,2,4 in persistent mode");
             }
         }
     } else if (gqa_ratio == 64){
@@ -918,8 +921,12 @@ void mla_decode_stage1_asm_fwd(
     } else if (gqa_ratio == 8){
         if (q_type == "bf16" && kv_type == "bf16"){
             if(!persistent){
-                config_max_seqlen_q = 1;
-                sub_Q = 8;
+                if(max_seqlen_q == 1){
+                    sub_Q = gqa_ratio;
+                } else if(max_seqlen_q == 2){
+                    sub_Q = gqa_ratio * max_seqlen_q;
+                    args.s_MQA = gqa_ratio;
+                }
             }
         } else if (q_type == "fp8" && kv_type == "fp8"){
             if(!persistent && max_seqlen_q == 1){

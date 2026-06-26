@@ -54,7 +54,6 @@ def causal_conv1d_update(
     Note:
         - Supports fp16, bf16, and fp32 data types
         - Kernel width support: 2, 3, 4
-        - Optimized for AMD MI308 GPU (64 threads per wavefront)
         - Uses register-based sliding window for efficiency
         - Pass empty tensors (torch.empty(0, ...)) for optional parameters
     """

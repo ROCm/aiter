@@ -152,7 +152,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         512: 32,
     }
 
-    if dtype == dtypes.fp8 and get_gfx() != "gfx1250":
+    if dtype == dtypes.fp8:
         min_block_n = get_block_n_fp8[int(nhead * max_seqlen_q)]
         # ceil(avg_kv / min_block_n) computed in pure integers (avg_kv = total_kv/bs).
         num_kv_splits = min(
@@ -232,8 +232,12 @@ def mla_decode_fwd(
             num_kv_splits, num_kv_splits_indptr = get_meta_param(
                 num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
             )
-
-        mgc = 64 if max_seqlen_q == 1 and nhead in [8, 16] else 16
+        mgc = (
+            64
+            if nhead in [8, 16]
+            and (max_seqlen_q == 1 or (nhead == 8 and max_seqlen_q == 2))
+            else 16
+        )
         mgc = (
             32
             if (
@@ -264,6 +268,11 @@ def mla_decode_fwd(
                         q.dtype == dtypes.bf16
                         and kv_buffer.dtype == dtypes.bf16
                         and nhead == 32
+                    )
+                    or (
+                        q.dtype == dtypes.bf16
+                        and kv_buffer.dtype == dtypes.bf16
+                        and nhead == 8
                     )
                 )
             )
@@ -316,6 +325,9 @@ def mla_decode_fwd(
                 q.dtype == dtypes.bf16
                 and kv_buffer.dtype == dtypes.bf16
                 and nhead == 32
+            )
+            or (
+                q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16 and nhead == 8
             )
         ):
             lse = final_lse if return_lse else attn_lse
@@ -418,6 +430,13 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.bf16
                 and kv_buffer.dtype == dtypes.bf16
                 and max_seqlen_q == 2
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 32
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q == 1
             )
             or (
                 get_gfx() == "gfx950"

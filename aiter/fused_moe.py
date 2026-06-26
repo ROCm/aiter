@@ -5,6 +5,7 @@ import functools
 import os
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Optional
 
 import aiter
@@ -22,8 +23,20 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.ops.flydsl.moe_common import GateMode
+
+try:
+    from aiter.ops.flydsl.utils import is_flydsl_available
+    from aiter.ops.flydsl.moe_common import GateMode
+except ImportError:
+
+    class GateMode(Enum):
+        SEPARATED = "separated"
+        INTERLEAVE = "interleave"
+
+    def is_flydsl_available():
+        return False
+
+
 from aiter import (
     fused_dynamic_mxfp4_quant_moe_sort,
     fused_dynamic_mxfp8_quant_moe_sort,
@@ -270,7 +283,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
 ):
     if not block_size_M:
@@ -326,7 +339,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -362,7 +375,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -425,35 +438,43 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-        _maybe_grouped_gfx1250_a8w4_moe,
-    )
+    grouped_a8w4_out = None
+    if is_flydsl_available():
+        try:
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                _maybe_grouped_gfx1250_a8w4_moe,
+            )
+        except ImportError:
+            _maybe_grouped_gfx1250_a8w4_moe = None
 
-    grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        E=E,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        dtype=dtype,
-        activation=activation,
-        quant_type=quant_type,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
-        isG1U1=isG1U1,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        expert_mask=expert_mask,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        gate_mode=gate_mode,
-    )
+        if _maybe_grouped_gfx1250_a8w4_moe is not None:
+            grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                E=E,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                dtype=dtype,
+                activation=activation,
+                quant_type=quant_type,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                isG1U1=isG1U1,
+                doweight_stage1=doweight_stage1,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                expert_mask=expert_mask,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                gate_mode=gate_mode,
+                swiglu_limit=swiglu_limit,
+            )
+
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
@@ -900,7 +921,7 @@ def _flydsl_stage1_wrapper(
     out_scale_sorted=None,
     bias1=None,
     topk_ids=None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
     **_kwargs,
@@ -943,6 +964,7 @@ def _flydsl_stage1_wrapper(
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
+        k_wave=parsed.get("k_wave", 1),
     )
 
 
@@ -1740,7 +1762,7 @@ def fused_moe_2stages(
     bias2=None,
     topk_ids=None,
     topk_weights=None,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
 ):
@@ -2148,8 +2170,8 @@ def torch_moe(
 
 
 # temp workaround for swiglu
-def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
-    if limit == 0.0:
+def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: Optional[float] = 7.0):
+    if limit is None:
         limit = 7.0
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
@@ -2173,7 +2195,7 @@ def torch_moe_stage1(
     w1_scale=None,  # [expert, inter_dim, 1]
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
@@ -2280,7 +2302,7 @@ def torch_moe_stage1(
         if use_swiglu:
             out = swiglu(gate, up, limit=swiglu_limit)
         else:
-            if swiglu_limit != 0:
+            if swiglu_limit:
                 gate = gate.clamp(min=None, max=swiglu_limit)
                 up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             out = torch_act(gate) * up

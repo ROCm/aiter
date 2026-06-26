@@ -19,7 +19,7 @@ from ..utility import dtypes
 #   - accepts an Optional[Tensor] correction_bias (None => no bias)
 #   - validates score_func string
 #   - exposes the same C++ kernel under a more accurate name
-@compile_ops("module_moe_topk")
+@compile_ops("module_moe_topk", develop=True)
 def topk_softplus(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,

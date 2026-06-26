@@ -82,29 +82,6 @@ from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
 
-_STATIC_ADAPTOR_CACHE = {}
-_STATIC_ADAPTOR_CACHE_MAX = 64
-
-
-def _cached_from_dlpack(t: torch.Tensor):
-    key = (
-        int(t.data_ptr()),
-        str(t.device),
-        str(t.dtype),
-        tuple(t.shape),
-        tuple(t.stride()),
-        int(t.storage_offset()),
-    )
-    cached = _STATIC_ADAPTOR_CACHE.get(key)
-    if cached is not None:
-        return cached
-    if len(_STATIC_ADAPTOR_CACHE) >= _STATIC_ADAPTOR_CACHE_MAX:
-        _STATIC_ADAPTOR_CACHE.clear()
-    adaptor = flyc.from_dlpack(t)
-    _STATIC_ADAPTOR_CACHE[key] = adaptor
-    return adaptor
-
-
 # --- shape constants (V4-Pro MVP) -------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64
 
@@ -1161,24 +1138,10 @@ def flydsl_qk_norm_rope_quant(
 
     if stream is None:
         stream = torch.cuda.current_stream()
-
-    def _has_direct_state():
-        return getattr(launcher, "_direct_call_state", None) is not None
+    fx_stream = Stream(stream)
 
     def _ptr_arg(t):
-        if _has_direct_state():
-            return int(t.data_ptr())
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-
-    def _stream_arg():
-        if _has_direct_state():
-            return stream
-        return Stream(stream)
-
-    q_weight_static = _cached_from_dlpack(q_weight_arg)
-    kv_weight_static = _cached_from_dlpack(kv_weight)
-    cos_static = _cached_from_dlpack(cos_2d)
-    sin_static = _cached_from_dlpack(sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
     # kernel uses per-token GTensor base-shift so each chunk's resource span
@@ -1197,10 +1160,10 @@ def flydsl_qk_norm_rope_quant(
         args = (
             _ptr_arg(q_view[start:end]),
             _ptr_arg(kv[start:end]),
-            q_weight_static,
-            kv_weight_static,
-            cos_static,
-            sin_static,
+            q_weight_arg,
+            kv_weight,
+            cos_2d,
+            sin_2d,
             _ptr_arg(positions[start:end]),
             _ptr_arg(q_out[start:end]),
             _ptr_arg(kv_out[start:end]),
@@ -1217,7 +1180,7 @@ def flydsl_qk_norm_rope_quant(
             swa_pos_stride,
             swa_cache_size,
             n,
-            _stream_arg(),
+            fx_stream,
         )
         _run_compiled(launcher, *args)
 

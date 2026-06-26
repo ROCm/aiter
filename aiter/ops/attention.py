@@ -392,7 +392,7 @@ def pa_ps_fwd_asm(
 
 
 # ---------------------------------------------------------------------------
-# pa_decode_bf16_asm (gfx1250) — persistent / split-KV paged-attention decode.
+# pa_decode_bf16_asm (gfx1250) -- persistent / split-KV paged-attention decode.
 #
 # Wraps the SP3 kernel PA_DECODE_D64_1TG_4W_PS (head_dim=64, page_size=256,
 # gqa=8).  FP8 Q **and** FP8 paged KV cache, bf16 output, **per-tensor** scalar
@@ -491,7 +491,7 @@ def pa_decode_bf16_asm(
         # produce inf/NaN in the in-kernel sink merge.
         sink = torch.full((q_head_num,), -1.0e30, dtype=torch.float32, device=device)
     else:
-        sink = sink.to(torch.float32).contiguous()
+        assert sink.dtype == torch.float32, "sink must be in fp32 for pa ASM"
 
     _pa_decode_bf16_asm(
         Q,
@@ -1108,8 +1108,23 @@ def get_mla_metadata_info_v1(
     )
 
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
-    max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
+    packed_qo_len = effective_seqlen_qo * num_head_qo
+    max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 16))
+
     if (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.bf16
+        and kv_dtype == dtypes.bf16
+        and packed_qo_len >= 64
+        and num_head_qo <= 64
+        and (packed_qo_len < 128 or num_head_qo == 48)
+    ):
+        if num_head_qo * 2 > 64:
+            # e.g. nhead=48: C++ does  `return seqlen_qo`  (not ceil)
+            max_qo_tiles_per_batch = effective_seqlen_qo
+        else:
+            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 64))
+    elif (
         num_head_qo == 16
         or (
             get_gfx() == "gfx942"
@@ -1136,10 +1151,10 @@ def get_mla_metadata_info_v1(
             )
         )
     ):
-        max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
+        max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
     elif (
         get_gfx() == "gfx950"
-        and ((num_head_qo * effective_seqlen_qo) >= 128 or num_head_qo > 64)
+        and (packed_qo_len >= 128 or num_head_qo > 64)
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
         and num_head_qo != 48
@@ -1147,9 +1162,7 @@ def get_mla_metadata_info_v1(
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
         else:
-            max_qo_tiles_per_batch = int(
-                math.ceil(effective_seqlen_qo * num_head_qo / 128)
-            )
+            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
 
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
@@ -1164,12 +1177,19 @@ def get_mla_metadata_info_v1(
         max_split_tiles = tile_cnt * cu_num
 
     # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
-    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). A single tile can in
-    # the worst case absorb the entire global budget, so reduce_partial_map must
-    # hold up to tile_cnt * per_tile_cap entries.
+    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). This is a GLOBAL
+    # budget shared across all tiles, so the total number of partial reduce
+    # entries is bounded by the base tiles (one per tile) plus at most the global
+    # split budget of EXTRA splits distributed across them:
+    #     reduce_partial_map <= tile_cnt + per_tile_cap
+    # The previous `tile_cnt * per_tile_cap` assumed every tile could individually
+    # absorb the whole global budget simultaneously, which the shared budget
+    # forbids. With cudagraph batch_size >> cu_num that product collapsed to
+    # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
+    # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
     if max_split_per_batch > 0:
         per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
-        max_split_tiles = max(max_split_tiles, tile_cnt * per_tile_cap)
+        max_split_tiles = max(max_split_tiles, tile_cnt + per_tile_cap)
 
     if not intra_batch_mode:
         return (
