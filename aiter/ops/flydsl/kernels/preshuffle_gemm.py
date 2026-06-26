@@ -540,10 +540,13 @@ def compile_preshuffle_gemm_a8(
         lds_a_ping = lds_a_ping_ptr.get()
         lds_out = lds_out_ptr.get()
 
+        # Per-workgroup output tile origin (row bx_m, col by_n). Computed here so
+        # the large row base can be folded into the C buffer resource's i64 base.
+        bx_m = bx * tile_m
+        by_n = by * tile_n
+
         # ---- Buffer resources (runtime byte sizes for OOB protection) ----
         _a_nrec = fx.Int64(c_m * (K * elem_bytes // a_elem_vec_pack))
-        # split-K atomic-adds all partials into the single [M, N] output.
-        _c_nrec = fx.Int64(c_m * c_n * 2)
 
         def _ptr_buffer_resource(ptr, num_records_bytes=None):
             addr = fx.ptrtoint(ptr)
@@ -555,7 +558,28 @@ def compile_preshuffle_gemm_a8(
             )
 
         a_rsrc = _ptr_buffer_resource(arg_a, _a_nrec)
-        c_rsrc = _ptr_buffer_resource(arg_c, _c_nrec)
+        # C output: buffer_ops voffsets are i32 (see PR #3125), so a [M, N] output
+        # exceeding 4 GB would overflow the per-store voffset. Fold THIS WG's row
+        # base (bx_m * c_n elements) into the resource's i64 BASE address and keep
+        # every C store offset relative to the WG row-tile (row_local * c_n + col),
+        # which always fits i32. num_records spans this WG's rows to the C end so
+        # OOB rows (ragged M) stay masked. split-K's _atomic_add_out is unaffected
+        # (it addresses arg_c via i64 pointer math, not buffer_ops).
+        _c_base_i64 = fx.arith.index_cast(T.i64, fx.ptrtoint(arg_c))
+        _c_row_off_i64 = fx.arith.index_cast(T.i64, bx_m * c_n * fx.Index(2))
+        _c_tile_addr = llvm.AddOp(
+            _c_base_i64, _c_row_off_i64, llvm.IntegerOverflowFlags(0)
+        ).result
+        # num_records is a 32-bit field, so it must bound only THIS WG's row tile
+        # (min(tile_m, remaining) rows x full N), never the whole output -- a >4GB
+        # output would overflow it (e.g. the bx_m==0 tile = c_m*c_n*2 >= 2^32).
+        # Bounding to the WG's own rows also masks ragged-M OOB rows.
+        _rows_rem = c_m - bx_m
+        _rows_wg = (_rows_rem < fx.Index(tile_m)).select(_rows_rem, fx.Index(tile_m))
+        _c_nrec = fx.Int64(_rows_wg * c_n * 2)
+        c_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            _c_tile_addr, num_records_bytes=_c_nrec
+        )
 
         # LLVM pointer type in AMDGPU global address space (1), reused for the
         # raw-pointer split-K ops (atomic fadd into C, coherent signal/semaphore).
@@ -610,9 +634,6 @@ def compile_preshuffle_gemm_a8(
             bias_rsrc = _ptr_buffer_resource(arg_bias)
         b_rsrc = _ptr_buffer_resource(arg_b)
         scale_b_rsrc = None if (is_f16_or_bf16) else _ptr_buffer_resource(arg_scale_b)
-
-        bx_m = bx * tile_m
-        by_n = by * tile_n
 
         # ── split-K in-kernel zero + cross-workgroup ordering ─────────────────
         # Each (m, n) output tile is reduced by `split_k` workgroups that all
@@ -1583,7 +1604,9 @@ def compile_preshuffle_gemm_a8(
                         v1.store(lds_out, [lds_idx], alignment=2)
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    idx_out = row * c_n + col_g0
+                    # offset relative to this WG's row-tile (row base folded into
+                    # c_rsrc); col_g0 is absolute and < N, so this fits i32.
+                    idx_out = row_local * c_n + col_g0
                     byte_off = idx_out * 2
                     e_vec = 4 if (int(tile_n) % (32 * 4)) == 0 else 2
                     if const_expr(e_vec == 4):
@@ -1629,7 +1652,11 @@ def compile_preshuffle_gemm_a8(
                     s_a_vec4 = s_a_vecs[mi]
                     s_a = Vec(s_a_vec4)[ii]
                 col_base = by_n + n_tile_base + lane_mod_16
-                idx_base = row * c_n + col_base
+                # buffer_store path: offset relative to this WG's row-tile (row base
+                # folded into c_rsrc's i64 base) so the i32 voffset stays in range
+                # for >4GB outputs. split-K's _atomic_add_out below takes the
+                # absolute element index (it uses arg_c's i64 address directly).
+                idx_base = row_in_tile * c_n + col_base
                 for ni in range_constexpr(num_acc_n):
                     acc_idx = mi * num_acc_n + ni
                     acc = final_accs[acc_idx]
@@ -1719,14 +1746,14 @@ def compile_preshuffle_gemm_a8(
                         val_s = half_f32 * val_s * one_plus_tanh
 
                     val_f16 = _out_dtype()(val_s)
-                    idx_out = idx_base + (ni * 16)
                     if const_expr(_is_split_k):
                         # split-K: accumulate partials into the shared [M, N]
                         # output via bf16/fp16 atomic add (lowered to a CAS loop
-                        # for the sub-dword element width).
-                        _atomic_add_out(idx_out, val_f16)
+                        # for the sub-dword element width). Uses the ABSOLUTE
+                        # element index (arg_c i64 address, >4GB-safe).
+                        _atomic_add_out(row * c_n + col_base + (ni * 16), val_f16)
                     else:
-                        buffer_ops.buffer_store(val_f16, c_rsrc, idx_out)
+                        buffer_ops.buffer_store(val_f16, c_rsrc, idx_base + (ni * 16))
 
             mfma_epilog(
                 use_cshuffle=False,
