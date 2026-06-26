@@ -575,7 +575,7 @@ def test_triton_unified_attn_3d(
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False, False, False),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, False, True, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True, True, False),
-        (torch.float16, torch.float16, torch.float16, False, False, False)
+        (torch.float16, torch.float16, torch.float16, False, False, False),
     ],
 )
 @pytest.mark.parametrize(
