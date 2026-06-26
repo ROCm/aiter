@@ -748,10 +748,16 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
 
         gemm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
         ref_keys = ["x_ref", "weight", "x_scale_ref", "w_scale_ref", "bias_f32"]
-        tasks = []
         lds_limit = max_lds_bytes_for_tune()
         padded_m = _get_padded_m(M)
         min_ctas = max(4, min(16, N // 64))
+
+        # Collect eligible candidates (all filters EXCEPT min_ctas), and separately
+        # those that also meet min_ctas. Use the min_ctas-respecting set when it is
+        # non-empty; otherwise fall back to the low-occupancy set so tiny shapes
+        # (e.g. small M + small N=768, where num_ctas can only reach 3-6 < min_ctas)
+        # still get tuned instead of being left untuned.
+        primary, fallback = [], []
         for i in sorted(kernels_list_flydsl_mxfp8.keys()):
             ki = kernels_list_flydsl_mxfp8[i]
             if kernel_instance_estimated_lds_bytes(ki) > lds_limit:
@@ -765,16 +771,28 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             # candidates without picking wastefully large tiles for tiny M.
             if ki.tile_m > padded_m and ki.tile_m > 64:
                 continue
-            num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
-            if num_ctas < min_ctas:
-                continue
             # mxfp8 tile_m is always a multiple of 32 (pack_M=2), so the fp8
             # pruning rules keyed on tile_m == 16 / tile_m < 32 never fire and are
             # omitted here. Only the tile_m=32-vs-large-M prune stays live.
             if M >= 8192 and ki.tile_m < 64:
                 continue
+            num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
             if getattr(ki, "xcd_swizzle", 0) > 0 and num_ctas < 64:
                 continue
+            fallback.append(i)
+            if num_ctas >= min_ctas:
+                primary.append(i)
+
+        chosen = primary if primary else fallback
+        if not primary and fallback:
+            print(
+                f"[FlyDSL] mxfp8 {M}x{N}x{K}: no candidate meets min_ctas={min_ctas}; "
+                f"using {len(fallback)} low-occupancy candidate(s)"
+            )
+
+        tasks = []
+        for i in chosen:
+            ki = kernels_list_flydsl_mxfp8[i]
             info = (info_keys, i, int(ki.split_k), ki.name, "flydsl_mxfp8")
             tasks.append(
                 (
