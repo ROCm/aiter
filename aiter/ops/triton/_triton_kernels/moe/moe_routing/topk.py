@@ -172,8 +172,8 @@ def _topk(
     HAS_BIAS: tl.constexpr = False,
     APPLY_RENORM: tl.constexpr = False,
     ROUTED_SCALING: tl.constexpr = 1.0,
-    Pop=None,                          # optional [n_expts_tot] int32 popularity (pre-zeroed)
-    WRITE_POP: tl.constexpr = False,   # atomic-accumulate popularity here
+    Pop=None,  # optional [n_expts_tot] int32 popularity (pre-zeroed)
+    WRITE_POP: tl.constexpr = False,  # atomic-accumulate popularity here
 ):
     # Backward-compat sanity. APPLY_SOFTMAX = post-selection softmax over the
     # K selected logits (legacy behavior). It only makes sense when no
