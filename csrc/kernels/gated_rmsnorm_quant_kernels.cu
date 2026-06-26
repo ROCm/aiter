@@ -467,7 +467,14 @@ __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
         #pragma unroll
         for (int i = 0; i < THREAD_DATA_SIZE; i++) {
             float clamped = fminf(fmaxf(gated_vals[i] * quant_scale_inv, -FP8_MAX), FP8_MAX);
-            out_ptr[elem_id + i] = opus::cast<DTYPE_O>(clamped);
+            DTYPE_O q = opus::cast<DTYPE_O>(clamped);
+            // e4m3fnuz has no signed zero: the 0x80 bit pattern is its NaN. A tiny
+            // negative value can round to -0 and thus become NaN downstream, so flush
+            // it to +0 (0x00). For e4m3fn this only turns -0 into +0, which is harmless.
+            if (*reinterpret_cast<const unsigned char*>(&q) == 0x80u) {
+                q = opus::cast<DTYPE_O>(0.0f);
+            }
+            out_ptr[elem_id + i] = q;
         }
     }
 
@@ -552,6 +559,9 @@ void gated_rmsnorm_fp8_per_token_quant_launcher(
     // head_dim must be unit-stride for vectorized loads; token/head may be strided slices.
     TORCH_CHECK(x.stride(2) == 1, "x.stride(2) must be 1 (head_dim contiguous), got ", x.stride(2));
     TORCH_CHECK(z.stride(2) == 1, "z.stride(2) must be 1 (head_dim contiguous), got ", z.stride(2));
+    // The kernel writes out via a flat row-major [num_tokens, num_heads*head_dim]
+    // index, so out must be contiguous (a strided out would be silently corrupted).
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous [num_tokens, num_heads*head_dim]");
 
     constexpr int thread_data_size = 16;
     gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size>(

@@ -171,17 +171,28 @@ if __name__ == "__main__":
     parser.add_argument("--num_tokens", type=int, default=None)
     parser.add_argument("--num_heads", type=int, default=None)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
+    parser.add_argument(
+        "--quant_dtype",
+        type=str,
+        default="all",
+        choices=["all", "e4m3fnuz", "e4m3fn"],
+        help="FP8 output dtype to test (default: both).",
+    )
     args = parser.parse_args()
 
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[args.dtype]
+    _QUANT_DTYPES = {
+        "e4m3fnuz": torch.float8_e4m3fnuz,
+        "e4m3fn": torch.float8_e4m3fn,
+    }
+    quant_dtypes = (
+        list(_QUANT_DTYPES.values())
+        if args.quant_dtype == "all"
+        else [_QUANT_DTYPES[args.quant_dtype]]
+    )
 
     if args.num_tokens is not None and args.num_heads is not None:
-        test_gated_rmsnorm_fp8_per_token_quant(
-            num_tokens=args.num_tokens,
-            num_heads=args.num_heads,
-            head_dim=128,
-            dtype=dtype,
-        )
+        test_configs = [(args.num_tokens, args.num_heads, 128)]
     else:
         test_configs = [
             # (num_tokens, num_heads, head_dim) -- num_heads spans TP/DP variants
@@ -196,25 +207,35 @@ if __name__ == "__main__":
             (1024, 64, 128),
             (2048, 16, 128),
             (2048, 64, 128),
+            # --- edge cases the original matrix missed ---
+            (1, 32, 128),  # single token (decode min)
+            (3, 32, 128),  # tiny odd token count
+            (1024, 1, 128),  # single head
+            (1024, 12, 128),  # partial warp (12 heads, groups_per_warp=8)
+            (1024, 40, 128),  # partial warp spanning >1 warp/token
+            (2048, 128, 128),  # max heads (16 warps/token)
         ]
 
-        print("\n" + "=" * 80)
-        print("BENCHMARK - Gated RMSNorm + FP8 Per-Token Quantization HIP Kernel")
-        print("=" * 80)
+    print("\n" + "=" * 80)
+    print("BENCHMARK - Gated RMSNorm + FP8 Per-Token Quantization HIP Kernel")
+    print(f"  quant_dtypes: {[str(q) for q in quant_dtypes]}")
+    print("=" * 80)
 
-        results = []
+    results = []
+    for quant_dtype in quant_dtypes:
         for num_tokens, num_heads, head_dim in test_configs:
-            results.append(
-                test_gated_rmsnorm_fp8_per_token_quant(
-                    num_tokens=num_tokens,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    dtype=dtype,
-                )
+            r = test_gated_rmsnorm_fp8_per_token_quant(
+                num_tokens=num_tokens,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                quant_dtype=quant_dtype,
             )
+            r["quant_dtype"] = str(quant_dtype)
+            results.append(r)
 
-        df = pd.DataFrame(results)
-        aiter.logger.info(
-            "gated_rmsnorm_fp8_per_token_quant summary (markdown):\n%s",
-            df.to_markdown(index=False),
-        )
+    df = pd.DataFrame(results)
+    aiter.logger.info(
+        "gated_rmsnorm_fp8_per_token_quant summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
