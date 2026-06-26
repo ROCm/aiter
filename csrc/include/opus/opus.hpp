@@ -2391,6 +2391,14 @@ struct tcopy_desc {
     OPUS_H_D void set_tensor_dim2_stride(uint64_t  v) { sg2[2] = uint32_t(v); sg2[3] = (sg2[3] & 0xFFFF0000u) | uint32_t((v >> 32) & 0xFFFFu); }                           // [64:48]
     OPUS_H_D void set_tensor_dim3_stride(uint64_t  v) { sg3[0] = uint32_t(v); sg3[1] = (sg3[1] & 0xFFFF0000u) | uint32_t((v >> 32) & 0xFFFFu); }                           // [0:48]
     OPUS_H_D void set_tensor_dim4       (uint32_t  v) { sg3[1] = (sg3[1] & 0x0000FFFFu) | (v << 16); sg3[2] = (sg3[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
+    // CLUSTER_LOAD_ASYNC peer bitmask (sg1[0] bits [15:0]). A mask that names at most one
+    // workgroup has no fan-out -- e.g. a cluster dim of 1, where the per-operand multicast
+    // group degenerates to the issuing WG itself -- so it is stored as 0 to leave multicast
+    // disabled. Masks naming >=2 WGs are written through unchanged. (The caller must also
+    // ensure the named WGs are CONTIGUOUS in cluster flat-id: gfx1250 TDM multicast
+    // deadlocks on a strided group, which the A operand would form for CWGM>1 -- the
+    // clusterlaunch pipeline zeroes mask_a for CWGM>1 at the source for that reason.)   // [0:16]
+    OPUS_H_D void set_workgroup_mask    (uint16_t  v) { uint16_t m = (__builtin_popcount((unsigned)v) > 1) ? v : uint16_t{0}; sg1[0] = (sg1[0] & 0xFFFF0000u) | uint32_t(m); }
 
     OPUS_H_D void make(uintptr_t lds_addr, const void* global_addr, uint32_t td0, uint32_t td1, uint64_t s0,
                        uint64_t s1=0, uint16_t lds_bar=0, uint32_t td2=0, uint32_t td3=0, uint64_t s2=0, uint64_t s3=0, uint32_t td4=0) {

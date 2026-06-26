@@ -225,10 +225,40 @@ def _gfx1250_select_candidates(
         bm, bn, bk = t
         gx = _ceil_div(M, bm)
         gy = _ceil_div(N, bn)
+        # Cluster M-extent + cwm cap (bucket-safety). A clusterlaunch kid groups cwm
+        # workgroups along M (spanning cwm*B_M rows) and the host rounds the M grid up
+        # to a multiple of cwm. A winner tuned at this M is reused for the whole
+        # M-bucket down to prev_m (the previous bucket's representative M), so it must
+        # keep ALL WGs busy across that bucket -- no idle OOB M-tiles for the smallest
+        # bucket M. Two rules:
+        #   1) cwm <= 3 -- cwm=4 over-rounds the M grid on non-multiple M (e.g. c4x1,
+        #      B_M=32, only cluster-fills at M multiple of 128, leaving idle WGs for
+        #      M=129..255 when reused for the M=256 bucket).
+        #   2) B_M*(cwm-1) <= prev_m -- the cluster's M-span must start within the
+        #      previous bucket so even the smallest bucket M keeps every cluster tile
+        #      in-bounds. cwm==1 always passes (B_M*0 <= prev_m). The boundary is
+        #      inclusive: e.g. M=64 (prev_m=32) admits cwm=3 with B_M=16 (16*2=32).
+        # prev_m = largest power-of-two strictly below M (the bucket lower edge:
+        # e.g. M=256 -> 128, M=128 -> 64).
+        prev_m = 1 << (M.bit_length() - 1)
+        if prev_m >= M:
+            prev_m >>= 1
+        prev_m = max(1, prev_m)
+        # 2D-cluster lockout: only DEGENERATE clusters (cwm==1 or cwn==1) are tuned.
+        # Full 2D clusters (cwm>1 && cwn>1) GPU-hang at runtime on gfx1250 (verified
+        # c4x2 / c2x4 / c4x4 / c2x2 at M=128 N=128 K=2880), and the hang is NOT fixed
+        # by any cluster-barrier sync variant (wave0/all-waves wait, +/- trailing
+        # barrier) -- it is a deeper strided-A multicast issue. Keep 2D out of the
+        # sweep until that is root-caused. (Re-enable by dropping this clause.)
         feas = [
             (cwm, cwn, kid)
             for (tbm, tbn, tbk, cwm, cwn), kid in GFX1250_CLUSTERLAUNCH_KID_OF.items()
-            if (tbm, tbn, tbk) == t and gx % cwm == 0 and gy % cwn == 0
+            if (tbm, tbn, tbk) == t
+            and gx % cwm == 0
+            and gy % cwn == 0
+            and cwm <= 3
+            and bm * (cwm - 1) <= prev_m
+            and (cwm == 1 or cwn == 1)
         ]
         feas.sort(
             key=lambda x: (
@@ -461,6 +491,16 @@ def kid_rejects_shape(k_inst, M, N, K):
         if (
             _ceil_div(M, k_inst.B_M) % k_inst.cluster_wg_m != 0
             or _ceil_div(N, k_inst.B_N) % k_inst.cluster_wg_n != 0
+        ):
+            return True
+        # 2D-cluster lockout (see candidate_kids_for_shape): 2D clusters (cwm>1 &&
+        # cwn>1) GPU-hang at runtime and no barrier-sync variant fixes it. Reject
+        # here too so an explicit-id / heuristic path can never launch a hanging kid.
+        # Override with OPUS_ALLOW_2D=1 for isolated root-cause probing only.
+        if (
+            k_inst.cluster_wg_m > 1
+            and k_inst.cluster_wg_n > 1
+            and os.environ.get("OPUS_ALLOW_2D") != "1"
         ):
             return True
         # NOTE: large output tiles (B_M*B_N >= 16384, e.g. 128x128 / 64x256) used

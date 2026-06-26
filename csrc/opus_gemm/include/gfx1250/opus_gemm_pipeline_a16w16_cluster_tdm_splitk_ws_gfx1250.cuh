@@ -272,14 +272,14 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
             w.make(reinterpret_cast<uintptr_t>(smem_a), kargs.ptr_a, 0,
                    k_extent, (uint32_t)row_extent_a, (uint64_t)stride_a,
                    (uint32_t)gk0, (uint32_t)tile_row);
-            w.desc.sg1[0] = (w.desc.sg1[0] & 0xFFFF0000u) | mask_a;
+            w.desc.set_workgroup_mask(mask_a);   // plain grid (no cluster) -> mask 0 -> GLOBAL_LOAD_ASYNC
             produce(w, slot_a_b, opus::number<1 + T::kNumSlots>{});       // FREE_A
         } else {  // wave_id == 1 -> B
             WindowB w;
             w.make(reinterpret_cast<uintptr_t>(smem_b), kargs.ptr_b, 0,
                    k_extent, (uint32_t)row_extent_b, (uint64_t)stride_b,
                    (uint32_t)gk0, (uint32_t)tile_col);
-            w.desc.sg1[0] = (w.desc.sg1[0] & 0xFFFF0000u) | mask_b;
+            w.desc.set_workgroup_mask(mask_b);   // plain grid (no cluster) -> mask 0 -> GLOBAL_LOAD_ASYNC
             produce(w, slot_b_b, opus::number<1 + 2 * T::kNumSlots>{});   // FREE_B
         }
         // Producer epilogue: rendezvous with the consumers at a workgroup barrier

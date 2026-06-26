@@ -192,16 +192,37 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
             binit(opus::number<1 + 2 * T::kNumSlots + s>{}, kFreeMemCnt); // FREE_B[s]
         });
     }
-    // Cluster sync: align all CWGM*CWGN WGs before the first multicast TDM. The
-    // cluster barrier (-3) counts ONE arrival PER WORKGROUP, so only a single wave
-    // per WG may signal/wait it -- letting all 4 waves issue it would over-count the
-    // cluster arrivals (4x per WG) and desync/hang the barrier. wave0 is the WG's
-    // representative. The trailing workgroup barrier then makes the other 3 waves
+    // Publish the named-barrier init (done by one consumer wave above) to every wave
+    // before first use. This workgroup barrier is ALWAYS needed, independent of the
+    // cluster barrier below.
+    __builtin_amdgcn_s_barrier();
+
+    // Cluster sync (-3): align all CWGM*CWGN WGs before the first multicast TDM. It
+    // counts ONE arrival PER WORKGROUP, so only wave0 (the WG representative) may
+    // signal/wait it; the trailing workgroup barrier then makes the other 3 waves
     // (incl. the B producer w1) wait for wave0's cluster sync, so no wave issues a
     // multicast TDM before every peer WG of the cluster is aligned.
-    __builtin_amdgcn_s_barrier();              // WG sync: others wait for wave0 cluster sync
-    if (wave_id == 0) {
-        __builtin_amdgcn_s_barrier_signal(-3);
+    //
+    // ONLY emit it for a 2D cluster (kClusterWgM>1 && kClusterWgN>1). That is exactly
+    // when an operand's multicast mask is a multi-WG STRIDED group (mask_a step=CWGM>1
+    // over CWGN>=2 peers) that the TDM multicast HW needs aligned. For a DEGENERATE
+    // cluster (CWGM==1 or CWGN==1) the only multicast group is CONTIGUOUS, so the
+    // barrier is unnecessary -- AND a 1-wide (1D) cluster combined with split_k>=2
+    // (grid.z>=2) DEADLOCKS cluster co-residency: the thin 1D cluster's WGs can't be
+    // guaranteed co-resident across z layers, so s_barrier_wait(-3) hangs forever
+    // (verified on gfx1250: 1x4 and 4x1 hang at split_k>=2 with the barrier; 2x2 /
+    // 2x4 / 4x4 do not, and all pass split_k=1/2/4 with this rule).
+    // Combined: degenerate-skip guard + all-waves-wait sync. Emit -3 ONLY for a 2D
+    // cluster (CWGM>1 && CWGN>1) where the strided-A multicast needs cluster-wide
+    // alignment. A degenerate (1D) cluster (CWGM==1 || CWGN==1) has only a contiguous
+    // multicast group (or none) and would DEADLOCK the -3 cluster co-residency at
+    // split_k>=2 (thin 1D cluster can't be co-resident across grid.z layers), so it is
+    // skipped. The -3 sync itself uses wave0-signal + ALL-waves-wait (no separate
+    // trailing workgroup barrier needed: every wave already waits on -3).
+    if constexpr (T::kClusterWgM > 1 && T::kClusterWgN > 1) {
+        if (wave_id == 0) {
+            __builtin_amdgcn_s_barrier_signal(-3);
+        }
         __builtin_amdgcn_s_barrier_wait(-3);
     }
 
@@ -319,14 +340,14 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
             w.make(reinterpret_cast<uintptr_t>(smem_a), kargs.ptr_a, 0,
                    k_extent, (uint32_t)row_extent_a, (uint64_t)stride_a,
                    (uint32_t)gk0, (uint32_t)tile_row);
-            w.desc.sg1[0] = (w.desc.sg1[0] & 0xFFFF0000u) | mask_a;
+            w.desc.set_workgroup_mask(mask_a);   // single-WG mask (popcount<=1) -> 0 (no multicast)
             produce(w, slot_a_b, opus::number<1 + T::kNumSlots>{});       // FREE_A
         } else {  // wave_id == 1 -> B
             WindowB w;
             w.make(reinterpret_cast<uintptr_t>(smem_b), kargs.ptr_b, 0,
                    k_extent, (uint32_t)row_extent_b, (uint64_t)stride_b,
                    (uint32_t)gk0, (uint32_t)tile_col);
-            w.desc.sg1[0] = (w.desc.sg1[0] & 0xFFFF0000u) | mask_b;
+            w.desc.set_workgroup_mask(mask_b);   // single-WG mask (popcount<=1) -> 0 (no multicast)
             produce(w, slot_b_b, opus::number<1 + 2 * T::kNumSlots>{});   // FREE_B
         }
         // Producer epilogue: rendezvous with the consumers at a workgroup barrier
