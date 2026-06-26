@@ -1314,12 +1314,6 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND                                      \
-    m.def("topk_sigmoid",                                    \
-          &aiter::topk_sigmoid,                              \
-          py::arg("topk_weights"),                           \
-          py::arg("topk_indices"),                           \
-          py::arg("gating_output"),                          \
-          "Apply topk sigmoid to the gating outputs.");      \
     m.def("topk_softplus",                                   \
           &aiter::topk_softplus,                             \
           py::arg("topk_weights"),                           \
@@ -1330,6 +1324,14 @@ namespace py = pybind11;
           py::arg("routed_scaling_factor") = 1.0,            \
           py::arg("score_func")            = "sqrtsoftplus", \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
+
+#define MOE_TOPK_CK_PYBIND                                   \
+    m.def("topk_sigmoid",                                    \
+          &aiter::topk_sigmoid,                              \
+          py::arg("topk_weights"),                           \
+          py::arg("topk_indices"),                           \
+          py::arg("gating_output"),                          \
+          "Apply topk sigmoid to the gating outputs.");
 
 #define MOE_SORTING_PYBIND                             \
     m.def("moe_sorting_fwd",                           \
@@ -2149,9 +2151,9 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
-          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
-          py::arg("shuffle_scale") = false); \
+          py::arg("shuffle_scale") = false,  \
+          py::arg("gemma_norm") = false);    \
     m.def("add_rmsnorm",                     \
           &aiter::add_rmsnorm,               \
           py::arg("out"),                    \
@@ -2168,9 +2170,9 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
-          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
-          py::arg("shuffle_scale") = false); \
+          py::arg("shuffle_scale") = false,  \
+          py::arg("gemma_norm") = false);    \
     m.def("rmsnorm",                         \
           &aiter::rmsnorm,                   \
           py::arg("out"),                    \
@@ -2306,6 +2308,30 @@ namespace py = pybind11;
           py::arg("causal"),                                                   \
           py::arg("return_lse"),                                               \
           py::arg("num_splits"));
+
+#define CAUSAL_CONV1D_FWD_SPLIT_QKV_PYBIND                                  \
+    m.def("causal_conv1d_fwd_split_qkv_hip",                                \
+          &aiter::causal_conv1d_fwd_split_qkv_hip,                          \
+          "causal_conv1d prefill fused split q/k/v (HIP)",                  \
+          py::arg("x"),                                                     \
+          py::arg("weight"),                                                \
+          py::arg("bias"),                                                  \
+          py::arg("conv_states"),                                           \
+          py::arg("cache_indices"),                                         \
+          py::arg("has_initial_state"),                                     \
+          py::arg("query_start_loc"),                                       \
+          py::arg("batch_ptr"),                                             \
+          py::arg("token_chunk_offset_ptr"),                                \
+          py::arg("q"),                                                     \
+          py::arg("k"),                                                     \
+          py::arg("v"),                                                     \
+          py::arg("k_dim"),                                                 \
+          py::arg("v_dim"),                                                 \
+          py::arg("n_programs"),                                            \
+          py::arg("block_m"),                                               \
+          py::arg("has_bias"),                                              \
+          py::arg("silu"),                                                  \
+          py::arg("pad_slot_id"));
 
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
     m.def("fused_split_gdr_update",                                   \
