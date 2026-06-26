@@ -173,19 +173,7 @@ def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
 
 def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contiguous):
     """Precompile the non-GEMM FlyDSL kernels the run-only grouped MoE fast path
-    launches around gemm1/gemm2.
-
-    Mirrors aiter.ops.flydsl.grouped_moe_gfx1250._maybe_grouped_gfx1250_a8w4_moe
-    (and the flydsl_moe_* wrappers in moe_kernels.py) so the AOT cache keys match
-    exactly what production dispatch looks up at inference time. The surrounding
-    kernels were fused in gfx1250_moe_splitk_fused (route+quant+scatter and
-    grouped quant+preshuffle in single passes), replacing the older
-    route_maps/scatter_copy/preshuffle_scale set that this helper used to cover.
-
-    Note ``quant_mode`` is the *activation* quant of the fused prep kernels:
-    a8w4 GEMM weights pair with MXFP8 activations, so data_format=="a8w4" maps
-    to quant_mode "fp8" here (not "a8w4"); data_format=="fp4" maps to "fp4".
-    """
+    launches around gemm1/gemm2."""
     import torch
 
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
