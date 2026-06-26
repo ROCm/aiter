@@ -33,6 +33,26 @@ __device__ __forceinline__ float warpReduceSum(float val)
     return val;
 }
 
+__device__ __forceinline__ float warpReduceMax(float val)
+{
+#pragma unroll
+    for(int mask = 16; mask > 0; mask >>= 1)
+    {
+        val = fmaxf(val, __shfl_xor(val, mask, 32));
+    }
+    return val;
+}
+
+// Per-token dynamic quant scale = amax / fp8_max so the largest |value| maps to the
+// fp8 max. The fp8 max is arch-dependent: OCP e4m3fn (448) on gfx950+, e4m3fnuz (240)
+// on gfx942. opus::finfo<cache_t>::max() resolves this at compile time per arch and
+// matches the opus::cast<fp8> hardware clamp range, so do NOT hardcode 448 here.
+template <typename cache_t>
+__device__ __forceinline__ float fp8Max()
+{
+    return static_cast<float>(opus::finfo<cache_t>::max());
+}
+
 template <typename scalar_t>
 __device__ __forceinline__ void loadElems(const scalar_t* __restrict__ src,
                                           float (&elems)[kElemsPerLane])
@@ -99,6 +119,30 @@ __device__ __forceinline__ void copyOrQuantizeCacheElems(const scalar_t* __restr
     }
 }
 
+// Strided V store for the SHUFFLE (asm) layout: the kElemsPerLane elements owned
+// by a lane are `stride` apart in the destination cache (V layout interleaves the
+// intra-page position x-remainder between consecutive head-dim elements). Source
+// is the raw (no norm/rope) qkv row, contiguous.
+template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
+__device__ __forceinline__ void storeCacheElemsStrided(const scalar_t* __restrict__ src,
+                                                       cache_t* __restrict__ dst,
+                                                       int64_t stride,
+                                                       float scale)
+{
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
+        {
+            dst[i * stride] = static_cast<cache_t>(src[i]);
+        }
+        else
+        {
+            dst[i * stride] = opus::cast<cache_t>(static_cast<float>(src[i]) / scale);
+        }
+    }
+}
+
 template <typename scalar_t>
 __device__ __forceinline__ void normAndRope(
     float (&elems)[kElemsPerLane],
@@ -158,7 +202,8 @@ template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType kv_dt,
           bool kIsSparse,
-          bool kInsertKV>
+          bool kInsertKV,
+          bool kAsmLayout>
 __global__ void fusedQKNormIdxrQKNormKernel(
     scalar_t* __restrict__ qkv,
     scalar_t* __restrict__ q_out,
@@ -171,10 +216,17 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     const int64_t* __restrict__ positions,
     const int64_t* __restrict__ slot_mapping,
     const int64_t* __restrict__ index_slot_mapping,
-    cache_t* __restrict__ kv_cache,
+    cache_t* __restrict__ kv_cache_k,
+    cache_t* __restrict__ kv_cache_v,
     scalar_t* __restrict__ index_cache,
-    const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale,
+    // Per-token dynamic-quant OUTPUT dequant scales (fp8 path only). Layout mirrors
+    // reshape_and_cache_with_pertoken_quant:
+    //   asm_layout : [num_blocks, num_kv_heads, block_size]
+    //     idx = block_idx*(nkv*block_size) + head*block_size + block_offset
+    //   page-128   : [num_kv_heads, max_kv_tokens]
+    //     idx = head*max_kv_tokens + slot
+    float* __restrict__ k_scale,
+    float* __restrict__ v_scale,
     float eps,
     int rotary_dim,
     int num_tokens,
@@ -182,10 +234,16 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int nkv,
     int niq,
     int block_size,
-    int64_t kv_s_block,
-    int64_t kv_s_kv,
-    int64_t kv_s_token,
-    int64_t kv_s_head)
+    int x,
+    int max_kv_tokens,
+    // page-128 (asm_layout=false) strides for the separate K/V caches
+    // (each [num_blocks, block_size, num_kv_heads, head_dim]); unused when kAsmLayout.
+    int64_t k_s_block,
+    int64_t k_s_token,
+    int64_t k_s_head,
+    int64_t v_s_block,
+    int64_t v_s_token,
+    int64_t v_s_head)
 {
     const int warps_per_block = blockDim.x / 32;
     const int lane_id = threadIdx.x % 32;
@@ -283,13 +341,57 @@ __global__ void fusedQKNormIdxrQKNormKernel(
         {
             if(mapped_slot >= 0)
             {
-                const int64_t b = mapped_slot / block_size;
-                const int64_t t = mapped_slot % block_size;
-                const int64_t off = b * kv_s_block + kv_s_kv + t * kv_s_token + head * kv_s_head;
-                const float v_scale_val =
-                    (kv_dt == vllm::Fp8KVCacheDataType::kAuto) ? 1.0f : *v_scale;
-                copyOrQuantizeCacheElems<scalar_t, cache_t, kv_dt>(
-                    row_ptr + dim_base, kv_cache + off + dim_base, v_scale_val);
+                // Per-token dynamic quant: amax over the lane's raw V elems, then a
+                // full-warp max -> the (token, head) head-dim amax. scale = amax/FP8_MAX.
+                float v_scale_val = 1.0f;
+                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    float local_amax = 0.0f;
+#pragma unroll
+                    for(int i = 0; i < kElemsPerLane; ++i)
+                    {
+                        local_amax = fmaxf(local_amax,
+                                           fabsf(static_cast<float>(row_ptr[dim_base + i])));
+                    }
+                    const float amax = warpReduceMax(local_amax);
+                    v_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
+                    if(lane_id == 0)
+                    {
+                        const int64_t b = mapped_slot / block_size;
+                        const int64_t t = mapped_slot % block_size;
+                        const int64_t scale_idx =
+                            kAsmLayout
+                                ? (b * (static_cast<int64_t>(nkv) * block_size) +
+                                   static_cast<int64_t>(head) * block_size + t)
+                                : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
+                        v_scale[scale_idx] = v_scale_val;
+                    }
+                }
+                if constexpr(kAsmLayout)
+                {
+                    // V SHUFFLE: [num_blocks, num_kv_heads, block_size/x, head_dim, x]
+                    //   off(d) = b*(nkv*hd*bs) + h*(hd*bs) + (t/x)*(hd*x) + d*x + (t%x)
+                    // The kElemsPerLane elements of a lane (consecutive d) are x apart.
+                    const int64_t b = mapped_slot / block_size;
+                    const int64_t t = mapped_slot % block_size;
+                    const int64_t v_base =
+                        b * (static_cast<int64_t>(nkv) * kHeadDim * block_size) +
+                        static_cast<int64_t>(head) * kHeadDim * block_size +
+                        (t / x) * (static_cast<int64_t>(kHeadDim) * x) +
+                        static_cast<int64_t>(dim_base) * x + (t % x);
+                    storeCacheElemsStrided<scalar_t, cache_t, kv_dt>(
+                        row_ptr + dim_base, kv_cache_v + v_base, x, v_scale_val);
+                }
+                else
+                {
+                    // page-128 V cache [num_blocks, block_size, num_kv_heads, head_dim]
+                    const int64_t b = mapped_slot / block_size;
+                    const int64_t t = mapped_slot % block_size;
+                    const int64_t off =
+                        b * v_s_block + t * v_s_token + head * v_s_head;
+                    copyOrQuantizeCacheElems<scalar_t, cache_t, kv_dt>(
+                        row_ptr + dim_base, kv_cache_v + off + dim_base, v_scale_val);
+                }
             }
             return;
         }
@@ -316,13 +418,58 @@ __global__ void fusedQKNormIdxrQKNormKernel(
             }
             else if(is_k)
             {
-                const int64_t b = mapped_slot / block_size;
-                const int64_t t = mapped_slot % block_size;
-                const int64_t off = b * kv_s_block + t * kv_s_token + head * kv_s_head;
-                const float k_scale_val =
-                    (kv_dt == vllm::Fp8KVCacheDataType::kAuto) ? 1.0f : *k_scale;
-                storeCacheElems<scalar_t, cache_t, kv_dt>(
-                    kv_cache + off + dim_base, elems, k_scale_val);
+                // Per-token dynamic quant: amax over the lane's post-norm/rope K elems,
+                // then a full-warp max -> the (token, head) head-dim amax.
+                float k_scale_val = 1.0f;
+                if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
+                {
+                    float local_amax = 0.0f;
+#pragma unroll
+                    for(int i = 0; i < kElemsPerLane; ++i)
+                    {
+                        local_amax = fmaxf(local_amax, fabsf(elems[i]));
+                    }
+                    const float amax = warpReduceMax(local_amax);
+                    k_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
+                    if(lane_id == 0)
+                    {
+                        const int64_t b = mapped_slot / block_size;
+                        const int64_t t = mapped_slot % block_size;
+                        const int64_t scale_idx =
+                            kAsmLayout
+                                ? (b * (static_cast<int64_t>(nkv) * block_size) +
+                                   static_cast<int64_t>(head) * block_size + t)
+                                : (static_cast<int64_t>(head) * max_kv_tokens + mapped_slot);
+                        k_scale[scale_idx] = k_scale_val;
+                    }
+                }
+                if constexpr(kAsmLayout)
+                {
+                    // K SHUFFLE: [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+                    //   off(d) = b*(nkv*(hd/x)*bs*x) + h*((hd/x)*bs*x)
+                    //            + (d/x)*(bs*x) + t*x + (d%x)
+                    // kElemsPerLane <= x, so a lane's elements share d/x and (d%x) runs
+                    // contiguously -> a contiguous run of kElemsPerLane in the cache.
+                    const int64_t b = mapped_slot / block_size;
+                    const int64_t t = mapped_slot % block_size;
+                    const int d0 = dim_base;  // = lane_id * kElemsPerLane
+                    const int64_t k_off =
+                        b * (static_cast<int64_t>(nkv) * (kHeadDim / x) * block_size * x) +
+                        static_cast<int64_t>(head) * ((kHeadDim / x) * block_size * x) +
+                        static_cast<int64_t>(d0 / x) * (static_cast<int64_t>(block_size) * x) +
+                        t * x + (d0 % x);
+                    storeCacheElems<scalar_t, cache_t, kv_dt>(
+                        kv_cache_k + k_off, elems, k_scale_val);
+                }
+                else
+                {
+                    // page-128 K cache [num_blocks, block_size, num_kv_heads, head_dim]
+                    const int64_t b = mapped_slot / block_size;
+                    const int64_t t = mapped_slot % block_size;
+                    const int64_t off = b * k_s_block + t * k_s_token + head * k_s_head;
+                    storeCacheElems<scalar_t, cache_t, kv_dt>(
+                        kv_cache_k + off + dim_base, elems, k_scale_val);
+                }
             }
         }
     }
@@ -345,10 +492,11 @@ void launchFusedQKNormIdxrQKNorm(
     const int64_t* positions,
     const int64_t* slot_mapping,
     const int64_t* index_slot_mapping,
-    cache_t* kv_cache,
+    cache_t* kv_cache_k,
+    cache_t* kv_cache_v,
     scalar_t* index_cache,
-    const float* k_scale,
-    const float* v_scale,
+    float* k_scale,
+    float* v_scale,
     float eps,
     int rotary_dim,
     int num_tokens,
@@ -356,12 +504,17 @@ void launchFusedQKNormIdxrQKNorm(
     int nkv,
     int niq,
     int block_size,
-    int64_t kv_s_block,
-    int64_t kv_s_kv,
-    int64_t kv_s_token,
-    int64_t kv_s_head,
+    int x,
+    int max_kv_tokens,
+    int64_t k_s_block,
+    int64_t k_s_token,
+    int64_t k_s_head,
+    int64_t v_s_block,
+    int64_t v_s_token,
+    int64_t v_s_head,
     bool has_index,
     bool insert_kv,
+    bool asm_layout,
     hipStream_t stream)
 {
     const int v_slots = insert_kv ? nkv : 0;
@@ -376,8 +529,8 @@ void launchFusedQKNormIdxrQKNorm(
         return;
     }
 
-#define LAUNCH(IS_SPARSE, INSERT)                                                           \
-    fusedQKNormIdxrQKNormKernel<scalar_t, cache_t, kv_dt, IS_SPARSE, INSERT>      \
+#define LAUNCH(IS_SPARSE, INSERT, ASM)                                                      \
+    fusedQKNormIdxrQKNormKernel<scalar_t, cache_t, kv_dt, IS_SPARSE, INSERT, ASM>      \
         <<<grid, kBlockSize, 0, stream>>>(qkv,                                               \
                                           q_out,                                             \
                                           index_q_out,                                       \
@@ -389,7 +542,8 @@ void launchFusedQKNormIdxrQKNorm(
                                           positions,                                         \
                                           slot_mapping,                                      \
                                           index_slot_mapping,                                \
-                                          kv_cache,                                          \
+                                          kv_cache_k,                                        \
+                                          kv_cache_v,                                        \
                                           index_cache,                                       \
                                           k_scale,                                           \
                                           v_scale,                                           \
@@ -400,33 +554,51 @@ void launchFusedQKNormIdxrQKNorm(
                                           nkv,                                               \
                                           niq,                                               \
                                           block_size,                                        \
-                                          kv_s_block,                                        \
-                                          kv_s_kv,                                           \
-                                          kv_s_token,                                        \
-                                          kv_s_head)
+                                          x,                                                 \
+                                          max_kv_tokens,                                     \
+                                          k_s_block,                                         \
+                                          k_s_token,                                         \
+                                          k_s_head,                                          \
+                                          v_s_block,                                         \
+                                          v_s_token,                                         \
+                                          v_s_head)
+
+#define LAUNCH_ASM(IS_SPARSE, INSERT)   \
+    do                                  \
+    {                                   \
+        if(asm_layout)                  \
+        {                               \
+            LAUNCH(IS_SPARSE, INSERT, true);  \
+        }                               \
+        else                            \
+        {                               \
+            LAUNCH(IS_SPARSE, INSERT, false); \
+        }                               \
+    } while(0)
 
     if(has_index)
     {
         if(insert_kv)
         {
-            LAUNCH(true, true);
+            LAUNCH_ASM(true, true);
         }
         else
         {
-            LAUNCH(true, false);
+            LAUNCH_ASM(true, false);
         }
     }
     else
     {
         if(insert_kv)
         {
-            LAUNCH(false, true);
+            LAUNCH_ASM(false, true);
         }
         else
         {
-            LAUNCH(false, false);
+            LAUNCH_ASM(false, false);
         }
     }
+#undef LAUNCH_ASM
 #undef LAUNCH
 }
 
@@ -446,7 +618,8 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> index_k_norm_weight,
     int64_t num_index_heads,
     std::optional<aiter_tensor_t> slot_mapping,
-    std::optional<aiter_tensor_t> kv_cache,
+    std::optional<aiter_tensor_t> kv_cache_k,
+    std::optional<aiter_tensor_t> kv_cache_v,
     std::optional<aiter_tensor_t> index_cache,
     int64_t block_size,
     std::optional<aiter_tensor_t> q_out,
@@ -454,7 +627,8 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> index_slot_mapping,
     const std::string& kv_cache_dtype,
     std::optional<aiter_tensor_t> k_scale,
-    std::optional<aiter_tensor_t> v_scale)
+    std::optional<aiter_tensor_t> v_scale,
+    bool asm_layout)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
 
@@ -485,7 +659,11 @@ static void fused_qknorm_idxrqknorm_impl(
     const int niq = static_cast<int>(num_index_heads);
     AITER_CHECK(nq > 0 && nkv > 0 && niq >= 0, "num_heads/num_kv_heads must be positive");
     const bool has_index = niq > 0;
-    const bool insert_kv = kv_cache.has_value();
+    // Both layouts use the separate kv_cache_k / kv_cache_v caches; asm_layout only
+    // selects the cache element addressing (page-16 SHUFFLE vs plain page-128).
+    AITER_CHECK(kv_cache_k.has_value() == kv_cache_v.has_value(),
+                "kv_cache_k and kv_cache_v must be provided together");
+    const bool insert_kv = kv_cache_k.has_value();
     const bool fp8_kv_cache =
         insert_kv && kv_cache_dtype.rfind("fp8", 0) == 0;
     const int expected_row = (nq + 2 * nkv + (has_index ? niq + 1 : 0)) * kHeadDim;
@@ -510,10 +688,16 @@ static void fused_qknorm_idxrqknorm_impl(
                     "index norm weights must have 128 elements");
     }
 
-    int64_t kv_s_block = 0;
-    int64_t kv_s_kv = 0;
-    int64_t kv_s_token = 0;
-    int64_t kv_s_head = 0;
+    // page-128 K/V cache strides ([num_blocks, block_size, num_kv_heads, head_dim]);
+    // unused in asm_layout (kernel computes SHUFFLE offsets directly).
+    int64_t k_s_block = 0;
+    int64_t k_s_token = 0;
+    int64_t k_s_head = 0;
+    int64_t v_s_block = 0;
+    int64_t v_s_token = 0;
+    int64_t v_s_head = 0;
+    int x = 0;  // SHUFFLE interleave factor = 16 / cache_itemsize (asm_layout only)
+    int max_kv_tokens = 0;  // page-128 per-token scale stride (scales: [nkv, max_kv_tokens])
     if(insert_kv)
     {
         AITER_CHECK(block_size > 0, "block_size must be positive in insert mode");
@@ -541,44 +725,131 @@ static void fused_qknorm_idxrqknorm_impl(
                             index_cache->dtype() == qkv.dtype(),
                         "sparse insert mode requires contiguous matching index_cache");
         }
-        AITER_CHECK(kv_cache->is_gpu(), "kv_cache must be CUDA");
+
+        // K/V cache dtype + scale checks (common to both layouts). kv_cache_k is the
+        // dtype reference for both the SHUFFLE and page-128 caches.
+        const aiter_tensor_t& kc = *kv_cache_k;
+        AITER_CHECK(kc.is_gpu(), "kv cache must be CUDA");
         if(fp8_kv_cache)
         {
             AITER_CHECK(kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3",
                         "fused_qknorm_idxrqknorm fp8 cache insert supports fp8_e4m3 only");
-            AITER_CHECK(kv_cache->dtype() == AITER_DTYPE_fp8 ||
-                            kv_cache->dtype() == AITER_DTYPE_u8,
+            AITER_CHECK(kc.dtype() == AITER_DTYPE_fp8 || kc.dtype() == AITER_DTYPE_u8,
                         "fp8 kv_cache must use float8_e4m3 or uint8 storage");
+            // k_scale/v_scale are per-token dynamic-quant OUTPUT tensors (fp32). Their
+            // exact shape is validated in the asm/page-128 branches below.
             AITER_CHECK(k_scale.has_value() && v_scale.has_value() &&
                             k_scale->is_gpu() && v_scale->is_gpu() &&
                             k_scale->is_contiguous() && v_scale->is_contiguous() &&
                             k_scale->dtype() == AITER_DTYPE_fp32 &&
                             v_scale->dtype() == AITER_DTYPE_fp32,
-                        "fp8 insert requires contiguous float32 CUDA k_scale/v_scale");
-            AITER_CHECK(k_scale->numel() >= 1 && v_scale->numel() >= 1,
-                        "k_scale/v_scale must contain at least one element");
+                        "fp8 per-token insert requires contiguous float32 CUDA "
+                        "k_scale/v_scale output tensors");
         }
         else
         {
             AITER_CHECK(kv_cache_dtype == "auto",
                         "non-fp8 fused_qknorm_idxrqknorm expects kv_cache_dtype='auto'");
-            AITER_CHECK(kv_cache->dtype() == qkv.dtype(),
+            AITER_CHECK(kc.dtype() == qkv.dtype(),
                         "kv_cache dtype must match qkv for non-fp8 cache");
         }
-        AITER_CHECK(kv_cache->dim() == 5 && kv_cache->size(1) == 2 &&
-                        kv_cache->size(2) == block_size && kv_cache->size(3) == nkv &&
-                        kv_cache->size(4) == kHeadDim && kv_cache->stride(4) == 1,
-                    "kv_cache must be [num_blocks, 2, block_size, num_kv_heads, 128] "
-                    "with contiguous head_dim");
-        if(has_index)
+
+        if(asm_layout)
         {
-            AITER_CHECK(index_cache->numel() >= kv_cache->size(0) * block_size * kHeadDim,
-                        "index_cache must contain at least num_blocks * block_size * 128 elements");
+            // SHUFFLE (asm_layout) caches, matching reshape_and_cache(asm_layout=true):
+            //   K [num_blocks, num_kv_heads, head_dim/x, block_size, x]
+            //   V [num_blocks, num_kv_heads, block_size/x, head_dim, x]
+            // with x = 16 / cache_itemsize and block_size the (physical) ASM page.
+            const int itemsize = static_cast<int>(kv_cache_k->element_size());
+            AITER_CHECK(itemsize > 0 && (16 % itemsize) == 0,
+                        "asm_layout kv cache element size must divide 16");
+            x = 16 / itemsize;
+            AITER_CHECK(kHeadDim % x == 0 && block_size % x == 0,
+                        "asm_layout requires x | head_dim and x | block_size");
+            AITER_CHECK(kv_cache_k->is_gpu() && kv_cache_k->is_contiguous() &&
+                            kv_cache_v->is_gpu() && kv_cache_v->is_contiguous(),
+                        "asm_layout kv_cache_k/kv_cache_v must be contiguous CUDA");
+            AITER_CHECK(kv_cache_k->dtype() == kv_cache_v->dtype(),
+                        "asm_layout kv_cache_k/kv_cache_v dtype must match");
+            AITER_CHECK(kv_cache_k->dim() == 5 && kv_cache_k->size(1) == nkv &&
+                            kv_cache_k->size(2) == kHeadDim / x &&
+                            kv_cache_k->size(3) == block_size && kv_cache_k->size(4) == x,
+                        "kv_cache_k must be [num_blocks, num_kv_heads, head_dim/x, "
+                        "block_size, x]");
+            AITER_CHECK(kv_cache_v->dim() == 5 && kv_cache_v->size(0) == kv_cache_k->size(0) &&
+                            kv_cache_v->size(1) == nkv &&
+                            kv_cache_v->size(2) == block_size / x &&
+                            kv_cache_v->size(3) == kHeadDim && kv_cache_v->size(4) == x,
+                        "kv_cache_v must be [num_blocks, num_kv_heads, block_size/x, "
+                        "head_dim, x]");
+            if(has_index)
+            {
+                AITER_CHECK(index_cache->numel() >=
+                                kv_cache_k->size(0) * block_size * kHeadDim,
+                            "index_cache must contain at least num_blocks * block_size "
+                            "* 128 elements");
+            }
+            // strides unused in asm_layout (kernel computes SHUFFLE offsets directly).
+            if(fp8_kv_cache)
+            {
+                // Per-token dequant scales: [num_blocks, num_kv_heads, block_size]
+                // (mirrors reshape_and_cache_with_pertoken_quant asm_layout).
+                const int64_t num_blocks = kv_cache_k->size(0);
+                AITER_CHECK(k_scale->numel() >= num_blocks * nkv * block_size &&
+                                v_scale->numel() >= num_blocks * nkv * block_size,
+                            "asm_layout fp8 per-token k_scale/v_scale must have at least "
+                            "num_blocks * num_kv_heads * block_size elements");
+            }
         }
-        kv_s_block = kv_cache->stride(0);
-        kv_s_kv = kv_cache->stride(1);
-        kv_s_token = kv_cache->stride(2);
-        kv_s_head = kv_cache->stride(3);
+        else
+        {
+            // page-128 caches as separate K and V tensors
+            //   [num_blocks, block_size, num_kv_heads, head_dim] (head_dim contiguous).
+            // These are typically the key/value slices of a fused
+            // [num_blocks, 2, block_size, num_kv_heads, head_dim] cache.
+            AITER_CHECK(kv_cache_k->is_gpu() && kv_cache_v->is_gpu(),
+                        "kv_cache_k/kv_cache_v must be CUDA");
+            AITER_CHECK(kv_cache_k->dtype() == kv_cache_v->dtype(),
+                        "kv_cache_k/kv_cache_v dtype must match");
+            AITER_CHECK(kv_cache_k->dim() == 4 && kv_cache_k->size(1) == block_size &&
+                            kv_cache_k->size(2) == nkv && kv_cache_k->size(3) == kHeadDim &&
+                            kv_cache_k->stride(3) == 1,
+                        "page-128 kv_cache_k must be [num_blocks, block_size, "
+                        "num_kv_heads, 128] with contiguous head_dim");
+            AITER_CHECK(kv_cache_v->dim() == 4 && kv_cache_v->size(0) == kv_cache_k->size(0) &&
+                            kv_cache_v->size(1) == block_size && kv_cache_v->size(2) == nkv &&
+                            kv_cache_v->size(3) == kHeadDim && kv_cache_v->stride(3) == 1,
+                        "page-128 kv_cache_v must be [num_blocks, block_size, "
+                        "num_kv_heads, 128] with contiguous head_dim");
+            if(has_index)
+            {
+                AITER_CHECK(index_cache->numel() >= kv_cache_k->size(0) * block_size * kHeadDim,
+                            "index_cache must contain at least num_blocks * block_size * 128 elements");
+            }
+            k_s_block = kv_cache_k->stride(0);
+            k_s_token = kv_cache_k->stride(1);
+            k_s_head = kv_cache_k->stride(2);
+            v_s_block = kv_cache_v->stride(0);
+            v_s_token = kv_cache_v->stride(1);
+            v_s_head = kv_cache_v->stride(2);
+            if(fp8_kv_cache)
+            {
+                // Per-token dequant scales: [num_kv_heads, max_kv_tokens] with
+                // idx = head * max_kv_tokens + slot (mirrors
+                // reshape_and_cache_with_pertoken_quant page-128). max_kv_tokens is the
+                // scale tensor's last-dim size (caller-sized to cover all slots).
+                AITER_CHECK(k_scale->dim() == 2 && v_scale->dim() == 2 &&
+                                k_scale->size(0) == nkv && v_scale->size(0) == nkv &&
+                                k_scale->size(1) == v_scale->size(1),
+                            "page-128 fp8 per-token k_scale/v_scale must be "
+                            "[num_kv_heads, max_kv_tokens]");
+                max_kv_tokens = static_cast<int>(k_scale->size(1));
+                const int64_t num_blocks = kv_cache_k->size(0);
+                AITER_CHECK(max_kv_tokens >= num_blocks * block_size,
+                            "page-128 fp8 per-token scale max_kv_tokens must be >= "
+                            "num_blocks * block_size");
+            }
+        }
     }
 
     if(q_out.has_value())
@@ -621,7 +892,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 reinterpret_cast<int64_t*>(positions.data_ptr()),
                 insert_kv ? reinterpret_cast<int64_t*>(slot_mapping->data_ptr()) : nullptr,
                 (insert_kv && has_index) ? reinterpret_cast<int64_t*>(index_slot_mapping->data_ptr()) : nullptr,
-                insert_kv ? reinterpret_cast<opus::fp8_t*>(kv_cache->data_ptr()) : nullptr,
+                insert_kv ? reinterpret_cast<opus::fp8_t*>(kv_cache_k->data_ptr()) : nullptr,
+                insert_kv ? reinterpret_cast<opus::fp8_t*>(kv_cache_v->data_ptr()) : nullptr,
                 (insert_kv && has_index) ? reinterpret_cast<T*>(index_cache->data_ptr())
                                          : nullptr,
                 insert_kv ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr,
@@ -633,12 +905,17 @@ static void fused_qknorm_idxrqknorm_impl(
                 nkv,
                 niq,
                 static_cast<int>(block_size),
-                kv_s_block,
-                kv_s_kv,
-                kv_s_token,
-                kv_s_head,
+                x,
+                max_kv_tokens,
+                k_s_block,
+                k_s_token,
+                k_s_head,
+                v_s_block,
+                v_s_token,
+                v_s_head,
                 has_index,
                 insert_kv,
+                asm_layout,
                 stream);
         }
         else
@@ -658,7 +935,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 reinterpret_cast<int64_t*>(positions.data_ptr()),
                 insert_kv ? reinterpret_cast<int64_t*>(slot_mapping->data_ptr()) : nullptr,
                 (insert_kv && has_index) ? reinterpret_cast<int64_t*>(index_slot_mapping->data_ptr()) : nullptr,
-                insert_kv ? reinterpret_cast<T*>(kv_cache->data_ptr()) : nullptr,
+                insert_kv ? reinterpret_cast<T*>(kv_cache_k->data_ptr()) : nullptr,
+                insert_kv ? reinterpret_cast<T*>(kv_cache_v->data_ptr()) : nullptr,
                 (insert_kv && has_index) ? reinterpret_cast<T*>(index_cache->data_ptr())
                                          : nullptr,
                 nullptr,
@@ -670,12 +948,17 @@ static void fused_qknorm_idxrqknorm_impl(
                 nkv,
                 niq,
                 static_cast<int>(block_size),
-                kv_s_block,
-                kv_s_kv,
-                kv_s_token,
-                kv_s_head,
+                x,
+                max_kv_tokens,
+                k_s_block,
+                k_s_token,
+                k_s_head,
+                v_s_block,
+                v_s_token,
+                v_s_head,
                 has_index,
                 insert_kv,
+                asm_layout,
                 stream);
         }
     });
@@ -695,12 +978,14 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> index_k_norm_weight,
     int64_t num_index_heads,
     std::optional<aiter_tensor_t> slot_mapping,
-    std::optional<aiter_tensor_t> kv_cache,
+    std::optional<aiter_tensor_t> kv_cache_k,
+    std::optional<aiter_tensor_t> kv_cache_v,
     std::optional<aiter_tensor_t> index_cache,
     int64_t block_size,
     std::optional<aiter_tensor_t> q_out,
     std::optional<aiter_tensor_t> index_q_out,
-    std::optional<aiter_tensor_t> index_slot_mapping)
+    std::optional<aiter_tensor_t> index_slot_mapping,
+    bool asm_layout)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
@@ -715,7 +1000,8 @@ void fused_qknorm_idxrqknorm(
                                                 index_k_norm_weight,
                                                 num_index_heads,
                                                 slot_mapping,
-                                                kv_cache,
+                                                kv_cache_k,
+                                                kv_cache_v,
                                                 index_cache,
                                                 block_size,
                                                 q_out,
@@ -723,7 +1009,8 @@ void fused_qknorm_idxrqknorm(
                                                 index_slot_mapping,
                                                 "auto",
                                                 std::nullopt,
-                                                std::nullopt);
+                                                std::nullopt,
+                                                asm_layout);
 }
 
 void fused_qknorm_idxrqknorm_fp8(
@@ -740,7 +1027,8 @@ void fused_qknorm_idxrqknorm_fp8(
     const aiter_tensor_t& index_k_norm_weight,
     int64_t num_index_heads,
     const aiter_tensor_t& slot_mapping,
-    aiter_tensor_t& kv_cache,
+    std::optional<aiter_tensor_t> kv_cache_k,
+    std::optional<aiter_tensor_t> kv_cache_v,
     aiter_tensor_t& index_cache,
     int64_t block_size,
     aiter_tensor_t& q_out,
@@ -748,7 +1036,8 @@ void fused_qknorm_idxrqknorm_fp8(
     const aiter_tensor_t& index_slot_mapping,
     const std::string& kv_cache_dtype,
     const aiter_tensor_t& k_scale,
-    const aiter_tensor_t& v_scale)
+    const aiter_tensor_t& v_scale,
+    bool asm_layout)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
@@ -763,7 +1052,8 @@ void fused_qknorm_idxrqknorm_fp8(
                                                 index_k_norm_weight,
                                                 num_index_heads,
                                                 slot_mapping,
-                                                kv_cache,
+                                                kv_cache_k,
+                                                kv_cache_v,
                                                 index_cache,
                                                 block_size,
                                                 q_out,
@@ -771,7 +1061,8 @@ void fused_qknorm_idxrqknorm_fp8(
                                                 index_slot_mapping,
                                                 kv_cache_dtype,
                                                 k_scale,
-                                                v_scale);
+                                                v_scale,
+                                                asm_layout);
 }
 
 } // namespace aiter
