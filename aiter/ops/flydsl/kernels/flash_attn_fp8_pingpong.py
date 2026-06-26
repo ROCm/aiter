@@ -150,9 +150,9 @@ def build_flash_attn_fp8_module(
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
 
-        def _sched(mask, n):
+        def _sched_barrier():
             if USE_MANUAL_SCHED:
-                rocdl.sched_group_barrier(mask, n, 0)
+                rocdl.sched_barrier(0)
 
         def _iglp():
             if USE_IGLP:
@@ -312,9 +312,7 @@ def build_flash_attn_fp8_module(
             )
 
         def _gpu_barrier():
-            llvm.InlineAsmOp(
-                None, [], "s_barrier", "", has_side_effects=True
-            )
+            llvm.InlineAsmOp(None, [], "s_barrier", "", has_side_effects=True)
 
         q_row = q_start + wave_q_offset + lo
         q_in_bounds = q_row < seq_len_v
@@ -401,13 +399,11 @@ def build_flash_attn_fp8_module(
                     vw[(u + PREFETCH_DEPTH) % 4] = read_v_pack(
                         v_off, un // PV_K_STEPS, un % PV_K_STEPS
                     )
-                    _sched(rocdl.mask_dsrd, 4)
                 else:
                     ki = u - (PV_UNITS - PREFETCH_DEPTH)
                     kw_prime[ki] = _load_k_unit(k_buf_off, ki // K_STEPS, ki % K_STEPS)
-                    _sched(rocdl.mask_dsrd, 2)
+                _sched_barrier()
                 o[dt] = mfma.call(vw[u % 4], p_ks_list[ks], o[dt])
-                _sched(rocdl.mask_mfma, 1)
             return o, l2, kw_prime
 
         QK_UNITS = N_KV_TILES * K_STEPS  # 8 (nt outer, ks inner)
@@ -442,13 +438,11 @@ def build_flash_attn_fp8_module(
                     kw[(u + PREFETCH_DEPTH) % 4] = _load_k_unit(
                         k_buf_off, un // K_STEPS, un % K_STEPS
                     )
-                    _sched(rocdl.mask_dsrd, 2)
                 else:
                     vi = u - (QK_UNITS - PREFETCH_DEPTH)
                     vw_prime[vi] = read_v_pack(v_off, vi // PV_K_STEPS, vi % PV_K_STEPS)
-                    _sched(rocdl.mask_dsrd, 4)
+                _sched_barrier()
                 s_accs[nt] = mfma.call(kw[u % 4], q_packs[ks], s_accs[nt])
-                _sched(rocdl.mask_mfma, 1)
             return s_accs, vw_prime
 
         def do_softmax(s_accs, m_running, is_g1=False):
@@ -548,6 +542,7 @@ def build_flash_attn_fp8_module(
 
         _wait_lgkmcnt()
         if is_g0:
+
             def g0_iter0():
                 _, k_buf_off, _, _, v_next = _bufs(fx.Index(0))
                 dma_v(v_next, fx.Index(BLOCK_N))
@@ -652,6 +647,7 @@ def build_flash_attn_fp8_module(
             of3 = o_fin[3]
             lf = l_fin_g
         else:
+
             def g1_iter0():
                 _, k_buf_off, _, k_next, _ = _bufs(fx.Index(0))
                 dma_k(k_next, fx.Index(BLOCK_N))
@@ -717,7 +713,9 @@ def build_flash_attn_fp8_module(
                     i_cur % fx.Index(NUM_BUF_V)
                 ) * fx.Index(LDS_V_TILE)
                 # PHASE 1 (mfma phase): softmax(i-1) | DMA K^{i+1}.
-                m_sm, corr_sm, p_sm, prowsum_sm = do_softmax([ss0, ss1, ss2, ss3], m_r, True)
+                m_sm, corr_sm, p_sm, prowsum_sm = do_softmax(
+                    [ss0, ss1, ss2, ss3], m_r, True
+                )
                 # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
                 oB, lB, kw_prime = apply_pv(
                     [oo0, oo1, oo2, oo3],
