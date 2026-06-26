@@ -137,7 +137,9 @@ def _reference_quant(y: torch.Tensor):
     return q, yscale
 
 
-def _assert_norm_close(actual: torch.Tensor, expected: torch.Tensor, dtype: torch.dtype):
+def _assert_norm_close(
+    actual: torch.Tensor, expected: torch.Tensor, dtype: torch.dtype
+):
     if dtype is torch.float32:
         atol, rtol = 1e-4, 1e-4
     elif dtype is torch.float16:
@@ -185,9 +187,7 @@ def test_flydsl_rmsnorm_quant_matches_torch(smooth: bool):
     xscale = (torch.rand((n,), device="cuda", dtype=dtype) + 0.5).contiguous()
 
     if smooth:
-        out, yscale = _flydsl_rmsnorm_quant_compile(
-            x, weight, eps, xscale=xscale
-        )
+        out, yscale = _flydsl_rmsnorm_quant_compile(x, weight, eps, xscale=xscale)
         ref_y = _reference_rmsnorm(x, weight, eps) * xscale.float()
     else:
         out, yscale = _flydsl_rmsnorm_quant_compile(x, weight, eps)

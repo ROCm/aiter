@@ -115,7 +115,9 @@ def _flydsl_add_layernorm_quant_compile(
     dtype_str = _kernel_dtype(x.dtype)
     if xscale is None:
         launch_fn = build_fused_add_layernorm_dynamicquant_module(n, dtype_str, eps=eps)
-        _run_compiled(launch_fn, x, residual, weight, bias, out, residual_out, yscale, m)
+        _run_compiled(
+            launch_fn, x, residual, weight, bias, out, residual_out, yscale, m
+        )
     else:
         launch_fn = build_fused_add_layernorm_smoothquant_module(n, dtype_str, eps=eps)
         _run_compiled(
@@ -154,7 +156,9 @@ def _reference_quant(y: torch.Tensor):
     return q, yscale
 
 
-def _assert_norm_close(actual: torch.Tensor, expected: torch.Tensor, dtype: torch.dtype):
+def _assert_norm_close(
+    actual: torch.Tensor, expected: torch.Tensor, dtype: torch.dtype
+):
     if dtype is torch.float32:
         atol, rtol = 1e-4, 1e-4
     elif dtype is torch.float16:
@@ -186,9 +190,7 @@ def test_flydsl_add_layernorm_matches_torch():
     x, weight, bias = _make_input(m, n, dtype, seed=1)
     residual = torch.randn_like(x).contiguous()
 
-    out, residual_out = _flydsl_add_layernorm_compile(
-        x, residual, weight, bias, eps
-    )
+    out, residual_out = _flydsl_add_layernorm_compile(x, residual, weight, bias, eps)
     residual_ref = (x + residual).float()
     ref = _reference_layernorm(x + residual, weight, bias, eps)
 
