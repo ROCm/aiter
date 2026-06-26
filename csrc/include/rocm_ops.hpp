@@ -1923,7 +1923,11 @@ namespace py = pybind11;
             py::arg("q_scale")           = std::nullopt,                                \
             py::arg("quant_group_size")  = 64,                                          \
             py::arg("scale_dtype")       = std::string("e8m0"),                         \
-            py::arg("q_rope_buff")       = std::nullopt);                               \
+            py::arg("q_rope_buff")       = std::nullopt,                                \
+            py::arg("swa_nope_scale_buff") = std::nullopt,                              \
+            py::arg("swa_rope_buff")     = std::nullopt,                                \
+            py::arg("state_slot_mapping") = std::nullopt,                               \
+            py::arg("batch_id_per_token") = std::nullopt);                              \
     m.def("fused_kv_norm_rope_group_quant",                                             \
             &aiter::fused_kv_norm_rope_group_quant,                                     \
             py::arg("kv"),                                                              \

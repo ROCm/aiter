@@ -198,7 +198,19 @@ void fused_qk_norm_rope_group_quant(
     const std::string& scale_dtype = "e8m0",
     // q_rope_buff: rotated Q-PE (bf16) [num_tokens, num_heads, pe_dim], required when Q is fp8
     // (Q mirrors K: nope fp8 + inline scale in q_nope_scale_buff, PE bf16 here). Unused for bf16 Q.
-    std::optional<aiter_tensor_t> q_rope_buff = std::nullopt);
+    std::optional<aiter_tensor_t> q_rope_buff = std::nullopt,
+    // --- Optional fused SWA ring-cache write (decode-only) ---
+    // swa_nope_scale_buff: ring [num_slots, cache_size, entry] mirroring k_nope_scale_buff's
+    //   nope fp8 + inline-scale layout (same dtype/width).
+    // swa_rope_buff: ring [num_slots, cache_size, pe_dim] bf16 mirroring k_rope_buff.
+    // state_slot_mapping: [bs] int32 per-seq ring slot. batch_id_per_token: [num_tokens] int32,
+    //   token->seq (-1 = CG-pad, skipped). The K row is scattered to
+    //   swa_*[state_slot_mapping[batch_id_per_token[t]], positions[t] % cache_size, :].
+    // All four must be provided together, or all omitted (no SWA write).
+    std::optional<aiter_tensor_t> swa_nope_scale_buff = std::nullopt,
+    std::optional<aiter_tensor_t> swa_rope_buff = std::nullopt,
+    std::optional<aiter_tensor_t> state_slot_mapping = std::nullopt,
+    std::optional<aiter_tensor_t> batch_id_per_token = std::nullopt);
 
 // K-only fused RMSNorm + GPT-J/NeoX RoPE + 1xG e8m0 group-quant for the
 // V4-Pro Attention.forward inference path (no Q wave). Scatters into a PAGED

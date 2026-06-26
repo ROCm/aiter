@@ -481,6 +481,111 @@ def test_flydsl_hca_fp8(bs, ratio=128, D=512, RD=64, G=64):
     return {"us_kernel": us_kernel, "err_pct": e_nope}
 
 
+@benchmark()
+def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
+    """CSA Main FP8 nm-asm group-quant: single-kernel ``flydsl_fused_compress_attn``
+    (overlap=True, ratio=4, quant_mode='group_fp8') writes the V4 nm layout (nope fp8 +
+    inline dup e8m0 + separate bf16 rope) -- byte-compatible with HCA Main. Validated
+    against the shared pure-torch ``fused_compress_attn_reference(group_quant=True)``.
+    """
+    from aiter.ops.flydsl.kernels.fused_compress_attn import flydsl_fused_compress_attn
+
+    shape = _shape_by_label("csa_main")
+    _, D, RD, ratio, overlap, *_ = shape
+    G = 64
+    nope_dim = D - RD
+    n_groups = nope_dim // G
+    inp = _build_inputs(shape, bs, mtp, "decode")
+    nb = inp["kv_cache"].shape[0]
+    kpb = inp["k_per_block"]
+
+    common = dict(
+        kv_in=inp["kv_in"],
+        score_in=inp["score_in"],
+        kv_state=inp["kv_state"],
+        score_state=inp["score_state"],
+        plan_gpu=inp["plan_gpu"],
+        state_slot_mapping=inp["state_slot_mapping"],
+        ape=inp["ape"],
+        rms_weight=inp["rms_weight"],
+        rms_eps=inp["rms_eps"],
+        cos_cache=inp["cos_cache"],
+        sin_cache=inp["sin_cache"],
+        block_tables=inp["block_tables"],
+        k_per_block=kpb,
+        overlap=overlap,
+        ratio=ratio,
+        head_dim=D,
+        rope_head_dim=RD,
+    )
+
+    fly_entry = torch.zeros(nb, kpb, D, dtype=dtypes.fp8)
+    fly_rope = torch.zeros(nb, kpb, RD, dtype=torch.bfloat16)
+    _, us_kernel = run_perftest(
+        flydsl_fused_compress_attn,
+        **common,
+        kv_cache=fly_entry,
+        quant=True,
+        quant_mode="group_fp8",
+        preshuffle=False,
+        cache_scale=None,
+        k_rope_cache=fly_rope,
+    )
+
+    ref_entry = torch.zeros(nb, kpb, D, dtype=dtypes.fp8)
+    ref_rope = torch.zeros(nb, kpb, RD, dtype=torch.bfloat16)
+    fused_compress_attn_reference(
+        kv_in=inp["kv_in"],
+        score_in=inp["score_in"],
+        kv_state=inp["kv_state"],
+        score_state=inp["score_state"],
+        plan_gpu=inp["plan_gpu"],
+        state_slot_mapping=inp["state_slot_mapping"],
+        ape=inp["ape"],
+        rms_weight=inp["rms_weight"],
+        rms_eps=inp["rms_eps"],
+        cos_cache=inp["cos_cache"],
+        sin_cache=inp["sin_cache"],
+        kv_cache=ref_entry,
+        block_tables=inp["block_tables"],
+        k_per_block=kpb,
+        overlap=overlap,
+        ratio=ratio,
+        head_dim=D,
+        rope_head_dim=RD,
+        group_quant=True,
+        quant_group_size=G,
+        k_rope_buff=ref_rope,
+    )
+
+    bt = inp["block_tables"]
+    fly_nope, fly_sc, fly_pe = _gather_nm_fp8(
+        fly_entry, fly_rope, bt, bs, nope_dim, n_groups
+    )
+    ref_nope, ref_sc, ref_pe = _gather_nm_fp8(
+        ref_entry, ref_rope, bt, bs, nope_dim, n_groups
+    )
+    fly_sf = (fly_sc.to(torch.int32) << 23).view(torch.float32)
+    ref_sf = (ref_sc.to(torch.int32) << 23).view(torch.float32)
+    fly_deq = fly_nope.float() * fly_sf.unsqueeze(-1).expand(bs, n_groups, G).reshape(
+        bs, nope_dim
+    )
+    ref_deq = ref_nope.float() * ref_sf.unsqueeze(-1).expand(bs, n_groups, G).reshape(
+        bs, nope_dim
+    )
+    msg = f"csa_main/nm_asm_fp8 bs={bs}"
+    e_nope = checkAllclose(
+        fly_deq, ref_deq, atol=0.05, rtol=0.02, tol_err_ratio=0.05, msg=f"{msg} nope"
+    )
+    checkAllclose(
+        fly_sc.float(), ref_sc.float(), atol=1.0, rtol=0.0, msg=f"{msg} scale(e8m0 +-1)"
+    )
+    checkAllclose(
+        fly_pe.float(), ref_pe.float(), atol=0.02, rtol=0.02, msg=f"{msg} rope(bf16)"
+    )
+    return {"us_kernel": us_kernel, "err_pct": e_nope}
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -541,6 +646,14 @@ parser.add_argument(
     32..1022 kw1, >=1023 kw4). Set to empty to skip the fp8 sweep.
     e.g.: --fp8-bs 1 64 1024""",
 )
+parser.add_argument(
+    "--csa-fp8-bs",
+    type=int,
+    nargs="*",
+    default=[1, 16, 64, 256],
+    help="""Batch sizes for the CSA Main nm-asm fp8 group-quant check (flydsl
+    single-kernel quant_mode='group_fp8' vs torch group_quant ref). Empty to skip.""",
+)
 
 args = parser.parse_args()
 
@@ -562,6 +675,9 @@ for bs in args.fp8_bs:
     fp8_df.append(test_flydsl_hca_fp8(bs))
 if fp8_df:
     df.extend(fp8_df)
+# CSA Main nm-asm fp8 check (flydsl single-kernel group-quant vs torch reference).
+for bs in args.csa_fp8_bs:
+    df.append(test_flydsl_csa_nm_asm_fp8(bs))
 df = pd.DataFrame(df)
 aiter.logger.info(
     "flydsl_compress_attn summary (markdown):\n%s", df.to_markdown(index=False)

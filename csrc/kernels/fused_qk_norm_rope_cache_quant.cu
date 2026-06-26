@@ -3971,7 +3971,23 @@ namespace aiter {
         int page_size;
         int kcache_block_stride, kcache_row_stride;  // nope+scale paged cache
         int krope_block_stride, krope_row_stride;     // rope paged cache
+        // --- Plan-based compressed-K scatter (PLAN_BASED template path) ---
+        int compress_ratio;
+        int block_table_seq_stride;
+        // --- Fused SWA ring-cache write (decode-only, QK kernel) ---
+        // When the QK kernel additionally scatters the post-norm/rope K row into a
+        // per-request sliding-window ring, the dest row is
+        //   swa_nope[slot*swa_nope_slot_stride + (pos%swa_cache_size)*swa_nope_row_stride]
+        //   swa_rope[slot*swa_rope_slot_stride + (pos%swa_cache_size)*swa_rope_row_stride]
+        // where slot = state_slot_mapping[batch_id_per_token[token]]. The ring mirrors
+        // the main cache's two-buffer split (nope fp8+inline-scale, rope bf16). Strides
+        // are in element units (cache_t for nope, scalar_t for rope). Unused (0) when
+        // SWA pointers are null. Ignored by the K-only kernel.
+        int swa_cache_size;
+        int swa_nope_slot_stride, swa_nope_row_stride;
+        int swa_rope_slot_stride, swa_rope_row_stride;
     };
+
 
     // ============================================================================
     // K wave body (shared between fuse_qk_norm_rope_group_quant_cache_kernel_impl
@@ -3993,14 +4009,15 @@ namespace aiter {
     // ============================================================================
     template <typename scalar_t, typename cache_t,
               vllm::Fp8KVCacheDataType kv_dt, bool is_neox,
-              int HEAD_DIM = 512, int PE_DIM = 64, int GROUP_SIZE = 64>
+              int HEAD_DIM = 512, int PE_DIM = 64, int GROUP_SIZE = 64,
+              bool HAS_SWA = false, typename rope_t = scalar_t>
     __device__ inline void k_wave_norm_rope_group_quant_impl(
         const scalar_t* __restrict__ kv,         // [num_tokens, (NK=1,) head_dim]
         cache_t*        __restrict__ kv_cache,   // [num_tokens, (NK=1,) head_dim]
-        scalar_t*       __restrict__ k_pe_out,   // [num_tokens, (NK=1,) pe_dim] bf16
+        rope_t*         __restrict__ k_pe_out,   // [num_tokens, (NK=1,) pe_dim] (rope_t, e.g. bf16)
         const scalar_t* __restrict__ k_weight,   // [head_dim]
-        const scalar_t* __restrict__ cos_ptr,    // pre-offset by positions[token_idx]
-        const scalar_t* __restrict__ sin_ptr,    // pre-offset by positions[token_idx]
+        const rope_t*   __restrict__ cos_ptr,    // pre-offset by positions[token_idx] (rope_t)
+        const rope_t*   __restrict__ sin_ptr,    // pre-offset by positions[token_idx] (rope_t)
         float eps,
         const MlaKernelParams& __restrict__ params,
         int32_t token_idx, int32_t tid,
@@ -4008,7 +4025,14 @@ namespace aiter {
         // QK passes token_idx*stride (token-contiguous); the K-only kernel passes
         // the paged slot offset (block*block_stride + off*row_stride) so the same
         // body writes either layout without branching on paging here.
-        int64_t out_cache_offset, int64_t out_rope_offset)
+        int64_t out_cache_offset, int64_t out_rope_offset,
+        // --- Optional fused SWA ring-cache write (decode-only, QK caller) ---
+        // When HAS_SWA && write_swa the same post-norm/rope K row (nope fp8+
+        // inline-scale and rope bf16) is also scattered into the SWA ring.
+        cache_t*  __restrict__ swa_nope = nullptr,
+        rope_t*   __restrict__ swa_rope = nullptr,
+        bool write_swa = false,
+        int64_t swa_cache_offset = 0, int64_t swa_rope_offset = 0)
     {
       // ---- Compile-time constants (collapsed by the compiler at every callsite) ----
       constexpr int32_t head_size = HEAD_DIM;
@@ -4017,10 +4041,10 @@ namespace aiter {
       // Elements/lane to cover one head in a single wave = HEAD_DIM/WARP_SIZE
       // (wave64: 8; wave32: 16). WARP_SIZE is the device-resolved wavefront size; safe in
       // this __device__ constexpr (using it in __launch_bounds__/template args would trip
-      // the host-pass ICE trap). fp32 is dead code; cap at 4 (no 32B opus float vector).
+      // the host-pass ICE trap). fp32 input uses vec=8 too (load_vector_nbytes does the
+      // 32B as 2x float4 chunks); rope_t (cos/sin/rope-out) is decoupled (e.g. bf16).
       constexpr int32_t kWave = WARP_SIZE;
-      constexpr int32_t vec_size_i =
-          std::is_same_v<scalar_t, float> ? 4 : ((HEAD_DIM / 8 <= kWave) ? 8 : 16);
+      constexpr int32_t vec_size_i = (HEAD_DIM / 8 <= kWave) ? 8 : 16;
       constexpr int32_t vec_size_o = vec_size_i;
       constexpr uint32_t nope_vec  = nope_dim / vec_size_o;
       constexpr uint32_t vec_stride = kWave;
@@ -4068,8 +4092,15 @@ namespace aiter {
       auto* ptr_o = kv_cache + kv_cache_offset + nope_offset;
       auto buffer_kv = opus::make_gmem<scalar_t>(kv_ptr, oob_i * sizeof(scalar_t));
       auto buffer_o  = opus::make_gmem<cache_t>(ptr_o, oob_o * sizeof(cache_t));
+      // SWA ring nope dest (mirrors ptr_o / buffer_o). Only dereferenced under HAS_SWA.
+      cache_t* ptr_swa_o = nullptr;
+      if constexpr (HAS_SWA) {
+        ptr_swa_o = write_swa ? (swa_nope + swa_cache_offset + nope_offset) : nullptr;
+      }
+      auto buffer_swa_o  = opus::make_gmem<cache_t>(
+          ptr_swa_o != nullptr ? ptr_swa_o : ptr_o, oob_o * sizeof(cache_t));
 
-      // Unified vec load: all 64 lanes load vec_size_i contiguous elements.
+      // Unified vec load: all lanes load vec_size_i contiguous elements.
       // For head_dim < 64*vec_size_i (e.g. 128, 192, 256, 384) the trailing
       // lanes have tid*vec_size_i >= head_dim and would OOB on a raw pointer
       // load. We use opus buffer descriptors (which return 0 for OOB) so the
@@ -4113,8 +4144,9 @@ namespace aiter {
           const bool is_x_half = (pe_local_tid < half_pe_threads);
           const int32_t cos_base =
               (is_x_half ? pe_local_tid : (pe_local_tid - half_pe_threads)) * vec_size_i;
-          const opus_vec_i cos_v = *reinterpret_cast<const opus_vec_i*>(cos_ptr + cos_base);
-          const opus_vec_i sin_v = *reinterpret_cast<const opus_vec_i*>(sin_ptr + cos_base);
+          using rope_vec_i = opus::vector_t<rope_t, vec_size_i>;
+          const rope_vec_i cos_v = *reinterpret_cast<const rope_vec_i*>(cos_ptr + cos_base);
+          const rope_vec_i sin_v = *reinterpret_cast<const rope_vec_i*>(sin_ptr + cos_base);
           #pragma unroll
           for (int i = 0; i < vec_size_i; i++) {
             pe_cos[i] = static_cast<float>(cos_v[i]);
@@ -4124,7 +4156,7 @@ namespace aiter {
           // GPT-J: lane reads cos/sin[pe_local_tid*(vec_size_i/2) .. +vec_size_i/2),
           // i.e. one freq per adjacent (2k, 2k+1) pair.
           constexpr int32_t half_vec = vec_size_i / 2;
-          using opus_vec_half = opus::vector_t<scalar_t, half_vec>;
+          using opus_vec_half = opus::vector_t<rope_t, half_vec>;
           const int32_t cos_base = pe_local_tid * half_vec;
           const opus_vec_half cos_v = *reinterpret_cast<const opus_vec_half*>(cos_ptr + cos_base);
           const opus_vec_half sin_v = *reinterpret_cast<const opus_vec_half*>(sin_ptr + cos_base);
@@ -4185,9 +4217,15 @@ namespace aiter {
             // Compiler folds to a shift since GROUP_SIZE / vec_size_i is power-of-2.
             const int group_id = tid / reduce_thread_size;  // 0..num_nope_groups-1
             auto* tmp = reinterpret_cast<uint8_t*>(ptr_o + nope_dim);
-            const uint16_t scale_pair =
-                static_cast<uint16_t>(s.byte) | (static_cast<uint16_t>(s.byte) << 8);
-            *reinterpret_cast<uint16_t*>(tmp + group_id * 2) = scale_pair;
+            tmp[group_id * 2]     = s.byte;
+            tmp[group_id * 2 + 1] = s.byte;
+            if constexpr (HAS_SWA) {
+              if (write_swa) {
+                auto* swa_tmp = reinterpret_cast<uint8_t*>(ptr_swa_o + nope_dim);
+                swa_tmp[group_id * 2]     = s.byte;
+                swa_tmp[group_id * 2 + 1] = s.byte;
+              }
+            }
           }
           inv_scale = is_nope_thread ? (1.0f / s.dq_scale) : 0.0f;
         } else {
@@ -4203,6 +4241,11 @@ namespace aiter {
             vec_out[i] = opus::cast<cache_t>(k_normed[i] * inv_scale);
           }
           store_vector<cache_t, cache_t, vec_size_o>(buffer_o, vec_out, nope_out_offset);
+          if constexpr (HAS_SWA) {
+            if (write_swa) {
+              store_vector<cache_t, cache_t, vec_size_o>(buffer_swa_o, vec_out, nope_out_offset);
+            }
+          }
         }
       } else {
         // bf16/fp16/fp32 cache: just store the normed value (no quant).
@@ -4214,11 +4257,21 @@ namespace aiter {
             vec_out_k[i] = static_cast<cache_t>(k_normed[i]);
           }
           store_vector<cache_t, cache_t, vec_size_o>(buffer_o, vec_out_k, nope_out_offset);
+          if constexpr (HAS_SWA) {
+            if (write_swa) {
+              store_vector<cache_t, cache_t, vec_size_o>(buffer_swa_o, vec_out_k, nope_out_offset);
+            }
+          }
         }
       }
 
       // ---- Step 4 (pe threads only): RoPE on the normed bf16 -> separate k_pe_out ----
-      scalar_t* k_out_rope = k_pe_out + out_rope_offset;  // dest row (token-contig or paged slot)
+      rope_t* k_out_rope = k_pe_out + out_rope_offset;  // dest row (token-contig or paged slot)
+      // SWA ring rope dest (mirrors k_out_rope). Only written under HAS_SWA.
+      rope_t* swa_out_rope = nullptr;
+      if constexpr (HAS_SWA) {
+        swa_out_rope = write_swa ? (swa_rope + swa_rope_offset) : nullptr;
+      }
       if (is_pe_lane) {
         const int32_t pe_local_tid = tid - pe_tid_start;  // 0..(pe_dim/vec_size_i - 1)
         if constexpr (is_neox) {
@@ -4235,7 +4288,11 @@ namespace aiter {
             float rot = is_x_half
                             ? (my_val * pe_cos[i] - pair_val * pe_sin[i])
                             : (my_val * pe_cos[i] + pair_val * pe_sin[i]);
-            k_out_rope[pe_local_tid * vec_size_i + i] = static_cast<scalar_t>(rot);
+            const rope_t rot_s = static_cast<rope_t>(rot);
+            k_out_rope[pe_local_tid * vec_size_i + i] = rot_s;
+            if constexpr (HAS_SWA) {
+              if (write_swa) swa_out_rope[pe_local_tid * vec_size_i + i] = rot_s;
+            }
           }
         } else {
           // GPT-J: pairs are adjacent (0,1), (2,3), ... within each thread's vec;
@@ -4246,8 +4303,16 @@ namespace aiter {
             float fky = k_normed[i + 1];
             float f32_cos = pe_cos[i >> 1];
             float f32_sin = pe_sin[i >> 1];
-            k_out_rope[pe_local_tid * vec_size_i + i]     = static_cast<scalar_t>(fkx * f32_cos - fky * f32_sin);
-            k_out_rope[pe_local_tid * vec_size_i + i + 1] = static_cast<scalar_t>(fky * f32_cos + fkx * f32_sin);
+            const rope_t r0 = static_cast<rope_t>(fkx * f32_cos - fky * f32_sin);
+            const rope_t r1 = static_cast<rope_t>(fky * f32_cos + fkx * f32_sin);
+            k_out_rope[pe_local_tid * vec_size_i + i]     = r0;
+            k_out_rope[pe_local_tid * vec_size_i + i + 1] = r1;
+            if constexpr (HAS_SWA) {
+              if (write_swa) {
+                swa_out_rope[pe_local_tid * vec_size_i + i]     = r0;
+                swa_out_rope[pe_local_tid * vec_size_i + i + 1] = r1;
+              }
+            }
           }
         }
       }
@@ -4257,7 +4322,7 @@ namespace aiter {
               bool is_neox,
               // --- NEW (flydsl-alignment) compile-time options ---
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
-              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int WAVE = 64>
+              int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1>
     __device__ void fuse_qk_norm_rope_group_quant_cache_kernel_impl(
         const scalar_t* __restrict__ q,       // [num_tokens, num_heads, head_dim]
         const scalar_t* __restrict__ kv,      // [num_tokens, (k_num_heads,) head_dim]
@@ -4272,7 +4337,12 @@ namespace aiter {
         const scalar_t *__restrict__ cos_cache,
         const scalar_t *__restrict__ sin_cache,
         float eps,
-        const MlaKernelParams& __restrict__ params
+        const MlaKernelParams& __restrict__ params,
+        // --- Optional fused SWA ring-cache write (decode-only). Null when unused. ---
+        cache_t*  __restrict__ swa_nope = nullptr,           // ring nope+scale, mirrors kv_cache
+        scalar_t* __restrict__ swa_rope = nullptr,           // ring rope bf16, mirrors k_pe_out
+        const int32_t* __restrict__ state_slot_mapping = nullptr,  // [bs] per-seq ring slot
+        const int32_t* __restrict__ batch_id_per_token = nullptr   // [T] token->seq, -1 = skip
     ) {
       // ---- All compile-time constants ----
       constexpr int32_t head_size = HEAD_DIM;
@@ -4280,16 +4350,15 @@ namespace aiter {
       constexpr int32_t nope_dim = head_size - pe_dim;
       // Elements/lane to cover one head with a single wave = HEAD_DIM/WARP_SIZE
       // (wave64: 8 for head=512; wave32: 16). WARP_SIZE is the device-resolved wavefront
-      // size; safe in this __device__ constexpr (matches the shared K-wave body). The trailing
-      // WAVE template param is kept for API compatibility but is no longer consulted, so the
-      // Q path is wave-generic without an extra per-wave-size instantiation.
+      // size; safe in this __device__ constexpr (matches the shared K-wave body), so the Q
+      // path is wave-generic without an extra per-wave-size instantiation.
       // fp32 is a dead-code instantiation; cap at 4 (no 32-byte opus float vector).
       constexpr int32_t kWave = WARP_SIZE;
       constexpr int32_t vec_size_i =
           std::is_same_v<scalar_t, float> ? 4 : ((HEAD_DIM / 8 <= kWave) ? 8 : 16);
       constexpr int32_t vec_size_o = vec_size_i;
       constexpr uint32_t nope_vec = nope_dim / vec_size_o;
-      constexpr uint32_t vec_stride = 64;
+      constexpr uint32_t vec_stride = kWave;
       constexpr int32_t GROUP_SIZE = 64;
       // V4 layout is always nope-first: nope occupies [0:nope_dim), pe the tail.
       constexpr int32_t nope_offset = 0;
@@ -4342,9 +4411,36 @@ namespace aiter {
             static_cast<int64_t>(token_idx) * params.token_stride;
         const int64_t out_rope_offset =
             static_cast<int64_t>(token_idx) * params.k_pe_out_stride_0;
-        k_wave_norm_rope_group_quant_impl<scalar_t, cache_t, kv_dt, is_neox, HEAD_DIM>(
-            kv, kv_cache, k_pe_out, k_weight, cos_ptr, sin_ptr, eps, params,
-            token_idx, static_cast<int32_t>(tid), out_cache_offset, out_rope_offset);
+        // Optional fused SWA ring scatter (decode-only): write the same post-norm/rope
+        // K row into swa_*[slot, pos%cache_size, :], slot = state_slot_mapping[bid].
+        // CG-pad tokens (bid < 0) are skipped.
+        bool write_swa = false;
+        int64_t swa_cache_offset = 0, swa_rope_offset = 0;
+        if (swa_nope != nullptr) {
+          const int32_t bid = batch_id_per_token[token_idx];
+          if (bid >= 0) {
+            const int64_t slot = static_cast<int64_t>(state_slot_mapping[bid]);
+            const int32_t ring =
+                static_cast<int32_t>(positions[token_idx]) % params.swa_cache_size;
+            write_swa = true;
+            swa_cache_offset = slot * params.swa_nope_slot_stride
+                             + static_cast<int64_t>(ring) * params.swa_nope_row_stride;
+            swa_rope_offset  = slot * params.swa_rope_slot_stride
+                             + static_cast<int64_t>(ring) * params.swa_rope_row_stride;
+          }
+        }
+        if (swa_nope != nullptr) {
+          k_wave_norm_rope_group_quant_impl<scalar_t, cache_t, kv_dt, is_neox,
+                                            HEAD_DIM, /*PE_DIM=*/64, /*GROUP_SIZE=*/64, true>(
+              kv, kv_cache, k_pe_out, k_weight, cos_ptr, sin_ptr, eps, params,
+              token_idx, static_cast<int32_t>(tid), out_cache_offset, out_rope_offset,
+              swa_nope, swa_rope, write_swa, swa_cache_offset, swa_rope_offset);
+        } else {
+          k_wave_norm_rope_group_quant_impl<scalar_t, cache_t, kv_dt, is_neox,
+                                            HEAD_DIM, /*PE_DIM=*/64, /*GROUP_SIZE=*/64, false>(
+              kv, kv_cache, k_pe_out, k_weight, cos_ptr, sin_ptr, eps, params,
+              token_idx, static_cast<int32_t>(tid), out_cache_offset, out_rope_offset);
+        }
       } else { // Q processing — multi-head loop
       // ============ Q Processing: RMS norm + optional q_weight + RoPE + optional fp8 group quant ============
       // Layout: every thread `tid` owns elements [tid*vec_size_i .. tid*vec_size_i+vec_size_i).
@@ -4361,7 +4457,8 @@ namespace aiter {
       const int64_t token_q_base = static_cast<int64_t>(token_idx) * params.q_stride_0;
       const int64_t token_qout_base = static_cast<int64_t>(token_idx) * params.q_out_stride_0;
 
-      // Q-quant constants. Q_REDUCE must be in {1,2,4,8,16,32,64} and Q_GROUP_SIZE must divide head_dim.
+      // Q-quant constants. Q_REDUCE must be a supported power-of-two group width and
+      // Q_GROUP_SIZE must divide head_dim.
       constexpr int32_t Q_REDUCE = Q_GROUP_SIZE / vec_size_i;
       constexpr int32_t Q_NUM_GROUPS = head_size / Q_GROUP_SIZE;
       static_assert(head_size % Q_GROUP_SIZE == 0, "head_size must be divisible by Q_GROUP_SIZE");
@@ -4585,7 +4682,7 @@ namespace aiter {
     // Fine-grained variant (FlyDSL-style decomposition) -- auto-selected for the
     // xlarge prefill tier (T >= ~8k, num_tokens <= 65535); ~5-17% faster there.
     // ---------------------------------------------------------------------------
-    // One block == one wave (64 threads) == exactly ONE (token, head) tile:
+    // One block == one wave == exactly ONE (token, head) tile:
     //   grid.x = num_heads + 1 (head; 0 -> K, 1.. -> Q), grid.y = num_tokens.
     // Mirrors flydsl: no head loop, no tokens-per-block packing, head on the fast
     // grid dim (co-scheduled blocks read contiguous q[token,*,:] rows). It also
@@ -4605,7 +4702,7 @@ namespace aiter {
     template <typename scalar_t, typename cache_t, typename query_t,
               vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, bool is_neox,
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
-              int HEAD_DIM = 512, int WAVE = 64>
+              int HEAD_DIM = 512>
     __device__ void fuse_qk_norm_rope_finegrained_impl(
         const scalar_t* __restrict__ q,
         const scalar_t* __restrict__ kv,
@@ -4632,9 +4729,8 @@ namespace aiter {
       constexpr int32_t nope_dim = head_size - pe_dim;
       // Elements/lane to cover one head with a single wave = HEAD_DIM/WARP_SIZE
       // (wave64: 8 for head=512; wave32: 16). WARP_SIZE is the device-resolved wavefront
-      // size; safe in this __device__ constexpr (matches the shared K-wave body). The trailing
-      // WAVE template param is kept for API compatibility but is no longer consulted, so the
-      // Q path is wave-generic without an extra per-wave-size instantiation.
+      // size; safe in this __device__ constexpr (matches the shared K-wave body), so the Q
+      // path is wave-generic without an extra per-wave-size instantiation.
       // fp32 is a dead-code instantiation; cap at 4 (no 32-byte opus float vector).
       constexpr int32_t kWave = WARP_SIZE;
       constexpr int32_t vec_size_i =
@@ -4699,7 +4795,7 @@ namespace aiter {
             if (is_nope_thread) amax_raw = fmaxf(amax_raw, fabsf(val * static_cast<float>(vec_k_weight[i])));
           }
         }
-        // Fused butterfly: row-sum over all 64 lanes; group-amax only over the
+        // Fused butterfly: row-sum over all lanes; group-amax only over the
         // last log2(reduce_thread_size) steps (offset < group width) so the two
         // shuffle chains overlap (the LLVM scheduler hides one behind the other).
         #pragma unroll
@@ -4969,13 +5065,19 @@ namespace aiter {
         const scalar_t *__restrict__ sin_cache,
         float eps,
         const MlaKernelParams params,
-        bool is_neox
+        bool is_neox,
+        // Optional fused SWA ring-cache write (decode-only). Null when unused.
+        cache_t*  __restrict__ swa_nope = nullptr,
+        scalar_t* __restrict__ swa_rope = nullptr,
+        const int32_t* __restrict__ state_slot_mapping = nullptr,
+        const int32_t* __restrict__ batch_id_per_token = nullptr
     ) {
       #define DISPATCH_NEOX(NEOX) \
         fuse_qk_norm_rope_group_quant_cache_kernel_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, \
             Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, TOKENS_PER_BLOCK>( \
             q, kv, k_pe_out, k_weight, q_weight, kv_cache, q_out, q_scale_raw, q_rope_out, positions, \
-            cos_cache, sin_cache, eps, params)
+            cos_cache, sin_cache, eps, params, \
+            swa_nope, swa_rope, state_slot_mapping, batch_id_per_token)
 
       if (is_neox) { DISPATCH_NEOX(true); }
       else         { DISPATCH_NEOX(false); }
@@ -4988,6 +5090,8 @@ namespace aiter {
 // Requires the following constexpr/locals in scope at the call site:
 //   head_dim_val, tokens_per_block_val, q_group_size_val, q_scale_fp32_val, has_q_weight_val
 //   q_weight_ptr (scalar_t*, may be nullptr), q_scale_ptr (void*, may be nullptr)
+//   swa_nope_ptr (CACHE_T*, may be nullptr), swa_rope_ptr (scalar_t*, may be nullptr),
+//   swa_slot_map_ptr / swa_bid_ptr (const int32_t*, may be nullptr)
 #define CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
          aiter::fuse_qk_norm_rope_group_quant_cache_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, \
                  q_group_size_val, q_scale_fp32_val, has_q_weight_val, head_dim_val, tokens_per_block_val> \
@@ -5006,7 +5110,11 @@ namespace aiter {
                  reinterpret_cast<const KV_T*>(sin_cache.data_ptr()),                                    \
                  static_cast<float>(eps),                                                                \
                  mla_params,                                                                             \
-                 is_neox);
+                 is_neox,                                                                                \
+                 reinterpret_cast<CACHE_T*>(swa_nope_ptr),                                               \
+                 reinterpret_cast<KV_T*>(swa_rope_ptr),                                                  \
+                 reinterpret_cast<const int32_t*>(swa_slot_map_ptr),                                     \
+                 reinterpret_cast<const int32_t*>(swa_bid_ptr));
 
 // Fine-grained launcher (1 wave / (token,head); grid=(num_tokens,num_heads+1), block=64).
 // Same arg list / scope requirements as the coarse macro above.
@@ -5048,7 +5156,18 @@ void fused_qk_norm_rope_group_quant(
     std::optional<aiter_tensor_t> q_scale,
     int64_t quant_group_size,
     const std::string& scale_dtype,
-    std::optional<aiter_tensor_t> q_rope_buff)
+    std::optional<aiter_tensor_t> q_rope_buff,
+    // --- Optional fused SWA ring-cache write (decode-only) ---
+    // Mirrors the main K output's two-buffer split into a per-request sliding-window
+    // ring: swa_nope_scale_buff [num_slots, cache_size, entry] (same nope fp8+inline-scale
+    // layout as k_nope_scale_buff) and swa_rope_buff [num_slots, cache_size, pe_dim] bf16.
+    // The K row is scattered to swa_*[state_slot_mapping[batch_id_per_token[t]],
+    // positions[t] % cache_size, :]. Tokens with batch_id < 0 (CG-pad) are skipped.
+    // All four must be provided together, or all omitted (no SWA write).
+    std::optional<aiter_tensor_t> swa_nope_scale_buff,
+    std::optional<aiter_tensor_t> swa_rope_buff,
+    std::optional<aiter_tensor_t> state_slot_mapping,
+    std::optional<aiter_tensor_t> batch_id_per_token)
 {
   int num_tokens = q.size(0);
   int head_dim   = kv.size(-1);
@@ -5162,6 +5281,46 @@ void fused_qk_norm_rope_group_quant(
   mla_params.num_tokens = num_tokens;
   mla_params.num_heads = num_heads;
 
+  // --- Optional fused SWA ring-cache write (decode-only) ---
+  // All four SWA tensors must be provided together or all omitted.
+  const bool has_swa = swa_nope_scale_buff.has_value();
+  void* swa_nope_ptr     = nullptr;
+  void* swa_rope_ptr     = nullptr;
+  void* swa_slot_map_ptr = nullptr;
+  void* swa_bid_ptr      = nullptr;
+  if (has_swa) {
+    AITER_CHECK(swa_rope_buff.has_value() && state_slot_mapping.has_value()
+                && batch_id_per_token.has_value(),
+                "SWA write requires swa_nope_scale_buff, swa_rope_buff, "
+                "state_slot_mapping and batch_id_per_token together");
+    // swa_nope ring: [num_slots, cache_size, entry] — must mirror k_nope_scale_buff dtype
+    // (the V4 reader expects the same nope fp8 + inline-scale entry layout) and have the
+    // same per-row width. swa_rope ring: [num_slots, cache_size, pe_dim] bf16.
+    AITER_CHECK(swa_nope_scale_buff->dim() == 3 && swa_rope_buff->dim() == 3,
+                "swa_*_buff must be 3D [num_slots, cache_size, entry/pe_dim]");
+    AITER_CHECK(swa_nope_scale_buff->dtype() == k_nope_scale_buff.dtype(),
+                "swa_nope_scale_buff dtype must match k_nope_scale_buff");
+    AITER_CHECK(swa_rope_buff->dtype() == k_rope_buff.dtype(),
+                "swa_rope_buff dtype must match k_rope_buff");
+    const int swa_cache_size = static_cast<int>(swa_nope_scale_buff->size(1));
+    AITER_CHECK(swa_rope_buff->size(1) == swa_cache_size,
+                "swa_nope_scale_buff and swa_rope_buff must share cache_size (dim 1)");
+    AITER_CHECK(state_slot_mapping->dtype() == AITER_DTYPE_i32
+                && batch_id_per_token->dtype() == AITER_DTYPE_i32,
+                "state_slot_mapping / batch_id_per_token must be int32");
+    AITER_CHECK(batch_id_per_token->size(0) >= num_tokens,
+                "batch_id_per_token length must be >= num_tokens");
+    mla_params.swa_cache_size       = swa_cache_size;
+    mla_params.swa_nope_slot_stride = static_cast<int>(swa_nope_scale_buff->stride(0));
+    mla_params.swa_nope_row_stride  = static_cast<int>(swa_nope_scale_buff->stride(1));
+    mla_params.swa_rope_slot_stride = static_cast<int>(swa_rope_buff->stride(0));
+    mla_params.swa_rope_row_stride  = static_cast<int>(swa_rope_buff->stride(1));
+    swa_nope_ptr     = swa_nope_scale_buff->data_ptr();
+    swa_rope_ptr     = swa_rope_buff->data_ptr();
+    swa_slot_map_ptr = state_slot_mapping->data_ptr();
+    swa_bid_ptr      = batch_id_per_token->data_ptr();
+  }
+
   // --- Pointer locals used by CALL macro ---
   void* q_weight_ptr   = has_q_weight ? q_weight->data_ptr()   : nullptr;
   void* q_scale_ptr    = (q_is_fp8 && q_scale.has_value()) ? q_scale->data_ptr() : nullptr;
@@ -5242,7 +5401,24 @@ void fused_qk_norm_rope_group_quant(
   // At mid T (256-2048) the coarse path's per-wave head aggregation (one cos/sin
   // gather reused across HPW heads) wins, so we only switch to FG for the xlarge
   // tier. grid.y == num_tokens, so cap at 65535 (larger T would need a Y-chunk loop).
-  const bool use_finegrained = use_xlarge_prefill && (num_tokens <= 65535);
+  // Fine-grained (1 wave / (token,head)) is the xlarge-prefill default. It also
+  // wins for *many-head* shapes in the large tier: with H>=128 (e.g. DeepSeek-V4
+  // at TP=1) the coarse HPW=8 path serializes 8 heads/wave with a long
+  // load->2-pass-reduce->store chain, while FG's finer split hides the memory
+  // latency better. Measured on an idle MI355 (fp8 quant): H=128 large tier is
+  // ~3-14% faster under FG (T=2048..4096); H<=32 stays on coarse (FG regresses
+  // few-head shapes ~6-10%), and H=64 is mixed so it stays coarse too.
+  constexpr int FG_MANY_HEADS_MIN = 128;
+  const bool use_finegrained =
+      (num_tokens <= 65535)
+      && (use_xlarge_prefill
+          || (use_large_prefill && num_heads >= FG_MANY_HEADS_MIN));
+  // The fine-grained kernel (xlarge prefill) does not carry the SWA scatter. SWA is a
+  // decode-only fusion (tiny T -> use_decode_path), so this should never collide; assert
+  // rather than silently drop the ring write.
+  AITER_CHECK(!(has_swa && use_finegrained),
+              "fused SWA ring write is not supported on the fine-grained (xlarge prefill) "
+              "path; SWA is decode-only");
   auto launch_all = [&](auto group_size_tag, auto scale_fp32_tag, auto has_qw_tag) {
     constexpr int  head_dim_val      = 512;
     constexpr int  q_group_size_val  = decltype(group_size_tag)::value;
@@ -5328,50 +5504,76 @@ void fused_qk_norm_rope_group_quant(
 //   apply_rotary_emb(kv[..., -rd:], freqs_cis)                         -> RoPE on PE
 //   act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, inplace=True) -> nope fp8 + e8m0
 // ============================================================================
+// PLAN_BASED=false: per-token flat slot_mapping + positions (vLLM-style paged write,
+//   used by the SWA / generic decode K-only path).
+// PLAN_BASED=true: compress path -- resolve the paged dest + RoPE position IN-KERNEL
+//   from the SGLang-style `plan` ([cap,4] = ragged_id,batch_id,position,window_len) +
+//   `block_table`, so NO host slot_mapping/comp_pos build is needed (the plan is the
+//   MTP-aware / CG-safe source of truth, like flydsl Kernel B / fused_compress). `kv`
+//   is the pre-pooled compressed K [cap, head_dim]; row = pid. ci = position/ratio,
+//   slot_in_block = ci%page_size, physical_block = block_table[batch_id, ci/page_size],
+//   comp_pos = ci*ratio. Sentinel rows (position<0) bail -> CG-safe fixed grid.
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt,
           bool is_neox, int HEAD_DIM = 512, int PE_DIM = 64,
-          int GROUP_SIZE = 64, int TOKENS_PER_BLOCK = 1>
+          int GROUP_SIZE = 64, int TOKENS_PER_BLOCK = 1, bool PLAN_BASED = false,
+          typename rope_t = scalar_t>
 __device__ void fuse_kv_norm_rope_group_quant_cache_kernel_impl(
     const scalar_t* __restrict__ kv,           // [num_tokens, (NK=1,) head_dim]
-    scalar_t*       __restrict__ k_rope_buff,  // paged rope cache [num_blocks, page_size, pe_dim] bf16 (MQA)
+    rope_t*         __restrict__ k_rope_buff,  // paged rope cache (rope_t, e.g. bf16) -- decoupled from input
     const scalar_t* __restrict__ k_weight,     // [head_dim]
     cache_t*        __restrict__ k_nope_scale_buff,  // paged nope+scale cache [num_blocks, page_size, head_dim] fp8 (MQA)
-    const int64_t*  __restrict__ positions,    // [num_tokens]
-    const int64_t*  __restrict__ slot_mapping, // [num_tokens] flat slot = block*page_size + offset
-    const scalar_t* __restrict__ cos_cache,    // [max_position, pe_dim/2]
-    const scalar_t* __restrict__ sin_cache,    // [max_position, pe_dim/2]
+    const int64_t*  __restrict__ positions,    // [num_tokens] (PLAN_BASED: unused)
+    const int64_t*  __restrict__ slot_mapping, // [num_tokens] flat slot (PLAN_BASED: unused)
+    const rope_t*   __restrict__ cos_cache,    // [max_position, pe_dim/2] (rope_t, e.g. bf16)
+    const rope_t*   __restrict__ sin_cache,    // [max_position, pe_dim/2] (rope_t, e.g. bf16)
     float eps,
-    const MlaKernelParams& __restrict__ params)
+    const MlaKernelParams& __restrict__ params,
+    const int32_t*  __restrict__ plan = nullptr,        // [cap,4] (PLAN_BASED only)
+    const int32_t*  __restrict__ block_table = nullptr) // [bs, max_blocks] (PLAN_BASED only)
 {
-  // Wave-level indexing: each wave handles one token; no Q grid.y dimension.
+  // Wave-level indexing: each wave handles one token / plan row.
   const uint32_t wave_id = threadIdx.x / WARP_SIZE;
   const int32_t  tid     = static_cast<int32_t>(threadIdx.x % WARP_SIZE);
   const int32_t  token_idx =
       static_cast<int32_t>(blockIdx.x) * TOKENS_PER_BLOCK + wave_id;
   if (token_idx >= params.num_tokens) return;
 
-  // Paged destination: slot_mapping[token] is the flat slot into the paged
-  // cache; split into (block, offset) so a padded block stride (kcache_block_stride
-  // != page_size*row_stride) is honored. A negative slot marks a skipped token.
-  const int64_t slot = slot_mapping[token_idx];
-  if (slot < 0) return;
-  const int64_t block  = slot / params.page_size;
-  const int64_t offset = slot % params.page_size;
-  const int64_t out_cache_offset =
-      block * params.kcache_block_stride + offset * params.kcache_row_stride;
-  const int64_t out_rope_offset =
-      block * params.krope_block_stride + offset * params.krope_row_stride;
+  int64_t out_cache_offset, out_rope_offset;
+  int32_t cos_sin_pos;
+  if constexpr (PLAN_BASED) {
+    // Compress path: resolve dest + RoPE position from plan + block_table in-kernel.
+    const int32_t batch_id = plan[token_idx * 4 + 1];
+    const int32_t position = plan[token_idx * 4 + 2];
+    if (position < 0) return;  // sentinel
+    const int32_t ratio         = params.compress_ratio;
+    const int32_t ci            = position / ratio;
+    const int32_t block_in_seq  = ci / params.page_size;
+    const int32_t slot_in_block = ci % params.page_size;
+    const int32_t physical_block =
+        block_table[static_cast<int64_t>(batch_id) * params.block_table_seq_stride + block_in_seq];
+    out_cache_offset = static_cast<int64_t>(physical_block) * params.kcache_block_stride
+                     + static_cast<int64_t>(slot_in_block) * params.kcache_row_stride;
+    out_rope_offset  = static_cast<int64_t>(physical_block) * params.krope_block_stride
+                     + static_cast<int64_t>(slot_in_block) * params.krope_row_stride;
+    cos_sin_pos = ci * ratio;  // comp_pos
+  } else {
+    // Generic path: per-token flat slot_mapping (negative slot = skipped token).
+    const int64_t slot = slot_mapping[token_idx];
+    if (slot < 0) return;
+    const int64_t block  = slot / params.page_size;
+    const int64_t offset = slot % params.page_size;
+    out_cache_offset = block * params.kcache_block_stride + offset * params.kcache_row_stride;
+    out_rope_offset  = block * params.krope_block_stride + offset * params.krope_row_stride;
+    cos_sin_pos = static_cast<int32_t>(positions[token_idx]);
+  }
 
-  // RoPE cos/sin pointers (per-token, shared by the wave). Tables are laid out
-  // [max_pos, PE_DIM/2] (GPT-J reuse-front-part style), so each token-row is
-  // (PE_DIM/2) elements wide -- match that exactly here regardless of PE_DIM.
-  const int32_t cos_sin_offset =
-      static_cast<int32_t>(positions[token_idx]) * (PE_DIM >> 1);
-  const scalar_t* cos_ptr = cos_cache + cos_sin_offset;
-  const scalar_t* sin_ptr = sin_cache + cos_sin_offset;
+  // RoPE cos/sin pointers. Tables [max_pos, PE_DIM/2] (GPT-J reuse-front-part style).
+  const int32_t cos_sin_offset = cos_sin_pos * (PE_DIM >> 1);
+  const rope_t* cos_ptr = cos_cache + cos_sin_offset;
+  const rope_t* sin_ptr = sin_cache + cos_sin_offset;
 
   k_wave_norm_rope_group_quant_impl<scalar_t, cache_t, kv_dt, is_neox,
-                                    HEAD_DIM, PE_DIM, GROUP_SIZE>(
+                                    HEAD_DIM, PE_DIM, GROUP_SIZE, /*HAS_SWA=*/false, rope_t>(
       kv, k_nope_scale_buff, k_rope_buff, k_weight, cos_ptr, sin_ptr, eps, params,
       token_idx, tid, out_cache_offset, out_rope_offset);
 }
@@ -5382,35 +5584,39 @@ __device__ void fuse_kv_norm_rope_group_quant_cache_kernel_impl(
 // bound holds for both. Literal because WARP_SIZE is not an ICE in the host compile pass.
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt,
           int HEAD_DIM = 512, int PE_DIM = 64, int GROUP_SIZE = 64,
-          int TOKENS_PER_BLOCK = 1>
+          int TOKENS_PER_BLOCK = 1, bool PLAN_BASED = false, typename rope_t = scalar_t>
 __global__ __launch_bounds__(TOKENS_PER_BLOCK * 64, 512 / (TOKENS_PER_BLOCK * 64))
 void fuse_kv_norm_rope_group_quant_cache_kernel(
     const scalar_t* __restrict__ kv,
-    scalar_t*       __restrict__ k_rope_buff,
+    rope_t*         __restrict__ k_rope_buff,
     const scalar_t* __restrict__ k_weight,
     cache_t*        __restrict__ k_nope_scale_buff,
     const int64_t*  __restrict__ positions,
     const int64_t*  __restrict__ slot_mapping,
-    const scalar_t* __restrict__ cos_cache,
-    const scalar_t* __restrict__ sin_cache,
+    const rope_t*   __restrict__ cos_cache,
+    const rope_t*   __restrict__ sin_cache,
     float eps,
     const MlaKernelParams params,
-    bool is_neox)
+    bool is_neox,
+    const int32_t* __restrict__ plan = nullptr,         // [cap,4] (PLAN_BASED only)
+    const int32_t* __restrict__ block_table = nullptr)  // [bs, max_blocks] (PLAN_BASED only)
 {
   if (is_neox) {
     fuse_kv_norm_rope_group_quant_cache_kernel_impl<scalar_t, cache_t, kv_dt, true,
                                                     HEAD_DIM, PE_DIM, GROUP_SIZE,
-                                                    TOKENS_PER_BLOCK>(
+                                                    TOKENS_PER_BLOCK, PLAN_BASED, rope_t>(
         kv, k_rope_buff, k_weight, k_nope_scale_buff, positions, slot_mapping,
-        cos_cache, sin_cache, eps, params);
+        cos_cache, sin_cache, eps, params, plan, block_table);
   } else {
     fuse_kv_norm_rope_group_quant_cache_kernel_impl<scalar_t, cache_t, kv_dt, false,
                                                     HEAD_DIM, PE_DIM, GROUP_SIZE,
-                                                    TOKENS_PER_BLOCK>(
+                                                    TOKENS_PER_BLOCK, PLAN_BASED, rope_t>(
         kv, k_rope_buff, k_weight, k_nope_scale_buff, positions, slot_mapping,
-        cos_cache, sin_cache, eps, params);
+        cos_cache, sin_cache, eps, params, plan, block_table);
   }
 }
+
+
 
 } // namespace aiter
 

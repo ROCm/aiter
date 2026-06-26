@@ -54,29 +54,13 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, rocdl, scf
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.runtime.device import get_rocm_arch as _get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from .tensor_shim import STensor, _to_raw, _run_compiled
-
-# FP8 quant helpers (same MX RoundUp e8m0 + cvt_pk_fp8 path as the C++ k_wave /
-# qk_norm_rope_quant, so the fp8 entry layout is byte-identical across kernels).
-from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
-from aiter.utility.mx_types import (
-    MxDtypeInt as _MxD,
-    MX_DEFAULT_ROUND_MODE as _MX_DEFAULT_MODE,
-)
-
-
-@lru_cache(maxsize=1)
-def _hca_fp8_mx_dtype():
-    # gfx942 (MI300) ships e4m3fnuz; gfx950+ (MI355) ships OCP e4m3fn. Matches
-    # the C++ kHwFp8E4m3Dtype selection so the e8m0 scale + fp8 bytes align.
-    return _MxD.FP8_E4M3_FNUZ if _get_hip_arch() == "gfx942" else _MxD.FP8_E4M3
-
+from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
 
 # Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
 # (the multi-wave LDS kernel references CompilationContext, STensor,
@@ -987,94 +971,31 @@ def _build_norm_rope_scatter_kernel(
             out_rsrc = buffer_ops.create_buffer_resource(kv_cache, max_size=True)
 
             if const_expr(quant):
-                # ---- FP8 nope (1xG e8m0) + inline dup scale ; bf16 rope -> separate buf ----
-                c0f = arith.constant(0.0, type=f32)
-                c_neg_uf = arith.constant(-(2.0**-8), type=f32)
-                # group-amax of |normed| over the RTS-thread group (shuffle_xor within group)
-                amax_g = _to_raw(arith.constant(0.0, type=f32))
-                for i in range_constexpr(VEC):
-                    nv = arith.subf(c0f, normed_lane[i])
-                    av = arith.maximumf(normed_lane[i], nv)
-                    amax_g = arith.maximumf(amax_g, av)
-                for sh in range_constexpr(log2_rts):
-                    off = RTS >> (sh + 1)
-                    peer = _to_raw(ArithValue(amax_g).shuffle_xor(off, WAVE))
-                    amax_g = arith.maximumf(amax_g, peer)
-                e8m0 = emit_mx_e8m0_scale(
-                    amax_g, mode=_MX_DEFAULT_MODE, dtype=_hca_fp8_mx_dtype()
-                )
-                quant_exp = arith.constant(254, type=i32) - e8m0
-                inv_scale = (quant_exp << arith.constant(23, type=i32)).bitcast(f32)
-
-                is_nope = arith.cmpi(
-                    CmpIPredicate.slt,
-                    _to_raw(lane),
-                    arith.constant(ROPE_THREAD_LO, type=i32),
-                )
-                _if_nope = scf.IfOp(is_nope)
-                with _if_then(_if_nope):
-                    # pack VEC=8 fp8 -> 2 dwords (with e4m3fnuz -0->+0 clamp)
-                    safe = []
-                    for i in range_constexpr(VEC):
-                        sv = arith.MulFOp(
-                            normed_lane[i], inv_scale, fastmath=fm_fast
-                        ).result
-                        is_tn = arith.andi(
-                            arith.cmpf(CmpFPredicate.OLT, sv, c0f),
-                            arith.cmpf(CmpFPredicate.OGT, sv, c_neg_uf),
-                        )
-                        safe.append(arith.select(is_tn, c0f, sv))
-                    p0 = arith.constant(0, type=i32)
-                    p0 = rocdl.cvt_pk_fp8_f32(i32, safe[0], safe[1], p0, 0)
-                    p0 = rocdl.cvt_pk_fp8_f32(i32, safe[2], safe[3], p0, 1)
-                    p1 = arith.constant(0, type=i32)
-                    p1 = rocdl.cvt_pk_fp8_f32(i32, safe[4], safe[5], p1, 0)
-                    p1 = rocdl.cvt_pk_fp8_f32(i32, safe[6], safe[7], p1, 1)
-                    nope_off = ArithValue(cache_base) + tid_x_vec  # fp8: 1 byte/elem
-                    store_vec = vector.from_elements(T.vec(2, i32), [p0, p1])
-                    buffer_ops.buffer_store(
-                        store_vec, out_rsrc, _to_raw(nope_off), offset_is_bytes=True
-                    )
-                    # group leader writes the dup e8m0 scale byte (s,s) at [NOPE + 2*group_id]
-                    group_id = ArithValue(lane) >> arith.constant(log2_rts, type=i32)
-                    lane_in_group = ArithValue(lane) & arith.constant(RTS - 1, type=i32)
-                    is_leader = arith.cmpi(
-                        CmpIPredicate.eq, _to_raw(lane_in_group), c_zero_i32
-                    )
-                    _if_leader = scf.IfOp(is_leader)
-                    with _if_then(_if_leader):
-                        e8m0_i8 = arith.TruncIOp(T.i8, e8m0).result
-                        # fp8 buffer element == 1 byte, so element offset == byte
-                        # offset; store the e8m0 scale twice (dup) at [NOPE + 2*gid].
-                        sc_off = (
-                            ArithValue(cache_base)
-                            + arith.constant(NOPE, type=i32)
-                            + ArithValue(group_id) * arith.constant(2, type=i32)
-                        )
-                        buffer_ops.buffer_store(e8m0_i8, out_rsrc, _to_raw(sc_off))
-                        buffer_ops.buffer_store(
-                            e8m0_i8, out_rsrc, _to_raw(ArithValue(sc_off) + c_one_i32)
-                        )
-                # rope lanes: rotated bf16 -> separate k_rope_buff
-                _if_rope_q = scf.IfOp(is_rope_t)
-                with _if_then(_if_rope_q):
-                    rope_rel_q = ArithValue(lane) - arith.constant(
-                        ROPE_THREAD_LO, type=i32
-                    )
-                    krope_rsrc = buffer_ops.create_buffer_resource(
+                # -- group_fp8 (V4 nm-asm) via shared emitter (single source of truth
+                # shared with the CSA single-kernel; fp8 entry layout stays identical). --
+                _krope_base = ArithValue(physical_block) * ArithValue(
+                    krope_block_stride
+                ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                emit_group_fp8_nm_asm_scatter(
+                    normed_lane=normed_lane,
+                    rotated_lane=rotated_lane,
+                    lane=lane,
+                    is_rope_t=is_rope_t,
+                    cache_base=_to_raw(cache_base),
+                    out_rsrc=out_rsrc,
+                    krope_base=_to_raw(_krope_base),
+                    krope_rsrc=buffer_ops.create_buffer_resource(
                         k_rope_buff, max_size=True
-                    )
-                    krope_off = (
-                        ArithValue(physical_block) * ArithValue(krope_block_stride)
-                        + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
-                        + ArithValue(rope_rel_q) * arith.constant(VEC, type=i32)
-                    )
-                    rope_f32 = vector.from_elements(vecVf32, rotated_lane)
-                    rope_bf16 = rope_f32.truncf(T.vec(VEC, T.bf16))
-                    dwr = (VEC + 1) // 2
-                    rope_i32 = vector.bitcast(T.vec(dwr, i32), rope_bf16)
-                    krope_off_dw = ArithValue(krope_off) >> c_one_i32
-                    buffer_ops.buffer_store(rope_i32, krope_rsrc, _to_raw(krope_off_dw))
+                    ),
+                    VEC=VEC,
+                    NOPE=NOPE,
+                    RTS=RTS,
+                    log2_rts=log2_rts,
+                    ROPE_THREAD_LO=ROPE_THREAD_LO,
+                    wave_width=WAVE,
+                    vecVf32=vecVf32,
+                    fm_fast=fm_fast,
+                )
             else:
                 # ---- BF16 single-buffer scatter (nope + rope contiguous) ----
                 out_lane = [

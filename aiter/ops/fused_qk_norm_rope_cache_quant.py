@@ -339,6 +339,16 @@ def _fused_qk_norm_rope_group_quant_kernel(
     # q_rope_buff: rotated Q-PE bf16 [num_tokens, num_heads, pe_dim]; required when Q is fp8
     #   (fp8 Q mirrors K: nope fp8 + inline dup e8m0 scale in q_nope_scale_buff, PE bf16 here). None for bf16 Q.
     q_rope_buff: Optional[Tensor] = None,
+    # --- Optional fused SWA ring-cache write (decode-only) ---
+    # swa_nope_scale_buff: ring [num_slots, cache_size, entry] mirroring k_nope_scale_buff
+    #   (same nope fp8 + inline-scale layout/dtype). swa_rope_buff: ring [num_slots, cache_size, pe_dim] bf16.
+    # state_slot_mapping: [bs] int32 per-seq ring slot. batch_id_per_token: [num_tokens] int32,
+    #   token->seq (-1 = CG-pad, skipped). K row -> swa_*[slot, positions[t] % cache_size, :].
+    # All four together or all None.
+    swa_nope_scale_buff: Optional[Tensor] = None,
+    swa_rope_buff: Optional[Tensor] = None,
+    state_slot_mapping: Optional[Tensor] = None,
+    batch_id_per_token: Optional[Tensor] = None,
 ) -> None: ...
 
 
@@ -371,6 +381,15 @@ def fused_qk_norm_rope_group_quant(
     ] = None,  # optional per-channel Q RMSNorm weight [head_dim]
     quant_group_size: int = 64,
     scale_dtype: str = "e8m0",
+    # --- Optional fused SWA ring-cache write (decode-only) ---
+    # swa_nope_scale_buff: ring [num_slots, cache_size, entry] mirroring k_nope_scale_buff
+    #   (same nope fp8 + inline-scale layout/dtype). swa_rope_buff: ring [num_slots, cache_size, rot_dim] bf16.
+    # state_slot_mapping: [bs] int32 per-seq ring slot. batch_id_per_token: [num_tokens] int32 (-1 = skip).
+    # All four together or all None. Caller owns the ring buffers (persistent state cache).
+    swa_nope_scale_buff: Optional[Tensor] = None,
+    swa_rope_buff: Optional[Tensor] = None,
+    state_slot_mapping: Optional[Tensor] = None,
+    batch_id_per_token: Optional[Tensor] = None,
 ):
     """DeepSeek-V4 fused Q/K RMSNorm + RoPE + group-quant WITHOUT a paged KV cache.
 
@@ -473,6 +492,10 @@ def fused_qk_norm_rope_group_quant(
         quant_group_size=quant_group_size,
         scale_dtype=scale_dtype,
         q_rope_buff=q_rope_buff,
+        swa_nope_scale_buff=swa_nope_scale_buff,
+        swa_rope_buff=swa_rope_buff,
+        state_slot_mapping=state_slot_mapping,
+        batch_id_per_token=batch_id_per_token,
     )
     return q_nope_scale_buff, q_rope_buff, k_nope_scale_buff, k_rope_buff
 
