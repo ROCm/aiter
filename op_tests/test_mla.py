@@ -138,6 +138,7 @@ def test_mla(
     decode_qlen,
     split_per_batch=None,
     return_lse=False,
+    is_causal=True,
     sequential_page_indices=False,
 ):
     ret = {}
@@ -359,7 +360,7 @@ def test_mla(
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
-        is_causal=True,
+        is_causal=is_causal,
         dtype=out_dtype,
     )
 
@@ -588,6 +589,7 @@ def test_mla(
     if return_lse:
         pass
     elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+        8,
         16,
         32,
         64,
@@ -778,6 +780,7 @@ parser.add_argument(
     choices=[
         (4, 1),
         (8, 1),
+        (8, 2),
         (12, 1),
         (16, 1),
         (16, 2),
@@ -824,6 +827,13 @@ parser.add_argument(
     help="""Use kv_indices[i]=i (sequential physical page id) instead of random pages.
     Expands KV pool to cover ctx length (tests 64-bit page_idx * stride).""",
 )
+parser.add_argument(
+    "--causal",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="""Enable/disable causal masking. Default: True.
+    --causal / --no-causal""",
+)
 
 
 args = parser.parse_args()
@@ -849,6 +859,7 @@ for nhead, decode_qlen in args.nhead:
                 decode_qlen=decode_qlen,
                 split_per_batch=split_per_batch,
                 return_lse=args.return_lse,
+                is_causal=args.causal,
                 sequential_page_indices=args.sequential_page_indices,
             )
             df.append(ret)
