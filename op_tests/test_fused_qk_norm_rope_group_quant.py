@@ -355,6 +355,182 @@ def test_fused_qk_norm_rope_group_quant(
 
 
 # ============================================================================
+# SWA fused ring-cache write test
+# ============================================================================
+#
+# Decode-only fusion: the post-norm/rope K row is ALSO scattered into a per-request
+# sliding-window ring that mirrors the main K output's two-buffer split:
+#   swa_nope[slot, pos % cache_size, :] = k_nope_scale_buff[t]   (nope fp8 + dup e8m0 + pad)
+#   swa_rope[slot, pos % cache_size, :] = k_rope_buff[t]         (rope bf16)
+# where slot = state_slot_mapping[batch_id_per_token[t]]; batch_id == -1 (CG-pad) skips.
+#
+# Verification strategy: run the kernel, then REPLAY the scatter in python from the
+# kernel's own main K outputs and compare byte-exact to the SWA ring. This validates
+# the ring addressing + the verbatim entry copy (incl. the duplicated scale + pad)
+# independently of the quant math (which the main test above already checks vs ref).
+
+
+def _build_swa_batch(T, cache_size):
+    """Collision-free decode-ish batch layout: split the first ``real`` tokens into
+    ``bs`` contiguous sequences (distinct ring slot per seq, consecutive positions ->
+    distinct pos%cache_size within a seq), plus a couple of trailing CG-pad (bid=-1)
+    tokens that must be skipped by the kernel. Returns int32 batch_id [T], int64
+    positions [T], int32 state_slot_mapping [bs], num_slots, bs, n_pad."""
+    n_pad = min(2, T - 1) if T > 1 else 0
+    real = T - n_pad
+    # Pick bs so each seq has <= cache_size tokens (consecutive positions -> distinct
+    # pos%cache_size within a seq => collision-free ring writes). At least 4 seqs when
+    # there are enough tokens, to exercise multi-seq slot indirection.
+    min_bs = (real + cache_size - 1) // cache_size  # ceil(real / cache_size)
+    bs = max(min(4, real), min_bs)
+    counts = [real // bs + (1 if i < real % bs else 0) for i in range(bs)]
+    assert max(counts) <= cache_size, "per-seq token count must be <= cache_size"
+    bid_list, pos_list = [], []
+    for i, cnt in enumerate(counts):
+        base = int(torch.randint(0, 64, (1,)).item())
+        for j in range(cnt):
+            bid_list.append(i)
+            pos_list.append(base + j)
+    for _ in range(n_pad):
+        bid_list.append(-1)
+        pos_list.append(0)
+    bid = torch.tensor(bid_list, dtype=torch.int32, device=_DEV)
+    pos = torch.tensor(pos_list, dtype=torch.int64, device=_DEV)
+    num_slots = bs + 2  # extra slots to exercise the slot indirection
+    slot_map = torch.randperm(num_slots, device=_DEV)[:bs].to(torch.int32)
+    return bid, pos, slot_map, num_slots, bs, n_pad
+
+
+@benchmark()
+def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, GK=64):
+    NK = 1
+    torch.manual_seed(0)
+    random.seed(0)
+    nope = D - RD
+    eps = 1e-6
+    cache_size = 128  # DeepSeek-V4 sliding window
+    n_groups_k = nope // GK
+    entry = D
+
+    bid, pos, slot_map, num_slots, bs, n_pad = _build_swa_batch(T, cache_size)
+    cos, sin = _cos_sin(int(pos.max().item()) + 4, RD, torch.bfloat16)
+    q = (torch.randn(T, H, D, device=_DEV) * 0.1).bfloat16()
+    kv = (torch.randn(T, NK, D, device=_DEV) * 0.1).bfloat16()
+    kw = (torch.randn(D, device=_DEV).abs() + 0.5).bfloat16()
+
+    # K reference (vs the main cache outputs)
+    ref_k_nope, ref_k_scale, ref_k_pe, _ = _norm_rope_nope_fp8(
+        kv, kw, cos, sin, pos, eps, is_neox=is_neox, group_size=GK
+    )
+
+    # Main K/Q output buffers
+    q_nope_scale_buff = (
+        torch.zeros(T, H, entry, dtype=_FP8, device=_DEV)
+        if q_fp8
+        else torch.empty(T, H, D, dtype=torch.bfloat16, device=_DEV)
+    )
+    q_rope_buff = (
+        torch.empty(T, H, RD, dtype=torch.bfloat16, device=_DEV) if q_fp8 else None
+    )
+    k_nope_scale_buff = torch.zeros(T, NK, entry, dtype=_FP8, device=_DEV)
+    k_rope_buff = torch.empty(T, NK, RD, dtype=torch.bfloat16, device=_DEV)
+
+    # SWA ring buffers (zero-init: unwritten cells must stay zero for the byte-compare)
+    swa_nope = torch.zeros(num_slots, cache_size, entry, dtype=_FP8, device=_DEV)
+    swa_rope = torch.zeros(num_slots, cache_size, RD, dtype=torch.bfloat16, device=_DEV)
+
+    (q_nope_scale_buff, q_rope_buff, k_nope_scale_buff, k_rope_buff), us = run_perftest(
+        aiter.fused_qk_norm_rope_group_quant,
+        q,
+        kv,
+        kw,
+        pos,
+        cos,
+        sin,
+        eps,
+        is_neox=is_neox,
+        q_out_dtype=(_FP8 if q_fp8 else torch.bfloat16),
+        q_nope_scale_buff=q_nope_scale_buff,
+        q_rope_buff=q_rope_buff,
+        k_nope_scale_buff=k_nope_scale_buff,
+        k_rope_buff=k_rope_buff,
+        quant_group_size=G,
+        scale_dtype="e8m0",
+        swa_nope_scale_buff=swa_nope,
+        swa_rope_buff=swa_rope,
+        state_slot_mapping=slot_map,
+        batch_id_per_token=bid,
+    )
+
+    # --- Main K cache still correct (sanity vs reference) ---
+    k_nope_got = k_nope_scale_buff[..., :nope]
+    k_scale_pairs = (
+        k_nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups_k]
+        .contiguous()
+        .reshape(T, NK, n_groups_k, 2)
+    )
+    got_k_scale_f32 = (k_scale_pairs[..., 0].to(torch.int32) << 23).view(torch.float32)
+    ref_k_scale_f32 = (ref_k_scale.to(torch.int32) << 23).view(torch.float32)
+    k_deq = k_nope_got.float() * got_k_scale_f32.unsqueeze(-1).expand(
+        T, NK, n_groups_k, GK
+    ).reshape(T, NK, nope)
+    ref_k_deq = ref_k_nope.float() * ref_k_scale_f32.unsqueeze(-1).expand(
+        T, NK, n_groups_k, GK
+    ).reshape(T, NK, nope)
+    err_k = checkAllclose(k_deq, ref_k_deq, atol=0.05, rtol=0.02, msg="K-nope fp8")
+    err_kpe = checkAllclose(
+        k_rope_buff.float(), ref_k_pe.float(), atol=0.01, rtol=0.01, msg="K-pe bf16"
+    )
+
+    # --- SWA ring == replay(main K outputs) ---
+    # Build the expected ring by replaying the scatter from the kernel's own main K
+    # outputs (last-write-wins; the collision-free layout makes order irrelevant).
+    exp_nope = torch.zeros_like(swa_nope)
+    exp_rope = torch.zeros_like(swa_rope)
+    bid_cpu = bid.tolist()
+    pos_cpu = pos.tolist()
+    slot_cpu = slot_map.tolist()
+    n_written = 0
+    for t in range(T):
+        b = bid_cpu[t]
+        if b < 0:
+            continue
+        slot = slot_cpu[b]
+        ring = pos_cpu[t] % cache_size
+        exp_nope[slot, ring] = k_nope_scale_buff[t, 0]
+        exp_rope[slot, ring] = k_rope_buff[t, 0]
+        n_written += 1
+
+    # Byte-exact compare (pure copy): fp8 entry incl. nope + dup scale + pad, and rope bf16.
+    err_swa_nope = checkAllclose(
+        swa_nope.view(torch.uint8).float(),
+        exp_nope.view(torch.uint8).float(),
+        atol=0.0,
+        rtol=0.0,
+        msg="SWA nope+scale entry (byte-exact)",
+    )
+    err_swa_rope = checkAllclose(
+        swa_rope.float(),
+        exp_rope.float(),
+        atol=0.0,
+        rtol=0.0,
+        msg="SWA rope bf16 (exact)",
+    )
+
+    return {
+        "hip_us": round(us, 3),
+        "bs": bs,
+        "num_slots": num_slots,
+        "n_pad": n_pad,
+        "n_written": n_written,
+        "err_k": err_k,
+        "err_kpe": err_kpe,
+        "err_swa_nope": err_swa_nope,
+        "err_swa_rope": err_swa_rope,
+    }
+
+
+# ============================================================================
 # argparse + matrix sweep
 # ============================================================================
 
@@ -393,30 +569,71 @@ parser.add_argument(
 parser.add_argument(
     "--no-flydsl", action="store_true", help="skip the flydsl perf comparison."
 )
+parser.add_argument(
+    "--q-bf16", action="store_true", help="use bf16 Q (default: fp8 Q)."
+)
+parser.add_argument(
+    "--swa",
+    action="store_true",
+    help="run ONLY the fused SWA ring-cache write test (decode-only).",
+)
+parser.add_argument(
+    "--no-swa",
+    action="store_true",
+    help="skip the fused SWA ring-cache write test.",
+)
 args = parser.parse_args()
 
 neox_modes = [False, True] if args.neox else [False]
 
 rows = []
-q_fp8 = True
-for G, H, neox in itertools.product(args.G, args.H, neox_modes):
-    for T in args.T:
-        rows.append(
-            test_fused_qk_norm_rope_group_quant(
-                T,
-                H,
-                args.D,
-                args.RD,
-                is_neox=neox,
-                q_fp8=q_fp8,
-                G=G,
-                GK=64,
-                compare_flydsl=not args.no_flydsl,
+q_fp8 = not args.q_bf16
+if not args.swa:
+    for G, H, neox in itertools.product(args.G, args.H, neox_modes):
+        for T in args.T:
+            rows.append(
+                test_fused_qk_norm_rope_group_quant(
+                    T,
+                    H,
+                    args.D,
+                    args.RD,
+                    is_neox=neox,
+                    q_fp8=q_fp8,
+                    G=G,
+                    GK=64,
+                    compare_flydsl=not args.no_flydsl,
+                )
             )
-        )
 
-df = pd.DataFrame(rows)
-aiter.logger.info(
-    "fused_qk_norm_rope_group_quant (V4) summary (markdown):\n%s",
-    df.to_markdown(index=False),
-)
+    df = pd.DataFrame(rows)
+    aiter.logger.info(
+        "fused_qk_norm_rope_group_quant (V4) summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+
+# --- SWA fused ring-cache write sweep (decode-only; small T to stay off the
+# fine-grained xlarge path which does not carry the SWA scatter) ---
+if args.swa or not args.no_swa:
+    # cap T to the decode/med range (<= 1024) so the coarse kernel (shared K-wave
+    # body) runs; the fine-grained xlarge path asserts out SWA by design.
+    swa_T = [t for t in args.T if t <= 1024] or [16, 64, 256]
+    swa_rows = []
+    for G, H, neox in itertools.product(args.G, args.H, neox_modes):
+        for T in swa_T:
+            swa_rows.append(
+                test_fused_qk_norm_rope_group_quant_swa(
+                    T,
+                    H,
+                    args.D,
+                    args.RD,
+                    is_neox=neox,
+                    q_fp8=q_fp8,
+                    G=G,
+                    GK=64,
+                )
+            )
+    swa_df = pd.DataFrame(swa_rows)
+    aiter.logger.info(
+        "fused_qk_norm_rope_group_quant SWA ring-write summary (markdown):\n%s",
+        swa_df.to_markdown(index=False),
+    )
