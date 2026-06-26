@@ -35,11 +35,13 @@ from flydsl.expr.typing import T
 from flydsl._mlir.dialects import scf, vector as mlir_vector
 from flydsl._mlir.dialects.rocdl import mfma_f32_32x32x16_fp8_fp8 as _ods_mfma32x32x16
 from flydsl._mlir import ir
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+from flydsl.runtime.device import get_rocm_arch
 
 from .tensor_shim import GTensor, _run_compiled, _to_raw
 
 Vec = fx.Vector
+
+arch = get_rocm_arch()
 
 # --------------------------------------------------------------------------- #
 # MfmaAtom — bundles all MFMA-shape-derived constants and the rocdl functor.
@@ -685,16 +687,20 @@ def flydsl_fp8_mqa_logits(
     # dequant-as-FNUZ (= FN_value/2) * 0.5 -> requant-to-FNUZ, keeping all
     # values <= 120 < 240 (safely within FNUZ range). The 2x factor per FN
     # operand is compensated via kv_scales.
-    _fnuz = torch.float8_e4m3fnuz
-    convert_q_fn = Q.dtype != _fnuz
-    convert_kv_fn = KV.dtype != _fnuz
-    scale_mul = 1.0
-    if convert_q_fn:
-        scale_mul *= 2.0
-    if convert_kv_fn:
-        scale_mul *= 2.0
-    if scale_mul != 1.0:
-        kv_scales = kv_scales.to(torch.float32) * scale_mul
+    if arch == "gfx942":
+        _fnuz = torch.float8_e4m3fnuz
+        convert_q_fn = Q.dtype != _fnuz
+        convert_kv_fn = KV.dtype != _fnuz
+        scale_mul = 1.0
+        if convert_q_fn:
+            scale_mul *= 2.0
+        if convert_kv_fn:
+            scale_mul *= 2.0
+        if scale_mul != 1.0:
+            kv_scales = kv_scales.to(torch.float32) * scale_mul
+    else:
+        convert_q_fn = False
+        convert_kv_fn = False
 
     variant = _resolve_variant(variant)
 
