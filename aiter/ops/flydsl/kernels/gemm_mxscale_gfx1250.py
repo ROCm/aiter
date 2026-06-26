@@ -2046,7 +2046,7 @@ def compile_mxscale_gemm(
                     return grouped_accs_to_row_major(accs_in)
                 return accs_in
 
-            _effective_l2_pf = num_buffers + 1
+            _effective_l2_pf = 2 # num_buffers + 1
             if const_expr(use_cluster and _effective_l2_pf > 0):
                 _effective_l2_pf = max(1, _effective_l2_pf - 1)
 
@@ -2563,18 +2563,9 @@ def compile_mxscale_gemm(
 
                             addr_box = [cur_addr_lo]
 
-                            # Order: tensorcnt(signal) -> TDM -> L2 prefetch. The
-                            # prefetch is issued AFTER the TDM, so the next step's
-                            # s_wait_tensorcnt (which only counts TDMs) drains the
-                            # TDM while the L2 prefetch (not counted) keeps running.
-                            def _mid_tdm_ws(
+                            def _issue_tdm_ws(
                                 _ls=load_stage,
                                 _ab=addr_box,
-                                _k_off=(
-                                    split_k_base
-                                    + loop_iter * arith.index(num_buffers * tile_k)
-                                    + arith.index(buf_idx * tile_k)
-                                ),
                             ):
                                 dg0 = vector.from_elements(
                                     T.vec(4, T.i32),
@@ -2589,6 +2580,17 @@ def compile_mxscale_gemm(
                                     tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
                                 )
                                 _ab[0] = arith.addi(_ab[0], active_adv_i32)
+
+                            # L2 prefetch stays a mid-compute callback so it issues
+                            # inside the WMMA body (overlapping compute), separate
+                            # from the hoisted TDM above.
+                            def _mid_prefetch_ws(
+                                _k_off=(
+                                    split_k_base
+                                    + loop_iter * arith.index(num_buffers * tile_k)
+                                    + arith.index(buf_idx * tile_k)
+                                ),
+                            ):
                                 _l2_prefetch(_k_off)
 
                             if const_expr(tdm_as_in_prologue):
@@ -2602,6 +2604,14 @@ def compile_mxscale_gemm(
                                 if tdm_as_in_prologue
                                 else stages_as_idx[buf_idx]
                             )
+                            # Hoist the TDM to be the FIRST load after the fence
+                            # wait: issue it here (before compute's B/scale ds_loads)
+                            # so its global->LDS DMA overlaps the entire compute
+                            # body. sched_barrier(0) pins it -- the compiler may not
+                            # sink it below the ds_loads. The L2 prefetch still rides
+                            # the mid-compute callback (overlapping the WMMA body).
+                            rocdl.sched_barrier(0)
+                            _issue_tdm_ws()
                             rocdl.sched_barrier(0)
                             accs_in = compute_tile_scheduled(
                                 accs_in,
@@ -2609,7 +2619,7 @@ def compile_mxscale_gemm(
                                 stages_b_idx[buf_idx],
                                 _as_idx,
                                 stages_bs_idx[buf_idx],
-                                mid_compute_callback=_mid_tdm_ws,
+                                mid_compute_callback=_mid_prefetch_ws,
                             )
                             cur_addr_lo = addr_box[0]
                             hot_loop_scheduler_scheduled()
