@@ -136,6 +136,10 @@ def gemm_a16w16_(
         if config is None:
             config, _ = get_gemm_config("GEMM-A16W16", M, N, K)
 
+        kernel_type_from_config = config.pop("kernel_type", None)
+        if kernel_type_from_config is not None:
+            kernel_type = kernel_type_from_config
+
         BLOCK_M = config["BLOCK_M"]
         BLOCK_N = config["BLOCK_N"]
         BLOCK_K = config["BLOCK_K"]
@@ -166,20 +170,21 @@ def gemm_a16w16_(
         _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
         _DEPTH_SLACK = {"compute_bound": 1}
 
-        # Fall back to the bandwidth_bound kernel when the requested variant cannot
-        # satisfy its minimum pipeline depth for this K. The bandwidth_bound kernel
-        # has no such floor (min depth 1) and is valid for every K, so we downgrade
-        # rather than error.
-        depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
-        if depth_cap < _MIN_BUFFERS[kernel_type]:
-            needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
-            _LOGGER.info(
-                f"GEMM_A16W16 [gluon/gfx1250]: kernel_type='{kernel_type}' needs "
-                f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
-                f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='bandwidth_bound'."
-            )
-            kernel_type = "bandwidth_bound"
-            depth_cap = num_k_tiles  # bandwidth_bound: depth slack 0, min depth 1
+        if kernel_type_from_config is None:
+            # Fall back to the bandwidth_bound kernel when the requested variant
+            # cannot satisfy its minimum pipeline depth for this K.
+            depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
+            if depth_cap < _MIN_BUFFERS[kernel_type]:
+                needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
+                _LOGGER.info(
+                    f"GEMM_A16W16 [gluon/gfx1250]: kernel_type='{kernel_type}' needs "
+                    f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
+                    f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='bandwidth_bound'."
+                )
+                kernel_type = "bandwidth_bound"
+                depth_cap = num_k_tiles
+        else:
+            depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
 
         NUM_BUFFERS = min(NUM_BUFFERS, depth_cap)
 

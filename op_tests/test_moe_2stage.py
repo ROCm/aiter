@@ -74,7 +74,7 @@ def test_fmoe(
     preshuffle=True,
     strict_accuracy=True,
     check_aot_cache=True,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -586,8 +586,8 @@ parser.add_argument(
     "--swiglu-limit",
     "-sl",
     type=float,
-    default=0.0,
-    help="Limit the number of experts for swiglu activation type. Default is 0.0.",
+    default=None,
+    help="swiglu/silu clamp limit. Default None means the kernel default (7.0).",
 )
 
 args = parser.parse_args()
@@ -652,6 +652,9 @@ def _row_to_kwargs(row):
         hidden_pad=0,
         intermediate_pad=0,
         preshuffle=True,
+        swiglu_limit=_effective_swiglu_limit(
+            q_type, aq_dtype, wq_dtype, args.swiglu_limit
+        ),
     )
 
 
@@ -726,7 +729,7 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
         return swiglu_limit
-    return 0.0
+    return None
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
@@ -781,6 +784,9 @@ def _iter_legacy_cases():
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
+            swiglu_limit=_effective_swiglu_limit(
+                quant_type, aq_dtype, wq_dtype, args.swiglu_limit
+            ),
             **over,
         )
 
@@ -908,12 +914,6 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    swiglu_limit = _effective_swiglu_limit(
-        kwargs["qType"],
-        kwargs["AQDType"],
-        kwargs["WQDType"],
-        args.swiglu_limit,
-    )
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     _force_moe_bound_zero = (
         kwargs["qType"],
@@ -928,7 +928,7 @@ for kwargs, extras in case_iter:
             if kwargs.get("check_aot_cache", False)
             else test_fmoe
         )
-        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+        ret = run_test_fmoe(**kwargs)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
