@@ -748,12 +748,6 @@ def compile_gemm1_a4w4_port(
     BK=256,
     interleave=True,
 ):
-    print(
-        f"[PORT-FLYDSL-GEMM1] compile_gemm1_a4w4_port ENTERED "
-        f"BM={BM} use_nt={use_nt} inline_quant={inline_quant} "
-        f"D_HIDDEN={D_HIDDEN} D_INTER={D_INTER} NE={NE} interleave={interleave}",
-        flush=True,
-    )
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
         (32, False, False),
