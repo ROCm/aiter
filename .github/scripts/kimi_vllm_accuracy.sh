@@ -10,15 +10,22 @@ TP=${TP:-8}
 PORT=${PORT:-8000}
 FEWSHOT=${FEWSHOT:-3}
 OUT=${OUT:-/tmp/kimi_vllm_acc}
+KIMI_VLLM_KV_CACHE_DTYPE=${KIMI_VLLM_KV_CACHE_DTYPE:-default}
+SERVER_LOG_TAIL_LINES=${SERVER_LOG_TAIL_LINES:-200}
 mkdir -p "$OUT"
 SLOG="$OUT/server.log"
 
 export AITER_QUICK_REDUCE_QUANTIZATION=${AITER_QUICK_REDUCE_QUANTIZATION:-INT4}
 export VLLM_ROCM_USE_AITER=${VLLM_ROCM_USE_AITER:-1}
 
+dump_server_log() {
+  echo "== vLLM server log tail =="
+  tail -n "$SERVER_LOG_TAIL_LINES" "$SLOG" || true
+}
+
 # Prefer a /models mount if the weights are pre-cached there.
 if [ -d "/models/${MODEL_PATH}" ]; then MODEL="/models/${MODEL_PATH}"; else MODEL="${MODEL_PATH}"; fi
-echo "== Kimi vLLM accuracy =="; echo "model=$MODEL tp=$TP"
+echo "== Kimi vLLM accuracy =="; echo "model=$MODEL tp=$TP kv_cache_dtype=$KIMI_VLLM_KV_CACHE_DTYPE"
 python3 -c "import vllm;print('vllm',vllm.__version__)" 2>/dev/null | tail -1
 pip show amd-aiter 2>/dev/null | grep -E '^Version' || true
 command -v lm_eval >/dev/null 2>&1 || pip install -q "lm-eval[api]"
@@ -34,27 +41,36 @@ echo "== launching vllm serve =="
 # default safetensors loader loads this 521GB checkpoint in ~27s/worker on
 # MI355X, so fastsafetensors buys nothing here. The reference 0.9409 run used it
 # only because the ATOM image happened to ship the package.
-vllm serve "$MODEL" \
-    --host 127.0.0.1 --port "$PORT" \
-    --async-scheduling \
-    --tensor-parallel-size "$TP" \
-    --trust-remote-code \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-    --kv-cache-dtype fp8 \
-    --max-num-batched-tokens 16384 \
-    --max-model-len 16384 \
-    --no-enable-prefix-caching \
-    > "$SLOG" 2>&1 &
+serve_args=(
+  "$MODEL"
+  --host 127.0.0.1 --port "$PORT"
+  --async-scheduling
+  --tensor-parallel-size "$TP"
+  --trust-remote-code
+  --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+  --block-size 1
+  --max-num-batched-tokens 16384
+  --max-model-len 16384
+  --no-enable-prefix-caching
+)
+
+# vLLM's ROCm AITER MLA fp8 decode path is unstable in current nightly images.
+# Keep the Kimi gate on default KV cache dtype unless explicitly testing fp8.
+if [ "$KIMI_VLLM_KV_CACHE_DTYPE" != "default" ]; then
+  serve_args+=(--kv-cache-dtype "$KIMI_VLLM_KV_CACHE_DTYPE")
+fi
+
+vllm serve "${serve_args[@]}" > "$SLOG" 2>&1 &
 SVPID=$!
 
 echo "== waiting for /health =="
 ready=0
 for i in $(seq 1 2400); do
   curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 && { ready=1; break; }
-  kill -0 $SVPID 2>/dev/null || { echo "SERVER DIED"; tail -n 80 "$SLOG"; exit 4; }
+  kill -0 $SVPID 2>/dev/null || { echo "SERVER DIED"; dump_server_log; exit 4; }
   sleep 1
 done
-[ "$ready" -eq 1 ] || { echo "SERVER NOT READY"; tail -n 80 "$SLOG"; exit 5; }
+[ "$ready" -eq 1 ] || { echo "SERVER NOT READY"; dump_server_log; exit 5; }
 echo "SERVER READY after ${i}s"
 
 echo "== lm_eval gsm8k ${FEWSHOT}-shot =="
@@ -69,6 +85,6 @@ pkill -9 -f "multiprocessing.spawn" 2>/dev/null || true
 
 rf=$(ls -1t "$OUT"/acc/**/*.json "$OUT"/acc/*.json 2>/dev/null | head -1)
 [ -z "$rf" ] && rf=$(find "$OUT/acc" -name '*.json' 2>/dev/null | head -1)
-if [ -z "$rf" ]; then echo "ERROR: no lm_eval result JSON"; exit 6; fi
+if [ -z "$rf" ]; then echo "ERROR: no lm_eval result JSON"; dump_server_log; exit 6; fi
 val=$(python3 -c "import json,sys;d=json.load(open('$rf'));print(d['results']['gsm8k']['exact_match,flexible-extract'])")
 echo "KIMI_FLEX_EXTRACT=${val}"
