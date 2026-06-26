@@ -70,6 +70,12 @@ _GEAK_V4_PATH = os.path.join(
     _REPO_ROOT,
     "aiter", "ops", "flydsl", "kernels", "fp8_mqa_logits_flydsl_geak_v4.py",
 )
+
+_GEAK_V5_PATH = os.path.join(
+    _REPO_ROOT,
+    "aiter", "ops", "flydsl", "kernels", "fp8_mqa_logits_flydsl_geak_v5.py",
+)
+
 _geak_v4_mod = None
 if os.path.exists(_GEAK_V4_PATH):
     import importlib.util as _imputil
@@ -79,7 +85,23 @@ if os.path.exists(_GEAK_V4_PATH):
         _spec.loader.exec_module(_geak_v4_mod)
     except Exception as _e:
         print(f"[warn] failed to load geak_v4 kernel: {_e}", file=sys.stderr)
-        _geak_v4_mod = None
+        exit(1)
+
+if os.path.exists(_GEAK_V5_PATH):
+    import importlib.util as _imputil
+    _spec = _imputil.spec_from_file_location(
+        "aiter.ops.flydsl.kernels.fp8_mqa_logits_flydsl_geak_v5",  # full dotted name
+        _GEAK_V5_PATH,
+        submodule_search_locations=[],  # marks it as a package member
+    )
+    _geak_v5_mod = _imputil.module_from_spec(_spec)
+    import sys as _sys
+    _sys.modules[_spec.name] = _geak_v5_mod  # register so relative imports resolve
+    try:
+        _spec.loader.exec_module(_geak_v5_mod)
+    except Exception as _e:
+        print(f"[warn] failed to load geak_v5 kernel: {_e}", file=sys.stderr)
+        exit(1)
 
 def _triton_logits_fallback(Q, KV, kv_scales, weights, cu_starts, cu_ends,
                             clean_logits=True, block_kv=64):
@@ -286,35 +308,29 @@ PRESET_SHAPES = [
     (1, 4096, 4096, 64, 128),
     (1, 1024, 4096, 64, 128),
     (1, 4096, 1024, 64, 128),
-    #(1, 4096, 16384, 64, 128),
-    #(1, 4096, 16000, 64, 128),  # non-aligned s_kv (tail)
-    # H = 64, long-ISL prefill (square; run without --verify, see note above)
-    (1, 4096, 8192, 64, 128),
-    (1, 8192, 4096, 64, 128),
-    (1, 8192, 8192, 64, 128),
-    (1, 16384, 16384, 64, 128),
-    (1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
-    # H = 128
-    (1, 1024, 1024, 128, 128),
-    (1, 2048, 2048, 128, 128),
-    (1, 4096, 4096, 128, 128),
-    (1, 1024, 4096, 128, 128),
-    #(1, 4096, 16384, 128, 128),
-    #(1, 4096, 16000, 128, 128),  # non-aligned s_kv (tail)
-    # H = 128, long-ISL prefill (mirrors the H=64 long-ISL group above)
-    (1, 8192, 8192, 128, 128),
-    (1, 16384, 16384, 128, 128),
-    (1, 32768, 32768, 128, 128),
+    # #(1, 4096, 16384, 64, 128),
+    # #(1, 4096, 16000, 64, 128),  # non-aligned s_kv (tail)
+    # # H = 64, long-ISL prefill (square; run without --verify, see note above)
+    # (1, 4096, 8192, 64, 128),
+    # (1, 8192, 4096, 64, 128),
+    # (1, 8192, 8192, 64, 128),
+    # (1, 16384, 16384, 64, 128),
+    # (1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
+    # # H = 128
+    # (1, 1024, 1024, 128, 128),
+    # (1, 2048, 2048, 128, 128),
+    # (1, 4096, 4096, 128, 128),
+    # (1, 1024, 4096, 128, 128),
+    # #(1, 4096, 16384, 128, 128),
+    # #(1, 4096, 16000, 128, 128),  # non-aligned s_kv (tail)
+    # # H = 128, long-ISL prefill (mirrors the H=64 long-ISL group above)
+    # (1, 8192, 8192, 128, 128),
+    # (1, 16384, 16384, 128, 128),
+    # (1, 32768, 32768, 128, 128),
 ]
 
-
 FLYDSL_PREFIX = "flydsl:"
-GEAK_IMPL_NAME = "geak_v4"
-
-
-def _is_flydsl_impl(name):
-    return name.startswith(FLYDSL_PREFIX) or name == GEAK_IMPL_NAME
-
+GEAK_IMPL_NAMES = ["geak_v4", "geak_v5"]
 
 def _flydsl_variant_of(name):
     """Return the variant tag for a 'flydsl:<variant>' impl name."""
@@ -325,8 +341,8 @@ def _impl_label(name):
     """Short, column-friendly label for an impl name (e.g. 'triton', 'fly:mfma')."""
     if name == "triton":
         return "triton"
-    if name == GEAK_IMPL_NAME:
-        return "flydsl:" + GEAK_IMPL_NAME
+    if name in GEAK_IMPL_NAMES:
+        return "flydsl:" + name
     if name.startswith(FLYDSL_PREFIX):
         return "flydsl:" + _flydsl_variant_of(name)
     return name
@@ -348,6 +364,8 @@ def _available_variants():
     variants = list(FP8_MQA_LOGITS_VARIANTS)
     if _geak_v4_mod is not None:
         variants.append("geak_v4")
+    if _geak_v5_mod is not None:
+        variants.append("geak_v5")
     return tuple(variants), FP8_MQA_LOGITS_DEFAULT_VARIANT
 
 
@@ -372,6 +390,8 @@ def _select_impls(which, flydsl_variants):
         available_variants = list(FP8_MQA_LOGITS_VARIANTS)
         if _geak_v4_mod is not None:
             available_variants.append("geak_v4")
+        if _geak_v5_mod is not None:
+            available_variants.append("geak_v5")
         available_variants = tuple(available_variants)
 
     want_triton = which in ("all", "triton")
@@ -396,7 +416,15 @@ def _select_impls(which, flydsl_variants):
                         f"[error] geak variant requested but {_GEAK_V4_PATH} "
                         f"failed to load."
                     )
-                impls[GEAK_IMPL_NAME] = _geak_v4_mod.flydsl_fp8_mqa_logits
+                impls["geak_v4"] = _geak_v4_mod.flydsl_fp8_mqa_logits
+                continue
+            if v == "geak_v5":
+                if _geak_v5_mod is None:
+                    raise SystemExit(
+                        f"[error] geak variant requested but {_GEAK_V5_PATH} "
+                        f"failed to load."
+                    )
+                impls["geak_v5"] = _geak_v5_mod.flydsl_fp8_mqa_logits
                 continue
             if v not in available_variants:
                 raise SystemExit(
@@ -448,9 +476,9 @@ def _make_closure(name, fn, shape, q_fp8, kv_fp8, scales, weights, ks, ke):
     """Build a timed closure for one impl.
 
     The geak v4 standalone kernel has a 6-arg ABI (no ``clean_logits``); all
-    other impls (triton, flydsl:* variants) take the standard 7 args.
+    other impls (triton, geak_v5, flydsl:mfma* variants) take the standard 7 args.
     """
-    if name == GEAK_IMPL_NAME:
+    if name == "geak_v4":
         # GEAK cannot support H=128, return None in this case
         if shape.num_heads_q == 128:
             return None
@@ -611,7 +639,7 @@ def _verify_reference(impls, q, kv, q_fp8, kv_fp8, scales, weights, ks, ke, shap
             status[name] = "REF"
             continue
         try:
-            if name == GEAK_IMPL_NAME:
+            if name == "geak_v4":
                 if _make_closure(name, fn, shape, q_fp8, kv_fp8, scales, weights, ks, ke) is None:
                     status[name] = "SKIP"
                     continue
@@ -665,7 +693,7 @@ def _verify_vs_triton(impls, q_fp8, kv_fp8, scales, weights, ks, ke, shape):
         if name == "triton":
             continue
         try:
-            if name == GEAK_IMPL_NAME:
+            if name == "geak_v4":
                 if _make_closure(name, fn, shape, q_fp8, kv_fp8, scales, weights, ks, ke) is None:
                     status[name] = "SKIP"
                     continue
@@ -995,7 +1023,7 @@ def main():
     p.add_argument(
         "--mode",
         choices=["eager", "graph", "all"],
-        default="eager",
+        default="graph",
         help=(
             "timing strategy: 'eager' = per-call latency (device + host bubble); "
             "'graph' = HIP graph-replay steady state (host overhead stripped); "
