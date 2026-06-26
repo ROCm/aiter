@@ -17,6 +17,7 @@ from aiter.aot.flydsl.common import (
     compile_only_env,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 
@@ -27,6 +28,55 @@ _TILE_K = 256
 
 def _align_up(value: int, alignment: int) -> int:
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _preshuffled_scale_shape(
+    rows: int, k_dim: int, warp_tile: int, tile_k: int = _TILE_K
+) -> tuple[int, int]:
+    """Mirror moe_grouped_gemm_mxscale_gfx1250._preshuffled_scale_shape.
+
+    The grouped GEMM launchers validate an exact preshuffled E8M0 scale layout
+    (see tests.kernels.test_gemm_mxscale_gfx1250.preshuffle_e8m0_scale), so the
+    AOT dummy tensors must use the same shape, not the plain (rows, k//32) one.
+    """
+    k_scale = int(k_dim) // 32
+    scale_k_per_tile = int(tile_k) // 32
+    if k_scale % scale_k_per_tile != 0:
+        raise ValueError(
+            f"K scale columns must be divisible by tile_k/32, got {k_scale} and {scale_k_per_tile}"
+        )
+    wmma_rep = int(warp_tile) // 16
+    if wmma_rep < 1:
+        raise ValueError(f"warp_tile must be >= 16, got {warp_tile}")
+    if int(rows) % wmma_rep != 0:
+        raise ValueError(
+            f"scale rows must be divisible by wmma_rep={wmma_rep}, got {rows}"
+        )
+    return int(rows) // wmma_rep, k_scale * wmma_rep
+
+
+def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
+    """Mirror moe_grouped_gemm_mxscale_gfx1250._preshuffled_b_scale_shape.
+
+    Weight (B) scale uses the n32k4 layout (different from the activation/A
+    layout above): a 32-row super-block folds into the column dim, so 32 N-rows
+    collapse to one row and each k_scale column expands x32. The grouped GEMM
+    launchers validate scale_w against THIS shape, so the AOT dummy must match.
+    """
+    k_scale = int(k_dim) // 32
+    if k_scale % 4 != 0:
+        raise ValueError(
+            f"B-scale k columns (K//32) must be divisible by 4 (K%128==0), got {k_scale}"
+        )
+    if int(rows) % 32 != 0:
+        raise ValueError(f"B-scale rows must be divisible by 32, got {rows}")
+    return int(rows) // 32, k_scale * 32
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes")
 
 
 def _as_int(value, default: int | None = None) -> int | None:
@@ -41,8 +91,10 @@ def _scheduler_variants(row, base_job):
     # runtime axis is dense vs DeepGEMM contiguous-M (auto-enabled for large token
     # counts). Mirror exactly that set so AOT never compiles GEMM variants the
     # runtime cannot launch.
+    explicit_contiguous = _as_bool(row.get("grouped_contiguous_m"), False)
+    contiguous_modes = [True] if explicit_contiguous else [False, True]
     variants = []
-    for contiguous in [False, True]:
+    for contiguous in contiguous_modes:
         variant = dict(base_job)
         variant["grouped_persistent_m"] = False
         variant["grouped_contiguous_m"] = contiguous
@@ -112,121 +164,257 @@ def parse_csv(csv_path: str):
 GROUPED_MOE_AOT_ARCH_DEFAULT = "gfx1250"
 
 
-def _compile_grouped_moe_aux_kernels(job, *, dtype, pack, warp_tile_m, max_m):
-    """Precompile the non-GEMM FlyDSL kernels the run-only grouped MoE path
+def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
+    """Mirror grouped_moe_gfx1250._choose_gather_reduce_vec."""
+    out_dwords = int(model_dim) // 2
+    n_iters_v4 = (out_dwords + 256 * 4 - 1) // (256 * 4)
+    return 4 if int(token_num) * n_iters_v4 >= 256 else 2
+
+
+def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contiguous):
+    """Precompile the non-GEMM FlyDSL kernels the run-only grouped MoE fast path
     launches around gemm1/gemm2.
+
+    Mirrors aiter.ops.flydsl.grouped_moe_gfx1250._maybe_grouped_gfx1250_a8w4_moe
+    (and the flydsl_moe_* wrappers in moe_kernels.py) so the AOT cache keys match
+    exactly what production dispatch looks up at inference time. The surrounding
+    kernels were fused in gfx1250_moe_splitk_fused (route+quant+scatter and
+    grouped quant+preshuffle in single passes), replacing the older
+    route_maps/scatter_copy/preshuffle_scale set that this helper used to cover.
+
+    Note ``quant_mode`` is the *activation* quant of the fused prep kernels:
+    a8w4 GEMM weights pair with MXFP8 activations, so data_format=="a8w4" maps
+    to quant_mode "fp8" here (not "a8w4"); data_format=="fp4" maps to "fp4".
     """
     import torch
 
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
         build_moe_contiguous_psum_module,
+        build_moe_contiguous_psum_remap_module,
+    )
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_fused_quant_preshuffle_module,
+        build_moe_fused_quant_preshuffle_route_ksplit_module,
+        build_moe_fused_route_quant_scatter_module,
+        build_moe_fused_route_quant_scatter_st_ksplit_module,
     )
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
         build_moe_gather_reduce_module,
     )
     from aiter.ops.flydsl.kernels.moe_route_maps import (
-        build_moe_route_maps_module,
-    )
-    from aiter.ops.flydsl.kernels.moe_scatter_copy_preshuffle_scale import (
-        build_moe_scatter_copy_preshuffle_scale_module,
-    )
-    from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
-        build_moe_scatter_copy_token_module,
+        build_moe_topids_to_rows_module,
     )
 
     dev = torch.device("cpu")
     i32 = torch.int32
     u8 = torch.uint8
+    bf16 = torch.bfloat16
     E = job["experts"]
     topk = job["topk"]
     model_dim = job["model_dim"]
     inter_dim = job["inter_dim"]
+    max_m = job["max_m"]
+    tile_m = job["tile_m"]
     token_num = max(1, job["token_num"])
     out_dtype = job["out_dtype"]
-
     numel = token_num * topk
-    num_dst = E * max_m
-    wmma_rep = warp_tile_m // 16
-    scale_k_per_tile = _TILE_K // 32
-    tiles_per_expert = max_m // (wmma_rep * 16)
-    grid_blocks = (numel + 255) // 256
+    grid = max(1, (numel + 255) // 256)
 
-    # Route -> grouped-row maps (no build-time params).
-    route_maps = build_moe_route_maps_module()
-    route_maps(
-        torch.empty((numel,), dtype=i32, device=dev),
-        torch.empty((E,), dtype=i32, device=dev),
-        torch.empty((numel,), dtype=i32, device=dev),
-        torch.empty((num_dst,), dtype=i32, device=dev),
-        numel,
-        topk,
-        max_m,
-        grid_blocks,
-        stream=0,
-    )
+    def _payload_cols(feat_dim):
+        return feat_dim if quant_mode == "fp8" else feat_dim // 2
 
-    # Payload route-gather (row width = model_dim // pack).
-    row_bytes = model_dim // pack
-    scatter_copy = build_moe_scatter_copy_token_module(row_bytes)
-    scatter_copy(
-        torch.empty((numel, row_bytes), dtype=u8, device=dev),
-        torch.empty((num_dst, row_bytes), dtype=u8, device=dev),
-        torch.empty((num_dst,), dtype=i32, device=dev),
-        num_dst,
-        stream=0,
-    )
+    def _payload_numel(rows, feat_dim):
+        return rows * _payload_cols(feat_dim)
 
-    # Stage1 scale: route-gather + WMMA preshuffle (gather=True).
-    ws1 = model_dim // 32
-    preshuffle1 = build_moe_scatter_copy_preshuffle_scale_module(
-        ws1, wmma_rep, scale_k_per_tile, gather=True
-    )
-    preshuffle1(
-        torch.empty((numel, ws1), dtype=u8, device=dev),
-        torch.empty((E * (max_m // wmma_rep), ws1 * wmma_rep), dtype=u8, device=dev),
-        torch.empty((num_dst,), dtype=i32, device=dev),
-        max_m,
-        E,
-        tiles_per_expert,
-        stream=0,
-    )
+    def _scale_pre_numel(out_e, out_m, feat_dim):
+        # (out_e, out_m // wmma_rep, (feat_dim // 32) * wmma_rep) flattened
+        return out_e * (out_m // wmma_rep) * ((feat_dim // 32) * wmma_rep)
 
-    # Stage2 scale: already grouped, pure preshuffle (gather=False).
-    ws2 = inter_dim // 32
-    preshuffle2 = build_moe_scatter_copy_preshuffle_scale_module(
-        ws2, wmma_rep, scale_k_per_tile, gather=False
-    )
-    preshuffle2(
-        torch.empty((num_dst, ws2), dtype=u8, device=dev),
-        torch.empty((E * (max_m // wmma_rep), ws2 * wmma_rep), dtype=u8, device=dev),
-        max_m,
-        E,
-        tiles_per_expert,
-        stream=0,
-    )
+    def _route_ksplit(feat_dim, source_topk, out_e, out_m, grouped_in_numel):
+        # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never
+        # sets remap_rows on the grouped MoE fast path (row_starts stays None).
+        launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
+            feat_dim=feat_dim,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+            source_topk=source_topk,
+            remap_rows=False,
+        )
+        launch(
+            torch.empty((grouped_in_numel,), dtype=bf16, device=dev),
+            torch.empty(
+                (_payload_numel(out_e * out_m, feat_dim),), dtype=u8, device=dev
+            ),
+            torch.empty(
+                (_scale_pre_numel(out_e, out_m, feat_dim),), dtype=u8, device=dev
+            ),
+            torch.empty((numel,), dtype=i32, device=dev),
+            torch.empty((max(E, 1),), dtype=i32, device=dev),  # dummy row_starts
+            1,
+            numel,
+            grid,
+            stream=0,
+        )
 
-    # Token-order gather-reduce epilogue (fast path is bf16/f16 only).
-    gather_reduce = build_moe_gather_reduce_module(model_dim, topk, out_dtype)
-    gather_reduce(
-        torch.empty((num_dst, model_dim), dtype=dtype, device=dev),
-        torch.empty((token_num, topk), dtype=i32, device=dev),
-        torch.empty((token_num, topk), dtype=dtype, device=dev),
-        torch.empty((token_num, model_dim), dtype=dtype, device=dev),
-        token_num,
-        stream=0,
-    )
+    def _plain_preshuffle(feat_dim, out_e, out_m, skip_padding):
+        launch = build_moe_fused_quant_preshuffle_module(
+            feat_dim=feat_dim,
+            wmma_rep=wmma_rep,
+            quant_mode=quant_mode,
+            skip_padding=skip_padding,
+        )
+        n_rows = out_e * out_m
+        launch(
+            torch.empty((n_rows * feat_dim,), dtype=bf16, device=dev),
+            torch.empty((_payload_numel(n_rows, feat_dim),), dtype=u8, device=dev),
+            torch.empty(
+                (_scale_pre_numel(out_e, out_m, feat_dim),), dtype=u8, device=dev
+            ),
+            torch.empty((max(E, 1),), dtype=i32, device=dev),
+            n_rows,
+            out_m,
+            grid,
+            stream=0,
+        )
 
-    # DeepGEMM contiguous-M tile-aligned prefix sum (no build-time params).
-    contiguous_psum = build_moe_contiguous_psum_module()
-    contiguous_psum(
-        torch.empty((E,), dtype=i32, device=dev),
-        torch.empty((E,), dtype=i32, device=dev),
-        torch.empty((E,), dtype=i32, device=dev),
-        torch.empty((1,), dtype=i32, device=dev),
-        E,
-        job["tile_m"],
-        stream=0,
-    )
+    def _topids_to_rows():
+        launch = build_moe_topids_to_rows_module()
+        launch(
+            torch.empty((numel,), dtype=i32, device=dev),
+            torch.empty((E,), dtype=i32, device=dev),
+            torch.empty((numel,), dtype=i32, device=dev),
+            numel,
+            max_m,
+            grid,
+            stream=0,
+        )
+
+    # --- Stage1 activation prep (a1): fused route + MX-quant + scatter ---
+    if contiguous:
+        # DeepGEMM contiguous-M: topids_to_rows -> contiguous psum+remap ->
+        # route-indexed quant+preshuffle into a single contiguous (E=1) buffer.
+        ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
+        contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
+
+        _topids_to_rows()
+
+        psum_remap = build_moe_contiguous_psum_remap_module()
+        psum_remap(
+            torch.empty((E,), dtype=i32, device=dev),
+            torch.empty((numel,), dtype=i32, device=dev),
+            torch.empty((E,), dtype=i32, device=dev),
+            torch.empty((E,), dtype=i32, device=dev),
+            torch.empty((1,), dtype=i32, device=dev),
+            numel,
+            E,
+            max_m,
+            tile_m,
+            stream=0,
+        )
+        # Also cover the plain prefix-sum kernel (used by the psum layout helper).
+        psum = build_moe_contiguous_psum_module()
+        psum(
+            torch.empty((E,), dtype=i32, device=dev),
+            torch.empty((E,), dtype=i32, device=dev),
+            torch.empty((E,), dtype=i32, device=dev),
+            torch.empty((1,), dtype=i32, device=dev),
+            E,
+            tile_m,
+            stream=0,
+        )
+
+        _route_ksplit(
+            feat_dim=model_dim,
+            source_topk=topk,
+            out_e=1,
+            out_m=contiguous_m,
+            grouped_in_numel=token_num * model_dim,
+        )
+        a2_out_e, a2_out_m = 1, contiguous_m
+    else:
+        # Dense masked layout (one (E, max_m, *) bucket per expert).
+        use_routeks_stage1 = token_num > 1 and topk > 1 and quant_mode == "fp4"
+        use_st_ksplit = token_num == 1 and topk > 0 and (topk & (topk - 1)) == 0
+        if use_routeks_stage1:
+            _topids_to_rows()
+            _route_ksplit(
+                feat_dim=model_dim,
+                source_topk=topk,
+                out_e=E,
+                out_m=max_m,
+                grouped_in_numel=token_num * model_dim,
+            )
+        else:
+            build_route = (
+                build_moe_fused_route_quant_scatter_st_ksplit_module
+                if use_st_ksplit
+                else build_moe_fused_route_quant_scatter_module
+            )
+            launch = build_route(
+                model_dim=model_dim,
+                topk=topk,
+                wmma_rep=wmma_rep,
+                quant_mode=quant_mode,
+                use_expert_row_base=False,
+                max_m=max_m,
+            )
+            launch(
+                torch.empty((numel,), dtype=i32, device=dev),
+                torch.empty((E,), dtype=i32, device=dev),
+                torch.empty((numel,), dtype=i32, device=dev),
+                torch.empty((token_num * model_dim,), dtype=bf16, device=dev),
+                torch.empty(
+                    (_payload_numel(E * max_m, model_dim),), dtype=u8, device=dev
+                ),
+                torch.empty(
+                    (_scale_pre_numel(E, max_m, model_dim),), dtype=u8, device=dev
+                ),
+                torch.empty((E,), dtype=i32, device=dev),  # expert_row_base (dummy)
+                numel,
+                grid,
+                stream=0,
+            )
+        a2_out_e, a2_out_m = E, max_m
+
+    # --- Stage2 activation prep (a2): fused grouped quant + preshuffle ---
+    # Runtime passes topids_to_rows whenever route rows fit the output capacity
+    # (almost always), taking the route-ksplit path with source_topk=0; the
+    # plain skip-padding path is the rare capacity-overflow fallback.
+    capacity_rows = a2_out_e * a2_out_m
+    if numel < capacity_rows:
+        _route_ksplit(
+            feat_dim=inter_dim,
+            source_topk=0,
+            out_e=a2_out_e,
+            out_m=a2_out_m,
+            grouped_in_numel=a2_out_e * a2_out_m * inter_dim,
+        )
+    else:
+        # masked_m is None on the contiguous path -> skip_padding=False;
+        # passed on the dense path -> skip_padding=True.
+        _plain_preshuffle(
+            feat_dim=inter_dim,
+            out_e=a2_out_e,
+            out_m=a2_out_m,
+            skip_padding=not contiguous,
+        )
+
+    # --- Epilogue: token-order gather-reduce (bf16/f16 fast path only) ---
+    # vec width is token-count dependent at runtime; cover both so run-only
+    # coverage holds across inference batch sizes, not just the CSV token.
+    for vec in (2, 4):
+        gather_reduce = build_moe_gather_reduce_module(
+            model_dim, topk, out_dtype, 1, vec
+        )
+        gather_reduce(
+            torch.empty((a2_out_e * a2_out_m, model_dim), dtype=dtype, device=dev),
+            torch.empty((token_num, topk), dtype=i32, device=dev),
+            torch.empty((token_num, topk), dtype=dtype, device=dev),
+            torch.empty((token_num, model_dim), dtype=dtype, device=dev),
+            token_num,
+            E * max_m * (model_dim // 2),
+            stream=0,
+        )
 
 
 def compile_one_config(**job):
@@ -238,8 +426,6 @@ def compile_one_config(**job):
         compile_moe_grouped_gemm1_mxfp4_masked,
         compile_moe_grouped_gemm2_a8w4_masked,
         compile_moe_grouped_gemm2_mxfp4_masked,
-        preshuffled_scale_shape,
-        preshuffled_b_scale_shape,
     )
 
     aot_arch = job.pop("gfx", "") or GROUPED_MOE_AOT_ARCH_DEFAULT
@@ -255,6 +441,8 @@ def compile_one_config(**job):
         dev = torch.device("cpu")
         dtype = torch.bfloat16 if job["out_dtype"] == "bf16" else torch.float16
         pack = 2 if job["data_format"] == "fp4" else 1
+        # Fused prep kernels quantize activations to MXFP8 for a8w4 weights.
+        quant_mode = "fp4" if job["data_format"] == "fp4" else "fp8"
         compiler1 = (
             compile_moe_grouped_gemm1_mxfp4_masked
             if job["data_format"] == "fp4"
@@ -316,16 +504,14 @@ def compile_one_config(**job):
             sx1 = torch.empty(
                 (
                     act_lead,
-                    *preshuffled_scale_shape(
-                        rows, job["model_dim"], warp_tile_m, _TILE_K
-                    ),
+                    *_preshuffled_scale_shape(rows, job["model_dim"], warp_tile_m),
                 ),
                 dtype=torch.uint8,
             )
             sw1 = torch.empty(
                 (
                     job["experts"],
-                    *preshuffled_b_scale_shape(2 * job["inter_dim"], job["model_dim"]),
+                    *_preshuffled_b_scale_shape(2 * job["inter_dim"], job["model_dim"]),
                 ),
                 dtype=torch.uint8,
             )
@@ -340,16 +526,14 @@ def compile_one_config(**job):
             sx2 = torch.empty(
                 (
                     act_lead,
-                    *preshuffled_scale_shape(
-                        rows, job["inter_dim"], warp_tile_m, _TILE_K
-                    ),
+                    *_preshuffled_scale_shape(rows, job["inter_dim"], warp_tile_m),
                 ),
                 dtype=torch.uint8,
             )
             sw2 = torch.empty(
                 (
                     job["experts"],
-                    *preshuffled_b_scale_shape(job["model_dim"], job["inter_dim"]),
+                    *_preshuffled_b_scale_shape(job["model_dim"], job["inter_dim"]),
                 ),
                 dtype=torch.uint8,
             )
@@ -426,16 +610,16 @@ def compile_one_config(**job):
                 bias=bias2,
             )
             # Non-GEMM auxiliary kernels the run-only fast path launches around
-            # the GEMMs (route maps, scatter-copy, scale preshuffle,
-            # gather-reduce, contiguous prefix-sum). They are
-            # scheduler-variant-independent, so the second variant just hits the
-            # on-disk AOT cache.
+            # the GEMMs (fused route+quant+scatter, grouped quant+preshuffle,
+            # contiguous prefix-sum(+remap), gather-reduce). These were fused in
+            # gfx1250_moe_splitk_fused, so AOT mirrors the new wrappers, not the
+            # legacy route_maps/scatter_copy kernels.
             _compile_grouped_moe_aux_kernels(
                 job,
                 dtype=dtype,
-                pack=pack,
-                warp_tile_m=warp_tile_m,
-                max_m=job["max_m"],
+                quant_mode=quant_mode,
+                wmma_rep=warp_tile_m // 16,
+                contiguous=contiguous,
             )
         elapsed = time.time() - t0
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
@@ -450,13 +634,18 @@ def main(argv=None):
     parser.add_argument("--csv", nargs="+", default=DEFAULT_CSVS)
     args = parser.parse_args(argv)
     jobs = collect_aot_jobs(args.csv, parse_csv)
-    print(f"[aiter] FlyDSL GROUPED_MOE AOT: {len(jobs)} kernels")
-    results = [compile_one_config(**job) for job in jobs]
-    ok = sum(1 for r in results if r["compile_time"] is not None)
+
+    total_t0 = time.time()
+    print(f"--- Compiling {len(jobs)} grouped-MoE kernels ---")
+    results = run_jobs_parallel(compile_one_config, jobs)
+    total_elapsed = time.time() - total_t0
+
+    ok = sum(1 for r in results if r.get("compile_time") is not None)
     fail = len(results) - ok
-    print(f"[aiter] FlyDSL GROUPED_MOE AOT: compiled {ok} ok, {fail} failed")
-    if fail:
-        sys.exit(1)
+    print(
+        f"\nSummary: {ok} ok, {fail} failed in {total_elapsed:.1f}s",
+    )
+    sys.exit(1 if fail > 0 else 0)
 
 
 if __name__ == "__main__":

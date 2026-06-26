@@ -1774,12 +1774,14 @@ namespace py = pybind11;
           py::arg("index_k_norm_weight"),                  \
           py::arg("num_index_heads"),                       \
           py::arg("slot_mapping"),                         \
-          py::arg("kv_cache"),                             \
+          py::arg("kv_cache_k"),                           \
+          py::arg("kv_cache_v"),                           \
           py::arg("index_cache"),                          \
           py::arg("block_size"),                           \
           py::arg("q_out"),                                \
           py::arg("index_q_out"),                          \
-          py::arg("index_slot_mapping"));                   \
+          py::arg("index_slot_mapping"),                   \
+          py::arg("asm_layout")    = false);                \
     m.def("fused_qknorm_idxrqknorm_fp8",     \
           &aiter::fused_qknorm_idxrqknorm_fp8, \
           py::arg("qkv"),                                  \
@@ -1795,7 +1797,8 @@ namespace py = pybind11;
           py::arg("index_k_norm_weight"),                  \
           py::arg("num_index_heads"),                       \
           py::arg("slot_mapping"),                         \
-          py::arg("kv_cache"),                             \
+          py::arg("kv_cache_k"),                           \
+          py::arg("kv_cache_v"),                           \
           py::arg("index_cache"),                          \
           py::arg("block_size"),                           \
           py::arg("q_out"),                                \
@@ -1803,7 +1806,8 @@ namespace py = pybind11;
           py::arg("index_slot_mapping"),                   \
           py::arg("kv_cache_dtype"),                       \
           py::arg("k_scale"),                              \
-          py::arg("v_scale"))
+          py::arg("v_scale"),                              \
+          py::arg("asm_layout")    = false)
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",             \
@@ -2145,6 +2149,7 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false); \
     m.def("add_rmsnorm",                     \
@@ -2154,7 +2159,8 @@ namespace py = pybind11;
           py::arg("residual_in"),            \
           py::arg("residual_out"),           \
           py::arg("weight"),                 \
-          py::arg("epsilon"));               \
+          py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false);    \
     m.def("rmsnorm_quant",                   \
           &aiter::rmsnorm_quant,             \
           py::arg("out"),                    \
@@ -2162,6 +2168,7 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false); \
     m.def("rmsnorm",                         \
@@ -2169,7 +2176,8 @@ namespace py = pybind11;
           py::arg("out"),                    \
           py::arg("input"),                  \
           py::arg("weight"),                 \
-          py::arg("epsilon"));
+          py::arg("epsilon"),                \
+          py::arg("gemma_norm") = false);    \
 
 #define GATED_RMSNORM_QUANT_PYBIND               \
     m.def("gated_rmsnorm_fp8_group_quant",       \

@@ -80,6 +80,7 @@ def rmsnorm2d_fwd_with_add(
     residual_out: Tensor,
     weight: Tensor,
     epsilon: float,
+    gemma_norm: bool = False,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
@@ -93,7 +94,7 @@ def rmsnorm2d_fwd_with_add(
             use_model_sensitive_rmsnorm,
         )
     else:
-        add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon)
+        add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon, gemma_norm)
 
 
 @compile_ops("module_rmsnorm")
@@ -238,6 +239,7 @@ def add_rmsnorm_quant(
     scale: Tensor,
     weight: Tensor,
     epsilon: float,
+    gemma_norm: bool = False,
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None: ...
@@ -251,6 +253,7 @@ def add_rmsnorm(
     residual_out: Tensor,
     weight: Tensor,
     epsilon: float,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -261,6 +264,7 @@ def rmsnorm_quant(
     scale: Tensor,
     weight: Tensor,
     epsilon: float,
+    gemma_norm: bool = False,
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None: ...
@@ -272,4 +276,5 @@ def rmsnorm(
     input: Tensor,
     weight: Tensor,
     epsilon: float,
+    gemma_norm: bool = False,
 ) -> None: ...
