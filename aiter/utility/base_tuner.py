@@ -373,7 +373,7 @@ class TunerCommon:
             self.untunedf = untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
             if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
-                self.tunedf["gfx"] = gfx
+                self.tunedf.insert(0, "gfx", gfx)
 
             untunedf_cols = self.untunedf.columns
             mask = (
@@ -401,7 +401,10 @@ class TunerCommon:
         for col in df_updates.columns:
             if col not in df_old.columns:
                 if col == "gfx":
-                    df_old[col] = self.get_gfx()
+                    # Keep gfx as the leading key column (canonical layout)
+                    # rather than appending it at the end when migrating a
+                    # legacy CSV.
+                    df_old.insert(0, col, self.get_gfx())
                 elif col == "cu_num":
                     df_old[col] = self.get_cu_num()
                 else:
@@ -443,6 +446,10 @@ class TunerCommon:
 
     def sortResults(self, tune_file, issorted, values):
         tunedf = _read_csv(tune_file)
+        # Migrate legacy tuned files lacking a gfx column so the gfx-aware
+        # dedup/sort keys below do not KeyError; keep gfx as the leading column.
+        if "gfx" in self.keys and "gfx" not in tunedf.columns:
+            tunedf.insert(0, "gfx", self.get_gfx())
         if issorted:
             tunedf = tunedf.sort_values(by=values)
         dedup_keys = self.keys
@@ -1568,7 +1575,7 @@ class GemmCommonTuner(TunerCommon):
             # Backfill gfx for legacy tuned CSVs so the key-based skip mask
             # below does not KeyError when gfx is part of the tuner keys.
             if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
-                self.tunedf["gfx"] = self.get_gfx()
+                self.tunedf.insert(0, "gfx", self.get_gfx())
 
             untunedf_cols = self.untunedf.columns
             if len(self.tunedf) != 0:
