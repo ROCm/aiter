@@ -121,17 +121,23 @@ def _build_kernel_mfma_r_w(
     WPB = waves_per_block
     MR_BLOCK_THREADS = 64 * WPB
 
-    assert H % 16 == 0, f"num_heads={H} must be a multiple of 16 for MFMA"
-    assert BKV % 16 == 0, f"block_kv={BKV} must be a multiple of 16 for MFMA"
-    assert D % 32 == 0, f"head_size={D} must be a multiple of 32 for MFMA K32"
+    # MFMA tile dims of the fp8 16x16x32 atom: MFMA_M x MFMA_N output tile,
+    # MFMA_K fp8 elements reduced per MFMA step.
+    MFMA_M = 16
+    MFMA_N = 16
+    MFMA_K = 32
+
+    assert H % MFMA_M == 0, f"num_heads={H} must be a multiple of MFMA_M={MFMA_M}"
+    assert BKV % MFMA_N == 0, f"block_kv={BKV} must be a multiple of MFMA_N={MFMA_N}"
+    assert D % MFMA_K == 0, f"head_size={D} must be a multiple of MFMA_K={MFMA_K}"
     assert RPB >= 1, "rows_per_block must be >= 1"
     assert WPB >= 1, "waves_per_block must be >= 1"
-    N_TILES = BKV // 16  # total column-tiles per BKV block
+    N_TILES = BKV // MFMA_N  # total column-tiles per BKV block
     assert (
         N_TILES % WPB == 0
-    ), f"BKV/16={N_TILES} must be divisible by waves_per_block={WPB}"
-    M_TILES = H // 16  # head row-tiles
-    K_STEPS = D // 32  # K32 MFMA steps over the head dim
+    ), f"BKV/MFMA_N={N_TILES} must be divisible by waves_per_block={WPB}"
+    M_TILES = H // MFMA_M  # head row-tiles
+    K_STEPS = D // MFMA_K  # MFMA K-steps over the head dim
     N_TILES_PER_WAVE = N_TILES // WPB  # column-tiles per wave
 
     fm_fast = arith.FastMathFlags.fast
@@ -175,9 +181,9 @@ def _build_kernel_mfma_r_w(
         # Decompose tid into wave index and in-wave lane.
         wave = fx.Int32(arith.divui(_to_raw(tid), _to_raw(fx.Int32(64))))
         lane = fx.Int32(arith.remui(_to_raw(tid), _to_raw(fx.Int32(64))))
-        lane_div_16 = fx.Int32(arith.divui(_to_raw(lane), _to_raw(fx.Int32(16))))
-        lane_mod_16 = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(16))))
-        lane8 = fx.Int32(arith.muli(_to_raw(lane_div_16), _to_raw(fx.Int32(8))))
+        lane_div_N = fx.Int32(arith.divui(_to_raw(lane), _to_raw(fx.Int32(MFMA_N))))
+        lane_mod_N = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(MFMA_N))))
+        lane8 = fx.Int32(arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(8))))
 
         # fp8 operands are read 8 bytes at a time as 2 i32 dwords (v8i8
         # buffer_load fails to lower on gfx942), bitcast to i64 for the MFMA.
@@ -260,29 +266,30 @@ def _build_kernel_mfma_r_w(
             starts[j] = fx.Int32(arith.maxsi(_to_raw(s), _to_raw(fx.Int32(0))))
             ends[j] = fx.Int32(arith.minsi(_to_raw(e), _to_raw(fx.Int32(seq_len_kv))))
 
-            # lane -> Q[row, h = mi*16 + lane%16, d = kk*32 + (lane//16)*8 + 0..7]
+            # lane -> Q[row, h = mi*MFMA_M + lane%MFMA_N,
+            #            d = kk*MFMA_K + (lane//MFMA_N)*8 + 0..7]
             row_a = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
             for mi in range_constexpr(M_TILES):
-                h_a = _i32_add(fx.Int32(mi * 16), lane_mod_16)
+                h_a = _i32_add(fx.Int32(mi * MFMA_M), lane_mod_N)
                 row_h = _i32_add(
                     fx.Int32(arith.muli(_to_raw(row), _to_raw(fx.Int32(H)))), h_a
                 )
                 base_a = fx.Int32(arith.muli(_to_raw(row_h), _to_raw(fx.Int32(D))))
                 for kk in range_constexpr(K_STEPS):
-                    d_a = _i32_add(fx.Int32(kk * 32), lane8)
+                    d_a = _i32_add(fx.Int32(kk * MFMA_K), lane8)
                     raw = _load_pack_i64(q_i32, _i32_add(base_a, d_a))
                     row_a[mi][kk] = _fn_to_fnuz_i64(raw) if convert_q_fn else raw
             a_packs[j] = row_a
 
-            # weights[row, h] preloaded per (mi, ii): head = mi*16 + lane_div_16*4 + ii
+            # weights[row, h] per (mi, ii): head = mi*MFMA_M + lane_div_N*4 + ii
             row_w = [[None] * 4 for _ in range_constexpr(M_TILES)]
             for mi in range_constexpr(M_TILES):
                 for ii in range_constexpr(4):
                     h_w = _i32_add(
-                        fx.Int32(mi * 16),
+                        fx.Int32(mi * MFMA_M),
                         _i32_add(
                             fx.Int32(
-                                arith.muli(_to_raw(lane_div_16), _to_raw(fx.Int32(4)))
+                                arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(4)))
                             ),
                             fx.Int32(ii),
                         ),
@@ -338,9 +345,11 @@ def _build_kernel_mfma_r_w(
                 col = _i32_add(
                     _i32_add(
                         col0,
-                        fx.Int32(arith.muli(_to_raw(abs_ni), _to_raw(fx.Int32(16)))),
+                        fx.Int32(
+                            arith.muli(_to_raw(abs_ni), _to_raw(fx.Int32(MFMA_N)))
+                        ),
                     ),
-                    lane_mod_16,
+                    lane_mod_N,
                 )
                 cols[ni] = col
                 col_clamped = fx.Int32(
@@ -353,7 +362,7 @@ def _build_kernel_mfma_r_w(
                     arith.muli(_to_raw(col_clamped), _to_raw(fx.Int32(D)))
                 )
                 for kk in range_constexpr(K_STEPS):
-                    d_b = _i32_add(fx.Int32(kk * 32), lane8)
+                    d_b = _i32_add(fx.Int32(kk * MFMA_K), lane8)
                     raw = _load_pack_i64(kv_i32, _i32_add(base_b, d_b))
                     b_packs[ni][kk] = _fn_to_fnuz_i64(raw) if convert_kv_fn else raw
 
@@ -392,7 +401,7 @@ def _build_kernel_mfma_r_w(
                         peer = _to_raw(ArithValue(col_sum).shuffle_xor(sh, 64))
                         col_sum = arith.AddFOp(col_sum, peer, fastmath=fm_fast).result
 
-                    # Only lane_div_16==0 lanes hold the 16 distinct columns.
+                    # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
                     # `col >= start` is required: the tile loop is BKV-aligned
                     # below `start`, so it guards the pre-filled -inf in
                     # [aligned_start, start).
@@ -416,7 +425,7 @@ def _build_kernel_mfma_r_w(
                         _to_raw(
                             arith.cmpi(
                                 arith.CmpIPredicate.eq,
-                                _to_raw(lane_div_16),
+                                _to_raw(lane_div_N),
                                 _to_raw(fx.Int32(0)),
                             )
                         ),
