@@ -34,6 +34,7 @@ import torch
 import flydsl.compiler as flyc
 
 # Sibling imports (script dir is on sys.path[0]); avoids importing the aiter pkg.
+import jagged_dense_bmm_bwd as _bwd
 from example_jagged_dense_bmm import make_seq_offsets
 from jagged_dense_bmm import BLOCK_M, K, N
 from jagged_dense_bmm_bwd import SPLIT, grad_dense_bias, grad_jagged
@@ -255,6 +256,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="jagged_dense_bmm backward: validate references + kernels")
     p.add_argument("-b", "--n-groups", type=int, default=64, help="number of groups (batch)")
     p.add_argument("-m", "--max-seq-len", type=int, default=512, help="max rows per group")
+    p.add_argument("-d", "--dim", type=int, default=None,
+                   help="square dense dim D (= K = N); overrides the compile-time "
+                        "constant at runtime so no source edit is needed")
     p.add_argument("--regime", choices=["uniform", "skew"], default="uniform")
     p.add_argument("--seed", type=int, default=1234, help="skew RNG seed")
     p.add_argument("--only", default="all", help="comma list of {djagged,ddense,dbias} or 'all'")
@@ -266,6 +270,15 @@ def main(argv=None):
     if not torch.cuda.is_available():
         print("CUDA/ROCm device not available; this example requires a GPU.")
         return 1
+
+    # Apply the runtime D override BEFORE any reference build or kernel launch
+    # (FlyDSL snapshots used globals on first compile). Propagate to this module's
+    # K/N/SPLIT (the refs + allocations read them as snapshotted-by-value names).
+    global K, N, SPLIT
+    if args.dim is not None:
+        _bwd.configure_dim(args.dim)
+        K = N = args.dim
+        SPLIT = _bwd.SPLIT
 
     which = GRADS if args.only == "all" else tuple(s.strip() for s in args.only.split(","))
     for w in which:

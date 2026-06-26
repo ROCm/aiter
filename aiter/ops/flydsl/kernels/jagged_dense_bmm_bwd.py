@@ -108,6 +108,40 @@ assert DDENSE_THREADS % DDENSE_BN == 0, "dOut staging map assumes DDENSE_THREADS
 DDENSE_NROW_GROUPS = DDENSE_THREADS // DDENSE_BN
 
 
+def configure_dim(D):
+    """Override the square dense dim D (= K = N) and every D-derived tiling
+    constant at runtime, so profiling / benchmarking harnesses can pick D without
+    hand-editing source (the temp-edit practice that previously left a stray
+    K=N=512 in the tree and risked profiling the wrong shape).
+
+    D is a compile-time constant for the kernels: FlyDSL snapshots a kernel's used
+    module globals on its *first* launch and rejects any later drift. So this MUST
+    be called before the first grad_* launch (e.g. right after arg parsing, before
+    warmup). It rebinds the constants on both this module and the forward module it
+    borrows K/N from, and returns D for convenience.
+    """
+    global K, N, SPLIT, NRED_BLK, NRED_COL_TILES, KOUT_BLOCKS, NRED_TILES
+    global NK_TILES, NN_TILES
+    if D % DDENSE_BK or D % DDENSE_BN or D % BLOCK_N or D % BLOCK_K:
+        raise ValueError(
+            f"D={D} must be divisible by the tile sizes "
+            f"(DDENSE_BK={DDENSE_BK}, DDENSE_BN={DDENSE_BN}, BLOCK_N={BLOCK_N}, BLOCK_K={BLOCK_K})"
+        )
+    import jagged_dense_bmm as _fwd
+
+    K = N = int(D)
+    _fwd.K = _fwd.N = int(D)
+    _fwd.N_BLOCKS = N // BLOCK_N
+    SPLIT = 2 if K <= 256 else 1
+    NRED_BLK = N if N <= 256 else 256
+    NRED_COL_TILES = (N + NRED_BLK - 1) // NRED_BLK
+    KOUT_BLOCKS = K // BLOCK_N
+    NRED_TILES = N // BLOCK_K
+    NK_TILES = K // DDENSE_BK
+    NN_TILES = N // DDENSE_BN
+    return K
+
+
 def _load_scalar(copy_atom, elem_dtype, divided_tensor, index):
     """Load one element at column `index` from a row already divided by (1, 1)."""
     view = fx.slice(divided_tensor, (None, index))

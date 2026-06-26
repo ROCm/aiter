@@ -79,6 +79,25 @@ Two practical problems were solved to get here:
    system stack (identical 7.2.70200 version), then always restore. Net-zero venv
    change.
 
+> **`--dim D` instead of editing the source constant (2026-06-26).** `D` (= `K = N`)
+> is now overridable at runtime: pass `-d/--dim D` to `profile_jagged_dense_bmm_bwd.py`
+> or `example_jagged_dense_bmm_bwd.py`. It calls `jagged_dense_bmm_bwd.configure_dim(D)`
+> before the first launch (FlyDSL freezes a kernel's globals on first compile), rebinding
+> every D-derived constant. Prefer this over the old hand-edit-`jagged_dense_bmm.py`-and-
+> revert dance — it leaves the source tree clean.
+>
+> **Box caveat (2026-06-26): rocprofiler PMC may be unusable if an unsupported GPU is
+> present.** On a workstation with an MI300X **plus** a Ryzen iGPU (gfx1036),
+> `rocprof-compute profile` / `rocprofv3 --pmc` abort (`unordered_map::at` after
+> `…supported_counters failed for agent … (gfx1036)`). `--kernel-trace`/`--hip-trace`
+> still work (durations/timeline, no counters). `ROCR_VISIBLE_DEVICES` does **not** mask
+> the iGPU from rocprofiler-sdk's KFD enumeration; hiding it needs `CAP_SYS_ADMIN`
+> (mount/cgroup) or a host amdgpu blacklist. When PMC is blocked, get the roofline
+> PMC-free: per-kernel TF/s from `--kernel-trace` durations + analytic FLOPs, ceilings
+> from a timing microbench (see `workloads/roofline_d512_from_bench.py`). **Do not** run
+> `profile_roofline.sh` on a fragile box — its empirical-roofline microbench is a max-
+> throughput GPU stress.
+
 ```bash
 # roofline (lightweight, ~3 counter passes):
 bash aiter/aiter/ops/flydsl/kernels/profile_roofline.sh --only all -b 64 -m 512
@@ -675,6 +694,123 @@ own MFMA throughput; still a win, and the bigger lever, `dense_bias`, wins comfo
   regression (still `split=2`, correctness green). Repo default restored to **D=128**.
 - Remaining headroom: `grad_jagged` @ D=512 uniform (~1.07×) is the tightest — a roofline
   push (g2s vectorization / merged K-column tiles) is the lever there, not `SPLIT`.
+
+## EXP-2026-06-26a — D=512 roofline + per-kernel profile on a new box (B=1024, Mi=7680); runtime-`D` parametrization; rocprofiler PMC blocked by an unsupported iGPU
+
+**New environment (NOT the 2026-06-22 box).** This session ran on a different
+machine — **AMD Ryzen 9 7950X workstation + one MI300X (gfx942) + the CPU's
+integrated GPU (gfx1036)**, torch **2.10.0+rocm7.2.4**, ROCm 7.2.4,
+rocprof-compute **3.4.0**. A fresh **`rocprof_venv`** was created here (the box had
+no profiler-driver venv): `python -m venv rocprof_venv` + the rocprofiler-compute
+`requirements.txt` with **pandas pinned 2.2.3** (pandas 3.x breaks the CSV merge,
+per the Tooling note). Absolute µs/TF-s here are **faster than EXP-2026-06-25c**
+(different torch/ROCm/box) and are **not** cross-comparable to it; use the
+*relative* placement. Empirical ceilings re-measured on this box (pure wall-clock,
+no PMC): **HBM 4.32 TB/s** (triad; copy 3.98) · **bf16 MFMA 680 TF/s achievable**
+(torch hipBLASLt 8192³; theoretical 1307).
+
+**Runtime `D` parametrization (replaces the temp-edit-the-constant practice).**
+The earlier EXP blocks set `K=N=D` by hand-editing `jagged_dense_bmm.py` and
+reverting — error-prone (it had in fact been left at a stray `K=N=256` in the tree).
+Added **`configure_dim(D)`** to `jagged_dense_bmm_bwd.py` (rebinds `K,N` and every
+D-derived constant: `SPLIT, NK_TILES, NN_TILES, NRED_BLK, NRED_COL_TILES,
+KOUT_BLOCKS, NRED_TILES`, plus the forward module's `K,N,N_BLOCKS`) and a **`-d/--dim`**
+flag to `profile_jagged_dense_bmm_bwd.py` and `example_jagged_dense_bmm_bwd.py`.
+FlyDSL snapshots a kernel's used globals on its *first* launch and rejects later
+drift (`jit_function.py:_check_globals_drift`), so `--dim` is applied **before**
+warmup. Verified: `--dim 512` reproduces the source-edit numbers (b64/m512 bench
+djagged 205 vs 209 TF/s, dense_bias 116 vs 115 — within noise) and `example --dim 512`
+is correct (cos 0.999999, uniform+skew). Repo `jagged_dense_bmm.py` left at its
+prior `K=N` with **no stray edit** — D now comes from the CLI.
+
+### rocprofiler-sdk PMC is unusable on this box (root-caused) → PMC-free fallback
+`rocprof-compute profile` (and any `rocprofv3 --pmc`) **aborts** here: the app dies on
+its first GPU op with `RuntimeError: unordered_map::at`, preceded by
+`rocprofiler_iterate_agent_supported_counters failed for agent 2 (gfx1036): Agent HW
+architecture is not supported`. Isolation (tiny torch *and* a 10-line HIP `vadd`):
+**`--hip-trace`/`--kernel-trace` work; `--pmc` always hangs/throws** → it is the
+counter path choking on the **unsupported integrated gfx1036**, independent of torch.
+`ROCR_VISIBLE_DEVICES=0`/`HIP_VISIBLE_DEVICES=0` do **not** help (they hide the iGPU
+from the *app* but not from rocprofiler-sdk's KFD-level agent enumeration), and the
+clean masks (mount/cgroup hiding KFD node 2 = `renderD136`) need `CAP_SYS_ADMIN`,
+which this container lacks (`unshare -m` → EPERM). Per the "avoid taking down the
+server" directive, **`profile_roofline.sh` was NOT used** (it also runs rocprof-compute's
+empirical-roofline microbench, a max-throughput GPU stress that reportedly crashed
+another box); everything below was run **directly** with low iters and a GPU-health
+check (`rocm-smi`) between steps. GPU stayed healthy throughout (≤39 °C, idle between
+runs). Full hardware counters (occupancy, MFMA-util %, dependency-/issue-wait, LDS
+conflicts) therefore **could not be collected**; getting them needs the iGPU hidden
+from rocprofiler (host-side amdgpu blacklist of gfx1036, or a privileged container).
+
+### Per-kernel GPU time (rocprofv3 `--kernel-trace`, mean/call; D=512, B=1024, Mi=7680)
+| kernel | uniform µs | skew µs | VGPR/AGPR | WGs (256-thr) |
+|---|--:|--:|---|--:|
+| `grad_dense_partials` (dDense+dBias, MFMA) | **18242** | **3199** | 96 / 128 | 16,384 (`NK·NN·B`, SPLIT=1) |
+| `grad_jagged` (dJagged GEMM, MFMA) | **13981** | 2604 | 36 / 132 | 122,880 (`120·B`) |
+| `grad_dense_reduce` (fp32→bf16) | 807 | 723 | 4 / 4 | 1,048,576 |
+| `grad_bias_reduce` | 5.0 | 4.9 | 4 / 4 | 2,048 |
+| **full backward (sum)** | **33035** | **6530** | | |
+
+(L: uniform 7,864,320; skew 1,201,999. Durations are pure GPU time from the trace;
+they sum to the wall-clock bench: uniform djagged 13.9 ms / dense_bias 19.1 ms, skew
+2.55 / 3.83 ms.)
+
+### Roofline placement (achieved TF-s exact from durations; AI analytic = upper bound)
+| kernel | regime | TF/s | % of 680 MFMA | achieved HBM BW | % of 4.32 TB/s |
+|---|---|--:|--:|--:|--:|
+| `grad_jagged` | uniform | **295** | **43%** | 1.19 TB/s | 28% |
+| `grad_dense_partials` | uniform | **226** | **33%** | 0.91 TB/s | 21% |
+| `grad_jagged` | skew | 242 | 36% | — | — |
+| `grad_dense_partials` | skew | 197 | 29% | — | — |
+
+Ridge point AI = 680/4.32 = **157 FLOP/byte**; both kernels' analytic AI ≈ 248
+(uniform), so both sit **well into the compute-bound region** — even their *achieved*
+BW is only 21–28% of HBM. PNG: `workloads/roofline_d512_b1024_m7680.png`
+(generator `workloads/roofline_d512_from_bench.py`).
+
+### Findings (what should drive the next optimization)
+- **Both compute kernels are MFMA-efficiency-bound, not memory-bound, at D=512.**
+  `grad_jagged` 43%, `grad_dense_partials` **33%** of the achievable bf16 MFMA ceiling;
+  HBM is ≤28% utilized. The lever is GEMM throughput (g2s vectorization, K-column tile
+  fusion / better operand reuse, deeper pipelining), **not** the reduce tail or bias.
+- **`grad_dense_partials` is the single biggest lever**: 18.2 ms = **55%** of the full
+  backward (uniform) yet the *lowest* %-of-peak (33%). Closing it toward `grad_jagged`'s
+  43% (let alone the matmul's 680 TF/s) is the highest-value work. Its 96 VGPR + 128 AGPR
+  footprint is the likely occupancy limiter (unconfirmed without PMC).
+- **Reduce tail is negligible at D=512 uniform (807 µs, 2.4%)** — `SPLIT=1` keeps the
+  fp32 partials round-trip small, vindicating the D-aware `SPLIT` (EXP-2026-06-25c).
+  **But under skew it is relatively large (723 µs ≈ 18% of `dense_bias`)**: its cost is
+  `n_groups·SPLIT·K·N·4` (D-bound, ~L-independent), so as skew shrinks L the fixed reduce
+  dominates more → a length-aware / smaller-footprint reduce is the skew lever.
+- **`grad_jagged` is ~123k tiny WGs** (`COARSEN_M=2`); at this MFMA efficiency (43%) the
+  remaining headroom is roofline-push, consistent with EXP-2026-06-24b's "dispatch/latency"
+  read (now unconfirmable in detail without counters).
+
+### Gate: **partial — roofline + time-breakdown delivered PMC-free; microarch counters blocked.**
+Roofline (placement + PNG) and an exact per-kernel time/register/grid breakdown are in
+hand and point clearly at **`grad_dense_partials` GEMM efficiency** as the next target.
+The detailed counter report (occupancy / MFMA-util / stall breakdown) is **deferred**
+until rocprofiler PMC works here (hide gfx1036 from the SDK). Correctness re-confirmed at
+D=512 via `example --dim 512` (cos 0.999999, uniform+skew). No source shape left edited.
+
+## Current status (2026-06-26)
+
+**D=512 roofline + per-kernel time breakdown captured on a new MI300X box; rocprofiler
+PMC counters blocked by an unsupported iGPU (EXP-2026-06-26a).** Set up `rocprof_venv`
+(pandas 2.2.3) and replaced the hand-edit-the-`D`-constant practice with a runtime
+**`--dim`** flag (`configure_dim` rebinds all D-derived constants before the first launch;
+verified parity + correctness). `rocprof-compute`/`rocprofv3 --pmc` **abort on this box**
+because rocprofiler-sdk cannot handle the Ryzen iGPU (gfx1036) — `--kernel-trace` works,
+`--pmc` does not, and the iGPU can't be masked without `CAP_SYS_ADMIN`. Ran everything
+**directly** (no `profile_roofline.sh`, no roofline microbench) with health checks; GPU
+stayed cool. **Result (B=1024, D=512, Mi=7680):** both MFMA kernels are **compute/MFMA-
+efficiency-bound, not memory-bound** — `grad_jagged` 295 TF/s (43% of the 680 TF/s
+achievable bf16 ceiling), `grad_dense_partials` 226 TF/s (**33%**); HBM ≤28% used. The
+**partials kernel is 55% of the full backward and the lowest %-of-peak → the next lever is
+its GEMM efficiency**, not the reduce/bias. Reduce tail is 2.4% (uniform) but ~18% under
+skew (D-bound fixed cost). Microarch counters (occupancy etc.) remain **TODO** pending a
+PMC-capable setup. Artifacts: `workloads/ktrace_d512_b1024_m7680_{uniform,skew}/`,
+`workloads/roofline_d512_b1024_m7680.png`.
 
 ## Current status (2026-06-25c)
 
