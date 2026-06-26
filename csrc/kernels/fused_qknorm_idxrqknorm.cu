@@ -43,9 +43,15 @@ __device__ __forceinline__ float warpReduceMax(float val)
     return val;
 }
 
-// fp8 e4m3 max magnitude (matches opus::cast<fp8> clamp range). Per-token dynamic
-// quant scale = amax / FP8_E4M3_MAX so the largest |value| maps to the fp8 max.
-constexpr float kFp8E4M3Max = 448.0f;
+// Per-token dynamic quant scale = amax / fp8_max so the largest |value| maps to the
+// fp8 max. The fp8 max is arch-dependent: OCP e4m3fn (448) on gfx950+, e4m3fnuz (240)
+// on gfx942. opus::finfo<cache_t>::max() resolves this at compile time per arch and
+// matches the opus::cast<fp8> hardware clamp range, so do NOT hardcode 448 here.
+template <typename cache_t>
+__device__ __forceinline__ float fp8Max()
+{
+    return static_cast<float>(opus::finfo<cache_t>::max());
+}
 
 template <typename scalar_t>
 __device__ __forceinline__ void loadElems(const scalar_t* __restrict__ src,
@@ -348,7 +354,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                                            fabsf(static_cast<float>(row_ptr[dim_base + i])));
                     }
                     const float amax = warpReduceMax(local_amax);
-                    v_scale_val = (amax > 0.0f) ? amax / kFp8E4M3Max : 1.0f;
+                    v_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
                     if(lane_id == 0)
                     {
                         const int64_t b = mapped_slot / block_size;
@@ -424,7 +430,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                         local_amax = fmaxf(local_amax, fabsf(elems[i]));
                     }
                     const float amax = warpReduceMax(local_amax);
-                    k_scale_val = (amax > 0.0f) ? amax / kFp8E4M3Max : 1.0f;
+                    k_scale_val = (amax > 0.0f) ? amax / fp8Max<cache_t>() : 1.0f;
                     if(lane_id == 0)
                     {
                         const int64_t b = mapped_slot / block_size;

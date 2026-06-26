@@ -227,6 +227,30 @@ def e8m0_shuffle(scale):
     return shuffle_scale(scale)
 
 
+def e8m0_unshuffle(scale):
+    """Inverse of the e8m0-shuffled layout written by fused_dynamic_mxfp4_quant_moe_sort_hip.
+    Converts from the C++ kernel's fp4_scale_shuffle_id layout back to linear row-major
+    layout, as expected by CK JIT kernels (DeviceMoeGemmMXBPreShuffle, Scale_Stride_AM).
+
+    The scale buffer has shape [m, K/32] where m is a multiple of 32 (not necessarily 256).
+    No padding is applied — the C++ and Python shuffle are equivalent for any m % 32 == 0.
+    """
+    if scale is None:
+        return scale
+    if scale.dtype == torch.float32:
+        return scale
+    assert scale.ndim == 2, "scale must be a 2D tensor"
+    m, n = scale.shape
+    assert m % 32 == 0 and n % 8 == 0, f"scale {m}×{n} not aligned for unshuffle"
+    # The C++ kernel wrote in [m//32, n//8, 4, 16, 2, 2] permuted order (equivalent to
+    # e8m0_shuffle's .view(m//32, 2, 16, n//8, 2, 4).permute(0,3,5,2,4,1)).
+    # Inverse permutation of (0, 3, 5, 2, 4, 1) is (0, 5, 3, 1, 4, 2).
+    t = scale.view(torch.uint8).view(m // 32, n // 8, 4, 16, 2, 2)
+    t = t.permute(0, 5, 3, 1, 4, 2).contiguous()
+    t = t.view(m, n)
+    return t.view(scale.dtype)
+
+
 def down_size(size):
     assert size[-1] % 2 == 0, f"{size} last dim not divisible by two"
     return (*size[:-1], size[-1] // 2)
@@ -797,7 +821,6 @@ def moe_mxfp4_sort(
         blockscale_e8m0 = padded
     M_i, N_i = blockscale_e8m0.shape
     M_o, N_o = sorted_ids.shape[0], N_i
-    assert (N_i // 2) % 2 == 0
     assert block_size % BLOCK_SIZE_M == 0
 
     blockscale_e8m0_sorted = torch.empty(
@@ -842,6 +865,4 @@ def moe_mxfp4_sort(
         grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
         _moe_mxfp4_sort_kernel[grid](*common_args, **common_kwargs)
 
-    # ``N_i`` was padded to a multiple of BLOCK_SIZE_N above, so ``N_o == N_i``
-    # is also a multiple of BLOCK_SIZE_N and the flat view is well-defined.
     return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)
