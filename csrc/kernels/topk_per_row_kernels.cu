@@ -2601,9 +2601,20 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
     }
 }
 
-// Decode entry: dispatches to mb or ob, passes next_n for step-based row length.
-// `workspace` (optional): caller-provided zeroed persistent mb buffer, see
-// top_k_per_row_prefill / get_topk_mb_workspace.
+// Decode entry: always uses the one-block kernel.
+//
+// CUDAGraph replays freeze all CPU-side arguments (including stride0), so
+// should_use_mulblocks() sees the pre-allocated stride0 (e.g. 262144) instead
+// of the actual sequence length, causing the mb path to be selected even when
+// the real data is short.  The mb persistent kernel also risks cross-block
+// barrier deadlock when other streams occupy CUs.  For typical decode batch
+// sizes the one-block kernel is both safer and faster.
+//
+// The original mb/ob dispatch logic is preserved below (commented out) for
+// reference in case multi-block decode is revisited in the future.
+//
+// `workspace` parameter is kept in the signature for API compatibility but
+// is unused on the ob-only path.
 void top_k_per_row_decode(const torch::Tensor& logits,
                           int64_t next_n,
                           const torch::Tensor& seqLens,
@@ -2618,6 +2629,7 @@ void top_k_per_row_decode(const torch::Tensor& logits,
 
     const int kTopK                  = static_cast<int>(k);
     static constexpr bool is_largest = true;
+    constexpr bool select_min        = !is_largest;
     size_t buf_size                  = 0;
 
     const hipStream_t stream = at::hip::getCurrentHIPStream();
@@ -2628,35 +2640,44 @@ void top_k_per_row_decode(const torch::Tensor& logits,
     int* indices_ptr  = indices.data_ptr<int>();
     int* seq_lens_ptr = seqLens.data_ptr<int>();
 
-    if (aiter::should_use_mulblocks(batch, stride0)) {
-        // Prefer the caller's persistent zeroed buffer (memset-free + self_reset);
-        // otherwise fall back to a fresh per-call buffer + the internal memset.
-        const bool prezeroed = workspace.has_value();
-        torch::Tensor fallback;
-        void* ws_ptr;
-        if (prezeroed) {
-            ws_ptr = workspace->data_ptr();
-        } else {
-            const size_t mb_ws = query_mb_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
-            fallback = torch::empty({static_cast<int64_t>(mb_ws)}, options);
-            ws_ptr   = static_cast<void*>(fallback.data_ptr<uint8_t>());
-        }
-        aiter::mb::standalone_stable_radix_topk<float, int, false, true, aiter::mb::Phase::Decode>(
-            ws_ptr, buf_size, logits_ptr, batch, stride0,
-            /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
-            kTopK, /*out=*/nullptr, indices_ptr,
-            is_largest, stream, static_cast<int>(next_n), prezeroed);
-    } else {
-        constexpr bool select_min = !is_largest;
-        // ob path keeps a fresh per-call buffer + its own internal memset.
-        const size_t ob_ws         = query_ob_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
-        torch::Tensor ob_workspace = torch::empty({static_cast<int64_t>(ob_ws)}, options);
-        void* ws_ptr               = static_cast<void*>(ob_workspace.data_ptr<uint8_t>());
-        aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode>(
-            ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
-            batch, stride0,
-            /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
-            kTopK, /*out=*/nullptr, indices_ptr,
-            select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
-    }
+    // Always use one-block path for decode.
+    const size_t ob_ws         = query_ob_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
+    torch::Tensor ob_workspace = torch::empty({static_cast<int64_t>(ob_ws)}, options);
+    void* ws_ptr               = static_cast<void*>(ob_workspace.data_ptr<uint8_t>());
+    aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode>(
+        ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
+        batch, stride0,
+        /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
+        kTopK, /*out=*/nullptr, indices_ptr,
+        select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
+
+    // --- Original mb/ob dispatch (commented out for reference) ---
+    // if (aiter::should_use_mulblocks(batch, stride0)) {
+    //     const bool prezeroed = workspace.has_value();
+    //     torch::Tensor fallback;
+    //     void* ws_ptr;
+    //     if (prezeroed) {
+    //         ws_ptr = workspace->data_ptr();
+    //     } else {
+    //         const size_t mb_ws = query_mb_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
+    //         fallback = torch::empty({static_cast<int64_t>(mb_ws)}, options);
+    //         ws_ptr   = static_cast<void*>(fallback.data_ptr<uint8_t>());
+    //     }
+    //     aiter::mb::standalone_stable_radix_topk<float, int, false, true, aiter::mb::Phase::Decode>(
+    //         ws_ptr, buf_size, logits_ptr, batch, stride0,
+    //         /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
+    //         kTopK, /*out=*/nullptr, indices_ptr,
+    //         is_largest, stream, static_cast<int>(next_n), prezeroed);
+    // } else {
+    //     constexpr bool select_min = !is_largest;
+    //     const size_t ob_ws         = query_ob_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
+    //     torch::Tensor ob_workspace = torch::empty({static_cast<int64_t>(ob_ws)}, options);
+    //     void* ws_ptr               = static_cast<void*>(ob_workspace.data_ptr<uint8_t>());
+    //     aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode>(
+    //         ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
+    //         batch, stride0,
+    //         /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
+    //         kTopK, /*out=*/nullptr, indices_ptr,
+    //         select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
+    // }
 }
