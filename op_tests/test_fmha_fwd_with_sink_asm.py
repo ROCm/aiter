@@ -347,33 +347,33 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
 # ---------------------------------------------------------------------------
 
 
-# Only causal kernels are shipped on gfx1250 (CSV registers only `mask=1`
-# entries — the nocausal `_brd_v8` binaries were removed).  is_causal is kept
-# as a parameter so the kernel-call sites still receive the (now always-True)
-# flag explicitly; if a nocausal binary is re-added, just add `False` back.
-@pytest.mark.parametrize("is_causal", [True])
+# KV-length constraint (mask=0 only): the non-causal (mask=0) kernels only
+# support sk (kv_seqlen) that is a multiple of 256.  
+_CORRECTNESS_SHAPES = [
+    # ----- Small shapes (cheap, GQA-light) ---------------------------
+    (64, 8, 1, 128, 2048, 1),  # D64  aligned
+    (64, 8, 1, 128, 2048, 2),
+    (64, 8, 1, 130, 2048, 1),  # D64  q-unaligned (sq not mult of 128)
+    (64, 8, 1, 128, 2300, 1),  # D64  kv-unaligned (sk not mult of 256) -> causal only
+    (128, 8, 1, 128, 2048, 1),  # D128 aligned
+    (128, 8, 1, 128, 2048, 2),
+    (128, 8, 1, 130, 2048, 1),  # D128 q-unaligned
+    (128, 8, 1, 128, 2300, 1),  # D128 kv-unaligned -> causal only
+    (64, 64, 8, 8192, 8192, 1),  # D64  perf-sized, aligned
+    (128, 64, 4, 4096, 4096, 1),  # D128 perf-sized, aligned
+]
+
+
+_CORRECTNESS_CASES = [
+    (head_dim, hq, hk, sq, sk, batch, causal)
+    for (head_dim, hq, hk, sq, sk, batch) in _CORRECTNESS_SHAPES
+    for causal in (True, False)
+    if causal or (sk % 256 == 0)
+]
+
+
 @pytest.mark.parametrize(
-    "head_dim,hq,hk,sq,sk,batch",
-    [
-        # ----- Small shapes (cheap, GQA-light) ---------------------------
-        # Catch unaligned-sq / unaligned-sk corner cases without paying
-        # the cost of materializing the full [b, h, sq, sk] fp32 attn
-        # matrix in _ref_attn.
-        (64, 8, 1, 128, 2048, 1),  # D64  aligned
-        (64, 8, 1, 128, 2048, 2),
-        (64, 8, 1, 130, 2048, 1),  # D64  q-unaligned (sq not mult of 128)
-        (64, 8, 1, 128, 2300, 1),  # D64  kv-unaligned (sk not mult of 256)
-        (128, 8, 1, 128, 2048, 1),  # D128 aligned
-        (128, 8, 1, 128, 2048, 2),
-        (128, 8, 1, 130, 2048, 1),  # D128 q-unaligned
-        (128, 8, 1, 128, 2300, 1),  # D128 kv-unaligned
-        # ----- Large shapes aligned to run.sh perf_v4_d64 / perf_v4_d128 -
-        # Same memory pressure as test_fmha_fwd_with_sink_asm_perf, batch=1 only
-        # because the reference path's fp32 attn matrix would otherwise
-        # exceed device memory (D64 batch=2 sq=sk=8192 → 32 GB).
-        (64, 64, 8, 8192, 8192, 1),  # D64  perf-sized, aligned
-        (128, 64, 4, 4096, 4096, 1),  # D128 perf-sized, aligned
-    ],
+    "head_dim,hq,hk,sq,sk,batch,is_causal", _CORRECTNESS_CASES
 )
 def test_fmha_fwd_with_sink_asm_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
     device = "cuda"
@@ -573,8 +573,7 @@ def test_fmha_fwd_with_sink_asm_layout(layout, head_dim):
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-# Only causal kernels are shipped (see test_fmha_fwd_with_sink_asm_correctness comment).
-@pytest.mark.parametrize("is_causal", [True])
+@pytest.mark.parametrize("is_causal", [True, False])
 def test_fmha_fwd_with_sink_asm_via_flash_attn_func(head_dim, is_causal):
     device = "cuda"
     torch.manual_seed(0)
@@ -805,8 +804,7 @@ _PERF_SHAPES = [
 
 @pytest.mark.parametrize("init", _PERF_INITS)
 @pytest.mark.parametrize("head_dim,seqlen", _PERF_SHAPES)
-# Only causal kernels are shipped (see test_fmha_fwd_with_sink_asm_correctness comment).
-@pytest.mark.parametrize("is_causal", [True])
+@pytest.mark.parametrize("is_causal", [True, False])
 def test_fmha_fwd_with_sink_asm_perf(head_dim, seqlen, is_causal, init):
     device = "cuda"
     torch.manual_seed(0)

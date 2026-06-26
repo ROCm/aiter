@@ -18,9 +18,9 @@ Sink convention (same as the fixed-batch path / CK attention_ref):
     to the kernel verbatim (no host-side scaling).  D64 kernels read it; D128
     kernels ignore it (pass None).
 
-Only causal kernels are shipped (CSV registers mask=1 rows), so is_causal=True.
-Causal uses bottom-right alignment per sequence (query i attends to key j iff
-j <= i + (sk - sq)), matching flash_attn varlen semantics.
+
+KV-length constraint (mask=0 only): the non-causal (mask=0) kernels only
+support per-sequence kv_seqlen that is a multiple of 256.  
 """
 
 from __future__ import annotations
@@ -131,11 +131,22 @@ def _ref_varlen(q, k, v, cu_q, cu_k, *, is_causal: bool, sink: Optional[torch.Te
 
 
 def make_varlen_packed(
-    seqlens: List[int], hq: int, hk: int, d: int, dv: int, device="cuda", seed=0
+    seqlens: List[int],
+    hq: int,
+    hk: int,
+    d: int,
+    dv: int,
+    device="cuda",
+    seed=0,
+    init: str = "randn",
 ):
     """Build packed THD q/k/v + cu_seqlens for the given per-batch seqlens.
 
     Uses equal q/k seqlens per batch (standard varlen self-attention).
+
+    init pattern (mirrors the fixed-batch perf test's `_make_qkv_perf`):
+      "randn"     : standard normal (default; exercises real attention math).
+      "const0.25" : fill every element with 0.25 
     """
     torch.manual_seed(seed)
     cu = torch.tensor(
@@ -145,6 +156,12 @@ def make_varlen_packed(
     q = torch.randn(total, hq, d, dtype=torch.bfloat16, device=device)
     k = torch.randn(total, hk, d, dtype=torch.bfloat16, device=device)
     v = torch.randn(total, hk, dv, dtype=torch.bfloat16, device=device)
+    if init == "const0.25":
+        q.fill_(0.25)
+        k.fill_(0.25)
+        v.fill_(0.25)
+    elif init != "randn":
+        raise ValueError(f"unknown perf init pattern: {init!r}")
     cu = cu.to(device)
     return q, k, v, cu
 
@@ -205,23 +222,39 @@ def run_kernel(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("is_causal", [True])
-@pytest.mark.parametrize(
-    "head_dim,hq,hk,seqlens",
-    [
-        # aligned single batch
-        (64, 8, 1, [256]),
-        (128, 8, 1, [256]),
-        # multi-batch, mixed (some unaligned) seqlens
-        (64, 8, 1, [128, 256, 384]),
-        (128, 8, 1, [128, 256, 384]),
-        (64, 8, 2, [100, 200, 300]),  # unaligned + GQA
-        (128, 8, 2, [100, 200, 300]),
-        # GQA-heavy, larger
-        (64, 64, 8, [512, 1024]),
-        (128, 64, 4, [512, 1024]),
-    ],
-)
+_CORRECTNESS_SHAPES = [
+    # aligned single batch
+    (64, 8, 1, [256]),
+    (128, 8, 1, [256]),
+    # multi-batch, mixed (some unaligned) seqlens -> causal only
+    (64, 8, 1, [128, 256, 384]),
+    (128, 8, 1, [128, 256, 384]),
+    (64, 8, 2, [100, 200, 300]),  # unaligned + GQA
+    (128, 8, 2, [100, 200, 300]),
+    # 256-aligned multi-batch (exercised under BOTH causal and mask=0)
+    (64, 8, 1, [256, 512]),
+    (128, 8, 1, [256, 512]),
+    (64, 8, 2, [256, 512, 768]),  # aligned 3-batch + GQA
+    (128, 8, 2, [256, 512, 768]),
+    # GQA-heavy, larger (256-aligned)
+    (64, 64, 8, [512, 1024]),
+    (128, 64, 4, [512, 1024]),
+]
+
+
+def _kv_256_aligned(seqlens) -> bool:
+    return all(s % 256 == 0 for s in seqlens)
+
+
+_CORRECTNESS_CASES = [
+    (hd, hq, hk, sl, causal)
+    for (hd, hq, hk, sl) in _CORRECTNESS_SHAPES
+    for causal in (True, False)
+    if causal or _kv_256_aligned(sl)
+]
+
+
+@pytest.mark.parametrize("head_dim,hq,hk,seqlens,is_causal", _CORRECTNESS_CASES)
 def test_fmha_fwd_with_sink_varlen_asm_correctness(
     head_dim, hq, hk, seqlens, is_causal
 ):
@@ -271,10 +304,10 @@ def test_fmha_fwd_with_sink_varlen_asm_correctness(
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("is_causal", [True])
+@pytest.mark.parametrize("is_causal", [True, False])
 def test_fmha_fwd_with_sink_varlen_asm_via_flash_attn_varlen_func(head_dim, is_causal):
     device = "cuda"
-    hq, hk, seqlens = 8, 1, [128, 256, 384]
+    hq, hk, seqlens = 8, 1, [256, 512, 768]
     q, k, v, cu = make_varlen_packed(seqlens, hq, hk, head_dim, head_dim, device=device)
     max_seqlen_q = max(seqlens)
     scale = 1.0 / math.sqrt(head_dim)
@@ -338,15 +371,27 @@ def _bench(fn, *args, num_iters=20, num_warmup=10, **kwargs) -> float:
     return start.elapsed_time(end) * 1000.0 / num_iters  # us per iter
 
 
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("is_causal", [True])
-def test_fmha_fwd_with_sink_varlen_asm_perf(head_dim, is_causal):
+_VARLEN_PERF_SHAPES = [
+    (64, 64, 8, [4096, 4096]),  # D64  multi-batch
+    (128, 64, 4, [2048, 2048]),  # D128 multi-batch
+    (128, 64, 4, [16384]),  # D128 sq=sk=16384 (long context)
+    (64, 64, 8, [32768]),  # D64  sq=sk=32768 (long context)
+]
+
+# Perf input init patterns (mirrors the fixed-batch perf test's _PERF_INITS):
+#   "randn"     : standard normal (default; exercises real attention math).
+#   "const0.25" : constant 0.25 fill (matches the cpp init_pattern=10 baseline).
+_VARLEN_PERF_INITS = ["randn", "const0.25"]
+
+
+@pytest.mark.parametrize("init", _VARLEN_PERF_INITS)
+@pytest.mark.parametrize("head_dim,hq,hk,seqlens", _VARLEN_PERF_SHAPES)
+@pytest.mark.parametrize("is_causal", [True, False])
+def test_fmha_fwd_with_sink_varlen_asm_perf(head_dim, hq, hk, seqlens, is_causal, init):
     device = "cuda"
-    if head_dim == 64:
-        hq, hk, seqlens = 64, 8, [4096, 4096]
-    else:
-        hq, hk, seqlens = 64, 4, [2048, 2048]
-    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, head_dim, head_dim, device=device)
+    q, k, v, cu = make_varlen_packed(
+        seqlens, hq, hk, head_dim, head_dim, device=device, init=init
+    )
     max_seqlen_q = max(seqlens)
     scale = 1.0 / math.sqrt(head_dim)
     sink = _d64_sink(hq, device) if head_dim == 64 else None
@@ -364,10 +409,13 @@ def test_fmha_fwd_with_sink_varlen_asm_perf(head_dim, is_causal):
         False,
         sink=sink,
     )
-    # Causal FLOPs summed over batches (each ~ 2 * hq * s^2 * 2d / 2).
-    flops = sum(2.0 * hq * s * s * (2 * head_dim) / 2.0 for s in seqlens)
+    # FLOPs summed over batches (each ~ 2 * hq * s^2 * 2d); causal halves it.
+    flops = sum(2.0 * hq * s * s * (2 * head_dim) for s in seqlens)
+    if is_causal:
+        flops /= 2.0
     tflops = flops / (us * 1e-6) / 1e12
     print(
-        f"[perf varlen] d={head_dim} causal={is_causal} seqlens={seqlens}: {us:.1f}us, {tflops:.2f} TFLOPS"
+        f"[perf varlen] d={head_dim} causal={is_causal} hq={hq} hk={hk} "
+        f"seqlens={seqlens} init={init}: {us:.1f}us, {tflops:.2f} TFLOPS"
     )
     assert us > 0.0 and math.isfinite(tflops)
