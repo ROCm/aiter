@@ -243,10 +243,9 @@ def _pack_factors(cfg: _GroupedA8W4Config) -> tuple[int, int]:
     return 1, 2
 
 
-def _preshuffled_scale_shape(
+def preshuffled_scale_shape(
     rows: int, k_dim: int, warp_tile: int, tile_k: int
 ) -> tuple[int, int]:
-    # Matches tests.kernels.test_gemm_mxscale_gfx1250.preshuffle_e8m0_scale.
     k_scale = int(k_dim) // 32
     scale_k_per_tile = int(tile_k) // 32
     if k_scale % scale_k_per_tile != 0:
@@ -263,7 +262,7 @@ def _preshuffled_scale_shape(
     return int(rows) // wmma_rep, k_scale * wmma_rep
 
 
-def _preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
+def preshuffled_b_scale_shape(rows: int, k_dim: int) -> tuple[int, int]:
     """Weight (B) scale shape in the n32k4 layout: (rows//32, (k_dim//32)*32).
 
     Matches ``aiter.ops.shuffle.shuffle_scale_n32k4``: a 32-row super-block folds
@@ -318,10 +317,10 @@ def _check_stage1_args(
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
     scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
-    scale_x_shape = _preshuffled_scale_shape(
+    scale_x_shape = preshuffled_scale_shape(
         scale_x_rows, cfg.model_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_b_scale_shape(2 * cfg.inter_dim, cfg.model_dim)
+    scale_w_shape = preshuffled_b_scale_shape(2 * cfg.inter_dim, cfg.model_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(
@@ -930,10 +929,10 @@ def _check_stage2_args(
         )
     warp_tile_m = cfg.tile_m // cfg.m_warp
     scale_x_rows = int(x.shape[1]) if cfg.grouped_contiguous_m else cfg.max_m
-    scale_x_shape = _preshuffled_scale_shape(
+    scale_x_shape = preshuffled_scale_shape(
         scale_x_rows, cfg.inter_dim, warp_tile_m, cfg.tile_k
     )
-    scale_w_shape = _preshuffled_b_scale_shape(cfg.model_dim, cfg.inter_dim)
+    scale_w_shape = preshuffled_b_scale_shape(cfg.model_dim, cfg.inter_dim)
     expected_scale_x = (1 if cfg.grouped_contiguous_m else cfg.experts, *scale_x_shape)
     if tuple(scale_x.shape) != expected_scale_x:
         raise ValueError(

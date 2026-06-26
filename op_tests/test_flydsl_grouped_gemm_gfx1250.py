@@ -25,6 +25,7 @@ check (``--scenario verify``).
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import os
 import sys
 from typing import Optional
@@ -33,6 +34,7 @@ import pytest
 import torch
 
 from aiter import ActivationType, QuantType, logger
+from aiter.aot.flydsl.common import run_only_env  # noqa: E402
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -434,6 +436,7 @@ def run_moe(
     bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
+    check_aot_cache: bool = True,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
     validated path: bench checks (and times) the CUDA-graph production path;
@@ -448,21 +451,23 @@ def run_moe(
     tag = f"{data_format} {layout} {act}"
 
     # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
-    out, ref, us = _run_grouped_via_fused_moe(
-        experts=experts,
-        tokens=tokens,
-        topk=topk,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        data_format=data_format,
-        layout=layout,
-        activation=activation,
-        swiglu_limit=swiglu_limit,
-        use_bias=use_bias,
-        bench=bench,
-        warmup=warmup,
-        iters=iters,
-    )
+    run_only = run_only_env() if check_aot_cache else nullcontext()
+    with run_only:
+        out, ref, us = _run_grouped_via_fused_moe(
+            experts=experts,
+            tokens=tokens,
+            topk=topk,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            data_format=data_format,
+            layout=layout,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            use_bias=use_bias,
+            bench=bench,
+            warmup=warmup,
+            iters=iters,
+        )
     mode = "graph" if bench else "eager"
     ld = _logits_diff(out, ref)
     rel = _rel_l2(out, ref)
@@ -630,6 +635,14 @@ def main() -> None:
         help="call the real grouped WMMA GEMM kernel. Default: True on gfx1250, "
         "False elsewhere (mock the GEMM so the tiny operators run on any arch).",
     )
+    parser.add_argument(
+        "--no-check-aot-cache",
+        action="store_true",
+        help="disable the default AOT cache-miss check. By default the test "
+        "runs in FlyDSL run-only mode (FLYDSL_RUNTIME_RUN_ONLY=1): kernels "
+        "load the AOT-precompiled artifact and never JIT-compile, so a cache "
+        "miss raises. Pass this flag to allow runtime JIT compilation.",
+    )
     args = parser.parse_args()
     if not args.real_gemm:
         _mock_grouped_gemm()
@@ -666,6 +679,7 @@ def main() -> None:
             activation=activation,
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
+            check_aot_cache=not args.no_check_aot_cache,
             raise_on_fail=False,
             bench=args.scenario == "bench",
             warmup=args.warmup,
