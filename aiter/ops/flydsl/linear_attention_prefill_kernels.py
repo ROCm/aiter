@@ -1164,7 +1164,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     _naive_active = _fork == "naive"
     _naive_opt_active = _fork == "naive_opt"
     # KV-class forks (h stored [..., K, V] -> host transposes to VK).
+    # NOTE: kv_naive now writes the public VK layout [..., V, K] directly
+    # (h-b128 coalesced store via lds_ht), so it is NOT in the transpose set --
+    # only the optimized ``kv`` fork still writes [..., K, V] and needs the view.
     _kv_active = _kv_opt_active or _kv_naive_active
+    _kv_needs_transpose = _kv_opt_active
     if _kv_opt_active:
         _compile_fn = _get_or_compile_kv
     elif _kv_naive_active:
@@ -1220,7 +1224,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     #     transposed VK view is returned below so the public layout stays VK.
     # ``_kv_active`` was set at the compile-fn selection above; the VK fork
     # (``_vk_active``) writes the public VK layout directly, no view needed.
-    h_shape = (B, NT, H, K, V) if _kv_active else (B, NT, H, V, K)
+    h_shape = (B, NT, H, K, V) if _kv_needs_transpose else (B, NT, H, V, K)
     vn_shape = (B, H, T_flat, V)
     vn_dtype = u.dtype
     fs_shape = (N, H, V, K) if output_final_state else None
@@ -1288,10 +1292,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         stream,
     )
 
-    # OPT-KV: the KV fork wrote h as [B, NT, H, K, V]; return a transposed
-    # VIEW so the public layout stays VK (zero-copy stride swap). The VK fork
-    # writes the public VK layout ([..., V, K]) directly, so no view is needed.
-    if _kv_active:
+    # OPT-KV: the optimized ``kv`` fork wrote h as [B, NT, H, K, V]; return a
+    # transposed VIEW so the public layout stays VK (zero-copy stride swap).
+    # The VK forks and kv_naive (h-b128) write the public VK layout
+    # ([..., V, K]) directly, so no view is needed.
+    if _kv_needs_transpose:
         h = h.transpose(-2, -1)
 
     return h, (v_new_buf if save_vn else None), final_state

@@ -155,6 +155,29 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_K_ELEMS = K * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
+    # EXPERIMENT (h-b128): transpose buffer for the h snapshot store. h is now
+    # written to HBM in the public VK layout [..., V, K] (K innermost), and to
+    # get a coalesced b128 (8 bf16) HBM write each thread must hold 8 CONTIGUOUS
+    # K for one V. The MFMA accumulators put a lane's 4 elems along K (V-tile
+    # fixed), so we first stage h_accs into this [V, K] LDS buffer (K innermost,
+    # contiguous), barrier, then cooperatively read 8 contiguous K per thread
+    # and vec_store(8) -> buffer_store_dwordx4. Row pad on the V axis breaks
+    # bank conflicts on the staging write.
+    #
+    # OCCUPANCY: gfx950 has 160KB LDS/CU; 3 waves/SIMD needs <= 160/3 = 53.3KB
+    # per WG. A SEPARATE 17KB transpose buffer would push 44KB -> 60KB and drop
+    # to 2 waves/SIMD (LDS-bound), which measured ~3.6% SLOWER despite halving
+    # buffer_store. So lds_ht ALIASES lds_k (18KB >= 17KB needed): the snapshot
+    # runs at the very start of the chunk, BEFORE this chunk's k is loaded into
+    # lds_k (step 3), and AFTER the previous chunk's GEMM2 finished reading
+    # lds_k -- a top-of-step-1 barrier guards that WAR. Net LDS stays 44KB ->
+    # 3 waves preserved. (Same aliasing trick HIP uses for gated_v/h_state.)
+    LDS_HT_PAD = 8  # pad on K axis (bf16); keeps 8-K vec aligned, breaks banks
+    LDS_HT_STRIDE = K + LDS_HT_PAD  # [V, K] : K innermost
+    LDS_HT_ELEMS = BV * LDS_HT_STRIDE
+    LDS_HT_BYTES = LDS_HT_ELEMS * 2
+    assert LDS_HT_ELEMS <= LDS_K_ELEMS, "lds_ht must fit inside aliased lds_k"
+
     # EXPERIMENT (u-prefetch): stage u cooperatively into lds_u [BT, BV] so the
     # per-lane v_new reads come from LDS instead of 16 scalar buffer_load_ushort
     # from HBM (u was the #2 VMEM-wait hotspot). u is V-contiguous in HBM, so the
@@ -171,13 +194,13 @@ def compile_chunk_gated_delta_h_kv_naive(
     # NOTE: lds_g removed -- gating reads g inline from HBM per lane (no g
     # staging buffer / no extra w-barrier publish dependency).
 
-    _K5_KERNEL_REVISION = 211  # u-prefetch: stage u into lds_u (was 16 scalar loads)
+    _K5_KERNEL_REVISION = 213  # h-b128 + lds_ht aliases lds_k (keep 44KB -> 3 waves)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_kv_naive_nolds_g_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_kv_naive_vkb128alias_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
@@ -185,6 +208,10 @@ def compile_chunk_gated_delta_h_kv_naive(
     allocator.ptr = lds_k_offset + LDS_K_BYTES
     lds_u_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_u_offset + LDS_U_BYTES
+    # h-b128: lds_ht ALIASES lds_k (no extra allocation) to keep LDS at 44KB
+    # and preserve 3 waves/SIMD. See the LDS_HT comment above for the WAR
+    # lifetime argument; a top-of-step-1 barrier enforces it.
+    lds_ht_offset = lds_k_offset
 
     # Cooperative load parameters
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
@@ -243,6 +270,8 @@ def compile_chunk_gated_delta_h_kv_naive(
         lds_k = STensor(lds_k_ptr, dtype=T.bf16, shape=(LDS_K_ELEMS,))
         lds_u_ptr = SmemPtr(lds_base_ptr, lds_u_offset, T.bf16, shape=(LDS_U_ELEMS,))
         lds_u = STensor(lds_u_ptr, dtype=T.bf16, shape=(LDS_U_ELEMS,))
+        lds_ht_ptr = SmemPtr(lds_base_ptr, lds_ht_offset, T.bf16, shape=(LDS_HT_ELEMS,))
+        lds_ht = STensor(lds_ht_ptr, dtype=T.bf16, shape=(LDS_HT_ELEMS,))
 
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
@@ -372,29 +401,54 @@ def compile_chunk_gated_delta_h_kv_naive(
             i_t_i32 = fx.Int32(i_t)
 
             # ============================================================
-            # 1. h snapshot: h_accs -> HBM directly, KV [..., K, V] layout.
-            # Each lane writes its 4 acc elems (4 consecutive K, V apart in
-            # memory) as 4 scalar bf16; adjacent lanes (lane_n) write adjacent
-            # V => coalesced. No lds_h, no barrier.
+            # 1. h snapshot: h_accs -> lds_ht [V, K] -> coalesced b128 HBM
+            # (public VK layout [..., V, K], K innermost). EXPERIMENT (h-b128):
+            #   (a) stage: each lane owns V col (wid*16+lane_n); its 4 acc elems
+            #       are 4 CONTIGUOUS K, written as one vec_store(4) into lds_ht.
+            #   (b) barrier.
+            #   (c) coalesced store: re-map threads so each thread reads 8
+            #       CONTIGUOUS K for one V from lds_ht and vec_store(8) to HBM
+            #       -> buffer_store_dwordx4 (was 4 scalar buffer_store_short).
+            # lds_ht ALIASES lds_k: this WAR barrier ensures the PREVIOUS chunk's
+            # GEMM2 finished reading lds_k before the staging below overwrites it
+            # (no barrier sits between the prev-chunk GEMM2 and here otherwise).
             # ============================================================
+            gpu.barrier()
+            ht_v_col = wid * fx.Int32(16) + lane_n
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(N_REPEAT):
                     acc_val = h_accs_in[kb * N_REPEAT + slot]
-                    h_v_global = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
-                    for elem_i in range_constexpr(4):
-                        k_global = (
-                            fx.Int32(kb * 64)
-                            + fx.Int32(slot * 16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        h_off = (
-                            h_base
-                            + i_t_i32 * stride_h
-                            + k_global * fx.Int32(V)
-                            + h_v_global
-                        )
-                        h_[fx.Index(h_off)] = acc_val[elem_i].to(fx.BFloat16)
+                    k_tile_base = (
+                        fx.Int32(kb * 64)
+                        + fx.Int32(slot * 16)
+                        + lane_m_base * fx.Int32(4)
+                    )
+                    ht_vec = acc_val.truncf(T.vec(4, T.bf16))
+                    ht_idx = ht_v_col * fx.Int32(LDS_HT_STRIDE) + k_tile_base
+                    lds_ht.vec_store((fx.Index(ht_idx),), ht_vec, 4)
+
+            gpu.barrier()
+
+            # Coalesced b128 read-out: V*K = BV*K elems; each thread does 8
+            # contiguous K (one b128). Groups = BV*(K/8); iters = groups/BLOCK.
+            HT_K8 = K // 8
+            HT_GROUPS = BV * HT_K8
+            HT_ITERS = HT_GROUPS // BLOCK_THREADS
+            for it in range_constexpr(HT_ITERS):
+                grp = fx.Int32(it * BLOCK_THREADS) + tid
+                v_loc = grp // fx.Int32(HT_K8)
+                k8 = (grp % fx.Int32(HT_K8)) * fx.Int32(8)
+                ht_read_idx = v_loc * fx.Int32(LDS_HT_STRIDE) + k8
+                tile8 = lds_ht.vec_load((fx.Index(ht_read_idx),), 8)
+                v_global = i_v * fx.Int32(BV) + v_loc
+                h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k8
+                h_.vec_store((fx.Index(h_off),), tile8, 8)
+
+            # NOTE: no barrier here. readout reads lds_ht(=lds_k); step 2 writes
+            # the independent lds_w/lds_u (no conflict), and step 3's lds_k
+            # overwrite is guarded by the barrier after the u-load below. Adding
+            # a barrier here would be redundant (and costs occupancy-sensitive
+            # sync time over the full NT-chunk loop).
 
             # ============================================================
             # 2. Load w -> lds_w (NO prefetch; load now, use after barrier)
