@@ -83,11 +83,14 @@ def flydsl_mla_reduce_v1(
         final_output.device.index
     ).multi_processor_count
 
-    # Tier from the observed split count = CSR row-0 width (indptr[1] - indptr[0]),
-    # matching the in-kernel `n_splits = indptr[tile+1] - indptr[tile]`. The old
-    # `reduce_partial_map.numel() // num_reduce_tile` miscounts once partial rows
-    # carry a q-dimension (decode_qlen > 1), so derive it from indptr directly.
-    num_splits = int(reduce_indptr[1].item() - reduce_indptr[0].item())
+    # Tier from the worst-case split count across all tiles. The kernel picks its
+    # algorithm at compile time (one tier for the whole launch), while the HIP
+    # kernel dispatches per tile from `n_splits = indptr[tile+1] - indptr[tile]`.
+    # Real decode metadata has variable per-tile splits, so taking only tile 0
+    # (indptr[1] - indptr[0]) can under-size the tier (e.g. m256 when another tile
+    # needs the LDS-backed mlds path) and overflow. Use the max CSR row width.
+    csr = reduce_indptr[: num_reduce_tile + 1]
+    num_splits = int((csr[1:] - csr[:-1]).max().item())
     tier = select_tier(num_splits)
 
     kernel = compile_mla_reduce(
@@ -120,5 +123,7 @@ def flydsl_mla_reduce_v1(
         int(num_cu),
         int(num_reduce_tile),
         int(max_seqlen_q),
+        int(partial_output.size(0)),
+        int(final_output.size(0)),
         stream,
     )

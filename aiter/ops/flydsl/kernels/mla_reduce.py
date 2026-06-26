@@ -120,11 +120,16 @@ def compile_mla_reduce(
     use_exp2: bool = True,
     use_packed_cvt: bool = False,
     use_packed_f32_fma: bool = False,
+    disable_guards: bool = False,
 ):
     """Compile an MLA reduce kernel for fixed (H, Dv, out_dtype, tier).
 
     tier selects the per-work-item algorithm (compile-time); the host picks it
     from the observed num_splits via ``select_tier``. Grid-launch, NTG=1.
+
+    disable_guards: test-only compile-time knob that skips gather/store bounds
+    guards so the suite can run a pre-fix kernel in-process. The production
+    wrapper (mla_reduce_kernels.py) never threads this (defaults False).
     """
     assert Dv % NUM_THREADS == 0, "Dv must be divisible by 128"
     assert tier in _TIER_NLSE, f"bad tier {tier}"
@@ -166,6 +171,9 @@ def compile_mla_reduce(
         stride_s_o: fx.Int32,  # final_output row stride (elements)
         stride_h_o: fx.Int32,  # final_output head stride (elements)
         max_splits: fx.Int32,  # = num_cu (LSE distribution stride)
+        num_reduce_tile: fx.Int32,  # CSR sentinel at indptr[num_reduce_tile]
+        num_partial_rows: fx.Int32,  # partial_output row count (gather bounds)
+        num_final_rows: fx.Int32,  # final_output row count (store q-range)
     ):
         out_t = _out_t(out_dtype)
         c_VEC = fx.Index(VEC)
@@ -206,6 +214,18 @@ def compile_mla_reduce(
         t0 = fx.Int32(g_indptr[tile])
         t1 = fx.Int32(g_indptr[tile + fx.Index(1)])
         n_splits = t1 - t0
+        last = fx.Int32(
+            g_indptr[fx.arith.index_cast(T.index, _to_raw(num_reduce_tile))]
+        )
+
+        # HIP kn_mla_reduce_v1_ps: skip tiles at the CSR sentinel (reduce.cu:692)
+        # or with n_splits<=1. Collapse the seq-loop upper bound instead of an
+        # scf.IfOp body-wrap so inactive tiles never enter gather/store paths
+        # even if reduce_final_map holds garbage q-ranges (serving tail).
+        has_work = fx.arith.andi(
+            fx.arith.cmpi(fx.arith.CmpIPredicate.sgt, n_splits, fx.Int32(1)),
+            fx.arith.cmpi(fx.arith.CmpIPredicate.ne, t0, last),
+        )
 
         if fx.const_expr(use_reduce_final_map):
             q_start = fx.Int32(g_fmap[tile, fx.Index(0)])
@@ -216,6 +236,19 @@ def compile_mla_reduce(
             qo_len = row1_idx0 - row0_idx0
             q_start = fx.Int32(tile) * qo_len
             q_end = (fx.Int32(tile) + fx.Int32(1)) * qo_len
+
+        if fx.const_expr(not disable_guards):
+            q_valid = fx.arith.andi(
+                fx.arith.cmpi(fx.arith.CmpIPredicate.sge, q_start, fx.Int32(0)),
+                fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.slt, q_start, num_final_rows
+                ),
+            )
+            has_work = fx.arith.andi(has_work, q_valid)
+            q_end_oob = fx.arith.cmpi(
+                fx.arith.CmpIPredicate.sgt, q_end, num_final_rows
+            )
+            q_end = q_end_oob.select(num_final_rows, q_end)
 
         col = tid * c_VEC
         lane = tid % fx.Int32(WARP)
@@ -230,24 +263,44 @@ def compile_mla_reduce(
                 shape=(LDS_MAX_SPLITS,),
             )
 
-        # NTG (number of q-position groups) = grid-y, read at runtime so one
-        # compiled kernel is correct for any grid-y in [1, max_seqlen_q]. Mirrors
-        # the HIP kernel's `seq += kNumThreadGroupPerBh` stride (reduce.cu:496).
         ntg = fx.Int32(fx.grid_dim.y)
         seq0 = q_start + fx.Int32(block_idx)
-
-        # Skip empty/degenerate tiles (n_splits <= 1). The real decode metadata
-        # can hand us reduce_indptr rows of width 0 (no partials for this tile)
-        # whose reduce_final_map q-range is uninitialized garbage; HIP guards this
-        # with `reduce_tile_start == last` and `num_splits > 1` (reduce.cu:691,743).
-        # Clamp the loop's upper bound to its lower bound so a no-work tile runs
-        # zero iterations and never dereferences that garbage q-range / stores OOB.
-        has_work = fx.arith.cmpi(fx.arith.CmpIPredicate.sgt, n_splits, fx.Int32(1))
         ub_seq = has_work.select(q_end, seq0)
 
         def gather_row(split_i32, local_seq):
             pmap = fx.Int32(g_pmap[fx.Index(t0 + split_i32)])
-            return fx.Index(pmap + local_seq)
+            row_i32 = pmap + local_seq
+            if fx.const_expr(not disable_guards):
+                in_bounds = fx.arith.andi(
+                    fx.arith.cmpi(
+                        fx.arith.CmpIPredicate.sge, row_i32, fx.Int32(0)
+                    ),
+                    fx.arith.cmpi(
+                        fx.arith.CmpIPredicate.slt, row_i32, num_partial_rows
+                    ),
+                )
+                safe_row_i32 = in_bounds.select(row_i32, fx.Int32(0))
+            else:
+                in_bounds = fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.eq, fx.Int32(0), fx.Int32(0)
+                )
+                safe_row_i32 = row_i32
+            row_idx = fx.arith.index_cast(
+                ir.IndexType.get(), _to_raw(safe_row_i32)
+            )
+            return row_idx, in_bounds
+
+        def load_split_o(split_i32, local_seq):
+            row_idx, in_bounds = gather_row(split_i32, local_seq)
+            loaded = load_o_elems(g_po, row_idx, fx.Index(head), col)
+            zero = fx.arith.constant(0.0, type=T.f32)
+            return [in_bounds.select(v, zero) for v in loaded]
+
+        def load_split_lse(split_i32, local_seq):
+            row_idx, in_bounds = gather_row(split_i32, local_seq)
+            lse = g_pl[row_idx, fx.Index(head)]
+            neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
+            return in_bounds.select(lse, neg_inf)
 
         def store_result(seq, out_elems):
             store_off = (
@@ -270,17 +323,15 @@ def compile_mla_reduce(
                 lse_val = _log(sum_e) + max_lse
                 inf = fx.arith.constant(float("inf"), type=T.f32)
                 final_lse_val = bad.select(inf, lse_val)
-                is_lane0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, tid, fx.Int32(0))
+                is_lane0 = fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.eq, tid, fx.Int32(0)
+                )
                 if_lane0 = scf.IfOp(is_lane0, results_=[], has_else=False)
                 with ir.InsertionPoint(if_lane0.then_block):
                     lse_off = fx.Int32(seq) * fx.Int32(H) + fx.Int32(head)
                     g_flse[fx.Index(lse_off)] = final_lse_val
                     scf.YieldOp([])
 
-        # Strided loop over the seq positions this block owns: for seq in
-        # range(q_start + blockIdx.y, q_end, ntg). Built as a raw scf.ForOp (not
-        # the AST `for` rewriter) to match this file's raw-builder idiom and to
-        # avoid auto iter_args inference on a store-only (no-carry) body.
         lb = fx.arith.index_cast(ir.IndexType.get(), _to_raw(seq0))
         ub = fx.arith.index_cast(ir.IndexType.get(), _to_raw(ub_seq))
         st = fx.arith.index_cast(ir.IndexType.get(), _to_raw(ntg))
@@ -290,9 +341,8 @@ def compile_mla_reduce(
             local_seq = seq - q_start
 
             if fx.const_expr(not is_massive):
-                row0 = gather_row(fx.Int32(0), local_seq)
-                o0 = load_o_elems(g_po, row0, fx.Index(head), col)
-                lse0 = g_pl[row0, fx.Index(head)]
+                o0 = load_split_o(fx.Int32(0), local_seq)
+                lse0 = load_split_lse(fx.Int32(0), local_seq)
 
                 init = [_to_raw(o0[i]) for i in fx.range_constexpr(VEC)]
                 init += [_to_raw(lse0), _to_raw(fx.arith.constant(1.0, type=T.f32))]
@@ -304,9 +354,8 @@ def compile_mla_reduce(
                     regs = [state[i] for i in fx.range_constexpr(VEC)]
                     max_lse = state[VEC]
                     sum_e = state[VEC + 1]
-                    rs = gather_row(fx.Int32(s), local_seq)
-                    os = load_o_elems(g_po, rs, fx.Index(head), col)
-                    lse = g_pl[rs, fx.Index(head)]
+                    os = load_split_o(fx.Int32(s), local_seq)
+                    lse = load_split_lse(fx.Int32(s), local_seq)
                     new_max = fx.arith.maximumf(max_lse, lse)
                     old = _exp(max_lse - new_max, use_exp2)
                     new = _exp(lse - new_max, use_exp2)
@@ -328,7 +377,9 @@ def compile_mla_reduce(
                 store_lse(seq, max_lse, sum_e)
             else:
                 neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
-                is_wave0 = fx.arith.cmpi(fx.arith.CmpIPredicate.eq, wave, fx.Int32(0))
+                is_wave0 = fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.eq, wave, fx.Int32(0)
+                )
                 if_w0 = scf.IfOp(is_wave0, results_=[], has_else=False)
                 with ir.InsertionPoint(if_w0.then_block):
                     local_lses = []
@@ -339,8 +390,7 @@ def compile_mla_reduce(
                             fx.arith.CmpIPredicate.slt, split_idx, n_splits
                         )
                         safe = in_rng.select(split_idx, fx.Int32(0))
-                        rs = gather_row(safe, local_seq)
-                        lse_j = g_pl[rs, fx.Index(head)]
+                        lse_j = load_split_lse(safe, local_seq)
                         lse_j = in_rng.select(lse_j, neg_inf)
                         local_lses.append(lse_j)
                         max_lse = fx.arith.maximumf(max_lse, lse_j)
@@ -405,11 +455,11 @@ def compile_mla_reduce(
                     fx.Index(0), fx.Index(n_splits), fx.Index(1), init=acc0
                 ):
                     regs = _as_list(state, VEC)
-                    rs = gather_row(fx.Int32(s), local_seq)
-                    os = load_o_elems(g_po, rs, fx.Index(head), col)
+                    os = load_split_o(fx.Int32(s), local_seq)
                     sc = lds_scale[fx.Index(s)]
                     new_regs = [
-                        _to_raw(regs[i] + os[i] * sc) for i in fx.range_constexpr(VEC)
+                        _to_raw(regs[i] + os[i] * sc)
+                        for i in fx.range_constexpr(VEC)
                     ]
                     accr = yield new_regs
                 accr = _as_list(accr, VEC)
@@ -432,6 +482,8 @@ def compile_mla_reduce(
         max_splits: fx.Int32,
         num_reduce_tile: fx.Int32,
         max_seqlen_q: fx.Int32,
+        num_partial_rows: fx.Int32,
+        num_final_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         if fx.const_expr(is_massive):
@@ -454,6 +506,9 @@ def compile_mla_reduce(
             stride_s_o,
             stride_h_o,
             max_splits,
+            num_reduce_tile,
+            num_partial_rows,
+            num_final_rows,
         ).launch(
             grid=(idx_H, idx_ntg, idx_tiles),
             block=(NUM_THREADS, 1, 1),
