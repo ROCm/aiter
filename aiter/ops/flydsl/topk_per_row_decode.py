@@ -419,16 +419,17 @@ def flydsl_top_k_per_row_decode(
                     "FLYDSL_TOPK_AITER_PERSISTENT_TIERED_SHORT_MAX", 16384
                 )
                 # Per-bucket active-part caps over the fixed launch grid. The
-                # optimum scales down with batch size: a single decode row wants
-                # ~16 parts (more only adds barrier/global-histogram-merge cost),
-                # while multi-row batches already fill the device so fewer parts
-                # per row cut barrier/atomic contention. Measured sweep optima
-                # (gfx942, 304 CU, K=512, mw=256000): rows=1 -> mid/long 16;
-                # rows>=2 -> mid 8; rows>=8 -> long 8. ``long_cap`` is never
-                # better at 32 than 16 at any measured row count, so 32 is
-                # dropped as a default.
+                # optimum scales down with batch size: a single long decode row
+                # benefits from the full g32 active set, while multi-row batches
+                # already fill the device so fewer parts per row cut barrier and
+                # global-histogram merge cost.
                 default_mid_cap = 16 if int(numRows) <= 1 else 8
-                default_long_cap = 8 if int(numRows) >= 8 else 16
+                if int(numRows) <= 1:
+                    default_long_cap = 32
+                elif int(numRows) >= 8:
+                    default_long_cap = 8
+                else:
+                    default_long_cap = 16
                 tiered_mid_cap = _env_int(
                     "FLYDSL_TOPK_AITER_PERSISTENT_TIERED_MID_CAP", default_mid_cap
                 )
