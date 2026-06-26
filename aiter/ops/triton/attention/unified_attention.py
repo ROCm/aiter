@@ -24,6 +24,17 @@ try:
 except:  # noqa: E722
     _unified_attention_gluon_kernel_2d = None
 
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
+        reduce_segments_gluon as _reduce_segments_gluon,
+    )
+except:  # noqa: E722
+    _reduce_segments_gluon = None
+
+# NUM_SEGMENTS values the gluon reduce holds in-thread; larger split counts
+# (very low batch / long context) fall back to the Triton reduce_segments.
+_GLUON_REDUCE_MAX_SEGMENTS = 8
+
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
@@ -640,6 +651,44 @@ def unified_attention(
         elif skip_reduce:
             return segm_output, segm_max, segm_expsum
 
+        head_size_padded = triton.next_power_of_2(head_size)
+        # gluon reduce: one workgroup/token, query heads split across waves,
+        # in-wave (no cross-wave) segment merge. Only valid for all-decode
+        # (seq_idx == query_token_idx) and small split counts; otherwise use
+        # the Triton reduce_segments.
+        gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
+        use_gluon_reduce = (
+            IS_DEVICE_ARCH_GFX12
+            and _reduce_segments_gluon is not None
+            and ALL_DECODE
+            and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
+            and head_size_padded % 32 == 0
+            and num_query_heads % gluon_num_warps == 0
+        )
+        if use_gluon_reduce:
+            _reduce_segments_gluon[(q.shape[0],)](
+                output_ptr=out,
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_query_heads=num_query_heads,
+                out_scale_ptr=output_scale,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                H=num_query_heads,
+                S=NUM_SEGMENTS,
+                D=head_size,
+                D_PAD=head_size_padded,
+                TILE_SIZE=reduce_config["TILE_SIZE"],
+                NUM_WARPS=gluon_num_warps,
+                IS_FP8_OUT=(out.dtype == e4m3_dtype),
+                FP8_MIN=torch.finfo(e4m3_dtype).min,
+                FP8_MAX=torch.finfo(e4m3_dtype).max,
+                num_warps=gluon_num_warps,
+            )
+            return out
+
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=segm_output,
@@ -653,7 +702,7 @@ def unified_attention(
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE_PADDED=head_size_padded,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             **reduce_config,

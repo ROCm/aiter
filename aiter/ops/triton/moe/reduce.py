@@ -4,6 +4,15 @@ import triton
 from aiter.ops.triton._triton_kernels.moe.reduce import _reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
+        reduce_grouped_gluon as _reduce_grouped_gluon,
+    )
+except:  # noqa: E722
+    _reduce_grouped_gluon = None
+
+_GLUON_REDUCE_WARPS = 8
+
 
 def reduce_grouped(
     x: torch.Tensor,
@@ -54,6 +63,43 @@ def reduce_grouped(
     assert x.shape[-1] % reduction_n == 0
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
+
+    # gluon path: one workgroup per group gathers its K*B rows via TDM and sums
+    # in-register (N split across waves). Plain sum only; everything else falls
+    # back to the Triton _reduce_grouped below.
+    N = x.shape[-1]
+    N_PAD = triton.next_power_of_2(N)
+    if (
+        _reduce_grouped_gluon is not None
+        and is_tdm_avail()
+        and indx is not None
+        and not apply_swiglu
+        and residual is None
+        and reduction_n == 1
+        and x.dim() == 3
+        and x.is_contiguous()
+        and indx.is_contiguous()
+        and out.dtype in (torch.bfloat16, torch.float16)
+        and N_PAD % (_GLUON_REDUCE_WARPS * 32) == 0
+        and N_PAD <= 8192
+        and K * x.shape[0] <= 8
+    ):
+        _reduce_grouped_gluon[(num_groups,)](
+            X=x,
+            Out=out,
+            InIndx=indx,
+            stride_xm=x.stride(1),
+            stride_om=out.stride(0),
+            stride_on=out.stride(1),
+            M=x.shape[1],
+            N=N,
+            N_PAD=N_PAD,
+            B=x.shape[0],
+            K=K,
+            NUM_WARPS=_GLUON_REDUCE_WARPS,
+            num_warps=_GLUON_REDUCE_WARPS,
+        )
+        return out
 
     # Step 9: prep external residual buffer + strides for the kernel.
     if residual is not None:
