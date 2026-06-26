@@ -54,12 +54,55 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  ffm-aiter-ut:
-    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }})
+  split_ffm_tests:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
     needs: [check-signal]
+    outputs:
+      shard_count: 5
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Load FFM Triton test suite
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin \
+            "refs/heads/${FFM_TEST_SOURCE_REF}:refs/remotes/origin/${FFM_TEST_SOURCE_REF}"
+          ffm_test_source_commit="$(git rev-parse "refs/remotes/origin/${FFM_TEST_SOURCE_REF}")"
+          echo "FFM test source commit: ${ffm_test_source_commit}"
+          rm -rf "${FFM_TEST}"
+          git checkout "refs/remotes/origin/${FFM_TEST_SOURCE_REF}" -- "${FFM_TEST}"
+          test_count="$(find "${FFM_TEST}" -type f -name 'test*.py' | wc -l | tr -d ' ')"
+          echo "Loaded ${test_count} FFM Triton test files from ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+          if [ "${test_count}" -eq 0 ]; then
+            echo "::error::No FFM Triton test files found in ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+            exit 1
+          fi
+
+      - name: Split FFM Triton Tests (5 shards)
+        run: ./.github/scripts/split_tests.sh --shards 5 --test-type triton
+
+      - name: Upload FFM test shard lists as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffm_triton_shards
+          path: triton_shard_*.list
+          retention-days: 7
+
+  ffm-aiter-ut:
+    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }}) / Shard ${{ matrix.shard }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    needs: [check-signal, split_ffm_tests]
     runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
 
     steps:
       - name: Checkout source
@@ -83,6 +126,22 @@ jobs:
             echo "::error::No FFM Triton test files found in ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
             exit 1
           fi
+
+      - name: Download FFM test shard lists
+        uses: actions/download-artifact@v4
+        timeout-minutes: 15
+        with:
+          name: ffm_triton_shards
+
+      - name: List FFM test shard files
+        run: |
+          ls -l triton_shard_*.list
+
+      - name: Export test file list for this shard as env
+        run: |
+          FFM_TEST_FILES="$(cat triton_shard_${{ matrix.shard }}.list)"
+          echo "${FFM_TEST_FILES}"
+          echo "FFM_TEST_FILES=${FFM_TEST_FILES}" >> "${GITHUB_ENV}"
 
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -138,6 +197,7 @@ jobs:
             --security-opt seccomp=unconfined \
             --shm-size=16gb \
             -e FFM_TEST="${FFM_TEST}" \
+            -e FFM_TEST_FILES="${FFM_TEST_FILES}" \
             -e FFM_TRITON_VERSION="${FFM_TRITON_VERSION}" \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /tmp \
@@ -148,6 +208,7 @@ jobs:
               echo "==== Runtime context ===="
               echo "initial pwd: $(pwd)"
               echo "FFM_TEST=${FFM_TEST}"
+              echo "FFM_TEST_FILES=${FFM_TEST_FILES}"
               echo "PATH=${PATH}"
               echo "PYTHONPATH=${PYTHONPATH:-}"
               cd /root/aiter
@@ -155,6 +216,11 @@ jobs:
               git config --global --add safe.directory /root/aiter
               echo "==== Image test suite info ===="
               find "${FFM_TEST}" -type f -name "test*.py" | wc -l
+              if [ -z "${FFM_TEST_FILES:-}" ]; then
+                echo "::error::FFM_TEST_FILES is empty for shard ${{ matrix.shard }}"
+                exit 1
+              fi
+              echo "Shard ${{ matrix.shard }} file count: $(wc -w <<< "${FFM_TEST_FILES}")"
               export ENABLE_CK=0
               echo "ENABLE_CK=${ENABLE_CK}"
               python3 -m pip show amd-aiter
@@ -198,7 +264,7 @@ jobs:
               python3 -c "from pathlib import Path; import aiter; aiter_dir = Path(aiter.__file__).resolve().parent; jit_dir = aiter_dir / \"jit\"; print(f\"aiter module: {aiter.__file__}\"); print(f\"aiter dir: {aiter_dir}\"); core_modules = sorted(jit_dir.glob(\"**/*core*.so\")); print(f\"FOUND {len(core_modules)} core module(s):\" if core_modules else f\"NOT FOUND: no *core*.so under {jit_dir}\"); [print(path) for path in core_modules]"
               python3 -c "import aiter; print(f\"aiter module: {aiter.__file__}\")"
               python3 -m pip uninstall -y pylama || true
-              python3 -m pytest -v "${FFM_TEST}"
+              python3 -m pytest -v ${FFM_TEST_FILES}
             '
 
       - name: Cleanup
