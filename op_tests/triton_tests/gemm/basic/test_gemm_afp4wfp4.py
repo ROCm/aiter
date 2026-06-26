@@ -13,7 +13,7 @@ from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.shuffle import shuffle_weight, shuffle_scale_gemm
+from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_gemm
 
 DEVICE_ARCH = arch_info.get_arch()
 

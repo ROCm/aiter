@@ -9,7 +9,7 @@ from aiter.ops.triton.attention.mla import (
     mla_prefill_fwd,
     mla_decode_fwd,
 )
-from aiter.ops.shuffle import shuffle_weight, shuffle_scale_batched
+from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_batched
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )

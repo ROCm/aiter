@@ -14,7 +14,7 @@ from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant imp
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -39,9 +39,10 @@ def preshuffle_weights(w: torch.Tensor) -> torch.Tensor:
     (E, K*16, N//16).
 
     This is the same transpose-first per-expert (16, 16) tiling that
-    ``aiter.ops.shuffle.shuffle_weight`` produces on its gfx1250 path, so the
-    host-side shuffle stays single-sourced in ``aiter.ops.shuffle``. The matching
-    in-kernel inverse is ``unshuffle_weights`` in the int8 smoothquant kernel.
+    ``aiter.ops.triton.utils.shuffle.shuffle_weight`` produces on its gfx1250
+    path, so the host-side shuffle stays single-sourced in
+    ``aiter.ops.triton.utils.shuffle``. The matching in-kernel inverse is
+    ``unshuffle_weights`` in the int8 smoothquant kernel.
 
     Args:
         w: int8 weight tensor of shape (E, K, N) where K % 32 == 0 and N % 16 == 0.

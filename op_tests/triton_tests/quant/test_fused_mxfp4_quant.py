@@ -15,7 +15,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     SCALE_GROUP_SIZE,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
 from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.utility.fp4_utils import moe_mxfp4_sort, dynamic_mxfp4_quant
 

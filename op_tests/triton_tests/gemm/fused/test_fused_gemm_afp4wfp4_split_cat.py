@@ -16,7 +16,7 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.shuffle import shuffle_weight
-from aiter.ops.shuffle import shuffle_scale_gemm
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
 
 SCALE_GROUP_SIZE = 32
 

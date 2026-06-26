@@ -13,7 +13,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
     moe_gemm_torch,
 )
-from aiter.ops.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
