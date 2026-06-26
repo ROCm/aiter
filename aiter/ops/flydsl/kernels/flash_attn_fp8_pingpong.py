@@ -138,6 +138,8 @@ def build_flash_attn_fp8_module(
 
         fm_fast = fx.arith.FastMathFlags.fast
 
+        # rocdl.s_setprio(0)
+
         def _fadd(a, b):
             return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
 
@@ -445,8 +447,8 @@ def build_flash_attn_fp8_module(
                 s_accs[nt] = mfma.call(kw[u % 4], q_packs[ks], s_accs[nt])
             return s_accs, vw_prime
 
-        def do_softmax(s_accs, m_running, is_g1=False):
-            if const_expr(SOFTMAX_PRIO != 0 and is_g1):
+        def do_softmax(s_accs, m_running, set_prio=False):
+            if const_expr(SOFTMAX_PRIO != 0 and set_prio):
                 rocdl.s_setprio(SOFTMAX_PRIO)
             local_max = Vec(s_accs[0])[0]
             for nt in range_constexpr(N_KV_TILES):
@@ -488,7 +490,7 @@ def build_flash_attn_fp8_module(
             for ks in range_constexpr(PV_K_STEPS):
                 lr = mfma.call(ones_pack, p_ks_list[ks], lr)
             p_rowsum = Vec(lr)[0]
-            if const_expr(SOFTMAX_PRIO != 0 and is_g1):
+            if const_expr(SOFTMAX_PRIO != 0 and set_prio):
                 rocdl.s_setprio(0)
             return m_new, corr, p_pack, p_rowsum
 
@@ -673,6 +675,7 @@ def build_flash_attn_fp8_module(
 
             # ---- Epilogue: softmax(N-1) then apply deferred PV(N-1). ----
             def g1_epilogue(m_e, l_e, oe0, oe1, oe2, oe3, sce0, sce1, sce2, sce3, *vwp):
+                # rocdl.s_setprio(1)
                 _m_e, corrf, pf, prowsumf = do_softmax([sce0, sce1, sce2, sce3], m_e)
                 _, k_buf_off_e, _, _, _ = _bufs(last_i * fx.Index(BLOCK_N))
                 o, l2, _ = apply_pv(
@@ -685,6 +688,7 @@ def build_flash_attn_fp8_module(
                     list(vwp),
                     k_buf_off_e,
                 )
+                # rocdl.s_setprio(0)
                 return o, l2
 
             # ---- Main loop: tiles 1..N-1 (softmax + DMA K + apply_pv + QK). ----
