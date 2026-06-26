@@ -542,8 +542,11 @@ def opus_gemm(
         kernelId=int(solidx),
         splitK=splitK,
     )
-    if bias is not None:
-        Y = Y + bias
+    # NOTE: do NOT add bias again here -- the opus splitk reduce kernel already
+    # folds `bias` into the fp32 accumulator before the bf16/fp32 cast (HAS_BIAS
+    # path). The previous `Y = Y + bias` double-counted bias (output = A@B^T +
+    # 2*bias), causing ~54% miscompare (maxabs ~= bias range) for every bias!=None
+    # opus shape under tgemm (e.g. ATOM's bf16 linear).
     return Y
 
 
