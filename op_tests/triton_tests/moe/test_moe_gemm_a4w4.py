@@ -248,9 +248,9 @@ def test_op(
             pytest.skip("Preshuffling weights is only supported on gfx1250")
         if backend != "gluon":
             pytest.skip("Preshuffling weights is only supported on gluon backend")
-        if n % 16 != 0 and k % 16 != 0:
+        if n % 16 != 0 or k % 32 != 0:
             pytest.skip(
-                "Preshuffling weights is only supported on shapes where n and k are divisible by 16"
+                "Preshuffling weights requires n divisible by 16 and k divisible by 32"
             )
 
     # skip gluon backend if not supported
