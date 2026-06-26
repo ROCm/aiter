@@ -112,9 +112,10 @@ def _fabs_f32(x):
     return fx.Float32(abs_bits.bitcast(T.f32))
 
 
-def _e8m0_from_amax(amax_f32):
-    """(e8m0_i32, quant_scale_f32) = ceil_pow2(amax/6) clamped to 254."""
-    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(T.i32))
+def _e8m0_from_amax(amax_f32, dtype_max=6.0):
+    """(e8m0_i32, quant_scale_f32) = ceil_pow2(amax/dtype_max) clamped to 254.
+    dtype_max is the output format's max magnitude (fp4 e2m1 = 6, fp8 e4m3 = 448)."""
+    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / dtype_max)).bitcast(T.i32))
     bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
     lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(bexp), _raw(fx.Int32(254)))
     e8m0 = fx.Int32(arith.select(lt, _raw(bexp), _raw(fx.Int32(254))))
@@ -153,12 +154,18 @@ def _gemm1_body_v2(
     interleave,
     b_nontemporal,
     a_dtype,
+    out_dtype,
 ):
     # A activation dtype: fp4 (packed 2/byte) or fp8 (1 byte/elem). Only the A
     # payload path differs (LDS tile size, ds-read gather, mfma A-format); the weight
     # + all e8m0 scale paths are identical. fp8 A uses the raw mfma_scale intrinsic
     # (cbsz=0); fp4 A keeps the fx.gemm fragment path.
     is_f8_a = a_dtype == "fp8"
+    # Intermediate OUTPUT dtype: fp4 (8/i32, INTER//2 bytes/row) or fp8 (mxfp8: 4/i32,
+    # INTER bytes/row). Only the epilogue requant/pack/store differs.
+    is_f8_out = out_dtype == "fp8"
+    out_max = 448.0 if is_f8_out else 6.0  # e4m3 / e2m1 max magnitude
+    out_pack = 1 if is_f8_out else 2  # logical out elems per stored byte
     a_pack = 1 if is_f8_a else 2  # logical A elems per stored byte
     am = 2 // a_pack  # A row-group calls per 8-row sub (fp8=2, fp4=1)
     KH_TILE_A = BK // a_pack  # A bytes per K-tile row in LDS (fp8=256, fp4=128)
@@ -176,6 +183,7 @@ def _gemm1_body_v2(
     NUM_N_BLOCKS = N_OUT // 256
     OUT_AS_PER_CHUNK_DW = ((INTER // 32) // 4 // 2) * 64
     K_G2_HALF = INTER // 2
+    K_G2_BYTES = INTER // out_pack  # output intermediate row stride (fp4 INTER/2, fp8 INTER)
 
     # block -> (m_block_idx, n_block_idx) ; e = sorted_expert_ids[m_block_idx]
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
@@ -565,35 +573,45 @@ def _gemm1_body_v2(
         local_max = local_max.maximumf(local_max.shuffle_xor(fx.Int32(1), fx.Int32(64)))
         local_max = local_max.maximumf(local_max.shuffle_xor(fx.Int32(2), fx.Int32(64)))
 
-        e8m0, qscale = _e8m0_from_amax(local_max)
+        e8m0, qscale = _e8m0_from_amax(local_max, out_max)
         scales_per_mr[mr] = e8m0
 
-        packed_i32 = _raw(fx.Int32(0))
         qscale_raw = _raw(qscale)
-        for w in range_constexpr(4):
-            packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
-                T.i32,
-                packed_i32,
-                _raw(result[2 * w]),
-                _raw(result[2 * w + 1]),
-                qscale_raw,
-                w,
-            )
-        packed = fx.Int32(packed_i32)
-
-        byte_pos = (
+        # fp4 byte position of this lane's 8 elems (8 fp4 = 4 bytes); fp8 doubles it
+        # (8 fp8 = 8 bytes), and the row stride is INTER (vs INTER//2).
+        byte_pos_fp4 = (
             n_block_idx * fx.Int32(BN_INT // 2)
             + wave_grp * fx.Int32(16)
             + kk * fx.Int32(4)
         )
         out_row = m_row + row_local
-        store_off = out_row * fx.Int32(K_G2_HALF) + byte_pos
-        llvm.StoreOp(
-            _raw(packed),
-            _gep1(aqout_base, store_off),
-            alignment=4,
-            nontemporal=True,
-        )
+        if const_expr(is_f8_out):
+            # 8 f32 -> 8 fp8 = 2x vector<2xi16> (4 fp8 each): cvt packs 2 fp8 into the
+            # lo/hi 16-bit half of the running vector. lo holds elems 0..3, hi 4..7.
+            v2i16 = T.vec(2, T.i16)
+            lo = _raw(Vec.filled(2, 0, fx.Int16))
+            lo = rocdl.cvt_scalef32_pk_fp8_f32(v2i16, lo, _raw(result[0]), _raw(result[1]), qscale_raw, 0)
+            lo = rocdl.cvt_scalef32_pk_fp8_f32(v2i16, lo, _raw(result[2]), _raw(result[3]), qscale_raw, 1)
+            hi = _raw(Vec.filled(2, 0, fx.Int16))
+            hi = rocdl.cvt_scalef32_pk_fp8_f32(v2i16, hi, _raw(result[4]), _raw(result[5]), qscale_raw, 0)
+            hi = rocdl.cvt_scalef32_pk_fp8_f32(v2i16, hi, _raw(result[6]), _raw(result[7]), qscale_raw, 1)
+            store_off = out_row * fx.Int32(K_G2_BYTES) + byte_pos_fp4 * fx.Int32(2)
+            llvm.StoreOp(lo, _gep1(aqout_base, store_off), alignment=4, nontemporal=True)
+            llvm.StoreOp(hi, _gep1(aqout_base, store_off + fx.Int32(4)), alignment=4, nontemporal=True)
+        else:
+            packed_i32 = _raw(fx.Int32(0))
+            for w in range_constexpr(4):
+                packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
+                    T.i32, packed_i32, _raw(result[2 * w]), _raw(result[2 * w + 1]),
+                    qscale_raw, w,
+                )
+            store_off = out_row * fx.Int32(K_G2_BYTES) + byte_pos_fp4
+            llvm.StoreOp(
+                _raw(fx.Int32(packed_i32)),
+                _gep1(aqout_base, store_off),
+                alignment=4,
+                nontemporal=True,
+            )
 
     ascaleout_base = _global_base_ptr1(arg_ascaleout)
     if kk == fx.Int32(0):
@@ -636,6 +654,7 @@ def compile_gemm1_a4w4_port(
     TOPK=TOPK_DEFAULT,
     interleave=True,
     a_dtype="fp4",
+    out_dtype="fp4",
 ):
     # use_nt IS the B-load cache policy (v1's `b_aux = 2 if use_nt else 0`;
     # tuned config BM32_NT vs BM32_CACHED): True -> nt (decode), False -> cached.
@@ -647,6 +666,8 @@ def compile_gemm1_a4w4_port(
         )
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
+    if out_dtype not in ("fp4", "fp8"):
+        raise AssertionError(f"out_dtype must be 'fp4' or 'fp8', got {out_dtype!r}")
 
     _K, _INTER, _NE = D_HIDDEN, D_INTER, NE
     assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
@@ -659,7 +680,8 @@ def compile_gemm1_a4w4_port(
     gu_tag = "il" if interleave else "sep"
     bnt_tag = "nt" if b_nontemporal else "cached"
     a_tag = "a8" if a_dtype == "fp8" else "a4"
-    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{bnt_tag}_{gu_tag}_{a_tag}_v2"
+    o_tag = "o8" if out_dtype == "fp8" else "o4"
+    name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{bnt_tag}_{gu_tag}_{a_tag}{o_tag}_v2"
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name=f"gemm1port_v2_smem_{name_suffix}"
@@ -713,6 +735,7 @@ def compile_gemm1_a4w4_port(
                 interleave=interleave,
                 b_nontemporal=b_nontemporal,
                 a_dtype=a_dtype,
+                out_dtype=out_dtype,
             )
 
     @flyc.jit

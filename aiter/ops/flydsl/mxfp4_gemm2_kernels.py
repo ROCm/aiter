@@ -53,27 +53,32 @@ def _epilog_of(atomic, mxfp4out, cshuffle=False):
 
 @functools.cache
 def _get_compiled_mxfp4_gemm2_port(
-    BM, use_nt, NE, N_OUT, epilog, D_INTER, D_INTER_REAL=None
+    BM, use_nt, NE, N_OUT, epilog, D_INTER, D_INTER_REAL=None, a_dtype="fp4"
 ):
     # Backend switch: AITER_MXFP4_GEMM2_V2=1 selects the layout-API v2 port for the
-    # (BM=32, atomic) variant (both use_nt; fast + streaming K-loop). Any other
-    # variant (or the env unset) keeps the byte-exact raw v1 kernel.
+    # (BM=32, atomic) variant (both use_nt; fast + streaming K-loop; a4w4 / a8w4
+    # mxfp8-intermediate input). Any other variant (or the env unset) keeps the v1.
     if (
         os.environ.get("AITER_MXFP4_GEMM2_V2") == "1"
         and (BM, epilog) == (32, "atomic")
     ):
         from .kernels.mxfp4_gemm2_v2 import compile_gemm2_a4w4_port
-    else:
-        from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
+
+        return compile_gemm2_a4w4_port(
+            BM=BM, use_nt=use_nt, NE=NE, N_OUT=N_OUT, epilog=epilog,
+            D_INTER=D_INTER, D_INTER_REAL=D_INTER_REAL, a_dtype=a_dtype,
+        )
+    # v1 (this branch) is fp4-A only.
+    if a_dtype != "fp4":
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm2 a_dtype={a_dtype!r} requires the v2 backend "
+            f"(AITER_MXFP4_GEMM2_V2=1, BM=32, atomic)"
+        )
+    from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
 
     return compile_gemm2_a4w4_port(
-        BM=BM,
-        use_nt=use_nt,
-        NE=NE,
-        N_OUT=N_OUT,
-        epilog=epilog,
-        D_INTER=D_INTER,
-        D_INTER_REAL=D_INTER_REAL,
+        BM=BM, use_nt=use_nt, NE=NE, N_OUT=N_OUT, epilog=epilog,
+        D_INTER=D_INTER, D_INTER_REAL=D_INTER_REAL,
     )
 
 
@@ -140,6 +145,7 @@ def flydsl_mxfp4_gemm2(
     flat_out_scale=None,
     cshuffle=False,
     D_INTER_REAL=None,
+    a_dtype="fp4",
     stream=None,
 ):
     """Run the FlyDSL port gemm2, writing flat_out (plus flat_out_scale when mxfp4out).
@@ -161,7 +167,7 @@ def flydsl_mxfp4_gemm2(
     )
     epilog = _epilog_of(atomic, mxfp4out, cshuffle)
     launch = _get_compiled_mxfp4_gemm2_port(
-        BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL
+        BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL, a_dtype
     )
 
     # grid size = max_m_blocks (an upper bound; the kernel reads the true active

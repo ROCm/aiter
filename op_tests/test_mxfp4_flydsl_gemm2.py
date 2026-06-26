@@ -462,3 +462,130 @@ def test_flydsl_gemm2_parametrized_k_numeric(D_INTER):
     # fp4 intermediate-quant ceiling; KIMI(512) fast path scores the same, so a
     # comparable score at the streaming (768) shape validates the K-loop.
     assert cos > 0.90, f"INTER={INTER} cos={cos:.4f} (n={n})"
+
+
+@_GFX950
+def test_flydsl_gemm2_mxfp8_chain():
+    """a8w4 mxfp8-intermediate chain: gemm1(fp8 A in, fp8 inter OUT) -> gemm2(fp8 A
+    in). Requires both v2 backends. The fp8 intermediate is far more precise than the
+    fp4 one (chain cos ~1.0 vs the ~0.90 fp4 ceiling), validating the fused fp8
+    epilogue + gemm2 fp8 input end-to-end."""
+    import os
+
+    if (
+        os.environ.get("AITER_MXFP4_GEMM1_V2") != "1"
+        or os.environ.get("AITER_MXFP4_GEMM2_V2") != "1"
+    ):
+        pytest.skip("mxfp8 chain requires AITER_MXFP4_GEMM1_V2=1 and AITER_MXFP4_GEMM2_V2=1")
+
+    import aiter
+    from aiter import QuantType, dtypes
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
+    from aiter.ops.flydsl.mxfp4_gemm2_kernels import flydsl_mxfp4_gemm2
+    from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+    from aiter.utility.fp4_utils import mxfp4_to_f32, e8m0_to_f32
+    from op_tests.test_mxfp4_flydsl_gemm1 import _torch_a_scale_sorted_shuffled
+    import torch.nn.functional as Fnn
+
+    NE, H, INTER, TOPK = 385, 7168, 512, 9
+    dev = torch.device("cuda")
+    BM, M, seed = 32, 256, 2
+    tq = aiter.get_torch_quant(QuantType.per_1x32)
+    torch.manual_seed(seed)
+    w1 = torch.randn((NE, 2 * INTER, H), dtype=dtypes.bf16, device=dev) / 10
+    w2 = torch.randn((NE, H, INTER), dtype=dtypes.bf16, device=dev) / 10
+    w1q, w1s = tq(w1, quant_dtype=dtypes.fp4x2)
+    w2q, w2s = tq(w2, quant_dtype=dtypes.fp4x2)
+    w1u8 = shuffle_weight_a16w4(w1q, 16, True).view(torch.uint8)
+    w1sc = shuffle_scale_a16w4(w1s, NE, True).view(torch.uint8)
+    w2u8 = shuffle_weight_a16w4(w2q, 16, False).view(torch.uint8)
+    w2sc = shuffle_scale_a16w4(w2s, NE, False).view(torch.uint8)
+    torch.manual_seed(seed + 1)
+    hidden = torch.randn((M, H), dtype=dtypes.bf16, device=dev) / 10
+    g = torch.Generator(device=dev).manual_seed(seed + 1)
+    bias = torch.randn(NE - 1, generator=g, device=dev) * 0.5
+    scores = torch.randn(M, NE - 1, generator=g, device=dev) + bias
+    rw, rid = torch.topk(scores.softmax(-1), TOPK - 1, dim=-1)
+    sid = torch.full((M, 1), NE - 1, device=dev, dtype=rid.dtype)
+    sw = torch.ones((M, 1), device=dev, dtype=rw.dtype)
+    topk_ids = torch.cat([sid, rid], 1).to(torch.int32)
+    topk_weight = torch.cat([sw, rw], 1).to(torch.float32)
+    active = min(NE, M * TOPK)
+    max_sorted = ((M * TOPK + active * (BM - 1) + BM - 1) // BM) * BM
+
+    def eb():
+        return torch.empty((0,), device=dev, dtype=dtypes.bf16)
+
+    sti = torch.empty((max_sorted,), device=dev, dtype=dtypes.i32)
+    sei = torch.empty((max_sorted // BM,), device=dev, dtype=dtypes.i32)
+    cumsum = torch.empty((2,), device=dev, dtype=dtypes.i32)
+    rev = torch.empty((M * TOPK,), device=dev, dtype=dtypes.i32)
+    swt = torch.empty((max_sorted,), device=dev, dtype=dtypes.fp32)
+    mm = torch.empty((NE,), device=dev, dtype=dtypes.i32)
+    mind = torch.empty((max_sorted,), device=dev, dtype=dtypes.i32)
+    aiter.mxfp4_moe_sort(
+        topk_ids=topk_ids, topk_weight=topk_weight, sorted_token_ids=sti,
+        sorted_expert_ids=sei, cumsum_tensor=cumsum, reverse_sorted=rev,
+        sorted_weights=swt, masked_m=mm, m_indices=mind, bf16_zero_out=eb(),
+        bf16_zero_workspace=eb(), M_logical=M, NE=NE, TOPK=TOPK, D_HIDDEN=H,
+        D_INTER=INTER, MB=BM, prologue=1,
+    )
+    torch.cuda.synchronize()
+    n = int(cumsum[0].item())
+
+    aq, asc = per_1x32_f8_scale_f8_quant(
+        hidden, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    aq = aq.view(torch.uint8).view(M, H).contiguous()
+    asc = asc.view(torch.uint8).view(M, H // 32).contiguous()
+    assh = _torch_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=BM)
+
+    isq = torch.zeros((max_sorted, INTER), device=dev, dtype=torch.uint8)  # fp8 inter
+    isc = INTER // 32
+    N_OUT = 2 * INTER
+    isr = (((max_sorted * (N_OUT // 64) * 4) + isc - 1) // isc + 31) // 32 * 32
+    iss = torch.zeros((isr, isc), device=dev, dtype=torch.uint8)
+    flydsl_mxfp4_gemm1(
+        a_quant=aq, a_scale_sorted_shuffled=assh, w1_u8=w1u8, w1_scale_u8=w1sc,
+        sorted_expert_ids=sei, cumsum_tensor=cumsum, m_indices=mind,
+        inter_sorted_quant=isq, inter_sorted_shuffled_scale=iss, hidden_states=hidden,
+        n_tokens=M, BM=BM, use_nt=True, inline_quant=False, NE=NE, D_HIDDEN=H,
+        D_INTER=INTER, topk=TOPK, interleave=True, a_dtype="fp8", out_dtype="fp8",
+    )
+    torch.cuda.synchronize()
+
+    flat = torch.zeros((M, H), dtype=dtypes.bf16, device=dev)
+    flydsl_mxfp4_gemm2(
+        inter_sorted_quant=isq, inter_sorted_shuffled_scale=iss, w2_u8=w2u8,
+        w2_scale_u8=w2sc, sorted_expert_ids=sei, cumsum_tensor=cumsum,
+        sorted_token_ids=sti, sorted_weights=swt, flat_out=flat, M_logical=M,
+        max_sorted=max_sorted, BM=BM, use_nt=False, atomic=True, mxfp4out=False,
+        NE=NE, D_HIDDEN=H, D_INTER=INTER, topk=TOPK, a_dtype="fp8",
+    )
+    torch.cuda.synchronize()
+
+    A = aq.view(torch.float8_e4m3fn).float()
+    Asc = e8m0_to_f32(asc.view(torch.uint8))
+    A = (A.view(M, H // 32, 32) * Asc.unsqueeze(-1)).view(M, H)
+    W1 = mxfp4_to_f32(w1q.view(torch.uint8))
+    W1s = e8m0_to_f32(w1s.view(torch.uint8)).view(NE, 2 * INTER, H // 32)
+    W1 = (W1.view(NE, 2 * INTER, H // 32, 32) * W1s.unsqueeze(-1)).view(NE, 2 * INTER, H)
+    W2 = mxfp4_to_f32(w2q.view(torch.uint8))
+    W2s = e8m0_to_f32(w2s.view(torch.uint8)).view(NE, H, INTER // 32)
+    W2 = (W2.view(NE, H, INTER // 32, 32) * W2s.unsqueeze(-1)).view(NE, H, INTER)
+    mind_c, sei_c, swt_c = mind[:n].cpu(), sei.cpu(), swt[:n].cpu()
+    ref = torch.zeros((M, H), dtype=torch.float32, device=dev)
+    for r in range(n):
+        tok = int(mind_c[r].item())
+        if tok >= M:
+            continue
+        e = int(sei_c[r // BM].item())
+        gate = A[tok] @ W1[e, :INTER].T
+        up = A[tok] @ W1[e, INTER : 2 * INTER].T
+        inter_r = Fnn.silu(gate) * up
+        ref[tok] += (inter_r @ W2[e].T) * float(swt_c[r].item())
+    cos = Fnn.cosine_similarity(ref.reshape(-1), flat.float().reshape(-1), dim=0).item()
+    print(f"[gemm2 mxfp8 chain] cos={cos:.4f} (n={n})")
+    # fp8 intermediate is much more precise than fp4 (~0.90); expect ~1.0.
+    assert cos > 0.99, f"mxfp8 chain cos={cos:.4f} (n={n})"
