@@ -82,29 +82,6 @@ from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
 
-_STATIC_ADAPTOR_CACHE = {}
-_STATIC_ADAPTOR_CACHE_MAX = 64
-
-
-def _cached_from_dlpack(t: torch.Tensor):
-    key = (
-        int(t.data_ptr()),
-        str(t.device),
-        str(t.dtype),
-        tuple(t.shape),
-        tuple(t.stride()),
-        int(t.storage_offset()),
-    )
-    cached = _STATIC_ADAPTOR_CACHE.get(key)
-    if cached is not None:
-        return cached
-    if len(_STATIC_ADAPTOR_CACHE) >= _STATIC_ADAPTOR_CACHE_MAX:
-        _STATIC_ADAPTOR_CACHE.clear()
-    adaptor = flyc.from_dlpack(t)
-    _STATIC_ADAPTOR_CACHE[key] = adaptor
-    return adaptor
-
-
 # --- shape constants (V4-Pro MVP) -------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64
 
@@ -977,6 +954,36 @@ def flydsl_qk_norm_rope_quant(
         (q_out, kv_out, q_scale_or_None, kv_scale_or_None)
         Scales are ``None`` when ``quant=False``.
     """
+    # ---- gfx1250 dispatch (wave32) ----
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+
+    if _get_gfx() == "gfx1250":
+        from .qk_norm_rope_quant_gfx1250 import flydsl_qk_norm_rope_quant_gfx1250
+
+        return flydsl_qk_norm_rope_quant_gfx1250(
+            q=q,
+            kv=kv,
+            kv_weight=kv_weight,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            positions=positions,
+            num_q_heads=num_q_heads,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            q_weight=q_weight,
+            quant=quant,
+            quant_group_size=quant_group_size,
+            scale_dtype=scale_dtype,
+            q_out=q_out,
+            kv_out=kv_out,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            swa_kv=swa_kv,
+            state_slot_mapping=state_slot_mapping,
+            batch_id_per_token=batch_id_per_token,
+            stream=stream,
+        )
+
     # Validate user-facing inputs with raise (not assert) so the checks are
     # not stripped under ``python -O``. Internal codegen invariants inside
     # _build_kernel/_store_*_vec_g remain as asserts on purpose.
@@ -1020,7 +1027,7 @@ def flydsl_qk_norm_rope_quant(
     # Normalize Q to [T, H, D] (the kernel expects 3D).
     if q.dim() == 2:
         if q.shape[1] != H * D:
-            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H*D}]")
+            raise ValueError(f"q shape {tuple(q.shape)} != [T, H*D={H * D}]")
         if not q.is_contiguous():
             raise ValueError("2D q must be contiguous to .view as [T,H,D]")
         q_view = q.view(T_tok, H, D)
@@ -1131,24 +1138,15 @@ def flydsl_qk_norm_rope_quant(
 
     if stream is None:
         stream = torch.cuda.current_stream()
-
-    def _has_direct_state():
-        return getattr(launcher, "_direct_call_state", None) is not None
+    fx_stream = Stream(stream)
 
     def _ptr_arg(t):
-        if _has_direct_state():
-            return int(t.data_ptr())
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
-    def _stream_arg():
-        if _has_direct_state():
-            return stream
-        return Stream(stream)
-
-    q_weight_static = _cached_from_dlpack(q_weight_arg)
-    kv_weight_static = _cached_from_dlpack(kv_weight)
-    cos_static = _cached_from_dlpack(cos_2d)
-    sin_static = _cached_from_dlpack(sin_2d)
+    q_weight_static = flyc.from_torch_tensor(q_weight_arg)
+    kv_weight_static = flyc.from_torch_tensor(kv_weight)
+    cos_static = flyc.from_torch_tensor(cos_2d)
+    sin_static = flyc.from_torch_tensor(sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
     # kernel uses per-token GTensor base-shift so each chunk's resource span
@@ -1187,7 +1185,7 @@ def flydsl_qk_norm_rope_quant(
             swa_pos_stride,
             swa_cache_size,
             n,
-            _stream_arg(),
+            fx_stream,
         )
         _run_compiled(launcher, *args)
 

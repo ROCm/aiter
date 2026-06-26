@@ -20,9 +20,31 @@ from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
-from ..ops.flydsl.utils import is_flydsl_available
+
+
+def is_flydsl_available():
+    try:
+        from ..ops.flydsl.utils import is_flydsl_available as _is_flydsl_available
+    except ImportError:
+        return False
+    return _is_flydsl_available()
+
 
 aiter_lib = Library("aiter", "FRAGMENT")
+
+
+# Arches whose prebuilt HIP CK blockscale modules ship matching code objects.
+# Other arches (e.g. gfx1201) SIGSEGV uncatchably at kernel launch, so gate
+# before the HIP call rather than try/except. Extend when prebuilts add archs.
+_BLOCKSCALE_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
+
+
+def _hip_blockscale_supported() -> bool:
+    """True if the prebuilt HIP CK blockscale module covers the running arch (else triton)."""
+    try:
+        return get_gfx() in _BLOCKSCALE_HIP_PREBUILT_ARCHES
+    except Exception:
+        return False
 
 
 def gen_gemm_a8w8_ck_fake_tensors(
@@ -635,10 +657,7 @@ def gemm_a8w8_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[-1]
     w_k = WQ.shape[-1]
-    if w_k > k:
-        XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
-        k = XQ.shape[-1]
-    elif w_k < k:
+    if w_k < k:
         raise RuntimeError(
             f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, " f"XQ K={k}"
         )
@@ -664,6 +683,14 @@ def gemm_a8w8_bpreshuffle(
         dtypes.fp8,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     )
+    if config is None and w_k > k:
+        config = get_GEMM_config_with_quant_type(
+            m,
+            n,
+            w_k,
+            dtypes.fp8,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+        )
     if config is not None:
         libtype = config["libtype"]
         splitK = int(config["splitK"])
@@ -672,6 +699,8 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl" and is_flydsl_available():
+            if w_k > k:
+                XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
     if get_gfx() == "gfx1250" and is_flydsl_available():
@@ -690,10 +719,14 @@ def gemm_a8w8_bpreshuffle(
                 f"[gfx1250] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
                 f"falling back to flydsl kernel '{ki.name}'."
             )
+            if w_k > k:
+                XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
             )
     try:
+        if w_k > k:
+            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, 0)
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
     except RuntimeError as e:
         raise RuntimeError(
@@ -739,6 +772,16 @@ def gemm_a8w8_blockscale(
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
+        if not _hip_blockscale_supported():
+            # No CK code object for this arch -> triton (same row-major x_scale
+            # + (N, K) weight layout; JIT-compiles per-arch).
+            from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+                gemm_a8w8_blockscale as _gemm_a8w8_blockscale_triton,
+            )
+
+            xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
+            wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
+            return _gemm_a8w8_blockscale_triton(xq, wq, x_scale, w_scale, dtype=dtype)
         config = get_CKGEMM_config(
             m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
         )
@@ -819,6 +862,39 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
+    if not _hip_blockscale_supported():
+        # No CK code object for this arch -> triton preshuffle. WQ is already
+        # (16,16)-shuffled (the only blockscale layout) == triton's (N//16, K*16)
+        # view; x_scale is column-major. Direct fit.
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale_preshuffle as _gemm_a8w8_blockscale_preshuffle_triton,
+        )
+
+        xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
+        wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
+        # Explicit config (no PRESHUFFLED tuning file on main yet); mirrors the
+        # gfx1201 non-preshuffle M_LEQ_8 default.
+        _fallback_cfg = {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 16,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 8,
+            "matrix_instr_nonkdim": 16,
+            "cache_modifier": ".cg",
+            "NUM_KSPLIT": 1,
+            "kpack": 2,
+        }
+        return _gemm_a8w8_blockscale_preshuffle_triton(
+            xq,
+            wq.reshape(n // 16, k * 16),
+            x_scale,
+            w_scale,
+            dtype=dtype,
+            config=_fallback_cfg,
+        )
     config = get_CKGEMM_config(
         m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
     )

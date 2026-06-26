@@ -5,6 +5,7 @@ import functools
 import os
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Optional
 
 import aiter
@@ -22,8 +23,20 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.ops.flydsl.moe_common import GateMode
+
+try:
+    from aiter.ops.flydsl.utils import is_flydsl_available
+    from aiter.ops.flydsl.moe_common import GateMode
+except ImportError:
+
+    class GateMode(Enum):
+        SEPARATED = "separated"
+        INTERLEAVE = "interleave"
+
+    def is_flydsl_available():
+        return False
+
+
 from aiter import (
     fused_dynamic_mxfp4_quant_moe_sort,
     fused_dynamic_mxfp8_quant_moe_sort,
@@ -270,7 +283,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
 ):
     if not block_size_M:
@@ -326,7 +339,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -362,7 +375,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -405,6 +418,9 @@ def fused_moe_(
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
+    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
+        # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
+        q_dtype_a = dtypes.fp8
     elif quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
@@ -422,35 +438,43 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
-    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-        _maybe_grouped_gfx1250_a8w4_moe,
-    )
+    grouped_a8w4_out = None
+    if is_flydsl_available():
+        try:
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                _maybe_grouped_gfx1250_a8w4_moe,
+            )
+        except ImportError:
+            _maybe_grouped_gfx1250_a8w4_moe = None
 
-    grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        E=E,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        dtype=dtype,
-        activation=activation,
-        quant_type=quant_type,
-        q_dtype_a=q_dtype_a,
-        q_dtype_w=q_dtype_w,
-        isG1U1=isG1U1,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        expert_mask=expert_mask,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        gate_mode=gate_mode,
-    )
+        if _maybe_grouped_gfx1250_a8w4_moe is not None:
+            grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                E=E,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                dtype=dtype,
+                activation=activation,
+                quant_type=quant_type,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                isG1U1=isG1U1,
+                doweight_stage1=doweight_stage1,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                expert_mask=expert_mask,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                gate_mode=gate_mode,
+                swiglu_limit=swiglu_limit,
+            )
+
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
@@ -897,7 +921,7 @@ def _flydsl_stage1_wrapper(
     out_scale_sorted=None,
     bias1=None,
     topk_ids=None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
     **_kwargs,
@@ -940,6 +964,7 @@ def _flydsl_stage1_wrapper(
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
+        k_wave=parsed.get("k_wave", 1),
     )
 
 
@@ -1428,6 +1453,7 @@ def get_2stage_cfgs(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
+        and q_dtype_w != dtypes.fp8
     ):
         return MOEMetadata(
             functools.partial(
@@ -1506,7 +1532,7 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and (activation == ActivationType.Swiglu or _flydsl_force)
         and q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
-        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
@@ -1521,38 +1547,26 @@ def get_2stage_cfgs(
         _out_type = "bf16" if dtype == dtypes.bf16 else "f16"
         # a-dtype "fp4" => a4w4 fp4/fp4; "fp8" => a8w4 fp8/fp4 FlyDSL family.
         _a_type = "fp4" if q_dtype_a == dtypes.fp4x2 else "fp8"
+        # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
+        _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
+        _s2_tk = 256 if (inter_dim % 256 == 0) else 128
+        # Per token tier: (tile_m, stage1 suffix, stage2 suffix).
         if token < 2048:
-            _tile_m = 32
-            _base_kn1 = flydsl_kernel_name(1, _a_type, "fp4", _out_type, 32, 128, 256)
-            _base_kn2 = flydsl_kernel_name(
-                2, _a_type, "fp4", _out_type, 32, 128, 256, "atomic"
-            )
-            kn1 = f"{_base_kn1}_w2"
-            kn2 = f"{_base_kn2}_bnt2"
+            _tile_m, _s1_sfx, _s2_sfx = 32, "_w2", "_bnt2"
         elif token < 4096:
-            _tile_m = 64
-            _base_kn1 = flydsl_kernel_name(1, _a_type, "fp4", _out_type, 64, 128, 256)
-            _base_kn2 = flydsl_kernel_name(
-                2, _a_type, "fp4", _out_type, 64, 128, 256, "atomic"
-            )
-            kn1 = f"{_base_kn1}_w3_bnt0"
-            kn2 = _base_kn2
+            _tile_m, _s1_sfx, _s2_sfx = 64, "_w3_bnt0", ""
         elif token < 16384:
-            _tile_m = 128
-            _base_kn1 = flydsl_kernel_name(1, _a_type, "fp4", _out_type, 128, 128, 256)
-            _base_kn2 = flydsl_kernel_name(
-                2, _a_type, "fp4", _out_type, 128, 128, 256, "atomic"
-            )
-            kn1 = f"{_base_kn1}_w2_bnt0"
-            kn2 = _base_kn2
+            _tile_m, _s1_sfx, _s2_sfx = 128, "_w2_bnt0", ""
         else:
-            _tile_m = 64
-            _base_kn1 = flydsl_kernel_name(1, _a_type, "fp4", _out_type, 64, 128, 256)
-            _base_kn2 = flydsl_kernel_name(
-                2, _a_type, "fp4", _out_type, 64, 128, 256, "atomic"
-            )
-            kn1 = f"{_base_kn1}_w4_bnt0"
-            kn2 = _base_kn2
+            _tile_m, _s1_sfx, _s2_sfx = 64, "_w4_bnt0", ""
+        _base_kn1 = flydsl_kernel_name(
+            1, _a_type, _w_type, _out_type, _tile_m, 128, 256
+        )
+        _base_kn2 = flydsl_kernel_name(
+            2, _a_type, _w_type, _out_type, _tile_m, 128, _s2_tk, "atomic"
+        )
+        kn1 = f"{_base_kn1}{_s1_sfx}"
+        kn2 = f"{_base_kn2}{_s2_sfx}"
 
         # fp8 stage1 kernel names always carry a "_gui" suffix
         # (moe_kernels.py:114-115). Append it before the lookup so the fp8
@@ -1748,7 +1762,7 @@ def fused_moe_2stages(
     bias2=None,
     topk_ids=None,
     topk_weights=None,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
 ):
@@ -1798,9 +1812,9 @@ def fused_moe_2stages(
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
-        and w1.dtype == dtypes.fp4x2
+        and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
     ):
-        # a8w4 mxfp8 activations + mxfp4 weights.
+        # mxfp8 activations + mxfp4 weights (a8w4) OR mxfp8 weights (a8w8).
         if _MOE_A8W4_BYPASS_QUANT:
             # Debug bypass: skip real quant, feed unit scales.
             a1 = hidden_states.to(dtypes.fp8)
@@ -1907,7 +1921,9 @@ def fused_moe_2stages(
         block_m=block_size_M,
         a1_scale=a1_scale,
         w1_scale=(
-            w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
+            w1_scale.view(dtypes.fp8_e8m0)
+            if w1.dtype in (dtypes.fp4x2, dtypes.fp8)
+            else w1_scale
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
@@ -1937,10 +1953,11 @@ def fused_moe_2stages(
         a2_scale = None
     elif (
         quant_type == aiter.QuantType.per_1x32
-        and dtype in [dtypes.bf16]
+        and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
-        and w1.dtype == dtypes.fp4x2
+        and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
     ):
+        # a8w4 / mxfp8: quantize stage1 output to mxfp8 for stage2's fp8 operand.
         if not _MOE_A8W4_BYPASS_QUANT:
             a2 = a2.view(-1, inter_dim)
             a2, a2_scale = fused_dynamic_mxfp8_quant_moe_sort(
@@ -2001,7 +2018,9 @@ def fused_moe_2stages(
         moe_out,
         topk,
         w2_scale=(
-            w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
+            w2_scale.view(dtypes.fp8_e8m0)
+            if w2.dtype in (dtypes.fp4x2, dtypes.fp8)
+            else w2_scale
         ),
         a2_scale=a2_scale,
         block_m=block_size_M,
@@ -2151,8 +2170,8 @@ def torch_moe(
 
 
 # temp workaround for swiglu
-def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
-    if limit == 0.0:
+def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: Optional[float] = 7.0):
+    if limit is None:
         limit = 7.0
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
@@ -2176,7 +2195,7 @@ def torch_moe_stage1(
     w1_scale=None,  # [expert, inter_dim, 1]
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
@@ -2191,12 +2210,15 @@ def torch_moe_stage1(
     elif quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
 
-        w1 = fp4_utils.mxfp4_to_f32(w1)
+        if w1.dtype == dtypes.fp8:  # mxfp8 weight
+            w1 = w1.to(ctype)
+        else:
+            w1 = fp4_utils.mxfp4_to_f32(w1)
         w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
-        if a1_scale is not None:  # skip a16w4
+        if a1_scale is not None:  # skip a16w4 / mxfp8-bf16-activation ref
             hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
-        else:  # a16w4
+        else:  # a16w4 / mxfp8 (bf16 reference activation)
             hidden_states = hidden_states.to(ctype)
     else:
         hidden_states = hidden_states.to(ctype)
@@ -2280,7 +2302,7 @@ def torch_moe_stage1(
         if use_swiglu:
             out = swiglu(gate, up, limit=swiglu_limit)
         else:
-            if swiglu_limit != 0:
+            if swiglu_limit:
                 gate = gate.clamp(min=None, max=swiglu_limit)
                 up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             out = torch_act(gate) * up
@@ -2311,12 +2333,15 @@ def torch_moe_stage2(
     elif quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
 
-        w2 = fp4_utils.mxfp4_to_f32(w2)
+        if w2.dtype == dtypes.fp8:  # mxfp8 weight
+            w2 = w2.to(ctype)
+        else:
+            w2 = fp4_utils.mxfp4_to_f32(w2)
         w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
         if a2_scale is not None:
             hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
-        else:  # a16w4
+        else:  # a16w4 / mxfp8 (bf16 reference activation)
             hidden_states = hidden_states.to(ctype)
     else:
         hidden_states = hidden_states.to(ctype)
