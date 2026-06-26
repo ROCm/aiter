@@ -24,7 +24,7 @@ import time
 
 import torch
 
-from aiter.aot.flydsl.common import compile_only_env
+from aiter.aot.flydsl.common import compile_only_env, run_jobs_parallel
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     FLYDSL_PS_REDUCE_AVAILABLE,
     PA_DECODE_MAX_SPLITS,
@@ -36,11 +36,11 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
 # target model configs. Axes map 1:1 onto the kernel's compile-time constants
 # (sink_dtype is pinned to output_dtype when use_sinks is False; see _expand_spec).
 PA_DECODE_AOT_SPEC = {
-    "head_size": [64],
-    "output_dtype": [torch.bfloat16],
-    "logits_dtype": [torch.bfloat16],
-    "use_sinks": [True],
-    "sink_dtype": [torch.bfloat16],
+    "head_size": [64, 128],
+    "output_dtype": [torch.bfloat16, torch.float16, torch.float32],
+    "logits_dtype": [torch.bfloat16, torch.float16, torch.float32],
+    "use_sinks": [True, False],
+    "sink_dtype": [torch.bfloat16, torch.float16, torch.float32],
     "max_context_partition_num": list(range(1, PA_DECODE_MAX_SPLITS + 1)),
 }
 
@@ -195,16 +195,14 @@ def main():
     print("=" * 72)
 
     t0 = time.time()
-    ok = 0
-    for i, job in enumerate(jobs, 1):
-        res = compile_one_config(**job)
-        if res["compile_time"] is not None:
-            ok += 1
-        print(f"  ... {i}/{len(jobs)} complete")
+    results = run_jobs_parallel(compile_one_config, jobs)
     elapsed = time.time() - t0
 
+    ok = sum(1 for r in results if r["compile_time"] is not None)
+    fail = len(results) - ok
+
     print("=" * 72)
-    print(f"  compiled {ok} ok, {len(jobs) - ok} failed in {elapsed:.1f}s")
+    print(f"  compiled {ok} ok, {fail} failed in {elapsed:.1f}s")
     print("=" * 72)
 
 
