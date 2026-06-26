@@ -37,8 +37,6 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
 # (sink_dtype is pinned to output_dtype when use_sinks is False; see _expand_spec).
 PA_DECODE_AOT_SPEC = {
     "head_size": [64],
-    "query_seq_len": [1, 2, 3, 4],
-    "query_group_size": [8],
     "output_dtype": [torch.bfloat16],
     "logits_dtype": [torch.bfloat16],
     "use_sinks": [True],
@@ -48,8 +46,6 @@ PA_DECODE_AOT_SPEC = {
 
 _AXES = (
     "head_size",
-    "query_seq_len",
-    "query_group_size",
     "output_dtype",
     "logits_dtype",
     "use_sinks",
@@ -57,12 +53,17 @@ _AXES = (
     "max_context_partition_num",
 )
 
+# query_seq_len / query_group_size are passed at launch time and no longer affect
+# the compiled kernel's cache key, so they are not AOT axes. Fixed dummy values
+# are used only to shape the COMPILE_ONLY dummy tensors.
+_DUMMY_QUERY_SEQ_LEN = 1
+_DUMMY_QUERY_GROUP_SIZE = 8
+
 
 def _job_kernel_name(job: dict) -> str:
     return (
         "pa_decode_ps_reduce "
-        f"hs={job['head_size']} ql={job['query_seq_len']} "
-        f"g={job['query_group_size']} out={job['output_dtype']} "
+        f"hs={job['head_size']} out={job['output_dtype']} "
         f"logits={job['logits_dtype']} sink={job['use_sinks']}/{job['sink_dtype']} "
         f"n={job['max_context_partition_num']}"
     )
@@ -101,8 +102,6 @@ def collect_jobs() -> list[dict]:
 def compile_one_config(
     *,
     head_size: int,
-    query_seq_len: int,
-    query_group_size: int,
     output_dtype: torch.dtype,
     logits_dtype: torch.dtype,
     use_sinks: bool,
@@ -115,10 +114,13 @@ def compile_one_config(
     Uses CPU dummy tensors and the inner ``compiled["launch"]`` (default stream)
     so it is safe inside a forked process pool and needs no live CUDA context.
     Only dtype/rank/contiguity of the dummy tensors matter for the cache key, so
-    sizes are minimal (batch=1, num_kv_heads=1).
+    sizes are minimal (batch=1, num_kv_heads=1). query_seq_len/query_group_size
+    are launch-time args (not cache keys), so fixed dummy values are used here.
     """
     result = {"kernel_name": kernel_name, "compile_time": None}
     n = max_context_partition_num
+    query_seq_len = _DUMMY_QUERY_SEQ_LEN
+    query_group_size = _DUMMY_QUERY_GROUP_SIZE
     eq_group = query_seq_len * query_group_size
     dev = torch.device("cpu")
 
@@ -143,8 +145,6 @@ def compile_one_config(
         with compile_only_env():
             compiled = compile_pa_decode_ps_reduce_flydsl(
                 max_context_partition_num=n,
-                query_seq_len=query_seq_len,
-                query_group_size=query_group_size,
                 head_size=head_size,
                 output_dtype_str=_flydsl_dtype_str(output_dtype),
                 logits_dtype_str=_flydsl_dtype_str(logits_dtype),
@@ -169,6 +169,8 @@ def compile_one_config(
                 temporary_output.stride(1),
                 temporary_output.stride(2),
                 temporary_output.stride(3),
+                query_seq_len,
+                query_group_size,
                 output.shape[0],
                 output.shape[2],
             )
