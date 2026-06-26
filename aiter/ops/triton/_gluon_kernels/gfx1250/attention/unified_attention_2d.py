@@ -1080,9 +1080,7 @@ class AttentionProgram:
         layout: gl.constexpr = cfg.pv_layout
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
         offs_d = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout))
-        query_pos = (
-            q_block_local_idx * cfg.BLOCK_Q + offs_m // cfg.NUM_QUERIES_PER_KV
-        )
+        query_pos = q_block_local_idx * cfg.BLOCK_Q + offs_m // cfg.NUM_QUERIES_PER_KV
         query_offset_0 = cur_batch_in_all_start_index + query_pos
         query_offset_1 = (
             kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m % cfg.NUM_QUERIES_PER_KV
@@ -1104,9 +1102,7 @@ class AttentionProgram:
 
         # M, L: [BLOCK_M]
         ml_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS
-        ml_offs = (
-            query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS + split_idx
-        )
+        ml_offs = query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS + split_idx
         gl.store(partial_m_ptr + ml_offs, M, mask=row_mask)
         gl.store(partial_l_ptr + ml_offs, L, mask=row_mask)
 
@@ -1501,9 +1497,7 @@ def attention_loop_tensor_subtile_split(
         qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
 
     # FP8: qk_layout (K from HEAD_SIZE) and pv_layout (K from TILE_SIZE) can carry
-    # different WMMA instr_shape K dims, so they are distinct layouts even though the
-    # MxN result distribution is identical. Relabel QK to pv_layout (trivial no-op) so
-    # the softmax state (M/alpha) and p share one layout, as loop variants 0/1 do.
+    # different WMMA instr_shape K dims. Relabel QK to pv_layout (trivial no-op)
     qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
     qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
     qk = pgm.concat_subtile(qk0, qk1)
@@ -1900,9 +1894,7 @@ def _unified_attention_gluon_kernel_2d(
         q_block_local_idx = q_block_global_idx - q_block_start_idx
 
         cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
-        cur_batch_query_len = (
-            cur_batch_in_all_stop_index - cur_batch_in_all_start_index
-        )
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
         # Not needed when num programs is computed precisely
         if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
@@ -1952,11 +1944,6 @@ def _unified_attention_gluon_kernel_2d(
             + (BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV
             + 1
         )
-        # Clamp to [1, seq_len]. The lower bound handles the degenerate case
-        # where every query in this M-block has an empty causally-allowed key
-        # set (happens when cur_batch_query_len > kv_len and q_pos+context_len<0
-        # for the whole block). Forcing tile_end >= 1 keeps the loop-final
-        # "last masked tile" well-defined (j=0 with all-mask, not j=-N).
         max_seq_prefix_len = gl.maximum(1, gl.minimum(max_seq_prefix_len, seq_len))
     else:
         max_seq_prefix_len = seq_len

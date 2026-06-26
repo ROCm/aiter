@@ -768,17 +768,13 @@ def _gfx1250_unified_attention_2d(
     ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
 
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
-    # Upper bound on masked tiles. +1 because the causal diagonal isnt
-    # tile-aligned, the query_span-wide band sits at an arbitrary key offset
-    # and can spill into one extra tile
+    # Upper bound on masked tiles
     query_span = (BLOCK_M - 1) // NUM_QUERIES_PER_KV + 1
     max_mask_tiles = (query_span + TILE_SIZE - 1) // TILE_SIZE + 1
     # other variants do at most 2 masking at the end of loop
     if max_mask_tiles > 2:
         loop_variant = 0
-    # Loop variants 1/2 split the KV tile in half (subtile WMMA + concat), which
-    # needs TILE_SIZE > 32; small tiles (e.g. non-shuffled block_size <= 32) fall
-    # back to the standard double-buffered loop.
+    # fall back to the standard double-buffered loop
     if TILE_SIZE <= 32:
         loop_variant = 0
     if not ALL_DECODE:
