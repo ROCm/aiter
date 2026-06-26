@@ -551,6 +551,48 @@ if _HAVE_TRITON:
         sb = ((E + 127) & 0xFF).to(tl.uint8)
         tl.store(scale_ptr + scale_off, sb, mask=m)
 
+    @triton.jit
+    def _gather_k_lds_kernel(
+        packed_ptr,  # uint8 packed K [b, sk, h, 96] flattened (contiguous)
+        buf_ptr,  # uint8 LDS-order output buffer [b, h, k_hs] flattened
+        srcw_ptr,  # int32 [k_hs] within-(b,h) source byte offset = (gc//96)*(h*96)+(gc%96)
+        valid_ptr,  # int8 [k_hs] 1=keep, 0=zero (fp6 dup/overflow + partial-seq tail)
+        KHS,  # nt*16384 output bytes per (b,h)
+        SKH96,  # sk*h*96 = packed bytes per batch
+        H,  # heads
+        BLOCK: tl.constexpr,
+    ):
+        # One fused pass replacing the torch permute+contiguous / advanced-index gather /
+        # masked_fill / buffer-copy chain (~4 full-size passes -> 1 gathered read + 1 write).
+        pid = tl.program_id(0)
+        nchunk = KHS // BLOCK
+        bh = pid // nchunk
+        chunk = pid % nchunk
+        bIdx = bh // H
+        hIdx = bh % H
+        p = chunk * BLOCK + tl.arange(0, BLOCK)
+        srcw = tl.load(srcw_ptr + p)
+        valid = tl.load(valid_ptr + p)
+        src_addr = bIdx * SKH96 + hIdx * 96 + srcw
+        byte = tl.load(packed_ptr + src_addr).to(tl.int32)
+        byte = tl.where(valid != 0, byte, 0).to(tl.uint8)
+        tl.store(buf_ptr + bh * KHS + p, byte)
+
+
+_QK_FIELD_PERM_CACHE: dict = {}
+
+
+def _qk_field_perm_dev(device):
+    """Cached per-device int32 field permutation for the lastdim fp6 pack. _qk_field_perm() is a
+    compile-time constant, but rebuilding it + a PAGEABLE host->device copy on EVERY Q and K pack
+    (quantize_fp6_k_lds_order_triton also calls the lastdim packer) was a per-attention sync that
+    serialized the quant. Build once per device and reuse."""
+    cperm = _QK_FIELD_PERM_CACHE.get(device)
+    if cperm is None:
+        cperm = torch.from_numpy(_qk_field_perm()).to(device)
+        _QK_FIELD_PERM_CACHE[device] = cperm
+    return cperm
+
 
 def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
     """GPU (Triton) equivalent of quantize_fp6_lastdim.
@@ -570,7 +612,7 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
     N = xflat.shape[0]
     packed = torch.empty(N, NB * 24, dtype=torch.uint8, device=x.device)
     scale = torch.empty(N, NB, dtype=torch.uint8, device=x.device)
-    cperm = torch.from_numpy(_qk_field_perm()).to(x.device)
+    cperm = _qk_field_perm_dev(x.device)
     n_blocks = N * NB
     BLOCK_N = 128
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
@@ -624,7 +666,25 @@ def _k_lds_gather_index(nt: int, total: int, device):
     return g
 
 
-def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128):
+_K_LDS_SRCW_CACHE: dict = {}
+
+
+def _k_lds_src_within(nt: int, total: int, h: int, device):
+    """Cached (srcw int32 [k_hs], valid int8 [k_hs]) for the fused LDS gather kernel.
+    srcw = (gc//96)*(h*96) + (gc%96) folds the [b,sk,h,96]->[b,h,token-major] permute
+    into the source address so the kernel reads `packed` directly (no permute+contiguous
+    copy). h-dependent (the h*96 token stride) so h is part of the key."""
+    key = (nt, total, h, device)
+    g = _K_LDS_SRCW_CACHE.get(key)
+    if g is None:
+        gc, valid = _k_lds_gather_index(nt, total, device)
+        srcw = ((gc // 96) * (h * 96) + (gc % 96)).to(torch.int32)
+        g = (srcw, valid.to(torch.int8))
+        _K_LDS_SRCW_CACHE[key] = g
+    return g
+
+
+def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False):
     """GPU equivalent of quantize_fp6_k_lds_order, returning the kernel-ready K view
     (seq stride 128) + E8M0 scale. Byte-identical to the numpy oracle's buffer but
     runs the pack+gather entirely on-device (seconds vs the per-tile numpy CPU
@@ -633,22 +693,41 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128):
 
     k_thd : float K [b, sk, h, 128] on GPU.
     Returns (k_view uint8 [b, sk, h, 96] strided over a [b,h,n_tiles*16384] buffer,
-             scale uint8 [b, sk, h, 4])."""
+             scale uint8 [b, sk, h, 4]).
+    If return_raw: returns (buf, sbuf) -- the FULL contiguous backing buffers (uint8 1D)
+    instead of the strided/padded views. A torch.library.custom_op caller MUST take this
+    path: returning the strided k_view as a custom-op output lets AOTAutograd clone it to a
+    contiguous numel-sized tensor (dropping the seq-stride-128 LDS layout -> garbage). The
+    caller rebuilds k_view = buf.as_strided(...) and k_scale = sbuf[:n].view(...) OUTSIDE the
+    op (traced as_strided, which inductor handles correctly)."""
     assert _HAVE_TRITON, "triton/torch unavailable"
     b, sk, h, d = k_thd.shape
     assert d == 128 and tile == 128, (d, sk, tile)
     nt = (sk + tile - 1) // tile  # ceil; partial tail handled by the valid mask
     packed, scale = quantize_fp6_lastdim_triton(k_thd)  # [b,sk,h,96], [b,sk,h,4]
     total = sk * 96
-    # token-major flat per (b,h): [b, h, sk*96]
-    km = packed.permute(0, 2, 1, 3).reshape(b, h, total).contiguous()
-    gc, valid = _k_lds_gather_index(nt, total, k_thd.device)
-    out = km[:, :, gc]  # [b, h, nt*16384] on-device gather
-    out = torch.where(valid.view(1, 1, -1), out, torch.zeros_like(out))
+    # Fused on-device LDS reorder: a single Triton gather (read `packed` via the cached
+    # source offset, apply the valid mask, write the buffer) replaces the torch chain of
+    # permute+contiguous / advanced-index gather / masked_fill / buffer-copy (~4 full-size
+    # passes -> 1 gathered read + 1 write; ~1.35x faster on the K reorder at long seq).
+    srcw, valid8 = _k_lds_src_within(nt, total, h, k_thd.device)
     k_hs = nt * 16384
     k_bs = h * k_hs
     buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=k_thd.device)
-    buf[: out.numel()] = out.reshape(-1)
+    BLOCK = 1024
+    assert k_hs % BLOCK == 0, (k_hs, BLOCK)
+    grid = (b * h * (k_hs // BLOCK),)
+    _gather_k_lds_kernel[grid](
+        packed.reshape(-1),
+        buf,
+        srcw,
+        valid8,
+        k_hs,
+        sk * h * 96,
+        h,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
     # seq stride = tile (=128) -> the kernel's _s_k_Seqs=128 -> tile base = token*128.
     k_view = buf.as_strided((b, sk, h, 96), (k_bs, tile, k_hs, 1))
     # K-SCALE TRAILING PAD (gfx950 fwd_hd128_mxfp6 op_sel-shift-free K-scale path): the kernel's
@@ -660,6 +739,8 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128):
     sflat = scale.reshape(-1)
     sbuf = torch.empty(sflat.numel() + 64, dtype=torch.uint8, device=scale.device)
     sbuf[: sflat.numel()] = sflat
+    if return_raw:
+        return buf, sbuf
     scale = sbuf[: sflat.numel()].view(b, sk, h, 4)
     return k_view, scale
 
