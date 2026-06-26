@@ -155,13 +155,23 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_K_ELEMS = K * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
+    # EXPERIMENT (u-prefetch): stage u cooperatively into lds_u [BT, BV] so the
+    # per-lane v_new reads come from LDS instead of 16 scalar buffer_load_ushort
+    # from HBM (u was the #2 VMEM-wait hotspot). u is V-contiguous in HBM, so the
+    # cooperative load mirrors the w-load (8 bf16/thread dwordx4, warp coalesced).
+    # Row pad to break LDS bank conflicts on the v_new read (mirrors lds_w pad).
+    LDS_U_PAD = 4
+    LDS_U_STRIDE = BV + LDS_U_PAD
+    LDS_U_ELEMS = BT * LDS_U_STRIDE
+    LDS_U_BYTES = LDS_U_ELEMS * 2
+
     # NOTE: lds_vn removed -- GEMM2 now feeds v_new (B operand) straight from
     # the vn_frags registers (vn-direct), so there is no gated-v_new LDS
     # round-trip. This frees BT*(BV+pad)*2 bytes of LDS.
     # NOTE: lds_g removed -- gating reads g inline from HBM per lane (no g
     # staging buffer / no extra w-barrier publish dependency).
 
-    _K5_KERNEL_REVISION = 210  # remove lds_g g-staging (inline g from HBM)
+    _K5_KERNEL_REVISION = 211  # u-prefetch: stage u into lds_u (was 16 scalar loads)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -173,6 +183,8 @@ def compile_chunk_gated_delta_h_kv_naive(
     allocator.ptr = lds_w_offset + LDS_W_BYTES
     lds_k_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_k_offset + LDS_K_BYTES
+    lds_u_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_u_offset + LDS_U_BYTES
 
     # Cooperative load parameters
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
@@ -229,6 +241,8 @@ def compile_chunk_gated_delta_h_kv_naive(
         lds_w = STensor(lds_w_ptr, dtype=T.bf16, shape=(LDS_W_ELEMS,))
         lds_k_ptr = SmemPtr(lds_base_ptr, lds_k_offset, T.bf16, shape=(LDS_K_ELEMS,))
         lds_k = STensor(lds_k_ptr, dtype=T.bf16, shape=(LDS_K_ELEMS,))
+        lds_u_ptr = SmemPtr(lds_base_ptr, lds_u_offset, T.bf16, shape=(LDS_U_ELEMS,))
+        lds_u = STensor(lds_u_ptr, dtype=T.bf16, shape=(LDS_U_ELEMS,))
 
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
@@ -237,6 +251,7 @@ def compile_chunk_gated_delta_h_kv_naive(
         v8bf16_type = T.vec(8, T.bf16)
         lds_w_memref = lds_w_ptr.get()
         lds_k_memref = lds_k_ptr.get()
+        lds_u_memref = lds_u_ptr.get()
 
         v4bf16_w_type = T.vec(4, T.bf16)
 
@@ -245,6 +260,9 @@ def compile_chunk_gated_delta_h_kv_naive(
 
         def _lds_vec_read_k_bf16x4(elem_idx):  # EXPERIMENT (vn-direct) std-A read from lds_k[K,BT]
             return vector.load_op(v4bf16_w_type, lds_k_memref, [elem_idx])
+
+        def _lds_read_u_scalar(elem_idx):  # EXPERIMENT (u-prefetch) per-lane u read from lds_u[BT,BV]
+            return vector.load_op(T.vec(1, T.bf16), lds_u_memref, [elem_idx])[0]
 
         v4bf16_type = T.vec(4, T.bf16)
 
@@ -397,6 +415,23 @@ def compile_chunk_gated_delta_h_kv_naive(
                     w_lds_off = row * fx.Int32(LDS_W_STRIDE) + col
                     lds_w.vec_store((fx.Index(w_lds_off),), w_vec, LOAD_VEC_WIDTH)
 
+            # EXPERIMENT (u-prefetch): cooperatively load u [BT, BV] -> lds_u,
+            # mirroring the w-load (u is V-contiguous in HBM, BV=64 per row =
+            # same decomposition as the 64-wide w rows). Replaces the 16 scalar
+            # buffer_load_ushort that were the #2 VMEM-wait hotspot. Published
+            # on the SAME barrier below as w (no extra barrier).
+            for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                abs_row = i_t_i32 * fx.Int32(BT) + row
+                safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                u_g_off = (
+                    v_base + safe_row * stride_v
+                    + i_v * fx.Int32(BV) + load_col_base
+                )
+                u_vec = v_.vec_load((fx.Index(u_g_off),), LOAD_VEC_WIDTH)
+                u_lds_off = row * fx.Int32(LDS_U_STRIDE) + load_col_base
+                lds_u.vec_store((fx.Index(u_lds_off),), u_vec, LOAD_VEC_WIDTH)
+
             gpu.barrier()
 
             # ============================================================
@@ -453,23 +488,23 @@ def compile_chunk_gated_delta_h_kv_naive(
             # ============================================================
             # 5. v_new = u - b_v  (u loaded inline, no prefetch)
             # ============================================================
-            u_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
+            # EXPERIMENT (u-prefetch): read u from lds_u [BT, BV] (staged above)
+            # instead of 16 scalar HBM loads. lds_u is chunk-local (rows 0..BT)
+            # and block-local in V (cols 0..BV), so the indices drop the
+            # i_t*BT / i_v*BV offsets used for the HBM address.
+            u_lds_col = wid * fx.Int32(16) + lane_n
             vn_frags = []
             for m_bt in range_constexpr(BT_MTILES):
                 bv_val = bv_accs[m_bt]
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
-                    u_bt_row_raw = (
-                        i_t_i32 * fx.Int32(BT)
-                        + fx.Int32(m_bt * 16)
+                    u_lds_row = (
+                        fx.Int32(m_bt * 16)
                         + lane_m_base * fx.Int32(4)
                         + fx.Int32(elem_i)
                     )
-                    safe_u_row = (u_bt_row_raw < T_local).select(
-                        u_bt_row_raw, fx.Int32(0)
-                    )
-                    u_off = v_base + safe_u_row * stride_v + u_col
-                    u_raw = v_[fx.Index(u_off)]
+                    u_lds_idx = u_lds_row * fx.Int32(LDS_U_STRIDE) + u_lds_col
+                    u_raw = _lds_read_u_scalar(fx.Index(u_lds_idx))
                     u_bf16 = fx.BFloat16(u_raw)
                     u_f32_elems.append(u_bf16.to(fx.Float32))
                 u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
