@@ -2309,6 +2309,30 @@ namespace py = pybind11;
           py::arg("return_lse"),                                               \
           py::arg("num_splits"));
 
+#define CAUSAL_CONV1D_FWD_SPLIT_QKV_PYBIND                                  \
+    m.def("causal_conv1d_fwd_split_qkv_hip",                                \
+          &aiter::causal_conv1d_fwd_split_qkv_hip,                          \
+          "causal_conv1d prefill fused split q/k/v (HIP)",                  \
+          py::arg("x"),                                                     \
+          py::arg("weight"),                                                \
+          py::arg("bias"),                                                  \
+          py::arg("conv_states"),                                           \
+          py::arg("cache_indices"),                                         \
+          py::arg("has_initial_state"),                                     \
+          py::arg("query_start_loc"),                                       \
+          py::arg("batch_ptr"),                                             \
+          py::arg("token_chunk_offset_ptr"),                                \
+          py::arg("q"),                                                     \
+          py::arg("k"),                                                     \
+          py::arg("v"),                                                     \
+          py::arg("k_dim"),                                                 \
+          py::arg("v_dim"),                                                 \
+          py::arg("n_programs"),                                            \
+          py::arg("block_m"),                                               \
+          py::arg("has_bias"),                                              \
+          py::arg("silu"),                                                  \
+          py::arg("pad_slot_id"));
+
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
     m.def("fused_split_gdr_update",                                   \
           &aiter::fused_split_gdr_update,                             \
