@@ -92,5 +92,3 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
-hca_compress_pool_prototype.txt
-kv_kernels_backup/
