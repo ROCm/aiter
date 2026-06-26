@@ -255,6 +255,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     B,
     B_slot,
     num_decode_toks_for_zeros,
+    MAX_EMBD_POS,  # unused here; kept for a uniform launch with the BLOCK kernel
     q_nope_stride_b,
     q_nope_stride_h,
     q_nope_stride_d,
@@ -581,6 +582,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     zeros_out_ptr,
     T,
     T_slot,
+    MAX_EMBD_POS,
     q_stride_t,
     q_stride_h,
     q_stride_d,
