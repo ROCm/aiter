@@ -4516,8 +4516,6 @@ def _flydsl_dtype_str(dtype: torch.dtype) -> str:
 def compile_pa_decode_ps_reduce_flydsl(
     *,
     max_context_partition_num: int,
-    query_seq_len: int,
-    query_group_size: int,
     head_size: int,
     output_dtype_str: str,
     logits_dtype_str: str,
@@ -4565,6 +4563,7 @@ def compile_pa_decode_ps_reduce_flydsl(
         stride_logits_head: Int32,
         stride_logits_part: Int32,
         stride_logits_group: Int32,
+        query_group_size: Int32,
     ):
         tid = gpu.thread_idx.x
         batch_idx = gpu.block_idx.x
@@ -4599,7 +4598,7 @@ def compile_pa_decode_ps_reduce_flydsl(
         c_red_slots = arith.constant(red_slots, type=T.i32)
         lane = tid & c_wave_mask
         wave = tid >> c_wave_shift
-        c_qgs = arith.constant(query_group_size, type=T.i32)
+        c_qgs = query_group_size
         group_idx = eqgs_idx % c_qgs
 
         def _wave_reduce_max_full(val):
@@ -4949,6 +4948,8 @@ def compile_pa_decode_ps_reduce_flydsl(
         stride_logits_head,
         stride_logits_part,
         stride_logits_group,
+        query_seq_len,
+        query_group_size,
         batch_size,
         num_kv_heads,
         stream: fx.Stream = fx.Stream(None),
@@ -4974,6 +4975,7 @@ def compile_pa_decode_ps_reduce_flydsl(
             stride_logits_head,
             stride_logits_part,
             stride_logits_group,
+            query_group_size,
         ).launch(
             grid=(batch_size, num_kv_heads, query_seq_len * query_group_size),
             block=(block_threads, 1, 1),
@@ -5016,8 +5018,6 @@ def launch_pa_decode_ps_reduce_flydsl(
 
     compiled = compile_pa_decode_ps_reduce_flydsl(
         max_context_partition_num=context_partition_num,
-        query_seq_len=query_seq_len,
-        query_group_size=query_group_size,
         head_size=head_size,
         output_dtype_str=_flydsl_dtype_str(output_ptr.dtype),
         logits_dtype_str=_flydsl_dtype_str(logits_ptr.dtype),
@@ -5048,6 +5048,8 @@ def launch_pa_decode_ps_reduce_flydsl(
         stride_logits_head,
         stride_logits_part,
         stride_logits_group,
+        query_seq_len,
+        query_group_size,
         output_ptr.shape[0],
         output_ptr.shape[2],
         torch.cuda.current_stream(output_ptr.device),
