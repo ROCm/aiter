@@ -33,7 +33,8 @@ def _epilog_of(atomic, mxfp4out, cshuffle=False):
 
 @functools.cache
 def _get_compiled_mxfp4_gemm2_port(
-    BM, use_nt, NE, N_OUT, epilog, D_INTER, D_INTER_REAL=None, BN=256, BK=256
+    BM, use_nt, NE, N_OUT, epilog, D_INTER, D_INTER_REAL=None, BN=256, BK=256,
+    xcd_swizzle=0,
 ):
     from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
 
@@ -47,6 +48,7 @@ def _get_compiled_mxfp4_gemm2_port(
         D_INTER_REAL=D_INTER_REAL,
         BN=BN,
         BK=BK,
+        xcd_swizzle=xcd_swizzle,
     )
 
 
@@ -115,6 +117,7 @@ def flydsl_mxfp4_gemm2(
     D_INTER_REAL=None,
     BN=256,
     BK=256,
+    xcd_swizzle=0,
     stream=None,
 ):
     _assert_supported(
@@ -132,7 +135,7 @@ def flydsl_mxfp4_gemm2(
     )
     epilog = _epilog_of(atomic, mxfp4out, cshuffle)
     launch = _get_compiled_mxfp4_gemm2_port(
-        BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL, BN, BK
+        BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL, BN, BK, xcd_swizzle
     )
 
     max_m_blocks = (max_sorted + BM - 1) // BM

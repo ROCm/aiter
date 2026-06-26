@@ -1330,6 +1330,7 @@ def _mxfp4_a4w4_stage1(
 
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
+    _xcd1 = _parse_mxfp4_g1_kname(kernelName1).get("xcd_swizzle", 0)
     flydsl_mxfp4_gemm1(
         a_quant=a_quant,
         a_scale_sorted_shuffled=a_scale_sorted_shuffled,
@@ -1349,6 +1350,7 @@ def _mxfp4_a4w4_stage1(
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
         topk=topk,
+        xcd_swizzle=_xcd1,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -1380,6 +1382,7 @@ def _mxfp4_a4w4_stage2(
     cshuffle=False,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
 ):
+    _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
     if atomic:
         out_buf = atomic_output_buf
     else:
@@ -1420,6 +1423,7 @@ def _mxfp4_a4w4_stage2(
                 D_INTER=D_INTER,
                 D_INTER_REAL=inter_real,
                 topk=topk,
+                xcd_swizzle=_xcd2,
             )
             out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
             aiter.mxfp4_moe_scatter_reduce_q(
@@ -1466,6 +1470,7 @@ def _mxfp4_a4w4_stage2(
         D_INTER=D_INTER,
         D_INTER_REAL=inter_real,
         topk=topk,
+        xcd_swizzle=_xcd2,
     )
 
     if atomic:
