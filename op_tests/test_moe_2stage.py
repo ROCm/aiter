@@ -924,7 +924,7 @@ for kwargs, extras in case_iter:
             run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
         )
         with aot_guard:
-            ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+            ret = test_fmoe(**kwargs)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
