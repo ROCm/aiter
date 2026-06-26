@@ -79,6 +79,22 @@ VT_BLKS_PER_ROW_PAD: int = VT_BLKS_PER_ROW + 2  # 66
 VT_NUM_SUB_BLKS: int = 8
 SZ_LDS_VT: int = VT_NUM_SUB_BLKS * ((BLOCK_N // VT_NUM_SUB_BLKS) * V_HEAD_DIM + 16 * 4)  # 16896
 
+# ---- VtManagerV1 de-interleaved (bank-conflict-free) byte layout ----
+# The HK VtManager8bitsV1 packs each lane's 4x8 fp8 block (32 B) contiguously
+# (lo b128 = rows 0,1 ; hi b128 = rows 2,3 at +16). With consecutive col-blocks
+# 32 B apart, each ds_write_b128 8-lane phase strides 8 banks, so col-blocks c
+# and c+4 collide -> an inherent 2-way LDS bank conflict (padding-immune since
+# the row-block is constant within a write phase). We instead split each
+# row-block into two 16-B "halves" (rows 0,1 and rows 2,3), each laid out with a
+# 16-B (= 4-bank) col-block stride. Now an 8-lane phase tiles all 32 banks
+# exactly -> conflict-free. Same total LDS (a pure byte permutation), and the
+# load reader is updated to match so the logical V^T element mapping is
+# unchanged.
+VT_ROWBLK_STRIDE: int = VT_BLKS_PER_ROW_PAD * VT_ELEMS_PER_BLK  # 2112 B per row-block
+VT_HALF_STRIDE: int = VT_BLKS_PER_ROW_PAD * 16  # 1056 B per 2-row half
+VT_COLBLK_STRIDE: int = 16  # 16 B per col-block within a half (was 32 B contiguous)
+VT_OFFSET_TL_BL: int = 4 * VT_ROWBLK_STRIDE  # 8448 B: jump 4 row-blocks (top->bottom)
+
 # ---- QManagerV3 LDS layout (per-warp staging for VRAM->LDS->GPR) ----
 Q_ELEM_PER_ROW: int = 64
 Q_ELEM_PER_COL: int = 16
@@ -417,21 +433,23 @@ def kn_sparse_mla_prefill(
         return r
 
     def _store_vt_to_lds(vt_lds_base_idx, warp_idx_val, lane_idx_val, vt8):
+        # De-interleaved layout: lo (rows 0,1) -> half 0, hi (rows 2,3) -> half 1,
+        # each at a 16-B col-block stride so every ds_write_b128 8-lane phase
+        # tiles all 32 LDS banks (conflict-free). See VT_*_STRIDE constants.
         row_blk = (warp_idx_val % 2) * 4 + lane_idx_val / 16
         col_blk = (lane_idx_val % 16) + (warp_idx_val / 2) * 16
-        block_offset = (row_blk * VT_BLKS_PER_ROW_PAD + col_blk) * VT_ELEMS_PER_BLK
-        lds_vt_addr = vt_lds_base_idx + block_offset
+        lo_addr = vt_lds_base_idx + row_blk * VT_ROWBLK_STRIDE + col_blk * VT_COLBLK_STRIDE
+        hi_addr = lo_addr + VT_HALF_STRIDE
         lo_packed = Vec.from_elements(vt8[0:4], fx.Int32)
-        Vec(lo_packed).bitcast(fx.Int8).store(lds_buffer, [lds_vt_addr])
+        Vec(lo_packed).bitcast(fx.Int8).store(lds_buffer, [lo_addr])
         hi_packed = Vec.from_elements(vt8[4:8], fx.Int32)
-        Vec(hi_packed).bitcast(fx.Int8).store(lds_buffer, [lds_vt_addr + 16])
+        Vec(hi_packed).bitcast(fx.Int8).store(lds_buffer, [hi_addr])
 
     def _load_vt_from_lds(vt_base_i32, col_offset):
         fixed_col_blk = col_offset // VT_COLS_PER_THR
-        fixed_block_offset = fixed_col_blk * VT_ELEMS_PER_BLK
-        offset_tl_bl = 4 * VT_BLKS_PER_ROW_PAD * VT_ELEMS_PER_BLK  # 8448
+        fixed_block_offset = fixed_col_blk * VT_COLBLK_STRIDE
         v0 = _lds_load_volatile(vt_base_i32, T.i32, byte_offset=fixed_block_offset)
-        v1 = _lds_load_volatile(vt_base_i32, T.i32, byte_offset=fixed_block_offset + offset_tl_bl)
+        v1 = _lds_load_volatile(vt_base_i32, T.i32, byte_offset=fixed_block_offset + VT_OFFSET_TL_BL)
         return v0, v1
 
     def _vt_base_i32():
@@ -439,8 +457,12 @@ def kn_sparse_mla_prefill(
         vt_col_blk = (lane_idx % 16) / VT_COLS_PER_THR
         vt_row_inblk = lane_idx % VT_ROWS_PER_THR
         vt_col_inblk = ((lane_idx % 8) / VT_ROWS_PER_THR) * VT_ROWS_PER_THR
-        vt_block_offset = (vt_row_blk * VT_BLKS_PER_ROW_PAD + vt_col_blk) * VT_ELEMS_PER_BLK
-        vt_inblock_offset = vt_row_inblk * VT_COLS_PER_THR + vt_col_inblk
+        vt_block_offset = (
+            vt_row_blk * VT_ROWBLK_STRIDE
+            + (vt_row_inblk / 2) * VT_HALF_STRIDE
+            + vt_col_blk * VT_COLBLK_STRIDE
+        )
+        vt_inblock_offset = (vt_row_inblk % 2) * VT_COLS_PER_THR + vt_col_inblk
         vt_lds_lane_offset = vt_block_offset + vt_inblock_offset
         return _i32(ArithValue(lds_base_idx + P_LDS_VT) + vt_lds_lane_offset)
 
@@ -1283,21 +1305,22 @@ def compile_sparse_mla_prefill_paged(
             return r
 
         def _store_vt_to_lds(vt_lds_base_idx, warp_idx_val, lane_idx_val, vt8):
+            # De-interleaved layout (bank-conflict-free b128 store); see the
+            # VT_*_STRIDE constants and the matching reader below.
             row_blk = (warp_idx_val % 2) * 4 + lane_idx_val / 16
             col_blk = (lane_idx_val % 16) + (warp_idx_val / 2) * 16
-            block_offset = (row_blk * VT_BLKS_PER_ROW_PAD + col_blk) * VT_ELEMS_PER_BLK
-            lds_vt_addr = vt_lds_base_idx + block_offset
+            lo_addr = vt_lds_base_idx + row_blk * VT_ROWBLK_STRIDE + col_blk * VT_COLBLK_STRIDE
+            hi_addr = lo_addr + VT_HALF_STRIDE
             lo_packed = Vec.from_elements(vt8[0:4], fx.Int32)
-            Vec(lo_packed).bitcast(fx.Int8).store(lds_buffer, [lds_vt_addr])
+            Vec(lo_packed).bitcast(fx.Int8).store(lds_buffer, [lo_addr])
             hi_packed = Vec.from_elements(vt8[4:8], fx.Int32)
-            Vec(hi_packed).bitcast(fx.Int8).store(lds_buffer, [lds_vt_addr + 16])
+            Vec(hi_packed).bitcast(fx.Int8).store(lds_buffer, [hi_addr])
 
         def _load_vt_from_lds(vt_base_i32, col_offset):
             fixed_col_blk = col_offset // VT_COLS_PER_THR
-            fixed_block_offset = fixed_col_blk * VT_ELEMS_PER_BLK
-            offset_tl_bl = 4 * VT_BLKS_PER_ROW_PAD * VT_ELEMS_PER_BLK
+            fixed_block_offset = fixed_col_blk * VT_COLBLK_STRIDE
             v0 = _lds_load_volatile(vt_base_i32, T.i32, byte_offset=fixed_block_offset)
-            v1 = _lds_load_volatile(vt_base_i32, T.i32, byte_offset=fixed_block_offset + offset_tl_bl)
+            v1 = _lds_load_volatile(vt_base_i32, T.i32, byte_offset=fixed_block_offset + VT_OFFSET_TL_BL)
             return v0, v1
 
         def _vt_base_i32():
@@ -1305,8 +1328,12 @@ def compile_sparse_mla_prefill_paged(
             vt_col_blk = (lane_idx % 16) / VT_COLS_PER_THR
             vt_row_inblk = lane_idx % VT_ROWS_PER_THR
             vt_col_inblk = ((lane_idx % 8) / VT_ROWS_PER_THR) * VT_ROWS_PER_THR
-            vt_block_offset = (vt_row_blk * VT_BLKS_PER_ROW_PAD + vt_col_blk) * VT_ELEMS_PER_BLK
-            vt_inblock_offset = vt_row_inblk * VT_COLS_PER_THR + vt_col_inblk
+            vt_block_offset = (
+                vt_row_blk * VT_ROWBLK_STRIDE
+                + (vt_row_inblk / 2) * VT_HALF_STRIDE
+                + vt_col_blk * VT_COLBLK_STRIDE
+            )
+            vt_inblock_offset = (vt_row_inblk % 2) * VT_COLS_PER_THR + vt_col_inblk
             vt_lds_lane_offset = vt_block_offset + vt_inblock_offset
             return _i32(ArithValue(lds_base_idx + P_LDS_VT) + vt_lds_lane_offset)
 
