@@ -170,10 +170,10 @@ def _torch_moe_ref(
         a1_scale=stage1_hidden_scale,
         w1_scale=w1_scale,
         w1_bias=w1_bias,
-        # torch_moe_stage1 also applies swiglu_limit as a generic gate/up
-        # clamp in the non-SwiGLU branch. The grouped FlyDSL SiLU epilogue
-        # does *not* clamp, so only pass the limit for true SwiGLU.
-        swiglu_limit=swiglu_limit if activation == ActivationType.Swiglu else 0.0,
+        # swiglu_limit clamps gate/up for both SwiGLU and SiLU: the grouped
+        # FlyDSL epilogue now applies it in either branch, so the reference
+        # passes it through unconditionally to stay in sync.
+        swiglu_limit=swiglu_limit,
     )
     if data_format == "a4w4":
         # Match the grouped a4w4 path again: stage2 input is MXFP4.
@@ -502,6 +502,12 @@ def test_grouped_a4w4_silu_matches_torch_ref(layout):
 @pytest.mark.parametrize("layout", ["gguu", "gugu"])
 def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
     run_moe("a4w4", layout=layout, activation=ActivationType.Swiglu)
+
+
+@pytest.mark.parametrize("layout", ["gguu", "gugu"])
+@pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
+def test_grouped_a4w4_swiglu_limit_clamps(layout, activation):
+    run_moe("a4w4", layout=layout, activation=activation, swiglu_limit=1.0)
 
 
 # ---------------------------------------------------------------------------
