@@ -138,6 +138,11 @@ def compile_chunk_gated_delta_h_kv_naive(
     # -- higher occupancy does NOT compensate the extra VMEM traffic. Keep True.
     USE_LDS_U = True
 
+    # EXPERIMENT toggle: v_new output store. True = stage to lds_vn [BT,V] then
+    # coalesced b128 read-out (independent buffer, ~8.5KB, keeps 3 waves);
+    # False = original 16 scalar buffer_store_short straight to HBM.
+    USE_LDS_VN_STORE = True
+
     # -- LDS layout (no lds_h: KV h-store goes reg -> HBM directly) --
     # lds_w / lds_k row pads break LDS bank conflicts. K (=128 bf16 = 256 B) is
     # a multiple of the 32-bank LDS period (128 B), so a plain row stride makes
@@ -185,6 +190,19 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_HT_BYTES = LDS_HT_ELEMS * 2
     assert LDS_HT_ELEMS <= LDS_K_ELEMS, "lds_ht must fit inside aliased lds_k"
 
+    # EXPERIMENT (vn-b128): transpose buffer for the v_new OUTPUT store. v_new is
+    # [B,H,T,V] (V innermost); the MFMA-C layout makes a lane's 4 elems stride
+    # along BT (by V) -> 16 scalar buffer_store_short. Stage vn into lds_vn
+    # [BT, V] (V innermost, contiguous), barrier, then read 8 contiguous V per
+    # thread and vec_store(8) -> buffer_store_dwordx4. INDEPENDENT buffer (not
+    # aliased): total LDS 44KB + ~8.5KB = ~51.5KB < 160/3 = 53.3KB, so 3 waves
+    # are preserved (verified). Tail chunks need a per-row bounds check on the
+    # readout (v_new is token-indexed, unlike the chunk-indexed h snapshot).
+    LDS_VN_PAD = 4
+    LDS_VN_STRIDE = BV + LDS_VN_PAD  # [BT, BV] : V innermost
+    LDS_VN_ELEMS = BT * LDS_VN_STRIDE
+    LDS_VN_BYTES = LDS_VN_ELEMS * 2
+
     # EXPERIMENT (u-prefetch): stage u cooperatively into lds_u [BT, BV] so the
     # per-lane v_new reads come from LDS instead of 16 scalar buffer_load_ushort
     # from HBM (u was the #2 VMEM-wait hotspot). u is V-contiguous in HBM, so the
@@ -201,13 +219,13 @@ def compile_chunk_gated_delta_h_kv_naive(
     # NOTE: lds_g removed -- gating reads g inline from HBM per lane (no g
     # staging buffer / no extra w-barrier publish dependency).
 
-    _K5_KERNEL_REVISION = 214  # EXPERIMENT: USE_LDS_U toggle (measure 4-wave)
+    _K5_KERNEL_REVISION = 215  # vn-b128: lds_vn staged coalesced v_new store (toggle)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
@@ -216,6 +234,10 @@ def compile_chunk_gated_delta_h_kv_naive(
     lds_u_offset = allocator._align(allocator.ptr, 16)
     if USE_LDS_U:
         allocator.ptr = lds_u_offset + LDS_U_BYTES  # only reserve when used
+    # vn-b128: independent lds_vn (margin is enough, no aliasing needed).
+    lds_vn_offset = allocator._align(allocator.ptr, 16)
+    if USE_LDS_VN_STORE:
+        allocator.ptr = lds_vn_offset + LDS_VN_BYTES  # only reserve when used
     # h-b128: lds_ht ALIASES lds_k (no extra allocation) to keep LDS at 44KB
     # and preserve 3 waves/SIMD. See the LDS_HT comment above for the WAR
     # lifetime argument; a top-of-step-1 barrier enforces it.
@@ -280,6 +302,8 @@ def compile_chunk_gated_delta_h_kv_naive(
         lds_u = STensor(lds_u_ptr, dtype=T.bf16, shape=(LDS_U_ELEMS,))
         lds_ht_ptr = SmemPtr(lds_base_ptr, lds_ht_offset, T.bf16, shape=(LDS_HT_ELEMS,))
         lds_ht = STensor(lds_ht_ptr, dtype=T.bf16, shape=(LDS_HT_ELEMS,))
+        lds_vn_ptr = SmemPtr(lds_base_ptr, lds_vn_offset, T.bf16, shape=(LDS_VN_ELEMS,))
+        lds_vn = STensor(lds_vn_ptr, dtype=T.bf16, shape=(LDS_VN_ELEMS,))
 
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
@@ -589,9 +613,62 @@ def compile_chunk_gated_delta_h_kv_naive(
                 vn_frags.append(u_f32 - bv_val)
 
             # ============================================================
-            # 5b. Store v_new (pre-gating) for output
+            # 5b. Store v_new (pre-gating). EXPERIMENT (vn-b128): stage to
+            # lds_vn [BT, V] (V innermost) then coalesced b128 read-out, instead
+            # of 16 scalar buffer_store_short. Must run BEFORE gating (step 6)
+            # which overwrites vn_frags in registers.
+            #   (a) stage: each lane writes its 4 m_bt x 4 elem to lds_vn at
+            #       row = m_bt*16 + lane_m_base*4 + elem (BT), col = wid*16+lane_n
+            #       (V). Scalar ds_write (cheap, on-chip).
+            #   (b) barrier.
+            #   (c) read 8 contiguous V per thread, vec_store(8) -> dwordx4.
+            #       v_new is token-indexed so guard each row with abs_row<T_local.
             # ============================================================
-            if const_expr(SAVE_NEW_VALUE):
+            if const_expr(SAVE_NEW_VALUE and USE_LDS_VN_STORE):
+                vn_stage_col = wid * fx.Int32(16) + lane_n
+                for m_bt in range_constexpr(BT_MTILES):
+                    vn_val = vn_frags[m_bt]
+                    for elem_i in range_constexpr(4):
+                        vn_lds_row = (
+                            fx.Int32(m_bt * 16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        vn_lds_idx = vn_lds_row * fx.Int32(LDS_VN_STRIDE) + vn_stage_col
+                        lds_vn[fx.Index(vn_lds_idx)] = vn_val[elem_i].to(fx.BFloat16)
+
+                gpu.barrier()
+
+                # Bare-function wrapper hides the GTensor vec_store from FlyDSL's
+                # dynamic-if AST rewriter (same trick as the scalar path's
+                # _emit_vn_store): the if body must not contain obj.method()/
+                # subscript on a non-MLIR-Value name.
+                def _emit_vn_vstore(off, vec):
+                    vn_.vec_store((fx.Index(off),), vec, 8)
+
+                VN_V8 = BV // 8
+                VN_GROUPS = BT * VN_V8
+                VN_ITERS = VN_GROUPS // BLOCK_THREADS
+                for it in range_constexpr(VN_ITERS):
+                    grp = fx.Int32(it * BLOCK_THREADS) + tid
+                    bt_row_local = grp // fx.Int32(VN_V8)
+                    v8 = (grp % fx.Int32(VN_V8)) * fx.Int32(8)
+                    # vec_load from lds_vn is unconditional (bt_row_local in
+                    # [0,BT) is always a valid LDS index); only the HBM store is
+                    # row-bounds-guarded for tail chunks.
+                    vn_read_idx = bt_row_local * fx.Int32(LDS_VN_STRIDE) + v8
+                    vn_tile8 = lds_vn.vec_load((fx.Index(vn_read_idx),), 8)
+                    abs_bt_row = i_t_i32 * fx.Int32(BT) + bt_row_local
+                    vn_off = (
+                        vn_base + abs_bt_row * fx.Int32(V)
+                        + i_v * fx.Int32(BV) + v8
+                    )
+                    if (abs_bt_row < T_local).ir_value():
+                        _emit_vn_vstore(vn_off, vn_tile8)
+
+                gpu.barrier()
+            elif const_expr(SAVE_NEW_VALUE):
+                # Original path: 16 scalar buffer_store_short straight to HBM.
                 def _emit_vn_store(off, value):
                     vn_[fx.Index(off)] = value
 
