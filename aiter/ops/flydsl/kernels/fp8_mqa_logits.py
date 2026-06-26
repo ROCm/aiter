@@ -18,6 +18,7 @@ drop-in interchangeable in tests and benchmarks.
 # stringizes annotations, which FlyDSL's kernel-argument typing relies on being
 # real objects. (Matches the note in qk_norm_rope_quant.py.)
 
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -147,6 +148,41 @@ _DEFAULT_COMPILE_HINTS = {
     "fast_fp_math": True,
 }
 
+# Don't split a row's KV window into chunks smaller than this many BKV tiles --
+# below it the per-block Q/weight preload stops being amortized.
+_MIN_TILES_PER_SPLIT = 8
+
+
+@lru_cache(maxsize=8)
+def _device_cu_count(device_index: int) -> int:
+    """Compute-unit count for a CUDA/HIP device (cached); 304 if unavailable."""
+    try:
+        return torch.cuda.get_device_properties(device_index).multi_processor_count
+    except Exception:
+        return 304
+
+
+def _auto_num_splits(
+    seq_len_padded: int, seq_len_kv: int, rpb: int, block_kv: int, device_index: int
+) -> int:
+    """KV-column splits (grid.y) to fill the device when the row grid is small.
+
+    For small-M / large-N shapes the ``ceil(seq_len/RPB)`` row grid leaves the
+    device block-starved; splitting each row's window across ``grid.y`` recovers
+    occupancy at no correctness cost (logits[m,n] are independent across n).
+    Returns 1 once the row grid alone oversubscribes the device. Constants tuned
+    on MI300X (304 CU): ~4x oversubscription, chunks >= _MIN_TILES_PER_SPLIT.
+    """
+    grid_x = seq_len_padded // rpb
+    if grid_x == 0 or seq_len_kv < 4096:
+        return 1
+    target_blocks = 4 * _device_cu_count(device_index)
+    if grid_x >= target_blocks:
+        return 1
+    max_splits = max(1, (seq_len_kv // block_kv) // _MIN_TILES_PER_SPLIT)
+    return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
+
+
 def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                            rows_per_block: int, waves_per_block: int,
                            mfma: MfmaAtom,
@@ -228,6 +264,7 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
         seq_len: fx.Int32,       # padded to a multiple of RPB
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
+        num_splits: fx.Int32,    # grid.y KV-column splits (1 == no split)
     ):
         f32_0 = arith.constant(0.0, type=T.f32)
         _mfma_res_ty = Vec.make_type(mfma.ACC_ELEMS, fx.Float32)
@@ -376,6 +413,22 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
             _to_raw(fx.Int32(BKV)),
         )
 
+        # KV-column split across grid.y. Block (.,by) takes a BKV-aligned
+        # slice of the union window; logits[m,n] are independent across n.
+        # The slices tile [start,end) exactly (disjoint, gap-free), 
+        # so each column has one writer.
+        # num_splits==1 collapses to the full window (by==0).
+        by = fx.block_idx.y
+        win_tiles = arith.ceildivui(
+            arith.subi(tile_end, tile_start), _to_raw(fx.Int32(BKV))
+        )
+        split_cols = arith.muli(
+            arith.ceildivui(win_tiles, _to_raw(num_splits)),
+            _to_raw(fx.Int32(BKV)),
+        )
+        tile_start = arith.addi(tile_start, arith.muli(_to_raw(by), split_cols))
+        tile_end = arith.minsi(arith.addi(tile_start, split_cols), tile_end)
+
         tile_lo   = _to_raw(fx.Index(fx.Int32(tile_start)))
         tile_hi   = _to_raw(fx.Index(fx.Int32(tile_end)))
         tile_step = _to_raw(fx.Index(fx.Int32(BKV)))
@@ -451,17 +504,29 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                         col_sum = arith.AddFOp(col_sum, peer, fastmath=fm_fast).result
 
                     # --- Writer predicate: lane_div_N == 0 owns MFMA_N distinct cols ---
-                    is_writer = arith.andi(
+                    # `col >= start` is required: the tile loop is BKV-aligned
+                    # below `start`, so it guards the pre-filled -inf in
+                    # [aligned_start, start). (Both the single-grid alignment and
+                    # the grid.y split can place the first tile below start.)
+                    in_window = arith.andi(
                         _to_raw(arith.cmpi(
-                            arith.CmpIPredicate.eq,
-                            _to_raw(lane_div_N),
-                            _to_raw(fx.Int32(0)),
+                            arith.CmpIPredicate.sge,
+                            _to_raw(col),
+                            _to_raw(starts[j]),
                         )),
                         _to_raw(arith.cmpi(
                             arith.CmpIPredicate.slt,
                             _to_raw(col),
                             _to_raw(ends[j]),
                         )),
+                    )
+                    is_writer = arith.andi(
+                        _to_raw(arith.cmpi(
+                            arith.CmpIPredicate.eq,
+                            _to_raw(lane_div_N),
+                            _to_raw(fx.Int32(0)),
+                        )),
+                        in_window,
                     )
                     with ir.InsertionPoint(scf.IfOp(is_writer).then_block):
                         out_row_t[col] = fx.Float32(col_sum)
@@ -481,12 +546,14 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
+        num_splits: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         n_blocks = arith.ceildivui(
             _to_raw(seq_len), _to_raw(fx.Int32(RPB))
         )
         gx = arith.index_cast(T.index, n_blocks)
+        gy = arith.index_cast(T.index, _to_raw(num_splits))
         kernel._func.__name__ = _kname
         kernel(
             Q,
@@ -499,7 +566,8 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
             seq_len,
             seq_len_kv,
             stride_logits_s,
-        ).launch(grid=(gx, 1, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
+            num_splits,
+        ).launch(grid=(gx, gy, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_fp8_mqa_logits_mfma_r_w
 
@@ -558,27 +626,26 @@ _VARIANT_BUILDERS = {
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
 DEFAULT_VARIANT = "mfma16x16x32_bkv128_r2_w2"
 
+def _auto_variant(seq_len, seq_len_kv):
+    """Pick (RPB, WPB) from the problem shape: RPB=2 always; WPB=2 packs more
+    column tiles per wave when M and N are both large, else WPB=4 for more
+    wavefronts on small-M / short-window shapes."""
+    wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
+    return f"mfma16x16x32_bkv128_r2_w{wpb}"
 
-def _resolve_variant(variant=None, *, use_mfma=None):
-    """Resolve the effective variant tag from the (variant, use_mfma, env) inputs.
-
-    Precedence: explicit ``variant=`` > legacy ``use_mfma=`` > env var
-    ``FLYDSL_FP8_MQA_LOGITS_VARIANT`` > ``DEFAULT_VARIANT``.
-    """
-    if variant is not None:
-        tag = variant
-    elif use_mfma is not None:
-        # Legacy use_mfma=True -> single-row 16x16x32 bkv128; False -> default.
-        tag = "mfma16x16x32_bkv128_r1_w1" if use_mfma else DEFAULT_VARIANT
-    else:
-        tag = os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT", DEFAULT_VARIANT)
+def _resolve_variant(variant, seq_len, seq_len_kv):
+    """Effective variant: explicit ``variant=`` > env var > shape-adaptive."""
+    tag = (
+        variant
+        or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
+        or _auto_variant(seq_len, seq_len_kv)
+    )
     if tag not in _VARIANT_BUILDERS:
         raise ValueError(
             f"unknown fp8_mqa_logits variant {tag!r}; "
             f"available: {list(KERNEL_VARIANTS)}"
         )
     return tag
-
 
 @lru_cache(maxsize=32)
 def compile_fp8_mqa_logits(
@@ -702,7 +769,7 @@ def flydsl_fp8_mqa_logits(
         convert_q_fn = False
         convert_kv_fn = False
 
-    variant = _resolve_variant(variant)
+    variant = _resolve_variant(variant, seq_len, seq_len_kv)
 
     launcher = compile_fp8_mqa_logits(
         num_heads=num_heads,
@@ -717,9 +784,10 @@ def flydsl_fp8_mqa_logits(
     # every block owns exactly RPB rows.  Padded rows get empty windows (start ==
     # end == 0) so the kernel writes nothing for them; the output is sliced back
     # to the original seq_len after the launch.
-    # Parse RPB from variant tag "mfma<shape>_bkv<B>_r<N>_w<M>" -> N.
-    _rpb_match = re.match(r"mfma\d+x\d+x\d+_bkv\d+_r(\d+)_w\d+", variant)
-    _RPB = int(_rpb_match.group(1)) if _rpb_match else 1
+    # Parse BKV and RPB from variant tag "mfma<shape>_bkv<B>_r<N>_w<M>".
+    _tag_match = re.match(r"mfma\d+x\d+x\d+_bkv(\d+)_r(\d+)_w\d+", variant)
+    _BKV = int(_tag_match.group(1)) if _tag_match else 128
+    _RPB = int(_tag_match.group(2)) if _tag_match else 1
     seq_len_padded = ((seq_len + _RPB - 1) // _RPB) * _RPB
     if seq_len_padded != seq_len:
         pad = seq_len_padded - seq_len
@@ -748,6 +816,10 @@ def flydsl_fp8_mqa_logits(
             device=Q.device,
         )[:, :seq_len_kv]
 
+    num_splits = _auto_num_splits(
+        seq_len_padded, seq_len_kv, _RPB, _BKV, Q.device.index
+    )
+
     if stream is None:
         stream = torch.cuda.current_stream()
 
@@ -764,6 +836,7 @@ def flydsl_fp8_mqa_logits(
             int(seq_len_padded),
             int(seq_len_kv),
             int(logits.stride(0)),
+            int(num_splits),
             stream,
         )
 
