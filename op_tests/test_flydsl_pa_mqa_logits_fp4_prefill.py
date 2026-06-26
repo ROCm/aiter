@@ -255,7 +255,7 @@ def run_case(
     # Precompute the persistent-grid schedule once (so the bench times only the
     # kernel launch, mirroring the standalone FlyDSL test).
     _, cta_info, n_ctas = compute_prefill_schedule(
-        row_to_batch, local_starts, local_ends, block_k, parallel_unit_num
+        row_to_batch, local_starts, local_ends, block_k, parallel_unit_num, max_seq_len
     )
     out = torch.full(
         (total_tokens, max_seq_len), float("-inf"), dtype=torch.float32, device=dev
