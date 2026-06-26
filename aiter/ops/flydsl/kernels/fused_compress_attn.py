@@ -215,7 +215,6 @@ def _build_kernel(
     GROUP_SIZE_Q = quant_group_size
     RTS = (GROUP_SIZE_Q // VEC) if nm_asm else 1  # threads/group (=8 for G=64,VEC=8)
     log2_rts = int(math.log2(RTS)) if nm_asm else 0
-    N_GROUPS = (NOPE // GROUP_SIZE_Q) if nm_asm else 1
     if nm_asm:
         assert quant and not preshuffle, "nm_asm: requires quant=True, preshuffle=False"
         assert (
