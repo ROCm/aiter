@@ -813,10 +813,9 @@ def mla_decode_stage1_asm_fwd(
     output: torch.Tensor,
     # [batch_size, num_heads, v_head_dim]
     lse: Optional[torch.Tensor] = None,
-    # [batch_size, num_heads]
+    # [1] per-tensor
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
-    # [1] pertensor
     # round-robin context-parallel (CP) extension:
     #   g_kv_indptr   : [batch_size+1] GLOBAL kv_indptr (per-request global KV length)
     #   cp_world_size : number of CP ranks (W); 1 == disabled
@@ -824,6 +823,9 @@ def mla_decode_stage1_asm_fwd(
     g_kv_indptr: Optional[torch.Tensor] = None,
     cp_world_size: int = 1,
     cp_rank: int = 0,
+    # [batch_size] scratch for gfx1250 packed MLA kernels
+    valid_split_count: Optional[torch.Tensor] = None,
+    use_valid_split_count_reduce: int = 0,
 ) -> None: ...
 
 

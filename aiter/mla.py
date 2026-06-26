@@ -26,6 +26,7 @@ def _fwd_kernel_stage2_asm(
     kv_indptr,
     kv_last_page_lens,
     num_kv_splits_indptr,
+    valid_split_count,
     stride_mid_ob: tl.int64,
     stride_mid_oh: tl.int64,
     stride_mid_os: tl.int64,
@@ -36,6 +37,7 @@ def _fwd_kernel_stage2_asm(
     KV_INDPTR_IS_PAGE_LEVEL: tl.constexpr,
     MAYBE_FINAL_OUT: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
+    USE_VALID_SPLIT_COUNT_REDUCE: tl.constexpr,
     BATCH_NUM: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
@@ -64,6 +66,10 @@ def _fwd_kernel_stage2_asm(
     num_valid_kv_splits = tl.minimum(
         cur_split_end - cur_split_start, tl.cdiv(cur_kv_seq_len, mgc)
     )
+    if USE_VALID_SPLIT_COUNT_REDUCE:
+        num_valid_kv_splits = tl.minimum(
+            num_valid_kv_splits, tl.load(valid_split_count + cur_batch)
+        )
     FINAL_OUT = MAYBE_FINAL_OUT and num_max_kv_splits == BATCH_NUM
 
     for cur_qo in range(cur_qo_start, cur_qo_end):
@@ -143,6 +149,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     get_block_n_fp8 = {
         8: 64,
         16: 128,
+        24: 128,
         32: 128,
         48: 64,
         64: 64,
@@ -269,11 +276,6 @@ def mla_decode_fwd(
                         and kv_buffer.dtype == dtypes.bf16
                         and nhead == 32
                     )
-                    or (
-                        q.dtype == dtypes.bf16
-                        and kv_buffer.dtype == dtypes.bf16
-                        and nhead == 8
-                    )
                 )
             )
             else torch.empty(
@@ -291,6 +293,16 @@ def mla_decode_fwd(
             if return_lse
             else None
         )
+
+        # Per-batch valid KV split count writeback buffer. Always allocated (and
+        # passed to stage1) so the asm kernel has a valid destination; whether
+        # stage2 actually uses it is gated by use_valid_split_count_reduce.
+        # Initialized to num_kv_splits so a min() against it is a no-op until the
+        # kernel overwrites it with the real (smaller) valid count.
+        valid_split_count = torch.full(
+            (bs,), num_kv_splits, dtype=dtypes.i32, device=device
+        )
+        use_valid_split_count_reduce = int(num_kv_splits > 1)
 
         aiter.mla_decode_stage1_asm_fwd(
             q,
@@ -316,6 +328,8 @@ def mla_decode_fwd(
             g_kv_indptr,
             cp_world_size,
             cp_rank,
+            valid_split_count,
+            use_valid_split_count_reduce,
         )
 
         if num_kv_splits == 1 and (
@@ -325,9 +339,6 @@ def mla_decode_fwd(
                 q.dtype == dtypes.bf16
                 and kv_buffer.dtype == dtypes.bf16
                 and nhead == 32
-            )
-            or (
-                q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16 and nhead == 8
             )
         ):
             lse = final_lse if return_lse else attn_lse
@@ -354,6 +365,7 @@ def mla_decode_fwd(
             kv_indptr,
             kv_last_page_lens,
             num_kv_splits_indptr,
+            valid_split_count,
             attn_lse.stride(0),
             attn_lse.stride(2),
             attn_lse.stride(1),
@@ -364,6 +376,7 @@ def mla_decode_fwd(
             KV_INDPTR_IS_PAGE_LEVEL=page_size > 1,
             MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
             HAS_FINAL_LSE=has_final_lse,
+            USE_VALID_SPLIT_COUNT_REDUCE=use_valid_split_count_reduce,
             BATCH_NUM=bs,
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
@@ -544,6 +557,8 @@ def mla_decode_fwd(
                 g_kv_indptr,
                 cp_world_size,
                 cp_rank,
+                None,
+                0,
             )
 
         aiter.mla_reduce_v1(
