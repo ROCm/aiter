@@ -313,23 +313,23 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     }
 
     // ---- CSV lookup-key normalization ---------------------------------------
-    // The shipped .co/symbol below the "qseqlen4_gqaratio16" name *also* serves
-    // the (gqa=64, qSeqLen=1) case because the kernel tile invariant
-    // `gqa * q_seq_logical = 64` is satisfied by both (16,4) and (64,1).
-    // hsa/codegen.py builds an unordered_map keyed by (arch + knl_name); a
-    // second CSV row for the gqa=64 variant would collide on that key and get
-    // silently dropped at init-list time, so the CSV ships only the (16,4)
-    // row. Normalize the lookup keys here so the (64,1) caller still finds
-    // the same .co. `sub_Q` and the per-launch geometry stay set to the
-    // gqa=64-correct values from the heuristic above — this remap only
-    // affects which CSV row identifies the binary to load.
+    // v4 nm ships ONE kernel binary (the 32n-tile .co, symbol
+    // mla_a8w8_qh64_qseqlen1_gqaratio64_nm). Its 64 q-row tile satisfies the
+    // invariant `gqa * q_seq_logical = 64`, so it serves all three shipped
+    // entry points: (gqa=16, qSeqLen=4), (gqa=64, qSeqLen=1) and (gqa=128,
+    // qSeqLen=1). The CSV carries a single (Gqa=64, qSeqLen=1) row; normalize
+    // every supported (gqa, qSeqLen) caller to that lookup key here. `sub_Q`
+    // and the per-launch grid geometry stay set to the gqa-correct values from
+    // the heuristic above — this remap only picks which CSV row (== which .co)
+    // to load.
     int csv_gqa     = gqa_ratio;
     int csv_qseqlen = config_max_seqlen_q;
-    if((gqa_ratio == 64 || gqa_ratio == 128) && q_type == "fp8" && kv_type == "fp8" &&
-       config_max_seqlen_q == 1)
+    if(q_type == "fp8" && kv_type == "fp8" &&
+       ((gqa_ratio == 16 && config_max_seqlen_q == 4) ||
+        ((gqa_ratio == 64 || gqa_ratio == 128) && config_max_seqlen_q == 1)))
     {
-        csv_gqa     = 16;
-        csv_qseqlen = 4;
+        csv_gqa     = 64;
+        csv_qseqlen = 1;
     }
 
     // Kernel lookup (cached across calls).

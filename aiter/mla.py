@@ -136,9 +136,9 @@ def get_meta_param(
     #
     # max_splits: inclusive upper bound of the auto-search range. Default None
     # keeps the historical V3 cap of 16 (so V3 callers are unaffected). Callers
-    # that know a larger physical ceiling — e.g. v4 nm, whose min KV tile is 16
-    # so a context_len=4096 single seq admits up to 4096/16=256 splits — pass a
-    # bigger value to let the heuristic explore it. The occupancy term still
+    # that know a larger physical ceiling — e.g. v4 nm 32n, whose min KV tile
+    # is 32 so a context_len=4096 single seq admits up to 4096/32=128 splits —
+    # pass a bigger value to let the heuristic explore it. The occupancy term still
     # self-limits the choice once bs*tg_factor*split saturates the CUs, and the
     # fp8 block cap below independently bounds it for numerical correctness.
     if num_kv_splits is None:
@@ -1049,7 +1049,7 @@ def mla_prefill_reduce(
 
 # ---------------------------------------------------------------------------
 # DSv4 MLA — additive entry point. Does NOT touch any existing
-#   gqa_ratio=16, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
+#   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
 def mla_decode_fwd_v4_nm(
     q,  # [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
@@ -1196,21 +1196,9 @@ def mla_decode_fwd_v4_nm(
         # bs*tg_factor*splits workgroups and stops over-splitting (e.g.
         # bs=64/gqa=128 picks splits=2, not 4).
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
-
-        # Raise the auto-search ceiling above V3's default 16 for small-batch
-        # long-context shapes. Two bounds gate it:
-        #   (1) KV-tile physical limit: the v4 kernel's inner loop consumes a
-        #       16-token tile, so each split must own >=16 tokens — the most
-        #       splits a (uniform) seq of `min_kv` tokens admits is
-        #       floor(min_kv / 16). page_size=1, so min_kv = total_kv//num_seqs
-        #       for the uniform partition we build below.
-        #   (2) Occupancy guard: never explore past ~2x the CU count of logical
-        #       workgroups (bs * tg_factor * split). Beyond that the GPU is
-        #       saturated and extra splits only add stage2-merge cost.
-        # Default-floor at 16 so well-saturated shapes keep V3's exact behavior.
         cu_num = get_cu_num()
         min_kv = total_kv // num_seqs if num_seqs > 0 else total_kv
-        tile_cap = max(1, min_kv // 16)
+        tile_cap = max(1, min_kv // 32)
         occ_cap = max(1, (2 * cu_num) // max(1, num_seqs * tg_factor))
         max_splits = max(16, min(tile_cap, occ_cap))
 

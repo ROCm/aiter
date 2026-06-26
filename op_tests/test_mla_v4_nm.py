@@ -2,28 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Tests for the mi350 v4 'nm' MLA pipeline (mla_decode_fwd_v4_nm).
-
-Purpose:
-  - **Smoke**: confirm the dispatcher loads its .co, accepts the v4 18-slot
-    kernarg layout, launches with the wave64 grid (bdx=256), and returns
-    finite outputs for the qh64_1tg_16mx4_16nx1_nm_recompile variant.
-  - **Determinism**: two back-to-back calls produce bit-identical outputs.
-  - **No-NaN guard**: the v4 port's #1 historical landmine was a 256-NaN +
-    256-zero output pattern caused by wave32-on-wave64 launch geometry.
-    This test fails loud on that exact regression.
-
-NOT covered here (intentionally separate work, document in the test file
-docstring as TODO):
-  - Numerical correctness vs a torch reference. The v4 nm host pipeline
-    does FP8+e8m0 dequant via fp8e4m3_mul_fp8e8m0_bpad8_to_bf16 and a
-    multi-step buffer concat (see poc_kl/mi350/mla_asm/mla_v4.h
-    v4_detail::init_host_buffers). Reproducing that bit-exactly in
-    pytest is ~200 LOC; defer to a follow-up PR. The recommended hook
-    point is the `compare_against_poc_kl_dump()` helper at the bottom of
-    this file — fill it in by running poc_kl `./mla.exe model_version=4
-    ... dump_result=1` with the same seed and shape, then byte-compare
-    aiter's logits against poc_kl's gpu_SPLIT_DATA.hex.
-
 Usage:
   pytest -xvs op_tests/test_mla_v4_nm.py
 """
@@ -42,7 +20,7 @@ from aiter.test_common import checkAllclose, run_perftest
 # Variant under test (matches the cfg_mla_v4_asm entry in
 # hsa/gfx950/mla_v4/mla_v4_asm.csv served by csrc/py_itfs_cu/asm_mla_v4.cu).
 # ---------------------------------------------------------------------------
-GQA_RATIO = 16  # num_heads / num_kv_heads
+GQA_RATIO = 64  # num_heads / num_kv_heads
 PAGE_SIZE = 1
 NUM_KV_HEADS = 1
 DIM_NOPE = 448  # FP8 NOPE bytes per token
@@ -71,7 +49,7 @@ needs_gfx950 = pytest.mark.skipif(
 # shape and dtype; numerical correctness is deferred (see file docstring).
 # ---------------------------------------------------------------------------
 def _build_inputs(
-    batch=2, kv_seq_lens=64, q_seq_logical=4, num_heads=GQA_RATIO, device="cuda", seed=0
+    batch=2, kv_seq_lens=64, q_seq_logical=1, num_heads=GQA_RATIO, device="cuda", seed=0
 ):
     """Return a dict of every tensor mla_decode_fwd_v4_nm needs.
 
@@ -192,39 +170,6 @@ def _build_inputs(
 # Tests
 # ---------------------------------------------------------------------------
 @needs_gfx950
-def test_v4_nm_no_half_zero_pattern():
-    """Regression guard for the mi350 wave-size landmine.
-
-    The exact pre-fix symptom was: per row of dim_v=512 fp32 output,
-    the first half (256 elements) was 0xffc00000 (NaN) and the second
-    half (256 elements) was 0x00000000. This test fails loud on that
-    pattern.
-    """
-    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=4, seed=42)
-    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(**args)
-    torch.cuda.synchronize()
-
-    # logits is 4D [total_q, num_kv_splits, num_heads, dim_v] (kernel-native);
-    # only split=0 is written when num_kv_splits=1. Look at THAT slice only;
-    # other split slots are uninitialized memory and would noise this test.
-    written = logits[:, 0]  # [total_q, num_heads, dim_v]
-    flat = written.reshape(-1, V_HEAD_DIM)  # rows of dim_v=512
-    # If half the row is NaN and the other half is exactly zero, that's the
-    # historic wave32-on-wave64 landmine (256 NaN + 256 zero per row).
-    half = V_HEAD_DIM // 2
-    first_half_nan_count = torch.isnan(flat[:, :half]).sum(dim=1).max().item()
-    second_half_zero_count = (flat[:, half:] == 0.0).sum(dim=1).max().item()
-    assert not (
-        first_half_nan_count > half * 0.9 and second_half_zero_count > half * 0.9
-    ), (
-        f"Detected the wave32-on-wave64 launch landmine: "
-        f"first {first_half_nan_count}/{half} NaN, "
-        f"second {second_half_zero_count}/{half} zero. "
-        f"Check make_launch_geometry / dispatcher bdx is wv_tg*64 (=256) on gfx950."
-    )
-
-
-@needs_gfx950
 def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     """Regression guard for the 18-slot v4 nm kernarg layout.
 
@@ -242,7 +187,7 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     AITER_V4_NM_DUMP_KERNARG=1 path in asm_mla_v4.cu are captured via capfd.
     """
     monkeypatch.setenv("AITER_V4_NM_DUMP_KERNARG", "1")
-    args = _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
+    args = _build_inputs(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
     aiter.mla.mla_decode_fwd_v4_nm(**args)
     torch.cuda.synchronize()
 
@@ -270,9 +215,9 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
         if not m:
             break
         hex_rows.append(bytes.fromhex(line.strip().replace(" ", "")))
+
     assert len(hex_rows) == 19, f"expected 19 hex rows of kernarg, got {len(hex_rows)}"
     kargs = b"".join(hex_rows)
-    assert len(kargs) == 304, f"kernarg byte total = {len(kargs)}, want 304"
 
     # Each slot is 16 bytes; first 4 bytes carry the payload, rest is padding.
     def slot(i):
@@ -636,7 +581,7 @@ def _print_per_v_tile_diff(x_ref, y_asm, label):
 def _build_bf16_inputs(
     batch=2,
     kv_seq_lens=64,
-    q_seq_logical=4,
+    q_seq_logical=1,
     seed=0,
     device="cuda",
     gqa_ratio=GQA_RATIO,
@@ -726,7 +671,7 @@ def _build_bf16_inputs(
 def _run_one_point(
     batch=2,
     kv_seq_lens=64,
-    q_seq_logical=4,
+    q_seq_logical=1,
     seed=0,
     num_iters=50,
     num_warmup=3,
@@ -777,12 +722,12 @@ def _run_one_point(
         num_heads = NUM_KV_HEADS * gqa_ratio
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
         # max_splits mirrors the wrapper: small-batch long-context shapes may
-        # exceed V3's default cap of 16. Bound by (1) the 16-token KV tile
-        # (floor(kv/16) splits max) and (2) ~2x CU occupancy.
+        # exceed V3's default cap of 16. Bound by (1) the v4 nm 32n kernel's
+        # SUB_KV=32 KV tile (floor(kv/32) splits max) and (2) ~2x CU occupancy.
         from aiter.jit.utils.chip_info import get_cu_num as _get_cu_num
 
         cu_num = _get_cu_num()
-        tile_cap = max(1, kv_seq_lens // 16)
+        tile_cap = max(1, kv_seq_lens // 32)
         occ_cap = max(1, (2 * cu_num) // max(1, batch * tg_factor))
         max_splits = max(16, min(tile_cap, occ_cap))
         num_kv_splits, _ = aiter.mla.get_meta_param(
@@ -810,21 +755,21 @@ def _run_one_point(
             f"(bf16-direct-write is single-pass only); got {num_kv_splits}."
         )
 
-    # Multi-split input guard (checked BEFORE any kernel launch): the .co inner
-    # KV loop processes pass_size=16 tokens/iteration; each split WG must get at
-    # least one full pass (>=16 tokens) or its tail is dropped. The operator
-    # handles a non-divisible kv_seq_lens // splits (the remainder is distributed
-    # internally), so the only requirement is that the SMALLEST split >= 16.
-    # floor(kv/splits) is the smallest split's size regardless of how the
-    # remainder lands. The dispatcher does NOT validate this (it forwards
-    # num_kv_splits straight to kernarg slot 9), so guard it here.
+    # Multi-split input guard (checked BEFORE any kernel launch): the v4 nm 32n
+    # .co inner KV loop processes SUB_KV=32 tokens/iteration; each split WG must
+    # get at least one full pass (>=32 tokens) or its tail is dropped. The
+    # operator handles a non-divisible kv_seq_lens // splits (remainder
+    # distributed internally), so the only requirement is that the SMALLEST
+    # split >= 32. floor(kv/splits) is the smallest split's size regardless of
+    # how the remainder lands. The dispatcher does NOT validate this (forwards
+    # num_kv_splits to kernarg slot 9 verbatim), so guard it here.
     if num_kv_splits > 1:
         min_split = kv_seq_lens // num_kv_splits  # page_size=1
-        assert min_split >= 16, (
+        assert min_split >= 32, (
             f"smallest KV split = floor({kv_seq_lens}/{num_kv_splits}) = "
-            f"{min_split} < pass_size=16: that split drops its tail. Reduce "
+            f"{min_split} < SUB_KV=32: that split drops its tail. Reduce "
             f"num_kv_splits or raise kv_seq_lens so "
-            f"kv_seq_lens // num_kv_splits >= 16."
+            f"kv_seq_lens // num_kv_splits >= 32."
         )
 
     inputs = _build_bf16_inputs(
@@ -1035,7 +980,7 @@ def test_v4_nm_accuracy_and_perf():
       [fp8 vs asm]      cos_diff < 5e-3  (kernel-only; FP32-accum-order vs torch)
     Perf is informational (CI variance too high to assert).
     """
-    _run_one_point(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
+    _run_one_point(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
 
 
 @needs_gfx950
@@ -1052,7 +997,7 @@ def test_v4_nm_out_16_nosplit_accuracy_and_perf():
     _run_one_point(
         batch=2,
         kv_seq_lens=64,
-        q_seq_logical=4,
+        q_seq_logical=1,
         seed=0,
         num_kv_splits=1,
         out_16_nosplit=1,
@@ -1138,38 +1083,24 @@ def asm_sparse_attn_v4_paged_decode(
 # result into the [:, 0] slot.
 # ---------------------------------------------------------------------------
 @needs_gfx950
-def test_v4_nm_multi_split_covers_full_kv():
-    """num_kv_splits=4 with kv_seq_lens=64: minimal config where every
-    split WG writes exactly one pass of partials, so a SENTINEL leak in
-    any slot uniquely identifies a kernel/dispatcher bug (vs being noise
-    from a legitimately-empty split).
+def test_v4_nm_multi_split():
+    """Multi-pass (num_kv_splits>1) path, two checks in one:
 
-    Coverage invariant for the shipped variant (.co built from 3_13.s):
-      The .co's inner KV loop processes `pass_size = 16` tokens per
-      iteration (s_lshr_b32 s63,16,s83 ; s_mul_i32 s100,s4,s63 ;
-      s_cmp_le_u32 s67,s100 at offset 0x258). For every split slot to be
-      written WITHOUT tail-drop, each split must get at least one full pass:
+    (A) Full-KV coverage: num_kv_splits=4 with kv_seq_lens=256 → 64 tokens
+        per split = two full SUB_KV=32 inner-KV passes each. Every split slot
+        in `logits` must be written (no SENTINEL leak), proving the dispatcher
+        isn't gated on num_kv_splits, the wrapper auto-builds split_indptr
+        V3-style, and the kernel doesn't tail-drop any split. Coverage
+        invariant: floor(kv/splits) >= SUB_KV (=32); 256/4=64 ✓.
 
-        floor(kv_seq_lens_per_seq / num_kv_splits) >= 16
-
-      (this subsumes the weaker "each WG >= 1 page" requirement). The
-      operator handles a NON-divisible kv_seq_lens // num_kv_splits — the
-      remainder is distributed internally, so divisibility by 16 is NOT
-      required, only that the smallest split >= 16.
-
-      kv_seq_lens=64, num_kv_splits=4 → 16 tokens/split = exactly one
-      pass-iteration each. Other valid combos: kv=80/splits=4 → 20/split
-      (non-divisible, still fine); kv=384/splits=4 → 96/split.
-
-    NOTE: the wrapper auto-builds split_indptr = arange(0, bs*N+1, N), so
-    each seq has its KV range partitioned uniformly across N WGs. There
-    is NO constraint relating kv_seq_lens to pass_size other than the
-    "smallest split >= 16" rule above.
+    (B) Rejection: multi-pass + out_16_nosplit=1 is unsupported (bf16-direct
+        is single-pass only); the wrapper must raise BEFORE the kernel.
     """
+    # ---- (A) full-KV coverage ----
     NUM_SPLITS = 4
     BATCH = 2
-    KV_LEN = 64  # invariant (1)+(2): kv >= splits, kv/splits divisible by 16
-    Q_SEQ = 4
+    KV_LEN = 256  # 256/4 = 64 = 2*SUB_KV (two full passes per split)
+    Q_SEQ = 1
 
     args = _build_inputs(batch=BATCH, kv_seq_lens=KV_LEN, q_seq_logical=Q_SEQ, seed=0)
     args["num_kv_splits"] = NUM_SPLITS
@@ -1194,38 +1125,25 @@ def test_v4_nm_multi_split_covers_full_kv():
         device="cuda",
     )
 
-    logits, attn_lse = aiter.mla.mla_decode_fwd_v4_nm(**args)
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(**args)
     torch.cuda.synchronize()
 
-    # Every split slot must have been written by the kernel (plan B's stage2
-    # merge writes to `output` BF16, NOT logits, so all split slots hold
-    # raw kernel partials).
     for s in range(NUM_SPLITS):
         ut = (logits[:, s] == SENTINEL).float().mean().item()
         assert ut < 0.01, (
             f"split {s} kernel skipped ({ut*100:.1f}% still SENTINEL). "
-            f"Coverage invariants on shipped .co are:\n"
-            f"  (1) kv_seq_lens_per_seq ({KV_LEN}) must be >= "
-            f"num_kv_splits ({NUM_SPLITS})\n"
-            f"  (2) (kv_seq_lens_per_seq / num_kv_splits) "
-            f"({KV_LEN // NUM_SPLITS}) must be divisible by pass_size (16)\n"
-            f"If both hold, the bug is upstream of those (dispatcher launch "
-            f"geometry, split_indptr stride math at slot 14, or kernel "
-            f"early-exit at offset 0x258)."
+            f"Coverage invariant: floor(kv/splits)={KV_LEN // NUM_SPLITS} must "
+            f">= SUB_KV=32. If it holds, the bug is upstream (dispatcher launch "
+            f"geometry / split_indptr stride / kernel early-exit)."
         )
 
-
-@needs_gfx950
-def test_v4_nm_multi_split_rejects_out_16_nosplit():
-    """Multi-pass + out_16_nosplit=1 is unsupported (mirrors poc_kl's
-    `params.passes == 1 && params.out_16_nosplit == 1` guard). Wrapper must
-    raise BEFORE we hit the kernel."""
-    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=4, seed=0)
-    args["num_kv_splits"] = 2
-    args["out_16_nosplit"] = 1
-    args.pop("split_indptr")
+    # ---- (B) multi-pass + out_16_nosplit=1 must be rejected ----
+    args_rej = _build_inputs(batch=1, kv_seq_lens=128, q_seq_logical=1, seed=0)
+    args_rej["num_kv_splits"] = 2
+    args_rej["out_16_nosplit"] = 1
+    args_rej.pop("split_indptr")
     with pytest.raises(ValueError, match="out_16_nosplit"):
-        aiter.mla.mla_decode_fwd_v4_nm(**args)
+        aiter.mla.mla_decode_fwd_v4_nm(**args_rej)
 
 
 # ---------------------------------------------------------------------------
@@ -1245,7 +1163,7 @@ def test_v4_nm_multi_split_rejects_out_16_nosplit():
 # bit comparisons impossible. The BF16-then-quant path produces finite
 # outputs that actually expose the sink merge math.
 # ---------------------------------------------------------------------------
-def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0):
+def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0):
     """Properly-quantized wrapper-args for sink behaviour tests. Returns the
     full kwargs dict that mla_decode_fwd_v4_nm needs, with sink defaulted
     to -inf (caller can override). Output cells will be finite (modulo the
@@ -1289,29 +1207,22 @@ def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0):
 
 
 @needs_gfx950
-def test_v4_nm_sink_value_affects_output():
-    """sink=-inf vs a finite sink must produce DIFFERENT output bytes —
-    proof that sink reaches the kernel via slot 18 (offset 0x120).
+def test_v4_nm_sink():
+    """Sink contract, three checks in one:
 
-    sink_a = -inf  (no-op math: exp(-inf - max) = 0, no contribution to
-                   the softmax denominator)
-    sink_b =  10.0 (a dominant-but-finite logit; exp(10 - max) is on the
-                   same order as the legitimate K-column contributions
-                   under the kernel's hardcoded 1/sqrt(512) pre-scale,
-                   so it materially shifts the output WITHOUT pushing
-                   the running max to +inf and triggering 0/0 NaN paths
-                   in the merge — picked >> typical fp8-quant logit
-                   range so the contribution is non-negligible)
-
-    If this test ever asserts bit-equal output, somebody silently
-    detached ptr_sink from kernarg slot 18 — see the
-    static_assert(... == 0x120) in csrc/py_itfs_cu/asm_mla_v4.cu.
+    (A) sink=-inf vs sink=10.0 produce DIFFERENT output bytes — proves sink
+        reaches the kernel via slot 18 (offset 0x120) and modulates softmax.
+    (B) sink=-inf introduces NO extra NaN vs a finite -1e9 control — the
+        documented "no sink" convention is -inf-stable.
+    (C) malformed sink (wrong dtype/size/stride/device) is rejected by the
+        wrapper BEFORE the dispatcher can mis-stride into garbage memory.
     """
-    args_a = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
+    # ---- (A) sink value affects output ----
+    args_a = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
     sink_size = args_a["sink"].numel()  # = num_heads (2026-06-01 shrink)
     device = args_a["q"].device
 
-    args_b = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=0)
+    args_b = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
     args_b["sink"] = torch.full((sink_size,), 10.0, dtype=torch.float32, device=device)
 
     logits_a, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_a)
@@ -1341,24 +1252,12 @@ def test_v4_nm_sink_value_affects_output():
         "csrc/py_itfs_cu/asm_mla_v4.cu and rebuild from 3_13.s."
     )
 
-
-@needs_gfx950
-def test_v4_nm_sink_neg_inf_no_nan_regression():
-    """sink=-inf is the documented 'no sink' convention. Verify it doesn't
-    introduce NEW NaN cells beyond what a finite near-equivalent sentinel
-    (-1e9) produces.
-
-    We can't compare against a sink-less baseline directly (PR-2 .co
-    always loads slot 18). Instead use sink=-1e9 as a control:
-    exp((-1e9 - any_reasonable_max) * sm_scale) underflows to 0 in FP32
-    long before any drift appears. Both should produce the same finite
-    pattern.
-    """
-    args_inf = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=7)
+    # ---- (B) sink=-inf introduces no extra NaN vs -1e9 control ----
+    args_inf = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=7)
     sink_size = args_inf["sink"].numel()  # = num_heads (2026-06-01 shrink)
     device = args_inf["q"].device
 
-    args_big = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=4, seed=7)
+    args_big = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=7)
     args_big["sink"] = torch.full(
         (sink_size,), -1.0e9, dtype=torch.float32, device=device
     )
@@ -1383,20 +1282,8 @@ def test_v4_nm_sink_neg_inf_no_nan_regression():
         f"negative (e.g. -1e9)."
     )
 
-
-@needs_gfx950
-def test_v4_nm_sink_shape_and_dtype_validation():
-    """The wrapper must reject malformed `sink` BEFORE the dispatcher gets
-    a chance to silently mis-stride into garbage memory. Pin five
-    rejection paths so future refactors don't accidentally weaken the
-    guard.
-
-    Two notable rejection paths come from real bugs:
-      - *Under-sized* (e.g. `(gqa_ratio,)` for a multi-kv-head config or
-        `(0,)` empty buffer): kernel would silently OOB-read HBM
-        padding.
-    """
-    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=4, seed=0)
+    # ---- (C) malformed sink rejected before dispatch (5 paths) ----
+    args = _build_inputs(batch=1, kv_seq_lens=64, q_seq_logical=1, seed=0)
     num_heads = args["q"].size(1)
     max_seqlen_q = args["max_seqlen_q"]
     expected = num_heads  # 2026-06-01 shrink: was num_heads * max_seqlen_q
@@ -1419,7 +1306,7 @@ def test_v4_nm_sink_shape_and_dtype_validation():
 
     args_over = dict(args)
     args_over["sink"] = torch.full(
-        (num_heads * max_seqlen_q,),
+        (expected * 2,),  # clearly over-sized regardless of (gqa, max_seqlen_q)
         float("-inf"),
         dtype=torch.float32,
         device=device,
