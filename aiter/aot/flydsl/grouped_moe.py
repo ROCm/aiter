@@ -11,6 +11,7 @@ import argparse
 import csv
 import sys
 import time
+import traceback
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -28,6 +29,11 @@ _TILE_K = 256
 
 def _align_up(value: int, alignment: int) -> int:
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _align_max_m(raw_max_m: int, warp_tile_m: int) -> int:
+    """Mirror grouped_moe_gfx1250's max_m rounding (>= one warp tile)."""
+    return max(int(warp_tile_m), _align_up(raw_max_m, warp_tile_m))
 
 
 def _preshuffled_scale_shape(
@@ -93,12 +99,23 @@ def _scheduler_variants(row, base_job):
     # runtime cannot launch.
     explicit_contiguous = _as_bool(row.get("grouped_contiguous_m"), False)
     contiguous_modes = [True] if explicit_contiguous else [False, True]
+    warp_tile_m = base_job["tile_m"] // base_job["m_warp"]
+    # Contiguous-M sizes max_m as max(cfg.max_m, token_num*topk) (default 0 when
+    # the CSV omits max_m); dense uses cfg.max_m (default token_num). max_m is
+    # baked into the GEMM kernel_tag, so AOT must derive it per-mode exactly as
+    # grouped_moe_gfx1250 does or the precompiled kernel never gets hit.
+    contiguous_max_m = _align_max_m(
+        max(_as_int(row.get("max_m"), 0), base_job["token_num"] * base_job["topk"]),
+        warp_tile_m,
+    )
     variants = []
     for contiguous in contiguous_modes:
         variant = dict(base_job)
         variant["grouped_persistent_m"] = False
         variant["grouped_contiguous_m"] = contiguous
         variant["expert_sched_mode"] = False
+        if contiguous:
+            variant["max_m"] = contiguous_max_m
         variants.append(variant)
     return variants
 
@@ -123,10 +140,7 @@ def parse_csv(csv_path: str):
             warp_tile_m = tile_m // m_warp
             topk = int(row.get("topk") or 1)
             raw_max_m = _as_int(row.get("max_m"), token_num)
-            max_m = max(
-                warp_tile_m,
-                ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m,
-            )
+            max_m = _align_max_m(raw_max_m, warp_tile_m)
             base_job = {
                 "kernel_name": row.get("kernelName1", "grouped_gemm1"),
                 "model_dim": int(row["model_dim"]),
@@ -164,20 +178,12 @@ def parse_csv(csv_path: str):
 GROUPED_MOE_AOT_ARCH_DEFAULT = "gfx1250"
 
 
-def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
-    """Mirror grouped_moe_gfx1250._choose_gather_reduce_vec."""
-    out_dwords = int(model_dim) // 2
-    n_iters_v4 = (out_dwords + 256 * 4 - 1) // (256 * 4)
-    return 4 if int(token_num) * n_iters_v4 >= 256 else 2
-
-
 def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contiguous):
     """Precompile the non-GEMM FlyDSL kernels the run-only grouped MoE fast path
     launches around gemm1/gemm2."""
     import torch
 
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
-        build_moe_contiguous_psum_module,
         build_moe_contiguous_psum_remap_module,
     )
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
@@ -299,17 +305,6 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             tile_m,
             stream=0,
         )
-        # Also cover the plain prefix-sum kernel (used by the psum layout helper).
-        psum = build_moe_contiguous_psum_module()
-        psum(
-            torch.empty((E,), dtype=i32, device=dev),
-            torch.empty((E,), dtype=i32, device=dev),
-            torch.empty((E,), dtype=i32, device=dev),
-            torch.empty((1,), dtype=i32, device=dev),
-            E,
-            tile_m,
-            stream=0,
-        )
 
         _route_ksplit(
             feat_dim=model_dim,
@@ -388,19 +383,26 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         )
 
     # --- Epilogue: token-order gather-reduce (bf16/f16 fast path only) ---
-    # vec width is token-count dependent at runtime; cover both so run-only
-    # coverage holds across inference batch sizes, not just the CSV token.
+    # split_k mirrors stage2's split_k2: when split_k2 > 1 the GEMM emits an
+    # unreduced (split_k, E, max_m, model_dim) tensor and gather-reduce folds the
+    # split slices itself, so its kernel identity depends on split_k. Hardcoding
+    # 1 here makes the token=1 / split_k2>1 CSV rows miss the AOT cache at
+    # inference. vec width is token-count dependent at runtime; cover both so
+    # run-only coverage holds across inference batch sizes, not just the CSV token.
+    split_k = job["split_k2"]
     for vec in (2, 4):
         gather_reduce = build_moe_gather_reduce_module(
-            model_dim, topk, out_dtype, 1, vec
+            model_dim, topk, out_dtype, split_k, vec
         )
         gather_reduce(
-            torch.empty((a2_out_e * a2_out_m, model_dim), dtype=dtype, device=dev),
+            torch.empty(
+                (split_k * a2_out_e * a2_out_m, model_dim), dtype=dtype, device=dev
+            ),
             torch.empty((token_num, topk), dtype=i32, device=dev),
             torch.empty((token_num, topk), dtype=dtype, device=dev),
             torch.empty((token_num, model_dim), dtype=dtype, device=dev),
             token_num,
-            E * max_m * (model_dim // 2),
+            a2_out_e * a2_out_m * (model_dim // 2),
             stream=0,
         )
 
@@ -614,6 +616,7 @@ def compile_one_config(**job):
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
     except Exception as e:
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
+        traceback.print_exc()
         return {**job, "compile_time": None, "compile_arch": aot_arch}
 
 
