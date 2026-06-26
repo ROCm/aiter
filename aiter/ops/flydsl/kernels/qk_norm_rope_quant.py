@@ -1143,12 +1143,7 @@ def flydsl_qk_norm_rope_quant(
     def _ptr_arg(t):
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
-    q_weight_static = flyc.from_torch_tensor(q_weight_arg)
-    kv_weight_static = flyc.from_torch_tensor(kv_weight)
-    cos_static = flyc.from_torch_tensor(cos_2d)
-    sin_static = flyc.from_torch_tensor(sin_2d)
-
-    # HW grid Y is a 16-bit field on AMD HIP -> cap 65535 blocks/launch. The
+    # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
     # kernel uses per-token GTensor base-shift so each chunk's resource span
     # is small (just the chunk's tokens), but the grid Y dim itself is HW-
     # bounded. We tried folding T across gridY+gridZ to do a single launch,
@@ -1165,10 +1160,10 @@ def flydsl_qk_norm_rope_quant(
         args = (
             _ptr_arg(q_view[start:end]),
             _ptr_arg(kv[start:end]),
-            q_weight_static,
-            kv_weight_static,
-            cos_static,
-            sin_static,
+            q_weight_arg,
+            kv_weight,
+            cos_2d,
+            sin_2d,
             _ptr_arg(positions[start:end]),
             _ptr_arg(q_out[start:end]),
             _ptr_arg(kv_out[start:end]),
