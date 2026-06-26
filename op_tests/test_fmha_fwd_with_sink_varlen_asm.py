@@ -20,7 +20,7 @@ Sink convention (same as the fixed-batch path / CK attention_ref):
 
 
 KV-length constraint (mask=0 only): the non-causal (mask=0) kernels only
-support per-sequence kv_seqlen that is a multiple of 256.  
+support per-sequence kv_seqlen that is a multiple of 256.
 """
 
 from __future__ import annotations
@@ -146,7 +146,7 @@ def make_varlen_packed(
 
     init pattern (mirrors the fixed-batch perf test's `_make_qkv_perf`):
       "randn"     : standard normal (default; exercises real attention math).
-      "const0.25" : fill every element with 0.25 
+      "const0.25" : fill every element with 0.25
     """
     torch.manual_seed(seed)
     cu = torch.tensor(

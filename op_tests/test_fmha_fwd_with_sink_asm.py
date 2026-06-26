@@ -348,7 +348,7 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
 
 
 # KV-length constraint (mask=0 only): the non-causal (mask=0) kernels only
-# support sk (kv_seqlen) that is a multiple of 256.  
+# support sk (kv_seqlen) that is a multiple of 256.
 _CORRECTNESS_SHAPES = [
     # ----- Small shapes (cheap, GQA-light) ---------------------------
     (64, 8, 1, 128, 2048, 1),  # D64  aligned
@@ -372,9 +372,7 @@ _CORRECTNESS_CASES = [
 ]
 
 
-@pytest.mark.parametrize(
-    "head_dim,hq,hk,sq,sk,batch,is_causal", _CORRECTNESS_CASES
-)
+@pytest.mark.parametrize("head_dim,hq,hk,sq,sk,batch,is_causal", _CORRECTNESS_CASES)
 def test_fmha_fwd_with_sink_asm_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
     device = "cuda"
     torch.manual_seed(0)
