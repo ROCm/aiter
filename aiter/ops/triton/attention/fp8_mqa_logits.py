@@ -125,8 +125,11 @@ def fp8_mqa_logits(
             matrix_instr_nonkdim = 16
 
         _fnuz = torch.float8_e4m3fnuz
-        convert_q_fn = Q.dtype != _fnuz
-        convert_kv_fn = KV.dtype != _fnuz
+        # The FN->FNUZ recast + scale compensation is only correct on gfx942,
+        # whose fp8 MFMA interprets operands as FNUZ. Other fp8 archs read the
+        # operands' native dtype, so converting there would corrupt them.
+        convert_q_fn = arch == "gfx942" and Q.dtype != _fnuz
+        convert_kv_fn = arch == "gfx942" and KV.dtype != _fnuz
         scale_mul = 1.0
         if convert_q_fn:
             scale_mul *= 2.0

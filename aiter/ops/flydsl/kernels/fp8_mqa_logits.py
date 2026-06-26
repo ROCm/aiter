@@ -24,6 +24,8 @@ from functools import lru_cache
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, range_constexpr, rocdl
@@ -597,8 +599,10 @@ def flydsl_fp8_mqa_logits(
         _fnuz,
         _fn,
     ), f"Q/KV must be e4m3 fp8 (fnuz or fn); got {Q.dtype}, {KV.dtype}"
-    convert_q_fn = Q.dtype != _fnuz
-    convert_kv_fn = KV.dtype != _fnuz
+    # Only gfx942 needs that conversion; other fp8 archs read operands in their
+    # native dtype, so the FN->FNUZ recast there would corrupt them.
+    convert_q_fn = get_gfx() == "gfx942" and Q.dtype != _fnuz
+    convert_kv_fn = get_gfx() == "gfx942" and KV.dtype != _fnuz
     scale_mul = (2.0 if convert_q_fn else 1.0) * (2.0 if convert_kv_fn else 1.0)
     if scale_mul != 1.0:
         kv_scales = kv_scales.to(torch.float32) * scale_mul
