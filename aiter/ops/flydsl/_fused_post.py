@@ -163,7 +163,10 @@ def _kb_sum_silu_mul_kernel(
     Python overhead (~25 us) dwarfs this kernel's GPU time at the small-M
     shapes that are the only place stage1 reduce mode ever wins.
     """
-    pid_m = tl.program_id(0)
+    # int64 offsets: KB * rows * (2*inter_dim) can exceed INT32_MAX for large
+    # rows (= token_num*topk), so compute flat offsets in 64-bit to avoid
+    # wraparound -> illegal memory access.
+    pid_m = tl.program_id(0).to(tl.int64)
     pid_n = tl.program_id(1)
 
     col_off = pid_n * BLOCK_N
@@ -174,7 +177,7 @@ def _kb_sum_silu_mul_kernel(
     u = tl.zeros([BLOCK_N], dtype=tl.float32)
 
     row_stride = 2 * inter_dim
-    slab_stride = rows * row_stride
+    slab_stride = rows.to(tl.int64) * row_stride
 
     for k in tl.static_range(KB):
         base = tmp_out_ptr + k * slab_stride + pid_m * row_stride
@@ -188,6 +191,75 @@ def _kb_sum_silu_mul_kernel(
     else:
         y = y.to(tl.float16)
     tl.store(out_ptr + pid_m * inter_dim + offs, y, mask=mask)
+
+
+@triton.jit
+def _kb_sum_silu_mul_quant_kernel(
+    qout_ptr,
+    scale_ptr,
+    tmp_out_ptr,
+    rows,
+    inter_dim,
+    KB: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per route: reduce kb -> silu(gate)*up -> per-row fp8 quant."""
+    # int64 offsets: KB * rows * (2*inter_dim) can exceed INT32_MAX for large
+    # rows (= token_num*topk), so compute flat offsets in 64-bit to avoid
+    # wraparound -> illegal memory access.
+    pid_m = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < inter_dim
+
+    g = tl.zeros([BLOCK_N], dtype=tl.float32)
+    u = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    row_stride = 2 * inter_dim
+    slab_stride = rows.to(tl.int64) * row_stride
+
+    for k in tl.static_range(KB):
+        base = tmp_out_ptr + k * slab_stride + pid_m * row_stride
+        g += tl.load(base + offs, mask=mask, other=0.0)
+        u += tl.load(base + inter_dim + offs, mask=mask, other=0.0)
+
+    y = (g * tl.sigmoid(g)) * u
+    amax = tl.max(tl.abs(y), axis=0)
+    scale = tl.maximum(amax / DTYPE_MAX, 1.0e-12)
+    q = (y / scale).to(qout_ptr.dtype.element_ty)
+
+    tl.store(qout_ptr + pid_m * inter_dim + offs, q, mask=mask)
+    tl.store(scale_ptr + pid_m, scale)
+
+
+@triton.jit
+def _silu_mul_quant_kernel(
+    qout_ptr,
+    scale_ptr,
+    tmp_out_ptr,
+    rows,
+    inter_dim,
+    DTYPE_MAX: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per route: silu(gate)*up -> per-row fp8 quant."""
+    # int64 row index: rows * (2*inter_dim) can exceed INT32_MAX for large
+    # rows/inter_dim, so compute flat offsets in 64-bit to avoid wraparound.
+    pid_m = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < inter_dim
+
+    base = tmp_out_ptr + pid_m * (2 * inter_dim)
+    g = tl.load(base + offs, mask=mask, other=0.0)
+    u = tl.load(base + inter_dim + offs, mask=mask, other=0.0)
+
+    y = (g * tl.sigmoid(g)) * u
+    amax = tl.max(tl.abs(y), axis=0)
+    scale = tl.maximum(amax / DTYPE_MAX, 1.0e-12)
+    q = (y / scale).to(qout_ptr.dtype.element_ty)
+
+    tl.store(qout_ptr + pid_m * inter_dim + offs, q, mask=mask)
+    tl.store(scale_ptr + pid_m, scale)
 
 
 def fused_kb_sum_silu_and_mul(
@@ -246,6 +318,113 @@ def fused_kb_sum_silu_and_mul(
     )
 
 
+def fused_kb_sum_silu_mul_quant(
+    qout: torch.Tensor,
+    scale_out: torch.Tensor,
+    tmp_out: torch.Tensor,
+    *,
+    inter_dim: Optional[int] = None,
+) -> None:
+    """Fused ``kb-sum+silu+mul+per-route fp8 quant`` for direct stage1."""
+    assert tmp_out.dtype == torch.float32, "tmp_out must be float32 partials"
+    assert tmp_out.is_contiguous(), "tmp_out must be contiguous"
+    assert qout.dtype in (torch.float8_e4m3fnuz, torch.int8), (
+        f"qout dtype must be fp8/int8, got {qout.dtype}"
+    )
+    assert scale_out.dtype == torch.float32, (
+        f"scale_out dtype must be fp32, got {scale_out.dtype}"
+    )
+    assert tmp_out.ndim == 3, (
+        f"tmp_out must be 3D (KB, rows, 2*inter_dim), got shape {tuple(tmp_out.shape)}"
+    )
+
+    kb, rows, two_n = tmp_out.shape
+    if inter_dim is None:
+        assert two_n % 2 == 0, f"tmp_out last dim must be even, got {two_n}"
+        inter_dim = two_n // 2
+    else:
+        assert two_n == 2 * inter_dim, (
+            f"tmp_out last dim {two_n} != 2*inter_dim {2 * inter_dim}"
+        )
+
+    assert qout.numel() == rows * inter_dim, (
+        f"qout numel {qout.numel()} != rows * inter_dim {rows * inter_dim}"
+    )
+    assert scale_out.numel() == rows, (
+        f"scale_out numel {scale_out.numel()} != rows {rows}"
+    )
+
+    block_n = triton.next_power_of_2(inter_dim)
+    _kb_sum_silu_mul_quant_kernel[(rows,)](
+        qout,
+        scale_out,
+        tmp_out,
+        rows,
+        inter_dim,
+        KB=kb,
+        DTYPE_MAX=(
+            torch.finfo(qout.dtype).max
+            if torch.is_floating_point(qout)
+            else torch.iinfo(qout.dtype).max
+        ),
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+
+
+def fused_silu_mul_quant(
+    qout: torch.Tensor,
+    scale_out: torch.Tensor,
+    tmp_out: torch.Tensor,
+    *,
+    inter_dim: Optional[int] = None,
+) -> None:
+    """Fused ``silu+mul+per-route fp8 quant`` for already-reduced direct stage1."""
+    assert tmp_out.dtype == torch.float32, "tmp_out must be float32 partials"
+    assert tmp_out.is_contiguous(), "tmp_out must be contiguous"
+    assert qout.dtype in (torch.float8_e4m3fnuz, torch.int8), (
+        f"qout dtype must be fp8/int8, got {qout.dtype}"
+    )
+    assert scale_out.dtype == torch.float32, (
+        f"scale_out dtype must be fp32, got {scale_out.dtype}"
+    )
+    assert tmp_out.ndim == 2, (
+        f"tmp_out must be 2D (rows, 2*inter_dim), got shape {tuple(tmp_out.shape)}"
+    )
+
+    rows, two_n = tmp_out.shape
+    if inter_dim is None:
+        assert two_n % 2 == 0, f"tmp_out last dim must be even, got {two_n}"
+        inter_dim = two_n // 2
+    else:
+        assert two_n == 2 * inter_dim, (
+            f"tmp_out last dim {two_n} != 2*inter_dim {2 * inter_dim}"
+        )
+
+    assert qout.numel() == rows * inter_dim, (
+        f"qout numel {qout.numel()} != rows * inter_dim {rows * inter_dim}"
+    )
+    assert scale_out.numel() == rows, (
+        f"scale_out numel {scale_out.numel()} != rows {rows}"
+    )
+
+    block_n = triton.next_power_of_2(inter_dim)
+    _silu_mul_quant_kernel[(rows,)](
+        qout,
+        scale_out,
+        tmp_out,
+        rows,
+        inter_dim,
+        DTYPE_MAX=(
+            torch.finfo(qout.dtype).max
+            if torch.is_floating_point(qout)
+            else torch.iinfo(qout.dtype).max
+        ),
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stage2 reduce-mode post-pass: topk-axis sum
 # ---------------------------------------------------------------------------
@@ -286,7 +465,10 @@ def _topk_sum_kernel(
     Same host-side config picker as ``_kb_sum_silu_mul_kernel``; ditto the
     rationale for skipping ``@triton.autotune``.
     """
-    pid_m = tl.program_id(0)
+    # int64 row index: token_num * TOPK * model_dim can exceed INT32_MAX
+    # (e.g. 65536 * 9 * 4096 ~= 2.42e9 > 2^31), so the flat offset must be
+    # computed in 64-bit to avoid wraparound -> illegal memory access.
+    pid_m = tl.program_id(0).to(tl.int64)
     pid_n = tl.program_id(1)
 
     col_off = pid_n * BLOCK_N
@@ -435,7 +617,10 @@ def _fused_init_kernel(
     and the kernel computes ``expert_idx = offs // w_cols`` to broadcast each
     expert's scale across its ``w_cols`` adjacent output columns.
     """
-    pid = tl.program_id(0)
+    # int64 offset base: the unified offset space (max of tmp_n / flat_a_n /
+    # flat_w_n) can exceed INT32_MAX for very large token counts, so compute
+    # the flat offset in 64-bit to avoid wraparound -> illegal memory access.
+    pid = tl.program_id(0).to(tl.int64)
     base = pid * BLOCK
     offs = base + tl.arange(0, BLOCK)
 

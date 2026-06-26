@@ -214,13 +214,21 @@ def c_shuffle_epilog(
 
         def _do_store_row():
             row_base_lds = row_local * tile_n_idx
+            # Hoist *all* LDS (CShuffle) reads for this row ahead of the stores so
+            # the backend can batch them under a single lgkmcnt wait and issue the
+            # subsequent atomics back-to-back, instead of the serial
+            # "ds_read -> s_waitcnt lgkmcnt(0) -> atomic" chain (one full LDS wait
+            # per atomic). This directly targets the vL1D-bound atomic epilogue.
+            loaded = []
             for nr in range_constexpr(n_reps_shuffle):
                 col_base_nr = arith.constant(nr * (CShuffleNLane * EVec), index=True)
                 col_pair0 = col_base_nr + (n_lane * c_evec)  # even col within tile
 
                 lds_idx_pair = row_base_lds + col_pair0
                 frag = vector.load_op(vec_frag, lds_out, [lds_idx_pair])
+                loaded.append((col_pair0, frag))
 
+            for col_pair0, frag in loaded:
                 store_pair(
                     row_local=row_local,
                     row=row,

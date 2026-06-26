@@ -3611,6 +3611,7 @@ class FmoeTuner(TunerCommon):
                     )
                     k["results"] = (
                         block_m,
+                        block_m,
                         ksplit,
                         e2e_us,
                         kernelName1,
@@ -3629,7 +3630,7 @@ class FmoeTuner(TunerCommon):
         for i, k in better_kernels.items():
             if k["kernel_name"] is None:
                 continue
-            tune_results.append([*k["row"].values, *k["results"]])
+            tune_results.append([*k["row"][self.keys].values, *k["results"]])
             print(
                 f"{k['name']} {GREEN} {float(k['e2e_us_base']):.3f}us -> {float(k['e2e_us']):.3f}us  (err: {k['err_ratio_base']*100:.0f}% -> {k['err_ratio']*100:.0f}%)  {END} {k['kernel_name']}"
             )

@@ -143,7 +143,8 @@ __global__ void initializeScale(float *d_data, int size, float value)
 
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 16>
 __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __restrict__ input,
-                                                             const int32_t cols)
+                                                             const int32_t cols,
+                                                             const int64_t row_idx = blockIdx.x)
 {
     static constexpr int32_t vec_size_i =
         thread_data_size == 0 ? 16 / sizeof(DTYPE_O) : thread_data_size;
@@ -156,7 +157,7 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
             ? 0.25
             : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
-    const int64_t row_offset        = blockIdx.x * cols;
+    const int64_t row_offset        = row_idx * cols;
     auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input + row_offset);
     auto const* input_vecs          = reinterpret_cast<vec_i const*>(ptr_i);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
@@ -235,13 +236,23 @@ __device__ __forceinline__ float atomicMaxFloat(float *addr, float value)
 
 template <typename DTYPE_I, typename DTYPE_O>
 __global__ void
-data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ input, const int cols)
+data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ input, const int cols, const int rows)
 {
-    auto res        = data_to_per_row_scale<DTYPE_I, DTYPE_O, 0>(input, cols);
-    float row_scale = std::get<0>(res);
+    // Grid-stride over rows so each block handles many rows and performs a SINGLE
+    // atomicMax at the end. Previously the launcher used one block per row
+    // (grid=rows), causing `rows`-way contention on the single `scale` address
+    // (e.g. ~295K atomics for MoE a2 quant) which serialized the kernel. The
+    // computed global max is identical; only the atomic count drops to gridDim.x.
+    float block_max = 0.f;
+    for(int row = blockIdx.x; row < rows; row += gridDim.x)
+    {
+        auto res        = data_to_per_row_scale<DTYPE_I, DTYPE_O, 0>(input, cols, row);
+        float row_scale = std::get<0>(res);
+        block_max       = max(block_max, row_scale);
+    }
     if(threadIdx.x == 0)
     {
-        atomicMaxFloat(scale, row_scale);
+        atomicMaxFloat(scale, block_max);
     }
 }
 
@@ -669,6 +680,9 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
     int rows       = input.numel() / cols;
     dim3 grid(rows);
     dim3 block(BlockSize);
+    // Capped grid for the scale (global max) pass: grid-stride bounds atomicMax
+    // contention to one per block instead of one per row.
+    dim3 scale_grid(rows < 8192 ? rows : 8192);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     if(out.dtype() == torch_fp8)
@@ -677,8 +691,8 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
             using input_dtype = typename t2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
-                scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+            aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<scale_grid, block, 0, stream>>>(
+                scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols, rows);
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -692,8 +706,8 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
             using input_dtype = typename t2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
-                scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+            aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<scale_grid, block, 0, stream>>>(
+                scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols, rows);
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<opus::i8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),

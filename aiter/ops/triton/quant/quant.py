@@ -7,6 +7,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     _per_tensor_amax_kernel,
+    _per_tensor_quant_fused_small_kernel,  # P1.1
     _quant_from_per_tensor_amax_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
     _dynamic_mxfp4_quant_kernel,
@@ -18,6 +19,7 @@ __all__ = [
     "static_per_tensor_quant_fp8_i8",
     "dynamic_per_tensor_quant_fp8_i8",
     "dynamic_per_tensor_quant_fp8_i8_nozero",
+    "dynamic_per_tensor_quant_fp8_i8_fused_small",
     "dynamic_per_token_quant_fp8_i8",
     "dynamic_mxfp4_quant",
     "_mxfp4_quant_op",
@@ -262,3 +264,37 @@ def dynamic_mxfp4_quant(
     )
 
     return (x_fp4, blockscale_e8m0)
+
+
+# P1.1_FUSED_SMALL_WRAPPER — single-launch per-tensor quant for small inputs.
+def dynamic_per_tensor_quant_fp8_i8_fused_small(
+    qx: torch.Tensor,
+    x_in: torch.Tensor,
+    scale_out: torch.Tensor,
+    max_block_size: int = 32768,
+):
+    """Single-launch dynamic per-tensor quant. Returns None if the input is
+    too large to fit in one Triton workgroup; caller should fall back to
+    dynamic_per_tensor_quant_fp8_i8_nozero in that case.
+    """
+    _LOGGER.info(f"DYNAMIC_PER_TENSOR_QUANT_FP8_I8_FUSED_SMALL: x={tuple(x_in.shape)}")
+    assert scale_out.numel() == 1
+    qx_flat = qx.reshape(-1)
+    x_flat = x_in.reshape(-1)
+    n_elements = x_flat.numel()
+    block_size = triton.next_power_of_2(n_elements)
+    if block_size > max_block_size:
+        return None
+    _per_tensor_quant_fused_small_kernel[(1,)](
+        x_flat,
+        qx_flat,
+        scale_out,
+        n_elements,
+        BLOCK_SIZE=block_size,
+        DTYPE_MAX=(
+            torch.finfo(qx.dtype).max
+            if torch.is_floating_point(qx)
+            else torch.iinfo(qx.dtype).max
+        ),
+    )
+    return qx, scale_out
