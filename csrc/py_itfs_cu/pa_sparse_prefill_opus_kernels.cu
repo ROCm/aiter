@@ -130,3 +130,173 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
 
 #undef LAUNCH_PA_PREFILL
 }
+
+// =============================================================================
+// FP8 (DeepSeek-V4 / asm-v4 layout) entry: dequant q/unified_kv/kv into bf16
+// scratch via the standalone dequant kernel, then run the bf16 attention.
+// =============================================================================
+void pa_sparse_prefill_opus_fp8_fwd(aiter_tensor_t& q_nope,
+                                    aiter_tensor_t& q_rope,
+                                    aiter_tensor_t& q_scale,
+                                    aiter_tensor_t& unified_kv_nope,
+                                    aiter_tensor_t& unified_kv_rope,
+                                    aiter_tensor_t& unified_kv_scale,
+                                    aiter_tensor_t& kv_nope,
+                                    aiter_tensor_t& kv_rope,
+                                    aiter_tensor_t& kv_scale,
+                                    aiter_tensor_t& kv_indices_prefix,
+                                    aiter_tensor_t& kv_indptr_prefix,
+                                    aiter_tensor_t& kv_indices_extend,
+                                    aiter_tensor_t& kv_indptr_extend,
+                                    aiter_tensor_t& attn_sink,
+                                    aiter_tensor_t& q_bf16,
+                                    aiter_tensor_t& unified_kv_bf16,
+                                    aiter_tensor_t& kv_bf16,
+                                    aiter_tensor_t& out,
+                                    float softmax_scale)
+{
+    constexpr int D_NOPE = 448;
+    constexpr int D_ROPE = 64;
+    constexpr int D_FULL = 512;
+    constexpr int NUM_TILES = 7;
+
+    // ---- dtype validation -------------------------------------------------
+    auto check_nope = [&](aiter_tensor_t& t, const char* nm) {
+        AITER_CHECK(t.dtype() == AITER_DTYPE_fp8, nm, " must be fp8 (e4m3)");
+        AITER_CHECK(t.is_contiguous(), nm, " must be contiguous");
+        AITER_CHECK(t.size(t.dim() - 1) == D_NOPE, nm, " last dim must be 448");
+    };
+    auto check_rope = [&](aiter_tensor_t& t, const char* nm) {
+        AITER_CHECK(t.dtype() == AITER_DTYPE_bf16, nm, " must be bf16");
+        AITER_CHECK(t.is_contiguous(), nm, " must be contiguous");
+        AITER_CHECK(t.size(t.dim() - 1) == D_ROPE, nm, " last dim must be 64");
+    };
+    auto check_scale = [&](aiter_tensor_t& t, const char* nm) {
+        AITER_CHECK(t.dtype() == AITER_DTYPE_fp32, nm, " must be fp32");
+        AITER_CHECK(t.is_contiguous(), nm, " must be contiguous");
+        AITER_CHECK(t.size(t.dim() - 1) == NUM_TILES, nm, " last dim must be 7");
+    };
+    auto check_bf16_scratch = [&](aiter_tensor_t& t, const char* nm) {
+        AITER_CHECK(t.dtype() == AITER_DTYPE_bf16, nm, " scratch must be bf16");
+        AITER_CHECK(t.is_contiguous(), nm, " scratch must be contiguous");
+        AITER_CHECK(t.size(t.dim() - 1) == D_FULL, nm, " scratch last dim must be 512");
+    };
+
+    check_nope(q_nope, "q_nope");       check_rope(q_rope, "q_rope");       check_scale(q_scale, "q_scale");
+    check_nope(unified_kv_nope, "unified_kv_nope"); check_rope(unified_kv_rope, "unified_kv_rope"); check_scale(unified_kv_scale, "unified_kv_scale");
+    check_nope(kv_nope, "kv_nope");     check_rope(kv_rope, "kv_rope");     check_scale(kv_scale, "kv_scale");
+    check_bf16_scratch(q_bf16, "q_bf16"); check_bf16_scratch(unified_kv_bf16, "unified_kv_bf16"); check_bf16_scratch(kv_bf16, "kv_bf16");
+
+    HipDeviceGuard guard(q_nope.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    auto rows_of = [&](aiter_tensor_t& t) {
+        long n = 1;
+        for(int i = 0; i < t.dim() - 1; ++i) n *= t.size(i);
+        return static_cast<int>(n);
+    };
+
+    auto launch_dequant = [&](aiter_tensor_t& nope, aiter_tensor_t& rope,
+                              aiter_tensor_t& scale, aiter_tensor_t& dst, int rows) {
+        if(rows == 0) return;
+        pa_v4_dequant_kargs dk{};
+        dk.nope_ptr     = nope.data_ptr();
+        dk.rope_ptr     = rope.data_ptr();
+        dk.scale_ptr    = reinterpret_cast<const float*>(scale.data_ptr());
+        dk.out_ptr      = dst.data_ptr();
+        dk.rows         = rows;
+        dk.stride_nope  = D_NOPE;
+        dk.stride_rope  = D_ROPE;
+        dk.stride_scale = NUM_TILES;
+        dk.stride_out   = D_FULL;
+        dim3 grid(rows);
+        dim3 block(128);
+        pa_v4_fp8_dequant_kernel<<<grid, block, 0, stream>>>(dk);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    };
+
+    launch_dequant(q_nope, q_rope, q_scale, q_bf16, rows_of(q_nope));
+    launch_dequant(unified_kv_nope, unified_kv_rope, unified_kv_scale, unified_kv_bf16, rows_of(unified_kv_nope));
+    launch_dequant(kv_nope, kv_rope, kv_scale, kv_bf16, rows_of(kv_nope));
+
+    // Run the existing, proven bf16 attention on the dequantized scratch.
+    pa_sparse_prefill_opus_fwd(q_bf16,
+                               unified_kv_bf16,
+                               kv_indices_prefix,
+                               kv_indptr_prefix,
+                               kv_bf16,
+                               kv_indices_extend,
+                               kv_indptr_extend,
+                               attn_sink,
+                               out,
+                               softmax_scale);
+}
+
+// =============================================================================
+// FUSED fp8 entry: single-warp kernel reading fp8 KV directly (no bf16 scratch).
+// =============================================================================
+void pa_sparse_prefill_opus_fp8_fused_fwd(aiter_tensor_t& q_nope,
+                                          aiter_tensor_t& q_rope,
+                                          aiter_tensor_t& q_scale,
+                                          aiter_tensor_t& unified_kv_nope,
+                                          aiter_tensor_t& unified_kv_rope,
+                                          aiter_tensor_t& unified_kv_scale,
+                                          aiter_tensor_t& kv_nope,
+                                          aiter_tensor_t& kv_rope,
+                                          aiter_tensor_t& kv_scale,
+                                          aiter_tensor_t& kv_indices_prefix,
+                                          aiter_tensor_t& kv_indptr_prefix,
+                                          aiter_tensor_t& kv_indices_extend,
+                                          aiter_tensor_t& kv_indptr_extend,
+                                          aiter_tensor_t& attn_sink,
+                                          aiter_tensor_t& out,
+                                          float softmax_scale)
+{
+    const int N = static_cast<int>(q_nope.size(0));
+    const int H = static_cast<int>(q_nope.size(1));
+    AITER_CHECK(q_nope.dtype() == AITER_DTYPE_fp8, "q_nope must be fp8");
+    AITER_CHECK(q_rope.dtype() == AITER_DTYPE_bf16, "q_rope must be bf16");
+    AITER_CHECK(out.dtype() == AITER_DTYPE_bf16, "out must be bf16");
+    AITER_CHECK(H % 16 == 0, "H must be a multiple of 16 for the fused fp8 kernel, got H=", H);
+    AITER_CHECK(q_nope.size(2) == 448, "q_nope last dim must be 448");
+    if (N == 0) return;
+
+    pa_sparse_prefill_fp8_kargs kargs{};
+    kargs.q_nope    = q_nope.data_ptr();
+    kargs.q_rope    = q_rope.data_ptr();
+    kargs.q_scale   = reinterpret_cast<const float*>(q_scale.data_ptr());
+    kargs.ukv_nope  = unified_kv_nope.data_ptr();
+    kargs.ukv_rope  = unified_kv_rope.data_ptr();
+    kargs.ukv_scale = reinterpret_cast<const float*>(unified_kv_scale.data_ptr());
+    kargs.kv_nope   = kv_nope.data_ptr();
+    kargs.kv_rope   = kv_rope.data_ptr();
+    kargs.kv_scale  = reinterpret_cast<const float*>(kv_scale.data_ptr());
+    kargs.attn_sink = attn_sink.data_ptr();
+    kargs.out       = out.data_ptr();
+    kargs.kv_indptr_prefix  = reinterpret_cast<const int*>(kv_indptr_prefix.data_ptr());
+    kargs.kv_indices_prefix = reinterpret_cast<const int*>(kv_indices_prefix.data_ptr());
+    kargs.kv_indptr_extend  = reinterpret_cast<const int*>(kv_indptr_extend.data_ptr());
+    kargs.kv_indices_extend = reinterpret_cast<const int*>(kv_indices_extend.data_ptr());
+    kargs.N = N;
+    kargs.H = H;
+    kargs.total_pages  = static_cast<int>(unified_kv_nope.size(0));
+    kargs.total_tokens = static_cast<int>(kv_nope.size(0));
+    kargs.softmax_scale = softmax_scale;
+
+    HipDeviceGuard guard(q_nope.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    // v4 layout: 448 nope + 64 rope, e8m0 scale per 64-elem tile, KV tile 32,
+    // up to MAX_WARPS=4 independent head-tiles/block.
+    using Traits = pa_prefill_fp8_traits<16, 32, 448, 64, 64, 4>;
+    // Pack up to MAX_WARPS head-tiles per block (more resident waves to hide
+    // memory latency). nwarp must divide H/16 so every warp maps to a valid head.
+    const int htiles = H / Traits::QTILE;
+    int nwarp = 1;
+    for (int nw = Traits::MAX_WARPS; nw >= 1; --nw) {
+        if (htiles % nw == 0) { nwarp = nw; break; }
+    }
+    dim3 grid(N, htiles / nwarp, 1);
+    dim3 block(nwarp * Traits::WARP_SIZE);
+    pa_prefill_fp8_fused_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
+    HIP_CALL_LAUNCH(hipGetLastError());
+}

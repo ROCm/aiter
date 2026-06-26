@@ -1387,6 +1387,49 @@ namespace py = pybind11;
           py::arg("out"),               \
           py::arg("softmax_scale"));
 
+#define PA_SPARSE_PREFILL_OPUS_FP8_PYBIND              \
+    m.def("pa_sparse_prefill_opus_fp8_fwd",            \
+          &pa_sparse_prefill_opus_fp8_fwd,             \
+          py::arg("q_nope"),                           \
+          py::arg("q_rope"),                           \
+          py::arg("q_scale"),                          \
+          py::arg("unified_kv_nope"),                  \
+          py::arg("unified_kv_rope"),                  \
+          py::arg("unified_kv_scale"),                 \
+          py::arg("kv_nope"),                          \
+          py::arg("kv_rope"),                          \
+          py::arg("kv_scale"),                         \
+          py::arg("kv_indices_prefix"),                \
+          py::arg("kv_indptr_prefix"),                 \
+          py::arg("kv_indices_extend"),                \
+          py::arg("kv_indptr_extend"),                 \
+          py::arg("attn_sink"),                        \
+          py::arg("q_bf16"),                           \
+          py::arg("unified_kv_bf16"),                  \
+          py::arg("kv_bf16"),                          \
+          py::arg("out"),                              \
+          py::arg("softmax_scale"));
+
+#define PA_SPARSE_PREFILL_OPUS_FP8_FUSED_PYBIND        \
+    m.def("pa_sparse_prefill_opus_fp8_fused_fwd",      \
+          &pa_sparse_prefill_opus_fp8_fused_fwd,       \
+          py::arg("q_nope"),                           \
+          py::arg("q_rope"),                           \
+          py::arg("q_scale"),                          \
+          py::arg("unified_kv_nope"),                  \
+          py::arg("unified_kv_rope"),                  \
+          py::arg("unified_kv_scale"),                 \
+          py::arg("kv_nope"),                          \
+          py::arg("kv_rope"),                          \
+          py::arg("kv_scale"),                         \
+          py::arg("kv_indices_prefix"),                \
+          py::arg("kv_indptr_prefix"),                 \
+          py::arg("kv_indices_extend"),                \
+          py::arg("kv_indptr_extend"),                 \
+          py::arg("attn_sink"),                        \
+          py::arg("out"),                              \
+          py::arg("softmax_scale"));
+
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
           &layernorm2d,                            \
