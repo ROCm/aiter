@@ -2,10 +2,16 @@
 # SPDX-License-Identifier: MIT
 """End-to-end benchmark: FlyDSL sparse MLA prefill (B2/GLM) vs Triton baselines.
 
-Fair comparison rule: report **total wall time** for each path, including all
-prep kernels the production stack runs before the core attention op.  The FlyDSL
-native path fuses gather/dequant/attn; the Triton production prefill path does
-not — so ``triton_prefill_e2e`` times dequant + attention, not attention alone.
+Metric: **GPU-kernel-only time** (summed CUDA/HIP device self-time per iter, via
+the torch profiler).  Model inference is GPU-bound and asynchronous — the host
+enqueues kernels and only waits for the GPU at the end — so host launch/sync
+overhead is not what we optimize; kernel device time is.  Wall time is ignored.
+
+Fair comparison rule: still sum **all** prep kernels the production stack runs
+before the core attention op.  The FlyDSL native path fuses gather/dequant/attn;
+the Triton production prefill path does not — so ``triton_prefill_e2e`` counts
+the dequant kernels + attention, not attention alone.  The per-kernel breakdown
+printed under each result shows where the device time goes.
 
 Run (gfx942, dsv4 preset: B2 main=512 + extra=128):
 
@@ -22,7 +28,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -143,25 +148,48 @@ class StageTimer:
         return dict(self.stages)
 
 
+def _short_kernel(name: str) -> str:
+    """Compact a CUDA/HIP kernel symbol for the per-kernel breakdown line."""
+    base = name.split("(")[0].split("<")[0].strip()
+    base = base.rsplit("::", 1)[-1].strip()
+    return (base or name)[:30]
+
+
 def _median_ms(fn: Callable[[], None], warmup: int, iters: int) -> tuple[float, dict[str, float]]:
-    """Return median total ms and median per-stage ms (if fn uses StageTimer via closure)."""
-    stage_accum: dict[str, list[float]] = {}
-    totals: list[float] = []
-    for i in range(warmup + iters):
+    """Return GPU-kernel-only ms/iter (device self-time) and a per-kernel breakdown.
+
+    Model inference is GPU-bound and asynchronous: the host enqueues kernels and
+    only waits for the GPU at the end, so **host launch/sync overhead is not what
+    we should optimize** — kernel device time is.  We therefore ignore wall time
+    entirely and sum every CUDA/HIP kernel's *device self-time* over ``iters``
+    profiled iterations (after ``warmup``), dividing by ``iters``.  The returned
+    ``stages`` dict is the per-kernel device-time breakdown (descending), which
+    replaces the old wall-clock StageTimer stages.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            fn()
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        stages = fn()
-        torch.cuda.synchronize()
-        elapsed = (time.perf_counter() - t0) * 1e3
-        if i >= warmup:
-            totals.append(elapsed)
-            if stages:
-                for k, v in stages.items():
-                    stage_accum.setdefault(k, []).append(v)
-    totals.sort()
-    med = totals[len(totals) // 2]
-    med_stages = {k: sorted(v)[len(v) // 2] for k, v in stage_accum.items()}
-    return med, med_stages
+
+    per_kernel: dict[str, float] = {}
+    total_us = 0.0
+    for e in prof.key_averages():
+        us = getattr(e, "self_device_time_total", 0.0) or getattr(e, "self_cuda_time_total", 0.0)
+        if us <= 0:
+            continue  # host-only op (launch, etc.) — ignored on purpose
+        total_us += us
+        per_kernel[e.key] = per_kernel.get(e.key, 0.0) + us
+    inv = 1.0 / (iters * 1000.0)  # us-total -> ms/iter
+    stages = {
+        _short_kernel(k): v * inv
+        for k, v in sorted(per_kernel.items(), key=lambda kv: -kv[1])
+    }
+    return total_us * inv, stages
 
 
 # ---------------------------------------------------------------------------
@@ -808,13 +836,14 @@ def bench_triton_decode_kernel_b2(inp: BenchInputsB2, warmup: int, iters: int) -
 
 
 def _print_result(r: TimingResult, baseline_ms: float | None) -> None:
-    stage_str = ", ".join(f"{k}={v:.3f}ms" for k, v in sorted(r.stages_ms.items()))
+    # stages are per-kernel device times (descending); keep that order, not sorted by name.
+    stage_str = ", ".join(f"{k}={v:.3f}ms" for k, v in r.stages_ms.items())
     ratio = ""
     if baseline_ms is not None and baseline_ms > 0:
         ratio = f"  ({r.total_ms / baseline_ms:.2f}x vs flydsl)"
-    print(f"{r.name:28s}  total={r.total_ms:8.3f} ms{ratio}")
+    print(f"{r.name:28s}  gpu_kernel={r.total_ms:8.3f} ms{ratio}")
     if stage_str:
-        print(f"{'':28s}  stages: {stage_str}")
+        print(f"{'':28s}  kernels: {stage_str}")
     if r.notes:
         print(f"{'':28s}  note: {r.notes}")
 
@@ -826,7 +855,7 @@ def run_bench(args: argparse.Namespace, T: int) -> None:
 
     print(
         f"sparse_mla_prefill bench  gfx942  T={T}  block_size={args.block_size}  "
-        f"warmup={args.warmup} iters={args.iters}  "
+        f"warmup={args.warmup} iters={args.iters}  metric=gpu_kernel_ms (device self-time)  "
         f"triton_dequant={'csr_slots' if csr_dequant else 'full_cache'}"
     )
     print()
@@ -852,8 +881,10 @@ def run_bench(args: argparse.Namespace, T: int) -> None:
         triton_dec = bench_triton_decode_kernel_b2(b2, args.warmup, args.iters)
         _print_result(triton_dec, fly_b2.total_ms)
     print()
-    print("Compare triton_prefill_e2e_* (total) against flydsl_*_e2e for fair E2E.")
-    print("triton_prefill_attn_only_* and triton_decode_kernel_* are subgraph references only.")
+    print("All times are summed GPU kernel device self-time per iter (host overhead ignored).")
+    print("Compare triton_prefill_e2e_* against flydsl_*_e2e for fair E2E; the per-kernel")
+    print("breakdown shows where device time goes. triton_decode_kernel_* is a decode")
+    print("subgraph reference only (not the prefill path this kernel replaces).")
     print()
 
 
