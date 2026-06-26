@@ -100,11 +100,6 @@ def compile_gemm2_a4w4_port(
     BN=256,
     BK=256,
 ):
-    print(
-        f"[PORT-FLYDSL-GEMM2] compile_gemm2_a4w4_port ENTERED "
-        f"BM={BM} use_nt={use_nt} NE={NE} N_OUT={N_OUT} epilog={epilog} D_INTER={D_INTER}",
-        flush=True,
-    )
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
     KH_TILE = BK // 2
     _K = D_INTER

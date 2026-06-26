@@ -728,10 +728,12 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
-    # mxfp4 weights (a4w4/a8w4/a16w4) all run the gate/up-interleaved (guinterleave)
-    # layout that the tuned kimik2_5 rows are keyed on, matching serving's
-    # ATOM_MOE_GU_ITLV=1. Include fp4x2 activations (true a4w4) so op_tests reach
-    # the HIP a4w4 backend instead of falling through to the separated default.
+    # mxfp4 weights (a4w4/a8w4/a16w4) run the gate/up-interleaved (guinterleave)
+    # layout, matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime
+    # weight-layout property (not a tuned-config key); request INTERLEAVE here so
+    # op_tests exercise the a4w4 FlyDSL port's interleave variant. Include fp4x2
+    # activations (true a4w4) so they reach the port instead of the separated
+    # default.
     if aq_dtype in [dtypes.fp8, dtypes.bf16, dtypes.fp4x2] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
