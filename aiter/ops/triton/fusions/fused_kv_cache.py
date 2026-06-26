@@ -6,16 +6,22 @@ import triton
 from typing import Tuple
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
-    _fused_qk_rope_reshape_and_cache_kernel,
+    _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
     _fused_qk_rope_cosine_cache_llama_kernel,
 )
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
+        _fused_qk_rope_cat_and_cache_mla_kernel_BLOCK as gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK,
+        _fused_qk_rope_reshape_and_cache_kernel as gluon_fused_qk_rope_reshape_and_cache_kernel,
+        _fused_qk_rope_reshape_and_cache_kernel_LOOP as gluon_fused_qk_rope_reshape_and_cache_kernel_LOOP,
     )
 except:  # noqa: E722
     gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
+    gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK = None
+    gluon_fused_qk_rope_reshape_and_cache_kernel = None
+    gluon_fused_qk_rope_reshape_and_cache_kernel_LOOP = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -136,6 +142,8 @@ def fused_qk_rope_cat_and_cache_mla(
     bk, kh, dk_nope = k_nope.shape
     bk2, kh2, dk2 = k_pe.shape
     kv_cache_dtype = kv_cache.dtype
+    d_freq = cos.shape[-1]
+    max_embd_pos = cos.shape[0]
     assert kv_cache_dtype in [
         torch.bfloat16,
         e4m3_dtype,
@@ -184,7 +192,6 @@ def fused_qk_rope_cat_and_cache_mla(
             dk_nope + d_pe == d_cache
         ), "D dimension of k_nope and k_pe should be summed up to be the D dimension of kv_cache"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
-    d_freq = cos.shape[-1]
     assert (d_freq == d_pe // 2) or (
         d_freq == d_pe
     ), "cos/sin last dim should be the same or half of the qk last dim"
@@ -248,12 +255,26 @@ def fused_qk_rope_cat_and_cache_mla(
         kv_cache_stride_d == 1
     ), "The stride of the last dimension of KV cache must be 1"
 
-    n_pid = b * qh + (b_slot - b) * kh
-    grid = (n_pid, 1, 1)
-    if DEVICE_ARCH == "gfx1250":
-        _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+    if DEVICE_ARCH == "gfx1250" and kv_cache_dtype != torch.uint8:
+        if b >= 8:
+            BLOCK_T = 1
+        else:
+            BLOCK_T = 1
+
+        # temporaily block off BLOCK version
+        if BLOCK_T > 1:
+            n_pid = triton.cdiv(b, BLOCK_T) * qh + triton.cdiv(b_slot - b, BLOCK_T) * kh
+            _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel_BLOCK
+            _extra_args = {"BLOCK_T": BLOCK_T}
+        else:
+            n_pid = b * qh + (b_slot - b) * kh
+            _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+            _extra_args = {}
     else:
+        n_pid = b * qh + (b_slot - b) * kh
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
+        _extra_args = {}
+    grid = (n_pid, 1, 1)
 
     _kernel[grid](
         q_nope,
@@ -272,6 +293,7 @@ def fused_qk_rope_cat_and_cache_mla(
         b,
         b_slot,
         num_decode_toks_for_zeros,
+        max_embd_pos,
         *q_nope.stride(),
         *q_pe.stride(),
         *k_nope.stride(),
@@ -303,6 +325,7 @@ def fused_qk_rope_cat_and_cache_mla(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         UPCAST_OPERAND=upcast_operand,
         num_warps=1,
+        **_extra_args,
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
@@ -373,6 +396,8 @@ def fused_qk_rope_reshape_and_cache(
     SCALE_K_WIDTH = 4
     x_cache = 8
     value_shuffle_layout = False
+    max_embd_pos = cos.shape[0]
+    d_freq = cos.shape[-1]
     if kv_cache_dtype == torch.uint8:
         # always shuffled
         t_cache, kh_cache, block_size, d_cache = key_cache.shape
@@ -441,7 +466,6 @@ def fused_qk_rope_reshape_and_cache(
         block_size
     ), "block_size should be power of 2"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
-    d_freq = cos.shape[-1]
     assert (d_freq == d // 2) or (
         d_freq == d
     ), "cos/sin last dim should be the same or half of the qk last dim"
@@ -517,9 +541,34 @@ def fused_qk_rope_reshape_and_cache(
         value_cache_stride_slot_chunk = 0
         value_cache_stride_x = 0
 
-    n_pid = t * qh + (t_slot - t) * kh
+    # On gfx1250 the gluon 2D kernel handles all bf16/fp8 cache layouts in
+    # one path (BLOCK_T > 1). uint8/NVFP4 still falls back to the Triton
+    # kernel (no NVFP4 support in the 2D gluon kernel yet).
+    if DEVICE_ARCH == "gfx1250" and kv_cache_dtype != torch.uint8:
+        if t >= 2048:
+            BLOCK_T = 16
+            BLOCK_T_NUM_ITR = 1
+        else:
+            BLOCK_T = 1
+            BLOCK_T_NUM_ITR = 1
+
+        # temporaily block off LOOP version
+        chunk = BLOCK_T * BLOCK_T_NUM_ITR
+        n_pid = triton.cdiv(t, chunk) * qh + triton.cdiv(t_slot - t, chunk) * kh
+        # Use the _LOOP variant only when we actually have an inner static
+        # loop to run; the regular kernel is leaner for BLOCK_T_NUM_ITR == 1.
+        if BLOCK_T_NUM_ITR > 1:
+            _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel_LOOP
+            _extra_args = {"BLOCK_T": BLOCK_T, "BLOCK_T_NUM_ITR": BLOCK_T_NUM_ITR}
+        else:
+            _kernel = gluon_fused_qk_rope_reshape_and_cache_kernel
+            _extra_args = {"BLOCK_T": BLOCK_T}
+    else:
+        n_pid = t * qh + (t_slot - t) * kh
+        _kernel = triton_fused_qk_rope_reshape_and_cache_kernel
+        _extra_args = {}
     grid = (n_pid, 1, 1)
-    _fused_qk_rope_reshape_and_cache_kernel[grid](
+    _kernel[grid](
         q,
         k,
         v,
@@ -535,6 +584,7 @@ def fused_qk_rope_reshape_and_cache(
         zeros_out,
         t,
         t_slot,
+        max_embd_pos,
         *q.stride(),
         *k.stride(),
         *v.stride(),
@@ -576,6 +626,7 @@ def fused_qk_rope_reshape_and_cache(
         HAVE_ZEROS=output_zeros,
         UPCAST_OPERAND=upcast_operand,
         num_warps=1,
+        **_extra_args,
     )
 
     if zeros_out is not None:
