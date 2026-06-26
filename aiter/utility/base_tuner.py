@@ -393,6 +393,19 @@ class TunerCommon:
             return df_old
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
+        # Backfill columns present in the new results but missing from a legacy
+        # tuned CSV (for example a newly added gfx key column), so that the
+        # key construction and per-column assignment below do not KeyError
+        # during migration. gfx/cu_num default to the running device; any other
+        # missing column defaults to NA.
+        for col in df_updates.columns:
+            if col not in df_old.columns:
+                if col == "gfx":
+                    df_old[col] = self.get_gfx()
+                elif col == "cu_num":
+                    df_old[col] = self.get_cu_num()
+                else:
+                    df_old[col] = pd.NA
         # Widen integer columns to object so that float/string updates don't
         # trigger a Pandas dtype-coercion error (e.g. tflops=0 stored as int64
         # cannot accept a float like 2.61).
@@ -1552,6 +1565,10 @@ class GemmCommonTuner(TunerCommon):
             self.untunedf["cu_num"] = self.get_cu_num()
             self.untunedf = self.untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            # Backfill gfx for legacy tuned CSVs so the key-based skip mask
+            # below does not KeyError when gfx is part of the tuner keys.
+            if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
+                self.tunedf["gfx"] = self.get_gfx()
 
             untunedf_cols = self.untunedf.columns
             if len(self.tunedf) != 0:
