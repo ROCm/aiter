@@ -39,7 +39,8 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arc
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1201", "gfx1250")
+IS_DEVICE_ARCH_GFX1250 = DEVICE_ARCH == "gfx1250"
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
@@ -48,7 +49,7 @@ def is_2d_gluon_available(
     q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
 ):
     use_gluon_2d = (
-        IS_DEVICE_ARCH_GFX12
+        IS_DEVICE_ARCH_GFX1250
         and _unified_attention_gluon_kernel_2d is not None
         and not softcap
         and not use_qq_bias
@@ -89,8 +90,11 @@ def select_2d_config(
         num_stages_2d, num_warps = 1, 2
     # pure decode config
     else:
-        # to not have masking when loading KV
-        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        # Avoid exceeding gfx1201's 64 KiB LDS/shared-memory limit.
+        if arch.name == "gfx1201":
+            TILE_SIZE = min(32, triton.next_power_of_2(block_size))
+        else:
+            TILE_SIZE = min(64, triton.next_power_of_2(block_size))
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
@@ -110,7 +114,7 @@ def select_2d_config(
             assert (
                 block_size >= 32
             ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
-        TILE_SIZE = block_size
+        TILE_SIZE = min(block_size, 32) if arch.name == "gfx1201" else block_size
     elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
         TILE_SIZE = max(32, TILE_SIZE)
 
@@ -147,10 +151,10 @@ def select_3d_config(
     attn_warps = 2
     waves_per_eu = 2
     num_segments = 0
-    attn_stages = 2
+    attn_stages = 1 if DEVICE_ARCH == "gfx1201" else 2
     if IS_DEVICE_ARCH_GFX12:
         attn_warps = 1
-        TILE_SIZE = block_size
+        TILE_SIZE = min(block_size, 32) if DEVICE_ARCH == "gfx1201" else block_size
         if shuffled_kv_cache and head_size < 128:
             if kv_cache_dtype == torch.bfloat16:
                 if block_size <= 64:
@@ -265,7 +269,7 @@ def use_2d_kernel(
     target_num_prgms,
     num_2d_prgms,
 ):
-    # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
+    # On gfx12-family devices, use 3D for pure decode and 2D otherwise.
     if IS_DEVICE_ARCH_GFX12:
         return (sliding_window > 0) or (not all_decode)
 
@@ -533,7 +537,7 @@ def unified_attention(
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
 
-        if IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache:
+        if IS_DEVICE_ARCH_GFX1250 and shuffled_kv_cache:
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
