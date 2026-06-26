@@ -41,6 +41,20 @@ if is_flydsl_available():
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+    from .norm_kernels import (
+        flydsl_add_layernorm,
+        flydsl_add_layernorm_dynamicquant,
+        flydsl_add_layernorm_smoothquant,
+        flydsl_add_rmsnorm,
+        flydsl_add_rmsnorm_dynamicquant,
+        flydsl_add_rmsnorm_smoothquant,
+        flydsl_layernorm,
+        flydsl_layernorm_dynamicquant,
+        flydsl_layernorm_smoothquant,
+        flydsl_rmsnorm,
+        flydsl_rmsnorm_dynamicquant,
+        flydsl_rmsnorm_smoothquant,
+    )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
     # from .linear_attention_prefill_kernels import flydsl_gdr_prefill
@@ -52,6 +66,18 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_flash_attn_func",
         "flydsl_qk_norm_rope_quant",
+        "flydsl_rmsnorm",
+        "flydsl_add_rmsnorm",
+        "flydsl_rmsnorm_dynamicquant",
+        "flydsl_rmsnorm_smoothquant",
+        "flydsl_add_rmsnorm_dynamicquant",
+        "flydsl_add_rmsnorm_smoothquant",
+        "flydsl_layernorm",
+        "flydsl_add_layernorm",
+        "flydsl_layernorm_dynamicquant",
+        "flydsl_layernorm_smoothquant",
+        "flydsl_add_layernorm_dynamicquant",
+        "flydsl_add_layernorm_smoothquant",
         # "flydsl_gdr_decode",
         # "flydsl_gdr_prefill",
     ]

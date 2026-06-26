@@ -9,14 +9,15 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("flydsl")
-from aiter.ops.flydsl import (  # noqa: E402
-    flydsl_add_rmsnorm,
-    flydsl_add_rmsnorm_dynamicquant,
-    flydsl_add_rmsnorm_smoothquant,
-    flydsl_rmsnorm,
-    flydsl_rmsnorm_dynamicquant,
-    flydsl_rmsnorm_smoothquant,
-    is_flydsl_available,
+import flydsl.compiler as flyc  # noqa: E402
+from aiter.ops.flydsl import is_flydsl_available  # noqa: E402
+from aiter.ops.flydsl.kernels.rmsnorm_kernel import (  # noqa: E402
+    build_fused_add_rmsnorm_dynamicquant_module,
+    build_fused_add_rmsnorm_module,
+    build_fused_add_rmsnorm_smoothquant_module,
+    build_rmsnorm_dynamicquant_module,
+    build_rmsnorm_module,
+    build_rmsnorm_smoothquant_module,
 )
 
 if not is_flydsl_available():
@@ -30,6 +31,96 @@ def _make_input(m: int, n: int, dtype: torch.dtype, seed: int = 0):
     x = torch.randn((m, n), device="cuda", dtype=torch.float32).to(dtype).contiguous()
     weight = torch.rand((n,), device="cuda", dtype=torch.float32).to(dtype).contiguous()
     return x, weight
+
+
+def _kernel_dtype(dtype: torch.dtype) -> str:
+    if dtype is torch.float32:
+        return "f32"
+    if dtype is torch.float16:
+        return "f16"
+    if dtype is torch.bfloat16:
+        return "bf16"
+    raise TypeError(f"unsupported dtype: {dtype!r}")
+
+
+def _run_compiled(launch_fn, *args):
+    stream = torch.cuda.current_stream()
+    compiled_fn = flyc.compile(launch_fn, *args, stream)
+    compiled_fn(*args, stream)
+
+
+def _flydsl_rmsnorm_compile(x: torch.Tensor, weight: torch.Tensor, eps: float):
+    m, n = x.shape
+    out = torch.empty_like(x)
+    launch_fn = build_rmsnorm_module(n, _kernel_dtype(x.dtype), eps=eps)
+    _run_compiled(launch_fn, x, weight, out, m)
+    return out
+
+
+def _flydsl_add_rmsnorm_compile(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+):
+    m, n = x.shape
+    out = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+    launch_fn = build_fused_add_rmsnorm_module(n, _kernel_dtype(x.dtype), eps=eps)
+    _run_compiled(launch_fn, x, residual, weight, out, residual_out, m)
+    return out, residual_out
+
+
+def _flydsl_rmsnorm_quant_compile(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    xscale: torch.Tensor | None = None,
+):
+    m, n = x.shape
+    out = torch.empty_like(x, dtype=torch.int8)
+    yscale = torch.empty((m,), device=x.device, dtype=torch.float32)
+    dtype_str = _kernel_dtype(x.dtype)
+    if xscale is None:
+        launch_fn = build_rmsnorm_dynamicquant_module(n, dtype_str, eps=eps)
+        _run_compiled(launch_fn, x, weight, out, yscale, m)
+    else:
+        launch_fn = build_rmsnorm_smoothquant_module(n, dtype_str, eps=eps)
+        _run_compiled(launch_fn, x, weight, xscale, out, yscale, m)
+    return out, yscale
+
+
+def _flydsl_add_rmsnorm_quant_compile(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    xscale: torch.Tensor | None = None,
+):
+    m, n = x.shape
+    out = torch.empty_like(x, dtype=torch.int8)
+    residual_out = torch.empty_like(x)
+    yscale = torch.empty((m,), device=x.device, dtype=torch.float32)
+    dtype_str = _kernel_dtype(x.dtype)
+    if xscale is None:
+        launch_fn = build_fused_add_rmsnorm_dynamicquant_module(n, dtype_str, eps=eps)
+        _run_compiled(launch_fn, x, residual, weight, out, residual_out, yscale, m)
+    else:
+        launch_fn = build_fused_add_rmsnorm_smoothquant_module(n, dtype_str, eps=eps)
+        _run_compiled(
+            launch_fn,
+            x,
+            residual,
+            weight,
+            xscale,
+            out,
+            residual_out,
+            yscale,
+            m,
+        )
+    return out, residual_out, yscale
 
 
 def _reference_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float):
@@ -66,7 +157,7 @@ def _assert_norm_close(actual: torch.Tensor, expected: torch.Tensor, dtype: torc
 )
 def test_flydsl_rmsnorm_matches_torch(m: int, n: int, dtype: torch.dtype, eps: float):
     x, weight = _make_input(m, n, dtype)
-    out = flydsl_rmsnorm(x, weight, epsilon=eps)
+    out = _flydsl_rmsnorm_compile(x, weight, eps)
     ref = _reference_rmsnorm(x, weight, eps)
     assert out.shape == x.shape
     assert out.dtype == dtype
@@ -78,7 +169,7 @@ def test_flydsl_add_rmsnorm_matches_torch():
     x, weight = _make_input(m, n, dtype, seed=1)
     residual = torch.randn_like(x).contiguous()
 
-    out, residual_out = flydsl_add_rmsnorm(x, residual, weight, epsilon=eps)
+    out, residual_out = _flydsl_add_rmsnorm_compile(x, residual, weight, eps)
     residual_ref = (x + residual).float()
     ref = _reference_rmsnorm(x + residual, weight, eps)
 
@@ -94,10 +185,12 @@ def test_flydsl_rmsnorm_quant_matches_torch(smooth: bool):
     xscale = (torch.rand((n,), device="cuda", dtype=dtype) + 0.5).contiguous()
 
     if smooth:
-        out, yscale = flydsl_rmsnorm_smoothquant(x, weight, xscale, epsilon=eps)
+        out, yscale = _flydsl_rmsnorm_quant_compile(
+            x, weight, eps, xscale=xscale
+        )
         ref_y = _reference_rmsnorm(x, weight, eps) * xscale.float()
     else:
-        out, yscale = flydsl_rmsnorm_dynamicquant(x, weight, epsilon=eps)
+        out, yscale = _flydsl_rmsnorm_quant_compile(x, weight, eps)
         ref_y = _reference_rmsnorm(x, weight, eps)
     q_ref, yscale_ref = _reference_quant(ref_y)
 
@@ -115,20 +208,20 @@ def test_flydsl_add_rmsnorm_quant_matches_torch(smooth: bool):
     xscale = (torch.rand((n,), device="cuda", dtype=dtype) + 0.5).contiguous()
 
     if smooth:
-        out, residual_out, yscale = flydsl_add_rmsnorm_smoothquant(
+        out, residual_out, yscale = _flydsl_add_rmsnorm_quant_compile(
             x,
             residual,
             weight,
-            xscale,
-            epsilon=eps,
+            eps,
+            xscale=xscale,
         )
         ref_y = _reference_rmsnorm(x + residual, weight, eps) * xscale.float()
     else:
-        out, residual_out, yscale = flydsl_add_rmsnorm_dynamicquant(
+        out, residual_out, yscale = _flydsl_add_rmsnorm_quant_compile(
             x,
             residual,
             weight,
-            epsilon=eps,
+            eps,
         )
         ref_y = _reference_rmsnorm(x + residual, weight, eps)
     q_ref, yscale_ref = _reference_quant(ref_y)
