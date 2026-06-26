@@ -308,6 +308,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     bias1: Optional[torch.Tensor],
     bias2: Optional[torch.Tensor],
     gate_mode: GateMode = GateMode.SEPARATED,
+    swiglu_limit: Optional[float] = None,
 ):
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
@@ -753,6 +754,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         model_dim,
         E,
         stream=torch.cuda.current_stream(),
+        swiglu_limit=swiglu_limit,
         _m_tile_prefix=m_tile_prefix,
         _m_tile_map=m_tile_map,
         bias=_bias1_arg,

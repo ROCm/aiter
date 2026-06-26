@@ -363,9 +363,9 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& scale,
         torch::Tensor& weight,
         double epsilon,
-        bool gemma_norm = false,
         int group_size = 0,
-        bool shuffle_scale = false
+        bool shuffle_scale = false,
+        bool gemma_norm = false
     )
     {
         int n = input.size(1);
@@ -423,9 +423,9 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& scale,
         torch::Tensor& weight,
         double epsilon,
-        bool gemma_norm = false,
         int group_size = 0,
-        bool shuffle_scale = false
+        bool shuffle_scale = false,
+        bool gemma_norm = false
     )
     {
         torch::Tensor residual_in = torch::empty({0}, torch::TensorOptions().dtype(input.dtype()).device(input.device()));
