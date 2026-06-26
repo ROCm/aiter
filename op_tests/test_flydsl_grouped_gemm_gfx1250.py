@@ -210,14 +210,22 @@ def _torch_moe_ref(
 # ---------------------------------------------------------------------------
 # Mock data builders
 # ---------------------------------------------------------------------------
-def _pattern_packed(experts: int, rows: int, k_pack: int) -> torch.Tensor:
+def _pattern_packed(
+    experts: int, rows: int, k_pack: int, *, zero_init: bool = False
+) -> torch.Tensor:
     """mxfp4 packed bytes ``(E, rows, k_pack) uint8`` from the global RNG."""
+    if zero_init:
+        return torch.zeros((experts, rows, k_pack), dtype=torch.uint8)
     return torch.randint(0, 256, (experts, rows, k_pack), dtype=torch.uint8)
 
 
-def init_weight_scales(experts: int, rows: int, n_blocks: int) -> torch.Tensor:
+def init_weight_scales(
+    experts: int, rows: int, n_blocks: int, *, zero_init: bool = False
+) -> torch.Tensor:
     """Per-block e8m0 weight scale: random small scales (drawn from the global
     RNG) so the n32k4 B-scale preshuffle layout is actually exercised."""
+    if zero_init:
+        return torch.zeros((experts, rows, n_blocks), dtype=torch.uint8)
     r = torch.randint(0, 3, (experts, rows, n_blocks), dtype=torch.int16)
     return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
 
@@ -271,6 +279,7 @@ def _run_grouped_via_fused_moe(
     seed: int = 0,
     warmup: int = 5,
     iters: int = 101,
+    zero_init: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[float]]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -299,18 +308,29 @@ def _run_grouped_via_fused_moe(
     # Logical weights/scale/bias: always GGUU (gate rows then up rows).
     # One global seed per case; every draw below uses the global RNG.
     torch.manual_seed(seed)
-    w1_logical = _pattern_packed(experts, 2 * inter, K_pack)
-    w2_logical = _pattern_packed(experts, K, inter_pack)
-    w1_scale_raw = init_weight_scales(experts, 2 * inter, K // SCALE_BLOCK)
-    w2_scale_raw = init_weight_scales(experts, K, inter // SCALE_BLOCK)
+    w1_logical = _pattern_packed(experts, 2 * inter, K_pack, zero_init=zero_init)
+    w2_logical = _pattern_packed(experts, K, inter_pack, zero_init=zero_init)
+    w1_scale_raw = init_weight_scales(
+        experts, 2 * inter, K // SCALE_BLOCK, zero_init=zero_init
+    )
+    w2_scale_raw = init_weight_scales(
+        experts, K, inter // SCALE_BLOCK, zero_init=zero_init
+    )
     if use_bias:
-        bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).float()
-        bias2 = (torch.randn((experts, K)) * 1e-3).float()
+        if zero_init:
+            bias1 = torch.zeros((experts, 2 * inter))
+            bias2 = torch.zeros((experts, K))
+        else:
+            bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).float()
+            bias2 = (torch.randn((experts, K)) * 1e-3).float()
     else:
         bias1 = torch.zeros((experts, 2 * inter))
         bias2 = torch.zeros((experts, K))
     # Activations: bf16; fused_moe handles the dispatched quant internally.
-    hidden = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
+    if zero_init:
+        hidden = torch.zeros((tokens, K), dtype=torch.bfloat16)
+    else:
+        hidden = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
 
     # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
     topk_id, topk_w = _make_topk(hidden, experts, topk)
@@ -444,6 +464,7 @@ def run_moe(
     bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
+    zero_init: bool = False,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
     validated path: bench checks (and times) the CUDA-graph production path;
@@ -472,6 +493,7 @@ def run_moe(
         bench=bench,
         warmup=warmup,
         iters=iters,
+        zero_init=zero_init,
     )
     mode = "graph" if bench else "eager"
     ld = _logits_diff(out, ref)
@@ -652,6 +674,12 @@ def main() -> None:
         "(gguu is dual-B and ignores it).",
     )
     parser.add_argument(
+        "--zero-init",
+        action="store_true",
+        help="initialize activations (A), activation scales (As), weights (B), "
+        "and weight scales (Bs) to zero instead of random values",
+    )
+    parser.add_argument(
         "--real-gemm",
         action="store_true",
         default=is_gfx1250(),
@@ -702,6 +730,7 @@ def main() -> None:
             bench=args.scenario == "bench",
             warmup=args.warmup,
             iters=args.iters,
+            zero_init=args.zero_init,
         )
         rows.append(
             {
