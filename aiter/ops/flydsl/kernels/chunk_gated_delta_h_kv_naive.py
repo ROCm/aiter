@@ -131,6 +131,13 @@ def compile_chunk_gated_delta_h_kv_naive(
     K_SUB_PER_BLOCK = 64 // WMMA_N  # 16-wide K sub-tiles per 64 block (=4)
     BT_MTILES = BT // WMMA_N  # 16-row BT M-tiles a warp spans in GEMM1 (=4)
 
+    # EXPERIMENT toggle: stage u via lds_u (True, rev211+) vs read u as scalar
+    # from HBM (False, rev210 path). MEASURED (varlen-32k-aws, T1000): USE_LDS_U
+    # =False reaches 4 waves/SIMD (VGPR 136->128, LDS 44->35KB) but is ~20%
+    # SLOWER (578us vs 480us) because u reverts to 16 scalar buffer_load_ushort
+    # -- higher occupancy does NOT compensate the extra VMEM traffic. Keep True.
+    USE_LDS_U = True
+
     # -- LDS layout (no lds_h: KV h-store goes reg -> HBM directly) --
     # lds_w / lds_k row pads break LDS bank conflicts. K (=128 bf16 = 256 B) is
     # a multiple of the 32-bank LDS period (128 B), so a plain row stride makes
@@ -194,20 +201,21 @@ def compile_chunk_gated_delta_h_kv_naive(
     # NOTE: lds_g removed -- gating reads g inline from HBM per lane (no g
     # staging buffer / no extra w-barrier publish dependency).
 
-    _K5_KERNEL_REVISION = 213  # h-b128 + lds_ht aliases lds_k (keep 44KB -> 3 waves)
+    _K5_KERNEL_REVISION = 214  # EXPERIMENT: USE_LDS_U toggle (measure 4-wave)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_kv_naive_vkb128alias_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
     lds_k_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_k_offset + LDS_K_BYTES
     lds_u_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_u_offset + LDS_U_BYTES
+    if USE_LDS_U:
+        allocator.ptr = lds_u_offset + LDS_U_BYTES  # only reserve when used
     # h-b128: lds_ht ALIASES lds_k (no extra allocation) to keep LDS at 44KB
     # and preserve 3 waves/SIMD. See the LDS_HT comment above for the WAR
     # lifetime argument; a top-of-step-1 barrier enforces it.
@@ -474,7 +482,8 @@ def compile_chunk_gated_delta_h_kv_naive(
             # same decomposition as the 64-wide w rows). Replaces the 16 scalar
             # buffer_load_ushort that were the #2 VMEM-wait hotspot. Published
             # on the SAME barrier below as w (no extra barrier).
-            for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+            if const_expr(USE_LDS_U):
+              for batch in range_constexpr(NUM_LOAD_BATCHES_64):
                 row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
                 abs_row = i_t_i32 * fx.Int32(BT) + row
                 safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
@@ -547,18 +556,33 @@ def compile_chunk_gated_delta_h_kv_naive(
             # and block-local in V (cols 0..BV), so the indices drop the
             # i_t*BT / i_v*BV offsets used for the HBM address.
             u_lds_col = wid * fx.Int32(16) + lane_n
+            u_hbm_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
             vn_frags = []
             for m_bt in range_constexpr(BT_MTILES):
                 bv_val = bv_accs[m_bt]
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
-                    u_lds_row = (
-                        fx.Int32(m_bt * 16)
-                        + lane_m_base * fx.Int32(4)
-                        + fx.Int32(elem_i)
-                    )
-                    u_lds_idx = u_lds_row * fx.Int32(LDS_U_STRIDE) + u_lds_col
-                    u_raw = _lds_read_u_scalar(fx.Index(u_lds_idx))
+                    if const_expr(USE_LDS_U):
+                        u_lds_row = (
+                            fx.Int32(m_bt * 16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        u_lds_idx = u_lds_row * fx.Int32(LDS_U_STRIDE) + u_lds_col
+                        u_raw = _lds_read_u_scalar(fx.Index(u_lds_idx))
+                    else:
+                        # rev210 path: scalar u read straight from HBM.
+                        u_bt_row_raw = (
+                            i_t_i32 * fx.Int32(BT)
+                            + fx.Int32(m_bt * 16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        safe_u_row = (u_bt_row_raw < T_local).select(
+                            u_bt_row_raw, fx.Int32(0)
+                        )
+                        u_off = v_base + safe_u_row * stride_v + u_hbm_col
+                        u_raw = v_[fx.Index(u_off)]
                     u_bf16 = fx.BFloat16(u_raw)
                     u_f32_elems.append(u_bf16.to(fx.Float32))
                 u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
