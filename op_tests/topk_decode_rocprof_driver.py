@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive kernel-only rocprofv3 traces for the three decode top-k kernels.
+"""Drive kernel-only rocprofv3 traces for current decode top-k kernels.
 
 For every (kernel, k, L) cell this launches a fresh process under
 ``rocprofv3 --kernel-trace`` so the trace contains only that kernel's
@@ -26,178 +26,18 @@ RUNNER = REPO_ROOT / "op_tests" / "topk_decode_rocprof_runner.py"
 
 # Substring/regex that identifies the kernel-under-test in the mangled name.
 KERNEL_MATCH = {
-    "flydsl": re.compile(r"topk_per_row_decode_radix_unordered"),
-    "flydsl_coop_atomic": re.compile(r"topk_per_row_decode_radix_coop_k512_.*atomic_hist"),
-    "flydsl_coop_partial": re.compile(r"topk_per_row_decode_radix_coop_k512_.*partial_hist"),
-    "flydsl_coop_local_merge": re.compile(
-        r"topk_per_row_decode_radix_coop_local_topk_merge_k512"
-    ),
-    "flydsl_coop_local_merge_p4": re.compile(
-        r"topk_per_row_decode_radix_coop_local_topk_merge_k512"
-    ),
-    "flydsl_coop_local_merge_p8": re.compile(
-        r"topk_per_row_decode_radix_coop_local_topk_merge_k512"
-    ),
-    "flydsl_coop_local_merge_p16": re.compile(
-        r"topk_per_row_decode_radix_coop_local_topk_merge_k512"
-    ),
-    "flydsl_coop_local_merge_p32": re.compile(
-        r"topk_per_row_decode_radix_coop_local_topk_merge_k512"
-    ),
-    "flydsl_aiter_persistent": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g\d+"
-    ),
-    "flydsl_aiter_persistent_stage1": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g\d+_v\d+_stage1"
-    ),
-    "flydsl_aiter_persistent_stage2": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g\d+_v\d+_stage2"
-    ),
-    "flydsl_aiter_persistent_stage4": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g\d+_v\d+_stage4"
-    ),
-    "flydsl_aiter_persistent_stage8": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g\d+_v\d+_stage8"
-    ),
-    "flydsl_aiter_persistent_tiered": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g\d+_v\d+_stage\d+.*_tiered"
-    ),
-    "flydsl_aiter_persistent_p2": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g2"
-    ),
-    "flydsl_aiter_persistent_p4": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g4"
-    ),
-    "flydsl_aiter_persistent_p8": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g8"
-    ),
-    "flydsl_aiter_persistent_p16": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g16"
-    ),
-    "flydsl_aiter_persistent_p30": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g30"
-    ),
-    "flydsl_aiter_persistent_p32": re.compile(
-        r"topk_per_row_decode_aiter_persistent_k512_bpp\d+_g32"
+    "flydsl": re.compile(r"topk_per_row_decode_radix_unordered_k2048"),
+    "flydsl_tiered": re.compile(
+        r"topk_per_row_decode_persistent_k512_bpp\d+_g\d+_v\d+_stage\d+.*_tiered"
     ),
     "aiter_hip": re.compile(r"radix_topk_one_block_kernel|radix_kernel|last_filter_kernel"),
     "vllm": re.compile(r"topKPerRowDecode"),
 }
 
 KERNEL_ENV = {
-    "flydsl_coop_atomic": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "8",
-        "FLYDSL_TOPK_COOP_MODE": "histogram",
-        "FLYDSL_TOPK_COOP_ATOMIC_HIST": "1",
-    },
-    "flydsl_coop_partial": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "8",
-        "FLYDSL_TOPK_COOP_MODE": "histogram",
-        "FLYDSL_TOPK_COOP_ATOMIC_HIST": "0",
-    },
-    "flydsl_coop_local_merge": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "8",
-        "FLYDSL_TOPK_COOP_MODE": "local_topk_merge",
-    },
-    "flydsl_coop_local_merge_p4": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "4",
-        "FLYDSL_TOPK_COOP_MODE": "local_topk_merge",
-    },
-    "flydsl_coop_local_merge_p8": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "8",
-        "FLYDSL_TOPK_COOP_MODE": "local_topk_merge",
-    },
-    "flydsl_coop_local_merge_p16": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "16",
-        "FLYDSL_TOPK_COOP_MODE": "local_topk_merge",
-    },
-    "flydsl_coop_local_merge_p32": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "32",
-        "FLYDSL_TOPK_COOP_MODE": "local_topk_merge",
-    },
-    "flydsl_aiter_persistent": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-    },
-    "flydsl_aiter_persistent_stage1": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-        "FLYDSL_TOPK_AITER_PERSISTENT_SCAN_STAGES": "1",
-    },
-    "flydsl_aiter_persistent_stage2": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-        "FLYDSL_TOPK_AITER_PERSISTENT_SCAN_STAGES": "2",
-    },
-    "flydsl_aiter_persistent_stage4": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-        "FLYDSL_TOPK_AITER_PERSISTENT_SCAN_STAGES": "4",
-    },
-    "flydsl_aiter_persistent_stage8": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-        "FLYDSL_TOPK_AITER_PERSISTENT_SCAN_STAGES": "8",
-    },
-    "flydsl_aiter_persistent_tiered": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent_tiered",
-    },
-    "flydsl_aiter_persistent_p2": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "2",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-    },
-    "flydsl_aiter_persistent_p4": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "4",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-    },
-    "flydsl_aiter_persistent_p8": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "8",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-    },
-    "flydsl_aiter_persistent_p16": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "16",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-    },
-    "flydsl_aiter_persistent_p30": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "30",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
-    },
-    "flydsl_aiter_persistent_p32": {
-        "FLYDSL_TOPK_COOP": "1",
-        "FLYDSL_TOPK_COOP_MIN_ROW_LEN": "0",
-        "FLYDSL_TOPK_COOP_PARTITIONS": "32",
-        "FLYDSL_TOPK_COOP_MODE": "aiter_persistent",
+    "flydsl_tiered": {
+        "FLYDSL_TOPK_TIERED": "1",
+        "FLYDSL_TOPK_TIERED_MIN_ROW_LEN": "0",
     },
 }
 
@@ -297,10 +137,14 @@ def run_cell(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kernels", nargs="+", default=["flydsl", "aiter_hip", "vllm"])
+    ap.add_argument(
+        "--kernels",
+        nargs="+",
+        default=["flydsl_tiered", "aiter_hip", "vllm"],
+    )
     ap.add_argument("--k", type=int, nargs="+", default=[512])
     # Dense L grid for the K=512 tiered decode study; extra density around the
-    # 12K-16K short/cooperative crossover and across the long tier.
+    # short/persistent tier boundary and across the long tier.
     ap.add_argument(
         "--L",
         type=int,
@@ -339,6 +183,14 @@ def main() -> None:
         help="Optional rocprofv3 kernel include regex; default captures all and filters post-hoc.",
     )
     args = ap.parse_args()
+
+    for kernel in args.kernels:
+        if kernel not in KERNEL_MATCH:
+            raise SystemExit(f"unknown kernel {kernel}; choices={sorted(KERNEL_MATCH)}")
+    if 512 in args.k and "flydsl" in args.kernels:
+        raise SystemExit("Use flydsl_tiered for K=512; standalone flydsl K=512 was pruned")
+    if any(k != 512 for k in args.k) and "flydsl_tiered" in args.kernels:
+        raise SystemExit("flydsl_tiered only supports K=512")
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)

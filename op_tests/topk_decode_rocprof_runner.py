@@ -7,12 +7,8 @@ dispatches. Host timing is intentionally NOT performed here -- timing comes
 from the rocprof kernel trace (Start/End timestamps).
 
 Kernels:
-  * flydsl                -> FlyDSL unordered radix-select path (ordered=False)
-  * flydsl_coop_atomic    -> FlyDSL cooperative path selected by environment
-  * flydsl_coop_partial   -> FlyDSL cooperative path selected by environment
-  * flydsl_coop_local_merge -> FlyDSL partition-local TopK plus merge path
-  * flydsl_aiter_persistent -> FlyDSL AITER-style persistent multi-block radix path
-  * flydsl_aiter_persistent_tiered -> persistent path with in-kernel tier dispatch
+  * flydsl                -> FlyDSL standalone unordered radix-select path (K=2048)
+  * flydsl_tiered         -> K=512 persistent path with in-kernel tier dispatch
   * aiter_hip             -> aiter.top_k_per_row_decode (HIP radix one/multi-block)
   * vllm                  -> torch.ops._C.top_k_per_row_decode (vLLM sampler.cu kernel)
 
@@ -87,25 +83,7 @@ def main() -> None:
         required=True,
         choices=[
             "flydsl",
-            "flydsl_coop_atomic",
-            "flydsl_coop_partial",
-            "flydsl_coop_local_merge",
-            "flydsl_coop_local_merge_p4",
-            "flydsl_coop_local_merge_p8",
-            "flydsl_coop_local_merge_p16",
-            "flydsl_coop_local_merge_p32",
-            "flydsl_aiter_persistent",
-            "flydsl_aiter_persistent_stage1",
-            "flydsl_aiter_persistent_stage2",
-            "flydsl_aiter_persistent_stage4",
-            "flydsl_aiter_persistent_stage8",
-            "flydsl_aiter_persistent_tiered",
-            "flydsl_aiter_persistent_p2",
-            "flydsl_aiter_persistent_p4",
-            "flydsl_aiter_persistent_p8",
-            "flydsl_aiter_persistent_p16",
-            "flydsl_aiter_persistent_p30",
-            "flydsl_aiter_persistent_p32",
+            "flydsl_tiered",
             "aiter_hip",
             "vllm",
         ],
@@ -131,6 +109,10 @@ def main() -> None:
     max_width = args.L if args.max_width is None else args.max_width
     if max_width < args.L:
         raise ValueError(f"--max-width={max_width} must be >= --L={args.L}")
+    if args.kernel == "flydsl" and args.k == 512:
+        raise ValueError("Use --kernel flydsl_tiered for K=512; standalone K=512 was pruned")
+    if args.kernel == "flydsl_tiered" and args.k != 512:
+        raise ValueError("flydsl_tiered is the K=512 tiered path")
 
     batch_size = args.num_rows // args.next_n
     seq_lens, row_ends = make_row_ends(

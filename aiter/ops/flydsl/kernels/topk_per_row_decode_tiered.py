@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 
-"""AITER-style persistent multi-block radix TopK-per-row decode kernel.
+"""Tiered persistent multi-block radix TopK-per-row decode kernel.
 
-This module intentionally keeps the implementation separate from the older
-cooperative experiments.  It ports the production AITER HIP multi-block shape:
-one persistent launch, ``grid=(blocks_per_row, num_rows)``, per-block LDS
-histograms, pass-private global histograms, and a row-local acquire/release
-barrier between radix passes.  The output is the unordered K=512 selected set.
+This module uses one persistent launch, ``grid=(blocks_per_row, num_rows)``,
+per-block LDS histograms, pass-private global histograms, and a row-local
+acquire/release barrier between radix passes. The output is the unordered K=512
+selected set.
 """
 
 import functools
@@ -28,31 +27,42 @@ RED_SLOTS = (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE
 LOAD_VEC = 4
 TOP_K = 512
 
-# Match AITER Counter's 128B spacing for hot inter-CTA fields while keeping the
-# workspace as an int32 tensor.
-COUNTER_SLOTS = 192
-COUNTER_ARRIVALS = 64
-COUNTER_OUT_FRONT = 96
-COUNTER_OUT_BACK = 128
-COUNTER_PASS_DONE = 160
+# Match HIP Counter's 128B spacing for hot inter-CTA fields while keeping the
+# workspace as an int32 tensor. Each group is 32 int32 slots == 128B.
+COUNTER_STRIDE = 32
+COUNTER_SLOTS = 6 * COUNTER_STRIDE
+COUNTER_ARRIVALS = 2 * COUNTER_STRIDE
+COUNTER_OUT_FRONT = 3 * COUNTER_STRIDE
+COUNTER_OUT_BACK = 4 * COUNTER_STRIDE
+COUNTER_PASS_DONE = 5 * COUNTER_STRIDE
 
 SMEM_META_K = 0
 SMEM_META_LEN = 1
 SMEM_META_THRESHOLD = 2
 SMEM_META_ABOVE = 3
 
+# Short one-CTA clone metadata reuses the same 8-int LDS block after zeroing.
+SMEM_META_SHORT_FIRST_ABOVE = 0
+SMEM_META_SHORT_FIRST_THRESHOLD = 1
+SMEM_META_SHORT_SECOND_ABOVE = 2
+SMEM_META_SHORT_SECOND_THRESHOLD = 3
+SMEM_META_SHORT_THIRD_ABOVE = 4
+SMEM_META_SHORT_THIRD_THRESHOLD = 5
+SMEM_META_SHORT_FRONT_COUNT = 6
+SMEM_META_SHORT_BACK_COUNT = 7
+
 
 def _num_passes(bits_per_pass: int) -> int:
     return (32 + bits_per_pass - 1) // bits_per_pass
 
 
-def aiter_persistent_workspace_slots(
+def tiered_topk_workspace_slots(
     num_rows: int,
     blocks_per_row: int,
     *,
     bits_per_pass: int,
 ) -> int:
-    """Return int32 workspace slots for the AITER-persistent K=512 path."""
+    """Return int32 workspace slots for the tiered K=512 path."""
 
     del blocks_per_row  # Global histograms are atomically merged per row.
     if num_rows < 0:
@@ -64,7 +74,7 @@ def aiter_persistent_workspace_slots(
 
 
 @functools.lru_cache(maxsize=16)
-def create_topk_per_row_decode_aiter_persistent_k512_kernel(
+def create_topk_per_row_decode_tiered_k512_kernel(
     blocks_per_row: int = 8,
     *,
     bits_per_pass: int = 10,
@@ -75,7 +85,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
     tiered_mid_max: int = 65536,
     tiered_long_cap: int = 32,
 ):
-    """Return a cached AITER-style persistent K=512 radix-select launcher."""
+    """Return a cached tiered persistent K=512 radix-select launcher."""
 
     if bits_per_pass not in (10, 11):
         raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
@@ -95,7 +105,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
     block_threads = BLOCK_THREADS
     if not 2 <= blocks_per_row <= 32:
         raise ValueError(
-            "AITER persistent TopK only supports blocks_per_row in [2, 32], "
+            "Tiered persistent TopK only supports blocks_per_row in [2, 32], "
             f"got {blocks_per_row}"
         )
 
@@ -112,7 +122,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
     num_buckets = 1 << bits_per_pass
     row_workspace_slots = COUNTER_SLOTS + num_passes * num_buckets
     kernel_name = (
-        "topk_per_row_decode_aiter_persistent_k512_"
+        "topk_per_row_decode_persistent_k512_"
         f"bpp{bits_per_pass}_g{blocks_per_row}_v2"
         f"_stage{scan_stages}"
         f"{'_tiered' if tiered else ''}"
@@ -128,7 +138,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
         s_meta: fx.Array[fx.Int32, 8, 16]
 
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
-    def topk_per_row_decode_aiter_persistent_k512_kernel(
+    def topk_per_row_decode_tiered_k512_kernel(
         logits: fx.Tensor,
         next_n: fx.Int32,
         seq_lens: fx.Tensor,
@@ -138,6 +148,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
         stride0: fx.Int32,
         stride1: fx.Int32,
     ):
+        del num_rows  # Launch grid_y already encodes the validated row count.
         del stride1  # The Python wrapper admits only stride1 == 1.
 
         block_x = gpu.block_id("x")
@@ -155,7 +166,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
         c_one = fx.Int32(1)
         c_two = fx.Int32(2)
         c_four = fx.Int32(4)
-        c_sixteen = fx.Int32(red_slots)
+        c_red_slots = fx.Int32(red_slots)
         c_last_wave = fx.Int32(red_slots - 1)
         c_last_lane = fx.Int32(WARP_SIZE - 1)
         c_vec = fx.Int32(LOAD_VEC)
@@ -200,7 +211,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
         if const_expr(tiered):
             # Per-bucket active-part caps over the fixed launch grid (excess
             # blocks return immediately). Short rows run the single-CTA clone;
-            # the mid and long cooperative buckets cap how many of the grid's
+            # the mid and long persistent buckets cap how many of the grid's
             # blocks participate, trading CU coverage against barrier/atomic
             # contention. Caps are clamped to the grid (``c_parts``).
             c_short_row_len = fx.Int32(tiered_short_max)
@@ -260,9 +271,6 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
         def counter_slot(slot: int):
             return workspace_slot(fx.Int32(slot))
 
-        def counter_slot_i32(slot_i32):
-            return workspace_slot(slot_i32)
-
         def global_i32_ptr(elem_i32):
             elem_idx = arith.index_cast(T.index, elem_i32)
             addr = fx.Index(workspace_base_idx) + fx.Index(elem_idx) * fx.Index(4)
@@ -279,9 +287,6 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
             return buffer_ops.buffer_load(
                 workspace_rsrc, elem_i32, vec_width=1, dtype=T.i32
             )
-
-        def ws_store(elem_i32, value):
-            buffer_ops.buffer_store(value, workspace_rsrc, elem_i32)
 
         def global_atomic_add_i32(
             elem_i32, value, ordering=llvm.AtomicOrdering.monotonic
@@ -306,14 +311,9 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
             ).result
 
         def global_atomic_load_i32_acquire(elem_i32):
-            # True acquire load of the slot rather than an atomicAdd(slot, 0)
-            # read-modify-write. The RMW form carried wave-reduce scaffolding
-            # (mbcnt / readfirstlane / exec-mask toggling) on every spin
-            # iteration; a plain acquire load (matching the AITER HIP
-            # __atomic_load_n(..., __ATOMIC_ACQUIRE) spin) reads the L2-coherent
-            # value without it. Kept volatile + agent-scoped acquire so it is not
-            # hoisted/cached and still establishes the cross-CTA happens-before
-            # with the release publish below.
+            # Volatile agent-scoped acquire load for the row-barrier spin. The
+            # matching release publish below makes histogram updates visible to
+            # peer CTAs without issuing a read-modify-write on the polled slot.
             return llvm.LoadOp(
                 T.i32,
                 global_i32_ptr(elem_i32),
@@ -350,6 +350,10 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
                 scf.YieldOp([data])
 
         def row_barrier(token: int):
+            # Intentional no-drain acquire/release protocol: workgroup barriers
+            # bracket local LDS work, the last CTA release-publishes pass_done,
+            # and peers spin with acquire loads. A full waitcnt drain here is
+            # performance/correctness sensitive.
             token_value = fx.Int32(token)
             target_arrivals = ArithValue(token_value) * ArithValue(active_parts)
             gpu.barrier()
@@ -370,9 +374,10 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
                     spin_until_slot_ge(counter_slot(COUNTER_PASS_DONE), token_value)
             gpu.barrier()
 
-        def aiter_twiddle_key(val):
-            # AITER's float twiddle maps larger fp32 values to smaller unsigned
-            # keys. Normalize signed zero to keep tie handling value-equivalent.
+        def radix_twiddle_key(val):
+            # Map larger fp32 values to smaller unsigned keys so ascending
+            # bucket scans select descending values. Normalize signed zero to
+            # keep tie handling value-equivalent.
             key_val = (ArithValue(val) == ArithValue(c_zero_f32)).select(c_zero_f32, val)
             bits = ArithValue(key_val).bitcast(T.i32)
             sign = ArithValue(bits).shrui(fx.Int32(31))
@@ -466,18 +471,18 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
             gpu.barrier()
 
             if wave == ArithValue(c_zero):
-                in16 = ArithValue(lane) < ArithValue(c_sixteen)
+                in16 = ArithValue(lane) < ArithValue(c_red_slots)
                 lane_safe = in16.select(lane, c_zero)
                 wtot = in16.select(fx.memref_load(s_scan, lane_safe), c_zero)
                 wincl = wave_inclusive_scan_i32(wtot)
                 wexcl = ArithValue(wincl) - ArithValue(wtot)
                 if in16:
                     fx.memref_store(
-                        wexcl, s_scan, ArithValue(lane) + ArithValue(c_sixteen)
+                        wexcl, s_scan, ArithValue(lane) + ArithValue(c_red_slots)
                     )
             gpu.barrier()
 
-            wave_off = fx.memref_load(s_scan, ArithValue(wave) + ArithValue(c_sixteen))
+            wave_off = fx.memref_load(s_scan, ArithValue(wave) + ArithValue(c_red_slots))
             excl0 = ArithValue(wave_off) + ArithValue(wave_excl_thread)
             incl0 = ArithValue(excl0) + ArithValue(c0)
             incl1 = ArithValue(incl0) + ArithValue(c1)
@@ -533,7 +538,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
                 in_range = ArithValue(col_i32) < row_len
                 if in_range:
                     val = vector.extract(vec, static_position=[j], dynamic_position=[])
-                    key = aiter_twiddle_key(val)
+                    key = radix_twiddle_key(val)
                     matches_prefix = True
                     if const_expr(pass_id != 0):
                         matches_prefix = ArithValue(
@@ -650,7 +655,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
                 in_range = ArithValue(col_i32) < row_len
                 if in_range:
                     val = vector.extract(vec, static_position=[j], dynamic_position=[])
-                    key = aiter_twiddle_key(val)
+                    key = radix_twiddle_key(val)
                     key_before_kth = arith.cmpi(
                         arith.CmpIPredicate.ult, key, kth_bits
                     )
@@ -790,20 +795,20 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
 
         def one_cta_short_clone():
             # Faithful clone of the standalone one-CTA unordered radix-select
-            # path (``topk_per_row_decode_radix_unordered_k512``). Runs entirely
-            # within a single CTA (part 0): LDS-only histograms, a hierarchical
-            # block scan to locate each radix threshold, and a direct LDS-counter
-            # atomic-append write. Three order-preserving passes peel 11/11/10
-            # bits of a twiddled fp32 key, so it requires a 2048-bin histogram
+            # path for K=512. Runs entirely within a single CTA (part 0):
+            # LDS-only histograms, a hierarchical block scan to locate each
+            # radix threshold, and a direct LDS-counter atomic-append write.
+            # Unlike the persistent multi-block path, this clone uses the
+            # standalone ascending ordered key and total-k threshold convention.
+            # Three order-preserving passes peel 11/11/10 bits of that key, so
+            # it requires a 2048-bin histogram
             # (``num_buckets == 2048``, i.e. bits_per_pass == 11). It reuses the
-            # persistent kernel's existing LDS (``s_hist`` 2048 ints, ``s_scan``
-            # 32 ints, ``s_meta`` 8 ints) with no extra shared memory.
+            # persistent kernel's existing LDS (``s_hist`` 2048 ints,
+            # ``s_scan`` 32 ints, ``s_meta`` 8 ints) with no extra shared memory.
             c_shift = fx.Int32(32 - 11)
             c_mid_shift = fx.Int32(10)
             c_bin_mask = fx.Int32((1 << 11) - 1)
             c_low_mask = fx.Int32((1 << 10) - 1)
-            c_six = fx.Int32(6)
-            c_seven = fx.Int32(7)
             c_thirtyone = fx.Int32(31)
 
             def ordered_key(val):
@@ -849,20 +854,20 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
                 gpu.barrier()
 
                 if wave == ArithValue(c_zero):
-                    in16 = ArithValue(lane) < ArithValue(c_sixteen)
+                    in16 = ArithValue(lane) < ArithValue(c_red_slots)
                     lane_safe = in16.select(lane, c_zero)
                     wtot = in16.select(fx.memref_load(s_scan, lane_safe), c_zero)
                     wincl = wave_inclusive_scan_i32(wtot)
                     wexcl = ArithValue(wincl) - ArithValue(wtot)
                     if in16:
                         fx.memref_store(
-                            wexcl, s_scan, ArithValue(lane) + ArithValue(c_sixteen)
+                            wexcl, s_scan, ArithValue(lane) + ArithValue(c_red_slots)
                         )
                 gpu.barrier()
 
-                wave_off = fx.memref_load(s_scan, ArithValue(wave) + ArithValue(c_sixteen))
+                wave_off = fx.memref_load(s_scan, ArithValue(wave) + ArithValue(c_red_slots))
                 last_off = fx.memref_load(
-                    s_scan, ArithValue(c_last_wave) + ArithValue(c_sixteen)
+                    s_scan, ArithValue(c_last_wave) + ArithValue(c_red_slots)
                 )
                 last_tot = fx.memref_load(s_scan, c_last_wave)
                 total = ArithValue(last_off) + ArithValue(last_tot)
@@ -959,12 +964,20 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
                         )
                         at_boundary = at_first & at_second & at_low
                         if strictly_above:
-                            pos = lds_atomic_add_i32(meta_base_ptr, c_six, c_one)
+                            pos = lds_atomic_add_i32(
+                                meta_base_ptr,
+                                fx.Int32(SMEM_META_SHORT_FRONT_COUNT),
+                                c_one,
+                            )
                             buffer_ops.buffer_store(
                                 col_i32, indices_rsrc, row_out + ArithValue(pos)
                             )
                         if at_boundary:
-                            back = lds_atomic_add_i32(meta_base_ptr, c_seven, c_one)
+                            back = lds_atomic_add_i32(
+                                meta_base_ptr,
+                                fx.Int32(SMEM_META_SHORT_BACK_COUNT),
+                                c_one,
+                            )
                             if ArithValue(back) < ArithValue(num_needed):
                                 out_pos = (
                                     ArithValue(c_top_k)
@@ -976,14 +989,8 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
                                 )
 
             # Reread driver: stream the whole valid row from HBM once per pass.
-            # Each radix pass and the final scatter funnel through the same
-            # per-chunk body. A register-resident variant (keeping the row live
-            # across passes to skip the rereads) was implemented and measured: it
-            # won ~5-10% only at the very top of the short tier (14K-16K), but
-            # regressed every row below ~12K and raised the universal kernel's
-            # VGPR high-water mark (40 -> 56), taxing long-tier occupancy. It was
-            # rejected and removed; the reread clone already beats every
-            # reference through L=16384.
+            # This keeps the short tier's VGPR footprint low while sharing the
+            # same per-chunk logic across radix passes and final scatter.
             def reread_pass(chunk_fn):
                 for vblk in range(
                     ArithValue(tid_idx),
@@ -997,17 +1004,29 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
             clear_hist()
             reread_pass(lambda cb, v: hist_pass1_chunk(cb, v))
             gpu.barrier()
-            choose_threshold(c_top_k, fx.Int32(0), fx.Int32(1))
-            first_threshold = fx.memref_load(s_meta, fx.Int32(1))
+            choose_threshold(
+                c_top_k,
+                fx.Int32(SMEM_META_SHORT_FIRST_ABOVE),
+                fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD),
+            )
+            first_threshold = fx.memref_load(
+                s_meta, fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD)
+            )
 
             # Pass 2: mid 11 bits within the high boundary bucket.
             clear_hist()
             reread_pass(lambda cb, v: hist_pass2_chunk(cb, v, first_threshold))
             gpu.barrier()
-            first_above = fx.memref_load(s_meta, fx.Int32(0))
+            first_above = fx.memref_load(s_meta, fx.Int32(SMEM_META_SHORT_FIRST_ABOVE))
             need_after_first = ArithValue(c_top_k) - ArithValue(first_above)
-            choose_threshold(need_after_first, fx.Int32(2), fx.Int32(3))
-            second_threshold = fx.memref_load(s_meta, fx.Int32(3))
+            choose_threshold(
+                need_after_first,
+                fx.Int32(SMEM_META_SHORT_SECOND_ABOVE),
+                fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD),
+            )
+            second_threshold = fx.memref_load(
+                s_meta, fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD)
+            )
 
             # Pass 3: low 10 bits within the high+mid boundary.
             clear_hist()
@@ -1017,11 +1036,19 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
                 )
             )
             gpu.barrier()
-            second_above = fx.memref_load(s_meta, fx.Int32(2))
+            second_above = fx.memref_load(
+                s_meta, fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)
+            )
             need_after_second = ArithValue(need_after_first) - ArithValue(second_above)
-            choose_threshold(need_after_second, fx.Int32(4), fx.Int32(5))
-            third_threshold = fx.memref_load(s_meta, fx.Int32(5))
-            third_above = fx.memref_load(s_meta, fx.Int32(4))
+            choose_threshold(
+                need_after_second,
+                fx.Int32(SMEM_META_SHORT_THIRD_ABOVE),
+                fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD),
+            )
+            third_threshold = fx.memref_load(
+                s_meta, fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD)
+            )
+            third_above = fx.memref_load(s_meta, fx.Int32(SMEM_META_SHORT_THIRD_ABOVE))
             num_needed = ArithValue(need_after_second) - ArithValue(third_above)
 
             # Final phase: direct atomic-append write (LDS counters only).
@@ -1061,16 +1088,16 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
             )
             if short_active:
                 one_cta_short_clone()
-            cooperative_active = (
+            persistent_active = (
                 (row_len > ArithValue(c_top_k))
                 & (part < ArithValue(active_parts))
                 & (~single_part_active)
             )
         else:
-            cooperative_active = (row_len > ArithValue(c_top_k)) & (
+            persistent_active = (row_len > ArithValue(c_top_k)) & (
                 part < ArithValue(active_parts)
             )
-        if cooperative_active:
+        if persistent_active:
             local_k = c_top_k
             local_len = row_len
             kth_bits = c_zero
@@ -1081,7 +1108,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
                 )
 
     @flyc.jit
-    def launch_topk_per_row_decode_aiter_persistent_k512(
+    def launch_topk_per_row_decode_tiered_k512(
         logits: fx.Tensor,
         next_n: fx.Int32,
         seq_lens: fx.Tensor,
@@ -1093,7 +1120,7 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
         stream: fx.Stream = fx.Stream(None),
     ):
         grid_y = arith.index_cast(T.index, num_rows)
-        topk_per_row_decode_aiter_persistent_k512_kernel(
+        topk_per_row_decode_tiered_k512_kernel(
             logits,
             next_n,
             seq_lens,
@@ -1108,4 +1135,4 @@ def create_topk_per_row_decode_aiter_persistent_k512_kernel(
             stream=stream,
         )
 
-    return launch_topk_per_row_decode_aiter_persistent_k512
+    return launch_topk_per_row_decode_tiered_k512

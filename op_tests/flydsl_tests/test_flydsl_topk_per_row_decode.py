@@ -56,7 +56,7 @@ def test_flydsl_top_k_per_row_decode_direct_fill_k2048():
         )
 
 
-def test_flydsl_top_k_per_row_decode_long_row_k2048_matches_torch_topk():
+def test_flydsl_top_k_per_row_decode_long_row_k2048_matches_torch_topk_set():
     torch.manual_seed(1)
     next_n = 1
     k = 2048
@@ -76,13 +76,10 @@ def test_flydsl_top_k_per_row_decode_long_row_k2048_matches_torch_topk():
     )
     torch.cuda.synchronize()
 
-    expected = torch.topk(logits[:, : int(seq_lens[0].item())], k, dim=-1).indices.to(
-        torch.int32
-    )
-    torch.testing.assert_close(indices.cpu(), expected.cpu())
+    _assert_topk_set_equivalent(logits[0], indices[0], k)
 
 
-def test_flydsl_top_k_per_row_decode_long_row_k512_matches_torch_topk():
+def test_flydsl_top_k_per_row_decode_long_row_k512_matches_torch_topk_set():
     torch.manual_seed(2)
     next_n = 1
     k = 512
@@ -102,10 +99,7 @@ def test_flydsl_top_k_per_row_decode_long_row_k512_matches_torch_topk():
     )
     torch.cuda.synchronize()
 
-    expected = torch.topk(logits[:, : int(seq_lens[0].item())], k, dim=-1).indices.to(
-        torch.int32
-    )
-    torch.testing.assert_close(indices.cpu(), expected.cpu())
+    _assert_topk_set_equivalent(logits[0], indices[0], k)
 
 
 def _assert_topk_set_equivalent(logits_row, actual_row, k):
@@ -187,5 +181,4 @@ def test_flydsl_top_k_per_row_decode_ties_k512_matches_torch_topk_set():
     )
     torch.cuda.synchronize()
 
-    expected = torch.arange(k, device="cpu", dtype=torch.int32)
-    torch.testing.assert_close(indices[0].cpu(), expected)
+    _assert_topk_set_equivalent(logits[0], indices[0], k)
