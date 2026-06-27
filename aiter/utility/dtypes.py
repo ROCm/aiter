@@ -142,4 +142,5 @@ def str2Dtype(v):
 
 def str2ActivationType(s):
     """Convert string to ActivationType."""
-    return getattr(ActivationType, s.capitalize())
+    name = "".join(p.capitalize() for p in s.split("_"))
+    return getattr(ActivationType, name)
