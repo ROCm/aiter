@@ -24,6 +24,17 @@ try:
 except:  # noqa: E722
     _unified_attention_gluon_kernel_2d = None
 
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
+        reduce_segments_gluon as _reduce_segments_gluon,
+    )
+except:  # noqa: E722
+    _reduce_segments_gluon = None
+
+# NUM_SEGMENTS values the gluon reduce holds in-thread; larger split counts
+# (very low batch / long context) fall back to the Triton reduce_segments.
+_GLUON_REDUCE_MAX_SEGMENTS = 8
+
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
@@ -124,14 +135,15 @@ def select_3d_config(
     kv_cache_dtype: torch.dtype,
     shuffled_kv_cache: bool = False,
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
+    SLIDING_WINDOW: int = None,
 ):
     # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
     # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
-    if IS_DEVICE_ARCH_GFX12:
-        assert kv_cache_dtype in (
-            torch.bfloat16,
-            e4m3_dtype,
-        ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
+    assert kv_cache_dtype in (
+        torch.float16,
+        torch.bfloat16,
+        e4m3_dtype,
+    ), f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
@@ -158,11 +170,15 @@ def select_3d_config(
             # GFX12 fallback
             waves_per_eu = 1
 
-        occ = waves_per_eu * 4 // attn_warps
-        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
-        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
-        num_segments = min(MAX_SEGMENTS, num_segments)
-        num_segments = triton.next_power_of_2(num_segments)
+        # SLIDING_WINDOW is `1 + window_size[0]` (0, not None, when absent), so test `> 0` like use_2d_kernel; `is not None` was always true and wrongly forced num_segments=1.
+        if SLIDING_WINDOW is not None and SLIDING_WINDOW > 0:
+            num_segments = 1
+        else:
+            occ = waves_per_eu * 4 // attn_warps
+            MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
+            num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
+            num_segments = min(MAX_SEGMENTS, num_segments)
+            num_segments = triton.next_power_of_2(num_segments)
 
         # # this section increases the num_warps if the occ is too high
         # total_num_wg = num_2d_prgms * num_segments
@@ -481,6 +497,7 @@ def unified_attention(
             kv_cache_dtype,
             shuffled_kv_cache,
             NUM_BLOCKS_GATHER_PER_TILE,
+            SLIDING_WINDOW,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
@@ -641,6 +658,41 @@ def unified_attention(
         elif skip_reduce:
             return segm_output, segm_max, segm_expsum
 
+        head_size_padded = triton.next_power_of_2(head_size)
+        # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
+        gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
+        use_gluon_reduce = (
+            IS_DEVICE_ARCH_GFX12
+            and _reduce_segments_gluon is not None
+            and ALL_DECODE
+            and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
+            and head_size_padded % 32 == 0
+            and num_query_heads % gluon_num_warps == 0
+        )
+        if use_gluon_reduce:
+            _reduce_segments_gluon[(q.shape[0],)](
+                output_ptr=out,
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_query_heads=num_query_heads,
+                out_scale_ptr=output_scale,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                H=num_query_heads,
+                S=NUM_SEGMENTS,
+                D=head_size,
+                D_PAD=head_size_padded,
+                TILE_SIZE=reduce_config["TILE_SIZE"],
+                NUM_WARPS=gluon_num_warps,
+                IS_FP8_OUT=(out.dtype == e4m3_dtype),
+                FP8_MIN=torch.finfo(e4m3_dtype).min,
+                FP8_MAX=torch.finfo(e4m3_dtype).max,
+                num_warps=gluon_num_warps,
+            )
+            return out
+
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=segm_output,
@@ -654,7 +706,7 @@ def unified_attention(
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE_PADDED=head_size_padded,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             **reduce_config,
