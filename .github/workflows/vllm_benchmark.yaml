@@ -144,14 +144,26 @@ jobs:
             runner: linux-aiter-mi35x-4
             kv_cache_dtype: default_kvcache
             tp: 4
-            extra_args: --block-size 128 --attention-backend TRITON_ATTN
-            extra_env_args: ""
+            extra_args: >-
+              --block-size 128
+              --attention-backend TRITON_ATTN
+              --tool-call-parser minimax_m3
+              --enable-auto-tool-choice
+              --reasoning-parser minimax_m3
+              --moe-backend aiter
+            extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
           - model: amd/MiniMax-M3-MXFP4
             runner: linux-aiter-do-mi350x-8
             kv_cache_dtype: default_kvcache
             tp: 8
-            extra_args: --block-size 128 --attention-backend TRITON_ATTN
-            extra_env_args: ""
+            extra_args: >-
+              --block-size 128
+              --attention-backend TRITON_ATTN
+              --tool-call-parser minimax_m3
+              --enable-auto-tool-choice
+              --reasoning-parser minimax_m3
+              --moe-backend aiter
+            extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
         
     steps:
       - name: Checkout Docker pull retry helper
