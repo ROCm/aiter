@@ -250,58 +250,67 @@ def build_flash_attn_fp8_module(
                 rsrc, lds_ptr, _dma_size, voff_i32, _dma_zero, _dma_zero, _dma_aux
             )
 
+        # ---- Precompute loop-invariant per-pass DMA addressing (depends only on
+        # tid/wave, not on kv_start/buf) once, so it is hoisted out of the main
+        # loop region instead of recomputed every iteration.  Perf-neutral on the
+        # bench shape (DMA address VALU is overlap-hidden / LLVM already hoists);
+        # kept as code hygiene -- the loop-invariant math is now explicit. ----
+        _ltid = tid - fx.Index(DMA_LANES)  # 0..255 within G1
+        _lwave = wave_id - fx.Index(NUM_WAVES // 2)  # 0..3 within G1
+        _dma_k_inv = []
+        for p in range_constexpr(DMA_PASSES):
+            c = fx.Index(p * DMA_LANES) + _ltid
+            kv = c // fx.Index(8)
+            d = (c % fx.Index(8)) * fx.Index(16)
+            lds_perm = (fx.Index(p * (NUM_WAVES // 2)) + _lwave) * fx.Index(
+                K_UNIT_STRIDE
+            )
+            _dma_k_inv.append((kv, d, lds_perm))
+
+        _half = wave_id % fx.Index(2)
+        _dma_v_inv = []
+        for p in range_constexpr(DMA_PASSES):
+            c = fx.Index(p * DMA_LANES) + tid
+            d_block = c // fx.Index(BLOCK_N)
+            kv_lds_pos = c % fx.Index(BLOCK_N)
+            # Inverse permutation: given LDS position, find actual kv row.
+            blk = kv_lds_pos // fx.Index(32)
+            rem = kv_lds_pos % fx.Index(32)
+            hi_group = (rem // fx.Index(16)) % fx.Index(2)
+            grp = (rem // fx.Index(4)) % fx.Index(4)
+            fine = rem % fx.Index(4)
+            kv = blk * fx.Index(32) + hi_group * fx.Index(4) + grp * fx.Index(8) + fine
+            d_voff = d_block * fx.Index(16)
+            # Each wave-pass writes a 64-kv half of one d-block; HW adds lane*16
+            # within the chosen 64-kv (1024B) half.
+            lds_perm = d_block * fx.Index(V_DBLOCK_STRIDE) + _half * fx.Index(
+                WAVE_DMA_STRIDE
+            )
+            _dma_v_inv.append((kv, d_voff, lds_perm))
+
         def dma_k(buf, kv_start):
-            k_buf_off = fx.Index(LDS_K_OFF) + buf * fx.Index(LDS_K_TILE)
-            ltid = tid - fx.Index(DMA_LANES)  # 0..255 within G1
-            lwave = wave_id - fx.Index(NUM_WAVES // 2)  # 0..3 within G1
+            base_lds = (
+                fx.Index(lds_offset) + fx.Index(LDS_K_OFF) + buf * fx.Index(LDS_K_TILE)
+            )
             for p in range_constexpr(DMA_PASSES):
-                c = fx.Index(p * DMA_LANES) + ltid
-                kv = c // fx.Index(8)
-                d = (c % fx.Index(8)) * fx.Index(16)
+                kv, d, lds_perm = _dma_k_inv[p]
                 kv_abs = kv_start + kv
                 in_b = kv_abs < seq_len_v
                 kv_safe = fx.Index(ArithValue(in_b).select(kv_abs, fx.Index(0)))
                 voff = kv_safe * fx.Index(STRIDE_TOKEN) + d
-                lds_byte = (
-                    fx.Index(lds_offset)
-                    + k_buf_off
-                    + (fx.Index(p * (NUM_WAVES // 2)) + lwave) * fx.Index(K_UNIT_STRIDE)
-                )
-                _dma_issue(k_rsrc, lds_byte, voff)
+                _dma_issue(k_rsrc, base_lds + lds_perm, voff)
 
         def dma_v(buf, kv_start):
-            v_buf_off = fx.Index(LDS_V_OFF) + buf * fx.Index(LDS_V_TILE)
+            base_lds = (
+                fx.Index(lds_offset) + fx.Index(LDS_V_OFF) + buf * fx.Index(LDS_V_TILE)
+            )
             for p in range_constexpr(DMA_PASSES):
-                c = fx.Index(p * DMA_LANES) + tid
-                d_block = c // fx.Index(BLOCK_N)
-                kv_lds_pos = c % fx.Index(BLOCK_N)
-                # Inverse permutation: given LDS position, find actual kv row.
-                blk = kv_lds_pos // fx.Index(32)
-                rem = kv_lds_pos % fx.Index(32)
-                hi_group = (rem // fx.Index(16)) % fx.Index(2)
-                grp = (rem // fx.Index(4)) % fx.Index(4)
-                fine = rem % fx.Index(4)
-                kv = (
-                    blk * fx.Index(32)
-                    + hi_group * fx.Index(4)
-                    + grp * fx.Index(8)
-                    + fine
-                )
+                kv, d_voff, lds_perm = _dma_v_inv[p]
                 kv_abs = kv_start + kv
                 in_b = kv_abs < seq_len_v
                 kv_safe = fx.Index(ArithValue(in_b).select(kv_abs, fx.Index(0)))
-                voff = kv_safe * fx.Index(STRIDE_TOKEN) + d_block * fx.Index(16)
-                # Each wave-pass writes a 64-kv half of one d-block.  The d-block
-                # data span (2048B) is padded to V_DBLOCK_STRIDE; HW adds lane*16
-                # within the chosen 64-kv (1024B) half.
-                half = wave_id % fx.Index(2)
-                lds_byte = (
-                    fx.Index(lds_offset)
-                    + v_buf_off
-                    + d_block * fx.Index(V_DBLOCK_STRIDE)
-                    + half * fx.Index(WAVE_DMA_STRIDE)
-                )
-                _dma_issue(v_rsrc, lds_byte, voff)
+                voff = kv_safe * fx.Index(STRIDE_TOKEN) + d_voff
+                _dma_issue(v_rsrc, base_lds + lds_perm, voff)
 
         def _wait_lgkmcnt(count=0):
             llvm.InlineAsmOp(
