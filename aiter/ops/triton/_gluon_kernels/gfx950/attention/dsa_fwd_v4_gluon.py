@@ -233,12 +233,7 @@ def _sparse_mla_fwd_gl_kernel(
     offs_v_klora = gl.arange(0, D_V, layout=gl.SliceLayout(1, blk_klora))
     offs_r_krope = gl.arange(0, D_ROPE, layout=gl.SliceLayout(1, blk_krope))
 
-    # First topk_pos load (tile 0)
-    tpos_offs0 = topk_base.to(tl.int32) + offs_tile_topk
-    topk_pos_reg = gl.amd.cdna4.buffer_load(
-        ptr=TopK_ptr, offsets=tpos_offs0,
-        mask=offs_tile_topk < TOPK, other=-1,
-    )
+    # (removed dead `topk_pos_reg` prologue load — was never consumed)
 
     # ---------- shared mem allocations for the K loop ----------
     smem_krope = gl.allocate_shared_memory(
@@ -268,6 +263,16 @@ def _sparse_mla_fwd_gl_kernel(
     topk_pos_mma = gl.amd.cdna4.buffer_load(
         ptr=TopK_ptr, offsets=topk_base.to(tl.int32) + offs_tile_mma,
         mask=offs_tile_mma < TOPK, other=-1,
+    )
+
+    # Deep-prefetch tile-1 topk ONCE in the neutral blk_topk layout (DEDUP). Carried as a
+    # single register set; converted to the klora/krope/mma layouts at point of use, to
+    # minimize carried register pressure (the 3-layout carry caused an acc-rescale codegen
+    # regression -- see att_fwd_gluon_mi350/RESULTS.md).
+    p1_off_topk = TILE_K + offs_tile_topk
+    tkraw = gl.amd.cdna4.buffer_load(
+        ptr=TopK_ptr, offsets=topk_base.to(tl.int32) + p1_off_topk,
+        mask=p1_off_topk < TOPK, other=-1,
     )
 
     valid_klora = (topk_pos_klora != -1)  # tile_start=0 -> offs_tile<TOPK already true
@@ -308,92 +313,83 @@ def _sparse_mla_fwd_gl_kernel(
     Q_lora_dot = smem_qlora.load(dot_qlora_a)
     Q_rope_dot = smem_qrope.load(dot_qrope_a)
 
-    # ---------- main loop: prefetch t+1, compute t ----------
+    # ---------- main loop (3-stage): gather tile t+1 from ALREADY-loaded topk,
+    #            deep-prefetch topk for tile t+2, compute tile t ----------
+    # Carried across iterations: tkraw_{klora,krope,mma} = raw topk for the tile to be
+    # GATHERED this iter (loaded the previous iter / prologue); valid_mma = mask for the
+    # tile being COMPUTED this iter. This lifts the topk load off the KV-gather critical
+    # path so the async_copy is never gated by a fresh index load.
     cur_buf = 0
     for t in range(NUM_TILES - 1):
-        # prefetch next-tile topk indices (per-layout)
-        next_offs_topk = (t + 1) * TILE_K + offs_tile_topk
-        next_offs_klora = (t + 1) * TILE_K + offs_tile_klora
-        next_offs_krope = (t + 1) * TILE_K + offs_tile_krope
-        next_offs_mma = (t + 1) * TILE_K + offs_tile_mma
-
-        topk_pos_klora_next = gl.amd.cdna4.buffer_load(
-            ptr=TopK_ptr, offsets=topk_base.to(tl.int32) + next_offs_klora,
-            mask=next_offs_klora < TOPK, other=-1,
-        )
-        topk_pos_krope_next = gl.amd.cdna4.buffer_load(
-            ptr=TopK_ptr, offsets=topk_base.to(tl.int32) + next_offs_krope,
-            mask=next_offs_krope < TOPK, other=-1,
-        )
-        topk_pos_mma_next = gl.amd.cdna4.buffer_load(
-            ptr=TopK_ptr, offsets=topk_base.to(tl.int32) + next_offs_mma,
-            mask=next_offs_mma < TOPK, other=-1,
-        )
-
-        valid_klora_next = (next_offs_klora < TOPK) & (topk_pos_klora_next != -1)
-        valid_krope_next = (next_offs_krope < TOPK) & (topk_pos_krope_next != -1)
-        valid_mma_next = (next_offs_mma < TOPK) & (topk_pos_mma_next != -1)
-
-        safe_klora_next = gl.where(valid_klora_next, topk_pos_klora_next, 0)
-        safe_krope_next = gl.where(valid_krope_next, topk_pos_krope_next, 0)
-
-        # K_lora_next + K_rope_next async DMA, both into the next buffer slot,
-        # committed as a single group so the loop's wait_group(1) retires both at once.
         next_buf = 1 - cur_buf
 
+        # validity / safe-pos for tile t+1: convert the single carried tkraw (blk_topk) to
+        # each consumer layout HERE (transient, not carried) -> low carried register pressure.
+        tk_klora = gl.convert_layout(tkraw, gl.SliceLayout(0, blk_klora))
+        tk_krope = gl.convert_layout(tkraw, gl.SliceLayout(0, blk_krope))
+        tk_mma = gl.convert_layout(tkraw, gl.SliceLayout(0, mfma_s))
+        n_off_klora = (t + 1) * TILE_K + offs_tile_klora
+        n_off_krope = (t + 1) * TILE_K + offs_tile_krope
+        n_off_mma = (t + 1) * TILE_K + offs_tile_mma
+        valid_klora_next = (n_off_klora < TOPK) & (tk_klora != -1)
+        valid_krope_next = (n_off_krope < TOPK) & (tk_krope != -1)
+        valid_mma_next = (n_off_mma < TOPK) & (tk_mma != -1)
+        safe_klora_next = gl.where(valid_klora_next, tk_klora, 0)
+        safe_krope_next = gl.where(valid_krope_next, tk_krope, 0)
+
+        # issue KV[t+1] async gather into next buffer (UNGATED by any topk load)
         klora_offs_next = (
             safe_klora_next[None, :].to(tl.int64) * stride_kv_t
             + offs_v_klora[:, None].to(tl.int64)
         )
-        klora_smem_next = smem_klora.index(next_buf)
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dest=klora_smem_next,
+            dest=smem_klora.index(next_buf),
             ptr=KV_ptr,
             offsets=klora_offs_next.to(tl.int32),
             mask=valid_klora_next[None, :],
         )
-
         krope_offs_next = (
             safe_krope_next[None, :].to(tl.int64) * stride_kv_t
             + (D_V + offs_r_krope[:, None]).to(tl.int64)
         )
-        krope_smem_next = smem_krope.index(next_buf)
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            dest=krope_smem_next,
+            dest=smem_krope.index(next_buf),
             ptr=KV_ptr,
             offsets=krope_offs_next.to(tl.int32),
             mask=valid_krope_next[None, :],
         )
         gl.amd.cdna4.async_copy.commit_group()
 
-        # Wait for the *current* K_rope tile (the older async commit; one outstanding
-        # is the just-issued next prefetch).
+        # deep-prefetch raw topk for tile t+2 (consumed NEXT iter; its latency hides
+        # behind this iter's wait_group + compute). buffer_load uses vmcnt, independent
+        # of the async_copy group counter that wait_group(1) tracks below.
+        f_off_topk = (t + 2) * TILE_K + offs_tile_topk
+        tkraw_n = gl.amd.cdna4.buffer_load(
+            ptr=TopK_ptr, offsets=topk_base.to(tl.int32) + f_off_topk,
+            mask=f_off_topk < TOPK, other=-1,
+        )
+
+        # wait for the *current* tile t's KV (older async group; one outstanding = t+1)
         gl.amd.cdna4.async_copy.wait_group(1)
 
-        # ---------- compute current tile ----------
-        # Read K_lora from current shared buffer in two views: dot-operand and
-        # transposed (V_lora). The permute is a memdesc view — no data movement.
+        # ---------- compute current tile t ----------
+        # K_lora in two views: dot-operand and transposed (V_lora). permute = view, no move.
         klora_smem_cur = smem_klora.index(cur_buf)
         K_lora_T_dot = klora_smem_cur.load(dot_klora_b)              # opIdx=1 of mfma_s
         V_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)    # opIdx=1 of mfma_acc
-
-        # Load K_rope from smem (current buffer).
         krope_smem_cur = smem_krope.index(cur_buf)
         K_rope_T_dot = krope_smem_cur.load(dot_krope_b)
 
-        # S = Q_lora @ K_lora_T + Q_rope @ K_rope_T
         S_zero = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_s)
         S = gl.amd.cdna4.mfma(Q_lora_dot, K_lora_T_dot, S_zero)
         S = gl.amd.cdna4.mfma(Q_rope_dot, K_rope_T_dot, S)
         S = S * scale
 
-        # Mask invalid columns/rows to -inf
         offs_h_mma = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_s))
         mask_h_mma = offs_h_mma < num_heads
         valid_mask = valid_mma[None, :] & mask_h_mma[:, None]
         S = gl.where(valid_mask, S, float("-inf"))
 
-        # Online softmax
         m_j = gl.max(S, axis=1)
         m_new = gl.maximum(m_i, m_j)
         m_new = gl.where(m_new > float("-inf"), m_new, 0.0)
@@ -401,7 +397,6 @@ def _sparse_mla_fwd_gl_kernel(
         P = gl.exp(S - m_new[:, None])
         l_new = alpha * l_i + gl.sum(P, axis=1)
 
-        # acc = acc * alpha + P @ V_lora
         alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
         acc = acc * alpha_acc[:, None]
 
@@ -412,16 +407,10 @@ def _sparse_mla_fwd_gl_kernel(
         m_i = m_new
         l_i = l_new
 
-        # Promote prefetched values to "current"
+        # ---------- promote ----------
         cur_buf = next_buf
-        topk_pos_klora = topk_pos_klora_next
-        topk_pos_krope = topk_pos_krope_next
-        topk_pos_mma = topk_pos_mma_next
-        valid_klora = valid_klora_next
-        valid_krope = valid_krope_next
-        valid_mma = valid_mma_next
-        safe_klora = safe_klora_next
-        safe_krope = safe_krope_next
+        valid_mma = valid_mma_next       # tile t+1 -> the tile computed next iter
+        tkraw = tkraw_n                  # tile t+2 -> the tile gathered next iter (single, blk_topk)
 
     # ---------- epilogue: process the last tile (NUM_TILES-1) ----------
     gl.amd.cdna4.async_copy.wait_group(0)
