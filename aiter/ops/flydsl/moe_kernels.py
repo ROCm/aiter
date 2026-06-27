@@ -182,7 +182,13 @@ def get_flydsl_stage2_kernels(
 
     b_nts = [0, 2]
 
-    xcd_swizzles = [0, 4]
+    # xcd_swizzle doubles as the L2-locality M-group width (WGM_S) in the
+    # stage2 kernel: the swizzle remaps workgroups onto XCDs *and* groups
+    # WGM_S consecutive M-tiles together so a shared A tile stays resident in
+    # L2 across N-tiles instead of being re-fetched from HBM. Offer a larger
+    # group (8) in addition to {0,4} so large-M shapes (where the A re-fetch /
+    # low-L2-hit cost dominates) can tune a wider L2 group.
+    xcd_swizzles = [0, 4, 8]
 
     for tm in tile_ms:
         for tn in tile_ns:
