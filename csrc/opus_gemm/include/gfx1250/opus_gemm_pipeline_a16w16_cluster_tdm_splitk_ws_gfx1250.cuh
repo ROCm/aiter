@@ -76,7 +76,7 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
     //   bjs   = signal only             (run-ahead / no-wait side)
     //   bjsw  = join + signal + wait    (waiting side; join sets namedBarID, its own
     //                                    signal is required for completion)
-    auto binit = [&](auto IdN, uint32_t mc) __attribute__((always_inline)) {
+    auto binit = [&](auto IdN, u32_t mc) __attribute__((always_inline)) {
         constexpr int id = IdN.value;
         if      constexpr (id == 1) s_barrier_init_ptr(&__nbar_1, mc);
         else if constexpr (id == 2) s_barrier_init_ptr(&__nbar_2, mc);
@@ -123,8 +123,8 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
     // selects GLOBAL_LOAD_ASYNC.
     const int tile_row = (int)__builtin_amdgcn_workgroup_id_x() * T::kBlockM;
     const int tile_col = (int)__builtin_amdgcn_workgroup_id_y() * T::kBlockN;
-    const uint16_t mask_a = 0u;
-    const uint16_t mask_b = 0u;
+    const u16_t mask_a = 0u;
+    const u16_t mask_b = 0u;
 
     const int stride_a = kargs.stride_a;
     const int stride_b = kargs.stride_b;
@@ -152,7 +152,7 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
     // shared barrier-unit state, so a single initializer suffices; the workgroup
     // barrier below then publishes it to every wave before first use.
     if (wave_id == T::kNumProducerWaves) {
-        constexpr uint32_t kFreeMemCnt = 1 + T::kNumConsumerWaves;   // prodX + 2 consumers
+        constexpr u32_t kFreeMemCnt = 1 + T::kNumConsumerWaves;   // prodX + 2 consumers
         opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
             constexpr int s = decltype(sN)::value;
             binit(opus::number<1 + s>{}, T::kNumWaves);                   // DATA[s]
@@ -165,7 +165,7 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
     // ---- Producers: w0 fills A slots, w1 fills B slots (kNumSlots ring). ----
     if (is_producer) {
         const int gk0 = k_step_beg * T::kBlockK;
-        const uint32_t k_extent = (uint32_t)(kargs.k - gk0);
+        const u32_t k_extent = (u32_t)(kargs.k - gk0);
         constexpr int slot_a_b = T::kSlotBytesA;
         constexpr int slot_b_b = T::kSlotBytesB;
         constexpr auto KStep = opus::number<T::kBlockK>{};
@@ -269,16 +269,16 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
 
         if (wave_id == 0) {
             WindowA w;
-            w.make((uint32_t)reinterpret_cast<uintptr_t>(smem_a), kargs.ptr_a, 0,
-                   k_extent, (uint32_t)row_extent_a, (uint64_t)stride_a,
-                   (uint32_t)gk0, (uint32_t)tile_row);
+            w.make((u32_t)reinterpret_cast<u64_t>(smem_a), kargs.ptr_a, 0,
+                   k_extent, (u32_t)row_extent_a, (u64_t)stride_a,
+                   (u32_t)gk0, (u32_t)tile_row);
             w.desc.set_workgroup_mask(mask_a);   // plain grid (no cluster): mask_a=0 -> multicast off
             produce(w, slot_a_b, opus::number<1 + T::kNumSlots>{});       // FREE_A
         } else {  // wave_id == 1 -> B
             WindowB w;
-            w.make((uint32_t)reinterpret_cast<uintptr_t>(smem_b), kargs.ptr_b, 0,
-                   k_extent, (uint32_t)row_extent_b, (uint64_t)stride_b,
-                   (uint32_t)gk0, (uint32_t)tile_col);
+            w.make((u32_t)reinterpret_cast<u64_t>(smem_b), kargs.ptr_b, 0,
+                   k_extent, (u32_t)row_extent_b, (u64_t)stride_b,
+                   (u32_t)gk0, (u32_t)tile_col);
             w.desc.set_workgroup_mask(mask_b);   // plain grid (no cluster): mask_b=0 -> multicast off
             produce(w, slot_b_b, opus::number<1 + 2 * T::kNumSlots>{});   // FREE_B
         }
