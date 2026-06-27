@@ -5,7 +5,7 @@
 
 One workgroup per group sums the ``K*B`` rows ``indx[g, :]`` (TDM-loaded, summed
 in-register, no cross-wave communication) into ``out[g, :N]``, with optional
-external residual fold-in. Swiglu stays on the Triton path.
+external residual fold-in.
 """
 
 from triton.experimental import gluon
@@ -32,6 +32,8 @@ def reduce_grouped_gluon(
     HAS_EXT_RESIDUAL: gl.constexpr,
 ):
     group = gl.program_id(0)
+    gl.static_assert(NPAD >= 32, "NPAD must be >= 32")
+    gl.static_assert(NPAD % (NUM_WARPS * 32) == 0, "NPAD must be a multiple of NUM_WARPS*32")
 
     # Load a power-of-2 column tile NPAD>=N (TDM block dims must be pow2) while the descriptor shape stays at true N, so TDM zero-pads cols [N:NPAD) (masked off on store).
     SIZE_N: gl.constexpr = NPAD // (NUM_WARPS * 32)
