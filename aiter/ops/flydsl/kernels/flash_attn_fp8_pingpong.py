@@ -118,6 +118,21 @@ def build_flash_attn_fp8_module(
     IGLP_VARIANT = 1
     # s_setprio bias for the softmax-role (transcendental) wave; 0 disables.
     SOFTMAX_PRIO = 1
+    # USE_SCHRAUDOLPH: replace the per-element quarter-rate v_exp_f32 in the P
+    # exp2 with the Schraudolph linear-mantissa bit trick (full-rate VALU).  The
+    # P output is quantized to fp8 E4M3 (~6% precision) so the ~2% approx error
+    # is below the quantization floor.  corr (the O-rescale) stays exact.
+    USE_SCHRAUDOLPH = True
+    # EXP2_SHIFT: scale all Schraudolph P up by 2^SHIFT.  A global P scale cancels
+    # in the softmax normalization (O and L both scale), so this only repositions
+    # P (range [2^-9,1]) within fp8 E4M3 -- a few bits up lifts small P out of the
+    # subnormal range and improves quantization accuracy for free.
+    EXP2_SHIFT = 4.0
+    # USE_ROLLBACK: skip the per-tile O*=corr (64 fmul) + L*=corr when no lane's
+    # running max grew this tile (corr==exp2(0)==1.0 exactly).  Wave-uniform
+    # scf.if predicate (64-lane OR of corr<1) so the wave never diverges; EXACT,
+    # not approximate.  After softmax warmup most tiles skip the rescale.
+    USE_ROLLBACK = True
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fp8_attn_kernel(
@@ -151,6 +166,14 @@ def build_flash_attn_fp8_module(
 
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
+
+        def _wave_or(pred_i1):
+            # OR a per-lane i1 predicate across all 64 lanes -> wave-uniform i1.
+            g = ArithValue(pred_i1).select(fx.Int32(1), fx.Int32(0))
+            for st in (1, 2, 4, 8, 16, 32):
+                peer = fx.Int32(g).shuffle_xor(fx.Int32(st), fx.Int32(WARP_SIZE))
+                g = arith.ori(_raw(g), _raw(peer))
+            return arith.cmpi(arith.CmpIPredicate.ne, _raw(g), _raw(fx.Int32(0)))
 
         def _sched_barrier():
             if USE_MANUAL_SCHED:
@@ -217,6 +240,24 @@ def build_flash_attn_fp8_module(
         scale_log2e = _fmul(qk_scale, c_log2e)
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
+
+        # Schraudolph base-2 exp constants: 2^y ~= bitcast_f32(floor(2^23*y + B))
+        # with B = (127 - c)*2^23.  c ~= 0.0426 centers the linear-mantissa
+        # interpolation error of 2^frac around 0 (peak |err| ~2%).
+        c_2p23 = fx.Float32(float(1 << 23))
+        # EXP2_SHIFT lifts all P up by 2^SHIFT (global scale cancels in softmax
+        # normalization; only repositions P within fp8 E4M3, out of subnormals).
+        c_exp2_bias = fx.Float32((127.0 - 0.0426 + EXP2_SHIFT) * float(1 << 23))
+
+        def _schraudolph(s, scale_x2p23, m_term):
+            # 2^(s*scale_log2e - m_new*scale_log2e) via the Schraudolph bit trick,
+            # fused: biased = s*(scale_log2e*2^23) + (-m_new*scale_log2e*2^23 + B).
+            # The mul+add contracts to a single FMA under fastmath, so the whole
+            # exp2 is FMA + max + fptosi + (free) bitcast == 3 full-rate ops,
+            # vs the original mul+add+v_exp_f32 (~6 incl. the quarter-rate exp).
+            # Clamp >= 0 so deep-negative exponents (P underflow) map to 0.0.
+            biased = _fmax(_fadd(_fmul(s, scale_x2p23), m_term), c_zero_f)
+            return arith.bitcast(T.f32, arith.fptosi(T.i32, _raw(biased)))
 
         DMA_BYTES = 16
         DMA_LANES = (NUM_WAVES // 2) * WARP_SIZE  # 256 (one 4-wave group)
@@ -389,7 +430,54 @@ def build_flash_attn_fp8_module(
             corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
             )
-            l2 = _fadd(_fmul(l_acc, corr), p_rowsum)
+            if const_expr(USE_ROLLBACK):
+                # Speculative rollback: O*=corr and L=L*corr+rowsum only matter
+                # when some lane's running max grew this tile (corr<1).
+                # corr==exp2(0)==1.0 exactly when no lane grew, so skipping the
+                # 64-fmul O-rescale + the L-mul is EXACT (not approximate).
+                # Branch on a wave-uniform OR of the per-lane (corr<1) predicate
+                # so the wave never diverges.
+                grew = arith.cmpf(
+                    arith.CmpFPredicate.OLT, _raw(corr), _raw(fx.Float32(1.0))
+                )
+                any_grew = _wave_or(grew)
+                o_vt = Vec.make_type(C_F32_PER_LANE, fx.Float32)
+                resc_if = scf.IfOp(
+                    any_grew, results_=[o_vt, o_vt, o_vt, o_vt, T.f32], has_else=True
+                )
+                with ir.InsertionPoint(resc_if.then_block):
+                    _ro = [
+                        _fmul(Vec(o_accs[dt]), corr_vec)
+                        for dt in range_constexpr(D_TILES)
+                    ]
+                    _rl = _fadd(_fmul(l_acc, corr), p_rowsum)
+                    scf.YieldOp(
+                        [
+                            _raw(_ro[0]),
+                            _raw(_ro[1]),
+                            _raw(_ro[2]),
+                            _raw(_ro[3]),
+                            _raw(_rl),
+                        ]
+                    )
+                with ir.InsertionPoint(resc_if.else_block):
+                    _nl = _fadd(_raw(l_acc), _raw(p_rowsum))
+                    scf.YieldOp(
+                        [
+                            _raw(o_accs[0]),
+                            _raw(o_accs[1]),
+                            _raw(o_accs[2]),
+                            _raw(o_accs[3]),
+                            _raw(_nl),
+                        ]
+                    )
+                o_accs = [
+                    as_dsl_value(resc_if.results[dt], o_accs[dt])
+                    for dt in range_constexpr(D_TILES)
+                ]
+                l2 = as_dsl_value(resc_if.results[4], l_acc)
+            else:
+                l2 = _fadd(_fmul(l_acc, corr), p_rowsum)
             p_ks_list = [
                 Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
                 for r in range_constexpr(PV_K_STEPS)
@@ -403,7 +491,7 @@ def build_flash_attn_fp8_module(
             for u in range_constexpr(PV_UNITS):
                 dt = u // PV_K_STEPS
                 ks = u % PV_K_STEPS
-                if const_expr(ks == 0):
+                if const_expr(not USE_ROLLBACK and ks == 0):
                     o[dt] = _fmul(Vec(o[dt]), corr_vec)
                 if const_expr(u + PREFETCH_DEPTH < PV_UNITS):
                     un = u + PREFETCH_DEPTH
@@ -475,23 +563,39 @@ def build_flash_attn_fp8_module(
             neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
             n_groups = C_F32_PER_LANE // 4
 
-            # Affine scale*S - scale*m computed packed (vector mulf/addf -> v_pk_*)
-            # over the whole vec<16xf32>; only exp2 stays per-scalar (v_exp_f32).
-            scale_vec = Vec.from_elements([scale_log2e], fx.Float32).broadcast_to(
-                C_F32_PER_LANE
-            )
-            neg_m_vec = Vec.from_elements([neg_scaled_m_new], fx.Float32).broadcast_to(
-                C_F32_PER_LANE
-            )
             p_words = []
-            for nt in range_constexpr(N_KV_TILES):
-                aff = Vec(_fadd(_fmul(Vec(s_accs[nt]), scale_vec), neg_m_vec))
-                for rg in range_constexpr(n_groups):
-                    ps = [
-                        rocdl.exp2(T.f32, _raw(aff[rg * 4 + i]))
-                        for i in range_constexpr(4)
-                    ]
-                    p_words.append(_f32x4_to_fp8_word(*ps))
+            if const_expr(USE_SCHRAUDOLPH):
+                # Fold scale_log2e and the 2^23 / bias affine into per-tile coeffs
+                # so each element's exp2 is one FMA + max + fptosi (full-rate).
+                scale_x2p23 = _fmul(scale_log2e, c_2p23)
+                m_term = _fadd(_fmul(neg_scaled_m_new, c_2p23), c_exp2_bias)
+                for nt in range_constexpr(N_KV_TILES):
+                    for rg in range_constexpr(n_groups):
+                        ps = [
+                            _schraudolph(
+                                Vec(s_accs[nt])[rg * 4 + i], scale_x2p23, m_term
+                            )
+                            for i in range_constexpr(4)
+                        ]
+                        p_words.append(_f32x4_to_fp8_word(*ps))
+            else:
+                # Affine scale*S - scale*m computed packed (vector mulf/addf ->
+                # v_pk_*) over the whole vec<16xf32>; exp2 stays per-scalar
+                # (quarter-rate v_exp_f32, exact).
+                scale_vec = Vec.from_elements([scale_log2e], fx.Float32).broadcast_to(
+                    C_F32_PER_LANE
+                )
+                neg_m_vec = Vec.from_elements(
+                    [neg_scaled_m_new], fx.Float32
+                ).broadcast_to(C_F32_PER_LANE)
+                for nt in range_constexpr(N_KV_TILES):
+                    aff = Vec(_fadd(_fmul(Vec(s_accs[nt]), scale_vec), neg_m_vec))
+                    for rg in range_constexpr(n_groups):
+                        ps = [
+                            rocdl.exp2(T.f32, _raw(aff[rg * 4 + i]))
+                            for i in range_constexpr(4)
+                        ]
+                        p_words.append(_f32x4_to_fp8_word(*ps))
             p_pack = Vec.from_elements(p_words, fx.Int32)
             p_ks_list = [
                 Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
@@ -729,9 +833,7 @@ def build_flash_attn_fp8_module(
                     i_cur % fx.Index(NUM_BUF_V)
                 ) * fx.Index(LDS_V_TILE)
                 # PHASE 1 (mfma phase): softmax(i-1) | DMA K^{i+1}.
-                m_sm, corr_sm, p_sm, prowsum_sm = do_softmax(
-                    [ss0, ss1, ss2, ss3], m_r
-                )
+                m_sm, corr_sm, p_sm, prowsum_sm = do_softmax([ss0, ss1, ss2, ss3], m_r)
                 rocdl.s_setprio(0)
                 # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
                 oB, lB, kw_prime = apply_pv(
