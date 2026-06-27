@@ -8,7 +8,6 @@ in-register, no cross-wave communication) into ``out[g, :N]``, with optional
 external residual fold-in. Swiglu stays on the Triton path.
 """
 
-import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
