@@ -118,21 +118,23 @@ def build_flash_attn_fp8_module(
     IGLP_VARIANT = 1
     # s_setprio bias for the softmax-role (transcendental) wave; 0 disables.
     SOFTMAX_PRIO = 1
+
     # USE_SCHRAUDOLPH: replace the per-element quarter-rate v_exp_f32 in the P
     # exp2 with the Schraudolph linear-mantissa bit trick (full-rate VALU).  The
     # P output is quantized to fp8 E4M3 (~6% precision) so the ~2% approx error
     # is below the quantization floor.  corr (the O-rescale) stays exact.
-    USE_SCHRAUDOLPH = True
+
+    # USE_ROLLBACK: skip the per-tile O*=corr (64 fmul) + L*=corr when no lane's
+    # running max grew this tile (corr==exp2(0)==1.0 exactly).  Wave-uniform
+    # scf.if predicate (64-lane OR of corr<1) so the wave never diverges; EXACT,
+    # not approximate.  After softmax warmup most tiles skip the rescale.
+    USE_SCHRAUDOLPH = False
+    USE_ROLLBACK = False
     # EXP2_SHIFT: scale all Schraudolph P up by 2^SHIFT.  A global P scale cancels
     # in the softmax normalization (O and L both scale), so this only repositions
     # P (range [2^-9,1]) within fp8 E4M3 -- a few bits up lifts small P out of the
     # subnormal range and improves quantization accuracy for free.
     EXP2_SHIFT = 4.0
-    # USE_ROLLBACK: skip the per-tile O*=corr (64 fmul) + L*=corr when no lane's
-    # running max grew this tile (corr==exp2(0)==1.0 exactly).  Wave-uniform
-    # scf.if predicate (64-lane OR of corr<1) so the wave never diverges; EXACT,
-    # not approximate.  After softmax warmup most tiles skip the rescale.
-    USE_ROLLBACK = True
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fp8_attn_kernel(
