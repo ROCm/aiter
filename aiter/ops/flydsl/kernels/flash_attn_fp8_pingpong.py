@@ -711,6 +711,7 @@ def build_flash_attn_fp8_module(
                 [_raw(v) for v in g1_carry],
             )
             with ir.InsertionPoint(for_op.body):
+                rocdl.s_setprio(1)
                 iv = for_op.induction_variable
                 _iglp()
                 _g1_args = [
@@ -729,8 +730,9 @@ def build_flash_attn_fp8_module(
                 ) * fx.Index(LDS_V_TILE)
                 # PHASE 1 (mfma phase): softmax(i-1) | DMA K^{i+1}.
                 m_sm, corr_sm, p_sm, prowsum_sm = do_softmax(
-                    [ss0, ss1, ss2, ss3], m_r, True
+                    [ss0, ss1, ss2, ss3], m_r
                 )
+                rocdl.s_setprio(0)
                 # PHASE 2 (softmax phase): deferred PV(i-1) + QK(i)->S.
                 oB, lB, kw_prime = apply_pv(
                     [oo0, oo1, oo2, oo3],
