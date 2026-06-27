@@ -66,9 +66,9 @@ gfx1250,256,2,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,
 gfx1250,256,4,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,8,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,16,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
-gfx1250,256,32,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,20000,9,26.25,opus_gemm_gfx1250_splitk_cluster_tdm_ws_128x16x32x128_1x2_16x16x32_0x0x0_p3w2,0.0,0.0,0.0
+gfx1250,256,32,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,48,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
-gfx1250,256,64,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,20000,13,26.34,opus_gemm_gfx1250_splitk_cluster_tdm_ws_128x16x32x128_1x2_16x16x32_0x0x0_p3w2,0.0,0.0,0.0
+gfx1250,256,64,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,80,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,96,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
 gfx1250,256,112,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,0,auto,0.0,0.0,0.0
