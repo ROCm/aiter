@@ -433,7 +433,6 @@ namespace py = pybind11;
           py::arg("is_neox"),                                                       \
           py::arg("is_nope_first") = true);
 
-
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
     AITER_SET_STREAM_PYBIND                                                                    \
     m.def("init_custom_ar",                                                                    \
@@ -1373,18 +1372,33 @@ namespace py = pybind11;
           py::arg("dispatch_policy")   = 0,            \
           py::arg("local_topk_ids")    = std::nullopt);
 
-#define PA_SPARSE_PREFILL_OPUS_PYBIND   \
-    m.def("pa_sparse_prefill_opus_fwd", \
-          &pa_sparse_prefill_opus_fwd,  \
-          py::arg("q"),                 \
-          py::arg("unified_kv"),        \
-          py::arg("kv_indices_prefix"), \
-          py::arg("kv_indptr_prefix"),  \
-          py::arg("kv"),                \
-          py::arg("kv_indices_extend"), \
-          py::arg("kv_indptr_extend"),  \
-          py::arg("attn_sink"),         \
-          py::arg("out"),               \
+#define PA_SPARSE_PREFILL_OPUS_PYBIND                  \
+    m.def("pa_sparse_prefill_opus_fwd",                \
+          &pa_sparse_prefill_opus_fwd,                 \
+          py::arg("q"),                                \
+          py::arg("unified_kv"),                       \
+          py::arg("kv_indices_prefix"),                \
+          py::arg("kv_indptr_prefix"),                 \
+          py::arg("kv"),                               \
+          py::arg("kv_indices_extend"),                \
+          py::arg("kv_indptr_extend"),                 \
+          py::arg("attn_sink"),                        \
+          py::arg("out"),                              \
+          py::arg("softmax_scale"));                   \
+    m.def("pa_sparse_prefill_fp8_opus_fwd",            \
+          &pa_sparse_prefill_fp8_opus_fwd,             \
+          py::arg("q_nope"),                           \
+          py::arg("q_rope"),                           \
+          py::arg("unified_kv_nope"),                  \
+          py::arg("unified_kv_rope"),                  \
+          py::arg("kv_indices_prefix"),                \
+          py::arg("kv_indptr_prefix"),                 \
+          py::arg("kv_nope"),                          \
+          py::arg("kv_rope"),                          \
+          py::arg("kv_indices_extend"),                \
+          py::arg("kv_indptr_extend"),                 \
+          py::arg("attn_sink"),                        \
+          py::arg("out"),                              \
           py::arg("softmax_scale"));
 
 #define NORM_PYBIND                                \
@@ -1907,6 +1921,42 @@ namespace py = pybind11;
           py::arg("k_scale"),                                   \
           py::arg("v_scale"),                                   \
           py::arg("max_tokens_per_batch") = 0);                 \
+    m.def("fused_qk_norm_rope_group_quant",                                             \
+            &aiter::fused_qk_norm_rope_group_quant,                                     \
+            py::arg("q"),                                                               \
+            py::arg("kv"),                                                              \
+            py::arg("k_rope_buff"),                                                     \
+            py::arg("k_weight"),                                                        \
+            py::arg("k_nope_scale_buff"),                                               \
+            py::arg("q_nope_scale_buff"),                                               \
+            py::arg("positions"),                                                       \
+            py::arg("cos_cache"),                                                       \
+            py::arg("sin_cache"),                                                       \
+            py::arg("eps"),                                                             \
+            py::arg("is_neox"),                                                         \
+            py::arg("q_weight")          = std::nullopt,                                \
+            py::arg("q_scale")           = std::nullopt,                                \
+            py::arg("quant_group_size")  = 64,                                          \
+            py::arg("scale_dtype")       = std::string("e8m0"),                         \
+            py::arg("q_rope_buff")       = std::nullopt,                                \
+            py::arg("swa_nope_scale_buff") = std::nullopt,                              \
+            py::arg("swa_rope_buff")     = std::nullopt,                                \
+            py::arg("state_slot_mapping") = std::nullopt,                               \
+            py::arg("batch_id_per_token") = std::nullopt);                              \
+    m.def("fused_kv_norm_rope_group_quant",                                             \
+            &aiter::fused_kv_norm_rope_group_quant,                                     \
+            py::arg("kv"),                                                              \
+            py::arg("k_rope_buff"),                                                     \
+            py::arg("k_weight"),                                                        \
+            py::arg("k_nope_scale_buff"),                                               \
+            py::arg("positions"),                                                       \
+            py::arg("slot_mapping"),                                                    \
+            py::arg("cos_cache"),                                                       \
+            py::arg("sin_cache"),                                                       \
+            py::arg("eps"),                                                             \
+            py::arg("is_neox"),                                                         \
+            py::arg("quant_group_size")  = 64,                                          \
+            py::arg("scale_dtype")       = std::string("e8m0"));                        \
     m.def("fused_qk_norm_rope_2way", &aiter::fused_qk_norm_rope_2way);                  \
     m.def("fused_qk_norm_rope_1way", &aiter::fused_qk_norm_rope_1way);                  \
     m.def("fused_qk_norm_rope_2way_fp8_perhead_quant",                                  \

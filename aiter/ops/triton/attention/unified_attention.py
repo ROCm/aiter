@@ -721,42 +721,14 @@ def _gfx1250_unified_attention_2d(
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
         num_blocks, NUM_KV_HEADS, _, BLOCK_SIZE, K_WIDTH = k.shape
-        # TILE_SIZE must be a multiple of the page size. Default to 128 so that
-        # small pages pack several blocks per tile, but grow it to BLOCK_SIZE
-        # when the page is larger (e.g. --block-size 256) so the invariant
-        # TILE_SIZE >= BLOCK_SIZE still holds.
-        TILE_SIZE = max(128, BLOCK_SIZE)
-        num_kv_blocks = TILE_SIZE // BLOCK_SIZE
-        assert (
-            TILE_SIZE >= BLOCK_SIZE
-        ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
     else:
         BLOCK_SIZE = k.shape[1]
         NUM_KV_HEADS = k.shape[2]
-        TILE_SIZE = BLOCK_SIZE
-        num_kv_blocks = 1
-    assert (
-        num_kv_blocks & (num_kv_blocks - 1) == 0
-    ), "num_kv_blocks must be a power of 2"
 
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
-    num_warps = 4
-    BLOCK_M = 128
-    waves_per_eu = 1
-    SLIDING_WINDOW = 1 + window_size[0]
-    ALL_DECODE = max_seqlen_q == 1
-    NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
-    num_warps = 4
-    BLOCK_M = 128
-    waves_per_eu = 1
-    if SLIDING_WINDOW > 0:
-        sel_loop_variant = 0
-    elif shuffled_kv_cache or TILE_SIZE > 32:
-        sel_loop_variant = 2
-    else:
-        sel_loop_variant = 0
+    num_buffers = None
     if ALL_DECODE:
         sel_loop_variant = 0
         BLOCK_M = (
@@ -764,34 +736,60 @@ def _gfx1250_unified_attention_2d(
             if NUM_QUERIES_PER_KV <= 16
             else triton.next_power_of_2(NUM_QUERIES_PER_KV)
         )
-        if Q_FP8 and KV_FP8:
-            num_warps = 1
-            waves_per_eu = 2
-            TILE_SIZE = 256
-        else:
-            num_warps = 1
-            waves_per_eu = 2
+        num_warps = 1
+        waves_per_eu = 2
+        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
+    elif SLIDING_WINDOW > 0:
+        # Prefill, sliding window
+        sel_loop_variant = 0
+        BLOCK_M = 64
+        num_warps = 4
+        waves_per_eu = 4
+        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
+    else:
+        # Prefill, full attention
+        sel_loop_variant = 2
+        BLOCK_M = 128
+        num_warps = 4
+        waves_per_eu = 2
+        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
+        num_buffers = 2
 
-    # auto mode, otherwise use the provided variant
-    if loop_variant is None:
-        loop_variant = sel_loop_variant
+    loop_variant = sel_loop_variant if loop_variant is None else loop_variant
+    # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page
+    if not shuffled_kv_cache:
+        TILE_SIZE = BLOCK_SIZE
+    # tile size cannot be less than block size
+    elif TILE_SIZE < BLOCK_SIZE:
+        TILE_SIZE = BLOCK_SIZE
+
+    num_kv_blocks = TILE_SIZE // BLOCK_SIZE if shuffled_kv_cache else 1
+    assert (
+        num_kv_blocks & (num_kv_blocks - 1) == 0
+    ), "num_kv_blocks must be a power of 2"
 
     assert (
         TILE_SIZE >= BLOCK_SIZE
     ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
 
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
-    # Upper bound on masked tiles. +1 because the causal diagonal isnt
-    # tile-aligned, the query_span-wide band sits at an arbitrary key offset
-    # and can spill into one extra tile
+    # Upper bound on masked tiles
     query_span = (BLOCK_M - 1) // NUM_QUERIES_PER_KV + 1
     max_mask_tiles = (query_span + TILE_SIZE - 1) // TILE_SIZE + 1
     # other variants do at most 2 masking at the end of loop
     if max_mask_tiles > 2:
         loop_variant = 0
-    total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
+    # fall back to the standard double-buffered loop
+    if TILE_SIZE <= 32:
+        loop_variant = 0
+    if not ALL_DECODE:
+        total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
+    else:
+        total_query_blocks = NUM_SEQS
     NUM_WARPS = num_warps
-    num_buffers = 2 if loop_variant == 0 else 3
+    if num_buffers is None:
+        num_buffers = 2 if loop_variant == 0 else 3
+        num_buffers = 2 if ALL_DECODE else num_buffers
 
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
