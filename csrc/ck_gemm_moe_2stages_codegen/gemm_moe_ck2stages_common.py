@@ -17,6 +17,9 @@ sys.path.insert(0, AITER_CORE_DIR)
 
 from chip_info import get_gfx  # noqa: E402
 
+ACT_TO_INT = {"gelu": 0, "silu": 1, "gelu_tanh": 3}
+INT_TO_ACT = {v: k for k, v in ACT_TO_INT.items()}
+
 
 @dataclass
 class kernelInstanceGEMM1:
@@ -29,7 +32,7 @@ class kernelInstanceGEMM1:
     GemmPipelineVersion: int
     Nswizzle: bool = False
     MulRoutedWeight: bool = False
-    ActOP: bool = False
+    ActOP: int = 0
     CDEElementOp: str = "TypeCast"
     QuantType: int = 1
     stage: int = 1
@@ -59,7 +62,7 @@ class kernelInstanceGEMM1:
                 "Nswizzle" + str(int(self.Nswizzle)),
                 "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
-                "silu" if self.ActOP else "gelu",
+                INT_TO_ACT[int(self.ActOP)],
                 self.Adtype.upper(),
                 self.Bdtype.upper(),
                 self.Cdtype.upper(),
@@ -410,7 +413,7 @@ def get_gemm1_kernels_list(
     kernels_list = {k: copy.deepcopy(v) for k, v in gemm1_kernels_dict[tag].items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
-        kernel.ActOP = ActOP == "silu"
+        kernel.ActOP = ACT_TO_INT[ActOP]
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
         kernel.Adtype = Adtype

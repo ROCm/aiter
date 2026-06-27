@@ -3,7 +3,11 @@
 import os
 import argparse
 import itertools
-from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
+from gemm_moe_ck2stages_common import (
+    get_gemm1_kernels_list,
+    get_gemm2_kernels_list,
+    ACT_TO_INT,
+)
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -926,7 +930,7 @@ class ck_moe_2stage_gemm_codegen:
                             Nswizzle=str(self.nswizzle).lower(),
                             Quant=self.quant_type,
                             ActOP=(
-                                int(self.activation == "silu")
+                                ACT_TO_INT[self.activation]
                                 if kernel.stage == 1
                                 else 0
                             ),
@@ -958,7 +962,7 @@ class ck_moe_2stage_gemm_codegen:
                     CDEElementOp=kernel.CDEElementOp,
                     Nswizzle=str(self.nswizzle).lower(),
                     Quant=self.quant_type,
-                    ActOP=int(self.activation == "silu") if kernel.stage == 1 else 0,
+                    ActOP=ACT_TO_INT[self.activation] if kernel.stage == 1 else 0,
                     Stage=kernel.stage,
                     BlockSize=kernel.BLOCK_SIZE,
                     MPerBlock=kernel.MPerBlock,
@@ -989,7 +993,7 @@ class ck_moe_2stage_gemm_codegen:
                 CDEElementOp=kernel_list[0].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
                 Quant=self.quant_type,
-                ActOP=str(int(self.activation == "silu")),
+                ActOP=str(ACT_TO_INT[self.activation]),
                 MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
                 Preshuffle=str(self.preshuffle).lower(),
             )
@@ -1071,7 +1075,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu"],
+        choices=["silu", "gelu", "gelu_tanh"],
         help="select activation",
     )
 
@@ -1184,11 +1188,12 @@ if __name__ == "__main__":
             "f16",
             "b16",
         ]
+        no_quant_acts = acts + ["gelu_tanh"]
         for (
             b_dtype,
             act,
             routed_weight,
-        ) in itertools.product(b_quant_dtypes, acts, routed_weight_l):
+        ) in itertools.product(b_quant_dtypes, no_quant_acts, routed_weight_l):
             c_dtype = a_dtype = b_dtype
 
             codegen = ck_moe_2stage_gemm_codegen(
