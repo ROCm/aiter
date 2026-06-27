@@ -124,14 +124,15 @@ def select_3d_config(
     kv_cache_dtype: torch.dtype,
     shuffled_kv_cache: bool = False,
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
+    SLIDING_WINDOW: int = None,
 ):
     # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
     # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
-    if IS_DEVICE_ARCH_GFX12:
-        assert kv_cache_dtype in (
-            torch.bfloat16,
-            e4m3_dtype,
-        ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
+    assert kv_cache_dtype in (
+        torch.float16,
+        torch.bfloat16,
+        e4m3_dtype,
+    ), f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
@@ -158,11 +159,14 @@ def select_3d_config(
             # GFX12 fallback
             waves_per_eu = 1
 
-        occ = waves_per_eu * 4 // attn_warps
-        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
-        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
-        num_segments = min(MAX_SEGMENTS, num_segments)
-        num_segments = triton.next_power_of_2(num_segments)
+        if SLIDING_WINDOW is not None:
+            num_segments = 1
+        else:
+            occ = waves_per_eu * 4 // attn_warps
+            MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
+            num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
+            num_segments = min(MAX_SEGMENTS, num_segments)
+            num_segments = triton.next_power_of_2(num_segments)
 
         # # this section increases the num_warps if the occ is too high
         # total_num_wg = num_2d_prgms * num_segments
@@ -481,6 +485,7 @@ def unified_attention(
             kv_cache_dtype,
             shuffled_kv_cache,
             NUM_BLOCKS_GATHER_PER_TILE,
+            SLIDING_WINDOW,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
