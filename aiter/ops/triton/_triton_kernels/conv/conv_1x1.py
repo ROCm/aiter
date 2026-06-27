@@ -21,7 +21,7 @@ _conv2d_1x1_kernel_repr = make_kernel_repr(
     [
         "BLOCK_M",
         "BLOCK_N",
-        "BLOCK_K",
+        "BLOCK_C",
         "GROUP_SIZE_M",
         "HAS_BIAS",
         "ACTIVATION",
@@ -50,7 +50,7 @@ def _conv2d_1x1_kernel(
     M_total: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_C: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     ACTIVATION: tl.constexpr,
@@ -64,7 +64,7 @@ def _conv2d_1x1_kernel(
     LAYOUT: "nchw" or "nhwc"
     """
     # W is always [K_out, C] contiguous
-    stride_w_k: tl.constexpr = C
+    stride_w_kout: tl.constexpr = C
     stride_w_c: tl.constexpr = 1
     if LAYOUT == "nchw":
         # NCHW: X[N, C, H, W_in], Y[N, K_out, P, Q]
@@ -107,17 +107,17 @@ def _conv2d_1x1_kernel(
     # Compute output tile indices
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    # Decode (n, p, q) from linear index
-    n_idx = offs_m // (P * Q)
-    pq = offs_m % (P * Q)
-    p_idx = pq // Q
-    q_idx = pq % Q
+    offs_c = tl.arange(0, BLOCK_C)
 
     # Valid output mask
     m_mask = offs_m < M_total
-    n_mask = offs_n < K_out
+    kout_mask = offs_n < K_out
+
+    # Decode (n, p, q) from linear index
+    n_idx = offs_m[:, None] // (P * Q)
+    pq = offs_m[:, None] % (P * Q)
+    p_idx = pq // Q
+    q_idx = pq % Q
 
     ih = p_idx * stride_h - pad_h
     iw = q_idx * stride_w - pad_w
@@ -126,33 +126,31 @@ def _conv2d_1x1_kernel(
     spatial_valid = (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W_in) & (n_idx < N)
 
     # Base pointers for this output tile
-    x_base = X + n_idx * stride_x_n + ih * stride_x_h + iw * stride_x_w  # [BLOCK_M]
-    w_base = W + offs_n * stride_w_k  # [BLOCK_N]
+    x_base = X + n_idx * stride_x_n + ih * stride_x_h + iw * stride_x_w  # [BLOCK_M, 1]
+    w_base = W + offs_n[None, :] * stride_w_kout  # [1, BLOCK_N]
 
     # Accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     # Channel reduction loop
-    for k0 in range(0, C, BLOCK_K):
-        k_offs = k0 + offs_k
-        k_mask = k_offs < C
+    for c0 in range(0, C, BLOCK_C):
+        c_offs = c0 + offs_c
+        c_mask = c_offs < C
 
-        # Load input: X[n, c, ih, iw] -> shape [BLOCK_M, BLOCK_K]
-        x_ptrs = x_base[:, None] + k_offs[None, :] * stride_x_c
-        x_mask = spatial_valid[:, None] & k_mask[None, :]
-        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        # Load input: X[n, c, ih, iw] -> shape [BLOCK_M, BLOCK_C]
+        x_ptrs = x_base + c_offs[None, :] * stride_x_c
+        x_tile = tl.load(x_ptrs, mask=spatial_valid & c_mask[None, :], other=0.0)
 
-        # Load weight: W[k_out, c] -> shape [BLOCK_K, BLOCK_N]
-        w_ptrs = w_base[None, :] + k_offs[:, None] * stride_w_c
-        w_mask = k_mask[:, None] & n_mask[None, :]
-        w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)
+        # Load weight: W[k_out, c] -> shape [BLOCK_C, BLOCK_N]
+        w_ptrs = w_base + c_offs[:, None] * stride_w_c
+        w_tile = tl.load(w_ptrs, mask=c_mask[:, None] & kout_mask[None, :], other=0.0)
 
-        # Accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N]
+        # Accumulate: [BLOCK_M, BLOCK_C] @ [BLOCK_C, BLOCK_N]
         acc = tl.dot(x_tile, w_tile, acc=acc)
 
     # Bias
     if HAS_BIAS:
-        b = tl.load(BIAS + offs_n, mask=n_mask, other=0.0)
+        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0)
         acc += b[None, :]
 
     # Activation
@@ -166,49 +164,48 @@ def _conv2d_1x1_kernel(
     # Store output: Y[n, k, p, q]
     y_ptrs = (
         Y
-        + n_idx[:, None] * stride_y_n
+        + n_idx * stride_y_n
         + offs_n[None, :] * stride_y_k
-        + p_idx[:, None] * stride_y_p
-        + q_idx[:, None] * stride_y_q
+        + p_idx * stride_y_p
+        + q_idx * stride_y_q
     )
-    y_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(y_ptrs, acc, mask=y_mask)
+    tl.store(y_ptrs, acc, mask=(m_mask[:, None] & kout_mask[None, :]))
 
 
 # Autotune search space (used when AITER_TRITON_CONV_AUTOTUNE=1).
 AUTOTUNE_1x1_CONFIGS = [
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
         num_warps=8,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_C": 32, "GROUP_SIZE_M": 4},
         num_warps=8,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 32, "GROUP_SIZE_M": 4},
         num_warps=4,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
         num_warps=8,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 64, "GROUP_SIZE_M": 4},
         num_warps=4,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
         num_warps=8,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
         num_warps=4,
         num_stages=1,
     ),

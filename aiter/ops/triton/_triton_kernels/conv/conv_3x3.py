@@ -50,7 +50,7 @@ _conv2d_3x3_cblocked_kernel_repr = make_kernel_repr(
 @triton.jit(repr=_conv2d_3x3_nhwc_kernel_repr)
 def _conv2d_3x3_nhwc_kernel(
     X,
-    W3,
+    W,
     BIAS,
     Y,
     N: tl.constexpr,
@@ -81,10 +81,10 @@ def _conv2d_3x3_nhwc_kernel(
     stride_x_w: tl.constexpr = C
     stride_x_h: tl.constexpr = W_in * C
     stride_x_n: tl.constexpr = H * W_in * C
-    # W3 layout: [K_out, 9, C_pad] contiguous
-    stride_w3_c: tl.constexpr = 1
-    stride_w3_rs: tl.constexpr = C_pad
-    stride_w3_kout: tl.constexpr = 9 * C_pad
+    # W layout: [K_out, 9, C_pad] contiguous
+    stride_w_c: tl.constexpr = 1
+    stride_w_rs: tl.constexpr = C_pad
+    stride_w_kout: tl.constexpr = 9 * C_pad
     # Y layout: [N, P, Q, K_out] contiguous NHWC (stride_y_k=1 hardcoded in store logic)
     stride_y_q: tl.constexpr = K_out
     stride_y_p: tl.constexpr = Q * K_out
@@ -107,7 +107,9 @@ def _conv2d_3x3_nhwc_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_c = tl.arange(0, BLOCK_C)
 
+    m_mask = offs_m < M_total
     kout_mask = offs_n < K_out
 
     # Decode (n, p, q) from linear index
@@ -118,43 +120,37 @@ def _conv2d_3x3_nhwc_kernel(
     n_valid = n_idx < N
 
     # Precompute base positions
-    base_oh = p_idx * stride_h - pad_h
-    base_ow = q_idx * stride_w - pad_w
-    stride_dh = dil_h * stride_x_h
-    stride_dw = dil_w * stride_x_w
-    x_base = X + n_idx * stride_x_n + base_oh * stride_x_h + base_ow * stride_x_w
+    base_ih = p_idx * stride_h - pad_h
+    base_iw = q_idx * stride_w - pad_w
+    stride_x_dh = dil_h * stride_x_h
+    stride_x_dw = dil_w * stride_x_w
 
-    # Weight base: W3[K_out, 9, C_pad]
-    w_base = W3 + offs_n[None, :] * stride_w3_kout
+    x_base = X + n_idx * stride_x_n + base_ih * stride_x_h + base_iw * stride_x_w
 
-    Y_ptrs = (
-        Y
-        + n_idx * stride_y_n
-        + offs_n[None, :]
-        + p_idx * stride_y_p
-        + q_idx * stride_y_q
-    )
+    # Weight base: W[K_out, 9, C_pad]
+    w_base = W + offs_n[None, :] * stride_w_kout
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    offs_c = tl.arange(0, BLOCK_C)
 
     for r in tl.static_range(3):
-        oh = base_oh + r * dil_h
-        valid_oh = n_valid & (oh >= 0) & (oh < H)
-        x_off_r = r * stride_dh
+        ih = base_ih + r * dil_h
+        valid_ih = n_valid & (ih >= 0) & (ih < H)
+        x_off_r = r * stride_x_dh
         for s in tl.static_range(3):
             rs_idx = r * 3 + s
-            ow = base_ow + s * dil_w
-            valid = valid_oh & (ow >= 0) & (ow < W_in)
+            iw = base_iw + s * dil_w
+            spatial_valid = valid_ih & (iw >= 0) & (iw < W_in)
 
             for c0 in range(0, C_pad, BLOCK_C):
                 c_offs = c0 + offs_c
                 c_mask = c_offs < C
 
-                x_ptrs = x_base + c_offs[None, :] + x_off_r + s * stride_dw
-                w_ptrs = w_base + rs_idx * stride_w3_rs + c_offs[:, None] * stride_w3_c
+                x_ptrs = x_base + c_offs[None, :] + x_off_r + s * stride_x_dw
+                w_ptrs = w_base + rs_idx * stride_w_rs + c_offs[:, None] * stride_w_c
 
-                x_tile = tl.load(x_ptrs, mask=valid & c_mask[None, :], other=0.0)
+                x_tile = tl.load(
+                    x_ptrs, mask=spatial_valid & c_mask[None, :], other=0.0
+                )
                 w_tile = tl.load(
                     w_ptrs, mask=c_mask[:, None] & kout_mask[None, :], other=0.0
                 )
@@ -172,17 +168,20 @@ def _conv2d_3x3_nhwc_kernel(
     elif ACTIVATION == "gelu":
         acc = _gelu_tanh(acc)
 
-    tl.store(
-        Y_ptrs,
-        acc,
-        mask=(n_valid & (p_idx < P) & (q_idx < Q) & kout_mask[None, :]),
+    y_ptrs = (
+        Y
+        + n_idx * stride_y_n
+        + offs_n[None, :]
+        + p_idx * stride_y_p
+        + q_idx * stride_y_q
     )
+    tl.store(y_ptrs, acc, mask=(m_mask[:, None] & kout_mask[None, :]))
 
 
 @triton.jit(repr=_conv2d_3x3_cblocked_kernel_repr)
 def _conv2d_3x3_cblocked_kernel(
     X,
-    W3,
+    W,
     BIAS,
     Y,
     N: tl.constexpr,
@@ -209,16 +208,17 @@ def _conv2d_3x3_cblocked_kernel(
     ACTIVATION: tl.constexpr,
 ):
     """Specialized 3x3 kernel for channel-blocked [N, C_blocks, H, W, Cb] input.
-    stride_c_local=1 is hardcoded so the compiler emits coalesced vector loads."""
+    stride_x_cb=1 is hardcoded so the compiler emits coalesced vector loads."""
     # X layout: [N, C_blocks, H, W_in, Cb] where C_blocks = C_pad // Cb
+    stride_x_cb: tl.constexpr = 1
     stride_x_w: tl.constexpr = Cb
     stride_x_h: tl.constexpr = W_in * Cb
     stride_x_cblock: tl.constexpr = H * W_in * Cb
     stride_x_n: tl.constexpr = (C_pad // Cb) * H * W_in * Cb
-    # W3 layout: [K_out, 9, C_pad] contiguous
-    stride_w3_c: tl.constexpr = 1
-    stride_w3_rs: tl.constexpr = C_pad
-    stride_w3_kout: tl.constexpr = 9 * C_pad
+    # W layout: [K_out, 9, C_pad] contiguous
+    stride_w_c: tl.constexpr = 1
+    stride_w_rs: tl.constexpr = C_pad
+    stride_w_kout: tl.constexpr = 9 * C_pad
     # Y layout: [N, K_out, P, Q] contiguous NCHW
     stride_y_q: tl.constexpr = 1
     stride_y_p: tl.constexpr = Q
@@ -242,7 +242,10 @@ def _conv2d_3x3_cblocked_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_c = tl.arange(0, BLOCK_C)
 
+    # Valid output mask
+    m_mask = offs_m < M_total
     kout_mask = offs_n < K_out
 
     # Decode (n, p, q) from linear index
@@ -253,38 +256,28 @@ def _conv2d_3x3_cblocked_kernel(
     n_valid = n_idx < N
 
     # Precompute base positions
-    base_oh = p_idx * stride_h - pad_h
-    base_ow = q_idx * stride_w - pad_w
-    stride_dh = dil_h * stride_x_h
-    stride_dw = dil_w * stride_x_w
+    base_ih = p_idx * stride_h - pad_h
+    base_iw = q_idx * stride_w - pad_w
+    stride_x_dh = dil_h * stride_x_h
+    stride_x_dw = dil_w * stride_x_w
 
     # x_base for channel-blocked layout: X[n, cblock, h, w, c_local]
     # base pointer accounts for n, h, w
-    x_base = X + n_idx * stride_x_n + base_oh * stride_x_h + base_ow * stride_x_w
+    x_base = X + n_idx * stride_x_n + base_ih * stride_x_h + base_iw * stride_x_w
 
-    # Weight base: W3[K_out, 9, C_pad]
-    w_base = W3 + offs_n[None, :] * stride_w3_kout
-
-    # Y pointers
-    Y_ptrs = (
-        Y
-        + n_idx * stride_y_n
-        + offs_n[None, :] * stride_y_k
-        + p_idx * stride_y_p
-        + q_idx * stride_y_q
-    )
+    # Weight base: W[K_out, 9, C_pad]
+    w_base = W + offs_n[None, :] * stride_w_kout
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    offs_c = tl.arange(0, BLOCK_C)
 
     for r in tl.static_range(3):
-        oh = base_oh + r * dil_h
-        valid_oh = n_valid & (oh >= 0) & (oh < H)
-        x_off_r = r * stride_dh
+        ih = base_ih + r * dil_h
+        valid_ih = n_valid & (ih >= 0) & (ih < H)
+        x_off_r = r * stride_x_dh
         for s in tl.static_range(3):
             rs_idx = r * 3 + s
-            ow = base_ow + s * dil_w
-            valid = valid_oh & (ow >= 0) & (ow < W_in)
+            iw = base_iw + s * dil_w
+            spatial_valid = valid_ih & (iw >= 0) & (iw < W_in)
 
             for c0 in range(0, C_pad, BLOCK_C):
                 c_offs = c0 + offs_c
@@ -297,13 +290,15 @@ def _conv2d_3x3_cblocked_kernel(
                 x_ptrs = (
                     x_base
                     + cblock_idx[None, :] * stride_x_cblock
-                    + c_local[None, :]
+                    + c_local[None, :] * stride_x_cb
                     + x_off_r
-                    + s * stride_dw
+                    + s * stride_x_dw
                 )
-                w_ptrs = w_base + rs_idx * stride_w3_rs + c_offs[:, None] * stride_w3_c
+                w_ptrs = w_base + rs_idx * stride_w_rs + c_offs[:, None] * stride_w_c
 
-                x_tile = tl.load(x_ptrs, mask=valid & c_mask[None, :], other=0.0)
+                x_tile = tl.load(
+                    x_ptrs, mask=spatial_valid & c_mask[None, :], other=0.0
+                )
                 w_tile = tl.load(
                     w_ptrs, mask=c_mask[:, None] & kout_mask[None, :], other=0.0
                 )
@@ -321,11 +316,14 @@ def _conv2d_3x3_cblocked_kernel(
     elif ACTIVATION == "gelu":
         acc = _gelu_tanh(acc)
 
-    tl.store(
-        Y_ptrs,
-        acc,
-        mask=(n_valid & (p_idx < P) & (q_idx < Q) & kout_mask[None, :]),
+    y_ptrs = (
+        Y
+        + n_idx * stride_y_n
+        + offs_n[None, :] * stride_y_k
+        + p_idx * stride_y_p
+        + q_idx * stride_y_q
     )
+    tl.store(y_ptrs, acc, mask=(m_mask[:, None] & kout_mask[None, :]))
 
 
 # Autotune search spaces (used when AITER_TRITON_CONV_AUTOTUNE=1).
