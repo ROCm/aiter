@@ -2,12 +2,12 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 /**
- * @file test_tcopy_gfx1250.cu
- * @brief Device test for opus::tcopy_window with 2-slot LDS ping-pong on gfx1250.
+ * @file test_tdm_gfx1250.cu
+ * @brief Device test for opus::tdm_window with 2-slot LDS ping-pong on gfx1250.
  *
- * Kernel: 32x64xK WMMA GEMM driven by tcopy_window K-step.
+ * Kernel: 32x64xK WMMA GEMM driven by tdm_window K-step.
  *   - 2-WG cluster (cluster_dims(2,1,1)); A multicast via SelectedWgs=<0,1>.
- *   - 4 producer waves load A/B tiles to LDS using tcopy_window::move() over K.
+ *   - 4 producer waves load A/B tiles to LDS using tdm_window::move() over K.
  *   - 4 consumer waves accumulate v_c via wmma_f16_16x16x32_f16.
  *   - LDS is double-buffered (2-deep ping-pong); s_wait_tensorcnt(1) keeps the
  *     prefetch in flight while the current tile is consumed.
@@ -26,7 +26,7 @@
 union Fp16x16Packer { opus::fp16x16_t vec16; opus::fp16x8_t vec8[2]; };
 
 __global__ __launch_bounds__(256, 2) __cluster_dims__(2, 1, 1)
-void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
+void tdm_gfx1250_kernel(const void* __restrict__ ptr_a,
                           const void* __restrict__ ptr_b,
                           void* __restrict__       ptr_c,
                           int stride_a,
@@ -39,13 +39,13 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
     constexpr int     Block_K              = 128;
     constexpr int     Block_M              = 32;
     constexpr int     Block_N              = 32;
-    constexpr int32_t consumerSubWarpNum   = 4;
+    constexpr int consumerSubWarpNum   = 4;
     DECLARE_NAMED_BARRIERS();
 
     const int      wave_id                = static_cast<int>(waveid_in_workgroup());
     const int      sub_consumer_wave_id   = wave_id % 4;
-    const uint32_t cluster_workgroup_id_x = __builtin_amdgcn_cluster_workgroup_id_x();
-    const int32_t  c_cluster_offset_elems = static_cast<int32_t>(cluster_workgroup_id_x) * Block_N;
+    const unsigned int cluster_workgroup_id_x = __builtin_amdgcn_cluster_workgroup_id_x();
+    const int  c_cluster_offset_elems = static_cast<int>(cluster_workgroup_id_x) * Block_N;
 
     const int K_STEPS = (stride_a + Block_K - 1) / Block_K;
 
@@ -56,17 +56,17 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
     constexpr int num_slots       = 2;
 
     __shared__ char Smem[num_slots * slot_pair_bytes];
-    const uintptr_t smembase = reinterpret_cast<uintptr_t>(Smem);
+    const __UINTPTR_TYPE__ smembase = reinterpret_cast<__UINTPTR_TYPE__>(Smem);
 
     using NoSelectedWgs = seq<>;
-    using WinB = tcopy_window<fp16_t, Block_K, 16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 5, 3, NoSelectedWgs>;
+    using WinB = tdm_window<fp16_t, Block_K, 16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 5, 3, NoSelectedWgs>;
     using SelectedWgs   = seq<0, 1>;
-    using WinA = tcopy_window<fp16_t, Block_K, 16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 1, 5, 3, SelectedWgs>;
+    using WinA = tdm_window<fp16_t, Block_K, 16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 1, 5, 3, SelectedWgs>;
 
     // dlds(ks): alternating ±slot_pair_bytes for ping-pong slot toggle.
-    const auto dlds = [&](int ks) -> intptr_t {
-        return (ks & 1) ? +static_cast<intptr_t>(slot_pair_bytes)
-                        : -static_cast<intptr_t>(slot_pair_bytes);
+    const auto dlds = [&](int ks) -> __INTPTR_TYPE__ {
+        return (ks & 1) ? +static_cast<__INTPTR_TYPE__>(slot_pair_bytes)
+                        : -static_cast<__INTPTR_TYPE__>(slot_pair_bytes);
     };
 
     // ────────────────────────────── producers ──────────────────────────────
@@ -76,12 +76,12 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
             sync_workgroup();
 
             WinA win_a;
-            const uintptr_t wave_lds_off = static_cast<uintptr_t>(wave_id) * 16 * (Block_K + 8) * sizeof(fp16_t);
+            const __UINTPTR_TYPE__ wave_lds_off = static_cast<__UINTPTR_TYPE__>(wave_id) * 16 * (Block_K + 8) * sizeof(fp16_t);
             win_a.make(smembase, ptr_a, wave_lds_off,
-                       static_cast<uint32_t>(stride_a),
-                       static_cast<uint32_t>(Block_M - wave_id * 16),
-                       static_cast<uint64_t>(stride_a),
-                       0, static_cast<uint32_t>(wave_id * 16));
+                       static_cast<unsigned int>(stride_a),
+                       static_cast<unsigned int>(Block_M - wave_id * 16),
+                       static_cast<unsigned long long>(stride_a),
+                       0, static_cast<unsigned int>(wave_id * 16));
 
             win_a.load_to_lds();
             if (K_STEPS > 1) {
@@ -108,13 +108,13 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
             sync_workgroup();
 
             WinB win_b;
-            const uintptr_t wave_lds_off = static_cast<uintptr_t>(wave_id - 2) * 16 * (Block_K + 8) * sizeof(fp16_t);
-            const uint32_t  b_origin1    = static_cast<uint32_t>(cluster_workgroup_id_x * Block_N + (wave_id - 2) * 16);
+            const __UINTPTR_TYPE__ wave_lds_off = static_cast<__UINTPTR_TYPE__>(wave_id - 2) * 16 * (Block_K + 8) * sizeof(fp16_t);
+            const unsigned int  b_origin1    = static_cast<unsigned int>(cluster_workgroup_id_x * Block_N + (wave_id - 2) * 16);
 
             win_b.make(smembase + slot_bytes_A, ptr_b, wave_lds_off,
-                       static_cast<uint32_t>(stride_b),
-                       static_cast<uint32_t>(Block_N - (wave_id - 2) * 16),
-                       static_cast<uint64_t>(stride_b),
+                       static_cast<unsigned int>(stride_b),
+                       static_cast<unsigned int>(Block_N - (wave_id - 2) * 16),
+                       static_cast<unsigned long long>(stride_b),
                        0, b_origin1);
 
             win_b.load_to_lds();
@@ -145,36 +145,36 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
         s_barrier_init_ptr(&__nbar_2, 4);
         sync_workgroup();
 
-        constexpr int32_t AKSldPack    = 16 / static_cast<int32_t>(sizeof(fp16_t));
-        constexpr int32_t AKSldLane    = 16 / AKSldPack;
-        constexpr int32_t AMSldLane    = get_warp_size() / AKSldLane;
-        constexpr int32_t AMSldRepeat  = Block_M / (AMSldLane * consumerSubWarpNum / 2);
-        constexpr int32_t AKSldRepeat  = Block_K / (AKSldPack * AKSldLane);
+        constexpr int AKSldPack    = 16 / static_cast<int>(sizeof(fp16_t));
+        constexpr int AKSldLane    = 16 / AKSldPack;
+        constexpr int AMSldLane    = get_warp_size() / AKSldLane;
+        constexpr int AMSldRepeat  = Block_M / (AMSldLane * consumerSubWarpNum / 2);
+        constexpr int AKSldRepeat  = Block_K / (AKSldPack * AKSldLane);
         static_assert(AKSldLane * AMSldLane == get_warp_size(), "A sld lane product");
-        constexpr int32_t SMemKPitch   = Block_K + 8;
+        constexpr int SMemKPitch   = Block_K + 8;
 
         auto block_sld_shape_a  = make_tuple(number<AMSldRepeat>{}, number<consumerSubWarpNum / 2>{}, number<AKSldRepeat>{}, number<AKSldLane>{}, number<AMSldLane>{}, number<AKSldPack>{});
         auto block_sld_stride_a = make_tuple(AMSldLane * SMemKPitch * consumerSubWarpNum / 2, AMSldLane * SMemKPitch, AKSldPack * AKSldLane, AKSldPack, SMemKPitch, 1_I);
         auto block_sld_win_a    = make_layout<0>(block_sld_shape_a, block_sld_stride_a);
 
-        constexpr int32_t BSldKPack   = 16 / static_cast<int32_t>(sizeof(fp16_t));
-        constexpr int32_t BSldKLane   = 16 / BSldKPack;
-        constexpr int32_t BSldNLane   = get_warp_size() / BSldKLane;
-        constexpr int32_t BSldNRepeat = Block_N / (BSldNLane * consumerSubWarpNum / 2);
-        constexpr int32_t BSldKRepeat = Block_K / (BSldKPack * BSldKLane);
+        constexpr int BSldKPack   = 16 / static_cast<int>(sizeof(fp16_t));
+        constexpr int BSldKLane   = 16 / BSldKPack;
+        constexpr int BSldNLane   = get_warp_size() / BSldKLane;
+        constexpr int BSldNRepeat = Block_N / (BSldNLane * consumerSubWarpNum / 2);
+        constexpr int BSldKRepeat = Block_K / (BSldKPack * BSldKLane);
         static_assert(BSldKLane * BSldNLane == get_warp_size(), "B sld lane product");
 
         auto block_sld_shape_b  = make_tuple(number<BSldNRepeat>{}, number<consumerSubWarpNum / 2>{}, number<BSldKRepeat>{}, number<BSldKLane>{}, number<BSldNLane>{}, number<BSldKPack>{});
         auto block_sld_stride_b = make_tuple(BSldNLane * SMemKPitch * consumerSubWarpNum / 2, BSldNLane * SMemKPitch, BSldKPack * BSldKLane, BSldKPack, SMemKPitch, 1_I);
         auto block_sld_win_b    = make_layout<0>(block_sld_shape_b, block_sld_stride_b);
 
-        const int32_t sub_consumer_wave_m = sub_consumer_wave_id / 2;
-        const int32_t sub_consumer_wave_n = sub_consumer_wave_id % 2;
-        const int32_t lid                 = static_cast<int32_t>(lane_id());
-        const int32_t a_lane_m            = lid / AMSldLane;
-        const int32_t a_lane_n            = lid % AMSldLane;
-        const int32_t b_lane_m            = lid / BSldNLane;
-        const int32_t b_lane_n            = lid % BSldNLane;
+        const int sub_consumer_wave_m = sub_consumer_wave_id / 2;
+        const int sub_consumer_wave_n = sub_consumer_wave_id % 2;
+        const int lid                 = static_cast<int>(lane_id());
+        const int a_lane_m            = lid / AMSldLane;
+        const int a_lane_n            = lid % AMSldLane;
+        const int b_lane_m            = lid / BSldNLane;
+        const int b_lane_n            = lid % BSldNLane;
 
         fp16x8_t v_c = {.0f};
 
@@ -186,21 +186,21 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
             s_barrier_join_ptr(&__nbar_1);
             __builtin_amdgcn_s_barrier_wait(1);
 
-            const int32_t slot_offset = (ks & 1) * slot_pair_bytes;
+            const int slot_offset = (ks & 1) * slot_pair_bytes;
 
             #pragma unroll
             for (int kt = 0; kt < K_WmmaTiles; ++kt) {
-                const int32_t kr0 = 2 * kt;
-                const int32_t kr1 = kr0 + 1;
+                const int kr0 = 2 * kt;
+                const int kr1 = kr0 + 1;
 
-                const int32_t a_sld_os0 = slot_offset
-                    + block_sld_win_a(0_I, sub_consumer_wave_m, kr0, a_lane_m, a_lane_n, 0_I) * static_cast<int32_t>(sizeof(fp16_t));
-                const int32_t a_sld_os1 = slot_offset
-                    + block_sld_win_a(0_I, sub_consumer_wave_m, kr1, a_lane_m, a_lane_n, 0_I) * static_cast<int32_t>(sizeof(fp16_t));
-                const int32_t b_sld_os0 = slot_offset + slot_bytes_A
-                    + block_sld_win_b(0_I, sub_consumer_wave_n, kr0, b_lane_m, b_lane_n, 0_I) * static_cast<int32_t>(sizeof(fp16_t));
-                const int32_t b_sld_os1 = slot_offset + slot_bytes_A
-                    + block_sld_win_b(0_I, sub_consumer_wave_n, kr1, b_lane_m, b_lane_n, 0_I) * static_cast<int32_t>(sizeof(fp16_t));
+                const int a_sld_os0 = slot_offset
+                    + block_sld_win_a(0_I, sub_consumer_wave_m, kr0, a_lane_m, a_lane_n, 0_I) * static_cast<int>(sizeof(fp16_t));
+                const int a_sld_os1 = slot_offset
+                    + block_sld_win_a(0_I, sub_consumer_wave_m, kr1, a_lane_m, a_lane_n, 0_I) * static_cast<int>(sizeof(fp16_t));
+                const int b_sld_os0 = slot_offset + slot_bytes_A
+                    + block_sld_win_b(0_I, sub_consumer_wave_n, kr0, b_lane_m, b_lane_n, 0_I) * static_cast<int>(sizeof(fp16_t));
+                const int b_sld_os1 = slot_offset + slot_bytes_A
+                    + block_sld_win_b(0_I, sub_consumer_wave_n, kr1, b_lane_m, b_lane_n, 0_I) * static_cast<int>(sizeof(fp16_t));
 
                 fp16x8_t sld_a0, sld_a1, sld_b0, sld_b1;
                 asm volatile(
@@ -228,21 +228,21 @@ void tcopy_gfx1250_kernel(const void* __restrict__ ptr_a,
         }
 
         // C store (gfx942-style, adapted for RDNA4 wave32 WMMA).
-        constexpr int32_t CGstNPack = 8;
-        constexpr int32_t CGstNLane = 2;
-        constexpr int32_t CGstMLane = 16;
+        constexpr int CGstNPack = 8;
+        constexpr int CGstNLane = 2;
+        constexpr int CGstMLane = 16;
 
         auto block_gmem_gst_shape_c  = make_tuple(number<consumerSubWarpNum / 2>{}, number<consumerSubWarpNum / 2>{}, number<CGstNLane>{}, number<CGstMLane>{}, number<CGstNPack>{});
         auto block_gmem_gst_stride_c = make_tuple(CGstMLane * stride_c, CGstNPack * CGstNLane, CGstNPack, stride_c, 1_I);
         auto block_gmem_gst_win_c    = make_layout<0>(block_gmem_gst_shape_c, block_gmem_gst_stride_c);
 
-        int32_t c_offset_elem = block_gmem_gst_win_c(sub_consumer_wave_m, sub_consumer_wave_n, lid / 16, lid % 16, 0_I) + c_cluster_offset_elems;
+        int c_offset_elem = block_gmem_gst_win_c(sub_consumer_wave_m, sub_consumer_wave_n, lid / 16, lid % 16, 0_I) + c_cluster_offset_elems;
         *(reinterpret_cast<fp16x8_t*>(reinterpret_cast<fp16_t*>(ptr_c) + c_offset_elem)) = v_c;
     }
 }
 
 #else  // !__gfx1250__
-__global__ void tcopy_gfx1250_kernel(const void*, const void*, void*, int, int, int) {}
+__global__ void tdm_gfx1250_kernel(const void*, const void*, void*, int, int, int) {}
 #endif // __gfx1250__
 
 #else
@@ -258,13 +258,13 @@ __global__ void tcopy_gfx1250_kernel(const void*, const void*, void*, int, int, 
     } \
 } while(0)
 
-__global__ void tcopy_gfx1250_kernel(const void*, const void*, void*, int, int, int) {}
+__global__ void tdm_gfx1250_kernel(const void*, const void*, void*, int, int, int) {}
 
-extern "C" void run_tcopy_gfx1250(const void* d_a, const void* d_b, void* d_c,
+extern "C" void run_tdm_gfx1250(const void* d_a, const void* d_b, void* d_c,
                                   int stride_a, int stride_b, int stride_c)
 {
     // 2 WGs forming a cluster (cluster_dims(2,1,1)); each WG has 256 threads = 8 waves.
-    hipLaunchKernelGGL(tcopy_gfx1250_kernel,
+    hipLaunchKernelGGL(tdm_gfx1250_kernel,
                        dim3(2, 1, 1), dim3(256), 0, 0,
                        d_a, d_b, d_c, stride_a, stride_b, stride_c);
     HIP_CALL(hipGetLastError());

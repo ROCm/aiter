@@ -163,7 +163,7 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static_assert(kTileM * kTileN == kNumConsumerWaves,
                   "consumer waves must equal kTileM*kTileN");
 
-    // ── TDM / tcopy_window pad parameters (all B_K-derived) ──────────────────
+    // ── TDM / tdm_window pad parameters (all B_K-derived) ──────────────────
     // One +kPadElems(=8) bf16 pad per B_K row -> conflict-free 16-row b128 reads.
     // PadInterval is the DWORD interval that yields exactly one pad per row:
     //   row = B_K bf16 = B_K/2 DWORD; pad every 2^(PadInterval+1) DWORD ->
@@ -262,12 +262,12 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int kSchedWmmaCount = kExpM * kExpN * kExpKHalf;
 
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
-    // tcopy_window types live only where tcopy_window is available (gfx1250
+    // tdm_window types live only where tdm_window is available (gfx1250
     // device pass + host pass). Non-gfx1250 device passes never reference them.
-    using WindowA = opus::tcopy_window<DataA, kTdmK, kARows, 0, 0, 0,
+    using WindowA = opus::tdm_window<DataA, kTdmK, kARows, 0, 0, 0,
                                        1, 0, 0, 0, 1, 0, 0, 0, 0,
                                        kLdsPadEn, kPadInterval, kPadAmount, opus::seq<>>;
-    using WindowB = opus::tcopy_window<DataB, kTdmK, kBRows, 0, 0, 0,
+    using WindowB = opus::tdm_window<DataB, kTdmK, kBRows, 0, 0, 0,
                                        1, 0, 0, 0, 1, 0, 0, 0, 0,
                                        kLdsPadEn, kPadInterval, kPadAmount, opus::seq<>>;
 #endif

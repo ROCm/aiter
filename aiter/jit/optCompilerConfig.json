@@ -314,7 +314,7 @@
         "flags_extra_cc": [],
   "flags_extra_hip": [
    "'-mllvm --amdgpu-mfma-vgpr-form'",
-   "(('-DOPUS_TCOPY_BUILTIN_HAS_SG_EXTRA=1' if (os.environ.get('OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA') == '1' or (os.environ.get('OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA') is None and parse(get_hip_version().split()[-1].rstrip('-').replace('-', '+')) > Version('7.13'))) else '') if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
+   "(('-DOPUS_TDM_BUILTIN_HAS_SG_EXTRA=1' if (os.environ.get('OPUS_TDM_BUILTIN_HAS_SG_EXTRA') == '1' or (os.environ.get('OPUS_TDM_BUILTIN_HAS_SG_EXTRA') is None and parse(get_hip_version().split()[-1].rstrip('-').replace('-', '+')) > Version('7.13'))) else '') if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
    "('-mllvm -amdgpu-expert-scheduling-mode' if ((get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) and os.environ.get('OPUS_NO_EXPERT_SCHED', '0') != '1') else '')",
    "('-mllvm -enable-post-misched=1' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')"
   ],

@@ -340,14 +340,14 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
             w.make(reinterpret_cast<uintptr_t>(smem_a), kargs.ptr_a, 0,
                    k_extent, (uint32_t)row_extent_a, (uint64_t)stride_a,
                    (uint32_t)gk0, (uint32_t)tile_row);
-            w.desc.set_workgroup_mask(mask_a);   // single-WG mask (popcount<=1) -> 0 (no multicast)
+            w.desc.set_workgroup_mask(mask_a);   // <=1-WG mask -> 0 -> multicast off; multi-WG mask kept for fan-out
             produce(w, slot_a_b, opus::number<1 + T::kNumSlots>{});       // FREE_A
         } else {  // wave_id == 1 -> B
             WindowB w;
             w.make(reinterpret_cast<uintptr_t>(smem_b), kargs.ptr_b, 0,
                    k_extent, (uint32_t)row_extent_b, (uint64_t)stride_b,
                    (uint32_t)gk0, (uint32_t)tile_col);
-            w.desc.set_workgroup_mask(mask_b);   // single-WG mask (popcount<=1) -> 0 (no multicast)
+            w.desc.set_workgroup_mask(mask_b);   // <=1-WG mask -> 0 -> multicast off; multi-WG mask kept for fan-out
             produce(w, slot_b_b, opus::number<1 + 2 * T::kNumSlots>{});   // FREE_B
         }
         // Producer epilogue: rendezvous with the consumers at a workgroup barrier

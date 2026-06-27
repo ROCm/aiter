@@ -39,7 +39,7 @@ _CU_SOURCES = [
     "test_mdiv.cu",
     "test_numeric_limits.cu",
     "test_workgroup_barrier.cu",
-    "test_tcopy_gfx1250.cu",
+    "test_tdm_gfx1250.cu",
     "test_finfo.cu",
     "test_opus_gmem_gfx1201.cu",
     "test_wmma_gfx1201.cu",

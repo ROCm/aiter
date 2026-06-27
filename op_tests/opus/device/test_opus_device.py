@@ -365,9 +365,9 @@ class OpusDeviceLib:
         fn.argtypes = [_VP, _VP, _VP, _I]
         fn(self._ptr(Input), self._ptr(Workspace), self._ptr(Result), int(n_chunks))
 
-    # -- tcopy_window 2-slot GEMM (gfx1250) --
-    def run_tcopy_gfx1250(self, A, B, C, stride_a, stride_b, stride_c):
-        fn = self._lib.run_tcopy_gfx1250
+    # -- tdm_window 2-slot GEMM (gfx1250) --
+    def run_tdm_gfx1250(self, A, B, C, stride_a, stride_b, stride_c):
+        fn = self._lib.run_tdm_gfx1250
         fn.restype = None
         fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
         fn(
@@ -2645,16 +2645,16 @@ def test_wb_streamk_reduce(mod):
     return 0
 
 
-def test_tcopy_gfx1250(mod):
-    """Test opus::tcopy_window 2-slot ping-pong GEMM (gfx1250 only).
+def test_tdm_gfx1250(mod):
+    """Test opus::tdm_window 2-slot ping-pong GEMM (gfx1250 only).
 
     Kernel is specialized for M=32, N=64 and K = positive multiple of 128.
     Threshold scales with K (fp16 accumulation noise grows ~linearly).
     """
     if _get_gpu_arch() not in {"gfx1250"}:
-        print("  SKIP: test_tcopy_gfx1250 (gfx1250 only)")
+        print("  SKIP: test_tdm_gfx1250 (gfx1250 only)")
         return 0
-    if _skip_if_missing_symbol(mod, "run_tcopy_gfx1250", "test_tcopy_gfx1250"):
+    if _skip_if_missing_symbol(mod, "run_tdm_gfx1250", "test_tdm_gfx1250"):
         return 0
 
     device = torch.device("cuda")
@@ -2673,7 +2673,7 @@ def test_tcopy_gfx1250(mod):
         b = b_fp32.to(torch.float16)
         c = torch.empty(M, N, device=device, dtype=torch.float16)
 
-        mod.run_tcopy_gfx1250(a, b, c, stride_a=K, stride_b=K, stride_c=N)
+        mod.run_tdm_gfx1250(a, b, c, stride_a=K, stride_b=K, stride_c=N)
 
         # Reference: C = A @ B^T (B is row-major NxK -> use transpose).
         ref = (a_fp32 @ b_fp32.t()).to(torch.float16).to(torch.float32)
@@ -2682,12 +2682,12 @@ def test_tcopy_gfx1250(mod):
         threshold = max(1e-2, 5e-5 * K)
         if max_abs > threshold:
             print(
-                f"  FAIL: tcopy_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})"
+                f"  FAIL: tdm_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})"
             )
             failures += 1
         else:
             print(
-                f"  PASS: tcopy_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})"
+                f"  PASS: tdm_move_2slot K={K} max_abs={max_abs:.4f} (thr={threshold:.4f})"
             )
     return failures
 
@@ -2791,7 +2791,7 @@ def main():
     failures += test_mdiv(mod)
     failures += test_wb_cumulative(mod)
     failures += test_wb_streamk_reduce(mod)
-    failures += test_tcopy_gfx1250(mod)
+    failures += test_tdm_gfx1250(mod)
 
     if failures:
         print(f"\n{failures} test(s) FAILED")

@@ -12,7 +12,6 @@
 // clang-format off
 #include <type_traits>
 #include <utility>
-#include <cstdint>
 
 #ifndef OPUS_ENABLE_RUNTIME_QUERY
 #define OPUS_ENABLE_RUNTIME_QUERY 0
@@ -1648,7 +1647,7 @@ OPUS_D unsigned int waveid_in_workgroup() { unsigned int wave_id; asm volatile("
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_14; \
     __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15; 
 
-OPUS_D void s_barrier_init_ptr(__amdgpu_named_workgroup_barrier_t* bar, uint32_t member_cnt) { __builtin_amdgcn_s_barrier_init(bar, member_cnt); }
+OPUS_D void s_barrier_init_ptr(__amdgpu_named_workgroup_barrier_t* bar, unsigned int member_cnt) { __builtin_amdgcn_s_barrier_init(bar, member_cnt); }
 OPUS_D void s_barrier_join_ptr(__amdgpu_named_workgroup_barrier_t* bar)                      { __builtin_amdgcn_s_barrier_join(bar); }
 OPUS_D void sync_cluster()   { __builtin_amdgcn_s_barrier_signal(-3); __builtin_amdgcn_s_barrier_wait(-3); }
 OPUS_D void sync_workgroup() { __builtin_amdgcn_s_barrier_signal(-1); __builtin_amdgcn_s_barrier_wait(-1); }
@@ -1720,28 +1719,18 @@ OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned in
 #define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 0
 #endif
 
-// v2bf16 buffer atomic-add has NO clang builtin (only global/flat/ds, never raw_(ptr_)buffer); bind the LLVM IR int_amdgcn_raw_buffer_atomic_fadd (".v2bf16" suffix = <2 x bfloat>) via __asm. rsrc is the i32x4 form (memcpy'd; __amdgpu_buffer_rsrc_t non-copyable).
+// No clang builtin for these (only global/flat/ds, never raw_(ptr_)buffer), so each binds the LLVM IR int_amdgcn_raw_buffer_atomic_* via __asm under one -Wundefined-inline silence; rsrc is the i32x4 form (memcpy'd, non-copyable): fadd.v2bf16=packed bf16 add, cmpswap.i32=32-bit CAS (emulates pk fadd where unsupported), add.i32=i32 add (aux drives returning-bit+scope).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
 #if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wundefined-inline"
 OPUS_D bf16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(bf16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2bf16");
-#pragma clang diagnostic pop
 #endif
-
-// buffer atomic cmpswap has NO clang builtin — only the LLVM IR int_amdgcn_raw_buffer_atomic_cmpswap (".i32" = 32-bit), bound via __asm. Used to emulate packed fadd on archs without native pk_add (read-modify-CAS loop on the 32-bit word). Returns the old in-memory value (i32).
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wundefined-inline"
 OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(i32_t src, i32_t cmp, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.cmpswap.i32");
-#pragma clang diagnostic pop
-
-// raw buffer atomic add i32 via the LLVM IR intrinsic (__asm, like cmpswap/v2bf16) not the raw_ptr builtin, so aux fully controls the returning-bit + scope. Returns pre-op value; rsrc is the i32x4 form.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wundefined-inline"
 OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_add_i32(i32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i32");
 #pragma clang diagnostic pop
 
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
-enum class atomic_scope : uint8_t { cu=0, se=1, dev=2, sys=3 };   // VMEM cache scope[4:3] for atomics
+enum class atomic_scope : unsigned char { cu=0, se=1, dev=2, sys=3 };   // VMEM cache scope[4:3] for atomics
 // RMW-atomic cpol (NOT make_cpol's load hints): TH[0]=returning (1=>returns pre-op value, tracked by LOADcnt; 0=>non-ret, STOREcnt), TH[1]=NT, TH[2]=cascade (defer scope of non-ret atomics; keep 0 for gates), scope[4:3]=cu/se/dev/sys (cross-cluster needs >=dev).
 OPUS_H_D constexpr int make_atomic_cpol(atomic_scope sc = atomic_scope::dev, bool returning = true, bool nt = false, bool cascade = false) { return (returning ? 1 : 0) | (nt ? (1 << 1) : 0) | (cascade ? (1 << 2) : 0) | ((int(sc) & 0x3) << 3); }
 static_assert(make_atomic_cpol(atomic_scope::dev, true, true, false) == 19, "atomic cpol layout drift");
@@ -1917,8 +1906,7 @@ struct gmem {
         }
     }
 
-    // atomic add. v_os / s_os in unit of T; ioffset is a compile-time element offset folded into the
-    // instruction immediate offset: field (also in unit of T). Returns the old value. x must match vec*vector_size.
+    // atomic add. v_os / s_os in unit of T; ioffset is a compile-time element offset folded into the instruction immediate offset: field (also in unit of T). Returns the old value. x must match vec*vector_size.
     template<index_t vec = 1, index_t ioffset = 0, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>
     OPUS_D auto atomic_add(const V& x, int v_os, int s_os = 0, number<ioffset> = {}, number<aux> = {}) {
         static_assert(std::is_same_v<typename vector_traits<V>::dtype, scalar_type>, "scalar type must match for atomic_add");
@@ -2304,15 +2292,14 @@ struct smem {
 template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>{ptr}; }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// tcopy (gfx1250): tcopy_desc = stateless D# (sg0..sg3 raw dwords); tcopy_window = stateful tile
-// window with make() + move(d0..d4, lds) + load_to_lds<cpol>(). cpol[6:0] = | rsvd | NV | scope[2] | th[3] |.
+// tdm (gfx1250): tdm_desc = stateless D# (sg0..sg3 raw dwords); tdm_window = stateful tile window with make() + move(d0..d4, lds) + load_to_lds<cpol>(); cpol[6:0] = | rsvd | NV | scope[2] | th[3] |.
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
 
-enum class tcopy_load_th : uint8_t { rt=0, nt=1, ht=2, bypass=3, nt_rt=4, rt_nt=5, nt_ht=6 };           // bypass = LU (last-use)
-enum class tcopy_scope   : uint8_t { cu=0, se=1, dev=2, sys=3 };
+enum class tdm_load_th : unsigned char { rt=0, nt=1, ht=2, bypass=3, nt_rt=4, rt_nt=5, nt_ht=6 };           // bypass = LU (last-use)
+enum class tdm_scope   : unsigned char { cu=0, se=1, dev=2, sys=3 };
 
-OPUS_H_D constexpr int make_cpol(tcopy_load_th th = tcopy_load_th::rt, tcopy_scope sc = tcopy_scope::dev, bool nv = false) { return (int(th) & 0x7) | ((int(sc) & 0x3) << 3) | (nv ? (1 << 5) : 0); }
-inline constexpr int default_cpol = make_cpol(tcopy_load_th::rt, tcopy_scope::dev);                     // = 16
+OPUS_H_D constexpr int make_cpol(tdm_load_th th = tdm_load_th::rt, tdm_scope sc = tdm_scope::dev, bool nv = false) { return (int(th) & 0x7) | ((int(sc) & 0x3) << 3) | (nv ? (1 << 5) : 0); }
+inline constexpr int default_cpol = make_cpol(tdm_load_th::rt, tdm_scope::dev);                     // = 16
 static_assert(default_cpol == 16, "cpol layout drift");
 
 namespace impl {
@@ -2320,13 +2307,13 @@ template<typename T> struct is_static_zero : false_type {};
 template<index_t I>  struct is_static_zero<number<I>> : bool_constant<I == 0> {};
 template<typename T> static constexpr bool is_static_zero_v = is_static_zero<remove_cvref_t<T>>::value;
 
-template<bool En> struct tcopy_dim_state {};
-template<>        struct tcopy_dim_state<true> { uint32_t extent=0; uint64_t stride=0; uint32_t origin=0; };
+template<bool En> struct tdm_dim_state {};
+template<>        struct tdm_dim_state<true> { unsigned int extent=0; unsigned long long stride=0; unsigned int origin=0; };
 
-// saturating_sub via pure SALU (s_sub_co_u32 + s_cselect_b32); avoids v_sub_nc_u32 clamp which
-OPUS_H_D uint32_t tcopy_saturating_sub(uint32_t e, uint32_t o) {
+// saturating_sub via pure SALU (s_sub_co_u32 + s_cselect_b32); clamps underflow to 0.
+OPUS_H_D unsigned int tdm_saturating_sub(unsigned int e, unsigned int o) {
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__AMDGCN__)
-    uint32_t es = __builtin_amdgcn_readfirstlane(e), os = __builtin_amdgcn_readfirstlane(o), r;
+    unsigned int es = __builtin_amdgcn_readfirstlane(e), os = __builtin_amdgcn_readfirstlane(o), r;
     asm("s_sub_co_u32 %0, %1, %2\n\ts_cselect_b32 %0, 0, %0" : "=s"(r) : "s"(es), "s"(os) : "scc"); return r;
 #else
     return (o < e) ? (e - o) : 0u;
@@ -2334,69 +2321,68 @@ OPUS_H_D uint32_t tcopy_saturating_sub(uint32_t e, uint32_t o) {
 }
 
 // wg_mask: seq<i0, i1, ...> index i → bit i. WgCount=0 → mask=0 (no multicast).
-template<index_t WgCount, typename Wgs> struct tcopy_wg_mask;
-template<index_t WgCount, index_t... Is> struct tcopy_wg_mask<WgCount, seq<Is...>> {
-    static_assert(WgCount >= 0 && (WgCount == 0 || index_t(sizeof...(Is)) == WgCount) && (WgCount == 0 || (((Is >= 0) && ...) && ((Is < 16) && ...))), "tcopy_desc: bad selected workgroups");
-    static constexpr uint16_t value = [] { if constexpr (WgCount == 0) return uint16_t{0}; else return (uint16_t{0} | ... | uint16_t(uint16_t{1} << Is)); }();
+template<index_t WgCount, typename Wgs> struct tdm_wg_mask;
+template<index_t WgCount, index_t... Is> struct tdm_wg_mask<WgCount, seq<Is...>> {
+    static_assert(WgCount >= 0 && (WgCount == 0 || index_t(sizeof...(Is)) == WgCount) && (WgCount == 0 || (((Is >= 0) && ...) && ((Is < 16) && ...))), "tdm_desc: bad selected workgroups");
+    static constexpr unsigned short value = [] { if constexpr (WgCount == 0) return (unsigned short)0; else return ((unsigned short)0 | ... | (unsigned short)((unsigned short)1 << Is)); }();
 };
-template<index_t WgCount, typename Wgs> static constexpr uint16_t tcopy_wg_mask_v = tcopy_wg_mask<WgCount, Wgs>::value;
+template<index_t WgCount, typename Wgs> static constexpr unsigned short tdm_wg_mask_v = tdm_wg_mask<WgCount, Wgs>::value;
 
 // __builtin_amdgcn_tensor_load_to_lds operand types (6th arg sg_extra MUST be present & all-zero).
-using tcopy_sg0_vec      = int32_t __attribute__((ext_vector_type(4)));
-using tcopy_sg1_vec      = int32_t __attribute__((ext_vector_type(8)));
-using tcopy_sg2_vec      = int32_t __attribute__((ext_vector_type(4)));
-using tcopy_sg3_vec      = int32_t __attribute__((ext_vector_type(4)));
-using tcopy_sg_extra_vec = int32_t __attribute__((ext_vector_type(8)));
+using tdm_sg0_vec      = int __attribute__((ext_vector_type(4)));
+using tdm_sg1_vec      = int __attribute__((ext_vector_type(8)));
+using tdm_sg2_vec      = int __attribute__((ext_vector_type(4)));
+using tdm_sg3_vec      = int __attribute__((ext_vector_type(4)));
+using tdm_sg_extra_vec = int __attribute__((ext_vector_type(8)));
 } // namespace impl
 
-template<typename T> struct tcopy_data_size { static_assert(sizeof(T)==1||sizeof(T)==2||sizeof(T)==4||sizeof(T)==8, "tcopy_data_size: bad element size"); static constexpr uint64_t value = (sizeof(T)==1)?0:(sizeof(T)==2)?1:(sizeof(T)==4)?2:3; };
+template<typename T> struct tdm_data_size { static_assert(sizeof(T)==1||sizeof(T)==2||sizeof(T)==4||sizeof(T)==8, "tdm_data_size: bad element size"); static constexpr unsigned long long value = (sizeof(T)==1)?0:(sizeof(T)==2)?1:(sizeof(T)==4)?2:3; };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// tcopy_desc<T, TileDim0..4, flags, pad, SelectedWgs>: stateless D# (sg0..sg3 raw uint32_t arrays).
-// Compile-time defaults baked into storage initializer; runtime setters are hand-coded mask+or.
+// tdm_desc<T, TileDim0..4, flags, pad, SelectedWgs>: stateless D# (sg0..sg3 raw unsigned int arrays); compile-time defaults baked into the storage initializer, runtime setters are hand-coded mask+or.
 template<typename DataType,
-         uint64_t TileDim0=0, uint64_t TileDim1=0, uint64_t TileDim2=0, uint64_t TileDim3=0, uint64_t TileDim4=0,
-         uint64_t Count=1, uint64_t GatherIndexSize=0, uint64_t GatherMode=0, uint64_t TypeLo=0, uint64_t TypeHi=1,
-         uint64_t AtomicBarrierEn=0, uint64_t IterateEn=0, uint64_t McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
-         uint64_t LdsPadEn=0, uint64_t PadInterval=0, uint64_t PadAmount=0, typename SelectedWorkgroups = seq<>>
-struct tcopy_desc {
-    static constexpr uint64_t data_size = tcopy_data_size<DataType>::value;
-    static constexpr uint64_t wg_mask   = impl::tcopy_wg_mask_v<SelectedWorkgroupCount, SelectedWorkgroups>;
-    static constexpr uint32_t ndim      = (TileDim4!=0)?5:(TileDim3!=0)?4:(TileDim2!=0)?3:2;
+         unsigned long long TileDim0=0, unsigned long long TileDim1=0, unsigned long long TileDim2=0, unsigned long long TileDim3=0, unsigned long long TileDim4=0,
+         unsigned long long Count=1, unsigned long long GatherIndexSize=0, unsigned long long GatherMode=0, unsigned long long TypeLo=0, unsigned long long TypeHi=1,
+         unsigned long long AtomicBarrierEn=0, unsigned long long IterateEn=0, unsigned long long McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
+         unsigned long long LdsPadEn=0, unsigned long long PadInterval=0, unsigned long long PadAmount=0, typename SelectedWorkgroups = seq<>>
+struct tdm_desc {
+    static constexpr unsigned long long data_size = tdm_data_size<DataType>::value;
+    static constexpr unsigned long long wg_mask   = impl::tdm_wg_mask_v<SelectedWorkgroupCount, SelectedWorkgroups>;
+    static constexpr unsigned int ndim      = (TileDim4!=0)?5:(TileDim3!=0)?4:(TileDim2!=0)?3:2;
 
     // Compile-time dword inits (only slots holding ≥1 compile-time field):
-    static constexpr uint32_t sg0_init0 = uint32_t(Count & 0x1) | (uint32_t(GatherIndexSize & 0x1) << 30) | (uint32_t(GatherMode & 0x1) << 31);                                            // count | gather flags
-    static constexpr uint32_t sg0_init3 = (uint32_t(TypeLo & 0x1) << 30) | (uint32_t(TypeHi & 0x1) << 31);                                                                                  // global_addr_hi(rt) | type
-    static constexpr uint32_t sg1_init0 = uint32_t(wg_mask & 0xFFFF) | (uint32_t(data_size & 0x3) << 16) | (uint32_t(AtomicBarrierEn & 0x1) << 18) | (uint32_t(IterateEn & 0x1) << 19) | (uint32_t(LdsPadEn & 0x1) << 20) | (uint32_t(McEarlyTimeout & 0x1) << 21) | (uint32_t(PadInterval & 0x7) << 22) | (uint32_t(PadAmount & 0x7F) << 25);   // wg_mask | data_size | flags | pad
-    static constexpr uint32_t sg1_init3 = uint32_t(TileDim0 & 0xFFFF) << 16;                                                                                                                // tensor_dim1_lo(rt) | tile_dim0
-    static constexpr uint32_t sg1_init4 = uint32_t(TileDim1 & 0xFFFF) | (uint32_t(TileDim2 & 0xFFFF) << 16);                                                                                // tile_dim1 | tile_dim2
-    static constexpr uint32_t sg2_init3 = uint32_t(TileDim3 & 0xFFFF) << 16;                                                                                                                // tdim2_stride_hi(rt) | tile_dim3
-    static constexpr uint32_t sg3_init2 = uint32_t(TileDim4 & 0xFFFF) << 16;                                                                                                                // tensor_dim4_hi(rt) | tile_dim4
+    static constexpr unsigned int sg0_init0 = (unsigned int)(Count & 0x1) | ((unsigned int)(GatherIndexSize & 0x1) << 30) | ((unsigned int)(GatherMode & 0x1) << 31);                                            // count | gather flags
+    static constexpr unsigned int sg0_init3 = ((unsigned int)(TypeLo & 0x1) << 30) | ((unsigned int)(TypeHi & 0x1) << 31);                                                                                  // global_addr_hi(rt) | type
+    static constexpr unsigned int sg1_init0 = (unsigned int)(wg_mask & 0xFFFF) | ((unsigned int)(data_size & 0x3) << 16) | ((unsigned int)(AtomicBarrierEn & 0x1) << 18) | ((unsigned int)(IterateEn & 0x1) << 19) | ((unsigned int)(LdsPadEn & 0x1) << 20) | ((unsigned int)(McEarlyTimeout & 0x1) << 21) | ((unsigned int)(PadInterval & 0x7) << 22) | ((unsigned int)(PadAmount & 0x7F) << 25);   // wg_mask | data_size | flags | pad
+    static constexpr unsigned int sg1_init3 = (unsigned int)(TileDim0 & 0xFFFF) << 16;                                                                                                                // tensor_dim1_lo(rt) | tile_dim0
+    static constexpr unsigned int sg1_init4 = (unsigned int)(TileDim1 & 0xFFFF) | ((unsigned int)(TileDim2 & 0xFFFF) << 16);                                                                                // tile_dim1 | tile_dim2
+    static constexpr unsigned int sg2_init3 = (unsigned int)(TileDim3 & 0xFFFF) << 16;                                                                                                                // tdim2_stride_hi(rt) | tile_dim3
+    static constexpr unsigned int sg3_init2 = (unsigned int)(TileDim4 & 0xFFFF) << 16;                                                                                                                // tensor_dim4_hi(rt) | tile_dim4
 
-    uint32_t sg0[4]{ sg0_init0, 0, 0, sg0_init3 };
-    uint32_t sg1[8]{ sg1_init0, 0, 0, sg1_init3, sg1_init4, 0, 0, 0 };
-    uint32_t sg2[4]{ 0, 0, 0, sg2_init3 };
-    uint32_t sg3[4]{ 0, 0, sg3_init2, 0 };
+    unsigned int sg0[4]{ sg0_init0, 0, 0, sg0_init3 };
+    unsigned int sg1[8]{ sg1_init0, 0, 0, sg1_init3, sg1_init4, 0, 0, 0 };
+    unsigned int sg2[4]{ 0, 0, 0, sg2_init3 };
+    unsigned int sg3[4]{ 0, 0, sg3_init2, 0 };
 
     // Runtime setters (bit positions as comments):
-    OPUS_H_D void set_lds_addr          (uintptr_t v) { sg0[1] = uint32_t(v); }                                                                                            // [32:32]
-    OPUS_H_D void set_global_addr       (uintptr_t v) { sg0[2] = uint32_t(v); sg0[3] = (sg0[3] & 0xFE000000u) | uint32_t((v >> 32) & 0x01FFFFFFu); }                       // [64:57]
-    OPUS_H_D void set_tensor_dim0       (uint32_t  v) { sg1[1] = (sg1[1] & 0x0000FFFFu) | (v << 16); sg1[2] = (sg1[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
-    OPUS_H_D void set_tensor_dim1       (uint32_t  v) { sg1[2] = (sg1[2] & 0x0000FFFFu) | (v << 16); sg1[3] = (sg1[3] & 0xFFFF0000u) | (v >> 16); }                        // [80:32]
-    OPUS_H_D void set_lds_barrier_addr  (uint16_t  v) { sg1[1] = (sg1[1] & 0xFFFF0000u) | uint32_t(v); }                                                                   // [32:16]
-    OPUS_H_D void set_tensor_dim0_stride(uint64_t  v) { sg1[5] = uint32_t(v); sg1[6] = (sg1[6] & 0xFFFF0000u) | uint32_t((v >> 32) & 0xFFFFu); }                           // [160:48]
-    OPUS_H_D void set_tensor_dim1_stride(uint64_t  v) { sg1[6] = (sg1[6] & 0x0000FFFFu) | uint32_t((v & 0xFFFFu) << 16); sg1[7] = uint32_t(v >> 16); }                     // [208:48]
-    OPUS_H_D void set_tensor_dim2       (uint32_t  v) { sg2[0] = v; }                                                                                                      // [0:32]
-    OPUS_H_D void set_tensor_dim3       (uint32_t  v) { sg2[1] = v; }                                                                                                      // [32:32]
-    OPUS_H_D void set_tensor_dim2_stride(uint64_t  v) { sg2[2] = uint32_t(v); sg2[3] = (sg2[3] & 0xFFFF0000u) | uint32_t((v >> 32) & 0xFFFFu); }                           // [64:48]
-    OPUS_H_D void set_tensor_dim3_stride(uint64_t  v) { sg3[0] = uint32_t(v); sg3[1] = (sg3[1] & 0xFFFF0000u) | uint32_t((v >> 32) & 0xFFFFu); }                           // [0:48]
-    OPUS_H_D void set_tensor_dim4       (uint32_t  v) { sg3[1] = (sg3[1] & 0x0000FFFFu) | (v << 16); sg3[2] = (sg3[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
+    OPUS_H_D void set_lds_addr          (__UINTPTR_TYPE__ v) { sg0[1] = (unsigned int)(v); }                                                                                            // [32:32]
+    OPUS_H_D void set_global_addr       (__UINTPTR_TYPE__ v) { sg0[2] = (unsigned int)(v); sg0[3] = (sg0[3] & 0xFE000000u) | (unsigned int)((v >> 32) & 0x01FFFFFFu); }                       // [64:57]
+    OPUS_H_D void set_tensor_dim0       (unsigned int  v) { sg1[1] = (sg1[1] & 0x0000FFFFu) | (v << 16); sg1[2] = (sg1[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
+    OPUS_H_D void set_tensor_dim1       (unsigned int  v) { sg1[2] = (sg1[2] & 0x0000FFFFu) | (v << 16); sg1[3] = (sg1[3] & 0xFFFF0000u) | (v >> 16); }                        // [80:32]
+    OPUS_H_D void set_lds_barrier_addr  (unsigned short  v) { sg1[1] = (sg1[1] & 0xFFFF0000u) | (unsigned int)(v); }                                                                   // [32:16]
+    OPUS_H_D void set_tensor_dim0_stride(unsigned long long  v) { sg1[5] = (unsigned int)(v); sg1[6] = (sg1[6] & 0xFFFF0000u) | (unsigned int)((v >> 32) & 0xFFFFu); }                           // [160:48]
+    OPUS_H_D void set_tensor_dim1_stride(unsigned long long  v) { sg1[6] = (sg1[6] & 0x0000FFFFu) | (unsigned int)((v & 0xFFFFu) << 16); sg1[7] = (unsigned int)(v >> 16); }                     // [208:48]
+    OPUS_H_D void set_tensor_dim2       (unsigned int  v) { sg2[0] = v; }                                                                                                      // [0:32]
+    OPUS_H_D void set_tensor_dim3       (unsigned int  v) { sg2[1] = v; }                                                                                                      // [32:32]
+    OPUS_H_D void set_tensor_dim2_stride(unsigned long long  v) { sg2[2] = (unsigned int)(v); sg2[3] = (sg2[3] & 0xFFFF0000u) | (unsigned int)((v >> 32) & 0xFFFFu); }                           // [64:48]
+    OPUS_H_D void set_tensor_dim3_stride(unsigned long long  v) { sg3[0] = (unsigned int)(v); sg3[1] = (sg3[1] & 0xFFFF0000u) | (unsigned int)((v >> 32) & 0xFFFFu); }                           // [0:48]
+    OPUS_H_D void set_tensor_dim4       (unsigned int  v) { sg3[1] = (sg3[1] & 0x0000FFFFu) | (v << 16); sg3[2] = (sg3[2] & 0xFFFF0000u) | (v >> 16); }                        // [48:32]
     // CLUSTER_LOAD_ASYNC peer bitmask (sg1[0] [15:0]); a <=1-WG mask has no fan-out so store 0 (multicast off).   // [0:16]
-    OPUS_H_D void set_workgroup_mask    (uint16_t  v) { uint16_t m = (__builtin_popcount((unsigned)v) > 1) ? v : uint16_t{0}; sg1[0] = (sg1[0] & 0xFFFF0000u) | uint32_t(m); }
+    OPUS_H_D void set_workgroup_mask    (unsigned short  v) { unsigned short m = (__builtin_popcount((unsigned)v) > 1) ? v : (unsigned short)0; sg1[0] = (sg1[0] & 0xFFFF0000u) | (unsigned int)(m); }
 
-    OPUS_H_D void make(uintptr_t lds_addr, const void* global_addr, uint32_t td0, uint32_t td1, uint64_t s0,
-                       uint64_t s1=0, uint16_t lds_bar=0, uint32_t td2=0, uint32_t td3=0, uint64_t s2=0, uint64_t s3=0, uint32_t td4=0) {
-        set_lds_addr(lds_addr); set_global_addr(reinterpret_cast<uintptr_t>(global_addr));
+    OPUS_H_D void make(__UINTPTR_TYPE__ lds_addr, const void* global_addr, unsigned int td0, unsigned int td1, unsigned long long s0,
+                       unsigned long long s1=0, unsigned short lds_bar=0, unsigned int td2=0, unsigned int td3=0, unsigned long long s2=0, unsigned long long s3=0, unsigned int td4=0) {
+        set_lds_addr(lds_addr); set_global_addr(reinterpret_cast<__UINTPTR_TYPE__>(global_addr));
         set_tensor_dim0(td0); set_tensor_dim1(td1); set_tensor_dim0_stride(s0);
         if (lds_bar) set_lds_barrier_addr(lds_bar);
         if (s1)  set_tensor_dim1_stride(s1);
@@ -2406,100 +2392,98 @@ struct tcopy_desc {
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// tcopy_window<T, ...>: stateful tile window over tcopy_desc. Caches global_offset_bytes /
-// lds_offset_bytes (layout_linear pattern); move(d0..d4, lds) does cache += delta and rewrites
-// only affected fields. opus::number<0>{} (0_I) → compile-time elide for that slot.
+// tdm_window<T, ...>: stateful tile window over tdm_desc; caches global/lds_offset_bytes (layout_linear), move(d0..d4, lds) does cache += delta and rewrites only affected fields, opus::number<0>{} (0_I) elides that slot at compile time.
 template<typename DataType,
-         uint64_t TileDim0=0, uint64_t TileDim1=0, uint64_t TileDim2=0, uint64_t TileDim3=0, uint64_t TileDim4=0,
-         uint64_t Count=1, uint64_t GatherIndexSize=0, uint64_t GatherMode=0, uint64_t TypeLo=0, uint64_t TypeHi=1,
-         uint64_t AtomicBarrierEn=0, uint64_t IterateEn=0, uint64_t McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
-         uint64_t LdsPadEn=0, uint64_t PadInterval=0, uint64_t PadAmount=0, typename SelectedWorkgroups = seq<>,
+         unsigned long long TileDim0=0, unsigned long long TileDim1=0, unsigned long long TileDim2=0, unsigned long long TileDim3=0, unsigned long long TileDim4=0,
+         unsigned long long Count=1, unsigned long long GatherIndexSize=0, unsigned long long GatherMode=0, unsigned long long TypeLo=0, unsigned long long TypeHi=1,
+         unsigned long long AtomicBarrierEn=0, unsigned long long IterateEn=0, unsigned long long McEarlyTimeout=0, index_t SelectedWorkgroupCount=0,
+         unsigned long long LdsPadEn=0, unsigned long long PadInterval=0, unsigned long long PadAmount=0, typename SelectedWorkgroups = seq<>,
          int CachePol = default_cpol>
-struct tcopy_window {
-    using desc_t = tcopy_desc<DataType, TileDim0, TileDim1, TileDim2, TileDim3, TileDim4, Count, GatherIndexSize, GatherMode, TypeLo, TypeHi, AtomicBarrierEn, IterateEn, McEarlyTimeout, SelectedWorkgroupCount, LdsPadEn, PadInterval, PadAmount, SelectedWorkgroups>;
+struct tdm_window {
+    using desc_t = tdm_desc<DataType, TileDim0, TileDim1, TileDim2, TileDim3, TileDim4, Count, GatherIndexSize, GatherMode, TypeLo, TypeHi, AtomicBarrierEn, IterateEn, McEarlyTimeout, SelectedWorkgroupCount, LdsPadEn, PadInterval, PadAmount, SelectedWorkgroups>;
 
     static constexpr int      cache_pol = CachePol;
-    static constexpr uint32_t ndim      = desc_t::ndim;
+    static constexpr unsigned int ndim      = desc_t::ndim;
     static constexpr bool     has_dim2  = (ndim >= 3), has_dim3 = (ndim >= 4), has_dim4 = (ndim >= 5);
-    static_assert((CachePol & ~0x3F) == 0, "tcopy_window: cache_pol must fit in 6 bits");
+    static_assert((CachePol & ~0x3F) == 0, "tdm_window: cache_pol must fit in 6 bits");
 
     desc_t    desc{};
-    uintptr_t lds_base_addr=0, global_base_addr=0, lds_offset_bytes=0, global_offset_bytes=0;
-    uint32_t  extent0=0, extent1=0, origin0=0, origin1=0;
-    uint64_t  stride0=0;                                                                                // = tcopy tensor_dim0_stride (elements)
-    [[no_unique_address]] impl::tcopy_dim_state<has_dim2> dim2{};
-    [[no_unique_address]] impl::tcopy_dim_state<has_dim3> dim3{};
-    [[no_unique_address]] impl::tcopy_dim_state<has_dim4> dim4{};
+    __UINTPTR_TYPE__ lds_base_addr=0, global_base_addr=0, lds_offset_bytes=0, global_offset_bytes=0;
+    unsigned int  extent0=0, extent1=0, origin0=0, origin1=0;
+    unsigned long long  stride0=0;                                                                                // = tdm tensor_dim0_stride (elements)
+    [[no_unique_address]] impl::tdm_dim_state<has_dim2> dim2{};
+    [[no_unique_address]] impl::tdm_dim_state<has_dim3> dim3{};
+    [[no_unique_address]] impl::tdm_dim_state<has_dim4> dim4{};
 
     // 2D make; 3D/4D/5D SFINAE overloads omitted (uncommon).
-    OPUS_H_D void make(uintptr_t lds_base, const void* global_base, uintptr_t lds_off, uint32_t td0, uint32_t td1, uint64_t s0, uint32_t o0=0, uint32_t o1=0) {
-        lds_base_addr=lds_base; global_base_addr=reinterpret_cast<uintptr_t>(global_base);
+    OPUS_H_D void make(__UINTPTR_TYPE__ lds_base, const void* global_base, __UINTPTR_TYPE__ lds_off, unsigned int td0, unsigned int td1, unsigned long long s0, unsigned int o0=0, unsigned int o1=0) {
+        lds_base_addr=lds_base; global_base_addr=reinterpret_cast<__UINTPTR_TYPE__>(global_base);
         lds_offset_bytes=lds_off; stride0=s0; origin0=o0; origin1=o1;
         extent0=o0+td0; extent1=o1+td1; materialize_desc_initial();
     }
 
-    // -DOPUS_TCOPY_BUILTIN_HAS_SG_EXTRA=1 → 6-operand tensor_load_to_lds (newer/patched llvm); default = 5-operand (CI llvm).
-#ifndef OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA
-#define OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA 0
+    // -DOPUS_TDM_BUILTIN_HAS_SG_EXTRA=1 → 6-operand tensor_load_to_lds (newer/patched llvm); default = 5-operand (CI llvm).
+#ifndef OPUS_TDM_BUILTIN_HAS_SG_EXTRA
+#define OPUS_TDM_BUILTIN_HAS_SG_EXTRA 0
 #endif
-#if OPUS_TCOPY_BUILTIN_HAS_SG_EXTRA
-#define OPUS_TCOPY_SG_EXTRA_ARG , impl::tcopy_sg_extra_vec{0, 0, 0, 0, 0, 0, 0, 0}
+#if OPUS_TDM_BUILTIN_HAS_SG_EXTRA
+#define OPUS_TDM_SG_EXTRA_ARG , impl::tdm_sg_extra_vec{0, 0, 0, 0, 0, 0, 0, 0}
 #else
-#define OPUS_TCOPY_SG_EXTRA_ARG
+#define OPUS_TDM_SG_EXTRA_ARG
 #endif
 
     template<int cpol = cache_pol>
     OPUS_D void load_to_lds() const {
         if constexpr (ndim == 2)
-            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tcopy_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tcopy_sg1_vec, desc.sg1), impl::tcopy_sg2_vec{0,0,0,0}, impl::tcopy_sg3_vec{0,0,0,0} OPUS_TCOPY_SG_EXTRA_ARG, cpol);
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tdm_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tdm_sg1_vec, desc.sg1), impl::tdm_sg2_vec{0,0,0,0}, impl::tdm_sg3_vec{0,0,0,0} OPUS_TDM_SG_EXTRA_ARG, cpol);
         else
-            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tcopy_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tcopy_sg1_vec, desc.sg1), __builtin_bit_cast(impl::tcopy_sg2_vec, desc.sg2), __builtin_bit_cast(impl::tcopy_sg3_vec, desc.sg3) OPUS_TCOPY_SG_EXTRA_ARG, cpol);
+            __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(impl::tdm_sg0_vec, desc.sg0), __builtin_bit_cast(impl::tdm_sg1_vec, desc.sg1), __builtin_bit_cast(impl::tdm_sg2_vec, desc.sg2), __builtin_bit_cast(impl::tdm_sg3_vec, desc.sg3) OPUS_TDM_SG_EXTRA_ARG, cpol);
     }
 
     // move(d0..d4, lds): per-dim signed deltas + lds byte delta. 0_I args are compile-time elided.
     template<typename D0=number<0>, typename D1=number<0>, typename D2=number<0>, typename D3=number<0>, typename D4=number<0>, typename Lds=number<0>>
     OPUS_H_D void move(D0 d0={}, D1 d1={}, D2 d2={}, D3 d3={}, D4 d4={}, Lds lds={}) {
-        static_assert(has_dim2 || impl::is_static_zero_v<D2>, "tcopy_window::move(): d2 requires has_dim2");
-        static_assert(has_dim3 || impl::is_static_zero_v<D3>, "tcopy_window::move(): d3 requires has_dim3");
-        static_assert(has_dim4 || impl::is_static_zero_v<D4>, "tcopy_window::move(): d4 requires has_dim4");
+        static_assert(has_dim2 || impl::is_static_zero_v<D2>, "tdm_window::move(): d2 requires has_dim2");
+        static_assert(has_dim3 || impl::is_static_zero_v<D3>, "tdm_window::move(): d3 requires has_dim3");
+        static_assert(has_dim4 || impl::is_static_zero_v<D4>, "tdm_window::move(): d4 requires has_dim4");
         constexpr bool z0=impl::is_static_zero_v<D0>, z1=impl::is_static_zero_v<D1>, z2=impl::is_static_zero_v<D2>, z3=impl::is_static_zero_v<D3>, z4=impl::is_static_zero_v<D4>, zL=impl::is_static_zero_v<Lds>;
-        if constexpr (!z0)             origin0     = uint32_t(int64_t(origin0)     + int64_t(d0));
-        if constexpr (!z1)             origin1     = uint32_t(int64_t(origin1)     + int64_t(d1));
-        if constexpr (has_dim2 && !z2) dim2.origin = uint32_t(int64_t(dim2.origin) + int64_t(d2));
-        if constexpr (has_dim3 && !z3) dim3.origin = uint32_t(int64_t(dim3.origin) + int64_t(d3));
-        if constexpr (has_dim4 && !z4) dim4.origin = uint32_t(int64_t(dim4.origin) + int64_t(d4));
+        if constexpr (!z0)             origin0     = (unsigned int)((long long)(origin0)     + (long long)(d0));
+        if constexpr (!z1)             origin1     = (unsigned int)((long long)(origin1)     + (long long)(d1));
+        if constexpr (has_dim2 && !z2) dim2.origin = (unsigned int)((long long)(dim2.origin) + (long long)(d2));
+        if constexpr (has_dim3 && !z3) dim3.origin = (unsigned int)((long long)(dim3.origin) + (long long)(d3));
+        if constexpr (has_dim4 && !z4) dim4.origin = (unsigned int)((long long)(dim4.origin) + (long long)(d4));
         constexpr bool any_moved = !z0 || !z1 || (has_dim2 && !z2) || (has_dim3 && !z3) || (has_dim4 && !z4);
-        if constexpr (any_moved) { global_offset_bytes = uintptr_t(intptr_t(global_offset_bytes) + coord_delta_to_global_offset_bytes(d0, d1, d2, d3, d4)); desc.set_global_addr(global_base_addr + global_offset_bytes); }
-        if constexpr (!zL)       { lds_offset_bytes    = uintptr_t(intptr_t(lds_offset_bytes)    + intptr_t(lds)); desc.sg0[1] = uint32_t(lds_base_addr + lds_offset_bytes); }   // lds_addr direct dword write
-        if constexpr (!z0)             desc.set_tensor_dim0(impl::tcopy_saturating_sub(extent0,     origin0));
-        if constexpr (!z1)             desc.set_tensor_dim1(impl::tcopy_saturating_sub(extent1,     origin1));
-        if constexpr (has_dim2 && !z2) desc.set_tensor_dim2(impl::tcopy_saturating_sub(dim2.extent, dim2.origin));
-        if constexpr (has_dim3 && !z3) desc.set_tensor_dim3(impl::tcopy_saturating_sub(dim3.extent, dim3.origin));
-        if constexpr (has_dim4 && !z4) desc.set_tensor_dim4(impl::tcopy_saturating_sub(dim4.extent, dim4.origin));
+        if constexpr (any_moved) { global_offset_bytes = (__UINTPTR_TYPE__)((__INTPTR_TYPE__)(global_offset_bytes) + coord_delta_to_global_offset_bytes(d0, d1, d2, d3, d4)); desc.set_global_addr(global_base_addr + global_offset_bytes); }
+        if constexpr (!zL)       { lds_offset_bytes    = (__UINTPTR_TYPE__)((__INTPTR_TYPE__)(lds_offset_bytes)    + (__INTPTR_TYPE__)(lds)); desc.sg0[1] = (unsigned int)(lds_base_addr + lds_offset_bytes); }   // lds_addr direct dword write
+        if constexpr (!z0)             desc.set_tensor_dim0(impl::tdm_saturating_sub(extent0,     origin0));
+        if constexpr (!z1)             desc.set_tensor_dim1(impl::tdm_saturating_sub(extent1,     origin1));
+        if constexpr (has_dim2 && !z2) desc.set_tensor_dim2(impl::tdm_saturating_sub(dim2.extent, dim2.origin));
+        if constexpr (has_dim3 && !z3) desc.set_tensor_dim3(impl::tdm_saturating_sub(dim3.extent, dim3.origin));
+        if constexpr (has_dim4 && !z4) desc.set_tensor_dim4(impl::tdm_saturating_sub(dim4.extent, dim4.origin));
     }
 private:
     template<typename D0, typename D1, typename D2, typename D3, typename D4>
-    OPUS_H_D constexpr int64_t coord_delta_to_global_offset_bytes(D0 d0, D1 d1, D2 d2, D3 d3, D4 d4) const {
-        int64_t dg = 0;
-        if constexpr (!impl::is_static_zero_v<D0>)             dg += int64_t(d0) * int64_t(sizeof(DataType));
-        if constexpr (!impl::is_static_zero_v<D1>)             dg += int64_t(d1) * int64_t(stride0)     * int64_t(sizeof(DataType));
-        if constexpr (has_dim2 && !impl::is_static_zero_v<D2>) dg += int64_t(d2) * int64_t(dim2.stride) * int64_t(sizeof(DataType));
-        if constexpr (has_dim3 && !impl::is_static_zero_v<D3>) dg += int64_t(d3) * int64_t(dim3.stride) * int64_t(sizeof(DataType));
-        if constexpr (has_dim4 && !impl::is_static_zero_v<D4>) dg += int64_t(d4) * int64_t(dim4.stride) * int64_t(sizeof(DataType));
+    OPUS_H_D constexpr long long coord_delta_to_global_offset_bytes(D0 d0, D1 d1, D2 d2, D3 d3, D4 d4) const {
+        long long dg = 0;
+        if constexpr (!impl::is_static_zero_v<D0>)             dg += (long long)(d0) * (long long)(sizeof(DataType));
+        if constexpr (!impl::is_static_zero_v<D1>)             dg += (long long)(d1) * (long long)(stride0)     * (long long)(sizeof(DataType));
+        if constexpr (has_dim2 && !impl::is_static_zero_v<D2>) dg += (long long)(d2) * (long long)(dim2.stride) * (long long)(sizeof(DataType));
+        if constexpr (has_dim3 && !impl::is_static_zero_v<D3>) dg += (long long)(d3) * (long long)(dim3.stride) * (long long)(sizeof(DataType));
+        if constexpr (has_dim4 && !impl::is_static_zero_v<D4>) dg += (long long)(d4) * (long long)(dim4.stride) * (long long)(sizeof(DataType));
         return dg;
     }
     OPUS_H_D void materialize_desc_initial() {
-        uint64_t s1=0, s2=0, s3=0; uint32_t td2=0, td3=0, td4=0;
+        unsigned long long s1=0, s2=0, s3=0; unsigned int td2=0, td3=0, td4=0;
         if constexpr (has_dim2) { s1 = dim2.stride; td2 = dim2.extent; }
         if constexpr (has_dim3) { s2 = dim3.stride; td3 = dim3.extent; }
         if constexpr (has_dim4) { s3 = dim4.stride; td4 = dim4.extent; }
-        uint64_t off = uint64_t(origin0) + uint64_t(origin1) * stride0;
-        if constexpr (has_dim2) off += uint64_t(dim2.origin) * dim2.stride;
-        if constexpr (has_dim3) off += uint64_t(dim3.origin) * dim3.stride;
-        if constexpr (has_dim4) off += uint64_t(dim4.origin) * dim4.stride;
+        unsigned long long off = (unsigned long long)(origin0) + (unsigned long long)(origin1) * stride0;
+        if constexpr (has_dim2) off += (unsigned long long)(dim2.origin) * dim2.stride;
+        if constexpr (has_dim3) off += (unsigned long long)(dim3.origin) * dim3.stride;
+        if constexpr (has_dim4) off += (unsigned long long)(dim4.origin) * dim4.stride;
         global_offset_bytes = off * sizeof(DataType);
         desc.make(lds_base_addr + lds_offset_bytes, reinterpret_cast<const void*>(global_base_addr + global_offset_bytes),
-                  impl::tcopy_saturating_sub(extent0, origin0), impl::tcopy_saturating_sub(extent1, origin1),
+                  impl::tdm_saturating_sub(extent0, origin0), impl::tdm_saturating_sub(extent1, origin1),
                   stride0, s1, 0, td2, td3, s2, s3, td4);
     }
 };
