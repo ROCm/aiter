@@ -141,7 +141,7 @@ jobs:
               --reasoning-parser deepseek_v4
             extra_env_args: ""
           - model: amd/MiniMax-M3-MXFP4
-            runner: linux-aiter-mi35x-4
+            runner: linux-aiter-do-mi350x-4
             kv_cache_dtype: default_kvcache
             tp: 4
             extra_args: >-
@@ -241,11 +241,7 @@ jobs:
                   exit 1
                 fi
                 ls -lh /workspace/aiter_wheels
-                if [[ \"\${AITER_USE_SYSTEM_TRITON:-0}\" == \"1\" ]]; then
-                  echo \"AITER_USE_SYSTEM_TRITON=1; keeping system Triton\"
-                else
-                  bash ./.github/scripts/install_triton.sh
-                fi
+                echo \"AITER_USE_SYSTEM_TRITON=1; keeping system Triton\"
                 pip show triton
                 pip uninstall -y aiter amd-aiter || true
                 pip config set global.default-timeout 60
