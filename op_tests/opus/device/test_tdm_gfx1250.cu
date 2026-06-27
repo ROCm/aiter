@@ -56,7 +56,7 @@ void tdm_gfx1250_kernel(const void* __restrict__ ptr_a,
     constexpr int num_slots       = 2;
 
     __shared__ char Smem[num_slots * slot_pair_bytes];
-    const __UINTPTR_TYPE__ smembase = reinterpret_cast<__UINTPTR_TYPE__>(Smem);
+    const u32_t smembase = static_cast<u32_t>(reinterpret_cast<__UINTPTR_TYPE__>(Smem));   // LDS addr is 32-bit on gfx1250
 
     using NoSelectedWgs = seq<>;
     using WinB = tdm_window<fp16_t, Block_K, 16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 5, 3, NoSelectedWgs>;
@@ -64,9 +64,9 @@ void tdm_gfx1250_kernel(const void* __restrict__ ptr_a,
     using WinA = tdm_window<fp16_t, Block_K, 16, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 1, 5, 3, SelectedWgs>;
 
     // dlds(ks): alternating ±slot_pair_bytes for ping-pong slot toggle.
-    const auto dlds = [&](int ks) -> __INTPTR_TYPE__ {
-        return (ks & 1) ? +static_cast<__INTPTR_TYPE__>(slot_pair_bytes)
-                        : -static_cast<__INTPTR_TYPE__>(slot_pair_bytes);
+    const auto dlds = [&](int ks) -> i32_t {
+        return (ks & 1) ? +static_cast<i32_t>(slot_pair_bytes)
+                        : -static_cast<i32_t>(slot_pair_bytes);
     };
 
     // ────────────────────────────── producers ──────────────────────────────
@@ -76,7 +76,7 @@ void tdm_gfx1250_kernel(const void* __restrict__ ptr_a,
             sync_workgroup();
 
             WinA win_a;
-            const __UINTPTR_TYPE__ wave_lds_off = static_cast<__UINTPTR_TYPE__>(wave_id) * 16 * (Block_K + 8) * sizeof(fp16_t);
+            const u32_t wave_lds_off = static_cast<u32_t>(wave_id) * 16 * (Block_K + 8) * sizeof(fp16_t);
             win_a.make(smembase, ptr_a, wave_lds_off,
                        static_cast<unsigned int>(stride_a),
                        static_cast<unsigned int>(Block_M - wave_id * 16),
@@ -108,7 +108,7 @@ void tdm_gfx1250_kernel(const void* __restrict__ ptr_a,
             sync_workgroup();
 
             WinB win_b;
-            const __UINTPTR_TYPE__ wave_lds_off = static_cast<__UINTPTR_TYPE__>(wave_id - 2) * 16 * (Block_K + 8) * sizeof(fp16_t);
+            const u32_t wave_lds_off = static_cast<u32_t>(wave_id - 2) * 16 * (Block_K + 8) * sizeof(fp16_t);
             const unsigned int  b_origin1    = static_cast<unsigned int>(cluster_workgroup_id_x * Block_N + (wave_id - 2) * 16);
 
             win_b.make(smembase + slot_bytes_A, ptr_b, wave_lds_off,
