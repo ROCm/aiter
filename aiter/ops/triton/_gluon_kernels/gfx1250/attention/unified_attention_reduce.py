@@ -110,9 +110,7 @@ def reduce_segments_gluon(
     offs_h = gl.arange(0, H, layout=gl.SliceLayout(1, L_HD))
     offs_d = gl.arange(0, D_PAD, layout=gl.SliceLayout(0, L_HD))
     o_offs = (
-        token * output_stride_0
-        + offs_h[:, None] * output_stride_1
-        + offs_d[None, :]
+        token * output_stride_0 + offs_h[:, None] * output_stride_1 + offs_d[None, :]
     )
     o_mask = (offs_d[None, :] < D) & (offs_h[:, None] < num_query_heads)
     gl.amd.gfx1250.buffer_store(
