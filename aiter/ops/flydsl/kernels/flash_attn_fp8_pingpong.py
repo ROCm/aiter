@@ -466,19 +466,20 @@ def build_flash_attn_fp8_module(
             neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
             n_groups = C_F32_PER_LANE // 4
 
+            # Affine scale*S - scale*m computed packed (vector mulf/addf -> v_pk_*)
+            # over the whole vec<16xf32>; only exp2 stays per-scalar (v_exp_f32).
+            scale_vec = Vec.from_elements([scale_log2e], fx.Float32).broadcast_to(
+                C_F32_PER_LANE
+            )
+            neg_m_vec = Vec.from_elements([neg_scaled_m_new], fx.Float32).broadcast_to(
+                C_F32_PER_LANE
+            )
             p_words = []
             for nt in range_constexpr(N_KV_TILES):
+                aff = Vec(_fadd(_fmul(Vec(s_accs[nt]), scale_vec), neg_m_vec))
                 for rg in range_constexpr(n_groups):
                     ps = [
-                        rocdl.exp2(
-                            T.f32,
-                            _raw(
-                                _fadd(
-                                    _fmul(Vec(s_accs[nt])[rg * 4 + i], scale_log2e),
-                                    neg_scaled_m_new,
-                                )
-                            ),
-                        )
+                        rocdl.exp2(T.f32, _raw(aff[rg * 4 + i]))
                         for i in range_constexpr(4)
                     ]
                     p_words.append(_f32x4_to_fp8_word(*ps))
