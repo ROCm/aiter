@@ -51,6 +51,8 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
     constexpr float hi = 448.0f, lo = -448.0f;
 #endif
     float a = tmp[0], b = tmp[1];
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
+    defined(__gfx1201__) || defined(__gfx1250__)
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
@@ -58,6 +60,11 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
                  : "=v"(w), "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
     return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+#else
+    // Arches without packed fp8-cvt (RDNA3/3.5, host): compile-only stub.
+    // fp8 KV-cache is unused on these arches; never executed at runtime.
+    (void)a; (void)b; (void)lo; (void)hi; return fp8x2_t{};
+#endif
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
@@ -76,6 +83,8 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
     fp32x2_t tmp       = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
     constexpr float hi = 57344.0f, lo = -57344.0f;
     float a = tmp[0], b = tmp[1];
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
+    defined(__gfx1201__) || defined(__gfx1250__)
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
                  "v_med3_f32 %2, %2, %3, %4\n"
@@ -83,6 +92,9 @@ OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
                  : "=v"(w), "+v"(a), "+v"(b)
                  : "v"(lo), "v"(hi));
     return __builtin_bit_cast(bf8x2_t, static_cast<int16_t>(w));
+#else
+    (void)a; (void)b; (void)lo; (void)hi; return bf8x2_t{};
+#endif
 }
 
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
@@ -843,6 +855,44 @@ __device__ void store_vector(opus::gmem<T>& buffer,
     else
     {
         static_assert(false, "vec_size * sizeof(T) must be a multiple of 16, 8, or 4");
+    }
+}
+
+// Wait until both the regular load queue and the async-load queue have at most
+// the given number of outstanding entries. A negative count means "don't wait"
+// on that queue: on split-counter archs the corresponding instruction is not
+// emitted, and on the combined-vmcnt arch it is treated as 0 in the sum.
+// gfx9 only has the combined vmcnt, which covers both, so wait on the sum.
+// Other archs (e.g. gfx1250) have split counters, so wait on loadcnt and asynccnt independently.
+template <index_t load_cnt, index_t async_load_cnt>
+OPUS_D void s_wait_all_loadcnt(number<load_cnt> = {}, number<async_load_cnt> = {})
+{
+#if defined(__gfx1250__)
+    if constexpr(load_cnt >= 0)
+        s_wait_loadcnt(number<load_cnt>{});
+    if constexpr(async_load_cnt >= 0)
+        s_wait_asynccnt(number<async_load_cnt>{});
+#else
+    constexpr index_t vmcnt = (load_cnt < 0 ? 0 : load_cnt) + (async_load_cnt < 0 ? 0 : async_load_cnt);
+    s_waitcnt_vmcnt(number<vmcnt>{});
+#endif
+}
+
+// Wait until the LDS (shared-memory) queue has at most the given number of
+// outstanding entries. A negative count means "don't wait", so no instruction
+// is emitted.
+// gfx9 routes LDS waits through the combined lgkmcnt; other archs (e.g. gfx1250)
+// have a dedicated dscnt counter.
+template <index_t ds_cnt>
+OPUS_D void s_wait_all_dscnt(number<ds_cnt> = {})
+{
+    if constexpr(ds_cnt >= 0)
+    {
+#if defined(__gfx1250__)
+        s_wait_dscnt(number<ds_cnt>{});
+#else
+        s_waitcnt_lgkmcnt(number<ds_cnt>{});
+#endif
     }
 }
 
