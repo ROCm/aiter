@@ -461,9 +461,7 @@ def build_flash_attn_fp8_module(
             )
             row_max_int = _fmax(local_max, peer_max)
             m_new = _fmax(m_running, row_max_int)
-            corr = ArithValue(_fmul(_fsub(m_running, m_new), scale_log2e)).exp2(
-                fastmath=fm_fast
-            )
+            corr = rocdl.exp2(T.f32, _raw(_fmul(_fsub(m_running, m_new), scale_log2e)))
 
             neg_scaled_m_new = _fsub(c_zero_f, _fmul(scale_log2e, m_new))
             n_groups = C_F32_PER_LANE // 4
@@ -472,12 +470,15 @@ def build_flash_attn_fp8_module(
             for nt in range_constexpr(N_KV_TILES):
                 for rg in range_constexpr(n_groups):
                     ps = [
-                        ArithValue(
-                            _fadd(
-                                _fmul(Vec(s_accs[nt])[rg * 4 + i], scale_log2e),
-                                neg_scaled_m_new,
-                            )
-                        ).exp2(fastmath=fm_fast)
+                        rocdl.exp2(
+                            T.f32,
+                            _raw(
+                                _fadd(
+                                    _fmul(Vec(s_accs[nt])[rg * 4 + i], scale_log2e),
+                                    neg_scaled_m_new,
+                                )
+                            ),
+                        )
                         for i in range_constexpr(4)
                     ]
                     p_words.append(_f32x4_to_fp8_word(*ps))
