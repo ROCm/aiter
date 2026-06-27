@@ -1580,8 +1580,30 @@ def flydsl_moe_stage2(
     else:
         _persist_m = -1 if m_blocks > 256 else 1
 
+    # fp8 (mxfp8 a8w8) stage2 historically force-disabled the persistent grid
+    # (always persist_m=1). For large M this is the dominant cost: a
+    # one-tile-per-workgroup grid launches O(m_blocks * n_tiles) workgroups
+    # (tens of thousands at M>=4k) and re-derives the per-tile expert base in
+    # every block, instead of a persistent round-robin grid (grid_y=cu_num)
+    # that amortizes launch overhead and reuses the expert base across tiles.
+    # The persistent stage2 path in compile_mixed_moe_gemm2 is dtype-agnostic
+    # (only the fp4 async-copy micro-opt is gated on b_dtype), so fp8 can use
+    # the same m_blocks heuristic as fp4. Behavior is gated so the legacy path
+    # stays one env-var away, and small/medium M (m_blocks<=256) is unchanged:
+    #   AITER_FLYDSL_FP8_STAGE2_PERSIST=
+    #     "auto" (default) -> persistent when m_blocks>256, else persist_m=1
+    #     "0"/"off"        -> legacy: always persist_m=1
+    #     "1"/"on"         -> always persistent (persist_m=-1)
     if a_dtype == "fp8":
-        _persist_m = 1
+        _fp8_persist = os.environ.get(
+            "AITER_FLYDSL_FP8_STAGE2_PERSIST", "auto"
+        ).lower()
+        if _fp8_persist in ("0", "off", "false"):
+            _persist_m = 1
+        elif _fp8_persist in ("1", "on", "true"):
+            _persist_m = -1
+        else:  # "auto": match fp4's large-M heuristic, leave small M as-is
+            _persist_m = -1 if m_blocks > 256 else 1
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
