@@ -3,6 +3,7 @@
 
 import torch
 import itertools
+from contextlib import nullcontext
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest
@@ -27,9 +28,8 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.aot.flydsl.common import fail_on_aot_cache_miss
+from aiter.aot.flydsl.common import run_only_env
 from aiter.ops.flydsl.moe_common import GateMode
-import aiter.ops.flydsl.moe_kernels as _aiter_mk
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -74,7 +74,7 @@ def test_fmoe(
     preshuffle=True,
     strict_accuracy=True,
     check_aot_cache=True,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -271,6 +271,18 @@ def test_fmoe(
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and AQDType == dtypes.fp4x2
+        and WQDType == dtypes.fp4x2
+    ):  # a4w4: both stage1 and stage2 use JIT CK (DeviceMoeGemmMXBPreShuffle)
+        # Both use preShuffleBuffer format = shuffle_weight_a16w4(gate_up=False)
+        # / shuffle_scale_a16w4(gate_up=False). Unlike a16w4, the a4w4 kernel
+        # uses gate_up=False for stage1 even though w1 has 2*N rows.
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, False)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, False)
+        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
@@ -428,9 +440,6 @@ def test_fmoe(
         )
 
     return {"us": us2, "logits_diff": float(logits_diff)}
-
-
-test_fmoe_with_aot_cache_check = fail_on_aot_cache_miss(_aiter_mk)(test_fmoe)
 
 
 l_quant = [
@@ -593,8 +602,8 @@ parser.add_argument(
     "--swiglu-limit",
     "-sl",
     type=float,
-    default=0.0,
-    help="Limit the number of experts for swiglu activation type. Default is 0.0.",
+    default=None,
+    help="swiglu/silu clamp limit. Default None means the kernel default (7.0).",
 )
 
 args = parser.parse_args()
@@ -659,6 +668,9 @@ def _row_to_kwargs(row):
         hidden_pad=0,
         intermediate_pad=0,
         preshuffle=True,
+        swiglu_limit=_effective_swiglu_limit(
+            q_type, aq_dtype, wq_dtype, args.swiglu_limit
+        ),
     )
 
 
@@ -728,10 +740,12 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
-    # mxfp4 weights (a4w4/a8w4/a16w4) all run the gate/up-interleaved (guinterleave)
-    # layout that the tuned kimik2_5 rows are keyed on, matching serving's
-    # ATOM_MOE_GU_ITLV=1. Include fp4x2 activations (true a4w4) so op_tests reach
-    # the HIP a4w4 backend instead of falling through to the separated default.
+    # mxfp4 weights (a4w4/a8w4/a16w4) run the gate/up-interleaved (guinterleave)
+    # layout, matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime
+    # weight-layout property (not a tuned-config key); request INTERLEAVE here so
+    # op_tests exercise the a4w4 FlyDSL port's interleave variant. Include fp4x2
+    # activations (true a4w4) so they reach the port instead of the separated
+    # default.
     if aq_dtype in [dtypes.fp8, dtypes.bf16, dtypes.fp4x2] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
@@ -743,7 +757,7 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
         return swiglu_limit
-    return 0.0
+    return None
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
@@ -798,6 +812,9 @@ def _iter_legacy_cases():
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
+            swiglu_limit=_effective_swiglu_limit(
+                quant_type, aq_dtype, wq_dtype, args.swiglu_limit
+            ),
             **over,
         )
 
@@ -950,12 +967,6 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    swiglu_limit = _effective_swiglu_limit(
-        kwargs["qType"],
-        kwargs["AQDType"],
-        kwargs["WQDType"],
-        args.swiglu_limit,
-    )
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     _force_moe_bound_zero = (
         kwargs["qType"],
@@ -965,12 +976,11 @@ for kwargs, extras in case_iter:
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:
-        run_test_fmoe = (
-            test_fmoe_with_aot_cache_check
-            if kwargs.get("check_aot_cache", False)
-            else test_fmoe
+        aot_guard = (
+            run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
         )
-        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+        with aot_guard:
+            ret = test_fmoe(**kwargs)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:

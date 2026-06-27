@@ -3793,14 +3793,16 @@ class FmoeTuner(TunerCommon):
                 doweight_stage1,
                 gate_mode,
             )
-            if gate_mode == "interleave":
-                tasks_ck.extend(self.gen_mxfp4_port_2stages_task(info, blockMs))
-            else:
-                tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
-                tasks_ck.extend(self.gen_2stages_task(info, blockMs))
-                tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
-                tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
-                task_1stage.extend(self.gen_1stage_asm_task(info))
+            tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
+            tasks_ck.extend(self.gen_2stages_task(info, blockMs))
+            tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+            tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
+            task_1stage.extend(self.gen_1stage_asm_task(info))
+            # a4w4 port competes as a normal candidate (self-gates to fp4/fp4).
+            # HAZARD: it's the only a4w4 kernel that does interleave, but is timed
+            # as separated, so a re-tune may pick separated-only flydsl/CK and drop
+            # interleave. Committed port rows are the source of truth; re-tune with care.
+            tasks_ck.extend(self.gen_mxfp4_port_2stages_task(info, blockMs))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
                 continue

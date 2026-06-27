@@ -126,7 +126,7 @@ else:
     from .ops.fused_qk_rmsnorm_group_quant import *  # noqa: F403,E402
     from .ops.groupnorm import *  # noqa: F403,E402
     from .ops.mhc import *  # noqa: F403,E402
-    from .ops.causal_conv1d import *  # noqa: F403,E402
+    from .ops.causal_conv1d_update import *  # noqa: F403,E402
     from .ops.fused_split_gdr_update import *  # noqa: F403,E402
     from . import mla  # noqa: F403,F401,E402
 

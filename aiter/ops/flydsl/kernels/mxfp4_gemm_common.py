@@ -10,7 +10,6 @@ from flydsl.expr.typing import T
 
 from . import dpp_utils
 
-
 _PTR3 = "!llvm.ptr<3>"
 kStages = 2
 kBS_stride_k0_dw = 64

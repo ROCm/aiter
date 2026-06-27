@@ -462,7 +462,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
 ):
     if not block_size_M:
@@ -518,7 +518,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -554,7 +554,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -654,7 +654,9 @@ def fused_moe_(
                 bias1=bias1,
                 bias2=bias2,
                 gate_mode=gate_mode,
+                swiglu_limit=swiglu_limit,
             )
+
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
@@ -1089,6 +1091,7 @@ class MOEMetadata:
     #  - prequant: fused_moe_2stages quantizes a1 before stage1.
     output_aux: bool = False
     prequant: bool = True
+    skip_inter_quant: bool = False
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1134,7 +1137,7 @@ def _flydsl_stage1_wrapper(
     out_scale_sorted=None,
     bias1=None,
     topk_ids=None,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: Optional[float] = None,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
     **_kwargs,
@@ -1281,6 +1284,7 @@ def _mxfp4_a4w4_stage1(
     kernelName1,
     device,
     use_nt=False,
+    interleave=True,
 ):
     if not inline_quant:
         aiter.mxfp4_moe_quant(
@@ -1350,6 +1354,7 @@ def _mxfp4_a4w4_stage1(
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
         topk=topk,
+        interleave=interleave,
         xcd_swizzle=_xcd1,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
@@ -1512,6 +1517,7 @@ def _mxfp4_a4w4_stage1_fw(
     kernelName1="",
     m_indices=None,
     moe_buf=None,
+    interleave=True,
     **_kwargs,
 ):
     device = hidden_states.device
@@ -1555,6 +1561,7 @@ def _mxfp4_a4w4_stage1_fw(
         kernelName1=kernelName1,
         device=device,
         use_nt=p1["use_nt"],
+        interleave=interleave,
     )
 
 
@@ -1673,20 +1680,7 @@ def get_2stage_cfgs(
         "q_type",
         "use_g1u1",
         "doweight_stage1",
-        # INTERLEAVE rows (mxfp4) vs everything else: only this split is keyed.
-        "gate_mode",
     ]
-
-    def _norm_gate_mode_col(df):
-        # CSV carries gate_mode only for INTERLEAVE (mxfp4) rows; collapse anything
-        # else (missing column, merge-fill, other modes) to "separated".
-        if "gate_mode" in df.columns:
-            df["gate_mode"] = df["gate_mode"].where(
-                df["gate_mode"] == "interleave", "separated"
-            )
-        else:
-            df["gate_mode"] = "separated"
-        return df
 
     def _ensure_gfx_column(df):
         """Guarantee a usable `gfx` column, migrating legacy cu_num-only CSVs."""
@@ -1706,7 +1700,6 @@ def get_2stage_cfgs(
         import pandas as pd
 
         df = pd.read_csv(tune_file)
-        df = _norm_gate_mode_col(df)
         df = _ensure_gfx_column(df)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") != "flydsl_fallback"]
@@ -1753,7 +1746,6 @@ def get_2stage_cfgs(
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
-        df = _norm_gate_mode_col(df)
         if "act_type" in df.columns:
             df["act_type"] = _ACT_TYPE_DISABLED_KEY
         fb_df = df[df["_tag"] == "flydsl_fallback"]
@@ -1784,7 +1776,6 @@ def get_2stage_cfgs(
     # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
     # on routed_topk; strip the fake slot before building the lookup key.
     topk -= int(is_ep)
-    key_gate_mode = "interleave" if gate_mode == GateMode.INTERLEAVE else "separated"
     keys = (
         gfx,
         cu_num,
@@ -1800,7 +1791,6 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
-        key_gate_mode,
     )
     keys_disabled = (
         gfx,
@@ -1817,7 +1807,6 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
-        key_gate_mode,
     )
 
     def MainFunc():
@@ -1978,18 +1967,29 @@ def get_2stage_cfgs(
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
             return 32
+        elif q_dtype_a == dtypes.fp4x2:
+            # MXFP4 fused quant+sort requires block_size % 32 == 0.
+            # block_m=64 is significantly faster than 32 for fp4x2 on
+            # gfx950 across all tested batch sizes (up to 1.5x for
+            # prefill).  128 is not supported by current CKTile stage2.
+            return 64
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
-    if (_is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2)) and (
-        gate_mode == GateMode.INTERLEAVE
-    ):
+    if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
+        # gate_mode is a runtime weight-layout property, not a tuning key: route
+        # any a4w4 kernelName to the port; the bound interleave flag picks the
+        # compiled il/sep variant at runtime.
         try:
             _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
         except ValueError:
             _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
         return MOEMetadata(
-            stage1=functools.partial(_mxfp4_a4w4_stage1_fw, kernelName1=kernelName1),
+            stage1=functools.partial(
+                _mxfp4_a4w4_stage1_fw,
+                kernelName1=kernelName1,
+                interleave=(gate_mode == GateMode.INTERLEAVE),
+            ),
             stage2=functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernelName2),
             block_m=_bm,
             ksplit=int(ksplit),
@@ -2239,6 +2239,7 @@ def get_2stage_cfgs(
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
+        and q_dtype_a not in [dtypes.fp4x2]
         and is_shuffled
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
         and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
@@ -2274,6 +2275,29 @@ def get_2stage_cfgs(
             run_1stage,
             has_bias=activation == ActivationType.Swiglu,
             stage2_has_bias=activation == ActivationType.Swiglu,
+        )
+    elif (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and q_dtype_a in [dtypes.fp4x2]
+        and q_dtype_w in [dtypes.fp4x2]
+    ):
+        return MOEMetadata(
+            functools.partial(
+                ck_moe_stage1,
+                quant_type=q_type,
+                activation=activation,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            ),
+            get_block_m(),
+            0,
+            False,
+            skip_inter_quant=True,
         )
 
     if (kernelName1 and "ck2stages" in kernelName1) or (
@@ -2393,7 +2417,7 @@ def fused_moe_2stages(
     bias2=None,
     topk_ids=None,
     topk_weights=None,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
     m_indices=None,
@@ -2591,6 +2615,7 @@ def fused_moe_2stages(
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
             or (metadata.ksplit > 1 and is_shuffled)
+            or metadata.skip_inter_quant
         )
     ):
         a2_scale = None
@@ -2813,8 +2838,8 @@ def torch_moe(
 
 
 # temp workaround for swiglu
-def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
-    if limit == 0.0:
+def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: Optional[float] = 7.0):
+    if limit is None:
         limit = 7.0
     # Clamp the input values
     x_glu = x_glu.clamp(min=None, max=limit)
@@ -2838,7 +2863,7 @@ def torch_moe_stage1(
     w1_scale=None,  # [expert, inter_dim, 1]
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
@@ -2945,7 +2970,7 @@ def torch_moe_stage1(
         if use_swiglu:
             out = swiglu(gate, up, limit=swiglu_limit)
         else:
-            if swiglu_limit != 0:
+            if swiglu_limit:
                 gate = gate.clamp(min=None, max=swiglu_limit)
                 up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             out = torch_act(gate) * up
@@ -3035,6 +3060,16 @@ def torch_moe_stage2(
         hidden_states = hidden_states.view(a2_shape)
 
         w2_shape = w2.shape
+        # Some TP-sharded models carry padded per_1x32 scale groups in w2_scale.
+        # Align scale groups to runtime inter_dim groups for robust torch fallback.
+        w2_scale = w2_scale.view(E, model_dim, -1)
+        w2_groups = inter_dim // 32
+        if w2_scale.shape[2] > w2_groups:
+            w2_scale = w2_scale[:, :, :w2_groups]
+        elif w2_scale.shape[2] < w2_groups:
+            pad = w2_groups - w2_scale.shape[2]
+            w2_scale = torch.nn.functional.pad(w2_scale, (0, pad), value=1.0)
+
         w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
             E, model_dim, inter_dim // 32, 1
         )
@@ -3158,8 +3193,6 @@ def cktile_moe_stage1(
     ):
         out = torch.empty(expected_out_shape, dtype=dtype, device=hidden_states.device)
     needs_post_activation = split_k > 1
-    # Split-k reduces into a token-topk workspace and applies activation after
-    # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
     workspace_rows = token_num * topk
     if needs_post_activation:
         tmp_out = torch.zeros(
@@ -3168,6 +3201,7 @@ def cktile_moe_stage1(
     else:
         tmp_out = out
     bias1 = _normalize_bias_for_kernel(bias1)
+
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,

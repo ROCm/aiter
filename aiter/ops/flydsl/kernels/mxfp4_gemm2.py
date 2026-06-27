@@ -30,7 +30,6 @@ from .mxfp4_gemm_common import (
     k_half_for,
     k_tiles_total_for,
     kunroll_for,
-    kas_c_k1_for,
     kbs_stride_n0_dw_for,
     kas_per_chunk_dw_for,
     num_n_blocks_for,
@@ -99,11 +98,6 @@ def compile_gemm2_a4w4_port(
     BK=256,
     xcd_swizzle=0,
 ):
-    print(
-        f"[PORT-FLYDSL-GEMM2] compile_gemm2_a4w4_port ENTERED "
-        f"BM={BM} use_nt={use_nt} NE={NE} N_OUT={N_OUT} epilog={epilog} D_INTER={D_INTER}",
-        flush=True,
-    )
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
     KH_TILE = BK // 2
     _K = D_INTER
@@ -128,9 +122,7 @@ def compile_gemm2_a4w4_port(
         else _aStages * _slot_bytes
     )
     _num_n_blocks = num_n_blocks_for(N_OUT, BN)
-    _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(
-        BM
-    )
+    _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(BM)
     _epi_tag = {
         "atomic": "atomic",
         "nonatomic": "nonatomic",
@@ -382,9 +374,7 @@ def _gemm2_body(
     _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
     _K_REAL = D_INTER if D_INTER_REAL is None else D_INTER_REAL
-    _n_real_half = (
-        _K_REAL + 127
-    ) // 128
+    _n_real_half = (_K_REAL + 127) // 128
     _kUnroll = kunroll_for(_K, BK)
     _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
     _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
@@ -394,9 +384,7 @@ def _gemm2_body(
     _bscale_bytes = bscale_bytes_for(NE, N_OUT, _K)
     _kbs_per_expert_dw = kbs_per_expert_dw_for(N_OUT, _K)
     _num_n_blocks = num_n_blocks_for(N_OUT, BN)
-    _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(
-        BM
-    )
+    _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(BM)
     b_aux = 2 if use_nt else 0
 
     m_block_idx = _udiv(bx_i32, _num_n_blocks)
@@ -528,9 +516,7 @@ def _gemm2_body(
                 byte_off = (
                     fx.Int32(slot * _slot_bytes) + lds_row * fx.Int32(KH_TILE) + lds_col
                 )
-                a[i][k] = llvm.load(
-                    T.vec(4, T.i32), _gep3(base_ptr, byte_off)
-                )
+                a[i][k] = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, byte_off))
         return a
 
     mfma_res_ty = T.f32x4
@@ -885,9 +871,7 @@ def _atomic_bf16_epilog(
                 pk = Vec.from_elements(
                     [v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32
                 ).to(fx.BFloat16)
-                off = (row_base_addr + fx.Int32(s * 64)) * fx.Int32(
-                    2
-                )
+                off = (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)
                 out_ptr = _gep1(out_base, off)
                 llvm.AtomicRMWOp(
                     llvm.AtomicBinOp.fadd,
