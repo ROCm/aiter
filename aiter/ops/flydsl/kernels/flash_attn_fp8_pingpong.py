@@ -525,6 +525,22 @@ def build_flash_attn_fp8_module(
             ).bitcast(fx.Int32)
             return blk_lo.shuffle(blk_hi, list(range(8)))
 
+        def _load_k_unit_global(kv_start, nt, ks):
+            # Same MFMA A-operand (vec<8xi32> = K[kv_row, d_base:d_base+32]) as
+            # _load_k_unit, but read straight from global K into VGPR
+            # (global_load_dwordx4), skipping the global->LDS->VGPR round-trip.
+            kv_row = kv_start + lo + fx.Index(nt * 32)
+            k_in_b = kv_row < seq_len_v
+            kv_safe = fx.Index(ArithValue(k_in_b).select(kv_row, fx.Index(0)))
+            d_base = fx.Index(ks * MFMA_K) + hi * 32
+            g_idx = global_idx(kv_safe, d_base)
+            gep = fx.buffer_ops.get_element_ptr(
+                k_ptr, fx.Int64(g_idx), elem_type=i8_type
+            )
+            raw = _pointer_load(v_i8x32, gep)
+            raw = ArithValue(k_in_b).select(raw, zero_qpack.ir_value())
+            return Vec(raw).bitcast(fx.Int32)
+
         def do_qk(k_buf_off, preloaded_kw, v_off):
             kw = [None] * 4
             vw_prime = [None] * PREFETCH_DEPTH
@@ -539,11 +555,13 @@ def build_flash_attn_fp8_module(
                     kw[(u + PREFETCH_DEPTH) % 4] = _load_k_unit(
                         k_buf_off, un // K_STEPS, un % K_STEPS
                     )
+                    # rocdl.sched_group_barrier(rocdl.mask_dsrd, 2, 0)
                 else:
                     vi = u - (QK_UNITS - PREFETCH_DEPTH)
                     vw_prime[vi] = read_v_pack(v_off, vi // PV_K_STEPS, vi % PV_K_STEPS)
                 _sched_barrier()
                 s_accs[nt] = mfma.call(kw[u % 4], q_packs[ks], s_accs[nt])
+                # rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 0)
             return s_accs, vw_prime
 
         def do_softmax(s_accs, m_running, set_prio=False):
@@ -636,17 +654,25 @@ def build_flash_attn_fp8_module(
             return is_first, k_buf_off, v_prev_off, k_next, v_next
 
         is_g0 = wave_id < fx.Index(NUM_WAVES // 2)
-        if is_g0:
-            dma_v(fx.Index(0), fx.Index(0))
-        else:
-            dma_k(fx.Index(0), fx.Index(0))
+        _, _, _, _k_next0, _v_next0 = _bufs(fx.Index(0))
 
-        _wait_vmcnt()
-        _gpu_barrier()
-
+        # Issue all prologue memory ops up front, back-to-back: the K-unit
+        # global prefetch (global -> VGPR) then both DMA calls (tile 0 + tile 1).
+        # The Q load (q_packs) is already issued above.
         kvw = [None] * PREFETCH_DEPTH
         for u in range_constexpr(PREFETCH_DEPTH):
-            kvw[u] = _load_k_unit(fx.Index(0), u // K_STEPS, u % K_STEPS)
+            kvw[u] = _load_k_unit_global(fx.Index(0), u // K_STEPS, u % K_STEPS)
+
+        if is_g0:
+            dma_v(fx.Index(0), fx.Index(0))
+            dma_v(_v_next0, fx.Index(BLOCK_N))
+        else:
+            dma_k(fx.Index(0), fx.Index(0))
+            dma_k(_k_next0, fx.Index(BLOCK_N))
+
+        _wait_vmcnt()
+        _wait_lgkmcnt()
+        _gpu_barrier()
 
         loop_step = fx.Int32(BLOCK_N)
         num_iters = (seq_len_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)
@@ -659,12 +685,10 @@ def build_flash_attn_fp8_module(
         of3 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
         lf = c_zero_f
 
-        _wait_lgkmcnt()
         if is_g0:
 
             def g0_iter0():
-                _, k_buf_off, _, _, v_next = _bufs(fx.Index(0))
-                dma_v(v_next, fx.Index(BLOCK_N))
+                _, k_buf_off, _, _, _ = _bufs(fx.Index(0))
 
                 v0_off = fx.Index(LDS_V_OFF)  # V^0 buf = LDSV[0]
                 sA, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v0_off)
@@ -768,8 +792,7 @@ def build_flash_attn_fp8_module(
         else:
 
             def g1_iter0():
-                _, k_buf_off, _, k_next, _ = _bufs(fx.Index(0))
-                dma_k(k_next, fx.Index(BLOCK_N))
+                _, k_buf_off, _, _, _ = _bufs(fx.Index(0))
 
                 v0_off = fx.Index(LDS_V_OFF)  # V^0 buf = LDSV[0]
                 sB, vwp = do_qk(k_buf_off, preloaded_kw=kvw, v_off=v0_off)
