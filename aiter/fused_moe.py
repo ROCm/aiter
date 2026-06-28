@@ -1254,6 +1254,12 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    is_ck_bf16_moe = (
+        q_type == QuantType.No
+        and dtype == torch.bfloat16
+        and q_dtype_a == torch.bfloat16
+        and q_dtype_w == torch.bfloat16
+    )
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -1307,6 +1313,12 @@ def get_2stage_cfgs(
         aiter.logger.info(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
+        if is_ck_bf16_moe:
+            logger.info(
+                f"[fused_moe][ck_bf16] no tuned config used for {keys}; "
+                f"using default heuristics block_m={block_m}, ksplit={ksplit}, "
+                f"use_nt={use_non_temporal_load}, tune_file={tune_file}"
+            )
     else:
         block_m = cfg["block_m"]
         if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
@@ -1330,6 +1342,13 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
+        if is_ck_bf16_moe:
+            logger.info(
+                f"[fused_moe][ck_bf16] tuned config used for {keys}: "
+                f"kernelName1={kernelName1}, kernelName2={kernelName2}, "
+                f"block_m={block_m}, ksplit={ksplit}, run_1stage={run_1stage}, "
+                f"use_nt={use_non_temporal_load}, tune_file={tune_file}"
+            )
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(

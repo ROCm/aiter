@@ -309,6 +309,67 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_nvfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for supported nvfp4_bf16 stage1 configs."""
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "nvfp4"
+    tile_ks = [64, 128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                name = flydsl_kernel_name(
+                    1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                )
+                kernels[name] = {
+                    "stage": 1,
+                    "a_dtype": a_dtype,
+                    "b_dtype": b_dtype,
+                    "out_dtype": out_dtype,
+                    "tile_m": tm,
+                    "tile_n": tn,
+                    "tile_k": tk,
+                    "MPerBlock": tm,
+                    "in_dtype": "nvfp4_bf16",
+                }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_nvfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for supported nvfp4_bf16 stage2 configs."""
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "nvfp4"
+    tile_ks = [64, 128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    kernels[name] = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "nvfp4_bf16",
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -320,6 +381,8 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_nvfp4_bf16(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_nvfp4_bf16(out))
 
 
 _register_all_configs()
@@ -405,6 +468,31 @@ def compile_flydsl_moe_stage1(
             scale_is_bf16=True,
             k_batch=k_batch,
         )
+    elif a_dtype == "bf16" and b_dtype == "nvfp4":
+        # nvfp4_bf16: bf16 activations, fp4_e2m1 weights with fp8_e4m3
+        # block scales (group_size=16) and a global f32 scale.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        # split-K needs cshuffle (None -> auto-enable); non-split-K uses direct epilog
+        # because stage1 CShuffle currently only supports f16 output.
+        _use_cshuffle = None if k_batch > 1 else False
+
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="nvfp4_bf16",
+            group_size=16,
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=_use_cshuffle,
+            scale_is_bf16=False,
+            k_batch=k_batch,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -486,6 +574,27 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             scale_is_bf16=True,
+        )
+    elif a_dtype == "bf16" and b_dtype == "nvfp4":
+        # nvfp4_bf16: bf16 activations, fp4_e2m1 weights with fp8_e4m3
+        # block scales (group_size=16) and a global f32 scale. The low-level
+        # compiler currently has only the dtype/plumbing stub.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="nvfp4_bf16",
+            group_size=16,
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            scale_is_bf16=False,
         )
     else:
         raise ValueError(
@@ -570,6 +679,7 @@ def _s1_args_std(
     w,
     a_scale,
     w_scale,
+    global_scale,
     sorted_ids,
     sorted_expert_ids,
     sorted_weights,
@@ -588,6 +698,7 @@ def _s1_args_std(
         _ptr_view_safe(w),
         _ptr_view_safe(a_scale),
         _ptr_view_safe(w_scale),
+        _ptr_view_safe(global_scale),
         _ptr_view_safe(sorted_ids),
         _ptr_view_safe(sorted_expert_ids),
         _ptr_view_safe(sorted_weights),
@@ -650,6 +761,7 @@ def _s2_args_std(
     w,
     a_scale,
     w_scale,
+    global_scale,
     sorted_ids,
     sorted_expert_ids,
     sorted_weights,
@@ -668,6 +780,7 @@ def _s2_args_std(
         _ptr_view_safe(w),
         _ptr_view_safe(a_scale),
         _ptr_view_safe(w_scale),
+        _ptr_view_safe(global_scale),
         _ptr_view_safe(sorted_ids),
         _ptr_view_safe(sorted_expert_ids),
         _ptr_view_safe(sorted_weights),
@@ -1037,6 +1150,7 @@ def flydsl_moe_stage1(
     act: str = "silu",
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
     persist_m: int = 0,
     use_async_copy: bool = False,
@@ -1128,6 +1242,11 @@ def flydsl_moe_stage1(
     flat_w_scale = (
         w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
     )
+    flat_global_scale = (
+        global_scale.view(-1)
+        if global_scale is not None
+        else torch.empty(0, device=dev)
+    )
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1202,6 +1321,7 @@ def flydsl_moe_stage1(
             w1.view(-1),
             flat_a_scale,
             flat_w_scale,
+            flat_global_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -1387,6 +1507,7 @@ def flydsl_moe_stage2(
     mode: str = "atomic",
     w2_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
     persist: Optional[bool] = None,
@@ -1469,6 +1590,11 @@ def flydsl_moe_stage2(
     flat_w_scale = (
         w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
     )
+    flat_global_scale = (
+        global_scale.view(-1)
+        if global_scale is not None
+        else torch.empty(0, device=dev)
+    )
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1533,6 +1659,7 @@ def flydsl_moe_stage2(
             w2,
             flat_a_scale,
             flat_w_scale,
+            flat_global_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
