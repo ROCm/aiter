@@ -916,31 +916,6 @@ if not args.no_legacy:
     _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
 
-# Kimi-K2.5 TP4 only
-case_iter = (
-    (
-        dict(
-            dtype=dtypes.bf16,
-            token=m,
-            model_dim=7168,
-            inter_dim=512,
-            E=385,
-            topk=9,
-            actType=aiter.ActivationType.Silu,
-            gateMode=_effective_gate_mode(dtypes.fp4x2, dtypes.fp4x2),
-            qType=aiter.QuantType.per_1x32,
-            AQDType=dtypes.fp4x2,
-            WQDType=dtypes.fp4x2,
-            use_g1u1=True,
-            doweight_stage1=False,
-            strict_accuracy=True,
-            check_aot_cache=False,
-        ),
-        {"model": "kimi_k2_5_tp4"},
-    )
-    for m in args.tokenNum
-)
-
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
 
 

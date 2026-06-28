@@ -5,7 +5,6 @@ import functools
 import os
 import re
 from dataclasses import dataclass
-import importlib.util
 from enum import Enum
 from typing import Callable, Optional
 
@@ -99,60 +98,6 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
-@functools.lru_cache(maxsize=1)
-def _mxfp4_sort_shapes():
-    try:
-        path = os.path.join(
-            AITER_CSRC_DIR,
-            "kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py",
-        )
-        spec = importlib.util.spec_from_file_location("_mxfp4_gen_instances", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return frozenset(tuple(s) for s in mod.SHAPES)
-    except Exception as e:
-        logger.warning(f"adaptive sort: could not load codegen SHAPES ({e}); disabling")
-        return frozenset()
-
-
-def _adaptive_sort_supported_shape(num_experts, topk, block_size, model_dim):
-    shapes = _mxfp4_sort_shapes()
-    if block_size in (32, 128):
-        # 3stage key = NE_TOPK_MB only; D_HIDDEN/D_INTER do not appear.
-        return any(ne == num_experts and tk == topk for (ne, _h, _e, tk) in shapes)
-    if block_size == 16:
-        # BM16 key additionally pins D_HIDDEN.
-        return any(
-            ne == num_experts and h == model_dim and tk == topk
-            for (ne, h, _e, tk) in shapes
-        )
-    return False
-
-
-def _use_adaptive_sort(
-    num_experts,
-    topk,
-    block_size,
-    model_dim,
-    dispatch_policy,
-    expert_mask,
-    return_local_topk_ids,
-    accumulate,
-):
-    if _MOE_SORT_BACKEND in ("opus", "ck"):
-        return False
-    if (
-        expert_mask is not None
-        or return_local_topk_ids
-        or dispatch_policy != 0
-        or accumulate
-    ):
-        return False
-    if _MOE_SORT_BACKEND == "adaptive":
-        return True
-    return _adaptive_sort_supported_shape(num_experts, topk, block_size, model_dim)
-
-
 def _adaptive_moe_sort(
     topk_ids,
     topk_weights,
@@ -240,27 +185,6 @@ def _moe_sorting_impl(
             model_dim,
             atomic=accumulate,
             emit_aux=True,
-            moebuf_dtype=moebuf_dtype,
-        )
-    if _use_adaptive_sort(
-        num_experts,
-        topk,
-        block_size,
-        model_dim,
-        dispatch_policy,
-        expert_mask,
-        return_local_topk_ids,
-        accumulate,
-    ):
-        return _adaptive_moe_sort(
-            topk_ids,
-            topk_weights,
-            num_experts,
-            topk,
-            block_size,
-            model_dim,
-            atomic=accumulate,
-            emit_aux=False,
             moebuf_dtype=moebuf_dtype,
         )
 
@@ -601,16 +525,13 @@ def fused_moe_(
         # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
         q_dtype_a = dtypes.fp8
     elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu:
-            if gate_mode == GateMode.SEPARATED:
-                q_dtype_a = (
-                    dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
-                )
-            elif gate_mode == GateMode.INTERLEAVE:
-                if get_gfx() != "gfx950" or M < bf16_fp8_bound:
-                    q_dtype_a = dtypes.bf16
-                else:
-                    q_dtype_a = dtypes.fp8
+        if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
+            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
+            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
 
