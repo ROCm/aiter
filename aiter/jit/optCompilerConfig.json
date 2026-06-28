@@ -92,6 +92,17 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla --output_dir {{}}'"
     },
+    "module_mla_v4_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla_v4.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m mla_v4 --output_dir {{}}'"
+    },
     "module_cache": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/cache_pybind.cu'",
@@ -515,7 +526,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-ffast-math'"
+            "'-ffast-math'",
+            "'-mllvm -enable-post-misched=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -525,8 +537,19 @@
     "module_moe_topk": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/topk_gating_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_moe_topk_ck": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/moe_topk_ck_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/topk_sigmoid_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/topk_gating_kernels.cu'",
             "f'{CK_DIR}/example/ck_tile/09_topk_softmax/topk_softmax_api.cpp'"
         ],
         "flags_extra_cc": [],
@@ -1591,6 +1614,21 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/chunk_gated_delta_rule_fwd_h_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/chunk_gated_delta_rule_fwd_h.cu'"
+        ],
+        "flags_extra_cc": [
+        ],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_causal_conv1d_fwd_split_qkv": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/causal_conv1d_fwd_split_qkv_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/causal_conv1d_fwd_split_qkv.cu'"
         ],
         "flags_extra_cc": [
         ],

@@ -123,7 +123,28 @@ struct __attribute__((packed)) MlaMi400KernelArgs
     p2 _p17;
 };
 
-static_assert(sizeof(MlaMi400KernelArgs) == 288, "MLA mi400 packed args must be 18*16=288B");
+struct __attribute__((packed)) MlaMi400PackedKernelArgs
+{
+    void* ptr_R;                  // dword 0-1
+    void* ptr_LSE;                // dword 2-3
+    void* ptr_Q;                  // dword 4-5
+    void* ptr_KV;                 // dword 6-7
+    void* ptr_LTP;                // dword 8-9
+    void* ptr_LTD;                // dword 10-11
+    void* ptr_LTL;                // dword 12-13
+    void* ptr_QTP;                // dword 14-15
+    void* ptr_QSCALE;             // dword 16-17
+    void* ptr_KVSCALE;            // dword 18-19
+    void* ptr_VALID_SPLIT_COUNT;  // dword 20-21
+    unsigned int out_16_nosplit;  // dword 22
+    float scalar;                 // dword 23
+    unsigned int q_seq_lens;      // dword 24
+    unsigned int passes;          // dword 25
+    unsigned int stride_page;     // dword 26
+    unsigned int log2_page;       // dword 27
+    unsigned int stride_Q;        // dword 28
+    unsigned int use_valid_split_count_reduce;  // dword 29
+};
 
 std::string get_heuristic_kernel_mla(std::string q_type,
                                      std::string kv_type,
@@ -264,6 +285,8 @@ static void mla_decode_mi400_dispatch(
     aiter_tensor_t* lse,
     aiter_tensor_t* q_scale,
     aiter_tensor_t* kv_scale,
+    aiter_tensor_t* valid_split_count,
+    int use_valid_split_count_reduce,
     hipStream_t stream)
 {
     (void)lse;
@@ -293,6 +316,10 @@ static void mla_decode_mi400_dispatch(
     const int num_heads    = Q->size(1);
     const int gqa_ratio    = num_heads / nhead_kv;
     const int kv_split     = splitData->size(1);
+    // TODO: Keep the ABI decision in this host dispatch layer: it owns kernel
+    // selection and the exact kernarg layout. qh128 remains on the legacy ABI
+    // for e2e stability; the other gfx1250 mi400 kernels use packed preload.
+    const bool use_packed_mi400_args = !(gqa_ratio == 128 && max_seqlen_q == 1);
     constexpr int bdx      = 128;
     constexpr int bdy      = 1;
     constexpr int bdz      = 1;
@@ -306,6 +333,8 @@ static void mla_decode_mi400_dispatch(
     // heuristic lookup is keyed by (gqa_ratio, max_seqlen_q), so reject any combo
     // that has no registered kernel before touching the dispatch path.
     const bool supported_variant =
+        (gqa_ratio == 8 &&
+         (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 3 || max_seqlen_q == 4)) ||
         (gqa_ratio == 16 && (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 4)) ||
         (gqa_ratio == 32 && max_seqlen_q == 1) ||
         (gqa_ratio == 64 && max_seqlen_q == 1) ||
@@ -316,7 +345,7 @@ static void mla_decode_mi400_dispatch(
                 gqa_ratio,
                 " max_seqlen_q=",
                 max_seqlen_q,
-                " (supported: gqa16 x qSeqLen{1,2,4}, gqa32 x qSeqLen1, gqa64 x qSeqLen1, "
+                " (supported: gqa8 x qSeqLen{1,2,3,4}, gqa16 x qSeqLen{1,2,4}, gqa32 x qSeqLen1, gqa64 x qSeqLen1, "
                 "gqa128 x qSeqLen1)");
     const int sub_Q = gqa_ratio * max_seqlen_q;
     AITER_CHECK(page_size == 64, __func__, ": only support page_size == 64 for minimal smoke");
@@ -328,6 +357,18 @@ static void mla_decode_mi400_dispatch(
     AITER_CHECK(q_scale->dtype() == AITER_DTYPE_fp32 && kv_scale->dtype() == AITER_DTYPE_fp32,
                 __func__,
                 ": q_scale and kv_scale must be fp32");
+    if(use_packed_mi400_args)
+    {
+        AITER_CHECK(valid_split_count != nullptr && valid_split_count->data_ptr() != nullptr,
+                    __func__,
+                    ": gfx1250 packed MLA requires valid_split_count scratch tensor");
+        AITER_CHECK(valid_split_count->dtype() == AITER_DTYPE_i32,
+                    __func__,
+                    ": valid_split_count must be int32");
+        AITER_CHECK(valid_split_count->size(0) >= batch,
+                    __func__,
+                    ": valid_split_count must have at least batch entries");
+    }
     // ABI contract with the mi400 .co: with out_16_nosplit==1 the passes==1
     // fast-path writes FINAL bf16 output directly into R. For passes>1, R holds
     // fp32 split partials that Python reduces in stage2.
@@ -366,38 +407,71 @@ static void mla_decode_mi400_dispatch(
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
     }
 
-    // gfx1250 mi400 dispatch: fill kernarg pack to match the layout produced by
-    // poc_kl/mi400/mla/mla_execute_v3_hip.inl::execute_v3_kernel (struct
-    // MlaV3HipKernelArgs). poc_kl multiplies CLI q_seq_lens by gqa_ratio
-    // before filling these slots, so the kernel sees the flattened Q/head
-    // extent rather than the user-visible token count.
+    // gfx1250 mi400 dispatch. qh128 is temporarily left on the legacy 288B ABI
+    // because it is used by e2e. Other gfx1250 private kernels use the new
+    // 120B packed-preload ABI from poc_kl/mi400/mla/mla_execute_v3_hip.inl.
     const int q_elem_size = Q->element_size();
     const int qk_head_dim = Q->size(2);
     const int q_seq_lens_kernel = max_seqlen_q * gqa_ratio;
-    MlaMi400KernelArgs args = {};
-    size_t arg_size         = sizeof(args);
-    args.ptr_R              = splitData->data_ptr();
-    args.ptr_LSE            = splitLse->data_ptr();
-    args.ptr_Q              = Q->data_ptr();
-    args.ptr_KV             = KV->data_ptr();
-    args.ptr_LTP            = kv_indptr->data_ptr();
-    args.ptr_LTD            = kv_page_indices->data_ptr();
-    args.ptr_LTL            = kv_last_page_lens->data_ptr();
-    args.scalar             = softmax_scale;
-    // poc_kl host: kargs.q_seq_lens_a = (cl_int)params.q_seq_lens.
-    args.q_seq_lens         = static_cast<unsigned int>(q_seq_lens_kernel);
-    args.passes             = kv_split;
-    // poc_kl host: stride_Q = num_kv_heads * q_seq_lens * dim_qk * sizeof(TQ).
-    args.stride_Q = static_cast<unsigned int>(nhead_kv * q_seq_lens_kernel * qk_head_dim * q_elem_size);
-    args.stride_page = static_cast<unsigned int>(KV->stride(0) * KV->element_size());
-    args.log2_page          = static_cast<unsigned int>(log2f(static_cast<float>(page_size)));
-    args.ptr_QTP            = qo_indptr->data_ptr();
-    args.ptr_STP            = num_kv_splits_indptr->data_ptr();
-    // out_16_nosplit==1 enables the passes==1 BF16 fast-path. Multi-split
-    // launches emit fp32 split partials for the Python stage2 reducer.
-    args.out_16_nosplit     = (kv_split == 1) ? 1 : 0;
-    args.ptr_QROPE          = q_scale->data_ptr();
-    args.ptr_KVROPE         = kv_scale->data_ptr();
+    const unsigned int stride_Q =
+        static_cast<unsigned int>(nhead_kv * q_seq_lens_kernel * qk_head_dim * q_elem_size);
+    const unsigned int stride_page = static_cast<unsigned int>(KV->stride(0) * KV->element_size());
+    const unsigned int log2_page = static_cast<unsigned int>(log2f(static_cast<float>(page_size)));
+    const unsigned int out_16_nosplit = (kv_split == 1) ? 1 : 0;
+
+    MlaMi400KernelArgs legacy_args = {};
+    MlaMi400PackedKernelArgs packed_args = {};
+    void* kernarg_ptr = nullptr;
+    size_t arg_size = 0;
+
+    if(!use_packed_mi400_args)
+    {
+        legacy_args.ptr_R = splitData->data_ptr();
+        legacy_args.ptr_LSE = splitLse->data_ptr();
+        legacy_args.ptr_Q = Q->data_ptr();
+        legacy_args.ptr_KV = KV->data_ptr();
+        legacy_args.ptr_LTP = kv_indptr->data_ptr();
+        legacy_args.ptr_LTD = kv_page_indices->data_ptr();
+        legacy_args.ptr_LTL = kv_last_page_lens->data_ptr();
+        legacy_args.scalar = softmax_scale;
+        legacy_args.q_seq_lens = static_cast<unsigned int>(q_seq_lens_kernel);
+        legacy_args.passes = kv_split;
+        legacy_args.stride_Q = stride_Q;
+        legacy_args.stride_page = stride_page;
+        legacy_args.log2_page = log2_page;
+        legacy_args.ptr_QTP = qo_indptr->data_ptr();
+        legacy_args.ptr_STP = num_kv_splits_indptr->data_ptr();
+        legacy_args.out_16_nosplit = out_16_nosplit;
+        legacy_args.ptr_QROPE = q_scale->data_ptr();
+        legacy_args.ptr_KVROPE = kv_scale->data_ptr();
+        kernarg_ptr = &legacy_args;
+        arg_size = sizeof(legacy_args);
+    }
+    else
+    {
+        packed_args.ptr_R = splitData->data_ptr();
+        packed_args.ptr_LSE = splitLse->data_ptr();
+        packed_args.ptr_Q = Q->data_ptr();
+        packed_args.ptr_KV = KV->data_ptr();
+        packed_args.ptr_LTP = kv_indptr->data_ptr();
+        packed_args.ptr_LTD = kv_page_indices->data_ptr();
+        packed_args.ptr_LTL = kv_last_page_lens->data_ptr();
+        packed_args.ptr_QTP = qo_indptr->data_ptr();
+        packed_args.ptr_QSCALE = q_scale->data_ptr();
+        packed_args.ptr_KVSCALE = kv_scale->data_ptr();
+        packed_args.ptr_VALID_SPLIT_COUNT = valid_split_count->data_ptr();
+        packed_args.out_16_nosplit = out_16_nosplit;
+        packed_args.scalar = softmax_scale;
+        packed_args.q_seq_lens = static_cast<unsigned int>(q_seq_lens_kernel);
+        packed_args.passes = kv_split;
+        packed_args.stride_page = stride_page;
+        packed_args.log2_page = log2_page;
+        packed_args.stride_Q = stride_Q;
+        packed_args.use_valid_split_count_reduce =
+            static_cast<unsigned int>(use_valid_split_count_reduce != 0);
+        kernarg_ptr = &packed_args;
+        arg_size = sizeof(packed_args);
+    }
 
     const int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
     const int gdy = batch;
@@ -466,86 +540,35 @@ static void mla_decode_mi400_dispatch(
                 output->stride(0),
                 output->stride(1),
                 output->stride(2));
+    std::printf("[aiter][mi400][debug] ABI=%s arg_size=%zu\n",
+                use_packed_mi400_args ? "packed-120B" : "legacy-288B-qh128",
+                arg_size);
     std::printf("[aiter][mi400][debug] ptrs: R=%p LSE=%p Q=%p KV=%p LTP=%p LTD=%p LTL=%p "
-                "QTP=%p STP=%p QROPE=%p KVROPE=%p output=%p final_lse=%p stream=%p\n",
-                args.ptr_R,
-                args.ptr_LSE,
-                args.ptr_Q,
-                args.ptr_KV,
-                args.ptr_LTP,
-                args.ptr_LTD,
-                args.ptr_LTL,
-                args.ptr_QTP,
-                args.ptr_STP,
-                args.ptr_QROPE,
-                args.ptr_KVROPE,
+                "QTP=%p QSCALE=%p KVSCALE=%p VSC=%p output=%p final_lse=%p stream=%p\n",
+                splitData->data_ptr(),
+                splitLse->data_ptr(),
+                Q->data_ptr(),
+                KV->data_ptr(),
+                kv_indptr->data_ptr(),
+                kv_page_indices->data_ptr(),
+                kv_last_page_lens->data_ptr(),
+                qo_indptr->data_ptr(),
+                q_scale->data_ptr(),
+                kv_scale->data_ptr(),
+                valid_split_count == nullptr ? nullptr : valid_split_count->data_ptr(),
                 output->data_ptr(),
                 lse == nullptr ? nullptr : lse->data_ptr(),
                 stream);
-    std::printf("[aiter][mi400][debug] kernargs: arg_size=%zu scalar=%g q_seq_lens=%u "
-                "passes=%u stride_Q=%u stride_page=%u log2_page=%u out_16_nosplit=%u\n",
-                arg_size,
-                args.scalar,
-                args.q_seq_lens,
-                args.passes,
-                args.stride_Q,
-                args.stride_page,
-                args.log2_page,
-                args.out_16_nosplit);
-    std::printf("[aiter][mi400][debug][arg00] offset=%zu name=ptr_R value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_R),
-                args.ptr_R);
-    std::printf("[aiter][mi400][debug][arg01] offset=%zu name=ptr_LSE value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_LSE),
-                args.ptr_LSE);
-    std::printf("[aiter][mi400][debug][arg02] offset=%zu name=ptr_Q value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_Q),
-                args.ptr_Q);
-    std::printf("[aiter][mi400][debug][arg03] offset=%zu name=ptr_KV value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_KV),
-                args.ptr_KV);
-    std::printf("[aiter][mi400][debug][arg04] offset=%zu name=ptr_LTP value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_LTP),
-                args.ptr_LTP);
-    std::printf("[aiter][mi400][debug][arg05] offset=%zu name=ptr_LTD value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_LTD),
-                args.ptr_LTD);
-    std::printf("[aiter][mi400][debug][arg06] offset=%zu name=ptr_LTL value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_LTL),
-                args.ptr_LTL);
-    std::printf("[aiter][mi400][debug][arg07] offset=%zu name=scalar value=%g\n",
-                offsetof(MlaMi400KernelArgs, scalar),
-                args.scalar);
-    std::printf("[aiter][mi400][debug][arg08] offset=%zu name=q_seq_lens value=%u\n",
-                offsetof(MlaMi400KernelArgs, q_seq_lens),
-                args.q_seq_lens);
-    std::printf("[aiter][mi400][debug][arg09] offset=%zu name=passes value=%u\n",
-                offsetof(MlaMi400KernelArgs, passes),
-                args.passes);
-    std::printf("[aiter][mi400][debug][arg10] offset=%zu name=stride_Q value=%u\n",
-                offsetof(MlaMi400KernelArgs, stride_Q),
-                args.stride_Q);
-    std::printf("[aiter][mi400][debug][arg11] offset=%zu name=stride_page value=%u\n",
-                offsetof(MlaMi400KernelArgs, stride_page),
-                args.stride_page);
-    std::printf("[aiter][mi400][debug][arg12] offset=%zu name=log2_page value=%u\n",
-                offsetof(MlaMi400KernelArgs, log2_page),
-                args.log2_page);
-    std::printf("[aiter][mi400][debug][arg13] offset=%zu name=ptr_QTP value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_QTP),
-                args.ptr_QTP);
-    std::printf("[aiter][mi400][debug][arg14] offset=%zu name=ptr_STP value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_STP),
-                args.ptr_STP);
-    std::printf("[aiter][mi400][debug][arg15] offset=%zu name=out_16_nosplit value=%u\n",
-                offsetof(MlaMi400KernelArgs, out_16_nosplit),
-                args.out_16_nosplit);
-    std::printf("[aiter][mi400][debug][arg16] offset=%zu name=ptr_QROPE value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_QROPE),
-                args.ptr_QROPE);
-    std::printf("[aiter][mi400][debug][arg17] offset=%zu name=ptr_KVROPE value=%p\n",
-                offsetof(MlaMi400KernelArgs, ptr_KVROPE),
-                args.ptr_KVROPE);
+    std::printf("[aiter][mi400][debug] kernargs: scalar=%g q_seq_lens=%u passes=%u "
+                "stride_Q=%u stride_page=%u log2_page=%u out_16_nosplit=%u use_valid_split_count_reduce=%u\n",
+                softmax_scale,
+                static_cast<unsigned int>(q_seq_lens_kernel),
+                static_cast<unsigned int>(kv_split),
+                stride_Q,
+                stride_page,
+                log2_page,
+                out_16_nosplit,
+                use_packed_mi400_args ? packed_args.use_valid_split_count_reduce : 0u);
     std::printf("[aiter][mi400][debug] launch: grid=(%d,%d,%d) block=(%d,%d,%d)\n",
                 gdx,
                 gdy,
@@ -573,7 +596,7 @@ static void mla_decode_mi400_dispatch(
     if(!skip_kernel)
     {
 #endif
-    impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, bdx, bdy, bdz, stream});
+    impl_ptr->launch_kernel({kernarg_ptr, &arg_size, gdx, gdy, gdz, bdx, bdy, bdz, stream});
 #ifdef ASM_DEBUG
         hipError_t launch_status = hipGetLastError();
         std::printf("[aiter][mi400][debug] after launch enqueue: hipGetLastError=%s (%d)\n",
@@ -643,6 +666,8 @@ void mla_decode_stage1_asm_fwd(
     aiter_tensor_t* g_kv_indptr,          //   [batch_size+1] GLOBAL kv_indptr for round-robin CP (nullable)
     int cp_world_size,                    //   round-robin CP world size (1 == disabled)
     int cp_rank,                          //   round-robin CP rank id
+    aiter_tensor_t* valid_split_count,    //   [batch_size] scratch for packed gfx1250 kernels (nullable)
+    int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -679,6 +704,8 @@ void mla_decode_stage1_asm_fwd(
                                          lse,
                                          q_scale,
                                          kv_scale,
+                                         valid_split_count,
+                                         use_valid_split_count_reduce,
                                          stream);
     }
 
@@ -921,8 +948,12 @@ void mla_decode_stage1_asm_fwd(
     } else if (gqa_ratio == 8){
         if (q_type == "bf16" && kv_type == "bf16"){
             if(!persistent){
-                config_max_seqlen_q = 1;
-                sub_Q = 8;
+                if(max_seqlen_q == 1){
+                    sub_Q = gqa_ratio;
+                } else if(max_seqlen_q == 2){
+                    sub_Q = gqa_ratio * max_seqlen_q;
+                    args.s_MQA = gqa_ratio;
+                }
             }
         } else if (q_type == "fp8" && kv_type == "fp8"){
             if(!persistent && max_seqlen_q == 1){
