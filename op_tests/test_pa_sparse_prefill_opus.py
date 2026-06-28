@@ -3,9 +3,19 @@
 
 """Tests for aiter's OPUS-based sparse paged prefill attention.
 
-We validate ``pa_sparse_prefill_opus`` (the gfx950 OPUS kernel for
-two-region sparse paged prefill attention) against an explicit PyTorch
-reference: per-token online-softmax + per-head sink.
+We validate both precision variants of the gfx950 OPUS two-region sparse
+paged prefill kernel against explicit PyTorch references (per-token
+online-softmax + per-head sink):
+
+* ``pa_sparse_prefill_opus`` -- bf16/fp16 Q/K/V/O in a single ``D=512``
+  head-dim tensor.
+* ``pa_sparse_prefill_fp8_opus`` -- split-precision DSA inputs: NoPE part
+  in fp8 (with embedded per-32-block E8M0 scales, 448 + 14 scales + pad =
+  512 fp8 slots/row) plus a bf16 RoPE part (64), bf16 output.
+
+A single ``prec`` axis (``"bf16"`` / ``"fp16"`` / ``"fp8"``) drives both
+paths through the same shape/mode sweep, so fp8 is exercised with the same
+test parameters as bf16/fp16.
 
 The same harness drives:
 
@@ -15,15 +25,15 @@ The same harness drives:
 
 Example CLI usage (inside the aiter source tree)::
 
-    # default sweep: N x H_Q x total_pages x {sparse, dense} (bf16), with bench
+    # default sweep: N x H_Q x total_pages x {sparse, dense} x {bf16, fp8}, with bench
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py
 
     # only dense CSR for both prefix and extend
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py --mode dense
 
-    # single shape, bf16 only, no correctness check
+    # single shape, fp8 only, no correctness check
     PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill_opus.py \\
-        -n 1024 --h_q 128 --dtype bf16 --mode sparse --no-verify
+        -n 1024 --h_q 128 --prec fp8 --mode sparse --no-verify
 
 Reference design notes (Q&A):
 
@@ -53,7 +63,10 @@ import pytest
 import torch
 
 import aiter  # noqa: F401  (registers the top-level export)
-from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
+from aiter.ops.pa_sparse_prefill_opus import (
+    pa_sparse_prefill_opus,
+    pa_sparse_prefill_fp8_opus,
+)
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 # ---------------------------------------------------------------------------
@@ -150,6 +163,95 @@ def _ref_pa_sparse_prefill_opus(
         p = exp_scores / denom
         out[i] = (p @ kv_rows).to(q.dtype)
 
+    return out
+
+
+# ---------------------------------------------------------------------------
+# FP8 DSA packing + reference (NoPE fp8 / RoPE bf16).
+#
+# The NoPE stream packs, per row of 512 fp8 slots:
+#   [ NoPE fp8 (448) | E8M0 block scales (14) | fp8 zero-pad (50) ]
+# with one E8M0 (power-of-two) scale per 32-element NoPE block. The RoPE
+# stream is a separate ``[*, 64]`` bf16 tensor. The kernel runs NoPE QK^T as
+# scaled MXFP8 MFMA, RoPE QK^T and PV at bf16, and accumulates in fp32.
+# ---------------------------------------------------------------------------
+
+_FP8_D_NOPE = 448
+_FP8_D_NOPE_PADDED = 512
+_FP8_D_ROPE = 64
+_FP8_D_HEAD = _FP8_D_NOPE + _FP8_D_ROPE  # 512
+_FP8_NBLK = _FP8_D_NOPE // 32  # 14
+_FP8_BLK = 32
+_FP8_MAX = 448.0  # e4m3fn max normal
+_FP8_KV_TILE_SIZE = 64  # KV_TILE_SIZE of the fp8 16mx1_16nx4 kernel
+
+
+def _quantize_nope(real: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``[R, 448]`` real values into a packed ``[R, 512]`` fp8 row
+    (NoPE fp8 + E8M0 block scales + zero pad) and return ``(packed_fp8, deq)``
+    where ``deq`` (``[R, 448]`` fp32) is the dequantized NoPE the kernel sees.
+    """
+    r = real.shape[0]
+    blk = real.reshape(r, _FP8_NBLK, _FP8_BLK).to(torch.float32)
+    amax = blk.abs().amax(dim=-1)  # [R, NBLK]
+
+    # Per-block E8M0 exponent chosen so the block max maps to (224, 448], i.e.
+    # strictly inside the e4m3fn finite range (overflow -> NaN on cast).
+    e_unbiased = torch.ceil(torch.log2(amax.clamp(min=1e-30) / _FP8_MAX)).to(
+        torch.int32
+    )
+    e_unbiased = torch.where(amax == 0, torch.zeros_like(e_unbiased), e_unbiased)
+    e_byte = (e_unbiased + 127).clamp(0, 255).to(torch.uint8)  # [R, NBLK]
+    s = torch.exp2(e_unbiased.to(torch.float32)).unsqueeze(-1)  # [R, NBLK, 1]
+
+    q = (blk / s).to(torch.float8_e4m3fn)  # [R, NBLK, BLOCK]
+    deq = (q.to(torch.float32) * s).reshape(r, _FP8_D_NOPE)
+
+    packed = torch.zeros(r, _FP8_D_NOPE_PADDED, dtype=torch.uint8, device=real.device)
+    packed[:, :_FP8_D_NOPE] = q.reshape(r, _FP8_D_NOPE).view(torch.uint8)
+    packed[:, _FP8_D_NOPE : _FP8_D_NOPE + _FP8_NBLK] = e_byte
+    return packed.view(torch.float8_e4m3fn), deq
+
+
+def _ref_pa_sparse_prefill_fp8(
+    q_fp32: torch.Tensor,  # [N, H, 512] fp32 (dequant NoPE + RoPE)
+    ukv_fp32: torch.Tensor,  # [total_pages, 512] fp32
+    kv_fp32: torch.Tensor,  # [total_tokens, 512] fp32
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """fp8 reference: identical attention math to the bf16 ref, but operating
+    on the already-dequantized ``concat(dequant_NoPE, RoPE)`` rows the kernel
+    consumes (so only the kernel's bf16 intermediates / MFMA rounding differ).
+    """
+    n, h, _ = q_fp32.shape
+    out = torch.zeros(n, h, _FP8_D_HEAD, dtype=torch.bfloat16, device=q_fp32.device)
+    pp = kv_indptr_prefix.to(torch.int64).cpu().tolist()
+    pe = kv_indptr_extend.to(torch.int64).cpu().tolist()
+    pidx = kv_indices_prefix.to(torch.int64)
+    eidx = kv_indices_extend.to(torch.int64)
+    sink_f = attn_sink.to(torch.float32)
+
+    for i in range(n):
+        rows = []
+        if pp[i + 1] > pp[i]:
+            rows.append(ukv_fp32.index_select(0, pidx[pp[i] : pp[i + 1]]))
+        if pe[i + 1] > pe[i]:
+            rows.append(kv_fp32.index_select(0, eidx[pe[i] : pe[i + 1]]))
+        if not rows:
+            continue
+        kv_rows = torch.cat(rows, dim=0)  # [nnz, 512]
+        scores = q_fp32[i] @ kv_rows.t() * softmax_scale  # [H, nnz]
+        sink_col = sink_f.unsqueeze(1)
+        m = torch.cat([scores, sink_col], dim=1).amax(dim=1, keepdim=True)
+        e_s = torch.exp(scores - m)
+        e_sink = torch.exp(sink_col - m)
+        denom = e_s.sum(dim=1, keepdim=True) + e_sink
+        out[i] = ((e_s / denom) @ kv_rows).to(torch.bfloat16)
     return out
 
 
@@ -310,6 +412,84 @@ def _make_inputs(
     )
 
 
+def _make_inputs_fp8(
+    n: int,
+    h: int,
+    total_pages: int,
+    total_tokens: int,
+    *,
+    mode: str = "sparse",
+    device: torch.device | str = "cuda",
+    seed: int = 0,
+) -> dict:
+    """Build split NoPE-fp8 / RoPE-bf16 inputs plus the matching fp32
+    reference rows. Returns ``{"kernel": ..., "ref": ...}`` where ``kernel``
+    holds the tensors passed to ``pa_sparse_prefill_fp8_opus`` and ``ref``
+    holds the dequantized ``*_fp32`` rows passed to ``_ref_pa_sparse_prefill_fp8``.
+    """
+    assert mode in _MODES
+    torch.manual_seed(seed)
+    device = torch.device(device)
+
+    def _streams(rows: int):
+        nope_fp8, deq = _quantize_nope(
+            torch.randn(rows, _FP8_D_NOPE, device=device) * 0.5
+        )
+        rope = (torch.randn(rows, _FP8_D_ROPE, device=device) * 0.5).to(torch.bfloat16)
+        row_fp32 = torch.cat([deq, rope.to(torch.float32)], dim=1)  # [rows, 512]
+        return nope_fp8, rope, row_fp32
+
+    qn, qr, q_fp32 = _streams(n * h)
+    qn = qn.reshape(n, h, _FP8_D_NOPE_PADDED)
+    qr = qr.reshape(n, h, _FP8_D_ROPE)
+    q_fp32 = q_fp32.reshape(n, h, _FP8_D_HEAD)
+    ukn, ukr, ukv_fp32 = _streams(total_pages)
+    kn, kr, kv_fp32 = _streams(total_tokens)
+
+    attn_sink = torch.randn(h, device=device, dtype=torch.float32) * 0.25
+
+    def _csr(total_rows: int, seed_offset: int):
+        if mode == "sparse":
+            return _random_csr(
+                n,
+                total_rows,
+                device=device,
+                kv_tile_size=_FP8_KV_TILE_SIZE,
+                seed=seed * 2 + seed_offset,
+            )
+        if mode == "dense":
+            return _dense_csr(n, total_rows, device=device)
+        return _empty_csr(n, device=device)
+
+    ip_p, ix_p = _csr(total_pages, 1)
+    ip_e, ix_e = _csr(total_tokens, 2)
+
+    kernel = dict(
+        q_nope=qn,
+        q_rope=qr,
+        unified_kv_nope=ukn,
+        unified_kv_rope=ukr,
+        kv_indices_prefix=ix_p,
+        kv_indptr_prefix=ip_p,
+        kv_nope=kn,
+        kv_rope=kr,
+        kv_indices_extend=ix_e,
+        kv_indptr_extend=ip_e,
+        attn_sink=attn_sink,
+    )
+    ref = dict(
+        q_fp32=q_fp32,
+        ukv_fp32=ukv_fp32,
+        kv_fp32=kv_fp32,
+        kv_indices_prefix=ix_p,
+        kv_indptr_prefix=ip_p,
+        kv_indices_extend=ix_e,
+        kv_indptr_extend=ip_e,
+        attn_sink=attn_sink,
+    )
+    return dict(kernel=kernel, ref=ref)
+
+
 # ---------------------------------------------------------------------------
 # perftest-wrapped kernel call (same shape as test_batch_prefill.py)
 # ---------------------------------------------------------------------------
@@ -325,9 +505,17 @@ def _profile_func(target_func, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def _get_tolerances(dtype: torch.dtype) -> Tuple[float, float]:
-    if dtype == torch.float16:
+# Supported precisions. "bf16"/"fp16" use the single-tensor Q/K/V/O kernel;
+# "fp8" uses the split NoPE-fp8 / RoPE-bf16 DSA kernel.
+_PRECS = ("bf16", "fp16", "fp8")
+_PREC_TO_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+def _get_tolerances(prec: str) -> Tuple[float, float]:
+    if prec == "fp16":
         return 1e-2, 1e-2
+    if prec == "fp8":
+        return 3e-2, 3e-2
     return 2e-2, 2e-2  # bf16 default
 
 
@@ -345,54 +533,56 @@ def run_pa_sparse_prefill_opus(
     d: int,
     total_pages: int,
     total_tokens: int,
-    dtype: torch.dtype,
+    prec: str,
     *,
     mode: str = "sparse",
     seed: int = 0,
     verify: bool = True,
     bench: bool = True,
 ) -> Optional[dict]:
+    assert prec in _PRECS, f"unknown prec {prec!r}"
     if _skip_if_unsupported(d=d):
         return None
 
-    inputs = _make_inputs(
-        n,
-        h,
-        d,
-        total_pages,
-        total_tokens,
-        dtype,
-        mode=mode,
-        seed=seed,
-    )
     softmax_scale = 1.0 / math.sqrt(d)
+    msg = (
+        f"[N={n} H={h} D={d} total_pages={total_pages} total_tokens={total_tokens} "
+        f"prec={prec} mode={mode}]"
+    )
 
-    nnz_p = int(inputs["kv_indices_prefix"].numel())
-    nnz_e = int(inputs["kv_indices_extend"].numel())
+    if prec == "fp8":
+        data = _make_inputs_fp8(n, h, total_pages, total_tokens, mode=mode, seed=seed)
+        kernel_inputs = data["kernel"]
+        kernel_fn = pa_sparse_prefill_fp8_opus
+        ref_fn, ref_inputs = _ref_pa_sparse_prefill_fp8, data["ref"]
+    else:
+        kernel_inputs = _make_inputs(
+            n,
+            h,
+            d,
+            total_pages,
+            total_tokens,
+            _PREC_TO_DTYPE[prec],
+            mode=mode,
+            seed=seed,
+        )
+        kernel_fn = pa_sparse_prefill_opus
+        ref_fn, ref_inputs = _ref_pa_sparse_prefill_opus, kernel_inputs
 
+    nnz_p = int(kernel_inputs["kv_indices_prefix"].numel())
+    nnz_e = int(kernel_inputs["kv_indices_extend"].numel())
     row: dict = {"nnz_prefix": nnz_p, "nnz_extend": nnz_e}
 
     if verify:
-        ref = _ref_pa_sparse_prefill_opus(**inputs, softmax_scale=softmax_scale)
-        got = pa_sparse_prefill_opus(**inputs, softmax_scale=softmax_scale)
-        rtol, atol = _get_tolerances(dtype)
-        checkAllclose(
-            got,
-            ref,
-            rtol=rtol,
-            atol=atol,
-            msg=(
-                f"[N={n} H={h} D={d} total_pages={total_pages} total_tokens={total_tokens} "
-                f"dtype={dtype} mode={mode}]"
-            ),
-        )
+        ref = ref_fn(**ref_inputs, softmax_scale=softmax_scale)
+        got = kernel_fn(**kernel_inputs, softmax_scale=softmax_scale)
+        rtol, atol = _get_tolerances(prec)
+        checkAllclose(got, ref, rtol=rtol, atol=atol, msg=msg)
 
     if bench:
         # `@perftest()` returns (data, avg_us_per_iter).
         _, lat_us = _profile_func(
-            pa_sparse_prefill_opus,
-            **inputs,
-            softmax_scale=softmax_scale,
+            kernel_fn, **kernel_inputs, softmax_scale=softmax_scale
         )
         # Sparse attention FLOPS: 4 * H * total_nnz * D
         total_nnz = nnz_p + nnz_e
@@ -416,18 +606,18 @@ _PYTEST_SHAPES = [
     (64, 64, 1024, 1024),
     (256, 128, 2048, 2048),
 ]
-_PYTEST_DTYPES = [torch.bfloat16, torch.float16]
+_PYTEST_PRECS = ["bf16", "fp16", "fp8"]
 _PYTEST_MODES = ["sparse", "dense", "empty"]
 
 
-@pytest.mark.parametrize("dtype", _PYTEST_DTYPES, ids=lambda d: str(d).split(".")[-1])
+@pytest.mark.parametrize("prec", _PYTEST_PRECS)
 @pytest.mark.parametrize(
     "n,h,total_pages,total_tokens",
     _PYTEST_SHAPES,
     ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
 )
 @pytest.mark.parametrize("mode", _PYTEST_MODES)
-def test_pa_sparse_prefill_opus(dtype, n, h, total_pages, total_tokens, mode):
+def test_pa_sparse_prefill_opus(prec, n, h, total_pages, total_tokens, mode):
     # bench=False keeps pytest fast; CLI path does the timing.
     run_pa_sparse_prefill_opus(
         n=n,
@@ -435,9 +625,9 @@ def test_pa_sparse_prefill_opus(dtype, n, h, total_pages, total_tokens, mode):
         d=512,
         total_pages=total_pages,
         total_tokens=total_tokens,
-        dtype=dtype,
+        prec=prec,
         mode=mode,
-        seed=(hash((n, h, total_pages, total_tokens, str(dtype), mode)) & 0xFFFF),
+        seed=(hash((n, h, total_pages, total_tokens, prec, mode)) & 0xFFFF),
         verify=True,
         bench=False,
     )
@@ -494,12 +684,16 @@ parser.add_argument(
     help="rows in extend kv (default: matches -n)",
 )
 parser.add_argument(
-    "--dtype",
+    "--prec",
     type=str,
     nargs="*",
-    default=["bf16"],
-    choices=["bf16", "fp16"],
-    help="attention dtype(s) to sweep (default: [bf16])",
+    default=["bf16", "fp8"],
+    choices=list(_PRECS),
+    help=(
+        "precision(s) to sweep (default: [bf16, fp8]).\n"
+        "  bf16/fp16: single-tensor Q/K/V/O kernel\n"
+        "  fp8      : split NoPE-fp8 / RoPE-bf16 DSA kernel"
+    ),
 )
 parser.add_argument(
     "--mode",
@@ -534,17 +728,14 @@ parser.add_argument(
 )
 
 
-_DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
-
-
 if __name__ == "__main__":
     args = parser.parse_args()
 
     rows = []
-    for n, h, dtype_str, mode, pages_arg in itertools.product(
+    for n, h, prec, mode, pages_arg in itertools.product(
         args.n_tokens,
         args.h_q,
-        args.dtype,
+        args.prec,
         args.mode,
         args.total_pages,
     ):
@@ -557,7 +748,7 @@ if __name__ == "__main__":
             d=args.head_dim,
             total_pages=total_pages,
             total_tokens=total_tokens,
-            dtype=_DTYPE_MAP[dtype_str],
+            prec=prec,
             mode=mode,
             seed=args.seed,
             verify=not args.no_verify,
@@ -568,13 +759,6 @@ if __name__ == "__main__":
 
     if rows:
         df = pd.DataFrame(rows)
-        # Stringify dtype for prettier print.
-        if "dtype" in df.columns:
-            df["dtype"] = df["dtype"].map(
-                lambda t: (
-                    str(t).split(".")[-1] if hasattr(t, "is_floating_point") else str(t)
-                )
-            )
         # Drop columns that don't carry signal in the default sweep.
         drop_cols = [c for c in ("verify", "bench", "seed") if c in df.columns]
         if drop_cols:
