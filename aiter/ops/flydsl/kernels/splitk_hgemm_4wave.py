@@ -36,8 +36,8 @@ from .tensor_shim import GTensor, STensor, get_dtype_in_kernel
 
 # MFMA-fixed constants (independent of shape/tile), mirroring the cuh.
 MFMA_M, MFMA_N, MFMA_K = 16, 16, 32
-KOCT = 8          # bf16 per lane per MFMA operand (= one b128)
-ACC_ROWS = 4      # C rows held per lane in the fp32 accumulator (floatx4)
+KOCT = 8  # bf16 per lane per MFMA operand (= one b128)
+ACC_ROWS = 4  # C rows held per lane in the fp32 accumulator (floatx4)
 WARP_SIZE = 64
 DTYPE_BYTES = 2
 
@@ -69,30 +69,30 @@ def compile_splitk_hgemm_4wave(
     KSLICE = K // SPLITK
     N_TILES = N // BN
     assert K % SPLITK == 0 and KSLICE % BK == 0, "bad splitK"
-    NCH = BN // MFMA_N                       # n-chunks per tile
+    NCH = BN // MFMA_N  # n-chunks per tile
     assert BN % MFMA_N == 0 and 4 % NCH == 0, "BN must give 1/2/4 n-chunks (<=4 waves)"
-    MGROUPS = 4 // NCH                        # wave M-groups
-    MCH_W = BM // (MGROUPS * MFMA_M)          # m-chunks per wave
+    MGROUPS = 4 // NCH  # wave M-groups
+    MCH_W = BM // (MGROUPS * MFMA_M)  # m-chunks per wave
     assert BM % (MGROUPS * MFMA_M) == 0 and MCH_W >= 1
-    KK = BK // MFMA_K                         # MFMA K-steps per tile
-    A_CHUNKS = BM * BK // KOCT // 256         # b128 A chunks loaded per thread
-    B_TOTAL = BN * BK // KOCT                 # b128 B chunks total
-    B_CHUNKS = (B_TOTAL + 255) // 256         # b128 B chunks loaded per thread
+    KK = BK // MFMA_K  # MFMA K-steps per tile
+    A_CHUNKS = BM * BK // KOCT // 256  # b128 A chunks loaded per thread
+    B_TOTAL = BN * BK // KOCT  # b128 B chunks total
+    B_CHUNKS = (B_TOTAL + 255) // 256  # b128 B chunks loaded per thread
     assert A_CHUNKS >= 1, "BM*BK too small for 256 threads (need >=1 b128/thread)"
     assert (BM * BK // KOCT) % 256 == 0, "BM*BK//KOCT must be a multiple of 256"
-    ROW_KOCT = BK // KOCT                     # b128 columns per LDS row (= 16 for BK=128)
-    NTILES = KSLICE // BK                     # K-tiles per slice
-    PAIRS = (BM * BN // 2) // 256             # column-pairs per thread in the epilogue
+    ROW_KOCT = BK // KOCT  # b128 columns per LDS row (= 16 for BK=128)
+    NTILES = KSLICE // BK  # K-tiles per slice
+    PAIRS = (BM * BN // 2) // 256  # column-pairs per thread in the epilogue
     assert (BM * BN // 2) % 256 == 0, "BM*BN/2 must be a multiple of 256"
 
     GPU_ARCH = get_rocm_arch()
-    AS_BYTES = 2 * BM * BK * DTYPE_BYTES      # double-buffered A tile
-    BS_BYTES = 2 * BN * BK * DTYPE_BYTES      # double-buffered B tile
+    AS_BYTES = 2 * BM * BK * DTYPE_BYTES  # double-buffered A tile
+    BS_BYTES = 2 * BN * BK * DTYPE_BYTES  # double-buffered B tile
     assert BM * BN * 4 <= AS_BYTES, "fp32 epilogue image must fit inside s_A"
     SMEM_USE = AS_BYTES + BS_BYTES
-    assert SMEM_USE <= SMEM_CAPACITY_MAP[GPU_ARCH], (
-        f"LDS {SMEM_USE} > cap {SMEM_CAPACITY_MAP[GPU_ARCH]}"
-    )
+    assert (
+        SMEM_USE <= SMEM_CAPACITY_MAP[GPU_ARCH]
+    ), f"LDS {SMEM_USE} > cap {SMEM_CAPACITY_MAP[GPU_ARCH]}"
 
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
@@ -123,18 +123,21 @@ def compile_splitk_hgemm_4wave(
         base_ptr = allocator.get_base()
         as_ = STensor(
             SmemPtr(base_ptr, smem_a_offset, dt, shape=(2 * BM * BK,)),
-            dt, shape=(2, BM * BK),
+            dt,
+            shape=(2, BM * BK),
         )
         bs_ = STensor(
             SmemPtr(base_ptr, smem_b_offset, dt, shape=(2 * BN * BK,)),
-            dt, shape=(2, BN * BK),
+            dt,
+            shape=(2, BN * BK),
         )
         fs_ = STensor(  # fp32 cshuffle image overlaying s_A (disjoint lifetime)
             SmemPtr(base_ptr, smem_a_offset, T.f32, shape=(BM * BN,)),
-            T.f32, shape=(BM, BN),
+            T.f32,
+            shape=(BM, BN),
         )
 
-        tid = fx.Index(fx.thread_idx.x)   # everything below is index-typed
+        tid = fx.Index(fx.thread_idx.x)  # everything below is index-typed
         wave = tid // WARP_SIZE
         lane = tid % WARP_SIZE
         g = lane // MFMA_M
