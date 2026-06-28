@@ -4650,7 +4650,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
                 kn1 = self._g1_kname(bm, n1, iq1)
                 for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                    cands.append(self._candidate_row(row, bm, kn1, self._g2_kname(bm, n2, ep)))
+                    cands.append(
+                        self._candidate_row(row, bm, kn1, self._g2_kname(bm, n2, ep))
+                    )
         return cands
 
     @staticmethod
@@ -4778,7 +4780,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         us = round(float(us), 4)
         candidate.update(
-            {"us1": us, "us": us, "err1": round(float(err), 6), "err2": round(float(err), 6)}
+            {
+                "us1": us,
+                "us": us,
+                "err1": round(float(err), 6),
+                "err2": round(float(err), 6),
+            }
         )
         return us
 
