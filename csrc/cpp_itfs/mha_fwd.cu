@@ -443,6 +443,12 @@ static float fmha_fwd_native_gfx942(const mha_fwd_args& a, const ck_tile::stream
     // Guard against NaN: bottom-right causal with sq > sk produces fully-masked rows.
     if(causal && a.seqlen_q > a.seqlen_k)
         return -1.f;
+    // Native split-K implements bottom-right causal only (mask_shift = sk - sq).
+    // A top-left causal request (mask_type==1) coincides with bottom-right only when
+    // seqlen_q == seqlen_k. For top-left with sq != sk, fall through to the batch
+    // (non-split) V3/CK path, which has a real top-left causal kernel.
+    if(a.mask_type == 1 && a.seqlen_q != a.seqlen_k)
+        return -1.f;
     if(a.nhead_q <= 0 || a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0)
         return -1.f;
 
