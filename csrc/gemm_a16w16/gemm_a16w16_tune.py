@@ -52,7 +52,10 @@ try:
     _opus_csrc = os.path.join(os.path.dirname(__file__), "../opus_gemm")
     if _opus_csrc not in sys.path:
         sys.path.insert(0, os.path.abspath(_opus_csrc))
-    from opus_gemm_common import kernels_list as _opus_kernels_list
+    from opus_gemm_common import (
+        SPLITK_KIDS as _opus_splitk_kids,
+        kernels_list as _opus_kernels_list,
+    )
     from opus_gemm_tune import (
         candidate_kids_for_shape as _opus_candidate_kids_for_shape,
         candidate_splitK as _opus_candidate_splitK,
@@ -68,6 +71,7 @@ try:
 except Exception as _opus_exc:
     _opus_gemm_a16w16_tune = None
     _opus_all_kernels = None
+    _opus_splitk_kids = frozenset()
     _opus_candidate_kids_for_shape = None
     _opus_kid_rejects_shape = None
     _opus_kid_rejects_bias = None
@@ -672,7 +676,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 continue
             if _opus_kid_rejects_bias(k_inst, has_bias):
                 continue
-            if k_inst.kernel_tag == "a16w16_flatmm_splitk":
+            if kid in _opus_splitk_kids:
                 splitK_range = _opus_candidate_splitK(M, N, K, 1, cu_num, k_inst)
             else:
                 splitK_range = [0]

@@ -5,10 +5,8 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
-import functools
-import inspect
 from dataclasses import dataclass
 import enum
 import os
@@ -34,6 +32,7 @@ class OpKind(enum.Enum):
 
     MOE = "moe"
     GEMM = "gemm"
+    GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
 
 
@@ -93,99 +92,6 @@ def collect_aot_jobs(
     return dedupe_jobs(jobs)
 
 
-def raise_if_aot_cache_miss(
-    case_kwargs: dict[str, Any],
-    cache_misses: list[tuple[str, int, Any, Any, int]],
-    last_cache_key: dict[int, Any],
-) -> None:
-    if not cache_misses:
-        return
-
-    details = []
-    for name, jf_id, manager_key, cache_dir, miss_count in cache_misses:
-        exists = cache_dir.exists() if cache_dir is not None else False
-        pkl_count = sum(1 for _ in cache_dir.glob("*.pkl")) if exists else 0
-        cache_key = last_cache_key.get(jf_id)
-        cache_key_str = (
-            "\n".join(f"      {item!r}" for item in cache_key)
-            if cache_key
-            else "<unknown>"
-        )
-        details.append(
-            f"  {name}: +{miss_count} miss, manager_key={manager_key}\n"
-            f"    cache_dir={cache_dir} (exists={exists}, pkl_count={pkl_count})\n"
-            f"    looked-up cache_key:\n{cache_key_str}"
-        )
-
-    raise RuntimeError(
-        "AOT cache miss for case " + repr(case_kwargs) + ":\n" + "\n".join(details)
-    )
-
-
-def fail_on_aot_cache_miss(
-    run_compiled_module: Any,
-    run_compiled_name: str = "_run_compiled",
-) -> Callable:
-    """Fail a wrapped test when a patched FlyDSL run helper reports cache misses."""
-
-    def decorator(func: Callable) -> Callable:
-        jit_fns_seen = []
-        last_cache_key = {}
-
-        def case_arguments(args, kwargs):
-            try:
-                bound = inspect.signature(func).bind_partial(*args, **kwargs)
-                bound.apply_defaults()
-                return dict(bound.arguments)
-            except Exception:
-                case_kwargs = dict(kwargs)
-                if args:
-                    case_kwargs["args"] = args
-                return case_kwargs
-
-        def aot_cache_misses():
-            misses = []
-            for jf in jit_fns_seen:
-                info = jf.cache_info()
-                if info is None or info.misses == 0:
-                    continue
-                cache_dir = getattr(jf.cache_manager, "cache_dir", None)
-                misses.append(
-                    (jf.func.__name__, id(jf), jf.manager_key, cache_dir, info.misses)
-                )
-            return misses
-
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            orig_run_compiled = getattr(run_compiled_module, run_compiled_name)
-
-            def run_compiled_tracked(exe, compile_args):
-                if exe not in jit_fns_seen:
-                    jit_fns_seen.append(exe)
-                try:
-                    exe._ensure_sig()
-                    bound = exe._sig.bind(*compile_args)
-                    bound.apply_defaults()
-                    last_cache_key[id(exe)] = exe._build_full_cache_key(bound.arguments)
-                except Exception:
-                    pass
-                return orig_run_compiled(exe, compile_args)
-
-            setattr(run_compiled_module, run_compiled_name, run_compiled_tracked)
-            try:
-                ret = func(*args, **kwargs)
-                raise_if_aot_cache_miss(
-                    case_arguments(args, kwargs), aot_cache_misses(), last_cache_key
-                )
-                return ret
-            finally:
-                setattr(run_compiled_module, run_compiled_name, orig_run_compiled)
-
-        return wrapper
-
-    return decorator
-
-
 @contextmanager
 def compile_only_env() -> Iterator[None]:
     prev = os.environ.get("COMPILE_ONLY")
@@ -197,6 +103,18 @@ def compile_only_env() -> Iterator[None]:
             os.environ.pop("COMPILE_ONLY", None)
         else:
             os.environ["COMPILE_ONLY"] = prev
+
+
+@contextmanager
+def run_only_env() -> Iterator[None]:
+    """Force FlyDSL run-only mode: load AOT artifacts, never JIT-compile.
+
+    Any kernel without a usable AOT cache raises RuntimeError at the call
+    site (with manager_key/cache_key/cache_dir details) instead of silently
+    masking missing precompiled coverage.
+    """
+    with override_env("FLYDSL_RUNTIME_RUN_ONLY", "1"):
+        yield
 
 
 @contextmanager
@@ -225,6 +143,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
+    elif kind is OpKind.GROUPED_MOE:
+        from .grouped_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
     else:
@@ -240,6 +160,8 @@ def _compile_one(kind: OpKind, job: dict[str, Any]) -> tuple[OpKind, dict[str, A
         from .moe import compile_one_config
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
+    elif kind is OpKind.GROUPED_MOE:
+        from .grouped_moe import compile_one_config
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
     else:
@@ -260,6 +182,50 @@ def _affinity_aware_cpu_count() -> int:
     except (AttributeError, OSError):
         n = os.cpu_count() or 0
     return max(n, 1)
+
+
+def _resolve_max_workers(num_jobs: int) -> int:
+    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
+    if workers_env is not None:
+        try:
+            max_workers = max(int(workers_env), 1)
+        except ValueError as e:
+            raise ValueError(
+                f"AITER_FLYDSL_AOT_WORKERS must be an integer, got {workers_env!r}"
+            ) from e
+    else:
+        max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
+    return max(min(max_workers, num_jobs), 1)
+
+
+def run_jobs_parallel(
+    worker: Callable[..., dict[str, Any]],
+    jobs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not jobs:
+        return []
+    max_workers = _resolve_max_workers(len(jobs))
+    total = len(jobs)
+    print(
+        f"[aiter] FlyDSL AOT: {total} kernels, {max_workers} worker processes",
+        flush=True,
+    )
+    results: list[dict[str, Any]] = []
+    pool = ProcessPoolExecutor(max_workers=max_workers)
+    try:
+        futures = {pool.submit(worker, **job): job for job in jobs}
+        for done, future in enumerate(as_completed(futures), 1):
+            try:
+                results.append(future.result())
+            except Exception as worker_err:
+                job = futures[future]
+                name = job.get("kernel_name") or job.get("kernelName") or repr(job)
+                print(f"  [FAIL] worker crashed: {name}: {worker_err}", flush=True)
+                results.append({"kernel_name": name, "compile_time": None})
+            print(f"  ... {done}/{total} complete", flush=True)
+    finally:
+        pool.shutdown(wait=True)
+    return results
 
 
 def start_aot(
@@ -285,17 +251,6 @@ def start_aot(
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
-    if workers_env is not None:
-        try:
-            max_workers = max(int(workers_env), 1)
-        except ValueError as e:
-            raise ValueError(
-                f"AITER_FLYDSL_AOT_WORKERS must be an integer, got {workers_env!r}"
-            ) from e
-    else:
-        max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
-
     all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
     for kind in OpKind:
         for job in _collect_aot_jobs_for(kind):
@@ -305,7 +260,7 @@ def start_aot(
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
         return None, {}
 
-    max_workers = min(max_workers, len(all_jobs))
+    max_workers = _resolve_max_workers(len(all_jobs))
     print(
         f"[aiter] FlyDSL AOT: {len(all_jobs)} kernels "
         f"({'+'.join(k.name for k in OpKind)}), "

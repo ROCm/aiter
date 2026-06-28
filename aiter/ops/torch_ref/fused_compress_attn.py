@@ -4,12 +4,12 @@
 """Pure-PyTorch reference for ``flydsl_fused_compress_attn`` /
 ``flydsl_hca_compress_attn``.
 
-Mirrors the kernel's plan-driven per-boundary online-softmax pool → RMSNorm
-→ GPT-J RoPE → paged cache scatter (BF16 or per-row FP8 with optional ue8m0
+Mirrors the kernel's plan-driven per-boundary online-softmax pool -> RMSNorm
+-> GPT-J RoPE -> paged cache scatter (BF16 or per-row FP8 with optional ue8m0
 scale + MFMA 16x16 preshuffle).
 
 Used by ``op_tests/test_flydsl_compress_attn.py`` to gate numerical
-correctness against the flydsl kernels. Not on the inference hot path —
+correctness against the flydsl kernels. Not on the inference hot path --
 the Python-side per-boundary loop makes it ~100x slower than the kernel.
 """
 
@@ -81,9 +81,19 @@ def fused_compress_attn(
     cache_scale: Optional[torch.Tensor] = None,
     use_ue8m0: bool = True,
     preshuffle: bool = True,
+    group_quant: bool = False,
+    quant_group_size: int = 64,
+    k_rope_buff: Optional[torch.Tensor] = None,
 ) -> None:
     """Side-effecting reference: writes into ``kv_cache`` (+ ``cache_scale``
     when ``quant=True``). Mirrors flydsl kernel's plan-driven dispatch.
+
+    ``group_quant=True`` selects the V4 nm-asm HCA fp8 layout instead of the
+    single-kernel per-row quant: ``kv_cache`` [nb, k_per_block, head_dim] fp8 holds
+    nope fp8 in [0:nope_dim) + inline duplicated e8m0 group scale bytes in
+    [nope_dim : nope_dim+2*nGroups); the rotated PE bf16 is written to the separate
+    paged ``k_rope_buff`` [nb, k_per_block, rope_head_dim]. ``cache_scale``/
+    ``preshuffle``/``use_ue8m0`` are ignored on this path.
 
     Sentinel plan rows (``position == -1``) are skipped, matching the kernel.
     """
@@ -94,20 +104,28 @@ def fused_compress_attn(
     K = (2 if overlap else 1) * ratio
     state_size = kv_state.shape[1]
     device = kv_in.device
+    nope_dim = head_dim - rope_head_dim
     plan_cpu = plan_gpu.detach().cpu()
     slot_map_cpu = state_slot_mapping.detach().cpu()
     bt_cpu = block_tables.detach().cpu()
     rms_w_f32 = rms_weight.float()
 
-    if quant:
+    if quant or group_quant:
         fp8_dtype = _fp8_dtype()
         fp8_max = float(torch.finfo(fp8_dtype).max)
         if kv_cache.dtype != fp8_dtype:
             raise TypeError(
-                f"quant=True expects kv_cache dtype {fp8_dtype}, got {kv_cache.dtype}"
+                f"quant expects kv_cache dtype {fp8_dtype}, got {kv_cache.dtype}"
             )
         kv_cache_flat = kv_cache.view(-1)
         kv_block_stride = kv_cache.stride(0)
+    if group_quant:
+        from aiter.utility.fp4_utils import f32_to_mx_e8m0_scale
+        from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
+
+        n_groups_q = nope_dim // quant_group_size
+        if k_rope_buff is None:
+            raise ValueError("group_quant=True requires k_rope_buff")
 
     for pid in range(plan_capacity):
         ragged_id, batch_id, position, window_len = plan_cpu[pid].tolist()
@@ -170,7 +188,29 @@ def fused_compress_attn(
         slot_in_block = ci % k_per_block
         physical = int(bt_cpu[batch_id, block_in_seq].item())
 
-        if quant:
+        if group_quant:
+            # V4 nm-asm HCA fp8: per-(1xG) e8m0 group-quant of the nope region +
+            # inline duplicated e8m0 scale byte; rotated PE bf16 -> separate buffer.
+            nope_part = normed[:nope_dim]
+            rope_part = normed[nope_dim:]  # already rotated above
+            grp = nope_part.reshape(n_groups_q, quant_group_size)
+            amax = grp.abs().amax(-1, keepdim=True).clamp_min(1e-12)  # [ng,1]
+            e8m0 = (
+                f32_to_mx_e8m0_scale(
+                    amax, mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP8_E4M3
+                )
+                .view(torch.uint8)
+                .reshape(n_groups_q)
+            )
+            inv_scale = 1.0 / (e8m0.to(torch.int32) << 23).view(torch.float32)  # [ng]
+            nope_fp8 = (grp * inv_scale.unsqueeze(-1)).reshape(nope_dim).to(fp8_dtype)
+            kv_cache[physical, slot_in_block, :nope_dim] = nope_fp8
+            row_u8 = kv_cache[physical, slot_in_block].view(torch.uint8)
+            for g in range(n_groups_q):
+                row_u8[nope_dim + 2 * g] = e8m0[g]
+                row_u8[nope_dim + 2 * g + 1] = e8m0[g]  # duplicated
+            k_rope_buff[physical, slot_in_block] = rope_part.to(k_rope_buff.dtype)
+        elif quant:
             # Mirror kernel exactly: ``am_safe * (1.0/fp8_max)`` as a fp32 mul
             # with a pre-folded fp32 reciprocal constant, NOT ``amax/fp8_max``
             # (fp32 div differs in the last bit and would shift ue8m0 boundary
