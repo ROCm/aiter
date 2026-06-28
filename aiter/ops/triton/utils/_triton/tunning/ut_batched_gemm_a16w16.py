@@ -23,7 +23,7 @@ input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=
 dtype = torch.bfloat16
 M, N, K = input_shape
 # Batch size is hard coded for now.
-B = 1 if K == 4096 else 2
+B = 8 if K == 4096 else 16
 x, weight, bias, y = generate_batched_gemm_a16w16_inputs(
     B,
     M,
