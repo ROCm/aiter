@@ -53,9 +53,9 @@ def build_fmha_bwd_preprocess_module(
     WARP_SIZE = get_warp_size()
     BLOCK_THREADS = WARP_SIZE  # one warp per block, no cross-warp reduction needed
 
-    assert head_dim % BLOCK_THREADS == 0, (
-        f"head_dim ({head_dim}) must be a multiple of BLOCK_THREADS ({BLOCK_THREADS})"
-    )
+    assert (
+        head_dim % BLOCK_THREADS == 0
+    ), f"head_dim ({head_dim}) must be a multiple of BLOCK_THREADS ({BLOCK_THREADS})"
     assert dtype in ("bf16", "fp16"), f"unsupported dtype: {dtype!r}"
 
     ELEM_BYTES = 2  # bf16 / fp16 are 2 bytes each
@@ -63,8 +63,8 @@ def build_fmha_bwd_preprocess_module(
 
     @flyc.kernel
     def fmha_bwd_preprocess_kernel(
-        o_ptr: fx.Tensor,      # forward output   [..., head_dim]
-        do_ptr: fx.Tensor,     # output gradient  [..., head_dim]
+        o_ptr: fx.Tensor,  # forward output   [..., head_dim]
+        do_ptr: fx.Tensor,  # output gradient  [..., head_dim]
         delta_ptr: fx.Tensor,  # output: rowsum(O * dO), fp32
         # O strides (in elements)
         stride_ob: Int32,
@@ -82,10 +82,10 @@ def build_fmha_bwd_preprocess_module(
         stride_deltam: Int32,
         seqlen_q: Int32,
     ):
-        seq_idx   = ArithValue(fx.block_idx.x)
+        seq_idx = ArithValue(fx.block_idx.x)
         batch_idx = ArithValue(fx.block_idx.y)
-        head_idx  = ArithValue(fx.block_idx.z)
-        tid       = ArithValue(fx.thread_idx.x)
+        head_idx = ArithValue(fx.block_idx.z)
+        tid = ArithValue(fx.thread_idx.x)
 
         i32 = T.i32
         f32 = T.f32
@@ -96,30 +96,32 @@ def build_fmha_bwd_preprocess_module(
         valid_row = arith.cmpi(CmpIPredicate.ult, seq_idx, seqlen_q_v)
         _if_valid = scf.IfOp(valid_row)
         with ir.InsertionPoint(_if_valid.then_block):
-            o_rsrc  = buffer_ops.create_buffer_resource(o_ptr,  max_size=True)
+            o_rsrc = buffer_ops.create_buffer_resource(o_ptr, max_size=True)
             do_rsrc = buffer_ops.create_buffer_resource(do_ptr, max_size=True)
 
-            stride_ob_v  = ArithValue(stride_ob)
-            stride_oh_v  = ArithValue(stride_oh)
-            stride_om_v  = ArithValue(stride_om)
-            stride_ok_v  = ArithValue(stride_ok)
+            stride_ob_v = ArithValue(stride_ob)
+            stride_oh_v = ArithValue(stride_oh)
+            stride_om_v = ArithValue(stride_om)
+            stride_ok_v = ArithValue(stride_ok)
             stride_dob_v = ArithValue(stride_dob)
             stride_doh_v = ArithValue(stride_doh)
             stride_dom_v = ArithValue(stride_dom)
             stride_dok_v = ArithValue(stride_dok)
 
             c_elem_bytes = arith.constant(ELEM_BYTES, type=i32)
-            c_16         = arith.constant(16, type=i32)
-            c_mask16     = arith.constant(0xFFFF, type=i32)
-            c_1_i32      = arith.constant(1, type=i32)
+            c_16 = arith.constant(16, type=i32)
+            c_mask16 = arith.constant(0xFFFF, type=i32)
+            c_1_i32 = arith.constant(1, type=i32)
 
             # Base element offsets for this (batch, head, row)
-            o_elem_base  = (batch_idx * stride_ob_v
-                            + head_idx * stride_oh_v
-                            + seq_idx  * stride_om_v)
-            do_elem_base = (batch_idx * stride_dob_v
-                            + head_idx * stride_doh_v
-                            + seq_idx  * stride_dom_v)
+            o_elem_base = (
+                batch_idx * stride_ob_v + head_idx * stride_oh_v + seq_idx * stride_om_v
+            )
+            do_elem_base = (
+                batch_idx * stride_dob_v
+                + head_idx * stride_doh_v
+                + seq_idx * stride_dom_v
+            )
 
             acc = arith.constant(0.0, type=f32)
 
@@ -129,30 +131,32 @@ def build_fmha_bwd_preprocess_module(
 
                 # Byte offsets for O and dO elements
                 # stride_ok / stride_dok expected to be 1 (contiguous D)
-                o_byte_off  = (o_elem_base  + col * stride_ok_v)  * c_elem_bytes
+                o_byte_off = (o_elem_base + col * stride_ok_v) * c_elem_bytes
                 do_byte_off = (do_elem_base + col * stride_dok_v) * c_elem_bytes
 
                 # Dword offset and hi/lo half selection
-                o_dw_off  = o_byte_off  >> arith.constant(2, type=i32)
+                o_dw_off = o_byte_off >> arith.constant(2, type=i32)
                 do_dw_off = do_byte_off >> arith.constant(2, type=i32)
 
                 # is_hi: 1 if the bf16 sits in the upper 16 bits of the dword
-                o_is_hi  = (o_byte_off  >> c_1_i32) & c_1_i32
+                o_is_hi = (o_byte_off >> c_1_i32) & c_1_i32
                 do_is_hi = (do_byte_off >> c_1_i32) & c_1_i32
 
-                o_raw  = buffer_ops.buffer_load(o_rsrc,  o_dw_off,  vec_width=1, dtype=i32)
-                do_raw = buffer_ops.buffer_load(do_rsrc, do_dw_off, vec_width=1, dtype=i32)
+                o_raw = buffer_ops.buffer_load(o_rsrc, o_dw_off, vec_width=1, dtype=i32)
+                do_raw = buffer_ops.buffer_load(
+                    do_rsrc, do_dw_off, vec_width=1, dtype=i32
+                )
 
                 # Extract bf16 into f32 by placing the 16-bit mantissa in the
                 # upper half of a 32-bit word (bf16 and f32 share the same exponent)
-                o_shifted  = (o_raw  >> (o_is_hi  * c_16)) & c_mask16
+                o_shifted = (o_raw >> (o_is_hi * c_16)) & c_mask16
                 do_shifted = (do_raw >> (do_is_hi * c_16)) & c_mask16
 
-                o_f32  = arith.bitcast(f32, o_shifted  << c_16)
+                o_f32 = arith.bitcast(f32, o_shifted << c_16)
                 do_f32 = arith.bitcast(f32, do_shifted << c_16)
 
                 prod = arith.mulf(o_f32, do_f32)
-                acc  = arith.addf(acc, prod)
+                acc = arith.addf(acc, prod)
 
             # Intra-warp reduction (sum across all WARP_SIZE lanes via xor shuffle).
             # Python for-loop over constant offsets — FlyDSL unrolls it at compile time.
@@ -160,7 +164,7 @@ def build_fmha_bwd_preprocess_module(
             # arith.constant cannot accept.)
             width_i32 = arith.constant(WARP_SIZE, type=i32)
             for sh in [WARP_SIZE >> i for i in range(1, WARP_SIZE.bit_length())]:
-                off  = arith.constant(sh, type=i32)
+                off = arith.constant(sh, type=i32)
                 peer = ArithValue(
                     gpu.ShuffleOp(acc, off, width_i32, mode="xor").shuffleResult
                 )
@@ -177,9 +181,11 @@ def build_fmha_bwd_preprocess_module(
                 stride_deltam_v = ArithValue(stride_deltam)
 
                 # delta is f32: 4 bytes per element, stride in elements → dword offset directly
-                delta_dw_off = (batch_idx * stride_deltab_v
-                                + head_idx * stride_deltah_v
-                                + seq_idx  * stride_deltam_v)
+                delta_dw_off = (
+                    batch_idx * stride_deltab_v
+                    + head_idx * stride_deltah_v
+                    + seq_idx * stride_deltam_v
+                )
 
                 acc_i32 = arith.bitcast(i32, acc)
                 buffer_ops.buffer_store(acc_i32, delta_rsrc, delta_dw_off)
@@ -192,10 +198,10 @@ def build_fmha_bwd_preprocess_module(
         o: fx.Tensor,
         do: fx.Tensor,
         delta: fx.Tensor,
-        stride_ob:  fx.Int32,
-        stride_oh:  fx.Int32,
-        stride_om:  fx.Int32,
-        stride_ok:  fx.Int32,
+        stride_ob: fx.Int32,
+        stride_oh: fx.Int32,
+        stride_om: fx.Int32,
+        stride_ok: fx.Int32,
         stride_dob: fx.Int32,
         stride_doh: fx.Int32,
         stride_dom: fx.Int32,
@@ -204,19 +210,29 @@ def build_fmha_bwd_preprocess_module(
         stride_deltah: fx.Int32,
         stride_deltam: fx.Int32,
         seqlen_q: fx.Int32,
-        batch:     fx.Int32,
+        batch: fx.Int32,
         num_heads: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        sq   = arith.index_cast(T.index, seqlen_q)
-        b    = arith.index_cast(T.index, batch)
-        h    = arith.index_cast(T.index, num_heads)
+        sq = arith.index_cast(T.index, seqlen_q)
+        b = arith.index_cast(T.index, batch)
+        h = arith.index_cast(T.index, num_heads)
 
         launcher = fmha_bwd_preprocess_kernel(
-            o, do, delta,
-            stride_ob, stride_oh, stride_om, stride_ok,
-            stride_dob, stride_doh, stride_dom, stride_dok,
-            stride_deltab, stride_deltah, stride_deltam,
+            o,
+            do,
+            delta,
+            stride_ob,
+            stride_oh,
+            stride_om,
+            stride_ok,
+            stride_dob,
+            stride_doh,
+            stride_dom,
+            stride_dok,
+            stride_deltab,
+            stride_deltah,
+            stride_deltam,
             seqlen_q,
         )
         launcher.launch(

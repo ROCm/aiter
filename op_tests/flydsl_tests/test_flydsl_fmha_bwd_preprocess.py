@@ -8,7 +8,9 @@ Verifies that delta = rowsum(O * dO) matches a reference torch computation.
 
 import torch
 import pytest
-from aiter.ops.flydsl.kernels.fmha_bwd_preprocess import build_fmha_bwd_preprocess_module
+from aiter.ops.flydsl.kernels.fmha_bwd_preprocess import (
+    build_fmha_bwd_preprocess_module,
+)
 
 
 def ref_delta(o, do):
@@ -16,22 +18,25 @@ def ref_delta(o, do):
     return (o.float() * do.float()).sum(dim=-1)  # [B, H, Sq]
 
 
-@pytest.mark.parametrize("B,H,Sq,D,dtype", [
-    (1, 5, 128,  128, torch.bfloat16),
-    (2, 8, 256,  128, torch.bfloat16),
-    (1, 1, 64,   128, torch.float16),
-    (1, 5, 1024, 128, torch.bfloat16),
-])
+@pytest.mark.parametrize(
+    "B,H,Sq,D,dtype",
+    [
+        (1, 5, 128, 128, torch.bfloat16),
+        (2, 8, 256, 128, torch.bfloat16),
+        (1, 1, 64, 128, torch.float16),
+        (1, 5, 1024, 128, torch.bfloat16),
+    ],
+)
 def test_fmha_bwd_preprocess(B, H, Sq, D, dtype):
     torch.manual_seed(42)
     dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
 
     # BSHD layout → permute to BHSD for the kernel
-    o_bshd  = torch.randn(B, Sq, H, D, dtype=dtype, device="cuda")
+    o_bshd = torch.randn(B, Sq, H, D, dtype=dtype, device="cuda")
     do_bshd = torch.randn(B, Sq, H, D, dtype=dtype, device="cuda")
 
     # Permute to BHSD: [B, H, Sq, D]
-    o  = o_bshd.permute(0, 2, 1, 3).contiguous()
+    o = o_bshd.permute(0, 2, 1, 3).contiguous()
     do = do_bshd.permute(0, 2, 1, 3).contiguous()
 
     delta = torch.zeros(B, H, Sq, dtype=torch.float32, device="cuda")
@@ -45,11 +50,23 @@ def test_fmha_bwd_preprocess(B, H, Sq, D, dtype):
 
     launcher = build_fmha_bwd_preprocess_module(head_dim=D, dtype=dtype_str)
     launcher(
-        o, do, delta,
-        stride_ob,  stride_oh,  stride_om,  stride_ok,
-        stride_dob, stride_doh, stride_dom, stride_dok,
-        stride_deltab, stride_deltah, stride_deltam,
-        Sq, B, H,
+        o,
+        do,
+        delta,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_ok,
+        stride_dob,
+        stride_doh,
+        stride_dom,
+        stride_dok,
+        stride_deltab,
+        stride_deltah,
+        stride_deltam,
+        Sq,
+        B,
+        H,
     )
     torch.cuda.synchronize()
 
@@ -61,7 +78,7 @@ def test_fmha_bwd_preprocess(B, H, Sq, D, dtype):
 
 
 if __name__ == "__main__":
-    test_fmha_bwd_preprocess(1, 5, 128,  128, torch.bfloat16)
-    test_fmha_bwd_preprocess(2, 8, 256,  128, torch.bfloat16)
+    test_fmha_bwd_preprocess(1, 5, 128, 128, torch.bfloat16)
+    test_fmha_bwd_preprocess(2, 8, 256, 128, torch.bfloat16)
     test_fmha_bwd_preprocess(1, 5, 1024, 128, torch.bfloat16)
     print("All tests passed.")
