@@ -44,6 +44,7 @@ FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
 KERNEL_FAMILY_HGEMM = "hgemm"
 KERNEL_FAMILY_SMALL_M = "small_m"
+KERNEL_FAMILY_HGEMM_4WAVE = "hgemm_4wave"
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
@@ -63,6 +64,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"(?:_wpe(?P<waves_per_eu>\d+))?"
     r"(?:_ur(?P<b_to_lds_unroll>\d+))?"
     r")?"
+    r"(?P<hgemm4wave_suffix>_4wave)?"
     r"_(?P<target_gfx>gfx[0-9a-z]+)$"
 )
 
@@ -176,10 +178,13 @@ def flydsl_kernel_name(
             name += f"_wpe{waves_per_eu}"
         if b_to_lds_unroll > 0:
             name += f"_ur{b_to_lds_unroll}"
+    elif kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
+        name += "_4wave"
     elif kernel_family != KERNEL_FAMILY_HGEMM:
         raise ValueError(
             f"Unsupported kernel_family={kernel_family!r}; expected "
-            f"{KERNEL_FAMILY_HGEMM!r} or {KERNEL_FAMILY_SMALL_M!r}"
+            f"{KERNEL_FAMILY_HGEMM!r}, {KERNEL_FAMILY_SMALL_M!r} or "
+            f"{KERNEL_FAMILY_HGEMM_4WAVE!r}"
         )
     name += f"_{get_gfx()}"
     return name
@@ -551,11 +556,12 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
     if m.group("a_dtype") != m.group("w_dtype"):
         return None
 
-    kernel_family = (
-        KERNEL_FAMILY_SMALL_M
-        if m.group("small_m_suffix") is not None
-        else KERNEL_FAMILY_HGEMM
-    )
+    if m.group("small_m_suffix") is not None:
+        kernel_family = KERNEL_FAMILY_SMALL_M
+    elif m.group("hgemm4wave_suffix") is not None:
+        kernel_family = KERNEL_FAMILY_HGEMM_4WAVE
+    else:
+        kernel_family = KERNEL_FAMILY_HGEMM
     block_k_warps = m.group("block_k_warps")
     block_k_warps = int(block_k_warps) if block_k_warps else 1
     config: Dict[str, object] = {
@@ -797,10 +803,13 @@ def _compile_flydsl_hgemm(
                 "small-M kernel fixes block_m_warps=1; "
                 f"got block_m_warps={block_m_warps}"
             )
+    elif kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
+        pass  # validated by kernel asserts
     else:
         raise ValueError(
             f"Unsupported kernel_family={kernel_family!r}; expected "
-            f"{KERNEL_FAMILY_HGEMM!r} or {KERNEL_FAMILY_SMALL_M!r}"
+            f"{KERNEL_FAMILY_HGEMM!r}, {KERNEL_FAMILY_SMALL_M!r} or "
+            f"{KERNEL_FAMILY_HGEMM_4WAVE!r}"
         )
 
     kernel = compile_flydsl_hgemm_kernel(
@@ -827,6 +836,34 @@ def _compile_flydsl_hgemm(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
     )
+
+    if kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
+        from .kernels.splitk_hgemm_4wave import _get_4wave_sig_sem
+
+        def launcher(
+            out: torch.Tensor,
+            a: torch.Tensor,
+            b: torch.Tensor,
+            bias: Optional[torch.Tensor] = None,
+            stream: Optional[torch.cuda.Stream] = None,
+        ):
+            if bias is not None:
+                raise ValueError("hgemm_4wave launcher does not support bias")
+            runtime_m = int(a.shape[0])
+            launch_stream = _normalize_launch_stream(a.device, stream)
+            sema, sig = _get_4wave_sig_sem(a.device)
+            return _run_compiled(
+                kernel,
+                _ptr_view_safe(out),
+                _ptr_view_safe(a),
+                _ptr_view_safe(b),
+                runtime_m,
+                _ptr_view_safe(sema),
+                _ptr_view_safe(sig),
+                fx.Stream(launch_stream),
+            )
+
+        return launcher
 
     def launcher(
         out: torch.Tensor,

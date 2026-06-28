@@ -4,9 +4,11 @@ from typing import Optional
 
 from .small_m_hgemm import compile_small_m_hgemm_kernel
 from .splitk_hgemm import compile_hgemm_kernel
+from .splitk_hgemm_4wave import compile_splitk_hgemm_4wave
 
 KERNEL_FAMILY_HGEMM = "hgemm"
 KERNEL_FAMILY_SMALL_M = "small_m"
+KERNEL_FAMILY_HGEMM_4WAVE = "hgemm_4wave"
 
 
 def compile_flydsl_hgemm_kernel(
@@ -76,7 +78,14 @@ def compile_flydsl_hgemm_kernel(
             HAS_BIAS=has_bias,
         )
 
+    if kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
+        # BN<-tile_n, BM<-tile_m, BK<-tile_k, SPLITK<-split_k.
+        return compile_splitk_hgemm_4wave(
+            n, k, tile_n, split_k, tile_m, BK=tile_k, dtype=dtype
+        )
+
     raise ValueError(
         f"Unsupported kernel_family={kernel_family!r}; expected "
-        f"{KERNEL_FAMILY_HGEMM!r} or {KERNEL_FAMILY_SMALL_M!r}"
+        f"{KERNEL_FAMILY_HGEMM!r}, {KERNEL_FAMILY_SMALL_M!r} or "
+        f"{KERNEL_FAMILY_HGEMM_4WAVE!r}"
     )
