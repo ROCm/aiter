@@ -4645,8 +4645,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
         cands = []
         for bm in sorted({v[0] for v in G1} & {v[0] for v in G2}):
-            if bm == 64:
-                continue
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
                 kn1 = self._g1_kname(bm, n1, iq1)
                 for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
