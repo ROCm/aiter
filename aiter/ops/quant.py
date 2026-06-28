@@ -862,6 +862,7 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     token_num: int,
     block_m: int,
     group_size: int = 32,
+    sorted_weights: Optional[torch.Tensor] = None,
 ) -> None:
     """
     HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
@@ -1004,6 +1005,7 @@ def fused_dynamic_mx_quant_moe_sort(
     quant_dtype: torch.dtype = dtypes.fp4x2,
     num_rows: Optional[torch.Tensor] = None,
     group_size: int = 32,
+    sorted_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Unified fused dynamic MX quant + MoE-sort entry (MXFP4 / MXFP8).
 
@@ -1085,6 +1087,7 @@ def fused_dynamic_mx_quant_moe_sort(
             token_num,
             block_size,
             group_size,
+            sorted_weights,
         )
     else:
         # Split path: per-token quant produces unswizzled e8m0 byte scale,
@@ -1117,6 +1120,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     block_size: int,
     num_rows: Optional[torch.Tensor] = None,
     group_size: int = 32,
+    sorted_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1134,6 +1138,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         quant_dtype=dtypes.fp4x2,
         num_rows=num_rows,
         group_size=group_size,
+        sorted_weights=sorted_weights,
     )
 
 
@@ -1146,6 +1151,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     block_size: int,
     num_rows: Optional[torch.Tensor] = None,
     group_size: int = 32,
+    sorted_weights: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1173,6 +1179,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
         quant_dtype=dtypes.fp8,
         num_rows=num_rows,
         group_size=group_size,
+        sorted_weights=sorted_weights,
     )
 
 
@@ -1226,6 +1233,16 @@ def rope_rotate_activation(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
+    out_scale: Optional[torch.Tensor] = None,
+    group_size: int = 128,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate.
+
+    When ``out_scale`` is given, the rotated activation is additionally
+    fp8-quantized in-kernel (fusing what ``get_hip_quant(per_1x128)`` would do):
+    ``out`` must be fp8 and receives ``round(rotated / scale)``, while
+    ``out_scale`` (``[m, dim // group_size]`` fp32) receives the per-(row,
+    ``1 x group_size``) block scales ``scale = absMax / fp8_max``. Without
+    ``out_scale`` it is the bf16/fp16 in-place path (``out`` shares dtype with
+    ``input``)."""
     ...
