@@ -135,7 +135,7 @@ jobs:
             fi
           done
 
-          docker run --rm \
+          docker run --rm -i \
             --device /dev/kfd ${DEVICE_FLAG} \
             ${GROUP_FLAGS} \
             --cap-add=SYS_PTRACE \
@@ -147,7 +147,7 @@ jobs:
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${FFM_IMAGE}" \
-            bash -lc '
+            bash -l -s <<'FFM_DOCKER_SCRIPT'
               set -euo pipefail
               source /ffm/ffmlite_env.sh
               cd /workspace
@@ -219,7 +219,7 @@ jobs:
 
               echo "==== Run sharded FFM Triton tests ===="
               python3 -m pytest -v "${FFM_TEST_ITEMS[@]}"
-            '
+          FFM_DOCKER_SCRIPT
 
       - name: Cleanup
         if: always()
