@@ -3113,7 +3113,7 @@ class FmoeTuner(TunerCommon):
             # kernel weight layout match (else outputs are uncorrelated).
             # Source of truth: aiter/fused_moe.py q_dtype_a selection.
             eff_q_dtype_a = q_dtype_a
-            if q_type == QuantType.per_1x32 and q_dtype_w != dtypes.i4x2:
+            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
                 if act_type == ActivationType.Swiglu:
                     eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
                 else:
@@ -3215,24 +3215,38 @@ class FmoeTuner(TunerCommon):
                     )
                 elif (
                     q_type == QuantType.per_1x32
-                    and eff_q_dtype_a in [dtypes.bf16, dtypes.fp16]
+                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
                     and q_dtype_w == dtypes.fp4x2
                 ):
-                    # a16w4 (bf16 activation): a16w4 weight layout
+                    # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
+                    # weight layout follows the *config* activation dtype, not the
+                    # runtime-effective one (mirror op_tests/test_moe_2stage.py).
                     w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
                     w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
                 elif (
                     q_type == QuantType.per_1x32
-                    and eff_q_dtype_a == dtypes.fp4x2
+                    and q_dtype_a == dtypes.fp4x2
                     and q_dtype_w == dtypes.fp4x2
                 ):
-                    # a4w4 (fp4 activation, what Silu+SEPARATED actually runs):
-                    # regular (16,16) weight shuffle + e8m0 scale shuffle.
+                    # a4w4 (fp4 activation/weight): standard (16,16) weight shuffle
+                    # + e8m0 scale shuffle (mirror test_moe_2stage preshuffle path).
                     w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, layout=(16, 16))
                     w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, layout=(16, 16))
                     w1_scale_fmoe = fp4_utils.e8m0_shuffle(w1_scale)
+                    w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
+                elif (
+                    q_type == QuantType.per_1x32
+                    and q_dtype_a == dtypes.fp8
+                    and q_dtype_w == dtypes.fp8
+                ):
+                    # mxfp8 (a8w8): gate-up interleaved fp8 weight; w1 scale uses the
+                    # a16w4 interleave, w2 scale uses plain e8m0 (mirror
+                    # op_tests/test_moe_2stage.py is_mxfp8).
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
+                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
                 elif q_dtype_w != dtypes.fp4x2:
                     w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
@@ -3279,6 +3293,15 @@ class FmoeTuner(TunerCommon):
                     and q_dtype_w == dtypes.fp4x2
                 ):
                     # a16w4 (bf16 activation): reference runs activation in bf16.
+                    a1_qt = hidden.to(dtype)
+                    a1_scale = None
+                elif (
+                    q_type == QuantType.per_1x32
+                    and q_dtype_a == dtypes.fp8
+                    and q_dtype_w == dtypes.fp8
+                ):
+                    # mxfp8 (a8w8): kernel quantizes the activation internally; the
+                    # reference runs activation in bf16 (mirror test_moe_2stage).
                     a1_qt = hidden.to(dtype)
                     a1_scale = None
                 else:
