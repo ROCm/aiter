@@ -2492,6 +2492,19 @@ def fused_moe_2stages(
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
     if m_indices is not None:
+        # mxfp4 a4w4 port OOB-pad sentinel contract. gemm1 sizes A_q's buffer
+        # extent from n_tokens = hidden_states.shape[0] and relies on the sort
+        # writing pad rows' m_indices = M (= topk_ids.shape[0]) so the load lands
+        # exactly past the extent and the HW returns 0 (see gemm1 aq_rsrc and
+        # csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh fill pad path). If
+        # the two diverge, pad rows read real/uninitialized data and silently
+        # corrupt the output, so lock the invariant here where both are visible.
+        if topk_ids is not None:
+            assert hidden_states.shape[0] == topk_ids.shape[0], (
+                f"mxfp4 a4w4 port: hidden_states rows ({hidden_states.shape[0]}) "
+                f"must equal topk_ids rows ({topk_ids.shape[0]}); a mismatch "
+                "breaks the gemm1 OOB-pad sentinel (m_indices=M)."
+            )
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted

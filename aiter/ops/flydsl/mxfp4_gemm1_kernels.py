@@ -104,6 +104,32 @@ def flydsl_mxfp4_gemm1(
         BN=BN,
         BK=BK,
     )
+    # OOB-pad sentinel contract: gemm1 sizes the load buffer extent from n_tokens
+    # and relies on the sort writing pad rows' m_indices = M (= n_tokens) so the
+    # load lands exactly past the extent and the HW returns 0. The extent is
+    # n_tokens rows * row-stride, so the backing buffer must be contiguous with
+    # exactly n_tokens rows (the inline path reads hidden_states, otherwise A_q).
+    # See csrc/kernels/mxfp4_moe/moe_aux/moe_3stage_sort.cuh fill pad path and
+    # kernels/mxfp4_gemm1.py (aq_rsrc / hidden_rsrc).
+    if inline_quant:
+        assert hidden_states.is_contiguous() and tuple(hidden_states.shape) == (
+            n_tokens,
+            D_HIDDEN,
+        ), (
+            f"inline-quant gemm1 hidden extent invariant violated: "
+            f"shape={tuple(hidden_states.shape)} "
+            f"contiguous={hidden_states.is_contiguous()} "
+            f"(expected ({n_tokens}, {D_HIDDEN}))"
+        )
+    else:
+        assert a_quant.is_contiguous() and tuple(a_quant.shape) == (
+            n_tokens,
+            D_HIDDEN // 2,
+        ), (
+            f"gemm1 A_q extent invariant violated: shape={tuple(a_quant.shape)} "
+            f"contiguous={a_quant.is_contiguous()} "
+            f"(expected ({n_tokens}, {D_HIDDEN // 2}))"
+        )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
