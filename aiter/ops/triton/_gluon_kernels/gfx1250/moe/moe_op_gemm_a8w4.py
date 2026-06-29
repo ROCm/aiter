@@ -282,8 +282,9 @@ def _moe_gemm_a8w4_decode(
         [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
     )
     if is_x_microscaled:
+        XS_PAD_INTERVAL: gl.constexpr = MX_SCALE_BLOCK_K if X_SCALE_TDM else 256
         SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[256, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0]
+            [[XS_PAD_INTERVAL, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0]
         )
     if Quant_static_scale is not None:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -889,8 +890,9 @@ def _moe_gemm_a8w4_prefill(
         [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
     )
     if is_x_microscaled:
+        XS_PAD_INTERVAL: gl.constexpr = MX_SCALE_BLOCK_K if X_SCALE_TDM else 256
         SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[256, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0]
+            [[XS_PAD_INTERVAL, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0]
         )
     if Quant_static_scale is not None:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
