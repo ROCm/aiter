@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 #include <cstdint>
+#include <optional>
 #include <vector>
 #include "aiter_tensor.h"
 
@@ -74,7 +75,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              int64_t reg_ptr,
                              int64_t reg_bytes,
                              bool use_1stage,
-                             bool gemma_norm = false);
+                             bool gemma_norm = false,
+                             std::optional<aiter_tensor_t> zero_fill = std::nullopt);
 void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  const aiter_tensor_t& inp,
                                  const aiter_tensor_t& res_inp,
@@ -85,7 +87,8 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  int64_t reg_ptr,
                                  int64_t reg_bytes,
                                  bool use_1stage,
-                                 bool gemma_norm = false);
+                                 bool gemma_norm = false,
+                                 std::optional<aiter_tensor_t> zero_fill = std::nullopt);
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& inp,
                                    const aiter_tensor_t& res_inp,

@@ -243,6 +243,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         prefill_support: bool = False,
         x_pad_to_multiple: int = 0,
         gemma_norm: bool = False,
+        zero_fill: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from aiter.dist.device_communicators.custom_all_reduce import (
             can_pack_2d_last_dim_slice,
@@ -301,6 +302,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 use_1stage,
                 out_hidden_dim=out_n,
                 gemma_norm=gemma_norm,
+                zero_fill=zero_fill,
             )
             assert out is not None
             assert res_out is not None
@@ -329,6 +331,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         input_for_ar = input_ if input_is_weak_contiguous else input_.contiguous()
         ar_out = self.all_reduce(input_for_ar, prefill_support=prefill_support)
+        if zero_fill is not None:
+            zero_fill.zero_()
         if input_n != n:
             # The padded tail is semantically zero for the current MoE path, so
             # the fallback path only needs the valid hidden region for RMSNorm.

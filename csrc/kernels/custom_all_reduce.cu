@@ -18,6 +18,7 @@
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include <cstring>
+#include <optional>
 
 using fp8_type = opus::fp8_t;
 
@@ -197,7 +198,9 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      AiterDtype dtype, float eps,
                                      int m, int input_n, int n, int out_n,
                                      bool use_1stage,
-                                     bool gemma_norm)
+                                     bool gemma_norm,
+                                     void* zero_fill,
+                                     int zero_fill_elems)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -219,7 +222,9 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             n,                                                   \
             out_n,                                               \
             use_1stage,                                          \
-            gemma_norm);                                         \
+            gemma_norm,                                          \
+            reinterpret_cast<DTYPE*>(zero_fill),                 \
+            zero_fill_elems);                                    \
     }                                                            \
     else                                                         \
     {                                                            \
@@ -508,7 +513,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              double eps,
                              int64_t reg_ptr, int64_t reg_bytes,
                              bool use_1stage,
-                             bool gemma_norm)
+                             bool gemma_norm,
+                             std::optional<aiter_tensor_t> zero_fill)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -517,6 +523,8 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
     int n = (int)w.numel();
     int m = (int)(inp.numel() / input_n);
     int out_n = (int)out.size(-1);
+    void* zero_fill_ptr = zero_fill.has_value() ? zero_fill->data_ptr() : nullptr;
+    int zero_fill_elems = zero_fill.has_value() ? (int)zero_fill->numel() : 0;
     if(input_n != n || out_n != n)
     {
         throw std::runtime_error(
@@ -535,14 +543,16 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage,
+                                 gemma_norm, zero_fill_ptr, zero_fill_elems);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage,
+                                 gemma_norm, zero_fill_ptr, zero_fill_elems);
     }
 }
 
@@ -555,7 +565,8 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
                                  double eps,
                                  int64_t reg_ptr, int64_t reg_bytes,
                                  bool use_1stage,
-                                 bool gemma_norm)
+                                 bool gemma_norm,
+                                 std::optional<aiter_tensor_t> zero_fill)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -564,6 +575,8 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
     int n = (int)w.numel();
     int m = (int)(inp.numel() / input_n);
     int out_n = (int)out.size(-1);
+    void* zero_fill_ptr = zero_fill.has_value() ? zero_fill->data_ptr() : nullptr;
+    int zero_fill_elems = zero_fill.has_value() ? (int)zero_fill->numel() : 0;
     if(input_n < n)
     {
         throw std::runtime_error(
@@ -581,14 +594,16 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage,
+                                 gemma_norm, zero_fill_ptr, zero_fill_elems);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage, gemma_norm);
+                                 dtype, (float)eps, m, input_n, n, out_n, use_1stage,
+                                 gemma_norm, zero_fill_ptr, zero_fill_elems);
     }
 }
 
@@ -621,14 +636,16 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false,
+                                 nullptr, 0);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false,
+                                 nullptr, 0);
     }
 }
 

@@ -68,6 +68,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     prefill_support: bool = False,
     x_pad_to_multiple: int = 0,
     gemma_norm: bool = False,
+    zero_fill: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm")
     return get_tp_group().fused_allreduce_rmsnorm(
@@ -78,6 +79,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
         prefill_support,
         x_pad_to_multiple=x_pad_to_multiple,
         gemma_norm=gemma_norm,
+        zero_fill=zero_fill,
     )
 
 

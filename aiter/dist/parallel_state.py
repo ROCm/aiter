@@ -133,6 +133,7 @@ def fused_allreduce_rmsnorm_fake(
     prefill_support: bool = False,
     x_pad_to_multiple: int = 0,
     gemma_norm: bool = False,
+    zero_fill: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     n = w.shape[-1]
     if x_pad_to_multiple > 0:
@@ -151,6 +152,7 @@ def fused_allreduce_rmsnorm_(
     prefill_support: bool = False,
     x_pad_to_multiple: int = 0,
     gemma_norm: bool = False,
+    zero_fill: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -164,6 +166,7 @@ def fused_allreduce_rmsnorm_(
         prefill_support,
         x_pad_to_multiple=x_pad_to_multiple,
         gemma_norm=gemma_norm,
+        zero_fill=zero_fill,
     )
 
 
@@ -537,6 +540,7 @@ class GroupCoordinator:
         prefill_support: bool = False,
         x_pad_to_multiple: int = 0,
         gemma_norm: bool = False,
+        zero_fill: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_allreduce_rmsnorm_(
             input_,
@@ -547,6 +551,7 @@ class GroupCoordinator:
             prefill_support=prefill_support,
             x_pad_to_multiple=x_pad_to_multiple,
             gemma_norm=gemma_norm,
+            zero_fill=zero_fill,
         )
 
     def fused_allreduce_rmsnorm_quant(
@@ -670,6 +675,7 @@ class GroupCoordinator:
         prefill_support: bool = False,
         x_pad_to_multiple: int = 0,
         gemma_norm: bool = False,
+        zero_fill: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -681,6 +687,7 @@ class GroupCoordinator:
             prefill_support,
             x_pad_to_multiple=x_pad_to_multiple,
             gemma_norm=gemma_norm,
+            zero_fill=zero_fill,
         )
 
     def _fused_allreduce_rmsnorm_quant_out_place(

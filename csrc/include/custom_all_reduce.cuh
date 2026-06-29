@@ -1356,6 +1356,23 @@ DINLINE void smemReduceSum(float* smem_addr)
     __syncthreads();
 }
 
+
+template <typename T>
+__device__ __forceinline__ void
+fused_zero_fill(T* __restrict__ zero_fill, int zero_fill_elems, int zero_block)
+{
+    if(zero_fill == nullptr)
+        return;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    int elem_idx = (zero_block * (int)blockDim.x + (int)threadIdx.x) * pack_size;
+    if(elem_idx + pack_size <= zero_fill_elems)
+        *reinterpret_cast<P*>(zero_fill + elem_idx) = P{};
+    else
+        for(int i = elem_idx; i < zero_fill_elems; ++i)
+            zero_fill[i] = downcast_s<T>(0.0f);
+}
+
 /*
  * input case n dim should be divided by 4096 with dtype bf16
  * and should be divided by 2048 with dtype fp32
@@ -1370,7 +1387,11 @@ __global__ void __launch_bounds__(tnum, 1)
                                     float eps,
                                     int rank,
                                     int m,
-                                    int n)
+                                    int n,
+                                    int out_hidden_dim,
+                                    T* __restrict__ zero_fill,
+                                    int zero_fill_elems,
+                                    int rms_grid_size)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1378,7 +1399,13 @@ __global__ void __launch_bounds__(tnum, 1)
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
 
-    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    if((int)blockIdx.x >= rms_grid_size)
+    {
+        fused_zero_fill<T>(zero_fill, zero_fill_elems, (int)blockIdx.x - rms_grid_size);
+        return;
+    }
+
+    for(int bid = blockIdx.x; bid < m; bid += rms_grid_size)
     {
         float square_sum = 0.0f;
         A rms_inp_f32[n_loop];
@@ -1443,7 +1470,10 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                                                                      int rank,
                                                                      int m,
                                                                      int n,
-                                                                     int out_hidden_dim)
+                                                                     int out_hidden_dim,
+                                                                     T* __restrict__ zero_fill,
+                                                                     int zero_fill_elems,
+                                                                     int rms_grid_size)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1454,7 +1484,13 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
     int out_pack_count      = out_hidden_dim / pack_size;
     int tail_pack_count     = out_pack_count - in_pack_count;
 
-    for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
+    if((int)blockIdx.x >= rms_grid_size)
+    {
+        fused_zero_fill<T>(zero_fill, zero_fill_elems, (int)blockIdx.x - rms_grid_size);
+        return;
+    }
+
+    for(int bid = blockIdx.x; bid < m; bid += rms_grid_size)
     {
         float square_sum = 0.0f;
         A rms_inp_f32[n_loop];
@@ -1912,6 +1948,8 @@ __global__ void __launch_bounds__(1024, 1)
                                    OutT* __restrict__ output,
                                    T* __restrict__ weight,
                                    float* __restrict__ scale_out,
+                                   T* __restrict__ zero_fill,
+                                   int zero_fill_elems,
                                    int size,
                                    int input_hidden_dim,
                                    int hidden_dim,
@@ -1921,12 +1959,17 @@ __global__ void __launch_bounds__(1024, 1)
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
     int out_block_size      = out_hidden_dim / pack_size;
+    int token_num           = size / hidden_dim;
+    if((int)blockIdx.x >= token_num)
+    {
+        fused_zero_fill<T>(zero_fill, zero_fill_elems, (int)blockIdx.x - token_num);
+        return;
+    }
     bool active             = (int)threadIdx.x < block_size;
     bool active_tail        = (int)threadIdx.x >= block_size && (int)threadIdx.x < out_block_size;
     using P                 = typename opus::vector_t<T, pack_size>;
     using OP                = typename opus::vector_t<OutT, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
-    int token_num           = size / hidden_dim;
     int access_id_in_token  = threadIdx.x * pack_size;
     const P* ptrs[ngpus];
     P* tmps[ngpus];
@@ -2368,7 +2411,9 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                              int hidden_dim,
                                              int out_hidden_dim,
                                              float eps,
-                                             hipStream_t stream)
+                                             hipStream_t stream,
+                                             T* zero_fill = nullptr,
+                                             int zero_fill_elems = 0)
 {
     constexpr int PACK_SIZE  = 16 / sizeof(T);
     constexpr int WARP_SIZE  = 32;
@@ -2378,7 +2423,11 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
     int LAUNCH_THREADS       = ((OUT_BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
     dim3 threadsPerBlock(LAUNCH_THREADS);
     int token_num            = size / hidden_dim;
-    dim3 numBlocks(std::min(token_num, kMaxBlocks));
+    int zeroBlocks           = 0;
+    if(zero_fill != nullptr && zero_fill_elems > 0)
+        zeroBlocks = (zero_fill_elems + PACK_SIZE * LAUNCH_THREADS - 1) /
+                     (PACK_SIZE * LAUNCH_THREADS);
+    dim3 numBlocks(std::min(token_num, kMaxBlocks) + zeroBlocks);
     allreduce_fusion_kernel_1stage<T, OutT, NGPUS, GEMMA_NORM>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
                                                     sg,
@@ -2389,6 +2438,8 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     output,
                                                     weight,
                                                     scale_out,
+                                                    zero_fill,
+                                                    zero_fill_elems,
                                                     size,
                                                     input_hidden_dim,
                                                     hidden_dim,
@@ -4005,7 +4056,9 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    int n,
                                    int out_n,
                                    bool use_1stage,
-                                   bool gemma_norm = false)
+                                   bool gemma_norm = false,
+                                   T* zero_fill = nullptr,
+                                   int zero_fill_elems = 0)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -4055,7 +4108,9 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                                                        n,                  \
                                                                        out_n,              \
                                                                        eps,                \
-                                                                       stream);            \
+                                                                       stream,             \
+                                                                       zero_fill,          \
+                                                                       zero_fill_elems);   \
         }                                                                                  \
         else                                                                               \
         {                                                                                  \
@@ -4073,7 +4128,9 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                                                         n,                 \
                                                                         out_n,             \
                                                                         eps,               \
-                                                                        stream);           \
+                                                                        stream,            \
+                                                                        zero_fill,         \
+                                                                        zero_fill_elems);  \
         }                                                                                  \
         return;                                                                            \
     }
@@ -4119,15 +4176,29 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         {                                                                              \
             auto kernel_ptr = reinterpret_cast<const void*>(gemma_template_kernel);     \
             setGrid(naive_grid_size, kernel_ptr);                                      \
+            int rms_grid_size = grid.x;                                                \
+            int zero_blocks = 0;                                                       \
+            if(zero_fill != nullptr && zero_fill_elems > 0)                            \
+                zero_blocks = (zero_fill_elems + ar_pack_size * (int)block.x - 1) /    \
+                              (ar_pack_size * (int)block.x);                          \
+            grid.x = rms_grid_size + zero_blocks;                                      \
             gemma_template_kernel<<<grid, block, 0, stream>>>(                         \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n); \
+                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n, \
+                zero_fill, zero_fill_elems, rms_grid_size);                            \
         }                                                                              \
         else                                                                           \
         {                                                                              \
             auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);           \
             setGrid(naive_grid_size, kernel_ptr);                                      \
+            int rms_grid_size = grid.x;                                                \
+            int zero_blocks = 0;                                                       \
+            if(zero_fill != nullptr && zero_fill_elems > 0)                            \
+                zero_blocks = (zero_fill_elems + ar_pack_size * (int)block.x - 1) /    \
+                              (ar_pack_size * (int)block.x);                          \
+            grid.x = rms_grid_size + zero_blocks;                                      \
             template_kernel<<<grid, block, 0, stream>>>(                               \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n); \
+                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, out_n, \
+                zero_fill, zero_fill_elems, rms_grid_size);                            \
         }                                                                              \
     } while(0)
 
@@ -4138,15 +4209,29 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         {                                                                       \
             auto kernel_ptr = reinterpret_cast<const void*>(gemma_template_kernel); \
             setGrid(naive_grid_size, kernel_ptr);                               \
+            int rms_grid_size = grid.x;                                          \
+            int zero_blocks = 0;                                                 \
+            if(zero_fill != nullptr && zero_fill_elems > 0)                      \
+                zero_blocks = (zero_fill_elems + ar_pack_size * (int)block.x - 1) / \
+                              (ar_pack_size * (int)block.x);                    \
+            grid.x = rms_grid_size + zero_blocks;                                \
             gemma_template_kernel<<<grid, block, 0, stream>>>(                  \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, n, \
+                zero_fill, zero_fill_elems, rms_grid_size);                      \
         }                                                                       \
         else                                                                    \
         {                                                                       \
             auto kernel_ptr = reinterpret_cast<const void*>(template_kernel);    \
             setGrid(naive_grid_size, kernel_ptr);                               \
+            int rms_grid_size = grid.x;                                          \
+            int zero_blocks = 0;                                                 \
+            if(zero_fill != nullptr && zero_fill_elems > 0)                      \
+                zero_blocks = (zero_fill_elems + ar_pack_size * (int)block.x - 1) / \
+                              (ar_pack_size * (int)block.x);                    \
+            grid.x = rms_grid_size + zero_blocks;                                \
             template_kernel<<<grid, block, 0, stream>>>(                        \
-                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
+                sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n, n, \
+                zero_fill, zero_fill_elems, rms_grid_size);                      \
         }                                                                       \
     } while(0)
 
