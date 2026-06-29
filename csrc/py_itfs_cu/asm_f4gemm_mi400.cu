@@ -6,13 +6,12 @@
 //   - mxfp4_gemm_asm: D[M,N] bf16 = A[M,K/2] mxfp4 * B[N,K/2] mxfp4 (e8m0 scales)
 //   - nvfp4_gemm_asm: D[M,N] bf16 = A[M,K/2] nvfp4 * B[N,K/2] nvfp4 (e4m3 scales + GlobalScale)
 //
-// KernelArgs uses the ROCm kernarg-preload layout (sgpr_mode==1) and must match
-// `args_preload` in poc_kl/mi400/f4gemm/f4gemm.cpp:546-564 exactly: pointers
+// KernelArgs uses the ROCm kernarg-preload layout (sgpr_mode==1): pointers
 // first (dw 0..9, MEM-first), then 4B-tight scalars. Bytes shipped to HW:
 //   MXFP4: 80B (struct minus the 2 trailing persistent log2 dwords)
 //   NVFP4: 88B (full struct incl. GlobalScaleA/B + trailing log2)
 //
-// Launch is cluster- and persistent-aware (mirrors poc_kl f4gemm.cpp):
+// Launch is cluster- and persistent-aware:
 //   - cluster_x/cluster_y are compile-time per .co and read from the CSV; a
 //     dim > 1 launches via hipDrvLaunchKernelEx with a cluster-dim attribute.
 //   - persistent dispatch is hardcoded on (persistent_tg=256, grid_y=4; both
@@ -166,7 +165,7 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
                 scale_block,
                 ")");
 
-    // Strides in bytes (matches poc_kl/mi400/f4gemm/f4gemm.cpp).
+    // Strides in bytes.
     unsigned int stride_a = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
     unsigned int stride_b = static_cast<unsigned int>(Kdim / 2);     // fp4 packed
     unsigned int stride_d = static_cast<unsigned int>(Ndim) * 2;     // bf16
@@ -193,7 +192,7 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
         args.GlobalScaleB = GlobalScaleB;
     }
 
-    // Bytes shipped to HW (matches f4gemm.cpp preload path):
+    // Bytes shipped to HW:
     //   NVFP4: full struct (5 ptrs + 8 scalars + GlobalScaleA/B + 2 log2) = 88B
     //   MXFP4: drop the 2 trailing persistent log2 dwords                 = 80B
     size_t arg_size = (intype == F4_INTYPE_NVFP4)
@@ -250,7 +249,7 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
         cfg.knl_name, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
-    // ----- Launch geometry: cluster + persistent (mirrors poc_kl f4gemm.cpp) -----
+    // ----- Launch geometry: cluster + persistent -----
     const int SUBM      = cfg.tile_m;
     const int SUBN      = cfg.tile_n;
     const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;  // compile-time per .co (CSV)
@@ -258,7 +257,7 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
 
     // Persistent dispatch is hardcoded on: all f4gemm_mi400 .co are persistent
     // shaders. persistent_tg / grid_y are runtime-only knobs (don't affect the
-    // .co), so they're fixed here at the poc_kl defaults; gridX is derived.
+    // .co), so they're fixed here at the default; gridX is derived.
     constexpr int PERSISTENT    = 1;
     constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
     constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
@@ -317,7 +316,7 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
 
         // Persistent shader reads log2(gridX)/log2(gridY). NVFP4 ships them at
         // dw20/21; MXFP4 has no GlobalScale so the shader reads them from the
-        // GlobalScale slots (dw18/19) -- matches f4gemm.cpp:621-635.
+        // GlobalScale slots (dw18/19).
         if(intype == F4_INTYPE_NVFP4)
         {
             args.log2_grid_x = log2_grid_x;

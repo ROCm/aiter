@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build all f4gemm_mi400 .co files from .s assembly sources.
 #
-# Each F4GEMM sp3 emits a kernel symbol named "f4gemm". The CFG map in
+# Each source .s emits a kernel symbol named "f4gemm". The CFG map in
 # asm_f4gemm_mi400_configs.hpp uses (arch + knl_name) as a unique key, so we
 # rename the kernel symbol per variant via sed before compilation. The
 # rename target matches the knl_name column in f4gemm_mi400.csv.
@@ -10,12 +10,7 @@
 #   ${SHADER_DIR}/f4gemm_${intype_name}_${subm}x${subn}_apre${apre}.s
 # where intype_name = "mxfp4" (intype=7) or "nvfp4" (intype=8).
 #
-# Generate these in poc_kl with `run.sh convert SUBM=.. SUBN=.. INTYPE=..
-# A_PRESHUFFLE=.. SGPR_MODE=1` and rename / move the resulting .s into the
-# expected filename.
-#
 # Usage:
-#   ./build_co.sh                            # default SHADER_DIR
 #   SHADER_DIR=/path/to/shaders ./build_co.sh
 #   SHADER_DIR=... CSV=... ./build_co.sh
 
@@ -24,7 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}"
 CSV="${CSV:-${SCRIPT_DIR}/f4gemm_mi400.csv}"
-SHADER_DIR="${SHADER_DIR:-/home/carhuang/yayang/Workspace/poc_kl/mi400/f4gemm/shaders}"
+SHADER_DIR="${SHADER_DIR:-${SCRIPT_DIR}/shaders}"
 ARCH="gfx1250"
 
 if command -v amdclang++ &>/dev/null; then
