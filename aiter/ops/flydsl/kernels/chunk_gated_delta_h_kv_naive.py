@@ -144,12 +144,12 @@ def compile_chunk_gated_delta_h_kv_naive(
     # =False reaches 4 waves/SIMD (VGPR 136->128, LDS 44->35KB) but is ~20%
     # SLOWER (578us vs 480us) because u reverts to 16 scalar buffer_load_ushort
     # -- higher occupancy does NOT compensate the extra VMEM traffic. Keep True.
-    USE_LDS_U = True
+    USE_LDS_U = False
 
     # EXPERIMENT toggle: v_new output store. True = stage to lds_vn [BT,V] then
     # coalesced b128 read-out (independent buffer, ~8.5KB, keeps 3 waves);
     # False = original 16 scalar buffer_store_short straight to HBM.
-    USE_LDS_VN_STORE = True
+    USE_LDS_VN_STORE = False
 
     # EXPERIMENT toggle (OPT-C(g), rev219+): stage the chunk's 64 per-row g into
     # lds_g (one coalesced load/thread, +256 B LDS) and read g from LDS in
@@ -159,7 +159,7 @@ def compile_chunk_gated_delta_h_kv_naive(
     # vmcnt(16) drain is fully hidden by 3-wave overlap, so it is not the
     # binding wait -- but ON cuts buffer_load 41->21 / removes the redundant HBM
     # g traffic, so kept True as the cleaner / lower-traffic default.
-    USE_LDS_G = True
+    USE_LDS_G = False
 
     # -- LDS layout (no lds_h: KV h-store goes reg -> HBM directly) --
     # lds_w / lds_k row pads break LDS bank conflicts. K (=128 bf16 = 256 B) is
@@ -206,7 +206,21 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_HT_STRIDE = K + LDS_HT_PAD  # [V, K] : K innermost
     LDS_HT_ELEMS = BV * LDS_HT_STRIDE
     LDS_HT_BYTES = LDS_HT_ELEMS * 2
-    assert LDS_HT_ELEMS <= LDS_K_ELEMS, "lds_ht must fit inside aliased lds_k"
+
+    # EXPERIMENT toggle (ht-independent): when False (default), lds_ht ALIASES
+    # lds_k (no extra LDS, 3 waves preserved) -- the snapshot runs at the top of
+    # the chunk before this chunk's k is loaded and after the prev chunk's GEMM2
+    # read lds_k, with a top-of-step-1 barrier guarding that WAR. When True,
+    # lds_ht gets its OWN buffer (+LDS_HT_BYTES ~17KB), HIP-style.
+    # MEASURED (2026-06-29, varlen-32k-aws T1000, pytest profiler kernel-time):
+    #   - True  (independent): LDS 70400 B/wg -> 2 waves/SIMD (LDS-bound, ATT
+    #     confirmed), FlyDSL_kvn ~533 us.
+    #   - False (aliased):     LDS 52992 B/wg -> 3 waves/SIMD, FlyDSL_kvn ~495 us.
+    # The independent layout is a ~38us (+~8%) REGRESSION (occupancy 3->2); set
+    # to True here for direct re-measurement / A/B comparison.
+    LDS_HT_INDEPENDENT = True
+    assert (LDS_HT_INDEPENDENT or LDS_HT_ELEMS <= LDS_K_ELEMS), \
+        "aliased lds_ht must fit inside lds_k"
 
     # EXPERIMENT (vn-b128): transpose buffer for the v_new OUTPUT store. v_new is
     # [B,H,T,V] (V innermost); the MFMA-C layout makes a lane's 4 elems stride
@@ -246,13 +260,13 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_G_ELEMS = BT
     LDS_G_BYTES = LDS_G_ELEMS * 4
 
-    _K5_KERNEL_REVISION = 220  # barrier-trim: drop redundant lds_vn-WAR + lds_k-RAW barriers (B6/B4)
+    _K5_KERNEL_REVISION = 222  # B1 conditional: skip top-of-chunk barrier in ht-independent mode (redundant)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}ht{int(LDS_HT_INDEPENDENT)}_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
@@ -269,10 +283,14 @@ def compile_chunk_gated_delta_h_kv_naive(
     lds_g_offset = allocator._align(allocator.ptr, 16)
     if USE_LDS_G:
         allocator.ptr = lds_g_offset + LDS_G_BYTES  # only reserve when used
-    # h-b128: lds_ht ALIASES lds_k (no extra allocation) to keep LDS at 44KB
-    # and preserve 3 waves/SIMD. See the LDS_HT comment above for the WAR
-    # lifetime argument; a top-of-step-1 barrier enforces it.
-    lds_ht_offset = lds_k_offset
+    # h-b128: lds_ht either ALIASES lds_k (default, no extra allocation, keeps
+    # 3 waves) or gets its OWN buffer (LDS_HT_INDEPENDENT=True, HIP-style, ~17KB
+    # extra -> expected 2 waves). See the LDS_HT comment above.
+    if LDS_HT_INDEPENDENT:
+        lds_ht_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = lds_ht_offset + LDS_HT_BYTES
+    else:
+        lds_ht_offset = lds_k_offset
 
     # Cooperative load parameters
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
@@ -474,11 +492,20 @@ def compile_chunk_gated_delta_h_kv_naive(
             #   (c) coalesced store: re-map threads so each thread reads 8
             #       CONTIGUOUS K for one V from lds_ht and vec_store(8) to HBM
             #       -> buffer_store_dwordx4 (was 4 scalar buffer_store_short).
-            # lds_ht ALIASES lds_k: this WAR barrier ensures the PREVIOUS chunk's
-            # GEMM2 finished reading lds_k before the staging below overwrites it
-            # (no barrier sits between the prev-chunk GEMM2 and here otherwise).
+            # WAR barrier at top-of-chunk:
+            #   - When lds_ht ALIASES lds_k (LDS_HT_INDEPENDENT=False): ensures
+            #     the PREVIOUS chunk's GEMM2 finished reading lds_k before the
+            #     staging below overwrites those bytes via lds_ht.
+            #   - When lds_ht is INDEPENDENT (True): the alias WAR is gone. The
+            #     only remaining hazard is lds_ht's OWN cross-chunk WAR (prev
+            #     chunk's step-1c read-out vs this chunk's step-1a stage-write),
+            #     but that is already covered by the prev chunk's B3 (line ~595)
+            #     and B7 (line ~837) -- both sit between the read-out and this
+            #     write -- so B1 is REDUNDANT here and is skipped. (Verified by
+            #     time-ordering; kept guarded so the aliased mode still has it.)
             # ============================================================
-            gpu.barrier()
+            if const_expr(not LDS_HT_INDEPENDENT):
+                gpu.barrier()
             ht_v_col = wid * fx.Int32(16) + lane_n
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(N_REPEAT):
