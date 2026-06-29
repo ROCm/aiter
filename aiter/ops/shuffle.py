@@ -6,6 +6,68 @@ import torch.nn.functional as F
 from aiter.jit.utils.chip_info import get_gfx
 
 
+def _moe_tile_shuffle(
+    src: torch.Tensor, tile_minor: int, tile_major: int
+) -> torch.Tensor:
+    """Row-major ``[M, N]`` -> tiled layout, matching the POC ``moe_shuffle_one``
+    (majorInN=true): the buffer is split into ``[M/tile_minor, N/tile_major]``
+    tiles laid out tile-row-major, and within each tile the ``tile_minor`` (M/row)
+    index is outer and the ``tile_major`` (N/col) index is inner.
+
+    This is the single permutation shared by the gfx1250 mxfp8fp4 A / B / scale
+    preshuffles; only the tile sizes differ.
+    """
+    M, N = src.shape
+    assert M % tile_minor == 0, f"rows={M} must be divisible by {tile_minor}"
+    assert N % tile_major == 0, f"cols={N} must be divisible by {tile_major}"
+    out = src.view(M // tile_minor, tile_minor, N // tile_major, tile_major)
+    out = out.permute(0, 2, 1, 3).contiguous()
+    return out.view(M, N)
+
+
+def shuffle_mxfp8fp4_a(src: torch.Tensor) -> torch.Tensor:
+    """gfx1250 mxfp8fp4 GEMM activation (A) preshuffle (a_preshuffle=1).
+
+    A is mxfp8 (e4m3, 1 byte/elem), row-major ``[M, K]``. The shader expects the
+    ``(m, k) -> (m/2, k/128, 2, 128)`` tiling (POC ``moe_shuffle(A, ..., 128, 2)``:
+    tileSizeMinor=2 over rows, tileSizeMajor=128 over K).
+    """
+    x_type = src.dtype
+    s = src.view(torch.uint8)
+    out = _moe_tile_shuffle(s, tile_minor=2, tile_major=128)
+    return out.view(x_type)
+
+
+def shuffle_mxfp8fp4_b(src: torch.Tensor) -> torch.Tensor:
+    """gfx1250 mxfp8fp4 GEMM weight (B) preshuffle (always applied).
+
+    Plain 16x16 tile transpose on the packed byte buffer (POC
+    ``moe_shuffle(B, ..., LAYOUT_16X16)``: tileSizeMajor=tileSizeMinor=16). Works
+    for both mxfp8 (``[N, K]`` 1 byte/elem) and mxfp4 (``[N, K/2]`` 2 elems/byte).
+    """
+    x_type = src.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        s = src.view(torch.uint8)
+    else:
+        s = src.view(torch.uint8)
+    out = _moe_tile_shuffle(s, tile_minor=16, tile_major=16)
+    return out.view(x_type)
+
+
+def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
+    """gfx1250 mxfp8fp4 GEMM e8m0 block-scale preshuffle.
+
+    Scale buffer is row-major ``[rows, K/32]`` (e8m0, one byte per 32-K block).
+    The shader expects ``(m, k) -> (m/32, k/4, 32, 4)`` (POC
+    ``moe_shuffle_one(scale, ..., tileSizeMajor=4, tileSizeMinor=32)``). Same
+    layout for the A and B scales.
+    """
+    x_type = src.dtype
+    s = src.view(torch.uint8)
+    out = _moe_tile_shuffle(s, tile_minor=32, tile_major=4)
+    return out.view(x_type)
+
+
 def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
     """
     Preshuffle weights for gfx1250 WMMA.

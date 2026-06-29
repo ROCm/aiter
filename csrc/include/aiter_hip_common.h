@@ -11,18 +11,18 @@
 #else
 #include "ck_tile/core.hpp"
 #endif
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <utility>
-#include <fstream>
-#include <mutex>
-#include <memory>
 #include <string_view>
-#include <algorithm>
+#include <utility>
 #ifdef AITER_EMBEDDED_HSA_HEADER
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
@@ -32,7 +32,8 @@ namespace aiter_detail {
 inline thread_local bool g_aiter_can_throw = false;
 
 template <typename... Args>
-[[noreturn, gnu::noinline]] inline void aiter_check_fatal(const char* file, size_t line, Args&&... args)
+[[noreturn, gnu::noinline]] inline void
+aiter_check_fatal(const char* file, size_t line, Args&&... args)
 {
     std::cerr << "[AITER] " << file << ":" << line << " ";
     (std::cerr << ... << std::forward<Args>(args)) << std::endl;
@@ -63,29 +64,29 @@ template <typename... Args>
 }
 } // namespace aiter_detail
 
-#define AITER_CHECK(x, ...)                                            \
-    do                                                                 \
-    {                                                                  \
-        if(!(x)) [[unlikely]]                                          \
-        {                                                              \
+#define AITER_CHECK(x, ...)                                                          \
+    do                                                                               \
+    {                                                                                \
+        if(!(x)) [[unlikely]]                                                        \
+        {                                                                            \
             aiter_detail::check_fail(__FILE__, __LINE__ __VA_OPT__(, ) __VA_ARGS__); \
-        }                                                              \
+        }                                                                            \
     } while(0)
 
 // Fatal on any HIP error -- use for init/teardown/resource management where
 // failure means unrecoverable state.
-#define HIP_CALL(call)                                                            \
-    do                                                                            \
-    {                                                                             \
-        hipError_t err = call;                                                    \
-        if(err != hipSuccess) [[unlikely]]                                        \
-        {                                                                         \
-            aiter_detail::aiter_check_fatal(__FILE__,                                 \
-                                        __LINE__,                                 \
-                                        "fail to call " #call " ---> [HIP error](", \
-                                        hipGetErrorString(err),                   \
-                                        ')');                                       \
-        }                                                                         \
+#define HIP_CALL(call)                                                                  \
+    do                                                                                  \
+    {                                                                                   \
+        hipError_t err = call;                                                          \
+        if(err != hipSuccess) [[unlikely]]                                              \
+        {                                                                               \
+            aiter_detail::aiter_check_fatal(__FILE__,                                   \
+                                            __LINE__,                                   \
+                                            "fail to call " #call " ---> [HIP error](", \
+                                            hipGetErrorString(err),                     \
+                                            ')');                                       \
+        }                                                                               \
     } while(0)
 
 // Launch-specific HIP error handling.
@@ -94,25 +95,29 @@ template <typename... Args>
 //   that tuning code can catch and skip without leaving the GPU in a bad state.
 // - All other launch failures remain fatal because they may indicate runtime
 //   or hardware problems after which continuing is unsafe.
-#define HIP_CALL_LAUNCH(call)                                                     \
-    do                                                                            \
-    {                                                                             \
-        hipError_t err = call;                                                    \
-        if(err != hipSuccess) [[unlikely]]                                        \
-        {                                                                         \
-            if(err == hipErrorInvalidValue)                                        \
-            {                                                                     \
-                aiter_detail::check_fail(__FILE__, __LINE__,                       \
-                    "fail to call " #call " ---> [HIP error](",                    \
-                    hipGetErrorString(err), ')');                                   \
-            }                                                                     \
-            else                                                                  \
-            {                                                                     \
-                aiter_detail::aiter_check_fatal(__FILE__, __LINE__,               \
-                    "fail to call " #call " ---> [HIP error](",                    \
-                    hipGetErrorString(err), ')');                                   \
-            }                                                                     \
-        }                                                                         \
+#define HIP_CALL_LAUNCH(call)                                                               \
+    do                                                                                      \
+    {                                                                                       \
+        hipError_t err = call;                                                              \
+        if(err != hipSuccess) [[unlikely]]                                                  \
+        {                                                                                   \
+            if(err == hipErrorInvalidValue)                                                 \
+            {                                                                               \
+                aiter_detail::check_fail(__FILE__,                                          \
+                                         __LINE__,                                          \
+                                         "fail to call " #call " ---> [HIP error](",        \
+                                         hipGetErrorString(err),                            \
+                                         ')');                                              \
+            }                                                                               \
+            else                                                                            \
+            {                                                                               \
+                aiter_detail::aiter_check_fatal(__FILE__,                                   \
+                                                __LINE__,                                   \
+                                                "fail to call " #call " ---> [HIP error](", \
+                                                hipGetErrorString(err),                     \
+                                                ')');                                       \
+            }                                                                               \
+        }                                                                                   \
     } while(0)
 
 struct p3
@@ -158,10 +163,10 @@ namespace aiter_detail {
 // https://github.com/llvm/llvm-project/blob/b0230f59969b9e8e7e0aff44cd34718987098462/llvm/lib/Frontend/Offloading/OffloadWrapper.cpp#L226
 struct FatBinaryWrapper
 {
-    uint32_t magic        = 0x48495046; // "HIPF";
-    uint32_t version      = 1;
+    uint32_t magic     = 0x48495046; // "HIPF";
+    uint32_t version   = 1;
     const void* binary = nullptr;
-    intptr_t __pad        = 0;
+    intptr_t __pad     = 0;
 };
 
 extern "C" void* __hipRegisterFatBinary(const FatBinaryWrapper* data) noexcept;
@@ -204,20 +209,16 @@ class AiterAsmKernelFast
                                             nullptr,
                                             nullptr);
         // Verify registration succeeded. __hipRegisterFunction returns void so
-        // we probe via hipGetFuncBySymbol — if it returns null the runtime silently
+        // we probe via hipGetFuncBySymbol -- if it returns null the runtime silently
         // rejected the kernel (e.g. resource limits, arch mismatch). This runs
         // once per kernel variant at init time, not on every launch.
         hipFunction_t probe = nullptr;
         (void)hipGetFuncBySymbol(&probe, reinterpret_cast<void*>(this));
-        AITER_CHECK(probe != nullptr,
-                    "kernel registration failed for '", kernel_name, "'.");
+        AITER_CHECK(probe != nullptr, "kernel registration failed for '", kernel_name, "'.");
     }
 
     public:
-    AiterAsmKernelFast(const char* kernel_name, const void* hsaco)
-    {
-        init(kernel_name, hsaco);
-    };
+    AiterAsmKernelFast(const char* kernel_name, const void* hsaco) { init(kernel_name, hsaco); };
 
     ~AiterAsmKernelFast() { aiter_detail::__hipUnregisterFatBinary(module); }
 
@@ -235,7 +236,7 @@ class AiterAsmKernelFast
                                      HIP_LAUNCH_PARAM_END};
         hipFunction_t kernel_func = nullptr;
         // TODO Ask runtime folks to provide an API for hipLaunchKernel with extra arg
-        // Don't error check here — registration is validated once in init().
+        // Don't error check here -- registration is validated once in init().
         (void)hipGetFuncBySymbol(&kernel_func, reinterpret_cast<void*>(this));
 
         if(kargs.cluster_x > 1 || kargs.cluster_y > 1 || kargs.cluster_z > 1)
@@ -276,21 +277,20 @@ class AiterAsmKernelFast
         }
 
         HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,
-                                       kargs.gdx,
-                                       kargs.gdy,
-                                       kargs.gdz,
-                                       kargs.bdx,
-                                       kargs.bdy,
-                                       kargs.bdz,
-                                       0,
-                                       kargs.stream,
-                                       nullptr,
-                                       (void**)&config));
+                                              kargs.gdx,
+                                              kargs.gdy,
+                                              kargs.gdz,
+                                              kargs.bdx,
+                                              kargs.bdy,
+                                              kargs.bdz,
+                                              0,
+                                              kargs.stream,
+                                              nullptr,
+                                              (void**)&config));
     };
 };
 
-
-class AiterAsmKernel: private AiterAsmKernelFast
+class AiterAsmKernel : private AiterAsmKernelFast
 {
     private:
     std::unique_ptr<char[]> hsaco_data;
@@ -300,7 +300,7 @@ class AiterAsmKernel: private AiterAsmKernelFast
                                    const char* data,
                                    size_t size)
     {
-        // The AMDGPU metadata is stored as msgpack in an ELF .note section — not as
+        // The AMDGPU metadata is stored as msgpack in an ELF .note section -- not as
         // raw ASCII. We scan for the amdhsa kernel descriptor's group_segment_fixed_size
         // field in the binary kernel descriptor block instead. In the AMDHSA kernel
         // descriptor (64 bytes at the start of the .text symbol), byte offset 0 is a
@@ -313,10 +313,10 @@ class AiterAsmKernel: private AiterAsmKernelFast
         // We do a byte-level search: find "group_segment_fixed_size" as raw bytes, then
         // decode the msgpack uint that follows.
 
-        static const char key[] = "group_segment_fixed_size";
+        static const char key[]     = "group_segment_fixed_size";
         static const size_t key_len = sizeof(key) - 1;
 
-        const char* p = data;
+        const char* p   = data;
         const char* end = data + size;
 
         while(p < end)
@@ -335,23 +335,23 @@ class AiterAsmKernel: private AiterAsmKernelFast
 
             // Decode the following msgpack integer
             uint64_t declared_lds = 0;
-            uint8_t tag = static_cast<uint8_t>(*vp);
-            if(tag <= 0x7f)                        // positive fixint
+            uint8_t tag           = static_cast<uint8_t>(*vp);
+            if(tag <= 0x7f) // positive fixint
                 declared_lds = tag;
-            else if(tag == 0xcc && vp + 1 < end)  // uint8
+            else if(tag == 0xcc && vp + 1 < end) // uint8
                 declared_lds = static_cast<uint8_t>(vp[1]);
-            else if(tag == 0xcd && vp + 2 < end)  // uint16 big-endian
+            else if(tag == 0xcd && vp + 2 < end) // uint16 big-endian
                 declared_lds = (static_cast<uint64_t>(static_cast<uint8_t>(vp[1])) << 8) |
-                                static_cast<uint64_t>(static_cast<uint8_t>(vp[2]));
-            else if(tag == 0xce && vp + 4 < end)  // uint32 big-endian
+                               static_cast<uint64_t>(static_cast<uint8_t>(vp[2]));
+            else if(tag == 0xce && vp + 4 < end) // uint32 big-endian
                 declared_lds = (static_cast<uint64_t>(static_cast<uint8_t>(vp[1])) << 24) |
                                (static_cast<uint64_t>(static_cast<uint8_t>(vp[2])) << 16) |
-                               (static_cast<uint64_t>(static_cast<uint8_t>(vp[3])) <<  8) |
-                                static_cast<uint64_t>(static_cast<uint8_t>(vp[4]));
+                               (static_cast<uint64_t>(static_cast<uint8_t>(vp[3])) << 8) |
+                               static_cast<uint64_t>(static_cast<uint8_t>(vp[4]));
             else
             {
                 p = found + 1;
-                continue;  // not a uint we recognise; keep searching
+                continue; // not a uint we recognise; keep searching
             }
 
             if(declared_lds == 0)
@@ -363,14 +363,20 @@ class AiterAsmKernel: private AiterAsmKernelFast
             hipDevice_t dev;
             int max_lds = 0;
             HIP_CALL(hipGetDevice(&dev));
-            HIP_CALL(hipDeviceGetAttribute(&max_lds, hipDeviceAttributeMaxSharedMemoryPerBlock, dev));
+            HIP_CALL(
+                hipDeviceGetAttribute(&max_lds, hipDeviceAttributeMaxSharedMemoryPerBlock, dev));
 
             AITER_CHECK(static_cast<int64_t>(declared_lds) <= static_cast<int64_t>(max_lds),
-                        "kernel '", kernel_name, "' in ", path.c_str(),
-                        ": group_segment_fixed_size=", static_cast<uint32_t>(declared_lds),
-                        " exceeds device LDS limit=", max_lds,
+                        "kernel '",
+                        kernel_name,
+                        "' in ",
+                        path.c_str(),
+                        ": group_segment_fixed_size=",
+                        static_cast<uint32_t>(declared_lds),
+                        " exceeds device LDS limit=",
+                        max_lds,
                         " bytes. Rebuild the .co with a smaller LDS allocation.");
-            return;  // validated OK
+            return; // validated OK
         }
     }
 
@@ -423,7 +429,6 @@ class AiterAsmKernel: private AiterAsmKernelFast
     using AiterAsmKernelFast::launch_kernel;
 };
 
-
 } // namespace
 
 static const std::string get_gpu_arch()
@@ -456,7 +461,8 @@ static inline bool is_fp8_ocp_arch()
 {
     std::string arch = get_gpu_arch();
     for(auto a : fp8_ocp_archs)
-        if(arch == a) return true;
+        if(arch == a)
+            return true;
     return false;
 }
 
