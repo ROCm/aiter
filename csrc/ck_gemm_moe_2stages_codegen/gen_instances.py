@@ -930,9 +930,7 @@ class ck_moe_2stage_gemm_codegen:
                             Nswizzle=str(self.nswizzle).lower(),
                             Quant=self.quant_type,
                             ActOP=(
-                                ACT_TO_INT[self.activation]
-                                if kernel.stage == 1
-                                else 0
+                                ACT_TO_INT[self.activation] if kernel.stage == 1 else 0
                             ),
                             Stage=kernel.stage,
                             BlockSize=kernel.BLOCK_SIZE,
