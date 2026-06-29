@@ -1645,6 +1645,41 @@ def get_2stage_cfgs(
             stage2_has_bias=activation == ActivationType.Swiglu,
         )
 
+    if (
+        activation == ActivationType.Swiglu
+        and q_dtype_w == dtypes.fp4x2
+        and q_type == QuantType.per_1x32
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and not kernelName1
+    ):
+        logger.warning(
+            "[fused_moe] SwiGLU MXFP4 with unshuffled weights not supported "
+            "by CK2stages codegen; routing to CK-Tile (ROCM-25478)"
+        )
+        _split_k = max(int(ksplit), 2)
+        _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        return MOEMetadata(
+            functools.partial(
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
+                split_k=_split_k,
+                dtype=dtype,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            ),
+            _cktile_block_m,
+            _split_k,
+            run_1stage,
+            has_bias=True,
+            stage2_has_bias=True,
+        )
+
     if (kernelName1 and "ck2stages" in kernelName1) or (
         not kernelName1
         and (
