@@ -363,7 +363,6 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& scale,
         torch::Tensor& weight,
         double epsilon,
-        bool gemma_norm = false,
         int group_size = 0,
         bool shuffle_scale = false,
         bool gemma_norm = false
@@ -424,7 +423,6 @@ __global__ void add_rmsnorm_quant_kernel(
         torch::Tensor& scale,
         torch::Tensor& weight,
         double epsilon,
-        bool gemma_norm = false,
         int group_size = 0,
         bool shuffle_scale = false,
         bool gemma_norm = false

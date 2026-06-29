@@ -2202,7 +2202,6 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
-          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false,  \
           py::arg("gemma_norm") = false);    \
@@ -2222,7 +2221,6 @@ namespace py = pybind11;
           py::arg("scale"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
-          py::arg("gemma_norm") = false,     \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false,  \
           py::arg("gemma_norm") = false);    \
