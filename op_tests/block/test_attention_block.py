@@ -565,6 +565,209 @@ def run_phase(
     return us, err
 
 
+def _make_decode_cache(cfg, conc, ctx, kv_cache_dtype, backend):
+    """Allocate + random-fill a ctx-len paged KV cache for `conc` seqs (untimed)."""
+    nkv, hd = cfg.num_key_value_heads, cfg.head_dim
+    bs = 16
+    bps = (ctx + bs - 1) // bs
+    nb = conc * bps
+    bt = torch.arange(nb, dtype=torch.int32).view(conc, bps)
+    cl = torch.full((conc,), ctx, dtype=torch.int32)
+    if backend == "asm":
+        x = 16 // torch.empty(0, dtype=kv_cache_dtype).element_size()
+        kc = (torch.randn(nb, nkv, hd // x, bs, x) * 0.1).to(kv_cache_dtype)
+        vc = (torch.randn(nb, nkv, hd, bs) * 0.1).to(kv_cache_dtype)
+    else:
+        kc = (torch.randn(nb, bs, nkv, hd) * 0.1).to(kv_cache_dtype)
+        vc = (torch.randn(nb, bs, nkv, hd) * 0.1).to(kv_cache_dtype)
+    return kc, vc, bt, cl, bs
+
+
+def _serve_decode_step(
+    cfg,
+    w,
+    hidden_step,
+    conc,
+    ctx,
+    kc,
+    vc,
+    bt,
+    cl,
+    bs,
+    sliding_window,
+    kv_cache_dtype,
+    backend,
+):
+    """One real decode step at concurrency `conc`: project `conc` new tokens, RoPE +
+    append to the pre-filled cache, attend over `ctx`, o_proj. Timed (perf only)."""
+    hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
+    scale = hd**-0.5
+    is_fp8 = kv_cache_dtype == dtypes.fp8
+    q, k, v = _qkv_split(F.linear(hidden_step, w.qkv_w, w.qkv_b), cfg)
+    pos = torch.full((conc,), ctx - 1, dtype=torch.int32)
+    last = ctx - 1
+    sm = bt[:, last // bs].to(torch.int64) * bs + (last % bs)
+    kv_scale = None
+    if is_fp8:
+        kv_scale = (
+            (torch.maximum(k.abs().max(), v.abs().max()) / torch.finfo(dtypes.fp8).max)
+            .reshape(1)
+            .float()
+        )
+    flash = backend == "triton"
+    q, _, _, _ = fused_qk_rope_reshape_and_cache(
+        q,
+        k,
+        v,
+        kc,
+        vc,
+        sm,
+        pos,
+        w.rotary_emb.cos_cache,
+        w.rotary_emb.sin_cache,
+        kv_scale,
+        kv_scale,
+        is_neox=w.rotary_emb.is_neox_style,
+        flash_layout=flash,
+        apply_scale=is_fp8,
+        output_zeros=False,
+    )
+    if backend == "asm":
+        if sliding_window > 0:
+            max_part, part_size = 1, 128
+        else:
+            max_part, part_size = get_recommended_splits(conc, nkv), 256
+        group = nq // nkv
+        inter = (conc, nkv, max_part, group)
+        es = torch.empty(inter, dtype=torch.float32)
+        ml = torch.empty(inter, dtype=torch.float32)
+        to = torch.empty(*inter, hd, dtype=dtypes.bf16)
+        o = torch.empty(conc, nq, hd, dtype=dtypes.bf16)
+        pa_decode_gluon(
+            o,
+            q,
+            kc,
+            vc,
+            cl,
+            bt,
+            scale,
+            1,
+            max_part,
+            part_size,
+            compute_type=kv_cache_dtype if is_fp8 else dtypes.bf16,
+            query_scale=None,
+            key_scale=kv_scale,
+            value_scale=kv_scale,
+            exp_sums=es,
+            max_logits=ml,
+            temporary_output=to,
+            alibi_slopes=None,
+            sinks=w.sinks,
+            sliding_window=sliding_window,
+            ps=True,
+        )
+    else:
+        cu_q = torch.arange(conc + 1, dtype=torch.int32)
+        if is_fp8:
+            desc = kv_scale.view(1, 1).expand(conc, nkv).contiguous()
+        else:
+            desc = torch.ones((conc, nkv), dtype=torch.float32)
+        window = (sliding_window - 1, 0) if sliding_window > 0 else (-1, -1)
+        o = torch.empty(conc, nq, hd, dtype=dtypes.bf16)
+        unified_attention(
+            q,
+            kc,
+            vc,
+            o,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=1,
+            seqused_k=cl,
+            max_seqlen_k=ctx,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window,
+            block_table=bt,
+            softcap=0,
+            q_descale=None,
+            k_descale=desc,
+            v_descale=desc,
+            sinks=w.sinks,
+        )
+    return F.linear(o.view(conc, nq * hd), w.o_w, w.o_b)
+
+
+def run_sweep(cfg, backend, kv_cache_dtype, args):
+    """Serving-scenario sweep: input/output = --sweep-io (default 8192/1024).
+    prefill (batch 1, latency + correctness) and a per-step decode at each
+    concurrency over a pre-filled ctx=input+output cache (latency only)."""
+    inp, out_len = args.sweep_io
+    ctx = inp + out_len
+    win = cfg.sliding_window if args.sliding_window is None else args.sliding_window
+    parities = {"even": [win], "odd": [-1], "both": [win, -1]}[args.layer_parity]
+    print(f"sweep: input={inp} output={out_len} (decode ctx={ctx}) conc={args.conc}")
+    rows = []
+    for sw in parities:
+        tag = "swa" if sw > 0 else "causal"
+        us, err = run_phase(
+            cfg, "prefill", kv_cache_dtype, 1, inp, sw, False, backend, args
+        )
+        ok = err == 0 or (isinstance(err, float) and err < 0.02)
+        rows.append(
+            {
+                "phase": "prefill",
+                "layer": tag,
+                "conc": 1,
+                "us": round(us, 1),
+                "pass": ok,
+            }
+        )
+    w = make_weights(cfg, dtypes.bf16)
+    cache_dtype = kv_cache_dtype
+    for sw in parities:
+        tag = "swa" if sw > 0 else "causal"
+        for conc in args.conc:
+            kc, vc, bt, cl, bs = _make_decode_cache(
+                cfg, conc, ctx, cache_dtype, backend
+            )
+            hs = (torch.randn(conc, cfg.hidden_size, dtype=torch.float32) * 0.1).to(
+                dtypes.bf16
+            )
+            _, us = run_perftest(
+                _serve_decode_step,
+                cfg,
+                w,
+                hs,
+                conc,
+                ctx,
+                kc,
+                vc,
+                bt,
+                cl,
+                bs,
+                sw,
+                cache_dtype,
+                backend,
+                num_iters=args.iters,
+                num_warmup=args.warmup,
+                num_rotate_args=1,
+            )
+            rows.append(
+                {
+                    "phase": "decode",
+                    "layer": tag,
+                    "conc": conc,
+                    "us": round(us, 1),
+                    "pass": "(perf)",
+                }
+            )
+    print("\n" + pd.DataFrame(rows).to_string(index=False))
+    fail = sum(1 for r in rows if r["pass"] is False)
+    if fail:
+        print(f"\n{fail} prefill check(s) FAILED")
+        sys.exit(1)
+    print("\nSweep done (decode rows are latency-only).")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", default="small", choices=list(CONFIGS.keys()))
@@ -615,6 +818,20 @@ def main():
     p.add_argument("--atol", type=float, default=2e-2)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--warmup", type=int, default=2)
+    p.add_argument(
+        "--sweep",
+        action="store_true",
+        help="serving-scenario sweep: prefill + per-step decode over a concurrency "
+        "sweep (--conc) at input/output = --sweep-io (default 8192/1024)",
+    )
+    p.add_argument(
+        "--sweep-io",
+        type=int,
+        nargs=2,
+        default=[8192, 1024],
+        metavar=("INPUT", "OUTPUT"),
+    )
+    p.add_argument("--conc", type=int, nargs="+", default=[1, 16, 64, 128, 256, 512])
     args = p.parse_args()
 
     cfg = CONFIGS[args.model]
@@ -627,6 +844,10 @@ def main():
     if kv_cache_dtype == dtypes.fp8:
         scope = "both phases" if backend == "triton" else "decode only (prefill bf16)"
         print(f"NOTE: fp8 KV-cache, {backend} backend -> applies to {scope}.")
+
+    if args.sweep:
+        run_sweep(cfg, backend, kv_cache_dtype, args)
+        return
 
     win = cfg.sliding_window if args.sliding_window is None else args.sliding_window
     parities = {"even": [win], "odd": [-1], "both": [win, -1]}[args.layer_parity]
