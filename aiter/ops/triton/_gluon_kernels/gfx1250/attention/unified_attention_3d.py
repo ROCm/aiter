@@ -2282,8 +2282,11 @@ def _unified_attention_gluon_kernel_3d(
         cfg.SLIDING_WINDOW > 0 or cfg.USE_ALIBI_SLOPES or cfg.USE_QQ_BIAS
     )
     if need_addtional_mask:
-        seq_offset = j_hbm_start * cfg.TILE_SIZE + gl.arange(
-            0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
+        seq_offset = (
+            j_hbm_start * cfg.TILE_SIZE
+            + gl.arange(
+                0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
+            )[None, :]
         )
 
     # physical_block_idx: gl.int32 = j_hbm_start + seq_idx * block_table_stride # no-paging expt
@@ -2319,7 +2322,7 @@ def _unified_attention_gluon_kernel_3d(
 
         S = pgm.apply_softcap(S)
         if need_addtional_mask:
-            seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+            seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
             S = pgm.apply_addtional_mask_qk(
                 S, seq_offset, alibi_slope, qq_bias_row_ptrs
             )
@@ -2358,7 +2361,7 @@ def _unified_attention_gluon_kernel_3d(
     if not need_addtional_mask:
         seq_offset = (pgm.tile_end - (cfg.NUM_STAGES - 1)) * cfg.TILE_SIZE + gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT)
-        )
+        )[None, :]
 
     if KV_CACHE_DTYPE == "nvfp4":
         k = pgm.tdm_shared_load_k(wait_count=3, buffer_id=buffer_id)
@@ -2372,7 +2375,7 @@ def _unified_attention_gluon_kernel_3d(
     S = S * qk_factor
 
     S = pgm.apply_softcap(S)
-    seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+    seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
     S = gl.where(seq_mask, S, float("-inf"))
     if need_addtional_mask:
         S = pgm.apply_addtional_mask_qk(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
