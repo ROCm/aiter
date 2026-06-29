@@ -40,6 +40,7 @@ def _job_key(job: dict) -> tuple:
             job["D_INTER"],
             job["NE"],
             job["topk"],
+            job["xcd_swizzle"],
         )
     return (
         2,
@@ -50,6 +51,7 @@ def _job_key(job: dict) -> tuple:
         job["epilog"],
         job["D_INTER"],
         job["D_INTER_REAL"],
+        job["xcd_swizzle"],
     )
 
 
@@ -97,6 +99,7 @@ def parse_csv(csv_path: str):
                         "D_INTER": d_inter,
                         "NE": expert,
                         "topk": topk,
+                        "xcd_swizzle": p1["xcd_swizzle"],
                     }
                 )
 
@@ -119,6 +122,7 @@ def parse_csv(csv_path: str):
                         "D_INTER": d_inter,
                         "D_INTER_REAL": d_inter_real,
                         "topk": topk,  # unused by the kernel; for the entry signature
+                        "xcd_swizzle": p2["xcd_swizzle"],
                     }
                 )
 
@@ -156,6 +160,7 @@ def _compile_stage1(job):
         D_HIDDEN=job["D_HIDDEN"],
         D_INTER=job["D_INTER"],
         topk=job["topk"],
+        xcd_swizzle=job["xcd_swizzle"],
         stream=0,
     )
 
@@ -189,6 +194,7 @@ def _compile_stage2(job):
         flat_out_scale=_dummy() if mxfp4out else None,
         cshuffle=epilog == "nonatomic_cshuffle",
         D_INTER_REAL=job["D_INTER_REAL"],
+        xcd_swizzle=job["xcd_swizzle"],
         stream=0,
     )
 
