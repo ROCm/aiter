@@ -165,7 +165,14 @@ def create_paged_preshuffle_kv_fp4(kv_bf16, kv_block_size, num_blocks, block_tab
 
 
 def ref_mqa_logits_mixed(
-    q_packed, q_scale, kv_fp4, kv_scale, weights, context_lens, next_n=1
+    q_packed,
+    q_scale,
+    kv_fp4,
+    kv_scale,
+    weights,
+    context_lens,
+    next_n=1,
+    weight_scale=1.0,
 ):
     """Reference: Q (FP4) + KV (FP4) dequant → einsum → relu → weight → sum.
 
@@ -200,10 +207,10 @@ def ref_mqa_logits_mixed(
         kvi = kv_dq[b, :ctx]  # [ctx, D]
         for n in range(next_n):
             qi = q_dq[b, n]  # [H, D]
-            wi = weights[b * next_n + n]  # [H]
+            wi = weights[b * next_n + n].float()  # [H]
             qk = qi @ kvi.T  # [H, ctx]
             qk = torch.relu(qk) * wi[:, None]
-            logits_i = qk.sum(dim=0)  # [ctx]
+            logits_i = qk.sum(dim=0) * weight_scale  # [ctx]
             valid_max = ctx - next_n + n
             if valid_max + 1 < ctx:
                 logits_i[valid_max + 1 :] = float("-inf")
@@ -308,7 +315,8 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     kv_bf16 = torch.randn(batch_size, t_max, head_dim, dtype=torch.bfloat16, device=dev)
     weights = (
         torch.randn(batch_size * next_n, heads, dtype=torch.float32, device=dev) * 0.1
-    )
+    ).to(torch.bfloat16)
+    weight_scale = 1.5
 
     q_packed, q_e8m0 = fp4_quant_e2m1_with_e8m0(
         q_bf16.reshape(batch_size * next_n * heads, head_dim), block_size=SCALE_BLOCK
@@ -332,6 +340,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
         weights,
         context_lens,
         next_n=next_n,
+        weight_scale=weight_scale,
     )
 
     # ── Pre-shuffle Q scales for kernel layout (avoids runtime v_bfe_u32) ──
@@ -372,6 +381,7 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
             weights,
             context_lens,
             t_max,
+            weight_scale=weight_scale,
             next_n=next_n,
             block_k=block_k,
             kv_block_size=kv_block_size,

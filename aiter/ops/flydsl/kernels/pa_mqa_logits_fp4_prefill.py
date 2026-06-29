@@ -206,6 +206,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
         weights_ptr: fx.Tensor,
         cta_info_ptr: fx.Tensor,  # [n_ctas, 6] i32
         stride_out_row: Int32,
+        weight_scale: fx.Float32,
     ):
         tid = gpu.thread_idx.x
         pid = gpu.block_idx.x
@@ -287,13 +288,14 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 [qs_dws[mi // 4] >> fx.Int32(8 * (mi % 4)) for mi in range(m_tiles)]
             )
 
-        # Weights (hoisted): [total_tokens, H], addressed by row_id.
+        # Weights (hoisted): [total_tokens, H] bf16, addressed by row_id.
+        # Loaded as bf16 then widened to f32 for the per-head weighting below.
         W_buf = fx.rocdl.make_buffer_tensor(weights_ptr)
         w_row = fx.slice(W_buf, (row_id, None))
         w_tiled_mi = fx.logical_divide(w_row, fx.make_layout(MFMA_M, 1))
-        w_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
+        w_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), 16)
         w_reg_ty = fx.MemRefType.get(
-            T.f32, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
+            T.bf16, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
         )
         w_reg_lay = fx.make_layout(4, 1)
         w_per_lane = []
@@ -302,7 +304,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             tile_div = fx.logical_divide(tile, fx.make_layout(4, 1))
             r = fx.memref_alloca(w_reg_ty, w_reg_lay)
             fx.copy_atom_call(w_atom, fx.slice(tile_div, (None, lane_div_16)), r)
-            w_per_lane.append(fx.memref_load_vec(r))
+            w_per_lane.append(fx.memref_load_vec(r).to(fx.Float32))
 
         # ── prologue + N-1 prefetch loop + epilogue ──
 
@@ -424,6 +426,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
             thread_sum = _bperm_xor_add(thread_sum, 16)
             thread_sum = _bperm_xor_add(thread_sum, 32)
+            thread_sum = arith.ArithValue(thread_sum) * weight_scale
 
             # Only [local_start, local_end) is written (one writer lane per
             # token); the rest stays at the caller's -inf pre-fill.
@@ -587,6 +590,7 @@ def compile_pa_mqa_logits_fp4_prefill(
         w,
         cta_info_,
         stride_out: fx.Int32,
+        weight_scale: fx.Float32,
         gx: fx.Int32,
         stream: fx.Stream,
     ):
@@ -596,7 +600,7 @@ def compile_pa_mqa_logits_fp4_prefill(
         with _ir.InsertionPoint(cctx.gpu_module_body):
             alloc.finalize()
         gxi = arith.index_cast(T.index, gx.ir_value())
-        kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out).launch(
+        kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
         )
 
@@ -615,6 +619,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     local_ends: torch.Tensor,
     max_seq_len: int,
     *,
+    weight_scale: float = 1.0,
     block_k: int = 256,
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
@@ -675,6 +680,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         weights,
         cta_info,
         out.stride(0),
+        float(weight_scale),
         n_ctas,
         stream,
     )
