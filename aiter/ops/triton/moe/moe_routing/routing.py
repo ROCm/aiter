@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 from dataclasses import dataclass, field
@@ -7,6 +8,19 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
 )
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+
+# HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the flat-topk
+# path uses fused min-unique routing (top-(k+1) -> drop least-batch-popular -> keep-k)
+# for batch sizes in [MIN_M (default 16), MAX_M (default 128)]. Unset, or outside that
+# window (tiny M where the expert union can't shrink, or prefill), falls through to stock.
+_USE_HERD = os.environ.get("AITER_TRITON_USE_HERD", "") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+_HERD_MIN_M = int(os.environ.get("AITER_TRITON_HERD_MIN_M", "16"))
+_HERD_MAX_M = int(os.environ.get("AITER_TRITON_HERD_MAX_M", "128"))
 
 
 @dataclass
@@ -294,6 +308,12 @@ def routing(
     # flat top-k path: plain top-k + softmax (score_mode is None)
     # ------------------------------------------------------------------
     if score_mode is None:
+        # HERD: env-gated fused min-unique routing (decode-sized batches only;
+        # prefill / large M falls through to the stock top-k path below).
+        if _USE_HERD and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M:
+            from .minunique import routing_minunique
+
+            return routing_minunique(logits, n_expts_act, sm_first=sm_first)
         from .topk import topk
 
         HIST_BLOCK_M = 32
