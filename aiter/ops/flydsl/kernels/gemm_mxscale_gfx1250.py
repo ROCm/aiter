@@ -2081,7 +2081,7 @@ def compile_mxscale_gemm(
                 if const_expr(_effective_l2_pf <= 0):
                     return
                 pf_k = k_base + arith.index(_effective_l2_pf * tile_k)
-                pf_k_packed_a = pf_k / arith.index(PACK_FACTOR_A)
+                # A L2 prefetch disabled (only B is prefetched); pf_k_packed_a omitted.
                 pf_k_packed_b = pf_k / arith.index(PACK_FACTOR_B)
                 # A L2 prefetch disabled (only B is prefetched).
                 # tdm_ops.l2_prefetch_tile(
