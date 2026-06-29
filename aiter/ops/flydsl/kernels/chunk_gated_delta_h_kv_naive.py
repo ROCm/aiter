@@ -177,6 +177,32 @@ def compile_chunk_gated_delta_h_kv_naive(
     # per-chunk synchronous vmcnt drain (the binding wait once w is prefetched).
     K_PF_INTERLEAVE = True
 
+    # EXPERIMENT toggle (HIP-align, store-overlap rev227): move the next-chunk
+    # w/k vec_loads from the GEMM2 interleave INTO the GEMM1 MFMA loop, so GEMM2
+    # is freed of load traffic and can hide the h-snapshot store instead (see
+    # HT_STORE_OVERLAP_GEMM2). Mirrors HIP, which loads next-chunk w/k during
+    # run_gemm1 and lets run_gemm2 hide the h store. Requires W_PF_INTERLEAVE.
+    # The loaded w_next/k_next live in registers GEMM1->yield (longer than the
+    # GEMM2 path), +~32 VGPR, fine at 2 waves (budget 256). False = rev226
+    # (loads stay in GEMM2).
+    W_PF_INTERLEAVE_GEMM1 = True
+
+    # EXPERIMENT toggle (HIP-align, store-overlap rev227): DECOUPLE the
+    # h-snapshot store. Keep only the stage (h_accs -> lds_ht, bf16) at the top
+    # of the chunk; move the b128 readout + HBM store to BETWEEN the step-7
+    # barrier and GEMM2 so GEMM2's MFMA chain hides the HBM store latency
+    # (mirrors HIP coalesced_vk_store_from_transpose placed before run_gemm2).
+    # The staged lds_ht copy is pre-gating and independent of h_accs, so GEMM2's
+    # in-place h_accs update does not corrupt the snapshot.
+    # Requires LDS_HT_INDEPENDENT (lds_ht must survive step1->preGEMM2 unaliased)
+    # and is only beneficial with W_PF_INTERLEAVE_GEMM1 (else GEMM2 still busy
+    # with loads). Barrier restructure: DROP B2 (stage->readout RAW now covered
+    # by the step2 w/u/g barrier + step5 vn barrier + step7 barrier), and ENABLE
+    # a top-of-chunk WAR barrier so the NEXT chunk's stage-write does not clobber
+    # lds_ht before this chunk's (now late) readout finishes. False = rev226
+    # (readout at top of chunk).
+    HT_STORE_OVERLAP_GEMM2 = True
+
     # -- LDS layout (no lds_h: KV h-store goes reg -> HBM directly) --
     # lds_w / lds_k row pads break LDS bank conflicts. K (=128 bf16 = 256 B) is
     # a multiple of the 32-bank LDS period (128 B), so a plain row stride makes
@@ -237,6 +263,10 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_HT_INDEPENDENT = True
     assert (LDS_HT_INDEPENDENT or LDS_HT_ELEMS <= LDS_K_ELEMS), \
         "aliased lds_ht must fit inside lds_k"
+    assert (not W_PF_INTERLEAVE_GEMM1 or W_PF_INTERLEAVE), \
+        "W_PF_INTERLEAVE_GEMM1 requires W_PF_INTERLEAVE"
+    assert (not HT_STORE_OVERLAP_GEMM2 or LDS_HT_INDEPENDENT), \
+        "HT_STORE_OVERLAP_GEMM2 requires LDS_HT_INDEPENDENT (lds_ht must survive step1->preGEMM2 unaliased)"
 
     # EXPERIMENT (vn-b128): transpose buffer for the v_new OUTPUT store. v_new is
     # [B,H,T,V] (V innermost); the MFMA-C layout makes a lane's 4 elems stride
@@ -276,13 +306,13 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_G_ELEMS = BT
     LDS_G_BYTES = LDS_G_ELEMS * 4
 
-    _K5_KERNEL_REVISION = 226  # w+k prefetch + lds_ht INDEPENDENT (decouple h-snapshot from lds_k, drop B1)
+    _K5_KERNEL_REVISION = 227  # HIP-align: w/k load -> GEMM1, h-snapshot store decoupled -> before GEMM2 (overlap)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}ht{int(LDS_HT_INDEPENDENT)}wpf{int(W_PF_INTERLEAVE)}kpf{int(K_PF_INTERLEAVE)}_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}ht{int(LDS_HT_INDEPENDENT)}wpf{int(W_PF_INTERLEAVE)}kpf{int(K_PF_INTERLEAVE)}wg1{int(W_PF_INTERLEAVE_GEMM1)}hov{int(HT_STORE_OVERLAP_GEMM2)}_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
@@ -596,7 +626,16 @@ def compile_chunk_gated_delta_h_kv_naive(
             #     write -- so B1 is REDUNDANT here and is skipped. (Verified by
             #     time-ordering; kept guarded so the aliased mode still has it.)
             # ============================================================
-            if const_expr(not LDS_HT_INDEPENDENT):
+            # B1 (top-of-chunk WAR):
+            #  - aliased lds_ht (LDS_HT_INDEPENDENT=False): guards the prev
+            #    chunk's GEMM2 lds_k reads vs this stage-write (lds_ht aliases
+            #    lds_k).
+            #  - HT_STORE_OVERLAP_GEMM2: the readout is deferred to before GEMM2,
+            #    so this barrier guards the prev chunk's (now late) readout-read
+            #    of lds_ht vs this chunk's stage-write (lds_ht's own cross-chunk
+            #    WAR; rev226 covered it with intervening barriers, but deferring
+            #    the readout removes that coverage).
+            if const_expr(not LDS_HT_INDEPENDENT or HT_STORE_OVERLAP_GEMM2):
                 gpu.barrier()
             ht_v_col = wid * fx.Int32(16) + lane_n
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -611,22 +650,25 @@ def compile_chunk_gated_delta_h_kv_naive(
                     ht_idx = ht_v_col * fx.Int32(LDS_HT_STRIDE) + k_tile_base
                     lds_ht.vec_store((fx.Index(ht_idx),), ht_vec, 4)
 
-            gpu.barrier()
-
-            # Coalesced b128 read-out: V*K = BV*K elems; each thread does 8
-            # contiguous K (one b128). Groups = BV*(K/8); iters = groups/BLOCK.
-            HT_K8 = K // 8
-            HT_GROUPS = BV * HT_K8
-            HT_ITERS = HT_GROUPS // BLOCK_THREADS
-            for it in range_constexpr(HT_ITERS):
-                grp = fx.Int32(it * BLOCK_THREADS) + tid
-                v_loc = grp // fx.Int32(HT_K8)
-                k8 = (grp % fx.Int32(HT_K8)) * fx.Int32(8)
-                ht_read_idx = v_loc * fx.Int32(LDS_HT_STRIDE) + k8
-                tile8 = lds_ht.vec_load((fx.Index(ht_read_idx),), 8)
-                v_global = i_v * fx.Int32(BV) + v_loc
-                h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k8
-                h_.vec_store((fx.Index(h_off),), tile8, 8)
+            if const_expr(not HT_STORE_OVERLAP_GEMM2):
+                # rev226: B2 + coalesced b128 read-out at the TOP of the chunk.
+                # V*K = BV*K elems; each thread reads 8 contiguous K (one b128).
+                # Groups = BV*(K/8); iters = groups/BLOCK.
+                gpu.barrier()
+                HT_K8 = K // 8
+                HT_GROUPS = BV * HT_K8
+                HT_ITERS = HT_GROUPS // BLOCK_THREADS
+                for it in range_constexpr(HT_ITERS):
+                    grp = fx.Int32(it * BLOCK_THREADS) + tid
+                    v_loc = grp // fx.Int32(HT_K8)
+                    k8 = (grp % fx.Int32(HT_K8)) * fx.Int32(8)
+                    ht_read_idx = v_loc * fx.Int32(LDS_HT_STRIDE) + k8
+                    tile8 = lds_ht.vec_load((fx.Index(ht_read_idx),), 8)
+                    v_global = i_v * fx.Int32(BV) + v_loc
+                    h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k8
+                    h_.vec_store((fx.Index(h_off),), tile8, 8)
+            # else (HT_STORE_OVERLAP_GEMM2): readout+store deferred to before
+            # GEMM2 (step 8) so GEMM2's MFMA hides the HBM store latency.
 
             # NOTE: no barrier here. readout reads lds_ht(=lds_k); step 2 writes
             # the independent lds_w/lds_u (no conflict), and step 3's lds_k
@@ -742,9 +784,44 @@ def compile_chunk_gated_delta_h_kv_naive(
             for _i in range_constexpr(N_REPEAT):
                 bv_accs.append(fx.full(4, 0.0, fx.Float32))
 
+            # W_PF_INTERLEAVE_GEMM1: issue NEXT chunk's w/k vec_loads INTERLEAVED
+            # into the GEMM1 (m_bt,kb,slot) iterations -- one load on each of the
+            # first NUM_W_LOADS+K_LOAD_BATCHES flat slots -- so each
+            # buffer_load_dwordx4's HBM latency hides behind GEMM1's MFMA chain
+            # AND GEMM2 is left free to hide the deferred h-snapshot store. The
+            # loaded values are carried in registers to the yield (mirrors HIP's
+            # next-chunk load in run_gemm1).
+            if const_expr(W_PF_INTERLEAVE and W_PF_INTERLEAVE_GEMM1):
+                next_i_t_i32 = i_t_i32 + fx.Int32(1)
+                w_next_pf = [None] * NUM_W_LOADS
+                if const_expr(K_PF_INTERLEAVE):
+                    k_next_pf = [None] * K_LOAD_BATCHES
+
             for m_bt in range_constexpr(BT_MTILES):
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for slot in range_constexpr(K_SUB_PER_BLOCK):
+                        if const_expr(W_PF_INTERLEAVE and W_PF_INTERLEAVE_GEMM1):
+                            g1_slot = (
+                                (m_bt * NUM_K_BLOCKS + kb) * K_SUB_PER_BLOCK + slot
+                            )
+                            # slots [0, NUM_W_LOADS) carry w; the next
+                            # K_LOAD_BATCHES slots carry k.
+                            if const_expr(g1_slot < NUM_W_LOADS):
+                                kb_w = g1_slot // NUM_LOAD_BATCHES_64
+                                batch_w = g1_slot % NUM_LOAD_BATCHES_64
+                                w_next_pf[g1_slot] = w_.vec_load(
+                                    (fx.Index(_w_load_off(next_i_t_i32, kb_w, batch_w)),),
+                                    LOAD_VEC_WIDTH,
+                                )
+                            elif const_expr(
+                                K_PF_INTERLEAVE
+                                and g1_slot < NUM_W_LOADS + K_LOAD_BATCHES
+                            ):
+                                batch_k = g1_slot - NUM_W_LOADS
+                                k_next_pf[batch_k] = k_.vec_load(
+                                    (fx.Index(_k_load_off(next_i_t_i32, batch_k)),),
+                                    LOAD_VEC_WIDTH,
+                                )
                         w_lds_row_idx = fx.Index(m_bt * 16) + lane_n_idx
                         w_lds_col_idx = fx.Index(
                             kb * 64 + slot * 16
@@ -945,6 +1022,28 @@ def compile_chunk_gated_delta_h_kv_naive(
             # ============================================================
             gpu.barrier()
 
+            # HT_STORE_OVERLAP_GEMM2: deferred h-snapshot readout + HBM store,
+            # issued HERE (after step-7 barrier, before GEMM2) so GEMM2's MFMA
+            # chain below hides the buffer_store latency. lds_ht still holds this
+            # chunk's PRE-gating snapshot (staged at step 1, independent buffer,
+            # untouched since -- gating only mutated the h_accs REGISTERS). The
+            # buffer_store is fire-and-forget; with loads moved to GEMM1, GEMM2
+            # has no vmcnt wait to drain it early. Mirrors HIP's
+            # coalesced_vk_store_from_transpose placed before run_gemm2.
+            if const_expr(HT_STORE_OVERLAP_GEMM2):
+                HT_K8 = K // 8
+                HT_GROUPS = BV * HT_K8
+                HT_ITERS = HT_GROUPS // BLOCK_THREADS
+                for it in range_constexpr(HT_ITERS):
+                    grp = fx.Int32(it * BLOCK_THREADS) + tid
+                    v_loc = grp // fx.Int32(HT_K8)
+                    k8 = (grp % fx.Int32(HT_K8)) * fx.Int32(8)
+                    ht_read_idx = v_loc * fx.Int32(LDS_HT_STRIDE) + k8
+                    tile8 = lds_ht.vec_load((fx.Index(ht_read_idx),), 8)
+                    v_global = i_v * fx.Int32(BV) + v_loc
+                    h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k8
+                    h_.vec_store((fx.Index(h_off),), tile8, 8)
+
             # ============================================================
             # 8. GEMM2: h[K,V] += k[K,BT] @ v_new_gated[BT,V]. VWARP.
             # EXPERIMENT (vn-direct): mirror GEMM1 -- A=k standard read from
@@ -957,7 +1056,9 @@ def compile_chunk_gated_delta_h_kv_naive(
             # GEMM2 outer (kb,slot) iterations -- one load on each of the first
             # NUM_W_LOADS slots -- so each buffer_load_dwordx4's HBM latency is
             # hidden behind the following MFMA chain (mirrors baseline OPT-W).
-            if const_expr(W_PF_INTERLEAVE):
+            # When W_PF_INTERLEAVE_GEMM1, the loads were already issued in GEMM1
+            # (above) so this GEMM2 interleave is skipped.
+            if const_expr(W_PF_INTERLEAVE and not W_PF_INTERLEAVE_GEMM1):
                 next_i_t_i32 = i_t_i32 + fx.Int32(1)
                 w_next_pf = [None] * NUM_W_LOADS
                 if const_expr(K_PF_INTERLEAVE):
@@ -965,7 +1066,7 @@ def compile_chunk_gated_delta_h_kv_naive(
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(N_REPEAT):
                     acc_idx = kb * N_REPEAT + slot
-                    if const_expr(W_PF_INTERLEAVE):
+                    if const_expr(W_PF_INTERLEAVE and not W_PF_INTERLEAVE_GEMM1):
                         g2_slot = kb * N_REPEAT + slot
                         # slots [0, NUM_W_LOADS) carry the w prefetch loads;
                         # slots [NUM_W_LOADS, NUM_W_LOADS+K_LOAD_BATCHES) carry k.
