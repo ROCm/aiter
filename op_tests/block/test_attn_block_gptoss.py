@@ -336,25 +336,17 @@ def kernel_block_decode(
 # Torch reference                                                             #
 # --------------------------------------------------------------------------- #
 def _ref_one_seq(q, k, v, sinks, scale, sliding_window, q_offset):
-    """Reference attention for one sequence.
-
-    q: [sq, nq, hd], k/v: [sk, nkv, hd]  (already RoPE'd).
-    Bottom-right causal: query row i (0-based in q) is at absolute position
-    q_offset + i; it attends key j iff j <= q_offset + i, and (when a window is
-    set) j > q_offset + i - window.
-    """
+    """Reference attention for one sequence. q:[sq,nq,hd], k/v:[sk,nkv,hd] (RoPE'd).
+    Bottom-right causal: query row i is at abs pos q_offset+i, attends key j iff
+    j <= q_offset+i (and j > q_offset+i-window when a window is set)."""
     sq, nq, hd = q.shape
     sk, nkv, _ = k.shape
     group = nq // nkv
-    qf = q.float()
-    kf = k.float()
-    vf = v.float()
-    # expand kv heads for GQA
-    kf = kf.repeat_interleave(group, dim=1)  # [sk, nq, hd]
+    qf, kf, vf = q.float(), k.float(), v.float()
+    kf = kf.repeat_interleave(group, dim=1)  # GQA expand -> [sk, nq, hd]
     vf = vf.repeat_interleave(group, dim=1)
 
-    # scores: [nq, sq, sk]
-    scores = torch.einsum("qhd,khd->hqk", qf, kf) * scale
+    scores = torch.einsum("qhd,khd->hqk", qf, kf) * scale  # [nq, sq, sk]
     qi = torch.arange(sq, device=q.device).view(sq, 1) + q_offset
     kj = torch.arange(sk, device=q.device).view(1, sk)
     mask = kj <= qi
@@ -372,65 +364,54 @@ def _ref_one_seq(q, k, v, sinks, scale, sliding_window, q_offset):
     return out
 
 
-def ref_block_prefill(cfg, w, hidden, cu_seqlens, positions, sliding_window):
+def _fp8_round_trip(t, s):
+    """e4m3 round-trip: stored = clamp(t/s) cast to fp8, recovered = *s. Clamp
+    matches the kernel's saturating store (torch .to(e4m3fn) NaNs on overflow)."""
+    fp8_max = torch.finfo(dtypes.fp8).max
+    return ((t.float() / s).clamp(-fp8_max, fp8_max).to(dtypes.fp8).float() * s).to(
+        t.dtype
+    )
+
+
+def ref_block(
+    cfg,
+    w,
+    hidden,
+    cu_seqlens,
+    positions,
+    sliding_window,
+    kv_cache_dtype=None,
+    decode=False,
+):
+    """Torch reference for the whole GPT-OSS attention block (prefill + decode).
+
+    Per sequence (delimited by cu_seqlens): bottom-right causal + optional
+    sliding window + sinks over GQA-expanded K/V. decode=True keeps only the last
+    query per sequence (paged decode); kv_cache_dtype=fp8 round-trips K/V to
+    mirror the fp8 cache (shared scale from PRE-RoPE max of K and V).
+    """
     hd, nq = cfg.head_dim, cfg.num_attention_heads
     scale = hd**-0.5
-    qkv = F.linear(hidden, w.qkv_w, w.qkv_b)
-    q, k, v = _qkv_split(qkv, cfg)
-    q, k = w.rotary_emb.forward_native(positions.long(), q, k)
-    outs = []
-    cu = cu_seqlens.tolist()
-    for b in range(len(cu) - 1):
-        s, e = cu[b], cu[b + 1]
-        outs.append(
-            _ref_one_seq(q[s:e], k[s:e], v[s:e], w.sinks, scale, sliding_window, 0)
-        )
-    o = torch.cat(outs, dim=0).to(hidden.dtype).view(-1, nq * hd)
-    return F.linear(o, w.o_w, w.o_b)
-
-
-def _fp8_round_trip(t, s):
-    """e4m3 round-trip with a given scale: stored = t/s (fp8), recovered = *s.
-
-    Clamp to +/-fp8_max before the cast to mirror the kernel's saturating store
-    (torch's .to(e4m3fn) yields NaN on overflow, the kernel saturates instead).
-    """
-    fp8_max = torch.finfo(dtypes.fp8).max
-    scaled = (t.float() / s).clamp(-fp8_max, fp8_max)
-    return (scaled.to(dtypes.fp8).float() * s).to(t.dtype)
-
-
-def ref_block_decode(
-    cfg, w, hidden_ctx, ctx_len, batch, sliding_window, kv_cache_dtype=None
-):
-    hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
-    scale = hd**-0.5
-    qkv = F.linear(hidden_ctx, w.qkv_w, w.qkv_b)
-    q, k, v = _qkv_split(qkv, cfg)
-    # Kernel derives the shared K/V scale from PRE-RoPE k and v (max of both).
+    q, k, v = _qkv_split(F.linear(hidden, w.qkv_w, w.qkv_b), cfg)
     kv_scale = None
     if kv_cache_dtype == dtypes.fp8:
         kv_scale = (
             max(k.abs().max(), v.abs().max()).float() / torch.finfo(dtypes.fp8).max
         )
-    positions = torch.arange(ctx_len, dtype=torch.int64).repeat(batch)
-    q, k = w.rotary_emb.forward_native(positions, q, k)
+    q, k = w.rotary_emb.forward_native(positions.long(), q, k)
     if kv_cache_dtype == dtypes.fp8:
         # Stored as e4m3: post-RoPE K and raw V, both with the pre-RoPE scale.
-        k = _fp8_round_trip(k, kv_scale)
-        v = _fp8_round_trip(v, kv_scale)
-    q = q.view(batch, ctx_len, nq, hd)
-    k = k.view(batch, ctx_len, nkv, hd)
-    v = v.view(batch, ctx_len, nkv, hd)
+        k, v = _fp8_round_trip(k, kv_scale), _fp8_round_trip(v, kv_scale)
     outs = []
-    for b in range(batch):
-        q_last = q[b, -1:].contiguous()  # [1, nq, hd]
+    cu = cu_seqlens.tolist()
+    for b in range(len(cu) - 1):
+        s, e = cu[b], cu[b + 1]
+        qs = q[e - 1 : e] if decode else q[s:e]
+        q_off = (e - s - 1) if decode else 0
         outs.append(
-            _ref_one_seq(
-                q_last, k[b], v[b], w.sinks, scale, sliding_window, ctx_len - 1
-            )
+            _ref_one_seq(qs, k[s:e], v[s:e], w.sinks, scale, sliding_window, q_off)
         )
-    o = torch.cat(outs, dim=0).to(hidden_ctx.dtype).view(batch, nq * hd)
+    o = torch.cat(outs, dim=0).to(hidden.dtype).view(-1, nq * hd)
     return F.linear(o, w.o_w, w.o_b)
 
 
@@ -460,7 +441,7 @@ def run_prefill(cfg, batch, seqlen, sliding_window, args):
         num_iters=args.iters,
         num_warmup=args.warmup,
     )
-    ref = ref_block_prefill(cfg, w, hidden, cu, positions, sliding_window)
+    ref = ref_block(cfg, w, hidden, cu, positions, sliding_window)
     err = checkAllclose(
         ref,
         out,
@@ -490,8 +471,10 @@ def run_decode(cfg, kv_cache_dtype, batch, ctx_len, sliding_window, args):
         num_iters=args.iters,
         num_warmup=args.warmup,
     )
-    ref = ref_block_decode(
-        cfg, w, hidden, ctx_len, batch, sliding_window, kv_cache_dtype
+    cu = torch.arange(0, (batch + 1) * ctx_len, ctx_len, dtype=torch.int32)
+    positions = torch.arange(ctx_len, dtype=torch.int32).repeat(batch)
+    ref = ref_block(
+        cfg, w, hidden, cu, positions, sliding_window, kv_cache_dtype, decode=True
     )
     # fp8 e4m3 KV adds quantization noise; relax tolerance for that path.
     rtol = args.rtol if kv_cache_dtype == dtypes.bf16 else max(args.rtol, 6e-2)
