@@ -16,10 +16,10 @@ grouped GEMM launcher directly. The grouped path is opted-in via the
 
 Pytest covers a small correctness case for each format. Direct execution
 (``python op_tests/test_flydsl_grouped_gemm_gfx1250.py``) runs a
-DeepSeek-style perf bench (``--scenario bench``) or a tiny correctness
-check (``--scenario verify``).
-DeepSeek-style perf bench (``--scenario bench``) or a tiny correctness
-check (``--scenario verify``).
+DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
+per-kernel bench that times gemm1 and gemm2 in isolation
+(``--scenario kernel-bench``), or a tiny correctness check
+(``--scenario verify``).
 """
 
 from __future__ import annotations
@@ -278,11 +278,12 @@ def _run_grouped_via_fused_moe(
     swiglu_limit: float = 7.0,
     use_bias: bool = True,
     bench: bool = False,
+    kernel_bench: bool = False,
     seed: int = 0,
     warmup: int = 5,
     iters: int = 101,
     zero_init: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[float]]:
+) -> tuple[torch.Tensor, torch.Tensor, Optional[float], Optional[dict]]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
     ``layout`` selects the stage1 weight physical layout:
@@ -295,7 +296,9 @@ def _run_grouped_via_fused_moe(
     path that is validated and timed: when set, the output comes from
     ``run_perftest`` in CUDA-graph mode (production path) and ``us`` is the graph
     timing; otherwise the output is a single eager (graph-off) call and ``us`` is
-    None. Returns ``(out, ref, us_or_None)``.
+    None. ``kernel_bench`` instead times the gemm1/gemm2 kernels in isolation
+    (looping each launch alone) and returns their per-kernel us in ``kernel_us``.
+    Returns ``(out, ref, us_or_None, kernel_us_or_None)``.
     """
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
@@ -393,7 +396,31 @@ def _run_grouped_via_fused_moe(
         )
 
     torch.cuda.synchronize()
-    if bench:
+    kernel_us = None
+    if kernel_bench:
+        # Kernel-bench: time gemm1 and gemm2 in isolation. One eager call
+        # populates the per-stage launch callables (and yields a correct ``out`` to
+        # verify); then loop each kernel alone. ``us`` (end-to-end) stays None.
+        from aiter.test_common import run_perftest
+        from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
+
+        sink: list = []
+        _grouped.kernel_bench_callable = sink
+        try:
+            out = _call()
+        finally:
+            _grouped.kernel_bench_callable = None
+        us = None
+        kernel_us = {}
+        for _name, callable in sink:
+            _, _us = run_perftest(
+                callable,
+                num_warmup=warmup,
+                num_iters=iters,
+                testGraph=False,
+            )
+            kernel_us[_name] = _us
+    elif bench:
         # Bench: validate + time the CUDA-graph (production) path. The returned
         # data is the graph-captured output.
         from aiter.test_common import run_perftest
@@ -422,7 +449,7 @@ def _run_grouped_via_fused_moe(
         activation=activation,
         swiglu_limit=swiglu_limit,
     ).to(out.dtype)
-    return out, ref, us
+    return out, ref, us, kernel_us
 
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -464,6 +491,7 @@ def run_moe(
     tol: float = VERIFY_TOL_A4W4,
     raise_on_fail: bool = True,
     bench: bool = False,
+    kernel_bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
     zero_init: bool = False,
@@ -484,7 +512,7 @@ def run_moe(
     # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
     run_only = run_only_env() if check_aot_cache else nullcontext()
     with run_only:
-        out, ref, us = _run_grouped_via_fused_moe(
+        out, ref, us, kernel_us = _run_grouped_via_fused_moe(
             experts=experts,
             tokens=tokens,
             topk=topk,
@@ -496,11 +524,12 @@ def run_moe(
             swiglu_limit=swiglu_limit,
             use_bias=use_bias,
             bench=bench,
+            kernel_bench=kernel_bench,
             warmup=warmup,
             iters=iters,
             zero_init=zero_init,
         )
-    mode = "graph" if bench else "eager"
+    mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
     ld = _logits_diff(out, ref)
     rel = _rel_l2(out, ref)
     print(
@@ -528,6 +557,26 @@ def run_moe(
             flush=True,
         )
         metrics["us"] = us
+    # --- perf (kernel-bench only): per-kernel gemm1/gemm2 timing (looped alone) ---
+    if kernel_bench:
+        kernel_us = kernel_us or {}
+        g1 = kernel_us.get("gemm1")
+        g2 = kernel_us.get("gemm2")
+        if g1 is None and g2 is None:
+            print(
+                f"[kernel-bench {tag}] no grouped kernels captured "
+                "(grouped path not taken?)",
+                flush=True,
+            )
+        else:
+            g1s = "n/a" if g1 is None else f"{g1:.2f}"
+            g2s = "n/a" if g2 is None else f"{g2:.2f}"
+            print(
+                f"[kernel-bench {tag}] gemm1 us = {g1s} gemm2 us = {g2s}",
+                flush=True,
+            )
+        metrics["gemm1_us"] = g1
+        metrics["gemm2_us"] = g2
     return metrics
 
 
@@ -637,7 +686,14 @@ def main() -> None:
         print("skipping: requires gfx1250")
         sys.exit(0)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=("bench", "verify"), default="bench")
+    parser.add_argument(
+        "--scenario",
+        choices=("bench", "verify", "kernel-bench"),
+        default="bench",
+        help="bench: time fused_moe end-to-end (CUDA graph). verify: eager "
+        "correctness only. kernel-bench: time the gemm1 and gemm2 kernels in "
+        "isolation (loop each launch alone).",
+    )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument(
         "--layout",
@@ -748,6 +804,7 @@ def main() -> None:
             check_aot_cache=not args.no_check_aot_cache,
             raise_on_fail=False,
             bench=args.scenario == "bench",
+            kernel_bench=args.scenario == "kernel-bench",
             warmup=args.warmup,
             iters=args.iters,
             zero_init=args.zero_init,
@@ -766,6 +823,8 @@ def main() -> None:
                 "rel_l2": metrics["rel_l2"],
                 "pass": metrics["passed"],
                 "us": metrics.get("us"),
+                "gemm1_us": metrics.get("gemm1_us"),
+                "gemm2_us": metrics.get("gemm2_us"),
             }
         )
 

@@ -26,6 +26,9 @@ _WARNED_NAIVE_EPILOGUE = False
 # weight is materialized at most once (not re-copied on every fused_moe call).
 _GROUPED_WEIGHT_CACHE = {}
 
+# Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable) per-kernel launches; None in production.
+kernel_bench_callable = None
+
 
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     """Contiguous uint8 view of a static MoE weight, cached by data_ptr."""
@@ -830,6 +833,30 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias1_arg,
     )
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(
+            (
+                "gemm1",
+                functools.partial(
+                    stage1,
+                    grouped_a2,
+                    grouped_a1,
+                    grouped_w1,
+                    grouped_a1_scale,
+                    grouped_w1_scale,
+                    masked_m,
+                    max_m,
+                    inter_dim,
+                    model_dim,
+                    E,
+                    stream=torch.cuda.current_stream(),
+                    swiglu_limit=swiglu_limit,
+                    _m_tile_prefix=m_tile_prefix,
+                    _m_tile_map=m_tile_map,
+                    bias=_bias1_arg,
+                ),
+            )
+        )
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
@@ -977,8 +1004,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage2 tokens={token_num} max_m={max_m} E={E}")
+    _stage2_out = grouped_out
     grouped_out = stage2(
-        grouped_out,
+        _stage2_out,
         grouped_a2_payload,
         grouped_w2,
         grouped_a2_scale,
@@ -993,6 +1021,29 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias2_arg,
     )
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(
+            (
+                "gemm2",
+                functools.partial(
+                    stage2,
+                    _stage2_out,
+                    grouped_a2_payload,
+                    grouped_w2,
+                    grouped_a2_scale,
+                    grouped_w2_scale,
+                    masked_m,
+                    max_m,
+                    model_dim,
+                    inter_dim,
+                    E,
+                    stream=torch.cuda.current_stream(),
+                    _m_tile_prefix=m_tile_prefix,
+                    _m_tile_map=m_tile_map,
+                    bias=_bias2_arg,
+                ),
+            )
+        )
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage2 sync OK")
