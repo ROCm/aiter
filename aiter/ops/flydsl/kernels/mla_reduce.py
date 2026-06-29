@@ -258,16 +258,12 @@ def compile_mla_reduce(
                     scf.YieldOp([])
 
         # Strided loop over the seq positions this block owns: for seq in
-        # range(q_start + blockIdx.y, q_end, ntg). Built as a raw scf.ForOp (not
-        # the AST `for` rewriter) to match this file's raw-builder idiom and to
-        # avoid auto iter_args inference on a store-only (no-carry) body.
-        lb = arith.index_cast(ir.IndexType.get(), _to_raw(seq0))
-        ub = arith.index_cast(ir.IndexType.get(), _to_raw(ub_seq))
-        st = arith.index_cast(ir.IndexType.get(), _to_raw(ntg))
-        for_seq = scf.ForOp(lb, ub, st)
-        with ir.InsertionPoint(for_seq.body):
-            seq = fx.Int32(for_seq.induction_variable)
-            local_seq = seq - q_start
+        # range(q_start + blockIdx.y, q_end, ntg). Use FlyDSL range (init=None
+        # forces scf_range without iter_args) so hot_loop_scheduler can interleave
+        # VMEM loads with compute in the inner split loops.
+        for seq in range(seq0, ub_seq, ntg, init=None):
+            seq_i32 = fx.Int32(seq)
+            local_seq = seq_i32 - q_start
 
             if const_expr(not is_massive):
                 row0 = gather_row(fx.Int32(0), local_seq)
@@ -302,8 +298,8 @@ def compile_mla_reduce(
                 sum_e = results[VEC + 1]
                 inv = rocdl.rcp(T.f32, sum_e)
                 out_elems = [regs[i] * inv for i in range_constexpr(VEC)]
-                store_result(seq, out_elems)
-                store_lse(seq, max_lse, sum_e)
+                store_result(seq_i32, out_elems)
+                store_lse(seq_i32, max_lse, sum_e)
             else:
                 neg_inf = arith.constant(float("-inf"), type=T.f32)
                 is_wave0 = arith.cmpi(arith.CmpIPredicate.eq, wave, fx.Int32(0))
@@ -358,7 +354,7 @@ def compile_mla_reduce(
                         is_l0 = arith.cmpi(arith.CmpIPredicate.eq, lane, fx.Int32(0))
                         if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
                         with ir.InsertionPoint(if_l0.then_block):
-                            lse_off = fx.Int32(seq) * fx.Int32(H) + fx.Int32(head)
+                            lse_off = seq_i32 * fx.Int32(H) + fx.Int32(head)
                             g_flse[fx.Index(lse_off)] = global_lse
                             scf.YieldOp([])
                     scf.YieldOp([])
@@ -383,8 +379,7 @@ def compile_mla_reduce(
                     out_elems = [accr]
                 else:
                     out_elems = [accr[i] for i in range_constexpr(VEC)]
-                store_result(seq, out_elems)
-            scf.YieldOp([])
+                store_result(seq_i32, out_elems)
         return
 
     @flyc.jit
