@@ -6,14 +6,12 @@ Runs OpenAI's GPT-OSS attention block end to end (mirrors ATOM's OAIAttention):
 qkv_proj -> RoPE(YaRN) + paged KV write -> attention (sinks + alternating sliding
 window + GQA) -> o_proj, checked against a torch reference via checkAllclose.
 
-aiter kernels exercised (head_dim=64 forces the triton/gluon path):
-  * get_rope                       YaRN cos/sin cache
-  * fused_qk_rope_reshape_and_cache   RoPE + paged cache write (NHD)
-  * flash_attn_varlen_func(sink_ptr)  prefill
-  * pa_decode_gluon                   decode
+aiter kernels: get_rope (YaRN) + fused_qk_rope_reshape_and_cache, then attention via
+--backend: asm = flash_attn_varlen_func(sink_ptr) + pa_decode_gluon (gfx942/gfx950);
+triton = unified_attention for both phases (portable, incl. gfx1250). bf16 + fp8 KV.
 
 Sinks = one learnable per-head logit acting as a zero-value KV column
-(denom += exp(sink_h - max)). Validated on MI355X / gfx950.
+(denom += exp(sink_h - max)). Validated on gfx950 / gfx942 / gfx1250.
 """
 
 import argparse
@@ -267,14 +265,11 @@ def _attn_triton(
     phase,
     kv_cache_dtype,
 ):
-    """Portable path (ATOM TritonMHABackend / use_flash_layout): flash-layout KV
-    cache + aiter unified_attention for prefill AND decode. Runs on gfx1250 too
-    (where flash_attn_varlen / pa_decode_gluon are unsupported).
-
-    The KV cache may be fp8 (both phases read it here): the fused kernel stores
-    kv/scale as e4m3 (one shared per-tensor scale from PRE-RoPE max) and
-    unified_attention dequantizes via k_descale/v_descale. Decode runs a true
-    single-token query per seq (max_seqlen_q=1) over the full-context cache."""
+    """Portable path (ATOM TritonMHABackend): flash-layout KV cache + aiter
+    unified_attention for prefill AND decode; runs on gfx1250 (where
+    flash_attn_varlen / pa_decode_gluon don't). fp8 KV (both phases read it): fused
+    stores kv/scale as e4m3 (shared PRE-RoPE-max scale), unified_attention dequants
+    via k/v_descale. Decode = single last-token query (max_seqlen_q=1)."""
     hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
     scale = hd**-0.5
     total = q.shape[0]
