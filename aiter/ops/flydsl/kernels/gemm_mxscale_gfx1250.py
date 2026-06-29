@@ -29,6 +29,7 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
+    WGP_BARRIER_ID,
     extract_lds_base_idx,
     get_lds_memref,
     issue_tdm_loads,
@@ -133,6 +134,8 @@ def compile_mxscale_gemm(
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
     kernel_tag: str = "gemm",
+    lds_prefetch: bool | None = None,
+    pf_depth_ks: int | None = None,
 ):
     """Compile an MXFP4 or MXFP8 GEMM kernel with TDM async copy.
 
@@ -596,6 +599,163 @@ def compile_mxscale_gemm(
         compute_schedule_kind == COMPUTE_SCHEDULE_FP4_COL_BAND
     )
     needs_grouped_row_masked_store = grouped_masked_m and (M % tile_m != 0)
+
+    # ── LDS grouped prefetch gate ───────────────────────────────────────────
+    _lds_pf_on = (
+        lds_prefetch if lds_prefetch is not None
+        else os.environ.get("AITER_GROUPED_LDS_PF", "1") == "1"
+    )
+    _use_lds_pf = (
+        wave_specialized_tdm
+        and compute_schedule_kind == COMPUTE_SCHEDULE_ROW_MAJOR_STREAMING
+        and _lds_pf_on
+    )
+    _pf_ks_depth_raw = (
+        pf_depth_ks if pf_depth_ks is not None
+        else int(os.environ.get("AITER_PF_DEPTH_KS", str(k_wmma_steps)))
+    )
+    _pf_ks_depth = max(1, min(_pf_ks_depth_raw, k_wmma_steps))
+
+    # ── Compile-time PF table + depth (sub-depth D<A support) ───────────────
+    _PF_TAG_A = 0
+    _PF_TAG_B = 1
+    _PF_TAG_AS = 2
+    _PF_TAG_BS = 3
+
+    _pf_num_tiles_b = WMMA_K // PACK_FACTOR_B // 16
+    _b_ngroup_stride = packed_tile_k_b * 16
+
+    if _use_lds_pf:
+        _pf_wpks = wmma_m_rep * wmma_n_rep
+        _A_wmma = k_wmma_steps * _pf_wpks
+        _pf_D = _pf_ks_depth * _pf_wpks
+        _pf_D = max(1, min(_A_wmma, _pf_D))
+        _pf_full_depth = _pf_D == _A_wmma
+
+        if not _pf_full_depth and num_k_tiles > num_buffers:
+            import warnings as _pf_warn
+            _pf_warn.warn(
+                f"pf sub-depth ignored: num_k_tiles({num_k_tiles}) > "
+                f"num_buffers({num_buffers}) causes LDS buffer reuse; "
+                f"using full prefetch."
+            )
+            _pf_D = _A_wmma
+            _pf_full_depth = True
+
+        _pf_order = [
+            (_wm, (wmma_n_rep - 1 - _wnr) if (_wm % 2 == 1) else _wnr)
+            for _wm in range(wmma_m_rep)
+            for _wnr in range(wmma_n_rep)
+        ]
+
+        _pf_load_table = []
+        _pf_plans = []
+        _pf_pos = []
+        _pf_wmma_plan_flat = []
+
+        def _emit_a_load_pf(wm, ks):
+            _a_imm = wm * WMMA_M * lds_a_stride_bytes + ks * (WMMA_K // PACK_FACTOR_A)
+            _start = len(_pf_load_table)
+            for _sub in range(DS_LOADS_PER_A_FRAG):
+                _pf_load_table.append((_PF_TAG_A, _a_imm + _sub * 32))
+            return (_start, DS_LOADS_PER_A_FRAG)
+
+        def _emit_b_load_pf(wn, ks):
+            _start = len(_pf_load_table)
+            if is_fp4:
+                _imm0 = wn * 2 * _b_ngroup_stride + ks * _pf_num_tiles_b * 256
+                _imm1 = (wn * 2 + 1) * _b_ngroup_stride + ks * _pf_num_tiles_b * 256
+                _pf_load_table.extend([
+                    (_PF_TAG_B, _imm0), (_PF_TAG_B, _imm0 + 512),
+                    (_PF_TAG_B, _imm1), (_PF_TAG_B, _imm1 + 512),
+                ])
+                return (_start, 4)
+            if is_a8w4:
+                _imm = wn * _b_ngroup_stride + ks * _pf_num_tiles_b * 256
+                _pf_load_table.extend([
+                    (_PF_TAG_B, _imm), (_PF_TAG_B, _imm + 512),
+                ])
+                return (_start, 2)
+            _imm = wn * _b_ngroup_stride + ks * _pf_num_tiles_b * 256
+            for _so in (0, 512, 1024, 1536):
+                _pf_load_table.append((_PF_TAG_B, _imm + _so))
+            return (_start, 4)
+
+        def _emit_as_load_pf(ks):
+            _as_n = (wmma_m_rep + 3) // 4
+            _as_off = ks * wmma_m_rep * SCALES_PER_WMMA
+            _start = len(_pf_load_table)
+            for _ld in range(_as_n):
+                _pf_load_table.append((_PF_TAG_AS, _as_off + _ld * 16))
+            return (_start, _as_n)
+
+        # n32k4 B-scale: each wn (or wn-pair when b_opsel_on) is one ds_load_b32
+        _bs_n32k4_kstep = BS_N32K4_BLOCK_N * SCALES_PER_WMMA
+        _bs_row_bytes_pf = scale_k_per_tile * BS_N32K4_BLOCK_N
+
+        def _emit_bs_load_pf(wn, ks):
+            _start = len(_pf_load_table)
+            k_off = ks * _bs_n32k4_kstep
+            if b_opsel_on:
+                _bs_idx = wn // 2
+                if wn % 2 == 0:
+                    _pf_load_table.append((_PF_TAG_BS, _bs_idx * _bs_row_bytes_pf + k_off))
+                    return (_start, 1)
+                return (_start, 0)
+            else:
+                _pf_load_table.append((_PF_TAG_BS, wn * _bs_row_bytes_pf + k_off))
+                return (_start, 1)
+
+        for _pf_ks in range(k_wmma_steps):
+            _a_seen, _b_seen, _bs_seen, _recs = {}, {}, {}, {}
+            _as_rec = None
+            for (_wm, _wn) in _pf_order:
+                _wmma_start = len(_pf_load_table)
+                if _as_rec is None:
+                    _as_rec = _emit_as_load_pf(_pf_ks)
+                if b_opsel_on:
+                    _bsg = _wn // 2
+                    if _bsg not in _bs_seen:
+                        _bs_seen[_bsg] = _emit_bs_load_pf(_wn, _pf_ks)
+                else:
+                    if _wn not in _bs_seen:
+                        _bs_seen[_wn] = _emit_bs_load_pf(_wn, _pf_ks)
+                if _wm not in _a_seen:
+                    _a_seen[_wm] = _emit_a_load_pf(_wm, _pf_ks)
+                if _wn not in _b_seen:
+                    _b_seen[_wn] = _emit_b_load_pf(_wn, _pf_ks)
+                _recs[(_wm, _wn)] = (_wmma_start, len(_pf_load_table) - _wmma_start)
+            _as_start_r, _as_n_r = _as_rec
+            _a_groups = [_a_seen[_wm] for _wm in range(wmma_m_rep)]
+            _b_groups = [_b_seen[_wn] for _wn in range(wmma_n_rep)]
+            _bs_groups = [_bs_seen[_g] for _g in sorted(_bs_seen.keys())]
+            _pf_plans.append((_as_start_r, _as_n_r, _a_groups, _b_groups, _bs_groups))
+            for (_wm, _wn) in _pf_order:
+                _pf_pos.append((_pf_ks, _wm, _wn))
+                _pf_wmma_plan_flat.append(_recs[(_wm, _wn)])
+
+        # Per-ks scale source maps for lazy assembly
+        _pf_as_src = []
+        _pf_bs_src = []
+        for _sks in range(k_wmma_steps):
+            _as_s, _as_n_s, _, _, _bs_gs = _pf_plans[_sks]
+            _pf_as_src.append([(_as_s + r // 4, r % 4) for r in range(wmma_m_rep)])
+            _bs_map = []
+            for _bs_s, _bs_n_s in _bs_gs:
+                for _i in range(_bs_n_s):
+                    _bs_map.append((_bs_s + _i, 0))  # b32 → whole value, sub=0
+            _pf_bs_src.append(_bs_map)
+
+        _pf_split_idx = (
+            _pf_wmma_plan_flat[_pf_D][0] if _pf_D < _A_wmma else len(_pf_load_table)
+        )
+    else:
+        _pf_full_depth = True
+        _pf_D = 0
+        _A_wmma = 0
+        _pf_wpks = 0
+        _pf_split_idx = 0
+
     kernel_tag_mode = str(kernel_tag).replace("-", "_")
     # Kernel symbol carries the data format + tile shape + buffer count so
     # profiles/dumps can tell configs apart (e.g. stage1 vs stage2, different
@@ -1228,12 +1388,20 @@ def compile_mxscale_gemm(
                 emit_filler=None,
                 next_bs_info=None,
                 mid_compute_callback=None,
+                pf_a_frags=None,
+                skip_wait=False,
             ):
                 """Half-based A-streaming with zigzag wn ordering.
 
                 When *next_bs_info* is provided, the next K-subtile's B+scale
                 loads are issued BEFORE the s_wait_dscnt so they overlap with
                 the current WMMA execution (partial drain pattern).
+
+                When *pf_a_frags* is provided the A ds_loads for this k-step are
+                skipped — the pre-fetched VGPR values from the previous tile's
+                interleaved post-fetch are used directly.  Combined with
+                *skip_wait*, the current-tile WMMAs run on loop-carried VGPRs
+                while the next tile's ds_loads stay in flight.
                 """
                 next_result = None
                 _front_wm = (wmma_m_rep + 1) // 2
@@ -1270,10 +1438,13 @@ def compile_mxscale_gemm(
                     mid_compute_callback()
                     rocdl.sched_barrier(0)
 
-                a_frags_front = [
-                    load_a_frag(a_buf, a_bases[wm], ks)
-                    for wm in range_constexpr(_front_wm)
-                ]
+                if const_expr(pf_a_frags is not None):
+                    a_frags_front = pf_a_frags[:_front_wm]
+                else:
+                    a_frags_front = [
+                        load_a_frag(a_buf, a_bases[wm], ks)
+                        for wm in range_constexpr(_front_wm)
+                    ]
 
                 _use_partial_drain = (
                     next_bs_info is not None and _front_wm * wmma_n_rep >= 4
@@ -1287,6 +1458,9 @@ def compile_mxscale_gemm(
                         nb_buf, nb_bases, nbs_buf, nbs_bases, nas_buf, nas_bases, n_ks
                     )
                     rocdl.s_wait_dscnt(_bs_ds_loads)
+                elif const_expr(skip_wait):
+                    _n_pf_per_ks = _bs_ds_loads + wmma_m_rep * DS_LOADS_PER_A_FRAG
+                    rocdl.s_wait_dscnt(_n_pf_per_ks // 2)
                 else:
                     rocdl.s_wait_dscnt(0)
 
@@ -1297,12 +1471,16 @@ def compile_mxscale_gemm(
                     mid_compute_callback()
 
                 if const_expr(_back_wm > 0):
-                    a_frags_back = [
-                        load_a_frag(a_buf, a_bases[_front_wm + h], ks)
-                        for h in range_constexpr(_back_wm)
-                    ]
-                    _back_drain = _bs_ds_loads if _use_partial_drain else 0
-                    rocdl.s_wait_dscnt(_back_drain)
+                    if const_expr(pf_a_frags is not None):
+                        a_frags_back = pf_a_frags[_front_wm : _front_wm + _back_wm]
+                    else:
+                        a_frags_back = [
+                            load_a_frag(a_buf, a_bases[_front_wm + h], ks)
+                            for h in range_constexpr(_back_wm)
+                        ]
+                    if const_expr(not skip_wait):
+                        _back_drain = _bs_ds_loads if _use_partial_drain else 0
+                        rocdl.s_wait_dscnt(_back_drain)
                     _emit_rows(_front_wm, a_frags_back)
 
                 if const_expr(_use_partial_drain):
@@ -1317,6 +1495,134 @@ def compile_mxscale_gemm(
                     return accs, next_result
                 return accs
 
+            # ── PF assembly helpers (sub-depth raw-carry → assembled frags) ──
+            if const_expr(_use_lds_pf and not _pf_full_depth):
+                def _assemble_pf_ks(raw, ks):
+                    _as_s, _as_n, _a_grps, _b_grps, _bs_grps = _pf_plans[ks]
+                    _as_vecs = raw[_as_s : _as_s + _as_n]
+                    _as_all = [
+                        vector.extract(_as_vecs[r // 4], static_position=[r % 4], dynamic_position=[])
+                        for r in range_constexpr(wmma_m_rep)
+                    ]
+                    _as_ks = _as_all[::2] if const_expr(use_scale_opsel) else _as_all
+                    _a_ks = []
+                    for _a_s, _a_n in _a_grps:
+                        _r = raw[_a_s : _a_s + _a_n]
+                        if const_expr(is_fp4):
+                            _a_ks.append(vector.shuffle(_r[0], _r[1], list(range(8))))
+                        else:
+                            _v01 = vector.shuffle(_r[0], _r[1], list(range(8)))
+                            _v23 = vector.shuffle(_r[2], _r[3], list(range(8)))
+                            _a_ks.append(vector.shuffle(_v01, _v23, list(range(16))))
+                    _b_ks = []
+                    for _b_s, _b_n in _b_grps:
+                        _r = raw[_b_s : _b_s + _b_n]
+                        if const_expr(is_a8w4):
+                            _b_ks.append(vector.shuffle(_r[0], _r[1], list(range(8))))
+                        else:
+                            _v01 = vector.shuffle(_r[0], _r[1], list(range(8)))
+                            _v23 = vector.shuffle(_r[2], _r[3], list(range(8)))
+                            _b_ks.append(vector.shuffle(_v01, _v23, list(range(16))))
+                    # n32k4 BS: each raw[i] is already a scalar (b32 load)
+                    _bs_ks = []
+                    for _bs_s, _bs_n in _bs_grps:
+                        for _bi in range(_bs_n):
+                            _bs_ks.append(raw[_bs_s + _bi])
+                    return _a_ks, _b_ks, _bs_ks, _as_ks
+
+                def _pf_lazy_a(raw, cache, ks, wm):
+                    _k = (ks, wm)
+                    if _k not in cache:
+                        _s, _n = _pf_plans[ks][2][wm]
+                        _r = raw[_s : _s + _n]
+                        if const_expr(is_fp4):
+                            cache[_k] = vector.shuffle(_r[0], _r[1], list(range(8)))
+                        else:
+                            _v01 = vector.shuffle(_r[0], _r[1], list(range(8)))
+                            _v23 = vector.shuffle(_r[2], _r[3], list(range(8)))
+                            cache[_k] = vector.shuffle(_v01, _v23, list(range(16)))
+                    return cache[_k]
+
+                def _pf_lazy_b(raw, cache, ks, wn):
+                    _k = (ks, wn)
+                    if _k not in cache:
+                        _s, _n = _pf_plans[ks][3][wn]
+                        _r = raw[_s : _s + _n]
+                        if const_expr(is_a8w4):
+                            cache[_k] = vector.shuffle(_r[0], _r[1], list(range(8)))
+                        else:
+                            _v01 = vector.shuffle(_r[0], _r[1], list(range(8)))
+                            _v23 = vector.shuffle(_r[2], _r[3], list(range(8)))
+                            cache[_k] = vector.shuffle(_v01, _v23, list(range(16)))
+                    return cache[_k]
+
+                def _pf_lazy_scales(raw, cache, ks, wm, wn):
+                    if ks not in cache:
+                        _as_pre = [
+                            vector.extract(raw[_ti], static_position=[_sub], dynamic_position=[])
+                            for (_ti, _sub) in _pf_as_src[ks]
+                        ]
+                        _as_ks_l = _as_pre[::2] if const_expr(use_scale_opsel) else _as_pre
+                        _bs_len = len(_pf_bs_src[ks])
+                        if const_expr(b_opsel_on):
+                            _bs_len = (_bs_len + 1) // 2
+                        cache[ks] = (_as_ks_l, [None] * _bs_len)
+                    _as_ks_l, _bs_list = cache[ks]
+                    if const_expr(b_opsel_on):
+                        _bidx = wn // 2
+                    else:
+                        _bidx = wn
+                    if _bs_list[_bidx] is None:
+                        _ti, _sub = _pf_bs_src[ks][_bidx]
+                        _bs_list[_bidx] = raw[_ti]  # b32: whole value
+                    return _as_ks_l, _bs_list
+
+            # -- LDS grouped prefetch: issue carry ds_loads --
+            def _issue_pf_all_ks(lds_a, lds_b, lds_bs, lds_as, depth=None):
+                """Issue ds_loads for the carry.
+
+                Full depth: returns list[(a_frags, b_frags, b_scales, a_scales)].
+                Sub depth:  returns flat list of raw b128/b32 vectors.
+                """
+                _a_buf, _a_bases = _precompute_a_lane_bases(lds_a)
+                _b_buf, _b_bases = _precompute_b_lane_bases(lds_b)
+                _as_buf, _as_bases = _precompute_scale_lane_bases(
+                    lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
+                )
+                _bs_buf, _bs_bases = _precompute_b_scale_n32k4_base(
+                    lds_bs, warp_n_base
+                )
+                _buf_pairs = [
+                    (_a_buf, _a_bases[0]),
+                    (_b_buf, _b_bases[0]),
+                    (_as_buf, _as_bases[0]),
+                    (_bs_buf, _bs_bases[0]),
+                ]
+
+                if const_expr(not _pf_full_depth):
+                    _raw = []
+                    for _tag, _imm in _pf_load_table[:_pf_split_idx]:
+                        _rbuf, _rbase = _buf_pairs[_tag]
+                        if const_expr(_tag == _PF_TAG_BS):
+                            _raw.append(lds_load_b32_raw(_rbuf, _rbase + arith.index(_imm)))
+                        else:
+                            _raw.append(lds_load_b128_raw(_rbuf, _rbase + arith.index(_imm)))
+                    return _raw
+
+                _d = k_wmma_steps if depth is None else min(depth, k_wmma_steps)
+                pf = []
+                for ks in range_constexpr(_d):
+                    _b_ks, _bs_ks, _as_ks = _load_b_and_scales(
+                        _b_buf, _b_bases, _bs_buf, _bs_bases,
+                        _as_buf, _as_bases, ks
+                    )
+                    _a_ks = [
+                        load_a_frag(_a_buf, _a_bases[wm], ks)
+                        for wm in range_constexpr(wmma_m_rep)
+                    ]
+                    pf.append((_a_ks, _b_ks, _bs_ks, _as_ks))
+                return pf
+
             # -- Compute on one LDS buffer --
             def compute_tile(
                 accs_in,
@@ -1326,6 +1632,12 @@ def compile_mxscale_gemm(
                 lds_bs,
                 emit_filler=None,
                 mid_compute_callback=None,
+                pf_all_ks=None,
+                next_lds_a=None,
+                next_lds_b=None,
+                next_lds_bs=None,
+                next_lds_as=None,
+                pf_depth=None,
             ):
                 current_accs = list(accs_in)
                 a_buf, a_bases = _precompute_a_lane_bases(lds_a)
@@ -1335,6 +1647,168 @@ def compile_mxscale_gemm(
                 )
                 bs_buf, bs_bases = _precompute_b_scale_n32k4_base(lds_bs, warp_n_base)
 
+                _has_pf = pf_all_ks is not None
+                _has_next = next_lds_b is not None
+                _pf_d = k_wmma_steps if pf_depth is None else pf_depth
+
+                if const_expr(_has_next):
+                    nxt_a_buf, nxt_a_bases = _precompute_a_lane_bases(next_lds_a)
+                    nxt_b_buf, nxt_b_bases = _precompute_b_lane_bases(next_lds_b)
+                    nxt_as_buf, nxt_as_bases = _precompute_scale_lane_bases(
+                        next_lds_as, warp_m_base, wmma_m_rep, interleaved_scale_cols_a
+                    )
+                    nxt_bs_buf, nxt_bs_bases = _precompute_b_scale_n32k4_base(
+                        next_lds_bs, warp_n_base
+                    )
+
+                # ── PF + next (full depth D=A): interleave assembled frags ──
+                if const_expr(_has_pf and _has_next and _pf_full_depth):
+                    nxt_pf = []
+                    for ks in range_constexpr(k_wmma_steps):
+                        _mid_cb = mid_compute_callback if ks == 0 else None
+                        _filler = emit_filler if ks == k_wmma_steps - 1 else None
+                        pf_a_ks, pf_b_ks, pf_bs_ks, pf_as_ks = pf_all_ks[ks]
+                        nxt_b_ks, nxt_bs_ks, nxt_as_ks = _load_b_and_scales(
+                            nxt_b_buf, nxt_b_bases, nxt_bs_buf, nxt_bs_bases,
+                            nxt_as_buf, nxt_as_bases, ks,
+                        )
+                        nxt_a_ks = [
+                            load_a_frag(nxt_a_buf, nxt_a_bases[wm], ks)
+                            for wm in range_constexpr(wmma_m_rep)
+                        ]
+                        nxt_pf.append((nxt_a_ks, nxt_b_ks, nxt_bs_ks, nxt_as_ks))
+                        current_accs = _a_streaming_compute(
+                            current_accs,
+                            a_buf,
+                            a_bases,
+                            pf_b_ks,
+                            pf_bs_ks,
+                            pf_as_ks,
+                            ks,
+                            emit_filler=_filler,
+                            mid_compute_callback=_mid_cb,
+                            pf_a_frags=pf_a_ks,
+                            skip_wait=True,
+                        )
+                    return current_accs, nxt_pf
+
+                # ── PF + next (sub-depth D<A): table-driven raw-carry pipeline ──
+                if const_expr(_has_pf and _has_next and not _pf_full_depth):
+                    _nxt_buf_pairs = [
+                        (nxt_a_buf, nxt_a_bases[0]),
+                        (nxt_b_buf, nxt_b_bases[0]),
+                        (nxt_as_buf, nxt_as_bases[0]),
+                        (nxt_bs_buf, nxt_bs_bases[0]),
+                    ]
+                    _cur_buf_pairs = [
+                        (a_buf, a_bases[0]),
+                        (b_buf, b_bases[0]),
+                        (as_buf, as_bases[0]),
+                        (bs_buf, bs_bases[0]),
+                    ]
+                    cur_all = list(pf_all_ks)
+                    nxt_raw = []
+                    if const_expr(_pf_D >= _pf_wpks):
+                        _cur_ks = _assemble_pf_ks(cur_all, 0)
+                    else:
+                        _cur_ks = None
+                        _lz_ac, _lz_bc, _lz_scc = {}, {}, {}
+                    for i in range_constexpr(_A_wmma):
+                        ks, wm, wn = _pf_pos[i]
+                        _j = i + _pf_D
+                        if const_expr(_j < _A_wmma):
+                            _ls, _lc = _pf_wmma_plan_flat[_j]
+                            for _t, _m in _pf_load_table[_ls : _ls + _lc]:
+                                _cb, _cba = _cur_buf_pairs[_t]
+                                if const_expr(_t == _PF_TAG_BS):
+                                    cur_all.append(lds_load_b32_raw(_cb, _cba + arith.index(_m)))
+                                else:
+                                    cur_all.append(lds_load_b128_raw(_cb, _cba + arith.index(_m)))
+                        else:
+                            _ls, _lc = _pf_wmma_plan_flat[_j - _A_wmma]
+                            for _t, _m in _pf_load_table[_ls : _ls + _lc]:
+                                _nb, _nba = _nxt_buf_pairs[_t]
+                                if const_expr(_t == _PF_TAG_BS):
+                                    nxt_raw.append(lds_load_b32_raw(_nb, _nba + arith.index(_m)))
+                                else:
+                                    nxt_raw.append(lds_load_b128_raw(_nb, _nba + arith.index(_m)))
+                        if const_expr(_pf_D >= _pf_wpks and i % _pf_wpks == 0 and i > 0):
+                            _cur_ks = _assemble_pf_ks(cur_all, ks)
+                        rocdl.sched_barrier(0)
+                        if const_expr(_pf_D >= _pf_wpks):
+                            _emit_wmma(current_accs, wm, wn, ks,
+                                       _cur_ks[0][wm], _cur_ks[1], _cur_ks[3], _cur_ks[2])
+                        else:
+                            _as_e, _bs_e = _pf_lazy_scales(cur_all, _lz_scc, ks, wm, wn)
+                            _emit_wmma(current_accs, wm, wn, ks,
+                                       _pf_lazy_a(cur_all, _lz_ac, ks, wm),
+                                       [_pf_lazy_b(cur_all, _lz_bc, ks, wn_i) for wn_i in range_constexpr(wmma_n_rep)],
+                                       _as_e, _bs_e)
+                        rocdl.sched_barrier(0)
+                    return current_accs, nxt_raw
+
+                # ── PF without next, full depth: final tile ──
+                if const_expr(_has_pf and _pf_full_depth):
+                    for ks in range_constexpr(k_wmma_steps):
+                        _mid_cb = mid_compute_callback if ks == 0 else None
+                        _filler = emit_filler if ks == k_wmma_steps - 1 else None
+                        pf_a_ks, pf_b_ks, pf_bs_ks, pf_as_ks = pf_all_ks[ks]
+                        current_accs = _a_streaming_compute(
+                            current_accs,
+                            a_buf,
+                            a_bases,
+                            pf_b_ks,
+                            pf_bs_ks,
+                            pf_as_ks,
+                            ks,
+                            emit_filler=_filler,
+                            mid_compute_callback=_mid_cb,
+                            pf_a_frags=pf_a_ks,
+                            skip_wait=True,
+                        )
+                    return current_accs
+
+                # ── PF without next, sub-depth: final tile ──
+                if const_expr(_has_pf and not _pf_full_depth):
+                    _cur_buf_pairs = [
+                        (a_buf, a_bases[0]),
+                        (b_buf, b_bases[0]),
+                        (as_buf, as_bases[0]),
+                        (bs_buf, bs_bases[0]),
+                    ]
+                    cur_all = list(pf_all_ks)
+                    if const_expr(_pf_D >= _pf_wpks):
+                        _cur_ks = _assemble_pf_ks(cur_all, 0)
+                    else:
+                        _cur_ks = None
+                        _lz_ac, _lz_bc, _lz_scc = {}, {}, {}
+                    for i in range_constexpr(_A_wmma):
+                        ks, wm, wn = _pf_pos[i]
+                        _j = i + _pf_D
+                        if const_expr(_j < _A_wmma):
+                            _ls, _lc = _pf_wmma_plan_flat[_j]
+                            for _t, _m in _pf_load_table[_ls : _ls + _lc]:
+                                _cb, _cba = _cur_buf_pairs[_t]
+                                if const_expr(_t == _PF_TAG_BS):
+                                    cur_all.append(lds_load_b32_raw(_cb, _cba + arith.index(_m)))
+                                else:
+                                    cur_all.append(lds_load_b128_raw(_cb, _cba + arith.index(_m)))
+                        if const_expr(_pf_D >= _pf_wpks and i % _pf_wpks == 0 and i > 0):
+                            _cur_ks = _assemble_pf_ks(cur_all, ks)
+                        rocdl.sched_barrier(0)
+                        if const_expr(_pf_D >= _pf_wpks):
+                            _emit_wmma(current_accs, wm, wn, ks,
+                                       _cur_ks[0][wm], _cur_ks[1], _cur_ks[3], _cur_ks[2])
+                        else:
+                            _as_e, _bs_e = _pf_lazy_scales(cur_all, _lz_scc, ks, wm, wn)
+                            _emit_wmma(current_accs, wm, wn, ks,
+                                       _pf_lazy_a(cur_all, _lz_ac, ks, wm),
+                                       [_pf_lazy_b(cur_all, _lz_bc, ks, wn_i) for wn_i in range_constexpr(wmma_n_rep)],
+                                       _as_e, _bs_e)
+                        rocdl.sched_barrier(0)
+                    return current_accs
+
+                # Original non-PF path
                 if const_expr(k_wmma_steps == 1):
                     b_frags, b_scales, a_scales = _load_b_and_scales(
                         b_buf, b_bases, bs_buf, bs_bases, as_buf, as_bases, 0
@@ -1625,6 +2099,12 @@ def compile_mxscale_gemm(
                 lds_bs,
                 emit_filler=None,
                 mid_compute_callback=None,
+                pf_all_ks=None,
+                next_lds_a=None,
+                next_lds_b=None,
+                next_lds_bs=None,
+                next_lds_as=None,
+                pf_depth=None,
             ):
                 if const_expr(compute_schedule_kind == COMPUTE_SCHEDULE_FP4_COL_BAND):
                     return compute_tile_fp4_bank_friendly(
@@ -1644,6 +2124,12 @@ def compile_mxscale_gemm(
                     lds_bs,
                     emit_filler=emit_filler,
                     mid_compute_callback=mid_compute_callback,
+                    pf_all_ks=pf_all_ks,
+                    next_lds_a=next_lds_a,
+                    next_lds_b=next_lds_b,
+                    next_lds_bs=next_lds_bs,
+                    next_lds_as=next_lds_as,
+                    pf_depth=pf_depth,
                 )
 
             def hot_loop_scheduler_scheduled():
@@ -2548,89 +3034,206 @@ def compile_mxscale_gemm(
             # This overlaps TDM DMA with the remaining WMMA instructions,
             _fence_outstanding = TDM_LOADS_PER_STEP * (num_buffers - 2)
 
+            # PF flat-list helpers (only used when _use_lds_pf)
+            if const_expr(_use_lds_pf):
+                _n_pf_a_per_ks = wmma_m_rep
+                _n_pf_b_per_ks = wmma_n_rep
+                _n_pf_bs_per_ks = wmma_n_rep // 2 if b_opsel_on else wmma_n_rep
+                if const_expr(use_scale_opsel):
+                    _n_pf_as_per_ks = (wmma_m_rep + 1) // 2
+                else:
+                    _n_pf_as_per_ks = wmma_m_rep
+                _n_pf_per_ks = (
+                    _n_pf_a_per_ks + _n_pf_b_per_ks + _n_pf_bs_per_ks + _n_pf_as_per_ks
+                )
+                if const_expr(_pf_full_depth):
+                    _n_pf_total = _pf_ks_depth * _n_pf_per_ks
+                else:
+                    _n_pf_total = _pf_split_idx
+
+                def _pf_all_ks_to_flat(pf_all_ks):
+                    if const_expr(not _pf_full_depth):
+                        return list(pf_all_ks)
+                    flat = []
+                    for (a_frags, b_frags, b_scales, a_scales) in pf_all_ks:
+                        flat.extend(a_frags)
+                        flat.extend(b_frags)
+                        flat.extend(b_scales)
+                        flat.extend(a_scales)
+                    return flat
+
+                def _flat_to_pf_all_ks(state, base):
+                    if const_expr(not _pf_full_depth):
+                        return list(state[base : base + _pf_split_idx])
+                    result = []
+                    idx = base
+                    for _ in range_constexpr(_pf_ks_depth):
+                        a_frags = list(state[idx : idx + _n_pf_a_per_ks])
+                        idx += _n_pf_a_per_ks
+                        b_frags = list(state[idx : idx + _n_pf_b_per_ks])
+                        idx += _n_pf_b_per_ks
+                        b_scales = list(state[idx : idx + _n_pf_bs_per_ks])
+                        idx += _n_pf_bs_per_ks
+                        a_scales = list(state[idx : idx + _n_pf_as_per_ks])
+                        idx += _n_pf_as_per_ks
+                        result.append((a_frags, b_frags, b_scales, a_scales))
+                    return result
+
+            _tail_pf_all_ks = None
+
             if const_expr(loop_iters > 0):
                 if const_expr(wave_specialized_tdm):
-                    init_args = list(accs) + [active_addr_lo]
+                    if const_expr(_use_lds_pf):
+                        rocdl.s_wait_tensorcnt(0)
+                        rocdl.s_barrier_signal(WGP_BARRIER_ID)
+                        rocdl.s_barrier_wait(WGP_BARRIER_ID)
+                        _pf_as_arg = (
+                            as_full_idx
+                            if tdm_as_in_prologue
+                            else stages_as_idx[0]
+                        )
+                        _pf_init = _issue_pf_all_ks(
+                            stages_a_idx[0],
+                            stages_b_idx[0],
+                            stages_bs_idx[0],
+                            _pf_as_arg,
+                            depth=_pf_ks_depth,
+                        )
+                        _pf_init_flat = _pf_all_ks_to_flat(_pf_init)
+                    else:
+                        _pf_init_flat = []
+
+                    init_args = list(accs) + [active_addr_lo] + _pf_init_flat
 
                     for loop_iter, state in range(0, loop_iters, 1, init=init_args):
                         accs_in = list(state[:n_accs])
                         cur_addr_lo = state[n_accs]
 
+                        if const_expr(_use_lds_pf):
+                            _pf_base = n_accs + 1
+                            _cur_pf_all_ks = _flat_to_pf_all_ks(state, _pf_base)
+                        else:
+                            _cur_pf_all_ks = None
+
                         for buf_idx in range_constexpr(num_buffers):
                             load_stage = (buf_idx + num_buffers - 1) % num_buffers
+                            next_buf = (buf_idx + 1) % num_buffers
 
-                            pipeline_fence_signal(
-                                outstanding=_fence_outstanding, use_cluster=use_cluster
-                            )
-                            pipeline_fence_wait(use_cluster=use_cluster)
-
-                            addr_box = [cur_addr_lo]
-
-                            def _issue_tdm_ws(
-                                _ls=load_stage,
-                                _ab=addr_box,
-                            ):
+                            if const_expr(_use_lds_pf):
+                                _k_off_tdm = (
+                                    split_k_base
+                                    + loop_iter * arith.index(num_buffers * tile_k)
+                                    + arith.index(buf_idx * tile_k)
+                                )
                                 dg0 = vector.from_elements(
                                     T.vec(4, T.i32),
                                     [
                                         pred_const,
-                                        active_stage_lds_addr[_ls],
-                                        _ab[0],
+                                        active_stage_lds_addr[load_stage],
+                                        cur_addr_lo,
                                         active_addr_hi,
                                     ],
                                 )
                                 tdm_ops.tensor_load_2d(
                                     tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
                                 )
-                                _ab[0] = arith.addi(_ab[0], active_adv_i32)
+                                cur_addr_lo = arith.addi(cur_addr_lo, active_adv_i32)
+                                _l2_prefetch(_k_off_tdm)
 
-                            # L2 prefetch stays a mid-compute callback so it issues
-                            # inside the WMMA body (overlapping compute), separate
-                            # from the hoisted TDM above.
-                            def _mid_prefetch_ws(
-                                _k_off=(
+                                pipeline_fence_signal(
+                                    outstanding=_fence_outstanding,
+                                    use_cluster=use_cluster,
+                                )
+                                pipeline_fence_wait(use_cluster=use_cluster)
+
+                                if const_expr(tdm_as_in_prologue):
+                                    _as_full_base_off[0] = (
+                                        loop_iter
+                                        * arith.index(num_buffers * interleaved_scale_cols_a)
+                                        + arith.index(buf_idx * interleaved_scale_cols_a)
+                                    )
+                                _as_idx = (
+                                    as_full_idx
+                                    if tdm_as_in_prologue
+                                    else stages_as_idx[buf_idx]
+                                )
+
+                                rocdl.sched_barrier(0)
+                                accs_in, _cur_pf_all_ks = compute_tile_scheduled(
+                                    accs_in,
+                                    stages_a_idx[buf_idx],
+                                    stages_b_idx[buf_idx],
+                                    _as_idx,
+                                    stages_bs_idx[buf_idx],
+                                    pf_all_ks=_cur_pf_all_ks,
+                                    next_lds_a=stages_a_idx[next_buf],
+                                    next_lds_b=stages_b_idx[next_buf],
+                                    next_lds_bs=stages_bs_idx[next_buf],
+                                    next_lds_as=stages_as_idx[next_buf],
+                                    pf_depth=_pf_ks_depth,
+                                )
+                            else:
+                                # FlyDSL pattern: TDM BEFORE fence for max
+                                # DMA overlap (TDM runs during fence_wait).
+                                _k_off_tdm = (
                                     split_k_base
                                     + loop_iter * arith.index(num_buffers * tile_k)
                                     + arith.index(buf_idx * tile_k)
-                                ),
-                            ):
-                                _l2_prefetch(_k_off)
-
-                            if const_expr(tdm_as_in_prologue):
-                                _as_full_base_off[0] = (
-                                    loop_iter
-                                    * arith.index(num_buffers * interleaved_scale_cols_a)
-                                    + arith.index(buf_idx * interleaved_scale_cols_a)
                                 )
-                            _as_idx = (
-                                as_full_idx
-                                if tdm_as_in_prologue
-                                else stages_as_idx[buf_idx]
-                            )
-                            # Hoist the TDM to be the FIRST load after the fence
-                            # wait: issue it here (before compute's B/scale ds_loads)
-                            # so its global->LDS DMA overlaps the entire compute
-                            # body. sched_barrier(0) pins it -- the compiler may not
-                            # sink it below the ds_loads. The L2 prefetch still rides
-                            # the mid-compute callback (overlapping the WMMA body).
-                            rocdl.sched_barrier(0)
-                            _issue_tdm_ws()
-                            rocdl.sched_barrier(0)
-                            accs_in = compute_tile_scheduled(
-                                accs_in,
-                                stages_a_idx[buf_idx],
-                                stages_b_idx[buf_idx],
-                                _as_idx,
-                                stages_bs_idx[buf_idx],
-                                mid_compute_callback=_mid_prefetch_ws,
-                            )
-                            cur_addr_lo = addr_box[0]
+                                dg0 = vector.from_elements(
+                                    T.vec(4, T.i32),
+                                    [
+                                        pred_const,
+                                        active_stage_lds_addr[load_stage],
+                                        cur_addr_lo,
+                                        active_addr_hi,
+                                    ],
+                                )
+                                tdm_ops.tensor_load_2d(
+                                    tdm_ops.TDMDescriptor2D(dg0, active_dgroup1)
+                                )
+                                cur_addr_lo = arith.addi(cur_addr_lo, active_adv_i32)
+                                _l2_prefetch(_k_off_tdm)
+
+                                pipeline_fence_signal(
+                                    outstanding=_fence_outstanding, use_cluster=use_cluster
+                                )
+                                pipeline_fence_wait(use_cluster=use_cluster)
+
+                                if const_expr(tdm_as_in_prologue):
+                                    _as_full_base_off[0] = (
+                                        loop_iter
+                                        * arith.index(num_buffers * interleaved_scale_cols_a)
+                                        + arith.index(buf_idx * interleaved_scale_cols_a)
+                                    )
+                                _as_idx = (
+                                    as_full_idx
+                                    if tdm_as_in_prologue
+                                    else stages_as_idx[buf_idx]
+                                )
+
+                                rocdl.sched_barrier(0)
+                                accs_in = compute_tile_scheduled(
+                                    accs_in,
+                                    stages_a_idx[buf_idx],
+                                    stages_b_idx[buf_idx],
+                                    _as_idx,
+                                    stages_bs_idx[buf_idx],
+                                )
                             hot_loop_scheduler_scheduled()
 
-                        results = yield list(accs_in) + [cur_addr_lo]
+                        if const_expr(_use_lds_pf):
+                            _pf_yield = _pf_all_ks_to_flat(_cur_pf_all_ks)
+                        else:
+                            _pf_yield = []
+                        results = yield list(accs_in) + [cur_addr_lo] + _pf_yield
 
                     accs = list(results[:n_accs])
                     active_addr_lo = results[n_accs]
+                    if const_expr(_use_lds_pf):
+                        _tail_pf_all_ks = _flat_to_pf_all_ks(results, n_accs + 1)
+                    else:
+                        _tail_pf_all_ks = None
                 else:
                     if const_expr(stage1_dual_b):
                         init_args = (
@@ -2953,6 +3556,18 @@ def compile_mxscale_gemm(
                     pipeline_fence(outstanding=0, use_cluster=use_cluster)
             elif const_expr(use_cluster):
                 gpu.cluster_barrier()
+            if const_expr(loop_iters == 0 and _use_lds_pf):
+                _pf_as_arg_tail = (
+                    as_full_idx if tdm_as_in_prologue else stages_as_idx[0]
+                )
+                _tail_pf_all_ks = _issue_pf_all_ks(
+                    stages_a_idx[0], stages_b_idx[0],
+                    stages_bs_idx[0], _pf_as_arg_tail,
+                    depth=_pf_ks_depth,
+                )
+                rocdl.s_wait_tensorcnt(0)
+                rocdl.s_wait_dscnt(0)
+
             epi_addrs_box = [None]
             _tail_had_load = False
             for _tail_i, (_load_stage, _compute_stage, _outstanding) in enumerate(
@@ -2976,6 +3591,7 @@ def compile_mxscale_gemm(
                 if const_expr(_outstanding == -1):
                     if const_expr(_tail_had_load):
                         pipeline_fence(outstanding=0, use_cluster=use_cluster)
+                    _use_tail_pf = _use_lds_pf and _tail_pf_all_ks is not None
                     if const_expr(use_tdm_store):
                         accs = compute_tile_scheduled(
                             accs,
@@ -2983,6 +3599,8 @@ def compile_mxscale_gemm(
                             stages_b_idx[_compute_stage],
                             _as_idx_for(_compute_stage),
                             stages_bs_idx[_compute_stage],
+                            pf_all_ks=_tail_pf_all_ks if _use_tail_pf else None,
+                            pf_depth=_pf_ks_depth if _use_tail_pf else None,
                         )
                     else:
 
@@ -2996,6 +3614,8 @@ def compile_mxscale_gemm(
                             _as_idx_for(_compute_stage),
                             stages_bs_idx[_compute_stage],
                             emit_filler=_emit_epi_addrs,
+                            pf_all_ks=_tail_pf_all_ks if _use_tail_pf else None,
+                            pf_depth=_pf_ks_depth if _use_tail_pf else None,
                         )
                         if const_expr(stage1_dual_b):
                             accs_up = compute_tile_scheduled(
@@ -3088,14 +3708,52 @@ def compile_mxscale_gemm(
                             _tail_mid_cb = _tail_mid_nws
 
                     rocdl.sched_barrier(0)
-                    accs = compute_tile_scheduled(
-                        accs,
-                        stages_a_idx[_compute_stage],
-                        stages_b_idx[_compute_stage],
-                        _as_idx_for(_compute_stage),
-                        stages_bs_idx[_compute_stage],
-                        mid_compute_callback=_tail_mid_cb,
-                    )
+                    _use_tail_pf_nt = _use_lds_pf and _tail_pf_all_ks is not None
+                    if const_expr(_use_tail_pf_nt):
+                        # Find the NEXT active compute stage in the tail plan
+                        # for interleaved next-tile ds_loads.
+                        _tail_next_cs = None
+                        _tail_active_css = [cs for ls, cs, out in tail_plan]
+                        _apos = _tail_active_css.index(_compute_stage)
+                        if _apos + 1 < len(_tail_active_css):
+                            _tail_next_cs = _tail_active_css[_apos + 1]
+                        _has_tail_next = _tail_next_cs is not None
+                        if const_expr(_has_tail_next):
+                            accs, _tail_pf_all_ks = compute_tile_scheduled(
+                                accs,
+                                stages_a_idx[_compute_stage],
+                                stages_b_idx[_compute_stage],
+                                _as_idx_for(_compute_stage),
+                                stages_bs_idx[_compute_stage],
+                                mid_compute_callback=_tail_mid_cb,
+                                pf_all_ks=_tail_pf_all_ks,
+                                next_lds_a=stages_a_idx[_tail_next_cs],
+                                next_lds_b=stages_b_idx[_tail_next_cs],
+                                next_lds_bs=stages_bs_idx[_tail_next_cs],
+                                next_lds_as=stages_as_idx[_tail_next_cs],
+                                pf_depth=_pf_ks_depth,
+                            )
+                        else:
+                            accs = compute_tile_scheduled(
+                                accs,
+                                stages_a_idx[_compute_stage],
+                                stages_b_idx[_compute_stage],
+                                _as_idx_for(_compute_stage),
+                                stages_bs_idx[_compute_stage],
+                                mid_compute_callback=_tail_mid_cb,
+                                pf_all_ks=_tail_pf_all_ks,
+                                pf_depth=_pf_ks_depth,
+                            )
+                            _tail_pf_all_ks = None
+                    else:
+                        accs = compute_tile_scheduled(
+                            accs,
+                            stages_a_idx[_compute_stage],
+                            stages_b_idx[_compute_stage],
+                            _as_idx_for(_compute_stage),
+                            stages_bs_idx[_compute_stage],
+                            mid_compute_callback=_tail_mid_cb,
+                        )
                     if const_expr(stage1_dual_b):
                         hot_loop_scheduler_scheduled()
                         accs_up = compute_tile_scheduled(

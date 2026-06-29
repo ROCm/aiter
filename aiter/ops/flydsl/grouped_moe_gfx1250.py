@@ -477,7 +477,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     _grouped_dbg("imports done")
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    tile_m, tile_n, tile_k = 64, 256, 256
+    tile_m, tile_n, tile_k = 16, 256, 256
     m_warp, n_warp = 1, 4
     num_buffers = 2
     num_buffer_stage2 = None  # None -> fall back to num_buffers below
@@ -632,9 +632,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     else:
         raw_max_m = _as_int(cfg_row.get("max_m"), token_num) if cfg_row else token_num
     _grouped_dbg(f"routing cfg_row={cfg_row} raw_max_m={raw_max_m}")
-    max_m = max(
-        warp_tile_m, ((raw_max_m + warp_tile_m - 1) // warp_tile_m) * warp_tile_m
-    )
+    max_m = 16  # HACK: force max_m=16 for perf testing
     _grouped_dbg(f"routing max_m={max_m}")
 
     # Build route maps once. The fast path uses the FlyDSL atomic-scatter kernel;
@@ -809,6 +807,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         if data_format == "fp4"
         else compile_moe_grouped_gemm1_a8w4_masked
     )
+    _lds_pf_stage1_env = os.environ.get("AITER_GROUPED_LDS_PF_STAGE1")
+    _lds_pf_stage1 = (
+        _lds_pf_stage1_env == "1" if _lds_pf_stage1_env is not None else None
+    )
+    _pf_depth_ks_stage1_env = os.environ.get("AITER_PF_DEPTH_KS_STAGE1")
+    _pf_depth_ks_stage1 = (
+        int(_pf_depth_ks_stage1_env) if _pf_depth_ks_stage1_env is not None else None
+    )
     _grouped_dbg("start stage1 compile")
     stage1 = stage1_compiler(
         model_dim=model_dim,
@@ -835,6 +841,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             and wave_specialized_tdm_req
         ),
         tdm_as_in_prologue=tdm_as_in_prologue_req,
+        lds_prefetch=_lds_pf_stage1,
+        pf_depth_ks=_pf_depth_ks_stage1,
     )
     _grouped_dbg("stage1 compile done; start launch")
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
@@ -952,6 +960,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         if data_format == "fp4"
         else compile_moe_grouped_gemm2_a8w4_masked
     )
+    _lds_pf_stage2_env = os.environ.get("AITER_GROUPED_LDS_PF_STAGE2")
+    _lds_pf_stage2 = (
+        _lds_pf_stage2_env == "1" if _lds_pf_stage2_env is not None else None
+    )
+    _pf_depth_ks_stage2_env = os.environ.get("AITER_PF_DEPTH_KS_STAGE2")
+    _pf_depth_ks_stage2 = (
+        int(_pf_depth_ks_stage2_env) if _pf_depth_ks_stage2_env is not None else None
+    )
     _grouped_dbg("start stage2 compile")
     stage2 = stage2_compiler(
         model_dim=model_dim,
@@ -972,6 +988,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         persistent_workers=None,
         wave_specialized_tdm=((m_warp * n_warp) == 4 and wave_specialized_tdm_req),
         tdm_as_in_prologue=tdm_as_in_prologue_req,
+        lds_prefetch=_lds_pf_stage2,
+        pf_depth_ks=_pf_depth_ks_stage2,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None

@@ -67,6 +67,8 @@ class _GroupedA8W4Config:
     data_format: str = "a8w4"
     act: str = "silu"
     stage1_weight_layout: str = "gguu"
+    lds_prefetch: Optional[bool] = None
+    pf_depth_ks: Optional[int] = None
 
 
 def _validate_common(cfg: _GroupedA8W4Config) -> None:
@@ -782,6 +784,8 @@ def _compile_base_a8w4_gemm(
         stage1_weight_layout=stage1_weight_layout,
         epilogue_bias=epilogue_bias,
         kernel_tag=kernel_tag,
+        lds_prefetch=cfg.lds_prefetch,
+        pf_depth_ks=cfg.pf_depth_ks,
     )
 
 
@@ -815,6 +819,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
     act: str = "silu",
     stage1_weight_layout: str = "gguu",
     data_format: str = "a8w4",
+    lds_prefetch: bool | None = None,
+    pf_depth_ks: int | None = None,
 ):
     cfg = _GroupedA8W4Config(
         model_dim=int(model_dim),
@@ -844,6 +850,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
         data_format=str(data_format),
         act=str(act),
         stage1_weight_layout=str(stage1_weight_layout),
+        lds_prefetch=lds_prefetch,
+        pf_depth_ks=pf_depth_ks,
     )
     _validate_common(cfg)
     fused_n = cfg.inter_dim
@@ -1214,6 +1222,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
     grouped_contiguous_m: bool = False,
     persistent_workers: int | None = None,
     data_format: str = "a8w4",
+    lds_prefetch: bool | None = None,
+    pf_depth_ks: int | None = None,
 ):
     cfg = _GroupedA8W4Config(
         model_dim=int(model_dim),
@@ -1241,6 +1251,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
         grouped_contiguous_m=bool(grouped_contiguous_m),
         persistent_workers=persistent_workers,
         data_format=str(data_format),
+        lds_prefetch=lds_prefetch,
+        pf_depth_ks=pf_depth_ks,
     )
     _validate_common(cfg)
 
