@@ -157,118 +157,63 @@ def _qkv_split(qkv, cfg):
     )
 
 
-def kernel_block_prefill(
+def kernel_block(
     cfg: GptOssCfg,
     w: BlockWeights,
-    hidden: torch.Tensor,  # [B*S, hidden]
-    cu_seqlens: torch.Tensor,  # [B+1] int32
-    positions: torch.Tensor,  # [B*S] int32
-    max_seqlen: int,
-    sliding_window: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Full GPT-OSS attention block, prefill path (varlen)."""
-    hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
-    scale = hd**-0.5
-
-    qkv = F.linear(hidden, w.qkv_w, w.qkv_b)
-    q, k, v = _qkv_split(qkv, cfg)
-
-    # RoPE + (throwaway) cache write. Prefill attention reads k/v directly, but
-    # GPT-OSS still applies RoPE via the fused kernel and writes the cache.
-    total = hidden.shape[0]
-    block_size = 16
-    x = 16 // torch.empty(0, dtype=dtype).element_size()
-    num_blocks = (total + block_size - 1) // block_size + 1
-    k_cache = torch.zeros(num_blocks, nkv, hd // x, block_size, x, dtype=dtype)
-    v_cache = torch.zeros(num_blocks, nkv, hd, block_size, dtype=dtype)
-    slot_mapping = torch.arange(total, dtype=torch.int64)
-    q, k, _, _ = fused_qk_rope_reshape_and_cache(
-        q,
-        k,
-        v,
-        k_cache,
-        v_cache,
-        slot_mapping,
-        positions,
-        w.rotary_emb.cos_cache,
-        w.rotary_emb.sin_cache,
-        None,
-        None,
-        is_neox=w.rotary_emb.is_neox_style,
-        flash_layout=False,
-        apply_scale=False,
-        output_zeros=False,
-    )
-
-    window = (sliding_window, 0, 0) if sliding_window > 0 else (-1, -1, 0)
-    o = aiter.flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window,
-        sink_ptr=w.sinks,
-    )
-    o = o.view(total, nq * hd)
-    return F.linear(o, w.o_w, w.o_b)
-
-
-def kernel_block_decode(
-    cfg: GptOssCfg,
-    w: BlockWeights,
-    hidden_ctx: torch.Tensor,  # [B*L, hidden]  (full context per seq)
-    ctx_len: int,
+    hidden: torch.Tensor,  # [B*T, hidden]  (T = seq_len for prefill / ctx_len for decode)
+    positions: torch.Tensor,  # [B*T] int32
+    cu_seqlens: torch.Tensor,  # [B+1] int32 (used by prefill)
+    seq_len: int,
     batch: int,
     sliding_window: int,
-    kv_cache_dtype: torch.dtype,  # bf16 or fp8 (paged cache precision)
+    kv_cache_dtype: torch.dtype,  # paged cache precision (bf16 or fp8)
+    phase: str,  # "prefill" or "decode"
 ) -> torch.Tensor:
-    """Full GPT-OSS attention block, decode path (paged, query_len=1).
+    """Whole GPT-OSS attention block for either phase.
 
-    Activations stay bf16; only the paged KV cache may be fp8. With fp8 a single
-    per-tensor scale is used for K and V (ATOM's convention): the fused kernel
-    stores ``kv / scale`` as e4m3 and pa_decode_gluon recovers ``stored * scale``.
+    Shared: qkv_proj -> RoPE + paged KV-cache write (fused) -> attention -> o_proj.
+    Activations stay bf16; only the paged cache may be fp8 (decode), using one
+    shared per-tensor scale for K and V derived from PRE-RoPE max (ATOM's
+    convention): fused stores ``kv/scale`` as e4m3, pa_decode_gluon recovers it.
+      prefill: all tokens are queries; flash_attn_varlen reads K/V directly.
+      decode : query = last token per sequence; pa_decode_gluon reads the cache.
     """
     hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
     scale = hd**-0.5
     act_dtype = dtypes.bf16
     is_fp8 = kv_cache_dtype == dtypes.fp8
+    total = hidden.shape[0]
 
-    qkv = F.linear(hidden_ctx, w.qkv_w, w.qkv_b)
+    qkv = F.linear(hidden, w.qkv_w, w.qkv_b)
     q, k, v = _qkv_split(qkv, cfg)
 
+    # Paged KV cache: decode reads it, prefill writes-then-ignores (it reads K/V
+    # directly) but still applies RoPE through the same fused kernel.
     block_size = 16
     x = 16 // torch.empty(0, dtype=kv_cache_dtype).element_size()
-    blocks_per_seq = (ctx_len + block_size - 1) // block_size
+    blocks_per_seq = (seq_len + block_size - 1) // block_size
     num_blocks = batch * blocks_per_seq
     k_cache = torch.zeros(num_blocks, nkv, hd // x, block_size, x, dtype=kv_cache_dtype)
     v_cache = torch.zeros(num_blocks, nkv, hd, block_size, dtype=kv_cache_dtype)
-
     block_tables = torch.arange(num_blocks, dtype=torch.int32).view(
         batch, blocks_per_seq
     )
-    # positions and slot_mapping over the whole context of every sequence.
-    positions = torch.arange(ctx_len, dtype=torch.int32).repeat(batch)
-    seq_ids = torch.arange(batch, dtype=torch.int64).repeat_interleave(ctx_len)
-    in_seq = torch.arange(ctx_len, dtype=torch.int64).repeat(batch)
+    seq_ids = torch.arange(batch, dtype=torch.int64).repeat_interleave(seq_len)
+    in_seq = torch.arange(seq_len, dtype=torch.int64).repeat(batch)
     slot_mapping = block_tables[seq_ids, in_seq // block_size].to(
         torch.int64
     ) * block_size + (in_seq % block_size)
 
+    # Graph-safe scale: stay on device (no .item()/Python max -> no host sync).
+    kv_scale = None
     if is_fp8:
         kv_scale = (
-            max(k.abs().max(), v.abs().max()).float() / torch.finfo(dtypes.fp8).max
+            (torch.maximum(k.abs().max(), v.abs().max()) / torch.finfo(dtypes.fp8).max)
+            .reshape(1)
+            .float()
         )
-        kv_scale = torch.tensor([kv_scale.item()], dtype=torch.float32)
-    else:
-        kv_scale = None
 
-    q_roped, _, _, _ = fused_qk_rope_reshape_and_cache(
+    q, k, _, _ = fused_qk_rope_reshape_and_cache(
         q,
         k,
         v,
@@ -286,49 +231,60 @@ def kernel_block_decode(
         output_zeros=False,
     )
 
-    # decode query = last token of each sequence.
-    q_dec = q_roped.view(batch, ctx_len, nq, hd)[torch.arange(batch), -1].contiguous()
-    q_dec = q_dec.view(batch, nq, hd)
-
-    context_lens = torch.full((batch,), ctx_len, dtype=torch.int32)
-    num_seqs = batch
-    if sliding_window > 0:
-        max_part = 1
-        part_size = 128
+    if phase == "prefill":
+        window = (sliding_window, 0, 0) if sliding_window > 0 else (-1, -1, 0)
+        o = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=seq_len,
+            max_seqlen_k=seq_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window,
+            sink_ptr=w.sinks,
+        )
+        o = o.view(total, nq * hd)
     else:
-        max_part = get_recommended_splits(num_seqs, nkv)
-        part_size = 256
-    group = nq // nkv
-    inter = (num_seqs, nkv, max_part, group)
-    exp_sums = torch.empty(inter, dtype=torch.float32)
-    max_logits = torch.empty(inter, dtype=torch.float32)
-    tmp_out = torch.empty(*inter, hd, dtype=act_dtype)
+        q_dec = q.view(batch, seq_len, nq, hd)[:, -1].contiguous().view(batch, nq, hd)
+        context_lens = torch.full((batch,), seq_len, dtype=torch.int32)
+        if sliding_window > 0:
+            max_part, part_size = 1, 128
+        else:
+            max_part, part_size = get_recommended_splits(batch, nkv), 256
+        group = nq // nkv
+        inter = (batch, nkv, max_part, group)
+        exp_sums = torch.empty(inter, dtype=torch.float32)
+        max_logits = torch.empty(inter, dtype=torch.float32)
+        tmp_out = torch.empty(*inter, hd, dtype=act_dtype)
+        o = torch.empty(batch, nq, hd, dtype=act_dtype)
+        pa_decode_gluon(
+            o,
+            q_dec,
+            k_cache,
+            v_cache,
+            context_lens,
+            block_tables,
+            scale,
+            1,  # query_length
+            max_part,
+            part_size,
+            compute_type=kv_cache_dtype if is_fp8 else act_dtype,
+            query_scale=None,
+            key_scale=kv_scale,
+            value_scale=kv_scale,
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=tmp_out,
+            alibi_slopes=None,
+            sinks=w.sinks,
+            sliding_window=sliding_window,
+            ps=True,
+        )
+        o = o.view(batch, nq * hd)
 
-    o = torch.empty(batch, nq, hd, dtype=act_dtype)
-    pa_decode_gluon(
-        o,
-        q_dec,
-        k_cache,
-        v_cache,
-        context_lens,
-        block_tables,
-        scale,
-        1,  # query_length
-        max_part,
-        part_size,
-        compute_type=kv_cache_dtype if is_fp8 else act_dtype,
-        query_scale=None,
-        key_scale=kv_scale,
-        value_scale=kv_scale,
-        exp_sums=exp_sums,
-        max_logits=max_logits,
-        temporary_output=tmp_out,
-        alibi_slopes=None,
-        sinks=w.sinks,
-        sliding_window=sliding_window,
-        ps=True,
-    )
-    o = o.view(batch, nq * hd)
     return F.linear(o, w.o_w, w.o_b)
 
 
@@ -418,73 +374,48 @@ def ref_block(
 # --------------------------------------------------------------------------- #
 # Drivers                                                                     #
 # --------------------------------------------------------------------------- #
-def run_prefill(cfg, batch, seqlen, sliding_window, args):
-    # Prefill reads K/V directly in bf16; the KV-cache precision does not affect
-    # this path, so prefill always runs bf16.
-    dtype = dtypes.bf16
-    w = make_weights(cfg, dtype)
-    total = batch * seqlen
-    hidden = (torch.randn(total, cfg.hidden_size, dtype=torch.float32) * 0.1).to(dtype)
-    cu = torch.arange(0, (batch + 1) * seqlen, seqlen, dtype=torch.int32)
-    positions = torch.arange(seqlen, dtype=torch.int32).repeat(batch)
-
-    out, us = run_perftest(
-        kernel_block_prefill,
-        cfg,
-        w,
-        hidden,
-        cu,
-        positions,
-        seqlen,
-        sliding_window,
-        dtype,
-        num_iters=args.iters,
-        num_warmup=args.warmup,
-    )
-    ref = ref_block(cfg, w, hidden, cu, positions, sliding_window)
-    err = checkAllclose(
-        ref,
-        out,
-        rtol=args.rtol,
-        atol=args.atol,
-        msg=f"prefill b{batch} s{seqlen} win{sliding_window} {dtype}",
-    )
-    return us, err
-
-
-def run_decode(cfg, kv_cache_dtype, batch, ctx_len, sliding_window, args):
+def run_phase(
+    cfg, phase, kv_cache_dtype, batch, seq_len, sliding_window, hipgraph, args
+):
+    decode = phase == "decode"
+    # KV-cache precision only matters for decode; prefill reads K/V directly (bf16).
+    cache_dtype = kv_cache_dtype if decode else dtypes.bf16
     w = make_weights(cfg, dtypes.bf16)
-    total = batch * ctx_len
+    total = batch * seq_len
     hidden = (torch.randn(total, cfg.hidden_size, dtype=torch.float32) * 0.1).to(
         dtypes.bf16
     )
+    cu = torch.arange(0, (batch + 1) * seq_len, seq_len, dtype=torch.int32)
+    positions = torch.arange(seq_len, dtype=torch.int32).repeat(batch)
 
     out, us = run_perftest(
-        kernel_block_decode,
+        kernel_block,
         cfg,
         w,
         hidden,
-        ctx_len,
+        positions,
+        cu,
+        seq_len,
         batch,
         sliding_window,
-        kv_cache_dtype,
+        cache_dtype,
+        phase,
+        testGraph=hipgraph,
         num_iters=args.iters,
         num_warmup=args.warmup,
     )
-    cu = torch.arange(0, (batch + 1) * ctx_len, ctx_len, dtype=torch.int32)
-    positions = torch.arange(ctx_len, dtype=torch.int32).repeat(batch)
-    ref = ref_block(
-        cfg, w, hidden, cu, positions, sliding_window, kv_cache_dtype, decode=True
-    )
+    ref = ref_block(cfg, w, hidden, cu, positions, sliding_window, cache_dtype, decode)
     # fp8 e4m3 KV adds quantization noise; relax tolerance for that path.
-    rtol = args.rtol if kv_cache_dtype == dtypes.bf16 else max(args.rtol, 6e-2)
-    atol = args.atol if kv_cache_dtype == dtypes.bf16 else max(args.atol, 6e-2)
+    relax = decode and cache_dtype == dtypes.fp8
+    rtol = max(args.rtol, 6e-2) if relax else args.rtol
+    atol = max(args.atol, 6e-2) if relax else args.atol
     err = checkAllclose(
         ref,
         out,
         rtol=rtol,
         atol=atol,
-        msg=f"decode  b{batch} ctx{ctx_len} win{sliding_window} {kv_cache_dtype}",
+        msg=f"{phase[:7]:7} b{batch} t{seq_len} win{sliding_window} "
+        f"{cache_dtype} graph={hipgraph}",
     )
     return us, err
 
@@ -506,6 +437,12 @@ def main():
         help="override the even-layer window size",
     )
     p.add_argument("--kv-cache-dtype", default="bf16", choices=["bf16", "fp8"])
+    p.add_argument(
+        "--hipgraph",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="HIP-graph capture/replay; auto = off for prefill, on for decode",
+    )
     p.add_argument("--batch", type=int, nargs="+", default=[1, 2])
     p.add_argument(
         "--seqlen",
@@ -542,13 +479,14 @@ def main():
     rows = []
     fail = 0
     for phase in phases:
+        # auto: prefill off, decode on; otherwise honor the explicit flag.
+        hipgraph = {"on": True, "off": False}.get(args.hipgraph, phase == "decode")
         for sw in parities:
             sizes = args.seqlen if phase == "prefill" else args.ctx_len
             for batch, sz in itertools.product(args.batch, sizes):
-                if phase == "prefill":
-                    us, err = run_prefill(cfg, batch, sz, sw, args)
-                else:
-                    us, err = run_decode(cfg, kv_cache_dtype, batch, sz, sw, args)
+                us, err = run_phase(
+                    cfg, phase, kv_cache_dtype, batch, sz, sw, hipgraph, args
+                )
                 ok = err == 0 or (isinstance(err, float) and err < 0.02)
                 fail += 0 if ok else 1
                 rows.append(
@@ -557,6 +495,7 @@ def main():
                         "window": sw,
                         "batch": batch,
                         "size": sz,
+                        "graph": hipgraph,
                         "us": round(us, 2),
                         "err_ratio": err,
                         "pass": ok,
