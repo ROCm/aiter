@@ -2,39 +2,18 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Functional + perf test for the whole GPT-OSS attention block.
 
-This runs the complete attention block of OpenAI's GPT-OSS (mirroring ATOM's
-``GptOssForCausalLM`` / ``OAIAttention``), end to end:
+Runs OpenAI's GPT-OSS attention block end to end (mirrors ATOM's OAIAttention):
+qkv_proj -> RoPE(YaRN) + paged KV write -> attention (sinks + alternating sliding
+window + GQA) -> o_proj, checked against a torch reference via checkAllclose.
 
-    hidden_states
-        -> qkv_proj (Linear, bias)        # generic bf16 GEMM (torch F.linear)
-        -> split q, k, v
-        -> RoPE (YaRN) + write paged KV    # aiter fused_qk_rope_reshape_and_cache
-        -> attention                       # prefill: flash_attn_varlen_func
-                                           # decode : pa_decode_gluon
-           with per-head attention sinks + alternating sliding window + GQA
-        -> o_proj (Linear, bias)           # generic bf16 GEMM (torch F.linear)
+aiter kernels exercised (head_dim=64 forces the triton/gluon path):
+  * get_rope                       YaRN cos/sin cache
+  * fused_qk_rope_reshape_and_cache   RoPE + paged cache write (NHD)
+  * flash_attn_varlen_func(sink_ptr)  prefill
+  * pa_decode_gluon                   decode
 
-GPT-OSS attention specifics that drive the kernel selection:
-  * head_dim = 64  -> ATOM forces the triton/gluon path (head_dim != 128).
-  * GQA          : num_attention_heads / num_key_value_heads (e.g. 64 / 8).
-  * attention sinks : one learnable logit per query head, acting as a zero-value
-    virtual KV column (``denom += exp(sink_h - max)``).
-  * sliding window : applied on even-indexed layers (window=128), odd layers are
-    full causal. Selected here via --layer-parity / --sliding-window.
-  * RoPE         : YaRN scaled, neox style, theta=150000.
-
-aiter kernels exercised (same as ATOM's PagedAttentionImpl for GPT-OSS):
-  * aiter.rotary_embedding.get_rope               (YaRN cos/sin cache)
-  * aiter.ops.triton.fusions.fused_kv_cache
-        .fused_qk_rope_reshape_and_cache          (RoPE + paged cache write, NHD)
-  * aiter.flash_attn_varlen_func (sink_ptr=...)   (prefill)
-  * aiter.ops.triton.gluon.pa_decode_gluon        (decode)
-
-Style mirrors op_tests/test_pa_decode_bf16_asm.py / test_pa_ps.py: a torch host
-reference compared against the kernel block via aiter.test_common.checkAllclose
-(no pytest), driven by argparse over a config grid, with a perf summary.
-
-Validated environment: MI355X / gfx950, torch 2.10, aiter main.
+Sinks = one learnable per-head logit acting as a zero-value KV column
+(denom += exp(sink_h - max)). Validated on MI355X / gfx950.
 """
 
 import argparse
@@ -89,9 +68,7 @@ class GptOssCfg:
         }
 
 
-# gpt-oss-20b and gpt-oss-120b share the same attention shape (only the number of
-# layers / experts differ, which the attention block does not see). "small" keeps
-# the real attention dims but is cheap to run.
+# 20b/120b share the attention shape (only layers/experts differ); "small" is an alias.
 CONFIGS = {
     "small": GptOssCfg(
         "small", hidden_size=2880, num_attention_heads=64, num_key_value_heads=8
@@ -169,15 +146,11 @@ def kernel_block(
     kv_cache_dtype: torch.dtype,  # paged cache precision (bf16 or fp8)
     phase: str,  # "prefill" or "decode"
 ) -> torch.Tensor:
-    """Whole GPT-OSS attention block for either phase.
-
-    Shared: qkv_proj -> RoPE + paged KV-cache write (fused) -> attention -> o_proj.
-    Activations stay bf16; only the paged cache may be fp8 (decode), using one
-    shared per-tensor scale for K and V derived from PRE-RoPE max (ATOM's
-    convention): fused stores ``kv/scale`` as e4m3, pa_decode_gluon recovers it.
-      prefill: all tokens are queries; flash_attn_varlen reads K/V directly.
-      decode : query = last token per sequence; pa_decode_gluon reads the cache.
-    """
+    """Whole GPT-OSS attention block for either phase: qkv_proj -> RoPE + paged
+    KV write (fused) -> attention -> o_proj. Prefill: all tokens are queries,
+    flash_attn_varlen reads K/V directly. Decode: query = last token per seq,
+    pa_decode_gluon reads the cache. Activations bf16; only the decode cache may
+    be fp8 (one shared K/V scale from PRE-RoPE max -> fused stores kv/scale)."""
     hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
     scale = hd**-0.5
     act_dtype = dtypes.bf16
@@ -187,8 +160,7 @@ def kernel_block(
     qkv = F.linear(hidden, w.qkv_w, w.qkv_b)
     q, k, v = _qkv_split(qkv, cfg)
 
-    # Paged KV cache: decode reads it, prefill writes-then-ignores (it reads K/V
-    # directly) but still applies RoPE through the same fused kernel.
+    # Paged KV cache: decode reads it; prefill writes-then-ignores it.
     block_size = 16
     x = 16 // torch.empty(0, dtype=kv_cache_dtype).element_size()
     blocks_per_seq = (seq_len + block_size - 1) // block_size
@@ -204,7 +176,7 @@ def kernel_block(
         torch.int64
     ) * block_size + (in_seq % block_size)
 
-    # Graph-safe scale: stay on device (no .item()/Python max -> no host sync).
+    # Graph-safe scale: keep on device (no .item()/Python max -> no host sync).
     kv_scale = None
     if is_fp8:
         kv_scale = (
