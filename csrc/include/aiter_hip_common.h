@@ -142,6 +142,13 @@ struct AiterAsmKernelArgs
     int bdy;
     int bdz;
     const hipStream_t stream;
+    // Optional workgroup-cluster dims (gfx1250+). Default 1x1x1 = clusters off
+    // (plain hipModuleLaunchKernel). Any dim > 1 launches via hipDrvLaunchKernelEx
+    // with a hipLaunchAttributeClusterDimension attribute; each cluster dim must
+    // evenly divide the corresponding grid dim.
+    int cluster_x = 1;
+    int cluster_y = 1;
+    int cluster_z = 1;
 };
 
 static const std::string get_gpu_arch();
@@ -230,6 +237,34 @@ class AiterAsmKernelFast
         // TODO Ask runtime folks to provide an API for hipLaunchKernel with extra arg
         // Don't error check here — registration is validated once in init().
         (void)hipGetFuncBySymbol(&kernel_func, reinterpret_cast<void*>(this));
+
+        if(kargs.cluster_x > 1 || kargs.cluster_y > 1 || kargs.cluster_z > 1)
+        {
+            // Cluster launch: blocks are grouped into clusters of the given dims.
+            // Each cluster dim must evenly divide the matching grid dim (enforced
+            // by the caller). Requires gfx1250+ and a cluster-aware kernel.
+            hipLaunchAttribute attrs[1];
+            attrs[0].id              = hipLaunchAttributeClusterDimension;
+            attrs[0].val.clusterDim.x = static_cast<unsigned int>(kargs.cluster_x);
+            attrs[0].val.clusterDim.y = static_cast<unsigned int>(kargs.cluster_y);
+            attrs[0].val.clusterDim.z = static_cast<unsigned int>(kargs.cluster_z);
+
+            HIP_LAUNCH_CONFIG launch_config{};
+            launch_config.gridDimX      = static_cast<unsigned int>(kargs.gdx);
+            launch_config.gridDimY      = static_cast<unsigned int>(kargs.gdy);
+            launch_config.gridDimZ      = static_cast<unsigned int>(kargs.gdz);
+            launch_config.blockDimX     = static_cast<unsigned int>(kargs.bdx);
+            launch_config.blockDimY     = static_cast<unsigned int>(kargs.bdy);
+            launch_config.blockDimZ     = static_cast<unsigned int>(kargs.bdz);
+            launch_config.sharedMemBytes = 0;
+            launch_config.hStream       = kargs.stream;
+            launch_config.attrs         = attrs;
+            launch_config.numAttrs      = 1;
+
+            HIP_CALL_LAUNCH(
+                hipDrvLaunchKernelEx(&launch_config, kernel_func, nullptr, (void**)&config));
+            return;
+        }
 
         HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,
                                        kargs.gdx,

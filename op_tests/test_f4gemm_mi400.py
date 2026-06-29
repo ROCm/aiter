@@ -107,12 +107,17 @@ def _str2tuple(s: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test gfx1250 F4GEMM (MXFP4 / NVFP4) ASM kernels")
-    parser.add_argument("--intype", choices=["mxfp4", "nvfp4", "both"], default="both")
+    # Only NVFP4 kernels are currently registered (see f4gemm_mi400.csv);
+    # mxfp4/both will find no kernel until an MXFP4 .co is added.
+    parser.add_argument("--intype", choices=["mxfp4", "nvfp4", "both"], default="nvfp4")
     parser.add_argument("--apre", type=int, choices=[0, 1], default=1,
                         help="A-preshuffle: 1 to preshuffle A, 0 to send row-major")
+    # Defaults are cluster(4x4)+persistent friendly: M %(tile_m*4)==0 and
+    # N %(tile_n*4)==0 for every tile in the CSV (min tile 64x256 -> M%256,
+    # N%1024). 1024x2048 and 2048x4096 satisfy all tiles up to 256x512.
     parser.add_argument("-s", "--shape", type=_str2tuple, nargs="*",
-                        default=[(256, 256, 256), (512, 512, 512)],
-                        help="(M,N,K) tuples, e.g. -s 256,256,256 512,512,512")
+                        default=[(1024, 2048, 2048), (2048, 4096, 4096)],
+                        help="(M,N,K) tuples, e.g. -s 1024,2048,2048 2048,4096,4096")
     parser.add_argument("--kernel", type=str, default="",
                         help="Force a specific kernelName (bypass heuristic)")
     args = parser.parse_args()

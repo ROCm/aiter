@@ -57,7 +57,7 @@ skipped=0
 failed=0
 
 # Skip CSV header line
-tail -n +2 "${CSV}" | while IFS=, read -r tile_m tile_n intype apre knl_name co_name; do
+tail -n +2 "${CSV}" | while IFS=, read -r tile_m tile_n intype apre cluster_x cluster_y knl_name co_name; do
     [ -z "${tile_m}" ] && continue
     iname=$(intype_name "${intype}")
     s_basename="f4gemm_${iname}_${tile_m}x${tile_n}_apre${apre}"

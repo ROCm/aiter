@@ -6,16 +6,24 @@
 //   - mxfp4_gemm_asm: D[M,N] bf16 = A[M,K/2] mxfp4 * B[N,K/2] mxfp4 (e8m0 scales)
 //   - nvfp4_gemm_asm: D[M,N] bf16 = A[M,K/2] nvfp4 * B[N,K/2] nvfp4 (e4m3 scales + GlobalScale)
 //
-// KernelArgs layout matches `args_preload` in poc_kl/mi400/f4gemm/f4gemm.cpp.
-// MXFP4 packs 72B (drops trailing GlobalScaleA/B); NVFP4 packs 80B.
+// KernelArgs uses the ROCm kernarg-preload layout (sgpr_mode==1) and must match
+// `args_preload` in poc_kl/mi400/f4gemm/f4gemm.cpp:546-564 exactly: pointers
+// first (dw 0..9, MEM-first), then 4B-tight scalars. Bytes shipped to HW:
+//   MXFP4: 80B (struct minus the 2 trailing persistent log2 dwords)
+//   NVFP4: 88B (full struct incl. GlobalScaleA/B + trailing log2)
 //
-// First version: cluster launch is disabled; only single-CU launches via
-// hipModuleLaunchKernel. CSV variants encoding cluster shapes are not exposed
-// here yet.
+// Launch is cluster- and persistent-aware (mirrors poc_kl f4gemm.cpp):
+//   - cluster_x/cluster_y are compile-time per .co and read from the CSV; a
+//     dim > 1 launches via hipDrvLaunchKernelEx with a cluster-dim attribute.
+//   - persistent dispatch is hardcoded on (persistent_tg=256, grid_y=4; both
+//     runtime-only knobs that don't affect the .co). The host ships
+//     log2(gridX)/log2(gridY) so the persistent shader can walk the cluster
+//     grid. NVFP4 carries them at dw20/21, MXFP4 reuses dw18/19.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_f4gemm_mi400_configs.hpp"
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <hip/hip_runtime.h>
 
@@ -24,36 +32,30 @@ constexpr int F4_INTYPE_NVFP4 = 8;
 constexpr int MXFP4_SCALE_BLOCK = 32;
 constexpr int NVFP4_SCALE_BLOCK = 16;
 
-// Legacy-mode KernelArgs (16B-per-arg, 368B total). Field order must match
-// poc_kl/mi400/f4gemm/f4gemm.cpp:387-411 exactly.
-struct _p3 { unsigned int _p0, _p1, _p2; };
-struct _p2 { unsigned int _p0, _p1; };
+// Preload-mode KernelArgs (4B-tight, MEM-first). Offsets in comments are the
+// kernarg byte offsets the preload-aware shader s_load's from.
 struct __attribute__((packed)) KernelArgs
 {
-    void* ptr_D;                  _p2 _pad0;      // arg 0
-    void* ptr_C;                  _p2 _pad1;      // arg 1
-    void* ptr_A;                  _p2 _pad2;      // arg 2
-    void* ptr_B;                  _p2 _pad3;      // arg 3
-    unsigned int strideD0;        _p3 _pad4;      // arg 4
-    unsigned int strideD1;        _p3 _pad5;      // arg 5
-    unsigned int strideC0;        _p3 _pad6;      // arg 6
-    unsigned int strideC1;        _p3 _pad7;      // arg 7
-    unsigned int strideA0;        _p3 _pad8;      // arg 8
-    unsigned int strideA1;        _p3 _pad9;      // arg 9
-    unsigned int strideB0;        _p3 _pad10;     // arg 10
-    unsigned int strideB1;        _p3 _pad11;     // arg 11
-    unsigned int M;               _p3 _pad12;     // arg 12
-    unsigned int N;               _p3 _pad13;     // arg 13
-    unsigned int K;               _p3 _pad14;     // arg 14
-    void* ptr_ScaleA;             _p2 _pad15;     // arg 15
-    void* ptr_ScaleB;             _p2 _pad16;     // arg 16
-    unsigned int ScaleA_stride0;  _p3 _pad17;     // arg 17
-    unsigned int ScaleA_stride1;  _p3 _pad18;     // arg 18
-    unsigned int ScaleB_stride0;  _p3 _pad19;     // arg 19
-    unsigned int ScaleB_stride1;  _p3 _pad20;     // arg 20
-    float GlobalScaleA;           _p3 _pad21;     // arg 21
-    float GlobalScaleB;           _p3 _pad22;     // arg 22
+    void*        ptr_D;            // dw 0..1   (off 0x00)
+    void*        ptr_A;           // dw 2..3   (off 0x08)
+    void*        ptr_B;           // dw 4..5   (off 0x10)
+    void*        ptr_ScaleA;       // dw 6..7   (off 0x18)
+    void*        ptr_ScaleB;       // dw 8..9   (off 0x20)
+    unsigned int strideD0;         // dw 10     (off 0x28)
+    unsigned int strideA0;         // dw 11     (off 0x2C)
+    unsigned int strideB0;        // dw 12     (off 0x30)
+    unsigned int ScaleA_stride0;   // dw 13     (off 0x34)
+    unsigned int ScaleB_stride0;  // dw 14     (off 0x38)
+    unsigned int M;                // dw 15     (off 0x3C)
+    unsigned int N;                // dw 16     (off 0x40)
+    unsigned int K;                // dw 17     (off 0x44)
+    float        GlobalScaleA;     // dw 18     (off 0x48) NVFP4 only
+    float        GlobalScaleB;     // dw 19     (off 0x4C) NVFP4 only
+    unsigned int log2_grid_x;      // dw 20     persistent only (unused -> 0)
+    unsigned int log2_grid_y;      // dw 21     persistent only (unused -> 0)
 };
+// 5 ptrs (40B) + 8 scalars (32B) + GlobalScaleA/B (8B) + 2 log2 (8B) = 88B.
+static_assert(sizeof(KernelArgs) == 88, "f4gemm_mi400 preload KernelArgs must be 88B");
 
 static std::tuple<std::string, int> get_heuristic_kernel(
     int M, int N, int K, std::string arch_id, int intype, int a_preshuffle, CFG* cfgs)
@@ -76,11 +78,21 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         const auto& cfg = el.second;
         if(cfg.intype != intype || cfg.a_preshuffle != a_preshuffle)
             continue;
-        if((N % cfg.tile_n) != 0)
+        // Persistent/cluster shaders don't mask partial tiles, so the problem
+        // must tile both dims exactly.
+        if((N % cfg.tile_n) != 0 || (M % cfg.tile_m) != 0)
             continue;
 
-        int tg_num_M         = (M + cfg.tile_m - 1) / cfg.tile_m;
-        int tg_num_N         = (N + cfg.tile_n - 1) / cfg.tile_n;
+        int tg_num_M         = (M + cfg.tile_m - 1) / cfg.tile_m;  // tiles in M (gdy)
+        int tg_num_N         = (N + cfg.tile_n - 1) / cfg.tile_n;  // tiles in N (gdx)
+
+        // Cluster dims (compile-time per .co, declared in the CSV) must evenly
+        // divide the tile grid; otherwise this variant can't run this shape.
+        int cl_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
+        int cl_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
+        if((cl_x > 1 && (tg_num_N % cl_x) != 0) || (cl_y > 1 && (tg_num_M % cl_y) != 0))
+            continue;
+
         tg_num               = tg_num_M * tg_num_N;
         uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
 
@@ -117,8 +129,9 @@ static std::tuple<std::string, int> get_heuristic_kernel(
     return std::make_tuple(selectedKernelName, 1);
 }
 
-// Shared dispatch body. NVFP4 path passes real GlobalScale floats; MXFP4 passes
-// 0.0f and a smaller arg_size that drops the trailing float pair.
+// Shared dispatch body. NVFP4 ships the full preload struct (88B) with real
+// GlobalScale floats; MXFP4 leaves GlobalScale unset and ships 80B (dropping
+// the trailing persistent log2 dword pair).
 static void f4gemm_mi400_launch(aiter_tensor_t* A,
                                 aiter_tensor_t* B,
                                 aiter_tensor_t* ScaleA,
@@ -160,26 +173,32 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
     unsigned int stride_sa = static_cast<unsigned int>(Kdim / scale_block);
     unsigned int stride_sb = static_cast<unsigned int>(Kdim / scale_block);
 
-    KernelArgs args{};
+    KernelArgs args{};                       // zero-init; log2_grid_x/y set below if persistent
     args.ptr_D           = out->ptr;
-    args.ptr_C           = out->ptr;
     args.ptr_A           = A->ptr;
     args.ptr_B           = B->ptr;
+    args.ptr_ScaleA      = ScaleA->ptr;
+    args.ptr_ScaleB      = ScaleB->ptr;
     args.strideD0        = stride_d;
-    args.strideC0        = stride_d;
     args.strideA0        = stride_a;
     args.strideB0        = stride_b;
+    args.ScaleA_stride0  = stride_sa;
+    args.ScaleB_stride0  = stride_sb;
     args.M               = Mdim;
     args.N               = Ndim;
     args.K               = Kdim;
-    args.ptr_ScaleA      = ScaleA->ptr;
-    args.ptr_ScaleB      = ScaleB->ptr;
-    args.ScaleA_stride0  = stride_sa;
-    args.ScaleB_stride0  = stride_sb;
-    args.GlobalScaleA    = GlobalScaleA;
-    args.GlobalScaleB    = GlobalScaleB;
+    if(intype == F4_INTYPE_NVFP4)
+    {
+        args.GlobalScaleA = GlobalScaleA;
+        args.GlobalScaleB = GlobalScaleB;
+    }
 
-    size_t arg_size = sizeof(KernelArgs);  // always 368B
+    // Bytes shipped to HW (matches f4gemm.cpp preload path):
+    //   NVFP4: full struct (5 ptrs + 8 scalars + GlobalScaleA/B + 2 log2) = 88B
+    //   MXFP4: drop the 2 trailing persistent log2 dwords                 = 80B
+    size_t arg_size = (intype == F4_INTYPE_NVFP4)
+                          ? sizeof(KernelArgs)
+                          : (sizeof(KernelArgs) - 2 * sizeof(unsigned int));
 
     const HipDeviceGuard device_guard(A->device_id);
 
@@ -231,12 +250,90 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
         cfg.knl_name, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
-    int gdx = (Ndim + cfg.tile_n - 1) / cfg.tile_n;
-    int gdy = (Mdim + cfg.tile_m - 1) / cfg.tile_m;
-    int gdz = 1;
-    int bdx = 128; // 4 wave * 32 thread on gfx1250
+    // ----- Launch geometry: cluster + persistent (mirrors poc_kl f4gemm.cpp) -----
+    const int SUBM      = cfg.tile_m;
+    const int SUBN      = cfg.tile_n;
+    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;  // compile-time per .co (CSV)
+    const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
-    impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, stream});
+    // Persistent dispatch is hardcoded on: all f4gemm_mi400 .co are persistent
+    // shaders. persistent_tg / grid_y are runtime-only knobs (don't affect the
+    // .co), so they're fixed here at the poc_kl defaults; gridX is derived.
+    constexpr int PERSISTENT    = 1;
+    constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
+    constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
+
+    const int tiles_x = Ndim / SUBN;   // N-direction output tiles (exact: see heuristic)
+    const int tiles_y = Mdim / SUBM;   // M-direction output tiles (exact: see heuristic)
+
+    // Cluster dims must evenly tile the work grid (cluster is compile-time per .co).
+    if(cluster_x > 1 || cluster_y > 1)
+    {
+        AITER_CHECK(tiles_x >= cluster_x && (tiles_x % cluster_x) == 0,
+                    __func__, " cluster_x=", cluster_x, " requires N tiles (", tiles_x,
+                    ") to be a multiple of it; N=", Ndim, " must be a multiple of ",
+                    SUBN * cluster_x);
+        AITER_CHECK(tiles_y >= cluster_y && (tiles_y % cluster_y) == 0,
+                    __func__, " cluster_y=", cluster_y, " requires M tiles (", tiles_y,
+                    ") to be a multiple of it; M=", Mdim, " must be a multiple of ",
+                    SUBM * cluster_y);
+    }
+
+    int          gdx         = tiles_x;
+    int          gdy         = tiles_y;
+    int          gdz         = 1;
+    unsigned int log2_grid_x = 0;
+    unsigned int log2_grid_y = 0;
+
+    if(PERSISTENT)
+    {
+        AITER_CHECK((PERSISTENT_TG % (cluster_x * cluster_y)) == 0,
+                    __func__, " persistent_tg=", PERSISTENT_TG,
+                    " not divisible by cluster_x*cluster_y=", cluster_x * cluster_y);
+        const int clusters = PERSISTENT_TG / (cluster_x * cluster_y);
+        AITER_CHECK(PERSISTENT_GY != 0 && (clusters % PERSISTENT_GY) == 0,
+                    __func__, " grid_y=", PERSISTENT_GY,
+                    " must be a nonzero divisor of cluster count ", clusters);
+        const int gridY = PERSISTENT_GY;
+        const int gridX = clusters / gridY;
+        // grid_flat advance = 1 << (log2_grid_x + log2_grid_y) must equal the
+        // cluster count, so cluster count and both grid dims must be power-of-two.
+        AITER_CHECK((clusters & (clusters - 1)) == 0,
+                    __func__, " persistent cluster count ", clusters, " must be power-of-two");
+        AITER_CHECK((gridX & (gridX - 1)) == 0 && (gridY & (gridY - 1)) == 0,
+                    __func__, " persistent gridX=", gridX, " gridY=", gridY,
+                    " must each be power-of-two");
+
+        // HIP gridDim must be a multiple of clusterDim per axis: the cluster grid
+        // scaled by the cluster dims.
+        gdx = gridX * cluster_x;
+        gdy = gridY * cluster_y;
+        gdz = 1;
+
+        for(int g = gridX; g > 1; g >>= 1)
+            log2_grid_x++;
+        for(int g = gridY; g > 1; g >>= 1)
+            log2_grid_y++;
+
+        // Persistent shader reads log2(gridX)/log2(gridY). NVFP4 ships them at
+        // dw20/21; MXFP4 has no GlobalScale so the shader reads them from the
+        // GlobalScale slots (dw18/19) -- matches f4gemm.cpp:621-635.
+        if(intype == F4_INTYPE_NVFP4)
+        {
+            args.log2_grid_x = log2_grid_x;
+            args.log2_grid_y = log2_grid_y;
+        }
+        else
+        {
+            std::memcpy(&args.GlobalScaleA, &log2_grid_x, sizeof(unsigned int));
+            std::memcpy(&args.GlobalScaleB, &log2_grid_y, sizeof(unsigned int));
+        }
+    }
+
+    const int bdx = 128; // 4 wave * 32 thread on gfx1250
+
+    impl_ptr->launch_kernel(
+        {&args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, stream, cluster_x, cluster_y, 1});
 }
 
 AITER_CTYPES_ERROR_DEF
