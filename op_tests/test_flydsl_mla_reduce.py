@@ -12,6 +12,7 @@ from aiter.ops.flydsl.kernels.mla_reduce import (
     compile_mla_reduce,
     select_tier,
     waves_per_eu_from_env,
+    should_use_persistent_launch,
 )
 from aiter.test_common import run_perftest
 
@@ -141,18 +142,24 @@ def hip_ref(po, pl, indptr, fmap, pmap, num_tiles, H, Dv, out_dtype, M=1):
 def make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, output_lse, M=1):
     """Precompile + bind args; return a zero-overhead closure for the timed loop."""
     num_tiles = fmap.shape[0]
-    max_splits = torch.cuda.get_device_properties(0).multi_processor_count
+    num_cu = torch.cuda.get_device_properties(0).multi_processor_count
     splits = int(indptr[1].item() - indptr[0].item())  # CSR row-0 width
     tier = select_tier(splits)
+    use_persistent = should_use_persistent_launch(
+        H=H,
+        max_seqlen_q=M,
+        num_reduce_tile=num_tiles,
+        num_cu=num_cu,
+    )
     kernel = compile_mla_reduce(
         H=H, Dv=Dv, out_dtype=out_dtype_str, tier=tier,
-        persistent=False, output_lse=output_lse, use_reduce_final_map=True,
+        persistent=use_persistent, output_lse=output_lse, use_reduce_final_map=True,
         waves_per_eu=waves_per_eu_from_env(),
     )
     head = (
         po, pl, indptr, pmap, fmap, fout, flse,
         int(fout.stride(0)), int(fout.stride(1)),
-        int(max_splits), int(num_tiles), int(M),
+        int(num_cu), int(num_tiles), int(M),
     )
 
     def run():

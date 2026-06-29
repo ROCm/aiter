@@ -25,6 +25,7 @@ from .kernels.mla_reduce import (
     compile_mla_reduce,
     select_tier,
     waves_per_eu_from_env,
+    should_use_persistent_launch,
 )
 
 __all__ = [
@@ -92,12 +93,19 @@ def flydsl_mla_reduce_v1(
     # carry a q-dimension (decode_qlen > 1), so derive it from indptr directly.
     num_splits = int(reduce_indptr[1].item() - reduce_indptr[0].item())
     tier = select_tier(num_splits)
+    use_persistent = should_use_persistent_launch(
+        H=H,
+        max_seqlen_q=max_seqlen_q,
+        num_reduce_tile=num_reduce_tile,
+        num_cu=num_cu,
+    )
 
     kernel = compile_mla_reduce(
         H=H,
         Dv=Dv,
         out_dtype=out_dtype_str,
         tier=tier,
+        persistent=use_persistent,
         output_lse=output_lse,
         use_reduce_final_map=use_reduce_final_map,
         waves_per_eu=waves_per_eu_from_env(),
