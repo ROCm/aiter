@@ -144,12 +144,12 @@ def compile_chunk_gated_delta_h_kv_naive(
     # =False reaches 4 waves/SIMD (VGPR 136->128, LDS 44->35KB) but is ~20%
     # SLOWER (578us vs 480us) because u reverts to 16 scalar buffer_load_ushort
     # -- higher occupancy does NOT compensate the extra VMEM traffic. Keep True.
-    USE_LDS_U = False
+    USE_LDS_U = True
 
     # EXPERIMENT toggle: v_new output store. True = stage to lds_vn [BT,V] then
     # coalesced b128 read-out (independent buffer, ~8.5KB, keeps 3 waves);
     # False = original 16 scalar buffer_store_short straight to HBM.
-    USE_LDS_VN_STORE = False
+    USE_LDS_VN_STORE = True
 
     # EXPERIMENT toggle (OPT-C(g), rev219+): stage the chunk's 64 per-row g into
     # lds_g (one coalesced load/thread, +256 B LDS) and read g from LDS in
@@ -159,7 +159,23 @@ def compile_chunk_gated_delta_h_kv_naive(
     # vmcnt(16) drain is fully hidden by 3-wave overlap, so it is not the
     # binding wait -- but ON cuts buffer_load 41->21 / removes the redundant HBM
     # g traffic, so kept True as the cleaner / lower-traffic default.
-    USE_LDS_G = False
+    USE_LDS_G = True
+
+    # EXPERIMENT toggle (w-prefetch-interleave, rev224): cross-chunk w register
+    # prefetch carried via the scf.for iter_args, with the NEXT chunk's w
+    # vec_loads issued INTERLEAVED into the GEMM2 MFMA loop (HBM latency hidden
+    # behind the MFMA chain, mirroring baseline chunk_gated_delta_h.py OPT-W).
+    # False = rev223 naive path (w loaded fresh into lds_w at the top of each
+    # chunk). Defined here (outer scope) so the smem sym_name can key on it.
+    W_PF_INTERLEAVE = True
+
+    # EXPERIMENT toggle (k-prefetch-interleave, rev225): same as W_PF_INTERLEAVE
+    # but for k -- carry t+1's k in registers (issued interleaved in GEMM2) and
+    # store to lds_k at the next chunk's step-3 (data from registers, no fresh
+    # HBM load). Requires W_PF_INTERLEAVE (shares GEMM2 interleave + iter_arg
+    # ordering: state = [h_accs] + [w_pf] + [k_pf]). Goal: take k off the
+    # per-chunk synchronous vmcnt drain (the binding wait once w is prefetched).
+    K_PF_INTERLEAVE = True
 
     # -- LDS layout (no lds_h: KV h-store goes reg -> HBM directly) --
     # lds_w / lds_k row pads break LDS bank conflicts. K (=128 bf16 = 256 B) is
@@ -260,13 +276,13 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_G_ELEMS = BT
     LDS_G_BYTES = LDS_G_ELEMS * 4
 
-    _K5_KERNEL_REVISION = 222  # B1 conditional: skip top-of-chunk barrier in ht-independent mode (redundant)
+    _K5_KERNEL_REVISION = 226  # w+k prefetch + lds_ht INDEPENDENT (decouple h-snapshot from lds_k, drop B1)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}ht{int(LDS_HT_INDEPENDENT)}_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}ht{int(LDS_HT_INDEPENDENT)}wpf{int(W_PF_INTERLEAVE)}kpf{int(K_PF_INTERLEAVE)}_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
@@ -472,15 +488,91 @@ def compile_chunk_gated_delta_h_kv_naive(
         NUM_W_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
         NUM_K_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
 
+        # EXPERIMENT (w-prefetch-interleave, rev224): hoist the cooperative w HBM
+        # load out of step-2 into a cross-chunk register prefetch carried via the
+        # scf.for init=/yield iter_args, AND issue the NEXT chunk's w vec_loads
+        # INTERLEAVED into the GEMM2 MFMA loop so each buffer_load's HBM latency
+        # is hidden behind the MFMA dependency chain (mirrors baseline
+        # chunk_gated_delta_h.py OPT-W; the prior phase1 carried w but issued the
+        # load AFTER GEMM2 -- no MFMA overlap -- which did not move VMEM-wait).
+        # step-2 then only STORES the already-in-register w to lds_w.
+        # When False: step-2 loads w fresh each chunk (the rev223 naive path).
+        # (W_PF_INTERLEAVE is defined at outer scope so sym_name can key on it.)
+
+        def _w_load_off(it_i32, kb, batch):
+            row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+            abs_row = it_i32 * fx.Int32(BT) + row
+            safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+            return w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
+
+        def _w_lds_off(kb, batch):
+            row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+            col = fx.Int32(kb * 64) + load_col_base
+            return row * fx.Int32(LDS_W_STRIDE) + col
+
+        # k-load params hoisted out of step-3 so the prologue + k prefetch helpers
+        # can reuse them (k is pre-transposed [B,Hg,K,T_flat], token innermost).
+        K_TOK_THREADS = BT // LOAD_VEC_WIDTH               # 8
+        K_ROWS_PER_BATCH = BLOCK_THREADS // K_TOK_THREADS  # 32
+        K_LOAD_BATCHES = K // K_ROWS_PER_BATCH             # 4
+        k_load_krow = tid // fx.Int32(K_TOK_THREADS)
+        k_load_tokbase = (tid % fx.Int32(K_TOK_THREADS)) * fx.Int32(LOAD_VEC_WIDTH)
+
+        def _k_load_off(it_i32, batch):
+            k_row = fx.Int32(batch * K_ROWS_PER_BATCH) + k_load_krow
+            abs_tok = it_i32 * fx.Int32(BT) + k_load_tokbase
+            in_b = abs_tok < T_local
+            k_off = k_base + k_row * T_flat + abs_tok
+            return in_b.select(k_off, k_base)
+
+        def _k_lds_off(batch):
+            k_row = fx.Int32(batch * K_ROWS_PER_BATCH) + k_load_krow
+            return k_row * fx.Int32(LDS_K_STRIDE) + k_load_tokbase
+
         c_zero = fx.Index(0)
         c_one = fx.Index(1)
         nt_idx = fx.Index(NT)
 
         # h_accs is the SSM recurrence state -- carried across chunks via yield.
+        # w_pf (W_PF_INTERLEAVE) = chunk-0's w prefetched into registers; also
+        # carried via the iter_args so each chunk consumes the prefetch issued by
+        # the previous chunk's GEMM2.
         init_state = [_to_raw(v) for v in h_accs]
+        if const_expr(W_PF_INTERLEAVE):
+            w_pf_init = []
+            for kb in range_constexpr(NUM_K_BLOCKS):
+                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                    w_pf_init.append(
+                        w_.vec_load(
+                            (fx.Index(_w_load_off(fx.Int32(0), kb, batch)),),
+                            LOAD_VEC_WIDTH,
+                        )
+                    )
+            init_state = init_state + [_to_raw(v) for v in w_pf_init]
+            # k prefetch (K_PF_INTERLEAVE requires W_PF_INTERLEAVE): chunk-0's k
+            # into registers, carried after the w_pf block in the iter_args.
+            if const_expr(K_PF_INTERLEAVE):
+                k_pf_init = []
+                for batch in range_constexpr(K_LOAD_BATCHES):
+                    k_pf_init.append(
+                        k_.vec_load(
+                            (fx.Index(_k_load_off(fx.Int32(0), batch)),), LOAD_VEC_WIDTH
+                        )
+                    )
+                init_state = init_state + [_to_raw(v) for v in k_pf_init]
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
             h_accs_in = list(state[:NUM_H_ACCS])
+            if const_expr(W_PF_INTERLEAVE):
+                w_pf = list(state[NUM_H_ACCS:NUM_H_ACCS + NUM_W_LOADS])
+                if const_expr(K_PF_INTERLEAVE):
+                    k_pf = list(
+                        state[
+                            NUM_H_ACCS + NUM_W_LOADS : NUM_H_ACCS
+                            + NUM_W_LOADS
+                            + K_LOAD_BATCHES
+                        ]
+                    )
             i_t_i32 = fx.Int32(i_t)
 
             # ============================================================
@@ -545,21 +637,32 @@ def compile_chunk_gated_delta_h_kv_naive(
             # ============================================================
             # 2. Load w -> lds_w (NO prefetch; load now, use after barrier)
             # ============================================================
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                    abs_row = i_t_i32 * fx.Int32(BT) + row
-                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    w_g_off = (
-                        w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
-                    )
-                    w_vec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
-                    col = fx.Int32(kb * 64) + load_col_base
-                    # Pad-based bank-conflict avoidance (no XOR swizzle): the
-                    # column is the plain logical column; the row pad in
-                    # LDS_W_STRIDE offsets the banks. GEMM1 read mirrors this.
-                    w_lds_off = row * fx.Int32(LDS_W_STRIDE) + col
-                    lds_w.vec_store((fx.Index(w_lds_off),), w_vec, LOAD_VEC_WIDTH)
+            # Pad-based bank-conflict avoidance (no XOR swizzle): the column is the
+            # plain logical column; the row pad in LDS_W_STRIDE offsets the banks.
+            # GEMM1 read mirrors this.
+            if const_expr(W_PF_INTERLEAVE):
+                # w already in registers (prefetched in prev chunk's GEMM2 /
+                # prologue) -- store-only, no HBM load here.
+                i_wp = 0
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                        lds_w.vec_store(
+                            (fx.Index(_w_lds_off(kb, batch)),), w_pf[i_wp], LOAD_VEC_WIDTH
+                        )
+                        i_wp += 1
+            else:
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                        row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                        abs_row = i_t_i32 * fx.Int32(BT) + row
+                        safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                        w_g_off = (
+                            w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
+                        )
+                        w_vec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
+                        col = fx.Int32(kb * 64) + load_col_base
+                        w_lds_off = row * fx.Int32(LDS_W_STRIDE) + col
+                        lds_w.vec_store((fx.Index(w_lds_off),), w_vec, LOAD_VEC_WIDTH)
 
             # EXPERIMENT (u-prefetch): cooperatively load u [BT, BV] -> lds_u,
             # mirroring the w-load (u is V-contiguous in HBM, BV=64 per row =
@@ -599,16 +702,18 @@ def compile_chunk_gated_delta_h_kv_naive(
             gpu.barrier()
 
             # ============================================================
-            # 3. Load k (pre-transposed [B,Hg,K,T_flat]) -> lds_k [K, BT].
-            # Each thread loads 8 contiguous tokens (BT, row-contiguous) for
-            # one K row, stores them contiguously into lds_k's [K, BT].
+            # 3. k -> lds_k [K, BT]. K_PF_INTERLEAVE: k already in registers
+            # (prefetched in prev chunk's GEMM2 / prologue) -- store-only. Else:
+            # load 8 contiguous tokens (BT, row-contiguous) per thread, store to
+            # lds_k. (k-load params hoisted to outer scope.)
             # ============================================================
-            K_TOK_THREADS = BT // LOAD_VEC_WIDTH               # 8
-            K_ROWS_PER_BATCH = BLOCK_THREADS // K_TOK_THREADS  # 32
-            K_LOAD_BATCHES = K // K_ROWS_PER_BATCH             # 4
-            k_load_krow = tid // fx.Int32(K_TOK_THREADS)
-            k_load_tokbase = (tid % fx.Int32(K_TOK_THREADS)) * fx.Int32(LOAD_VEC_WIDTH)
-            for batch in range_constexpr(K_LOAD_BATCHES):
+            if const_expr(W_PF_INTERLEAVE and K_PF_INTERLEAVE):
+                for batch in range_constexpr(K_LOAD_BATCHES):
+                    lds_k.vec_store(
+                        (fx.Index(_k_lds_off(batch)),), k_pf[batch], LOAD_VEC_WIDTH
+                    )
+            else:
+              for batch in range_constexpr(K_LOAD_BATCHES):
                 k_row = fx.Int32(batch * K_ROWS_PER_BATCH) + k_load_krow
                 abs_tok = i_t_i32 * fx.Int32(BT) + k_load_tokbase
                 in_b = abs_tok < T_local
@@ -848,9 +953,38 @@ def compile_chunk_gated_delta_h_kv_naive(
             # BT_MTILES 16-row tiles; vn_frags[m_bt] is each reduction tile.
             # (numpy-verified index formulas, err ~1e-5.)
             # ============================================================
+            # W_PF_INTERLEAVE: issue NEXT chunk's w vec_loads INTERLEAVED into the
+            # GEMM2 outer (kb,slot) iterations -- one load on each of the first
+            # NUM_W_LOADS slots -- so each buffer_load_dwordx4's HBM latency is
+            # hidden behind the following MFMA chain (mirrors baseline OPT-W).
+            if const_expr(W_PF_INTERLEAVE):
+                next_i_t_i32 = i_t_i32 + fx.Int32(1)
+                w_next_pf = [None] * NUM_W_LOADS
+                if const_expr(K_PF_INTERLEAVE):
+                    k_next_pf = [None] * K_LOAD_BATCHES
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for slot in range_constexpr(N_REPEAT):
                     acc_idx = kb * N_REPEAT + slot
+                    if const_expr(W_PF_INTERLEAVE):
+                        g2_slot = kb * N_REPEAT + slot
+                        # slots [0, NUM_W_LOADS) carry the w prefetch loads;
+                        # slots [NUM_W_LOADS, NUM_W_LOADS+K_LOAD_BATCHES) carry k.
+                        if const_expr(g2_slot < NUM_W_LOADS):
+                            kb_w = g2_slot // NUM_LOAD_BATCHES_64
+                            batch_w = g2_slot % NUM_LOAD_BATCHES_64
+                            w_next_pf[g2_slot] = w_.vec_load(
+                                (fx.Index(_w_load_off(next_i_t_i32, kb_w, batch_w)),),
+                                LOAD_VEC_WIDTH,
+                            )
+                        elif const_expr(
+                            K_PF_INTERLEAVE
+                            and g2_slot < NUM_W_LOADS + K_LOAD_BATCHES
+                        ):
+                            batch_k = g2_slot - NUM_W_LOADS
+                            k_next_pf[batch_k] = k_.vec_load(
+                                (fx.Index(_k_load_off(next_i_t_i32, batch_k)),),
+                                LOAD_VEC_WIDTH,
+                            )
                     for m_bt in range_constexpr(BT_MTILES):
                         k_lds_row = fx.Index(kb * 64 + slot * 16) + lane_n_idx
                         k_lds_col = fx.Index(m_bt * 16) + lane_m_base_idx * fx.Index(4)
@@ -861,7 +995,15 @@ def compile_chunk_gated_delta_h_kv_naive(
                             k_a, vn_b, h_accs_in[acc_idx]
                         )
 
-            results = yield [_to_raw(v) for v in h_accs_in]
+            # Single yield statement (FlyDSL's scf.for rewriter forbids two yield
+            # statements in a loop body, even under a const_expr branch): build
+            # the iter_args list conditionally, then yield once.
+            yield_list = [_to_raw(v) for v in h_accs_in]
+            if const_expr(W_PF_INTERLEAVE):
+                yield_list = yield_list + [_to_raw(v) for v in w_next_pf]
+                if const_expr(K_PF_INTERLEAVE):
+                    yield_list = yield_list + [_to_raw(v) for v in k_next_pf]
+            results = yield yield_list
 
         h_accs_final = list(results[:NUM_H_ACCS])
 
