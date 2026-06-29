@@ -33,10 +33,12 @@ import itertools
 
 import pandas as pd
 import torch
+import pytest
 
 import aiter
 from aiter import dtypes
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.jit.utils.chip_info import get_gfx
 
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.flydsl.kernels.fp8_einsum import (
@@ -47,6 +49,11 @@ from aiter.ops.flydsl.kernels.fp8_einsum import (
 
 torch.set_default_device("cuda")
 
+
+pytestmark = pytest.mark.skipif(
+    get_gfx() != "gfx950",
+    reason="fp8_einsum targets gfx950 (MI355X) only",
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Packed-UE8M0 input construction (self-contained — no perf-dir dependency).
@@ -269,7 +276,6 @@ def test_qz(H, D, R, B, tn):
         "us": round(us, 3),
         "TFLOPS": round(_tf(us, H, D, R, B), 1),
     }
-
 
 @benchmark()
 def test_qz_splitk(H, D, R, B, sk):
