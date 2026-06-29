@@ -792,7 +792,8 @@ allreduce_prototype_twoshot(T const* A,
         block += grid;
         flag_color++;
     }
-    d_flag_color[blockIdx.x] = flag_color;
+    if (threadIdx.x == 0 && threadIdx.y == 0)
+        d_flag_color[blockIdx.x] = flag_color;
 }
 
 #define TWOSHOT_DISPATCH(__codec)                                             \
