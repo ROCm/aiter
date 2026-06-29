@@ -6,7 +6,7 @@
 #   port of the hand-written HIP cuh csrc/kernels/prezero_gemm/splitk_gemm_a16w16.cuh.
 #
 #   C[M,N] += A[M,K] @ B[N,K]^T   (TN, bf16 in / fp32 accumulate / packed-bf16 atomic out).
-#   C is zeroed in-kernel: ksplit==0 zeros its tile + a per-tile
+#   C is zeroed in-kernel (when ZERO_INIT): ksplit==0 zeros its tile + a per-tile
 #   signal/sema handshake before atomic-adds — no external memset.
 #
 # Same design as the cuh (see its header for the full rationale):
@@ -110,6 +110,7 @@ def compile_splitk_hgemm_4wave(
     BM: int,
     BK: int = 128,
     dtype: str = "bf16",
+    ZERO_INIT: bool = True,
 ):
     assert dtype == "bf16", "cuh port is bf16-only"
     KSLICE = K // SPLITK
@@ -147,6 +148,8 @@ def compile_splitk_hgemm_4wave(
     allocator.ptr = smem_b_offset + BS_BYTES
 
     KERNEL_NAME = f"splitk_hgemm_4wave_{dtype}_M{BM}xN{BN}xK{BK}_SPK{SPLITK}_{GPU_ARCH}"
+    if not ZERO_INIT:
+        KERNEL_NAME += "_NOZINIT"
 
     @flyc.kernel(known_block_size=[256, 1, 1])
     def kern(
@@ -163,8 +166,9 @@ def compile_splitk_hgemm_4wave(
         A_ = GTensor(A, dtype=dt, shape=(-1, K))
         B_ = GTensor(B, dtype=dt, shape=(N, K))
         C_ = GTensor(C, dtype=dt, shape=(-1, N))
-        semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
-        signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
+        if const_expr(ZERO_INIT):
+            semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
+            signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
 
         base_ptr = allocator.get_base()
         as_ = STensor(
@@ -200,127 +204,128 @@ def compile_splitk_hgemm_4wave(
         m_idx = fx.Index(m)
         idx0 = fx.Index(0)
 
-        # *16: one cache line per tile (avoid semaphore false sharing)
-        signal_idx = (mtile * N_TILES + n_tile) * 16
+        if const_expr(ZERO_INIT):
+            # *16: one cache line per tile (avoid semaphore false sharing)
+            signal_idx = (mtile * N_TILES + n_tile) * 16
 
-        def _gptr(ptr, off_elems, elem_bytes):
-            base = arith.index_cast(T.i64, fx.ptrtoint(ptr))
-            boff = arith.index_cast(
-                T.i64, fx.Index(off_elems) * fx.Index(elem_bytes)
-            )
-            return llvm.IntToPtrOp(
-                ir.Type.parse("!llvm.ptr<1>"),
-                llvm.AddOp(base, boff, llvm.IntegerOverflowFlags(0)).result,
-            ).result
-
-        ZVEC = 8
-        ZG_TOTAL = BM * BN // ZVEC
-        ZG_PER_T = (ZG_TOTAL + 255) // 256
-        ZG_GUARD = ZG_TOTAL % 256 != 0
-
-        def zero_c_tile():
-            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ksplit, idx0)
-            ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-            with ir.InsertionPoint(ks0_if.then_block):
-                zvec = vector.broadcast(
-                    T.vec(ZVEC, dt), arith.constant(0.0, type=dt)
+            def _gptr(ptr, off_elems, elem_bytes):
+                base = arith.index_cast(T.i64, fx.ptrtoint(ptr))
+                boff = arith.index_cast(
+                    T.i64, fx.Index(off_elems) * fx.Index(elem_bytes)
                 )
-                zvec_v = (
-                    zvec._value if const_expr(hasattr(zvec, "_value")) else zvec
-                )
-                for c in range_constexpr(ZG_PER_T):
-                    gidx = tid + c * 256
-                    el = gidx * ZVEC
-                    row = el // BN
-                    col = el % BN
-                    gm = mrow0 + row
-                    cond = arith.cmpi(arith.CmpIPredicate.ult, gm, m_idx)
-                    if const_expr(ZG_GUARD):
-                        cond = arith.andi(
-                            cond,
-                            arith.cmpi(
-                                arith.CmpIPredicate.ult, gidx, fx.Index(ZG_TOTAL)
-                            ),
-                        )
-                    cif = scf.IfOp(cond, results_=[], has_else=False)
-                    with ir.InsertionPoint(cif.then_block):
-                        lin = arith.index_cast(
-                            T.i32, C_.linear_offset((gm, n0 + col))
-                        )
-                        cptr = _gptr(C, fx.Index(lin), DTYPE_BYTES)
+                return llvm.IntToPtrOp(
+                    ir.Type.parse("!llvm.ptr<1>"),
+                    llvm.AddOp(base, boff, llvm.IntegerOverflowFlags(0)).result,
+                ).result
+
+            ZVEC = 8
+            ZG_TOTAL = BM * BN // ZVEC
+            ZG_PER_T = (ZG_TOTAL + 255) // 256
+            ZG_GUARD = ZG_TOTAL % 256 != 0
+
+            def zero_c_tile():
+                cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ksplit, idx0)
+                ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
+                with ir.InsertionPoint(ks0_if.then_block):
+                    zvec = vector.broadcast(
+                        T.vec(ZVEC, dt), arith.constant(0.0, type=dt)
+                    )
+                    zvec_v = (
+                        zvec._value if const_expr(hasattr(zvec, "_value")) else zvec
+                    )
+                    for c in range_constexpr(ZG_PER_T):
+                        gidx = tid + c * 256
+                        el = gidx * ZVEC
+                        row = el // BN
+                        col = el % BN
+                        gm = mrow0 + row
+                        cond = arith.cmpi(arith.CmpIPredicate.ult, gm, m_idx)
+                        if const_expr(ZG_GUARD):
+                            cond = arith.andi(
+                                cond,
+                                arith.cmpi(
+                                    arith.CmpIPredicate.ult, gidx, fx.Index(ZG_TOTAL)
+                                ),
+                            )
+                        cif = scf.IfOp(cond, results_=[], has_else=False)
+                        with ir.InsertionPoint(cif.then_block):
+                            lin = arith.index_cast(
+                                T.i32, C_.linear_offset((gm, n0 + col))
+                            )
+                            cptr = _gptr(C, fx.Index(lin), DTYPE_BYTES)
+                            llvm.InlineAsmOp(
+                                None,
+                                [cptr, zvec_v],
+                                "global_store_dwordx4 $0, $1, off sc0 sc1",
+                                "v,v",
+                                has_side_effects=True,
+                            )
+                            scf.YieldOp([])
+                    gpu.barrier()
+                    is_t0 = arith.cmpi(arith.CmpIPredicate.eq, tid, idx0)
+                    t0_if = scf.IfOp(is_t0, results_=[], has_else=False)
+                    with ir.InsertionPoint(t0_if.then_block):
+                        sptr = _gptr(signal, signal_idx, 4)
                         llvm.InlineAsmOp(
                             None,
-                            [cptr, zvec_v],
-                            "global_store_dwordx4 $0, $1, off sc0 sc1",
+                            [sptr, arith.constant(1, type=T.i32)],
+                            "global_store_dword $0, $1, off sc0 sc1",
                             "v,v",
                             has_side_effects=True,
                         )
                         scf.YieldOp([])
-                gpu.barrier()
+                    gpu.barrier()
+                    scf.YieldOp([])
+
+            def split_k_barrier():
                 is_t0 = arith.cmpi(arith.CmpIPredicate.eq, tid, idx0)
                 t0_if = scf.IfOp(is_t0, results_=[], has_else=False)
                 with ir.InsertionPoint(t0_if.then_block):
-                    sptr = _gptr(signal, signal_idx, 4)
-                    llvm.InlineAsmOp(
-                        None,
-                        [sptr, arith.constant(1, type=T.i32)],
-                        "global_store_dword $0, $1, off sc0 sc1",
-                        "v,v",
-                        has_side_effects=True,
+                    init_cur = arith.constant(0, type=T.i32)
+                    w = scf.WhileOp([T.i32], [init_cur])
+                    before = ir.Block.create_at_start(w.before, [T.i32])
+                    after = ir.Block.create_at_start(w.after, [T.i32])
+                    with ir.InsertionPoint(before):
+                        cur = before.arguments[0]
+                        need = arith.CmpIOp(
+                            arith.CmpIPredicate.eq, cur, arith.constant(0, type=T.i32)
+                        ).result
+                        scf.ConditionOp(need, [cur])
+                    with ir.InsertionPoint(after):
+                        sptr = _gptr(signal, signal_idx, 4)
+                        data = llvm.InlineAsmOp(
+                            T.i32,
+                            [sptr],
+                            "global_load_dword $0, $1, off sc1",
+                            "=v,v",
+                            has_side_effects=True,
+                        ).result
+                        rocdl.s_waitcnt(0)
+                        scf.YieldOp([data])
+                    scf.YieldOp([])
+                rocdl.sched_barrier(0)
+                gpu.barrier()
+                t0_if2 = scf.IfOp(is_t0, results_=[], has_else=False)
+                with ir.InsertionPoint(t0_if2.then_block):
+                    semptr = _gptr(semaphore, signal_idx, 4)
+                    arrive = llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add,
+                        semptr,
+                        arith.constant(1, type=T.i32),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    ).result
+                    cond_last = arith.cmpi(
+                        arith.CmpIPredicate.eq, fx.Index(arrive), fx.Index(SPLITK - 1)
                     )
+                    last_if = scf.IfOp(cond_last, results_=[], has_else=False)
+                    with ir.InsertionPoint(last_if.then_block):
+                        semaphore_[signal_idx] = arith.constant(0, type=T.i32)
+                        signal_[signal_idx] = arith.constant(0, type=T.i32)
+                        scf.YieldOp([])
                     scf.YieldOp([])
                 gpu.barrier()
-                scf.YieldOp([])
-
-        def split_k_barrier():
-            is_t0 = arith.cmpi(arith.CmpIPredicate.eq, tid, idx0)
-            t0_if = scf.IfOp(is_t0, results_=[], has_else=False)
-            with ir.InsertionPoint(t0_if.then_block):
-                init_cur = arith.constant(0, type=T.i32)
-                w = scf.WhileOp([T.i32], [init_cur])
-                before = ir.Block.create_at_start(w.before, [T.i32])
-                after = ir.Block.create_at_start(w.after, [T.i32])
-                with ir.InsertionPoint(before):
-                    cur = before.arguments[0]
-                    need = arith.CmpIOp(
-                        arith.CmpIPredicate.eq, cur, arith.constant(0, type=T.i32)
-                    ).result
-                    scf.ConditionOp(need, [cur])
-                with ir.InsertionPoint(after):
-                    sptr = _gptr(signal, signal_idx, 4)
-                    data = llvm.InlineAsmOp(
-                        T.i32,
-                        [sptr],
-                        "global_load_dword $0, $1, off sc1",
-                        "=v,v",
-                        has_side_effects=True,
-                    ).result
-                    rocdl.s_waitcnt(0)
-                    scf.YieldOp([data])
-                scf.YieldOp([])
-            rocdl.sched_barrier(0)
-            gpu.barrier()
-            t0_if2 = scf.IfOp(is_t0, results_=[], has_else=False)
-            with ir.InsertionPoint(t0_if2.then_block):
-                semptr = _gptr(semaphore, signal_idx, 4)
-                arrive = llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    semptr,
-                    arith.constant(1, type=T.i32),
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                ).result
-                cond_last = arith.cmpi(
-                    arith.CmpIPredicate.eq, fx.Index(arrive), fx.Index(SPLITK - 1)
-                )
-                last_if = scf.IfOp(cond_last, results_=[], has_else=False)
-                with ir.InsertionPoint(last_if.then_block):
-                    semaphore_[signal_idx] = arith.constant(0, type=T.i32)
-                    signal_[signal_idx] = arith.constant(0, type=T.i32)
-                    scf.YieldOp([])
-                scf.YieldOp([])
-            gpu.barrier()
 
         # Per-thread global<->LDS coordinates (tile-local row/k of each b128 chunk).
         a_row = [0] * A_CHUNKS
@@ -381,7 +386,8 @@ def compile_splitk_hgemm_4wave(
                     )
             return acc_new
 
-        zero_c_tile()
+        if const_expr(ZERO_INIT):
+            zero_c_tile()
 
         # ---- main loop: double-buffered LDS, one K-tile prefetch ahead of compute ----
         storeA(idx0, loadA(kbeg))
@@ -420,7 +426,8 @@ def compile_splitk_hgemm_4wave(
                 )
         gpu.barrier()
 
-        split_k_barrier()
+        if const_expr(ZERO_INIT):
+            split_k_barrier()
 
         vec2_ty = T.vec(2, dt)
         for p4 in range_constexpr(PAIRS):

@@ -119,6 +119,7 @@ def compile_hgemm_kernel(
     BLOCK_K_WARPS: int = 1,
     B_TO_LDS: bool = False,
     HAS_BIAS: bool = False,
+    ZERO_INIT: bool = True,
 ):
     assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 16
     assert TILE_M * TILE_N * TILE_K <= 256 * 256 * 64
@@ -239,6 +240,8 @@ def compile_hgemm_kernel(
     KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
     if HAS_BIAS:
         KERNEL_NAME += "_BIAS"
+    if not ZERO_INIT:
+        KERNEL_NAME += "_NOZINIT"
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_kernel(
@@ -805,7 +808,7 @@ def compile_hgemm_kernel(
 
         warp_offset = get_dma_copy_warp_offset()
 
-        if const_expr(IS_SPLIT_K):
+        if const_expr(IS_SPLIT_K and ZERO_INIT):
             zero_c()
 
         if const_expr(B_TO_LDS):
@@ -959,7 +962,8 @@ def compile_hgemm_kernel(
 
         # write back to global
         if const_expr(IS_SPLIT_K):
-            split_k_barrier()
+            if const_expr(ZERO_INIT):
+                split_k_barrier()
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)

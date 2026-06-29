@@ -398,6 +398,7 @@ def compile_small_m_hgemm_kernel(
     B_TO_LDS_UNROLL: int = 0,
     B_TO_LDS: bool = False,
     HAS_BIAS: bool = False,
+    ZERO_INIT: bool = True,
 ):
     if dtype != "bf16":
         raise ValueError(f"`small_m_hgemm.py` only supports bf16, got {dtype!r}")
@@ -535,6 +536,8 @@ def compile_small_m_hgemm_kernel(
         b_to_lds=B_TO_LDS,
         has_bias=HAS_BIAS,
     )
+    if not ZERO_INIT:
+        KERNEL_NAME += "_NOZINIT"
 
     @flyc.kernel
     def small_m_hgemm_kernel(
@@ -668,6 +671,8 @@ def compile_small_m_hgemm_kernel(
             return llvm_ptr._value if hasattr(llvm_ptr, "_value") else llvm_ptr
 
         def prepare_split_k_tile(c_g, bias_g, tile_n_offset, tile_signal_idx):
+            if const_expr(not ZERO_INIT):
+                return
             is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
             is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
             with ir.InsertionPoint(is_t0_cond_if.then_block):
@@ -712,6 +717,9 @@ def compile_small_m_hgemm_kernel(
                 scf.YieldOp([])
 
         def split_k_barrier(tile_signal_idx):
+            if const_expr(not ZERO_INIT):
+                gpu.barrier()
+                return
             init_cur = arith.constant(0, type=T.i32)
             w = scf.WhileOp([T.i32], [init_cur])
             before = ir.Block.create_at_start(w.before, [T.i32])

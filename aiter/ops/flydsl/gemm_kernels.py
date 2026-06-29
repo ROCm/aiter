@@ -805,6 +805,7 @@ def _compile_flydsl_hgemm(
     c_to_lds: bool = False,
     kernel_family: str = KERNEL_FAMILY_HGEMM,
     has_bias: bool = False,
+    zero_init: bool = True,
 ):
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
@@ -876,6 +877,7 @@ def _compile_flydsl_hgemm(
         b_preshuffle=b_preshuffle,
         c_to_lds=c_to_lds,
         has_bias=has_bias,
+        zero_init=zero_init,
     )
 
     if kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
@@ -967,6 +969,7 @@ def flydsl_hgemm(
     auto_shuffle_b: bool = False,
     c_to_lds: bool = False,
     kernel_family: Optional[str] = None,
+    zero_init: bool = True,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
     """Run FlyDSL HGEMM."""
@@ -992,7 +995,8 @@ def flydsl_hgemm(
         )
 
     if out is None:
-        out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+        alloc = torch.empty if zero_init else torch.zeros
+        out = alloc((m, n), dtype=a.dtype, device=a.device)
 
     launch_stream = _normalize_launch_stream(a.device, stream)
     resolved_kernel_family = (
@@ -1022,6 +1026,7 @@ def flydsl_hgemm(
         c_to_lds=c_to_lds,
         kernel_family=resolved_kernel_family,
         has_bias=bias is not None,
+        zero_init=zero_init,
     )
 
     launcher(out, a, b, bias=bias, stream=launch_stream)

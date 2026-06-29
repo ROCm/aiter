@@ -35,6 +35,7 @@ def compile_flydsl_hgemm_kernel(
     b_preshuffle: bool = False,
     c_to_lds: bool = False,
     has_bias: bool = False,
+    zero_init: bool = True,
 ):
     """Build one FlyDSL HGEMM-family kernel from a unified config surface."""
 
@@ -59,6 +60,7 @@ def compile_flydsl_hgemm_kernel(
             BLOCK_K_WARPS=block_k_warps,
             B_TO_LDS=b_to_lds,
             HAS_BIAS=has_bias,
+            ZERO_INIT=zero_init,
         )
 
     if kernel_family == KERNEL_FAMILY_SMALL_M:
@@ -76,12 +78,13 @@ def compile_flydsl_hgemm_kernel(
             B_TO_LDS_UNROLL=b_to_lds_unroll,
             B_TO_LDS=b_to_lds,
             HAS_BIAS=has_bias,
+            ZERO_INIT=zero_init,
         )
 
     if kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
         # BN<-tile_n, BM<-tile_m, BK<-tile_k, SPLITK<-split_k.
         return compile_splitk_hgemm_4wave(
-            n, k, tile_n, split_k, tile_m, BK=tile_k, dtype=dtype
+            n, k, tile_n, split_k, tile_m, BK=tile_k, dtype=dtype, ZERO_INIT=zero_init
         )
 
     raise ValueError(
