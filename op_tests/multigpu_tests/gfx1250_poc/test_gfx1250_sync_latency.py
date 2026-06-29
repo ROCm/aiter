@@ -117,7 +117,11 @@ parser = argparse.ArgumentParser(
     "(start_sync / end_sync / two_sync)"
 )
 parser.add_argument(
-    "-t", "--tp-size", type=int, choices=[2, 4], default=2,
+    "-t",
+    "--tp-size",
+    type=int,
+    choices=[2, 4],
+    default=2,
     help="tensor-parallel size (default: 2)",
 )
 
@@ -140,17 +144,19 @@ if __name__ == "__main__":
                 latency_us = run_one(tp_size, grid, kernel, init_method)
             except Exception as e:
                 import traceback
+
                 traceback.print_exc()
                 logger.error(
-                    "grid=%d kernel=%s FAILED: %s", grid, kernel, e,
+                    "grid=%d kernel=%s FAILED: %s",
+                    grid,
+                    kernel,
+                    e,
                 )
                 latency_us = float("nan")
             row[kernel] = latency_us
         rows.append(row)
 
-    header = (
-        f"{'grid':>6s} | {'start_sync(us)':>14s} | {'end_sync(us)':>14s} | {'two_sync(us)':>14s}"
-    )
+    header = f"{'grid':>6s} | {'start_sync(us)':>14s} | {'end_sync(us)':>14s} | {'two_sync(us)':>14s}"
     sep = "-" * len(header)
     print(f"\ngfx1250 sync latency (tp={tp_size}, block=256)")
     print(sep)
