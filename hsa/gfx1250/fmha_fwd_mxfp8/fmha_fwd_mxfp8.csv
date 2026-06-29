@@ -1,0 +1,2 @@
+dtype,hdim_q,hdim_v,mask,knl_name,co_name
+mxfp8bf16,128,128,0,MXFP8_FMHA_FWD_D128_1TG_4W_64mx4_128nx1_KERNEL_FUNC,fmha_fwd_mxfp8_d128.co

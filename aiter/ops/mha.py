@@ -484,6 +484,107 @@ def fmha_fwd_with_sink_varlen_asm(
     return out, lse
 
 
+# ---------------------------------------------------------------------------
+# fmha_fwd_mxfp8_asm (gfx1250 / MI450) — dedicated MXFP8 FMHA forward.
+#
+# This is an intentionally separate integration path from both the bf16
+# `fmha_fwd_with_sink_asm` and the shared `fmha_v3` paths.  The MXFP8 kernel
+# uses its own slot-padded kernarg ABI carrying q/k/v micro-scaling (e8m0)
+# descale pointers, expected to diverge further from the MI350 layout — so it
+# gets its own C++ translation unit (csrc/py_itfs_cu/asm_fmha_fwd_mxfp8.cu)
+# and its own Python entry point here.
+#
+# API contract: q/k/v are **bshd shape** ([batch, seq, head, dim]) fp8 (e4m3),
+# in bhsd memory order (stride_head > stride_seq); strides are read directly
+# from the tensors.  q/k/v_scale are 1-D float8_e8m0fnu descale buffers laid
+# out as the kernel expects (block_size=32 along head_dim).  All GPU tensors
+# (out, lse, scales) are allocated on the Python side.
+# ---------------------------------------------------------------------------
+@compile_ops(
+    "module_fmha_fwd_mxfp8_asm",
+    fc_name="fmha_fwd_mxfp8_asm",
+    ffi_type="ctypes",
+)
+def _fmha_fwd_mxfp8_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_scale: Tensor,
+    k_scale: Tensor,
+    v_scale: Tensor,
+    out: Tensor,
+    lse: Tensor,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+) -> None: ...
+
+
+def fmha_fwd_mxfp8_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_scale: Tensor,
+    k_scale: Tensor,
+    v_scale: Tensor,
+    softmax_scale: Optional[float] = None,
+    is_causal: bool = False,
+    return_lse: bool = False,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor]:
+    """Public wrapper for the gfx1250 MXFP8 ASM FMHA forward.
+
+    Args:
+        q: (batch, seqlen_q, nheads, hdim_q) fp8 (e4m3), bhsd memory layout
+        k: (batch, seqlen_k, nheads_k, hdim_q) fp8 (e4m3), bhsd memory layout
+        v: (batch, seqlen_k, nheads_k, hdim_v) fp8 (e4m3), bhsd memory layout
+        q_scale/k_scale/v_scale: float8_e8m0fnu micro-scaling descale buffers.
+        softmax_scale: softmax scaling; defaults to hdim_q ** -0.5.
+        is_causal: must be False (causal not supported yet).
+        return_lse: whether the returned lse contents are meaningful.
+        out: optional preallocated bf16 output [batch, seqlen_q, nheads, hdim_v].
+
+    Returns:
+        (out, lse). The kernel always touches the lse buffer; when
+        return_lse=False its contents are undefined and should be ignored.
+    """
+    assert not is_causal, "fmha_fwd_mxfp8_asm: causal masking is not supported yet"
+
+    batch, q_seq_len, q_head_num, qk_head_dim = q.shape
+    v_head_dim = v.size(3)
+
+    if softmax_scale is None:
+        softmax_scale = qk_head_dim ** (-0.5)
+
+    if out is None:
+        # bf16 output in bhsd memory layout, returned as a bshd-shaped view.
+        out_bhsd = torch.empty(
+            (batch, q_head_num, q_seq_len, v_head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        out = out_bhsd.transpose(1, 2)
+
+    lse = torch.empty(
+        (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
+    )
+
+    _fmha_fwd_mxfp8_asm(
+        q,
+        k,
+        v,
+        q_scale,
+        k_scale,
+        v_scale,
+        out,
+        lse,
+        float(softmax_scale),
+        bool(is_causal),
+        bool(return_lse),
+    )
+    return out, lse
+
+
 def cmdGenFunc_mha_varlen_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
