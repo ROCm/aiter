@@ -22,6 +22,11 @@ on:
         required: true
         default: rocm/ffm-dev:latest
         type: string
+      test_ref:
+        description: Git branch containing the reduced FFM Triton test suite.
+        required: true
+        default: shared/reduced_tests_for_FFM_CI
+        type: string
 
 permissions:
   contents: read
@@ -32,8 +37,9 @@ concurrency:
 
 env:
   FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
-  FFM_TEST: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
-  FFM_TEST_NODE_PATTERN: '::(test_gemm_a16_w16\[(bandwidth_bound|compute_bound)-gluon-64-2880-4096\]|test_gemm_a16_w16_layout\[(bandwidth_bound|compute_bound)-gluon-(TT|NN|NT)-64-2880-4096\]|test_gemm_a16_w16_atomic\[(True|False)-64-2880-4096\])$'
+  FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
+  FFM_TEST: op_tests/triton_tests
+  FFM_SHARD_COUNT: 16
 
 jobs:
   check-signal:
@@ -49,17 +55,38 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   ffm-aiter-ut:
-    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }})
+    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }}) / Shard ${{ matrix.shard }}
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     needs: [check-signal]
     runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
-    timeout-minutes: 60
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+
+      - name: Load reduced FFM Triton test suite
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin \
+            "refs/heads/${FFM_TEST_SOURCE_REF}:refs/remotes/origin/${FFM_TEST_SOURCE_REF}"
+          ffm_test_source_commit="$(git rev-parse "refs/remotes/origin/${FFM_TEST_SOURCE_REF}")"
+          echo "FFM test source commit: ${ffm_test_source_commit}"
+          rm -rf "${FFM_TEST}"
+          git checkout "refs/remotes/origin/${FFM_TEST_SOURCE_REF}" -- "${FFM_TEST}"
+          test_count="$(find "${FFM_TEST}" -type f -name 'test*.py' | wc -l | tr -d ' ')"
+          echo "Loaded ${test_count} FFM Triton test files from ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+          if [ "${test_count}" -eq 0 ]; then
+            echo "::error::No FFM Triton test files found in ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
+            exit 1
+          fi
 
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -91,7 +118,7 @@ jobs:
           set -euo pipefail
           docker pull "${FFM_IMAGE}"
 
-      - name: Run selected existing aiter FFM unit tests
+      - name: Run sharded FFM Triton tests
         run: |
           set -euo pipefail
 
@@ -115,7 +142,8 @@ jobs:
             --security-opt seccomp=unconfined \
             --shm-size=16gb \
             -e FFM_TEST="${FFM_TEST}" \
-            -e FFM_TEST_NODE_PATTERN="${FFM_TEST_NODE_PATTERN}" \
+            -e FFM_SHARD_INDEX="${{ matrix.shard }}" \
+            -e FFM_SHARD_COUNT="${FFM_SHARD_COUNT}" \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${FFM_IMAGE}" \
@@ -129,7 +157,8 @@ jobs:
               echo "pwd: $(pwd)"
               echo "aiter checkout: $(git rev-parse HEAD)"
               echo "FFM_TEST=${FFM_TEST}"
-              echo "FFM_TEST_NODE_PATTERN=${FFM_TEST_NODE_PATTERN}"
+              echo "FFM_SHARD_INDEX=${FFM_SHARD_INDEX}"
+              echo "FFM_SHARD_COUNT=${FFM_SHARD_COUNT}"
               echo "PATH=${PATH}"
               echo "PYTHONPATH=${PYTHONPATH:-}"
 
@@ -152,17 +181,30 @@ jobs:
               python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
               python3 -m pip uninstall -y pylama || true
 
-              echo "==== Select existing FFM test cases ===="
-              FFM_COLLECTED="$(python3 -m pytest --collect-only -q "${FFM_TEST}")"
-              mapfile -t FFM_TEST_NODES < <(grep -E "${FFM_TEST_NODE_PATTERN}" <<< "${FFM_COLLECTED}" || true)
-              printf "%s\n" "${FFM_TEST_NODES[@]}"
-              if [ "${#FFM_TEST_NODES[@]}" -eq 0 ]; then
-                echo "::error::No FFM test nodes matched ${FFM_TEST_NODE_PATTERN}"
+              echo "==== Collect and shard FFM Triton test nodes ===="
+              python3 -m pytest --collect-only -q "${FFM_TEST}" > ffm_collected_nodes.txt
+              grep -E "^${FFM_TEST}/.*::" ffm_collected_nodes.txt > ffm_all_nodes.list || true
+              all_count="$(wc -l < ffm_all_nodes.list | tr -d " ")"
+              echo "Collected ${all_count} FFM Triton test node(s)"
+              if [ "${all_count}" -eq 0 ]; then
+                echo "::error::No FFM Triton test nodes collected from ${FFM_TEST}"
+                cat ffm_collected_nodes.txt
                 exit 1
               fi
-              echo "Selected ${#FFM_TEST_NODES[@]} existing test node(s)"
 
-              echo "==== Run selected existing FFM unit tests ===="
+              awk -v shard="${FFM_SHARD_INDEX}" -v shards="${FFM_SHARD_COUNT}" \
+                "((NR - 1) % shards) == shard" \
+                ffm_all_nodes.list > ffm_shard_nodes.list
+              shard_count="$(wc -l < ffm_shard_nodes.list | tr -d " ")"
+              echo "Selected ${shard_count} FFM Triton test node(s) for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
+              if [ "${shard_count}" -eq 0 ]; then
+                echo "::error::No FFM Triton test nodes selected for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
+                exit 1
+              fi
+              cat ffm_shard_nodes.list
+              mapfile -t FFM_TEST_NODES < ffm_shard_nodes.list
+
+              echo "==== Run sharded FFM Triton tests ===="
               python3 -m pytest -v "${FFM_TEST_NODES[@]}"
             '
 
