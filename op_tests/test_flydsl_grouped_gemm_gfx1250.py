@@ -404,15 +404,15 @@ def _run_grouped_via_fused_moe(
         from aiter.test_common import run_perftest
         from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
 
-        sink: list = []
-        _grouped.kernel_bench_callable = sink
+        kernel_bench_callable: list = []
+        _grouped.kernel_bench_callable = kernel_bench_callable
         try:
             out = _call()
         finally:
             _grouped.kernel_bench_callable = None
         us = None
         kernel_us = {}
-        for _name, callable in sink:
+        for _name, callable in kernel_bench_callable:
             _, _us = run_perftest(
                 callable,
                 num_warmup=warmup,

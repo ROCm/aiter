@@ -75,6 +75,7 @@ def test_fmoe(
     strict_accuracy=True,
     check_aot_cache=True,
     swiglu_limit=None,
+    kernel_bench=False,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -380,13 +381,7 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    out2_ck, us2 = run_perftest(
-        fused_moe,
-        input,
-        w1_qt_aiter,
-        w2_qt_aiter,
-        topk_weights,
-        topk_ids,
+    _fused_moe_kwargs = dict(
         w1_scale=w1_scale_aiter,
         w2_scale=w2_scale_aiter,
         quant_type=qType,
@@ -398,8 +393,60 @@ def test_fmoe(
         bias2=exp_bias2_aiter,
         swiglu_limit=swiglu_limit,
         gate_mode=gateMode,
+    )
+
+    if kernel_bench:
+        # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
+        # fused_moe call populates the per-stage launch callables (via the opt-in
+        # kernel_bench_callable hook) and yields a correct output; then loop each
+        # captured kernel launch alone (excludes input prep / quant / sorting).
+        kernel_bench_callable = []
+        aiter.fused_moe.kernel_bench_callable = kernel_bench_callable
+        try:
+            out2_ck = fused_moe(
+                input,
+                w1_qt_aiter,
+                w2_qt_aiter,
+                topk_weights,
+                topk_ids,
+                **_fused_moe_kwargs,
+            )
+        finally:
+            aiter.fused_moe.kernel_bench_callable = None
+        kernel_us = {}
+        for _name, _call in kernel_bench_callable:
+            _, _us = run_perftest(_call, num_iters=20, num_warmup=3)
+            kernel_us[_name] = _us
+        us1 = kernel_us.get("stage1")
+        us2_stage = kernel_us.get("stage2")
+        if not kernel_us:
+            logging.warning(
+                "kernel_bench: no kernels captured (non-2stage/1stage path?) (quant:%s)",
+                AQDType,
+            )
+        else:
+            logging.info(
+                "kernel_bench: stage1=%s us, stage2=%s us (quant:%s)",
+                "n/a" if us1 is None else f"{us1:.2f}",
+                "n/a" if us2_stage is None else f"{us2_stage:.2f}",
+                AQDType,
+            )
+        return {
+            "us": (us1 or 0.0) + (us2_stage or 0.0),
+            "us_stage1": us1,
+            "us_stage2": us2_stage,
+        }
+
+    out2_ck, us2 = run_perftest(
+        fused_moe,
+        input,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
         num_iters=5,
         num_warmup=2,
+        **_fused_moe_kwargs,
     )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
@@ -439,7 +486,12 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    return {
+        "us": us2,
+        "logits_diff": float(logits_diff),
+        "us_stage1": None,
+        "us_stage2": None,
+    }
 
 
 l_quant = [
@@ -597,6 +649,15 @@ parser.add_argument(
     type=float,
     default=None,
     help="swiglu/silu clamp limit. Default None means the kernel default (7.0).",
+)
+parser.add_argument(
+    "--kernel-bench",
+    "-kb",
+    action="store_true",
+    help="""Time the stage1 / stage2 kernels in isolation (loop each launch
+    alone, excluding input prep) and report them as us_stage1 / us_stage2.
+    Only the 2-stage path exposes per-kernel launches; the 1-stage path reports
+    n/a.""",
 )
 
 args = parser.parse_args()
@@ -936,7 +997,7 @@ for kwargs, extras in case_iter:
             run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
         )
         with aot_guard:
-            ret = test_fmoe(**kwargs)
+            ret = test_fmoe(**kwargs, kernel_bench=args.kernel_bench)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
