@@ -1255,6 +1255,7 @@ def _mxfp4_a4w4_stage1(
 
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
+    _xcd1 = _parse_mxfp4_g1_kname(kernelName1).get("xcd_swizzle", 0)
     flydsl_mxfp4_gemm1(
         a_quant=a_quant,
         a_scale_sorted_shuffled=a_scale_sorted_shuffled,
@@ -1275,6 +1276,7 @@ def _mxfp4_a4w4_stage1(
         D_INTER=D_INTER,
         topk=topk,
         interleave=interleave,
+        xcd_swizzle=_xcd1,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -1289,7 +1291,7 @@ def _mxfp4_a4w4_stage2(
     sorted_expert_ids,
     sorted_weights,
     reverse_sorted,
-    atomic_output_buf,
+    out_dst,  # caller's output buffer; written in-place (atomic accum or scatter_reduce dst)
     *,
     atomic,
     mxfp4out,
@@ -1306,8 +1308,9 @@ def _mxfp4_a4w4_stage2(
     cshuffle=False,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
 ):
+    _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
     if atomic:
-        out_buf = atomic_output_buf
+        out_buf = out_dst
     else:
         _mx_shape_ok = (
             BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
@@ -1346,8 +1349,11 @@ def _mxfp4_a4w4_stage2(
                 D_INTER=D_INTER,
                 D_INTER_REAL=inter_real,
                 topk=topk,
+                xcd_swizzle=_xcd2,
             )
-            out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
+            # scatter_reduce fully overwrites each output row -> write the caller's
+            # buffer directly (avoids a redundant (M, D_HIDDEN) D2D copy at the end).
+            out = out_dst
             aiter.mxfp4_moe_scatter_reduce_q(
                 flat_out_q=flat_out_q,
                 flat_out_scale=flat_out_scale,
@@ -1392,13 +1398,16 @@ def _mxfp4_a4w4_stage2(
         D_INTER=D_INTER,
         D_INTER_REAL=inter_real,
         topk=topk,
+        xcd_swizzle=_xcd2,
     )
 
     if atomic:
         return out_buf
 
     # -- scatter_reduce: per-(token, topk-slot) flat_out -> per-token out --
-    out = torch.empty((M, D_HIDDEN), dtype=dtypes.bf16, device=device)
+    # Write the caller's buffer directly (scatter_reduce overwrites every row), so the
+    # trailing `moe_out.copy_(out)` becomes a no-op and the D2D copy is eliminated.
+    out = out_dst
     aiter.mxfp4_moe_scatter_reduce(
         flat_out=out_buf,
         reverse_sorted=reverse_sorted,
@@ -1520,7 +1529,7 @@ def _mxfp4_a4w4_stage2_fw(
         sorted_expert_ids,
         sorted_weights,
         reverse_sorted,
-        moe_out if atomic else None,
+        moe_out,
         atomic=atomic,
         mxfp4out=mxfp4out,
         kernelName2=kernelName2,

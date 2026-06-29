@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -41,7 +39,6 @@ from .mxfp4_gemm_common import (
 )
 
 NUM_CU = 256
-PORT_XCD_SWIZZLE = int(os.environ.get("PORT_XCD_SWIZZLE", "-1"))
 
 
 def aq_bytes_for(max_m, k):
@@ -99,6 +96,7 @@ def compile_gemm2_a4w4_port(
     D_INTER_REAL=None,
     BN=256,
     BK=256,
+    xcd_swizzle=0,
 ):
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
     KH_TILE = BK // 2
@@ -133,6 +131,8 @@ def compile_gemm2_a4w4_port(
     }[epilog]
     _rtag = "" if _K_REAL == _K else f"r{_K_REAL}"
     _tag = f"ne{NE}_h{N_OUT}_i{_K}{_rtag}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
+    if xcd_swizzle > 0:
+        _tag += f"_xcd{xcd_swizzle}"
     _name = f"gemm2_a4w4_port_{_tag}"
 
     allocator = SmemAllocator(
@@ -230,7 +230,7 @@ def compile_gemm2_a4w4_port(
             _NXCD = 8
             _xq = _udiv(bound, _NXCD)
             _xr = _umod(bound, _NXCD)
-            _SW = PORT_XCD_SWIZZLE
+            _SW = xcd_swizzle
 
             def _xcd(pid):
                 xc = _umod(pid, _NXCD)

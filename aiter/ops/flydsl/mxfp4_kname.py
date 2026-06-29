@@ -53,6 +53,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         "kSplitK": nums.get("kSplitK", 0),
         "inline_quant": "F16IN" in flags,
         "use_nt": "NT" in flags,
+        "xcd_swizzle": nums.get("xcd_swizzle", 0),
     }
 
 
@@ -76,6 +77,7 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         "use_nt": "NT" in flags,
         "mxfp4out": mxfp4out,
         "cshuffle": cshuffle,
+        "xcd_swizzle": nums.get("xcd_swizzle", 0),
     }
 
 

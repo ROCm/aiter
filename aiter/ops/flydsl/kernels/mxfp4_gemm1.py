@@ -43,6 +43,16 @@ from .mxfp4_gemm_common import (
 )
 
 
+def _udiv(a, c):
+    cc = fx.Int32(c) if isinstance(c, int) else c
+    return fx.Int32(arith.divui(_raw(a), _raw(cc)))
+
+
+def _umod(a, c):
+    cc = fx.Int32(c) if isinstance(c, int) else c
+    return fx.Int32(arith.remui(_raw(a), _raw(cc)))
+
+
 def n_out_for(inter):
     return 2 * inter
 
@@ -747,6 +757,7 @@ def compile_gemm1_a4w4_port(
     BN=256,
     BK=256,
     interleave=True,
+    xcd_swizzle=0,
 ):
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
@@ -790,6 +801,8 @@ def compile_gemm1_a4w4_port(
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
     name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    if xcd_swizzle > 0:
+        name_suffix += f"_xcd{xcd_swizzle}"
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name=f"gemm1port_smem_{name_suffix}"
@@ -820,7 +833,34 @@ def compile_gemm1_a4w4_port(
         cumsum0 = llvm.load(T.i32, _global_ptr1(arg_cumsum, fx.Int32(0)))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(_NUM_N_BLOCKS)
+
+        _NXCD = 8
+        _xq = _udiv(bound, _NXCD)
+        _xr = _umod(bound, _NXCD)
+        _SW = xcd_swizzle
+
+        def _xcd(pid):
+            xc = _umod(pid, _NXCD)
+            wgid = (
+                xc * _xq
+                + fx.Int32(arith.minsi(_raw(xc), _raw(_xr)))
+                + _udiv(pid, _NXCD)
+            )
+            _ng = fx.Int32(_SW * _NUM_N_BLOCKS)
+            group_id = wgid // _ng
+            first_pid_m = group_id * fx.Int32(_SW)
+            remaining_m = total_m_blocks - first_pid_m
+            group_size_m = fx.Int32(arith.minsi(_raw(remaining_m), _raw(fx.Int32(_SW))))
+            wig = wgid % _ng
+            m_block = first_pid_m + (wig % group_size_m)
+            n_block = wig // group_size_m
+            return m_block * fx.Int32(_NUM_N_BLOCKS) + n_block
+
         if fx.Int32(bx_i32) < bound:
+            if const_expr(_SW > 0):
+                _tile = _xcd(bx_i32)
+            else:
+                _tile = bx_i32
             _gemm1_body(
                 allocator,
                 lds_off,
@@ -833,7 +873,7 @@ def compile_gemm1_a4w4_port(
                 arg_aqout,
                 arg_ascaleout,
                 arg_hidden,
-                bx_i32,
+                _tile,
                 lane,
                 wave,
                 use_nt,
