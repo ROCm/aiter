@@ -1440,7 +1440,6 @@ def compile_moe_gemm1(
 
                 def hot_loop_scheduler():
                     rocdl.sched_barrier(0)
-                    return
                     mfma_group = num_acc_n * 2
                     # K64 micro-step: 2x K32 MFMA per gemm.
                     mfma_total = (k_unroll * 2) * m_repeat * mfma_group
