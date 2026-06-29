@@ -475,8 +475,12 @@ def compile_mxscale_gemm(
     # so the row stride is num_k_tiles * interleaved_scale_cols_a. Placed after
     # the stage arena; the epilogue D-store may alias it (As is dead by then).
     as_full_row_stride = num_k_tiles * interleaved_scale_cols_a
-    _as_lds_cols = as_full_row_stride if tdm_as_in_prologue else interleaved_scale_cols_a
-    lds_a_scale_full_bytes = tile_m * scale_k_per_tile * num_k_tiles + _scale_guard_bytes
+    _as_lds_cols = (
+        as_full_row_stride if tdm_as_in_prologue else interleaved_scale_cols_a
+    )
+    lds_a_scale_full_bytes = (
+        tile_m * scale_k_per_tile * num_k_tiles + _scale_guard_bytes
+    )
     if tdm_as_in_prologue:
         as_full_rel_off = _align_up(arena_alloc.ptr, 16)
         arena_alloc.ptr = as_full_rel_off + lds_a_scale_full_bytes
@@ -515,9 +519,7 @@ def compile_mxscale_gemm(
         # the per-warp column count. gugu (stage1_act_interleave) writes the
         # de-interleaved swiglu output (C_N = N/2), so each warp stores
         # warp_tile_n/2 columns; otherwise the raw warp_tile_n columns.
-        _tdm_store_warp_n = (
-            warp_tile_n // 2 if stage1_act_interleave else warp_tile_n
-        )
+        _tdm_store_warp_n = warp_tile_n // 2 if stage1_act_interleave else warp_tile_n
         lds_d_row_stride = _tdm_store_warp_n * elem_bytes_d
         warp_d_bytes = warp_tile_m * lds_d_row_stride
         total_d_bytes = num_warps * warp_d_bytes
@@ -2071,7 +2073,7 @@ def compile_mxscale_gemm(
                     return grouped_accs_to_row_major(accs_in)
                 return accs_in
 
-            _effective_l2_pf = 2 # num_buffers + 1
+            _effective_l2_pf = 2  # num_buffers + 1
             if const_expr(use_cluster and _effective_l2_pf > 0):
                 _effective_l2_pf = max(1, _effective_l2_pf - 1)
 
@@ -2241,7 +2243,7 @@ def compile_mxscale_gemm(
                 warp_m_off_sgpr = wave_m_idx * arith.index(warp_tile_m)
                 # gugu output is de-interleaved (C_N = N/2): the store tile, global
                 # N extent, stride and per-warp N offset all halve.
-                _store_N = (C_N if stage1_act_interleave else N)
+                _store_N = C_N if stage1_act_interleave else N
                 _store_warp_n = (
                     warp_tile_n // 2 if stage1_act_interleave else warp_tile_n
                 )
@@ -2619,11 +2621,9 @@ def compile_mxscale_gemm(
                                 _l2_prefetch(_k_off)
 
                             if const_expr(tdm_as_in_prologue):
-                                _as_full_base_off[0] = (
-                                    loop_iter
-                                    * arith.index(num_buffers * interleaved_scale_cols_a)
-                                    + arith.index(buf_idx * interleaved_scale_cols_a)
-                                )
+                                _as_full_base_off[0] = loop_iter * arith.index(
+                                    num_buffers * interleaved_scale_cols_a
+                                ) + arith.index(buf_idx * interleaved_scale_cols_a)
                             _as_idx = (
                                 as_full_idx
                                 if tdm_as_in_prologue
@@ -2856,11 +2856,9 @@ def compile_mxscale_gemm(
                                 _l2_prefetch(_k_off)
 
                             if const_expr(tdm_as_in_prologue):
-                                _as_full_base_off[0] = (
-                                    loop_iter
-                                    * arith.index(num_buffers * interleaved_scale_cols_a)
-                                    + arith.index(buf_idx * interleaved_scale_cols_a)
-                                )
+                                _as_full_base_off[0] = loop_iter * arith.index(
+                                    num_buffers * interleaved_scale_cols_a
+                                ) + arith.index(buf_idx * interleaved_scale_cols_a)
                             _as_idx = (
                                 as_full_idx
                                 if tdm_as_in_prologue
@@ -2988,9 +2986,7 @@ def compile_mxscale_gemm(
                     _as_full_base_off[0] = arith.index(
                         (loop_iters * num_buffers + _tail_i) * interleaved_scale_cols_a
                     )
-                _tail_as_idx = (
-                    as_full_idx if tdm_as_in_prologue else None
-                )
+                _tail_as_idx = as_full_idx if tdm_as_in_prologue else None
 
                 def _as_idx_for(cs):
                     return _tail_as_idx if tdm_as_in_prologue else stages_as_idx[cs]

@@ -543,7 +543,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         )
     # gemm1 (stage1) tiles: tile_{m,n,k} read straight from the CSV, defaulting
     # to n_warp*64 / 256 when the column is absent.
-    tile_n = _as_int(cfg_row.get("tile_n"), int(n_warp) * 64) if cfg_row else int(n_warp) * 64
+    tile_n = (
+        _as_int(cfg_row.get("tile_n"), int(n_warp) * 64)
+        if cfg_row
+        else int(n_warp) * 64
+    )
     tile_k = _as_int(cfg_row.get("tile_k"), 256) if cfg_row else 256
     warp_tile_m = tile_m // m_warp
     # gemm2 (stage2) tiles: tile_{m,n,k}2, each defaulting to the shared gemm1

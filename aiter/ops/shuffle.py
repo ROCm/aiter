@@ -180,11 +180,7 @@ def shuffle_scale_n32k4(
                 f"GUGU n32k4 scale needs N=2*inter_dim (even rows), got N={N}"
             )
         # (E, [g..,u..], k) -> (E, 2, N/2, k) -> (E, N/2, 2, k) -> (E, N, k)
-        s = (
-            s.view(E, 2, N // 2, k_scale)
-            .permute(0, 2, 1, 3)
-            .reshape(E, N, k_scale)
-        )
+        s = s.view(E, 2, N // 2, k_scale).permute(0, 2, 1, 3).reshape(E, N, k_scale)
     if N % 32 != 0:
         raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
     if k_scale % 4 != 0:
