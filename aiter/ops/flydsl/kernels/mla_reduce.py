@@ -153,26 +153,24 @@ def compile_mla_reduce(
     ):
         out_t = _out_t(out_dtype)
         c_VEC = fx.Index(VEC)
-        acc_vt = T.vec(VEC, T.f32)
         out_vt = T.vec(VEC, out_t)
 
-        def load_o_elems(g, row_idx, head_idx, col_idx):
-            """Load VEC fp32 elements as a python list of scalars."""
+        def load_o_vec(g, row_idx, head_idx, col_idx):
+            """Load VEC contiguous fp32 elements; vector for VEC>1, scalar for VEC==1."""
             if const_expr(VEC == 1):
-                return [g[row_idx, head_idx, col_idx]]
-            v = g.vec_load((row_idx, head_idx, col_idx), VEC)
-            return [
-                vector.extract(v, static_position=[i], dynamic_position=[])
-                for i in range_constexpr(VEC)
-            ]
+                return g[row_idx, head_idx, col_idx]
+            return g.vec_load((row_idx, head_idx, col_idx), VEC)
 
         def store_o_elems(g, off_idx, elems_f32):
-            """Cast VEC fp32 scalars to out_t and store."""
+            """Cast VEC fp32 scalars to out_t and emit one vector buffer store."""
             if const_expr(VEC == 1):
                 g[off_idx] = elems_f32[0].truncf(out_t)
                 return
-            ov = vector.from_elements(acc_vt, [_to_raw(e) for e in elems_f32])
-            g.vec_store((off_idx,), ov.truncf(out_vt), VEC)
+            out_vec = vector.from_elements(
+                out_vt,
+                [_to_raw(elems_f32[i].truncf(out_t)) for i in range_constexpr(VEC)],
+            )
+            g.vec_store((off_idx,), out_vec, VEC)
 
         tid = fx.thread_idx.x
         head = fx.block_idx.x
@@ -267,10 +265,14 @@ def compile_mla_reduce(
 
             if const_expr(not is_massive):
                 row0 = gather_row(fx.Int32(0), local_seq)
-                o0 = load_o_elems(g_po, row0, fx.Index(head), col)
+                o0 = load_o_vec(g_po, row0, fx.Index(head), col)
                 lse0 = g_pl[row0, fx.Index(head)]
 
-                init = [_to_raw(o0[i]) for i in range_constexpr(VEC)]
+                if const_expr(VEC == 1):
+                    o0_elems = [o0]
+                else:
+                    o0_elems = [o0[i] for i in range_constexpr(VEC)]
+                init = [_to_raw(o0_elems[i]) for i in range_constexpr(VEC)]
                 init += [_to_raw(lse0), _to_raw(arith.constant(1.0, type=T.f32))]
 
                 results = init
@@ -280,15 +282,18 @@ def compile_mla_reduce(
                     max_lse = state[VEC]
                     sum_e = state[VEC + 1]
                     rs = gather_row(fx.Int32(s), local_seq)
-                    os = load_o_elems(g_po, rs, fx.Index(head), col)
+                    os = load_o_vec(g_po, rs, fx.Index(head), col)
                     lse = g_pl[rs, fx.Index(head)]
                     new_max = arith.maximumf(max_lse, lse)
                     old = _exp(max_lse - new_max, use_exp2)
                     new = _exp(lse - new_max, use_exp2)
-                    new_regs = [
-                        _to_raw(regs[i] * old + os[i] * new)
-                        for i in range_constexpr(VEC)
-                    ]
+                    if const_expr(VEC == 1):
+                        new_regs = [_to_raw(regs[0] * old + os * new)]
+                    else:
+                        new_regs = [
+                            _to_raw(regs[i] * old + os[i] * new)
+                            for i in range_constexpr(VEC)
+                        ]
                     results = yield new_regs + [
                         _to_raw(new_max), _to_raw(sum_e * old + new)
                     ]
@@ -369,11 +374,15 @@ def compile_mla_reduce(
                                       fx.Index(1), init=acc0):
                     regs = tuple(state[i] for i in range_constexpr(VEC))
                     rs = gather_row(fx.Int32(s), local_seq)
-                    os = load_o_elems(g_po, rs, fx.Index(head), col)
+                    os = load_o_vec(g_po, rs, fx.Index(head), col)
                     sc = lds_scale[fx.Index(s)]
-                    new_regs = [
-                        _to_raw(regs[i] + os[i] * sc) for i in range_constexpr(VEC)
-                    ]
+                    if const_expr(VEC == 1):
+                        new_regs = [_to_raw(regs[0] + os * sc)]
+                    else:
+                        new_regs = [
+                            _to_raw(regs[i] + os[i] * sc)
+                            for i in range_constexpr(VEC)
+                        ]
                     accr = yield new_regs
                 if const_expr(VEC == 1):
                     out_elems = [accr]
