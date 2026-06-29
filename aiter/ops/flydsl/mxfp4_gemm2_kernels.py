@@ -33,7 +33,15 @@ def _epilog_of(atomic, mxfp4out, cshuffle=False):
 
 @functools.cache
 def _get_compiled_mxfp4_gemm2_port(
-    BM, use_nt, NE, N_OUT, epilog, D_INTER, D_INTER_REAL=None, BN=256, BK=256,
+    BM,
+    use_nt,
+    NE,
+    N_OUT,
+    epilog,
+    D_INTER,
+    D_INTER_REAL=None,
+    BN=256,
+    BK=256,
     xcd_swizzle=0,
 ):
     from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port

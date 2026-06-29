@@ -19,7 +19,16 @@ _SUPPORTED = {
 
 @functools.cache
 def _get_compiled_mxfp4_gemm1_port(
-    BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, BN, BK, interleave=True,
+    BM,
+    use_nt,
+    inline_quant,
+    D_HIDDEN,
+    D_INTER,
+    NE,
+    topk,
+    BN,
+    BK,
+    interleave=True,
     xcd_swizzle=0,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
@@ -98,7 +107,16 @@ def flydsl_mxfp4_gemm1(
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
-        BM, use_nt, inline_quant, D_HIDDEN, D_INTER, NE, topk, BN, BK, interleave,
+        BM,
+        use_nt,
+        inline_quant,
+        D_HIDDEN,
+        D_INTER,
+        NE,
+        topk,
+        BN,
+        BK,
+        interleave,
         xcd_swizzle,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)

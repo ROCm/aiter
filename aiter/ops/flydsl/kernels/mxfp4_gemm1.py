@@ -850,9 +850,7 @@ def compile_gemm1_a4w4_port(
             group_id = wgid // _ng
             first_pid_m = group_id * fx.Int32(_SW)
             remaining_m = total_m_blocks - first_pid_m
-            group_size_m = fx.Int32(
-                arith.minsi(_raw(remaining_m), _raw(fx.Int32(_SW)))
-            )
+            group_size_m = fx.Int32(arith.minsi(_raw(remaining_m), _raw(fx.Int32(_SW))))
             wig = wgid % _ng
             m_block = first_pid_m + (wig % group_size_m)
             n_block = wig // group_size_m
