@@ -33,6 +33,7 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
     pack_int8_to_packed_int4,
     shuffle_scale_for_int4,
+    repack_mxfp4_for_gfx942_fp4_bf16,
 )
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
@@ -58,6 +59,8 @@ if is_flydsl_available():
         get_flydsl_stage2_kernels,
         get_flydsl_stage1_kernels_int4_bf16,
         get_flydsl_stage2_kernels_int4_bf16,
+        get_flydsl_stage1_kernels_fp4_bf16,
+        get_flydsl_stage2_kernels_fp4_bf16,
         flydsl_moe_stage1,
         flydsl_moe_stage2,
     )
@@ -1048,6 +1051,27 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle_ck = w2_qt_shffle
             w1_scale_aiter = w1_scale
             w2_scale_aiter = w2_scale
+        elif (
+            q_type == QuantType.per_1x32
+            and q_dtype_w == dtypes.fp4x2
+            and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+            and get_gfx() == "gfx942"
+        ):
+            # gfx942 a16w4: int4-style preshuffle + bf16-expanded scales.
+            E1, N1 = w1_qt.shape[0], w1_qt.shape[1]
+            K1 = w1_qt.shape[2] * 2
+            E2, N2 = w2_qt.shape[0], w2_qt.shape[1]
+            K2 = w2_qt.shape[2] * 2
+            w1_qt_shffle_flydsl, w1_scale_flydsl = repack_mxfp4_for_gfx942_fp4_bf16(
+                w1_qt, w1_scale, E1, N1, K1
+            )
+            w2_qt_shffle_flydsl, w2_scale_flydsl = repack_mxfp4_for_gfx942_fp4_bf16(
+                w2_qt, w2_scale, E2, N2, K2
+            )
+            w1_qt_shffle_ck = w1_qt_shffle
+            w2_qt_shffle_ck = w2_qt_shffle
+            w1_scale_aiter = w1_scale
+            w2_scale_aiter = w2_scale
         else:
             if w1_scale_aiter is None:
                 w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
@@ -1144,8 +1168,15 @@ class FmoeTuner(TunerCommon):
             # ref1 is always bf16
             ref1_bf16 = ref1
 
-            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-                # a16wi4: bf16 passthrough, no inter-stage quant
+            if q_type == QuantType.per_1x32 and (
+                q_dtype_w == dtypes.i4x2
+                or (
+                    q_dtype_w == dtypes.fp4x2
+                    and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+                    and get_gfx() == "gfx942"
+                )
+            ):
+                # a16wi4 / a16w4-gfx942: bf16 passthrough, no inter-stage quant
                 a2_qt = ref1
                 a2_scale = None
                 a2_scale_mxfp4_sort = None
@@ -2610,6 +2641,10 @@ class FmoeTuner(TunerCommon):
         if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
             return tasks_flydsl
 
+        # gfx942 a16w4 uses gen_flydsl_fp4_bf16_2stages_task, not this gfx950 path.
+        if q_dtype_a in (dtypes.bf16, dtypes.fp16) and gfx == "gfx942":
+            return tasks_flydsl
+
         _a_dtype_map = {
             dtypes.fp8: "fp8",
             dtypes.fp4x2: "fp4",
@@ -3087,6 +3122,213 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
+    def gen_flydsl_fp4_bf16_2stages_task(self, info, blockMs):
+        """gfx942 a16w4 (bf16 x MX-FP4) FlyDSL decode candidates."""
+        tasks_flydsl = []
+        if not is_flydsl_available():
+            return tasks_flydsl
+        (
+            gfx,
+            cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = info
+
+        if not (
+            q_type == QuantType.per_1x32
+            and q_dtype_w == dtypes.fp4x2
+            and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+            and gfx == "gfx942"
+        ):
+            return tasks_flydsl
+
+        out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+
+        flydsl_s1_kernels = get_flydsl_stage1_kernels_fp4_bf16(out_dtype_str)
+        flydsl_s2_kernels = get_flydsl_stage2_kernels_fp4_bf16(out_dtype_str)
+
+        for blockM in blockMs:
+            if blockM not in [16, 32, 64, 128] or not use_g1u1:
+                continue
+            for kname, kparams in flydsl_s1_kernels.items():
+                # a16w4 constraint: block_m == kn1.tile_m == kn2.tile_m.
+                ktm = kparams["tile_m"]
+                if ktm != blockM:
+                    continue
+                # All k_batch variants; the correctness gate drops bad configs.
+                kb = kparams.get("k_batch", 1)
+                if model_dim % kb != 0:
+                    continue
+                k_per_batch = model_dim // kb
+                if k_per_batch % kparams["tile_k"] != 0:
+                    continue
+                k_tiles = k_per_batch // kparams["tile_k"]
+                if k_tiles < 4 or k_tiles % 2 != 0:
+                    continue
+                # a16w4 stage1 output stays bf16 (no fuse_fp4 / fuse_fp8 requant)
+                ref_args_extra = (
+                    [
+                        "a1_qt",
+                        "w1_qt",
+                        "w2_qt",
+                        "topk_weights",
+                        "topk_ids",
+                        "a1_scale",
+                        "w1_scale",
+                        "sorted_ids",
+                        "num_valid_ids",
+                        "bias",
+                    ],
+                    dtype,
+                    act_type,
+                    q_type,
+                    doweight_stage1,
+                    topk,
+                    blockM,
+                )
+                tasks_flydsl.append(
+                    (
+                        (info, "stage1", kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        (
+                            token,
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            act_type,
+                            dtype,
+                            q_dtype_a,
+                            q_dtype_w,
+                            q_type,
+                            use_g1u1,
+                            doweight_stage1,
+                            blockM,
+                            1,
+                        ),
+                        FmoeTuner.run_flydsl_stage1_out,
+                        (
+                            [
+                                "a1_qt",
+                                "w1_qt_shffle_flydsl",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "sorted_weights",
+                                "num_valid_ids",
+                                "w1_scale_flydsl",
+                                "a1_scale_fp4_sort",
+                                "bias",
+                            ],
+                            dtype,
+                            topk,
+                            kparams,
+                            blockM,
+                            q_dtype_a,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage1,
+                        ref_args_extra,
+                        {},
+                        (None),
+                        0.01,
+                        0.01,
+                        True,
+                    )
+                )
+
+            for kname, kparams in flydsl_s2_kernels.items():
+                s2_tile_m = kparams["tile_m"]
+                if s2_tile_m != blockM:
+                    continue
+                if kparams.get("mode", "atomic") != "atomic":
+                    continue
+                if kparams.get("persist", None) is not None:
+                    continue
+                s2_kparams = {**kparams, "sort_block_m": blockM}
+                s2_kname = kname
+
+                s2_ref_args = (
+                    [
+                        "a2_qt",
+                        "w1_qt",
+                        "w2_qt",
+                        "topk_weights",
+                        "topk_ids",
+                        "a2_scale",
+                        "w2_scale",
+                        "bias",
+                    ],
+                    dtype,
+                    q_type,
+                    doweight_stage1,
+                )
+
+                tasks_flydsl.append(
+                    (
+                        (info, "stage2", s2_kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        (
+                            token,
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            act_type,
+                            dtype,
+                            q_dtype_a,
+                            q_dtype_w,
+                            q_type,
+                            use_g1u1,
+                            doweight_stage1,
+                            blockM,
+                            2,
+                        ),
+                        FmoeTuner.run_flydsl_stage2_out,
+                        (
+                            [
+                                "a2_qt",
+                                "w2_qt_shffle_flydsl",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "sorted_weights",
+                                "num_valid_ids",
+                                "w2_scale_flydsl",
+                                "a2_scale_mxfp4_sort",
+                                "moe_buf",
+                                "bias",
+                            ],
+                            dtype,
+                            topk,
+                            s2_kparams,
+                            blockM,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage2,
+                        s2_ref_args,
+                        {},
+                        (None),
+                        0.01,
+                        0.01,
+                        None,
+                    )
+                )
+
+        return tasks_flydsl
+
     def run_config(self, args):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import run_perftest, checkAllclose
@@ -3404,8 +3646,21 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
             if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
-                print(f"{q_type} is not supported on {get_gfx()}")
-                return []
+                # gfx942 per_1x32 is supported only via FlyDSL decode kernels.
+                _gfx942_flydsl_decode = (
+                    get_gfx() == "gfx942"
+                    and is_flydsl_available()
+                    and (
+                        q_dtype_w == dtypes.i4x2
+                        or (
+                            q_dtype_w == dtypes.fp4x2
+                            and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+                        )
+                    )
+                )
+                if not _gfx942_flydsl_decode:
+                    print(f"{q_type} is not supported on {get_gfx()}")
+                    return []
             if not use_g1u1:
                 print("no moe solution(g1u0) can tune for ", line)
                 continue
@@ -3426,11 +3681,25 @@ class FmoeTuner(TunerCommon):
                 use_g1u1,
                 doweight_stage1,
             )
-            tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
-            tasks_ck.extend(self.gen_2stages_task(info, blockMs))
-            tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+            # gfx942 per_1x32 decode is FlyDSL-only; CK/ASM generators have no kernel.
+            _gfx942_flydsl_only = (
+                gfx == "gfx942"
+                and q_type == QuantType.per_1x32
+                and (
+                    q_dtype_w == dtypes.i4x2
+                    or (
+                        q_dtype_w == dtypes.fp4x2
+                        and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+                    )
+                )
+            )
+            if not _gfx942_flydsl_only:
+                tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
+                tasks_ck.extend(self.gen_2stages_task(info, blockMs))
+                tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+                task_1stage.extend(self.gen_1stage_asm_task(info))
             tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
-            task_1stage.extend(self.gen_1stage_asm_task(info))
+            tasks_ck.extend(self.gen_flydsl_fp4_bf16_2stages_task(info, blockMs))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
                 continue
