@@ -181,31 +181,44 @@ jobs:
               python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
               python3 -m pip uninstall -y pylama || true
 
-              echo "==== Collect and shard FFM Triton test nodes ===="
-              python3 -m pytest --collect-only -q "${FFM_TEST}" > ffm_collected_nodes.txt
-              grep -E "^${FFM_TEST}/.*::" ffm_collected_nodes.txt > ffm_all_nodes.list || true
-              all_count="$(wc -l < ffm_all_nodes.list | tr -d " ")"
-              echo "Collected ${all_count} FFM Triton test node(s)"
-              if [ "${all_count}" -eq 0 ]; then
-                echo "::error::No FFM Triton test nodes collected from ${FFM_TEST}"
-                cat ffm_collected_nodes.txt
-                exit 1
-              fi
+              echo "==== Build FFM Triton shard ===="
+              printf "%s\n" \
+                "op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.py" \
+                > ffm_node_sharded_files.list
 
-              awk -v shard="${FFM_SHARD_INDEX}" -v shards="${FFM_SHARD_COUNT}" \
-                "((NR - 1) % shards) == shard" \
-                ffm_all_nodes.list > ffm_shard_nodes.list
-              shard_count="$(wc -l < ffm_shard_nodes.list | tr -d " ")"
-              echo "Selected ${shard_count} FFM Triton test node(s) for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
+              ./.github/scripts/split_tests.sh --shards "${FFM_SHARD_COUNT}" --test-type triton
+              grep -Fxv -f ffm_node_sharded_files.list "triton_shard_${FFM_SHARD_INDEX}.list" > ffm_shard_items.list || true
+
+              while IFS= read -r file; do
+                if [ ! -f "${file}" ]; then
+                  echo "Node-sharded file not present in reduced suite, skipping: ${file}"
+                  continue
+                fi
+                echo "Collecting node-sharded file: ${file}"
+                if ! python3 -m pytest --collect-only -q "${file}" > ffm_collect_one_file.txt 2>&1; then
+                  cat ffm_collect_one_file.txt
+                  echo "::error::Failed to collect ${file}"
+                  exit 1
+                fi
+                awk \
+                  -v prefix="${file}::" \
+                  -v shard="${FFM_SHARD_INDEX}" \
+                  -v shards="${FFM_SHARD_COUNT}" \
+                  'index($0, prefix) == 1 { n++; if (((n - 1) % shards) == shard) print }' \
+                  ffm_collect_one_file.txt >> ffm_shard_items.list
+              done < ffm_node_sharded_files.list
+
+              shard_count="$(wc -l < ffm_shard_items.list | tr -d " ")"
+              echo "Selected ${shard_count} FFM Triton item(s) for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
               if [ "${shard_count}" -eq 0 ]; then
-                echo "::error::No FFM Triton test nodes selected for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
+                echo "::error::No FFM Triton items selected for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
                 exit 1
               fi
-              cat ffm_shard_nodes.list
-              mapfile -t FFM_TEST_NODES < ffm_shard_nodes.list
+              cat ffm_shard_items.list
+              mapfile -t FFM_TEST_ITEMS < ffm_shard_items.list
 
               echo "==== Run sharded FFM Triton tests ===="
-              python3 -m pytest -v "${FFM_TEST_NODES[@]}"
+              python3 -m pytest -v "${FFM_TEST_ITEMS[@]}"
             '
 
       - name: Cleanup
