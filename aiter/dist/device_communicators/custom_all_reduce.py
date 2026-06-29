@@ -43,12 +43,15 @@ except Exception as e:
 def is_full_xgmi(physical_device_ids: List[int]) -> bool:
     # Custom IPC all-reduce requires every GPU pair to share a single-hop XGMI
     # (Infinity Fabric) link; otherwise the caller falls back to RCCL.
-    from amdsmi import (
-        amdsmi_init,
-        amdsmi_shut_down,
-        amdsmi_get_processor_handles,
-        amdsmi_topo_get_link_type,
-    )
+    try:
+        from amdsmi import (
+            amdsmi_init,
+            amdsmi_shut_down,
+            amdsmi_get_processor_handles,
+            amdsmi_topo_get_link_type,
+        )
+    except: 
+        return False
 
     amdsmi_init()
     handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
