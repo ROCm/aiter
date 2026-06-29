@@ -386,8 +386,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         quant_type="per_token",
         group_size=128,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
         quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
+        if gemma_norm and quant_type != "per_token":
+            raise NotImplementedError(
+                "gemma_norm fused quant currently supports per-token FP8 only"
+            )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
                 input_,
@@ -416,7 +421,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             (
                 hidden_dim in [512, 1024, 2048, 4096]
                 or (
-                    hidden_dim == 7168
+                    hidden_dim in [7168, 6144]
                     and input_.dtype in (torch.float16, torch.bfloat16)
                 )
             )
@@ -432,11 +437,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 else (total_bytes <= total_bytes_limit)
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
-                input_, res_inp_, weight_, eps, use_1stage
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                use_1stage,
+                gemma_norm=gemma_norm,
             )
         else:
             out_, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                prefill_support,
+                gemma_norm=gemma_norm,
             )
             hip_quant = get_hip_quant(QuantType.per_Token)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)

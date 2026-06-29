@@ -239,7 +239,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             eps,                                                 \
             m,                                                   \
             n,                                                   \
-            use_1stage);                                         \
+            use_1stage,                                          \
+            gemma_norm);                                         \
     }
 
     switch(dtype)
@@ -601,7 +602,8 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& w,
                                    double eps,
                                    int64_t reg_ptr, int64_t reg_bytes,
-                                   bool use_1stage)
+                                   bool use_1stage,
+                                   bool gemma_norm)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -621,14 +623,14 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage, gemma_norm);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage, false);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage, gemma_norm);
     }
 }
 

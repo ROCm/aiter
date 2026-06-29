@@ -174,15 +174,17 @@ def fused_allreduce_rmsnorm_quant_fake(
     eps: float,
     group_name: str,
     prefill_support: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del gemma_norm
     return (
         torch.empty_like(res_inp),
         torch.empty_like(inp),
-        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device()),
+        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device),
     )
 
 
-@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_fake)
 def fused_allreduce_rmsnorm_quant_(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -190,13 +192,14 @@ def fused_allreduce_rmsnorm_quant_(
     eps: float,
     group_name: str,
     prefill_support: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_quant_out_place(
-        inp, res_inp, w, eps, prefill_support
+        inp, res_inp, w, eps, prefill_support, gemma_norm=gemma_norm
     )
 
 
@@ -559,6 +562,7 @@ class GroupCoordinator:
         quant_type: Any = "per_token",
         group_size: int = 128,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
         if quant_type == "per_token" and group_size == 128 and not emit_bf16:
             return fused_allreduce_rmsnorm_quant_(
@@ -568,6 +572,7 @@ class GroupCoordinator:
                 eps,
                 group_name=self.unique_name,
                 prefill_support=prefill_support,
+                gemma_norm=gemma_norm,
             )
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -580,6 +585,7 @@ class GroupCoordinator:
             quant_type=quant_type,
             group_size=group_size,
             emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -690,6 +696,7 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
+        gemma_norm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -699,6 +706,7 @@ class GroupCoordinator:
             weight_,
             eps,
             prefill_support,
+            gemma_norm=gemma_norm,
         )
 
     def _fused_qknorm_allreduce_out_place(
