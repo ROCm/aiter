@@ -112,6 +112,32 @@ def parse_csv(csv_path: str):
             )
             stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
 
+            # CK-Tile stage1 (cktile_*) with split-K runs a FlyDSL post-activation
+            # epilogue on the interleaved gate/up output: silu -> silu_and_mul_fq
+            # (quant_mode="none", gui_layout=True), swiglu -> swiglu_and_mul.
+            # These are *not* flydsl_ stage names so the loop below skips them;
+            # emit a dedicated epilogue job here. The cache key depends only on
+            # (inter_dim, topk) for silu and (inter_dim) for swiglu, so the model
+            # shape from the CSV row covers it regardless of the runtime split_k
+            # (which the cfg=None heuristic path derives from get_ksplit()).
+            if stage1_name.startswith("cktile_"):
+                epi_job = {
+                    "kernel_name": f"cktile_epilogue_{act}",
+                    "stage": "epilogue",
+                    "act": act,
+                    "inter_dim": inter_dim,
+                    "topk": topk,
+                    "cu_num": cu_num,
+                    # Not used by the epilogue compile; zeroed so dedup keys on
+                    # (act, inter_dim, topk, cu_num) only.
+                    "model_dim": 0,
+                    "experts": 0,
+                }
+                key = job_identity(epi_job)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append(epi_job)
+
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
                 if not name or not name.startswith("flydsl_"):
@@ -748,6 +774,69 @@ def _precompile_to_cache(
                 )
 
 
+def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
+    """Precompile the CK-Tile split-K post-activation epilogue kernel.
+
+    cktile_moe_stage1 with split_k>1 emits a workspace of interleaved gate/up
+    output and then runs a FlyDSL epilogue to apply the activation:
+      silu  -> flydsl_silu_and_mul_interleaved (silu_and_mul_fq with
+               quant_mode="none", gui_layout=True)
+      swiglu -> flydsl_swiglu_and_mul_interleaved (swiglu_and_mul)
+    Dispatch through the same runtime builders so the cache key matches; the
+    key depends only on inter_dim (swiglu) / (inter_dim, topk) (silu), and the
+    row/token dims are dynamic, so dummy buffers suffice.
+    """
+    import torch
+
+    from aiter.ops.flydsl.moe_kernels import (
+        _get_compiled_silu_fused,
+        _get_compiled_swiglu,
+        _ptr_view_safe,
+        _run_compiled,
+    )
+
+    dev = torch.device("cpu")
+    rows = 256
+
+    # COMPILE_ONLY=1 makes the executor compile + persist the artifact without
+    # launching the kernel; without it _run_compiled would dispatch on the
+    # (absent) GPU under fake tensors and fault.
+    with compile_only_env():
+        if act == "swiglu":
+            exe = _get_compiled_swiglu(inter_dim)
+            x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
+            out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
+            _run_compiled(exe, (x, out, rows, 0))
+            return
+
+        exe = _get_compiled_silu_fused(
+            inter_dim, topk, quant_mode="none", gui_layout=True, act="silu"
+        )
+        x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
+        out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
+        empty_scale = torch.empty(0, dtype=torch.uint8, device=dev)
+        empty_i32 = torch.empty(0, dtype=torch.int32, device=dev)
+        empty_f32 = torch.empty(0, dtype=torch.float32, device=dev)
+        sorted_token_ids = torch.zeros(rows, dtype=torch.int32, device=dev)
+        num_valid_ids = torch.zeros(2, dtype=torch.int32, device=dev)
+        _run_compiled(
+            exe,
+            (
+                _ptr_view_safe(x),
+                _ptr_view_safe(out),
+                _ptr_view_safe(empty_scale),
+                _ptr_view_safe(sorted_token_ids),
+                _ptr_view_safe(num_valid_ids),
+                _ptr_view_safe(empty_i32),
+                _ptr_view_safe(empty_f32),
+                rows,
+                sorted_token_ids.shape[0],
+                float("inf"),
+                0,
+            ),
+        )
+
+
 def compile_one_config(
     kernel_name: str,
     model_dim: int,
@@ -765,10 +854,15 @@ def compile_one_config(
     Returns a dict with timing info.
     """
     aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
+    is_epilogue = kwargs.get("stage") == "epilogue"
     shape_str = (
-        f"{kernel_name}  "
-        f"model_dim={model_dim} inter_dim={inter_dim} "
-        f"E={experts} topk={topk}"
+        f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
+        if is_epilogue
+        else (
+            f"{kernel_name}  "
+            f"model_dim={model_dim} inter_dim={inter_dim} "
+            f"E={experts} topk={topk}"
+        )
     )
     result = {
         "kernel_name": kernel_name,
@@ -785,14 +879,21 @@ def compile_one_config(
             override_env("FLYDSL_GPU_ARCH", aot_arch),
             FakeTensorMode(),
         ):
-            _precompile_to_cache(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=experts,
-                topk=topk,
-                cu_num=cu_num,
-                **kwargs,
-            )
+            if is_epilogue:
+                _precompile_epilogue_to_cache(
+                    act=kwargs.get("act", "silu"),
+                    inter_dim=inter_dim,
+                    topk=topk,
+                )
+            else:
+                _precompile_to_cache(
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    experts=experts,
+                    topk=topk,
+                    cu_num=cu_num,
+                    **kwargs,
+                )
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
@@ -831,14 +932,16 @@ def main():
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
+    epilogue_jobs = [j for j in all_jobs if j["stage"] == "epilogue"]
     print("=" * 72)
     print("FlyDSL MoE AOT Pre-compilation")
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")
-    print(f"  Stage1 jobs:  {len(stage1_jobs)}")
-    print(f"  Stage2 jobs:  {len(stage2_jobs)}")
-    print(f"  Total jobs:   {len(all_jobs)}")
+    print(f"  Stage1 jobs:    {len(stage1_jobs)}")
+    print(f"  Stage2 jobs:    {len(stage2_jobs)}")
+    print(f"  Epilogue jobs:  {len(epilogue_jobs)}")
+    print(f"  Total jobs:     {len(all_jobs)}")
     print("  Compile arch: (from cu_num)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
@@ -846,11 +949,13 @@ def main():
 
     total_t0 = time.time()
 
-    # Stage1 and stage2 kernels are independent compiles (each writes its
-    # own artifact to cache; stage2 does not read stage1's output), so they
-    # share a single pool for maximum fan-out instead of two serial passes.
-    print(f"\n--- Compiling {len(all_jobs)} kernels (stage1 + stage2) ---")
-    results = run_jobs_parallel(compile_one_config, stage1_jobs + stage2_jobs)
+    # Stage1, stage2 and CK-Tile epilogue kernels are independent compiles
+    # (each writes its own artifact to cache; none reads another's output), so
+    # they share a single pool for maximum fan-out instead of serial passes.
+    print(f"\n--- Compiling {len(all_jobs)} kernels (stage1 + stage2 + epilogue) ---")
+    results = run_jobs_parallel(
+        compile_one_config, stage1_jobs + stage2_jobs + epilogue_jobs
+    )
 
     total_elapsed = time.time() - total_t0
 

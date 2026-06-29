@@ -81,5 +81,7 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
     }
 
 
-def _is_mxfp4_kname(kname: str) -> bool:
-    return bool(kname) and kname.startswith("flydsl_mxmoe_g")
+def _is_mxfp4_kname(kname) -> bool:
+    # CSV tune files leave kernelName empty for 1-stage configs; pandas loads
+    # those cells as float('nan'), and bool(nan) is True, so guard on str type.
+    return isinstance(kname, str) and kname.startswith("flydsl_mxmoe_g")

@@ -1939,9 +1939,9 @@ def get_2stage_cfgs(
             run_1stage,
             flat=cfg_flat,
         )
-    is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
-    is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
-    is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
+    is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
+    is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
+    is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
