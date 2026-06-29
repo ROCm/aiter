@@ -47,6 +47,10 @@ from aiter.ops.flydsl.kernels.pipeline_utils import (
     tdm_epilogue_fence_threshold_bytes,
 )
 
+# Experiment: drop a fraction of WMMA (MFMA). 1=keep all, 2=keep half. Probe
+# only -- skipped accumulators are not updated (results become wrong).
+_WMMA_KEEP_FRAC = int(os.environ.get("AITER_WMMA_KEEP_FRAC", "1") or "1", 0)
+
 # Common constants
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 128
 WAVE_SIZE = 32
@@ -1177,6 +1181,8 @@ def compile_mxscale_gemm(
             def _emit_wmma(accs, wm, wn, ks, a_frag, b_frags, a_scales, b_scales):
                 """Emit one WMMA instruction (format-specific)."""
                 idx = wm * wmma_n_rep + wn
+                if const_expr(_WMMA_KEEP_FRAC > 1 and (idx % _WMMA_KEEP_FRAC) != 0):
+                    return
                 if const_expr(use_scale_opsel):
                     a_scale_idx = wm // 2
                     a_opsel = wm % 2
@@ -1457,6 +1463,10 @@ def compile_mxscale_gemm(
                         row_base = group_base + wm_local * _bank_half_wn
                         for wn_local in range_constexpr(_bank_half_wn):
                             idx = row_base + wn_local
+                            if const_expr(
+                                _WMMA_KEEP_FRAC > 1 and (idx % _WMMA_KEEP_FRAC) != 0
+                            ):
+                                continue
                             current_accs[idx] = rocdl.wmma_scale_f32_32x16x128_f4(
                                 T.vec(16, T.f32),
                                 b_frags[wn_local],

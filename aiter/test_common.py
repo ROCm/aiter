@@ -76,9 +76,22 @@ def perftest(
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
             if int(os.environ.get("AITER_LOG_MORE", 0)) or use_cuda_event:
-                latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
+                if use_cuda_event:
+                    # Time the WHOLE loop (events outside the loop): one sync, no
+                    # per-iter empty_cache, so iterations pipeline and the GPU
+                    # stays saturated -> steady-state throughput, not per-call
+                    # latency. Use run_iters_rotate (same arg rotation as the
+                    # profiler-trace path) to defeat L2 reuse -> apples-to-apples.
+                    start_event.record()
+                    data = run_iters_rotate(num_iters, func, rotate_args)
+                    end_event.record()
+                    end_event.synchronize()
+                    avg = start_event.elapsed_time(end_event) * 1000 / num_iters
+                    logger.info(f"avg: {avg} us/iter from cuda.Event (loop)")
+                    return data, avg
+                latencies = []
                 for _ in range(num_iters):
                     start_event.record()
                     data = func(*args, **kwargs)
@@ -88,8 +101,6 @@ def perftest(
                     torch.cuda.empty_cache()
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
-                if use_cuda_event:
-                    return data, avg
 
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],

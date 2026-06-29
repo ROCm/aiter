@@ -211,21 +211,45 @@ def _torch_moe_ref(
 # Mock data builders
 # ---------------------------------------------------------------------------
 def _pattern_packed(
-    experts: int, rows: int, k_pack: int, *, zero_init: bool = False
+    experts: int,
+    rows: int,
+    k_pack: int,
+    *,
+    zero_init: bool = False,
+    half_init: bool = False,
 ) -> torch.Tensor:
-    """mxfp4 packed bytes ``(E, rows, k_pack) uint8`` from the global RNG."""
+    """mxfp4 packed bytes ``(E, rows, k_pack) uint8`` from the global RNG.
+
+    ``half_init`` fills every mxfp4 nibble with 0x1, the e2m1 code for 0.5 (a
+    clean power-of-two with zero mantissa); paired with a 2^0 e8m0 scale every
+    weight dequantizes to exactly 0.5."""
     if zero_init:
         return torch.zeros((experts, rows, k_pack), dtype=torch.uint8)
+    if half_init:
+        # 0x11: two packed e2m1 nibbles of 0x1 (= 0.5) per byte.
+        return torch.full((experts, rows, k_pack), 0x11, dtype=torch.uint8)
     return torch.randint(0, 256, (experts, rows, k_pack), dtype=torch.uint8)
 
 
 def init_weight_scales(
-    experts: int, rows: int, n_blocks: int, *, zero_init: bool = False
+    experts: int,
+    rows: int,
+    n_blocks: int,
+    *,
+    zero_init: bool = False,
+    half_init: bool = False,
 ) -> torch.Tensor:
     """Per-block e8m0 weight scale: random small scales (drawn from the global
-    RNG) so the n32k4 B-scale preshuffle layout is actually exercised."""
+    RNG) so the n32k4 B-scale preshuffle layout is actually exercised.
+
+    ``half_init`` uses a unit (2^0) scale so the 0.5 mxfp4 nibbles dequantize to
+    exactly 0.5; e8m0 is a pure exponent, so the scale has no mantissa to clean."""
     if zero_init:
         return torch.zeros((experts, rows, n_blocks), dtype=torch.uint8)
+    if half_init:
+        return torch.full(
+            (experts, rows, n_blocks), DEFAULT_SCALE_BYTE, dtype=torch.uint8
+        )
     r = torch.randint(0, 3, (experts, rows, n_blocks), dtype=torch.int16)
     return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
 
@@ -280,6 +304,7 @@ def _run_grouped_via_fused_moe(
     warmup: int = 5,
     iters: int = 101,
     zero_init: bool = False,
+    half_init: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[float]]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -308,18 +333,25 @@ def _run_grouped_via_fused_moe(
     # Logical weights/scale/bias: always GGUU (gate rows then up rows).
     # One global seed per case; every draw below uses the global RNG.
     torch.manual_seed(seed)
-    w1_logical = _pattern_packed(experts, 2 * inter, K_pack, zero_init=zero_init)
-    w2_logical = _pattern_packed(experts, K, inter_pack, zero_init=zero_init)
+    w1_logical = _pattern_packed(
+        experts, 2 * inter, K_pack, zero_init=zero_init, half_init=half_init
+    )
+    w2_logical = _pattern_packed(
+        experts, K, inter_pack, zero_init=zero_init, half_init=half_init
+    )
     w1_scale_raw = init_weight_scales(
-        experts, 2 * inter, K // SCALE_BLOCK, zero_init=zero_init
+        experts, 2 * inter, K // SCALE_BLOCK, zero_init=zero_init, half_init=half_init
     )
     w2_scale_raw = init_weight_scales(
-        experts, K, inter // SCALE_BLOCK, zero_init=zero_init
+        experts, K, inter // SCALE_BLOCK, zero_init=zero_init, half_init=half_init
     )
     if use_bias:
         if zero_init:
             bias1 = torch.zeros((experts, 2 * inter))
             bias2 = torch.zeros((experts, K))
+        elif half_init:
+            bias1 = torch.full((experts, 2 * inter), 0.5)
+            bias2 = torch.full((experts, K), 0.5)
         else:
             bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).float()
             bias2 = (torch.randn((experts, K)) * 1e-3).float()
@@ -329,6 +361,9 @@ def _run_grouped_via_fused_moe(
     # Activations: bf16; fused_moe handles the dispatched quant internally.
     if zero_init:
         hidden = torch.zeros((tokens, K), dtype=torch.bfloat16)
+    elif half_init:
+        # 0.5 is exact in bf16 (clean mantissa).
+        hidden = torch.full((tokens, K), 0.5, dtype=torch.bfloat16)
     else:
         hidden = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
 
@@ -465,6 +500,7 @@ def run_moe(
     warmup: int = 5,
     iters: int = 101,
     zero_init: bool = False,
+    half_init: bool = False,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
     validated path: bench checks (and times) the CUDA-graph production path;
@@ -494,6 +530,7 @@ def run_moe(
         warmup=warmup,
         iters=iters,
         zero_init=zero_init,
+        half_init=half_init,
     )
     mode = "graph" if bench else "eager"
     ld = _logits_diff(out, ref)
@@ -680,6 +717,12 @@ def main() -> None:
         "and weight scales (Bs) to zero instead of random values",
     )
     parser.add_argument(
+        "--half-init",
+        action="store_true",
+        help="initialize activations (A), weights (B), and bias to exactly 0.5 "
+        "(clean mantissa) with a unit weight scale, instead of random values",
+    )
+    parser.add_argument(
         "--real-gemm",
         action="store_true",
         default=is_gfx1250(),
@@ -687,6 +730,8 @@ def main() -> None:
         "False elsewhere (mock the GEMM so the tiny operators run on any arch).",
     )
     args = parser.parse_args()
+    if args.zero_init and args.half_init:
+        raise SystemExit("--zero-init and --half-init are mutually exclusive")
     # Toggle wave-specialized TDM for the grouped gemm1 and gemm2 (read by
     # grouped_moe; applied where valid).
     _wst = "1" if args.wst else "0"
@@ -731,6 +776,7 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
             zero_init=args.zero_init,
+            half_init=args.half_init,
         )
         rows.append(
             {
