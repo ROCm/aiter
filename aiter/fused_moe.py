@@ -22,6 +22,18 @@ from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+# Route moe_sorting to the FlyDSL atomicAdd (lazy-index) implementation.
+# Falls back to CK automatically for cases it does not support (expert_mask /
+# num_local_tokens / flydsl unavailable).
+_USE_FLYDSL_MOE_SORTING = (
+    os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
+    and is_flydsl_available()
+)
+
+
+def _flydsl_moe_sorting_supported(expert_mask, num_local_tokens):
+    """The FlyDSL atomic sort only covers the plain (no-EP) sorting path."""
+    return expert_mask is None and num_local_tokens is None
 
 
 def _moe_sorting_impl(
@@ -35,6 +47,8 @@ def _moe_sorting_impl(
     num_local_tokens,
     dispatch_policy,
     use_opus,
+    use_flydsl=False,
+    skip_moe_buf_zero=False,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -48,6 +62,29 @@ def _moe_sorting_impl(
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+
+    if use_flydsl and _flydsl_moe_sorting_supported(expert_mask, num_local_tokens):
+        from aiter.ops.flydsl.moe_sorting_api import moe_sorting_atomic_fwd
+
+        ti = topk_ids if topk_ids.dtype == dtypes.i32 else topk_ids.to(dtypes.i32)
+        tw = (
+            topk_weights
+            if topk_weights.dtype == dtypes.fp32
+            else topk_weights.to(dtypes.fp32)
+        )
+        moe_sorting_atomic_fwd(
+            ti,
+            tw,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            int(block_size),
+            skip_moe_buf_zero=skip_moe_buf_zero,
+        )
+        return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -77,6 +114,7 @@ def moe_sorting(
     expert_mask=None,
     num_local_tokens=None,
     dispatch_policy=0,
+    skip_moe_buf_zero=False,
 ):
     try:
         return _moe_sorting_impl(
@@ -90,6 +128,8 @@ def moe_sorting(
             num_local_tokens,
             dispatch_policy,
             use_opus=_USE_OPUS_MOE_SORTING,
+            use_flydsl=_USE_FLYDSL_MOE_SORTING,
+            skip_moe_buf_zero=skip_moe_buf_zero,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -438,6 +478,7 @@ def fused_moe_(
                 expert_mask,
                 num_local_tokens,
                 moe_sorting_dispatch_policy,
+                skip_moe_buf_zero=metadata.skip_moe_buf_zero,
             )
         )
         sorted_ids2 = sorted_ids1
@@ -455,6 +496,7 @@ def fused_moe_(
             expert_mask,
             num_local_tokens,
             moe_sorting_dispatch_policy,
+            skip_moe_buf_zero=metadata.skip_moe_buf_zero,
         )
         sorted_ids2, sorted_weights2, sorted_expert_ids2, num_valid_ids2, moe_buf = (
             moe_sorting(
@@ -467,6 +509,7 @@ def fused_moe_(
                 expert_mask,
                 num_local_tokens,
                 moe_sorting_dispatch_policy,
+                skip_moe_buf_zero=metadata.skip_moe_buf_zero,
             )
         )
         # Different block_m can legitimately produce different padded valid-id
@@ -1145,6 +1188,9 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_fp4_quant: bool = False
     stage0: Callable = None
+    # stage2 writes its final result (reduce/split-reduce) instead of
+    # atomic-accumulating into moe_buf -> the moe_buf pre-zero can be skipped.
+    skip_moe_buf_zero: bool = False
 
     def __post_init__(self):
         if self.block_m2 is None:
@@ -1645,11 +1691,19 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
 
+        # A FlyDSL reduce/split-reduce stage2 writes its final result instead of
+        # atomic-accumulating into moe_buf, so the moe_buf pre-zero is unnecessary.
+        _s2_reduce = False
         if is_flydsl2:
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
             )
+            _p2 = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName2)
+            if _p2:
+                _s2_reduce = _p2.get("mode") == "reduce" or bool(
+                    _p2.get("split_reduce", False)
+                )
         else:
             stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
@@ -1667,6 +1721,7 @@ def get_2stage_cfgs(
             block_m2=block_m2,
             run_1stage=run_1stage,
             fuse_fp4_quant=_s1_fq and q_type2 == QuantType.per_1x32,
+            skip_moe_buf_zero=_s2_reduce,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
