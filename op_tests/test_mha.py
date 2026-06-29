@@ -91,6 +91,7 @@ def run_ck(
     return_attn_probs=False,
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
+    num_splits=0,
 ):
     (out, softmax_lse, S_dmask), us_fwd = run_perftest(
         aiter.flash_attn_func,
@@ -109,6 +110,7 @@ def run_ck(
         how_v3_bf16_cvt=2,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_kv=cu_seqlens_kv,
+        num_splits=num_splits,
         num_rotate_args=1,
     )
 
@@ -213,6 +215,7 @@ def test_flash_attn_output(
     gqa_ratio,
     dtype,
     input_layout,
+    num_splits=0,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -302,6 +305,7 @@ def test_flash_attn_output(
         deterministic,
         return_lse,
         return_attn_probs,
+        num_splits=num_splits,
     )
 
     out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
@@ -417,6 +421,7 @@ def flash_attn_output_benchmark(
     gqa_ratio,
     dtype,
     input_layout,
+    num_splits=0,
 ):
     return test_flash_attn_output(
         batch_size,
@@ -433,6 +438,7 @@ def flash_attn_output_benchmark(
         gqa_ratio,
         dtype,
         input_layout,
+        num_splits=num_splits,
     )
 
 
@@ -808,6 +814,13 @@ parser.add_argument(
     help="""input_layout.
     e.g.: -i BSHD""",
 )
+parser.add_argument(
+    "-ns",
+    "--num_splits",
+    type=int,
+    default=0,
+    help="native split-K num_splits (0=auto/heuristic, 1=disable split-K, >=2 forces native if capable)",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
 
@@ -842,6 +855,7 @@ if __name__ == "__main__":
             gqa_ratio,
             dtypes.d_dtypes[dtype],
             args.input_layout,
+            args.num_splits,
         )
         collected.append(ret)
         # test_flash_attn_seq_padding(
