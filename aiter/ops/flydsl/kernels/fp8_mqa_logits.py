@@ -317,6 +317,13 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
             v2 = i32_view.vec_load((dword_off,), vec_size=2)
             return Vec(v2).bitcast(fx.Int64)[0].ir_value()
 
+        # def _load_pack_i64x2(i32_view, byte_off_i32):
+        #     dword_off = fx.Int32(
+        #         arith.divui(_to_raw(byte_off_i32), _to_raw(fx.Int32(4)))
+        #     )
+        #     v4 = i32_view.vec_load((dword_off,), vec_size=4)
+        #     return Vec(v4).bitcast(fx.Int64)[0].ir_value()
+
         # ---- FN -> FNUZ in-kernel byte conversion ----
         def _fn_to_fnuz_i64(raw_i64):
             """Map FN byte 0x80 (neg-zero) -> 0x00 in 8 packed fp8 bytes."""
@@ -481,7 +488,7 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
 
                     # --- Head reduction step 1: in-register partial sum ---
                     # Each lane accumulates M_TILES * ACC_ELEMS MFMA output elements
-                    # (covering different head subsets) into col_sum via scale/ReLU/weight.
+                    # (covering different head subsets) into col_sum via ReLU/weight.
                     for mi in range_constexpr(M_TILES):
                         acc = Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32)
                         for kk in range_constexpr(K_STEPS):
@@ -490,11 +497,11 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                                 [a_packs[j][mi][kk], b_packs[ni][kk], acc, 0, 0, 0],
                             )
                         for ii in range_constexpr(mfma.ACC_ELEMS):
-                            score  = Vec(acc)[ii].ir_value()
-                            scaled = arith.MulFOp(score, kv_scale, fastmath=fm_fast).result
-                            relu   = arith.maximumf(scaled, _to_raw(f32_0))
-                            wsc    = arith.MulFOp(relu, w_frag[j][mi][ii], fastmath=fm_fast).result
+                            score   = Vec(acc)[ii].ir_value()
+                            relu    = arith.maximumf(score, _to_raw(f32_0))
+                            wsc     = arith.MulFOp(relu, w_frag[j][mi][ii], fastmath=fm_fast).result
                             col_sum = arith.AddFOp(col_sum, wsc, fastmath=fm_fast).result
+                    col_sum = arith.MulFOp(col_sum, kv_scale, fastmath=fm_fast).result
 
                     # --- Head reduction step 2: shuffle_xor butterfly (within wave) ---
                     # mfma.shuffle_offsets covers all lane groups so every lane ends up
