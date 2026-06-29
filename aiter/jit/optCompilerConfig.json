@@ -768,7 +768,8 @@
         ],
         "flags_extra_hip": [
             "'-mllvm -greedy-reverse-local-assignment=1'",
-            "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
+            "'-mllvm --amdgpu-use-amdgpu-trackers=1'",
+            "'--save-temps'"
         ],
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances_cktile.py --working_path {{}} --tune'"

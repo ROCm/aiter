@@ -421,7 +421,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         task_asm = []
 
         ### asm kernels
-        asm_kernels_id = ck_kernels_num + 1
+        asm_kernels_id = 0
         asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
         asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
         asm_tiles = [key for key in asm_kernels.keys()]
@@ -440,7 +440,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 maxsplitK = 0
             for splitK in range(maxsplitK + 1):
                 kernel_name = kernelName[0]
-                info = ((gfx, cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
+                info = ((gfx, cu_num, M, N, K), asm_kernels_id, splitK, kernel_name, "asm")
                 task_asm.append(
                     (
                         info,
