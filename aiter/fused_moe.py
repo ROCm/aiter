@@ -3155,7 +3155,14 @@ def ck_moe_stage1(
     dtype=None,
 ):
     token_num = hidden_states.shape[0]
-    is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
+    # Only enable split-k when each K partition owns >= 2 k-tiles
+    # (KBatch = K / (splitk * KPerBlock), KPerBlock == 256). When KBatch == 1 the
+    # CK kernel uses atomic-add but skips the output memset, accumulating onto
+    # uninitialized memory -> gibberish. This guards splitk from CSV / AITER_KSPLIT
+    # that bypass get_ksplit's KBatch >= 2 check.
+    KPerBlock = 256
+    k_batch = (hidden_states.shape[1] // splitk) // KPerBlock if splitk > 1 else 1
+    is_splitk = quant_type == QuantType.per_1x128 and splitk > 1 and k_batch >= 2
     if is_splitk:
         # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
         sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
