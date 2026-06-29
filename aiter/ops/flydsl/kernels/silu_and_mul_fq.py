@@ -79,9 +79,23 @@ def build_silu_and_mul_fq_module(
 
     scale_cols = inter_dim // 32
     ELEMS_PER_THREAD = (inter_dim + BLOCK_THREADS - 1) // BLOCK_THREADS
-    VEC = max(ELEMS_PER_THREAD, 2)
-    if VEC % 2 != 0:
-        VEC += 1
+    # VEC must be a power of two: the divisors of 32 are exactly the powers of
+    # two, and VEC has to evenly divide both the 32-element quant block
+    # (THREADS_PER_QUANT_BLK = 32 // VEC) and, for the block-interleave layout,
+    # the 16-element gate/up block (a thread's VEC columns are loaded as one
+    # contiguous vector, so they must stay within a single block). Rounding only
+    # up to even is not enough: inter_dim=1536 gives ELEMS_PER_THREAD=6, and
+    # VEC=6 divides neither 32 nor 16. Round up to the next power of two instead.
+    #
+    # Cap at 8: a VEC bf16 vector is loaded/stored as a (VEC*2/4)-dword buffer
+    # op, so VEC=8 is dwordx4 (128-bit) -- the widest the AMDGPU backend can
+    # select. VEC=16 would be dwordx8 (256-bit) and fails instruction selection
+    # ("Cannot select AMDGPUISD::BUFFER_LOAD"). Wider inter_dim is handled by
+    # extra iterations of the COLS_PER_ITER loop, not a wider VEC.
+    VEC = 2
+    while VEC < ELEMS_PER_THREAD:
+        VEC *= 2
+    VEC = min(VEC, 8)
     assert 32 % VEC == 0, f"VEC={VEC} must divide 32 evenly"
     if gui_layout:
         assert VEC <= 16, f"VEC={VEC} must be <=16 for block-interleave layout"
