@@ -72,20 +72,6 @@ def _log(x):
     return mlir_math.log(x, fastmath=fm_fast)
 
 
-def _as_list(state, n):
-    """Normalize a loop-carried state to a list of n values.
-
-    FlyDSL's range(init=...) unwraps a single-element carry to a bare scalar;
-    re-wrap so element indexing works uniformly for VEC==1.
-    """
-    if n == 1:
-        try:
-            return [state[0]]
-        except (TypeError, KeyError):
-            return [state]
-    return [state[i] for i in range(n)]
-
-
 # Massive-path sub-tiers (mirror MlaReduceProblemSize, reduce.cu:121).
 #   simple : register online-softmax, num_splits in {2,3}
 #   m64    : <=64 splits, 1 LSE per lane in warp0
@@ -379,12 +365,13 @@ def compile_mla_reduce(
 
                 gpu.barrier()
 
-                acc0 = [_to_raw(arith.constant(0.0, type=T.f32))
-                        for _ in range_constexpr(VEC)]
-                accr = acc0
+                acc0 = tuple(
+                    _to_raw(arith.constant(0.0, type=T.f32))
+                    for _ in range_constexpr(VEC)
+                )
                 for s, state in range(fx.Index(0), fx.Index(n_splits),
                                       fx.Index(1), init=acc0):
-                    regs = _as_list(state, VEC)
+                    regs = tuple(state[i] for i in range_constexpr(VEC))
                     rs = gather_row(fx.Int32(s), local_seq)
                     os = load_o_elems(g_po, rs, fx.Index(head), col)
                     sc = lds_scale[fx.Index(s)]
@@ -392,8 +379,10 @@ def compile_mla_reduce(
                         _to_raw(regs[i] + os[i] * sc) for i in range_constexpr(VEC)
                     ]
                     accr = yield new_regs
-                accr = _as_list(accr, VEC)
-                out_elems = [accr[i] for i in range_constexpr(VEC)]
+                if const_expr(VEC == 1):
+                    out_elems = [accr]
+                else:
+                    out_elems = [accr[i] for i in range_constexpr(VEC)]
                 store_result(seq, out_elems)
             scf.YieldOp([])
         return
