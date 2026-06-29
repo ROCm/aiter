@@ -382,8 +382,8 @@ def grad_bias_reduce_kernel(
 
 @flyc.kernel
 def grad_dense_partials_kernel(
-    PARTIALS: fx.Tensor,      # out    (n_groups * SPLIT * K, N)  fp32
-    BIAS_PARTIALS: fx.Tensor, # out    (n_groups * SPLIT, N)      fp32  (fused dBias)
+    PARTIALS: fx.Tensor,      # out  SPLIT>=2: (n_groups*SPLIT*K, N) fp32 scratch; SPLIT==1: bf16 dDense (n_groups*K, N)
+    BIAS_PARTIALS: fx.Tensor, # out  SPLIT>=2: (n_groups*SPLIT, N) fp32 (fused dBias); SPLIT==1: bf16 dBias (n_groups, N)
     JAGGED: fx.Tensor,        # jagged (L, K)                     bf16
     DOUT: fx.Tensor,          # grad   (L, N)                     bf16
     SEQ_OFFSETS: fx.Tensor,   # (n_groups + 1,) int32
@@ -515,14 +515,31 @@ def grad_dense_partials_kernel(
         _carry_out = yield [bias_acc]
     bias_acc_final = _carry_out
 
-    # Epilogue: write the fp32 accumulator straight to the fp32 partials scratch
-    # (no bf16 cast; the reduce pass does the final fp32 -> bf16).
-    thr_copy_r2g_C = fx.make_tiled_copy_C(
-        fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32), tiled_mma
-    ).get_slice(tid)
-    mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C)
-    thr_gPart = thr_copy_r2g_C.partition_S(gPart)
-    fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32), mma_frag_C_retile, thr_gPart)
+    # Epilogue. SPLIT==1 (e.g. D=512): each (K,N) tile is fully reduced inside this one
+    # workgroup, so truncate the fp32 accumulator to bf16 and store it STRAIGHT to dDense
+    # (PARTIALS *is* the bf16 dDense view in that case -- part_off collapses to the
+    # dDense element offset since off_s==0). This skips the fp32 partials round-trip and
+    # the separate grad_dense_reduce launch. SPLIT>=2 (e.g. D=256): write the fp32
+    # accumulator to the partials scratch; the reduce pass sums the SPLIT partials and
+    # casts to bf16.
+    if fx.const_expr(SPLIT == 1):
+        mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
+        thr_copy_r2g_C = fx.make_tiled_copy_C(
+            fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), tiled_mma
+        ).get_slice(tid)
+        mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C_bf16)
+        thr_gPart = thr_copy_r2g_C.partition_S(gPart)
+        mma_frag_C_bf16.store(
+            fx.arith.trunc_f(fx.T.VectorType.get([64], fx.T.bf16()), mma_frag_C.load())
+        )
+        fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), mma_frag_C_retile, thr_gPart)
+    else:
+        thr_copy_r2g_C = fx.make_tiled_copy_C(
+            fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32), tiled_mma
+        ).get_slice(tid)
+        mma_frag_C_retile = thr_copy_r2g_C.retile(mma_frag_C)
+        thr_gPart = thr_copy_r2g_C.partition_S(gPart)
+        fx.copy(fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32), mma_frag_C_retile, thr_gPart)
 
     # Fused dBias epilogue: combine the per-thread column partials through LDS (the
     # sJ/sD staging region is dead now, so reuse it as fp32 scratch -> no extra smem,
@@ -542,8 +559,15 @@ def grad_dense_partials_kernel(
             BP_buf = fx.rocdl.make_buffer_tensor(BIAS_PARTIALS, max_size=True)
             part_row = off_b * fx.Int32(SPLIT) + off_s
             bp_div = fx.logical_divide(fx.slice(BP_buf, (part_row, None)), fx.make_layout(1, 1))
-            copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-            _store_scalar(copy_f32, fx.Float32, bp_div, n_off + tid, col_sum)
+            if fx.const_expr(SPLIT == 1):
+                # SPLIT==1: BIAS_PARTIALS is the bf16 dBias view (part_row == off_b),
+                # so write the final column sum straight to dBias[b] -- no separate
+                # grad_bias_reduce launch.
+                copy_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+                _store_scalar(copy_bf16, fx.BFloat16, bp_div, n_off + tid, col_sum.to(fx.BFloat16))
+            else:
+                copy_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+                _store_scalar(copy_f32, fx.Float32, bp_div, n_off + tid, col_sum)
 
 
 @flyc.kernel
@@ -592,10 +616,15 @@ def grad_dense_bias(
 
     Both reduce over the dynamic sequence axis m, so the dBias column-sums are fused
     into the dDense partials pass (which already streams dOut through LDS) instead of
-    re-reading dOut in a separate kernel. Three launches: one bf16-MFMA partials pass
-    writes both the fp32 (K, N) dDense partials and the fp32 (N,) dBias partials per
-    (group, split), then two light reduce passes sum the SPLIT partials into bf16
-    dDense and dBias respectively.
+    re-reading dOut in a separate kernel.
+
+    Two launch schedules, chosen by the compile-time SPLIT:
+      * SPLIT == 1 (e.g. D=512): each (K, N) tile is fully reduced inside one workgroup,
+        so the partials pass truncates its fp32 accumulator to bf16 and writes dDense +
+        dBias DIRECTLY -- no fp32 scratch round-trip and no reduce passes (1 launch).
+      * SPLIT >= 2 (e.g. D=256): three launches -- one bf16-MFMA partials pass writes the
+        fp32 (K, N) dDense partials and fp32 (N,) dBias partials per (group, split), then
+        two light reduce passes sum the SPLIT partials into bf16 dDense and dBias.
     """
     # Same MFMA atom + tiling as the forward GEMM: 16x16x16 bf16, 4 N-atoms per
     # 256-thread workgroup, natural (4,4,2) K-fragment ordering. Here the operands
@@ -605,13 +634,21 @@ def grad_dense_bias(
         fx.make_layout((1, 4, 1), (0, 1, 0)),
         fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
     )
-    grad_dense_partials_kernel(partials, bias_partials, JAGGED, dOut, SEQ_OFFSETS, tiled_mma).launch(
-        grid=(NK_TILES * NN_TILES, SPLIT, n_groups), block=(DDENSE_THREADS, 1, 1),
-        smem=_DDENSE_SMEM_BYTES, stream=stream
-    )
-    grad_dense_reduce_kernel(dDense, partials).launch(
-        grid=(NRED_COL_TILES, K, n_groups), block=(NRED_BLK, 1, 1), stream=stream
-    )
-    grad_bias_reduce_kernel(dBias, bias_partials).launch(
-        grid=(NRED_COL_TILES, n_groups, 1), block=(NRED_BLK, 1, 1), stream=stream
-    )
+    if SPLIT == 1:
+        # SPLIT==1 fast path: partials kernel writes bf16 dDense + dBias directly
+        # (dDense/dBias passed as the PARTIALS/BIAS_PARTIALS args); scratch unused.
+        grad_dense_partials_kernel(dDense, dBias, JAGGED, dOut, SEQ_OFFSETS, tiled_mma).launch(
+            grid=(NK_TILES * NN_TILES, SPLIT, n_groups), block=(DDENSE_THREADS, 1, 1),
+            smem=_DDENSE_SMEM_BYTES, stream=stream
+        )
+    else:
+        grad_dense_partials_kernel(partials, bias_partials, JAGGED, dOut, SEQ_OFFSETS, tiled_mma).launch(
+            grid=(NK_TILES * NN_TILES, SPLIT, n_groups), block=(DDENSE_THREADS, 1, 1),
+            smem=_DDENSE_SMEM_BYTES, stream=stream
+        )
+        grad_dense_reduce_kernel(dDense, partials).launch(
+            grid=(NRED_COL_TILES, K, n_groups), block=(NRED_BLK, 1, 1), stream=stream
+        )
+        grad_bias_reduce_kernel(dBias, bias_partials).launch(
+            grid=(NRED_COL_TILES, n_groups, 1), block=(NRED_BLK, 1, 1), stream=stream
+        )

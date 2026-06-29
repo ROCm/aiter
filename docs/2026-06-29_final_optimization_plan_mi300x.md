@@ -146,7 +146,18 @@ matters **more at D=256** (SPLIT=2 doubles the partials work + the reduce traffi
   Utilization ↑ (toward `grad_jagged`'s 36%); partials µs ↓.
 - **Gate:** ≥1.15× on `grad_dense_partials` µs (rocprof) at **both** D=256 and D=512,
   correctness green.
-- [ ] vectorized staging  [ ] dBias-fusion rework  [ ] re-profile + EXP block.
+- [x] vectorized staging  [x] dBias-fusion rework  [x] re-profile + EXP block.
+- **RESULT (EXP-2026-06-29a): GATE FAILED — reverted.** Vectorizing the staging to
+  128-bit loads is correct (cos 0.999999, both D × both regimes) but **regresses**
+  `grad_dense_partials` 5425 → 8383 µs (**0.65×**) at D=256 uniform; every `dense_bias`
+  bench config is slower (J-only vectorization also regressed). Root cause (ISA + A/B
+  isolation): the kernel is **occupancy-starved (~2 waves/SIMD: 224 VGPR + 32 KB dynamic
+  LDS) and memory-latency-bound**, so the baseline's many small loads supply the MLP that
+  hides HBM latency; few wide loads lose it, and the transpose keeps the LDS store scalar
+  regardless (no `ds_read_transpose` on gfx942). The "issue-/dependency-wait bound, cut
+  VMEM instrs" premise (from the MI325X box) does **not** transfer here. **Recommend
+  re-sequencing: run Phase D (occupancy) first**, then re-attempt vectorized staging once
+  there are enough waves to tolerate wide-load latency.
 
 ### Phase B — `grad_jagged` K-column operand reuse (cut dOut re-streaming)
 - **Why:** dJagged reads dOut once per K-output tile (`KOUT_BLOCKS = K/BLOCK_N`). dOut
@@ -160,7 +171,17 @@ matters **more at D=256** (SPLIT=2 doubles the partials work + the reduce traffi
   (the value may differ per shape).
 - **Target:** dOut HBM bytes ↓ (→ AI ↑, push toward compute), Issue-Wait ↓, fewer WGs.
 - **Gate:** measurable `grad_jagged` µs/TF-s gain at both D, no correctness regression.
-- [ ] K-coarsening  [ ] re-sweep COARSEN_M @ D=256 and D=512  [ ] re-profile + EXP block.
+- [x] K-coarsening  [x] re-sweep COARSEN_M @ D=256 and D=512  [x] re-profile + EXP block.
+- **RESULT (EXP-2026-06-29b): GATE FAILED — reverted.** K-coarsening is correct (cos
+  0.999999, both D × both regimes) but gives **no robust gain**: at D=256 every coarsened
+  config regresses (M2K2 5237 vs baseline 4946 µs; fastest is *no* coarsening), and at
+  D=512 the best point (M1K2 15257) is only ~0.9% under baseline (15400) = noise;
+  `COARSEN_K=4` **spills** (21–26 ms). Root cause = same as Phase A: `grad_jagged` is
+  **occupancy/latency-bound (6.4% occ, Issue-Wait 54.5%), not dOut-bandwidth-bound**, so
+  the extra fp32 accumulator (VGPR 36→268) cuts occupancy faster than the dOut-reuse
+  helps. The COARSEN_M re-sweep also showed the shipped **COARSEN_M=2 is itself neutral**
+  on this box. **Recommend Phase D (occupancy) first**, then re-attempt — register
+  headroom would let the reuse convert to time.
 
 ### Phase C — `SPLIT==1` fast path: write bf16 dDense directly, skip the reduce (D=512)
 - **Why:** at D=512 `SPLIT = 2 if K<=256 else 1` → **1**. With one split, each output
@@ -177,7 +198,16 @@ matters **more at D=256** (SPLIT=2 doubles the partials work + the reduce traffi
   D=512; partials HBM-BW% and AI ↑.
 - **Gate:** D=512 `dense_bias` end-to-end ↓ (expect ≥1.05× uniform, more under skew),
   D=256 (SPLIT=2) **unchanged**, correctness green both stars.
-- [ ] SPLIT==1 direct-write  [ ] drop reduce launches  [ ] re-profile + EXP block.
+- [x] SPLIT==1 direct-write  [x] drop reduce launches  [x] re-profile + EXP block.
+- **RESULT (EXP-2026-06-29c): GATE PASSED ✅ — SHIPPED.** D=512 `dense_bias` **1.04×
+  uniform / 1.30× skew** (kernel-sum 19841→19077 / 4310→3307 µs; both reduce launches
+  dropped, 3→1), D=256 unchanged, correctness green (cos 0.999999, both regimes). Finding:
+  the win is entirely the **reduce-launch removal** (a fixed D-bound `n_groups·K·N`
+  round-trip → small under uniform, large under skew); **halving the partials write traffic
+  did nothing** because `grad_dense_partials` is read-dominated (streams ~16 GB J+dOut vs
+  ~0.5 GB partials write), so the partials kernel time is unchanged. First kept win of the
+  three phases; also simplifies the D=512 schedule and drops the fp32 scratch from its
+  critical path.
 
 ### Phase D — Lift `grad_dense_partials` occupancy (register/LDS pressure)
 - **Why:** ~28–30% wavefront occupancy, capped by VGPR (~72–76%) + LDS (~71–77% →
