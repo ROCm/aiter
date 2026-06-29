@@ -95,7 +95,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=44
     FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=42
     FILE_TIMES[op_tests/test_pa_ps.py]=42
-    FILE_TIMES[op_tests/test_causal_conv1d.py]=34
+    FILE_TIMES[op_tests/test_causal_conv1d_update.py]=34
     FILE_TIMES[op_tests/test_moe_sorting_mxfp4.py]=33
     FILE_TIMES[op_tests/test_batched_gemm_bf16.py]=32
     FILE_TIMES[op_tests/test_gemm_a4w4.py]=31
