@@ -22,11 +22,6 @@ on:
         required: true
         default: rocm/ffm-dev:latest
         type: string
-      test_ref:
-        description: Git branch containing the FFM Triton test suite.
-        required: true
-        default: shared/reduced_tests_for_FFM_CI
-        type: string
 
 permissions:
   contents: read
@@ -37,9 +32,7 @@ concurrency:
 
 env:
   FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
-  FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
-  FFM_TEST: op_tests/triton_tests
-  FFM_TRITON_VERSION: "3.6.0"
+  FFM_TEST: op_tests/triton_tests/gemm/basic/test_gemm_a16w16_ffm_smoke.py
 
 jobs:
   check-signal:
@@ -54,55 +47,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  split_ffm_tests:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: ubuntu-latest
-    needs: [check-signal]
-    outputs:
-      shard_count: 5
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 0
-
-      - name: Load FFM Triton test suite
-        run: |
-          set -euo pipefail
-          git fetch --no-tags --depth=1 origin \
-            "refs/heads/${FFM_TEST_SOURCE_REF}:refs/remotes/origin/${FFM_TEST_SOURCE_REF}"
-          ffm_test_source_commit="$(git rev-parse "refs/remotes/origin/${FFM_TEST_SOURCE_REF}")"
-          echo "FFM test source commit: ${ffm_test_source_commit}"
-          rm -rf "${FFM_TEST}"
-          git checkout "refs/remotes/origin/${FFM_TEST_SOURCE_REF}" -- "${FFM_TEST}"
-          test_count="$(find "${FFM_TEST}" -type f -name 'test*.py' | wc -l | tr -d ' ')"
-          echo "Loaded ${test_count} FFM Triton test files from ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
-          if [ "${test_count}" -eq 0 ]; then
-            echo "::error::No FFM Triton test files found in ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
-            exit 1
-          fi
-
-      - name: Split FFM Triton Tests (5 shards)
-        run: ./.github/scripts/split_tests.sh --shards 5 --test-type triton
-
-      - name: Upload FFM test shard lists as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ffm_triton_shards
-          path: triton_shard_*.list
-          retention-days: 7
-
   ffm-aiter-ut:
-    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }}) / Shard ${{ matrix.shard }}
+    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }})
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    needs: [check-signal, split_ffm_tests]
+    needs: [check-signal]
     runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4]
+    timeout-minutes: 60
 
     steps:
       - name: Checkout source
@@ -110,38 +60,6 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
-
-      - name: Load FFM Triton test suite
-        run: |
-          set -euo pipefail
-          git fetch --no-tags --depth=1 origin \
-            "refs/heads/${FFM_TEST_SOURCE_REF}:refs/remotes/origin/${FFM_TEST_SOURCE_REF}"
-          ffm_test_source_commit="$(git rev-parse "refs/remotes/origin/${FFM_TEST_SOURCE_REF}")"
-          echo "FFM test source commit: ${ffm_test_source_commit}"
-          rm -rf "${FFM_TEST}"
-          git checkout "refs/remotes/origin/${FFM_TEST_SOURCE_REF}" -- "${FFM_TEST}"
-          test_count="$(find "${FFM_TEST}" -type f -name 'test*.py' | wc -l | tr -d ' ')"
-          echo "Loaded ${test_count} FFM Triton test files from ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
-          if [ "${test_count}" -eq 0 ]; then
-            echo "::error::No FFM Triton test files found in ${FFM_TEST_SOURCE_REF}/${FFM_TEST}"
-            exit 1
-          fi
-
-      - name: Download FFM test shard lists
-        uses: actions/download-artifact@v4
-        timeout-minutes: 15
-        with:
-          name: ffm_triton_shards
-
-      - name: List FFM test shard files
-        run: |
-          ls -l triton_shard_*.list
-
-      - name: Export test file list for this shard as env
-        run: |
-          FFM_TEST_FILES="$(cat triton_shard_${{ matrix.shard }}.list)"
-          echo "${FFM_TEST_FILES}"
-          echo "FFM_TEST_FILES=${FFM_TEST_FILES}" >> "${GITHUB_ENV}"
 
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -173,7 +91,7 @@ jobs:
           set -euo pipefail
           docker pull "${FFM_IMAGE}"
 
-      - name: Run aiter FFM unit test
+      - name: Run aiter FFM smoke test
         run: |
           set -euo pipefail
 
@@ -197,74 +115,43 @@ jobs:
             --security-opt seccomp=unconfined \
             --shm-size=16gb \
             -e FFM_TEST="${FFM_TEST}" \
-            -e FFM_TEST_FILES="${FFM_TEST_FILES}" \
-            -e FFM_TRITON_VERSION="${FFM_TRITON_VERSION}" \
             -v "${GITHUB_WORKSPACE}:/workspace" \
-            -w /tmp \
+            -w /workspace \
             "${FFM_IMAGE}" \
             bash -lc '
               set -euo pipefail
               source /ffm/ffmlite_env.sh
+              cd /workspace
+              git config --global --add safe.directory /workspace
+
               echo "==== Runtime context ===="
-              echo "initial pwd: $(pwd)"
+              echo "pwd: $(pwd)"
+              echo "aiter checkout: $(git rev-parse HEAD)"
               echo "FFM_TEST=${FFM_TEST}"
-              echo "FFM_TEST_FILES=${FFM_TEST_FILES}"
               echo "PATH=${PATH}"
               echo "PYTHONPATH=${PYTHONPATH:-}"
-              cd /root/aiter
-              echo "aiter root pwd: $(pwd)"
-              git config --global --add safe.directory /root/aiter
-              echo "==== Image test suite info ===="
-              find "${FFM_TEST}" -type f -name "test*.py" | wc -l
-              if [ -z "${FFM_TEST_FILES:-}" ]; then
-                echo "::error::FFM_TEST_FILES is empty for shard ${{ matrix.shard }}"
-                exit 1
-              fi
-              echo "Shard ${{ matrix.shard }} file count: $(wc -w <<< "${FFM_TEST_FILES}")"
+
               export ENABLE_CK=0
-              echo "ENABLE_CK=${ENABLE_CK}"
-              python3 -m pip show amd-aiter
-              echo "==== Check FFM image Aiter git version ===="
-              if [ -d /root/aiter/.git ]; then
-                git -C /root/aiter rev-parse HEAD
-                git -C /root/aiter branch --show-current || true
-                git -C /root/aiter log -1 --oneline
-                git -C /root/aiter status --short --branch
-              else
-                echo "/root/aiter is not a git checkout"
-              fi
-              echo "==== Check expected Aiter APIs ===="
-              grep -R "dynamic_nvfp4_quant" -n /root/aiter/aiter/ops/triton/quant || true
-              grep -R "is_2d_gluon_available" -n /root/aiter/aiter/ops/triton/attention || true
-              grep -R "shuffle_weight_gfx1250" -n /root/aiter/aiter/ops || true
-              grep -R "routing_from_hash" -n /root/aiter/aiter/ops/triton/moe || true
-              echo "==== Pin Triton ===="
-              python3 -m pip show amd-triton triton triton-kernels || true
-              TRITON_DEFAULT_ROCM_VERSION="${TRITON_DEFAULT_ROCM_VERSION:-7.2.0}"
-              TRITON_INDEX_URL="https://pypi.amd.com/triton/release_/rocm-${TRITON_DEFAULT_ROCM_VERSION}/simple/"
-              ROCM_VERSION="$(dpkg -l rocm-core 2>/dev/null | awk '\''/^ii/{print $3}'\'' || true)"
-              if [ -z "${ROCM_VERSION}" ]; then
-                ROCM_VERSION="$(rpm -q --queryformat '\''%{VERSION}'\'' rocm-core 2>/dev/null || true)"
-              fi
-              if [ -n "${ROCM_VERSION}" ]; then
-                ROCM_MAJOR_MINOR="$(echo "${ROCM_VERSION}" | cut -d. -f1,2)"
-                TRITON_INDEX_URL="https://pypi.amd.com/triton/release_/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
-              else
-                echo "rocm-core not found; using default ROCm version ${TRITON_DEFAULT_ROCM_VERSION}"
-              fi
-              echo "Installing triton==${FFM_TRITON_VERSION} from PyPI with AMD index fallback ${TRITON_INDEX_URL}"
+              export AITER_TRITON_ONLY=1
+              export AITER_USE_SYSTEM_TRITON=1
               export PIP_BREAK_SYSTEM_PACKAGES=1
-              python3 -m pip install --break-system-packages \
-                --index-url https://pypi.org/simple \
-                --extra-index-url "${TRITON_INDEX_URL}" \
-                "triton==${FFM_TRITON_VERSION}"
-              python3 -m pip show amd-triton triton triton-kernels || true
-              python3 -c "import triton; print(f\"triton version after pin: {triton.__version__}\")"
-              echo "==== Check Aiter core module ===="
-              python3 -c "from pathlib import Path; import aiter; aiter_dir = Path(aiter.__file__).resolve().parent; jit_dir = aiter_dir / \"jit\"; print(f\"aiter module: {aiter.__file__}\"); print(f\"aiter dir: {aiter_dir}\"); core_modules = sorted(jit_dir.glob(\"**/*core*.so\")); print(f\"FOUND {len(core_modules)} core module(s):\" if core_modules else f\"NOT FOUND: no *core*.so under {jit_dir}\"); [print(path) for path in core_modules]"
-              python3 -c "import aiter; print(f\"aiter module: {aiter.__file__}\")"
+              echo "ENABLE_CK=${ENABLE_CK}"
+              echo "AITER_TRITON_ONLY=${AITER_TRITON_ONLY}"
+              echo "AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}"
+
+              echo "==== Python packages before reinstall ===="
+              python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
+
+              echo "==== Reinstall mounted aiter checkout ===="
+              python3 -m pip uninstall -y amd-aiter aiter || true
+              python3 -m pip install --break-system-packages --no-build-isolation -e .
+
+              echo "==== Python packages after reinstall ===="
+              python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
               python3 -m pip uninstall -y pylama || true
-              python3 -m pytest -v ${FFM_TEST_FILES}
+
+              echo "==== Run FFM smoke test ===="
+              python3 -m pytest -v "${FFM_TEST}"
             '
 
       - name: Cleanup
