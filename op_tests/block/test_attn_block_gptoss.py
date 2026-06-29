@@ -134,7 +134,7 @@ def _qkv_split(qkv, cfg):
     )
 
 
-def kernel_block(
+def attention_block(
     cfg: GptOssCfg,
     w: BlockWeights,
     hidden: torch.Tensor,  # [B*T, hidden]  (T = seq_len for prefill / ctx_len for decode)
@@ -361,7 +361,7 @@ def run_phase(
     positions = torch.arange(seq_len, dtype=torch.int32).repeat(batch)
 
     out, us = run_perftest(
-        kernel_block,
+        attention_block,
         cfg,
         w,
         hidden,
