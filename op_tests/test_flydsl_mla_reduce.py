@@ -8,7 +8,11 @@ import argparse
 import torch
 import aiter
 
-from aiter.ops.flydsl.kernels.mla_reduce import compile_mla_reduce, select_tier
+from aiter.ops.flydsl.kernels.mla_reduce import (
+    compile_mla_reduce,
+    select_tier,
+    waves_per_eu_from_env,
+)
 from aiter.test_common import run_perftest
 
 
@@ -143,6 +147,7 @@ def make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, out_dtype_str, ou
     kernel = compile_mla_reduce(
         H=H, Dv=Dv, out_dtype=out_dtype_str, tier=tier,
         persistent=False, output_lse=output_lse, use_reduce_final_map=True,
+        waves_per_eu=waves_per_eu_from_env(),
     )
     head = (
         po, pl, indptr, pmap, fmap, fout, flse,

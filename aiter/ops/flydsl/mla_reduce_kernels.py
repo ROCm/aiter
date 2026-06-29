@@ -13,14 +13,19 @@ from the observed ``num_splits`` (``select_tier``) and launches one workgroup pe
 
 This is an OPT-IN fallback. Production code (``aiter/mla.py``) keeps calling the
 HIP ``aiter.mla_reduce_v1`` by default; set ``AITER_MLA_REDUCE_FLYDSL=1`` to route
-through this wrapper instead. See mla-reduce-docs/ for the design comparison.
+through this wrapper instead. Tune occupancy via ``AITER_MLA_REDUCE_WAVES_PER_EU``
+(4/6/8; default 4). See mla-reduce-docs/ for the design comparison.
 """
 
 from __future__ import annotations
 
 import torch
 
-from .kernels.mla_reduce import compile_mla_reduce, select_tier
+from .kernels.mla_reduce import (
+    compile_mla_reduce,
+    select_tier,
+    waves_per_eu_from_env,
+)
 
 __all__ = [
     "flydsl_mla_reduce_v1",
@@ -95,6 +100,7 @@ def flydsl_mla_reduce_v1(
         tier=tier,
         output_lse=output_lse,
         use_reduce_final_map=use_reduce_final_map,
+        waves_per_eu=waves_per_eu_from_env(),
     )
 
     if final_lse is None:
