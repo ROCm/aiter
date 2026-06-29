@@ -246,7 +246,7 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_G_ELEMS = BT
     LDS_G_BYTES = LDS_G_ELEMS * 4
 
-    _K5_KERNEL_REVISION = 219  # phase-4: OPT-C(g) lds_g staging (kill inline-g HBM loads)
+    _K5_KERNEL_REVISION = 220  # barrier-trim: drop redundant lds_vn-WAR + lds_k-RAW barriers (B6/B4)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -595,7 +595,13 @@ def compile_chunk_gated_delta_h_kv_naive(
                 k_lds_off = k_row * fx.Int32(LDS_K_STRIDE) + k_load_tokbase
                 lds_k.vec_store((fx.Index(k_lds_off),), k_vec, LOAD_VEC_WIDTH)
 
-            gpu.barrier()
+            # NOTE (barrier-trim): removed the post-k-load barrier. It guarded
+            # the lds_k RAW (step 3 cooperative write -> step 8 GEMM2 read), but
+            # nothing reads or overwrites lds_k between here and GEMM2 (GEMM1
+            # reads lds_w, v_new reads lds_u, gating reads lds_g), and the
+            # step-7 cross-chunk barrier (B7, line ~801) sits right before GEMM2
+            # and already publishes this write as a pre-read fence. lds_k's
+            # lds_ht alias WAR for the NEXT chunk is covered by B1 (step 1).
 
             # ============================================================
             # 4. GEMM1: b_v = w @ h^T (h from registers). VWARP.
@@ -716,7 +722,14 @@ def compile_chunk_gated_delta_h_kv_naive(
                     if (abs_bt_row < T_local).ir_value():
                         _emit_vn_vstore(vn_off, vn_tile8)
 
-                gpu.barrier()
+                # NOTE (barrier-trim): removed the post-readout lds_vn WAR
+                # barrier. Its only job was to keep this chunk's lds_vn read-out
+                # ahead of the NEXT chunk's lds_vn stage-write (step 5b), but
+                # that next write is separated by 6 intervening barriers
+                # (B7 step7, B1 step1, B2, B3, B4-or-B7, B5), so the WAR is
+                # already covered. gpu.barrier() is LDS/WG-only and does not
+                # gate the HBM buffer_store, so dropping it cannot affect v_new
+                # correctness.
             elif const_expr(SAVE_NEW_VALUE):
                 # Original path: 16 scalar buffer_store_short straight to HBM.
                 def _emit_vn_store(off, value):
