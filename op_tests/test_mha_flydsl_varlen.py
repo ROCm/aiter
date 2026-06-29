@@ -28,6 +28,10 @@ HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
 
 
+def _use_gfx1250_varlen_asm(causal):
+    return causal and HEAD_DIM_QK == 128 and HEAD_DIM_V == 128
+
+
 def _time_fn(fn, warmup, repeat):
     for _ in range(warmup):
         fn()
@@ -107,6 +111,22 @@ def run_varlen_test(
     cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32, device=device)
 
     def _run():
+        if _use_gfx1250_varlen_asm(causal):
+            out, lse = aiter.fmha_fwd_with_sink_varlen_asm(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_sq,
+                scale,
+                True,
+                return_lse,
+                sink=None,
+            )
+            lse = lse.squeeze(-1)
+            return (out, lse) if return_lse else out
+
         return flash_attn_varlen_func(
             q,
             k,
@@ -133,7 +153,8 @@ def run_varlen_test(
     avg_us = avg_ms * 1000
 
     seqs = [cu_q[i + 1] - cu_q[i] for i in range(B)]
-    tag = f"B={B} H={H} seqs={seqs} causal={causal} lse={return_lse}"
+    kernel = "asm" if _use_gfx1250_varlen_asm(causal) else "flydsl"
+    tag = f"B={B} H={H} seqs={seqs} causal={causal} lse={return_lse} kernel={kernel}"
     print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
 
     ref_result = _ref_mha_varlen(
@@ -197,6 +218,7 @@ def run_varlen_test(
         "seqs_k": [cu_k[i + 1] - cu_k[i] for i in range(B)],
         "causal": causal,
         "lse": return_lse,
+        "kernel": kernel,
         "avg_us": round(avg_us, 2),
         "tflops": round(fwd_tflops, 2),
         "pass": passed,
@@ -262,8 +284,8 @@ if __name__ == "__main__":
         type=dtypes.str2tuple,
         nargs="+",
         default=[(192, 128)],
-        help="Dimension of query/key and value. Currently only 192,128 is supported.\n"
-        "e.g.: -d_qk_v 192,128",
+        help="Dimension of query/key and value. Supports 192,128 (FlyDSL) and "
+        "128,128 (gfx1250 ASM causal path).\ne.g.: -d_qk_v 128,128",
     )
     parser.add_argument(
         "-c",
@@ -311,11 +333,14 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    supported_dims = {(192, 128), (128, 128)}
+    if len(args.d_qk_v) != 1:
+        raise ValueError("Only one -d_qk_v value is supported for this script.")
     for d_qk_v in args.d_qk_v:
-        assert d_qk_v == (
-            192,
-            128,
-        ), f"Currently only D_qk=192, D_v=128 is supported, got {d_qk_v}"
+        assert d_qk_v in supported_dims, (
+            f"Supported D_qk,D_v values are {sorted(supported_dims)}, got {d_qk_v}"
+        )
+    HEAD_DIM_QK, HEAD_DIM_V = args.d_qk_v[0]
 
     def _parse_bool(s):
         if s is None:
@@ -324,6 +349,8 @@ if __name__ == "__main__":
 
     causal_filter = _parse_bool(args.causal)
     lse_filter = _parse_bool(args.return_lse)
+    if (HEAD_DIM_QK, HEAD_DIM_V) == (128, 128) and causal_filter is False:
+        raise ValueError("The gfx1250 ASM varlen path only supports causal=True.")
     single_shape = all(
         x is not None
         for x in [args.batch_size, args.nheads, args.seqlen_q, args.seqlen_k]
@@ -411,7 +438,10 @@ if __name__ == "__main__":
             ([0, 1], [0, 512], 128),
         ]
 
-    causal_list = [causal_filter] if causal_filter is not None else [False, True]
+    if (HEAD_DIM_QK, HEAD_DIM_V) == (128, 128) and causal_filter is None:
+        causal_list = [True]
+    else:
+        causal_list = [causal_filter] if causal_filter is not None else [False, True]
     lse_list = [lse_filter] if lse_filter is not None else [False, True]
 
     tests = []

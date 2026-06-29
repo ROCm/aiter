@@ -1,0 +1,34 @@
+date: 2026-07-01T10:32:48+00:00
+host: ctheliosr-1b114-f01-2
+pwd: /data/yanguahe/code/wk_sp1/aiter
+repo_head: 4ba7b597cdffbe51973086cef9d9b1bae64e22f3
+clangxx: /opt/rocm/llvm/bin/clang++
+objdump: /opt/rocm/llvm/bin/llvm-objdump
+AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 46fcb339fb61119b337f973c7ca9e710a319fdd0+PATCHED:440716f8b87be9d8e20ed910e10e5b6d14d57cf6)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-BKC26-05-04/lib/llvm/bin
+AMD LLVM version 23.0.0git
+  Optimized build.
+
+
+ASM input:
+        .amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
+        .amdhsa_code_object_version 6
+        .text
+        .globl  tdm_objdump_probe
+        .p2align        8
+        .type   tdm_objdump_probe,@function
+tdm_objdump_probe:
+        s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1
+        tensor_load_to_lds s[12:15], s[4:11]
+        s_endpgm
+.Lfunc_end0:
+        .size   tdm_objdump_probe, .Lfunc_end0-tdm_objdump_probe
+
+Assembling with clang++ -x assembler...
+clang_status=0
+
+clang stdout:
+
+clang stderr:

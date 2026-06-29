@@ -1,0 +1,27 @@
+Running asm-varlen-mha: python op_tests/test_mha_flydsl_varlen.py --causal true --return_lse true -d_qk_v 128,128 -b 1 -nh 64 -sq 8192 -sk 8192 --random-value false --warmup 5 --repeat 20
+[aiter] import [module_aiter_core] under /data/yanguahe/code/wk_sp1/aiter/aiter/jit/module_aiter_core.so
+[aiter] LoadKernel: _ZN5aiter43fmha_bf16_pertokenBf16_hd128_128x256_varlenE hsaco: /data/yanguahe/code/wk_sp1/aiter/hsa//gfx1250/fmha_fwd_bf16_varlen/fmha_bf16_pertokenBf16_hd128_128x256_varlen.co
+Traceback (most recent call last):
+  File "/data/yanguahe/code/wk_sp1/aiter/op_tests/test_mha_flydsl_varlen.py", line 463, in <module>
+    ok, ret = run_varlen_test(
+              ^^^^^^^^^^^^^^^^
+  File "/data/yanguahe/code/wk_sp1/aiter/op_tests/test_mha_flydsl_varlen.py", line 160, in run_varlen_test
+    ref_result = _ref_mha_varlen(
+                 ^^^^^^^^^^^^^^^^
+  File "/data/yanguahe/code/wk_sp1/aiter/op_tests/test_mha_flydsl_varlen.py", line 73, in _ref_mha_varlen
+    qk = qk.masked_fill(mask.unsqueeze(0), float("-inf"))
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: HIP out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 432.00 GiB of which 11.14 GiB is free. Of the allocated memory 17.39 GiB is allocated by PyTorch, and 15.96 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+============================================================
+FlyDSL MHA Varlen Tests
+============================================================
+  [B=1 H=64 seqs=[8192] causal=True lse=True kernel=asm] avg: 0.575ms (574.6 us)  1913.5 TFLOPS
+  [seqs=[8192] causal=True lse=True] ERROR: HIP out of memory. Tried to allocate 16.00 GiB. GPU 0 has a total capacity of 432.00 GiB of which 11.14 GiB is free. Of the allocated memory 17.39 GiB is allocated by PyTorch, and 15.96 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+============================================================
+0/1 passed
+============================================================
+
+asm-varlen-mha exit status: 0
+
+Dump files under ./flydsl_dump:
