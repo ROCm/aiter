@@ -263,20 +263,6 @@ def run_fused_softmax(
 
 
 @perftest(num_iters=100, num_warmup=1)
-def run_ck_sigmoid(gating_output: torch.Tensor, topk: int):
-    """CK TopkSoftmaxWarpPerRowPipeline with sigmoid activation."""
-    tokens, num_experts = gating_output.shape
-    topk_weights = torch.empty(
-        (tokens, topk), dtype=torch.float32, device=gating_output.device
-    )
-    topk_ids = torch.empty(
-        (tokens, topk), dtype=torch.int32, device=gating_output.device
-    )
-    aiter.topk_sigmoid(topk_weights, topk_ids, gating_output)
-    return topk_weights, topk_ids
-
-
-@perftest(num_iters=100, num_warmup=1)
 def run_vllm_softmax(
     gating_output: torch.Tensor,
     topk: int,
@@ -302,9 +288,6 @@ def run_vllm_softmax(
     return topk_weights, topk_ids
 
 
-_CK_SIGMOID_MAX_EXPERTS = 192  # CK dispatches up to 192 experts
-
-
 def benchmark_topk_sigmoid(
     num_experts: int = 128,
     num_tokens: int = 1024,
@@ -316,13 +299,6 @@ def benchmark_topk_sigmoid(
     # run benchmarks
     (scores_torch, indices_torch), avg_torch = run_torch(gating_output.clone(), topk)
     (scores_fused, indices_fused), avg_fused = run_fused(gating_output.clone(), topk)
-
-    # CK topk_sigmoid: only supports experts <= 192
-    ck_supported = num_experts <= _CK_SIGMOID_MAX_EXPERTS
-    if ck_supported:
-        (scores_ck, indices_ck), avg_ck = run_ck_sigmoid(gating_output.clone(), topk)
-    else:
-        avg_ck = float("nan")
 
     # check correctness
     score_errors = checkAllclose(scores_torch, scores_fused, tol_err_ratio=0.01)
@@ -336,9 +312,7 @@ def benchmark_topk_sigmoid(
         "dtype": str(dtype).split(".")[-1],
         "torch_us": avg_torch,
         "fused_us": avg_fused,
-        "ck_us": avg_ck,
-        "fused_uplift": avg_torch / avg_fused,
-        "ck_uplift": avg_torch / avg_ck if ck_supported else float("nan"),
+        "uplift": avg_torch / avg_fused,
         "score_errors": score_errors,
         "index_errors": index_errors,
     }
@@ -694,10 +668,7 @@ if __name__ == "__main__":
             )
         )
         print("=" * 80)
-        print("topk_sigmoid benchmark: topk_gating (fused) vs CK topk_sigmoid")
-        print(
-            f"  CK supported up to {_CK_SIGMOID_MAX_EXPERTS} experts; 'nan' = not supported"
-        )
+        print("topk_sigmoid benchmark")
         print("=" * 80)
         collected = []
         for num_experts, num_tokens, topk, dtype in sigmoid_configs:
@@ -707,11 +678,7 @@ if __name__ == "__main__":
             collected.append(result)
         df = pd.DataFrame(collected)
         print(df.to_string(index=False))
-        ck_rows = df[df["ck_us"].notna() & ~df["ck_us"].apply(lambda x: x != x)]
-        print(f"\nAverage fused uplift: {df['fused_uplift'].mean():.2f}x")
-        ck_valid = df[df["ck_uplift"].notna() & (df["ck_uplift"] == df["ck_uplift"])]
-        if len(ck_valid) > 0:
-            print(f"Average CK    uplift: {ck_valid['ck_uplift'].mean():.2f}x")
+        print(f"\nAverage uplift: {df['uplift'].mean():.2f}x")
         # benchmark_topk_sigmoid uses {score,index}_errors columns
         errors = df[(df["index_errors"] > 0.01) | (df["score_errors"] > 0.01)]
         if len(errors) > 0:
