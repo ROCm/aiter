@@ -341,6 +341,28 @@ __global__ void  p2p_bandwidth_test_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// sync latency
+// ---------------------------------------------------------------------------
+template <int ngpus>
+__global__ void start_sync_latency(RankSignals sg, Signal* self_sg, int rank)
+{
+  start_sync<ngpus>(sg, self_sg, rank);
+}
+
+template <int ngpus>
+__global__ void end_sync_latency(RankSignals sg, Signal* self_sg, int rank)
+{
+  end_sync<ngpus>(sg, self_sg, rank);
+}
+
+template <int ngpus>
+__global__ void two_sync_latency(RankSignals sg, Signal* self_sg, int rank)
+{
+  start_sync<ngpus>(sg, self_sg, rank);
+  end_sync<ngpus>(sg, self_sg, rank);
+}
+
+// ---------------------------------------------------------------------------
 // CustomAllreduce class (gfx1250-only, simplified)
 // ---------------------------------------------------------------------------
 // gfx1250: hipIpc is not available. Buffer sharing uses torch's

@@ -66,5 +66,8 @@ int64_t get_graph_buffer_count(fptr_t _fa);
 void get_graph_buffer_ptrs(fptr_t _fa, int64_t ptrs_out);
 void register_graph_buffers(fptr_t _fa,
                             const std::vector<int64_t>& ptrs_per_rank);
+void start_sync_latency(fptr_t _fa, int64_t blocks);
+void end_sync_latency(fptr_t _fa, int64_t blocks);
+void two_sync_latency(fptr_t _fa, int64_t blocks);
 
 } // namespace aiter

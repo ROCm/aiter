@@ -299,4 +299,48 @@ void all_reduce(fptr_t _fa,
                 use_new, is_broadcast_reg_outptr);
 }
 
+// ---- Sync latency measurement kernels ----
+
+void start_sync_latency(fptr_t _fa, int64_t blocks)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int ws = fa->world_size_;
+    constexpr int threads = 256;
+    if(ws == 2)
+        aiter::start_sync_latency<2><<<blocks, threads, 0, stream>>>(
+            fa->sg_, fa->self_sg_, fa->rank_);
+    else
+        aiter::start_sync_latency<4><<<blocks, threads, 0, stream>>>(
+            fa->sg_, fa->self_sg_, fa->rank_);
+}
+
+void end_sync_latency(fptr_t _fa, int64_t blocks)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int ws = fa->world_size_;
+    constexpr int threads = 256;
+    if(ws == 2)
+        aiter::end_sync_latency<2><<<blocks, threads, 0, stream>>>(
+            fa->sg_, fa->self_sg_, fa->rank_);
+    else
+        aiter::end_sync_latency<4><<<blocks, threads, 0, stream>>>(
+            fa->sg_, fa->self_sg_, fa->rank_);
+}
+
+void two_sync_latency(fptr_t _fa, int64_t blocks)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int ws = fa->world_size_;
+    constexpr int threads = 256;
+    if(ws == 2)
+        aiter::two_sync_latency<2><<<blocks, threads, 0, stream>>>(
+            fa->sg_, fa->self_sg_, fa->rank_);
+    else
+        aiter::two_sync_latency<4><<<blocks, threads, 0, stream>>>(
+            fa->sg_, fa->self_sg_, fa->rank_);
+}
+
 } // namespace aiter

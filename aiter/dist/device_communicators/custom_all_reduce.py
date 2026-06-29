@@ -599,6 +599,16 @@ class CustomAllreduce:
         #     return
 
         self.disabled = False
+        # gfx1250 (MI450) cannot register CUDA-graph-captured buffers across
+        # ranks: `flush_graph_buffers` / `register_graph_buffers` are no-ops
+        # there (VMM-based graph exchange not yet implemented). The "registered"
+        # capture path bakes raw input pointers that peers would dereference at
+        # replay without ever being registered → GPU page fault on the first
+        # graph replay (e.g. V4 TP=2 decode). Force the copy-in "unreg" path
+        # during capture, which routes through the pre-registered VMM pool
+        # (exchanged at init, address-stable across replays).
+        if self._is_gfx1250:
+            enable_register_for_capturing = False
         self.enable_register_for_capturing = enable_register_for_capturing
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
@@ -954,7 +964,12 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.reduce_scatter(input, output, dim, registered=True)
+                # gfx1250 cannot register graph buffers cross-rank (see
+                # enable_register_for_capturing note in __init__); use the
+                # copy-in path so capture/replay reads the pre-registered pool.
+                return self.reduce_scatter(
+                    input, output, dim, registered=self.enable_register_for_capturing
+                )
             else:
                 # Warmup forward (pre-capture): run the REAL reduce_scatter via
                 # the copy-in path. Unlike custom_all_reduce, returning zeros
@@ -1031,7 +1046,13 @@ class CustomAllreduce:
 
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                out = self.all_gather_reg(inp.view(view_dtype), dim=dim)
+                # gfx1250 cannot register graph buffers cross-rank (see
+                # enable_register_for_capturing note in __init__); use the
+                # copy-in path so capture/replay reads the pre-registered pool.
+                if self.enable_register_for_capturing:
+                    out = self.all_gather_reg(inp.view(view_dtype), dim=dim)
+                else:
+                    out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
             else:
                 # Warmup forward (pre-capture): run the REAL all_gather via the
                 # copy-in (unreg) path. Returning zeros here corrupts V4 MoE

@@ -39,4 +39,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("_fa"), py::arg("ptrs_out"));
     m.def("register_graph_buffers", &aiter::register_graph_buffers,
           py::arg("_fa"), py::arg("ptrs_per_rank"));
+    m.def("start_sync_latency", &aiter::start_sync_latency,
+          py::arg("_fa"), py::arg("blocks"));
+    m.def("end_sync_latency", &aiter::end_sync_latency,
+          py::arg("_fa"), py::arg("blocks"));
+    m.def("two_sync_latency", &aiter::two_sync_latency,
+          py::arg("_fa"), py::arg("blocks"));
 }

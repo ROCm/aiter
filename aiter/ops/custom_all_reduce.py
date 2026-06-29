@@ -315,6 +315,18 @@ def get_graph_buffer_ptrs_gfx1250(_fa: int, ptrs_out: int) -> None: ...
 def register_graph_buffers_gfx1250(_fa: int, ptrs_per_rank: List[int]) -> None: ...
 
 
+@compile_ops(GFX1250_MD_NAME, fc_name="start_sync_latency", develop=True)
+def start_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="end_sync_latency", develop=True)
+def end_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="two_sync_latency", develop=True)
+def two_sync_latency_gfx1250(_fa: int, blocks: int) -> None: ...
+
+
 @compile_ops(FUSED_AR_MHC_MD_NAME)
 def fused_allreduce_mhc_post_only(
     _fa: int,

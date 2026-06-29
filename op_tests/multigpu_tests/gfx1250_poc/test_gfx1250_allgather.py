@@ -8,7 +8,6 @@
 #   (each rank reads input_size bytes from the remote GPU via XGMI)
 
 import os
-import sys
 from multiprocessing import Pool, set_start_method
 
 import torch
@@ -128,7 +127,7 @@ def run_one(size: int, kernel_type: int, distributed_init_method: str):
     try:
         for r in rets:
             results.append(r.get(timeout=_INIT_TIMEOUT_SEC))
-    except Exception as e:
+    except Exception:
         pool.terminate()
         pool.join()
         raise
