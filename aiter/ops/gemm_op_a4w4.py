@@ -45,7 +45,7 @@ def get_GEMM_config(M: int, N: int, K: int):
             get_GEMM_config.has_gfx = True
         else:
             logger.warning(
-                f"{AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE} has no 'gfx' column — "
+                f"{AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE} has no 'gfx' column -- "
                 "falling back to cu_num-only key. Re-run the tuner or migrate the CSV."
             )
             get_GEMM_config.gemm_dict = gemm_dict.set_index(
@@ -244,11 +244,11 @@ def gemm_a4w4_asm(
     ffi_type="ctypes",
 )
 def _mxfp4_gemm_asm(
-    A: Tensor,        # A:[M, K/2] fp4x2 (preshuffled if a_preshuffle=1)
-    B: Tensor,        # B:[N, K/2] fp4x2 (preshuffled)
-    ScaleA: Tensor,   # ScaleA:[M, K/32] e8m0 (shuffled)
-    ScaleB: Tensor,   # ScaleB:[N, K/32] e8m0 (shuffled)
-    out: Tensor,      # Out:[M, N] bf16
+    A: Tensor,  # A:[M, K/2] fp4x2 (preshuffled if a_preshuffle=1)
+    B: Tensor,  # B:[N, K/2] fp4x2 (preshuffled)
+    ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
+    ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
+    out: Tensor,  # Out:[M, N] bf16
     kernelName: Optional[str] = None,
     a_preshuffle: int = 1,
 ) -> None: ...
@@ -262,8 +262,8 @@ def _mxfp4_gemm_asm(
 def _nvfp4_gemm_asm(
     A: Tensor,
     B: Tensor,
-    ScaleA: Tensor,   # e4m3 (shuffled)
-    ScaleB: Tensor,   # e4m3 (shuffled)
+    ScaleA: Tensor,  # e4m3 (shuffled)
+    ScaleB: Tensor,  # e4m3 (shuffled)
     GlobalScaleA: float,
     GlobalScaleB: float,
     out: Tensor,
@@ -273,10 +273,10 @@ def _nvfp4_gemm_asm(
 
 
 def gemm_mxfp4_asm(
-    A: Tensor,        # A:[M, K/2] fp4x2
-    B: Tensor,        # B:[N, K/2] fp4x2
-    ScaleA: Tensor,   # ScaleA:[M, K/32] e8m0
-    ScaleB: Tensor,   # ScaleB:[N, K/32] e8m0
+    A: Tensor,  # A:[M, K/2] fp4x2
+    B: Tensor,  # B:[N, K/2] fp4x2
+    ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0
+    ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0
     dtype: torch.dtype = dtypes.bf16,
     a_preshuffle: bool = True,
     kernelName: str = "",
@@ -286,7 +286,11 @@ def gemm_mxfp4_asm(
     N = B.shape[0]
     out = torch.empty((M, N), dtype=dtype, device=A.device)
     _mxfp4_gemm_asm(
-        A, B, ScaleA, ScaleB, out,
+        A,
+        B,
+        ScaleA,
+        ScaleB,
+        out,
         kernelName if kernelName else None,
         int(bool(a_preshuffle)),
     )
@@ -296,8 +300,8 @@ def gemm_mxfp4_asm(
 def gemm_nvfp4_asm(
     A: Tensor,
     B: Tensor,
-    ScaleA: Tensor,   # e4m3
-    ScaleB: Tensor,   # e4m3
+    ScaleA: Tensor,  # e4m3
+    ScaleB: Tensor,  # e4m3
     GlobalScaleA: float,
     GlobalScaleB: float,
     dtype: torch.dtype = dtypes.bf16,
@@ -309,8 +313,12 @@ def gemm_nvfp4_asm(
     N = B.shape[0]
     out = torch.empty((M, N), dtype=dtype, device=A.device)
     _nvfp4_gemm_asm(
-        A, B, ScaleA, ScaleB,
-        float(GlobalScaleA), float(GlobalScaleB),
+        A,
+        B,
+        ScaleA,
+        ScaleB,
+        float(GlobalScaleA),
+        float(GlobalScaleB),
         out,
         kernelName if kernelName else None,
         int(bool(a_preshuffle)),
@@ -332,7 +340,9 @@ def gemm_a4w4_mi400(
     B: Tensor,  # B:[N, K/2] f4x2 (preshuffled when bpreshuffle=1)
     A_scale: Tensor,  # A_scale:[M, K/block_size] MXFP4: e8m0 (block=32), NVFP4: e4m3 (block=16)
     B_scale: Tensor,  # B_scale:[N, K/block_size] MXFP4: e8m0 (block=32), NVFP4: e4m3 (block=16)
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32 (not yet supported by mi400 kernels)
+    bias: Optional[
+        Tensor
+    ] = None,  # bias:[1, N] f32 (not yet supported by mi400 kernels)
     dtype: torch.dtype = dtypes.bf16,
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
@@ -350,8 +360,10 @@ def gemm_a4w4_mi400(
     interface compatibility but not forwarded. ``bias``/``alpha``/``beta`` are
     not yet plumbed through the mi400 kernels.
     """
-    if bias is not None or (alpha is not None and alpha != 1.0) or (
-        beta is not None and beta != 0.0
+    if (
+        bias is not None
+        or (alpha is not None and alpha != 1.0)
+        or (beta is not None and beta != 0.0)
     ):
         logger.warning(
             "gemm_a4w4 on gfx1250 ignores bias/alpha/beta: not yet supported by "

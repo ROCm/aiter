@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -163,6 +163,7 @@ def shuffle_scale_n32k4(src: torch.Tensor, experts_cnt: int = None) -> torch.Ten
         )
     g = s.view(E, N // 32, 32, k_scale // 4, 4).permute(0, 1, 3, 2, 4).contiguous()
     return g.reshape(E, N // 32, k_scale * 32)
+
 
 def shuffle_scale_f4(
     src: torch.Tensor,

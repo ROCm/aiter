@@ -97,15 +97,29 @@ def _run_kernel(intype, inp, apre, kernelName, num_iters, needTrace):
     if intype == "mxfp4":
         return run_perftest(
             aiter.gemm_mxfp4_asm,
-            inp["A"], inp["B"], inp["sA"], inp["sB"],
-            dtype=dtypes.bf16, a_preshuffle=bool(apre), kernelName=kernelName,
-            num_iters=num_iters, needTrace=needTrace,
+            inp["A"],
+            inp["B"],
+            inp["sA"],
+            inp["sB"],
+            dtype=dtypes.bf16,
+            a_preshuffle=bool(apre),
+            kernelName=kernelName,
+            num_iters=num_iters,
+            needTrace=needTrace,
         )
     return run_perftest(
         aiter.gemm_nvfp4_asm,
-        inp["A"], inp["B"], inp["sA"], inp["sB"], inp["gA"], inp["gB"],
-        dtype=dtypes.bf16, a_preshuffle=bool(apre), kernelName=kernelName,
-        num_iters=num_iters, needTrace=needTrace,
+        inp["A"],
+        inp["B"],
+        inp["sA"],
+        inp["sB"],
+        inp["gA"],
+        inp["gB"],
+        dtype=dtypes.bf16,
+        a_preshuffle=bool(apre),
+        kernelName=kernelName,
+        num_iters=num_iters,
+        needTrace=needTrace,
     )
 
 
@@ -125,8 +139,11 @@ def test_gemm(intype, M, N, K, apre, kernelName="", mode="perf"):
     err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} asm")
 
     io_bytes = (
-        inp["A"].nbytes + inp["B"].nbytes
-        + inp["sA"].nbytes + inp["sB"].nbytes + out.nbytes
+        inp["A"].nbytes
+        + inp["B"].nbytes
+        + inp["sA"].nbytes
+        + inp["sB"].nbytes
+        + out.nbytes
     )
     ret = {
         "intype": intype,
@@ -152,28 +169,46 @@ if __name__ == "__main__":
         description="Test/benchmark gfx1250 F4GEMM (MXFP4 / NVFP4) ASM kernels",
     )
     parser.add_argument(
-        "--mode", choices=["func", "perf", "profile", "all"], default="perf",
+        "--mode",
+        choices=["func", "perf", "profile", "all"],
+        default="perf",
         help="func=acc only, perf=acc+timing, profile=perf+trace, all=perf",
     )
     # mxfp4 and nvfp4 variants are registered in f4gemm.csv; each needs its
     # matching .co built (build_co.sh) before --intype can select it.
     parser.add_argument("--intype", choices=["mxfp4", "nvfp4", "both"], default="nvfp4")
-    parser.add_argument("--apre", type=int, choices=[0, 1], default=1,
-                        help="A-preshuffle: 1 to preshuffle A, 0 to send row-major")
+    parser.add_argument(
+        "--apre",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="A-preshuffle: 1 to preshuffle A, 0 to send row-major",
+    )
     # Defaults are cluster(4x4)+persistent friendly for the registered tiles:
     # 256x256 needs M%1024,N%1024; 128x512 needs M%512,N%2048.
-    parser.add_argument("-s", "--shape", type=_str2tuple, nargs="*",
-                        default=[(1024, 2048, 2048), (2048, 4096, 4096)],
-                        help="(M,N,K) tuples, e.g. -s 1024,2048,2048 2048,4096,4096")
-    parser.add_argument("--kernel", type=str, default="",
-                        help="Force a specific kernelName (bypass heuristic)")
+    parser.add_argument(
+        "-s",
+        "--shape",
+        type=_str2tuple,
+        nargs="*",
+        default=[(1024, 2048, 2048), (2048, 4096, 4096)],
+        help="(M,N,K) tuples, e.g. -s 1024,2048,2048 2048,4096,4096",
+    )
+    parser.add_argument(
+        "--kernel",
+        type=str,
+        default="",
+        help="Force a specific kernelName (bypass heuristic)",
+    )
     args = parser.parse_args()
 
     intypes = ["mxfp4", "nvfp4"] if args.intype == "both" else [args.intype]
     rows = []
     for it in intypes:
         for M, N, K in args.shape:
-            ret = test_gemm(it, M, N, K, args.apre, kernelName=args.kernel, mode=args.mode)
+            ret = test_gemm(
+                it, M, N, K, args.apre, kernelName=args.kernel, mode=args.mode
+            )
             if ret is not None:
                 rows.append(ret)
 
@@ -181,7 +216,8 @@ if __name__ == "__main__":
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "f4gemm_mi400 %s summary (markdown):\n%s",
-            args.mode, df.to_markdown(index=False),
+            args.mode,
+            df.to_markdown(index=False),
         )
         if args.mode == "profile":
             aiter.logger.info("profiler traces written under ./aiter_logs/")

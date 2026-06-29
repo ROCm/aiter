@@ -111,10 +111,17 @@ def test_gemm(intype, M, N, K, apre, dtype=dtypes.bf16, mode="perf", tile="auto"
         gB = None if inp["gB"] is None else torch.tensor(inp["gB"], dtype=torch.float32)
         out, us = run_perftest(
             aiter.gemm_a4w4,
-            inp["A"], inp["B"], inp["sA"], inp["sB"],
-            dtype=dtype, apreshuffle=bool(apre), bpreshuffle=True,
-            global_A_scale=gA, global_B_scale=gB,
-            num_iters=num_iters, needTrace=needTrace,
+            inp["A"],
+            inp["B"],
+            inp["sA"],
+            inp["sB"],
+            dtype=dtype,
+            apreshuffle=bool(apre),
+            bpreshuffle=True,
+            global_A_scale=gA,
+            global_B_scale=gB,
+            num_iters=num_iters,
+            needTrace=needTrace,
         )
         which = "gemm_a4w4"
     else:
@@ -123,22 +130,39 @@ def test_gemm(intype, M, N, K, apre, dtype=dtypes.bf16, mode="perf", tile="auto"
         if intype == "nvfp4":
             out, us = run_perftest(
                 aiter.gemm_nvfp4_asm,
-                inp["A"], inp["B"], inp["sA"], inp["sB"], inp["gA"], inp["gB"],
-                dtype=dtype, a_preshuffle=bool(apre), kernelName=which,
-                num_iters=num_iters, needTrace=needTrace,
+                inp["A"],
+                inp["B"],
+                inp["sA"],
+                inp["sB"],
+                inp["gA"],
+                inp["gB"],
+                dtype=dtype,
+                a_preshuffle=bool(apre),
+                kernelName=which,
+                num_iters=num_iters,
+                needTrace=needTrace,
             )
         else:
             out, us = run_perftest(
                 aiter.gemm_mxfp4_asm,
-                inp["A"], inp["B"], inp["sA"], inp["sB"],
-                dtype=dtype, a_preshuffle=bool(apre), kernelName=which,
-                num_iters=num_iters, needTrace=needTrace,
+                inp["A"],
+                inp["B"],
+                inp["sA"],
+                inp["sB"],
+                dtype=dtype,
+                a_preshuffle=bool(apre),
+                kernelName=which,
+                num_iters=num_iters,
+                needTrace=needTrace,
             )
     err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {which}")
 
     io_bytes = (
-        inp["A"].nbytes + inp["B"].nbytes
-        + inp["sA"].nbytes + inp["sB"].nbytes + out.nbytes
+        inp["A"].nbytes
+        + inp["B"].nbytes
+        + inp["sA"].nbytes
+        + inp["sB"].nbytes
+        + out.nbytes
     )
     ret = {
         "intype": intype,
@@ -164,25 +188,44 @@ if __name__ == "__main__":
         description="Test/benchmark gfx1250 A4W4 (F4GEMM) via the unified gemm_a4w4 API",
     )
     parser.add_argument(
-        "--mode", choices=["func", "perf", "profile", "all"], default="perf",
+        "--mode",
+        choices=["func", "perf", "profile", "all"],
+        default="perf",
         help="func=acc only, perf=acc+timing, profile=perf+trace, all=perf",
     )
     parser.add_argument("--intype", choices=["mxfp4", "nvfp4", "both"], default="nvfp4")
     parser.add_argument(
-        "--tile", choices=["auto", "256x256"], default="auto",
+        "--tile",
+        choices=["auto", "256x256"],
+        default="auto",
         help="auto=unified gemm_a4w4 (C++ heuristic); 256x256 forces that tile",
     )
-    parser.add_argument("--apre", type=int, choices=[0, 1], default=1,
-                        help="A-preshuffle: 1 to preshuffle A, 0 to send row-major")
     parser.add_argument(
-        "-d", "--dtype", type=dtypes.str2Dtype, nargs="*",
-        choices=[dtypes.d_dtypes["bf16"]], metavar="{bf16}",
-        default=[dtypes.d_dtypes["bf16"]], help="output dtype, e.g. -d bf16",
+        "--apre",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="A-preshuffle: 1 to preshuffle A, 0 to send row-major",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        choices=[dtypes.d_dtypes["bf16"]],
+        metavar="{bf16}",
+        default=[dtypes.d_dtypes["bf16"]],
+        help="output dtype, e.g. -d bf16",
     )
     # cluster(4x4)+persistent friendly for the 256x256 tile: M%1024, N%1024.
-    parser.add_argument("-mnk", "--shape", type=_str2tuple, nargs="*",
-                        default=[(1024, 2048, 2048), (2048, 4096, 4096)],
-                        help="(M,N,K) tuples, e.g. -mnk 1024,2048,2048 2048,4096,4096")
+    parser.add_argument(
+        "-mnk",
+        "--shape",
+        type=_str2tuple,
+        nargs="*",
+        default=[(1024, 2048, 2048), (2048, 4096, 4096)],
+        help="(M,N,K) tuples, e.g. -mnk 1024,2048,2048 2048,4096,4096",
+    )
     args = parser.parse_args()
 
     intypes = ["mxfp4", "nvfp4"] if args.intype == "both" else [args.intype]
@@ -190,7 +233,9 @@ if __name__ == "__main__":
     for dtype in args.dtype:
         for it in intypes:
             for M, N, K in args.shape:
-                ret = test_gemm(it, M, N, K, args.apre, dtype=dtype, mode=args.mode, tile=args.tile)
+                ret = test_gemm(
+                    it, M, N, K, args.apre, dtype=dtype, mode=args.mode, tile=args.tile
+                )
                 if ret is not None and "us" in ret:
                     rows.append(ret)
 
@@ -198,7 +243,8 @@ if __name__ == "__main__":
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "gemm_a4w4_mi400 %s summary (markdown):\n%s",
-            args.mode, df.to_markdown(index=False),
+            args.mode,
+            df.to_markdown(index=False),
         )
         if args.mode == "profile":
             aiter.logger.info("profiler traces written under ./aiter_logs/")
