@@ -254,11 +254,14 @@ def _attn_asm(
 
 
 def _attn_triton(
-    cfg, w, q, k, v, positions, cu_seqlens, seq_len, batch, sliding_window
+    cfg, w, q, k, v, positions, cu_seqlens, seq_len, batch, sliding_window, phase
 ):
     """Portable path (ATOM TritonMHABackend / use_flash_layout): flash-layout KV
     cache + aiter unified_attention for prefill AND decode. Runs on gfx1250 too
-    (where flash_attn_varlen / pa_decode_gluon are unsupported). bf16 only."""
+    (where flash_attn_varlen / pa_decode_gluon are unsupported). bf16 only.
+
+    Decode runs a true single-token query per seq (max_seqlen_q=1) over the
+    cache populated with the full context, matching the asm decode cost."""
     hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
     scale = hd**-0.5
     total = q.shape[0]
@@ -300,15 +303,40 @@ def _attn_triton(
 
     context_lens = torch.full((batch,), seq_len, dtype=torch.int32)
     ones = torch.ones((batch, nkv), dtype=torch.float32)  # bf16 -> no dequant
-    # All tokens run as queries (causal); the decode caller keeps the last per seq.
-    o = torch.empty(total, nq, hd, dtype=dtypes.bf16)
+    if phase == "prefill":
+        o = torch.empty(total, nq, hd, dtype=dtypes.bf16)
+        unified_attention(
+            q,
+            k_cache,
+            v_cache,
+            o,
+            cu_seqlens_q=cu_seqlens,
+            max_seqlen_q=seq_len,
+            seqused_k=context_lens,
+            max_seqlen_k=seq_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=ones,
+            v_descale=ones,
+            sinks=w.sinks,
+        )
+        return o.view(total, nq * hd)
+
+    # decode: single last-token query per seq over the full-context cache.
+    q_dec = q.view(batch, seq_len, nq, hd)[:, -1].contiguous()
+    cu_q = torch.arange(batch + 1, dtype=torch.int32)
+    o = torch.empty(batch, nq, hd, dtype=dtypes.bf16)
     unified_attention(
-        q,
+        q_dec,
         k_cache,
         v_cache,
         o,
-        cu_seqlens_q=cu_seqlens,
-        max_seqlen_q=seq_len,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=1,
         seqused_k=context_lens,
         max_seqlen_k=seq_len,
         softmax_scale=scale,
@@ -321,7 +349,7 @@ def _attn_triton(
         v_descale=ones,
         sinks=w.sinks,
     )
-    return o.view(total, nq * hd)
+    return o.view(batch, nq * hd)
 
 
 def attention_block(
@@ -346,12 +374,18 @@ def attention_block(
     q, k, v = _qkv_split(qkv, cfg)
     if backend == "triton":
         o = _attn_triton(
-            cfg, w, q, k, v, positions, cu_seqlens, seq_len, batch, sliding_window
+            cfg,
+            w,
+            q,
+            k,
+            v,
+            positions,
+            cu_seqlens,
+            seq_len,
+            batch,
+            sliding_window,
+            phase,
         )
-        if phase == "decode":
-            # unified_attention runs all tokens as queries; keep last per seq.
-            nq, hd = cfg.num_attention_heads, cfg.head_dim
-            o = o.view(batch, seq_len, nq * hd)[:, -1].contiguous()
     else:
         o = _attn_asm(
             cfg,
