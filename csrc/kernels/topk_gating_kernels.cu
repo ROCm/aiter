@@ -888,7 +888,7 @@ __global__ void topk_softplus_kernel_smem_n(
         dim3((num_tokens + (TPW) - 1) / (TPW)), dim3(block), 0, stream,                         \
         reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
         has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
-        topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),                            \
+        reinterpret_cast<float*>(topk_weights.data_ptr()), reinterpret_cast<int*>(topk_indices.data_ptr()), \
         stride_tk, topk, num_tokens, routed_scaling_factor);
 
 // smem_n: ROWS_PER_WARP=RPW shared-memory kernel; smem = RPW * num_experts floats.
@@ -898,7 +898,7 @@ __global__ void topk_softplus_kernel_smem_n(
         dim3((num_tokens + (RPW) - 1) / (RPW)), dim3(block), (RPW) * shared_mem_size, stream,   \
         reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
         has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
-        topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),                            \
+        reinterpret_cast<float*>(topk_weights.data_ptr()), reinterpret_cast<int*>(topk_indices.data_ptr()), \
         stride_tk, num_experts, topk, num_tokens, routed_scaling_factor);
 
 // prefill: vectorized-load scan+invalidate kernel, templatized TPW.
@@ -908,7 +908,7 @@ __global__ void topk_softplus_kernel_smem_n(
         dim3((num_tokens + (TPW) - 1) / (TPW)), dim3(block), 0, stream,                         \
         reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
         has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
-        topk_weights.data_ptr<float>(), topk_indices.data_ptr<int>(),                            \
+        reinterpret_cast<float*>(topk_weights.data_ptr()), reinterpret_cast<int*>(topk_indices.data_ptr()), \
         stride_tk, topk, num_tokens, routed_scaling_factor);
 
 // ---------------------------------------------------------------------------
@@ -1033,12 +1033,16 @@ void topk_softplus(aiter_tensor_t& topk_weights,
                 if(num_tokens >= 1024)
                 {
                     if(topk <= 8)
-                        best_tpw = (num_experts <= 64) ? 8 : (num_experts <= 128) ? 8 : 4;
+                        best_tpw = (num_experts <= 64) ? (topk <= 4 ? 16 : 8) : (num_experts <= 128) ? 8 : 4;
                     else if(topk <= 16)
                         best_tpw = 4;
                 }
                 // Compile-time dispatch of TPW (must be static for template).
                 // TPW=1 covers decode + small T for all score functions.
+                if(best_tpw >= 16 && topk <= 4)
+                {
+                    _DISPATCH_PREFILL_N_KERNEL(64, 16)
+                }
                 if(best_tpw >= 8 && topk <= 8)
                 {
                     _DISPATCH_PREFILL_N_KERNEL(64,  8)
