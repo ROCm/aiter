@@ -3,6 +3,7 @@
 
 """Preshuffle GEMM (layout API): f16/bf16/fp8/int8, ping-pong scf.for loop with scheduler hints."""
 
+import functools
 from typing import Optional
 
 import flydsl.compiler as flyc
@@ -104,6 +105,7 @@ def _get_preload(tile_m, tile_n, tile_k):
     return _TILE_PRELOAD_TABLE.get((int(tile_m), int(tile_n), int(tile_k)), _TILE_PRELOAD_DEFAULT)
 
 
+@functools.lru_cache(maxsize=1024)
 def compile_preshuffle_gemm(
     *,
     N: int,
@@ -244,7 +246,15 @@ def compile_preshuffle_gemm(
         thr_g2r_B = fx.make_tiled_copy_B(buf_copy, tiled_mma).get_slice(tid)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        swz = fx.SwizzleType.get(4, 4, 3) if const_expr(is_8bit) else fx.SwizzleType.get(3, 3, 3)
+        # A-LDS swizzle. For 8-bit, match the async DMA's swizzle_xor16
+        # (k ^ ((m % (tile_k//16)) * 16)) so use_async_copy reads back what it wrote:
+        # get(b, 4, b) with b = log2(tile_k//16).
+        if const_expr(is_8bit):
+            k_blocks16 = (tile_k * elem_bytes) // 16
+            swz_bits = k_blocks16.bit_length() - 1  # log2
+            swz = fx.SwizzleType.get(swz_bits, 4, swz_bits)
+        else:
+            swz = fx.SwizzleType.get(3, 3, 3)
 
         def _make_sA(arr):
             return fx.make_view(
@@ -512,7 +522,6 @@ def compile_preshuffle_gemm(
             lane_id = gpu.thread_id("x") % 64
             lane_div_16 = lane_id // 16
             lane_mod_16 = lane_id % 16
-            n_tile_base = wave_id * n_per_wave
 
             if const_expr(is_8bit):
                 # FP8/INT8: per-row(scale_a) × per-col(scale_b) scaling applied inline.
@@ -529,8 +538,11 @@ def compile_preshuffle_gemm(
                     return Vec(fx.memref_load_vec(r))[0]
 
                 # Per-column scales (1/N-block) and per-row scales (1/row/thread).
+                # The 4 waves tile N interleaved at 16-col granularity (wave layout
+                # (1,4,1) over the 16-wide MMA N atom), so N-block ni of this wave
+                # lives at column (ni*num_waves + wave_id)*16, NOT wave_id*n_per_wave+ni*16.
                 s_b_vals = [
-                    load_scale(scale_b_div, by_n + n_tile_base + ni * 16 + lane_mod_16)
+                    load_scale(scale_b_div, by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16)
                     for ni in range_constexpr(num_acc_n)
                 ]
                 s_a_vals = [
@@ -549,7 +561,7 @@ def compile_preshuffle_gemm(
                     fx.copy_atom_call(bias_copy, fx.slice(bias_div, (None, fx.Int32(index))), r)
                     return fx.Float32(Vec(fx.memref_load_vec(r))[0])
 
-                bias_vals = [load_bias(by_n + n_tile_base + ni * 16 + lane_mod_16) for ni in range_constexpr(num_acc_n)]
+                bias_vals = [load_bias(by_n + (ni * num_waves + wave_id) * 16 + lane_mod_16) for ni in range_constexpr(num_acc_n)]
 
             def apply_activation(val_s):
                 # ReLU/SiLU/GeLU ported from v1: maximumf for relu; exp+rcp for silu;
@@ -575,21 +587,22 @@ def compile_preshuffle_gemm(
 
             acc_vec = Vec(frag_C.load())
             out_elems = []
-            for mi in range_constexpr(m_repeat):
-                for ni in range_constexpr(num_acc_n):
-                    for ii in range_constexpr(4):
-                        idx = mi * num_acc_n * 4 + ni * 4 + ii
-                        val = acc_vec[idx]
-                        if const_expr(is_int8):
-                            val = val.to(Float32)
-                        if const_expr(is_8bit):
-                            val_s = (val * s_a_vals[mi][ii]) * s_b_vals[ni]
-                        else:
-                            val_s = val
-                        if const_expr(_has_bias):
-                            val_s = val_s + bias_vals[ni]
-                        val_s = apply_activation(val_s)
-                        out_elems.append(val_s.to(out_elem_cls))
+
+            for p in range_constexpr(acc_size):
+                ni = p // (m_repeat * 4)
+                mi = (p // 4) % m_repeat
+                ii = p % 4
+                val = acc_vec[p]
+                if const_expr(is_int8):
+                    val = val.to(Float32)
+                if const_expr(is_8bit):
+                    val_s = (val * s_a_vals[mi][ii]) * s_b_vals[ni]
+                else:
+                    val_s = val
+                if const_expr(_has_bias):
+                    val_s = val_s + bias_vals[ni]
+                val_s = apply_activation(val_s)
+                out_elems.append(val_s.to(out_elem_cls))
 
             out_vec = vector.from_elements(T.vec(acc_size, out_elem_cls.ir_type), out_elems)
             frag_C_out.store(out_vec)
