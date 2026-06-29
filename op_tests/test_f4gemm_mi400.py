@@ -155,8 +155,8 @@ if __name__ == "__main__":
         "--mode", choices=["func", "perf", "profile", "all"], default="perf",
         help="func=acc only, perf=acc+timing, profile=perf+trace, all=perf",
     )
-    # Only NVFP4 kernels are currently registered (see f4gemm_mi400.csv);
-    # mxfp4/both will find no kernel until an MXFP4 .co is added.
+    # mxfp4 and nvfp4 variants are registered in f4gemm.csv; each needs its
+    # matching .co built (build_co.sh) before --intype can select it.
     parser.add_argument("--intype", choices=["mxfp4", "nvfp4", "both"], default="nvfp4")
     parser.add_argument("--apre", type=int, choices=[0, 1], default=1,
                         help="A-preshuffle: 1 to preshuffle A, 0 to send row-major")

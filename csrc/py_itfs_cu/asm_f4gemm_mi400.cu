@@ -20,7 +20,7 @@
 //     grid. NVFP4 carries them at dw20/21, MXFP4 reuses dw18/19.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
-#include "asm_f4gemm_mi400_configs.hpp"
+#include "asm_f4gemm_configs.hpp"
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -54,7 +54,7 @@ struct __attribute__((packed)) KernelArgs
     unsigned int log2_grid_y;      // dw 21     persistent only (unused -> 0)
 };
 // 5 ptrs (40B) + 8 scalars (32B) + GlobalScaleA/B (8B) + 2 log2 (8B) = 88B.
-static_assert(sizeof(KernelArgs) == 88, "f4gemm_mi400 preload KernelArgs must be 88B");
+static_assert(sizeof(KernelArgs) == 88, "f4gemm preload KernelArgs must be 88B");
 
 static std::tuple<std::string, int> get_heuristic_kernel(
     int M, int N, int K, std::string arch_id, int intype, int a_preshuffle, CFG* cfgs)
@@ -201,10 +201,10 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
 
     const HipDeviceGuard device_guard(A->device_id);
 
-    static CFG* config_map = &cfg_f4gemm_mi400;
+    static CFG* config_map = &cfg_f4gemm;
     AITER_CHECK(!config_map->empty(),
                 __func__,
-                " no kernel registered for f4gemm_mi400; check AITER_GPU_ARCHS=gfx1250");
+                " no kernel registered for f4gemm; check AITER_GPU_ARCHS=gfx1250");
 
     std::string arch_id = get_gpu_arch();
     std::string selectedName =
@@ -235,7 +235,7 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
     auto it = config_map->find(selectedName);
     AITER_CHECK(it != config_map->end(),
                 __func__,
-                " kernel not in cfg_f4gemm_mi400: ",
+                " kernel not in cfg_f4gemm: ",
                 selectedName);
 
     const auto& cfg     = it->second;

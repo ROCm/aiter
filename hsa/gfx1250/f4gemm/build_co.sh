@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build all f4gemm_mi400 .co files from .s assembly sources.
+# Build all gfx1250 f4gemm .co files from .s assembly sources.
 #
 # Each source .s emits a kernel symbol named "f4gemm". The CFG map in
-# asm_f4gemm_mi400_configs.hpp uses (arch + knl_name) as a unique key, so we
+# asm_f4gemm_configs.hpp uses (arch + knl_name) as a unique key, so we
 # rename the kernel symbol per variant via sed before compilation. The
-# rename target matches the knl_name column in f4gemm_mi400.csv.
+# rename target matches the knl_name column in f4gemm.csv.
 #
 # Expected input layout (one .s per (intype, subm, subn, apre)):
 #   ${SHADER_DIR}/f4gemm_${intype_name}_${subm}x${subn}_apre${apre}.s
@@ -18,7 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="${SCRIPT_DIR}"
-CSV="${CSV:-${SCRIPT_DIR}/f4gemm_mi400.csv}"
+CSV="${CSV:-${SCRIPT_DIR}/f4gemm.csv}"
 SHADER_DIR="${SHADER_DIR:-${SCRIPT_DIR}/shaders}"
 ARCH="gfx1250"
 
@@ -31,7 +31,7 @@ else
     exit 1
 fi
 
-echo "=== Building f4gemm_mi400 .co files ==="
+echo "=== Building gfx1250 f4gemm .co files ==="
 echo "  Compiler:   ${CXX}"
 echo "  CSV:        ${CSV}"
 echo "  Shader dir: ${SHADER_DIR}"
