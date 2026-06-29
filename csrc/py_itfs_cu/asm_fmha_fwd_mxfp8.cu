@@ -28,59 +28,51 @@
 #include <cmath>
 #include <memory>
 
-// Slot-padded kernarg ABI -- matches the poc host
-// (poc_kl/mi400/fmha_fwd_mxfp8/fmha_fwd_mxfp8.cpp :: FmhaFwdKernelArgsBase).
-// Each pointer occupies a 16-byte slot (8B ptr + 8B pad); each 32-bit scalar
-// occupies a 16-byte slot (4B value + 12B pad).  Do NOT repack this struct:
-// the byte offsets are part of the kernel ABI emitted in the .co metadata.
-namespace {
-struct mxpad2 { unsigned int _p0, _p1; };
-struct mxpad3 { unsigned int _p0, _p1, _p2; };
-}
-
+// Packed kernarg ABI (148 B = 0x94) -- matches the poc host
+// (poc_kl/mi400/fmha_fwd_mxfp8/fmha_fwd_mxfp8.cpp :: FmhaFwdKernelArgsBase,
+// branch features/yj/prefill).  This is the *new* tightly-packed layout: 8-byte
+// pointers and 4-byte ints with no slot padding.  Byte offsets (in comments)
+// are part of the kernel ABI emitted in the .co metadata -- do NOT reorder or
+// repack.  Notable changes vs the old 560-B slot-padded layout: scale pointers
+// moved to the middle (0x60-0x77), q_ts moved to 0x78, varlen QSeq/KSeq
+// pointers removed.
 #pragma pack(push, 1)
 struct KernelArgs
 {
-    void*  ptr_O;            mxpad2 _padO;
-    const void* ptr_Q;       mxpad2 _padQ;
-    const void* ptr_K;       mxpad2 _padK;
-    const void* ptr_V;       mxpad2 _padV;
-    void*  ptr_LSE;          mxpad2 _padLSE;
-    float  scalar;           mxpad3 _padSc;
-    int    q_seq_len;        mxpad3 _p0;
-    int    stride_q_seq;     mxpad3 _p1;
-    int    stride_q_tg;      mxpad3 _p2;
-    int    stride_q_head;    mxpad3 _p3;
-    int    stride_q_batch;   mxpad3 _p4;
-    int    gqa;              mxpad3 _p5;
-    int    stride_k_seq;     mxpad3 _p6;
-    int    stride_k_head;    mxpad3 _p7;
-    int    stride_k_batch;   mxpad3 _p8;
-    int    opt;              mxpad3 _p9;
-    int    lse;              mxpad3 _p10;
-    int    kv_seq_len;       mxpad3 _p11;
-    int    qk_head_dim;      mxpad3 _p12;
-    int    v_head_dim;       mxpad3 _p13;
-    int    q_head_num;       mxpad3 _p14;
-    int    stride_v_seq;     mxpad3 _p15;
-    int    stride_v_head;    mxpad3 _p16;
-    int    stride_v_batch;   mxpad3 _p17;
-    int    stride_o_seq;     mxpad3 _p18;
-    int    stride_o_head;    mxpad3 _p19;
-    int    stride_o_batch;   mxpad3 _p20;
-    void*  ptr_QSeq;         mxpad2 _padQSeq;
-    void*  ptr_KSeq;         mxpad2 _padKSeq;
-    int    stride_lse_head;  mxpad3 _p21;
-    void*  ptr_QSeqPad;      mxpad2 _padQSeqPad;
-    void*  ptr_KSeqPad;      mxpad2 _padKSeqPad;
-    void*  ptr_QScale;       mxpad2 _padQScale;
-    void*  ptr_KScale;       mxpad2 _padKScale;
-    void*  ptr_VScale;       mxpad2 _padVScale;
+    void*       ptr_O;          // 0x00  s_D_addr
+    const void* ptr_Q;          // 0x08  s_Q_addr
+    const void* ptr_K;          // 0x10  s_K_addr
+    const void* ptr_V;          // 0x18  s_V_addr
+    void*       ptr_LSE;        // 0x20  s_LSE_addr
+    float       scalar;         // 0x28  s_scalar
+    int         q_seq_len;      // 0x2C  s_Q_seq_len
+    int         stride_q_seq;   // 0x30  s_Q_Seqs
+    int         stride_q_head;  // 0x34  s_Q_Hs
+    int         stride_q_batch; // 0x38  s_Q_BAs
+    int         gqa;            // 0x3C  s_gqa
+    int         stride_k_seq;   // 0x40  s_K_Seqs
+    int         stride_k_head;  // 0x44  s_K_Hs
+    int         stride_k_batch; // 0x48  s_K_BAs
+    int         kv_seq_len;     // 0x4C  s_KV_seq_len
+    int         q_head_num;     // 0x50  s_Q_head_num
+    int         stride_v_seq;   // 0x54  s_V_Seqs
+    int         stride_v_head;  // 0x58  s_V_Hs
+    int         stride_v_batch; // 0x5C  s_V_BAs
+    const void* ptr_QScale;     // 0x60  s_Q_scale_addr
+    const void* ptr_KScale;     // 0x68  s_K_scale_addr
+    const void* ptr_VScale;     // 0x70  s_V_scale_addr
+    int         stride_q_tg;    // 0x78  s_Q_Ts
+    int         opt;            // 0x7C  s_opt
+    int         lse;            // 0x80  s_LSE
+    int         stride_o_seq;   // 0x84  s_D_Seqs
+    int         stride_o_head;  // 0x88  s_D_Hs
+    int         stride_o_batch; // 0x8C  s_D_BAs
+    int         stride_lse_head;// 0x90  s_LSE_Hs
 };
 #pragma pack(pop)
-static_assert(sizeof(KernelArgs) == 560,
-              "fmha_fwd_mxfp8_asm: KernelArgs must be 560B (35 x 16B slots), "
-              "matching the poc FmhaFwdKernelArgsBase ABI");
+static_assert(sizeof(KernelArgs) == 0x94,
+              "fmha_fwd_mxfp8_asm: KernelArgs must be 148B packed, "
+              "matching the poc FmhaFwdKernelArgsBase ABI (features/yj/prefill)");
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -255,33 +247,27 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.scalar         = softmax_scale;
     args.q_seq_len      = q_seq_len;
     args.stride_q_seq   = stride_q_seq;
-    args.stride_q_tg    = stride_q_tg;
     args.stride_q_head  = stride_q_head;
     args.stride_q_batch = stride_q_batch;
     args.gqa            = gqa;
     args.stride_k_seq   = stride_k_seq;
     args.stride_k_head  = stride_k_head;
     args.stride_k_batch = stride_k_batch;
-    args.opt            = 0;
-    args.lse            = return_lse ? 1 : 0;
     args.kv_seq_len     = kv_seq_len;
-    args.qk_head_dim    = qk_head_dim;
-    args.v_head_dim     = v_head_dim;
     args.q_head_num     = q_head_num;
     args.stride_v_seq   = stride_v_seq;
     args.stride_v_head  = stride_v_head;
     args.stride_v_batch = stride_v_batch;
-    args.stride_o_seq   = stride_o_seq;
-    args.stride_o_head  = stride_o_head;
-    args.stride_o_batch = stride_o_batch;
-    args.ptr_QSeq       = nullptr;
-    args.ptr_KSeq       = nullptr;
-    args.stride_lse_head = stride_lse_head;
-    args.ptr_QSeqPad    = nullptr;
-    args.ptr_KSeqPad    = nullptr;
     args.ptr_QScale     = q_scale->data_ptr();
     args.ptr_KScale     = k_scale->data_ptr();
     args.ptr_VScale     = v_scale->data_ptr();
+    args.stride_q_tg    = stride_q_tg;
+    args.opt            = 0;
+    args.lse            = return_lse ? 1 : 0;
+    args.stride_o_seq   = stride_o_seq;
+    args.stride_o_head  = stride_o_head;
+    args.stride_o_batch = stride_o_batch;
+    args.stride_lse_head = stride_lse_head;
 
     size_t arg_size = sizeof(args);
 
