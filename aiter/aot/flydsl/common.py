@@ -6,8 +6,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import functools
-import inspect
 import json
 import multiprocessing
 from multiprocessing.connection import wait as wait_for_sentinels
