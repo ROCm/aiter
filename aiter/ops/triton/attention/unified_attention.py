@@ -753,7 +753,7 @@ def _gfx1250_unified_attention_2d(
         num_warps = 4
         waves_per_eu = 2
         TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
-        num_buffers = 2
+        num_buffers = 3
 
         if max_seqlen_k < 2048:
             BLOCK_M = 64
