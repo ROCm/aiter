@@ -1206,7 +1206,7 @@ def mla_decode_fwd_v4_nm(
     #       could shrink it and desync the buffer shapes). Only synthesize a
     #       uniform split_indptr if the caller didn't pass one.
     total_kv = kv_page_indices.shape[0]
-    if num_kv_splits is None:
+    if num_kv_splits is None or split_indptr is None:
         # The shipped qh64 .co has a 64-row tile; the dispatcher launches
         # gdx = ceil(num_heads / 64) thread-groups per (seq, kv-split) along
         # the head dim. gqa=128 (num_heads=128) is realized as TWO WGs
@@ -1215,8 +1215,8 @@ def mla_decode_fwd_v4_nm(
         # bs*tg_factor*splits workgroups and stops over-splitting (e.g.
         # bs=64/gqa=128 picks splits=2, not 4).
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
-        num_kv_splits, meta_split_indptr = get_meta_param(
-            None,
+        meta_num_kv_splits, meta_split_indptr = get_meta_param(
+            num_kv_splits,
             num_seqs,
             total_kv,
             num_heads,
@@ -1224,17 +1224,10 @@ def mla_decode_fwd_v4_nm(
             q.dtype,
             tg_factor,
         )
+        if num_kv_splits is None:
+            num_kv_splits = meta_num_kv_splits
         if split_indptr is None:
             split_indptr = meta_split_indptr.to(device=q.device, dtype=torch.int32)
-
-    if split_indptr is None:
-        split_indptr = torch.arange(
-            0,
-            (num_seqs + 1) * num_kv_splits,
-            num_kv_splits,
-            dtype=torch.int32,
-            device=q.device,
-        )
 
     # ---- Multi-pass requires the FP32 split-output path ----
     if num_kv_splits > 1 and out_16_nosplit != 0:
@@ -1298,6 +1291,19 @@ def mla_decode_fwd_v4_nm(
             f"note in the `logits` shape error above for details."
         )
 
+    # Per-batch valid-split count buffer (main added this to stage2 to skip
+    # empty splits in the reduce). Allocated HERE — alongside logits/attn_lse,
+    # at a fixed [num_seqs] size with num_kv_splits already resolved — rather
+    # than inside the `num_kv_splits > 1` stage2 block, so a CUDA-graph capture
+    # sees a single fixed-size allocation (mirrors V3 mla_decode_fwd, which
+    # allocates valid_split_count before stage1). v4 nm's split_indptr is
+    # uniform (every seq uses all num_kv_splits) so initialize to num_kv_splits;
+    # gfx950 disables the valid-split reduce anyway (USE_VALID_SPLIT_COUNT_REDUCE
+    # below), making this a passive ABI placeholder there.
+    valid_split_count = torch.full(
+        (num_seqs,), num_kv_splits, dtype=dtypes.i32, device=q.device
+    )
+
     # softmax_scale is ignored by the v4 nm kernel (hardcodes 1/sqrt(512));
     # we still pass *something* through to satisfy the C ABI.
     sm_scale_arg = 0.0 if sm_scale is None else float(sm_scale)
@@ -1320,6 +1326,8 @@ def mla_decode_fwd_v4_nm(
         logits,
         attn_lse,
         output,
+        valid_split_count,  # ABI parity w/ V3 stage1 (kernel ignores it; nullable)
+        0,  # use_valid_split_count_reduce: ABI parity; v4 nm kernel ignores it
     )
 
     # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
@@ -1342,14 +1350,6 @@ def mla_decode_fwd_v4_nm(
         # final_lse output is not currently part of the wrapper's public API.
         final_lse_buf = torch.empty((1,), dtype=dtypes.fp32, device=device)
 
-        # Per-batch valid-split count buffer (main added this to stage2 to skip
-        # empty splits in the reduce). v4 nm's split_indptr is uniform — every
-        # seq uses all num_kv_splits — so initialize to num_kv_splits; the
-        # USE_VALID_SPLIT_COUNT_REDUCE gate just makes the min() a no-op here.
-        valid_split_count = torch.full(
-            (num_seqs,), num_kv_splits, dtype=dtypes.i32, device=device
-        )
-
         _fwd_kernel_stage2_asm[(num_seqs, num_heads)](
             logits,  # Mid_O   [total_q, num_kv_splits, num_heads, dv]
             attn_lse,  # Mid_lse [total_q, num_kv_splits, num_heads, 1]
@@ -1370,7 +1370,13 @@ def mla_decode_fwd_v4_nm(
             KV_INDPTR_IS_PAGE_LEVEL=False,  # page_size=1 -> token-level indptr
             MAYBE_FINAL_OUT=True,
             HAS_FINAL_LSE=False,
-            USE_VALID_SPLIT_COUNT_REDUCE=int(num_kv_splits > 1),
+            # gfx950 (mi350) v4 nm uses uniform full-coverage splits with no
+            # empty-split skipping, so the valid-split reduce is a no-op there;
+            # force 0 to keep the legacy reduce path. Other archs follow the
+            # main convention (enable when multi-split).
+            USE_VALID_SPLIT_COUNT_REDUCE=(
+                0 if get_gfx() == "gfx950" else int(num_kv_splits > 1)
+            ),
             BATCH_NUM=num_seqs,
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,

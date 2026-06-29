@@ -870,50 +870,12 @@ def mla_decode_v4_asm(
     splitLse: torch.Tensor,
     # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
     output: torch.Tensor,
-) -> None: ...
-
-
-MD_NAME_V4 = "module_mla_v4_asm"
-
-
-@compile_ops(MD_NAME_V4, ffi_type="ctypes")
-def mla_decode_v4_asm(
-    # [total_query_len, num_heads, head_size]   FP8 packed Q + e8m0 scale region
-    Q: torch.Tensor,
-    # [total_query_len, num_heads, kv_rotary]   BF16
-    qrope: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, head_size]  FP8
-    KV: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, kv_rotary]  BF16
-    kvrope: torch.Tensor,
-    # [num_seqs+1]
-    qo_indptr: torch.Tensor,
-    # [num_seqs+1]
-    kv_indptr: torch.Tensor,
-    # [num_page_used]
-    kv_page_indices: torch.Tensor,
-    # [num_seqs]
-    kv_last_page_lens: torch.Tensor,
-    # [num_seqs+1]
-    split_indptr: torch.Tensor,
-    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
-    # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
-    # tensor; there is no nullable-sink convention on the C ABI. Pass
-    # torch.full((num_heads,), float("-inf")) for "no sink" math.
-    sink: torch.Tensor,
-    max_seqlen_q: int,
-    # ignored on v4 nm; kernel hardcodes 1/sqrt(kV4DimNope+kV4DimRope)=1/sqrt(512)
-    softmax_scale: float,
-    # 0 = fp32 split-out path; 1 = bf16 nosplit reduce path
-    out_16_nosplit: int,
-    num_kv_splits: int,
-    # outputs
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32
-    splitData: torch.Tensor,
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, 1]          FP32
-    splitLse: torch.Tensor,
-    # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
-    output: torch.Tensor,
+    # [num_seqs] i32 scratch (nullable). ABI parity with V3 stage1's
+    # valid-split-count slot; the shipped v4 nm .co does NOT consume it, so it is
+    # a passive placeholder enabling CUDA-graph-safe fixed-buffer plumbing.
+    valid_split_count: Optional[torch.Tensor] = None,
+    # ABI parity with V3 stage1's trailing scalar; ignored by the v4 nm kernel.
+    use_valid_split_count_reduce: int = 0,
 ) -> None: ...
 
 

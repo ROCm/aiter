@@ -169,12 +169,21 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* splitData,          // [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32
      aiter_tensor_t* splitLse,           // [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, 1]          FP32
      aiter_tensor_t* output,             // [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
+     aiter_tensor_t* valid_split_count,  // [num_seqs] i32 scratch (nullable). Mirrors V3
+                                         // mla_decode_stage1_asm_fwd's valid-split-count slot;
+     int use_valid_split_count_reduce,   // ABI parity with V3 stage1's trailing scalar.
      hipStream_t stream),
     (Q, qrope, KV, kvrope, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens,
      split_indptr, sink, max_seqlen_q, softmax_scale, out_16_nosplit, num_kv_splits,
-     splitData, splitLse, output, stream))
+     splitData, splitLse, output, valid_split_count, use_valid_split_count_reduce, stream))
 {
     (void)softmax_scale;
+    // valid_split_count / use_valid_split_count_reduce: ABI parity with V3
+    // stage1 (nullable / passive). The shipped v4 nm .co does not consume them;
+    // accept and ignore so callers can plumb a fixed buffer through for
+    // CUDA-graph capture without a separate codepath.
+    (void)valid_split_count;
+    (void)use_valid_split_count_reduce;
     AITER_CHECK(sink != nullptr, __func__, ": `sink` must not be NULL");
     AITER_CHECK(sink->data_ptr() != nullptr,
                 __func__, ": `sink` data_ptr is NULL — caller must allocate "
