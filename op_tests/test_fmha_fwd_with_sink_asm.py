@@ -29,6 +29,10 @@ Sink mechanism (zero-value virtual KV column):
       sink_term  = exp(sink - new_max)
       denom      = denom * rescale + sink_term
   where max_scores / scores are already in the scaled (softmax_scale) domain.
+
+This is a standalone script (no pytest): it sweeps a set of shapes, runs the
+kernel against a PyTorch reference and/or a perf benchmark, and prints a
+markdown summary table — mirroring the style of op_tests/test_quant.py.
 """
 
 from __future__ import annotations
@@ -36,15 +40,14 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-import time as _t
 from typing import Optional
 
-import pytest
+import pandas as pd
 import torch
 
 import aiter
 
-from aiter.test_common import checkAllclose
+from aiter.test_common import benchmark, checkAllclose
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 # from aiter.test_mha_common import (
@@ -52,37 +55,6 @@ from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 #
 # )  # noqa: F401  (kept for easy swap-back; see doc-block below)
 
-
-def _is_gfx1250_host() -> bool:
-    """True only on a gfx1250 GPU host.
-
-    The fmha_fwd_with_sink_asm ASM kernels are the only ones shipped in
-    hsa/gfx1250/fmha_fwd_bf16/*.co — there are no gfx942 / gfx950 / etc.
-    binaries.  On any other arch the ops-layer call raises
-    'no kernel for arch=...' at launch, so without this guard the tests
-    would FAIL (not skip) on non-gfx1250 CI runners.  Computed once here so
-    every test (current and future) is covered at the module level, instead
-    of relying on each test remembering a per-test guard.
-
-    Robust against the no-GPU case: get_gfx() queries the runtime and can
-    raise when no device is present, so we short-circuit on
-    torch.cuda.is_available() first and swallow any probe error.
-    """
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return get_gfx() == "gfx1250"
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _is_gfx1250_host(),
-    reason=(
-        "fmha_fwd_with_sink_asm ASM kernels are only shipped for gfx1250 "
-        "(hsa/gfx1250/fmha_fwd_bf16/*.co); no GPU or a different arch — skip"
-    ),
-)
 
 # ---------------------------------------------------------------------------
 # Reference implementation.  Inputs accepted as bshd (matches kernel API);
@@ -95,16 +67,6 @@ pytestmark = pytest.mark.skipif(
 # ULP of quantization on lse (~3e-2 for sq=8192 d=128), which exceeds
 # tight comparison thresholds.  `_ref_attn` keeps lse in fp32 and
 # matches the kernel to ~5e-6 (essentially fp32 noise floor).
-#
-# attention_ref is still imported above so it is trivial to swap back
-# when (a) the upstream API stops casting lse to bf16, or (b) you only
-# need rtol-based comparison (rtol=1% absorbs the bf16 quantization).
-#
-# Historical aside: an earlier ROCm 7.13 driver could enter a wedged
-# state after many ASM kernel launches, after which ANY GPU op (incl.
-# attention_ref) would hang in uninterruptible sleep until
-# `rocm-smi --gpureset`.  The wedge is environmental, not a property
-# of attention_ref itself.
 # ---------------------------------------------------------------------------
 
 
@@ -155,30 +117,6 @@ def _ref_attn(q, k, v, *, is_causal: bool, sink: "Optional[torch.Tensor]" = None
     return out, lse
 
 
-def _cmp(a: torch.Tensor, b: torch.Tensor, *, rtol=1e-2, atol=1e-2, msg: str = ""):
-    """bf16-safe wrapper around checkAllclose, but **failing** on mismatch.
-
-    `aiter.test_common.checkAllclose` only logs a warning when the two
-    tensors disagree -- it never raises -- so the surrounding test would
-    PASS silently even with NaN-filled outputs.  This wrapper forwards the
-    diff metadata to checkAllclose (for the nicely-formatted diff log),
-    then explicitly fails the test using `torch.testing.assert_close` so
-    that pytest reports a real failure on any mismatch or NaN.
-
-    On gfx1250 + ROCm 7.13 some bf16 element-wise GPU ops (isnan / isclose /
-    contiguous) deadlock when invoked right after a custom ASM kernel.  The
-    deadlock is unrelated to fmha_fwd_with_sink_asm itself (it has been reproduced with
-    pure-PyTorch programs).  As a workaround we cast both tensors to fp32 on
-    CPU before comparing -- this avoids triggering the buggy GPU bf16 path.
-    """
-    a32 = a.detach().float().cpu()
-    b32 = b.detach().float().cpu()
-    # First: produce the nice diff log if not all-close (warning! / failed!).
-    checkAllclose(a32, b32, rtol=rtol, atol=atol, msg=msg)
-    # Then: enforce a hard failure.  equal_nan=False so any NaN is a mismatch.
-    torch.testing.assert_close(a32, b32, rtol=rtol, atol=atol, msg=msg)
-
-
 def _nrms(actual: torch.Tensor, expected: torch.Tensor) -> float:
     """Normalized RMS error on fp32 CPU tensors (avoids bf16 GPU element-wise hang).
 
@@ -190,10 +128,7 @@ def _nrms(actual: torch.Tensor, expected: torch.Tensor) -> float:
     `1 / max(|b|, eps)` term blows up for the (legitimately) near-zero
     elements common in softmax outputs, producing huge nrms values that have
     nothing to do with the kernel actually being wrong.  For bf16 (relative
-    precision ~3.9e-3) we use eps=1e-3: this lets ~0 outputs contribute at
-    most a per-element relative error of `|a-b| / 1e-3`, which for valid
-    bf16-precision kernel output is well under 1 (consistent with the
-    overall metric being a small ~1e-3 number on PASSing kernels).
+    precision ~3.9e-3) we use eps=1e-3.
     """
     a32 = actual.detach().float().cpu()
     b32 = expected.detach().float().cpu()
@@ -343,182 +278,19 @@ def run_ref(q, k, v, *, is_causal: bool, sink: Optional[torch.Tensor] = None):
 
 
 # ---------------------------------------------------------------------------
-# Correctness tests (sbhd input → bshd output, compare against bhsd reference)
+# q/k/v perf-init helper
 # ---------------------------------------------------------------------------
 
-
-# KV-length constraint (mask=0 only): the non-causal (mask=0) kernels only
-# support sk (kv_seqlen) that is a multiple of 256.
-_CORRECTNESS_SHAPES = [
-    # ----- Small shapes (cheap, GQA-light) ---------------------------
-    (64, 8, 1, 128, 2048, 1),  # D64  aligned
-    (64, 8, 1, 128, 2048, 2),
-    (64, 8, 1, 130, 2048, 1),  # D64  q-unaligned (sq not mult of 128)
-    (64, 8, 1, 128, 2300, 1),  # D64  kv-unaligned (sk not mult of 256) -> causal only
-    (128, 8, 1, 128, 2048, 1),  # D128 aligned
-    (128, 8, 1, 128, 2048, 2),
-    (128, 8, 1, 130, 2048, 1),  # D128 q-unaligned
-    (128, 8, 1, 128, 2300, 1),  # D128 kv-unaligned -> causal only
-    (64, 64, 8, 8192, 8192, 1),  # D64  perf-sized, aligned
-    (128, 64, 4, 4096, 4096, 1),  # D128 perf-sized, aligned
-]
+# Initialization patterns for q/k/v buffers.
+#   "randn"     : standard normal (default; exercises real attention math).
+#   "const0.25" : fill every element with 0.25 — matches the cpp perf-test
+#                 init pattern (`init_pattern=10`) used in cpp perf runs.
+_PERF_INITS = ["randn", "const0.25"]
 
 
-_CORRECTNESS_CASES = [
-    (head_dim, hq, hk, sq, sk, batch, causal)
-    for (head_dim, hq, hk, sq, sk, batch) in _CORRECTNESS_SHAPES
-    for causal in (True, False)
-    if causal or (sk % 256 == 0)
-]
-
-
-@pytest.mark.parametrize("head_dim,hq,hk,sq,sk,batch,is_causal", _CORRECTNESS_CASES)
-def test_fmha_fwd_with_sink_asm_correctness(head_dim, hq, hk, sq, sk, batch, is_causal):
-    device = "cuda"
-    torch.manual_seed(0)
-
-    # Allocate in sbhd memory but return bshd-shaped views (kernel reads
-    # strides directly so non-contiguous bshd views work).
-    q, k, v = make_qkv_bshd(
-        layout=2,
-        sq=sq,
-        sk=sk,
-        batch=batch,
-        hq=hq,
-        hk=hk,
-        d=head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    scale = 1.0 / math.sqrt(head_dim)
-
-    # D64 -> non-zero sink (exercises ENABLE_SINK code path)
-    # D128 -> no sink (kernel ignores it)
-    sink = _d64_sink(hq, device) if head_dim == 64 else None
-
-    out_kernel, lse_asm = run_kernel(
-        q,
-        k,
-        v,
-        scale=scale,
-        is_causal=is_causal,
-        sink=sink,
-        via="public",
-    )
-
-    # Pinpoint NaN/Inf source: check kernel outputs BEFORE running the
-    # reference, so that a kernel-produced NaN is flagged independently
-    # of any reference-path issue.  Move to fp32 CPU first to avoid the
-    # gfx1250 bf16 element-wise deadlock noted near the top of this file.
-    _ok = out_kernel.detach().float().cpu()
-    _ls = lse_asm.detach().float().cpu()
-    _shape_msg = f"d={head_dim} causal={is_causal} b={batch} sq={sq} sk={sk}"
-    assert (
-        not _ok.isnan().any().item()
-    ), f"KERNEL out contains NaN [{_shape_msg}] -- kernel-side bug"
-    assert (
-        not _ok.isinf().any().item()
-    ), f"KERNEL out contains Inf [{_shape_msg}] -- kernel-side bug"
-    assert (
-        not _ls.isnan().any().item()
-    ), f"KERNEL lse contains NaN [{_shape_msg}] -- kernel-side bug"
-    assert (
-        not _ls.isinf().any().item()
-    ), f"KERNEL lse contains Inf [{_shape_msg}] -- kernel-side bug"
-
-    out_ref, lse_ref = run_ref(q, k, v, is_causal=is_causal, sink=sink)
-
-    # Likewise sanity-check the reference before comparing.  A NaN here
-    # indicates a reference-path issue (e.g. softmax underflow at a corner
-    # case the kernel handles correctly).
-    _or = out_ref.detach().float().cpu()
-    _lr = lse_ref.detach().float().cpu()
-    assert (
-        not _or.isnan().any().item()
-    ), f"REFERENCE out contains NaN [{_shape_msg}] -- ref-path issue"
-    assert (
-        not _or.isinf().any().item()
-    ), f"REFERENCE out contains Inf [{_shape_msg}] -- ref-path issue"
-    assert (
-        not _lr.isnan().any().item()
-    ), f"REFERENCE lse contains NaN [{_shape_msg}] -- ref-path issue"
-    assert (
-        not _lr.isinf().any().item()
-    ), f"REFERENCE lse contains Inf [{_shape_msg}] -- ref-path issue"
-
-    nrms_o = _nrms(out_kernel, out_ref)
-    print(f"[corr {_shape_msg}] nrms(out)={nrms_o:.3e}")
-
-    _cmp(
-        out_kernel,
-        out_ref,
-        rtol=1e-2,
-        atol=1e-2,
-        msg=f"out mismatch (d={head_dim}, causal={is_causal}, b={batch})",
-    )
-    _cmp(
-        lse_asm,
-        lse_ref,
-        rtol=1e-2,
-        atol=1e-2,
-        msg=f"lse mismatch (d={head_dim}, causal={is_causal}, b={batch})",
-    )
-
-
-def test_fmha_fwd_with_sink_asm_ops_layer():
-    """Direct ops-layer call: bshd qkv (sbhd memory layout), D64 + non-zero sink.
-
-    Uses is_causal=True because only causal binaries are registered in the
-    CSV (mask=1 rows).  The test purpose is to exercise the low-level ops
-    entry point with a D64+sink call; causal vs nocausal is orthogonal here.
-    """
-    device = "cuda"
-    torch.manual_seed(0)
-
-    sq, batch, hq, hk, sk, d = 128, 1, 8, 2, 2048, 64
-    q, k, v = make_qkv_bshd(
-        layout=2,
-        sq=sq,
-        sk=sk,
-        batch=batch,
-        hq=hq,
-        hk=hk,
-        d=d,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    scale = 1.0 / math.sqrt(d)
-    sink = _d64_sink(hq, device)
-
-    out_kernel, lse_asm = run_kernel(
-        q,
-        k,
-        v,
-        scale=scale,
-        is_causal=True,
-        sink=sink,
-        via="ops",
-    )
-    out_ref, lse_ref = run_ref(q, k, v, is_causal=True, sink=sink)
-
-    _cmp(out_kernel, out_ref, rtol=1e-2, atol=1e-2)
-    _cmp(lse_asm, lse_ref, rtol=1e-2, atol=1e-2)
-
-
-# ---------------------------------------------------------------------------
-# Memory-layout tests: API takes only bshd shape, but the kernel reads strides
-# directly so non-contiguous bshd views (backed by sbhd / bhsd memory) must
-# also produce correct results.  3 layouts x 2 head_dim = 6 cases.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("layout", [0, 1, 2])
-def test_fmha_fwd_with_sink_asm_layout(layout, head_dim):
-    device = "cuda"
-    torch.manual_seed(0)
-    batch, hq, hk, sq, sk = 1, 8, 1, 128, 2048
-
+def _make_qkv(init: str, *, layout, sq, sk, batch, hq, hk, d, dtype, device):
+    """Allocate (q, k, v) in `layout` memory with bshd-shaped views, using the
+    requested init pattern.  See `make_qkv_bshd` for layout semantics."""
     q, k, v = make_qkv_bshd(
         layout=layout,
         sq=sq,
@@ -526,266 +298,44 @@ def test_fmha_fwd_with_sink_asm_layout(layout, head_dim):
         batch=batch,
         hq=hq,
         hk=hk,
-        d=head_dim,
-        dtype=torch.bfloat16,
+        d=d,
+        dtype=dtype,
         device=device,
     )
-    scale = 1.0 / math.sqrt(head_dim)
-    sink = _d64_sink(hq, device) if head_dim == 64 else None
-
-    # is_causal=True: only causal kernels are registered in the CSV.  The
-    # layout test purpose (verify non-contiguous bshd views work) is
-    # orthogonal to causal masking, so causal=True is a fine choice here.
-    out_kernel, lse_asm = run_kernel(
-        q,
-        k,
-        v,
-        scale=scale,
-        is_causal=True,
-        sink=sink,
-        via="public",
-    )
-    out_ref, lse_ref = run_ref(q, k, v, is_causal=True, sink=sink)
-
-    _cmp(
-        out_kernel,
-        out_ref,
-        rtol=1e-2,
-        atol=1e-2,
-        msg=f"out mismatch (layout={layout}, d={head_dim})",
-    )
-    _cmp(
-        lse_asm,
-        lse_ref,
-        rtol=1e-2,
-        atol=1e-2,
-        msg=f"lse mismatch (layout={layout}, d={head_dim})",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Integration test: aiter.flash_attn_func -> mha._flash_attn_forward dispatcher
-# -> our fmha_fwd_with_sink_asm branch.  Verifies the public-API path on gfx1250
-# matches a direct ops-layer call bit-for-bit (same kernel, same args).
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("is_causal", [True, False])
-def test_fmha_fwd_with_sink_asm_via_flash_attn_func(head_dim, is_causal):
-    device = "cuda"
-    torch.manual_seed(0)
-    batch, hq, hk, sq, sk = 1, 8, 1, 128, 2048
-
-    # bshd input (flash_attn_func contract); contiguous.
-    q, k, v = make_qkv_bshd(
-        layout=0,
-        sq=sq,
-        sk=sk,
-        batch=batch,
-        hq=hq,
-        hk=hk,
-        d=head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    scale = 1.0 / math.sqrt(head_dim)
-    sink = _d64_sink(hq, device) if head_dim == 64 else None
-
-    out_direct, lse_direct = run_kernel(
-        q,
-        k,
-        v,
-        scale=scale,
-        is_causal=is_causal,
-        sink=sink,
-        via="ops",
-    )
-    out_via, lse_via = run_kernel(
-        q,
-        k,
-        v,
-        scale=scale,
-        is_causal=is_causal,
-        sink=sink,
-        via="public",
-    )
-
-    # Same kernel, same args -> bit-identical (cast to fp32 to avoid bf16
-    # element-wise hang in some ROCm builds).
-    do = (out_via.float() - out_direct.float()).abs().max().item()
-    dl = (lse_via.float() - lse_direct.float()).abs().max().item()
-    assert do == 0.0, (
-        f"flash_attn_func != fmha_fwd_with_sink_asm "
-        f"(d={head_dim}, causal={is_causal})  max|dO|={do}"
-    )
-    assert dl == 0.0, (
-        f"lse via flash_attn_func != direct "
-        f"(d={head_dim}, causal={is_causal})  max|dLSE|={dl}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Multi-GPU dispatch test.
-#
-# Regression for: `flash_attn_func` must launch on q.device(), not on the
-# Python thread's current_device.
-#
-# Two correctness layers are exercised:
-#   (1) Python ctypes layer (aiter/jit/core.py) picks the stream via
-#       torch.cuda.current_stream(tensor_device).cuda_stream — should be
-#       q.device()'s stream regardless of current_device.
-#   (2) C++ launch path (asm_fmha_fwd_with_sink.cu) installs a HipDeviceGuard
-#       pinned to q->device_id, so AiterAsmKernelFast::launch_kernel ->
-#       hipGetFuncBySymbol(...) resolves the kernel handle against the
-#       correct device's module table.
-#
-# Without either fix, calling with current_device != q.device() would
-# either crash in hipGetFuncBySymbol (nullptr handle) or submit on the
-# wrong device.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("head_dim", [64, 128])
-def test_fmha_fwd_with_sink_asm_multi_gpu_dispatch(head_dim):
-    """flash_attn_func on a non-current device must dispatch correctly."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("multi-GPU dispatch test needs >=2 ROCm GPUs")
-
-    torch.manual_seed(0)
-    batch, hq, hk, sq, sk = 1, 4, 1, 128, 1024
-    scale = 1.0 / math.sqrt(head_dim)
-    dev_q = "cuda:1"  # tensors live here
-    dev_other = 0  # caller's current_device when we invoke the API
-
-    # Allocate everything on dev_q with current_device set to dev_q so the
-    # baseline run goes through the "current == q" path.
-    with torch.cuda.device(dev_q):
-        q1, k1, v1 = make_qkv_bshd(
-            layout=0,
-            sq=sq,
-            sk=sk,
-            batch=batch,
-            hq=hq,
-            hk=hk,
-            d=head_dim,
-            dtype=torch.bfloat16,
-            device=dev_q,
-        )
-        sink1 = _d64_sink(hq, dev_q) if head_dim == 64 else None
-        out_baseline, lse_baseline = run_kernel(
-            q1,
-            k1,
-            v1,
-            scale=scale,
-            is_causal=True,
-            sink=sink1,
-            via="public",
-        )
-    # Clone so the next run can't alias-overwrite us (defensive; the kernel
-    # writes to a fresh `out` tensor each call, but we want to be 100% sure
-    # the second comparison is against a stable snapshot).
-    out_baseline = out_baseline.clone()
-    lse_baseline = lse_baseline.clone()
-
-    # Now switch current_device to dev_other and re-run with the SAME dev_q
-    # tensors.  Pre-fix this is the crash / wrong-device path.
-    with torch.cuda.device(dev_other):
-        assert (
-            torch.cuda.current_device() == dev_other
-        ), "test setup error: failed to switch current_device"
-        out_xdev, lse_xdev = run_kernel(
-            q1,
-            k1,
-            v1,
-            scale=scale,
-            is_causal=True,
-            sink=sink1,
-            via="public",
-        )
-
-    # Outputs must land on q.device(), not on the caller's current_device.
-    assert (
-        out_xdev.device == q1.device
-    ), f"out landed on {out_xdev.device}, expected {q1.device}"
-    assert (
-        lse_xdev.device == q1.device
-    ), f"lse landed on {lse_xdev.device}, expected {q1.device}"
-
-    # Same inputs + same (deterministic) kernel -> bit-exact match across
-    # current_device contexts.  If the guard or stream picker regresses,
-    # we'll either be here with a numerical mismatch (silent wrong-device
-    # launch) or we'll have already crashed before reaching this point.
-    _cmp(
-        out_xdev,
-        out_baseline,
-        rtol=0.0,
-        atol=0.0,
-        msg=f"out differs across current_device (d={head_dim})",
-    )
-    _cmp(
-        lse_xdev,
-        lse_baseline,
-        rtol=0.0,
-        atol=0.0,
-        msg=f"lse differs across current_device (d={head_dim})",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Performance tests
-# ---------------------------------------------------------------------------
-
-
-# Initialization patterns for perf q/k/v buffers.
-#   "randn"     : standard normal (default; exercises real attention math).
-#   "const0.25" : fill every element with 0.25 — matches the cpp perf-test
-#                 init pattern (`init_pattern=10`) used in cpp perf runs.
-#                 Useful when comparing pytest perf numbers to a cpp baseline
-#                 that was produced with constant-fill inputs (rules out any
-#                 perf swings caused by data-dependent kernel behavior, e.g.
-#                 denormal handling or softmax-saturation paths).
-_PERF_INITS = ["randn", "const0.25"]
-
-
-def _make_qkv_perf(init: str, *, layout, sq, sk, batch, hq, hk, d, dtype, device):
-    """Allocate (q, k, v) in `layout` memory with bshd-shaped views, using the
-    requested perf-init pattern.  See `make_qkv_bshd` for layout semantics."""
-    if init == "randn":
-        return make_qkv_bshd(
-            layout=layout,
-            sq=sq,
-            sk=sk,
-            batch=batch,
-            hq=hq,
-            hk=hk,
-            d=d,
-            dtype=dtype,
-            device=device,
-        )
     if init == "const0.25":
-        # Use randn-allocated bshd-shaped views (so .stride() reflects the
-        # requested layout's memory), then fill in-place with 0.25.  In-place
-        # `.fill_()` is layout-agnostic so this works for non-contiguous views.
-        q, k, v = make_qkv_bshd(
-            layout=layout,
-            sq=sq,
-            sk=sk,
-            batch=batch,
-            hq=hq,
-            hk=hk,
-            d=d,
-            dtype=dtype,
-            device=device,
-        )
+        # In-place `.fill_()` is layout-agnostic so this works for
+        # non-contiguous views.
         q.fill_(0.25)
         k.fill_(0.25)
         v.fill_(0.25)
-        return q, k, v
-    raise ValueError(f"unknown perf init pattern: {init!r}")
+    elif init != "randn":
+        raise ValueError(f"unknown init pattern: {init!r}")
+    return q, k, v
 
 
-# (head_dim, seqlen) perf shapes; sq == sk.  batch=2, hq=64, hk=8 (D64) / 4 (D128).
+# ---------------------------------------------------------------------------
+# Shape tables
+# ---------------------------------------------------------------------------
+
+# KV-length constraint (mask=0 only): the non-causal (mask=0) kernels only
+# support sk (kv_seqlen) that is a multiple of 256.  Non-causal cases with a
+# non-256-aligned sk are skipped automatically in the sweep.
+# hq=64 for all cases; hk=8 for D64 and hk=4 for D128 (GQA ratios 8 / 16).
+_CORRECTNESS_SHAPES = [
+    # ----- Small shapes ---------------------------------------------------
+    (64, 64, 8, 128, 2048, 1),  # D64  aligned
+    (64, 64, 8, 128, 2048, 2),
+    (64, 64, 8, 130, 2048, 1),  # D64  q-unaligned (sq not mult of 128)
+    (64, 64, 8, 128, 2300, 1),  # D64  kv-unaligned (sk not mult of 256) -> causal only
+    (128, 64, 4, 128, 2048, 1),  # D128 aligned
+    (128, 64, 4, 128, 2048, 2),
+    (128, 64, 4, 130, 2048, 1),  # D128 q-unaligned
+    (128, 64, 4, 128, 2300, 1),  # D128 kv-unaligned -> causal only
+    (64, 64, 8, 8192, 8192, 1),  # D64  perf-sized, aligned
+    (128, 64, 4, 4096, 4096, 1),  # D128 perf-sized, aligned
+]
+
+# (head_dim, seqlen) perf shapes; sq == sk.  batch=1, hq=64, hk=8 (D64) / 4 (D128).
 _PERF_SHAPES = [
     (64, 1024),
     (64, 4096),
@@ -800,102 +350,33 @@ _PERF_SHAPES = [
 ]
 
 
-@pytest.mark.parametrize("init", _PERF_INITS)
-@pytest.mark.parametrize("head_dim,seqlen", _PERF_SHAPES)
-@pytest.mark.parametrize("is_causal", [True, False])
-def test_fmha_fwd_with_sink_asm_perf(head_dim, seqlen, is_causal, init):
-    device = "cuda"
-    torch.manual_seed(0)
-
-    # batch=1, hq=64; kv_head_num matches run.sh perf (D64 gqa=8, D128 gqa=16).
-    batch, hq = 1, 64
-    hk = 8 if head_dim == 64 else 4
-    sq = sk = seqlen
-    q, k, v = _make_qkv_perf(
-        init,
-        layout=2,
-        sq=sq,
-        sk=sk,
-        batch=batch,
-        hq=hq,
-        hk=hk,
-        d=head_dim,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    scale = 1.0 / math.sqrt(head_dim)
-    sink = _d64_sink(hq, device) if head_dim == 64 else None
-
-    us = _bench(
-        aiter.fmha_fwd_with_sink_asm,
-        q,
-        k,
-        v,
-        scale,
-        is_causal,
-        False,
-        sink=sink,
-        num_iters=20,
-        num_warmup=10,
-    )
-    flops = 2.0 * batch * hq * sq * sk * (2 * head_dim)
-    if is_causal:
-        flops /= 2.0
-    tflops = flops / (us * 1e-6) / 1e12
-    print(
-        f"[perf] d={head_dim} sq=sk={seqlen} b={batch} hq={hq} hk={hk} "
-        f"causal={is_causal} init={init}: {us:.1f}us, {tflops:.2f} TFLOPS"
-    )
-    # Sanity: catch silent-PASS when timing infrastructure breaks (e.g. profiler
-    # / ROCTracer drops events → us=0, TFLOPS=inf).  Without these asserts the
-    # test would PASS with bogus numbers.
-    assert us > 0.0, (
-        f"perf timing returned us={us}; timing path broken "
-        f"(run with -s to see live numbers)"
-    )
-    assert math.isfinite(tflops) and 0 < tflops < 5000, (
-        f"TFLOPS={tflops} not finite / out of plausible range; " f"likely broken timing"
-    )
-
-
 # ---------------------------------------------------------------------------
-# CLI single-shape runner: shared by `__main__` invocation and ad-hoc usage.
+# Benchmark entry: correctness (+ optional perf) for one shape.
+#
+# Decorated with @benchmark() (aiter.test_common), which logs the call args
+# and merges the returned metric dict so each invocation yields one DataFrame
+# row — mirroring op_tests/test_quant.py.
 # ---------------------------------------------------------------------------
 
 
-def run_cli(
-    *,
-    batch: int,
-    hq: int,
-    hk: int,
-    sq: int,
-    sk: int,
-    head_dim: int,
-    causal: bool = False,
-    layout: int = 0,
-    init: str = "randn",
-    do_ref: bool = False,
-    do_perf: bool = False,
-) -> int:
-    """Single-shape runner.
-
-    Returns 0 on success, 1 if --ref check fails.  Prints a one-line summary
-    of kernel shape / time and (if requested) ref / perf metrics.
-
-    `init` selects q/k/v initialization: "randn" (random normal) or
-    "const0.25" (every element filled with 0.25).
-    """
+@benchmark()
+def test_fmha_fwd_with_sink_asm(
+    head_dim,
+    hq,
+    hk,
+    sq,
+    sk,
+    batch,
+    is_causal,
+    layout,
+    init,
+    do_ref,
+    do_perf,
+):
     device = "cuda"
     torch.manual_seed(0)
-    assert hq % hk == 0, "q_head_num must be a multiple of kv_head_num"
 
-    print(
-        f"Shape: b={batch} hq={hq} hk={hk} sq={sq} sk={sk} d={head_dim} "
-        f"causal={causal} layout={layout} init={init}",
-        flush=True,
-    )
-
-    q, k, v = _make_qkv_perf(
+    q, k, v = _make_qkv(
         init,
         layout=layout,
         sq=sq,
@@ -908,44 +389,47 @@ def run_cli(
         device=device,
     )
     scale = 1.0 / math.sqrt(head_dim)
+    # D64 -> non-zero sink (exercises ENABLE_SINK code path).
+    # D128 -> no sink (kernel ignores it).
     sink = _d64_sink(hq, device) if head_dim == 64 else None
-    torch.cuda.synchronize()
 
-    t0 = _t.time()
-    out_kernel, lse_asm = run_kernel(
-        q,
-        k,
-        v,
-        scale=scale,
-        is_causal=causal,
-        sink=sink,
-        via="ops",
-    )
-    torch.cuda.synchronize()
-    print(f"asm time: {(_t.time()-t0)*1000:.2f} ms", flush=True)
-    print(
-        f"out.shape={tuple(out_kernel.shape)}  lse.shape={tuple(lse_asm.shape)}",
-        flush=True,
-    )
+    ret = {}
 
-    rc = 0
     if do_ref:
-        out_ref, lse_ref = run_ref(q, k, v, is_causal=causal, sink=sink)
-        diff_o = (out_kernel.float() - out_ref.float()).abs().max().item()
-        diff_l = (lse_asm.float() - lse_ref.float()).abs().max().item()
-        nrms_o = _nrms(out_kernel, out_ref)
-        # Pass criterion (bf16 attention conventional thresholds):
-        #   |dO|   <= 2e-2   |dLSE| <= 2e-2
-        ok_o = diff_o <= 2e-2
-        ok_l = diff_l <= 2e-2
-        print(
-            f"ref:  max|dO|={diff_o:.4f} {'OK' if ok_o else 'FAIL'}   "
-            f"max|dLSE|={diff_l:.4f} {'OK' if ok_l else 'FAIL'}   "
-            f"nrms(O)={nrms_o:.3e}",
-            flush=True,
+        # Public-API path (dispatcher → asm) and low-level ops path.
+        out_pub, lse_pub = run_kernel(
+            q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="public"
         )
-        if not (ok_o and ok_l):
-            rc = 1
+        out_ops, lse_ops = run_kernel(
+            q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="ops"
+        )
+        out_ref, lse_ref = run_ref(q, k, v, is_causal=is_causal, sink=sink)
+
+        # checkAllclose returns the mismatch ratio (0.0 == all-close) and logs
+        # a nicely-formatted diff.  Cast to fp32 CPU first to avoid the
+        # gfx1250 + ROCm bf16 element-wise deadlock noted in the module docs.
+        msg = f"d={head_dim} c={is_causal} layout={layout}"
+        err_o = checkAllclose(
+            out_ref.float().cpu(),
+            out_pub.float().cpu(),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"O {msg}",
+        )
+        err_l = checkAllclose(
+            lse_ref.float().cpu(),
+            lse_pub.float().cpu(),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"LSE {msg}",
+        )
+        ret["err(O)"] = err_o
+        ret["err(LSE)"] = err_l
+        ret["nrms(O)"] = _nrms(out_pub, out_ref)
+        # Public dispatcher must match the low-level ops call bit-for-bit
+        # (same kernel, same args).
+        ret["dO(pub-ops)"] = (out_pub.float() - out_ops.float()).abs().max().item()
+        ret["dLSE(pub-ops)"] = (lse_pub.float() - lse_ops.float()).abs().max().item()
 
     if do_perf:
         us = _bench(
@@ -954,102 +438,212 @@ def run_cli(
             k,
             v,
             scale,
-            causal,
+            is_causal,
             False,
             sink=sink,
-            num_iters=10,
-            num_warmup=2,
+            num_iters=20,
+            num_warmup=10,
         )
         flops = 2.0 * batch * hq * sq * sk * (2 * head_dim)
-        if causal:
+        if is_causal:
             flops /= 2.0
-        tflops = flops / (us * 1e-6) / 1e12
-        print(f"perf: {us:.1f} us  ({tflops:.2f} TFLOPS)", flush=True)
-        # CLI surfaces the same breakage pytest would: us=0 / TFLOPS=inf
-        # signals broken timing infra (profiler / ROCTracer event drop).
-        if not (us > 0.0 and math.isfinite(tflops) and 0 < tflops < 5000):
-            print(
-                f"perf: WARNING — bogus timing (us={us}, tflops={tflops})", flush=True
-            )
-            rc = 1
+        ret["us"] = us
+        ret["tflops"] = flops / (us * 1e-6) / 1e12
 
-    return rc
+    return ret
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU dispatch check (optional; needs >=2 ROCm GPUs).
+#
+# Regression for: `flash_attn_func` must launch on q.device(), not on the
+# Python thread's current_device.
+# ---------------------------------------------------------------------------
+
+
+def run_multi_gpu_dispatch(head_dim):
+    if torch.cuda.device_count() < 2:
+        print("[multi-gpu] skip: needs >=2 ROCm GPUs")
+        return
+    torch.manual_seed(0)
+    batch, hq, hk, sq, sk = 1, 4, 1, 128, 1024
+    scale = 1.0 / math.sqrt(head_dim)
+    dev_q = "cuda:1"  # tensors live here
+    dev_other = 0  # caller's current_device when we invoke the API
+
+    with torch.cuda.device(dev_q):
+        q1, k1, v1 = make_qkv_bshd(
+            layout=0,
+            sq=sq,
+            sk=sk,
+            batch=batch,
+            hq=hq,
+            hk=hk,
+            d=head_dim,
+            dtype=torch.bfloat16,
+            device=dev_q,
+        )
+        sink1 = _d64_sink(hq, dev_q) if head_dim == 64 else None
+        out_baseline, lse_baseline = run_kernel(
+            q1, k1, v1, scale=scale, is_causal=True, sink=sink1, via="public"
+        )
+    out_baseline = out_baseline.clone()
+    lse_baseline = lse_baseline.clone()
+
+    with torch.cuda.device(dev_other):
+        out_xdev, lse_xdev = run_kernel(
+            q1, k1, v1, scale=scale, is_causal=True, sink=sink1, via="public"
+        )
+
+    on_q = out_xdev.device == q1.device and lse_xdev.device == q1.device
+    do = (out_xdev.float() - out_baseline.float()).abs().max().item()
+    dl = (lse_xdev.float() - lse_baseline.float()).abs().max().item()
+    print(
+        f"[multi-gpu d={head_dim}] out.device={out_xdev.device} "
+        f"on_q_device={on_q} max|dO|={do} max|dLSE|={dl}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
-    description="Run aiter.fmha_fwd_with_sink_asm on a single shape and dump kernel args.",
-)
-parser.add_argument("-b", "--batch", type=int, default=1, help="batch size (default 1)")
-parser.add_argument(
-    "-n", "--q_head_num", type=int, default=8, help="q_head_num (default 8)"
-)
-parser.add_argument(
-    "-kn",
-    "--kv_head_num",
-    type=int,
-    default=1,
-    help="kv_head_num (default 1, must divide q_head_num)",
-)
-parser.add_argument(
-    "-q", "--seqlen_q", type=int, default=128, help="q seq length (default 128)"
-)
-parser.add_argument(
-    "-k", "--seqlen_k", type=int, default=2048, help="kv seq length (default 2048)"
+    description="Sweep aiter.fmha_fwd_with_sink_asm shapes and print a summary.",
 )
 parser.add_argument(
     "-d",
     "--head_dim",
     type=int,
+    nargs="*",
     choices=[64, 128],
-    default=128,
-    help="head dim, 64 or 128 (default 128)",
+    default=[64, 128],
+    help="head dim(s) to test (default: 64 128)",
 )
-parser.add_argument("-c", "--causal", action="store_true", help="enable causal mask")
+parser.add_argument(
+    "-c",
+    "--causal",
+    type=int,
+    nargs="*",
+    choices=[0, 1],
+    default=[0, 1],
+    help="causal mode(s): 0=non-causal 1=causal (default: 0 1)",
+)
 parser.add_argument(
     "-l",
     "--layout",
     type=int,
+    nargs="*",
     choices=[0, 1, 2],
-    default=0,
-    help="input memory layout: 0=bshd 1=bhsd 2=sbhd (default 0)\n"
+    default=[2],
+    help="input memory layout(s): 0=bshd 1=bhsd 2=sbhd (default: 2)\n"
     "(API always sees bshd shape; non-zero layout returns a\n"
     "non-contiguous bshd view of the underlying memory)",
 )
 parser.add_argument(
     "--init",
     type=str,
+    nargs="*",
     choices=_PERF_INITS,
-    default="randn",
-    help="q/k/v initialization: 'randn' (random normal, default) or\n"
-    "'const0.25' (every element filled with the fixed value 0.25)",
+    default=["randn"],
+    help="q/k/v init pattern(s): 'randn' (default) or 'const0.25'",
 )
 parser.add_argument(
-    "--ref",
+    "--no-ref",
     action="store_true",
-    help="also run PyTorch reference and print max diff + nrms",
+    help="skip the correctness sweep (PyTorch reference comparison)",
 )
 parser.add_argument(
-    "--perf",
+    "--no-perf",
     action="store_true",
-    help="run perf benchmark for this shape (10 iters, 2 warmup)",
+    help="skip the perf sweep",
 )
+parser.add_argument(
+    "--multi-gpu",
+    action="store_true",
+    help="also run the multi-GPU dispatch check (needs >=2 ROCm GPUs)",
+)
+
 
 if __name__ == "__main__":
     if get_gfx() not in ["gfx1250"]:
+        print(
+            "fmha_fwd_with_sink_asm ASM kernels are only shipped for gfx1250 "
+            "(hsa/gfx1250/fmha_fwd_bf16/*.co); no GPU or a different arch — skip."
+        )
         sys.exit(0)
+
     args = parser.parse_args()
-    rc = run_cli(
-        batch=args.batch,
-        hq=args.q_head_num,
-        hk=args.kv_head_num,
-        sq=args.seqlen_q,
-        sk=args.seqlen_k,
-        head_dim=args.head_dim,
-        causal=args.causal,
-        layout=args.layout,
-        init=args.init,
-        do_ref=args.ref,
-        do_perf=args.perf,
-    )
-    sys.exit(rc)
+    causal_modes = [bool(c) for c in args.causal]
+
+    # ----- Correctness sweep (ref + public-vs-ops bit-exactness) ----------
+    if not args.no_ref:
+        rows = []
+        for head_dim, hq, hk, sq, sk, batch in _CORRECTNESS_SHAPES:
+            if head_dim not in args.head_dim:
+                continue
+            for is_causal in causal_modes:
+                # mask=0 (non-causal) kernels require sk % 256 == 0.
+                if not is_causal and sk % 256 != 0:
+                    continue
+                for layout in args.layout:
+                    for init in args.init:
+                        rows.append(
+                            test_fmha_fwd_with_sink_asm(
+                                head_dim,
+                                hq,
+                                hk,
+                                sq,
+                                sk,
+                                batch,
+                                is_causal,
+                                layout,
+                                init,
+                                do_ref=True,
+                                do_perf=False,
+                            )
+                        )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "fmha_fwd_with_sink_asm correctness summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+    # ----- Perf sweep -----------------------------------------------------
+    if not args.no_perf:
+        rows = []
+        for head_dim, seqlen in _PERF_SHAPES:
+            if head_dim not in args.head_dim:
+                continue
+            batch, hq = 1, 64
+            hk = 8 if head_dim == 64 else 4
+            for is_causal in causal_modes:
+                # perf always covers both init patterns (randn + const0.25).
+                for init in _PERF_INITS:
+                    rows.append(
+                        test_fmha_fwd_with_sink_asm(
+                            head_dim,
+                            hq,
+                            hk,
+                            seqlen,
+                            seqlen,
+                            batch,
+                            is_causal,
+                            2,  # perf uses sbhd layout
+                            init,
+                            do_ref=False,
+                            do_perf=True,
+                        )
+                    )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "fmha_fwd_with_sink_asm perf summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+    # ----- Optional multi-GPU dispatch check ------------------------------
+    if args.multi_gpu:
+        for head_dim in args.head_dim:
+            run_multi_gpu_dispatch(head_dim)

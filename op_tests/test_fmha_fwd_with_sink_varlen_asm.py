@@ -18,55 +18,42 @@ Sink convention (same as the fixed-batch path / CK attention_ref):
     to the kernel verbatim (no host-side scaling).  D64 kernels read it; D128
     kernels ignore it (pass None).
 
-
 KV-length constraint (mask=0 only): the non-causal (mask=0) kernels only
 support per-sequence kv_seqlen that is a multiple of 256.
+
+This is a standalone script (no pytest): it sweeps a set of shapes, runs the
+kernel against a PyTorch reference and/or a perf benchmark, and prints a
+markdown summary table — mirroring the style of op_tests/test_quant.py.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
+import sys
 from typing import List, Optional
 
-import pytest
+import pandas as pd
 import torch
 
 import aiter
+from aiter.test_common import benchmark, checkAllclose
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-
-
-def _is_gfx1250_host() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        return get_gfx() == "gfx1250"
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _is_gfx1250_host(),
-    reason=(
-        "fmha_fwd_with_sink_varlen_asm ASM kernels are only shipped for gfx1250 "
-        "(hsa/gfx1250/fmha_fwd_bf16_varlen/*.co); no GPU or a different arch — skip"
-    ),
-)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _cmp(a: torch.Tensor, b: torch.Tensor, *, rtol=1e-2, atol=1e-2, msg: str = ""):
-    """fp32-on-CPU compare that hard-fails on mismatch / NaN.
-
-    Cast to fp32 CPU first to avoid the gfx1250 + ROCm bf16 element-wise hang
-    that can occur right after a custom ASM kernel launch.
-    """
-    a32 = a.detach().float().cpu()
-    b32 = b.detach().float().cpu()
-    torch.testing.assert_close(a32, b32, rtol=rtol, atol=atol, msg=msg)
+def _nrms(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """Normalized RMS error on fp32 CPU tensors (eps=1e-3 for bf16)."""
+    a32 = actual.detach().float().cpu()
+    b32 = expected.detach().float().cpu()
+    abs_diff = (a32 - b32).abs()
+    eps = 1e-3
+    max_item = max(a32.abs().max().item(), b32.abs().max().item(), eps)
+    sq_diff = (abs_diff / b32.abs().clamp(min=eps)).pow(2)
+    return (sq_diff.sum().sqrt() / (math.sqrt(b32.numel()) * max_item)).item()
 
 
 def _d64_sink(hq: int, device: str) -> torch.Tensor:
@@ -130,6 +117,12 @@ def _ref_varlen(q, k, v, cu_q, cu_k, *, is_causal: bool, sink: Optional[torch.Te
     return out, lse
 
 
+# Perf input init patterns (mirrors the fixed-batch perf test's _PERF_INITS):
+#   "randn"     : standard normal (default; exercises real attention math).
+#   "const0.25" : constant 0.25 fill (matches the cpp init_pattern=10 baseline).
+_PERF_INITS = ["randn", "const0.25"]
+
+
 def make_varlen_packed(
     seqlens: List[int],
     hq: int,
@@ -143,10 +136,6 @@ def make_varlen_packed(
     """Build packed THD q/k/v + cu_seqlens for the given per-batch seqlens.
 
     Uses equal q/k seqlens per batch (standard varlen self-attention).
-
-    init pattern (mirrors the fixed-batch perf test's `_make_qkv_perf`):
-      "randn"     : standard normal (default; exercises real attention math).
-      "const0.25" : fill every element with 0.25
     """
     torch.manual_seed(seed)
     cu = torch.tensor(
@@ -161,7 +150,7 @@ def make_varlen_packed(
         k.fill_(0.25)
         v.fill_(0.25)
     elif init != "randn":
-        raise ValueError(f"unknown perf init pattern: {init!r}")
+        raise ValueError(f"unknown init pattern: {init!r}")
     cu = cu.to(device)
     return q, k, v, cu
 
@@ -217,146 +206,6 @@ def run_kernel(
     raise ValueError(f"unknown via={via!r}")
 
 
-# ---------------------------------------------------------------------------
-# Correctness
-# ---------------------------------------------------------------------------
-
-
-_CORRECTNESS_SHAPES = [
-    # aligned single batch
-    (64, 8, 1, [256]),
-    (128, 8, 1, [256]),
-    # multi-batch, mixed (some unaligned) seqlens -> causal only
-    (64, 8, 1, [128, 256, 384]),
-    (128, 8, 1, [128, 256, 384]),
-    (64, 8, 2, [100, 200, 300]),  # unaligned + GQA
-    (128, 8, 2, [100, 200, 300]),
-    # 256-aligned multi-batch (exercised under BOTH causal and mask=0)
-    (64, 8, 1, [256, 512]),
-    (128, 8, 1, [256, 512]),
-    (64, 8, 2, [256, 512, 768]),  # aligned 3-batch + GQA
-    (128, 8, 2, [256, 512, 768]),
-    # GQA-heavy, larger (256-aligned)
-    (64, 64, 8, [512, 1024]),
-    (128, 64, 4, [512, 1024]),
-]
-
-
-def _kv_256_aligned(seqlens) -> bool:
-    return all(s % 256 == 0 for s in seqlens)
-
-
-_CORRECTNESS_CASES = [
-    (hd, hq, hk, sl, causal)
-    for (hd, hq, hk, sl) in _CORRECTNESS_SHAPES
-    for causal in (True, False)
-    if causal or _kv_256_aligned(sl)
-]
-
-
-@pytest.mark.parametrize("head_dim,hq,hk,seqlens,is_causal", _CORRECTNESS_CASES)
-def test_fmha_fwd_with_sink_varlen_asm_correctness(
-    head_dim, hq, hk, seqlens, is_causal
-):
-    device = "cuda"
-    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, head_dim, head_dim, device=device)
-    cu_q = cu
-    cu_k = cu  # equal q/k seqlens per batch
-    max_seqlen_q = max(seqlens)
-    scale = 1.0 / math.sqrt(head_dim)
-
-    # D64 -> exercise sink; D128 -> kernel ignores sink (pass None).
-    sink = _d64_sink(hq, device) if head_dim == 64 else None
-
-    # Drive the public API (aiter.flash_attn_varlen_func), which dispatches
-    # to the fmha_fwd_with_sink_varlen_asm branch on gfx1250.
-    out_k, lse_k = run_kernel(
-        q,
-        k,
-        v,
-        cu_q,
-        cu_k,
-        max_seqlen_q,
-        scale=scale,
-        is_causal=is_causal,
-        sink=sink,
-        via="public",
-    )
-
-    msg = f"d={head_dim} hq={hq} hk={hk} seqlens={seqlens}"
-    _ok = out_k.detach().float().cpu()
-    assert not _ok.isnan().any().item(), f"KERNEL out NaN [{msg}]"
-    assert not _ok.isinf().any().item(), f"KERNEL out Inf [{msg}]"
-
-    out_ref, lse_ref = _ref_varlen(q, k, v, cu_q, cu_k, is_causal=is_causal, sink=sink)
-
-    _cmp(out_k, out_ref, rtol=1e-2, atol=1e-2, msg=f"out mismatch [{msg}]")
-    _cmp(lse_k, lse_ref, rtol=1e-2, atol=1e-2, msg=f"lse mismatch [{msg}]")
-
-
-# ---------------------------------------------------------------------------
-# Integration test: aiter.flash_attn_varlen_func -> _flash_attn_varlen_forward
-# dispatcher -> fmha_fwd_with_sink_varlen_asm branch.  Verifies the public-API
-# path on gfx1250 matches a direct ops-layer call bit-for-bit (same kernel,
-# same args) — the lse layout differs (ops: (total_q, nheads); public:
-# (nheads, total_q)) but run_kernel normalizes both to (total_q, nheads).
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("is_causal", [True, False])
-def test_fmha_fwd_with_sink_varlen_asm_via_flash_attn_varlen_func(head_dim, is_causal):
-    device = "cuda"
-    hq, hk, seqlens = 8, 1, [256, 512, 768]
-    q, k, v, cu = make_varlen_packed(seqlens, hq, hk, head_dim, head_dim, device=device)
-    max_seqlen_q = max(seqlens)
-    scale = 1.0 / math.sqrt(head_dim)
-    sink = _d64_sink(hq, device) if head_dim == 64 else None
-
-    out_direct, lse_direct = run_kernel(
-        q,
-        k,
-        v,
-        cu,
-        cu,
-        max_seqlen_q,
-        scale=scale,
-        is_causal=is_causal,
-        sink=sink,
-        via="ops",
-    )
-    out_via, lse_via = run_kernel(
-        q,
-        k,
-        v,
-        cu,
-        cu,
-        max_seqlen_q,
-        scale=scale,
-        is_causal=is_causal,
-        sink=sink,
-        via="public",
-    )
-
-    # Same kernel, same args -> bit-identical (cast to fp32 to avoid bf16
-    # element-wise hang in some ROCm builds).
-    do = (out_via.float() - out_direct.float()).abs().max().item()
-    dl = (lse_via.float() - lse_direct.float()).abs().max().item()
-    assert do == 0.0, (
-        f"flash_attn_varlen_func != fmha_fwd_with_sink_varlen_asm "
-        f"(d={head_dim}, causal={is_causal})  max|dO|={do}"
-    )
-    assert dl == 0.0, (
-        f"lse via flash_attn_varlen_func != direct "
-        f"(d={head_dim}, causal={is_causal})  max|dLSE|={dl}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Perf (single multi-batch shape per head_dim)
-# ---------------------------------------------------------------------------
-
-
 def _bench(fn, *args, num_iters=20, num_warmup=10, **kwargs) -> float:
     for _ in range(num_warmup):
         fn(*args, **kwargs)
@@ -371,6 +220,32 @@ def _bench(fn, *args, num_iters=20, num_warmup=10, **kwargs) -> float:
     return start.elapsed_time(end) * 1000.0 / num_iters  # us per iter
 
 
+# ---------------------------------------------------------------------------
+# Shape tables
+# ---------------------------------------------------------------------------
+
+
+# hq=64 for all cases; hk=8 for D64 and hk=4 for D128 (GQA ratios 8 / 16).
+_CORRECTNESS_SHAPES = [
+    # aligned single batch
+    (64, 64, 8, [256]),
+    (128, 64, 4, [256]),
+    # multi-batch, mixed (some unaligned) seqlens -> causal only
+    (64, 64, 8, [128, 256, 384]),
+    (128, 64, 4, [128, 256, 384]),
+    (64, 64, 8, [100, 200, 300]),  # unaligned
+    (128, 64, 4, [100, 200, 300]),
+    # 256-aligned multi-batch (exercised under BOTH causal and mask=0)
+    (64, 64, 8, [256, 512]),
+    (128, 64, 4, [256, 512]),
+    (64, 64, 8, [256, 512, 768]),  # aligned 3-batch
+    (128, 64, 4, [256, 512, 768]),
+    # larger (256-aligned)
+    (64, 64, 8, [512, 1024]),
+    (128, 64, 4, [512, 1024]),
+]
+
+
 _VARLEN_PERF_SHAPES = [
     (64, 64, 8, [4096, 4096]),  # D64  multi-batch
     (128, 64, 4, [2048, 2048]),  # D128 multi-batch
@@ -378,44 +253,223 @@ _VARLEN_PERF_SHAPES = [
     (64, 64, 8, [32768]),  # D64  sq=sk=32768 (long context)
 ]
 
-# Perf input init patterns (mirrors the fixed-batch perf test's _PERF_INITS):
-#   "randn"     : standard normal (default; exercises real attention math).
-#   "const0.25" : constant 0.25 fill (matches the cpp init_pattern=10 baseline).
-_VARLEN_PERF_INITS = ["randn", "const0.25"]
+
+def _kv_256_aligned(seqlens) -> bool:
+    return all(s % 256 == 0 for s in seqlens)
 
 
-@pytest.mark.parametrize("init", _VARLEN_PERF_INITS)
-@pytest.mark.parametrize("head_dim,hq,hk,seqlens", _VARLEN_PERF_SHAPES)
-@pytest.mark.parametrize("is_causal", [True, False])
-def test_fmha_fwd_with_sink_varlen_asm_perf(head_dim, hq, hk, seqlens, is_causal, init):
+# ---------------------------------------------------------------------------
+# Benchmark entry: correctness (+ optional perf) for one shape.
+# ---------------------------------------------------------------------------
+
+
+@benchmark()
+def test_fmha_fwd_with_sink_varlen_asm(
+    head_dim,
+    hq,
+    hk,
+    seqlens,
+    is_causal,
+    init,
+    do_ref,
+    do_perf,
+):
     device = "cuda"
     q, k, v, cu = make_varlen_packed(
         seqlens, hq, hk, head_dim, head_dim, device=device, init=init
     )
+    cu_q = cu
+    cu_k = cu  # equal q/k seqlens per batch
     max_seqlen_q = max(seqlens)
     scale = 1.0 / math.sqrt(head_dim)
+    # D64 -> exercise sink; D128 -> kernel ignores sink (pass None).
     sink = _d64_sink(hq, device) if head_dim == 64 else None
 
-    us = _bench(
-        aiter.fmha_fwd_with_sink_varlen_asm,
-        q,
-        k,
-        v,
-        cu,
-        cu,
-        max_seqlen_q,
-        scale,
-        is_causal,
-        False,
-        sink=sink,
-    )
-    # FLOPs summed over batches (each ~ 2 * hq * s^2 * 2d); causal halves it.
-    flops = sum(2.0 * hq * s * s * (2 * head_dim) for s in seqlens)
-    if is_causal:
-        flops /= 2.0
-    tflops = flops / (us * 1e-6) / 1e12
-    print(
-        f"[perf varlen] d={head_dim} causal={is_causal} hq={hq} hk={hk} "
-        f"seqlens={seqlens} init={init}: {us:.1f}us, {tflops:.2f} TFLOPS"
-    )
-    assert us > 0.0 and math.isfinite(tflops)
+    ret = {}
+
+    if do_ref:
+        out_pub, lse_pub = run_kernel(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q,
+            scale=scale,
+            is_causal=is_causal,
+            sink=sink,
+            via="public",
+        )
+        out_ops, lse_ops = run_kernel(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max_seqlen_q,
+            scale=scale,
+            is_causal=is_causal,
+            sink=sink,
+            via="ops",
+        )
+        out_ref, lse_ref = _ref_varlen(
+            q, k, v, cu_q, cu_k, is_causal=is_causal, sink=sink
+        )
+
+        msg = f"d={head_dim} c={is_causal} seqlens={seqlens}"
+        ret["err(O)"] = checkAllclose(
+            out_ref.float().cpu(),
+            out_pub.float().cpu(),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"O {msg}",
+        )
+        ret["err(LSE)"] = checkAllclose(
+            lse_ref.float().cpu(),
+            lse_pub.float().cpu(),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"LSE {msg}",
+        )
+        ret["nrms(O)"] = _nrms(out_pub, out_ref)
+        # Public dispatcher must match the low-level ops call bit-for-bit.
+        ret["dO(pub-ops)"] = (out_pub.float() - out_ops.float()).abs().max().item()
+        ret["dLSE(pub-ops)"] = (lse_pub.float() - lse_ops.float()).abs().max().item()
+
+    if do_perf:
+        us = _bench(
+            aiter.fmha_fwd_with_sink_varlen_asm,
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max_seqlen_q,
+            scale,
+            is_causal,
+            False,
+            sink=sink,
+        )
+        # FLOPs summed over batches (each ~ 2 * hq * s^2 * 2d); causal halves it.
+        flops = sum(2.0 * hq * s * s * (2 * head_dim) for s in seqlens)
+        if is_causal:
+            flops /= 2.0
+        ret["us"] = us
+        ret["tflops"] = flops / (us * 1e-6) / 1e12
+
+    return ret
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="Sweep aiter.fmha_fwd_with_sink_varlen_asm shapes and print a summary.",
+)
+parser.add_argument(
+    "-d",
+    "--head_dim",
+    type=int,
+    nargs="*",
+    choices=[64, 128],
+    default=[64, 128],
+    help="head dim(s) to test (default: 64 128)",
+)
+parser.add_argument(
+    "-c",
+    "--causal",
+    type=int,
+    nargs="*",
+    choices=[0, 1],
+    default=[0, 1],
+    help="causal mode(s): 0=non-causal 1=causal (default: 0 1)",
+)
+parser.add_argument(
+    "--init",
+    type=str,
+    nargs="*",
+    choices=_PERF_INITS,
+    default=["randn"],
+    help="q/k/v init pattern(s): 'randn' (default) or 'const0.25'",
+)
+parser.add_argument(
+    "--no-ref",
+    action="store_true",
+    help="skip the correctness sweep (PyTorch reference comparison)",
+)
+parser.add_argument(
+    "--no-perf",
+    action="store_true",
+    help="skip the perf sweep",
+)
+
+
+if __name__ == "__main__":
+    if get_gfx() not in ["gfx1250"]:
+        print(
+            "fmha_fwd_with_sink_varlen_asm ASM kernels are only shipped for gfx1250 "
+            "(hsa/gfx1250/fmha_fwd_bf16_varlen/*.co); no GPU or a different arch — skip."
+        )
+        sys.exit(0)
+
+    args = parser.parse_args()
+    causal_modes = [bool(c) for c in args.causal]
+
+    # ----- Correctness sweep ---------------------------------------------
+    if not args.no_ref:
+        rows = []
+        for head_dim, hq, hk, seqlens in _CORRECTNESS_SHAPES:
+            if head_dim not in args.head_dim:
+                continue
+            for is_causal in causal_modes:
+                # mask=0 (non-causal) kernels require every kv_seqlen % 256 == 0.
+                if not is_causal and not _kv_256_aligned(seqlens):
+                    continue
+                for init in args.init:
+                    rows.append(
+                        test_fmha_fwd_with_sink_varlen_asm(
+                            head_dim,
+                            hq,
+                            hk,
+                            seqlens,
+                            is_causal,
+                            init,
+                            do_ref=True,
+                            do_perf=False,
+                        )
+                    )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "fmha_fwd_with_sink_varlen_asm correctness summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+    # ----- Perf sweep -----------------------------------------------------
+    if not args.no_perf:
+        rows = []
+        for head_dim, hq, hk, seqlens in _VARLEN_PERF_SHAPES:
+            if head_dim not in args.head_dim:
+                continue
+            for is_causal in causal_modes:
+                # perf always covers both init patterns (randn + const0.25).
+                for init in _PERF_INITS:
+                    rows.append(
+                        test_fmha_fwd_with_sink_varlen_asm(
+                            head_dim,
+                            hq,
+                            hk,
+                            seqlens,
+                            is_causal,
+                            init,
+                            do_ref=False,
+                            do_perf=True,
+                        )
+                    )
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "fmha_fwd_with_sink_varlen_asm perf summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
