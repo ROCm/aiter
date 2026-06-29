@@ -371,6 +371,36 @@ def run_benchmark(args):
             chk = chk_res.get(b, _CHK_SKIP)
             print(_fmt_row(label, T, H, D, kv_len, bench_res.get(b), chk))
 
+    if backend == "both":
+        _HDR_CMP = (
+            f"{'Shape':<14} {'T':>4} {'H':>4} {'D':>4} {'kv_len':>7}"
+            f"   {'TFLOPS(fl)':>10} {'TFLOPS(tr)':>10}"
+            f"   {'verify(fl)':>10} {'verify(tr)':>10}"
+            f"   {'fl/tr':>6}"
+        )
+        _SEP_CMP = "-" * len(_HDR_CMP)
+        print(f"\n[comparison: flydsl vs triton]")
+        print(_HDR_CMP)
+        print(_SEP_CMP)
+        for label, T, H, D, kv_len in shapes:
+            _, _, _, _, bench_res, chk_res = all_bench[label]
+            fl = bench_res.get("flydsl")
+            tr = bench_res.get("triton")
+            fl_tflops = f"{fl[2]:>10.3f}" if fl else f"{'N/A':>10}"
+            tr_tflops = f"{tr[2]:>10.3f}" if tr else f"{'N/A':>10}"
+            fl_chk = f"{chk_res.get('flydsl', _CHK_SKIP):>10}"
+            tr_chk = f"{chk_res.get('triton', _CHK_SKIP):>10}"
+            if fl and tr:
+                ratio = f"{fl[2] / tr[2]:>6.3f}"
+            else:
+                ratio = f"{'N/A':>6}"
+            print(
+                f"{label:<14} {T:>4} {H:>4} {D:>4} {kv_len:>7}"
+                f"   {fl_tflops} {tr_tflops}"
+                f"   {fl_chk} {tr_chk}"
+                f"   {ratio}"
+            )
+
     if do_verify:
         print()
         print("Verification:", "ALL PASS" if all_pass else "SOME FAILURES")
