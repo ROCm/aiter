@@ -29,10 +29,6 @@ Sink mechanism (zero-value virtual KV column):
       sink_term  = exp(sink - new_max)
       denom      = denom * rescale + sink_term
   where max_scores / scores are already in the scaled (softmax_scale) domain.
-
-This is a standalone script (no pytest): it sweeps a set of shapes, runs the
-kernel against a PyTorch reference and/or a perf benchmark, and prints a
-markdown summary table — mirroring the style of op_tests/test_quant.py.
 """
 
 from __future__ import annotations
@@ -47,7 +43,7 @@ import torch
 
 import aiter
 
-from aiter.test_common import benchmark, checkAllclose
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 # from aiter.test_mha_common import (
@@ -137,26 +133,6 @@ def _nrms(actual: torch.Tensor, expected: torch.Tensor) -> float:
     max_item = max(a32.abs().max().item(), b32.abs().max().item(), eps)
     sq_diff = (abs_diff / b32.abs().clamp(min=eps)).pow(2)
     return (sq_diff.sum().sqrt() / (math.sqrt(b32.numel()) * max_item)).item()
-
-
-def _bench(fn, *args, num_iters: int = 10, num_warmup: int = 2, **kwargs) -> float:
-    """CUDA-Event-based per-iter timing (us).
-
-    Bypasses run_perftest because torch.profiler / ROCTracer drops kernel
-    events on gfx1250 + ROCm 7.x (warning: "ROCTracer produced duplicate
-    flow start"), making run_perftest report 0 us / inf TFLOPS.
-    """
-    for _ in range(num_warmup):
-        fn(*args, **kwargs)
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(num_iters):
-        fn(*args, **kwargs)
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) * 1000.0 / num_iters  # ms->us, per-iter
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +408,7 @@ def test_fmha_fwd_with_sink_asm(
         ret["dLSE(pub-ops)"] = (lse_pub.float() - lse_ops.float()).abs().max().item()
 
     if do_perf:
-        us = _bench(
+        _, us = run_perftest(
             aiter.fmha_fwd_with_sink_asm,
             q,
             k,

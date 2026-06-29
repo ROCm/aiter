@@ -37,7 +37,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter.test_common import benchmark, checkAllclose
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 # ---------------------------------------------------------------------------
@@ -206,20 +206,6 @@ def run_kernel(
     raise ValueError(f"unknown via={via!r}")
 
 
-def _bench(fn, *args, num_iters=20, num_warmup=10, **kwargs) -> float:
-    for _ in range(num_warmup):
-        fn(*args, **kwargs)
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(num_iters):
-        fn(*args, **kwargs)
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) * 1000.0 / num_iters  # us per iter
-
-
 # ---------------------------------------------------------------------------
 # Shape tables
 # ---------------------------------------------------------------------------
@@ -337,7 +323,7 @@ def test_fmha_fwd_with_sink_varlen_asm(
         ret["dLSE(pub-ops)"] = (lse_pub.float() - lse_ops.float()).abs().max().item()
 
     if do_perf:
-        us = _bench(
+        _, us = run_perftest(
             aiter.fmha_fwd_with_sink_varlen_asm,
             q,
             k,
@@ -349,6 +335,8 @@ def test_fmha_fwd_with_sink_varlen_asm(
             is_causal,
             False,
             sink=sink,
+            num_iters=20,
+            num_warmup=10,
         )
         # FLOPs summed over batches (each ~ 2 * hq * s^2 * 2d); causal halves it.
         flops = sum(2.0 * hq * s * s * (2 * head_dim) for s in seqlens)
