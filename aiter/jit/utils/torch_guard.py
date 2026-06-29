@@ -65,6 +65,7 @@ NONE_WRAPPED_OP = [
     "get_graph_buffer_ipc_meta",
     "_ActivationType",
     "_QuantType",
+    "_MlaVersion",
     "_MxScaleRoundMode",
     "_MxDtype",
     # "dispose",

@@ -4,7 +4,7 @@
 import math
 from typing import Optional, Tuple
 
-from aiter.ops.enum import QuantType, Enum
+from aiter.ops.enum import QuantType, Enum, MlaVersion
 import torch
 import triton
 import triton.language as tl
@@ -1203,9 +1203,12 @@ def get_mla_metadata_v1(
     topk: int = -1,
     max_split_per_batch: int = -1,
     intra_batch_mode: bool = False,
-    dtype_q: Optional[torch.dtype] = None,
-    dtype_kv: Optional[torch.dtype] = None,
     is_cp_round_robin: bool = False,
+    mla_version: int = MlaVersion.V32.value,
+    dtype_q_nope: Optional[torch.dtype] = None,
+    dtype_q_rope: Optional[torch.dtype] = None,
+    dtype_kv_nope: Optional[torch.dtype] = None,
+    dtype_kv_rope: Optional[torch.dtype] = None,
 ) -> None:
     """
     Inputs:

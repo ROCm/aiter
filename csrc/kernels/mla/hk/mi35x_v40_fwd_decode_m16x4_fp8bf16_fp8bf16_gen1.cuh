@@ -11,6 +11,7 @@
 #include <assert.h>
 #include <limits>
 #include <optional>
+#include "hk_mla_v40_fwd_decode_gen1_common.cuh"
 
 using namespace hk_mla;
 
@@ -18,27 +19,32 @@ using namespace hk_mla;
 // boundary-checked prefetch). Comment out to fall back to the full ladder.
 #define MLA_SLIM_DISPATCH 1
 
+
 // Warp-index group. PV is always at call end for every warp; the only
 // compile-time distinction that matters is whether the warp is a RoPE owner
 // (warps 5,7) -- those run the buffer_load_lds RoPE prefetch path. The NoPE
 // split (Lo/Hi) is vestigial but kept so the per-warp-type dispatch and the
 // SIMD-pairing comments stay stable.
-enum class WarpTypeM16x8 : uint8_t
+// m16x4: 4 physical waves, each cooperatively loads its OWN KV col-strip
+// (warp_idx, always NoPE) PLUS the warp_idx+kNumWarps(=+4) strip. The +4 strip
+// is asymmetric by parity: even waves (0,2) -> w4/w6 (col-tile 2, NoPE); odd
+// waves (1,3) -> w5/w7 (col-tile 3, tile-1 = RoPE). So RoPE-ownership lives in
+// the +4 strip of odd waves -> encoded compile-time here (the even/odd axis).
+// Phase 1: PV always at call end. The delay/non-delay PV axis (occ=2 SIMD
+// pairing) is added in Phase 2 -> 4 states.
+enum class WarpTypeM16x4 : uint8_t
 {
-    LoNoPEWarp, // warps 0-3: NoPE
-    HiNoPEWarp, // warps 4,6: NoPE
-    HiRoPEWarp  // warps 5,7: RoPE owner
+    EvenPlus4NoPE, // phys waves 0,2: own NoPE; +4 (w4,w6) NoPE
+    OddPlus4RoPE   // phys waves 1,3: own NoPE; +4 (w5,w7) tile-1 RoPE
 };
 
-#include "hk_mla_v40_fwd_decode_gen1_common.cuh"
-
-// V4.0 mi35x m16x8 decode kernel: separate FP8 NOPE + BF16 ROPE buffers for
+// V4.0 mi35x m16x4 decode kernel: separate FP8 NOPE + BF16 ROPE buffers for
 // both Q and KV. End-to-end body (Phases 4a..4g) in place: prologue (Q load +
 // first KV tile) -> per-warp dispatch ladder over mla_main (QK GEMM + softmax
 // + PV GEMM + epilogue, with online-softmax rescale across K-tile iters).
 #if defined(__gfx950__)
-template <WarpTypeM16x8 kWarpType, typename T>
-__device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV40DecodeFwdParams<T>
+template <WarpTypeM16x4 kWarpType, typename T>
+__device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV40DecodeFwdParams<T>
                                                                           params,
                                                                           const uint32_t warp_idx)
 {
@@ -54,13 +60,16 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
     using G = hk::group<T::kNumWarps>;
 
-    // Compile-time warp type (chosen by the __global__ wrapper's entry divergence).
-    constexpr bool kIsRopeWarp = (kWarpType == WarpTypeM16x8::HiRoPEWarp);
+    // Own KV strip (warp_idx, 0..3) is always NoPE. The +4 strip's RoPE-ownership
+    // is the parity flag below. (kIsRopeWarp names the OWN strip for the shared
+    // manager calls; it is always false in m16x4.)
+    constexpr bool kIsRopeWarp   = false;
+    constexpr bool kPlus4IsRope  = (kWarpType == WarpTypeM16x4::OddPlus4RoPE);
 
-    // Deferred-PV grouping: Lo (LoNoPEWarp, warps 0-3) defers its PV by one tile;
-    // Hi (HiNoPEWarp/HiRoPEWarp, warps 4-7) keeps PV at call end. Staggering the
-    // two groups on a shared SIMD lets Lo's PV overlap Hi's QK/softmax.
-    constexpr bool kPvAtEnd = (kWarpType != WarpTypeM16x8::LoNoPEWarp);
+    // Phase 1: PV always at call end (no deferral). Phase 2 adds the deferred-PV
+    // axis for the occ=2 SIMD-pairing experiment.
+    constexpr bool kPvAtEnd = true;
+    (void)kPlus4IsRope;
 
     constexpr comp_t log2e = 1.4426950408889634;
 
@@ -378,6 +387,9 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         }
 
         // Prologue: prefetch + cvt+store the first KV tile into the curr pong.
+        // m16x4: each wave loads its OWN col-strip (warp_idx, NoPE) AND the
+        // warp_idx+kNumWarps strip (col-tiles 2,3; tile-1 RoPE on odd waves ->
+        // kPlus4IsRope). Same row_kv_ld for both (warp_idx and +4 share rows).
         // kCheckBoundary is true when the tile straddles the batch tail.
         if(kv_len < T::kBlockN)
         {
@@ -386,11 +398,21 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                                                    params.p_kv_buffer,
                                                    params.p_kv_buffer_rope,
                                                    row_kv_ld_first);
+            kv_manager.template async_load_k<true, kPlus4IsRope>(p_lds_kv_curr,
+                                                   warp_idx + T::kNumWarps,
+                                                   params.p_kv_buffer,
+                                                   params.p_kv_buffer_rope,
+                                                   row_kv_ld_first);
         }
         else
         {
             kv_manager.template async_load_k<false, kIsRopeWarp>(p_lds_kv_curr,
                                                     warp_idx,
+                                                    params.p_kv_buffer,
+                                                    params.p_kv_buffer_rope,
+                                                    row_kv_ld_first);
+            kv_manager.template async_load_k<false, kPlus4IsRope>(p_lds_kv_curr,
+                                                    warp_idx + T::kNumWarps,
                                                     params.p_kv_buffer,
                                                     params.p_kv_buffer_rope,
                                                     row_kv_ld_first);
@@ -448,7 +470,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 row_kv_ld_next = row_kv_ld_next_next;
 
                 // Lo warps uses 2x PV GEMM to hide latency of loading next next row_kv_ld
-                if constexpr(kWarpType == WarpTypeM16x8::LoNoPEWarp)
+                if constexpr(false)
                 {
                     row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
                 }
@@ -459,7 +481,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             // until the wait+cvt+store sequence below; the gap in between
             // hides vmcnt latency under QK MFMAs.
             constexpr uint32_t kTileCols = 256u;
-            typename KvManager8to16bitsV1<T>::KvTilePrefetch p0, p1;
+            // p0/p1 = own strip tile-0/1; p0b/p1b = +4 strip (p1b unused on odd).
+            typename KvManager8to16bitsV1<T>::KvTilePrefetch p0, p1, p0b, p1b;
 
             // Issue both tiles' NoPE prefetches before the barrier so their vmem
             // load latency overlaps the barrier wait. NoPE is VGPR-landing only
@@ -471,6 +494,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             //   waves 0-4,6: 4 loads (2 NoPE dwordx4 + 2 scale ubyte, both tiles)
             //   waves 5,7:   2 loads (tile-0 NoPE only; tile-1 is their RoPE half)
             // so the post-barrier wait below is wave-dependent.
+            // own strip only (2 carriers across QK). +4 is prefetched in Phase B
+            // after own cvt+store frees p0/p1, so p0b/p1b reuse their regs.
             if constexpr(kIsGlobalLast == false)
             {
                 kv_manager.template prefetch_kv_nope<0u, 0u, kCheckBoundaryNext, kIsRopeWarp>(
@@ -493,18 +518,9 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
             __builtin_amdgcn_s_setprio(3);
 
-            // Drain the NoPE prefetches enough to leave only this iter's own
-            // prologue loads pending, then cross-warp barrier so KV LDS
-            // sub-blocks are visible to QK reads. RoPE-owner waves issued 2
-            // fewer loads, so they wait on vmcnt(2) vs vmcnt(4).
-            if constexpr(kIsRopeWarp)
-            {
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/2));
-            }
-            else
-            {
-                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/4));
-            }
+            // Keep the own prefetch (4 loads: p0+p1) in flight for cvt+store, then
+            // cross-warp barrier so KV LDS is visible to QK.
+            __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/4));
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
@@ -603,52 +619,64 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             if constexpr(kIsGlobalLast == false)
             {
                 constexpr uint32_t kTileCols = 256u;
-
-                // RoPE half of NEXT tile 1 (waves 5,7 only) DMAs straight
-                // into p_lds_kv_next. Moved here (after QK GEMM) from the
-                // mid-QK Pair P0 slot. Must be issued before the tile-1
-                // wait below so its vmem load is counted. NoPE halves were
-                // issued pre-barrier; this is vmcnt, the QK ds_reads are
-                // lgkmcnt -- different counters.
-                kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext, kIsRopeWarp>(
-                    p_lds_kv_next, warp_idx, params.p_kv_buffer_rope, row_kv_ld_next);
-
-                // Prefetches already issued mid-QK-body. Just drain +
-                // cvt + store. 4 vmem ops in flight; first wait drains
-                // tile-0 (leave tile-1's 2 in flight); second drains tile-1.
+                const uint32_t kPlus4WarpIdx = warp_idx + T::kNumWarps;
                 hk::u32x4 dw;
-                kv_manager.template wait_kv_loads<0u, 0u, kIsRopeWarp, /*kVmCnt=*/2>(warp_idx);
+
+                // ---- own strip cvt+store (p0,p1 from Phase A; 4 loads, drain 2->0) ----
+                kv_manager.template wait_kv_loads<0u, 0u, false, /*kVmCnt=*/2>(warp_idx);
                 const float scale_f0 = kv_manager.kv_tile_scale_f(p0);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p0, scale_f0);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p0, scale_f0);
-                kv_manager.template store_kv_tile_step<0u, 0u, 0, kIsRopeWarp>(p_lds_kv_next, warp_idx, dw);
+                kv_manager.template store_kv_tile_step<0u, 0u, 0, false>(p_lds_kv_next, warp_idx, dw);
                 kv_manager.template cvt_kv_tile_step<2>(dw, p0, scale_f0);
                 kv_manager.template cvt_kv_tile_step<3>(dw, p0, scale_f0);
-                kv_manager.template store_kv_tile_step<0u, 0u, 1, kIsRopeWarp>(p_lds_kv_next, warp_idx, dw);
+                kv_manager.template store_kv_tile_step<0u, 0u, 1, false>(p_lds_kv_next, warp_idx, dw);
+                kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/0>(warp_idx);
+                const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
+                kv_manager.template cvt_kv_tile_step<0>(dw, p1, scale_f1);
+                kv_manager.template cvt_kv_tile_step<1>(dw, p1, scale_f1);
+                kv_manager.template store_kv_tile_step<0u, kTileCols, 0, false>(p_lds_kv_next, warp_idx, dw);
+                kv_manager.template cvt_kv_tile_step<2>(dw, p1, scale_f1);
+                kv_manager.template cvt_kv_tile_step<3>(dw, p1, scale_f1);
+                kv_manager.template store_kv_tile_step<0u, kTileCols, 1, false>(p_lds_kv_next, warp_idx, dw);
 
-                // Tile-1 is the RoPE half for waves 5,7 -- they have no NoPE
-                // data in p1 (prefetch_kv_nope was a no-op) and their
-                // store_kv_tile_step already skips, so skip the scale+cvts
-                // too (they'd compute discarded garbage from uninit p1).
-                if constexpr(!kIsRopeWarp)
+                // ---- +4 strip: prefetch now (p0b/p1b reuse p0/p1 regs), then cvt ----
+                // p1b is a no-op on odd (+4 tile-1 is RoPE, DMA'd by prefetch_kv_rope).
+                kv_manager.template prefetch_kv_nope<0u, 0u, kCheckBoundaryNext, kPlus4IsRope>(
+                    kPlus4WarpIdx, params.p_kv_buffer, row_kv_ld_next, p0b);
+                kv_manager.template prefetch_kv_nope<0u, kTileCols, kCheckBoundaryNext, kPlus4IsRope>(
+                    kPlus4WarpIdx, params.p_kv_buffer, row_kv_ld_next, p1b);
+                kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext, kPlus4IsRope>(
+                    p_lds_kv_next, kPlus4WarpIdx, params.p_kv_buffer_rope, row_kv_ld_next);
+
+                kv_manager.template wait_kv_loads<0u, 0u, kPlus4IsRope, /*kVmCnt=*/2>(kPlus4WarpIdx);
+                const float scale_f0b = kv_manager.kv_tile_scale_f(p0b);
+                kv_manager.template cvt_kv_tile_step<0>(dw, p0b, scale_f0b);
+                kv_manager.template cvt_kv_tile_step<1>(dw, p0b, scale_f0b);
+                kv_manager.template store_kv_tile_step<0u, 0u, 0, kPlus4IsRope>(p_lds_kv_next, kPlus4WarpIdx, dw);
+                kv_manager.template cvt_kv_tile_step<2>(dw, p0b, scale_f0b);
+                kv_manager.template cvt_kv_tile_step<3>(dw, p0b, scale_f0b);
+                kv_manager.template store_kv_tile_step<0u, 0u, 1, kPlus4IsRope>(p_lds_kv_next, kPlus4WarpIdx, dw);
+                if constexpr(!kPlus4IsRope)
                 {
-                    kv_manager.template wait_kv_loads<0u, kTileCols, kIsRopeWarp, /*kVmCnt=*/0>(warp_idx);
-
-                    const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
-                    kv_manager.template cvt_kv_tile_step<0>(dw, p1, scale_f1);
-                    kv_manager.template cvt_kv_tile_step<1>(dw, p1, scale_f1);
-                    kv_manager.template store_kv_tile_step<0u, kTileCols, 0, kIsRopeWarp>(
-                        p_lds_kv_next, warp_idx, dw);
-                    kv_manager.template cvt_kv_tile_step<2>(dw, p1, scale_f1);
-                    kv_manager.template cvt_kv_tile_step<3>(dw, p1, scale_f1);
-                    kv_manager.template store_kv_tile_step<0u, kTileCols, 1, kIsRopeWarp>(
-                        p_lds_kv_next, warp_idx, dw);
+                    kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/0>(kPlus4WarpIdx);
+                    const float scale_f1b = kv_manager.kv_tile_scale_f(p1b);
+                    kv_manager.template cvt_kv_tile_step<0>(dw, p1b, scale_f1b);
+                    kv_manager.template cvt_kv_tile_step<1>(dw, p1b, scale_f1b);
+                    kv_manager.template store_kv_tile_step<0u, kTileCols, 0, false>(p_lds_kv_next, kPlus4WarpIdx, dw);
+                    kv_manager.template cvt_kv_tile_step<2>(dw, p1b, scale_f1b);
+                    kv_manager.template cvt_kv_tile_step<3>(dw, p1b, scale_f1b);
+                    kv_manager.template store_kv_tile_step<0u, kTileCols, 1, false>(p_lds_kv_next, kPlus4WarpIdx, dw);
+                }
+                else
+                {
+                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
                 }
             }
 
             // ---- Update row_kv_ld_next_next for the call AFTER this one ----
             // Hi warps uses softmax + PV GEMM to hide latency of loading next next row_kv_ld
-            if constexpr((kIsGlobalLast == false) && (kWarpType != WarpTypeM16x8::LoNoPEWarp))
+            if constexpr((kIsGlobalLast == false) && (true))
             {
                 row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
             }
@@ -743,7 +771,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 pack_2f32_to_bf16_pair_pinned<k_p_mfma_begin + 3, k_p_comp_begin + 6>();
             }
 
-            if constexpr(kWarpType == WarpTypeM16x8::LoNoPEWarp)
+            if constexpr(false)
             {
                 __builtin_amdgcn_sched_barrier(0);
                 __builtin_amdgcn_s_setprio(0);
@@ -872,7 +900,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
         //
         // Per-warp causal_offset < kBlockN (qseqlen <= 8, kBlockN = 32) means
         // num_iters_eff in {0, num_iters - 1, num_iters}: at most 1 trailing
-        // skip iter. Same ladder shape as V32 m16x8.
+        // skip iter. Same ladder shape as V32 m16x4.
 #if !defined(MLA_SLIM_DISPATCH)
         if(kv_len_eff <= 0)
         {
@@ -1184,29 +1212,24 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((amdgpu_num_vgpr(44)))
-void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T>
+void kn_mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T>
                                                                                    params)
 {
     const uint32_t warp_idx = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
 
     // Diverge on warp type ONCE at kernel entry so each type compiles as its own
-    // body (compile-time kWarpType, no runtime warp-idx branches inside). PV is
-    // at call end for every warp; the only functional split is RoPE-owner
-    // (warps 5,7) vs NoPE. The Lo/Hi NoPE split is vestigial.
-    if(warp_idx < 4u)
+    // body (compile-time kWarpType). 4 physical waves; the only functional split
+    // is the +4 col-strip's RoPE-ownership = wave parity: odd waves (1,3) load
+    // w5/w7 (tile-1 RoPE) in their +4 strip, even waves (0,2) load w4/w6 (NoPE).
+    if((warp_idx & 1u) == 0u)
     {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::LoNoPEWarp>(params,
-                                                                                      warp_idx);
-    }
-    else if(KvManager8to16bitsV1<T>::wave_is_rope_owner(warp_idx))
-    {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::HiRoPEWarp>(params,
-                                                                                      warp_idx);
+        mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x4::EvenPlus4NoPE>(
+            params, warp_idx);
     }
     else
     {
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x8::HiNoPEWarp>(params,
-                                                                                      warp_idx);
+        mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl<WarpTypeM16x4::OddPlus4RoPE>(
+            params, warp_idx);
     }
 }
 
@@ -1214,7 +1237,7 @@ void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdPar
 template <typename T>
 __global__ __launch_bounds__(
     T::kNumThreads,
-    T::kOccupancy) void kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T>
+    T::kOccupancy) void kn_mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1(HkMlaV40DecodeFwdParams<T>
                                                                                    params)
 {
     (void)params;
@@ -1223,7 +1246,7 @@ __global__ __launch_bounds__(
 #endif
 
 template <typename Traits>
-void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
+void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
                                                          aiter_tensor_t& query_rope,
                                                          aiter_tensor_t& kv_buffer,
                                                          aiter_tensor_t& kv_buffer_rope,
@@ -1240,7 +1263,7 @@ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
                                                          const float* p_attn_sink)
 {
     // Shape / dtype / rank checks live ONCE in the outer dispatcher
-    // (hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1) so we don't
+    // (hk_mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1) so we don't
     // pay for them per page_size template instantiation.
     const int32_t num_qheads      = query.size(1);
     const int32_t log2_num_qheads = __builtin_ctz(num_qheads);
@@ -1274,14 +1297,14 @@ void mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
         softmax_scale,
         log2_num_qheads};
 
-    const dim3 grid        = dim3(dev_prop.multiProcessorCount);
+    const dim3 grid        = dim3(dev_prop.multiProcessorCount * Traits::kOccupancy);
     const int32_t lds_size = dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy;
 
-    kn_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1<Traits>
+    kn_mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1<Traits>
         <<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
 }
 
-void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
+void hk_mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1(aiter_tensor_t& query,
                                                             aiter_tensor_t& query_rope,
                                                             aiter_tensor_t& kv_buffer,
                                                             aiter_tensor_t& kv_buffer_rope,
@@ -1305,13 +1328,13 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
     const bool kv_rope_is_bf16 = (kv_buffer_rope.dtype() == AITER_DTYPE_bf16);
 
     AITER_CHECK(q_nope_is_fp8 && kv_nope_is_fp8,
-                "hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1 requires FP8 NOPE; got q=",
+                "hk_mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1 requires FP8 NOPE; got q=",
                 AiterDtype_to_str(query.dtype()),
                 ", kv=",
                 AiterDtype_to_str(kv_buffer.dtype()));
     AITER_CHECK(
         q_rope_is_bf16 && kv_rope_is_bf16,
-        "hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1 requires BF16 ROPE; got q_rope=",
+        "hk_mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1 requires BF16 ROPE; got q_rope=",
         AiterDtype_to_str(query_rope.dtype()),
         ", kv_rope=",
         AiterDtype_to_str(kv_buffer_rope.dtype()));
@@ -1332,9 +1355,9 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
                                                 hk::bf16,
                                                 hk::bf16,
                                                 /*kBlockN_=*/32,
-                                                /*kNumWarps_=*/8,
-                                                /*kOccupancy_=*/1,
-                                                /*kBlockM_=*/128,
+                                                /*kNumWarps_=*/4,
+                                                /*kOccupancy_=*/2,
+                                                /*kBlockM_=*/64,
                                                 /*kPageSize_=*/1>;
 
     const int64_t num_qheads = query.size(1);
@@ -1477,11 +1500,11 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
                                                hk::bf16,                               \
                                                hk::bf16,                               \
                                                /*kBlockN_=*/32,                        \
-                                               /*kNumWarps_=*/8,                       \
-                                               /*kOccupancy_=*/1,                      \
-                                               /*kBlockM_=*/128,                       \
+                                               /*kNumWarps_=*/4,                       \
+                                               /*kOccupancy_=*/2,                      \
+                                               /*kBlockM_=*/64,                       \
                                                /*kPageSize_=*/PageSize>;               \
-        mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1<Traits>(query,             \
+        mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1<Traits>(query,             \
                                                                     query_rope,        \
                                                                     kv_buffer,         \
                                                                     kv_buffer_rope,    \
@@ -1507,10 +1530,11 @@ void hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1(aiter_tensor_t& quer
     default:
         AITER_CHECK(
             false,
-            "hk_mi35x_mla_v40_fwd_decode_m16x8_fp8bf16_fp8bf16_gen1: unsupported page_size ",
+            "hk_mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1: unsupported page_size ",
             page_size,
             " (supported: 1, 64).");
     }
 
 #undef DISPATCH_PAGE_SIZE
 }
+

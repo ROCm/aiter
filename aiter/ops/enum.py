@@ -12,5 +12,10 @@ def _ActivationType(dummy): ...
 def _QuantType(dummy): ...
 
 
+@compile_ops("module_mla_metadata", "MlaVersion")
+def _MlaVersion(dummy): ...
+
+
 ActivationType = type(_ActivationType(0))
 QuantType = type(_QuantType(0))
+MlaVersion = type(_MlaVersion(0))

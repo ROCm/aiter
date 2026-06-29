@@ -107,8 +107,8 @@ class QManager8to16bitsV1
     static_assert(T::kQkNopeHeadDim == 448, "QManager8to16bitsV1: NOPE width must be 448.");
     static_assert(T::kQkRopeHeadDim == 64, "QManager8to16bitsV1: ROPE width must be 64.");
     static_assert(T::kQkHeadDim == 512, "QManager8to16bitsV1: kQkHeadDim must be 512 (NOPE+ROPE).");
-    static_assert(T::kBlockM == 128, "QManager8to16bitsV1: kBlockM must be 128.");
-    static_assert(T::kNumWarps == 8, "QManager8to16bitsV1: requires 8 warps.");
+    static_assert(T::kBlockM == 128 || T::kBlockM == 64, "QManager8to16bitsV1: kBlockM must be 128 or 64.");
+    static_assert(T::kNumWarps == 8 || T::kNumWarps == 4, "QManager8to16bitsV1: requires 8 or 4 warps.");
     static_assert(T::kTileM == 16, "QManager8to16bitsV1: kTileM must be 16.");
 
     public:
@@ -698,7 +698,7 @@ class KvManager8to16bitsV1
     static_assert(T::kQkRopeHeadDim == 64, "KvManager8to16bitsV1: ROPE width must be 64.");
     static_assert(T::kQkHeadDim == 512,
                   "KvManager8to16bitsV1: kQkHeadDim must be 512 (NOPE+ROPE).");
-    static_assert(T::kNumWarps == 8, "KvManager8to16bitsV1: requires 8 warps.");
+    static_assert(T::kNumWarps == 8 || T::kNumWarps == 4, "KvManager8to16bitsV1: requires 8 or 4 warps (m16x4 passes warp_idx 0..7 via the +kNumWarps col-strip).");
 
     public:
     // ---- Sub-block geometry ------------------------------------------------

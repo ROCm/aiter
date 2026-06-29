@@ -795,8 +795,11 @@ def test_mla_v4(
         fast_mode=True,
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=False,
-        dtype_q=dtypes.fp8,
-        dtype_kv=dtypes.fp8,
+        mla_version=aiter.MlaVersion.V40,
+        dtype_q_nope=dtypes.fp8,
+        dtype_q_rope=dtypes.bf16,
+        dtype_kv_nope=dtypes.fp8,
+        dtype_kv_rope=dtypes.bf16,
     )
 
     if os.environ.get("DUMP_MLA_METADATA", ""):
@@ -840,8 +843,8 @@ def test_mla_v4(
     # Packed FP8 (NOPE+dup-scale+pad) Q/KV + BF16 RoPE Q/KV; output BF16.
     # mla_v40_decode_fwd raises NotImplementedError for shapes the router
     # can't dispatch yet, so we only invoke it when the HK constraint
-    # (nhead*decode_qlen)==128 is satisfied.
-    if max_seqlen_qo * nhead == 128:
+    # (nhead*decode_qlen) in {128 (m16x8), 64 (m16x4)} is satisfied.
+    if max_seqlen_qo * nhead in (128, 64):
         out_v40 = torch.empty((total_q, nhead, V4_DIM_V), dtype=out_dtype)
         (v40_logits, _v40_final_lse), us_v40_decode = run_perftest(
             aiter.mla.mla_v40_decode_fwd,

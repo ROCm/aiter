@@ -1907,6 +1907,11 @@ namespace py = pybind11;
           py::arg("k") = 2048);
 
 #define MLA_METADATA_PYBIND                               \
+    pybind11::enum_<MlaVersion>(m, "MlaVersion")          \
+        .value("V32", MlaVersion::V32)                    \
+        .value("V40", MlaVersion::V40)                    \
+        .export_values();                                 \
+    pybind11::implicitly_convertible<int, MlaVersion>();  \
     m.def("get_mla_metadata_v1",                          \
           &get_mla_metadata_v1,                           \
           "get_mla_metadata_v1",                          \
@@ -1930,9 +1935,12 @@ namespace py = pybind11;
           py::arg("topk")                = -1,            \
           py::arg("max_split_per_batch") = -1,            \
           py::arg("intra_batch_mode")    = false,         \
-          py::arg("dtype_q")             = std::nullopt,  \
-          py::arg("dtype_kv")            = std::nullopt,  \
-          py::arg("is_cp_round_robin")   = false);        \
+          py::arg("is_cp_round_robin")   = false,         \
+          py::arg("mla_version")         = MlaVersion::V32,\
+          py::arg("dtype_q_nope")        = std::nullopt,  \
+          py::arg("dtype_q_rope")        = std::nullopt,  \
+          py::arg("dtype_kv_nope")       = std::nullopt,  \
+          py::arg("dtype_kv_rope")       = std::nullopt); \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
 #define PA_METADATA_PYBIND                       \

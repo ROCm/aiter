@@ -1112,8 +1112,8 @@ def test_mla(
         fast_mode=True if not non_persistent_mode else False,
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=non_persistent_mode,
-        dtype_q=dtype,
-        dtype_kv=kvtype,
+        dtype_q_nope=dtype,
+        dtype_kv_nope=kvtype,
     )
 
     if os.environ.get("DUMP_MLA_METADATA", ""):

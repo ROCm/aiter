@@ -627,7 +627,7 @@ def mla_v40_decode_fwd(
 
     use_hk = (
         get_gfx() == "gfx950"
-        and nhead * max_seqlen_q == 128
+        and nhead * max_seqlen_q in (64, 128)
         and q.dtype == dtypes.fp8
         and kv_buffer.dtype == dtypes.fp8
         and q_rope.dtype == dtypes.bf16
