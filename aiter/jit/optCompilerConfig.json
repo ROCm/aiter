@@ -239,7 +239,6 @@
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/include'"
         ],
         "flags_extra_hip": [
-            "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm -enable-noalias-to-md-conversion=1'"
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances_cktile.py --working_path {{}} --tune_file {AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE}'"
@@ -756,7 +755,6 @@
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/include'"
         ],
         "flags_extra_hip": [
-            "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm -enable-noalias-to-md-conversion=1'"
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances_cktile.py --working_path {{}} --tune'"
