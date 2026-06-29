@@ -3,8 +3,9 @@
 r"""Micro-benchmark ``grouped_gemm_mxfp8_hip_fwd`` for PR tables (gfx950).
 
 This is **not** the same script as ``bench_smallm_mxfp8.py`` (decode dense vs
-Triton ``dot_scaled``). Here we benchmark **prefill-style grouped GEMM** (G=1
-cases with valid ``tile_offs`` / ``block_to_expert``).
+Triton ``dot_scaled``). Here we benchmark **prefill-style grouped GEMM**
+(multi-expert G>=1 cases with valid ``group_offs`` / ``tile_offs`` /
+``block_to_expert``; defaults use G=8).
 
 How to generate a PR-style table
 --------------------------------
@@ -25,9 +26,10 @@ HIP, but reproducible without vLLM. Use the ratio as “vs accurate matmul”, *
 as “vs Triton” unless you wire Triton yourself.
 
 **Default rows**
-Only **G=1** shapes that satisfy kernel preflight (``K>=384``, ``K%32==0``,
-``N%16==0``, ``M%16==0`` for preshuffle launch). Extend ``DEFAULT_BENCH_CASES``
-for more rows.
+Multi-expert **G=8** shapes that satisfy kernel preflight (``K>=384``,
+``K%32==0``, ``N%16==0``, ``M%16==0``, and per-expert ``M_g%16==0`` for the
+preshuffle launch). ``M_total`` is split evenly across the G experts. Extend
+``DEFAULT_BENCH_CASES`` for more rows.
 
 **vs decode PR #3783 table**
 That table comes from ``bench_smallm_mxfp8.py`` + **Triton dot_scaled** baseline
@@ -52,12 +54,14 @@ from aiter.ops.grouped_gemm_mxfp8 import grouped_gemm_mxfp8_hip_fwd
 from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 from aiter.utility.fp4_utils import e8m0_to_f32
 
-# (label, M_total, N, K, G) — extend as needed; G>1 needs correct tile metadata (not included yet).
+# (label, M_total, N, K, G) — M_total is split evenly across G experts, so
+# M_total must be divisible by G and each per-expert share by 16. G=8 mirrors a
+# realistic MoE grouped GEMM (not a degenerate single-expert / plain GEMM).
 DEFAULT_BENCH_CASES: tuple[tuple[str, int, int, int, int], ...] = (
-    ("smoke", 512, 256, 384, 1),
-    ("m512_n512_k512", 512, 512, 512, 1),
-    ("m1024_n512_k1024", 1024, 512, 1024, 1),
-    ("m2048_n1024_k2048", 2048, 1024, 2048, 1),
+    ("g8_smoke", 2048, 256, 384, 8),
+    ("g8_m2048_n512_k1024", 2048, 512, 1024, 8),
+    ("g8_m4096_n512_k1024", 4096, 512, 1024, 8),
+    ("g8_m8192_n1024_k2048", 8192, 1024, 2048, 8),
 )
 
 
@@ -82,26 +86,43 @@ def _mxfp8_dequant_blocked(
     return (x_f * s_f32).reshape(*lead, k)
 
 
-def _grouped_ref_g1(
+def _grouped_ref(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
+    per_expert_rows: list[int],
 ) -> torch.Tensor:
-    a_dq = _mxfp8_dequant_blocked(a, a_scale)
-    b_dq = _mxfp8_dequant_blocked(b[0], b_scale[0])
-    return a_dq @ b_dq.transpose(0, 1)
+    """Grouped NT GEMM reference (G>=1): per-expert dequant matmul, concatenated."""
+    outs = []
+    start = 0
+    for gi, rows in enumerate(per_expert_rows):
+        a_dq = _mxfp8_dequant_blocked(a[start : start + rows], a_scale[start : start + rows])
+        b_dq = _mxfp8_dequant_blocked(b[gi], b_scale[gi])
+        outs.append(a_dq @ b_dq.transpose(0, 1))
+        start += rows
+    return torch.cat(outs, dim=0)
 
 
-def _tile_metadata(m_total: int, n: int, g: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """G=1 only: flat tile grid prefix sums."""
-    tiles_m = (m_total + 255) // 256
+def _tile_metadata(
+    per_expert_rows: list[int], n: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flat tile-grid prefix sums for arbitrary G.
+
+    tiles_per_expert = ceil(M_g / 256) * ceil(N / 256); ``tile_offs`` is their
+    prefix sum and ``block_to_expert`` labels every flat tile with its expert.
+    """
     tiles_n = (n + 255) // 256
-    total_tiles = tiles_m * tiles_n * g
-    tile_offs = torch.zeros(g + 1, dtype=torch.int32, device="cuda")
-    tile_offs[1] = total_tiles
-    block_to_expert = torch.zeros(total_tiles, dtype=torch.int32, device="cuda")
-    return block_to_expert, tile_offs
+    tile_offs = [0]
+    block_to_expert: list[int] = []
+    for gi, rows in enumerate(per_expert_rows):
+        per_expert_tiles = ((rows + 255) // 256) * tiles_n
+        block_to_expert.extend([gi] * per_expert_tiles)
+        tile_offs.append(tile_offs[-1] + per_expert_tiles)
+    return (
+        torch.tensor(block_to_expert, dtype=torch.int32, device="cuda"),
+        torch.tensor(tile_offs, dtype=torch.int32, device="cuda"),
+    )
 
 
 def _median_gpu_us(
@@ -146,18 +167,23 @@ def _prepare_tensors(
     b_flat, b_s_u8 = dynamic_mxfp8_quant(b_bf16)
     b = b_flat.view(g, n, k).contiguous()
     b_scale = b_s_u8.view(g, n, k // 32).contiguous().view(torch.float8_e8m0fnu)
-    group_offs = torch.tensor([0, m_total], device=device, dtype=torch.int64)
-    block_to_expert, tile_offs = _tile_metadata(m_total, n, g)
+    per_expert_rows = [m_total // g] * g
+    group_offs = torch.tensor(
+        [(m_total // g) * i for i in range(g + 1)], device=device, dtype=torch.int64
+    )
+    block_to_expert, tile_offs = _tile_metadata(per_expert_rows, n)
     return a, b, a_scale, b_scale, group_offs, block_to_expert, tile_offs
 
 
 def _validate_case(m_total: int, n: int, k: int, g: int) -> None:
-    if g != 1:
+    if g < 1 or m_total % g != 0:
+        raise ValueError(f"M_total={m_total} must be divisible by G={g}")
+    per_expert = m_total // g
+    if k < 384 or k % 32 != 0 or n % 16 != 0 or m_total % 16 != 0 or per_expert % 16 != 0:
         raise ValueError(
-            "bench defaults only support G=1 tile metadata; extend _tile_metadata for G>1"
+            f"illegal shape M={m_total} N={n} K={k} G={g} (per-expert={per_expert}) "
+            "for kernel preflight (K>=384, K%32==0, N%16==0, M%16==0, M_g%16==0)"
         )
-    if k < 384 or k % 32 != 0 or n % 16 != 0 or m_total % 16 != 0:
-        raise ValueError(f"illegal shape M={m_total} N={n} K={k} for kernel preflight")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -207,8 +233,10 @@ def main(argv: list[str] | None = None) -> int:
         }
         if args.ref_torch:
 
-            def ref_fn():
-                return _grouped_ref_g1(a, b, a_scale, b_scale)
+            per_expert_rows = [m_total // g] * g
+
+            def ref_fn(per_expert_rows=per_expert_rows):
+                return _grouped_ref(a, b, a_scale, b_scale, per_expert_rows)
 
             ref_us = _median_gpu_us(
                 ref_fn, warmup=max(3, args.warmup // 5), iters=args.iters
