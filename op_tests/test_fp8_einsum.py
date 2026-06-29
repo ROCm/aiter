@@ -55,6 +55,7 @@ pytestmark = pytest.mark.skipif(
     reason="fp8_einsum targets gfx950 (MI355X) only",
 )
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Packed-UE8M0 input construction (self-contained — no perf-dir dependency).
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,6 +277,7 @@ def test_qz(H, D, R, B, tn):
         "us": round(us, 3),
         "TFLOPS": round(_tf(us, H, D, R, B), 1),
     }
+
 
 @benchmark()
 def test_qz_splitk(H, D, R, B, sk):
