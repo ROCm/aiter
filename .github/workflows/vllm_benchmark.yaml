@@ -141,7 +141,7 @@ jobs:
               --reasoning-parser deepseek_v4
             extra_env_args: ""
           - model: amd/MiniMax-M3-MXFP4
-            runner: linux-aiter-do-mi350x-4
+            runner: linux-aiter-do-mi350x-8
             kv_cache_dtype: default_kvcache
             tp: 4
             extra_args: >-
