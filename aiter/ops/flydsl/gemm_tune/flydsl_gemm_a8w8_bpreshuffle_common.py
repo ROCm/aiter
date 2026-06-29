@@ -39,12 +39,14 @@ class kernelInstance:
     q_dtype_a: str  # "fp8" | "int8"
     q_dtype_w: str  # "fp8" | "int8"
     dtype: str  # output dtype: "bf16" | "fp16"
-    lds_stage: int  # 1 or 2
-    use_cshuffle_epilog: int  # 0 or 1
     use_async_copy: int  # 0 or 1
     waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
-    sScheduler: str  # "Default"
-    xcd_swizzle: int = 0  # 0=off, >0=group size for XCD remap
+    sScheduler: str  # "Default" (scheduler hints on) | "Off" (compiler default)
+
+    @property
+    def enable_scheduler(self) -> bool:
+        """Map the scheduler name token to compile_preshuffle_gemm(enable_scheduler=)."""
+        return str(self.sScheduler).lower() != "off"
 
     @property
     def name(self) -> str:
@@ -63,11 +65,8 @@ class kernelInstance:
                     map(
                         str,
                         [
-                            self.lds_stage,
-                            self.use_cshuffle_epilog,
                             self.use_async_copy,
                             self.waves_per_eu,
-                            self.xcd_swizzle,
                         ],
                     )
                 ),
@@ -80,11 +79,8 @@ def _ki(
     tile_m,
     tile_n,
     tile_k,
-    lds_stage,
-    cshuffle=0,
     async_copy=0,
     waves_per_eu=0,
-    xcd_swizzle=0,
     scheduler="Default",
     q_dtype_a="fp8",
     q_dtype_w="fp8",
@@ -97,12 +93,9 @@ def _ki(
         q_dtype_a,
         q_dtype_w,
         dtype,
-        lds_stage,
-        cshuffle,
         async_copy,
         waves_per_eu,
         scheduler,
-        xcd_swizzle,
     )
 
 
@@ -127,38 +120,18 @@ def preshuffle_gemm_estimated_lds_bytes(
     *,
     in_dtype: str = "fp8",
     out_dtype: str = "bf16",
-    lds_stage: int = 2,
-    use_cshuffle_epilog: int = 0,
 ) -> int:
     """Estimated total LDS (bytes) for preshuffle_gemm: sum of two smem globals.
 
-    Mirrors ``preshuffle_gemm.py`` ping/pong allocation; used to skip tune
-    instances that exceed AMDGPU per-kernel LDS limits (e.g. 64 KiB on gfx942).
+    Mirrors ``preshuffle_gemm.py`` ping/pong A-tile allocation (``SharedStorage``
+    holds two ``tile_m x tile_k`` buffers); used to skip tune instances that
+    exceed AMDGPU per-kernel LDS limits (e.g. 64 KiB on gfx942).
     """
-    is_fp4 = in_dtype == "fp4"
-    elem_bytes = 1 if in_dtype in ("fp8", "int8", "int4", "fp4") else 2
-    a_elem_vec_pack = 2 if is_fp4 else 1
-    tile_k_bytes = int(tile_k) * elem_bytes
-    lds_tile_bytes = int(tile_m) * tile_k_bytes // a_elem_vec_pack
-    # Epilogue staging in LDS is fp16/bf16-sized (2 bytes per element).
-    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if int(use_cshuffle_epilog) else 0
+    elem_bytes = 1 if in_dtype in ("fp8", "int8") else 2
+    a_tile_bytes = int(tile_m) * int(tile_k) * elem_bytes
 
-    ptr_pong = 0
-    ptr_ping = 0
-    if int(lds_stage) == 2:
-        buffer_size_bytes = max(lds_tile_bytes, lds_out_bytes // 2)
-        buffer_size_elems = (
-            buffer_size_bytes if elem_bytes == 1 else buffer_size_bytes // 2
-        )
-        bsz = buffer_size_elems * elem_bytes
-        ptr_pong = _smem_align(ptr_pong) + bsz
-        ptr_ping = _smem_align(ptr_ping) + bsz
-    else:
-        lds_total_bytes = max(lds_tile_bytes, lds_out_bytes)
-        lds_total_elems = lds_total_bytes if elem_bytes == 1 else lds_total_bytes // 2
-        ptr_pong = _smem_align(ptr_pong) + lds_total_elems * elem_bytes
-
-    return _smem_finalize_size(ptr_pong) + _smem_finalize_size(ptr_ping)
+    # Two ping/pong A-tile buffers, each finalized to a 128B-aligned smem global.
+    return _smem_finalize_size(_smem_align(a_tile_bytes)) * 2
 
 
 def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
@@ -169,8 +142,6 @@ def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
         ki.tile_k,
         in_dtype=ki.q_dtype_a,
         out_dtype=ki.dtype,
-        lds_stage=ki.lds_stage,
-        use_cshuffle_epilog=ki.use_cshuffle_epilog,
     )
 
 
@@ -188,8 +159,8 @@ def max_lds_bytes_for_tune() -> int:
 # Base tile configurations: (tile_m, tile_n, tile_k)
 # ---------------------------------------------------------------------------
 
-# lds_stage=2 tiles shared by gfx942 and gfx950
-_base_tiles_lds2_common = [
+# Tiles shared by gfx942 and gfx950
+_base_tiles_common = [
     # small M (decode / token-gen)
     (16,  64,  256), (16,  64,  512),
     (16,  128, 256), (16,  128, 512), (16,  256, 256), (16,  256, 512),
@@ -221,37 +192,23 @@ _base_tiles_lds2_common = [
     (256, 64,  128), (256, 128, 128), (256, 192, 128),
 ]
 
-# gfx942-only lds_stage=2 tiles (tile_k=64 not supported on gfx950)
-_base_tiles_lds2_942_extra = [
+# gfx942-only tiles (tile_k=64 not supported on gfx950)
+_base_tiles_942_extra = [
     (64,  256, 64),
     (128, 128, 64),
 ]
 
-# gfx950-only lds_stage=2 tile
-_base_tiles_lds2_950_extra = [
+# gfx950-only tile
+_base_tiles_950_extra = [
     (256, 256, 128),
 ]
 
-# lds_stage=1 tiles (same for both archs)
-_base_tiles_lds1 = [
-    (16,  64,  256), (16,  64,  512),
-    (16,  128, 256), (16,  128, 512), (16,  256, 256), (16,  256, 512),
-    (16,  512, 256),
-    (32,  64,  128), (32,  64,  256), (32,  64,  512), (32,  128, 128),
-    (32,  128, 256),
-    (64,  64,  128), (64,  64,  256), (64,  128, 128), (64,  128, 256),
-    (64,  256, 128),
-    (128, 64,  128), (128, 128, 128), (128, 128, 256), (128, 256, 128),
-]
-
 # ---------------------------------------------------------------------------
-# Combo sweep: lds_stage x cshuffle x async_copy x waves_per_eu
+# Combo sweep: async_copy x waves_per_eu x scheduler
 # ---------------------------------------------------------------------------
-_LDS_STAGES      = (1, 2)
-_CSHUFFLE_VALS   = (0, 1)
 _ASYNC_COPY_VALS = (0, 1)
 _WAVES_PER_EU    = (0, 1, 2, 3, 4)
-_XCD_SWIZZLE_VALS = (0, 4)
+_SCHEDULER_VALS  = ("Default", "Off")  # in-loop sched hints on / compiler default
 
 _WAVES_PER_WG = 4  # typical wavefronts per workgroup in FlyDSL preshuffle GEMM
 
@@ -284,46 +241,43 @@ def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
     return int(total_vgpr / max(est_per_wave, 1))
 
 
-def _build_kernels_list(tiles_lds2, tiles_lds1, total_vgpr=512):
-    tiles_by_lds = {2: tiles_lds2, 1: tiles_lds1}
+def _build_kernels_list(tiles, total_vgpr=512):
     kl = {}
     idx = 0
-    for wpe in _WAVES_PER_EU:
-        for csh in _CSHUFFLE_VALS:
+    for sched in _SCHEDULER_VALS:
+        for wpe in _WAVES_PER_EU:
             for acp in _ASYNC_COPY_VALS:
-                for xcd in _XCD_SWIZZLE_VALS:
-                    for lds in _LDS_STAGES:
-                        for tm, tn, tk in tiles_by_lds[lds]:
-                            if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
-                                continue
-                            kl[idx] = _ki(tm, tn, tk, lds, csh, acp, wpe, xcd)
-                            idx += 1
+                for tm, tn, tk in tiles:
+                    if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
+                        continue
+                    kl[idx] = _ki(tm, tn, tk, acp, wpe, sched)
+                    idx += 1
     return kl
 
 
 kernels_list_942 = _build_kernels_list(
-    _base_tiles_lds2_common + _base_tiles_lds2_942_extra, _base_tiles_lds1,
+    _base_tiles_common + _base_tiles_942_extra,
     total_vgpr=_vgpr_per_simd("gfx942"))
 kernels_list_950 = _build_kernels_list(
-    _base_tiles_lds2_common + _base_tiles_lds2_950_extra, _base_tiles_lds1,
+    _base_tiles_common + _base_tiles_950_extra,
     total_vgpr=_vgpr_per_simd("gfx950"))
 # fmt: on
 
 default_kernels_dict_942 = {
-    (-1): _ki(128, 128, 128, 2, 0, 0, 2, 0, "Default"),
-    (-2): _ki(16, 64, 512, 2, 0, 0, 2, 0, "Default"),
-    (-3): _ki(32, 64, 512, 2, 0, 0, 2, 0, "Default"),
-    (-4): _ki(64, 256, 64, 2, 0, 0, 2, 0, "Default"),
-    (-5): _ki(128, 128, 64, 2, 0, 0, 2, 0, "Default"),
-    (-6): _ki(128, 64, 128, 2, 0, 0, 2, 0, "Default"),
-    (-7): _ki(64, 256, 128, 2, 0, 0, 2, 0, "Default"),
+    (-1): _ki(128, 128, 128, 0, 2, "Default"),
+    (-2): _ki(16, 64, 512, 0, 2, "Default"),
+    (-3): _ki(32, 64, 512, 0, 2, "Default"),
+    (-4): _ki(64, 256, 64, 0, 2, "Default"),
+    (-5): _ki(128, 128, 64, 0, 2, "Default"),
+    (-6): _ki(128, 64, 128, 0, 2, "Default"),
+    (-7): _ki(64, 256, 128, 0, 2, "Default"),
 }
 
 default_kernels_dict_950 = {
-    (-1): _ki(128, 256, 256, 2, 0, 0, 2, 0, "Default"),
-    (-2): _ki(16, 64, 512, 2, 0, 0, 2, 0, "Default"),
-    (-3): _ki(32, 64, 512, 2, 0, 0, 2, 0, "Default"),
-    (-4): _ki(128, 128, 128, 2, 0, 0, 2, 0, "Default"),
+    (-1): _ki(128, 256, 256, 0, 2, "Default"),
+    (-2): _ki(16, 64, 512, 0, 2, "Default"),
+    (-3): _ki(32, 64, 512, 0, 2, "Default"),
+    (-4): _ki(128, 128, 128, 0, 2, "Default"),
 }
 
 arch = get_gfx()
