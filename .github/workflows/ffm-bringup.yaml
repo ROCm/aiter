@@ -32,7 +32,8 @@ concurrency:
 
 env:
   FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
-  FFM_TEST: op_tests/triton_tests/gemm/basic/test_gemm_a16w16_ffm_smoke.py
+  FFM_TEST: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
+  FFM_TEST_NODE_PATTERN: '::test_gemm_a16_w16\[(bandwidth_bound|compute_bound)-gluon-64-2880-4096\]$'
 
 jobs:
   check-signal:
@@ -91,7 +92,7 @@ jobs:
           set -euo pipefail
           docker pull "${FFM_IMAGE}"
 
-      - name: Run aiter FFM smoke test
+      - name: Run selected existing aiter FFM unit tests
         run: |
           set -euo pipefail
 
@@ -115,6 +116,7 @@ jobs:
             --security-opt seccomp=unconfined \
             --shm-size=16gb \
             -e FFM_TEST="${FFM_TEST}" \
+            -e FFM_TEST_NODE_PATTERN="${FFM_TEST_NODE_PATTERN}" \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${FFM_IMAGE}" \
@@ -128,6 +130,7 @@ jobs:
               echo "pwd: $(pwd)"
               echo "aiter checkout: $(git rev-parse HEAD)"
               echo "FFM_TEST=${FFM_TEST}"
+              echo "FFM_TEST_NODE_PATTERN=${FFM_TEST_NODE_PATTERN}"
               echo "PATH=${PATH}"
               echo "PYTHONPATH=${PYTHONPATH:-}"
 
@@ -150,8 +153,18 @@ jobs:
               python3 -m pip show torch triton amd-triton triton-kernels amd-aiter aiter || true
               python3 -m pip uninstall -y pylama || true
 
-              echo "==== Run FFM smoke test ===="
-              python3 -m pytest -v "${FFM_TEST}"
+              echo "==== Select existing FFM test cases ===="
+              FFM_COLLECTED="$(python3 -m pytest --collect-only -q "${FFM_TEST}")"
+              mapfile -t FFM_TEST_NODES < <(grep -E "${FFM_TEST_NODE_PATTERN}" <<< "${FFM_COLLECTED}" || true)
+              printf "%s\n" "${FFM_TEST_NODES[@]}"
+              if [ "${#FFM_TEST_NODES[@]}" -eq 0 ]; then
+                echo "::error::No FFM test nodes matched ${FFM_TEST_NODE_PATTERN}"
+                exit 1
+              fi
+              echo "Selected ${#FFM_TEST_NODES[@]} existing test node(s)"
+
+              echo "==== Run selected existing FFM unit tests ===="
+              python3 -m pytest -v "${FFM_TEST_NODES[@]}"
             '
 
       - name: Cleanup
