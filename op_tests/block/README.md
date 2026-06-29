@@ -8,7 +8,9 @@ Runs OpenAI's GPT-OSS attention block end to end and checks it against a torch r
 
 GPT-OSS's `head_dim=64` forces the triton/gluon path, so the kernels exercised are: `get_rope` (YaRN), `fused_qk_rope_reshape_and_cache` (RoPE + paged cache write), `flash_attn_varlen_func(sink_ptr=)` (prefill), and `pa_decode_gluon` (decode).
 
-Validated on MI355X (gfx950) and MI308X (gfx942); fp8 KV is arch-portable (`dtypes.fp8` resolves to e4m3fn on gfx950 / e4m3fnuz on gfx942).
+Two arch backends mirror ATOM's selector: `asm` (AiterBackend — `flash_attn_varlen_func` + `pa_decode_gluon`, gfx942/gfx950) and `triton` (TritonMHABackend / `use_flash_layout` — `unified_attention` for both phases, portable incl. gfx1250). `--backend auto` picks `triton` on gfx1250, else `asm`.
+
+Validated on MI355X (gfx950), MI308X (gfx942) — both backends — and gfx1250 (triton backend). fp8 KV is arch-portable on the asm path (`dtypes.fp8` resolves to e4m3fn on gfx950 / e4m3fnuz on gfx942); the triton backend is bf16-only.
 
 ### Quick start
 
@@ -26,7 +28,8 @@ python3 op_tests/block/test_attention_block.py --model gpt-oss-120b --phase both
 | `--seqlen` | prefill prompt length (list ok) |
 | `--ctx-len` | decode KV context length (list ok) |
 | `--layer-parity` | `even` (sliding window) / `odd` (full causal) / `both` |
-| `--kv-cache-dtype` | `bf16` / `fp8` (fp8 affects decode only) |
+| `--kv-cache-dtype` | `bf16` / `fp8` (fp8 affects asm decode only) |
+| `--backend` | `auto` / `asm` (gfx942/950) / `triton` (portable, incl. gfx1250) |
 | `--hipgraph` | `auto` (off prefill, on decode) / `on` / `off` |
 
 ### Mapping a serving scenario to parameters

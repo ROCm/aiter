@@ -33,6 +33,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
     get_recommended_splits,
     pa_decode_gluon,
 )
+from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.test_common import checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -134,33 +135,28 @@ def _qkv_split(qkv, cfg):
     )
 
 
-def attention_block(
-    cfg: GptOssCfg,
-    w: BlockWeights,
-    hidden: torch.Tensor,  # [B*T, hidden]  (T = seq_len for prefill / ctx_len for decode)
-    positions: torch.Tensor,  # [B*T] int32
-    cu_seqlens: torch.Tensor,  # [B+1] int32 (used by prefill)
-    seq_len: int,
-    batch: int,
-    sliding_window: int,
-    kv_cache_dtype: torch.dtype,  # paged cache precision (bf16 or fp8)
-    phase: str,  # "prefill" or "decode"
-) -> torch.Tensor:
-    """Whole GPT-OSS attention block for either phase: qkv_proj -> RoPE + paged
-    KV write (fused) -> attention -> o_proj. Prefill: all tokens are queries,
-    flash_attn_varlen reads K/V directly. Decode: query = last token per seq,
-    pa_decode_gluon reads the cache. Activations bf16; only the decode cache may
-    be fp8 (one shared K/V scale from PRE-RoPE max -> fused stores kv/scale)."""
+def _attn_asm(
+    cfg,
+    w,
+    q,
+    k,
+    v,
+    positions,
+    cu_seqlens,
+    seq_len,
+    batch,
+    sliding_window,
+    kv_cache_dtype,
+    phase,
+):
+    """CDNA3/CDNA4 path (ATOM AiterBackend): SHUFFLE/NHD paged cache, prefill via
+    flash_attn_varlen_func, decode via pa_decode_gluon. gfx942/gfx950 only."""
     hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
     scale = hd**-0.5
     act_dtype = dtypes.bf16
     is_fp8 = kv_cache_dtype == dtypes.fp8
-    total = hidden.shape[0]
+    total = q.shape[0]
 
-    qkv = F.linear(hidden, w.qkv_w, w.qkv_b)
-    q, k, v = _qkv_split(qkv, cfg)
-
-    # Paged KV cache: decode reads it; prefill writes-then-ignores it.
     block_size = 16
     x = 16 // torch.empty(0, dtype=kv_cache_dtype).element_size()
     blocks_per_seq = (seq_len + block_size - 1) // block_size
@@ -176,7 +172,6 @@ def attention_block(
         torch.int64
     ) * block_size + (in_seq % block_size)
 
-    # Graph-safe scale: keep on device (no .item()/Python max -> no host sync).
     kv_scale = None
     if is_fp8:
         kv_scale = (
@@ -218,45 +213,160 @@ def attention_block(
             window_size=window,
             sink_ptr=w.sinks,
         )
-        o = o.view(total, nq * hd)
-    else:
-        q_dec = q.view(batch, seq_len, nq, hd)[:, -1].contiguous().view(batch, nq, hd)
-        context_lens = torch.full((batch,), seq_len, dtype=torch.int32)
-        if sliding_window > 0:
-            max_part, part_size = 1, 128
-        else:
-            max_part, part_size = get_recommended_splits(batch, nkv), 256
-        group = nq // nkv
-        inter = (batch, nkv, max_part, group)
-        exp_sums = torch.empty(inter, dtype=torch.float32)
-        max_logits = torch.empty(inter, dtype=torch.float32)
-        tmp_out = torch.empty(*inter, hd, dtype=act_dtype)
-        o = torch.empty(batch, nq, hd, dtype=act_dtype)
-        pa_decode_gluon(
-            o,
-            q_dec,
-            k_cache,
-            v_cache,
-            context_lens,
-            block_tables,
-            scale,
-            1,  # query_length
-            max_part,
-            part_size,
-            compute_type=kv_cache_dtype if is_fp8 else act_dtype,
-            query_scale=None,
-            key_scale=kv_scale,
-            value_scale=kv_scale,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            temporary_output=tmp_out,
-            alibi_slopes=None,
-            sinks=w.sinks,
-            sliding_window=sliding_window,
-            ps=True,
-        )
-        o = o.view(batch, nq * hd)
+        return o.view(total, nq * hd)
 
+    q_dec = q.view(batch, seq_len, nq, hd)[:, -1].contiguous().view(batch, nq, hd)
+    context_lens = torch.full((batch,), seq_len, dtype=torch.int32)
+    if sliding_window > 0:
+        max_part, part_size = 1, 128
+    else:
+        max_part, part_size = get_recommended_splits(batch, nkv), 256
+    group = nq // nkv
+    inter = (batch, nkv, max_part, group)
+    exp_sums = torch.empty(inter, dtype=torch.float32)
+    max_logits = torch.empty(inter, dtype=torch.float32)
+    tmp_out = torch.empty(*inter, hd, dtype=act_dtype)
+    o = torch.empty(batch, nq, hd, dtype=act_dtype)
+    pa_decode_gluon(
+        o,
+        q_dec,
+        k_cache,
+        v_cache,
+        context_lens,
+        block_tables,
+        scale,
+        1,
+        max_part,
+        part_size,
+        compute_type=kv_cache_dtype if is_fp8 else act_dtype,
+        query_scale=None,
+        key_scale=kv_scale,
+        value_scale=kv_scale,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=tmp_out,
+        alibi_slopes=None,
+        sinks=w.sinks,
+        sliding_window=sliding_window,
+        ps=True,
+    )
+    return o.view(batch, nq * hd)
+
+
+def _attn_triton(
+    cfg, w, q, k, v, positions, cu_seqlens, seq_len, batch, sliding_window
+):
+    """Portable path (ATOM TritonMHABackend / use_flash_layout): flash-layout KV
+    cache + aiter unified_attention for prefill AND decode. Runs on gfx1250 too
+    (where flash_attn_varlen / pa_decode_gluon are unsupported). bf16 only."""
+    hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
+    scale = hd**-0.5
+    total = q.shape[0]
+    # unified_attention window is (left, right) with left = sliding_window - 1.
+    window = (sliding_window - 1, 0) if sliding_window > 0 else (-1, -1)
+
+    # Flash-layout cache [num_blocks, block_size, num_kv_heads, head_dim].
+    block_size = 16
+    blocks_per_seq = (seq_len + block_size - 1) // block_size
+    num_blocks = batch * blocks_per_seq
+    k_cache = torch.zeros(num_blocks, block_size, nkv, hd, dtype=dtypes.bf16)
+    v_cache = torch.zeros(num_blocks, block_size, nkv, hd, dtype=dtypes.bf16)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32).view(
+        batch, blocks_per_seq
+    )
+    seq_ids = torch.arange(batch, dtype=torch.int64).repeat_interleave(seq_len)
+    in_seq = torch.arange(seq_len, dtype=torch.int64).repeat(batch)
+    slot_mapping = block_tables[seq_ids, in_seq // block_size].to(
+        torch.int64
+    ) * block_size + (in_seq % block_size)
+
+    q, _, _, _ = fused_qk_rope_reshape_and_cache(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        positions,
+        w.rotary_emb.cos_cache,
+        w.rotary_emb.sin_cache,
+        None,
+        None,
+        is_neox=w.rotary_emb.is_neox_style,
+        flash_layout=True,
+        apply_scale=False,
+        output_zeros=False,
+    )
+
+    context_lens = torch.full((batch,), seq_len, dtype=torch.int32)
+    ones = torch.ones((batch, nkv), dtype=torch.float32)  # bf16 -> no dequant
+    # All tokens run as queries (causal); the decode caller keeps the last per seq.
+    o = torch.empty(total, nq, hd, dtype=dtypes.bf16)
+    unified_attention(
+        q,
+        k_cache,
+        v_cache,
+        o,
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen_q=seq_len,
+        seqused_k=context_lens,
+        max_seqlen_k=seq_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=ones,
+        v_descale=ones,
+        sinks=w.sinks,
+    )
+    return o.view(total, nq * hd)
+
+
+def attention_block(
+    cfg: GptOssCfg,
+    w: BlockWeights,
+    hidden: torch.Tensor,  # [B*T, hidden]  (T = seq_len for prefill / ctx_len for decode)
+    positions: torch.Tensor,  # [B*T] int32
+    cu_seqlens: torch.Tensor,  # [B+1] int32
+    seq_len: int,
+    batch: int,
+    sliding_window: int,
+    kv_cache_dtype: torch.dtype,  # paged cache precision (bf16 or fp8)
+    phase: str,  # "prefill" or "decode"
+    backend: str,  # "asm" (gfx942/950) or "triton" (portable, incl. gfx1250)
+) -> torch.Tensor:
+    """Whole GPT-OSS attention block: qkv_proj -> RoPE + paged KV write (fused) ->
+    attention -> o_proj. Two arch backends mirror ATOM: "asm" (AiterBackend,
+    flash_attn_varlen + pa_decode_gluon, gfx942/950) and "triton" (TritonMHA /
+    use_flash_layout, unified_attention, portable incl. gfx1250). Activations bf16;
+    the asm decode cache may be fp8 (shared K/V scale from PRE-RoPE max)."""
+    qkv = F.linear(hidden, w.qkv_w, w.qkv_b)
+    q, k, v = _qkv_split(qkv, cfg)
+    if backend == "triton":
+        o = _attn_triton(
+            cfg, w, q, k, v, positions, cu_seqlens, seq_len, batch, sliding_window
+        )
+        if phase == "decode":
+            # unified_attention runs all tokens as queries; keep last per seq.
+            nq, hd = cfg.num_attention_heads, cfg.head_dim
+            o = o.view(batch, seq_len, nq * hd)[:, -1].contiguous()
+    else:
+        o = _attn_asm(
+            cfg,
+            w,
+            q,
+            k,
+            v,
+            positions,
+            cu_seqlens,
+            seq_len,
+            batch,
+            sliding_window,
+            kv_cache_dtype,
+            phase,
+        )
     return F.linear(o, w.o_w, w.o_b)
 
 
@@ -347,11 +457,11 @@ def ref_block(
 # Drivers                                                                     #
 # --------------------------------------------------------------------------- #
 def run_phase(
-    cfg, phase, kv_cache_dtype, batch, seq_len, sliding_window, hipgraph, args
+    cfg, phase, kv_cache_dtype, batch, seq_len, sliding_window, hipgraph, backend, args
 ):
     decode = phase == "decode"
-    # KV-cache precision only matters for decode; prefill reads K/V directly (bf16).
-    cache_dtype = kv_cache_dtype if decode else dtypes.bf16
+    # KV-cache precision only matters for asm decode; prefill / triton are bf16.
+    cache_dtype = kv_cache_dtype if (decode and backend == "asm") else dtypes.bf16
     w = make_weights(cfg, dtypes.bf16)
     total = batch * seq_len
     hidden = (torch.randn(total, cfg.hidden_size, dtype=torch.float32) * 0.1).to(
@@ -372,6 +482,7 @@ def run_phase(
         sliding_window,
         cache_dtype,
         phase,
+        backend,
         testGraph=hipgraph,
         num_iters=args.iters,
         num_warmup=args.warmup,
@@ -386,7 +497,7 @@ def run_phase(
         out,
         rtol=rtol,
         atol=atol,
-        msg=f"{phase[:7]:7} b{batch} t{seq_len} win{sliding_window} "
+        msg=f"{phase[:7]:7} {backend:6} b{batch} t{seq_len} win{sliding_window} "
         f"{cache_dtype} graph={hipgraph}",
     )
     return us, err
@@ -409,6 +520,14 @@ def main():
         help="override the even-layer window size",
     )
     p.add_argument("--kv-cache-dtype", default="bf16", choices=["bf16", "fp8"])
+    p.add_argument(
+        "--backend",
+        default="auto",
+        choices=["auto", "asm", "triton"],
+        help="asm = flash_attn_varlen + pa_decode_gluon (gfx942/950); "
+        "triton = unified_attention flash-layout (portable, incl. gfx1250); "
+        "auto = triton on gfx1250, else asm",
+    )
     p.add_argument(
         "--hipgraph",
         default="auto",
@@ -437,8 +556,16 @@ def main():
     args = p.parse_args()
 
     cfg = CONFIGS[args.model]
+    if args.backend == "auto":
+        backend = "triton" if aiter.get_gfx() == "gfx1250" else "asm"
+    else:
+        backend = args.backend
+    print(f"backend={backend} (gfx={aiter.get_gfx()})")
     kv_cache_dtype = dtypes.bf16 if args.kv_cache_dtype == "bf16" else dtypes.fp8
-    if kv_cache_dtype == dtypes.fp8:
+    if kv_cache_dtype == dtypes.fp8 and backend == "triton":
+        print("NOTE: triton backend is bf16-only; ignoring --kv-cache-dtype fp8.")
+        kv_cache_dtype = dtypes.bf16
+    elif kv_cache_dtype == dtypes.fp8:
         print(
             "NOTE: fp8 KV-cache affects the decode path only "
             "(activations stay bf16; prefill stays bf16)."
@@ -457,13 +584,14 @@ def main():
             sizes = args.seqlen if phase == "prefill" else args.ctx_len
             for batch, sz in itertools.product(args.batch, sizes):
                 us, err = run_phase(
-                    cfg, phase, kv_cache_dtype, batch, sz, sw, hipgraph, args
+                    cfg, phase, kv_cache_dtype, batch, sz, sw, hipgraph, backend, args
                 )
                 ok = err == 0 or (isinstance(err, float) and err < 0.02)
                 fail += 0 if ok else 1
                 rows.append(
                     {
                         "phase": phase,
+                        "backend": backend,
                         "window": sw,
                         "batch": batch,
                         "size": sz,
