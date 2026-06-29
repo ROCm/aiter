@@ -172,6 +172,10 @@ def shuffle_scale_f4(
 
     NVFP4 (intype=8): tileSizeMajor=8, tileSizeMinor=32, majorInN=True
     MXFP4 (intype=7): tileSizeMajor=4, tileSizeMinor=32, majorInN=True
+
+    poc_kl moe_shuffle_one lays each tile out as buffer[m*tileMajor + k] with
+    m (minor, the M/row dir) outer and k (major, the N/col dir) inner, i.e. the
+    destination tile order is [tileM, tileN, m, k].
     """
     tile_major = 8 if intype == 8 else 4
     tile_minor = 32
@@ -180,9 +184,33 @@ def shuffle_scale_f4(
     tiles_m = M // tile_minor
     tiles_n = N // tile_major
 
+    # src[tileM*minor + m, tileN*major + k] -> [tileM, m, tileN, k]
     out = src.view(tiles_m, tile_minor, tiles_n, tile_major)
-    out = out.permute(0, 2, 3, 1).contiguous()
+    # -> [tileM, tileN, m, k] (m outer, k inner) per moe_shuffle_one
+    out = out.permute(0, 2, 1, 3).contiguous()
     return out.view(M, N)
+
+
+def shuffle_weight_f4(src: torch.Tensor) -> torch.Tensor:
+    """gfx1250 F4GEMM weight (A/B) preshuffle matching poc_kl
+    ``moe_shuffle<uint8>(..., FP4, LAYOUT_16X16)``.
+
+    Input is packed fp4 ``[rows, K/2]`` (uint8, two nibbles per byte). For FP4 +
+    LAYOUT_16X16 poc_kl uses tileSizeMajor=16 (N/col dir) and tileSizeMinor=16
+    (M/row dir) with majorInN=True, which is a plain 16x16 tile transpose on the
+    packed byte buffer. Same layout for MXFP4 and NVFP4.
+    """
+    x_type = src.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        src = src.view(torch.uint8)
+    rows, kp = src.shape  # kp = K/2 packed bytes
+    assert rows % 16 == 0, f"rows={rows} must be divisible by 16"
+    assert kp % 16 == 0, f"packed K dim={kp} must be divisible by 16"
+    # src[tileM*16 + m, tileK*16 + k] -> [tileM, m, tileK, k]
+    out = src.view(rows // 16, 16, kp // 16, 16)
+    # -> [tileM, tileK, m, k] (tilePtr[m*16 + k]) per moe_shuffle_one
+    out = out.permute(0, 2, 1, 3).contiguous()
+    return out.view(rows, kp).view(x_type)
 
 
 def shuffle_scale(

@@ -10,7 +10,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.ops.shuffle import shuffle_weight, shuffle_scale_f4
+from aiter.ops.shuffle import shuffle_weight_f4, shuffle_scale_f4
 from aiter.utility import fp4_utils
 from aiter.test_common import checkAllclose
 
@@ -77,8 +77,8 @@ def run_one(intype: str, M: int, N: int, K: int, apre: int, kernelName: str = ""
         ref = nvfp4_ref_matmul(A, B, sA, sB, gA, gB, M, N, K).to(dtypes.bf16)
 
     # Preshuffle: B is always preshuffled; A optional per `apre`.
-    A_dev = shuffle_weight(A, layout=(16, 16)) if apre else A
-    B_dev = shuffle_weight(B, layout=(16, 16))
+    A_dev = shuffle_weight_f4(A) if apre else A
+    B_dev = shuffle_weight_f4(B)
     intype_id = 7 if is_mx else 8
     sA_dev = shuffle_scale_f4(sA, intype_id)
     sB_dev = shuffle_scale_f4(sB, intype_id)
