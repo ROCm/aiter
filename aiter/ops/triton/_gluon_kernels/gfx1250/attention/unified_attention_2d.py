@@ -9,7 +9,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 float8_info = torch.finfo(e4m3_dtype)
 
-_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.NONE)
+_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
 
 @gluon.jit
@@ -1766,10 +1766,7 @@ def load_q(
             [cfg.BLOCK_Q, LOAD_COLS],
             layout=q_smem_layout,
         )
-        q_base = (
-            cur_batch_in_all_start_index.to(gl.int64) * query_stride_0
-            + kv_head_idx * LOAD_COLS
-        )
+        q_base = cur_batch_in_all_start_index * query_stride_0 + kv_head_idx * LOAD_COLS
         q_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=query_ptr + q_base,
             shape=[cur_batch_query_len, LOAD_COLS],
@@ -1897,7 +1894,7 @@ def _unified_attention_gluon_kernel_2d(
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
-    #q_block_global_idx = gl.program_id(1)
+    # q_block_global_idx = gl.program_id(1)
     q_block_global_idx = gl.num_programs(1) - 1 - gl.program_id(1)
     # program_id(2) is 0 for a 2d grid (NUM_SPLITS==1), so this is always safe.
     split_idx = gl.program_id(2)
@@ -1979,7 +1976,7 @@ def _unified_attention_gluon_kernel_2d(
         + query_offset_1[:, None] * query_stride_1
         + offs_d[None, :]
     )
-    
+
     q = load_q(
         cfg,
         query_ptr,
