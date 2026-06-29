@@ -486,22 +486,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 if self._ar_1stage_override is not None
                 else (total_bytes <= total_bytes_limit)
             )
-            result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
-                input_,
-                res_inp_,
-                weight_,
-                eps,
-                group_size,
-                use_1stage,
-                emit_bf16=emit_bf16,
-                transpose_scale=transpose_scale,
-            )
-            if result is not None:
-                if emit_bf16:
-                    out, res_out, scale_out, bf16_out = result
-                else:
-                    out, res_out, scale_out = result
-                fused_ok = True
+            try:
+                result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
+                    input_,
+                    res_inp_,
+                    weight_,
+                    eps,
+                    group_size,
+                    use_1stage,
+                    emit_bf16=emit_bf16,
+                    transpose_scale=transpose_scale,
+                )
+                if result is not None:
+                    if emit_bf16:
+                        out, res_out, scale_out, bf16_out = result
+                    else:
+                        out, res_out, scale_out = result
+                    fused_ok = True
+            except Exception:
+                pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(
                 input_, res_inp_, weight_, eps, prefill_support
