@@ -22,6 +22,7 @@ from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from aiter.jit.utils.chip_info import get_gfx
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
+from .kernels.splitk_hgemm_4wave import iter_4wave_tile_configs
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
@@ -663,8 +664,48 @@ def get_flydsl_splitk_hgemm_kernels(
                 config["c_to_lds"],
             )
             kernels[name] = config
+
+    if None not in (m, n, k):
+        for tile_m, tile_n, tile_k, split_k in iter_4wave_tile_configs(m, n, k):
+            config = {
+                "kernel_family": KERNEL_FAMILY_HGEMM_4WAVE,
+                "stages": FIXED_STAGE,
+                "tile_m": tile_m,
+                "tile_n": tile_n,
+                "tile_k": tile_k,
+                "split_k": split_k,
+                "block_m_warps": 1,
+                "block_n_warps": 1,
+                "block_k_warps": 1,
+                "async_copy": KERNEL_ASYNC_COPY,
+                "b_to_lds": True,
+                "b_preshuffle": False,
+                "c_to_lds": False,
+                "dtype": dtype,
+                "out_dtype": out_dtype,
+                "target_gfx": get_gfx(),
+            }
+            name = flydsl_kernel_name(
+                config["stages"],
+                dtype,
+                out_dtype,
+                tile_m,
+                tile_n,
+                tile_k,
+                split_k,
+                config["block_m_warps"],
+                config["block_n_warps"],
+                config["block_k_warps"],
+                config["async_copy"],
+                config["b_to_lds"],
+                config["b_preshuffle"],
+                config["c_to_lds"],
+                kernel_family=KERNEL_FAMILY_HGEMM_4WAVE,
+            )
+            kernels[name] = config
     # NOTE: Keep the old small_m registry generation here for now, but leave it
-    # disabled so shape-aware FlyDSL catalog/tuning only enumerates generic HGEMM.
+    # disabled so shape-aware FlyDSL catalog/tuning enumerates only generic HGEMM
+    # and the 4-wave family above (not small_m).
     #
     # if m is not None and n is not None and k is not None:
     #     for config in (

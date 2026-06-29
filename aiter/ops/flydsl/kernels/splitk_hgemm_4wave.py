@@ -42,6 +42,52 @@ WARP_SIZE = 64
 DTYPE_BYTES = 2
 
 
+# Tuner search-space bounds. The kernel's own asserts (in `compile_splitk_hgemm_4wave`)
+# are the single source of truth for validity; `iter_4wave_tile_configs` just walks a
+# bounded grid and keeps the (BM, BN, BK, SPLITK) points the kernel accepts.
+FOURWAVE_TILE_M_OPTIONS = (16, 32, 64, 128)
+FOURWAVE_TILE_N_OPTIONS = (32, 64)
+FOURWAVE_TILE_K = 128
+FOURWAVE_MAX_SPLIT_K = 16
+# Persistent per-device split-K signal/semaphore buffer length; one slot is
+# needed per output tile, so configs whose tile count exceeds this are invalid.
+SIG_SEM_SLOTS = 1 << 16
+
+
+def _fourwave_tile_ok(N, K, BN, BM, BK, SPLITK):
+    if N % BN or K % SPLITK:
+        return False
+    if (K // SPLITK) % BK:
+        return False
+    NCH = BN // MFMA_N
+    if BN % MFMA_N or 4 % NCH:
+        return False
+    MGROUPS = 4 // NCH
+    if BM < MGROUPS * MFMA_M or BM % (MGROUPS * MFMA_M):
+        return False
+    if BM * BK // KOCT < 256 or (BM * BK // KOCT) % 256:
+        return False
+    if (BM * BN // 2) % 256:
+        return False
+    # Double-buffered A/B LDS tiles must fit, and the fp32 epilogue overlays s_A.
+    AS_BYTES = 2 * BM * BK * DTYPE_BYTES
+    BS_BYTES = 2 * BN * BK * DTYPE_BYTES
+    if BM * BN * 4 > AS_BYTES:
+        return False
+    return AS_BYTES + BS_BYTES <= SMEM_CAPACITY_MAP[get_rocm_arch()]
+
+
+def iter_4wave_tile_configs(M, N, K):
+    """Yield (BM, BN, BK, SPLITK) tuples the fixed-4-wave kernel accepts for (M, N, K)."""
+    for BN in FOURWAVE_TILE_N_OPTIONS:
+        for BM in FOURWAVE_TILE_M_OPTIONS:
+            if (N // BN) * ((M + BM - 1) // BM) > SIG_SEM_SLOTS:
+                continue
+            for SPLITK in range(1, FOURWAVE_MAX_SPLIT_K + 1):
+                if _fourwave_tile_ok(N, K, BN, BM, FOURWAVE_TILE_K, SPLITK):
+                    yield (BM, BN, FOURWAVE_TILE_K, SPLITK)
+
+
 def _rot021(e):
     # tile-independent 8-block XOR swizzle helper (cuh rot021).
     return ((e & 6) >> 1) | ((e & 1) << 2) | (e & 8)
@@ -445,8 +491,8 @@ def _get_4wave_sig_sem(device):
     key = (device.type, device.index)
     bufs = _SIG_SEM_CACHE.get(key)
     if bufs is None:
-        sema = torch.zeros(1 << 16, dtype=torch.int32, device=device)
-        sig = torch.zeros(1 << 16, dtype=torch.int32, device=device)
+        sema = torch.zeros(SIG_SEM_SLOTS, dtype=torch.int32, device=device)
+        sig = torch.zeros(SIG_SEM_SLOTS, dtype=torch.int32, device=device)
         _SIG_SEM_CACHE[key] = bufs = (sema, sig)
     return bufs
 
