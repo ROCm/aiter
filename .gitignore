@@ -92,3 +92,6 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
+
+# rocprof-compute outputs
+op_tests/op_benchmarks/triton/workloads/**
