@@ -142,7 +142,9 @@ def indexer_k_fp4_paged_preshuffle(k, slot_mapping, kv_cache, kv_scale, kv_block
 # ── Reference ────────────────────────────────────────────────────────
 
 
-def ref_prefill_logits(q_in, kv_in, weights, row_to_batch, ls, le, max_seq_len):
+def ref_prefill_logits(
+    q_in, kv_in, weights, row_to_batch, ls, le, max_seq_len, weight_scale=1.0
+):
     total_tokens = q_in.shape[0]
     out = torch.full(
         (total_tokens, max_seq_len), float("-inf"), device=dev, dtype=torch.float32
@@ -152,8 +154,8 @@ def ref_prefill_logits(q_in, kv_in, weights, row_to_batch, ls, le, max_seq_len):
         if e <= s:
             continue
         qk = q_in[r].float() @ kv_in[b, s:e].float().T
-        qk = torch.relu(qk) * weights[r][:, None]
-        out[r, s:e] = qk.sum(dim=0)
+        qk = torch.relu(qk) * weights[r].float()[:, None]
+        out[r, s:e] = qk.sum(dim=0) * weight_scale
     return out
 
 
@@ -236,7 +238,10 @@ def run_case(
     q_bf16 = torch.randn(
         total_tokens, heads, head_dim, dtype=torch.bfloat16, device=dev
     )
-    weights = torch.randn(total_tokens, heads, dtype=torch.float32, device=dev) * 0.1
+    weights = (
+        torch.randn(total_tokens, heads, dtype=torch.float32, device=dev) * 0.1
+    ).to(torch.bfloat16)
+    weight_scale = 1.5
     q_fp4, q_scale = quant_q_fp4_preshuffle(q_bf16)
     q_e8 = fp4_quant_e2m1_with_e8m0(q_bf16.reshape(total_tokens * heads, head_dim))[
         1
@@ -246,10 +251,10 @@ def run_case(
     )
 
     ref_fp4 = ref_prefill_logits(
-        q_dq, kv_dq, weights, row_to_batch, ls, le, max_seq_len
+        q_dq, kv_dq, weights, row_to_batch, ls, le, max_seq_len, weight_scale
     )
     ref_bf16 = ref_prefill_logits(
-        q_bf16, kv_bf16, weights, row_to_batch, ls, le, max_seq_len
+        q_bf16, kv_bf16, weights, row_to_batch, ls, le, max_seq_len, weight_scale
     )
 
     # Precompute the persistent-grid schedule once (so the bench times only the
@@ -273,6 +278,7 @@ def run_case(
             local_starts,
             local_ends,
             max_seq_len,
+            weight_scale=weight_scale,
             block_k=block_k,
             kv_block_size=kv_block_size,
             parallel_unit_num=parallel_unit_num,
@@ -398,7 +404,13 @@ def _bench_vs_atom(
                 True,
             )
             return fp8_mqa_logits(
-                q_fp8, dst_k, dst_scale, weights, cu_starts, cu_ends, clean_logits=True
+                q_fp8,
+                dst_k,
+                dst_scale,
+                weights.float(),
+                cu_starts,
+                cu_ends,
+                clean_logits=True,
             )
 
         atom_out = atom_logits()

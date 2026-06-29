@@ -239,6 +239,7 @@ def build_pa_mqa_logits_fp4_module(
         weights_ptr: fx.Tensor,
         cta_info_ptr: fx.Tensor,  # [total_ctas, 4] i32: [batch_packed, chunk_start, chunk_count, ctx_len]
         stride_out_batch: Int32,
+        weight_scale: fx.Float32,
     ):
         tid = gpu.thread_idx.x
         pid = gpu.block_idx.x
@@ -315,12 +316,13 @@ def build_pa_mqa_logits_fp4_module(
                 [qs_dws[mi // 4] >> fx.Int32(8 * (mi % 4)) for mi in range(m_tiles)]
             )
 
+        # Weights: [B*next_n, H] bf16, loaded as bf16 then widened to f32.
         W_buf = fx.rocdl.make_buffer_tensor(weights_ptr)
         w_row = fx.slice(W_buf, (batch_packed, None))
         w_tiled_mi = fx.logical_divide(w_row, fx.make_layout(MFMA_M, 1))
-        w_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
+        w_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), 16)
         w_reg_ty = fx.MemRefType.get(
-            T.f32, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
+            T.bf16, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
         )
         w_reg_lay = fx.make_layout(4, 1)
         w_per_lane = []  # w_per_lane[mi_idx] = vec<4xf32>, indexed by elem
@@ -329,7 +331,7 @@ def build_pa_mqa_logits_fp4_module(
             tile_div = fx.logical_divide(tile, fx.make_layout(4, 1))
             r = fx.memref_alloca(w_reg_ty, w_reg_lay)
             fx.copy_atom_call(w_atom, fx.slice(tile_div, (None, lane_div_16)), r)
-            w_per_lane.append(fx.memref_load_vec(r))
+            w_per_lane.append(fx.memref_load_vec(r).to(fx.Float32))
 
         # ── Step 3: prologue + N-1 prefetch loop + epilogue ──
         def _load_phys(c_i32_arg):
@@ -496,6 +498,7 @@ def build_pa_mqa_logits_fp4_module(
 
             thread_sum = _bperm_xor_add(thread_sum, 16)
             thread_sum = _bperm_xor_add(thread_sum, 32)
+            thread_sum = arith.ArithValue(thread_sum) * weight_scale
 
             oob_off = fx.Int32(-1)
             is_writer = lane_div_16 < fx.Int32(1)
@@ -676,6 +679,7 @@ def compile_pa_mqa_logits_fp4(
         w,
         cta_info_,
         stride_out: fx.Int32,
+        weight_scale: fx.Float32,
         gx: fx.Int32,
         stream: fx.Stream,
     ):
@@ -685,7 +689,7 @@ def compile_pa_mqa_logits_fp4(
         with _ir.InsertionPoint(cctx.gpu_module_body):
             alloc.finalize()
         gxi = arith.index_cast(T.index, gx.ir_value())
-        kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out).launch(
+        kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
         )
 
@@ -702,6 +706,7 @@ def flydsl_pa_mqa_logits_fp4(
     context_lens: torch.Tensor,
     max_seq_len: int,
     *,
+    weight_scale: float = 1.0,
     next_n: int = 1,
     block_k: int = 256,
     kv_block_size: int = 64,
@@ -761,6 +766,7 @@ def flydsl_pa_mqa_logits_fp4(
         weights,
         cta_info,
         out.stride(0),
+        float(weight_scale),
         total_ctas,
         stream,
     )
