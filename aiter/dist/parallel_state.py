@@ -664,17 +664,17 @@ class GroupCoordinator:
         # never lowers into the compiled graph and the model silently falls back
         # to the plain AllReduce+RMSNorm path. The emit_bf16 case returns a 4th
         # tensor and is rare/eager-only, so it stays on the direct path.
-        # if not emit_bf16:
-        #     return fused_allreduce_rmsnorm_quant_per_group_(
-        #         input_,
-        #         residual_inp_,
-        #         weight_,
-        #         eps,
-        #         group_name=self.unique_name,
-        #         group_size=group_size,
-        #         prefill_support=prefill_support,
-        #         transpose_scale=transpose_scale,
-        #     )
+        if not emit_bf16:
+            return fused_allreduce_rmsnorm_quant_per_group_(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_name=self.unique_name,
+                group_size=group_size,
+                prefill_support=prefill_support,
+                transpose_scale=transpose_scale,
+            )
         return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
             input_,
             residual_inp_,
