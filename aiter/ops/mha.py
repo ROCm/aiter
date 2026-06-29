@@ -1726,6 +1726,34 @@ def _flash_attn_forward(
             ret = ret and (sink_ptr is not None)
         return ret
 
+    def can_impl_fmha_fwd_mxfp8_asm():
+        # gfx1250 ASM MXFP8 forward (fmha_fwd_mxfp8_asm).  Dedicated path: fp8
+        # (e4m3) q/k/v with microscaling (e8m0) block-scale descale buffers.
+        # The e8m0 descale dtype is what distinguishes MXFP8 from the per-tensor
+        # fp8 path (is_fmha_v3_fp8, which uses fp32 descales on gfx942/gfx950).
+        ret = get_gfx() == "gfx1250"
+        ret = ret and (q.dtype == dtypes.fp8)
+        ret = ret and (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        )
+        ret = ret and (
+            q_descale.dtype == dtypes.fp8_e8m0
+            and k_descale.dtype == dtypes.fp8_e8m0
+            and v_descale.dtype == dtypes.fp8_e8m0
+        )
+        # Only the D128 non-causal kernel is registered in fmha_fwd_mxfp8.csv.
+        ret = ret and (hdim_q == 128)
+        ret = ret and (hdim_v == hdim_q)
+        ret = ret and (not causal)
+        ret = ret and (seqlen_k % 128 == 0)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (sink_size == 0 and sink_ptr is None)
+        ret = ret and (alibi_slopes is None and bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        return ret
+
     def can_impl_fmha_native():
         # Native hand-written HIP D64 split-K forward. gfx942-only, dense bf16, no
         # bias/alibi/swa/dropout/sink/fp8/varlen. See design doc.
@@ -1812,6 +1840,24 @@ def _flash_attn_forward(
             bool(causal),
             True,
             sink_ptr,
+            out,
+        )
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_fwd_mxfp8_asm():
+        # gfx1250 ASM MXFP8 path: fp8 q/k/v with e8m0 block-scale descales.
+        # q/k/v are bshd; the kernel reads strides directly (no API-side
+        # permute).  Output is bf16; softmax_scale is forwarded as-is.
+        out_, softmax_lse = fmha_fwd_mxfp8_asm(
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            float(softmax_scale),
+            bool(causal),
+            True,
             out,
         )
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
