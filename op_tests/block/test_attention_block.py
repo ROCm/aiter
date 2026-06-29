@@ -565,10 +565,9 @@ def run_phase(
     return us, err
 
 
-def _make_decode_cache(cfg, conc, ctx, kv_cache_dtype, backend):
+def _make_decode_cache(cfg, conc, ctx, kv_cache_dtype, backend, bs=16):
     """Allocate + random-fill a ctx-len paged KV cache for `conc` seqs (untimed)."""
     nkv, hd = cfg.num_key_value_heads, cfg.head_dim
-    bs = 16
     bps = (ctx + bs - 1) // bs
     nb = conc * bps
     bt = torch.arange(nb, dtype=torch.int32).view(conc, bps)
@@ -698,36 +697,54 @@ def _serve_decode_step(
 
 def run_sweep(cfg, backend, kv_cache_dtype, args):
     """Serving-scenario sweep: input/output = --sweep-io (default 8192/1024).
-    prefill (batch 1, latency + correctness) and a per-step decode at each
-    concurrency over a pre-filled ctx=input+output cache (latency only)."""
+    Latency-only (correctness is covered by the default grid): prefill (batch 1)
+    + per-step decode at each concurrency over a pre-filled ctx=input+output cache.
+    (The 8K prefill reference would materialize an ~[H, S, S] fp32 tensor, so the
+    sweep skips it.)"""
     inp, out_len = args.sweep_io
     ctx = inp + out_len
     win = cfg.sliding_window if args.sliding_window is None else args.sliding_window
     parities = {"even": [win], "odd": [-1], "both": [win, -1]}[args.layer_parity]
     print(f"sweep: input={inp} output={out_len} (decode ctx={ctx}) conc={args.conc}")
+    print(f"{'phase':8}{'layer':8}{'conc':>6}{'us':>10}")
+
+    def _emit(phase, layer, conc, us):
+        print(f"{phase:8}{layer:8}{conc:>6}{round(us, 1):>10}", flush=True)
+        rows.append({"phase": phase, "layer": layer, "conc": conc, "us": round(us, 1)})
+
+    w = make_weights(cfg, dtypes.bf16)
+    cache_dtype = kv_cache_dtype
     rows = []
     for sw in parities:
         tag = "swa" if sw > 0 else "causal"
-        us, err = run_phase(
-            cfg, "prefill", kv_cache_dtype, 1, inp, sw, False, backend, args
+        hidden = (torch.randn(inp, cfg.hidden_size, dtype=torch.float32) * 0.1).to(
+            dtypes.bf16
         )
-        ok = err == 0 or (isinstance(err, float) and err < 0.02)
-        rows.append(
-            {
-                "phase": "prefill",
-                "layer": tag,
-                "conc": 1,
-                "us": round(us, 1),
-                "pass": ok,
-            }
+        cu = torch.tensor([0, inp], dtype=torch.int32)
+        positions = torch.arange(inp, dtype=torch.int32)
+        _, us = run_perftest(
+            attention_block,
+            cfg,
+            w,
+            hidden,
+            positions,
+            cu,
+            inp,
+            1,
+            sw,
+            cache_dtype,
+            "prefill",
+            backend,
+            num_iters=args.iters,
+            num_warmup=args.warmup,
+            num_rotate_args=1,
         )
-    w = make_weights(cfg, dtypes.bf16)
-    cache_dtype = kv_cache_dtype
+        _emit("prefill", tag, 1, us)
     for sw in parities:
         tag = "swa" if sw > 0 else "causal"
         for conc in args.conc:
             kc, vc, bt, cl, bs = _make_decode_cache(
-                cfg, conc, ctx, cache_dtype, backend
+                cfg, conc, ctx, cache_dtype, backend, bs=args.block_size
             )
             hs = (torch.randn(conc, cfg.hidden_size, dtype=torch.float32) * 0.1).to(
                 dtypes.bf16
@@ -751,21 +768,9 @@ def run_sweep(cfg, backend, kv_cache_dtype, args):
                 num_warmup=args.warmup,
                 num_rotate_args=1,
             )
-            rows.append(
-                {
-                    "phase": "decode",
-                    "layer": tag,
-                    "conc": conc,
-                    "us": round(us, 1),
-                    "pass": "(perf)",
-                }
-            )
-    print("\n" + pd.DataFrame(rows).to_string(index=False))
-    fail = sum(1 for r in rows if r["pass"] is False)
-    if fail:
-        print(f"\n{fail} prefill check(s) FAILED")
-        sys.exit(1)
-    print("\nSweep done (decode rows are latency-only).")
+            _emit("decode", tag, conc, us)
+    print("\nSweep done (latency-only; correctness is covered by the default grid).")
+    _ = rows
 
 
 def main():
@@ -832,6 +837,12 @@ def main():
         metavar=("INPUT", "OUTPUT"),
     )
     p.add_argument("--conc", type=int, nargs="+", default=[1, 16, 64, 128, 256, 512])
+    p.add_argument(
+        "--block-size",
+        type=int,
+        default=16,
+        help="decode KV-cache page size for --sweep (serving uses 128)",
+    )
     args = p.parse_args()
 
     cfg = CONFIGS[args.model]
