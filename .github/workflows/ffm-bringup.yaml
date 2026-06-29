@@ -33,8 +33,7 @@ concurrency:
 env:
   FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
   FFM_TEST: op_tests/triton_tests/gemm/basic/test_gemm_a16w16.py
-  FFM_TEST_NODE_PATTERN: '::test_gemm_a16_w16\[(bandwidth_bound|compute_bound)-gluon-64-2880-4096\]$'
-  FFM_SHARD_COUNT: 2
+  FFM_TEST_NODE_PATTERN: '::(test_gemm_a16_w16\[(bandwidth_bound|compute_bound)-gluon-64-2880-4096\]|test_gemm_a16_w16_layout\[(bandwidth_bound|compute_bound)-gluon-(TT|NN|NT)-64-2880-4096\]|test_gemm_a16_w16_atomic\[(True|False)-64-2880-4096\])$'
 
 jobs:
   check-signal:
@@ -50,16 +49,11 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   ffm-aiter-ut:
-    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }}) / Shard ${{ matrix.shard }}
+    name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }})
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     needs: [check-signal]
     runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1]
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -122,8 +116,6 @@ jobs:
             --shm-size=16gb \
             -e FFM_TEST="${FFM_TEST}" \
             -e FFM_TEST_NODE_PATTERN="${FFM_TEST_NODE_PATTERN}" \
-            -e FFM_SHARD_INDEX="${{ matrix.shard }}" \
-            -e FFM_SHARD_COUNT="${FFM_SHARD_COUNT}" \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${FFM_IMAGE}" \
@@ -138,8 +130,6 @@ jobs:
               echo "aiter checkout: $(git rev-parse HEAD)"
               echo "FFM_TEST=${FFM_TEST}"
               echo "FFM_TEST_NODE_PATTERN=${FFM_TEST_NODE_PATTERN}"
-              echo "FFM_SHARD_INDEX=${FFM_SHARD_INDEX}"
-              echo "FFM_SHARD_COUNT=${FFM_SHARD_COUNT}"
               echo "PATH=${PATH}"
               echo "PYTHONPATH=${PYTHONPATH:-}"
 
@@ -164,17 +154,13 @@ jobs:
 
               echo "==== Select existing FFM test cases ===="
               FFM_COLLECTED="$(python3 -m pytest --collect-only -q "${FFM_TEST}")"
-              mapfile -t FFM_TEST_NODES < <(
-                grep -E "${FFM_TEST_NODE_PATTERN}" <<< "${FFM_COLLECTED}" |
-                  awk -v shard="${FFM_SHARD_INDEX}" -v shards="${FFM_SHARD_COUNT}" \
-                    "((NR - 1) % shards) == shard"
-              )
+              mapfile -t FFM_TEST_NODES < <(grep -E "${FFM_TEST_NODE_PATTERN}" <<< "${FFM_COLLECTED}" || true)
               printf "%s\n" "${FFM_TEST_NODES[@]}"
               if [ "${#FFM_TEST_NODES[@]}" -eq 0 ]; then
-                echo "::error::No FFM test nodes matched ${FFM_TEST_NODE_PATTERN} for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
+                echo "::error::No FFM test nodes matched ${FFM_TEST_NODE_PATTERN}"
                 exit 1
               fi
-              echo "Selected ${#FFM_TEST_NODES[@]} existing test node(s) for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
+              echo "Selected ${#FFM_TEST_NODES[@]} existing test node(s)"
 
               echo "==== Run selected existing FFM unit tests ===="
               python3 -m pytest -v "${FFM_TEST_NODES[@]}"
