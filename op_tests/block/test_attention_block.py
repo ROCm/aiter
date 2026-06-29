@@ -254,17 +254,31 @@ def _attn_asm(
 
 
 def _attn_triton(
-    cfg, w, q, k, v, positions, cu_seqlens, seq_len, batch, sliding_window, phase
+    cfg,
+    w,
+    q,
+    k,
+    v,
+    positions,
+    cu_seqlens,
+    seq_len,
+    batch,
+    sliding_window,
+    phase,
+    kv_cache_dtype,
 ):
     """Portable path (ATOM TritonMHABackend / use_flash_layout): flash-layout KV
     cache + aiter unified_attention for prefill AND decode. Runs on gfx1250 too
-    (where flash_attn_varlen / pa_decode_gluon are unsupported). bf16 only.
+    (where flash_attn_varlen / pa_decode_gluon are unsupported).
 
-    Decode runs a true single-token query per seq (max_seqlen_q=1) over the
-    cache populated with the full context, matching the asm decode cost."""
+    The KV cache may be fp8 (both phases read it here): the fused kernel stores
+    kv/scale as e4m3 (one shared per-tensor scale from PRE-RoPE max) and
+    unified_attention dequantizes via k_descale/v_descale. Decode runs a true
+    single-token query per seq (max_seqlen_q=1) over the full-context cache."""
     hd, nq, nkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
     scale = hd**-0.5
     total = q.shape[0]
+    is_fp8 = kv_cache_dtype == dtypes.fp8
     # unified_attention window is (left, right) with left = sliding_window - 1.
     window = (sliding_window - 1, 0) if sliding_window > 0 else (-1, -1)
 
@@ -272,8 +286,8 @@ def _attn_triton(
     block_size = 16
     blocks_per_seq = (seq_len + block_size - 1) // block_size
     num_blocks = batch * blocks_per_seq
-    k_cache = torch.zeros(num_blocks, block_size, nkv, hd, dtype=dtypes.bf16)
-    v_cache = torch.zeros(num_blocks, block_size, nkv, hd, dtype=dtypes.bf16)
+    k_cache = torch.zeros(num_blocks, block_size, nkv, hd, dtype=kv_cache_dtype)
+    v_cache = torch.zeros(num_blocks, block_size, nkv, hd, dtype=kv_cache_dtype)
     block_tables = torch.arange(num_blocks, dtype=torch.int32).view(
         batch, blocks_per_seq
     )
@@ -282,6 +296,15 @@ def _attn_triton(
     slot_mapping = block_tables[seq_ids, in_seq // block_size].to(
         torch.int64
     ) * block_size + (in_seq % block_size)
+
+    # Graph-safe shared K/V scale from PRE-RoPE max (no .item()/Python max).
+    kv_scale = None
+    if is_fp8:
+        kv_scale = (
+            (torch.maximum(k.abs().max(), v.abs().max()) / torch.finfo(dtypes.fp8).max)
+            .reshape(1)
+            .float()
+        )
 
     q, _, _, _ = fused_qk_rope_reshape_and_cache(
         q,
@@ -293,16 +316,21 @@ def _attn_triton(
         positions,
         w.rotary_emb.cos_cache,
         w.rotary_emb.sin_cache,
-        None,
-        None,
+        kv_scale,
+        kv_scale,
         is_neox=w.rotary_emb.is_neox_style,
         flash_layout=True,
-        apply_scale=False,
+        apply_scale=is_fp8,
         output_zeros=False,
     )
 
     context_lens = torch.full((batch,), seq_len, dtype=torch.int32)
-    ones = torch.ones((batch, nkv), dtype=torch.float32)  # bf16 -> no dequant
+    # descale for unified_attention: bf16 -> ones (no-op); fp8 -> shared scale.
+    if is_fp8:
+        descale = kv_scale.view(1, 1).expand(batch, nkv).contiguous()
+    else:
+        descale = torch.ones((batch, nkv), dtype=torch.float32)
+    ones = descale
     if phase == "prefill":
         o = torch.empty(total, nq, hd, dtype=dtypes.bf16)
         unified_attention(
@@ -385,6 +413,7 @@ def attention_block(
             batch,
             sliding_window,
             phase,
+            kv_cache_dtype,
         )
     else:
         o = _attn_asm(
@@ -494,8 +523,12 @@ def run_phase(
     cfg, phase, kv_cache_dtype, batch, seq_len, sliding_window, hipgraph, backend, args
 ):
     decode = phase == "decode"
-    # KV-cache precision only matters for asm decode; prefill / triton are bf16.
-    cache_dtype = kv_cache_dtype if (decode and backend == "asm") else dtypes.bf16
+    # KV-cache precision: triton reads the cache in BOTH phases (fp8 applies to
+    # both); asm prefill reads K/V directly (bf16), so fp8 affects asm decode only.
+    if backend == "triton":
+        cache_dtype = kv_cache_dtype
+    else:
+        cache_dtype = kv_cache_dtype if decode else dtypes.bf16
     w = make_weights(cfg, dtypes.bf16)
     total = batch * seq_len
     hidden = (torch.randn(total, cfg.hidden_size, dtype=torch.float32) * 0.1).to(
@@ -523,7 +556,7 @@ def run_phase(
     )
     ref = ref_block(cfg, w, hidden, cu, positions, sliding_window, cache_dtype, decode)
     # fp8 e4m3 KV adds quantization noise; relax tolerance for that path.
-    relax = decode and cache_dtype == dtypes.fp8
+    relax = cache_dtype == dtypes.fp8
     rtol = max(args.rtol, 6e-2) if relax else args.rtol
     atol = max(args.atol, 6e-2) if relax else args.atol
     err = checkAllclose(
@@ -596,14 +629,9 @@ def main():
         backend = args.backend
     print(f"backend={backend} (gfx={aiter.get_gfx()})")
     kv_cache_dtype = dtypes.bf16 if args.kv_cache_dtype == "bf16" else dtypes.fp8
-    if kv_cache_dtype == dtypes.fp8 and backend == "triton":
-        print("NOTE: triton backend is bf16-only; ignoring --kv-cache-dtype fp8.")
-        kv_cache_dtype = dtypes.bf16
-    elif kv_cache_dtype == dtypes.fp8:
-        print(
-            "NOTE: fp8 KV-cache affects the decode path only "
-            "(activations stay bf16; prefill stays bf16)."
-        )
+    if kv_cache_dtype == dtypes.fp8:
+        scope = "both phases" if backend == "triton" else "decode only (prefill bf16)"
+        print(f"NOTE: fp8 KV-cache, {backend} backend -> applies to {scope}.")
 
     win = cfg.sliding_window if args.sliding_window is None else args.sliding_window
     parities = {"even": [win], "odd": [-1], "both": [win, -1]}[args.layer_parity]
