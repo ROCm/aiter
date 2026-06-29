@@ -18,7 +18,7 @@ Pytest covers a small correctness case for each format. Direct execution
 (``python op_tests/test_flydsl_grouped_gemm_gfx1250.py``) runs a
 DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
 per-kernel bench that times gemm1 and gemm2 in isolation
-(``--scenario kernel-bench``), or a tiny correctness check
+(``--scenario kernel``), or a tiny correctness check
 (``--scenario verify``).
 """
 
@@ -688,10 +688,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--scenario",
-        choices=("bench", "verify", "kernel-bench"),
+        choices=("bench", "verify", "kernel"),
         default="bench",
         help="bench: time fused_moe end-to-end (CUDA graph). verify: eager "
-        "correctness only. kernel-bench: time the gemm1 and gemm2 kernels in "
+        "correctness only. kernel: time the gemm1 and gemm2 kernels in "
         "isolation (loop each launch alone).",
     )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
@@ -804,7 +804,7 @@ def main() -> None:
             check_aot_cache=not args.no_check_aot_cache,
             raise_on_fail=False,
             bench=args.scenario == "bench",
-            kernel_bench=args.scenario == "kernel-bench",
+            kernel_bench=args.scenario == "kernel",
             warmup=args.warmup,
             iters=args.iters,
             zero_init=args.zero_init,
