@@ -3695,7 +3695,9 @@ class FmoeTuner(TunerCommon):
             )
             profileDF = (
                 profileDF.sort_values("us")
-                .drop_duplicates(["stage", "block_m", "flat", "_is_fused"], keep="first")
+                .drop_duplicates(
+                    ["stage", "block_m", "flat", "_is_fused"], keep="first"
+                )
                 .drop(columns=["_is_fused"])
             )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
