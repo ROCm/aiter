@@ -28,6 +28,7 @@ from op_tests.flydsl_mla_reduce_common import (
     torch_ref,
     torch_ref_gather,
 )
+from aiter.ops.flydsl.kernels.mla_reduce import select_tier
 
 # DeepSeek shape: HIP MLA_REDUCE_ROUTER has a Dv=512 template, so these compare
 # against the HIP kernel directly.
@@ -269,7 +270,10 @@ def test_flydsl_mla_reduce_uniform_smoke(case):
     )
     fout.zero_()
     flse.zero_()
-    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, True)
+    run = make_runner(
+        po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, True,
+        tier=select_tier(S),
+    )
     run()
     torch.cuda.synchronize()
     if ref == "hip":
@@ -304,6 +308,26 @@ def test_flydsl_mla_reduce_cudagraph_replay(case):
         ref_out, ref_lse = torch_ref_gather(
             po, pl, indptr, fmap, pmap, H, Dv, out_dtype, M
         )
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+def test_flydsl_mla_reduce_small_split_cudagraph_replay():
+    """Uniform 32-split tiles under cudagraph replay (runtime NLSE=1 path)."""
+    _require_cuda()
+    H, Dv = _GLM_SHAPE
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    spt = [32] * 4
+    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
+        spt, H, Dv, out_dtype, M=1, gap_stride=1
+    )
+    fout.zero_()
+    flse.zero_()
+    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, True, M=1)
+    run_cudagraph_replay(run)
+    ref_out, ref_lse = torch_ref_gather(
+        po, pl, indptr, fmap, pmap, H, Dv, out_dtype, M=1
+    )
     _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 

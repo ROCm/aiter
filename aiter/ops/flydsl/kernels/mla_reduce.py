@@ -32,6 +32,7 @@ import enum
 import functools
 import math
 import os
+from contextlib import contextmanager
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -82,11 +83,19 @@ class Tier(enum.Enum):
     M64 = "m64"  # <=64 splits, 1 LSE per lane in warp0
     M256 = "m256"  # <=256 splits, up to 4 LSE per lane in warp0
     MLDS = "mlds"  # >256 splits, 4 in regs + overflow in LDS
+    ALL = "all"  # all bodies; device-side runtime branch on n_splits (production)
 
 
 # LSE registers per warp0 lane (None = LDS-backed overflow).
-_TIER_NLSE = {Tier.SIMPLE: 0, Tier.M64: 1, Tier.M256: 4, Tier.MLDS: None}
+_TIER_NLSE = {
+    Tier.SIMPLE: 0,
+    Tier.M64: 1,
+    Tier.M256: 4,
+    Tier.MLDS: None,
+    Tier.ALL: None,
+}
 LDS_MAX_SPLITS = 304  # >= MI300X CU count; compile-time LDS cap
+NLSE_MLDS = (LDS_MAX_SPLITS + WARP - 1) // WARP  # ceil(304/64) = 5
 
 # Production default (opt4 sweep: 4 ~= 6 < 8 on H=16 Dv=512 tiles=8 splits=32).
 _DEFAULT_WAVES_PER_EU = 4
@@ -98,6 +107,36 @@ def waves_per_eu_from_env(default: int = _DEFAULT_WAVES_PER_EU) -> int:
     if raw is None:
         return default
     return int(raw)
+
+
+@contextmanager
+def _if_then(if_op):
+    """SCF IfOp then-region; auto-insert scf.yield if missing."""
+    with ir.InsertionPoint(if_op.then_block):
+        try:
+            yield if_op.then_block
+        finally:
+            blk = if_op.then_block
+            if (not blk.operations) or not isinstance(
+                blk.operations[-1], scf.YieldOp
+            ):
+                scf.YieldOp([])
+
+
+@contextmanager
+def _if_else(if_op):
+    """SCF IfOp else-region; auto-insert scf.yield if missing."""
+    if getattr(if_op, "else_block", None) is None:
+        raise RuntimeError("IfOp has no else block")
+    with ir.InsertionPoint(if_op.else_block):
+        try:
+            yield if_op.else_block
+        finally:
+            blk = if_op.else_block
+            if (not blk.operations) or not isinstance(
+                blk.operations[-1], scf.YieldOp
+            ):
+                scf.YieldOp([])
 
 
 def select_tier(num_splits: int) -> Tier:
@@ -146,9 +185,10 @@ def compile_mla_reduce(
 ):
     """Compile an MLA reduce kernel for fixed (H, Dv, out_dtype, tier).
 
-    tier selects the per-work-item algorithm (compile-time); the host picks it
-    from the observed num_splits via ``select_tier``. ``persistent`` selects the
-    grid-stride launch (kn_mla_reduce_v1_ps); otherwise a 3-D grid launch.
+    tier selects the per-work-item algorithm. ``Tier.ALL`` (production) emits
+    every body and branches on device ``n_splits`` per tile (mirrors HIP).
+    Other tiers compile a single body for isolated tests. ``persistent`` selects
+    the grid-stride launch (kn_mla_reduce_v1_ps); otherwise a 3-D grid launch.
 
     disable_guards: test-only compile-time knob that skips gather/store bounds
     guards so the suite can run a pre-fix kernel in-process. The production
@@ -157,9 +197,12 @@ def compile_mla_reduce(
     assert Dv % NUM_THREADS == 0, "Dv must be divisible by 128"
     assert tier in _TIER_NLSE, f"bad tier {tier}"
     VEC = Dv // NUM_THREADS
+    is_runtime_tier = tier == Tier.ALL
     is_massive = tier != Tier.SIMPLE
     if tier == Tier.MLDS:
-        NLSE = (LDS_MAX_SPLITS + WARP - 1) // WARP
+        NLSE = NLSE_MLDS
+    elif tier == Tier.ALL:
+        NLSE = 0  # unused; runtime dispatch picks NLSE per branch
     else:
         NLSE = _TIER_NLSE[tier]
 
@@ -177,7 +220,7 @@ def compile_mla_reduce(
         )
         lse_scale_off = allocator._align(allocator.ptr, 16)
         allocator.ptr = lse_scale_off + LDS_MAX_SPLITS * 4
-        if tier == Tier.MLDS:
+        if tier in (Tier.MLDS, Tier.ALL):
             local_lse_off = allocator._align(allocator.ptr, 16)
             overflow_slots = max(0, LDS_MAX_SPLITS - 256)
             allocator.ptr = local_lse_off + overflow_slots * 4
@@ -339,6 +382,21 @@ def compile_mla_reduce(
                 zero = fx.arith.constant(0.0, type=T.f32)
                 return [in_bounds.select(v, zero) for v in loaded]
 
+            def load_split_o_raw(split_i32, local_seq):
+                """Like load_split_o but without consuming the loaded value.
+
+                Returns the raw loaded VEC scalars plus an OOB float mask
+                (1.0 in-bounds / 0.0 OOB). Deferring the bounds guard to the
+                point of use lets the prefetched load stay in flight (vmcnt(1))
+                instead of draining (vmcnt(0)) in the same loop iteration.
+                """
+                row_idx, in_bounds = gather_row(split_i32, local_seq)
+                loaded = load_o_elems(g_po, row_idx, fx.Index(head), col)
+                one = fx.arith.constant(1.0, type=T.f32)
+                zero = fx.arith.constant(0.0, type=T.f32)
+                mask = in_bounds.select(one, zero)
+                return loaded, mask
+
             def load_split_lse(split_i32, local_seq):
                 row_idx, in_bounds = gather_row(split_i32, local_seq)
                 lse = g_pl[row_idx, fx.Index(head)]
@@ -378,147 +436,216 @@ def compile_mla_reduce(
             # opt5: FlyDSL range (init=None -> scf_range without iter_args) so
             # hot_loop_scheduler can interleave the inner split-loop VMEM loads
             # with compute. Strided over the seq positions this block owns.
+            def emit_simple_body(seq_i32, local_seq):
+                o0 = load_split_o(fx.Int32(0), local_seq)
+                lse0 = load_split_lse(fx.Int32(0), local_seq)
+
+                init = [_to_raw(o0[i]) for i in fx.range_constexpr(VEC)]
+                init += [
+                    _to_raw(lse0),
+                    _to_raw(fx.arith.constant(1.0, type=T.f32)),
+                ]
+
+                results = init
+                for s, state in range(
+                    fx.Index(1), fx.Index(n_splits), fx.Index(1), init=init
+                ):
+                    regs = [state[i] for i in fx.range_constexpr(VEC)]
+                    max_lse = state[VEC]
+                    sum_e = state[VEC + 1]
+                    os = load_split_o(fx.Int32(s), local_seq)
+                    lse = load_split_lse(fx.Int32(s), local_seq)
+                    new_max = fx.arith.maximumf(max_lse, lse)
+                    old = _exp(max_lse - new_max, use_exp2)
+                    new = _exp(lse - new_max, use_exp2)
+                    new_regs = [
+                        _to_raw(regs[i] * old + os[i] * new)
+                        for i in fx.range_constexpr(VEC)
+                    ]
+                    results = yield new_regs + [
+                        _to_raw(new_max),
+                        _to_raw(sum_e * old + new),
+                    ]
+
+                regs = [results[i] for i in fx.range_constexpr(VEC)]
+                max_lse = results[VEC]
+                sum_e = results[VEC + 1]
+                inv = fx.rocdl.rcp(T.f32, sum_e)
+                out_elems = [regs[i] * inv for i in fx.range_constexpr(VEC)]
+                store_result(seq_i32, out_elems)
+                store_lse(seq_i32, max_lse, sum_e)
+
+            def emit_massive_body(seq_i32, local_seq, nlse: int):
+                """Warp0 LSE reduce -> lds_scale -> barrier -> accumulate."""
+                neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
+                is_wave0 = fx.arith.cmpi(
+                    fx.arith.CmpIPredicate.eq, wave, fx.Int32(0)
+                )
+                if_w0 = scf.IfOp(is_wave0, results_=[], has_else=False)
+                with ir.InsertionPoint(if_w0.then_block):
+                    local_lses = []
+                    max_lse = neg_inf
+                    for j in fx.range_constexpr(nlse):
+                        split_idx = lane + fx.Int32(j * WARP)
+                        in_rng = fx.arith.cmpi(
+                            fx.arith.CmpIPredicate.slt, split_idx, n_splits
+                        )
+                        safe = in_rng.select(split_idx, fx.Int32(0))
+                        lse_j = load_split_lse(safe, local_seq)
+                        lse_j = in_rng.select(lse_j, neg_inf)
+                        local_lses.append(lse_j)
+                        max_lse = fx.arith.maximumf(max_lse, lse_j)
+                    for off in [32, 16, 8, 4, 2, 1]:
+                        peer = mlir_gpu.ShuffleOp(
+                            _to_raw(max_lse),
+                            _to_raw(fx.arith.constant(off, type=T.i32)),
+                            width_i32,
+                            mode="xor",
+                        ).shuffleResult
+                        max_lse = fx.arith.maximumf(max_lse, peer)
+                    sum_e = fx.arith.constant(0.0, type=T.f32)
+                    for j in fx.range_constexpr(nlse):
+                        sum_e = sum_e + _exp(
+                            local_lses[j] - max_lse, use_exp2
+                        )
+                    for off in [32, 16, 8, 4, 2, 1]:
+                        peer = mlir_gpu.ShuffleOp(
+                            _to_raw(sum_e),
+                            _to_raw(fx.arith.constant(off, type=T.i32)),
+                            width_i32,
+                            mode="xor",
+                        ).shuffleResult
+                        sum_e = sum_e + peer
+                    bad = fx.arith.ori(
+                        fx.arith.cmpf(
+                            fx.arith.CmpFPredicate.OEQ,
+                            sum_e,
+                            fx.arith.constant(0.0, type=T.f32),
+                        ),
+                        fx.arith.cmpf(
+                            fx.arith.CmpFPredicate.UNO, sum_e, sum_e
+                        ),
+                    )
+                    inf = fx.arith.constant(float("inf"), type=T.f32)
+                    global_lse = bad.select(inf, _log(sum_e) + max_lse)
+                    for j in fx.range_constexpr(nlse):
+                        split_idx = lane + fx.Int32(j * WARP)
+                        in_rng = fx.arith.cmpi(
+                            fx.arith.CmpIPredicate.slt, split_idx, n_splits
+                        )
+                        if_s = scf.IfOp(in_rng, results_=[], has_else=False)
+                        with ir.InsertionPoint(if_s.then_block):
+                            sc = _exp(local_lses[j] - global_lse, use_exp2)
+                            lds_scale[fx.Index(split_idx)] = sc
+                            scf.YieldOp([])
+                    if fx.const_expr(output_lse):
+                        is_l0 = fx.arith.cmpi(
+                            fx.arith.CmpIPredicate.eq, lane, fx.Int32(0)
+                        )
+                        if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
+                        with ir.InsertionPoint(if_l0.then_block):
+                            lse_off = (
+                                seq_i32 * fx.Int32(H) + fx.Int32(head)
+                            )
+                            g_flse[fx.Index(lse_off)] = global_lse
+                            scf.YieldOp([])
+                    scf.YieldOp([])
+
+                fx.gpu.barrier()
+
+                # Software-pipelined accumulate: prefetch os[s+1] while FMA uses
+                # os[s]. The bounds guard is carried as a float mask and folded
+                # into the scale at point-of-use (sc * mask), so the prefetched
+                # load is NOT consumed in the iteration it is issued -- the
+                # scheduler can keep it in flight (vmcnt(1)) instead of draining
+                # (vmcnt(0)) every iteration. State = raw_os(VEC) + mask + regs(VEC).
+                os0, mask0 = load_split_o_raw(fx.Int32(0), local_seq)
+                init_os = [_to_raw(os0[i]) for i in fx.range_constexpr(VEC)]
+                init_regs = [
+                    _to_raw(fx.arith.constant(0.0, type=T.f32))
+                    for _ in fx.range_constexpr(VEC)
+                ]
+                init_state = init_os + [_to_raw(mask0)] + init_regs
+                last_s = n_splits - fx.Int32(1)
+                loop_stop = fx.arith.index_cast(T.index, _to_raw(last_s))
+                for s, state in range(
+                    fx.Index(0), loop_stop, fx.Index(1), init=init_state
+                ):
+                    os = [state[i] for i in fx.range_constexpr(VEC)]
+                    mask = state[VEC]
+                    regs = [state[VEC + 1 + i] for i in fx.range_constexpr(VEC)]
+                    s_next = fx.arith.addi(
+                        fx.arith.index_cast(T.i32, _to_raw(s)),
+                        fx.arith.constant(1, type=T.i32),
+                    )
+                    # Issue the prefetch first, then consume the previous load.
+                    os_next, mask_next = load_split_o_raw(s_next, local_seq)
+                    next_os = [_to_raw(os_next[i]) for i in fx.range_constexpr(VEC)]
+                    sc_eff = lds_scale[fx.Index(s)] * mask
+                    new_regs = [
+                        _to_raw(regs[i] + os[i] * sc_eff)
+                        for i in fx.range_constexpr(VEC)
+                    ]
+                    results = yield next_os + [_to_raw(mask_next)] + new_regs
+                os_last = [results[i] for i in fx.range_constexpr(VEC)]
+                mask_last = results[VEC]
+                regs_last = [results[VEC + 1 + i] for i in fx.range_constexpr(VEC)]
+                sc_eff_last = lds_scale[fx.Index(last_s)] * mask_last
+                if fx.const_expr(VEC == 1):
+                    out_elems = [regs_last[0] + os_last[0] * sc_eff_last]
+                else:
+                    out_elems = [
+                        regs_last[i] + os_last[i] * sc_eff_last
+                        for i in fx.range_constexpr(VEC)
+                    ]
+                store_result(seq_i32, out_elems)
+
+            def dispatch_tier_body(seq_i32, local_seq):
+                """Select algorithm from n_splits (runtime for Tier.ALL)."""
+                if fx.const_expr(is_runtime_tier):
+                    is_lt_thr = fx.arith.cmpi(
+                        fx.arith.CmpIPredicate.slt,
+                        n_splits,
+                        fx.Int32(MASSIVE_THR),
+                    )
+                    if_lt = scf.IfOp(is_lt_thr, results_=[], has_else=True)
+                    with _if_then(if_lt):
+                        emit_simple_body(seq_i32, local_seq)
+                    with _if_else(if_lt):
+                        is_le_64 = fx.arith.cmpi(
+                            fx.arith.CmpIPredicate.sle,
+                            n_splits,
+                            fx.Int32(64),
+                        )
+                        if_le64 = scf.IfOp(
+                            is_le_64, results_=[], has_else=True
+                        )
+                        with _if_then(if_le64):
+                            emit_massive_body(seq_i32, local_seq, 1)
+                        with _if_else(if_le64):
+                            is_le_256 = fx.arith.cmpi(
+                                fx.arith.CmpIPredicate.sle,
+                                n_splits,
+                                fx.Int32(256),
+                            )
+                            if_le256 = scf.IfOp(
+                                is_le_256, results_=[], has_else=True
+                            )
+                            with _if_then(if_le256):
+                                emit_massive_body(seq_i32, local_seq, 4)
+                            with _if_else(if_le256):
+                                emit_massive_body(
+                                    seq_i32, local_seq, NLSE_MLDS
+                                )
+                elif fx.const_expr(not is_massive):
+                    emit_simple_body(seq_i32, local_seq)
+                else:
+                    emit_massive_body(seq_i32, local_seq, NLSE)
+
             for seq in range(seq0, ub_seq, ntg, init=None):
                 seq_i32 = fx.Int32(seq)
                 local_seq = seq_i32 - q_start
-
-                if fx.const_expr(not is_massive):
-                    o0 = load_split_o(fx.Int32(0), local_seq)
-                    lse0 = load_split_lse(fx.Int32(0), local_seq)
-
-                    init = [_to_raw(o0[i]) for i in fx.range_constexpr(VEC)]
-                    init += [
-                        _to_raw(lse0),
-                        _to_raw(fx.arith.constant(1.0, type=T.f32)),
-                    ]
-
-                    results = init
-                    for s, state in range(
-                        fx.Index(1), fx.Index(n_splits), fx.Index(1), init=init
-                    ):
-                        regs = [state[i] for i in fx.range_constexpr(VEC)]
-                        max_lse = state[VEC]
-                        sum_e = state[VEC + 1]
-                        os = load_split_o(fx.Int32(s), local_seq)
-                        lse = load_split_lse(fx.Int32(s), local_seq)
-                        new_max = fx.arith.maximumf(max_lse, lse)
-                        old = _exp(max_lse - new_max, use_exp2)
-                        new = _exp(lse - new_max, use_exp2)
-                        new_regs = [
-                            _to_raw(regs[i] * old + os[i] * new)
-                            for i in fx.range_constexpr(VEC)
-                        ]
-                        results = yield new_regs + [
-                            _to_raw(new_max),
-                            _to_raw(sum_e * old + new),
-                        ]
-
-                    regs = [results[i] for i in fx.range_constexpr(VEC)]
-                    max_lse = results[VEC]
-                    sum_e = results[VEC + 1]
-                    inv = fx.rocdl.rcp(T.f32, sum_e)
-                    out_elems = [regs[i] * inv for i in fx.range_constexpr(VEC)]
-                    store_result(seq_i32, out_elems)
-                    store_lse(seq_i32, max_lse, sum_e)
-                else:
-                    neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
-                    is_wave0 = fx.arith.cmpi(
-                        fx.arith.CmpIPredicate.eq, wave, fx.Int32(0)
-                    )
-                    if_w0 = scf.IfOp(is_wave0, results_=[], has_else=False)
-                    with ir.InsertionPoint(if_w0.then_block):
-                        local_lses = []
-                        max_lse = neg_inf
-                        for j in fx.range_constexpr(NLSE):
-                            split_idx = lane + fx.Int32(j * WARP)
-                            in_rng = fx.arith.cmpi(
-                                fx.arith.CmpIPredicate.slt, split_idx, n_splits
-                            )
-                            safe = in_rng.select(split_idx, fx.Int32(0))
-                            lse_j = load_split_lse(safe, local_seq)
-                            lse_j = in_rng.select(lse_j, neg_inf)
-                            local_lses.append(lse_j)
-                            max_lse = fx.arith.maximumf(max_lse, lse_j)
-                        for off in [32, 16, 8, 4, 2, 1]:
-                            peer = mlir_gpu.ShuffleOp(
-                                _to_raw(max_lse),
-                                _to_raw(fx.arith.constant(off, type=T.i32)),
-                                width_i32,
-                                mode="xor",
-                            ).shuffleResult
-                            max_lse = fx.arith.maximumf(max_lse, peer)
-                        sum_e = fx.arith.constant(0.0, type=T.f32)
-                        for j in fx.range_constexpr(NLSE):
-                            sum_e = sum_e + _exp(
-                                local_lses[j] - max_lse, use_exp2
-                            )
-                        for off in [32, 16, 8, 4, 2, 1]:
-                            peer = mlir_gpu.ShuffleOp(
-                                _to_raw(sum_e),
-                                _to_raw(fx.arith.constant(off, type=T.i32)),
-                                width_i32,
-                                mode="xor",
-                            ).shuffleResult
-                            sum_e = sum_e + peer
-                        bad = fx.arith.ori(
-                            fx.arith.cmpf(
-                                fx.arith.CmpFPredicate.OEQ,
-                                sum_e,
-                                fx.arith.constant(0.0, type=T.f32),
-                            ),
-                            fx.arith.cmpf(
-                                fx.arith.CmpFPredicate.UNO, sum_e, sum_e
-                            ),
-                        )
-                        inf = fx.arith.constant(float("inf"), type=T.f32)
-                        global_lse = bad.select(inf, _log(sum_e) + max_lse)
-                        for j in fx.range_constexpr(NLSE):
-                            split_idx = lane + fx.Int32(j * WARP)
-                            in_rng = fx.arith.cmpi(
-                                fx.arith.CmpIPredicate.slt, split_idx, n_splits
-                            )
-                            if_s = scf.IfOp(in_rng, results_=[], has_else=False)
-                            with ir.InsertionPoint(if_s.then_block):
-                                sc = _exp(local_lses[j] - global_lse, use_exp2)
-                                lds_scale[fx.Index(split_idx)] = sc
-                                scf.YieldOp([])
-                        if fx.const_expr(output_lse):
-                            is_l0 = fx.arith.cmpi(
-                                fx.arith.CmpIPredicate.eq, lane, fx.Int32(0)
-                            )
-                            if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
-                            with ir.InsertionPoint(if_l0.then_block):
-                                lse_off = (
-                                    seq_i32 * fx.Int32(H) + fx.Int32(head)
-                                )
-                                g_flse[fx.Index(lse_off)] = global_lse
-                                scf.YieldOp([])
-                        scf.YieldOp([])
-
-                    fx.gpu.barrier()
-
-                    acc0 = tuple(
-                        _to_raw(fx.arith.constant(0.0, type=T.f32))
-                        for _ in fx.range_constexpr(VEC)
-                    )
-                    for s, state in range(
-                        fx.Index(0), fx.Index(n_splits), fx.Index(1), init=acc0
-                    ):
-                        regs = tuple(
-                            state[i] for i in fx.range_constexpr(VEC)
-                        )
-                        os = load_split_o(fx.Int32(s), local_seq)
-                        sc = lds_scale[fx.Index(s)]
-                        new_regs = [
-                            _to_raw(regs[i] + os[i] * sc)
-                            for i in fx.range_constexpr(VEC)
-                        ]
-                        accr = yield new_regs
-                    if fx.const_expr(VEC == 1):
-                        out_elems = [accr]
-                    else:
-                        out_elems = [accr[i] for i in fx.range_constexpr(VEC)]
-                    store_result(seq_i32, out_elems)
+                dispatch_tier_body(seq_i32, local_seq)
 
         if fx.const_expr(persistent):
             # Grid-stride persistent launch (kn_mla_reduce_v1_ps, reduce.cu:669).

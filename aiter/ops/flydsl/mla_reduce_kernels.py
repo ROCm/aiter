@@ -7,9 +7,8 @@ Drop-in fallback for the HIP ``aiter.mla_reduce_v1`` (csrc/kernels/mla/reduce.cu
 Same signature, same input/output contract, so production paths can swap it in.
 
 The FlyDSL kernel is compiled per (H, Dv, out_dtype, tier, output_lse) and cached
-(``compile_mla_reduce`` is ``lru_cache``-backed). The host picks the split-tier
-from the observed ``num_splits`` (``select_tier``) and launches one workgroup per
-``(head, tile)`` work item.
+(``compile_mla_reduce`` is ``lru_cache``-backed). Production uses ``Tier.ALL``:
+one kernel with device-side runtime tier selection per tile (mirrors HIP).
 
 This is an OPT-IN fallback. Production code (``aiter/mla.py``) keeps calling the
 HIP ``aiter.mla_reduce_v1`` by default; set ``AITER_MLA_REDUCE_FLYDSL=1`` to route
@@ -21,8 +20,8 @@ from __future__ import annotations
 import torch
 
 from .kernels.mla_reduce import (
+    Tier,
     compile_mla_reduce,
-    select_tier,
     should_use_persistent_launch,
     waves_per_eu_from_env,
 )
@@ -88,15 +87,6 @@ def flydsl_mla_reduce_v1(
         final_output.device.index
     ).multi_processor_count
 
-    # Tier from the worst-case split count across all tiles. The kernel picks its
-    # algorithm at compile time (one tier for the whole launch), while the HIP
-    # kernel dispatches per tile from `n_splits = indptr[tile+1] - indptr[tile]`.
-    # Real decode metadata has variable per-tile splits, so taking only tile 0
-    # (indptr[1] - indptr[0]) can under-size the tier (e.g. m256 when another tile
-    # needs the LDS-backed mlds path) and overflow. Use the max CSR row width.
-    csr = reduce_indptr[: num_reduce_tile + 1]
-    num_splits = int((csr[1:] - csr[:-1]).max().item())
-    tier = select_tier(num_splits)
     use_persistent = should_use_persistent_launch(
         H=H,
         max_seqlen_q=max_seqlen_q,
@@ -108,7 +98,7 @@ def flydsl_mla_reduce_v1(
         H=H,
         Dv=Dv,
         out_dtype=out_dtype_str,
-        tier=tier,
+        tier=Tier.ALL,
         persistent=use_persistent,
         output_lse=output_lse,
         use_reduce_final_map=use_reduce_final_map,

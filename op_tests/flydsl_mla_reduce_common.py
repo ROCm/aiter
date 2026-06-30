@@ -4,6 +4,7 @@ import torch
 import aiter
 
 from aiter.ops.flydsl.kernels.mla_reduce import (
+    Tier,
     compile_mla_reduce,
     select_tier,
     should_use_persistent_launch,
@@ -578,14 +579,22 @@ def make_runner(
     output_lse,
     M=1,
     *,
+    tier=None,
     disable_guards=False,
     num_partial_rows=None,
     num_final_rows=None,
 ):
-    """Precompile + bind args; return a zero-overhead closure for the timed loop."""
+    """Precompile + bind args; return a zero-overhead closure for the timed loop.
+
+    tier: compile-time tier override for isolated tests. None (default) uses
+    Tier.ALL (production path with device-side runtime tier selection).
+    """
     num_tiles = fmap.shape[0]
     max_splits = torch.cuda.get_device_properties(0).multi_processor_count
-    tier = select_tier(max_splits_from_indptr(indptr))
+    if tier is None:
+        compile_tier = Tier.ALL
+    else:
+        compile_tier = tier
     if num_partial_rows is None:
         num_partial_rows = int(po.size(0))
     if num_final_rows is None:
@@ -600,7 +609,7 @@ def make_runner(
         H=H,
         Dv=Dv,
         out_dtype=out_dtype_str,
-        tier=tier,
+        tier=compile_tier,
         persistent=use_persistent,
         output_lse=output_lse,
         use_reduce_final_map=True,
