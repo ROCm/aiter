@@ -63,6 +63,11 @@ def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int):
         torch.bfloat16: 2**-7,
         torch.float32: 2**-23,
     }.get(dtype, 2**-10)
+    # rtol relaxes in steps as the reduction depth K_red (= C*R*S) grows: more
+    # accumulated terms means more rounding, so the relative-error budget widens.
+    # Breakpoints (1024, 4096) and values (6e-3 / 8e-3 / 1.2e-2) are empirical —
+    # the lowest rtol that still holds across the fuzzer shape sweep at each depth.
+    # See DESIGN.md section 8 for the full numerical model.
     rtol = 6e-3 if K_red < 1024 else (8e-3 if K_red < 4096 else 1.2e-2)
     # Error model: fp16 inputs multiplied pairwise have eps relative error per product.
     # Accumulated in fp32 over K_red terms, max absolute error grows as ~eps * sqrt(K_red).
