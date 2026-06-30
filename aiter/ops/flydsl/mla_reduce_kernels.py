@@ -24,6 +24,7 @@ from .kernels.mla_reduce import (
     compile_mla_reduce,
     select_tier,
     should_use_persistent_launch,
+    waves_per_eu_from_env,
 )
 
 __all__ = [
@@ -111,6 +112,7 @@ def flydsl_mla_reduce_v1(
         persistent=use_persistent,
         output_lse=output_lse,
         use_reduce_final_map=use_reduce_final_map,
+        waves_per_eu=waves_per_eu_from_env(),
     )
 
     if final_lse is None:

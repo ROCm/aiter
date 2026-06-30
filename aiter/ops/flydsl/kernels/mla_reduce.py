@@ -31,6 +31,7 @@ Two launch modes (mirrors the HIP kernel):
 import enum
 import functools
 import math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -87,6 +88,17 @@ class Tier(enum.Enum):
 _TIER_NLSE = {Tier.SIMPLE: 0, Tier.M64: 1, Tier.M256: 4, Tier.MLDS: None}
 LDS_MAX_SPLITS = 304  # >= MI300X CU count; compile-time LDS cap
 
+# Production default (opt4 sweep: 4 ~= 6 < 8 on H=16 Dv=512 tiles=8 splits=32).
+_DEFAULT_WAVES_PER_EU = 4
+
+
+def waves_per_eu_from_env(default: int = _DEFAULT_WAVES_PER_EU) -> int:
+    """Read ``AITER_MLA_REDUCE_WAVES_PER_EU`` (sweep/tuning knob)."""
+    raw = os.environ.get("AITER_MLA_REDUCE_WAVES_PER_EU")
+    if raw is None:
+        return default
+    return int(raw)
+
 
 def select_tier(num_splits: int) -> Tier:
     if num_splits < MASSIVE_THR:
@@ -126,7 +138,7 @@ def compile_mla_reduce(
     output_lse: bool = False,
     use_reduce_final_map: bool = True,
     prefetch_depth: int = 2,
-    waves_per_eu: int = 8,
+    waves_per_eu: int = _DEFAULT_WAVES_PER_EU,
     use_exp2: bool = True,
     use_packed_cvt: bool = False,
     use_packed_f32_fma: bool = False,
@@ -581,11 +593,20 @@ def compile_mla_reduce(
         num_final_rows: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        ctx = CompilationContext.get_current()
         if fx.const_expr(is_massive):
             allocator.finalized = False
-            ctx = CompilationContext.get_current()
             with ir.InsertionPoint(ctx.gpu_module_body):
                 allocator.finalize()
+
+        # opt4: pin occupancy via rocdl.waves_per_eu on the emitted gpu.func.
+        if fx.const_expr(waves_per_eu >= 1):
+            _wpe = int(waves_per_eu)
+            for op in ctx.gpu_module_body.operations:
+                if getattr(op, "OPERATION_NAME", None) == "gpu.func":
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        T.i32, _wpe
+                    )
 
         idx_tiles = fx.arith.index_cast(T.index, num_reduce_tile)
         idx_H = fx.Index(H)

@@ -7,6 +7,7 @@ from aiter.ops.flydsl.kernels.mla_reduce import (
     compile_mla_reduce,
     select_tier,
     should_use_persistent_launch,
+    waves_per_eu_from_env,
 )
 
 
@@ -604,6 +605,7 @@ def make_runner(
         output_lse=output_lse,
         use_reduce_final_map=True,
         disable_guards=disable_guards,
+        waves_per_eu=waves_per_eu_from_env(),
     )
     head = (
         po,
