@@ -685,10 +685,12 @@ LDS base:
   ├── [0]         scores_lds [N_WAVES=4, BLOCK_H=16, ALIAS_ROW_STRIDE=17] f32 (4352 B)
   │              └── p_lds  [BLOCK_H=16, ALIAS_ROW_STRIDE=17] f32         (alias of wave 0)
   ├── [4352]    kv_lds     [BLOCK_K=16, KV_ROW_STRIDE=584]   bf16       (18688 B)
-  ├── [23040]   acc_lds    [BLOCK_H=16, ACC_ROW_STRIDE=584]  f32        (37376 B)
-  ├── [60416]   slots_lds  [BLOCK_K=16]                       i32        (64 B)
-  └── [60480]   valids_lds [BLOCK_K=16]                       i32        (64 B)
+  ├── [23040]   slots_lds  [BLOCK_K=16]                       i32        (64 B)
+  └── [23104]   valids_lds [BLOCK_K=16]                       i32        (64 B)
 ```
+
+Total LDS: **23168 bytes** (< 32 KB, enabling 2 CTAs/CU vs 1 CTA/CU at 60544 bytes).
+The output accumulator is stored in VGPR iter-args rather than `acc_lds` (see §6.5).
 
 Flat index formulas (all compile-time constants after padding).
 `kv_slot` is the KV-tile row index (0..BLOCK_K-1), equal to `lane_row` at runtime:
@@ -696,7 +698,6 @@ Flat index formulas (all compile-time constants after padding).
 scores_lds[w, head, kv_slot]  →  w * BLOCK_H * ALIAS_ROW_STRIDE + head * ALIAS_ROW_STRIDE + kv_slot
 p_lds[head, kv_slot]          →  head * ALIAS_ROW_STRIDE + kv_slot   (= scores_lds[0, head, kv_slot])
 kv_lds[kv_slot, d_col]        →  kv_slot * KV_ROW_STRIDE + d_col     (KV_ROW_STRIDE = D + 8)
-acc_lds[head, d_col]          →  head    * ACC_ROW_STRIDE + d_col     (ACC_ROW_STRIDE = D + 8)
 ```
 
 ### 6.3 Step-by-step per KV tile: QK matrix multiplication
@@ -838,7 +839,7 @@ PV step.
 | `alpha[4]` | VGPRs | each lane, 4 rescale factors |
 | P tile `[16, 17]` f32 | `p_lds` (= scores_lds base) | LDS, all waves share |
 | KV tile `[16, 584]` bf16 | `kv_lds` | LDS, all waves share |
-| Acc tile `[16, 584]` f32 | `acc_lds` | LDS, all waves share |
+| Acc `[D_CHUNKS_W=9]` × `vec<4,f32>` | VGPRs (ForOp iter-args) | each lane, 9 acc chunks |
 
 ### 6.5 PV matrix multiplication
 
@@ -880,19 +881,17 @@ This is a **transposed access pattern** — QK indexed by `(kv_slot=lane_row, d=
 PV indexes by `(kv_slot=lane_cgrp*4..+3, d=lane_row)` — which is why the KV tile must
 live in LDS rather than VGPR registers: VGPR data cannot be shared across lanes.
 
-**C-frag (acc_lds read, rescale, MFMA, write back):**
+**C-frag (VGPR iter-arg, rescale, MFMA):**
 ```
-acc_flat   = (lane_cgrp*4 + v) * ACC_ROW_STRIDE + d_col
-acc_frag[v] = acc_lds[acc_flat]                      # read old accumulator
+acc_frag = acc_i[dc]                        # VGPR iter-arg from previous tile
 
 # Rescale with per-head alpha (online softmax correction)
-acc_frag[v] *= alpha[v]
+acc_frag_scaled[v] = acc_frag[v] * alpha[v]
 
 # PV MFMA: acc += P @ KV for this D-chunk
-new_acc_frag = mfma_f32_16x16x16_bf16(a_frag, b_frag, acc_frag)
+new_acc_frag = mfma_f32_16x16x16_bf16(a_frag, b_frag, acc_frag_scaled)
 
-# Write updated accumulator back
-acc_lds[acc_flat] = new_acc_frag[v]
+new_acc.append(new_acc_frag)                # collected; yielded as iter-arg at tile end
 ```
 
 The `alpha[v] = exp2(m_old[v] - m_new[v])` rescale is applied before the MFMA. This
@@ -900,32 +899,36 @@ implements the online-softmax update `acc_new = alpha * acc_old + p * V` in a si
 MFMA call: after multiplying `acc_old` by `alpha`, the MFMA adds `p * V` (via the
 `P @ KV` product contribution) to it.
 
-A third `gpu.barrier()` after the PV loop ensures `acc_lds` writes are visible before
-the next tile overwrites `scores_lds`.
+No barrier is needed after the PV loop — the accumulator lives in VGPRs, so there is
+no LDS writeback to make visible.
 
-#### Why acc_lds and not VGPRs
+#### Why VGPRs work for acc
 
-The `acc_lds` region holds `BLOCK_H × D = 16 × 576 = 9216` f32 values. Storing this
-in VGPRs would require 9216 × 4 bytes / (256 threads × 4 bytes/VGPR) = 36 VGPRs per
-thread just for the accumulator — on top of the Q and KV data already in registers.
-With total VGPR budget ≈ 128–256 per thread at typical occupancy, LDS is the better
-tradeoff. The padded LDS row strides (`ACC_ROW_STRIDE = D + 8`) keep the bank conflict
-rate low despite the frequent cross-row reads.
+Each lane holds `D_CHUNKS_W = 9` acc fragments of type `vec<4, f32>`. That is
+`9 × 4 × 4 = 144` bytes = **36 VGPRs** per lane — well within the 512-VGPR budget on
+gfx942. With 4 waves × 64 lanes = 256 threads per CTA, each wave's share is 36 VGPRs
+for acc, leaving ample room for Q/KV loads, softmax scalars, and loop temporaries.
+
+Eliminating `acc_lds` saves `BLOCK_H × (D+8) × 4 = 16 × 584 × 4 = 37376` bytes of
+LDS, reducing total LDS from 60544 → **23168 bytes** and enabling 2 CTAs/CU instead
+of 1, which is the primary source of the occupancy and performance improvement.
 
 ### 6.6 ForOp structure and loop-carried state
 
-The KV tile loop is an `scf.ForOp` from `tile_start` to `tile_end`. Only the online
-softmax scalars are loop-carried as ForOp iter-args — `acc_lds` lives outside the
-ForOp and is updated in-place.
+The KV tile loop is an `scf.ForOp` from `tile_start` to `tile_end`. Both the online
+softmax scalars and the output accumulator are loop-carried as ForOp iter-args.
 
 ```
-ForOp iter-args: [m_i[0], m_i[1], m_i[2], m_i[3],
-                  l_i[0], l_i[1], l_i[2], l_i[3]]   # 8 f32 per lane
+ForOp iter-args: [m_i[0], m_i[1], m_i[2], m_i[3],       # 4 f32: running max per head
+                  l_i[0], l_i[1], l_i[2], l_i[3],        # 4 f32: running sum per head
+                  acc_dc0, acc_dc1, ..., acc_dc8]          # 9 × vec<4,f32>: accumulator per D-chunk
+                                                           # 44 iter-args total
 ```
 
 Each lane holds 4 `(m_i, l_i)` pairs — one per head it serves
-(`head = h_base + lane_cgrp*4 + v`). These are VGPRs visible only within one lane;
-cross-lane communication uses the butterfly reduction and LDS as described in §6.4.
+(`head = h_base + lane_cgrp*4 + v`). The 9 accumulator fragments `acc_dc[i]` are
+`vec<4, f32>` — each holds 4 f32 output values for the 4 heads owned by this lane at
+D-chunk `i`. Cross-lane communication uses the butterfly reduction and LDS as described in §6.4.
 
 #### Initialization
 
@@ -936,7 +939,7 @@ for v in 0..3:
     sink_v = attn_sink[h_v]                     # per-head learnable log-weight
     m_i[v] = sink_v * log2(e)                   # virtual token with weight 1
     l_i[v] = 1.0                                # exp2(sink - m_i) = 1
-    acc_lds[head=lane_cgrp*4+v, :] = 0.0        # zero accumulator
+acc_dc[0..8] = vec<4,f32>(0.0)                  # zero accumulator in VGPRs
 ```
 
 The sink initialisation absorbs it as if it were the first KV token (score =
@@ -947,7 +950,7 @@ maximum, so the sink's weight naturally enters the softmax denominator.
 ```
 m_i[v] = -inf     # no prior max
 l_i[v] = 0.0      # no prior mass
-acc_lds[:, :] = 0.0
+acc_dc[0..8] = vec<4,f32>(0.0)
 ```
 
 #### Termination
@@ -959,8 +962,8 @@ After the ForOp: `m_final[4]`, `l_final[4]` from the last iteration's iter-args.
 for v in 0..3:
     h_v = h_base + lane_cgrp*4 + v
     for dc in 0..D_CHUNKS_W:
-        d_col = d_wave_base + dc*16 + lane_row
-        acc_val = acc_lds[head=lane_cgrp*4+v, d_col]
+        d_col   = d_wave_base + dc*16 + lane_row
+        acc_val = vector.extract(acc_final[dc], v)    # from VGPR iter-arg
         out_val = bf16(acc_val / max(l_final[v], 1e-30))
         out[t, h_v, d_col] = out_val   (if h_v < H)
 ```
@@ -968,14 +971,14 @@ for v in 0..3:
 **`KV_SPLITS > 1` — partial emit:**
 ```python
 for v in 0..3:
-    h_v   = h_base + lane_cgrp*4 + v
+    h_v     = h_base + lane_cgrp*4 + v
     ml_flat = t * KV_SPLITS * H + pid_k * H + h_v
     if lane_row == 0:                           # one lane writes the scalar stats
         m_partial[ml_flat] = m_final[v]
         l_partial[ml_flat] = l_final[v]
     for dc in 0..D_CHUNKS_W:
-        d_col = d_wave_base + dc*16 + lane_row
-        acc_val = acc_lds[head=lane_cgrp*4+v, d_col]
+        d_col   = d_wave_base + dc*16 + lane_row
+        acc_val = vector.extract(acc_final[dc], v)    # from VGPR iter-arg
         acc_partial[ml_flat * D + d_col] = acc_val
 ```
 
