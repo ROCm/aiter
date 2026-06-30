@@ -2,16 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """FlyDSL implementation of the sparse paged-decode attention kernel for gfx942.
 
-Ports _pa_decode_sparse from Triton (aiter/ops/triton/_triton_kernels/attention/
-pa_decode_sparse.py) to FlyDSL. Both KV_SPLITS==1 (direct output) and KV_SPLITS>1
-(partial emit + Triton reduce) paths are implemented.
-
-Thread layout
--------------
-BLOCK_THREADS = 64 (one wave). Each thread owns VEC = D // 64 contiguous elements of
-the head dimension (e.g. VEC=9 for D=576). All 64 threads together cover all D
-elements. The online-softmax accumulator (D fp32 values) lives in LDS; only the
-running (m_i, l_i) scalars are carried as scf.ForOp iter-args.
+Both KV_SPLITS==1 (direct output) and KV_SPLITS>1 paths are implemented.
+The reduce part is not yet implemented (Triton kernel exist for this).
 
 KV_SPLITS > 1
 -------------
@@ -49,22 +41,12 @@ from .tensor_shim import STensor, _to_raw
 # Constants
 # ---------------------------------------------------------------------------
 
-BLOCK_THREADS = 64   # one wave64
+WAVE_SIZE = 64
 _LOG2E = 1.4426950408889634
 _NEG_INF = float("-inf")
 
 # ---------------------------------------------------------------------------
-# LDS pointer helper (addr-space 3 = LDS on AMDGPU)
-# ---------------------------------------------------------------------------
-
-def _make_lds_ptr(byte_addr_i64):
-    """Convert an i64 LDS byte address to !llvm.ptr<3> (LDS pointer)."""
-    lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-    return mlir_llvm.IntToPtrOp(lds_ptr_type, byte_addr_i64).result
-
-
-# ---------------------------------------------------------------------------
-# Helper: IfOp then-block context manager (mirrors fused_compress_attn.py)
+# Helper: IfOp then-block context manager
 # ---------------------------------------------------------------------------
 
 @contextmanager
@@ -78,564 +60,74 @@ def _if_then(if_op):
             if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
                 scf.YieldOp([])
 
-
 # ---------------------------------------------------------------------------
-# Kernel factory
-# ---------------------------------------------------------------------------
-
-@functools.lru_cache(maxsize=256)
-def _compile_pa_decode_sparse(
-    *,
-    H: int,
-    D: int,
-    BLOCK_K: int,
-    KV_SPLITS: int,
-    softmax_scale: float,
-):
-    """JIT-compile the FlyDSL kernel for the given constexpr configuration.
-
-    Returns a flyc.jit launcher function that can be called with torch tensors.
-    Cached on (H, D, BLOCK_K, KV_SPLITS, softmax_scale) — first call compiles,
-    subsequent calls reuse.
-    """
-    assert D % BLOCK_THREADS == 0, f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
-    VEC = D // BLOCK_THREADS   # elements per thread (9 for D=576)
-
-    fm = arith.FastMathFlags.fast
-
-    # ---- LDS allocation ----
-    # Region 0: acc accumulator — D fp32 = D*4 bytes
-    # Region 1: KV staging      — BLOCK_K rows, row-major.
-    # Region 2: scores          — BLOCK_K fp32 (written by all threads, same value)
-    # Region 3: p_vals          — BLOCK_K fp32 (written by all threads, same value)
-    # Region 4: slots           — BLOCK_K i32 (written by thread 0, read by all)
-    # Region 5: valids          — BLOCK_K i32 (written by thread 0, read by all)
-    #
-    # buffer_load_to_lds uses size_bytes=4 (one dword per lane per call).
-    # 64 lanes × 4 bytes = 256 bytes per call.  To preserve row-major layout,
-    # the row stride must be a multiple of 256 bytes.
-    # Row size (unpadded): D × sizeof(bf16) = D*2 bytes.
-    # Padded row size:     ceil(D*2 / 256) × 256 bytes.
-    _ROW_BYTES_RAW    = D * 2                         # bf16 row in bytes
-    _N_DMA_CALLS      = (_ROW_BYTES_RAW + 255) // 256 # calls needed per row
-    _ROW_BYTES_PADDED = _N_DMA_CALLS * 256            # padded to multiple of 256
-    # Number of bf16 elements per padded row (may include padding elements at end)
-    _ROW_ELEMS_PADDED = _ROW_BYTES_PADDED // 2
-
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None,
-        arch=GPU_ARCH,
-        global_sym_name=f"pa_decode_sparse_smem_D{D}_K{BLOCK_K}_S{KV_SPLITS}",
-    )
-    lds_acc_off   = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_acc_off + D * 4                          # D × sizeof(fp32)
-    lds_kv_off    = allocator._align(allocator.ptr, 256)         # 256-byte align for DMA
-    allocator.ptr = lds_kv_off + BLOCK_K * _ROW_BYTES_PADDED     # BLOCK_K padded rows
-    lds_scores_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr  = lds_scores_off + BLOCK_K * 4               # BLOCK_K × sizeof(f32)
-    lds_pvals_off  = allocator._align(allocator.ptr, 16)
-    allocator.ptr  = lds_pvals_off + BLOCK_K * 4                # BLOCK_K × sizeof(f32)
-    lds_slots_off  = allocator._align(allocator.ptr, 16)
-    allocator.ptr  = lds_slots_off + BLOCK_K * 4                # BLOCK_K × sizeof(i32)
-    lds_valids_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr  = lds_valids_off + BLOCK_K * 4               # BLOCK_K × sizeof(i32)
-
-    # ---- Helpers (defined outside @flyc.kernel so they capture constants) ----
-
-    def _fexp2(x):
-        """exp2(x) via llvm.amdgcn.exp2.f32."""
-        return mlir_llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [x], [], [])
-
-    def _wave_reduce_add(x):
-        """Butterfly reduce-add across the 64-lane wave."""
-        w = _to_raw(x)
-        # 6 rounds: halves = 32, 16, 8, 4, 2, 1
-        for sh in range_constexpr(6):
-            half = 32 >> sh   # 32, 16, 8, 4, 2, 1
-            peer = _to_raw(ArithValue(w).shuffle_xor(half, BLOCK_THREADS))
-            w = arith.AddFOp(w, peer, fastmath=fm).result
-        return w
-
-    def _lds_ptr_i64(byte_addr_i32):
-        """Extend i32 LDS byte address to i64, return !llvm.ptr<3>."""
-        addr_i64 = arith.extui(T.i64, byte_addr_i32)
-        return _make_lds_ptr(addr_i64)
-
-    # ---- Kernel name ----
-    _kname = f"pa_decode_sparse_H{H}_D{D}_K{BLOCK_K}_S{KV_SPLITS}_flydsl"
-
-    @flyc.kernel(name=_kname, known_block_size=[BLOCK_THREADS, 1, 1])
-    def _kernel(
-        q:           fx.Tensor,   # [T, H, D]            bf16
-        unified_kv:  fx.Tensor,   # [total_pages, D]     bf16
-        kv_indices:  fx.Tensor,   # [total_indices]      i32
-        kv_indptr:   fx.Tensor,   # [T+1]                i32
-        attn_sink:   fx.Tensor,   # [H]                  f32
-        m_partial:   fx.Tensor,   # [T, KV_SPLITS, H]    f32  (dummy when KV_SPLITS==1)
-        l_partial:   fx.Tensor,   # [T, KV_SPLITS, H]    f32
-        acc_partial: fx.Tensor,   # [T, KV_SPLITS, H, D] f32
-        out:         fx.Tensor,   # [T, H, D]            bf16
-    ):
-        f32 = T.f32
-        i32 = T.i32
-
-        c_zero     = arith.constant(0.0, type=f32)
-        c_one      = arith.constant(1.0, type=f32)
-        c_neg_inf  = arith.constant(_NEG_INF, type=f32)
-        c_eps      = arith.constant(1e-30, type=f32)
-        c_log2e    = arith.constant(_LOG2E, type=f32)
-        c_scale_l2 = arith.constant(softmax_scale * _LOG2E, type=f32)
-
-        c0_i32 = arith.constant(0, type=i32)
-        c1_i32 = arith.constant(1, type=i32)
-        c2_i32 = arith.constant(2, type=i32)
-
-        cH_i32   = arith.constant(H, type=i32)
-        cD_i32   = arith.constant(D, type=i32)
-        cHD_i32  = arith.constant(H * D, type=i32)
-        cKVS_i32 = arith.constant(KV_SPLITS, type=i32)
-        cBLK_i32 = arith.constant(BLOCK_K, type=i32)
-        cVEC_i32 = arith.constant(VEC, type=i32)
-        cKH_i32  = arith.constant(KV_SPLITS * H, type=i32)
-
-        # block_idx / thread_idx return `index` type; cast to i32 for arithmetic.
-        t     = arith.index_cast(i32, _to_raw(fx.block_idx.x))   # token index
-        h     = arith.index_cast(i32, _to_raw(fx.block_idx.y))   # head index
-        pid_k = arith.index_cast(i32, _to_raw(fx.block_idx.z))   # KV-split index
-        tid   = arith.index_cast(i32, _to_raw(fx.thread_idx.x))  # 0..63
-
-        # ---- 1. kv_indptr: read kv_start and kv_end ----
-        indptr_rsrc = buffer_ops.create_buffer_resource(kv_indptr, max_size=True)
-        kv_start_v  = buffer_ops.buffer_load(indptr_rsrc, t, vec_width=1, dtype=i32)
-        kv_end_v    = buffer_ops.buffer_load(
-            indptr_rsrc, ArithValue(t) + c1_i32, vec_width=1, dtype=i32
-        )
-        kv_start = rocdl.readfirstlane(i32, kv_start_v)
-        kv_end   = rocdl.readfirstlane(i32, kv_end_v)
-        kv_len   = arith.subi(kv_end, kv_start)
-
-        # ---- 2. Compute tile range for this KV-split ----
-        tiles_per_seg = arith.ceildivsi(kv_len, arith.muli(cKVS_i32, cBLK_i32))
-        tile_start    = arith.muli(pid_k, tiles_per_seg)
-        num_tiles     = arith.ceildivsi(kv_len, cBLK_i32)
-        tile_end_raw  = arith.muli(arith.addi(pid_k, c1_i32), tiles_per_seg)
-        tile_end      = arith.minsi(tile_end_raw, num_tiles)
-
-        # ---- 3. Early-exit: nothing to do for this split ----
-        has_work = arith.cmpi(CmpIPredicate.slt, tile_start, tile_end)
-        _if_work = scf.IfOp(_to_raw(has_work), results_=[], has_else=False)
-        with _if_then(_if_work):
-
-            # ---- 4. Per-thread column range: [tid*VEC, tid*VEC+VEC) ----
-            tid_x_vec = arith.muli(tid, cVEC_i32)
-
-            # ---- 5. Load Q row: q[t, h, tid*VEC : tid*VEC+VEC] ----
-            # Q is bf16; load as packed i32 dwords (2 bf16 per dword).
-            # q_base is the flat element index of the first bf16 for this thread.
-            q_rsrc = buffer_ops.create_buffer_resource(q, max_size=True)
-            q_base = arith.addi(
-                arith.muli(t, cHD_i32),
-                arith.addi(arith.muli(h, cD_i32), tid_x_vec),
-            )
-            # Load VEC bf16 scalars, convert to fp32, scale by softmax_scale * LOG2E.
-            # Since tid*VEC is always even (VEC=9 is odd → first element of each thread
-            # may land on an odd bf16 index for some threads), handle per-element.
-            q_lane = []
-            for v in range_constexpr(VEC):
-                off_bf16 = arith.addi(q_base, arith.constant(v, type=i32))
-                # Dword index: floor(off_bf16 / 2); which half: off_bf16 % 2
-                off_dw = arith.divsi(off_bf16, c2_i32)
-                odd    = arith.remsi(off_bf16, c2_i32)
-                dw_v   = buffer_ops.buffer_load(q_rsrc, off_dw, vec_width=1, dtype=i32)
-                pair   = vector.bitcast(
-                    T.vec(2, T.bf16),
-                    vector.from_elements(T.vec(1, T.i32), [dw_v])
-                )
-                lo = vector.extract(pair, static_position=[0], dynamic_position=[])
-                hi = vector.extract(pair, static_position=[1], dynamic_position=[])
-                is_odd   = arith.cmpi(CmpIPredicate.eq, odd, c1_i32)
-                q_bf16   = arith.select(is_odd, hi, lo)
-                q_f32    = arith.extf(f32, q_bf16)
-                q_lane.append(arith.mulf(q_f32, c_scale_l2, fastmath=fm))
-
-            # ---- 6. Init m_i and l_i ----
-            # KV_SPLITS is a Python compile-time constant (captured from factory closure).
-            # The branch is resolved at kernel-factory time, so both paths are fine.
-            # We pre-assign defaults to satisfy Python name analysis inside @flyc.kernel.
-            m_init = c_neg_inf
-            l_init = c_zero
-            if KV_SPLITS == 1:
-                # Fold attention sink as the virtual initial key (weight=1, value=0).
-                # m_i = sink * LOG2E,  l_i = exp2(sink - m_i) = 1.0
-                sink_rsrc = buffer_ops.create_buffer_resource(attn_sink, max_size=True)
-                sink_v    = buffer_ops.buffer_load(sink_rsrc, h, vec_width=1, dtype=f32)
-                sink_s    = rocdl.readfirstlane(f32, sink_v)
-                m_init    = arith.mulf(sink_s, c_log2e, fastmath=fm)
-                l_init    = c_one
-
-            # ---- 7. Init LDS regions ----
-            lds_base = allocator.get_base()
-            # Acc accumulator: D fp32 values.
-            lds_acc  = STensor(
-                SmemPtr(lds_base, lds_acc_off, T.f32, shape=(D,)),
-                dtype=T.f32,
-                shape=(D,),
-            )
-            # KV staging: BLOCK_K rows, each _ROW_ELEMS_PADDED bf16 elements wide.
-            # Layout: element (j, e) at flat index j*_ROW_ELEMS_PADDED + e.
-            lds_kv = STensor(
-                SmemPtr(lds_base, lds_kv_off, T.bf16,
-                        shape=(BLOCK_K * _ROW_ELEMS_PADDED,)),
-                dtype=T.bf16,
-                shape=(BLOCK_K * _ROW_ELEMS_PADDED,),
-            )
-            # LDS-resident scores, p_vals, slots, valids — eliminates VGPR pressure
-            # from holding BLOCK_K simultaneously-live values throughout the tile loop.
-            lds_scores = STensor(
-                SmemPtr(lds_base, lds_scores_off, T.f32, shape=(BLOCK_K,)),
-                dtype=T.f32,
-                shape=(BLOCK_K,),
-            )
-            lds_pvals = STensor(
-                SmemPtr(lds_base, lds_pvals_off, T.f32, shape=(BLOCK_K,)),
-                dtype=T.f32,
-                shape=(BLOCK_K,),
-            )
-            lds_slots = STensor(
-                SmemPtr(lds_base, lds_slots_off, T.i32, shape=(BLOCK_K,)),
-                dtype=T.i32,
-                shape=(BLOCK_K,),
-            )
-            lds_valids = STensor(
-                SmemPtr(lds_base, lds_valids_off, T.i32, shape=(BLOCK_K,)),
-                dtype=T.i32,
-                shape=(BLOCK_K,),
-            )
-            for v in range_constexpr(VEC):
-                idx = arith.addi(tid_x_vec, arith.constant(v, type=i32))
-                lds_acc[fx.Index(idx)] = c_zero
-
-            # Barrier: ensure all threads finish zeroing before the tile loop.
-            gpu.barrier()
-
-            # ---- 8. Buffer resources for kv_indices and unified_kv ----
-            idx_rsrc = buffer_ops.create_buffer_resource(kv_indices, max_size=True)
-            kv_rsrc  = buffer_ops.create_buffer_resource(unified_kv,  max_size=True)
-
-            # Per-thread voffset contribution for DMA calls:
-            #   tid * 4 bytes (each thread loads one dword per call)
-            tid_dw_off = arith.muli(tid, arith.constant(4, type=i32))
-
-            # ---- 9. KV tile loop ----
-            # Carries (m_i, l_i) as ForOp iter-args; acc lives in LDS.
-            for tile_idx, loop_state in range(
-                _to_raw(tile_start), _to_raw(tile_end), 1,
-                init=[m_init, l_init],
-            ):
-                m_i = loop_state[0]
-                l_i = loop_state[1]
-
-                # Loop induction variable tile_idx is index type; cast to i32.
-                tile_i32    = arith.index_cast(i32, _to_raw(tile_idx))
-                k_tile_base = arith.muli(tile_i32, cBLK_i32)
-
-                # -- 9a. Thread 0 loads BLOCK_K slot indices into LDS ----
-                # All threads read the same index values, so only thread 0 loads
-                # and writes to lds_slots/lds_valids, eliminating 16 readfirstlane
-                # calls (major SALU reduction).
-                kv_end_m1 = arith.subi(arith.addi(kv_start, kv_len), c1_i32)
-                is_t0 = arith.cmpi(CmpIPredicate.eq, tid, c0_i32)
-                _if_load_slots = scf.IfOp(_to_raw(is_t0), results_=[], has_else=False)
-                with _if_then(_if_load_slots):
-                    for j in range_constexpr(BLOCK_K):
-                        raw_pos = arith.addi(kv_start,
-                                             arith.addi(k_tile_base,
-                                                        arith.constant(j, type=i32)))
-                        in_rng  = arith.cmpi(CmpIPredicate.slt, raw_pos,
-                                              arith.addi(kv_start, kv_len))
-                        pos     = arith.minsi(raw_pos, kv_end_m1)
-                        slot_v  = buffer_ops.buffer_load(idx_rsrc, pos, vec_width=1, dtype=i32)
-                        slot    = arith.select(in_rng, slot_v,
-                                               arith.constant(-1, type=i32))
-                        valid_i32 = arith.select(in_rng, c1_i32, c0_i32)
-                        j_idx = arith.constant(j, type=i32)
-                        lds_slots[fx.Index(j_idx)]  = slot
-                        lds_valids[fx.Index(j_idx)] = valid_i32
-
-                # Barrier: thread 0 slot writes visible to all threads before DMA.
-                gpu.barrier()
-
-                # -- 9b. Load BLOCK_K KV rows into LDS via buffer_load_to_lds --
-                #
-                # All threads read slot from LDS (no readfirstlane needed).
-                # buffer_load_to_lds with size_bytes=4 (one dword per lane per call):
-                #   64 lanes × 4 bytes = 256 bytes loaded per call.
-                #   Each lane i loads VRAM[row_base + tid*4 + n*256] into
-                #   LDS[lds_row_base + i*4 + n*256].
-                #   → row-major layout preserved in LDS.
-                for j in range_constexpr(BLOCK_K):
-                    j_idx       = arith.constant(j, type=i32)
-                    slot_j      = lds_slots[fx.Index(j_idx)]
-                    safe_slot_j = arith.maxsi(slot_j, c0_i32)
-                    # VRAM byte base for this row: safe_slot_j * D * 2 + tid*4
-                    vram_row_base = arith.muli(
-                        safe_slot_j, arith.constant(D * 2, type=i32)
-                    )
-                    vram_voff = arith.addi(vram_row_base, tid_dw_off)
-                    # LDS base for row j (static, byte address)
-                    lds_row_base_byte = arith.constant(
-                        lds_kv_off + j * _ROW_BYTES_PADDED, type=i32
-                    )
-                    lds_ptr = _lds_ptr_i64(lds_row_base_byte)
-                    for n in range_constexpr(_N_DMA_CALLS):
-                        # Compute how many threads have a valid VRAM dword in chunk n.
-                        # Chunk n covers VRAM bytes [n*256, n*256+256); valid range is
-                        # [n*256, D*2). Number of valid dwords = (valid_bytes) // 4.
-                        chunk_start = n * 256
-                        chunk_valid_bytes = min(256, _ROW_BYTES_RAW - chunk_start)
-                        n_valid_threads = chunk_valid_bytes // 4
-                        if n_valid_threads == BLOCK_THREADS:
-                            # All 64 threads have valid VRAM data: unconditional load.
-                            rocdl.buffer_load_to_lds(
-                                kv_rsrc, lds_ptr, vram_voff,
-                                size_bytes=4,
-                                offset=n * 256,
-                            )
-                        else:
-                            # Partial chunk: only threads 0..n_valid_threads-1 load.
-                            # Threads >= n_valid_threads would read past unified_kv.
-                            in_valid = arith.cmpi(
-                                CmpIPredicate.slt,
-                                tid,
-                                arith.constant(n_valid_threads, type=i32),
-                            )
-                            _if_dma = scf.IfOp(
-                                _to_raw(in_valid), results_=[], has_else=False
-                            )
-                            with _if_then(_if_dma):
-                                rocdl.buffer_load_to_lds(
-                                    kv_rsrc, lds_ptr, vram_voff,
-                                    size_bytes=4,
-                                    offset=n * 256,
-                                )
-
-                # Barrier: all DMA writes complete before reading LDS.
-                gpu.barrier()
-
-                # -- 9c. Compute dot products: read KV from LDS, store score to LDS --
-                # Pass 1: For each KV row j, compute partial dot, wave-reduce to score,
-                # then write score to lds_scores[j]. This way scores[] never exist as
-                # a VGPR list — only one score is live at a time.
-                m_block = c_neg_inf
-                for j in range_constexpr(BLOCK_K):
-                    j_idx     = arith.constant(j, type=i32)
-                    valid_i32 = lds_valids[fx.Index(j_idx)]
-                    valid_j   = arith.cmpi(CmpIPredicate.ne, valid_i32, c0_i32)
-                    partial_j = c_zero
-                    for v in range_constexpr(VEC):
-                        kv_lds_idx = arith.addi(
-                            arith.constant(j * _ROW_ELEMS_PADDED, type=i32),
-                            arith.addi(tid_x_vec, arith.constant(v, type=i32)),
-                        )
-                        kv_bf16 = lds_kv[fx.Index(kv_lds_idx)]
-                        kv_f32  = arith.extf(f32, kv_bf16)
-                        kv_safe = arith.select(valid_j, kv_f32, c_zero)
-                        partial_j = arith.addf(
-                            partial_j,
-                            arith.mulf(q_lane[v], kv_safe, fastmath=fm),
-                            fastmath=fm,
-                        )
-                    full_dot = _wave_reduce_add(partial_j)
-                    score_j  = arith.select(valid_j, full_dot, c_neg_inf)
-                    # All threads write same score (wave-broadcast value)
-                    lds_scores[fx.Index(j_idx)] = score_j
-                    m_block = arith.maximumf(m_block, score_j)
-
-                m_new = arith.maximumf(m_i, m_block)
-
-                # -- 9d. Online softmax update --
-
-                # alpha = (m_new == -inf) ? 1.0 : exp2(m_i - m_new)
-                is_all_inf = arith.cmpf(CmpFPredicate.OEQ, m_new, c_neg_inf)
-                raw_alpha  = _fexp2(arith.subf(m_i, m_new))
-                alpha      = arith.select(is_all_inf, c_one, raw_alpha)
-
-                # Pass 2: Compute p[j] = exp2(score_j - m_new), accumulate sum_p,
-                # write p_vals to LDS. Only one p_j live at a time.
-                sum_p = c_zero
-                for j in range_constexpr(BLOCK_K):
-                    j_idx     = arith.constant(j, type=i32)
-                    score_j   = lds_scores[fx.Index(j_idx)]
-                    valid_i32 = lds_valids[fx.Index(j_idx)]
-                    valid_j   = arith.cmpi(CmpIPredicate.ne, valid_i32, c0_i32)
-                    pj        = _fexp2(arith.subf(score_j, m_new))
-                    pj_safe   = arith.select(valid_j, pj, c_zero)
-                    lds_pvals[fx.Index(j_idx)] = pj_safe
-                    sum_p = arith.addf(sum_p, pj_safe, fastmath=fm)
-
-                l_new = arith.addf(
-                    arith.mulf(l_i, alpha, fastmath=fm), sum_p, fastmath=fm
-                )
-
-                # Pass 3: Acc update — read KV and p[j] from LDS row-by-row.
-                # Apply alpha rescale once (row-independent), then accumulate
-                # BLOCK_K weighted KV contributions. Inner order: v-outer, j-inner
-                # so each thread's VEC elements of acc are updated together.
-                for v in range_constexpr(VEC):
-                    idx     = arith.addi(tid_x_vec, arith.constant(v, type=i32))
-                    acc_old = lds_acc[fx.Index(idx)]
-                    new_val = arith.mulf(acc_old, alpha, fastmath=fm)
-                    for j in range_constexpr(BLOCK_K):
-                        j_idx = arith.constant(j, type=i32)
-                        kv_lds_idx = arith.addi(
-                            arith.constant(j * _ROW_ELEMS_PADDED, type=i32),
-                            arith.addi(tid_x_vec, arith.constant(v, type=i32)),
-                        )
-                        kv_bf16 = lds_kv[fx.Index(kv_lds_idx)]
-                        kv_f32  = arith.extf(f32, kv_bf16)
-                        pj_safe = lds_pvals[fx.Index(j_idx)]
-                        new_val = arith.addf(
-                            new_val,
-                            arith.mulf(pj_safe, kv_f32, fastmath=fm),
-                            fastmath=fm,
-                        )
-                    lds_acc[fx.Index(idx)] = new_val
-
-                # Barrier before next tile's DMA overwrites lds_kv/lds_slots/lds_valids.
-                gpu.barrier()
-
-                loop_state = yield [m_new, l_new]
-
-            m_final = loop_state[0]
-            l_final = loop_state[1]
-
-            # ---- 10. Output ----
-            if KV_SPLITS == 1:
-                # Direct write: out[t, h, :] = acc / max(l, eps)
-                out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
-                l_safe   = arith.maximumf(l_final, c_eps)
-                for v in range_constexpr(VEC):
-                    idx      = arith.addi(tid_x_vec, arith.constant(v, type=i32))
-                    acc_val  = lds_acc[fx.Index(idx)]
-                    out_f32  = arith.divf(acc_val, l_safe)
-                    out_bf16 = arith.truncf(T.bf16, out_f32)
-                    out_flat = arith.addi(
-                        arith.muli(t, cHD_i32),
-                        arith.addi(arith.muli(h, cD_i32), idx),
-                    )
-                    buffer_ops.buffer_store(out_bf16, out_rsrc, out_flat)
-
-            else:
-                # Partial emit: write (m, l) from thread 0, acc from all threads.
-
-                # m_partial[t, pid_k, h] and l_partial[t, pid_k, h]
-                ml_flat = arith.addi(
-                    arith.muli(t, cKH_i32),
-                    arith.addi(arith.muli(pid_k, cH_i32), h),
-                )
-
-                # Only thread 0 writes m and l (they are wave-wide scalars)
-                is_t0  = arith.cmpi(CmpIPredicate.eq, tid, c0_i32)
-                _if_t0 = scf.IfOp(_to_raw(is_t0), results_=[], has_else=False)
-                with _if_then(_if_t0):
-                    mp_rsrc = buffer_ops.create_buffer_resource(m_partial, max_size=True)
-                    lp_rsrc = buffer_ops.create_buffer_resource(l_partial, max_size=True)
-                    buffer_ops.buffer_store(m_final, mp_rsrc, ml_flat)
-                    buffer_ops.buffer_store(l_final, lp_rsrc, ml_flat)
-
-                # All threads write their VEC elements of acc_partial[t, pid_k, h, :]
-                ap_rsrc = buffer_ops.create_buffer_resource(acc_partial, max_size=True)
-                for v in range_constexpr(VEC):
-                    idx     = arith.addi(tid_x_vec, arith.constant(v, type=i32))
-                    acc_val = lds_acc[fx.Index(idx)]
-                    ap_flat = arith.addi(
-                        arith.muli(ml_flat, cD_i32),
-                        idx,
-                    )
-                    buffer_ops.buffer_store(acc_val, ap_rsrc, ap_flat)
-
-    # ---- Launcher ----
-    @flyc.jit
-    def _launcher(
-        q, unified_kv, kv_indices, kv_indptr, attn_sink,
-        m_partial, l_partial, acc_partial, out,
-        T_size: Int32,
-        stream: FlyStream = fx.Stream(None),
-    ):
-        # Emit the LDS memref.global into the gpu.module body.
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
-        # Grid dimensions: (T, H, KV_SPLITS).
-        # T_size is an Int32 scalar; H and KV_SPLITS are Python ints (compile-time consts).
-        _kernel(
-            q, unified_kv, kv_indices, kv_indptr, attn_sink,
-            m_partial, l_partial, acc_partial, out,
-        ).launch(
-            grid=(T_size, H, KV_SPLITS),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-        )
-
-    return _launcher
-
-
-# ---------------------------------------------------------------------------
-# MFMA-based kernel (BLOCK_H=16, one MFMA tile per head-group per CTA)
+# MFMA-based kernel (BLOCK_H=16, 4-wave 256-thread design)
 # ---------------------------------------------------------------------------
 #
 # Architecture summary
 # --------------------
 # Grid : (T, ceil(H/BLOCK_H), KV_SPLITS)   BLOCK_H=16 heads per CTA
-# Block: 64 threads (one wave64)
-# MFMA : mfma_f32_16x16x16bf16_1k — 16×16×16 BF16 accumulate into 4×f32 per lane
+# Block: 256 threads (4 waves x 64 lanes)
+# MFMA : mfma_f32_16x16x16bf16_1k — 16x16x16 BF16 accumulate into 4xf32 per lane
 #
-# MFMA C-output layout (CONFIRMED from mfma_epilogues.py::default_epilog):
+# Thread layout:
+#   wave_id   = tid // 64        (0..3)
+#   lane      = tid  % 64        (0..63)
+#   lane_row  = lane % 16        — MFMA M/N index (head or kv slot, depending on step)
+#   lane_cgrp = lane // 16       — column group within wave's D-slice (0..3)
+#   d_wave_base = wave_id * (D // 4)  — D-column base for this wave
+#
+# MFMA C-output layout:
 #   Lane l: c_frag[v] = C[M = (l//16)*4 + v,  N = l%16]
 #   In other words: M-index = lane_cgrp*4+v,  N-index = lane_row
 #
-# LDS layout (BLOCK_H=16, D=576) — total 56448 bytes < 64 KB
-# ----------------------------------------------------------------
-#   Region 0: KV_lds  [BLOCK_K=16, D]        bf16 = 16*576*2 = 18432 bytes
-#   Region 1: acc_lds [BLOCK_H=16, D]        fp32 = 16*576*4 = 36864 bytes
-#   Region 2: p_lds   [BLOCK_H=16, BLOCK_K]  fp32 = 16*16*4  =  1024 bytes
-#   Region 3: slots/valids [BLOCK_K*2]       i32  = 16*4*2   =   128 bytes
+# LDS layout (D=576) — total 23168 bytes < 32 KB -> enables 2 CTAs/CU
+# -----------------------------------------------------------------------
+#   Region 0: scores_lds [N_WAVES=4, BLOCK_H=16, BLOCK_K+1=17] f32 = 4352 bytes
+#             (cross-wave QK partial scores; aliased as p_lds [BLOCK_H, BLOCK_K+1])
+#   Region 1: kv_lds     [BLOCK_K=16, D+KV_PAD=584]            bf16 = 18688 bytes
+#   Region 2: slots_lds  [BLOCK_K=16]                          i32  =    64 bytes
+#   Region 3: valids_lds [BLOCK_K=16]                          i32  =    64 bytes
 #
-# Key design: KV tile loaded ONCE into KV_lds per tile (via buffer_load_to_lds),
-# then reused for both QK B-frag and PV B-frag reads — matching Triton's pattern
-# of using the kv register tile for both tl.dot(q, tl.trans(kv)) and
-# tl.dot(p, kv). Q is loaded from VRAM per tile (hits L2 after first tile).
+# VGPR accumulator:
+#   Each lane carries D_CHUNKS_W = (D//4)//16 acc chunks as ForOp iter-args.
+#   acc_dc[k] = vec<4,f32>; acc_dc[k][v] = acc[head=lane_cgrp*4+v, d=d_wave_base+k*16+lane_row]
+#   ForOp iter-args: [m_i×4, l_i×4, acc_dc0, ..., acc_dc{D_CHUNKS_W-1}] = 8 + D_CHUNKS_W values
 #
-# QK step: S[BLOCK_H, BLOCK_K] = Q[BLOCK_H, D] × KV[BLOCK_K, D]^T
-#   A-frag: Q[M=lane_row (head), K=lane_cgrp*4..+3 (D)]  — from VRAM (L2-cached)
-#   B-frag: KV[N=lane_row (kv_slot), K=lane_cgrp*4..+3 (D)]  — from KV_lds
-#   C-frag: c_frag[v] = S[head=lane_cgrp*4+v, kv_slot=lane_row]
+# QK step: each wave computes a partial S[BLOCK_H, BLOCK_K] over its D-slice.
+#   A-frag: Q[M=lane_row (head), K=d_wave_base + lane_cgrp*4..+3]    — from VRAM (L2-cached)
+#   B-frag: KV[N=lane_row (kv_slot), K=d_wave_base + lane_cgrp*4..+3] — from VRAM
+#   C-frag: c_frag[v] = partial S[head=lane_cgrp*4+v, kv_slot=lane_row] for this wave's D-slice
+#   KV data also written to kv_lds[lane_row, col..+3] for the PV transpose step.
+#
+# Cross-wave reduce (QK scores):
+#   Each wave writes its c_frag to scores_lds[wave_id, head, kv_slot]; barrier;
+#   all waves then read and sum the 4 partials -> full score[head, kv_slot].
 #
 # Softmax: per-head max/exp across BLOCK_K KV columns.
 #   Lane l holds scores for 4 heads (lane_cgrp*4..+3) vs 1 kv slot (lane_row).
 #   Butterfly xor over lane_row dimension (xor 1,2,4,8) to get max/sum over all 16 kv.
 #   Each lane carries 4 (m_i, l_i) pairs as ForOp iter-args.
+#   Softmax runs redundantly on all 4 waves (identical results).
 #
-# LDS transpose: write p[head=lane_cgrp*4+v, kv_slot=lane_row]; barrier;
-#   read as A-frag: p[head=lane_row, kv_slot=lane_cgrp*4..+3]
+# LDS transpose (p-matrix):
+#   Write p_lds[head=lane_cgrp*4+v, kv_slot=lane_row]; barrier;
+#   read as A-frag: p_lds[head=lane_row, kv_slot=lane_cgrp*4..+3]
+#   p_lds aliases the bottom BLOCK_H rows of scores_lds (wave_id==0 slice).
 #
-# PV step: acc[BLOCK_H, D] += p[BLOCK_H, BLOCK_K] × KV[BLOCK_K, D]
-#   A-frag: p[M=lane_row (head), K=lane_cgrp*4..+3 (kv)]  — from p_lds after transpose
-#   B-frag: KV[N=lane_row (D_col), K=lane_cgrp*4..+3 (kv_slot)] — from KV_lds (same tile)
-#   C-frag: c_frag[v] = acc[head=lane_cgrp*4+v, d=d_base+lane_row]
+# PV step: acc[BLOCK_H, D] += p[BLOCK_H, BLOCK_K] x KV[BLOCK_K, D]
+#   A-frag: p[M=lane_row (head), K=lane_cgrp*4..+3 (kv)]    — from p_lds after transpose
+#   B-frag: KV[N=d_wave_base+lane_row (D_col), K=lane_cgrp*4..+3 (kv_slot)] — from kv_lds
+#   C-frag: acc_dc[dc][v] = acc[head=lane_cgrp*4+v, d=d_wave_base+dc*16+lane_row]
+#   Result stays in VGPR iter-args — no LDS write-back needed.
 #
 # Per-tile barrier sequence:
-#   1. barrier after slot load    (lds_slots/lds_valids visible)
-#   2. barrier after KV DMA       (KV_lds visible for QK + PV)
-#   3. barrier after p write      (p_lds visible for PV A-frag transpose read)
-#   4. barrier after acc write    (acc_lds visible before next tile overwrites KV_lds)
+#   1. barrier after slot load      (lds_slots/lds_valids visible)
+#   2. barrier after QK scores+KV   (scores_lds + kv_lds written by all waves)
+#   3. barrier after p write        (p_lds visible for PV A-frag transpose read)
 
-_MFMA_K = 16   # K-elements per MFMA call (gfx942 16×16×16 BF16)
+_MFMA_K = 16   # K-elements per MFMA call (gfx942 16x16x16 BF16)
 _BLOCK_H = 16  # heads per CTA (matches MFMA M/N tile size)
-
 
 def _get_mfma_bf16_k16():
     """Return the mfma_f32_16x16x16bf16_1k MLIR op, or None on non-gfx942."""
@@ -643,7 +135,6 @@ def _get_mfma_bf16_k16():
         rocdl, "mfma_f32_16x16x16_bf16_1k", None
     )
     return fn
-
 
 @functools.lru_cache(maxsize=256)
 def _compile_pa_decode_sparse_mfma(
@@ -659,7 +150,7 @@ def _compile_pa_decode_sparse_mfma(
     Returns a flyc.jit launcher, cached on configuration.
 
     4-wave design (256 threads), VGPR accumulator:
-    - 4 waves × 64 lanes = 256 threads per CTA.
+    - 4 waves x 64 lanes = 256 threads per CTA.
     - Each wave handles D_PER_WAVE = D//4 D-columns for both QK and PV.
     - KV tile is stored to kv_lds during QK for transposed PV reads (restored).
     - Cross-wave QK partial scores are accumulated via scores_lds (a sub-region
@@ -678,7 +169,7 @@ def _compile_pa_decode_sparse_mfma(
     - valids_lds [BLOCK_K] i32 = 64 bytes
     - acc_lds ELIMINATED — accumulator in VGPR ForOp iter-args
 
-    ForOp iter-args: [m_i×4, l_i×4, acc_dc0, acc_dc1, ..., acc_dc8] = 44 values
+    ForOp iter-args: [m_i x 4, l_i x 4, acc_dc0, acc_dc1, ..., acc_dc8] = 44 values
     where acc_dc[k] = vec<4,f32> carrying running accumulator for d-chunk k.
     """
     assert D % _MFMA_K == 0, f"D={D} must be divisible by MFMA_K={_MFMA_K}"
@@ -693,9 +184,8 @@ def _compile_pa_decode_sparse_mfma(
     fm = arith.FastMathFlags.fast
     N_WAVES       = 4
     D_PER_WAVE    = D // N_WAVES          # D-columns per wave (144 for D=576)
-    D_CHUNKS      = D // _MFMA_K          # total MFMA K-chunks across all waves (36 for D=576)
     D_CHUNKS_W    = D_PER_WAVE // _MFMA_K  # K-chunks per wave (9 for D=576)
-    BLOCK_THREADS_MFMA = 64 * N_WAVES     # 256
+    BLOCK_THREADS_MFMA = WAVE_SIZE * N_WAVES     # 256
 
     GPU_ARCH = get_rocm_arch()
 
@@ -737,11 +227,6 @@ def _compile_pa_decode_sparse_mfma(
     # ---- Helpers ----
     def _fexp2(x):
         return mlir_llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [x], [], [])
-
-    def _lds_ptr_i64(byte_addr_i32):
-        """Extend i32 LDS byte address to i64, return !llvm.ptr<3>."""
-        addr_i64 = arith.extui(T.i64, byte_addr_i32)
-        return _make_lds_ptr(addr_i64)
 
     def _mfma_bf16(a_v4bf16, b_v4bf16, acc_v4f32):
         """mfma_f32_16x16x16bf16_1k: A,B as v4i16 (bitcast from v4bf16)."""
@@ -1269,9 +754,9 @@ def flydsl_pa_decode_sparse(
         kv_splits     = min(max_kv_splits, kv_splits)
         kv_splits     = triton.next_power_of_2(kv_splits)
 
-    assert D % BLOCK_THREADS == 0, (
-        f"D={D} must be divisible by {BLOCK_THREADS} (BLOCK_THREADS); "
-        f"got D % {BLOCK_THREADS} = {D % BLOCK_THREADS}"
+    assert D % WAVE_SIZE == 0, (
+        f"D={D} must be divisible by {WAVE_SIZE} (threads per wave); "
+        f"got D % {WAVE_SIZE} = {D % WAVE_SIZE}"
     )
 
     out = torch.zeros((T_val, H, D), dtype=torch.bfloat16, device=device)
