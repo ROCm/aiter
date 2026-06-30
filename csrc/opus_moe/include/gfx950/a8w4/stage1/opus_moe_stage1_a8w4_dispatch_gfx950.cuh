@@ -30,9 +30,13 @@ constexpr int kid_sort_block_m(int kid)
 template<typename Traits>
 inline void launch(const OpusMoeStage1A8W4Kargs& kargs, hipStream_t stream)
 {
+    // sorted route metadata includes per-expert padding; token_num * topk is
+    // not enough to cover all valid sorted route tiles.
+    const int route_tiles =
+        (kargs.sorted_blocks * Traits::SORT_BLOCK_M + Traits::B_M - 1) /
+        Traits::B_M;
     dim3 grid(Traits::STAGE1_COL_TILES,
-              (kargs.sorted_blocks * Traits::SORT_BLOCK_M + Traits::B_M - 1) /
-                  Traits::B_M,
+              route_tiles,
               1);
     dim3 block(Traits::BLOCK_SIZE);
     opus_moe_stage1_a8w4_kernel_gfx950<Traits><<<grid, block, 0, stream>>>(kargs);

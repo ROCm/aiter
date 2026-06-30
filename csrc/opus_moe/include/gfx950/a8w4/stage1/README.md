@@ -53,7 +53,7 @@ Keep stage2 files in `../` unchanged while stage1 is experimental. Move shared
 A8W4 helpers into a common folder only after both stage1 and stage2 need the same
 code.
 
-Active candidate:
+Active candidates:
 
 ```text
 Stage1 ids are registered through `aiter/ops/opus_moe_stage1_a8w4_meta.py` and
@@ -61,22 +61,24 @@ the generated `opus_moe_stage1_a8w4_meta.h` / `opus_moe_stage1_a8w4_manifest.h`
 headers. They use the 10xx range; A8W4 stage2 ids are generated from the
 stage2 meta manifest outside this experimental range.
 
-1010: P0 BM32 x BN384 x BK256, SORT_BLOCK_M=32,
-      A-reuse MFMA path. Kept for synthetic tuning where it is selected by
-      mid-size token buckets.
+1010: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=4,
+      single output-group A-reuse path. Selected for token=1/2.
 
-1020: P0 BM64 x BN384 x BK256, SORT_BLOCK_M=64,
-      row-split variant. Kept dispatchable for manual comparison, but not
-      scheduled by the current pruned tuner policy.
+1020: P0 BM16 x BN64 x BK256, SORT_BLOCK_M=32, K_WAVE=2,
+      single output-group A-reuse path. Selected for token=4 only.
 
-1030: P0 BM64 x BN384 x BK256, SORT_BLOCK_M=64,
-      gate/up group-split path. Kept for token=64 synthetic tuning.
+1030: P0 BM16 x BN64 x BK256, SORT_BLOCK_M=32,
+      single output-group A-reuse path. Selected for token=8/16.
 
-1040: P0 BM128 x BN256 x BK256, SORT_BLOCK_M=128,
-      EPILOGUE_ROW_SPLIT=2, gate/up group-split ownership. This is the primary
-      real-routing P0 path. It stages A through shared memory, keeps W1/scale
-      loads register-based, writes activated values to shared memory, and
-      quantizes output in two row passes.
+1040: P0 BM32 x BN384 x BK256, SORT_BLOCK_M=32,
+      full six-output-group A-reuse path. Selected for token=64/256/512/1024.
+
+1050: P0 BM64 x BN384 x BK256, SORT_BLOCK_M=64,
+      gate/up group-split path. Selected for token=128.
+
+1060: P0 BM128 x BN256 x BK256, SORT_BLOCK_M=128,
+      EPILOGUE_ROW_SPLIT=2, gate/up group-split ownership. Selected for
+      token=32 and large token buckets.
 ```
 
 Current code structure:

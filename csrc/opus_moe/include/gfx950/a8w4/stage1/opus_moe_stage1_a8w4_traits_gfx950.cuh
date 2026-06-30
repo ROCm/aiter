@@ -65,7 +65,9 @@ template<int BlockM,
          int BlockK,
          int SortBlockM = BlockM,
          int EpilogueRowSplit = 1,
-         bool GateUpGroupSplit = false>
+         bool GateUpGroupSplit = false,
+         int OutputScaleGroupsOverride = 0,
+         int KWave = 1>
 struct OpusMoeStage1A8W4Shape
 {
     static constexpr int B_M = BlockM;
@@ -86,8 +88,13 @@ struct OpusMoeStage1A8W4Shape
     static constexpr int B_BYTES_PER_VEC = BYTES_PER_VEC;
     static constexpr int A_LDS_STAGES = 3;
     static constexpr int A_LDS_STAGE_ELEMS = B_M * B_K_LOGICAL;
-    static constexpr int BLOCK_SIZE = kDefaultCtaThreads;
-    static constexpr int MIN_BLOCKS_PER_CU = kMinBlocksPerCu;
+    static constexpr int WAVE_SIZE = opus::get_warp_size();
+    static constexpr int K_WAVE = KWave;
+    static constexpr int KWAVE_BASE_WAVES = 4;
+    static constexpr int BLOCK_SIZE =
+        K_WAVE == 1 ? kDefaultCtaThreads : KWAVE_BASE_WAVES * K_WAVE * WAVE_SIZE;
+    static constexpr int MIN_BLOCKS_PER_CU =
+        K_WAVE == 1 ? kMinBlocksPerCu : 1;
 
     static constexpr int TOPK = kTopK;
     static constexpr int H = kModelDim;
@@ -102,15 +109,42 @@ struct OpusMoeStage1A8W4Shape
     static constexpr int GATE_UP_LOGICAL_DIM = kGateUpLogicalDim;
     static constexpr int GATE_UP_EFFECTIVE_DIM = kGateUpEffectiveDim;
     static constexpr int EXPERTS = kExperts;
-    static constexpr int OUTPUT_COLS_PER_TILE = B_N / 2;
+    static constexpr int DEFAULT_OUTPUT_COLS_PER_TILE = B_N / 2;
+    static constexpr int DEFAULT_OUTPUT_SCALE_GROUPS_PER_TILE =
+        DEFAULT_OUTPUT_COLS_PER_TILE / kScaleGroupLogicalK;
     static constexpr int OUTPUT_SCALE_GROUPS_PER_TILE =
-        OUTPUT_COLS_PER_TILE / kScaleGroupLogicalK;
+        OutputScaleGroupsOverride > 0 ?
+            OutputScaleGroupsOverride :
+            DEFAULT_OUTPUT_SCALE_GROUPS_PER_TILE;
+    static constexpr int ACC_SCALE_GROUPS_PER_TILE =
+        DEFAULT_OUTPUT_SCALE_GROUPS_PER_TILE;
+    static constexpr int OUTPUT_COLS_PER_TILE =
+        OUTPUT_SCALE_GROUPS_PER_TILE * kScaleGroupLogicalK;
+    static constexpr int SCALE_MN_PACK = 2;
+    static constexpr int SCALE_K_PACK = 2;
     static constexpr int EPILOGUE_ROW_SPLIT = EpilogueRowSplit;
     static constexpr int EPILOGUE_ROWS_PER_PASS = B_M / EPILOGUE_ROW_SPLIT;
     static constexpr int EPILOGUE_SMEM_COLS =
         OUTPUT_SCALE_GROUPS_PER_TILE * kScaleGroupLogicalK * 2;
     static constexpr int EPILOGUE_SMEM_ROWS = EPILOGUE_ROWS_PER_PASS;
     static constexpr int EPILOGUE_THREADS = EPILOGUE_ROWS_PER_PASS * 2;
+    static constexpr int EPILOGUE_SMEM_BYTES =
+        EPILOGUE_SMEM_ROWS * EPILOGUE_SMEM_COLS *
+        static_cast<int>(sizeof(float));
+    static constexpr int A_REG_LDS_STAGE_BYTES = B_M * MMA_K;
+    static constexpr int A_REG_LDS_BYTES =
+        2 * SCALE_K_PACK * A_REG_LDS_STAGE_BYTES;
+    static constexpr int KWAVE_REDUCE_BYTES =
+        K_WAVE == 1 ? 0 : K_WAVE * KWAVE_BASE_WAVES *
+                              M_MFMA_PER_WAVE * WAVE_SIZE *
+                              static_cast<int>(sizeof(float)) * 4;
+    static constexpr int MAINLOOP_SCRATCH_BYTES =
+        A_REG_LDS_BYTES > KWAVE_REDUCE_BYTES ? A_REG_LDS_BYTES :
+                                               KWAVE_REDUCE_BYTES;
+    static constexpr int SHARED_SCRATCH_BYTES =
+        EPILOGUE_SMEM_BYTES > MAINLOOP_SCRATCH_BYTES ?
+            EPILOGUE_SMEM_BYTES :
+            MAINLOOP_SCRATCH_BYTES;
     static constexpr bool GATE_UP_GROUP_SPLIT = GateUpGroupSplit;
     static constexpr int GATE_UP_GROUP_SPLIT_GROUPS =
         OUTPUT_SCALE_GROUPS_PER_TILE / 2;
@@ -119,7 +153,8 @@ struct OpusMoeStage1A8W4Shape
         (B_K_LOGICAL / 2 - EFFECTIVE_INTER_DIM % (B_K_LOGICAL / 2)) %
         (B_K_LOGICAL / 2);
     static constexpr int STAGE1_COL_TILES =
-        (GATE_UP_LOGICAL_DIM - 2 * INTER_DIM_PAD + TILE2_PAD + B_N - 1) / B_N;
+        (EFFECTIVE_INTER_DIM + OUTPUT_COLS_PER_TILE - 1) /
+        OUTPUT_COLS_PER_TILE;
     static constexpr int SCALE_GROUP_LOGICAL_K = kScaleGroupLogicalK;
     static constexpr int SCALE_GROUPS = LOGICAL_INTER_DIM / SCALE_GROUP_LOGICAL_K;
     static constexpr int EFFECTIVE_SCALE_GROUPS =
@@ -128,10 +163,8 @@ struct OpusMoeStage1A8W4Shape
     static constexpr int HIDDEN_SCALE_WORDS_PER_ROW =
         HIDDEN_SCALE_GROUPS * static_cast<int>(sizeof(uint8_t)) /
         static_cast<int>(sizeof(uint32_t));
-    static constexpr int SCALE_MN_PACK = 2;
-    static constexpr int SCALE_K_PACK = 2;
-    static constexpr int WAVE_SIZE = opus::get_warp_size();
-    static constexpr int M_SCALE_PACKS = M_MFMA_PER_WAVE / SCALE_MN_PACK;
+    static constexpr int M_SCALE_PACKS =
+        (M_MFMA_PER_WAVE + SCALE_MN_PACK - 1) / SCALE_MN_PACK;
     static constexpr int SCALE_WORDS_PER_K_TILE =
         (HIDDEN_SCALE_GROUPS / 4) / SCALE_K_PACK;
     static constexpr int SCALE_LAYOUT_STRIDE_K0 = 4 * MMA_M;
@@ -155,8 +188,13 @@ struct OpusMoeStage1A8W4Shape
     static_assert(B_N % 2 == 0);
     static_assert(B_N % (2 * MMA_N) == 0);
     static_assert(B_M % MMA_M == 0);
-    static_assert(M_MFMA_PER_WAVE % SCALE_MN_PACK == 0);
+    static_assert(M_MFMA_PER_WAVE > 0);
     static_assert(MFMA_K_STEPS % SCALE_K_PACK == 0);
+    static_assert(K_WAVE > 0);
+    static_assert(K_WAVE == 1 || OUTPUT_SCALE_GROUPS_PER_TILE == 1);
+    static_assert(MFMA_K_STEPS % K_WAVE == 0);
+    static_assert((MFMA_K_STEPS / K_WAVE) % SCALE_K_PACK == 0);
+    static_assert(K_WAVE == 1 || BLOCK_SIZE <= 1024);
     static_assert(EPILOGUE_ROW_SPLIT > 0);
     static_assert(B_M % EPILOGUE_ROW_SPLIT == 0);
     static_assert(EPILOGUE_ROWS_PER_PASS > 0);
@@ -172,10 +210,16 @@ struct OpusMoeStage1A8W4Shape
 
 using OpusMoeStage1A8W4P0Bm32Bn384AReuse =
     OpusMoeStage1A8W4Shape<32, 384, 256, 32>;
-using OpusMoeStage1A8W4P0Bm64Bn384RowSplit =
-    OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4AReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4>;
+using OpusMoeStage1A8W4P0Bm16Bn64Sbm32G1AReuse =
+    OpusMoeStage1A8W4Shape<16, 64, 256, 32>;
+using OpusMoeStage1A8W4P0Bm16Bn64Sbm32G1KWave2AReuse =
+    OpusMoeStage1A8W4Shape<16, 64, 256, 32, 1, false, 0, 2>;
 using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplit =
     OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true>;
+using OpusMoeStage1A8W4P0Bm64Bn256GateUpGroupSplit =
+    OpusMoeStage1A8W4Shape<64, 256, 256, 64, 2, true>;
 using OpusMoeStage1A8W4P0Bm128Bn256GateUpGroupSplit =
     OpusMoeStage1A8W4Shape<128, 256, 256, 128, 2, true>;
 

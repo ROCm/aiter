@@ -2905,6 +2905,18 @@ class FmoeTuner(TunerCommon):
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_str, b_dtype_str, out_dtype_str
         )
+        prune_dsv4_a8w4_flydsl = (
+            os.environ.get("DSV4_A8W4_PRUNE_FLYDSL", "0") == "1"
+            and gfx == "gfx950"
+            and dtype == dtypes.bf16
+            and q_dtype_a == dtypes.fp8
+            and q_dtype_w == dtypes.fp4x2
+            and q_type == QuantType.per_1x32
+            and use_g1u1
+            and not doweight_stage1
+            and act_type == ActivationType.Silu
+            and (model_dim, inter_dim, expert, topk) == (7168, 512, 384, 6)
+        )
 
         for blockM in blockMs:
             if blockM not in [32, 64, 128] or not use_g1u1:
@@ -2945,6 +2957,13 @@ class FmoeTuner(TunerCommon):
                         ]
 
                 for s1_name, s1_params, is_fp4, is_fp8 in s1_variants:
+                    if (
+                        prune_dsv4_a8w4_flydsl
+                        and not self._is_dsv4_a8w4_stage1_flydsl_candidate(
+                            token, s1_name
+                        )
+                    ):
+                        continue
                     s1_compare_fn = None
                     if is_fp8 or a_dtype_str == "fp8":
                         s1_compare_fn = cosine_diff_compare
@@ -3039,6 +3058,13 @@ class FmoeTuner(TunerCommon):
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
+                if (
+                    prune_dsv4_a8w4_flydsl
+                    and not self._is_dsv4_a8w4_stage2_flydsl_candidate(
+                        token, s2_kname
+                    )
+                ):
+                    continue
 
                 s2_ref_kwargs = {}
                 s2_compare_fn = None
@@ -3312,6 +3338,30 @@ class FmoeTuner(TunerCommon):
             and "_xcd4" not in name
         )
 
+    @staticmethod
+    def _is_dsv4_a8w4_stage2_flydsl_candidate(token, kernel_name):
+        name = str(kernel_name)
+        if not name.startswith("flydsl_moe2_afp8_wfp4_bf16_"):
+            return False
+        if not ("_atomic" in name or "_reduce" in name):
+            return False
+        if "_sbm" in name:
+            return False
+        if "_atomic" in name and "_bnt2" not in name:
+            return False
+        if "_atomic_bnt2_persist" in name and "_xcd4" not in name:
+            return False
+
+        if token <= 2:
+            return "t32x128x256" in name
+        if token <= 4:
+            return "t32x256x256" in name
+        if token <= 2048:
+            return "t32x256x256" in name
+        if token <= 4096:
+            return "t64x256x256" in name
+        return "t128x256x256" in name
+
     def gen_opus_stage1_a8w4_task(self, info, blockMs):
         tasks_opus = []
         (
@@ -3349,13 +3399,14 @@ class FmoeTuner(TunerCommon):
         )
 
         for s1_name, kparams in get_opus_a8w4_stage1_kernels(token).items():
-            blockM = int(kparams["block_m"])
-            if blockM not in blockMs:
+            kernel_block_m = int(kparams["block_m"])
+            sort_block_m = int(kparams["sort_block_m"])
+            if kernel_block_m not in blockMs and sort_block_m not in blockMs:
                 continue
             kernel_id = int(kparams["kid"])
             tasks_opus.append(
                 (
-                    (info, "stage1", s1_name, blockM),
+                    (info, "stage1", s1_name, sort_block_m),
                     FmoeTuner.generate_data_2stages,
                     (
                         token,
@@ -3370,7 +3421,7 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         use_g1u1,
                         doweight_stage1,
-                        blockM,
+                        sort_block_m,
                         1,
                     ),
                     FmoeTuner.run_opus_stage1_a8w4_out,
@@ -3387,7 +3438,7 @@ class FmoeTuner(TunerCommon):
                         dtype,
                         topk,
                         kernel_id,
-                        blockM,
+                        sort_block_m,
                         q_dtype_a,
                         q_type,
                         act_type,
@@ -3412,7 +3463,7 @@ class FmoeTuner(TunerCommon):
                         q_type,
                         doweight_stage1,
                         topk,
-                        blockM,
+                        sort_block_m,
                         False,
                         True,
                     ),

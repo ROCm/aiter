@@ -11,12 +11,6 @@ namespace stage1_a8w4
 
 #ifdef __HIP_DEVICE_COMPILE__
 
-inline __device__ uint8_t fp32_to_fp8_byte(float value)
-{
-    const auto fp8 = opus::fp32_to_fp8(value);
-    return static_cast<uint8_t>(__builtin_bit_cast(signed char, fp8));
-}
-
 inline __device__ uint32_t fp32x4_to_fp8x4_word(float v0,
                                                 float v1,
                                                 float v2,
@@ -155,13 +149,19 @@ template<typename Traits, typename CAcc>
 inline __device__ void epilogue_store_row_pass(
     float* __restrict__ smem_gate_up,
     CAcc (&rc)[Traits::M_MFMA_PER_WAVE]
-             [Traits::OUTPUT_SCALE_GROUPS_PER_TILE],
+             [Traits::ACC_SCALE_GROUPS_PER_TILE],
     const int (&ga)[Traits::M_MFMA_PER_WAVE],
     int wave_id,
     int row_pass_base)
 {
-    const int out_half = wave_id / 2;
-    const int gate_up = wave_id & 1;
+    if constexpr(Traits::K_WAVE > 1)
+    {
+        if(wave_id >= Traits::KWAVE_BASE_WAVES)
+            return;
+    }
+    const int epilogue_wave = wave_id % Traits::KWAVE_BASE_WAVES;
+    const int out_half = epilogue_wave / 2;
+    const int gate_up = epilogue_wave & 1;
 
     #pragma unroll
     for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
@@ -376,7 +376,7 @@ inline __device__ void quant_epilogue(
     const Tile<Traits>& tile,
     const LayoutA& u_ga,
     CAcc (&rc)[Traits::M_MFMA_PER_WAVE]
-             [Traits::OUTPUT_SCALE_GROUPS_PER_TILE],
+             [Traits::ACC_SCALE_GROUPS_PER_TILE],
     int wave_id,
     const int* __restrict__ smem_token,
     const int* __restrict__ smem_slot,
@@ -411,7 +411,7 @@ template<typename Traits, typename CAcc>
 inline __device__ void epilogue_store_activated_row_pass_gate_up_group_split(
     float* __restrict__ smem_values,
     CAcc (&rc)[Traits::M_MFMA_PER_WAVE]
-             [Traits::OUTPUT_SCALE_GROUPS_PER_TILE],
+             [Traits::ACC_SCALE_GROUPS_PER_TILE],
     const AOperandCoord<Traits> (&a_coord)[Traits::M_MFMA_PER_WAVE],
     int wave_id,
     int row_pass_base)
@@ -449,7 +449,7 @@ inline __device__ void
 epilogue_store_activated_row_pass_gate_up_group_split_static(
     float* __restrict__ smem_values,
     CAcc (&rc)[Traits::M_MFMA_PER_WAVE]
-             [Traits::OUTPUT_SCALE_GROUPS_PER_TILE],
+             [Traits::ACC_SCALE_GROUPS_PER_TILE],
     const AOperandCoord<Traits> (&a_coord)[Traits::M_MFMA_PER_WAVE],
     int wave_id)
 {
@@ -497,7 +497,7 @@ inline __device__ void quant_epilogue_gate_up_group_split(
     const Tile<Traits>& tile,
     const LayoutA& u_ga,
     CAcc (&rc)[Traits::M_MFMA_PER_WAVE]
-             [Traits::OUTPUT_SCALE_GROUPS_PER_TILE],
+             [Traits::ACC_SCALE_GROUPS_PER_TILE],
     int wave_id,
     const int* __restrict__ smem_token,
     const int* __restrict__ smem_slot,

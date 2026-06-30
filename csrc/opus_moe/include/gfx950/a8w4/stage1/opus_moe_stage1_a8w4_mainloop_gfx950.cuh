@@ -265,6 +265,81 @@ inline __device__ void load_a_mfma_reg_from_lds(
 }
 
 template<typename Traits, typename Mma>
+inline __device__ void load_a_mfma_reg_direct(
+    const OpusMoeStage1A8W4Kargs& kargs,
+    typename Mma::mfma_type::vtype_a& ra,
+    bool route_valid,
+    int64_t a_payload_base,
+    int k_step)
+{
+    if(!route_valid)
+        return;
+
+    const int64_t a_offset =
+        a_payload_base + static_cast<int64_t>(k_step) * Traits::MMA_K;
+    const auto a_lo = *reinterpret_cast<const stage1_u32x4_t*>(
+        kargs.hidden_fp8 + a_offset);
+    const auto a_hi = *reinterpret_cast<const stage1_u32x4_t*>(
+        kargs.hidden_fp8 + a_offset + 4 * Traits::BYTES_PER_VEC);
+    pack_a_mfma_reg(a_lo, a_hi, ra);
+}
+
+template<typename Traits, typename CReg>
+inline __device__ void reduce_single_group_kwave(int wave_id,
+                                                 int lane_id,
+                                                 uint8_t* __restrict__ smem_reduce,
+                                                 CReg (&rc)[Traits::M_MFMA_PER_WAVE]
+                                                          [Traits::ACC_SCALE_GROUPS_PER_TILE])
+{
+    if constexpr(Traits::K_WAVE > 1)
+    {
+        static_assert(Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 1);
+        const int base_wave = wave_id % Traits::KWAVE_BASE_WAVES;
+        const int wave_k = wave_id / Traits::KWAVE_BASE_WAVES;
+        auto* smem_c = reinterpret_cast<CReg*>(smem_reduce);
+
+        #pragma unroll
+        for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+        {
+            const int store_idx =
+                (((wave_k * Traits::KWAVE_BASE_WAVES + base_wave) *
+                      Traits::M_MFMA_PER_WAVE +
+                  mi) *
+                     Traits::WAVE_SIZE +
+                 lane_id);
+            smem_c[store_idx] = rc[mi][0];
+        }
+        __syncthreads();
+
+        if(wave_k == 0)
+        {
+            #pragma unroll
+            for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+            {
+                const int base_idx =
+                    ((base_wave * Traits::M_MFMA_PER_WAVE + mi) *
+                         Traits::WAVE_SIZE +
+                     lane_id);
+                CReg sum = smem_c[base_idx];
+                #pragma unroll
+                for(int kw = 1; kw < Traits::K_WAVE; ++kw)
+                {
+                    const int load_idx =
+                        (((kw * Traits::KWAVE_BASE_WAVES + base_wave) *
+                              Traits::M_MFMA_PER_WAVE +
+                          mi) *
+                             Traits::WAVE_SIZE +
+                         lane_id);
+                    sum = sum + smem_c[load_idx];
+                }
+                rc[mi][0] = sum;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template<typename Traits, typename Mma>
 inline __device__ void accumulate_loaded_a_with_b(
     Mma& mma,
     const typename Mma::mfma_type::vtype_a& ra,
@@ -288,6 +363,150 @@ inline __device__ void accumulate_loaded_a_with_b(
 }
 
 template<typename Traits, typename Mma, typename LayoutA, typename LayoutB>
+inline __device__ void mainloop_single_group_direct_a(
+    Mma& mma,
+    const LayoutA& u_ga,
+    const LayoutB& u_gb,
+    const OpusMoeStage1A8W4Kargs& kargs,
+    const Tile<Traits>& tile,
+    int wave_id,
+    int lane_id,
+    const int* __restrict__ smem_token,
+    const int* __restrict__ smem_slot,
+    const uint8_t* __restrict__ smem_route_valid,
+    uint8_t* __restrict__ smem_scratch,
+    typename Mma::vtype_c (&rc)[Traits::M_MFMA_PER_WAVE]
+                              [Traits::ACC_SCALE_GROUPS_PER_TILE])
+{
+    using opus::operator""_I;
+
+    static_assert(Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 1);
+    static_assert(Traits::M_MFMA_PER_WAVE > 0);
+    static_assert(Traits::M_MFMA_PER_WAVE <= 2);
+
+    using V_A = typename Mma::mfma_type::vtype_a;
+    using V_B = typename Mma::mfma_type::vtype_b;
+
+    const int base_wave = wave_id % Traits::KWAVE_BASE_WAVES;
+    const int wave_k = wave_id / Traits::KWAVE_BASE_WAVES;
+    const int out_half = base_wave / 2;
+    const int gate_up = base_wave & 1;
+
+    int ga[Traits::M_MFMA_PER_WAVE];
+    collect_a_offsets<Traits>(u_ga, ga);
+    const int gb = static_cast<int>(u_gb(0_I, 0_I));
+
+    int token[Traits::M_MFMA_PER_WAVE];
+    int slot[Traits::M_MFMA_PER_WAVE];
+    bool route_valid[Traits::M_MFMA_PER_WAVE];
+    int64_t a_payload_base[Traits::M_MFMA_PER_WAVE];
+    #pragma unroll
+    for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+    {
+        route_valid[mi] = route_from_smem(
+            a_local_m<Traits>(ga[mi]),
+            smem_token,
+            smem_slot,
+            smem_route_valid,
+            token[mi],
+            slot[mi]);
+        (void)slot[mi];
+        a_payload_base[mi] = a_payload_base_byte_offset<Traits>(
+            token[mi], ga[mi], kargs.stride_hidden_t);
+    }
+
+    constexpr int kW1KStepBytes = w1_payload_k_step_stride_bytes<Traits>();
+    int a_scale_base[Traits::M_SCALE_PACKS];
+    #pragma unroll
+    for(int mp = 0; mp < Traits::M_SCALE_PACKS; ++mp)
+    {
+        a_scale_base[mp] =
+            a_scale_base_byte_offset<Traits>(tile.route_base, mp, gb);
+    }
+
+    const int output_col_base =
+        tile.out_col_base + out_half * Traits::MMA_N;
+    const int64_t b_payload_base =
+        w1_payload_group_base_byte_offset<Traits>(
+            tile.expert_id, output_col_base, gate_up, gb, kargs.stride_w1_e);
+    const int b_scale_base =
+        w1_scale_base_byte_offset<Traits>(
+            tile.expert_id, output_col_base, gb);
+
+    constexpr int kStepsPerWave = Traits::MFMA_K_STEPS / Traits::K_WAVE;
+    const int k_begin = wave_k * kStepsPerWave;
+    const int k_end = k_begin + kStepsPerWave;
+
+    for(int k_pair = k_begin; k_pair < k_end;
+        k_pair += Traits::SCALE_K_PACK)
+    {
+        const int k_pair_idx = k_pair / Traits::SCALE_K_PACK;
+        const int a_scale_step_offset =
+            k_pair_idx * Traits::SCALE_LAYOUT_STRIDE_K0 *
+            static_cast<int>(sizeof(uint32_t));
+
+        int a_scale[Traits::M_SCALE_PACKS];
+        #pragma unroll
+        for(int mp = 0; mp < Traits::M_SCALE_PACKS; ++mp)
+        {
+            a_scale[mp] = static_cast<int>(
+                *reinterpret_cast<const uint32_t*>(
+                    kargs.hidden_scale_e8m0 + a_scale_base[mp] +
+                    a_scale_step_offset));
+        }
+
+        const int b_scale = static_cast<int>(
+            *reinterpret_cast<const uint32_t*>(
+                kargs.w1_scale_e8m0 + b_scale_base +
+                a_scale_step_offset));
+
+        const stage1_u32x4_t b_raw_kk0 =
+            *reinterpret_cast<const stage1_u32x4_t*>(
+                kargs.w1_fp4 + b_payload_base +
+                static_cast<int64_t>(k_pair) * kW1KStepBytes);
+
+        #pragma unroll
+        for(int kk = 0; kk < Traits::SCALE_K_PACK; ++kk)
+        {
+            const int k_step = k_pair + kk;
+            stage1_u32x4_t b_raw = b_raw_kk0;
+            if(kk != 0)
+            {
+                b_raw = *reinterpret_cast<const stage1_u32x4_t*>(
+                    kargs.w1_fp4 + b_payload_base +
+                    static_cast<int64_t>(k_step) * kW1KStepBytes);
+            }
+
+            V_B rb{};
+            unpack_b_mfma_reg(b_raw, rb);
+            const int selector_b =
+                (k_step & 1) * Traits::SCALE_MN_PACK + gate_up;
+
+            #pragma unroll
+            for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
+            {
+                V_A ra{};
+                load_a_mfma_reg_direct<Traits, Mma>(
+                    kargs, ra, route_valid[mi], a_payload_base[mi], k_step);
+                accumulate_loaded_a_with_b<Traits, Mma>(
+                    mma,
+                    ra,
+                    rb,
+                    rc[mi][0],
+                    mi + tile.route_base / Traits::MMA_M,
+                    route_valid[mi],
+                    a_scale[mi / Traits::SCALE_MN_PACK],
+                    k_step,
+                    selector_b,
+                    b_scale);
+            }
+        }
+    }
+
+    reduce_single_group_kwave<Traits>(wave_id, lane_id, smem_scratch, rc);
+}
+
+template<typename Traits, typename Mma, typename LayoutA, typename LayoutB>
 inline __device__ void mainloop(
     Mma& mma,
     const LayoutA& u_ga,
@@ -301,14 +520,15 @@ inline __device__ void mainloop(
     const uint8_t* __restrict__ smem_route_valid,
     uint8_t* __restrict__ smem_a_reg,
     typename Mma::vtype_c (&rc)[Traits::M_MFMA_PER_WAVE]
-                              [Traits::OUTPUT_SCALE_GROUPS_PER_TILE])
+                              [Traits::ACC_SCALE_GROUPS_PER_TILE])
 {
     using opus::operator""_I;
 
-    static_assert(Traits::B_N == 384 || Traits::B_N == 256);
     static_assert(Traits::SORT_BLOCK_M % Traits::B_M == 0);
     static_assert(Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 6 ||
-                  Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 4);
+                  Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 4 ||
+                  Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 2 ||
+                  Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 1);
     static_assert(Traits::SCALE_GROUP_LOGICAL_K == 32);
     static_assert(Traits::MMA_M == 16);
     static_assert(Traits::MMA_N == 16);
@@ -317,8 +537,28 @@ inline __device__ void mainloop(
     static_assert(Traits::M_MFMA_PER_WAVE <= 8);
     static_assert(a_reg_lds_stage_bytes<Traits>() == Traits::B_M * Traits::MMA_K);
     static_assert(2 * Traits::SCALE_K_PACK * a_reg_lds_stage_bytes<Traits>() <=
-                  Traits::EPILOGUE_SMEM_ROWS * Traits::EPILOGUE_SMEM_COLS *
-                      static_cast<int>(sizeof(float)));
+                  Traits::SHARED_SCRATCH_BYTES);
+
+    if constexpr(Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 1)
+    {
+        mainloop_single_group_direct_a<Traits>(
+            mma,
+            u_ga,
+            u_gb,
+            kargs,
+            tile,
+            wave_id,
+            lane_id,
+            smem_token,
+            smem_slot,
+            smem_route_valid,
+            smem_a_reg,
+            rc);
+        return;
+    }
+
+    static_assert(Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 1 ||
+                  Traits::B_N == 384 || Traits::B_N == 256);
 
     using V_A = typename Mma::mfma_type::vtype_a;
     using V_B = typename Mma::mfma_type::vtype_b;
@@ -533,7 +773,7 @@ inline __device__ void mainloop_gate_up_group_split(
     const uint8_t* __restrict__ smem_route_valid,
     uint8_t* __restrict__ smem_a_reg,
     typename Mma::vtype_c (&rc)[Traits::M_MFMA_PER_WAVE]
-                              [Traits::OUTPUT_SCALE_GROUPS_PER_TILE])
+                              [Traits::ACC_SCALE_GROUPS_PER_TILE])
 {
     using opus::operator""_I;
 

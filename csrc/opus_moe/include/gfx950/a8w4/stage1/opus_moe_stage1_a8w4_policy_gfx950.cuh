@@ -332,7 +332,6 @@ template<typename Traits>
 struct Tile
 {
     int tid;
-    int route_tile;
     int route_base;
     int col_tile;
     int out_col_base;
@@ -350,7 +349,6 @@ inline __device__ Tile<Traits> make_tile(const OpusMoeStage1A8W4Kargs& kargs)
     const int route_subtile = route_tile - sorted_block * route_subtiles;
     const int expert_id = kargs.sorted_expert_ids[sorted_block];
     return {static_cast<int>(threadIdx.x),
-            route_tile,
             sorted_block * Traits::SORT_BLOCK_M +
                 route_subtile * Traits::B_M,
             col_tile,

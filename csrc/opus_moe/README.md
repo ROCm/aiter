@@ -96,10 +96,12 @@ Experimental A8W4 stage1 ids use the 10xx namespace:
 
 | kid | name | block shape | status |
 |---:|---|---|---|
-| `1010` | `opus_moe1_a8w4_bm32_bn384_a_reuse_mfma` | `BM32 x BN384` | local stage1 replay/tuner |
-| `1020` | `opus_moe1_a8w4_bm64_bn384_row_split` | `BM64 x BN384` | dispatchable, not in pruned tuner |
-| `1030` | `opus_moe1_a8w4_bm64_bn384_gateup_groupsplit` | `BM64 x BN384` | local stage1 replay/tuner |
-| `1040` | `opus_moe1_a8w4_bm128_bn256_gateup_groupsplit` | `BM128 x BN256` | local stage1 replay/tuner |
+| `1010` | `opus_moe1_a8w4_bm16_bn384_g1_kw4_a_reuse_mfma` | `BM16 x BN384`, `sort_block_m=16`, `K_WAVE=4` | token=1/2 small-token path |
+| `1020` | `opus_moe1_a8w4_bm16_bn64_sbm32_g1_kw2_a_reuse_mfma` | `BM16 x BN64`, `sort_block_m=32`, `K_WAVE=2` | token=4 small-token path |
+| `1030` | `opus_moe1_a8w4_bm16_bn64_sbm32_g1_a_reuse_mfma` | `BM16 x BN64`, `sort_block_m=32` | token=8/16 small-token path |
+| `1040` | `opus_moe1_a8w4_bm32_bn384_a_reuse_mfma` | `BM32 x BN384` | local stage1 replay/tuner |
+| `1050` | `opus_moe1_a8w4_bm64_bn384_gateup_groupsplit` | `BM64 x BN384` | local stage1 replay/tuner |
+| `1060` | `opus_moe1_a8w4_bm128_bn256_gateup_groupsplit` | `BM128 x BN256` | local stage1 replay/tuner |
 
 In fused MoE tuned configs, the preferred A8W4 stage2 selection is a per-kid
 `kernelName2` value from the table above. The generic wrapper name

@@ -12,10 +12,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-OPUS_A8W4_STAGE1_KID_P0_BM32_BN384_A_REUSE_MFMA = 1010
-OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_ROW_SPLIT = 1020
-OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_GATE_UP_GROUP_SPLIT = 1030
-OPUS_A8W4_STAGE1_KID_P0_BM128_BN256_GATE_UP_GROUP_SPLIT = 1040
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_A_REUSE_MFMA = 1010
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN64_SBM32_G1_KW2_A_REUSE_MFMA = 1020
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN64_SBM32_G1_A_REUSE_MFMA = 1030
+OPUS_A8W4_STAGE1_KID_P0_BM32_BN384_A_REUSE_MFMA = 1040
+OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_GATE_UP_GROUP_SPLIT = 1050
+OPUS_A8W4_STAGE1_KID_P0_BM128_BN256_GATE_UP_GROUP_SPLIT = 1060
+OPUS_A8W4_STAGE1_KID_P0_BM64_BN256_GATE_UP_GROUP_SPLIT = 1070
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,36 @@ class OpusA8W4Stage1Instance:
 
 OPUS_A8W4_STAGE1_INSTANCES = (
     OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw4_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave4AReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(1, 2),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN64_SBM32_G1_KW2_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn64_sbm32_g1_kw2_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn64Sbm32G1KWave2AReuse",
+        block_m=16,
+        block_n=64,
+        block_k=256,
+        sort_block_m=32,
+        tuner_tokens=(4,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN64_SBM32_G1_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn64_sbm32_g1_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn64Sbm32G1AReuse",
+        block_m=16,
+        block_n=64,
+        block_k=256,
+        sort_block_m=32,
+        tuner_tokens=(8, 16),
+    ),
+    OpusA8W4Stage1Instance(
         kid=OPUS_A8W4_STAGE1_KID_P0_BM32_BN384_A_REUSE_MFMA,
         name="opus_moe1_a8w4_bm32_bn384_a_reuse_mfma",
         trait="OpusMoeStage1A8W4P0Bm32Bn384AReuse",
@@ -72,18 +105,7 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         block_n=384,
         block_k=256,
         sort_block_m=32,
-        tuner_min_token=1,
-        tuner_max_token=1024,
-    ),
-    OpusA8W4Stage1Instance(
-        kid=OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_ROW_SPLIT,
-        name="opus_moe1_a8w4_bm64_bn384_row_split",
-        trait="OpusMoeStage1A8W4P0Bm64Bn384RowSplit",
-        block_m=64,
-        block_n=384,
-        block_k=256,
-        sort_block_m=64,
-        tuner_candidate=False,
+        tuner_tokens=(64, 256, 512, 1024),
     ),
     OpusA8W4Stage1Instance(
         kid=OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_GATE_UP_GROUP_SPLIT,
@@ -93,7 +115,7 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         block_n=384,
         block_k=256,
         sort_block_m=64,
-        tuner_min_token=1,
+        tuner_tokens=(128,),
     ),
     OpusA8W4Stage1Instance(
         kid=OPUS_A8W4_STAGE1_KID_P0_BM128_BN256_GATE_UP_GROUP_SPLIT,
@@ -103,8 +125,18 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         block_n=256,
         block_k=256,
         sort_block_m=128,
-        tuner_tokens=(32, 128),
+        tuner_tokens=(32,),
         tuner_min_token=2048,
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM64_BN256_GATE_UP_GROUP_SPLIT,
+        name="opus_moe1_a8w4_bm64_bn256_gateup_groupsplit",
+        trait="OpusMoeStage1A8W4P0Bm64Bn256GateUpGroupSplit",
+        block_m=64,
+        block_n=256,
+        block_k=256,
+        sort_block_m=64,
+        tuner_tokens=(4096,),
     ),
 )
 

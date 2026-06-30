@@ -31,9 +31,8 @@ struct OpusMoeStage1A8W4Pipeline
            tile.expert_id >= Traits::EXPERTS)
             return;
 
-        __shared__ __align__(Traits::BYTES_PER_VEC) float
-            smem_gate_up[Traits::EPILOGUE_SMEM_ROWS *
-                         Traits::EPILOGUE_SMEM_COLS];
+        __shared__ __align__(Traits::BYTES_PER_VEC) uint8_t
+            smem_scratch[Traits::SHARED_SCRATCH_BYTES];
         __shared__ int smem_token[Traits::B_M];
         __shared__ int smem_slot[Traits::B_M];
         __shared__ uint8_t smem_route_valid[Traits::B_M];
@@ -55,7 +54,7 @@ struct OpusMoeStage1A8W4Pipeline
 
         typename decltype(mma)::vtype_c
             rc[Traits::M_MFMA_PER_WAVE]
-              [Traits::OUTPUT_SCALE_GROUPS_PER_TILE]{};
+              [Traits::ACC_SCALE_GROUPS_PER_TILE]{};
 
         if constexpr(Traits::GATE_UP_GROUP_SPLIT)
         {
@@ -70,7 +69,7 @@ struct OpusMoeStage1A8W4Pipeline
                 smem_token,
                 smem_slot,
                 smem_route_valid,
-                reinterpret_cast<uint8_t*>(smem_gate_up),
+                smem_scratch,
                 rc);
             quant_epilogue_gate_up_group_split<Traits>(
                 kargs,
@@ -81,7 +80,7 @@ struct OpusMoeStage1A8W4Pipeline
                 smem_token,
                 smem_slot,
                 smem_route_valid,
-                smem_gate_up);
+                reinterpret_cast<float*>(smem_scratch));
         }
         else
         {
@@ -96,7 +95,7 @@ struct OpusMoeStage1A8W4Pipeline
                 smem_token,
                 smem_slot,
                 smem_route_valid,
-                reinterpret_cast<uint8_t*>(smem_gate_up),
+                smem_scratch,
                 rc);
             quant_epilogue<Traits>(
                 kargs,
@@ -107,7 +106,7 @@ struct OpusMoeStage1A8W4Pipeline
                 smem_token,
                 smem_slot,
                 smem_route_valid,
-                smem_gate_up);
+                reinterpret_cast<float*>(smem_scratch));
         }
 #else
         (void)kargs;
