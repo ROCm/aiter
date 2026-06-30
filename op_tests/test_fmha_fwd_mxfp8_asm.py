@@ -12,18 +12,45 @@
 #   batch=1, kv_head_num=1, gqa=1, seq_len=512, head_dim=128, mask=0.
 
 import argparse
-import math
 
+import pytest
 import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.test_common import run_perftest
 from aiter.test_mha_common import attention_ref
 
 BLOCK_SIZE = 32
 SUB_Q = 256
 SUB_K = 128
+
+
+def _is_gfx1250_host() -> bool:
+    """True only on a gfx1250 GPU host.
+
+    The MXFP8 ASM kernel is only shipped in hsa/gfx1250/fmha_fwd_mxfp8/*.co —
+    there are no gfx942 / gfx950 / etc. binaries.  On any other arch the call
+    raises 'no kernel for arch=...' at launch, so this guard skips (not fails)
+    the tests on non-gfx1250 hosts.  Short-circuits on no-GPU and swallows any
+    probe error.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return get_gfx() == "gfx1250"
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _is_gfx1250_host(),
+    reason=(
+        "fmha_fwd_mxfp8_asm ASM kernel is only shipped for gfx1250 "
+        "(hsa/gfx1250/fmha_fwd_mxfp8/*.co); no GPU or a different arch — skip"
+    ),
+)
 
 
 def align_to_tile(original, tile_size):
@@ -65,9 +92,15 @@ def make_inputs(batch, nheads, nheads_k, seqlen_q, seqlen_k, d):
 
     # BHSD memory (batch, head, seq, dim); transpose(1,2) gives a BSHD-shaped
     # view whose strides satisfy stride_head > stride_seq (bhsd memory order).
-    q_bhsd = torch.randn(batch, nheads, seqlen_q, d, device="cuda", dtype=torch.bfloat16)
-    k_bhsd = torch.randn(batch, nheads_k, seqlen_k, d, device="cuda", dtype=torch.bfloat16)
-    v_bhsd = torch.randn(batch, nheads_k, seqlen_k, d_v, device="cuda", dtype=torch.bfloat16)
+    q_bhsd = torch.randn(
+        batch, nheads, seqlen_q, d, device="cuda", dtype=torch.bfloat16
+    )
+    k_bhsd = torch.randn(
+        batch, nheads_k, seqlen_k, d, device="cuda", dtype=torch.bfloat16
+    )
+    v_bhsd = torch.randn(
+        batch, nheads_k, seqlen_k, d_v, device="cuda", dtype=torch.bfloat16
+    )
 
     q_fp8 = q_bhsd.to(dtypes.fp8)
     k_fp8 = k_bhsd.to(dtypes.fp8)
@@ -82,7 +115,9 @@ def make_inputs(batch, nheads, nheads_k, seqlen_q, seqlen_k, d):
     k_scale = create_mxfp8_scale_buffer(
         batch, nheads_k, seqlen_k, d, BLOCK_SIZE, SUB_K, extra_tiles=2
     )
-    v_scale = create_mxfp8_scale_buffer(batch, nheads_k, seqlen_k, d_v, BLOCK_SIZE, SUB_K)
+    v_scale = create_mxfp8_scale_buffer(
+        batch, nheads_k, seqlen_k, d_v, BLOCK_SIZE, SUB_K
+    )
 
     return q_in, k_in, v_in, q_scale, k_scale, v_scale, q_fp8, k_fp8, v_fp8
 
@@ -127,6 +162,49 @@ def run_one(batch, nheads, nheads_k, seqlen_q, seqlen_k, d, check=True):
     print("[test] PASS")
 
 
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("seqlen", [256, 384, 512, 1024, 8192])
+@pytest.mark.parametrize("nheads, nheads_k", [(5, 5), (8, 2)])
+@pytest.mark.parametrize("batch", [3])
+def test_fmha_fwd_mxfp8_asm_correctness(batch, nheads, nheads_k, seqlen, d, causal):
+    """MXFP8 ASM FMHA forward correctness across batch/head/seqlen shapes."""
+    (
+        q_in,
+        k_in,
+        v_in,
+        q_scale,
+        k_scale,
+        v_scale,
+        q_fp8,
+        k_fp8,
+        v_fp8,
+    ) = make_inputs(batch, nheads, nheads_k, seqlen, seqlen, d)
+
+    out, _ = aiter.fmha_fwd_mxfp8_asm(
+        q_in,
+        k_in,
+        v_in,
+        q_scale,
+        k_scale,
+        v_scale,
+        is_causal=causal,
+        return_lse=True,
+    )
+
+    q_ref = q_fp8.to(torch.bfloat16).transpose(1, 2)
+    k_ref = k_fp8.to(torch.bfloat16).transpose(1, 2)
+    v_ref = v_fp8.to(torch.bfloat16).transpose(1, 2)
+    out_ref, _, _ = attention_ref(q_ref, k_ref, v_ref, causal=causal, upcast=True)
+
+    max_diff = (out.float() - out_ref.float()).abs().max().item()
+    print(
+        f"[corr b={batch} hq={nheads} hk={nheads_k} seq={seqlen} d={d} "
+        f"causal={causal}] max_diff={max_diff:.5f}"
+    )
+    assert max_diff < 0.05, f"max_diff={max_diff} exceeds threshold 0.05"
+
+
 def run_perf(batch, nheads, nheads_k, seqlen_q, seqlen_k, d):
     (
         q_in,
@@ -151,9 +229,7 @@ def run_perf(batch, nheads, nheads_k, seqlen_q, seqlen_k, d):
     )
 
     fwd_flop = (
-        batch
-        * nheads
-        * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+        batch * nheads * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
     )
     tflops = fwd_flop / 1.0e6 / us
     quant_bytes = (
@@ -167,9 +243,7 @@ def run_perf(batch, nheads, nheads_k, seqlen_q, seqlen_k, d):
         f"[perf] b={batch} nheads={nheads} nheads_k={nheads_k} "
         f"seqlen_q={seqlen_q} seqlen_k={seqlen_k} d={d}"
     )
-    print(
-        f"[perf] latency={us:.2f} us  tflops={tflops:.2f}  gb/s={gb_per_s:.2f}"
-    )
+    print(f"[perf] latency={us:.2f} us  tflops={tflops:.2f}  gb/s={gb_per_s:.2f}")
 
 
 parser = argparse.ArgumentParser(description="MXFP8 ASM FMHA forward test (gfx1250)")

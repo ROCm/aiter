@@ -5,7 +5,7 @@
 //
 // This is a **dedicated** integration path, intentionally kept separate from
 // the bf16 `asm_fmha_fwd_with_sink` path and from the shared `fmha_v3` path.
-// The MXFP8 kernel uses its own (slot-padded) kernarg ABI which carries the
+// The MXFP8 kernel uses its own tightly-packed kernarg ABI which carries the
 // q/k/v micro-scaling (e8m0) descale pointers and which is expected to diverge
 // further from the MI350 / bf16 layouts.  Keeping a separate translation unit
 // and KernelArgs struct here means future MXFP8 kernarg changes never disturb
