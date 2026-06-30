@@ -304,7 +304,14 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     naive_ctas = batch_size * next_n * ((max_ctx + block_k - 1) // block_k)
     print("=" * 96)
 
-    max_blocks_per_seq = (max_ctx + kv_block_size - 1) // kv_block_size
+    # The kernel reads KV in block_k-sized chunks, so it touches tokens up to
+    # ceil(ctx/block_k)*block_k even when ctx is only kv_block_size-aligned.
+    # Size block_tables/kv_cache to the block_k boundary, otherwise the chunk
+    # tail reads past block_tables -> garbage phys block -> illegal access.
+    max_blocks_per_seq = max(
+        (max_ctx + block_k - 1) // block_k * (block_k // kv_block_size),
+        block_k // kv_block_size,
+    )
     num_blocks = max_blocks_per_seq * batch_size
     t_max = max_blocks_per_seq * kv_block_size
 
@@ -358,6 +365,11 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     # ---- Host schedule (precomputed once so the bench times only the launch) ----
     from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import compute_varctx_schedule
 
+    # The persistent-grid schedule has S = parallel_unit_num // next_n batch
+    # slots; if batch_size exceeds S the surplus batches are silently dropped
+    # (their out stays -inf -> NaN cosine). Grow the grid so every (batch,
+    # next_n) gets at least one slot.
+    parallel_unit_num = max(parallel_unit_num, batch_size * next_n)
     safe, cta_info, total_ctas = compute_varctx_schedule(
         context_lens, block_k, parallel_unit_num, t_max, next_n=next_n
     )
