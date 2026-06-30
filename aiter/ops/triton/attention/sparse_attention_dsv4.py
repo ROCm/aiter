@@ -20,7 +20,7 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
 from aiter.ops.triton.utils._triton import arch_info
 
 # Gluon (CDNA4) variant — opt-in, gated on Triton ≥ 3.6 + arch=gfx950.
-# Prefill is served by the unified `mla_gluon(..., mode="prefill")` entry (HAS_PE=False
+# Prefill is served by the unified `mla_gluon(..., has_pe=False)` entry (HAS_PE=False
 # + 1-D VarLen + single-split fast path over the shared `_mla_gluon` kernel).
 _TRITON_VERSION = Version(triton.__version__)
 _TRITON_GE_36 = _TRITON_VERSION >= Version("3.6.0")
@@ -316,7 +316,7 @@ def _sparse_attn_prefill_ragged(
             indices,  # page_table = ragged kv_indices
             indptr,  # seq_info = ragged kv_indptr
             float(scale),
-            mode="prefill",
+            has_pe=False,
             attn_sink=attn_sink if has_attn_sink else None,
         )
         return out

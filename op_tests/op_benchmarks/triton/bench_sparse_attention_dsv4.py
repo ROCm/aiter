@@ -5,7 +5,7 @@
 
 Benchmarks the Triton prefill kernel against the Gluon (CDNA4 / gfx950) prefill
 backend and reports the speedup over Triton. The Gluon backend is the unified
-`mla_gluon(..., mode="prefill")` entry (HAS_PE=False over the shared `_mla_gluon`
+`mla_gluon(..., has_pe=False)` entry (HAS_PE=False over the shared `_mla_gluon`
 kernel) — the backend the production entrance uses. When Gluon is unavailable
 (non-gfx950 arch, or Triton < 3.6), only the Triton perf is reported.
 
@@ -89,7 +89,7 @@ def _launch_prefill(
             indices,  # page_table = ragged kv_indices
             indptr,  # seq_info = ragged kv_indptr
             scale,
-            mode="prefill",
+            has_pe=False,
             attn_sink=attn_sink if has_sink else None,
         )
         return

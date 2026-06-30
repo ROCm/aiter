@@ -157,18 +157,11 @@ python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
 
 ### `mla_gluon.py` — MLA Decode + DeepSeek V4 Sparse Prefill
 
-A single public wrapper, **`mla_gluon(..., mode=...)`**, drives a single `@gluon.jit` backend kernel, **`_mla_gluon`**. Both modes share the kernel's explicit layouts, async-copy pipeline, and base-2 online-softmax epilogue; a `REGIME` constexpr (plus the `HAS_PE` / `EFF_ITER` knobs) gates the per-regime layouts, grid mapping, and the QK/PV math:
+**Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False)`
 
-- **`mode="decode"`** (default) — MLA decode (regimes `bh64`, `bh16bn128`, `bh16bn64`).
-- **`mode="prefill"`** — DeepSeek V4 sparse-attention prefill (regime `bh64` + `HAS_PE=False`).
+**Description:** Multi-head Latent Attention (DeepSeek MLA) kernel with split-KV. Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles.
 
-The two share the same kernel because DSV4 sparse prefill is exactly MLA with the RoPE term folded into the latent (`HAS_PE=False`) and per-query ragged KV — i.e. the decode NoPE path over a 1-D VarLen index view.
-
-**Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, mode="decode", k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False)`
-
-**Description:** Multi-head Latent Attention (DeepSeek MLA) decode with split-KV. Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles. Returns `(o, final_lse)` (`final_lse` is None unless `return_lse=True`).
-
-Decode dispatches by `(nhead, kv_c.dtype)` to one of three regimes of the shared `_mla_gluon` kernel (the `bh64` regime is also reused by `mode="prefill"` with `HAS_PE=False` — see below):
+The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time regimes (single `@gluon.jit` kernel, REGIME constexpr gates layouts and grid mapping):
 
 - **`bh64`** (`nhead in {64, 128}`): bf16 KV, BLOCK_H=64, BLOCK_N=64, multi-batch + XCD-aware 3-D grid. `NUM_KV_SPLITS` auto-picked &isin; {1, 2, 4} so the launch fills ~256 workgroups (one wave on MI350). When `NUM_KV_SPLITS == 1`, stage-1 writes the final attention output directly to `o` (no temp buffer, no reduce). When `NUM_KV_SPLITS > 1`, stage-1 writes per-split `(acc, fp32 lse)` and stage-2 (`_mla_softmax_reducev_kernel`) reduces them into `o`.
 - **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 2-D grid `(1, NUM_KV_SPLITS)` with token-bound `NUM_KV_SPLITS = max(1, min(256, min_kv_seq_len))` — 256 for the normal long-context path, reduced only for small kv (`min_kv_seq_len < 256`) so every split stays non-empty. Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1` (skipped via the fast path only at `min_kv_seq_len == 1`). Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
