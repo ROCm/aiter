@@ -1741,6 +1741,16 @@ def _flash_attn_forward(
             and k_descale.dtype == dtypes.fp8_e8m0
             and v_descale.dtype == dtypes.fp8_e8m0
         )
+
+        # The MXFP8 ASM kernel is validated only for BHSD memory order: a
+        # bshd-shaped [b, s, h, d] tensor whose head stride exceeds its seq
+        # stride (i.e. backed by [b, h, s, d] memory), with a contiguous last
+        # dim.  Any other layout (e.g. plain contiguous BSHD) is left to the
+        # other forward implementations rather than risking a wrong result.
+        def _is_bhsd(t):
+            return t.dim() == 4 and t.stride(-1) == 1 and t.stride(2) > t.stride(1)
+
+        ret = ret and _is_bhsd(q) and _is_bhsd(k) and _is_bhsd(v)
         # Only the D128 non-causal kernel is registered in fmha_fwd_mxfp8.csv.
         ret = ret and (hdim_q == 128)
         ret = ret and (hdim_v == hdim_q)
