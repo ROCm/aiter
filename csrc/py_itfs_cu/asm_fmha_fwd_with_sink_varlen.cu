@@ -59,8 +59,10 @@ static_assert(sizeof(FmhaFwdVarlenKernelArgs) == 0x58,
 
 // ---- helpers ---------------------------------------------------------------
 
-// Kernel selection: only (dtype, hdim_q, hdim_v, mask).  Only the _brd (border)
-// causal kernels are shipped, so mask is always 1.
+// Kernel selection: (dtype, hdim_q, hdim_v, mask).  mask = is_causal: the csv
+// registers both mask=0 (non-causal, _rxy[_sink]_pfnr source) and mask=1
+// (causal, _rxy[_sink]_pfnr_cas_brd source -> *_mask_varlen.co) variants, so
+// is_causal picks the matching .co at launch time.
 static std::string get_heuristic_kernel_fmha_fwd_bf16_varlen(const std::string& dtype,
                                                              int hdim_q,
                                                              int hdim_v,
@@ -246,9 +248,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int sub_Q        = 128;   // ts_qo
     const int wv_tg        = 4;
     const int bdx          = (wv_tg == 4) ? 128 : 256;
-    const int tg_div       = 1;     // double_q = 0
-    const int q_tile_count = (max_seqlen_q + sub_Q - 1) / sub_Q;
-    const int gdx          = (q_tile_count + tg_div - 1) / tg_div;
+    const bool double_q    = (args.opt & 0x2) != 0;  // bit1 of s_opt
+    const int  tg_div      = double_q ? 2 : 1;
+    const int  q_tile_count = (max_seqlen_q + sub_Q - 1) / sub_Q;
+    const int  gdx          = (q_tile_count + tg_div - 1) / tg_div;
     const int gdy          = q_head_num;
     const int gdz          = batch;
 

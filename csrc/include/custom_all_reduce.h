@@ -109,7 +109,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t reg_ptr,
                                              int64_t reg_bytes,
                                              bool use_1stage,
-                                             int64_t bf16_out_ptr = 0);
+                                             int64_t bf16_out_ptr = 0,
+                                             bool transpose_scale = false);
 void fused_allreduce_rmsnorm_mxfp4_quant(fptr_t _fa,
                                          const aiter_tensor_t& inp,
                                          const aiter_tensor_t& res_inp,
@@ -132,6 +133,20 @@ void fused_qknorm_allreduce(fptr_t _fa,
                             double eps,
                             int64_t reg_ptr,
                             int64_t reg_bytes);
+void fused_qknorm_allreduce_rope(fptr_t _fa,
+                                 const aiter_tensor_t& qkv_in,
+                                 const aiter_tensor_t& q_w,
+                                 const aiter_tensor_t& k_w,
+                                 const aiter_tensor_t& q_out,
+                                 const aiter_tensor_t& k_out,
+                                 const aiter_tensor_t& v_out,
+                                 const aiter_tensor_t& cos_sin_cache,
+                                 const aiter_tensor_t& position_ids,
+                                 int64_t head_dim,
+                                 int64_t rotary_dim,
+                                 double eps,
+                                 int64_t reg_ptr,
+                                 int64_t reg_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_input_buffer(fptr_t _fa,

@@ -77,7 +77,7 @@ def _flash_attn_forward(
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    if window_size_right != -1:
+    if _MHA_IMPL != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
     sliding_window = window_size_left if window_size_left >= 0 else 0
 
@@ -191,9 +191,6 @@ def _flash_attn_forward(
         assert (
             not IS_FP8
         ), "dao_ai impl does not support FP8. Use the default impl or FA3 path."
-        assert (
-            window_size_left == -1 and window_size_right == -1
-        ), "dao_ai impl does not support sliding window attention."
         if is_varlen:
             o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
                 q,
@@ -212,8 +209,8 @@ def _flash_attn_forward(
                 softmax_scale=softmax_scale,
                 zero_tensors=False,
                 causal=causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
                 softcap=0.0,
                 return_softmax=return_softmax,
             )
@@ -227,8 +224,8 @@ def _flash_attn_forward(
                 dropout_p,
                 softmax_scale,
                 causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
                 softcap=0.0,
                 return_softmax=return_softmax,
             )
@@ -423,8 +420,8 @@ class _FlashAttnFunc(torch.autograd.Function):
                 ctx.dropout_p,
                 ctx.softmax_scale,
                 ctx.causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
                 softcap=0.0,
                 deterministic=ctx.deterministic,
             )
@@ -717,8 +714,8 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 softmax_scale=ctx.softmax_scale,
                 zero_tensors=False,
                 causal=ctx.causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
                 softcap=0.0,
                 deterministic=False,
             )

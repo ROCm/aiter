@@ -132,6 +132,7 @@ def fused_allreduce_rmsnorm_quant_per_group(
     reg_bytes: int,
     use_1stage: bool,
     bf16_out_ptr: int = 0,
+    transpose_scale: bool = False,
 ) -> None: ...
 
 
@@ -161,6 +162,25 @@ def fused_qknorm_allreduce(
     q_out: torch.Tensor,
     k_out: torch.Tensor,
     v_out: torch.Tensor,
+    eps: float,
+    reg_ptr: int,
+    reg_bytes: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def fused_qknorm_allreduce_rope(
+    _fa: int,
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
     eps: float,
     reg_ptr: int,
     reg_bytes: int,
