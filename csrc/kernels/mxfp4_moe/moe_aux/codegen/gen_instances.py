@@ -17,6 +17,7 @@ from pathlib import Path
 # (NE, D_HIDDEN, D_INTER, TOPK)
 SHAPES = [
     (385, 7168, 512, 9),  # Kimi-K2.5 TP=4
+    (385, 7168, 1024, 9),  # Kimi-K2.5 TP=2 (kimik2_c)
     (257, 7168, 512, 9),  # DSR (dsv3_b)
     (257, 7168, 256, 9),  # DSR D_INTER=256 (dsv3_c)
     (384, 7168, 512, 8),  # Kimi-K2 TP=4, TOPK=8 (kimik2_a)
