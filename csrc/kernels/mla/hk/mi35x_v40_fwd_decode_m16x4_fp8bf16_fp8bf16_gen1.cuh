@@ -68,7 +68,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
     // Phase 1: PV always at call end (no deferral). Phase 2 adds the deferred-PV
     // axis for the occ=2 SIMD-pairing experiment.
-    constexpr bool kPvAtEnd = true;
+    constexpr bool kPvAtEnd = false;
     (void)kPlus4IsRope;
 
     constexpr comp_t log2e = 1.4426950408889634;
@@ -164,6 +164,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
     // ---- Runtime constants ----
     const uint32_t lane_idx = opus::lane_id();
+    const uint32_t p4_warp_idx = warp_idx + T::kNumWarps;
 
     // Causal mask: compute per-warp kv_end offset for MTP.
     // num_wave_group = qseqlen = kBlockM / num_qheads
@@ -502,6 +503,10 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                     warp_idx, params.p_kv_buffer, row_kv_ld_next, p0);
                 kv_manager.template prefetch_kv_nope<0u, kTileCols, kCheckBoundaryNext, kIsRopeWarp>(
                     warp_idx, params.p_kv_buffer, row_kv_ld_next, p1);
+                kv_manager.template prefetch_kv_nope<0u, 0u, kCheckBoundaryNext, kPlus4IsRope>(
+                    p4_warp_idx, params.p_kv_buffer, row_kv_ld_next, p0b);
+                kv_manager.template prefetch_kv_nope<0u, kTileCols, kCheckBoundaryNext, kPlus4IsRope>(
+                    p4_warp_idx, params.p_kv_buffer, row_kv_ld_next, p1b);
             }
 
             // ---- Lo deferred PV (of the PREVIOUS tile) ----
@@ -518,9 +523,14 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
             __builtin_amdgcn_s_setprio(3);
 
-            // Keep the own prefetch (4 loads: p0+p1) in flight for cvt+store, then
-            // cross-warp barrier so KV LDS is visible to QK.
-            __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/4));
+            if constexpr(kWarpType == WarpTypeM16x4::EvenPlus4NoPE)
+            {
+                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/8));
+            }
+            else
+            {
+                __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/0, /*vmcnt=*/6));
+            }
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
@@ -619,11 +629,14 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             if constexpr(kIsGlobalLast == false)
             {
                 constexpr uint32_t kTileCols = 256u;
-                const uint32_t kPlus4WarpIdx = warp_idx + T::kNumWarps;
+                const uint32_t p4_warp_idx = warp_idx + T::kNumWarps;
                 hk::u32x4 dw;
 
+                kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext, kPlus4IsRope>(
+                    p_lds_kv_next, p4_warp_idx, params.p_kv_buffer_rope, row_kv_ld_next);
+
                 // ---- own strip cvt+store (p0,p1 from Phase A; 4 loads, drain 2->0) ----
-                kv_manager.template wait_kv_loads<0u, 0u, false, /*kVmCnt=*/2>(warp_idx);
+                kv_manager.template wait_kv_loads<0u, 0u, false, /*kVmCnt=*/6>(warp_idx);
                 const float scale_f0 = kv_manager.kv_tile_scale_f(p0);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p0, scale_f0);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p0, scale_f0);
@@ -631,7 +644,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 kv_manager.template cvt_kv_tile_step<2>(dw, p0, scale_f0);
                 kv_manager.template cvt_kv_tile_step<3>(dw, p0, scale_f0);
                 kv_manager.template store_kv_tile_step<0u, 0u, 1, false>(p_lds_kv_next, warp_idx, dw);
-                kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/0>(warp_idx);
+                kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/4>(warp_idx);
                 const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p1, scale_f1);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p1, scale_f1);
@@ -640,37 +653,24 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 kv_manager.template cvt_kv_tile_step<3>(dw, p1, scale_f1);
                 kv_manager.template store_kv_tile_step<0u, kTileCols, 1, false>(p_lds_kv_next, warp_idx, dw);
 
-                // ---- +4 strip: prefetch now (p0b/p1b reuse p0/p1 regs), then cvt ----
-                // p1b is a no-op on odd (+4 tile-1 is RoPE, DMA'd by prefetch_kv_rope).
-                kv_manager.template prefetch_kv_nope<0u, 0u, kCheckBoundaryNext, kPlus4IsRope>(
-                    kPlus4WarpIdx, params.p_kv_buffer, row_kv_ld_next, p0b);
-                kv_manager.template prefetch_kv_nope<0u, kTileCols, kCheckBoundaryNext, kPlus4IsRope>(
-                    kPlus4WarpIdx, params.p_kv_buffer, row_kv_ld_next, p1b);
-                kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext, kPlus4IsRope>(
-                    p_lds_kv_next, kPlus4WarpIdx, params.p_kv_buffer_rope, row_kv_ld_next);
-
-                kv_manager.template wait_kv_loads<0u, 0u, kPlus4IsRope, /*kVmCnt=*/2>(kPlus4WarpIdx);
+                kv_manager.template wait_kv_loads<0u, 0u, kPlus4IsRope, /*kVmCnt=*/2>(p4_warp_idx);
                 const float scale_f0b = kv_manager.kv_tile_scale_f(p0b);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p0b, scale_f0b);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p0b, scale_f0b);
-                kv_manager.template store_kv_tile_step<0u, 0u, 0, kPlus4IsRope>(p_lds_kv_next, kPlus4WarpIdx, dw);
+                kv_manager.template store_kv_tile_step<0u, 0u, 0, kPlus4IsRope>(p_lds_kv_next, p4_warp_idx, dw);
                 kv_manager.template cvt_kv_tile_step<2>(dw, p0b, scale_f0b);
                 kv_manager.template cvt_kv_tile_step<3>(dw, p0b, scale_f0b);
-                kv_manager.template store_kv_tile_step<0u, 0u, 1, kPlus4IsRope>(p_lds_kv_next, kPlus4WarpIdx, dw);
+                kv_manager.template store_kv_tile_step<0u, 0u, 1, kPlus4IsRope>(p_lds_kv_next, p4_warp_idx, dw);
                 if constexpr(!kPlus4IsRope)
                 {
-                    kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/0>(kPlus4WarpIdx);
+                    kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/0>(p4_warp_idx);
                     const float scale_f1b = kv_manager.kv_tile_scale_f(p1b);
                     kv_manager.template cvt_kv_tile_step<0>(dw, p1b, scale_f1b);
                     kv_manager.template cvt_kv_tile_step<1>(dw, p1b, scale_f1b);
-                    kv_manager.template store_kv_tile_step<0u, kTileCols, 0, false>(p_lds_kv_next, kPlus4WarpIdx, dw);
+                    kv_manager.template store_kv_tile_step<0u, kTileCols, 0, false>(p_lds_kv_next, p4_warp_idx, dw);
                     kv_manager.template cvt_kv_tile_step<2>(dw, p1b, scale_f1b);
                     kv_manager.template cvt_kv_tile_step<3>(dw, p1b, scale_f1b);
-                    kv_manager.template store_kv_tile_step<0u, kTileCols, 1, false>(p_lds_kv_next, kPlus4WarpIdx, dw);
-                }
-                else
-                {
-                    __builtin_amdgcn_s_waitcnt(hk_mla::encode_s_waitcnt(/*lgkmcnt=*/-1, /*vmcnt=*/0));
+                    kv_manager.template store_kv_tile_step<0u, kTileCols, 1, false>(p_lds_kv_next, p4_warp_idx, dw);
                 }
             }
 

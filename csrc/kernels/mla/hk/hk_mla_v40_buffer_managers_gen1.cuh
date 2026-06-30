@@ -1085,7 +1085,8 @@ class KvManager8to16bitsV1
             return;
         }
 
-        const uint32_t lane_idx         = opus::lane_id();
+        uint32_t lane_idx = opus::lane_id();
+        asm volatile("" : "+v"(lane_idx)); // break-CSE: don't hold store addr across QK
         const uint32_t row_in_tile      = lane_idx >> 2;
         const uint32_t col_group        = lane_idx & 3u;
         const uint32_t row_tile         = wave_row_tile(warp_idx);
