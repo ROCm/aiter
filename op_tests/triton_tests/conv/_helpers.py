@@ -42,12 +42,9 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.triton.conv._utils import (
-    dynamic_conv_tolerances,
     _out_hw,
     _is_1x1_conv,
     _is_3x3_conv,
-    _winograd_tolerances,
-    apply_activation,
 )
 from aiter.ops.triton.conv._launch import _select_3x3_method
 from aiter.ops.triton.conv.conv2d import (
@@ -58,6 +55,44 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_winograd_f4x3_fused,
     conv2d_winograd_f4x3_cblocked,
 )
+
+
+def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int):
+    eps = {
+        torch.float16: 2**-10,
+        torch.bfloat16: 2**-7,
+        torch.float32: 2**-23,
+    }.get(dtype, 2**-10)
+    rtol = 6e-3 if K_red < 1024 else (8e-3 if K_red < 4096 else 1.2e-2)
+    # Error model: fp16 inputs multiplied pairwise have eps relative error per product.
+    # Accumulated in fp32 over K_red terms, max absolute error grows as ~eps * sqrt(K_red).
+    # The 10x multiplier covers worst-case accumulation ordering differences
+    # between our Triton kernels and PyTorch reference.
+    atol = max(eps * 8, 10.0 * eps * (K_red**0.5))
+    return rtol, atol
+
+
+def _winograd_tolerances(dtype, K_red, variant="f4x3"):
+    """Return (rtol, atol) for Winograd F(4x4,3x3) correctness checks.
+    Winograd transforms amplify fp16 rounding errors:
+    - F(4x4,3x3): coefficients up to ±8, significant amplification
+    """
+    rtol, atol = dynamic_conv_tolerances(dtype, K_red)
+    if variant == "f4x3":
+        rtol *= 6.0
+        atol = max(atol * 6.0, 0.6)
+    return rtol, atol
+
+
+def apply_activation(y: torch.Tensor, activation: str):
+    if activation == "relu":
+        return F.relu(y)
+    if activation == "relu6":
+        return torch.clamp(y, 0, 6)
+    if activation == "gelu":
+        return F.gelu(y, approximate="tanh")
+    return y
+
 
 # -- Architecture gating ------------------------------------------------------
 SUPPORTED_ARCHS = {
@@ -159,7 +194,7 @@ class TestSuite:
         rel = max_abs / (float(ref32.abs().max().item()) + 1e-6)
         if rtol is None or atol is None:
             K_est = int(K_red) if K_red is not None else 1024
-            rtol_calc, atol_calc = dynamic_conv_tolerances(self.dtype, K_est, ref32)
+            rtol_calc, atol_calc = dynamic_conv_tolerances(self.dtype, K_est)
             rtol = rtol if rtol is not None else rtol_calc
             atol = atol if atol is not None else atol_calc
         try:
@@ -190,12 +225,12 @@ def _get_tolerances(
     method_name, entry, suite, y_ref, N, C, H, W, K_out, R, S, stride, dilation
 ):
     if entry.is_winograd:
-        return _winograd_tolerances(suite.dtype, C * R * S, y_ref, "f4x3")
+        return _winograd_tolerances(suite.dtype, C * R * S, "f4x3")
     if method_name == "default" and _is_3x3_conv(R, S):
         routed = _select_3x3_method(N, C, H, W, K_out, stride, dilation)
         if routed and "winograd" in routed:
-            return _winograd_tolerances(suite.dtype, C * R * S, y_ref, "f4x3")
-    return dynamic_conv_tolerances(suite.dtype, C * R * S, y_ref)
+            return _winograd_tolerances(suite.dtype, C * R * S, "f4x3")
+    return dynamic_conv_tolerances(suite.dtype, C * R * S)
 
 
 def run_all_methods(
@@ -274,7 +309,7 @@ def run_all_methods(
         if _is_3x3_conv(R, S):
             nhwc_method = _select_3x3_method(N, C, H, W_in, K_out, stride, dilation)
             if nhwc_method in ("winograd_f4x3", "winograd_f4x3_cblocked"):
-                _r, _a = _winograd_tolerances(suite.dtype, C * R * S, y_ref, "f4x3")
+                _r, _a = _winograd_tolerances(suite.dtype, C * R * S, "f4x3")
                 suite.check_close(f"{name} [NHWC]", y_nhwc, y_ref, rtol=_r, atol=_a)
             else:
                 suite.check_close(f"{name} [NHWC]", y_nhwc, y_ref, K_red=C * R * S)
