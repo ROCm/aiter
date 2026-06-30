@@ -48,13 +48,37 @@ def dao_ai_impl():
 
 
 @pytest.mark.parametrize(
-    "BATCH, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, CAUSAL, VARLEN, BWD",
+    "BATCH, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, CAUSAL, VARLEN, BWD, WINDOW_SIZE",
     [
-        (1, 128, 128, 8, 8, 64, True, False, False),  # fwd causal
-        (2, 256, 256, 16, 4, 128, False, False, False),  # fwd GQA non-causal
-        (1, 128, 128, 8, 8, 64, True, True, False),  # fwd_varlen causal
-        (1, 128, 128, 8, 8, 64, True, False, True),  # bwd causal
-        (1, 128, 128, 8, 8, 64, True, True, True),  # bwd_varlen causal
+        (1, 128, 128, 8, 8, 64, True, False, False, (-1, -1)),  # fwd causal
+        (2, 256, 256, 16, 4, 128, False, False, False, (-1, -1)),  # fwd GQA non-causal
+        (1, 128, 128, 8, 8, 64, True, True, False, (-1, -1)),  # fwd_varlen causal
+        (1, 128, 128, 8, 8, 64, True, False, True, (-1, -1)),  # bwd causal
+        (1, 128, 128, 8, 8, 64, True, True, True, (-1, -1)),  # bwd_varlen causal
+        (1, 128, 128, 8, 8, 64, True, False, True, (32, 0)),  # causal window
+        (1, 128, 128, 8, 8, 64, True, True, True, (32, 0)),  # causal window varlen
+        (1, 128, 128, 8, 8, 64, False, False, True, (16, 16)),  # symmetric window
+        (1, 128, 128, 8, 8, 64, False, True, True, (16, 16)),  # symmetric win varlen
+        (1, 128, 128, 8, 8, 64, False, False, True, (-1, 32)),  # infinite-left window
+        # seqlen_q != seqlen_k exercises the causal_offset / delta_qk arithmetic
+        (1, 128, 256, 8, 8, 64, True, False, True, (32, 0)),  # causal, sq != sk
+        (1, 128, 256, 8, 8, 64, True, True, True, (32, 0)),  # causal varlen, sq != sk
+        (1, 128, 256, 8, 8, 64, False, False, True, (16, 16)),  # symmetric, sq != sk
+        # GQA (num_q_heads != num_k_heads) combined with sliding-window backward
+        (2, 128, 128, 16, 4, 64, True, False, True, (32, 0)),  # GQA causal window
+        (2, 128, 128, 16, 4, 64, False, True, True, (16, 16)),  # GQA symmetric varlen
+        # Production-size sequence lengths (beyond the upstream 2048 cap) with
+        # large windows (128/256). seqlen >> window means the window spans many
+        # key blocks, exercising the bwd full/partial/skipped block
+        # classification that the small (seqlen 128, window 16/32) cases barely
+        # reach.
+        (1, 4096, 4096, 8, 8, 64, True, False, True, (256, 0)),  # large causal window
+        (1, 4096, 4096, 8, 8, 64, True, True, True, (256, 0)),  # large causal varlen
+        (1, 4096, 4096, 8, 8, 64, False, False, True, (256, 256)),  # large symmetric
+        (2, 4096, 4096, 16, 4, 64, True, False, True, (128, 0)),  # GQA large causal
+        # seqlen_q != seqlen_k at production size exercises the causal_offset /
+        # delta_qk arithmetic with a window spanning many blocks.
+        (1, 4096, 8192, 8, 8, 64, True, False, True, (256, 0)),  # large causal sq != sk
     ],
 )
 def test_mha_dao_ai(
@@ -68,6 +92,7 @@ def test_mha_dao_ai(
     CAUSAL: bool,
     VARLEN: bool,
     BWD: bool,
+    WINDOW_SIZE: tuple[int, int],
     dtype=torch.float16,
 ):
     """Test dao_ai impl dispatch for fwd/bwd x varlen against PyTorch reference."""
@@ -138,12 +163,15 @@ def test_mha_dao_ai(
                 max_seqlen_q,
                 max_seqlen_k,
                 causal=CAUSAL,
+                window_size=WINDOW_SIZE,
             )
     else:
         query_padding_mask = None
         key_padding_mask = None
         with torch.set_grad_enabled(BWD):
-            triton_out = flash_attn_func(q, k, v, causal=CAUSAL)
+            triton_out = flash_attn_func(
+                q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE
+            )
 
     # Forward check against PyTorch reference
     q_ref = q.detach().clone().requires_grad_(BWD)
@@ -154,6 +182,7 @@ def test_mha_dao_ai(
         k_ref,
         v_ref,
         causal=CAUSAL,
+        window_size=WINDOW_SIZE,
         query_padding_mask=query_padding_mask,
         key_padding_mask=key_padding_mask,
     )
@@ -204,6 +233,39 @@ def test_mha_dao_ai(
             rtol=1e-2,
             msg=lambda msg: f"dao_ai bwd dv mismatch\n\n{msg}\n",
         )
+
+
+def test_mha_dao_ai_negative_right_window_raises(dao_ai_impl):
+    """A negative right edge (window_size_right < 0) must be rejected.
+
+    Neither fwd nor bwd has an infinite-right code path: WINDOW_SIZE_RIGHT is used
+    as a literal finite offset everywhere (the per-element right_bound, the forward
+    block-classification bounds, and the m_lo/n_hi bounds in
+    _sliding_window_q_bounds/_k_bounds), so a value of -1 collapses right_bound to
+    "anchor - 1" -- over-masking per element AND skipping blocks that should
+    contribute. Both forward and backward guard against it instead of silently
+    returning a wrong result.
+
+    Forward is the reachable guard via the public API (it fires before grad can
+    run); the matching backward guard in attention_backward_triton_impl remains as
+    defense-in-depth. (window_size_right == -1 is only valid as the off sentinel,
+    paired with window_size_left == -1.)
+    """
+    torch.manual_seed(20)
+    q = torch.randn(
+        1, 128, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    k = torch.randn(
+        1, 128, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+    v = torch.randn(
+        1, 128, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True
+    )
+
+    # window_size=(32, -1): finite left, negative right -> sliding window active
+    # with window_size_right < 0. Forward must raise before any backward runs.
+    with pytest.raises(NotImplementedError):
+        flash_attn_func(q, k, v, causal=False, window_size=(32, -1))
 
 
 @pytest.mark.parametrize("default_device", ["cpu", "cuda"])
