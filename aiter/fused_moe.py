@@ -876,7 +876,6 @@ class MOEMetadata:
     fuse_quant: str = ""
     stage2_has_bias: bool = False
     flat: bool = False
-    skip_inter_quant: bool = False
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1365,12 +1364,6 @@ def get_2stage_cfgs(
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
             return 32
-        elif q_dtype_a == dtypes.fp4x2:
-            # MXFP4 fused quant+sort requires block_size % 32 == 0.
-            # block_m=64 is significantly faster than 32 for fp4x2 on
-            # gfx950 across all tested batch sizes (up to 1.5x for
-            # prefill).  128 is not supported by current CKTile stage2.
-            return 64
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
@@ -1615,7 +1608,6 @@ def get_2stage_cfgs(
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
-        and q_dtype_a not in [dtypes.fp4x2]
         and is_shuffled
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
         and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
@@ -1652,17 +1644,28 @@ def get_2stage_cfgs(
             has_bias=activation == ActivationType.Swiglu,
             stage2_has_bias=activation == ActivationType.Swiglu,
         )
-    elif (
-        dtype in [dtypes.bf16, dtypes.fp16]
+
+    if (
+        activation == ActivationType.Swiglu
+        and q_dtype_w == dtypes.fp4x2
         and q_type == QuantType.per_1x32
-        and q_dtype_a in [dtypes.fp4x2]
-        and q_dtype_w in [dtypes.fp4x2]
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and not kernelName1
     ):
+        logger.warning(
+            "[fused_moe] SwiGLU MXFP4 with unshuffled weights not supported "
+            "by CK2stages codegen; routing to CK-Tile (ROCM-25478)"
+        )
+        _split_k = max(int(ksplit), 2)
+        _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
             functools.partial(
-                ck_moe_stage1,
-                quant_type=q_type,
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
+                split_k=_split_k,
+                dtype=dtype,
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -1670,10 +1673,11 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
             ),
-            get_block_m(),
-            0,
-            False,
-            skip_inter_quant=True,
+            _cktile_block_m,
+            _split_k,
+            run_1stage,
+            has_bias=True,
+            stage2_has_bias=True,
         )
 
     if (kernelName1 and "ck2stages" in kernelName1) or (
@@ -1979,7 +1983,6 @@ def fused_moe_2stages(
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
             or (metadata.ksplit > 1 and is_shuffled)
-            or metadata.skip_inter_quant
         )
     ):
         a2_scale = None
@@ -2424,16 +2427,6 @@ def torch_moe_stage2(
         hidden_states = hidden_states.view(a2_shape)
 
         w2_shape = w2.shape
-        # Some TP-sharded models carry padded per_1x32 scale groups in w2_scale.
-        # Align scale groups to runtime inter_dim groups for robust torch fallback.
-        w2_scale = w2_scale.view(E, model_dim, -1)
-        w2_groups = inter_dim // 32
-        if w2_scale.shape[2] > w2_groups:
-            w2_scale = w2_scale[:, :, :w2_groups]
-        elif w2_scale.shape[2] < w2_groups:
-            pad = w2_groups - w2_scale.shape[2]
-            w2_scale = torch.nn.functional.pad(w2_scale, (0, pad), value=1.0)
-
         w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
             E, model_dim, inter_dim // 32, 1
         )
@@ -2557,6 +2550,8 @@ def cktile_moe_stage1(
     ):
         out = torch.empty(expected_out_shape, dtype=dtype, device=hidden_states.device)
     needs_post_activation = split_k > 1
+    # Split-k reduces into a token-topk workspace and applies activation after
+    # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
     workspace_rows = token_num * topk
     if needs_post_activation:
         tmp_out = torch.zeros(
@@ -2565,7 +2560,6 @@ def cktile_moe_stage1(
     else:
         tmp_out = out
     bias1 = _normalize_bias_for_kernel(bias1)
-
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
