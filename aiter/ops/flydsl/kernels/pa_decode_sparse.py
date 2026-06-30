@@ -21,7 +21,6 @@ import functools
 from contextlib import contextmanager
 
 import torch
-import triton
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -726,38 +725,34 @@ def flydsl_pa_decode_sparse(
     T_val, H, D = q.shape
     device = q.device
 
-    # ---- block_k selection ----
-    # MFMA kernel: BLOCK_H=16, BLOCK_K=16. Requires H divisible by 16 and D divisible by 16.
-    # Falls back to scalar kernel otherwise.
-    _use_mfma = (
-        D % _MFMA_K == 0
-        and _get_mfma_bf16_k16() is not None
-        and H % _BLOCK_H == 0
-    )
-    block_k = _BLOCK_H if _use_mfma else (16 if D >= 256 else 32)
-
-    # ---- kv_splits auto-selection ----
-    # Target: keep total CTAs near max_num_wg for good GPU utilization.
-    # MFMA uses n_head_blocks = ceil(H/16) CTAs per token, vs H for scalar.
-    # This reduces parallelism 16× → compensate with more kv_splits.
-    max_num_wg = 256
-    if kv_splits is None:
-        max_kv_len    = kv_indices.shape[0]
-        max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
-        n_head_blocks = (H + _BLOCK_H - 1) // _BLOCK_H if _use_mfma else H
-        kv_splits     = max(1, max_num_wg // max(1, T_val * n_head_blocks))
-        if _use_mfma:
-            # MFMA groups BLOCK_H=16 heads per CTA, reducing head parallelism 16×.
-            # Compensate with more kv_splits, but cap at 2 to avoid reduce overhead:
-            # empirically kv_splits=2 is near-optimal for large T×H workloads.
-            kv_splits = max(kv_splits, 2)
-        kv_splits     = min(max_kv_splits, kv_splits)
-        kv_splits     = triton.next_power_of_2(kv_splits)
-
     assert D % WAVE_SIZE == 0, (
         f"D={D} must be divisible by {WAVE_SIZE} (threads per wave); "
         f"got D % {WAVE_SIZE} = {D % WAVE_SIZE}"
     )
+
+    # ---- block_k selection ----
+    # MFMA kernel: BLOCK_H=16, BLOCK_K=16. Requires H divisible by 16 and D divisible by 16.
+    assert D % _MFMA_K == 0 and _get_mfma_bf16_k16() is not None and H % _BLOCK_H == 0, "For MFMA kernel, D must be divisible by 16 and H must be divisible by 16"
+    block_k = _BLOCK_H
+
+    # ---- kv_splits auto-selection ----
+    # Target: keep total CTAs near max_num_wg for good GPU utilization.
+    # MFMA uses n_head_blocks = ceil(H/16) CTAs per token, vs H for scalar.
+    # This reduces parallelism 16x -> compensate with more kv_splits.
+    max_occupancy = 2 # We can schedule 2 CTAs per CU
+    num_cus = 304 # gfx942 has 304 CUs
+    max_num_wg = max_occupancy * num_cus
+    if kv_splits is None:
+        max_kv_len    = kv_indices.shape[0]
+        max_kv_splits = max(1, (max_kv_len + block_k - 1) // block_k)
+        n_head_blocks = (H + _BLOCK_H - 1) // _BLOCK_H
+        kv_splits     = max(1, max_num_wg // max(1, T_val * n_head_blocks))
+        # MFMA groups BLOCK_H=16 heads per CTA, reducing head parallelism 16x.
+        # Compensate with more kv_splits, but cap at 2 to avoid reduce overhead:
+        # empirically kv_splits=2 is near-optimal for large T×H workloads.
+        kv_splits     = max(kv_splits, 2)
+        kv_splits     = min(max_kv_splits, kv_splits)
+        kv_splits     = 1 << (kv_splits - 1).bit_length()
 
     out = torch.zeros((T_val, H, D), dtype=torch.bfloat16, device=device)
 
@@ -769,16 +764,7 @@ def flydsl_pa_decode_sparse(
         acc_partial = torch.empty((T_val, kv_splits, H, D), dtype=torch.float32, device=device)
 
     # ---- Compile (or retrieve cached) kernel ----
-    if _use_mfma:
-        launcher = _compile_pa_decode_sparse_mfma(
-            H=H,
-            D=D,
-            BLOCK_K=block_k,
-            KV_SPLITS=kv_splits,
-            softmax_scale=float(softmax_scale),
-        )
-    else:
-        launcher = _compile_pa_decode_sparse(
+    launcher = _compile_pa_decode_sparse_mfma(
             H=H,
             D=D,
             BLOCK_K=block_k,
@@ -807,9 +793,9 @@ def flydsl_pa_decode_sparse(
         return acc_partial, m_partial, l_partial
 
     # ---- Triton reduce kernel: combine KV_SPLITS partial states ----
-    block_d      = triton.next_power_of_2(D)
+    block_d      = 1 << (D - 1).bit_length()
     block_h_red  = 1
-    grid_reduce  = (T_val, triton.cdiv(H, block_h_red))
+    grid_reduce  = (T_val, (H + block_h_red - 1) // block_h_red)
 
     _pa_decode_sparse_reduce = _get_triton_reduce()
     _pa_decode_sparse_reduce[grid_reduce](
