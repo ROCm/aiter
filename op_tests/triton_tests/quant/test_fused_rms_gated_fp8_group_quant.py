@@ -7,7 +7,7 @@
 import pytest
 import torch
 
-from aiter.ops.triton.quant.fused_fp8_quant import (
+from aiter.ops.triton.quant import (
     fused_rms_gated_fp8_group_quant,
     get_fp8_min_max_bounds,
 )

@@ -72,6 +72,25 @@ struct smem_x1b {
             inner.template store<vec>(v_, swiz(offsets[i]));
         }
     }
+
+    template<opus::index_t vec = 1, typename V, typename Layout,
+             std::enable_if_t<((opus::is_array_v<V> || opus::is_dtype_v<V> || opus::is_vector_v<V>)
+                                && opus::is_layout_v<Layout>), bool> = true>
+    OPUS_D void store_part(const V& x, const Layout& u, opus::index_t i) {
+        using LT = opus::layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = opus::layout_to_offsets<vec>(u);
+        auto a_ = [&]() {
+            if constexpr (opus::is_array_v<V>) return opus::to_vector(x);
+            else if constexpr (opus::is_dtype_v<V>) return opus::make_repeated_vector(x, opus::number<r_elem.value>{});
+            else if constexpr (opus::is_vector_v<V>) return x;
+        }();
+        vector_type<vec> v_;
+        for (opus::index_t j = 0; j < vec * vector_size; j++)
+            v_[j] = a_[i * vec * vector_size + j];
+        inner.template store<vec>(v_, swiz(offsets[i]));
+    }
+
 };
 
 namespace opus {
@@ -272,6 +291,41 @@ inline __device__ auto make_layout_rb_wave_n_major(int lane_id, int wave_id_n) {
         opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n / wn_per_wm_grp, lane_id_n % T::T_N, wave_id_n % wn_per_wm_grp, lane_id_n / T::T_N, lane_id / T::W_N}));
 }
 
+// Dedicated B LDS read layout for the gfx942 quad MFMA32 path.
+// It reads the make_layout_sb() physical layout while mapping the compute
+// wave's N id onto the storing wave-M slot.
+template<typename T, int STRIDE_PAD = 0>
+inline __device__ auto make_layout_rb_quad_mfma32(int lane_id, int wave_id_n) {
+    static_assert(T::T_M == 2 && T::T_N == 2);
+    static_assert(T::W_N == 32 && T::W_K == 8);
+    static_assert(T::E_N == 2 && T::E_K == 4);
+    static_assert(T::VEC_B == 8);
+
+    constexpr int total_ds_b_reads = T::E_K * T::W_N * T::W_K / (opus::get_warp_size() * T::VEC_B);
+    static_assert(total_ds_b_reads == T::E_K / 2);
+
+    constexpr int lds_stride = T::smem_linear_wave + STRIDE_PAD;
+    constexpr int threads_k = T::B_K / T::VEC_B;
+    auto lane_id_n = lane_id % T::W_N;
+
+    auto u = opus::make_layout<T::VEC_B>(
+        opus::make_tuple(
+            opus::number<T::E_N>{},
+            opus::number<total_ds_b_reads>{},
+            opus::number<T::VEC_B>{}),
+        opus::make_tuple(
+            opus::number<T::T_M * T::T_N * lds_stride>{},
+            opus::number<2 * T::VEC_B>{},
+            1_I),
+        opus::make_tuple(opus::_, opus::_, opus::_));
+
+    u += wave_id_n * T::T_N * lds_stride
+       + (lane_id_n % T::T_N) * lds_stride
+       + (lane_id_n / T::T_N) * threads_k * T::VEC_B
+       + (lane_id / T::W_N) * T::VEC_B;
+    return u;
+}
+
 // ---- epilogue helpers ---- Non-splitk direct store to C with partial-tile pred.
 template<typename T, typename Mma, typename GC, typename Kargs, typename VC>
 OPUS_D inline void epilogue_store_c_if(
@@ -343,8 +397,12 @@ OPUS_D inline void epilogue_store_c_lds_staged(
             T::VEC_C * opus::vector_traits<D_ACC>::size();
 
         constexpr int HALF_TILE_ELEMS = T::HALF_B_M * T::HALF_B_N;
-        constexpr int STORE_VEC = HALF_TILE_ELEMS / T::BLOCK_SIZE;
-        static_assert(STORE_VEC * T::BLOCK_SIZE == HALF_TILE_ELEMS);
+        constexpr int THREAD_TILE_VEC = HALF_TILE_ELEMS / T::BLOCK_SIZE;
+        static_assert(THREAD_TILE_VEC * T::BLOCK_SIZE == HALF_TILE_ELEMS);
+        constexpr int MAX_STORE_VEC = 16 / sizeof(D_C); // raw_buffer_store supports up to b128
+        constexpr int STORE_VEC = THREAD_TILE_VEC < MAX_STORE_VEC ? THREAD_TILE_VEC : MAX_STORE_VEC;
+        static_assert(THREAD_TILE_VEC % STORE_VEC == 0);
+        constexpr int STORE_ITERS = THREAD_TILE_VEC / STORE_VEC;
 
         constexpr int LDS_PAD = 8;
         constexpr int LDS_STRIDE = T::HALF_B_N + LDS_PAD;
@@ -359,10 +417,6 @@ OPUS_D inline void epilogue_store_c_lds_staged(
         auto offsets_lds = opus::layout_to_offsets<T::VEC_C>(u_lds_c);
 
         const int tid = opus::thread_id_x();
-        const int rd_row = (tid * STORE_VEC) / T::HALF_B_N;
-        const int rd_col = (tid * STORE_VEC) % T::HALF_B_N;
-        const int lds_rd_off = rd_row * LDS_STRIDE + rd_col;
-        const int gmem_v_off = rd_row * kargs.stride_c + rd_col;
 
         #pragma unroll
         for (int hm = 0; hm < 2; hm++) {
@@ -391,12 +445,21 @@ OPUS_D inline void epilogue_store_c_lds_staged(
 
             __builtin_amdgcn_s_barrier();
 
-            auto coal0 = s_c0.template load<STORE_VEC>(lds_rd_off);
-            auto coal1 = s_c1.template load<STORE_VEC>(lds_rd_off);
-            g_c.template store<STORE_VEC>(coal0, gmem_v_off,
-                c_offset(hm, 0), opus::number<7>{});
-            g_c.template store<STORE_VEC>(coal1, gmem_v_off,
-                c_offset(hm, 1), opus::number<7>{});
+            #pragma unroll
+            for (int si = 0; si < STORE_ITERS; si++) {
+                const int linear = tid * THREAD_TILE_VEC + si * STORE_VEC;
+                const int rd_row = linear / T::HALF_B_N;
+                const int rd_col = linear % T::HALF_B_N;
+                const int lds_rd_off = rd_row * LDS_STRIDE + rd_col;
+                const int gmem_v_off = rd_row * kargs.stride_c + rd_col;
+
+                auto coal0 = s_c0.template load<STORE_VEC>(lds_rd_off);
+                auto coal1 = s_c1.template load<STORE_VEC>(lds_rd_off);
+                g_c.template store<STORE_VEC>(coal0, gmem_v_off,
+                    c_offset(hm, 0), opus::number<7>{});
+                g_c.template store<STORE_VEC>(coal1, gmem_v_off,
+                    c_offset(hm, 1), opus::number<7>{});
+            }
 
             if (hm == 0) __builtin_amdgcn_s_barrier();
         }

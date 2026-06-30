@@ -109,6 +109,27 @@ struct opus_splitk_ws_handle {
 };
 #endif
 
+#ifdef __HIP_DEVICE_COMPILE__
+template <typename D_WS>
+__device__ __forceinline__ D_WS* opus_splitk_ws_ptr(
+    const opus_splitk_ws_handle* __restrict__ ws_handle) {
+#if defined(__gfx942__)
+    __UINTPTR_TYPE__ ptr_bits = 0;
+    if ((opus::thread_id_x() & (opus::get_warp_size() - 1)) == 0) {
+        ptr_bits = reinterpret_cast<__UINTPTR_TYPE__>(ws_handle->ptr);
+    }
+    const unsigned lo = __builtin_amdgcn_readfirstlane(
+        static_cast<unsigned>(ptr_bits));
+    const unsigned hi = __builtin_amdgcn_readfirstlane(
+        static_cast<unsigned>(ptr_bits >> 32));
+    ptr_bits = (static_cast<__UINTPTR_TYPE__>(hi) << 32) | lo;
+    return reinterpret_cast<D_WS*>(ptr_bits);
+#else
+    return reinterpret_cast<D_WS*>(ws_handle->ptr);
+#endif
+}
+#endif
+
 // Shared kargs for splitK pipelines (splitk / splitk_p1 / splitk_legacy / splitk_p1_bk128).
 struct opus_gemm_splitk_kargs {
     const void* __restrict__ ptr_a;         // bf16 [B, M, K]

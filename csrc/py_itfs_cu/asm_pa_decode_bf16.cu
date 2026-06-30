@@ -15,16 +15,17 @@
 //     the caller (the kernel forms scl_log2e = query_scale*key_scale*log2e).
 //   * Single thread-group per work item, 4 waves of 32 lanes → bdx = 128
 //     (wave32), launched persistently with grid.x = CU count.
-//   * GPT-OSS style attention sink: per-Q-head fp32 sink logits in the kernel's
-//     pre-scale raw-logit domain (sink slot is always read by this kernel).
+//   * GPT-OSS style attention sink: per-Q-head fp32 sink logits in the SCALED-
+//     logit domain (compared directly to (q.k)*softmax_scale, i.e. exp(sink); the
+//     kernel divides by s_eff internally). Sink slot is always read by this kernel.
 //
 // Memory-allocation policy: every tensor is caller-allocated.  This entry point
 // does only pointer + stride bookkeeping and kernel launch — no GPU memory
 // allocation, no torch dependency (mirrors asm_fmha_fwd_with_sink.cu).
 //
-// Kernel argument block — 16-byte-slot padded ABI, 0x160 bytes total.  Offsets
+// Kernel argument block — 16-byte-slot padded ABI, 0x170 bytes total.  Offsets
 // must match the s_load_dword offsets in the SP3 main (see sched2/pa_ps.cpp
-// "Kernel argument layout").
+// "Kernel argument layout").  softmax_scale is a by-value f32 kernarg at 0x60.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "aiter_hip_common.h"   // HipDeviceGuard, AiterAsmKernel, p2, p3, get_num_cu_func, ...
@@ -42,26 +43,28 @@ struct KernelArgs
     void* ptr_V;          p2 _p3;    // 0x030  V_addr (FP8 paged)
     void* ptr_KVIndices;  p2 _p4;    // 0x040  flattened physical page ids
     void* ptr_CL;         p2 _p5;    // 0x050  context lengths
-    void* ptr_QScale;     p2 _p6;    // 0x060  per-tensor Q scale (scalar)
-    void* ptr_KScale;     p2 _p7;    // 0x070  per-tensor K scale (scalar)
-    void* ptr_VScale;     p2 _p8;    // 0x080  per-tensor V scale (scalar)
-    unsigned int kv_nheads; p3 _p9;  // 0x090  kv_head_num
-    unsigned int Qs;      p3 _p10;   // 0x0A0  bytes per MTP layer in FP8 Q
-    unsigned int Bs;      p3 _p11;   // 0x0B0  K_blk_stride
-    unsigned int KVs;     p3 _p12;   // 0x0C0  K_head_stride
-    unsigned int mtp;     p3 _p13;   // 0x0D0  mtp
-    unsigned int GQA;     p3 _p14;   // 0x0E0  gqa_ratio
-    void* ptr_QOIndptr;   p2 _p15;   // 0x0F0  QOIndptr (accepted but unused)
-    void* ptr_KVIndptr;   p2 _p16;   // 0x100  KVIndptr
-    void* ptr_WorkPtr;    p2 _p17;   // 0x110  WorkPtr
-    void* ptr_WorkInfo;   p2 _p18;   // 0x120  WorkInfo
-    void* ptr_SplitO;     p2 _p19;   // 0x130  SplitO
-    void* ptr_SplitLSE;   p2 _p20;   // 0x140  SplitLSE
-    void* ptr_Sink;       p2 _p21;   // 0x150  SinkBuffer (pre-scale raw logits)
+    float softmax_scale;  p3 _p6;    // 0x060  attention softmax scale (by value)
+    void* ptr_QScale;     p2 _p7;    // 0x070  per-tensor Q scale (scalar)
+    void* ptr_KScale;     p2 _p8;    // 0x080  per-tensor K scale (scalar)
+    void* ptr_VScale;     p2 _p9;    // 0x090  per-tensor V scale (scalar)
+    unsigned int kv_nheads; p3 _p10; // 0x0A0  kv_head_num
+    unsigned int Qs;      p3 _p11;   // 0x0B0  bytes per MTP layer in FP8 Q
+    unsigned int Bs;      p3 _p12;   // 0x0C0  K_blk_stride
+    unsigned int KVs;     p3 _p13;   // 0x0D0  K_head_stride
+    unsigned int mtp;     p3 _p14;   // 0x0E0  mtp
+    unsigned int GQA;     p3 _p15;   // 0x0F0  gqa_ratio
+    void* ptr_QOIndptr;   p2 _p16;   // 0x100  QOIndptr (accepted but unused)
+    void* ptr_KVIndptr;   p2 _p17;   // 0x110  KVIndptr
+    void* ptr_WorkPtr;    p2 _p18;   // 0x120  WorkPtr
+    void* ptr_WorkInfo;   p2 _p19;   // 0x130  WorkInfo
+    void* ptr_SplitO;     p2 _p20;   // 0x140  SplitO
+    void* ptr_SplitLSE;   p2 _p21;   // 0x150  SplitLSE
+    void* ptr_Sink;       p2 _p22;   // 0x160  SinkBuffer (scaled-domain logits, exp(sink))
 };
 #pragma pack(pop)
-static_assert(sizeof(KernelArgs) == 0x160,
-              "asm_pa_decode_bf16: KernelArgs must be 0x160 B (matches SP3 s_load offsets)");
+static_assert(sizeof(KernelArgs) == 0x170,
+              "asm_pa_decode_bf16: KernelArgs must be 0x170 B (matches SP3 s_load offsets; "
+              "softmax_scale by-value at 0x60)");
 
 // Kernel-side constants (must match SP3).
 static constexpr int PA_HEAD_DIM  = 64;
@@ -108,8 +111,11 @@ AITER_CTYPES_ERROR_DEF
 // kv_indices / kv_indptr / context_lens / qo_indptr : persistent metadata.
 // work_indptr / work_info / split_o / split_lse      : persistent work split.
 // q_scale / k_scale / v_scale : 1-element fp32 device tensors (per-tensor
-//           dequant; softmax scale pre-folded into key_scale by the caller).
-// sink    : fp32 [kv_head*gqa] per-Q-head sink logits (pre-scale domain); the
+//           dequant; per-tensor scales only).
+// softmax_scale : attention scale (e.g. 1/sqrt(head_dim)), passed BY VALUE at
+//           kernarg 0x60.  The kernel folds query_scale*key_scale*softmax_scale
+//           *log2(e) into scl_log2e (caller does NOT pre-fold it).
+// sink    : fp32 [kv_head*gqa] per-Q-head sink logits (scaled-logit domain); the
 //           kernel always reads this slot, so it must be non-null.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     pa_decode_bf16_asm,
@@ -118,6 +124,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* V,
      aiter_tensor_t* kv_indices,
      aiter_tensor_t* context_lens,
+     float           softmax_scale,
      aiter_tensor_t* q_scale,
      aiter_tensor_t* k_scale,
      aiter_tensor_t* v_scale,
@@ -133,7 +140,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      int             mtp,
      const char*     kernelName_,
      hipStream_t     stream),
-    (Q, K, V, kv_indices, context_lens, q_scale, k_scale, v_scale, out,
+    (Q, K, V, kv_indices, context_lens, softmax_scale, q_scale, k_scale, v_scale, out,
      qo_indptr, kv_indptr, work_indptr, work_info, split_o, split_lse, sink,
      gqa, mtp, kernelName_, stream))
 {
@@ -194,6 +201,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.ptr_V         = V->data_ptr();
     args.ptr_KVIndices = kv_indices->data_ptr();
     args.ptr_CL        = context_lens->data_ptr();
+    args.softmax_scale = softmax_scale;                 // by-value f32 @ 0x60
     args.ptr_QScale    = q_scale->data_ptr();
     args.ptr_KScale    = k_scale->data_ptr();
     args.ptr_VScale    = v_scale->data_ptr();

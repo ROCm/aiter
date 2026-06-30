@@ -443,8 +443,7 @@ def torch_mla_extend_split_kv(
     kvc = torch.index_select(kvc_cache, 0, kv_indices)
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
     num_works = work_indptr[-1].item()
-    partial_os = []
-    partial_lses = []
+    partial_records = []  # (partial_qo_loc, o, lse) for kv-split (partial) works
     final_out = torch.empty(total_q, nheads, kv_lora_rank, dtype=dtype, device=dev)
     final_lse = torch.empty(total_q, nheads, dtype=torch.float32, device=dev)
 
@@ -474,6 +473,13 @@ def torch_mla_extend_split_kv(
             and is_fp8_q
             and is_fp8_kvc
             and max_seqlen_q == 2
+        )
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 32
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 1
         )
         or (
             get_gfx() == "gfx950"
@@ -591,19 +597,24 @@ def torch_mla_extend_split_kv(
             final_out[qo_start:qo_end, :, :] = o
             final_lse[qo_start:qo_end, :] = lse.transpose(0, 1)  # [seq_q, num_heads]
         else:
-            partial_os.append(o)
-            partial_lses.append(lse)
+            partial_records.append((partial_qo_loc, o, lse))
 
-    partial_o = (
-        torch.concat(partial_os)
-        if partial_os
-        else torch.empty(0, nheads, qk_rope_head_dim, dtype=torch.float32, device=dev)
-    )
-    partial_lse = (
-        torch.concat(partial_lses, dim=1).transpose(0, 1)
-        if partial_lses
-        else torch.empty(0, nheads, dtype=torch.float32, device=dev)
-    )
+    if partial_records:
+        dv = partial_records[0][1].shape[-1]
+        buf_rows = max(loc + o.shape[0] for loc, o, _ in partial_records)
+        partial_o = torch.zeros(buf_rows, nheads, dv, dtype=torch.float32, device=dev)
+        partial_lse = torch.full(
+            (buf_rows, nheads), float("-inf"), dtype=torch.float32, device=dev
+        )
+        for loc, o, lse in partial_records:
+            n = o.shape[0]
+            partial_o[loc : loc + n] = o.to(torch.float32)
+            partial_lse[loc : loc + n] = lse.transpose(0, 1).to(torch.float32)
+    else:
+        partial_o = torch.empty(
+            0, nheads, kv_lora_rank, dtype=torch.float32, device=dev
+        )
+        partial_lse = torch.empty(0, nheads, dtype=torch.float32, device=dev)
     partial_o = torch.where(
         torch.isnan(partial_o), torch.zeros_like(partial_o), partial_o
     )
@@ -1143,7 +1154,7 @@ def test_mla(
     # torch.set_printoptions(linewidth=200)
     # print(f"{kv_indptr=}")
     # print(f"{work_indptr=}")
-    # print(f"{work_info_set[:work_indptr[-1].item()]=}")
+    # print(f"{work_info_set[:32]}")
     # print(f"{reduce_indptr=}")
     # print(f"{reduce_final_map=}")
     # print(f"{reduce_partial_map=}")
@@ -1758,7 +1769,6 @@ parser.add_argument(
     help="""return lse. Default: False.
     --lse # True""",
 )
-
 args = parser.parse_args()
 for nhead, decode_qlen in args.nhead:
     df = []

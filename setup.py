@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.2.0"
+FLYDSL_VERSION = "flydsl==0.2.2"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -392,11 +392,10 @@ if PREBUILD_KERNELS != 0:
         _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
         os.environ["AITER_AOT_IMPORT"] = "1"
         try:
-            from aiter.aot.flydsl.common import start_aot, wait_aot
+            from aiter.aot.flydsl.common import run_aot
 
             flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            pool, futures = start_aot(flydsl_cache_dir)
-            wait_aot(pool, futures)
+            run_aot(flydsl_cache_dir)
         finally:
             if _prev_aot_import is None:
                 os.environ.pop("AITER_AOT_IMPORT", None)
