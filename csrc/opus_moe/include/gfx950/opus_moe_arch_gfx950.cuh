@@ -6,7 +6,9 @@
 
 #include "../opus_moe_arch.cuh"
 #include "../opus_moe_common.cuh"
+#include "opus_moe_stage2_route_output_reduce_gfx950.cuh"
 #include "a16w16/opus_moe_pipeline_stage2_gemmstyle_gfx950.cuh"
+#include "a8w4/opus_moe_pipeline_stage2_a8w4_decode_main_gfx950.cuh"
 #include "opus_moe_stage2_manifest.h"
 
 #include "aiter_hip_common.h"
@@ -47,6 +49,36 @@ inline void opus_moe_stage2_gemmstyle_launch_gfx950(const opus_moe_stage2_bf16_k
     dim3 grid(n_tiles, m_tiles, 1);
     dim3 block(Traits::BLOCK_SIZE);
     opus_moe_stage2_gemmstyle_kernel_gfx950<Traits><<<grid, block, 0, stream>>>(kargs);
+}
+
+template<typename Traits>
+inline void opus_moe_stage2_a8w4_decode_launch_gfx950(
+    const opus_moe_stage2_a8w4_kargs& kargs,
+    hipStream_t stream)
+{
+    int route_blocks =
+        (kargs.sorted_blocks * Traits::SORT_BLOCK_M + Traits::B_M - 1) /
+        Traits::B_M;
+    opus_moe_stage2_a8w4_kargs launch_kargs = kargs;
+    launch_kargs.sorted_blocks = route_blocks;
+    if constexpr(Traits::DECODE_PACE_ROUTE_BLOCKS_TO_POW2)
+    {
+        int paced_route_blocks = 1;
+        while(paced_route_blocks < route_blocks)
+            paced_route_blocks <<= 1;
+        route_blocks = paced_route_blocks;
+        launch_kargs.sorted_blocks = route_blocks;
+    }
+    AITER_CHECK(kargs.model_dim % Traits::B_N == 0,
+                "Opus A8W4 stage2 requires model_dim to be a multiple of block_n=",
+                Traits::B_N,
+                ", got ",
+                kargs.model_dim);
+    const int n_tiles = kargs.model_dim / Traits::B_N;
+    dim3 grid(n_tiles, route_blocks, 1);
+    dim3 block(Traits::BLOCK_SIZE);
+    opus_moe_stage2_a8w4_decode_kernel_gfx950<Traits><<<grid, block, 0, stream>>>(
+        launch_kargs);
 }
 
 namespace opus_moe_gfx950_detail
