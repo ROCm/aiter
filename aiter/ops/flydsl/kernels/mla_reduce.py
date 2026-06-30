@@ -206,18 +206,20 @@ def compile_mla_reduce(
     else:
         NLSE = _TIER_NLSE[tier]
 
-    # ---- LDS layout (massive tiers only) ----
-    # [ lse_scale : LDS_MAX_SPLITS f32 ] ++ [ local_lse overflow : (NLSE-4 lanes) f32 ]
+    # ---- LDS layout (all tiers: pmap; massive adds scale + overflow) ----
+    # [ pmap : LDS_MAX_SPLITS i32 ] ++ [ lse_scale : LDS_MAX_SPLITS f32 ]
+    # ++ [ local_lse overflow : (NLSE-4 lanes) f32 ]  (MLDS/ALL only)
     GPU_ARCH = get_rocm_arch()
-    allocator = None
+    allocator = SmemAllocator(
+        None,
+        arch=GPU_ARCH,
+        global_sym_name=f"mla_reduce_smem_{tier.value}_{Dv}_{H}",
+    )
+    pmap_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = pmap_off + LDS_MAX_SPLITS * 4
     lse_scale_off = 0
     local_lse_off = 0
     if is_massive:
-        allocator = SmemAllocator(
-            None,
-            arch=GPU_ARCH,
-            global_sym_name=f"mla_reduce_smem_{tier.value}_{Dv}_{H}",
-        )
         lse_scale_off = allocator._align(allocator.ptr, 16)
         allocator.ptr = lse_scale_off + LDS_MAX_SPLITS * 4
         if tier in (Tier.MLDS, Tier.ALL):
@@ -294,8 +296,13 @@ def compile_mla_reduce(
             g_indptr[fx.arith.index_cast(T.index, _to_raw(num_reduce_tile))]
         )
 
+        base = allocator.get_base()
+        lds_pmap = STensor(
+            SmemPtr(base, pmap_off, T.i32, shape=(LDS_MAX_SPLITS,)),
+            dtype=T.i32,
+            shape=(LDS_MAX_SPLITS,),
+        )
         if fx.const_expr(is_massive):
-            base = allocator.get_base()
             lds_scale = STensor(
                 SmemPtr(base, lse_scale_off, T.f32, shape=(LDS_MAX_SPLITS,)),
                 dtype=T.f32,
@@ -313,6 +320,17 @@ def compile_mla_reduce(
             t1 = fx.Int32(g_indptr[tile + fx.Index(1)])
             n_splits = t1 - t0
 
+            # Stage reduce_partial_map[t0:t1] to LDS once per work item
+            # (mirrors reduce.cu:431-438; removes per-split global pmap loads).
+            for split_i in range(
+                fx.Int32(tid), fx.Index(n_splits), fx.Int32(NUM_THREADS), init=None
+            ):
+                split_i32 = fx.Int32(split_i)
+                lds_pmap[fx.Index(split_i32)] = fx.Int32(
+                    g_pmap[fx.Index(t0 + split_i32)]
+                )
+            fx.gpu.barrier()
+
             # HIP kn_mla_reduce_v1_ps: skip tiles at the CSR sentinel
             # (reduce.cu:692) or with n_splits<=1. Collapse the seq-loop upper
             # bound instead of an scf.IfOp body-wrap so inactive tiles never
@@ -327,8 +345,8 @@ def compile_mla_reduce(
                 q_start = fx.Int32(g_fmap[tile, fx.Index(0)])
                 q_end = fx.Int32(g_fmap[tile, fx.Index(1)])
             else:
-                row0_idx0 = fx.Int32(g_pmap[fx.Index(t0)])
-                row1_idx0 = fx.Int32(g_pmap[fx.Index(t0) + fx.Index(1)])
+                row0_idx0 = fx.Int32(lds_pmap[fx.Index(0)])
+                row1_idx0 = fx.Int32(lds_pmap[fx.Index(1)])
                 qo_len = row1_idx0 - row0_idx0
                 q_start = fx.Int32(tile) * qo_len
                 q_end = (fx.Int32(tile) + fx.Int32(1)) * qo_len
@@ -352,7 +370,7 @@ def compile_mla_reduce(
             ub_seq = has_work.select(q_end, seq0)
 
             def gather_row(split_i32, local_seq):
-                pmap = fx.Int32(g_pmap[fx.Index(t0 + split_i32)])
+                pmap = fx.Int32(lds_pmap[fx.Index(split_i32)])
                 row_i32 = pmap + local_seq
                 if fx.const_expr(not disable_guards):
                     in_bounds = fx.arith.andi(
@@ -683,8 +701,8 @@ def compile_mla_reduce(
                 )
                 with ir.InsertionPoint(if_has_work.then_block):
                     process_work_item(head, block_idx, tile, num_thread_group)
-                    # LDS (lds_scale) is reused per work item; fence before the
-                    # next iteration's warp0 overwrites it.
+                    # LDS (lds_pmap, lds_scale) is reused per work item; fence
+                    # before the next iteration overwrites it.
                     fx.gpu.barrier()
                     scf.YieldOp([])
 
@@ -719,10 +737,9 @@ def compile_mla_reduce(
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
-        if fx.const_expr(is_massive):
-            allocator.finalized = False
-            with ir.InsertionPoint(ctx.gpu_module_body):
-                allocator.finalize()
+        allocator.finalized = False
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
 
         # opt4: pin occupancy via rocdl.waves_per_eu on the emitted gpu.func.
         if fx.const_expr(waves_per_eu >= 1):
