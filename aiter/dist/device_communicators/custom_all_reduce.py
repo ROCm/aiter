@@ -15,6 +15,7 @@
 * limitations under the License.
 """
 
+import os
 import pickle
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -252,8 +253,11 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=1024 * 1024 * 1024,  # 2GB bf16/half
+        max_size=1024 * 1024 * 1024,  # 1GB IPC input buffer; meta buffer is 2x this
         enable_register_for_capturing: bool = True,
+        ar_max_size: Optional[int] = None,
+        rs_max_size: Optional[int] = None,
+        ag_max_size: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -356,6 +360,25 @@ class CustomAllreduce:
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
         self.max_size = max_size
+        # Per-op performance caps (in bytes). These are *separate* from
+        # ``max_size`` (which bounds the shared IPC buffer capacity): the
+        # custom IPC kernels only beat RCCL up to an op-specific input size,
+        # above which we want the caller to fall back to RCCL even though the
+        # input still fits the buffer. ``None`` means "no perf cap" (only the
+        # buffer-capacity bound applies). An explicit constructor arg wins over
+        # the AITER_{AR,RS,AG}_MAX_SIZE_MB env (value in MB; <= 0 disables),
+        # which in turn wins over the per-op defaults below. Defaults come from
+        # benchmarks: custom reduce_scatter only beats RCCL below ~32MB and
+        # custom all_gather below ~2MB; all_reduce has no perf cap (None).
+        self.ar_max_size = self._resolve_perf_cap(
+            ar_max_size, "AITER_AR_MAX_SIZE_MB", default_mb=None
+        )
+        self.rs_max_size = self._resolve_perf_cap(
+            rs_max_size, "AITER_RS_MAX_SIZE_MB", default_mb=32
+        )
+        self.ag_max_size = self._resolve_perf_cap(
+            ag_max_size, "AITER_AG_MAX_SIZE_MB", default_mb=2
+        )
         self.rank = rank
         self.world_size = world_size
 
@@ -423,6 +446,26 @@ class CustomAllreduce:
         """Batch-register graph-captured buffer addresses."""
         self._pool.flush_graph_buffers(self._ptr)
 
+    @staticmethod
+    def _resolve_perf_cap(
+        arg: Optional[int], env_name: str, default_mb: Optional[float] = None
+    ) -> Optional[int]:
+        """Resolve a per-op performance cap (in bytes).
+
+        Priority: explicit constructor arg > ``env_name`` (value in MB) >
+        ``default_mb``. A value <= 0 (or unset with no default) means "no cap".
+        """
+        if arg is not None:
+            return arg if arg > 0 else None
+        raw = os.getenv(env_name)
+        mb = float(raw) if raw is not None else default_mb
+        if mb is None:
+            return None
+        return int(mb * 1024 * 1024) if mb > 0 else None
+
+    def _within_perf_cap(self, inp_size: int, cap: Optional[int]) -> bool:
+        return cap is None or inp_size <= cap
+
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
@@ -435,9 +478,29 @@ class CustomAllreduce:
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         # In allreduce 2stage writemode, use 2x tmp buffer
-        if self.world_size == 2 or self.fully_connected:
-            return inp_size <= (self.max_size / 2)
-        return False
+        if not (self.world_size == 2 or self.fully_connected):
+            return False
+        # buffer-capacity bound + per-op performance cap
+        return inp_size <= (self.max_size / 2) and self._within_perf_cap(
+            inp_size, self.ar_max_size
+        )
+
+    def should_custom_rs(self, inp: torch.Tensor):
+        if self.disabled:
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        if inp_size % 16 != 0:
+            return False
+        if not is_weak_contiguous(inp):
+            return False
+        if not (self.world_size == 2 or self.fully_connected):
+            return False
+        # reduce_scatter stages the full input through the shared IPC buffer
+        # (same capacity bound historically used via should_custom_ar), plus an
+        # independent performance cap (custom only beats RCCL below ~32MB).
+        return inp_size <= (self.max_size / 2) and self._within_perf_cap(
+            inp_size, self.rs_max_size
+        )
 
     def should_custom_ag(self, inp: torch.Tensor):
         if self.disabled:
@@ -447,11 +510,13 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
+        if not (self.world_size == 2 or self.fully_connected):
+            return False
         # all_gather output = input * world_size, so the per-rank input
-        # must fit within max_size / world_size
-        if self.world_size == 2 or self.fully_connected:
-            return inp_size <= (self.max_size / (self.world_size * 2))
-        return False
+        # must fit within max_size / world_size, plus the per-op perf cap.
+        return inp_size <= (self.max_size / (self.world_size * 2)) and (
+            self._within_perf_cap(inp_size, self.ag_max_size)
+        )
 
     def all_reduce(
         self,
@@ -536,7 +601,7 @@ class CustomAllreduce:
         self, input: torch.Tensor, output: torch.Tensor
     ) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
-        if self.disabled or not self.should_custom_ar(input):
+        if self.disabled or not self.should_custom_rs(input):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
