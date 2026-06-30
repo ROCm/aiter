@@ -334,7 +334,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int csv_gqa     = gqa_ratio;
     int csv_qseqlen = config_max_seqlen_q;
     if(q_type == "fp8" && kv_type == "fp8" &&
-       ((gqa_ratio == 16 && config_max_seqlen_q == 4) ||
+       ((gqa_ratio == 16 && ( config_max_seqlen_q == 4 || config_max_seqlen_q == 1)) ||
         ((gqa_ratio == 64 || gqa_ratio == 128) && config_max_seqlen_q == 1)))
     {
         csv_gqa     = 64;

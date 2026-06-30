@@ -694,18 +694,22 @@ def _run_one_point(
     # The shipped qh64 .co has a 64 q-row tile; the dispatcher
     # (csrc/py_itfs_cu/asm_mla_v4.cu) selects sub_Q based on (gqa_ratio,
     # max_seqlen_q) and computes gdx = ceil(gqa*max_seqlen_q / sub_Q), so a
-    # single .co covers three (gqa, q_seq_logical) entry points:
-    #   (16, 4) — 16 heads × 4 logical-Q rows = 64 → gdx=1
-    #   (64, 1) — 64 heads × 1 logical-Q row  = 64 → gdx=1
-    #   (128,1) — 128 heads × 1 logical-Q row = 128 → gdx=2 (two WGs along head)
-    # The CSV alias in asm_mla_v4.cu remaps gqa∈{64,128} to the (16,4) lookup
-    # row so all three find the same kernel symbol.
-    _SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1)}
+    # single .co covers these (gqa, q_seq_logical) entry points:
+    #   (16, 4) — 16 heads × 4 logical-Q rows = 64 → sub_Q=64, gdx=1
+    #   (64, 1) — 64 heads × 1 logical-Q row  = 64 → sub_Q=64, gdx=1
+    #   (128,1) — 128 heads × 1 logical-Q row = 128 → sub_Q=64, gdx=2 (2 WGs)
+    #   (16, 1) — 16 heads × 1 logical-Q row  = 16 → sub_Q=16, gdx=1; the
+    #             kernel writes a compact 16-row partial (no 64-row tile
+    #             slack — verified: logits come back [num_seqs,1,16,512]).
+    # The CSV alias in asm_mla_v4.cu remaps all of these to the single
+    # (Gqa=64, qSeqLen=1) lookup row so they share one kernel symbol.
+    _SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1), (16, 1)}
     assert (gqa_ratio, q_seq_logical) in _SHIPPED_TILE_VARIANTS, (
         f"(gqa_ratio={gqa_ratio}, q_seq_logical={q_seq_logical}) not in shipped "
         f"variants {_SHIPPED_TILE_VARIANTS} for the qh64 .co. The dispatcher "
-        f"picks sub_Q=64 and launches gdx=ceil(gqa*max_seqlen_q/64) WGs along "
-        f"the head dim; only these three pairs are exercised by CSV+dispatcher."
+        f"picks sub_Q from (gqa, max_seqlen_q) and launches "
+        f"gdx=ceil(gqa*max_seqlen_q/sub_Q) WGs along the head dim; only these "
+        f"pairs are exercised by CSV+dispatcher."
     )
 
     # Auto-pick the split count when the caller passes None — mirrors the
@@ -971,6 +975,37 @@ def test_v4_nm_accuracy_and_perf():
     Perf is informational (CI variance too high to assert).
     """
     _run_one_point(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
+
+
+@needs_gfx950
+def test_v4_nm_gqa16_qseqlen1_accuracy_and_perf():
+    """Accuracy for the (gqa_ratio=16, q_seq_logical=1) entry point.
+
+    This pair is served by the same single qh64 .co via the
+    `gqa_ratio == 16 && config_max_seqlen_q == 1` normalization branch in
+    asm_mla_v4.cu. Unlike the other three shipped variants it does NOT
+    satisfy gqa*q_seq=64 (here 16*1=16); the dispatcher picks sub_Q=16 and
+    the kernel writes a compact 16-row partial (logits [num_seqs,1,16,512],
+    no 64-row tile slack). _run_one_point's buffers are already sized to
+    num_heads=gqa_ratio so the existing reshape/compare path handles it
+    directly. Run with sink off and on so the sink path is covered too.
+    """
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=16,
+        attn_sink=False,
+    )
+    _run_one_point(
+        batch=2,
+        kv_seq_lens=64,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=16,
+        attn_sink=True,
+    )
 
 
 @needs_gfx950
