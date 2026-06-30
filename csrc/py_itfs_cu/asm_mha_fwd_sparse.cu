@@ -810,6 +810,229 @@ fmha_v3_fwd_fp8_sparse_vfa(at::Tensor& q,
     return {out};
 }
 
+// Persistent/sorted/affine fp8 sparse sibling (prevfa surgical port). Identical
+// data contract to fmha_v3_fwd_fp8_sparse plus a host-built `work_table`
+// int32[total_tiles] tensor (entry k = packed q | (h<<16) | (b<<24), LPT-sorted).
+// Routes to the persistent/sorted/affine .co's per (sorted, affine); only the
+// affine-sorted .co is shipped in this branch today.
+std::vector<at::Tensor>
+fmha_v3_fwd_fp8_sparse_persistent(at::Tensor& q,
+                                  const at::Tensor& k,
+                                  const at::Tensor& v,
+                                  const at::Tensor& q_descale,
+                                  const at::Tensor& k_descale,
+                                  const at::Tensor& v_descale,
+                                  const at::Tensor& kv_block_indices,
+                                  const at::Tensor& lut_start,
+                                  const at::Tensor& lut_count,
+                                  const at::Tensor& work_table,
+                                  float softmax_scale,
+                                  bool sorted,
+                                  std::optional<at::Tensor> lut_freeze,
+                                  std::optional<at::Tensor> out_,
+                                  bool affine)
+{
+    // ---- dtype + device checks (mirror fmha_v3_fwd_fp8_sparse) -------------
+    TORCH_CHECK((q.dtype() == at::ScalarType::Float8_e4m3fnuz ||
+                     q.dtype() == at::ScalarType::Float8_e4m3fn) &&
+                    (k.dtype() == at::ScalarType::Float8_e4m3fnuz ||
+                     k.dtype() == at::ScalarType::Float8_e4m3fn),
+                "fmha_v3_fwd_fp8_sparse_persistent: Q and K must be fp8.");
+    TORCH_CHECK(v.dtype() == at::ScalarType::Float8_e4m3fnuz ||
+                    v.dtype() == at::ScalarType::Float8_e4m3fn,
+                "fmha_v3_fwd_fp8_sparse_persistent: V must be fp8.");
+    TORCH_CHECK(q_descale.dtype() == torch::kFloat32 &&
+                    k_descale.dtype() == torch::kFloat32 &&
+                    v_descale.dtype() == torch::kFloat32,
+                "fmha_v3_fwd_fp8_sparse_persistent: descale tensors must be fp32.");
+    TORCH_CHECK(kv_block_indices.dtype() == torch::kInt32 &&
+                    lut_start.dtype() == torch::kInt32 &&
+                    lut_count.dtype() == torch::kInt32 &&
+                    work_table.dtype() == torch::kInt32,
+                "fmha_v3_fwd_fp8_sparse_persistent: LUT + work_table must be int32.");
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(q_descale); CHECK_DEVICE(k_descale); CHECK_DEVICE(v_descale);
+    CHECK_DEVICE(kv_block_indices); CHECK_DEVICE(lut_start); CHECK_DEVICE(lut_count);
+    CHECK_DEVICE(work_table);
+
+    TORCH_CHECK(q.stride(-1) == 1, "Q must have contiguous last dimension");
+    TORCH_CHECK(k.stride(-1) == 1, "K must have contiguous last dimension");
+    TORCH_CHECK(v.stride(-1) == 1, "V must have contiguous last dimension");
+    TORCH_CHECK(work_table.is_contiguous(),
+                "fmha_v3_fwd_fp8_sparse_persistent: work_table must be contiguous.");
+
+    const auto sz = q.sizes();
+    const int batch_size = sz[0];
+    const int seqlen_q = sz[1];
+    const int num_heads = sz[2];
+    const int head_size_q = sz[3];
+    const int head_size_v = v.sizes()[3];
+    const int seqlen_k = k.size(1);
+    const int num_heads_k = k.size(2);
+
+    TORCH_CHECK(head_size_q == ASM_SPARSE_HEAD_DIM && head_size_v == ASM_SPARSE_HEAD_DIM,
+                "fmha_v3_fwd_fp8_sparse_persistent: only hd=", ASM_SPARSE_HEAD_DIM,
+                " is supported (got Qd=", head_size_q, " Vd=", head_size_v, ").");
+    TORCH_CHECK(num_heads % num_heads_k == 0,
+                "fmha_v3_fwd_fp8_sparse_persistent: HQ must be divisible by HK.");
+    const int gqa_ratio = num_heads / num_heads_k;
+    TORCH_CHECK((gqa_ratio & (gqa_ratio - 1)) == 0,
+                "fmha_v3_fwd_fp8_sparse_persistent: GQA ratio must be a power of 2.");
+
+    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_q);
+    CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_q);
+    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
+
+    const int num_q_blocks =
+        (seqlen_q + ASM_SPARSE_BLOCK_M - 1) / ASM_SPARSE_BLOCK_M;
+    const int64_t expected_lut_meta =
+        static_cast<int64_t>(batch_size) * num_heads * num_q_blocks;
+    TORCH_CHECK(lut_start.numel() == expected_lut_meta,
+                "fmha_v3_fwd_fp8_sparse_persistent: lut_start.numel() = ",
+                lut_start.numel(), ", expected ", expected_lut_meta, ".");
+    TORCH_CHECK(lut_count.numel() == expected_lut_meta,
+                "fmha_v3_fwd_fp8_sparse_persistent: lut_count.numel() = ",
+                lut_count.numel(), ", expected ", expected_lut_meta, ".");
+    TORCH_CHECK(work_table.numel() == expected_lut_meta,
+                "fmha_v3_fwd_fp8_sparse_persistent: work_table.numel() = ",
+                work_table.numel(), ", expected ", expected_lut_meta,
+                " (= batch*HQ*num_q_blocks = total tiles).");
+
+    if (lut_freeze.has_value())
+    {
+        TORCH_CHECK(lut_freeze->dtype() == torch::kInt32,
+                    "fmha_v3_fwd_fp8_sparse_persistent: lut_freeze must be int32.");
+        CHECK_DEVICE((*lut_freeze));
+        TORCH_CHECK(lut_freeze->numel() == expected_lut_meta,
+                    "fmha_v3_fwd_fp8_sparse_persistent: lut_freeze.numel() = ",
+                    lut_freeze->numel(), ", expected ", expected_lut_meta, ".");
+    }
+
+    auto opts = q.options();
+    at::Tensor out;
+    if (out_.has_value())
+    {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == torch::kBFloat16,
+                    "fmha_v3_fwd_fp8_sparse_persistent: out must be bf16.");
+        CHECK_DEVICE(out);
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
+    }
+    else
+    {
+        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v},
+                           opts.dtype(torch::kBFloat16));
+    }
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    mha_fwd_sparse_args a{};
+    a.use_asm_v3       = true;
+    a.v3_api_check     = false;
+    a.how_v3_bf16_cvt  = 0;
+    a.data_type        = "fp8bf16";
+    a.is_group_mode    = false;
+    a.bias_type        = 0;
+    a.has_lse          = false;
+    a.qscale_type      = 0;
+    a.has_sink         = false;
+
+    a.q_ptr            = q.data_ptr();
+    a.k_ptr            = k.data_ptr();
+    a.v_ptr            = v.data_ptr();
+    a.bias_ptr         = nullptr;
+    a.q_descale_ptr    = q_descale.data_ptr();
+    a.k_descale_ptr    = k_descale.data_ptr();
+    a.v_descale_ptr    = v_descale.data_ptr();
+    a.rand_val_ptr     = nullptr;
+    a.lse_ptr          = nullptr;
+    a.o_ptr            = out.data_ptr();
+
+    a.seqstart_q_ptr = nullptr;
+    a.seqstart_k_ptr = nullptr;
+    a.seqlen_q_ptr   = nullptr;
+    a.seqlen_k_ptr   = nullptr;
+    a.cu_seqlen_q_ptr = nullptr;
+    a.cu_seqlen_k_ptr = nullptr;
+    a.block_scale_seqstart_q_ptr = nullptr;
+    a.block_scale_seqstart_k_ptr = nullptr;
+    a.sink_ptr = nullptr;
+
+    a.seqlen_q       = seqlen_q;
+    a.seqlen_k       = seqlen_k;
+    a.batch          = batch_size;
+    a.max_seqlen_q   = seqlen_q;
+    a.hdim_q         = head_size_q;
+    a.hdim_v         = head_size_v;
+    a.nhead_q        = num_heads;
+    a.nhead_k        = num_heads_k;
+    a.scale_s        = softmax_scale;
+    a.logits_soft_cap = 0.0f;
+
+    a.stride_q       = q.stride(1);
+    a.stride_k       = k.stride(1);
+    a.stride_v       = v.stride(1);
+    a.stride_bias    = 0;
+    a.stride_randval = 0;
+    a.stride_o       = out.stride(1);
+    a.nhead_stride_q = q.stride(2);
+    a.nhead_stride_k = k.stride(2);
+    a.nhead_stride_v = v.stride(2);
+    a.nhead_stride_bias = 0;
+    a.nhead_stride_randval = 0;
+    a.nhead_stride_lse = 0;
+    a.nhead_stride_o = out.stride(2);
+    a.nhead_stride_q_descale = (q_descale.dim() == 2) ? q_descale.stride(1) : 0;
+    a.nhead_stride_k_descale = (k_descale.dim() == 2) ? k_descale.stride(1) : 0;
+    a.nhead_stride_v_descale = (v_descale.dim() == 2) ? v_descale.stride(1) : 0;
+    a.batch_stride_q = q.stride(0);
+    a.batch_stride_k = k.stride(0);
+    a.batch_stride_v = v.stride(0);
+    a.batch_stride_bias = 0;
+    a.batch_stride_randval = 0;
+    a.batch_stride_lse = 0;
+    a.batch_stride_o = out.stride(0);
+    a.batch_stride_q_descale = (q_descale.dim() == 2) ? q_descale.stride(0) : 0;
+    a.batch_stride_k_descale = (k_descale.dim() == 2) ? k_descale.stride(0) : 0;
+    a.batch_stride_v_descale = (v_descale.dim() == 2) ? v_descale.stride(0) : 0;
+
+    a.window_size_left = -1;
+    a.window_size_right = -1;
+    a.sink_size = 0;
+    a.mask_type = 0;
+    a.min_seqlen_q = 0;
+    a.p_drop = 0.0f;
+    a.s_randval = false;
+    a.drop_seed_offset =
+        std::pair<const void*, const void*>{nullptr, nullptr};
+    a.block_scale_size_q = 128;
+    a.block_scale_size_kv = 128;
+
+    a.kv_block_indices_ptr = kv_block_indices.data_ptr();
+    a.lut_start_ptr        = lut_start.data_ptr();
+    a.lut_count_ptr        = lut_count.data_ptr();
+    a.lut_freeze_ptr       = lut_freeze.has_value() ? lut_freeze->data_ptr()
+                                                    : nullptr;
+
+    // Persistent extension:
+    a.work_table_ptr = work_table.data_ptr();
+    a.total_tiles    = static_cast<uint32_t>(expected_lut_meta);
+    a.num_wgs        = 0; // 0 => dispatcher auto-sizes to the CU count
+
+    ck_tile::stream_config stream_config{stream};
+    float t;
+    if(affine)
+        t = sorted ? aiter::fmha_fwd_v3_fp8_sparse_affine_sorted(a, stream_config)
+                   : aiter::fmha_fwd_v3_fp8_sparse_affine(a, stream_config);
+    else
+        t = aiter::fmha_fwd_v3_fp8_sparse_persistent(a, stream_config, sorted);
+    TORCH_CHECK(t >= 0, "fmha_v3_fwd_fp8_sparse_persistent: dispatcher returned an "
+                        "error code (unsupported config or .co not found).");
+    return {out};
+}
+
 // Sparse mxfp4 sibling.
 //
 // Layout assumptions (caller is expected to pass packed fp4 tensors as

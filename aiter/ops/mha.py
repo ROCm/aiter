@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -476,6 +477,89 @@ def fmha_v3_fwd_fp8_sparse_vfa(
     freeze_softmax_max_count: int,  # online blocks before freezing the max
     out: Optional[Tensor] = None,
 ) -> Tuple[Tensor]: ...
+
+
+def _gen_fmha_v3_fwd_fp8_sparse_persistent_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_descale: Tensor,
+    k_descale: Tensor,
+    v_descale: Tensor,
+    kv_block_indices: Tensor,
+    lut_start: Tensor,
+    lut_count: Tensor,
+    work_table: Tensor,
+    softmax_scale: float,
+    sorted: bool = False,
+    lut_freeze: Optional[Tensor] = None,
+    out: Optional[Tensor] = None,
+    affine: bool = False,
+) -> Tuple[Tensor]:
+    if out is not None:
+        return (out,)
+    b, sq, hq, _ = q.shape
+    head_dim_v = v.shape[-1]
+    return (q.new_empty((b, sq, hq, head_dim_v), dtype=dtypes.bf16),)
+
+
+@compile_ops(
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd_fp8_sparse_persistent",
+    gen_fake=_gen_fmha_v3_fwd_fp8_sparse_persistent_fake_tensors,
+    mutates_args=[],
+)
+def fmha_v3_fwd_fp8_sparse_persistent(
+    q: Tensor,                    # [b, sq, hq, 128], fp8
+    k: Tensor,                    # [b, sk, hk, 128], fp8
+    v: Tensor,                    # [b, sk, hk, 128], fp8
+    q_descale: Tensor,            # [1] or [b, hk], fp32
+    k_descale: Tensor,            # [1] or [b, hk], fp32
+    v_descale: Tensor,            # [1] or [b, hk], fp32
+    kv_block_indices: Tensor,     # int32
+    lut_start: Tensor,            # int32 [b*hq*num_q_blocks]
+    lut_count: Tensor,            # int32 [b*hq*num_q_blocks]
+    work_table: Tensor,           # int32 [b*hq*num_q_blocks] (packed q|h<<16|b<<24)
+    softmax_scale: float,
+    sorted: bool = False,         # True: sorted 1-WG/tile dispatch; False: persistent grid-stride
+    lut_freeze: Optional[Tensor] = None,  # VSA: int32 [b*hq*num_q_blocks]
+    out: Optional[Tensor] = None,
+    affine: bool = False,         # True (requires sorted): route to the affine-codegen sorted .co
+) -> Tuple[Tensor]: ...
+
+
+def build_sparse_persistent_work_table(
+    lut_count: Tensor,
+    batch: int,
+    num_heads: int,
+    num_q_blocks: int,
+) -> Tensor:
+    """Build the LPT-sorted work table for the persistent/affine fp8 sparse kernel.
+
+    The flat tile index matches the kernel's lut_idx:
+        i = b * (HQ * num_q_blocks) + h * num_q_blocks + q
+    We sort those indices by lut_count (KV blocks per tile) descending so the
+    heaviest tiles are handed out first and spread across workgroups. Each entry
+    packs the decoded tile as
+        q | (h << 16) | (b << 24)
+    which the kernel unpacks into tgid_x/y/z (q < 65536, h < 256, b < 256).
+
+    Returns an int32 [batch*HQ*num_q_blocks] tensor on lut_count's device.
+    """
+    flat = lut_count.reshape(-1)
+    total = batch * num_heads * num_q_blocks
+    assert flat.numel() == total, (
+        f"lut_count.numel()={flat.numel()} != batch*HQ*num_q_blocks={total}"
+    )
+    # Descending LPT order over flat tile indices (tie order is irrelevant).
+    order = torch.argsort(flat, descending=True)  # int64 tile indices
+    q = order % num_q_blocks
+    h = (order // num_q_blocks) % num_heads
+    b = order // (num_q_blocks * num_heads)
+    packed = (
+        (q & 0xFFFF) | ((h & 0xFF) << 16) | ((b & 0xFF) << 24)
+    ).to(torch.int32)
+    return packed.contiguous()
 
 
 def cmdGenFunc_mha_varlen_fwd(
@@ -3516,6 +3600,8 @@ def flash_attn_fp8_sparse_pertensor_func(
     lut_start: torch.Tensor,
     lut_count: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    lut_freeze: Optional[torch.Tensor] = None,
+    dispatch: Optional[str] = None,
 ):
     """Block-sparse Sage fp8 FMHA forward (hd=128, gfx950).
 
@@ -3534,6 +3620,18 @@ def flash_attn_fp8_sparse_pertensor_func(
             aiter.ops.triton.attention.utils.block_attn_mask_to_ragged_lut
             (return_none_if_dense=False; this kernel has no dense path).
         softmax_scale: if None, defaults to head_dim**-0.5
+        lut_freeze: optional VSA freeze LUT (int32 [b*hq*num_q_blocks]). Only
+            honored by the persistent/affine dispatch modes; ignored by "default".
+        dispatch: tile-dispatch strategy. None/"" (default) reads env
+            AITER_FP8_SPARSE_DISPATCH and falls back to "default":
+            "default"        -> base one-WG-per-tile .co fwd_hd128_fp8_sparse.co
+                                (deployed 704-byte path, unchanged), or
+            "affine_sorted"  -> the new LPT-sorted, intra-GPU load-balanced
+                                affine kernel fwd_hd128_fp8_sparse_affine_sorted.co
+                                (flat grid (total_tiles,1,1), 752-byte kernarg with
+                                an internally-built LPT work table).
+            "sorted"/"persistent"/"affine" are accepted for A/B but their .co's
+            are NOT shipped in this branch yet (the dispatcher will error at load).
 
     Constraints (assert-checked C++-side, see asm_mha_fwd_sparse.cu::
     fmha_v3_fwd_fp8_sparse):
@@ -3545,6 +3643,16 @@ def flash_attn_fp8_sparse_pertensor_func(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+    # Resolve the dispatch mode: explicit `dispatch` arg > env > "default".
+    if dispatch is None:
+        dispatch = os.environ.get("AITER_FP8_SPARSE_DISPATCH", "").lower()
+    if not dispatch:
+        dispatch = "default"
+    if dispatch not in ("default", "sorted", "persistent", "affine", "affine_sorted"):
+        raise ValueError(
+            f"flash_attn_fp8_sparse_pertensor_func: unknown dispatch={dispatch!r} "
+            "(expected 'default', 'sorted', 'persistent', 'affine', or 'affine_sorted')"
+        )
     head_size_q_og = q.size(3)
     head_size_v_og = v.size(3)
     if head_size_q_og % 8 != 0:
@@ -3552,19 +3660,45 @@ def flash_attn_fp8_sparse_pertensor_func(
         k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
     if head_size_v_og % 8 != 0:
         v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
-    outs = fmha_v3_fwd_fp8_sparse(
-        q,
-        k,
-        v,
-        q_descale,
-        k_descale,
-        v_descale,
-        kv_block_indices,
-        lut_start,
-        lut_count,
-        float(softmax_scale),
-        None,
-    )
+    if dispatch in ("sorted", "persistent", "affine", "affine_sorted"):
+        batch, seqlen_q, num_heads = q.shape[0], q.shape[1], q.shape[2]
+        num_q_blocks = (seqlen_q + 255) // 256  # kTileQ = 256
+        # The non-sorted affine .co ignores the work table, but the persistent
+        # entry requires it; build it once (cheap) so the call stays uniform.
+        work_table = build_sparse_persistent_work_table(
+            lut_count, batch, num_heads, num_q_blocks
+        )
+        outs = fmha_v3_fwd_fp8_sparse_persistent(
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            kv_block_indices,
+            lut_start,
+            lut_count,
+            work_table,
+            float(softmax_scale),
+            dispatch in ("sorted", "affine_sorted"),  # sorted (1-WG/tile)
+            lut_freeze,
+            None,
+            dispatch in ("affine", "affine_sorted"),  # affine: route to affine-codegen .co
+        )
+    else:
+        outs = fmha_v3_fwd_fp8_sparse(
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            kv_block_indices,
+            lut_start,
+            lut_count,
+            float(softmax_scale),
+            None,
+        )
     out_padded = outs[0]
     out = out_padded[..., :head_size_v_og]
     return out

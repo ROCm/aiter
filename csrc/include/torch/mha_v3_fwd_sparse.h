@@ -93,6 +93,32 @@ fmha_v3_fwd_fp8_sparse_vfa(at::Tensor& q,                  // [b, sq, hq, d], fp
                            int64_t freeze_softmax_max_count,   // online blocks before freeze
                            std::optional<at::Tensor> out_ = std::nullopt); // bf16
 
+// Persistent/sorted/affine fp8 sparse sibling (prevfa surgical port). Same data
+// contract as fmha_v3_fwd_fp8_sparse plus a `work_table` int32[total_tiles]
+// tensor (entry k = packed q | (h<<16) | (b<<24), LPT-sorted by lut_count desc).
+//   sorted=false, affine=false : persistent grid-stride (fwd_hd128_fp8_sparse_persistent.co)
+//   sorted=true , affine=false : sorted 1-WG/tile     (fwd_hd128_fp8_sparse_sorted.co)
+//   sorted=true , affine=true  : affine sorted        (fwd_hd128_fp8_sparse_affine_sorted.co) [SHIPPED]
+//   sorted=false, affine=true  : affine non-sorted    (fwd_hd128_fp8_sparse_affine.co)
+// All reuse the BASE fp8 sparse kernel symbol
+// _ZN5aiter32fmha_fwd_hd128_fp8_sparse_gfx950E.
+std::vector<at::Tensor>
+fmha_v3_fwd_fp8_sparse_persistent(at::Tensor& q,                  // [b, sq, hq, d], fp8
+                                  const at::Tensor& k,            // [b, sk, hk, d], fp8
+                                  const at::Tensor& v,            // [b, sk, hk, d_v], fp8
+                                  const at::Tensor& q_descale,    // [1] or [b, hk], fp32
+                                  const at::Tensor& k_descale,    // [1] or [b, hk], fp32
+                                  const at::Tensor& v_descale,    // [1] or [b, hk], fp32
+                                  const at::Tensor& kv_block_indices, // int32
+                                  const at::Tensor& lut_start,        // int32 [b*hq*nqb]
+                                  const at::Tensor& lut_count,        // int32 [b*hq*nqb]
+                                  const at::Tensor& work_table,       // int32 [b*hq*nqb]
+                                  float softmax_scale,
+                                  bool sorted = false,                // true: sorted 1-WG/tile; false: persistent
+                                  std::optional<at::Tensor> lut_freeze = std::nullopt,
+                                  std::optional<at::Tensor> out_ = std::nullopt, // bf16
+                                  bool affine = false);               // true: route to affine .co
+
 std::vector<at::Tensor>
 fmha_v3_fwd_mxfp4_sparse(at::Tensor& q,                  // [b, sq, hq, d/2], int8/uint8
                         const at::Tensor& k,             // [b, sk, hk, d/2], int8/uint8
