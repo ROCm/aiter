@@ -211,14 +211,6 @@ def compile_mxscale_gemm(
             )
         if split_k != 1:
             raise ValueError("stage1_act GEMM epilogue fuse requires split_k == 1")
-        if use_tdm_store and stage1_weight_layout_mode != "gugu":
-            # TDM-store of the fused-activation output is supported only for the
-            # gugu (interleaved single-B) layout. gguu (dual-B) still requires
-            # use_tdm_store=False (buffer_store).
-            raise ValueError(
-                "stage1_act TDM-store epilogue supports only the gugu layout; "
-                "gguu (dual-B) requires use_tdm_store=False"
-            )
         if wave_specialized_tdm and stage1_weight_layout_mode != "gugu":
             # gguu is dual-B: gate+up are separate weights -> 6 TDM streams
             # (A, B_gate, B_up, As, Bs_gate, Bs_up), which cannot map onto the
