@@ -142,8 +142,10 @@ def test_gemm(intype, M, N, K, apre, init, dtype=dtypes.bf16):
         )
 
     def run_asm():
-        # Low-level asm entry with the 256x256 tile kernel forced by name.
-        knl = f"f4gemm_{intype}_256x256_apre{apre}"
+        # See hsa/gfx1250/f4gemm/f4gemm.csv.
+        pre = "ABpreShuffle" if apre else "BpreShuffle"
+        base = f"f4gemm_bf16_{intype}_{pre}_256x256_4x4_ps"
+        knl = f"_ZN5aiter{len(base)}{base}E"
         if intype == "nvfp4":
             return aiter.gemm_nvfp4_asm(
                 inp["A"],
@@ -167,10 +169,7 @@ def test_gemm(intype, M, N, K, apre, init, dtype=dtypes.bf16):
         )
 
     candidates = {"gemm_a4w4": run_unified}
-    # Only the apre=1 256x256 tile kernels are shipped today (hsa/gfx1250/f4gemm).
-    # Skip the forced-tile asm candidate elsewhere instead of erroring the row.
-    if apre == 1:
-        candidates["asm"] = run_asm
+    candidates["asm"] = run_asm
 
     flops = 2 * M * N * K
     nbytes = (
@@ -218,8 +217,7 @@ def main():
         nargs="*",
         choices=[0, 1],
         default=[1],
-        help="A-preshuffle variant(s): 1 preshuffles A, 0 sends row-major "
-        "(only apre=1 256x256 kernels are currently shipped)",
+        help="A-preshuffle variant(s): 1 preshuffle",
     )
     parser.add_argument(
         "--init",
