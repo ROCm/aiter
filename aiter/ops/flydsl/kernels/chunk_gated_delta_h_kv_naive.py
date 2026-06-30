@@ -185,6 +185,8 @@ def compile_chunk_gated_delta_h_kv_naive(
     # The loaded w_next/k_next live in registers GEMM1->yield (longer than the
     # GEMM2 path), +~32 VGPR, fine at 2 waves (budget 256). False = rev226
     # (loads stay in GEMM2).
+    # MEASURED (GPU7, varlen-32k-aws, kernel-only, paired with
+    # HT_STORE_OVERLAP_GEMM2 below): see HT_STORE_OVERLAP_GEMM2 note.
     W_PF_INTERLEAVE_GEMM1 = True
 
     # EXPERIMENT toggle (HIP-align, store-overlap rev227): DECOUPLE the
@@ -201,6 +203,15 @@ def compile_chunk_gated_delta_h_kv_naive(
     # a top-of-chunk WAR barrier so the NEXT chunk's stage-write does not clobber
     # lds_ht before this chunk's (now late) readout finishes. False = rev226
     # (readout at top of chunk).
+    # MEASURED (GPU7, varlen-32k-aws, kernel-only median us, both overlap flags
+    # ON vs OFF, all 41 kv_naive allclose pass):
+    #   T1000 : overlap 496.8  vs htindep(2w) 516.8  vs aliased(3w) 483.9
+    #   T5000 : overlap 502.0  vs htindep(2w) 524.5  vs aliased(3w) 522.9
+    #   T10000: overlap 555.7  vs htindep(2w) 719.9  vs aliased(3w) 716.8
+    # => store-overlap recovers the 2-wave penalty and BEATS the 3-wave aliased
+    # best at T5000 (-4.0%) / T10000 (-22.5%); slightly behind 3-wave at T1000
+    # (+2.7%, fewest chunks so occupancy edge wins). Benefit scales with NT
+    # (per-chunk store latency was the exposed cost). Kept ON as the default.
     HT_STORE_OVERLAP_GEMM2 = True
 
     # -- LDS layout (no lds_h: KV h-store goes reg -> HBM directly) --

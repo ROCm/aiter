@@ -366,8 +366,8 @@ _PREFILL_GROUPS = [
         model_name="varlen-32k-aws",
         Hv=32,
         tps=[1],
-        # full_prompt_lens=[1000, 5000, 10000],
-        full_prompt_lens=[1000],
+        full_prompt_lens=[1000, 5000, 10000],
+        # full_prompt_lens=[1000],
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
@@ -1768,13 +1768,17 @@ def _run_perf_comparison(args: PrefillArgs):
     us_hip = _bench_fn(hip_launch) if hip_supported else float("nan")
 
     fly_vs_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
+    # fly_opt (kv_naive) speedup vs Triton_vk (>1 means fly_opt is faster).
+    fly_opt_vs_vk = (
+        us_triton_vk / us_fly_kv_naive if us_fly_kv_naive > 0 else float("inf")
+    )
     fly_vs_origin_opt = us_triton_origin_opt / us_fly if us_fly > 0 else float("inf")
     fly_vs_vllm = (
         us_vllm / us_fly if (us_fly > 0 and us_vllm == us_vllm) else float("nan")
     )
-    # HIP vs FlyDSL ratio (>1 means HIP is slower than the FlyDSL baseline).
-    hip_vs_fly = (
-        us_hip / us_fly if (us_fly > 0 and us_hip == us_hip) else float("nan")
+    # HIP speedup vs Triton_vk (>1 means HIP is faster than Triton_vk).
+    hip_vs_vk = (
+        us_triton_vk / us_hip if (us_hip > 0 and us_hip == us_hip) else float("nan")
     )
 
     _perf_results.append(
@@ -1800,8 +1804,9 @@ def _run_perf_comparison(args: PrefillArgs):
             "HIP_vk(us)": us_hip,
             "flydsl_vs_vk": fly_vs_vk,
             "flydsl_vs_origin_opt": fly_vs_origin_opt,
-            "flydsl_vs_vllm": fly_vs_vllm,
-            "hip_vs_flydsl": hip_vs_fly,
+        "flydsl_vs_vllm": fly_vs_vllm,
+        "hip_vs_vk": hip_vs_vk,
+        "flydsl_opt_vs_vk": fly_opt_vs_vk,
         }
     )
 
@@ -1899,25 +1904,23 @@ def _print_perf_table():
         return
 
     cols = [
-        ("Model", "Model", 16),
-        ("TP", "TP", 3),
-        ("Hg", "Hg", 3),
-        ("H", "H", 3),
-        ("SeqLen", "SeqLen", 7),
-        ("T", "T", 7),
+        ("Model", "Model", 14),
+        ("TP", "TP", 2),
+        ("Hg", "Hg", 2),
+        ("H", "H", 2),
+        ("SeqLen", "SeqLen", 6),
+        ("T", "T", 5),
         ("var", "varlen", 3),
-        ("fs", "final_st", 3),
-        ("FlyDSL", "FlyDSL_vk(us)", 8),
-        ("FlyDSL_n", "FlyDSL_naive(us)", 12),
-        ("FlyDSL_nopt", "FlyDSL_naive_opt(us)", 12),
-        ("FlyDSL_kv", "FlyDSL_kv(us)", 9),
-        ("FlyDSL_kvn", "FlyDSL_kvnaive(us)", 10),
-        ("Tri_vk", "Triton_vk(us)", 8),
-        ("vLLM", "vLLM_vk(us)", 8),
-        ("HIP", "HIP_vk(us)", 8),
-        ("fly/vk", "flydsl_vs_vk", 7),
-        ("fly/vllm", "flydsl_vs_vllm", 8),
-        ("hip/fly", "hip_vs_flydsl", 8),
+        ("fs", "final_st", 2),
+        ("FlyDSL", "FlyDSL_vk(us)", 6),
+        ("fly_naive", "FlyDSL_naive(us)", 9),
+        ("fly_opt", "FlyDSL_kvnaive(us)", 7),
+        ("Tri_vk", "Triton_vk(us)", 6),
+        ("vLLM", "vLLM_vk(us)", 6),
+        ("HIP", "HIP_vk(us)", 6),
+        ("fly/vk", "flydsl_vs_vk", 6),
+        ("hip/vk", "hip_vs_vk", 6),
+        ("fly_opt/vk", "flydsl_opt_vs_vk", 10),
     ]
 
     def _fmt_cell(val, key, width):
