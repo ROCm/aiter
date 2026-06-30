@@ -203,7 +203,6 @@ def compile_mla_reduce(
     ):
         out_t = _out_t(out_dtype)
         c_VEC = fx.Index(VEC)
-        acc_vt = T.vec(VEC, T.f32)
         out_vt = T.vec(VEC, out_t)
 
         def load_o_elems(g, row_idx, head_idx, col_idx):
@@ -217,12 +216,23 @@ def compile_mla_reduce(
             ]
 
         def store_o_elems(g, off_idx, elems_f32):
-            """Cast VEC fp32 scalars to out_t and store."""
+            """Cast VEC fp32 scalars to out_t and emit one vector buffer store.
+
+            Truncate each element to out_t first, then pack into the out_t vector
+            so the store lowers to buffer_store_dwordx2/4 instead of a per-element
+            (scalarized) buffer_store_short.
+            """
             if fx.const_expr(VEC == 1):
                 g[off_idx] = elems_f32[0].truncf(out_t)
                 return
-            ov = fx.vector.from_elements(acc_vt, [_to_raw(e) for e in elems_f32])
-            g.vec_store((off_idx,), ov.truncf(out_vt), VEC)
+            out_vec = fx.vector.from_elements(
+                out_vt,
+                [
+                    _to_raw(elems_f32[i].truncf(out_t))
+                    for i in fx.range_constexpr(VEC)
+                ],
+            )
+            g.vec_store((off_idx,), out_vec, VEC)
 
         tid = fx.thread_idx.x
         col = tid * c_VEC
