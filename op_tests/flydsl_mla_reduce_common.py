@@ -3,7 +3,11 @@
 import torch
 import aiter
 
-from aiter.ops.flydsl.kernels.mla_reduce import compile_mla_reduce, select_tier
+from aiter.ops.flydsl.kernels.mla_reduce import (
+    compile_mla_reduce,
+    select_tier,
+    should_use_persistent_launch,
+)
 
 
 def max_splits_from_indptr(indptr: torch.Tensor) -> int:
@@ -585,12 +589,18 @@ def make_runner(
         num_partial_rows = int(po.size(0))
     if num_final_rows is None:
         num_final_rows = int(fout.size(0))
+    use_persistent = should_use_persistent_launch(
+        H=H,
+        max_seqlen_q=M,
+        num_reduce_tile=num_tiles,
+        num_cu=max_splits,
+    )
     kernel = compile_mla_reduce(
         H=H,
         Dv=Dv,
         out_dtype=out_dtype_str,
         tier=tier,
-        persistent=False,
+        persistent=use_persistent,
         output_lse=output_lse,
         use_reduce_final_map=True,
         disable_guards=disable_guards,
