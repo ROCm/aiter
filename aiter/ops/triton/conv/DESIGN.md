@@ -182,9 +182,12 @@ Everything else (`conv2d_nchw`, `conv2d_1x1`, `conv2d_winograd_f4x3_cblocked`,
 …) is **semi-public**: not in `__all__` but importable by name. The benchmark
 harness uses these directly to compare methods on the same shape.
 
-`conv2d.py` also exposes `_last_triton_kernel: Optional[str]` — set by
-`conv2d_nchw` / `conv2d_nhwc` after each routing decision, read by the bench
-to label rows in the per-layer table.
+`conv2d.py` exposes `_resolve_route(...)` — the single source of truth for
+dispatch (returns a `Route` enum member whose value is the kernel display name).
+The benchmark defines a thin `which_kernel(x, w_oihw, ...)` helper on top of it
+to label rows in the per-layer table and pick correctness tolerances, without
+launching. Routing logic stays in `conv2d.py`; the bench-only label query lives
+with the bench.
 
 ---
 
@@ -686,9 +689,10 @@ Concretely, to add (say) a `winograd_f6x3` variant:
 6. **Optionally route** from `_select_3x3_method` if the new kernel
    should be auto-selected. Update the heuristic comment block with the
    shape range where it wins. If you do route from `_select_3x3_method`,
-   also add a `_last_triton_kernel = "..."` line in the matching branch
-   of `conv2d_nchw` / `conv2d_nhwc` so the bench labels the row
-   correctly.
+   add a `Route` enum member (its value is the kernel display name) and a
+   branch in `_resolve_route` (the single source of truth for dispatch),
+   plus the matching branch in `_route_and_run`. The bench's `which_kernel`
+   labels then follow automatically.
 7. **Run the suite** — `pytest op_tests/triton_tests/conv/` parametrizes
    `test_no_bias` and `test_activations` over every entry in
    `METHOD_REGISTRY`, so the new method gets correctness coverage

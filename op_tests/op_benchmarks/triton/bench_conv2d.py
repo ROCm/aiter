@@ -47,7 +47,6 @@ import torch
 import torch.nn.functional as F
 import triton
 
-import aiter.ops.triton.conv.conv2d as _ops_module
 from aiter.ops.triton.conv._utils import (
     BLOCK_K,
     flops_conv,
@@ -66,7 +65,20 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_winograd_f4x3,
     conv2d_winograd_f4x3_fused,
     conv2d_winograd_f4x3_cblocked,
+    _resolve_route,
 )
+
+
+def which_kernel(x, w_oihw, stride=(1, 1), dilation=(1, 1), layout="nchw"):
+    """Name of the Triton kernel ``conv2d`` would route to for these shapes,
+    without launching anything. Delegates to the production ``_resolve_route``
+    (the same decision the router uses), so the label can never drift from
+    dispatch. Bench-only: used to label rows and pick correctness tolerances."""
+    N, C, H, W_in = x.shape
+    K_out, _, R, S = w_oihw.shape
+    route = _resolve_route(R, S, stride, dilation, N, C, H, W_in, K_out, layout.lower())
+    return route.value
+
 
 METHODS = {
     "auto": conv2d,
@@ -347,10 +359,16 @@ def bench_one_shape(
     def run_torch():
         return F.conv2d(x_in, w, b, stride=stride, padding=padding, dilation=dilation)
 
-    # One run: captures the output (for correctness) AND _last_triton_kernel.
+    # One run for correctness. The routed-kernel name is queried separately via
+    # which_kernel (no global side-channel); forced --methods name the kernel
+    # directly, so for those we use the method string (its winograd/cblocked
+    # substrings drive the checks below).
     y_tri = run_triton()
     torch.cuda.synchronize()
-    kernel_name = getattr(_ops_module, "_last_triton_kernel", "") or ""
+    if method in ("auto", "default") or layout == "nhwc":
+        kernel_name = which_kernel(x_in, w, stride, dilation, layout=layout)
+    else:
+        kernel_name = method
     is_winograd = "winograd" in kernel_name.lower() or "wino" in kernel_name.lower()
 
     y_ref = run_torch()
