@@ -164,20 +164,47 @@ def upcast_from_mxfp(
     reshaped_scale = scale.view(-1, scale.shape[-1])
     BLOCK_OUT_DIM = 128
     BLOCK_QUANT_DIM = 32
-    blocks_out_dim = triton.cdiv(reshaped_out.shape[0], BLOCK_OUT_DIM)
     blocks_quant_dim = triton.cdiv(reshaped_out.shape[1], BLOCK_QUANT_DIM)
-    _upcast_from_mxfp[(blocks_out_dim, blocks_quant_dim)](
-        reshaped_out,
-        *reshaped_out.stride(),
-        reshaped_scale,
-        *reshaped_scale.stride(),
-        reshaped_tensor,
-        *reshaped_tensor.stride(),
-        *reshaped_out.shape,
-        BLOCK_OUT_DIM,
-        BLOCK_QUANT_DIM,
-        num_warps=8,
-    )
+    total_rows, out_cols = reshaped_out.shape
+
+    def _launch(out_buf, scale_buf, tensor_buf):
+        blocks_out_dim = triton.cdiv(out_buf.shape[0], BLOCK_OUT_DIM)
+        _upcast_from_mxfp[(blocks_out_dim, blocks_quant_dim)](
+            out_buf,
+            *out_buf.stride(),
+            scale_buf,
+            *scale_buf.stride(),
+            tensor_buf,
+            *tensor_buf.stride(),
+            *out_buf.shape,
+            BLOCK_OUT_DIM,
+            BLOCK_QUANT_DIM,
+            num_warps=8,
+        )
+
+    # The kernel faults on gfx1250 when the output tensor's storage exceeds 2 GiB 
+    # (2**31 bytes): >2 GiB outputs drop off the buffer-ops path onto a global_store.
+    STORE_LIMIT = 1 << 31
+    if total_rows * out_cols * reshaped_out.element_size() < STORE_LIMIT:
+        _launch(reshaped_out, reshaped_scale, reshaped_tensor)
+    else:
+        max_chunk_bytes = 1 << 30  # 1 GiB staging buffers, well under the limit
+        bytes_per_row = out_cols * reshaped_out.element_size()
+        rows_per_chunk = max(max_chunk_bytes // bytes_per_row, BLOCK_OUT_DIM)
+        # align to a multiple of BLOCK_OUT_DIM so blocks don't straddle chunks
+        rows_per_chunk -= rows_per_chunk % BLOCK_OUT_DIM
+        rows_per_chunk = max(rows_per_chunk, BLOCK_OUT_DIM)
+        for row_start in range(0, total_rows, rows_per_chunk):
+            row_end = min(row_start + rows_per_chunk, total_rows)
+            out_chunk = torch.empty(
+                (row_end - row_start, out_cols), dtype=out.dtype, device=out.device
+            )
+            _launch(
+                out_chunk,
+                reshaped_scale[row_start:row_end],
+                reshaped_tensor[row_start:row_end],
+            )
+            reshaped_out[row_start:row_end].copy_(out_chunk)
     out = out.transpose(axis, scale.ndim - 1).contiguous()
     return out
 
