@@ -159,7 +159,7 @@ def select_3d_config(
             # GFX12 fallback
             waves_per_eu = 1
 
-        if SLIDING_WINDOW is not None:
+        if SLIDING_WINDOW is not None and SLIDING_WINDOW > 0:
             num_segments = 1
         else:
             occ = waves_per_eu * 4 // attn_warps
