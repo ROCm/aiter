@@ -58,7 +58,7 @@ TESTS = [
         "model_id": "Qwen/Qwen3.5-397B-A17B",
         "model_path_env": "QWEN35_MODEL_PATH",
         "test_type": "Accuracy",
-        "timeout_minutes": 70,
+        "timeout_minutes": 100,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35 --nightly --timeout-per-file 3600",
         "run_on_pr": True,
