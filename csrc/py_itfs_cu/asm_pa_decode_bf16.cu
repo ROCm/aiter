@@ -115,9 +115,9 @@ struct KernelArgs
     void* ptr_KVIndices;  p2 _p4;    // 0x040  flattened physical page ids
     void* ptr_CL;         p2 _p5;    // 0x050  context lengths
     float softmax_scale;  p3 _p6;    // 0x060  attention softmax scale (by value)
-    float query_scale;    p3 _p7;    // 0x070  per-tensor Q scale (by value)
-    float key_scale;      p3 _p8;    // 0x080  per-tensor K scale (by value)
-    float value_scale;    p3 _p9;    // 0x090  per-tensor V scale (by value)
+    void* ptr_QScale;     p2 _p7;    // 0x070  per-tensor Q scale (scalar)
+    void* ptr_KScale;     p2 _p8;    // 0x080  per-tensor K scale (scalar)
+    void* ptr_VScale;     p2 _p9;    // 0x090  per-tensor V scale (scalar)
     unsigned int kv_nheads; p3 _p10; // 0x0A0  kv_head_num
     unsigned int Qs;      p3 _p11;   // 0x0B0  bytes per MTP layer in FP8 Q
     unsigned int Bs;      p3 _p12;   // 0x0C0  K_blk_stride
