@@ -3042,6 +3042,16 @@ class FmoeTuner(TunerCommon):
                     continue
                 if model_dim % kparams["tile_k"] != 0:
                     continue
+                kb = kparams.get("k_batch", 1)
+                if kb > 1:
+                    if model_dim % kb != 0:
+                        continue
+                    k_per_batch = model_dim // kb
+                    if k_per_batch % kparams["tile_k"] != 0:
+                        continue
+                    k_tiles = k_per_batch // kparams["tile_k"]
+                    if k_tiles < 4 or k_tiles % 2 != 0:
+                        continue
                 bytes_per_thread_x = (
                     kparams["tile_m"] * kparams["tile_k"] * 2 // 256
                 )

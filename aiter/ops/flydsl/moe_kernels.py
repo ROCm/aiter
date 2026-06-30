@@ -317,24 +317,29 @@ def get_flydsl_stage1_kernels_nvfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
     tile_ks = [64, 128, 256]
     tile_ms = [16, 32, 64, 128]
     tile_ns = [64, 128]
+    k_batches = [1, 2, 4, 7, 14]
 
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
-                name = flydsl_kernel_name(
-                    1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                )
-                kernels[name] = {
-                    "stage": 1,
-                    "a_dtype": a_dtype,
-                    "b_dtype": b_dtype,
-                    "out_dtype": out_dtype,
-                    "tile_m": tm,
-                    "tile_n": tn,
-                    "tile_k": tk,
-                    "MPerBlock": tm,
-                    "in_dtype": "nvfp4_bf16",
-                }
+                for kb in k_batches:
+                    name = flydsl_kernel_name(
+                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                    )
+                    if kb != 1:
+                        name += f"_kb{kb}"
+                    kernels[name] = {
+                        "stage": 1,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "in_dtype": "nvfp4_bf16",
+                        "k_batch": kb,
+                    }
     return kernels
 
 
