@@ -468,9 +468,8 @@ def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
     """
     x = actual.double()
     y = expected.double()
-    denom = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denom
-    return float(1 - sim)
+    denom = (x * x + y * y).sum() + 1e-8
+    return float(((x - y) ** 2).sum() / denom)
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +819,7 @@ def main() -> None:
                 "data_format": args.data_format,
                 "layout": args.layout,
                 "act": args.act,
+                "init": "random" if args.const_init is None else "const",
                 "experts": args.experts,
                 "tokens": _tok,
                 "topk": args.topk,
