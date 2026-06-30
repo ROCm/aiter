@@ -210,7 +210,7 @@ def _moe_gemm_a8w4_decode(
     # A pointers
     off_x_m = BLOCK_M * block_id
     if GatherIndx is None:
-        X += start_m * stride_x_m
+        X += start_m.to(index_type) * stride_x_m
     else:
         if GatherIndx.dtype.element_ty == gl.uint16:
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
@@ -374,7 +374,7 @@ def _moe_gemm_a8w4_decode(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
         if GatherIndx is None:
-            XMxScale += start_m * stride_x_mx_m
+            XMxScale += start_m.to(index_type) * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
                 shape=(M, tl.cdiv(K, MX_PACK_DIVISOR)),
@@ -687,7 +687,7 @@ def _moe_gemm_a8w4_decode(
         out = out.to(tl.bfloat16)
 
     # TDM Store: accumulator → shared memory → global memory
-    Y += start_m * stride_y_m
+    Y += start_m.to(index_type) * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,
         shape=[BLOCK_M, OUT_BLOCK_N],
@@ -823,7 +823,7 @@ def _moe_gemm_a8w4_prefill(
     # A pointers
     off_x_m = BLOCK_M * block_id
     if GatherIndx is None:
-        X += start_m * stride_x_m
+        X += start_m.to(index_type) * stride_x_m
     else:
         if GatherIndx.dtype.element_ty == gl.uint16:
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
@@ -981,7 +981,7 @@ def _moe_gemm_a8w4_prefill(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
         if GatherIndx is None:
-            XMxScale += start_m * stride_x_mx_m
+            XMxScale += start_m.to(index_type) * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
                 shape=(M, tl.cdiv(K, MX_PACK_DIVISOR)),
@@ -1337,7 +1337,7 @@ def _moe_gemm_a8w4_prefill(
         out = out.to(tl.bfloat16)
 
     # TDM Store: accumulator → shared memory → global memory
-    Y += start_m * stride_y_m
+    Y += start_m.to(index_type) * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,
         shape=[BLOCK_M, OUT_BLOCK_N],
