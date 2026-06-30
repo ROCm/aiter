@@ -61,6 +61,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         os.environ.get("AITER_AR_1STAGE", "")
     )
     _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", -1))
+    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", -1))
+    _ar_quant_no_prefill_max_bytes = int(
+        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", -1)
+    )
 
     def __init__(
         self,
@@ -419,6 +423,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         hidden_dim = int(input_.shape[-1])
         element_size = input_.element_size()
         total_bytes = input_.numel() * element_size
+        fused_quant_bytes_limit = (
+            self._ar_quant_max_bytes if self._ar_quant_max_bytes >= 0 else 4096 * 1024
+        )
+        no_prefill_quant_bytes_limit = (
+            self._ar_quant_no_prefill_max_bytes
+            if self._ar_quant_no_prefill_max_bytes >= 0
+            else 64 * 1024 * 1024
+        )
         if (
             (
                 hidden_dim in [512, 1024, 2048, 4096]
@@ -427,8 +439,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     and input_.dtype in (torch.float16, torch.bfloat16)
                 )
             )
-            and total_bytes <= 4096 * 1024
-            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+            and total_bytes <= fused_quant_bytes_limit
+            and (prefill_support or total_bytes <= no_prefill_quant_bytes_limit)
         ):
             total_bytes_limit = (
                 self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
