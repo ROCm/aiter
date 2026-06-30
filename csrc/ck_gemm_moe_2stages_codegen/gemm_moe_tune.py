@@ -4,6 +4,7 @@
 import torch
 import aiter
 import pandas as pd
+import math
 import os
 import sys
 import tempfile
@@ -134,7 +135,14 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
 
     x = ref.double().flatten()
     y = res.double().flatten()
-    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    if not bool(torch.isfinite(x).all().item() and torch.isfinite(y).all().item()):
+        cos_diff = float("inf")
+    else:
+        numer = (x * y).sum().item()
+        denom = (x * x + y * y).sum().item()
+        cos_diff = 1 - 2 * numer / max(denom, 1e-12)
+        if not math.isfinite(cos_diff):
+            cos_diff = float("inf")
     if printLog:
         if cos_diff < COS_DIFF_THRESHOLD:
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[32mpassed~\033[0m]")
@@ -221,6 +229,8 @@ class FmoeTuner(TunerCommon):
             required=False,
             help="On gfx1250, tune the FlyDSL grouped-GEMM MoE path instead of the normal fmoe tuner.",
         )
+        # Experimental Opus A8W4 stage1 candidates are intentionally opt-in;
+        # default fused-MoE tuning should not emit opus_moe1_a8w4_* rows.
         self.parser.add_argument(
             "--stage1-a8w4-flydsl-opus-only",
             action="store_true",
@@ -777,6 +787,50 @@ class FmoeTuner(TunerCommon):
         return out
 
     @staticmethod
+    def run_opus_stage1_a8w4_prealloc_out(
+        a1_qt_opus,
+        w1_qt_shffle_ck,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        a1_scale_opus,
+        w1_scale_aiter,
+        opus_stage1_out,
+        opus_stage1_out_scale,
+        dtype,
+        topk,
+        kernel_id,
+        blockM,
+        q_dtype_a,
+        q_type,
+        act_type,
+    ):
+        if (
+            dtype != dtypes.bf16
+            or q_dtype_a != dtypes.fp8
+            or q_type != QuantType.per_1x32
+            or act_type != ActivationType.Silu
+        ):
+            raise ValueError("Opus A8W4 stage1 only supports DSV4 bf16/fp8/fp4 Silu")
+        out, _ = opus_moe_stage1_a8w4_fwd(
+            a1_qt_opus,
+            w1_qt_shffle_ck,
+            a1_scale_opus,
+            w1_scale_aiter,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk=topk,
+            inter_dim_pad=128,
+            model_dim_pad=0,
+            out=opus_stage1_out,
+            out_scale=opus_stage1_out_scale,
+            block_m=blockM,
+            kernel_id=kernel_id,
+        )
+        return out
+
+    @staticmethod
     def run_asm_stage1(
         input,
         w1,
@@ -1104,6 +1158,7 @@ class FmoeTuner(TunerCommon):
         use_g1u1,
         doweight_stage1,
         blockM,
+        stage=1,
         device="cuda",
     ):
         _data = FmoeTuner.generate_data(
@@ -1294,8 +1349,26 @@ class FmoeTuner(TunerCommon):
                     block_size=blockM,
                     sorted_weights=sorted_weights,
                 )
+                opus_stage1_out = torch.empty(
+                    (token, topk, inter_dim),
+                    dtype=dtypes.fp8,
+                    device=device,
+                )
+                sorted_size = max(
+                    int(sorted_ids.numel()),
+                    int(sorted_expert_ids.numel()) * int(blockM),
+                )
+                padded_rows = (sorted_size + 255) // 256 * 256
+                scale_cols = inter_dim // 32
+                padded_cols = (scale_cols + 7) // 8 * 8
+                opus_stage1_out_scale = torch.empty(
+                    (padded_rows, padded_cols),
+                    dtype=dtypes.fp8_e8m0,
+                    device=device,
+                )
             else:
                 a1_qt_opus, a1_scale_opus = None, None
+                opus_stage1_out, opus_stage1_out_scale = None, None
             if (
                 q_type == QuantType.per_1x32
                 and q_dtype_w != dtypes.i4x2
@@ -1338,6 +1411,8 @@ class FmoeTuner(TunerCommon):
                 "a1_qt_fp8_cast": a1_qt_fp8_cast,
                 "a1_qt_opus": a1_qt_opus,
                 "a1_scale_opus": a1_scale_opus,
+                "opus_stage1_out": opus_stage1_out,
+                "opus_stage1_out_scale": opus_stage1_out_scale,
                 "a1_scale_none": None,
                 "bias": (
                     torch.clamp(
@@ -1465,6 +1540,181 @@ class FmoeTuner(TunerCommon):
                     else None
                 ),
             }
+
+    @staticmethod
+    def generate_data_opus_stage1_a8w4(
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        act_type,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        q_type,
+        use_g1u1,
+        doweight_stage1,
+        blockM,
+        stage=1,
+        device="cuda",
+    ):
+        if (
+            dtype != dtypes.bf16
+            or q_dtype_a != dtypes.fp8
+            or q_dtype_w != dtypes.fp4x2
+            or q_type != QuantType.per_1x32
+            or not use_g1u1
+            or doweight_stage1
+            or act_type != ActivationType.Silu
+        ):
+            raise ValueError("lean Opus stage1 data is only for DSV4 A8W4 Silu")
+
+        torch.manual_seed(0)
+        input = torch.randn((token, model_dim), dtype=dtype, device=device) / 10
+        w1_qt = torch.empty(
+            (expert, inter_dim * 2, model_dim // 2),
+            dtype=q_dtype_w,
+            device=device,
+        )
+        w1_scale = torch.empty(
+            (expert * inter_dim * 2, model_dim // 32),
+            dtype=dtypes.fp8_e8m0,
+            device=device,
+        )
+        # Keep peak memory low without switching to CPU quantization. The GPU
+        # quant path is the production path and avoids CPU/GPU fp4 drift in
+        # stage1->stage2 correctness oracles.
+        chunk_experts = 8
+        for start in range(0, expert, chunk_experts):
+            end = min(start + chunk_experts, expert)
+            chunk = end - start
+            w1 = (
+                torch.randn(
+                    (chunk, inter_dim * 2, model_dim),
+                    dtype=dtype,
+                    device=device,
+                )
+                / 10
+            )
+            w1_qt_chunk, w1_scale_chunk = FmoeTuner.weight_quant(
+                w1, q_type, quant_dtype=q_dtype_w
+            )
+            w1_qt_chunk = w1_qt_chunk.view(chunk, inter_dim * 2, model_dim // 2)
+            scale_start = start * inter_dim * 2
+            scale_end = end * inter_dim * 2
+            w1_qt[start:end].copy_(w1_qt_chunk)
+            w1_scale[scale_start:scale_end].copy_(w1_scale_chunk)
+            del w1, w1_qt_chunk, w1_scale_chunk
+        w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
+        w1_qt_shffle_ck.is_shuffled = True
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        if TUNE_MOE_EXPERT_BALANCE:
+            score = torch.zeros((token, expert), dtype=dtype, device=device)
+            start_col = 0
+            end_col = topk
+            for token_id in range(token):
+                score[token_id, start_col:end_col] = 1.0
+                start_col = end_col % expert
+                end_col = start_col + topk
+        else:
+            score = torch.randn((token, expert), dtype=dtype, device=device)
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+        del score
+
+        a1_qt = input.to(dtype)
+        a1_scale = None
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+            moe_sorting(topk_ids, topk_weights, expert, model_dim, dtype, blockM)
+        )
+        needed = sorted_expert_ids.shape[0] * blockM
+        if sorted_ids.shape[0] < needed:
+            pad = torch.full(
+                (needed - sorted_ids.shape[0],),
+                token,
+                dtype=sorted_ids.dtype,
+                device=sorted_ids.device,
+            )
+            sorted_ids = torch.cat([sorted_ids, pad])
+            sorted_weights = torch.cat(
+                [
+                    sorted_weights,
+                    torch.zeros(
+                        pad.shape[0],
+                        dtype=sorted_weights.dtype,
+                        device=sorted_weights.device,
+                    ),
+                ]
+            )
+        # Opus stage1 does not apply topk route weights when doweight_stage1 is
+        # false, but a stage1->stage2 consumer still needs the original route
+        # weights for the stage2 reduction.
+        sorted_weights_for_stage1 = None
+
+        a1_qt_opus, a1_scale_opus = fused_dynamic_mxfp8_quant_moe_sort(
+            input,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            topk=topk,
+            block_size=blockM,
+            sorted_weights=sorted_weights_for_stage1,
+        )
+        opus_stage1_out = torch.empty(
+            (token, topk, inter_dim),
+            dtype=dtypes.fp8,
+            device=device,
+        )
+        sorted_size = max(
+            int(sorted_ids.numel()),
+            int(sorted_expert_ids.numel()) * int(blockM),
+        )
+        padded_rows = (sorted_size + 255) // 256 * 256
+        scale_cols = inter_dim // 32
+        padded_cols = (scale_cols + 7) // 8 * 8
+        opus_stage1_out_scale = torch.empty(
+            (padded_rows, padded_cols),
+            dtype=dtypes.fp8_e8m0,
+            device=device,
+        )
+
+        # Stage1 reference uses w2 only for shape inference. Avoid retaining a
+        # full stage2 weight tensor in stage1-only Opus measurements.
+        w2_storage = torch.empty((1,), dtype=q_dtype_w, device=device)
+        w2_qt_dummy = torch.as_strided(
+            w2_storage,
+            (expert, model_dim, inter_dim // 2),
+            (0, 0, 0),
+        )
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        return {
+            "input": input,
+            "a1_qt": a1_qt,
+            "w1_qt": w1_qt,
+            "w2_qt": w2_qt_dummy,
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "a1_scale": a1_scale,
+            "w1_scale": w1_scale,
+            "sorted_ids": sorted_ids,
+            "sorted_expert_ids": sorted_expert_ids,
+            "sorted_weights": sorted_weights,
+            "stage1_sorted_weights": sorted_weights_for_stage1,
+            "num_valid_ids": num_valid_ids,
+            "moe_buf": moe_buf,
+            "w1_qt_shffle_ck": w1_qt_shffle_ck,
+            "w1_scale_aiter": w1_scale_aiter,
+            "a1_qt_opus": a1_qt_opus,
+            "a1_scale_opus": a1_scale_opus,
+            "opus_stage1_out": opus_stage1_out,
+            "opus_stage1_out_scale": opus_stage1_out_scale,
+            "bias": None,
+        }
 
     @staticmethod
     def generate_data_1stage(
@@ -1622,6 +1872,96 @@ class FmoeTuner(TunerCommon):
                 ref1.view(ref1.shape[0], -1, 128), quant_dtype=a1_qt.dtype
             )
             ref1 = ref1.view(ref1.shape[0], topk, -1)
+        return ref1
+
+    @staticmethod
+    def run_torch_moe_stage1_a8w4_sparse_ref(
+        a1_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        a1_scale,
+        w1_scale,
+        sorted_ids=None,
+        num_valid_ids=None,
+        w1_bias=None,
+        dtype=dtypes.bf16,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.No,
+        doweight_stage1=False,
+        topk=1,
+        blockM=32,
+        fuse_fp4=False,
+        fuse_fp8=False,
+    ):
+        if (
+            quant_type != QuantType.per_1x32
+            or a1_scale is not None
+            or activation != ActivationType.Silu
+            or doweight_stage1
+            or fuse_fp4
+        ):
+            return FmoeTuner.run_torch_moe_stage1(
+                a1_qt,
+                w1_qt,
+                w2_qt,
+                topk_weights,
+                topk_ids,
+                a1_scale,
+                w1_scale,
+                sorted_ids,
+                num_valid_ids,
+                w1_bias,
+                dtype,
+                activation,
+                quant_type,
+                doweight_stage1,
+                topk,
+                blockM,
+                fuse_fp4,
+                fuse_fp8,
+            )
+
+        from aiter.utility import fp4_utils
+
+        token_num, model_dim = a1_qt.shape
+        route_topk = topk_ids.shape[1]
+        inter_dim = w2_qt.shape[2] * (w2_qt.shape[1] // w1_qt.shape[2])
+        n = w1_qt.shape[1]
+        hidden = a1_qt.to(dtypes.fp32)
+        hidden = hidden.view(token_num, 1, model_dim).expand(-1, route_topk, -1)
+        out = torch.zeros(
+            (token_num, route_topk, n),
+            dtype=dtypes.fp32,
+            device=a1_qt.device,
+        )
+
+        for expert_id in torch.unique(topk_ids).tolist():
+            expert_id = int(expert_id)
+            mask = topk_ids == expert_id
+            if not bool(mask.any()):
+                continue
+            sub_tokens = hidden[mask]
+            w1_e = fp4_utils.mxfp4_to_f32(w1_qt[expert_id : expert_id + 1])[0]
+            w1_scale_e = fp4_utils.e8m0_to_f32(
+                w1_scale[expert_id * n : (expert_id + 1) * n]
+            )
+            w1_e = w1_e.view(n, model_dim // 32, 32) * w1_scale_e.view(
+                n, model_dim // 32, 1
+            )
+            w1_e = w1_e.view(n, model_dim)
+            out[mask] = sub_tokens @ w1_e.transpose(0, 1)
+            if w1_bias is not None:
+                out[mask] = out[mask] + w1_bias[expert_id].view(1, -1)
+
+        gate, up = out.split([inter_dim, inter_dim], dim=-1)
+        ref1 = (F.silu(gate) * up).to(dtype)
+        if fuse_fp8:
+            a2_fp8_bytes, _a2_scale_e8m0 = torch_dynamic_mxfp8_quant(
+                ref1.reshape(-1, inter_dim)
+            )
+            return a2_fp8_bytes.view(dtypes.fp8).view(token_num, route_topk, inter_dim)
         return ref1
 
     @staticmethod
@@ -2814,7 +3154,7 @@ class FmoeTuner(TunerCommon):
             tasks_ck.append(
                 (
                     (info, "stage2", cktile_s2_name, blockM),
-                    FmoeTuner.generate_data_2stages,
+                    FmoeTuner.generate_data_opus_stage1_a8w4,
                     (*_gen_data_args_s2, blockM, 2),
                     FmoeTuner.cktile_moe_stage2_out,
                     (
@@ -3398,16 +3738,28 @@ class FmoeTuner(TunerCommon):
             get_opus_a8w4_stage1_kernels,
         )
 
-        for s1_name, kparams in get_opus_a8w4_stage1_kernels(token).items():
+        only_kids_env = os.environ.get("OPUS_STAGE1_A8W4_ONLY_KIDS", "").strip()
+        only_kids = None
+        if only_kids_env:
+            only_kids = {
+                int(kid.strip())
+                for kid in only_kids_env.split(",")
+                if kid.strip()
+            }
+        stage1_kernels = get_opus_a8w4_stage1_kernels(token)
+
+        for s1_name, kparams in stage1_kernels.items():
             kernel_block_m = int(kparams["block_m"])
             sort_block_m = int(kparams["sort_block_m"])
             if kernel_block_m not in blockMs and sort_block_m not in blockMs:
                 continue
             kernel_id = int(kparams["kid"])
+            if only_kids is not None and kernel_id not in only_kids:
+                continue
             tasks_opus.append(
                 (
                     (info, "stage1", s1_name, sort_block_m),
-                    FmoeTuner.generate_data_2stages,
+                    FmoeTuner.generate_data_opus_stage1_a8w4,
                     (
                         token,
                         model_dim,
@@ -3424,7 +3776,7 @@ class FmoeTuner(TunerCommon):
                         sort_block_m,
                         1,
                     ),
-                    FmoeTuner.run_opus_stage1_a8w4_out,
+                    FmoeTuner.run_opus_stage1_a8w4_prealloc_out,
                     (
                         [
                             "a1_qt_opus",
@@ -3434,6 +3786,8 @@ class FmoeTuner(TunerCommon):
                             "num_valid_ids",
                             "a1_scale_opus",
                             "w1_scale_aiter",
+                            "opus_stage1_out",
+                            "opus_stage1_out_scale",
                         ],
                         dtype,
                         topk,
@@ -3444,7 +3798,7 @@ class FmoeTuner(TunerCommon):
                         act_type,
                     ),
                     {},
-                    FmoeTuner.run_torch_moe_stage1,
+                    FmoeTuner.run_torch_moe_stage1_a8w4_sparse_ref,
                     (
                         [
                             "a1_qt",
@@ -4004,6 +4358,7 @@ class FmoeTuner(TunerCommon):
         tasks_ck = []
         task_1stage = []
         in_data = []
+        stage1_a8w4_only_dispatch = False
         for line in untunedf[keys].values:
             (
                 gfx,
@@ -4063,6 +4418,37 @@ class FmoeTuner(TunerCommon):
                 and (model_dim, inter_dim, expert, topk) == (7168, 512, 384, 6)
             )
             if stage1_a8w4_only:
+                stage1_a8w4_only_dispatch = True
+
+                stage1_source_env = os.environ.get(
+                    "OPUS_STAGE1_A8W4_ONLY_SOURCE", "all"
+                ).strip().lower()
+                if stage1_source_env in ("", "all", "both"):
+                    stage1_sources = {"flydsl", "opus"}
+                else:
+                    stage1_sources = {
+                        source.strip()
+                        for source in stage1_source_env.split(",")
+                        if source.strip()
+                    }
+                invalid_sources = stage1_sources - {"flydsl", "opus"}
+                if invalid_sources:
+                    raise ValueError(
+                        "OPUS_STAGE1_A8W4_ONLY_SOURCE supports only "
+                        f"flydsl/opus/all, got {sorted(invalid_sources)}"
+                    )
+
+                def _stage1_no_rotate_task(task):
+                    # The DSV4 A8W4 stage1-only experiment compares production
+                    # launch closures. Tensor-arg rotation dominates
+                    # small-token Opus timings, but larger buckets should keep
+                    # run_perftest's default auto-rotation to match the frozen
+                    # baseline timing path.
+                    kwargs = dict(task[5])
+                    if token < 4096:
+                        kwargs.setdefault("num_rotate_args", 1)
+                    return task[:5] + (kwargs,) + task[6:]
+
                 flydsl_stage1_tasks = [
                     task
                     for task in self.gen_flydsl_2stages_task(info, blockMs)
@@ -4073,8 +4459,16 @@ class FmoeTuner(TunerCommon):
                         )
                     )
                 ]
-                tasks_ck.extend(flydsl_stage1_tasks)
-                tasks_ck.extend(self.gen_opus_stage1_a8w4_task(info, blockMs))
+                flydsl_stage1_tasks = [
+                    _stage1_no_rotate_task(task) for task in flydsl_stage1_tasks
+                ]
+                if "flydsl" in stage1_sources:
+                    tasks_ck.extend(flydsl_stage1_tasks)
+                if "opus" in stage1_sources:
+                    tasks_ck.extend(
+                        _stage1_no_rotate_task(task)
+                        for task in self.gen_opus_stage1_a8w4_task(info, blockMs)
+                    )
             else:
                 _opus_only = os.environ.get("OPUS_ONLY", "0") == "1"
                 # TUNE_ONLY: comma-list subset gate to isolate sources, e.g.
@@ -4129,13 +4523,26 @@ class FmoeTuner(TunerCommon):
         in_data.append((len(all_tasks), ()))
         rets = []
         if len(all_tasks) > 0:
-            ### shape_grouped should be False as multiple stages
+            shape_grouped = bool(args.shape_grouped and stage1_a8w4_only_dispatch)
+            if shape_grouped:
+                data_keys = {
+                    (id(task[1]), task[2])
+                    for task in all_tasks
+                    if len(task) >= 3
+                }
+                if len(data_keys) > 1:
+                    print(
+                        "[stage1-a8w4] disabling --shape_grouped because "
+                        "candidate kernels require different data generation "
+                        "arguments"
+                    )
+                    shape_grouped = False
             rets = mp_tuner(
                 all_tasks,
                 in_data,
                 mp_num,
                 True,
-                False,
+                shape_grouped,
                 timeout=args.timeout,
                 verbose=args.verbose,
             )
@@ -4306,6 +4713,7 @@ class FmoeTuner(TunerCommon):
             ].copy()
             if args.stage1_a8w4_flydsl_opus_only:
                 stage1_only = profileDF[profileDF["stage"] == "stage1"].copy()
+                stage1_only = stage1_only[stage1_only["err"] == 0.0].copy()
                 if len(stage1_only) == 0:
                     print(
                         f"no valid stage1 candidate found for {key}, please check "

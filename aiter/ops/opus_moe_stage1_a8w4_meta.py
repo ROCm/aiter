@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Structured metadata for experimental Opus MoE A8W4 stage1 kernels.
+"""Structured metadata for Opus MoE A8W4 stage1 kernels.
 
 This module is torch-free so runtime wrappers, tuner code, and csrc codegen can
 share the same stage1 kid table without drifting.
@@ -13,12 +13,29 @@ from typing import Optional
 
 
 OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_A_REUSE_MFMA = 1010
+OPUS_A8W4_STAGE1_KID_P0_BM32_BN384_GATE_UP_GROUP_SPLIT_NOCLAMP = 1014
+OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_GATE_UP_GROUP_SPLIT_T4096_MIN1 = 1018
+OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_GATE_UP_GROUP_SPLIT_T4096_NOCLAMP_MIN1 = 1019
 OPUS_A8W4_STAGE1_KID_P0_BM16_BN64_SBM32_G1_KW2_A_REUSE_MFMA = 1020
 OPUS_A8W4_STAGE1_KID_P0_BM16_BN64_SBM32_G1_A_REUSE_MFMA = 1030
 OPUS_A8W4_STAGE1_KID_P0_BM32_BN384_A_REUSE_MFMA = 1040
 OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_GATE_UP_GROUP_SPLIT = 1050
 OPUS_A8W4_STAGE1_KID_P0_BM128_BN256_GATE_UP_GROUP_SPLIT = 1060
 OPUS_A8W4_STAGE1_KID_P0_BM64_BN256_GATE_UP_GROUP_SPLIT = 1070
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G6_KW1_EXPERTCAP_NOCLAMP_GROUP_SPLIT_RS2_MIN4_A_REUSE_MFMA = 1072
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_NOCLAMP_SPLIT_SELECTOR_B_A_REUSE_MFMA = 1073
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_CAP_ROUTES_NOCLAMP_SPLIT_SELECTOR_B_A_REUSE_MFMA = 1074
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW2_NOCLAMP_SPLIT_SELECTOR_B_A_REUSE_MFMA = 1076
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW2_CAP_ROUTES_NOCLAMP_SPLIT_SELECTOR_B_MIN2_A_REUSE_MFMA = 1078
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW1_A_REUSE_MFMA = 1083
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_CAP_ROUTES_A_REUSE_MFMA = 1087
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW2_CAP_ROUTES_A_REUSE_MFMA = 1090
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN64_SBM32_G1_KW2_CAP_ROUTES_A_REUSE_MFMA = 1091
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW1_NOCLAMP_A_REUSE_MFMA = 1094
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_NOCLAMP_A_REUSE_MFMA = 1095
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW2_CAP_ROUTES_NOCLAMP_A_REUSE_MFMA = 1097
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G6_KW1_EXPERTCAP_NOCLAMP_GROUP_SPLIT_MIN1_A_REUSE_MFMA = 1098
+OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G6_KW1_NOCLAMP_GROUP_SPLIT_MIN1_A_REUSE_MFMA = 1099
 
 
 @dataclass(frozen=True)
@@ -75,7 +92,37 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         block_n=384,
         block_k=256,
         sort_block_m=16,
-        tuner_tokens=(1, 2),
+        tuner_tokens=(1, 2, 4, 8, 16, 32),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM32_BN384_GATE_UP_GROUP_SPLIT_NOCLAMP,
+        name="opus_moe1_a8w4_bm32_bn384_gateup_groupsplit_noclamp",
+        trait="OpusMoeStage1A8W4P0Bm32Bn384GateUpGroupSplitNoClamp",
+        block_m=32,
+        block_n=384,
+        block_k=256,
+        sort_block_m=32,
+        tuner_tokens=(512, 1024, 2048),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_GATE_UP_GROUP_SPLIT_T4096_MIN1,
+        name="opus_moe1_a8w4_bm64_bn384_gateup_groupsplit_t4096_min1",
+        trait="OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096Min1",
+        block_m=64,
+        block_n=384,
+        block_k=256,
+        sort_block_m=64,
+        tuner_tokens=(4096,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_GATE_UP_GROUP_SPLIT_T4096_NOCLAMP_MIN1,
+        name="opus_moe1_a8w4_bm64_bn384_gateup_groupsplit_t4096_noclamp_min1",
+        trait="OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096NoClampMin1",
+        block_m=64,
+        block_n=384,
+        block_k=256,
+        sort_block_m=64,
+        tuner_tokens=(4096, 8192, 16384, 32768),
     ),
     OpusA8W4Stage1Instance(
         kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN64_SBM32_G1_KW2_A_REUSE_MFMA,
@@ -105,7 +152,7 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         block_n=384,
         block_k=256,
         sort_block_m=32,
-        tuner_tokens=(64, 256, 512, 1024),
+        tuner_tokens=(64, 128, 256, 512, 1024),
     ),
     OpusA8W4Stage1Instance(
         kid=OPUS_A8W4_STAGE1_KID_P0_BM64_BN384_GATE_UP_GROUP_SPLIT,
@@ -115,7 +162,7 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         block_n=384,
         block_k=256,
         sort_block_m=64,
-        tuner_tokens=(128,),
+        tuner_tokens=(128, 4096),
     ),
     OpusA8W4Stage1Instance(
         kid=OPUS_A8W4_STAGE1_KID_P0_BM128_BN256_GATE_UP_GROUP_SPLIT,
@@ -137,6 +184,146 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         block_k=256,
         sort_block_m=64,
         tuner_tokens=(4096,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G6_KW1_EXPERTCAP_NOCLAMP_GROUP_SPLIT_RS2_MIN4_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g6_kw1_expertcap_noclamp_groupsplit_rs2_min4_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G6KWave1ExpertCapNoClampGroupSplitRs2Min4AReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(256, 512),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G6_KW1_EXPERTCAP_NOCLAMP_GROUP_SPLIT_MIN1_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g6_kw1_expertcap_noclamp_groupsplit_min1_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G6KWave1ExpertCapNoClampGroupSplitMin1AReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(512,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G6_KW1_NOCLAMP_GROUP_SPLIT_MIN1_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g6_kw1_noclamp_groupsplit_min1_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G6KWave1NoClampGroupSplitMin1AReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(1024,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_NOCLAMP_SPLIT_SELECTOR_B_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw4_noclamp_splitselectorb_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave4NoClampSplitSelectorBAReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(2,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_CAP_ROUTES_NOCLAMP_SPLIT_SELECTOR_B_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw4_caproutes_noclamp_splitselectorb_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampSplitSelectorBAReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(64, 128),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW2_NOCLAMP_SPLIT_SELECTOR_B_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw2_noclamp_splitselectorb_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave2NoClampSplitSelectorBAReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(8,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW2_CAP_ROUTES_NOCLAMP_SPLIT_SELECTOR_B_MIN2_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw2_caproutes_noclamp_splitselectorb_min2_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin2AReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(1,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW1_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw1_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave1AReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(16,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_CAP_ROUTES_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw4_caproutes_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesAReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(8,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW2_CAP_ROUTES_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw2_caproutes_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesAReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(8,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN64_SBM32_G1_KW2_CAP_ROUTES_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn64_sbm32_g1_kw2_caproutes_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn64Sbm32G1KWave2CapRoutesAReuse",
+        block_m=16,
+        block_n=64,
+        block_k=256,
+        sort_block_m=32,
+        tuner_tokens=(4,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW1_NOCLAMP_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw1_noclamp_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave1NoClampAReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(16,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW4_NOCLAMP_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw4_noclamp_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave4NoClampAReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(32,),
+    ),
+    OpusA8W4Stage1Instance(
+        kid=OPUS_A8W4_STAGE1_KID_P0_BM16_BN384_G1_KW2_CAP_ROUTES_NOCLAMP_A_REUSE_MFMA,
+        name="opus_moe1_a8w4_bm16_bn384_g1_kw2_caproutes_noclamp_a_reuse_mfma",
+        trait="OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampAReuse",
+        block_m=16,
+        block_n=384,
+        block_k=256,
+        sort_block_m=16,
+        tuner_tokens=(4, 8),
     ),
 )
 

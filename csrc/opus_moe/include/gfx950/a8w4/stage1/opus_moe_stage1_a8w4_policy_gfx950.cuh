@@ -287,6 +287,11 @@ inline __device__ int activated_smem_offset(int smem_row,
                                             int group,
                                             int local_col)
 {
+    if constexpr(Traits::GATE_UP_GROUP_SPLIT && Traits::B_M == 64 &&
+                 Traits::B_N == 256)
+    {
+        local_col ^= (smem_row & 7) << 2;
+    }
     return smem_row *
                (Traits::OUTPUT_SCALE_GROUPS_PER_TILE *
                 Traits::SCALE_GROUP_LOGICAL_K) +
@@ -300,19 +305,9 @@ inline __device__ int output_byte_offset(int token,
                                          int64_t stride_out_t,
                                          int64_t stride_out_k)
 {
-    constexpr auto block_shape = opus::make_tuple(
-        opus::number<1>{}, opus::number<1>{}, opus::number<1>{});
-    constexpr auto block_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}));
-    auto u = opus::make_layout<-1>(
-        block_shape,
-        opus::unfold_x_stride(
-            block_dim,
-            block_shape,
-            opus::tuple{stride_out_t, stride_out_k, opus::number<1>{}}));
-    return static_cast<int>(u(token, slot, effective_col));
+    return static_cast<int>(static_cast<int64_t>(token) * stride_out_t +
+                            static_cast<int64_t>(slot) * stride_out_k +
+                            effective_col);
 }
 
 template<typename Traits>

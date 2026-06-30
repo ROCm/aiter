@@ -3,6 +3,7 @@
 #pragma once
 
 #include "opus_moe_stage1_a8w4_policy_gfx950.cuh"
+#include "mx_quant_utils.h"
 
 namespace opus_moe
 {
@@ -11,14 +12,35 @@ namespace stage1_a8w4
 
 #ifdef __HIP_DEVICE_COMPILE__
 
+inline __device__ float clamp_e4m3fn(float v)
+{
+    constexpr float kFp8E4M3FnMax = 448.0f;
+    if(!(v == v))
+        return 0.0f;
+    v = v > kFp8E4M3FnMax ? kFp8E4M3FnMax : v;
+    v = v < -kFp8E4M3FnMax ? -kFp8E4M3FnMax : v;
+    return v;
+}
+
+template<typename Traits>
 inline __device__ uint32_t fp32x4_to_fp8x4_word(float v0,
                                                 float v1,
                                                 float v2,
                                                 float v3)
 {
     int packed = 0;
-    packed = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, packed, 0);
-    packed = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, packed, 1);
+    if constexpr(Traits::CLAMP_OUTPUT_FP8)
+    {
+        packed = __builtin_amdgcn_cvt_pk_fp8_f32(
+            clamp_e4m3fn(v0), clamp_e4m3fn(v1), packed, 0);
+        packed = __builtin_amdgcn_cvt_pk_fp8_f32(
+            clamp_e4m3fn(v2), clamp_e4m3fn(v3), packed, 1);
+    }
+    else
+    {
+        packed = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, packed, 0);
+        packed = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, packed, 1);
+    }
     return static_cast<uint32_t>(packed);
 }
 
@@ -34,13 +56,32 @@ inline __device__ float silu_mul(float gate, float up)
     return gate * sig * up;
 }
 
+template<bool AssumeFinite>
 inline __device__ uint8_t mxfp8_scale_byte_from_amax(float amax)
 {
-    uint32_t max_bits = __builtin_bit_cast(uint32_t, amax);
-    max_bits = (max_bits + 0x400000u) & 0xFF800000u;
-    uint32_t exp_field = max_bits >> 23;
-    exp_field = exp_field > 8u ? exp_field - 8u : 0u;
-    return static_cast<uint8_t>(exp_field > 254u ? 254u : exp_field);
+    // Exact RoundUp/RCEIL for FP8_E4M3:
+    //   ceil_pow2(amax / 448), where 448 = 1.75 * 2^8.
+    const uint32_t bits = __builtin_bit_cast(uint32_t, amax);
+    const uint32_t exp = (bits >> 23) & 0xFFu;
+    const uint32_t mant = bits & 0x7FFFFFu;
+    if constexpr(!AssumeFinite)
+    {
+        if(exp == 0xFFu)
+            return 0xFFu;
+    }
+    if(exp <= 8u)
+    {
+        const uint32_t scaled_bits =
+            __builtin_bit_cast(uint32_t, amax * (1.0f / 448.0f));
+        uint32_t scaled_exp = (scaled_bits >> 23) & 0xFFu;
+        if(scaled_exp < 0xFFu && (scaled_bits & 0x7FFFFFu))
+            scaled_exp += 1u;
+        return static_cast<uint8_t>(scaled_exp);
+    }
+    uint32_t scale_exp = exp > 8u ? exp - 8u : 0u;
+    if(mant > 0x600000u)
+        scale_exp += 1u;
+    return static_cast<uint8_t>(scale_exp);
 }
 
 inline __device__ float mxfp8_quant_scale(uint8_t e8m0_biased)
@@ -232,7 +273,8 @@ inline __device__ void epilogue_quantize_row_pass(
         const int lane_id = tile.tid % opus::get_warp_size();
         const float amax = pair_amax(local_amax, lane_id);
 
-        const uint8_t scale_byte = mxfp8_scale_byte_from_amax(amax);
+        const uint8_t scale_byte =
+            mxfp8_scale_byte_from_amax<!Traits::CLAMP_OUTPUT_FP8>(amax);
         const float quant_scale = mxfp8_quant_scale(scale_byte);
         const int scale_col =
             group_col_base / Traits::SCALE_GROUP_LOGICAL_K;
@@ -252,7 +294,7 @@ inline __device__ void epilogue_quantize_row_pass(
             ++word)
         {
             const int base = word * static_cast<int>(sizeof(uint32_t));
-            packed[word] = fp32x4_to_fp8x4_word(
+            packed[word] = fp32x4_to_fp8x4_word<Traits>(
                 values[base + 0] * quant_scale,
                 values[base + 1] * quant_scale,
                 values[base + 2] * quant_scale,
@@ -281,20 +323,30 @@ inline __device__ void epilogue_quantize_activated_row_pass(
     const uint8_t* __restrict__ smem_route_valid,
     float* __restrict__ smem_values)
 {
-    constexpr bool kSplitQuantGroupBlocks =
+    constexpr bool kSplitQuantGroupBlocks2 =
         Traits::GATE_UP_GROUP_SPLIT &&
         Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 4 &&
         Traits::EPILOGUE_THREADS * 2 == Traits::BLOCK_SIZE;
+    constexpr bool kSplitQuantGroupBlocks3 =
+        Traits::GATE_UP_GROUP_SPLIT &&
+        Traits::B_M == 32 &&
+        Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 6 &&
+        Traits::EPILOGUE_THREADS * 3 <= Traits::BLOCK_SIZE;
 
-    const int smem_m = kSplitQuantGroupBlocks ? (tile.tid >> 2) : (tile.tid >> 1);
+    int smem_m = tile.tid >> 1;
+    if constexpr(kSplitQuantGroupBlocks2)
+        smem_m = tile.tid >> 2;
+    if constexpr(kSplitQuantGroupBlocks3)
+        smem_m = tile.tid / 6;
     const int half = tile.tid & 1;
     const int local_m = row_pass_base + smem_m;
     const int local_col_base = half * (Traits::SCALE_GROUP_LOGICAL_K / 2);
     const int route_row = tile.route_base + local_m;
-    const bool epilogue_active =
-        kSplitQuantGroupBlocks ?
-            tile.tid < Traits::EPILOGUE_THREADS * 2 :
-            tile.tid < Traits::EPILOGUE_THREADS;
+    bool epilogue_active = tile.tid < Traits::EPILOGUE_THREADS;
+    if constexpr(kSplitQuantGroupBlocks2)
+        epilogue_active = tile.tid < Traits::EPILOGUE_THREADS * 2;
+    if constexpr(kSplitQuantGroupBlocks3)
+        epilogue_active = tile.tid < Traits::EPILOGUE_THREADS * 3;
     if(!epilogue_active)
         return;
 
@@ -306,8 +358,14 @@ inline __device__ void epilogue_quantize_activated_row_pass(
         return;
 
     constexpr int kGroupsPerThread =
-        kSplitQuantGroupBlocks ? 2 : Traits::OUTPUT_SCALE_GROUPS_PER_TILE;
-    const int group_base = kSplitQuantGroupBlocks ? ((tile.tid >> 1) & 1) * 2 : 0;
+        kSplitQuantGroupBlocks2 ? 2 :
+        kSplitQuantGroupBlocks3 ? 2 :
+        Traits::OUTPUT_SCALE_GROUPS_PER_TILE;
+    int group_base = 0;
+    if constexpr(kSplitQuantGroupBlocks2)
+        group_base = ((tile.tid >> 1) & 1) * 2;
+    if constexpr(kSplitQuantGroupBlocks3)
+        group_base = ((tile.tid >> 1) % 3) * 2;
     for(int local_group = 0; local_group < kGroupsPerThread; ++local_group)
     {
         const int group = group_base + local_group;
@@ -331,7 +389,8 @@ inline __device__ void epilogue_quantize_activated_row_pass(
         const int lane_id = tile.tid % opus::get_warp_size();
         const float amax = pair_amax(local_amax, lane_id);
 
-        const uint8_t scale_byte = mxfp8_scale_byte_from_amax(amax);
+        const uint8_t scale_byte =
+            mxfp8_scale_byte_from_amax<!Traits::CLAMP_OUTPUT_FP8>(amax);
         const float quant_scale = mxfp8_quant_scale(scale_byte);
         const int scale_col =
             group_col_base / Traits::SCALE_GROUP_LOGICAL_K;
@@ -351,7 +410,7 @@ inline __device__ void epilogue_quantize_activated_row_pass(
             ++word)
         {
             const int base = word * static_cast<int>(sizeof(uint32_t));
-            packed[word] = fp32x4_to_fp8x4_word(
+            packed[word] = fp32x4_to_fp8x4_word<Traits>(
                 values[base + 0] * quant_scale,
                 values[base + 1] * quant_scale,
                 values[base + 2] * quant_scale,

@@ -7,9 +7,9 @@ Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 This directory is the isolated workspace for experimental gfx950 A8W4 stage1
 kernels. It is wired only through the explicit stage1 Python/API entry point
-and is not selected by fused MoE serving dispatch.
+and opt-in tuner flags. It is not selected by fused MoE serving dispatch.
 
-Initial target:
+Current replay target:
 
 ```text
 large routed A8W4 stage1 bucket
@@ -20,6 +20,23 @@ effective_inter_dim: 384
 inter_dim_pad: 128
 experts: 384
 topk: 6
+```
+
+Entry points and gating:
+
+```text
+Runtime/JIT API:
+  C++/pybind symbol: opus_moe_stage1_a8w4_fwd
+  Python wrapper:    aiter/ops/opus/moe_stage1_a8w4.py
+
+Tuner opt-in:
+  csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py
+    --stage1-a8w4-flydsl-opus-only
+    --include-opus-stage1-a8w4
+
+Serving:
+  Fused MoE default dispatch does not select these kernels, and the DSV4 tuned
+  CSV currently has no `opus_moe1_a8w4_*` entries.
 ```
 
 File roles:
@@ -62,7 +79,8 @@ headers. They use the 10xx range; A8W4 stage2 ids are generated from the
 stage2 meta manifest outside this experimental range.
 
 1010: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=4,
-      single output-group A-reuse path. Selected for token=1/2.
+      single output-group A-reuse path. Candidate for token=1/2/4/8/16/32;
+      currently useful for token8/32 and retained for token16 comparison.
 
 1020: P0 BM16 x BN64 x BK256, SORT_BLOCK_M=32, K_WAVE=2,
       single output-group A-reuse path. Selected for token=4 only.
@@ -71,14 +89,44 @@ stage2 meta manifest outside this experimental range.
       single output-group A-reuse path. Selected for token=8/16.
 
 1040: P0 BM32 x BN384 x BK256, SORT_BLOCK_M=32,
-      full six-output-group A-reuse path. Selected for token=64/256/512/1024.
+      full six-output-group A-reuse path. Candidate for token=64/256/512/1024.
 
 1050: P0 BM64 x BN384 x BK256, SORT_BLOCK_M=64,
-      gate/up group-split path. Selected for token=128.
+      gate/up group-split path. Candidate for token=128.
 
 1060: P0 BM128 x BN256 x BK256, SORT_BLOCK_M=128,
-      EPILOGUE_ROW_SPLIT=2, gate/up group-split ownership. Selected for
-      token=32 and large token buckets.
+      EPILOGUE_ROW_SPLIT=2, gate/up group-split ownership. Candidate for
+      token=32 and token buckets >=2048.
+
+1070: P0 BM64 x BN256 x BK256, SORT_BLOCK_M=64,
+      gate/up group-split path with BM64-specific shared-memory swizzle.
+      Candidate for token=4096 replay.
+
+1083: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=1,
+      single output-group A-reuse path. Candidate for token=16 only.
+
+1087: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=4,
+      single output-group A-reuse path with route tile cap. Probe for token=8.
+
+1090: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=2,
+      single output-group A-reuse path with route tile cap. Candidate for
+      token=8.
+
+1091: P0 BM16 x BN64 x BK256, SORT_BLOCK_M=32, K_WAVE=2,
+      single output-group A-reuse path with route tile cap. Candidate for
+      token=4.
+
+1094: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=1,
+      single output-group A-reuse path with output FP8 clamp disabled.
+      Candidate for token=16.
+
+1095: P0 BM16 x BN384 x BK256, SORT_BLOCK_M=16, K_WAVE=4,
+      single output-group A-reuse path with output FP8 clamp disabled.
+      Candidate for token=32.
+
+1096/1097: rejected three-output-group K_WAVE=4 probes. They were slower in
+      strict current-code C48/C49/C51 runs and are intentionally not exposed
+      through metadata or wrapper constants.
 ```
 
 Current code structure:
@@ -111,4 +159,7 @@ Current limitation:
 The current tuner policy is intentionally pruned while stage1 remains
 experimental. Additional candidates should be scheduled only after they have a
 measured replay need and a matching correctness/timing artifact.
+
+Clear the Opus MoE JIT cache before validating source or metadata changes:
+  rm -rf aiter/jit/build/module_moe_opus aiter/jit/module_moe_opus.so
 ```

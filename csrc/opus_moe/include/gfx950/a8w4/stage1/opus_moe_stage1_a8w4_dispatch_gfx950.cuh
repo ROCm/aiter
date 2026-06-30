@@ -32,9 +32,22 @@ inline void launch(const OpusMoeStage1A8W4Kargs& kargs, hipStream_t stream)
 {
     // sorted route metadata includes per-expert padding; token_num * topk is
     // not enough to cover all valid sorted route tiles.
-    const int route_tiles =
+    int route_tiles =
         (kargs.sorted_blocks * Traits::SORT_BLOCK_M + Traits::B_M - 1) /
         Traits::B_M;
+    constexpr int route_subtiles = Traits::SORT_BLOCK_M / Traits::B_M;
+    if constexpr(Traits::CAP_ROUTE_TILES_TO_EXPERT_BLOCKS)
+    {
+        const int expert_blocks = Traits::EXPERTS * route_subtiles;
+        route_tiles =
+            route_tiles < expert_blocks ? route_tiles : expert_blocks;
+    }
+    else if constexpr(Traits::CAP_ROUTE_TILES_TO_ROUTED_BLOCKS)
+    {
+        const int routed_blocks = kargs.token_num * kargs.topk * route_subtiles;
+        route_tiles =
+            route_tiles < routed_blocks ? route_tiles : routed_blocks;
+    }
     dim3 grid(Traits::STAGE1_COL_TILES,
               route_tiles,
               1);

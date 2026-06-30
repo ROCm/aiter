@@ -99,9 +99,17 @@ Experimental A8W4 stage1 ids use the 10xx namespace:
 | `1010` | `opus_moe1_a8w4_bm16_bn384_g1_kw4_a_reuse_mfma` | `BM16 x BN384`, `sort_block_m=16`, `K_WAVE=4` | token=1/2 small-token path |
 | `1020` | `opus_moe1_a8w4_bm16_bn64_sbm32_g1_kw2_a_reuse_mfma` | `BM16 x BN64`, `sort_block_m=32`, `K_WAVE=2` | token=4 small-token path |
 | `1030` | `opus_moe1_a8w4_bm16_bn64_sbm32_g1_a_reuse_mfma` | `BM16 x BN64`, `sort_block_m=32` | token=8/16 small-token path |
-| `1040` | `opus_moe1_a8w4_bm32_bn384_a_reuse_mfma` | `BM32 x BN384` | local stage1 replay/tuner |
-| `1050` | `opus_moe1_a8w4_bm64_bn384_gateup_groupsplit` | `BM64 x BN384` | local stage1 replay/tuner |
-| `1060` | `opus_moe1_a8w4_bm128_bn256_gateup_groupsplit` | `BM128 x BN256` | local stage1 replay/tuner |
+| `1040` | `opus_moe1_a8w4_bm32_bn384_a_reuse_mfma` | `BM32 x BN384`, `sort_block_m=32` | token=64/256/512/1024 replay/tuner |
+| `1050` | `opus_moe1_a8w4_bm64_bn384_gateup_groupsplit` | `BM64 x BN384`, `sort_block_m=64` | token=128 replay/tuner |
+| `1060` | `opus_moe1_a8w4_bm128_bn256_gateup_groupsplit` | `BM128 x BN256`, `sort_block_m=128` | token=32 and token>=2048 replay/tuner |
+| `1070` | `opus_moe1_a8w4_bm64_bn256_gateup_groupsplit` | `BM64 x BN256`, `sort_block_m=64` | token=4096 replay/tuner |
+
+These stage1 ids are experimental. They are reachable through the explicit
+`opus_moe_stage1_a8w4_fwd` API, the Python wrapper
+`aiter/ops/opus/moe_stage1_a8w4.py`, and opt-in flags in
+`csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py`. They are not used by
+fused MoE default dispatch; the current DSV4 tuned CSV does not contain
+`opus_moe1_a8w4_*` entries.
 
 In fused MoE tuned configs, the preferred A8W4 stage2 selection is a per-kid
 `kernelName2` value from the table above. The generic wrapper name
@@ -181,9 +189,12 @@ JIT build blob. The BF16 manifest is consumed by private BF16 dispatch source;
 the A8W4 manifests are consumed by stage1/stage2 dispatch wrappers for
 `kid -> traits -> launcher` cases.
 
-A8W4 production selection should be done through the fused MoE tuned
+A8W4 production stage2 selection should be done through the fused MoE tuned
 configuration by adding `opus_...` stage2 kernel names only for measured cases
-where Opus is correct and faster than the baseline.
+where Opus is correct and faster than the baseline. A8W4 stage1 remains an
+explicit replay/tuner path until measured `opus_moe1_a8w4_*` CSV entries are
+added intentionally. The A8W4 kernels are not selected through
+`opus_moe_tune.py`.
 
 ## Validation
 

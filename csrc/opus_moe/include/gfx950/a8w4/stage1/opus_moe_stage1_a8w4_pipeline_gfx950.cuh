@@ -19,28 +19,27 @@ namespace stage1_a8w4
 template<typename Traits>
 struct OpusMoeStage1A8W4Pipeline
 {
-    static __device__ void run(const OpusMoeStage1A8W4Kargs& kargs)
-    {
 #ifdef __HIP_DEVICE_COMPILE__
+    static __device__ bool process_tile(
+        const OpusMoeStage1A8W4Kargs& kargs,
+        const Tile<Traits>& tile,
+        uint8_t* __restrict__ smem_scratch,
+        int* __restrict__ smem_token,
+        int* __restrict__ smem_slot,
+        uint8_t* __restrict__ smem_route_valid)
+    {
         using D_ACC = opus::fp32_t;
         using D_MFMA_A = opus::fp8_t;
         using D_MFMA_B = opus::fp4_t;
 
-        const auto tile = make_tile<Traits>(kargs);
         if(tile.route_base >= tile.valid_rows || tile.expert_id < 0 ||
            tile.expert_id >= Traits::EXPERTS)
-            return;
-
-        __shared__ __align__(Traits::BYTES_PER_VEC) uint8_t
-            smem_scratch[Traits::SHARED_SCRATCH_BYTES];
-        __shared__ int smem_token[Traits::B_M];
-        __shared__ int smem_slot[Traits::B_M];
-        __shared__ uint8_t smem_route_valid[Traits::B_M];
+            return false;
 
         const bool has_route = load_route_metadata_to_smem<Traits>(
             kargs, tile, smem_token, smem_slot, smem_route_valid);
         if(!has_route)
-            return;
+            return false;
 
         auto mma = opus::make_mfma<D_MFMA_A, D_MFMA_B, D_ACC>(
             opus::number<Traits::MMA_M>{},
@@ -108,6 +107,28 @@ struct OpusMoeStage1A8W4Pipeline
                 smem_route_valid,
                 reinterpret_cast<float*>(smem_scratch));
         }
+        return true;
+    }
+#endif
+
+    static __device__ void run(const OpusMoeStage1A8W4Kargs& kargs)
+    {
+#ifdef __HIP_DEVICE_COMPILE__
+        __shared__ __align__(Traits::BYTES_PER_VEC) uint8_t
+            smem_scratch[Traits::SHARED_SCRATCH_BYTES];
+        __shared__ int smem_token[Traits::B_M];
+        __shared__ int smem_slot[Traits::B_M];
+        __shared__ uint8_t smem_route_valid[Traits::B_M];
+
+        const auto tile = make_tile<Traits>(kargs);
+        process_tile(
+            kargs,
+            tile,
+            smem_scratch,
+            smem_token,
+            smem_slot,
+            smem_route_valid);
+
 #else
         (void)kargs;
 #endif

@@ -352,14 +352,60 @@ inline __device__ void accumulate_loaded_a_with_b(
     int selector_b,
     int b_scale)
 {
-    if(!route_valid)
-        return;
-
+    constexpr int kNoScaleWord = 0x7f7f7f7f;
+    const int safe_a_scale = route_valid ? a_scale : kNoScaleWord;
     const int selector_a =
         (k_step & 1) * Traits::SCALE_MN_PACK +
         (mi_idx & (Traits::SCALE_MN_PACK - 1));
     rc = scaled_mfma_select(
-        mma, ra, rb, rc, a_scale, b_scale, selector_a, selector_b);
+        mma, ra, rb, rc, safe_a_scale, b_scale, selector_a, selector_b);
+}
+
+template<int SelectorB, typename Mma, typename AReg, typename BReg, typename CReg>
+inline __device__ auto scaled_mfma_select_split_b(Mma& mma,
+                                                  const AReg& a,
+                                                  const BReg& b,
+                                                  const CReg& c,
+                                                  int scale_a,
+                                                  int scale_b,
+                                                  int selector_a)
+    -> typename Mma::vtype_c
+{
+    static_assert(SelectorB >= 0);
+    static_assert(SelectorB < 4);
+
+    switch(selector_a)
+    {
+    case 0:
+        return mma(a, b, c, scale_a, scale_b, opus::number<0>{}, opus::number<SelectorB>{});
+    case 1:
+        return mma(a, b, c, scale_a, scale_b, opus::number<1>{}, opus::number<SelectorB>{});
+    case 2:
+        return mma(a, b, c, scale_a, scale_b, opus::number<2>{}, opus::number<SelectorB>{});
+    default:
+        return mma(a, b, c, scale_a, scale_b, opus::number<3>{}, opus::number<SelectorB>{});
+    }
+}
+
+template<typename Traits, typename Mma, int SelectorB>
+inline __device__ void accumulate_loaded_a_with_b_split_b(
+    Mma& mma,
+    const typename Mma::mfma_type::vtype_a& ra,
+    const typename Mma::mfma_type::vtype_b& rb,
+    typename Mma::vtype_c& rc,
+    int mi_idx,
+    bool route_valid,
+    int a_scale,
+    int k_step,
+    int b_scale)
+{
+    constexpr int kNoScaleWord = 0x7f7f7f7f;
+    const int safe_a_scale = route_valid ? a_scale : kNoScaleWord;
+    const int selector_a =
+        (k_step & 1) * Traits::SCALE_MN_PACK +
+        (mi_idx & (Traits::SCALE_MN_PACK - 1));
+    rc = scaled_mfma_select_split_b<SelectorB>(
+        mma, ra, rb, rc, safe_a_scale, b_scale, selector_a);
 }
 
 template<typename Traits, typename Mma, typename LayoutA, typename LayoutB>
@@ -421,7 +467,8 @@ inline __device__ void mainloop_single_group_direct_a(
     for(int mp = 0; mp < Traits::M_SCALE_PACKS; ++mp)
     {
         a_scale_base[mp] =
-            a_scale_base_byte_offset<Traits>(tile.route_base, mp, gb);
+            a_scale_base_byte_offset<Traits>(
+                tile.route_base, mp, gb);
     }
 
     const int output_col_base =
@@ -488,17 +535,75 @@ inline __device__ void mainloop_single_group_direct_a(
                 V_A ra{};
                 load_a_mfma_reg_direct<Traits, Mma>(
                     kargs, ra, route_valid[mi], a_payload_base[mi], k_step);
-                accumulate_loaded_a_with_b<Traits, Mma>(
-                    mma,
-                    ra,
-                    rb,
-                    rc[mi][0],
-                    mi + tile.route_base / Traits::MMA_M,
-                    route_valid[mi],
-                    a_scale[mi / Traits::SCALE_MN_PACK],
-                    k_step,
-                    selector_b,
-                    b_scale);
+                if constexpr(Traits::SPLIT_SELECTOR_B)
+                {
+                    if(selector_b == 0)
+                    {
+                        accumulate_loaded_a_with_b_split_b<Traits, Mma, 0>(
+                            mma,
+                            ra,
+                            rb,
+                            rc[mi][0],
+                            mi + tile.route_base / Traits::MMA_M,
+                            route_valid[mi],
+                            a_scale[mi / Traits::SCALE_MN_PACK],
+                            k_step,
+                            b_scale);
+                    }
+                    else if(selector_b == 1)
+                    {
+                        accumulate_loaded_a_with_b_split_b<Traits, Mma, 1>(
+                            mma,
+                            ra,
+                            rb,
+                            rc[mi][0],
+                            mi + tile.route_base / Traits::MMA_M,
+                            route_valid[mi],
+                            a_scale[mi / Traits::SCALE_MN_PACK],
+                            k_step,
+                            b_scale);
+                    }
+                    else if(selector_b == 2)
+                    {
+                        accumulate_loaded_a_with_b_split_b<Traits, Mma, 2>(
+                            mma,
+                            ra,
+                            rb,
+                            rc[mi][0],
+                            mi + tile.route_base / Traits::MMA_M,
+                            route_valid[mi],
+                            a_scale[mi / Traits::SCALE_MN_PACK],
+                            k_step,
+                            b_scale);
+                    }
+                    else
+                    {
+                        accumulate_loaded_a_with_b_split_b<Traits, Mma, 3>(
+                            mma,
+                            ra,
+                            rb,
+                            rc[mi][0],
+                            mi + tile.route_base / Traits::MMA_M,
+                            route_valid[mi],
+                            a_scale[mi / Traits::SCALE_MN_PACK],
+                            k_step,
+                            b_scale);
+                    }
+                }
+                else
+                {
+                    accumulate_loaded_a_with_b<Traits, Mma>(
+                        mma,
+                        ra,
+                        rb,
+                        rc[mi][0],
+                        mi + tile.route_base / Traits::MMA_M,
+                        route_valid[mi],
+                        a_scale[mi / Traits::SCALE_MN_PACK],
+                        k_step,
+                        selector_b,
+                        b_scale);
+                }
             }
         }
     }
@@ -599,7 +704,8 @@ inline __device__ void mainloop(
     for(int mp = 0; mp < Traits::M_SCALE_PACKS; ++mp)
     {
         a_scale_base[mp] =
-            a_scale_base_byte_offset<Traits>(tile.route_base, mp, gb);
+            a_scale_base_byte_offset<Traits>(
+                tile.route_base, mp, gb);
     }
 
     int64_t b_payload_base[Traits::OUTPUT_SCALE_GROUPS_PER_TILE];
@@ -741,7 +847,7 @@ inline __device__ void mainloop(
                         ra[mi],
                         rb,
                         rc[mi][group],
-                        mi,
+                        mi + tile.route_base / Traits::MMA_M,
                         route_valid[mi],
                         a_scale[mi / Traits::SCALE_MN_PACK],
                         k_step,
@@ -780,7 +886,8 @@ inline __device__ void mainloop_gate_up_group_split(
     static_assert(Traits::GATE_UP_GROUP_SPLIT);
     static_assert(Traits::B_N == 384 || Traits::B_N == 256);
     static_assert(Traits::SORT_BLOCK_M % Traits::B_M == 0);
-    static_assert(Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 6 ||
+    static_assert(Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 12 ||
+                  Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 6 ||
                   Traits::OUTPUT_SCALE_GROUPS_PER_TILE == 4);
     static_assert(Traits::GATE_UP_GROUP_SPLIT_GROUPS * 2 ==
                   Traits::OUTPUT_SCALE_GROUPS_PER_TILE);
@@ -983,8 +1090,11 @@ inline __device__ void mainloop_gate_up_group_split(
             #pragma unroll
             for(int mi = 0; mi < Traits::M_MFMA_PER_WAVE; ++mi)
             {
-                load_a_mfma_reg_from_lds<Traits, Mma>(
-                    smem_a_reg, ra[mi], pair_buffer, kk, mi, lane_id);
+                if(route_valid[mi])
+                {
+                    load_a_mfma_reg_from_lds<Traits, Mma>(
+                        smem_a_reg, ra[mi], pair_buffer, kk, mi, lane_id);
+                }
             }
             const int selector_gate = (k_step & 1) * Traits::SCALE_MN_PACK;
             const int selector_up = selector_gate + 1;
@@ -1002,7 +1112,7 @@ inline __device__ void mainloop_gate_up_group_split(
                         ra[mi],
                         rb_gate,
                         rc[mi][local_group],
-                        mi,
+                        mi + tile.route_base / Traits::MMA_M,
                         route_valid[mi],
                         a_scale[mi / Traits::SCALE_MN_PACK],
                         k_step,
@@ -1020,7 +1130,7 @@ inline __device__ void mainloop_gate_up_group_split(
                         ra[mi],
                         rb_up,
                         rc[mi][local_group + kGroupsPerWave],
-                        mi,
+                        mi + tile.route_base / Traits::MMA_M,
                         route_valid[mi],
                         a_scale[mi / Traits::SCALE_MN_PACK],
                         k_step,
@@ -1052,6 +1162,11 @@ inline __device__ void mainloop_gate_up_group_split(
             __syncthreads();
         }
     }
+
+    // The epilogue reuses smem_scratch for activated values. Keep faster waves
+    // from overwriting the final A-register LDS buffer while slower waves are
+    // still consuming it.
+    __syncthreads();
 }
 
 #endif // __HIP_DEVICE_COMPILE__

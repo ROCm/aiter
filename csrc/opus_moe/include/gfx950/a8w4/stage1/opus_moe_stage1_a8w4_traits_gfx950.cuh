@@ -67,7 +67,12 @@ template<int BlockM,
          int EpilogueRowSplit = 1,
          bool GateUpGroupSplit = false,
          int OutputScaleGroupsOverride = 0,
-         int KWave = 1>
+         int KWave = 1,
+         bool CapRouteTilesToRoutedBlocks = false,
+         bool ClampOutputFp8 = true,
+         bool SplitSelectorB = false,
+         int MinBlocksPerCuOverride = 0,
+         bool CapRouteTilesToExpertBlocks = false>
 struct OpusMoeStage1A8W4Shape
 {
     static constexpr int B_M = BlockM;
@@ -94,7 +99,9 @@ struct OpusMoeStage1A8W4Shape
     static constexpr int BLOCK_SIZE =
         K_WAVE == 1 ? kDefaultCtaThreads : KWAVE_BASE_WAVES * K_WAVE * WAVE_SIZE;
     static constexpr int MIN_BLOCKS_PER_CU =
-        K_WAVE == 1 ? kMinBlocksPerCu : 1;
+        MinBlocksPerCuOverride > 0 ? MinBlocksPerCuOverride :
+        K_WAVE == 1 ? kMinBlocksPerCu :
+        1;
 
     static constexpr int TOPK = kTopK;
     static constexpr int H = kModelDim;
@@ -117,7 +124,7 @@ struct OpusMoeStage1A8W4Shape
             OutputScaleGroupsOverride :
             DEFAULT_OUTPUT_SCALE_GROUPS_PER_TILE;
     static constexpr int ACC_SCALE_GROUPS_PER_TILE =
-        DEFAULT_OUTPUT_SCALE_GROUPS_PER_TILE;
+        OUTPUT_SCALE_GROUPS_PER_TILE;
     static constexpr int OUTPUT_COLS_PER_TILE =
         OUTPUT_SCALE_GROUPS_PER_TILE * kScaleGroupLogicalK;
     static constexpr int SCALE_MN_PACK = 2;
@@ -136,7 +143,8 @@ struct OpusMoeStage1A8W4Shape
         2 * SCALE_K_PACK * A_REG_LDS_STAGE_BYTES;
     static constexpr int KWAVE_REDUCE_BYTES =
         K_WAVE == 1 ? 0 : K_WAVE * KWAVE_BASE_WAVES *
-                              M_MFMA_PER_WAVE * WAVE_SIZE *
+                              M_MFMA_PER_WAVE *
+                              OUTPUT_SCALE_GROUPS_PER_TILE * WAVE_SIZE *
                               static_cast<int>(sizeof(float)) * 4;
     static constexpr int MAINLOOP_SCRATCH_BYTES =
         A_REG_LDS_BYTES > KWAVE_REDUCE_BYTES ? A_REG_LDS_BYTES :
@@ -146,6 +154,12 @@ struct OpusMoeStage1A8W4Shape
             EPILOGUE_SMEM_BYTES :
             MAINLOOP_SCRATCH_BYTES;
     static constexpr bool GATE_UP_GROUP_SPLIT = GateUpGroupSplit;
+    static constexpr bool CAP_ROUTE_TILES_TO_ROUTED_BLOCKS =
+        CapRouteTilesToRoutedBlocks;
+    static constexpr bool CLAMP_OUTPUT_FP8 = ClampOutputFp8;
+    static constexpr bool SPLIT_SELECTOR_B = SplitSelectorB;
+    static constexpr bool CAP_ROUTE_TILES_TO_EXPERT_BLOCKS =
+        CapRouteTilesToExpertBlocks;
     static constexpr int GATE_UP_GROUP_SPLIT_GROUPS =
         OUTPUT_SCALE_GROUPS_PER_TILE / 2;
 
@@ -206,18 +220,53 @@ struct OpusMoeStage1A8W4Shape
     static_assert(PACKED_H % BYTES_PER_VEC == 0);
     static_assert(OUTPUT_COLS_PER_TILE % SCALE_GROUP_LOGICAL_K == 0);
     static_assert(HIDDEN_SCALE_GROUPS % static_cast<int>(sizeof(uint32_t)) == 0);
+    static_assert(!CAP_ROUTE_TILES_TO_ROUTED_BLOCKS || SORT_BLOCK_M % B_M == 0);
 };
 
 using OpusMoeStage1A8W4P0Bm32Bn384AReuse =
     OpusMoeStage1A8W4Shape<32, 384, 256, 32>;
+using OpusMoeStage1A8W4P0Bm32Bn384GateUpGroupSplitNoClamp =
+    OpusMoeStage1A8W4Shape<32, 384, 256, 32, 2, true, 0, 1, false, false>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave1AReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave1NoClampAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 1, false, false>;
+using OpusMoeStage1A8W4P0Bm16Bn384G6KWave1ExpertCapNoClampGroupSplitRs2Min4AReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 2, true, 6, 1, true, false, false, 4, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G6KWave1ExpertCapNoClampGroupSplitMin1AReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, true, 6, 1, true, false, false, 1, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G6KWave1NoClampGroupSplitMin1AReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, true, 6, 1, true, false, false, 1>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true, false>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2NoClampSplitSelectorBAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave2CapRoutesNoClampSplitSelectorBMin2AReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 2, true, false, true, 2>;
 using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4AReuse =
     OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4NoClampAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, false, false>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4NoClampSplitSelectorBAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, false, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesNoClampSplitSelectorBAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true, false, true>;
+using OpusMoeStage1A8W4P0Bm16Bn384G1KWave4CapRoutesAReuse =
+    OpusMoeStage1A8W4Shape<16, 384, 256, 16, 1, false, 1, 4, true>;
 using OpusMoeStage1A8W4P0Bm16Bn64Sbm32G1AReuse =
     OpusMoeStage1A8W4Shape<16, 64, 256, 32>;
 using OpusMoeStage1A8W4P0Bm16Bn64Sbm32G1KWave2AReuse =
     OpusMoeStage1A8W4Shape<16, 64, 256, 32, 1, false, 0, 2>;
+using OpusMoeStage1A8W4P0Bm16Bn64Sbm32G1KWave2CapRoutesAReuse =
+    OpusMoeStage1A8W4Shape<16, 64, 256, 32, 1, false, 0, 2, true>;
 using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplit =
     OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true>;
+using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096Min1 =
+    OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, false, true, false, 1>;
+using OpusMoeStage1A8W4P0Bm64Bn384GateUpGroupSplitT4096NoClampMin1 =
+    OpusMoeStage1A8W4Shape<64, 384, 256, 64, 2, true, 0, 1, false, false, false, 1>;
 using OpusMoeStage1A8W4P0Bm64Bn256GateUpGroupSplit =
     OpusMoeStage1A8W4Shape<64, 256, 256, 64, 2, true>;
 using OpusMoeStage1A8W4P0Bm128Bn256GateUpGroupSplit =
