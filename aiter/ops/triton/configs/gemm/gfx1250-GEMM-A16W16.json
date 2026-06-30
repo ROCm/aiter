@@ -1,4 +1,12 @@
 {
+    "M_LEQ_64": {
+        "BLOCK_M": 64,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 4,
+        "num_warps": 4,
+        "kernel_type": "compute_bound"
+    },
     "any": {
         "BLOCK_M": 32,
         "BLOCK_N": 64,

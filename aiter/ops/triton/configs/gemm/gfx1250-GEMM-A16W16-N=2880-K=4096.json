@@ -32,11 +32,11 @@
         "kernel_type": "bandwidth_bound"
     },
     "any": {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
         "BLOCK_K": 64,
-        "NUM_BUFFERS": 3,
+        "NUM_BUFFERS": 4,
         "num_warps": 8,
-        "kernel_type": "bandwidth_bound"
+        "kernel_type": "compute_bound"
     }
 }
