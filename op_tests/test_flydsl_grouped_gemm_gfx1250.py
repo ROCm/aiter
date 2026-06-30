@@ -213,21 +213,21 @@ def _torch_moe_ref(
 # Mock data builders
 # ---------------------------------------------------------------------------
 def _pattern_packed(
-    experts: int, rows: int, k_pack: int, *, zero_init: bool = False
+    experts: int, rows: int, k_pack: int, *, const_init: Optional[float] = None
 ) -> torch.Tensor:
     """mxfp4 packed bytes ``(E, rows, k_pack) uint8`` from the global RNG."""
-    if zero_init:
-        return torch.zeros((experts, rows, k_pack), dtype=torch.uint8)
+    if const_init is not None:
+        return torch.full((experts, rows, k_pack), int(const_init), dtype=torch.uint8)
     return torch.randint(0, 256, (experts, rows, k_pack), dtype=torch.uint8)
 
 
 def init_weight_scales(
-    experts: int, rows: int, n_blocks: int, *, zero_init: bool = False
+    experts: int, rows: int, n_blocks: int, *, const_init: Optional[float] = None
 ) -> torch.Tensor:
     """Per-block e8m0 weight scale: random small scales (drawn from the global
     RNG) so the n32k4 B-scale preshuffle layout is actually exercised."""
-    if zero_init:
-        return torch.zeros((experts, rows, n_blocks), dtype=torch.uint8)
+    if const_init is not None:
+        return torch.full((experts, rows, n_blocks), int(const_init), dtype=torch.uint8)
     r = torch.randint(0, 3, (experts, rows, n_blocks), dtype=torch.int16)
     return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
 
@@ -282,7 +282,7 @@ def _run_grouped_via_fused_moe(
     seed: int = 0,
     warmup: int = 5,
     iters: int = 101,
-    zero_init: bool = False,
+    const_init: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[float], Optional[dict]]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -313,18 +313,18 @@ def _run_grouped_via_fused_moe(
     # Logical weights/scale/bias: always GGUU (gate rows then up rows).
     # One global seed per case; every draw below uses the global RNG.
     torch.manual_seed(seed)
-    w1_logical = _pattern_packed(experts, 2 * inter, K_pack, zero_init=zero_init)
-    w2_logical = _pattern_packed(experts, K, inter_pack, zero_init=zero_init)
+    w1_logical = _pattern_packed(experts, 2 * inter, K_pack, const_init=const_init)
+    w2_logical = _pattern_packed(experts, K, inter_pack, const_init=const_init)
     w1_scale_raw = init_weight_scales(
-        experts, 2 * inter, K // SCALE_BLOCK, zero_init=zero_init
+        experts, 2 * inter, K // SCALE_BLOCK, const_init=const_init
     )
     w2_scale_raw = init_weight_scales(
-        experts, K, inter // SCALE_BLOCK, zero_init=zero_init
+        experts, K, inter // SCALE_BLOCK, const_init=const_init
     )
     if use_bias:
-        if zero_init:
-            bias1 = torch.zeros((experts, 2 * inter))
-            bias2 = torch.zeros((experts, K))
+        if const_init is not None:
+            bias1 = torch.full((experts, 2 * inter), float(const_init))
+            bias2 = torch.full((experts, K), float(const_init))
         else:
             bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).float()
             bias2 = (torch.randn((experts, K)) * 1e-3).float()
@@ -332,8 +332,8 @@ def _run_grouped_via_fused_moe(
         bias1 = torch.zeros((experts, 2 * inter))
         bias2 = torch.zeros((experts, K))
     # Activations: bf16; fused_moe handles the dispatched quant internally.
-    if zero_init:
-        hidden = torch.zeros((tokens, K), dtype=torch.bfloat16)
+    if const_init is not None:
+        hidden = torch.full((tokens, K), float(const_init), dtype=torch.bfloat16)
     else:
         hidden = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
 
@@ -494,7 +494,7 @@ def run_moe(
     kernel_bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
-    zero_init: bool = False,
+    const_init: Optional[float] = None,
     check_aot_cache: bool = True,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
@@ -527,7 +527,7 @@ def run_moe(
             kernel_bench=kernel_bench,
             warmup=warmup,
             iters=iters,
-            zero_init=zero_init,
+            const_init=const_init,
         )
     mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
     ld = _logits_diff(out, ref)
@@ -741,10 +741,16 @@ def main() -> None:
         "(gguu is dual-B and ignores it).",
     )
     parser.add_argument(
-        "--zero-init",
-        action="store_true",
-        help="initialize activations (A), activation scales (As), weights (B), "
-        "and weight scales (Bs) to zero instead of random values",
+        "--const-init",
+        type=float,
+        nargs="?",
+        const=0.0,
+        default=None,
+        metavar="VALUE",
+        help="initialize activations (A), weights (B), weight scales (Bs), and "
+        "bias to the constant VALUE instead of random values. Bare --const-init "
+        "uses 0.0 (zero-init). uint8 tensors (weights, scales) are filled with "
+        "int(VALUE).",
     )
     parser.add_argument(
         "--real-gemm",
@@ -807,7 +813,7 @@ def main() -> None:
             kernel_bench=args.scenario == "kernel",
             warmup=args.warmup,
             iters=args.iters,
-            zero_init=args.zero_init,
+            const_init=args.const_init,
         )
         rows.append(
             {
