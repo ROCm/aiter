@@ -46,19 +46,30 @@ def rell2(a,b):
     a,b=a.float(),b.float()
     return (torch.linalg.vector_norm(a-b)/torch.linalg.vector_norm(b).clamp_min(1e-12)).item()
 
-print(f"{'config':>16} | {'opus(us)':>9} {'triton(us)':>10} {'speedup':>8} | {'w relL2':>9} {'u relL2':>9}")
-print("-"*72)
-for (B,T,H) in [(1,1024,4),(1,2048,16),(1,4096,8),(1,8192,32),(1,16384,16),(4,2048,8),(1,32768,16)]:
-    k,v,g,beta=make(B,T,H)
-    K=k.shape[-1]; V=v.shape[-1]
-    w=torch.empty(B,T,H,K,dtype=torch.bfloat16,device="cuda")
-    u=torch.empty(B,T,H,V,dtype=torch.bfloat16,device="cuda")
-    gc=torch.empty(B,T,H,dtype=torch.float32,device="cuda")
-    # precision vs triton non-fused
-    gT,wT,uT=triton_k14(k,v,g,beta)
-    opus_k14(k,v,g,beta,w,u,gc)
-    dw,du=rell2(w,wT),rell2(u,uT)
-    # cudagraph timing
-    to=graph_time(lambda: opus_k14(k,v,g,beta,w,u,gc))
-    tt=graph_time(lambda: triton_k14(k,v,g,beta))
-    print(f"B{B}T{T}H{H:<2}".rjust(16)+f" | {to:9.1f} {tt:10.1f} {tt/to:7.2f}x | {dw:9.2e} {du:9.2e}",flush=True)
+# Model configs (K=V=128): 35B-tp1=H32, 35B-tp2=H16, FULL-tp1=H64
+MODELS = [
+    ("35B-tp1",  32, [1024, 2048, 4096, 8192, 16384, 32768, 65536]),
+    ("35B-tp2",  16, [1024, 8192, 65536]),
+    ("FULL-tp1", 64, [1024, 8192, 65536]),
+]
+
+print(f"{'model':>9} {'T':>6} | {'Opus K1(us)':>11} {'Triton k14(us)':>14} {'speedup':>8} | {'w relL2':>9} {'u relL2':>9}")
+print("-"*80)
+for name, H, Ts in MODELS:
+    for T in Ts:
+        B = 1
+        k,v,g,beta=make(B,T,H)
+        K=k.shape[-1]; V=v.shape[-1]
+        w=torch.empty(B,T,H,K,dtype=torch.bfloat16,device="cuda")
+        u=torch.empty(B,T,H,V,dtype=torch.bfloat16,device="cuda")
+        gc=torch.empty(B,T,H,dtype=torch.float32,device="cuda")
+        # precision vs triton non-fused
+        gT,wT,uT=triton_k14(k,v,g,beta)
+        opus_k14(k,v,g,beta,w,u,gc)
+        dw,du=rell2(w,wT),rell2(u,uT)
+        # cudagraph timing
+        to=graph_time(lambda: opus_k14(k,v,g,beta,w,u,gc))
+        tt=graph_time(lambda: triton_k14(k,v,g,beta))
+        print(f"{name:>9} {T:>6} | {to:11.1f} {tt:14.1f} {tt/to:7.2f}x | {dw:9.2e} {du:9.2e}",flush=True)
+        del k,v,g,beta,w,u,gc,gT,wT,uT
+        torch.cuda.empty_cache()
