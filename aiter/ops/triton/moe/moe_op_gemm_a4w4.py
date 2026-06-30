@@ -390,6 +390,8 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         block_k = 256
         num_warps = 4
 
+    num_buffers = min(num_buffers, triton.cdiv(k, block_k))
+
     ret = {
         "block_m": block_m,
         "block_n": block_n,
