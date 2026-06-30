@@ -1279,8 +1279,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_map,
                         cfg.max_m,
                         fused_n,
-                        stream,
                         _swiglu_lim_rt,
+                        stream,
                     )
                 else:
                     _run_compiled(
@@ -1295,8 +1295,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_map,
                         cfg.max_m,
                         fused_n,
-                        stream,
                         _swiglu_lim_rt,
+                        stream,
                     )
             else:
                 if bias is not None:
@@ -1313,6 +1313,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_map,
                         cfg.max_m,
                         2 * cfg.inter_dim,
+                        _swiglu_lim_rt,
                         stream,
                     )
                 else:
@@ -1328,6 +1329,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_map,
                         cfg.max_m,
                         2 * cfg.inter_dim,
+                        _swiglu_lim_rt,
                         stream,
                     )
             if _gemm_events is not None:
@@ -1358,8 +1360,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_total,
                         contiguous_m,
                         fused_n,
-                        stream,
                         _swiglu_lim_rt,
+                        stream,
                     )
                 else:
                     _run_compiled(
@@ -1375,8 +1377,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_total,
                         contiguous_m,
                         fused_n,
-                        stream,
                         _swiglu_lim_rt,
+                        stream,
                     )
             else:
                 if bias is not None:
@@ -1394,6 +1396,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_total,
                         contiguous_m,
                         2 * cfg.inter_dim,
+                        _swiglu_lim_rt,
                         stream,
                     )
                 else:
@@ -1410,6 +1413,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         m_tile_total,
                         contiguous_m,
                         2 * cfg.inter_dim,
+                        _swiglu_lim_rt,
                         stream,
                     )
             if _gemm_events is not None:
@@ -1436,8 +1440,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         cfg.max_m,
                         fused_n,
-                        stream,
                         _swiglu_lim_rt,
+                        stream,
                     )
                 else:
                     _run_compiled(
@@ -1453,8 +1457,8 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         cfg.max_m,
                         fused_n,
-                        stream,
                         _swiglu_lim_rt,
+                        stream,
                     )
             else:
                 if bias is not None:
@@ -1472,6 +1476,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         cfg.max_m,
                         2 * cfg.inter_dim,
+                        _swiglu_lim_rt,
                         stream,
                     )
                 else:
@@ -1488,6 +1493,7 @@ def compile_moe_grouped_gemm1_a8w4_masked(
                         cfg.max_m,
                         cfg.max_m,
                         2 * cfg.inter_dim,
+                        _swiglu_lim_rt,
                         stream,
                     )
             if _gemm_events is not None:
@@ -1666,8 +1672,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     m_tile_map,
                     cfg.max_m,
                     cfg.model_dim,
-                    stream,
                     _no_act_swiglu_lim,
+                    stream,
                 )
             else:
                 _run_compiled(
@@ -1682,8 +1688,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     m_tile_map,
                     cfg.max_m,
                     cfg.model_dim,
-                    stream,
                     _no_act_swiglu_lim,
+                    stream,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1711,8 +1717,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     m_tile_total,
                     contiguous_m,
                     cfg.model_dim,
-                    stream,
                     _no_act_swiglu_lim,
+                    stream,
                 )
             else:
                 _run_compiled(
@@ -1728,8 +1734,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     m_tile_total,
                     contiguous_m,
                     cfg.model_dim,
-                    stream,
                     _no_act_swiglu_lim,
+                    stream,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)
@@ -1754,8 +1760,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.max_m,
                     cfg.model_dim,
-                    stream,
                     _no_act_swiglu_lim,
+                    stream,
                 )
             else:
                 _run_compiled(
@@ -1771,8 +1777,8 @@ def compile_moe_grouped_gemm2_a8w4_masked(
                     cfg.max_m,
                     cfg.max_m,
                     cfg.model_dim,
-                    stream,
                     _no_act_swiglu_lim,
+                    stream,
                 )
             if _gemm_events is not None:
                 _gemm_events[1].record(stream)

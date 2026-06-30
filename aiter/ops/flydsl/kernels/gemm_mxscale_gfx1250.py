@@ -3430,8 +3430,8 @@ def compile_mxscale_gemm(
         arg_b_scale: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
-        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3497,8 +3497,8 @@ def compile_mxscale_gemm(
         i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
-        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3568,8 +3568,8 @@ def compile_mxscale_gemm(
         arg_m_tile_map: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
-        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3623,8 +3623,8 @@ def compile_mxscale_gemm(
         arg_bias: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
-        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3691,8 +3691,8 @@ def compile_mxscale_gemm(
         i32_m_tile_bound: fx.Int32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
-        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
@@ -3763,8 +3763,8 @@ def compile_mxscale_gemm(
         arg_m_tile_map: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream,
-        swiglu_limit_f: fx.Float32 = fx.Float32(float("inf")),
     ):
         _ = cache_tag
         ctx = CompilationContext.get_current()
