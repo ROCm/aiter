@@ -2,8 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # =============================================================================
-# splitk_hgemm_4wave (flydsl) — a fixed-4-wave split-K bf16 GEMM, faithful FlyDSL
-#   port of the hand-written HIP cuh csrc/kernels/prezero_gemm/splitk_gemm_a16w16.cuh.
+# splitk_hgemm_fixed_tile (flydsl) — a fixed-tile (4-wave / 256-thread) split-K bf16
+#   GEMM, faithful FlyDSL port of the hand-written HIP cuh
+#   csrc/kernels/prezero_gemm/splitk_gemm_a16w16.cuh.
 #
 #   C[M,N] += A[M,K] @ B[N,K]^T   (TN, bf16 in / fp32 accumulate / packed-bf16 atomic out).
 #   C is zeroed in-kernel: ksplit==0 zeros its tile + a per-tile
@@ -42,19 +43,19 @@ WARP_SIZE = 64
 DTYPE_BYTES = 2
 
 
-# Tuner search-space bounds. The kernel's own asserts (in `compile_splitk_hgemm_4wave`)
-# are the single source of truth for validity; `iter_4wave_tile_configs` just walks a
+# Tuner search-space bounds. The kernel's own asserts (in `compile_splitk_hgemm_fixed_tile`)
+# are the single source of truth for validity; `iter_fixed_tile_configs` just walks a
 # bounded grid and keeps the (BM, BN, BK, SPLITK) points the kernel accepts.
-FOURWAVE_TILE_M_OPTIONS = (16, 32, 64, 128)
-FOURWAVE_TILE_N_OPTIONS = (32, 64)
-FOURWAVE_TILE_K = 128
-FOURWAVE_MAX_SPLIT_K = 16
+FIXED_TILE_M_OPTIONS = (16, 32, 64, 128)
+FIXED_TILE_N_OPTIONS = (32, 64)
+FIXED_TILE_K = 128
+FIXED_TILE_MAX_SPLIT_K = 16
 # Persistent per-device split-K signal/semaphore buffer length; one slot is
 # needed per output tile, so configs whose tile count exceeds this are invalid.
 SIG_SEM_SLOTS = 1 << 16
 
 
-def _fourwave_tile_ok(N, K, BN, BM, BK, SPLITK):
+def _fixed_tile_ok(N, K, BN, BM, BK, SPLITK):
     if N % BN or K % SPLITK:
         return False
     if (K // SPLITK) % BK:
@@ -77,15 +78,15 @@ def _fourwave_tile_ok(N, K, BN, BM, BK, SPLITK):
     return AS_BYTES + BS_BYTES <= SMEM_CAPACITY_MAP[get_rocm_arch()]
 
 
-def iter_4wave_tile_configs(M, N, K):
+def iter_fixed_tile_configs(M, N, K):
     """Yield (BM, BN, BK, SPLITK) tuples the fixed-4-wave kernel accepts for (M, N, K)."""
-    for BN in FOURWAVE_TILE_N_OPTIONS:
-        for BM in FOURWAVE_TILE_M_OPTIONS:
+    for BN in FIXED_TILE_N_OPTIONS:
+        for BM in FIXED_TILE_M_OPTIONS:
             if (N // BN) * ((M + BM - 1) // BM) > SIG_SEM_SLOTS:
                 continue
-            for SPLITK in range(1, FOURWAVE_MAX_SPLIT_K + 1):
-                if _fourwave_tile_ok(N, K, BN, BM, FOURWAVE_TILE_K, SPLITK):
-                    yield (BM, BN, FOURWAVE_TILE_K, SPLITK)
+            for SPLITK in range(1, FIXED_TILE_MAX_SPLIT_K + 1):
+                if _fixed_tile_ok(N, K, BN, BM, FIXED_TILE_K, SPLITK):
+                    yield (BM, BN, FIXED_TILE_K, SPLITK)
 
 
 def _rot021(e):
@@ -102,7 +103,7 @@ def _phys(row, k, BK):
 
 
 @functools.lru_cache(maxsize=4096)
-def compile_splitk_hgemm_4wave(
+def compile_splitk_hgemm_fixed_tile(
     N: int,
     K: int,
     BN: int,
@@ -146,7 +147,7 @@ def compile_splitk_hgemm_4wave(
     smem_b_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_b_offset + BS_BYTES
 
-    KERNEL_NAME = f"splitk_hgemm_4wave_{dtype}_M{BM}xN{BN}xK{BK}_SPK{SPLITK}_{GPU_ARCH}"
+    KERNEL_NAME = f"splitk_hgemm_fixed_tile_{dtype}_M{BM}xN{BN}xK{BK}_SPK{SPLITK}_{GPU_ARCH}"
 
     @flyc.kernel(known_block_size=[256, 1, 1])
     def kern(
@@ -484,7 +485,7 @@ def compile_splitk_hgemm_4wave(
 _SIG_SEM_CACHE = {}
 
 
-def _get_4wave_sig_sem(device):
+def _get_fixed_tile_sig_sem(device):
     """Persistent per-device signal/semaphore buffers, reset in-kernel."""
     import torch
 
@@ -497,7 +498,7 @@ def _get_4wave_sig_sem(device):
     return bufs
 
 
-def splitk_hgemm_4wave(C, A, B, BN, SPLITK, BM, BK=128, stream=None):
+def splitk_hgemm_fixed_tile(C, A, B, BN, SPLITK, BM, BK=128, stream=None):
     """C[M,N] += A@B^T (bf16, TN); C is zeroed in-kernel (may be uninitialized)."""
     import torch
     import flydsl.compiler as flyc
@@ -506,8 +507,8 @@ def splitk_hgemm_4wave(C, A, B, BN, SPLITK, BM, BK=128, stream=None):
     from .tensor_shim import _run_compiled
 
     N, K, m = B.shape[0], A.shape[1], int(A.shape[0])
-    launch = compile_splitk_hgemm_4wave(N, K, BN, SPLITK, BM, BK=BK, dtype="bf16")
-    sema, sig = _get_4wave_sig_sem(C.device)
+    launch = compile_splitk_hgemm_fixed_tile(N, K, BN, SPLITK, BM, BK=BK, dtype="bf16")
+    sema, sig = _get_fixed_tile_sig_sem(C.device)
     s = torch.cuda.current_stream() if stream is None else stream
 
     def _pv(t):

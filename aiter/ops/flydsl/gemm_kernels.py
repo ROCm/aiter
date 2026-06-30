@@ -22,7 +22,7 @@ from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from aiter.jit.utils.chip_info import get_gfx
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
-from .kernels.splitk_hgemm_4wave import iter_4wave_tile_configs
+from .kernels.splitk_hgemm_fixed_tile import iter_fixed_tile_configs
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
@@ -45,7 +45,7 @@ FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
 KERNEL_FAMILY_HGEMM = "hgemm"
 KERNEL_FAMILY_SMALL_M = "small_m"
-KERNEL_FAMILY_HGEMM_4WAVE = "hgemm_4wave"
+KERNEL_FAMILY_HGEMM_FIXED_TILE = "hgemm_fixed_tile"
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
@@ -65,7 +65,7 @@ _HGEMM_KERNEL_RE = re.compile(
     r"(?:_wpe(?P<waves_per_eu>\d+))?"
     r"(?:_ur(?P<b_to_lds_unroll>\d+))?"
     r")?"
-    r"(?P<hgemm4wave_suffix>_4wave)?"
+    r"(?P<hgemmfixedtile_suffix>_fixed_tile)?"
     r"_(?P<target_gfx>gfx[0-9a-z]+)$"
 )
 
@@ -179,13 +179,13 @@ def flydsl_kernel_name(
             name += f"_wpe{waves_per_eu}"
         if b_to_lds_unroll > 0:
             name += f"_ur{b_to_lds_unroll}"
-    elif kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
-        name += "_4wave"
+    elif kernel_family == KERNEL_FAMILY_HGEMM_FIXED_TILE:
+        name += "_fixed_tile"
     elif kernel_family != KERNEL_FAMILY_HGEMM:
         raise ValueError(
             f"Unsupported kernel_family={kernel_family!r}; expected "
             f"{KERNEL_FAMILY_HGEMM!r}, {KERNEL_FAMILY_SMALL_M!r} or "
-            f"{KERNEL_FAMILY_HGEMM_4WAVE!r}"
+            f"{KERNEL_FAMILY_HGEMM_FIXED_TILE!r}"
         )
     name += f"_{get_gfx()}"
     return name
@@ -559,8 +559,8 @@ def _parse_hgemm_kernel_params(name: str) -> Optional[Dict]:
 
     if m.group("small_m_suffix") is not None:
         kernel_family = KERNEL_FAMILY_SMALL_M
-    elif m.group("hgemm4wave_suffix") is not None:
-        kernel_family = KERNEL_FAMILY_HGEMM_4WAVE
+    elif m.group("hgemmfixedtile_suffix") is not None:
+        kernel_family = KERNEL_FAMILY_HGEMM_FIXED_TILE
     else:
         kernel_family = KERNEL_FAMILY_HGEMM
     block_k_warps = m.group("block_k_warps")
@@ -666,9 +666,9 @@ def get_flydsl_splitk_hgemm_kernels(
             kernels[name] = config
 
     if None not in (m, n, k):
-        for tile_m, tile_n, tile_k, split_k in iter_4wave_tile_configs(m, n, k):
+        for tile_m, tile_n, tile_k, split_k in iter_fixed_tile_configs(m, n, k):
             config = {
-                "kernel_family": KERNEL_FAMILY_HGEMM_4WAVE,
+                "kernel_family": KERNEL_FAMILY_HGEMM_FIXED_TILE,
                 "stages": FIXED_STAGE,
                 "tile_m": tile_m,
                 "tile_n": tile_n,
@@ -700,7 +700,7 @@ def get_flydsl_splitk_hgemm_kernels(
                 config["b_to_lds"],
                 config["b_preshuffle"],
                 config["c_to_lds"],
-                kernel_family=KERNEL_FAMILY_HGEMM_4WAVE,
+                kernel_family=KERNEL_FAMILY_HGEMM_FIXED_TILE,
             )
             kernels[name] = config
     # NOTE: Keep the old small_m registry generation here for now, but leave it
@@ -844,13 +844,13 @@ def _compile_flydsl_hgemm(
                 "small-M kernel fixes block_m_warps=1; "
                 f"got block_m_warps={block_m_warps}"
             )
-    elif kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
+    elif kernel_family == KERNEL_FAMILY_HGEMM_FIXED_TILE:
         pass  # validated by kernel asserts
     else:
         raise ValueError(
             f"Unsupported kernel_family={kernel_family!r}; expected "
             f"{KERNEL_FAMILY_HGEMM!r}, {KERNEL_FAMILY_SMALL_M!r} or "
-            f"{KERNEL_FAMILY_HGEMM_4WAVE!r}"
+            f"{KERNEL_FAMILY_HGEMM_FIXED_TILE!r}"
         )
 
     kernel = compile_flydsl_hgemm_kernel(
@@ -878,8 +878,8 @@ def _compile_flydsl_hgemm(
         has_bias=has_bias,
     )
 
-    if kernel_family == KERNEL_FAMILY_HGEMM_4WAVE:
-        from .kernels.splitk_hgemm_4wave import _get_4wave_sig_sem
+    if kernel_family == KERNEL_FAMILY_HGEMM_FIXED_TILE:
+        from .kernels.splitk_hgemm_fixed_tile import _get_fixed_tile_sig_sem
 
         def launcher(
             out: torch.Tensor,
@@ -889,10 +889,10 @@ def _compile_flydsl_hgemm(
             stream: Optional[torch.cuda.Stream] = None,
         ):
             if bias is not None:
-                raise ValueError("hgemm_4wave launcher does not support bias")
+                raise ValueError("hgemm_fixed_tile launcher does not support bias")
             runtime_m = int(a.shape[0])
             launch_stream = _normalize_launch_stream(a.device, stream)
-            sema, sig = _get_4wave_sig_sem(a.device)
+            sema, sig = _get_fixed_tile_sig_sem(a.device)
             return _run_compiled(
                 kernel,
                 _ptr_view_safe(out),
