@@ -149,7 +149,7 @@ def _gemm1_body(
     NUM_N_BLOCKS,
     OUT_AS_PER_CHUNK_DW,
     K_G2_HALF,
-    interleave=True,
+    interleave=False,
 ):
     BN_INT = BN // 2
     b_aux = 2 if use_nt else 0
@@ -756,7 +756,7 @@ def compile_gemm1_a4w4_port(
     TOPK,
     BN=256,
     BK=256,
-    interleave=True,
+    interleave=False,
     xcd_swizzle=0,
 ):
     if (BM, use_nt, inline_quant) not in {

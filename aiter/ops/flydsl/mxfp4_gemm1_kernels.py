@@ -28,7 +28,7 @@ def _get_compiled_mxfp4_gemm1_port(
     topk,
     BN,
     BK,
-    interleave=True,
+    interleave=False,
     xcd_swizzle=0,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
@@ -89,7 +89,7 @@ def flydsl_mxfp4_gemm1(
     topk,
     BN=256,
     BK=256,
-    interleave=True,
+    interleave=False,
     xcd_swizzle=0,
     stream=None,
 ):

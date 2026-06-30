@@ -1211,7 +1211,7 @@ def _mxfp4_a4w4_stage1(
     kernelName1,
     device,
     use_nt=False,
-    interleave=True,
+    interleave=False,
 ):
     if not inline_quant:
         aiter.mxfp4_moe_quant(
@@ -1444,7 +1444,7 @@ def _mxfp4_a4w4_stage1_fw(
     kernelName1="",
     m_indices=None,
     moe_buf=None,
-    interleave=True,
+    interleave=False,
     **_kwargs,
 ):
     device = hidden_states.device
