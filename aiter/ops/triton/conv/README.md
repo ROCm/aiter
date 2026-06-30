@@ -225,7 +225,7 @@ aiter/ops/triton/conv/                Kernel library
   conv2d.py                           Public API + smart routing
   _launch.py                          Grid setup + _select_3x3_method
   _prepack.py                         Weight repack caches (LRU) + input packer
-  _utils.py                           Shape math, tolerance model
+  _utils.py                           Shape math, eligibility predicates
   README.md, DESIGN.md
 
 aiter/ops/triton/_triton_kernels/conv/   @triton.jit kernels

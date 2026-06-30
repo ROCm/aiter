@@ -120,7 +120,7 @@ aiter/ops/triton/conv/
   conv2d.py            public functions + smart routing in conv2d_nchw / conv2d_nhwc
   _launch.py           grid setup, _select_3x3_method, dtype mapping
   _prepack.py          weight/input repacks + LRU caches
-  _utils.py            shape math, _is_*_conv predicates, tolerance model, activation
+  _utils.py            shape math, _is_*_conv predicates, eligibility checks
 
 aiter/ops/triton/_triton_kernels/conv/
   __init__.py          empty marker (kernels are imported by full path)
@@ -145,7 +145,7 @@ The split mirrors *responsibility*, not LOC: `conv2d.py` is "what does the user
 ask for", `_launch.py` is "how do we set up the grid", `_prepack.py` is "what
 shape does the kernel actually want to read", and the `_triton_kernels/conv/` folder is
 "the math". `_utils.py` sits underneath all four as a shared helper layer
-(shape math, eligibility predicates, tolerance model, activation enum).
+(shape math, eligibility predicates, output allocation, bias prep).
 
 ---
 
@@ -593,7 +593,7 @@ eviction; larger models need the env override.
 
 ## 8. Numerical model and tolerances
 
-`_utils.py:dynamic_conv_tolerances` is the formula used by the test
+`_helpers.py:dynamic_conv_tolerances` is the formula used by the test
 harness:
 
 ```python
@@ -681,7 +681,7 @@ Concretely, to add (say) a `winograd_f6x3` variant:
    `is_winograd=True` if the kernel uses Winograd-style transforms
    (you'll need the 6× tolerance bump). If the kernel uses a different
    Winograd tile (e.g. F(6,3)), also add a new `variant=` branch in
-   `_utils._winograd_tolerances` and route to it from
+   `_helpers._winograd_tolerances` and route to it from
    `_helpers._get_tolerances` — F(4,3)'s 6× bump
    is calibrated specifically for that tile size. Also add the kernel to
    `op_tests/op_benchmarks/triton/bench_conv2d.py`'s `METHODS` dict so
