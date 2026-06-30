@@ -375,13 +375,12 @@ def compile_mla_reduce(
                         g_flse[fx.Index(lse_off)] = final_lse_val
                         scf.YieldOp([])
 
-            lb = fx.arith.index_cast(ir.IndexType.get(), _to_raw(seq0))
-            ub = fx.arith.index_cast(ir.IndexType.get(), _to_raw(ub_seq))
-            st = fx.arith.index_cast(ir.IndexType.get(), _to_raw(ntg))
-            for_seq = scf.ForOp(lb, ub, st)
-            with ir.InsertionPoint(for_seq.body):
-                seq = fx.Int32(for_seq.induction_variable)
-                local_seq = seq - q_start
+            # opt5: FlyDSL range (init=None -> scf_range without iter_args) so
+            # hot_loop_scheduler can interleave the inner split-loop VMEM loads
+            # with compute. Strided over the seq positions this block owns.
+            for seq in range(seq0, ub_seq, ntg, init=None):
+                seq_i32 = fx.Int32(seq)
+                local_seq = seq_i32 - q_start
 
                 if fx.const_expr(not is_massive):
                     o0 = load_split_o(fx.Int32(0), local_seq)
@@ -419,8 +418,8 @@ def compile_mla_reduce(
                     sum_e = results[VEC + 1]
                     inv = fx.rocdl.rcp(T.f32, sum_e)
                     out_elems = [regs[i] * inv for i in fx.range_constexpr(VEC)]
-                    store_result(seq, out_elems)
-                    store_lse(seq, max_lse, sum_e)
+                    store_result(seq_i32, out_elems)
+                    store_lse(seq_i32, max_lse, sum_e)
                 else:
                     neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
                     is_wave0 = fx.arith.cmpi(
@@ -490,7 +489,7 @@ def compile_mla_reduce(
                             if_l0 = scf.IfOp(is_l0, results_=[], has_else=False)
                             with ir.InsertionPoint(if_l0.then_block):
                                 lse_off = (
-                                    fx.Int32(seq) * fx.Int32(H) + fx.Int32(head)
+                                    seq_i32 * fx.Int32(H) + fx.Int32(head)
                                 )
                                 g_flse[fx.Index(lse_off)] = global_lse
                                 scf.YieldOp([])
@@ -519,8 +518,7 @@ def compile_mla_reduce(
                         out_elems = [accr]
                     else:
                         out_elems = [accr[i] for i in fx.range_constexpr(VEC)]
-                    store_result(seq, out_elems)
-                scf.YieldOp([])
+                    store_result(seq_i32, out_elems)
 
         if fx.const_expr(persistent):
             # Grid-stride persistent launch (kn_mla_reduce_v1_ps, reduce.cu:669).
