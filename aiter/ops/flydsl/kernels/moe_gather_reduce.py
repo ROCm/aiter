@@ -79,11 +79,17 @@ def _pack_pair_from_f32(acc_lo, acc_hi, out_dtype, *, i32):
     return lo_i32 | (hi_i32 << arith.constant(16, type=i32))
 
 
-def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "bf16"):
-    """Return a JIT launcher for the one-pass MoE gather-reduce epilogue (dwordx4).
+def build_moe_gather_reduce_module(
+    model_dim: int,
+    topk: int,
+    out_dtype: str = "bf16",
+    split_k: int = 1,
+    vec_dwords: int = 2,
+):
+    """Return a JIT launcher for the one-pass MoE gather-reduce epilogue.
 
-    Each thread owns 4 consecutive dwords (8 elements) and loads/stores at
-    ``vec_width=4``.  Rows whose dword count is not a multiple of 4 process the
+    Each thread owns ``vec_dwords`` consecutive dwords and loads/stores at
+    ``vec_width=vec_dwords``.  Rows whose dword count is not a multiple of VEC process the
     trailing partial group through a per-lane scalar tail, so any even
     ``model_dim`` is supported.
 
@@ -92,16 +98,24 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
     model_dim : int   output columns (must be even; 2 elems per dword)
     topk      : int   number of expert contributions summed per token
     out_dtype : str   "bf16" or "f16" (input and output share this dtype)
+    split_k   : int   number of split-K slices in grouped_out_flat
+    vec_dwords: int   dwords per thread (2 or 4)
     """
     assert model_dim % 2 == 0, "model_dim must be even (2 elems per dword)"
     assert out_dtype in ("bf16", "f16")
-    VEC = 4  # dwords per thread
+    if vec_dwords not in (2, 4):
+        raise ValueError(f"vec_dwords must be 2 or 4, got {vec_dwords}")
+    # Smaller per-thread groups increase column-grid parallelism for tiny token
+    # batches (e.g. token=1 decode) and reduce per-CTA split_k/topk work.
+    VEC = int(vec_dwords)
     out_dwords = model_dim // 2  # dwords per output row
     row_dwords = model_dim // 2  # dwords per grouped_out_flat row (same)
     DWORDS_PER_ITER = BLOCK_THREADS * VEC  # dwords advanced per loop iter
     n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
 
-    module_name = f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}"
+    module_name = (
+        f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
+    )
 
     @flyc.kernel(name=module_name)
     def moe_gather_reduce_kernel(
@@ -110,13 +124,14 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
         gather_w: fx.Tensor,  # (token_num, topk)    bf16/f16 (== out_dtype)
         out: fx.Tensor,  # (token_num, model_dim) bf16/f16
         num_tokens: Int32,
+        slice_stride_dw: Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
 
         f32 = T.f32
         i32 = T.i32
-        vec4_i32 = T.vec(VEC, i32)
+        vec_i32_ty = T.vec(VEC, i32)
         w_dt = T.bf16 if out_dtype == "bf16" else T.f16  # weight native dtype
 
         out_dwords_i32 = arith.constant(out_dwords, type=i32)
@@ -125,6 +140,7 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
         vec_i32 = arith.constant(VEC, type=i32)
         num_tokens_i32 = ArithValue(num_tokens)
         bid_i32 = ArithValue(bid)
+        slice_stride_dw_i32 = ArithValue(slice_stride_dw)
 
         tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
         _if_tok = scf.IfOp(tok_valid)
@@ -134,6 +150,7 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
             w_rsrc = buffer_ops.create_buffer_resource(gather_w, max_size=True)
             out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
             thread_id = ArithValue(tid)
+            iter_idx_i32 = ArithValue(fx.block_idx.y)
 
             # Base dword offset of this token's row in topids_to_rows / gather_w
             # (both are (token_num, topk), 1 dword per element).
@@ -157,34 +174,36 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
                 )
                 return row_i32, w_f32
 
-            for iter_idx in range_constexpr(n_iters):
-                # First dword of this thread's 4-dword group.
-                dw_base = thread_id * vec_i32 + arith.constant(
-                    iter_idx * DWORDS_PER_ITER, type=i32
+            dw_base = thread_id * vec_i32 + iter_idx_i32 * arith.constant(
+                DWORDS_PER_ITER, type=i32
+            )
+            dw_valid = arith.cmpi(CmpIPredicate.ult, dw_base, out_dwords_i32)
+            _if_dw = scf.IfOp(dw_valid)
+            with ir.InsertionPoint(_if_dw.then_block):
+                full_valid = arith.cmpi(
+                    CmpIPredicate.ule, dw_base + vec_i32, out_dwords_i32
                 )
-                # Skip threads whose group starts past the row end.
-                dw_valid = arith.cmpi(CmpIPredicate.ult, dw_base, out_dwords_i32)
-                _if_dw = scf.IfOp(dw_valid)
-                with ir.InsertionPoint(_if_dw.then_block):
-                    # Fast path iff the whole 4-dword group is in range; else a
-                    # per-lane scalar tail handles the partial trailing group
-                    # (out_dwords % VEC != 0).  Mirrors compile_moe_reduction.
-                    full_valid = arith.cmpi(
-                        CmpIPredicate.ule, dw_base + vec_i32, out_dwords_i32
-                    )
-                    _if_full = scf.IfOp(full_valid, has_else=True)
-                    with ir.InsertionPoint(_if_full.then_block):
-                        # 2 f32 accumulators per dword lane (lo/hi packed element).
-                        acc = [
+                _if_full = scf.IfOp(full_valid, has_else=True)
+                with ir.InsertionPoint(_if_full.then_block):
+                    acc = [
+                        ArithValue(arith.constant(0.0, type=f32))
+                        for _ in range(2 * VEC)
+                    ]
+
+                    for k in range_constexpr(topk):
+                        row_i32, w_f32 = _load_row_weight(k)
+                        src_dw_base = row_i32 * row_dwords_i32 + dw_base
+                        red = [
                             ArithValue(arith.constant(0.0, type=f32))
                             for _ in range(2 * VEC)
                         ]
-
-                        for k in range_constexpr(topk):
-                            row_i32, w_f32 = _load_row_weight(k)
-                            src_dw = row_i32 * row_dwords_i32 + dw_base
+                        for sk in range_constexpr(split_k):
+                            sk_off = arith.constant(sk, type=i32) * slice_stride_dw_i32
                             raw_vec = buffer_ops.buffer_load(
-                                in_rsrc, src_dw, vec_width=VEC, dtype=i32
+                                in_rsrc,
+                                src_dw_base + sk_off,
+                                vec_width=VEC,
+                                dtype=i32,
                             )
                             for lane in range_constexpr(VEC):
                                 raw_dw = ArithValue(
@@ -197,55 +216,70 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
                                 lo_f32, hi_f32 = _unpack_pair_to_f32(
                                     raw_dw, out_dtype, f32=f32, i32=i32
                                 )
-                                acc[2 * lane] = acc[2 * lane] + w_f32 * lo_f32
-                                acc[2 * lane + 1] = acc[2 * lane + 1] + w_f32 * hi_f32
-
-                        packed = [
-                            _pack_pair_from_f32(
-                                acc[2 * lane], acc[2 * lane + 1], out_dtype, i32=i32
-                            )
-                            for lane in range(VEC)
-                        ]
-                        out_vec = vector.from_elements(vec4_i32, packed)
-                        buffer_ops.buffer_store(
-                            out_vec, out_rsrc, out_row_dw_base + dw_base
-                        )
-                        scf.YieldOp([])
-                    with ir.InsertionPoint(_if_full.else_block):
-                        # Tail: < VEC dwords left in the row; one dword per lane,
-                        # each guarded against the row end.
+                                red[2 * lane] = red[2 * lane] + lo_f32
+                                red[2 * lane + 1] = red[2 * lane + 1] + hi_f32
                         for lane in range_constexpr(VEC):
-                            dw_idx = dw_base + arith.constant(lane, type=i32)
-                            lane_valid = arith.cmpi(
-                                CmpIPredicate.ult, dw_idx, out_dwords_i32
+                            acc[2 * lane] = acc[2 * lane] + w_f32 * red[2 * lane]
+                            acc[2 * lane + 1] = (
+                                acc[2 * lane + 1] + w_f32 * red[2 * lane + 1]
                             )
-                            _if_lane = scf.IfOp(lane_valid)
-                            with ir.InsertionPoint(_if_lane.then_block):
-                                acc_lo = ArithValue(arith.constant(0.0, type=f32))
-                                acc_hi = ArithValue(arith.constant(0.0, type=f32))
-                                for k in range_constexpr(topk):
-                                    row_i32, w_f32 = _load_row_weight(k)
-                                    src_dw = row_i32 * row_dwords_i32 + dw_idx
+
+                    packed = [
+                        _pack_pair_from_f32(
+                            acc[2 * lane], acc[2 * lane + 1], out_dtype, i32=i32
+                        )
+                        for lane in range(VEC)
+                    ]
+                    out_vec = vector.from_elements(vec_i32_ty, packed)
+                    buffer_ops.buffer_store(
+                        out_vec, out_rsrc, out_row_dw_base + dw_base
+                    )
+                    scf.YieldOp([])
+                with ir.InsertionPoint(_if_full.else_block):
+                    for lane in range_constexpr(VEC):
+                        dw_idx = dw_base + arith.constant(lane, type=i32)
+                        lane_valid = arith.cmpi(
+                            CmpIPredicate.ult, dw_idx, out_dwords_i32
+                        )
+                        _if_lane = scf.IfOp(lane_valid)
+                        with ir.InsertionPoint(_if_lane.then_block):
+                            acc_lo = ArithValue(arith.constant(0.0, type=f32))
+                            acc_hi = ArithValue(arith.constant(0.0, type=f32))
+                            for k in range_constexpr(topk):
+                                row_i32, w_f32 = _load_row_weight(k)
+                                src_dw_base = row_i32 * row_dwords_i32 + dw_idx
+                                red_lo = ArithValue(arith.constant(0.0, type=f32))
+                                red_hi = ArithValue(arith.constant(0.0, type=f32))
+                                for sk in range_constexpr(split_k):
+                                    sk_off = (
+                                        arith.constant(sk, type=i32)
+                                        * slice_stride_dw_i32
+                                    )
                                     raw_dw = ArithValue(
                                         buffer_ops.buffer_load(
-                                            in_rsrc, src_dw, vec_width=1, dtype=i32
+                                            in_rsrc,
+                                            src_dw_base + sk_off,
+                                            vec_width=1,
+                                            dtype=i32,
                                         )
                                     )
                                     lo_f32, hi_f32 = _unpack_pair_to_f32(
                                         raw_dw, out_dtype, f32=f32, i32=i32
                                     )
-                                    acc_lo = acc_lo + w_f32 * lo_f32
-                                    acc_hi = acc_hi + w_f32 * hi_f32
+                                    red_lo = red_lo + lo_f32
+                                    red_hi = red_hi + hi_f32
+                                acc_lo = acc_lo + w_f32 * red_lo
+                                acc_hi = acc_hi + w_f32 * red_hi
 
-                                packed = _pack_pair_from_f32(
-                                    acc_lo, acc_hi, out_dtype, i32=i32
-                                )
-                                buffer_ops.buffer_store(
-                                    packed, out_rsrc, out_row_dw_base + dw_idx
-                                )
-                                scf.YieldOp([])
-                        scf.YieldOp([])
+                            packed = _pack_pair_from_f32(
+                                acc_lo, acc_hi, out_dtype, i32=i32
+                            )
+                            buffer_ops.buffer_store(
+                                packed, out_rsrc, out_row_dw_base + dw_idx
+                            )
+                            scf.YieldOp([])
                     scf.YieldOp([])
+                scf.YieldOp([])
             scf.YieldOp([])
 
     @flyc.jit
@@ -255,6 +289,7 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
         gather_w: fx.Tensor,
         out: fx.Tensor,
         num_tokens: fx.Int32,
+        slice_stride_dw: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -263,10 +298,15 @@ def build_moe_gather_reduce_module(model_dim: int, topk: int, out_dtype: str = "
 
         idx_tokens = arith.index_cast(T.index, num_tokens)
         launcher = moe_gather_reduce_kernel(
-            grouped_out_flat, topids_to_rows, gather_w, out, num_tokens
+            grouped_out_flat,
+            topids_to_rows,
+            gather_w,
+            out,
+            num_tokens,
+            slice_stride_dw,
         )
         launcher.launch(
-            grid=(idx_tokens, 1, 1),
+            grid=(idx_tokens, n_iters, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
