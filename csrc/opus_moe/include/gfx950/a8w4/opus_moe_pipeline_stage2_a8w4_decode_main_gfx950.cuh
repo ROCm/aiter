@@ -11,7 +11,8 @@
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
 
-// Tile mapping: windowed XCD swizzle improves w2 L2 reuse for the route_out path (bit-exact, bijective).
+// Tile mapping: baseline m-fast mapping by default. Windowed XCD swizzle is
+// available when traits opt in with SWIZZLE_C > 0.
 template<typename T>
 inline __device__ void opus_moe_stage2_a8w4_decode_tile_ids(int wgid,
                                                             int route_blocks,
@@ -165,8 +166,8 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     {
         if constexpr(T::IS_BM32_BN256)
         {
-            // num_valid_ids excludes padding rows; a full sorted tile has valid
-            // token/slot metadata for every row under any routing pattern.
+            // Fast path for full sorted tiles. Store-side route_row guards are
+            // still kept so malformed metadata cannot write a negative route row.
             if(route_base + T::B_M <= sorted_rows)
             {
                 __syncthreads();
@@ -786,7 +787,9 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out(
         for(int row_iter = 0; row_iter < T::B_M / ROWS_PER_ITER; ++row_iter)
         {
             const int local_m = row_iter * ROWS_PER_ITER + row_in_iter;
-            store_row(local_m, smem_route_base[local_m]);
+            const int route_row = smem_route_base[local_m];
+            if(route_row >= 0)
+                store_row(local_m, route_row);
         }
     }
     else
@@ -841,7 +844,10 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
         // e8m0 scale: pick power-of-2 s=2^(E-127) so amax/s in (128,256] < 448(e4m3 max).
         const int ax_e = (amax_bits >> 7) & 0xff;        // biased bf16 exponent
         int E = ax_e - 7;
-        if(E < 0) E = 0;
+        if(amax_bits == 0)
+            E = 0;
+        else if(E < 1)
+            E = 1;
         // gfx950 HW scaled-cvt: fp8 = bf16 / s, s = 2^(E-127) = bitcast(E<<23). Power-of-2
         // scaling is exact, so this is bit-identical to (bf16->f32)*2^(127-E)->fp8 but skips
         // 8x(bf16->f32) + 8x(*inv) per row -> fewer VALU.
@@ -872,7 +878,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
         const int route_row = smem_route_base[local_m];
         if constexpr(FullRouteTile)
         {
-            store_row(local_m, route_row);
+            if(route_row >= 0)
+                store_row(local_m, route_row);
         }
         else
         {

@@ -80,6 +80,7 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
     from .moe_stage2_a8w4_meta import (
         opus_a8w4_kid_block_m,
         opus_a8w4_kid_from_name,
+        opus_a8w4_kid_reduce_block_n,
         opus_a8w4_reduce_block_n_from_name,
         opus_a8w4_kid_uses_route,
     )
@@ -90,18 +91,34 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
     name = _cfg_str(_cfg_first(cfg, "kernelName2", "kernel_name2", "stage2_kernel"))
     kid = opus_a8w4_kid_from_name(name)
     if kid is not None:
+        reduce_block_n = opus_a8w4_reduce_block_n_from_name(name)
+        if reduce_block_n is None:
+            reduce_block_n = opus_a8w4_kid_reduce_block_n(kid)
         return {
             "kernel_id": kid,
             "stage2_block_m": opus_a8w4_kid_block_m(kid),
             "route_out": opus_a8w4_kid_uses_route(kid),
-            "stage2_reduce_block_n": opus_a8w4_reduce_block_n_from_name(name),
+            "stage2_reduce_block_n": reduce_block_n,
         }
     # Legacy fallback: explicit numeric columns.
+    kernel_id = _cfg_int(
+        _cfg_first(cfg, "stage2_kernel_id", "opus_kernel_id", "kernel_id2"),
+        -1,
+    )
+    reduce_block_n = _cfg_optional_int(
+        _cfg_first(cfg, "stage2_reduce_block_n", "reduce_block_n")
+    )
+    if kernel_id != -1:
+        if reduce_block_n is None:
+            reduce_block_n = opus_a8w4_kid_reduce_block_n(kernel_id)
+        return {
+            "kernel_id": kernel_id,
+            "stage2_block_m": opus_a8w4_kid_block_m(kernel_id),
+            "route_out": opus_a8w4_kid_uses_route(kernel_id),
+            "stage2_reduce_block_n": reduce_block_n,
+        }
     return {
-        "kernel_id": _cfg_int(
-            _cfg_first(cfg, "stage2_kernel_id", "opus_kernel_id", "kernel_id2"),
-            -1,
-        ),
+        "kernel_id": kernel_id,
         "stage2_block_m": _cfg_int(
             _cfg_first(cfg, "stage2_block_m", "opus_block_m", "kernel_block_m"),
             sort_block_m,
@@ -110,9 +127,7 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
             _cfg_first(cfg, "stage2_route_out", "route_out", "return_per_slot"),
             False,
         ),
-        "stage2_reduce_block_n": _cfg_optional_int(
-            _cfg_first(cfg, "stage2_reduce_block_n", "reduce_block_n")
-        ),
+        "stage2_reduce_block_n": reduce_block_n,
     }
 
 
@@ -123,6 +138,7 @@ def cfg_is_supported(
     gfx: str,
     block_m,
     is_ep: bool,
+    has_stage2_bias: bool = False,
 ) -> tuple[bool, str]:
     if not is_opus_a8w4_stage2_kernel(kernel_name):
         return False, f"unknown Opus A8W4 stage2 kernelName2={kernel_name!r}"
@@ -130,11 +146,16 @@ def cfg_is_supported(
         return False, f"requires gfx950, got {gfx}"
     if is_ep:
         return False, "EP expert_mask/topk_ids are not supported"
+    if has_stage2_bias:
+        return False, "stage2 bias is not supported"
 
     sort_block_m = _cfg_int(block_m, _DEFAULT_SORT_BLOCK_M)
     if sort_block_m <= 0:
         return False, f"requires positive sort block_m, got {sort_block_m}"
-    values = stage2_cfg_values(cfg, block_m)
+    try:
+        values = stage2_cfg_values(cfg, block_m)
+    except ValueError as exc:
+        return False, str(exc)
     kernel_block_m = int(values["stage2_block_m"])
     from .moe_stage2_a8w4_meta import opus_a8w4_supported_block_ms
 

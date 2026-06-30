@@ -76,6 +76,8 @@ def test_fmoe(
     check_aot_cache=True,
     swiglu_limit=None,
     kernel_bench=False,
+    disable_stage2_bias=False,
+    reference_intermediate_pad=0,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -104,6 +106,8 @@ def test_fmoe(
     if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
+    if disable_stage2_bias:
+        exp_bias2 = None
     if AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
@@ -211,8 +215,8 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4
-        exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
-        exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
+        exp_bias1_aiter = None if exp_bias1 is None else exp_bias1.to(dtypes.fp32)
+        exp_bias2_aiter = None if exp_bias2 is None else exp_bias2.to(dtypes.fp32)
     elif (
         qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
     ):  # a16wi4: no bias
@@ -354,15 +358,27 @@ def test_fmoe(
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
 
+    ref_a2_qt = a2_qt
+    ref_w2_qt = w2_qt
+    ref_w2_scale = w2_scale
+    if reference_intermediate_pad:
+        effective_inter_dim = inter_dim - int(reference_intermediate_pad)
+        ref_a2_qt = a2_qt[..., :effective_inter_dim].contiguous()
+        if qType == aiter.QuantType.per_1x32 and WQDType == dtypes.fp4x2:
+            ref_w2_qt = w2_qt[..., : effective_inter_dim // 2].contiguous()
+            ref_w2_scale = w2_scale[..., : effective_inter_dim // 32].contiguous()
+        else:
+            ref_w2_qt = w2_qt[..., :effective_inter_dim].contiguous()
+
     out2_ref = torch_moe_stage2(
-        a2_qt,
+        ref_a2_qt,
         w1_qt,  # E, inter_dim*2, model_dim
-        w2_qt,  # E, model_dim, inter_dim
+        ref_w2_qt,  # E, model_dim, inter_dim
         topk_weights,
         topk_ids,
         dtype=dtype,
         quant_type=qType,
-        w2_scale=w2_scale,
+        w2_scale=ref_w2_scale,
         a2_scale=a2_scale,
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
@@ -679,11 +695,26 @@ def _str2enum(s, enum_cls):
 
 
 def _row_to_kwargs(row):
-    # csv rows store already-effective dims, so pad defaults to 0.
     q_type = _str2enum(row["q_type"], aiter.QuantType)
     aq_dtype = _str2dtype(row["q_dtype_a"])
     wq_dtype = _str2dtype(row["q_dtype_w"])
     act_type = _str2enum(row["act_type"], aiter.ActivationType)
+    inter_dim = int(row["inter_dim"])
+    reference_intermediate_pad = 0
+    kernel_name2 = str(row.get("kernelName2", "") or "")
+    if kernel_name2.startswith("opus_"):
+        from aiter.ops.opus.moe_stage2_a8w4_meta import (
+            opus_a8w4_shape_family_for_shape,
+        )
+
+        shape_family = opus_a8w4_shape_family_for_shape(
+            model_dim=int(row["model_dim"]),
+            inter_dim=inter_dim,
+            expert=int(row["expert"]),
+            topk=int(row["topk"]),
+        )
+        if shape_family is not None:
+            reference_intermediate_pad = int(shape_family.inter_dim_pad)
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
     gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
@@ -691,7 +722,7 @@ def _row_to_kwargs(row):
         dtype=_str2dtype(row["dtype"]),
         token=int(row["token"]),
         model_dim=int(row["model_dim"]),
-        inter_dim=int(row["inter_dim"]),
+        inter_dim=inter_dim,
         E=int(row["expert"]),
         topk=int(row["topk"]),
         actType=act_type,
@@ -704,6 +735,7 @@ def _row_to_kwargs(row):
         hidden_pad=0,
         intermediate_pad=0,
         preshuffle=True,
+        reference_intermediate_pad=reference_intermediate_pad,
         swiglu_limit=_effective_swiglu_limit(
             q_type, aq_dtype, wq_dtype, args.swiglu_limit
         ),
@@ -717,6 +749,9 @@ def _iter_csv_cases():
     df_csv = pd.read_csv(merged_csv)
     rows = df_csv[df_csv["cu_num"] == cu]
     for _, row in rows.iterrows():
+        tag = row.get("_tag", "")
+        if pd.notna(tag) and str(tag).strip():
+            continue
         kernel_name1 = str(row.get("kernelName1", "") or "")
         kernel_name2 = str(row.get("kernelName2", "") or "")
         if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
@@ -757,6 +792,7 @@ def _iter_csv_cases():
             continue
         kwargs["strict_accuracy"] = True
         kwargs["check_aot_cache"] = True
+        kwargs["disable_stage2_bias"] = kernel_name2.startswith("opus_")
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,

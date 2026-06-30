@@ -395,7 +395,7 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         block_m=64,
         sort_block_m=64,
         route_reduce="full_model_n7168",
-        tuner_candidate=False,
+        min_tuner_token=4096,
         shape_family=_K3,
         mode_default=True,
     ),
@@ -596,6 +596,13 @@ def opus_a8w4_kid_uses_route(kid: int) -> bool:
 
 def opus_a8w4_kid_block_m(kid: int) -> int:
     return _require_a8w4_stage2_instance(kid).block_m
+
+
+def opus_a8w4_kid_reduce_block_n(kid: int) -> Optional[int]:
+    route_reduce = opus_a8w4_route_reduce(
+        _require_a8w4_stage2_instance(kid).route_reduce
+    )
+    return None if route_reduce is None else route_reduce.block_n
 
 
 def opus_a8w4_supported_block_ms() -> tuple[int, ...]:

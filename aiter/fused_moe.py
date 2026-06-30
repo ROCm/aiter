@@ -499,6 +499,7 @@ def fused_moe_(
         isShuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        has_stage2_bias=bias2 is not None,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -1069,6 +1070,7 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
+    has_stage2_bias=False,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -1281,6 +1283,7 @@ def get_2stage_cfgs(
                 gfx=gfx,
                 block_m=cfg.get("block_m", BLOCK_SIZE_M),
                 is_ep=is_ep,
+                has_stage2_bias=has_stage2_bias,
             )
             if not opus_supported:
                 cfg = None
@@ -1893,6 +1896,7 @@ def fused_moe_2stages(
         is_shuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        has_stage2_bias=bias2 is not None,
     )
     if (
         quant_type == QuantType.per_1x32

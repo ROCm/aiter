@@ -80,6 +80,17 @@ void check_i32_metadata(const aiter_tensor_t& t, const char* name, bool non_empt
         AITER_CHECK(t.size(0) > 0, name, " must be non-empty");
 }
 
+void check_same_device(const aiter_tensor_t& ref,
+                       const char* ref_name,
+                       const aiter_tensor_t& t,
+                       const char* name)
+{
+    AITER_CHECK(t.device_id == ref.device_id,
+                name,
+                " must be on the same device as ",
+                ref_name);
+}
+
 void check_sorted_weights(const std::optional<aiter_tensor_t>& sorted_weights)
 {
     if(!sorted_weights.has_value())
@@ -227,6 +238,14 @@ void opus_moe_stage2_route_reduce_fwd(aiter_tensor_t& inter_states,
     check_i32_metadata(sorted_expert_ids, "sorted_expert_ids", true);
     check_i32_metadata(num_valid_ids, "num_valid_ids", true);
     check_sorted_weights(sorted_weights);
+    check_same_device(inter_states, "inter_states", w2, "w2");
+    check_same_device(inter_states, "inter_states", sorted_token_ids, "sorted_token_ids");
+    check_same_device(inter_states, "inter_states", sorted_expert_ids, "sorted_expert_ids");
+    check_same_device(inter_states, "inter_states", num_valid_ids, "num_valid_ids");
+    check_same_device(inter_states, "inter_states", route_out, "route_out");
+    check_same_device(inter_states, "inter_states", out, "out");
+    if(sorted_weights.has_value())
+        check_same_device(inter_states, "inter_states", *sorted_weights, "sorted_weights");
 
     const int token_num = static_cast<int>(inter_states.size(0));
     const int actual_topk = static_cast<int>(inter_states.size(1));
@@ -331,6 +350,15 @@ void opus_moe_stage2_a8w4_decode_fwd(
     check_i32_metadata(sorted_expert_ids, "sorted_expert_ids", true);
     check_i32_metadata(num_valid_ids, "num_valid_ids", true);
     check_sorted_weights(sorted_weights);
+    check_same_device(inter_states, "inter_states", w2, "w2");
+    check_same_device(inter_states, "inter_states", a2_scale, "a2_scale");
+    check_same_device(inter_states, "inter_states", w2_scale, "w2_scale");
+    check_same_device(inter_states, "inter_states", sorted_token_ids, "sorted_token_ids");
+    check_same_device(inter_states, "inter_states", sorted_expert_ids, "sorted_expert_ids");
+    check_same_device(inter_states, "inter_states", num_valid_ids, "num_valid_ids");
+    check_same_device(inter_states, "inter_states", out, "out");
+    if(sorted_weights.has_value())
+        check_same_device(inter_states, "inter_states", *sorted_weights, "sorted_weights");
 
     const int token_num = static_cast<int>(inter_states.size(0));
     const int actual_topk = static_cast<int>(inter_states.size(1));
@@ -463,20 +491,54 @@ void opus_moe_stage2_reduce_token_slot_route_output_fwd(aiter_tensor_t& route_ou
     // (no OPUS_ROUTE_FP8 env): keeps reduce in sync with the decode kid that produced it.
     const int route_out_fp8 = (route_out.dtype() == AITER_DTYPE_u8) ? 1 : 0;
     check_tensor(out, "out", 2, "[token, model_dim]", AITER_DTYPE_bf16, "bf16");
+    check_same_device(route_out, "route_out", out, "out");
+    AITER_CHECK(topk > 0, "route_out reduce requires positive topk, got ", topk);
+    const int token_num = static_cast<int>(out.size(0));
+    const int actual_topk = topk;
+    const int model_dim = static_cast<int>(out.size(1));
     if(!route_out_fp8)
     {
         check_tensor(route_out, "route_out", 3, "[token, topk, model_dim]",
                      AITER_DTYPE_bf16, "bf16");
+        AITER_CHECK(route_out.size(0) == token_num && route_out.size(1) == actual_topk &&
+                        route_out.size(2) == model_dim,
+                    "bf16 route_out shape must be [",
+                    token_num,
+                    ", ",
+                    actual_topk,
+                    ", ",
+                    model_dim,
+                    "]");
         AITER_CHECK(route_out.stride(0) == route_out.stride(1) * topk,
                     "route_out must be contiguous over [token, topk] rows");
     }
-    // fp8: route_out is uint8 [token*topk, model_dim + model_dim/8] (scale embedded).
-    const int token_num = static_cast<int>(out.size(0));
-    const int actual_topk = topk;
-    const int model_dim = static_cast<int>(out.size(1));
-    AITER_CHECK(out.size(0) == token_num && out.size(1) == model_dim,
-                "out shape must be [token, model_dim]");
-    if(token_num == 0 || topk == 0 || model_dim == 0)
+    else
+    {
+        check_tensor(route_out,
+                     "route_out",
+                     2,
+                     "[token * topk, model_dim + model_dim / 8]",
+                     AITER_DTYPE_u8,
+                     "uint8");
+        AITER_CHECK(model_dim % 8 == 0,
+                    "MXFP8 route_out reduce requires model_dim to be a multiple of 8, got ",
+                    model_dim);
+        const int64_t expected_rows = static_cast<int64_t>(token_num) * actual_topk;
+        const int64_t expected_cols = static_cast<int64_t>(model_dim) + model_dim / 8;
+        AITER_CHECK(route_out.size(0) == expected_rows && route_out.size(1) == expected_cols,
+                    "MXFP8 route_out shape must be [",
+                    expected_rows,
+                    ", ",
+                    expected_cols,
+                    "], got [",
+                    route_out.size(0),
+                    ", ",
+                    route_out.size(1),
+                    "]");
+        AITER_CHECK(route_out.stride(0) >= expected_cols,
+                    "MXFP8 route_out row stride must cover model_dim + model_dim / 8 bytes");
+    }
+    if(token_num == 0 || model_dim == 0)
         return;
 
     opus_moe_stage2_route_reduce_kargs kargs{};
