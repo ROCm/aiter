@@ -176,15 +176,16 @@ def _build_kernel(
     state_size: int,
     k_per_block: int,
     has_block_table: bool,
-    quant: bool,
     use_ue8m0: bool,
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
     enable_prefetch_input: bool = True,
-    quant_mode: str = "per_row_fp8",  # "per_row_fp8" (indexer) | "group_fp8" (CSA/HCA Main, nm-asm); orthogonal to quant_fp4
+    # Single quant source of truth: "none" | "per_row_fp8" (indexer) |
+    # "group_fp8" (CSA/HCA Main nm-asm) | "fp4". `quant`/`quant_fp4`/`nm_asm`
+    # are derived from it below.
+    quant_mode: str = "none",
     quant_group_size: int = 64,
-    quant_fp4: bool = False,
 ):
     """Build the @flyc.kernel + @flyc.jit launcher for a given config.
 
@@ -198,13 +199,14 @@ def _build_kernel(
       - state_size: ring-buffer modulo of kv_state.shape[1] (>= K)
       - k_per_block: paged cache tokens per block (= block_size // ratio)
       - has_block_table: False → skip cache scatter (warmup path)
-      - quant: True → fp8/fp4 (Indexer-inner); False → bf16 (Main)
-      - quant_mode: "per_row_fp8" (indexer) | "group_fp8" (CSA/HCA Main nm-asm)
-      - quant_fp4: only when quant=True. True → FP4 (E2M1) per-group(32) e8m0
-        scale + FP4 preshuffle layout; False → FP8 (per quant_mode above).
-      - use_ue8m0: only when quant=True and not quant_fp4 (round scale to
-        power-of-2). The FP4 path always uses the MX RoundUp e8m0 scale.
-      - preshuffle: only when quant=True (MFMA 16x16 tile / FP4 KV tile layout)
+      - quant_mode: single quant selector (the booleans below are derived):
+          "none"        → bf16 paged write (Main)            → quant=False
+          "per_row_fp8" → FP8 e4m3 per-row scale (Indexer)   → quant=True
+          "group_fp8"   → FP8 1xG group scale (Main nm-asm)  → quant=True, nm_asm
+          "fp4"         → FP4 (E2M1) per-group(32) e8m0 scale → quant=True, quant_fp4
+      - use_ue8m0: only for fp8 (round scale to power-of-2); the FP4 path
+        always uses the MX RoundUp e8m0 scale regardless.
+      - preshuffle: only when quant (MFMA 16x16 tile / FP4 KV tile layout)
       - enable_prefetch_input: True → Phase 2 carries k+1 loads through
         scf.for iter-args so the buffer_load issue overlaps current iter's
         softmax compute. Helps long K (HCA K=128). Larger VEC pays a register
@@ -224,7 +226,10 @@ def _build_kernel(
     # For Indexer (D=128, VEC=2) -> 32 .. 63 are rope threads, 1 pair each (=64=2RD/2).
     # The RD%(2*VEC) == 0 invariant means rope threads cleanly own whole pairs.
 
-    # FP8 1xG e8m0 group-quant geometry (quant_mode=="nm_asm" only): nope region split
+    # Derive the quant booleans from the single `quant_mode` source of truth.
+    quant = quant_mode != "none"
+    quant_fp4 = quant_mode == "fp4"
+    # FP8 1xG e8m0 group-quant geometry (quant_mode=="group_fp8" only): nope region split
     # into N_GROUPS groups of quant_group_size; RTS lanes per group cooperate on amax via
     # shuffle_xor. Byte-identical to HCA Kernel B / C++ k_wave fp8.
     nm_asm = quant_mode == "group_fp8"
@@ -1481,12 +1486,13 @@ def _build_kernel_ksplit(
     state_size: int,
     k_per_block: int,
     k_split_num_waves: int,
-    quant: bool,
     use_ue8m0: bool,
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    quant_fp4: bool = False,
+    # Single quant source of truth: "none" | "per_row_fp8" | "fp4".
+    # (ksplit has no "group_fp8" path.) `quant`/`quant_fp4` derived below.
+    quant_mode: str = "none",
 ):
     """K-split single-kernel: NW-wave LDS-reduced compress + norm + rope +
     scatter (BF16, FP8, or FP4). Constexpr knobs mirror :func:`_build_kernel`
@@ -1515,6 +1521,10 @@ def _build_kernel_ksplit(
     NW = k_split_num_waves
     BLOCK_TH = BLOCK_THREADS * NW
     K_PER_WAVE = K // NW
+
+    # Derive the quant booleans from the single `quant_mode` source of truth.
+    quant = quant_mode != "none"
+    quant_fp4 = quant_mode == "fp4"
 
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
@@ -2498,15 +2508,14 @@ def compile_flydsl_fused_compress_attn(
     state_size: int,
     k_per_block: int,
     has_block_table: bool,
-    quant: bool,
     use_ue8m0: bool,
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
     enable_prefetch_input: bool = True,
-    quant_mode: str = "per_row_fp8",  # "per_row_fp8" (indexer) | "group_fp8" (CSA/HCA Main, nm-asm); orthogonal to quant_fp4
+    # "none" | "per_row_fp8" | "group_fp8" | "fp4" (single quant selector).
+    quant_mode: str = "none",
     quant_group_size: int = 64,
-    quant_fp4: bool = False,
 ):
     launcher = _build_kernel(
         head_dim=head_dim,
@@ -2516,7 +2525,6 @@ def compile_flydsl_fused_compress_attn(
         state_size=state_size,
         k_per_block=k_per_block,
         has_block_table=has_block_table,
-        quant=quant,
         use_ue8m0=use_ue8m0,
         preshuffle=preshuffle,
         rms_weight_is_bf16=rms_weight_is_bf16,
@@ -2524,7 +2532,6 @@ def compile_flydsl_fused_compress_attn(
         enable_prefetch_input=enable_prefetch_input,
         quant_mode=quant_mode,
         quant_group_size=quant_group_size,
-        quant_fp4=quant_fp4,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
@@ -2566,12 +2573,12 @@ def compile_flydsl_fused_compress_attn_ksplit(
     state_size: int,
     k_per_block: int,
     k_split_num_waves: int,
-    quant: bool,
     use_ue8m0: bool,
     preshuffle: bool,
     rms_weight_is_bf16: bool,
     rms_eps: float,
-    quant_fp4: bool = False,
+    # "none" | "per_row_fp8" | "fp4" (single quant selector; no group_fp8).
+    quant_mode: str = "none",
 ):
     launcher = _build_kernel_ksplit(
         head_dim=head_dim,
@@ -2581,12 +2588,11 @@ def compile_flydsl_fused_compress_attn_ksplit(
         state_size=state_size,
         k_per_block=k_per_block,
         k_split_num_waves=k_split_num_waves,
-        quant=quant,
         use_ue8m0=use_ue8m0,
         preshuffle=preshuffle,
         rms_weight_is_bf16=rms_weight_is_bf16,
         rms_eps=rms_eps,
-        quant_fp4=quant_fp4,
+        quant_mode=quant_mode,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
@@ -2664,9 +2670,8 @@ def flydsl_fused_compress_attn(
         )
     _quant = _mode != "none"
     _fp4 = _mode == "fp4"
-    # Internal builder quant_mode only distinguishes per_row_fp8 vs group_fp8;
-    # FP4 rides the `quant_fp4` bool, so it maps to per_row_fp8 (nm_asm=False).
-    _builder_quant_mode = "group_fp8" if _mode == "group_fp8" else "per_row_fp8"
+    # `_mode` (none|per_row_fp8|group_fp8|fp4) is the single selector passed
+    # straight to the builders, which derive quant/quant_fp4/nm_asm from it.
 
     # ---- gfx1250 dispatch (wave32) ----
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
@@ -2930,12 +2935,11 @@ def flydsl_fused_compress_attn(
             state_size=state_size,
             k_per_block=k_per_block,
             k_split_num_waves=int(k_split_num_waves),
-            quant=_quant,
             use_ue8m0=use_ue8m0,
             preshuffle=preshuffle,
             rms_weight_is_bf16=_rms_weight_is_bf16,
             rms_eps=float(rms_eps),
-            quant_fp4=_fp4,
+            quant_mode=_mode,  # never "group_fp8" here (use_ksplit excludes nm_asm)
         )
         if stream is None:
             stream = torch.cuda.current_stream()
@@ -2978,14 +2982,12 @@ def flydsl_fused_compress_attn(
         state_size=state_size,
         k_per_block=k_per_block,
         has_block_table=has_bt,
-        quant=_quant,
         use_ue8m0=use_ue8m0,
         preshuffle=preshuffle,
         rms_weight_is_bf16=_rms_weight_is_bf16,
         rms_eps=float(rms_eps),
-        quant_mode=_builder_quant_mode,
+        quant_mode=_mode,  # single selector: none|per_row_fp8|group_fp8|fp4
         quant_group_size=64,
-        quant_fp4=_fp4,
     )
 
     if stream is None:
