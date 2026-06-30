@@ -754,6 +754,8 @@ class AttentionProgram:
         kv_head_idx,
         output_stride_0,
         output_stride_1,
+        split_idx=0,
+        NUM_SPLITS: gl.constexpr = 1,
     ):
         num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
         tile_start = 0
@@ -793,6 +795,15 @@ class AttentionProgram:
                 query_pos, gl.SliceLayout(1, cfg.qk_layout)
             )[:, None]
             query_mask_qk = gl.convert_layout(query_mask, cfg.qk_layout)
+
+        # Split-KV: carve [tile_start, tile_end) into NUM_SPLITS contiguous
+        # split_idx==0 / NUM_SPLITS==1 is a no-op
+        if NUM_SPLITS > 1:
+            active_tiles = tile_end - tile_start
+            tiles_per_split = (active_tiles + NUM_SPLITS - 1) // NUM_SPLITS
+            split_start = tile_start + split_idx * tiles_per_split
+            tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
+            tile_start = split_start
 
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
@@ -1042,6 +1053,60 @@ class AttentionProgram:
             gl.store(self.output_ptr + o_offs, casted_out, mask=o_mask)
 
     @gluon.jit
+    def store_partial(
+        self,
+        M,
+        L,
+        acc,
+        partial_m_ptr,
+        partial_l_ptr,
+        partial_acc_ptr,
+        split_idx,
+        q_block_local_idx,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        cur_batch_query_len,
+        NUM_SPLITS: gl.constexpr,
+    ):
+        """Split-KV partials: store the *un-reduced* M (raw row max), L (exp sum)
+        and acc (un-normalized PV accumulator) for this split. The cross-split
+        reduction (flash rescale by exp2((M_s - max_s M)*QK_scale)) is done later.
+
+        Buffers are contiguous:
+            partial_acc : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS, HEAD_SIZE]
+            partial_m/l : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS]
+        """
+        cfg: gl.constexpr = self.cfg
+        layout: gl.constexpr = cfg.pv_layout
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
+        offs_d = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout))
+        query_pos = q_block_local_idx * cfg.BLOCK_Q + offs_m // cfg.NUM_QUERIES_PER_KV
+        query_offset_0 = cur_batch_in_all_start_index + query_pos
+        query_offset_1 = (
+            kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m % cfg.NUM_QUERIES_PER_KV
+        )
+        row_mask = (query_pos < cur_batch_query_len) & (
+            query_offset_1 < cfg.NUM_QUERY_HEADS
+        )
+
+        # acc: [BLOCK_M, HEAD_SIZE]
+        acc_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS * cfg.HEAD_SIZE
+        acc_stride_1: gl.constexpr = NUM_SPLITS * cfg.HEAD_SIZE
+        acc_offs = (
+            query_offset_0[:, None] * acc_stride_0
+            + query_offset_1[:, None] * acc_stride_1
+            + split_idx * cfg.HEAD_SIZE
+            + offs_d[None, :]
+        )
+        gl.store(partial_acc_ptr + acc_offs, acc, mask=row_mask[:, None])
+
+        # M, L: [BLOCK_M]
+        ml_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS
+        ml_offs = query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS + split_idx
+        gl.store(partial_m_ptr + ml_offs, M, mask=row_mask)
+        gl.store(partial_l_ptr + ml_offs, L, mask=row_mask)
+
+    @gluon.jit
     def compute_qk_subtile(self, k):
         S = gl.zeros(
             [self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 2],
@@ -1119,8 +1184,13 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     buffer_id: gl.int32 = 0
     kv_loader.load_k_to_shared(physical_block_idx, buffer_id=buffer_id)
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buffer_id)
+    # if all decode, we only have one masked tile, no need for double loop
+    if pgm.cfg.ALL_DECODE:
+        end = pgm.tile_end - 1
+    else:
+        end = pgm.safe_tile_end
     # ---- Safe tiles (no mask) ----
-    for j in range(pgm.tile_start, pgm.safe_tile_end):
+    for j in range(pgm.tile_start, end):
         next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
         k = kv_loader.load_k_from_shared(
             wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
@@ -1142,27 +1212,27 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
         buffer_id = 1 - buffer_id
         next_physical_block_idx = next2_physical_block_idx
 
-    # ---- Masked tiles (causal boundary) ----
-    for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
-        next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
-        k = kv_loader.load_k_from_shared(
-            wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
-        )
-        kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
-        kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+    if not pgm.cfg.ALL_DECODE:
+        for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
+            next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
+            k = kv_loader.load_k_from_shared(
+                wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id
+            )
+            kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+            kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
 
-        S = pgm.compute_qk(k)
-        S = pgm.apply_mask_qk(S, j)
-        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
-        p, alpha, M = pgm.softmax_part0(S, M)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+            S = pgm.compute_qk(k)
+            S = pgm.apply_mask_qk(S, j)
+            S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+            p, alpha, M = pgm.softmax_part0(S, M)
+            p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
 
-        v = kv_loader.load_v_from_shared(
-            wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id
-        )
-        acc = pgm.compute_pv(p, v, acc)
-        buffer_id = 1 - buffer_id
-        next_physical_block_idx = next2_physical_block_idx
+            v = kv_loader.load_v_from_shared(
+                wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id
+            )
+            acc = pgm.compute_pv(p, v, acc)
+            buffer_id = 1 - buffer_id
+            next_physical_block_idx = next2_physical_block_idx
 
     # Last tile is always masked
     k = kv_loader.load_k_from_shared(
@@ -1427,9 +1497,7 @@ def attention_loop_tensor_subtile_split(
         qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
 
     # FP8: qk_layout (K from HEAD_SIZE) and pv_layout (K from TILE_SIZE) can carry
-    # different WMMA instr_shape K dims, so they are distinct layouts even though the
-    # MxN result distribution is identical. Relabel QK to pv_layout (trivial no-op) so
-    # the softmax state (M/alpha) and p share one layout, as loop variants 0/1 do.
+    # different WMMA instr_shape K dims. Relabel QK to pv_layout (trivial no-op)
     qk0 = gl.convert_layout(qk0, cfg.pv_layout, assert_trivial=True)
     qk1 = gl.convert_layout(qk1, cfg.pv_layout, assert_trivial=True)
     qk = pgm.concat_subtile(qk0, qk1)
@@ -1768,10 +1836,17 @@ def _unified_attention_gluon_kernel_2d(
     LOOP_VARIANT: gl.constexpr = 0,
     USE_TDM_STORE: gl.constexpr = 0,
     K_WIDTH: gl.constexpr = 0,
+    # Split-KV (3d grid)
+    NUM_SPLITS: gl.constexpr = 1,
+    partial_m_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
+    partial_l_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
+    partial_acc_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS, head_size]
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
     q_block_global_idx = gl.num_programs(1) - 1 - gl.program_id(1)
+    # program_id(2) is 0 for a 2d grid (NUM_SPLITS==1), so this is always safe.
+    split_idx = gl.program_id(2)
     Q_FP8: gl.constexpr = query_ptr.dtype.is_fp8()
     KV_FP8: gl.constexpr = key_cache_ptr.dtype.is_fp8()
 
@@ -1810,20 +1885,27 @@ def _unified_attention_gluon_kernel_2d(
         block_table_stride,
     )
 
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
-    )
+    if not ALL_DECODE:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
+        )
+        cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
+        q_block_start_idx = cur_batch_in_all_start_index // cfg.BLOCK_Q + seq_idx
+        q_block_local_idx = q_block_global_idx - q_block_start_idx
 
-    cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
-    q_block_start_idx = cur_batch_in_all_start_index // cfg.BLOCK_Q + seq_idx
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
+        cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
-    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
-
-    # Not needed when num programs is computed precisely
-    if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
-        return
+        # Not needed when num programs is computed precisely
+        if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
+            return
+    else:
+        # One program per sequence: q_block_global_idx maps directly to seq_idx,
+        # each handling a single (decode) query token.
+        seq_idx = q_block_global_idx
+        q_block_local_idx: gl.int32 = 0
+        cur_batch_query_len: gl.int32 = 1
+        cur_batch_in_all_start_index: gl.int32 = q_block_global_idx
 
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
     offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.q_layout))
@@ -1862,11 +1944,6 @@ def _unified_attention_gluon_kernel_2d(
             + (BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV
             + 1
         )
-        # Clamp to [1, seq_len]. The lower bound handles the degenerate case
-        # where every query in this M-block has an empty causally-allowed key
-        # set (happens when cur_batch_query_len > kv_len and q_pos+context_len<0
-        # for the whole block). Forcing tile_end >= 1 keeps the loop-final
-        # "last masked tile" well-defined (j=0 with all-mask, not j=-N).
         max_seq_prefix_len = gl.maximum(1, gl.minimum(max_seq_prefix_len, seq_len))
     else:
         max_seq_prefix_len = seq_len
@@ -1891,7 +1968,15 @@ def _unified_attention_gluon_kernel_2d(
         kv_head_idx,
         output_stride_0,
         output_stride_1,
+        split_idx,
+        NUM_SPLITS,
     )
+
+    # This split owns no tiles (more splits than active tiles). The partial
+    # buffers are pre-filled with neutral values (M=-inf, L=0, acc=0) so the
+    # later reduction simply ignores it.
+    if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
+        return
 
     # Pick the KV loader based on TILE_SIZE and LOOP_VARIANT
     if TILE_SIZE == BLOCK_SIZE:
@@ -1921,14 +2006,22 @@ def _unified_attention_gluon_kernel_2d(
             kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m_pv % cfg.NUM_QUERIES_PER_KV
         )
         query_mask_1_pv = query_offset_1_pv < NUM_QUERY_HEADS
-        M = gl.amd.cdna4.buffer_load(
-            ptr=sink_ptr,
-            offsets=query_offset_1_pv,
-            mask=query_mask_1_pv,
-            other=float("-inf"),
-        ).to(dtype=gl.float32)
-        # NOTE: See softmax0 why
-        M = M / SCALE
+        if NUM_SPLITS == 1 or split_idx == 0:
+            M = gl.amd.cdna4.buffer_load(
+                ptr=sink_ptr,
+                offsets=query_offset_1_pv,
+                mask=query_mask_1_pv,
+                other=float("-inf"),
+            ).to(dtype=gl.float32)
+            # NOTE: See softmax0 why
+            M = M / SCALE
+        else:
+            M = gl.full(
+                [BLOCK_M],
+                float("-inf"),
+                dtype=gl.float32,
+                layout=gl.SliceLayout(1, cfg.pv_layout),
+            )
 
     L = gl.full(
         [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
@@ -1983,6 +2076,24 @@ def _unified_attention_gluon_kernel_2d(
             acc0,
             acc1,
         )
+
+    if NUM_SPLITS > 1:
+        # Split-KV: emit un-reduced partials; the reduction happens separately.
+        pgm.store_partial(
+            M,
+            L,
+            acc,
+            partial_m_ptr,
+            partial_l_ptr,
+            partial_acc_ptr,
+            split_idx,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            NUM_SPLITS,
+        )
+        return
 
     # Normalize and store output
     l_recip = pgm.out_scale / L[:, None]

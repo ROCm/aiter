@@ -3,6 +3,7 @@
 
 import torch
 import itertools
+from contextlib import nullcontext
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest
@@ -27,9 +28,8 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.aot.flydsl.common import fail_on_aot_cache_miss
+from aiter.aot.flydsl.common import run_only_env
 from aiter.ops.flydsl.moe_common import GateMode
-import aiter.ops.flydsl.moe_kernels as _aiter_mk
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -74,7 +74,8 @@ def test_fmoe(
     preshuffle=True,
     strict_accuracy=True,
     check_aot_cache=True,
-    swiglu_limit=0.0,
+    swiglu_limit=None,
+    kernel_bench=False,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -368,13 +369,7 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    out2_ck, us2 = run_perftest(
-        fused_moe,
-        input,
-        w1_qt_aiter,
-        w2_qt_aiter,
-        topk_weights,
-        topk_ids,
+    _fused_moe_kwargs = dict(
         w1_scale=w1_scale_aiter,
         w2_scale=w2_scale_aiter,
         quant_type=qType,
@@ -386,8 +381,60 @@ def test_fmoe(
         bias2=exp_bias2_aiter,
         swiglu_limit=swiglu_limit,
         gate_mode=gateMode,
+    )
+
+    if kernel_bench:
+        # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
+        # fused_moe call populates the per-stage launch callables (via the opt-in
+        # kernel_bench_callable hook) and yields a correct output; then loop each
+        # captured kernel launch alone (excludes input prep / quant / sorting).
+        kernel_bench_callable = []
+        aiter.fused_moe.kernel_bench_callable = kernel_bench_callable
+        try:
+            out2_ck = fused_moe(
+                input,
+                w1_qt_aiter,
+                w2_qt_aiter,
+                topk_weights,
+                topk_ids,
+                **_fused_moe_kwargs,
+            )
+        finally:
+            aiter.fused_moe.kernel_bench_callable = None
+        kernel_us = {}
+        for _name, _call in kernel_bench_callable:
+            _, _us = run_perftest(_call, num_iters=20, num_warmup=3)
+            kernel_us[_name] = _us
+        us1 = kernel_us.get("stage1")
+        us2_stage = kernel_us.get("stage2")
+        if not kernel_us:
+            logging.warning(
+                "kernel_bench: no kernels captured (non-2stage/1stage path?) (quant:%s)",
+                AQDType,
+            )
+        else:
+            logging.info(
+                "kernel_bench: stage1=%s us, stage2=%s us (quant:%s)",
+                "n/a" if us1 is None else f"{us1:.2f}",
+                "n/a" if us2_stage is None else f"{us2_stage:.2f}",
+                AQDType,
+            )
+        return {
+            "us": (us1 or 0.0) + (us2_stage or 0.0),
+            "us_stage1": us1,
+            "us_stage2": us2_stage,
+        }
+
+    out2_ck, us2 = run_perftest(
+        fused_moe,
+        input,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
         num_iters=5,
         num_warmup=2,
+        **_fused_moe_kwargs,
     )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
@@ -428,9 +475,6 @@ def test_fmoe(
         )
 
     return {"us": us2, "logits_diff": float(logits_diff)}
-
-
-test_fmoe_with_aot_cache_check = fail_on_aot_cache_miss(_aiter_mk)(test_fmoe)
 
 
 l_quant = [
@@ -586,8 +630,16 @@ parser.add_argument(
     "--swiglu-limit",
     "-sl",
     type=float,
-    default=0.0,
-    help="Limit the number of experts for swiglu activation type. Default is 0.0.",
+    default=None,
+    help="swiglu/silu clamp limit. Default None means the kernel default (7.0).",
+)
+parser.add_argument(
+    "--kernel",
+    action="store_true",
+    help="""Time the stage1 / stage2 kernels in isolation (loop each launch
+    alone, excluding input prep) and report them as us_stage1 / us_stage2.
+    Only the 2-stage path exposes per-kernel launches; the 1-stage path reports
+    n/a.""",
 )
 
 args = parser.parse_args()
@@ -652,6 +704,9 @@ def _row_to_kwargs(row):
         hidden_pad=0,
         intermediate_pad=0,
         preshuffle=True,
+        swiglu_limit=_effective_swiglu_limit(
+            q_type, aq_dtype, wq_dtype, args.swiglu_limit
+        ),
     )
 
 
@@ -726,7 +781,7 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
         return swiglu_limit
-    return 0.0
+    return None
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
@@ -781,6 +836,9 @@ def _iter_legacy_cases():
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
+            swiglu_limit=_effective_swiglu_limit(
+                quant_type, aq_dtype, wq_dtype, args.swiglu_limit
+            ),
             **over,
         )
 
@@ -908,12 +966,6 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    swiglu_limit = _effective_swiglu_limit(
-        kwargs["qType"],
-        kwargs["AQDType"],
-        kwargs["WQDType"],
-        args.swiglu_limit,
-    )
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     _force_moe_bound_zero = (
         kwargs["qType"],
@@ -923,12 +975,11 @@ for kwargs, extras in case_iter:
     if _force_moe_bound_zero:
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     try:
-        run_test_fmoe = (
-            test_fmoe_with_aot_cache_check
-            if kwargs.get("check_aot_cache", False)
-            else test_fmoe
+        aot_guard = (
+            run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
         )
-        ret = run_test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+        with aot_guard:
+            ret = test_fmoe(**kwargs, kernel_bench=args.kernel)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
