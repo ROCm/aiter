@@ -60,6 +60,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
     )
+    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", -1))
 
     def __init__(
         self,
@@ -277,10 +278,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         can_use_custom_ar = (
             ca_comm is not None and not ca_comm.disabled and can_use_fuse_ar_rms
         )
+        total_bytes_limit = (
+            self._ar_1stage_max_kb
+            if self._ar_1stage_max_kb >= 0
+            else 128 * 7168 * 2 // self.world_size
+        )
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else (total_bytes * self.world_size <= 128 * 7168 * 2)
+            else (total_bytes <= total_bytes_limit)
         )
         if (
             not use_general_path
@@ -380,6 +386,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         quant_type="per_token",
         group_size=128,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
         if quant_type == "per_group":
@@ -391,6 +398,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group_size=group_size,
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
             )
         if quant_type == "mxfp4":
             return self.fused_allreduce_rmsnorm_mxfp4_quant(
@@ -403,16 +411,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
         if emit_bf16:
             raise ValueError("emit_bf16 is not supported for per-token FP8 quant")
-        total_bytes = input_.numel() * input_.element_size()
+        hidden_dim = int(input_.shape[-1])
+        element_size = input_.element_size()
+        total_bytes = input_.numel() * element_size
         if (
-            int(input_.shape[-1]) in [512, 1024, 2048, 4096]
+            (
+                hidden_dim in [512, 1024, 2048, 4096]
+                or (
+                    hidden_dim == 7168
+                    and input_.dtype in (torch.float16, torch.bfloat16)
+                )
+            )
             and total_bytes <= 4096 * 1024
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
+            total_bytes_limit = (
+                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+            )
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else (total_bytes <= total_bytes_limit)
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
@@ -437,6 +456,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         group_size=128,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         """Fused AR+RMSNorm+per-group FP8 quant, optionally also emitting the
         pre-quantization bf16/fp16 normed output.
@@ -458,10 +478,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and self.world_size != 6
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
+            total_bytes_limit = (
+                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+            )
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else (total_bytes <= total_bytes_limit)
             )
             try:
                 result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
@@ -472,12 +495,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     group_size,
                     use_1stage,
                     emit_bf16=emit_bf16,
+                    transpose_scale=transpose_scale,
                 )
-                if emit_bf16:
-                    out, res_out, scale_out, bf16_out = result
-                else:
-                    out, res_out, scale_out = result
-                fused_ok = True
+                if result is not None:
+                    if emit_bf16:
+                        out, res_out, scale_out, bf16_out = result
+                    else:
+                        out, res_out, scale_out = result
+                    fused_ok = True
             except Exception:
                 pass
         if not fused_ok:
@@ -485,7 +510,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 input_, res_inp_, weight_, eps, prefill_support
             )
             hip_quant = get_hip_quant(QuantType.per_1x128)
-            out, scale_out = hip_quant(out_, quant_dtype=fp8)
+            # The fused path and the registered op's fake return the per-group
+            # scale in column-major (1, M) layout (stride (1, M)) when
+            # transpose_scale=True. per_group_quant_hip cannot produce that
+            # stride directly (with transpose_scale=True it returns a contiguous
+            # (M, num_groups) buffer with SHUFFLED bytes -- a different physical
+            # arrangement). So compute the plain row-major scale and, when
+            # transpose_scale is requested, copy its values into a genuinely
+            # column-major (1, M)-strided tensor so the runtime stride/values
+            # match the fake (otherwise torch.compile's assert_size_stride fails
+            # or the GEMM reads the wrong layout).
+            out, scale_row = hip_quant(out_, quant_dtype=fp8, transpose_scale=False)
+            if transpose_scale:
+                M, num_groups = scale_row.shape
+                scale_out = torch.empty(
+                    (num_groups, M), dtype=scale_row.dtype, device=scale_row.device
+                ).transpose(0, 1)
+                scale_out.copy_(scale_row)
+            else:
+                scale_out = scale_row
             if emit_bf16:
                 bf16_out = out_
         assert out is not None

@@ -11,7 +11,7 @@ the JIT path hits the cache instead of compiling again.
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h kernels |
-| `common.py` | — | Shared job collection / process pool / cache-hit checking logic |
+| `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
 
@@ -65,7 +65,10 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 | --- | --- | --- |
 | `AITER_AOT_IMPORT` | Set to `1` so `import aiter` only loads the lightweight JIT core and skips the full top-level op namespace — faster and avoids heavy import side effects during AOT compilation (this is what `setup.py` sets while pre-compiling). | `0` |
 | `FLYDSL_RUNTIME_CACHE_DIR` | Cache directory | `~/.flydsl/cache` |
-| `AITER_FLYDSL_AOT_WORKERS` | Process-pool concurrency (each worker uses ~1.5–2.5 GB RSS; lower it on memory-tight containers) | `min(available CPUs, 64)` |
+| `AITER_FLYDSL_AOT_WORKERS` | Max concurrent worker processes. Set explicitly to honor it verbatim (bypasses the memory cap below); `0`/negative clamps to 1. Each worker uses ~1.5–2.5 GB RSS. | `min(affinity-aware CPUs, 64)`, then capped by available memory |
+| `AITER_FLYDSL_AOT_MEM_PER_WORKER_GB` | Assumed GiB/worker for the **auto memory cap** that keeps the OOM-killer from firing. Only applies when `AITER_FLYDSL_AOT_WORKERS` is **not** set; `0` disables the cap. | `2.0` |
+| `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
+| `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
 | `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
 
@@ -121,6 +124,29 @@ python op_tests/test_moe_2stage.py
   compile; stdout has per-kernel diagnostics. The exception message inlines at
   most 10 entries (`_MAX_ERRORS_IN_MSG` in `common.py`), the rest are elided as
   `(... N more)`.
-- **Worker OOM / killed**: lower `AITER_FLYDSL_AOT_WORKERS`.
+- **Every kernel fails with the same error** (e.g. `'ArithValue' object has no
+  attribute 'ir_value'`): this is a **FlyDSL version mismatch**, not a per-kernel
+  problem. Check the *imported* FlyDSL:
+  ```bash
+  python -c "import flydsl, os; print(flydsl.__version__, os.path.dirname(flydsl.__file__))"
+  ```
+  If the version is older than the project's `FLYDSL_VERSION` (top-level
+  `setup.py`), a stale build is winning on `PYTHONPATH`. Either `pip install` the
+  matching version *and* drop the shadowing entry from `PYTHONPATH`, or rebuild
+  your local FlyDSL checkout (`scripts/build.sh`, after `pip install
+  nanobind==2.12.0` if CMake reports it missing) so the on-`PYTHONPATH` build dir
+  is refreshed to the right version.
+- **Worker OOM / killed (exitcode -9)**: abnormal exits are auto-retried
+  (`AITER_FLYDSL_AOT_MAX_RETRIES`) and the default worker count is already
+  memory-capped (`AITER_FLYDSL_AOT_MEM_PER_WORKER_GB`). If it still happens,
+  lower `AITER_FLYDSL_AOT_WORKERS` or raise the assumed GiB/worker.
+- **A kernel hangs / never finishes**: it is killed once it exceeds
+  `AITER_FLYDSL_AOT_TIMEOUT` (default 1200 s) and then retried. Lower the timeout
+  to fail faster, or raise it for genuinely slow kernels.
+- **`hipModuleLoadData ... hipErrorNoBinaryForGpu` printed but the kernel still
+  shows `[OK]`**: expected when AOT-compiling for an arch that is **not** the
+  machine's GPU (e.g. building `gfx950` artifacts on a different card). MLIR
+  compilation and the cache write succeed; only the *load* step fails, which AOT
+  does not need. It is noise, not a failure.
 - **Step 2 reports a cache miss**: confirm step 1 actually ran, the cache dir and
   arch match, and the CSV config hasn't changed.
