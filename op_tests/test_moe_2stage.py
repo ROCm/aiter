@@ -486,12 +486,7 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {
-        "us": us2,
-        "logits_diff": float(logits_diff),
-        "us_stage1": None,
-        "us_stage2": None,
-    }
+    return {"us": us2, "logits_diff": float(logits_diff)}
 
 
 l_quant = [
@@ -651,8 +646,7 @@ parser.add_argument(
     help="swiglu/silu clamp limit. Default None means the kernel default (7.0).",
 )
 parser.add_argument(
-    "--kernel-bench",
-    "-kb",
+    "--kernel",
     action="store_true",
     help="""Time the stage1 / stage2 kernels in isolation (loop each launch
     alone, excluding input prep) and report them as us_stage1 / us_stage2.
@@ -997,7 +991,7 @@ for kwargs, extras in case_iter:
             run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
         )
         with aot_guard:
-            ret = test_fmoe(**kwargs, kernel_bench=args.kernel_bench)
+            ret = test_fmoe(**kwargs, kernel_bench=args.kernel)
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
