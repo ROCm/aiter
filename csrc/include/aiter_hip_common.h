@@ -240,9 +240,7 @@ class AiterAsmKernelFast
 
         if(kargs.cluster_x > 1 || kargs.cluster_y > 1 || kargs.cluster_z > 1)
         {
-            // Cluster launch: blocks are grouped into clusters of the given dims.
-            // Each cluster dim must evenly divide the matching grid dim (enforced
-            // by the caller). Requires gfx1250+ and a cluster-aware kernel.
+#ifdef AITER_ENABLE_CLUSTER_LAUNCH
             hipLaunchAttribute attrs[1];
             attrs[0].id              = hipLaunchAttributeClusterDimension;
             attrs[0].val.clusterDim.x = static_cast<unsigned int>(kargs.cluster_x);
@@ -264,6 +262,17 @@ class AiterAsmKernelFast
             HIP_CALL_LAUNCH(
                 hipDrvLaunchKernelEx(&launch_config, kernel_func, nullptr, (void**)&config));
             return;
+#else
+            // Cluster dims were requested at runtime, but this build was compiled
+            // without cluster launch support. Fail loudly rather than silently
+            // dropping the cluster configuration (which would launch a plain grid
+            // and produce wrong results for a cluster-aware kernel).
+            AITER_CHECK(false,
+                        "workgroup-cluster launch requested (cluster=",
+                        kargs.cluster_x, "x", kargs.cluster_y, "x", kargs.cluster_z,
+                        ") but this build lacks cluster support; rebuild with "
+                        "AITER_ENABLE_CLUSTER_LAUNCH on gfx1250+ / HIP >= 7.0");
+#endif
         }
 
         HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,

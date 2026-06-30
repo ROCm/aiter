@@ -876,7 +876,7 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
-        if get_gfx() == "gfx1250" and hip_version >= Version("7.14.0"):
+        if get_gfx() == "gfx1250" and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
 
         if not torch_exclude:
