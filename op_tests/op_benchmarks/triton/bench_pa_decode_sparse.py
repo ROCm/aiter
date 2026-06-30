@@ -72,16 +72,16 @@ _RTOL = 5e-3
 
 DSV4_SHAPES = [
     # (label,       T,    H,    D,   kv_len)
-    ("T1-k2k",      1,  128,  576,   2048),
-    ("T4-k2k",      4,  128,  576,   2048),
-    ("T16-k2k",    16,  128,  576,   2048),
-    ("T32-k2k",    32,  128,  576,   2048),
-    ("T64-k2k",    64,  128,  576,   2048),
-    ("T128-k2k",  128,  128,  576,   2048),
-    ("T256-k2k",  256,  128,  576,   2048),
-    ("T32-k1k",    32,  128,  576,   1024),
-    ("T32-k4k",    32,  128,  576,   4096),
-    ("T32-k8k",    32,  128,  576,   8192),
+    ("T1-kv2k",      1,  128,  576,   2048),
+    ("T4-kv2k",      4,  128,  576,   2048),
+    ("T16-kv2k",    16,  128,  576,   2048),
+    ("T32-kv2k",    32,  128,  576,   2048),
+    ("T64-kv2k",    64,  128,  576,   2048),
+    ("T128-kv2k",  128,  128,  576,   2048),
+    ("T256-kv2k",  256,  128,  576,   2048),
+    ("T32-kv1k",    32,  128,  576,   1024),
+    ("T32-kv4k",    32,  128,  576,   4096),
+    ("T32-kv8k",    32,  128,  576,   8192),
 ]
 
 _FP8_DTYPE = torch.float8_e4m3fnuz
@@ -420,7 +420,7 @@ def parse_args():
     p.add_argument("--D",      type=int, default=None, help="Head dimension")
     p.add_argument("--kv_len", type=int, default=None, help="KV slots per token")
 
-    p.add_argument("--backend", choices=["triton", "flydsl", "both"], default="triton",
+    p.add_argument("--backend", choices=["triton", "flydsl", "both"], default="both",
                    help="Kernel backend to benchmark (default: triton)")
 
     p.add_argument("--block_k",   type=int, default=0,
