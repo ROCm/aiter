@@ -564,6 +564,11 @@ class GroupCoordinator:
         emit_bf16: bool = False,
         gemma_norm: bool = False,
     ):
+        from aiter.dist.device_communicators.communicator_cuda import (
+            _normalize_fused_ar_rms_quant_type,
+        )
+
+        quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
         if quant_type == "per_token" and group_size == 128 and not emit_bf16:
             return fused_allreduce_rmsnorm_quant_(
                 input_,
