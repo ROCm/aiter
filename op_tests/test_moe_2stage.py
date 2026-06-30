@@ -259,9 +259,9 @@ def test_fmoe(
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif (
         qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.fp4x2])
+        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4 / a8w4 / a4w4 — all use the gate-up-interleaved a16w4 weight layout
+    ):  # a16w4 / a8w4
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
@@ -728,13 +728,10 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
-    # mxfp4 weights (a4w4/a8w4/a16w4) run the gate/up-interleaved (guinterleave)
-    # layout, matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime
-    # weight-layout property (not a tuned-config key); request INTERLEAVE here so
-    # op_tests exercise the a4w4 FlyDSL port's interleave variant. Include fp4x2
-    # activations (true a4w4) so they reach the port instead of the separated
-    # default.
-    if aq_dtype in [dtypes.fp8, dtypes.bf16, dtypes.fp4x2] and wq_dtype == dtypes.fp4x2:
+    # a16w4/a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
+    # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
+    # property (not a tuned-config key); request INTERLEAVE here for them.
+    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
     if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
