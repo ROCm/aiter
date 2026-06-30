@@ -201,7 +201,7 @@ def _moe_gemm_a4w4_gfx1250(
     )
 
     NUM_LOADS_IN_BATCH: gl.constexpr = 4 if X_SCALES_TDM else 3
-    gl.static_assert(NUM_BUFFERS >= 3, "NUM_BUFFERS must be at least 3")
+    gl.static_assert(NUM_BUFFERS >= 1, "NUM_BUFFERS must be at least 1")
 
     w_type: gl.constexpr = W.dtype.element_ty
     gl.static_assert(w_type == gl.uint8, "Weights must be uint8")
@@ -267,6 +267,7 @@ def _moe_gemm_a4w4_gfx1250(
         offs_x_m = PACKED_BLOCK_M_X * block_id + gl.arange(
             0, PACKED_BLOCK_M_X, layout=GATHER_IDX_LAYOUT
         )
+        offs_x_m = offs_x_m % M
         GatherIndx += start_m
         offs_x_m = gl.amd.gfx1250.buffer_load(GatherIndx, offs_x_m) // N_EXPTS_ACT
 
