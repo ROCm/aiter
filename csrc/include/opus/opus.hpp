@@ -1721,11 +1721,34 @@ OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned in
 #define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 0
 #endif
 
+// __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_{f32,v2f16} (opaque rsrc) only exist on clang>=22 / ROCm>=7.2; __has_builtin picks the builtin where present, else the __asm LLVM-intrinsic fallback (i32x4 rsrc, below) -- no -D flag or version literal needed.
+#ifndef OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_raw_ptr_buffer_atomic_fadd_f32)
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN 1
+#else
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN 0
+#endif
+#endif
+#ifndef OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16)
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN 1
+#else
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN 0
+#endif
+#endif
+
 // No clang builtin for these (only global/flat/ds, never raw_(ptr_)buffer), so each binds the LLVM IR int_amdgcn_raw_buffer_atomic_* via __asm under one -Wundefined-inline silence; rsrc is the i32x4 form (memcpy'd, non-copyable): fadd.v2bf16=packed bf16 add, cmpswap.i32=32-bit CAS (emulates pk fadd where unsupported), add.i32=i32 add (aux drives returning-bit+scope).
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wundefined-inline"
 #if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
 OPUS_D bf16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(bf16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2bf16");
+#endif
+// fadd.f32 / fadd.v2f16 __asm fallbacks for toolchains without the raw_ptr builtins (clang < 22).
+#if OPUS_HAS_BUFFER_ATOMIC_FADD_F32 && !OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+OPUS_D fp32_t llvm_amdgcn_raw_buffer_atomic_fadd_f32(fp32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.f32");
+#endif
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 && !OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+OPUS_D fp16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(fp16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2f16");
 #endif
 OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(i32_t src, i32_t cmp, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.cmpswap.i32");
 OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_add_i32(i32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i32");
@@ -1867,11 +1890,21 @@ struct gmem {
         if constexpr (std::is_same_v<scalar_type, fp32_t> && total == 1) {
             static_assert(OPUS_HAS_BUFFER_ATOMIC_FADD_F32, "buffer_atomic_add f32 not supported on this arch");
 #if OPUS_HAS_BUFFER_ATOMIC_FADD_F32
+#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
             return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_f32(__builtin_bit_cast(fp32_t, x), cached_rsrc, vo, s_os, aux));
+#else
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_f32(__builtin_bit_cast(fp32_t, x), rsrc_, vo, s_os, aux));
+#endif
 #endif
         } else if constexpr (std::is_same_v<scalar_type, fp16_t> && total == 2) {
 #if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16
+#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
             return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16(__builtin_bit_cast(fp16x2_t, x), cached_rsrc, vo, s_os, aux));
+#else
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(__builtin_bit_cast(fp16x2_t, x), rsrc_, vo, s_os, aux));
+#endif
 #else
             return __builtin_bit_cast(type, _atomic_pk_add_cas(__builtin_bit_cast(fp16x2_t, x), vo, s_os, aux));
 #endif
@@ -2425,9 +2458,13 @@ struct tdm_window {
         extent0=o0+td0; extent1=o1+td1; materialize_desc_initial();
     }
 
-    // -DOPUS_TDM_BUILTIN_HAS_SG_EXTRA=1 → 6-operand tensor_load_to_lds (newer/patched llvm); default = 5-operand (CI llvm).
+    // 6-operand tensor_load_to_lds (clang>=23 / ROCm>=7.14) vs 5-operand (older); auto-detected from clang version, predefine OPUS_TDM_BUILTIN_HAS_SG_EXTRA=0/1 to override.
 #ifndef OPUS_TDM_BUILTIN_HAS_SG_EXTRA
-#define OPUS_TDM_BUILTIN_HAS_SG_EXTRA 0
+#  if defined(__clang_major__) && (__clang_major__ >= 23)
+#    define OPUS_TDM_BUILTIN_HAS_SG_EXTRA 1
+#  else
+#    define OPUS_TDM_BUILTIN_HAS_SG_EXTRA 0
+#  endif
 #endif
 #if OPUS_TDM_BUILTIN_HAS_SG_EXTRA
 #define OPUS_TDM_SG_EXTRA_ARG , impl::tdm_sg_extra_vec{0, 0, 0, 0, 0, 0, 0, 0}

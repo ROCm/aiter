@@ -218,6 +218,11 @@ def _gfx1250_select_candidates(
             best = c if best is None else min(best, c)
         return best if best is not None else float("inf")
 
+    # prev_m = lower edge of the runtime reuse bucket (prev_m, M]; a winner tuned at M
+    # is reused down to prev_m, so an M-cluster must stay full across that whole bucket.
+    # Computed directly as M // 2.
+    prev_m = max(1, M // 2)
+
     tiles = sorted(GFX1250_PLAIN_KID_OF.keys(), key=lambda t: _tile_score(*t))
     sel = set()
     for t in tiles[:top_tiles]:
@@ -225,25 +230,21 @@ def _gfx1250_select_candidates(
         bm, bn, bk = t
         gx = _ceil_div(M, bm)
         gy = _ceil_div(N, bn)
-        # Cluster M-extent + cwm cap (bucket-safety). A clusterlaunch kid groups cwm
+        # M-direction cluster (cwm) admission. A clusterlaunch kid groups cwm
         # workgroups along M (spanning cwm*B_M rows) and the host rounds the M grid up
-        # to a multiple of cwm. A winner tuned at this M is reused for the whole
-        # M-bucket down to prev_m (the previous bucket's representative M), so it must
-        # keep ALL WGs busy across that bucket -- no idle OOB M-tiles for the smallest
-        # bucket M. Two rules:
-        #   1) cwm <= 3 -- cwm=4 over-rounds the M grid on non-multiple M (e.g. c4x1,
-        #      B_M=32, only cluster-fills at M multiple of 128, leaving idle WGs for
-        #      M=129..255 when reused for the M=256 bucket).
-        #   2) B_M*(cwm-1) <= prev_m -- the cluster's M-span must start within the
-        #      previous bucket so even the smallest bucket M keeps every cluster tile
-        #      in-bounds. cwm==1 always passes (B_M*0 <= prev_m). The boundary is
-        #      inclusive: e.g. M=64 (prev_m=32) admits cwm=3 with B_M=16 (16*2=32).
-        # prev_m = largest power-of-two strictly below M (the bucket lower edge:
-        # e.g. M=256 -> 128, M=128 -> 64).
-        prev_m = 1 << (M.bit_length() - 1)
-        if prev_m >= M:
-            prev_m >>= 1
-        prev_m = max(1, prev_m)
+        # to a multiple of cwm; a winner tuned at M is reused for the whole bucket
+        # (prev_m, M], so it must stay FULL (every cluster WG fed) for every M in that
+        # bucket -- otherwise the round-up idles half a cluster for the smaller M. Two
+        # reject rules:
+        #   1) cwm >= 3 -- dropped entirely (over-rounds the M grid badly).
+        #   2) M > 128 -- prohibit M-direction clusters (cwm>=2) entirely. For larger M
+        #      the runtime reuse bucket is wide and many c2x1 configs leave half a
+        #      cluster idle/unlaunched across it; only cwm==1 (no M-cluster) is allowed.
+        #   3) Not full across (prev_m, M]: ceil(m/B_M) must be the SAME multiple-of-cwm
+        #      value for every m in (prev_m, M]. Two consecutive tile-counts can never
+        #      both be multiples of cwm>=2, so this collapses to a single tile-count:
+        #          ceil((prev_m+1)/B_M) == ceil(M/B_M)  (== gx)
+        #      combined with gx % cwm == 0 below. cwm==1 (no M-cluster) is exempt.
         # 2D-cluster lockout: only DEGENERATE clusters (cwm==1 or cwn==1) are tuned.
         # Full 2D clusters (cwm>1 && cwn>1) GPU-hang at runtime on gfx1250 (verified
         # c4x2 / c2x4 / c4x4 / c2x2 at M=128 N=128 K=2880), and the hang is NOT fixed
@@ -256,8 +257,9 @@ def _gfx1250_select_candidates(
             if (tbm, tbn, tbk) == t
             and gx % cwm == 0
             and gy % cwn == 0
-            and cwm <= 3
-            and bm * (cwm - 1) <= prev_m
+            and cwm <= 2
+            and (cwm == 1 or M <= 128)
+            and (cwm == 1 or _ceil_div(prev_m + 1, bm) == gx)
             and (cwm == 1 or cwn == 1)
         ]
         feas.sort(
