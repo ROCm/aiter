@@ -224,11 +224,89 @@ class TunerCommon:
             default=defaults.get("min_improvement_pct", 3.0),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
+        self.parser.add_argument(
+            "--tune_tie_break_rel_tol",
+            type=float,
+            default=0.0,
+            help="When picking the per-shape top-1 kernel, treat any two "
+            "candidates whose us are within this relative tolerance as tied "
+            "and break the tie by smaller kernelId. Stabilizes picks across "
+            "repeated multi-GPU tune runs when many candidates have very "
+            "close timings (common on a8w8_bpreshuffle). Default 0 = off "
+            "(strict us ordering, current behavior). Recommended: 0.02.",
+        )
+        self.parser.add_argument(
+            "--auto_group_small_m",
+            type=int,
+            default=0,
+            help="Hybrid batching: when >0, shapes with M <= this value are "
+            "tuned with shape_grouped=True (one shape's kernels back-to-back "
+            "on one GPU -- stabilizes small-shape picks at ~10pct extra "
+            "wallclock on that batch only), while larger shapes keep the "
+            "global --shape_grouped setting (default False, which is faster "
+            "for large shapes). Default 0 = off. Recommended pairing: "
+            "--auto_group_small_m 64 --tune_tie_break_rel_tol 0.02.",
+        )
+        self.parser.add_argument(
+            "--fast_tune",
+            action="store_true",
+            default=False,
+            help="During multi-process tuning, skip the reference computation "
+            "and accuracy comparison entirely (every kernel gets err_ratio=0). "
+            "Removes all checkAllclose-related GPU/CPU syncs from the tune hot "
+            "path, which is the cleanest setting for multi-GPU timing accuracy. "
+            "MUST be combined with --post_verify, otherwise the picked kernel "
+            "has no correctness guarantee.",
+        )
+        self.parser.add_argument(
+            "--post_verify",
+            action="store_true",
+            default=False,
+            help="After tuning, re-run each shape's top-1 picked kernel serially "
+            "on a single GPU and apply a strict per-element relative-error check. "
+            "On failure, demote and fall through to top-2/3. Catches wide-range "
+            "output errors that the tuner hot path's global max-magnitude "
+            "heuristic misses, without perturbing multi-GPU timing accuracy.",
+        )
+        self.parser.add_argument(
+            "--post_verify_slack_tol",
+            type=float,
+            default=10.0,
+            help="With --post_verify, maximum allowed per-element ratio of "
+            "|a-b| / (atol + rtol*|b|) -- i.e. how many times past the "
+            "kernel's own tune-time isclose tolerance the worst element is "
+            "allowed to be. 1.0 == exactly at tune tolerance; 10.0 (default) "
+            "== 10x past, the conventional catastrophic threshold. Anchoring "
+            "to (atol + rtol*|b|) avoids the small-|b| false-positive of "
+            "naive |a-b|/|b|.",
+        )
+        self.parser.add_argument(
+            "--post_verify_max_fallback",
+            type=int,
+            default=3,
+            help="With --post_verify, maximum number of top-N candidates to "
+            "verify per shape before giving up (default 3).",
+        )
+        self.parser.add_argument(
+            "--post_verify_iters",
+            type=int,
+            default=1,
+            help="With --post_verify, how many times to re-execute each "
+            "candidate; the median slack across iters is compared to "
+            "--post_verify_slack_tol. Default 1 (cheapest); 3 or 5 makes "
+            "borderline accept/demote decisions reproducible across "
+            "experiment repeats at linear cost.",
+        )
 
     def parse_args(self):
         args = self.parser.parse_args()
         if args.update_improved and not args.compare:
             self.parser.error("--update_improved requires --compare")
+        if args.fast_tune and not args.post_verify:
+            self.parser.error(
+                "--fast_tune requires --post_verify (without verification the "
+                "picked kernel has no correctness guarantee)"
+            )
         return args
 
     @abstractmethod
@@ -447,6 +525,39 @@ class TunerCommon:
     def get_gfx(self):
         return _chip_get_gfx()
 
+    def _build_batch_plan(self, args, batch_size):
+        """Return a list of (batch_df, shape_grouped_override).
+
+        Default: naive contiguous slices of self.untunedf, override=None
+        (use args.shape_grouped unchanged).
+
+        Hybrid batching (--auto_group_small_m N > 0): partition shapes into
+        small (M <= N) and rest (M > N); small batches force
+        shape_grouped=True (stabilizes small-shape picks cheaply), rest
+        batches keep args.shape_grouped. Small and rest never share a batch.
+        """
+        df = self.untunedf
+        auto_m = getattr(args, "auto_group_small_m", 0) or 0
+
+        def _slice(d, override):
+            return [
+                (d.iloc[i : i + batch_size].reset_index(drop=True), override)
+                for i in range(0, len(d), batch_size)
+            ]
+
+        if auto_m > 0 and "M" in df.columns:
+            small = df[df["M"] <= auto_m].reset_index(drop=True)
+            rest = df[df["M"] > auto_m].reset_index(drop=True)
+            plan = _slice(small, True) + _slice(rest, args.shape_grouped)
+            if getattr(args, "verbose", False):
+                logger.info(
+                    f"[auto_group_small_m={auto_m}] small(M<={auto_m})="
+                    f"{len(small)} shapes -> shape_grouped=True; "
+                    f"rest={len(rest)} shapes -> shape_grouped={args.shape_grouped}"
+                )
+            return plan
+        return _slice(df, None)
+
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
         rets = list(rets)
@@ -473,9 +584,23 @@ class TunerCommon:
 
         grouped_results = list(grouped_rets.items())
 
+        tie_rel_tol = getattr(args, "tune_tie_break_rel_tol", 0.0) or 0.0
         for info_key, time_list in grouped_results:
             tol_err_ratio = args.errRatio
             sorted_time = sorted(time_list, key=lambda x: x[1])
+            # Stability against multi-GPU timing noise: among kernels within
+            # `tie_rel_tol` of the best us, deterministically prefer the
+            # smaller kernelId so consecutive tune runs converge on the same
+            # pick rather than flipping between noise-equivalent kernels.
+            # info_ex[0] is the kernelId in every current tune script.
+            if tie_rel_tol > 0 and sorted_time:
+                best_us = next((us for _, us, _ in sorted_time if us > 0), None)
+                if best_us is not None and best_us > 0:
+                    cutoff = best_us * (1.0 + tie_rel_tol)
+                    near_best = [t for t in sorted_time if 0 < t[1] <= cutoff]
+                    rest = [t for t in sorted_time if not (0 < t[1] <= cutoff)]
+                    near_best.sort(key=lambda t: (t[0][0], t[1]))
+                    sorted_time = near_best + rest
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio)
                 for info_ex, us, max_err_ratio in sorted_time
@@ -1390,7 +1515,11 @@ class TunerCommon:
             )
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
-        total_batches = (len(self.untunedf) + batch_size - 1) // batch_size
+        # Build the batch plan as a list of (batch_df, shape_grouped_override).
+        # shape_grouped_override is None to use args.shape_grouped unchanged,
+        # or a bool to force grouping for that batch (hybrid batching).
+        batch_plan = self._build_batch_plan(args, batch_size)
+        total_batches = len(batch_plan)
         compare_report_file = self._init_compare_report(
             args, output_file, batch_size, total_batches
         )
@@ -1412,9 +1541,14 @@ class TunerCommon:
         self.tune_start_time = time.time()
         tuning_status = "Finished"
         try:
-            for i in range(0, len(self.untunedf), batch_size):
-                batch = self.untunedf.iloc[i : i + batch_size].reset_index(drop=True)
+            for batch, sg_override in batch_plan:
                 processed_batches += 1
+                # Hybrid batching: temporarily override shape_grouped for this
+                # batch (small shapes -> grouped). tune() reads args.shape_grouped,
+                # so set/restore it around the call. None = leave as-is.
+                _saved_sg = args.shape_grouped
+                if sg_override is not None:
+                    args.shape_grouped = sg_override
                 batch_pre_tune_results = None
                 if args.compare:
                     batch_header = f"=== Running pre-tune benchmark (batch {processed_batches}/{total_batches}) ==="
@@ -1427,6 +1561,8 @@ class TunerCommon:
                         print_results=args.verbose,
                     )
                 all_results = self.tune(batch, self.tunedf, args)
+                # Restore global shape_grouped now that tune() has consumed it.
+                args.shape_grouped = _saved_sg
                 if all_results:
                     results = self.post_process(all_results, args, topk)
                     if args.compare:

@@ -149,8 +149,18 @@ def worker(
     return info, us, round(max_err_ratio, 4)
 
 
-def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
-    """Work group that processes a batch of related tasks."""
+def work_group(
+    GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False, skip_compare=False
+):
+    """Work group that processes a batch of related tasks.
+
+    skip_compare=True forces ref=None into the worker so the entire
+    reference computation and accuracy comparison are skipped, leaving
+    only the kernel timing measurement. This is intended for use with
+    a downstream post-tune verification pass (see post_verify.py); on
+    its own it produces results with err_ratio=0 for every successful
+    kernel and must NOT be used to pick a final kernel directly.
+    """
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
     (
@@ -178,16 +188,19 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         else input_data
     )
 
-    assert ref_func is not None or ref is not None or fast_mode != 0
-    # ref=None & ref_func=None & fast_mode=1: fast tune, not compare results, do not postprocess,return all results
-    # ref=None & fast_mode=0: ref_func should be given and return best result
-    # (ref!=None | ref_func!=None) & fast_mode=1: compare results and return all results, but do not postprocess
-    # (ref!=None | ref_func!=None) & fast_mode=0: return best result, postprocess
-    if ref is None and not fast_mode or (ref_func is not None and fast_mode):
-        ref_data_keys, *rest = ([], *ref_args) if not data else ref_args
-        updated_ref_args = tuple(data[k] for k in ref_data_keys) + tuple(rest)
-        ref = ref_func(*updated_ref_args, **ref_kwargs)
-        torch.cuda.synchronize()
+    if skip_compare:
+        ref = None
+    else:
+        assert ref_func is not None or ref is not None or fast_mode != 0
+        # ref=None & ref_func=None & fast_mode=1: fast tune, not compare results, do not postprocess,return all results
+        # ref=None & fast_mode=0: ref_func should be given and return best result
+        # (ref!=None | ref_func!=None) & fast_mode=1: compare results and return all results, but do not postprocess
+        # (ref!=None | ref_func!=None) & fast_mode=0: return best result, postprocess
+        if ref is None and not fast_mode or (ref_func is not None and fast_mode):
+            ref_data_keys, *rest = ([], *ref_args) if not data else ref_args
+            updated_ref_args = tuple(data[k] for k in ref_data_keys) + tuple(rest)
+            ref = ref_func(*updated_ref_args, **ref_kwargs)
+            torch.cuda.synchronize()
 
     try:
         # Retrieve GPU ID from the map
@@ -233,7 +246,9 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 else args
             )
 
-            if ref_noused is not None:
+            if skip_compare:
+                ref = None
+            elif ref_noused is not None:
                 ref = ref_noused
             else:
                 _cur_key = (id(ref_func), ref_args)
@@ -309,6 +324,7 @@ def mp_tuner(
     err_ratio=0.05,
     timeout=None,
     verbose=False,  # print verbose log
+    skip_compare=False,
 ):
     """Multi-process tuner with GPU fault isolation.
 
@@ -324,6 +340,13 @@ def mp_tuner(
         shape_grouped: Group tasks by shape
         err_ratio: Error tolerance ratio
         timeout: Timeout in seconds for each task group (None = no timeout)
+        skip_compare: If True, the multi-process tune phase skips all
+            reference computation and accuracy comparison and returns only
+            timing measurements (every successful kernel gets err_ratio=0).
+            Intended to be combined with a downstream post-tune
+            verification pass (see ``aiter/utility/post_verify.py``).
+            On its own this mode does NOT guarantee correctness of the
+            picked kernel.
 
     Returns:
         List of (info, latency, error_ratio) tuples
@@ -385,6 +408,7 @@ def mp_tuner(
                     in_datas[ref_data_index[k]],
                     task_group[k],
                     verbose,
+                    skip_compare,
                 ),
             )
             for k in task_indices
