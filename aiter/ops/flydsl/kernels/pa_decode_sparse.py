@@ -386,8 +386,6 @@ def _compile_pa_decode_sparse_mfma(
                 c_zero_v4f32 = arith.constant_vector(0.0, T.f32x4)
                 c_frag = c_zero_v4f32
 
-                qk_a_frags  = []
-                qk_kv_v4s   = []
                 qk_col_offs = []
 
                 for dc in range_constexpr(D_CHUNKS_W):
@@ -411,7 +409,7 @@ def _compile_pa_decode_sparse_mfma(
                     for v in range_constexpr(4):
                         elem = vector.extract(q_v4, static_position=[v], dynamic_position=[])
                         q_vals.append(arith.select(h_valid, elem, c_zero_bf16))
-                    qk_a_frags.append(vector.from_elements(T.vec(4, T.bf16), q_vals))
+                    qk_a_frags = vector.from_elements(T.vec(4, T.bf16), q_vals)
 
                     # KV VRAM → kv_lds[lane_row, col_off:+4]
                     flat_kv = arith.addi(arith.muli(safe_slot_qk, cD_i32), col_off)
@@ -428,12 +426,10 @@ def _compile_pa_decode_sparse_mfma(
                     for v in range_constexpr(4):
                         kv_flat_r = arith.addi(kv_row_base, arith.addi(col_off, arith.constant(v, type=i32)))
                         b_vals_qk.append(lds_kv[fx.Index(kv_flat_r)])
-                    qk_kv_v4s.append(vector.from_elements(T.vec(4, T.bf16), b_vals_qk))
+                    qk_kv_v4s = vector.from_elements(T.vec(4, T.bf16), b_vals_qk)
 
-                # Issue MFMAs after all KV loads (all within same wave — no barrier needed
-                # before reading back what this wave just wrote)
-                for dc in range_constexpr(D_CHUNKS_W):
-                    c_frag = _mfma_bf16(qk_a_frags[dc], qk_kv_v4s[dc], c_frag)
+                    # Execute the MFMA for this D-chunk (per wave, 4x4 output per lane)
+                    c_frag = _mfma_bf16(qk_a_frags, qk_kv_v4s, c_frag)
 
                 # -- Step 3: Write partial QK scores to scores_lds --
                 # c_frag[v] = partial S[head=lane_cgrp*4+v, kv_slot=lane_row] over D/4 columns.
@@ -449,15 +445,18 @@ def _compile_pa_decode_sparse_mfma(
 
                 gpu.barrier()   # scores_lds + kv_lds written by all waves
 
-                # -- Step 4: Cross-wave reduce + softmax (all waves, same result) --
-                # Each lane reads the 4 wave partials for its (head, kv_slot) combination and sums.
-                # scores_lds[w, head, kv_slot] for w=0..3 → full score[head, kv_slot]
-                # Then butterfly max/sum over lane_row dim (xor 1,2,4,8) as in current 1-wave.
+                # -- Steps 4+5: Cross-wave reduce + softmax + p_lds write (fused, per-v) --
+                # Each value v is independent: reduce → softmax → store to p_lds immediately.
+                # Fusing eliminates the c_frag_scaled and p_vals_v4 temporaries and lets
+                # the LDS reads for v+1 issue while v's VALU chain executes.
+                m_new = []
+                alpha = []
+                l_new = []
 
-                c_frag_scaled = []
                 for v in range_constexpr(4):
                     head_idx = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
-                    # Sum 4 wave partials for this (head, kv_slot=lane_row)
+
+                    # Sum N_WAVES partials from scores_lds
                     partial_sum = c_zero_f32
                     for w in range_constexpr(N_WAVES):
                         alias_flat_w = arith.addi(
@@ -465,34 +464,26 @@ def _compile_pa_decode_sparse_mfma(
                             arith.addi(arith.muli(head_idx, cARS_i32), lane_row),
                         )
                         partial_sum = arith.addf(partial_sum, lds_scores[fx.Index(alias_flat_w)], fastmath=fm)
-                    # Scale and gate by validity
-                    partial_scaled = arith.mulf(partial_sum, c_scale_l2, fastmath=fm)
-                    c_frag_scaled.append(arith.select(valid_kv_slot, partial_scaled, c_neg_inf))
+                    s_v = arith.select(valid_kv_slot,
+                                       arith.mulf(partial_sum, c_scale_l2, fastmath=fm),
+                                       c_neg_inf)
 
-                # Online softmax (same as 1-wave: butterfly over lane_row / kv dimension)
-                m_new     = []
-                alpha     = []
-                p_vals_v4 = []
-                sum_p_v   = []
-
-                for v in range_constexpr(4):
-                    s_v = c_frag_scaled[v]
-
-                    # Butterfly max over lane_row (kv) dim within this wave's 64 lanes
+                    # Butterfly max over kv (lane_row) dim
                     s_max_v = s_v
                     for xor_off in [1, 2, 4, 8]:
                         peer    = _to_raw(ArithValue(s_max_v).shuffle_xor(xor_off, BLOCK_THREADS_MFMA))
                         s_max_v = arith.maximumf(s_max_v, peer)
 
-                    m_new_v      = arith.maximumf(m_i[v], s_max_v)
-                    is_all_inf_v = arith.cmpf(CmpFPredicate.OEQ, m_new_v, c_neg_inf)
-                    raw_alpha_v  = _fexp2(arith.subf(m_i[v], m_new_v))
-                    alpha_v      = arith.select(is_all_inf_v, c_one_f32, raw_alpha_v)
+                    m_new_v  = arith.maximumf(m_i[v], s_max_v)
+                    alpha_v  = arith.select(
+                        arith.cmpf(CmpFPredicate.OEQ, m_new_v, c_neg_inf),
+                        c_one_f32, _fexp2(arith.subf(m_i[v], m_new_v)),
+                    )
+                    pj_safe_v = arith.select(valid_kv_slot,
+                                             _fexp2(arith.subf(s_v, m_new_v)),
+                                             c_zero_f32)
 
-                    pj_v      = _fexp2(arith.subf(c_frag_scaled[v], m_new_v))
-                    pj_safe_v = arith.select(valid_kv_slot, pj_v, c_zero_f32)
-
-                    # Butterfly sum_p over lane_row dim
+                    # Butterfly sum_p over kv dim
                     sum_p_vv = pj_safe_v
                     for xor_off in [1, 2, 4, 8]:
                         peer     = _to_raw(ArithValue(sum_p_vv).shuffle_xor(xor_off, BLOCK_THREADS_MFMA))
@@ -500,21 +491,11 @@ def _compile_pa_decode_sparse_mfma(
 
                     m_new.append(m_new_v)
                     alpha.append(alpha_v)
-                    p_vals_v4.append(pj_safe_v)
-                    sum_p_v.append(sum_p_vv)
+                    l_new.append(arith.addf(arith.mulf(l_i[v], alpha_v, fastmath=fm), sum_p_vv, fastmath=fm))
 
-                l_new = []
-                for v in range_constexpr(4):
-                    l_new.append(arith.addf(
-                        arith.mulf(l_i[v], alpha[v], fastmath=fm), sum_p_v[v], fastmath=fm
-                    ))
-
-                # -- Step 5: Write p to p_lds (= scores_lds base) for LDS transpose --
-                # All 4 waves write the same values; redundant writes are harmless.
-                for v in range_constexpr(4):
-                    p_head = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
-                    p_flat = arith.addi(arith.muli(p_head, cARS_i32), lane_row)
-                    lds_p[fx.Index(p_flat)] = p_vals_v4[v]
+                    # Write p to p_lds immediately
+                    p_flat = arith.addi(arith.muli(head_idx, cARS_i32), lane_row)
+                    lds_p[fx.Index(p_flat)] = pj_safe_v
 
                 gpu.barrier()   # p_lds visible for PV
 
@@ -920,10 +901,11 @@ def _compile_pa_decode_sparse_mfma_fp8(
 
                 gpu.barrier()   # scores_lds + kv_lds written by all waves
 
-                # -- Step 4: Cross-wave reduce + softmax --
-                c_frag_scaled = []
+                # -- Steps 4+5: Cross-wave reduce + softmax + p_lds write (fused, per-v) --
+                m_new = []; alpha = []; l_new = []
                 for v in range_constexpr(4):
                     head_idx = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
+
                     ps = c_zero_f32
                     for w in range_constexpr(N_WAVES):
                         wf = arith.addi(
@@ -931,32 +913,23 @@ def _compile_pa_decode_sparse_mfma_fp8(
                             arith.addi(arith.muli(head_idx, cARS_i32), lane_row),
                         )
                         ps = arith.addf(ps, lds_scores[fx.Index(wf)], fastmath=fm)
-                    c_frag_scaled.append(arith.select(valid_kv_slot,
-                        arith.mulf(ps, c_scale_l2, fastmath=fm), c_neg_inf))
+                    sv = arith.select(valid_kv_slot, arith.mulf(ps, c_scale_l2, fastmath=fm), c_neg_inf)
 
-                m_new = []; alpha = []; p_vals_v4 = []; sum_p_v = []
-                for v in range_constexpr(4):
-                    sv = c_frag_scaled[v]
                     smx = sv
                     for xo in [1, 2, 4, 8]:
                         smx = arith.maximumf(smx, _to_raw(ArithValue(smx).shuffle_xor(xo, BLOCK_THREADS_MFMA)))
-                    m_new_v     = arith.maximumf(m_i[v], smx)
-                    is_inf_v    = arith.cmpf(CmpFPredicate.OEQ, m_new_v, c_neg_inf)
-                    alpha_v     = arith.select(is_inf_v, c_one_f32, _fexp2(arith.subf(m_i[v], m_new_v)))
-                    pj_safe_v   = arith.select(valid_kv_slot, _fexp2(arith.subf(sv, m_new_v)), c_zero_f32)
+                    m_new_v  = arith.maximumf(m_i[v], smx)
+                    alpha_v  = arith.select(arith.cmpf(CmpFPredicate.OEQ, m_new_v, c_neg_inf),
+                                            c_one_f32, _fexp2(arith.subf(m_i[v], m_new_v)))
+                    pj_safe_v = arith.select(valid_kv_slot, _fexp2(arith.subf(sv, m_new_v)), c_zero_f32)
                     sp = pj_safe_v
                     for xo in [1, 2, 4, 8]:
                         sp = arith.addf(sp, _to_raw(ArithValue(sp).shuffle_xor(xo, BLOCK_THREADS_MFMA)), fastmath=fm)
                     m_new.append(m_new_v); alpha.append(alpha_v)
-                    p_vals_v4.append(pj_safe_v); sum_p_v.append(sp)
+                    l_new.append(arith.addf(arith.mulf(l_i[v], alpha_v, fastmath=fm), sp, fastmath=fm))
 
-                l_new = [arith.addf(arith.mulf(l_i[v], alpha[v], fastmath=fm), sum_p_v[v], fastmath=fm)
-                         for v in range_constexpr(4)]
-
-                # -- Step 5: Write p to p_lds --
-                for v in range_constexpr(4):
-                    p_head = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
-                    lds_p[fx.Index(arith.addi(arith.muli(p_head, cARS_i32), lane_row))] = p_vals_v4[v]
+                    # Write p to p_lds immediately
+                    lds_p[fx.Index(arith.addi(arith.muli(head_idx, cARS_i32), lane_row))] = pj_safe_v
 
                 gpu.barrier()   # p_lds visible for PV
 
@@ -1140,9 +1113,6 @@ def flydsl_pa_decode_sparse(
         max_kv_splits = max(1, (max_kv_len + block_k - 1) // block_k)
         n_head_blocks = (H + _BLOCK_H - 1) // _BLOCK_H
         kv_splits     = max(1, max_num_wg // max(1, T_val * n_head_blocks))
-        # MFMA groups BLOCK_H=16 heads per CTA, reducing head parallelism 16x.
-        # Compensate with more kv_splits, but cap at 2 to avoid reduce overhead:
-        # empirically kv_splits=2 is near-optimal for large T×H workloads.
         kv_splits     = max(kv_splits, 2)
         kv_splits     = min(max_kv_splits, kv_splits)
         kv_splits     = 1 << (kv_splits - 1).bit_length()
