@@ -603,6 +603,466 @@ gfx942/gfx950 Triton path.
 
 ---
 
+## Part 6 — FlyDSL MFMA Kernel Implementation
+
+This section describes the actual implementation in
+`aiter/ops/flydsl/kernels/pa_decode_sparse.py`, function
+`_compile_pa_decode_sparse_mfma`. The kernel replaces the Triton `_pa_decode_sparse`
+main loop with a FlyDSL kernel that issues MFMA instructions explicitly, using a
+4-wave (256-thread) CTA design.
+
+### 6.1 Thread and wave organisation
+
+Each CTA has **256 threads** arranged as **4 waves of 64 lanes**:
+
+```
+BLOCK_THREADS = 256 = 4 waves × 64 lanes
+wave_id  = tid // 64           # 0, 1, 2, 3
+lane     = tid % 64            # 0..63 within the wave
+lane_row = lane % 16           # 0..15 — the MFMA M/N index (head or kv row)
+lane_cgrp = lane // 16         # 0..3  — column group within the wave's D-slice
+```
+
+The 256-thread design is required because each wave handles only `D/4` D-columns.
+With four waves together they cover all `D` columns for both the QK and PV matrix
+multiplications, as described in §6.3 and §6.5.
+
+**Block dimensions for D = 576:**
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `BLOCK_H` | 16 | heads per CTA (= `_BLOCK_H`) |
+| `BLOCK_K` | 16 | KV slots per tile (= `BLOCK_H` for MFMA) |
+| `N_WAVES` | 4 | waves per CTA |
+| `D_PER_WAVE` | 144 | D-columns owned by each wave (`D / 4`) |
+| `D_CHUNKS_W` | 9 | MFMA K-chunks per wave (`D_PER_WAVE / 16`) |
+
+### 6.2 LDS layout and bank-conflict mitigation
+
+The CTA uses four LDS regions.
+
+**gfx942 LDS bank geometry:**
+- **32 banks**, each **4 bytes (32 bits)** wide
+- Bank index for a byte address: `bank = (byte_offset // 4) % 32`
+- Bank period (one full cycle through all banks): `32 × 4 = 128 bytes`
+
+A conflict occurs when two threads in the same wave access **different addresses that
+share the same bank index** in the same clock cycle — their accesses are serialized.
+Any row stride that is an exact multiple of 128 bytes maps every row to the same
+set of bank indices, causing N-way conflicts on cross-row (transposed) accesses.
+Each LDS region is padded to shift the row stride off the 128-byte boundary:
+
+| Region | Unpadded shape | Unpadded row stride | Pad | Padded shape | Padded row stride | Bytes | `stride % 128` |
+|--------|---------------|--------------------|----|--------------|-------------------|-------|----------------|
+| `scores_lds` | `[4, 16, 16]` f32 | `BLOCK_K × 4 = 64` B | +1 f32 | `[4, 16, 17]` f32 | `(BLOCK_K+1) × 4 = 68` B | 4352 | 68 ✓ |
+| `kv_lds` | `[16, 576]` bf16 | `D × 2 = 1152` B | +8 bf16 | `[16, 584]` bf16 | `(D+8) × 2 = 1168` B | 18688 | 16 ✓ |
+| `acc_lds` | `[16, 576]` f32 | `D × 4 = 2304` B | +8 f32 | `[16, 584]` f32 | `(D+8) × 4 = 2336` B | 37376 | 32 ✓ |
+| `slots_lds` | `[16]` i32 | — | — | `[16]` i32 | — | 64 | — |
+| `valids_lds` | `[16]` i32 | — | — | `[16]` i32 | — | 64 | — |
+| **Total** | | | | | | **60544** | < 64 KB ✓ |
+
+**`kv_lds` and `acc_lds`**: the unpadded strides (1152 B and 2304 B) are exact
+multiples of 128, causing 4-way conflicts on every transposed access in the PV step.
+Adding 8 elements per row (`KV_PAD = ACC_PAD = 8`) shifts the stride to 1168 B and
+2336 B respectively.
+
+**`scores_lds`**: each row holds `BLOCK_K = 16` f32 scores (one per KV slot), so the
+unpadded stride is only `16 × 4 = 64` bytes — also an exact multiple of 128 (64 = 128/2,
+so every pair of rows aliases). Adding just **1 f32 per row** (`ALIAS_ROW_STRIDE = BLOCK_K + 1 = 17`)
+gives a stride of `17 × 4 = 68` bytes. Since 68 is not a multiple of 128, adjacent rows
+no longer alias. The logical shape becomes `[N_WAVES=4, BLOCK_H=16, 17]` f32 with only
+`4 × 16 × 1 × 4 = 256` bytes of wasted padding in 4352 total bytes.
+
+`scores_lds` and `p_lds` share the same base LDS address. `scores_lds` is the larger
+array (`[4, 16, 17]` f32) used for cross-wave QK score communication; `p_lds`
+(`[16, 17]` f32) is wave 0's sub-region of `scores_lds`, reused to hold the softmax
+probability matrix P for the PV step. After the cross-wave reduce writes the full P
+into `p_lds` (step 5 in §6.4), the wave-indexed offsets of `scores_lds` are no longer
+needed, so the overlap is safe.
+
+```
+LDS base:
+  ├── [0]         scores_lds [N_WAVES=4, BLOCK_H=16, ALIAS_ROW_STRIDE=17] f32 (4352 B)
+  │              └── p_lds  [BLOCK_H=16, ALIAS_ROW_STRIDE=17] f32         (alias of wave 0)
+  ├── [4352]    kv_lds     [BLOCK_K=16, KV_ROW_STRIDE=584]   bf16       (18688 B)
+  ├── [23040]   acc_lds    [BLOCK_H=16, ACC_ROW_STRIDE=584]  f32        (37376 B)
+  ├── [60416]   slots_lds  [BLOCK_K=16]                       i32        (64 B)
+  └── [60480]   valids_lds [BLOCK_K=16]                       i32        (64 B)
+```
+
+Flat index formulas (all compile-time constants after padding).
+`kv_slot` is the KV-tile row index (0..BLOCK_K-1), equal to `lane_row` at runtime:
+```
+scores_lds[w, head, kv_slot]  →  w * BLOCK_H * ALIAS_ROW_STRIDE + head * ALIAS_ROW_STRIDE + kv_slot
+p_lds[head, kv_slot]          →  head * ALIAS_ROW_STRIDE + kv_slot   (= scores_lds[0, head, kv_slot])
+kv_lds[kv_slot, d_col]        →  kv_slot * KV_ROW_STRIDE + d_col     (KV_ROW_STRIDE = D + 8)
+acc_lds[head, d_col]          →  head    * ACC_ROW_STRIDE + d_col     (ACC_ROW_STRIDE = D + 8)
+```
+
+### 6.3 Step-by-step per KV tile: QK matrix multiplication
+
+**Inputs:** Q tile `[BLOCK_H=16, D=576]` bf16 in VRAM (per-head query), KV tile
+`[BLOCK_K=16, D=576]` bf16 gathered from `unified_kv` via slot indices.
+
+**Goal:** compute the score matrix `S[BLOCK_H, BLOCK_K]` = `Q @ K^T`.
+
+Each wave is responsible for one D-slice of width `D_PER_WAVE = D/4 = 144`.
+
+```
+wave 0: d ∈ [0,   144)  →  D_CHUNKS_W=9 MFMA K-chunks
+wave 1: d ∈ [144, 288)
+wave 2: d ∈ [288, 432)
+wave 3: d ∈ [432, 576)
+```
+
+Within a wave, the QK MFMA loop runs `D_CHUNKS_W = 9` iterations (one per 16-column
+chunk of this wave's D-slice). Per iteration at chunk `dc`:
+
+```
+col_off = d_wave_base + dc * 16 + lane_cgrp * 4   # D-column base for this lane
+
+# Q A-frag: Q[head, col_off..+3]  (4 bf16 elements per lane, 4 consecutive M-rows)
+flat_q = t * H * D + h_lane * D + col_off
+q_v4   = buffer_load(q_rsrc, flat_q // 2, vec_width=2)          # 4 bf16 as 2 i32
+
+# KV B-frag for QK: KV[slot[lane_row], col_off..+3]  (same slot for all groups)
+flat_kv = safe_slot * D + col_off
+kv_v4   = buffer_load(kv_rsrc, flat_kv // 2, vec_width=2)       # 4 bf16 as 2 i32
+
+# Write KV into kv_lds for PV reuse (transposed access needed there)
+for v in 0..3:
+    kv_lds[lane_row, col_off + v] = kv_v4[v]
+
+# QK partial MFMA (accumulates into c_frag over D_CHUNKS_W iterations)
+c_frag = mfma_f32_16x16x16_bf16(q_v4, kv_v4, c_frag)
+```
+
+**MFMA C-frag layout.** After `mfma_f32_16x16x16_bf16(A, B, C)`:
+```
+c_frag[v]  ↔  C[M = lane_cgrp*4 + v,  N = lane_row]
+           ↔  S_partial[head = lane_cgrp*4+v,  kv_slot = lane_row]
+```
+Each lane accumulates a partial score for 4 (head, kv_slot) pairs over its wave's D-slice.
+After all 9 iterations: `c_frag[v]` = sum of D/4 contributions to `S[head=lane_cgrp*4+v, kv_slot=lane_row]`.
+
+**Simultaneously**, each lane writes its 4 KV bf16 values into `kv_lds[lane_row, col_off..+3]`.
+Over all 9 iterations and 4 waves, this fills `kv_lds[0..15, 0..575]` — the complete KV
+tile in row-major order. This staging is necessary because the PV step requires the KV
+matrix in transposed access order relative to QK (see §6.5).
+
+### 6.4 Online softmax with cross-wave LDS communication
+
+After the QK loop, each wave holds a **partial score** `c_frag[v]` for only `D/4`
+of the inner dimension. The full score `S[head, kv_slot] = Σ_{wave} c_frag_wave[v]` requires
+summing the 4 waves' contributions. This is done via `scores_lds`.
+
+#### Step 3 — write partial QK scores to scores_lds
+
+All 4 waves write their partial c-frags to `scores_lds`:
+
+```
+scores_lds[wave_id, head, kv_slot] = c_frag[v]
+  where head = lane_cgrp*4 + v,  kv_slot = lane_row
+
+flat index = wave_id * BLOCK_H * ALIAS_ROW_STRIDE
+           + (lane_cgrp*4+v) * ALIAS_ROW_STRIDE
+           + lane_row
+```
+
+A `gpu.barrier()` ensures all waves have written before the next step.
+
+#### Step 4 — cross-wave reduce, scale, and online softmax
+
+All 4 waves independently perform the same reduction and softmax (redundant but avoids
+further synchronisation). For each of its 4 (head, kv_slot) pairs:
+
+```python
+# Sum 4 wave partials → full score for (head=lane_cgrp*4+v, kv_slot=lane_row)
+s_full = sum(scores_lds[w, head, kv_slot] for w in 0..3)
+
+# Gate by validity (slot == -1 → mask to -inf)
+s_scaled = s_full * softmax_scale * log2(e)          # base-2 domain
+s_gated  = s_scaled if slot_valid else -inf
+
+# Butterfly max over lane_row (kv_slot) dimension — finds max score across all 16 KV slots
+# Each lane XOR-exchanges with neighbours at distance 1, 2, 4, 8
+s_max = butterfly_max(s_gated, xor=[1, 2, 4, 8])    # wave-wide reduce
+
+# Online softmax update (one of 4 independent per-head states)
+m_new   = max(m_i, s_max)
+alpha   = exp2(m_i - m_new)      # rescale factor for old accumulator
+p_j     = exp2(s_gated - m_new)  # probability for this KV slot
+
+# Butterfly sum over lane_row dimension — normalisation denominator
+sum_p   = butterfly_sum(p_j, xor=[1, 2, 4, 8])
+
+l_new   = alpha * l_i + sum_p
+```
+
+`m_i` and `l_i` are **ForOp iter-args** — they carry the running softmax state across
+KV tiles. Each lane maintains 4 independent `(m_i, l_i)` pairs, one per head it owns
+(`head = h_base + lane_cgrp*4 + v`).
+
+**Base-2 softmax.** Q is pre-scaled by `softmax_scale * log2(e)` before the tile loop.
+All exponentials use `exp2` (hardware instruction `v_exp2_f32`) rather than `exp`.
+This is numerically equivalent (`exp(x) = exp2(x / ln2) = exp2(x * log2(e))`) but
+avoids a separate multiply inside the inner loop.
+
+**The butterfly reduction.** With `BLOCK_THREADS_MFMA = 256`, the butterfly uses XOR
+offsets 1, 2, 4, 8 — these span all 16 lane_row values (the kv_slot dimension) within
+each group of 16 consecutive lanes. Since all 256 threads run identical butterfly code
+with `width=256`, each group of 16 lanes sharing the same `lane_cgrp` sees the correct
+max/sum for its head.
+
+#### Step 5 — write P to p_lds for PV
+
+After the softmax update, each lane holds `p_j = exp2(score - m_new)` for its `(head,
+kv_slot)` pair. All waves write the same values (the reduce in step 4 is identical across
+all waves), so the writes are redundant but harmless:
+
+```
+p_lds[head, kv_slot] = p_j
+  where head = lane_cgrp*4 + v,  kv_slot = lane_row
+
+flat index = (lane_cgrp*4+v) * ALIAS_ROW_STRIDE + lane_row
+```
+
+A second `gpu.barrier()` makes `p_lds` and `kv_lds` visible to all waves before the
+PV step.
+
+**State summary at this point:**
+
+| Value | Location | Owner |
+|-------|----------|-------|
+| `m_new[4]`, `l_new[4]` | VGPRs (ForOp iter-args) | each lane, 4 per-head values |
+| `alpha[4]` | VGPRs | each lane, 4 rescale factors |
+| P tile `[16, 17]` f32 | `p_lds` (= scores_lds base) | LDS, all waves share |
+| KV tile `[16, 584]` bf16 | `kv_lds` | LDS, all waves share |
+| Acc tile `[16, 584]` f32 | `acc_lds` | LDS, all waves share |
+
+### 6.5 PV matrix multiplication
+
+**Goal:** update the output accumulator `acc[BLOCK_H, D] += P[BLOCK_H, BLOCK_K] @ KV[BLOCK_K, D]`.
+
+Each wave handles its D-slice (`D_PER_WAVE = D/4` columns) for all 16 heads. The loop
+runs `D_CHUNKS_W = 9` MFMA iterations per wave.
+
+#### Reading the PV operands from LDS
+
+The MFMA `mfma_f32_16x16x16_bf16(A, B, C)` with M=16, K=16, N=16 requires:
+- **A-frag**: `P[M=lane_row, K=lane_cgrp*4..+3]` — lane reads 4 elements from P's
+  row indexed by `lane_row`, at KV columns `lane_cgrp*4..lane_cgrp*4+3`.
+- **B-frag**: `KV[K=lane_cgrp*4..+3, N=lane_row]` — lane reads 4 elements from KV's
+  columns indexed by the wave's current D-column, at KV rows `lane_cgrp*4..+3`.
+- **C-frag**: `acc[M=lane_cgrp*4..+3, N=d_col]` — 4 f32 accumulator values.
+
+**A-frag from p_lds (no transpose needed):**
+```
+p_flat = lane_row * ALIAS_ROW_STRIDE + (lane_cgrp*4 + v)
+a_frag[v] = bf16(p_lds[p_flat])
+```
+P is stored in row-major order as `P[head, kv_slot]`. Reading `P[head=lane_row, kv_slot=kv_k]`
+at flat index `lane_row * ALIAS_ROW_STRIDE + kv_k` gives the MFMA A-frag element
+needed: `A[M=lane_row, K=kv_k]` = `P[head=lane_row, kv_slot=kv_k]`.
+
+**B-frag from kv_lds (transposed access):**
+```
+kv_slot_pv = lane_cgrp*4 + v          # KV slot index for PV
+d_col      = d_wave_base + dc*16 + lane_row
+kv_flat_pv = kv_slot_pv * KV_ROW_STRIDE + d_col
+b_frag[v]  = kv_lds[kv_flat_pv]
+```
+
+`kv_lds[kv_slot, d_col]` holds `KV[kv_slot, d_col]`. The QK step wrote
+`kv_lds[lane_row, col_off+v]` = `KV[kv_slot=lane_row, d=col_off+v]`.
+The PV step reads `kv_lds[kv_slot_pv, d_col]` = `KV[kv_slot=lane_cgrp*4+v, d=d_col]`.
+This is a **transposed access pattern** — QK indexed by `(kv_slot=lane_row, d=lane_cgrp*4..+3)`,
+PV indexes by `(kv_slot=lane_cgrp*4..+3, d=lane_row)` — which is why the KV tile must
+live in LDS rather than VGPR registers: VGPR data cannot be shared across lanes.
+
+**C-frag (acc_lds read, rescale, MFMA, write back):**
+```
+acc_flat   = (lane_cgrp*4 + v) * ACC_ROW_STRIDE + d_col
+acc_frag[v] = acc_lds[acc_flat]                      # read old accumulator
+
+# Rescale with per-head alpha (online softmax correction)
+acc_frag[v] *= alpha[v]
+
+# PV MFMA: acc += P @ KV for this D-chunk
+new_acc_frag = mfma_f32_16x16x16_bf16(a_frag, b_frag, acc_frag)
+
+# Write updated accumulator back
+acc_lds[acc_flat] = new_acc_frag[v]
+```
+
+The `alpha[v] = exp2(m_old[v] - m_new[v])` rescale is applied before the MFMA. This
+implements the online-softmax update `acc_new = alpha * acc_old + p * V` in a single
+MFMA call: after multiplying `acc_old` by `alpha`, the MFMA adds `p * V` (via the
+`P @ KV` product contribution) to it.
+
+A third `gpu.barrier()` after the PV loop ensures `acc_lds` writes are visible before
+the next tile overwrites `scores_lds`.
+
+#### Why acc_lds and not VGPRs
+
+The `acc_lds` region holds `BLOCK_H × D = 16 × 576 = 9216` f32 values. Storing this
+in VGPRs would require 9216 × 4 bytes / (256 threads × 4 bytes/VGPR) = 36 VGPRs per
+thread just for the accumulator — on top of the Q and KV data already in registers.
+With total VGPR budget ≈ 128–256 per thread at typical occupancy, LDS is the better
+tradeoff. The padded LDS row strides (`ACC_ROW_STRIDE = D + 8`) keep the bank conflict
+rate low despite the frequent cross-row reads.
+
+### 6.6 ForOp structure and loop-carried state
+
+The KV tile loop is an `scf.ForOp` from `tile_start` to `tile_end`. Only the online
+softmax scalars are loop-carried as ForOp iter-args — `acc_lds` lives outside the
+ForOp and is updated in-place.
+
+```
+ForOp iter-args: [m_i[0], m_i[1], m_i[2], m_i[3],
+                  l_i[0], l_i[1], l_i[2], l_i[3]]   # 8 f32 per lane
+```
+
+Each lane holds 4 `(m_i, l_i)` pairs — one per head it serves
+(`head = h_base + lane_cgrp*4 + v`). These are VGPRs visible only within one lane;
+cross-lane communication uses the butterfly reduction and LDS as described in §6.4.
+
+#### Initialization
+
+`KV_SPLITS == 1` (single-pass, attention sink folded inline):
+```
+for v in 0..3:
+    h_v    = h_base + lane_cgrp*4 + v
+    sink_v = attn_sink[h_v]                     # per-head learnable log-weight
+    m_i[v] = sink_v * log2(e)                   # virtual token with weight 1
+    l_i[v] = 1.0                                # exp2(sink - m_i) = 1
+    acc_lds[head=lane_cgrp*4+v, :] = 0.0        # zero accumulator
+```
+
+The sink initialisation absorbs it as if it were the first KV token (score =
+`attn_sink[h]`, value = 0). Every subsequent token is compared against this initial
+maximum, so the sink's weight naturally enters the softmax denominator.
+
+`KV_SPLITS > 1` (partial emit, sink handled by reduce kernel):
+```
+m_i[v] = -inf     # no prior max
+l_i[v] = 0.0      # no prior mass
+acc_lds[:, :] = 0.0
+```
+
+#### Termination
+
+After the ForOp: `m_final[4]`, `l_final[4]` from the last iteration's iter-args.
+
+**`KV_SPLITS == 1` — direct output:**
+```python
+for v in 0..3:
+    h_v = h_base + lane_cgrp*4 + v
+    for dc in 0..D_CHUNKS_W:
+        d_col = d_wave_base + dc*16 + lane_row
+        acc_val = acc_lds[head=lane_cgrp*4+v, d_col]
+        out_val = bf16(acc_val / max(l_final[v], 1e-30))
+        out[t, h_v, d_col] = out_val   (if h_v < H)
+```
+
+**`KV_SPLITS > 1` — partial emit:**
+```python
+for v in 0..3:
+    h_v   = h_base + lane_cgrp*4 + v
+    ml_flat = t * KV_SPLITS * H + pid_k * H + h_v
+    if lane_row == 0:                           # one lane writes the scalar stats
+        m_partial[ml_flat] = m_final[v]
+        l_partial[ml_flat] = l_final[v]
+    for dc in 0..D_CHUNKS_W:
+        d_col = d_wave_base + dc*16 + lane_row
+        acc_val = acc_lds[head=lane_cgrp*4+v, d_col]
+        acc_partial[ml_flat * D + d_col] = acc_val
+```
+
+The Triton `_pa_decode_sparse_reduce` kernel then combines these partial states across
+all KV splits and folds in the attention sink (§4.4).
+
+### 6.7 Tile-level execution timeline
+
+```
+[Tile loop body — 1 KV tile of BLOCK_K=16 slots]
+
+1. WAVE 0 ONLY (lane_cgrp==0): load slot indices into slots_lds / valids_lds
+   (16 slots × 1 lane each, via buffer_load)
+   gpu.barrier()  — slots visible to all 256 threads
+
+2. ALL WAVES: QK MFMA loop (D_CHUNKS_W=9 iterations per wave)
+   Each iteration:
+   a. Load Q A-frag from VRAM  (buffer_load, 4 bf16)
+   b. Load KV B-frag from VRAM (buffer_load, 4 bf16)
+   c. Write KV to kv_lds[lane_row, col_off..+3]  (4 bf16 → LDS)
+   d. Issue mfma_f32_16x16x16_bf16(q_v4, kv_v4, c_frag)  (accumulates c_frag)
+
+3. ALL WAVES: write c_frag to scores_lds[wave_id, head, kv_slot]
+   gpu.barrier()  — all partial QK scores + kv_lds writes visible
+
+4. ALL WAVES (independently, same result):
+   a. Sum 4 wave partials from scores_lds → full score[head, kv_slot]
+   b. Apply validity mask (slot == -1 → -inf)
+   c. Butterfly max over lane_row: s_max
+   d. Online softmax: m_new = max(m_i, s_max); alpha; p_j; butterfly sum_p; l_new
+   e. Write p_j to p_lds[head, kv_slot]
+   gpu.barrier()  — p_lds visible for PV A-frag reads
+
+5. ALL WAVES: PV MFMA loop (D_CHUNKS_W=9 iterations per wave)
+   Each iteration:
+   a. Load A-frag: p_lds[lane_row * ALIAS_ROW_STRIDE + kv_k]  (4 bf16 from p_lds)
+   b. Load B-frag: kv_lds[kv_row_pv * KV_ROW_STRIDE + d_col]  (4 bf16 from kv_lds)
+   c. Load C-frag: acc_lds[head * ACC_ROW_STRIDE + d_col]      (4 f32 from acc_lds)
+   d. Rescale C-frag by alpha[v]
+   e. Issue mfma_f32_16x16x16_bf16(a_frag, b_frag, rescaled_c)
+   f. Write result back to acc_lds[head * ACC_ROW_STRIDE + d_col]
+   gpu.barrier()  — acc_lds updated; scores_lds safe for next tile's step 3
+
+→ yield (m_new[4], l_new[4]) as next iteration's iter-args
+```
+
+**MFMA count per tile:** `D_CHUNKS_W × N_WAVES × 2 (QK + PV) = 9 × 4 × 2 = 72`
+instructions — identical to the Triton analysis in §4.0.
+
+### 6.8 MFMA operand layout summary
+
+The `mfma_f32_16x16x16_bf16` instruction computes `C[16,16] += A[16,16] × B[16,16]`.
+On gfx942 with a 64-lane wave, the operands are distributed as:
+
+```
+C-frag: lane l carries C[lane_cgrp*4 + v, lane_row]  for v ∈ {0,1,2,3}
+A-frag: lane l carries A[lane_cgrp*4 + v, K_col]     for v ∈ {0,1,2,3}  (4 consecutive M-rows)
+B-frag: lane l carries B[K_row, lane_row + ?]         (column of B)
+```
+
+The kernel uses this layout as follows:
+
+| Step | M (row) | K (inner) | N (col) | A source | B source | C source |
+|------|---------|-----------|---------|----------|----------|----------|
+| QK | head = `lane_cgrp*4+v` | d chunk | kv_slot = `lane_row` | Q`[head, d]` from VRAM | KV`[kv_slot, d]` from VRAM | partial score (VGPR) |
+| PV | head = `lane_row` | kv_slot = `lane_cgrp*4+v` | d = `d_col` | P`[head, kv_slot]` from `p_lds` | KV`[kv_slot, d]` from `kv_lds` | acc`[head, d]` from `acc_lds` |
+
+Note the role swap between QK and PV: in QK, `lane_row` indexes the kv_slot (N) dimension;
+in PV, `lane_row` indexes the head (M) dimension. This reversal is why the P matrix
+must be stored in LDS in row-major `P[head, kv_slot]` order — the PV A-frag reads
+`P[head=lane_row, kv_slot=kv_k]` in row-major order at `lane_row * ALIAS_ROW_STRIDE + kv_k`,
+which matches exactly how the softmax wrote `P[head=lane_cgrp*4+v, kv_slot=lane_row]` at
+`(lane_cgrp*4+v) * ALIAS_ROW_STRIDE + lane_row`.
+
+### 6.9 Performance (T=128, H=128, D=576, kv\_len=2048)
+
+| Kernel | Time | BW | TFLOPS | vs Triton |
+|--------|------|-----|--------|-----------|
+| FlyDSL 4-wave + LDS padding | 2.096 ms | 162.6 GB/s | 18.5 | **1.28×** |
+| Triton `_pa_decode_sparse` | 2.687 ms | 126.8 GB/s | 14.4 | 1.00× |
+
+The LDS row padding (`KV_PAD=8`, `ACC_PAD=8`, `ALIAS_ROW_STRIDE=BLOCK_K+1`) improved
+performance from 1.20× to 1.28× vs Triton by eliminating 4-way LDS bank conflicts on
+the transposed `kv_lds` and `acc_lds` accesses.
+
+---
+
 ## Glossary
 
 - **Decode step** — one token-generation step; the model produces one new token given
