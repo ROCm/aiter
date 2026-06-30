@@ -2524,24 +2524,25 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-    if not ENABLE_CK:
-        from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
+    # comment for now to avoid ut run into triton fallback
+    # if not ENABLE_CK:
+    #     from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
-        return flash_attn_func_triton(
-            q=q,
-            k=k,
-            v=v,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_lse=return_lse,
-            return_attn_probs=return_attn_probs,
-            sink=sink_ptr,
-        )
+    #     return flash_attn_func_triton(
+    #         q=q,
+    #         k=k,
+    #         v=v,
+    #         dropout_p=dropout_p,
+    #         softmax_scale=softmax_scale,
+    #         causal=causal,
+    #         window_size=window_size,
+    #         bias=bias,
+    #         alibi_slopes=alibi_slopes,
+    #         deterministic=deterministic,
+    #         return_lse=return_lse,
+    #         return_attn_probs=return_attn_probs,
+    #         sink=sink_ptr,
+    #     )
     return FlashAttnFunc.apply(
         q,
         k,
