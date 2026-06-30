@@ -56,9 +56,15 @@ BLOCK_SIZE_M = 32
 # Default to Opus unless CK sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 # "adaptive sort" backend selection (our mxfp4 sort as a general World-1 backend):
-#   auto (default) -> use adaptive on codegen'd shapes, else fall back to Opus/CK
-#   adaptive       -> force the adaptive branch (kernel TORCH_CHECK throws on unsupported shape)
-#   opus / ck      -> never use adaptive (legacy behavior; ck still needs AITER_USE_CK_MOE_SORTING)
+#   auto (default) -> same as adaptive; NO shape fallback. The adaptive kernel is
+#                     codegen'd for a fixed shape set (see SHAPES in
+#                     csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py); an
+#                     un-codegen'd shape hits TORCH_CHECK in aux_find rather than
+#                     falling back. This is safe today only because output_aux is
+#                     set only for tuned-CSV rows routed to the port, which are
+#                     exactly the codegen'd shapes (an implicit, hand-synced coupling).
+#   adaptive       -> force the adaptive branch (same behavior as auto)
+#   opus / ck      -> never use adaptive (legacy path; ck still needs AITER_USE_CK_MOE_SORTING)
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
@@ -173,7 +179,7 @@ def _moe_sorting_impl(
     device = topk_ids.device
     M, topk = topk_ids.shape
 
-    if output_aux and _MOE_SORT_BACKEND != "opus":
+    if output_aux and _MOE_SORT_BACKEND not in ("opus", "ck"):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
         return _adaptive_moe_sort(
