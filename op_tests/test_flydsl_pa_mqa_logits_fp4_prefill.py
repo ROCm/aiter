@@ -232,6 +232,11 @@ def run_case(
             ls.append(s)
             le.append(e)
     total_tokens = len(rb)
+    # The persistent-grid schedule maps each (row, chunk-split) work item to a
+    # fixed CTA slot in [0, parallel_unit_num). If there are more rows than
+    # slots, the surplus rows are silently dropped (their out stays -inf -> NaN
+    # cosine). Grow the grid so every row gets at least one slot.
+    parallel_unit_num = max(parallel_unit_num, total_tokens)
     row_to_batch = torch.tensor(rb, dtype=torch.int32, device=dev)
     local_starts = torch.tensor(ls, dtype=torch.int32, device=dev)
     local_ends = torch.tensor(le, dtype=torch.int32, device=dev)
