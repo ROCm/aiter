@@ -1692,6 +1692,7 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
 {
     using mrope_utils::WARP_SIZE;
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
+    constexpr int PAIR_VEC_SIZE   = VEC_SIZE / 2;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
     // NEOX neighbor in lane space: lane k swaps with lane (k ^ NEIGHBOR_XOR).
     // For all supported HEAD_SIZE in {64, 128, 256}, NEIGHBOR_XOR = 16 (= half of WARP_SIZE).
@@ -1726,7 +1727,8 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
     // _apply_rope_complex passes complex freqs in fp32, so the underlying
     // cos/sin pairs carry full fp32 precision). Loading as fp32 keeps the
     // input precision unchanged through the rope multiply.
-    vec_t<float, VEC_SIZE> cos_sin_vec, cos_vec, sin_vec;
+    vec_t<float, VEC_SIZE> cos_sin_vec;
+    vec_t<float, PAIR_VEC_SIZE> cos_vec, sin_vec;
 
     if(is_q)
     {
@@ -1753,12 +1755,12 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
     }
     else
     {
-        // Interleaved mode only consumes VEC_SIZE/2 cos/sin per lane (one per pair).
-        // Use scalar loads of exactly VEC_SIZE/2 elements to avoid the OOB read at
+        // Interleaved mode only consumes PAIR_VEC_SIZE cos/sin per lane (one per pair).
+        // Use scalar loads of exactly PAIR_VEC_SIZE elements to avoid the OOB read at
         // the buffer tail when access_id_in_head/2 + HALF_HEAD_SIZE + VEC_SIZE-1
         // would read past the last token's row.
 #pragma unroll
-        for(int i = 0; i < VEC_SIZE / 2; ++i)
+        for(int i = 0; i < PAIR_VEC_SIZE; ++i)
         {
             cos_vec[i] = cos_sin[token_id * HEAD_SIZE + access_id_in_head / 2 + i];
             sin_vec[i] =
@@ -1847,7 +1849,7 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
         // same conversion-instruction-count win as the RMSNorm writeback.
         float out_f32[VEC_SIZE];
 #pragma unroll
-        for(int i = 0; i < VEC_SIZE / 2; ++i)
+        for(int i = 0; i < PAIR_VEC_SIZE; ++i)
         {
             out_f32[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
                                  (float)x_vec[2 * i + 1] * (float)sin_vec[i];
