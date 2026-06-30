@@ -3,7 +3,6 @@
 > **`Conv2d` for AMD ROCm — a drop-in replacement for `torch.nn.Conv2d`,
 > optimized for AMD RDNA GPUs.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.9.1-ee4c2c.svg)](https://pytorch.org)
 [![ROCm](https://img.shields.io/badge/ROCm-7.2-ED1C24.svg)](https://www.amd.com/en/developer/resources/rocm-hub.html)
