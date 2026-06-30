@@ -26,6 +26,9 @@ _WARNED_NAIVE_EPILOGUE = False
 # weight is materialized at most once (not re-copied on every fused_moe call).
 _GROUPED_WEIGHT_CACHE = {}
 
+# Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable) per-kernel launches; None in production.
+kernel_bench_callable = None
+
 
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     """Contiguous uint8 view of a static MoE weight, cached by data_ptr."""
@@ -462,9 +465,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     tile_m, tile_n, tile_k = 64, 256, 256
     m_warp, n_warp = 1, 4
     num_buffers = 2
+    num_buffer_stage2 = None  # None -> fall back to num_buffers below
     split_k1 = 1
     split_k2 = 1
     grouped_contiguous_m = False
+    # WST / As-prologue requests, applied to BOTH gemm1 and gemm2. Precedence:
+    # env var (if set) > CSV column > default(off). CSV sets the per-row default;
+    # an explicitly-set env var overrides it.
+    wave_specialized_tdm_req = False
+    tdm_as_in_prologue_req = False
     cfg_row = _find_grouped_config(
         token_num=_get_padded_M(token_num),
         model_dim=model_dim,
@@ -484,6 +493,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         tile_k = _as_int(cfg_row.get("tile_k"), tile_k)
         n_warp = _as_int(cfg_row.get("n_warp"), n_warp)
         num_buffers = _as_int(cfg_row.get("num_buffers"), num_buffers)
+        # stage2 buffer count; absent column -> keep None so it inherits num_buffers
+        num_buffer_stage2 = _as_int(cfg_row.get("num_buffer_stage2"), num_buffer_stage2)
         split_k1 = _as_int(cfg_row.get("split_k1"), split_k1)
         split_k2 = _as_int(cfg_row.get("split_k2"), split_k2)
         grouped_contiguous_m = _as_bool(
@@ -492,10 +503,67 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         stage1_weight_layout = (
             cfg_row.get("stage1_weight_layout") or stage1_weight_layout
         )
+        wave_specialized_tdm_req = _as_bool(
+            cfg_row.get("wave_specialized_tdm"), wave_specialized_tdm_req
+        )
+        tdm_as_in_prologue_req = _as_bool(
+            cfg_row.get("tdm_as_in_prologue"), tdm_as_in_prologue_req
+        )
         _grouped_dbg(f"using grouped CSV config: {cfg_row}")
-    # tile_n = int(n_warp) * 64
-    # tile_k = 256
+    else:
+        logger.info(
+            "no grouped CSV config matched (token=%d model_dim=%d inter_dim=%d "
+            "experts=%d topk=%d act=%s dtype=%s q_dtype_a=%s q_dtype_w=%s "
+            "quant_type=%s gate_mode=%s); using defaults tile_m=%d n_warp=%d "
+            "num_buffers=%d split_k1=%d split_k2=%d stage1_weight_layout=%s",
+            _get_padded_M(token_num),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            activation,
+            dtype,
+            q_dtype_a,
+            q_dtype_w_key,
+            quant_type,
+            gate_mode,
+            tile_m,
+            n_warp,
+            num_buffers,
+            split_k1,
+            split_k2,
+            stage1_weight_layout,
+        )
+    # Env vars override the CSV when explicitly set (presence check, so an env
+    # value of "0" also overrides a CSV "1").
+    if "AITER_GROUPED_GEMM_WAVE_SPECIALIZED" in os.environ:
+        wave_specialized_tdm_req = (
+            os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] in _TRUTHY_ENV
+        )
+    if "AITER_GROUPED_GEMM_AS_PROLOGUE" in os.environ:
+        tdm_as_in_prologue_req = (
+            os.environ["AITER_GROUPED_GEMM_AS_PROLOGUE"] in _TRUTHY_ENV
+        )
+    # gemm1 (stage1) tiles: tile_{m,n,k} read straight from the CSV, defaulting
+    # to n_warp*64 / 256 when the column is absent.
+    tile_n = (
+        _as_int(cfg_row.get("tile_n"), int(n_warp) * 64)
+        if cfg_row
+        else int(n_warp) * 64
+    )
+    tile_k = _as_int(cfg_row.get("tile_k"), 256) if cfg_row else 256
     warp_tile_m = tile_m // m_warp
+    # gemm2 (stage2) tiles: tile_{m,n,k}2, each defaulting to the shared gemm1
+    # tile_{m,n,k} above. Absent columns keep the old behavior. max_m / routing
+    # use the shared tile_m; correctness of any non-default override is the
+    # caller's responsibility.
+    tile_m2 = _as_int(cfg_row.get("tile_m2"), tile_m) if cfg_row else tile_m
+    tile_n2 = _as_int(cfg_row.get("tile_n2"), tile_n) if cfg_row else tile_n
+    tile_k2 = _as_int(cfg_row.get("tile_k2"), tile_k) if cfg_row else tile_k
+    # stage2 buffer count: dedicated column if present, else inherit gemm1's.
+    if num_buffer_stage2 is None:
+        num_buffer_stage2 = num_buffers
+    warp_tile_m2 = tile_m2 // m_warp
     warp_tile_n = tile_n // n_warp
 
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
@@ -734,6 +802,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         persistent_workers=None,
         act="swiglu" if activation == ActivationType.Swiglu else "silu",
         stage1_weight_layout=stage1_weight_layout,
+        wave_specialized_tdm=(
+            stage1_weight_layout == "gugu"
+            and (m_warp * n_warp) == 4
+            and wave_specialized_tdm_req
+        ),
+        tdm_as_in_prologue=tdm_as_in_prologue_req,
     )
     _grouped_dbg("stage1 compile done; start launch")
     _bias1_arg = bias1 if (bias1 is not None and bias1.numel() > 0) else None
@@ -759,6 +833,30 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias1_arg,
     )
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(
+            (
+                "gemm1",
+                functools.partial(
+                    stage1,
+                    grouped_a2,
+                    grouped_a1,
+                    grouped_w1,
+                    grouped_a1_scale,
+                    grouped_w1_scale,
+                    masked_m,
+                    max_m,
+                    inter_dim,
+                    model_dim,
+                    E,
+                    stream=torch.cuda.current_stream(),
+                    swiglu_limit=swiglu_limit,
+                    _m_tile_prefix=m_tile_prefix,
+                    _m_tile_map=m_tile_map,
+                    bias=_bias1_arg,
+                ),
+            )
+        )
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage1 sync OK, unsort")
@@ -820,7 +918,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 grouped_a2, inter_dim
             )
         grouped_a2_scale = _grouped_a8w4_preshuffle_e8m0_scale(
-            a2_scale_raw, warp_tile=warp_tile_m, scale_k_per_tile=tile_k // 32
+            a2_scale_raw, warp_tile=warp_tile_m2, scale_k_per_tile=tile_k2 // 32
         )
     else:
         from aiter.ops.flydsl.moe_kernels import flydsl_moe_fused_quant_preshuffle
@@ -834,7 +932,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             grouped_a2,
             route_E,
             route_max_m,
-            wmma_rep=warp_tile_m // 16,
+            wmma_rep=warp_tile_m2 // 16,
             quant_mode=fused_quant_mode,
             masked_m=_fused_masked_m,
             topids_to_rows=_fused_topids_to_rows,
@@ -884,18 +982,20 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         inter_dim=inter_dim,
         experts=E,
         max_m=max_m,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
+        tile_m=tile_m2,
+        tile_n=tile_n2,
+        tile_k=tile_k2,
         m_warp=m_warp,
         n_warp=n_warp,
         out_dtype=out_dtype_str,
-        num_buffers=num_buffers,
+        num_buffers=num_buffer_stage2,
         split_k=split_k2,
         expert_sched_mode=False,
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
+        wave_specialized_tdm=((m_warp * n_warp) == 4 and wave_specialized_tdm_req),
+        tdm_as_in_prologue=tdm_as_in_prologue_req,
     )
     _grouped_dbg("stage2 compile done; start launch")
     _bias2_arg = bias2 if (bias2 is not None and bias2.numel() > 0) else None
@@ -904,8 +1004,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg(f"[crash-probe] before stage2 tokens={token_num} max_m={max_m} E={E}")
+    _stage2_out = grouped_out
     grouped_out = stage2(
-        grouped_out,
+        _stage2_out,
         grouped_a2_payload,
         grouped_w2,
         grouped_a2_scale,
@@ -920,6 +1021,29 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _m_tile_map=m_tile_map,
         bias=_bias2_arg,
     )
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(
+            (
+                "gemm2",
+                functools.partial(
+                    stage2,
+                    _stage2_out,
+                    grouped_a2_payload,
+                    grouped_w2,
+                    grouped_a2_scale,
+                    grouped_w2_scale,
+                    masked_m,
+                    max_m,
+                    model_dim,
+                    inter_dim,
+                    E,
+                    stream=torch.cuda.current_stream(),
+                    _m_tile_prefix=m_tile_prefix,
+                    _m_tile_map=m_tile_map,
+                    bias=_bias2_arg,
+                ),
+            )
+        )
     if _grouped_sync_dbg:
         torch.cuda.synchronize()
     _grouped_dbg("[crash-probe] after stage2 sync OK")

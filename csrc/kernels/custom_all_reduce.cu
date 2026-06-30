@@ -643,7 +643,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t group_size,
                                              int64_t reg_ptr, int64_t reg_bytes,
                                              bool use_1stage,
-                                             int64_t bf16_out_ptr)
+                                             int64_t bf16_out_ptr,
+                                             bool transpose_scale)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -681,7 +682,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::bf16_t*>(bf16_out));
+            reinterpret_cast<opus::bf16_t*>(bf16_out), transpose_scale);
         break;
     }
 #endif
@@ -695,7 +696,7 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
             reinterpret_cast<float*>(scale_out.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(w.data_ptr()),
             (float)eps, m, n, (int)group_size, use_1stage,
-            reinterpret_cast<opus::fp16_t*>(bf16_out));
+            reinterpret_cast<opus::fp16_t*>(bf16_out), transpose_scale);
         break;
     }
     default:
