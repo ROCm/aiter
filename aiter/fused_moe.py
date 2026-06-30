@@ -37,6 +37,7 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+NVFP4_BF16_QDTYPE = "nvfp4_bf16"
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -257,6 +258,8 @@ def fused_moe(
     # following for quant
     w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
+    w1_global_scale: Optional[torch.tensor] = None,
+    w2_global_scale: Optional[torch.tensor] = None,
     a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
@@ -287,6 +290,8 @@ def fused_moe(
         doweight_stage1=doweight_stage1,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        w1_global_scale=w1_global_scale,
+        w2_global_scale=w2_global_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_size_M=block_size_M,
@@ -315,6 +320,8 @@ def fused_moe_fake(
     # following for quant
     w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
@@ -351,6 +358,8 @@ def fused_moe_(
     # following for quant
     w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
@@ -393,6 +402,19 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    is_nvfp4_bf16 = (
+        q_dtype_w == torch.uint8
+        and quant_type == QuantType.No
+        and dtype == dtypes.bf16
+        and hidden_states.dtype == dtypes.bf16
+        and w1_scale is not None
+        and w2_scale is not None
+        and w1_global_scale is not None
+        and w2_global_scale is not None
+    )
+    if is_nvfp4_bf16:
+        q_dtype_a = dtypes.bf16
+        q_dtype_w = NVFP4_BF16_QDTYPE
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
     # use FP8 as activation dtype to skip redundant re-quantization
     if (
@@ -566,6 +588,8 @@ def fused_moe_(
             w2_scale=w2_scale,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
+            w1_global_scale=w1_global_scale,
+            w2_global_scale=w2_global_scale,
             num_local_tokens=num_local_tokens,
             # following for cktile support
             hidden_pad=hidden_pad,
@@ -604,6 +628,8 @@ def fused_moe_1stage(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_global_scale=None,
+    w2_global_scale=None,
     num_local_tokens: Optional[torch.tensor] = None,
     M: int = None,
     device=None,
@@ -753,6 +779,40 @@ def get_block_size_M(token, topk, expert, inter_dim):
     return sorted(tmp, key=lambda x: x[:2])[0][-1]
 
 
+def _get_default_bf16_nvfp4_fused_moe_params(
+    token: int,
+    topk: int,
+    expert: int,
+    model_dim: int,
+    inter_dim: int,
+    block_m: Optional[int] = None,
+) -> dict[str, int | str]:
+    """Return AITER's fallback FlyDSL params for BF16 x NVFP4 fused MoE."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+    tile_m = (
+        get_block_size_M(token, topk, expert, inter_dim)
+        if block_m is None
+        else int(block_m)
+    )
+    stage1_tile_k = (
+        256 if model_dim % 256 == 0 else 128 if model_dim % 128 == 0 else 64
+    )
+    stage2_tile_k = (
+        256 if inter_dim % 256 == 0 else 128 if inter_dim % 128 == 0 else 64
+    )
+    return {
+        "block_m": tile_m,
+        "ksplit": 0,
+        "kernelName1": flydsl_kernel_name(
+            1, "bf16", "nvfp4", "bf16", tile_m, 128, stage1_tile_k
+        ),
+        "kernelName2": flydsl_kernel_name(
+            2, "bf16", "nvfp4", "bf16", tile_m, 128, stage2_tile_k, "atomic"
+        ),
+    }
+
+
 @functools.lru_cache(maxsize=2048)
 def use_nt(token, topk, e):
     use_nt = int(os.environ.get("AITER_USE_NT", "-1"))
@@ -898,6 +958,7 @@ def _flydsl_stage1_wrapper(
     bias1=None,
     topk_ids=None,
     swiglu_limit: float = 0.0,
+    w1_global_scale=None,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
     **_kwargs,
@@ -926,6 +987,7 @@ def _flydsl_stage1_wrapper(
         out_dtype=parsed["out_dtype"],
         act=act,
         w1_scale=w1_scale,
+        global_scale=w1_global_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
         use_async_copy=True,
@@ -961,6 +1023,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    w2_global_scale=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -995,6 +1058,7 @@ def _flydsl_stage2_wrapper(
         out_dtype=parsed["out_dtype"],
         mode=parsed.get("mode", "atomic"),
         w2_scale=w2_scale,
+        global_scale=w2_global_scale,
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
         sort_block_m=parsed.get("sort_block_m", 0),
@@ -1260,6 +1324,12 @@ def get_2stage_cfgs(
         and q_dtype_a == torch.bfloat16
         and q_dtype_w == torch.bfloat16
     )
+    is_nvfp4_bf16_moe = (
+        q_type == QuantType.No
+        and dtype == torch.bfloat16
+        and q_dtype_a == torch.bfloat16
+        and q_dtype_w == NVFP4_BF16_QDTYPE
+    )
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -1319,6 +1389,16 @@ def get_2stage_cfgs(
                 f"using default heuristics block_m={block_m}, ksplit={ksplit}, "
                 f"use_nt={use_non_temporal_load}, tune_file={tune_file}"
             )
+        if is_nvfp4_bf16_moe:
+            default_nvfp4_params = _get_default_bf16_nvfp4_fused_moe_params(
+                token, topk, expert, model_dim, inter_dim, block_m
+            )
+            kernelName1 = str(default_nvfp4_params["kernelName1"])
+            kernelName2 = str(default_nvfp4_params["kernelName2"])
+            logger.info(
+                f"[fused_moe][nvfp4_bf16] no tuned config used for {keys}; "
+                f"using default FlyDSL kernels ({kernelName1=}, {kernelName2=})"
+            )
     else:
         block_m = cfg["block_m"]
         if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
@@ -1348,6 +1428,12 @@ def get_2stage_cfgs(
                 f"kernelName1={kernelName1}, kernelName2={kernelName2}, "
                 f"block_m={block_m}, ksplit={ksplit}, run_1stage={run_1stage}, "
                 f"use_nt={use_non_temporal_load}, tune_file={tune_file}"
+            )
+        if is_nvfp4_bf16_moe:
+            logger.info(
+                f"[fused_moe][nvfp4_bf16] tuned config used for {keys}: "
+                f"kernelName1={kernelName1}, kernelName2={kernelName2}, "
+                f"block_m={block_m}, ksplit={ksplit}, tune_file={tune_file}"
             )
 
     tag = f"({kernelName1=}, {kernelName2=})"
@@ -1759,6 +1845,8 @@ def fused_moe_2stages(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_global_scale=None,
+    w2_global_scale=None,
     num_local_tokens: Optional[torch.tensor] = None,
     # following for cktile support
     hidden_pad=0,
@@ -1780,6 +1868,13 @@ def fused_moe_2stages(
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    is_nvfp4_bf16 = (
+        q_dtype_w == NVFP4_BF16_QDTYPE
+        and quant_type == QuantType.No
+        and dtype == dtypes.bf16
+        and w1_global_scale is not None
+        and w2_global_scale is not None
+    )
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -1839,6 +1934,10 @@ def fused_moe_2stages(
 
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
+        a1 = hidden_states.to(dtype)
+        a1_scale = None
+    elif is_nvfp4_bf16:
+        # NVFP4-BF16: activations remain bf16; weights dequantize in FlyDSL.
         a1 = hidden_states.to(dtype)
         a1_scale = None
     elif quant_type == QuantType.per_1x32:
@@ -1905,6 +2004,9 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if metadata.stage1.func is _flydsl_stage1_wrapper:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+    if is_nvfp4_bf16:
+        extra_stage1_args["w1_global_scale"] = w1_global_scale
+        extra_stage2_args["w2_global_scale"] = w2_global_scale
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
     if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
@@ -1972,6 +2074,9 @@ def fused_moe_2stages(
             a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
+        a2_scale = None
+    elif is_nvfp4_bf16:
+        # NVFP4-BF16 stage1 produces bf16 activations for stage2.
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
