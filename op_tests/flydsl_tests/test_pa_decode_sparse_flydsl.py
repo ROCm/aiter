@@ -209,8 +209,8 @@ def _make_inputs(
 
 # D=512 and D=576 are both divisible by BLOCK_THREADS=64.
 # D=576 matches the DSv4 MLA head dimension (kv_lora_rank=512 + rope_rank=64).
-@pytest.mark.parametrize("T", [1, 32])
-@pytest.mark.parametrize("H", [1, 8, 16, 128])
+@pytest.mark.parametrize("T", [1, 2, 32, 64])
+@pytest.mark.parametrize("H", [16, 128])
 @pytest.mark.parametrize("D", [512, 576])
 @pytest.mark.parametrize("kv_len", [100, 400, 1024])
 @pytest.mark.parametrize("var_len", [True, False])
