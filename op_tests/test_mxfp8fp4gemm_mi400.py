@@ -17,6 +17,7 @@
 # The .cu heuristic picks whichever registered tile fits the shape.
 
 import argparse
+import itertools
 
 import pandas as pd
 import torch
@@ -38,6 +39,7 @@ pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 
 MX_SCALE_BLOCK = 32
+SUPPORTED_GFX = ["gfx1250"]  # ASM kernels are gfx1250-only (kernarg preload)
 
 
 def _rand_mxfp8(rows: int, k: int) -> torch.Tensor:
@@ -57,29 +59,47 @@ def _rand_e8m0_scale(rows: int, k: int) -> torch.Tensor:
     return torch.randint(125, 130, (rows, k // MX_SCALE_BLOCK), dtype=torch.uint8)
 
 
-def _fp8_to_f32(x_fp8: torch.Tensor) -> torch.Tensor:
-    return x_fp8.to(torch.float32)
-
-
 def _ref(intype, A, B, sA, sB, M, N):
-    A_f32 = _fp8_to_f32(A)[:M]
+    # Reference only: fp32 math, cast back. Not timed, not in the table.
+    A_f32 = A.to(torch.float32)[:M]
     if intype == "a8w4":
         B_f32 = fp4_utils.mxfp4_to_f32(B)[:N]
     else:
-        B_f32 = _fp8_to_f32(B)[:N]
+        B_f32 = B.to(torch.float32)[:N]
     sA_f = fp4_utils.e8m0_to_f32(sA).repeat_interleave(MX_SCALE_BLOCK, dim=1)
     sB_f = fp4_utils.e8m0_to_f32(sB).repeat_interleave(MX_SCALE_BLOCK, dim=1)
     return (A_f32 * sA_f) @ (B_f32 * sB_f).T
 
 
-def _prep(intype: str, M: int, N: int, K: int, apre: int):
-    """Build raw + shuffled device tensors and the f32 golden reference."""
-    A = _rand_mxfp8(M, K)
-    if intype == "a8w4":
-        B = _rand_fp4_packed(N, K)
+def _const_mxfp8(rows: int, k: int, val: float) -> torch.Tensor:
+    # Constant mxfp8 (e4m3): a single representable value, deterministic for perf.
+    return torch.full((rows, k), val, dtype=torch.float32).to(torch.float8_e4m3fn)
+
+
+def _prep(intype: str, M: int, N: int, K: int, apre: int, init: str):
+    """Build raw + shuffled device tensors and the f32 golden reference.
+
+    init="random"   : randn-derived mxfp8/mxfp4 + random e8m0 scales (varied).
+                      Mirrors the POC sin_cos_init=1 (varied, non-zero) pattern.
+    init="constant" : mirrors the POC sin_cos_init=10 -- every A/B element = 0.5
+                      (exact in e4m3 and e2m1) with a neutral e8m0 scale 0x7F
+                      (exp 0 -> 2^0 = 1.0). Deterministic/stable for perf.
+    """
+    if init == "constant":
+        A = _const_mxfp8(M, K, 0.5)
+        if intype == "a8w4":
+            B = torch.full((N, K // 2), 0x11, dtype=torch.uint8)  # e2m1 nibble 0.5
+        else:
+            B = _const_mxfp8(N, K, 0.5)
+        sA = torch.full((M, K // MX_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
+        sB = torch.full((N, K // MX_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
     else:
-        B = _rand_mxfp8(N, K)
-    sA, sB = _rand_e8m0_scale(M, K), _rand_e8m0_scale(N, K)
+        A = _rand_mxfp8(M, K)
+        if intype == "a8w4":
+            B = _rand_fp4_packed(N, K)
+        else:
+            B = _rand_mxfp8(N, K)
+        sA, sB = _rand_e8m0_scale(M, K), _rand_e8m0_scale(N, K)
 
     ref = _ref(intype, A, B, sA, sB, M, N).to(dtypes.bf16)
 
@@ -92,107 +112,130 @@ def _prep(intype: str, M: int, N: int, K: int, apre: int):
     return inp, ref
 
 
-def _run_kernel(intype, inp, apre, kernelName, num_iters, needTrace):
-    fn = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
-    return run_perftest(
-        fn,
-        inp["A"],
-        inp["B"],
-        inp["sA"],
-        inp["sB"],
-        dtype=dtypes.bf16,
-        a_preshuffle=bool(apre),
-        kernelName=kernelName,
-        num_iters=num_iters,
-        needTrace=needTrace,
-    )
-
-
-@benchmark()
-def test_gemm(intype, M, N, K, apre, kernelName="", mode="perf"):
-    if get_gfx() not in ["gfx1250"]:
-        return None
-
+@benchmark()  # intype, M, N, K, apre, init, ... become the table's left columns
+def test_gemm(intype, M, N, K, apre, init="random", mode="perf"):
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
 
-    inp, ref = _prep(intype, M, N, K, apre)
+    inp, ref = _prep(intype, M, N, K, apre, init)
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
-    out, us = _run_kernel(intype, inp, apre, kernelName, num_iters, needTrace)
 
-    err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} asm")
-
-    io_bytes = (
-        inp["A"].nbytes
-        + inp["B"].nbytes
-        + inp["sA"].nbytes
-        + inp["sB"].nbytes
-        + out.nbytes
-    )
-    ret = {
-        "intype": intype,
-        "apre": apre,
-        "us": round(us, 2),
-        "TFLOPS": round(M * N * K * 2 / us / 1e6, 1),
-        "TB/s": round(io_bytes / us / 1e6, 2),
-        "err": err,
+    # Single ASM kernel under test, dispatched by intype. Faithful to the model
+    # call: the wrapper allocates its own bf16 output (no preallocated buffer).
+    fn = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
+    candidates = {
+        "asm": lambda: fn(
+            inp["A"],
+            inp["B"],
+            inp["sA"],
+            inp["sB"],
+            dtype=dtypes.bf16,
+            a_preshuffle=bool(apre),  # kernelName omitted -> .cu heuristic picks the tile
+        ),
     }
-    if needTrace:
-        gpu_id = torch.cuda.current_device()
-        ret["trace"] = f"./aiter_logs/gpu_id_{gpu_id}"
+
+    flops = 2 * M * N * K
+    in_bytes = inp["A"].nbytes + inp["B"].nbytes + inp["sA"].nbytes + inp["sB"].nbytes
+
+    ret = {"gfx": get_gfx()}
+    for name, cand in candidates.items():
+        out, us = run_perftest(cand, num_iters=num_iters, needTrace=needTrace)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=1e-1,
+            atol=1.0,
+            msg=f"{intype} {name}",
+        )
+        io_bytes = in_bytes + out.nbytes
+        ret[f"{name} us"] = round(us, 2)
+        ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
+        ret[f"{name} TB/s"] = round(io_bytes / us / 1e6, 2)
+        ret[f"{name} err"] = err
+        if needTrace:
+            ret[f"{name} trace"] = f"./aiter_logs/gpu_id_{torch.cuda.current_device()}"
     return ret
 
 
-def _str2tuple(s: str):
-    return tuple(int(x) for x in s.split(","))
+def main():
+    # Whole-op arch gate goes HERE, not inside test_gemm: @benchmark always
+    # returns the call-args dict, so an in-fn `return` still emits an args-only row.
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "mxfp8fp4 gemm (a8w8/a8w4) unsupported on %s; skipping", get_gfx()
+        )
+        return
 
-
-if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="Test/benchmark gfx1250 MXFP8x{FP8,FP4} (a8w8 / a8w4) ASM kernels",
     )
     parser.add_argument(
         "--mode",
-        choices=["func", "perf", "profile", "all"],
+        choices=["func", "perf", "profile"],
         default="perf",
-        help="func=acc only, perf=acc+timing, profile=perf+trace, all=perf",
+        help="func=acc only, perf=acc+timing, profile=perf+trace",
     )
-    parser.add_argument("--intype", choices=["a8w8", "a8w4", "both"], default="both")
+    parser.add_argument(
+        "--intype",
+        nargs="*",
+        choices=["a8w8", "a8w4"],
+        default=["a8w8", "a8w4"],
+        help="input-type sweep list (a8w8 and/or a8w4)",
+    )
     parser.add_argument(
         "--apre",
         type=int,
+        nargs="*",
         choices=[0, 1],
-        default=1,
-        help="A-preshuffle: 1 to preshuffle A, 0 to send row-major",
+        default=[1],
+        help="A-preshuffle sweep list: 1 preshuffles A, 0 sends it row-major",
     )
-    # Defaults satisfy at least one registered tile each:
-    #   (1024,2048,1024),(4096,8192,1024) -> 256x256; (512,16384,1024) -> 64x512.
+    parser.add_argument(
+        "--init",
+        nargs="*",
+        choices=["constant", "random"],
+        default=["constant", "random"],
+        help="input-data init mode(s)"
+        "  constant = A=1.0, B=2.0/0x33, neutral e8m0 scales (deterministic)"
+        "  random   = randn-derived mxfp8/mxfp4 + random e8m0 scales",
+    )
+    # Default (M,N,K) = union of the POC perf matrices (run.sh + run_compute.sh).
+    # The .cu heuristic picks the registered tile that fits each shape.
+    #   run_compute.sh perf -> 256x256 tile (cluster 4x4, BS=1, init 10):
+    #     fp8: (16384,16384,8192) (16384,16384,16384) (8192,8192,16384)
+    #     fp4: (16384,16384,16384) (16384,16384,32768) (8192,8192,32768) (8192,8192,65536)
+    #   run.sh perf -> 64x512 tile (cluster 1x4, init {10,1}), BS=64 folded into
+    #   M (M_eff = M*BS; aiter forces batch_size=1, so M*BS is FLOP-equivalent):
+    #     fp8 (K=8192):  (1024,16384,8192)  (128,16384,8192)    # M=16*64, 2*64
+    #     fp4 (K=16384): (1024,16384,16384) (128,16384,16384)   # M=16*64, 2*64
+    # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
         "-s",
         "--shape",
-        type=_str2tuple,
+        type=dtypes.str2tuple,
         nargs="*",
-        default=[(1024, 2048, 1024), (4096, 8192, 1024), (512, 16384, 1024)],
-        help="(M,N,K) tuples, e.g. -s 1024,2048,1024 512,16384,1024",
-    )
-    parser.add_argument(
-        "--kernel",
-        type=str,
-        default="",
-        help="Force a specific kernelName (bypass heuristic)",
+        default=[
+            (16384, 16384, 8192),
+            (16384, 16384, 16384),
+            (8192, 8192, 16384),
+            (16384, 16384, 32768),
+            (8192, 8192, 32768),
+            (8192, 8192, 65536),
+            (1024, 16384, 8192),
+            (128, 16384, 8192),
+            (1024, 16384, 16384),
+            (128, 16384, 16384),
+        ],
+        help="(M,N,K) tuples, e.g. -s 16384,16384,8192 128,16384,16384",
     )
     args = parser.parse_args()
 
-    intypes = ["a8w8", "a8w4"] if args.intype == "both" else [args.intype]
     rows = []
-    for it in intypes:
-        for M, N, K in args.shape:
-            ret = test_gemm(
-                it, M, N, K, args.apre, kernelName=args.kernel, mode=args.mode
-            )
-            if ret is not None:
-                rows.append(ret)
+    for intype, (M, N, K), apre, init in itertools.product(
+        args.intype, args.shape, args.apre, args.init
+    ):
+        rows.append(test_gemm(intype, M, N, K, apre, init=init, mode=args.mode))
 
     if rows and args.mode != "func":
         df = pd.DataFrame(rows)
@@ -203,3 +246,7 @@ if __name__ == "__main__":
         )
         if args.mode == "profile":
             aiter.logger.info("profiler traces written under ./aiter_logs/")
+
+
+if __name__ == "__main__":
+    main()
