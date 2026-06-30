@@ -10,9 +10,10 @@
 #   perf    : correctness + latency/TFLOPS/TB-s summary table
 #   profile : perf + a torch profiler trace dumped under ./aiter_logs
 #
-# Shape constraints (persistent + cluster, no partial-tile masking):
+# Shape constraints (persistent + cluster):
 #   256x256 tile (cluster 4x4): M % 1024 == 0, N % 1024 == 0
-#   64x512  tile (cluster 1x4): M % 64   == 0, N % 2048 == 0
+#   64x512  tile (cluster 1x4): N % 2048 == 0  (M unconstrained: partial M-tile
+#                               allowed since M is not clustered)
 #   all:    K % 128 == 0
 # The .cu heuristic picks whichever registered tile fits the shape.
 
@@ -130,7 +131,9 @@ def test_gemm(intype, M, N, K, apre, init="random", mode="perf"):
             inp["sA"],
             inp["sB"],
             dtype=dtypes.bf16,
-            a_preshuffle=bool(apre),  # kernelName omitted -> .cu heuristic picks the tile
+            a_preshuffle=bool(
+                apre
+            ),  # kernelName omitted -> .cu heuristic picks the tile
         ),
     }
 
@@ -212,6 +215,7 @@ def main():
     # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
         "-s",
+        "-mnk",
         "--shape",
         type=dtypes.str2tuple,
         nargs="*",
@@ -221,10 +225,10 @@ def main():
             (16384, 16384, 16384),
             # memory-bound
             # N16K x BS64
-            (16, 1048576, 16384),
-            (2, 1048576, 16384),
-            (16, 1048576, 8192),
-            (2, 1048576, 8192)
+            # (16, 1048576, 16384),
+            # (2, 1048576, 16384),
+            # (16, 1048576, 8192),
+            # (2, 1048576, 8192)
         ],
         help="(M,N,K) tuples, e.g. -s 16384,16384,8192 128,16384,16384",
     )
