@@ -11,15 +11,15 @@ re-exporting A8W4 data from the package source of truth.
 
 from __future__ import annotations
 
+import os
 import sys
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
 
 
-def _load_a8w4_meta_module():
+def _load_ops_meta_module(rel_meta_path: Path, module_name: str):
     here = Path(__file__).resolve()
-    rel_meta_path = Path("aiter") / "ops" / "opus" / "moe_stage2_a8w4_meta.py"
     candidates = [
         here.parents[2] / rel_meta_path,
     ]
@@ -28,7 +28,7 @@ def _load_a8w4_meta_module():
     for path in candidates:
         if path.exists():
             spec = importlib.util.spec_from_file_location(
-                "_opus_moe_stage2_a8w4_meta", path
+                module_name, path
             )
             if spec is None or spec.loader is None:
                 break
@@ -36,12 +36,20 @@ def _load_a8w4_meta_module():
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             return module
-    raise ImportError("unable to locate aiter/ops/opus/moe_stage2_a8w4_meta.py")
+    raise ImportError(f"unable to locate {rel_meta_path.as_posix()}")
 
 
-_a8w4_meta = _load_a8w4_meta_module()
+_a8w4_meta = _load_ops_meta_module(
+    Path("aiter") / "ops" / "opus" / "moe_stage2_a8w4_meta.py",
+    "_opus_moe_stage2_a8w4_meta",
+)
+_a8w4_stage1_meta = _load_ops_meta_module(
+    Path("aiter") / "ops" / "opus_moe_stage1_a8w4_meta.py",
+    "_opus_moe_stage1_a8w4_meta",
+)
 OPUS_A8W4_STAGE2_BY_KID = _a8w4_meta.OPUS_A8W4_STAGE2_BY_KID
 OPUS_A8W4_TUNER_INSTANCES = _a8w4_meta.OPUS_A8W4_TUNER_INSTANCES
+OPUS_A8W4_DSV4_VERIFIED_SHAPE = _a8w4_meta.OPUS_A8W4_DSV4_VERIFIED_SHAPE
 OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT = (
     _a8w4_meta.OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT
 )
@@ -82,7 +90,91 @@ STAGE2_BF16_KERNELS = {
     ),
 }
 
+DEFAULT_STAGE2_KIDS = tuple(STAGE2_BF16_KERNELS)
+
+STAGE2_KERNELS_BY_DTYPE = {
+    "bf16": STAGE2_BF16_KERNELS,
+}
+
 STAGE2_A8W4_KERNELS: dict[int, OpusA8W4Stage2Instance] = dict(OPUS_A8W4_STAGE2_BY_KID)
 STAGE2_A8W4_TUNER_KERNELS: dict[int, OpusA8W4Stage2Instance] = {
     inst.kid: inst for inst in OPUS_A8W4_TUNER_INSTANCES
 }
+OPUS_A8W4_STAGE1_BY_KID = _a8w4_stage1_meta.OPUS_A8W4_STAGE1_BY_KID
+OPUS_A8W4_STAGE1_TUNER_INSTANCES = _a8w4_stage1_meta.OPUS_A8W4_STAGE1_TUNER_INSTANCES
+OpusA8W4Stage1Instance = _a8w4_stage1_meta.OpusA8W4Stage1Instance
+
+STAGE1_A8W4_KERNELS: dict[int, OpusA8W4Stage1Instance] = dict(
+    OPUS_A8W4_STAGE1_BY_KID
+)
+STAGE1_A8W4_TUNER_KERNELS: dict[int, OpusA8W4Stage1Instance] = {
+    inst.kid: inst for inst in OPUS_A8W4_STAGE1_TUNER_INSTANCES
+}
+
+STAGE2_TUNE_KEY_COLUMNS = [
+    "arch",
+    "cu_num",
+    "token",
+    "model_dim",
+    "inter_dim",
+    "expert",
+    "topk",
+    "dtype",
+    "a2_layout",
+    "output_mode",
+    "block_m",
+]
+
+STAGE2_TUNE_RESULT_COLUMNS = [
+    "kid",
+    "kernel_name",
+    "block_n",
+    "block_k",
+    "us",
+    "max_abs",
+    "mean_abs",
+    "valid",
+]
+
+STAGE2_TUNE_COLUMNS = STAGE2_TUNE_KEY_COLUMNS + STAGE2_TUNE_RESULT_COLUMNS
+
+
+def default_stage2_tuned_csv() -> str:
+    env_path = os.environ.get("OPUS_MOE_STAGE2_TUNED_CSV")
+    if env_path:
+        return env_path
+
+    for data_dir in (
+        Path("/shared/amdgpu/home/hyi_qle/yifehuan_temp/data"),
+        Path("/app/yifehuan_temp/data"),
+    ):
+        if data_dir.exists():
+            return str(data_dir / "opus_moe_stage2_tuned.csv")
+
+    return "/tmp/opus_moe_stage2_tuned.csv"
+
+
+def candidate_stage2_kids_for_shape(
+    *,
+    model_dim: int,
+    inter_dim: int,
+    block_m: int,
+    dtype: str = "bf16",
+    requested_kids: list[int] | tuple[int, ...] | None = None,
+) -> list[OpusMoeStage2Instance]:
+    kernel_table = STAGE2_KERNELS_BY_DTYPE.get(dtype, {})
+    default_kids = tuple(kernel_table)
+    kids = list(requested_kids or default_kids)
+    instances: list[OpusMoeStage2Instance] = []
+
+    for kid in kids:
+        inst = kernel_table.get(int(kid))
+        if inst is None:
+            continue
+        if block_m % inst.block_m != 0:
+            continue
+        if model_dim % inst.block_n != 0 or inter_dim % inst.block_k != 0:
+            continue
+        instances.append(inst)
+
+    return instances

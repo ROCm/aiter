@@ -24,3 +24,17 @@ void opus_moe_stage2_reduce_token_slot_route_output_fwd(aiter_tensor_t& route_ou
                                                         aiter_tensor_t& out,
                                                         int topk,
                                                         int block_n);
+
+void opus_moe_stage1_a8w4_fwd(aiter_tensor_t& hidden_states,
+                              aiter_tensor_t& w1,
+                              aiter_tensor_t& hidden_scale,
+                              aiter_tensor_t& w1_scale,
+                              aiter_tensor_t& sorted_token_ids,
+                              aiter_tensor_t& sorted_expert_ids,
+                              aiter_tensor_t& num_valid_ids,
+                              aiter_tensor_t& out,
+                              aiter_tensor_t& out_scale,
+                              int block_m,
+                              int kernel_id,
+                              int inter_dim_pad,
+                              int model_dim_pad);

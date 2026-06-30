@@ -323,7 +323,23 @@ namespace py = pybind11;
           py::arg("route_out"),                                                     \
           py::arg("out"),                                                           \
           py::arg("topk"),                                                          \
-          py::arg("block_n") = -1)
+          py::arg("block_n") = -1);                                                  \
+    m.def("opus_moe_stage1_a8w4_fwd",                                                \
+          &opus_moe_stage1_a8w4_fwd,                                                 \
+          "Experimental A8W4 Opus MoE stage1 path",                                  \
+          py::arg("hidden_states"),                                                  \
+          py::arg("w1"),                                                             \
+          py::arg("hidden_scale"),                                                   \
+          py::arg("w1_scale"),                                                       \
+          py::arg("sorted_token_ids"),                                               \
+          py::arg("sorted_expert_ids"),                                              \
+          py::arg("num_valid_ids"),                                                  \
+          py::arg("out"),                                                            \
+          py::arg("out_scale"),                                                      \
+          py::arg("block_m"),                                                        \
+          py::arg("kernel_id"),                                                      \
+          py::arg("inter_dim_pad"),                                                  \
+          py::arg("model_dim_pad") = 0)
 
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
