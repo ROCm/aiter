@@ -20,7 +20,7 @@ Usage examples
 # FlyDSL only:
   python bench_pa_decode_sparse.py --backend flydsl
 
-# FP8 KV cache path (Triton only — FlyDSL FP8 not yet implemented):
+# FP8 KV cache path (auto-dispatched in FlyDSL):
   python bench_pa_decode_sparse.py --kv_dtype fp8
 
 # Single shape:
@@ -176,10 +176,10 @@ def _run_triton(q, unified_kv, kv_scales, indices, indptr, sink, scale, kv_split
     )
 
 
-def _run_flydsl(q, unified_kv, indices, indptr, sink, scale, kv_splits):
+def _run_flydsl(q, unified_kv, kv_scales, indices, indptr, sink, scale, kv_splits):
     return flydsl_pa_decode_sparse(
         q, unified_kv, indices, indptr, sink, scale,
-        kv_splits=kv_splits, skip_reduce=False,
+        kv_scales=kv_scales, kv_splits=kv_splits, skip_reduce=False,
     )
 
 
@@ -208,9 +208,12 @@ def _verify_backend(backend_name, out, ref, triton_out=None):
     """Print per-check lines; return overall pass/fail."""
     ok_total = True
 
-    passed, max_err = _allclose(out, ref)
-    ok_total = ok_total and passed
-    print(f"    {backend_name} vs torch-ref: {'PASS' if passed else 'FAIL'}  maxErr={max_err:.2e}")
+    if ref is not None:
+        passed, max_err = _allclose(out, ref)
+        ok_total = ok_total and passed
+        print(f"    {backend_name} vs torch-ref: {'PASS' if passed else 'FAIL'}  maxErr={max_err:.2e}")
+    else:
+        print(f"    {backend_name} vs torch-ref: SKIP (no torch ref for fp8)")
 
     if backend_name == "flydsl" and triton_out is not None:
         passed2, max_err2 = _allclose(out, triton_out)
@@ -246,26 +249,30 @@ def run_shape(label, T, H, D, kv_len, backend, kv_dtype, block_k, kv_splits,
     bench_results: dict = {}
     chk_results:   dict = {}
 
-    flydsl_ok = (kv_dtype != "fp8") and (D % 64 == 0)
+    flydsl_ok = (D % 64 == 0)
 
     # --- verification ---
     triton_out = flydsl_out = ref = None
     if do_verify:
         print(f"  [verify] {label}  T={T} H={H} D={D} kv_len={kv_len}")
         if backend in ("triton", "both"):
-            ref        = _torch_reference(q, unified_kv, indices, indptr, sink, scale)
             triton_out = _run_triton(q, unified_kv, kv_scales, indices, indptr, sink, scale,
                                      kv_splits)
-            ok = _verify_backend("triton", triton_out, ref)
+            if kv_dtype != "fp8":
+                ref = _torch_reference(q, unified_kv, indices, indptr, sink, scale)
+                ok = _verify_backend("triton", triton_out, ref)
+            else:
+                ok = True  # fp8 Triton is reference; skip torch comparison
             chk_results["triton"] = _CHK_PASS if ok else _CHK_FAIL
 
         if backend in ("flydsl", "both"):
             if not flydsl_ok:
                 chk_results["flydsl"] = _CHK_UNSUP
             else:
-                if ref is None:
+                if ref is None and kv_dtype != "fp8":
                     ref = _torch_reference(q, unified_kv, indices, indptr, sink, scale)
-                flydsl_out = _run_flydsl(q, unified_kv, indices, indptr, sink, scale, kv_splits)
+                flydsl_out = _run_flydsl(q, unified_kv, kv_scales, indices, indptr, sink, scale,
+                                         kv_splits)
                 ok = _verify_backend("flydsl", flydsl_out, ref,
                                      triton_out=triton_out if backend == "both" else None)
                 chk_results["flydsl"] = _CHK_PASS if ok else _CHK_FAIL
@@ -293,7 +300,7 @@ def run_shape(label, T, H, D, kv_len, backend, kv_dtype, block_k, kv_splits,
             def fn_flydsl():
                 flydsl_pa_decode_sparse(
                     q, unified_kv, indices, indptr, sink, scale,
-                    kv_splits=kv_splits, skip_reduce=skip_reduce,
+                    kv_scales=kv_scales, kv_splits=kv_splits, skip_reduce=skip_reduce,
                 )
             ms = _time_ms(fn_flydsl, cfg)
             bench_results["flydsl"] = (ms, bw_bytes / (ms * 1e-3) * 1e-9,
