@@ -64,6 +64,13 @@ def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
     """
     x_type = src.dtype
     s = src.view(torch.uint8)
+    # The shader loads scales in 32-row super-rows, so the row count must be a
+    # multiple of 32. Pad a short buffer (small M) up to the next multiple with
+    # the neutral e8m0 scale 0x7F (2^0 == 1.0), matching the POC host's
+    # ScaleA_M = (M + 31) & ~31 padding.
+    pad = (-s.shape[0]) % 32
+    if pad:
+        s = F.pad(s, (0, 0, 0, pad), value=0x7F)
     out = _moe_tile_shuffle(s, tile_minor=32, tile_major=4)
     return out.view(x_type)
 
