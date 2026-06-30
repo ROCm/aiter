@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# A4W4 (F4GEMM) test/benchmark for gfx1250 (mi400), modeled on test_gemm_a4w4.py.
-# Drives the unified ``aiter.gemm_a4w4`` API (which dispatches to the mi400
-# F4GEMM path on gfx1250) and reuses the shared harness (run_torch reference,
-# run_perftest, benchmark table, checkAllclose, fp4_utils).
+# A4W4 (F4GEMM) test/benchmark for gfx1250 (mi400), modeled on test_gemm_a4w4.py
+# and the aiter-op-test standard (candidates dict + run_perftest loop, a torch
+# reference that is only compared (never timed/tabled), TFLOPS + TB/s per
+# candidate, one markdown summary table, and a __main__ guard).
 #
-#   MXFP4 (intype=7): reuses the per_1x32 e8m0 quant, gfx1250 weight/scale shuffle
-#   NVFP4 (intype=8): e4m3 per-16 scales + per-tensor global scales
+# Two candidates per (intype, shape, apre) row -- both resolve to the same mi400
+# F4GEMM .co but exercise different entrypoints:
+#   gemm_a4w4 : the unified API the model calls (C++ heuristic picks the tile)
+#   asm       : the low-level asm entry with the tile kernel forced by name
 #
-# Modes (mirrors the shader-side run.sh): func | perf | profile | all
+#   MXFP4 (intype=mxfp4): per_1x32 e8m0 scales, gfx1250 weight/scale shuffle
+#   NVFP4 (intype=nvfp4): e4m3 per-16 scales + per-tensor global scales
 
 import argparse
+import itertools
 
 import pandas as pd
 import torch
@@ -28,6 +32,7 @@ torch.set_printoptions(sci_mode=False)
 pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 
+SUPPORTED_GFX = ["gfx1250"]  # mi400-only F4GEMM (preload SGPR) path
 MXFP4_SCALE_BLOCK = 32
 NVFP4_SCALE_BLOCK = 16
 
@@ -37,6 +42,7 @@ def _e4m3_to_f32(s: torch.Tensor) -> torch.Tensor:
 
 
 def run_torch_mxfp4(xq, wq, xs, ws, dtype):
+    # Reference only: fp32 math, cast back. Not timed, not in the table.
     x_f32 = fp4_utils.mxfp4_to_f32(xq)
     w_f32 = fp4_utils.mxfp4_to_f32(wq)
     xs = fp4_utils.e8m0_to_f32(xs).repeat_interleave(MXFP4_SCALE_BLOCK, dim=1)
@@ -45,6 +51,7 @@ def run_torch_mxfp4(xq, wq, xs, ws, dtype):
 
 
 def run_torch_nvfp4(xq, wq, xs, ws, gA, gB, dtype):
+    # Reference only: fp32 math, cast back. Not timed, not in the table.
     x_f32 = fp4_utils.mxfp4_to_f32(xq)
     w_f32 = fp4_utils.mxfp4_to_f32(wq)
     xs = _e4m3_to_f32(xs).repeat_interleave(NVFP4_SCALE_BLOCK, dim=1)
@@ -93,24 +100,18 @@ def _prep_nvfp4(M, N, K, apre, dtype):
     return inp, ref
 
 
-@benchmark()
-def test_gemm(intype, M, N, K, apre, dtype=dtypes.bf16, mode="perf", tile="auto"):
-    if get_gfx() not in ["gfx1250"]:
-        return None
-
+@benchmark()  # (intype, M, N, K, apre, dtype) become the table's left columns
+def test_gemm(intype, M, N, K, apre, dtype=dtypes.bf16):
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
     inp, ref = (_prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4)(M, N, K, apre, dtype)
 
-    needTrace = mode == "profile"
-    num_iters = 5 if mode == "func" else 101
-
-    if tile == "auto":
-        # Unified API: tile picked by the C++ heuristic. NVFP4 global scales as tensors.
+    def run_unified():
+        # The path the model runs: unified API, C++ heuristic picks the tile.
+        # NVFP4 per-tensor global scales are passed as tensors here.
         gA = None if inp["gA"] is None else torch.tensor(inp["gA"], dtype=torch.float32)
         gB = None if inp["gB"] is None else torch.tensor(inp["gB"], dtype=torch.float32)
-        out, us = run_perftest(
-            aiter.gemm_a4w4,
+        return aiter.gemm_a4w4(
             inp["A"],
             inp["B"],
             inp["sA"],
@@ -120,92 +121,73 @@ def test_gemm(intype, M, N, K, apre, dtype=dtypes.bf16, mode="perf", tile="auto"
             bpreshuffle=True,
             global_A_scale=gA,
             global_B_scale=gB,
-            num_iters=num_iters,
-            needTrace=needTrace,
         )
-        which = "gemm_a4w4"
-    else:
-        # Force a specific tile via the low-level asm entry (kernel per intype).
-        which = f"f4gemm_{intype}_{tile}_apre{apre}"
-        if intype == "nvfp4":
-            out, us = run_perftest(
-                aiter.gemm_nvfp4_asm,
-                inp["A"],
-                inp["B"],
-                inp["sA"],
-                inp["sB"],
-                inp["gA"],
-                inp["gB"],
-                dtype=dtype,
-                a_preshuffle=bool(apre),
-                kernelName=which,
-                num_iters=num_iters,
-                needTrace=needTrace,
-            )
-        else:
-            out, us = run_perftest(
-                aiter.gemm_mxfp4_asm,
-                inp["A"],
-                inp["B"],
-                inp["sA"],
-                inp["sB"],
-                dtype=dtype,
-                a_preshuffle=bool(apre),
-                kernelName=which,
-                num_iters=num_iters,
-                needTrace=needTrace,
-            )
-    err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {which}")
 
-    io_bytes = (
+    def run_asm():
+        # Low-level asm entry with the 256x256 tile kernel forced by name.
+        knl = f"f4gemm_{intype}_256x256_apre{apre}"
+        if intype == "nvfp4":
+            return aiter.gemm_nvfp4_asm(
+                inp["A"], inp["B"], inp["sA"], inp["sB"], inp["gA"], inp["gB"],
+                dtype=dtype, a_preshuffle=bool(apre), kernelName=knl,
+            )
+        return aiter.gemm_mxfp4_asm(
+            inp["A"], inp["B"], inp["sA"], inp["sB"],
+            dtype=dtype, a_preshuffle=bool(apre), kernelName=knl,
+        )
+
+    candidates = {"gemm_a4w4": run_unified}
+    # Only the apre=1 256x256 tile kernels are shipped today (hsa/gfx1250/f4gemm).
+    # Skip the forced-tile asm candidate elsewhere instead of erroring the row.
+    if apre == 1:
+        candidates["asm"] = run_asm
+
+    flops = 2 * M * N * K
+    nbytes = (
         inp["A"].nbytes
         + inp["B"].nbytes
         + inp["sA"].nbytes
         + inp["sB"].nbytes
-        + out.nbytes
+        + M * N * dtype.itemsize  # bf16 output
     )
-    ret = {
-        "intype": intype,
-        "tile": tile,
-        "apre": apre,
-        "us": round(us, 2),
-        "TFLOPS": round(M * N * K * 2 / us / 1e6, 1),
-        "TB/s": round(io_bytes / us / 1e6, 2),
-        "err": err,
-    }
-    if needTrace:
-        ret["trace"] = f"./aiter_logs/gpu_id_{torch.cuda.current_device()}"
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        out, us = run_perftest(fn)
+        err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {name}")
+        ret[f"{name} us"] = round(us, 2)
+        ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
+        ret[f"{name} TB/s"] = round(nbytes / us / 1e6, 2)
+        ret[f"{name} err"] = err
     return ret
 
 
-def _str2tuple(s: str):
-    return tuple(int(x) for x in s.split(","))
+def main():
+    # Whole-op arch gate goes HERE: @benchmark always returns the call-args dict,
+    # so an in-fn return would still emit an args-only NaN row.
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("gemm_a4w4 (mi400 F4GEMM) unsupported on %s; skipping", get_gfx())
+        return
 
-
-if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="Test/benchmark gfx1250 A4W4 (F4GEMM) via the unified gemm_a4w4 API",
     )
     parser.add_argument(
-        "--mode",
-        choices=["func", "perf", "profile", "all"],
-        default="perf",
-        help="func=acc only, perf=acc+timing, profile=perf+trace, all=perf",
-    )
-    parser.add_argument("--intype", choices=["mxfp4", "nvfp4", "both"], default="nvfp4")
-    parser.add_argument(
-        "--tile",
-        choices=["auto", "256x256"],
-        default="auto",
-        help="auto=unified gemm_a4w4 (C++ heuristic); 256x256 forces that tile",
+        "--intype",
+        nargs="*",
+        choices=["mxfp4", "nvfp4"],
+        default=["mxfp4", "nvfp4"],
+        help="fp4 input format(s) to sweep, e.g. --intype nvfp4",
     )
     parser.add_argument(
         "--apre",
         type=int,
+        nargs="*",
         choices=[0, 1],
-        default=1,
-        help="A-preshuffle: 1 to preshuffle A, 0 to send row-major",
+        default=[1],
+        help="A-preshuffle variant(s): 1 preshuffles A, 0 sends row-major "
+        "(only apre=1 256x256 kernels are currently shipped)",
     )
     parser.add_argument(
         "-d",
@@ -217,34 +199,29 @@ if __name__ == "__main__":
         default=[dtypes.d_dtypes["bf16"]],
         help="output dtype, e.g. -d bf16",
     )
-    # cluster(4x4)+persistent friendly for the 256x256 tile: M%1024, N%1024.
     parser.add_argument(
         "-mnk",
         "--shape",
-        type=_str2tuple,
+        type=dtypes.str2tuple,
         nargs="*",
-        default=[(1024, 2048, 2048), (2048, 4096, 4096)],
-        help="(M,N,K) tuples, e.g. -mnk 1024,2048,2048 2048,4096,4096",
+        # cluster(4x4)+persistent friendly for the 256x256 tile: M%1024, N%1024.
+        default=[(2048, 2048, 2048), (16384, 16384, 16384)],
+        help="(M,N,K) tuples, e.g. -mnk 2048,2048,2048 16384,16384,16384",
     )
     args = parser.parse_args()
 
-    intypes = ["mxfp4", "nvfp4"] if args.intype == "both" else [args.intype]
-    rows = []
-    for dtype in args.dtype:
-        for it in intypes:
-            for M, N, K in args.shape:
-                ret = test_gemm(
-                    it, M, N, K, args.apre, dtype=dtype, mode=args.mode, tile=args.tile
-                )
-                if ret is not None and "us" in ret:
-                    rows.append(ret)
-
-    if rows and args.mode != "func":
+    for dtype in args.dtype:  # one table per output dtype
+        rows = [
+            test_gemm(intype, M, N, K, apre, dtype=dtype)
+            for intype, apre, (M, N, K) in itertools.product(
+                args.intype, args.apre, args.shape
+            )
+        ]
         df = pd.DataFrame(rows)
         aiter.logger.info(
-            "gemm_a4w4_mi400 %s summary (markdown):\n%s",
-            args.mode,
-            df.to_markdown(index=False),
+            "gemm_a4w4_mi400 summary (markdown):\n%s", df.to_markdown(index=False)
         )
-        if args.mode == "profile":
-            aiter.logger.info("profiler traces written under ./aiter_logs/")
+
+
+if __name__ == "__main__":
+    main()
