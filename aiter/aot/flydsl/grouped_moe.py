@@ -420,9 +420,12 @@ def compile_one_config(**job):
 
     aot_arch = job.pop("gfx", "") or GROUPED_MOE_AOT_ARCH_DEFAULT
     shape_str = (
+        # Use .get() so a missing key can't raise here, outside the try below:
+        # an escaping exception would crash the worker (exitcode != 0), which the
+        # AOT pool misreads as a transient failure and retries -> potential deadlock.
         f"{job.get('kernel_name', 'grouped_gemm')}  "
-        f"model_dim={job['model_dim']} inter_dim={job['inter_dim']} "
-        f"E={job['experts']} topk={job['topk']} "
+        f"model_dim={job.get('model_dim')} inter_dim={job.get('inter_dim')} "
+        f"E={job.get('experts')} topk={job.get('topk')} "
         f"contiguous={bool(job.get('grouped_contiguous_m', False))}"
     )
 
@@ -615,6 +618,10 @@ def compile_one_config(**job):
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
     except Exception as e:
+        # Catch everything and return cleanly with compile_time=None: the AOT pool
+        # keys off exitcode 0 + compile_time=None to mark "produced no kernel" and
+        # NOT retry it. An escaping exception crashes the worker (exitcode != 0),
+        # which the pool misreads as a transient failure and retries -> deadlock.
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
         traceback.print_exc()
         return {**job, "compile_time": None, "compile_arch": aot_arch}
