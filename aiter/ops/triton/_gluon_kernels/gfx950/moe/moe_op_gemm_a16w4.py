@@ -185,6 +185,7 @@ def _moe_gemm_a16w4(
     expt_data = gl.load(ExptData + pid_m)
     if XCD_SWIZZLE == 1 and expt_data == -1:
         return
+    
     expt_id = expt_data & 0x0000FFFF
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
@@ -192,6 +193,9 @@ def _moe_gemm_a16w4(
     expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
     start_m = start_m.to(index_type)
     pid_n = pid_n.to(index_type)
+
+    # size_per_thread[K]=8 keeps the bf16 transfer at 128 bits, satisfying the
+    # buffer_load_to_shared requirement (size_per_thread * element_bits in {32, 128}).
     GLOBAL_X_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[16, 4],
@@ -210,15 +214,27 @@ def _moe_gemm_a16w4(
         warps_per_cta=[num_warps, 1],
         order=[1, 0]
     )
+    # Offsets layout for the scale's buffer_load_to_shared. The HW requires
+    # size_per_thread * element_bits in {32, 128}; the e8m0 scales are uint8, so
+    # size_per_thread[K]=4 -> 32 bits. (GLOBAL_WS_LAYOUT's [1,8] would be 64 bits
+    # and fails to lower.) The consume layout from shared stays GLOBAL_WS_LAYOUT.
+    GLOBAL_WS_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[16, 4],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0]
+    )
 
     # X / gather offsets
+    X_base = X
     if GatherIndx is None:
-        X += start_m * stride_x_m
+        X_base += start_m * stride_x_m
         offs_x_m_scalar = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, GLOBAL_X_LAYOUT))
         # Wrap within this expert's [0, M) rows so blocks that extend past the
         # expert's token count don't read out of bounds (rows past M are masked
         # out at store time). Mirrors the `offs_x_m % M` guard in the Triton kernel.
-        offs_x_m = offs_x_m_scalar % M
+        #offs_x_m = offs_x_m_scalar % M
+        offs_x_m = offs_x_m_scalar
     else:
         if GatherIndx.dtype.element_ty == gl.uint16:
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
@@ -237,14 +253,14 @@ def _moe_gemm_a16w4(
         
         offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
         mask_idx = offs_x_m < M
-        offs_x_m = offs_x_m % M
+        #offs_x_m = offs_x_m % M
         GatherIndx += start_m
         offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
         offs_x_m = gl.convert_layout(offs_x_m, gl.SliceLayout(1, GLOBAL_X_LAYOUT))
     offs_x_k = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, GLOBAL_X_LAYOUT))
     x_offsets = offs_x_m[:, None]*stride_x_m + offs_x_k[None, :]*stride_x_k
-    XPtrs = (X + x_offsets)
+    XPtrs = (X_base + x_offsets)
 
     W_K_DIVISOR: gl.constexpr = 2  # fp4: two values packed per uint8 along K
     W_N_DIVISOR: gl.constexpr = 1
@@ -257,8 +273,9 @@ def _moe_gemm_a16w4(
     # not read out of bounds; the extra columns are masked out at store time.
     offs_w_n = (pid_n * PACKED_BLOCK_N_W + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(1, GLOBAL_W_LAYOUT))) % (N // W_N_DIVISOR)
     offs_w_k = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(0, GLOBAL_W_LAYOUT))
-    W += expt_id * stride_w_e
-    WPtrs = W + (
+    W_base = W + expt_id * stride_w_e
+    w_offsets = offs_w_k[None, :] * stride_w_k + offs_w_n[:, None] * stride_w_n
+    WPtrs = W_base + (
         offs_w_k[None, :] * stride_w_k +
         offs_w_n[:, None] * stride_w_n
     )
@@ -276,12 +293,41 @@ def _moe_gemm_a16w4(
         PRESHUFFLE_FACTOR: gl.constexpr = 1
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
-    offs_w_n_scale = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, GLOBAL_WS_LAYOUT))) % N
-    offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, GLOBAL_WS_LAYOUT))
+    offs_w_n_scale = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, GLOBAL_WS_LOAD_LAYOUT))) % N
+    offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, GLOBAL_WS_LOAD_LAYOUT))
+    w_scale_offsets = offs_w_k_scale[None, :] * stride_w_mx_k + offs_w_n_scale[:, None] * stride_w_mx_n 
     WMxScalePtrs = (
         WMxScale +
         offs_w_k_scale[None, :] * stride_w_mx_k +
         offs_w_n_scale[:, None] * stride_w_mx_n 
+    )
+
+    SHARED_LAYOUT_X: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    SHARED_LAYOUT_W: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+
+    '''
+    SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0]
+    )
+    SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[PACKED_BLOCK_K_W, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0]
+    )
+    SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_K, 16]],
+        [SCALE_BLOCK_N, PACKED_MX_BLOCK],
+        [1, 0],
+    )
+    '''
+
+    x_buffer = gl.allocate_shared_memory(
+        X.dtype.element_ty, shape= [BLOCK_M, BLOCK_K], layout=SHARED_LAYOUT_X
+    )
+    w_buffer = gl.allocate_shared_memory(
+        W.dtype.element_ty, shape= [BLOCK_N, PACKED_BLOCK_K_W], layout=SHARED_LAYOUT_W
+    )
+    ws_buffer = gl.allocate_shared_memory(
+        WMxScale.dtype.element_ty, shape= [SCALE_BLOCK_N, PACKED_MX_BLOCK], layout=SHARED_LAYOUT_W_SCALES
     )
 
     #MFMA Layout - instruction [16,16,32]
@@ -302,19 +348,45 @@ def _moe_gemm_a16w4(
         # the case where BLOCK_K evenly divides K), and only the trailing
         # partial block is masked.
         k_base = k * BLOCK_K
-        #load x
+
         mask_x = (k_base + offs_x_k < K)[None, :] & (offs_x_m < num_tokens)[:, None]
         mask_w = (k_base // W_K_DIVISOR + offs_w_k < K // W_K_DIVISOR)[None, :]
-        x = gl.load(XPtrs, mask=mask_x, other=0.0)
+
+        #load x
+        #Option 1. Works
+        #x = gl.load(XPtrs, mask=mask_x, other=0.0)
+        
+        #Option 2. Compiler error
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(x_buffer, X_base, x_offsets, mask=mask_x, other=0.0)
+        gl.amd.cdna4.async_copy.commit_group()
+        gl.amd.cdna4.async_copy.wait_group(0)
+        x = x_buffer.load(GLOBAL_X_LAYOUT)
+
+        #Option 3. Works
+        #x = gl.amd.cdna3.buffer_load(X_base, x_offsets, mask=mask_x, other=0.0)
+
         #load w
         w = gl.load(WPtrs, mask=mask_w, other=0.0)
+        #gl.amd.cdna4.async_copy.buffer_load_to_shared(w_buffer, W_base, w_offsets, mask=mask_w, other=0.0)
+        #gl.amd.cdna4.async_copy.commit_group()
+        #gl.amd.cdna4.async_copy.wait_group(0)
+        #w = w_buffer.load(GLOBAL_W_LAYOUT)
+
         #load w_scales
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
             w_scales = gl.load(WMxScalePtrs)
-            w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
+            #w_scales = gl.amd.cdna4.async_copy.buffer_load_to_shared(ws_buffer, WMxScale, w_scale_offsets)
         else:
             mask_w_k_scale = (k_base + offs_w_k_scale * MX_PACK_DIVISOR < K)[None, :]
             w_scales = gl.load(WMxScalePtrs, mask=mask_w_k_scale, other=0.0)
+            #w_scales = gl.amd.cdna4.async_copy.buffer_load_to_shared(ws_buffer, WMxScale, w_scale_offsets, mask=mask_w_k_scale, other=0.0)
+        
+
+        #w_scales = ws_buffer.load(GLOBAL_WS_LAYOUT)
+        if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+            w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
+
+
         #convert weight scales layout
         w_scales = (
             w_scales.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
@@ -323,18 +395,24 @@ def _moe_gemm_a16w4(
         )
         w_scales = gl.convert_layout(w_scales, GLOBAL_WS_LAYOUT)
         #upcast w to bf16
-        w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=1
-                                            )
+        w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=1)
 
         #convert weight layout
         x = gl.convert_layout(x, DOT_LAYOUT_X)
         w_kn = gl.convert_layout(w_bf16.trans(1,0), DOT_LAYOUT_W)
+        #w_kn = gl.convert_layout(w_bf16, DOT_LAYOUT_W)
 
         #acc = mfma
         acc = gl.amd.cdna4.mfma(x, w_kn, acc)
 
         #advance K pointers for the next block
-        XPtrs += BLOCK_K * stride_x_k
+        #If using option 2 or 3
+        X_base += BLOCK_K * stride_x_k
+        #W_base += PACKED_BLOCK_K_W * stride_w_k
+        #WMxScale += PACKED_MX_BLOCK * stride_w_mx_k
+
+        #If using option 1.
+        #XPtrs += BLOCK_K * stride_x_k
         WPtrs += PACKED_BLOCK_K_W * stride_w_k
         WMxScalePtrs += PACKED_MX_BLOCK * stride_w_mx_k
 
