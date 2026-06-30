@@ -21,6 +21,7 @@ from __future__ import annotations
 import csv
 import functools
 import math
+import os
 import warnings
 from pathlib import Path
 
@@ -1139,12 +1140,20 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # mis-read the [B, Hg, K, T] layout the KV forks require. V must be a
     # multiple of 64 for this to be legal.
     if _fork in ("kv", "kv_naive"):
-        if V % 64 != 0:
+        # ``kv`` is still BV=64-only. ``kv_naive`` is now VWARP-parameterized
+        # (BV = NUM_WARPS*16, NUM_WARPS in {1,2,4}), so it accepts BV in
+        # {16,32,64}; override with FLYDSL_K5_KVNAIVE_BV for A/B sweeps,
+        # otherwise default to 64 (the tuned production choice).
+        if _fork == "kv_naive":
+            _bv_env = os.environ.get("FLYDSL_K5_KVNAIVE_BV")
+            BV = int(_bv_env) if _bv_env else 64
+            assert BV in (16, 32, 64), "kv_naive BV must be in {16,32,64}"
+        else:
+            BV = 64
+        if V % BV != 0:
             raise ValueError(
-                f"FlyDSL K5 {_fork}: requires V % 64 == 0 (BV=64-only fork); "
-                f"got V={V}."
+                f"FlyDSL K5 {_fork}: requires V % BV == 0; got V={V}, BV={BV}."
             )
-        BV = 64
 
     # Fork routing. Each fork maps to its OWN compiled kernel (distinct
     # ``_get_or_compile*`` cache namespace) -- no shared flag dispatch:
@@ -1156,8 +1165,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     #     (baseline layout, NOT the BV==64-only VWARP fork).
     #   * None          : baseline kernel.
     _vwarp_gate = BV == 64
+    # kv_naive is VWARP-parameterized (BV in {16,32,64} -> NUM_WARPS in {1,2,4}).
+    _kv_naive_gate = BV in (16, 32, 64)
     _kv_opt_active = (_fork == "kv") and _vwarp_gate
-    _kv_naive_active = (_fork == "kv_naive") and _vwarp_gate
+    _kv_naive_active = (_fork == "kv_naive") and _kv_naive_gate
     _vk_active = (_fork == "vk") and _vwarp_gate
     _vk_naive_active = (_fork == "vk_naive") and _vwarp_gate
     _hipport_active = (_fork == "hipport") and _vwarp_gate

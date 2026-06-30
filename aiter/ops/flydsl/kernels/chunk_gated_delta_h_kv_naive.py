@@ -121,23 +121,29 @@ def compile_chunk_gated_delta_h_kv_naive(
     assert BV % 16 == 0
     NUM_K_BLOCKS = K // 64
 
-    assert BV == 64, "naive KV fork is VWARP-only (BV must be 64)"
+    # VWARP fork: each warp owns ONE 16-wide V-tile, full K, full BT (V is the
+    # output column in BOTH GEMM1 and GEMM2, so splitting V across warps needs no
+    # cross-warp reduction). Hence BV == NUM_WARPS * 16 and the WG size scales
+    # with BV: BV=64->4 warps/256 thr, BV=32->2 warps/128 thr, BV=16->1 warp/64.
+    assert BV in (16, 32, 64), "VWARP KV fork supports BV in {16,32,64} (BV=NUM_WARPS*16)"
     assert not USE_GK, "naive KV fork does not support per-K gates (USE_GK)"
 
     _fast_exp = _make_fast_exp(G_IS_LOG2_SCALED)
 
     WARP_SIZE = 64
-    NUM_WARPS = 4
-    BLOCK_THREADS = NUM_WARPS * WARP_SIZE
-
     WMMA_N = 16
     WMMA_K = 32  # ds_read_tr16 bt-row span granularity (2 x 16)
-    N_REPEAT = BV // WMMA_N  # 4
 
-    NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT
+    NUM_WARPS = BV // WMMA_N  # one 16-wide V-tile per warp -> BV = NUM_WARPS*16
+    BLOCK_THREADS = NUM_WARPS * WARP_SIZE
 
-    K_SUB_PER_BLOCK = 64 // WMMA_N  # 16-wide K sub-tiles per 64 block (=4)
-    BT_MTILES = BT // WMMA_N  # 16-row BT M-tiles a warp spans in GEMM1 (=4)
+    # K-sub-tiles per 64-K block and BT M-tiles a warp spans in GEMM1. These are
+    # BV-INDEPENDENT (each warp covers the full K and full BT for its V-tile).
+    K_SUB_PER_BLOCK = 64 // WMMA_N  # =4
+    BT_MTILES = BT // WMMA_N  # =4
+
+    # h_accs covers the full K for this warp's V-tile -> independent of BV.
+    NUM_H_ACCS = NUM_K_BLOCKS * K_SUB_PER_BLOCK
 
     # EXPERIMENT toggle: stage u via lds_u (True, rev211+) vs read u as scalar
     # from HBM (False, rev210 path). MEASURED (varlen-32k-aws, T1000): USE_LDS_U
@@ -317,13 +323,13 @@ def compile_chunk_gated_delta_h_kv_naive(
     LDS_G_ELEMS = BT
     LDS_G_BYTES = LDS_G_ELEMS * 4
 
-    _K5_KERNEL_REVISION = 227  # HIP-align: w/k load -> GEMM1, h-snapshot store decoupled -> before GEMM2 (overlap)
+    _K5_KERNEL_REVISION = 230  # NUM_WARPS=BV//16 variable (BV in {16,32,64}); N_REPEAT disentangled -> K_SUB_PER_BLOCK
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_kv_naive_vkb128alias_u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}ht{int(LDS_HT_INDEPENDENT)}wpf{int(W_PF_INTERLEAVE)}kpf{int(K_PF_INTERLEAVE)}wg1{int(W_PF_INTERLEAVE_GEMM1)}hov{int(HT_STORE_OVERLAP_GEMM2)}_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_kv_naive_vkb128alias_bv{BV}u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}ht{int(LDS_HT_INDEPENDENT)}wpf{int(W_PF_INTERLEAVE)}kpf{int(K_PF_INTERLEAVE)}wg1{int(W_PF_INTERLEAVE_GEMM1)}hov{int(HT_STORE_OVERLAP_GEMM2)}_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
@@ -351,9 +357,16 @@ def compile_chunk_gated_delta_h_kv_naive(
 
     # Cooperative load parameters
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
-    THREADS_PER_ROW_64 = 64 // LOAD_VEC_WIDTH  # 8
+    THREADS_PER_ROW_64 = 64 // LOAD_VEC_WIDTH  # 8 (w loads 64-wide K blocks)
     ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64  # 32
     NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64  # 2
+    # u is [BT, BV]: its cooperative load must tile the BV-wide V segment, NOT
+    # the 64-wide K block w uses. For BV=64 these match the _64 params; for BV<64
+    # they differ -- using the 64-wide decomposition would read past the BV-wide
+    # segment into the next i_v block / past V (GPU page fault). So u gets its own.
+    THREADS_PER_ROW_U = BV // LOAD_VEC_WIDTH  # BV=64->8, 32->4, 16->2
+    ROWS_PER_BATCH_U = BLOCK_THREADS // THREADS_PER_ROW_U
+    NUM_LOAD_BATCHES_U = BT // ROWS_PER_BATCH_U
 
     @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_kv_naive")
     def gdn_h_kernel(
@@ -416,6 +429,9 @@ def compile_chunk_gated_delta_h_kv_naive(
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
         load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(LOAD_VEC_WIDTH)
+        # u-specific (BV-wide segment, not the 64-wide K block).
+        u_load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_U)
+        u_load_col_base = (tid % fx.Int32(THREADS_PER_ROW_U)) * fx.Int32(LOAD_VEC_WIDTH)
 
         v8bf16_type = T.vec(8, T.bf16)
         lds_w_memref = lds_w_ptr.get()
@@ -504,7 +520,7 @@ def compile_chunk_gated_delta_h_kv_naive(
         acc_zero = fx.full(4, 0.0, fx.Float32)
         h_accs = []
         for _kb in range_constexpr(NUM_K_BLOCKS):
-            for _nr in range_constexpr(N_REPEAT):
+            for _nr in range_constexpr(K_SUB_PER_BLOCK):
                 h_accs.append(acc_zero)
 
         # -- Load initial state (VWARP: wid -> V-tile, slot -> K sub-tile).
@@ -512,7 +528,7 @@ def compile_chunk_gated_delta_h_kv_naive(
         # fork -- only the snapshot STORE differs between the KV/VK forks. --
         if const_expr(USE_INITIAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for slot in range_constexpr(N_REPEAT):
+                for slot in range_constexpr(K_SUB_PER_BLOCK):
                     h0_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
                     h0_row_base = (
                         fx.Int32(kb * 64)
@@ -523,7 +539,7 @@ def compile_chunk_gated_delta_h_kv_naive(
                     loaded_vec = h0_.vec_load((fx.Index(h0_off_base),), 4)
                     if const_expr(STATE_DTYPE_BF16):
                         loaded_vec = loaded_vec.extf(T.f32x4)
-                    acc_idx = kb * N_REPEAT + slot
+                    acc_idx = kb * K_SUB_PER_BLOCK + slot
                     h_accs[acc_idx] = h_accs[acc_idx] + loaded_vec
 
         NUM_W_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
@@ -650,8 +666,8 @@ def compile_chunk_gated_delta_h_kv_naive(
                 gpu.barrier()
             ht_v_col = wid * fx.Int32(16) + lane_n
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for slot in range_constexpr(N_REPEAT):
-                    acc_val = h_accs_in[kb * N_REPEAT + slot]
+                for slot in range_constexpr(K_SUB_PER_BLOCK):
+                    acc_val = h_accs_in[kb * K_SUB_PER_BLOCK + slot]
                     k_tile_base = (
                         fx.Int32(kb * 64)
                         + fx.Int32(slot * 16)
@@ -723,16 +739,16 @@ def compile_chunk_gated_delta_h_kv_naive(
             # buffer_load_ushort that were the #2 VMEM-wait hotspot. Published
             # on the SAME barrier below as w (no extra barrier).
             if const_expr(USE_LDS_U):
-              for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+              for batch in range_constexpr(NUM_LOAD_BATCHES_U):
+                row = fx.Int32(batch * ROWS_PER_BATCH_U) + u_load_row_in_batch
                 abs_row = i_t_i32 * fx.Int32(BT) + row
                 safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
                 u_g_off = (
                     v_base + safe_row * stride_v
-                    + i_v * fx.Int32(BV) + load_col_base
+                    + i_v * fx.Int32(BV) + u_load_col_base
                 )
                 u_vec = v_.vec_load((fx.Index(u_g_off),), LOAD_VEC_WIDTH)
-                u_lds_off = row * fx.Int32(LDS_U_STRIDE) + load_col_base
+                u_lds_off = row * fx.Int32(LDS_U_STRIDE) + u_load_col_base
                 lds_u.vec_store((fx.Index(u_lds_off),), u_vec, LOAD_VEC_WIDTH)
 
             # OPT-C(g) (PHASE-4): cooperatively stage this chunk's per-row g into
@@ -792,7 +808,7 @@ def compile_chunk_gated_delta_h_kv_naive(
             # 4. GEMM1: b_v = w @ h^T (h from registers). VWARP.
             # ============================================================
             bv_accs = []
-            for _i in range_constexpr(N_REPEAT):
+            for _i in range_constexpr(BT_MTILES):
                 bv_accs.append(fx.full(4, 0.0, fx.Float32))
 
             # W_PF_INTERLEAVE_GEMM1: issue NEXT chunk's w/k vec_loads INTERLEAVED
@@ -843,7 +859,7 @@ def compile_chunk_gated_delta_h_kv_naive(
                             w_lds_row_idx * fx.Index(LDS_W_STRIDE) + w_lds_col_idx
                         )
                         a_frag = _lds_vec_read_w_bf16x4(w_lds_idx)
-                        b_frag = h_accs_in[kb * N_REPEAT + slot].to(fx.BFloat16)
+                        b_frag = h_accs_in[kb * K_SUB_PER_BLOCK + slot].to(fx.BFloat16)
                         bv_accs[m_bt] = _mfma_bf16_16x16x16(
                             a_frag, b_frag, bv_accs[m_bt]
                         )
@@ -1019,8 +1035,8 @@ def compile_chunk_gated_delta_h_kv_naive(
 
                 exp_g_last_s = fx.Float32(exp_g_last)
                 for kb in range_constexpr(NUM_K_BLOCKS):
-                    for nr in range_constexpr(N_REPEAT):
-                        acc_idx = kb * N_REPEAT + nr
+                    for nr in range_constexpr(K_SUB_PER_BLOCK):
+                        acc_idx = kb * K_SUB_PER_BLOCK + nr
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_s
 
             # ============================================================
@@ -1075,10 +1091,10 @@ def compile_chunk_gated_delta_h_kv_naive(
                 if const_expr(K_PF_INTERLEAVE):
                     k_next_pf = [None] * K_LOAD_BATCHES
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for slot in range_constexpr(N_REPEAT):
-                    acc_idx = kb * N_REPEAT + slot
+                for slot in range_constexpr(K_SUB_PER_BLOCK):
+                    acc_idx = kb * K_SUB_PER_BLOCK + slot
                     if const_expr(W_PF_INTERLEAVE and not W_PF_INTERLEAVE_GEMM1):
-                        g2_slot = kb * N_REPEAT + slot
+                        g2_slot = kb * K_SUB_PER_BLOCK + slot
                         # slots [0, NUM_W_LOADS) carry the w prefetch loads;
                         # slots [NUM_W_LOADS, NUM_W_LOADS+K_LOAD_BATCHES) carry k.
                         if const_expr(g2_slot < NUM_W_LOADS):
@@ -1122,8 +1138,8 @@ def compile_chunk_gated_delta_h_kv_naive(
         # -- Epilogue: store final state (VK [V, K], same as VK fork) --
         if const_expr(STORE_FINAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
-                for slot in range_constexpr(N_REPEAT):
-                    acc_idx = kb * N_REPEAT + slot
+                for slot in range_constexpr(K_SUB_PER_BLOCK):
+                    acc_idx = kb * K_SUB_PER_BLOCK + slot
                     acc_val = h_accs_final[acc_idx]
                     ht_col = i_v * fx.Int32(BV) + wid * fx.Int32(16) + lane_n
                     ht_row_base = (
