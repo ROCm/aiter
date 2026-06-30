@@ -319,6 +319,10 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["fuse_fp4_quant"] = True
         elif stage == 2 and token == "persist":
             params["persist"] = True
+        elif stage == 2 and token.startswith("pn") and token[2:].isdigit():
+            # persist_n: number of N-tiles each workgroup covers (per-WG N-loop
+            # length). Only meaningful with `persist`. See compile_moe_gemm2.
+            params["persist_n"] = int(token[2:])
         elif token.startswith("sbm") and token[3:].isdigit():
             params["sort_block_m"] = int(token[3:])
         elif token == "fq":
@@ -1029,6 +1033,7 @@ def compile_flydsl_moe_stage2(
     n_per_wave: int = 32,
     k_batch: int = 1,
     persist: bool = False,
+    persist_n: int = 0,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if direct:
@@ -1109,6 +1114,7 @@ def compile_flydsl_moe_stage2(
             n_per_wave=n_per_wave,
             k_batch=k_batch,
             persist=persist,
+            persist_n=persist_n,
         )
 
 
@@ -1891,6 +1897,7 @@ def flydsl_moe_stage2(
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
     persist: Optional[bool] = None,
+    persist_n: int = 0,
     use_async_copy: bool = False,
     waves_per_eu: int = 3,
     b_nt: int = 2,
@@ -2070,6 +2077,7 @@ def flydsl_moe_stage2(
         n_per_wave=n_per_wave,
         k_batch=k_batch,
         persist=bool(persist),
+        persist_n=persist_n,
     )
     _run_compiled(exe, args)
 

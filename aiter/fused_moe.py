@@ -1363,6 +1363,7 @@ def _flydsl_stage2_wrapper(
         # Keep stage2 persist behavior aligned with kernel naming.
         # For migrated old kernels (non `_persist` names), force legacy non-persistent path.
         persist=parsed.get("persist", False),
+        persist_n=parsed.get("persist_n", 0),
         n_per_wave=parsed.get("n_per_wave", 32),
         k_batch=parsed.get("k_batch", 1),
     )

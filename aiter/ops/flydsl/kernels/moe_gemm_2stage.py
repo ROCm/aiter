@@ -2177,6 +2177,7 @@ def compile_moe_gemm2(
     n_per_wave: int = 32,
     k_batch: int = 1,
     persist: bool = False,
+    persist_n: int = 0,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2468,6 +2469,25 @@ def compile_moe_gemm2(
         "FLYDSL_MOE_STAGE2_PERSIST_PF", "1"
     ) in ("1", "true", "True", "YES", "yes")
 
+    # persist_n: how many N-tiles each workgroup covers when persist is on.
+    # Generalizes the persist on/off boolean into a count:
+    #   persist_n == gx_total  -> one WG does ALL N-tiles (current full persist)
+    #   persist_n == 1         -> one WG does 1 N-tile (~= persist off, grid spans N)
+    #   1 < persist_n < gx     -> grid X dim = gx_total/persist_n; each WG sweeps
+    #                             persist_n consecutive N-tiles. Trades X reuse /
+    #                             cross-N overlap for more (shorter) WGs i.e. higher
+    #                             occupancy/parallelism (useful at small M).
+    # Env unset / <=0 / not dividing gx_total -> default to full persist (unchanged).
+    _gx_total = int(model_dim) // int(tile_n)
+    # persist_n source: kernel-name / arg (per-shape, takes precedence) else the
+    # global env override else full persist.
+    _pn_env = int(os.environ.get("FLYDSL_MOE_STAGE2_PERSIST_N", "0") or "0")
+    _pn_req = int(persist_n) if int(persist_n) > 0 else _pn_env
+    if _persist and 0 < _pn_req < _gx_total and _gx_total % _pn_req == 0:
+        _persist_n = _pn_req
+    else:
+        _persist_n = _gx_total
+
     # NOTE: Keep this as a callable so we don't require an MLIR Context at Python-time.
     def out_elem():
         ty = T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
@@ -2486,9 +2506,12 @@ def compile_moe_gemm2(
     _npw_tag2 = f"_n{n_per_wave}" if n_per_wave != 32 else ""
     _kb_tag2 = f"_kb{int(k_batch)}" if _is_splitk else ""
     _persist_tag2 = "_persist" if _persist else ""
+    # Encode persist_n in the module name so distinct per-WG N-loop lengths get
+    # separate compile caches (only when partial, i.e. < full).
+    _pn_tag2 = f"_pn{_persist_n}" if (_persist and _persist_n < _gx_total) else ""
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_npw_tag2}{_kb_tag2}{_persist_tag2}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_npw_tag2}{_kb_tag2}{_persist_tag2}{_pn_tag2}"
         f"_abi5_i64reduce"  # keep reduce-mode temp-buffer addressing in index/i64 space
     ).replace("-", "_")
 
@@ -4098,28 +4121,42 @@ def compile_moe_gemm2(
             _if_blk = scf.IfOp(blk_valid)
             with _if_then(_if_blk):
                 if _persist:
-                    # Persistent N-loop: this WG covers ALL N-tiles for its M-block.
-                    # X is loaded once into static LDS (first N-tile) and reused.
+                    # Persistent N-loop: this WG covers `_persist_n` N-tiles for its
+                    # M-block. X is loaded once into static LDS (first N-tile) and
+                    # reused across them. Full persist (_persist_n == _gx_total) keeps
+                    # the original compile-time tile indices (grid X == 1, block_id
+                    # x == 0). A partial persist_n uses a runtime per-WG base tile
+                    # (grid X == _gx_total/_persist_n).
                     _gx_static = int(model_dim) // int(tile_n)
+                    if _persist_n >= _gx_static:
+                        def _tile_idx(j):
+                            return fx.Index(j)
+                        _ntiles = _gx_static
+                    else:
+                        _wg_base = gpu.block_id("x") * fx.Index(_persist_n)
+
+                        def _tile_idx(j):
+                            return _wg_base + fx.Index(j)
+                        _ntiles = _persist_n
                     if _persist_pf:
                         # Cross-N-tile software pipeline: thread prefetched B so the
                         # next N-tile's W2 loads overlap the current epilogue write.
                         _b_pf = None
-                        for _by_idx in range_constexpr(_gx_static):
+                        for _by_idx in range_constexpr(_ntiles):
                             _nxt = (
-                                fx.Index(_by_idx + 1)
-                                if _by_idx + 1 < _gx_static
+                                _tile_idx(_by_idx + 1)
+                                if _by_idx + 1 < _ntiles
                                 else None
                             )
                             _b_pf = _moe_gemm2_then_body(
-                                fx.Index(_by_idx),
+                                _tile_idx(_by_idx),
                                 _by_idx == 0,
                                 b_preloaded=_b_pf,
                                 next_by=_nxt,
                             )
                     else:
-                        for _by_idx in range_constexpr(_gx_static):
-                            _moe_gemm2_then_body(fx.Index(_by_idx), _by_idx == 0)
+                        for _by_idx in range_constexpr(_ntiles):
+                            _moe_gemm2_then_body(_tile_idx(_by_idx), _by_idx == 0)
                 else:
                     _moe_gemm2_then_body(gpu.block_id("x"))
 
@@ -4150,7 +4187,11 @@ def compile_moe_gemm2(
         size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
         # Persist: N-tiles are looped inside each workgroup, so the grid X dim is 1
         # (each WG covers the full N for its M-block). Otherwise N is a grid dim.
-        gx = fx.Index(1) if _persist else (n_in // fx.Index(tile_n))
+        gx = (
+            fx.Index(_gx_total // _persist_n)
+            if _persist
+            else (n_in // fx.Index(tile_n))
+        )
         gy = size_expert_ids_in
 
         moe_gemm2(
