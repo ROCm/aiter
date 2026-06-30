@@ -265,7 +265,7 @@ def _moe_gemm_a16w4(
 
     #W scale pointers
     WMxScale += expt_id * stride_w_mx_e
-    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+    if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
         gl.static_assert(stride_w_mx_k is not None)
         gl.static_assert(stride_w_mx_n is not None)
         PRESHUFFLE_FACTOR: gl.constexpr = 32
@@ -303,7 +303,7 @@ def _moe_gemm_a16w4(
         # partial block is masked.
         k_base = k * BLOCK_K
         #load x
-        mask_x = (k_base + offs_x_k < K)[None, :]
+        mask_x = (k_base + offs_x_k < K)[None, :] & (offs_x_m < num_tokens)[:, None]
         mask_w = (k_base // W_K_DIVISOR + offs_w_k < K // W_K_DIVISOR)[None, :]
         x = gl.load(XPtrs, mask=mask_x, other=0.0)
         #load w
@@ -323,7 +323,8 @@ def _moe_gemm_a16w4(
         )
         w_scales = gl.convert_layout(w_scales, GLOBAL_WS_LAYOUT)
         #upcast w to bf16
-        w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=1)
+        w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=1
+                                            )
 
         #convert weight layout
         x = gl.convert_layout(x, DOT_LAYOUT_X)

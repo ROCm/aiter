@@ -129,7 +129,7 @@ def get_gluon_kernel_config(m, n, k, routing_data):
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 1
     split_k = 1
-    block_k = 64
+    block_k = 256
 
     if block_m == 16:
         block_n = 128
@@ -201,13 +201,15 @@ def moe_gemm_a16w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
+    backend=None,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
-    use_gluon = True if get_arch() == "gfx950" else False
+    use_gluon = True if get_arch() == "gfx950" and backend in [None, "gluon"] else False
+    print(f"gluon={use_gluon}")
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x_scales is None, "x_scales must be none"
     assert x_static_scale is None, "x_static_scale must be none"

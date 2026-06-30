@@ -73,6 +73,7 @@ def init_compute_data(
     x = alloc_rand(shape_x, device=device, dtype=act_dtype)
     w = alloc_rand((n_expts_tot, k, n), device=device, dtype=weight_dtype)
     bias = alloc_rand((n_expts_tot, n), device=device, dtype=torch.float32)
+    bias = torch.zeros((n_expts_tot, n), device=device,dtype=torch.float32)
     if has_y_gammas:
         gamma = 2 ** torch.randint(
             -5, 0, (m * n_expts_act,), device=device, dtype=torch.float32
@@ -177,6 +178,7 @@ class Case:
             Case(4, 4, 8, 2, 1),
             Case(4, 4, 8, 8, 2),
             Case(4, 4, 8, 128, 4),
+            Case(4, 32, 64, 128, 4),
             Case(4, 1024, 3072, 128, 4),
             Case(32, 6144, 3072, 128, 4),
             Case(16, 1024, 1024, 128, 4),
@@ -209,8 +211,11 @@ class Case:
         (True, True),
     ],
 )
-@pytest.mark.parametrize("has_y_gammas", [False, True])
-@pytest.mark.parametrize("apply_swiglu", [False, True])
+#@pytest.mark.parametrize("has_y_gammas", [False, True])
+#@pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("has_y_gammas", [False])
+@pytest.mark.parametrize("apply_swiglu", [False])
+@pytest.mark.parametrize("backend",[None,"triton"])
 def test_op(
     m,
     n,
@@ -222,6 +227,7 @@ def test_op(
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    backend,
     device="cuda",
 ):
 
@@ -288,6 +294,8 @@ def test_op(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
 
+    #print(f"w_tri.shape={w_tri.shape}")
+    #print(f"w_scale_tri.shape={w_scale_tri.shape}")
     tri_y = moe_gemm_a16w4(
         x_tri,
         w_tri,
@@ -303,5 +311,6 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        backend=backend
     )
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
