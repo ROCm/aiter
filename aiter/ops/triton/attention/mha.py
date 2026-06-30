@@ -29,6 +29,16 @@ def mha_set_use_fused_bwd_kernel(value: bool):
     _USE_FUSED_BWD_KERNEL = value
 
 
+global _USE_FLYDSL_BWD_KERNEL
+_USE_FLYDSL_BWD_KERNEL = False
+
+
+def mha_set_use_flydsl_bwd_kernel(value: bool):
+    """Enable the FlyDSL backward kernel (non-causal MHA only; falls back to Triton if unsupported)."""
+    global _USE_FLYDSL_BWD_KERNEL
+    _USE_FLYDSL_BWD_KERNEL = value
+
+
 _MHA_IMPL: Literal["default", "dao_ai"] = "default"
 
 
@@ -407,7 +417,26 @@ class _FlashAttnFunc(torch.autograd.Function):
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
         sliding_window = _get_sliding_window_size(ctx.window_size)
 
-        if _MHA_IMPL == "dao_ai":
+        flydsl_handled = False
+        if _USE_FLYDSL_BWD_KERNEL:
+            from aiter.ops.flydsl.fmha_bwd_kernels import flydsl_flash_attn_backward
+            flydsl_handled = flydsl_flash_attn_backward(
+                q,
+                k,
+                v,
+                out,
+                do_padded,
+                softmax_lse,
+                dq,
+                dk,
+                dv,
+                ctx.softmax_scale,
+                ctx.causal,
+            )
+
+        if flydsl_handled:
+            pass
+        elif _MHA_IMPL == "dao_ai":
             assert sink is None, "dao_ai impl does not support attention sink."
             flash_attn_2.bwd(
                 do_padded,
