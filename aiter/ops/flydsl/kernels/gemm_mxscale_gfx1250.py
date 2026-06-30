@@ -897,28 +897,9 @@ def compile_mxscale_gemm(
             if const_expr(wave_specialized_tdm):
                 tdm_wave_id = rocdl.wave_id()
                 if const_expr(tdm_as_in_prologue):
-                    # A-scale is resident from the prologue, so the As loader wave
-                    # is repurposed: B is loaded cooperatively by wave0 + wave1
-                    # (the B descriptor is built with num_warps=2, so each wave
-                    # has its own half baked into the global/LDS offsets), wave2
-                    # loads A, wave3 loads B-scale. As is not loaded in the loop.
-                    tdm_wave_is_b = arith.ori(
-                        arith.cmpi(
-                            arith.CmpIPredicate.eq,
-                            tdm_wave_id,
-                            arith.constant(0, type=T.i32),
-                        ),
-                        arith.cmpi(
-                            arith.CmpIPredicate.eq,
-                            tdm_wave_id,
-                            arith.constant(1, type=T.i32),
-                        ),
-                    )
-                    tdm_wave_is_a = arith.cmpi(
-                        arith.CmpIPredicate.eq,
-                        tdm_wave_id,
-                        arith.constant(2, type=T.i32),
-                    )
+                    # wave0/wave1 -> B (cooperative halves), wave2 -> A, wave3 -> Bs.
+                    tdm_wave_is_b = tdm_wave_id < fx.Int32(2)
+                    tdm_wave_is_a = tdm_wave_id == fx.Int32(2)
 
                     def _select_wave_tdm_value(a_value, b_value, as_value, bs_value):
                         # wave2 -> A, default (wave3) -> Bs; as_value is unused.
@@ -929,21 +910,9 @@ def compile_mxscale_gemm(
                 else:
                     # Original wst: one tensor per wave -- wave0=A, wave1=B,
                     # wave2=A-scale, wave3=B-scale.
-                    tdm_wave_is_a = arith.cmpi(
-                        arith.CmpIPredicate.eq,
-                        tdm_wave_id,
-                        arith.constant(0, type=T.i32),
-                    )
-                    tdm_wave_is_b = arith.cmpi(
-                        arith.CmpIPredicate.eq,
-                        tdm_wave_id,
-                        arith.constant(1, type=T.i32),
-                    )
-                    tdm_wave_is_as = arith.cmpi(
-                        arith.CmpIPredicate.eq,
-                        tdm_wave_id,
-                        arith.constant(2, type=T.i32),
-                    )
+                    tdm_wave_is_a = tdm_wave_id == fx.Int32(0)
+                    tdm_wave_is_b = tdm_wave_id == fx.Int32(1)
+                    tdm_wave_is_as = tdm_wave_id == fx.Int32(2)
 
                     def _select_wave_tdm_value(a_value, b_value, as_value, bs_value):
                         result = arith.select(tdm_wave_is_as, as_value, bs_value)
