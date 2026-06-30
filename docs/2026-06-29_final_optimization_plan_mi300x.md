@@ -280,3 +280,358 @@ libs, so there is no double-registration clash, and `flydsl_venv` already carrie
 rocprof-compute dependency (pandas pinned 2.2.3). PMC works on this gfx942 MI300X.
 `HIP_VISIBLE_DEVICES=6` pins all work to GPU 6 (verified: the analyze Dispatch List
 reports `GPU_ID = 6` for every dispatch).
+
+
+## EXP-2026-06-29a — Phase A: vectorize the dDense partials staging (TiledCopy/128-bit) — GATE FAILED (regression)
+
+**Box / tooling.** MI300X (gfx942), `HIP_VISIBLE_DEVICES=6`, `flydsl_venv`
+(torch 2.10.0+rocm7.2.4). Per-kernel GPU time via `rocprofv3 --kernel-trace`
+(mean/call, iters=20/warmup=5); end-to-end via `example/profile_jagged_dense_bmm_bwd.py
+--bench`. This is **Phase A of the 2026-06-29 MI300X plan** (vectorize the
+`grad_dense_partials` global→LDS transpose-staging, top-ranked lever there).
+
+**Scope / implementation.** Replaced the per-thread `vec_width=1` bf16 staging loads
+(32 J + 32 dOut per m-tile, manual indices) with **128-bit / 8×bf16 vectorized
+`buffer_load`s** along the contiguous global axis (k for J, n for dOut), then scatter
+the 8 elements into the transposed swizzled LDS (`sJ(k,m)`/`sD(n,m)`, m contiguous).
+Reworked the fused dBias accordingly: a vectorized dOut load makes each thread own
+`_VEC=8` consecutive columns, so the per-thread `bias_acc` became a `_VEC`-wide fp32
+loop iter-arg and the end-of-kernel LDS combine widened to `[col*_BIAS_ROW_GROUPS+r]`.
+The transpose stays on the LDS store (gfx942 has no `ds_read_transpose`).
+
+**Correctness: green.** cos 0.999999 (dDense + dBias) at **D∈{256,512} × {uniform,skew}**
+— the vectorized staging + widened dBias combine are correct. The change is purely a
+perf regression, not a bug.
+
+### Result: vectorizing the staging makes the partials kernel *slower* at both D.
+`grad_dense_partials` mean/call (rocprofv3 `--kernel-trace`, D=256 uniform, B=1024, Mi=7680):
+| variant | partials µs | vs baseline |
+|---|--:|--:|
+| **baseline** (scalar `vec_width=1` staging) | **5425** | 1.00× |
+| Phase A (J **and** dOut vectorized + dBias rework) | **8383** | **0.65× (−55% slower)** |
+
+End-to-end `dense_bias` bench (wall-clock µs/iter; partials is ~95% of it):
+| D / regime | baseline | Phase A | J-only vectorized |
+|---|--:|--:|--:|
+| 256 uniform | **5843** | 8796 | 7422 |
+| 512 uniform | **20494** | 33394 | — |
+| 256 skew | **1333** | 1945 | — |
+| 512 skew | **4332** | 6653 | — |
+
+Every config regresses. An **A/B isolation** (vectorize *only* the J load, leaving the
+dOut staging + single-column dBias exactly as baseline) **also** regressed
+(7422 vs 5843 µs end-to-end) → the regressor is the **load width itself**, not the
+dBias rework.
+
+### Why (ISA + mechanism)
+ASM dump (`FLYDSL_DUMP_IR=1`), `grad_dense_partials_kernel`, D=256:
+| metric | baseline | Phase A |
+|---|--:|--:|
+| `buffer_load_ushort` (per m-tile) | **64** | 0 |
+| `buffer_load_dwordx4` | 0 | **8** |
+| `ds_write_b16` (LDS scatter) | 64 | **64 (unchanged)** |
+| `v_lshrrev`/`v_and` (bf16 unpack) | ~0 | **25** |
+| `s_waitcnt` (whole module) | 73 | 27 |
+| VGPR / AGPR | **224 / 0** | 212 / 0 |
+
+The vectorization **worked** (64 scalar loads → 8 `dwordx4`), but:
+1. **The transpose forces the LDS store to stay scalar** (`ds_write_b16` stays 64;
+   gfx942 has no `ds_read_transpose`), so only one side of the staging vectorizes.
+2. **The kernel is occupancy-starved → memory-latency-bound, not issue-instruction-
+   bound.** It carries 224 VGPR + a 32 KB *dynamic* LDS staging buffer → only ~2
+   wavefronts/SIMD. At that occupancy the baseline's **32 small in-flight loads per
+   operand provide the memory-level parallelism (MLP)** that hides HBM latency; folding
+   them into 4 wide `dwordx4` loads **cuts MLP** and exposes the latency the few waves
+   cannot cover. The inserted `load → unpack(25 ALU) → scalar-scatter` dependency chain
+   makes it worse. VGPRs even went *down* (224→212), so this is **not** register
+   pressure — it is MLP/latency.
+
+So the MI325X-era premise ("issue-/dependency-wait bound at ~73%, cut VMEM instrs to
+win") **does not transfer to this MI300X box**: `grad_dense_partials` here is
+latency/occupancy-bound, and fewer-but-wider loads lose the MLP that was hiding the
+latency.
+
+### Gate: **FAILED** (target ≥1.15× on `grad_dense_partials` µs at both D; got 0.65×).
+**Reverted** — baseline staging restored, **no source change shipped** (`git diff`
+clean). Correctness re-confirmed on the restored baseline implicitly (identical to HEAD).
+
+### Recommendation (re-sequence the plan for this box)
+- **Do Phase D (occupancy) before Phase A.** The partials kernel must first get more
+  waves/SIMD (shrink the 32 KB LDS staging and/or the VGPR/AGPR footprint — e.g. a
+  64×64 output sub-tile) so it can tolerate wide-load latency. Vectorized staging
+  (and any deeper m-tile pipelining, which would *2×* the LDS and hurt occupancy
+  further) is only likely to pay **after** occupancy is lifted.
+- A TiledCopy (`make_tiled_copy` + `partition_S/D`) phrasing was **not** pursued:
+  it issues the same 128-bit loads, so it shares the MLP-loss root cause; the problem
+  is architectural (occupancy/latency), not a manual-codegen artifact.
+- The bytes staged are unchanged by Phase A, so even a perfectly vectorized staging
+  has limited ceiling here; **cutting HBM traffic** (Phase C at D=512; lighter
+  partials/reduce) and **lifting occupancy** (Phase D) are the higher-value levers.
+
+Artifacts: `/tmp/kt_base`, `/tmp/kt_pA` (kernel traces); ASM dumps under
+`~/.flydsl/debug/grad_dense_bias/` (regenerable with `FLYDSL_DUMP_IR=1`).
+
+## EXP-2026-06-29b — Phase B: `grad_jagged` K-column operand reuse (K-coarsening) — GATE FAILED (no robust gain)
+
+**Box / tooling.** MI300X (gfx942), `HIP_VISIBLE_DEVICES=6`, `flydsl_venv`. Per-kernel
+GPU time via `rocprofv3 --kernel-trace` (mean/call, iters=20/warmup=5). **Phase B of the
+2026-06-29 MI300X plan** (cut dOut re-streaming in `grad_jagged`).
+
+**Scope / implementation.** Added **`COARSEN_K`**: one WG now computes `COARSEN_K`
+consecutive `BLOCK_N` K-output tiles from a **single** staged dOut A-fragment — the
+dOut g2s + s2r feed is loaded once and reused across the K-tiles' Dense B-fragments and
+fp32 accumulators (analogous to the existing `COARSEN_M`, but over the output-K axis).
+The grid's K dim shrank to `KOUT_KGROUPS = KOUT_BLOCKS // COARSEN_K`; `COARSEN_K` is
+clamped to a divisor of `KOUT_BLOCKS` (so D=128/`KOUT_BLOCKS=1` disables it). dOut HBM
+reads drop by `COARSEN_K`; LDS (only dOut is staged) is unchanged. Both `COARSEN_M` and
+`COARSEN_K` were made env-overridable for the sweep, then **reverted**.
+
+**Correctness: green.** cos 0.999999 at D∈{256,512} × {uniform,skew}.
+
+### Result: K-coarsening gives no measurable gain; it regresses at D=256.
+`grad_jagged` mean/call (rocprofv3 `--kernel-trace`, uniform, B=1024, Mi=7680), sweeping
+(COARSEN_M, COARSEN_K):
+| D | M1K1 | **M2K1 (baseline)** | M4K1 | M1K2 | M2K2 | M4K2 | M1K4 | M2K4 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| 256 (KOUT=2) | 4938 | **4946** | 5022 | 5015 | 5237 | 5271 | — | — |
+| 512 (KOUT=4) | — | **15400** | 15689 | **15257** | 15565 | — | 21061 | 25914 |
+
+- **D=256:** every K-coarsened config is **slower** than baseline (M2K2 5237 vs 4946);
+  the fastest point is *no* coarsening at all (M1K1 4938 ≈ M2K1 4946).
+- **D=512:** the best K-coarsened point (M1K2 15257) is only **~0.9%** under baseline
+  (15400) — within run-to-run noise, not a robust gain. **`COARSEN_K=4` spills** and is
+  catastrophic (21–26 ms, +37–68%).
+- **Aside:** the *shipped* `COARSEN_M=2` is itself **neutral** on this box (M1K1≈M2K1 at
+  D=256) — the cross-box value from EXP-2026-06-24b doesn't help here either. Left at 2
+  (no regression).
+
+### Why (mechanism)
+`grad_jagged` is **occupancy/latency-bound, not dOut-bandwidth-bound**, so reducing dOut
+traffic does not move the wall: per the 06-29 plan §1b (this box, PMC) it runs at **6.4%
+occupancy** (D=256), **Issue-Wait 54.5%**, IPC 0.29 — many tiny WGs that can't hide
+latency. K-coarsening adds a **second fp32 accumulator** (and a second Dense B stream),
+pushing `grad_jagged` from ~36 VGPR (accumulator in AGPR) to **268 VGPR** at `COARSEN_K=2`
+(no spill) and into **spills** at `COARSEN_K=4` — i.e. it **cuts occupancy further**,
+offsetting any dOut-reuse benefit. Same root cause as Phase A (EXP-2026-06-29a):
+**occupancy is the binding constraint**, and both levers that trade registers for reuse
+lose more to occupancy than they gain. (The EXP-2026-06-26a roofline already had
+`grad_jagged` at only ~28% HBM BW at D=512, consistent with "not bandwidth-bound".)
+
+### Gate: **FAILED** (target: measurable `grad_jagged` µs gain at **both** D; got a
+regression at D=256 and ~noise at D=512). **Reverted** — `grad_jagged` restored to
+baseline (`git checkout`, diff clean), `COARSEN_M` kept at 2. Correctness re-confirmed
+on the restored baseline (cos 0.999999).
+
+### Recommendation
+Same as Phase A: **lift occupancy first (Phase D)**, then re-attempt K-coarsening — with
+register headroom the extra accumulator(s) would not crater occupancy, and the dOut-reuse
+could then convert to time. As-is, neither M- nor K-coarsening is a lever on this box.
+
+## EXP-2026-06-29c — Phase C: `SPLIT==1` fast path — write bf16 dDense/dBias directly, skip the reduce (D=512) — GATE PASSED ✅ (SHIPPED)
+
+**Box / tooling.** MI300X (gfx942), `HIP_VISIBLE_DEVICES=6`, `flydsl_venv`. Per-kernel GPU
+time via `rocprofv3 --kernel-trace` (mean/call, iters=20/warmup=5); end-to-end via
+`example --bench`. **Phase C of the 2026-06-29 MI300X plan.**
+
+**Scope / implementation.** When `SPLIT == 1` (compile-time; D=512 → `2 if K<=256 else 1`),
+each `(K,N)` output tile is fully reduced inside one workgroup, so the separate reduce
+passes are pure fp32→bf16 round-trips. Added a compile-time `if fx.const_expr(SPLIT == 1)`
+branch to `grad_dense_partials_kernel`'s epilogue: truncate the fp32 MFMA accumulator to
+bf16 and store it **straight to dDense** (`BufferCopy16b`), and likewise write the fused
+dBias column sums straight to bf16 `dBias`. The launcher passes `dDense`/`dBias` as the
+`PARTIALS`/`BIAS_PARTIALS` args and launches **1 kernel instead of 3** when `SPLIT==1`
+(`part_off` collapses to the dDense element offset because `off_s==0`). The `SPLIT>=2`
+path (D=256) is byte-identical to before (fp32 scratch + two reduces). `make_fragment_C`
+still yields an fp32 accumulator for a bf16 output view (same as `grad_jagged`).
+
+**Correctness: green.** cos 0.999999 (dDense + dBias) at D∈{256,512} × {uniform,skew}.
+
+### Result: removes both reduce launches at D=512; clear win, big under skew.
+Per-kernel GPU time (`rocprofv3 --kernel-trace`, D=512, B=1024, Mi=7680, mean/call):
+| kernel | base uniform | **Phase C uniform** | base skew | **Phase C skew** |
+|---|--:|--:|--:|--:|
+| `grad_dense_partials` | 18974 | 19077 | 3448 | 3307 |
+| `grad_dense_reduce` | 861 | **— (dropped)** | 857 | **— (dropped)** |
+| `grad_bias_reduce` | 5.5 | **— (dropped)** | 5.5 | **— (dropped)** |
+| **dense_bias (sum)** | **19841** | **19077 (1.04×)** | **4310** | **3307 (1.30×)** |
+
+End-to-end `dense_bias` bench (wall-clock µs/iter): D=512 uniform 20494→**20073** (1.02×),
+skew 4332→**3342 (1.30×)**. **D=256 unchanged** (SPLIT=2 path untouched): rocprof still
+shows 3 launches (partials 5455 + reduce 243 + bias_reduce 5.9); bench 5843→5903 / 1333→1342
+(noise).
+
+### Finding: the win is the reduce-launch removal, not the partials write-traffic halving.
+The plan expected "remove ~824 µs reduce **+** halve the partials write traffic
+(fp32→bf16)". The reduce removal landed (−866 µs uniform); the **partials kernel itself is
+unchanged** (18974→19077 µs, noise) — halving its *write* bytes does ~nothing because the
+partials kernel is **read-dominated** (it streams ~16 GB of J+dOut vs ~0.5 GB fp32 partials
+write at D=512). So the realized win = the deleted reduce pass, which is a **fixed
+D-bound cost** (`n_groups·K·N` round-trip) → a small 1.04× under uniform (where it's ~4% of
+a 19.8 ms job) but a large **1.30×** under skew (where the small ~3.3 ms partials makes the
+fixed ~0.86 ms reduce a big fraction). D=256 (SPLIT=2, a genuine cross-split reduction) is
+correctly left alone.
+
+### Gate: **PASS** — D=512 `dense_bias` end-to-end ↓ (1.04× uniform, **1.30× skew**),
+D=256 **unchanged**, correctness green at both stars. (Uniform is just under the 1.05×
+estimate only because the write-traffic-halving half of the hypothesis didn't materialize;
+the reduce-removal alone is a robust, zero-downside win.) **SHIPPED** — first kept change of
+the three phases. It also simplifies the D=512 schedule (3 launches → 1) and removes the
+fp32 dDense/dBias scratch from the D=512 critical path.
+
+## EXP-2026-06-29d — Phase D: lift `grad_dense_partials` occupancy (tile/footprint sweep) — GATE FAILED + it reframes Phase A
+
+**Box / tooling.** MI300X (gfx942), `HIP_VISIBLE_DEVICES=6`, `flydsl_venv`. Per-kernel GPU
+time via `rocprofv3 --kernel-trace` (mean/call, iters=20/warmup=5); VGPR/LDS from
+`FLYDSL_DUMP_IR=1` ISA. **Phase D of the 2026-06-29 MI300X plan** + the requested **Phase A
+revisit** (does higher occupancy rescue the vectorized staging?).
+
+**Scope.** Made the partials output sub-tile `DDENSE_BK × DDENSE_BN` env-overridable and
+swept {128×128 (baseline), 64×128, 128×64, 64×64}; `DDENSE_BM=64` fixed. Smaller tiles
+shrink the LDS staging (`(BK+BN)·BM·2`) and the per-thread fp32 C-fragment
+(`BK·BN/256`), raising waves/CU — at the cost of a bigger grid and more operand re-reads
+(J ×`N/BN`, dOut ×`K/BK`). Fixed the SPLIT==1 epilogue's hardcoded `[64]` C-fragment to
+the computed `_DDENSE_CFRAG` so the small tiles are correct.
+
+### Result: occupancy rises a lot; partials time does NOT move (gate fails).
+`grad_dense_partials` mean/call (rocprofv3, uniform, B=1024, Mi=7680):
+| tile (BK×BN) | D=256 µs | D=512 µs | VGPR | LDS | ~occupancy |
+|---|--:|--:|--:|--:|--:|
+| **128×128 (baseline)** | **5462** | **19032** | 224 | 32 KB | ~2 WG/CU |
+| 64×128 | 5487 | 19040 | — | 24 KB | — |
+| 128×64 | 5455 | 19090 | — | 24 KB | — |
+| 64×64 | 5465 | 19044 | **98** | **16 KB** | ~4 WG/CU |
+
+`64×64` more than **halves VGPR (224→98)** and **halves LDS (32→16 KB)** → roughly
+**doubles occupancy** (~25%→~50%), yet partials time is **identical** (5465 vs 5462 µs,
+noise). It also **doubles** the J+dOut HBM re-reads and the LDS staging volume — also with
+**no time change**.
+
+### Conclusion: `grad_dense_partials` is MFMA-pipeline-bound, not occupancy/traffic/LDS-bound.
+The only quantity invariant across the whole sweep is the **MFMA instruction count**
+(`2·L·K·N` is fixed; tiling just redistributes the same MFMAs). Occupancy ↑, HBM traffic
+↑/↓, LDS volume ↑/↓ all leave the time flat → the kernel sits at its **matrix-core
+issue/dependency limit**, with the load/LDS/feed already fully overlapped behind the MFMA
+pipeline. The "26–28% MFMA util" from §1 is therefore **issue/dependency-latency in the
+MFMA feed**, not a throughput headroom that occupancy can recover.
+
+### Gate: **FAILED** — occupancy ↑ ~2× but partials µs flat (does not convert to time, the
+gate's explicit requirement). **Reverted** to the shipped Phase-C state (128×128, fixed
+constants). The smaller tile is a *free* occupancy lever (same time) but ships **2× more
+HBM traffic + 4× the grid**, so it is strictly worse system-wide — not kept.
+
+### Phase A revisit (the asked-for "does Phase D rescue Phase A?")
+Added an env-guarded **vectorized-J staging** (128-bit / 8×bf16 loads) and A/B'd it against
+the scalar baseline at both tiles (rocprof partials, D=256 uniform):
+| tile | scalar | vectorized-J |
+|---|--:|--:|
+| 128×128 | 5444 | **5443** |
+| 64×64 | 5476 | **5449** |
+
+**Vectorizing the loads is NEUTRAL at every tile** (also end-to-end: J-vec dense_bias 5862
+vs baseline 5843 µs, cos 0.999999) — exactly what "MFMA-bound, loads already hidden"
+predicts. **This corrects EXP-2026-06-29a:** its claim that "J-only vectorization also
+regressed (7422 µs end-to-end)" was a bad measurement — clean rocprof + bench show
+J-staging vectorization is **neutral**. The full Phase-A regression (partials 5425→8383 µs)
+therefore came from the **dOut-vectorization + dBias-fusion rework** (the vec8 bias
+iter-args + per-element extract/convert/add in the dOut loop), **not** the load
+vectorization. So:
+- Higher occupancy *is* available at zero time cost (Phase D headroom), and at that
+  headroom vectorized loads don't regress — **but it doesn't matter**, because staging was
+  never the bottleneck. Phase A has **no path to a win** on this kernel: loads are already
+  hidden (vectorizing = neutral) and the bias rework is pure overhead.
+- **The real lever for `grad_dense_partials` is the MFMA pipeline itself** — the MMA atom
+  (try `16×16×32` / `32×32×8`), the `(4,4,2)` K-fragment, `traversal_order`, and breaking
+  the accumulator dependency chain (more independent C sub-tiles per wave) to lift the
+  26–28% MFMA util — **not** staging, occupancy, LDS, or HBM traffic.
+
+Artifacts: `/tmp/dsw`, `/tmp/vsw` (kernel traces); ISA via `FLYDSL_DUMP_IR=1`.
+
+## EXP-2026-06-29e — Phase D revisited: SHIP the 64×64 footprint as a register/LDS-headroom state change (perf-neutral)
+
+**Decision (supersedes EXP-2026-06-29d's "reverted").** EXP-29d showed the 64×64 sub-tile
+is *time-neutral* but reverted it because it ships more HBM traffic. Reconsidered on a
+"state-machine" view: a perf-neutral change that **halves register + LDS pressure** is a
+real state change worth banking — it is exactly the headroom the next lever (MFMA-feed ILP:
+more independent accumulator chains / a wider MMA atom) needs, and 128×128's **224 VGPR /
+~2 WG/CU** had none. So `grad_dense_partials` now uses **`DDENSE_BK = DDENSE_BN = 64`**
+(was 128), plus a computed `_DDENSE_CFRAG` for the SPLIT==1 bf16 epilogue.
+
+**Footprint (ISA, D=256):** partials **VGPR 224 → 98** (no spill), **LDS 32 KB → 16 KB**,
+fp32 C-fragment 64 → 16 elems/thread → occupancy ~2×.
+
+**Correctness: green** — cos 0.999999 (dDense + dBias) at D∈{256,512} × {uniform,skew}.
+
+**Performance: neutral everywhere** (end-to-end `dense_bias` bench, **back-to-back**
+128×128 vs 64×64, µs/iter):
+| D / regime | 128×128 | 64×64 |
+|---|--:|--:|
+| 256 uniform | 5867 | 5908 |
+| 512 uniform | 19990 | 19974 |
+| 256 skew | 1335 | 1336 |
+| 512 skew | 3305 | 3321 |
+All within ~0.7% (noise). Also re-verified per-kernel (rocprof) flat as in EXP-29d.
+
+**Variance caveat (shared box).** An *initial* one-off D=512-skew run read 3887 µs for
+64×64 (looked like a 16% regression); a clean back-to-back re-measure (all four tiles
+3305–3327 µs) showed it was **transient contention from another user on the server**, not a
+real regression. Lesson: always compare tiles back-to-back in one run here, and distrust a
+single off reading.
+
+**Status: SHIPPED** (kept). It does not reduce time on its own (the kernel is MFMA-bound,
+EXP-29d), but it **banks the register/LDS headroom** for the MFMA-feed ILP work, which is
+the actual next lever. The traffic/grid cost (J ×N/64, dOut ×K/64; 4× WGs) is free while
+MFMA-bound — to be watched if a later change makes the kernel memory-bound.
+
+## Current status (2026-06-29)
+
+**Phase C SHIPPED ✅; Phase D footprint (64×64) SHIPPED as a perf-neutral register/LDS
+headroom change (EXP-2026-06-29e); Phases A & B gate-failed.** The day's mechanistic
+keystone (EXP-29d): `grad_dense_partials` is **MFMA-pipeline-bound**: a
+128×128→64×64 tile sweep halves VGPR (224→98) and LDS (32→16 KB) and ~doubles occupancy
+with **zero** change in kernel time, and also 2×'s HBM traffic with zero change — so
+occupancy, LDS, and bandwidth are all already hidden behind the matrix-core feed. This
+**explains and corrects Phase A**: vectorizing the staging *loads* is **neutral** (not the
+regressor EXP-29a thought); the Phase-A regression came from the dOut+dBias-fusion rework,
+and no staging/occupancy change can speed an MFMA-bound kernel. **Next lever is the MFMA
+pipeline (atom/fragment/traversal/accumulator-ILP), not memory or occupancy.** For
+`grad_jagged` the same occupancy-isn't-the-lever story holds (Phase B). **Shipped: Phase C**
+(D=512 reduce-launch removal, 1.04× uniform / 1.30× skew) **+ the Phase D 64×64 footprint**
+(EXP-29e) — perf-neutral but banks VGPR 224→98 / LDS 32→16 KB as headroom for the MFMA-feed
+ILP work, which is the next lever to try.
+
+## Current status (2026-06-29-C)
+
+**Phase C SHIPPED ✅ (EXP-2026-06-29c); Phases A & B gate-failed and reverted
+(EXP-2026-06-29a/b).** Net for the day on GPU 6:
+- **C (kept):** `SPLIT==1` (D=512) now writes bf16 dDense/dBias straight from the partials
+  kernel and drops both reduce launches (3→1). **D=512 `dense_bias` 1.04× uniform / 1.30×
+  skew**, D=256 unchanged, correctness green. The win is the reduce-launch removal (a fixed
+  D-bound cost, hence huge under skew); halving the partials *write* traffic did nothing
+  because that kernel is read-dominated.
+- **A & B (reverted):** both were register-for-reuse levers on the two MFMA kernels and both
+  lost to **occupancy**, the binding constraint here — (A) vectorizing `grad_dense_partials`
+  staging regressed it 5425→8383 µs (latency/MLP-bound at ~2 waves); (B) `grad_jagged`
+  K-coarsening gave no robust gain (extra accumulator drove VGPR 36→268, cutting the 6.4%
+  occupancy). Even the shipped `COARSEN_M=2` is neutral on this box.
+- **Takeaway / next:** the two wins available without an occupancy fix are *structural*
+  (delete work / traffic), like C. The compute-kernel micro-opts (A/B, and likely the
+  staging part of D's siblings) are gated on **lifting occupancy first → Phase D** (shrink
+  the 32 KB LDS / register footprint of `grad_dense_partials`), after which A/B may convert.
+`grad_jagged` baselines (this box, GPU 6, rocprofv3): D=256 uniform 4953 µs, D=512 uniform
+15384 µs; bench djagged D=256/512 uniform 5035 / 15844 µs, skew 953 / 2779 µs.
+
+## Current status (2026-06-29-A)
+
+**Phase A (2026-06-29 MI300X plan) attempted and GATE-FAILED on GPU 6 (EXP-2026-06-29a).**
+Vectorizing the `grad_dense_partials` global→LDS transpose-staging to 128-bit loads is
+**correct** (cos 0.999999, D∈{256,512} × {uniform,skew}) but **regresses** the partials
+kernel **5425 → 8383 µs (0.65×)** at D=256 uniform, and every `dense_bias` bench config
+is slower. Root cause (ISA + A/B isolation): the kernel is **occupancy-starved (~2
+waves/SIMD: 224 VGPR + 32 KB dynamic LDS) and memory-latency-bound**, so the baseline's
+many small loads give the MLP that hides HBM latency; few wide loads lose it, and the
+transpose keeps the LDS store scalar regardless (no `ds_read_transpose` on gfx942).
+**Reverted to baseline; nothing shipped.** Next: **re-order to do Phase D (occupancy)
+first**, then re-attempt vectorized staging once there are enough waves to tolerate
+wide-load latency. Baselines for reference (this box, GPU 6, rocprofv3 kernel-trace,
+B=1024/Mi=7680): partials D=256 uniform **5425 µs**, end-to-end `dense_bias` bench
+D=256/512 uniform **5843 / 20494 µs**, skew **1333 / 4332 µs**.
