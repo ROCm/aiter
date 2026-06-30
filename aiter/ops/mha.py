@@ -1594,8 +1594,6 @@ def _flash_attn_forward(
         # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
         ret = get_gfx() == "gfx1250"
         ret = ret and (q.dtype == dtypes.bf16)
-        # Only causal gfx1250 binaries are registered in fmha_fwd_bf16*.csv.
-        ret = ret and bool(causal)
         ret = ret and (hdim_q in (64, 128))
         ret = ret and (hdim_v == hdim_q)
         ret = ret and (nhead_q % nhead_k == 0)
@@ -2505,8 +2503,6 @@ def _flash_attn_varlen_forward(
         # logits (per-Q-head fp32) supported; sink-token (sink_size) not.
         ret = get_gfx() == "gfx1250"
         ret = ret and (q.dtype == dtypes.bf16)
-        # Only causal gfx1250 binaries are registered in fmha_fwd_bf16*.csv.
-        ret = ret and bool(causal)
         ret = ret and (hdim_q in (64, 128))
         ret = ret and (hdim_v == hdim_q)
         ret = ret and (nhead_q % nhead_k == 0)
