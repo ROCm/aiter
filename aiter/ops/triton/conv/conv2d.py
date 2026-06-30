@@ -52,8 +52,11 @@ def _resolve_route(R, S, stride, dilation, N, C, H, W_in, K_out, layout):
     if _is_3x3_conv(R, S):
         method = _select_3x3_method(N, C, H, W_in, K_out, stride, dilation)
         if layout == "nhwc":
-            # cblocked is NCHW-only; NHWC routes any winograd pick to the
-            # NCHW-input winograd kernel, else the NHWC 3x3 kernel.
+            # _select_3x3_method tunes for NCHW; the cblocked vs. non-cblocked
+            # distinction is deliberately ignored here because cblocked is an
+            # NCHW-only layout. The only NHWC question is winograd-or-not: any
+            # winograd pick maps to the (NCHW-input) winograd kernel, a plain
+            # "cblocked" pick falls through to the NHWC 3x3 kernel.
             if method in ("winograd_f4x3", "winograd_f4x3_cblocked"):
                 return Route.WF4X3
             return Route.NHWC_3X3
