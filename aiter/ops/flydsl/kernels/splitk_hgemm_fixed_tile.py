@@ -147,7 +147,9 @@ def compile_splitk_hgemm_fixed_tile(
     smem_b_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_b_offset + BS_BYTES
 
-    KERNEL_NAME = f"splitk_hgemm_fixed_tile_{dtype}_M{BM}xN{BN}xK{BK}_SPK{SPLITK}_{GPU_ARCH}"
+    KERNEL_NAME = (
+        f"splitk_hgemm_fixed_tile_{dtype}_M{BM}xN{BN}xK{BK}_SPK{SPLITK}_{GPU_ARCH}"
+    )
 
     @flyc.kernel(known_block_size=[256, 1, 1])
     def kern(
@@ -206,9 +208,7 @@ def compile_splitk_hgemm_fixed_tile(
 
         def _gptr(ptr, off_elems, elem_bytes):
             base = arith.index_cast(T.i64, fx.ptrtoint(ptr))
-            boff = arith.index_cast(
-                T.i64, fx.Index(off_elems) * fx.Index(elem_bytes)
-            )
+            boff = arith.index_cast(T.i64, fx.Index(off_elems) * fx.Index(elem_bytes))
             return llvm.IntToPtrOp(
                 ir.Type.parse("!llvm.ptr<1>"),
                 llvm.AddOp(base, boff, llvm.IntegerOverflowFlags(0)).result,
@@ -223,12 +223,8 @@ def compile_splitk_hgemm_fixed_tile(
             cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ksplit, idx0)
             ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
             with ir.InsertionPoint(ks0_if.then_block):
-                zvec = vector.broadcast(
-                    T.vec(ZVEC, dt), arith.constant(0.0, type=dt)
-                )
-                zvec_v = (
-                    zvec._value if const_expr(hasattr(zvec, "_value")) else zvec
-                )
+                zvec = vector.broadcast(T.vec(ZVEC, dt), arith.constant(0.0, type=dt))
+                zvec_v = zvec._value if const_expr(hasattr(zvec, "_value")) else zvec
                 for c in range_constexpr(ZG_PER_T):
                     gidx = tid + c * 256
                     el = gidx * ZVEC
@@ -245,9 +241,7 @@ def compile_splitk_hgemm_fixed_tile(
                         )
                     cif = scf.IfOp(cond, results_=[], has_else=False)
                     with ir.InsertionPoint(cif.then_block):
-                        lin = arith.index_cast(
-                            T.i32, C_.linear_offset((gm, n0 + col))
-                        )
+                        lin = arith.index_cast(T.i32, C_.linear_offset((gm, n0 + col)))
                         cptr = _gptr(C, fx.Index(lin), DTYPE_BYTES)
                         llvm.InlineAsmOp(
                             None,
