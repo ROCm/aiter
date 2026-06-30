@@ -1013,16 +1013,15 @@ all KV splits and folds in the attention sink (§4.4).
    gpu.barrier()  — p_lds visible for PV A-frag reads
 
 5. ALL WAVES: PV MFMA loop (D_CHUNKS_W=9 iterations per wave)
-   Each iteration:
+   Each iteration (dc = 0..8):
    a. Load A-frag: p_lds[lane_row * ALIAS_ROW_STRIDE + kv_k]  (4 bf16 from p_lds)
-   b. Load B-frag: kv_lds[kv_row_pv * KV_ROW_STRIDE + d_col]  (4 bf16 from kv_lds)
-   c. Load C-frag: acc_lds[head * ACC_ROW_STRIDE + d_col]      (4 f32 from acc_lds)
+   b. Load B-frag: kv_lds[kv_slot_pv * KV_ROW_STRIDE + d_col]  (4 bf16 from kv_lds)
+   c. Fetch C-frag from VGPR iter-arg acc_dc[dc]              (4 f32, no LDS load)
    d. Rescale C-frag by alpha[v]
-   e. Issue mfma_f32_16x16x16_bf16(a_frag, b_frag, rescaled_c)
-   f. Write result back to acc_lds[head * ACC_ROW_STRIDE + d_col]
-   gpu.barrier()  — acc_lds updated; scores_lds safe for next tile's step 3
+   e. Issue mfma_f32_16x16x16_bf16(a_frag, b_frag, rescaled_c)  → new_acc[dc]
+   (no barrier needed — acc lives in VGPRs)
 
-→ yield (m_new[4], l_new[4]) as next iteration's iter-args
+→ yield (m_new[4], l_new[4], new_acc[0..8]) as next iteration's iter-args
 ```
 
 **MFMA count per tile:** `D_CHUNKS_W × N_WAVES × 2 (QK + PV) = 9 × 4 × 2 = 72`
@@ -1044,7 +1043,7 @@ The kernel uses this layout as follows:
 | Step | M (row) | K (inner) | N (col) | A source | B source | C source |
 |------|---------|-----------|---------|----------|----------|----------|
 | QK | head = `lane_cgrp*4+v` | d chunk | kv_slot = `lane_row` | Q`[head, d]` from VRAM | KV`[kv_slot, d]` from VRAM | partial score (VGPR) |
-| PV | head = `lane_row` | kv_slot = `lane_cgrp*4+v` | d = `d_col` | P`[head, kv_slot]` from `p_lds` | KV`[kv_slot, d]` from `kv_lds` | acc`[head, d]` from `acc_lds` |
+| PV | head = `lane_row` | kv_slot = `lane_cgrp*4+v` | d = `d_col` | P`[head, kv_slot]` from `p_lds` | KV`[kv_slot, d]` from `kv_lds` | acc`[head, d]` from VGPR iter-arg |
 
 Note the role swap between QK and PV: in QK, `lane_row` indexes the kv_slot (N) dimension;
 in PV, `lane_row` indexes the head (M) dimension. This reversal is why the P matrix
@@ -1057,12 +1056,17 @@ which matches exactly how the softmax wrote `P[head=lane_cgrp*4+v, kv_slot=lane_
 
 | Kernel | Time | BW | TFLOPS | vs Triton |
 |--------|------|-----|--------|-----------|
-| FlyDSL 4-wave + LDS padding | 2.096 ms | 162.6 GB/s | 18.5 | **1.28×** |
+| FlyDSL 4-wave + VGPR acc | ~1.3 ms | ~250 GB/s | **29.75** | **2.07×** |
+| FlyDSL 4-wave + LDS padding | 2.096 ms | 162.6 GB/s | 18.5 | 1.28× |
 | Triton `_pa_decode_sparse` | 2.687 ms | 126.8 GB/s | 14.4 | 1.00× |
 
-The LDS row padding (`KV_PAD=8`, `ACC_PAD=8`, `ALIAS_ROW_STRIDE=BLOCK_K+1`) improved
-performance from 1.20× to 1.28× vs Triton by eliminating 4-way LDS bank conflicts on
-the transposed `kv_lds` and `acc_lds` accesses.
+The VGPR accumulation design (Priority 1) eliminated `acc_lds` (37376 bytes) and moved
+the output accumulator into ForOp VGPR iter-args (`9 × vec<4,f32>` per lane = 36 VGPRs).
+This reduced LDS from 60544 → **23168 bytes**, enabling 2 CTAs/CU and producing a
+**2.07× speedup** over Triton at T=128.
+
+LDS row padding (`KV_PAD=8`, `ALIAS_ROW_STRIDE=BLOCK_K+1`) remains active to eliminate
+bank conflicts on the transposed `kv_lds` accesses in the PV step.
 
 ---
 
