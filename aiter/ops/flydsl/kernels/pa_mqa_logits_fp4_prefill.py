@@ -60,6 +60,20 @@ def compute_prefill_schedule(
     P = parallel_unit_num
     T = local_ends.shape[0]  # fixed total_tokens (rows)
 
+    # Guard against silent row-dropping. The persistent grid has P slots; each
+    # (row, chunk-split) work item needs one. `valid = slot < total_splits`
+    # below truncates any work past slot P, leaving those rows at the caller's
+    # out pre-fill (-inf/NaN) -> wrong top-k with NO error. `P >= T` is a
+    # host-side (sync-free, CUDAGraph-safe) sufficient condition: at the
+    # coarsest folding (safe = max_chunks) total_splits == #non-empty rows <= T,
+    # so P >= T guarantees total_splits <= P. (Conservative for very sparse
+    # inputs where most rows are empty; the V4 indexer rows are all non-empty.)
+    assert P >= T, (
+        f"compute_prefill_schedule: parallel_unit_num={P} < rows={T} would "
+        f"silently drop rows past slot {P} (logits stay at the caller's "
+        f"pre-fill -> wrong top-k). Pass parallel_unit_num >= number of rows."
+    )
+
     rb = row_to_batch.to(torch.int32)
     ls = local_starts.to(torch.int32)
     le = local_ends.to(torch.int32)
@@ -232,7 +246,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
         kv_rsrc = buffer_ops.create_buffer_resource(kv_cache_ptr, max_size=True)
         kvs_rsrc = buffer_ops.create_buffer_resource(kv_scale_ptr, max_size=True)
         bt_rsrc = buffer_ops.create_buffer_resource(kv_indices_ptr, max_size=True)
-        out_rsrc = buffer_ops.create_buffer_resource(out_logits_ptr, max_size=True)
 
         ZERO_F = fx.Float32(0.0)
         c0_i32 = fx.Int32(0)
@@ -242,6 +255,22 @@ def build_pa_mqa_logits_fp4_prefill_module(
         batch_id = cta_info_vec[1]
         chunk_start = cta_info_vec[2]
         chunk_count = cta_info_vec[3]
+
+        # Per-CTA output base. `row_id * stride_out_row` overflows i32 when
+        # row_id * max_seq_len > 2^31-1 (e.g. V4 max_model_len_idx = 262144 with
+        # >8k prefill rows): the store offset wraps and the row is silently
+        # dropped (out stays at the caller's NaN/-inf pre-fill). Fold the row
+        # base into the buffer-resource base pointer in i64 so only the small
+        # per-token offset rides the 32-bit buffer voffset.
+        _row_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(row_id))
+        _stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(stride_out_row))
+        _row_elems_i64 = arith.muli(_row_i64, _stride_i64)
+        _row_bytes_i64 = arith.muli(
+            _row_elems_i64, arith.constant(4, type=T.i64)  # sizeof(f32)
+        )
+        out_rsrc = buffer_ops.create_buffer_resource(
+            out_logits_ptr, max_size=True, base_byte_offset=_row_bytes_i64
+        )
 
         # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte FP4
         # chunk for head row mi_idx*16+lane_mod_16. Q: [total_tokens, H, D/2] uint8.
@@ -434,7 +463,10 @@ def build_pa_mqa_logits_fp4_prefill_module(
             is_writer = lane_div_16 < fx.Int32(1)
             out_token = token_base + lane_mod_16
             in_window = (out_token >= local_start) & (out_token < local_end)
-            out_off_real = row_id * stride_out_row + out_token
+            # Row base is folded into `out_rsrc`'s i64 base pointer (see above),
+            # so the per-token store offset is just the (small) token index —
+            # no i32 overflow even for very large stride_out_row * row_id.
+            out_off_real = out_token
             out_off = in_window.select(out_off_real, oob_off)
             out_off = is_writer.select(out_off, oob_off)
             buffer_ops.buffer_store(thread_sum, out_rsrc, out_off)

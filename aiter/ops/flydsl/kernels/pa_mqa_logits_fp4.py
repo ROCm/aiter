@@ -58,6 +58,22 @@ def compute_varctx_schedule(
     )
     S = P // next_n  # max number of (batch, chunk-split) slots before next_n fan-out
 
+    # Guard against silent batch-dropping. There are S per-next_n slots; each
+    # (batch, chunk-split) work item needs one. `valid = slot < total_splits`
+    # below truncates any work past slot S, leaving those batches at the
+    # caller's out pre-fill (-inf/NaN) -> wrong top-k with NO error. `S >= B`
+    # (i.e. P >= B * next_n) is a host-side (sync-free, CUDAGraph-safe)
+    # sufficient condition: at the coarsest folding (safe = max_chunks)
+    # total_splits == #non-empty batches <= B, so S >= B guarantees
+    # total_splits <= S.
+    B = context_lens.shape[0]
+    assert S >= B, (
+        f"compute_varctx_schedule: parallel_unit_num//next_n={S} < batches={B} "
+        f"would silently drop batches past slot {S} (logits stay at the "
+        f"caller's pre-fill -> wrong top-k). Pass parallel_unit_num >= "
+        f"batches * next_n."
+    )
+
     ctx = context_lens.to(torch.int32)
 
     chunks_per_batch = (ctx + (block_k - 1)) // block_k  # [B] int32
@@ -257,7 +273,6 @@ def build_pa_mqa_logits_fp4_module(
         kv_rsrc = buffer_ops.create_buffer_resource(kv_cache_ptr, max_size=True)
         kvs_rsrc = buffer_ops.create_buffer_resource(kv_scale_ptr, max_size=True)
         bt_rsrc = buffer_ops.create_buffer_resource(kv_indices_ptr, max_size=True)
-        out_rsrc = buffer_ops.create_buffer_resource(out_logits_ptr, max_size=True)
 
         ZERO_F = fx.Float32(0.0)
         c0_i32 = fx.Int32(0)
@@ -267,6 +282,22 @@ def build_pa_mqa_logits_fp4_module(
         chunk_start = cta_info_vec[1]
         chunk_count = cta_info_vec[2]
         context_len = cta_info_vec[3]
+
+        # Per-CTA output base. `batch_packed * stride_out_batch` overflows i32
+        # when batch_packed * max_seq_len > 2^31-1 (large B*next_n with a big
+        # max_seq_len): the store offset wraps and the row is silently dropped
+        # (out stays at the caller's pre-fill). Fold the row base into the
+        # buffer-resource base pointer in i64 so only the small per-token offset
+        # rides the 32-bit buffer voffset.
+        _row_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(batch_packed))
+        _stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(stride_out_batch))
+        _row_elems_i64 = arith.muli(_row_i64, _stride_i64)
+        _row_bytes_i64 = arith.muli(
+            _row_elems_i64, arith.constant(4, type=T.i64)  # sizeof(f32)
+        )
+        out_rsrc = buffer_ops.create_buffer_resource(
+            out_logits_ptr, max_size=True, base_byte_offset=_row_bytes_i64
+        )
 
         pid_b = batch_packed // fx.Int32(next_n)
         pid_next_n = batch_packed % fx.Int32(next_n)
@@ -505,7 +536,10 @@ def build_pa_mqa_logits_fp4_module(
             out_token = token_base + lane_mod_16
             mask_off = fx.Int32(next_n - 1) - pid_next_n
             in_ctx = (out_token + mask_off) < context_len
-            out_off_real = batch_packed * stride_out_batch + out_token
+            # Row base folded into out_rsrc's i64 base pointer (see above), so
+            # the per-token store offset is just the (small) token index — no
+            # i32 overflow even for large stride_out_batch * batch_packed.
+            out_off_real = out_token
             out_off = in_ctx.select(out_off_real, oob_off)
             out_off = is_writer.select(out_off, oob_off)
             buffer_ops.buffer_store(thread_sum, out_rsrc, out_off)
