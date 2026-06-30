@@ -675,7 +675,7 @@ def _decode_bitmatrix(bitmatrix, n_tokens, n_expts_tot):
 
 def _assert_bitmatrix_matches(bitmatrix, tri_ids, n_tokens, n_expts_tot):
     decoded = _decode_bitmatrix(bitmatrix, n_tokens, n_expts_tot).cpu()
-    expected = torch.zeros((n_tokens, n_expts_tot), dtype=torch.bool)
+    expected = torch.zeros((n_tokens, n_expts_tot), dtype=torch.bool, device="cpu")
     expected.scatter_(1, tri_ids.cpu().long(), True)
     assert torch.equal(decoded, expected), "bitmatrix does not match selected ids"
 
