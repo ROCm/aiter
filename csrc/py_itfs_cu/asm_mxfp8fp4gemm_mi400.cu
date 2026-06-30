@@ -52,10 +52,7 @@ struct __attribute__((packed)) KernelArgs
 static_assert(sizeof(KernelArgs) == 76, "mxfp8fp4 preload KernelArgs must be 76B");
 
 // Pick the best registered kernel variant for (M,N,K) given the B dtype and
-// a_preshuffle. Persistent/cluster shaders don't mask partial tiles, so the
-// problem must tile both dims exactly, and the cluster dims must evenly divide
-// the tile grid. Heuristic: fewest CU "rounds", tie-broken on empty-CU fit and
-// compute/mem efficiency (matches the f4gemm selector).
+// a_preshuffle.
 static std::tuple<std::string, int> get_heuristic_kernel(
     int M, int N, int K, std::string arch_id, int b_intype, int a_preshuffle, CFG* cfgs)
 {
@@ -76,14 +73,23 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         const auto& cfg = el.second;
         if(cfg.b_intype != b_intype || cfg.a_preshuffle != a_preshuffle)
             continue;
-        if((N % cfg.tile_n) != 0 || (M % cfg.tile_m) != 0)
+
+        int cl_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
+        int cl_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
+
+        // N is cluster-tiled with no partial-tile masking, so it must tile
+        // exactly. M only needs to fill tile_m when it is clustered
+        // (cluster_y > 1); a cluster_y == 1 tile lets the persistent scheduler
+        // run a partial trailing M-tile bounded by the M kernarg (scale padded
+        // to 32 rows), so small M selects the 64mx1_128nx4 tile.
+        if((N % cfg.tile_n) != 0)
+            continue;
+        if(cl_y > 1 && (M % cfg.tile_m) != 0)
             continue;
 
         int tg_num_M = (M + cfg.tile_m - 1) / cfg.tile_m; // tiles in M (gdy)
         int tg_num_N = (N + cfg.tile_n - 1) / cfg.tile_n; // tiles in N (gdx)
 
-        int cl_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
-        int cl_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
         if((cl_x > 1 && (tg_num_N % cl_x) != 0) || (cl_y > 1 && (tg_num_M % cl_y) != 0))
             continue;
 
