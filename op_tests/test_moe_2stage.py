@@ -1032,7 +1032,9 @@ for kwargs, extras in case_iter:
             run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
         )
         with aot_guard:
-            ret = test_fmoe(**kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype)
+            ret = test_fmoe(
+                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+            )
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
