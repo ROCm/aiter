@@ -203,9 +203,9 @@ def _moe_gemm_a8w4_decode(
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
     start_m = gl.load(ExptOffs + expt_id)
-    expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
-    start_m = start_m.to(index_type)
-    pid_n = pid_n.to(index_type)
+    #expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
+    #start_m = start_m.to(index_type)
+    #pid_n = pid_n.to(index_type)
 
     # A pointers
     off_x_m = BLOCK_M * block_id
@@ -244,7 +244,7 @@ def _moe_gemm_a8w4_decode(
         PACKED_BLOCK_N_W: gl.constexpr = BLOCK_N
     MX_SCALE_BLOCK_K: gl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
-    WMxScale += expt_id * stride_w_mx_e
+    WMxScale += expt_id.to(index_type) * stride_w_mx_e
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         gl.static_assert(stride_w_mx_k is not None)
         gl.static_assert(stride_w_mx_n is not None)
@@ -260,8 +260,8 @@ def _moe_gemm_a8w4_decode(
     # B pointers
     off_w_n_scale = pid_n * SCALE_BLOCK_N
     off_w_n = pid_n * PACKED_BLOCK_N_W
-    W += expt_id * stride_w_e
-
+    W += expt_id.to(index_type) * stride_w_e
+    
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0]
     )
@@ -816,9 +816,9 @@ def _moe_gemm_a8w4_prefill(
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
     start_m = gl.load(ExptOffs + expt_id)
-    expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
-    start_m = start_m.to(index_type)
-    pid_n = pid_n.to(index_type)
+    #expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
+    #start_m = start_m.to(index_type)
+    #pid_n = pid_n.to(index_type)
 
     # A pointers
     off_x_m = BLOCK_M * block_id
@@ -853,7 +853,7 @@ def _moe_gemm_a8w4_prefill(
         PACKED_BLOCK_N_W: gl.constexpr = BLOCK_N
     MX_SCALE_BLOCK_K: gl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
-    WMxScale += expt_id * stride_w_mx_e
+    WMxScale += expt_id.to(index_type) * stride_w_mx_e
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         gl.static_assert(stride_w_mx_k is not None)
         gl.static_assert(stride_w_mx_n is not None)
@@ -869,7 +869,7 @@ def _moe_gemm_a8w4_prefill(
     # B pointers
     off_w_n_scale = pid_n * SCALE_BLOCK_N
     off_w_n = pid_n * PACKED_BLOCK_N_W
-    W += expt_id * stride_w_e
+    W += expt_id.to(index_type) * stride_w_e
 
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0]
