@@ -39,7 +39,7 @@ env:
   FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
   FFM_TEST_SOURCE_REF: ${{ inputs.test_ref || 'shared/reduced_tests_for_FFM_CI' }}
   FFM_TEST: op_tests/triton_tests
-  FFM_SHARD_COUNT: 16
+  FFM_SHARD_COUNT: 32
 
 jobs:
   check-signal:
@@ -63,7 +63,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
 
     steps:
       - name: Checkout source
@@ -163,7 +163,7 @@ jobs:
               echo "PYTHONPATH=${PYTHONPATH:-}"
 
               export ENABLE_CK=0
-              export AITER_TRITON_ONLY=1
+              export AITER_TRITON_ONLY=0
               export AITER_USE_SYSTEM_TRITON=1
               export PIP_BREAK_SYSTEM_PACKAGES=1
               echo "ENABLE_CK=${ENABLE_CK}"
@@ -183,11 +183,18 @@ jobs:
 
               echo "==== Build FFM Triton shard ===="
               printf "%s\n" \
+                "op_tests/triton_tests/attention/test_mha_v3.py" \
+                "op_tests/triton_tests/test_pa_decode_gluon.py" \
+                "op_tests/triton_tests/conv/test_causal_conv1d.py" \
+                "op_tests/triton_tests/attention/test_mha_fp8.py" \
                 "op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.py" \
                 > ffm_node_sharded_files.list
 
               ./.github/scripts/split_tests.sh --shards "${FFM_SHARD_COUNT}" --test-type triton
-              grep -Fxv -f ffm_node_sharded_files.list "triton_shard_${FFM_SHARD_INDEX}.list" > ffm_shard_items.list || true
+              tr " " "\n" < "triton_shard_${FFM_SHARD_INDEX}.list" \
+                | sed "/^$/d" \
+                | grep -Fxv -f ffm_node_sharded_files.list \
+                > ffm_shard_items.list || true
 
               while IFS= read -r file; do
                 if [ ! -f "${file}" ]; then
@@ -208,6 +215,8 @@ jobs:
                   ffm_collect_one_file.txt >> ffm_shard_items.list
               done < ffm_node_sharded_files.list
 
+              awk 'NF && !seen[$0]++' ffm_shard_items.list > ffm_shard_items.dedup
+              mv ffm_shard_items.dedup ffm_shard_items.list
               shard_count="$(wc -l < ffm_shard_items.list | tr -d " ")"
               echo "Selected ${shard_count} FFM Triton item(s) for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
               if [ "${shard_count}" -eq 0 ]; then
