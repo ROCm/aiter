@@ -610,7 +610,6 @@ def fused_dynamic_mxfp4_quant_moe_sort(
 
     N_i = scaleN
     M_o, N_o = sorted_ids.shape[0], N_i
-    assert (N_i // 2) % 2 == 0
     assert block_size % BLOCK_SIZE_M == 0
 
     blockscale_e8m0_sorted = torch.empty(
@@ -642,6 +641,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         *blockscale_e8m0_sorted.stride(),
         token_num=token_num,
         N_i=N_i,
+        N_o=N_o,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         BLOCK_SIZE_Mx=BLOCK_SIZE_Mx,
         BLOCK_SIZE_M=BLOCK_SIZE_M // 2,

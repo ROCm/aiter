@@ -839,6 +839,7 @@ def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
     stride_o4,  #: tl.constexpr,
     token_num,  #: tl.constexpr,
     N_i,  #: tl.constexpr,
+    N_o,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_Mx: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -934,12 +935,13 @@ def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
 
     pid -= num_pid_x
     num_pid_n = tl.cdiv(N_i, BLOCK_SIZE_N * 2)
-    pid_m = pid // num_pid_n  # * 2
-    pid_n = pid % num_pid_n  # * 2
-    # pid_m = tl.program_id(0) * 2
-    # pid_n = tl.program_id(1) * 2
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
     num_valid_ids = tl.load(num_valid_ids_ptr)
     if pid_m * BLOCK_SIZE_M * 2 >= num_valid_ids:
+        return
+    num_valid_n_tiles = tl.cdiv(N_o, BLOCK_SIZE_N * 2)
+    if pid_n >= num_valid_n_tiles:
         return
     stride_o0 = tl.cast(stride_o0, tl.int64)
     stride_o1 = tl.cast(stride_o1, tl.int64)

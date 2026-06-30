@@ -876,6 +876,7 @@ class MOEMetadata:
     fuse_quant: str = ""
     stage2_has_bias: bool = False
     flat: bool = False
+    skip_inter_quant: bool = False
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1364,6 +1365,12 @@ def get_2stage_cfgs(
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
             return 32
+        elif q_dtype_a == dtypes.fp4x2:
+            # MXFP4 fused quant+sort requires block_size % 32 == 0.
+            # block_m=64 is significantly faster than 32 for fp4x2 on
+            # gfx950 across all tested batch sizes (up to 1.5x for
+            # prefill).  128 is not supported by current CKTile stage2.
+            return 64
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
@@ -1608,6 +1615,7 @@ def get_2stage_cfgs(
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
+        and q_dtype_a not in [dtypes.fp4x2]
         and is_shuffled
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
         and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
@@ -1643,6 +1651,33 @@ def get_2stage_cfgs(
             run_1stage,
             has_bias=activation == ActivationType.Swiglu,
             stage2_has_bias=activation == ActivationType.Swiglu,
+        )
+    elif (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and q_dtype_a in [dtypes.fp4x2]
+        and q_dtype_w in [dtypes.fp4x2]
+    ):
+        # Stage1 uses JIT CK (DeviceMoeGemmMXBPreShuffle) which correctly
+        # handles fp4x2 activations x fp4x2 weights.  Stage2 uses CKTile AOT
+        # with bf16 activations x fp4x2 weights (a16w4 path), skipping the
+        # costly intermediate bf16->fp4x2 quantization between stages.
+        return MOEMetadata(
+            functools.partial(
+                ck_moe_stage1,
+                quant_type=q_type,
+                activation=activation,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            ),
+            get_block_m(),
+            0,
+            False,
+            skip_inter_quant=True,
         )
 
     if (
@@ -1983,6 +2018,7 @@ def fused_moe_2stages(
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
             or (metadata.ksplit > 1 and is_shuffled)
+            or metadata.skip_inter_quant
         )
     ):
         a2_scale = None
@@ -2427,6 +2463,15 @@ def torch_moe_stage2(
         hidden_states = hidden_states.view(a2_shape)
 
         w2_shape = w2.shape
+        # Some TP-sharded models carry padded per_1x32 scale groups in w2_scale.
+        # Align scale groups to runtime inter_dim groups for robust torch fallback.
+        w2_scale = w2_scale.view(E, model_dim, -1)
+        w2_groups = inter_dim // 32
+        if w2_scale.shape[2] > w2_groups:
+            w2_scale = w2_scale[:, :, :w2_groups]
+        elif w2_scale.shape[2] < w2_groups:
+            pad = w2_groups - w2_scale.shape[2]
+            w2_scale = torch.nn.functional.pad(w2_scale, (0, pad), value=1.0)
         w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
             E, model_dim, inter_dim // 32, 1
         )
