@@ -32,11 +32,13 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-# (label, head_dim, rope_head_dim, ratio, overlap, quant, use_ue8m0, preshuffle)
+# (label, head_dim, rope_head_dim, ratio, overlap, quant_mode, use_ue8m0, preshuffle)
+# quant_mode ∈ {"none","fp8","fp4"}.
 SHAPES = [
-    ("csa_main", 512, 64, 4, True, False, False, False),
-    ("csa_indexer", 128, 64, 4, True, True, True, True),
-    ("hca_main", 512, 64, 128, False, False, False, False),
+    ("csa_main", 512, 64, 4, True, "none", False, False),
+    ("csa_indexer", 128, 64, 4, True, "fp8", True, True),
+    ("csa_indexer_fp4", 128, 64, 4, True, "fp4", True, True),
+    ("hca_main", 512, 64, 128, False, "none", False, False),
 ]
 K_PER_BLOCK = (
     64  # paged-cache compressed-slot block size (multiple of 16 for preshuffle)
@@ -85,7 +87,8 @@ def _build_inputs(shape, bs, mtp, mode):
     Both modes append SENTINEL_PAD trailing rows with position=-1 so the
     kernel's plan-capacity > num_compress padding-bail path is exercised.
     """
-    label, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
+    label, D, RD, ratio, overlap, quant_mode, ue8m0, preshuffle = shape
+    quant = quant_mode in ("fp8", "fp4")
     dim_full = (2 if overlap else 1) * D
     K_pool = (2 if overlap else 1) * ratio
 
@@ -165,9 +168,19 @@ def _build_inputs(shape, bs, mtp, mode):
     # paged cache: one block per seq is enough (num_per_seq ≤ K_PER_BLOCK).
     blocks_per_seq = (num_per_seq + K_PER_BLOCK - 1) // K_PER_BLOCK
     total_blocks = bs * blocks_per_seq + 4
-    if quant:
+    if quant_mode == "fp8":
         kv_cache = torch.zeros(total_blocks, K_PER_BLOCK, D, dtype=dtypes.fp8)
         cache_scale = torch.zeros(total_blocks, K_PER_BLOCK, dtype=torch.float32)
+    elif quant_mode == "fp4":
+        # FP4 preshuffle: data [NB, k_tiles, 4, K_PER_BLOCK, 16] u8,
+        # scale [NB, k_tiles, 4, K_PER_BLOCK] u8 (e8m0). 16 bytes = 32 fp4.
+        k_tiles = D // 128
+        kv_cache = torch.zeros(
+            total_blocks, k_tiles, 4, K_PER_BLOCK, 16, dtype=torch.uint8
+        )
+        cache_scale = torch.zeros(
+            total_blocks, k_tiles, 4, K_PER_BLOCK, dtype=torch.uint8
+        )
     else:
         kv_cache = torch.zeros(total_blocks, K_PER_BLOCK, D, dtype=torch.bfloat16)
         cache_scale = None
@@ -196,6 +209,7 @@ def _build_inputs(shape, bs, mtp, mode):
         ratio=ratio,
         overlap=overlap,
         quant=quant,
+        quant_mode=quant_mode,
         use_ue8m0=ue8m0,
         preshuffle=preshuffle,
         rms_eps=RMS_EPS,
@@ -230,6 +244,7 @@ def _run_kernel(inp, *, use_2kernel):
             **common,
             overlap=inp["overlap"],
             quant=inp["quant"],
+            quant_mode=inp["quant_mode"],
             cache_scale=inp["cache_scale"],
             use_ue8m0=inp["use_ue8m0"],
             preshuffle=inp["preshuffle"],
@@ -240,7 +255,8 @@ def _run_kernel(inp, *, use_2kernel):
 def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
     """One case. ``mode`` ∈ {'decode','prefill'}, ``path`` ∈ {'single','2kernel'}."""
     shape = _shape_by_label(shape_label)
-    _, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
+    _, D, RD, ratio, overlap, quant_mode, ue8m0, preshuffle = shape
+    quant = quant_mode in ("fp8", "fp4")
     use_2kernel = path == "2kernel"
     inp = _build_inputs(shape, bs, mtp, mode)
 
@@ -273,13 +289,48 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
         head_dim=D,
         rope_head_dim=RD,
         quant=quant,
+        quant_mode=quant_mode,
         cache_scale=ref_inp["cache_scale"],
         use_ue8m0=ue8m0,
         preshuffle=preshuffle,
     )
 
     msg = f"{shape_label}/{mode}/{path} bs={bs} mtp={mtp}"
-    if quant:
+    if quant_mode == "fp4":
+        # FP4 cache: dequantize both (e8m0 scale * E2M1 value) and compare
+        # within tolerance; e8m0 scale bytes bit-exact.
+        from aiter.utility.fp4_utils import mxfp4_to_f32
+
+        k_dq = mxfp4_to_f32(inp["kv_cache"].reshape(-1, 16)) * (
+            2.0
+            ** (
+                inp["cache_scale"].reshape(-1).to(torch.int32)[:, None].float() - 127.0
+            )
+        )
+        r_dq = mxfp4_to_f32(ref_inp["kv_cache"].reshape(-1, 16)) * (
+            2.0
+            ** (
+                ref_inp["cache_scale"].reshape(-1).to(torch.int32)[:, None].float()
+                - 127.0
+            )
+        )
+        err = checkAllclose(
+            k_dq,
+            r_dq,
+            rtol=1e-2,
+            atol=1e-2,
+            tol_err_ratio=0.05,
+            msg=f"{msg} kv_cache(fp4 dequant)",
+        )
+        checkAllclose(
+            inp["cache_scale"].to(torch.int32),
+            ref_inp["cache_scale"].to(torch.int32),
+            rtol=0,
+            atol=0,
+            tol_err_ratio=0.0,
+            msg=f"{msg} cache_scale(e8m0 bit-exact)",
+        )
+    elif quant:
         err = checkAllclose(
             inp["kv_cache"].to(dtypes.fp32),
             ref_inp["kv_cache"].to(dtypes.fp32),
