@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # Build all gfx1250 mxfp8fp4gemm .co files from the POC .s assembly sources.
 #
-# Each POC .s already declares a uniquely-named kernel symbol
-#   <variant>_KERNEL_FUNC
-# (e.g. MXFP8xFP8_GEMM_1TG_4W_128mx2_128nx2_APRESHUFFLE_CLUSTER4x4_PS_KERNEL_FUNC),
-# which equals the knl_name column in mxfp8fp4gemm.csv. Because the symbols are
-# already unique per variant, no symbol renaming is needed (unlike f4gemm) -- we
-# just compile each .s to its co_name.
+# Each POC .s declares a uniquely-named kernel symbol "<variant>_KERNEL_FUNC"
+# (e.g. MXFP8xFP8_GEMM_1TG_4W_128mx2_128nx2_APRESHUFFLE_CLUSTER4x4_PS_KERNEL_FUNC).
+# The CFG map in asm_mxfp8fp4gemm_configs.hpp uses (arch + knl_name) as a unique
+# key, and knl_name is now the mangled aiter symbol _ZN5aiter<len><base>E (see
+# mxfp8fp4gemm.csv). So, like f4gemm, we rename the kernel symbol per variant via
+# sed before compilation: <variant>_KERNEL_FUNC -> knl_name.
 #
-# Source .s filename is derived from knl_name by dropping the trailing
-# "_KERNEL_FUNC", i.e. ${SHADER_DIR}/${knl_name%_KERNEL_FUNC}.s
+# The source .s filename / old symbol is derived from the row's (b_intype,
+# tile_m, tile_n) -- there are only two registered tile shapes:
+#   256x256 -> 128mx2_128nx2 + CLUSTER4x4   (cluster_x=4, cluster_y=4)
+#   64x512  -> 64mx1_128nx4  + CLUSTER1x4   (cluster_x=4, cluster_y=1)
+# and b_intype 0 -> FP8 (a8w8), 1 -> FP4 (a8w4); all rows are APRESHUFFLE + PS.
 #
 # Usage:
 #   SHADER_DIR=/path/to/poc/mxfp8fp4gemm/shaders ./build_co.sh
+#   SHADER_DIR=... CSV=... ./build_co.sh
 #
 # Default SHADER_DIR points at the POC checkout next to this repo.
 
@@ -41,6 +45,15 @@ echo "  Output dir: ${OUTPUT_DIR}"
 echo "  Arch:       ${ARCH}"
 echo ""
 
+# Map a registered (tile_m, tile_n) shape to the POC .s "<mx>_<nx>" + cluster tag.
+tile_tag() {
+    case "$1x$2" in
+        256x256) echo "128mx2_128nx2 CLUSTER4x4" ;;
+        64x512)  echo "64mx1_128nx4 CLUSTER1x4" ;;
+        *)       echo "" ;;
+    esac
+}
+
 built=0
 skipped=0
 failed=0
@@ -50,26 +63,42 @@ tail -n +2 "${CSV}" | while IFS=, read -r tile_m tile_n b_intype a_preshuffle cl
     [ -z "${tile_m}" ] && continue
     knl_name="$(echo "${knl_name}" | tr -d '[:space:]')"
     co_name="$(echo "${co_name}" | tr -d '[:space:]')"
-    s_basename="${knl_name%_KERNEL_FUNC}"
-    s_file="${SHADER_DIR}/${s_basename}.s"
-    co_file="${OUTPUT_DIR}/${co_name}"
 
-    if [ ! -f "${s_file}" ]; then
-        printf "  SKIP  %-40s (missing %s)\n" "${co_name}" "${s_file}"
+    bw=$([ "${b_intype}" = "1" ] && echo 4 || echo 8)   # 0->FP8 (a8w8), 1->FP4 (a8w4)
+    read -r mxnx cluster <<<"$(tile_tag "${tile_m}" "${tile_n}")"
+    if [ -z "${mxnx}" ]; then
+        printf "  SKIP  %-55s (no source mapping for ${tile_m}x${tile_n})\n" "${co_name}"
         skipped=$((skipped + 1))
         continue
     fi
 
-    printf "  BUILD %-40s ... " "${co_name}"
+    s_basename="MXFP8xFP${bw}_GEMM_1TG_4W_${mxnx}_APRESHUFFLE_${cluster}_PS"
+    old_symbol="${s_basename}_KERNEL_FUNC"
+    s_file="${SHADER_DIR}/${s_basename}.s"
+    co_file="${OUTPUT_DIR}/${co_name}"
+
+    if [ ! -f "${s_file}" ]; then
+        printf "  SKIP  %-55s (missing %s)\n" "${co_name}" "${s_file}"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    tmp_s="$(mktemp --suffix=.s)"
+    # Rename the unique POC kernel symbol to the mangled aiter knl_name. \b keeps
+    # the trailing ".kd" in ".symbol: <old>.kd" intact (it re-anchors at the dot).
+    sed -E "s/\b${old_symbol}\b/${knl_name}/g" "${s_file}" > "${tmp_s}"
+
+    printf "  BUILD %-55s ... " "${co_name}"
     if ${CXX} -x assembler -target amdgcn--amdhsa --offload-arch=${ARCH} \
-        "${s_file}" -o "${co_file}"; then
+        "${tmp_s}" -o "${co_file}" 2>/dev/null; then
         echo "OK"
         built=$((built + 1))
     else
         echo "FAILED"
         failed=$((failed + 1))
     fi
+    rm -f "${tmp_s}"
 done
 
 echo ""
-echo "=== Done ==="
+echo "=== Done (built=${built}, skipped=${skipped}, failed=${failed}) ==="
