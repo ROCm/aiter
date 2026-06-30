@@ -1043,7 +1043,13 @@ class FmoeTuner(TunerCommon):
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
             w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
-        elif q_dtype_w == dtypes.fp8 and q_dtype_a == dtypes.fp8:  # mxfp8 (a8w8)
+        elif (
+            q_dtype_w == dtypes.fp8
+            and q_dtype_a == dtypes.fp8
+            and q_type == QuantType.per_1x32
+        ):  # mxfp8 (a8w8); per_1x128/per_Token fp8 must use the standard
+            # shuffle_weight((16,16)) + e8m0_shuffle scale path (see else below),
+            # matching op_tests/test_moe_2stage.py is_mxfp8 routing.
             w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, True)
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
