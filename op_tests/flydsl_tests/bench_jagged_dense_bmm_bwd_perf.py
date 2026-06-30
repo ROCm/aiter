@@ -98,11 +98,23 @@ def default_benchmark_configs():
     ]
 
 
-def _make_seq_offsets(B, Mi, regime, seed, device):
+def _make_seq_offsets(B, Mi, regime, seed, device, sparsity=0.95):
     """Per-group prefix-sum offsets. uniform: every group == Mi. skew: Mi*U**4
-    with ~20% empty groups + one full and one near-full group (deployment dist)."""
+    with ~20% empty groups + one full and one near-full group (deployment dist).
+    genrec: M_i ~ Uniform(1, Mi) * sparsity, clamped >=1 -- mirrors the recsys
+    harness common.gen_jagged_offsets so this bench is apples-to-apples with the
+    genrec/HSTU jdbba sweeps (use the genrec seed, e.g. 1001, for an identical
+    M_i instance). Here Mi is the ENVELOPE (max_seq_len), not the per-group len."""
     if regime == "uniform":
         return torch.arange(0, (B + 1) * Mi, Mi, dtype=torch.int32, device=device)
+    if regime == "genrec":
+        g = torch.Generator(device=device).manual_seed(seed)
+        lengths = torch.randint(1, Mi + 1, size=(B,), device=device, generator=g)
+        if sparsity < 1.0:
+            lengths = (lengths.float() * sparsity).clamp(min=1.0).to(torch.int64)
+        so = torch.zeros(B + 1, dtype=torch.int32, device=device)
+        so[1:] = torch.cumsum(lengths, dim=0).to(torch.int32)
+        return so
     g = torch.Generator().manual_seed(seed)
     u = torch.rand(B, generator=g)
     t = (Mi * (u**4)).floor().to(torch.int64)
@@ -116,7 +128,7 @@ def _make_seq_offsets(B, Mi, regime, seed, device):
     return so.to(device)
 
 
-def _make_inputs(B, D, Kout, Mi, regime="uniform", seed=1234, device="cuda"):
+def _make_inputs(B, D, Kout, Mi, regime="uniform", seed=1234, device="cuda", sparsity=0.95):
     """Returns the tensors the backward kernels need for the given regime.
 
     jagged (L, K), dense (B, K, N), dOut (L, N), seq_offsets (B+1,). Naming mirrors
@@ -124,7 +136,7 @@ def _make_inputs(B, D, Kout, Mi, regime="uniform", seed=1234, device="cuda"):
     """
     torch.manual_seed(0)
     N, K = Kout, D  # GEMM: output N = Kout, reduction K = D
-    seq_offsets = _make_seq_offsets(B, Mi, regime, seed, device)
+    seq_offsets = _make_seq_offsets(B, Mi, regime, seed, device, sparsity=sparsity)
     L = int(seq_offsets[-1].item())
 
     jagged = torch.randn(max(L, 1), K, dtype=torch.bfloat16, device=device)
@@ -301,7 +313,7 @@ def _run_one_regime(custom, args, regime, providers, unit):
     @triton.testing.perf_report([config])
     def bench_fn(B, D, KOUT, MI, provider, regime):
         jagged, dense, d_out, seq_offsets, L, N, K = _make_inputs(
-            B, D, KOUT, MI, regime=regime, seed=args.seed
+            B, D, KOUT, MI, regime=regime, seed=args.seed, sparsity=args.sparsity
         )
 
         if provider == "triton":
@@ -361,9 +373,12 @@ def parse_args(argv=None):
     p.add_argument("--metric", choices=["time", "throughput", "bandwidth"], default="time")
     p.add_argument("--component", choices=["jagged", "dense_bias", "all"], default="all",
                    help="which backward output(s) to score: dJagged / (dDense,dBias) / both")
-    p.add_argument("--regime", choices=["uniform", "skew", "both"], default="uniform",
-                   help="sequence-length distribution (uniform baseline / skewed deployment / both)")
-    p.add_argument("--seed", type=int, default=1234, help="skew RNG seed")
+    p.add_argument("--regime", choices=["uniform", "skew", "genrec", "both"], default="uniform",
+                   help="sequence-length distribution (uniform baseline / skewed deployment / "
+                        "genrec Uniform(1,Mi)*sparsity apples-to-apples with the recsys sweeps / both)")
+    p.add_argument("--seed", type=int, default=1234, help="skew/genrec RNG seed (use 1001 to match genrec)")
+    p.add_argument("--sparsity", type=float, default=0.95,
+                   help="genrec regime: scale M_i ~ Uniform(1,Mi) by this factor (clamped >=1)")
     p.add_argument("-b", type=int, default=0, help="B groups (custom shape)")
     p.add_argument("-d", type=int, default=0, help="D = reduction K (custom shape)")
     p.add_argument("-kout", type=int, default=0, help="Kout = output N (custom shape)")
