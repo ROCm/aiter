@@ -15,17 +15,27 @@
 
 | Symbol | Meaning | Typical value (DeepSeek V3/V4) |
 |--------|---------|-------------------------------|
-| `B` | batch size (number of decode requests in flight) | 1 – 256 |
-| `T` | number of decode tokens (`= B` for single-token decode) | 1 – 256 |
+| `B` | batch size — number of concurrent decode requests | 1 – 256 |
+| `T` | total decode query tokens in one kernel call — equals `B` for standard autoregressive decode (one new token per request per step); equals `B × draft_len` for speculative decode | 1 – 256 |
 | `H` | number of query heads | 128 |
 | `D` | per-head dimension (after MLA absorption) | 576 (`= 512 + 64`) |
 | `Dv` | value head dimension | 512 |
 | `kv_lora_rank` | MLA KV latent dimension | 512 |
 | `rope_rank` | MLA decoupled RoPE key dimension | 64 |
-| `L` | full KV sequence length (context window) | up to 128k |
-| `k` | sparse top-k budget (tokens attended per query) | 2048 |
+| `L` | full KV sequence length per request (context window) | up to 128k |
+| `k` | sparse top-k budget — KV slots attended per query token | 2048 |
 | `BLOCK_K` | KV tile width in the decode inner loop | 16 or 32 |
 | `KV_SPLITS` | number of parallel split-K partitions | power of 2, auto |
+
+**On `T` vs `B`.** In standard autoregressive decode each request emits exactly one new
+token per step, so `T = B`. The kernel treats each of the `T` rows of `q[T, H, D]` as
+an independent query — it does not need to know which rows belong to which request.
+The per-request KV history is encoded in the CSR structure `(kv_indices, kv_indptr)`:
+`kv_indptr[t]` to `kv_indptr[t+1]` selects the sparse slots for query token `t`.
+
+At `T = 1` the kernel launches only `1 × ceil(H/BLOCK_H) × KV_SPLITS` CTAs — e.g.,
+`1 × 8 × 8 = 64` for `H = 128`, `BLOCK_H = 16`, `KV_SPLITS = 8`. MI300X has 304 CUs,
+so single-request decode is always CU-count limited and `KV_SPLITS` is the primary lever.
 
 ---
 
@@ -328,11 +338,6 @@ A `[16, 16]` MFMA C-tile uses 16 VGPRs per lane (one per C-row). For 36 tiles al
 the full accumulator occupies 36 × 16 = 576 AGPRs per lane — well within gfx942's 512
 AGPR limit if split across registers, but in practice typically kept in LDS or written
 tile-by-tile to avoid AGPR pressure at large D.
-
-**The Triton kernel** (`_pa_decode_sparse`) expresses both steps as `tl.dot()` calls,
-which the Triton compiler lowers to sequences of `v_mfma_f32_16x16x16_bf16`. The
-FlyDSL port (`pa_decode_sparse.py`) currently uses `BLOCK_H=1` with scalar ops; a
-future MFMA-based FlyDSL version would raise `BLOCK_H` to 16 and issue MFMA explicitly.
 
 ### 4.1 Data layout
 
