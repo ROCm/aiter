@@ -34,7 +34,10 @@ import flydsl.expr as fx  # noqa: E402
 # Import the kernel directly to avoid pulling the full aiter package
 # (which requires triton, pandas, etc.).  In CI the full aiter env is present.
 try:
-    from aiter.ops.flydsl.kernels.moe_warp_decode import compile_wd_moe_gate_up
+    from aiter.ops.flydsl.kernels.moe_warp_decode import (
+        compile_wd_moe_gate_up,
+        compile_wd_moe_down_reduce,
+    )
 except ImportError:
     import importlib.util
     import pathlib
@@ -47,6 +50,7 @@ except ImportError:
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     compile_wd_moe_gate_up = _mod.compile_wd_moe_gate_up
+    compile_wd_moe_down_reduce = _mod.compile_wd_moe_down_reduce
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +307,159 @@ def test_gate_up_bf16x_fp8w(shape_name, hidden, inter, topk, experts, B):
         rtol=0.1,
         pass_pct=90.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# down_reduce helpers + tests
+# ---------------------------------------------------------------------------
+
+
+def _ref_down_reduce(
+    inter_states: torch.Tensor,  # [B*TOPK, INTER] bf16
+    w_down: torch.Tensor,  # [E*HIDDEN, INTER] bf16
+    router_ids: torch.Tensor,  # [B*TOPK] i32
+    router_wts: torch.Tensor,  # [B*TOPK] f32
+    B: int,
+    topk: int,
+    inter: int,
+    hidden: int,
+) -> torch.Tensor:
+    """FP32 reference for down_reduce: Y = sum_k(rw_k * (inter_k @ W_down_ek.T))."""
+    ref = torch.zeros(B, hidden, dtype=torch.float32, device=inter_states.device)
+    xf = inter_states.float()
+    wf = w_down.float()
+    for b in range(B):
+        for k in range(topk):
+            slot = b * topk + k
+            e = router_ids[slot].item()
+            rw = router_wts[slot].item()
+            partial = wf[e * hidden : (e + 1) * hidden] @ xf[slot]  # [hidden]
+            ref[b] += rw * partial
+    return ref
+
+
+def _run_down_kernel(
+    exe,
+    y_out,
+    inter_states,
+    w_down,
+    router_ids,
+    router_wts,
+    B,
+    topk,
+    inter,
+    hidden,
+    experts,
+):
+    stream = torch.cuda.current_stream()
+    exe(
+        _ptr(y_out),
+        _ptr(inter_states),
+        _ptr(w_down),
+        _ptr(router_ids),
+        _ptr(router_wts),
+        B,
+        topk,
+        inter,
+        hidden,
+        experts,
+        stream,
+    )
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts", SHAPES)
+@pytest.mark.parametrize("B", BATCHES)
+def test_down_reduce_bf16_f32path(shape_name, hidden, inter, topk, experts, B):
+    """BF16 intermediate × BF16 weight down_reduce, FP32 scalar path (gfx942 + gfx950)."""
+    torch.manual_seed(42)
+    inter_states = (
+        torch.randn(B * topk, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    w_down = (
+        torch.randn(experts * hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    router_ids = torch.randint(
+        0, experts, (B * topk,), dtype=torch.int32, device="cuda"
+    )
+    router_wts_raw = torch.rand(B * topk, dtype=torch.float32, device="cuda")
+    # Normalise per token
+    router_wts = (
+        router_wts_raw.view(B, topk)
+        / router_wts_raw.view(B, topk).sum(dim=1, keepdim=True)
+    ).reshape(-1)
+
+    ref = _ref_down_reduce(
+        inter_states, w_down, router_ids, router_wts, B, topk, inter, hidden
+    )
+    y_out = torch.zeros(B, hidden, dtype=torch.float32, device="cuda")  # f32, zero-init
+
+    exe = compile_wd_moe_down_reduce(
+        hidden=hidden, inter=inter, experts=experts, topk=topk, use_dot2=False
+    )
+    _run_down_kernel(
+        exe,
+        y_out,
+        inter_states,
+        w_down,
+        router_ids,
+        router_wts,
+        B,
+        topk,
+        inter,
+        hidden,
+        experts,
+    )
+
+    _check(ref, y_out, f"{shape_name} B={B} down f32path", atol=0.01, rtol=0.05)
+
+
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts", SHAPES)
+@pytest.mark.parametrize("B", BATCHES)
+def test_down_reduce_bf16_dot2path(shape_name, hidden, inter, topk, experts, B):
+    """BF16 intermediate × BF16 weight down_reduce, v_dot2 path (gfx950 only)."""
+    if not _is_gfx950():
+        pytest.skip(f"v_dot2_f32_bf16 requires gfx950, got {_rocm_arch()}")
+
+    torch.manual_seed(42)
+    inter_states = (
+        torch.randn(B * topk, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    w_down = (
+        torch.randn(experts * hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    router_ids = torch.randint(
+        0, experts, (B * topk,), dtype=torch.int32, device="cuda"
+    )
+    router_wts_raw = torch.rand(B * topk, dtype=torch.float32, device="cuda")
+    router_wts = (
+        router_wts_raw.view(B, topk)
+        / router_wts_raw.view(B, topk).sum(dim=1, keepdim=True)
+    ).reshape(-1)
+
+    ref = _ref_down_reduce(
+        inter_states, w_down, router_ids, router_wts, B, topk, inter, hidden
+    )
+    y_out = torch.zeros(B, hidden, dtype=torch.float32, device="cuda")
+
+    exe = compile_wd_moe_down_reduce(
+        hidden=hidden, inter=inter, experts=experts, topk=topk, use_dot2=True
+    )
+    _run_down_kernel(
+        exe,
+        y_out,
+        inter_states,
+        w_down,
+        router_ids,
+        router_wts,
+        B,
+        topk,
+        inter,
+        hidden,
+        experts,
+    )
+
+    _check(ref, y_out, f"{shape_name} B={B} down dot2path", atol=0.01, rtol=0.05)
 
 
 # ---------------------------------------------------------------------------

@@ -103,14 +103,20 @@ def _dot2_dep(acc_f32, a_i32, b_i32):
     """v_dot2_f32_bf16 in dependent-chain form (gfx950 only).
 
     dst += a[lo]*b[lo] + a[hi]*b[hi]  (2 MACs/lane/cycle).
-    s_nop 2 covers the write->read hazard on the accumulator.
+
+    Embeds s_waitcnt vmcnt(0) before the dot2 to ensure a_i32 and b_i32
+    (typically from buffer_load) are ready.  The AMDGPU SIInsertWaitcnts
+    LLVM pass does not analyse inline asm operand registers, so without an
+    explicit waitcnt the dot2 may read stale values from pending VMEM loads.
+
+    s_nop 2 after the dot2 covers the write->read hazard on the accumulator.
     """
     result = llvm.inline_asm(
         T.f32,
         [acc_f32, a_i32, b_i32],
-        "v_dot2_f32_bf16 $0, $2, $3, $1",
+        "s_waitcnt vmcnt(0)\nv_dot2_f32_bf16 $0, $2, $3, $1",
         "=v,v,v,v",
-        has_side_effects=False,
+        has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
@@ -409,3 +415,251 @@ def compile_wd_moe_gate_up(
         ).launch(grid=(grid_x, 1, 1), block=(_WAVE_SIZE, 1, 1), stream=stream)
 
     return _launch
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: down_reduce
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=None)
+def compile_wd_moe_down_reduce(
+    *,
+    hidden: int,
+    inter: int,
+    experts: int,
+    topk: int,
+    k_vector: int = 8,
+    use_dot2: bool = False,
+):
+    """Compile warp-decode down_reduce and return a @flyc.jit launch wrapper.
+
+    One wavefront (64 lanes) per output channel Y[token_b, out_j].
+    Contracts over INTER (inner) then TOPK (expert slots, outer).
+    Epilogue: FP32 atomic-add into y_out (caller must zero-init y_out).
+
+    Parameters
+    ----------
+    hidden   : HIDDEN dimension (output size, e.g. 7168 for DeepSeek-V3).
+    inter    : INTER dimension (contraction axis, e.g. 2048).
+    experts  : E, number of experts.
+    topk     : top-K experts per token (compile-time; enables range_constexpr).
+    k_vector : BF16 elements per lane per K-step (default 8).
+    use_dot2 : if True, use v_dot2_f32_bf16 (gfx950 only);
+               if False, use FP32 scalar path (gfx942 + gfx950).
+
+    Launch signature:
+        exe(_ptr(y_out), _ptr(inter_states), _ptr(w_down), _ptr(router_ids),
+            _ptr(router_wts), B, topk, inter, hidden, experts, stream)
+
+    Tensor layouts (all row-major, contiguous):
+        y_out        : [B, HIDDEN]       f32  output (zero-init before launch!)
+        inter_states : [B*TOPK, INTER]   bf16 (gate_up output)
+        w_down       : [E*HIDDEN, INTER] bf16 weight rows
+        router_ids   : [B*TOPK]          i32  expert index per slot
+        router_wts   : [B*TOPK]          f32  router weight per slot
+    """
+    if hidden % (_WAVE_SIZE * k_vector) != 0:
+        raise ValueError(
+            f"hidden={hidden} must be divisible by WAVE_SIZE*k_vector"
+            f"={_WAVE_SIZE * k_vector}"
+        )
+    if inter % (_WAVE_SIZE * k_vector) != 0:
+        raise ValueError(
+            f"inter={inter} must be divisible by WAVE_SIZE*k_vector"
+            f"={_WAVE_SIZE * k_vector}"
+        )
+
+    dot2_tag = "_dot2" if use_dot2 else "_f32"
+    module_name = (
+        f"wd_down_h{hidden}_i{inter}_e{experts}_topk{topk}_kv{k_vector}{dot2_tag}"
+    )
+
+    _k_pairs = k_vector // 2
+    _k_step = _WAVE_SIZE * k_vector  # INTER elements per loop iteration
+    _n_k_steps = inter // _k_step
+
+    @flyc.kernel(name=module_name, known_block_size=[_WAVE_SIZE, 1, 1])
+    def _kernel(
+        arg_y_out: fx.Pointer,  # [B, HIDDEN] f32, zero-init
+        arg_inter: fx.Pointer,  # [B*TOPK, INTER] bf16
+        arg_w_down: fx.Pointer,  # [E*HIDDEN, INTER] bf16
+        arg_router_ids: fx.Pointer,  # [B*TOPK] i32
+        arg_router_wts: fx.Pointer,  # [B*TOPK] f32
+        i32_B: fx.Int32,
+        i32_TOPK: fx.Int32,
+        i32_INTER: fx.Int32,
+        i32_HIDDEN: fx.Int32,
+        i32_E: fx.Int32,
+    ):
+        f32 = T.f32
+        i32 = T.i32
+        i64 = T.i64
+
+        B_i32 = i32_B.ir_value()
+        TOPK_i32 = i32_TOPK.ir_value()
+        INTER_i32 = i32_INTER.ir_value()
+        HIDDEN_i32 = i32_HIDDEN.ir_value()
+
+        # ── Buffer resources ─────────────────────────────────────────────────
+        def _rsrc(ptr, nbytes_i32):
+            addr64 = arith.index_cast(i64, fx.ptrtoint(ptr))
+            return buffer_ops.create_buffer_resource_from_addr(
+                addr64, num_records_bytes=nbytes_i32
+            )
+
+        max_slots = B_i32 * TOPK_i32
+        inter_rsrc = _rsrc(
+            arg_inter, max_slots * INTER_i32 * arith.constant(2, type=i32)
+        )
+        rid_rsrc = _rsrc(arg_router_ids, max_slots * arith.constant(4, type=i32))
+        rwt_rsrc = _rsrc(arg_router_wts, max_slots * arith.constant(4, type=i32))
+        # y_out: [B, HIDDEN] f32 — use -1 sentinel (unbounded) since B*HIDDEN can be large
+        y_rsrc = _rsrc(arg_y_out, arith.constant(-1, type=i32))
+        # w_down: per-row resources built per slot below (E*HIDDEN*INTER can exceed i32)
+
+        # ── Block → (out_j, token_b) ─────────────────────────────────────────
+        lane_i32 = arith.index_cast(i32, gpu.thread_id("x"))
+        blk_i32 = arith.index_cast(i32, gpu.block_id("x"))
+
+        out_j = arith.remui(blk_i32, HIDDEN_i32)
+        token_b = arith.divui(blk_i32, HIDDEN_i32)
+
+        # ── Outer loop: TOPK slots ────────────────────────────────────────────
+        # Each slot: router_wt * sum_over_INTER(inter[slot] · W_down[expert, out_j])
+        # Accumulate weighted slot sums into total_acc.
+        # Both the k-step loop (over INTER) and the pair loop are compile-time
+        # unrolled with range_constexpr to keep everything in one flat basic block
+        # per slot — this avoids v_dot2_f32_bf16 write latency crossing loop
+        # back-edges and the resulting correctness hazard.
+        lane_kV = lane_i32 * arith.constant(k_vector, type=i32)
+        c_two = arith.constant(2, type=i32)
+        zero_f32 = arith.constant(0.0, type=f32)
+        zero_i32 = arith.constant(0, type=i32)
+
+        HIDDEN_i64 = arith.extsi(i64, HIDDEN_i32)
+        INTER_i64 = arith.extsi(i64, INTER_i32)
+        out_j_i64 = arith.extsi(i64, out_j)
+        row_nb = INTER_i32 * arith.constant(2, type=i32)
+
+        # Outer for: slot = 0..TOPK  (carries total_acc as f32)
+        outer_for = scf.ForOp(
+            arith.constant(0, index=True),
+            arith.index_cast(ir.IndexType.get(), TOPK_i32),
+            arith.constant(1, index=True),
+            iter_args=[zero_f32],
+        )
+        with ir.InsertionPoint(outer_for.body):
+            slot_idx = arith.index_cast(i32, outer_for.induction_variable)
+            total_acc = outer_for.inner_iter_args[0]
+
+            flat_slot = token_b * TOPK_i32 + slot_idx
+            expert_e = buffer_ops.buffer_load(
+                rid_rsrc, flat_slot, vec_width=1, dtype=i32
+            )
+            router_wt = buffer_ops.buffer_load(
+                rwt_rsrc, flat_slot, vec_width=1, dtype=f32
+            )
+
+            # Per-row w_down resource (i64 to avoid i32 overflow for large shapes).
+            # DeepSeek-V3: (255*7168+7167)*2048*2 = 3.75 GB > INT32_MAX.
+            expert_i64 = arith.extsi(i64, expert_e)
+            w_row_byte_off = (
+                (expert_i64 * HIDDEN_i64 + out_j_i64)
+                * INTER_i64
+                * arith.constant(2, type=i64)
+            )
+            w_base = arith.addi(
+                arith.index_cast(i64, fx.ptrtoint(arg_w_down)), w_row_byte_off
+            )
+            w_row_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                w_base, num_records_bytes=row_nb
+            )
+
+            inter_row_base = flat_slot * INTER_i32  # bf16 element offset
+
+            # Both loops compile-time unrolled: no loop-carried dot2 hazards.
+            cur = zero_f32
+            for k_step in range_constexpr(_n_k_steps):
+                k_base_c = arith.constant(k_step * _k_step, type=i32)
+                lane_k = k_base_c + lane_kV
+                for p in range_constexpr(_k_pairs):
+                    p2 = arith.constant(p * 2, type=i32)
+                    x_off = (inter_row_base + lane_k + p2) // c_two
+                    w_off = (lane_k + p2) // c_two
+                    x_word = buffer_ops.buffer_load(
+                        inter_rsrc, x_off, vec_width=1, dtype=i32
+                    )
+                    w_word = buffer_ops.buffer_load(
+                        w_row_rsrc, w_off, vec_width=1, dtype=i32
+                    )
+                    if use_dot2:
+                        cur = _dot2_dep(cur, x_word, w_word)
+                    else:
+                        x0 = _bf16_pair_to_f32(x_word, 0)
+                        x1 = _bf16_pair_to_f32(x_word, 1)
+                        cur = arith.addf(
+                            cur,
+                            arith.addf(
+                                arith.mulf(x0, _bf16_pair_to_f32(w_word, 0)),
+                                arith.mulf(x1, _bf16_pair_to_f32(w_word, 1)),
+                            ),
+                        )
+
+            new_total = arith.addf(total_acc, arith.mulf(router_wt, cur))
+            scf.YieldOp([new_total])
+
+        total_sum_all_lanes = _butterfly_reduce(outer_for.results[0])
+
+        # ── Epilogue: lane 0 atomic-adds FP32 result into y_out ──────────────
+        lane_zero = arith.cmpi(CmpIPredicate.eq, lane_i32, arith.constant(0, type=i32))
+        if_op = scf.IfOp(lane_zero)
+        with ir.InsertionPoint(if_op.then_block):
+            # y_out element offset (f32 = 4 bytes): token_b * HIDDEN + out_j
+            out_elem_i32 = token_b * HIDDEN_i32 + out_j  # element index
+            # raw_ptr_buffer_atomic_fadd: atomically y_out[out_elem] += total
+            rocdl.raw_ptr_buffer_atomic_fadd(
+                total_sum_all_lanes,
+                y_rsrc,
+                out_elem_i32 * arith.constant(4, type=i32),  # byte offset
+                zero_i32,
+                zero_i32,
+            )
+            scf.YieldOp([])
+
+    # ── @flyc.jit launch wrapper ──────────────────────────────────────────────
+    _dk = _kernel
+
+    @flyc.jit
+    def _launch_down(
+        arg_y_out: fx.Pointer,
+        arg_inter: fx.Pointer,
+        arg_w_down: fx.Pointer,
+        arg_router_ids: fx.Pointer,
+        arg_router_wts: fx.Pointer,
+        i32_B: fx.Int32,
+        i32_TOPK: fx.Int32,
+        i32_INTER: fx.Int32,
+        i32_HIDDEN: fx.Int32,
+        i32_E: fx.Int32,
+        stream: fx.Stream,
+    ):
+        idx = ir.IndexType.get()
+        # Grid: B * HIDDEN blocks (one wave per output channel)
+        grid_x = arith.index_cast(idx, i32_B.ir_value()) * arith.index_cast(
+            idx, i32_HIDDEN.ir_value()
+        )
+        _dk(
+            arg_y_out,
+            arg_inter,
+            arg_w_down,
+            arg_router_ids,
+            arg_router_wts,
+            i32_B,
+            i32_TOPK,
+            i32_INTER,
+            i32_HIDDEN,
+            i32_E,
+        ).launch(grid=(grid_x, 1, 1), block=(_WAVE_SIZE, 1, 1), stream=stream)
+
+    return _launch_down
