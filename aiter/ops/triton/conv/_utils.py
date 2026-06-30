@@ -37,6 +37,29 @@ def _out_hw(H, W, R, S, stride, padding, dilation):
     return P, Q
 
 
+def _conv_dims(x, w_oihw, stride, padding, dilation):
+    """Shared wrapper preamble: validate inputs and return the conv dimensions."""
+    assert x.is_cuda and w_oihw.is_cuda
+    N, C, H, W_in = x.shape
+    K_out, Cw, R, S = w_oihw.shape
+    assert Cw == C
+    P, Q = _out_hw(H, W_in, R, S, stride, padding, dilation)
+    return N, C, H, W_in, K_out, R, S, P, Q
+
+
+def _alloc_output(N, K_out, P, Q, x, layout):
+    """Allocate the output tensor, channels_last for nhwc else contiguous."""
+    y = torch.empty((N, K_out, P, Q), device=x.device, dtype=x.dtype)
+    if layout == "nhwc":
+        return y.to(memory_format=torch.channels_last)
+    return y
+
+
+def _prep_bias(bias):
+    """Cast bias to contiguous fp32 for the kernels, or None when absent."""
+    return bias.float().contiguous() if bias is not None else None
+
+
 def _storage_ptr(t: torch.Tensor) -> int:
     return (
         t.untyped_storage().data_ptr()
@@ -63,6 +86,17 @@ def _is_winograd_eligible(R, S, stride, dilation, C=None):
     if C is not None and C < 4:
         return False
     return True
+
+
+def _require_winograd_eligible(name, R, S, stride, dilation, C):
+    """Raise a uniform ValueError if this shape isn't Winograd F(4,3)-eligible."""
+    if not _is_winograd_eligible(R, S, stride, dilation, C):
+        raise ValueError(
+            f"{name} requires 3x3 kernel with stride=1, dilation=1, "
+            f"and C >= 4 (F(4,3) output transform amplifies rounding by up to "
+            f"361x; C<4 has too few reduction terms to absorb it), "
+            f"got {R}x{S} stride={stride} dilation={dilation} C={C}"
+        )
 
 
 def _winograd_tolerances(dtype, K_red, ref, variant="f4x3"):
