@@ -30,6 +30,19 @@ _USE_FLYDSL_MOE_SORTING = (
     and is_flydsl_available()
 )
 
+# Route the per_Tensor fp8 STAGE2 activation quant (the stage1 intermediate
+# [token*topk, inter_dim]) through the fused Triton kernel
+# (dynamic_per_tensor_quant_fp8_i8_*) for the non-direct 2-stage path too,
+# instead of the slow 3-launch HIP dynamic_per_tensor_quant (initScale +
+# data_to_scale global-atomicMax + scaled_quant). The HIP data_to_scale maps
+# one block per row and is pathologically slow on the narrow stage2 cols
+# (inter_dim=192: ~12 of 256 lanes active + single global atomicMax). The
+# direct path already uses this fused helper; this extends it to the CK-gemm1
+# + flydsl-gemm2 path. Stage1 hidden (cols=model_dim, wide) is left on the HIP
+# path since the fused Triton path regresses there at large M. Default on;
+# set =0 to fall back.
+_FAST_PT_QUANT = os.environ.get("AITER_FUSED_MOE_FAST_PT_QUANT", "1") == "1"
+
 
 def _flydsl_moe_sorting_supported(expert_mask, num_local_tokens):
     """The FlyDSL atomic sort only covers the plain (no-EP) sorting path."""
@@ -2204,8 +2217,16 @@ def fused_moe_2stages(
         )
         a2 = a2_v
     elif (
-        _is_direct_params(stage2_params)
-        and q_type2 == QuantType.per_Tensor
+        q_type2 == QuantType.per_Tensor
+        and (
+            _is_direct_params(stage2_params)
+            or (
+                _FAST_PT_QUANT
+                and q_dtype_a2 == dtypes.fp8
+                and a2_scale is None
+                and num_local_tokens is None
+            )
+        )
     ):
         a2, a2_scale = _direct_stage2_per_tensor_quant(a2, a2_scale, q_dtype_a2)
         a2 = a2.view(token_num, topk, inter_dim)
