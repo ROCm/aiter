@@ -132,11 +132,7 @@ def get_gfx_list() -> list[str]:
             gfxs = ["cpu"]
     else:
         gfxs = _parse_gpu_archs_env(gfx_env)
-    # AITER_GPU_ARCHS selects which tuned/asm kernels codegen emits; it normally
-    # tracks GPU_ARCHS (the compile offload arch). Honor a preset value so the
-    # codegen arch can be decoupled from the offload arch (e.g. asm-only modules
-    # whose host code must compile for a different arch than the .co targets).
-    os.environ.setdefault("AITER_GPU_ARCHS", ";".join(gfxs))
+    os.environ["AITER_GPU_ARCHS"] = ";".join(gfxs)
 
     return gfxs
 
