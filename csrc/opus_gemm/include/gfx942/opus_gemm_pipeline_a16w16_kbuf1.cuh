@@ -71,7 +71,7 @@ void gemm_a16w16_kbuf1_kernel(Kargs kargs) {
 
     auto g_c = [&]() {
         if constexpr (IS_SPLITK) {
-            return make_gmem(reinterpret_cast<D_C*>(kargs.ws_handle->ptr)
+            return make_gmem(opus_splitk_ws_ptr<D_C>(kargs.ws_handle)
                              + (size_t)split_id  * kargs.batch * kargs.stride_ws_batch
                              + (size_t)batch_id  * kargs.stride_ws_batch
                              + (size_t)row       * kargs.stride_ws
@@ -170,7 +170,6 @@ void gemm_a16w16_kbuf1_kernel(Kargs kargs) {
     v_a[0] = load<T::VEC_A>(s_a[0], u_ra);
 
     // MAIN LOOP -- 4-phase MMA+ds_read interleave (legacy).
-    #pragma unroll 4
     for (int tile = 0; tile < loops - 2; tile++) {
 
         phase_b_prefetch<T, T::a_ds_read_insts + T::b_ds_read_insts>(v_a[0], v_b[0], acc_00, v_b[1], lds_b1);
