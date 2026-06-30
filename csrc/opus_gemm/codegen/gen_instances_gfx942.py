@@ -41,7 +41,13 @@ GFX942_SPLITK_TRAITS_OVERRIDES = {
     },
 }
 
+GFX942_QUAD_MFMA32_SPLITK_TAG = "a16w16_quad_mfma32_kbuf1_sk"
 GFX942_SPLITK_TAGS = _SPLITK + ("a16w16_em3en4_lds1_pgr2_sk",)
+GFX942_EVEN_LOOP_SPLITK_TAGS = (
+    "a16w16_kbuf2v_sk",
+    "a16w16_kbuf2v_bk128_sk",
+    GFX942_QUAD_MFMA32_SPLITK_TAG,
+)
 
 
 def _splitk_traits_geometry(k):
@@ -66,7 +72,9 @@ def _uses_bf16_workspace(k):
 PIPELINE_HEADER_MAP = {
     "a16w16_em3en4_lds1_pgr2_sk": _gfx942_pipeline("a16w16_em3en4_lds1_pgr2_sk"),
     "a16w16_kbuf1_large_tile": _gfx942_pipeline("a16w16_kbuf1_large_tile"),
+    "a16w16_quad_mfma32_kbuf1": _gfx942_pipeline("a16w16_quad_mfma32_kbuf1"),
     "a16w16_wave_k_coop": _gfx942_pipeline("a16w16_wave_k_coop"),
+    "a16w16_wave_k_coop_accum": _gfx942_pipeline("a16w16_wave_k_coop"),
     **{nosplit: _gfx942_pipeline(nosplit) for nosplit in _NOSPLIT},
     **{
         splitk: _gfx942_pipeline(nosplit) for nosplit, splitk in W3_KERNEL_PAIRS.items()
@@ -80,7 +88,9 @@ TRAITS_NAME_MAP = {tag: GFX942_TRAITS_NAME for tag in _GFX942_A16W16_TAGS}
 KARGS_NAME_MAP = {
     "a16w16_em3en4_lds1_pgr2_sk": "opus_gemm_splitk_kargs",
     "a16w16_kbuf1_large_tile": "opus_gemm_noscale_kargs",
+    "a16w16_quad_mfma32_kbuf1": "opus_gemm_noscale_kargs",
     "a16w16_wave_k_coop": "opus_gemm_noscale_kargs",
+    "a16w16_wave_k_coop_accum": "opus_gemm_noscale_kargs",
     **{tag: "opus_gemm_splitk_kargs" for tag in _SPLITK},
     **{tag: "opus_gemm_noscale_kargs" for tag in _NOSPLIT},
 }
@@ -88,7 +98,9 @@ KARGS_NAME_MAP = {
 KERNEL_FUNC_MAP = {
     "a16w16_em3en4_lds1_pgr2_sk": "gemm_a16w16_em3en4_lds1_pgr2_sk_kernel",
     "a16w16_kbuf1_large_tile": "gemm_a16w16_kbuf1_large_tile_kernel",
+    "a16w16_quad_mfma32_kbuf1": "gemm_a16w16_quad_mfma32_kbuf1_kernel",
     "a16w16_wave_k_coop": "gemm_a16w16_wave_k_coop_kernel",
+    "a16w16_wave_k_coop_accum": "gemm_a16w16_wave_k_coop_accum_kernel",
     # gfx942 paired tags: nosplit_tag's kernel symbol; splitk_tag reuses it.
     **{nosplit: f"gemm_{nosplit}_kernel" for nosplit in W3_KERNEL_PAIRS.keys()},
     **{splitk: f"gemm_{nosplit}_kernel" for nosplit, splitk in W3_KERNEL_PAIRS.items()},
@@ -111,6 +123,13 @@ EXACT_N_ROWBLOCK_REDUCE_CONFIGS = (
 
 def splitk_reduce_extra_forward_decls():
     return (
+        "template<int VEC_, int BLOCK_, typename D_OUT,\n"
+        "         bool HAS_BIAS_, typename D_BIAS_, bool HAS_OOB_>\n"
+        "__global__ void splitk_reduce_kernel_bf16ws_fallback(\n"
+        "    const opus_splitk_ws_handle* ws_handle, D_OUT* c_out,\n"
+        "    int split_k, int M, int N, int batch,\n"
+        "    int padded_M, int padded_N,\n"
+        "    const D_BIAS_* bias, int stride_bias_batch);\n"
         "template<int SPLIT_K, int N_VEC, int ROWS_PER_BLOCK, int VEC_,\n"
         "         typename D_WS, typename D_OUT, bool HAS_BIAS_, typename D_BIAS_>\n"
         "__global__ void splitk_reduce_kernel_exact_n_rowblock(\n"
@@ -123,6 +142,15 @@ def splitk_reduce_extra_forward_decls():
 
 def splitk_reduce_extra_device_instantiations():
     contents = "// Exact-N row-block reduce instantiations (BLOCK=N_VEC*ROWS)\n"
+    for out_type in ("__bf16", "float"):
+        contents += (
+            f"template __global__ void splitk_reduce_kernel_bf16ws_fallback<16, 64, {out_type}, true,  {out_type}, true>(\n"
+            f"    const opus_splitk_ws_handle*, {out_type}*, int, int, int, int, int, int,\n"
+            f"    const {out_type}*, int);\n"
+            f"template __global__ void splitk_reduce_kernel_bf16ws_fallback<16, 64, {out_type}, false, {out_type}, true>(\n"
+            f"    const opus_splitk_ws_handle*, {out_type}*, int, int, int, int, int, int,\n"
+            f"    const {out_type}*, int);\n"
+        )
     for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS:
         for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS:
             for ws_type in ("float", "__bf16"):
@@ -169,9 +197,14 @@ def gen_splitk_gfx942_instance(
     **_unused,
 ):
     """gfx942 a16w16 splitk launcher emit."""
+    is_quad_mfma32_splitk = k.kernel_tag == GFX942_QUAD_MFMA32_SPLITK_TAG
     kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
+    if is_quad_mfma32_splitk:
+        kargs_explicit_param = f", {k.GROUP_M}, opus_gemm_splitk_kargs"
+        fwd_decl_kargs_tpl = ", int COL_MAJOR_GROUP_M, typename Kargs"
+        fwd_decl_kargs_fnarg = "Kargs"
     bf16ws = _uses_bf16_workspace(k)
     workspace_dtype, workspace_ptr_type = _splitk_workspace_types(k)
     # gfx942 a16w16_traits: 7 params <BLOCK_SIZE, BLOCK, DTYPE, VEC, TILE, WAVE, LDS_DEPTH=2>.
@@ -192,14 +225,23 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         f"template<typename Traits{fwd_decl_kargs_tpl}>\n"
         f"__global__ void {kernel_func}({fwd_decl_kargs_fnarg} kargs);"
     )
-    kernel_launch_body = (
-        f"\n    {kernel_func}<{k.name}_Traits<D_C>>"
-        f"<<<grid_main, block_main, 0, stream>>>(kargs);"
-    )
+    if is_quad_mfma32_splitk:
+        kernel_launch_body = (
+            f"\n    {kernel_func}<{k.name}_Traits<D_C>, {k.GROUP_M}, opus_gemm_splitk_kargs>"
+            f"<<<grid_main, block_main, 0, stream>>>(kargs);"
+        )
+    else:
+        kernel_launch_body = (
+            f"\n    {kernel_func}<{k.name}_Traits<D_C>>"
+            f"<<<grid_main, block_main, 0, stream>>>(kargs);"
+        )
     reduce_rowblock_prelude = """
-    // Exact-N row-block fast path: static split_k, no OOB.
+    // Exact-N row-block fast path: static split_k, guarded M tail.
     const bool reduce_rowblock_align = (padded_N == N);
 """
+    rowblock_rows_by_n = {}
+    for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS:
+        rowblock_rows_by_n.setdefault(vec * nvec, []).append(rows)
 
     def reduce_rowblock_branch(hasbias):
         hb = "true" if hasbias else "false"
@@ -213,16 +255,18 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS:
             n_exact = vec * nvec
             block_size = nvec * rows
+            rows_for_n = rowblock_rows_by_n[n_exact]
+            m_condition = "" if rows == rows_for_n[-1] else f" && (M % {rows} == 0)"
             for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS:
                 kw = "if" if first else "else if"
                 first = False
                 branches.append(
-                    f"""            {kw} (reduce_rowblock_align && N == {n_exact} && (M % {rows} == 0) && split_k == {sk}) {{{{{{{{
-            dim3 grid_rowblock(1, M / {rows}, batch);
+                    f"""            {kw} (reduce_rowblock_align && N == {n_exact}{m_condition} && split_k == {sk}) {{{{{{{{
+            dim3 grid_rowblock(1, (M + {rows} - 1) / {rows}, batch);
             dim3 block_rowblock({block_size});
             splitk_reduce_kernel_exact_n_rowblock<{sk}, {nvec}, {rows}, {vec}, {workspace_ptr_type}, __bf16, {{hb}}, __bf16>
                 <<<grid_rowblock, block_rowblock, 0, stream>>>(
-                    ws_handle_,
+                    ws_handle_device_,
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     M, N, batch, padded_M, padded_N,
                     {{bias_arg}});
@@ -240,10 +284,15 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
             if hasbias
             else f"\n{indent}            nullptr, 0);"
         )
+        reduce_kernel = (
+            "splitk_reduce_kernel_bf16ws_fallback"
+            if bf16ws
+            else "splitk_reduce_kernel_fallback"
+        )
         return (
-            f"{indent}splitk_reduce_kernel_fallback<REDUCE_VEC, REDUCE_BS, {dtype}, {hb}, {dtype}, true>\n"
+            f"{indent}{reduce_kernel}<REDUCE_VEC, REDUCE_BS, {dtype}, {hb}, {dtype}, true>\n"
             f"{indent}    <<<grid_reduce, block_reduce, 0, stream>>>(\n"
-            f"{indent}        ws_handle_,\n"
+            f"{indent}        ws_handle_device_,\n"
             f"{indent}        reinterpret_cast<{dtype}*>(Y.data_ptr()),\n"
             f"{indent}        split_k, M, N, batch, padded_M, padded_N,"
             f"{bias_args}"
@@ -254,25 +303,48 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     fp32_t = _baseline_call("float", True, "            ")
     fp32_f = _baseline_call("float", False, "            ")
     bf16_y_check = ""
-    bf16ws_reduce_check = ""
+    bf16ws_fallback_decl = ""
+    bf16ws_host_redirect = ""
     if bf16ws:
-        n_conditions = " || ".join(
-            f"(N == {vec * nvec} && (M % {rows} == 0))"
-            for vec, nvec, rows in EXACT_N_ROWBLOCK_REDUCE_CONFIGS
+        fp32ws_name = k.name.replace("_bf16ws", "")
+        exact_reduce_shape_conditions = " ||\n        ".join(
+            f"(N == {n_exact})"
+            for n_exact in sorted(
+                {vec * nvec for vec, nvec, _ in EXACT_N_ROWBLOCK_REDUCE_CONFIGS}
+            )
         )
-        sk_conditions = " || ".join(
-            f"split_k == {sk}" for sk in SPLITK_REDUCE_SUPPORTED_SPLITKS
-        )
+        if is_quad_mfma32_splitk:
+            bf16ws_host_redirect = f"""
+    const bool bf16ws_exact_reduce_shape =
+        {exact_reduce_shape_conditions};
+    AITER_CHECK(bf16ws_exact_reduce_shape,
+        "{err_label} bf16 workspace currently supports only exact-N rowblock "
+        "reduce shapes");
+"""
+        else:
+            bf16ws_fallback_decl = f"""
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+template <typename D_C>
+void {fp32ws_name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK);
+#endif
+"""
+            bf16ws_host_redirect = f"""
+    const bool bf16ws_exact_reduce_shape =
+        {exact_reduce_shape_conditions};
+    if (!bf16ws_exact_reduce_shape) {{
+        {fp32ws_name}<D_C>(XQ, WQ, Y, bias, splitK);
+        return;
+    }}
+"""
         bf16_y_check = (
             "    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,\n"
             f'    "{err_label} bf16 workspace currently supports only bf16 Y");\n'
         )
-        bf16ws_reduce_check = f"""
-    AITER_CHECK(padded_N == N && ({n_conditions}),
-    "{err_label} bf16 workspace requires an exact-N row-block reduce shape");
-    AITER_CHECK({sk_conditions},
-    "{err_label} bf16 workspace requires an instantiated split_k");
-"""
     reduce_launch = f"""
     constexpr int REDUCE_VEC = 16;
     constexpr int REDUCE_BS  = 64;
@@ -314,6 +386,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 #else
 #include "{pipeline_header}"
 #endif
+{bf16ws_fallback_decl}
 {traits_aliases}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
@@ -333,6 +406,7 @@ void
     int N = WQ.size(1);
     int K = XQ.size(2);
 
+{bf16ws_host_redirect}
 {bf16_y_check}
     AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
             || Y.dtype() == AITER_DTYPE_fp32,
@@ -394,7 +468,7 @@ void
     // requires loops even per split.
     int total_iters = (K + {k.B_K} - 1) / {k.B_K};
     constexpr int min_iters_per_split = 2;
-    constexpr bool require_even_loops_dbuf2 = {"true" if k.kernel_tag in ("a16w16_kbuf2v_sk", "a16w16_kbuf2v_bk128_sk") else "false"};
+    constexpr bool require_even_loops_dbuf2 = {"true" if k.kernel_tag in GFX942_EVEN_LOOP_SPLITK_TAGS else "false"};
     while (split_k > 1) {{{{
     int iters_full = (total_iters + split_k - 1) / split_k;
     int last_loops = total_iters - (split_k - 1) * iters_full;
@@ -418,13 +492,14 @@ void
     int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
     int padded_M    = num_tiles_m * {k.B_M};
     int padded_N    = num_tiles_n * {k.B_N};
-{bf16ws_reduce_check}
 
     auto stream = aiter::getCurrentHIPStream();
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
     HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
     const bool capturing = (capture_status != hipStreamCaptureStatusNone);
     extern opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t, bool);
+    extern const opus_splitk_ws_handle* opus_splitk_ws_device_handle(hipStream_t, bool);
+    extern void opus_splitk_ws_sync_to_device(hipStream_t);
     auto* ws_handle_ = opus_splitk_ws_get(stream, /*allow_create=*/!capturing);
 
     size_t ws_bytes = (size_t)split_k * (size_t)batch
@@ -447,12 +522,15 @@ void
     HIP_CALL(hipMalloc(&new_ptr, grow_bytes));
     ws_handle_->ptr = new_ptr;
     ws_handle_->bytes = grow_bytes;
+    opus_splitk_ws_sync_to_device(stream);
     }}
+    const auto* ws_handle_device_ =
+        opus_splitk_ws_device_handle(stream, /*allow_create=*/!capturing);
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a         = XQ.data_ptr();
     kargs.ptr_b         = WQ.data_ptr();
-    kargs.ws_handle     = ws_handle_;
+    kargs.ws_handle     = ws_handle_device_;
     kargs.ptr_c         = Y.data_ptr();
     kargs.ptr_bias      = ptr_bias_;
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
@@ -485,7 +563,7 @@ void
     )
 
 
-def gen_a16w16_nosplit_gfx942_instance(
+def _emit_a16w16_nosplit_launcher(
     cg,
     k,
     pipeline_header,
@@ -495,50 +573,17 @@ def gen_a16w16_nosplit_gfx942_instance(
     db,
     traits_name,
     kargs_name,
-    kargs_template_vars,
     instance_impl_preamble,
     instance_impl_host_tu_split,
-    record_one_instantiation,
-    A16W16_TUNE_HOST_EXTRA,
     A16W16_TUNE_TAGS,
-    **_unused,
+    fwd_decl_kargs_tpl,
+    fwd_decl_kargs_fnarg,
+    traits_extra,
+    k_check,
+    grid_decl,
+    launch_block,
+    device_decl_for_dtype,
 ):
-    """gfx942 a16w16 non-splitK launcher emit (kbuf1_large_tile / kbuf2v /
-    kbuf2v_bk128 / kbuf1 / wave_k_coop)."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
-        kargs_template_vars(k.kernel_tag, kargs_name)
-    )
-    is_wkc = k.kernel_tag == "a16w16_wave_k_coop"
-    waves_per_wg = k.BLOCK_SIZE // 64
-    t_k = waves_per_wg if is_wkc else 1
-    lds_depth_suffix = ", 1" if is_wkc else ""
-    traits_extra = (
-        f",\n        opus::seq<{k.T_M}, {k.T_N}, {t_k}>,"
-        f"\n        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>"
-        f"{lds_depth_suffix}"
-    )
-
-    if is_wkc:
-        wg_k_tile = k.B_K * t_k
-        k_check = f"""
-    AITER_CHECK(K % {wg_k_tile} == 0,
-        "K=", K, " must be divisible by B_K*T_K={wg_k_tile} for wave-K-coop");
-    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
-"""
-    else:
-        min_k = 2 * k.B_K
-        k_check = f"""
-    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
-    AITER_CHECK(loops_ >= 2,
-        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
-    AITER_CHECK(loops_ % 2 == 0,
-        "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
-    AITER_CHECK(K % 2 == 0,
-        "K=", K, " must be even (a16w16 family rejects odd K due to a "
-        "latent K-tail accumulation bug; pass an even K)");
-    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
-"""
-
     extra_param = (
         ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*splitK*/"
         if k.kernel_tag in A16W16_TUNE_TAGS
@@ -559,15 +604,6 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::tuple<{da}, {db}, D_C, fp32_t>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra}>;
 """
-
-    launch_block = f"""
-    auto stream = aiter::getCurrentHIPStream();
-    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
-    grid_decl = (
-        "    dim3 grid(num_tiles_n, num_tiles_m, batch);"
-        if is_wkc
-        else "    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);"
-    )
 
     preamble = instance_impl_preamble()
     host_tu_split = instance_impl_host_tu_split(
@@ -632,16 +668,191 @@ void
             f"    aiter_tensor_t &WQ,\n"
             f"    aiter_tensor_t &Y{inst_extra_param});\n"
         )
-        device_decl = (
-            f"template __global__ void {kernel_func}<\n"
-            f"    {k.name}_Traits<{CDtype}>{kargs_explicit_param}>({kargs_name});\n"
-        )
         cg._host_instantiations.append(
             {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
         )
         cg._device_instantiations.append(
-            {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
+            {
+                "kid_name": k.name,
+                "dtype": CDtype,
+                "device_decl": device_decl_for_dtype(CDtype),
+            }
         )
+
+
+def gen_a16w16_quad_mfma32_gfx942_instance(
+    cg,
+    k,
+    pipeline_header,
+    traits_header,
+    kernel_func,
+    da,
+    db,
+    traits_name,
+    kargs_name,
+    kargs_template_vars,
+    instance_impl_preamble,
+    instance_impl_host_tu_split,
+    record_one_instantiation,
+    A16W16_TUNE_HOST_EXTRA,
+    A16W16_TUNE_TAGS,
+    **_unused,
+):
+    """gfx942 quad MFMA32 launcher emit."""
+    fwd_decl_kargs_fnarg = "Kargs"
+    fwd_decl_kargs_tpl = ", int COL_MAJOR_GROUP_M, typename Kargs"
+    traits_extra = (
+        f",\n        opus::seq<{k.T_M}, {k.T_N}, 1>,"
+        f"\n        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>"
+    )
+    min_k = 2 * k.B_K
+    k_check = f"""
+    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
+    AITER_CHECK(loops_ >= 2,
+        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
+    AITER_CHECK(loops_ % 2 == 0,
+        "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+"""
+
+    launch_block = f"""
+    auto stream = aiter::getCurrentHIPStream();
+    if (num_tiles_m <= 8 && num_tiles_n > 8) {{
+        {kernel_func}<{k.name}_Traits<D_C>, 2><<<grid, block, 0, stream>>>(kargs);
+    }} else if (num_tiles_n <= 8) {{
+        {kernel_func}<{k.name}_Traits<D_C>, 8><<<grid, block, 0, stream>>>(kargs);
+    }} else {{
+        {kernel_func}<{k.name}_Traits<D_C>, 0><<<grid, block, 0, stream>>>(kargs);
+    }}"""
+    grid_decl = "    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);"
+
+    def device_decl_for_dtype(CDtype):
+        return (
+            f"template __global__ void {kernel_func}<\n"
+            f"    {k.name}_Traits<{CDtype}>, 0, opus_gemm_noscale_kargs>({kargs_name});\n"
+            f"template __global__ void {kernel_func}<\n"
+            f"    {k.name}_Traits<{CDtype}>, 2, opus_gemm_noscale_kargs>({kargs_name});\n"
+            f"template __global__ void {kernel_func}<\n"
+            f"    {k.name}_Traits<{CDtype}>, 8, opus_gemm_noscale_kargs>({kargs_name});\n"
+        )
+
+    _emit_a16w16_nosplit_launcher(
+        cg,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
+        instance_impl_preamble,
+        instance_impl_host_tu_split,
+        A16W16_TUNE_TAGS,
+        fwd_decl_kargs_tpl,
+        fwd_decl_kargs_fnarg,
+        traits_extra,
+        k_check,
+        grid_decl,
+        launch_block,
+        device_decl_for_dtype,
+    )
+
+
+def gen_a16w16_nosplit_gfx942_instance(
+    cg,
+    k,
+    pipeline_header,
+    traits_header,
+    kernel_func,
+    da,
+    db,
+    traits_name,
+    kargs_name,
+    kargs_template_vars,
+    instance_impl_preamble,
+    instance_impl_host_tu_split,
+    record_one_instantiation,
+    A16W16_TUNE_HOST_EXTRA,
+    A16W16_TUNE_TAGS,
+    **_unused,
+):
+    """gfx942 a16w16 non-splitK launcher emit (kbuf2v / kbuf2v_bk128 /
+    kbuf1 / wave_k_coop)."""
+    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+        kargs_template_vars(k.kernel_tag, kargs_name)
+    )
+    is_wkc_accum = k.kernel_tag == "a16w16_wave_k_coop_accum"
+    is_wkc = k.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum")
+    waves_per_wg = k.BLOCK_SIZE // 64
+    t_k = waves_per_wg if is_wkc else 1
+    lds_depth_suffix = ", 1" if is_wkc else ""
+    traits_extra = (
+        f",\n        opus::seq<{k.T_M}, {k.T_N}, {t_k}>,"
+        f"\n        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>"
+        f"{lds_depth_suffix}"
+    )
+    if is_wkc:
+        wg_k_tile = k.B_K * t_k
+        k_check = f"""
+    AITER_CHECK(K % {wg_k_tile} == 0,
+        "K=", K, " must be divisible by B_K*T_K={wg_k_tile} for wave-K-coop");
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+"""
+    else:
+        min_k = 2 * k.B_K
+        k_check = f"""
+    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
+    AITER_CHECK(loops_ >= 2,
+        "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
+    AITER_CHECK(loops_ % 2 == 0,
+        "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
+    AITER_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+"""
+
+    launch_block = f"""
+    auto stream = aiter::getCurrentHIPStream();
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
+    if is_wkc_accum:
+        grid_decl = "    dim3 grid(num_tiles_n * 8, num_tiles_m, batch);"
+    elif is_wkc:
+        grid_decl = "    dim3 grid(num_tiles_n, num_tiles_m, batch);"
+    else:
+        grid_decl = "    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);"
+
+    def device_decl_for_dtype(CDtype):
+        return (
+            f"template __global__ void {kernel_func}<\n"
+            f"    {k.name}_Traits<{CDtype}>{kargs_explicit_param}>({kargs_name});\n"
+        )
+
+    _emit_a16w16_nosplit_launcher(
+        cg,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
+        instance_impl_preamble,
+        instance_impl_host_tu_split,
+        A16W16_TUNE_TAGS,
+        fwd_decl_kargs_tpl,
+        fwd_decl_kargs_fnarg,
+        traits_extra,
+        k_check,
+        grid_decl,
+        launch_block,
+        device_decl_for_dtype,
+    )
 
 
 # ---------- Self-register at import time ----------
@@ -649,6 +860,11 @@ void
 for _tag in GFX942_SPLITK_TAGS:
     register_emit("gfx942", _tag, gen_splitk_gfx942_instance)
 
+register_emit(
+    "gfx942",
+    "a16w16_quad_mfma32_kbuf1",
+    gen_a16w16_quad_mfma32_gfx942_instance,
+)
 # gfx942 a16w16 non-splitK family.
 _GFX942_NOSPLIT_TAGS = (
     "a16w16_kbuf1_large_tile",
@@ -656,6 +872,7 @@ _GFX942_NOSPLIT_TAGS = (
     "a16w16_kbuf2v_bk128",
     "a16w16_kbuf1",
     "a16w16_wave_k_coop",
+    "a16w16_wave_k_coop_accum",
 )
 for _tag in _GFX942_NOSPLIT_TAGS:
     register_emit("gfx942", _tag, gen_a16w16_nosplit_gfx942_instance)
@@ -738,10 +955,10 @@ def _validate_a16w16_wave_k_coop_gfx942(k: OpusGemmInstance):
     errors = []
     if getattr(k, "arch_prefix", "") != "gfx942":
         errors.append("wave-K-coop is gfx942-only")
-    if k.kernel_tag != "a16w16_wave_k_coop":
-        errors.append(f"kernel_tag={k.kernel_tag} must be a16w16_wave_k_coop")
-    if k.BLOCK_SIZE not in (64, 256, 512, 1024):
-        errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} must be 64, 256, 512, or 1024")
+    if k.kernel_tag not in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
+        errors.append(f"kernel_tag={k.kernel_tag} must be a16w16_wave_k_coop/_accum")
+    if k.BLOCK_SIZE not in (256, 512):
+        errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} must be 256 or 512")
     waves_per_wg = k.BLOCK_SIZE // WARP_SIZE
     if (k.T_M, k.T_N) != (1, 1):
         errors.append(
@@ -776,7 +993,8 @@ def _validate_a16w16_wave_k_coop_gfx942(k: OpusGemmInstance):
     partial_bytes = k.B_M * k.B_N * 4 * t_k
     ab_bytes = a_bytes + b_bytes
     alias_partial = ab_bytes + partial_bytes > _GFX942_LDS_PER_WG_BYTES
-    lds_bytes = ab_bytes + (0 if alias_partial else partial_bytes)
+    alias_bytes = max(ab_bytes, partial_bytes)
+    lds_bytes = alias_bytes if alias_partial else ab_bytes + partial_bytes
     if alias_partial and ab_bytes > _GFX942_LDS_PER_WG_BYTES:
         errors.append(f"A/B LDS={ab_bytes // 1024}KiB exceeds 64KiB")
     if lds_bytes > _GFX942_LDS_PER_WG_BYTES:
@@ -795,6 +1013,82 @@ def _validate_a16w16_wave_k_coop_gfx942(k: OpusGemmInstance):
         "vgpr_est": 4 * E_K * (E_M + 2 * E_N) + 80,
         "lds_bytes": lds_bytes,
         "min_k": t_k * k.B_K,
+    }
+
+
+def _validate_a16w16_quad_mfma32_gfx942(k: OpusGemmInstance):
+    """Validate the gfx942 quad MFMA32 path.
+
+    This is deliberately separate from _validate_a16w16_gfx942 so the legacy
+    16x16x16 family remains locked to its original MFMA shape.
+    """
+    errors = []
+    if getattr(k, "arch_prefix", "") != "gfx942":
+        errors.append("quad_mfma32 path is gfx942-only")
+    valid_tags = ("a16w16_quad_mfma32_kbuf1", GFX942_QUAD_MFMA32_SPLITK_TAG)
+    if k.kernel_tag not in valid_tags:
+        errors.append(f"kernel_tag={k.kernel_tag} must be one of {valid_tags}")
+    valid_blocks = {
+        (256, 256, 256, 32): (2, 2, 2, 2, 4),
+    }
+    block_key = (k.BLOCK_SIZE, k.B_M, k.B_N, k.B_K)
+    if block_key not in valid_blocks:
+        errors.append(
+            f"BLOCK=({k.BLOCK_SIZE},{k.B_M},{k.B_N},{k.B_K}) must be one of "
+            f"{tuple(valid_blocks)}"
+        )
+    if (k.W_M, k.W_N, k.W_K) != (32, 32, 8):
+        errors.append(f"WAVE=({k.W_M},{k.W_N},{k.W_K}) must be (32,32,8)")
+
+    sizeof_da = 2
+    expected_vec = 16 // sizeof_da
+    if k.VEC_A != expected_vec or k.VEC_B != expected_vec:
+        errors.append(f"VEC_A/B must be {expected_vec}")
+    if k.VEC_C != 4:
+        errors.append("VEC_C must be 4")
+
+    lds_depth = 2
+    half_bm = k.B_M // lds_depth
+    half_bn = k.B_N // lds_depth
+    E_M = half_bm // (k.W_M * k.T_M) if (k.W_M * k.T_M) else 0
+    E_N = half_bn // (k.W_N * k.T_N) if (k.W_N * k.T_N) else 0
+    E_K = k.B_K // k.W_K if k.W_K else 0
+    expected = valid_blocks.get(block_key)
+    if expected is not None and (k.T_M, k.T_N, E_M, E_N, E_K) != expected:
+        errors.append(
+            f"E=({E_M},{E_N},{E_K}) inconsistent with the quad_mfma32 tile whitelist"
+        )
+
+    agpr_per_mfma = (k.W_M * k.W_N) // WARP_SIZE
+    total_agprs = 4 * E_M * E_N * agpr_per_mfma
+    vgpr_est = 4 * E_K * (E_M + 2 * E_N) + 80
+    if total_agprs > 256:
+        errors.append(f"AGPR={total_agprs} must be <= 256")
+    if vgpr_est > 256:
+        errors.append(f"VGPR_est={vgpr_est} exceeds 256")
+    if vgpr_est + total_agprs > 512:
+        errors.append(f"VGPR+AGPR={vgpr_est + total_agprs} exceeds 512")
+
+    ab_stage_bytes = 2 * (k.B_M + k.B_N) * k.B_K
+    c_stage_bytes = half_bm * half_bn * sizeof_da
+    lds_bytes = max(ab_stage_bytes, c_stage_bytes)
+    if lds_bytes > _GFX942_LDS_PER_WG_BYTES:
+        errors.append(f"LDS={lds_bytes // 1024}KiB exceeds 64KiB")
+
+    if errors:
+        raise ValueError(
+            f"Invalid gfx942 quad_mfma32 instance '{k.name}':\n"
+            + "\n".join(f"  - {e}" for e in errors)
+        )
+
+    return {
+        "E_M": E_M,
+        "E_N": E_N,
+        "E_K": E_K,
+        "agprs": total_agprs,
+        "vgpr_est": vgpr_est,
+        "lds_bytes": lds_bytes,
+        "min_k": 2 * k.B_K,
     }
 
 

@@ -317,7 +317,11 @@ void opus_gemm_a16w16_tune(
 namespace {
 struct SplitkWsRegistry {
   std::mutex mu;
-  std::unordered_map<hipStream_t, opus_splitk_ws_handle*> map;
+  struct Owner {
+    opus_splitk_ws_handle* host;
+    opus_splitk_ws_handle* device;
+  };
+  std::unordered_map<hipStream_t, Owner*> map;
 };
 SplitkWsRegistry& splitk_ws_registry()
 {
@@ -331,20 +335,62 @@ opus_splitk_ws_handle* opus_splitk_ws_get(hipStream_t s, bool allow_create)
   auto& R = splitk_ws_registry();
   std::lock_guard<std::mutex> g(R.mu);
   auto it = R.map.find(s);
-  if (it != R.map.end()) return it->second;
+  if (it != R.map.end()) return it->second->host;
   AITER_CHECK(allow_create,
               "splitk workspace not initialized for the current CUDA stream. "
               "Call aiter.opus_gemm_workspace_init() inside "
               "`with torch.cuda.stream(s):` (and warm with the largest "
               "expected gemm) before HIP graph capture.");
+  auto* owner = new SplitkWsRegistry::Owner{};
   opus_splitk_ws_handle* h = nullptr;
   HIP_CALL(hipHostMalloc(reinterpret_cast<void**>(&h),
                          sizeof(opus_splitk_ws_handle),
                          hipHostMallocCoherent));
   h->ptr   = nullptr;
   h->bytes = 0;
-  R.map[s] = h;
+  owner->host   = h;
+  owner->device = nullptr;
+  R.map[s]      = owner;
   return h;
+}
+
+const opus_splitk_ws_handle* opus_splitk_ws_device_handle(hipStream_t s, bool allow_create)
+{
+  (void)opus_splitk_ws_get(s, allow_create);
+  auto& R = splitk_ws_registry();
+  std::lock_guard<std::mutex> g(R.mu);
+  auto it = R.map.find(s);
+  AITER_CHECK(it != R.map.end(), "splitk workspace not initialized for the current CUDA stream.");
+  if (it->second->device == nullptr)
+  {
+    AITER_CHECK(allow_create,
+                "splitk workspace device handle not initialized for the current CUDA stream. "
+                "Warm the opus gfx942 splitK launcher eagerly before HIP graph capture.");
+    HIP_CALL(hipMalloc(reinterpret_cast<void**>(&it->second->device),
+                       sizeof(opus_splitk_ws_handle)));
+    HIP_CALL(hipMemcpy(it->second->device,
+                       it->second->host,
+                       sizeof(opus_splitk_ws_handle),
+                       hipMemcpyHostToDevice));
+  }
+  return it->second->device;
+}
+
+void opus_splitk_ws_sync_to_device(hipStream_t s)
+{
+  auto& R = splitk_ws_registry();
+  std::lock_guard<std::mutex> g(R.mu);
+  auto it = R.map.find(s);
+  AITER_CHECK(it != R.map.end(), "splitk workspace not initialized for the current CUDA stream.");
+  if (it->second->device == nullptr)
+  {
+    HIP_CALL(hipMalloc(reinterpret_cast<void**>(&it->second->device),
+                       sizeof(opus_splitk_ws_handle)));
+  }
+  HIP_CALL(hipMemcpy(it->second->device,
+                     it->second->host,
+                     sizeof(opus_splitk_ws_handle),
+                     hipMemcpyHostToDevice));
 }
 
 void opus_gemm_workspace_init()

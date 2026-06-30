@@ -74,6 +74,9 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "moe_op_gemm_a8w4": bench_moe_gemm_a8w4_main,
     "moe_op_gemm_a4w4": bench_moe_gemm_a4w4_main,
     "rmsnorm": bench_rmsnorm_main,
+    # Fused RMSNorm + residual add + MXFP4 quant. Reuses bench_rmsnorm.py
+    # (via its --quant mxfp4 mode), so there is no separate bench script.
+    "fused_rms_mxfp4_quant": bench_rmsnorm_main,
     "rope": bench_rope_main,
     "mha": bench_mha_main,
     "mla": bench_mla_main,
@@ -308,6 +311,17 @@ class RmsnormKernelHandler(KernelHandler):
         }
 
 
+class FusedRmsMxfp4QuantKernelHandler(RmsnormKernelHandler):
+    """Handler for fused RMSNorm + residual add + MXFP4 quant.
+
+    Identical shape handling to RMSNorm (reads N from model_shapes.json); only
+    the bench args differ, flipping bench_rmsnorm.py into its fused-quant mode.
+    """
+
+    def build_args(self) -> str:
+        return super().build_args() + " --quant mxfp4 --add-residual"
+
+
 class RopeKernelHandler(KernelHandler):
     """Handler for RoPE benchmarks."""
 
@@ -530,6 +544,7 @@ _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: "moe" in k, MoeKernelHandler),
     (lambda k: "gemm" in k and "moe" not in k, GemmKernelHandler),
     (lambda k: k == "rmsnorm", RmsnormKernelHandler),
+    (lambda k: k == "fused_rms_mxfp4_quant", FusedRmsMxfp4QuantKernelHandler),
     (lambda k: k == "rope", RopeKernelHandler),
     (lambda k: k == "mha", MhaKernelHandler),
     (lambda k: k == "mla", MlaKernelHandler),

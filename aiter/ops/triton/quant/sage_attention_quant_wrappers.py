@@ -118,6 +118,8 @@ def sage_quant_mxfp4(
     USE_RNE=False,
     R=None,
     BLOCK_R=32,
+    smooth_k=True,
+    return_lse=False,
 ):
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
 
@@ -157,6 +159,14 @@ def sage_quant_mxfp4(
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
+    # Capture un-rotated K mean before rotation_smooth_qk so we can build the
+    # ring-attention LSE compensation in natural log units below.
+    if return_lse and smooth_k:
+        k_mean = k.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+    else:
+        k_mean = None
+
+    q_orig = q
     q, k, delta_s = rotation_smooth_qk(
         q,
         k,
@@ -166,6 +176,7 @@ def sage_quant_mxfp4(
         q_smoothing=q_smoothing,
         layout=layout,
         sm_scale=(sm_scale * 1.4426950408889634),
+        smooth_k=smooth_k,
     )
 
     sage_quant_v_kernel[grid](
@@ -193,7 +204,34 @@ def sage_quant_mxfp4(
     q_fp4, q_scale = downcast_func(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
 
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+    if not return_lse:
+        return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
+
+    # K-smoothing shifts every qk_ij by a row-wise constant
+    # delta_lse_i = sm_scale * Q_i . k_mean^T (in natural log units).
+    # Adding it back to the kernel's softmax_lse recovers the LSE for un-smoothed
+    # K, which is what FA-style ring-attention merges require.
+    if k_mean is None:
+        delta_lse = torch.zeros(
+            (b, h_qo, qo_len), device=q_orig.device, dtype=torch.float32
+        )
+    else:
+        if layout == "bhsd":
+            q_bhsd = q_orig
+            kmean_bhsd = k_mean
+        else:
+            q_bhsd = q_orig.transpose(1, 2)
+            kmean_bhsd = k_mean.transpose(1, 2)
+        if h_qo != h_kv:
+            assert (
+                h_qo % h_kv == 0
+            ), f"GQA ratio must be integer, got h_qo={h_qo}, h_kv={h_kv}"
+            kmean_bhsd = kmean_bhsd.repeat_interleave(h_qo // h_kv, dim=1)
+        delta_lse = (q_bhsd.to(torch.float32) * kmean_bhsd.to(torch.float32)).sum(
+            dim=-1
+        ) * sm_scale
+
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s, delta_lse
 
 
 def sage_quant(
@@ -364,6 +402,7 @@ def rotation_smooth_qk(
     q_smoothing=False,
     sm_scale=None,
     layout="bhsd",
+    smooth_k=True,
 ):
 
     if R is None:  # Generate Hadamard Matrix R if not given
@@ -457,7 +496,8 @@ def rotation_smooth_qk(
     )
 
     # smooth k
-    K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
+    if smooth_k:
+        K_rot = K_rot - K_rot.mean(dim=1 if layout == "bshd" else 2, keepdim=True)
 
     if q_smoothing:
         # compute delta s that needs to be added due to q smoothing

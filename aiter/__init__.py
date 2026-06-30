@@ -118,11 +118,14 @@ else:
     from .ops.trans_ragged_layout import *  # noqa: F403,E402
     from .ops.sample import *  # noqa: F403,E402
     from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
+    from .ops.fused_qknorm_idxrqknorm import (  # noqa: F401,E402
+        fused_qknorm_idxrqknorm,
+    )
     from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
     from .ops.fused_qk_rmsnorm_group_quant import *  # noqa: F403,E402
     from .ops.groupnorm import *  # noqa: F403,E402
     from .ops.mhc import *  # noqa: F403,E402
-    from .ops.causal_conv1d import *  # noqa: F403,E402
+    from .ops.causal_conv1d_update import *  # noqa: F403,E402
     from .ops.fused_split_gdr_update import *  # noqa: F403,E402
     from . import mla  # noqa: F403,F401,E402
 

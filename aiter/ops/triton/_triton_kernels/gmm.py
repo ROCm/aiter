@@ -78,14 +78,148 @@ def _remap_xcd_tile_grid(
 # ------------------------------------------------------------------------------
 
 
-@triton.heuristics(
-    {
-        "K_DIVISIBLE_BY_BLOCK_SIZE_K": lambda META: META["K"] % META["BLOCK_SIZE_K"]
-        == 0,
-    }
-)
 @triton.jit
-def gmm_kernel(
+def _total_gmm_tiles(
+    group_sizes_ptr,
+    G: int,
+    num_n_tiles: int,
+    BLOCK_SIZE_G: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    INT_TYPE: tl.constexpr,
+):
+    g_range = tl.arange(0, BLOCK_SIZE_G)
+    g_mask = g_range < G
+    group_sizes = tl.load(group_sizes_ptr + g_range, mask=g_mask, other=0)
+    num_m_tiles = tl.cdiv(group_sizes, BLOCK_SIZE_M)
+    num_tiles = num_m_tiles * num_n_tiles
+    cumsum_tile = tl.where(g_mask, tl.cumsum(num_tiles, dtype=INT_TYPE), 0)
+    total_tiles = tl.max(cumsum_tile)
+    return total_tiles
+
+
+@triton.jit
+def _resolve_gmm_tile(
+    group_sizes_ptr,
+    tile,
+    G: int,
+    num_n_tiles: int,
+    BLOCK_SIZE_G: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    INT_TYPE: tl.constexpr,
+):
+    g_range = tl.arange(0, BLOCK_SIZE_G)
+    g_mask = g_range < G
+    group_sizes = tl.load(group_sizes_ptr + g_range, mask=g_mask, other=0)
+    num_m_tiles = tl.cdiv(group_sizes, BLOCK_SIZE_M)
+    num_tiles = num_m_tiles * num_n_tiles
+    cumsum_tile = tl.where(g_mask, tl.cumsum(num_tiles, dtype=INT_TYPE), 0)
+    cumsum_m = tl.where(g_mask, tl.cumsum(group_sizes, dtype=INT_TYPE), 0)
+    g = tl.sum((cumsum_tile <= tile) & g_mask, dtype=INT_TYPE)
+    tl.device_assert(g < G, "g >= G")
+    prev_mask = g_range < g
+    prev_cumsum_m = tl.max(tl.where(prev_mask, cumsum_m, 0))
+    prev_cumsum_tile = tl.max(tl.where(prev_mask, cumsum_tile, 0))
+    g_cumsum_m = tl.max(tl.where(g_range == g, cumsum_m, 0))
+    m = g_cumsum_m - prev_cumsum_m
+    num_m_tiles_out = tl.cdiv(m, BLOCK_SIZE_M)
+    tile_in_mm = tile - prev_cumsum_tile
+    tl.device_assert(tile_in_mm >= 0, "tile_in_mm < 0")
+    #      g, m, num_m_tiles,     last_m,        tile_in_mm
+    return g, m, num_m_tiles_out, prev_cumsum_m, tile_in_mm
+
+
+@triton.jit
+def _process_gmm_tile(
+    # Tensor pointers:
+    lhs_ptr,
+    rhs_ptr,
+    out_ptr,
+    bias_ptr,
+    # Tensor shapes:
+    K: int,
+    N: int,
+    # Tile arguments:
+    g: int,  # group number
+    m: int,  # number of lhs / out rows
+    num_m_tiles: int,  # number of tiles in row dimension
+    num_n_tiles: int,  # number of tiles in column dimension
+    tile_in_mm: int,  # tile coordinates in current MM problem
+    last_m: int,  # last row of lhs / out
+    # Meta-parameters:
+    TRANS_RHS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    K_DIVISIBLE_BY_BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    USE_BIAS: tl.constexpr,
+):
+    tile_m, tile_n = _remap_xcd_tile_grid(
+        tile_in_mm, num_m_tiles, num_n_tiles, GROUP_SIZE=GROUP_SIZE
+    )
+
+    offs_lhs_m = (tile_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % m
+    offs_rhs_n = (tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
+
+    lhs_ptrs = lhs_ptr + (last_m + offs_lhs_m[:, None]) * K + offs_k[None, :]
+
+    if TRANS_RHS:
+        rhs_ptrs = (
+            rhs_ptr + g.to(tl.int64) * K * N + offs_k[:, None] + offs_rhs_n[None, :] * K
+        )
+    else:
+        rhs_ptrs = (
+            rhs_ptr + g.to(tl.int64) * K * N + offs_k[:, None] * N + offs_rhs_n[None, :]
+        )
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        if K_DIVISIBLE_BY_BLOCK_SIZE_K:
+            lhs = tl.load(lhs_ptrs)
+            rhs = tl.load(rhs_ptrs)
+        else:
+            k_mask_limit = K - k * BLOCK_SIZE_K
+            lhs = tl.load(lhs_ptrs, mask=offs_k[None, :] < k_mask_limit, other=0)
+            rhs = tl.load(rhs_ptrs, mask=offs_k[:, None] < k_mask_limit, other=0)
+
+        acc = tl.dot(lhs, rhs, acc=acc)
+
+        lhs_ptrs += BLOCK_SIZE_K
+
+        if TRANS_RHS:
+            rhs_ptrs += BLOCK_SIZE_K
+        else:
+            rhs_ptrs += BLOCK_SIZE_K * N
+
+    # Add bias if enabled.
+    if USE_BIAS:
+        offs_bias_n = tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        bias_ptrs = bias_ptr + g.to(tl.int64) * N + offs_bias_n
+        bias = tl.load(bias_ptrs, mask=offs_bias_n < N, other=0.0)
+        # Convert bias to float32 to match accumulator precision.
+        bias = bias.to(tl.float32)
+        # Broadcast bias across M dimension and add in float32.
+        acc += bias[None, :]
+
+    # Convert to output dtype after all computations.
+    acc = acc.to(out_ptr.type.element_ty)
+
+    offs_out_m = tile_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_out_n = tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    out_ptrs = out_ptr + (last_m + offs_out_m[:, None]) * N + offs_out_n[None, :]
+
+    tl.store(
+        out_ptrs,
+        acc,
+        mask=(offs_out_m[:, None] < m) & (offs_out_n[None, :] < N),
+    )
+
+
+@triton.jit
+def _gmm(
     # Tensor pointers:
     lhs_ptr,
     rhs_ptr,
@@ -97,6 +231,7 @@ def gmm_kernel(
     K: int,
     N: int,
     G: int,
+    num_n_tiles: int,
     # Meta-parameters:
     TRANS_RHS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -106,25 +241,19 @@ def gmm_kernel(
     GROUP_SIZE: tl.constexpr,
     GRID_DIM: tl.constexpr,
     USE_BIAS: tl.constexpr,
+    INT_TYPE: tl.constexpr,
 ):
-    tl.assume(M > 0)
-    tl.assume(K > 0)
-    tl.assume(N > 0)
-    tl.assume(G > 0)
-
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
-    tl.device_assert(num_n_tiles > 0, "num_n_tiles <= 0")
+    zero = tl.cast(0, INT_TYPE)
 
     # Current tile. Each program computes multiple tiles of each group.
-    tile = tl.program_id(0)
-    tl.device_assert(tile >= 0, "tile < 0 (at initialization)")
+    tile = tl.program_id(0).to(INT_TYPE)
 
     # Tile limit of last MM problem (inclusive).
-    last_mm_tile = 0
+    last_mm_tile = zero
 
     # Last input row of lhs and output row of out. Each group reads some rows of
     # lhs and writes some rows to out.
-    last_m = 0
+    last_m = zero
 
     # Loop through all (m, K, N) MM problems:
     #   (m, K) x (K, N) = (m, N)
@@ -132,16 +261,11 @@ def gmm_kernel(
     for g in range(G):
         # Get m dimension of current MM problem.
         m = tl.load(group_sizes_ptr + g)
-        # m can be zero if group is empty
+        # m can be zero if group is empty.
         tl.device_assert(m >= 0, "m < 0")
 
         num_m_tiles = tl.cdiv(m, BLOCK_SIZE_M)
-        # num_m_tiles can be zero if group is empty
-        tl.device_assert(num_m_tiles >= 0, "num_m_tiles < 0")
-
         num_tiles = num_m_tiles * num_n_tiles
-        # num_tiles can be zero if group is empty
-        tl.device_assert(num_tiles >= 0, "num_tiles < 0")
 
         # Loop through tiles of current MM problem.
         while tile >= last_mm_tile and tile < last_mm_tile + num_tiles:
@@ -149,90 +273,30 @@ def gmm_kernel(
             tile_in_mm = tile - last_mm_tile
             tl.device_assert(tile_in_mm >= 0, "tile_in_mm < 0")
 
-            tile_m, tile_n = _remap_xcd_tile_grid(
-                tile_in_mm, num_m_tiles, num_n_tiles, GROUP_SIZE=GROUP_SIZE
-            )
-
-            # Do regular MM:
-
-            tl.device_assert(tile_m * BLOCK_SIZE_M >= 0, "tile_m * BLOCK_SIZE_M < 0")
-            tl.device_assert(tile_n * BLOCK_SIZE_N >= 0, "tile_n * BLOCK_SIZE_N < 0")
-
-            offs_lhs_m = (
-                tile_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-            ) % m
-            offs_rhs_n = (
-                tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            ) % N
-            offs_k = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
-
-            lhs_ptrs = lhs_ptr + (last_m + offs_lhs_m[:, None]) * K + offs_k[None, :]
-
-            if TRANS_RHS:
-                rhs_ptrs = (
-                    rhs_ptr
-                    + g.to(tl.int64) * K * N
-                    + offs_k[:, None]
-                    + offs_rhs_n[None, :] * K
-                )
-            else:
-                rhs_ptrs = (
-                    rhs_ptr
-                    + g.to(tl.int64) * K * N
-                    + offs_k[:, None] * N
-                    + offs_rhs_n[None, :]
-                )
-
-            acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-            for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-                if K_DIVISIBLE_BY_BLOCK_SIZE_K:
-                    lhs = tl.load(lhs_ptrs)
-                    rhs = tl.load(rhs_ptrs)
-                else:
-                    k_mask_limit = K - k * BLOCK_SIZE_K
-                    lhs = tl.load(
-                        lhs_ptrs, mask=offs_k[None, :] < k_mask_limit, other=0
-                    )
-                    rhs = tl.load(
-                        rhs_ptrs, mask=offs_k[:, None] < k_mask_limit, other=0
-                    )
-
-                acc = tl.dot(lhs, rhs, acc=acc)
-
-                lhs_ptrs += BLOCK_SIZE_K
-
-                if TRANS_RHS:
-                    rhs_ptrs += BLOCK_SIZE_K
-                else:
-                    rhs_ptrs += BLOCK_SIZE_K * N
-
-            # Add bias if enabled
-            if USE_BIAS:
-                offs_bias_n = tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(
-                    0, BLOCK_SIZE_N
-                )
-                bias_ptrs = bias_ptr + g.to(tl.int64) * N + offs_bias_n
-                bias = tl.load(bias_ptrs, mask=offs_bias_n < N, other=0.0)
-                # Convert bias to float32 to match accumulator precision
-                bias = bias.to(tl.float32)
-                # Broadcast bias across M dimension and add in float32
-                acc += bias[None, :]
-
-            # Convert to output dtype after all computations
-            acc = acc.to(out_ptr.type.element_ty)
-
-            offs_out_m = tile_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-            offs_out_n = tile_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-            out_ptrs = (
-                out_ptr + (last_m + offs_out_m[:, None]) * N + offs_out_n[None, :]
-            )
-
-            tl.store(
-                out_ptrs,
-                acc,
-                mask=(offs_out_m[:, None] < m) & (offs_out_n[None, :] < N),
+            _process_gmm_tile(
+                # Tensor pointers:
+                lhs_ptr,
+                rhs_ptr,
+                out_ptr,
+                bias_ptr,
+                # Tensor shapes:
+                K,
+                N,
+                # Tile arguments:
+                g,
+                m,
+                num_m_tiles,
+                num_n_tiles,
+                tile_in_mm,
+                last_m,
+                # Meta-parameters:
+                TRANS_RHS=TRANS_RHS,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                K_DIVISIBLE_BY_BLOCK_SIZE_K=K_DIVISIBLE_BY_BLOCK_SIZE_K,
+                GROUP_SIZE=GROUP_SIZE,
+                USE_BIAS=USE_BIAS,
             )
 
             # Go to the next tile by advancing number of programs.
@@ -249,6 +313,176 @@ def gmm_kernel(
         # last_m can be zero if group 0 is skipped
         tl.device_assert(last_m >= 0, "last_m < 0 (at update)")
         tl.device_assert(last_m <= M, "last_m > M (at update)")
+
+
+@triton.jit
+def _work_stealing_gmm(
+    # Tensor pointers:
+    lhs_ptr,
+    rhs_ptr,
+    group_sizes_ptr,
+    out_ptr,
+    bias_ptr,
+    tile_counter_ptr,
+    # Tensor shapes:
+    K: int,
+    N: int,
+    G: int,
+    num_n_tiles: int,
+    # Meta-parameters:
+    TRANS_RHS: tl.constexpr,
+    BLOCK_SIZE_G: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    K_DIVISIBLE_BY_BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    USE_BIAS: tl.constexpr,
+    INT_TYPE: tl.constexpr,
+):
+    total_tiles = _total_gmm_tiles(
+        group_sizes_ptr,
+        G,
+        num_n_tiles,
+        BLOCK_SIZE_G=BLOCK_SIZE_G,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        INT_TYPE=INT_TYPE,
+    )
+    tl.device_assert(total_tiles > 0, "total_tiles <= 0")
+
+    tile = tl.program_id(0).to(INT_TYPE)
+
+    while tile < total_tiles:
+        g, m, num_m_tiles, last_m, tile_in_mm = _resolve_gmm_tile(
+            group_sizes_ptr,
+            tile,
+            G,
+            num_n_tiles,
+            BLOCK_SIZE_G=BLOCK_SIZE_G,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            INT_TYPE=INT_TYPE,
+        )
+        _process_gmm_tile(
+            # Tensor pointers:
+            lhs_ptr,
+            rhs_ptr,
+            out_ptr,
+            bias_ptr,
+            # Tensor shapes:
+            K,
+            N,
+            # Tile arguments:
+            g,
+            m,
+            num_m_tiles,
+            num_n_tiles,
+            tile_in_mm,
+            last_m,
+            # Meta-parameters:
+            TRANS_RHS=TRANS_RHS,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            K_DIVISIBLE_BY_BLOCK_SIZE_K=K_DIVISIBLE_BY_BLOCK_SIZE_K,
+            GROUP_SIZE=GROUP_SIZE,
+            USE_BIAS=USE_BIAS,
+        )
+        tile = tl.atomic_add(tile_counter_ptr, 1, sem="relaxed").to(INT_TYPE)
+
+
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_G": lambda META: triton.next_power_of_2(META["G"]),
+        "K_DIVISIBLE_BY_BLOCK_SIZE_K": lambda META: META["K"] % META["BLOCK_SIZE_K"]
+        == 0,
+    }
+)
+@triton.jit
+def gmm_kernel(
+    # Tensor pointers:
+    lhs_ptr,
+    rhs_ptr,
+    group_sizes_ptr,
+    out_ptr,
+    bias_ptr,
+    tile_counter_ptr,
+    # Tensor shapes:
+    M: int,
+    K: int,
+    N: int,
+    G: int,
+    # Meta-parameters:
+    TRANS_RHS: tl.constexpr,
+    BLOCK_SIZE_G: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    K_DIVISIBLE_BY_BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    GRID_DIM: tl.constexpr,
+    USE_BIAS: tl.constexpr,
+    WORK_STEALING: tl.constexpr,
+):
+    tl.assume(M > 0)
+    tl.assume(K > 0)
+    tl.assume(N > 0)
+    tl.assume(G > 0)
+
+    INT_TYPE: tl.constexpr = group_sizes_ptr.type.element_ty
+
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N).to(INT_TYPE)
+    tl.device_assert(num_n_tiles > 0, "num_n_tiles <= 0")
+
+    if WORK_STEALING:
+        _work_stealing_gmm(
+            # Tensor pointers:
+            lhs_ptr,
+            rhs_ptr,
+            group_sizes_ptr,
+            out_ptr,
+            bias_ptr,
+            tile_counter_ptr,
+            # Tensor shapes:
+            K,
+            N,
+            G,
+            num_n_tiles,
+            # Meta-parameters:
+            TRANS_RHS=TRANS_RHS,
+            BLOCK_SIZE_G=BLOCK_SIZE_G,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            K_DIVISIBLE_BY_BLOCK_SIZE_K=K_DIVISIBLE_BY_BLOCK_SIZE_K,
+            GROUP_SIZE=GROUP_SIZE,
+            USE_BIAS=USE_BIAS,
+            INT_TYPE=INT_TYPE,
+        )
+    else:
+        _gmm(
+            # Tensor pointers:
+            lhs_ptr,
+            rhs_ptr,
+            group_sizes_ptr,
+            out_ptr,
+            bias_ptr,
+            # Tensor shapes:
+            M,
+            K,
+            N,
+            G,
+            num_n_tiles,
+            # Meta-parameters:
+            TRANS_RHS=TRANS_RHS,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            K_DIVISIBLE_BY_BLOCK_SIZE_K=K_DIVISIBLE_BY_BLOCK_SIZE_K,
+            GROUP_SIZE=GROUP_SIZE,
+            GRID_DIM=GRID_DIM,
+            USE_BIAS=USE_BIAS,
+            INT_TYPE=INT_TYPE,
+        )
 
 
 # Persistent TGMM kernel.
@@ -283,25 +517,28 @@ def tgmm_persistent_kernel(
     tl.assume(N > 0)
     tl.assume(G > 0)
 
-    num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    int_type = group_sizes_ptr.type.element_ty
+    zero = tl.cast(0, int_type)
+
+    num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K).to(int_type)
     tl.device_assert(num_k_tiles > 0, "num_k_tiles <= 0")
 
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N).to(int_type)
     tl.device_assert(num_n_tiles > 0, "num_n_tiles <= 0")
 
     num_tiles = num_k_tiles * num_n_tiles
     tl.device_assert(num_tiles > 0, "num_tiles <= 0")
 
     # Current tile. Each program computes multiple tiles of each group.
-    tile = tl.program_id(0)
+    tile = tl.program_id(0).to(int_type)
     tl.device_assert(tile >= 0, "tile < 0 (at initialization)")
 
     # Tile limit of last MM problem (inclusive).
-    last_mm_tile = 0
+    last_mm_tile = zero
 
     # Last input column of lhs and input row of rhs. Each group reads some
     # columns of lhs and some rows of rhs.
-    last_m = 0
+    last_m = zero
 
     # Loop through all (K, m, N) MM problems:
     #   (K, m) x (m, N) = (K, N)

@@ -97,6 +97,19 @@ def lds_load_b128_raw(lds_base_idx, byte_offset):
     )
 
 
+def lds_load_b32_raw(lds_base_idx, byte_offset):
+    """Load 4 bytes from LDS as ``i32`` using a pre-extracted base index.
+
+    Produces ``ds_load_b32``; ``byte_offset`` must be 4-byte aligned.
+
+    Args:
+        lds_base_idx: Index value from ``extract_lds_base_idx``.
+        byte_offset: Byte offset (index-type) relative to the base.
+    """
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
+
+
 def lds_transpose_load_raw(result_type, lds_base_idx, byte_offset):
     """Transpose-load 16 bytes from LDS using a pre-extracted base index."""
     from flydsl._mlir.dialects import rocdl as _rocdl

@@ -28,6 +28,7 @@ from aiter import dtypes
 from aiter import get_gfx
 from aiter.utility import fp4_utils
 import argparse
+import os
 
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
@@ -488,6 +489,10 @@ def test_fmoe_ep_mxfp4(
     if quant_label == "a8w4_mxfp4":
         act = ActivationType.Silu
         gate_mode = GateMode.INTERLEAVE.value
+        # Force the fp8 (a8w4) kernel regardless of token count. Below the
+        # default AITER_BF16_FP8_MOE_BOUND (256) the picker selects bf16/a16w4,
+        # which for Silu at ksplit<=1 has no kernel and dispatch-crashes.
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     else:
         act = ActivationType.Silu
         gate_mode = GateMode.SEPARATED.value

@@ -581,6 +581,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     zeros_out_ptr,
     T,
     T_slot,
+    MAX_EMBD_POS,
     q_stride_t,
     q_stride_h,
     q_stride_d,
