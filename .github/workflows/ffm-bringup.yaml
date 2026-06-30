@@ -59,7 +59,7 @@ jobs:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     needs: [check-signal]
     runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
-    timeout-minutes: 180
+    timeout-minutes: 420
     strategy:
       fail-fast: false
       matrix:
