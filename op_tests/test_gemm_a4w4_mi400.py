@@ -217,7 +217,7 @@ def main():
         nargs="*",
         choices=[0, 1],
         default=[1],
-        help="A-preshuffle variant(s): 1 preshuffle",
+        help="A-preshuffle sweep list: 1 preshuffles A, 0 sends it row-major",
     )
     parser.add_argument(
         "--init",
@@ -244,7 +244,7 @@ def main():
         type=dtypes.str2tuple,
         nargs="*",
         # cluster(4x4)+persistent friendly for the 256x256 tile: M%1024, N%1024.
-        default=[(2048, 2048, 2048), (16384, 16384, 16384)],
+        default=[(16384, 16384, 16384)],
         help="(M,N,K) tuples, e.g. -mnk 2048,2048,2048 16384,16384,16384",
     )
     args = parser.parse_args()
