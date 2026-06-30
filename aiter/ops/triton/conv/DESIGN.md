@@ -613,6 +613,19 @@ The `10×` multiplier covers worst-case ordering differences between our
 Triton accumulation order and PyTorch's (different tile shape → different
 sum order → different rounding).
 
+**The `rtol` step-ladder.** `rtol` widens in two steps as the reduction
+depth `K_red = C · R · S` grows: `6e-3` below 1024, `8e-3` below 4096,
+`1.2e-2` beyond. The reasoning is the same √N error growth as `atol` — a
+deeper reduction accumulates more rounding, so the *relative* error budget
+has to widen too — but discretized into buckets rather than a continuous
+`√K_red` curve, because rtol is a coarse backstop to atol (which already
+carries the continuous term). The three breakpoints and values are
+empirical: each is the tightest rtol that still passes across the full
+fuzzer shape sweep at that depth, so the ladder stays as strict as the
+hardware allows without flagging healthy fp16/bf16 ordering noise. They are
+not derived from a closed form — retune them if the kernel set or the
+reference accumulation order changes.
+
 `_winograd_tolerances` then bumps `rtol` by **6×** and `atol` by
 `max(6×, 0.6)` for any Winograd kernel — the `0.6` floor catches
 small-`K_red` cases where the √N-scaled base atol is too tight to absorb
