@@ -808,8 +808,6 @@ def _iter_legacy_cases():
                     pad_pairs = [(0, 0)]
             for hidden_pad, intermediate_pad in pad_pairs:
                 use_inter_dim = inter_dim
-                if get_gfx() == "gfx942" and use_inter_dim < 1024:
-                    use_inter_dim = 4096
                 for m in args.tokenNum:
                     yield _kw(
                         dtype,
@@ -820,6 +818,7 @@ def _iter_legacy_cases():
                         aq_dtype,
                         wq_dtype,
                         doweight_stage1,
+                        # g1u1 fp4_bf16 requires Swiglu; Silu epilogue is broken
                         aiter.ActivationType.Swiglu,
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
