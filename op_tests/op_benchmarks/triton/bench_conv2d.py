@@ -49,12 +49,9 @@ import triton
 
 from aiter.ops.triton.conv._utils import (
     BLOCK_K,
-    flops_conv,
     _out_hw,
     _is_1x1_conv,
     _is_3x3_conv,
-    dynamic_conv_tolerances,
-    _winograd_tolerances,
 )
 from aiter.ops.triton.conv._prepack import prepack_nchw_to_cblocked
 from aiter.ops.triton.conv.conv2d import (
@@ -67,6 +64,14 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_winograd_f4x3_cblocked,
     _resolve_route,
 )
+from op_tests.triton_tests.conv._helpers import (
+    dynamic_conv_tolerances,
+    _winograd_tolerances,
+)
+
+
+def flops_conv(N, C, K_out, R, S, P, Q):
+    return 2.0 * N * P * Q * K_out * C * R * S
 
 
 def which_kernel(x, w_oihw, stride=(1, 1), dilation=(1, 1), layout="nchw"):
@@ -138,9 +143,9 @@ def _torch_dtype(s: str) -> torch.dtype:
 def _check_close(got, ref, dtype, K_red, is_winograd: bool) -> bool:
     """Tolerance-aware correctness check (same model as the pytest suite)."""
     if is_winograd:
-        rtol, atol = _winograd_tolerances(dtype, K_red, ref, "f4x3")
+        rtol, atol = _winograd_tolerances(dtype, K_red, "f4x3")
     else:
-        rtol, atol = dynamic_conv_tolerances(dtype, K_red, ref)
+        rtol, atol = dynamic_conv_tolerances(dtype, K_red)
     try:
         torch.testing.assert_close(got.float(), ref.float(), rtol=rtol, atol=atol)
         return True

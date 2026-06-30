@@ -2,30 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 
 # Channel padding granularity for prepacked weights/inputs. Must align with the
 # BLOCK_K autotune candidates in _triton_kernels/conv/helpers.py — change with care.
 BLOCK_K = 64
-
-
-def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int, ref: torch.Tensor):
-    eps = {
-        torch.float16: 2**-10,
-        torch.bfloat16: 2**-7,
-        torch.float32: 2**-23,
-    }.get(dtype, 2**-10)
-    rtol = 6e-3 if K_red < 1024 else (8e-3 if K_red < 4096 else 1.2e-2)
-    # Error model: fp16 inputs multiplied pairwise have eps relative error per product.
-    # Accumulated in fp32 over K_red terms, max absolute error grows as ~eps * sqrt(K_red).
-    # The 10x multiplier covers worst-case accumulation ordering differences
-    # between our Triton kernels and PyTorch reference.
-    atol = max(eps * 8, 10.0 * eps * (K_red**0.5))
-    return rtol, atol
-
-
-def flops_conv(N, C, K_out, R, S, P, Q):
-    return 2.0 * N * P * Q * K_out * C * R * S
 
 
 def _out_hw(H, W, R, S, stride, padding, dilation):
@@ -97,25 +77,3 @@ def _require_winograd_eligible(name, R, S, stride, dilation, C):
             f"361x; C<4 has too few reduction terms to absorb it), "
             f"got {R}x{S} stride={stride} dilation={dilation} C={C}"
         )
-
-
-def _winograd_tolerances(dtype, K_red, ref, variant="f4x3"):
-    """Return (rtol, atol) for Winograd F(4x4,3x3) correctness checks.
-    Winograd transforms amplify fp16 rounding errors:
-    - F(4x4,3x3): coefficients up to ±8, significant amplification
-    """
-    rtol, atol = dynamic_conv_tolerances(dtype, K_red, ref)
-    if variant == "f4x3":
-        rtol *= 6.0
-        atol = max(atol * 6.0, 0.6)
-    return rtol, atol
-
-
-def apply_activation(y: torch.Tensor, activation: str):
-    if activation == "relu":
-        return F.relu(y)
-    if activation == "relu6":
-        return torch.clamp(y, 0, 6)
-    if activation == "gelu":
-        return F.gelu(y, approximate="tanh")
-    return y
