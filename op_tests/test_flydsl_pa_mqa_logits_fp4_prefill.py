@@ -190,7 +190,8 @@ def run_case(
         (w if isinstance(w, int) else w[1]) for ws in windows_per_batch for w in ws
     )
     max_blocks_per_seq = max(
-        (max_end + kv_block_size - 1) // kv_block_size, block_k // kv_block_size
+        (max_end + block_k - 1) // block_k * (block_k // kv_block_size),
+        block_k // kv_block_size,
     )
     t_max = max_blocks_per_seq * kv_block_size
     max_seq_len = t_max
