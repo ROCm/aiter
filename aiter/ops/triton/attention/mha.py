@@ -48,13 +48,31 @@ def mha_set_use_int64_strides(value: bool):
     _USE_INT64_STRIDES = value
 
 
-_AITER_SWIZZLE = int(os.environ.get("AITER_SWIZZLE", "0"))
+_MHA_SWIZZLE_VALUES = ("default", "spatial")
+
+_env_swizzle = os.environ.get("AITER_TRITON_MHA_SWIZZLE", "default")
+if _env_swizzle not in _MHA_SWIZZLE_VALUES:
+    raise ValueError(
+        f"Invalid AITER_TRITON_MHA_SWIZZLE value: {_env_swizzle!r}. "
+        f"Must be one of {_MHA_SWIZZLE_VALUES}."
+    )
+_MHA_SWIZZLE: Literal["default", "spatial"] = _env_swizzle
+del _env_swizzle
 
 
-def mha_set_swizzle(value: int):
-    """Set spatial swizzle mode: 0 = baseline (remap_xcd), 1 = spatial MHA/GQA."""
-    global _AITER_SWIZZLE
-    _AITER_SWIZZLE = value
+def mha_set_swizzle(value: Literal["default", "spatial"]):
+    """Set MHA workgroup swizzle mode.
+
+    Args:
+        value: ``"default"`` preserves the existing remap_xcd behaviour.
+               ``"spatial"`` enables XCD-aware KV-head mapping for MHA and GQA.
+    """
+    if value not in _MHA_SWIZZLE_VALUES:
+        raise ValueError(
+            f"Invalid swizzle value: {value!r}. Must be one of {_MHA_SWIZZLE_VALUES}."
+        )
+    global _MHA_SWIZZLE
+    _MHA_SWIZZLE = value
 
 
 def _get_sliding_window_size(window_size: Tuple[int, int]) -> int:
@@ -309,7 +327,7 @@ def _flash_attn_forward(
             VARLEN=is_varlen,
             BATCH=batch,
             NUM_XCD=get_num_xcds(),
-            SWIZZLE=_AITER_SWIZZLE,
+            SWIZZLE=_MHA_SWIZZLE,
             USE_INT64_STRIDES=_USE_INT64_STRIDES,
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
