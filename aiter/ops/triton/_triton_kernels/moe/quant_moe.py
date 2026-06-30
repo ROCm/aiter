@@ -325,7 +325,11 @@ def _upcast_from_mxfp(
     mx_scale_ptr += (
         start_mx_scale_quant * stride_scale_quant + start_out * stride_scale_outer
     )
-    out_ptr += start_out * stride_o_outer + start_out_quant * stride_o_quant
+    # gfx1250 workaround: keep the quant-dim term out of the base-pointer
+    # advance and fold it into the per-lane offset (out_offsets) below. With the
+    # quant term in the base advance, the backend miscompiles the store-address
+    # arithmetic for outputs whose byte offset exceeds 2 GiB.
+    out_ptr += start_out * stride_o_outer
 
     # Compute offsets and masks.
     offs_src_quant = tl.arange(0, BLOCK_SIZE_QUANT_MX_TENSOR)[None, :].to(tl.int64)
@@ -348,7 +352,9 @@ def _upcast_from_mxfp(
     )
     scale_offsets = offs_scale * stride_scale_quant + offs_outer * stride_scale_outer
     # gfx1250 workaround
-    out_offsets = offs_out_quant * stride_o_quant + offs_outer * stride_o_outer
+    out_offsets = (
+        start_out_quant + offs_out_quant
+    ) * stride_o_quant + offs_outer * stride_o_outer
 
     # Load the packed tensor and scale.
     tensor = tl.load(mx_tensor_ptr + tensor_offsets, mask=full_mask_src)
