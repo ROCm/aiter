@@ -723,7 +723,7 @@ def _compile_pa_decode_sparse_mfma(
     )
 
     allocator = SmemAllocator(None, arch=GPU_ARCH,
-        global_sym_name=f"pa_decode_sparse_mfma4w_v2_smem_D{D}_K{BLOCK_K}_S{KV_SPLITS}")
+        global_sym_name=f"pa_decode_sparse_mfma16x16x16_4w_v3_smem_D{D}_K{BLOCK_K}_S{KV_SPLITS}")
     lds_scores_off = allocator._align(allocator.ptr, 16)
     allocator.ptr  = lds_scores_off + SCORES_LDS_BYTES
     lds_kv_off     = allocator._align(allocator.ptr, 16)
@@ -749,7 +749,7 @@ def _compile_pa_decode_sparse_mfma(
         b_vi16 = vector.bitcast(T.vec(4, T.i16), b_v4bf16)
         return mfma_fn(T.f32x4, [a_vi16, b_vi16, acc_v4f32, 0, 0, 0])
 
-    _kname = f"pa_decode_sparse_mfma4w_v2_H{H}_D{D}_K{BLOCK_K}_S{KV_SPLITS}"
+    _kname = f"pa_decode_sparse_mfma16x16x16_4w_v3_H{H}_D{D}_K{BLOCK_K}_S{KV_SPLITS}"
 
     @flyc.kernel(name=_kname, known_block_size=[BLOCK_THREADS_MFMA, 1, 1])
     def _kernel(
@@ -910,14 +910,28 @@ def _compile_pa_decode_sparse_mfma(
                 c_zero_v4f32 = arith.constant_vector(0.0, T.f32x4)
                 c_frag = c_zero_v4f32  # partial QK score for this wave's D-slice
 
+                # --- Software pipelining: issue all VMEM loads before any MFMA ---
+                # Since range_constexpr fully unrolls the loop at IR build time, we split
+                # the QK loop into two phases:
+                #   Phase A: issue all D_CHUNKS_W buffer_loads for Q and KV (VMEM in-flight)
+                #   Phase B: write kv_lds, then issue MFMAs (GPU overlaps VMEM↔MFMA)
+                # The GPU's VMEM instruction queue holds up to 16 outstanding requests;
+                # all D_CHUNKS_W=9 Q and KV loads fit simultaneously, hiding VMEM latency 
+                # behind the MFMA pipeline.
+
+                qk_a_frags = []   # pre-loaded Q A-frags, one per D-chunk
+                qk_kv_v4s  = []   # pre-loaded KV raw vectors, one per D-chunk
+                qk_col_offs = []  # column offsets, one per D-chunk
+
+                # Phase A: issue all loads
                 for dc in range_constexpr(D_CHUNKS_W):
                     d_base_const = dc * _MFMA_K   # local offset within wave's D-slice
-                    # Global D-column = d_wave_base + d_base_const + lane_cgrp*4..+3
                     col_off = arith.addi(
                         d_wave_base,
                         arith.addi(arith.constant(d_base_const, type=i32),
                                    arith.muli(lane_cgrp, c4_i32)),
                     )
+                    qk_col_offs.append(col_off)
 
                     # Q A-frag: Q[h_lane, col_off..+3]
                     flat_q = arith.addi(
@@ -931,13 +945,19 @@ def _compile_pa_decode_sparse_mfma(
                     for v in range_constexpr(4):
                         elem = vector.extract(q_v4, static_position=[v], dynamic_position=[])
                         q_vals.append(arith.select(h_valid, elem, c_zero_bf16))
-                    a_frag = vector.from_elements(T.vec(4, T.bf16), q_vals)
+                    qk_a_frags.append(vector.from_elements(T.vec(4, T.bf16), q_vals))
 
                     # KV B-frag for QK: KV[safe_slot_qk, col_off..+3]
                     flat_kv = arith.addi(arith.muli(safe_slot_qk, cD_i32), col_off)
                     dw_kv   = arith.divsi(flat_kv, c2_i32)
                     raw_kv  = buffer_ops.buffer_load(kv_rsrc, dw_kv, vec_width=2, dtype=i32)
-                    kv_v4   = vector.bitcast(T.vec(4, T.bf16), raw_kv)
+                    qk_kv_v4s.append(vector.bitcast(T.vec(4, T.bf16), raw_kv))
+
+                # Phase B: write kv_lds + issue MFMAs (VMEM latency already in-flight)
+                for dc in range_constexpr(D_CHUNKS_W):
+                    col_off = qk_col_offs[dc]
+                    kv_v4   = qk_kv_v4s[dc]
+                    a_frag  = qk_a_frags[dc]
 
                     c_frag = _mfma_bf16(a_frag, kv_v4, c_frag)
 
@@ -953,12 +973,12 @@ def _compile_pa_decode_sparse_mfma(
                 # scores_lds flat: wave*BLOCK_H*ALIAS_ROW_STRIDE + head*ALIAS_ROW_STRIDE + kv
                 for v in range_constexpr(4):
                     head_idx  = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
-                    alias_flat = arith.addi(
+                    scores_flat = arith.addi(
                         arith.muli(wave_id, arith.constant(_BLOCK_H * ALIAS_ROW_STRIDE, type=i32)),
                         arith.addi(arith.muli(head_idx, cARS_i32), lane_row),
                     )
                     s_v = vector.extract(c_frag, static_position=[v], dynamic_position=[])
-                    lds_scores[fx.Index(alias_flat)] = s_v
+                    lds_scores[fx.Index(scores_flat)] = s_v
 
                 gpu.barrier()   # scores_lds + kv_lds written by all waves
 
@@ -1038,27 +1058,39 @@ def _compile_pa_decode_sparse_mfma(
                 # A-frag: p[M=lane_row (head), K=lane_cgrp*4..+3 (kv)] from p_lds (transposed)
                 # B-frag: KV[kv_slot=lane_cgrp*4+v, d_col] from kv_lds (transposed read)
                 # C-frag: acc_i[dc] = vec<4,f32> VGPR iter-arg (no LDS round-trip)
-                new_acc = []
+                #
+                # Software pipelining for PV: pre-load all A-frags and B-frags from LDS
+                # before issuing any MFMAs. LDS reads have have small latency - issuing them
+                # all upfront lets early MFMAs run while later LDS reads complete.
+                pv_a_frags = []   # pre-loaded P A-frags
+                pv_b_frags = []   # pre-loaded KV B-frags
+                pv_d_cols  = []   # d_col per D-chunk
+
+                # The P A-frag is the same for all D-chunks (depends only on lane_row/lane_cgrp).
+                # Pre-load it once and reuse across all D-chunks.
+                a_vals_p_common = []
+                for v in range_constexpr(4):
+                    kv_k     = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
+                    p_flat_r = arith.addi(arith.muli(lane_row, cARS_i32), kv_k)
+                    a_vals_p_common.append(arith.truncf(T.bf16, lds_p[fx.Index(p_flat_r)]))
+                a_frag_pv_common = vector.from_elements(T.vec(4, T.bf16), a_vals_p_common)
+
+                # Phase A: issue all D-chunk LDS reads for KV B-frags
                 for dc in range_constexpr(D_CHUNKS_W):
                     d_base_i32 = arith.addi(d_wave_base, arith.constant(dc * _MFMA_K, type=i32))
                     d_col_i32  = arith.addi(d_base_i32, lane_row)
+                    pv_d_cols.append(d_col_i32)
 
-                    # A-frag: p[head=lane_row, kv_slot=lane_cgrp*4..+3] from p_lds (transposed)
-                    a_vals_p = []
-                    for v in range_constexpr(4):
-                        kv_k     = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
-                        p_flat_r = arith.addi(arith.muli(lane_row, cARS_i32), kv_k)
-                        a_vals_p.append(arith.truncf(T.bf16, lds_p[fx.Index(p_flat_r)]))
-                    a_frag_pv = vector.from_elements(T.vec(4, T.bf16), a_vals_p)
-
-                    # B-frag: KV[kv_slot=lane_cgrp*4+v, d_col] from kv_lds
                     b_vals_pv = []
                     for v in range_constexpr(4):
                         kv_slot_pv = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
                         kv_flat_pv = arith.addi(arith.muli(kv_slot_pv, cKVRS_i32), d_col_i32)
                         b_vals_pv.append(lds_kv[fx.Index(kv_flat_pv)])
-                    b_frag_pv = vector.from_elements(T.vec(4, T.bf16), b_vals_pv)
+                    pv_b_frags.append(vector.from_elements(T.vec(4, T.bf16), b_vals_pv))
 
+                # Phase B: issue MFMAs (LDS reads from Phase A already in-flight / complete)
+                new_acc = []
+                for dc in range_constexpr(D_CHUNKS_W):
                     # Rescale acc by per-head alpha (online softmax correction)
                     acc_frag = acc_i[dc]   # vec<4,f32> from ForOp iter-arg
                     acc_scaled = []
@@ -1067,7 +1099,7 @@ def _compile_pa_decode_sparse_mfma(
                         acc_scaled.append(arith.mulf(val, alpha[v], fastmath=fm))
                     acc_frag_scaled = vector.from_elements(T.f32x4, acc_scaled)
 
-                    new_acc.append(_mfma_bf16(a_frag_pv, b_frag_pv, acc_frag_scaled))
+                    new_acc.append(_mfma_bf16(a_frag_pv_common, pv_b_frags[dc], acc_frag_scaled))
 
                 # acc stays in VGPRs — no barrier needed here.
                 # The next tile's Step 3 barrier covers scores_lds reuse.
