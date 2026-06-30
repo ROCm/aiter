@@ -692,17 +692,29 @@ def fused_qk_norm_rope_1way_fp8_perhead_quant(
         dtype=fp8_dtype,
         device=k.device,
     )
-    q_descale = torch.empty((batch_size, num_heads_q), dtype=torch.float32, device=q.device)
-    k_descale = torch.empty((batch_size, num_heads_k), dtype=torch.float32, device=k.device)
+    q_descale = torch.empty(
+        (batch_size, num_heads_q), dtype=torch.float32, device=q.device
+    )
+    k_descale = torch.empty(
+        (batch_size, num_heads_k), dtype=torch.float32, device=k.device
+    )
     q_unquantized = (
         out_q
         if out_q is not None
-        else torch.empty((batch_size, num_tokens, num_heads_q, head_size), dtype=q.dtype, device=q.device)
+        else torch.empty(
+            (batch_size, num_tokens, num_heads_q, head_size),
+            dtype=q.dtype,
+            device=q.device,
+        )
     )
     k_unquantized = (
         out_k
         if out_k is not None
-        else torch.empty((batch_size, num_tokens, num_heads_k, head_size), dtype=k.dtype, device=k.device)
+        else torch.empty(
+            (batch_size, num_tokens, num_heads_k, head_size),
+            dtype=k.dtype,
+            device=k.device,
+        )
     )
 
     _fused_qk_norm_rope_1way_fp8_perhead_quant_kernel(
@@ -905,6 +917,8 @@ def v_1way_per_head_fp8_quant(v: Tensor) -> tuple[Tensor, Tensor]:
         dtype=fp8_dtype,
         device=v.device,
     )
-    v_descale = torch.empty((batch_size, num_heads), dtype=torch.float32, device=v.device)
+    v_descale = torch.empty(
+        (batch_size, num_heads), dtype=torch.float32, device=v.device
+    )
     _v_1way_per_head_fp8_quant_kernel(v, v_fp8, v_descale)
     return v_fp8, v_descale
