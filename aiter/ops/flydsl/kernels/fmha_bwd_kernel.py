@@ -25,7 +25,7 @@ B[k=(l//16)×4..+3, n=l%16] is loaded from Q[l%16, D_step×16+(l//16)×4..+3]
 which treats the M-index as MFMA-N and the D-index as MFMA-K.
 The result C[n,m] = Σ_d K[n,d]·Q[m,d] = (K @ Q^T)[n,m] ✓
 
-LDS layout  (44 KB total, < 64 KB gfx950 limit)
+LDS layout  (44 KB total; gfx950 LDS limit is 160 KB = 163840 B)
 ────────────────────────────────────────────────
   k_lds  [64, 128] bf16  — 16 KB  loaded once per K-tile
   v_lds  [64, 128] bf16  — 16 KB  loaded once per K-tile
@@ -57,12 +57,15 @@ from .kernels_common import get_warp_size
 _LOG2E = math.log2(math.e)
 
 # ── geometry ──────────────────────────────────────────────────────────────────
+# NOTE: BLOCK_N=128 (NUM_WARPS=8) was tried and gave 0% speedup on the canonical
+# shape — this kernel is NOT bound by Q/dO HBM re-reads, so widening the K-tile
+# does not help. Kept at 64 (compute/LDS/latency-bound; optimize those instead).
 BLOCK_N = 64
 BLOCK_M = 16
 WMMA_SIZE = 16  # MFMA tile dimension (16×16×16)
 A_FRAG = 4  # bf16 per lane for MFMA A/B (K=16 → 4 per lane)
 C_FRAG = 4  # f32 per lane for MFMA C
-NUM_WARPS = 4
+NUM_WARPS = BLOCK_N // WMMA_SIZE  # 4 warps × 16 N-rows each
 WARP_SIZE = 64
 BLOCK_THREADS = NUM_WARPS * WARP_SIZE  # 256
 
@@ -266,7 +269,7 @@ def build_fmha_bwd_kernel_module(
     allocator._align(allocator.ptr, 16)
     allocator.ptr = _LDS_TOTAL
 
-    @flyc.kernel
+    @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def fmha_bwd_mfma_kernel(
         q_ptr: fx.Tensor,
         k_ptr: fx.Tensor,

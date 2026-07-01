@@ -417,6 +417,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         flydsl_handled = False
         if _USE_FLYDSL_BWD_KERNEL:
             from aiter.ops.flydsl.fmha_bwd_kernels import flydsl_flash_attn_backward
+
             flydsl_handled = flydsl_flash_attn_backward(
                 q,
                 k,
