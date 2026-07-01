@@ -23,7 +23,8 @@ on:
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # Label-triggered MI300X runs should not cancel the regular PR validation run.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.event.action == 'labeled' && github.event.label.name || 'default' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -381,7 +382,7 @@ jobs:
           event_name = os.environ.get("EVENT_NAME")
           event_action = os.environ.get("EVENT_ACTION")
           github_ref = os.environ.get("GITHUB_REF")
-labels = json.loads(os.environ.get("PR_LABELS") or "[]") or []
+          labels = json.loads(os.environ.get("PR_LABELS") or "[]") or []
 
           include = []
           labeled_event = event_name == "pull_request" and event_action == "labeled"
