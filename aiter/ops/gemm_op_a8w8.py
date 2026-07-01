@@ -415,7 +415,7 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
             _CKGEMM_HAS_GFX[tuned_file] = True
         else:
             logger.warning(
-                f"{tuned_file} has no 'gfx' column — falling back to cu_num-only key. "
+                f"{tuned_file} has no 'gfx' column -- falling back to cu_num-only key. "
                 "Re-run the tuner or migrate the CSV to add a gfx column."
             )
             _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
@@ -471,7 +471,7 @@ def get_GEMM_config_with_quant_type(
             _GEMM_QUANT_TYPE_HAS_GFX[tuned_file] = True
         else:
             logger.warning(
-                f"{tuned_file} has no 'gfx' column — falling back to cu_num-only key. "
+                f"{tuned_file} has no 'gfx' column -- falling back to cu_num-only key. "
                 "Re-run the tuner or migrate the CSV to add a gfx column."
             )
             _GEMM_QUANT_TYPE_CACHE[tuned_file] = asmGemmDictDf.set_index(
@@ -1073,3 +1073,51 @@ def gemm_a8w8_bpreshuffle_cktile_tune(
     kernelId: int,
     splitK: int = 0,
 ) -> Tensor: ...
+
+
+# ---------------------------------------------------------------------------
+# gfx1250 (mi400) MXFP8 x MXFP8 GEMM (a8w8) -- ASM, kernarg preload mode.
+# A (activation) and B (weight) are both mxfp8 (e4m3) with OCP MX e8m0 block
+# scales (block=32). Kernel variant is auto-selected by the .cu heuristic
+# unless an explicit kernelName is given. See asm_mxfp8fp4gemm_mi400.cu.
+# ---------------------------------------------------------------------------
+@compile_ops(
+    "module_mxfp8fp4gemm_asm",
+    fc_name="mxfp8_mxfp8_gemm_asm",
+    ffi_type="ctypes",
+)
+def _mxfp8_mxfp8_gemm_asm(
+    A: Tensor,  # A:[M, K]   mxfp8 e4m3 (preshuffled if a_preshuffle=1)
+    B: Tensor,  # B:[N, K]   mxfp8 e4m3 (always preshuffled)
+    ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
+    ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
+    out: Tensor,  # Out:[M, N] bf16
+    kernelName: Optional[str] = None,
+    a_preshuffle: int = 1,
+) -> None: ...
+
+
+def gemm_a8w8_mxfp8(
+    A: Tensor,  # A:[M, K]   mxfp8 e4m3
+    B: Tensor,  # B:[N, K]   mxfp8 e4m3
+    ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0
+    ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0
+    dtype: torch.dtype = dtypes.bf16,
+    a_preshuffle: bool = True,
+    kernelName: str = "",
+) -> Tensor:
+    """gfx1250 MXFP8 x MXFP8 GEMM (a8w8). D[M,N] bf16 = A @ B^T with e8m0 block
+    scales. Kernel auto-selected from M/N/K unless ``kernelName`` is given."""
+    M = A.shape[0]
+    N = B.shape[0]
+    out = torch.empty((M, N), dtype=dtype, device=A.device)
+    _mxfp8_mxfp8_gemm_asm(
+        A,
+        B,
+        ScaleA,
+        ScaleB,
+        out,
+        kernelName if kernelName else None,
+        int(bool(a_preshuffle)),
+    )
+    return out

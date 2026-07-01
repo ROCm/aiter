@@ -1744,6 +1744,55 @@ def attention_loop_tensor_subtile_split(
 
 
 @gluon.jit
+def load_q(
+    cfg,
+    query_ptr,
+    q_offs,
+    query_mask,
+    cur_batch_in_all_start_index,
+    kv_head_idx,
+    cur_batch_query_len,
+    q_block_local_idx,
+    query_stride_0,
+    USE_TDM_LOAD: gl.constexpr = False,
+):
+    if USE_TDM_LOAD and cfg.ARCH_NAME == "gfx1250":
+        LOAD_COLS: gl.constexpr = cfg.NUM_QUERIES_PER_KV * cfg.HEAD_SIZE
+        q_smem_layout: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        q_smem = gl.allocate_shared_memory(
+            query_ptr.dtype.element_ty,
+            [cfg.BLOCK_Q, LOAD_COLS],
+            layout=q_smem_layout,
+        )
+        q_base = cur_batch_in_all_start_index * query_stride_0 + kv_head_idx * LOAD_COLS
+        q_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=query_ptr + q_base,
+            shape=[cur_batch_query_len, LOAD_COLS],
+            strides=[query_stride_0, 1],
+            block_shape=[cfg.BLOCK_Q, LOAD_COLS],
+            layout=q_smem_layout,
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            q_desc,
+            [(q_block_local_idx * cfg.BLOCK_Q).to(gl.int32), 0],
+            q_smem,
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
+        q = q_smem.reshape([cfg.BLOCK_M, cfg.HEAD_SIZE]).load(layout=cfg.q_layout)
+    else:
+        q = gl.amd.cdna4.buffer_load(
+            ptr=query_ptr,
+            offsets=q_offs,
+            mask=query_mask,
+            other=0.0,
+            cache=cfg.Q_CACHE_MODIFIER,
+        )
+    return q
+
+
+@gluon.jit
 def find_seq_idx(
     query_start_len_ptr,
     target_idx,
@@ -1834,7 +1883,8 @@ def _unified_attention_gluon_kernel_2d(
     REMOVE_INDIRECT_ACCESS: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 2,
     LOOP_VARIANT: gl.constexpr = 0,
-    USE_TDM_STORE: gl.constexpr = 0,
+    USE_TDM_STORE: gl.constexpr = 1,
+    USE_TDM_LOAD: gl.constexpr = 1,
     K_WIDTH: gl.constexpr = 0,
     # Split-KV (3d grid)
     NUM_SPLITS: gl.constexpr = 1,
@@ -1844,6 +1894,7 @@ def _unified_attention_gluon_kernel_2d(
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
+    # q_block_global_idx = gl.program_id(1)
     q_block_global_idx = gl.num_programs(1) - 1 - gl.program_id(1)
     # program_id(2) is 0 for a 2d grid (NUM_SPLITS==1), so this is always safe.
     split_idx = gl.program_id(2)
@@ -1926,12 +1977,17 @@ def _unified_attention_gluon_kernel_2d(
         + offs_d[None, :]
     )
 
-    q = gl.amd.cdna4.buffer_load(
-        ptr=query_ptr,
-        offsets=q_offs,
-        mask=query_mask,
-        other=0.0,
-        cache=cfg.Q_CACHE_MODIFIER,
+    q = load_q(
+        cfg,
+        query_ptr,
+        q_offs,
+        query_mask,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        cur_batch_query_len,
+        q_block_local_idx,
+        query_stride_0,
+        USE_TDM_LOAD=USE_TDM_LOAD,
     )
 
     seq_len = gl.load(seq_lens_ptr + seq_idx)
