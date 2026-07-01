@@ -109,6 +109,13 @@ def test_aiter_jit_dir_with_enum():
             out_cpu == 0
         ), "Output tensor should contain non-zero values (kernel should have computed results)"
 
+        generated_modules = [
+            filename for filename in os.listdir(temp_dir) if filename.endswith(".so")
+        ]
+        assert (
+            generated_modules
+        ), "Expected compiled modules in AITER_JIT_DIR when invoking kernel with enum arguments"
+
 
 if __name__ == "__main__":
     test_aiter_jit_dir_with_enum()

@@ -678,6 +678,126 @@ def test_fused_ar_rmsnorm_padded_input_case(
     }
 
 
+def fused_ar_rmsnorm_gemma(
+    tp_size,
+    pp_size,
+    rankID,
+    x,
+    residual,
+    weight,
+    eps,
+    distributed_init_method: Optional[str] = None,
+):
+    device = torch.device(f"cuda:{rankID}")
+    torch.cuda.set_device(device)
+    logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rankID,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, pp_size)
+    x = x.to(device)
+    residual = residual.to(device)
+    weight = weight.to(device)
+
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1, device=device), group=group)
+    torch.cuda.synchronize()
+
+    out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+        x,
+        residual,
+        weight,
+        eps,
+        gemma_norm=True,
+    )
+
+    if dist.is_initialized():
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        torch.cuda.empty_cache()
+    return out, res_out
+
+
+def test_fused_ar_gemma_rmsnorm_case(
+    tp_size,
+    pp_size,
+    shape,
+    dtype,
+    *,
+    distributed_init_method: Optional[str] = None,
+):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "49373"
+    pool = Pool(processes=tp_size)
+    torch.manual_seed(123)
+    x = torch.randn(shape, dtype=dtype)
+    residual = torch.randn(shape, dtype=dtype)
+    # GemmaRMSNorm stores zero-centered weights and applies (1 + weight).
+    weight = torch.randn((shape[-1],), dtype=dtype) * 0.1
+    eps = 1e-6
+    rets = []
+    for rank in range(tp_size):
+        rets.append(
+            pool.apply_async(
+                fused_ar_rmsnorm_gemma,
+                args=(
+                    tp_size,
+                    pp_size,
+                    rank,
+                    x,
+                    residual,
+                    weight,
+                    eps,
+                    distributed_init_method,
+                ),
+            )
+        )
+    pool.close()
+    pool.join()
+
+    ref_residual = x * tp_size + residual
+    ref_out = F.rms_norm(
+        input=ref_residual,
+        normalized_shape=(shape[-1],),
+        weight=weight + 1.0,
+        eps=eps,
+    )
+    rets = [ret.get() for ret in rets]
+
+    atol = 1e-2 if dtype != torch.bfloat16 else 5e-2
+    rtol = atol
+    max_err = 0.0
+    max_res_err = 0.0
+    for out, res_out in rets:
+        assert out.shape == shape
+        assert res_out.shape == shape
+        err = checkAllclose(
+            ref_out,
+            out.to(ref_out),
+            msg=f"test_fused_ar_gemma_rmsnorm_case: {shape=} {dtype=}",
+            atol=atol,
+            rtol=rtol,
+        )
+        res_err = checkAllclose(
+            ref_residual,
+            res_out.to(ref_residual),
+            msg=f"test_fused_ar_gemma_rmsnorm_case residual: {shape=} {dtype=}",
+            atol=atol,
+            rtol=rtol,
+        )
+        max_err = max(max_err, err)
+        max_res_err = max(max_res_err, res_err)
+    return {
+        "shape": shape,
+        "dtype": str(dtype),
+        "err": max_err,
+        "res_err": max_res_err,
+    }
+
+
 try:
     import pytest
 
@@ -769,6 +889,25 @@ try:
         assert (
             ret["res_err"] < 5e-2
         ), f"fused_ar_rmsnorm residual err={ret['res_err']} config={ret}"
+
+    def test_gemma_norm_tp2():
+        if torch.cuda.device_count() < 2:
+            pytest.skip(f"requires >= 2 GPUs (have {torch.cuda.device_count()})")
+        ret = test_fused_ar_gemma_rmsnorm_case(
+            tp_size=2,
+            pp_size=1,
+            shape=(17, 2048),
+            dtype=dtypes.d_dtypes["bf16"],
+            distributed_init_method=get_distributed_init_method(
+                get_ip(), get_open_port()
+            ),
+        )
+        assert (
+            ret["err"] < 5e-2
+        ), f"fused_ar_gemma_rmsnorm err={ret['err']} config={ret}"
+        assert (
+            ret["res_err"] < 5e-2
+        ), f"fused_ar_gemma_rmsnorm residual err={ret['res_err']} config={ret}"
 
 except ImportError:
     pass

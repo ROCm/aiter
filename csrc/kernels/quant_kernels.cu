@@ -1685,6 +1685,48 @@ void moe_smooth_per_token_scaled_quant_v2(
 // `aiter::mx_scale_shuffle_idx`. The legacy kernel name
 // `mxfp4_quant_moe_sort_kernel` was misleading because it implied fp4-only
 // — the implementation has always been dtype-templated.
+template <typename DTYPE_O, int thread_data_size>
+__device__ void store_zero_mx_quant_moe_sort_row(
+    DTYPE_O* __restrict__ out,
+    uint8_t* __restrict__ scale,
+    const int sorted_row,
+    const int32_t scaleN_pad,
+    const int32_t scaleN_valid,
+    const int scale_k,
+    const int num_thread_per_group,
+    const int topk_id,
+    const int topk,
+    const int64_t offset_base,
+    const int cols)
+{
+    if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
+    {
+        int addr    = aiter::mx_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k);
+        scale[addr] = 0;
+    }
+    if(topk_id < topk || topk == 1)
+    {
+        const int64_t row_bytes = std::is_same_v<DTYPE_O, opus::fp4_t> ? cols / 2 : cols;
+        uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
+        const int64_t row_offset = offset_base * row_bytes;
+        auto buffer_o = opus::make_gmem<uint8_t>(out_u8 + row_offset, row_bytes);
+
+        static constexpr int32_t zero_vec_bytes = 16;
+        opus::vector_t<uint8_t, zero_vec_bytes> zero_vec;
+#pragma unroll
+        for(int j = 0; j < zero_vec_bytes; j++)
+        {
+            zero_vec[j] = 0;
+        }
+
+        const int32_t num_vecs = (row_bytes + zero_vec_bytes - 1) / zero_vec_bytes;
+        for(int32_t vec_idx = threadIdx.x; vec_idx < num_vecs; vec_idx += blockDim.x)
+        {
+            buffer_o.template store<zero_vec_bytes>(zero_vec, vec_idx * zero_vec_bytes);
+        }
+    }
+}
+
 template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
 __global__ void fused_mx_quant_moe_sort_kernel(
     DTYPE_O* __restrict__ out,
@@ -1692,6 +1734,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
     DTYPE_I const* __restrict__ input,
     int32_t const* __restrict__ sorted_ids,
     int32_t const* __restrict__ num_valid_ids,
+    float const* __restrict__ sorted_weights,
     const int32_t num_tokens,
     const int32_t cols,
     const int32_t group_size,
@@ -1765,6 +1808,23 @@ __global__ void fused_mx_quant_moe_sort_kernel(
             }
 
             int64_t offset_base = topk == 1 ? (int64_t)(token_idx) : (int64_t)(token_idx * topk + topk_id);
+            const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
+            if(sorted_weights != nullptr && sorted_weights[sorted_row] == 0.0f)
+            {
+                store_zero_mx_quant_moe_sort_row<DTYPE_O, thread_data_size>(
+                    out,
+                    scale,
+                    sorted_row,
+                    scaleN_pad,
+                    scaleN_valid,
+                    scale_k,
+                    num_thread_per_group,
+                    topk_id,
+                    topk,
+                    offset_base,
+                    cols);
+                continue;
+            }
             auto buffer_input =
                 opus::make_gmem<DTYPE_I>(input + offset_base * input_stride, cols * sizeof(DTYPE_I));
             vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(
@@ -1801,7 +1861,6 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 row_scale = absMax * inverted_DTYPE_MAX;
             }
 
-            const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
             if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
             {
                 uint8_t bs_e8m0 = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
@@ -1833,6 +1892,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 reinterpret_cast<input_dtype const*>(input.data_ptr()),                         \
                 reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                              \
                 reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                           \
+                sorted_weights_ptr,                                                            \
                 token_num,                                                                      \
                 cols,                                                                           \
                 group_size,                                                                     \
@@ -1879,12 +1939,24 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     const aiter_tensor_t& num_valid_ids,
     int token_num,
     int block_m,
-    int group_size
+    int group_size,
+    std::optional<aiter_tensor_t> sorted_weights
 )
 {
     int cols = input.size(-1);
     int topk = input.numel() / (cols * token_num);
     int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
+    if(sorted_weights.has_value())
+    {
+        AITER_CHECK(sorted_weights->dtype() == AITER_DTYPE_fp32,
+                    __func__,
+                    " sorted_weights must be fp32 when provided");
+        AITER_CHECK(sorted_weights->numel() >= sorted_ids.size(0),
+                    __func__,
+                    " sorted_weights must have at least sorted_ids.size(0) elements");
+    }
+    float const* sorted_weights_ptr =
+        sorted_weights.has_value() ? reinterpret_cast<float const*>(sorted_weights->data_ptr()) : nullptr;
 
     const int num_cu = get_num_cu_func();
     int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;

@@ -8,6 +8,7 @@ import logging
 import multiprocessing
 import os
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -20,8 +21,8 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list  # noqa: E402
-from cpp_extension import _jit_compile, get_hip_version  # noqa: E402
+from chip_info import get_gfx, get_gfx_list, get_gfx_runtime  # noqa: E402
+from cpp_extension import _jit_compile, executable_path, get_hip_version  # noqa: E402
 from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
@@ -488,7 +489,7 @@ def hip_flag_checker(flag_hip: str) -> bool:
     import subprocess
 
     cmd = (
-        ["hipcc"]
+        [executable_path("hipcc")]
         + flag_hip.split()
         + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
     )
@@ -510,11 +511,12 @@ def check_LLVM_MAIN_REVISION():
     #define CK_TILE_HOST_DEVICE_EXTERN"""
     import subprocess
 
-    cmd = """echo "#include <tuple>
-__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
     try:
+        hipcc = shlex.quote(executable_path("hipcc"))
+        cmd = f"""echo "#include <tuple>
+__host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" | {hipcc} -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
         subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, AssertionError):
         return 554785
     return 554785 - 1
 
@@ -606,9 +608,50 @@ def get_module_custom_op(md_name: str) -> None:
     return
 
 
+def _so_offload_archs(so_path):
+    # parse the gfx targets embedded in a built module .so from its clang
+    # offload-bundle entry ids (e.g. the 'gfx942' in '...amdhsa--gfx942').
+    # the .so is mmap'd, not read whole, since CK modules can be hundreds of MB.
+    # an empty set means host-only module, missing file, or unreadable.
+    import mmap
+
+    archs = set()
+    try:
+        with open(so_path, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+)", mm):
+                    archs.add(m.group(1).decode())
+    except (OSError, ValueError, OverflowError):
+        pass
+    return archs
+
+
+def _needs_arch_rebuild(md_name):
+    # a prebuilt .so is a valid host extension on any GPU, so importing one
+    # built for the wrong arch succeeds and only faults later at kernel launch.
+    # if the .so carries device code for other arches but NOT the running GPU,
+    # force a JIT rebuild for the native arch instead.
+    try:
+        cur = get_gfx_runtime()
+    except Exception:
+        # running arch undetectable (e.g. no GPU) -> keep normal behaviour
+        return False
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+    built = _so_offload_archs(so_path)
+    if not built or cur in built:
+        return False
+    logger.warning(
+        f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "
+        f"running arch {cur}; rebuilding for {cur}"
+    )
+    return True
+
+
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
     check_numa()
+    if _needs_arch_rebuild(md_name):
+        raise ModuleNotFoundError(md_name)
     get_module_custom_op(md_name)
     return __mds[md_name]
 
@@ -833,6 +876,8 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
+        if get_gfx() == "gfx1250" and hip_version >= Version("7.0.0"):
+            flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
 
         if not torch_exclude:
             import torch
@@ -1208,7 +1253,7 @@ def _ctypes_call(func, fc_name, md_name):
         if _cache:
             return
         so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
-        if not os.path.exists(so_path):
+        if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
             d_args = get_args_of_build(md_name)
             d_args["torch_exclude"] = True
             build_module(
