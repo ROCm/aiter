@@ -14,11 +14,11 @@ torch.manual_seed(42)
 
 # GLM5.2-FP8 params
 token = 1
-# Test: large model dims, small expert/topk (isolate dimension issue)
-d_model = 1024
-d_ff = 256
+# Test: large model dims, small expert/topk
+d_model = 6144
+d_ff = 2048
 experts = 4
-topk = 8
+topk = 2
 blk_n, blk_k = 128, 128
 
 print(f"=== Flat kernel debug test ===")
