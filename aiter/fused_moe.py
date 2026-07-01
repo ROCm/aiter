@@ -50,6 +50,7 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+_MIN_M_PAD = max(1, int(os.environ.get("ATOM_MOE_MPAD", "16")))
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -83,6 +84,25 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
     # but must be valid device pointers -- alias topk_ids as scratch.
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
+
+
+def _pad_rows(
+    tensor: Optional[torch.Tensor],
+    padded_m: int,
+    *,
+    fill_value: float | int = 0,
+) -> Optional[torch.Tensor]:
+    if tensor is None or tensor.shape[0] >= padded_m:
+        return tensor
+
+    padded = torch.empty(
+        (padded_m, *tensor.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    padded[: tensor.shape[0]].copy_(tensor)
+    padded[tensor.shape[0] :].fill_(fill_value)
+    return padded
 
 
 def _moe_sorting_impl(
@@ -386,6 +406,7 @@ def fused_moe_(
         block_size_M = None
     """user API"""
     M, topk = topk_ids.shape
+    orig_M = M
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     assert w1.shape[1] in [
@@ -438,6 +459,16 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    padded_M = get_padded_M(M)
+    pad_output = padded_M > M and num_local_tokens is None
+    if pad_output:
+        hidden_states = _pad_rows(hidden_states, padded_M, fill_value=0)
+        topk_ids = _pad_rows(topk_ids, padded_M, fill_value=0)
+        topk_weight = _pad_rows(topk_weight, padded_M, fill_value=0)
+        if a1_scale is not None and a1_scale.shape[0] == M:
+            a1_scale = _pad_rows(a1_scale, padded_M, fill_value=0)
+        M = padded_M
+
     grouped_a8w4_out = None
     if is_flydsl_available():
         try:
@@ -476,10 +507,10 @@ def fused_moe_(
             )
 
     if grouped_a8w4_out is not None:
-        return grouped_a8w4_out
+        return grouped_a8w4_out[:orig_M] if pad_output else grouped_a8w4_out
 
     metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
+        padded_M,  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
@@ -545,7 +576,7 @@ def fused_moe_(
         local_topk_ids = None
 
     if metadata.run_1stage:
-        return metadata.stage1(
+        moe_out = metadata.stage1(
             hidden_states,
             w1,
             w2,
@@ -568,8 +599,9 @@ def fused_moe_(
             device=topk_ids.device,
             doweight_stage1=doweight_stage1,
         )
+        return moe_out[:orig_M] if pad_output else moe_out
     else:
-        return fused_moe_2stages(
+        moe_out = fused_moe_2stages(
             hidden_states,
             w1,
             w2,
@@ -603,6 +635,7 @@ def fused_moe_(
             gate_mode=gate_mode,
             expert_mask=expert_mask,
         )
+        return moe_out[:orig_M] if pad_output else moe_out
 
 
 def fused_moe_1stage(
@@ -857,7 +890,7 @@ _PADDED_M_TIERS = [32768, 131072]
 
 def get_padded_M(M):
     if M < _PADDED_M_TIERS[0]:
-        return nextPow2(M)
+        return max(nextPow2(M), _MIN_M_PAD) if M > 0 else 1
     for tier in reversed(_PADDED_M_TIERS):
         if M >= tier:
             return tier
