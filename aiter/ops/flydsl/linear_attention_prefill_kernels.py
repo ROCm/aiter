@@ -42,9 +42,11 @@ from .kernels.chunk_gated_delta_h_naive_opt import (
 # is the stripped no-lds_g variant (gating reads g inline from HBM). File names,
 # symbol names and the host ``_fork`` selector all agree.
 from .kernels.chunk_gated_delta_h_kv import compile_chunk_gated_delta_h_kv
-from .kernels.chunk_gated_delta_h_vk import compile_chunk_gated_delta_h_vk
-from .kernels.chunk_gated_delta_h_vk_naive import (
-    compile_chunk_gated_delta_h_vk_naive,
+from .kernels.chunk_gated_delta_h_mfma16_hip import (
+    compile_chunk_gated_delta_h_mfma16_hip,
+)
+from .kernels.chunk_gated_delta_h_mfma16_3wave_opt2 import (
+    compile_chunk_gated_delta_h_mfma16_3wave_opt2,
 )
 from .kernels.chunk_gated_delta_h_mfma16_2wave_opt1 import (
     compile_chunk_gated_delta_h_mfma16_2wave_opt1,
@@ -707,7 +709,7 @@ def _get_or_compile_kv(
 
 
 @functools.lru_cache(maxsize=None)
-def _get_or_compile_vk(
+def _get_or_compile_mfma16_hip(
     K,
     V,
     BT,
@@ -724,10 +726,11 @@ def _get_or_compile_vk(
     state_bf16=False,
     g_log2_scaled=False,
 ):
-    """Compile (and cache) the VK-layout K5 kernel (separate implementation,
-    forked from the KV variant: VWARP 16x16x16 + 3-wave). Same compile-time
-    config surface as the baseline / KV paths; distinct cache namespace."""
-    return compile_chunk_gated_delta_h_vk(
+    """Compile (and cache) the mfma16 / HIP-aligned K5 kernel (formerly the "vk"
+    fork): 16x16x16 bf16 MFMA + HIP-matching warp partition, writing the public
+    VK layout [..., V, K]. Same compile-time config surface as the baseline / KV
+    paths; distinct cache namespace."""
+    return compile_chunk_gated_delta_h_mfma16_hip(
         K=K,
         V=V,
         BT=BT,
@@ -747,7 +750,7 @@ def _get_or_compile_vk(
 
 
 @functools.lru_cache(maxsize=None)
-def _get_or_compile_vk_naive(
+def _get_or_compile_mfma16_3wave_opt2(
     K,
     V,
     BT,
@@ -764,10 +767,12 @@ def _get_or_compile_vk_naive(
     state_bf16=False,
     g_log2_scaled=False,
 ):
-    """Compile (and cache) the NAIVE (un-pipelined) VK-fork K5 kernel. Same
-    VWARP layout + coalesced h-store as the optimized VK fork, but with all
-    prefetch / software-pipeline scheduling removed -- for trace baselining."""
-    return compile_chunk_gated_delta_h_vk_naive(
+    """Compile (and cache) the mfma16_3wave_opt2 K5 kernel -- currently an exact
+    copy of mfma16_2wave_opt1 (VWARP MFMA 16x16x16, HIP-aligned store-overlap,
+    input k pre-transposed [B,Hg,K,T], output public VK [..., V, K]). Kept as a
+    separate compile/cache namespace so a 3-wave occupancy variant can diverge
+    from the 2-wave line without disturbing it."""
+    return compile_chunk_gated_delta_h_mfma16_3wave_opt2(
         K=K,
         V=V,
         BT=BT,
@@ -975,7 +980,7 @@ def _resolve_state_dtype(initial_state, state_dtype):
 # maps to its own compiled kernel + cache namespace (see the dispatch in the
 # wrapper body). ``None`` (not listed here) means the baseline kernel.
 _K5_FORKS = frozenset(
-    {"kv", "vk", "mfma16_2wave_opt1", "vk_naive", "naive", "naive_opt", "hipport"}
+    {"kv", "mfma16_hip", "mfma16_2wave_opt1", "mfma16_3wave_opt2", "naive", "naive_opt", "hipport"}
 )
 
 
@@ -1005,8 +1010,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
       * ``None``        -> baseline kernel (``chunk_gated_delta_h.py``).
       * ``"kv"``        -> KV fork (coalesced [..., K, V] h-store); BV==64 only.
-      * ``"vk"``        -> VK fork (public [..., V, K] layout); BV==64 only.
-      * ``"vk_naive"``  -> un-pipelined VK fork; BV==64 only.
+      * ``"mfma16_hip"`` -> mfma16 / HIP-aligned fork (public [..., V, K]
+        layout; 16x16x16 MFMA + HIP split-M warp partition; NON-VWARP only);
+        BV==64 only.
+      * ``"mfma16_3wave_opt2"`` -> exact copy of mfma16_2wave_opt1 (KV-in /
+        VK-out fork); divergence base for a 3-wave variant.
       * ``"mfma16_2wave_opt1"``  -> un-pipelined KV fork; BV==64 only.
       * ``"naive"``     -> un-pipelined baseline fork; any BV.
 
@@ -1085,7 +1093,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # contiguous). This is now their REQUIRED input layout -- the caller
     # (upstream / tests) owns the transpose, the host does NOT permute. Every
     # other fork keeps the original token-major [B, T_flat, Hg, K] layout.
-    _kv_k_pretransposed = _fork in ("kv", "mfma16_2wave_opt1")
+    _kv_k_pretransposed = _fork in ("kv", "mfma16_2wave_opt1", "mfma16_3wave_opt2")
     if _kv_k_pretransposed:
         B, Hg, K, T = k.shape
     else:
@@ -1139,12 +1147,12 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # baseline kernel -- the baseline expects token-major k, which would
     # mis-read the [B, Hg, K, T] layout the KV forks require. V must be a
     # multiple of 64 for this to be legal.
-    if _fork in ("kv", "mfma16_2wave_opt1"):
-        # ``kv`` is still BV=64-only. ``mfma16_2wave_opt1`` is now VWARP-parameterized
-        # (BV = NUM_WARPS*16, NUM_WARPS in {1,2,4}), so it accepts BV in
-        # {16,32,64}; override with FLYDSL_K5_KVNAIVE_BV for A/B sweeps,
-        # otherwise default to 64 (the tuned production choice).
-        if _fork == "mfma16_2wave_opt1":
+    if _fork in ("kv", "mfma16_2wave_opt1", "mfma16_3wave_opt2"):
+        # ``kv`` is still BV=64-only. ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``
+        # are VWARP-parameterized (BV = NUM_WARPS*16, NUM_WARPS in {1,2,4}), so
+        # they accept BV in {16,32,64}; override with FLYDSL_K5_KVNAIVE_BV for
+        # A/B sweeps, otherwise default to 64 (the tuned production choice).
+        if _fork in ("mfma16_2wave_opt1", "mfma16_3wave_opt2"):
             _bv_env = os.environ.get("FLYDSL_K5_KVNAIVE_BV")
             BV = int(_bv_env) if _bv_env else 64
             assert BV in (16, 32, 64), "mfma16_2wave_opt1 BV must be in {16,32,64}"
@@ -1159,8 +1167,9 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # ``_get_or_compile*`` cache namespace) -- no shared flag dispatch:
     #   * kv / mfma16_2wave_opt1 : separate VWARP kernels storing h coalesced as
     #     [..., K, V]; gated on BV==64, else fall back to baseline.
-    #   * vk / vk_naive : separate VWARP kernels writing the public VK layout
-    #     [..., V, K] directly; gated on BV==64, else fall back to baseline.
+    #   * mfma16_hip : NON-VWARP (HIP split-M) kernel writing the public VK
+    #     layout [..., V, K] directly; gated on BV==64, else fall back to baseline.
+    #   * mfma16_3wave_opt2 : exact copy of mfma16_2wave_opt1 (KV-in/VK-out).
     #   * naive         : un-pipelined twin of the baseline kernel; ANY BV
     #     (baseline layout, NOT the BV==64-only VWARP fork).
     #   * None          : baseline kernel.
@@ -1169,8 +1178,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     _mfma16_2wave_opt1_gate = BV in (16, 32, 64)
     _kv_opt_active = (_fork == "kv") and _vwarp_gate
     _mfma16_2wave_opt1_active = (_fork == "mfma16_2wave_opt1") and _mfma16_2wave_opt1_gate
-    _vk_active = (_fork == "vk") and _vwarp_gate
-    _vk_naive_active = (_fork == "vk_naive") and _vwarp_gate
+    _mfma16_hip_active = (_fork == "mfma16_hip") and _vwarp_gate
+    # mfma16_3wave_opt2 is a copy of mfma16_2wave_opt1 (same KV-in/VK-out fork).
+    _mfma16_3wave_opt2_gate = BV in (16, 32, 64)
+    _mfma16_3wave_opt2_active = (_fork == "mfma16_3wave_opt2") and _mfma16_3wave_opt2_gate
     _hipport_active = (_fork == "hipport") and _vwarp_gate
     _naive_active = _fork == "naive"
     _naive_opt_active = _fork == "naive_opt"
@@ -1178,16 +1189,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     # NOTE: mfma16_2wave_opt1 now writes the public VK layout [..., V, K] directly
     # (h-b128 coalesced store via lds_ht), so it is NOT in the transpose set --
     # only the optimized ``kv`` fork still writes [..., K, V] and needs the view.
-    _kv_active = _kv_opt_active or _mfma16_2wave_opt1_active
+    _kv_active = _kv_opt_active or _mfma16_2wave_opt1_active or _mfma16_3wave_opt2_active
     _kv_needs_transpose = _kv_opt_active
     if _kv_opt_active:
         _compile_fn = _get_or_compile_kv
     elif _mfma16_2wave_opt1_active:
         _compile_fn = _get_or_compile_mfma16_2wave_opt1
-    elif _vk_active:
-        _compile_fn = _get_or_compile_vk
-    elif _vk_naive_active:
-        _compile_fn = _get_or_compile_vk_naive
+    elif _mfma16_hip_active:
+        _compile_fn = _get_or_compile_mfma16_hip
+    elif _mfma16_3wave_opt2_active:
+        _compile_fn = _get_or_compile_mfma16_3wave_opt2
     elif _hipport_active:
         _compile_fn = _get_or_compile_hipport
     elif _naive_active:
@@ -1230,11 +1241,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     grid_nh = N * H
 
     # h hidden-state layout:
-    #   * baseline & VK fork  -> [B, NT, H, V, K] (true VK, K innermost).
+    #   * baseline & mfma16_hip fork -> [B, NT, H, V, K] (true VK, K innermost).
     #   * KV fork (BV==64)    -> [B, NT, H, K, V] (coalesced KV stores); a
     #     transposed VK view is returned below so the public layout stays VK.
-    # ``_kv_active`` was set at the compile-fn selection above; the VK fork
-    # (``_vk_active``) writes the public VK layout directly, no view needed.
+    # ``_kv_active`` was set at the compile-fn selection above; the mfma16_hip
+    # fork (``_mfma16_hip_active``) writes the public VK layout directly, no view needed.
     h_shape = (B, NT, H, K, V) if _kv_needs_transpose else (B, NT, H, V, K)
     vn_shape = (B, H, T_flat, V)
     vn_dtype = u.dtype
@@ -1358,7 +1369,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_kv(
     )
 
 
-def chunk_gated_delta_rule_fwd_h_flydsl_vk(
+def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     k: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
@@ -1374,11 +1385,13 @@ def chunk_gated_delta_rule_fwd_h_flydsl_vk(
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Separate VK-layout K5 implementation (forked from the KV variant;
-    VWARP 16x16x16 + 3-wave). API-identical to
-    ``chunk_gated_delta_rule_fwd_h_flydsl``; the VK kernel is used only when
-    the chosen BV is 64, else it falls back to the baseline. The returned h is
-    the usual VK layout (transposed view)."""
+    """mfma16 / HIP-aligned K5 implementation (formerly the "vk" fork): NON-VWARP
+    only -- uses the 16x16x16 bf16 MFMA and the SAME split-M warp partition (BT
+    split-M, K split across waves, V not split across warps) as the hand-tuned
+    HIP/C++ K5 kernel, writing the public VK layout [..., V, K]. API-identical to
+    ``chunk_gated_delta_rule_fwd_h_flydsl``; the kernel is used only when the
+    chosen BV is 64, else it falls back to the baseline. The returned h is the
+    usual VK layout (transposed view)."""
     return chunk_gated_delta_rule_fwd_h_flydsl(
         k,
         w,
@@ -1394,11 +1407,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl_vk(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
-        _fork="vk",
+        _fork="mfma16_hip",
     )
 
 
-def chunk_gated_delta_rule_fwd_h_flydsl_vk_naive(
+def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_3wave_opt2(
     k: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
@@ -1414,11 +1427,14 @@ def chunk_gated_delta_rule_fwd_h_flydsl_vk_naive(
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """NAIVE (un-pipelined) VK-fork K5 implementation. Same VWARP layout +
-    coalesced VK h-store as ``chunk_gated_delta_rule_fwd_h_flydsl_vk``, but with
-    all prefetch / software-pipeline scheduling removed -- used to baseline the
-    raw bottleneck structure in a trace before re-designing the pipeline. Used
-    only when the chosen BV is 64, else it falls back to the baseline."""
+    """mfma16_3wave_opt2 K5 implementation -- currently an EXACT copy of
+    ``chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1`` (VWARP MFMA
+    16x16x16, HIP-aligned store-overlap), kept as a separate compile/cache
+    namespace so a 3-wave occupancy variant can diverge from the 2-wave line.
+
+    Like 2wave_opt1, ``k`` MUST be passed PRE-TRANSPOSED to ``[B, Hg, K, T_flat]``
+    (K major, T innermost); the output h is the public VK ``[..., V, K]`` layout
+    written directly (no host transpose)."""
     return chunk_gated_delta_rule_fwd_h_flydsl(
         k,
         w,
@@ -1434,7 +1450,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_vk_naive(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
-        _fork="vk_naive",
+        _fork="mfma16_3wave_opt2",
     )
 
 

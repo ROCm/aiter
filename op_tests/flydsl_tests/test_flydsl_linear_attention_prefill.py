@@ -34,8 +34,8 @@ try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         chunk_gated_delta_rule_fwd_h_flydsl,
         chunk_gated_delta_rule_fwd_h_flydsl_kv,
-        chunk_gated_delta_rule_fwd_h_flydsl_vk,
-        chunk_gated_delta_rule_fwd_h_flydsl_vk_naive,
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_3wave_opt2,
         chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1,
         chunk_gated_delta_rule_fwd_h_flydsl_naive,
         chunk_gated_delta_rule_fwd_h_flydsl_naive_opt,
@@ -1012,17 +1012,16 @@ class TestCorrectness:
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_correctness_flydsl_vk(self, args: PrefillArgs):
-        """Separate VK-layout FlyDSL K5 impl (forked from the KV variant;
-        VWARP 16x16x16 + 3-wave). Same VK public outputs as the baseline
-        flydsl path; only the BV==64 configs exercise the VK kernel, others
-        fall back."""
+    def test_correctness_flydsl_mfma16_hip(self, args: PrefillArgs):
+        """mfma16 / HIP-aligned FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
+        MFMA + HIP warp partition. Same VK public outputs as the baseline flydsl
+        path; only the BV==64 configs exercise the kernel, others fall back."""
         context_lens = args.resolve_context_lens()
         k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
             context_lens, args=args
         )
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_vk(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             k,
             w_c,
             u_c,
@@ -1049,22 +1048,24 @@ class TestCorrectness:
             vn_ref,
             fs_ref,
             output_final_state=args.output_final_state,
-            label="flydsl_vk",
+            label="flydsl_mfma16_hip",
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_correctness_flydsl_vk_naive(self, args: PrefillArgs):
-        """Naive (un-pipelined) VK-fork FlyDSL K5 impl (same VWARP layout +
-        coalesced VK h-store as flydsl_vk, all prefetch/pipeline scheduling
-        removed). Same VK public outputs as the baseline flydsl path; only the
-        BV==64 configs exercise the naive VK kernel, others fall back."""
+    def test_correctness_flydsl_mfma16_3wave_opt2(self, args: PrefillArgs):
+        """mfma16_3wave_opt2 fork -- currently an exact copy of mfma16_2wave_opt1
+        (VWARP MFMA 16x16x16, HIP-aligned store-overlap). KV-in fork: k is passed
+        PRE-TRANSPOSED to [B, Hg, K, T]; output is public VK [..., V, K]."""
         context_lens = args.resolve_context_lens()
         k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
             context_lens, args=args
         )
 
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_vk_naive(
-            k,
+        # mfma16_3wave_opt2 consumes k PRE-TRANSPOSED to [B, Hg, K, T] (like
+        # mfma16_2wave_opt1). The reference still takes token-major k.
+        k_kvn = k.permute(0, 2, 3, 1).contiguous()
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_3wave_opt2(
+            k_kvn,
             w_c,
             u_c,
             g=g,
@@ -1090,7 +1091,7 @@ class TestCorrectness:
             vn_ref,
             fs_ref,
             output_final_state=args.output_final_state,
-            label="flydsl_vk_naive",
+            label="flydsl_mfma16_3wave_opt2",
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
@@ -1618,8 +1619,8 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
-    def flydsl_vk_launch():
-        chunk_gated_delta_rule_fwd_h_flydsl_vk(
+    def flydsl_mfma16_hip_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             k=k,
             w=w_c,
             u=u_c,
@@ -1629,9 +1630,9 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
-    def flydsl_vk_naive_launch():
-        chunk_gated_delta_rule_fwd_h_flydsl_vk_naive(
-            k=k,
+    def flydsl_mfma16_3wave_opt2_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_3wave_opt2(
+            k=k_kvn,
             w=w_c,
             u=u_c,
             g=g,
@@ -1745,8 +1746,8 @@ def _run_perf_comparison(args: PrefillArgs):
     # kernel time, not the autotune sweep.
     flydsl_launch()
     flydsl_kv_launch()
-    flydsl_vk_launch()
-    flydsl_vk_naive_launch()
+    flydsl_mfma16_hip_launch()
+    flydsl_mfma16_3wave_opt2_launch()
     flydsl_mfma16_2wave_opt1_launch()
     flydsl_naive_launch()
     flydsl_naive_opt_launch()
@@ -1758,8 +1759,8 @@ def _run_perf_comparison(args: PrefillArgs):
 
     us_fly = _bench_fn(flydsl_launch)
     us_fly_kv = _bench_fn(flydsl_kv_launch)
-    us_fly_vk = _bench_fn(flydsl_vk_launch)
-    us_fly_vk_naive = _bench_fn(flydsl_vk_naive_launch)
+    us_fly_mfma16_hip = _bench_fn(flydsl_mfma16_hip_launch)
+    us_fly_mfma16_3wave_opt2 = _bench_fn(flydsl_mfma16_3wave_opt2_launch)
     us_fly_mfma16_2wave_opt1 = _bench_fn(flydsl_mfma16_2wave_opt1_launch)
     us_fly_naive = _bench_fn(flydsl_naive_launch)
     us_fly_naive_opt = _bench_fn(flydsl_naive_opt_launch)
@@ -1795,8 +1796,8 @@ def _run_perf_comparison(args: PrefillArgs):
             "FlyDSL_vk(us)": us_fly,
             "FlyDSL_kv(us)": us_fly_kv,
             "FlyDSL_mfma16_2wave_opt1(us)": us_fly_mfma16_2wave_opt1,
-            "FlyDSL_vkfork(us)": us_fly_vk,
-            "FlyDSL_vknaive(us)": us_fly_vk_naive,
+            "FlyDSL_mfma16_hip(us)": us_fly_mfma16_hip,
+            "FlyDSL_mfma16_3wave_opt2(us)": us_fly_mfma16_3wave_opt2,
             "FlyDSL_naive(us)": us_fly_naive,
             "FlyDSL_naive_opt(us)": us_fly_naive_opt,
             "Triton_vk(us)": us_triton_vk,
@@ -1911,17 +1912,19 @@ def _print_perf_table():
         ("H", "H", 2),
         ("SeqLen", "SeqLen", 6),
         ("T", "T", 5),
-        ("var", "varlen", 3),
+        ("v", "varlen", 1),
         ("fs", "final_st", 2),
         ("FlyDSL", "FlyDSL_vk(us)", 6),
-        ("fly_naive", "FlyDSL_naive(us)", 9),
-        ("fly_opt", "FlyDSL_mfma16_2wave_opt1(us)", 7),
+        ("naive", "FlyDSL_naive(us)", 6),
+        ("fly_2w", "FlyDSL_mfma16_2wave_opt1(us)", 6),
+        ("fly_3w", "FlyDSL_mfma16_3wave_opt2(us)", 6),
+        ("fly_hip", "FlyDSL_mfma16_hip(us)", 7),
+        ("HIP", "HIP_vk(us)", 6),
         ("Tri_vk", "Triton_vk(us)", 6),
         ("vLLM", "vLLM_vk(us)", 6),
-        ("HIP", "HIP_vk(us)", 6),
         ("fly/vk", "flydsl_vs_vk", 6),
         ("hip/vk", "hip_vs_vk", 6),
-        ("fly_opt/vk", "flydsl_opt_vs_vk", 10),
+        ("2w/vk", "flydsl_opt_vs_vk", 6),
     ]
 
     def _fmt_cell(val, key, width):
@@ -1933,8 +1936,8 @@ def _print_perf_table():
             return (f"{val:.2f}x" if "_vs_" in key else f"{val:.1f}").rjust(width)
         return str(val).rjust(width)
 
-    header = " | ".join(display.rjust(w) for display, _, w in cols)
-    sep = "-+-".join("-" * w for _, _, w in cols)
+    header = "|".join(display.rjust(w) for display, _, w in cols)
+    sep = "+".join("-" * w for _, _, w in cols)
     border = "=" * len(header)
 
     lines = [
@@ -1948,7 +1951,7 @@ def _print_perf_table():
         sep,
     ]
     for row in _perf_results:
-        lines.append(" | ".join(_fmt_cell(row[k], k, w) for _, k, w in cols))
+        lines.append("|".join(_fmt_cell(row[k], k, w) for _, k, w in cols))
     lines.append(sep)
     lines.append("")
     print("\n".join(lines))
