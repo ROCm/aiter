@@ -129,8 +129,7 @@ def gemm_a16w16_(
         ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
         assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
 
-        M, _ = x.shape
-        K = x.stride(0)
+        M, K = x.shape
         N, _ = w.shape
 
         if config is None:
@@ -148,27 +147,28 @@ def gemm_a16w16_(
 
         # The kernels walk K with update_tensor_descriptor(add_offsets=...),
         # which advances the load position without shrinking the descriptor's
-        # OOB bound, so a partial last K-tile would read past the end of K.
-        # Require K to be a multiple of BLOCK_K rather than padding here. (M and
-        # N may be unaligned: their descriptor bounds + store mask zero-fill the
-        # partial tiles.)
-        assert (
-            K % BLOCK_K == 0
-        ), f"K ({K}) must be a multiple of BLOCK_K ({BLOCK_K}) for the gluon a16w16 GEMM"
+        # OOB bound. The final K tile is peeled out of the pipeline loop and
+        # reloaded with set_bounds, so a partial last tile (K not a multiple of
+        # BLOCK_K) is clamped and zero-filled instead of read out of bounds.
+        # Hence K need not be aligned to BLOCK_K. (M and N partial tiles are
+        # likewise handled by the descriptor bounds + store mask.)
 
         # Clamp the software-pipeline depth to the number of K-tiles.
         #
         # The prologue/epilogue walk a fixed number of K-tiles determined by
         # NUM_BUFFERS, independent of how many real tiles exist. If NUM_BUFFERS
         # exceeds that count the pipeline loop counts go negative, so cap the
-        # depth at the real tile count. Variants differ in reach and in the
-        # minimum depth they require:
-        #   bandwidth_bound : reaches num_k_tiles -> cap = num_k_tiles
-        #   compute_bound : preloads one tile ahead (needs num_k_tiles >= NB + 1)
-        #                   -> cap = num_k_tiles - 1
+        # depth at the real tile count. Both variants peel the final K tile out
+        # of the main loop for the bounds-checked tail load, which costs one
+        # extra tile of reach. Variants differ in reach and in the minimum depth
+        # they require:
+        #   bandwidth_bound : peels the last tile (needs num_k_tiles >= NB)
+        #                     -> cap = num_k_tiles
+        #   compute_bound : preloads one tile ahead AND peels the last tile
+        #                   (needs num_k_tiles >= NB + 2) -> cap = num_k_tiles - 2
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
-        _DEPTH_SLACK = {"compute_bound": 1}
+        _DEPTH_SLACK = {"compute_bound": 2}
 
         if kernel_type_from_config is None:
             # Fall back to the bandwidth_bound kernel when the requested variant
@@ -176,7 +176,7 @@ def gemm_a16w16_(
             depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
             if depth_cap < _MIN_BUFFERS[kernel_type]:
                 needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
-                _LOGGER.info(
+                _LOGGER.warning(
                     f"GEMM_A16W16 [gluon/gfx1250]: kernel_type='{kernel_type}' needs "
                     f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
                     f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='bandwidth_bound'."
