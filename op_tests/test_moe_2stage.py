@@ -323,8 +323,25 @@ def test_fmoe(
                 # Keep the torch reference at f32 until the quantization step.
                 stage1_ref_dtype = dtypes.fp32
 
+    # Detect xbf16: when active, the kernel receives BF16 input (not FP8),
+    # so the reference must also use BF16 input for a fair comparison.
+    ref_xbf16 = False
+    if qType == aiter.QuantType.per_128x128:
+        _metadata = get_2stage_cfgs(
+            get_padded_M(token), model_dim, inter_dim, E, topk, dtype,
+            AQDType, WQDType, qType, use_g1u1, actType, doweight_stage1,
+            hidden_pad, intermediate_pad,
+            getattr(w1_qt_aiter, "is_shuffled", False)
+            or getattr(w2_qt_aiter, "is_shuffled", False),
+            gateMode,
+        )
+        ref_xbf16 = getattr(_metadata, "xbf16", False)
+
+    ref_a1 = input if ref_xbf16 else a1_qt
+    ref_a1_scale = None if ref_xbf16 else a1_scale
+
     out1_ref = torch_moe_stage1(
-        a1_qt,
+        ref_a1,
         w1_qt,
         w2_qt,
         topk_weights,
@@ -332,7 +349,7 @@ def test_fmoe(
         dtype=stage1_ref_dtype,
         activation=actType,
         quant_type=qType,
-        a1_scale=a1_scale,
+        a1_scale=ref_a1_scale,
         w1_scale=w1_scale,
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
