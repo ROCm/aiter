@@ -639,22 +639,26 @@ def compile_wd_moe_down_reduce(
     topk: int,
     k_vector: int = 8,
     use_dot2: bool = False,
+    h_per_warp: int = 1,
 ):
     """Compile warp-decode down_reduce and return a @flyc.jit launch wrapper.
 
-    One wavefront (64 lanes) per output channel Y[token_b, out_j].
+    One wavefront (64 lanes) per h_per_warp output channel(s) of Y[token_b, :].
     Contracts over INTER (inner) then TOPK (expert slots, outer).
     Epilogue: FP32 atomic-add into y_out (caller must zero-init y_out).
 
     Parameters
     ----------
-    hidden   : HIDDEN dimension (output size, e.g. 7168 for DeepSeek-V3).
-    inter    : INTER dimension (contraction axis, e.g. 2048).
-    experts  : E, number of experts.
-    topk     : top-K experts per token (compile-time; enables range_constexpr).
-    k_vector : BF16 elements per lane per K-step (default 8).
-    use_dot2 : if True, use v_dot2_f32_bf16 (gfx950 only);
-               if False, use FP32 scalar path (gfx942 + gfx950).
+    hidden      : HIDDEN dimension (output size).
+    inter       : INTER dimension (contraction axis).
+    experts     : E, number of experts.
+    topk        : top-K experts per token (compile-time).
+    k_vector    : BF16 elements per lane per K-step (default 8).
+    use_dot2    : if True, use v_dot2_f32_bf16 (gfx950 only).
+    h_per_warp  : output channels per wave (1 or 2).  h_per_warp=2 (H2 layout)
+                  computes two adjacent channels (out_j, out_j+1) per wave,
+                  reusing the same inter[slot] loads for both W_down rows.
+                  Grid becomes B × HIDDEN/h_per_warp.  Must divide hidden evenly.
 
     Launch signature:
         exe(_ptr(y_out), _ptr(inter_states), _ptr(w_down), _ptr(router_ids),
@@ -677,11 +681,16 @@ def compile_wd_moe_down_reduce(
             f"inter={inter} must be divisible by WAVE_SIZE*k_vector"
             f"={_WAVE_SIZE * k_vector}"
         )
+    if h_per_warp not in (1, 2):
+        raise ValueError(f"h_per_warp must be 1 or 2, got {h_per_warp}")
+    if hidden % h_per_warp != 0:
+        raise ValueError(
+            f"hidden={hidden} must be divisible by h_per_warp={h_per_warp}"
+        )
 
     dot2_tag = "_dot2" if use_dot2 else "_f32"
-    module_name = (
-        f"wd_down_h{hidden}_i{inter}_e{experts}_topk{topk}_kv{k_vector}{dot2_tag}"
-    )
+    h2_tag = "_h2" if h_per_warp == 2 else ""
+    module_name = f"wd_down_h{hidden}_i{inter}_e{experts}_topk{topk}_kv{k_vector}{dot2_tag}{h2_tag}"
 
     _k_pairs = k_vector // 2
     _k_step = _WAVE_SIZE * k_vector  # INTER elements per loop iteration
@@ -726,20 +735,20 @@ def compile_wd_moe_down_reduce(
         y_rsrc = _rsrc(arg_y_out, arith.constant(-1, type=i32))
         # w_down: per-row resources built per slot below (E*HIDDEN*INTER can exceed i32)
 
-        # ── Block → (out_j, token_b) ─────────────────────────────────────────
+        # ── Block → (out_j_0, [out_j_1], token_b) ───────────────────────────
+        # h_per_warp=1: each block handles one output channel out_j.
+        #   grid = B × HIDDEN;  out_j = block_id % HIDDEN
+        # h_per_warp=2 (H2): each block handles two adjacent channels.
+        #   grid = B × (HIDDEN/2);  out_j_0 = (block_id % (HIDDEN/2)) * 2
+        #   Reuses the same inter[slot] activation loads for both W_down rows.
         lane_i32 = arith.index_cast(i32, gpu.thread_id("x"))
         blk_i32 = arith.index_cast(i32, gpu.block_id("x"))
 
-        out_j = arith.remui(blk_i32, HIDDEN_i32)
-        token_b = arith.divui(blk_i32, HIDDEN_i32)
+        HIDDEN_blocks = arith.constant(hidden // h_per_warp, type=i32)
+        blk_in_token = arith.remui(blk_i32, HIDDEN_blocks)
+        token_b = arith.divui(blk_i32, HIDDEN_blocks)
+        out_j_0 = blk_in_token * arith.constant(h_per_warp, type=i32)
 
-        # ── Outer loop: TOPK slots ────────────────────────────────────────────
-        # Each slot: router_wt * sum_over_INTER(inter[slot] · W_down[expert, out_j])
-        # Accumulate weighted slot sums into total_acc.
-        # Both the k-step loop (over INTER) and the pair loop are compile-time
-        # unrolled with range_constexpr to keep everything in one flat basic block
-        # per slot — this avoids v_dot2_f32_bf16 write latency crossing loop
-        # back-edges and the resulting correctness hazard.
         lane_kV = lane_i32 * arith.constant(k_vector, type=i32)
         c_two = arith.constant(2, type=i32)
         zero_f32 = arith.constant(0.0, type=f32)
@@ -747,19 +756,24 @@ def compile_wd_moe_down_reduce(
 
         HIDDEN_i64 = arith.extsi(i64, HIDDEN_i32)
         INTER_i64 = arith.extsi(i64, INTER_i32)
-        out_j_i64 = arith.extsi(i64, out_j)
+        out_j0_i64 = arith.extsi(i64, out_j_0)
         row_nb = INTER_i32 * arith.constant(2, type=i32)
 
-        # Outer for: slot = 0..TOPK  (carries total_acc as f32)
+        # Outer for: slot = 0..TOPK
+        # Carries: [total_acc_0] for h_per_warp=1,
+        #          [total_acc_0, total_acc_1] for h_per_warp=2.
+        n_accs = h_per_warp
+        initial_accs = [zero_f32] * n_accs
+
         outer_for = scf.ForOp(
             arith.constant(0, index=True),
             arith.index_cast(ir.IndexType.get(), TOPK_i32),
             arith.constant(1, index=True),
-            iter_args=[zero_f32],
+            iter_args=initial_accs,
         )
         with ir.InsertionPoint(outer_for.body):
             slot_idx = arith.index_cast(i32, outer_for.induction_variable)
-            total_acc = outer_for.inner_iter_args[0]
+            accs = list(outer_for.inner_iter_args)
 
             flat_slot = token_b * TOPK_i32 + slot_idx
             expert_e = buffer_ops.buffer_load(
@@ -768,71 +782,82 @@ def compile_wd_moe_down_reduce(
             router_wt = buffer_ops.buffer_load(
                 rwt_rsrc, flat_slot, vec_width=1, dtype=f32
             )
-
-            # Per-row w_down resource (i64 to avoid i32 overflow for large shapes).
-            # DeepSeek-V3: (255*7168+7167)*2048*2 = 3.75 GB > INT32_MAX.
             expert_i64 = arith.extsi(i64, expert_e)
-            w_row_byte_off = (
-                (expert_i64 * HIDDEN_i64 + out_j_i64)
-                * INTER_i64
-                * arith.constant(2, type=i64)
-            )
-            w_base = arith.addi(
-                arith.index_cast(i64, fx.ptrtoint(arg_w_down)), w_row_byte_off
-            )
-            w_row_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                w_base, num_records_bytes=row_nb
-            )
 
-            inter_row_base = flat_slot * INTER_i32  # bf16 element offset
+            # Build per-row w_down resources for each output channel this wave owns.
+            w_row_rsrcs: list = []
+            for h in range_constexpr(h_per_warp):
+                out_jh_i64 = arith.addi(out_j0_i64, arith.constant(h, type=i64))
+                w_row_byte_off = (
+                    (expert_i64 * HIDDEN_i64 + out_jh_i64)
+                    * INTER_i64
+                    * arith.constant(2, type=i64)
+                )
+                w_base = arith.addi(
+                    arith.index_cast(i64, fx.ptrtoint(arg_w_down)), w_row_byte_off
+                )
+                w_row_rsrcs.append(
+                    buffer_ops.create_buffer_resource_from_addr(
+                        w_base, num_records_bytes=row_nb
+                    )
+                )
 
-            # Both loops compile-time unrolled: no loop-carried dot2 hazards.
-            cur = zero_f32
+            inter_row_base = flat_slot * INTER_i32
+
+            # Inner loops compile-time unrolled for each output channel.
+            # x loads are shared across all h_per_warp channels; only w loads differ.
+            curs: list = [zero_f32] * h_per_warp
             for k_step in range_constexpr(_n_k_steps):
                 k_base_c = arith.constant(k_step * _k_step, type=i32)
                 lane_k = k_base_c + lane_kV
                 for p in range_constexpr(_k_pairs):
                     p2 = arith.constant(p * 2, type=i32)
                     x_off = (inter_row_base + lane_k + p2) // c_two
-                    w_off = (lane_k + p2) // c_two
                     x_word = buffer_ops.buffer_load(
                         inter_rsrc, x_off, vec_width=1, dtype=i32
                     )
-                    w_word = buffer_ops.buffer_load(
-                        w_row_rsrc, w_off, vec_width=1, dtype=i32
-                    )
-                    if use_dot2:
-                        cur = _dot2_dep(cur, x_word, w_word)
-                    else:
-                        x0 = _bf16_pair_to_f32(x_word, 0)
-                        x1 = _bf16_pair_to_f32(x_word, 1)
-                        cur = arith.addf(
-                            cur,
-                            arith.addf(
-                                arith.mulf(x0, _bf16_pair_to_f32(w_word, 0)),
-                                arith.mulf(x1, _bf16_pair_to_f32(w_word, 1)),
-                            ),
+                    for h in range_constexpr(h_per_warp):
+                        w_off = (lane_k + p2) // c_two
+                        w_word = buffer_ops.buffer_load(
+                            w_row_rsrcs[h], w_off, vec_width=1, dtype=i32
                         )
+                        if use_dot2:
+                            curs[h] = _dot2_dep(curs[h], x_word, w_word)
+                        else:
+                            x0 = _bf16_pair_to_f32(x_word, 0)
+                            x1 = _bf16_pair_to_f32(x_word, 1)
+                            curs[h] = arith.addf(
+                                curs[h],
+                                arith.addf(
+                                    arith.mulf(x0, _bf16_pair_to_f32(w_word, 0)),
+                                    arith.mulf(x1, _bf16_pair_to_f32(w_word, 1)),
+                                ),
+                            )
 
-            new_total = arith.addf(total_acc, arith.mulf(router_wt, cur))
-            scf.YieldOp([new_total])
+            new_accs = [
+                arith.addf(accs[h], arith.mulf(router_wt, curs[h]))
+                for h in range(h_per_warp)
+            ]
+            scf.YieldOp(new_accs)
 
-        total_sum_all_lanes = _butterfly_reduce(outer_for.results[0])
+        # ── Epilogue: butterfly reduce then lane-0 atomic-add ────────────────
+        # _butterfly_reduce uses gpu.shuffle XOR — ALL 64 lanes must execute it.
+        # It must be OUTSIDE the lane_zero if_op.
+        totals = [_butterfly_reduce(outer_for.results[h]) for h in range(h_per_warp)]
 
-        # ── Epilogue: lane 0 atomic-adds FP32 result into y_out ──────────────
         lane_zero = arith.cmpi(CmpIPredicate.eq, lane_i32, arith.constant(0, type=i32))
         if_op = scf.IfOp(lane_zero)
         with ir.InsertionPoint(if_op.then_block):
-            # y_out element offset (f32 = 4 bytes): token_b * HIDDEN + out_j
-            out_elem_i32 = token_b * HIDDEN_i32 + out_j  # element index
-            # raw_ptr_buffer_atomic_fadd: atomically y_out[out_elem] += total
-            rocdl.raw_ptr_buffer_atomic_fadd(
-                total_sum_all_lanes,
-                y_rsrc,
-                out_elem_i32 * arith.constant(4, type=i32),  # byte offset
-                zero_i32,
-                zero_i32,
-            )
+            for h in range_constexpr(h_per_warp):
+                out_j_h = arith.addi(out_j_0, arith.constant(h, type=i32))
+                out_elem_i32 = token_b * HIDDEN_i32 + out_j_h
+                rocdl.raw_ptr_buffer_atomic_fadd(
+                    totals[h],
+                    y_rsrc,
+                    out_elem_i32 * arith.constant(4, type=i32),
+                    zero_i32,
+                    zero_i32,
+                )
             scf.YieldOp([])
 
     # ── @flyc.jit launch wrapper ──────────────────────────────────────────────
@@ -853,9 +878,11 @@ def compile_wd_moe_down_reduce(
         stream: fx.Stream,
     ):
         idx = ir.IndexType.get()
-        # Grid: B * HIDDEN blocks (one wave per output channel)
-        grid_x = arith.index_cast(idx, i32_B.ir_value()) * arith.index_cast(
-            idx, i32_HIDDEN.ir_value()
+        # Grid: B × (HIDDEN / h_per_warp) blocks
+        grid_x = (
+            arith.index_cast(idx, i32_B.ir_value())
+            * arith.index_cast(idx, i32_HIDDEN.ir_value())
+            // arith.constant(h_per_warp, index=True)
         )
         _dk(
             arg_y_out,
