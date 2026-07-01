@@ -14,11 +14,11 @@ torch.manual_seed(42)
 
 # GLM5.2-FP8 params
 token = 1
-# Test: large E to check uint32 stride overflow
+# GLM5.2-FP8 params
 d_model = 6144
 d_ff = 2048
 experts = 256
-topk = 2
+topk = 8
 blk_n, blk_k = 128, 128
 
 print(f"=== Flat kernel debug test ===")
