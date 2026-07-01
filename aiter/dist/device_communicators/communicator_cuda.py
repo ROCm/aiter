@@ -465,7 +465,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and ca_comm.should_custom_rs(input_)
         ):
             ca_comm.custom_reduce_scatter(input_, output_)
         else:
