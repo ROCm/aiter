@@ -1,0 +1,5 @@
+tile_m,tile_n,b_intype,a_preshuffle,cluster_x,cluster_y,persistent,wg_max,knl_name,co_name
+256,256,0,1,4,4,1,256,_ZN5aiter48f8gemm_bf16_mxfp8fp8_ABpreShuffle_256x256_4x4_psE,f8gemm_bf16_mxfp8fp8_ABpreShuffle_256x256_4x4_ps.co
+64,512,0,1,4,1,1,256,_ZN5aiter47f8gemm_bf16_mxfp8fp8_ABpreShuffle_64x512_4x1_psE,f8gemm_bf16_mxfp8fp8_ABpreShuffle_64x512_4x1_ps.co
+256,256,1,1,4,4,1,256,_ZN5aiter48f8gemm_bf16_mxfp8fp4_ABpreShuffle_256x256_4x4_psE,f8gemm_bf16_mxfp8fp4_ABpreShuffle_256x256_4x4_ps.co
+64,512,1,1,4,1,1,256,_ZN5aiter47f8gemm_bf16_mxfp8fp4_ABpreShuffle_64x512_4x1_psE,f8gemm_bf16_mxfp8fp4_ABpreShuffle_64x512_4x1_ps.co
