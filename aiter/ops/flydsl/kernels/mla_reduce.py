@@ -40,6 +40,8 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr.typing import T
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf, math as mlir_math, gpu as mlir_gpu
+from flydsl._mlir.dialects import llvm as llvm_dialect
+from flydsl.expr import rocdl
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.runtime.device import get_rocm_arch
 
@@ -291,10 +293,30 @@ def compile_mla_reduce(
         g_fo = GTensor(final_output, dtype=out_t, shape=(-1,))
         g_flse = GTensor(final_lse, dtype=T.f32, shape=(-1,))
 
+        _glb_ptr_ty = ir.Type.parse("!llvm.ptr<1>")
+
+        def _scalar_indptr(idx):
+            """Uniform ``reduce_indptr[idx]`` as a scalar SGPR value.
+
+            Mirrors HIP ``__builtin_amdgcn_readfirstlane(p_reduce_indptr[tile])``
+            (reduce.cu:688). Uses a raw pointer deref + readfirstlane rather than
+            the GTensor buffer_load path: a ``buffer_load`` is inherently a vector
+            memory op (voffset addressing) and never lowers to ``s_load_dword``,
+            so wrapping it in readfirstlane leaves the vector load + lgkmcnt(0)
+            floor stall in place. A raw ``llvm.load`` from the uniform address is
+            scalarizable, so the sentinel becomes an ``s_load_dword``.
+            """
+            idx_index = fx.arith.index_cast(T.index, _to_raw(idx))
+            byte_off = fx.arith.muli(
+                idx_index, fx.arith.constant(4, index=True)
+            )
+            addr_i64 = g_indptr.get_llvm_ptr(reduce_indptr, byte_off)
+            addr_ptr = llvm_dialect.inttoptr(_glb_ptr_ty, _to_raw(addr_i64))
+            val = llvm_dialect.load(T.i32, addr_ptr)
+            return fx.Int32(rocdl.readfirstlane(T.i32, val))
+
         c_H = fx.Int32(H)
-        last = fx.Int32(
-            g_indptr[fx.arith.index_cast(T.index, _to_raw(num_reduce_tile))]
-        )
+        last = _scalar_indptr(_to_raw(num_reduce_tile))
 
         base = allocator.get_base()
         lds_pmap = STensor(
@@ -826,7 +848,9 @@ def compile_mla_reduce(
                 block_idx = temp_idx % num_thread_group
                 tile = temp_idx // num_thread_group
 
-                tile_start = fx.Int32(g_indptr[tile])
+                # Uniform sentinel -> scalar s_load_dword (reduce.cu:688), not a
+                # per-lane buffer_load + s_waitcnt lgkmcnt(0) (the traversal floor).
+                tile_start = _scalar_indptr(tile)
                 is_past_end = fx.arith.cmpi(
                     fx.arith.CmpIPredicate.eq, tile_start, last
                 )
