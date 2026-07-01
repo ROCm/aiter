@@ -131,8 +131,10 @@ def fused_compress_attn(
 
     # Master quant selector; `quant`/`group_quant` bools are legacy fallbacks.
     #   none | fp8/per_row_fp8 (per-row) | group_fp8 (nm-asm) | fp4
-    mode = quant_mode if quant_mode is not None else (
-        "group_fp8" if group_quant else ("fp8" if quant else "none")
+    mode = (
+        quant_mode
+        if quant_mode is not None
+        else ("group_fp8" if group_quant else ("fp8" if quant else "none"))
     )
     if mode == "per_row_fp8":
         mode = "fp8"

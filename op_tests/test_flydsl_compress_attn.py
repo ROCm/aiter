@@ -327,9 +327,7 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
 
         k_dq = mxfp4_to_f32(inp["kv_cache"].reshape(-1, 16)) * (
             2.0
-            ** (
-                inp["cache_scale"].reshape(-1).to(torch.int32)[:, None].float() - 127.0
-            )
+            ** (inp["cache_scale"].reshape(-1).to(torch.int32)[:, None].float() - 127.0)
         )
         r_dq = mxfp4_to_f32(ref_inp["kv_cache"].reshape(-1, 16)) * (
             2.0

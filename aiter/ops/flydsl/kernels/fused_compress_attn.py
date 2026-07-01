@@ -90,7 +90,10 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from .tensor_shim import STensor, _to_raw, _run_compiled
 from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
-from aiter.utility.mx_types import MxDtypeInt as _MxDtypeInt, MxScaleRoundModeInt as _MxRoundInt
+from aiter.utility.mx_types import (
+    MxDtypeInt as _MxDtypeInt,
+    MxScaleRoundModeInt as _MxRoundInt,
+)
 
 # Shared FP8 group_fp8 (V4 nm-asm) scatter emitter (single source of truth across
 # the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
@@ -1300,9 +1303,7 @@ def _build_kernel(
                         kv_cache, max_size=True
                     )
                     # packed byte index within the row = (tid*VEC) / 2.
-                    packed_start = ArithValue(tid_x_vec) >> arith.constant(
-                        1, type=i32
-                    )
+                    packed_start = ArithValue(tid_x_vec) >> arith.constant(1, type=i32)
                     # flat paged slot (for the linear fallback).
                     flat_slot = ArithValue(physical_block) * arith.constant(
                         k_per_block, type=i32
@@ -2661,7 +2662,9 @@ def flydsl_fused_compress_attn(
     #   "per_row_fp8" -> FP8 e4m3 per-row scale (indexer)        [alias "fp8"]
     #   "group_fp8"   -> FP8 1xG group scale (CSA/HCA Main nm-asm)
     #   "fp4"         -> FP4 (E2M1) per-group(32) e8m0 scale
-    _mode = quant_mode if quant_mode is not None else ("per_row_fp8" if quant else "none")
+    _mode = (
+        quant_mode if quant_mode is not None else ("per_row_fp8" if quant else "none")
+    )
     if _mode == "fp8":
         _mode = "per_row_fp8"  # back-compat alias
     if _mode not in ("none", "per_row_fp8", "group_fp8", "fp4"):
@@ -2799,7 +2802,9 @@ def flydsl_fused_compress_attn(
                 or cache_scale.dim() != 2
                 or cache_scale.shape[0] != kv_cache.shape[0]
             ):
-                raise ValueError("fp8 quant requires fp32 [NB, k_per_block] cache_scale")
+                raise ValueError(
+                    "fp8 quant requires fp32 [NB, k_per_block] cache_scale"
+                )
             if preshuffle:
                 if head_dim % _PRESHUFFLE_TILE != 0:
                     raise ValueError(
