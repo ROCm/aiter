@@ -117,7 +117,7 @@ def compile_gemm2_a4w4_port(
     _aStages = kStages if _K_TILES_TOTAL <= kStages else 3
     _acc_rows = min(BM, 64) if epilog == "nonatomic_cshuffle" else BM
     _lds_bytes = (
-        max(lds_acc_bytes_for(_acc_rows, BN), _aStages * _slot_bytes)
+        lds_acc_bytes_for(_acc_rows, BN) + _aStages * _slot_bytes
         if epilog != "nonatomic"
         else _aStages * _slot_bytes
     )
@@ -401,7 +401,12 @@ def _gemm2_body(
     lds_base = allocator.get_base()
     saq = SmemPtr(lds_base, lds_off, T.i8, shape=(_aStages * _slot_bytes,))
     lds_acc = (
-        SmemPtr(lds_base, lds_off, T.f32, shape=(_lds_acc_floats,))
+        SmemPtr(
+            lds_base,
+            lds_off + _aStages * _slot_bytes,
+            T.f32,
+            shape=(_lds_acc_floats,),
+        )
         if epilog != "nonatomic"
         else None
     )
@@ -682,7 +687,6 @@ def _cshuffle_flat_bf16_epilog(
     col_start = n_lane * fx.Int32(2)
     out_base = _global_base_ptr1(arg_out)
 
-    gpu.barrier()
     for i in range_constexpr(_iC):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
         for J in range_constexpr(4):
@@ -842,8 +846,6 @@ def _atomic_bf16_epilog(
                 T.f32, _gep1(sweights_base, sorted_pos * fx.Int32(4)), invariant=True
             )
         )
-
-    gpu.barrier()
 
     for i in range_constexpr(_kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
