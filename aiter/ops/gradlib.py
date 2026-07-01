@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from typing import Optional
@@ -24,6 +24,7 @@ def gen_hipb_mm_fake_tensor(
     scaleB: Optional[torch.Tensor] = None,
     scaleOut: Optional[torch.Tensor] = None,
     bpreshuffle: Optional[bool] = None,
+    use_gelu: Optional[bool] = None,
 ):
     mat1_sizes = mat1.size()
     mat2_sizes = mat2.size()
@@ -47,6 +48,7 @@ def hipb_mm(
     scaleB: Optional[torch.Tensor] = None,
     scaleOut: Optional[torch.Tensor] = None,
     bpreshuffle: Optional[bool] = None,
+    use_gelu: Optional[bool] = None,
 ) -> torch.Tensor: ...
 
 
@@ -60,6 +62,7 @@ def hipb_findallsols(
     scaleB: Optional[torch.Tensor] = None,
     scaleC: Optional[torch.Tensor] = None,
     bpreshuffle: bool = False,
+    use_gelu: bool = False,
 ) -> list[int]: ...
 
 

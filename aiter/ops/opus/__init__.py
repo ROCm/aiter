@@ -10,7 +10,7 @@ two callables become stubs that raise RuntimeError on invocation, so
 
 from ._arch import _detect_arch
 
-_SUPPORTED = {"gfx950", "gfx942"}
+_SUPPORTED = {"gfx950", "gfx942", "gfx1250"}
 _FEATURE = "aiter.ops.opus (a16w16)"
 _HINT = (
     "opus_gemm supports gfx950 (MFMA 16x16x32 / ds_read_b64_tr / 160 KiB "
