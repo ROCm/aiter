@@ -174,7 +174,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # K_out cols x 4. NOTE: HIP's exact rotating-pair bank-swizzle is a
     # micro-opt and is NOT bit-replicated; the K-major panel + plain b64
     # fragment read match HIP's access pattern (K-major, no HW transpose).
-    LDS_KP_PANEL_ELEMS = (BT // 4) * 64 * 4  # = 64 * BT per 64-K block
+    # k K-major shared2 panel row stride = 64 (K_out cols), no padding -- matches
+    # HIP's compact k_panel0[64*BT]. (A padded stride was tried to break the
+    # GEMM2 k-read bank conflict but a trace showed the bank conflict is NOT the
+    # bottleneck -- the LDS stall is dominated by op count/scheduling -- so the
+    # pad was reverted.)
+    LDS_KP_ROW_STRIDE = 64
+    LDS_KP_PANEL_ELEMS = (BT // 4) * LDS_KP_ROW_STRIDE * 4
     LDS_KP_ELEMS = NUM_K_BLOCKS * LDS_KP_PANEL_ELEMS
     LDS_KP_BYTES = LDS_KP_ELEMS * 2
 
@@ -204,7 +210,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 106  # HIP-ALIGN 2b/3: GEMM2 k K-major shared2 panel + gated_v shared2 (load_shared2, no ds_read_tr16) (rev105 was tr16 GEMM2)
+    _K5_KERNEL_REVISION = 110  # LDS-eff: lds_ht transpose-buffer store 4x scalar -> 1 b64 (cut ds_write op count)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -542,17 +548,20 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         4,
                     )
 
-                    # HIP-ALIGN 1a: [V][K] transpose buffer for the b128 store
-                    # (V = hp_col, K = k_tile_base + lane_m_base*4 + elem_i).
-                    for elem_i in range_constexpr(4):
-                        bf16_val = acc_val[elem_i].to(fx.BFloat16)
-                        ht_k = (
-                            k_tile_base
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        lds_ht_idx = hp_col * fx.Int32(LDS_HT_STRIDE) + ht_k
-                        lds_ht[fx.Index(lds_ht_idx)] = bf16_val
+                    # HIP-ALIGN 1a: [V][K] transpose buffer for the b128 store.
+                    # The 4 elem_i are 4 consecutive K (k_tile_base+lm*4+[0..3])
+                    # so write them as ONE b64 (ds_write_b64) instead of 4 scalar
+                    # ds_write_b16 -- cuts the transpose-buffer store op count 4x.
+                    ht_base_idx = (
+                        hp_col * fx.Int32(LDS_HT_STRIDE)
+                        + k_tile_base
+                        + lane_m_base * fx.Int32(4)
+                    )
+                    lds_ht.vec_store(
+                        (fx.Index(ht_base_idx),),
+                        acc_val.truncf(T.vec(4, T.bf16)),
+                        4,
+                    )
 
             gpu.barrier()
 
@@ -968,7 +977,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     kvec = k_prefetch[kb * NUM_LOAD_BATCHES_64 + batch]
                     cell0 = (
                         kp_pbase
-                        + (bt_group * fx.Int32(64) + load_col_base) * fx.Int32(4)
+                        + (bt_group * fx.Int32(LDS_KP_ROW_STRIDE) + load_col_base)
+                        * fx.Int32(4)
                         + t_slot
                     )
                     for i in range_constexpr(LOAD_VEC_WIDTH):
@@ -1031,10 +1041,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     k_rb_lo = fx.Int32((bt_s * WMMA_K) >> 2) + lane_m_base
                     k_rb_hi = fx.Int32(((bt_s * WMMA_K) + 16) >> 2) + lane_m_base
                     k_a_lo = _lds_read_kp_bf16x4(
-                        kp_pbase + (k_rb_lo * fx.Int32(64) + k_col) * fx.Int32(4)
+                        kp_pbase
+                        + (k_rb_lo * fx.Int32(LDS_KP_ROW_STRIDE) + k_col) * fx.Int32(4)
                     )
                     k_a_hi = _lds_read_kp_bf16x4(
-                        kp_pbase + (k_rb_hi * fx.Int32(64) + k_col) * fx.Int32(4)
+                        kp_pbase
+                        + (k_rb_hi * fx.Int32(LDS_KP_ROW_STRIDE) + k_col) * fx.Int32(4)
                     )
 
                     for nr in range_constexpr(N_REPEAT):
