@@ -9,6 +9,7 @@
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
+#include <vector>
 
 template <int32_t kSizeDV_, int32_t kNumHeadQ_, int32_t kNumThreadGroupPerBh_>
 struct MlaReduceKernelV1Traits
@@ -944,15 +945,6 @@ __device__ __forceinline__ void buf_load_dwordx(int (&bits)[VEC], __amdgpu_buffe
     }
 }
 
-static inline bool mla_fast_reduce_enabled()
-{
-    static const bool enabled = []() {
-        const char* s = getenv("AITER_MLA_FAST_REDUCE");
-        return !(s && s[0] == '0');
-    }();
-    return enabled;
-}
-
 template <typename Traits, int MAX_SPLITS, int BATCH, typename out_t>
 __global__ void __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy)
 kn_mla_reduce_v1_fast(
@@ -987,9 +979,22 @@ kn_mla_reduce_v1_fast(
     const int nsplits = end - base;
     if (nsplits < 2) return;   // nosplit tiles already written to o by stage1
 
-    // uniform decode: output row == tile index (== reduce_final_map[tile].q_start).
-    const int out_row = reduce_tile;
-    const int pbase   = base;
+    // Two invariants let the fast path drop both metadata indirections the
+    // general kernel performs (reduce_final_map for the output row,
+    // reduce_partial_map for each pool row). Both hold ONLY under uniform
+    // decode (max_seqlen_q==1), which is exactly what fast_eligible gates on;
+    // they are established by the decode metadata builder and are asserted
+    // host-side under ASM_DEBUG in mla_reduce_v1() below.
+    //
+    // (A) output row == tile index == reduce_final_map[tile].q_start.
+    //     Source: decode_update_mla_metadata_v1_kernel (aiter/ops/attention.py),
+    //     q_len==1 branch stores q_start = batch_id = tile_idx (and q_end = q_start+1).
+    // (B) the tile's pool rows are the contiguous identity range [base,end):
+    //     reduce_partial_map[base+k] == base+k for k in [0,nsplits).
+    //     Source: the decode planner allocates the partial pool as a contiguous
+    //     arange, so the map is identity and (base+k) indexes the pool directly.
+    const int out_row = reduce_tile;   // invariant (A)
+    const int pbase   = base;          // invariant (B): pool row == base + k
 
     const auto LSE = opus::make_buffer_rsrc(
         partial_lse, (uint32_t)((size_t)P * H * (int)sizeof(float)));
@@ -1359,12 +1364,53 @@ void mla_reduce_v1(
         params.num_reduce_tile      = num_reduce_tile;
         params.output_lse           = output_lse;
         params.use_reduce_final_map = !no_reduce_final_map;
-        params.fast_eligible        = mla_fast_reduce_enabled() &&
-                                      (max_seqlen_q == 1 && !output_lse && !no_reduce_final_map);
+        params.fast_eligible        = (max_seqlen_q == 1 && !output_lse && !no_reduce_final_map);
         params.pool_size            = (int32_t)partial_output.size(0);
         params.active_num_reduce_tile =
             params.fast_eligible ? min(num_reduce_tile, (int32_t)final_output.size(-3))
                                  : num_reduce_tile;
+
+#ifdef ASM_DEBUG
+        // Host-side verification of the two uniform-decode
+        // invariants kn_mla_reduce_v1_fast relies on. Copies the metadata maps
+        // back to host and asserts them so a future change to the decode
+        // metadata builder that breaks either invariant will fail.
+        if(params.fast_eligible)
+        {
+            const int32_t n_tiles = params.active_num_reduce_tile;
+            std::vector<int32_t> indptr(num_reduce_tile + 1);
+            std::vector<MlaPartialTileInfo> final_map(num_reduce_tile);
+            std::vector<int32_t> partial_map(reduce_partial_map.numel());
+            HIP_CALL(hipStreamSynchronize(stream));
+            HIP_CALL(hipMemcpy(indptr.data(), params.p_reduce_indptr,
+                               indptr.size() * sizeof(int32_t), hipMemcpyDeviceToHost));
+            HIP_CALL(hipMemcpy(final_map.data(), params.p_reduce_final_map,
+                               final_map.size() * sizeof(MlaPartialTileInfo),
+                               hipMemcpyDeviceToHost));
+            HIP_CALL(hipMemcpy(partial_map.data(), params.p_reduce_partial_map,
+                               partial_map.size() * sizeof(int32_t), hipMemcpyDeviceToHost));
+            for(int32_t t = 0; t < n_tiles; ++t)
+            {
+                const int32_t base    = indptr[t];
+                const int32_t nsplits = indptr[t + 1] - base;
+                if(nsplits < 2)
+                    continue; // nosplit tile: fast kernel skips it (stage1 wrote o)
+                // invariant (A): output row == tile == reduce_final_map[tile].q_start
+                TORCH_CHECK(final_map[t].q_start == t && final_map[t].q_end == t + 1,
+                            "mla_reduce_v1 fast path invariant (A) violated at tile ", t,
+                            ": reduce_final_map=[", final_map[t].q_start, ",",
+                            final_map[t].q_end, "], expected [", t, ",", t + 1, "]");
+                // invariant (B): pool rows are the contiguous identity range [base,end)
+                for(int32_t k = 0; k < nsplits; ++k)
+                {
+                    TORCH_CHECK(partial_map[base + k] == base + k,
+                                "mla_reduce_v1 fast path invariant (B) violated at tile ", t,
+                                " split ", k, ": reduce_partial_map[", base + k, "]=",
+                                partial_map[base + k], ", expected ", base + k);
+                }
+            }
+        }
+#endif
 
         DISPATCH_MLA_REDUCE_KERNEL(output_lse ? final_lse.value().scalar_type()
                                               : at::ScalarType::Float,
