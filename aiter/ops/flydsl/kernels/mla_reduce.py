@@ -369,9 +369,14 @@ def compile_mla_reduce(
             seq0 = q_start + fx.Int32(block_idx)
             ub_seq = has_work.select(q_end, seq0)
 
-            def gather_row(split_i32, local_seq):
-                pmap = fx.Int32(lds_pmap[fx.Index(split_i32)])
-                row_i32 = pmap + local_seq
+            def row_from_pmap(pmap_i32, local_seq):
+                """Bounds-guarded row index from an already-loaded pmap value.
+
+                Shared by the scalar gather_row (LDS read per split) and the
+                vectorized group loader (one ds_read_b128 per group), so both
+                paths apply the identical clamp/mask.
+                """
+                row_i32 = pmap_i32 + local_seq
                 if fx.const_expr(not disable_guards):
                     in_bounds = fx.arith.andi(
                         fx.arith.cmpi(
@@ -393,6 +398,10 @@ def compile_mla_reduce(
                     ir.IndexType.get(), _to_raw(safe_row_i32)
                 )
                 return row_idx, in_bounds
+
+            def gather_row(split_i32, local_seq):
+                pmap = fx.Int32(lds_pmap[fx.Index(split_i32)])
+                return row_from_pmap(pmap, local_seq)
 
             def load_split_o(split_i32, local_seq):
                 row_idx, in_bounds = gather_row(split_i32, local_seq)
@@ -591,31 +600,69 @@ def compile_mla_reduce(
                 _grp_shift = GRP.bit_length() - 1
                 zero_f = fx.arith.constant(0.0, type=T.f32)
 
-                def load_g(split_i32):
-                    """Guarded raw load of one split: (os_list, mask, scale).
+                one_f = fx.arith.constant(1.0, type=T.f32)
 
-                    Clamps OOB split index to 0 (valid LDS slot) and returns
-                    mask=0 so the contribution is dropped without touching stale
-                    LDS as a NaN source.
+                def load_group(base_i32):
+                    """Load GRP splits [base..base+GRP) as a batch.
+
+                    Vectorized LDS: the group's pmap indices and lse scales live
+                    at contiguous LDS slots, so read them with wide ds_read_b128
+                    (STensor.load vec) instead of GRP scalar ds_read_b32 -- the
+                    ATT #1 stall was LDS/SMEM-wait (lgkmcnt) once the pipeline hid
+                    VMEM. base = i*GRP is 16B-aligned. Returns (os_list, masks,
+                    scales) matching the loop-carried state layout.
+
+                    Tail safety: a partial final group reads slots >= n_splits
+                    (stale/unwritten). The pmap value is row-clamped (row_from_
+                    pmap) and the scale is select-forced to 0 for invalid splits
+                    (in_split false), so no stale NaN reaches the FMA. Selecting
+                    on the *scale* (an LDS/register value) is free -- it does not
+                    touch the VMEM os load, so the deferred-guard vmcnt overlap is
+                    preserved.
                     """
-                    in_split = fx.arith.cmpi(
-                        fx.arith.CmpIPredicate.slt, split_i32, n_splits
+                    base_idx = fx.Index(base_i32)
+                    pmap_v = lds_pmap.load(base_idx, vec_size=GRP)
+                    scale_v = lds_scale.load(base_idx, vec_size=GRP)
+                    # Slot-0 pmap (always validly staged, since the massive body
+                    # only runs when n_splits > 1). OOB lanes of the vector read
+                    # hit stale slots; substitute pmap0 so the row computation
+                    # never sees a stale value -- mirrors the old scalar
+                    # safe_split=0 clamp and stays safe even with guards disabled
+                    # (else no clamp -> stale pmap -> wild global gather address).
+                    pmap0 = fx.Int32(
+                        fx.vector.extract(
+                            pmap_v, static_position=[0], dynamic_position=[]
+                        )
                     )
-                    safe_split = fx.Int32(in_split.select(split_i32, fx.Int32(0)))
-                    os_raw, row_mask = load_split_o_raw(safe_split, local_seq)
-                    mask = in_split.select(row_mask, zero_f)
-                    sc = lds_scale[fx.Index(safe_split)]
-                    return os_raw, mask, sc
+                    os_list = []
+                    masks = []
+                    scs = []
+                    for j in fx.range_constexpr(GRP):
+                        split_j = base_i32 + fx.Int32(j)
+                        in_split = fx.arith.cmpi(
+                            fx.arith.CmpIPredicate.slt, split_j, n_splits
+                        )
+                        pmap_raw = fx.Int32(
+                            fx.vector.extract(
+                                pmap_v, static_position=[j], dynamic_position=[]
+                            )
+                        )
+                        pmap_j = fx.Int32(in_split.select(pmap_raw, pmap0))
+                        row_idx, in_bounds = row_from_pmap(pmap_j, local_seq)
+                        os_raw = load_o_elems(g_po, row_idx, fx.Index(head), col)
+                        valid = fx.arith.andi(in_split, in_bounds)
+                        mask = valid.select(one_f, zero_f)
+                        sc_j = fx.vector.extract(
+                            scale_v, static_position=[j], dynamic_position=[]
+                        )
+                        sc_safe = valid.select(sc_j, zero_f)
+                        os_list.append(os_raw)
+                        masks.append(mask)
+                        scs.append(sc_safe)
+                    return os_list, masks, scs
 
                 # Prologue: load group 0 (splits 0..GRP-1).
-                os_g0 = []
-                mask_g0 = []
-                sc_g0 = []
-                for j in fx.range_constexpr(GRP):
-                    osj, mj, scj = load_g(fx.Int32(j))
-                    os_g0.append(osj)
-                    mask_g0.append(mj)
-                    sc_g0.append(scj)
+                os_g0, mask_g0, sc_g0 = load_group(fx.Int32(0))
                 init_os = []
                 for j in fx.range_constexpr(GRP):
                     init_os += [
@@ -669,15 +716,8 @@ def compile_mla_reduce(
                     os_g, regs, mask_g, sc_g = unpack(state)
                     i_i32 = fx.Int32(fx.arith.index_cast(T.i32, _to_raw(i)))
                     # Issue the next group's loads FIRST (stay in flight), then
-                    # FMA the carried group.
-                    n_os = []
-                    n_mask = []
-                    n_sc = []
-                    for j in fx.range_constexpr(GRP):
-                        osj, mj, scj = load_g(i_i32 + fx.Int32(GRP + j))
-                        n_os.append(osj)
-                        n_mask.append(mj)
-                        n_sc.append(scj)
+                    # FMA the carried group. Vectorized LDS reads for the group.
+                    n_os, n_mask, n_sc = load_group(i_i32 + fx.Int32(GRP))
                     new_regs = accumulate(regs, os_g, mask_g, sc_g)
                     next_os_flat = []
                     for j in fx.range_constexpr(GRP):
