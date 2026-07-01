@@ -882,7 +882,7 @@ def flydsl_pa_decode_sparse(
         assert kv_splits & (kv_splits - 1) == 0, f"kv_splits={kv_splits} is not a power of 2"
 
 
-    out = torch.zeros((T_val, H, D), dtype=torch.bfloat16, device=device)
+    out = torch.empty((T_val, H, D), dtype=torch.bfloat16, device=device)
 
     if kv_splits == 1:
         m_partial = l_partial = acc_partial = out  # dummy (not written by kernel)
