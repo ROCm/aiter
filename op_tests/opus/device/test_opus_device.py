@@ -2061,6 +2061,152 @@ def test_dtype_convert_fp32_fp8_vec8(mod):
     return 0
 
 
+def test_dtype_convert_fp32_bf8_scalar(mod):
+    """Test scalar FP32 -> BF8 (e5m2) -> FP32 round-trip via opus::cast (one element per thread)."""
+    arch = _get_gpu_arch()
+    if arch not in _FP8_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->bf8 scalar requires {_FP8_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    n = 1048576
+    device = torch.device("cuda")
+
+    torch.manual_seed(230)
+    In = torch.randn(n, device=device, dtype=torch.float32) * 2.0
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_bf8_scalar")
+
+    bf8_dtype = _get_bf8_dtype()
+    Ref = In.to(bf8_dtype).to(torch.float32)
+
+    # BF8 e5m2 has 2 mantissa bits, so tolerance is larger than fp8 e4m3
+    atol, rtol = 0.5, 0.3
+    ok = torch.allclose(Out, Ref, atol=atol, rtol=rtol)
+    max_diff = (Out - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Out - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->bf8 scalar max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->bf8 scalar (n={n}), max_diff={max_diff:.6e}")
+    return 0
+
+
+def test_dtype_convert_fp32_bf8(mod):
+    """Test FP32 -> BF8 (e5m2) -> FP32 round-trip via OPUS packed cast (x4)."""
+    arch = _get_gpu_arch()
+    if arch not in _FP8_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->bf8 requires {_FP8_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    # n must be a multiple of BLOCK_SIZE * 4 = 1024
+    n = 1048576  # 1M elements
+    device = torch.device("cuda")
+
+    torch.manual_seed(231)
+    In = torch.randn(n, device=device, dtype=torch.float32) * 2.0
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_bf8")
+
+    # Reference: PyTorch fp32 -> bf8 -> fp32 round-trip (arch-dependent dtype)
+    bf8_dtype = _get_bf8_dtype()
+    Ref = In.to(bf8_dtype).to(torch.float32)
+
+    atol, rtol = 0.5, 0.3
+    ok = torch.allclose(Out, Ref, atol=atol, rtol=rtol)
+    max_diff = (Out - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Out - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->bf8 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->bf8 (n={n}), max_diff={max_diff:.6e}")
+    return 0
+
+
+def test_dtype_convert_fp32_bf8_x2(mod):
+    """Test FP32x2 -> BF8x2 -> FP32x2 round-trip via opus::cast packed x2."""
+    arch = _get_gpu_arch()
+    if arch not in _FP8_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->bf8 x2 requires {_FP8_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    n = 1048576
+    device = torch.device("cuda")
+
+    torch.manual_seed(232)
+    In = torch.randn(n, device=device, dtype=torch.float32) * 2.0
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_bf8_x2")
+
+    bf8_dtype = _get_bf8_dtype()
+    Ref = In.to(bf8_dtype).to(torch.float32)
+
+    atol, rtol = 0.5, 0.3
+    ok = torch.allclose(Out, Ref, atol=atol, rtol=rtol)
+    max_diff = (Out - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Out - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->bf8 x2 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->bf8 x2 (n={n}), max_diff={max_diff:.6e}")
+    return 0
+
+
+def test_dtype_convert_fp32_bf8_vec8(mod):
+    """Test FP32x8 -> BF8(auto-fold 2x x4) -> FP32x8 round-trip.
+
+    Exercises the generic vectorized cast() auto-folding path for bf8 with 8-wide input.
+    """
+    arch = _get_gpu_arch()
+    if arch not in _FP8_SUPPORTED_ARCHS:
+        print(
+            f"  SKIP: dtype_convert fp32<->bf8 vec8 requires {_FP8_SUPPORTED_ARCHS}, got '{arch}'"
+        )
+        return 0
+
+    n = 1048576
+    device = torch.device("cuda")
+
+    torch.manual_seed(233)
+    In = torch.randn(n, device=device, dtype=torch.float32) * 2.0
+    Out = torch.empty(n, device=device, dtype=torch.float32)
+
+    mod.run_dtype_convert(In, Out, "fp32_bf8_vec8")
+
+    bf8_dtype = _get_bf8_dtype()
+    Ref = In.to(bf8_dtype).to(torch.float32)
+
+    atol, rtol = 0.5, 0.3
+    ok = torch.allclose(Out, Ref, atol=atol, rtol=rtol)
+    max_diff = (Out - Ref).abs().max().item()
+    if not ok:
+        diff_count = (Out - Ref).abs().gt(atol + rtol * Ref.abs()).sum().item()
+        print(
+            f"  FAIL: dtype_convert fp32<->bf8 vec8 max_diff={max_diff:.6e}, "
+            f"{diff_count}/{n} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: dtype_convert fp32<->bf8 vec8 (n={n}), max_diff={max_diff:.6e}")
+    return 0
+
+
 def test_dtype_convert_fp32_fp4_x2(mod):
     """Test FP32x2 -> FP4(x2) -> FP32x2 round-trip via opus::cast packed x2 (gfx950 only)."""
     arch = _get_gpu_arch()
@@ -2718,6 +2864,10 @@ def main():
     failures += test_dtype_convert_fp32_fp8(mod)
     failures += test_dtype_convert_fp32_fp8_x2(mod)
     failures += test_dtype_convert_fp32_fp8_vec8(mod)
+    failures += test_dtype_convert_fp32_bf8_scalar(mod)
+    failures += test_dtype_convert_fp32_bf8(mod)
+    failures += test_dtype_convert_fp32_bf8_x2(mod)
+    failures += test_dtype_convert_fp32_bf8_vec8(mod)
     failures += test_dtype_convert_fp32_fp4(mod)
     failures += test_dtype_convert_fp32_fp4_x2(mod)
     failures += test_dtype_convert_fp32_fp4_x4(mod)

@@ -21,6 +21,10 @@
  *   FP32 <-> FP8   | x2 pk   | cast<fp8_t>(fp32x2_t)              | gfx942 + gfx950
  *   FP32 <-> FP8   | x4 pk   | cast<fp8_t>(fp32x4_t)              | gfx942 + gfx950
  *   FP32 <-> FP8   | x8 fold | cast<fp8_t>(fp32x8_t)  auto-fold   | gfx942 + gfx950
+ *   FP32 <-> BF8   | scalar  | cast<bf8_t>(fp32_t)                | gfx942 + gfx950
+ *   FP32 <-> BF8   | x2 pk   | cast<bf8_t>(fp32x2_t)              | gfx942 + gfx950
+ *   FP32 <-> BF8   | x4 pk   | cast<bf8_t>(fp32x4_t)              | gfx942 + gfx950
+ *   FP32 <-> BF8   | x8 fold | cast<bf8_t>(fp32x8_t)  auto-fold   | gfx942 + gfx950
  *   FP32 <-> FP4   | x2 pk   | cast<fp4_t>(fp32x2_t)              | gfx950
  *   FP32 <-> FP4   | x4 pk   | cast<fp4_t>(fp32x4_t)              | gfx950
  *   FP32 <-> FP4   | x8 pk   | cast<fp4_t>(fp32x8_t)              | gfx950
@@ -194,6 +198,72 @@ __global__ void dtype_convert_fp32_fp8_vec8_kernel(const float* __restrict__ in,
 }
 
 template<int BLOCK_SIZE>
+__global__ void dtype_convert_fp32_bf8_scalar_kernel(const float* __restrict__ in,
+                                                     float* __restrict__ out,
+                                                     int n)
+{
+    int gid = __builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + __builtin_amdgcn_workitem_id_x();
+    if (gid >= n) return;
+
+    opus::fp32_t val = in[gid];
+    opus::bf8_t tmp = opus::cast<opus::bf8_t>(val);
+    out[gid] = opus::cast<opus::fp32_t>(tmp);
+}
+
+template<int BLOCK_SIZE>
+__global__ void dtype_convert_fp32_bf8_x2_kernel(const float* __restrict__ in,
+                                                 float* __restrict__ out,
+                                                 int n)
+{
+    int gid = (__builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + __builtin_amdgcn_workitem_id_x()) * 2;
+    if (gid >= n) return;
+
+    opus::fp32x2_t v_in;
+    v_in[0] = in[gid + 0]; v_in[1] = in[gid + 1];
+
+    auto v_bf8 = opus::cast<opus::bf8_t>(v_in);
+    auto v_out = opus::cast<opus::fp32_t>(v_bf8);
+
+    out[gid + 0] = v_out[0]; out[gid + 1] = v_out[1];
+}
+
+template<int BLOCK_SIZE>
+__global__ void dtype_convert_fp32_bf8_kernel(const float* __restrict__ in,
+                                              float* __restrict__ out,
+                                              int n)
+{
+    int gid = (__builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + __builtin_amdgcn_workitem_id_x()) * 4;
+    if (gid >= n) return;
+
+    opus::fp32x4_t v_in;
+    v_in[0] = in[gid + 0]; v_in[1] = in[gid + 1];
+    v_in[2] = in[gid + 2]; v_in[3] = in[gid + 3];
+
+    auto v_bf8 = opus::cast<opus::bf8_t>(v_in);
+    auto v_out = opus::cast<opus::fp32_t>(v_bf8);
+
+    out[gid + 0] = v_out[0]; out[gid + 1] = v_out[1];
+    out[gid + 2] = v_out[2]; out[gid + 3] = v_out[3];
+}
+
+template<int BLOCK_SIZE>
+__global__ void dtype_convert_fp32_bf8_vec8_kernel(const float* __restrict__ in,
+                                                   float* __restrict__ out,
+                                                   int n)
+{
+    int gid = (__builtin_amdgcn_workgroup_id_x() * BLOCK_SIZE + __builtin_amdgcn_workitem_id_x()) * 8;
+    if (gid >= n) return;
+
+    opus::fp32x8_t v_in;
+    for (int i = 0; i < 8; ++i) v_in[i] = in[gid + i];
+
+    auto v_bf8 = opus::cast<opus::bf8_t>(v_in);
+    auto v_out = opus::cast<opus::fp32_t>(v_bf8);
+
+    for (int i = 0; i < 8; ++i) out[gid + i] = v_out[i];
+}
+
+template<int BLOCK_SIZE>
 __global__ void dtype_convert_fp32_fp4_x2_kernel(const float* __restrict__ in,
                                                  float* __restrict__ out,
                                                  int n)
@@ -242,6 +312,10 @@ template __global__ void dtype_convert_fp32_bf16_vec4_kernel<256>(const float*, 
 template __global__ void dtype_convert_fp32_fp16_vec4_kernel<256>(const float*, float*, int);
 template __global__ void dtype_convert_fp32_fp8_x2_kernel<256>(const float*, float*, int);
 template __global__ void dtype_convert_fp32_fp8_vec8_kernel<256>(const float*, float*, int);
+template __global__ void dtype_convert_fp32_bf8_scalar_kernel<256>(const float*, float*, int);
+template __global__ void dtype_convert_fp32_bf8_x2_kernel<256>(const float*, float*, int);
+template __global__ void dtype_convert_fp32_bf8_kernel<256>(const float*, float*, int);
+template __global__ void dtype_convert_fp32_bf8_vec8_kernel<256>(const float*, float*, int);
 template __global__ void dtype_convert_fp32_fp4_x2_kernel<256>(const float*, float*, int);
 template __global__ void dtype_convert_fp32_fp4_x4_kernel<256>(const float*, float*, int);
 
@@ -352,6 +426,50 @@ extern "C" void run_dtype_convert_fp32_fp8_vec8(const void* d_in, void* d_out, i
     constexpr int BS = 256;
     int blocks = (n / 8 + BS - 1) / BS;
     hipLaunchKernelGGL((dtype_convert_fp32_fp8_vec8_kernel<BS>),
+        dim3(blocks), dim3(BS), 0, 0,
+        static_cast<const float*>(d_in), static_cast<float*>(d_out), n);
+    HIP_CALL(hipGetLastError());
+    HIP_CALL(hipDeviceSynchronize());
+}
+
+extern "C" void run_dtype_convert_fp32_bf8_scalar(const void* d_in, void* d_out, int n)
+{
+    constexpr int BS = 256;
+    int blocks = (n + BS - 1) / BS;
+    hipLaunchKernelGGL((dtype_convert_fp32_bf8_scalar_kernel<BS>),
+        dim3(blocks), dim3(BS), 0, 0,
+        static_cast<const float*>(d_in), static_cast<float*>(d_out), n);
+    HIP_CALL(hipGetLastError());
+    HIP_CALL(hipDeviceSynchronize());
+}
+
+extern "C" void run_dtype_convert_fp32_bf8_x2(const void* d_in, void* d_out, int n)
+{
+    constexpr int BS = 256;
+    int blocks = (n / 2 + BS - 1) / BS;
+    hipLaunchKernelGGL((dtype_convert_fp32_bf8_x2_kernel<BS>),
+        dim3(blocks), dim3(BS), 0, 0,
+        static_cast<const float*>(d_in), static_cast<float*>(d_out), n);
+    HIP_CALL(hipGetLastError());
+    HIP_CALL(hipDeviceSynchronize());
+}
+
+extern "C" void run_dtype_convert_fp32_bf8(const void* d_in, void* d_out, int n)
+{
+    constexpr int BS = 256;
+    int blocks = (n / 4 + BS - 1) / BS;
+    hipLaunchKernelGGL((dtype_convert_fp32_bf8_kernel<BS>),
+        dim3(blocks), dim3(BS), 0, 0,
+        static_cast<const float*>(d_in), static_cast<float*>(d_out), n);
+    HIP_CALL(hipGetLastError());
+    HIP_CALL(hipDeviceSynchronize());
+}
+
+extern "C" void run_dtype_convert_fp32_bf8_vec8(const void* d_in, void* d_out, int n)
+{
+    constexpr int BS = 256;
+    int blocks = (n / 8 + BS - 1) / BS;
+    hipLaunchKernelGGL((dtype_convert_fp32_bf8_vec8_kernel<BS>),
         dim3(blocks), dim3(BS), 0, 0,
         static_cast<const float*>(d_in), static_cast<float*>(d_out), n);
     HIP_CALL(hipGetLastError());

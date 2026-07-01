@@ -1142,6 +1142,22 @@ OPUS_D auto fp8_to_fp32(const fp8_t& x) {
     return __builtin_amdgcn_cvt_f32_fp8(w, /*byte=*/0);
 #endif
 }
+OPUS_D auto fp32_to_bf8(const fp32_t& x) {
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+    (void)x; return __builtin_bit_cast(bf8_t, static_cast<unsigned char>(0));
+#else
+    int w; w = __builtin_amdgcn_cvt_pk_bf8_f32(x, 0.0f, w, /*sel=lo*/0);
+    return __builtin_bit_cast(bf8_t, static_cast<unsigned char>(w));
+#endif
+}
+OPUS_D auto bf8_to_fp32(const bf8_t& x) {
+#if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
+    (void)x; return fp32_t(0.0f);
+#else
+    int w = static_cast<int>(__builtin_bit_cast(unsigned char, x));
+    return __builtin_amdgcn_cvt_f32_bf8(w, /*byte=*/0);
+#endif
+}
 OPUS_D constexpr auto fp32_to_fp32(const fp32_t& x) { return x; }
 OPUS_D constexpr auto fp32_to_i8(const fp32_t& x) { return static_cast<i8_t>(x); }
 OPUS_D constexpr auto i8_to_fp32(const i8_t& x) { return static_cast<fp32_t>(x); }
@@ -1155,6 +1171,8 @@ OPUS_CAST_DEFINE(bf16, fp32)
 OPUS_CAST_DEFINE(fp32, bf16)
 OPUS_CAST_DEFINE(fp8, fp32)
 OPUS_CAST_DEFINE(fp32, fp8)
+OPUS_CAST_DEFINE(bf8, fp32)
+OPUS_CAST_DEFINE(fp32, bf8)
 OPUS_CAST_DEFINE(fp32, fp32)
 OPUS_CAST_DEFINE(i8, fp32)
 OPUS_CAST_DEFINE(fp32, i8)
@@ -1257,6 +1275,22 @@ template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_
 OPUS_D constexpr decltype(auto) fp32_to_bf8_packed_x2(const S& s, number<sel> = {}) {
     int w ; w = __builtin_amdgcn_cvt_pk_bf8_f32(s[0], s[1], w, sel);
     return __builtin_bit_cast(bf8x2_t, static_cast<short>(w));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_bf8_packed_x4(const S& s) {
+    int w ; w = __builtin_amdgcn_cvt_pk_bf8_f32(s[0], s[1], w, 0); w = __builtin_amdgcn_cvt_pk_bf8_f32(s[2], s[3], w, 1);
+    return __builtin_bit_cast(bf8x4_t, w);
+}
+template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf8x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) bf8_to_fp32_packed_x2(const S& s, number<sel> = {}) {
+    union { int bitwise; S f8_packs[2]; } value; value.f8_packs[0] = s;
+    return __builtin_amdgcn_cvt_pk_f32_bf8(value.bitwise, sel);
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, bf8x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) bf8_to_fp32_packed_x4(const S& s) {
+    int bitwise = __builtin_bit_cast(int, s);
+    auto x = __builtin_amdgcn_cvt_pk_f32_bf8(bitwise, 0); auto y = __builtin_amdgcn_cvt_pk_f32_bf8(bitwise, 1);
+    return fp32x4_t{x[0], x[1], y[0], y[1]};
 }
 
 namespace impl {
@@ -1438,6 +1472,15 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp8_to_f
 template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp8x4_t> && std::is_same_v<D, fp32_t>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp8_to_fp32_packed_x4(s, std::forward<Aux>(aux)...); }
 
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x2_t> && std::is_same_v<D, bf8_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_bf8_packed_x2(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x4_t> && std::is_same_v<D, bf8_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_bf8_packed_x4(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, bf8x2_t> && std::is_same_v<D, fp32_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return bf8_to_fp32_packed_x2(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, bf8x4_t> && std::is_same_v<D, fp32_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return bf8_to_fp32_packed_x4(s, std::forward<Aux>(aux)...); }
+
 template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x2_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp4_packed_x2(s, std::forward<Aux>(aux)...); }
 template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x4_t> && std::is_same_v<D, fp4_t>, bool> = true>
@@ -1471,6 +1514,8 @@ OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) 
 template<typename D, typename S, typename... Aux, std::enable_if_t<((is_vector_v<S> || is_tuple_v<S> || is_array_v<S>) && !is_packs_v<D> && !is_packs_v<get_value_t<S>>)
     && !(is_any_of_v<S, fp32x2_t, fp32x4_t>&& std::is_same_v<D, fp8_t >)
     && !(is_any_of_v<S, fp8x2_t , fp8x4_t >&& std::is_same_v<D, fp32_t>)
+    && !(is_any_of_v<S, fp32x2_t, fp32x4_t>&& std::is_same_v<D, bf8_t >)
+    && !(is_any_of_v<S, bf8x2_t , bf8x4_t >&& std::is_same_v<D, fp32_t>)
 , bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
     if      constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, fp8_t>) { // fp32 -> fp8 , x4N
@@ -1480,6 +1525,14 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
     else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 4 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x4N
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 2 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x2N
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, bf8_t>) { // fp32 -> bf8 , x4N
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 2 == 0 && std::is_same_v<D, bf8_t>) { // fp32 -> bf8 , x2N
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
+    else if constexpr (std::is_same_v<get_value_t<S>, bf8_t>  && size<S>() % 4 == 0 && std::is_same_v<D, fp32_t>) { // bf8 -> fp32, x4N
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
+    else if constexpr (std::is_same_v<get_value_t<S>, bf8_t>  && size<S>() % 2 == 0 && std::is_same_v<D, fp32_t>) { // bf8 -> fp32, x2N
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (is_vector_v<S> && size<S>() > 16 && sizeof...(Aux) == 0) {
         return __builtin_convertvector(s, vector_t<D, size<S>()>); }
