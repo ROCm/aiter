@@ -18,7 +18,7 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    return defaultDtypes.get(get_gfx(), {"fp8": _8bit_fallback})["fp8"]
+    return defaultDtypes.get(get_gfx_runtime(), {"fp8": _8bit_fallback})["fp8"]
 
 
 i4x2 = getattr(torch, "int4", _8bit_fallback)
