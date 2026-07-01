@@ -5096,37 +5096,95 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return us
 
-    def tune(self, untunedf, tunedf, args):
-        del tunedf
-        rows = []
-        for _, row in untunedf.iterrows():
-            best, failures = None, []
-            for candidate in self._candidate_rows(row):
-                try:
-                    us = self._run_candidate(row, candidate, args)
-                    print(
-                        f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
-                        f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
-                        flush=True,
-                    )
-                    if best is None or us < float(best["us"]):
-                        best = candidate
-                except Exception as exc:
-                    failures.append(
-                        f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
-                    )
-                    print(f"[mxfp4-port] candidate failed: {failures[-1]}", flush=True)
-            if best is None:
-                best = self._candidate_rows(row)[0]
-                best["us"] = self.INVALID_TIME
-                best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
+    def _tune_one_shape(self, row, args):
+        """Sweep all (g1, g2) candidates for one shape; return the best row dict.
+
+        --timeout (if > 0) bounds each candidate via SIGALRM. This runs on the
+        main thread of whichever process owns the shape, so it works for both the
+        sequential path and each per-shape worker in the --mp parallel path. A
+        true GPU hang only aborts once control returns to Python; slow/looping
+        candidates are caught reliably.
+        """
+        import signal
+
+        timeout = int(getattr(args, "timeout", 0) or 0)
+
+        class _CandidateTimeout(Exception):
+            pass
+
+        def _on_alarm(signum, frame):
+            raise _CandidateTimeout(f"exceeded {timeout}s timeout")
+
+        if timeout > 0:
+            try:
+                signal.signal(signal.SIGALRM, _on_alarm)
+            except ValueError:
+                timeout = 0  # not on the main thread; cannot arm SIGALRM
+
+        best, failures = None, []
+        for candidate in self._candidate_rows(row):
+            if timeout > 0:
+                signal.alarm(timeout)
+            try:
+                us = self._run_candidate(row, candidate, args)
                 print(
-                    f"[mxfp4-port] all candidates failed for "
-                    f"{tuple(row[k] for k in self.keys)}",
+                    f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
+                    f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
                     flush=True,
                 )
-            rows.append(best)
-        return rows
+                if best is None or us < float(best["us"]):
+                    best = candidate
+            except Exception as exc:
+                failures.append(
+                    f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
+                )
+                print(f"[mxfp4-port] candidate failed: {failures[-1]}", flush=True)
+            finally:
+                if timeout > 0:
+                    signal.alarm(0)
+        if best is None:
+            best = self._candidate_rows(row)[0]
+            best["us"] = self.INVALID_TIME
+            best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
+            print(
+                f"[mxfp4-port] all candidates failed for "
+                f"{tuple(row[k] for k in self.keys)}",
+                flush=True,
+            )
+        return best
+
+    def tune(self, untunedf, tunedf, args):
+        del tunedf
+        rows = [row.to_dict() for _, row in untunedf.iterrows()]
+
+        mp_num = int(getattr(args, "mp", 1) or 1)
+        try:
+            ngpu = torch.cuda.device_count()
+        except Exception:
+            ngpu = 1
+        mp_num = max(1, min(mp_num, ngpu, len(rows)))
+
+        if mp_num <= 1:
+            return [self._tune_one_shape(row, args) for row in rows]
+
+        # One fresh process per shape (memory fully released between shapes),
+        # spread across mp_num GPUs. A shared queue hands out distinct GPU ids so
+        # the mp_num concurrent workers never collide on the same device.
+        import multiprocessing as _mp
+
+        print(f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True)
+        ctx = _mp.get_context("spawn")
+        mgr = ctx.Manager()
+        gpu_q = mgr.Queue()
+        for g in range(mp_num):
+            gpu_q.put(g)
+        payloads = [(self.keys, row, args, gpu_q) for row in rows]
+        with ctx.Pool(processes=mp_num, maxtasksperchild=1) as pool:
+            # chunksize=1 so each shape is its own task: with maxtasksperchild=1
+            # the worker is torn down after every shape (memory fully released,
+            # and one process never spans multiple GPUs via the shared queue).
+            results = pool.map(_mxfp4_tune_shape_worker, payloads, chunksize=1)
+        return results
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del args, topk, fast_mode
@@ -5152,6 +5210,35 @@ class Mxfp4FlydslTuner(FmoeTuner):
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
         resultdf = resultdf.astype(str).drop_duplicates(subset=self.keys, keep="last")
         resultdf.to_csv(file, index=False)
+
+
+def _mxfp4_tune_shape_worker(payload):
+    """Spawned worker: tune one shape on a queue-assigned GPU (for --mxfp4-flydsl
+    --mp). Rebuilds a minimal tuner since the instance need only carry ``keys``."""
+    keys, row, args, gpu_q = payload
+    gpu = gpu_q.get()
+    try:
+        torch.cuda.set_device(gpu)
+        tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
+        tuner.keys = keys
+        print(
+            f"[mxfp4-port] shape token={row['token']} inter={row['inter_dim']} "
+            f"expert={row['expert']} topk={row['topk']} -> GPU{gpu}",
+            flush=True,
+        )
+        return tuner._tune_one_shape(row, args)
+    except Exception as exc:
+        # Catastrophic (non per-candidate) failure: record as a failed shape so
+        # the pool keeps going instead of aborting the whole run.
+        best = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
+        best.keys = keys
+        cand = best._candidate_rows(row)[0]
+        cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
+        cand["kernelName1"] = (f"FAILED(GPU{gpu}): {exc}")[:240]
+        print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
+        return cand
+    finally:
+        gpu_q.put(gpu)
 
 
 if __name__ == "__main__":
