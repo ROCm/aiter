@@ -74,6 +74,13 @@ NRED_TILES = N // BLOCK_K   # contraction tiles over N (compile-time)
 # COARSEN_M=1 reproduces the original kernel/grid exactly.
 COARSEN_M = 2
 
+# grad_jagged A-staging depth (B2). The double-buffered sA is BLOCK_M*BLOCK_K*GJ_STAGES_A
+# bf16 = 32 KB at the default 2 stages, which caps grad_jagged at <=2 WG/CU (LDS-bound,
+# 25% occupancy ceiling). GJ_STAGES_A=1 single-buffers it -> 16 KB -> up to 4 WG/CU, at
+# the cost of one extra barrier/iter (the write can no longer overlap the next read).
+# Defaults to the forward's STAGES_A (2) so the baseline is byte-identical.
+GJ_STAGES_A = 1
+
 # dDense partials tiling. The contraction dDense[k,n] = sum_m J[m,k]*dOut[m,n] is
 # a transposed GEMM C[k,n] = sum_m A[k,m]*B[n,m] with A = J.T and B = dOut.T, i.e.
 # the reduction axis m is the *contiguous* fragment axis of both operands. Each
@@ -233,9 +240,9 @@ def grad_jagged_kernel(
 
             composed_layout_A = fx.make_composed_layout(
                 fx.static(fx.SwizzleType.get(3, 3, 3)),
-                fx.make_ordered_layout((BLOCK_M, BLOCK_K, STAGES_A), (1, 0, 2)),
+                fx.make_ordered_layout((BLOCK_M, BLOCK_K, GJ_STAGES_A), (1, 0, 2)),
             )
-            sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)  # (BM, BK, STAGES_A)
+            sA = fx.make_view(fx.get_dyn_shared(fx.BFloat16), composed_layout_A)  # (BM, BK, GJ_STAGES_A)
 
             thr_gA_k = thr_copy_g2s_A.partition_S(gA_k)  # (VA, VM, VK, n)
             thr_sA = thr_copy_g2s_A.partition_D(sA)      # (VA, VM, VK, STAGES_A)
@@ -256,6 +263,11 @@ def grad_jagged_kernel(
 
             def run_pipeline_stage(read_stage, next_k, read_next=True):
                 write_stage = read_stage ^ 1
+                # B stays register-double-buffered (no LDS cost) on read/write_stage.
+                # A's LDS stage folds modulo GJ_STAGES_A: at 2 stages this is the
+                # original ping-pong; at 1 stage (B2) it collapses to a single buffer.
+                a_read = read_stage % GJ_STAGES_A
+                a_write = write_stage % GJ_STAGES_A
                 if fx.const_expr(read_next):
                     next_k = fx.Int32(next_k)
                     fx.copy(
@@ -274,7 +286,7 @@ def grad_jagged_kernel(
                 for block_k_iter in fx.range_constexpr(BLOCK_K // 32):
                     fx.copy(
                         uni_copy_128b,
-                        thr_sA_s2r[None, None, block_k_iter, read_stage],
+                        thr_sA_s2r[None, None, block_k_iter, a_read],
                         mma_frag_A_retile[None, None, block_k_iter],
                     )
                     fx.gemm(
@@ -286,7 +298,11 @@ def grad_jagged_kernel(
                         traversal_order=fx.GemmTraversalOrder.KNM,
                     )
 
-                fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, write_stage])
+                # Single-buffer (GJ_STAGES_A==1): the next-k write reuses the buffer we
+                # just read, so all threads must finish their s2r reads before any write.
+                if fx.const_expr(GJ_STAGES_A == 1):
+                    fx.gpu.barrier()
+                fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, a_write])
                 fx.gpu.barrier()
 
             # Prologue: load contraction-tile 0 into the read buffer.
@@ -348,8 +364,9 @@ def grad_jagged(
 
     bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
     bm_coarse = (bm + COARSEN_M - 1) // COARSEN_M  # M row-tiles per WG = COARSEN_M
+    gj_smem = BLOCK_M * BLOCK_K * GJ_STAGES_A * 2  # bf16 sA staging (B2: 32 KB at 2 stages)
     grad_jagged_kernel(dJagged, dOut, DENSE, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A).launch(
-        grid=(bm_coarse * KOUT_BLOCKS, 1, n_groups), block=(256, 1, 1), smem=32768, stream=stream
+        grid=(bm_coarse * KOUT_BLOCKS, 1, n_groups), block=(256, 1, 1), smem=gj_smem, stream=stream
     )
 
 

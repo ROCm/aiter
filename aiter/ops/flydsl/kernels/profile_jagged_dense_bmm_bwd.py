@@ -174,6 +174,9 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--sparsity", type=float, default=0.95,
                    help="genrec regime: scale M_i ~ Uniform(1,max_seq_len) by this factor (clamped >=1)")
+    p.add_argument("--gj-stages", type=int, default=None,
+                   help="B2: grad_jagged A-staging depth. 1 = single-buffer sA (32 KB -> 16 KB LDS, "
+                        "up to 4 WG/CU), 2 = double-buffer (default).")
     p.add_argument("--only", default="all", help="comma list of {djagged,dense_bias} or 'all'")
     p.add_argument("--mode", choices=["bench", "profile"], default="bench")
     p.add_argument("--warmup", type=int, default=10)
@@ -190,8 +193,14 @@ def main(argv=None):
     global K, N, SPLIT
     if args.dim is not None:
         _bwd.configure_dim(args.dim)
+
         K = N = _ex.K = _ex.N = args.dim
         SPLIT = _bwd.SPLIT
+
+    # B2 grad_jagged A-staging depth (compile-time constant snapshotted on first launch,
+    # so set before any launch, like configure_dim). rm -rf ~/.flydsl/cache between configs.
+    if args.gj_stages is not None:
+        _bwd.GJ_STAGES_A = args.gj_stages
 
     which = GRADS if args.only == "all" else tuple(s.strip() for s in args.only.split(","))
     for w in which:
