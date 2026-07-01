@@ -99,17 +99,56 @@ def _fp8x2_to_bf16(fp8_word_i32, scale_f32, sel: int):
     )
 
 
+def _vmcnt0():
+    """Wait for all pending VMEM load operations to complete.
+
+    Must be inserted between the load phase and compute phase of a batched
+    load/compute pattern.  The AMDGPU SIInsertWaitcnts LLVM pass does not
+    analyse inline asm register operands, so callers of _dot2_batched must
+    manually emit this barrier after issuing all loads.
+    """
+    llvm.InlineAsmOp(
+        res=None,
+        operands_=[],
+        asm_string="s_waitcnt vmcnt(0)",
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
+def _dot2_batched(acc_f32, a_i32, b_i32):
+    """v_dot2_f32_bf16 for use AFTER an explicit s_waitcnt vmcnt(0).
+
+    No embedded wait (loads are already guaranteed ready by the caller's
+    _vmcnt0() call).  No embedded s_nop — designed for use with independent
+    accumulators; caller must emit one rocdl.s_nop(2) drain before reading
+    any accumulator produced by this function.
+
+    Replaces the old _dot2_dep which embedded both a per-call s_waitcnt
+    (serialising loads) and a per-call s_nop (unnecessary with independent
+    accumulators).  The batched pattern issues all buffer_loads → _vmcnt0()
+    → all _dot2_batched() → one rocdl.s_nop(2) → sum accumulators.
+    This allows the GPU memory controller to have _k_pairs * 3 VMEM ops
+    in flight simultaneously instead of just 2, recovering ~2× HBM utilisation.
+    """
+    return llvm.inline_asm(
+        T.f32,
+        [acc_f32, a_i32, b_i32],
+        "v_dot2_f32_bf16 $0, $2, $3, $1",
+        "=v,v,v,v",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def _dot2_dep(acc_f32, a_i32, b_i32):
-    """v_dot2_f32_bf16 in dependent-chain form (gfx950 only).
+    """v_dot2_f32_bf16 in legacy dependent-chain form.
 
-    dst += a[lo]*b[lo] + a[hi]*b[hi]  (2 MACs/lane/cycle).
-
-    Embeds s_waitcnt vmcnt(0) before the dot2 to ensure a_i32 and b_i32
-    (typically from buffer_load) are ready.  The AMDGPU SIInsertWaitcnts
-    LLVM pass does not analyse inline asm operand registers, so without an
-    explicit waitcnt the dot2 may read stale values from pending VMEM loads.
-
-    s_nop 2 after the dot2 covers the write->read hazard on the accumulator.
+    Kept for the down_reduce kernel which uses a scf.ForOp carried
+    accumulator with loads interleaved across iterations.  For the gate_up
+    inner loop use _dot2_batched + _vmcnt0 instead.
     """
     result = llvm.inline_asm(
         T.f32,
@@ -293,71 +332,166 @@ def compile_wd_moe_gate_up(
             k_base = step_i32 * c_k_step  # K-element start of this tile
             lane_k = k_base + lane_kV  # this lane's element start
 
-            g_cur, u_cur = g_acc, u_acc
+            # Batched load/compute pattern: issue ALL loads → one vmcnt → compute.
+            # Profiling showed per-pair s_waitcnt vmcnt(0) (the old _dot2_dep) kept
+            # HBM utilisation at only 44% vs CK's 97%.  With all _k_pairs loads
+            # in-flight simultaneously, the HBM controller can pipeline requests.
+            #
+            # ── Phase 1: issue all buffer loads ──────────────────────────────────
+            # Pre-initialise all list containers so they are always in scope.
+            # FlyDSL's AST rewriter visits all branches of if/elif/else for type
+            # inference, so every variable referenced in any branch must be defined
+            # before the first conditional.
+            g_fp8_words: list = []
+            u_fp8_words: list = []
+            x_words_fp8: list = []
+            x_words_bf16: list = []
+            g_words_bf16: list = []
+            u_words_bf16: list = []
 
             if w_dtype == "fp8":
-                # FP8 weights: each i32 word packs 4 FP8 (covering 4 activation elements).
-                # Outer loop: k_vector//4 FP8 words per lane (= 2 for k_vector=8).
-                # Inner loop: 2 activation pairs per FP8 word (sel=0 and sel=1).
-                # This avoids loading the same FP8 word twice within range_constexpr.
                 for wi in range_constexpr(_k_fp8_words):
-                    # FP8 i32 word offset within row: lane_k//4 + wi.
-                    # lane_k is divisible by 4 (k_vector=8, WAVE_SIZE=64 → multiples of 8).
                     wi4 = arith.constant(wi * 4, type=i32)
                     w_i32_off = (lane_k + wi4) // c_four
-                    g_fp8 = buffer_ops.buffer_load(
-                        wg_row_rsrc, w_i32_off, vec_width=1, dtype=i32
+                    g_fp8_words.append(
+                        buffer_ops.buffer_load(
+                            wg_row_rsrc, w_i32_off, vec_width=1, dtype=i32
+                        )
                     )
-                    u_fp8 = buffer_ops.buffer_load(
-                        wu_row_rsrc, w_i32_off, vec_width=1, dtype=i32
+                    u_fp8_words.append(
+                        buffer_ops.buffer_load(
+                            wu_row_rsrc, w_i32_off, vec_width=1, dtype=i32
+                        )
                     )
-                    # Two activation BF16 pairs per FP8 word (sel=0 and sel=1)
                     for sel in range_constexpr(2):
-                        # BF16 pair offset: wi*2 + sel  (pairs within lane's k_vector chunk)
                         pair_elem = arith.constant((wi * 2 + sel) * 2, type=i32)
                         x_off = (x_row_base + lane_k + pair_elem) // c_two
-                        x_word = buffer_ops.buffer_load(
-                            x_rsrc, x_off, vec_width=1, dtype=i32
+                        x_words_fp8.append(
+                            buffer_ops.buffer_load(
+                                x_rsrc, x_off, vec_width=1, dtype=i32
+                            )
                         )
-                        g_bf16 = _fp8x2_to_bf16(g_fp8, w_scale, sel)
-                        u_bf16 = _fp8x2_to_bf16(u_fp8, w_scale, sel)
-                        g_cur = _dot2_dep(g_cur, x_word, g_bf16)
-                        u_cur = _dot2_dep(u_cur, x_word, u_bf16)
             else:
-                # BF16 weights: k_vector//2 i32 words per lane (same as activation).
+                x_words_bf16 = []
+                g_words_bf16 = []
+                u_words_bf16 = []
                 for p in range_constexpr(_k_pairs):
                     p2 = arith.constant(p * 2, type=i32)
-                    w_off = (lane_k + p2) // c_two
-                    x_off = (x_row_base + lane_k + p2) // c_two
-                    x_word = buffer_ops.buffer_load(
-                        x_rsrc, x_off, vec_width=1, dtype=i32
-                    )
-                    g_word = buffer_ops.buffer_load(
-                        wg_row_rsrc, w_off, vec_width=1, dtype=i32
-                    )
-                    u_word = buffer_ops.buffer_load(
-                        wu_row_rsrc, w_off, vec_width=1, dtype=i32
+                    x_words_bf16.append(
+                        buffer_ops.buffer_load(
+                            x_rsrc,
+                            (x_row_base + lane_k + p2) // c_two,
+                            vec_width=1,
+                            dtype=i32,
+                        )
                     )
                     if _use_dot2:
-                        g_cur = _dot2_dep(g_cur, x_word, g_word)
-                        u_cur = _dot2_dep(u_cur, x_word, u_word)
-                    else:
-                        x0 = _bf16_pair_to_f32(x_word, 0)
-                        x1 = _bf16_pair_to_f32(x_word, 1)
-                        g_cur = arith.addf(
-                            g_cur,
-                            arith.addf(
-                                arith.mulf(x0, _bf16_pair_to_f32(g_word, 0)),
-                                arith.mulf(x1, _bf16_pair_to_f32(g_word, 1)),
-                            ),
+                        g_words_bf16.append(
+                            buffer_ops.buffer_load(
+                                wg_row_rsrc,
+                                (lane_k + p2) // c_two,
+                                vec_width=1,
+                                dtype=i32,
+                            )
                         )
-                        u_cur = arith.addf(
-                            u_cur,
-                            arith.addf(
-                                arith.mulf(x0, _bf16_pair_to_f32(u_word, 0)),
-                                arith.mulf(x1, _bf16_pair_to_f32(u_word, 1)),
-                            ),
+                        u_words_bf16.append(
+                            buffer_ops.buffer_load(
+                                wu_row_rsrc,
+                                (lane_k + p2) // c_two,
+                                vec_width=1,
+                                dtype=i32,
+                            )
                         )
+
+            # ── Phase 2: one vmcnt to wait for all loads ──────────────────────────
+            if _use_dot2:
+                _vmcnt0()
+
+            # ── Phase 3: compute with independent accumulators ───────────────────
+            # Each of the _k_pairs accumulator slots (g_slots[i], u_slots[i]) is
+            # independent — no write→read hazard between them, so no s_nop between
+            # consecutive dot2 calls.  One drain s_nop 2 covers all before summing.
+            zero_f32 = arith.constant(0.0, type=f32)
+            # Pre-initialise g_cur/u_cur so the AST rewriter can resolve them
+            # from scf.YieldOp even when visiting branches where they're not set.
+            g_cur = g_acc
+            u_cur = u_acc
+
+            if w_dtype == "fp8":
+                g_slots = []
+                u_slots = []
+                for wi in range_constexpr(_k_fp8_words):
+                    for sel in range_constexpr(2):
+                        idx = wi * 2 + sel
+                        x_word = x_words_fp8[idx]
+                        g_bf16 = _fp8x2_to_bf16(g_fp8_words[wi], w_scale, sel)
+                        u_bf16 = _fp8x2_to_bf16(u_fp8_words[wi], w_scale, sel)
+                        g_slots.append(_dot2_batched(zero_f32, x_word, g_bf16))
+                        u_slots.append(_dot2_batched(zero_f32, x_word, u_bf16))
+                rocdl.s_nop(2)  # one drain covers all slots
+                g_partial = g_slots[0]
+                u_partial = u_slots[0]
+                for i in range(1, _k_pairs):
+                    g_partial = arith.addf(g_partial, g_slots[i])
+                    u_partial = arith.addf(u_partial, u_slots[i])
+                g_cur = arith.addf(g_acc, g_partial)
+                u_cur = arith.addf(u_acc, u_partial)
+
+            elif _use_dot2:
+                g_slots = []
+                u_slots = []
+                for p in range_constexpr(_k_pairs):
+                    g_slots.append(
+                        _dot2_batched(zero_f32, x_words_bf16[p], g_words_bf16[p])
+                    )
+                    u_slots.append(
+                        _dot2_batched(zero_f32, x_words_bf16[p], u_words_bf16[p])
+                    )
+                rocdl.s_nop(2)  # one drain covers all slots
+                g_partial = g_slots[0]
+                u_partial = u_slots[0]
+                for i in range(1, _k_pairs):
+                    g_partial = arith.addf(g_partial, g_slots[i])
+                    u_partial = arith.addf(u_partial, u_slots[i])
+                g_cur = arith.addf(g_acc, g_partial)
+                u_cur = arith.addf(u_acc, u_partial)
+
+            else:
+                # FP32 scalar path: loads are handled by LLVM's SIInsertWaitcnts,
+                # no explicit vmcnt needed.
+                g_cur = g_acc
+                u_cur = u_acc
+                for p in range_constexpr(_k_pairs):
+                    x_word = x_words_bf16[p]
+                    g_word = buffer_ops.buffer_load(
+                        wg_row_rsrc,
+                        (lane_k + arith.constant(p * 2, type=i32)) // c_two,
+                        vec_width=1,
+                        dtype=i32,
+                    )
+                    u_word = buffer_ops.buffer_load(
+                        wu_row_rsrc,
+                        (lane_k + arith.constant(p * 2, type=i32)) // c_two,
+                        vec_width=1,
+                        dtype=i32,
+                    )
+                    x0 = _bf16_pair_to_f32(x_word, 0)
+                    x1 = _bf16_pair_to_f32(x_word, 1)
+                    g_cur = arith.addf(
+                        g_cur,
+                        arith.addf(
+                            arith.mulf(x0, _bf16_pair_to_f32(g_word, 0)),
+                            arith.mulf(x1, _bf16_pair_to_f32(g_word, 1)),
+                        ),
+                    )
+                    u_cur = arith.addf(
+                        u_cur,
+                        arith.addf(
+                            arith.mulf(x0, _bf16_pair_to_f32(u_word, 0)),
+                            arith.mulf(x1, _bf16_pair_to_f32(u_word, 1)),
+                        ),
+                    )
+
             scf.YieldOp([g_cur, u_cur])
 
         gate_sum = _butterfly_reduce(for_op.results[0])
