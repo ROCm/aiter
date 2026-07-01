@@ -36,7 +36,7 @@ try:
         chunk_gated_delta_rule_fwd_h_flydsl_kv,
         chunk_gated_delta_rule_fwd_h_flydsl_vk,
         chunk_gated_delta_rule_fwd_h_flydsl_vk_naive,
-        chunk_gated_delta_rule_fwd_h_flydsl_kv_naive,
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1,
         chunk_gated_delta_rule_fwd_h_flydsl_naive,
         chunk_gated_delta_rule_fwd_h_flydsl_naive_opt,
         chunk_gated_delta_rule_fwd_h_flydsl_hipport,
@@ -692,6 +692,7 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
 _K5_KERNEL_PREFIXES = [
     "chunk_gdn_fwd_h_flydsl_vk",
     "chunk_gdn_fwd_h_flydsl_kv",
+    "chunk_gdn_fwd_h_flydsl_mfma16",
     "chunk_gdn_fwd_h_flydsl_naive",
     "chunk_gated_delta_rule_fwd_kernel_h",
 ]
@@ -768,7 +769,7 @@ def _assert_close_lowmem(
 
     Equivalent in semantics to ``torch.testing.assert_close(a, b, atol, rtol)``
     but streams over a flattened view in row chunks so it never materialises
-    more than one chunk-sized fp32 temporary. Used for the kv_naive/triton_vk
+    more than one chunk-sized fp32 temporary. Used for the mfma16_2wave_opt1/triton_vk
     consistency check, where the h / v_new tensors at long context are
     multi-GiB and the stock ``assert_close`` (which up-casts both whole tensors
     and builds a full mismatch report) OOMs on a 256 GiB card. On mismatch it
@@ -1223,7 +1224,7 @@ class TestCorrectness:
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_correctness_flydsl_kv_naive(self, args: PrefillArgs):
+    def test_correctness_flydsl_mfma16_2wave_opt1(self, args: PrefillArgs):
         """Naive (un-pipelined) KV-fork FlyDSL K5 impl (same VWARP layout +
         coalesced KV h-store as flydsl_kv, all prefetch/pipeline scheduling
         removed). Same VK public outputs as the baseline flydsl path; only the
@@ -1233,11 +1234,11 @@ class TestCorrectness:
             context_lens, args=args
         )
 
-        # kv_naive consumes k PRE-TRANSPOSED to [B, Hg, K, T] (the caller owns
+        # mfma16_2wave_opt1 consumes k PRE-TRANSPOSED to [B, Hg, K, T] (the caller owns
         # the transpose; the host no longer permutes). The reference still
         # takes the original token-major [B, T, Hg, K] k.
         k_kvn = k.permute(0, 2, 3, 1).contiguous()
-        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1(
             k_kvn,
             w_c,
             u_c,
@@ -1264,7 +1265,7 @@ class TestCorrectness:
             vn_ref,
             fs_ref,
             output_final_state=args.output_final_state,
-            label="flydsl_kv_naive",
+            label="flydsl_mfma16_2wave_opt1",
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
@@ -1308,8 +1309,8 @@ class TestCorrectness:
         )
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
-    def test_consistency_kv_naive_vs_triton_vk(self, args: PrefillArgs):
-        """Direct kv_naive <-> triton_vk consistency (NOT vs the FP32 ref).
+    def test_consistency_mfma16_2wave_opt1_vs_triton_vk(self, args: PrefillArgs):
+        """Direct mfma16_2wave_opt1 <-> triton_vk consistency (NOT vs the FP32 ref).
 
         Both backends consume identical inputs (k / w_c / u_c / g / h0 / cu)
         and return VK-ordered outputs, and they implement the same bf16 +
@@ -1329,10 +1330,10 @@ class TestCorrectness:
             context_lens, args=args
         )
 
-        # kv_naive needs k pre-transposed to [B, Hg, K, T]; triton_vk keeps the
+        # mfma16_2wave_opt1 needs k pre-transposed to [B, Hg, K, T]; triton_vk keeps the
         # original token-major [B, T, Hg, K] layout.
         k_kvn = k.permute(0, 2, 3, 1).contiguous()
-        h_kvn, vn_kvn, fs_kvn = chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
+        h_kvn, vn_kvn, fs_kvn = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1(
             k_kvn,
             w_c,
             u_c,
@@ -1360,18 +1361,18 @@ class TestCorrectness:
         # streams the ``|a-b| <= atol + rtol*|b|`` check in chunks instead.
         _assert_close_lowmem(
             h_kvn, h_vk, atol=atol, rtol=rtol,
-            msg="kv_naive vs triton_vk: h mismatch",
+            msg="mfma16_2wave_opt1 vs triton_vk: h mismatch",
         )
         # v_new is head-major [B,H,T,V] in both backends; compare as-is (the
         # shared permutation to [B,T,H,V] is a no-op for an elementwise check).
         _assert_close_lowmem(
             vn_kvn, vn_vk, atol=atol, rtol=rtol,
-            msg="kv_naive vs triton_vk: v_new mismatch",
+            msg="mfma16_2wave_opt1 vs triton_vk: v_new mismatch",
         )
         if args.output_final_state:
             _assert_close_lowmem(
                 fs_kvn, fs_vk, atol=atol, rtol=rtol,
-                msg="kv_naive vs triton_vk: final_state mismatch",
+                msg="mfma16_2wave_opt1 vs triton_vk: final_state mismatch",
             )
         else:
             assert fs_kvn is None and fs_vk is None
@@ -1588,7 +1589,7 @@ def _run_perf_comparison(args: PrefillArgs):
         else None
     )
 
-    # Both KV forks (kv, kv_naive) require k pre-transposed to [B, Hg, K, T].
+    # Both KV forks (kv, mfma16_2wave_opt1) require k pre-transposed to [B, Hg, K, T].
     # Do it ONCE outside the timed window (the caller owns the transpose now),
     # so the benchmarked KV-fork time reflects the kernel alone -- matching the
     # other forks which consume the token-major k without a host permute.
@@ -1639,8 +1640,8 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
-    def flydsl_kv_naive_launch():
-        chunk_gated_delta_rule_fwd_h_flydsl_kv_naive(
+    def flydsl_mfma16_2wave_opt1_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1(
             k=k_kvn,
             w=w_c,
             u=u_c,
@@ -1746,7 +1747,7 @@ def _run_perf_comparison(args: PrefillArgs):
     flydsl_kv_launch()
     flydsl_vk_launch()
     flydsl_vk_naive_launch()
-    flydsl_kv_naive_launch()
+    flydsl_mfma16_2wave_opt1_launch()
     flydsl_naive_launch()
     flydsl_naive_opt_launch()
     if _HAS_VLLM_K5:
@@ -1759,7 +1760,7 @@ def _run_perf_comparison(args: PrefillArgs):
     us_fly_kv = _bench_fn(flydsl_kv_launch)
     us_fly_vk = _bench_fn(flydsl_vk_launch)
     us_fly_vk_naive = _bench_fn(flydsl_vk_naive_launch)
-    us_fly_kv_naive = _bench_fn(flydsl_kv_naive_launch)
+    us_fly_mfma16_2wave_opt1 = _bench_fn(flydsl_mfma16_2wave_opt1_launch)
     us_fly_naive = _bench_fn(flydsl_naive_launch)
     us_fly_naive_opt = _bench_fn(flydsl_naive_opt_launch)
     us_triton_vk = _bench_fn(triton_vk_launch)
@@ -1768,9 +1769,9 @@ def _run_perf_comparison(args: PrefillArgs):
     us_hip = _bench_fn(hip_launch) if hip_supported else float("nan")
 
     fly_vs_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
-    # fly_opt (kv_naive) speedup vs Triton_vk (>1 means fly_opt is faster).
+    # fly_opt (mfma16_2wave_opt1) speedup vs Triton_vk (>1 means fly_opt is faster).
     fly_opt_vs_vk = (
-        us_triton_vk / us_fly_kv_naive if us_fly_kv_naive > 0 else float("inf")
+        us_triton_vk / us_fly_mfma16_2wave_opt1 if us_fly_mfma16_2wave_opt1 > 0 else float("inf")
     )
     fly_vs_origin_opt = us_triton_origin_opt / us_fly if us_fly > 0 else float("inf")
     fly_vs_vllm = (
@@ -1793,7 +1794,7 @@ def _run_perf_comparison(args: PrefillArgs):
             "final_st": args.output_final_state,
             "FlyDSL_vk(us)": us_fly,
             "FlyDSL_kv(us)": us_fly_kv,
-            "FlyDSL_kvnaive(us)": us_fly_kv_naive,
+            "FlyDSL_mfma16_2wave_opt1(us)": us_fly_mfma16_2wave_opt1,
             "FlyDSL_vkfork(us)": us_fly_vk,
             "FlyDSL_vknaive(us)": us_fly_vk_naive,
             "FlyDSL_naive(us)": us_fly_naive,
@@ -1914,7 +1915,7 @@ def _print_perf_table():
         ("fs", "final_st", 2),
         ("FlyDSL", "FlyDSL_vk(us)", 6),
         ("fly_naive", "FlyDSL_naive(us)", 9),
-        ("fly_opt", "FlyDSL_kvnaive(us)", 7),
+        ("fly_opt", "FlyDSL_mfma16_2wave_opt1(us)", 7),
         ("Tri_vk", "Triton_vk(us)", 6),
         ("vLLM", "vLLM_vk(us)", 6),
         ("HIP", "HIP_vk(us)", 6),

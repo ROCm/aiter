@@ -2,47 +2,61 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Gated Delta Net K5 hidden-state recurrence kernel -- stripped (no-lds_g) KV fork.
+Gated Delta Net K5 hidden-state recurrence kernel -- MFMA 16x16x16 VWARP fork,
+2-wave (LDS-bound) with HIP-aligned load/store overlap ("mfma16_2wave_opt1").
 
-Exports ``compile_chunk_gated_delta_h_kv_naive`` / emits
-``chunk_gdn_fwd_h_flydsl_kv_naive`` and backs the host ``_fork="kv_naive"`` path.
-This is the NO-lds_g variant (gating reads g inline from HBM per lane). Its
-sibling ``chunk_gated_delta_h_kv.py`` is the with-lds_g variant (``_fork="kv"``).
+Exports ``compile_chunk_gated_delta_h_mfma16_2wave_opt1`` / emits
+``chunk_gdn_fwd_h_flydsl_mfma16_2wave_opt1`` and backs the host
+``_fork="mfma16_2wave_opt1"`` path. Sibling ``chunk_gated_delta_h_kv.py`` is the
+with-lds_g "kv" fork (``_fork="kv"``).
 
-ALL prefetch / software-pipeline scheduling is removed, AND the per-chunk g LDS
-staging (lds_g) is removed -- gating reads g inline from HBM per lane. A trace
-therefore shows the raw bottleneck structure with no hand-scheduling and no
-g-staging tweak:
+(History: this file started life as the stripped "kv_naive" fork -- all
+prefetch/pipeline removed to expose the raw bottleneck -- and was then optimized
+into the current HIP-aligned pipeline. It was renamed accordingly; the compile /
+entry / kernel symbols now read ``mfma16_2wave_opt1``.)
 
-  * NO cross-chunk w prefetch (no init=/yield carry of w).
-  * NO OPT-K k-prefetch interleave (k is loaded straight to LDS before GEMM1).
-  * NO OPT-W next-w interleave into GEMM2.
+Layout / occupancy:
+  * VWARP MFMA 16x16x16 (bf16 1k). BV-parameterized: BV in {16,32,64} ->
+    NUM_WARPS in {1,2,4}; each warp owns a 16-wide V-tile x full K.
+  * Public h snapshot in VK [..., V, K] (K innermost): h_accs -> lds_ht stage
+    -> coalesced b128 read-out -> HBM (buffer_store_dwordx4).
+  * INDEPENDENT lds_ht (its own ~17KB buffer, NOT aliased into lds_k). Total
+    LDS ~70KB/wg -> 2 waves/SIMD (LDS-bound). The independent buffer is the
+    substrate for the store overlap below (the deferred readout must survive
+    step-1 -> pre-GEMM2 unaliased).
 
-PHASE-4 (rev219): lds_g g-staging IS now enabled (OPT-C(g), ported from the
-sibling chunk_gated_delta_h_kv.py). The chunk's 64 per-row g values are staged
-once into a tiny 256 B LDS buffer (branchless, published on the existing
-w-barrier) and read from LDS in gating, replacing the ~17 scalar
-buffer_load_dword/lane that the ISA proved were the #1 VMEM-wait (a vmcnt(16)->0
-drain in gating). +256 B LDS, 3-wave safe. The w/u/k prefetch experiments
-(rev216-218) were reverted first -- they were net-neutral because those wide
-dwordx4 loads were not the binding wait; the scalar g loads were.
+Cooperative on-chip staging (coalesce the otherwise-scattered HBM traffic):
+  * lds_u  : u cooperatively vec-loaded (dwordx4) then read per-lane in step 5.
+  * lds_vn : v_new staged then coalesced b128 read-out to HBM.
+  * lds_g  : chunk's 64 per-row g staged once (256 B), read from LDS in gating
+    (replaces the ~17 scalar buffer_load_dword/lane that were a top VMEM-wait).
 
-What is KEPT (these are layout/correctness, not pipeline scheduling):
-  * OPT-VWARP layout (wid -> one 16-wide V-tile, full K). VWARP-only file:
-    the non-VWARP path is dropped entirely (this fork is BV==64 only).
-  * KV h snapshot store: h is written DIRECTLY to HBM in [..., K, V] layout
-    (V innermost) straight from the h_accs registers -- adjacent lanes (V)
-    write adjacent HBM addresses => coalesced, no lds_h round-trip. The host
-    wrapper returns a transposed VK view so callers see the usual VK layout.
-  * h_accs recurrence state is still carried across chunks via the dynamic
+HIP-aligned software pipeline (the "opt" in the name):
+  * W_PF_INTERLEAVE / K_PF_INTERLEAVE: next chunk's w/k are prefetched into
+    registers, carried across chunks via the scf.for init=/yield.
+  * W_PF_INTERLEAVE_GEMM1: those next-chunk w/k vec_loads are issued INTERLEAVED
+    into the GEMM1 MFMA loop (HBM load latency hidden by GEMM1), which frees
+    GEMM2 to hide the store below.
+  * HT_STORE_OVERLAP_GEMM2: the h-snapshot b128 readout + HBM store is DEFERRED
+    from the top of the chunk to just before GEMM2, so GEMM2's MFMA chain hides
+    the store latency (mirrors HIP's coalesced_vk_store_from_transpose placed
+    before run_gemm2). The staged lds_ht copy is pre-gating, so GEMM2's in-place
+    h_accs update does not corrupt the snapshot.
+  * h_accs recurrence state is carried across chunks via the dynamic
     ``for ... init=/yield`` -- that is the SSM recurrence, not a prefetch.
 
 For each chunk t (serial over NT chunks):
-  1. Store h snapshot for downstream K6 (h_accs -> HBM, KV [K][V] coalesced).
-  2. v_new = u - w @ h   (delta correction via MFMA, h from registers).
+  1. h snapshot STAGE: h_accs (pre-gating) -> lds_ht.  (b128 readout+store is
+     deferred to just before step 3's GEMM2 when HT_STORE_OVERLAP_GEMM2.)
+  2. v_new = u - w @ h   (GEMM1; next-chunk w/k loads interleaved here).
   3. Gated decay + state update:
        v_new *= exp(g_last - g_cumsum)
-       h = h * exp(g_last) + k^T @ v_new
+       h = h * exp(g_last) + k^T @ v_new   (GEMM2; h-snapshot store overlapped).
+
+Behavior is controlled by the compile-time toggles near the top of
+``compile_...`` (USE_LDS_U / USE_LDS_VN_STORE / USE_LDS_G / LDS_HT_INDEPENDENT /
+W_PF_INTERLEAVE(_GEMM1) / K_PF_INTERLEAVE / HT_STORE_OVERLAP_GEMM2), each with a
+MEASURED note recording its A/B result on varlen-32k-aws.
 """
 
 import math
@@ -92,7 +106,7 @@ def _mfma_bf16_16x16x16(a_bf16x4, b_bf16x4, acc_f32x4):
 # -- Compile the kernel ---------------------------------------------------
 
 
-def compile_chunk_gated_delta_h_kv_naive(
+def compile_chunk_gated_delta_h_mfma16_2wave_opt1(
     *,
     K: int,
     V: int,
@@ -210,7 +224,7 @@ def compile_chunk_gated_delta_h_kv_naive(
     # lds_ht before this chunk's (now late) readout finishes. False = rev226
     # (readout at top of chunk).
     # MEASURED (GPU7, varlen-32k-aws, kernel-only median us, both overlap flags
-    # ON vs OFF, all 41 kv_naive allclose pass):
+    # ON vs OFF, all 41 mfma16_2wave_opt1 allclose pass):
     #   T1000 : overlap 496.8  vs htindep(2w) 516.8  vs aliased(3w) 483.9
     #   T5000 : overlap 502.0  vs htindep(2w) 524.5  vs aliased(3w) 522.9
     #   T10000: overlap 555.7  vs htindep(2w) 719.9  vs aliased(3w) 716.8
@@ -329,7 +343,7 @@ def compile_chunk_gated_delta_h_kv_naive(
     allocator = SmemAllocator(
         None,
         arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_kv_naive_vkb128alias_bv{BV}u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}ht{int(LDS_HT_INDEPENDENT)}wpf{int(W_PF_INTERLEAVE)}kpf{int(K_PF_INTERLEAVE)}wg1{int(W_PF_INTERLEAVE_GEMM1)}hov{int(HT_STORE_OVERLAP_GEMM2)}_smem_v{_K5_KERNEL_REVISION}",
+        global_sym_name=f"gdn_h_mfma16_2wave_opt1_vkb128alias_bv{BV}u{int(USE_LDS_U)}vn{int(USE_LDS_VN_STORE)}g{int(USE_LDS_G)}ht{int(LDS_HT_INDEPENDENT)}wpf{int(W_PF_INTERLEAVE)}kpf{int(K_PF_INTERLEAVE)}wg1{int(W_PF_INTERLEAVE_GEMM1)}hov{int(HT_STORE_OVERLAP_GEMM2)}_smem_v{_K5_KERNEL_REVISION}",
     )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
@@ -368,7 +382,7 @@ def compile_chunk_gated_delta_h_kv_naive(
     ROWS_PER_BATCH_U = BLOCK_THREADS // THREADS_PER_ROW_U
     NUM_LOAD_BATCHES_U = BT // ROWS_PER_BATCH_U
 
-    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_kv_naive")
+    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_mfma16_2wave_opt1")
     def gdn_h_kernel(
         k_tensor: fx.Pointer,
         v_tensor: fx.Pointer,
@@ -1206,5 +1220,5 @@ def compile_chunk_gated_delta_h_kv_naive(
 
 
 __all__ = [
-    "compile_chunk_gated_delta_h_kv_naive",
+    "compile_chunk_gated_delta_h_mfma16_2wave_opt1",
 ]

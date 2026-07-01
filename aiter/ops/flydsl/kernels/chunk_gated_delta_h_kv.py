@@ -6,8 +6,9 @@ Gated Delta Net K5 hidden-state recurrence kernel -- un-pipelined KV fork.
 
 Exports ``compile_chunk_gated_delta_h_kv`` / emits ``chunk_gdn_fwd_h_flydsl_kv``
 and backs the host ``_fork="kv"`` path. This is the WITH-lds_g variant (it keeps
-the OPT-C(g) g-staging tweak below). Its sibling ``chunk_gated_delta_h_kv_naive.py``
-is the more-stripped no-lds_g variant (``_fork="kv_naive"``).
+the OPT-C(g) g-staging tweak below). Its sibling
+``chunk_gated_delta_h_mfma16_2wave_opt1.py`` is the mfma16 2-wave store-overlap
+variant (``_fork="mfma16_2wave_opt1"``).
 
 This is a deliberately stripped-down variant with ALL prefetch / software-
 pipeline scheduling removed, so a trace shows the raw bottleneck structure
