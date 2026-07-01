@@ -70,6 +70,11 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
+# Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
+# per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
+# so there is no overhead.
+kernel_bench_callable = None
+
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
@@ -680,7 +685,8 @@ def fused_moe_(
             local_topk_ids = None
 
     if metadata.run_1stage:
-        return metadata.stage1(
+        _stage1_call = functools.partial(
+            metadata.stage1,
             hidden_states,
             w1,
             w2,
@@ -703,6 +709,9 @@ def fused_moe_(
             device=topk_ids.device,
             doweight_stage1=doweight_stage1,
         )
+        if kernel_bench_callable is not None:
+            kernel_bench_callable.append(("stage1", _stage1_call))
+        return _stage1_call()
     else:
         return fused_moe_2stages(
             hidden_states,
@@ -2506,7 +2515,8 @@ def fused_moe_2stages(
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
-    a2 = metadata.stage1(
+    _stage1_call = functools.partial(
+        metadata.stage1,
         a1,
         w1,
         w2,
@@ -2525,6 +2535,9 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(("stage1", _stage1_call))
+    a2 = _stage1_call()
     if m_indices is not None and isinstance(a2, tuple):
         a2, a2_scale = a2[0], a2[1]
     elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
@@ -2607,7 +2620,8 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    metadata.stage2(
+    _stage2_call = functools.partial(
+        metadata.stage2,
         a2,
         w1,
         w2,
@@ -2626,6 +2640,9 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(("stage2", _stage2_call))
+    _stage2_call()
 
     return moe_out
 
