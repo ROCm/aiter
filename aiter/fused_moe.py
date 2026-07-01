@@ -415,7 +415,7 @@ def fused_moe_(
         and w2_global_scale is not None
     )
     if is_nvfp4_bf16:
-        assert q_dtype_a == dtypes.bf16
+        q_dtype_a = dtypes.bf16
         q_dtype_w = "nvfp4_bf16"
 
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,

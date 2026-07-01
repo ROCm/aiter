@@ -47,7 +47,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility import fp4_utils
-from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.utility.fp4_utils import moe_mxfp4_sort, _quantize_nvfp4_weight_for_moe
 
 
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -89,59 +89,6 @@ def is_nvfp4_bf16_tune_key(dtype, q_dtype_a, q_dtype_w, q_type):
         and q_dtype_w == "nvfp4_bf16"
         and q_type == QuantType.No
     )
-
-
-def _quantize_nvfp4_weight_for_moe(
-    weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    def _pack_fp4_to_uint8(fp4_f32: torch.Tensor) -> torch.Tensor:
-        e2m1_encode = {
-            0.0: 0,
-            0.5: 1,
-            1.0: 2,
-            1.5: 3,
-            2.0: 4,
-            3.0: 5,
-            4.0: 6,
-            6.0: 7,
-        }
-        sign = (fp4_f32 < 0).to(torch.uint8) << 3
-        magnitude = torch.abs(fp4_f32)
-        code = torch.zeros_like(magnitude, dtype=torch.uint8)
-        for value, bits in e2m1_encode.items():
-            code[magnitude == value] = bits
-        nibbles = sign | code
-        low = nibbles[..., 0::2]
-        high = nibbles[..., 1::2]
-        return low | (high << 4)
-
-    expert, n_out, k = weight.shape
-    if k % 16 != 0:
-        raise ValueError(f"NVFP4 MoE weight K must be divisible by 16, got K={k}")
-    global_scale = torch.ones((expert,), dtype=torch.float32, device=weight.device)
-    packed_per_expert = []
-    scales_per_expert = []
-    for expert_idx in range(expert):
-        fp4_f32, block_scales_f32 = fp4_utils.ref_nvfp4_quant(
-            weight[expert_idx].float(),
-            global_scale[expert_idx : expert_idx + 1],
-            block_size=16,
-        )
-        packed_per_expert.append(_pack_fp4_to_uint8(fp4_f32))
-        scales_per_expert.append(
-            block_scales_f32.to(torch.float8_e4m3fn).view(torch.uint8)
-        )
-    packed_weight = torch.stack(packed_per_expert, dim=0).contiguous()
-    block_scales = torch.stack(scales_per_expert, dim=0).contiguous()
-    dequantized_weight = fp4_utils.dequantize_nvfp4(
-        packed_weight,
-        block_scales,
-        global_scale,
-        weight.dtype,
-        block_size=16,
-    )
-    block_scales.dequantized_weight = dequantized_weight.contiguous()
-    return packed_weight.contiguous(), block_scales, global_scale
 
 
 TUNE_MOE_EXPERT_BALANCE = (

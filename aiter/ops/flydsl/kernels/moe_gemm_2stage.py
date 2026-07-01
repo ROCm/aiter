@@ -203,6 +203,11 @@ def compile_moe_gemm1(
         raise ValueError(
             f"FlyDSL nvfp4_bf16 groupwise scale requires group_size=16, got {group_size}."
         )
+    if is_nvfp4_bf16 and inter_dim % tile_n != 0:
+        raise ValueError(
+            "FlyDSL nvfp4_bf16 stage1 requires inter_dim to be a positive "
+            f"multiple of tile_n, got inter_dim={inter_dim}, tile_n={tile_n}."
+        )
     is_int4_bf16_groupwise = is_int4_bf16 and use_groupwise_scale
     use_inloop_w_scale = use_groupwise_scale or use_nvfp4_groupwise_scale
     num_groups = (
@@ -237,6 +242,14 @@ def compile_moe_gemm1(
         )
     else:
         _k_per_batch = model_dim
+        if is_nvfp4_bf16:
+            _k_tiles = _k_per_batch // tile_k
+            if _k_tiles < 2 or _k_tiles % 2 != 0:
+                raise ValueError(
+                    "FlyDSL nvfp4_bf16 stage1 requires an even number of K tiles "
+                    f">= 2, got model_dim/tile_k={_k_tiles} "
+                    f"(model_dim={model_dim}, tile_k={tile_k})."
+                )
 
     mfma_i32_k32 = None
     if is_int8:
@@ -2236,6 +2249,11 @@ def compile_moe_gemm2(
     if use_nvfp4_groupwise_scale and group_size != 16:
         raise ValueError(
             f"FlyDSL nvfp4_bf16 groupwise scale requires group_size=16, got {group_size}."
+        )
+    if is_nvfp4_bf16 and model_dim % tile_n != 0:
+        raise ValueError(
+            "FlyDSL nvfp4_bf16 stage2 requires model_dim to be a positive "
+            f"multiple of tile_n, got model_dim={model_dim}, tile_n={tile_n}."
         )
     is_int4_bf16_groupwise = is_int4_bf16 and use_groupwise_scale
     use_inloop_w_scale = use_groupwise_scale or use_nvfp4_groupwise_scale
