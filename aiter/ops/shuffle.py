@@ -225,13 +225,11 @@ def shuffle_scale_n32k4(
 
     * ``False`` (GGUU / ``GateMode.SEPARATED``): rows are ``[g0..g_{I-1},
       u0..u_{I-1}]``; the n32k4 super-rows are taken as-is.
-    * ``True`` (GUGU / ``GateMode.INTERLEAVE``): the raw GGUU rows are first
-      interleaved to ``[g0,u0,g1,u1,...]`` (matching the INTERLEAVE stage1
-      weight layout produced for the fused gemm1) and then folded into n32k4.
-
-    ``gate_up`` is accepted for signature parity with ``shuffle_scale`` /
-    ``moe_shuffle_scale``; the gate/up interleave is driven by
-    ``is_guinterleave`` (the n32k4 fold is identical for both).
+    * ``True`` + ``gate_up=True``: rows are rearranged per 16-row tile to
+      ``[g0..g15,u0..u15,g16..g31,u16..u31,...]``, matching
+      ``shuffle_weight(..., is_guinterleave=True, gate_up=True)``.
+    * ``True`` + ``gate_up=False``: preserve the older row-wise GUGU layout
+      ``[g0,u0,g1,u1,...]``.
     """
     s = src.view(torch.uint8).contiguous()
     if s.ndim == 2:
@@ -242,14 +240,31 @@ def shuffle_scale_n32k4(
         raise ValueError(f"n32k4 scale must be 2D or 3D, got {s.ndim}D")
     E, N, k_scale = s.shape
     if is_guinterleave:
-        # GUGU: interleave gate/up rows [g..,u..] -> [g0,u0,g1,u1,...] so the
-        # n32k4 super-rows line up with the INTERLEAVE stage1 weight layout.
         if N % 2 != 0:
             raise ValueError(
                 f"GUGU n32k4 scale needs N=2*inter_dim (even rows), got N={N}"
             )
-        # (E, [g..,u..], k) -> (E, 2, N/2, k) -> (E, N/2, 2, k) -> (E, N, k)
-        s = s.view(E, 2, N // 2, k_scale).permute(0, 2, 1, 3).reshape(E, N, k_scale)
+        inter = N // 2
+        if gate_up:
+            if inter % 16 != 0:
+                raise ValueError(
+                    "GUGU tiled n32k4 scale needs inter_dim divisible by 16, "
+                    f"got inter_dim={inter}"
+                )
+            # (E, [g..,u..], k) -> (E, 2, I/16, 16, k)
+            # -> (E, I/16, 2, 16, k) -> [16G,16U] tiles.
+            s = (
+                s.view(E, 2, inter // 16, 16, k_scale)
+                .permute(0, 2, 1, 3, 4)
+                .reshape(E, N, k_scale)
+            )
+        else:
+            # Older row-wise GUGU: [g..,u..] -> [g0,u0,g1,u1,...].
+            s = (
+                s.view(E, 2, inter, k_scale)
+                .permute(0, 2, 1, 3)
+                .reshape(E, N, k_scale)
+            )
     if N % 32 != 0:
         raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
     if k_scale % 4 != 0:

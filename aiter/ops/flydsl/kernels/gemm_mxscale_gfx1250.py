@@ -518,12 +518,14 @@ def compile_mxscale_gemm(
         d_output_off = 0
         _lds_d_stride_elems = lds_d_row_stride // 2
         _warp_d_elems = warp_d_bytes // 2
-        # per-WMMA-N column stride and per-lane-kgrp stride in bf16 elements.
-        # gugu de-interleaves (raw 2 cols -> 1 output col), so both halve.
+        # Per-WMMA-N column stride and per-lane-kgrp stride in bf16 elements.
+        # Stage1 gugu consumes the shuffle_weight(..., gate_up=True) layout:
+        # each raw 32-row group is [16 gate rows, 16 up rows], producing 16
+        # output columns.
         _n_col_d_elems = (
             (WMMA_N // 2 if stage1_act_interleave else WMMA_N) * elem_bytes_d // 2
         )
-        _kgrp_d_elems = 4 if stage1_act_interleave else (4 * elem_bytes_d)
+        _kgrp_d_elems = 4 * elem_bytes_d
         d_need_epilogue_fence = total_d_bytes > epilogue_fence_threshold_bytes
         if total_d_bytes > arena_total_bytes:
             arena_total_bytes = total_d_bytes
@@ -564,6 +566,26 @@ def compile_mxscale_gemm(
                 m_off = _wm * WMMA_M
                 n_sub = _wn
                 _sub_tiles.append((acc_idx, 0, m_off, n_sub))
+
+    _stage1_interleave_pairs = []
+    if stage1_act_interleave:
+        _sub_tile_lookup = {
+            (m_off, wn): (acc_idx, vec_base)
+            for acc_idx, vec_base, m_off, wn in _sub_tiles
+        }
+        for acc_idx, vec_base, m_off, wn in _sub_tiles:
+            if wn % 2 != 0:
+                continue
+            _up_tile = _sub_tile_lookup.get((m_off, wn + 1))
+            if _up_tile is None:
+                raise ValueError(
+                    "stage1 gugu tiled layout requires each warp to cover a "
+                    "complete 32-row gate/up group"
+                )
+            up_acc_idx, up_vec_base = _up_tile
+            _stage1_interleave_pairs.append(
+                (acc_idx, vec_base, up_acc_idx, up_vec_base, m_off, wn)
+            )
 
     COMPUTE_SCHEDULE_ROW_MAJOR_STREAMING = "row_major_streaming"
     COMPUTE_SCHEDULE_FP4_COL_BAND = "fp4_col_band"
@@ -1793,6 +1815,36 @@ def compile_mxscale_gemm(
                     elems.append(_stage1_act_mul_scalar(g, u))
                 return vector.from_elements(T.vec(8, T.f32), elems)
 
+            def _stage1_tiled_logical_col_base(wn):
+                raw_col_base = (
+                    blk_n
+                    + warp_n_base
+                    + arith.index(wn * WMMA_N)
+                    + lane_kgrp * arith.index(8)
+                )
+                return (
+                    (raw_col_base // arith.index(32)) * arith.index(16)
+                    + raw_col_base % arith.index(16)
+                )
+
+            def _add_stage1_tiled_bias_vec8(acc_vec8, wn, up):
+                if const_expr(not epilogue_bias_mode):
+                    return acc_vec8
+                elems = []
+                logical_col_base = _stage1_tiled_logical_col_base(wn)
+                bias_base = batch_idx * arith.index(B_TOTAL_N) + logical_col_base
+                if const_expr(up):
+                    bias_base = bias_base + arith.index(N // 2)
+                for vi in range_constexpr(8):
+                    bias_h = buffer_ops.buffer_load(
+                        bias_rsrc,
+                        arith.index_cast(T.i32, bias_base + arith.index(vi)),
+                        vec_width=1,
+                        dtype=_out_elem_local,
+                    )
+                    elems.append(bias_h.extf(T.f32))
+                return acc_vec8 + vector.from_elements(T.vec(8, T.f32), elems)
+
             def epilogue_stage1_act_stores(gate_accs, up_accs, addrs):
                 addr_idx = 0
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
@@ -1840,18 +1892,21 @@ def compile_mxscale_gemm(
                             )
 
             def epilogue_stage1_act_interleaved_stores(final_accs):
-                for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    raw_sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
-                    raw_sub8 = _add_bias_vec8(raw_sub8, wn)
+                for (
+                    gate_acc_idx,
+                    gate_vec_base,
+                    up_acc_idx,
+                    up_vec_base,
+                    m_off,
+                    wn,
+                ) in _stage1_interleave_pairs:
+                    gate_sub8 = _get_acc_sub8(final_accs, gate_acc_idx, gate_vec_base)
+                    up_sub8 = _get_acc_sub8(final_accs, up_acc_idx, up_vec_base)
+                    gate_sub8 = _add_stage1_tiled_bias_vec8(gate_sub8, wn, False)
+                    up_sub8 = _add_stage1_tiled_bias_vec8(up_sub8, wn, True)
                     row_local = blk_m + warp_m_base + arith.index(m_off) + lane16
                     row = flat_m_base + warp_m_base + arith.index(m_off) + lane16
-                    raw_col_base = (
-                        blk_n
-                        + warp_n_base
-                        + arith.index(wn * WMMA_N)
-                        + lane_kgrp * arith.index(8)
-                    )
-                    out_col_base = raw_col_base // arith.index(2)
+                    out_col_base = _stage1_tiled_logical_col_base(wn)
                     store_valid = tile_valid
                     if const_expr(needs_grouped_row_masked_store):
                         row_valid = arith.cmpi(
@@ -1863,78 +1918,67 @@ def compile_mxscale_gemm(
                     if const_expr(N % tile_n != 0):
                         col_valid = arith.cmpi(
                             arith.CmpIPredicate.slt,
-                            arith.index_cast(T.i32, out_col_base + arith.index(3)),
+                            arith.index_cast(T.i32, out_col_base + arith.index(7)),
                             arith.constant(C_N, type=T.i32),
                         )
                         store_valid = arith.andi(store_valid, col_valid)
-                    out_vals = []
-                    for pair in range_constexpr(4):
-                        g = vector.extract(
-                            raw_sub8, static_position=[pair * 2], dynamic_position=[]
-                        )
-                        u = vector.extract(
-                            raw_sub8,
-                            static_position=[pair * 2 + 1],
-                            dynamic_position=[],
-                        )
-                        out_vals.append(_stage1_act_mul_scalar(g, u))
+                    out_sub8 = _stage1_act_mul_vec8(gate_sub8, up_sub8)
                     store_if = scf.IfOp(store_valid, results_=[], has_else=False)
                     with ir.InsertionPoint(store_if.then_block):
                         elem_off = row * arith.index(C_N) + out_col_base
                         if const_expr(_bf16_out):
-                            h_vals = [
-                                arith.trunc_f(_out_elem_local, v) for v in out_vals
-                            ]
-                            h_vec = vector.from_elements(
-                                T.vec(4, _out_elem_local), h_vals
-                            )
-                            i32_vec = vector.bitcast(T.vec(2, T.i32), h_vec)
                             byte_off = elem_off * arith.index(elem_bytes_d)
-                            buffer_ops.buffer_store(
-                                i32_vec,
+                            store_acc_vec8_to_buffer(
+                                out_sub8,
                                 c_rsrc,
                                 arith.index_cast(T.i32, byte_off),
+                                out_elem=_out_elem_local,
                                 offset_is_bytes=True,
                             )
                         else:
-                            f_vec = vector.from_elements(T.vec(4, T.f32), out_vals)
-                            buffer_ops.buffer_store(
-                                f_vec, c_rsrc, arith.index_cast(T.i32, elem_off)
+                            store_acc_vec8_to_buffer(
+                                out_sub8,
+                                c_rsrc,
+                                [elem_off, elem_off + arith.index(4)],
                             )
                         scf.YieldOp([])
 
             def epilogue_stage1_act_interleaved_lds_stores(final_accs, d_buf, d_base):
-                # Same de-interleave + swiglu as the buffer-store path, but write
-                # the 4 activated outputs per sub-tile into the C_N-wide LDS output
-                # tile (de-interleaved layout) for a subsequent tensor_store_2d.
+                # Same gate/up pairing as the buffer-store path, but write the
+                # activated vec8 into the C_N-wide LDS output tile for a
+                # subsequent tensor_store_2d.
                 # No per-row mask here: the TDM-store path is gated on
                 # not needs_grouped_row_masked_store.
-                for acc_idx, vec_base, m_off, wn in _sub_tiles:
-                    raw_sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
-                    raw_sub8 = _add_bias_vec8(raw_sub8, wn)
-                    out_vals = []
-                    for pair in range_constexpr(4):
-                        g = vector.extract(
-                            raw_sub8, static_position=[pair * 2], dynamic_position=[]
-                        )
-                        u = vector.extract(
-                            raw_sub8,
-                            static_position=[pair * 2 + 1],
-                            dynamic_position=[],
-                        )
-                        out_vals.append(_stage1_act_mul_scalar(g, u))
+                for (
+                    gate_acc_idx,
+                    gate_vec_base,
+                    up_acc_idx,
+                    up_vec_base,
+                    m_off,
+                    wn,
+                ) in _stage1_interleave_pairs:
+                    gate_sub8 = _get_acc_sub8(final_accs, gate_acc_idx, gate_vec_base)
+                    up_sub8 = _get_acc_sub8(final_accs, up_acc_idx, up_vec_base)
+                    gate_sub8 = _add_stage1_tiled_bias_vec8(gate_sub8, wn, False)
+                    up_sub8 = _add_stage1_tiled_bias_vec8(up_sub8, wn, True)
+                    out_sub8 = _stage1_act_mul_vec8(gate_sub8, up_sub8)
                     off = d_base + arith.index(
                         m_off * _lds_d_stride_elems + wn * _n_col_d_elems
                     )
                     if const_expr(_bf16_out):
-                        h_vec = vector.from_elements(
-                            T.vec(4, _out_elem_local),
-                            [arith.trunc_f(_out_elem_local, v) for v in out_vals],
-                        )
-                        lds_store_b64(d_buf, off, h_vec)
+                        h_vals = []
+                        for vi in range_constexpr(8):
+                            out_elem = vector.extract(
+                                out_sub8, static_position=[vi], dynamic_position=[]
+                            )
+                            h_vals.append(arith.trunc_f(_out_elem_local, out_elem))
+                        h_vec = vector.from_elements(T.vec(8, _out_elem_local), h_vals)
+                        lds_store_b128(d_buf, off, h_vec)
                     else:
-                        f_vec = vector.from_elements(T.vec(4, T.f32), out_vals)
-                        lds_store_b128(d_buf, off, f_vec)
+                        lo = vector.shuffle(out_sub8, out_sub8, [0, 1, 2, 3])
+                        hi = vector.shuffle(out_sub8, out_sub8, [4, 5, 6, 7])
+                        lds_store_b128(d_buf, off, lo)
+                        lds_store_b128(d_buf, off + arith.index(8), hi)
 
             def epilogue_lds_stores(final_accs, d_buf, d_base):
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:

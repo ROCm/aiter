@@ -344,22 +344,27 @@ def _run_grouped_via_fused_moe(
     # ---- prep grouped GEMM inputs ----
     # Stage1 weight/scale/bias get rearranged to physical ``layout``; stage2
     # has no GUGU/GGUU concept (single N=hidden GEMM).
+    w1_phys = w1_logical
+    bias1_phys = bias1
     if layout == "gugu":
-        w1_phys = _gguu_to_gugu_rows(w1_logical)
-        bias1_phys = _gguu_to_gugu_rows(bias1)
+        # w1_phys = _gguu_to_gugu_rows(w1_logical)
+        # bias1_phys = _gguu_to_gugu_rows(bias1)
         gate_mode = GateMode.INTERLEAVE
     else:
-        w1_phys = w1_logical
-        bias1_phys = bias1
+
         gate_mode = GateMode.SEPARATED
 
-    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
+    w1_grouped = shuffle_weight(
+        w1_phys,
+        layout=(16, 16),
+        is_guinterleave=gate_mode == GateMode.INTERLEAVE,
+        gate_up=True,
+    )
     w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
     if layout == "gugu":
-        # GUGU B-scale is always built the production way: feed the RAW GGUU
-        # scale to moe_shuffle_scale(is_guinterleave=True), which interleaves
-        # gate/up rows then folds n32k4 (aiter.ops.shuffle.shuffle_scale_n32k4
-        # end to end) -- the weights/bias are row-interleaved above.
+        # GUGU B-scale follows the same tiled GU physical layout as
+        # shuffle_weight(..., gate_up=True): each 32-row group is 16 gate rows
+        # followed by the matching 16 up rows.
         w1_scale = moe_shuffle_scale(
             w1_scale_raw.contiguous(),
             experts_cnt=experts,
