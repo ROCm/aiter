@@ -107,6 +107,14 @@ float fmha_fwd_v3_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
 // validate shapes (see asm_mha_fwd_sparse.cu::fmha_v3_fwd_mxfp4_sparse).
 float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 
+// Sorted-dispatch mxfp4 sparse sibling. Flat grid (total_tiles,1,1) driven by a
+// host-built LPT work table (a.work_table_ptr / a.total_tiles); each WG reads
+// work_table[wg_id]. Reuses the BASE mxfp4 sparse kernel symbol
+// (_ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E) and the 752-byte persistent
+// kernarg (3 LUT pointers at 0x290/0x2A0/0x2B0, work_table at 0x2D0); routes to
+// fwd_hd128_mxfp4_sparse_sorted.co. Requires a.work_table_ptr / a.total_tiles.
+float fmha_fwd_v3_mxfp4_sparse_sorted(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
 // DENSE (non-sparse) mxfp4 sibling. Same fp4-Q/K * fp8-V * bf16-out contract as
 // the mxfp4 sparse path, but the kernel (fwd_hd128_mxfp4.co, from
 // mi350_fmha_hd128_mxfp4.py) walks all KV blocks sequentially -- no LUT. It reads

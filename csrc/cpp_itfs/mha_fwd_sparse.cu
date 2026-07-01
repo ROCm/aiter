@@ -31,6 +31,13 @@ static constexpr const char* kSparseMxfp4KernelName =
     "_ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E";
 static constexpr const char* kSparseMxfp4CoName =
     "fmha_v3_fwd/fwd_hd128_mxfp4_sparse.co";
+// Sorted (flat-grid, LPT work-table) mxfp4 sparse sibling. Reuses the BASE
+// mxfp4 sparse kernel symbol (kSparseMxfp4KernelName); only the .co differs.
+// Built from the persistent/sorted codegen: one WG per tile on a flat grid
+// (total_tiles,1,1); each WG reads work_table[wg_id]. 752-byte kernarg with
+// work_table at 0x2D0 (the 3 LUT pointers stay at 0x290/0x2A0/0x2B0).
+static constexpr const char* kSparseMxfp4SortedCoName =
+    "fmha_v3_fwd/fwd_hd128_mxfp4_sparse_sorted.co";
 // DENSE mxfp4 sibling (no LUT; reads the 656-byte dense kernarg).
 static constexpr const char* kDenseMxfp4KernelName =
     "_ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E";
@@ -240,6 +247,72 @@ float fmha_fwd_v3_mxfp4_sparse(mha_fwd_sparse_args a, const ck_tile::stream_conf
     const int gdx = num_q_blocks;
     const int gdy = a.nhead_q;
     const int gdz = a.batch;
+    const int bdx = kSparseBdx;
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr     = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
+                                 bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// Sorted-dispatch mxfp4 sparse sibling. One WG per tile on a flat grid
+// (total_tiles,1,1); each WG reads its tile from work_table[wg_id]. Reuses the
+// BASE mxfp4 sparse kernel symbol (kSparseMxfp4KernelName) and our 704-byte
+// init_sparse_v3_args base (the 3 LUT pointers stay at 0x290/0x2A0/0x2B0); the
+// 752-byte persistent kernarg adds ptr_work_table at 0x2D0. Requires
+// a.work_table_ptr / a.total_tiles. Mirrors fmha_fwd_v3_fp8_sparse_affine_sorted
+// but keeps the mxfp4 0x290 LUT tail (no group-mode-slot remap).
+float fmha_fwd_v3_mxfp4_sparse_sorted(mha_fwd_sparse_args a,
+                                      const ck_tile::stream_config& s)
+{
+    const char* tag = "fmha_fwd_v3_mxfp4_sparse_sorted";
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING(tag << ": only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    // Like fmha_fwd_v3_mxfp4_sparse, the dtype tag is kept opaque to the host;
+    // the torch entry validates that Q/K are fp4-packed.
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING(tag << ": unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must all be off)");
+        return -1;
+    }
+    if(a.work_table_ptr == nullptr || a.total_tiles == 0)
+    {
+        AITER_LOG_WARNING(tag << ": work_table_ptr/total_tiles must be set");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        kSparseMxfp4SortedCoName,
+        [&]() { return AiterAsmKernel(kSparseMxfp4KernelName, kSparseMxfp4SortedCoName); });
+
+    fmha_fwd_v3_sparse_persistent_args args{};
+    size_t arg_size = sizeof(args);
+    init_sparse_v3_args(args, a); // dense 656-byte base + 0x290 LUT tail (704)
+    args.ptr_work_table = a.work_table_ptr; // 0x2D0
+    args.s_total_tiles  = a.total_tiles;
+    args.s_num_wgs      = a.total_tiles;    // unused by the sorted .co, kept for parity
+
+    const int gdx = static_cast<int>(a.total_tiles);
+    const int gdy = 1;
+    const int gdz = 1;
     const int bdx = kSparseBdx;
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {

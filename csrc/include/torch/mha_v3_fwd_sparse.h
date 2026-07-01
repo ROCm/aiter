@@ -132,6 +132,26 @@ fmha_v3_fwd_mxfp4_sparse(at::Tensor& q,                  // [b, sq, hq, d/2], in
                         float softmax_scale,
                         std::optional<at::Tensor> out_ = std::nullopt); // [b, sq, hq, d_v], bf16
 
+// Sorted-dispatch mxfp4 sparse sibling of fmha_v3_fwd_mxfp4_sparse. Same mxfp4
+// data contract (fp4-packed Q/K, fp8 V, E8M0 Q/K scales, fp32 V descale, int32
+// LUT, bf16 out) plus a host-built `work_table` int32[total_tiles] tensor (entry
+// k = packed q | (h<<16) | (b<<24), LPT-sorted). Routes to the sorted .co
+// fwd_hd128_mxfp4_sparse_sorted.co via aiter::fmha_fwd_v3_mxfp4_sparse_sorted
+// (BASE mxfp4 sparse kernel symbol _ZN5aiter35fmha_fwd_hd128_mxfp4_sparse_gfx950E).
+std::vector<at::Tensor>
+fmha_v3_fwd_mxfp4_sparse_sorted(at::Tensor& q,                  // [b, sq, hq, d/2], int8/uint8
+                               const at::Tensor& k,             // [b, sk, hk, d/2], int8/uint8
+                               const at::Tensor& v,             // [b, sk, hk, d_v], fp8
+                               const at::Tensor& q_descale,     // E8M0 bytes
+                               const at::Tensor& k_descale,     // E8M0 bytes
+                               const at::Tensor& v_descale,     // fp32 per output channel
+                               const at::Tensor& kv_block_indices, // int32
+                               const at::Tensor& lut_start,        // int32 [b*hq*num_q_blocks]
+                               const at::Tensor& lut_count,        // int32 [b*hq*num_q_blocks]
+                               const at::Tensor& work_table,       // int32 [b*hq*num_q_blocks]
+                               float softmax_scale,
+                               std::optional<at::Tensor> out_ = std::nullopt); // bf16
+
 // DENSE (non-sparse) mxfp4 sibling of fmha_v3_fwd_mxfp4_sparse (no LUT).
 // Kernel: _ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E from
 // aiter/hsa/gfx950/fmha_v3_fwd/fwd_hd128_mxfp4.co.
