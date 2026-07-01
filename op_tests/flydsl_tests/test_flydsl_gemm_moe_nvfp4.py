@@ -29,6 +29,7 @@ DTYPE = torch.bfloat16
 NVFP4_BF16_QDTYPE = "nvfp4_bf16"
 MODEL_DIMS = [128, 192, 256, 512, 1024, 1536, 2048]
 INTER_DIMS = [128, 192, 256, 512, 1024, 1536, 2048]
+TOKENS = [1, 16, 234]
 
 
 
@@ -55,7 +56,6 @@ def _assert_close(
     label: str,
     actual: torch.Tensor,
     expected: torch.Tensor,
-    *,
     atol: float,
     rtol: float,
 ) -> None:
@@ -69,7 +69,6 @@ def _assert_close(
 
 
 def _make_case(
-    *,
     tokens: int = 16,
     experts: int = 8,
     model_dim: int = 256,
@@ -232,7 +231,7 @@ def _is_unsupported_nvfp4_stage2_shape(model_dim: int, params: dict) -> bool:
 @pytest.mark.parametrize("inter_dim", INTER_DIMS)
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("experts", [128])
-@pytest.mark.parametrize("tokens", [1])
+@pytest.mark.parametrize("tokens", TOKENS)
 def test_stage1_correctness(
     tokens: int,
     experts: int,
@@ -345,7 +344,7 @@ def test_stage1_correctness(
 @pytest.mark.parametrize("inter_dim", INTER_DIMS)
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("experts", [128])
-@pytest.mark.parametrize("tokens", [1])
+@pytest.mark.parametrize("tokens", TOKENS)
 def test_stage2_correctness(
     tokens: int,
     experts: int,
@@ -467,7 +466,7 @@ def test_stage2_correctness(
 @pytest.mark.parametrize("inter_dim", INTER_DIMS)
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("experts", [128])
-@pytest.mark.parametrize("tokens", [1])
+@pytest.mark.parametrize("tokens", TOKENS)
 def test_fused_moe_2stages_correctness(
     tokens: int,
     experts: int,
