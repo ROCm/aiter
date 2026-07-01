@@ -276,6 +276,9 @@ def test_fmoe(
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+    elif qType == aiter.QuantType.per_128x128:
+        w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
+        w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
