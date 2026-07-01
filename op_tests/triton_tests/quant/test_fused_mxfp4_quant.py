@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import pytest
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_flatten_mxfp4_quant,
@@ -158,6 +157,7 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shuffle", [True, False])
 @pytest.mark.parametrize("scale_shuffle_padding", [True, False])
+@pytest.mark.parametrize("inargs", ["triton", "gluon"])
 def test_fused_rms_quant(
     M: int,
     N1: int,
@@ -168,11 +168,14 @@ def test_fused_rms_quant(
     dtype,
     shuffle: bool,
     scale_shuffle_padding: bool,
+    inargs: str,
 ):
+
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    torch.manual_seed(0)
+    if inargs == "gluon" and arch_info.get_arch() != "gfx1250":
+        pytest.skip("Gluon kernel only supported on gfx1250 hardware")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     x1, x2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
@@ -202,6 +205,7 @@ def test_fused_rms_quant(
             shuffle=shuffle,
             scale_shuffle_padding=scale_shuffle_padding,
             output_unquantized_inp1=True,
+            inargs=inargs,
         )
     )
 
@@ -230,55 +234,6 @@ def test_fused_rms_quant(
     y1_fp32_triton = convert_mxfp4_to_fp32(y1_fp4_triton, y1_scales_triton)
 
     torch.testing.assert_close(y1_fp32_torch, y1_fp32_triton)
-
-
-def run_torch_reduce_act_mul_mxfp4_group_quant(x, x2, activation, dtype, shuffle):
-    x = x.to(torch.float32)
-    d = x.shape[-1] // 2
-    y2 = None
-    if x.dim() == 3:
-        x = x.sum(axis=0)
-        y2 = x2.sum(axis=0).to(dtype=dtype)
-    else:
-        assert x2 is None, "x2 must be None in x.dim() == 2 cases"
-    x, x_mul = x.split([d, d], dim=-1)
-    if activation == "silu":
-        out = F.silu(x) * x_mul
-    elif activation == "gelu":
-        out = F.gelu(x) * x_mul
-    out, out_scale = torch_dynamic_mxfp4_quant(out)
-    if shuffle:
-        # out_scale_pad = out_scale
-        M = out_scale.shape[0]
-        N = out.shape[1] * 2
-        scaleM = (M + 255) // 256 * 256
-        scaleN_valid = (N + 31) // 32
-        scaleN = (scaleN_valid + 7) // 8 * 8
-        out_scale_pad = torch.empty(
-            (scaleM, scaleN), dtype=out_scale.dtype, device=out_scale.device
-        )
-        out_scale_pad[:M, :scaleN] = out_scale[:M, :scaleN]
-        out_scale = shuffle_scales(out_scale_pad)
-        out_scale = out_scale.view(out_scale.shape[0] * 32, -1)
-    return (out, out_scale), y2
-
-
-def generate_fused_reduce_act_mul_mxfp4_group_quant(
-    M: int,
-    N1: int,
-    dtype=torch.bfloat16,
-    SPK: int = 1,
-    N2: int = 1,
-):
-    if SPK == 1:
-        x = torch.randn((M, N1 * 2), dtype=dtype).cuda() / 10
-    else:
-        x = torch.randn((SPK, M, N1 * 2), dtype=torch.float32).cuda() / 10
-    x2 = None
-    if SPK > 1:
-        x2 = torch.randn((SPK, M, N2), dtype=torch.float32).cuda() / 10
-
-    return x, x2
 
 
 @pytest.mark.parametrize(
