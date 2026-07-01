@@ -1031,9 +1031,7 @@ def unpack_b_nvfp4(packed32, scale_i8, arith, vector):
     def fp4_bytes_to_i64(sel_a: int, sel_b: int, block_scale):
         elems = []
         for byte_sel in (sel_a, sel_b):
-            pair = cvt_scalef32_pk_bf16_fp4(
-                bf16x2_ty, packed32, unity, byte_sel
-            )
+            pair = cvt_scalef32_pk_bf16_fp4(bf16x2_ty, packed32, unity, byte_sel)
             for elem_idx in range(2):
                 v = vector.extract(
                     pair, static_position=[elem_idx], dynamic_position=[]

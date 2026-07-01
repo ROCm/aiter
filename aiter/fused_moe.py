@@ -37,7 +37,6 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
-NVFP4_BF16_QDTYPE = "nvfp4_bf16"
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -402,6 +401,9 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+
+    # NOTE: There is no trivial way to distinguish mxfp4 input vs nvfp4 input at the moment,
+    # apart from relying on `w1_global_scale is not None`.
     is_nvfp4_bf16 = (
         q_dtype_w == torch.uint8
         and quant_type == QuantType.No
@@ -413,8 +415,9 @@ def fused_moe_(
         and w2_global_scale is not None
     )
     if is_nvfp4_bf16:
-        q_dtype_a = dtypes.bf16
-        q_dtype_w = NVFP4_BF16_QDTYPE
+        assert q_dtype_a == dtypes.bf16
+        q_dtype_w = "nvfp4_bf16"
+
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
     # use FP8 as activation dtype to skip redundant re-quantization
     if (
@@ -1398,7 +1401,7 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
-        
+
         logger.info(f"[fused_moe] tuned config used for {keys}: kernelName1={kernelName1}, kernelName2={kernelName2}")
 
     tag = f"({kernelName1=}, {kernelName2=})"
@@ -1495,12 +1498,10 @@ def get_2stage_cfgs(
         )
 
     # Default nvfp4_bf16 fallback when tuned kernelName1/kernelName2 are not found.
-    if (
-        q_type == QuantType.No
-        and dtype == torch.bfloat16
-        and q_dtype_a == torch.bfloat16
-        and q_dtype_w == NVFP4_BF16_QDTYPE
-    ):
+    if q_dtype_w == "nvfp4_bf16":
+        assert q_type == QuantType.No
+        assert dtype == torch.bfloat16
+        assert q_dtype_a == torch.bfloat16
         if not is_flydsl_available():
             raise RuntimeError(
                 f"nvfp4_bf16 fused MoE requires FlyDSL, but FlyDSL is unavailable for {keys}"
@@ -1871,13 +1872,6 @@ def fused_moe_2stages(
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
-    is_nvfp4_bf16 = (
-        q_dtype_w == NVFP4_BF16_QDTYPE
-        and quant_type == QuantType.No
-        and dtype == dtypes.bf16
-        and w1_global_scale is not None
-        and w2_global_scale is not None
-    )
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -1939,7 +1933,7 @@ def fused_moe_2stages(
         # a16wi4: bf16 activations, int4 weights; no activation quantization needed
         a1 = hidden_states.to(dtype)
         a1_scale = None
-    elif is_nvfp4_bf16:
+    elif q_dtype_w == "nvfp4_bf16":
         # NVFP4-BF16: activations remain bf16; weights dequantize in FlyDSL.
         a1 = hidden_states.to(dtype)
         a1_scale = None
@@ -2007,7 +2001,7 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if metadata.stage1.func is _flydsl_stage1_wrapper:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
-    if is_nvfp4_bf16:
+    if q_dtype_w == "nvfp4_bf16":
         extra_stage1_args["w1_global_scale"] = w1_global_scale
         extra_stage2_args["w2_global_scale"] = w2_global_scale
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
@@ -2078,7 +2072,7 @@ def fused_moe_2stages(
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
         a2_scale = None
-    elif is_nvfp4_bf16:
+    elif q_dtype_w == "nvfp4_bf16":
         # NVFP4-BF16 stage1 produces bf16 activations for stage2.
         a2_scale = None
     elif quant_type == QuantType.per_1x32:

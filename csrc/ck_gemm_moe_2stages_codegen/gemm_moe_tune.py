@@ -73,13 +73,12 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
 FLYDSL_FALLBACK_TAG = "flydsl_fallback"
-NVFP4_BF16_QDTYPE = "nvfp4_bf16"
 
 
 def parse_q_dtype_w(value):
     value = str(value).strip()
-    if value == NVFP4_BF16_QDTYPE:
-        return NVFP4_BF16_QDTYPE
+    if value == "nvfp4_bf16":
+        return "nvfp4_bf16"
     return eval(value)
 
 
@@ -87,7 +86,7 @@ def is_nvfp4_bf16_tune_key(dtype, q_dtype_a, q_dtype_w, q_type):
     return (
         dtype == torch.bfloat16
         and q_dtype_a == torch.bfloat16
-        and q_dtype_w == NVFP4_BF16_QDTYPE
+        and q_dtype_w == "nvfp4_bf16"
         and q_type == QuantType.No
     )
 
@@ -247,7 +246,7 @@ class FmoeTuner(TunerCommon):
     }
 
     def get_bpe(self, dtype):
-        if dtype == NVFP4_BF16_QDTYPE:
+        if dtype == "nvfp4_bf16":
             return 0.5
         return super().get_bpe(dtype)
 
@@ -283,7 +282,7 @@ class FmoeTuner(TunerCommon):
         qType,
         quant_dtype,
     ):
-        if quant_dtype == NVFP4_BF16_QDTYPE:
+        if quant_dtype == "nvfp4_bf16":
             weight_qt, weight_scale, global_scale = _quantize_nvfp4_weight_for_moe(
                 weight
             )
@@ -886,7 +885,7 @@ class FmoeTuner(TunerCommon):
         w2_global_scale = getattr(w2_scale, "global_scale", None)
         w1_ref_bf16 = getattr(w1_scale, "dequantized_weight", None)
         w2_ref_bf16 = getattr(w2_scale, "dequantized_weight", None)
-        if q_dtype_w == NVFP4_BF16_QDTYPE:
+        if q_dtype_w == "nvfp4_bf16":
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
         elif q_dtype_w is not dtypes.fp4x2:
@@ -1154,7 +1153,7 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle_ck = w2_qt_shffle
             w1_scale_aiter = w1_scale
             w2_scale_aiter = w2_scale
-        elif q_dtype_w == NVFP4_BF16_QDTYPE:
+        elif q_dtype_w == "nvfp4_bf16":
             w1_qt_shffle_flydsl = fp4_utils.shuffle_nvfp4_weight_for_flydsl(w1_qt)
             w2_qt_shffle_flydsl = fp4_utils.shuffle_nvfp4_weight_for_flydsl(w2_qt)
             # Natural quantizer layout is [E, N, G]. FlyDSL MoE expects [E, G, N].
@@ -1247,7 +1246,7 @@ class FmoeTuner(TunerCommon):
                 if (q_type == QuantType.per_1x32 and q_dtype_a == dtypes.fp8)
                 else a1_scale
             )
-            if q_dtype_w == NVFP4_BF16_QDTYPE:
+            if q_dtype_w == "nvfp4_bf16":
                 ref_w1 = w1_ref_bf16
                 ref_w2 = w2_ref_bf16
                 ref_a1_scale = None
@@ -1280,7 +1279,7 @@ class FmoeTuner(TunerCommon):
                 a2_qt = ref1
                 a2_scale = None
                 a2_scale_mxfp4_sort = None
-            elif q_dtype_w == NVFP4_BF16_QDTYPE:
+            elif q_dtype_w == "nvfp4_bf16":
                 # NVFP4-BF16: activations remain bf16 between stages.
                 a2_qt = ref1
                 a2_scale = None
@@ -3044,9 +3043,7 @@ class FmoeTuner(TunerCommon):
                     k_tiles = k_per_batch // kparams["tile_k"]
                     if k_tiles < 4 or k_tiles % 2 != 0:
                         continue
-                bytes_per_thread_x = (
-                    kparams["tile_m"] * kparams["tile_k"] * 2 // 256
-                )
+                bytes_per_thread_x = kparams["tile_m"] * kparams["tile_k"] * 2 // 256
                 if bytes_per_thread_x % 16 != 0:
                     continue
                 tasks_flydsl.append(
@@ -3500,7 +3497,7 @@ class FmoeTuner(TunerCommon):
                 w2_global_scale = getattr(w2_scale, "global_scale", None)
                 w1_ref_bf16 = getattr(w1_scale, "dequantized_weight", None)
                 w2_ref_bf16 = getattr(w2_scale, "dequantized_weight", None)
-                if q_dtype_w == NVFP4_BF16_QDTYPE:
+                if q_dtype_w == "nvfp4_bf16":
                     w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
                     w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
                 elif q_dtype_w is not dtypes.fp4x2:
@@ -3536,13 +3533,9 @@ class FmoeTuner(TunerCommon):
                         .view(-1)
                         .contiguous()
                     )
-                elif q_dtype_w == NVFP4_BF16_QDTYPE:
-                    w1_qt_fmoe = fp4_utils.shuffle_nvfp4_weight_for_flydsl(
-                        w1_qt_fmoe
-                    )
-                    w2_qt_fmoe = fp4_utils.shuffle_nvfp4_weight_for_flydsl(
-                        w2_qt_fmoe
-                    )
+                elif q_dtype_w == "nvfp4_bf16":
+                    w1_qt_fmoe = fp4_utils.shuffle_nvfp4_weight_for_flydsl(w1_qt_fmoe)
+                    w2_qt_fmoe = fp4_utils.shuffle_nvfp4_weight_for_flydsl(w2_qt_fmoe)
                     w1_scale_fmoe = w1_scale.permute(0, 2, 1).contiguous()
                     w2_scale_fmoe = w2_scale.permute(0, 2, 1).contiguous()
                 elif q_dtype_w == torch.int4:
@@ -3614,7 +3607,7 @@ class FmoeTuner(TunerCommon):
                 elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
                     a1_qt = hidden.to(dtypes.bf16)
                     a1_scale = None
-                elif q_dtype_w == NVFP4_BF16_QDTYPE:
+                elif q_dtype_w == "nvfp4_bf16":
                     a1_qt = hidden.to(dtypes.bf16)
                     a1_scale = None
                 elif (
@@ -3646,7 +3639,7 @@ class FmoeTuner(TunerCommon):
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                 )
-                if q_dtype_w == NVFP4_BF16_QDTYPE:
+                if q_dtype_w == "nvfp4_bf16":
                     ref = self.torch_moe_2stages(
                         a1_qt,
                         w1_ref_bf16,
