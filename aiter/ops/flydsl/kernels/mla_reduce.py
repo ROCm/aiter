@@ -571,51 +571,115 @@ def compile_mla_reduce(
 
                 fx.gpu.barrier()
 
-                # Software-pipelined accumulate: prefetch os[s+1] while FMA uses
-                # os[s]. The bounds guard is carried as a float mask and folded
-                # into the scale at point-of-use (sc * mask), so the prefetched
-                # load is NOT consumed in the iteration it is issued -- the
-                # scheduler can keep it in flight (vmcnt(1)) instead of draining
-                # (vmcnt(0)) every iteration. State = raw_os(VEC) + mask + regs(VEC).
-                os0, mask0 = load_split_o_raw(fx.Int32(0), local_seq)
-                init_os = [_to_raw(os0[i]) for i in fx.range_constexpr(VEC)]
-                init_regs = [
-                    _to_raw(fx.arith.constant(0.0, type=T.f32))
-                    for _ in fx.range_constexpr(VEC)
-                ]
-                init_state = init_os + [_to_raw(mask0)] + init_regs
-                last_s = n_splits - fx.Int32(1)
-                loop_stop = fx.arith.index_cast(T.index, _to_raw(last_s))
-                for s, state in range(
-                    fx.Index(0), loop_stop, fx.Index(1), init=init_state
-                ):
-                    os = [state[i] for i in fx.range_constexpr(VEC)]
-                    mask = state[VEC]
-                    regs = [state[VEC + 1 + i] for i in fx.range_constexpr(VEC)]
-                    s_next = fx.arith.addi(
-                        fx.arith.index_cast(T.i32, _to_raw(s)),
-                        fx.arith.constant(1, type=T.i32),
+                # Lever #1: depth-2 double-rate software pipeline. Process 2
+                # splits per iteration and keep TWO output buffer_loads in flight
+                # (oaccu_0/oaccu_1 in HIP reduce_output_massive). The two carried
+                # loads (os0/os1) and the two prefetched loads for the next pair
+                # are distinct SSA values so the compiler allocates separate
+                # VGPRs -> genuine vmcnt(>=1) overlap (depth-1 aliased the single
+                # carried os into the next load dest, forcing vmcnt(0) drain).
+                #
+                # Bounds are carried as float masks (deferred-guard); the split
+                # index is also clamped so OOB prefetches read lds_pmap[0]/
+                # lds_scale[0] (always written) -> no NaN*0 pollution, mask=0
+                # zeroes the contribution.
+                zero_f = fx.arith.constant(0.0, type=T.f32)
+
+                def load_g(split_i32):
+                    """Guarded raw load of one split: (os_list, mask, scale).
+
+                    Clamps OOB split index to 0 (valid LDS slot) and returns
+                    mask=0 so the contribution is dropped without touching stale
+                    LDS as a NaN source.
+                    """
+                    in_split = fx.arith.cmpi(
+                        fx.arith.CmpIPredicate.slt, split_i32, n_splits
                     )
-                    # Issue the prefetch first, then consume the previous load.
-                    os_next, mask_next = load_split_o_raw(s_next, local_seq)
-                    next_os = [_to_raw(os_next[i]) for i in fx.range_constexpr(VEC)]
-                    sc_eff = lds_scale[fx.Index(s)] * mask
+                    safe_split = fx.Int32(in_split.select(split_i32, fx.Int32(0)))
+                    os_raw, row_mask = load_split_o_raw(safe_split, local_seq)
+                    mask = in_split.select(row_mask, zero_f)
+                    sc = lds_scale[fx.Index(safe_split)]
+                    return os_raw, mask, sc
+
+                os0_l, m0, sc0 = load_g(fx.Int32(0))
+                os1_l, m1, sc1 = load_g(fx.Int32(1))
+                init_os0 = [_to_raw(os0_l[i]) for i in fx.range_constexpr(VEC)]
+                init_os1 = [_to_raw(os1_l[i]) for i in fx.range_constexpr(VEC)]
+                init_regs = [
+                    _to_raw(zero_f) for _ in fx.range_constexpr(VEC)
+                ]
+                init_state = (
+                    init_os0
+                    + init_os1
+                    + init_regs
+                    + [_to_raw(m0), _to_raw(sc0), _to_raw(m1), _to_raw(sc1)]
+                )
+
+                # num_iters = floor((n_splits - 1) / 2); the loop consumes pairs
+                # (0,1)..(stop-2,stop-1) and the epilogue the final carried pair
+                # (stop, stop+1). stop = 2 * num_iters.
+                n_minus1 = n_splits - fx.Int32(1)
+                num_iters = fx.Int32(
+                    fx.arith.shrsi(
+                        _to_raw(n_minus1),
+                        _to_raw(fx.arith.constant(1, type=T.i32)),
+                    )
+                )
+                stop_i32 = num_iters * fx.Int32(2)
+                loop_stop = fx.arith.index_cast(T.index, _to_raw(stop_i32))
+
+                def unpack(state):
+                    os0 = [state[i] for i in fx.range_constexpr(VEC)]
+                    os1 = [state[VEC + i] for i in fx.range_constexpr(VEC)]
+                    regs = [
+                        state[2 * VEC + i] for i in fx.range_constexpr(VEC)
+                    ]
+                    m0 = state[3 * VEC]
+                    sc0 = state[3 * VEC + 1]
+                    m1 = state[3 * VEC + 2]
+                    sc1 = state[3 * VEC + 3]
+                    return os0, os1, regs, m0, sc0, m1, sc1
+
+                for i, state in range(
+                    fx.Index(0), loop_stop, fx.Index(2), init=init_state
+                ):
+                    os0, os1, regs, m0, sc0, m1, sc1 = unpack(state)
+                    i_i32 = fx.Int32(fx.arith.index_cast(T.i32, _to_raw(i)))
+                    # Issue the next pair's loads FIRST (stay in flight), then
+                    # FMA the two carried loads.
+                    os0n_l, m0n, sc0n = load_g(i_i32 + fx.Int32(2))
+                    os1n_l, m1n, sc1n = load_g(i_i32 + fx.Int32(3))
+                    next_os0 = [
+                        _to_raw(os0n_l[k]) for k in fx.range_constexpr(VEC)
+                    ]
+                    next_os1 = [
+                        _to_raw(os1n_l[k]) for k in fx.range_constexpr(VEC)
+                    ]
+                    sc_eff0 = sc0 * m0
+                    sc_eff1 = sc1 * m1
                     new_regs = [
-                        _to_raw(regs[i] + os[i] * sc_eff)
-                        for i in fx.range_constexpr(VEC)
+                        _to_raw(regs[k] + os0[k] * sc_eff0 + os1[k] * sc_eff1)
+                        for k in fx.range_constexpr(VEC)
                     ]
-                    results = yield next_os + [_to_raw(mask_next)] + new_regs
-                os_last = [results[i] for i in fx.range_constexpr(VEC)]
-                mask_last = results[VEC]
-                regs_last = [results[VEC + 1 + i] for i in fx.range_constexpr(VEC)]
-                sc_eff_last = lds_scale[fx.Index(last_s)] * mask_last
-                if fx.const_expr(VEC == 1):
-                    out_elems = [regs_last[0] + os_last[0] * sc_eff_last]
-                else:
-                    out_elems = [
-                        regs_last[i] + os_last[i] * sc_eff_last
-                        for i in fx.range_constexpr(VEC)
-                    ]
+                    results = yield (
+                        next_os0
+                        + next_os1
+                        + new_regs
+                        + [
+                            _to_raw(m0n),
+                            _to_raw(sc0n),
+                            _to_raw(m1n),
+                            _to_raw(sc1n),
+                        ]
+                    )
+
+                os0, os1, regs, m0, sc0, m1, sc1 = unpack(results)
+                sc_eff0 = sc0 * m0
+                sc_eff1 = sc1 * m1
+                out_elems = [
+                    regs[k] + os0[k] * sc_eff0 + os1[k] * sc_eff1
+                    for k in fx.range_constexpr(VEC)
+                ]
                 store_result(seq_i32, out_elems)
 
             def dispatch_tier_body(seq_i32, local_seq):
