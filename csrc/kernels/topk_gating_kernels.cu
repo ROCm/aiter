@@ -23,6 +23,14 @@
 
 namespace aiter {
 
+// E=128 opt_n (TPW=4) wins on gfx942 but regresses on gfx950; gate to gfx942.
+// Cached: get_gpu_arch() re-queries the driver on every call.
+inline bool topk_gating_prefer_optn_e128()
+{
+    static const bool v = (get_gpu_arch() == "gfx942");
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // Primitives
 // ---------------------------------------------------------------------------
@@ -991,7 +999,9 @@ void topk_softplus(aiter_tensor_t& topk_weights,
             {
                 _DISPATCH_OPT_N_KERNEL(64, 8)
             }
-            if(topk <= 16 && num_experts == 128 && num_tokens >= 4096)
+            // gfx942 only; gfx950 falls through to the TPW=1 opt kernel below.
+            if(topk <= 16 && num_experts == 128 && num_tokens >= 4096 &&
+               topk_gating_prefer_optn_e128())
             {
                 _DISPATCH_OPT_N_KERNEL(128, 4)
             }
