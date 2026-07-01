@@ -19,6 +19,7 @@ from aiter.ops.triton._triton_kernels.activation import (
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+
 _LOGGER = AiterTritonLogger()
 
 
@@ -632,7 +633,6 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     num_pid = triton.cdiv(M, BLOCK_SIZE_Mx) * scaleN + triton.cdiv(
         M_o, BLOCK_SIZE_M
     ) * triton.cdiv(N_i, BLOCK_SIZE_N)
-
 
     if args == "gluon" and get_arch() != "gfx1250":
         raise ValueError("Gluon is only supported on gfx1250")

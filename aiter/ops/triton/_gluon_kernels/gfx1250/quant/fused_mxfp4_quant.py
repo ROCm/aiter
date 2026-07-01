@@ -1,7 +1,6 @@
-import triton
-import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
 
 @gluon.jit
 def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
@@ -31,24 +30,24 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
     TOPK: gl.constexpr,
 ):
 
-    #pid contains both phase 1 and phase 2 ids
+    # pid contains both phase 1 and phase 2 ids
     pid = gl.program_id(0)
 
-    #number of phase 1 ids (quantize stage)
+    # number of phase 1 ids (quantize stage)
     num_pid_x = gl.cdiv(Mx, BLOCK_SIZE_Mx) * scaleNx
 
-    #block size for the second input (sort stage)
+    # block size for the second input (sort stage)
     BLOCK_SIZE_Nb: gl.constexpr = BLOCK_SIZE_N * 2 * MXFP4_QUANT_BLOCK_SIZE
 
-    #layout descriptor for quantize stage
+    # layout descriptor for quantize stage
     gLayout2d: gl.constexpr = gl.BlockedLayout(
         [BLOCK_SIZE_Mx // 8, 2],
-        [2,16],
-        [4,1],
-        [1,0],
+        [2, 16],
+        [4, 1],
+        [1, 0],
     )
 
-    #layout descriptor for sort stage
+    # layout descriptor for sort stage
     gLayout1D_id: gl.constexpr = gl.BlockedLayout(
         [1],
         [32],
@@ -56,7 +55,7 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
         [0],
     )
 
-    #layout descriptor for sort stage
+    # layout descriptor for sort stage
     gLayout2d_phase2: gl.constexpr = gl.BlockedLayout(
         [4, 16],
         [2, 16],
@@ -64,23 +63,13 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
         [1, 0],
     )
 
-    gather_index_layout: gl.constexpr = gl.SliceLayout(
-        0, gl.BlockedLayout(
-            [1,4],
-            [32,1],
-            [1, gl.num_warps()],
-            [1,0]
-        )
-    )
-    
     x_row_layout: gl.constexpr = gl.SliceLayout(1, gLayout2d_phase2)
     x_col_layout: gl.constexpr = gl.SliceLayout(0, gLayout2d_phase2)
 
-    #memory layouts
-    sharedLayout3D: gl.constexpr = gl.SwizzledSharedLayout(1,1,1,order=[2,1,0])
-    sharedLayout2D: gl.constexpr = gl.SwizzledSharedLayout(1,1,1,order=[1,0])
+    # memory layouts
+    sharedLayout2D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
 
-    #tdm descriptors
+    # tdm descriptors
     x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         x_ptr,
         [Mx, Nx],
@@ -97,27 +86,21 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
         sharedLayout2D,
     )
 
-    x_gather_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        x_ptr,
-        [Mx, Nx],
-        [stride_x_m, stride_x_n],
-        [BLOCK_SIZE_M * 2, BLOCK_SIZE_Nb],
-        sharedLayout2D,
+    # shared memory for the input tensor
+    smem_x = gl.allocate_shared_memory(
+        x_ptr.dtype.element_ty, [BLOCK_SIZE_Mx, MXFP4_QUANT_BLOCK_SIZE], sharedLayout2D
     )
-
-    #shared memory for the input tensor
-    smem_x = gl.allocate_shared_memory(x_ptr.dtype.element_ty, [BLOCK_SIZE_Mx, MXFP4_QUANT_BLOCK_SIZE], sharedLayout2D)
-    #shared memory for the quantized tensor
-    smem_x_fp4 = gl.allocate_shared_memory(gl.uint8, [BLOCK_SIZE_Mx, MXFP4_QUANT_BLOCK_SIZE // 2], sharedLayout2D)
-    #shared memory for the gathered tensor
-    smem_x_gather = gl.allocate_shared_memory(x_ptr.dtype.element_ty, [BLOCK_SIZE_M * 2, BLOCK_SIZE_Nb], sharedLayout2D)
+    # shared memory for the quantized tensor
+    smem_x_fp4 = gl.allocate_shared_memory(
+        gl.uint8, [BLOCK_SIZE_Mx, MXFP4_QUANT_BLOCK_SIZE // 2], sharedLayout2D
+    )
 
     stride_x_m = gl.cast(stride_x_m, gl.int64)
     stride_x_n = gl.cast(stride_x_n, gl.int64)
     stride_x_fp4_m = gl.cast(stride_x_fp4_m, gl.int64)
     stride_x_fp4_n = gl.cast(stride_x_fp4_n, gl.int64)
 
-    #phase 1: quantize the input tensor
+    # phase 1: quantize the input tensor
     if pid < num_pid_x:
         pid_m = pid // scaleNx
         pid_n = pid % scaleNx
@@ -197,7 +180,7 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
 
         return
 
-    #phase 2: sort block scale tensor
+    # phase 2: sort block scale tensor
     pid -= num_pid_x
     num_pid_n = gl.cdiv(N_i, BLOCK_SIZE_N * 2)
     pid_m = pid // num_pid_n  # * 2
@@ -211,9 +194,9 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
     stride_o3 = gl.cast(stride_o3, gl.int64)
     stride_o4 = gl.cast(stride_o4, gl.int64)
 
-
-
-    sorted_ids_offs = pid_m * BLOCK_SIZE_M * 2 + gl.arange(0, BLOCK_SIZE_M * 2, gLayout1D_id)
+    sorted_ids_offs = pid_m * BLOCK_SIZE_M * 2 + gl.arange(
+        0, BLOCK_SIZE_M * 2, gLayout1D_id
+    )
     sorted_ids_mask = sorted_ids_offs < num_valid_ids
     sorted_ids = gl.amd.gfx1250.buffer_load(
         sorted_ids_ptr,
@@ -229,12 +212,10 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
     else:
         x_offs_m = sorted_ids * TOPK + topk_ids
 
-
     x_offs_m_row = gl.convert_layout(x_offs_m, x_row_layout)
-    row_valid    = gl.convert_layout(sorted_ids < token_num, x_row_layout)
-    x_offs_n  = pid_n * BLOCK_SIZE_Nb + gl.arange(0, BLOCK_SIZE_Nb, x_col_layout)
+    row_valid = gl.convert_layout(sorted_ids < token_num, x_row_layout)
+    x_offs_n = pid_n * BLOCK_SIZE_Nb + gl.arange(0, BLOCK_SIZE_Nb, x_col_layout)
     col_valid = x_offs_n < Nx
-
 
     x_offs_2d = (
         x_offs_m_row.to(gl.int64)[:, None] * stride_x_m
@@ -264,13 +245,13 @@ def _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel(
     offs_0 = gl.arange(0, BLOCK_SIZE_M)
     offs_1 = gl.arange(0, BLOCK_SIZE_N)
     offs_4 = gl.arange(0, 4)
-   
+
     offs = (
-        offs_0[:, None, None] * stride_o0 + 
-        offs_1[None, :, None] * stride_o1 + 
-        pid_n * stride_o2 + 
-        pid_m * stride_o3 + 
-        offs_4[None, None, :] * stride_o4
+        offs_0[:, None, None] * stride_o0
+        + offs_1[None, :, None] * stride_o1
+        + pid_n * stride_o2
+        + pid_m * stride_o3
+        + offs_4[None, None, :] * stride_o4
     ).to(gl.int32)
-    
-    gl.store(blockscale_e8m0_sorted_ptr +offs, out)
+
+    gl.store(blockscale_e8m0_sorted_ptr + offs, out)

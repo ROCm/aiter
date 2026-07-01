@@ -538,8 +538,6 @@ def run_fused_dynamic_mxfp4_quant_moe_sort_triton(
     return x_fp4, x_scales
 
 
-
-
 @pytest.mark.parametrize("hidden_dim", [256])
 @pytest.mark.parametrize("token_num", [1, 32, 1024])
 @pytest.mark.parametrize(
