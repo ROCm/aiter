@@ -756,7 +756,8 @@
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/include'"
         ],
         "flags_extra_hip": [
-            "'-mllvm -enable-noalias-to-md-conversion=1'"
+            "'-mllvm -enable-noalias-to-md-conversion=1'",
+            "'--save-temps'"
         ],
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances_cktile.py --working_path {{}} --tune'"
     },

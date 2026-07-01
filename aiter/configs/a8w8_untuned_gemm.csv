@@ -1,67 +1,49 @@
 M,N,K,q_dtype_w
-1, 1280, 8192,torch.int8
-32, 1280, 8192,torch.int8
-64, 1280, 8192,torch.int8
-128, 1280, 8192,torch.int8
-192, 1280, 8192,torch.int8
-256, 1280, 8192,torch.int8
-320, 1280, 8192,torch.int8
-512, 1280, 8192,torch.int8
-1024, 1280, 8192,torch.int8
-2048, 1280, 8192,torch.int8
-4096, 1280, 8192,torch.int8
-8192, 1280, 8192,torch.int8
-16384, 1280, 8192,torch.int8
-1, 8192, 1024,torch.int8
-32, 8192, 1024,torch.int8
-64, 8192, 1024,torch.int8
-128, 8192, 1024,torch.int8
-192, 8192, 1024,torch.int8
-256, 8192, 1024,torch.int8
-320, 8192, 1024,torch.int8
-512, 8192, 1024,torch.int8
-1024, 8192, 1024,torch.int8
-2048, 8192, 1024,torch.int8
-4096, 8192, 1024,torch.int8
-8192, 8192, 1024,torch.int8
-16384, 8192, 1024,torch.int8
-16,1024,8192,torch.float8_e4m3fn
-16,1280,8192,torch.float8_e4m3fn
-16,3584,8192,torch.float8_e4m3fn
-16,7168,8192,torch.float8_e4m3fn
-16,8192,8192,torch.float8_e4m3fn
-16,10240,8192,torch.float8_e4m3fn
-16,28672,8192,torch.float8_e4m3fn
-16,57344,8192,torch.float8_e4m3fn
-32,1024,8192,torch.float8_e4m3fn
-32,1280,8192,torch.float8_e4m3fn
-32,3584,8192,torch.float8_e4m3fn
-32,7168,8192,torch.float8_e4m3fn
-32,8192,8192,torch.float8_e4m3fn
-32,10240,8192,torch.float8_e4m3fn
-32,28672,8192,torch.float8_e4m3fn
-32,57344,8192,torch.float8_e4m3fn
-64,1024,8192,torch.float8_e4m3fn
-64,1280,8192,torch.float8_e4m3fn
-64,3584,8192,torch.float8_e4m3fn
-64,7168,8192,torch.float8_e4m3fn
-64,8192,8192,torch.float8_e4m3fn
-64,10240,8192,torch.float8_e4m3fn
-64,28672,8192,torch.float8_e4m3fn
-64,57344,8192,torch.float8_e4m3fn
-128,1024,8192,torch.float8_e4m3fn
-128,1280,8192,torch.float8_e4m3fn
-128,3584,8192,torch.float8_e4m3fn
-128,7168,8192,torch.float8_e4m3fn
-128,8192,8192,torch.float8_e4m3fn
-128,10240,8192,torch.float8_e4m3fn
-128,28672,8192,torch.float8_e4m3fn
-128,57344,8192,torch.float8_e4m3fn
-256,1024,8192,torch.float8_e4m3fn
-256,1280,8192,torch.float8_e4m3fn
-256,3584,8192,torch.float8_e4m3fn
-256,7168,8192,torch.float8_e4m3fn
-256,8192,8192,torch.float8_e4m3fn
-256,10240,8192,torch.float8_e4m3fn
-256,28672,8192,torch.float8_e4m3fn
-256,57344,8192,torch.float8_e4m3fn
+6144,12288,4096,torch.int8
+12288,12288,4096,torch.int8
+24576,12288,4096,torch.int8
+49152,12288,4096,torch.int8
+73728,12288,4096,torch.int8
+98304,12288,4096,torch.int8
+196608,12288,4096,torch.int8
+294912,12288,4096,torch.int8
+393216,12288,4096,torch.int8
+589824,12288,4096,torch.int8
+786432,12288,4096,torch.int8
+1048576,12288,4096,torch.int8
+6144,4096,4096,torch.int8
+12288,4096,4096,torch.int8
+24576,4096,4096,torch.int8
+49152,4096,4096,torch.int8
+73728,4096,4096,torch.int8
+98304,4096,4096,torch.int8
+196608,4096,4096,torch.int8
+294912,4096,4096,torch.int8
+393216,4096,4096,torch.int8
+589824,4096,4096,torch.int8
+786432,4096,4096,torch.int8
+1048576,4096,4096,torch.int8
+6144,1536,4096,torch.int8
+12288,1536,4096,torch.int8
+24576,1536,4096,torch.int8
+49152,1536,4096,torch.int8
+73728,1536,4096,torch.int8
+98304,1536,4096,torch.int8
+196608,1536,4096,torch.int8
+294912,1536,4096,torch.int8
+393216,1536,4096,torch.int8
+589824,1536,4096,torch.int8
+786432,1536,4096,torch.int8
+1048576,1536,4096,torch.int8
+6144,4096,1536,torch.int8
+12288,4096,1536,torch.int8
+24576,4096,1536,torch.int8
+49152,4096,1536,torch.int8
+73728,4096,1536,torch.int8
+98304,4096,1536,torch.int8
+196608,4096,1536,torch.int8
+294912,4096,1536,torch.int8
+393216,4096,1536,torch.int8
+589824,4096,1536,torch.int8
+786432,4096,1536,torch.int8
+1048576,4096,1536,torch.int8
