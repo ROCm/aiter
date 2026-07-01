@@ -541,6 +541,26 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_moe_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/opus_moe_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/opus_moe/opus_moe.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-mllvm --amdgpu-mfma-vgpr-form'"
+        ],
+        "md_name": "'module_moe_opus'",
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/opus_moe/include'",
+            "f'{AITER_CSRC_DIR}/opus_gemm/include'"
+        ],
+        "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/opus_moe/gen_instances.py --working_path {{0}}'"
+    },
     "module_pa_sparse_prefill_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_sparse_prefill_opus_kernels.cu'",
