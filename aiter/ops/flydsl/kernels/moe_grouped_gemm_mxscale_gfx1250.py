@@ -460,7 +460,12 @@ def _compile_stage1_finalize_act(
                     alpha = arith.constant(1.702, type=T.f32)
 
                 if const_expr(stage1_weight_layout == "gugu"):
-                    gugu_base_dw = tmp_row_dw + col_dw * arith.index(2)
+                    out_elem = col_dw * arith.index(2)
+                    tile16 = out_elem // arith.index(16)
+                    intra16 = out_elem % arith.index(16)
+                    gate_base_elem = tile16 * arith.index(32) + intra16
+                    gate_base_dw = tmp_row_dw + gate_base_elem // arith.index(2)
+                    up_base_dw = gate_base_dw + arith.index(8)
                     g_acc = [
                         ArithValue(arith.constant(0.0, type=T.f32))
                         for _ in range(VEC_DW * 2)
@@ -471,34 +476,31 @@ def _compile_stage1_finalize_act(
                     ]
                     for sk in range_constexpr(split_k):
                         sk_off = arith.index(sk * slice_stride_dw)
-                        gugu_off = arith.index_cast(T.i32, gugu_base_dw + sk_off)
-                        gugu_off2 = arith.index_cast(
-                            T.i32, gugu_base_dw + arith.index(VEC_DW) + sk_off
+                        gate_off = arith.index_cast(T.i32, gate_base_dw + sk_off)
+                        up_off = arith.index_cast(T.i32, up_base_dw + sk_off)
+                        gate_vec = buffer_ops.buffer_load(
+                            tmp_rsrc, gate_off, vec_width=VEC_DW, dtype=T.i32
                         )
-                        vec0 = buffer_ops.buffer_load(
-                            tmp_rsrc, gugu_off, vec_width=VEC_DW, dtype=T.i32
-                        )
-                        vec1 = buffer_ops.buffer_load(
-                            tmp_rsrc, gugu_off2, vec_width=VEC_DW, dtype=T.i32
+                        up_vec = buffer_ops.buffer_load(
+                            tmp_rsrc, up_off, vec_width=VEC_DW, dtype=T.i32
                         )
                         for lane in range_constexpr(VEC_DW):
-                            dw = vector.extract(
-                                vec0, static_position=[lane], dynamic_position=[]
+                            gate_dw = vector.extract(
+                                gate_vec, static_position=[lane], dynamic_position=[]
                             )
-                            g, u = _unpack_pair_to_f32(
-                                dw, out_dtype, f32=T.f32, i32=T.i32
+                            up_dw = vector.extract(
+                                up_vec, static_position=[lane], dynamic_position=[]
                             )
-                            g_acc[lane] = g_acc[lane] + g
-                            u_acc[lane] = u_acc[lane] + u
-                        for lane in range_constexpr(VEC_DW):
-                            dw = vector.extract(
-                                vec1, static_position=[lane], dynamic_position=[]
+                            g0, g1 = _unpack_pair_to_f32(
+                                gate_dw, out_dtype, f32=T.f32, i32=T.i32
                             )
-                            g, u = _unpack_pair_to_f32(
-                                dw, out_dtype, f32=T.f32, i32=T.i32
+                            u0, u1 = _unpack_pair_to_f32(
+                                up_dw, out_dtype, f32=T.f32, i32=T.i32
                             )
-                            g_acc[VEC_DW + lane] = g_acc[VEC_DW + lane] + g
-                            u_acc[VEC_DW + lane] = u_acc[VEC_DW + lane] + u
+                            g_acc[lane * 2] = g_acc[lane * 2] + g0
+                            g_acc[lane * 2 + 1] = g_acc[lane * 2 + 1] + g1
+                            u_acc[lane * 2] = u_acc[lane * 2] + u0
+                            u_acc[lane * 2 + 1] = u_acc[lane * 2 + 1] + u1
                     out_packed = []
                     for pair_idx in range_constexpr(VEC_DW * 2):
                         g = g_acc[pair_idx]
@@ -793,10 +795,12 @@ def _compile_stage1_finalize_act_bias(
                 )
                 bias_row_base = e * arith.index(bias_stride_e)
                 if const_expr(stage1_weight_layout == "gugu"):
-                    gate_off = tmp_row_base + col * arith.index(2)
-                    up_off = gate_off + arith.index(1)
-                    gate_bias_off = bias_row_base + col * arith.index(2)
-                    up_bias_off = gate_bias_off + arith.index(1)
+                    tile16 = col // arith.index(16)
+                    intra16 = col % arith.index(16)
+                    gate_off = tmp_row_base + tile16 * arith.index(32) + intra16
+                    up_off = gate_off + arith.index(16)
+                    gate_bias_off = bias_row_base + col
+                    up_bias_off = bias_row_base + arith.index(inter_dim) + col
                 else:
                     gate_off = tmp_row_base + col
                     up_off = gate_off + arith.index(inter_dim)
