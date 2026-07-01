@@ -939,11 +939,6 @@ def unpack_b_w4a16_groupwise(packed32, scale_val, arith, vector, use_gfx950_cvt=
     )
 
 
-# ---------------------------------------------------------------------------
-# NVFP4 W4A16 groupwise load / unpack helpers
-# ---------------------------------------------------------------------------
-
-
 def _load_fp8_block_scale(
     buffer_ops,
     arith,

@@ -74,7 +74,6 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 
 FLYDSL_FALLBACK_TAG = "flydsl_fallback"
 NVFP4_BF16_QDTYPE = "nvfp4_bf16"
-_E2M1_ENCODE = {0.0: 0, 0.5: 1, 1.0: 2, 1.5: 3, 2.0: 4, 3.0: 5, 4.0: 6, 6.0: 7}
 
 
 def parse_q_dtype_w(value):
@@ -93,25 +92,29 @@ def is_nvfp4_bf16_tune_key(dtype, q_dtype_a, q_dtype_w, q_type):
     )
 
 
-def _pack_fp4_to_uint8(fp4_f32: torch.Tensor) -> torch.Tensor:
-    sign = (fp4_f32 < 0).to(torch.uint8) << 3
-    magnitude = torch.abs(fp4_f32)
-    code = torch.zeros_like(magnitude, dtype=torch.uint8)
-    for value, bits in _E2M1_ENCODE.items():
-        code[magnitude == value] = bits
-    nibbles = sign | code
-    low = nibbles[..., 0::2]
-    high = nibbles[..., 1::2]
-    return low | (high << 4)
-
-
 def _quantize_nvfp4_weight_for_moe(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-        dequantize_to_dtype,
-        ref_nvfp4_quant,
-    )
+    def _pack_fp4_to_uint8(fp4_f32: torch.Tensor) -> torch.Tensor:
+        e2m1_encode = {
+            0.0: 0,
+            0.5: 1,
+            1.0: 2,
+            1.5: 3,
+            2.0: 4,
+            3.0: 5,
+            4.0: 6,
+            6.0: 7,
+        }
+        sign = (fp4_f32 < 0).to(torch.uint8) << 3
+        magnitude = torch.abs(fp4_f32)
+        code = torch.zeros_like(magnitude, dtype=torch.uint8)
+        for value, bits in e2m1_encode.items():
+            code[magnitude == value] = bits
+        nibbles = sign | code
+        low = nibbles[..., 0::2]
+        high = nibbles[..., 1::2]
+        return low | (high << 4)
 
     expert, n_out, k = weight.shape
     if k % 16 != 0:
@@ -120,39 +123,28 @@ def _quantize_nvfp4_weight_for_moe(
     packed_per_expert = []
     scales_per_expert = []
     for expert_idx in range(expert):
-        fp4_f32, block_scales_f32 = ref_nvfp4_quant(
+        fp4_f32, block_scales_f32 = fp4_utils.ref_nvfp4_quant(
             weight[expert_idx].float(),
             global_scale[expert_idx : expert_idx + 1],
             block_size=16,
         )
         packed_per_expert.append(_pack_fp4_to_uint8(fp4_f32))
-        scales_per_expert.append(block_scales_f32.to(torch.float8_e4m3fn).view(torch.uint8))
+        scales_per_expert.append(
+            block_scales_f32.to(torch.float8_e4m3fn).view(torch.uint8)
+        )
     packed_weight = torch.stack(packed_per_expert, dim=0).contiguous()
     block_scales = torch.stack(scales_per_expert, dim=0).contiguous()
-    dequantized_weight = dequantize_to_dtype(
+    dequantized_weight = fp4_utils.dequantize_nvfp4(
         packed_weight,
         block_scales,
         global_scale,
         weight.dtype,
         block_size=16,
-        swizzle=False,
     )
     block_scales.dequantized_weight = dequantized_weight.contiguous()
     return packed_weight.contiguous(), block_scales, global_scale
 
 
-def _shuffle_nvfp4_weight_for_flydsl(weight: torch.Tensor) -> torch.Tensor:
-    """Preshuffle packed NVFP4 [E, N, K//2] for FlyDSL kpack_bytes=8 layout."""
-    expert, n_out, packed_k = weight.shape
-    if n_out % 16 != 0 or packed_k % 32 != 0:
-        raise ValueError(
-            f"NVFP4 FlyDSL weight requires N%16==0 and packed_K%32==0, "
-            f"got shape={tuple(weight.shape)}"
-        )
-    flattened = weight.view(expert * n_out, packed_k)
-    shuffled = flattened.view(expert * n_out // 16, 16, packed_k // 32, 4, 8)
-    shuffled = shuffled.permute(0, 2, 3, 1, 4).contiguous()
-    return shuffled.view_as(weight)
 TUNE_MOE_EXPERT_BALANCE = (
     os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
@@ -1163,8 +1155,8 @@ class FmoeTuner(TunerCommon):
             w1_scale_aiter = w1_scale
             w2_scale_aiter = w2_scale
         elif q_dtype_w == NVFP4_BF16_QDTYPE:
-            w1_qt_shffle_flydsl = _shuffle_nvfp4_weight_for_flydsl(w1_qt)
-            w2_qt_shffle_flydsl = _shuffle_nvfp4_weight_for_flydsl(w2_qt)
+            w1_qt_shffle_flydsl = fp4_utils.shuffle_nvfp4_weight_for_flydsl(w1_qt)
+            w2_qt_shffle_flydsl = fp4_utils.shuffle_nvfp4_weight_for_flydsl(w2_qt)
             # Natural quantizer layout is [E, N, G]. FlyDSL MoE expects [E, G, N].
             w1_scale_flydsl = w1_scale.permute(0, 2, 1).contiguous()
             w2_scale_flydsl = w2_scale.permute(0, 2, 1).contiguous()
@@ -3545,8 +3537,12 @@ class FmoeTuner(TunerCommon):
                         .contiguous()
                     )
                 elif q_dtype_w == NVFP4_BF16_QDTYPE:
-                    w1_qt_fmoe = _shuffle_nvfp4_weight_for_flydsl(w1_qt_fmoe)
-                    w2_qt_fmoe = _shuffle_nvfp4_weight_for_flydsl(w2_qt_fmoe)
+                    w1_qt_fmoe = fp4_utils.shuffle_nvfp4_weight_for_flydsl(
+                        w1_qt_fmoe
+                    )
+                    w2_qt_fmoe = fp4_utils.shuffle_nvfp4_weight_for_flydsl(
+                        w2_qt_fmoe
+                    )
                     w1_scale_fmoe = w1_scale.permute(0, 2, 1).contiguous()
                     w2_scale_fmoe = w2_scale.permute(0, 2, 1).contiguous()
                 elif q_dtype_w == torch.int4:

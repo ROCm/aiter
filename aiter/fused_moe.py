@@ -801,15 +801,19 @@ def _get_default_bf16_nvfp4_fused_moe_params(
     stage2_tile_k = (
         256 if inter_dim % 256 == 0 else 128 if inter_dim % 128 == 0 else 64
     )
+
+    kernelName1 = flydsl_kernel_name(
+        1, "bf16", "nvfp4", "bf16", tile_m, 128, stage1_tile_k
+    )
+    kernelName2 = flydsl_kernel_name(
+        2, "bf16", "nvfp4", "bf16", tile_m, 128, stage2_tile_k, "atomic"
+    )
+
     return {
         "block_m": tile_m,
         "ksplit": 0,
-        "kernelName1": flydsl_kernel_name(
-            1, "bf16", "nvfp4", "bf16", tile_m, 128, stage1_tile_k
-        ),
-        "kernelName2": flydsl_kernel_name(
-            2, "bf16", "nvfp4", "bf16", tile_m, 128, stage2_tile_k, "atomic"
-        ),
+        "kernelName1": kernelName1,
+        "kernelName2": kernelName2,
     }
 
 
@@ -1318,18 +1322,6 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
-    is_ck_bf16_moe = (
-        q_type == QuantType.No
-        and dtype == torch.bfloat16
-        and q_dtype_a == torch.bfloat16
-        and q_dtype_w == torch.bfloat16
-    )
-    is_nvfp4_bf16_moe = (
-        q_type == QuantType.No
-        and dtype == torch.bfloat16
-        and q_dtype_a == torch.bfloat16
-        and q_dtype_w == NVFP4_BF16_QDTYPE
-    )
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -1383,22 +1375,6 @@ def get_2stage_cfgs(
         aiter.logger.info(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
-        if is_ck_bf16_moe:
-            logger.info(
-                f"[fused_moe][ck_bf16] no tuned config used for {keys}; "
-                f"using default heuristics block_m={block_m}, ksplit={ksplit}, "
-                f"use_nt={use_non_temporal_load}, tune_file={tune_file}"
-            )
-        if is_nvfp4_bf16_moe:
-            default_nvfp4_params = _get_default_bf16_nvfp4_fused_moe_params(
-                token, topk, expert, model_dim, inter_dim, block_m
-            )
-            kernelName1 = str(default_nvfp4_params["kernelName1"])
-            kernelName2 = str(default_nvfp4_params["kernelName2"])
-            logger.info(
-                f"[fused_moe][nvfp4_bf16] no tuned config used for {keys}; "
-                f"using default FlyDSL kernels ({kernelName1=}, {kernelName2=})"
-            )
     else:
         block_m = cfg["block_m"]
         if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
@@ -1422,19 +1398,8 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
-        if is_ck_bf16_moe:
-            logger.info(
-                f"[fused_moe][ck_bf16] tuned config used for {keys}: "
-                f"kernelName1={kernelName1}, kernelName2={kernelName2}, "
-                f"block_m={block_m}, ksplit={ksplit}, run_1stage={run_1stage}, "
-                f"use_nt={use_non_temporal_load}, tune_file={tune_file}"
-            )
-        if is_nvfp4_bf16_moe:
-            logger.info(
-                f"[fused_moe][nvfp4_bf16] tuned config used for {keys}: "
-                f"kernelName1={kernelName1}, kernelName2={kernelName2}, "
-                f"block_m={block_m}, ksplit={ksplit}, tune_file={tune_file}"
-            )
+        
+        logger.info(f"[fused_moe] tuned config used for {keys}: kernelName1={kernelName1}, kernelName2={kernelName2}")
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
@@ -1528,6 +1493,41 @@ def get_2stage_cfgs(
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and is_flydsl2,
         )
+
+    # Default nvfp4_bf16 fallback when tuned kernelName1/kernelName2 are not found.
+    if (
+        q_type == QuantType.No
+        and dtype == torch.bfloat16
+        and q_dtype_a == torch.bfloat16
+        and q_dtype_w == NVFP4_BF16_QDTYPE
+    ):
+        if not is_flydsl_available():
+            raise RuntimeError(
+                f"nvfp4_bf16 fused MoE requires FlyDSL, but FlyDSL is unavailable for {keys}"
+            )
+        default_nvfp4_params = _get_default_bf16_nvfp4_fused_moe_params(
+            token, topk, expert, model_dim, inter_dim, block_m
+        )
+        kernelName1 = str(default_nvfp4_params["kernelName1"])
+        kernelName2 = str(default_nvfp4_params["kernelName2"])
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kernelName1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kernelName2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            int(default_nvfp4_params["block_m"]),
+            int(default_nvfp4_params["ksplit"]),
+            False,
+        )
     if (
         gate_mode != GateMode.SEPARATED
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1562,6 +1562,8 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
     )
+
+    # Default int4_bf16 fallback when tuned kernelName1/kernelName2 are not found.
     if (
         q_type == QuantType.per_1x32
         and q_dtype_w == dtypes.i4x2
@@ -1617,6 +1619,7 @@ def get_2stage_cfgs(
         and not doweight_stage1
         and is_flydsl_available()
     )
+    # Default mxfp4 flydsl fallback when tuned kernelName1/kernelName2 are not found.
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_kernel_name,
