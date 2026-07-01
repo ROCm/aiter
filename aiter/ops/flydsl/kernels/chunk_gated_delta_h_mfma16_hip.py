@@ -161,20 +161,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # GEMM2, V not split across warps) with the SAME 16x16x16 bf16 MFMA. The
     # alternative OPT-VWARP layout has been removed entirely from this fork.
 
-    # -- LDS layout: w and k store all K-blocks to reduce barriers --
-    LDS_W_STRIDE = K
-    LDS_W_ELEMS_PER_STAGE = BT * LDS_W_STRIDE
-    # NOTE: a ping/pong double-buffer for lds_w was originally reserved here
-    # (2 stages), but the read offset (GEMM1) and write offset
-    # (w_prefetch_lds_all) never select a stage via i_t%2 -- both always use
-    # stage 0. W is written at the top of each chunk and read by GEMM1 in the
-    # SAME chunk (separated by a barrier), so there is no t / t+1 overlap to
-    # double-buffer. The second stage was therefore allocated but never
-    # accessed -- pure dead LDS. Use a single stage to reclaim those bytes
-    # (16 KB at BT=64,K=128); behaviour is identical.
-    LDS_W_STAGES = 1
-    LDS_W_ELEMS = LDS_W_ELEMS_PER_STAGE * LDS_W_STAGES
-    LDS_W_BYTES = LDS_W_ELEMS * 2
+    # HIP-ALIGN 2a: w panels (w_panel0/1), one [BT][64] panel per 64-K block,
+    # written with HIP's ``w_panel_swizzle`` (bank-conflict-free) and read by
+    # GEMM1 via ``load_a_w_fragment_swizzled`` (plain b64, contiguous 16-K).
+    LDS_WP_PANEL_ELEMS = BT * 64
+    LDS_WP_ELEMS = NUM_K_BLOCKS * LDS_WP_PANEL_ELEMS
+    LDS_WP_BYTES = LDS_WP_ELEMS * 2
 
     LDS_K_STRIDE = K
     LDS_K_ELEMS = BT * LDS_K_STRIDE
@@ -207,7 +199,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 104  # HIP-ALIGN 1b: GEMM1 B via h_state panels (load_b_shared2), lds_h removed (rev103 was b128 store only)
+    _K5_KERNEL_REVISION = 105  # HIP-ALIGN 2a: GEMM1 w via HIP w_panel swizzle + load_a_w_fragment_swizzled (contiguous), h-B contiguous (rev104 was interleaved lds_w)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -215,8 +207,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         arch=GPU_ARCH,
         global_sym_name=f"gdn_h_mfma16_hip_smem_v{_K5_KERNEL_REVISION}",
     )
-    lds_w_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_w_offset + LDS_W_BYTES
+    lds_wp_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_wp_offset + LDS_WP_BYTES
     lds_k_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_k_offset + LDS_K_BYTES
     lds_vn_offset = allocator._align(allocator.ptr, 16)
@@ -340,9 +332,10 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # -- LDS views --
         lds_base_ptr = allocator.get_base()
 
-        # w tile (bf16) -- separate from k
-        lds_w_ptr = SmemPtr(lds_base_ptr, lds_w_offset, T.bf16, shape=(LDS_W_ELEMS,))
-        lds_w = STensor(lds_w_ptr, dtype=T.bf16, shape=(LDS_W_ELEMS,))
+        # w panels (bf16, HIP w_panel swizzle) -- separate from k
+        lds_wp_ptr = SmemPtr(lds_base_ptr, lds_wp_offset, T.bf16, shape=(LDS_WP_ELEMS,))
+        lds_wp = STensor(lds_wp_ptr, dtype=T.bf16, shape=(LDS_WP_ELEMS,))
+        lds_wp_memref = lds_wp_ptr.get()
 
         # k tile (bf16) -- separate from w
         lds_k_ptr = SmemPtr(lds_base_ptr, lds_k_offset, T.bf16, shape=(LDS_K_ELEMS,))
@@ -381,11 +374,36 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
         # -- LDS vector read helpers (generates ds_read_b128 for 8xbf16) --
         v8bf16_type = T.vec(8, T.bf16)
-        lds_w_memref = lds_w_ptr.get()
         lds_k_memref = lds_k_ptr.get()
 
-        def _lds_vec_read_w_bf16x8(elem_idx):
-            return vector.load_op(v8bf16_type, lds_w_memref, [elem_idx])
+        # HIP-ALIGN 2a: w_panel swizzle (returns ELEMENT offset within a panel).
+        # Port of w_panel_swizzle_base_bytes >> 1 (all bf16 = 2 B).
+        #   row_in_half = row & 31; col_group = col_base >> 3
+        #   tid = row_in_half*8 + col_group
+        #   base_bytes = ((tid<<4)&4080) ^ (tid&120); if row&32: base|=4096
+        def _w_panel_swz_elems(row, col_base):
+            row_in_half = row & fx.Int32(31)
+            col_group = col_base >> fx.Int32(3)
+            tid_like = row_in_half * fx.Int32(8) + col_group
+            base = ((tid_like << fx.Int32(4)) & fx.Int32(4080)) ^ (
+                tid_like & fx.Int32(120)
+            )
+            base = base | ((row & fx.Int32(32)) << fx.Int32(7))  # 32<<7 = 4096
+            return base >> fx.Int32(1)  # bytes -> bf16 elements
+
+        v4bf16_w_type = T.vec(4, T.bf16)
+
+        # HIP-ALIGN 2a: load_a_w_fragment_swizzled (contiguous 16-K A frag).
+        # Caller passes row = row_base + lane&15 and k0 = k_base + (lane>>4)*4;
+        # the ^4-elem (^8-byte) toggle picks the low/high 4 within an 8-group.
+        def _load_a_w_swizzled(panel_base_elems, row, k0):
+            col_base = k0 & fx.Int32(~7)
+            elem = _w_panel_swz_elems(row, col_base) ^ (k0 & fx.Int32(4))
+            return vector.load_op(
+                v4bf16_w_type,
+                lds_wp_memref,
+                [fx.Index(panel_base_elems + elem)],
+            )
 
         def _lds_vec_read_k_bf16x8(elem_idx):
             return vector.load_op(v8bf16_type, lds_k_memref, [elem_idx])
@@ -518,21 +536,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             w_prefetch_all = list(state[NUM_H_ACCS:])
             i_t_i32 = fx.Int32(i_t)
 
-            # -- 1. Compute w LDS offsets (w data already prefetched) --
-            # OPT-4: XOR swizzle to break 64-way bank conflict on lds_w.
-            # Pattern: swz_col = col ^ ((row & 7) << 3) at 8-bf16 granularity
-            # matching LOAD_VEC_WIDTH. Read path (W A-frag below) applies the
-            # SAME swizzle. lds_k is NOT swizzled (ds_read_tr_b16 spans 4 rows
-            # per instr; a row-dependent XOR would break the HW transpose
-            # alignment).
-            w_prefetch_lds_all = []
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                    col = fx.Int32(kb * 64) + load_col_base
-                    swz_col = _xor_swizzle(row, col)
-                    w_prefetch_lds_all.append(row * fx.Int32(LDS_W_STRIDE) + swz_col)
-
             # Stage h_accs into (a) the h_state panels [row_block][V] for the
             # GEMM1 B operand (HIP shared2 layout, plain b64 read) and (b) the
             # [V][K] transpose buffer for the b128 HBM store. split-M mapping:
@@ -593,13 +596,27 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 )
                 h_.vec_store((fx.Index(h_off),), vec8, LOAD_VEC_WIDTH)
 
-            # -- Store prefetched w to LDS (data already in registers from previous iter/prologue) --
-            for i_wp in range_constexpr(NUM_W_LOADS):
-                lds_w.vec_store(
-                    (fx.Index(w_prefetch_lds_all[i_wp]),),
-                    w_prefetch_all[i_wp],
-                    LOAD_VEC_WIDTH,
-                )
+            # HIP-ALIGN 2a: write prefetched w to the swizzled panels.
+            # w_prefetch_all is ordered [kb][batch] = b16x8 (8 K) for
+            # row = batch*32 + tid//8, col_base = (tid%8)*8. Split into
+            # low4/high4 and store at the w_panel swizzle base and base^4 (elem)
+            # in panel kb -- matching load_a_w_fragment_swizzled reads below.
+            for kb in range_constexpr(NUM_K_BLOCKS):
+                wp_panel_base = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
+                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                    swz = wp_panel_base + _w_panel_swz_elems(row, load_col_base)
+                    wvec = w_prefetch_all[kb * NUM_LOAD_BATCHES_64 + batch]
+                    lds_wp.vec_store(
+                        (fx.Index(swz),),
+                        wvec.shuffle(wvec, [0, 1, 2, 3]),
+                        4,
+                    )
+                    lds_wp.vec_store(
+                        (fx.Index(swz ^ fx.Int32(4)),),
+                        wvec.shuffle(wvec, [4, 5, 6, 7]),
+                        4,
+                    )
 
             gpu.barrier()
 
@@ -794,20 +811,21 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                             LOAD_VEC_WIDTH,
                         )
 
-                    w_lds_row_idx = wid_idx * fx.Index(16) + lane_n_idx
-                    w_lds_col_idx = fx.Index(
-                        kb * 64 + ks * WMMA_K
-                    ) + lane_m_base_idx * fx.Index(8)
-                    # OPT-4: apply SAME XOR swizzle as the write side.
-                    w_lds_col_idx = _xor_swizzle_idx(
-                        w_lds_row_idx, w_lds_col_idx
+                    # HIP-ALIGN 2a: A = load_a_w_fragment_swizzled. Two
+                    # contiguous 16-K tiles (lo=[ks*32,+16), hi=[+16,+32));
+                    # k0 = tile_base + lane_m_base*4 (standard A layout).
+                    wp_pbase = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
+                    a_row = wid * fx.Int32(16) + lane_n
+                    a_frag_lo = _load_a_w_swizzled(
+                        wp_pbase,
+                        a_row,
+                        fx.Int32(ks * WMMA_K) + lane_m_base * fx.Int32(4),
                     )
-                    w_lds_idx = (
-                        w_lds_row_idx * fx.Index(LDS_W_STRIDE) + w_lds_col_idx
+                    a_frag_hi = _load_a_w_swizzled(
+                        wp_pbase,
+                        a_row,
+                        fx.Int32(ks * WMMA_K + 16) + lane_m_base * fx.Int32(4),
                     )
-                    a_frag8 = _lds_vec_read_w_bf16x8(w_lds_idx)
-                    a_frag_lo = a_frag8.shuffle(a_frag8, [0, 1, 2, 3])
-                    a_frag_hi = a_frag8.shuffle(a_frag8, [4, 5, 6, 7])
 
                     for nr in range_constexpr(N_REPEAT):
                         slot_idx = (
@@ -818,19 +836,15 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         for _eidx in SLOT_ASSIGN_CT[slot_idx]:
                             extra_load_emitters[_eidx]()
 
-                        # HIP-ALIGN 1b: B = load_b_shared2(panel_kb, k_base,
-                        # lane, nr*16). col = (lane&15)+nr*16;
+                        # HIP-ALIGN 1b/2a: B = load_b_shared2(panel_kb, k_base,
+                        # lane, nr*16), CONTIGUOUS to match the (now HIP-style)
+                        # contiguous w A read. col = (lane&15)+nr*16;
                         # row_block = (k_base>>2)+(lane>>4). lo tile K in
-                        # [ks*32, ks*32+16), hi in [ks*32+16, ks*32+32) --
-                        # matching a_frag_lo/a_frag_hi of the WMMA_K=32 w read.
-                        # w A-frag (bf16x8 split) uses an interleaved K layout:
-                        # a_frag_lo covers the EVEN 4-K groups (lane_m_base*8+
-                        # 0..3), a_frag_hi the ODD groups (+4..7). Match B's
-                        # k_group: row_block = ks*8 + lane_m_base*2 (lo), +1 (hi).
+                        # [ks*32, ks*32+16), hi in [ks*32+16, ks*32+32).
                         hp_base = fx.Int32(kb * LDS_HP_PANEL_ELEMS)
                         hp_col_b = fx.Int32(nr * 16) + lane_n
-                        rb_lo = fx.Int32((ks * WMMA_K) >> 2) + lane_m_base * fx.Int32(2)
-                        rb_hi = rb_lo + fx.Int32(1)
+                        rb_lo = fx.Int32((ks * WMMA_K) >> 2) + lane_m_base
+                        rb_hi = fx.Int32(((ks * WMMA_K) + 16) >> 2) + lane_m_base
                         idx_lo = hp_base + (
                             rb_lo * fx.Int32(BV) + hp_col_b
                         ) * fx.Int32(4)
