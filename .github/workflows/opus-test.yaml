@@ -59,7 +59,7 @@ jobs:
           event_name = os.environ.get("EVENT_NAME")
           event_action = os.environ.get("EVENT_ACTION")
           github_ref = os.environ.get("GITHUB_REF")
-          labels = json.loads(os.environ.get("PR_LABELS") or "[]")
+labels = json.loads(os.environ.get("PR_LABELS") or "[]") or []
 
           include = []
           labeled_event = event_name == "pull_request" and event_action == "labeled"
