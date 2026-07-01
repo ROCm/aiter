@@ -212,6 +212,7 @@ def select_3d_config(
         MIN_SEGMENTS = min(8, MAX_SEGMENTS)
         if head_size >= 512 and not arch.is_rdna:
             MIN_SEGMENTS = min(16, MAX_SEGMENTS)
+        MIN_SEGMENTS = triton.next_power_of_2(MIN_SEGMENTS)
         if num_segments == 0:
             num_segments = math.ceil(target_num_prgms / num_2d_prgms)
             num_segments = min(num_segments, MAX_SEGMENTS)

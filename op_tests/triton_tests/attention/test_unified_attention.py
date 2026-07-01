@@ -557,7 +557,7 @@ def test_triton_unified_attn_3d(
     ],
 )
 @pytest.mark.parametrize("num_heads", [(8, 8), (8, 1)])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("head_size", [64, 128, 256, 512])
 @pytest.mark.parametrize("block_size", [16, 64])
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize(
