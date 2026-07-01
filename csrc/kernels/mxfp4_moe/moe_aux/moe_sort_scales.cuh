@@ -9,7 +9,7 @@ namespace aiter::mxfp4_moe::moe_sort_scales {
 
 constexpr int MASK_TOKEN_ID = 0x00FFFFFF;
 
-template <int BM, int NUM_EXPERTS, int D_INTER, int D_HIDDEN, int BK,
+template <int BM, int NUM_EXPERTS, int D_HIDDEN, int BK,
           int N_CTAS, int THREADS_PER_CTA>
 __global__ void sort_scales_kernel_impl(
     const int M, const int MAX_SORTED,
@@ -77,14 +77,14 @@ __global__ void sort_scales_kernel_impl(
     }
 }
 
-template <int BM, int NE, int D_INTER, int D_HIDDEN, int BK,
+template <int BM, int NE, int D_HIDDEN, int BK,
           int N_CTAS, int THREADS_PER_CTA>
 inline void launch(
     hipStream_t stream, int M, int max_sorted,
     const uint8_t *a_scale, const int32_t *sorted_token_ids, const int32_t *cumsum,
     uint8_t *a_scale_sorted_shuffled)
 {
-    sort_scales_kernel_impl<BM, NE, D_INTER, D_HIDDEN, BK, N_CTAS, THREADS_PER_CTA>
+    sort_scales_kernel_impl<BM, NE, D_HIDDEN, BK, N_CTAS, THREADS_PER_CTA>
         <<<N_CTAS, THREADS_PER_CTA, 0, stream>>>(
             M, max_sorted, a_scale, sorted_token_ids, cumsum, a_scale_sorted_shuffled);
 }

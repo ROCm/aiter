@@ -88,7 +88,6 @@ def mxfp4_moe_sort_scales(
     NE: int,
     TOPK: int,
     D_HIDDEN: int,
-    D_INTER: int,
     MB: int,
     max_sorted: int,
 ) -> None: ...

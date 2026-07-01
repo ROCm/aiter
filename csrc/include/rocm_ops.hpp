@@ -2506,7 +2506,6 @@ namespace py = pybind11;
           py::arg("NE"),                                                  \
           py::arg("TOPK"),                                                \
           py::arg("D_HIDDEN"),                                            \
-          py::arg("D_INTER"),                                            \
           py::arg("MB"),                                                  \
           py::arg("max_sorted"));                                         \
     m.def("mxfp4_moe_scatter_reduce",                                     \

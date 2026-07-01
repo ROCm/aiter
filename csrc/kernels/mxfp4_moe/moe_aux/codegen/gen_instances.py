@@ -227,10 +227,10 @@ def _aux_quant_body(ne, topk, mb, h):
     )
 
 
-def _aux_sort_scales_body(bm, ne, e, h):
+def _aux_sort_scales_body(bm, ne, h):
     return (
         f"    aiter::mxfp4_moe::moe_sort_scales::launch<\n"
-        f"        {bm}, {ne}, {e}, {h}, kBK, kNCtasScales, kThreadsScales>(\n"
+        f"        {bm}, {ne}, {h}, kBK, kNCtasScales, kThreadsScales>(\n"
         f"            stream, M, max_sorted,\n"
         f"            reinterpret_cast<uint8_t*>(a_scale),\n"
         f"            sorted_token_ids, cumsum,\n"
@@ -322,14 +322,14 @@ class mxfp4_moe_aux_codegen:
                 )
 
         # sort_scales: BM in {32, 64, 128} (MB=16 callers clamp to BM=32)
-        for ne, h, e, topk in SHAPES:
+        for ne, h in sorted({(ne, h) for ne, h, _e, _topk in SHAPES}):
             for bm in (32, 64, 128):
                 yield Instance(
-                    f"aux_sortscales_BM{bm}_NE{ne}_E{e}_H{h}",
+                    f"aux_sortscales_BM{bm}_NE{ne}_H{h}",
                     "SortScalesFn",
                     AUX_INC_SORT_SCALES,
                     AUX_SORT_SCALES_PARAMS,
-                    _aux_sort_scales_body(bm, ne, e, h),
+                    _aux_sort_scales_body(bm, ne, h),
                 )
 
         # scatter_reduce / scatter_reduce_q: keyed by (D_HIDDEN, TOPK, NT) only,

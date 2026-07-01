@@ -233,7 +233,6 @@ void mxfp4_moe_sort_scales_kernel(
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
-    int64_t D_INTER,
     int64_t MB,
     int64_t max_sorted)
 {
@@ -246,7 +245,7 @@ void mxfp4_moe_sort_scales_kernel(
     const int64_t BM_clamped = (MB < 32) ? 32 : MB;
 
     const std::string key = "aux_sortscales_BM" + std::to_string(BM_clamped)
-        + "_NE" + std::to_string(NE) + "_E" + std::to_string(D_INTER)
+        + "_NE" + std::to_string(NE)
         + "_H" + std::to_string(D_HIDDEN);
     aux_find(sort_scales_lookup(), key, "mxfp4_moe_sort_scales")(
         stream, M, static_cast<int>(max_sorted),

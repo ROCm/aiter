@@ -21,6 +21,7 @@ __global__ void scatter_reduce_kernel_impl(
     const float *__restrict__ sorted_weights,
     __hip_bfloat16 *__restrict__ output) {
     static_assert(COLS_PER_THREAD % 8 == 0, "COLS_PER_THREAD must be a multiple of 8 (one int4 = 8 bf16)");
+    static_assert(D_HIDDEN % COLS_PER_THREAD == 0, "D_HIDDEN must be a multiple of COLS_PER_THREAD");
     constexpr int N_INT4 = COLS_PER_THREAD / 8;
 
     const int col_base = (blockIdx.x * blockDim.x + threadIdx.x) * COLS_PER_THREAD;
@@ -106,6 +107,7 @@ __global__ void scatter_reduce_mxfp4_kernel(
     // Locked to 8 cols/thread = one u32 load (8 fp4 within one 32-col scale
     // block). Wider COLS are latency/MLP-bound, not DRAM-bound — measured slower.
     static_assert(COLS_PER_THREAD == 8, "scatter_reduce_mxfp4: COLS_PER_THREAD must be 8");
+    static_assert(D_HIDDEN % COLS_PER_THREAD == 0, "D_HIDDEN must be a multiple of COLS_PER_THREAD");
     constexpr int QCOLS = D_HIDDEN / 2;
     constexpr int SCOLS = D_HIDDEN / 32;
 

@@ -65,7 +65,6 @@ void mxfp4_moe_sort_scales_kernel(
     int64_t NE,
     int64_t TOPK,
     int64_t D_HIDDEN,
-    int64_t D_INTER,
     int64_t MB,
     int64_t max_sorted);
 
