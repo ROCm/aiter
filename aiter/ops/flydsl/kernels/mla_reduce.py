@@ -592,11 +592,14 @@ def compile_mla_reduce(
                 # index is also clamped so OOB prefetches read lds_pmap[0]/
                 # lds_scale[0] (always written) -> no NaN*0 pollution, mask=0
                 # zeroes the contribution.
-                # GRP = splits processed per iteration (loads in flight). GRP=8
-                # is the gfx942 sweet spot: vgpr ~125 keeps 2 waves/SIMD while
-                # reaching vmcnt(7) overlap. GRP=16 pushes vgpr ~199 (1 wave/SIMD)
-                # for no b8_s32 gain and only marginal b1_s128 gain.
-                GRP = 8
+                # GRP = splits processed per iteration (loads in flight), tier-
+                # dependent. The long-loop M256/MLDS path (nlse>=4, e.g. b1_s128
+                # @128 splits) wins ~8% in graph mode at GRP=16 (deeper vmcnt
+                # overlap over many iterations, 13.1->12.1us, 0.88x HIP). The M64
+                # path (nlse=1) keeps GRP=8: at GRP=16 the low-split tail (b8_s5/
+                # s6 @5-6 splits) regresses +11% because a group wastes 10 masked
+                # lanes instead of 2, and b8_s32 sees no gain beyond noise.
+                GRP = 16 if nlse >= 4 else 8
                 _grp_shift = GRP.bit_length() - 1
                 zero_f = fx.arith.constant(0.0, type=T.f32)
 
