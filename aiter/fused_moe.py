@@ -128,7 +128,18 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
     skip_moe_buf_zero=False,
+    use_flydsl=None,
 ):
+    # use_flydsl: None -> honor the global env default; True/False -> per-call
+    # override. The FlyDSL atomic sort is neutral-to-faster than CK across the
+    # whole hy3 2-stage sweep (e.g. token=32 e2e 179->165us), and auto-falls
+    # back to CK for unsupported cases (expert_mask / num_local_tokens / no
+    # flydsl), so the 2-stage path forces it on while the 1-stage/asm path is
+    # left on the env default to keep that baseline unchanged.
+    _use_flydsl = (
+        (_USE_FLYDSL_MOE_SORTING if use_flydsl is None else bool(use_flydsl))
+        and is_flydsl_available()
+    )
     try:
         return _moe_sorting_impl(
             topk_ids,
@@ -141,7 +152,7 @@ def moe_sorting(
             num_local_tokens,
             dispatch_policy,
             use_opus=_USE_OPUS_MOE_SORTING,
-            use_flydsl=_USE_FLYDSL_MOE_SORTING,
+            use_flydsl=_use_flydsl,
             skip_moe_buf_zero=skip_moe_buf_zero,
         )
     except Exception as e:
@@ -492,6 +503,9 @@ def fused_moe_(
                 num_local_tokens,
                 moe_sorting_dispatch_policy,
                 skip_moe_buf_zero=metadata.skip_moe_buf_zero,
+                # 2-stage: force FlyDSL sort (faster, auto CK fallback);
+                # 1-stage/asm: leave on env default to keep that baseline.
+                use_flydsl=None if metadata.run_1stage else True,
             )
         )
         sorted_ids2 = sorted_ids1
@@ -510,6 +524,7 @@ def fused_moe_(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             skip_moe_buf_zero=metadata.skip_moe_buf_zero,
+            use_flydsl=True,
         )
         sorted_ids2, sorted_weights2, sorted_expert_ids2, num_valid_ids2, moe_buf = (
             moe_sorting(
@@ -523,6 +538,7 @@ def fused_moe_(
                 num_local_tokens,
                 moe_sorting_dispatch_policy,
                 skip_moe_buf_zero=metadata.skip_moe_buf_zero,
+                use_flydsl=True,
             )
         )
         # Different block_m can legitimately produce different padded valid-id
@@ -982,7 +998,10 @@ def _direct_per_tensor_quant_cached(
         dynamic_per_tensor_quant_fp8_i8_fused_small,
     )
     if dynamic_per_tensor_quant_fp8_i8_fused_small(qbuf, quant_input, sbuf) is not None:
-        _guard_zero_input(qbuf, sbuf)
+        # The fused-small kernel now clamps `scale` to a tiny epsilon internally,
+        # so an all-zero tile produces a clean fp8 zero (not NaN 0x80). This makes
+        # the external _guard_zero_input (clamp_ + eq + masked_fill_, 3 extra
+        # elementwise launches per quant) unnecessary on this hot small-M path.
         return qbuf, sbuf, amax, sbuf.view(1)
     n_blocks = (quant_input.numel() + 1023) // 1024
     if (
