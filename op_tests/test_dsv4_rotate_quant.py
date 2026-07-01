@@ -174,7 +174,13 @@ def kv_fp4_preshuffle_layout(
     block = sm // kv_block_size
     pos = sm % kv_block_size
     kv_cache[block, :, :, pos, :] = fp4_v
-    kv_scale[block, :, :, pos] = scale_v
+    # Scale axis is INTERLEAVED (sflat = (pos%16)*(kv_block_size/16) + pos//16)
+    # so the pa_mqa_logits_fp4 reader's packed-dword load is contiguous. Matches
+    # the kernel's kv_scale_preshuffle_offset. Degenerates to linear `pos` for
+    # kv_block_size==16; for the indexer's k1_csa==64 it is (pos%16)*4 + pos//16.
+    tiles_per_block = kv_block_size // 16
+    sflat = (pos % 16) * tiles_per_block + (pos // 16)
+    kv_scale[block, :, :, sflat] = scale_v
     return kv_cache, kv_scale
 
 
