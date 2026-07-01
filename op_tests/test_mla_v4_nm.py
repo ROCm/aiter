@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the mi350 v4 'nm' MLA pipeline (mla_decode_fwd_v4_nm).
+"""Tests for the v4 MLA pipeline (mla_decode_fwd_v4_nm).
 Usage:
   pytest -xvs op_tests/test_mla_v4_nm.py
 """
@@ -25,7 +25,9 @@ PAGE_SIZE = 1
 NUM_KV_HEADS = 1
 DIM_NOPE = 448  # FP8 NOPE bytes per token
 DIM_ROPE = 64  # BF16 ROPE elements per token (= 128 bytes; lives in qrope/kvrope)
-DIM_QK_PACKED = 576  # = args.dim(512) + args.k_rotary(64); matches poc_kl stride_Page
+DIM_QK_PACKED = (
+    576  # = args.dim(512) + args.k_rotary(64); matches the kernel stride_Page
+)
 V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 
 
@@ -38,13 +40,13 @@ def _on_gfx950():
 
 needs_gfx950 = pytest.mark.skipif(
     not torch.cuda.is_available() or not _on_gfx950(),
-    reason="v4 nm shader is shipped only for gfx950 (mi350); requires GPU",
+    reason="v4 nm shader is shipped only for gfx950; requires GPU",
 )
 
 
 # ---------------------------------------------------------------------------
 # Synthetic input builders. We do NOT replicate the host-side FP8+e8m0 dequant
-# packing here (that's poc_kl/mla_v4.h v4_detail::init_host_buffers). For
+# packing here (that lives in the host-side kernel init). For
 # smoke testing the dispatcher we just need byte-level buffers of the right
 # shape and dtype; numerical correctness is deferred (see file docstring).
 # ---------------------------------------------------------------------------
@@ -53,7 +55,7 @@ def _build_inputs(
 ):
     """Return a dict of every tensor mla_decode_fwd_v4_nm needs.
 
-    Sizes mirror what poc_kl/mi350/mla_asm/mla.cpp computes for the same cmd
+    Sizes mirror what the reference host harness computes for the same cmd
     (only with kv_seq_lens shrunk small for fast pytest):
       total_q = batch * num_heads * q_seq_logical
       num_page = batch * (kv_seq_lens / page_size)
@@ -488,7 +490,7 @@ def _asm_attn_decode_bf16(
 
     Stride note: KV.size(3) is the per-token kernel stride in bytes. The
     kernel reads exactly 448 (nope) + 8 (scale) + slack = our 512-byte
-    layout. Padding to 576 (poc_kl's stride_Page) made the kernel read
+    layout. Padding to 576 (the kernel's stride_Page) made the kernel read
     garbage bytes as scale and produced all-NaN — DON'T pad.
     """
     total_q = q_bf16.size(0)
@@ -1495,14 +1497,10 @@ if __name__ == "__main__":
     import itertools
     import sys
 
-    # The v4 nm kernel ships only for gfx950 (mi350). CI runs every op_tests
-    # file via `python3 <file>` (not pytest), which bypasses the per-test
-    # @needs_gfx950 skipif marker and would execute this driver — loading the
-    # gfx950-only .co — on a gfx942 (mi300) runner and fail. Guard the driver
-    # so it cleanly no-ops (exit 0) anywhere that isn't gfx950.
+    # The v4 nm kernel ships only for gfx950.
     if not torch.cuda.is_available() or not _on_gfx950():
         print(
-            "[v4 nm] skip: shipped only for gfx950 (mi350); "
+            "[v4 nm] skip: shipped only for gfx950; "
             "current device is not gfx950. Exiting 0."
         )
         sys.exit(0)

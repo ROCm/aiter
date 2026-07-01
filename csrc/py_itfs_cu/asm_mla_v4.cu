@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// v4 MLA decode dispatcher (mi350 nm-recompile family).
+// v4 MLA decode dispatcher
 //
 // This is a peer of csrc/py_itfs_cu/asm_mla.cu but targets the v4 18-slot
 // kernarg ABI which is *binary incompatible* with v3's 14-slot layout:
 //
 //   slot 8  = raw gqa_ratio          (not s_MQA = gqa_ratio*max_seqlen_q)
-//   slot 9  = num_kv_splits          (== poc_kl `passes`)
+//   slot 9  = num_kv_splits          (kernel "passes")
 //   slot 10 = total_kv = kv_seq_lens * num_seqs
 //   slot 11 = stride_page = page_size * dim_qk_packed (bytes)
 //   slot 14 = ptr_STP (split_indptr) -- NEW
@@ -41,11 +41,7 @@
 AITER_CTYPES_ERROR_DEF
 
 // ----------------------------------------------------------------------------
-// Debug buffer dump. Mirrors asm_mla.cu::mla_dump_mi400_debug_buffer but is
-// gated purely at RUNTIME by AITER_MLA_DEBUG_DUMP_DIR (no ASM_DEBUG compile
-// flag needed), so the shipped .so can dump on demand. Writes <name>.bin (raw
-// device->host bytes) + <name>.meta.txt (dtype/shape/stride) into the dir.
-// No-op when the tensor is null or the env var is unset.
+// Debug buffer dump
 // ----------------------------------------------------------------------------
 static void mla_v4_dump_debug_buffer(const std::string& dump_dir,
                                      const char* name,
@@ -114,9 +110,7 @@ static void mla_v4_dump_debug_buffer(const std::string& dump_dir,
 }
 
 // ----------------------------------------------------------------------------
-// 19-slot kernarg buffer (304 bytes).verified by
-// op_tests/test_mla_v4_nm.py::test_v4_nm_kernarg_scalar_slots.
-//
+// 19-slot kernarg buffer (304 bytes).
 // `ptr_sink` (slot 18, byte offset 0x120) is the attention-sink logit
 // pointer. Pass `torch.full((num_heads,), -inf)` for "no sink"
 // math (exp(-inf - max) = 0 → no contribution); the wrapper does NOT
@@ -154,8 +148,7 @@ static_assert(offsetof(MlaV4KernelArgs, ptr_sink) == 0x120,
 
 // ----------------------------------------------------------------------------
 // kV4DimNope + kV4DimRope = 448 + 64 = 512. The kernel hardcodes
-// 1/sqrt(512) as its softmax pre-scale. Keep the constant here so the
-// dispatcher and the regression test agree without #include'ing poc_kl.
+// 1/sqrt(512) as its softmax pre-scale. 
 // ----------------------------------------------------------------------------
 static constexpr int kV4DimNope = 448;
 static constexpr int kV4DimRope = 64;
@@ -169,7 +162,7 @@ static constexpr int kV4DimRope = 64;
 // (see the V3-style decision tree below) and page_size comes from KV->size(1).
 //
 // `num_kv_splits` ("passes") is also NOT a key — the .co supports any value
-// at runtime via slot 9 of the kernarg packet (mirrors poc_kl `params.passes`).
+// at runtime via slot 9 of the kernarg packet.
 // ----------------------------------------------------------------------------
 static std::string get_heuristic_kernel_mla_v4(const std::string& q_type,
                                                const std::string& kv_type,
@@ -385,13 +378,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     }
 
     // ---- CSV lookup-key normalization ---------------------------------------
-    // v4 nm ships ONE kernel binary (the 32n-tile .co, symbol
-    // mla_a8w8_qh64_qseqlen1_gqaratio64_nm). Its 64 q-row tile serves every
-    // supported entry point, so normalize each to the single (Gqa=64,
-    // qSeqLen=1) CSV row. `sub_Q` and the per-launch grid geometry keep the
-    // gqa-correct values set above — this remap only picks which CSV row
-    // (== which .co) to load. Unsupported pairs skip the remap and fall
-    // through to a "no shipped variant" error in get_heuristic_kernel_mla_v4.
+    // v4 nm 64 q-row tile serves every supported entry point, so normalize each to the single (Gqa=64,
+    // qSeqLen=1) CSV row. 
     int csv_gqa     = gqa_ratio;
     int csv_qseqlen = config_max_seqlen_q;
     if(supported)
@@ -434,9 +422,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int gdy = num_seqs;
     const int gdz = num_kv_splits;
 
-    // ----- DEBUG: env-gated 304B kernarg dump for cross-check vs poc_kl. -----
-    // Used by op_tests/test_mla_v4_nm.py::test_v4_nm_kernarg_scalar_slots to
-    // lock in the 19-slot layout. Has no runtime cost when env unset.
+    // ----- DEBUG: env-gated 304B kernarg dump for cross-check. -----
     if(const char* dbg = std::getenv("AITER_V4_NM_DUMP_KERNARG"))
     {
         if(dbg[0] == '1')
@@ -558,9 +544,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         }
     }
 
-    // Runtime-gated raw buffer dump (inputs + stage1 outputs) for cross-check
-    // vs poc_kl. Set AITER_MLA_DEBUG_DUMP_DIR=<dir>; unset == zero cost. We
-    // sync the stream first so splitData/splitLse hold the finished results.
     if(const char* dump_env = std::getenv("AITER_MLA_DEBUG_DUMP_DIR"))
     {
         if(dump_env[0] != '\0')
