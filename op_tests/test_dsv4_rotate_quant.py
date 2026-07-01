@@ -443,7 +443,6 @@ def test_rmsnorm_rope_rotate_fp4quant_kvcache(
     ret["us"] = us
     rope_bytes = M * head_num * rope_dim * cos.element_size()
     position_bytes = M * positions.element_size()
-    weight_bytes = N * norm_weight.element_size()
     ret["TB/s"] = bandwidth_tbs(
         tensor_nbytes(x, kvcache, scale, norm_weight) + rope_bytes + position_bytes,
         us,
