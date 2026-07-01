@@ -8,6 +8,8 @@ from functools import lru_cache
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -99,36 +101,96 @@ def compute_prefill_schedule(
     excl = incl - ctas_r  # exclusive prefix sum
     total_splits = incl[-1]  # 0-dim; total valid (row, split) slots
 
-    # ── map each fixed slot → (row, split_within_row) via searchsorted ──
-    slot = torch.arange(P, device=device, dtype=torch.int32)  # [P]
-    row_of_slot = torch.searchsorted(incl, slot, right=True)  # [P], in [0, T]
-    valid = slot < total_splits  # [P] bool
-    safe_row = torch.clamp(row_of_slot, max=T - 1)  # avoid OOB gather
-    split_within = slot - excl[safe_row]  # [P]
-    start = split_within * safe  # [P]
-    n_chunks_slot = chunks_per_row[safe_row]  # [P]
-    count = torch.clamp(torch.minimum(safe, n_chunks_slot - start), min=0)  # [P]
-
-    row_sel = safe_row
-    batch_sel = rb[safe_row]
-    ls_sel = ls[safe_row]
-    le_sel = le[safe_row]
-
-    valid_i = valid.to(torch.int32)
-    row_id = row_sel * valid_i
-    batch_id = batch_sel * valid_i
-    start = start * valid_i
-    count = torch.where(valid, count, torch.ones_like(count))
-    ls_out = ls_sel * valid_i
-    le_out = le_sel * valid_i
-
-    cta_info = (
-        torch.stack([row_id, batch_id, start, count, ls_out, le_out], dim=-1)
-        .reshape(P, CTA_INFO_WIDTH)
-        .to(torch.int32)
-        .contiguous()
+    # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
+    # (the ~25 per-slot torch ops below were the bulk of the ~50-launch cost).
+    cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
+    safe_i32 = safe.reshape(1).to(torch.int32)
+    total_splits_i32 = total_splits.reshape(1).to(torch.int32)
+    BLOCK_P = 256
+    grid = (triton.cdiv(P, BLOCK_P),)
+    _prefill_cta_info_kernel[grid](
+        incl,
+        excl,
+        chunks_per_row.to(torch.int32),
+        rb,
+        ls,
+        le,
+        safe_i32,
+        total_splits_i32,
+        cta_info,
+        T,
+        P,
+        BLOCK_P=BLOCK_P,
     )
     return safe, cta_info, P
+
+
+@triton.jit
+def _prefill_cta_info_kernel(
+    incl_ptr,  # [T] int32 inclusive prefix sum of per-row CTA counts
+    excl_ptr,  # [T] int32 exclusive prefix sum
+    chunks_ptr,  # [T] int32 chunks_per_row
+    rb_ptr,  # [T] int32 row_to_batch
+    ls_ptr,  # [T] int32 local_starts
+    le_ptr,  # [T] int32 local_ends
+    safe_ptr,  # [1] int32
+    total_splits_ptr,  # [1] int32
+    cta_info_ptr,  # [P, 6] int32
+    T,
+    P,
+    BLOCK_P: tl.constexpr,
+):
+    """Single-kernel slot->row mapping + cta_info emit for ragged prefill.
+
+    Each program handles BLOCK_P persistent-grid slots: binary-search the
+    per-row inclusive prefix sum (`incl`) for the owning row (searchsorted,
+    right=True), gather the row's fields, and write the [P,6] cta_info row.
+    Collapses ~25 tiny torch ops (gathers/where/stack) into one launch.
+    Bit-exact with the torch tail it replaces.
+    """
+    pid = tl.program_id(0)
+    safe = tl.load(safe_ptr)
+    total_splits = tl.load(total_splits_ptr)
+    slot = pid * BLOCK_P + tl.arange(0, BLOCK_P)  # [BLOCK_P]
+    smask = slot < P
+    valid = slot < total_splits
+
+    # searchsorted(incl, slot, right=True) = count(incl <= slot): per-slot
+    # binary search over incl[T] in global memory (~log2(T) iters).
+    lo = tl.zeros([BLOCK_P], tl.int32)
+    hi = tl.full([BLOCK_P], T, tl.int32)
+    for _ in tl.static_range(32):
+        mid = (lo + hi) // 2
+        incl_mid = tl.load(incl_ptr + tl.minimum(mid, T - 1), mask=(mid < T), other=2147483647)
+        go_right = incl_mid <= slot
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(go_right, hi, mid)
+    safe_row = tl.minimum(lo, T - 1)  # clamp for gather
+
+    excl_r = tl.load(excl_ptr + safe_row, mask=smask, other=0)
+    chunks_r = tl.load(chunks_ptr + safe_row, mask=smask, other=0)
+    rb_r = tl.load(rb_ptr + safe_row, mask=smask, other=0)
+    ls_r = tl.load(ls_ptr + safe_row, mask=smask, other=0)
+    le_r = tl.load(le_ptr + safe_row, mask=smask, other=0)
+
+    vi = valid.to(tl.int32)
+    split_within = slot - excl_r
+    start = split_within * safe  # pre-mask (count uses this)
+    count = tl.maximum(tl.minimum(safe, chunks_r - start), 0)
+    row_id = safe_row * vi
+    batch_id = rb_r * vi
+    start = start * vi
+    count = tl.where(valid, count, 1)
+    ls_out = ls_r * vi
+    le_out = le_r * vi
+
+    base = slot * 6
+    tl.store(cta_info_ptr + base + 0, row_id, mask=smask)
+    tl.store(cta_info_ptr + base + 1, batch_id, mask=smask)
+    tl.store(cta_info_ptr + base + 2, start, mask=smask)
+    tl.store(cta_info_ptr + base + 3, count, mask=smask)
+    tl.store(cta_info_ptr + base + 4, ls_out, mask=smask)
+    tl.store(cta_info_ptr + base + 5, le_out, mask=smask)
 
 
 def build_pa_mqa_logits_fp4_prefill_module(
