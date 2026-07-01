@@ -9,7 +9,7 @@ mfma16 / HIP-aligned fork (formerly the "vk" fork): the compute path uses the
 hand-tuned HIP/C++ K5 kernel -- and the SAME warp partition (BT split-M, K split
 across waves, V not split across warps). This fork is NON-VWARP / split-M ONLY
 (the alternative OPT-VWARP layout has been removed). It writes the public VK
-layout [..., V, K] via a cooperative lds_h transpose h-store.
+layout [..., V, K] via a [V][K] transpose buffer + b128 store (HIP-aligned).
 
 For each chunk t (serial over NT chunks):
   1. Store h snapshot for downstream K6
@@ -186,15 +186,28 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     LDS_VN_ELEMS = BT * LDS_VN_STRIDE
     LDS_VN_BYTES = LDS_VN_ELEMS * 2
 
-    # OPT-H: lds_h stride padding (break 2-way bank conflict on ds_read_u16).
-    LDS_H_PAD = 4  # 4 bf16 = 8 bytes
-    LDS_H_STRIDE = BV + LDS_H_PAD
-    LDS_H_ELEMS = K * LDS_H_STRIDE
-    LDS_H_BYTES = LDS_H_ELEMS * 2
+    # HIP-ALIGN phase 1b: h_state panels (shared2 layout) for the GEMM1 B
+    # operand. One [row_block][V] panel per 64-K block (like HIP's
+    # h_state_panel0/1); GEMM1 reads the MFMA B fragment with a plain b64 load
+    # (load_b_shared2) instead of the hardware-transpose ds_read_tr16. Each
+    # cell holds 4 K (a k_group): 64/4=16 row_blocks x BV cols x 4 K.
+    LDS_HP_PANEL_ELEMS = (64 // 4) * BV * 4  # = 64 * BV per 64-K block
+    LDS_HP_ELEMS = NUM_K_BLOCKS * LDS_HP_PANEL_ELEMS
+    LDS_HP_BYTES = LDS_HP_ELEMS * 2
+
+    # HIP-ALIGN phase 1a: [V][K] transpose buffer for the h snapshot HBM store.
+    # h_accs (f32) is written here in V-major / K-innermost order so 8 adjacent
+    # K land contiguously -> a single b128 (ds_read_b128 + buffer_store b128),
+    # matching HIP's ``h_transpose_buf`` + ``coalesced_vk_store_from_transpose``
+    # (fewer store instructions than the per-element bf16 readout). K-contiguous
+    # (no pad) so the 8-wide vec load/store stays 16 B aligned.
+    LDS_HT_STRIDE = K
+    LDS_HT_ELEMS = BV * LDS_HT_STRIDE
+    LDS_HT_BYTES = LDS_HT_ELEMS * 2
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 102  # mfma16_hip: NON-VWARP (HIP split-M) only; VWARP layout removed (rev101 was VWARP 16x16x16)
+    _K5_KERNEL_REVISION = 104  # HIP-ALIGN 1b: GEMM1 B via h_state panels (load_b_shared2), lds_h removed (rev103 was b128 store only)
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -208,15 +221,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     allocator.ptr = lds_k_offset + LDS_K_BYTES
     lds_vn_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_vn_offset + LDS_VN_BYTES
-    lds_h_offset = allocator._align(allocator.ptr, 16)
-    # OPT-VK-COALESCE: the h snapshot is routed through lds_h so the HBM write
-    # can be a coalesced cooperative transpose (adjacent threads write adjacent
-    # K) instead of the per-lane non-coalesced buffer_store_dwordx2 scatter.
-    # This re-introduces LDS_H_BYTES of group_segment and the extra VGPR/barrier
-    # may drop occupancy from 3 -> 2 waves/SIMD, but the coalesced h store more
-    # than pays for it (the scatter store was the #1 hotspot at ~25% of all
-    # stall).
-    allocator.ptr = lds_h_offset + LDS_H_BYTES
+    # HIP-ALIGN 1b: h_state panels (GEMM1 B operand, shared2 layout).
+    lds_hp_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_hp_offset + LDS_HP_BYTES
+    # HIP-ALIGN phase 1a: [V][K] transpose buffer for the b128 h store.
+    lds_ht_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_ht_offset + LDS_HT_BYTES
 
     # Cooperative load parameters
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
@@ -342,9 +352,21 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         lds_vn_ptr = SmemPtr(lds_base_ptr, lds_vn_offset, T.bf16, shape=(LDS_VN_ELEMS,))
         lds_vn = STensor(lds_vn_ptr, dtype=T.bf16, shape=(LDS_VN_ELEMS,))
 
-        # h snapshot (bf16)
-        lds_h_ptr = SmemPtr(lds_base_ptr, lds_h_offset, T.bf16, shape=(LDS_H_ELEMS,))
-        lds_h = STensor(lds_h_ptr, dtype=T.bf16, shape=(LDS_H_ELEMS,))
+        # h_state panels (shared2 layout) for the GEMM1 B operand
+        lds_hp_ptr = SmemPtr(lds_base_ptr, lds_hp_offset, T.bf16, shape=(LDS_HP_ELEMS,))
+        lds_hp = STensor(lds_hp_ptr, dtype=T.bf16, shape=(LDS_HP_ELEMS,))
+        lds_hp_memref = lds_hp_ptr.get()
+
+        # h snapshot transpose buffer [V][K] (bf16) for the b128 HBM store
+        lds_ht_ptr = SmemPtr(lds_base_ptr, lds_ht_offset, T.bf16, shape=(LDS_HT_ELEMS,))
+        lds_ht = STensor(lds_ht_ptr, dtype=T.bf16, shape=(LDS_HT_ELEMS,))
+        lds_ht_memref = lds_ht_ptr.get()
+
+        # HIP-ALIGN 1b: plain b64 read of a shared2 panel cell (GEMM1 B frag).
+        v4bf16_hp_type = T.vec(4, T.bf16)
+
+        def _lds_read_hp_bf16x4(elem_idx):
+            return vector.load_op(v4bf16_hp_type, lds_hp_memref, [fx.Index(elem_idx)])
 
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
@@ -500,9 +522,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             # OPT-4: XOR swizzle to break 64-way bank conflict on lds_w.
             # Pattern: swz_col = col ^ ((row & 7) << 3) at 8-bf16 granularity
             # matching LOAD_VEC_WIDTH. Read path (W A-frag below) applies the
-            # SAME swizzle. lds_k / lds_h are NOT swizzled (ds_read_tr_b16
-            # spans 4 rows per instr; a row-dependent XOR would break the HW
-            # transpose alignment).
+            # SAME swizzle. lds_k is NOT swizzled (ds_read_tr_b16 spans 4 rows
+            # per instr; a row-dependent XOR would break the HW transpose
+            # alignment).
             w_prefetch_lds_all = []
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for batch in range_constexpr(NUM_LOAD_BATCHES_64):
@@ -511,47 +533,65 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     swz_col = _xor_swizzle(row, col)
                     w_prefetch_lds_all.append(row * fx.Int32(LDS_W_STRIDE) + swz_col)
 
-            # OPT-VK-COALESCE: route the h snapshot through lds_h and write HBM
-            # as a 256-thread cooperative transpose (adjacent threads -> adjacent
-            # K) so the store coalesces into wide transactions. lane->(V,K)
-            # mapping (split-M): wid -> K sub-tile, acc_j(nr) -> V-tile.
+            # Stage h_accs into (a) the h_state panels [row_block][V] for the
+            # GEMM1 B operand (HIP shared2 layout, plain b64 read) and (b) the
+            # [V][K] transpose buffer for the b128 HBM store. split-M mapping:
+            # wid -> K sub-tile, acc_j(nr) -> V-tile.
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for acc_j in range_constexpr(N_REPEAT):
                     acc_idx = kb * N_REPEAT + acc_j
                     acc_val = h_accs_in[acc_idx]
                     # acc_j == nr (V-tile); K sub-tile = wid*16.
-                    lds_h_col = fx.Int32(acc_j * 16) + lane_n
+                    hp_col = fx.Int32(acc_j * 16) + lane_n
                     k_tile_base = fx.Int32(kb * 64) + wid * fx.Int32(16)
 
+                    # HIP-ALIGN 1b: write the h_state panel cell (shared2). This
+                    # lane owns k_group (row_block = wid*4+lane_m_base) at V-col
+                    # = nr*16+lane_n; 4 warps together fill all 16 row_blocks.
+                    hp_row_block = wid * fx.Int32(4) + lane_m_base
+                    hp_cell = fx.Int32(kb * LDS_HP_PANEL_ELEMS) + (
+                        hp_row_block * fx.Int32(BV) + hp_col
+                    ) * fx.Int32(4)
+                    lds_hp.vec_store(
+                        (fx.Index(hp_cell),),
+                        acc_val.truncf(T.vec(4, T.bf16)),
+                        4,
+                    )
+
+                    # HIP-ALIGN 1a: [V][K] transpose buffer for the b128 store
+                    # (V = hp_col, K = k_tile_base + lane_m_base*4 + elem_i).
                     for elem_i in range_constexpr(4):
-                        f32_val = acc_val[elem_i]
-                        bf16_val = f32_val.to(fx.BFloat16)
-                        lds_h_row = (
+                        bf16_val = acc_val[elem_i].to(fx.BFloat16)
+                        ht_k = (
                             k_tile_base
                             + lane_m_base * fx.Int32(4)
                             + fx.Int32(elem_i)
                         )
-                        # OPT-H: stride is LDS_H_STRIDE = BV + LDS_H_PAD
-                        lds_h_idx = lds_h_row * fx.Int32(LDS_H_STRIDE) + lds_h_col
-                        lds_h[fx.Index(lds_h_idx)] = bf16_val
+                        lds_ht_idx = hp_col * fx.Int32(LDS_HT_STRIDE) + ht_k
+                        lds_ht[fx.Index(lds_ht_idx)] = bf16_val
 
             gpu.barrier()
 
-            # OPT-H: LDS -> HBM transpose loop. linear -> (k_idx, v_loc) with K
-            # innermost, so adjacent tid write adjacent k_idx (contiguous HBM)
-            # => coalesced buffer_store.
-            VK_TOTAL = K * BV
-            for vk_base in range_constexpr(0, VK_TOTAL, BLOCK_THREADS):
-                linear = fx.Int32(vk_base) + tid
-                k_idx = linear % fx.Int32(K)
-                v_loc = linear // fx.Int32(K)
-                lds_read_idx = k_idx * fx.Int32(LDS_H_STRIDE) + v_loc
-                bf16_tile = lds_h[fx.Index(lds_read_idx)]
+            # HIP-ALIGN 1a: b128 h store. Each thread reads 8 contiguous K from
+            # lds_ht[v][k8:k8+8] (ds_read_b128) and writes them to HBM
+            # h[chunk][v][k8:k8+8] (buffer_store b128). K_VECS = K/8 vectors per
+            # v row; adjacent threads cover adjacent (v, k8) -> coalesced wide
+            # stores (1/8 the store instructions of the per-element readout).
+            K_VECS = K // LOAD_VEC_WIDTH
+            NUM_HT_VECS = BV * K_VECS
+            for vbase in range_constexpr(0, NUM_HT_VECS, BLOCK_THREADS):
+                vec_idx = fx.Int32(vbase) + tid
+                k8 = (vec_idx % fx.Int32(K_VECS)) * fx.Int32(LOAD_VEC_WIDTH)
+                v_loc = vec_idx // fx.Int32(K_VECS)
+                lds_ht_read = v_loc * fx.Int32(LDS_HT_STRIDE) + k8
+                vec8 = vector.load_op(
+                    v8bf16_type, lds_ht_memref, [fx.Index(lds_ht_read)]
+                )
                 v_global = i_v * fx.Int32(BV) + v_loc
                 h_off = (
-                    h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k_idx
+                    h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k8
                 )
-                h_[fx.Index(h_off)] = bf16_tile
+                h_.vec_store((fx.Index(h_off),), vec8, LOAD_VEC_WIDTH)
 
             # -- Store prefetched w to LDS (data already in registers from previous iter/prologue) --
             for i_wp in range_constexpr(NUM_W_LOADS):
@@ -769,8 +809,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     a_frag_lo = a_frag8.shuffle(a_frag8, [0, 1, 2, 3])
                     a_frag_hi = a_frag8.shuffle(a_frag8, [4, 5, 6, 7])
 
-                    global_ks = kb * K_STEPS_PER_BLOCK + ks
-
                     for nr in range_constexpr(N_REPEAT):
                         slot_idx = (
                             kb * (K_STEPS_PER_BLOCK * N_REPEAT)
@@ -780,23 +818,27 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         for _eidx in SLOT_ASSIGN_CT[slot_idx]:
                             extra_load_emitters[_eidx]()
 
-                        h_k_row = (
-                            fx.Int32(global_ks * WMMA_K)
-                            + lane_m_base * fx.Int32(8)
-                            + tr_k_group
-                        )
-                        h_v_col = fx.Int32(nr * 16) + tr_col_sub * fx.Int32(4)
-                        h_lds_elem = (
-                            h_k_row * fx.Int32(LDS_H_STRIDE) + h_v_col
-                        )
-                        h_lds_byte = h_lds_elem * fx.Int32(2) + fx.Int32(
-                            lds_h_offset
-                        )
-
-                        b_frag_lo = _ds_read_tr_bf16x4(h_lds_byte)
-                        b_frag_hi = _ds_read_tr_bf16x4(
-                            h_lds_byte + fx.Int32(4 * LDS_H_STRIDE * 2)
-                        )
+                        # HIP-ALIGN 1b: B = load_b_shared2(panel_kb, k_base,
+                        # lane, nr*16). col = (lane&15)+nr*16;
+                        # row_block = (k_base>>2)+(lane>>4). lo tile K in
+                        # [ks*32, ks*32+16), hi in [ks*32+16, ks*32+32) --
+                        # matching a_frag_lo/a_frag_hi of the WMMA_K=32 w read.
+                        # w A-frag (bf16x8 split) uses an interleaved K layout:
+                        # a_frag_lo covers the EVEN 4-K groups (lane_m_base*8+
+                        # 0..3), a_frag_hi the ODD groups (+4..7). Match B's
+                        # k_group: row_block = ks*8 + lane_m_base*2 (lo), +1 (hi).
+                        hp_base = fx.Int32(kb * LDS_HP_PANEL_ELEMS)
+                        hp_col_b = fx.Int32(nr * 16) + lane_n
+                        rb_lo = fx.Int32((ks * WMMA_K) >> 2) + lane_m_base * fx.Int32(2)
+                        rb_hi = rb_lo + fx.Int32(1)
+                        idx_lo = hp_base + (
+                            rb_lo * fx.Int32(BV) + hp_col_b
+                        ) * fx.Int32(4)
+                        idx_hi = hp_base + (
+                            rb_hi * fx.Int32(BV) + hp_col_b
+                        ) * fx.Int32(4)
+                        b_frag_lo = _lds_read_hp_bf16x4(idx_lo)
+                        b_frag_hi = _lds_read_hp_bf16x4(idx_hi)
 
                         bv_accs[nr] = _mfma_bf16_16x16x16(
                             a_frag_lo, b_frag_lo, bv_accs[nr]
