@@ -38,8 +38,8 @@ def block_quant_weight(w, blk_n, blk_k):
     w_blocks = w_blocks.permute(0, 1, 3, 2, 4).contiguous()  # [E, nbn, nbk, blk_n, blk_k]
     # Per-block max for scale
     amax = w_blocks.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-12)
-    scale = amax / 448.0  # FP8 E4M3FNUZ max = 448
-    w_q = (w_blocks / scale).clamp(-448, 448).to(torch.float8_e4m3fnuz)
+    scale = amax / 240.0  # FP8 E4M3FNUZ max = 240
+    w_q = (w_blocks / scale).clamp(-240, 240).to(torch.float8_e4m3fnuz)
     scale = scale.squeeze(-1).squeeze(-1)  # [E, nbn, nbk]
     # Reshape back to [E, N, K]
     w_q = w_q.permute(0, 1, 3, 2, 4).contiguous().view(E, N, K)
@@ -97,7 +97,7 @@ def torch_moe_ref(input_bf16, w1_q, w2_q, w1_scale, w2_scale, topk_weights, topk
             gu = x @ w1_f[eid].T  # [d_ff*2]
             gate = gu[:d_ff]
             up = gu[d_ff:]
-            act = torch.sigmoid(gate) * gate * up  # SiLU(gate) * up
+            act = torch.nn.functional.silu(gate) * up
             # Stage 2: down
             down = act @ w2_f[eid].T  # [d_model]
             out[t] += w * down
