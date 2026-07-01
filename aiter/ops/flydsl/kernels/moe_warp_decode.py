@@ -99,22 +99,31 @@ def _fp8x2_to_bf16(fp8_word_i32, scale_f32, sel: int):
     )
 
 
-def _vmcnt0():
-    """Wait for all pending VMEM load operations to complete.
+def _vmcnt_n(n: int):
+    """s_waitcnt vmcnt(N) — wait until N or fewer VMEM ops are outstanding.
 
-    Must be inserted between the load phase and compute phase of a batched
-    load/compute pattern.  The AMDGPU SIInsertWaitcnts LLVM pass does not
-    analyse inline asm register operands, so callers of _dot2_batched must
-    manually emit this barrier after issuing all loads.
+    Used between the 'issue current-step loads' and 'compute previous-step'
+    phases of the software-prefetch pipeline.  N is the number of loads just
+    issued for the current step (which we do NOT want to wait for yet).
     """
     llvm.InlineAsmOp(
         res=None,
         operands_=[],
-        asm_string="s_waitcnt vmcnt(0)",
+        asm_string=f"s_waitcnt vmcnt({n})",
         constraints="",
         has_side_effects=True,
         is_align_stack=False,
     )
+
+
+def _vmcnt0():
+    """Wait for ALL pending VMEM loads to complete (vmcnt(0)).
+
+    Used in the epilogue of the prefetch pipeline (after the last k-step's
+    loads have been issued, before the final compute pass).
+    Also used in the non-prefetch batched pattern.
+    """
+    _vmcnt_n(0)
 
 
 def _dot2_batched(acc_f32, a_i32, b_i32):
@@ -318,38 +327,55 @@ def compile_wd_moe_gate_up(
         c_four = arith.constant(4, type=i32)
         x_row_base = token_b * HIDDEN_i32  # BF16 element offset
 
-        for_op = scf.ForOp(
-            arith.constant(0, index=True),
-            arith.constant(_n_k_steps, index=True),
-            arith.constant(1, index=True),
-            iter_args=[arith.constant(0.0, type=f32), arith.constant(0.0, type=f32)],
-        )
-        with ir.InsertionPoint(for_op.body):
-            step_i32 = arith.index_cast(i32, for_op.induction_variable)
-            g_acc = for_op.inner_iter_args[0]
-            u_acc = for_op.inner_iter_args[1]
+        # ── Software-pipelined prefetch K-loop ───────────────────────────────
+        # For dot2 paths (FP8 and BF16+dot2), we overlap VMEM loads with VALU
+        # compute using a prologue/epilogue structure:
+        #
+        #   Prologue:  issue loads for k-step 0
+        #   for step in 1..n_k_steps-1:
+        #     A) issue loads for step (no wait)       ← NEW VMEM pipeline
+        #     B) vmcnt(n_loads_per_step)              ← wait for PREV step only
+        #     C) compute PREV step (from iter_args)
+        #     yield [g, u, curr_loads...]
+        #   Epilogue: vmcnt(0) + compute last step
+        #
+        # The loads for step k+1 fly in HBM while step k's dot2s execute,
+        # recovering the ~30% HBM gap vs CK (which achieves this automatically
+        # via LLVM's instruction scheduler on its non-asm intrinsics).
+        #
+        # Load order within each step:
+        #   FP8 path:   [g_fp8_0,g_fp8_1, u_fp8_0,u_fp8_1, x_0,x_1,x_2,x_3]
+        #   BF16 dot2:  [x_0,g_0,u_0, x_1,g_1,u_1, x_2,g_2,u_2, x_3,g_3,u_3]
+        # (interleaved to allow the GPU to pipeline the address calculations)
 
-            k_base = step_i32 * c_k_step  # K-element start of this tile
-            lane_k = k_base + lane_kV  # this lane's element start
+        zero_f32 = arith.constant(0.0, type=f32)
+        c1_idx = arith.constant(1, index=True)
+        # Pre-initialise so the AST rewriter can resolve g_final/u_final from
+        # _butterfly_reduce even when visiting the branch where they're not set.
+        g_final = zero_f32
+        u_final = zero_f32
 
-            # Batched load/compute pattern: issue ALL loads → one vmcnt → compute.
-            # Profiling showed per-pair s_waitcnt vmcnt(0) (the old _dot2_dep) kept
-            # HBM utilisation at only 44% vs CK's 97%.  With all _k_pairs loads
-            # in-flight simultaneously, the HBM controller can pipeline requests.
-            #
-            # ── Phase 1: issue all buffer loads ──────────────────────────────────
-            # Pre-initialise all list containers so they are always in scope.
-            # FlyDSL's AST rewriter visits all branches of if/elif/else for type
-            # inference, so every variable referenced in any branch must be defined
-            # before the first conditional.
-            g_fp8_words: list = []
-            u_fp8_words: list = []
-            x_words_fp8: list = []
-            x_words_bf16: list = []
-            g_words_bf16: list = []
-            u_words_bf16: list = []
+        if w_dtype == "fp8":
+            # ── FP8: batched load/compute (proven correct, 44%→65% HBM gain) ─
+            # Prefetch pipeline has an unresolved phase bug for FP8 (alternating
+            # k-step correctness when n_k_steps is odd).  Use the working batched
+            # pattern: issue all loads → one vmcnt → compute.  TODO: debug the
+            # prefetch path and enable it for FP8 as well.
+            for_op = scf.ForOp(
+                arith.constant(0, index=True),
+                arith.constant(_n_k_steps, index=True),
+                c1_idx,
+                iter_args=[zero_f32, zero_f32],
+            )
+            with ir.InsertionPoint(for_op.body):
+                step_i32 = arith.index_cast(i32, for_op.induction_variable)
+                g_acc = for_op.inner_iter_args[0]
+                u_acc = for_op.inner_iter_args[1]
+                lane_k = step_i32 * c_k_step + lane_kV
 
-            if w_dtype == "fp8":
+                g_fp8_words: list = []
+                u_fp8_words: list = []
+                x_words_fp8: list = []
                 for wi in range_constexpr(_k_fp8_words):
                     wi4 = arith.constant(wi * 4, type=i32)
                     w_i32_off = (lane_k + wi4) // c_four
@@ -371,109 +397,155 @@ def compile_wd_moe_gate_up(
                                 x_rsrc, x_off, vec_width=1, dtype=i32
                             )
                         )
-            else:
-                x_words_bf16 = []
-                g_words_bf16 = []
-                u_words_bf16 = []
+
+                _vmcnt0()
+
+                g_slots: list = []
+                u_slots: list = []
+                for wi in range_constexpr(_k_fp8_words):
+                    for sel in range_constexpr(2):
+                        idx = wi * 2 + sel
+                        xw = x_words_fp8[idx]
+                        g_slots.append(
+                            _dot2_batched(
+                                zero_f32,
+                                xw,
+                                _fp8x2_to_bf16(g_fp8_words[wi], w_scale, sel),
+                            )
+                        )
+                        u_slots.append(
+                            _dot2_batched(
+                                zero_f32,
+                                xw,
+                                _fp8x2_to_bf16(u_fp8_words[wi], w_scale, sel),
+                            )
+                        )
+                rocdl.s_nop(2)
+                gp = g_slots[0]
+                up = u_slots[0]
+                for i in range(1, _k_pairs):
+                    gp = arith.addf(gp, g_slots[i])
+                    up = arith.addf(up, u_slots[i])
+                g_cur = arith.addf(g_acc, gp)
+                u_cur = arith.addf(u_acc, up)
+                scf.YieldOp([g_cur, u_cur])
+
+            g_final = for_op.results[0]
+            u_final = for_op.results[1]
+
+        elif _use_dot2:
+            # ── BF16 dot2: software-pipelined prefetch (overlaps VMEM + VALU) ─
+            # Issue next k-step's 12 loads while computing current k-step's dot2s.
+            # Carries loaded i32 VGPRs as scf.ForOp iter_args across iterations.
+            _n_loads = _k_pairs * 3  # 4 × (x + g + u) = 12 loads per step
+
+            def _emit_loads_bf16d2(lane_k_i32):
+                """Return 12 i32 loads for one k-step (BF16×BF16 dot2 path)."""
+                ld = []
                 for p in range_constexpr(_k_pairs):
-                    p2 = arith.constant(p * 2, type=i32)
-                    x_words_bf16.append(
+                    p2c = arith.constant(p * 2, type=i32)
+                    ld.append(
                         buffer_ops.buffer_load(
                             x_rsrc,
-                            (x_row_base + lane_k + p2) // c_two,
+                            (x_row_base + lane_k_i32 + p2c) // c_two,
                             vec_width=1,
                             dtype=i32,
                         )
                     )
-                    if _use_dot2:
-                        g_words_bf16.append(
-                            buffer_ops.buffer_load(
-                                wg_row_rsrc,
-                                (lane_k + p2) // c_two,
-                                vec_width=1,
-                                dtype=i32,
-                            )
+                    ld.append(
+                        buffer_ops.buffer_load(
+                            wg_row_rsrc,
+                            (lane_k_i32 + p2c) // c_two,
+                            vec_width=1,
+                            dtype=i32,
                         )
-                        u_words_bf16.append(
-                            buffer_ops.buffer_load(
-                                wu_row_rsrc,
-                                (lane_k + p2) // c_two,
-                                vec_width=1,
-                                dtype=i32,
-                            )
+                    )
+                    ld.append(
+                        buffer_ops.buffer_load(
+                            wu_row_rsrc,
+                            (lane_k_i32 + p2c) // c_two,
+                            vec_width=1,
+                            dtype=i32,
                         )
+                    )
+                return ld
 
-            # ── Phase 2: one vmcnt to wait for all loads ──────────────────────────
-            if _use_dot2:
-                _vmcnt0()
-
-            # ── Phase 3: compute with independent accumulators ───────────────────
-            # Each of the _k_pairs accumulator slots (g_slots[i], u_slots[i]) is
-            # independent — no write→read hazard between them, so no s_nop between
-            # consecutive dot2 calls.  One drain s_nop 2 covers all before summing.
-            zero_f32 = arith.constant(0.0, type=f32)
-            # Pre-initialise g_cur/u_cur so the AST rewriter can resolve them
-            # from scf.YieldOp even when visiting branches where they're not set.
-            g_cur = g_acc
-            u_cur = u_acc
-
-            if w_dtype == "fp8":
-                g_slots = []
-                u_slots = []
-                for wi in range_constexpr(_k_fp8_words):
-                    for sel in range_constexpr(2):
-                        idx = wi * 2 + sel
-                        x_word = x_words_fp8[idx]
-                        g_bf16 = _fp8x2_to_bf16(g_fp8_words[wi], w_scale, sel)
-                        u_bf16 = _fp8x2_to_bf16(u_fp8_words[wi], w_scale, sel)
-                        g_slots.append(_dot2_batched(zero_f32, x_word, g_bf16))
-                        u_slots.append(_dot2_batched(zero_f32, x_word, u_bf16))
-                rocdl.s_nop(2)  # one drain covers all slots
-                g_partial = g_slots[0]
-                u_partial = u_slots[0]
-                for i in range(1, _k_pairs):
-                    g_partial = arith.addf(g_partial, g_slots[i])
-                    u_partial = arith.addf(u_partial, u_slots[i])
-                g_cur = arith.addf(g_acc, g_partial)
-                u_cur = arith.addf(u_acc, u_partial)
-
-            elif _use_dot2:
-                g_slots = []
-                u_slots = []
+            def _compute_bf16d2(prev_ld, g_acc_val, u_acc_val):
+                """Compute dot2s from pre-loaded (vmcnt-cleared) BF16×BF16 values."""
+                # Layout: [x0,g0,u0, x1,g1,u1, x2,g2,u2, x3,g3,u3]
+                g_sl: list = []
+                u_sl: list = []
                 for p in range_constexpr(_k_pairs):
-                    g_slots.append(
-                        _dot2_batched(zero_f32, x_words_bf16[p], g_words_bf16[p])
+                    g_sl.append(
+                        _dot2_batched(zero_f32, prev_ld[p * 3], prev_ld[p * 3 + 1])
                     )
-                    u_slots.append(
-                        _dot2_batched(zero_f32, x_words_bf16[p], u_words_bf16[p])
+                    u_sl.append(
+                        _dot2_batched(zero_f32, prev_ld[p * 3], prev_ld[p * 3 + 2])
                     )
-                rocdl.s_nop(2)  # one drain covers all slots
-                g_partial = g_slots[0]
-                u_partial = u_slots[0]
+                rocdl.s_nop(2)
+                gp = g_sl[0]
+                up = u_sl[0]
                 for i in range(1, _k_pairs):
-                    g_partial = arith.addf(g_partial, g_slots[i])
-                    u_partial = arith.addf(u_partial, u_slots[i])
-                g_cur = arith.addf(g_acc, g_partial)
-                u_cur = arith.addf(u_acc, u_partial)
+                    gp = arith.addf(gp, g_sl[i])
+                    up = arith.addf(up, u_sl[i])
+                return arith.addf(g_acc_val, gp), arith.addf(u_acc_val, up)
 
-            else:
-                # FP32 scalar path: loads are handled by LLVM's SIInsertWaitcnts,
-                # no explicit vmcnt needed.
+            # Prologue: issue step-0 loads
+            prologue_ld = _emit_loads_bf16d2(lane_kV)
+
+            for_op = scf.ForOp(
+                c1_idx,
+                arith.constant(_n_k_steps, index=True),
+                c1_idx,
+                iter_args=[zero_f32, zero_f32] + prologue_ld,
+            )
+            with ir.InsertionPoint(for_op.body):
+                step_i32 = arith.index_cast(i32, for_op.induction_variable)
+                g_acc = for_op.inner_iter_args[0]
+                u_acc = for_op.inner_iter_args[1]
+                prev_ld = list(for_op.inner_iter_args[2:])
+                lane_k_curr = step_i32 * c_k_step + lane_kV
+                curr_ld = _emit_loads_bf16d2(lane_k_curr)  # A) issue next step
+                _vmcnt_n(_n_loads)  # B) wait for prev step
+                g_new, u_new = _compute_bf16d2(prev_ld, g_acc, u_acc)  # C) compute
+                scf.YieldOp([g_new, u_new] + curr_ld)
+
+            last_ld = list(for_op.results[2:])
+            _vmcnt0()
+            g_final, u_final = _compute_bf16d2(
+                last_ld, for_op.results[0], for_op.results[1]
+            )
+
+        else:
+            # ── f32 scalar path (gfx942 + gfx950 correctness) ────────────────
+            # LLVM's SIInsertWaitcnts handles load ordering automatically for
+            # regular VALU ops; no explicit vmcnt needed.
+            for_op = scf.ForOp(
+                arith.constant(0, index=True),
+                arith.constant(_n_k_steps, index=True),
+                c1_idx,
+                iter_args=[zero_f32, zero_f32],
+            )
+            with ir.InsertionPoint(for_op.body):
+                step_i32 = arith.index_cast(i32, for_op.induction_variable)
+                g_acc = for_op.inner_iter_args[0]
+                u_acc = for_op.inner_iter_args[1]
+                lane_k = step_i32 * c_k_step + lane_kV
                 g_cur = g_acc
                 u_cur = u_acc
                 for p in range_constexpr(_k_pairs):
-                    x_word = x_words_bf16[p]
-                    g_word = buffer_ops.buffer_load(
-                        wg_row_rsrc,
-                        (lane_k + arith.constant(p * 2, type=i32)) // c_two,
+                    p2 = arith.constant(p * 2, type=i32)
+                    x_word = buffer_ops.buffer_load(
+                        x_rsrc,
+                        (x_row_base + lane_k + p2) // c_two,
                         vec_width=1,
                         dtype=i32,
                     )
+                    g_word = buffer_ops.buffer_load(
+                        wg_row_rsrc, (lane_k + p2) // c_two, vec_width=1, dtype=i32
+                    )
                     u_word = buffer_ops.buffer_load(
-                        wu_row_rsrc,
-                        (lane_k + arith.constant(p * 2, type=i32)) // c_two,
-                        vec_width=1,
-                        dtype=i32,
+                        wu_row_rsrc, (lane_k + p2) // c_two, vec_width=1, dtype=i32
                     )
                     x0 = _bf16_pair_to_f32(x_word, 0)
                     x1 = _bf16_pair_to_f32(x_word, 1)
@@ -491,11 +563,13 @@ def compile_wd_moe_gate_up(
                             arith.mulf(x1, _bf16_pair_to_f32(u_word, 1)),
                         ),
                     )
+                scf.YieldOp([g_cur, u_cur])
 
-            scf.YieldOp([g_cur, u_cur])
+            g_final = for_op.results[0]
+            u_final = for_op.results[1]
 
-        gate_sum = _butterfly_reduce(for_op.results[0])
-        up_sum = _butterfly_reduce(for_op.results[1])
+        gate_sum = _butterfly_reduce(g_final)
+        up_sum = _butterfly_reduce(u_final)
 
         # ── Epilogue: lane 0 writes silu(gate) * up as BF16 ─────────────────
         lane_zero = arith.cmpi(CmpIPredicate.eq, lane_i32, arith.constant(0, type=i32))
