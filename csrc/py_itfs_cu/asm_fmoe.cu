@@ -196,6 +196,14 @@ class FMoeKernel
             gdx = ((inter_dim + sub_GU - 1) / sub_GU);
             gdy = static_cast<int>(topk);
             gdz = static_cast<int>(token_cnt);
+            fprintf(stderr, "[aiter_fmoe_debug] FLAT dispatch: grid=(%d,%d,%d) dim=%u inter_dim=%u token_cnt=%u eprt_cnt=%u topk=%u\n",
+                    gdx, gdy, gdz, args.dim, args.inter_dim, args.token_cnt, args.eprt_cnt, args.topk);
+            fprintf(stderr, "[aiter_fmoe_debug] Xs=%u GUs=%u Ds=%u Os=%u eGUs=%u eDs=%u eGUQs=%u eDQs=%u\n",
+                    args.Xs, args.GUs, args.Ds, args.Os, args.eGUs, args.eDs, args.eGUQs, args.eDQs);
+            fprintf(stderr, "[aiter_fmoe_debug] ptrs: O=%p X=%p GU=%p XC=%p D=%p XQ=%p GUQ=%p DQ=%p STP=%p SW=%p SEP=%p\n",
+                    args.ptr_O, args.ptr_X, args.ptr_GU, args.ptr_XC, args.ptr_D,
+                    args.ptr_XQ, args.ptr_GUQ, args.ptr_DQ, args.ptr_STP, args.ptr_SW, args.ptr_SEP);
+            fprintf(stderr, "[aiter_fmoe_debug] arg_size=%zu flat=%d sub_GU=%u\n", arg_size, (int)this->is_flat_dispatch, sub_GU);
         }
         else if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
                 (args.total_tgs % args.ps_deno) == 0) // ps
