@@ -571,18 +571,24 @@ def compile_mla_reduce(
 
                 fx.gpu.barrier()
 
-                # Lever #1: depth-2 double-rate software pipeline. Process 2
-                # splits per iteration and keep TWO output buffer_loads in flight
-                # (oaccu_0/oaccu_1 in HIP reduce_output_massive). The two carried
-                # loads (os0/os1) and the two prefetched loads for the next pair
-                # are distinct SSA values so the compiler allocates separate
-                # VGPRs -> genuine vmcnt(>=1) overlap (depth-1 aliased the single
-                # carried os into the next load dest, forcing vmcnt(0) drain).
+                # Lever #1/#5: GRP-wide double-rate software pipeline. Process
+                # GRP splits per iteration and keep GRP output buffer_loads in
+                # flight (generalizes HIP oaccu_0/oaccu_1 depth-2). Each group's
+                # carried loads and the next group's prefetch are distinct SSA
+                # values so the compiler allocates separate VGPRs -> genuine
+                # vmcnt(>0) overlap (depth-1 aliased the single carried os into
+                # the next load dest, forcing vmcnt(0) drain).
                 #
                 # Bounds are carried as float masks (deferred-guard); the split
                 # index is also clamped so OOB prefetches read lds_pmap[0]/
                 # lds_scale[0] (always written) -> no NaN*0 pollution, mask=0
                 # zeroes the contribution.
+                # GRP = splits processed per iteration (loads in flight). GRP=8
+                # is the gfx942 sweet spot: vgpr ~125 keeps 2 waves/SIMD while
+                # reaching vmcnt(7) overlap. GRP=16 pushes vgpr ~199 (1 wave/SIMD)
+                # for no b8_s32 gain and only marginal b1_s128 gain.
+                GRP = 8
+                _grp_shift = GRP.bit_length() - 1
                 zero_f = fx.arith.constant(0.0, type=T.f32)
 
                 def load_g(split_i32):
@@ -601,85 +607,94 @@ def compile_mla_reduce(
                     sc = lds_scale[fx.Index(safe_split)]
                     return os_raw, mask, sc
 
-                os0_l, m0, sc0 = load_g(fx.Int32(0))
-                os1_l, m1, sc1 = load_g(fx.Int32(1))
-                init_os0 = [_to_raw(os0_l[i]) for i in fx.range_constexpr(VEC)]
-                init_os1 = [_to_raw(os1_l[i]) for i in fx.range_constexpr(VEC)]
-                init_regs = [
-                    _to_raw(zero_f) for _ in fx.range_constexpr(VEC)
-                ]
-                init_state = (
-                    init_os0
-                    + init_os1
-                    + init_regs
-                    + [_to_raw(m0), _to_raw(sc0), _to_raw(m1), _to_raw(sc1)]
-                )
+                # Prologue: load group 0 (splits 0..GRP-1).
+                os_g0 = []
+                mask_g0 = []
+                sc_g0 = []
+                for j in fx.range_constexpr(GRP):
+                    osj, mj, scj = load_g(fx.Int32(j))
+                    os_g0.append(osj)
+                    mask_g0.append(mj)
+                    sc_g0.append(scj)
+                init_os = []
+                for j in fx.range_constexpr(GRP):
+                    init_os += [
+                        _to_raw(os_g0[j][k]) for k in fx.range_constexpr(VEC)
+                    ]
+                init_regs = [_to_raw(zero_f) for _ in fx.range_constexpr(VEC)]
+                init_ms = []
+                for j in fx.range_constexpr(GRP):
+                    init_ms += [_to_raw(mask_g0[j]), _to_raw(sc_g0[j])]
+                init_state = init_os + init_regs + init_ms
 
-                # num_iters = floor((n_splits - 1) / 2); the loop consumes pairs
-                # (0,1)..(stop-2,stop-1) and the epilogue the final carried pair
-                # (stop, stop+1). stop = 2 * num_iters.
+                # N = floor((n_splits - 1) / GRP) loop iterations; the loop
+                # consumes groups 0..N-1 and the epilogue the final carried
+                # group N. stop = N * GRP (step GRP).
                 n_minus1 = n_splits - fx.Int32(1)
                 num_iters = fx.Int32(
                     fx.arith.shrsi(
                         _to_raw(n_minus1),
-                        _to_raw(fx.arith.constant(1, type=T.i32)),
+                        _to_raw(fx.arith.constant(_grp_shift, type=T.i32)),
                     )
                 )
-                stop_i32 = num_iters * fx.Int32(2)
+                stop_i32 = num_iters * fx.Int32(GRP)
                 loop_stop = fx.arith.index_cast(T.index, _to_raw(stop_i32))
+                _mbase = (GRP + 1) * VEC
 
                 def unpack(state):
-                    os0 = [state[i] for i in fx.range_constexpr(VEC)]
-                    os1 = [state[VEC + i] for i in fx.range_constexpr(VEC)]
-                    regs = [
-                        state[2 * VEC + i] for i in fx.range_constexpr(VEC)
+                    os_g = [
+                        [state[j * VEC + k] for k in fx.range_constexpr(VEC)]
+                        for j in fx.range_constexpr(GRP)
                     ]
-                    m0 = state[3 * VEC]
-                    sc0 = state[3 * VEC + 1]
-                    m1 = state[3 * VEC + 2]
-                    sc1 = state[3 * VEC + 3]
-                    return os0, os1, regs, m0, sc0, m1, sc1
+                    regs = [
+                        state[GRP * VEC + k] for k in fx.range_constexpr(VEC)
+                    ]
+                    mask_g = [state[_mbase + 2 * j] for j in fx.range_constexpr(GRP)]
+                    sc_g = [state[_mbase + 2 * j + 1] for j in fx.range_constexpr(GRP)]
+                    return os_g, regs, mask_g, sc_g
+
+                def accumulate(regs, os_g, mask_g, sc_g):
+                    new_regs = list(regs)
+                    for j in fx.range_constexpr(GRP):
+                        sc_eff = sc_g[j] * mask_g[j]
+                        new_regs = [
+                            new_regs[k] + os_g[j][k] * sc_eff
+                            for k in fx.range_constexpr(VEC)
+                        ]
+                    return new_regs
 
                 for i, state in range(
-                    fx.Index(0), loop_stop, fx.Index(2), init=init_state
+                    fx.Index(0), loop_stop, fx.Index(GRP), init=init_state
                 ):
-                    os0, os1, regs, m0, sc0, m1, sc1 = unpack(state)
+                    os_g, regs, mask_g, sc_g = unpack(state)
                     i_i32 = fx.Int32(fx.arith.index_cast(T.i32, _to_raw(i)))
-                    # Issue the next pair's loads FIRST (stay in flight), then
-                    # FMA the two carried loads.
-                    os0n_l, m0n, sc0n = load_g(i_i32 + fx.Int32(2))
-                    os1n_l, m1n, sc1n = load_g(i_i32 + fx.Int32(3))
-                    next_os0 = [
-                        _to_raw(os0n_l[k]) for k in fx.range_constexpr(VEC)
-                    ]
-                    next_os1 = [
-                        _to_raw(os1n_l[k]) for k in fx.range_constexpr(VEC)
-                    ]
-                    sc_eff0 = sc0 * m0
-                    sc_eff1 = sc1 * m1
-                    new_regs = [
-                        _to_raw(regs[k] + os0[k] * sc_eff0 + os1[k] * sc_eff1)
-                        for k in fx.range_constexpr(VEC)
-                    ]
-                    results = yield (
-                        next_os0
-                        + next_os1
-                        + new_regs
-                        + [
-                            _to_raw(m0n),
-                            _to_raw(sc0n),
-                            _to_raw(m1n),
-                            _to_raw(sc1n),
+                    # Issue the next group's loads FIRST (stay in flight), then
+                    # FMA the carried group.
+                    n_os = []
+                    n_mask = []
+                    n_sc = []
+                    for j in fx.range_constexpr(GRP):
+                        osj, mj, scj = load_g(i_i32 + fx.Int32(GRP + j))
+                        n_os.append(osj)
+                        n_mask.append(mj)
+                        n_sc.append(scj)
+                    new_regs = accumulate(regs, os_g, mask_g, sc_g)
+                    next_os_flat = []
+                    for j in fx.range_constexpr(GRP):
+                        next_os_flat += [
+                            _to_raw(n_os[j][k]) for k in fx.range_constexpr(VEC)
                         ]
+                    next_ms = []
+                    for j in fx.range_constexpr(GRP):
+                        next_ms += [_to_raw(n_mask[j]), _to_raw(n_sc[j])]
+                    results = yield (
+                        next_os_flat
+                        + [_to_raw(r) for r in new_regs]
+                        + next_ms
                     )
 
-                os0, os1, regs, m0, sc0, m1, sc1 = unpack(results)
-                sc_eff0 = sc0 * m0
-                sc_eff1 = sc1 * m1
-                out_elems = [
-                    regs[k] + os0[k] * sc_eff0 + os1[k] * sc_eff1
-                    for k in fx.range_constexpr(VEC)
-                ]
+                os_g, regs, mask_g, sc_g = unpack(results)
+                out_elems = accumulate(regs, os_g, mask_g, sc_g)
                 store_result(seq_i32, out_elems)
 
             def dispatch_tier_body(seq_i32, local_seq):
