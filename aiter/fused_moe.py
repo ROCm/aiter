@@ -1458,6 +1458,9 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
+        
+        logger.info(f"[fused_moe] tuned config used for {keys}: kernelName1={kernelName1}, kernelName2={kernelName2}")
+
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
@@ -1465,8 +1468,6 @@ def get_2stage_cfgs(
     opus_stage2_cfg_values = (
         _opus_a8w4.stage2_cfg_values(cfg, block_m) if is_opus_cfg else {}
     )
-
-        logger.info(f"[fused_moe] tuned config used for {keys}: kernelName1={kernelName1}, kernelName2={kernelName2}")
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
