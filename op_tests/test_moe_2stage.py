@@ -323,26 +323,12 @@ def test_fmoe(
                 # Keep the torch reference at f32 until the quantization step.
                 stage1_ref_dtype = dtypes.fp32
 
-    # Detect xbf16: when active, the kernel receives BF16 input (not FP8),
-    # so the reference must also use BF16 input for a fair comparison.
-    from aiter.fused_moe import quant_remap
-    ref_xbf16 = False
-    if qType in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128):
-        _q = quant_remap.get(qType, qType)
-        _metadata = get_2stage_cfgs(
-            get_padded_M(token), model_dim, inter_dim, E, topk, dtype,
-            AQDType, WQDType, _q, use_g1u1, actType, doweight_stage1,
-            hidden_pad, intermediate_pad,
-            getattr(w1_qt_aiter, "is_shuffled", False)
-            or getattr(w2_qt_aiter, "is_shuffled", False),
-            gateMode,
-        )
-        ref_xbf16 = getattr(_metadata, "xbf16", False)
-
-    if ref_xbf16:
-        print(f"[test] ref_xbf16=True: using BF16 input ({input.dtype}) for reference instead of {a1_qt.dtype}")
-    ref_a1 = input if ref_xbf16 else a1_qt
-    ref_a1_scale = None if ref_xbf16 else a1_scale
+    # per_128x128 ASM kernels may use xbf16 (in-kernel quantization from BF16).
+    # Use BF16 input for the reference to match — it's a better ground truth
+    # and works for both xbf16 and non-xbf16 paths.
+    ref_bf16 = qType in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128)
+    ref_a1 = input if ref_bf16 else a1_qt
+    ref_a1_scale = None if ref_bf16 else a1_scale
 
     out1_ref = torch_moe_stage1(
         ref_a1,
