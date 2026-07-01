@@ -322,12 +322,12 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             int32_t row_kv_ld;
             if(tile_end <= kv_end)
             {
-                row_kv_ld = get_kv_ld_row<false, T::kPageSize>(
+                row_kv_ld = get_kv_ld_row<false, T::kPageSize, /*kForceBufferLoad=*/true>(
                     params.p_kv_indices, kv_ld_row_base_idx, tile_start, tile_end);
             }
             else
             {
-                row_kv_ld = get_kv_ld_row<true, T::kPageSize>(
+                row_kv_ld = get_kv_ld_row<true, T::kPageSize, /*kForceBufferLoad=*/true>(
                     params.p_kv_indices, kv_ld_row_base_idx, tile_start, kv_end);
             }
             return row_kv_ld;
