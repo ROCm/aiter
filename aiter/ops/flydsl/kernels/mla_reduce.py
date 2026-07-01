@@ -312,7 +312,11 @@ def compile_mla_reduce(
             )
             addr_i64 = g_indptr.get_llvm_ptr(reduce_indptr, byte_off)
             addr_ptr = llvm_dialect.inttoptr(_glb_ptr_ty, _to_raw(addr_i64))
-            val = llvm_dialect.load(T.i32, addr_ptr)
+            # invariant=True -> !invariant.load: reduce_indptr is read-only in
+            # this kernel, so the uniform-address load can be scalarized by the
+            # AMDGPU backend into s_load_dword (SMEM) instead of a per-lane
+            # global_load + s_waitcnt vmcnt(0), matching HIP's scalar sentinel.
+            val = llvm_dialect.load(T.i32, addr_ptr, invariant=True)
             return fx.Int32(rocdl.readfirstlane(T.i32, val))
 
         c_H = fx.Int32(H)
