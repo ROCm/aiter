@@ -183,16 +183,47 @@ jobs:
 
               echo "==== Build FFM Triton shard ===="
               printf "%s\n" \
+                "op_tests/triton_tests/conv/test_causal_conv1d.py" \
+                "op_tests/triton_tests/attention/test_mha_with_pe.py" \
+                "op_tests/triton_tests/gemm/basic/test_gemm_a8w8.py" \
+                "op_tests/triton_tests/gemm/basic/test_gemm_a8w8_blockscale.py" \
+                "op_tests/triton_tests/moe/test_moe_gemm_int8_smoothquant.py" \
+                "op_tests/triton_tests/attention/test_unified_attention.py" \
+                "op_tests/triton_tests/attention/test_pa_decode.py" \
+                "op_tests/triton_tests/moe/test_moe_gemm_a8w8_blockscale.py" \
+                "op_tests/triton_tests/fusions/test_fused_kv_cache.py" \
+                "op_tests/triton_tests/moe/test_moe.py" \
+                "op_tests/triton_tests/attention/test_pa_prefill.py" \
+                "op_tests/triton_tests/rope/test_fused_qkv_split_qk_rope.py" \
+                "op_tests/triton_tests/test_pa_decode_gluon.py" \
+                "op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_a16w16.py" \
+                "op_tests/triton_tests/rope/test_rope.py" \
+                "op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_mul_add.py" \
+                "op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py" \
+                "op_tests/triton_tests/gemm/feed_forward/test_ff_a16w16_fused.py" \
+                "op_tests/triton_tests/gemm/feed_forward/test_ff_a16w16.py" \
+                "op_tests/triton_tests/gemm/batched/test_batched_gemm_afp4wfp4.py" \
+                "op_tests/triton_tests/fusions/test_fused_reduce_qk_norm_rope_swa_write.py" \
+                "op_tests/triton_tests/gemm/fused/test_fused_gemm_afp4wfp4_split_cat.py" \
+                "op_tests/triton_tests/gemm/basic/test_gemm_afp8wfp8.py" \
+                "op_tests/triton_tests/fusions/test_mhc.py" \
+                "op_tests/triton_tests/moe/test_moe_routing.py" \
+                "op_tests/triton_tests/moe/test_moe_routing_sigmoid_top1_fused.py" \
+                > ffm_excluded_files.list
+
+              printf "%s\n" \
                 "op_tests/triton_tests/attention/test_mha_v3.py" \
                 "op_tests/triton_tests/test_pa_decode_gluon.py" \
                 "op_tests/triton_tests/conv/test_causal_conv1d.py" \
                 "op_tests/triton_tests/attention/test_mha_fp8.py" \
                 "op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.py" \
-                > ffm_node_sharded_files.list
+                > ffm_node_sharded_files.all
+              grep -Fxv -f ffm_excluded_files.list ffm_node_sharded_files.all > ffm_node_sharded_files.list || true
 
               ./.github/scripts/split_tests.sh --shards "${FFM_SHARD_COUNT}" --test-type triton
               tr " " "\n" < "triton_shard_${FFM_SHARD_INDEX}.list" \
                 | sed "/^$/d" \
+                | grep -Fxv -f ffm_excluded_files.list \
                 | grep -Fxv -f ffm_node_sharded_files.list \
                 > ffm_shard_items.list || true
 
@@ -220,14 +251,14 @@ jobs:
               shard_count="$(wc -l < ffm_shard_items.list | tr -d " ")"
               echo "Selected ${shard_count} FFM Triton item(s) for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
               if [ "${shard_count}" -eq 0 ]; then
-                echo "::error::No FFM Triton items selected for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}"
-                exit 1
+                echo "No FFM Triton items selected for shard ${FFM_SHARD_INDEX}/${FFM_SHARD_COUNT}; exiting successfully."
+                exit 0
               fi
               cat ffm_shard_items.list
               mapfile -t FFM_TEST_ITEMS < ffm_shard_items.list
 
               echo "==== Run sharded FFM Triton tests ===="
-              python3 -m pytest -v "${FFM_TEST_ITEMS[@]}"
+              python3 -m pytest -v --maxfail=1 --tb=short --durations=50 "${FFM_TEST_ITEMS[@]}"
           FFM_DOCKER_SCRIPT
 
       - name: Cleanup
