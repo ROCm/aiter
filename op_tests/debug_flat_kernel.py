@@ -14,10 +14,10 @@ torch.manual_seed(42)
 
 # GLM5.2-FP8 params
 token = 1
-# Test: large model dims, small expert/topk
+# Test: large E to check uint32 stride overflow
 d_model = 6144
 d_ff = 2048
-experts = 4
+experts = 256
 topk = 2
 blk_n, blk_k = 128, 128
 
