@@ -325,25 +325,27 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 row_kv_ld = get_kv_ld_row<false, T::kPageSize>(
                     params.p_kv_indices, kv_ld_row_base_idx, tile_start, tile_end);
             }
-            else if(tile_start < kv_end)
+            else
             {
                 row_kv_ld = get_kv_ld_row<true, T::kPageSize>(
                     params.p_kv_indices, kv_ld_row_base_idx, tile_start, kv_end);
             }
-            else
-            {
-                row_kv_ld = -1;
-            }
             return row_kv_ld;
+        };
+
+        auto kv_ld_row_fixup = [&](const int32_t raw, const int32_t tile_start) -> int32_t {
+            const bool is_oob =
+                (static_cast<int32_t>(kv_ld_row_base_idx) + tile_start >= kv_end) && (raw == 0);
+            return is_oob ? -1 : raw;
         };
 
         // Tile 0's KV row goes to the prologue; tile 1's seed row goes to the
         // first lambda call's prefetch. `row_kv_ld_next_next` is a one-deep
         // carry: each lambda call snapshots it for its prefetch and updates it
         // for the call after (matching V32's per-warp dispatch pattern).
-        const int32_t row_kv_ld_first = resolve_row_kv_ld(kv_start);
-        int32_t row_kv_ld_next_next =
-            (kv_len > T::kBlockN) ? resolve_row_kv_ld(kv_start + T::kBlockN) : -1;
+        const int32_t row_kv_ld_first =
+            kv_ld_row_fixup(resolve_row_kv_ld(kv_start), kv_start);
+        int32_t row_kv_ld_next_next = resolve_row_kv_ld(kv_start + T::kBlockN);
 
         // Load Q: Q[:, 0:256] -> VGPR pinned at k_q_vgpr_begin (32 vgprs/lane).
         //         Q[:, 256:512] -> bf16 final LDS region inside p_lds_q.
@@ -468,7 +470,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
             int32_t row_kv_ld_next = 0;
             if constexpr(kIsGlobalLast == false)
             {
-                row_kv_ld_next = row_kv_ld_next_next;
+                row_kv_ld_next =
+                    kv_ld_row_fixup(row_kv_ld_next_next, kv_tile_start + T::kBlockN);
             }
 
             // ---- Phase A: prefetch NEXT tile into the next-pong ----
@@ -602,6 +605,14 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 // Steady + drain: wait until sub-tile S is the oldest still queued
                 // (lgkmcnt = min(reads-behind-S, kDepth-1)), mma it, then refill
                 // its slot with S+kDepth.
+
+                if constexpr(kIsGlobalLast == false)
+                {
+                    row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
+                    kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext, kPlus4IsRope>(
+                        p_lds_kv_next, p4_warp_idx, params.p_kv_buffer_rope, row_kv_ld_next);
+                }
+
                 opus::static_for<kNumSub>([&](auto s_) {
                     constexpr uint32_t S    = s_.value;
                     constexpr uint32_t tail = kNumSub - 1u - S;
@@ -626,11 +637,8 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 const uint32_t p4_warp_idx = warp_idx + T::kNumWarps;
                 hk::u32x4 dw;
 
-                kv_manager.template prefetch_kv_rope<0u, kTileCols, kCheckBoundaryNext, kPlus4IsRope>(
-                    p_lds_kv_next, p4_warp_idx, params.p_kv_buffer_rope, row_kv_ld_next);
-
                 // ---- own strip cvt+store (p0,p1 from Phase A; 4 loads, drain 2->0) ----
-                kv_manager.template wait_kv_loads<0u, 0u, false, /*kVmCnt=*/6>(warp_idx);
+                kv_manager.template wait_kv_loads<0u, 0u, false, /*kVmCnt=*/7>(warp_idx);
                 const float scale_f0 = kv_manager.kv_tile_scale_f(p0);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p0, scale_f0);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p0, scale_f0);
@@ -638,7 +646,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 kv_manager.template cvt_kv_tile_step<2>(dw, p0, scale_f0);
                 kv_manager.template cvt_kv_tile_step<3>(dw, p0, scale_f0);
                 kv_manager.template store_kv_tile_step<0u, 0u, 1, false>(p_lds_kv_next, warp_idx, dw);
-                kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/4>(warp_idx);
+                kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/5>(warp_idx);
                 const float scale_f1 = kv_manager.kv_tile_scale_f(p1);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p1, scale_f1);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p1, scale_f1);
@@ -647,11 +655,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
                 kv_manager.template cvt_kv_tile_step<3>(dw, p1, scale_f1);
                 kv_manager.template store_kv_tile_step<0u, kTileCols, 1, false>(p_lds_kv_next, warp_idx, dw);
 
-                kv_manager.template wait_kv_loads<0u, 0u, kPlus4IsRope, /*kVmCnt=*/2>(p4_warp_idx);
-                if constexpr(kPlus4IsRope)
-                {
-                    row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
-                }
+                kv_manager.template wait_kv_loads<0u, 0u, kPlus4IsRope, /*kVmCnt=*/3>(p4_warp_idx);
                 const float scale_f0b = kv_manager.kv_tile_scale_f(p0b);
                 kv_manager.template cvt_kv_tile_step<0>(dw, p0b, scale_f0b);
                 kv_manager.template cvt_kv_tile_step<1>(dw, p0b, scale_f0b);
@@ -662,8 +666,7 @@ __device__ void mi35x_mla_v40_fwd_decode_m16x4_fp8bf16_fp8bf16_gen1_impl(HkMlaV4
 
                 if constexpr(!kPlus4IsRope)
                 {
-                    kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/0>(p4_warp_idx);
-                    row_kv_ld_next_next = resolve_row_kv_ld(kv_tile_start + 2 * T::kBlockN);
+                    kv_manager.template wait_kv_loads<0u, kTileCols, false, /*kVmCnt=*/1>(p4_warp_idx);
                     const float scale_f1b = kv_manager.kv_tile_scale_f(p1b);
                     kv_manager.template cvt_kv_tile_step<0>(dw, p1b, scale_f1b);
                     kv_manager.template cvt_kv_tile_step<1>(dw, p1b, scale_f1b);
