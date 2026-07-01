@@ -847,19 +847,40 @@ def flydsl_pa_decode_sparse(
     # ---- kv_splits auto-selection ----
     # Target: keep total CTAs near max_num_wg for good GPU utilization.
     # Larger MFMA tiles reduce head parallelism; compensate with more kv_splits.
-    lds_estimate = (n_waves * mfma.MFMA_M * (mfma.MFMA_N + 1) * 4 +
-                    block_k * (D + 8) * 2 + 2 * block_k * 4)
-    max_occupancy = 1 if lds_estimate > 32768 else 2
+    max_occupancy = 1 if "32x32x8" in mfma.fn_name else 2
     num_cus = 304  # gfx942 has 304 CUs
     max_num_wg = max_occupancy * num_cus
     n_head_blocks = (H + mfma.MFMA_M - 1) // mfma.MFMA_M
     if kv_splits is None:
         max_kv_len    = kv_indices.shape[0]
         max_kv_splits = max(1, (max_kv_len + block_k - 1) // block_k)
-        kv_splits     = max(1, max_num_wg // max(1, T_val * n_head_blocks))
-        kv_splits     = max(kv_splits, 2)
-        kv_splits     = min(max_kv_splits, kv_splits)
-        kv_splits     = 1 << (kv_splits - 1).bit_length()
+        base_ctas     = T_val * n_head_blocks
+        # Choose power-of-2 KV_SPLITS for wave-aligned GPU utilisation.
+        # Constraint: KV_SPLITS must be a power of 2 (Triton reduce uses tl.arange).
+        #
+        # Step 1: find the smallest power-of-2 ks_one such that
+        #   base_ctas * ks_one ≥ max_num_wg  (fills ≥ 1 full GPU wave).
+        # Step 2: if that total is also ≥ max_num_wg/2 (i.e. we're within 2× of a full
+        #   wave), try doubling once — empirically 2 full waves hides VMEM latency better
+        #   on gfx942.  The double must still be a power of 2 and ≤ max_kv_splits.
+        # Step 3: snap back to max_kv_splits (which may not be a power of 2); then
+        #   round down to the largest power of 2 that is ≤ max_kv_splits to stay valid.
+        ks_one = 1
+        while ks_one * base_ctas < max_num_wg and (ks_one << 1) <= max_kv_splits:
+            ks_one <<= 1
+        if ks_one * base_ctas >= max_num_wg // 2:
+            ks_two = ks_one << 1   # still a power of 2
+        else:
+            ks_two = ks_one
+        # Snap to a valid power-of-2 ≤ max_kv_splits.
+        kv_splits = ks_two
+        while kv_splits > max_kv_splits:
+            kv_splits >>= 1
+
+        kv_splits = max(kv_splits, 1)
+        # kv_splits must be a power of 2 (Triton reduce requires tl.arange(0, KV_SPLITS)).
+        assert kv_splits & (kv_splits - 1) == 0, f"kv_splits={kv_splits} is not a power of 2"
+
 
     out = torch.zeros((T_val, H, D), dtype=torch.bfloat16, device=device)
 
