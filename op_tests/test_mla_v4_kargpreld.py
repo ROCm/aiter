@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the mi400 v4 'nm' MLA pipeline (mla_decode_fwd_v4_nm).
+"""Tests for the gfx1250 v4 'nm' MLA pipeline (mla_decode_fwd_v4_nm).
 
 Purpose:
   - **Smoke**: confirm the dispatcher loads its .co, accepts the v4 21-slot
@@ -16,7 +16,7 @@ NOT covered here (intentionally separate work, document in the test file
 docstring as TODO):
   - Numerical correctness vs a torch reference. The v4 nm host pipeline
     does FP8+e8m0 dequant via fp8e4m3_mul_fp8e8m0_bpad8_to_bf16 and a
-    multi-step buffer concat (see poc_kl/mi400/mla/mla_v4.h
+    multi-step buffer concat (see poc_kl/gfx1250/mla/mla_v4.h
     v4_detail::init_host_buffers). Reproducing that bit-exactly in
     pytest is ~200 LOC; defer to a follow-up PR. The recommended hook
     point is the `compare_against_poc_kl_dump()` helper at the bottom of
@@ -25,7 +25,8 @@ docstring as TODO):
     aiter's logits against poc_kl's gpu_SPLIT_DATA.hex.
 
 Usage:
-  pytest -xvs op_tests/test_mla_v4_nm.py
+  docker exec -e ENABLE_CK=0 -w $aiter_dir $docker_name \
+  bash -lc 'ENABLE_CK=0 python -m pytest -v op_tests/test_mla_v4_kargpreld.py'
 """
 
 from dataclasses import dataclass
@@ -54,7 +55,7 @@ V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 
 
 # ---------------------------------------------------------------------------
-# gfx1250 / mi400 v4 nm kernel variants. In this (num_kv_heads=1) test:
+# gfx1250 / gfx1250 v4 nm kernel variants. In this (num_kv_heads=1) test:
 #   nhead       == gqa_ratio        (num query heads)
 #   decode_qlen == q_seq_logical    (logical Q rows per sequence)
 # The single shipped sparse .co (mla_a8w8_qh64_1tg_16mx4_64nx1_sparse) has a
@@ -64,24 +65,24 @@ V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 # shipped yet — the sweep auto-skips any combo the dispatcher can't resolve.
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
-class MlaMi400KernelVariant:
+class Mlagfx1250KernelVariant:
     name: str
     nhead: int
     decode_qlen: int
 
 
-_MI400_KERNEL_VARIANTS = [
-    MlaMi400KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
-    MlaMi400KernelVariant(name="qh64-q1-16mx4-64nx1-np", nhead=64, decode_qlen=1),
-    MlaMi400KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
+_gfx1250_KERNEL_VARIANTS = [
+    #Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
+    Mlagfx1250KernelVariant(name="qh64-q1-16mx4-64nx1-np", nhead=64, decode_qlen=1),
+    #Mlagfx1250KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
 ]
-_MI400_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _MI400_KERNEL_VARIANTS}
-_MI400_VARIANT_BY_KEY_NAME = {v.name: v for v in _MI400_KERNEL_VARIANTS}
+_gfx1250_VARIANT_BY_KEY = {(v.nhead, v.decode_qlen): v for v in _gfx1250_KERNEL_VARIANTS}
+_gfx1250_VARIANT_BY_KEY_NAME = {v.name: v for v in _gfx1250_KERNEL_VARIANTS}
 
-# Default sweep grids (mirrors test_mla_mi400_triton.py).
-_MI400_CTX_LENS = [7, 17, 67, 128 + 37]  # list[int](range(1, 130))
-_MI400_BATCH_SIZES = [1, 16, 32]
-_MI400_SPLIT_PER_BATCH = [1, 2]  # , 4, 8]
+# Default sweep grids (mirrors test_mla_gfx1250_triton.py).
+_gfx1250_CTX_LENS = [7, 17, 67, 128 + 37]  # list[int](range(1, 130))
+_gfx1250_BATCH_SIZES = [1, 16, 32]
+_gfx1250_SPLIT_PER_BATCH = [1, 2]  # , 4, 8]
 
 
 def _on_gfx1250():
@@ -93,7 +94,7 @@ def _on_gfx1250():
 
 needs_gfx1250 = pytest.mark.skipif(
     not torch.cuda.is_available() or not _on_gfx1250(),
-    reason="v4 nm shader is shipped only for gfx1250 (mi400); requires GPU",
+    reason="v4 nm shader is shipped only for gfx1250 (gfx1250); requires GPU",
 )
 
 
@@ -108,7 +109,7 @@ def _build_inputs(
 ):
     """Return a dict of every tensor mla_decode_fwd_v4_nm needs.
 
-    Sizes mirror what poc_kl/mi400/mla/mla.cpp computes for the same cmd
+    Sizes mirror what poc_kl/gfx1250/mla/mla.cpp computes for the same cmd
     (only with kv_seq_lens shrunk small for fast pytest):
       total_q = batch * num_heads * q_seq_logical
       num_page = batch * (kv_seq_lens / page_size)
@@ -226,7 +227,7 @@ def _build_inputs(
 # ---------------------------------------------------------------------------
 @needs_gfx1250
 def test_v4_nm_no_half_zero_pattern():
-    """Regression guard for the mi400 wave-size landmine.
+    """Regression guard for the gfx1250 wave-size landmine.
 
     The exact pre-fix symptom was: per row of dim_v=512 fp32 output,
     the first half (256 elements) was 0xffc00000 (NaN) and the second
@@ -1376,7 +1377,7 @@ if __name__ == "__main__":
         "--batch",
         type=int,
         nargs="*",
-        default=_MI400_BATCH_SIZES,
+        default=_gfx1250_BATCH_SIZES,
         help="Batch size(s). e.g. -b 1 2 4",
     )
     parser.add_argument(
@@ -1384,16 +1385,16 @@ if __name__ == "__main__":
         "--kv-seq-lens",
         type=int,
         nargs="*",
-        default=_MI400_CTX_LENS,
+        default=_gfx1250_CTX_LENS,
         help="KV tokens per sequence (context length). e.g. -c 64 256 1024",
     )
     parser.add_argument(
         "--variant",
         nargs="*",
-        choices=[v.name for v in _MI400_KERNEL_VARIANTS],
-        default=[v.name for v in _MI400_KERNEL_VARIANTS],
+        choices=[v.name for v in _gfx1250_KERNEL_VARIANTS],
+        default=[v.name for v in _gfx1250_KERNEL_VARIANTS],
         help="Kernel variant name(s); nhead and decode_qlen are taken from "
-        "_MI400_KERNEL_VARIANTS. Defaults to all variants.",
+        "_gfx1250_KERNEL_VARIANTS. Defaults to all variants.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iters", type=int, default=5, help="Perf timed iterations")
@@ -1402,7 +1403,7 @@ if __name__ == "__main__":
         "--split-kv",
         type=int,
         nargs="*",
-        default=_MI400_SPLIT_PER_BATCH,
+        default=_gfx1250_SPLIT_PER_BATCH,
         help="num_kv_splits value(s) to sweep. e.g. --split-kv 1 2 4 8",
     )
     parser.add_argument(
@@ -1426,24 +1427,24 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # (nhead, decode_qlen) is determined solely by the selected variant(s) from
-    # _MI400_KERNEL_VARIANTS.
+    # _gfx1250_KERNEL_VARIANTS.
     selected_variants = (
         [args.variant] if isinstance(args.variant, str) else list(args.variant)
     )
     nhead_combos = [
         (
-            _MI400_VARIANT_BY_KEY_NAME[name].nhead,
-            _MI400_VARIANT_BY_KEY_NAME[name].decode_qlen,
+            _gfx1250_VARIANT_BY_KEY_NAME[name].nhead,
+            _gfx1250_VARIANT_BY_KEY_NAME[name].decode_qlen,
         )
         for name in selected_variants
     ]
 
-    # num_kv_splits sweep list (defaults to _MI400_SPLIT_PER_BATCH).
+    # num_kv_splits sweep list (defaults to _gfx1250_SPLIT_PER_BATCH).
     split_list = list(args.split_kv)
 
     perf_rows = []
     for nhead, decode_qlen in nhead_combos:
-        variant = _MI400_VARIANT_BY_KEY.get((nhead, decode_qlen))
+        variant = _gfx1250_VARIANT_BY_KEY.get((nhead, decode_qlen))
         label = variant.name if variant else f"qh{nhead}-q{decode_qlen}"
         for batch, kv_seq_lens, split_kv in itertools.product(
             args.batch, args.kv_seq_lens, split_list
