@@ -125,8 +125,10 @@ moe_buf = flat_buf[:row_bytes].view(torch.bfloat16).view(token, d_model)
 w1_scale_flat = w1_scale.view(experts, -1).contiguous()
 w2_scale_flat = w2_scale.view(experts, -1).contiguous()
 
-# Empty input scale (xbf16 kernel computes its own)
-a1_scale = torch.empty(0, device="cuda")
+# Input scale: xbf16 kernel computes its own, but pass a valid pointer
+# (null SRD base may cause issues on gfx942 even if no loads are issued)
+nbk = d_model // blk_k  # number of scale blocks along K
+a1_scale = torch.zeros((token, nbk), dtype=torch.float32, device="cuda")
 
 kernel_name = "_ZN5aiter56fmoe_bf16_a16_blockscaleFp8_g1u1_vs_silu_1tg_16x128_flatE"
 
