@@ -91,6 +91,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     group_size: int = 128,
     emit_bf16: bool = False,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ):
     """Fused tensor-parallel all-reduce + RMSNorm + quantization.
 
@@ -114,6 +115,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         group_size=group_size,
         emit_bf16=emit_bf16,
         transpose_scale=transpose_scale,
+        gemma_norm=gemma_norm,
     )
 
 

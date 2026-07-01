@@ -37,6 +37,7 @@ except ImportError:
         return False
 
 
+from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 from aiter import (
     fused_dynamic_mxfp4_quant_moe_sort,
     fused_dynamic_mxfp8_quant_moe_sort,
@@ -235,19 +236,16 @@ def get_topk_valid_mask(
     return expert_mask[topk_ids]
 
 
-def is_flydsl_stage2_reduce(stage2: Callable) -> bool:
-    """Return True iff `stage2` is the FlyDSL stage2 wrapper compiled in
-    reduce mode (i.e. its kernelName parses to ``mode == "reduce"``).
-
-    All other stage2 paths (CK, cktile, FlyDSL atomic) return False, which
-    keeps moe_sorting on the atomic-accumulate moe_buf shape.
-    """
+def stage2_uses_route_reduce(stage2: Callable) -> bool:
+    """Return True when stage2 writes per-slot route output then reduces it."""
     func = getattr(stage2, "func", stage2)
-    if func is not _flydsl_stage2_wrapper:
-        return False
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
-    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
-    return parsed is not None and parsed.get("mode", "atomic") == "reduce"
+    if func is _flydsl_stage2_wrapper:
+        parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
+        return parsed is not None and parsed.get("mode", "atomic") == "reduce"
+    if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
+        return _opus_a8w4.stage2_uses_route_reduce(stage2)
+    return False
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -501,6 +499,7 @@ def fused_moe_(
         isShuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        has_stage2_bias=bias2 is not None,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -531,7 +530,7 @@ def fused_moe_(
         num_local_tokens,
         moe_sorting_dispatch_policy,
         return_local_topk_ids=need_local_topk_ids,
-        accumulate=not is_flydsl_stage2_reduce(metadata.stage2),
+        accumulate=not stage2_uses_route_reduce(metadata.stage2),
         flat=metadata.flat,
     )
     if need_local_topk_ids:
@@ -548,6 +547,7 @@ def fused_moe_(
             sorting_ret
         )
         local_topk_ids = None
+    _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
         _stage1_call = functools.partial(
@@ -885,6 +885,11 @@ class MOEMetadata:
     fuse_quant: str = ""
     stage2_has_bias: bool = False
     flat: bool = False
+    skip_inter_quant: bool = False
+    route_bucket: str = ""
+    expected_sorted_blocks: Optional[int] = None
+    min_sorted_blocks: Optional[int] = None
+    max_sorted_blocks: Optional[int] = None
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1065,6 +1070,7 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
+    has_stage2_bias=False,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -1268,6 +1274,23 @@ def get_2stage_cfgs(
         cfg = _lookup_cfg(cfg_2stages)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+    if cfg is not None:
+        kn2 = str(cfg.get("kernelName2", "") or "").strip()
+        if kn2.startswith("opus_"):
+            opus_supported, opus_reason = _opus_a8w4.cfg_is_supported(
+                kn2,
+                cfg=cfg,
+                gfx=gfx,
+                block_m=cfg.get("block_m", BLOCK_SIZE_M),
+                is_ep=is_ep,
+                has_stage2_bias=has_stage2_bias,
+            )
+            if not opus_supported:
+                cfg = None
+                logger.warning(
+                    f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
+                    "using default heuristics"
+                )
     if cfg is not None and not is_flydsl_available():
         kn1 = str(cfg.get("kernelName1", ""))
         kn2 = str(cfg.get("kernelName2", ""))
@@ -1364,6 +1387,13 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
+    is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
+        cfg.get("kernelName2", "")
+    )
+    route_bucket_metadata = _opus_a8w4.route_bucket_metadata(cfg) if is_opus_cfg else {}
+    opus_stage2_cfg_values = (
+        _opus_a8w4.stage2_cfg_values(cfg, block_m) if is_opus_cfg else {}
+    )
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
@@ -1395,10 +1425,12 @@ def get_2stage_cfgs(
             ksplit,
             run_1stage,
             flat=cfg_flat,
+            **route_bucket_metadata,
         )
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     is_cktile2 = bool(kernelName2) and kernelName2.startswith("cktile_")
+    is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
@@ -1430,6 +1462,14 @@ def get_2stage_cfgs(
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
             )
+        elif is_opus2:
+            stage2_func = functools.partial(
+                _opus_a8w4.opus_a8w4_stage2_wrapper,
+                kernelName=kernelName2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+                **opus_stage2_cfg_values,
+            )
         elif is_cktile2:
             stage2_func = functools.partial(
                 cktile_moe_stage2,
@@ -1456,6 +1496,7 @@ def get_2stage_cfgs(
             has_bias=enable_bias and is_flydsl1,
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and is_flydsl2,
+            **route_bucket_metadata,
         )
     if (
         gate_mode != GateMode.SEPARATED
@@ -1710,6 +1751,14 @@ def get_2stage_cfgs(
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
             )
+        elif _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2):
+            stage2_func = functools.partial(
+                _opus_a8w4.opus_a8w4_stage2_wrapper,
+                kernelName=kernelName2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+                **opus_stage2_cfg_values,
+            )
         elif kernelName2 and kernelName2.startswith("cktile_"):
             stage2_func = functools.partial(
                 cktile_moe_stage2,
@@ -1739,6 +1788,7 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
+            **route_bucket_metadata,
         )
 
     # TODO: remove when stage2 support more size
@@ -1747,7 +1797,15 @@ def get_2stage_cfgs(
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
 
-    if kernelName2 and kernelName2.startswith("cktile_"):
+    if _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2):
+        stage2_func = functools.partial(
+            _opus_a8w4.opus_a8w4_stage2_wrapper,
+            kernelName=kernelName2,
+            inter_dim_pad=intermediate_pad,
+            model_dim_pad=hidden_pad,
+            **opus_stage2_cfg_values,
+        )
+    elif kernelName2 and kernelName2.startswith("cktile_"):
         stage2_func = functools.partial(
             cktile_moe_stage2,
             n_pad_zeros=hidden_pad // 64 * 64,
@@ -1773,6 +1831,7 @@ def get_2stage_cfgs(
         block_m,
         ksplit,
         run_1stage,
+        **route_bucket_metadata,
     )
 
 
@@ -1837,6 +1896,7 @@ def fused_moe_2stages(
         is_shuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        has_stage2_bias=bias2 is not None,
     )
     if (
         quant_type == QuantType.per_1x32
@@ -2056,6 +2116,7 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    stage2_sorted_weights = sorted_weights if not doweight_stage1 else None
     _stage2_call = functools.partial(
         metadata.stage2,
         a2,
@@ -2073,7 +2134,7 @@ def fused_moe_2stages(
         ),
         a2_scale=a2_scale,
         block_m=block_size_M,
-        sorted_weights=sorted_weights if not doweight_stage1 else None,
+        sorted_weights=stage2_sorted_weights,
         **extra_stage2_args,
     )
     if kernel_bench_callable is not None:
