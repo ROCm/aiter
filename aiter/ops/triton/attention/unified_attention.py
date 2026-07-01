@@ -86,7 +86,20 @@ def select_2d_config(
 
     # base prefill, for short cases
     if not all_decode:
-        num_stages_2d, num_warps = 1, 2
+        if head_size >= 512 and not arch.is_rdna:
+            BLOCK_M = max(16, triton.next_power_of_2(num_queries_per_kv))
+            num_warps, num_stages_2d = 4, 1
+        elif head_size >= 256 and not arch.is_rdna:
+            num_warps, num_stages_2d = 2, 2
+            TILE_SIZE = 32
+        else:
+            # large prefill config
+            if max_seqlen_q >= 256:
+                BLOCK_M = 64 if arch.is_rdna else 128
+                num_stages_2d, num_warps = 1, 4
+            else:
+                num_stages_2d, num_warps = 1, 2
+
     # pure decode config
     else:
         # to not have masking when loading KV
@@ -94,12 +107,10 @@ def select_2d_config(
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
-            num_stages_2d, num_warps = 3, 2
-
-    # large prefill config
-    if max_seqlen_q >= 256:
-        BLOCK_M = 64 if arch.is_rdna else 128
-        num_stages_2d, num_warps = 1, 4
+            if head_size >= 512:
+                num_stages_2d, num_warps = 1, 4
+            else:
+                num_stages_2d, num_warps = 3, 2
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
@@ -188,6 +199,9 @@ def select_3d_config(
         #     attn_warps = max(attn_warps, 1)
         #     attn_warps = min(attn_warps, 4)
     else:
+        if head_size >= 512 and not get_arch().is_rdna:
+            attn_warps, attn_stages = 4, 1
+
         occ = waves_per_eu * 4 // attn_warps
         target_num_prgms = target_num_prgms * occ
 
@@ -195,6 +209,8 @@ def select_3d_config(
 
         MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
         MIN_SEGMENTS = min(8, MAX_SEGMENTS)
+        if head_size >= 512 and not get_arch().is_rdna:
+            MIN_SEGMENTS = min(16, MAX_SEGMENTS)
         if num_segments == 0:
             num_segments = math.ceil(target_num_prgms / num_2d_prgms)
             num_segments = min(num_segments, MAX_SEGMENTS)
