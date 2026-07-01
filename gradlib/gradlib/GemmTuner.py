@@ -153,6 +153,8 @@ class Gemm:
         num_warmup=10,
         timeout=None,
         verbose=False,
+        rtol=None,
+        atol=None,
     ):
         torch.cuda.empty_cache()
         self.m = m
@@ -173,8 +175,9 @@ class Gemm:
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
         self.topn = 20
         self.hipb_sols = []
-        self.rtol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
-        self.atol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
+        _tol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
+        self.rtol = rtol if rtol is not None else _tol
+        self.atol = atol if atol is not None else _tol
         self.check_err_ratio = err_ratio
         self.profile_file = profile_file
         self.hipb_prefer_ratio = 0.995
@@ -525,8 +528,9 @@ class GemmTuner(GemmCommonTuner):
                     eval(indtype),
                     eval(outdtype),
                 )
-                _atol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
-                _rtol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                _tol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                _atol = _tol
+                _rtol = _tol
                 err_ratio = checkAllclose(
                     out, ref, atol=_atol, rtol=_rtol, msg=f"run_config {shape_str}"
                 )

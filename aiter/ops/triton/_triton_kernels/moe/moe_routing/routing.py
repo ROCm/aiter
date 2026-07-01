@@ -48,7 +48,11 @@ def _routing_compute_indx(
     LOAD_SIZE: tl.constexpr = N_EXPTS_ACT_PAD * BLOCK_M
     local_offs = tl.arange(0, LOAD_SIZE)
     offs = pid_m * BLOCK_M * N_EXPTS_ACT + local_offs
-    if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
+    # TDM tensor descriptors require >=16 bytes in the last dim. The expert-index
+    # load is int16 (2 bytes), so LOAD_SIZE must be >=8 elements; for tiny routing
+    # tiles (e.g. decode bs=1, where BLOCK_M=1 -> LOAD_SIZE=N_EXPTS_ACT_PAD) fall
+    # back to the functionally-identical plain-load branch below.
+    if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD and LOAD_SIZE >= 8:
         expt_desc = tl.make_tensor_descriptor(
             base=ExptIndx + pid_m * BLOCK_M * N_EXPTS_ACT,
             shape=(1, LOAD_SIZE),
@@ -122,7 +126,11 @@ def _routing_compute_indx_fused(
     LOAD_SIZE: tl.constexpr = N_EXPTS_ACT_PAD * BLOCK_M
     local_offs = tl.arange(0, LOAD_SIZE)
     offs = local_offs
-    if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
+    # TDM tensor descriptors require >=16 bytes in the last dim. The expert-index
+    # load is int16 (2 bytes), so LOAD_SIZE must be >=8 elements; for tiny routing
+    # tiles (e.g. decode bs=1, where BLOCK_M=1 -> LOAD_SIZE=N_EXPTS_ACT_PAD) fall
+    # back to the functionally-identical plain-load branch below.
+    if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD and LOAD_SIZE >= 8:
         expt_desc = tl.make_tensor_descriptor(
             base=ExptIndx,
             shape=(1, LOAD_SIZE),

@@ -155,6 +155,34 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
     return out
 
 
+def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+        kernels_list as kernels_list_flydsl_wmma,
+    )
+    from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
+        run_preshuffle_gemm_a8_gfx1250,
+    )
+
+    ki = kernels_list_flydsl_wmma[kernel_id]
+    run_preshuffle_gemm_a8_gfx1250(
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out,
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        num_buffers=ki.num_buffers,
+        split_k=ki.split_k,
+        cluster_m=ki.cluster_m,
+        cluster_n=ki.cluster_n,
+        m_warp=ki.m_warp,
+        n_warp=ki.n_warp,
+    )
+    return out
+
+
 def generate_data(
     m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, is_asm=False, device="cuda"
 ):
@@ -464,6 +492,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         seed,
     ):
         gfx, cu_num, M, N, K, q_dtype_w = info_keys
+
+        if gfx == "gfx1250":
+            return self._get_flydsl_tune_task_gfx1250(info_keys, seed)
+
         q_dtype_eval = eval(q_dtype_w)
         if q_dtype_eval == dtypes.fp8:
             pass
@@ -519,6 +551,63 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     run_gemm_flydsl,
                     (
                         gemm_flydsl_keys,
+                        i,
+                    ),
+                    {
+                        "num_warmup": args.warmup,
+                        "num_iters": args.iters,
+                    },
+                    run_torch,
+                    (
+                        ref_keys,
+                        dtypes.bf16,
+                    ),
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                    None,
+                    None,
+                    ("out",),
+                )
+            )
+        return tasks
+
+    def _get_flydsl_tune_task_gfx1250(self, info_keys, seed):
+        """gfx1250 WMMA ptpc tuning tasks for the FlyDSL libtype."""
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
+        if eval(q_dtype_w) != dtypes.fp8:
+            print(
+                f"[FlyDSL][gfx1250] WMMA ptpc supports fp8 only, skipping {q_dtype_w}"
+            )
+            return []
+        if not is_flydsl_available():
+            return []
+        try:
+            from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+                kernels_list as kernels_list_flydsl_wmma,
+                kernel_fits_shape as kernel_fits_shape_wmma,
+            )
+        except ImportError:
+            return []
+        if not kernels_list_flydsl_wmma:
+            return []
+        gemm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
+        ref_keys = ["x", "weight", "x_scale", "w_scale", "bias_f32"]
+        tasks = []
+        for i in sorted(kernels_list_flydsl_wmma.keys()):
+            ki = kernels_list_flydsl_wmma[i]
+            if not kernel_fits_shape_wmma(ki, M, N, K):
+                continue
+            info = (info_keys, i, 0, ki.name, "flydsl")
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, seed, dtypes.bf16, dtypes.fp8),
+                    run_gemm_flydsl_gfx1250,
+                    (
+                        gemm_keys,
                         i,
                     ),
                     {

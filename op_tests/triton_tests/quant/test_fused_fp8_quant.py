@@ -365,6 +365,60 @@ def test_fused_flatten_fp8_group_quant(M: int, N1: int, N2: int, dtype):
     torch.testing.assert_close(y_upcast_torch, y_upcast_triton, atol=0.1, rtol=0.1)
 
 
+@pytest.mark.parametrize("M", [1, 32, 256])
+@pytest.mark.parametrize("N1, N2", [(16, 128)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fused_flatten_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int, dtype):
+    """transpose_scale=True returns the same logical (M, num_bs_cols) scale
+    tensor as the default path, but in column-major storage so consumers like
+    CK bpreshuffle GEMM can read the transposed layout without an extra
+    .transpose(-1, -2).contiguous() copy.
+    """
+    torch.manual_seed(0)
+    group_size = 128
+    dtype_quant = aiter.dtypes.fp8
+    x = torch.randn((N1, M, N2), dtype=dtype, device="cuda") / 10
+    x = x.transpose(0, 1)
+
+    y_q_default, y_s_default = fused_flatten_fp8_group_quant(
+        x,
+        group_size=group_size,
+        dtype_quant=dtype_quant,
+        transpose_scale=False,
+    )
+
+    y_q_transposed, y_s_transposed = fused_flatten_fp8_group_quant(
+        x,
+        group_size=group_size,
+        dtype_quant=dtype_quant,
+        transpose_scale=True,
+    )
+
+    num_bs_cols = (N1 * N2 + group_size - 1) // group_size
+
+    # Public shape is identical for both paths.
+    assert y_s_default.shape == (M, num_bs_cols)
+    assert y_s_transposed.shape == (M, num_bs_cols)
+
+    # Default path is row-major contiguous: strides (num_bs_cols, 1).
+    assert y_s_default.stride() == (num_bs_cols, 1)
+    assert y_s_default.is_contiguous()
+
+    # transpose_scale=True path is column-major: strides (1, M).
+    # Underlying (num_bs_cols, M) buffer is row-major (and therefore .T is
+    # contiguous), which is exactly the layout the CK bpreshuffle GEMM
+    # consumer can read directly.
+    assert y_s_transposed.stride() == (1, M)
+    assert y_s_transposed.T.is_contiguous()
+
+    # Logical values at [m, n] match between the two paths element-wise — the
+    # flag only changes physical layout, not the per-token-group scales.
+    torch.testing.assert_close(y_s_transposed, y_s_default, atol=0, rtol=0)
+
+    # FP8 quantized tensor is bit-identical between the two paths.
+    torch.testing.assert_close(y_q_transposed, y_q_default, atol=0, rtol=0)
+
+
 def run_torch_reduce_act_mul_fp8_group_quant(
     x, x2, activation, dtype, dtype_quant, group_size=128
 ):

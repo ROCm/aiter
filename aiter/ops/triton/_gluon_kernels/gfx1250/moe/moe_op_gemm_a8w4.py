@@ -84,7 +84,7 @@ def unswizzle_mx_scale_gfx1250(
     return scale_buffer_slice
 
 
-@gluon.jit(launch_metadata=matmul_launch_metadata)
+@gluon.jit(launch_metadata=matmul_launch_metadata, do_not_specialize=["num_tokens"])
 def _moe_gemm_a8w4_decode(
     Y,
     stride_y_m,

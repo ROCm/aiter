@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ATen/hip/HIPContext.h>
 #include <torch/extension.h>
 
 namespace aiter {
@@ -43,6 +44,31 @@ void mhc_post(torch::Tensor& out,            // (m, hc_mult, hidden_size)
               torch::Tensor& x,              // (m, hidden_size)
               torch::Tensor& residual,       // (m, hc_mult, hidden_size)
               torch::Tensor& post_layer_mix, // (m, hc_mult)
-              torch::Tensor& comb_res_mix    // (m, hc_mult, hc_mult)
-);
+              torch::Tensor& comb_res_mix,   // (m, hc_mult, hc_mult)
+              int store_nt                   = -1);
+// Optimized mhc_post launch on raw device pointers (used by fused AR+MHC split epilogue).
+void launch_mhc_post_raw(hipStream_t stream,
+                         c10::ScalarType dtype,
+                         void* out,
+                         void* x,
+                         void* residual,
+                         void* post_layer_mix,
+                         void* comb_res_mix,
+                         int m,
+                         int hidden_size,
+                         int x_stride,
+                         int residual_stride,
+                         int store_nt = -1);
+void mhc_fused_post_pre_gemm_sqrsum(
+    torch::Tensor& gemm_out_mul,    // (split_k, m, hc_mult3)
+    torch::Tensor& gemm_out_sqrsum, // (split_k, m)
+    torch::Tensor& next_residual,   // (m, hc_mult, hidden_size)
+    torch::Tensor& layer_input,     // (m, hidden_size)
+    torch::Tensor& residual_in,     // (m, hc_mult, hidden_size)
+    torch::Tensor& post_layer_mix,  // (m, hc_mult)
+    torch::Tensor& comb_res_mix,    // (m, hc_mult, hc_mult)
+    torch::Tensor& fn,              // (hc_mult3, hc_mult * hidden_size)
+    int tile_m                       = 16,
+    int tile_n                       = 32,
+    int tile_k                       = 32);
 } // namespace aiter

@@ -22,6 +22,12 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>TBD</td><td>—</td><td>TBD</td>
 </tr>
 <tr>
+  <td><code>gemm_a8w8_blockscale</code></td><td>GEMM<br>(block-scale)</td><td>CDNA4</td>
+  <td nowrap>A/B: fp8_e4m3 (mfma_scaled)<br>Out: bf16/fp16<br>Per-tile scales:<br>A [M, K/GROUP_K],<br>B [N/GROUP_N, K/GROUP_K]<br>BLOCK_K=128, NUM_WARPS=4<br>(BM,BN) &isin; {(64,128),<br>(128,128),(128,256)}</td>
+  <td>python op_tests/op_benchmarks/<br>triton/bench_gemm_a8w8_<br>blockscale.py -gluon</td>
+  <td>~1271<br>TFLOPS<br>(4Kx4Kx4K)</td><td>—</td><td>TBD</td>
+</tr>
+<tr>
   <td rowspan="4"><code>mla_decode_gluon</code></td><td rowspan="4">MLA<br>Decode</td><td rowspan="4">CDNA4</td>
   <td nowrap>(bh64)<br>Q: bf16, KV: bf16, Out: bf16<br>batch_size in {64, 128, 256}<br>nhead in {64, 128}<br>PAGE_SIZE=1<br>BLOCK_H=BLOCK_N=64</td>
   <td>python op_tests/test_mla.py \<br>-c 16384 -b 64 128 \<br>-n 64,1 128,1 \<br>-d bf16 -kvd bf16</td>
@@ -69,6 +75,77 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 | Scales | per-row (A), per-column (B), float32 |
 | Tunable | BLOCK_SIZE_M/N/K, GROUP_SIZE_M, NUM_XCDS, NUM_WARPS |
 | Config | `$AITER_TRITON_CONFIGS_PATH/gemm/gluon/gfx950-GEMM-A8W8.json` |
+
+---
+
+### `gemm_a8w8_blockscale.py` — FP8 GEMM with block-scale quantization
+
+**Function:** `gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=bf16, y=None, config=None)`
+
+**Description:** Y = X &times; W^T where X and W are fp8_e4m3 and each carries
+per-tile (block) fp32 scales — X by `[M, ceil(K/GROUP_K)]` and W by
+`[ceil(N/GROUP_N), ceil(K/GROUP_K)]`. The inner instruction is
+`gl.amd.cdna4.mfma_scaled` (CDNA4 V_MFMA_SCALE_F32_*) which folds both scales
+into the dot product. The kernel pipelines two independent async-copy streams
+— A/B operands and the per-tile scales — through `NUM_STAGES`-deep LDS
+multi-buffers; pipelining scales separately is the main perf delta vs. the
+equivalent Triton kernel.
+
+**Pipeline.** Three things are in flight on every main-loop iter `k`:
+
+| Stream | Operation | K-tile index |
+|--------|-----------|--------------|
+| global -> LDS | prefetch A, B (`async_copy.buffer_load_to_shared`) | `k + 2` |
+| global -> LDS | prefetch a_scale, b_scale (separate stream) | `k + 1` |
+| LDS -> regs | load operands into mfma dot layouts (becomes next iter's `prev_*`) | `k + 1` |
+| LDS -> regs | load scales (broadcast across MFMA lanes) | `k` |
+| compute | `mfma_scaled` on `prev_a / prev_b` (LDS-read in iter `k - 1`) | `k` |
+| compute | scale-accumulate `acc += mfma_out * a_scale * b_scale` | `k` |
+
+The body of the loop is hard-coded as `EVEN_K=True` so the compiler drops the
+K-mask branch from the hot path. A `commit_group()` is issued *before* the
+LDS reads / MFMA so the backend can hoist `buffer_load_to_shared` up past
+the `ds_read_b128` + `v_mfma_*`; deferring the commit serializes the global
+load behind compute and tanks throughput.
+
+A statically-unrolled wind-down (1 iter when `EVEN_K`, 2 iters when not — the
+extra iter covers the boundary-masked last tile) drains the pipe. The unroll
+is what kills the `prev_a / prev_b` PHI node that would otherwise force the
+dot operands out of AGPRs in the hot loop. Runtime `num_k_iter > N` guards
+make the wind-down a no-op for small-K shapes so only the Final iter runs.
+
+**Parameters**
+
+| Parameter | Details |
+|-----------|---------|
+| Arch | gfx950 (CDNA4) only |
+| A / B dtype | fp8_e4m3 |
+| Output | bf16 (default), fp16 |
+| Scales | fp32 |
+| Scale tile | `GROUP_K`, `GROUP_N` (powers of two, inferred from `w_scale.shape`) |
+| Tile shapes | `(BLOCK_SIZE_M, BLOCK_SIZE_N)` &isin; `{(64,128), (128,128), (128,256)}` |
+| Baked-in | `BLOCK_SIZE_K = 128`, `NUM_WARPS = 4`, MFMA `16&times;16&times;128` |
+| SplitK | `NUM_KSPLIT` (separate reduce kernel `_gemm_a8w8_blockscale_reduce_kernel`) |
+| Tunable | `BLOCK_SIZE_M`, `BLOCK_SIZE_N`, `GROUP_SIZE_M`, `NUM_KSPLIT`, `NUM_STAGES`, `NUM_XCDS` |
+| Config | `$AITER_TRITON_CONFIGS_PATH/gemm/gluon/gfx950-GEMM-A8W8_BLOCKSCALE[-N=*-K=*].json` |
+
+**Perf** (MI350, `-gluon` flag selects this kernel; vs. the in-tree Triton kernel):
+
+```
+python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
+```
+
+| M | N | K | Gluon TFLOPS | Triton TFLOPS | Speedup |
+|---|---|---|--------------|---------------|---------|
+| 128   | 1280 | 8192 | 100.6  | 51.1   | 1.97&times; |
+| 2048  | 1280 | 8192 | 677.3  | 341.7  | 1.98&times; |
+| 4096  | 1280 | 8192 | 863.5  | 670.9  | 1.29&times; |
+| 8192  | 1280 | 8192 | 887.1  | 683.1  | 1.30&times; |
+| 16384 | 1280 | 8192 | 1164.9 | 899.0  | 1.30&times; |
+| 4096  | 4096 | 4096 | 1271.4 | 1013.2 | 1.26&times; |
+| 4096  | 4096 | 4160 | 1076.1 | 862.7  | 1.25&times; |
+
+(Small-M shapes where the kernel is launch- / occupancy-bound — e.g. `M=192` and `M=512` at `N=1280, K=8192` — are currently slower than Triton; tuning continues.)
 
 ---
 

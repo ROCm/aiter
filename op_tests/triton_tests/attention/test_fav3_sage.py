@@ -1026,3 +1026,174 @@ def test_sage_ring_merge_matches_single_call(
         rtol=RTOL_fp8,
         max_diff_percentage=1.0,
     )
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(256, 256), (512, 512)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (16, 16), (16, 4)])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("qsmooth", [False, True])
+def test_sage_mxfp4_return_lse_matches_reference(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    layout: str,
+    qsmooth: bool,
+    dtype=torch.bfloat16,
+):
+    """
+    With smooth_k=True the kernel computes LSE against (K - mean(K)). The
+    wrapper's correction term should make the returned LSE match the LSE that
+    an un-smoothed K would produce (within mxfp4 quant noise). This is the
+    property that FA-style ring-attention merging relies on.
+    """
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    HEAD_SZ = 128
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    _, triton_lse = fav3_sage_mxfp4_wrapper(
+        q,
+        k,
+        v,
+        causal=False,
+        layout=layout,
+        q_smooth=qsmooth,
+        hadamard_rotation=True,
+        return_lse=True,
+        smooth_k=True,
+    )
+
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    if layout == "bshd":
+        q_b = q.permute(0, 2, 1, 3).contiguous()
+        k_b = k.permute(0, 2, 1, 3).contiguous()
+    else:
+        q_b = q
+        k_b = k
+    if NUM_Q_HEADS != NUM_K_HEADS:
+        assert NUM_Q_HEADS % NUM_K_HEADS == 0
+        k_b = k_b.repeat_interleave(NUM_Q_HEADS // NUM_K_HEADS, dim=1)
+    qk = (q_b.float() @ k_b.float().transpose(-1, -2)) * softmax_scale
+    lse_ref = torch.logsumexp(qk, dim=-1)
+
+    assert (
+        triton_lse.shape == lse_ref.shape
+    ), f"LSE shape {tuple(triton_lse.shape)} != reference {tuple(lse_ref.shape)}"
+    # mxfp4 quant noise is larger than int8 sage; use loose tolerances.
+    torch.testing.assert_close(
+        triton_lse,
+        lse_ref.to(triton_lse.dtype),
+        atol=4e-1,
+        rtol=1e-1,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN", [512, 1024])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 4)])
+@pytest.mark.parametrize("RING_DEGREE", [2, 4])
+@pytest.mark.parametrize("layout", ["bhsd", "bshd"])
+@pytest.mark.parametrize("qsmooth", [False, True])
+def test_sage_mxfp4_ring_merge_matches_single_call(
+    BATCH: int,
+    SEQLEN: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    RING_DEGREE: int,
+    layout: str,
+    qsmooth: bool,
+    dtype=torch.bfloat16,
+):
+    """
+    Mimic ring attention: split K/V along the sequence dim into RING_DEGREE shards,
+    run mxfp4 sage per shard with return_lse=True, FA-merge the partial (out, lse)
+    pairs, and assert the merged output matches a single-call mxfp4 sage forward
+    (within mxfp4 quant noise). Pre-fix this diverges with RING_DEGREE because
+    each shard uses a different K mean; post-fix it stays bounded.
+    """
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    HEAD_SZ = 128
+    assert SEQLEN % RING_DEGREE == 0
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN,
+        SEQLEN,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    full_out, _ = fav3_sage_mxfp4_wrapper(
+        q,
+        k,
+        v,
+        causal=False,
+        layout=layout,
+        q_smooth=qsmooth,
+        hadamard_rotation=True,
+        return_lse=True,
+        smooth_k=True,
+    )
+
+    seq_dim_kv = 2 if layout == "bhsd" else 1
+    k_shards = k.chunk(RING_DEGREE, dim=seq_dim_kv)
+    v_shards = v.chunk(RING_DEGREE, dim=seq_dim_kv)
+
+    out_acc = None
+    lse_acc = None
+    for k_s, v_s in zip(k_shards, v_shards):
+        out_s, lse_s = fav3_sage_mxfp4_wrapper(
+            q,
+            k_s.contiguous(),
+            v_s.contiguous(),
+            causal=False,
+            layout=layout,
+            q_smooth=qsmooth,
+            hadamard_rotation=True,
+            return_lse=True,
+            smooth_k=True,
+        )
+        out_s = out_s.float()
+        lse_s = lse_s.float()
+        if out_acc is None:
+            out_acc, lse_acc = out_s, lse_s
+        else:
+            out_acc, lse_acc = _fa_merge_partial(out_acc, lse_acc, out_s, lse_s, layout)
+
+    merged_out = out_acc.to(full_out.dtype)
+    assert merged_out.shape == full_out.shape
+
+    check_attention_outputs(
+        merged_out,
+        full_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=1.5,
+    )

@@ -18,12 +18,11 @@ import flydsl.expr as fx
 
 
 def crd2idx(crd, layout):
-    """crd2idx returning an index-type scalar (unwraps fly.int_tuple)."""
-    result = fx.crd2idx(crd, layout)
-    scalar = fx.get_scalar(result)
-    if isinstance(scalar, ir.Value) and not isinstance(scalar.type, ir.IndexType):
-        scalar = _arith.IndexCastOp(T.index, scalar).result
-    return scalar
+    """crd2idx returning an index-typed ir.Value (unwraps fly.int_tuple)."""
+    scalar = fx.get_scalar(fx.crd2idx(crd, layout)).ir_value()
+    if isinstance(scalar.type, ir.IndexType):
+        return scalar
+    return _arith.IndexCastOp(T.index, scalar).result
 
 
 def swizzle_xor16(row, col, k_blocks16):
@@ -332,7 +331,7 @@ def load_b_raw_w4a16(
     k2_base = lane_odd * fx.Index(half_bytes)
 
     coord_pack = (n_blk, k0, k1_local, n_intra, fx.Index(0))
-    idx_pack = crd2idx(coord_pack, layout_b)
+    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
     idx_bytes = idx_pack + k2_base
 
     b4 = _buffer_load_vec(
@@ -488,7 +487,7 @@ def load_b_pack_k32(
     k2_base = arith.constant((ki_step % 2) * half_bytes, index=True)
 
     coord_pack = (n_blk, k0, k1, n_intra, fx.Index(0))
-    idx_pack = crd2idx(coord_pack, layout_b)
+    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
 
     if unpack_int4:
         idx_bytes = idx_pack + k2_base
@@ -551,7 +550,7 @@ def tile_chunk_coord_i32(
         raise ValueError(f"chunk_i32 must be one of (1,2,4), got {chunk_i32!r}")
     chunk_off_i32 = arith.constant(i * total_threads * chunk_i32, index=True)
     tile_idx_i32 = tx_i32_base + chunk_off_i32
-    coord_local = fx.idx2crd(tile_idx_i32, layout_tile_div4)
+    coord_local = fx.idx2crd(fx.Int32(tile_idx_i32), layout_tile_div4)
     row_local = fx.get(coord_local, 0)
     col_local_i32 = fx.get(coord_local, 1)
     return row_local, col_local_i32
@@ -604,7 +603,7 @@ def lds_store_16b_xor16(
     col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
     col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
-    idx0 = crd2idx(coord_store, layout_lds) + lds_base
+    idx0 = crd2idx(tuple(fx.Int32(c) for c in coord_store), layout_lds) + lds_base
     v16 = vector.bitcast(vec16_ty, vec_part_i32x4)
     vector.store(v16, lds_memref, [idx0])
 
@@ -631,7 +630,7 @@ def lds_store_8b_xor16(
     col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
     col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
-    idx0 = crd2idx(coord_store, layout_lds) + lds_base
+    idx0 = crd2idx(tuple(fx.Int32(c) for c in coord_store), layout_lds) + lds_base
     v8 = vector.bitcast(vec8_ty, vec_part_i32x2)
     vector.store(v8, lds_memref, [idx0])
 
@@ -658,7 +657,7 @@ def lds_store_4b_xor16(
     col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
     col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     coord_store = (row_local, col_swz)
-    idx0 = crd2idx(coord_store, layout_lds) + lds_base
+    idx0 = crd2idx(tuple(fx.Int32(c) for c in coord_store), layout_lds) + lds_base
     v4 = vector.bitcast(vec4_ty, vec_part_i32x1)
     vector.store(v4, lds_memref, [idx0])
 
@@ -684,14 +683,14 @@ def lds_load_pack_k32(
     col_base_swz = swizzle_xor16(curr_row_a_lds, col_base, k_blocks16)
     if ck_lds128:
         coord_a16 = (curr_row_a_lds, col_base_swz)
-        idx_a16 = crd2idx(coord_a16, layout_lds) + lds_base
+        idx_a16 = crd2idx(tuple(fx.Int32(c) for c in coord_a16), layout_lds) + lds_base
         loaded_a16 = vector.load_op(vec16_ty, lds_memref, [idx_a16])
         a_vec128 = vector.bitcast(vec2_i64_ty, loaded_a16)
         return vector.extract(a_vec128, static_position=[half], dynamic_position=[])
     else:
         col_swizzled = col_base_swz + (half * 8)
         coord_a = (curr_row_a_lds, col_swizzled)
-        idx_a = crd2idx(coord_a, layout_lds) + lds_base
+        idx_a = crd2idx(tuple(fx.Int32(c) for c in coord_a), layout_lds) + lds_base
         loaded_a8 = vector.load_op(vec8_ty, lds_memref, [idx_a])
         a_vec64 = vector.bitcast(vec1_i64_ty, loaded_a8)
         return vector.extract(a_vec64, static_position=[0], dynamic_position=[])
@@ -732,23 +731,23 @@ def xcd_remap_bx_by(
     _c1 = fx.arith.constant(1, index=True)
     _c_tm = fx.arith.constant(tile_m, index=True)
     _gx = fx.arith.constant(N // tile_n, index=True)
-    _gy = (c_m + _c_tm - _c1) / _c_tm
+    _gy = (c_m + _c_tm - _c1) // _c_tm
 
     _linear_id = bx * _gx + by
     _num_wgs = _gx * _gy
 
     _c_xcds = fx.arith.constant(num_xcds, index=True)
-    _q = _num_wgs / _c_xcds
+    _q = _num_wgs // _c_xcds
     _r = _num_wgs % _c_xcds
     _xcd = _linear_id % _c_xcds
-    _in_xcd = _linear_id / _c_xcds
+    _in_xcd = _linear_id // _c_xcds
     _xcd_lt_r = fx.arith.cmpi(CmpIPredicate.ult, _xcd, _r)
     _clip = fx.arith.select(_xcd_lt_r, _xcd, _r)
     _wgid = _xcd * _q + _clip + _in_xcd
 
     _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
     _num_wgid_in_group = _c_wgm * _gx
-    _group_id = _wgid / _num_wgid_in_group
+    _group_id = _wgid // _num_wgid_in_group
     _first_pid_m = _group_id * _c_wgm
     _remaining_m = _gy - _first_pid_m
     _cmp_m = fx.arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
@@ -756,7 +755,7 @@ def xcd_remap_bx_by(
 
     _wgid_in_group = _wgid % _num_wgid_in_group
     new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
-    new_by = _wgid_in_group / _group_size_m
+    new_by = _wgid_in_group // _group_size_m
     return new_bx, new_by
 
 
