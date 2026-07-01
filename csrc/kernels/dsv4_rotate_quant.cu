@@ -149,9 +149,19 @@ __device__ __forceinline__ int64_t kv_scale_preshuffle_offset(const int64_t bloc
 {
     const int32_t k_tile = scale_group_idx / 4;
     const int32_t group4 = scale_group_idx % 4;
+    // The scale axis is INTERLEAVED within each (block, k_tile, group4) region:
+    //   sflat = (pos%16) * (kv_block_size/16) + pos/16
+    // so the pa_mqa_logits_fp4 reader's packed-dword load (NTPW e8m0 bytes for
+    // the NTPW N-tiles of a token at lane_mod_16) is contiguous. The multiplier
+    // (kv_block_size/16) is the number of MFMA_N=16 tiles per block = the
+    // reader's NTPW whenever N_PHYS==1 (the only mode the packed reader runs).
+    // For kv_block_size==16 it degenerates to the plain linear `pos` layout;
+    // for the FP4 indexer (k1_csa==64) it is (pos%16)*4 + pos/16.
+    const int32_t tiles_per_block = kv_block_size / 16;
+    const int32_t sflat = (pos_in_block % 16) * tiles_per_block + (pos_in_block / 16);
     return block_idx * static_cast<int64_t>(k_tiles) * 4 * kv_block_size +
            static_cast<int64_t>(k_tile) * 4 * kv_block_size +
-           static_cast<int64_t>(group4) * kv_block_size + pos_in_block;
+           static_cast<int64_t>(group4) * kv_block_size + sflat;
 }
 
 __device__ __forceinline__ void store_kv_scale_e8m0_preshuffle(uint8_t* __restrict__ scale,
