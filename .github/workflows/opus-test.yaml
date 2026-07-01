@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # labeled: re-run when adding ci:mi300x to start MI300X OPUS tests
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
     paths-ignore:
       - '**/*.md'
@@ -25,7 +26,7 @@ env:
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -37,20 +38,54 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
+  opus_matrix:
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x') }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Select OPUS test runners
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          GITHUB_REF: ${{ github.ref }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          event_name = os.environ.get("EVENT_NAME")
+          event_action = os.environ.get("EVENT_ACTION")
+          github_ref = os.environ.get("GITHUB_REF")
+          labels = json.loads(os.environ.get("PR_LABELS") or "[]")
+
+          include = []
+          labeled_event = event_name == "pull_request" and event_action == "labeled"
+          run_mi35x = not labeled_event
+          run_mi300x = github_ref == "refs/heads/main" or (
+              event_name == "pull_request" and "ci:mi300x" in labels
+          )
+
+          if run_mi35x:
+              include.append({"runner": "linux-aiter-mi35x-1", "label": "MI35X"})
+
+          if run_mi300x:
+              include.append({"runner": "aiter-1gpu-runner", "label": "MI300X"})
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"matrix={json.dumps({'include': include}, separators=(',', ':'))}\n")
+          PY
+
   opus:
     if: >-
-      (!github.event.pull_request || github.event.pull_request.draft == false) &&
-      github.event.action != 'labeled'
+      needs.opus_matrix.outputs.matrix != ''
     name: OPUS Tests (${{ matrix.label }})
-    needs: check-signal
+    needs: [check-signal, opus_matrix]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-          - runner: aiter-1gpu-runner
-            label: MI300X
+      matrix: ${{ fromJSON(needs.opus_matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
 
     steps:

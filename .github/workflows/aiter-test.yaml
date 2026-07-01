@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # labeled: re-run when adding ci:mi300x to start MI300X standard tests
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]  # Triggers on PRs targeting `main`
     paths:
       - '**'
@@ -35,7 +36,7 @@ env:
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -48,7 +49,7 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_wheels:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x') }}
     runs-on: build-only-aiter
     needs: check-signal
     permissions:
@@ -328,7 +329,7 @@ jobs:
           S3_PUBLIC: "https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950"
 
   split_aiter_tests:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x') }}
     runs-on: ubuntu-latest
     needs: [check-signal, build_aiter_wheels]
     outputs:
@@ -350,7 +351,7 @@ jobs:
           retention-days: 7
 
   prepare_triton_wheel:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x') }}
     needs: check-signal
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
@@ -358,80 +359,78 @@ jobs:
       artifact-name: triton_wheelhouse
       retention-days: 3
 
+  standard_test_matrix:
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x') }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      expected_runners: ${{ steps.matrix.outputs.expected_runners }}
+    steps:
+      - name: Select standard test runners
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          GITHUB_REF: ${{ github.ref }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          event_name = os.environ.get("EVENT_NAME")
+          event_action = os.environ.get("EVENT_ACTION")
+          github_ref = os.environ.get("GITHUB_REF")
+          labels = json.loads(os.environ.get("PR_LABELS") or "[]")
+
+          include = []
+          labeled_event = event_name == "pull_request" and event_action == "labeled"
+          run_mi35x = not labeled_event
+          run_mi300x = github_ref == "refs/heads/main" or (
+              event_name == "pull_request" and "ci:mi300x" in labels
+          )
+
+          if run_mi35x:
+              include.extend(
+                  {
+                      "runner": "linux-aiter-mi35x-1",
+                      "label": "MI35X",
+                      "shard_total": 8,
+                      "shard_idx": shard,
+                  }
+                  for shard in range(8)
+              )
+
+          if run_mi300x:
+              include.extend(
+                  {
+                      "runner": "aiter-1gpu-runner",
+                      "label": "MI300X",
+                      "shard_total": 8,
+                      "shard_idx": shard,
+                  }
+                  for shard in range(8)
+              )
+
+          expected_runners = []
+          for item in include:
+              runner = item["runner"]
+              if runner not in expected_runners:
+                  expected_runners.append(runner)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"matrix={json.dumps({'include': include}, separators=(',', ':'))}\n")
+              output.write(f"expected_runners={' '.join(expected_runners)}\n")
+          PY
+
   standard:
     if: >-
-      (!github.event.pull_request || github.event.pull_request.draft == false) &&
-      github.event.action != 'labeled'
+      needs.standard_test_matrix.outputs.matrix != ''
     name: Standard Tests (1 GPU)
-    needs: [build_aiter_wheels, split_aiter_tests, prepare_triton_wheel]
+    needs: [build_aiter_wheels, split_aiter_tests, prepare_triton_wheel, standard_test_matrix]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 0
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 1
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 2
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 3
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 4
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 5
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 6
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            shard_total: 8
-            shard_idx: 7
-          - runner: aiter-1gpu-runner
-            label: MI300X
-            shard_total: 8
-            shard_idx: 0
-          - runner: aiter-1gpu-runner
-            label: MI300X
-            shard_total: 8
-            shard_idx: 1
-          - runner: aiter-1gpu-runner
-            label: MI300X
-            shard_total: 8
-            shard_idx: 2
-          - runner: aiter-1gpu-runner
-            label: MI300X
-            shard_total: 8
-            shard_idx: 3
-          - runner: aiter-1gpu-runner
-            label: MI300X
-            shard_total: 8
-            shard_idx: 4
-          - runner: aiter-1gpu-runner
-            label: MI300X
-            shard_total: 8
-            shard_idx: 5
-          - runner: aiter-1gpu-runner
-            label: MI300X
-            shard_total: 8
-            shard_idx: 6
-          - runner: aiter-1gpu-runner
-            label: MI300X
-            shard_total: 8
-            shard_idx: 7
+      matrix: ${{ fromJSON(needs.standard_test_matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -677,11 +676,11 @@ jobs:
 
   standard-test-finish:
     if: >-
-      !github.event.pull_request.draft &&
-      github.event.action != 'labeled'
+      (!github.event.pull_request || github.event.pull_request.draft == false) &&
+      (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:mi300x')
     name: Standard Test Results
     runs-on: ubuntu-latest
-    needs: [standard]
+    needs: [standard, standard_test_matrix]
     steps:
       - name: Download all test logs
         uses: actions/download-artifact@v4
@@ -695,12 +694,15 @@ jobs:
           ls -l standard-test-log-*
 
       - name: Check Standard Test Results
+        env:
+          EXPECTED_RUNNERS: ${{ needs.standard_test_matrix.outputs.expected_runners }}
         run: |
           set -ex
           echo "Checking Standard Test Results..."
           all_passed=true
+          runners=(${EXPECTED_RUNNERS})
           for shard in {0..7}; do
-            for runner in {linux-aiter-mi35x-1,aiter-1gpu-runner}; do
+            for runner in "${runners[@]}"; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "Test report for ${runner} shard ${shard} not found."
                 all_passed=false
