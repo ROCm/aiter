@@ -325,11 +325,13 @@ def test_fmoe(
 
     # Detect xbf16: when active, the kernel receives BF16 input (not FP8),
     # so the reference must also use BF16 input for a fair comparison.
+    from aiter.fused_moe import quant_remap
     ref_xbf16 = False
-    if qType == aiter.QuantType.per_128x128:
+    if qType in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128):
+        _q = quant_remap.get(qType, qType)
         _metadata = get_2stage_cfgs(
             get_padded_M(token), model_dim, inter_dim, E, topk, dtype,
-            AQDType, WQDType, qType, use_g1u1, actType, doweight_stage1,
+            AQDType, WQDType, _q, use_g1u1, actType, doweight_stage1,
             hidden_pad, intermediate_pad,
             getattr(w1_qt_aiter, "is_shuffled", False)
             or getattr(w2_qt_aiter, "is_shuffled", False),
