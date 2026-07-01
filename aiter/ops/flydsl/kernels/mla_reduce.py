@@ -578,8 +578,6 @@ def compile_mla_reduce(
                             scf.YieldOp([])
                     scf.YieldOp([])
 
-                fx.gpu.barrier()
-
                 # Lever #1/#5: GRP-wide double-rate software pipeline. Process
                 # GRP splits per iteration and keep GRP output buffer_loads in
                 # flight (generalizes HIP oaccu_0/oaccu_1 depth-2). Each group's
@@ -605,33 +603,26 @@ def compile_mla_reduce(
 
                 one_f = fx.arith.constant(1.0, type=T.f32)
 
-                def load_group(base_i32):
-                    """Load GRP splits [base..base+GRP) as a batch.
+                def load_os_group(base_i32):
+                    """pmap-only phase of a group load: gather rows + issue the
+                    GRP os buffer_loads + compute the float OOB masks. Depends on
+                    lds_pmap (staged + barriered at the top of the work item),
+                    NOT on lds_scale, so it can be hoisted ahead of the LSE-reduce
+                    scale barrier (lever #6) to overlap the VMEM load latency with
+                    the warp0 LSE reduce + the barrier wait.
 
-                    Vectorized LDS: the group's pmap indices and lse scales live
-                    at contiguous LDS slots, so read them with wide ds_read_b128
-                    (STensor.load vec) instead of GRP scalar ds_read_b32 -- the
-                    ATT #1 stall was LDS/SMEM-wait (lgkmcnt) once the pipeline hid
-                    VMEM. base = i*GRP is 16B-aligned. Returns (os_list, masks,
-                    scales) matching the loop-carried state layout.
+                    Vectorized LDS: base = i*GRP is 16B-aligned so the pmap read
+                    is a wide ds_read_b128. Returns (os_list, masks, valids); the
+                    scale fold happens later in load_scales.
 
-                    Tail safety: a partial final group reads slots >= n_splits
-                    (stale/unwritten). The pmap value is row-clamped (row_from_
-                    pmap) and the scale is select-forced to 0 for invalid splits
-                    (in_split false), so no stale NaN reaches the FMA. Selecting
-                    on the *scale* (an LDS/register value) is free -- it does not
-                    touch the VMEM os load, so the deferred-guard vmcnt overlap is
-                    preserved.
+                    Tail safety: OOB lanes (slot >= n_splits) read stale slots, so
+                    the pmap value is substituted with slot-0's (always staged,
+                    since the massive body only runs when n_splits > 1) and
+                    row-clamped -- no stale value ever reaches the gather address,
+                    even with guards disabled.
                     """
                     base_idx = fx.Index(base_i32)
                     pmap_v = lds_pmap.load(base_idx, vec_size=GRP)
-                    scale_v = lds_scale.load(base_idx, vec_size=GRP)
-                    # Slot-0 pmap (always validly staged, since the massive body
-                    # only runs when n_splits > 1). OOB lanes of the vector read
-                    # hit stale slots; substitute pmap0 so the row computation
-                    # never sees a stale value -- mirrors the old scalar
-                    # safe_split=0 clamp and stays safe even with guards disabled
-                    # (else no clamp -> stale pmap -> wild global gather address).
                     pmap0 = fx.Int32(
                         fx.vector.extract(
                             pmap_v, static_position=[0], dynamic_position=[]
@@ -639,7 +630,7 @@ def compile_mla_reduce(
                     )
                     os_list = []
                     masks = []
-                    scs = []
+                    valids = []
                     for j in fx.range_constexpr(GRP):
                         split_j = base_i32 + fx.Int32(j)
                         in_split = fx.arith.cmpi(
@@ -655,17 +646,41 @@ def compile_mla_reduce(
                         os_raw = load_o_elems(g_po, row_idx, fx.Index(head), col)
                         valid = fx.arith.andi(in_split, in_bounds)
                         mask = valid.select(one_f, zero_f)
+                        os_list.append(os_raw)
+                        masks.append(mask)
+                        valids.append(valid)
+                    return os_list, masks, valids
+
+                def load_scales(base_i32, valids):
+                    """scale phase: wide ds_read_b128 of lds_scale + select-to-0
+                    on invalid splits (prevents stale-NaN * mask(0) pollution).
+                    Must run after the scale barrier."""
+                    scale_v = lds_scale.load(fx.Index(base_i32), vec_size=GRP)
+                    scs = []
+                    for j in fx.range_constexpr(GRP):
                         sc_j = fx.vector.extract(
                             scale_v, static_position=[j], dynamic_position=[]
                         )
-                        sc_safe = valid.select(sc_j, zero_f)
-                        os_list.append(os_raw)
-                        masks.append(mask)
-                        scs.append(sc_safe)
+                        scs.append(valids[j].select(sc_j, zero_f))
+                    return scs
+
+                def load_group(base_i32):
+                    """Combined pmap+scale load for the steady-state loop (both
+                    LDS regions are valid past the barrier)."""
+                    os_list, masks, valids = load_os_group(base_i32)
+                    scs = load_scales(base_i32, valids)
                     return os_list, masks, scs
 
-                # Prologue: load group 0 (splits 0..GRP-1).
-                os_g0, mask_g0, sc_g0 = load_group(fx.Int32(0))
+                # Prologue + lever #6: hoist group-0's os buffer_loads ahead of
+                # the scale barrier. They depend only on the already-staged
+                # lds_pmap, so issuing them here overlaps GRP VMEM loads with the
+                # warp0 LSE reduce and the barrier wait; the barrier-protected
+                # scales are folded in afterwards.
+                os_g0, mask_g0, valid_g0 = load_os_group(fx.Int32(0))
+
+                fx.gpu.barrier()
+
+                sc_g0 = load_scales(fx.Int32(0), valid_g0)
                 init_os = []
                 for j in fx.range_constexpr(GRP):
                     init_os += [
