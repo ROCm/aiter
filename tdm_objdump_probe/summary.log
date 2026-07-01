@@ -1,0 +1,16 @@
+clang_status=0
+objdump_status=0
+tensor_load_to_lds_matches=1
+
+Generated files:
+tdm_objdump_probe/build.log
+tdm_objdump_probe/clang_stderr.log
+tdm_objdump_probe/clang_stdout.log
+tdm_objdump_probe/objdump_stderr.log
+tdm_objdump_probe/summary.log
+tdm_objdump_probe/tdm_probe.co
+tdm_objdump_probe/tdm_probe.objdump.s
+tdm_objdump_probe/tdm_probe.s
+
+Objdump tensor lines:
+8:	tensor_load_to_lds s[12:15], s[4:11]                       // 000000000008: D0710001 7C000000 7C7C040C

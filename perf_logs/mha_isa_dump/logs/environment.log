@@ -1,0 +1,11 @@
+date: 2026-07-01T09:31:17+00:00
+host: ctheliosr-1b114-f01-2
+container: hyg_fyd1
+pwd: /data/yanguahe/code/wk_sp1/aiter
+host_git_branch: hyg_dev
+host_git_commit: afd9d37bdd7bac53d950fbebf6b1df969ba9ef3a
+python: /opt/venv/bin/python
+Python 3.12.3
+
+rocm tools:
+  /opt/rocm/llvm/bin/llvm-objdump: available

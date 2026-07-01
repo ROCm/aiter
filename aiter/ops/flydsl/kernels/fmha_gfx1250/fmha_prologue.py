@@ -125,16 +125,15 @@ def _acc_bank(g_idx, tile):
 
 def _permlanex16_f32(src):
     """v_permlanex16_b32 via inline asm (intrinsic lacks SelectionDAG lowering)."""
-    i32_ty = ir.IntegerType.get_signless(32)
-    src_i32 = arith.bitcast(i32_ty, src)
+    src_i32 = arith.bitcast(T.i32, src)
     result_i32 = llvm_dialect.inline_asm(
-        i32_ty,
+        T.i32,
         [src_i32],
         "v_permlanex16_b32 $0, $1, 0, 0",
         "=v,0",
         has_side_effects=True,
     )
-    return arith.bitcast(ir.F32Type.get(), result_i32)
+    return arith.bitcast(T.f32, result_i32)
 
 
 def _setreg(hwreg_enc, value):
@@ -164,16 +163,14 @@ def _s_wait_tensorcnt(cnt):
 
 def lds_load_b128(lds_base_raw, byte_offset_raw):
     lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
-    total = arith.unwrap(arith.addi(lds_base_raw, byte_offset_raw))
+    total = arith.unwrap(lds_base_raw + byte_offset_raw)
     ptr = llvm_dialect.inttoptr(lds_ptr_ty, total)
-    vec_ty = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
-    return llvm_dialect.load(vec_ty, ptr)
+    return llvm_dialect.load(T.vec(4, T.i32), ptr)
 
 
 def make_wmma_frag_bf16(vec4_lo, vec4_hi):
-    vec8bf16_ty = ir.VectorType.get([8], ir.BF16Type.get())
-    v0 = vector.bitcast(vec8bf16_ty, vec4_lo)
-    v1 = vector.bitcast(vec8bf16_ty, vec4_hi)
+    v0 = vector.bitcast(T.vec(8, T.bf16), vec4_lo)
+    v1 = vector.bitcast(T.vec(8, T.bf16), vec4_hi)
     return vector.shuffle(v0, v1, list(range(16)))
 
 
@@ -195,20 +192,15 @@ def _phase4_q_load_flydsl(
     For QK_HDIM=192: 6 loads per bank (3 frags × 2 loads each), bank1 offset=192 bytes.
     For QK_HDIM=128: 4 loads per bank (2 frags × 2 loads each), bank1 offset=128 bytes.
     """
-    lane_lo = arith.andi(lane_id, arith.constant(15, type=T.i32))
-    lane_hi = arith.shrui(lane_id, arith.constant(4, type=T.i32))
-    base = arith.addi(
-        arith.muli(lane_lo, stride_q_seq),
-        arith.muli(lane_hi, arith.constant(16, type=T.i32)),
-    )
-    wave_off = arith.muli(
-        arith.muli(wave_id, arith.constant(32, type=T.i32)), stride_q_seq
-    )
-    q_byte_off = arith.addi(base, wave_off)
+    lane_lo = lane_id & 15
+    lane_hi = lane_id >> 4
+    base = lane_lo * stride_q_seq + lane_hi * 16
+    wave_off = (wave_id * 32) * stride_q_seq
+    q_byte_off = base + wave_off
 
-    q_elem_off = arith.shrui(q_byte_off, arith.constant(2, type=T.i32))
+    q_elem_off = q_byte_off >> 2
 
-    vec4i32_ty = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+    vec4i32_ty = T.vec(4, T.i32)
     soff_zero = arith.unwrap(arith.constant(0, type=T.i32))
     aux_zero = arith.unwrap(arith.constant(0, type=T.i32))
 
@@ -216,9 +208,7 @@ def _phase4_q_load_flydsl(
     q_base_bytes = _mul_nuw(arith.unwrap(q_elem_off), four_i32)
     if q_tile_offset_bytes is not None:
         q_base_bytes = _add_nuw(q_tile_offset_bytes, q_base_bytes)
-    stride_16_bytes = arith.unwrap(
-        arith.muli(stride_q_seq, arith.constant(16, type=T.i32))
-    )
+    stride_16_bytes = arith.unwrap(stride_q_seq * 16)
 
     # K-half byte offset = QK_HDIM bytes (splits K cols in half per bank pair)
     _K_HALF_BYTES = QK_HDIM  # 192 for 192-dim, 128 for 128-dim
@@ -227,14 +217,12 @@ def _phase4_q_load_flydsl(
     _FRAGS_PER_BANK = (QK_HDIM // 2) // 32
     _LOADS_PER_BANK = _FRAGS_PER_BANK * 2  # 2 raw loads per v16bf16 frag
 
+    _k_half_c = arith.unwrap(arith.constant(_K_HALF_BYTES, type=T.i32))
     bank_offsets_bytes = [
         arith.unwrap(arith.constant(0, type=T.i32)),
-        arith.unwrap(arith.constant(_K_HALF_BYTES, type=T.i32)),
+        _k_half_c,
         stride_16_bytes,
-        _add_nuw(
-            stride_16_bytes,
-            arith.unwrap(arith.constant(_K_HALF_BYTES, type=T.i32)),
-        ),
+        _add_nuw(stride_16_bytes, _k_half_c),
     ]
 
     q_frags = []
@@ -269,27 +257,20 @@ def _phase4_q_load_flydsl(
 
 def _phase9a_k_lds_addr_gen(lane_id, wave_id):
     """K LDS addresses — pure FlyDSL arith + bank hints."""
-    lane_lo = arith.andi(lane_id, arith.constant(0xF, type=T.i32))
-    lane_hi = arith.shrui(lane_id, arith.constant(4, type=T.i32))
-    base = arith.addi(
-        arith.muli(lane_lo, arith.constant(K_ROW_BYTES, type=T.i32)),
-        arith.muli(lane_hi, arith.constant(16, type=T.i32)),
-    )
+    lane_lo = lane_id & 0xF
+    lane_hi = lane_id >> 4
+    base = lane_lo * K_ROW_BYTES + lane_hi * 16
 
-    seg1 = arith.addi(base, arith.constant(K_SU_HALF_OFFSET, type=T.i32))
-    seg2 = arith.addi(base, arith.constant(PINGPONG_OFFSET, type=T.i32))
-    seg3 = arith.addi(seg1, arith.constant(PINGPONG_OFFSET, type=T.i32))
+    seg1 = base + K_SU_HALF_OFFSET
+    seg2 = base + PINGPONG_OFFSET
+    seg3 = seg1 + PINGPONG_OFFSET
 
-    wave_is_odd = arith.cmpi(
-        arith.CmpIPredicate.ne,
-        arith.andi(wave_id, arith.constant(1, type=T.i32)),
-        arith.constant(0, type=T.i32),
-    )
+    wave_is_odd = (wave_id & 1) != 0
 
-    a0 = arith.unwrap(arith.select(wave_is_odd, seg2, base))
-    a1 = arith.unwrap(arith.select(wave_is_odd, seg3, seg1))
-    a2 = arith.unwrap(arith.select(wave_is_odd, base, seg2))
-    a3 = arith.unwrap(arith.select(wave_is_odd, seg1, seg3))
+    a0 = arith.unwrap(wave_is_odd.select(seg2, base))
+    a1 = arith.unwrap(wave_is_odd.select(seg3, seg1))
+    a2 = arith.unwrap(wave_is_odd.select(base, seg2))
+    a3 = arith.unwrap(wave_is_odd.select(seg1, seg3))
 
     rocdl.sched_barrier(0)
 
@@ -303,35 +284,25 @@ def _phase9a_k_lds_addr_gen(lane_id, wave_id):
 
 def _phase9b_v_lds_addr_gen(lane_id, wave_id):
     """V LDS addresses — pure FlyDSL arith + bank hints."""
-    lane_and_7 = arith.andi(lane_id, arith.constant(7, type=T.i32))
-    lane_shr4 = arith.shrui(lane_id, arith.constant(4, type=T.i32))
-    row = arith.addi(lane_and_7, arith.shli(lane_shr4, arith.constant(3, type=T.i32)))
+    lane_and_7 = lane_id & 7
+    lane_shr4 = lane_id >> 4
+    row = lane_and_7 + (lane_shr4 << 3)
 
-    lane_shr3 = arith.shrui(lane_id, arith.constant(3, type=T.i32))
-    sub_col = arith.shli(
-        arith.andi(lane_shr3, arith.constant(1, type=T.i32)),
-        arith.constant(4, type=T.i32),
-    )
+    lane_shr3 = lane_id >> 3
+    sub_col = (lane_shr3 & 1) << 4
 
-    addr_base = arith.addi(
-        arith.addi(arith.muli(row, arith.constant(V_ROW_BYTES, type=T.i32)), sub_col),
-        arith.constant(V_LDS_OFFSET, type=T.i32),
-    )
-    addr_half = arith.addi(addr_base, arith.constant(V_SU_HALF_OFFSET, type=T.i32))
+    addr_base = row * V_ROW_BYTES + sub_col + V_LDS_OFFSET
+    addr_half = addr_base + V_SU_HALF_OFFSET
 
-    seg2_a = arith.addi(addr_base, arith.constant(PINGPONG_OFFSET, type=T.i32))
-    seg2_h = arith.addi(addr_half, arith.constant(PINGPONG_OFFSET, type=T.i32))
+    seg2_a = addr_base + PINGPONG_OFFSET
+    seg2_h = addr_half + PINGPONG_OFFSET
 
-    wave_is_odd = arith.cmpi(
-        arith.CmpIPredicate.ne,
-        arith.andi(wave_id, arith.constant(1, type=T.i32)),
-        arith.constant(0, type=T.i32),
-    )
+    wave_is_odd = (wave_id & 1) != 0
 
-    s0_a = arith.unwrap(arith.select(wave_is_odd, seg2_a, addr_base))
-    s0_h = arith.unwrap(arith.select(wave_is_odd, seg2_h, addr_half))
-    s2_a = arith.unwrap(arith.select(wave_is_odd, addr_base, seg2_a))
-    s2_h = arith.unwrap(arith.select(wave_is_odd, addr_half, seg2_h))
+    s0_a = arith.unwrap(wave_is_odd.select(seg2_a, addr_base))
+    s0_h = arith.unwrap(wave_is_odd.select(seg2_h, addr_half))
+    s2_a = arith.unwrap(wave_is_odd.select(addr_base, seg2_a))
+    s2_h = arith.unwrap(wave_is_odd.select(addr_half, seg2_h))
 
     rocdl.sched_barrier(0)
 
@@ -358,12 +329,9 @@ def _phase9d_k_lds_load_flydsl(k_addrs, lds_offset=0):
         half_off = half_idx * K_D_HALF_OFFSET + lds_offset
         for bank in fx.range_constexpr(4):
             for i in fx.range_constexpr(NUM_K_LOADS_PER_HALF):
-                byte_off = arith.unwrap(
-                    arith.constant(
-                        half_off + i * K_LOAD_STRIDE,
-                        type=T.i32,
-                    )
-                )
+                byte_off = arith.unwrap(arith.constant(
+                    half_off + i * K_LOAD_STRIDE, type=T.i32,
+                ))
                 loaded = lds_load_b128(k_addrs[bank], byte_off)
                 all_bank_loads[half_idx][bank].append(set_vgpr_bank(loaded, bank))
 
@@ -393,8 +361,8 @@ def _qk_wmma_64_flydsl(k_frags, q_frags):
     Tile ordering: (acc_pair0,n=0), (acc_pair0,n=1), (acc_pair1,n=0), (acc_pair1,n=1)
     avoids consecutive WMMAs with same SRCC/SRCD bank.
     """
-    vec8f32_ty = ir.VectorType.get([8], ir.F32Type.get())
-    zero_acc = arith.unwrap(arith.constant_vector(0.0, T.vec(8, T.f32)))
+    vec8f32_ty = T.vec(8, T.f32)
+    zero_acc = arith.unwrap(arith.constant_vector(0.0, vec8f32_ty))
 
     accs = {}
     rocdl.sched_barrier(0)
@@ -444,11 +412,7 @@ def _causal_mask_flydsl(accs, row_pos, su_col_offset=0):
         for i in fx.range_constexpr(8):
             col = col_base + i
             elem = vector.extract(acc, [], static_position=[i])
-            cmp = arith.unwrap(
-                arith.cmpi(
-                    arith.CmpIPredicate.slt, row_pos, arith.constant(col, type=T.i32)
-                )
-            )
+            cmp = arith.unwrap(row_pos < col)
             masked = llvm_dialect.select(cmp, neg_inf_raw, elem)
             acc = vector.insert(masked, acc, [], static_position=[i])
 
@@ -466,7 +430,6 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     Returns (row_max, row_sum).
     """
 
-    f32 = ir.F32Type.get()
     neg_inf_raw = arith.unwrap(arith.constant(float("-inf"), type=T.f32))
     zero_raw = arith.unwrap(arith.constant(0.0, type=T.f32))
     s_zero = arith.unwrap(arith.constant(0, type=T.i32))
@@ -492,7 +455,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     # ---- Cross-lane permlanex16 + cross-bank max → global_max ----
     for bank in fx.range_constexpr(4):
         val = max_per_bank[bank]
-        xchg = _rocdl_permlanex16(f32, val, val, s_zero, s_zero, False, False)
+        xchg = _rocdl_permlanex16(T.f32, val, val, s_zero, s_zero, False, False)
         max_per_bank[bank] = set_vgpr_bank(arith.maxnumf(val, xchg), bank)
 
     cross01 = arith.maxnumf(max_per_bank[0], max_per_bank[1])
@@ -504,7 +467,7 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
     row_sum = {}
     for bank in fx.range_constexpr(4):
         neg_ms = set_vgpr_bank(
-            arith.negf(arith.mulf(global_max, softmax_scale_raw)),
+            -(global_max * softmax_scale_raw),
             bank,
         )
         scale_b = set_vgpr_bank(softmax_scale_raw, bank)
@@ -514,8 +477,8 @@ def _softmax_complete_flydsl(accs, softmax_scale_raw):
             for i in fx.range_constexpr(8):
                 elem = vector.extract(acc, [], static_position=[i])
                 x = llvm_dialect.intr_fma(elem, scale_b, neg_ms)
-                exp_val = _rocdl_exp2(f32, x)
-                running_sum = arith.addf(running_sum, exp_val)
+                exp_val = _rocdl_exp2(T.f32, x)
+                running_sum = running_sum + exp_val
         row_sum[bank] = set_vgpr_bank(running_sum, bank)
         rocdl.sched_barrier(0)
 
@@ -534,21 +497,12 @@ def _phase5_head_index_div_flydsl(workgroup_id, num_heads):
 
 def _phase6_compute_lds_offsets(wave_id):
     """Per-wave LDS base offsets for K and V TDM descriptors."""
-    wid_odd = arith.andi(wave_id, arith.constant(1, type=T.i32))
-    wid_half = arith.shrui(wave_id, arith.constant(1, type=T.i32))
+    wid_odd = wave_id & 1
+    wid_half = wave_id >> 1
 
-    k_lds_base = arith.addi(
-        arith.muli(wid_odd, arith.constant(PINGPONG_OFFSET, type=T.i32)),
-        arith.muli(wid_half, arith.constant(0x2200, type=T.i32)),
-    )
+    k_lds_base = wid_odd * PINGPONG_OFFSET + wid_half * 0x2200
 
-    v_lds_base = arith.addi(
-        arith.addi(
-            arith.constant(V_LDS_OFFSET, type=T.i32),
-            arith.muli(wid_odd, arith.constant(PINGPONG_OFFSET, type=T.i32)),
-        ),
-        arith.muli(wid_half, arith.constant(0x2400, type=T.i32)),
-    )
+    v_lds_base = V_LDS_OFFSET + wid_odd * PINGPONG_OFFSET + wid_half * 0x2400
 
     return k_lds_base, v_lds_base
 
@@ -571,29 +525,27 @@ def _build_tdm_dgroup1(config_val, stride_i32):
 
 
 def _split_i64_to_lo_hi(val_i64):
-    i32 = ir.IntegerType.get_signless(32)
-    lo = arith.trunci(i32, val_i64)
-    hi_shifted = arith.shrui(val_i64, arith.constant(32, type=T.i64))
-    hi_raw = arith.trunci(i32, hi_shifted)
-    hi = arith.ori(hi_raw, arith.constant(-2147483648, type=T.i32))
+    lo = arith.trunci(T.i32, val_i64)
+    hi_shifted = val_i64 >> 32
+    hi_raw = arith.trunci(T.i32, hi_shifted)
+    hi = hi_raw | arith.constant(-2147483648, type=T.i32)
     return lo, hi
 
 
 def _compute_k_global_addr(arg_K, k_offset, wave_id, stride_k_32):
     from flydsl._mlir.dialects import fly as _fly_d
 
-    i64 = ir.IntegerType.get_signless(64)
     glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
 
     a_raw = arg_K.__extract_to_ir_values__()[0]
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
-    base_i64 = llvm_dialect.ptrtoint(i64, glb_ptr)
+    base_i64 = llvm_dialect.ptrtoint(T.i64, glb_ptr)
 
-    k_off_i64 = arith.extsi(i64, arith.unwrap(k_offset))
-    addr_i64 = arith.addi(base_i64, k_off_i64)
+    k_off_i64 = arith.extsi(T.i64, arith.unwrap(k_offset))
+    addr_i64 = base_i64 + k_off_i64
 
-    wave_off = arith.muli(arith.unwrap(wave_id), arith.unwrap(stride_k_32))
-    addr_i64 = arith.addi(addr_i64, arith.extsi(i64, wave_off))
+    wave_off = arith.unwrap(wave_id) * arith.unwrap(stride_k_32)
+    addr_i64 = addr_i64 + arith.extsi(T.i64, wave_off)
 
     return addr_i64
 
@@ -601,28 +553,26 @@ def _compute_k_global_addr(arg_K, k_offset, wave_id, stride_k_32):
 def _compute_v_global_addr(arg_V, v_offset, wave_id, stride_v_32):
     from flydsl._mlir.dialects import fly as _fly_d
 
-    i64 = ir.IntegerType.get_signless(64)
     glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
 
     a_raw = arg_V.__extract_to_ir_values__()[0]
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
-    base_i64 = llvm_dialect.ptrtoint(i64, glb_ptr)
+    base_i64 = llvm_dialect.ptrtoint(T.i64, glb_ptr)
 
-    v_off_i64 = arith.extsi(i64, arith.unwrap(v_offset))
-    addr_i64 = arith.addi(base_i64, v_off_i64)
+    v_off_i64 = arith.extsi(T.i64, arith.unwrap(v_offset))
+    addr_i64 = base_i64 + v_off_i64
 
-    wave_off = arith.muli(arith.unwrap(wave_id), arith.unwrap(stride_v_32))
-    addr_i64 = arith.addi(addr_i64, arith.extsi(i64, wave_off))
+    wave_off = arith.unwrap(wave_id) * arith.unwrap(stride_v_32)
+    addr_i64 = addr_i64 + arith.extsi(T.i64, wave_off)
 
     return addr_i64
 
 
 def _k_tdm_setup(arg_K, k_offset, stride_k_seq, stride_k_32, wave_id):
     """Common K TDM setup: returns (dgroup1, addr_i64, stride_adv_i64)."""
-    i64 = ir.IntegerType.get_signless(64)
     k_dgroup1 = _build_tdm_dgroup1(_K_TDM_CONFIG, stride_k_seq)
     k_addr_i64 = _compute_k_global_addr(arg_K, k_offset, wave_id, stride_k_32)
-    stride_adv_i64 = arith.extsi(i64, arith.unwrap(stride_k_32))
+    stride_adv_i64 = arith.extsi(T.i64, arith.unwrap(stride_k_32))
     return k_dgroup1, k_addr_i64, stride_adv_i64
 
 
@@ -644,13 +594,13 @@ def _k_tdm_issue_pair(
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)
         if i == 0:
-            cur_addr = arith.addi(cur_addr, stride_adv_i64)
+            cur_addr = cur_addr + stride_adv_i64
 
     _s_wait_tensorcnt(wait_count)
     rocdl.s_barrier_signal(-1)
     rocdl.s_barrier_wait(-1)
 
-    return arith.addi(cur_addr, stride_adv_i64)
+    return cur_addr + stride_adv_i64
 
 
 def _phase_first_v_tdm_flydsl(
@@ -662,15 +612,14 @@ def _phase_first_v_tdm_flydsl(
     wave_id,
 ):
     """Issue 2 V TDM copies (Global → LDS) for V block 0."""
-    i64 = ir.IntegerType.get_signless(64)
     v_dgroup1 = _build_tdm_dgroup1(_V_TDM_CONFIG, stride_v_seq)
     v_addr_i64 = _compute_v_global_addr(arg_V, v_offset, wave_id, stride_v_32)
-    stride_adv_i64 = arith.extsi(i64, arith.unwrap(stride_v_32))
+    stride_adv_i64 = arith.extsi(T.i64, arith.unwrap(stride_v_32))
     pred = arith.constant(1, type=T.i32)
 
     lds_offsets = [
         v_lds_base,
-        arith.addi(v_lds_base, arith.constant(V_SU1_OFFSET, type=T.i32)),
+        v_lds_base + V_SU1_OFFSET,
     ]
 
     cur_addr = v_addr_i64
@@ -681,7 +630,7 @@ def _phase_first_v_tdm_flydsl(
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)
         if i < len(lds_offsets) - 1:
-            cur_addr = arith.addi(cur_addr, stride_adv_i64)
+            cur_addr = cur_addr + stride_adv_i64
 
 
 def _phase7_softmax_init_flydsl():
@@ -717,18 +666,17 @@ def _phase_v_tdm_blk1_flydsl(
     wave_id,
 ):
     """V TDM block 1 (2 copies)."""
-    i64 = ir.IntegerType.get_signless(64)
     v_dgroup1 = _build_tdm_dgroup1(_V_TDM_CONFIG, stride_v_seq)
     pred = arith.constant(1, type=T.i32)
 
-    v_blk_inc = arith.muli(arith.constant(K_TILE_N, type=T.i32), stride_v_seq)
-    v_offset_blk1 = arith.addi(v_offset, v_blk_inc)
+    v_blk_inc = K_TILE_N * stride_v_seq
+    v_offset_blk1 = v_offset + v_blk_inc
     v_addr_i64 = _compute_v_global_addr(arg_V, v_offset_blk1, wave_id, stride_v_32)
-    stride_adv_i64 = arith.extsi(i64, arith.unwrap(stride_v_32))
+    stride_adv_i64 = arith.extsi(T.i64, arith.unwrap(stride_v_32))
 
     lds_offsets = [
-        arith.addi(v_lds_base, arith.constant(2 * V_SU1_OFFSET, type=T.i32)),
-        arith.addi(v_lds_base, arith.constant(3 * V_SU1_OFFSET, type=T.i32)),
+        v_lds_base + (2 * V_SU1_OFFSET),
+        v_lds_base + (3 * V_SU1_OFFSET),
     ]
 
     cur_addr = v_addr_i64
@@ -739,7 +687,7 @@ def _phase_v_tdm_blk1_flydsl(
         rocdl.s_barrier_signal(-1)
         rocdl.s_barrier_wait(-1)
         if i < len(lds_offsets) - 1:
-            cur_addr = arith.addi(cur_addr, stride_adv_i64)
+            cur_addr = cur_addr + stride_adv_i64
 
     _s_wait_tensorcnt(4)
     rocdl.s_barrier_signal(-1)

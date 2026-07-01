@@ -26,6 +26,74 @@ if aiter.get_gfx() != "gfx1250":
 
 HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
+INPUT_DTYPE = "bf16"
+MXFP8_BLOCK_SIZE = 32
+MXFP8_SUB_Q = 256
+MXFP8_SUB_K = 128
+
+
+def _use_gfx1250_varlen_asm(causal):
+    return causal and HEAD_DIM_QK == 128 and HEAD_DIM_V == 128
+
+
+def _use_gfx1250_mxfp8_asm():
+    return INPUT_DTYPE == "mxfp8"
+
+
+def _align_to_tile(original, tile_size):
+    return (original + tile_size - 1) // tile_size * tile_size
+
+
+def _create_mxfp8_scale_buffer(
+    batch,
+    head_num,
+    seq_len,
+    head_dim,
+    sub_tile,
+    device,
+    extra_tiles=0,
+):
+    aligned_seq = _align_to_tile(batch * seq_len, sub_tile) + extra_tiles * sub_tile
+    num = aligned_seq * head_dim * head_num // MXFP8_BLOCK_SIZE
+    return torch.full((num,), 1.0, dtype=torch.float8_e8m0fnu, device=device)
+
+
+def _make_mxfp8_bshd_inputs(B, H, SQ, SK, random_value, device):
+    """Build bshd-shaped fp8 views backed by bhsd memory plus e8m0 descales."""
+    if random_value:
+        torch.manual_seed(42)
+        q_bhsd = torch.randn(B, H, SQ, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+        k_bhsd = torch.randn(B, H, SK, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+        v_bhsd = torch.randn(B, H, SK, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
+    else:
+        q_bhsd = torch.full(
+            (B, H, SQ, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device
+        )
+        k_bhsd = torch.full(
+            (B, H, SK, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device
+        )
+        v_bhsd = torch.full(
+            (B, H, SK, HEAD_DIM_V), 0.25, dtype=torch.bfloat16, device=device
+        )
+
+    q = q_bhsd.to(torch.float8_e4m3fn).transpose(1, 2)
+    k = k_bhsd.to(torch.float8_e4m3fn).transpose(1, 2)
+    v = v_bhsd.to(torch.float8_e4m3fn).transpose(1, 2)
+
+    q_scale = _create_mxfp8_scale_buffer(B, H, SQ, HEAD_DIM_QK, MXFP8_SUB_Q, device)
+    # Current MXFP8 K-scale kernel over-reads by 2 tiles; mirror its op_test padding.
+    k_scale = _create_mxfp8_scale_buffer(
+        B, H, SK, HEAD_DIM_QK, MXFP8_SUB_K, device, extra_tiles=2
+    )
+    v_scale = _create_mxfp8_scale_buffer(B, H, SK, HEAD_DIM_V, MXFP8_SUB_K, device)
+    return q, k, v, q_scale, k_scale, v_scale
+
+
+def _is_uniform_cu(cu):
+    if len(cu) <= 1:
+        return False
+    seqs = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
+    return all(s == seqs[0] for s in seqs)
 
 
 def _time_fn(fn, warmup, repeat):
@@ -80,11 +148,10 @@ def _ref_mha_varlen(q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False):
 
 
 def run_varlen_test(
-    cu_q_list, cu_k_list, H=1, causal=False, return_lse=False, warmup=1, repeat=5
+    cu_q_list, cu_k_list, H=1, causal=False, return_lse=False, warmup=1, repeat=5,
+    random_value=True,
 ):
     device = torch.device("cuda")
-    torch.manual_seed(42)
-
     cu_q, cu_k = cu_q_list, cu_k_list
     B = len(cu_q) - 1
     total_q, total_k = cu_q[-1], cu_k[-1]
@@ -92,9 +159,68 @@ def run_varlen_test(
     max_sq = max(cu_q[i + 1] - cu_q[i] for i in range(B))
     max_sk = max(cu_k[i + 1] - cu_k[i] for i in range(B))
 
-    q = torch.randn(total_q, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-    k = torch.randn(total_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-    v = torch.randn(total_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
+    if _use_gfx1250_mxfp8_asm():
+        if causal:
+            raise ValueError(
+                "fmha_fwd_mxfp8_d128.co is registered as mask=0 only; "
+                "use --dtype mxfp8 with --causal false."
+            )
+        if (HEAD_DIM_QK, HEAD_DIM_V) != (128, 128):
+            raise ValueError("--dtype mxfp8 only supports -d_qk_v 128,128.")
+        if not (_is_uniform_cu(cu_q) and _is_uniform_cu(cu_k)):
+            raise ValueError("--dtype mxfp8 requires fixed per-batch sequence lengths.")
+
+        SQ = cu_q[1] - cu_q[0]
+        SK = cu_k[1] - cu_k[0]
+        q, k, v, q_scale, k_scale, v_scale = _make_mxfp8_bshd_inputs(
+            B, H, SQ, SK, random_value, device
+        )
+        scale = 1.0 / math.sqrt(HEAD_DIM_QK)
+
+        def _run_mxfp8():
+            return aiter.fmha_fwd_mxfp8_asm(
+                q,
+                k,
+                v,
+                q_scale,
+                k_scale,
+                v_scale,
+                softmax_scale=scale,
+                is_causal=False,
+                return_lse=return_lse,
+            )
+
+        avg_ms = _time_fn(_run_mxfp8, warmup, repeat)
+        _run_mxfp8()
+
+        fwd_flop = _fwd_flops_varlen(cu_q, cu_k, H, HEAD_DIM_QK, HEAD_DIM_V, False)
+        fwd_tflops = _tflops(fwd_flop, avg_ms)
+        avg_us = avg_ms * 1000
+        seqs = [cu_q[i + 1] - cu_q[i] for i in range(B)]
+        tag = f"B={B} H={H} seqs={seqs} causal=False lse={return_lse} kernel=mxfp8"
+        print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
+        return True, {
+            "B": B,
+            "H": H,
+            "seqs_q": seqs,
+            "seqs_k": [cu_k[i + 1] - cu_k[i] for i in range(B)],
+            "causal": False,
+            "lse": return_lse,
+            "kernel": "mxfp8",
+            "avg_us": round(avg_us, 2),
+            "tflops": round(fwd_tflops, 2),
+            "pass": True,
+        }
+
+    if random_value:
+        torch.manual_seed(42)
+        q = torch.randn(total_q, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+        k = torch.randn(total_k, H, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+        v = torch.randn(total_k, H, HEAD_DIM_V, dtype=torch.bfloat16, device=device)
+    else:
+        q = torch.full((total_q, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
+        k = torch.full((total_k, H, HEAD_DIM_QK), 0.25, dtype=torch.bfloat16, device=device)
+        v = torch.full((total_k, H, HEAD_DIM_V), 0.25, dtype=torch.bfloat16, device=device)
 
     scale = 1.0 / math.sqrt(HEAD_DIM_QK)
 
@@ -102,6 +228,22 @@ def run_varlen_test(
     cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32, device=device)
 
     def _run():
+        if _use_gfx1250_varlen_asm(causal):
+            out, lse = aiter.fmha_fwd_with_sink_varlen_asm(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_sq,
+                scale,
+                True,
+                return_lse,
+                sink=None,
+            )
+            lse = lse.squeeze(-1)
+            return (out, lse) if return_lse else out
+
         return flash_attn_varlen_func(
             q,
             k,
@@ -128,7 +270,8 @@ def run_varlen_test(
     avg_us = avg_ms * 1000
 
     seqs = [cu_q[i + 1] - cu_q[i] for i in range(B)]
-    tag = f"B={B} H={H} seqs={seqs} causal={causal} lse={return_lse}"
+    kernel = "asm" if _use_gfx1250_varlen_asm(causal) else "flydsl"
+    tag = f"B={B} H={H} seqs={seqs} causal={causal} lse={return_lse} kernel={kernel}"
     print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
 
     ref_result = _ref_mha_varlen(
@@ -192,6 +335,7 @@ def run_varlen_test(
         "seqs_k": [cu_k[i + 1] - cu_k[i] for i in range(B)],
         "causal": causal,
         "lse": return_lse,
+        "kernel": kernel,
         "avg_us": round(avg_us, 2),
         "tflops": round(fwd_tflops, 2),
         "pass": passed,
@@ -257,8 +401,8 @@ if __name__ == "__main__":
         type=dtypes.str2tuple,
         nargs="+",
         default=[(192, 128)],
-        help="Dimension of query/key and value. Currently only 192,128 is supported.\n"
-        "e.g.: -d_qk_v 192,128",
+        help="Dimension of query/key and value. Supports 192,128 (FlyDSL) and "
+        "128,128 (gfx1250 ASM causal path).\ne.g.: -d_qk_v 128,128",
     )
     parser.add_argument(
         "-c",
@@ -297,13 +441,32 @@ if __name__ == "__main__":
         action="store_true",
         help="Also time Triton for each case and print speedup.",
     )
+    parser.add_argument(
+        "--random-value",
+        type=str,
+        default="true",
+        help="Use random input data (default true). Set false to use fixed 0.25.\n"
+        "e.g.: --random-value false",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=["bf16", "mxfp8"],
+        default="bf16",
+        help="Input/kernel dtype path: bf16 (default) or mxfp8. "
+        "mxfp8 uses fmha_fwd_mxfp8_d128.co and currently requires --causal false.",
+    )
     args = parser.parse_args()
 
+    INPUT_DTYPE = args.dtype
+    supported_dims = {(192, 128), (128, 128)}
+    if len(args.d_qk_v) != 1:
+        raise ValueError("Only one -d_qk_v value is supported for this script.")
     for d_qk_v in args.d_qk_v:
-        assert d_qk_v == (
-            192,
-            128,
-        ), f"Currently only D_qk=192, D_v=128 is supported, got {d_qk_v}"
+        assert d_qk_v in supported_dims, (
+            f"Supported D_qk,D_v values are {sorted(supported_dims)}, got {d_qk_v}"
+        )
+    HEAD_DIM_QK, HEAD_DIM_V = args.d_qk_v[0]
 
     def _parse_bool(s):
         if s is None:
@@ -312,6 +475,18 @@ if __name__ == "__main__":
 
     causal_filter = _parse_bool(args.causal)
     lse_filter = _parse_bool(args.return_lse)
+    if INPUT_DTYPE == "mxfp8":
+        if (HEAD_DIM_QK, HEAD_DIM_V) != (128, 128):
+            raise ValueError("--dtype mxfp8 only supports -d_qk_v 128,128.")
+        if causal_filter is True:
+            raise ValueError(
+                "fmha_fwd_mxfp8_d128.co is a non-causal (mask=0) kernel; "
+                "run with --dtype mxfp8 --causal false."
+            )
+        if causal_filter is None:
+            causal_filter = False
+    elif (HEAD_DIM_QK, HEAD_DIM_V) == (128, 128) and causal_filter is False:
+        raise ValueError("The gfx1250 ASM varlen path only supports causal=True.")
     single_shape = all(
         x is not None
         for x in [args.batch_size, args.nheads, args.seqlen_q, args.seqlen_k]
@@ -399,7 +574,10 @@ if __name__ == "__main__":
             ([0, 1], [0, 512], 128),
         ]
 
-    causal_list = [causal_filter] if causal_filter is not None else [False, True]
+    if (HEAD_DIM_QK, HEAD_DIM_V) == (128, 128) and causal_filter is None:
+        causal_list = [True]
+    else:
+        causal_list = [causal_filter] if causal_filter is not None else [False, True]
     lse_list = [lse_filter] if lse_filter is not None else [False, True]
 
     tests = []
@@ -426,6 +604,7 @@ if __name__ == "__main__":
                 return_lse=return_lse,
                 warmup=args.warmup,
                 repeat=args.repeat,
+                random_value=_parse_bool(args.random_value),
             )
             if args.cmp_triton:
                 device = torch.device("cuda")

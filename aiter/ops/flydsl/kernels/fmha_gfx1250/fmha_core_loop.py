@@ -276,20 +276,17 @@ def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
 
 
 def _get_types():
-    f32_ty = ir.F32Type.get()
-    bf16_ty = ir.BF16Type.get()
-    i32_ty = ir.IntegerType.get_signless(32)
     return {
-        "f32": f32_ty,
-        "bf16": bf16_ty,
-        "i32": i32_ty,
-        "v2f32": ir.VectorType.get([2], f32_ty),
-        "v2bf16": ir.VectorType.get([2], bf16_ty),
-        "v8f32": ir.VectorType.get([8], f32_ty),
-        "v8bf16": ir.VectorType.get([8], bf16_ty),
-        "v16bf16": ir.VectorType.get([16], bf16_ty),
-        "v4i32": ir.VectorType.get([4], i32_ty),
-        "v8i32": ir.VectorType.get([8], i32_ty),
+        "f32": T.f32,
+        "bf16": T.bf16,
+        "i32": T.i32,
+        "v2f32": T.vec(2, T.f32),
+        "v2bf16": T.vec(2, T.bf16),
+        "v8f32": T.vec(8, T.f32),
+        "v8bf16": T.vec(8, T.bf16),
+        "v16bf16": T.vec(16, T.bf16),
+        "v4i32": T.vec(4, T.i32),
+        "v8i32": T.vec(8, T.i32),
         "lds_ptr": ir.Type.parse("!llvm.ptr<3>"),
     }
 
@@ -300,7 +297,7 @@ def _get_types():
 
 
 def _make_v2f32(lo, hi, bank=0):
-    v2f32_ty = ir.VectorType.get([2], ir.F32Type.get())
+    v2f32_ty = T.vec(2, T.f32)
     idx_0 = arith.unwrap(arith.constant(0, type=T.i32))
     idx_1 = arith.unwrap(arith.constant(1, type=T.i32))
     undef = llvm_dialect.mlir_undef(v2f32_ty)
@@ -327,8 +324,7 @@ def _broadcast_f32_to_v2f32(val, bank=0):
 
 
 def make_wmma_frag_bf16(vec4_lo, vec4_hi):
-    bf16_ty = ir.BF16Type.get()
-    vec8_bf16_ty = ir.VectorType.get([8], bf16_ty)
+    vec8_bf16_ty = T.vec(8, T.bf16)
     v0 = vector.bitcast(vec8_bf16_ty, vec4_lo)
     v1 = vector.bitcast(vec8_bf16_ty, vec4_hi)
     return vector.shuffle(v0, v1, list(range_constexpr(16)))
@@ -500,7 +496,7 @@ def _atom_tdm_dim1_clamp(s_g1_2):
 def _atom_tdm_next_lds_addr(s_lds_part_offset, next_offset):
 
     result = _emit_result(
-        ir.IntegerType.get_signless(32),
+        T.i32,
         f"s_add_co_i32 $0, $1, {next_offset}",
         [s_lds_part_offset],
         "=s,s",
@@ -522,8 +518,7 @@ def _atom_tdm_set_lds_addr(s_g0, s_addr):
 def _atom_exp_f32(src, bank):
 
     _sched_barrier(0)
-    f32 = ir.F32Type.get()
-    result = _rocdl_exp2(f32, src)
+    result = _rocdl_exp2(T.f32, src)
     banked = set_vgpr_bank(result, bank)
     _sched_barrier(0)
 
@@ -603,11 +598,9 @@ def _atom_max_num_f32(src0, src1, bank):
 def _atom_permlanex16(src, s_sel0, s_sel1, bank):
 
     _sched_barrier(0)
-    i32_ty = ir.IntegerType.get_signless(32)
-    f32_ty = ir.F32Type.get()
-    src_i32 = llvm_dialect.bitcast(i32_ty, src)
-    r = _rocdl_permlanex16(i32_ty, src_i32, src_i32, s_sel0, s_sel1, False, False)
-    r_f32 = llvm_dialect.bitcast(f32_ty, r)
+    src_i32 = llvm_dialect.bitcast(T.i32, src)
+    r = _rocdl_permlanex16(T.i32, src_i32, src_i32, s_sel0, s_sel1, False, False)
+    r_f32 = llvm_dialect.bitcast(T.f32, r)
     # Use bank+2 so tmps[1] is in a DIFFERENT bank from tmps[0] (which is in `bank`).
     # This prevents LLVM from doing in-place permlanex16 (same VGPR for src and dst),
     # which would cause v_max_num_f32 v,v,v (self-max) in the subsequent max3.
@@ -654,7 +647,7 @@ def _atom_pk_mul_f32(a, b, bank):
 def _atom_cvt_pk_bf16_f32(a, bank):
     """v_cvt_pk_bf16_f32 via arith.truncf v2f32 → v2bf16."""
     _sched_barrier(0)
-    v2bf16_ty = ir.VectorType.get([2], ir.BF16Type.get())
+    v2bf16_ty = T.vec(2, T.bf16)
     r = arith.truncf(v2bf16_ty, a)
     banked = set_vgpr_bank(r, bank)
     _sched_barrier(0)
@@ -921,7 +914,7 @@ def _build_softmax_part2_ops(
     def op_save_old_max(b=bank):
         ss["old_max"][b] = _atom_mov_b32(ss["local_max"][b], b)
         _sched_barrier(0)
-        v2f32_ty = ir.VectorType.get([2], ir.F32Type.get())
+        v2f32_ty = T.vec(2, T.f32)
         idx_0 = arith.unwrap(arith.constant(0, type=T.i32))
         idx_1 = arith.unwrap(arith.constant(1, type=T.i32))
         undef = llvm_dialect.mlir_undef(v2f32_ty)
@@ -1030,9 +1023,9 @@ def _build_softmax_part2_ops(
 
             def op_exp_lo(pidx=_pidx, b=bank, _clo=sp_lo_cache):
                 lo, hi = _split_v2f32(sp_pairs[pidx])
-                v2f32_ty = ir.VectorType.get([2], ir.F32Type.get())
+                v2f32_ty = T.vec(2, T.f32)
                 _sched_barrier(0)
-                exp_lo = _rocdl_exp2(ir.F32Type.get(), lo)
+                exp_lo = _rocdl_exp2(T.f32, lo)
                 _sched_barrier(0)
                 undef = llvm_dialect.mlir_undef(v2f32_ty)
                 _idx0 = arith.unwrap(arith.constant(0, type=T.i32))
@@ -1048,9 +1041,9 @@ def _build_softmax_part2_ops(
 
             def op_exp_hi(pidx=_pidx, b=bank, _chi=sp_hi_cache):
                 lo, hi = _split_v2f32(sp_pairs[pidx])
-                v2f32_ty = ir.VectorType.get([2], ir.F32Type.get())
+                v2f32_ty = T.vec(2, T.f32)
                 _sched_barrier(0)
-                exp_hi = _rocdl_exp2(ir.F32Type.get(), hi)
+                exp_hi = _rocdl_exp2(T.f32, hi)
                 _sched_barrier(0)
                 undef = llvm_dialect.mlir_undef(v2f32_ty)
                 _idx0 = arith.unwrap(arith.constant(0, type=T.i32))

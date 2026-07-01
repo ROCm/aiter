@@ -32,6 +32,7 @@ from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
 
 __all__ = [
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_batch_func",
     "flydsl_flash_attn_varlen_func",
 ]
 
@@ -206,6 +207,88 @@ def flydsl_flash_attn_func(
     if seq_len_pad != seq_len_real:
         return o_p[:, :seq_len_real, :, :].contiguous()
     return o_p
+
+
+def flydsl_flash_attn_batch_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    return_lse: bool = False,
+    dropout_p: float = 0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    sink=None,
+):
+    """FlyDSL MHA forward, BSHD batch layout (gfx1250).
+
+    Thin wrapper: reshapes BSHD → THD, constructs uniform cu_seqlens,
+    calls the varlen kernel, and reshapes output back to BSHD.
+
+    Returns the result if FlyDSL can handle this configuration,
+    otherwise returns None so the caller falls through to Triton/CK.
+    """
+    from ...jit.utils.chip_info import get_gfx
+
+    supported = (
+        get_gfx() == "gfx1250"
+        and q.shape[-1] == 192
+        and v.shape[-1] == 128
+        and q.dtype == torch.bfloat16
+        and dropout_p == 0.0
+        and tuple(window_size[:2]) == (-1, -1)
+        and bias is None
+        and alibi_slopes is None
+        and sink is None
+        and not deterministic
+        and not return_attn_probs
+    )
+    if not supported:
+        return None
+
+    B, S_q, H_q, D_qk = q.shape
+    S_k = k.shape[1]
+
+    # BSHD → THD (zero-copy reshape)
+    q_thd = q.reshape(B * S_q, H_q, D_qk).contiguous()
+    k_thd = k.reshape(B * S_k, k.shape[2], k.shape[3]).contiguous()
+    v_thd = v.reshape(B * S_k, v.shape[2], v.shape[3]).contiguous()
+
+    # Uniform cu_seqlens for equal-length batches
+    cu_seqlens_q = torch.arange(
+        0, (B + 1) * S_q, S_q, dtype=torch.int32, device=q.device
+    )
+    cu_seqlens_k = torch.arange(
+        0, (B + 1) * S_k, S_k, dtype=torch.int32, device=q.device
+    )
+
+    out_thd = torch.empty(
+        B * S_q, H_q, v.shape[-1], dtype=torch.bfloat16, device=q.device
+    )
+
+    result = flash_attn_varlen_d192_gfx1250(
+        q_thd,
+        k_thd,
+        v_thd,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        S_q,
+        S_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        out=out_thd,
+        return_lse=return_lse,
+    )
+
+    if return_lse:
+        o, lse = result
+        # lse: [B*S_q, H] → [B, H, S_q] to match flash_attn_func convention
+        return o.reshape(B, S_q, H_q, -1), lse.reshape(B, S_q, H_q).permute(0, 2, 1)
+    return result.reshape(B, S_q, H_q, -1)
 
 
 def flydsl_flash_attn_varlen_func(

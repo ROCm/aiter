@@ -1,0 +1,11 @@
+Expected ASM registry: hsa/gfx1250/fmha_fwd_bf16_varlen/fmha_fwd_bf16_varlen.csv
+
+Registry contents:
+dtype,hdim_q,hdim_v,mask,knl_name,co_name
+bf16,64,64,1,_ZN5aiter42fmha_bf16_pertokenBf16_hd64_128x256_varlenE,fmha_bf16_pertokenBf16_hd64_128x256_varlen.co
+bf16,128,128,1,_ZN5aiter43fmha_bf16_pertokenBf16_hd128_128x256_varlenE,fmha_bf16_pertokenBf16_hd128_128x256_varlen.co
+
+Searching for fmha_bf16_pertokenBf16_hd128_128x256_varlen.co:
+[aiter] import [module_aiter_core] under /data/yanguahe/code/wk_sp1/aiter/aiter/jit/module_aiter_core.so
+/data/yanguahe/code/wk_sp1/aiter/hsa/gfx1250/fmha_fwd_bf16_varlen/fmha_bf16_pertokenBf16_hd128_128x256_varlen.co
+Using objdump: /opt/rocm/llvm/bin/llvm-objdump
