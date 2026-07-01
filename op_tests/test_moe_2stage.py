@@ -339,6 +339,8 @@ def test_fmoe(
         )
         ref_xbf16 = getattr(_metadata, "xbf16", False)
 
+    if ref_xbf16:
+        print(f"[test] ref_xbf16=True: using BF16 input ({input.dtype}) for reference instead of {a1_qt.dtype}")
     ref_a1 = input if ref_xbf16 else a1_qt
     ref_a1_scale = None if ref_xbf16 else a1_scale
 
