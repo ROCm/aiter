@@ -329,6 +329,10 @@ def test_fmoe(
     ref_bf16 = qType in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128)
     ref_a1 = input if ref_bf16 else a1_qt
     ref_a1_scale = None if ref_bf16 else a1_scale
+    print(f"[test_debug] ref_bf16={ref_bf16} ref_a1.dtype={ref_a1.dtype} ref_a1.shape={ref_a1.shape} "
+          f"ref_a1_scale={'None' if ref_a1_scale is None else f'{ref_a1_scale.shape}'} "
+          f"w1_qt.dtype={w1_qt.dtype} w1_qt.shape={w1_qt.shape} "
+          f"w1_qt_aiter.dtype={w1_qt_aiter.dtype} w1_qt_aiter.shape={w1_qt_aiter.shape}")
 
     out1_ref = torch_moe_stage1(
         ref_a1,
