@@ -907,20 +907,10 @@ def mla_decode_gluon(
             ), f"mla_decode_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
             NUM_KV_SPLITS = max(1, min(256 // (batch_size * qlen), min_kv_seq_len))
         else:  # bh16bn64
-            # NUM_KV_SPLITS for the small-batch / small-ctx (occupancy-bound) regime.
-            # The old formula split 1-per-block (cdiv(ctx,BLOCK_N)), which OVER-splits:
-            # latency here is dominated by fixed overhead (stage-1 pipeline prologue +
-            # the separate stage-2 reduce launch), NOT occupancy, so extra splits only
-            # pile on stage-2 reduction + intermediate-logits traffic. Measured (q1/b1,
-            # do_bench): ctx=256 s=1->15us vs cdiv=4->19us; ctx=4096 s=16->22.6us vs
-            # cdiv=64->29.7us; over-splitting to s=256 -> ~86us.
-            # Improved rule:
-            #   - very short seq (<= FAST_PATH_MAX_BLOCKS blocks): NUM_KV_SPLITS=1 so
-            #     the stage-1 fast path writes O directly and skips stage-2 entirely.
-            #   - else: >= MIN_BLOCKS_PER_SPLIT blocks per split (each WG amortizes its
-            #     fixed prologue/epilogue), capped by the ~256-WG occupancy budget.
-            # For large batch the occupancy cap 256//(batch*qlen) dominates, so this is
-            # identical to the old formula there (only small batch / large ctx changes).
+            # NUM_KV_SPLITS: avoid over-splitting (small batch/ctx is fixed-overhead
+            # bound, not occupancy bound). Very short seq -> 1 split (stage-1 fast
+            # path, no stage-2); else >= MIN_BLOCKS_PER_SPLIT blocks/split, capped by
+            # the ~256-WG occupancy budget (which dominates for large batch).
             FAST_PATH_MAX_BLOCKS = 4
             MIN_BLOCKS_PER_SPLIT = 2
             num_blocks = triton.cdiv(min_kv_seq_len, BLOCK_N)
@@ -936,13 +926,9 @@ def mla_decode_gluon(
             kv_c.dtype == kv_dtype and k_pe.dtype == kv_dtype
         ), f"kv_c/k_pe must be {kv_dtype}, got {kv_c.dtype}/{k_pe.dtype}"
 
-    # Optional NUM_KV_SPLITS override (tuning knob for the occupancy-bound regime:
-    # small batch * small ctx, where the auto formula caps splits at cdiv(ctx,BLOCK_N)
-    # and leaves the GPU under-occupied). Only honored for the bh16* regimes (bh64
-    # has a num_iter>=3 assume that a free override would violate). Clamped to
-    # [1, min_kv_seq_len] so every split stays non-empty (split_len = ctx //
-    # NUM_KV_SPLITS >= 1); splits beyond cdiv(ctx,BLOCK_N) create partial-block
-    # (masked) MFMA, which is free when the GPU would otherwise be idle.
+    # Optional NUM_KV_SPLITS override (tuning knob). Only for bh16* regimes (bh64's
+    # num_iter>=3 assume forbids it); clamped to [1, min_kv_seq_len] so every split
+    # stays non-empty.
     if num_kv_splits is not None and REGIME != "bh64":
         NUM_KV_SPLITS = max(1, min(int(num_kv_splits), min_kv_seq_len))
 
