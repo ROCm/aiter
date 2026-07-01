@@ -71,17 +71,30 @@ _RTOL = 5e-3
 # ---------------------------------------------------------------------------
 
 DSV4_SHAPES = [
-    # (label,       T,    H,    D,   kv_len)
-    ("T1-kv2k",      1,  128,  576,   2048),
-    ("T4-kv2k",      4,  128,  576,   2048),
-    ("T16-kv2k",    16,  128,  576,   2048),
-    ("T32-kv2k",    32,  128,  576,   2048),
-    ("T64-kv2k",    64,  128,  576,   2048),
-    ("T128-kv2k",  128,  128,  576,   2048),
-    ("T256-kv2k",  256,  128,  576,   2048),
-    ("T32-kv1k",    32,  128,  576,   1024),
-    ("T32-kv4k",    32,  128,  576,   4096),
-    ("T32-kv8k",    32,  128,  576,   8192),
+    #(label,       T,    H,    D,   kv_len)
+    ("T1-kv2k-d576",      1,  128,  576,   2048),
+    ("T2-kv2k-d576",      2,  128,  576,   2048),
+    ("T4-kv2k-d576",      4,  128,  576,   2048),
+    ("T16-kv2k-d576",    16,  128,  576,   2048),
+    ("T32-kv2k-d576",    32,  128,  576,   2048),
+    ("T64-kv2k-d576",    64,  128,  576,   2048),
+    ("T128-kv2k-d576",  128,  128,  576,   2048),
+    ("T256-kv2k-d576",  256,  128,  576,   2048),
+    ("T32-kv1k-d576",    32,  128,  576,   1024),
+    ("T32-kv4k-d576",    32,  128,  576,   4096),
+    ("T32-kv8k-d576",    32,  128,  576,   8192),
+
+    ("T1-kv2k-d512",      1,  128,  512,   2048),
+    ("T2-kv2k-d512",      2,  128,  512,   2048),
+    ("T4-kv2k-d512",      4,  128,  512,   2048),
+    ("T16-kv2k-d512",    16,  128,  512,   2048),
+    ("T32-kv2k-d512",    32,  128,  512,   2048),
+    ("T64-kv2k-d512",    64,  128,  512,   2048),
+    ("T128-kv2k-d512",  128,  128,  512,   2048),
+    ("T256-kv2k-d512",  256,  128,  512,   2048),
+    ("T32-kv1k-d512",    32,  128,  512,   1024),
+    ("T32-kv4k-d512",    32,  128,  512,   4096),
+    ("T32-kv8k-d512",    32,  128,  512,   8192),
 ]
 
 _FP8_DTYPE = torch.float8_e4m3fnuz
@@ -176,10 +189,12 @@ def _run_triton(q, unified_kv, kv_scales, indices, indptr, sink, scale, kv_split
     )
 
 
-def _run_flydsl(q, unified_kv, kv_scales, indices, indptr, sink, scale, kv_splits):
+def _run_flydsl(q, unified_kv, kv_scales, indices, indptr, sink, scale, kv_splits,
+               mfma_shape="16x16x16", n_waves=4):
     return flydsl_pa_decode_sparse(
         q, unified_kv, indices, indptr, sink, scale,
         kv_scales=kv_scales, kv_splits=kv_splits, skip_reduce=False,
+        mfma_shape=mfma_shape, n_waves=n_waves,
     )
 
 
@@ -228,7 +243,7 @@ def _verify_backend(backend_name, out, ref, triton_out=None):
 # ---------------------------------------------------------------------------
 
 def run_shape(label, T, H, D, kv_len, backend, kv_dtype, block_k, kv_splits,
-              skip_reduce, cfg, do_verify):
+              skip_reduce, cfg, do_verify, mfma_shape="16x16x16", n_waves=4):
     """Benchmark and optionally verify one shape.
 
     Returns:
@@ -242,6 +257,7 @@ def run_shape(label, T, H, D, kv_len, backend, kv_dtype, block_k, kv_splits,
         q, unified_kv, kv_scales, indices, indptr, sink, scale = make_inputs_bf16(T, H, D, kv_len)
         bw_bytes = _bytes_bf16(T, H, D, kv_len)
 
+    # block_k for triton; for flydsl it's auto-selected by mfma_shape
     bk     = block_k if block_k else (16 if D >= 256 else 32)
     n_tiles = T * triton.cdiv(kv_len, bk)
     flops  = 2.0 * n_tiles * H * D * bk + 2.0 * n_tiles * H * bk
@@ -249,7 +265,18 @@ def run_shape(label, T, H, D, kv_len, backend, kv_dtype, block_k, kv_splits,
     bench_results: dict = {}
     chk_results:   dict = {}
 
-    flydsl_ok = (D % 64 == 0)
+    if mfma_shape is not None:
+        from aiter.ops.flydsl.kernels.pa_decode_sparse import _MFMA_MAP
+        mfma = _MFMA_MAP[mfma_shape]
+        d_per_wave = D // n_waves if D % n_waves == 0 else 1
+        flydsl_ok = (
+            D % 64 == 0
+            and H % mfma.MFMA_M == 0
+            and D % n_waves == 0
+            and d_per_wave % mfma.MFMA_N == 0
+        )
+    else:
+        flydsl_ok = True  # mfma_shape=None means auto-select; assume it's valid
 
     # --- verification ---
     triton_out = flydsl_out = ref = None
@@ -272,7 +299,7 @@ def run_shape(label, T, H, D, kv_len, backend, kv_dtype, block_k, kv_splits,
                 if ref is None and kv_dtype != "fp8":
                     ref = _torch_reference(q, unified_kv, indices, indptr, sink, scale)
                 flydsl_out = _run_flydsl(q, unified_kv, kv_scales, indices, indptr, sink, scale,
-                                         kv_splits)
+                                         kv_splits, mfma_shape=mfma_shape, n_waves=n_waves)
                 ok = _verify_backend("flydsl", flydsl_out, ref,
                                      triton_out=triton_out if backend == "both" else None)
                 chk_results["flydsl"] = _CHK_PASS if ok else _CHK_FAIL
@@ -301,6 +328,7 @@ def run_shape(label, T, H, D, kv_len, backend, kv_dtype, block_k, kv_splits,
                 flydsl_pa_decode_sparse(
                     q, unified_kv, indices, indptr, sink, scale,
                     kv_scales=kv_scales, kv_splits=kv_splits, skip_reduce=skip_reduce,
+                    mfma_shape=mfma_shape, n_waves=n_waves,
                 )
             ms = _time_ms(fn_flydsl, cfg)
             bench_results["flydsl"] = (ms, bw_bytes / (ms * 1e-3) * 1e-9,
@@ -343,6 +371,8 @@ def run_benchmark(args):
     kv_splits   = args.kv_splits if args.kv_splits else None
     skip_reduce = args.skip_reduce
     do_verify   = not args.no_verify
+    mfma_shape  = args.mfma_shape
+    n_waves     = args.n_waves
 
     cfg = MeasureConfig(
         warmup_iters=args.warmup,
@@ -352,6 +382,94 @@ def run_benchmark(args):
 
     backends = ["triton", "flydsl"] if backend == "both" else [backend]
 
+    # When mfma_shape == "all", benchmark all three FlyDSL variants:
+    # 16x16x16/4w, 32x32x8/4w (D=512 only), 32x32x8/6w (D=576 only)
+    _ALL_FLYDSL_VARIANTS = [
+        ("16x16x16", 4),
+        ("32x32x8",  4),   # D=512: D_PER_WAVE=128, 4 chunks
+        ("32x32x8",  6),   # D=576: D_PER_WAVE=96,  3 chunks
+    ]
+
+    if mfma_shape == "all" and "flydsl" in backends:
+        # Run triton once + all three FlyDSL variants; display multi-variant comparison
+        all_bench_triton: dict = {}
+        all_bench_variants: dict = {}  # (mfma_shape, n_waves) -> {label: (T,H,D,kv_len,res,chk)}
+        all_pass = True
+
+        for label, T, H, D, kv_len in shapes:
+            # Triton
+            if "triton" in backends:
+                bench_res, chk_res = run_shape(
+                    label, T, H, D, kv_len,
+                    backend="triton", kv_dtype=kv_dtype,
+                    block_k=block_k, kv_splits=kv_splits,
+                    skip_reduce=skip_reduce, cfg=cfg,
+                    do_verify=do_verify,
+                )
+                all_bench_triton[label] = (T, H, D, kv_len, bench_res, chk_res)
+                for v in chk_res.values():
+                    if v == _CHK_FAIL:
+                        all_pass = False
+
+            # FlyDSL variants
+            for ms_shape, nw in _ALL_FLYDSL_VARIANTS:
+                key = (ms_shape, nw)
+                if key not in all_bench_variants:
+                    all_bench_variants[key] = {}
+                bench_res, chk_res = run_shape(
+                    label, T, H, D, kv_len,
+                    backend="flydsl", kv_dtype=kv_dtype,
+                    block_k=block_k, kv_splits=kv_splits,
+                    skip_reduce=skip_reduce, cfg=cfg,
+                    do_verify=do_verify,
+                    mfma_shape=ms_shape, n_waves=nw,
+                )
+                all_bench_variants[key][label] = (T, H, D, kv_len, bench_res, chk_res)
+                for v in chk_res.values():
+                    if v == _CHK_FAIL:
+                        all_pass = False
+
+        # Print comparison table
+        _HDR_ALL = (
+            f"{'Shape':<14} {'T':>4} {'H':>4} {'D':>4} {'kv_len':>7}"
+            f"   {'triton':>8} {'fl-16/4w':>9} {'fl-32/4w':>9} {'fl-32/6w':>9}"
+            f"   {'fl-16/tr':>9} {'fl-32/4w/tr':>11} {'fl-32/6w/tr':>11}"
+        )
+        _SEP_ALL = "-" * len(_HDR_ALL)
+        print(f"\n[FlyDSL mfma_shape=all vs triton — TFLOPS]")
+        print(_HDR_ALL)
+        print(_SEP_ALL)
+        for label, T, H, D, kv_len in shapes:
+            tr_res = all_bench_triton.get(label, (T, H, D, kv_len, {}, {}))[4].get("triton")
+            fl_results = {}
+            for ms_shape, nw in _ALL_FLYDSL_VARIANTS:
+                key = (ms_shape, nw)
+                fl_results[key] = all_bench_variants[key][label][4].get("flydsl")
+
+            tr_tf = f"{tr_res[2]:>8.3f}" if tr_res else f"{'N/A':>8}"
+            fl_tfs = []
+            for ms_shape, nw in _ALL_FLYDSL_VARIANTS:
+                r = fl_results[(ms_shape, nw)]
+                fl_tfs.append(f"{r[2]:>9.3f}" if r else f"{'N/A':>9}")
+            ratios = []
+            for ms_shape, nw in _ALL_FLYDSL_VARIANTS:
+                r = fl_results[(ms_shape, nw)]
+                if r and tr_res:
+                    ratios.append(f"{r[2]/tr_res[2]:>9.3f}×")
+                else:
+                    ratios.append(f"{'N/A':>9}")
+            print(
+                f"{label:<14} {T:>4} {H:>4} {D:>4} {kv_len:>7}"
+                f"   {tr_tf} {' '.join(fl_tfs)}"
+                f"   {' '.join(ratios)}"
+            )
+
+        if do_verify:
+            print()
+            print("Verification:", "ALL PASS" if all_pass else "SOME FAILURES")
+        return
+
+    # --- standard single-variant path ---
     # Run each shape once (verification + benchmark for all active backends),
     # then display a separate table per backend.
     all_bench: dict = {}   # label -> (bench_res, chk_res)
@@ -363,6 +481,7 @@ def run_benchmark(args):
             block_k=block_k, kv_splits=kv_splits,
             skip_reduce=skip_reduce, cfg=cfg,
             do_verify=do_verify,
+            mfma_shape=mfma_shape, n_waves=n_waves,
         )
         all_bench[label] = (T, H, D, kv_len, bench_res, chk_res)
         for v in chk_res.values():
@@ -386,7 +505,7 @@ def run_benchmark(args):
             f"   {'fl/tr':>6}"
         )
         _SEP_CMP = "-" * len(_HDR_CMP)
-        print(f"\n[comparison: flydsl vs triton]")
+        print(f"\n[comparison: flydsl ({mfma_shape}/{n_waves}w) vs triton]")
         print(_HDR_CMP)
         print(_SEP_CMP)
         for label, T, H, D, kv_len in shapes:
@@ -439,6 +558,13 @@ def parse_args():
 
     p.add_argument("--kv_dtype", choices=["bf16", "fp8"], default="bf16",
                    help="KV cache dtype (default: bf16); fp8 is Triton-only")
+
+    p.add_argument("--mfma_shape", choices=["16x16x16", "32x32x8", "all"], default=None,
+                   help="MFMA instruction shape for FlyDSL (default: 16x16x16); "
+                        "'all' benchmarks 16x16x16/4w + 32x32x8/4w(D=512) + 32x32x8/6w(D=576)")
+    p.add_argument("--n_waves", type=int, default=None,
+                   help="Number of wavefronts per CTA for FlyDSL (default: 4); "
+                        "ignored when --mfma_shape all")
 
     p.add_argument("--no-verify", action="store_true",
                    help="Disable correctness checks (useful for profiling)")

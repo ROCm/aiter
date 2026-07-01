@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import functools
 from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 
@@ -45,6 +47,47 @@ _LOG2E = 1.4426950408889634
 _NEG_INF = float("-inf")
 
 # ---------------------------------------------------------------------------
+# MfmaAtom: compile-time MFMA shape descriptor
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MfmaAtom:
+    name: str                              # e.g. "16x16x16", "32x32x8"
+    MFMA_M: int                            # output tile M rows (= BLOCK_H per CTA)
+    MFMA_N: int                            # output tile N cols (= BLOCK_K per CTA)
+    MFMA_K: int                            # K-reduction elements per MFMA call
+    ACC_ELEMS: int                         # accumulator f32 elements per lane (4 or 16)
+    fn_name: str                           # rocdl attribute name
+    shuffle_offsets: Tuple[int, ...]       # XOR offsets for softmax butterfly
+    acc_head_static_offsets: Tuple[int, ...] # head index within M-tile per acc elem
+    acc_head_group_stride: int             # lane_cgrp multiplier for head idx
+
+MFMA_16x16x16 = MfmaAtom(
+    name="16x16x16",
+    MFMA_M=16, MFMA_N=16, MFMA_K=16,
+    ACC_ELEMS=4,
+    fn_name="mfma_f32_16x16x16bf16_1k",
+    shuffle_offsets=(1, 2, 4, 8),
+    acc_head_static_offsets=(0, 1, 2, 3),
+    acc_head_group_stride=4,
+)
+
+MFMA_32x32x8 = MfmaAtom(
+    name="32x32x8",
+    MFMA_M=32, MFMA_N=32, MFMA_K=8,
+    ACC_ELEMS=16,
+    fn_name="mfma_f32_32x32x8bf16_1k",
+    shuffle_offsets=(1, 2, 4, 8, 16),
+    acc_head_static_offsets=(0,1,2,3, 8,9,10,11, 16,17,18,19, 24,25,26,27),
+    acc_head_group_stride=4,
+)
+
+_MFMA_MAP: dict[str, MfmaAtom] = {
+    "16x16x16": MFMA_16x16x16,
+    "32x32x8":  MFMA_32x32x8,
+}
+
+# ---------------------------------------------------------------------------
 # Helper: IfOp then-block context manager
 # ---------------------------------------------------------------------------
 
@@ -60,14 +103,16 @@ def _if_then(if_op):
                 scf.YieldOp([])
 
 # ---------------------------------------------------------------------------
-# MFMA-based kernel (BLOCK_H=16, 4-wave 256-thread design)
+# MFMA-based kernel (BLOCK_H=16, 4-wave 256-thread/6-wave 384-thread design)
 # ---------------------------------------------------------------------------
 #
 # Architecture summary
 # --------------------
 # Grid : (T, ceil(H/BLOCK_H), KV_SPLITS)   BLOCK_H=16 heads per CTA
-# Block: 256 threads (4 waves x 64 lanes)
-# MFMA : mfma_f32_16x16x16bf16_1k — 16x16x16 BF16 accumulate into 4xf32 per lane
+# Block: 256 threads (4 waves x 64 lanes) or 384 threads (6 waves x 64 lanes) depending on MFMA shape
+# MFMA shapes: 16x16x16 or 32x32x8
+#
+# MFMA 16x16x16: mfma_f32_16x16x16bf16_1k — 16x16x16 BF16 accumulate into 4xf32 per lane
 #
 # Thread layout:
 #   wave_id   = tid // 64        (0..3)
@@ -125,77 +170,58 @@ def _if_then(if_op):
 #   2. barrier after QK scores+KV   (scores_lds + kv_lds written by all waves)
 #   3. barrier after p write        (p_lds visible for PV A-frag transpose read)
 
-_MFMA_K = 16   # K-elements per MFMA call (gfx942 16x16x16 BF16)
-_BLOCK_H = 16  # heads per CTA (matches MFMA M/N tile size)
-
-def _get_mfma_bf16_k16():
-    """Return the mfma_f32_16x16x16bf16_1k MLIR op, or None on non-gfx942."""
-    fn = getattr(rocdl, "mfma_f32_16x16x16bf16_1k", None) or getattr(
-        rocdl, "mfma_f32_16x16x16_bf16_1k", None
-    )
-    return fn
-
 @functools.lru_cache(maxsize=256)
 def _compile_pa_decode_sparse_mfma(
     *,
-    H: int,          # actual number of heads (may be < _BLOCK_H)
+    H: int,          # actual number of heads
     D: int,
     BLOCK_K: int,
     KV_SPLITS: int,
     softmax_scale: float,
     quant_kv: bool = False,
+    mfma: MfmaAtom = MFMA_16x16x16,
+    n_waves: int = 4,
 ):
-    """JIT-compile the MFMA-based kernel (v3): BLOCK_H=16 heads per CTA, 4 waves.
+    """JIT-compile the MFMA-based sparse paged-decode attention kernel.
+
+    Parameterized over MfmaAtom shape and number of wavefronts per CTA.
+
+    Supported configurations:
+    - 16x16x16 / 4-wave: BLOCK_H=16, 256 threads, ~23KB LDS → 2 CTAs/CU
+    - 32x32x8  / 6-wave: BLOCK_H=32, 384 threads, ~63KB LDS → 1 CTA/CU
 
     Supports both bf16 KV (quant_kv=False) and fp8 KV with per-group scales
-    (quant_kv=True). The two paths differ only in Step 2 (KV VRAM load); all
-    other steps are identical. Python-level branching on quant_kv selects the
-    path at compile time; lru_cache keys on quant_kv so both paths are cached.
+    (quant_kv=True). The two paths differ only in Step 2 (KV VRAM load).
 
-    Returns a flyc.jit launcher, cached on configuration.
-
-    4-wave design (256 threads), VGPR accumulator, single kv_lds buffer:
-    - 4 waves x 64 lanes = 256 threads per CTA.
-    - Each wave handles D_PER_WAVE = D//4 D-columns for both QK and PV.
-    - KV tile loaded from VRAM → kv_lds (as bf16) during QK; reused for PV.
-    - Cross-wave QK partial scores via scores_lds (aliased with p_lds).
-    - Softmax runs redundantly on all 4 waves; p_lds written by all.
-    - Accumulator in VGPR ForOp iter-args (D_CHUNKS_W f32x4 values), no acc_lds.
-
-    BF16 path (quant_kv=False):
-    - unified_kv: [total_pages, D] bfloat16
-    - kv_scales:  not used (dummy tensor passed)
-
-    FP8 path (quant_kv=True):
-    - unified_kv: [total_pages, D] float8_e4m3fnuz (1 byte/elem)
-    - kv_scales:  [total_pages, D//GROUP_SIZE] float32 per-group absmax scales
-    - GROUP_SIZE = 64; N_GROUPS = D // 64
-    - Dequantizes KV fp8 → bf16 on load; stores bf16 in kv_lds (same layout).
-
-    LDS layout (23168 bytes < 32KB → 2 CTAs/CU):
-    - scores_lds [N_WAVES, BLOCK_H, BLOCK_K+1] f32 = 4352 bytes
-    - kv_lds     [BLOCK_K, D + KV_PAD] bf16 = 18688 bytes
-    - slots_lds  [BLOCK_K] i32 = 64 bytes
-    - valids_lds [BLOCK_K] i32 = 64 bytes
-
-    ForOp iter-args: [m_i x 4, l_i x 4, acc_dc0, ..., acc_dc8] = 44 values.
+    Returns a flyc.jit launcher, cached on (mfma, n_waves, quant_kv, ...).
     """
-    assert D % _MFMA_K == 0, f"D={D} must be divisible by MFMA_K={_MFMA_K}"
-    assert D % 4 == 0, f"D={D} must be divisible by 4 waves"
+    _BLOCK_H  = mfma.MFMA_M
+    _MFMA_K   = mfma.MFMA_K
+    _MFMA_N   = mfma.MFMA_N   # N-dimension of MFMA (= number of D-cols per c_frag)
+    ACC_ELEMS = mfma.ACC_ELEMS
+    N_WAVES   = n_waves
+    BLOCK_THREADS_MFMA = WAVE_SIZE * N_WAVES
+    D_PER_WAVE = D // N_WAVES
+    # D_CHUNKS_W: number of acc D-chunks per wave. Each acc chunk covers MFMA_N D-columns.
+    # For QK: MFMA_N/MFMA_K inner calls per D-chunk reduce over that chunk's D-columns.
+    # For PV: 1 MFMA call per D-chunk covers MFMA_N D-columns (lane_row = 0..MFMA_N-1).
+    D_CHUNKS_W  = D_PER_WAVE // _MFMA_N
+    # Number of QK MFMA calls per acc D-chunk (= MFMA_N // MFMA_K, always integer)
+    QK_CALLS_PW = _MFMA_N // _MFMA_K
+
+    assert D % N_WAVES == 0, f"D={D} must be divisible by N_WAVES={N_WAVES}"
+    assert D_PER_WAVE % _MFMA_N == 0, f"D_PER_WAVE={D_PER_WAVE} must be divisible by MFMA_N={_MFMA_N}"
+    assert _MFMA_N % _MFMA_K == 0, f"MFMA_N={_MFMA_N} must be divisible by MFMA_K={_MFMA_K}"
     assert BLOCK_K == _BLOCK_H, (
         f"MFMA kernel requires BLOCK_K == BLOCK_H == {_BLOCK_H}; got BLOCK_K={BLOCK_K}"
     )
     if quant_kv:
         assert D % 64 == 0, f"D={D} must be divisible by GROUP_SIZE=64 for fp8 quantization"
 
-    mfma_fn = _get_mfma_bf16_k16()
-    assert mfma_fn is not None, "mfma_f32_16x16x16bf16_1k not found in rocdl"
+    mfma_fn = getattr(rocdl, mfma.fn_name, None)
+    assert mfma_fn is not None, f"{mfma.fn_name} not found in rocdl"
 
     fm = arith.FastMathFlags.fast
-    N_WAVES       = 4
-    D_PER_WAVE    = D // N_WAVES          # D-columns per wave (144 for D=576)
-    D_CHUNKS_W    = D_PER_WAVE // _MFMA_K  # K-chunks per wave (9 for D=576)
-    BLOCK_THREADS_MFMA = WAVE_SIZE * N_WAVES     # 256
 
     # FP8 quantization parameters (only relevant when quant_kv=True)
     GROUP_SIZE = 64
@@ -207,16 +233,12 @@ def _compile_pa_decode_sparse_mfma(
     KV_ROW_STRIDE    = D + KV_PAD
     ALIAS_ROW_STRIDE = BLOCK_K + 1
 
-    SCORES_LDS_BYTES = N_WAVES * _BLOCK_H * ALIAS_ROW_STRIDE * 4   # 4352 bytes
-    KV_LDS_BYTES     = BLOCK_K * KV_ROW_STRIDE * 2                  # 18688 bytes
-
-    assert SCORES_LDS_BYTES + KV_LDS_BYTES + 2 * BLOCK_K * 4 <= 32768, (
-        f"LDS budget exceeded 32KB: {SCORES_LDS_BYTES + KV_LDS_BYTES + 2*BLOCK_K*4}"
-    )
+    SCORES_LDS_BYTES = N_WAVES * _BLOCK_H * ALIAS_ROW_STRIDE * 4
+    KV_LDS_BYTES     = BLOCK_K * KV_ROW_STRIDE * 2
 
     _kv_tag = "fp8" if quant_kv else "bf16"
     allocator = SmemAllocator(None, arch=GPU_ARCH,
-        global_sym_name=f"pa_decode_sparse_mfma4w_v3_{_kv_tag}_smem_D{D}_K{BLOCK_K}_S{KV_SPLITS}")
+        global_sym_name=f"pa_decode_sparse_{mfma.name}_{N_WAVES}w_{_kv_tag}_smem_D{D}_K{BLOCK_K}_S{KV_SPLITS}")
     lds_scores_off = allocator._align(allocator.ptr, 16)
     allocator.ptr  = lds_scores_off + SCORES_LDS_BYTES
     lds_kv_off     = allocator._align(allocator.ptr, 16)
@@ -225,19 +247,31 @@ def _compile_pa_decode_sparse_mfma(
     allocator.ptr  = lds_slots_off + BLOCK_K * 4
     lds_valids_off = allocator._align(allocator.ptr, 16)
     allocator.ptr  = lds_valids_off + BLOCK_K * 4
-    lds_p_off      = lds_scores_off   # p_lds aliases the base of scores_lds
+    # p_lds aliases the base of scores_lds (first wave's region).
+    # Safe because all waves finish reading scores_lds before any wave writes p_lds
+    # (enforced by the barrier inserted between the read and write phases below).
+    lds_p_off      = lds_scores_off
 
-    # ---- Helpers ----
+    # ---- Helpers (defined inside kernel context to avoid MLIR type construction
+    #      before the context is established) ----
     def _fexp2(x):
         return mlir_llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [x], [], [])
 
-    def _mfma_bf16(a_v4bf16, b_v4bf16, acc_v4f32):
-        """mfma_f32_16x16x16bf16_1k: A,B as v4i16 (bitcast from v4bf16)."""
-        a_vi16 = vector.bitcast(T.vec(4, T.i16), a_v4bf16)
-        b_vi16 = vector.bitcast(T.vec(4, T.i16), b_v4bf16)
-        return mfma_fn(T.f32x4, [a_vi16, b_vi16, acc_v4f32, 0, 0, 0])
+    def _acc_vec_type():
+        """vec<ACC_ELEMS, f32> — called inside kernel body where MLIR context is active."""
+        return T.vec(ACC_ELEMS, T.f32)
 
-    _kname = f"pa_decode_sparse_mfma16x16x16_4w_v3_{_kv_tag}_H{H}_D{D}_K{BLOCK_K}_S{KV_SPLITS}"
+    def _kfrag_vec_type():
+        """vec<4, bf16> — the MFMA K-fragment is always 4 bf16 elements per lane group."""
+        return T.vec(4, T.bf16)
+
+    def _mfma_bf16(a_vbf16, b_vbf16, acc_vf32):
+        """Call the MFMA instruction. A,B as v4i16 (bitcast from v4bf16); acc as vec<ACC_ELEMS,f32>."""
+        a_vi16 = vector.bitcast(T.vec(4, T.i16), a_vbf16)
+        b_vi16 = vector.bitcast(T.vec(4, T.i16), b_vbf16)
+        return mfma_fn(_acc_vec_type(), [a_vi16, b_vi16, acc_vf32, 0, 0, 0])
+
+    _kname = f"pa_decode_sparse_{mfma.name}_{N_WAVES}w_{_kv_tag}_H{H}_D{D}_K{BLOCK_K}_S{KV_SPLITS}"
 
     @flyc.kernel(name=_kname, known_block_size=[BLOCK_THREADS_MFMA, 1, 1])
     def _kernel(
@@ -338,12 +372,16 @@ def _compile_pa_decode_sparse_mfma(
             lds_valids = STensor(SmemPtr(lds_base, lds_valids_off, T.i32, shape=(BLOCK_K,)),
                 dtype=T.i32, shape=(BLOCK_K,))
 
-            # ---- Init m_i[4], l_i[4] ----
+            # ---- Init m_i[ACC_ELEMS], l_i[ACC_ELEMS] ----
             sink_rsrc_init = buffer_ops.create_buffer_resource(attn_sink, max_size=True) if KV_SPLITS == 1 else None
             m_inits = []
             l_inits = []
-            for _v in range_constexpr(4):
-                h_v = arith.addi(h_base, arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(_v, type=i32)))
+            for _v in range_constexpr(ACC_ELEMS):
+                _head_local = mfma.acc_head_static_offsets[_v]
+                h_v = arith.addi(h_base, arith.addi(
+                    arith.muli(lane_cgrp, arith.constant(mfma.acc_head_group_stride, type=i32)),
+                    arith.constant(_head_local, type=i32),
+                ))
                 h_v_valid = arith.cmpi(CmpIPredicate.slt, h_v, cH_i32)
                 if KV_SPLITS == 1:
                     h_v_safe = arith.minsi(h_v, arith.subi(cH_i32, c1_i32))
@@ -358,7 +396,7 @@ def _compile_pa_decode_sparse_mfma(
             # ---- Accumulator VGPR init (zero vectors, one per D-chunk per wave) ----
             acc_inits = []
             for _dc in range_constexpr(D_CHUNKS_W):
-                acc_inits.append(arith.constant_vector(0.0, T.f32x4))
+                acc_inits.append(arith.constant_vector(0.0, _acc_vec_type()))
 
             # ---- Buffer resources ----
             idx_rsrc = buffer_ops.create_buffer_resource(kv_indices, max_size=True)
@@ -369,14 +407,14 @@ def _compile_pa_decode_sparse_mfma(
             kv_end_m1 = arith.subi(arith.addi(kv_start, kv_len), c1_i32)
 
             # ---- KV tile loop ----
-            # ForOp iter-args: [m_i×4, l_i×4, acc_dc0..acc_dc8] = 44 values
+            # ForOp iter-args: [m_i×ACC_ELEMS, l_i×ACC_ELEMS, acc_dc0..acc_dc{D_CHUNKS_W-1}]
             for tile_idx, loop_state in range(
                 _to_raw(tile_start), _to_raw(tile_end), 1,
                 init=m_inits + l_inits + acc_inits,
             ):
-                m_i   = [loop_state[v]      for v in range_constexpr(4)]
-                l_i   = [loop_state[4 + v]  for v in range_constexpr(4)]
-                acc_i = [loop_state[8 + dc] for dc in range_constexpr(D_CHUNKS_W)]
+                m_i   = [loop_state[v]                for v  in range_constexpr(ACC_ELEMS)]
+                l_i   = [loop_state[ACC_ELEMS + v]    for v  in range_constexpr(ACC_ELEMS)]
+                acc_i = [loop_state[2*ACC_ELEMS + dc] for dc in range_constexpr(D_CHUNKS_W)]
 
                 tile_i32    = arith.index_cast(i32, _to_raw(tile_idx))
                 k_tile_base = arith.muli(tile_i32, cBK_i32)
@@ -409,83 +447,89 @@ def _compile_pa_decode_sparse_mfma(
                 # NOTE: slot read before barrier is safe — same wave wrote it above.
                 # Other waves will barrier before reading.
 
-                c_zero_bf16  = arith.constant(0.0, type=T.bf16)
-                c_zero_v4f32 = arith.constant_vector(0.0, T.f32x4)
-                c_frag = c_zero_v4f32
+                c_zero_bf16 = arith.constant(0.0, type=T.bf16)
+                c_frag = arith.constant_vector(0.0, _acc_vec_type())
 
-                qk_col_offs = []
+                # -- QK MFMA: accumulate S[BLOCK_H, BLOCK_K] = Q[BLOCK_H, D] x KV[D, BLOCK_K]
+                # Outer loop: dc over D_CHUNKS_W acc D-chunks (each chunk = MFMA_N D-columns).
+                # Inner loop: kk over QK_CALLS_PW calls per chunk (each call covers MFMA_K D-cols).
+                # kv_lds is also populated here (all MFMA_N D-cols per chunk row written).
+                kv_row_base = arith.muli(lane_row, cKVRS_i32)
 
                 for dc in range_constexpr(D_CHUNKS_W):
-                    d_base_const = dc * _MFMA_K
-                    col_off = arith.addi(
-                        d_wave_base,
-                        arith.addi(arith.constant(d_base_const, type=i32),
-                                   arith.muli(lane_cgrp, c4_i32)),
-                    )
-                    qk_col_offs.append(col_off)
+                    for kk in range_constexpr(QK_CALLS_PW):
+                        # D-column base for this inner call: dc*MFMA_N + kk*MFMA_K
+                        d_base_const = dc * _MFMA_N + kk * _MFMA_K
+                        col_off = arith.addi(
+                            d_wave_base,
+                            arith.addi(arith.constant(d_base_const, type=i32),
+                                       arith.muli(lane_cgrp, c4_i32)),
+                        )
 
-                    # Q A-frag: VRAM load
-                    flat_q = arith.addi(
-                        arith.muli(t, cHD_i32),
-                        arith.addi(arith.muli(h_lane, cD_i32), col_off),
-                    )
-                    dw_q  = arith.divsi(flat_q, c2_i32)
-                    raw_q = buffer_ops.buffer_load(q_rsrc, dw_q, vec_width=2, dtype=i32)
-                    q_v4  = vector.bitcast(T.vec(4, T.bf16), raw_q)
-                    q_vals = []
-                    for v in range_constexpr(4):
-                        elem = vector.extract(q_v4, static_position=[v], dynamic_position=[])
-                        q_vals.append(arith.select(h_valid, elem, c_zero_bf16))
-                    qk_a_frags = vector.from_elements(T.vec(4, T.bf16), q_vals)
+                        # Q A-frag: VRAM load (4 bf16 at col_off)
+                        flat_q = arith.addi(
+                            arith.muli(t, cHD_i32),
+                            arith.addi(arith.muli(h_lane, cD_i32), col_off),
+                        )
+                        dw_q  = arith.divsi(flat_q, c2_i32)
+                        raw_q = buffer_ops.buffer_load(q_rsrc, dw_q, vec_width=2, dtype=i32)
+                        q_v4  = vector.bitcast(T.vec(4, T.bf16), raw_q)
+                        q_vals = []
+                        for v in range_constexpr(4):
+                            elem = vector.extract(q_v4, static_position=[v], dynamic_position=[])
+                            q_vals.append(arith.select(h_valid, elem, c_zero_bf16))
+                        qk_a_frags = vector.from_elements(T.vec(4, T.bf16), q_vals)
 
-                    # KV VRAM → kv_lds[lane_row, col_off:+4] (bf16 or dequantized fp8)
-                    kv_row_base = arith.muli(lane_row, cKVRS_i32)
-                    qk_kv_v4s = None  # set in if/else below
-                    if quant_kv:
-                        # FP8 path: load 4 fp8 bytes as i32, dequantize to bf16
-                        flat_kv_byte = arith.addi(arith.muli(safe_slot_qk, cD_i32), col_off)
-                        raw_kv_i32   = buffer_ops.buffer_load(kv_rsrc,
-                                           arith.divsi(flat_kv_byte, c4_i32),
-                                           vec_width=1, dtype=i32)
-                        # Scale: kv_scales[slot, group_g], group_g = (d_wave_base + dc*16) // 64
-                        dc_col_i32  = arith.addi(d_wave_base, arith.constant(dc * _MFMA_K, type=i32))
-                        group_g_i32 = arith.divsi(dc_col_i32, cGS_i32)
-                        scale_v     = buffer_ops.buffer_load(scl_rsrc,
-                                          arith.addi(arith.muli(safe_slot_qk, cNG_i32), group_g_i32),
-                                          vec_width=1, dtype=f32)
-                        bf16_vals = []
-                        for v in range_constexpr(4):
-                            f32_v  = rocdl.cvt_f32_fp8(T.f32, raw_kv_i32, v)
-                            bf16_v = arith.truncf(T.bf16, arith.mulf(f32_v, scale_v, fastmath=fm))
-                            kv_flat = arith.addi(kv_row_base, arith.addi(col_off, arith.constant(v, type=i32)))
-                            lds_kv[fx.Index(kv_flat)] = bf16_v
-                            bf16_vals.append(bf16_v)
-                        qk_kv_v4s = vector.from_elements(T.vec(4, T.bf16), bf16_vals)
-                    else:
-                        # BF16 path: load 4 bf16 as i32×2, write to kv_lds
-                        flat_kv = arith.addi(arith.muli(safe_slot_qk, cD_i32), col_off)
-                        raw_kv  = buffer_ops.buffer_load(kv_rsrc, arith.divsi(flat_kv, c2_i32),
-                                                         vec_width=2, dtype=i32)
-                        kv_v4   = vector.bitcast(T.vec(4, T.bf16), raw_kv)
-                        for v in range_constexpr(4):
-                            kv_elem = vector.extract(kv_v4, static_position=[v], dynamic_position=[])
-                            kv_flat = arith.addi(kv_row_base, arith.addi(col_off, arith.constant(v, type=i32)))
-                            lds_kv[fx.Index(kv_flat)] = kv_elem
-                        # Collect B-frag from just-written kv_lds
-                        b_vals_qk = []
-                        for v in range_constexpr(4):
-                            kv_flat_r = arith.addi(kv_row_base, arith.addi(col_off, arith.constant(v, type=i32)))
-                            b_vals_qk.append(lds_kv[fx.Index(kv_flat_r)])
-                        qk_kv_v4s = vector.from_elements(T.vec(4, T.bf16), b_vals_qk)
+                        # KV VRAM → kv_lds[lane_row, col_off:+4] and QK B-frag
+                        qk_kv_v4s = None  # set in if/else below
+                        if quant_kv:
+                            # FP8 path: load 4 fp8 bytes as i32, dequantize to bf16
+                            flat_kv_byte = arith.addi(arith.muli(safe_slot_qk, cD_i32), col_off)
+                            raw_kv_i32   = buffer_ops.buffer_load(kv_rsrc,
+                                               arith.divsi(flat_kv_byte, c4_i32),
+                                               vec_width=1, dtype=i32)
+                            dc_col_i32  = arith.addi(d_wave_base, arith.constant(d_base_const, type=i32))
+                            group_g_i32 = arith.divsi(dc_col_i32, cGS_i32)
+                            scale_v     = buffer_ops.buffer_load(scl_rsrc,
+                                              arith.addi(arith.muli(safe_slot_qk, cNG_i32), group_g_i32),
+                                              vec_width=1, dtype=f32)
+                            bf16_vals = []
+                            for v in range_constexpr(4):
+                                f32_v  = rocdl.cvt_f32_fp8(T.f32, raw_kv_i32, v)
+                                bf16_v = arith.truncf(T.bf16, arith.mulf(f32_v, scale_v, fastmath=fm))
+                                kv_flat = arith.addi(kv_row_base, arith.addi(col_off, arith.constant(v, type=i32)))
+                                lds_kv[fx.Index(kv_flat)] = bf16_v
+                                bf16_vals.append(bf16_v)
+                            qk_kv_v4s = vector.from_elements(T.vec(4, T.bf16), bf16_vals)
+                        else:
+                            # BF16 path: load 4 bf16 as i32×2, write to kv_lds
+                            flat_kv = arith.addi(arith.muli(safe_slot_qk, cD_i32), col_off)
+                            raw_kv  = buffer_ops.buffer_load(kv_rsrc, arith.divsi(flat_kv, c2_i32),
+                                                             vec_width=2, dtype=i32)
+                            kv_v4   = vector.bitcast(T.vec(4, T.bf16), raw_kv)
+                            for v in range_constexpr(4):
+                                kv_elem = vector.extract(kv_v4, static_position=[v], dynamic_position=[])
+                                kv_flat = arith.addi(kv_row_base, arith.addi(col_off, arith.constant(v, type=i32)))
+                                lds_kv[fx.Index(kv_flat)] = kv_elem
+                            # Collect B-frag from just-written kv_lds
+                            b_vals_qk = []
+                            for v in range_constexpr(4):
+                                kv_flat_r = arith.addi(kv_row_base, arith.addi(col_off, arith.constant(v, type=i32)))
+                                b_vals_qk.append(lds_kv[fx.Index(kv_flat_r)])
+                            qk_kv_v4s = vector.from_elements(T.vec(4, T.bf16), b_vals_qk)
 
-                    # Execute the MFMA for this D-chunk (per wave, 4x4 output per lane)
-                    c_frag = _mfma_bf16(qk_a_frags, qk_kv_v4s, c_frag)
+                        # Execute QK MFMA for this D sub-chunk (accumulate into c_frag)
+                        c_frag = _mfma_bf16(qk_a_frags, qk_kv_v4s, c_frag)
 
                 # -- Step 3: Write partial QK scores to scores_lds --
-                # c_frag[v] = partial S[head=lane_cgrp*4+v, kv_slot=lane_row] over D/4 columns.
+                # c_frag[v] = partial S[head, kv_slot=lane_row] for this wave's D-slice.
                 # scores_lds flat: wave*BLOCK_H*ALIAS_ROW_STRIDE + head*ALIAS_ROW_STRIDE + kv
-                for v in range_constexpr(4):
-                    head_idx  = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
+                for v in range_constexpr(ACC_ELEMS):
+                    _head_off_v = mfma.acc_head_static_offsets[v]
+                    head_idx  = arith.addi(
+                        arith.muli(lane_cgrp, arith.constant(mfma.acc_head_group_stride, type=i32)),
+                        arith.constant(_head_off_v, type=i32),
+                    )
                     scores_flat = arith.addi(
                         arith.muli(wave_id, arith.constant(_BLOCK_H * ALIAS_ROW_STRIDE, type=i32)),
                         arith.addi(arith.muli(head_idx, cARS_i32), lane_row),
@@ -495,16 +539,26 @@ def _compile_pa_decode_sparse_mfma(
 
                 gpu.barrier()   # scores_lds + kv_lds written by all waves
 
-                # -- Steps 4+5: Cross-wave reduce + softmax + p_lds write (fused, per-v) --
-                # Each value v is independent: reduce → softmax → store to p_lds immediately.
-                # Fusing eliminates the c_frag_scaled and p_vals_v4 temporaries and lets
-                # the LDS reads for v+1 issue while v's VALU chain executes.
-                m_new = []
-                alpha = []
-                l_new = []
+                # -- Steps 4+5: Cross-wave reduce + softmax + p_lds write --
+                # Phase A: Read all scores_lds partials and compute softmax values (VGPR only).
+                # Phase B: Barrier to ensure all waves finish reading scores_lds before any
+                #          wave writes p_lds (p_lds aliases scores_lds[wave=0] region).
+                # Phase C: Write all p_lds values.
+                # Phase D: Barrier before PV step reads p_lds.
+                m_new    = []
+                alpha    = []
+                l_new    = []
+                pj_vals  = []   # softmax probabilities; written to p_lds in phase C
+                head_idxs = []  # head indices for p_lds write (reused in phase C)
 
-                for v in range_constexpr(4):
-                    head_idx = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
+                # Phase A: read scores_lds, compute softmax — no LDS writes yet
+                for v in range_constexpr(ACC_ELEMS):
+                    _head_off_v = mfma.acc_head_static_offsets[v]
+                    head_idx = arith.addi(
+                        arith.muli(lane_cgrp, arith.constant(mfma.acc_head_group_stride, type=i32)),
+                        arith.constant(_head_off_v, type=i32),
+                    )
+                    head_idxs.append(head_idx)
 
                     # Sum N_WAVES partials from scores_lds
                     partial_sum = c_zero_f32
@@ -518,10 +572,10 @@ def _compile_pa_decode_sparse_mfma(
                                        arith.mulf(partial_sum, c_scale_l2, fastmath=fm),
                                        c_neg_inf)
 
-                    # Butterfly max over kv (lane_row) dim
+                    # Butterfly max over kv (lane_row) dim — shuffle within wavefront (width=WAVE_SIZE)
                     s_max_v = s_v
-                    for xor_off in [1, 2, 4, 8]:
-                        peer    = _to_raw(ArithValue(s_max_v).shuffle_xor(xor_off, BLOCK_THREADS_MFMA))
+                    for xor_off in mfma.shuffle_offsets:
+                        peer    = _to_raw(ArithValue(s_max_v).shuffle_xor(xor_off, WAVE_SIZE))
                         s_max_v = arith.maximumf(s_max_v, peer)
 
                     m_new_v  = arith.maximumf(m_i[v], s_max_v)
@@ -533,68 +587,91 @@ def _compile_pa_decode_sparse_mfma(
                                              _fexp2(arith.subf(s_v, m_new_v)),
                                              c_zero_f32)
 
-                    # Butterfly sum_p over kv dim
+                    # Butterfly sum_p over kv dim — shuffle within wavefront (width=WAVE_SIZE)
                     sum_p_vv = pj_safe_v
-                    for xor_off in [1, 2, 4, 8]:
-                        peer     = _to_raw(ArithValue(sum_p_vv).shuffle_xor(xor_off, BLOCK_THREADS_MFMA))
+                    for xor_off in mfma.shuffle_offsets:
+                        peer     = _to_raw(ArithValue(sum_p_vv).shuffle_xor(xor_off, WAVE_SIZE))
                         sum_p_vv = arith.addf(sum_p_vv, peer, fastmath=fm)
 
                     m_new.append(m_new_v)
                     alpha.append(alpha_v)
                     l_new.append(arith.addf(arith.mulf(l_i[v], alpha_v, fastmath=fm), sum_p_vv, fastmath=fm))
+                    pj_vals.append(pj_safe_v)
 
-                    # Write p to p_lds immediately
-                    p_flat = arith.addi(arith.muli(head_idx, cARS_i32), lane_row)
-                    lds_p[fx.Index(p_flat)] = pj_safe_v
+                # Phase B: all waves finished reading scores_lds; safe to write p_lds
+                gpu.barrier()
+
+                # Phase C: write p_lds (aliases scores_lds[wave=0] region — now safe)
+                for v in range_constexpr(ACC_ELEMS):
+                    p_flat = arith.addi(arith.muli(head_idxs[v], cARS_i32), lane_row)
+                    lds_p[fx.Index(p_flat)] = pj_vals[v]
 
                 gpu.barrier()   # p_lds visible for PV
 
                 # -- Step 6: PV MFMA (per wave, reading KV from kv_lds) --
-                # A-frag: p[M=lane_row, K=lane_cgrp*4..+3] from p_lds (transposed)
-                # B-frag: KV[kv_slot=lane_cgrp*4+v, d_col] from kv_lds
-                a_vals_p_common = []
-                for v in range_constexpr(4):
-                    kv_k     = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
-                    p_flat_r = arith.addi(arith.muli(lane_row, cARS_i32), kv_k)
-                    a_vals_p_common.append(arith.truncf(T.bf16, lds_p[fx.Index(p_flat_r)]))
-                a_frag_pv_common = vector.from_elements(T.vec(4, T.bf16), a_vals_p_common)
-
-                pv_b_frags = []
-                for dc in range_constexpr(D_CHUNKS_W):
-                    d_base_i32 = arith.addi(d_wave_base, arith.constant(dc * _MFMA_K, type=i32))
-                    d_col_i32  = arith.addi(d_base_i32, lane_row)
-                    b_vals_pv = []
-                    for v in range_constexpr(4):
-                        kv_slot_pv = arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32))
-                        kv_flat_pv = arith.addi(arith.muli(kv_slot_pv, cKVRS_i32), d_col_i32)
-                        b_vals_pv.append(lds_kv[fx.Index(kv_flat_pv)])
-                    pv_b_frags.append(vector.from_elements(T.vec(4, T.bf16), b_vals_pv))
+                # For each acc D-chunk dc, accumulate QK_CALLS_PW MFMA calls (inner kk loop).
+                # kk-th call:
+                #   A-frag: p[M=lane_row, K=kk*MFMA_K + lane_cgrp*4..+3] from p_lds
+                #   B-frag: KV[K=kk*MFMA_K + lane_cgrp*4..+3, N=d_wave_base+dc*MFMA_N+lane_row]
 
                 new_acc = []
                 for dc in range_constexpr(D_CHUNKS_W):
+                    d_base_i32 = arith.addi(d_wave_base, arith.constant(dc * _MFMA_N, type=i32))
+                    d_col_i32  = arith.addi(d_base_i32, lane_row)
+
+                    # Scale acc from previous tile
                     acc_frag = acc_i[dc]
                     acc_scaled = []
-                    for v in range_constexpr(4):
+                    for v in range_constexpr(ACC_ELEMS):
                         val = vector.extract(acc_frag, static_position=[v], dynamic_position=[])
                         acc_scaled.append(arith.mulf(val, alpha[v], fastmath=fm))
-                    acc_frag_scaled = vector.from_elements(T.f32x4, acc_scaled)
-                    new_acc.append(_mfma_bf16(a_frag_pv_common, pv_b_frags[dc], acc_frag_scaled))
+                    acc_cur = vector.from_elements(_acc_vec_type(), acc_scaled)
+
+                    # QK_CALLS_PW inner MFMA calls, each covering MFMA_K kv-slots
+                    for kk in range_constexpr(QK_CALLS_PW):
+                        kk_off = kk * _MFMA_K  # kv-slot base for this inner call
+
+                        # A-frag: p[head=lane_row, kv=kk_off + lane_cgrp*4..+3]
+                        a_vals_pv = []
+                        for v in range_constexpr(4):
+                            kv_k     = arith.addi(arith.muli(lane_cgrp, c4_i32),
+                                                  arith.constant(kk_off + v, type=i32))
+                            p_flat_r = arith.addi(arith.muli(lane_row, cARS_i32), kv_k)
+                            a_vals_pv.append(arith.truncf(T.bf16, lds_p[fx.Index(p_flat_r)]))
+                        a_frag_pv = vector.from_elements(_kfrag_vec_type(), a_vals_pv)
+
+                        # B-frag: KV[kv=kk_off + lane_cgrp*4..+3, d_col]
+                        b_vals_pv = []
+                        for v in range_constexpr(4):
+                            kv_slot_pv = arith.addi(arith.muli(lane_cgrp, c4_i32),
+                                                    arith.constant(kk_off + v, type=i32))
+                            kv_flat_pv = arith.addi(arith.muli(kv_slot_pv, cKVRS_i32), d_col_i32)
+                            b_vals_pv.append(lds_kv[fx.Index(kv_flat_pv)])
+                        b_frag_pv = vector.from_elements(_kfrag_vec_type(), b_vals_pv)
+
+                        acc_cur = _mfma_bf16(a_frag_pv, b_frag_pv, acc_cur)
+
+                    new_acc.append(acc_cur)
 
                 loop_state = yield m_new + l_new + new_acc
 
-            m_final     = [loop_state[v]      for v in range_constexpr(4)]
-            l_final     = [loop_state[4 + v]  for v in range_constexpr(4)]
-            acc_final   = [loop_state[8 + dc] for dc in range_constexpr(D_CHUNKS_W)]
+            m_final   = [loop_state[v]                for v  in range_constexpr(ACC_ELEMS)]
+            l_final   = [loop_state[ACC_ELEMS + v]    for v  in range_constexpr(ACC_ELEMS)]
+            acc_final = [loop_state[2*ACC_ELEMS + dc] for dc in range_constexpr(D_CHUNKS_W)]
 
             # ---- Output ----
             if KV_SPLITS == 1:
                 out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
-                for v in range_constexpr(4):
-                    h_v       = arith.addi(h_base, arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32)))
+                for v in range_constexpr(ACC_ELEMS):
+                    _head_off_v = mfma.acc_head_static_offsets[v]
+                    h_v       = arith.addi(h_base, arith.addi(
+                        arith.muli(lane_cgrp, arith.constant(mfma.acc_head_group_stride, type=i32)),
+                        arith.constant(_head_off_v, type=i32),
+                    ))
                     h_v_valid = arith.cmpi(CmpIPredicate.slt, h_v, cH_i32)
                     l_safe_v  = arith.maximumf(l_final[v], c_eps)
                     for dc in range_constexpr(D_CHUNKS_W):
-                        d_base_i32 = arith.addi(d_wave_base, arith.constant(dc * _MFMA_K, type=i32))
+                        d_base_i32 = arith.addi(d_wave_base, arith.constant(dc * _MFMA_N, type=i32))
                         d_col_i32  = arith.addi(d_base_i32, lane_row)
                         acc_val    = vector.extract(acc_final[dc], static_position=[v], dynamic_position=[])
                         out_f32    = arith.divf(acc_val, l_safe_v)
@@ -610,8 +687,12 @@ def _compile_pa_decode_sparse_mfma(
                 ap_rsrc = buffer_ops.create_buffer_resource(acc_partial, max_size=True)
                 mp_rsrc = buffer_ops.create_buffer_resource(m_partial, max_size=True)
                 lp_rsrc = buffer_ops.create_buffer_resource(l_partial, max_size=True)
-                for v in range_constexpr(4):
-                    h_v       = arith.addi(h_base, arith.addi(arith.muli(lane_cgrp, c4_i32), arith.constant(v, type=i32)))
+                for v in range_constexpr(ACC_ELEMS):
+                    _head_off_v = mfma.acc_head_static_offsets[v]
+                    h_v       = arith.addi(h_base, arith.addi(
+                        arith.muli(lane_cgrp, arith.constant(mfma.acc_head_group_stride, type=i32)),
+                        arith.constant(_head_off_v, type=i32),
+                    ))
                     h_v_valid = arith.cmpi(CmpIPredicate.slt, h_v, cH_i32)
                     _if_hv    = scf.IfOp(_to_raw(h_v_valid), results_=[], has_else=False)
                     with _if_then(_if_hv):
@@ -626,7 +707,7 @@ def _compile_pa_decode_sparse_mfma(
                             buffer_ops.buffer_store(l_final[v], lp_rsrc, ml_flat)
 
                         for dc in range_constexpr(D_CHUNKS_W):
-                            d_base_i32 = arith.addi(d_wave_base, arith.constant(dc * _MFMA_K, type=i32))
+                            d_base_i32 = arith.addi(d_wave_base, arith.constant(dc * _MFMA_N, type=i32))
                             d_col_i32  = arith.addi(d_base_i32, lane_row)
                             acc_val    = vector.extract(acc_final[dc], static_position=[v], dynamic_position=[])
                             ap_flat    = arith.addi(arith.muli(ml_flat, cD_i32), d_col_i32)
@@ -644,7 +725,7 @@ def _compile_pa_decode_sparse_mfma(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
 
-        n_head_blocks = (H + _BLOCK_H - 1) // _BLOCK_H
+        n_head_blocks = (H + _BLOCK_H - 1) // _BLOCK_H  # _BLOCK_H = mfma.MFMA_M, captured in closure
         _kernel(
             q, unified_kv, kv_scales, kv_indices, kv_indptr, attn_sink,
             m_partial, l_partial, acc_partial, out,
@@ -679,10 +760,12 @@ def flydsl_pa_decode_sparse(
     softmax_scale,
     *,
     kv_scales=None,
-    block_h=None,    # unused (BLOCK_H=1 is fixed); kept for API parity
+    block_h=None,        # unused (BLOCK_H fixed by mfma shape); kept for API parity
     kv_splits=None,
     has_invalid=False,   # sentinel support not yet implemented
     skip_reduce=False,
+    mfma_shape = None,  # "16x16x16" or "32x32x8"
+    n_waves = None,     # 4 or 6 are generally the supported wave configs.
 ):
     """FlyDSL sparse paged-decode attention.
 
@@ -713,6 +796,37 @@ def flydsl_pa_decode_sparse(
     if has_invalid:
         raise NotImplementedError("has_invalid=True not yet implemented in FlyDSL kernel")
 
+    if mfma_shape is None:
+        # For T=1, we use 32x32x8 shape, otherwise 16x16x16 shape is generally better for T>1.
+        # 32x32x8 shape requires n_waves = 6
+        if q.shape[0] == 1:
+            assert n_waves is None or n_waves == 6 or n_waves == 4, (
+                f"mfma_shape=None auto-selects 32x32x8 for T=1, which requires n_waves=6 or n_wave=4; "
+                f"got n_waves={n_waves}"
+            )
+            # Select number of waves based on D. We must have  D % n_waves == 0.
+            # Prefer 6 waves for better occupancy, but if D is not divisible by 6, fall back to 4 waves.
+            if q.shape[2] % 6 == 0:
+                n_waves = 6
+            elif q.shape[2] % 4 == 0:
+                n_waves = 4
+            else:
+                raise ValueError(
+                    f"mfma_shape=None auto-selects 32x32x8 for T=1, which requires n_waves=6 or n_wave=4; "
+                    f"got n_waves={n_waves} and D={q.shape[2]} is not divisible by 6 or 4"
+                )
+            mfma = _MFMA_MAP["32x32x8"]
+        else:
+            assert n_waves is None or n_waves == 4, (
+                f"mfma_shape=None auto-selects 16x16x16 for T>1, which requires n_waves=4; "
+                f"got n_waves={n_waves}"
+            )
+            n_waves = 4
+            mfma = _MFMA_MAP["16x16x16"]
+    else:
+        mfma = _MFMA_MAP[mfma_shape]
+        assert n_waves is not None, "n_waves must be specified when mfma_shape is specified"
+
     T_val, H, D = q.shape
     device = q.device
 
@@ -722,21 +836,26 @@ def flydsl_pa_decode_sparse(
     )
 
     # ---- block_k selection ----
-    # MFMA kernel: BLOCK_H=16, BLOCK_K=16. Requires H divisible by 16 and D divisible by 16.
-    assert D % _MFMA_K == 0 and _get_mfma_bf16_k16() is not None and H % _BLOCK_H == 0, "For MFMA kernel, D must be divisible by 16 and H must be divisible by 16"
-    block_k = _BLOCK_H
+    # BLOCK_K == MFMA_N == MFMA_M for all supported shapes.
+    block_k = mfma.MFMA_N
+    assert D % mfma.MFMA_K == 0, f"D={D} must be divisible by MFMA_K={mfma.MFMA_K}"
+    assert D % n_waves == 0, f"D={D} must be divisible by n_waves={n_waves}"
+    assert H % mfma.MFMA_M == 0, (
+        f"H={H} must be divisible by MFMA_M={mfma.MFMA_M} for mfma_shape={mfma_shape}"
+    )
 
     # ---- kv_splits auto-selection ----
     # Target: keep total CTAs near max_num_wg for good GPU utilization.
-    # MFMA uses n_head_blocks = ceil(H/16) CTAs per token, vs H for scalar.
-    # This reduces parallelism 16x -> compensate with more kv_splits.
-    max_occupancy = 2 # We can schedule 2 CTAs per CU
-    num_cus = 304 # gfx942 has 304 CUs
+    # Larger MFMA tiles reduce head parallelism; compensate with more kv_splits.
+    lds_estimate = (n_waves * mfma.MFMA_M * (mfma.MFMA_N + 1) * 4 +
+                    block_k * (D + 8) * 2 + 2 * block_k * 4)
+    max_occupancy = 1 if lds_estimate > 32768 else 2
+    num_cus = 304  # gfx942 has 304 CUs
     max_num_wg = max_occupancy * num_cus
+    n_head_blocks = (H + mfma.MFMA_M - 1) // mfma.MFMA_M
     if kv_splits is None:
         max_kv_len    = kv_indices.shape[0]
         max_kv_splits = max(1, (max_kv_len + block_k - 1) // block_k)
-        n_head_blocks = (H + _BLOCK_H - 1) // _BLOCK_H
         kv_splits     = max(1, max_num_wg // max(1, T_val * n_head_blocks))
         kv_splits     = max(kv_splits, 2)
         kv_splits     = min(max_kv_splits, kv_splits)
@@ -761,6 +880,8 @@ def flydsl_pa_decode_sparse(
         KV_SPLITS=kv_splits,
         softmax_scale=float(softmax_scale),
         quant_kv=kv_scales is not None,
+        mfma=mfma,
+        n_waves=n_waves,
     )
     # The merged kernel always takes kv_scales; pass a dummy 1-element tensor for bf16.
     kv_scales_arg = kv_scales if kv_scales is not None else q.new_empty(1, dtype=torch.float32)

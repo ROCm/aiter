@@ -15,7 +15,12 @@ import pytest
 import torch
 import triton
 
-from aiter.ops.flydsl.kernels.pa_decode_sparse import flydsl_pa_decode_sparse
+from aiter.ops.flydsl.kernels.pa_decode_sparse import (
+    flydsl_pa_decode_sparse,
+    MFMA_16x16x16,
+    MFMA_32x32x8,
+    _MFMA_MAP,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -209,17 +214,29 @@ def _make_inputs(
 
 # D=512 and D=576 are both divisible by BLOCK_THREADS=64.
 # D=576 matches the DSv4 MLA head dimension (kv_lora_rank=512 + rope_rank=64).
+@pytest.mark.parametrize("mfma_shape,n_waves", [
+    ("16x16x16", 4),
+    ("32x32x8",  6),   # D=576 only (96 cols/wave, 3 chunks, ~63KB LDS)
+    ("32x32x8",  4),   # D=512 only (128 cols/wave, 4 chunks, ~50KB LDS)
+])
 @pytest.mark.parametrize("T", [1, 2, 32, 64])
 @pytest.mark.parametrize("H", [16, 128])
 @pytest.mark.parametrize("D", [512, 576])
 @pytest.mark.parametrize("kv_len", [100, 400, 1024])
 @pytest.mark.parametrize("var_len", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
-def test_flydsl_pa_decode_sparse_vs_reference(T, H, D, kv_len, var_len, skip_reduce):
+def test_flydsl_pa_decode_sparse_vs_reference(mfma_shape, n_waves, T, H, D, kv_len, var_len, skip_reduce):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if D % 64 != 0:
         pytest.skip(f"D={D} not divisible by BLOCK_THREADS=64")
+    mfma = _MFMA_MAP[mfma_shape]
+    if H % mfma.MFMA_M != 0:
+        pytest.skip(f"H={H} not divisible by MFMA_M={mfma.MFMA_M} for mfma_shape={mfma_shape}")
+    if D % n_waves != 0:
+        pytest.skip(f"D={D} not divisible by n_waves={n_waves}")
+    if (D // n_waves) % mfma.MFMA_N != 0:
+        pytest.skip(f"D_PER_WAVE={D // n_waves} not divisible by MFMA_N={mfma.MFMA_N}")
 
     pages = T * kv_len
     q, ukv, indices, indptr, sink, scale = _make_inputs(
@@ -235,12 +252,14 @@ def test_flydsl_pa_decode_sparse_vs_reference(T, H, D, kv_len, var_len, skip_red
         sink,
         scale,
         skip_reduce=skip_reduce,
+        mfma_shape=mfma_shape,
+        n_waves=n_waves,
     )
 
     if isinstance(result, tuple):
         # skip_reduce with kv_splits > 1: partials returned; combine in torch.
         acc_partial, m_partial, l_partial = result
-        block_k = 16 if D >= 256 else 32
+        block_k = mfma.MFMA_N
         out = _reduce_partials_torch(
             acc_partial, m_partial, l_partial, sink, indptr, block_k
         ).to(q.dtype)
