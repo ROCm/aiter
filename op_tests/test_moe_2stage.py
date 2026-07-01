@@ -277,7 +277,14 @@ def test_fmoe(
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif qType == aiter.QuantType.per_128x128:
-        pass  # DEBUG: skip shuffle to verify if it matters
+        # dev-platform 16x16 tile shuffle: group elements into contiguous 16x16 tiles
+        def devplat_shuffle(x):
+            E_dim, N, K = x.shape
+            x = x.view(E_dim, N // 16, 16, K // 16, 16)
+            x = x.permute(0, 1, 3, 2, 4).contiguous()
+            return x.view(E_dim, N, K)
+        w1_qt_aiter = devplat_shuffle(w1_qt_aiter)
+        w2_qt_aiter = devplat_shuffle(w2_qt_aiter)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
