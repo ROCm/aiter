@@ -17,7 +17,7 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
+from chip_info import build_tune_dict, get_gfx, write_lookup_header  # noqa: E402
 
 from gemm_a8w8_common import (  # noqa: E402
     default_kernels_dict_cktile,
@@ -115,10 +115,20 @@ torch::Tensor
 
 """
 
-        TILE_INSTANCE = f"""using TileGemmInstance = TileGemmConfig<
+        # Automatically determine K_Warp_Tile based on arch and type
+        if k.M_Warp_Tile == 32 and k.N_Warp_Tile == 32:
+            K_Warp_Tile = "16"
+        elif k.M_Warp_Tile == 16 and k.N_Warp_Tile == 16:
+            if get_gfx().startswith("gfx95"):
+                K_Warp_Tile = "std::is_same_v<ABDataType, TILE_I8> ? 64 : 128"
+            else:
+                K_Warp_Tile = "32"
+
+        TILE_INSTANCE = f"""constexpr ck_tile::index_t K_Warp_Tile = {K_Warp_Tile};
+    using TileGemmInstance = TileGemmConfig<
             {k.M_Tile}, {k.N_Tile}, {k.K_Tile},
             {k.M_Warp}, {k.N_Warp}, {k.K_Warp},
-            {k.M_Warp_Tile}, {k.N_Warp_Tile}, {k.K_Warp_Tile},
+            {k.M_Warp_Tile}, {k.N_Warp_Tile}, K_Warp_Tile,
             {str(k.TiledMMAPermuteN).lower()},
             {str(k.TransposeC).lower()},
             {str(k.UsePersistentKernel).lower()},
@@ -180,7 +190,7 @@ template torch::Tensor
             for EDtype in ["TILE_BF16", "TILE_FP16"]:
                 for ABDtype in ["TILE_FP8", "TILE_I8"]:
                     for DDtype in ["TILE_FP32", EDtype]:
-                        intsance = INSTANCE_template.format(
+                        instance = INSTANCE_template.format(
                             name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}, true"
                         )
                         Path(
@@ -188,7 +198,7 @@ template torch::Tensor
                                 self.instances_path,
                                 f"{k.name}_ab{ABDtype}_d{DDtype}_e{EDtype}.cpp",
                             )
-                        ).write_text(intsance)
+                        ).write_text(instance)
 
     def gen_lookup_dict(self, kernels_dict: dict):
         LOOKUP_head = """#pragma once
