@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" font-family="-apple-system,Segoe UI,Roboto,sans-serif">
+<rect x="0" y="0" width="760" height="500" fill="#ffffff"/>
+<text x="20" y="22" font-size="15" font-weight="700" fill="#222">Jagged-Dense BMM backward — hierarchical roofline (bf16, MI300X gfx942)</text>
+<line x1="70.0" y1="34" x2="70.0" y2="420" stroke="#ededed"/>
+<line x1="160.0" y1="34" x2="160.0" y2="420" stroke="#ededed"/>
+<line x1="250.0" y1="34" x2="250.0" y2="420" stroke="#ededed"/>
+<line x1="340.0" y1="34" x2="340.0" y2="420" stroke="#ededed"/>
+<line x1="430.0" y1="34" x2="430.0" y2="420" stroke="#ededed"/>
+<line x1="520.0" y1="34" x2="520.0" y2="420" stroke="#ededed"/>
+<line x1="610.0" y1="34" x2="610.0" y2="420" stroke="#ededed"/>
+<line x1="700.0" y1="34" x2="700.0" y2="420" stroke="#ededed"/>
+<line x1="70" y1="420.0" x2="700" y2="420.0" stroke="#ededed"/>
+<line x1="70" y1="364.9" x2="700" y2="364.9" stroke="#ededed"/>
+<line x1="70" y1="309.7" x2="700" y2="309.7" stroke="#ededed"/>
+<line x1="70" y1="254.6" x2="700" y2="254.6" stroke="#ededed"/>
+<line x1="70" y1="199.4" x2="700" y2="199.4" stroke="#ededed"/>
+<line x1="70" y1="144.3" x2="700" y2="144.3" stroke="#ededed"/>
+<line x1="70" y1="89.1" x2="700" y2="89.1" stroke="#ededed"/>
+<line x1="70" y1="34.0" x2="700" y2="34.0" stroke="#ededed"/>
+<text x="70.0" y="435" font-size="10" fill="#888" text-anchor="middle">8</text>
+<text x="160.0" y="435" font-size="10" fill="#888" text-anchor="middle">16</text>
+<text x="250.0" y="435" font-size="10" fill="#888" text-anchor="middle">32</text>
+<text x="340.0" y="435" font-size="10" fill="#888" text-anchor="middle">64</text>
+<text x="430.0" y="435" font-size="10" fill="#888" text-anchor="middle">128</text>
+<text x="520.0" y="435" font-size="10" fill="#888" text-anchor="middle">256</text>
+<text x="610.0" y="435" font-size="10" fill="#888" text-anchor="middle">512</text>
+<text x="700.0" y="435" font-size="10" fill="#888" text-anchor="middle">1024</text>
+<text x="62" y="423.0" font-size="10" fill="#888" text-anchor="end">16</text>
+<text x="62" y="367.9" font-size="10" fill="#888" text-anchor="end">32</text>
+<text x="62" y="312.7" font-size="10" fill="#888" text-anchor="end">64</text>
+<text x="62" y="257.6" font-size="10" fill="#888" text-anchor="end">128</text>
+<text x="62" y="202.4" font-size="10" fill="#888" text-anchor="end">256</text>
+<text x="62" y="147.3" font-size="10" fill="#888" text-anchor="end">512</text>
+<text x="62" y="92.1" font-size="10" fill="#888" text-anchor="end">1024</text>
+<text x="62" y="37.0" font-size="10" fill="#888" text-anchor="end">2048</text>
+<text x="385" y="452" font-size="12" fill="#555" text-anchor="middle">Arithmetic intensity — FLOP / byte (HBM), log scale</text>
+<text x="18" y="227" font-size="12" fill="#555" text-anchor="middle" transform="rotate(-90 18 227)">Performance — TFLOP/s (bf16), log scale</text>
+<line x1="70.0" y1="69.7" x2="700.0" y2="69.7" stroke="#aaaaaa" stroke-width="1.25" stroke-dasharray="2 5"/>
+<text x="698.0" y="65.7" font-size="10" fill="#aaaaaa" text-anchor="end">datasheet 1307</text>
+<line x1="70.0" y1="106.2" x2="700.0" y2="106.2" stroke="#444" stroke-width="2.0"/>
+<text x="698.0" y="102.2" font-size="10" fill="#444" text-anchor="end">f16 / ≈true bf16  827</text>
+<line x1="70.0" y1="151.3" x2="700.0" y2="151.3" stroke="#c2c2c2" stroke-width="1.25" stroke-dasharray="5 4"/>
+<text x="698.0" y="147.3" font-size="10" fill="#c2c2c2" text-anchor="end">bf16 tool 469 (artifact)</text>
+<line x1="70.0" y1="361.8" x2="605.1" y2="34.0" stroke="#2E79B5" stroke-width="2.25"/>
+<text x="609.1" y="46.0" font-size="10" fill="#2E79B5">HBM 4.15 TB/s</text>
+<line x1="70.0" y1="224.9" x2="381.5" y2="34.0" stroke="#b8b8b8" stroke-width="1.25" stroke-dasharray="5 4"/>
+<text x="384.5" y="31.0" font-size="10" fill="#b8b8b8">L2 23.24 TB/s</text>
+<line x1="70.0" y1="140.2" x2="243.4" y2="34.0" stroke="#b8b8b8" stroke-width="1.25" stroke-dasharray="5 4"/>
+<text x="246.4" y="31.0" font-size="10" fill="#b8b8b8">LDS 67.33 TB/s</text>
+<circle cx="413.7" cy="151.3" r="3" fill="#999"/>
+<text x="419.7" y="163.3" font-size="9" fill="#999">ridge 113</text>
+<circle cx="487.3" cy="106.2" r="3" fill="#999"/>
+<text x="493.3" y="118.2" font-size="9" fill="#999">ridge 199</text>
+<line x1="355.8" y1="221.0" x2="355.8" y2="186.7" stroke="#2E79B5" stroke-width="1" stroke-dasharray="3 3"/>
+<circle cx="355.8" cy="186.7" r="2.5" fill="none" stroke="#2E79B5"/>
+<circle cx="355.8" cy="221.0" r="6" fill="#2E79B5" stroke="#fff" stroke-width="1.5"/>
+<text x="365.8" y="225.0" font-size="11" font-weight="600" fill="#222">dDense+dBias</text>
+<text x="365.8" y="239.0" font-size="9" fill="#888">195 TF/s · 65% of HBM roof</text>
+<line x1="395.4" y1="199.0" x2="395.4" y2="162.5" stroke="#D0672A" stroke-width="1" stroke-dasharray="3 3"/>
+<circle cx="395.4" cy="162.5" r="2.5" fill="none" stroke="#D0672A"/>
+<circle cx="395.4" cy="199.0" r="6" fill="#D0672A" stroke="#fff" stroke-width="1.5"/>
+<text x="405.4" y="203.0" font-size="11" font-weight="600" fill="#222">dJagged</text>
+<text x="405.4" y="217.0" font-size="9" fill="#888">258 TF/s · 63% of HBM roof</text>
+<rect x="70" y="34" width="630" height="386" fill="none" stroke="#ccc"/>
+<line x1="70" y1="464" x2="88" y2="464" stroke="#2E79B5" stroke-width="2"/>
+<text x="94" y="468" font-size="10" fill="#555">HBM roof (binding)</text>
+<line x1="212.0" y1="464" x2="230.0" y2="464" stroke="#b8b8b8" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="236.0" y="468" font-size="10" fill="#555">L2 / LDS (context)</text>
+<line x1="354.0" y1="464" x2="372.0" y2="464" stroke="#444" stroke-width="2"/>
+<text x="378.0" y="468" font-size="10" fill="#555">MFMA ceilings</text>
+<circle cx="471.0" cy="464" r="5" fill="#2E79B5"/>
+<text x="490.0" y="468" font-size="10" fill="#555">grad_dense_partials</text>
+<circle cx="619.0" cy="464" r="5" fill="#D0672A"/>
+<text x="638.0" y="468" font-size="10" fill="#555">grad_jagged</text>
+<text x="20" y="492" font-size="9" fill="#888">Source: rocprof-compute 3.4.0 empirical roofline + counters · genrec D=512 B=1024 Mi=16384 L=7.89M · EXP-2026-07-01b/c. Achieved÷MFMA-util ⇒ ~770 TF/s true bf16 peak (≈ f16 line); 469 is a tool artifact.</text>
+</svg>
