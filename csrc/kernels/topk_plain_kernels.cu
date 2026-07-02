@@ -68,27 +68,21 @@ __global__ void topk_per_row(const float* logits,
                              int stride1,
                              int rowOffset);
 
-// Forward declaration of standalone_stable_radix_11bits from topk_per_row_kernels.cu
-template <typename T,
-          typename IdxT,
-          bool WRITE_TOPK_VALUES,
-          bool sorted = false,
-          Phase phase = Phase::Prefill>
-void standalone_stable_radix_11bits(void* buf,
-                                    size_t& buf_size,
-                                    T const* in,
-                                    int batch_size,
-                                    int64_t len,
-                                    IdxT* rowStarts,
-                                    IdxT* rowEnds,
-                                    IdxT k,
-                                    T* out,
-                                    IdxT* out_idx,
-                                    bool greater,
-                                    hipStream_t stream,
-                                    int next_n = 0);
-
 } // namespace aiter
+
+// Forward declaration: dispatches to mb or ob radix topk (defined in topk_per_row_kernels.cu).
+extern void radix_topk_dispatch(void* buf,
+                                size_t& buf_size,
+                                float const* in,
+                                int batch_size,
+                                int64_t len,
+                                int* rowStarts,
+                                int* rowEnds,
+                                int k,
+                                float* out,
+                                int* out_idx,
+                                bool greater,
+                                hipStream_t stream);
 
 // Forward declaration of workspace size calculation function (at global scope)
 template <typename T, aiter::Phase phase = aiter::Phase::Prefill>
@@ -2492,47 +2486,26 @@ void topk_per_row_kernel_launcher(const float* in,
                                   hipStream_t stream)
 {
 
-    size_t buf_size = 0; // will be overwritten by the kernel
-
+    size_t buf_size = 0;
     static constexpr bool is_largest = true;
 
-    int64_t workspace_size = invokeComputeTopkLastDimWorkspaceSize<float>(batch_size, stride0);
-
+    int64_t workspace_size = invokeComputeTopkLastDimWorkspaceSize<float>(batch_size, stride0, k);
     auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
     torch::Tensor workspace = torch::empty({workspace_size}, options);
 
-    if(out)
-    {
-        aiter::standalone_stable_radix_11bits<float, int, true, true>(
-            static_cast<void*>(workspace.data_ptr<uint8_t>()),
-            buf_size,
-            in,
-            batch_size,
-            stride0,
-            const_cast<IdxT*>(rowStarts),
-            const_cast<IdxT*>(rowEnds),
-            k,
-            const_cast<float*>(out),
-            out_idx,
-            is_largest,
-            stream);
-    }
-    else
-    {
-        aiter::standalone_stable_radix_11bits<float, int, false, true>(
-            static_cast<void*>(workspace.data_ptr<uint8_t>()),
-            buf_size,
-            in,
-            batch_size,
-            stride0,
-            const_cast<IdxT*>(rowStarts),
-            const_cast<IdxT*>(rowEnds),
-            k,
-            nullptr,
-            out_idx,
-            is_largest,
-            stream);
-    }
+    radix_topk_dispatch(
+        static_cast<void*>(workspace.data_ptr<uint8_t>()),
+        buf_size,
+        in,
+        batch_size,
+        stride0,
+        const_cast<IdxT*>(rowStarts),
+        const_cast<IdxT*>(rowEnds),
+        k,
+        const_cast<float*>(out),
+        out_idx,
+        is_largest,
+        stream);
 }
 
 void topk_plain(torch::Tensor& values,   // [batch, len]

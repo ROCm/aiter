@@ -7,6 +7,7 @@
 
 # Python standard library
 from functools import partial
+import warnings
 
 # PyTorch
 import torch
@@ -64,6 +65,9 @@ REAL_SHAPES: list[tuple[int, int, int, int]] = [
 # Test shapes are test only + real ones.
 TEST_SHAPES: list[tuple[int, int, int, int]] = TEST_ONLY_SHAPES + REAL_SHAPES
 
+# Other production workload: unknown model
+#                                                   M,    K,    N,  G
+OTHER_REAL_SHAPE: tuple[int, int, int, int] = (267424, 1280, 2560, 32)
 
 # Transpositions.
 
@@ -126,15 +130,26 @@ def torch_gmm(
 ) -> Tensor:
     check_input_device_dtype(lhs, rhs, group_sizes)
 
-    M, _, N, G = get_gmm_shape(lhs, rhs, group_sizes)
+    M, K, N, G = get_gmm_shape(lhs, rhs, group_sizes)
 
     out = get_gmm_output(
         M,
         N,
-        device=lhs.device,
         preferred_element_type=preferred_element_type,
+        device=lhs.device,
         existing_out=existing_out,
     )
+
+    # rhs has three supported storage layouts (see gmm() docstring):
+    #   * Non-transposed:        shape (G, K, N), stride (K*N, N, 1).
+    #   * Transposed (layout 1): shape (G, K, N), stride (K*N, 1, K).
+    #   * Transposed (layout 2): shape (G, N, K), stride (K*N, K, 1).
+    # For PyTorch matmul, only the tensor metadata matters: when rhs has shape
+    # (G, N, K) (layout 2), we need to transpose rhs[g] from (N, K) to (K, N)
+    # before the matmul. For the other two layouts, rhs[g] already has the
+    # logical (K, N) shape; PyTorch handles the column-major stride of layout
+    # 1 transparently via strides.
+    is_rhs_layout_2 = rhs.shape[1] == N and rhs.shape[2] == K
 
     last_row = 0
 
@@ -148,7 +163,9 @@ def torch_gmm(
         start_idx = last_row
         end_idx = last_row + m
 
-        result = (lhs[start_idx:end_idx, :] @ rhs[g]).to(torch.float32)
+        # rhs_g is the (K, N) matrix for group g, regardless of storage layout.
+        rhs_g = rhs[g].T if is_rhs_layout_2 else rhs[g]
+        result = (lhs[start_idx:end_idx, :] @ rhs_g).to(torch.float32)
         if bias is not None:
             result += bias[g].to(torch.float32)
         out[start_idx:end_idx, :] = result.to(preferred_element_type)
@@ -201,9 +218,9 @@ def test_gmm(
             lhs,
             rhs,
             group_sizes,
+            bias=bias,
             preferred_element_type=out_dtype,
             existing_out=out_triton,
-            bias=bias,
         )
 
         m = int(torch.sum(group_sizes).item())
@@ -231,6 +248,61 @@ def test_gmm(
         )
 
 
+@pytest.mark.parametrize(
+    "M, K, N, G", [OTHER_REAL_SHAPE, OTHER_REAL_SHAPE[:-1] + (17,)]
+)
+@pytest.mark.parametrize(
+    "trans_rhs, alt_trans", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("grid_dim", [None, 240])
+@pytest.mark.parametrize("work_stealing", [False, True])
+def test_gmm_alt_trans_rhs_int64_group_sizes_grid_dim_override_work_stealing(
+    M: int,
+    K: int,
+    N: int,
+    G: int,
+    trans_rhs: bool,
+    alt_trans: bool,
+    grid_dim: int | None,
+    work_stealing: bool,
+):
+    lhs, rhs, multiple_group_sizes, out_torch, _ = gen_gmm_tensors(
+        M,
+        K,
+        N,
+        G,
+        NUM_GROUP_SIZES,
+        group_sizes_dtype=torch.int64,  # feature under test
+        trans_rhs=trans_rhs,
+        alt_trans=alt_trans,  # feature under test
+        rng_seed=RNG_SEED,
+        unif_group_sizes=True,
+    )
+    out_triton = torch.empty_like(out_torch)
+
+    for group_sizes in multiple_group_sizes:
+        torch_gmm(lhs, rhs, group_sizes, existing_out=out_torch)
+
+        # Ignore expected warnings about grid dimension override.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore" if grid_dim is not None else "default")
+            triton_gmm(
+                lhs,
+                rhs,
+                group_sizes,
+                existing_out=out_triton,
+                grid_dim=grid_dim,  # feature under test
+                work_stealing=work_stealing,  # feature under test
+            )
+
+        m = int(torch.sum(group_sizes).item())
+        check_tensors(
+            out_triton[:m],
+            out_torch[:m],
+            "Triton GMM doesn't match PyTorch reference GMM.",
+        )
+
+
 # TGMM unit tests.
 # ------------------------------------------------------------------------------
 
@@ -252,8 +324,8 @@ def torch_tgmm(
         K,
         N,
         G,
-        device=lhs.device,
         preferred_element_type=preferred_element_type,
+        device=lhs.device,
         existing_out=existing_out,
     )
 
@@ -267,6 +339,17 @@ def torch_tgmm(
         existing_bias_grad=bias_grad,
     )
 
+    # lhs has three supported storage layouts (see ptgmm() / nptgmm() docstring):
+    #   * Non-transposed:        shape (K, M), stride (M, 1).
+    #   * Transposed (layout 1): shape (K, M), stride (1, K).
+    #   * Transposed (layout 2): shape (M, K), stride (K, 1).
+    # For PyTorch slicing along the m-dimension we need lhs to logically have
+    # shape (K, M). Layout 2 has shape (M, K), so we transpose it. The other
+    # two layouts already have shape (K, M); PyTorch handles the column-major
+    # stride of layout 1 transparently via strides.
+    is_lhs_layout_2 = lhs.shape[0] == M
+    lhs_km = lhs.T if is_lhs_layout_2 else lhs
+
     last_col = 0
 
     for g in range(G):
@@ -278,12 +361,12 @@ def torch_tgmm(
 
         start_idx = last_col
         end_idx = last_col + m
-        mm = lhs[:, start_idx:end_idx] @ rhs[start_idx:end_idx, :]
+        mm = lhs_km[:, start_idx:end_idx] @ rhs[start_idx:end_idx, :]
         out[g] = mm.to(preferred_element_type)
 
         # Bias gradient: sum lhs across m-dimension (columns) for each group.
         if compute_bias_grad:
-            grad = lhs[:, start_idx:end_idx].sum(dim=1, dtype=torch.float32)
+            grad = lhs_km[:, start_idx:end_idx].sum(dim=1, dtype=torch.float32)
             bias_grad[g] += grad
 
         last_col += m
@@ -341,9 +424,9 @@ def test_tgmm(
             lhs,
             rhs,
             group_sizes,
+            bias_grad=bias_grad_torch,
             preferred_element_type=out_dtype,
             existing_out=out_torch,
-            bias_grad=bias_grad_torch,
             accumulate=False,
         )
 
@@ -445,9 +528,9 @@ def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
             lhs,
             rhs,
             group_sizes,
+            bias_grad=bias_grad_triton,
             preferred_element_type=out_dtype,
             existing_out=out_triton,
-            bias_grad=bias_grad_triton,
             accumulate=True,
         )
     else:
@@ -455,9 +538,9 @@ def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
             lhs,
             rhs,
             group_sizes,
+            bias_grad=bias_grad_triton,
             preferred_element_type=out_dtype,
             existing_out=out_triton,
-            bias_grad=bias_grad_triton,
             accumulate=True,
         )
 
@@ -473,4 +556,68 @@ def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
             bias_grad_triton[non_empty_groups],
             bias_grad_torch[non_empty_groups],
             "Triton persistent TGMM bias_grad with ACCUMULATE=True does not match reference.",
+        )
+
+
+@pytest.mark.parametrize("persistent_str", {"p", "np"})
+@pytest.mark.parametrize(
+    "M, K, N, G", [OTHER_REAL_SHAPE, OTHER_REAL_SHAPE[:-1] + (13,)]
+)
+@pytest.mark.parametrize(
+    "trans_lhs, alt_trans", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("grid_dim", [None, 228])
+def test_tgmm_alt_trans_lhs_int64_group_sizes_grid_dim_override(
+    persistent_str: str,
+    M: int,
+    K: int,
+    N: int,
+    G: int,
+    trans_lhs: bool,
+    alt_trans: bool,
+    grid_dim: int | None,
+):
+    assert persistent_str in {"p", "np"}
+    persistent: bool = persistent_str == "p"
+    has_grid_dim: bool = grid_dim is not None
+
+    if not persistent and has_grid_dim:
+        pytest.skip("Grid dimension override is only applicable to persistent TGMM.")
+
+    lhs, rhs, multiple_group_sizes, out_torch, _ = gen_tgmm_tensors(
+        M,
+        K,
+        N,
+        G,
+        NUM_GROUP_SIZES,
+        group_sizes_dtype=torch.int64,  # feature under test
+        trans_lhs=trans_lhs,
+        alt_trans=alt_trans,  # feature under test
+        rng_seed=RNG_SEED,
+        unif_group_sizes=True,
+    )
+    out_triton = torch.empty_like(out_torch)
+
+    for group_sizes in multiple_group_sizes:
+        torch_tgmm(lhs, rhs, group_sizes, existing_out=out_torch)
+
+        if persistent:
+            # Ignore expected warnings about grid dimension override.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore" if has_grid_dim else "default")
+                triton_ptgmm(
+                    lhs,
+                    rhs,
+                    group_sizes,
+                    existing_out=out_triton,
+                    grid_dim=grid_dim,  # feature under test
+                )
+        else:
+            triton_nptgmm(lhs, rhs, group_sizes, existing_out=out_triton)
+
+        non_empty_groups = group_sizes > 0
+        check_tensors(
+            out_triton[non_empty_groups],
+            out_torch[non_empty_groups],
+            f"Triton {'persistent' if persistent else 'non-persistent'} TGMM doesn't match PyTorch reference TGMM.",
         )

@@ -1,10 +1,119 @@
 #include "mha_bwd.h"
 #include "aiter_hip_common.h"
 #include "asm_fmha_v3_bwd_configs.hpp"
-#include <memory>
+#include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace aiter {
+namespace {
+
+struct KernelArgBufferWriter
+{
+    template <typename T>
+    void append_raw(const T& value)
+    {
+        const auto* bytes = reinterpret_cast<const std::byte*>(&value);
+        storage.insert(storage.end(), bytes, bytes + sizeof(T));
+    }
+
+    template <typename PtrT>
+    void append_ptr(PtrT ptr, bool compact)
+    {
+        append_raw(ptr);
+        if(!compact)
+        {
+            append_raw(uint32_t{0});
+            append_raw(uint32_t{0});
+        }
+    }
+
+    void append_u32(uint32_t value, bool compact)
+    {
+        append_raw(value);
+        if(!compact)
+        {
+            append_raw(uint32_t{0});
+            append_raw(uint32_t{0});
+            append_raw(uint32_t{0});
+        }
+    }
+
+    std::vector<std::byte> storage;
+};
+
+struct fmha_bwd_odo_logical_args
+{
+    const void* ptr_o;
+    const void* ptr_do;
+    void* ptr_d;
+    uint32_t Hs_o;
+    uint32_t BAs_o;
+    uint32_t Seqs_o;
+    uint32_t Hs_do;
+    uint32_t BAs_do;
+    uint32_t Seqs_do;
+    uint32_t Hs_d;
+    uint32_t BAs_d;
+    uint32_t Seqs_d;
+    uint32_t seqlen_q;
+    uint32_t head_dim;
+    const void* ptr_qseq;
+    const void* ptr_qseq_padded;
+};
+
+bool use_compact_fmha_bwd_kernel_args(const std::string& arch_id)
+{
+    return arch_id == "gfx1250";
+}
+
+fmha_bwd_odo_logical_args make_fmha_bwd_odo_logical_args(const mha_bwd_args& a)
+{
+    return {
+        a.o_ptr,
+        a.do_ptr,
+        a.d_ptr,
+        static_cast<uint32_t>(a.nhead_stride_o * 2),
+        static_cast<uint32_t>(a.batch_stride_o * 2),
+        static_cast<uint32_t>(a.stride_o * 2),
+        static_cast<uint32_t>(a.nhead_stride_do * 2),
+        static_cast<uint32_t>(a.batch_stride_do * 2),
+        static_cast<uint32_t>(a.stride_do * 2),
+        static_cast<uint32_t>(a.nhead_stride_lsed * 4),
+        static_cast<uint32_t>(a.batch_stride_lsed * 4),
+        1u * 4u,
+        static_cast<uint32_t>(a.seqlen_q),
+        static_cast<uint32_t>(a.hdim_q),
+        (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr,
+        a.seqstart_q_ptr,
+    };
+}
+
+std::vector<std::byte> pack_fmha_bwd_odo_args(const fmha_bwd_odo_logical_args& args, bool compact)
+{
+    KernelArgBufferWriter writer;
+    writer.append_ptr(args.ptr_o, compact);
+    writer.append_ptr(args.ptr_do, compact);
+    writer.append_ptr(args.ptr_d, compact);
+    writer.append_u32(args.Hs_o, compact);
+    writer.append_u32(args.BAs_o, compact);
+    writer.append_u32(args.Seqs_o, compact);
+    writer.append_u32(args.Hs_do, compact);
+    writer.append_u32(args.BAs_do, compact);
+    writer.append_u32(args.Seqs_do, compact);
+    writer.append_u32(args.Hs_d, compact);
+    writer.append_u32(args.BAs_d, compact);
+    writer.append_u32(args.Seqs_d, compact);
+    writer.append_u32(args.seqlen_q, compact);
+    writer.append_u32(args.head_dim, compact);
+    writer.append_ptr(args.ptr_qseq, compact);
+    writer.append_ptr(args.ptr_qseq_padded, compact);
+    return writer.storage;
+}
+
+} // namespace
+
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
 {
     if(hdim_q == 192 && hdim_v == 128 && arch_id == "gfx950")
@@ -133,6 +242,21 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #if ONLY_FAV3
     return asm_ret;
 #else // !ONLY_FAV3
+    if(asm_ret != -1)
+        return asm_ret;
+
+    if(a.is_group_mode && (a.seqstart_q_ptr == nullptr || a.seqstart_k_ptr == nullptr))
+    {
+        AITER_LOG_ERROR("mha_bwd: group mode requires seqstart_q_ptr and seqstart_k_ptr");
+        return -1;
+    }
+
+    if(a.is_group_mode && !a.pinned_host_alloc)
+    {
+        AITER_LOG_ERROR("mha_bwd: group mode requires pinned_host_alloc callback");
+        return -1;
+    }
+
     const fmha_bwd_traits traits{
         a.seqlen_q,
         a.seqlen_k,
@@ -153,6 +277,19 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         a.is_deterministic,
     };
 
+    fmha_bwd_launcher launcher(traits);
+    void* workspace_ptr = a.workspace_alloc(launcher.workspace_size, /*zero_init=*/false);
+
+    // Single call enqueues the full async workspace pipeline on the caller's
+    // stream: dq_acc zero (if needed), D2H seqstart (group mode), pack on host,
+    // H2D ws metadata. The pinned staging buffer is owned by `launcher` and
+    // released by its destructor via a tail hipLaunchHostFunc on the stream.
+    launcher.prepare_workspace_async(workspace_ptr,
+                                     static_cast<const int*>(a.seqstart_q_ptr),
+                                     static_cast<const int*>(a.seqstart_k_ptr),
+                                     s,
+                                     a.pinned_host_alloc);
+
     fmha_bwd_args ck_args{
         /* q_ptr              */ a.q_ptr,
         /* k_ptr              */ a.k_ptr,
@@ -167,7 +304,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* dk_ptr             */ a.dk_ptr,
         /* dv_ptr             */ a.dv_ptr,
         /* dbias_ptr          */ a.dbias_ptr,
-        /* dq_acc_ptr         */ a.dq_acc_ptr,
+        /* workspace_ptr      */ workspace_ptr,
         /* sink_ptr           */ a.sink_ptr,
         /* d_sink_ptr         */ a.d_sink_ptr,
 
@@ -196,7 +333,6 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* stride_o           */ a.stride_o,
         /* stride_randval     */ a.stride_randval,
         /* stride_do          */ a.stride_do,
-        /* stride_dq_acc      */ a.stride_dq_acc,
         /* stride_dq          */ a.stride_dq,
         /* stride_dk          */ a.stride_dk,
         /* stride_dv          */ a.stride_dv,
@@ -210,7 +346,6 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* nhead_stride_randval*/ a.nhead_stride_randval,
         /* nhead_stride_do    */ a.nhead_stride_do,
         /* nhead_stride_lsed  */ a.nhead_stride_lsed,
-        /* nhead_stride_dq_acc*/ static_cast<ck_tile::long_index_t>(a.nhead_stride_dq_acc),
         /* nhead_stride_dq    */ a.nhead_stride_dq,
         /* nhead_stride_dk    */ a.nhead_stride_dk,
         /* nhead_stride_dv    */ a.nhead_stride_dv,
@@ -224,13 +359,11 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* batch_stride_randval*/ a.batch_stride_randval,
         /* batch_stride_do    */ a.batch_stride_do,
         /* batch_stride_lsed  */ a.batch_stride_lsed,
-        /* batch_stride_dq_acc*/ static_cast<ck_tile::long_index_t>(a.batch_stride_dq_acc),
         /* batch_stride_dq    */ a.batch_stride_dq,
         /* batch_stride_dk    */ a.batch_stride_dk,
         /* batch_stride_dv    */ a.batch_stride_dv,
         /* batch_stride_dbias */ a.batch_stride_dbias,
 
-        /* split_stride_dq_acc*/ a.split_stride_dq_acc,
         /* window_size_left   */ a.window_size_left,
         /* window_size_right  */ a.window_size_right,
         /* mask_type          */ a.mask_type,
@@ -239,25 +372,16 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* drop_seed_offset   */ a.drop_seed_offset,
     };
 
-    if(asm_ret == -1)
-    {
-        return fmha_bwd(traits, ck_args, s);
-    }
-    return asm_ret;
+    return launcher.run(ck_args, s);
 #endif
 }
 
 float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
-    if(a.nhead_stride_dq_acc < a.stride_dq_acc)
-    {
-        return -1;  // dq_acc only support BHSD layout
-    }
-
     std::string arch_id = get_gpu_arch();
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
        (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic) ||
-       ((arch_id != "gfx942") && (arch_id != "gfx950")))
+       ((arch_id != "gfx942") && (arch_id != "gfx950") && (arch_id != "gfx1250")))
     {
         return -1;
     }
@@ -311,7 +435,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                 return &cfg_fmha_bwd_dq_shuffle;
             }
         }
-        else
+        else if (arch_id == "gfx942")
         {
             if(a.v3_atomic_fp32)
             {
@@ -321,11 +445,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             {
                 return static_cast<CFG*>(nullptr);
             }
+        } else {
+            return &cfg_fmha_bwd_dq_convert; // gfx1250 only support atomic32=1
         }
     }();
 
     bool need_post_processing =
-        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
+        ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1) || (arch_id == "gfx1250");
 
     int mt = asm_mask_type();
 
@@ -367,6 +493,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     int ts_kv;
     int ts_dq;
     size_t arg_size;
+    const bool compact_odo_args = use_compact_fmha_bwd_kernel_args(arch_id);
 
     AiterAsmKernel* impl_ptr_pre    = nullptr;
     AiterAsmKernel* impl_ptr_dqdkdv = nullptr;
@@ -427,38 +554,54 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     if(a.v3_api_check)
         return 1;
 
-    fmha_bwd_odo_args odo_args;
-
-    odo_args.ptr_o           = a.o_ptr;
-    odo_args.ptr_do          = a.do_ptr;
-    odo_args.ptr_d           = a.d_ptr;
-    odo_args.Hs_o            = a.nhead_stride_o * 2;
-    odo_args.BAs_o           = a.batch_stride_o * 2;
-    odo_args.Seqs_o          = a.stride_o * 2;
-    odo_args.Hs_do           = a.nhead_stride_do * 2;
-    odo_args.BAs_do          = a.batch_stride_do * 2;
-    odo_args.Seqs_do         = a.stride_do * 2;
-    odo_args.Hs_d            = a.nhead_stride_lsed * 4;
-    odo_args.BAs_d           = a.batch_stride_lsed * 4;
-    odo_args.Seqs_d          = 1 * 4;
-    odo_args.seqlen_q        = a.seqlen_q;
-    odo_args.head_dim        = a.hdim_q;
-    odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
-    odo_args.ptr_qseq =
-        (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    const auto odo_args  = make_fmha_bwd_odo_logical_args(a);
+    auto odo_arg_storage = pack_fmha_bwd_odo_args(odo_args, compact_odo_args);
 
     auto pre_kernel_launch = [&]() {
-        arg_size = sizeof(odo_args);
-        int bdx = 256;
+        arg_size = odo_arg_storage.size();
+        int bdx = (arch_id == "gfx1250") ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
-        impl_ptr_pre->launch_kernel({&odo_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        impl_ptr_pre->launch_kernel(
+            {odo_arg_storage.data(), &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
     };
 
+    // ASM dq_accum layout (a.seqlen_q is total_q in group mode):
+    //   atomic_fp32 batch:  (1, batch, nhead_q, seqlen_q,             hdim_q)        [fp32]
+    //   atomic16    batch:  (1, batch, nhead_q, ceil16(seqlen_q),     pad_hdim_q)    [q-dtype]
+    //   atomic_fp32 group:  (1,        nhead_q, total_q,              hdim_q)        [fp32]
+    //   atomic16    group:  (1, batch, nhead_q, ceil16(max_seqlen_q), 128)           [q-dtype]
+    void* dq_acc_ptr           = nullptr;
+    size_t stride_dq_acc       = 0;
+    size_t nhead_stride_dq_acc = 0;
+    size_t batch_stride_dq_acc = 0;
+    size_t dq_acc_element_size = 0;
+
+    if(need_post_processing)
+    {
+        dq_acc_element_size = a.v3_atomic_fp32 ? 4 : 2;
+
+        const size_t a16_pad_seq  = (a.max_seqlen_q + 15) / 16 * 16;
+        const size_t a16_pad_hdim = a.hdim_q == 192 ? 192 : 128;
+        const size_t dq_acc_seq   = a.v3_atomic_fp32 ? a.seqlen_q : a16_pad_seq;
+        const size_t dq_acc_hdim  = a.v3_atomic_fp32 ? a.hdim_q : a16_pad_hdim;
+
+        const size_t per_batch_elems = static_cast<size_t>(a.nhead_q) * dq_acc_seq * dq_acc_hdim;
+        const size_t effective_batch = (a.is_group_mode && a.v3_atomic_fp32) ? 1 : a.batch;
+
+        stride_dq_acc             = dq_acc_hdim;
+        nhead_stride_dq_acc       = dq_acc_seq * dq_acc_hdim;
+        batch_stride_dq_acc       = (effective_batch == 1) ? 0 : per_batch_elems;
+        const size_t dq_acc_bytes = effective_batch * per_batch_elems * dq_acc_element_size;
+
+        // ASM kernel atomically accumulates into dq_accum; require zero-init.
+        dq_acc_ptr = a.workspace_alloc(dq_acc_bytes, /*zero_init=*/true);
+    }
+
     fmha_bwd_dqdkdv_args dqdkdv_args;
-    dqdkdv_args.ptr_dq     = need_post_processing ? a.dq_acc_ptr : a.dq_ptr;
+    dqdkdv_args.ptr_dq     = need_post_processing ? dq_acc_ptr : a.dq_ptr;
     dqdkdv_args.ptr_dk     = a.dk_ptr;
     dqdkdv_args.ptr_dv     = a.dv_ptr;
     dqdkdv_args.ptr_q      = a.q_ptr;
@@ -546,13 +689,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto dqdkdv_kernel_launch = [&]() {
         arg_size                  = sizeof(dqdkdv_args);
-        int bdx = 256;
+        int bdx = (arch_id == "gfx1250") ? 128 : 256;
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
         if((mt == 1) || (mt == 2))
-        { // causal
+        { // mask kb
             gdx = (gdx + 1) / 2;
         }
 
@@ -568,14 +711,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             [=](const ck_tile::stream_config& s_) { dqdkdv_kernel_launch(); });
     }
 
-    int dq_acc_element_size = a.v3_atomic_fp32 ? 4 : 2;
     fmha_bwd_post_kernel_args post_args;
 
-    post_args.ptr_dq_acc      = a.dq_acc_ptr;
+    post_args.ptr_dq_acc      = dq_acc_ptr;
     post_args.ptr_dq          = a.dq_ptr;
-    post_args.Hs_dq_acc       = a.nhead_stride_dq_acc * dq_acc_element_size;
-    post_args.BAs_dq_acc      = a.batch_stride_dq_acc * dq_acc_element_size;
-    post_args.Seqs_dq_acc     = a.stride_dq_acc * dq_acc_element_size;
+    post_args.Hs_dq_acc       = nhead_stride_dq_acc * dq_acc_element_size;
+    post_args.BAs_dq_acc      = batch_stride_dq_acc * dq_acc_element_size;
+    post_args.Seqs_dq_acc     = stride_dq_acc * dq_acc_element_size;
     post_args.Hs_dq           = a.nhead_stride_dq * 2;
     post_args.BAs_dq          = a.batch_stride_dq * 2;
     post_args.Seqs_dq         = a.stride_dq * 2;
@@ -586,8 +728,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
 
     auto post_kernel_launch = [&]() {
-        arg_size                  = sizeof(post_args);
-        int bdx = 256;
+        arg_size = sizeof(post_args);
+        int bdx = (arch_id == "gfx1250") ? 128 : 256;
         int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
         int gdy = a.nhead_q;
         int gdz = a.batch;

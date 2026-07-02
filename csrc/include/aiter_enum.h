@@ -83,3 +83,9 @@ static inline std::string AiterDtype_to_str(int dtype)
     default: return "unknown";
     }
 }
+
+// FP8 format mapping: which GPU architectures use OCP (e4m3fn) vs FNUZ (e4m3fnuz)
+// gfx950 (MI350): OCP e4m3fn  (bias=7, no negative-zero-as-NaN)
+// gfx942 (MI300): FNUZ e4m3fnuz (bias=8, negative-zero-as-NaN)
+static constexpr const char* fp8_ocp_archs[]  = {"gfx950", "gfx1250"};
+static constexpr const char* fp8_fnuz_archs[] = {"gfx942"};

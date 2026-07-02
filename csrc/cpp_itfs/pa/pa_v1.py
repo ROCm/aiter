@@ -53,6 +53,59 @@ def compile(
     )
 
 
+def validate_paged_attention_v1_workspace(
+    workspace_buffer,
+    query,
+    block_tables,
+    context_lens,
+    block_size,
+    max_context_len,
+    partition_size,
+    mtp=1,
+):
+    op_name = "paged_attention_v1"
+    max_num_partitions = math.ceil(max_context_len / partition_size)
+    # Use the launch-time upper bound rather than reading context_lens data.
+    # context_lens may live on GPU, and scalar extraction would force a sync
+    # and introduce tensor-data-dependent Python in torch.compile paths.
+    min_blocks_per_seq = math.ceil(max_context_len / block_size)
+
+    if block_tables.dim() != 2:
+        raise ValueError(
+            f"{op_name}: block_tables must be 2D "
+            f"[num_seqs, max_num_blocks_per_seq], got {tuple(block_tables.shape)}"
+        )
+    if block_tables.size(1) < min_blocks_per_seq:
+        raise ValueError(
+            f"{op_name}: block_tables.size(1)={block_tables.size(1)} is too small "
+            f"for max_context_len={max_context_len} and block_size={block_size}; "
+            f"need at least {min_blocks_per_seq} block-table entries per sequence"
+        )
+    if context_lens.size(0) != block_tables.size(0):
+        raise ValueError(
+            f"{op_name}: context_lens.size(0)={context_lens.size(0)} must match "
+            f"block_tables.size(0)={block_tables.size(0)}"
+        )
+
+    num_seqs = block_tables.size(0)
+    num_heads = query.size(1)
+    head_size = query.size(2)
+    tmp_out_elem_bytes = query.element_size()
+    required_bytes = (
+        num_seqs * mtp * num_heads * max_num_partitions * head_size * tmp_out_elem_bytes
+        + 2 * num_seqs * mtp * num_heads * max_num_partitions * 4
+    )
+    workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+    if workspace_bytes < required_bytes:
+        raise ValueError(
+            f"{op_name}: workspace_buffer is too small ({workspace_bytes} bytes) for "
+            f"max_context_len={max_context_len}, partition_size={partition_size}, "
+            f"num_seqs={num_seqs}, num_heads={num_heads}, head_size={head_size}, mtp={mtp}; "
+            f"need at least {required_bytes} bytes "
+            f"({max_num_partitions} partition slots)"
+        )
+
+
 def paged_attention_v1(
     out,
     workspace_buffer,
@@ -114,6 +167,16 @@ def paged_attention_v1(
     head_size = query.size(2)
     q_stride = query.stride(0)
     block_size = key_cache.size(2) if kv_cache_layout == "HND" else key_cache.size(1)
+    validate_paged_attention_v1_workspace(
+        workspace_buffer,
+        query,
+        block_tables,
+        context_lens,
+        block_size,
+        max_context_len,
+        partition_size,
+        mtp,
+    )
     max_num_blocks_per_seq = block_tables.size(1)
     kv_block_stride = key_cache.stride(0)
     kv_head_stride = (

@@ -17,7 +17,11 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
+from chip_info import (  # noqa: E402
+    build_tune_dict,
+    write_lookup_header,
+    write_name_keyed_lookup_header,
+)
 
 from gemm_a8w8_blockscale_cktile_instance import (  # noqa: E402
     default_kernels_cktile_dict,
@@ -146,10 +150,19 @@ template torch::Tensor
 
     def gen_lookup_dict(self, kernels_dict: dict):
         """
-        Generate lookup dictionary for kernel instances
+        Generate lookup dictionary for kernel instances.
+
+        - Tune mode (istune=True): emits a kernelId-keyed table for *_tune.cu.
+        - Non-tune mode (istune=False): emits a name-keyed registry consumed
+          by gemm_a8w8_blockscale_cktile.cu's Python-driven dispatch.
         """
 
-        LOOKUP_head = """#pragma once
+        output_path = os.path.join(
+            self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"
+        )
+
+        if self.istune:
+            LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -158,23 +171,49 @@ template torch::Tensor
 #define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
-        LOOKUP_template = """
+            LOOKUP_template = """
        {{{MNK},                                                                                                       \\
         {kernel_name}<DTYPE, ETYPE>}},                       \\"""
 
-        LOOKUP_end = """
+            LOOKUP_end = """
    }
 
 #endif // USE_ROCM
 """
-        write_lookup_header(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"),
-            kernels_dict,
-            LOOKUP_head,
-            LOOKUP_template,
-            LOOKUP_end,
-            self.istune,
-        )
+            write_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+                self.istune,
+            )
+        else:
+            LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+            LOOKUP_template = """
+       {{"{kernel_name}",                                                                                                       \\
+        {kernel_name}<DTYPE, ETYPE>}},                       \\"""
+
+            LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+            write_name_keyed_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+            )
 
     def gen_manifest_head(self, kernels_dict):
         """
@@ -250,8 +289,12 @@ torch::Tensor
             # generate code for default kernels
             self.gen_code(candidate_kernels_cktile_dict)
         else:
-            # generate code for tuned kernels from tune_file
-            self.gen_code(self.get_tune_dict(self.tune_file))
+            # Runtime dispatch is keyed by kernelName from Python-selected tuned
+            # rows. Build the full CKTile candidate registry so a newly tuned CSV
+            # cannot reference a valid candidate that is absent from the .so.
+            runtime_kernels = self.get_tune_dict(self.tune_file)
+            runtime_kernels.update(candidate_kernels_cktile_dict)
+            self.gen_code(runtime_kernels)
 
 
 if __name__ == "__main__":

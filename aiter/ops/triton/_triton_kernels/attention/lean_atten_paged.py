@@ -323,7 +323,7 @@ def _attn_lean_tile(
             acc * alpha[:, None]
         )  # Scale each row of acc by the corresponding elements in alpha
         v = tl.load(V_bptr, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
-        acc += tl.dot(p.to(v.dtype), v)  # acc.shape = [BLOCK_M, HEAD_DIM]
+        acc = tl.dot(p.to(v.dtype), v, acc=acc)  # acc.shape = [BLOCK_M, HEAD_DIM]
         # -- update l_i
         l_ij = tl.sum(p, 1)  # rowsum(p)
         l_i = l_i * alpha + l_ij

@@ -28,7 +28,24 @@ def swiglu_and_mul_bias(
 
 
 @compile_ops("module_activation", develop=True)
+def gelu_and_mul_bias(
+    out: Tensor, input: Tensor, expert_ids: Tensor, bias: Tensor
+) -> None: ...
+
+
+@compile_ops("module_activation", develop=True)
 def scaled_silu_and_mul(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
+
+
+@compile_ops("module_activation", develop=True)
+def silu_and_mul_quant(
+    out: Tensor,
+    input: Tensor,
+    scale: Tensor,
+    group_size: int,
+    limit: float = 0.0,
+    shuffle_scale: bool = False,
+) -> None: ...
 
 
 @compile_ops("module_activation", develop=True)

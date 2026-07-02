@@ -6,6 +6,15 @@ SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
 export CLANG_TOOLCHAIN_PROGRAM_TIMEOUT="${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT:-300}"
 
+# Avoid per-invocation hipcc native arch probing (can timeout under heavy JIT
+# parallelism) by resolving the current GPU arch once for this job.
+if [[ -z "${GPU_ARCHS:-}" ]]; then
+    detected_arch=$(rocminfo 2>/dev/null | grep -m1 -oE 'gfx[0-9a-z]+' || true)
+    if [[ "$detected_arch" =~ ^gfx[0-9a-z]+$ ]]; then
+        export GPU_ARCHS="$detected_arch"
+    fi
+fi
+
 files=()
 failedFiles=()
 
@@ -50,6 +59,7 @@ fi
 
 echo "Running ${sharded_files[@]} in shard $SHARD_IDX of $SHARD_TOTAL."
 echo "Using CLANG_TOOLCHAIN_PROGRAM_TIMEOUT=${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT}" | tee -a latest_test.log
+echo "Using GPU_ARCHS=${GPU_ARCHS:-native}" | tee -a latest_test.log
 
 for file in "${sharded_files[@]}"; do
     # Print a clear separator and test file name for readability
@@ -92,6 +102,30 @@ for file in "${sharded_files[@]}"; do
         echo
     } | tee -a latest_test.log
 done
+
+# Extra parameterized invocations for MLA bh16 gluon (bh16bn64 + bh16bn128, gfx950-only gates).
+# Run only in whichever shard actually owns test_mla.py — the shard layout can shift as tests
+# are added/removed, so we can't hardcode SHARD_IDX.
+mla_in_shard=false
+for f in "${sharded_files[@]}"; do
+    if [[ "$f" == "op_tests/test_mla.py" ]]; then
+        mla_in_shard=true
+        break
+    fi
+done
+if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
+    for args in \
+        "-c 49152 -b 1 -n 16,1 -kvd bf16" \
+        "-c 98304 -b 1 -n 16,1 -kvd fp8" \
+        "-c 10000 100000 -b 1 3 4 -n 12,1 16,1 -kvd bf16 -lse" \
+        "-c 1 21 63 64 65 256 -b 1 -n 16,1 -kvd bf16 -lse"; do
+        echo "=== extra: test_mla.py $args ===" | tee -a latest_test.log
+        if ! timeout 10m python3 op_tests/test_mla.py $args 2>&1 | tee -a latest_test.log; then
+            testFailed=true
+            failedFiles+=("test_mla.py $args")
+        fi
+    done
+fi
 
 if [ "$testFailed" = true ]; then
     {

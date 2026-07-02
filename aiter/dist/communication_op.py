@@ -66,10 +66,18 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     weight_: torch.Tensor,
     eps: float,
     prefill_support: bool = False,
+    x_pad_to_multiple: int = 0,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm")
     return get_tp_group().fused_allreduce_rmsnorm(
-        input_, residual_inp_, weight_, eps, prefill_support
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        prefill_support,
+        x_pad_to_multiple=x_pad_to_multiple,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -79,7 +87,23 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     weight_: torch.Tensor,
     eps: float,
     prefill_support: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    quant_type: Any = "per_token",
+    group_size: int = 128,
+    emit_bf16: bool = False,
+    transpose_scale: bool = False,
+    gemma_norm: bool = False,
+):
+    """Fused tensor-parallel all-reduce + RMSNorm + quantization.
+
+    ``quant_type`` selects the quantization epilogue:
+    ``"per_token"`` for existing FP8 per-token quantization,
+    ``"per_group"`` / ``"per_1x128"`` for FP8 per-group quantization, and
+    ``"mxfp4"`` / ``"per_1x32"`` for MXFP4 quantization.
+
+    ``transpose_scale`` (per-group only) writes the per-group scale in
+    column-major layout ``(num_groups, M)`` viewed as ``(M, num_groups)``,
+    matching what ``gemm_a8w8_blockscale_preshuffle`` expects.
+    """
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm_quant")
     return get_tp_group().fused_allreduce_rmsnorm_quant(
         input_,
@@ -87,6 +111,11 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         weight_,
         eps,
         prefill_support,
+        quant_type=quant_type,
+        group_size=group_size,
+        emit_bf16=emit_bf16,
+        transpose_scale=transpose_scale,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -98,15 +127,81 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     group_size: int = 128,
     prefill_support: bool = False,
     emit_bf16: bool = False,
+    transpose_scale: bool = False,
 ):
+    # Route through GroupCoordinator.fused_allreduce_rmsnorm_quant_per_group,
+    # which (for the non-emit_bf16 case) dispatches the torch.library-registered
+    # op ``fused_allreduce_rmsnorm_quant_per_group_``. Going through the generic
+    # ``fused_allreduce_rmsnorm_quant`` instead would reach the raw pybind chain
+    # directly, which Dynamo cannot trace -> graph break / compile failure under
+    # torch.compile, silently disabling the fusion.
+    _assert_no_custom_group(
+        "tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group"
+    )
     return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
         input_,
         residual_inp_,
         weight_,
         eps,
-        group_size,
-        prefill_support,
+        group_size=group_size,
+        prefill_support=prefill_support,
         emit_bf16=emit_bf16,
+        transpose_scale=transpose_scale,
+    )
+
+
+def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    prefill_support: bool = False,
+    emit_bf16: bool = False,
+):
+    return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        prefill_support,
+        quant_type="mxfp4",
+        emit_bf16=emit_bf16,
+    )
+
+
+def tensor_model_parallel_fused_qknorm_allreduce(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    eps: float,
+):
+    return get_tp_group().fused_qknorm_allreduce(
+        qkv_in,
+        q_w,
+        k_w,
+        eps,
+    )
+
+
+def tensor_model_parallel_fused_qknorm_allreduce_rope(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+):
+    return get_tp_group().fused_qknorm_allreduce_rope(
+        qkv_in,
+        q_w,
+        k_w,
+        cos_sin_cache,
+        position_ids,
+        head_dim,
+        rotary_dim,
+        eps,
     )
 
 

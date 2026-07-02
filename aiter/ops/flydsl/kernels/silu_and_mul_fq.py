@@ -28,6 +28,13 @@ from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
 
 from flydsl._mlir import ir
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import buffer_ops
 
@@ -42,7 +49,6 @@ def build_silu_and_mul_fq_module(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    swiglu_limit: float = 0.0,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -55,7 +61,9 @@ def build_silu_and_mul_fq_module(
         Number of expert slots per token.
     quant_mode : str
         "fp4"  -> MXFP4 output + e8m0 scale (tiled layout)
-        "fp8"  -> MXFP8 (e4m3fn) output + e8m0 scale (tiled layout)
+        "fp8"  -> MXFP8 output + e8m0 scale (tiled layout). Element dtype is
+                  arch-dependent: e4m3fnuz (gfx942) or e4m3fn (gfx950+); the
+                  E8M0 RoundUp scale formula picks ``max_pos`` accordingly.
         "none" -> bf16 output, no quantization (out_scale_sorted ignored)
     gui_layout : bool
         False -> input is gate-up separated  [gate_0:N | up_0:N]
@@ -84,23 +92,38 @@ def build_silu_and_mul_fq_module(
         SHUFFLE_DISTS.append(d)
         d *= 2
 
-    _fp_headroom = 2 if _need_fp4 else 8
-
     elem_bytes_bf16 = 2
 
     if _need_fp8:
         from flydsl._mlir.dialects import rocdl
 
+    # All four MXFP4/MXFP8 scale modes share NV ROUND_UP today (industry default,
+    # 0% max-value clipping). FP8 dtype follows the HW FP8 variant: gfx942 ships
+    # e4m3fnuz (max=240), gfx950+ ships OCP e4m3fn (max=448). Single-statement
+    # ternary avoids closure-cell binding edge cases in FlyDSL AOT trace; the
+    # bf16 fallback uses FP4_E2M1 as a placeholder (guarded by
+    # ``const_expr(_need_quant)`` at the call site).
+    _mx_dtype = (
+        _D.FP4_E2M1
+        if _need_fp4
+        else (
+            (_D.FP8_E4M3_FNUZ if get_hip_arch() == "gfx942" else _D.FP8_E4M3)
+            if _need_fp8
+            else _D.FP4_E2M1
+        )
+    )
+
     @flyc.kernel
     def silu_and_mul_fq_kernel(
-        x: fx.Tensor,
-        out_buf: fx.Tensor,
-        out_scale_sorted: fx.Tensor,
-        sorted_ids: fx.Tensor,
-        num_valid_ids: fx.Tensor,
-        topk_ids: fx.Tensor,
-        bias: fx.Tensor,
+        x: fx.Pointer,
+        out_buf: fx.Pointer,
+        out_scale_sorted: fx.Pointer,
+        sorted_ids: fx.Pointer,
+        num_valid_ids: fx.Pointer,
+        topk_ids: fx.Pointer,
+        bias: fx.Pointer,
         token_num: Int32,
+        swiglu_limit_f: fx.Float32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -114,27 +137,15 @@ def build_silu_and_mul_fq_module(
         c3_i32 = arith.constant(3, type=i32)
         c4_i32 = arith.constant(4, type=i32)
         c5_i32 = arith.constant(5, type=i32)
-        c7_i32 = arith.constant(7, type=i32)
         c15_i32 = arith.constant(15, type=i32)
-        c21_i32 = arith.constant(21, type=i32)
         c23_i32 = arith.constant(23, type=i32)
-        c28_i32 = arith.constant(28, type=i32)
         c31_i32 = arith.constant(31, type=i32)
         c32_i32 = arith.constant(32, type=i32)
         c64_i32 = arith.constant(64, type=i32)
-        c126_i32 = arith.constant(126, type=i32)
-        c127_i32 = arith.constant(127, type=i32)
         c254_i32 = arith.constant(254, type=i32)
         c256_i32 = arith.constant(256, type=i32)
-        c0xFF_i32 = arith.constant(0xFF, type=i32)
-        c0x200000_i32 = arith.constant(0x200000, type=i32)
-        c0xFF800000_i32 = arith.constant(0xFF800000, type=i32)
-        c0x400000_i32 = arith.constant(0x400000, type=i32)
-        c0x7FFFFF_i32 = arith.constant(0x7FFFFF, type=i32)
-        c0x80000000_i32 = arith.constant(0x80000000, type=i32)
         c0_f32 = arith.constant(0.0, type=f32)
         c1_f32 = arith.constant(1.0, type=f32)
-        c_headroom_i32 = arith.constant(_fp_headroom, type=i32)
 
         scale_cols_i32 = arith.constant(scale_cols, type=i32)
         inter_dim_i32 = arith.constant(inter_dim, type=i32)
@@ -142,14 +153,19 @@ def build_silu_and_mul_fq_module(
         topk_i32 = arith.constant(topk, type=i32)
         n32_sort = scale_cols_i32 * c32_i32
 
-        in_rsrc = buffer_ops.create_buffer_resource(x, max_size=True)
-        out_rsrc = buffer_ops.create_buffer_resource(out_buf, max_size=True)
-        scale_rsrc = buffer_ops.create_buffer_resource(out_scale_sorted, max_size=True)
-        tid_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
-        nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        def _ptr_buffer_resource(ptr):
+            addr = fx.ptrtoint(ptr)
+            addr_i64 = arith.index_cast(T.i64, addr)
+            return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+
+        in_rsrc = _ptr_buffer_resource(x)
+        out_rsrc = _ptr_buffer_resource(out_buf)
+        scale_rsrc = _ptr_buffer_resource(out_scale_sorted)
+        tid_rsrc = _ptr_buffer_resource(sorted_ids)
+        nv_rsrc = _ptr_buffer_resource(num_valid_ids)
         if enable_bias:
-            topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
-            bias_rsrc = buffer_ops.create_buffer_resource(bias, max_size=True)
+            topk_rsrc = _ptr_buffer_resource(topk_ids)
+            bias_rsrc = _ptr_buffer_resource(bias)
 
             def _load_bias_scalar(offset):
                 return buffer_ops.buffer_load(bias_rsrc, offset, vec_width=1, dtype=f32)
@@ -169,22 +185,10 @@ def build_silu_and_mul_fq_module(
         s_ok = arith.cmpi(CmpIPredicate.ult, slot_id, topk_i32)
         is_valid = arith.andi(row_in_range, arith.andi(t_ok, s_ok))
 
-        if const_expr(_need_fp4):
-
-            def _f32_to_e2m1(qx_f32):
-                qx = qx_f32.bitcast(i32)
-                s = qx & c0x80000000_i32
-                e = (qx >> c23_i32) & c0xFF_i32
-                m = qx & c0x7FFFFF_i32
-                adj_exp = arith.maxsi(c126_i32 - e, c0_i32)
-                m_denorm = (c0x400000_i32 | (m >> c1_i32)) >> adj_exp
-                is_denorm = arith.cmpi(CmpIPredicate.ult, e, c127_i32)
-                m = arith.select(is_denorm, m_denorm, m)
-                e = arith.maxsi(e - c126_i32, c0_i32)
-                combined = (e << c2_i32) | (m >> c21_i32)
-                rounded = (combined + c1_i32) >> c1_i32
-                e2m1 = arith.minui(rounded, c7_i32)
-                return (s >> c28_i32) | e2m1
+        # FP4/FP8 scale and f32->fp4 conversion are shared with
+        # mixed_moe_gemm_2stage; helpers live in
+        # aiter.ops.flydsl.kernels.quant_utils.
+        _f32_to_e2m1 = emit_f32_to_e2m1
 
         thread_id = ArithValue(tid)
         COLS_PER_ITER = BLOCK_THREADS * VEC
@@ -273,12 +277,16 @@ def build_silu_and_mul_fq_module(
                     swiglu_neg_alpha_log2e = arith.constant(
                         -1.4426950408889634 * 1.702, type=f32
                     )
-                    if const_expr(swiglu_limit != 0):
-                        _limit = arith.constant(float(swiglu_limit), type=f32)
-                        _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
-                    else:
-                        _limit = arith.constant(7.0, type=f32)
-                        _neg_limit = arith.constant(-7.0, type=f32)
+                    # ``swiglu_limit`` is a runtime f32 scalar.  The host passes the
+                    # clamp bound (7.0 default for swiglu) or +inf to disable the
+                    # clamp (silu without a configured limit).  ``min(x, lim)`` is
+                    # expressed via the wrapped ``maximumf`` + negation so the kernel
+                    # never bakes the limit as a compile-time constant.
+                    _neg_limit = -swiglu_limit_f
+
+                    def _fmin(x):
+                        # min(x, lim) == -max(-x, -lim)
+                        return -((-x).maximumf(_neg_limit))
 
                     act_vals = []
                     for vi in range_constexpr(VEC):
@@ -295,16 +303,13 @@ def build_silu_and_mul_fq_module(
                             u = u + _load_bias_scalar(
                                 bias_row + inter_dim_i32 + bias_col
                             )
-                        gate = g
-                        linear = u
-
-                        t = g * neg_log2e
-
-                        if const_expr(swiglu_limit != 0 and act != "swiglu"):
-                            gate = arith.minimumf(gate, _limit)
-                            linear = arith.minimumf(linear, _limit)
-                            linear = arith.maximumf(linear, _neg_limit)
+                        # gate: upper-clamped only; linear: clamped to [-lim, lim].
+                        gate = _fmin(g)
+                        linear = _fmin(u).maximumf(_neg_limit)
+                        if const_expr(act == "swiglu"):
                             t = gate * swiglu_neg_alpha_log2e
+                        else:
+                            t = gate * neg_log2e
 
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -314,9 +319,10 @@ def build_silu_and_mul_fq_module(
                             f32, "llvm.amdgcn.rcp.f32", [den], [], []
                         )
                         if const_expr(act == "swiglu"):
-                            act_vals.append(gate * sig * (linear + c1_f32))
+                            act_v = gate * sig * (linear + c1_f32)
                         else:
-                            act_vals.append(gate * sig * linear)
+                            act_v = gate * sig * linear
+                        act_vals.append(act_v)
 
                     if const_expr(_need_quant):
                         local_max = c0_f32
@@ -331,12 +337,12 @@ def build_silu_and_mul_fq_module(
                             peer = local_max.shuffle_xor(off, c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        max_i32_v = local_max.bitcast(i32)
-                        # Match fp4_utils.f32_to_e8m0(max_abs / 4): round the
-                        # exponent at the 1.5x threshold before dropping mantissa.
-                        max_rounded = (max_i32_v + c0x400000_i32) & c0xFF800000_i32
-                        exp_field = max_rounded >> c23_i32
-                        e8m0_biased = arith.maxsi(exp_field - c_headroom_i32, c0_i32)
+                        # NV ROUND_UP / torchao RCEIL: scale = ceil_pow2(amax / max_pos),
+                        # 0% max-value clipping. Same formula for FP4 / FP8; only
+                        # max_pos differs (selected by ``_mx_dtype``).
+                        e8m0_biased = emit_mx_e8m0_scale(
+                            local_max, mode=_DEFAULT_MODE, dtype=_mx_dtype
+                        )
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(f32)
 
@@ -539,15 +545,16 @@ def build_silu_and_mul_fq_module(
 
     @flyc.jit
     def launch_silu_and_mul_fq(
-        x: fx.Tensor,
-        out_buf: fx.Tensor,
-        out_scale_sorted: fx.Tensor,
-        sorted_ids: fx.Tensor,
-        num_valid_ids: fx.Tensor,
-        topk_ids: fx.Tensor,
-        bias: fx.Tensor,
+        x: fx.Pointer,
+        out_buf: fx.Pointer,
+        out_scale_sorted: fx.Pointer,
+        sorted_ids: fx.Pointer,
+        num_valid_ids: fx.Pointer,
+        topk_ids: fx.Pointer,
+        bias: fx.Pointer,
         token_num: fx.Int32,
         num_sorted_rows: fx.Int32,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -564,6 +571,7 @@ def build_silu_and_mul_fq_module(
             topk_ids,
             bias,
             token_num,
+            swiglu_limit_f,
         )
         launcher.launch(
             grid=(idx_rows, 1, 1),
