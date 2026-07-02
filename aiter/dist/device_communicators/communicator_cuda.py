@@ -14,46 +14,6 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
 
-_FUSED_AR_RMS_QUANT_ALIASES = {
-    "fp8": "per_token",
-    "fp8_per_token": "per_token",
-    "per-token": "per_token",
-    "per_token": "per_token",
-    "per_token_fp8": "per_token",
-    "fp8_per_group": "per_group",
-    "per-group": "per_group",
-    "per_group": "per_group",
-    "per_group_fp8": "per_group",
-    "per_1x128": "per_group",
-    "fp4": "mxfp4",
-    "fp4_e2m1": "mxfp4",
-    "mx_fp4": "mxfp4",
-    "mxfp4": "mxfp4",
-    "per_1x32": "mxfp4",
-}
-
-
-def _normalize_fused_ar_rms_quant_type(quant_type):
-    if isinstance(quant_type, str):
-        normalized = _FUSED_AR_RMS_QUANT_ALIASES.get(quant_type.lower())
-        if normalized is not None:
-            return normalized
-    else:
-        if quant_type == QuantType.per_Token:
-            return "per_token"
-        if quant_type in (QuantType.per_1x128, getattr(QuantType, "per_128x128", None)):
-            return "per_group"
-        if quant_type == QuantType.per_1x32:
-            return "mxfp4"
-        try:
-            return _normalize_fused_ar_rms_quant_type(QuantType(quant_type))
-        except Exception:
-            pass
-    raise ValueError(
-        "unsupported fused AR+RMSNorm quant_type="
-        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
-    )
-
 
 class CudaCommunicator(DeviceCommunicatorBase):
     # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
@@ -393,6 +353,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         transpose_scale: bool = False,
         gemma_norm: bool = False,
     ):
+        # Lazy import to avoid an aiter.dist import cycle.
+        from aiter.dist.communication_op import _normalize_fused_ar_rms_quant_type
+
         quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
         if gemma_norm and quant_type != "per_token":
             raise NotImplementedError(
