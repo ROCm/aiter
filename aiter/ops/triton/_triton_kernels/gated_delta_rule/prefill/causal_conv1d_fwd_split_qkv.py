@@ -309,9 +309,8 @@ def _causal_conv1d_fwd_split_qkv_kernel(
         tl.store(v_ptrs, acc, mask=mask_feat & is_value)
 
 
-# 2D-tiled variant: loads a [feature, token] tile and vectorizes the conv over
-# both axes. grid.x decodes a flattened (sequence, chunk) schedule through
-# batch_ptr / token_chunk_offset_ptr; grid.y is the feature block.
+# 2D-tiled variant: loads a [feature, token] tile and vectorizes the conv over both axes.
+# grid.x decodes a flattened (sequence, chunk) schedule through batch_ptr / token_chunk_offset_ptr; grid.y is the feature block.
 
 
 @triton.jit()

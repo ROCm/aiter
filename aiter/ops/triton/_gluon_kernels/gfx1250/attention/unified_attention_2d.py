@@ -150,9 +150,8 @@ class AttentionConfig:
         self.LOOP_VARIANT = gl.constexpr(LOOP_VARIANT)
         self.USE_SINKS = gl.constexpr(USE_SINKS)
 
-        # Upper bound on masked tiles. +1 because the causal diagonal isnt
-        # tile-aligned, the query_span-wide band sits at an arbitrary key offset
-        # and can spill into one extra tile
+        # Upper bound on masked tiles. +1 because the causal diagonal isnt tile-aligned, the query_span-wide band sits
+        # at an arbitrary key offset and can spill into one extra tile
         QUERY_SPAN = gl.constexpr((self.BLOCK_M - 1) // self.NUM_QUERIES_PER_KV + 1)
         self.NUM_MASKED_TILES = gl.constexpr(
             (QUERY_SPAN + self.TILE_SIZE - 1) // self.TILE_SIZE + 1
@@ -2028,9 +2027,8 @@ def _unified_attention_gluon_kernel_2d(
         NUM_SPLITS,
     )
 
-    # This split owns no tiles (more splits than active tiles). The partial
-    # buffers are pre-filled with neutral values (M=-inf, L=0, acc=0) so the
-    # later reduction simply ignores it.
+    # This split owns no tiles (more splits than active tiles). The partial buffers are pre-filled with neutral values
+    # (M=-inf, L=0, acc=0) so the later reduction simply ignores it.
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
         return
 

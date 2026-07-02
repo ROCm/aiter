@@ -42,9 +42,8 @@ from aiter.ops.triton._triton_kernels.gmm import (
 # ------------------------------------------------------------------------------
 
 
-# Per-(device, stream) cache for the work stealing tile counter. A single `int32`
-# scratch buffer is reused across launches to avoid an allocator round-trip plus
-# 4-byte host to device copy on every call.
+# Per-(device, stream) cache for the work stealing tile counter. A single `int32` scratch buffer is reused across
+# launches to avoid an allocator round-trip plus 4-byte host to device copy on every call.
 _GMM_TILE_COUNTER_CACHE: dict[tuple[torch.device, int], Tensor] = {}
 
 
@@ -240,9 +239,8 @@ def gmm(
         warnings.warn(
             f"Overriding GMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
         )
-        # Copy before mutating: when `config` comes from `get_config` it's the
-        # dict cached by `@functools.lru_cache`, so an in-place write would leak
-        # the override into subsequent calls.
+        # Copy before mutating: when `config` comes from `get_config` it's the dict cached by `@functools.lru_cache`, so
+        # an in-place write would leak the override into subsequent calls.
         config = dict(config)
         config["GRID_DIM"] = grid_dim
 
@@ -450,9 +448,8 @@ def ptgmm(
         warnings.warn(
             f"Overriding PTGMM grid dim with {grid_dim} (it was {config['GRID_DIM']})."
         )
-        # Copy before mutating: when `config` comes from `get_config` it's the
-        # dict cached by `@functools.lru_cache`, so an in-place write would leak
-        # the override into subsequent calls.
+        # Copy before mutating: when `config` comes from `get_config` it's the dict cached by `@functools.lru_cache`, so
+        # an in-place write would leak the override into subsequent calls.
         config = dict(config)
         config["GRID_DIM"] = grid_dim
 

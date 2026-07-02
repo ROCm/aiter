@@ -47,9 +47,8 @@ def _rms_norm_kernel(
     output_ptr,
     g_ptr,
     rsigma_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `input_row_stride` is
-    # how much to increase `input_ptr` by to get the element one row down.
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `input_row_stride` is how much to increase `input_ptr` by to get the element one row down.
     input_row_stride,
     output_row_stride,
     # Matrix dimensions
@@ -168,9 +167,8 @@ def _quant_rms_norm_kernel(
     g_ptr,
     # Auxiliary tensor to store intermediate data
     aux_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `input_row_stride` is
-    # how much to increase `input_ptr` by to get the element one row down.
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `input_row_stride` is how much to increase `input_ptr` by to get the element one row down.
     input_row_stride,
     output_row_stride,
     aux_row_stride,
@@ -398,9 +396,8 @@ def _fused_add_rmsnorm_kernel(
     res_out_ptr,
     g_ptr,
     rsigma_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `input_row_stride` is
-    # how much to increase `input_ptr` by to get the element one row down.
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `input_row_stride` is how much to increase `input_ptr` by to get the element one row down.
     input_row_stride,
     output_row_stride,
     # Matrix dimensions
@@ -550,9 +547,8 @@ def _quant_fused_add_rmsnorm_kernel(
     g_ptr,
     # Auxiliary tensor to store intermediate data
     aux_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `input_row_stride` is
-    # how much to increase `input_ptr` by to get the element one row down.
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `input_row_stride` is how much to increase `input_ptr` by to get the element one row down.
     input_row_stride,
     output_row_stride,
     aux_row_stride,
@@ -920,8 +916,7 @@ def _rmsnorm_bwd_dg_reduce_triton(
     BLOCK_SIZE_N: tl.constexpr,
 ):
     # we want parallelism in N direction
-    # if N is small, we will just use one CU,
-    # otherwise, it can be split by N/BLOCK_SIZE
+    # if N is small, we will just use one CU, otherwise, it can be split by N/BLOCK_SIZE
     pid = tl.program_id(0)
     cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)

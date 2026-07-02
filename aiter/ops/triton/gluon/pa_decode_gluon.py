@@ -1649,8 +1649,7 @@ def paged_attention_decode_sliding_window_head_1(
     # SEQUENCE PROCESSING
 
     if ONE_SHOT and sinks_ptr is not None:
-        # sinks_ptr is per-query-head: [num_query_heads] where
-        # num_query_heads = num_kv_heads * query_group_size.
+        # sinks_ptr is per-query-head: [num_query_heads] where num_query_heads = num_kv_heads * query_group_size.
         # It is shared across query positions (query_seq_len).
         sinks_values = gl.load(
             sinks_ptr + max_logits_group_idx_in_len,
@@ -2686,8 +2685,7 @@ def paged_attention_decode_sliding_window(
     # SEQUENCE PROCESSING
 
     if ONE_SHOT and sinks_ptr is not None:
-        # sinks_ptr is per-query-head: [num_query_heads] where
-        # num_query_heads = num_kv_heads * query_group_size.
+        # sinks_ptr is per-query-head: [num_query_heads] where num_query_heads = num_kv_heads * query_group_size.
         # It is shared across query positions (query_seq_len).
         sinks_values = gl.load(
             sinks_ptr + kv_head_idx * query_group_size + max_logits_group_idx_in_len,
@@ -3600,9 +3598,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
 
     if SLIDING_WINDOW > 0:
-        # Only program 0 processes the full sliding window in a single FP32
-        # accumulation pass, avoiding BF16 intermediate quantization loss from
-        # multi-partition PS combine. All other programs early-return with defaults.
+        # Only program 0 processes the full sliding window in a single FP32 accumulation pass, avoiding BF16
+        # intermediate quantization loss from multi-partition PS combine. All other programs early-return with defaults.
         if output_partition_idx > 0:
             store_temporary_result(
                 max_logits,

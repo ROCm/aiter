@@ -183,10 +183,9 @@ def fwd(
         max_seqlens_q_local = q.shape[1] if max_seqlen_q is None else max_seqlen_q
         max_seqlens_k_local = k.shape[1] if max_seqlen_k is None else max_seqlen_k
 
-    # Use decode kernel for KV cache scenarios: k_new/v_new (incremental update),
-    # kv_batch_idx (cache batch indexing), or seqused_k without seqused_q (cache fill
-    # levels). Varlen uses both seqused_q and seqused_k for masking, so that pairing
-    # stays on prefill.
+    # Use decode kernel for KV cache scenarios: k_new/v_new (incremental update), kv_batch_idx (cache batch indexing), or
+    # seqused_k without seqused_q (cache fill levels). Varlen uses both seqused_q and seqused_k for masking, so that
+    # pairing stays on prefill.
     use_decode = (
         k_new is not None  # Have new KV to append (KV cache indicator)
         or v_new is not None  # Have new KV to append (KV cache indicator)

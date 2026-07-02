@@ -9,9 +9,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
-# HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the
-# flat-topk path uses fused min-unique routing (top-(k+1) -> drop least-batch-
-# popular -> keep-k) for batch sizes in [MIN_M (16), MAX_M (128)]. Otherwise
+# HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the flat-topk path uses fused min-unique
+# routing (top-(k+1) -> drop least-batch-popular -> keep-k) for batch sizes in [MIN_M (16), MAX_M (128)]. Otherwise
 # (unset, tiny M, or prefill) falls through to the stock path.
 _USE_HERD = os.environ.get("AITER_TRITON_USE_HERD", "") not in (
     "",
@@ -27,12 +26,10 @@ _HERD_MAX_M = int(os.environ.get("AITER_TRITON_HERD_MAX_M", "128"))
 class ExptData:
     # hist[i] is the number of tokens routed to expert i
     hist: torch.Tensor
-    # token_offs_raw[i] is the offset of the first token routed
-    # to expert i in an expert-sorted array
+    # token_offs_raw[i] is the offset of the first token routed to expert i in an expert-sorted array
     token_offs_raw: torch.Tensor
-    # token_offs_pad[i] is the offset of the first token routed
-    # to expert i in an expert-sorted array, assuming histogram
-    # rounded to the next multiple of `block_m`
+    # token_offs_pad[i] is the offset of the first token routed to expert i in an expert-sorted array, assuming
+    # histogram rounded to the next multiple of `block_m`
     token_offs_pad: torch.Tensor
     # block_id_map contain one value for each `pid`` launched by
     # the matrix multiplication kernel launched with block_m:
@@ -286,8 +283,7 @@ def routing(
     """
     num_tokens, n_expts_tot = logits.shape
 
-    # block_m heuristic from the raw logits shape and the originally requested
-    # n_expts_act.
+    # block_m heuristic from the raw logits shape and the originally requested n_expts_act.
     m = num_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))

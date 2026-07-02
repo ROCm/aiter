@@ -125,10 +125,9 @@ def _pa_decode_sparse(
         mask=h_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
-    # Fold softmax_scale AND log2(e) into q once, so the QK dot lands scores in
-    # the base-2 domain and the per-element softmax can use the bare exp2 HW
-    # instruction (v_exp_f32) instead of natural exp (which adds a *log2(e) fmac
-    # in front of every exp). Mirrors ATOM's qk_scale = softmax_scale * LOG2E.
+    # Fold softmax_scale AND log2(e) into q once, so the QK dot lands scores in the base-2 domain and the per-element
+    # softmax can use the bare exp2 HW instruction (v_exp_f32) instead of natural exp (which adds a *log2(e) fmac in
+    # front of every exp). Mirrors ATOM's qk_scale = softmax_scale * LOG2E.
     LOG2E = 1.4426950408889634
     q = (q.to(tl.float32) * (softmax_scale * LOG2E)).to(q_ptr.dtype.element_ty)
 
@@ -147,9 +146,8 @@ def _pa_decode_sparse(
     tile_end = tl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
 
     if KV_SPLITS == 1:
-        # Fold sink as initial running max so it participates in the softmax
-        # denom; sink contributes 0 to acc (virtual K with weight 1). Scores
-        # live in the base-2 domain, so lift the sink there too (* LOG2E).
+        # Fold sink as initial running max so it participates in the softmax denom; sink contributes 0 to acc (virtual K
+        # with weight 1). Scores live in the base-2 domain, so lift the sink there too (* LOG2E).
         sink = (
             tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")).to(
                 tl.float32
@@ -204,10 +202,9 @@ def _pa_decode_sparse(
 
         m_block = tl.max(scores, axis=1)
         m_new = tl.maximum(m_i, m_block)
-        # A tile with no valid key (all sentinels / out-of-range) leaves
-        # m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf) = NaN. With
-        # l_i/acc still 0 that NaN survives as 0*NaN = NaN and poisons the
-        # split's partials (and the reduce). Treat such a tile as a no-op.
+        # A tile with no valid key (all sentinels / out-of-range) leaves m_new == -inf, so exp(m_i - m_new) = exp(-inf +
+        # inf) = NaN. With l_i/acc still 0 that NaN survives as 0*NaN = NaN and poisons the split's partials (and the
+        # reduce). Treat such a tile as a no-op.
         alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp2(m_i - m_new))
         p = tl.exp2(scores - m_new[:, None])
         p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
@@ -347,29 +344,26 @@ def _pa_decode_sparse_reduce(
         other=0.0,
     )  # [KV_SPLITS, BLOCK_H, BLOCK_D]
 
-    # The main kernel's domain must match here: the triton main scales scores by
-    # softmax_scale * log2(e) and emits base-2 partials (USE_EXP2=True, exp2 +
-    # sink lifted by log2(e)); the gluon main stays in the natural-exp domain
+    # The main kernel's domain must match here: the triton main scales scores by softmax_scale * log2(e) and emits
+    # base-2 partials (USE_EXP2=True, exp2 + sink lifted by log2(e)); the gluon main stays in the natural-exp domain
     # (USE_EXP2=False, exp + sink unscaled).
     LOG2E = 1.4426950408889634
     sink_scale = LOG2E if USE_EXP2 else 1.0
 
     # Pre-sink combine across splits.
     m_max = tl.max(m_p, axis=0)  # [BLOCK_H]
-    # Empty/stale splits carry m_p == -inf. Force their weight to 0 rather than
-    # evaluating exp(m_p - m_max): when a token has *no* valid key at all,
-    # m_max is also -inf and exp(-inf + inf) = NaN would corrupt the output.
+    # Empty/stale splits carry m_p == -inf. Force their weight to 0 rather than evaluating exp(m_p - m_max): when a
+    # token has *no* valid key at all, m_max is also -inf and exp(-inf + inf) = NaN would corrupt the output.
     if USE_EXP2:
         alpha_split = tl.where(
             m_p == float("-inf"), 0.0, tl.exp2(m_p - m_max[None, :])
         )  # [KV_SPLITS, BLOCK_H]
     else:
         alpha_split = tl.where(m_p == float("-inf"), 0.0, tl.exp(m_p - m_max[None, :]))
-    # A split with zero valid keys (all -inf / sentinels) carries m_p == -inf and
-    # may have written NaN l/acc partials (the gluon main kernel does, since it
-    # has no dead-tile guard). alpha_split is 0 there, but NaN * 0 == NaN would
-    # still leak through the sum, zeroing the whole token's output. Mask the full
-    # term (not just the weight) so dead splits contribute exactly 0.
+    # A split with zero valid keys (all -inf / sentinels) carries m_p == -inf and may have written NaN l/acc partials
+    # (the gluon main kernel does, since it has no dead-tile guard). alpha_split is 0 there, but NaN * 0 == NaN would
+    # still leak through the sum, zeroing the whole token's output. Mask the full term (not just the weight) so dead
+    # splits contribute exactly 0.
     is_dead = m_p == float("-inf")  # [KV_SPLITS, BLOCK_H]
     l_combined = tl.sum(tl.where(is_dead, 0.0, l_p * alpha_split), axis=0)  # [BLOCK_H]
     acc_combined = tl.sum(

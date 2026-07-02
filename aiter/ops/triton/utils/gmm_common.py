@@ -551,8 +551,7 @@ def get_gmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool, 
     #   * Non-transposed:        shape (G, K, N), stride (K*N, N, 1) -> TRANS_RHS=False.
     #   * Transposed (layout 1): shape (G, K, N), stride (K*N, 1, K) -> TRANS_RHS=True.
     #   * Transposed (layout 2): shape (G, N, K), stride (K*N, K, 1) -> TRANS_RHS=True.
-    # Both transposed layouts hit the same TRANS_RHS branch (identical byte offsets);
-    # they differ only in metadata.
+    # Both transposed layouts hit the same TRANS_RHS branch (identical byte offsets); they differ only in metadata.
     G, rhs_d1, rhs_d2 = rhs.shape
     is_kn_shape = (rhs_d1 == K) and (rhs_d2 == N)  # (G, K, N)
     is_nk_shape = (rhs_d1 == N) and (rhs_d2 == K)  # (G, N, K)
@@ -578,12 +577,11 @@ def get_gmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool, 
         + int(is_rhs_transposed_layout_1)
         + int(is_rhs_transposed_layout_2)
     )
-    # When K == N, shape (G, K, N) and (G, N, K) are indistinguishable, and so are
-    # the strides for non-transposed and transposed layout 2: (K*N, N, 1) and
-    # (K*N, K, 1) collapse to the same tuple. The two interpretations correspond
-    # to different mathematical operations (see TRANS_RHS branches in the kernel),
-    # so we cannot disambiguate from shape+stride alone in that case. Transposed
-    # layout 1 stays unambiguous because its stride pattern (K*N, 1, K) differs.
+    # When K == N, shape (G, K, N) and (G, N, K) are indistinguishable, and so are the strides for non-transposed and
+    # transposed layout 2: (K*N, N, 1) and (K*N, K, 1) collapse to the same tuple. The two interpretations correspond to
+    # different mathematical operations (see TRANS_RHS branches in the kernel), so we cannot disambiguate from
+    # shape+stride alone in that case. Transposed layout 1 stays unambiguous because its stride pattern (K*N, 1, K)
+    # differs.
     assert num_matches == 1, (
         "rhs must match exactly one supported layout: "
         "non-transposed (shape (G, K, N), stride (K*N, N, 1)), "
@@ -632,8 +630,7 @@ def gen_tgmm_input(
         torch.manual_seed(rng_seed)
 
     if trans_lhs:
-        # Two physically equivalent transposed layouts (same memory order: K fastest,
-        # then M; only shape/stride differ).
+        # Two physically equivalent transposed layouts (same memory order: K fastest, then M; only shape/stride differ).
         if alt_trans:
             # Transposed layout 2: shape (M, K), stride (K, 1); row-major over swapped shape.
             lhs = torch.randn((M, K), dtype=torch.float32, device=device)
@@ -901,8 +898,7 @@ def get_tgmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool,
     #   * Non-transposed:        shape (K, M), stride (M, 1) -> TRANS_LHS=False.
     #   * Transposed (layout 1): shape (K, M), stride (1, K) -> TRANS_LHS=True.
     #   * Transposed (layout 2): shape (M, K), stride (K, 1) -> TRANS_LHS=True.
-    # Both transposed layouts hit the same TRANS_LHS branch (identical byte offsets);
-    # they differ only in metadata.
+    # Both transposed layouts hit the same TRANS_LHS branch (identical byte offsets); they differ only in metadata.
     lhs_d1, lhs_d2 = lhs.shape
     is_km_shape = (lhs_d1 == K) and (lhs_d2 == M)  # (K, M)
     is_mk_shape = (lhs_d1 == M) and (lhs_d2 == K)  # (M, K)
@@ -925,9 +921,8 @@ def get_tgmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool,
         + int(is_lhs_transposed_layout_1)
         + int(is_lhs_transposed_layout_2)
     )
-    # When K == M, shape (K, M) and (M, K) are indistinguishable, and so are the
-    # strides for non-transposed and transposed layout 2: (M, 1) and (K, 1)
-    # collapse to the same tuple. Transposed layout 1 stays unambiguous because
+    # When K == M, shape (K, M) and (M, K) are indistinguishable, and so are the strides for non-transposed and
+    # transposed layout 2: (M, 1) and (K, 1) collapse to the same tuple. Transposed layout 1 stays unambiguous because
     # its stride pattern (1, K) differs.
     assert num_matches == 1, (
         "lhs must match exactly one supported layout: "

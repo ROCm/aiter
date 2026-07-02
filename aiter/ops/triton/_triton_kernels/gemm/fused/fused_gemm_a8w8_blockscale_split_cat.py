@@ -33,10 +33,8 @@ def _fused_gemm_a8w8_blockscale_split_cat(
     S1,
     S2,
     S3,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_a_m` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `stride_a_m` is how much to increase `a_ptr` by to get the element one row down (A has M rows).
     stride_a_m,
     stride_a_k,
     stride_b_k,
@@ -268,10 +266,8 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     S1,
     S2,
     S3,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_a_m` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `stride_a_m` is how much to increase `a_ptr` by to get the element one row down (A has M rows).
     stride_a_m,
     stride_a_k,
     stride_b_n,

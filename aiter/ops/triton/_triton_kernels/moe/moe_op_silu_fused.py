@@ -176,8 +176,7 @@ def _fused_moe_silu_kernel_gptq_awq(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
-    # Map program ids `pid` to the block of C it should compute,
-    # grouped ordering to promote L2 data reuse.
+    # Map program ids `pid` to the block of C it should compute, grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -253,12 +252,10 @@ def _fused_moe_silu_kernel_gptq_awq(
     elif has_zp and use_int4_w4a16:
         b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
-    # Iterate to compute a block of C, accumulating in fp32 for accuracy;
-    # converted back to fp16 after the loop.
+    # Iterate to compute a block of C, accumulating in fp32 for accuracy; converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
+        # Load the next block of A and B, generate a mask by checking the K dimension.
 
         if not block_k_diviable:
             k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
@@ -489,12 +486,10 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
         elif has_zp and use_int4_w4a16:
             b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
-        # Iterate to compute a block of C, accumulating in fp32 for accuracy;
-        # converted back to fp16 after the loop.
+        # Iterate to compute a block of C, accumulating in fp32 for accuracy; converted back to fp16 after the loop.
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            # Load the next block of A and B, generate a mask by checking the
-            # K dimension.
+            # Load the next block of A and B, generate a mask by checking the K dimension.
 
             if not block_k_diviable:
                 k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
@@ -662,8 +657,7 @@ def _fused_moe_silu_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
-    # Map program ids `pid` to the block of C it should compute,
-    # grouped ordering to promote L2 data reuse.
+    # Map program ids `pid` to the block of C it should compute, grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -738,12 +732,10 @@ def _fused_moe_silu_kernel(
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
 
-    # Iterate to compute a block of C, accumulating in fp32 for accuracy;
-    # converted back to fp16 after the loop.
+    # Iterate to compute a block of C, accumulating in fp32 for accuracy; converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
+        # Load the next block of A and B, generate a mask by checking the K dimension.
         if EVEN_K:
             a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
             b = tl.load(b_ptrs)
@@ -950,8 +942,7 @@ def _fused_moe_persistent_silu_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            # Load the next block of A and B, generate a mask by checking the
-            # K dimension.
+            # Load the next block of A and B, generate a mask by checking the K dimension.
             if EVEN_K:
                 a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
                 b = tl.load(b_ptrs)

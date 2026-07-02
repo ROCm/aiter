@@ -212,17 +212,14 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
     b_g_cumsum = tl.cumsum(b_g, axis=0)
-    # Store g_cumsum in log2 space when downstream kernels consume it with exp2:
-    # exp2(x * RCP_LN2) == exp(x), keeping results identical. The scale arrives
-    # as the constexpr G_SCALE (RCP_LN2 when use_exp2 else 1.0) so the kernel
-    # never reads a module-level global; cumsum's linearity makes scaling before
-    # or after the cumsum equivalent.
+    # Store g_cumsum in log2 space when downstream kernels consume it with exp2: exp2(x * RCP_LN2) == exp(x),
+    # keeping results identical. The scale arrives as the constexpr G_SCALE (RCP_LN2 when use_exp2 else 1.0) so the
+    # kernel never reads a module-level global; cumsum's linearity makes scaling before or after the cumsum equivalent.
     if G_SCALE != 1.0:
         b_g_cumsum = b_g_cumsum * G_SCALE
 
-    # g_cumsum is stored head-major [B, H, T] (stride 1 along T) so the
-    # downstream solve/recompute, hidden-state and output kernels can read it
-    # contiguously per (batch, head).
+    # g_cumsum is stored head-major [B, H, T] (stride 1 along T) so the downstream solve/recompute,
+    # hidden-state and output kernels can read it contiguously per (batch, head).
     if IS_VARLEN:
         g_out_base = g_cumsum_out + i_h * T_flat + bos
     else:
@@ -299,11 +296,9 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     H = beta.shape[-1]
     BT = chunk_size
 
-    # Pass the ORIGINAL (cache-stable) cu_seqlens to prepare_chunk_indices
-    # together with num_decodes/num_decode_tokens, so the chunk-index build
-    # caches on the stable tensor identity and never re-fires the .tolist()
-    # D2H across forward calls. The kernel walks the pre-sliced prefill data
-    # via the rebased cu_seqlens.
+    # Pass the ORIGINAL (cache-stable) cu_seqlens to prepare_chunk_indices together with num_decodes/num_decode_tokens,
+    # so the chunk-index build caches on the stable tensor identity and never re-fires the .tolist() D2H across forward
+    # calls. The kernel walks the pre-sliced prefill data via the rebased cu_seqlens.
     if cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, BT, num_decodes, num_decode_tokens

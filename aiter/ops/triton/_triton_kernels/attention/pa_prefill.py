@@ -166,9 +166,8 @@ def _fwd_kernel(
         )
         qk *= sm_scale
         if SLIDING_WINDOW > 0:
-            # Keep each Q (pos cur_batch_ctx_len+offs_m) attending only to KV
-            # (pos start_n+offs_n) within SLIDING_WINDOW. Use -10000 not -inf so
-            # a fully-masked row doesn't make m_ij=-inf and NaN in exp().
+            # Keep each Q (pos cur_batch_ctx_len+offs_m) attending only to KV (pos start_n+offs_n) within SLIDING_WINDOW.
+            # Use -10000 not -inf so a fully-masked row doesn't make m_ij=-inf and NaN in exp().
             qk = tl.where(
                 (cur_batch_ctx_len + offs_m[:, None]) - (start_n + offs_n[None, :])
                 < SLIDING_WINDOW,

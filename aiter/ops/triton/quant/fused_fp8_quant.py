@@ -546,9 +546,8 @@ def fused_flatten_fp8_group_quant(
     out = torch.empty((M, N), dtype=dtype_quant, device=x.device)
 
     if transpose_scale:
-        # (num_bs_cols, M) row-major buffer, .T'd to a (M, num_bs_cols) view with
-        # strides (1, M); passing its natural strides writes correct memory in
-        # column-major layout with no stride special-casing or trailing .view().
+        # (num_bs_cols, M) row-major buffer, .T'd to a (M, num_bs_cols) view with strides (1, M); passing its natural
+        # strides writes correct memory in column-major layout with no stride special-casing or trailing .view().
         out_block_scales = torch.empty(
             (num_bs_cols, M), dtype=torch.float32, device=x.device
         ).T

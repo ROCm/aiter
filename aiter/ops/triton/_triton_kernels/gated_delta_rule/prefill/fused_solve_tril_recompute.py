@@ -24,9 +24,8 @@ from ..utils import prepare_chunk_indices, prepare_rebased_cu_seqlens
 from ..utils.op import exp
 from ..utils.solve_tril import FLA_TRIL_PRECISION, solve_tril
 
-# Fused vs split (solve_tril + recompute) dispatch threshold in chunks (NT):
-# at or below this NT the fused kernel wins on launch overhead. Crossover can
-# shift under CUDA-graph/async capture -- re-tune via the env var if needed.
+# Fused vs split (solve_tril + recompute) dispatch threshold in chunks (NT): at or below this NT the fused kernel wins
+# on launch overhead. Crossover can shift under CUDA-graph/async capture -- re-tune via the env var if needed.
 _SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX = int(
     os.environ.get("AITER_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", "32")
 )
@@ -390,8 +389,7 @@ def fused_solve_tril_recompute_w_u_kernel(
 
 # Split path: head-major recompute_w_u kernel (consumes pre-inverted Ai).
 # Used for long sequences where solve_tril + plain matmul beats the fused kernel.
-# Output layout [B, H, T, K/V] head-major matches the fused path so the
-# downstream hidden-state kernel (chunk_delta_h) sees the same tensors.
+# Output layout [B, H, T, K/V] head-major matches the fused path so the downstream hidden-state kernel (chunk_delta_h) sees the same tensors.
 if IS_AMD:
     # Fixed BK=BV=64, autotune over num_warps x num_stages.
     _RECOMPUTE_WU_HM_CONFIGS = [
@@ -468,8 +466,7 @@ def recompute_w_u_head_major_kernel(
     else:
         bos = i_b * T
 
-    # Load beta, Ai (inverted A), and gate eagerly so they hoist out of the
-    # V/K loops and overlap memory latency.
+    # Load beta, Ai (inverted A), and gate eagerly so they hoist out of the V/K loops and overlap memory latency.
     if IS_VARLEN:
         g_base = g + i_h * T_flat + bos
     else:
@@ -613,9 +610,8 @@ def fused_solve_tril_recompute_w_u(
     H = v.shape[-2]
     BT = A_raw.shape[-1]
 
-    # Chunk indices come from the original (cache-stable) cu_seqlens + cached
-    # decode ints (no per-forward D2H); kernels walk pre-sliced prefill data
-    # via the rebased cu_seqlens.
+    # Chunk indices come from the original (cache-stable) cu_seqlens + cached decode ints (no per-forward D2H);
+    # kernels walk pre-sliced prefill data via the rebased cu_seqlens.
     if cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, BT, num_decodes, num_decode_tokens

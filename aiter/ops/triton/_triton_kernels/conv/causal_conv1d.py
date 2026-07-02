@@ -467,8 +467,7 @@ def _causal_conv1d_update_kernel(
     # STEP 2: assume state_len > seqlen
     idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-    # The conv_state updates works in a sliding window manner,
-    # at each forward pass, the tokens are shift by 1, so we
+    # The conv_state updates works in a sliding window manner, at each forward pass, the tokens are shift by 1, so we
     # load since idx_tokens + 1.
     conv_state_ptrs_source = (
         conv_state_ptr

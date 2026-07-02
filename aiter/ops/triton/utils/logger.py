@@ -2,10 +2,8 @@ import os
 import logging
 
 
-# AITER Triton Logger: singleton around python logging, reads env var
-# AITER_TRITON_LOG_LEVEL once at init.
-# AITER_TRITON_LOG_LEVEL follows python logging levels: DEBUG, INFO, WARNING,
-# ERROR, CRITICAL.
+# AITER Triton Logger: singleton around python logging, reads env var AITER_TRITON_LOG_LEVEL once at init.
+# AITER_TRITON_LOG_LEVEL follows python logging levels: DEBUG, INFO, WARNING, ERROR, CRITICAL.
 class AiterTritonLogger(object):
     _instance = None
 

@@ -180,9 +180,8 @@ def _pa_decode_sparse(
         mask=h_mask_q[:, None],
         other=0.0,
     )
-    # Natural-exp domain (scores scaled by softmax_scale only). The shared
-    # reduce kernel is told to recombine these partials with exp (USE_EXP2=False)
-    # for the gluon path, so this kernel must NOT pre-scale q by log2(e).
+    # Natural-exp domain (scores scaled by softmax_scale only). The shared reduce kernel is told to recombine these
+    # partials with exp (USE_EXP2=False) for the gluon path, so this kernel must NOT pre-scale q by log2(e).
     mfma_q = gl.convert_layout(q, dot_q_layout)
     mfma_q = mfma_q.to(gl.float32) * softmax_scale
     mfma_q = mfma_q.to(q_ptr.dtype.element_ty)
@@ -229,9 +228,8 @@ def _pa_decode_sparse(
     acc = gl.zeros([BLOCK_H, BLOCK_D], dtype=gl.float32, layout=PV_WMMA_LAYOUT)
 
     # ---- 2-stage pipeline ----
-    # Slot tensor: loaded synchronously (analogous to physical_block_idx
-    # in gluon/mla.py). KV cache: async_gather into a 2-deep ring buffer so
-    # the next tile's gather runs in parallel with the current tile's math.
+    # Slot tensor: loaded synchronously (analogous to physical_block_idx in gluon/mla.py). KV cache: async_gather into a
+    # 2-deep ring buffer so the next tile's gather runs in parallel with the current tile's math.
     NUM_BUFFERS: gl.constexpr = 2
     kv_bufs = gl.allocate_shared_memory(
         unified_kv_ptr.dtype.element_ty,
@@ -277,9 +275,8 @@ def _pa_decode_sparse(
     k_offs_slot = gl.arange(0, BLOCK_K, layout=slot_reg_layout)
 
     # ---- Prologue ----
-    # TDM async_load slot[tile_start] -> slot_bufs[0] and slot[tile_start+1] ->
-    # slot_bufs[1] (slots run one tile ahead of the KV gather). Wait for the
-    # first, read it back to registers, and kick off the KV gather for tile 0.
+    # TDM async_load slot[tile_start] -> slot_bufs[0] and slot[tile_start+1] -> slot_bufs[1] (slots run one tile ahead
+    # of the KV gather). Wait for the first, read it back to registers, and kick off the KV gather for tile 0.
     gl.amd.gfx1250.tdm.async_load(
         slot_desc, [0, tile_start * BLOCK_K], slot_bufs.index(0)
     )
@@ -289,10 +286,9 @@ def _pa_decode_sparse(
     gl.amd.gfx1250.tdm.async_wait(1)  # slot[tile_start] ready (slot[+1] in flight)
     slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
 
-    # Async gather KV[slot_reg] -> kv_bufs[0]. When HAS_INVALID, clamp -1
-    # sentinels to 0 and carry cur_valid (slot >= 0) into the loop so it serves
-    # both the gather clamp and the per-tile softmax mask. When the caller
-    # guarantees no -1 (HAS_INVALID=False), skip the clamp and all masking.
+    # Async gather KV[slot_reg] -> kv_bufs[0]. When HAS_INVALID, clamp -1 sentinels to 0 and carry cur_valid (slot >= 0)
+    # into the loop so it serves both the gather clamp and the per-tile softmax mask. When the caller guarantees no -1
+    # (HAS_INVALID=False), skip the clamp and all masking.
     if HAS_INVALID:
         cur_valid = slot_reg >= 0
         safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
@@ -330,9 +326,8 @@ def _pa_decode_sparse(
             .load(layout=slot_reg_layout)
         )
 
-        # Async gather KV[i+1] using slot[i+1] -> kv_bufs[async_idx]. next_valid
-        # (slot[i+1] >= 0) is reused next iteration as that tile's softmax mask,
-        # so slot >= 0 is computed only once per tile.
+        # Async gather KV[i+1] using slot[i+1] -> kv_bufs[async_idx]. next_valid (slot[i+1] >= 0) is reused next
+        # iteration as that tile's softmax mask, so slot >= 0 is computed only once per tile.
         if HAS_INVALID:
             next_valid = slot_reg >= 0
             safe_next_slot = gl.where(next_valid, slot_reg, 0)
@@ -342,8 +337,7 @@ def _pa_decode_sparse(
             kv_desc, safe_next_slot, 0, kv_bufs.index(async_idx)
         )
 
-        # Wait for KV[i] (the FIFO ordering guarantees it is older than the
-        # ops we want to keep in flight).
+        # Wait for KV[i] (the FIFO ordering guarantees it is older than the ops we want to keep in flight).
         gl.amd.gfx1250.tdm.async_wait(2)
         if QUANT_KV:
             gl.amd.cdna4.async_copy.wait_group(0)
@@ -412,9 +406,8 @@ def _pa_decode_sparse(
         gl.amd.cdna4.async_copy.wait_group(0)
 
     j_final = tile_end - 1
-    # The final tile can be partial, so the in-range mask is always needed; the
-    # -1 sentinel part (cur_valid, carried from the last loop iter / prologue) is
-    # only AND-ed in when the caller may have sentinels.
+    # The final tile can be partial, so the in-range mask is always needed; the -1 sentinel part (cur_valid, carried
+    # from the last loop iter / prologue) is only AND-ed in when the caller may have sentinels.
     final_in_range = (j_final * BLOCK_K + k_offs_slot) < kv_len
     if HAS_INVALID:
         final_valid = final_in_range & cur_valid

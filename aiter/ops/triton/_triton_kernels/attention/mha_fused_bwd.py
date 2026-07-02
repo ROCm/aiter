@@ -74,8 +74,7 @@ def _bwd_preprocess(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
 
-    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout),
-    # so address each with its own strides.
+    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout), so address each with its own strides.
     offs_o = (
         bid * stride_o_b
         + hid * stride_o_h

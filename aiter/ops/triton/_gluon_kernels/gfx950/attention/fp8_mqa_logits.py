@@ -67,9 +67,8 @@ def _store_logits_block(
 
 @gluon.constexpr_function
 def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, shape):
-    # Mirrors Triton's CoalesceAsyncCopy partition (lg2(C)->reg, lg2(WS)->lane,
-    # lg2(NW)->warp, leftovers->reg) so the blocked layout stays in sync with the
-    # shared layout and async-copy folds.
+    # Mirrors Triton's CoalesceAsyncCopy partition (lg2(C)->reg, lg2(WS)->lane, lg2(NW)->warp, leftovers->reg) so the
+    # blocked layout stays in sync with the shared layout and async-copy folds.
     rank = len(shape)
     lg2_c = contiguity.bit_length() - 1
     lg2_nw = num_warps.bit_length() - 1
@@ -98,10 +97,9 @@ def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, sha
 def _make_kv_load_layouts_cdna4(
     HEAD_SIZE, BLOCK_KV, NUM_WARPS, WARP_SIZE, USE_PADDED_SHARED_LAYOUT
 ):
-    # K [HEAD_SIZE, BLOCK_KV] fp8 layouts. XOR-swizzle dim1 to break LDS
-    # bank-conflict periodicity + 1 KiB interval padding; the matching blocked
-    # layout lets CoalesceAsyncCopy fold async-copy + shared store. Older Triton:
-    # simple fallback.
+    # K [HEAD_SIZE, BLOCK_KV] fp8 layouts. XOR-swizzle dim1 to break LDS bank-conflict periodicity + 1 KiB interval
+    # padding; the matching blocked layout lets CoalesceAsyncCopy fold async-copy + shared store. Older Triton: simple
+    # fallback.
     CONTIGUITY = 16  # 128-bit vector / 8-bit fp8
     if USE_PADDED_SHARED_LAYOUT:
         LG2_HS = HEAD_SIZE.bit_length() - 1
@@ -301,9 +299,8 @@ def _mqa_dot(
 
 @gluon.constexpr_function
 def _make_head_reduction_plan(linear_layout, num_heads, block_kv, num_chains):
-    # Reg bits split into `folded` (FMA) and `summed` (gl.sum). log2(NUM_CHAINS)
-    # folded bits stay as a parallel-chain axis for shorter dependency depth
-    # to help with RAW issues
+    # Reg bits split into `folded` (FMA) and `summed` (gl.sum). log2(NUM_CHAINS) folded bits stay as a parallel-chain
+    # axis for shorter dependency depth to help with RAW issues
     assert (
         num_chains >= 1 and (num_chains & (num_chains - 1)) == 0
     ), f"num_chains must be a power of 2, got {num_chains}"
@@ -373,9 +370,8 @@ def _weighted_sum_fma_fold(
     mfma_layout: gl.constexpr,
     NUM_CHAINS: gl.constexpr = 1,
 ):
-    # sum_h(s[h, k] * w[h]) via reg-axis FMA folding. NUM_CHAINS parallel
-    # chains trade NUM_CHAINS-1 extra adds for shorter dep chain.
-    # Returns [BLOCK_KV] in SliceLayout(0, mfma_layout).
+    # sum_h(s[h, k] * w[h]) via reg-axis FMA folding. NUM_CHAINS parallel chains trade NUM_CHAINS-1 extra adds for
+    # shorter dep chain. Returns [BLOCK_KV] in SliceLayout(0, mfma_layout).
     if NUM_CHAINS < 1:
         s = s * w_col
         s = gl.sum(s, 0)
@@ -442,9 +438,8 @@ def mqa_logits_loop_double_buf(
         masked=True,
     )
     relative_end: gl.int32 = end_ind - start_ind
-    # Body: full tiles only. With loop bound `num_full_tiles - 2`, the prefetch
-    # at i+2 is guaranteed to address a full tile (i+2 in [2, num_full_tiles-1]),
-    # so no mask is needed
+    # Body: full tiles only. With loop bound `num_full_tiles - 2`, the prefetch at i+2 is guaranteed to address a full
+    # tile (i+2 in [2, num_full_tiles-1]), so no mask is needed
     buf_cur: gl.int32 = 0
     for i in tl.range(0, num_full_tiles - 2):
         kv_scales = _load_kv_scales_block(

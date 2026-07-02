@@ -145,14 +145,12 @@ def gemm_a16w16_(
         NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
         num_warps = config["num_warps"]
 
-        # K need not be aligned to BLOCK_K: the final K tile is peeled out and
-        # reloaded with set_bounds, so a partial last tile is clamped/zero-filled
-        # instead of read OOB. M/N partial tiles use descriptor bounds + store mask.
+        # K need not be aligned to BLOCK_K: the final K tile is peeled out and reloaded with set_bounds, so a partial
+        # last tile is clamped/zero-filled instead of read OOB. M/N partial tiles use descriptor bounds + store mask.
 
-        # Clamp software-pipeline depth to the K-tile count: prologue/epilogue
-        # walk a fixed NUM_BUFFERS tiles, so NUM_BUFFERS > real tiles makes loop
-        # counts go negative. Both variants peel the final K tile (one extra
-        # tile of reach); minimum depth differs:
+        # Clamp software-pipeline depth to the K-tile count: prologue/epilogue walk a fixed NUM_BUFFERS tiles, so
+        # NUM_BUFFERS > real tiles makes loop counts go negative. Both variants peel the final K tile (one extra tile
+        # of reach); minimum depth differs:
         #   bandwidth_bound : peels last tile (needs num_k_tiles >= NB)
         #                     -> cap = num_k_tiles
         #   compute_bound : preloads one tile ahead AND peels last tile
@@ -162,8 +160,7 @@ def gemm_a16w16_(
         _DEPTH_SLACK = {"compute_bound": 2}
 
         if kernel_type_from_config is None:
-            # Fall back to bandwidth_bound when the requested variant can't meet
-            # its minimum pipeline depth for this K.
+            # Fall back to bandwidth_bound when the requested variant can't meet its minimum pipeline depth for this K.
             depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
             if depth_cap < _MIN_BUFFERS[kernel_type]:
                 needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
@@ -181,9 +178,8 @@ def gemm_a16w16_(
 
         w = w.T
 
-        # Operand layout in BLAS TT/TN/NT/NN form: 'T' = row-major (trailing dim
-        # contiguous), 'N' = column-major. First char is x (A), second is w (B,
-        # after the transpose above).
+        # Operand layout in BLAS TT/TN/NT/NN form: 'T' = row-major (trailing dim contiguous), 'N' = column-major. First
+        # char is x (A), second is w (B, after the transpose above).
         if x.stride(1) == 1:
             layout = "T"
         elif x.stride(0) == 1:

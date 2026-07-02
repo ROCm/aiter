@@ -102,10 +102,9 @@ def grouped_topk(
     )
     bitmatrix_data = torch.transpose(bitmatrix_data, 0, 1)[:n_rows]
 
-    # Scratchpads. The per-column sum buffer consumed by Bitmatrix.sum() /
-    # sort_tokens must cover the full padded column count (n_cols_pad), which
-    # widens with the shared experts; sizing by n_total alone can under-allocate
-    # (e.g. n_total=257 -> n_cols_pad=512 but cdiv(257,128)*128=384).
+    # Scratchpads. The per-column sum buffer consumed by Bitmatrix.sum() / sort_tokens must cover the full padded column
+    # count (n_cols_pad), which widens with the shared experts; sizing by n_total alone can under-allocate (e.g.
+    # n_total=257 -> n_cols_pad=512 but cdiv(257,128)*128=384).
     s_blocks = triton.cdiv(n_cols_pad, BLOCK_S)
     s_cols = s_blocks * BLOCK_S
     scratchpad = torch.empty((s_cols,), dtype=torch.int32, device=dev)
@@ -222,9 +221,8 @@ def topk(
     # NOTE: these are not returned
     y_vals = torch.empty((n_rows, k), dtype=x.dtype, device=dev)
     y_indx = torch.empty((n_rows, k), dtype=torch.int16, device=dev)
-    # Triton's tl.topk fails to compile for k=1 (log_k=0 reduces the hypercube
-    # to a 0-D tensor; the final reshape hits dtype.numel). Pad to ≥ 2 — the
-    # kernel already masks N_EXPTS_ACT < N_EXPTS_ACT_PAD on store.
+    # Triton's tl.topk fails to compile for k=1 (log_k=0 reduces the hypercube to a 0-D tensor; the final reshape hits
+    # dtype.numel). Pad to ≥ 2 — the kernel already masks N_EXPTS_ACT < N_EXPTS_ACT_PAD on store.
     k_pow2 = max(2, triton.next_power_of_2(k))
     # create bitmatrix in transposed memory layout:
     n_cols_pad = triton.cdiv(n_cols, BLOCK_N) * BLOCK_N

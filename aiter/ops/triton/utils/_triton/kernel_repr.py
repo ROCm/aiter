@@ -26,9 +26,8 @@ def _sanitize_constexpr_value(value):
 
 
 def make_kernel_repr(base_name, config_keys, name_key=None):
-    # When name_key is set, the base name is taken from the matching constexpr
-    # kwarg at call time (falling back to base_name if missing/empty). Lets a
-    # single shared kernel produce caller-specific names in compiled artifacts.
+    # When name_key is set, the base name is taken from the matching constexpr kwarg at call time (falling back to
+    # base_name if missing/empty). Lets a single shared kernel produce caller-specific names in compiled artifacts.
     def _repr(specialization):
         constants = specialization.constants
 

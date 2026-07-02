@@ -109,9 +109,8 @@ def _prefetch_tensors(
     NEED_M_MASK: gl.constexpr,
     NEED_N_MASK: gl.constexpr,
 ):
-    # Schedule the global->LDS async copy for iteration `k_iter`'s A/B tile
-    # into stage `k_iter % NUM_STAGES`; caller owns the matching commit_group /
-    # wait_group.
+    # Schedule the global->LDS async copy for iteration `k_iter`'s A/B tile into stage `k_iter % NUM_STAGES`; caller owns
+    # the matching commit_group / wait_group.
     buf_idx = k_iter % NUM_STAGES
     k_off = k_iter * BLOCK_SIZE_K
     a_ptr_iter = a_ptr + k_off * stride_ak
@@ -154,9 +153,8 @@ def _load_shared(
     dot_b_layout: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
-    # LDS -> register read of stage `k_iter % NUM_STAGES` into the mfma_scaled
-    # dot-operand layouts. `load_shared_relaxed` omits the cross-warp ds_read
-    # fence since the caller's wait_group already synchronizes the wave.
+    # LDS -> register read of stage `k_iter % NUM_STAGES` into the mfma_scaled dot-operand layouts.
+    # `load_shared_relaxed` omits the cross-warp ds_read fence since the caller's wait_group already synchronizes the wave.
     buf_idx = k_iter % NUM_STAGES
     a = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_a.index(buf_idx), dot_a_layout)
     b = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_b.index(buf_idx), dot_b_layout)
@@ -178,12 +176,10 @@ def _prefetch_scales(
     GROUP_K: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
-    # Independent global->LDS stream for the per-K-tile (a_scale, b_scale) pair.
-    # Scales are pipelined separately from A/B: they feed mfma_scaled via
-    # SGPR-style broadcasts (A/B via ds_read_b128 into AGPRs), so fusing them
-    # into one stage would waste ds_read bandwidth on a tiny tensor. Triton
-    # doesn't hoist scale loads, so this explicit pipelining is the main perf
-    # delta vs. the Triton kernel.
+    # Independent global->LDS stream for the per-K-tile (a_scale, b_scale) pair. Scales are pipelined separately from A/B:
+    # they feed mfma_scaled via SGPR-style broadcasts (A/B via ds_read_b128 into AGPRs), so fusing them into one stage
+    # would waste ds_read bandwidth on a tiny tensor. Triton doesn't hoist scale loads, so this explicit pipelining is
+    # the main perf delta vs. the Triton kernel.
     buf_idx = k_iter % NUM_STAGES
     k_scale_off = k_iter * (BLOCK_SIZE_K // GROUP_K)
     a_scale_ptr_iter = a_scale_ptr + k_scale_off * stride_ascale_k
@@ -358,9 +354,8 @@ def _compute_MN_tile(
     offs_a = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
     offs_b = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
-    # Scale offsets in the 1D blocked layout used by the direct-to-LDS loads.
-    # B_scale indexes the N-grouped vector, so one B_scale element broadcasts
-    # across GROUP_N lanes that write the same value to LDS (harmless).
+    # Scale offsets in the 1D blocked layout used by the direct-to-LDS loads. B_scale indexes the N-grouped vector, so
+    # one B_scale element broadcasts across GROUP_N lanes that write the same value to LDS (harmless).
     offs_am_scale_blk = pid_m * BLOCK_SIZE_M + gl.arange(
         0, BLOCK_SIZE_M, layout=blocked_scale
     )
@@ -515,10 +510,9 @@ def _compute_MN_tile(
         prev_a = cur_a
         prev_b = cur_b
 
-    # Wind-down: statically unrolled to eliminate the `prev_a, prev_b` PHI so
-    # the main loop's dot operands stay AGPR-resident. Runtime `num_k_iter > N`
-    # guards protect negative slot indices when K is short; for small K only
-    # the Final iter below runs (assumes num_k_iter >= 1).
+    # Wind-down: statically unrolled to eliminate the `prev_a, prev_b` PHI so the main loop's dot operands stay
+    # AGPR-resident. Runtime `num_k_iter > N` guards protect negative slot indices when K is short; for small K only the
+    # Final iter below runs (assumes num_k_iter >= 1).
     if EVEN_K:
         if num_k_iter > 1:
             gl.amd.cdna4.async_copy.wait_group(0)
@@ -731,8 +725,7 @@ def _gemm_a8w8_blockscale_kernel(
     M,
     N,
     K,
-    # Strides: ptr increment per 1 element in a dimension. E.g. `stride_am`
-    # advances `a_ptr` one row down (A has M rows).
+    # Strides: ptr increment per 1 element in a dimension. E.g. `stride_am` advances `a_ptr` one row down (A has M rows).
     stride_am,
     stride_ak,
     stride_bk,
@@ -1008,9 +1001,8 @@ def _get_config(
         if potential_block_m.isnumeric():
             bounds.append(int(potential_block_m))
 
-    # Walk buckets in ascending-M order; pick the smallest whose tile the
-    # kernel supports. Unsupported buckets are skipped (they revive once the
-    # kernel grows the matching padded-LDS layouts), so we may fall to "any".
+    # Walk buckets in ascending-M order; pick the smallest whose tile the kernel supports. Unsupported buckets are
+    # skipped (they revive once the kernel grows the matching padded-LDS layouts), so we may fall to "any".
     config = _get_config._config_dict[key]["any"]
     for bound in sorted(bounds):
         if M > bound or f"M_LEQ_{bound}" not in _get_config._config_dict[key]:

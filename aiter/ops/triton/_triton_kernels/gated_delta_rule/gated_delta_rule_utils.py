@@ -47,9 +47,8 @@ GATED_DELTA_RULE_TRITON_AUTOTUNE = os.environ.get(
     "GATED_DELTA_RULE_TRITON_AUTOTUNE", "0"
 ).lower() in ("1", "true", "yes", "on")
 
-# log2(e) == 1/ln(2). Converts natural-log gate values to log2 space so
-# kernels can use exp2 instead of exp. Python/wrapper-only: pass into kernels
-# as a constexpr scale (e.g. G_SCALE); never reference inside @triton.jit kernels.
+# log2(e) == 1/ln(2). Converts natural-log gate values to log2 space so kernels can use exp2 instead of exp.
+# Python/wrapper-only: pass into kernels as a constexpr scale (e.g. G_SCALE); never reference inside @triton.jit kernels.
 RCP_LN2: float = math.log2(math.e)
 
 

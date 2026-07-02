@@ -494,9 +494,8 @@ def _fwd_kernel_splitK(
         v_mask = (offs_n < N_CTX_K_FINAL)[:, None]
         osk_mask = (offs_m < N_CTX_Q)[:, None]
 
-    # scale sm_scale by log_2(e) and use
-    # 2^x instead of exp in the loop because CSE and LICM
-    # don't work as expected with `exp` in the loop
+    # scale sm_scale by log_2(e) and use 2^x instead of exp in the loop because CSE and LICM don't work as expected
+    # with `exp` in the loop
     qk_scale = sm_scale * 1.44269504
 
     # load q: it will stay in SRAM throughout
@@ -536,9 +535,8 @@ def _fwd_kernel_splitK(
                 process_end = tl.minimum(hi - block_start, BLOCK_SIZE_K)
                 process_end = tl.minimum(process_end, block_end - block_start)
 
-                # Floor-align to BLOCK_N so the tile containing process_start is
-                # covered; masking below removes columns outside [lo, hi), giving
-                # identical coverage without duplication.
+                # Floor-align to BLOCK_N so the tile containing process_start is covered; masking below removes
+                # columns outside [lo, hi), giving identical coverage without duplication.
                 aligned_start = (process_start // BLOCK_N) * BLOCK_N
                 if aligned_start > 0 and aligned_start + BLOCK_N > process_start:
                     # ensure we include the tile that contains process_start
@@ -1049,9 +1047,8 @@ def attention_forward_decode_triton_impl(
     )
     use_cache_seqlens = cache_seqlens is not None
     use_sliding_window = window_size_left != -1 or window_size_right != -1
-    # WINDOW_SIZE_RIGHT is a literal finite offset (no infinite-right branch), so a
-    # negative right would silently over-mask; reject it. (right == -1 is only the
-    # off sentinel, paired with left == -1, which leaves this flag False.)
+    # WINDOW_SIZE_RIGHT is a literal finite offset (no infinite-right branch), so a negative right would silently
+    # over-mask; reject it. (right == -1 is only the off sentinel, paired with left == -1, which leaves this flag False.)
     if use_sliding_window and window_size_right < 0:
         raise NotImplementedError(
             "Sliding-window attention requires window_size_right >= 0 "

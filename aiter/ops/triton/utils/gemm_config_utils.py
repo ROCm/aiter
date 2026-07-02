@@ -216,8 +216,7 @@ def compute_splitk_params(config: dict, K: int) -> dict:
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
 
     if "BLOCK_SIZE_K" in config:
-        # If NUM_KSPLIT makes K too small, then BLOCK_K will decrease to be smaller than
-        # GROUP_K.
+        # If NUM_KSPLIT makes K too small, then BLOCK_K will decrease to be smaller than GROUP_K.
         while (
             config["NUM_KSPLIT"] > 1
             and config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]
@@ -259,8 +258,7 @@ def _gemm_lds_bytes(
     elem_a = block_m * block_k
     elem_b = block_k * block_n
     if use_async_padding:
-        # Padded shared encoding + N buffers (matches TensorAtlas
-        # _estimate_triton_lds_async_copy / tritonBLAS origami).
+        # Padded shared encoding + N buffers (matches TensorAtlas _estimate_triton_lds_async_copy / tritonBLAS origami).
         pa = _padded_size_32_4(elem_a)
         pb = _padded_size_32_4(elem_b)
         if block_k & (block_k - 1) == 0:
@@ -281,8 +279,8 @@ def pick_gemm_num_stages(
 ):
     assert min(block_m, block_n, block_k, bits_a, bits_b) > 0
     # bits_a / bits_b: element bit-widths (8 for fp8, 4 for mxfp4).
-    # use_async_padding: True when the kernel lowers to async direct-to-LDS
-    # with padded shared encoding (e.g. a4w4 on gfx950).
+    # use_async_padding: True when the kernel lowers to async direct-to-LDS with padded shared encoding
+    # (e.g. a4w4 on gfx950).
     cap = arch_info._LDS_CAP_BYTES.get(arch)
     if cap is None:
         return 2

@@ -173,9 +173,8 @@ def _causal_conv1d_update_single_token_kernel(
     # STEP 2: assume state_len > seqlen
     idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-    # With speculative decoding, the conv_state updates works in a sliding
-    # window manner, at each forward pass, the tokens are shift by 1, so we
-    # load since idx_tokens + 1.
+    # With speculative decoding, the conv_state updates works in a sliding window manner, at each forward pass, the
+    # tokens are shift by 1, so we load since idx_tokens + 1.
     conv_state_ptrs_source = (
         conv_state_ptr
         + (conv_states_input_coord * stride_conv_state_seq)
@@ -453,9 +452,8 @@ def _reshape_causal_conv1d_update_single_token_kernel(
         # STEP 2: assume state_len > seqlen
         idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-        # With speculative decoding, the conv_state updates works in a sliding
-        # window manner, at each forward pass, the tokens are shift by 1, so we
-        # load since idx_tokens + 1.
+        # With speculative decoding, the conv_state updates works in a sliding window manner, at each forward pass, the
+        # tokens are shift by 1, so we load since idx_tokens + 1.
         conv_state_ptrs_source = (
             conv_state_ptr
             + (conv_states_input_coord * stride_conv_state_seq)

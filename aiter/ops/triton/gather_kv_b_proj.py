@@ -36,9 +36,8 @@ def gather_kv_b_proj(
 
     qk_nope_head_dim = weight_n // tp_k_head_num_k - v_head_dim
 
-    # Three scale modes: None -> unquantized weight (NO_SCALE branch skips
-    # scale load/multiply); dim==1 or [N,1] -> per-row; else per-block
-    # ([N//128, K//128]).
+    # Three scale modes: None -> unquantized weight (NO_SCALE branch skips scale load/multiply); dim==1 or [N,1] ->
+    # per-row; else per-block ([N//128, K//128]).
     no_scale = kv_proj_scale is None
     if no_scale:
         # Triton needs a non-None pointer per kernel arg even when unread; pass
@@ -92,8 +91,7 @@ def gather_kv_b_proj(
             f"shuffled_kv_cache gather requires block_size % 16 == 0 (16-token "
             f"shuffle groups), got block_size={block_size}"
         )
-        # Shuffle keeps each token's data in its own block, so a chunk spans
-        # exactly one block (KBlocksPerChunkK == 1).
+        # Shuffle keeps each token's data in its own block, so a chunk spans exactly one block (KBlocksPerChunkK == 1).
         ChunkK = block_size
     elif is_fp4_weight:
         ChunkK = 64

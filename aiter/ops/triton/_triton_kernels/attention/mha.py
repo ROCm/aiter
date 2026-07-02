@@ -154,9 +154,8 @@ def _attn_fwd_inner(
         # TODO: This can be optimized to only be true for the padded block.
         mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
         if MASK_STEPS:
-            # Mask the last block when seqlen_k is not a multiple of BLOCK_N.
-            # Computing mask_partial unconditionally (vs the old if) removes the
-            # if-else from the causal loop, helping scheduling and register pressure.
+            # Mask the last block when seqlen_k is not a multiple of BLOCK_N. Computing mask_partial unconditionally (vs
+            # the old if) removes the if-else from the causal loop, helping scheduling and register pressure.
             # if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
             bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
             size_n = start_n + OFFS_N[None, :]
@@ -497,12 +496,10 @@ def _attn_fwd(
 
     n_blocks = _cdiv_fn(seqlen_k, BLOCK_N)
 
-    # Early-exit for causal: when seqlen_q > seqlen_k, some M rows are fully
-    # masked (0 written to output, inf to LSE) and need no GEMMs. Determine N and
-    # whether this WG covers those rows.
+    # Early-exit for causal: when seqlen_q > seqlen_k, some M rows are fully masked (0 written to output, inf to LSE)
+    # and need no GEMMs. Determine N and whether this WG covers those rows.
     if IS_CAUSAL:
-        # Causal boundary is bottom-right aligned; for rectangular scores this
-        # reduces n_blocks for this WG.
+        # Causal boundary is bottom-right aligned; for rectangular scores this reduces n_blocks for this WG.
         n_blocks_seqlen = _cdiv_fn(
             (start_m + 1) * BLOCK_M + seqlen_k - seqlen_q, BLOCK_N
         )
@@ -685,9 +682,8 @@ def _attn_fwd(
     is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
     skipped_blocks = 0
     if SLIDING_WINDOW > 0:
-        # Skip K blocks that are fully left of the earliest key position
-        # reachable by this Q block. The first retained block can still be
-        # partially outside the window, so we keep the per-element mask below.
+        # Skip K blocks that are fully left of the earliest key position reachable by this Q block. The first retained
+        # block can still be partially outside the window, so we keep the per-element mask below.
         window_start_n = start_m * BLOCK_M + seqlen_k - seqlen_q - SLIDING_WINDOW
         skipped_blocks = tl.maximum(window_start_n, 0) // BLOCK_N
         skipped_blocks = tl.minimum(skipped_blocks, n_blocks)
@@ -839,10 +835,9 @@ def _attn_fwd(
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
-    # If seqlen_q > seqlen_k but the delta is not a multiple of BLOCK_M,
-    # then we have one block with a row of all NaNs which come from computing
-    # softmax over a row of all -infs (-inf - inf = NaN). We check for that here
-    # and store 0s where there are NaNs as these rows should've been zeroed out.
+    # If seqlen_q > seqlen_k but the delta is not a multiple of BLOCK_M, then we have one block with a row of all NaNs
+    # which come from computing softmax over a row of all -infs (-inf - inf = NaN). We check for that here and store 0s
+    # where there are NaNs as these rows should've been zeroed out.
     end_m_idx = (start_m + 1) * BLOCK_M
     start_m_idx = start_m * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k

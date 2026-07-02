@@ -825,8 +825,7 @@ def _bwd_dq_inner_split(
     curr_philox_offset = batch_philox_offset
     for blk_idx in range(num_steps):
         offs_n = curr_n + tl.arange(0, BLOCK_N)
-        # end_n is needed because the end of causal True might not be perfectly
-        # aligned with the end of the block
+        # end_n is needed because the end of causal True might not be perfectly aligned with the end of the block
         mask_n = offs_n < end_n
         mask_kT = mask_n[None, :]
         mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
@@ -1388,9 +1387,8 @@ def _bwd_kernel_fused_atomic_causal(
         else:
             start_m = max(start_n + delta_qk, 0)
             start_m = (start_m // BLOCK_M) * BLOCK_M
-            # because we might shift the masked blocks up, we are deeper into
-            # the masked out region, so we would potentially increase the total
-            # steps with masked operation to get out of it
+            # because we might shift the masked blocks up, we are deeper into the masked out region, so we would
+            # potentially increase the total steps with masked operation to get out of it
             residue_m = max(start_n + delta_qk - start_m, 0)
             len_m = BLOCK_N + residue_m
 
@@ -1698,9 +1696,8 @@ def _bwd_kernel_split_dkdv_causal(
         else:
             start_m = max(start_n + delta_qk, 0)
             start_m = start_m // BLOCK_M * BLOCK_M
-            # because we might shift the masked blocks up, we are deeper into
-            # the masked out region, so we would potentially increase the total
-            # steps with masked operation to get out of it
+            # because we might shift the masked blocks up, we are deeper into the masked out region, so we would
+            # potentially increase the total steps with masked operation to get out of it
             residue_m = max(start_n + delta_qk - start_m, 0)
             len_m = BLOCK_N + residue_m
 
@@ -1962,8 +1959,7 @@ def _bwd_kernel_split_dq_causal(
     for head_q_idx in range(
         head_k_idx * GROUP_SIZE, head_k_idx * GROUP_SIZE + GROUP_SIZE
     ):
-        # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front
-        #   for every M-tile
+        # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front for every M-tile
         end_n = start_m + BLOCK_M - delta_qk
         # clamp end_n at [0, seqlen_k]
         end_n = max(min(end_n, seqlen_k), 0)
@@ -3080,8 +3076,7 @@ def _bwd_dq_inner(
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
-        # end_n is needed because the end of causal True might not be perfectly
-        # aligned with the end of the block
+        # end_n is needed because the end of causal True might not be perfectly aligned with the end of the block
         mask_n = offs_n < end_n
         if DEBUG_TRITON_DETAIL:
             print(
@@ -3462,9 +3457,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             else:
                 start_m = max(start_n + delta_qk, 0)
                 start_m = start_m // BLOCK_M1 * BLOCK_M1
-                # because we might shift the masked blocks up, we are deeper into
-                # the masked out region, so we would potentially increase the total
-                # steps with masked operation to get out of it
+                # because we might shift the masked blocks up, we are deeper into the masked out region, so we would
+                # potentially increase the total steps with masked operation to get out of it
                 residue_m = max(start_n + delta_qk - start_m, 0)
                 len_m = BLOCK_N1 + residue_m
                 if DEBUG_TRITON:
@@ -3573,9 +3567,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
             start_m += num_steps * MASK_BLOCK_M1
-            # The unmasked region runs from the diagonal to seqlen_q. With a
-            # finite left window, queries more than WINDOW_SIZE_LEFT past this
-            # K block attend nothing in it, so cap the sweep at that upper bound.
+            # The unmasked region runs from the diagonal to seqlen_q. With a finite left window, queries more than
+            # WINDOW_SIZE_LEFT past this K block attend nothing in it, so cap the sweep at that upper bound.
             if USE_SLIDING_WINDOW and WINDOW_SIZE_LEFT >= 0:
                 # m_hi = (n_hi + WINDOW_SIZE_LEFT) - (seqlen_k - seqlen_q)
                 m_hi = (start_n + BLOCK_N1 - 1) + WINDOW_SIZE_LEFT + delta_qk
@@ -3691,8 +3684,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
 
         # If MQA / GQA, set the K and V head offsets appropriately.
         for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
-            # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front
-            #   for every M-tile
+            # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front for every M-tile
             end_n = start_m + BLOCK_M2 - delta_qk
             # clamp end_n at [0, seqlen_k]
             end_n = max(min(end_n, seqlen_k), 0)
@@ -3797,9 +3789,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
             end_n -= num_steps * MASK_BLOCK_N2
-            # The unmasked region runs from 0 up to the diagonal (end_n). With a
-            # finite left window, keys more than WINDOW_SIZE_LEFT before this Q
-            # block fall outside the band, so raise the lower bound.
+            # The unmasked region runs from 0 up to the diagonal (end_n). With a finite left window, keys more than
+            # WINDOW_SIZE_LEFT before this Q block fall outside the band, so raise the lower bound.
             if USE_SLIDING_WINDOW and WINDOW_SIZE_LEFT >= 0:
                 # n_lo = start_m - (seqlen_q - seqlen_k) - WINDOW_SIZE_LEFT
                 n_lo = start_m - delta_qk - WINDOW_SIZE_LEFT
@@ -4614,9 +4605,8 @@ def attention_backward_triton_impl(
         raise NotImplementedError(
             "Sliding-window backward is currently implemented for fused mode only."
         )
-    # Only an infinite *left* edge (WINDOW_SIZE_LEFT < 0) is special-cased; there
-    # is no infinite-right path, so an active window requires window_size_right >= 0
-    # (a negative right bound would silently mask out almost everything).
+    # Only an infinite *left* edge (WINDOW_SIZE_LEFT < 0) is special-cased; there is no infinite-right path, so an
+    # active window requires window_size_right >= 0 (a negative right bound would silently mask out almost everything).
     if use_sliding_window and window_size_right < 0:
         raise NotImplementedError(
             "Sliding-window backward requires window_size_right >= 0 "
@@ -4700,8 +4690,7 @@ def attention_backward_triton_impl(
     if DEBUG:
         print("delta:", delta, delta.shape)
 
-    # dropout mask tensor for debugging. We dump the dropout mask created in
-    #   the kernel for testing
+    # dropout mask tensor for debugging. We dump the dropout mask created in the kernel for testing
     dropout_mask = None
     stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn = (0, 0, 0, 0)
     if use_dropout:

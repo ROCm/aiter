@@ -1105,11 +1105,10 @@ def attn_fwd(
     """
 
     # Compute pointers for all the tensors used in this kernel.
-    # When HEAD_STRIDE_ALIGNED_8 is set the head-axis offset is a multiple of 8
-    # elements; the resulting byte alignment is dtype-dependent (16B for fp16/bf16,
-    # 8B for fp8, 32B for fp32). Only the 16-byte case lets AxisInfo widen the K/V
-    # load to 128-bit (buffer_load_b128). Auto-specialization fires only at the
-    # 16-element threshold, so hint the smaller multiple explicitly.
+    # When HEAD_STRIDE_ALIGNED_8 is set the head-axis offset is a multiple of 8 elements; the resulting byte alignment
+    # is dtype-dependent (16B for fp16/bf16, 8B for fp8, 32B for fp32). Only the 16-byte case lets AxisInfo widen the K/V
+    # load to 128-bit (buffer_load_b128). Auto-specialization fires only at the 16-element threshold, so hint the smaller
+    # multiple explicitly.
     qh_off = off_h_q * stride_qh
     kh_off = off_h_k * stride_kh
     vh_off = off_h_k * stride_vh
@@ -1742,12 +1741,10 @@ def attention_forward_prefill_triton_impl(
 
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
-    # The kernel only special-cases an infinite *left* edge (WINDOW_SIZE_LEFT < 0).
-    # WINDOW_SIZE_RIGHT is always a literal finite offset, so a negative right does
-    # not mean "unbounded" -- it collapses right_bound to (anchor - 1) and silently
-    # over-masks. Reject it. (right == -1 is only valid as the "off" sentinel,
-    # together with left == -1.) Matches the backward guard in
-    # attention_backward_triton_impl.
+    # The kernel only special-cases an infinite *left* edge (WINDOW_SIZE_LEFT < 0). WINDOW_SIZE_RIGHT is always a literal
+    # finite offset, so a negative right does not mean "unbounded" -- it collapses right_bound to (anchor - 1) and
+    # silently over-masks. Reject it. (right == -1 is only valid as the "off" sentinel, together with left == -1.)
+    # Matches the backward guard in attention_backward_triton_impl.
     if use_sliding_window and window_size_right < 0:
         raise NotImplementedError(
             "Sliding-window attention requires window_size_right >= 0 "
@@ -1815,10 +1812,9 @@ def attention_forward_prefill_triton_impl(
 
     num_xcd = 1 if arch.is_rdna else 8
 
-    # Soundness precondition for the `tl.multiple_of` head-stride hint in attn_fwd:
-    # only enable when every Q/K/V head-axis stride is a multiple of 8 elements.
-    # A non-contiguous input (e.g. transposed view) can have stride_*h != head_dim,
-    # so the head_dim constexpr alone is not enough.
+    # Soundness precondition for the `tl.multiple_of` head-stride hint in attn_fwd: only enable when every Q/K/V
+    # head-axis stride is a multiple of 8 elements. A non-contiguous input (e.g. transposed view) can have stride_*h !=
+    # head_dim, so the head_dim constexpr alone is not enough.
     head_stride_aligned_8 = (
         stride_qh % 8 == 0 and stride_kh % 8 == 0 and stride_vh % 8 == 0
     )

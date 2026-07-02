@@ -140,9 +140,8 @@ def pa_decode_sparse(
 
     use_gluon = DEVICE_ARCH == "gfx1250"
 
-    # gfx1250 stages slots through LDS via TDM async_load, which hides the
-    # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
-    # arches use the synchronous slot path, where 32 exposes memory latency.
+    # gfx1250 stages slots through LDS via TDM async_load, which hides the larger per-tile KV gather latency
+    # -> BLOCK_K=32 is fastest there. Other arches use the synchronous slot path, where 32 exposes memory latency.
     if use_gluon:
         block_k = 32
         attn_num_warps = 2

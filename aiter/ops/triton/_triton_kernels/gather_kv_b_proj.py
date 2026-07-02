@@ -199,9 +199,8 @@ def _triton_gather_kv_b_proj_fp4_impl(
         packed_cols = seg * PackedScaleKGranularity + offs_k_packed[:, None]
 
         if WEIGHT_PRESHUFFLE:
-            # Inverse of aiter.ops.shuffle.shuffle_weight for uint8/packed-fp4
-            # tensors with layout=(16, 16).  It maps logical [N, K//2]
-            # coordinates back into the preshuffled storage.
+            # Inverse of aiter.ops.shuffle.shuffle_weight for uint8/packed-fp4 tensors with layout=(16, 16).
+            # It maps logical [N, K//2] coordinates back into the preshuffled storage.
             k_n0 = k_abs_rows[None, :] // 16
             k_bn = k_abs_rows[None, :] % 16
             k_k0 = packed_cols // 32
@@ -457,8 +456,7 @@ def _triton_gather_kv_b_proj_impl(
         v_scale_n_idx = v_abs_rows // ScaleNGranularity
 
     if WEIGHT_PRESHUFFLE:
-        # _load_unshuffle_segment returns [PaddedHeadDim, ScaleKGranularity]
-        # with zero-filled rows beyond HeadDim
+        # _load_unshuffle_segment returns [PaddedHeadDim, ScaleKGranularity] with zero-filled rows beyond HeadDim
         k_nope_weight_0 = _load_unshuffle_segment(
             k_head_base, 0, QkNopeHeadDim, PaddedK, KV_CDim, ScaleKGranularity
         ).to(k_type)
@@ -578,12 +576,11 @@ def _triton_gather_kv_b_proj_impl(
             other=0.0,
         ).to(tl.float32)
 
-    # Within-block element layout. Plain: each token's (KV_CDim + KV_PeDim)
-    # latent contiguous. Shuffled (cat_and_cache_mla(shuffled_kv_cache=True)):
-    # groups 16 tokens and K_WIDTH-wide dim segments for MFMA-friendly access;
-    # per block the first KBlockSize*KV_CDim elements are the shuffled lora part,
-    # the remaining KBlockSize*KV_PeDim the shuffled rope part. Offsets are
-    # separable into token and dim parts, mapping onto the existing 2-D loads.
+    # Within-block element layout. Plain: each token's (KV_CDim + KV_PeDim) latent contiguous. Shuffled
+    # (cat_and_cache_mla(shuffled_kv_cache=True)): groups 16 tokens and K_WIDTH-wide dim segments for MFMA-friendly
+    # access; per block the first KBlockSize*KV_CDim elements are the shuffled lora part, the remaining
+    # KBlockSize*KV_PeDim the shuffled rope part. Offsets are separable into token and dim parts, mapping onto the
+    # existing 2-D loads.
     if SHUFFLED_KV_CACHE:
         if k_buffer.dtype.element_ty == tl.bfloat16:
             K_WIDTH: tl.constexpr = 8

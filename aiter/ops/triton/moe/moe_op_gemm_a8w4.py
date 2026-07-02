@@ -110,9 +110,8 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
         }
 
     # Fallback for shapes not in the tuned dispatch JSON.
-    # Look for a tuned entry with the same (N, K) but any block_m — the tile
-    # geometry and num_stages from that entry are a better starting point than
-    # a generic default, and avoid regressing to num_stages=1 on gfx950.
+    # Look for a tuned entry with the same (N, K) but any block_m — the tile geometry and num_stages from that entry are
+    # a better starting point than a generic default, and avoid regressing to num_stages=1 on gfx950.
     # Under CDNA4 swizzle, skip BLOCK_K<256 entries since unswizzle can't compile them.
     dispatch = _get_a8w4_dispatch(arch)
     proxy = next(
@@ -175,9 +174,8 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
-            # Floor at 64 (was 32): out_mx_quant=True with apply_swiglu requires
-            # OUT_BLOCK_N = BLOCK_N // 2 >= 32. Loop boundary changed to keep
-            # block_n >= 64 for both MX and non-MX paths.
+            # Floor at 64 (was 32): out_mx_quant=True with apply_swiglu requires OUT_BLOCK_N = BLOCK_N // 2 >= 32. Loop
+            # boundary changed to keep block_n >= 64 for both MX and non-MX paths.
             while block_n >= 128 and grid < get_num_sms():
                 block_n = block_n // 2
                 grid_m = routing_data.n_blocks(m, block_m)
@@ -199,9 +197,8 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
                 num_warps = 4
 
         elif block_m == 64:
-            # V4-Flash prefill-tuned (rocprof brute force v2): for block_m=64,
-            # (bn=128, nw=4, ns=1) gives 2-4x speedup over the previous bn=512/nw=8
-            # default on all four V4-Flash prefill shapes.
+            # V4-Flash prefill-tuned (rocprof brute force v2): for block_m=64, (bn=128, nw=4, ns=1) gives 2-4x speedup
+            # over the previous bn=512/nw=8 default on all four V4-Flash prefill shapes.
             block_n = 128
             num_warps = 4
             num_stages = 1
@@ -214,9 +211,8 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
             # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
             num_warps = 4 if block_m == 128 else 8
 
-        # bits_a=8 (fp8), bits_b=4 (mxfp4). Picks ns=2 when the tile fits in LDS,
-        # else falls back to ns=1. The previous hardcoded ns=1 silently regressed
-        # gpt-oss W4A8 MoE shapes by 30-40% vs the JSON-tuned ns=2 winners; the
+        # bits_a=8 (fp8), bits_b=4 (mxfp4). Picks ns=2 when the tile fits in LDS, else falls back to ns=1. The previous
+        # hardcoded ns=1 silently regressed gpt-oss W4A8 MoE shapes by 30-40% vs the JSON-tuned ns=2 winners; the
         # block_m==64 branch keeps its rocprof-tuned ns=1 override.
         if block_m != 64:
             num_stages = pick_gemm_num_stages(
@@ -359,12 +355,10 @@ def moe_gemm_a8w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
-    # Idea 1: emit (fp8 e4m3, ue8m0 per-1×32 scale) directly from the GEMM
-    # write-back. When out_mx_quant=True, returns (y_fp8, y_scale_ue8m0).
-    # Requires SPLIT_K==1 and no scatter_indx (GEMM1-style).
+    # Idea 1: emit (fp8 e4m3, ue8m0 per-1×32 scale) directly from the GEMM write-back. When out_mx_quant=True, returns
+    # (y_fp8, y_scale_ue8m0). Requires SPLIT_K==1 and no scatter_indx (GEMM1-style).
     out_mx_quant: bool = False,
-    # External residual to fold into reduce_grouped writeback (saves the
-    # standalone routed+shared elementwise add).
+    # External residual to fold into reduce_grouped writeback (saves the standalone routed+shared elementwise add).
     residual=None,
 ):
     """
@@ -387,9 +381,8 @@ def moe_gemm_a8w4(
     num_tokens = x.shape[-2]
     M = num_tokens if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
-    # Output buffer must be sized to the PADDED N: the kernel writes full
-    # block_n columns per tile (grid_n * block_n cols total), which can exceed
-    # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
+    # Output buffer must be sized to the PADDED N: the kernel writes full block_n columns per tile (grid_n * block_n
+    # cols total), which can exceed unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
     padded_N = N
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:
@@ -404,9 +397,8 @@ def moe_gemm_a8w4(
         config = get_kernel_config_gluon(M, N, K, routing_data)
     else:
         config = get_kernel_config_triton(M, N, K, routing_data, swizzle_mx_scale)
-    # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries
-    # pick BK<256 for utilization. Clamp only when swizzle is requested so
-    # StridedLayout callers keep their tuned BK<256.
+    # CDNA4 swizzle requires BLOCK_K % 256 == 0; some tuned small-K entries pick BK<256 for utilization. Clamp only when
+    # swizzle is requested so StridedLayout callers keep their tuned BK<256.
     if swizzle_mx_scale == "CDNA4_SCALE" and config["block_k"] < 256:
         config["block_k"] = 256
     if apply_swiglu and config["split_k"] > 1:

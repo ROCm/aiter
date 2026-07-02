@@ -46,10 +46,8 @@ def _batched_gemm_bf16_kernel(
     M,
     N,
     K,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `stride_am` is how much to increase `a_ptr` by to get the element one row down (A has M rows).
     stride_ab,
     stride_am,
     stride_ak,

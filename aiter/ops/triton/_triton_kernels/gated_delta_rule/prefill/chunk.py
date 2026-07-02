@@ -317,10 +317,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             g_head_major=True,
         )
     elif use_chunk_flydsl:
-        # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
-        # (matches Triton VK / HIP). ``g_cumsum`` from K1+K2 is already
-        # head-major, so pass it through directly. The wrapper accepts
-        # ``use_exp2`` as a kwarg and pre-scales ``gk`` internally.
+        # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout (matches Triton VK / HIP).
+        # ``g_cumsum`` from K1+K2 is already head-major, so pass it through directly.
+        # The wrapper accepts ``use_exp2`` as a kwarg and pre-scales ``gk`` internally.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
             chunk_gated_delta_rule_fwd_h_flydsl,
         )

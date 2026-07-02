@@ -145,8 +145,7 @@ def _fused_moe_kernel_mxfp4_silu(
             "BLOCK_SIZE_K must be a multiple of MX_PACK_DIVISOR",
         )
 
-    # Map program ids `pid` to the block of C it should compute,
-    # grouped ordering to promote L2 data reuse.
+    # Map program ids `pid` to the block of C it should compute, grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -294,12 +293,10 @@ def _fused_moe_kernel_mxfp4_silu(
         + (offs_b_k[:, None] * stride_bk + offs_b_n[None, :] * stride_bn)
     )
 
-    # Iterate to compute a block of C, accumulating in fp32 for accuracy;
-    # converted back to fp16 after the loop.
+    # Iterate to compute a block of C, accumulating in fp32 for accuracy; converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, PACKED_BLOCK_K_A)):
-        # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
+        # Load the next block of A and B, generate a mask by checking the K dimension.
         if EVEN_K:
             a = tl.load(
                 a_ptrs,

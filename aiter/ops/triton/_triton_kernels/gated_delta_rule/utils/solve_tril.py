@@ -101,8 +101,7 @@ def solve_tril_16x16_kernel(
     b_A = -b_A
 
     for i in range(2, min(16, T - i_t * 16)):
-        # [16]; A is strictly lower triangular (enforced by the fused
-        # cumsum+KKT kernel) so the
+        # [16]; A is strictly lower triangular (enforced by the fused cumsum+KKT kernel) so the
         # upper-tri elements are already zero, no defensive mask needed.
         b_a = -tl.load(A + (i_t * 16 + i) * H * BT + o_i + offset)
         b_a = b_a + tl.sum(b_a[:, None] * b_A, 0)
@@ -220,10 +219,9 @@ def merge_16x16_to_32x32_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
-    # Ai has strict-lower + identity structure. The strict-upper 16x16 block
-    # Ai_12 is implicitly zero -- write it explicitly so the caller can
-    # allocate Ai via `torch.empty_like` instead of `torch.zeros_like` and
-    # skip the memset on the critical path.
+    # Ai has strict-lower + identity structure. The strict-upper 16x16 block Ai_12 is implicitly zero -- write it
+    # explicitly so the caller can allocate Ai via `torch.empty_like` instead of `torch.zeros_like` and skip the
+    # memset on the critical path.
     z16 = tl.zeros([16, 16], dtype=b_Ai_11.dtype)
 
     if not USE_TMA:
@@ -357,10 +355,8 @@ def merge_16x16_to_64x64_inverse_kernel(
     b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
     b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
 
-    # A is strict-lower-tri (the fused cumsum+KKT kernel enforces it), so
-    # defensive `o_i < i` masks
-    # inside the loops are redundant; dropping them saves a `tl.where`
-    # per iteration in the serial triangular solve.
+    # A is strict-lower-tri (the fused cumsum+KKT kernel enforces it), so defensive `o_i < i` masks inside the loops
+    # are redundant; dropping them saves a `tl.where` per iteration in the serial triangular solve.
     for i in range(2, min(16, T - i_t * BT)):
         b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
         b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
@@ -451,10 +447,9 @@ def merge_16x16_to_64x64_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
-    # Ai has strict-lower + identity structure. The 6 strict-upper sub-blocks
-    # Ai_12, Ai_13, Ai_14, Ai_23, Ai_24, Ai_34 are implicitly zero -- write
-    # them explicitly so the caller can allocate Ai via `torch.empty_like`
-    # instead of `torch.zeros_like` (skips the memset on the critical path).
+    # Ai has strict-lower + identity structure. The 6 strict-upper sub-blocks Ai_12, Ai_13, Ai_14, Ai_23, Ai_24, Ai_34
+    # are implicitly zero -- write them explicitly so the caller can allocate Ai via `torch.empty_like` instead of
+    # `torch.zeros_like` (skips the memset on the critical path).
     z16 = tl.zeros([16, 16], dtype=b_Ai_11.dtype)
 
     if not USE_TMA:
@@ -635,11 +630,9 @@ def solve_tril(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
-    # `empty_like` is safe because the kernels below explicitly write every
-    # in-bounds element of Ai's chunked layout (strict-lower + diagonal + the
-    # strict-upper blocks zeroed by tl.store). Out-of-bounds tail rows past
-    # T-1 are never read by the downstream recompute_w_u kernel since it also
-    # uses boundary_check.
+    # `empty_like` is safe because the kernels below explicitly write every in-bounds element of Ai's chunked layout
+    # (strict-lower + diagonal + the strict-upper blocks zeroed by tl.store). Out-of-bounds tail rows past T-1 are
+    # never read by the downstream recompute_w_u kernel since it also uses boundary_check.
     Ai = torch.empty_like(A, dtype=output_dtype)
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel

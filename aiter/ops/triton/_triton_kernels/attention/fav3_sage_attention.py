@@ -283,9 +283,8 @@ def _sage_fwd_blocksparse_nomask(
                 v = tl.load(v_ptrs)
 
         # -- compute qk ----
-        # Same optimization as `_sage_fwd_no_mask`: defer the (q_descale *
-        # k_descale) descale until softmax so it fuses with the m_ij subtract
-        # into one FMA (valid because scale > 0).
+        # Same optimization as `_sage_fwd_no_mask`: defer the (q_descale * k_descale) descale until softmax so it fuses
+        # with the m_ij subtract into one FMA (valid because scale > 0).
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
 
@@ -452,10 +451,9 @@ def _sage_fwd_blocksparse_mask(
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # -- compute qk ----
-        # Same optimization as `_sage_fwd_no_mask`: defer the (q_descale *
-        # k_descale) descale until softmax to fuse it into one FMA. Padding
-        # masked to -inf is invariant under the positive scale, so the mask can
-        # be applied in either domain.
+        # Same optimization as `_sage_fwd_no_mask`: defer the (q_descale * k_descale) descale until softmax to fuse it
+        # into one FMA. Padding masked to -inf is invariant under the positive scale, so the mask can be applied in
+        # either domain.
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)

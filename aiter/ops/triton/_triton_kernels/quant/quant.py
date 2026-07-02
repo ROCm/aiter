@@ -370,9 +370,8 @@ def _dynamic_mxfp4_quant_kernel(
             )
 
 
-# MXFP8 (1x32 e8m0) quant: derives a per-block uint8 e8m0 scale + FP8 e4m3
-# values. The bit-trick (bitcast amax to int32, add 0x200000, mask 0xFF800000,
-# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() - 8
+# MXFP8 (1x32 e8m0) quant: derives a per-block uint8 e8m0 scale + FP8 e4m3 values. The bit-trick (bitcast amax to int32,
+# add 0x200000, mask 0xFF800000, bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() - 8
 # is the unbiased e8m0 exponent (dtypeMax = 2**8).
 
 
@@ -455,9 +454,8 @@ def _dynamic_mxfp8_quant_kernel(
         )
 
 
-# Transcoder: (FP8 fnuz, fp32 1x128 scale) -> (FP8 fn, e8m0 1x32 scale).
-# Replaces the Python dequant+requant cascade in linear.py's MXFP8 fallback
-# path for MLA wq_b when q_norm emits the legacy fp8 fnuz + fp32 1x128 format.
+# Transcoder: (FP8 fnuz, fp32 1x128 scale) -> (FP8 fn, e8m0 1x32 scale). Replaces the Python dequant+requant cascade
+# in linear.py's MXFP8 fallback path for MLA wq_b when q_norm emits the legacy fp8 fnuz + fp32 1x128 format.
 #
 # In: x_fp8_fnuz (M, N) — fp8 e4m3fnuz bits (interpreted with bias 8 -> value)
 #     x_scale_fp32 (M, N//128) — fp32 per-token-block scale

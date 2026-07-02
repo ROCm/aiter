@@ -6,11 +6,9 @@ import triton.language as tl
 
 from .quant import _mxfp8_quant_op
 
-# Fused RMSNorm + MXFP8 (1x32 e8m0) quant. Replaces the separate
-# rmsnorm_quant(fp8 fnuz + fp32 1x128) + transcode-to-MXFP8 sequence upstream
-# of MXFP8-aware GEMMs (e.g. V4 q_norm -> wq_b).
-# One program per row; full row held in registers, so K <= BLOCK_SIZE_K
-# constexpr (power of two >= K).
+# Fused RMSNorm + MXFP8 (1x32 e8m0) quant. Replaces the separate rmsnorm_quant(fp8 fnuz + fp32 1x128) +
+# transcode-to-MXFP8 sequence upstream of MXFP8-aware GEMMs (e.g. V4 q_norm -> wq_b).
+# One program per row; full row held in registers, so K <= BLOCK_SIZE_K constexpr (power of two >= K).
 #
 # In:  x (M, K) bf16 or fp16
 #      g (K,)  bf16 or fp16 weight
@@ -86,11 +84,10 @@ def _fused_rms_mxfp8_kernel(
         )
 
 
-# Dual fused RMSNorm: Q-side (MXFP8 quant + e8m0 scale emit) + K-side (bf16 out).
-# Replaces CK `fused_qk_rmsnorm_group_quant` in one Triton launch for the MXFP8
-# GEMM path (Task #77). Q and K are independent (separate weight, eps, K dim),
-# packed into one program per row to amortize launch overhead only -- the
-# normalization arithmetic is not fused.
+# Dual fused RMSNorm: Q-side (MXFP8 quant + e8m0 scale emit) + K-side (bf16 out). Replaces CK
+# `fused_qk_rmsnorm_group_quant` in one Triton launch for the MXFP8 GEMM path (Task #77). Q and K are
+# independent (separate weight, eps, K dim), packed into one program per row to amortize launch overhead
+# only -- the normalization arithmetic is not fused.
 #
 # In:  q     (M, KQ) bf16 or fp16
 #      kv    (M, KK) bf16 or fp16
@@ -197,11 +194,10 @@ def _fused_dual_rmsnorm_mxfp8_quant_kernel(
         )
 
 
-# Flatten-then-MXFP8 quant. Takes (M, N1, N2) input, flattens the trailing two
-# dims into N = N1 * N2, and emits per-1x32 MXFP8 (FP8 e4m3fn values + uint8
-# e8m0 scales) along the flattened axis. One program per (m, n1); each program
-# handles a row of N2 elements that contributes BLOCK_SIZE_N2 // 32 groups to
-# the M-th row of the (M, N) flattened output.
+# Flatten-then-MXFP8 quant. Takes (M, N1, N2) input, flattens the trailing two dims into N = N1 * N2, and emits
+# per-1x32 MXFP8 (FP8 e4m3fn values + uint8 e8m0 scales) along the flattened axis. One program per (m, n1);
+# each program handles a row of N2 elements that contributes BLOCK_SIZE_N2 // 32 groups to the M-th row of the
+# (M, N) flattened output.
 
 
 @triton.jit
@@ -224,9 +220,8 @@ def _fused_flatten_mxfp8_quant_kernel(
     n1 = tl.program_id(1)
 
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N2 // QUANT_BLOCK_SIZE
-    # In the flattened (M, N1 * N2) output, each n1 segment is exactly N2 wide
-    # (not BLOCK_SIZE_N2), so stride between n1 segments must use N2 — otherwise
-    # non-power-of-2 N2 (e.g. 7168) would gap-write the output.
+    # In the flattened (M, N1 * N2) output, each n1 segment is exactly N2 wide (not BLOCK_SIZE_N2), so stride between n1
+    # segments must use N2 — otherwise non-power-of-2 N2 (e.g. 7168) would gap-write the output.
     n2_groups = N2 // QUANT_BLOCK_SIZE
 
     n2_offs = tl.arange(0, BLOCK_SIZE_N2)

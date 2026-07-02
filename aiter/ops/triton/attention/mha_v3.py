@@ -673,8 +673,7 @@ def _quantize_bshd(
 
     batch, seqlen, num_heads, head_dim = x.shape
 
-    # For GQA/MQA: if group_size is specified and > 1,
-    # we need to group query heads and compute scaling per group
+    # For GQA/MQA: if group_size is specified and > 1, we need to group query heads and compute scaling per group
     if group_size is not None and group_size > 1:
         assert (
             num_heads % group_size == 0
@@ -763,8 +762,7 @@ def _quantize_thd(
 
     fp8_max = torch.finfo(fp8_dtype).max
 
-    # For GQA/MQA: if group_size is specified and > 1,
-    # we need to group query heads and compute scaling per group
+    # For GQA/MQA: if group_size is specified and > 1, we need to group query heads and compute scaling per group
     if group_size is not None and group_size > 1:
         assert (
             num_heads % group_size == 0

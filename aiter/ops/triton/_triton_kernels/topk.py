@@ -230,11 +230,9 @@ def _bitonic_merge(
     """
     n_outer: core.constexpr = x.numel >> n_dims
     core.static_assert(stage <= n_dims)
-    # flip denotes whether to re-arrange sub-sequences of elements in ascending or
-    # descending order.
+    # flip denotes whether to re-arrange sub-sequences of elements in ascending or descending order.
     # if flip = 00000000... then all elements will be re-arranged ascendingly at this stage
-    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
-    # a stride of 2) at this stage
+    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with a stride of 2) at this stage
     if order == 2:
         shape: core.constexpr = [n_outer * 2 ** (n_dims - 1 - stage), 2, 2**stage]
         flip = core.reshape(
