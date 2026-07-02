@@ -1,26 +1,18 @@
 #pragma once
 #include "op_gemm.hpp"
 
-// ================================================================
 // op_softmax.hpp — the online-softmax stage of the D64 FMHA fwd kernel
-// ================================================================
 //
-// ROLE IN THE PIPELINE
-//   Sits between GEMM0 (S_acc = Q.K^T) and GEMM1 (O_acc += P.V). For each
-//   64-column K/V tile the kernel walks, this stage:
-//     1. masks out-of-bounds / causal-future scores      (softmax_mask)
-//     2. tracks the running per-row max across tiles      (softmax_row_max)
-//     3. rescales the carried O_acc when the max grows     (rescale_o_acc)
-//     4. turns scores into probabilities P = exp2(...)     (softmax_exp2)
-//     5. accumulates the running per-row sum               (softmax_row_sum)
-//   Steps 2/3/5 implement Milakov-style online softmax: max and sum are kept
-//   incrementally so the kernel never materializes the full score row.
+// Sits between GEMM0 (S_acc = Q.K^T) and GEMM1 (O_acc += P.V). Per 64-column K/V
+// tile: (1) mask OOB / causal-future scores (softmax_mask), (2) track running
+// per-row max (softmax_row_max), (3) rescale carried O_acc when the max grows
+// (rescale_o_acc), (4) scores -> probs P = exp2(...) (softmax_exp2), (5) accumulate
+// running per-row sum (softmax_row_sum). Steps 2/3/5 are Milakov online softmax:
+// max/sum kept incrementally so the full score row is never materialized.
 //
-// DEFERRED SCALE
-//   GEMM0 emits RAW (unscaled) scores. The softmax scale (1/sqrt(d) folded into
-//   log2e) is NOT applied here — it is fused into the exp2 argument in
-//   softmax_exp2 as exp2(scale*S - scale*m). Carrying S unscaled keeps mask /
-//   max bookkeeping in raw units and saves a multiply pass over S_acc.
+// DEFERRED SCALE: GEMM0 emits RAW scores. The scale (1/sqrt(d) folded into log2e)
+//   is fused into the exp2 arg in softmax_exp2 (exp2(scale*S - scale*m)), not
+//   applied here — keeps mask/max bookkeeping in raw units, saves a multiply pass.
 //
 // S_acc distribution (TransposedC, groups-of-8 via SwizzleA):
 //   m_row = (lane%32) + 32*warp  — each lane owns ONE M-row
@@ -44,20 +36,15 @@
 // n_col = kv_offset + (i/8)*16 + k_sub*8 + (i%8)      [for n0 tile]
 //       = kv_offset + 32 + (i/8)*16 + k_sub*8 + (i%8)  [for n1 tile]
 //
-// softmax_mask<HasMask>: set masked S_acc entries to -INF in place.
-//   The -INF survives the deferred scale (fmaf(scale, -INF, ...) = -INF) and
-//   becomes exp2(-INF) = 0 in softmax_exp2, so masked columns contribute nothing
-//   to either the row max or the row sum.
+// softmax_mask<HasMask>: set masked S_acc entries to -INF in place. -INF survives
+//   the deferred scale and becomes exp2(-INF)=0, so masked columns add nothing to
+//   the row max or sum. HasMask is compile-time: false = boundary only, true =
+//   causal + boundary (dead branch folds away).
 //
-//   HasMask is a COMPILE-TIME switch: false = boundary masking only (non-causal),
-//   true = causal + boundary. Templating it lets the dead branch fold away.
-//
-//   Per-lane derivation. This lane owns columns at absolute index
-//   col_base + off, where col_base = kv_offset + k_sub*8 and off ranges over the
-//   16 register offsets {0..7, 16..23} (n1 adds a further +32). Rather than
-//   compare each absolute column to two bounds, we fold both bounds into a single
-//   scalar `limit` measured in `off` units, so the per-element test is just
-//   off >= limit:
+//   Per-lane derivation. This lane owns absolute columns col_base + off, where
+//   col_base = kv_offset + k_sub*8 and off ranges over the 16 register offsets
+//   {0..7, 16..23} (n1 adds +32). Fold both bounds into a single `off`-space scalar
+//   `limit` so the per-element test is just off >= limit:
 //     - boundary: off < seqlen_k - col_base
 //     - causal  : off < (m_row + mask_shift - col_base + 1)
 //   `limit` = min of the two (causal only when HasMask).
@@ -90,11 +77,10 @@ __device__ __forceinline__ void softmax_mask(
         limit = (causal < limit) ? causal : limit;
     }
 
-    // Full-tile fast path: when the whole 64-column tile is in-bounds, no element
-    // is masked. Skipping it removes the per-iteration 32 v_cmp + 30 s_or + 32
-    // v_cndmask the compiler emits otherwise. The guard is wave-uniform so this is
-    // a single scalar branch. The boundary mask only does work on the last tile
-    // (and, for causal, the diagonal tiles), which still take the slow path.
+    // Full-tile fast path: when the whole 64-column tile is in-bounds nothing is
+    // masked, so skip the per-element compares. The guard is wave-uniform (single
+    // scalar branch). Only the last tile (and, for causal, diagonal tiles) take the
+    // slow path.
     if constexpr (!HasMask) {
         // Max absolute column in this tile = kv_offset + 63 (k_sub=1, n1, off=23).
         if (kv_offset + kN0 <= seqlen_k)
@@ -112,13 +98,8 @@ __device__ __forceinline__ void softmax_mask(
     // Slow path: one compare per element against `limit` (no scale — deferred to
     // exp). The 16 offsets are the n_col free-dim pattern for this lane's half:
     // (i/8)*16 + (i%8) = {0..7, 16..23}. n1 is the same columns shifted by +32.
-    //
-    // NOTE: because `limit` is a runtime scalar and `off` a compile-time constant,
-    // LLVM lowers this as a serial OR-scan of the per-element predicates rather
-    // than a vector compare. That is INTENTIONALLY left simple — the scalar VALU
-    // work is hidden behind the neighboring MFMA pipeline and was verified to be a
-    // non-issue. The real causal performance lever is block load-balance (heavy
-    // M-tiles launched first), handled in the entry .cu files, NOT here.
+    // (LLVM lowers this as a serial OR-scan hidden behind the neighboring MFMA; the
+    // real causal perf lever is heavy-M-tile-first load-balance in the entry .cu.)
     constexpr int offsets[16] = {0,1,2,3,4,5,6,7, 16,17,18,19,20,21,22,23};
     #pragma unroll
     for (int i = 0; i < 16; i++) {
@@ -133,14 +114,13 @@ __device__ __forceinline__ void softmax_mask(
 // ---- Row max: intra-lane max + 1 ds_bpermute cross-half ----
 //
 // softmax_row_max(v16f&, v16f&, rmax): reduce this row's 64 masked scores to a
-// single fp32 max, seeded with the running `rmax` from prior tiles (online
-// softmax). Returns the same scalar on every lane of the row (both k_sub halves).
+// single fp32 max, seeded with running `rmax` (online softmax). Returns the same
+// scalar on every lane of the row.
 //
-// WHY no butterfly. By the TransposedC layout, all 32 lanes of one k_sub half
-// already hold the SAME 32 N-columns (they differ only in m_row). So the 64-column
-// max for this row is: (intra-lane max over this half's 32 registers) combined
-// with (the other half's 32 registers). The complementary half lives on partner
-// lane^32, so a SINGLE ds_bpermute exchange suffices — no log2(32) shuffle tree.
+// No butterfly: by TransposedC all 32 lanes of a k_sub half hold the SAME 32
+// N-columns (differ only in m_row), so the 64-column max = (intra-lane max over
+// this half's 32 registers) combined with the complementary half on lane^32 — a
+// SINGLE ds_bpermute, no log2(32) shuffle tree.
 //
 //   s_acc_n0/n1 : the two masked score halves (read-only)
 //   rmax        : running max carried in from previous K/V tiles (-INF at start)
@@ -167,17 +147,15 @@ __device__ __forceinline__ float softmax_row_max(
 
 // ---- Exp2: P = exp2(scale * S - scale * m_new) ----
 //
-// softmax_exp2: convert raw masked scores S into probabilities P, in place.
-// This is where the DEFERRED softmax scale is finally applied, fused with the
-// max-subtraction into one FMA: arg = fmaf(scale, S, -scale_m) = scale*(S - m).
-// Then P = exp2(arg) via the hardware exp2.
-//   - scale is log2e-based (the 1/sqrt(d) factor folded into log2e), so exp2 of
-//     a log2-domain argument yields the natural-base softmax weight.
-//   - scale_m = scale * m_new is precomputed by the caller (max already in
-//     log2 domain), so each element costs one v_fma_f32 (1-cycle, guaranteed
-//     fused) + one v_exp_f32 — no separate subtract/multiply pass over S.
-//   - Masked entries: fmaf(scale, -INF, -scale_m) = -INF, exp2(-INF) = 0, so
-//     they drop out of the subsequent row sum / P.V GEMM automatically.
+// softmax_exp2: raw masked scores S -> probabilities P, in place. Applies the
+// DEFERRED scale, fused with the max-subtraction into one FMA:
+// arg = fmaf(scale, S, -scale_m) = scale*(S - m), then P = exp2(arg) via HW exp2.
+//   - scale is log2e-based (1/sqrt(d) folded into log2e), so exp2 of a log2-domain
+//     arg yields the natural-base softmax weight.
+//   - scale_m = scale * m_new is precomputed by the caller, so each element is one
+//     v_fma_f32 + one v_exp_f32 (no separate subtract/multiply pass).
+//   - Masked entries: fmaf(scale, -INF, -scale_m) = -INF, exp2(-INF) = 0, so they
+//     drop out of the row sum / P.V GEMM automatically.
 //
 //   s_acc_n0/n1 : scores in, probabilities P out (in place)
 //   scale       : log2e-based softmax scale
@@ -225,11 +203,10 @@ __device__ __forceinline__ float softmax_row_sum(
 
 // ---- Rescale O_acc when max changes between tiles ----
 //
-// rescale_o_acc: the online-softmax correction. When a new K/V tile raises the
-// running row max from old_max to new_max, every probability computed against the
-// OLD max is too large by exp2(old_max - new_max); the carried O_acc (= sum of
-// P_old . V) inherits that same factor and must be scaled down before this tile's
-// P.V is added. (The running sum is corrected the same way by the caller.)
+// rescale_o_acc: online-softmax correction. When a new tile raises the running max
+// old_max -> new_max, every prob against the OLD max is too large by
+// exp2(old_max - new_max); the carried O_acc inherits that factor and is scaled
+// down before this tile's P.V is added (caller corrects the sum likewise).
 // new_max >= old_max, so 0 < factor <= 1.
 //
 //   o_acc_d0/d1 : the two hdim halves of the output accumulator, scaled in place
@@ -254,19 +231,12 @@ __device__ __forceinline__ void rescale_o_acc(
     rescale_o_acc(o_acc_d0, o_acc_d1, __builtin_amdgcn_exp2f(old_max - new_max));
 }
 
-// ================================================================
 // Legacy functions — DEAD CODE, kept for reference (no live caller).
-//
-// These are the PRE-online-softmax variants. They differ from the live path
-// above in two ways: (1) they produce/consume a per-register array (one max/sum
-// per register slot instead of a single per-row scalar), and (2) they reduce with
-// a full log2(32) butterfly of ds_bpermutes instead of the single lane^32
-// exchange the TransposedC layout makes sufficient. They were called by an old
-// `_device.hpp` entry that has since been removed; nothing in this kernel
-// references them now (the live pipeline.hpp uses the scalar softmax_row_max /
-// softmax_row_sum / softmax_exp2 above). `inline` so they emit no code while
-// uncalled. New readers can skip this block.
-// ================================================================
+// Pre-online-softmax variants, differing from the live path in two ways: (1) they
+// produce/consume a per-register array (one max/sum per register slot, not a single
+// per-row scalar), and (2) they reduce with a full log2(32) butterfly of
+// ds_bpermutes instead of the single lane^32 exchange TransposedC makes sufficient.
+// Superseded by the scalar softmax_row_max / softmax_row_sum / softmax_exp2 above.
 
 // Old softmax_row_max with array output (no live caller; see banner above)
 __device__ __forceinline__ void softmax_row_max(float (&row_max)[16],
