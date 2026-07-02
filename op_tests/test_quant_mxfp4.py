@@ -418,12 +418,9 @@ if __name__ == "__main__":
         # HW builtin (v_cvt_pk_f4_*) does exact RNE; full byte-equal coverage.
         round_modes = [0, 1, 2, 3]
     else:
-        # gfx942 / other gfx: kernel uses a SW round-half-away fallback that
-        # matches CPU Python ref on Even (mode 2) but can diverge from it by
-        # <=1 ULP near FP4 round thresholds (5.0 / 3.5 / 2.5 / 1.75 / 1.25 /
-        # 0.75 / 0.25), breaking byte-level equality for the other three
-        # modes. Stay with the historically validated default; users can opt
-        # in to the full sweep with --round_mode 0 1 2 3.
+        # Non-gfx950 SW fallback matches CPU ref only on Even (mode 2); other
+        # modes diverge by <=1 ULP near FP4 round thresholds, breaking byte
+        # equality. Default to [2]; opt in to full sweep via --round_mode 0 1 2 3.
         round_modes = [2]
         aiter.logger.info(
             "Non-gfx950 device detected (%s); default round_mode coverage "

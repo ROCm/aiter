@@ -32,10 +32,8 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 
-# ============================================================
-# Worker: single custom group — runs allreduce, allgather, reduce_scatter
+# Worker: single custom group runs allreduce/allgather/reduce_scatter.
 # Returns per-op timing: (out_ar, us_ar, out_ag, us_ag, out_rs, us_rs)
-# ============================================================
 def custom_group_worker(
     world_size,
     tp_size,
@@ -145,12 +143,10 @@ def custom_group_worker(
     return results
 
 
-# ============================================================
 # Multi-group config:
 #   oe:  [[0,4],[1,5],[2,6],[3,7]]  — 4 independent DP2 groups
 #   att: [[0,1,2,3],[4,5,6,7]]     — 2 independent TP4 groups
 #   ffn: [0,1,2,3,4,5,6,7]         — 1 TP8 group
-# ============================================================
 MULTI_GROUP_CONFIG = {
     "oe": [[0, 4], [1, 5], [2, 6], [3, 7]],
     "att": [[0, 1, 2, 3], [4, 5, 6, 7]],
@@ -159,10 +155,8 @@ MULTI_GROUP_CONFIG = {
 MULTI_GROUP_NAMES = list(MULTI_GROUP_CONFIG.keys())
 
 
-# ============================================================
-# Worker: multi-group — runs each op separately per group
+# Worker: multi-group runs each op separately per group.
 # Returns dict: {gname: (out_ar, us_ar, out_ag, us_ag, out_rs, us_rs)}
-# ============================================================
 def multi_group_worker(
     rankID,
     deviceID,
@@ -264,9 +258,7 @@ def multi_group_worker(
     return results
 
 
-# ============================================================
 # Helper: compute references for allreduce, allgather, reduce_scatter
-# ============================================================
 def compute_refs(xs_ar, xs_ag, xs_rs, world_size):
     """Compute reference outputs for all 3 ops.
 
@@ -289,9 +281,7 @@ def compute_refs(xs_ar, xs_ag, xs_rs, world_size):
     return ref_ar, ref_ag, chunks_rs
 
 
-# ============================================================
 # Test 1: custom TP group on GPUs [0,2,4,6]
-# ============================================================
 @benchmark()
 def test_custom_tp(
     shape,
@@ -371,9 +361,7 @@ def test_custom_tp(
     }
 
 
-# ============================================================
 # Test 2: custom DP group on GPUs [1,3,5,7]
-# ============================================================
 @benchmark()
 def test_custom_dp(
     shape,
@@ -453,10 +441,8 @@ def test_custom_dp(
     }
 
 
-# ============================================================
 # Test 3: custom 2D subgroups (two independent TP4 groups)
 #   [[0,1,2,3],[4,5,6,7]] → devices 0-3 form one TP4, devices 4-7 form another
-# ============================================================
 @benchmark()
 def test_custom_2d(
     shape,
@@ -544,9 +530,7 @@ def test_custom_2d(
     }
 
 
-# ============================================================
 # Helper: normalize 1D group config to 2D for reference computation
-# ============================================================
 def normalize_group_config(cfg):
     """[0,1,2,3] → [[0,1,2,3]];  [[0,1],[2,3]] stays as-is."""
     if all(isinstance(r, int) for r in cfg):
@@ -554,15 +538,11 @@ def normalize_group_config(cfg):
     return cfg
 
 
-# ============================================================
-# Test 4: multi-group (oe dp2x4 + att tp4x2 + ffn tp8)
-#   All groups initialized upfront via CustomGroupConfig, selected
-#   by name at runtime — no destroy/reinit between phases.
-#   oe:  [[0,4],[1,5],[2,6],[3,7]] → 4 independent DP2 groups
-#   att: [[0,1,2,3],[4,5,6,7]]    → 2 independent TP4 groups
-#   ffn: [0,1,2,3,4,5,6,7]        → 1 TP8 group
-#   Each group runs allreduce, allgather, reduce_scatter.
-# ============================================================
+# Test 4: multi-group (oe dp2x4 + att tp4x2 + ffn tp8). All groups
+# initialized upfront via CustomGroupConfig, selected by name at runtime
+# (no destroy/reinit between phases). Each group runs allreduce, allgather,
+# reduce_scatter. Layouts: oe [[0,4],[1,5],[2,6],[3,7]] (4 DP2),
+# att [[0,1,2,3],[4,5,6,7]] (2 TP4), ffn [0..7] (1 TP8).
 @benchmark()
 def test_multi_group(
     shape,
@@ -660,9 +640,7 @@ def test_multi_group(
     return ret
 
 
-# ============================================================
 # Helper: expand multi_group result into one row per group
-# ============================================================
 def expand_groups(ret):
     """Transform multi_group result dict into one row per group,
     each with columns: test, ar_min_us, ar_max_us, ar_err, ag_..., rs_..."""

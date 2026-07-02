@@ -119,15 +119,10 @@ def build(verbose=False, jobs=None):
     if verbose:
         print(f"[setup] arch={arch}, jobs={jobs}")
 
-    # Per-arch skip list: kernels that use builtins not available on the
-    # target arch. Skipped at .so build time so the rest of the suite
-    # still links; the Python harness sees the missing extern "C" launcher
-    # and reports SKIP for those tests.
-    #
-    # gfx1201 / gfx1200 (Navi 44/48, RDNA4): opus _async_load uses
-    # __builtin_amdgcn_raw_ptr_buffer_load_lds which needs the
-    # Per-arch build-time skip list. Empty today; add entries here if a
-    # future kernel needs an arch-specific feature unavailable elsewhere.
+    # Per-arch build-time skip list: kernels using builtins unavailable on
+    # the target arch. Skipped so the rest of the suite still links; the
+    # Python harness sees the missing extern "C" launcher and reports SKIP.
+    # Empty today; add entries here for future arch-specific kernels.
     _ARCH_SKIP_SOURCES = {}
     skip = _ARCH_SKIP_SOURCES.get(arch, set())
     sources = [s for s in _CU_SOURCES if s not in skip]

@@ -69,9 +69,7 @@ from aiter.ops.pa_sparse_prefill_opus import (
 )
 from aiter.test_common import benchmark, checkAllclose, perftest
 
-# ---------------------------------------------------------------------------
 # Skip helpers
-# ---------------------------------------------------------------------------
 
 
 def _skip(reason: str) -> bool:
@@ -105,9 +103,7 @@ def _skip_if_unsupported(d: int) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
 # PyTorch reference: per-token online-softmax + per-head sink.
-# ---------------------------------------------------------------------------
 
 
 def _ref_pa_sparse_prefill_opus(
@@ -166,15 +162,12 @@ def _ref_pa_sparse_prefill_opus(
     return out
 
 
-# ---------------------------------------------------------------------------
 # FP8 DSA packing + reference (NoPE fp8 / RoPE bf16).
-#
-# The NoPE stream packs, per row of 512 fp8 slots:
+# NoPE stream packs, per row of 512 fp8 slots:
 #   [ NoPE fp8 (448) | E8M0 block scales (14) | fp8 zero-pad (50) ]
-# with one E8M0 (power-of-two) scale per 32-element NoPE block. The RoPE
-# stream is a separate ``[*, 64]`` bf16 tensor. The kernel runs NoPE QK^T as
-# scaled MXFP8 MFMA, RoPE QK^T and PV at bf16, and accumulates in fp32.
-# ---------------------------------------------------------------------------
+# with one E8M0 (power-of-two) scale per 32-element NoPE block. RoPE is a
+# separate [*, 64] bf16 tensor. Kernel: NoPE QK^T as scaled MXFP8 MFMA, RoPE
+# QK^T and PV at bf16, fp32 accumulate.
 
 _FP8_D_NOPE = 448
 _FP8_D_NOPE_PADDED = 512
@@ -255,15 +248,11 @@ def _ref_pa_sparse_prefill_fp8(
     return out
 
 
-# ---------------------------------------------------------------------------
 # CSR index generators
-# ---------------------------------------------------------------------------
 
-# Must match the KV_TILE_SIZE template default in
-# csrc/include/pa_sparse_prefill_opus.h. The kernel inner loop advances the
-# K/V dimension in chunks of this size, so the trailing-tile branches (full /
-# half / over-tile) are most likely to break when nnz_per_row sits at one of
-# these boundary values.
+# Must match KV_TILE_SIZE default in csrc/include/pa_sparse_prefill_opus.h.
+# Kernel advances K/V in chunks of this size, so trailing-tile branches
+# (full/half/over-tile) break at nnz_per_row boundary values.
 _KV_TILE_SIZE = 32
 
 
@@ -352,9 +341,7 @@ def _empty_csr(n: int, *, device: torch.device) -> Tuple[torch.Tensor, torch.Ten
     )
 
 
-# ---------------------------------------------------------------------------
 # Input factory
-# ---------------------------------------------------------------------------
 
 # Single sparsity knob applied symmetrically to both prefix and extend CSRs.
 _MODES = ("sparse", "dense", "empty")
@@ -490,9 +477,7 @@ def _make_inputs_fp8(
     return dict(kernel=kernel, ref=ref)
 
 
-# ---------------------------------------------------------------------------
 # perftest-wrapped kernel call (same shape as test_batch_prefill.py)
-# ---------------------------------------------------------------------------
 
 
 @perftest()
@@ -500,9 +485,7 @@ def _profile_func(target_func, *args, **kwargs):
     return target_func(*args, **kwargs)
 
 
-# ---------------------------------------------------------------------------
 # Tolerances
-# ---------------------------------------------------------------------------
 
 
 # Supported precisions. "bf16"/"fp16" use the single-tensor Q/K/V/O kernel;
@@ -519,11 +502,9 @@ def _get_tolerances(prec: str) -> Tuple[float, float]:
     return 2e-2, 2e-2  # bf16 default
 
 
-# ---------------------------------------------------------------------------
 # Single-case driver -- both pytest and CLI go through this.
 # `@benchmark()` collects the kwargs into a row dict and merges in whatever
 # this function returns, so the CLI can build a pandas DataFrame.
-# ---------------------------------------------------------------------------
 
 
 @benchmark()
@@ -594,9 +575,7 @@ def run_pa_sparse_prefill_opus(
     return row
 
 
-# ---------------------------------------------------------------------------
 # pytest parametrised correctness sweep (CI).
-# ---------------------------------------------------------------------------
 
 
 _PYTEST_SHAPES = [
@@ -633,9 +612,7 @@ def test_pa_sparse_prefill_opus(prec, n, h, total_pages, total_tokens, mode):
     )
 
 
-# ---------------------------------------------------------------------------
 # CLI (mirrors test_batch_prefill.py style).
-# ---------------------------------------------------------------------------
 
 
 parser = argparse.ArgumentParser(

@@ -220,12 +220,10 @@ def test_moe_mx_quant_sort(
 
     # Reference: per-row MX quant + python-side byte sort.
     ref_out, scale = _ref_quant(input, quant_dtype)
-    # For stage2 the per-row scale is `(token_num * topk, scaleN)`. Reshape
-    # to 3D `(token_num, topk, scaleN)` so `run_torch` sees the topk dim
-    # and applies the proper `sorted_ids * topk + topk_ids` indexing
-    # instead of treating it as 2D (which collapses every slot onto
-    # token_idx 0..token_num-1 and produces ~3-5% byte mismatches versus
-    # the HIP/split paths in stage2).
+    # For stage2 reshape the per-row scale (token_num*topk, scaleN) to 3D
+    # (token_num, topk, scaleN) so run_torch sees the topk dim and applies the
+    # sorted_ids*topk + topk_ids indexing (2D would collapse onto token_idx and
+    # mismatch the HIP/split paths).
     if stage != "stage1":
         scale = scale.view(token_num, topk_orig, -1)
     ref_scale = run_torch(scale.clone(), sorted_ids.clone(), num_valid_ids, token_num)
@@ -282,14 +280,10 @@ def test_moe_mx_quant_sort(
     checkAllclose(
         ref_out.view(torch.uint8), hip_out.view(torch.uint8), msg=f"hip {label} out"
     )
-    # The wrapper allocates `scale` with `torch.empty` (no zero-init) for
-    # perf, so positions the kernel does not write (padding rows within
-    # expert blocks; padding cols when `model_dim/32` is not a multiple
-    # of 8) contain allocator garbage. Production GEMM consumers never
-    # read those positions, but a byte-level `checkAllclose` would
-    # otherwise flag them. Mask out positions where ref is 0 (the
-    # un-written / zero-init slots), matching the trick the original
-    # mxfp4 test applied to the Triton path.
+    # The wrapper allocates `scale` with torch.empty (no zero-init), so kernel-
+    # unwritten padding slots (padding rows in expert blocks; padding cols when
+    # model_dim/32 is not a multiple of 8) hold garbage. Production GEMM never
+    # reads them, but byte-level checkAllclose would; mask positions where ref is 0.
     hip_mask = ref_scale == 0
     hip_scale = hip_scale[: ref_scale.shape[0]]
     hip_scale.view(torch.uint8)[hip_mask] = 0
@@ -401,12 +395,10 @@ args = parser.parse_args()
 _quant_dtype = dtypes.fp4x2 if args.quant_dtype == "fp4x2" else dtypes.fp8
 _label = args.quant_dtype  # for log msg
 
-# Standalone byte sort/swizzle test. The underlying kernels
-# (`mxfp4_moe_sort_hip`, `fp4_utils.moe_mxfp4_sort`) are dtype-agnostic
-# (uint8 byte shuffle), but the Triton path is fp4-only by name, and the
-# HIP path is implicitly exercised inside `test_moe_mx_quant_sort`'s split
-# path. To avoid the misleading "triton_us" column when running with
-# `-q fp8`, only run this test for the fp4 mode.
+# Standalone byte sort/swizzle test. Kernels (mxfp4_moe_sort_hip,
+# fp4_utils.moe_mxfp4_sort) are dtype-agnostic (uint8 byte shuffle), but the
+# Triton path is fp4-only; run only in fp4 mode to avoid a misleading triton_us
+# column under -q fp8 (the HIP path is exercised via test_moe_mx_quant_sort).
 if _quant_dtype == dtypes.fp4x2:
     df = []
     for dtype in args.dtype:

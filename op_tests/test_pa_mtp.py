@@ -450,7 +450,7 @@ def test_pa_mtp(
     ret["us_hip_bf16"] = us_hip
     ret["err_hip_bf16"] = err_noquant
 
-    # ################## quant start ######################
+    # quant start
     k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
         pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=aiter.dtypes.fp8)
     )

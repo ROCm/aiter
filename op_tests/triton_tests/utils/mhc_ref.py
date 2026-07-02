@@ -35,9 +35,7 @@ __all__ = [
     "generate_mhc_post_inputs",
 ]
 
-# =============================================================================
 # PyTorch Reference Implementations
-# =============================================================================
 
 
 def mhc_torch(
@@ -317,9 +315,7 @@ def is_doubly_stochastic(P: torch.Tensor, tol: float = 1e-3) -> bool:
     return True
 
 
-# =============================================================================
 # Test Input Generation
-# =============================================================================
 
 
 def generate_mhc_inputs(
@@ -367,9 +363,7 @@ def generate_mhc_inputs(
     return x, phi, alpha_pre, alpha_post, alpha_res, bias, n
 
 
-# =============================================================================
 # Test Configurations
-# =============================================================================
 
 
 def get_test_shapes():

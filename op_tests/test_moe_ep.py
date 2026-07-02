@@ -360,9 +360,7 @@ def test_fmoe_ep(
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
 
-# ---------------------------------------------------------------------------
 # EP end-to-end with per_1x32 mxfp4 (a8w4 / a4w4) via fused_moe
-# ---------------------------------------------------------------------------
 
 
 def _per_1x32_mxfp4_quant(w):

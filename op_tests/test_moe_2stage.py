@@ -664,11 +664,8 @@ args = parser.parse_args()
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
 
-# ---------------------------------------------------------------------------
 # Both modes (CLI sweep / model-csv) reduce to the same shape:
-#   yield (test_fmoe_kwargs, extras_for_df)
-# A single runner consumes the stream.
-# ---------------------------------------------------------------------------
+#   yield (test_fmoe_kwargs, extras_for_df); a single runner consumes the stream.
 # Only kept for dtypes that may not exist as torch attributes in older builds;
 # anything else falls through to getattr(torch, attr).
 _DTYPE_STR_FALLBACK = {
@@ -966,9 +963,7 @@ def _iter_legacy_cases():
                     ), extras
 
 
-# ---------------------------------------------------------------------------
 # Run
-# ---------------------------------------------------------------------------
 _case_iters = []
 if not args.no_flydsl_csv:
     _case_iters.append(_iter_csv_cases())

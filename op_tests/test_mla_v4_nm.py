@@ -16,10 +16,8 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, run_perftest
 
-# ---------------------------------------------------------------------------
 # Variant under test (matches the cfg_mla_v4_asm entry in
 # hsa/gfx950/mla_v4/mla_v4_asm.csv served by csrc/py_itfs_cu/asm_mla_v4.cu).
-# ---------------------------------------------------------------------------
 GQA_RATIO = 64  # num_heads / num_kv_heads
 PAGE_SIZE = 1
 NUM_KV_HEADS = 1
@@ -42,12 +40,9 @@ needs_gfx950 = pytest.mark.skipif(
 )
 
 
-# ---------------------------------------------------------------------------
-# Synthetic input builders. We do NOT replicate the host-side FP8+e8m0 dequant
-# packing here (that's poc_kl/mla_v4.h v4_detail::init_host_buffers). For
-# smoke testing the dispatcher we just need byte-level buffers of the right
-# shape and dtype; numerical correctness is deferred (see file docstring).
-# ---------------------------------------------------------------------------
+# Synthetic input builders: byte-level buffers of the right shape/dtype for
+# dispatcher smoke testing. Does NOT replicate host-side FP8+e8m0 dequant packing
+# (poc_kl/mla_v4.h v4_detail::init_host_buffers); numerical correctness deferred.
 def _build_inputs(
     batch=2, kv_seq_lens=64, q_seq_logical=1, num_heads=GQA_RATIO, device="cuda", seed=0
 ):
@@ -166,9 +161,7 @@ def _build_inputs(
     )
 
 
-# ---------------------------------------------------------------------------
 # Tests
-# ---------------------------------------------------------------------------
 @needs_gfx950
 def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     """Regression guard for the 18-slot v4 nm kernarg layout.
@@ -241,11 +234,9 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     expected_kv_split = 1  # num_kv_splits=1
     expected_log2_page = 0  # log2(page_size=1)
     expected_out16ns = 0  # out_16_nosplit=0
-    # slots 10 (s_total_kv) and 11 (s_stride_page) are NEVER read — only 17 kernarg
-    # loads, none at offsets 0xA0/0xB0). The dispatcher leaves them at 0
-    # via `args = {}` zero-init to skip the per-call D2H readback that
-    # used to compute s_total_kv. See the "Dead kernarg slots" block in
-    # csrc/py_itfs_cu/asm_mla_v4.cu for the full justification.
+    # slots 10 (s_total_kv) / 11 (s_stride_page) are DEAD (never read); dispatcher
+    # zero-inits them to skip a per-call D2H readback. See "Dead kernarg slots" in
+    # csrc/py_itfs_cu/asm_mla_v4.cu.
     expected_total_kv = 0
     expected_stride_pg = 0
 
@@ -277,13 +268,11 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
         assert ptr != 0, f"slot {slot_idx} pointer is NULL"
 
 
-# ---------------------------------------------------------------------------
-# Torch golden + accuracy + perf tests (resolves the TODO #1 in the file
-# docstring). Mirrors op_tests/rui.py's torch reference and op_tests/test_mla.py's
-# checkAllclose/run_perftest pattern. The ATOM-style wrapper below mirrors
-# ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode
-# so the asm op can drop in as a replacement for the triton fallback there.
-# ---------------------------------------------------------------------------
+# Torch golden + accuracy + perf tests (resolves the TODO #1 in the file docstring).
+# Mirrors op_tests/rui.py's torch reference and test_mla.py's checkAllclose/
+# run_perftest pattern. The ATOM-style wrapper below mirrors
+# ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode so the
+# asm op can drop in for the triton fallback there.
 
 # MODEL1_FP8Sparse layout (mirrored locally; not exported by aiter.ops.quant
 # in this tree). Drives the per-token packing the v4 nm asm kernel expects.
@@ -292,10 +281,9 @@ _QUANT_D_NOPE = 448  # FP8-quantized
 _QUANT_D_ROPE = 64  # BF16 (kept separate in `qrope`/`kvrope` buffer)
 _QUANT_TILE_SIZE = 64
 _QUANT_NUM_TILES = _QUANT_D_NOPE // _QUANT_TILE_SIZE  # 7
-# v4 nm kernel reads each tile's e8m0 scale TWICE in a row, so the scale
-# block on disk is 14 bytes laid out as (s0,s0,s1,s1,...,s6,s6). Empirically
-# verified: without the duplication V[256:448] of the asm output is all-zero
-# and V[0:256] is partially correct, because scale reads land mid-pad.
+# v4 nm kernel reads each tile's e8m0 scale TWICE in a row, so the scale block on
+# disk is 14 bytes laid out as (s0,s0,s1,s1,...,s6,s6); without the duplication
+# scale reads land mid-pad and V[256:448] of the asm output comes back all-zero.
 _QUANT_NUM_SCALE_BYTES = _QUANT_NUM_TILES * 2  # 14
 
 
@@ -994,11 +982,9 @@ def test_v4_nm_out_16_nosplit_accuracy_and_perf():
     )
 
 
-# ---------------------------------------------------------------------------
 # ATOM-API wrapper (future drop-in replacement for ATOM's
-# `sparse_attn_v4_paged_decode`). Lives in the test file as a *proof of API
-# fit*; the production wrapper belongs in aiter/mla.py once exercised here.
-# ---------------------------------------------------------------------------
+# `sparse_attn_v4_paged_decode`): a proof of API fit; the production wrapper
+# belongs in aiter/mla.py once exercised here.
 def asm_sparse_attn_v4_paged_decode(
     q,  # [N, H=16, D=512] bf16
     unified_kv,  # [total_pages, D=512] bf16 (page_size=1, single KV head)
@@ -1064,14 +1050,10 @@ def asm_sparse_attn_v4_paged_decode(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Multi-pass (num_kv_splits > 1) — opens the path that mirrors V3's
-# non-persistent stage1 + stage2 reduce. The .co binary already supports any
-# number of passes via slot 9; this test verifies (a) the dispatcher lookup
-# isn't gated on num_kv_splits, (b) the python wrapper auto-builds
-# split_indptr V3-style, and (c) the in-place logsumexp merge writes a finite
-# result into the [:, 0] slot.
-# ---------------------------------------------------------------------------
+# Multi-pass (num_kv_splits > 1) — mirrors V3's non-persistent stage1 + stage2
+# reduce (.co supports any pass count via slot 9). Verifies (a) dispatcher lookup
+# isn't gated on num_kv_splits, (b) wrapper auto-builds split_indptr V3-style, and
+# (c) the in-place logsumexp merge writes a finite result into the [:, 0] slot.
 @needs_gfx950
 def test_v4_nm_multi_split():
     """Multi-pass (num_kv_splits>1) path, two checks in one:
@@ -1136,23 +1118,14 @@ def test_v4_nm_multi_split():
         aiter.mla.mla_decode_fwd_v4_nm(**args_rej)
 
 
-# ---------------------------------------------------------------------------
-# Sink interface (PR-2: sink-aware .co + slot 18 plumbed end-to-end)
-# ---------------------------------------------------------------------------
-# These tests pin down the behavioural contract: We assert that
-#   (a) sink=-inf vs sink=+inf produce DIFFERENT output bytes — proves the
-#       sink data actually reaches the kernel and modulates the softmax
-#       denominator,
-#   (b) sink=-inf does NOT produce extra NaNs vs a near-equivalent finite
-#       sentinel (-1e9), so callers can safely use -inf as the "no sink"
-#       convention without numerical surprises.
-#
-# Build helper note: we use _build_bf16_inputs + _native_to_2buff_for_asm
-# instead of _build_inputs because the latter generates random FP8 bytes
-# (incl. random e8m0 scale bytes), which dequant to 100% NaN/inf and make
-# bit comparisons impossible. The BF16-then-quant path produces finite
-# outputs that actually expose the sink merge math.
-# ---------------------------------------------------------------------------
+# Sink interface (PR-2: sink-aware .co + slot 18 plumbed end-to-end). Contract:
+#   (a) sink=-inf vs sink=+inf produce DIFFERENT output bytes (sink reaches the
+#       kernel and modulates the softmax denominator);
+#   (b) sink=-inf produces no extra NaNs vs a finite sentinel (-1e9), so -inf is
+#       safe as the "no sink" convention.
+# Build helper note: use _build_bf16_inputs + _native_to_2buff_for_asm (not
+# _build_inputs, whose random FP8/e8m0 bytes dequant to all NaN/inf) so outputs
+# are finite and expose the sink merge math.
 def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0):
     """Properly-quantized wrapper-args for sink behaviour tests. Returns the
     full kwargs dict that mla_decode_fwd_v4_nm needs, with sink defaulted

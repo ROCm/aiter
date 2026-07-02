@@ -69,9 +69,7 @@ VERIFY_TOL_A8W4 = 0.02
 LOGITS_DIFF_TOL = 0.01
 
 
-# ---------------------------------------------------------------------------
 # Environment / arch guards
-# ---------------------------------------------------------------------------
 def _require_gfx1250() -> None:
     # AITER_FORCE_GFX1250=1 forces the grouped path on other archs (e.g. gfx942)
     # to exercise the tiny operators with the GEMM mocked (default; pass
@@ -104,14 +102,10 @@ def is_gfx1250() -> bool:
 #       16-byte chunks) the grouped FlyDSL kernels consume.
 #   moe_shuffle_scale(s, experts_cnt=E) -> arch-aware MoE B-scale shuffle; on
 #       gfx1250 it folds to the grouped-only n32k4 e8m0 layout (shuffle_scale_n32k4).
-# ---------------------------------------------------------------------------
-# Reference: aiter's own ``torch_moe_stage1`` + ``torch_moe_stage2``
-# (high-precision fp32 baseline that decodes mxfp4/e8m0 internally and
-# evaluates the same swiglu+bias formula the grouped path uses). It still
-# diverges from the quantised grouped GEMM path by mxfp4/mxfp8 round noise
-# (~0.2 rel_l2 on random uint8 weights, ~0.02 on real model weights). The
-# point is to catch *catastrophic* regressions, not chase fp32 parity.
-# ---------------------------------------------------------------------------
+# Reference: aiter's own ``torch_moe_stage1`` + ``torch_moe_stage2`` (fp32
+# baseline that decodes mxfp4/e8m0 and evaluates the same swiglu+bias formula
+# the grouped path uses). Diverges by mxfp4/mxfp8 round noise; catches
+# catastrophic regressions, not fp32 parity.
 def _torch_moe_ref(
     hidden: torch.Tensor,  # (T, K) bf16
     w1_packed: torch.Tensor,  # (E, 2*I, K_pack) uint8 (GGUU)
@@ -209,9 +203,7 @@ def _torch_moe_ref(
     return out
 
 
-# ---------------------------------------------------------------------------
 # Mock data builders
-# ---------------------------------------------------------------------------
 def _pattern_packed(
     experts: int, rows: int, k_pack: int, *, const_init: Optional[float] = None
 ) -> torch.Tensor:
@@ -262,9 +254,7 @@ def _gguu_to_gugu_rows(t: torch.Tensor) -> torch.Tensor:
     return torch.stack([g, u], dim=2).flatten(1, 2).contiguous()
 
 
-# ---------------------------------------------------------------------------
 # Core runner: build inputs, invoke fused_moe, optionally compare to ref
-# ---------------------------------------------------------------------------
 def _run_grouped_via_fused_moe(
     *,
     experts: int,
@@ -472,9 +462,7 @@ def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(((x - y) ** 2).sum() / denom)
 
 
-# ---------------------------------------------------------------------------
 # Pytest correctness suite
-# ---------------------------------------------------------------------------
 def run_moe(
     data_format: str,
     *,
@@ -609,9 +597,7 @@ def test_grouped_a4w4_swiglu_limit_clamps(layout, activation):
     run_moe("a4w4", layout=layout, activation=activation, swiglu_limit=1.0)
 
 
-# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
 def _mock_grouped_gemm() -> None:
     """Run the grouped MoE path without the gfx1250-only kernels.
 

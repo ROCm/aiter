@@ -71,17 +71,13 @@ import torch
 import aiter
 from aiter import pertoken_quant
 
-# ---------- configuration matching the ATOM Eagle3 draft signature ----------
-# Production layout per TP=8 rank: num_q_heads = num_kv_heads = 8 (full MHA).
-# aiter's gqa-rounding selects the gqa8 kernel either way.
-#
-# Critical: per-block stride must match production for the i32-overflow
-# hypothesis to be testable. With NUM_KV_HEADS=8, HEAD_DIM=128, BLOCK_SIZE=16,
-# bf16 elem_size=2:
+# Configuration matching the ATOM Eagle3 draft signature.
+# Production TP=8 rank: num_q_heads = num_kv_heads = 8 (full MHA); gqa-rounding
+# picks the gqa8 kernel. Per-block stride must match production to make the
+# i32-overflow testable (lowering NUM_KV_HEADS shrinks stride, pushing the
+# boundary above any practical block_id and masking the bug):
 #     per_block_stride = 16 × 8 × 128 × 2 = 32,768 bytes
 #     i32 overflow boundary = 2^31 / 32768 = 65,536
-# Lowering NUM_KV_HEADS would shrink the stride and push the overflow
-# boundary far above any practical block_id, masking the bug.
 NUM_Q_HEADS = 8
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
@@ -131,13 +127,9 @@ _FINGERPRINTS = [
 ]
 
 
-# ---------- KV-cache quantization variants ----------------------------------
-# The >4GB / block_id-truncation fix lives in the SP3 paged-attention kernels.
-# The non-quantized (bf16/fp16 KV) kernels use an unconditional 64-bit
-# global_load; the quantized (pertoken fp8 / int8 KV, "W8") kernels received
-# the same 64-bit global_load treatment in the *_MTP variants. We therefore
-# exercise all three KV families so the fix is validated across the kernels
-# that were actually rebuilt:
+# KV-cache quantization variants. The >4GB fix (64-bit global_load) lives in the
+# SP3 kernels: unconditional in noquant, added to the *_MTP quant variants. Test
+# all three families so the fix is covered across the rebuilt kernels:
 #   "noquant" → pa_bf16_noquant_gqa8_*           (bf16 KV)
 #   "fp8"     → pa_bf16_pertokenFp8_gqa8_*        (per-token fp8 KV)
 #   "int8"    → pa_bf16_pertokenInt8_gqa8_*       (per-token int8 KV)
@@ -150,11 +142,9 @@ _HIGH_PRECISION = {"noquant": 0, "fp8": 1, "int8": 0}
 # Dequant noise budget on top of the bf16 baseline tolerance.
 _ABS_TOL = {"noquant": 1e-2, "fp8": 2e-2, "int8": 3e-2}
 
-# Cache the (possibly large, ~5GB) quantized KV pools so the parametrized
-# pytest cases don't re-quantize 70k blocks for every block_id/qlen combo.
-# Keyed by (q_dtype_str, kv_quant); the pool only depends on the KV dtype and
-# NUM_KV_HEADS, so gqa8 and gqa16 (which differ only in query-head count) share
-# the same cached pool.
+# Cache the (~5GB) quantized KV pools, keyed by (q_dtype_str, kv_quant), so the
+# parametrized cases don't re-quantize 70k blocks each combo. The pool depends
+# only on KV dtype + NUM_KV_HEADS, so gqa8 and gqa16 share it.
 _KV_CACHE_BY_QUANT = {}
 
 
@@ -555,9 +545,8 @@ if __name__ == "__main__":
             q_dtype,
         )
 
-    # ---- Performance comparison ----
-    # Measure latency across different block_id ranges and batch sizes
-    # to verify no performance regression from the rebase fix.
+    # Performance comparison: latency across block_id ranges and batch sizes to
+    # verify no regression from the rebase fix.
 
     print("=== Performance Comparison ===")
     print(

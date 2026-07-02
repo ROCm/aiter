@@ -1371,9 +1371,8 @@ def test_mla(
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
-        # Use the kv_last_page_lens computed in the outer scope (varlen / ctx_lens
-        # aware). The previous unconditional ones() overwrite was correct only
-        # for page_size == 1.
+        # Use the outer-scope kv_last_page_lens (varlen/ctx_lens aware); an
+        # unconditional ones() would only be correct for page_size == 1.
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
         q_fp8 = q.to(dtypes.fp8)

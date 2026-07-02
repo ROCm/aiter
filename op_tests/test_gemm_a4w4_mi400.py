@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# A4W4 (F4GEMM) test/benchmark for gfx1250 (mi400), modeled on test_gemm_a4w4.py
-# and the aiter-op-test standard (candidates dict + run_perftest loop, a torch
-# reference that is only compared (never timed/tabled), TFLOPS + TB/s per
-# candidate, one markdown summary table, and a __main__ guard).
+# A4W4 (F4GEMM) test/benchmark for gfx1250 (mi400), modeled on test_gemm_a4w4.py.
 #
 # Two candidates per (intype, shape, apre) row -- both resolve to the same mi400
 # F4GEMM .co but exercise different entrypoints:

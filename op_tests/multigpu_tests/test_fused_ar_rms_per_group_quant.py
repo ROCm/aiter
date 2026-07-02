@@ -263,15 +263,10 @@ def fused_ar_rmsnorm_per_group_quant(
         out_fp8, scale_out, res_out = result
         bf16_out = None
 
-    # The returned scale carries the logical (M, num_groups) shape for both
-    # layouts; only the storage stride differs:
-    #   transpose_scale=False -> row-major,    stride (num_groups, 1)
-    #   transpose_scale=True  -> column-major, stride (1, M) -- storage
-    #       (num_groups, M) viewed transposed; this is what
-    #       gemm_a8w8_blockscale_preshuffle consumes (and what inductor
-    #       re-strides the fused op output to). In both cases reading
-    #       scale[t, g] yields the correct per-(token, group) scale, so the
-    #       dequant below is layout-agnostic.
+    # Returned scale keeps logical (M, num_groups) shape for both layouts;
+    # only storage stride differs: row-major (num_groups, 1) vs column-major
+    # (1, M) (what gemm_a8w8_blockscale_preshuffle consumes). Either way
+    # scale[t, g] is correct, so the dequant below is layout-agnostic.
     M_local, num_groups_local = scale_out.shape
     if transpose_scale:
         assert scale_out.stride() == (1, M_local), (
@@ -286,10 +281,8 @@ def fused_ar_rmsnorm_per_group_quant(
 
     dequant = out_fp8.float() * scale_out.repeat_interleave(group_size, dim=-1)
 
-    # When requesting bf16 output, verify it matches the fp8+scale dequant
-    # at FP8 precision: both are produced by the same fused kernel from the
-    # same internal fp32 normed value, so they should differ only by the
-    # post-quant rounding.
+    # bf16 output should match the fp8+scale dequant to FP8 precision (same
+    # kernel, same internal fp32 value, differ only by post-quant rounding).
     bf16_vs_fp8_diff = None
     if bf16_out is not None:
         bf16_vs_fp8_diff = (bf16_out.float() - dequant).abs().max().item()
@@ -374,11 +367,9 @@ def test_fused_ar_rmsnorm_per_group_quant(
             ss == expected_scale_shape
         ), f"Scale shape mismatch: got {ss}, expected {expected_scale_shape}"
 
-    # The fused kernel's scale layout must match what the downstream GEMM (and
-    # inductor's re-layout of the op output) expects: column-major stride (1, M)
-    # when transpose_scale=True, else row-major stride (num_groups, 1). Combined
-    # with the value-level checkAllclose below, this guarantees each group's
-    # scale landed in the correct slot.
+    # Scale layout must match the downstream GEMM: column-major (1, M) when
+    # transpose_scale, else row-major (num_groups, 1). With the value-level
+    # checkAllclose below, this guarantees each group's scale is in its slot.
     num_groups = K // group_size
     expected_stride = (1, M) if transpose_scale else (num_groups, 1)
     for st in scale_strides:
@@ -465,12 +456,10 @@ l_tp = [8]
 l_pp = [1]
 l_graph = [False]
 l_group_size = [128]
-# Cover both the fp8-only output (keep_bf16=False, std-attention layers)
-# and the fp8+bf16 dual-output (keep_bf16=True, GDN-style layers).
+# fp8-only (std-attention) and fp8+bf16 dual-output (GDN-style) paths.
 l_emit_bf16 = [False, True]
-# Cover both scale layouts: row-major (non-preshuffle GEMM, default) and
-# column-major (transpose_scale=True, what gemm_a8w8_blockscale_preshuffle
-# consumes). Both must reproduce the same reference dequant.
+# Both scale layouts: row-major (default) and column-major (transpose_scale,
+# for gemm_a8w8_blockscale_preshuffle); both must match the reference dequant.
 l_transpose_scale = [False, True]
 
 parser = argparse.ArgumentParser(
@@ -557,9 +546,8 @@ if __name__ == "__main__":
     freeze_support()
     args = parser.parse_args()
 
-    # 1. Non-distributed Python-side validator test. Runs first so that a
-    #    regression in the helper doesn't waste compute on the full
-    #    distributed sweep.
+    # Non-distributed validator test first, so a helper regression fails
+    # before the full distributed sweep.
     if not args.skip_python_check:
         test_group_size_validation_python_check()
 
@@ -580,15 +568,12 @@ if __name__ == "__main__":
     if args.transpose_scale is not None:
         l_transpose_scale = [bool(args.transpose_scale)]
 
-    # ``--sweep-group-size`` replaces the default matrix with the cross
-    # product of every supported group_size (power-of-two tpg on bf16)
-    # and a small canonical shape set, so we validate the expanded
-    # group_size check without blowing up wall-clock time.
+    # --sweep-group-size: cross every supported group_size with a small
+    # canonical shape set to validate the group_size check cheaply.
     if args.sweep_group_size:
         l_group_size = [32, 64, 128, 256, 512]
         l_shape = [(128, 4096), (512, 4096), (1024, 4096)]
-        # keep emit_bf16 coverage since it is a separate kernel path
-        # but no need to resweep on every shape size
+        # emit_bf16 is a separate kernel path, keep both
         l_emit_bf16 = [False, True]
 
     df = []

@@ -810,10 +810,8 @@ def test_batch_prefill_page_size_1_linear_sglang(
             kv_last_page_lens=kv_last_page_len_gpu,
         )
 
-        # Causal + kv_len < qo_len: rows with few valid K positions amplify
-        # FP8 quantization error (not averaged over many attention targets).
-        # Larger head_dim accumulates more rounding error in dot products
-        # (CK's own FP8BF16 atol is 0.18 for reference).
+        # Bump threshold: causal + kv_len<qo_len rows and larger head_dim
+        # amplify FP8 error (CK's own FP8BF16 atol is 0.18 for reference).
         fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
         if head_dim > 128:
             fp8_threshold = max(fp8_threshold, 0.06)
@@ -1101,10 +1099,8 @@ def test_batch_prefill(
             profile=False,
         )
 
-        # Causal + kv_len < qo_len: rows with few valid K positions amplify
-        # FP8 quantization error (not averaged over many attention targets).
-        # Larger head_dim accumulates more rounding error in dot products
-        # (CK's own FP8BF16 atol is 0.18 for reference).
+        # Bump threshold: causal + kv_len<qo_len rows and larger head_dim
+        # amplify FP8 error (CK's own FP8BF16 atol is 0.18 for reference).
         fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
         if head_dim > 128:
             fp8_threshold = max(fp8_threshold, 0.06)
@@ -2811,9 +2807,7 @@ if __name__ == "__main__":
     print("=" * 100)
 
 
-# =============================================================================
 # StreamLLM Sink Token Tests
-# =============================================================================
 
 
 def ref_masked_attention_with_sink(

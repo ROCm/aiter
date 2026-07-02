@@ -161,9 +161,7 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
     _assert_indx_equal(ref_scatter, tri_scatter)
 
 
-# --------------------------
 # Reference implementations for routing with score mode paths
-# --------------------------
 
 
 def _score_transform_torch(logits, score_mode):
@@ -362,9 +360,7 @@ def _check_routing_data_bucket(
             ), f"expert {e} token {tt_r}: weight ref={w_r} test={w_t}"
 
 
-# --------------------------
 # routing score mode
-# --------------------------
 
 
 @pytest.mark.parametrize(
@@ -434,9 +430,7 @@ def test_routing_score_mode(
     assert tri_routing_data.block_m == block_m
 
 
-# --------------------------
 # routing_from_hash
-# --------------------------
 
 
 @pytest.mark.parametrize(
@@ -514,17 +508,12 @@ def test_routing_from_hash(
     assert tri_routing_data.block_m == block_m
 
 
-# ==========================================================================
-# grouped-top-k routing (aiter.ops.triton.moe.moe_routing.topk.grouped_topk)
-# Moved from test_grouped_topk.py. Reuses the shared helpers above
-# (assert_equal, assert_close, init_data, _sort_and_build_torch,
-# _check_routing_data_bucket).
-# ==========================================================================
+# grouped-top-k routing (aiter.ops.triton.moe.moe_routing.topk.grouped_topk).
+# Reuses shared helpers above (assert_equal, assert_close, init_data,
+# _sort_and_build_torch, _check_routing_data_bucket).
 
 
-# --------------------------------------------------------------------------
 # torch references
-# --------------------------------------------------------------------------
 
 
 def _ref_sqrtsoftplus_grouped(
@@ -641,9 +630,7 @@ def _ref_arbitrary_grouped(
     return w.float(), ids.to(torch.int64)
 
 
-# --------------------------------------------------------------------------
 # output comparison utilities
-# --------------------------------------------------------------------------
 
 
 def _row_sort_by_id(ids, weights):
@@ -680,9 +667,7 @@ def _assert_bitmatrix_matches(bitmatrix, tri_ids, n_tokens, n_expts_tot):
     assert torch.equal(decoded, expected), "bitmatrix does not match selected ids"
 
 
-# --------------------------------------------------------------------------
 # parametrization
-# --------------------------------------------------------------------------
 
 # (n_expts_tot, num_expert_group, topk_group, n_expts_act) — DeepSeek-like.
 GROUP_SHAPES = [
@@ -706,14 +691,9 @@ def _maybe_skip():
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
 
-# --------------------------------------------------------------------------
-# 1. direct kernel test: (y_vals, y_indx, bitmatrix)
-#
-# Unified across contiguous/arbitrary expert->group layouts, score modes, and
-# 0/1/2 fused always-on shared experts. The curated case list reproduces the
-# original three tests' coverage exactly (contiguous x SCORE_COMBOS x no shared;
-# arbitrary x sqrtsoftplus; contiguous x sqrtsoftplus x shared 1/2).
-# --------------------------------------------------------------------------
+# 1. direct kernel test: (y_vals, y_indx, bitmatrix). Unified across
+# contiguous/arbitrary expert->group layouts, score modes, and 0/1/2 fused
+# always-on shared experts.
 
 # sqrtsoftplus + bias + renorm + scale=2.5: the fixed combo the arbitrary-group
 # and shared-expert variants exercise.
@@ -832,13 +812,9 @@ def test_grouped_topk_kernel(n_tokens, shape, score_combo, group_mode):
     _assert_bitmatrix_matches(bitmatrix, y_indx, n_tokens, n_expts_tot)
 
 
-# --------------------------------------------------------------------------
-# 3. end-to-end routing_score_mode(use_grouped_topk=True)
-#
-# grouped_topk is the deterministic ground truth, and _check_routing_data_bucket
-# validates hist / ExptData / inverse-permutation / per-expert (token, weight)
-# multisets over the gate count.
-# --------------------------------------------------------------------------
+# 3. end-to-end routing_score_mode(use_grouped_topk=True). grouped_topk is the
+# deterministic ground truth; _check_routing_data_bucket validates hist /
+# ExptData / inverse-permutation / per-expert (token, weight) multisets.
 
 
 @pytest.mark.parametrize("n_tokens", [8, 16, 64, 1024])

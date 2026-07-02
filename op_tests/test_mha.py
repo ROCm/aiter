@@ -879,14 +879,11 @@ if __name__ == "__main__":
     aiter.logger.info(f"mha summary:\n{df}")
 
 
-# ---------------------------------------------------------------------------
 # Sink backward tests (mha_bwd with sink / d_sink)
-#
 # Reference formula (derived from kernel block_fmha_bwd_dot_do_o.hpp):
 #   D[b, h, q]      = sum_j(dout[b, q, h, j] * out[b, q, h, j]) * p_undrop
 #   P_sink[b, h, q] = exp(sink[b, h] - lse_fwd[b, h, q])
 #   d_sink[h]       = sum_{b, q} (-P_sink[b, h, q] * D[b, h, q])
-# ---------------------------------------------------------------------------
 
 
 def _sink_make_qkvo(

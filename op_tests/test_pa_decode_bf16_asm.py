@@ -318,14 +318,11 @@ def build_pa_metadata(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        # KV-GRANULARITY = WAVES*page_size (4 pages): this kernel processes WAVES
-        # pages per loop iteration, ONE page per wave. With kv_granularity=page_size
-        # every split work item is single-page -> 3 of 4 waves are OOB (clamp+mask),
-        # a barely-exercised path that produces wrong/nondeterministic results on
-        # silicon (deep-split). 4-page chunks keep all 4 waves valid = the multi-page
-        # shape the kernel was HW-validated on. (Sequences not a multiple of 4 pages
-        # still leave a <4-page remainder chunk; exact multiples like 1024/4096 are
-        # fully covered.)
+        # KV-GRANULARITY = WAVES*page_size (4 pages): kernel does WAVES pages/iter,
+        # one page per wave. page_size granularity makes every split single-page ->
+        # 3 of 4 waves OOB (deep-split, wrong/nondeterministic on silicon); 4-page
+        # chunks keep all 4 waves valid (the HW-validated shape). Non-multiples of 4
+        # leave a <4-page remainder; exact multiples (1024/4096) fully covered.
         kv_granularity=page_size,
         block_size=page_size,
         max_seqlen_qo=qlen_with_mtp,
@@ -489,22 +486,18 @@ def ref_pa_decode(
         pages = kv_indices[int(kv_indptr[b]) : int(kv_indptr[b + 1])].long()
         tok_page = pages.repeat_interleave(page_size)[:ctx]
         tok_off = torch.arange(ctx, device=device) % page_size
-        # IMPORTANT: keep K/V/Q raw (fp8 dequant, UNSCALED) and apply the scales
-        # AFTER the fp32 dot/PV, matching the kernel (it folds q/k scales into
-        # scl_log2e applied to Q.K, and value_scale at finalize).  Scaling the
-        # operands first changes the fp32 accumulation magnitude and diverges
-        # badly for large scales (the dot sums ~scale^2 terms instead of ~1).
+        # Keep K/V/Q raw (fp8 dequant, unscaled) and apply scales AFTER the fp32
+        # dot/PV, matching the kernel (q/k scales fold into scl_log2e on Q.K,
+        # value_scale at finalize). Scaling operands first inflates the fp32
+        # accumulation (~scale^2 vs ~1) and diverges badly for large scales.
         Kc = K_tm[tok_page, :, tok_off, :]  # [ctx, kv_head, head_dim] raw
         Vc = V_tm[tok_page, :, tok_off, :]  # [ctx, kv_head, head_dim] raw
         for ql in range(qlen):
             # SP3 causal border (no +1): MTP position ql attends to the first
-            # `ctx - mtp + ql` tokens.  When this is <= 0 the row is FULLY masked
-            # (no valid KV) and the kernel outputs 0 (max-init / L=0 guard).  Do
-            # NOT clamp to a minimum of 1 here: that makes the reference attend to
-            # token 0 and diverge from the GPU for tiny kv_seq_len + mtp>0 (e.g.
-            # kv_seq_len=1, mtp=2 -> MTP rows 0,1 are fully masked: GPU=0, but a
-            # clamped ref would expect V[0]).  The emu host (pa_setNEG_INF_MQA)
-            # masks these rows to 0, which is why the same case passes on emu.
+            # `ctx - mtp + ql` tokens; <= 0 means fully masked -> kernel outputs 0
+            # (max-init / L=0 guard). Do NOT clamp to a minimum of 1: that makes the
+            # ref attend token 0 and diverge from GPU for tiny kv_seq_len + mtp>0
+            # (e.g. kv_seq_len=1, mtp=2). The emu host masks these rows to 0 too.
             valid = min(ctx - mtp + ql, ctx)
             if valid <= 0:
                 out[b, ql] = 0
@@ -703,12 +696,11 @@ def test_pa_decode(
             )
         ).to(fp8)
 
-    # ---- split-KV metadata (ALIGNED with ATOM) ----
-    # Use build_pa_metadata() = aiter.get_pa_metadata_v1() (v1_2_pa_device GPU kernel)
-    # — the SAME metadata path ATOM uses (build_pa_metadata_for_decode). kv_granularity
-    # = page_size, block_size = page_size, matching ATOM's max(block_size,16). This
-    # validates the kernel against ATOM's actual work-item/split convention (NOT the
-    # legacy emu make_sched2_metadata, kept above for reference). Pairs with cpu_reduce_v1.
+    # split-KV metadata via build_pa_metadata() = aiter.get_pa_metadata_v1()
+    # (v1_2_pa_device GPU kernel), the same path ATOM uses. kv_granularity =
+    # block_size = page_size (ATOM's max(block_size,16)); validates against ATOM's
+    # work-item/split convention (not the legacy emu make_sched2_metadata above).
+    # Pairs with cpu_reduce_v1.
     (
         work_indptr,
         work_info,
@@ -824,17 +816,13 @@ def test_pa_decode(
     }
 
 
-# ---------------------------------------------------------------------------
-# V-mask NaN-vs-zero bit-match test
-# ---------------------------------------------------------------------------
-# When kv_seq_len is not a multiple of page_size, the last KV page holds
-# uninitialized V for tokens [seq_len, page_end).  The score border mask drives
-# P=0 there, but a stale fp8-NaN V byte makes the PV WMMA compute 0*NaN = NaN
-# (then spread by the reduce).  The kernel's V-mask (apply_V_mask in
-# PA_DECODE_D64_1TG_4W_PS.sp3...) zeros those V bytes before the PV WMMA.  This
-# test fills that padding region two ways — all-NaN vs all-zero — and requires
-# the kernel outputs to be BIT-IDENTICAL: if the mask is correct the NaN can
-# never reach the math, so both runs must produce the same bytes.
+# V-mask NaN-vs-zero bit-match test.
+# When kv_seq_len isn't a multiple of page_size, the last KV page holds uninit V
+# for tokens [seq_len, page_end); the border mask drives P=0 there, but a stale
+# fp8-NaN V makes the PV WMMA compute 0*NaN = NaN. The kernel's V-mask
+# (apply_V_mask in PA_DECODE_D64_1TG_4W_PS.sp3) zeros those bytes before the PV
+# WMMA. This test fills the padding all-NaN vs all-zero and requires the kernel
+# output to be BIT-IDENTICAL (a correct mask keeps the NaN out of the math).
 
 
 def _build_pa_inputs(
@@ -1076,15 +1064,14 @@ def test_pa_decode_vmask(
         inp["V"], 0.0, inp["kv_indices"], inp["kv_indptr"], inp["seq_lens_kv"], ps
     )
 
-    # Run EACH input REPS times.  The kernel race is intermittent, so a single
-    # zero-V-x2 control can miss it (the two runs happen to agree).  Running both
-    # zero-V and NaN-V several times lets us separate the race from a real V leak:
-    #   * det_zero / det_nan = max pairwise mismatch WITHIN each input's repeats
-    #       -> nonzero == kernel nondeterminism (a race), independent of V.
-    #   * vmask = NaN-V vs zero-V.  Only meaningful when det_zero==det_nan==0; if the
-    #       kernel is nondeterministic the vmask diff is dominated by the race.
-    # `out` (direct-O) is torch.empty -> uninitialized for split rows, so we judge by
-    # split_o (zero-init kernel partials) and the FINAL reduced output only.
+    # Run EACH input REPS times: the race is intermittent, so a single zero-V x2
+    # control can miss it. Running zero-V and NaN-V repeatedly separates race from
+    # a real V leak:
+    #   * det_zero / det_nan = max pairwise mismatch WITHIN an input's repeats ->
+    #       nonzero == kernel nondeterminism (race), independent of V.
+    #   * vmask = NaN-V vs zero-V; only meaningful when det_zero==det_nan==0.
+    # `out` (direct-O) is uninitialized for split rows, so judge by split_o
+    # (zero-init partials) and the FINAL reduced output only.
     REPS = int(
         os.environ.get("PA_VMASK_REPS", "10")
     )  # intermittent race -> need enough reps to detect reliably

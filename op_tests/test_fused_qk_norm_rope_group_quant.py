@@ -354,9 +354,7 @@ def test_fused_qk_norm_rope_group_quant(
     }
 
 
-# ============================================================================
 # SWA fused ring-cache write test
-# ============================================================================
 #
 # Decode-only fusion: the post-norm/rope K row is ALSO scattered into a per-request
 # sliding-window ring that mirrors the main K output's two-buffer split:
@@ -364,10 +362,9 @@ def test_fused_qk_norm_rope_group_quant(
 #   swa_rope[slot, pos % cache_size, :] = k_rope_buff[t]         (rope bf16)
 # where slot = state_slot_mapping[batch_id_per_token[t]]; batch_id == -1 (CG-pad) skips.
 #
-# Verification strategy: run the kernel, then REPLAY the scatter in python from the
-# kernel's own main K outputs and compare byte-exact to the SWA ring. This validates
-# the ring addressing + the verbatim entry copy (incl. the duplicated scale + pad)
-# independently of the quant math (which the main test above already checks vs ref).
+# Verification: replay the scatter in python from the kernel's own main K outputs
+# and compare byte-exact to the SWA ring (validates ring addressing + verbatim
+# entry copy incl. dup scale + pad, independently of the quant math).
 
 
 def _build_swa_batch(T, cache_size):

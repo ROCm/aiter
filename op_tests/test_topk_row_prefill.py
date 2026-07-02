@@ -640,9 +640,9 @@ parser.add_argument(
 args = parser.parse_args()
 
 
-# ========== Run Tests Based on Mode ==========
+# Run tests based on mode
 if args.mode in ["prefill", "all"]:
-    # ========== Prefill Tests ==========
+    # Prefill tests
     df_prefill = []
     param_info_list = []
     # num_row = 6912

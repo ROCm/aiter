@@ -718,18 +718,12 @@ class TestCorrectness:
             context_lens, args=args
         )
 
-        # vLLM's host wrapper infers ``H = u.shape[-2]`` and ``T = k.shape[1]``
-        # (T-major), so it needs the un-permuted ``w_orig`` / ``u_orig`` of
-        # shape ``[B, T, H, *]``, NOT the H-major ``w_c`` / ``u_c`` that
-        # aiter's ``opt_vk`` consumes. Feeding ``u_c`` would make vLLM think
-        # ``H = T`` and try to allocate ``(B, NT, T, V, K)`` for ``h``
-        # (terabytes for long contexts). vLLM supports GQA natively, so we
-        # also do NOT repeat_interleave ``k``.
-        # vLLM's upstream K5 host wrapper indexes ``g`` as token-major
-        # ``[T_total, H]`` (FLA's original layout). Our test fixture now
-        # produces ``g`` in head-major ``[H, T_total]`` (matching the
-        # aiter / FlyDSL K5 convention), so transpose+contiguous it back
-        # to token-major before launching vLLM.
+        # vLLM's host wrapper infers H = u.shape[-2], T = k.shape[1] (T-major), so it
+        # needs the un-permuted w_orig/u_orig [B, T, H, *], not the H-major w_c/u_c
+        # aiter's opt_vk consumes (feeding u_c makes vLLM think H = T and allocate
+        # (B, NT, T, V, K) for h -- terabytes for long contexts). GQA is native, so k
+        # is not repeat_interleaved. vLLM also indexes g as token-major [T_total, H]
+        # (FLA's layout), so transpose our head-major [H, T_total] g back before launch.
         g_token_major = g.transpose(0, 1).contiguous()
         h_vllm, vn_vllm, fs_vllm = chunk_gated_delta_rule_fwd_h_vllm(
             k,
@@ -750,13 +744,10 @@ class TestCorrectness:
             cu_seqlens=cu,
         )
 
-        # vLLM's ``v_new = empty_like(u_orig)`` is already T-major [B, T, H, V],
-        # matching ``vn_ref`` directly -- we must NOT route through
-        # ``_assert_k5_outputs_match_ref`` because that helper calls
-        # ``_normalize_opt_v_new`` (permute 0,2,1,3) on the assumption that the
-        # K5 returned ``v_new`` in head-major [B, H, T, V] layout (aiter's
-        # convention). ``h`` and ``final_state`` follow the same vk layout as
-        # the aiter ``opt_vk`` path, so we compare them directly.
+        # vLLM's v_new = empty_like(u_orig) is already T-major [B, T, H, V], matching
+        # vn_ref, so we do NOT use _assert_k5_outputs_match_ref (its
+        # _normalize_opt_v_new permute assumes head-major [B, H, T, V]). h and
+        # final_state share the aiter opt_vk vk layout, so compare them directly.
         atol, rtol = 5e-2, 5e-2
         torch.testing.assert_close(
             h_vllm.float(),
@@ -872,13 +863,10 @@ def _run_perf_comparison(args: PrefillArgs):
     k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
     total_tokens = sum(context_lens)
 
-    # Triton K5 host wrappers only accept f32 ``initial_state`` and always
-    # produce an f32 ``final_state``. When FlyDSL is benched with a bf16
-    # SSM state, we still want a Triton baseline for comparison, so we
-    # promote h0 to f32 once (outside the timed window) and feed it to
-    # the Triton closures. The resulting "Triton(f32) vs FlyDSL(bf16)"
-    # row answers the practical question "how much does enabling
-    # bf16-state win against the existing Triton baseline?".
+    # Triton K5 host wrappers only accept f32 initial_state and always produce an f32
+    # final_state. For a bf16-state FlyDSL bench we still want a Triton baseline, so
+    # promote h0 to f32 once (outside the timed window) and feed it to the Triton
+    # closures.
     h0_triton_vk = h0.float() if (h0 is not None and h0.dtype != torch.float32) else h0
 
     # triton_origin_opt uses a [K, V] hidden-state layout, so its h0
@@ -912,15 +900,11 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
-    # vLLM upstream K5 (chunk_delta_h.chunk_gated_delta_rule_fwd_h). Uses
-    # the same vk hidden-state layout and same final_state dtype as the
-    # aiter ``opt_vk`` wrapper, but unlike ``opt_vk`` its host wrapper
-    # infers ``H = u.shape[-2]`` (T-major), so it requires the un-permuted
-    # ``w_orig`` / ``u_orig`` -- feeding the H-major ``w_c`` / ``u_c``
-    # would make vLLM compute ``H = T`` and try to allocate a
-    # terabyte-sized ``h``. vLLM supports GQA natively, so ``k`` is also
-    # passed un-expanded. We still feed the same h0_triton_vk (fp32) as
-    # ``triton_vk_launch`` because vk hidden-state layout is identical.
+    # vLLM upstream K5: same vk hidden-state layout / final_state dtype as aiter
+    # opt_vk, but its host wrapper infers H = u.shape[-2] (T-major), so it needs the
+    # un-permuted w_orig/u_orig (H-major w_c/u_c would make it compute H = T and
+    # allocate a terabyte-sized h). GQA is native, so k is passed un-expanded; h0 is
+    # the same fp32 h0_triton_vk since the vk layout is identical.
     def vllm_launch():
         chunk_gated_delta_rule_fwd_h_vllm(
             k=k,
@@ -947,14 +931,10 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
-    # Warmup FlyDSL once so its internal BV-autotune sweep does not
-    # leak into the timed window. Triton's own ``triton.autotune`` is
-    # already absorbed by ``_bench_fn``'s NUM_WARMUP=5 prelude, except
-    # for vLLM upstream's K5 -- its first call also runs a BV/warps/
-    # stages sweep and the 5-iter prelude is not always enough to
-    # converge the autotuner on long-T shapes. Pre-warm it once here
-    # for parity with FlyDSL so that ``us_vllm`` reflects steady-state
-    # kernel time, not the autotune sweep.
+    # Warm up FlyDSL once so its BV-autotune sweep doesn't leak into the timed window.
+    # Triton's triton.autotune is absorbed by _bench_fn's NUM_WARMUP=5, except vLLM's
+    # K5 whose first-call sweep may not converge in 5 iters on long-T shapes -- pre-warm
+    # it too so us_vllm reflects steady-state kernel time.
     flydsl_launch()
     if _HAS_VLLM_K5:
         vllm_launch()
@@ -1356,31 +1336,17 @@ class TestStateDtypeBF16:
             )
 
 
-# -- triton_origin_opt: BV=16 + exp2 variant of fwd_h --------------------
-#
-# Inlined from the (now-deleted) standalone benchmark script
-# ``0423_gdr_prefill_bench_standalone.py``. Launches the same recurrence
-# kernel as the existing ``chunk_gated_delta_rule_fwd_h`` (``triton_origin``
-# in this file), but with two changes that the standalone bench's new
-# pipeline applies on top of the original RTP config:
-#
-#   - BV = 16 (was 32): smaller V-tile -> more (V/BV) blocks per (B*H)
-#     program-id pair -> better occupancy on MI355X.
-#   - USE_EXP2 = True (was False): emits a single ``v_exp_f32`` per
-#     gate evaluation instead of the ``v_log + v_mul + v_exp`` chain that
-#     ``tl.exp`` lowers to.
-#
-# Because USE_EXP2 expects gates pre-scaled by ``1/ln(2)``, the wrapper
-# multiplies the supplied ``g`` (already a per-chunk cumsum, as produced
-# by ``_make_inputs``) by RCP_LN2 before launching. That scale step is
-# excluded from the K5 kernel time -- we time only the kernel itself, in
-# line with how the other K5 wrappers in this file are benchmarked.
-#
-# The kernel itself is wrapped in a ``triton.autotune`` sweep over
-# (BV, num_warps, num_stages); the standalone version pinned BV=16
-# only, but exposing the sweep here matches what aiter's own
-# ``chunk_gated_delta_rule_fwd_kernel_h_blockdim64`` does internally
-# and lets each shape pick its own best config on first run.
+# triton_origin_opt: BV=16 + exp2 variant of fwd_h.
+# Inlined from the (now-deleted) standalone bench 0423_gdr_prefill_bench_standalone.py.
+# Same recurrence kernel as chunk_gated_delta_rule_fwd_h (triton_origin here), plus:
+#   - BV = 16 (was 32): smaller V-tile -> more (V/BV) blocks per (B*H) pid -> better
+#     occupancy on MI355X.
+#   - USE_EXP2 = True (was False): one v_exp_f32 per gate eval instead of the
+#     v_log + v_mul + v_exp chain that tl.exp lowers to.
+# USE_EXP2 expects gates pre-scaled by 1/ln(2), so the wrapper multiplies g (a
+# per-chunk cumsum from _make_inputs) by RCP_LN2 before launch; that scale is
+# excluded from K5 kernel time. The kernel is wrapped in a triton.autotune sweep
+# over (BV, num_warps, num_stages) so each shape picks its best config on first run.
 
 _RCP_LN2 = 1.0 / 0.6931471805599453
 
@@ -1388,18 +1354,14 @@ _exp = tl.exp
 _exp2 = tl.math.exp2
 
 
-# Decorator stack mirrors FLA's K5 kernels (Heuristics outer, Autotune
-# inner) so that Triton 3.x writes the sweep result to its persistent
-# autotune cache (`~/.triton/autotune`) via ``cache_results=True``. After
-# the first run each (H, K, V, BT, IS_VARLEN) key is served from disk and
-# subsequent runs no longer launch the full BV/warps/stages sweep -- the
-# rocprof kernel-stats CSV then reports the same ~56 calls as the other
-# K5 kernels, instead of the 9000+ that an un-cached sweep produces.
-#
-# ``Hg`` is intentionally excluded from ``key``: it only affects host-side
-# address arithmetic (``H // Hg`` divisor for the K block-ptr), not the
-# compiled binary or tile shape, so adding it would just multiply the
-# number of unique keys and force redundant sweeps.
+# Decorator stack mirrors FLA's K5 kernels (Heuristics outer, Autotune inner) so
+# Triton 3.x writes the sweep result to its persistent autotune cache
+# (~/.triton/autotune) via cache_results=True. After the first run each
+# (H, K, V, BT, IS_VARLEN) key is served from disk, so subsequent runs skip the
+# full BV/warps/stages sweep.
+# Hg is intentionally excluded from key: it only affects host-side address
+# arithmetic (H // Hg divisor for the K block-ptr), not the compiled binary or tile
+# shape, so including it would just multiply unique keys and force redundant sweeps.
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,

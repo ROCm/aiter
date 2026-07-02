@@ -51,9 +51,7 @@ except ImportError:
     _HAS_AITER_MHC_POST = False
 
 
-# =============================================================================
 # Tests
-# =============================================================================
 
 
 def _alphas(alpha_pre, alpha_post, alpha_res, device="cuda"):
@@ -336,9 +334,7 @@ def test_mhc_output_range():
     )
 
 
-# =============================================================================
 # Split-K Tests
-# =============================================================================
 
 
 def _make_split_k_config(num_ksplit, n=4):
@@ -564,9 +560,7 @@ def test_split_k_large_k():
     )
 
 
-# =============================================================================
 # Triton-vs-HIP parity anchor
-# =============================================================================
 
 
 def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n):
@@ -704,9 +698,7 @@ def test_triton_mhc_matches_hip(M, n, C):
         ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
 
 
-# =============================================================================
 # mhc_post Tests
-# =============================================================================
 
 
 @pytest.mark.parametrize(
@@ -868,9 +860,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     assert pct <= 0.05, f"{msg} (atol=2e-2, rtol=1e-2, bad_element_ratio={pct:.2%})"
 
 
-# =============================================================================
 # Fused mhc_post_pre Tests
-# =============================================================================
 
 
 @pytest.mark.parametrize("M", [1, 4, 64, 128])

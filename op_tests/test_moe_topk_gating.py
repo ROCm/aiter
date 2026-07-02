@@ -29,21 +29,17 @@ from aiter.test_common import (
 from aiter.utility.dtypes import str2Dtype, str2tuple
 
 # NOTE on correctness metrics by score function:
-# - sigmoid uses element-wise comparison (score_errors/index_errors) because
-#   both torch/topk and fused paths return sorted top-K.
-# - softplus/softmax use set-based ID matching (id_errors/max_weight_err)
-#   because torch references intentionally use `topk(..., sorted=False)` to
-#   mirror routing behavior where top-K order is not semantically required.
+# - sigmoid uses element-wise comparison (score_errors/index_errors): both
+#   torch/topk and fused paths return sorted top-K.
+# - softplus/softmax use set-based ID matching (id_errors/max_weight_err): torch
+#   references use topk(..., sorted=False), so top-K order is not required.
 #
-# Tie-aware selection: the fused kernel scores experts with hardware-approximate
-# math (exp2f/log2f, ~1e-6 ULP), while the torch reference uses exact libm. When
-# two experts straddle the top-K cutoff with biased selection scores closer than
-# this noise, which one wins is a genuine tie and the choice is semantically
-# irrelevant (the swapped experts carry near-identical weights). We must NOT flag
-# such boundary ties as errors, otherwise tiny token counts (e.g. 64) make a
-# single harmless flip exceed the 1% threshold. `_count_routing_mismatches`
-# excuses a token iff every kernel-only expert sits within `tol` below the cutoff
-# and every reference-only expert sits within `tol` above it.
+# Tie-aware selection: the fused kernel uses hardware-approximate math (exp2f/
+# log2f, ~1e-6 ULP) vs the reference's exact libm. Experts straddling the top-K
+# cutoff within that noise are genuine ties (near-identical weights) and must not
+# be flagged. _count_routing_mismatches excuses a token iff every kernel-only
+# expert is within `tol` below the cutoff and every reference-only expert within
+# `tol` above it.
 
 # Tolerance for boundary ties: ~1e-4 is ~100x the kernel's score-approximation
 # noise (~1e-6 on O(1) scores), so genuine routing bugs (gaps >> 1e-4) are still

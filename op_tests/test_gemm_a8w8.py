@@ -594,9 +594,7 @@ def _iter_flydsl_csv_cases():
         )
 
 
-# ---------------------------------------------------------------------------
 # Argument parser
-# ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
