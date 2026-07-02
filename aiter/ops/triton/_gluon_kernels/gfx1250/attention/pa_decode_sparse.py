@@ -521,8 +521,11 @@ def _pa_decode_sparse(
         )
         out0, out1 = gl.split(out_r)
         out_buf0.store(out0)
-        gl.amd.gfx1250.tdm.async_store(out_desc, [h_off_base, 0], out_buf0)
         out_buf1.store(out1)
+        # Make every warp's LDS writes visible before TDM reads them (the WMMA
+        # store is multi-warp), then issue both DMAs and drain once.
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(out_desc, [h_off_base, 0], out_buf0)
         gl.amd.gfx1250.tdm.async_store(out_desc, [h_off_base, HALF_D], out_buf1)
         gl.amd.gfx1250.tdm.async_wait(0)
     else:
@@ -556,12 +559,45 @@ def _pa_decode_sparse(
             layout=acc_half_shared,
         )
 
+        # TDM store the m_i / l_i partials as 1D [BLOCK_H] slabs. No padding is
+        # needed (BLOCK_H fp32 elements -> BLOCK_H distinct banks, no conflict),
+        # so a plain non-swizzled layout (max_phase==1) is accepted by TDM. The
+        # descriptor base folds in the per-(token, split) offset, and shape=[H]
+        # boundary handling drops rows >= H (replaces the old h_mask_ml).
+        ml_shared: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[0]
+        )
+        m_base = t * mp_stride_t + pid_k * mp_stride_k
+        l_base = t * lp_stride_t + pid_k * lp_stride_k
+        m_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=m_partial_ptr + m_base,
+            shape=[H],
+            strides=[mp_stride_h],
+            block_shape=[BLOCK_H],
+            layout=ml_shared,
+        )
+        l_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=l_partial_ptr + l_base,
+            shape=[H],
+            strides=[lp_stride_h],
+            block_shape=[BLOCK_H],
+            layout=ml_shared,
+        )
+
+        # Allocate every LDS staging buffer up front so their lifetimes overlap:
+        # this stops the allocator from reusing an acc buffer (whose async_store
+        # DMA is still in flight) for the small m/l buffers, which would corrupt
+        # the acc data mid-transfer. Order is: store all -> barrier -> issue all
+        # DMAs -> single wait. The barrier makes every warp's LDS writes visible
+        # before any TDM read (the WMMA store is multi-warp).
         acc_buf0 = gl.allocate_shared_memory(
             acc_partial_ptr.dtype.element_ty, [BLOCK_H, HALF_D], acc_half_shared
         )
         acc_buf1 = gl.allocate_shared_memory(
             acc_partial_ptr.dtype.element_ty, [BLOCK_H, HALF_D], acc_half_shared
         )
+        m_buf = gl.allocate_shared_memory(gl.float32, [BLOCK_H], ml_shared)
+        l_buf = gl.allocate_shared_memory(gl.float32, [BLOCK_H], ml_shared)
 
         acc_r = (
             acc.to(acc_partial_ptr.dtype.element_ty)
@@ -569,32 +605,17 @@ def _pa_decode_sparse(
             .permute(0, 2, 1)
         )
         acc0, acc1 = gl.split(acc_r)
-        # Ensure all wavefronts have finished writing to LDS before TDM reads it.
-        # gl.barrier()
-
         acc_buf0.store(acc0)
-        gl.amd.gfx1250.tdm.async_store(acc_desc, [h_off_base, 0], acc_buf0)
-
         acc_buf1.store(acc1)
-        gl.amd.gfx1250.tdm.async_store(acc_desc, [h_off_base, HALF_D], acc_buf1)
+        m_buf.store(m_i)
+        l_buf.store(l_i)
 
-        h_offs_ml = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT))
-        h_offs_ml_eff = h_off_base + h_offs_ml
-        h_mask_ml = h_offs_ml_eff < H
-        m_base = t * mp_stride_t + pid_k * mp_stride_k
-        l_base = t * lp_stride_t + pid_k * lp_stride_k
-        gl.amd.cdna4.buffer_store(
-            m_i,
-            ptr=m_partial_ptr + m_base,
-            offsets=(h_offs_ml_eff * mp_stride_h).to(gl.int32),
-            mask=h_mask_ml,
-        )
-        gl.amd.cdna4.buffer_store(
-            l_i,
-            ptr=l_partial_ptr + l_base,
-            offsets=(h_offs_ml_eff * lp_stride_h).to(gl.int32),
-            mask=h_mask_ml,
-        )
+        gl.barrier()
+
+        gl.amd.gfx1250.tdm.async_store(acc_desc, [h_off_base, 0], acc_buf0)
+        gl.amd.gfx1250.tdm.async_store(acc_desc, [h_off_base, HALF_D], acc_buf1)
+        gl.amd.gfx1250.tdm.async_store(m_desc, [h_off_base], m_buf)
+        gl.amd.gfx1250.tdm.async_store(l_desc, [h_off_base], l_buf)
 
         gl.amd.gfx1250.tdm.async_wait(0)
 
@@ -740,7 +761,7 @@ def _pa_decode_sparse_reduce(
     gl.amd.gfx1250.tdm.async_wait(0)
     m_p = smemM.load(L_KH)  # [KV_SPLITS, BLOCK_H]
     l_p = smemL.load(L_KH)  # [KV_SPLITS, BLOCK_H]
-    a_p = smemAcc.load(BLK3)  # [KV_SPLITS, BLOCK_H, BLOCK_D]
+    a_p = smemAcc.load(BLK3).to(gl.float32)  # [KV_SPLITS, BLOCK_H, BLOCK_D]
 
     m_p = gl.where(seg_active, m_p, neg_inf)
     l_p = gl.where(seg_active, l_p, zero_kh)
