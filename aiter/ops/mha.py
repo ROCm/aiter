@@ -485,7 +485,7 @@ def fmha_fwd_with_sink_varlen_asm(
 
 
 # ---------------------------------------------------------------------------
-# fmha_fwd_mxfp8_asm (gfx1250 / MI450) — dedicated MXFP8 FMHA forward.
+# fmha_fwd_mxfp8_asm (gfx1250) — dedicated MXFP8 FMHA forward.
 #
 # This is an intentionally separate integration path from both the bf16
 # `fmha_fwd_with_sink_asm` and the shared `fmha_v3` paths.  The MXFP8 kernel
