@@ -119,10 +119,9 @@ def build(verbose=False, jobs=None):
     if verbose:
         print(f"[setup] arch={arch}, jobs={jobs}")
 
-    # Per-arch build-time skip list: kernels using builtins unavailable on
-    # the target arch. Skipped so the rest of the suite still links; the
-    # Python harness sees the missing extern "C" launcher and reports SKIP.
-    # Empty today; add entries here for future arch-specific kernels.
+    # Per-arch build-time skip list: kernels using builtins unavailable on the target arch. Skipped so the rest of the
+    # suite still links; the Python harness sees the missing extern "C" launcher and reports SKIP. Empty today; add
+    # entries here for future arch-specific kernels.
     _ARCH_SKIP_SOURCES = {}
     skip = _ARCH_SKIP_SOURCES.get(arch, set())
     sources = [s for s in _CU_SOURCES if s not in skip]

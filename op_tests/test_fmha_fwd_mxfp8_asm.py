@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Correctness + performance test for the gfx1250 MXFP8 ASM FMHA forward path
-# (aiter.fmha_fwd_mxfp8_asm): a @benchmark sweep timed with run_perftest and
-# checked with checkAllclose against a torch reference.
+# Correctness + performance test for the gfx1250 MXFP8 ASM FMHA forward path (aiter.fmha_fwd_mxfp8_asm): a @benchmark
+# sweep timed with run_perftest and checked with checkAllclose against a torch reference.
 
 import argparse
 import itertools

@@ -315,9 +315,8 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
     }
 
 
-# Mix of decode-sized (1-stage), prefill-sized within the 512 KiB 2-stage
-# budget, and an oversized shape that should fall back to fused
-# AR+RMSNorm + dynamic_mxfp4_quant.
+# Mix of decode-sized (1-stage), prefill-sized within the 512 KiB 2-stage budget, and an oversized shape that should
+# fall back to fused AR+RMSNorm + dynamic_mxfp4_quant.
 CI_SHAPES = [
     # Covers all three dispatch paths at the default --tp-size 8:
     (1, 4096),  # direct_1stage (K<=4096 -> M<=32 at TP=8)
@@ -434,9 +433,8 @@ def main():
             shape, tp_size, element_size, stage_override, emit_bf16
         )
         if expected == "fallback" and stage_override in ("1", "0"):
-            # When forcing a specific kernel, only exercise shapes that the
-            # kernel actually supports. Fallbacks under override would just
-            # silently re-test the unfused reference path.
+            # When forcing a specific kernel, only exercise shapes that the kernel actually supports.
+            # Fallbacks under override would just silently re-test the unfused reference path.
             continue
         rows.append(
             test_fused_ar_rmsnorm_mxfp4_quant(

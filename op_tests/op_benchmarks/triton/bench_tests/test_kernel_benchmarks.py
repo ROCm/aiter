@@ -125,8 +125,7 @@ def test_kimi_k2_model_shapes_entry():
     mha = kimi["mha"][0]
     assert (mha["hq"], mha["hkv"], mha["dqk"], mha["dv"]) == (64, 64, 192, 128)
 
-    # Routed MoE GEMM must reflect Kimi K2's E=384, TopK=8, hidden=7168,
-    # 2*moe_intermediate_size=4096.
+    # Routed MoE GEMM must reflect Kimi K2's E=384, TopK=8, hidden=7168, 2*moe_intermediate_size=4096.
     moe_kernels = [k for k in kimi if k.startswith("moe_op_gemm_")]
     assert moe_kernels, "Kimi-K2 must exercise at least one MoE GEMM kernel"
     for k in moe_kernels:
@@ -136,8 +135,7 @@ def test_kimi_k2_model_shapes_entry():
         assert shape["Dim1"] == 7168, (k, shape)
         assert shape["Dim2"] == 4096, (k, shape)
 
-    # MLA projection GEMMs (q_b, kv_b, o_proj) — these differ from DSR1
-    # because Kimi K2 halves the head count.
+    # MLA projection GEMMs (q_b, kv_b, o_proj) — these differ from DSR1 because Kimi K2 halves the head count.
     dense_gemm_kernels = [k for k in kimi if k.startswith("gemm_") and "moe" not in k]
     assert dense_gemm_kernels, "Kimi-K2 must exercise at least one dense GEMM"
     for k in dense_gemm_kernels:
@@ -147,8 +145,7 @@ def test_kimi_k2_model_shapes_entry():
             assert (16384, 512) in nk, f"{k} missing kv_b_proj shape"
             assert (7168, 8192) in nk, f"{k} missing o_proj shape"
 
-    # --model 'kimi' regex (case-insensitive, from bench_models.parse_args)
-    # must match exactly this entry.
+    # --model 'kimi' regex (case-insensitive, from bench_models.parse_args) must match exactly this entry.
     pat = re.compile("kimi", re.IGNORECASE)
     assert [m for m in data if pat.search(m)] == ["Kimi-K2 Thinking"]
 

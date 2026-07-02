@@ -509,8 +509,7 @@ def test_routing_from_hash(
 
 
 # grouped-top-k routing (aiter.ops.triton.moe.moe_routing.topk.grouped_topk).
-# Reuses shared helpers above (assert_equal, assert_close, init_data,
-# _sort_and_build_torch, _check_routing_data_bucket).
+# Reuses shared helpers above (assert_equal, assert_close, init_data, _sort_and_build_torch, _check_routing_data_bucket).
 
 
 # torch references
@@ -695,8 +694,7 @@ def _maybe_skip():
 # contiguous/arbitrary expert->group layouts, score modes, and 0/1/2 fused
 # always-on shared experts.
 
-# sqrtsoftplus + bias + renorm + scale=2.5: the fixed combo the arbitrary-group
-# and shared-expert variants exercise.
+# sqrtsoftplus + bias + renorm + scale=2.5: the fixed combo the arbitrary-group and shared-expert variants exercise.
 SQ_COMBO = ("sqrtsoftplus", True, True, 2.5)
 
 

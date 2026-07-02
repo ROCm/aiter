@@ -128,8 +128,7 @@ def custom_group_worker(
         out_ag, us_ag = run_ag(x_ag)
         out_rs, us_rs = run_rs(x_rs)
 
-    # move tensors to CPU before destroying distributed env,
-    # otherwise CUDA IPC serialization fails with invalid argument
+    # move tensors to CPU before destroying distributed env, otherwise CUDA IPC serialization fails with invalid argument
     out_ar = out_ar.cpu()
     out_ag = out_ag.cpu()
     out_rs = out_rs.cpu()

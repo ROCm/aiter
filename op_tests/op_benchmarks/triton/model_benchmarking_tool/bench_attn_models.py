@@ -217,8 +217,7 @@ class Model:
 
         if self.dqk == self.dv:
             # Case 1: dqk == dv == d
-            # If not a power of 2, promote to next power of 2
-            # (same logic for both bwdo and bwdf)
+            # If not a power of 2, promote to next power of 2 (same logic for both bwdo and bwdf)
             effective_dqk = effective_dv = next_power_of_2(self.dqk)
         else:
             # Case 2: dqk > dv (guaranteed by __post_init__ assertion)

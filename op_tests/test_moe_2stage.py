@@ -181,8 +181,7 @@ def test_fmoe(
         dtypes.i4x2,
         dtypes.fp8,
     ):
-        # fp4x2 weights pack 2 nibbles/byte -> halved last dim. fp8 (mxfp8) and
-        # i4x2 keep their stored shape.
+        # fp4x2 weights pack 2 nibbles/byte -> halved last dim. fp8 (mxfp8) and i4x2 keep their stored shape.
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
     else:
@@ -400,9 +399,8 @@ def test_fmoe(
     )
 
     if kernel_bench:
-        # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
-        # fused_moe call populates the per-stage launch callables (via the opt-in
-        # kernel_bench_callable hook) and yields a correct output; then loop each
+        # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager fused_moe call populates the per-stage
+        # launch callables (via the opt-in kernel_bench_callable hook) and yields a correct output; then loop each
         # captured kernel launch alone (excludes input prep / quant / sorting).
         kernel_bench_callable = []
         aiter.fused_moe.kernel_bench_callable = kernel_bench_callable
@@ -764,10 +762,9 @@ def _iter_csv_cases():
                 e,
             )
             continue
-        # The reference path below uses the CSV q_dtype_a directly, while
-        # fused_moe selects q_dtype_a from the current Swiglu MXFP4 runtime mode.
-        # Skip CSV rows that are tuned for a different mode to avoid comparing
-        # e.g. an fp4x2 reference against a bf16/fp8 runtime dispatch.
+        # The reference path below uses the CSV q_dtype_a directly, while fused_moe selects q_dtype_a from the current
+        # Swiglu MXFP4 runtime mode. Skip CSV rows that are tuned for a different mode to avoid comparing e.g. an fp4x2
+        # reference against a bf16/fp8 runtime dispatch.
         expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
             kwargs["token"],
             kwargs["actType"],

@@ -140,9 +140,8 @@ def _make_mla_mi400_case(
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
     if num_kv_splits is None:
-        # Mirror mla_decode_fwd(num_kv_splits=None): resolve the auto split count
-        # and its indptr through the shared meta-param heuristic so the case
-        # carries a concrete value for the shape checks and the kernel args.
+        # Mirror mla_decode_fwd(num_kv_splits=None): resolve the auto split count and its indptr through the shared
+        # meta-param heuristic so the case carries a concrete value for the shape checks and the kernel args.
         num_kv_splits, num_kv_splits_indptr = aiter.mla.get_meta_param(
             None,
             batch,
@@ -170,9 +169,8 @@ def _make_mla_mi400_case(
     kv_last_page_lens = torch.full(
         (batch,), last_page_len, dtype=torch.int32, device=device
     )
-    # gfx1250/mi400 stage1 asm kernel consumes a PAGE-level kv_indptr directly, so
-    # build it as the per-batch prefix sum of page counts ([0, npb, 2*npb, ...] for
-    # uniform ctx_lens).
+    # gfx1250/mi400 stage1 asm kernel consumes a PAGE-level kv_indptr directly, so build it as the per-batch prefix sum
+    # of page counts ([0, npb, 2*npb, ...] for uniform ctx_lens).
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=device)
     kv_indptr[1:] = torch.cumsum(
         torch.full((batch,), num_pages_per_batch, dtype=torch.int32, device=device),

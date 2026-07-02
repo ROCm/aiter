@@ -288,9 +288,8 @@ def pertoken_quant_ref(x: torch.Tensor):
     """
     fp8_dtype = fp8_cache_dtype()
     assert fp8_dtype is not None
-    # fp8 max is arch-dependent and MUST match the kernel's fp8Max<cache_t>():
-    # e4m3fnuz (gfx942) -> 240, e4m3fn (gfx950+) -> 448. Hardcoding 448 mis-scales
-    # the e4m3fnuz cache on MI300X.
+    # fp8 max is arch-dependent and MUST match the kernel's fp8Max<cache_t>(): e4m3fnuz (gfx942) -> 240, e4m3fn
+    # (gfx950+) -> 448. Hardcoding 448 mis-scales the e4m3fnuz cache on MI300X.
     fp8_max = torch.finfo(fp8_dtype).max
     amax = x.float().abs().amax(dim=-1, keepdim=True)
     scale = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
@@ -733,9 +732,8 @@ def test_fused_qknorm_idxrqknorm(
                     atol=atol,
                 )
         elif mode.startswith("asm_layout"):
-            # Ground truth: write the SAME normed/roped K and raw V into freshly
-            # zeroed SHUFFLE caches via the PROVEN reshape_and_cache(asm_layout=True)
-            # writer, then compare the fused-op caches against it element-wise. This
+            # Ground truth: write the SAME normed/roped K and raw V into freshly zeroed SHUFFLE caches via the PROVEN
+            # reshape_and_cache(asm_layout=True) writer, then compare the fused-op caches against it element-wise. This
             # directly validates the new SHUFFLE layout offsets.
             ref_k_cache = torch.zeros_like(kv_cache_k)
             ref_v_cache = torch.zeros_like(kv_cache_v)

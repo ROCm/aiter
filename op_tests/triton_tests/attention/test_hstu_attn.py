@@ -111,8 +111,7 @@ def sanity_check_attention(
 
 
 # calculate flops of the hstu attention
-# lower trigualar mask, so no need to multiple by 2
-# for flops calculation
+# lower trigualar mask, so no need to multiple by 2 for flops calculation
 def get_flops(seq_offsets: torch.Tensor, heads: int, attn_dim: int, hidden_dim: int):
     total_flops = 0.0
     seq_num = seq_offsets.shape[0] - 1

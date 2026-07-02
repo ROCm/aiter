@@ -442,9 +442,8 @@ def test_flash_attn_kvcache_noncontiguous_paged(
         seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
     )
 
-    # Sanity: the views must really be non-contiguous (block stride == 2x), else
-    # this test would silently degrade to the contiguous case and stop guarding
-    # the fix.
+    # Sanity: the views must really be non-contiguous (block stride == 2x), else this test would silently degrade to the
+    # contiguous case and stop guarding the fix.
     assert not k_cache_paged.is_contiguous()
     assert not v_cache_paged.is_contiguous()
     assert k_cache_paged.stride(0) == 2 * paged_kv_block_size * nheads_k * d
@@ -507,9 +506,8 @@ def test_flash_attn_kvcache_noncontiguous_paged(
         f"{mult}x Pytorch baseline diff {pt_max_diff:.6e} + 1e-5"
     )
 
-    # The exact same data laid out in a *contiguous* paged cache must produce the
-    # same result -- this directly pins the kernel to the real block stride
-    # rather than the contiguous-only assumption.
+    # The exact same data laid out in a *contiguous* paged cache must produce the same result -- this directly pins the
+    # kernel to the real block stride rather than the contiguous-only assumption.
     out_contig = flash_attn_with_kvcache(
         q,
         k_cache_paged.contiguous(),
@@ -756,8 +754,7 @@ def test_flash_attn_kvcache_graph_capture(mha_type, new_kv):
 
 
 # ===========================================================================
-# Additional mha_v3 tests: FP8 fwd/bwd, paged graph capture, and
-# flash_attn_func / flash_attn_varlen_func graph capture.
+# Additional mha_v3 tests: FP8 fwd/bwd, paged graph capture, and flash_attn_func / flash_attn_varlen_func graph capture.
 # ===========================================================================
 
 
@@ -1147,11 +1144,9 @@ def test_mha_v3_sliding_window_bwd(
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, CAUSAL, WINDOW_SIZE",
     [
-        # Production-size sequence lengths (beyond the upstream 2048 cap) paired
-        # with large windows (128/256). seqlen >> window means the window spans
-        # many key blocks, so the bwd full/partial/skipped block classification
-        # is exercised across many blocks -- the small (seqlen 128, window 16/32)
-        # cases above barely span more than one block.
+        # Production-size sequence lengths (beyond the upstream 2048 cap) paired with large windows (128/256). seqlen >>
+        # window means the window spans many key blocks, so the bwd full/partial/skipped block classification is
+        # exercised across many blocks -- the small (seqlen 128, window 16/32) cases above barely span more than one block.
         (4096, 4096, 8, 8, True, (256, 0)),  # large causal window
         (4096, 4096, 16, 4, False, (128, 128)),  # GQA large symmetric window
         (8192, 8192, 8, 8, True, (256, 0)),  # larger causal window
@@ -1201,9 +1196,8 @@ def _check_sliding_window_bwd(
 ):
     """Run one FA3 sliding-window backward and check out/dq/dk/dv vs the PyTorch
     reference. Shared by the small-matrix and production-size tests above."""
-    # The Triton attention path uses approximate dot/exp implementations for fp32
-    # too. Keep fp32 in the matrix to exercise the code path, but use tolerances
-    # consistent with the non-FP8 backward tests.
+    # The Triton attention path uses approximate dot/exp implementations for fp32 too. Keep fp32 in the matrix to
+    # exercise the code path, but use tolerances consistent with the non-FP8 backward tests.
     fwd_atol, fwd_rtol = 1e-2, 1e-2
     bwd_atol, bwd_rtol = 1.5e-2, 1.5e-2
     torch.cuda.empty_cache()

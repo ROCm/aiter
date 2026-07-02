@@ -35,9 +35,8 @@ from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 torch.set_default_device("cuda")
 
-# Every card these ASM kernels are built/validated for.  The .co files only
-# ship for gfx1250 (hsa/gfx1250/fmha_fwd_bf16/*.co); on any other arch the
-# kernel launch raises 'no kernel for arch=...'.
+# Every card these ASM kernels are built/validated for.  The .co files only ship for gfx1250
+# (hsa/gfx1250/fmha_fwd_bf16/*.co); on any other arch the kernel launch raises 'no kernel for arch=...'.
 SUPPORTED_GFX = ["gfx1250"]
 
 
@@ -156,9 +155,8 @@ def _flops_bytes(batch, hq, hk, sq, sk, d, is_causal, esz):
 # Shape tables
 # ---------------------------------------------------------------------------
 
-# Correctness shapes (torch reference is feasible here).  hq=64; hk=8 for D64
-# and hk=4 for D128 (GQA ratios 8 / 16).  Non-causal (mask=0) kernels require
-# sk % 256 == 0 — non-aligned sk rows are causal-only (filtered in the sweep).
+# Correctness shapes (torch reference is feasible here).  hq=64; hk=8 for D64 and hk=4 for D128 (GQA ratios 8 / 16).
+# Non-causal (mask=0) kernels require sk % 256 == 0 — non-aligned sk rows are causal-only (filtered in the sweep).
 # (head_dim, hq, hk, sq, sk, batch)
 _CORRECTNESS_SHAPES = [
     (64, 64, 8, 128, 2048, 1),  # D64  aligned

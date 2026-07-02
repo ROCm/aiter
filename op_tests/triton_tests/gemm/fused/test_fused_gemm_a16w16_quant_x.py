@@ -59,8 +59,7 @@ def _assert_quant_close(triton_x_quant, triton_x_scales, x):
     ref_x_quant, ref_x_scales = torch_mxfp8_quant_from_fp32(x.to(torch.float32))
     # e8m0 scales: bit-exact (integer-only after fp32 cast).
     torch.testing.assert_close(triton_x_scales, ref_x_scales)
-    # Quantized values: compare via uint8 view (allow off-by-1 for any rounding
-    # subtlety in the fp32->fp8 cast).
+    # Quantized values: compare via uint8 view (allow off-by-1 for any rounding subtlety in the fp32->fp8 cast).
     torch.testing.assert_close(
         triton_x_quant.view(torch.uint8).to(torch.int32),
         ref_x_quant.view(torch.uint8).to(torch.int32),

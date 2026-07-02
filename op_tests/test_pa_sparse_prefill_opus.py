@@ -165,9 +165,8 @@ def _ref_pa_sparse_prefill_opus(
 # FP8 DSA packing + reference (NoPE fp8 / RoPE bf16).
 # NoPE stream packs, per row of 512 fp8 slots:
 #   [ NoPE fp8 (448) | E8M0 block scales (14) | fp8 zero-pad (50) ]
-# with one E8M0 (power-of-two) scale per 32-element NoPE block. RoPE is a
-# separate [*, 64] bf16 tensor. Kernel: NoPE QK^T as scaled MXFP8 MFMA, RoPE
-# QK^T and PV at bf16, fp32 accumulate.
+# with one E8M0 (power-of-two) scale per 32-element NoPE block. RoPE is a separate [*, 64] bf16 tensor.
+# Kernel: NoPE QK^T as scaled MXFP8 MFMA, RoPE QK^T and PV at bf16, fp32 accumulate.
 
 _FP8_D_NOPE = 448
 _FP8_D_NOPE_PADDED = 512
@@ -188,8 +187,7 @@ def _quantize_nope(real: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     blk = real.reshape(r, _FP8_NBLK, _FP8_BLK).to(torch.float32)
     amax = blk.abs().amax(dim=-1)  # [R, NBLK]
 
-    # Per-block E8M0 exponent chosen so the block max maps to (224, 448], i.e.
-    # strictly inside the e4m3fn finite range (overflow -> NaN on cast).
+    # Per-block E8M0 exponent chosen so the block max maps to (224, 448], i.e. strictly inside the e4m3fn finite range (overflow -> NaN on cast).
     e_unbiased = torch.ceil(torch.log2(amax.clamp(min=1e-30) / _FP8_MAX)).to(
         torch.int32
     )
@@ -293,9 +291,8 @@ def _random_csr(
     lo = 0 if allow_empty else 1
 
     lens = torch.randint(lo, total_rows + 1, (n,), generator=g, dtype=torch.int32)
-    # Seed the leading rows with tile-boundary lengths -- guarantees every
-    # sparse sweep exercises the kernel's full/half/over-tile branches and
-    # (when allow_empty) the sink-only empty-row path.
+    # Seed the leading rows with tile-boundary lengths -- guarantees every sparse sweep exercises the kernel's
+    # full/half/over-tile branches and (when allow_empty) the sink-only empty-row path.
     boundary = _boundary_nnz(kv_tile_size, total_rows)
     if not allow_empty:
         boundary = [max(b, 1) for b in boundary]

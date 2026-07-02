@@ -136,9 +136,9 @@ def rope_rotate_fp8quant_torch(
 
 @benchmark()
 def test_rope_rotate_fp8quant(M, head_num, N, dtype=torch.bfloat16):
-    # fp8 path is supported on both gfx950 (e4m3fn) and gfx942 (e4m3fnuz) -- the
-    # arch-only fp4 kernels are gfx942-gated out, so this module builds and runs
-    # on gfx942 too. fp8_max (448 vs 240) is taken from torch.finfo per arch.
+    # fp8 path is supported on both gfx950 (e4m3fn) and gfx942 (e4m3fnuz) -- the arch-only fp4 kernels are
+    # gfx942-gated out, so this module builds and runs on gfx942 too. fp8_max (448 vs 240) is taken from torch.finfo
+    # per arch.
     rope_dim = 64
     group_size = 128
     max_pos = 2048
@@ -300,9 +300,8 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-# Which quant paths to sweep. Explicit --fp8 / --rope still select a single
-# path (backward compat). With neither flag, the default sweep covers BOTH the
-# fp4 path and the fused rope+hadamard+fp8 path, so CI exercises the fp8 kernel
+# Which quant paths to sweep. Explicit --fp8 / --rope still select a single path (backward compat). With neither flag,
+# the default sweep covers BOTH the fp4 path and the fused rope+hadamard+fp8 path, so CI exercises the fp8 kernel
 # (aiter.rope_rotate_activation with out_scale) by default.
 if args.fp8:
     test_fns = [test_rope_rotate_fp8quant]

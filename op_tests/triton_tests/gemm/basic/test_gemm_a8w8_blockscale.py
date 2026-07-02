@@ -155,9 +155,8 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
             )
 
     if impl != "gluon" and K < 512:
-        # Small-K shapes were added for the gluon wind-down's num_k_iter
-        # guards; the standard triton / preshuffle autotune configs fail to
-        # compile at these K values (BLOCK_SIZE_K mismatch).
+        # Small-K shapes were added for the gluon wind-down's num_k_iter guards; the standard triton / preshuffle
+        # autotune configs fail to compile at these K values (BLOCK_SIZE_K mismatch).
         pytest.skip("Small-K shapes exercise gluon-only paths.")
 
     dtype = str_to_torch_dtype[dtype]

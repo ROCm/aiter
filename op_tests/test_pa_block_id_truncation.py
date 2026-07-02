@@ -83,14 +83,12 @@ NUM_KV_HEADS = 8
 HEAD_DIM = 128
 BLOCK_SIZE = 16
 
-# To exercise the gqa16 kernel family we keep NUM_KV_HEADS=8 (so the 32 KB
-# per-block stride and the 65,536 overflow boundary are unchanged) and raise
-# the query-head count so gqa_ratio = 128 / 8 = 16 rounds to the gqa16 kernel.
+# To exercise the gqa16 kernel family we keep NUM_KV_HEADS=8 (so the 32 KB per-block stride and the 65,536 overflow
+# boundary are unchanged) and raise the query-head count so gqa_ratio = 128 / 8 = 16 rounds to the gqa16 kernel.
 GQA16_Q_HEADS = 128
 
-# Query/KV dtype families. The rebuilt .co set splits into a `pa_bf16_*` half
-# (bf16 query) and a `pa_fp16_*` half (fp16 query); both must read >4GB blocks
-# correctly, so we exercise both.
+# Query/KV dtype families. The rebuilt .co set splits into a `pa_bf16_*` half (bf16 query) and a `pa_fp16_*` half (fp16
+# query); both must read >4GB blocks correctly, so we exercise both.
 Q_DTYPES = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
@@ -112,8 +110,7 @@ EDGE_LAST_SAFE = 65_535
 EDGE_FIRST_BUGGY = 65_536
 BUGGY_BLOCK_ID = 67_000
 
-# Distinct fingerprint per block — kept small (< 1.0) to stay well within
-# bf16 precision after softmax normalization.
+# Distinct fingerprint per block — kept small (< 1.0) to stay well within bf16 precision after softmax normalization.
 SIG_SAFE = 0.50
 SIG_EDGE_LAST = 0.30
 SIG_EDGE_FIRST = 0.40
@@ -142,9 +139,8 @@ _HIGH_PRECISION = {"noquant": 0, "fp8": 1, "int8": 0}
 # Dequant noise budget on top of the bf16 baseline tolerance.
 _ABS_TOL = {"noquant": 1e-2, "fp8": 2e-2, "int8": 3e-2}
 
-# Cache the (~5GB) quantized KV pools, keyed by (q_dtype_str, kv_quant), so the
-# parametrized cases don't re-quantize 70k blocks each combo. The pool depends
-# only on KV dtype + NUM_KV_HEADS, so gqa8 and gqa16 share it.
+# Cache the (~5GB) quantized KV pools, keyed by (q_dtype_str, kv_quant), so the parametrized cases don't re-quantize 70k
+# blocks each combo. The pool depends only on KV dtype + NUM_KV_HEADS, so gqa8 and gqa16 share it.
 _KV_CACHE_BY_QUANT = {}
 
 
@@ -182,9 +178,8 @@ def _pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype):
         .permute(0, 1, 3, 2)
         .contiguous()
     )
-    # ASM kernel consumes the raw per-token scales ([num_blocks, num_heads,
-    # block_size, 1]); the flattened [num_heads, total_tokens] form is only for
-    # the torch reference.
+    # ASM kernel consumes the raw per-token scales ([num_blocks, num_heads, block_size, 1]); the flattened [num_heads,
+    # total_tokens] form is only for the torch reference.
     return k_quant, v_quant, k_scale_asm, v_scale_asm
 
 
@@ -304,9 +299,8 @@ def _run_pa_fwd_asm(
         qo_indptr=cu_seqlens_q,
         high_precision=hp,
     )
-    # Output shape: [max_qlen, num_q_heads, head_dim] — all elements should
-    # equal the fingerprint of target_block_id (because V is constant in
-    # that block and softmax weights sum to 1).
+    # Output shape: [max_qlen, num_q_heads, head_dim] — all elements should equal the fingerprint of target_block_id
+    # (because V is constant in that block and softmax weights sum to 1).
     return out.float().mean().item()
 
 

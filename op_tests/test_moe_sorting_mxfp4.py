@@ -142,10 +142,9 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage)
         block_size,
     )
 
-    # Pad cols to multiple of 8: the swizzle formula `mx_scale_shuffle_idx`
-    # uses `scaleN_pad = pad8(scaleN)`, so the destination buffer needs
-    # `pad8(model_dim/32)` cols to avoid OOB writes when scaleN is not
-    # already a multiple of 8 (e.g. inter_dim=384 -> scaleN=12 -> 16).
+    # Pad cols to multiple of 8: the swizzle formula `mx_scale_shuffle_idx` uses `scaleN_pad = pad8(scaleN)`, so the
+    # destination buffer needs `pad8(model_dim/32)` cols to avoid OOB writes when scaleN is not already a multiple of 8
+    # (e.g. inter_dim=384 -> scaleN=12 -> 16).
     scaleN_pad = ((model_dim // 32) + 7) // 8 * 8
     hip_scale = torch.zeros(
         ((sorted_ids.shape[0] + 31) // 32 * 32, scaleN_pad),
@@ -220,10 +219,9 @@ def test_moe_mx_quant_sort(
 
     # Reference: per-row MX quant + python-side byte sort.
     ref_out, scale = _ref_quant(input, quant_dtype)
-    # For stage2 reshape the per-row scale (token_num*topk, scaleN) to 3D
-    # (token_num, topk, scaleN) so run_torch sees the topk dim and applies the
-    # sorted_ids*topk + topk_ids indexing (2D would collapse onto token_idx and
-    # mismatch the HIP/split paths).
+    # For stage2 reshape the per-row scale (token_num*topk, scaleN) to 3D (token_num, topk, scaleN) so run_torch sees
+    # the topk dim and applies the sorted_ids*topk + topk_ids indexing (2D would collapse onto token_idx and mismatch
+    # the HIP/split paths).
     if stage != "stage1":
         scale = scale.view(token_num, topk_orig, -1)
     ref_scale = run_torch(scale.clone(), sorted_ids.clone(), num_valid_ids, token_num)
@@ -238,9 +236,8 @@ def test_moe_mx_quant_sort(
         quant_dtype,
     )
 
-    # HIP fused: the Python wrapper internally dispatches by M (small M ->
-    # single fused kernel; large M -> split path). For production-sized M
-    # (e.g. 15472) this auto-selects split, matching the split column.
+    # HIP fused: the Python wrapper internally dispatches by M (small M -> single fused kernel; large M -> split path).
+    # For production-sized M (e.g. 15472) this auto-selects split, matching the split column.
     hip_fn = (
         aiter.fused_dynamic_mxfp8_quant_moe_sort
         if is_fp8
@@ -256,11 +253,9 @@ def test_moe_mx_quant_sort(
         block_size,
     )
 
-    # Triton path: fp4 only. MUST run BEFORE the `num_valid_ids.item()`
-    # below -- the Triton kernel takes `num_valid_ids` as a 0-d tensor
-    # pointer (it does `tl.load(num_valid_ids_ptr)` internally), and
-    # would otherwise see a Python int and fail at compile time with
-    # "Unsupported ptr type triton.language.int32 in `tl.load`".
+    # Triton path: fp4 only. MUST run BEFORE the `num_valid_ids.item()` below -- the Triton kernel takes `num_valid_ids`
+    # as a 0-d tensor pointer (it does `tl.load(num_valid_ids_ptr)` internally), and would otherwise see a Python int
+    # and fail at compile time with "Unsupported ptr type triton.language.int32 in `tl.load`".
     triton_out = triton_scale = None
     triton_us = None
     if not is_fp8:
@@ -280,10 +275,9 @@ def test_moe_mx_quant_sort(
     checkAllclose(
         ref_out.view(torch.uint8), hip_out.view(torch.uint8), msg=f"hip {label} out"
     )
-    # The wrapper allocates `scale` with torch.empty (no zero-init), so kernel-
-    # unwritten padding slots (padding rows in expert blocks; padding cols when
-    # model_dim/32 is not a multiple of 8) hold garbage. Production GEMM never
-    # reads them, but byte-level checkAllclose would; mask positions where ref is 0.
+    # The wrapper allocates `scale` with torch.empty (no zero-init), so kernel- unwritten padding slots (padding rows in
+    # expert blocks; padding cols when model_dim/32 is not a multiple of 8) hold garbage. Production GEMM never reads
+    # them, but byte-level checkAllclose would; mask positions where ref is 0.
     hip_mask = ref_scale == 0
     hip_scale = hip_scale[: ref_scale.shape[0]]
     hip_scale.view(torch.uint8)[hip_mask] = 0
@@ -395,10 +389,9 @@ args = parser.parse_args()
 _quant_dtype = dtypes.fp4x2 if args.quant_dtype == "fp4x2" else dtypes.fp8
 _label = args.quant_dtype  # for log msg
 
-# Standalone byte sort/swizzle test. Kernels (mxfp4_moe_sort_hip,
-# fp4_utils.moe_mxfp4_sort) are dtype-agnostic (uint8 byte shuffle), but the
-# Triton path is fp4-only; run only in fp4 mode to avoid a misleading triton_us
-# column under -q fp8 (the HIP path is exercised via test_moe_mx_quant_sort).
+# Standalone byte sort/swizzle test. Kernels (mxfp4_moe_sort_hip, fp4_utils.moe_mxfp4_sort) are dtype-agnostic (uint8
+# byte shuffle), but the Triton path is fp4-only; run only in fp4 mode to avoid a misleading triton_us column under -q
+# fp8 (the HIP path is exercised via test_moe_mx_quant_sort).
 if _quant_dtype == dtypes.fp4x2:
     df = []
     for dtype in args.dtype:

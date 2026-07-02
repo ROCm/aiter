@@ -1287,9 +1287,8 @@ def test_vector_add(mod):
     return 0
 
 
-# Archs where the opus.hpp gfx12 (Navi 44/48 RDNA4) path is active. The kernel
-# body in test_opus_gmem_gfx1201.cu is gated by __gfx1201__ / __gfx1200__ --
-# on other archs the launcher runs an empty kernel, so we skip the correctness
+# Archs where the opus.hpp gfx12 (Navi 44/48 RDNA4) path is active. The kernel body in test_opus_gmem_gfx1201.cu is
+# gated by __gfx1201__ / __gfx1200__ -- on other archs the launcher runs an empty kernel, so we skip the correctness
 # check to avoid a misleading failure.
 _OPUS_PARSE_GFX1201_ARCHS = {"gfx1201", "gfx1200"}
 
@@ -1330,16 +1329,14 @@ def test_opus_gmem_gfx1201(mod):
     return 0
 
 
-# WMMA tests for gfx1200/gfx1201 (Navi 44/48, RDNA4). Both archs share the
-# same gfx12 wmma-128b ISA so the kernel bodies in test_wmma_gfx1201.cu are
-# gated by __gfx1201__ / __gfx1200__ -- on other archs the launcher runs an
-# empty kernel so we skip the correctness check.
+# WMMA tests for gfx1200/gfx1201 (Navi 44/48, RDNA4). Both archs share the same gfx12 wmma-128b ISA so the kernel
+# bodies in test_wmma_gfx1201.cu are gated by __gfx1201__ / __gfx1200__ -- on other archs the launcher runs an empty
+# kernel so we skip the correctness check.
 _WMMA_GFX1201_ARCHS = {"gfx1201", "gfx1200"}
 
 
 def _wmma_gfx1201_tolerances(out_dtype):
-    # f32 acc is bit-exact against the FP32 reference matmul; f16/bf16 acc
-    # picks up one ULP of rounding error.
+    # f32 acc is bit-exact against the FP32 reference matmul; f16/bf16 acc picks up one ULP of rounding error.
     if out_dtype == torch.float32:
         return 5e-2, 1e-2
     if out_dtype == torch.float16:
@@ -1650,8 +1647,7 @@ def test_async_load(mod):
     return 0
 
 
-# Sentinel that the i_os kernel pre-fills into LDS; must match
-# ASYNC_LOAD_IOS_SENTINEL in test_async_load.cu.
+# Sentinel that the i_os kernel pre-fills into LDS; must match ASYNC_LOAD_IOS_SENTINEL in test_async_load.cu.
 _ASYNC_LOAD_IOS_SENTINEL = -123456.0
 
 
@@ -1754,8 +1750,7 @@ def test_dtype_convert_fp32_bf16(mod):
 
     mod.run_dtype_convert(In, Out, "fp32_bf16")
 
-    # Both gfx942 (with 0_I) and gfx950 (native) use RNE,
-    # which matches PyTorch's .to(bfloat16).
+    # Both gfx942 (with 0_I) and gfx950 (native) use RNE, which matches PyTorch's .to(bfloat16).
     Ref = In.to(torch.bfloat16).to(torch.float32)
 
     ok = torch.equal(Out, Ref)
@@ -1984,8 +1979,7 @@ def test_dtype_convert_fp32_fp4(mod):
 
     mod.run_dtype_convert(In, Out, "fp32_fp4")
 
-    # Reference: input values are exactly representable in FP4,
-    # so the round-trip should be bit-exact.
+    # Reference: input values are exactly representable in FP4, so the round-trip should be bit-exact.
     Ref = In
 
     ok = torch.equal(Out, Ref)

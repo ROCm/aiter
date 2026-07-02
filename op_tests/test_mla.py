@@ -231,9 +231,8 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
-    # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both
-    # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
-    # (1M+) never trigger the O(N^2) ref.
+    # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both the lazy "tile area" gate and the per-call
+    # ctx so decode-scale ctx_lens (1M+) never trigger the O(N^2) ref.
     if (
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16

@@ -507,8 +507,7 @@ def test_flash_attn_varlen_func(
         requires_grad=True,
     )
 
-    # return_attn_probs is just for host verification (to produce same dropout mask)
-    # no need to use in actual case
+    # return_attn_probs is just for host verification (to produce same dropout mask) no need to use in actual case
     if dropout_p > 0:
         return_attn_probs = True
     else:

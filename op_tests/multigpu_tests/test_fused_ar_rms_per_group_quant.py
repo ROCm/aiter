@@ -263,10 +263,9 @@ def fused_ar_rmsnorm_per_group_quant(
         out_fp8, scale_out, res_out = result
         bf16_out = None
 
-    # Returned scale keeps logical (M, num_groups) shape for both layouts;
-    # only storage stride differs: row-major (num_groups, 1) vs column-major
-    # (1, M) (what gemm_a8w8_blockscale_preshuffle consumes). Either way
-    # scale[t, g] is correct, so the dequant below is layout-agnostic.
+    # Returned scale keeps logical (M, num_groups) shape for both layouts; only storage stride differs:
+    # row-major (num_groups, 1) vs column-major (1, M) (what gemm_a8w8_blockscale_preshuffle consumes).
+    # Either way scale[t, g] is correct, so the dequant below is layout-agnostic.
     M_local, num_groups_local = scale_out.shape
     if transpose_scale:
         assert scale_out.stride() == (1, M_local), (
@@ -287,8 +286,7 @@ def fused_ar_rmsnorm_per_group_quant(
     if bf16_out is not None:
         bf16_vs_fp8_diff = (bf16_out.float() - dequant).abs().max().item()
 
-    # Capture shape/stride as plain Python tuples before teardown frees the
-    # device tensors.
+    # Capture shape/stride as plain Python tuples before teardown frees the device tensors.
     scale_shape = tuple(scale_out.shape)
     scale_stride = scale_out.stride()
 
@@ -367,9 +365,8 @@ def test_fused_ar_rmsnorm_per_group_quant(
             ss == expected_scale_shape
         ), f"Scale shape mismatch: got {ss}, expected {expected_scale_shape}"
 
-    # Scale layout must match the downstream GEMM: column-major (1, M) when
-    # transpose_scale, else row-major (num_groups, 1). With the value-level
-    # checkAllclose below, this guarantees each group's scale is in its slot.
+    # Scale layout must match the downstream GEMM: column-major (1, M) when transpose_scale, else row-major
+    # (num_groups, 1). With the value-level checkAllclose below, this guarantees each group's scale is in its slot.
     num_groups = K // group_size
     expected_stride = (1, M) if transpose_scale else (num_groups, 1)
     for st in scale_strides:
@@ -546,8 +543,7 @@ if __name__ == "__main__":
     freeze_support()
     args = parser.parse_args()
 
-    # Non-distributed validator test first, so a helper regression fails
-    # before the full distributed sweep.
+    # Non-distributed validator test first, so a helper regression fails before the full distributed sweep.
     if not args.skip_python_check:
         test_group_size_validation_python_check()
 

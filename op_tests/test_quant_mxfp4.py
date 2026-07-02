@@ -145,9 +145,8 @@ def fp32_to_e2m1_rne(val: torch.Tensor) -> torch.Tensor:
     return e2m1.to(torch.uint8)
 
 
-# Both the gfx950 hardware conversion and the non-gfx950 software fallback
-# (even_round_e2m1 in csrc/kernels/quant_mxfp4.cu) perform round-to-nearest-even,
-# so the reference uses RNE on every arch.
+# Both the gfx950 hardware conversion and the non-gfx950 software fallback (even_round_e2m1 in
+# csrc/kernels/quant_mxfp4.cu) perform round-to-nearest-even, so the reference uses RNE on every arch.
 fp32_to_e2m1 = fp32_to_e2m1_rne
 
 
@@ -418,9 +417,8 @@ if __name__ == "__main__":
         # HW builtin (v_cvt_pk_f4_*) does exact RNE; full byte-equal coverage.
         round_modes = [0, 1, 2, 3]
     else:
-        # Non-gfx950 SW fallback matches CPU ref only on Even (mode 2); other
-        # modes diverge by <=1 ULP near FP4 round thresholds, breaking byte
-        # equality. Default to [2]; opt in to full sweep via --round_mode 0 1 2 3.
+        # Non-gfx950 SW fallback matches CPU ref only on Even (mode 2); other modes diverge by <=1 ULP near FP4 round
+        # thresholds, breaking byte equality. Default to [2]; opt in to full sweep via --round_mode 0 1 2 3.
         round_modes = [2]
         aiter.logger.info(
             "Non-gfx950 device detected (%s); default round_mode coverage "

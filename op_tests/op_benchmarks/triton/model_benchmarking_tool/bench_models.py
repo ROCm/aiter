@@ -74,8 +74,8 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "moe_op_gemm_a8w4": bench_moe_gemm_a8w4_main,
     "moe_op_gemm_a4w4": bench_moe_gemm_a4w4_main,
     "rmsnorm": bench_rmsnorm_main,
-    # Fused RMSNorm + residual add + MXFP4 quant. Reuses bench_rmsnorm.py
-    # (via its --quant mxfp4 mode), so there is no separate bench script.
+    # Fused RMSNorm + residual add + MXFP4 quant.
+    # Reuses bench_rmsnorm.py (via its --quant mxfp4 mode), so there is no separate bench script.
     "fused_rms_mxfp4_quant": bench_rmsnorm_main,
     "rope": bench_rope_main,
     "mha": bench_mha_main,

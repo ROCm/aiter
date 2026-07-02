@@ -1053,8 +1053,7 @@ def test_mla(
         dtype=out_dtype,
     )
 
-    # It is necessary to limit the size of the tensor in the DP mode
-    # so reduce the split_num in the DP mode.
+    # It is necessary to limit the size of the tensor in the DP mode so reduce the split_num in the DP mode.
     if nhead >= 128:
         gpu = torch.cuda.current_device()
         device_properties = torch.cuda.get_device_properties(gpu)

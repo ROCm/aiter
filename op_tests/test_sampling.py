@@ -355,12 +355,10 @@ def test_top_k_top_p_statistical_distribution(batch_size, vocab_size, k, p):
             )
 
 
-# Regression: HSA OOB from uninitialized `temp_storage.last_valid_id`. When every
-# thread fails predicate `x > low` on the first do-while iter (all-zero/all-NaN
-# row), max_valid stays -1, the guarded write to last_valid_id is skipped, and
-# the recovery read faults at a page boundary. Reproduced on Qwen3.6-A3B-FP8
-# (vocab=248320). Tests must yield only in-range ids (no segfault) for both the
-# TopP-only and joint TopK+TopP kernels.
+# Regression: HSA OOB from uninitialized `temp_storage.last_valid_id`. When every thread fails predicate `x > low` on
+# the first do-while iter (all-zero/all-NaN row), max_valid stays -1, the guarded write to last_valid_id is skipped,
+# and the recovery read faults at a page boundary. Reproduced on Qwen3.6-A3B-FP8 (vocab=248320). Tests must yield only
+# in-range ids (no segfault) for both the TopP-only and joint TopK+TopP kernels.
 
 
 def _make_degenerate_probs(batch_size, vocab_size, mode):
@@ -384,9 +382,8 @@ def _make_degenerate_probs(batch_size, vocab_size, mode):
 
 
 @pytest.mark.parametrize("batch_size", [1, 8])
-# Include 248320 (Qwen3.6 — original crash) and 128256 (Llama-3) which both
-# satisfy vocab %% (BLOCK_THREADS * VEC_SIZE) != 0, where the last block has
-# fewer active threads and the bug surfaces most reliably.
+# Include 248320 (Qwen3.6 — original crash) and 128256 (Llama-3) which both satisfy vocab %% (BLOCK_THREADS * VEC_SIZE)
+# != 0, where the last block has fewer active threads and the bug surfaces most reliably.
 @pytest.mark.parametrize("vocab_size", [32000, 128256, 248320])
 @pytest.mark.parametrize("mode", ["zero", "nan"])
 def test_top_p_sampling_degenerate_row(batch_size, vocab_size, mode):
@@ -424,12 +421,10 @@ def test_top_k_top_p_sampling_degenerate_row(batch_size, vocab_size, mode, k, p)
         )
 
 
-# "top-k first" fast path (aiter port of flashinfer PR #3461). A scalar top_k
-# (maybe_top_k_arr=None) <=256 over vocab >=65536 routes through a Python fast
-# path: parallel top-k -> renorm over k survivors -> top-p over k -> gather to
+# "top-k first" fast path (aiter port of flashinfer PR #3461). A scalar top_k (maybe_top_k_arr=None) <=256 over vocab
+# >=65536 routes through a Python fast path: parallel top-k -> renorm over k survivors -> top-p over k -> gather to
 # global index. Must stay distribution-equivalent to the fused full-vocab kernel.
-# NOTE: existing joint tests pass top_k as a TENSOR (does NOT trigger fast path);
-# these pass a Python int to exercise it.
+# NOTE: existing joint tests pass top_k as a TENSOR (does NOT trigger fast path); these pass a Python int to exercise it.
 
 
 def _joint_mask(normalized_prob, k, p, eps=1e-4):

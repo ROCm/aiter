@@ -52,8 +52,7 @@ from op_tests.triton_tests.utils.mhc_ref import (
     mhc_e2e_ref,
 )
 
-# Optional HIP imports; --with-hip code paths fail loudly at runtime via
-# _validate_with_hip when these are None.
+# Optional HIP imports; --with-hip code paths fail loudly at runtime via _validate_with_hip when these are None.
 try:  # pragma: no cover
     import aiter as _aiter
     import aiter.jit.utils.chip_info as _aiter_chip_info
@@ -185,8 +184,7 @@ def _compute_metrics(
     if operation in ("post", "e2e"):
         # out[M, j, c] = post_mix[M, j] * layer_input[M, c]
         #              + sum_h comb_mix[M, h, j] * residual[M, h, c]
-        # 2 * n * (n+1) FLOPs per (M, c) under the GEMV "2 FLOPs per MAC"
-        # convention.
+        # 2 * n * (n+1) FLOPs per (M, c) under the GEMV "2 FLOPs per MAC" convention.
         mix_bytes = 4  # fp32 mixes
         total_flops += 2.0 * M * n * (n + 1) * C
         total_memory += (

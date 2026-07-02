@@ -233,8 +233,7 @@ def sinkhorn_knopp_asymmetric_exp_domain_torch(
 
     A = logits.to(torch.float32)
 
-    # First iter (asymmetric): softmax over the row (last dim) + eps, then
-    # divide by (col_sum + eps).
+    # First iter (asymmetric): softmax over the row (last dim) + eps, then divide by (col_sum + eps).
     row_max = A.amax(dim=-1, keepdim=True)  # (M, N, 1)
     P = torch.exp(A - row_max)
     row_sum = P.sum(dim=-1, keepdim=True)  # (M, N, 1)

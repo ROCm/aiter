@@ -41,9 +41,8 @@ from aiter.utility.dtypes import str2Dtype, str2tuple
 # expert is within `tol` below the cutoff and every reference-only expert within
 # `tol` above it.
 
-# Tolerance for boundary ties: ~1e-4 is ~100x the kernel's score-approximation
-# noise (~1e-6 on O(1) scores), so genuine routing bugs (gaps >> 1e-4) are still
-# caught while harmless tie flips are excused.
+# Tolerance for boundary ties: ~1e-4 is ~100x the kernel's score-approximation noise (~1e-6 on O(1) scores), so genuine
+# routing bugs (gaps >> 1e-4) are still caught while harmless tie flips are excused.
 _TIE_TOL = 1e-4
 
 

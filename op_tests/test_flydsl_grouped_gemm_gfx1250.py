@@ -71,9 +71,8 @@ LOGITS_DIFF_TOL = 0.01
 
 # Environment / arch guards
 def _require_gfx1250() -> None:
-    # AITER_FORCE_GFX1250=1 forces the grouped path on other archs (e.g. gfx942)
-    # to exercise the tiny operators with the GEMM mocked (default; pass
-    # --real-gemm to call the real gfx1250 kernel instead).
+    # AITER_FORCE_GFX1250=1 forces the grouped path on other archs (e.g. gfx942) to exercise the tiny operators with
+    # the GEMM mocked (default; pass --real-gemm to call the real gfx1250 kernel instead).
     if os.environ.get("AITER_FORCE_GFX1250", "0") in ("1", "true", "True", "yes"):
         return
     try:
@@ -166,9 +165,8 @@ def _torch_moe_ref(
         a1_scale=stage1_hidden_scale,
         w1_scale=w1_scale,
         w1_bias=w1_bias,
-        # swiglu_limit clamps gate/up for both SwiGLU and SiLU: the grouped
-        # FlyDSL epilogue now applies it in either branch, so the reference
-        # passes it through unconditionally to stay in sync.
+        # swiglu_limit clamps gate/up for both SwiGLU and SiLU: the grouped FlyDSL epilogue now applies it in either
+        # branch, so the reference passes it through unconditionally to stay in sync.
         swiglu_limit=swiglu_limit,
     )
     if data_format == "a4w4":
@@ -346,10 +344,9 @@ def _run_grouped_via_fused_moe(
     w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
     w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
     if layout == "gugu":
-        # GUGU B-scale is always built the production way: feed the RAW GGUU
-        # scale to moe_shuffle_scale(is_guinterleave=True), which interleaves
-        # gate/up rows then folds n32k4 (aiter.ops.shuffle.shuffle_scale_n32k4
-        # end to end) -- the weights/bias are row-interleaved above.
+        # GUGU B-scale is always built the production way: feed the RAW GGUU scale to
+        # moe_shuffle_scale(is_guinterleave=True), which interleaves gate/up rows then folds n32k4
+        # (aiter.ops.shuffle.shuffle_scale_n32k4 end to end) -- the weights/bias are row-interleaved above.
         w1_scale = moe_shuffle_scale(
             w1_scale_raw.contiguous(),
             experts_cnt=experts,
@@ -388,9 +385,8 @@ def _run_grouped_via_fused_moe(
     torch.cuda.synchronize()
     kernel_us = None
     if kernel_bench:
-        # Kernel-bench: time gemm1 and gemm2 in isolation. One eager call
-        # populates the per-stage launch callables (and yields a correct ``out`` to
-        # verify); then loop each kernel alone. ``us`` (end-to-end) stays None.
+        # Kernel-bench: time gemm1 and gemm2 in isolation. One eager call populates the per-stage launch callables
+        # (and yields a correct ``out`` to verify); then loop each kernel alone. ``us`` (end-to-end) stays None.
         from aiter.test_common import run_perftest
         from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
 
@@ -423,8 +419,7 @@ def _run_grouped_via_fused_moe(
         out = _call()
         us = None
 
-    # Reference always uses GGUU logical inputs (layouts are numerically
-    # equivalent; only physical packing differs).
+    # Reference always uses GGUU logical inputs (layouts are numerically equivalent; only physical packing differs).
     ref = _torch_moe_ref(
         hidden,
         w1_logical,
@@ -753,8 +748,7 @@ def main() -> None:
         "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
     args = parser.parse_args()
-    # Toggle wave-specialized TDM for the grouped gemm1 and gemm2 (read by
-    # grouped_moe; applied where valid).
+    # Toggle wave-specialized TDM for the grouped gemm1 and gemm2 (read by grouped_moe; applied where valid).
     _wst = "1" if args.wst else "0"
     os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] = _wst
     if not args.real_gemm:

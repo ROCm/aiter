@@ -263,8 +263,7 @@ def test_pa_decode_sparse_vs_reference(
             acc_partial, m_partial, l_partial, sink, indptr, block_k, use_exp2
         ).to(q.dtype)
     else:
-        # kv_splits == 1 (skip_reduce is a no-op) or skip_reduce=False: the
-        # wrapper already returns the final output.
+        # kv_splits == 1 (skip_reduce is a no-op) or skip_reduce=False: the wrapper already returns the final output.
         out = result
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)

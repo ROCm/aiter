@@ -146,11 +146,10 @@ def test_fused_kv_norm_rope_group_quant(T, D, RD, *, is_neox, G):
         kv, kv_weight, cos, sin, pos, eps, is_neox=is_neox, group_size=G
     )
 
-    # Paged KV cache + slot_mapping: random permutation of distinct slots (no
-    # collisions) for a non-identity paged scatter. Caches are [num_blocks,
-    # page_size, entry] (MQA: no num_kv_heads dim); token -> slot_mapping[token]
-    # = block*page_size + offset. Zero-init so unwritten slots and each entry's
-    # trailing pad read back as zero (asm-reader contract).
+    # Paged KV cache + slot_mapping: random permutation of distinct slots (no collisions) for a non-identity paged
+    # scatter. Caches are [num_blocks, page_size, entry] (MQA: no num_kv_heads dim); token -> slot_mapping[token] =
+    # block*page_size + offset. Zero-init so unwritten slots and each entry's trailing pad read
+    # back as zero (asm-reader contract).
     page_size = 1
     num_blocks = (T + page_size - 1) // page_size + 1  # a little slack
     num_slots = num_blocks * page_size
@@ -185,9 +184,8 @@ def test_fused_kv_norm_rope_group_quant(T, D, RD, *, is_neox, G):
     rope_buff = k_rope_buff.view(num_slots, RD)[slot_mapping].unsqueeze(1)
 
     # --- Accuracy ---
-    # K nope fp8 from nope_scale_buff[..., 0:nope]; e8m0 scale @[nope:nope+2*n_groups),
-    # written as each tile-scale duplicated x2 (s0,s0,s1,s1,...). Take the first of
-    # each pair for dequant; verify BOTH halves equal the reference scale.
+    # K nope fp8 from nope_scale_buff[..., 0:nope]; e8m0 scale @[nope:nope+2*n_groups), written as each tile-scale
+    # duplicated x2 (s0,s0,s1,s1,...). Take the first of each pair for dequant; verify BOTH halves equal the reference scale.
     k_nope_got = nope_scale_buff[..., :nope]
     k_scale_pairs = (
         nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups]

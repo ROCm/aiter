@@ -44,9 +44,8 @@ def bench_fn(M: int, N4: int, N16: int, K: int, metric: str, **kwargs):
     """
     c_dtype = torch.bfloat16
 
-    # FP4 branch (non-preshuffled). ``output=True`` pre-allocates ``y_fp4``. With
-    # shuffles off the ``_triton`` returns equal the plain ones; we pass the
-    # ``_triton`` set to mirror the test's wrapper call exactly.
+    # FP4 branch (non-preshuffled). ``output=True`` pre-allocates ``y_fp4``. With shuffles off the
+    # ``_triton`` returns equal the plain ones; we pass the ``_triton`` set to mirror the test's wrapper call exactly.
     (
         x_fp4,
         w_fp4,
@@ -234,9 +233,8 @@ def run_benchmark(args, defaults):
 def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="Fused AFP4WFP4 + A16W16 GEMM")
     parser = add_argparse_ff(parser)
-    # get_ff_args destructures a 4-element --shape as (B, M, N, K); for this op
-    # --shape is (M, N4, N16, K), so the shape path reads args.shape directly
-    # and ignores that (B, M, N, K) mapping.
+    # get_ff_args destructures a 4-element --shape as (B, M, N, K); for this op --shape is (M, N4, N16, K),
+    # so the shape path reads args.shape directly and ignores that (B, M, N, K) mapping.
     return get_ff_args(parser, args=args)
 
 

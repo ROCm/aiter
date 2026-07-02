@@ -163,11 +163,9 @@ def _build_inputs(shape, bs, mtp, mode):
             else:  # prefill
                 position_in_seq = (s + 1) * ratio - 1
                 ragged_id = b * PREFILL_CONTEXT_LEN + position_in_seq
-                # window_len uses position_in_seq (not ragged_id) so the
-                # K-loop's input-phase reads stay within seq b's input
-                # range [b*seq_len, (b+1)*seq_len). Earlier source positions
-                # for the first few boundaries of every seq fall back to
-                # state-cache reads (or padding when s < 0).
+                # window_len uses position_in_seq (not ragged_id) so the K-loop's input-phase reads stay within seq
+                # b's input range [b*seq_len, (b+1)*seq_len). Earlier source positions for the first few boundaries of
+                # every seq fall back to state-cache reads (or padding when s < 0).
                 window_len = max(0, K_pool - 1 - position_in_seq)
             plan[pid, 0] = ragged_id
             plan[pid, 1] = b
@@ -188,9 +186,9 @@ def _build_inputs(shape, bs, mtp, mode):
         for j in range(blocks_per_seq):
             block_tables[b, j] = b * blocks_per_seq + j
 
-    # Dominant memory traffic (bandwidth-bound): per compressed boundary pool
-    # K_pool source tokens from kv_in + score_in (dim_full wide, bf16) and write
-    # D compressed elements to kv_cache. state-cache reads are a secondary term.
+    # Dominant memory traffic (bandwidth-bound): per compressed boundary pool K_pool source tokens from kv_in +
+    # score_in (dim_full wide, bf16) and write D compressed elements to kv_cache. state-cache reads are a secondary
+    # term.
     nbytes = num_compress * (
         K_pool * dim_full * 2 * kv_in.element_size()  # kv_in + score_in pooled reads
         + D * kv_cache.element_size()  # compressed cache write (fp8=1B / bf16=2B)
@@ -621,8 +619,7 @@ def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
 
 
 def main():
-    # The wrappers dispatch wave64/wave32 by arch; skip cleanly on anything
-    # outside the validated set.
+    # The wrappers dispatch wave64/wave32 by arch; skip cleanly on anything outside the validated set.
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
             "flydsl compress_attn unsupported on %s; skipping", get_gfx()

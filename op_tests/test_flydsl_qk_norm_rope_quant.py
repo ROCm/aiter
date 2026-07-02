@@ -262,10 +262,9 @@ def test_flydsl_qk_norm_rope_quant(
         ref_deq = _dequant(ref_q, ref_qs, **deq_kw)
         got_kv_deq = _dequant(got_kv, got_ks, **deq_kw)
         ref_kv_deq = _dequant(ref_kv, ref_ks, **deq_kw)
-        # Looser tolerance under fp8 + group quant -- pow2 rounding plus bf16
-        # RoPE noise pushes per-element diffs into the 0.1-10 range depending
-        # on amax. cos-sim (computed via checkAllclose's atol on row sums)
-        # remains > 0.999 in all configs we ship.
+        # Looser tolerance under fp8 + group quant -- pow2 rounding plus bf16 RoPE noise pushes per-element diffs
+        # into the 0.1-10 range depending on amax. cos-sim (computed via checkAllclose's atol on row sums) remains
+        # > 0.999 in all configs we ship.
         rtol, atol = 0.05, 5.0
     else:
         got_deq = got_q.float()
