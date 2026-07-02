@@ -182,6 +182,8 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
 
     // intra-thread squared-sum in CK's order: T5 pipeline sums in pairs
     // (a0^2+a1^2), the default pipeline sums one element at a time.
+    // intra-thread squared-sum in CK's order: T5 sums pairs (a0^2+a1^2), the
+    // default sums one element at a time.
     float sq = 0.0f;
     if(t5)
     {
