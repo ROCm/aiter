@@ -77,9 +77,9 @@ class IndexFirstAxisResidual(torch.autograd.Function):
         second_dim = other_shape.numel()
         # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.
         output = input[indices]
-        # We don't want to reshape input (b ... -> b (...)) since it could change the channel_last memory format to
-        # channel_first. In other words, input might not be contiguous. If we don't detach, Pytorch complains about
-        # output being a view and is being modified inplace
+        # We don't want to reshape input (b ... -> b (...)) since it could change the channel_last
+        # memory format to channel_first. In other words, input might not be contiguous.
+        # If we don't detach, Pytorch complains about output being a view and is being modified inplace
         return output, input.detach()
 
     @staticmethod
