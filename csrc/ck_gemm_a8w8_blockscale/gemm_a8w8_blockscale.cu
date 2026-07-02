@@ -17,11 +17,9 @@ using BlockwiseKernel = torch::Tensor (*)(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
 // Name-keyed dispatch table.  Keys are std::string_view onto the kernel-name
-// string literals embedded in the generated *_lookup.h (static storage,
-// permanently valid).  Values are raw function pointers so the table is
-// trivially destructible and gets constant-initialized into .data.rel.ro,
-// matching the style of GemmDispatchMap introduced for the tuple-keyed
-// modules in PR #3255 (no per-pair std::function ctor / landing pad cost).
+// string literals in the generated *_lookup.h (static storage, permanently
+// valid).  Values are raw fn ptrs so the table is trivially destructible and
+// constant-initialized into .data.rel.ro (no per-pair std::function cost).
 using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 
 // Defined in gemm_a8w8_blockscale_lookup_{fp16,bf16}.cu.
@@ -29,17 +27,13 @@ extern const BlockwiseKernelMap& get_blockscale_lookup_fp16();
 extern const BlockwiseKernelMap& get_blockscale_lookup_bf16();
 
 // Python-driven name-keyed dispatch.  The Python frontend
-// (aiter/ops/gemm_op_a8w8.py) reads aiter/configs/a8w8_blockscale_tuned_gemm.csv
-// (cached via lru_cache) and passes the resolved `kernelName` here; we only
-// look it up.  This makes the CSV the single source of truth — editing it no
-// longer requires rebuilding a tuple-keyed C++ table.
+// (aiter/ops/gemm_op_a8w8.py) reads a8w8_blockscale_tuned_gemm.csv and passes
+// the resolved `kernelName` here; the CSV is the single source of truth.
 //
-// Empty kernelName  : Python had no tuned row (or AITER_BYPASS_TUNE_CONFIG=1)
-//                     -> use the heuristic default kernel.
-// Non-empty kernelName not in registry: hard error — the CSV references a
-//                     kernel that was not compiled into this .so, almost
-//                     certainly because the user updated the CSV without
-//                     rebuilding aiter.  Surface, don't hide.
+// Empty kernelName -> Python had no tuned row (or AITER_BYPASS_TUNE_CONFIG=1);
+//   use the heuristic default kernel.
+// Non-empty kernelName not in registry -> hard error: the CSV references a
+//   kernel not compiled into this .so (CSV updated without rebuilding aiter).
 template <typename DDataType, typename EDataType = DDataType>
 static BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
 {
