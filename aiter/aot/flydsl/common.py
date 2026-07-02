@@ -157,8 +157,7 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import compile_one_config
     elif kind is OpKind.GROUPED_MOE:
-        # grouped_moe AOT not wired up yet (no jobs are ever collected); keep a
-        # trivial stub so the dispatch is total.
+        # grouped_moe AOT not wired up yet (no jobs are ever collected); keep a trivial stub so the dispatch is total.
         return lambda **_kw: {}
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
@@ -308,9 +307,8 @@ def _run_file_pool(
         idx, _ = running.pop(proc)
         out_path = os.path.join(result_dir, f"k{idx}.json")
         if proc.exitcode != 0:
-            # Worker died abnormally (OOM-kill -9, segfault -11, ...) before
-            # writing its result. Transient -> retry (terminal once retries run
-            # out, leaving results[idx]=None).
+            # Worker died abnormally (OOM-kill -9, segfault -11, ...) before writing its result. Transient -> retry
+            # (terminal once retries run out, leaving results[idx]=None).
             retry_or_drop(idx, f"worker crashed (exitcode={proc.exitcode})")
             return
         # Clean exit (exitcode 0): deterministic, never retried.
@@ -358,8 +356,8 @@ def _run_file_pool(
 
             launch()  # refill freed slots (including any just-requeued retries)
     finally:
-        # Kill any survivors (e.g. on an unexpected exception) so we never leave
-        # orphaned compilers blocking the caller's exit.
+        # Kill any survivors (e.g. on an unexpected exception) so we never leave orphaned compilers blocking the
+        # caller's exit.
         for proc in list(running):
             try:
                 if proc.is_alive():
@@ -421,9 +419,8 @@ def run_aot(cache_dir: str) -> None:
 
     max_workers = get_max_workers(len(all_jobs))
 
-    # Per-child result files live here -- recreated fresh so stale results
-    # from a previous (e.g. crashed) build can never be mistaken for this
-    # run's output.
+    # Per-child result files live here -- recreated fresh so stale results from a previous (e.g. crashed) build can
+    # never be mistaken for this run's output.
     result_dir = os.path.join(cache_dir, ".aot_results")
     shutil.rmtree(result_dir, ignore_errors=True)
     os.makedirs(result_dir, exist_ok=True)

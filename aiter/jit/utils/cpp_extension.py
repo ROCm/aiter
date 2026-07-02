@@ -713,10 +713,8 @@ class BuildExtension(build_ext):
             extension.extra_compile_args.append(flag)
 
     def _define_torch_extension_name(self, extension):
-        # pybind11 doesn't support dots in the names
-        # so in order to support extensions in the packages
-        # like torch._C, we take the last part of the string
-        # as the library name
+        # pybind11 doesn't support dots in the names so in order to support extensions in the packages
+        # like torch._C, we take the last part of the string as the library name
         names = extension.name.split(".")
         name = names[-1]
         define = f"-DTORCH_EXTENSION_NAME={name}"
@@ -1623,8 +1621,7 @@ def _write_ninja_file_to_build_library(
         if python_include_path is not None:
             system_includes.append(python_include_path)
 
-    # Turn into absolute paths so we can emit them into the ninja build
-    # file wherever it is.
+    # Turn into absolute paths so we can emit them into the ninja build file wherever it is.
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
 
     if not torch_exclude:
@@ -1748,8 +1745,7 @@ def _write_ninja_file(
         flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
     flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
 
-    # Turn into absolute paths so we can emit them into the ninja build
-    # file wherever it is.
+    # Turn into absolute paths so we can emit them into the ninja build file wherever it is.
     sources = [os.path.abspath(file) for file in sources]
 
     # See https://ninja-build.org/build.ninja.html for reference.
@@ -1803,9 +1799,8 @@ def _write_ninja_file(
         object_file_q = object_file.replace(" ", "$ ")
         build.append(f"build {object_file_q}: {rule} {source_file_q}")
         if per_source_flags:
-            # Append to the rule-level $cuda_post_cflags rather than
-            # replacing it, so the global flags (e.g. --offload-arch) stay
-            # in effect for this TU too.
+            # Append to the rule-level $cuda_post_cflags rather than replacing it, so the global flags
+            # (e.g. --offload-arch) stay in effect for this TU too.
             build.append(
                 "  cuda_post_cflags = "
                 f"{' '.join(cuda_post_cflags + list(per_source_flags))}"

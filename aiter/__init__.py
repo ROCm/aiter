@@ -58,9 +58,8 @@ def getLogger():
 
 logger = getLogger()
 AITER_AOT_IMPORT = os.getenv("AITER_AOT_IMPORT", "0") == "1"
-# Triton-only: expose only the Triton ops, skipping the C++/CK/HIP ops and their
-# JIT build. Always on for Windows (no CK/HIP there); elsewhere opt in via the
-# env var, e.g. Triton-backend users with no C++ toolchain or CK.
+# Triton-only: expose only the Triton ops, skipping the C++/CK/HIP ops and their JIT build. Always on for Windows (no
+# CK/HIP there); elsewhere opt in via the env var, e.g. Triton-backend users with no C++ toolchain or CK.
 AITER_TRITON_ONLY = (
     os.getenv("AITER_TRITON_ONLY", "0") == "1" or sys.platform == "win32"
 )

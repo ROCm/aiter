@@ -107,8 +107,7 @@ class QuickAllReduce:
             dist.get_backend(group) != dist.Backend.NCCL
         ), "Custom quick allreduce should be attached to a non-NCCL group."
         if not all(in_the_same_node_as(group, source_rank=0)):
-            # No need to initialize custom quick allreduce for
-            # multi-node case.
+            # No need to initialize custom quick allreduce for multi-node case.
             logger.warning(
                 "Custom quick allreduce is disabled because this "
                 "process group spans across nodes."
@@ -152,8 +151,7 @@ class QuickAllReduce:
         dist.all_gather(gather_list, tensor, group=self.group)
         physical_device_ids = [t.item() for t in gather_list]
 
-        # test nvlink first, this will filter out most of the cases
-        # where custom quick allreduce is not supported
+        # test nvlink first, this will filter out most of the cases where custom quick allreduce is not supported
         # this checks hardware and driver support for NVLink
 
         # self.fully_connected = is_full_nvlink(physical_device_ids, self.world_size)
@@ -168,8 +166,7 @@ class QuickAllReduce:
         self.init_quick_all_reduce()
 
     def init_quick_all_reduce(self):
-        # On RocM, bfloat16 kernels are slower than fp16
-        # due to slower match operations
+        # On RocM, bfloat16 kernels are slower than fp16 due to slower match operations
         # If environment variable is set to 1, we convert input to fp16
         self.use_fp16_kernels = int(
             os.environ.get("AITER_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)
@@ -231,8 +228,7 @@ class QuickAllReduce:
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         inp_size = inp.numel() * inp.element_size()
-        # custom quick allreduce requires input byte size to be
-        # multiples of 16
+        # custom quick allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
         if not is_weak_contiguous(inp):
@@ -248,8 +244,7 @@ class QuickAllReduce:
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""
-        # quick allreduce doesn't require a separate graph mode,
-        # as QR uses static IPC buffer.
+        # quick allreduce doesn't require a separate graph mode, as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
         ops.qr_all_reduce(

@@ -401,9 +401,8 @@ class TunerCommon:
         for col in df_updates.columns:
             if col not in df_old.columns:
                 if col == "gfx":
-                    # Keep gfx as the leading key column (canonical layout)
-                    # rather than appending it at the end when migrating a
-                    # legacy CSV.
+                    # Keep gfx as the leading key column (canonical layout) rather than
+                    # appending it at the end when migrating a legacy CSV.
                     df_old.insert(0, col, self.get_gfx())
                 elif col == "cu_num":
                     df_old[col] = self.get_cu_num()

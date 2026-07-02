@@ -9361,9 +9361,8 @@ PYTORCH_SPECIFIC_MAPPINGS = collections.OrderedDict(
 CAFFE2_SPECIFIC_MAPPINGS = collections.OrderedDict(
     [
         ("cuda_stream", ("hip_stream", API_CAFFE2)),
-        # if the header is a native hip folder (under hip directory),
-        # there is no need to add a hip path to it; the trie in hipify script
-        # takes this mapping order to forbid further replacement
+        # if the header is a native hip folder (under hip directory), there is no need to add a hip path to it;
+        # the trie in hipify script takes this mapping order to forbid further replacement
         ("/hip/", ("/hip/", API_CAFFE2)),
         ("/context_gpu", ("/hip/context_gpu", API_CAFFE2)),
         ("/common_gpu", ("/hip/common_gpu", API_CAFFE2)),
@@ -9442,8 +9441,7 @@ CAFFE2_SPECIFIC_MAPPINGS = collections.OrderedDict(
 # substitution would be invalid. Instead we list every externally-used c10/cuda
 # identifier/file explicitly.
 #
-# NB: if you want a transformation to ONLY apply to the c10/ directory,
-# put it as API_CAFFE2
+# NB: if you want a transformation to ONLY apply to the c10/ directory, put it as API_CAFFE2
 C10_MAPPINGS = collections.OrderedDict(
     [
         ("CUDA_VERSION", ("TORCH_HIP_VERSION", API_PYTORCH)),
@@ -9479,8 +9477,7 @@ C10_MAPPINGS = collections.OrderedDict(
         ("c10::cuda", ("c10::hip", API_C10)),
         ("cuda::CUDAStream", ("hip::HIPStream", API_C10)),
         ("CUDAStream", ("HIPStream", API_C10)),
-        # This substitution is not permissible, because there's another copy of this
-        # function in torch/cuda.h
+        # This substitution is not permissible, because there's another copy of this function in torch/cuda.h
         # ("cuda::device_count", ("hip::device_count", API_C10)),
         ("cuda::current_device", ("hip::current_device", API_C10)),
         ("cuda::set_device", ("hip::set_device", API_C10)),
@@ -9511,8 +9508,7 @@ C10_MAPPINGS = collections.OrderedDict(
     ]
 )
 
-# NB: C10 mappings are more specific than Caffe2 mappings, so run them
-# first
+# NB: C10 mappings are more specific than Caffe2 mappings, so run them first
 CUDA_TO_HIP_MAPPINGS = [
     CUDA_IDENTIFIER_MAP,
     CUDA_TYPE_NAME_MAP,

@@ -433,8 +433,7 @@ class GroupCoordinator:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
+            # a group with `gloo` backend, to allow direct coordination between processes through the CPU.
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
             if self.rank in ranks:
                 self.ranks = ranks
@@ -522,8 +521,7 @@ class GroupCoordinator:
         else:
             stream = graph_capture_context.stream
 
-        # only cuda uses this function,
-        # so we don't abstract it into the base class
+        # only cuda uses this function, so we don't abstract it into the base class
         maybe_ca_context = nullcontext()
         from aiter.dist.device_communicators.communicator_cuda import (
             CudaCommunicator,
@@ -535,8 +533,7 @@ class GroupCoordinator:
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
 
-        # ensure all initialization operations complete before attempting to
-        # capture the graph on another stream
+        # ensure all initialization operations complete before attempting to capture the graph on another stream
         curr_stream = torch.cuda.current_stream()
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
@@ -667,14 +664,11 @@ class GroupCoordinator:
     ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        # The 3-output (fp8, residual, scale) case goes through a
-        # torch.library-registered op so it is traceable under torch.compile /
-        # inductor (mirrors the per_token fast-path in
-        # fused_allreduce_rmsnorm_quant). Without this, the per_group call is a
-        # plain Python -> pybind chain that Dynamo cannot trace, so the fused op
-        # never lowers into the compiled graph and the model silently falls back
-        # to the plain AllReduce+RMSNorm path. The emit_bf16 case returns a 4th
-        # tensor and is rare/eager-only, so it stays on the direct path.
+        # The 3-output (fp8, residual, scale) case goes through a torch.library-registered op so it is traceable under
+        # torch.compile / inductor (mirrors the per_token fast-path in fused_allreduce_rmsnorm_quant). Without this, the
+        # per_group call is a plain Python -> pybind chain that Dynamo cannot trace, so the fused op never lowers into
+        # the compiled graph and the model silently falls back to the plain AllReduce+RMSNorm path. The emit_bf16 case
+        # returns a 4th tensor and is rare/eager-only, so it stays on the direct path.
         if not emit_bf16:
             return fused_allreduce_rmsnorm_quant_per_group_(
                 input_,
@@ -896,10 +890,9 @@ class GroupCoordinator:
             f"input shape error, input.shape[{dim}]={input_.shape[dim]} "
             f"is not divisible by world_size={world_size}"
         )
-        # Output keeps the same rank/strides as input, only the scattered
-        # dim shrinks by world_size. Allocation is contiguous; the custom
-        # kernel writes elements in linear order into this layout, so no
-        # post-kernel reshape/copy is needed.
+        # Output keeps the same rank/strides as input, only the scattered dim shrinks by world_size. Allocation is
+        # contiguous; the custom kernel writes elements in linear order into this layout, so no post-kernel reshape/copy
+        # is needed.
         out_shape = (
             input_.shape[:dim]
             + (input_.shape[dim] // world_size,)
@@ -1150,8 +1143,8 @@ class GroupCoordinator:
             ), f"Expecting a dictionary, got {type(tensor_dict)}"
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
-            # `broadcast_object_list` has serialization & deserialization,
-            # all happening on CPU. Therefore, we can use the CPU group.
+            # `broadcast_object_list` has serialization & deserialization, all happening on CPU. Therefore, we can use
+            # the CPU group.
             self.broadcast_object(metadata_list, src=src)
             async_handles = []
             for tensor in tensor_list:
@@ -1237,8 +1230,8 @@ class GroupCoordinator:
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # `metadata_list` lives in CPU memory.
-        # `send_object_list` has serialization & deserialization,
-        # all happening on CPU. Therefore, we can use the CPU group.
+        # `send_object_list` has serialization & deserialization, all happening on CPU. Therefore, we can use the CPU
+        # group.
         self.send_object(metadata_list, dst=dst)
         for tensor in tensor_list:
             if tensor.numel() == 0:
@@ -1628,8 +1621,7 @@ def init_distributed_environment(
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
     if local_rank == -1:
-        # local rank not set, this usually happens in single-node
-        # setting, where we can use rank as local rank
+        # local rank not set, this usually happens in single-node setting, where we can use rank as local rank
         if distributed_init_method == "env://":
             # local_rank = envs.LOCAL_RANK
             local_rank = os.environ.get("LOCAL_RANK", rank)
@@ -1697,18 +1689,16 @@ def initialize_model_parallel(
     #     data_parallel_size = config.parallel_config.data_parallel_size
 
     # the layout order is: ExternalDP x DP x PP x TP
-    # ExternalDP is the data parallel group that is not part of the model,
-    # every dp rank can generate independently (in verl integration).
-    # DP is the data parallel group that is part of the model,
-    # all the ranks in the same DP group should generate simultaneously,
-    # i.e. the `generate` call in the same DP group should be called together,
-    # otherwise it will cause deadlock.
-    # to get group_ranks for each dimension, transpose that dimension to the
-    # last dimension, then reshape to 2D, then unbind the last dimension
+    # ExternalDP is the data parallel group that is not part of the model, every dp rank can generate independently (in
+    # verl integration).
+    # DP is the data parallel group that is part of the model, all the ranks in the same DP group should generate
+    # simultaneously, i.e. the `generate` call in the same DP group should be called together, otherwise it will cause
+    # deadlock.
+    # to get group_ranks for each dimension, transpose that dimension to the last dimension, then reshape to 2D, then
+    # unbind the last dimension
     # the layout order is: ExternalDP x DP x PP x PCP x TP
-    # PCP (prefill context parallel) is an INDEPENDENT dimension that grows
-    # world_size (world = ... x pcp x tp), and sits just outside TP (mirrors
-    # vLLM's layout). It is NOT the commented-out DCP below, which reuses TP.
+    # PCP (prefill context parallel) is an INDEPENDENT dimension that grows world_size (world = ... x pcp x tp), and
+    # sits just outside TP (mirrors vLLM's layout). It is NOT the commented-out DCP below, which reuses TP.
     all_ranks = torch.arange(world_size).reshape(
         -1,
         data_parallel_size,
@@ -1717,9 +1707,8 @@ def initialize_model_parallel(
         tensor_model_parallel_size,
     )  # noqa
 
-    # When custom groups are provided, all communication goes through them
-    # (standard ops assert via _assert_no_custom_group). Skip expensive
-    # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
+    # When custom groups are provided, all communication goes through them (standard ops assert via
+    # _assert_no_custom_group). Skip expensive CudaCommunicator allocation for standard TP/PP/DP/EP groups.
     need_std_comm = custom_group_config is None
 
     # Build the tensor model-parallel groups.
@@ -1756,9 +1745,8 @@ def initialize_model_parallel(
     )
 
     # Build the prefill context-parallel (PCP) groups.
-    # PCP is an INDEPENDENT dimension (world = ... x pcp x tp), unlike the
-    # commented-out DCP above which reuses TP GPUs. PCP sits just outside TP,
-    # so transpose(3, 4) brings the PCP dim innermost. DO NOT touch _DCP.
+    # PCP is an INDEPENDENT dimension (world = ... x pcp x tp), unlike the commented-out DCP above which reuses TP GPUs.
+    # PCP sits just outside TP, so transpose(3, 4) brings the PCP dim innermost. DO NOT touch _DCP.
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (

@@ -61,9 +61,8 @@ def can_pack_2d_last_dim_slice(inp: torch.Tensor) -> bool:
     return inp.stride(-1) == 1 and inp.stride(0) >= n and not inp.is_contiguous()
 
 
-# Wavefront width on AMD CDNA / gfx94x / gfx950. ``__shfl_xor`` in the
-# fused per-group FP8 quant epilogue is scoped to a single wavefront, so
-# ``threads_per_group = group_size / PACK_SIZE`` must fit inside it.
+# Wavefront width on AMD CDNA / gfx94x / gfx950. ``__shfl_xor`` in the fused per-group FP8 quant epilogue is scoped to a
+# single wavefront, so ``threads_per_group = group_size / PACK_SIZE`` must fit inside it.
 _AITER_AR_WAVEFRONT_SIZE = 64
 
 
@@ -366,8 +365,7 @@ class CustomAllreduce:
         self.disabled = True
 
         if not custom_ar:
-            # disable because of missing custom allreduce library
-            # e.g. in a non-cuda environment
+            # disable because of missing custom allreduce library e.g. in a non-cuda environment
             return
 
         self.group = group
@@ -444,8 +442,8 @@ class CustomAllreduce:
 
         self.disabled = False
         self.enable_register_for_capturing = enable_register_for_capturing
-        # Buffer for tuples of per-rank IPC buffer pointers. Each tuple is
-        # 8*world_size bytes (world_size <= 8); 8MB holds 131072 tuples.
+        # Buffer for tuples of per-rank IPC buffer pointers. Each tuple is 8*world_size bytes (world_size <= 8); 8MB
+        # holds 131072 tuples.
         self.rank_data = torch.empty(
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
@@ -454,8 +452,7 @@ class CustomAllreduce:
         self.world_size = world_size
 
         # Create IPC buffer pool and allocate all named buffers.
-        # "meta" uses hipAlloc (uncached) for synchronization metadata +
-        # intermediate allreduce temp storage.
+        # "meta" uses hipAlloc (uncached) for synchronization metadata + intermediate allreduce temp storage.
         # "input" uses torchAlloc (cached) for D2D relay in eager mode.
         self._pool = IPCBufferPool(self.device, self.group)
         self._pool.create("meta", ops.meta_size() + max_size * 2, uncached=True)
@@ -524,8 +521,7 @@ class CustomAllreduce:
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
-        # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
+        # for 4 or more non NVLink-capable GPUs, custom allreduce provides little performance improvement over NCCL.
         # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
             # decode
@@ -557,8 +553,7 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        # all_gather output = input * world_size, so the per-rank input
-        # must fit within max_size / world_size
+        # all_gather output = input * world_size, so the per-rank input must fit within max_size / world_size
         if self.world_size == 2 or self.fully_connected:
             return inp_size <= (self.max_size / (self.world_size * 2))
         return False
@@ -609,8 +604,7 @@ class CustomAllreduce:
                     registered_input=self.enable_register_for_capturing,
                 )
             else:
-                # if warm up, mimic the allocation pattern
-                # since custom allreduce is out-of-place
+                # if warm up, mimic the allocation pattern since custom allreduce is out-of-place
                 return torch.zeros_like(input)
         else:
             # note: outside of cuda graph context,
@@ -624,8 +618,7 @@ class CustomAllreduce:
                 registered_input=False,
             )
 
-    # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
-    # in csrc/include/custom_all_reduce.cuh.
+    # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim` in csrc/include/custom_all_reduce.cuh.
     _RS_SPLIT_FIRST = 0
     _RS_SPLIT_LAST = 1
     _RS_SPLIT_MID = 2
@@ -708,21 +701,18 @@ class CustomAllreduce:
     def custom_reduce_scatter(
         self, input: torch.Tensor, output: torch.Tensor, dim: int = 0
     ) -> Optional[torch.Tensor]:
-        # when custom allreduce is disabled or this shape/dim is unsupported,
-        # this will be None and the caller is expected to fall back to an
-        # external reduce_scatter implementation (NCCL / pynccl / torch.dist).
+        # when custom allreduce is disabled or this shape/dim is unsupported, this will be None and the caller is
+        # expected to fall back to an external reduce_scatter implementation (NCCL / pynccl / torch.dist).
         if self.disabled or not self.should_custom_rs(input, dim):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.reduce_scatter(input, output, dim, registered=True)
             else:
-                # Warmup forward (pre-capture): run the REAL reduce_scatter via
-                # the copy-in path. Unlike custom_all_reduce, returning zeros
-                # here corrupts DeepSeek-V4 hash-routed MoE accuracy (~5pp GSM8K
-                # drop) — the warmup result feeds downstream state baked into the
-                # captured graph. Out-of-place collective, so allocation pattern
-                # still matches the captured all_gather_reg path.
+                # Warmup forward (pre-capture): run the REAL reduce_scatter via the copy-in path. Unlike
+                # custom_all_reduce, returning zeros here corrupts DeepSeek-V4 hash-routed MoE accuracy (~5pp GSM8K
+                # drop) — the warmup result feeds downstream state baked into the captured graph. Out-of-place
+                # collective, so allocation pattern still matches the captured all_gather_reg path.
                 return self.reduce_scatter(input, output, dim, registered=False)
         else:
             return self.reduce_scatter(input, output, dim, registered=False)
@@ -774,10 +764,9 @@ class CustomAllreduce:
         )
         return out
 
-    # Int dtypes have no fp counterpart in the C++ dispatch enum, but the
-    # all-gather kernel is pure memcpy parametrized only by sizeof(T). View
-    # ints as same-size floats so callers gathering token-id tensors work
-    # (e.g. DeepSeek-V4-Pro hash-gate gathers int32 across DP ranks).
+    # Int dtypes have no fp counterpart in the C++ dispatch enum, but the all-gather kernel is pure memcpy parametrized
+    # only by sizeof(T). View ints as same-size floats so callers gathering token-id tensors work (e.g. DeepSeek-V4-Pro
+    # hash-gate gathers int32 across DP ranks).
     _INT_TO_FP_VIEW = {
         torch.int64: torch.float64,
         torch.int32: torch.float32,
@@ -794,9 +783,8 @@ class CustomAllreduce:
             if torch.cuda.is_current_stream_capturing():
                 out = self.all_gather_reg(inp.view(view_dtype), dim=dim)
             else:
-                # Warmup forward (pre-capture): run the REAL all_gather via the
-                # copy-in (unreg) path. Returning zeros here corrupts V4 MoE
-                # accuracy — see custom_reduce_scatter for the rationale.
+                # Warmup forward (pre-capture): run the REAL all_gather via the copy-in (unreg) path. Returning zeros
+                # here corrupts V4 MoE accuracy — see custom_reduce_scatter for the rationale.
                 out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
         else:
             out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
@@ -950,9 +938,8 @@ class CustomAllreduce:
         prefill_support: bool = False,
         gemma_norm: bool = False,
     ) -> Optional[torch.Tensor]:
-        # Let the C++ wrapper pack supported last-dim sliced views directly
-        # into the registered IPC buffer so eager and graph paths both avoid
-        # materializing an intermediate contiguous tensor in Python.
+        # Let the C++ wrapper pack supported last-dim sliced views directly into the registered IPC buffer so eager and
+        # graph paths both avoid materializing an intermediate contiguous tensor in Python.
         if self.disabled or not self.should_custom_ar_bytes(input, prefill_support):
             return None
         if self._IS_CAPTURING:
@@ -1048,25 +1035,20 @@ class CustomAllreduce:
         transpose_scale: bool = False,
     ):
         K = inp.shape[-1]
-        # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
-        # the C++ host dispatcher checks; catching it here surfaces a
-        # synchronous ``ValueError`` instead of a post-launch
-        # ``RuntimeError`` that would only fire at CUDA-graph replay and
-        # would be much harder to attribute to the offending call site.
+        # Fail fast on bad ``group_size`` at the Python boundary. Mirrors the C++ host dispatcher checks; catching it
+        # here surfaces a synchronous ``ValueError`` instead of a post-launch ``RuntimeError`` that would only fire at
+        # CUDA-graph replay and would be much harder to attribute to the offending call site.
         _validate_per_group_size(group_size, inp.element_size(), K)
         res_out = torch.empty_like(inp)
         num_groups = K // group_size
         out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
         if transpose_scale:
-            # Column-major scale: the kernel writes scale[group_id * M + tidx],
-            # i.e. it fills a (num_groups, M) row-major buffer. Expose it to the
-            # consumer as a logical (M, num_groups) tensor via transpose -> stride
-            # (1, M), the layout gemm_a8w8_blockscale_preshuffle consumes. This
-            # also matches the layout inductor re-strides the op output to (the
-            # op has no needs_fixed_stride_order tag on torch>=2.8), so the
-            # torch.compile fake (which declares the same (1, M) stride) agrees
-            # with the runtime tensor. Requires a 2D (M, K) input; the per-group
-            # fused path is always 2D in practice.
+            # Column-major scale: the kernel writes scale[group_id * M + tidx], i.e. it fills a (num_groups, M)
+            # row-major buffer. Expose it to the consumer as a logical (M, num_groups) tensor via transpose -> stride
+            # (1, M), the layout gemm_a8w8_blockscale_preshuffle consumes. This also matches the layout inductor
+            # re-strides the op output to (the op has no needs_fixed_stride_order tag on torch>=2.8), so the
+            # torch.compile fake (which declares the same (1, M) stride) agrees with the runtime tensor. Requires a 2D
+            # (M, K) input; the per-group fused path is always 2D in practice.
             assert inp.dim() == 2, (
                 "transpose_scale per-group quant requires a 2D (M, K) input, "
                 f"got shape {tuple(inp.shape)}"
@@ -1079,10 +1061,9 @@ class CustomAllreduce:
             scale_out = torch.empty(
                 inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
             )
-        # Optional bf16/fp16 mirror of the pre-quantization normed output.
-        # Requested by GDN-style layers that also need an unquantized view
-        # (e.g. Qwen3.5 in_proj_ba). Zero-overhead when not requested
-        # because the kernel branches on the pointer being non-null.
+        # Optional bf16/fp16 mirror of the pre-quantization normed output. Requested by GDN-style layers that also need
+        # an unquantized view (e.g. Qwen3.5 in_proj_ba). Zero-overhead when not requested because the kernel branches on
+        # the pointer being non-null.
         bf16_out = None
         bf16_ptr = 0
         if emit_bf16:

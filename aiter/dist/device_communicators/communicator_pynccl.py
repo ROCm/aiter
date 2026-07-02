@@ -92,8 +92,7 @@ class PyNcclCommunicator:
             self.nccl = NCCLLibrary(library_path)
         except Exception as e:
             print(f"Failed to load NCCL library: {e}")
-            # disable because of missing NCCL library
-            # e.g. in a non-GPU environment
+            # disable because of missing NCCL library e.g. in a non-GPU environment
             self.available = False
             self.disabled = True
             return
@@ -128,8 +127,7 @@ class PyNcclCommunicator:
         assert isinstance(device, torch.device)
         self.device = device
         # nccl communicator and stream will use this device
-        # `torch.cuda.device` is a context manager that changes the
-        # current cuda device to the specified one
+        # `torch.cuda.device` is a context manager that changes the current cuda device to the specified one
         with torch.cuda.device(device):
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank

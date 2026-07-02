@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Pure Python wrapper for NCCL, so NCCL can be used with CUDA graphs.
-# Rejected alternatives: cupy (hangs on NCCL comm init); torch.distributed
-# (all_reduce uses cuda APIs disallowed during graph capture, see
-# https://discuss.pytorch.org/t/pytorch-cudagraph-with-nccl-operation-failed/);
-# a C/C++ binding (needs recompilation to switch NCCL versions). A pure Python
-# wrapper lets us switch NCCL versions via env VLLM_NCCL_SO_PATH / the so_file var.
+# Pure Python wrapper for NCCL, so NCCL can be used with CUDA graphs. Rejected alternatives: cupy (hangs on NCCL comm
+# init); torch.distributed (all_reduce uses cuda APIs disallowed during graph capture, see
+# https://discuss.pytorch.org/t/pytorch-cudagraph-with-nccl-operation-failed/); a C/C++ binding (needs recompilation to
+# switch NCCL versions). A pure Python wrapper lets us switch NCCL versions via env VLLM_NCCL_SO_PATH / the so_file var.
 
 import ctypes
 import platform
@@ -276,12 +274,10 @@ class NCCLLibrary:
         # Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
     ]
 
-    # class attribute to store the mapping from the path to the library
-    # to avoid loading the same library multiple times
+    # class attribute to store the mapping from the path to the library to avoid loading the same library multiple times
     path_to_library_cache: dict[str, Any] = {}
 
-    # class attribute to store the mapping from library path
-    #  to the corresponding dictionary
+    # class attribute to store the mapping from library path to the corresponding dictionary
     path_to_dict_mapping: dict[str, dict[str, Any]] = {}
 
     def __init__(self, so_file: str | None = None):
@@ -327,8 +323,7 @@ class NCCLLibrary:
                             func.name,
                             so_file,
                         )
-                        # Having an exception here on ROCm platform is
-                        # not allowed during graph capturing
+                        # Having an exception here on ROCm platform is not allowed during graph capturing
                         continue
                     raise
             NCCLLibrary.path_to_dict_mapping[so_file] = _funcs

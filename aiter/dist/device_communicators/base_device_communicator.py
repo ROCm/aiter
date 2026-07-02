@@ -43,20 +43,18 @@ class All2AllManagerBase:
         self.dp_group = get_dp_group()
         self.tp_group = get_tp_group()
 
-        # no self.ep_group since self.ep_group is still in construction
-        # when we create this object
+        # no self.ep_group since self.ep_group is still in construction when we create this object
         self.dp_rank = self.dp_group.rank_in_group
         self.dp_world_size = self.dp_group.world_size
         self.rank = dist.get_rank(cpu_group)
         self.world_size = dist.get_world_size(cpu_group)
 
-        # all2all communication often has separate implementations for
-        # intra-node and inter-node communication
+        # all2all communication often has separate implementations for intra-node and inter-node communication
         self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))
 
     def get_handle(self, kwargs):
-        # Get an all2all handle keyed on kwargs (layers differ, e.g. hidden size
-        # 1024 vs 2048); the implementation usually caches/reuses per config.
+        # Get an all2all handle keyed on kwargs (layers differ, e.g. hidden size 1024 vs 2048); the implementation
+        # usually caches/reuses per config.
         raise NotImplementedError
 
     def dispatch(

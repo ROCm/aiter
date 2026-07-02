@@ -133,8 +133,7 @@ class bcolors:
 
 
 # Context manager to remove hipify intermediates when keep_intermediates=False.
-# Main usecase is cpp_extensions.load; keeping intermediates avoids recompiles,
-# but CI etc. may want them removed.
+# Main usecase is cpp_extensions.load; keeping intermediates avoids recompiles, but CI etc. may want them removed.
 class GeneratedFileCleaner:
     """Context Manager to clean up generated files"""
 
@@ -205,8 +204,7 @@ def matched_files_iter(
         for filename in filenames:
             filepath = os.path.join(abs_dirpath, filename)
             rel_filepath = os.path.join(rel_dirpath, filename)
-            # We respect extensions, UNLESS you wrote the entire
-            # filename verbatim, in which case we always accept it
+            # We respect extensions, UNLESS you wrote the entire filename verbatim, in which case we always accept it
             if (
                 _fnmatch(filepath, includes)
                 and (not _fnmatch(filepath, ignores))

@@ -92,9 +92,8 @@ def parse_csv(csv_path: str):
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
             q_dtype_w = row.get("q_dtype_w", "")
-            # Cover both runtime bias choices for fp4-weight MoE. Model configs
-            # share kernel families, and runtime bias selection can vary by
-            # activation dtype/model semantics.
+            # Cover both runtime bias choices for fp4-weight MoE. Model configs share kernel families, and runtime bias
+            # selection can vary by activation dtype/model semantics.
             bias_supported = (
                 q_type.strip().split(".")[-1] == "per_1x32"
                 and dtype in ("torch.bfloat16", "torch.float16")
@@ -102,8 +101,8 @@ def parse_csv(csv_path: str):
             )
             enable_bias_options = [False, True] if bias_supported else [False]
 
-            # Detect stage1's fuse_quant from kernel suffix to align stage2's
-            # a2_scale shape with what runtime actually passes.
+            # Detect stage1's fuse_quant from kernel suffix to align stage2's a2_scale shape with what runtime actually
+            # passes.
             stage1_name = row.get("kernelName1", "").strip()
             stage1_params = (
                 get_flydsl_kernel_params(stage1_name)
@@ -136,9 +135,8 @@ def parse_csv(csv_path: str):
                         "token_num": token,
                         "block_m": block_m,
                     }
-                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
-                    # this changes the shape of a2_scale (sorted scale buffer
-                    # vs separate quant call output).
+                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant — this changes the shape of a2_scale
+                    # (sorted scale buffer vs separate quant call output).
                     if params["stage"] == 2:
                         job["stage1_fuse_quant"] = (
                             stage1_out_dtype
@@ -171,13 +169,11 @@ def _precompile_to_cache(
     out_dtype: str = "bf16",
     act: str = "silu",
     doweight_stage1: bool = False,
-    # Must match the runtime default of ``compile_mixed_moe_gemm2`` /
-    # ``compile_mixed_moe_gemm1`` (``Optional[int] = None``). A scalar default
-    # (e.g. ``3``) would make the AOT-side ``_cache_tag`` tuple disagree with
-    # the runtime-side tuple for any legacy kernel that does not explicitly
-    # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
-    # production-variant ``_persist_async_w4_cumul3`` does), causing
-    # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
+    # Must match the runtime default of ``compile_mixed_moe_gemm2`` / ``compile_mixed_moe_gemm1`` (``Optional[int] =
+    # None``). A scalar default (e.g. ``3``) would make the AOT-side ``_cache_tag`` tuple disagree with the runtime-side
+    # tuple for any legacy kernel that does not explicitly pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels``
+    # (only the production-variant ``_persist_async_w4_cumul3`` does), causing ``AOT cache miss`` at runtime even though
+    # the .pkl is present on disk.
     waves_per_eu: Optional[int] = None,
     k_batch: int = 1,
     b_nt: int = 2,
@@ -193,9 +189,8 @@ def _precompile_to_cache(
     enable_bias: bool = False,
     stage1_fuse_quant=None,
     k_wave: int = 1,
-    # Stage2-only kernel tuning knobs (registered by the production-variant
-    # entries in `get_flydsl_stage2_kernels`). Forwarded into
-    # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
+    # Stage2-only kernel tuning knobs (registered by the production-variant entries in `get_flydsl_stage2_kernels`).
+    # Forwarded into `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     **kwargs,
@@ -305,8 +300,8 @@ def _precompile_to_cache(
                 device=dev,
             )
         if a_dtype == "fp4":
-            # fused_dynamic_mxfp4_quant_moe_sort or mxfp4_moe_sort_fwd:
-            # output shape is ((sorted_ids+31)//32*32, (cols+31)//32) in fp8_e8m0.
+            # fused_dynamic_mxfp4_quant_moe_sort or mxfp4_moe_sort_fwd: output shape is ((sorted_ids+31)//32*32,
+            # (cols+31)//32) in fp8_e8m0.
             rows = (max_num_tokens_padded + 31) // 32 * 32
             cols = (model_dim + 31) // 32
             return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
@@ -351,8 +346,7 @@ def _precompile_to_cache(
                 device=dev,
             )
         if a_dtype == "fp4":
-            # fused_dynamic_mxfp4_quant_moe_sort / mxfp4_moe_sort_fwd path:
-            # 32-row alignment.
+            # fused_dynamic_mxfp4_quant_moe_sort / mxfp4_moe_sort_fwd path: 32-row alignment.
             rows = (max_num_tokens_padded + 31) // 32 * 32
             cols = (inter_dim + 31) // 32
             return torch.zeros(rows * cols, dtype=torch.uint8, device=dev)
@@ -728,11 +722,9 @@ def _precompile_to_cache(
             )
             _run_compiled(exe, args)
 
-            # Reduce mode (accumulate=False) runs a separate topk reduction
-            # kernel inside the runtime stage2 wrapper. Precompile it via the
-            # same shared helper the runtime uses so the cache key matches.
-            # Single-GPU path uses use_mask=False (plain); EP/masked reduction
-            # is a multi-GPU path (separately gated) and not covered here.
+            # Reduce mode (accumulate=False) runs a separate topk reduction kernel inside the runtime stage2 wrapper.
+            # Precompile it via the same shared helper the runtime uses so the cache key matches. Single-GPU path uses
+            # use_mask=False (plain); EP/masked reduction is a multi-GPU path (separately gated) and not covered here.
             if not accumulate:
                 from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
@@ -846,9 +838,8 @@ def main():
 
     total_t0 = time.time()
 
-    # Stage1 and stage2 kernels are independent compiles (each writes its
-    # own artifact to cache; stage2 does not read stage1's output), so they
-    # share a single pool for maximum fan-out instead of two serial passes.
+    # Stage1 and stage2 kernels are independent compiles (each writes its own artifact to cache; stage2 does not read
+    # stage1's output), so they share a single pool for maximum fan-out instead of two serial passes.
     print(f"\n--- Compiling {len(all_jobs)} kernels (stage1 + stage2) ---")
     results = run_jobs_parallel(compile_one_config, stage1_jobs + stage2_jobs)
 

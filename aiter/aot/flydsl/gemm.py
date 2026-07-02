@@ -278,8 +278,7 @@ def _compile_hgemm_to_cache(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
     )
-    # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
-    # optional bias and split-K sync tensors.
+    # FlyDSL JIT does not accept None for tensor slots; pass real buffers for optional bias and split-K sync tensors.
     launch_bias = bias if has_bias else b
     _compile_executable_to_cache(
         exe,
@@ -440,8 +439,8 @@ def main():
 
     total_t0 = time.time()
 
-    # HGEMM and preshuffle kernels are independent compiles, so they share
-    # one pool for maximum fan-out instead of two serial passes.
+    # HGEMM and preshuffle kernels are independent compiles, so they share one pool for maximum fan-out instead of two
+    # serial passes.
     print(f"\n--- Compiling {len(all_jobs)} kernels (hgemm + preshuffle) ---")
     results = run_jobs_parallel(compile_one_config, hgemm_jobs + preshuffle_jobs)
 

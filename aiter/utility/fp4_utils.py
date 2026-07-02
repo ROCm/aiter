@@ -107,9 +107,8 @@ def f32_to_mx_e8m0_scale(
         shape as ``amax``. NaN/Inf inputs map to ``0xFF`` (E8M0 NaN).
         Inputs near FLT_MAX may also map to ``0xFF`` after ceil rounding.
     """
-    # Normalise int / pybind enum into a plain int -- pybind11 enum classes
-    # do not auto-compare equal to ``int`` (unlike ``IntEnum``), so callers
-    # passing ``mode=1`` would otherwise mis-dispatch.
+    # Normalise int / pybind enum into a plain int -- pybind11 enum classes do not auto-compare equal to ``int``
+    # (unlike ``IntEnum``), so callers passing ``mode=1`` would otherwise mis-dispatch.
     mode_int = int(mode)
     dtype_int = int(dtype)
     if dtype_int not in _DTYPE_CFG:
@@ -164,9 +163,8 @@ def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
 
 
 # Low-level implementation used by the generic dispatcher above.
-# _f32_to_e8m0_floor_impl / _f32_to_e8m0_ceil_impl are the only primitives that
-# touch the f32 bit pattern; they take an already-divided value (amax / divisor)
-# and emit the biased exponent.
+# _f32_to_e8m0_floor_impl / _f32_to_e8m0_ceil_impl are the only primitives that touch the f32 bit pattern; they take
+# an already-divided value (amax / divisor) and emit the biased exponent.
 
 
 def _f32_to_e8m0_floor_impl(x: Tensor) -> Tensor:
@@ -304,15 +302,13 @@ def _f32_to_floatx_unpacked(x: Tensor, ebits: int, mbits: int) -> Tensor:
     # converting to float? probably but need to verify
     x = x.view(torch.float)
 
-    # rewrite saturate/denorm/norm branches without explicit data dependent
-    # control flow, to be more compiler friendly
+    # rewrite saturate/denorm/norm branches without explicit data dependent control flow, to be more compiler friendly
     saturate_mask = x >= max_normal
     denormal_mask = torch.logical_and(torch.logical_not(saturate_mask), x < min_normal)
     normal_mask = torch.logical_not(torch.logical_or(saturate_mask, denormal_mask))
 
     #
-    # branch 1: saturate to max val - handled later in the code which combines
-    #   the branches
+    # branch 1: saturate to max val - handled later in the code which combines the branches
     #
 
     #
@@ -541,8 +537,7 @@ def dynamic_mxfp4_quant(
     assert (N // 2) % 2 == 0
 
     # This is fixed by spec for MXFP4. Do not tune this.
-    # For performance, perhaps, we should look at passing multiple of 32 column blocks
-    # that a triton program can process
+    # For performance, perhaps, we should look at passing multiple of 32 column blocks that a triton program can process
     MXFP4_QUANT_BLOCK_SIZE = 32
 
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
@@ -799,9 +794,8 @@ def moe_mxfp4_sort(
         device=blockscale_e8m0.device,
     )  # .fill_(0)
 
-    # Dispatch threshold: for small token counts the 2D-grid kernel has better
-    # parallelism; for large token counts the fused-N kernel wins by reusing
-    # sorted_ids row addresses across all N tiles.
+    # Dispatch threshold: for small token counts the 2D-grid kernel has better parallelism;
+    # for large token counts the fused-N kernel wins by reusing sorted_ids row addresses across all N tiles.
     _FUSED_N_THRESHOLD = 2048
 
     common_args = (

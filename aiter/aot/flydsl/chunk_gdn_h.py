@@ -66,14 +66,12 @@ _DEFAULT_CSV = (
 )
 DEFAULT_CSVS = [str(_DEFAULT_CSV)]
 CHUNK_GDN_H_AOT_ARCH_DEFAULT = "gfx950"
-# K5 ships a single kernel today; mirrors the ``@flyc.kernel(name=...)``
-# decorator in ``kernels/chunk_gated_delta_h.py`` so the AOT ``result`` dict
-# and any failure-mode print share one source of truth.
+# K5 ships a single kernel today; mirrors the ``@flyc.kernel(name=...)`` decorator in ``kernels/chunk_gated_delta_h.py``
+# so the AOT ``result`` dict and any failure-mode print share one source of truth.
 _KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_vk"
 
 # Map jsonl ``dtype`` string -> torch dtype name used for dummy tensors.
-# Only bf16 is exercised by the kernel today (state_t is selected
-# separately via ``STATE_DTYPE_BF16``).
+# Only bf16 is exercised by the kernel today (state_t is selected separately via ``STATE_DTYPE_BF16``).
 _TORCH_DTYPE = {
     "torch.bfloat16": "bfloat16",
     "torch.float16": "float16",
@@ -144,9 +142,8 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                     "save_vn": _parse_bool(row.get("save_vn") or "True"),
                     "is_varlen": _parse_bool(row.get("is_varlen") or "False"),
                     "wu_contig": _parse_bool(row.get("wu_contig") or "True"),
-                    # state dtype is not tracked in the tuned csv yet; default
-                    # f32 here, then main() unconditionally fans out into a
-                    # bf16 twin so both runtime paths are pre-compiled.
+                    # state dtype is not tracked in the tuned csv yet; default f32 here, then main() unconditionally
+                    # fans out into a bf16 twin so both runtime paths are pre-compiled.
                     "state_bf16": False,
                 }
             except (KeyError, ValueError) as e:
@@ -205,11 +202,9 @@ def _compile_chunk_gdn_h_to_cache(
     torch_dtype = _torch_dtype_for_kernel(dtype)
     state_dtype = torch.bfloat16 if state_bf16 else torch.float32
 
-    # Pick a representative T_flat / N for the dummy tensors. These only
-    # influence the host launch shape, not the compiled artifact, so any
-    # value consistent with BT divisibility works. ``is_varlen`` flips
-    # the kernel's cu_seqlens read path at runtime, but the AOT dummy
-    # tensor shape is identical in both modes, so we use a single T.
+    # Pick a representative T_flat / N for the dummy tensors. These only influence the host launch shape, not the
+    # compiled artifact, so any value consistent with BT divisibility works. ``is_varlen`` flips the kernel's cu_seqlens
+    # read path at runtime, but the AOT dummy tensor shape is identical in both modes, so we use a single T.
     T_flat = BT
     N = 1
     B = N
@@ -224,9 +219,8 @@ def _compile_chunk_gdn_h_to_cache(
     h = torch.empty((B, max(T_flat // BT, 1), H, V, K), device=dev, dtype=torch_dtype)
     h0 = torch.empty((N, H, V, K), device=dev, dtype=state_dtype)
     ht = torch.empty((N, H, V, K), device=dev, dtype=state_dtype)
-    # Variable-length book-keeping tensors. FlyDSL JIT does not accept
-    # ``None`` for tensor slots, so allocate small int32 buffers even when
-    # the kernel branch is disabled.
+    # Variable-length book-keeping tensors. FlyDSL JIT does not accept ``None`` for tensor slots, so allocate small
+    # int32 buffers even when the kernel branch is disabled.
     cu_seqlens = torch.zeros((N + 1,), device=dev, dtype=torch.int32)
     chunk_offsets = torch.zeros((N + 1,), device=dev, dtype=torch.int32)
 
@@ -387,15 +381,13 @@ def main():
 
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
 
-    # ``--target-arch`` rewrites the ``arch`` field of every job, then we
-    # dedupe again because two csv rows that differed only in arch
-    # collapse to the same compile after the override.
+    # ``--target-arch`` rewrites the ``arch`` field of every job, then we dedupe again because two csv rows that
+    # differed only in arch collapse to the same compile after the override.
     if args.target_arch and all_jobs:
         all_jobs = dedupe_jobs([dict(j, arch=args.target_arch) for j in all_jobs])
 
-    # Fan out into both f32-state and bf16-state variants so neither
-    # runtime path pays a JIT cost on first call. ``dedupe_jobs`` drops
-    # any pre-existing dup.
+    # Fan out into both f32-state and bf16-state variants so neither runtime path pays a JIT cost on first call.
+    # ``dedupe_jobs`` drops any pre-existing dup.
     if all_jobs:
         all_jobs = dedupe_jobs(all_jobs + [dict(j, state_bf16=True) for j in all_jobs])
 

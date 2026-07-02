@@ -141,8 +141,7 @@ def paged_attention_v2(
 class PagedAttentionMetadata:
     """Metadata for PagedAttention."""
 
-    # (batch_size,). The length of sequences (entire tokens seen so far) per
-    # sequence.
+    # (batch_size,). The length of sequences (entire tokens seen so far) per sequence.
     seq_lens_tensor: Optional[torch.Tensor]
     # Maximum sequence length in the batch. 0 if it is prefill-only batch.
     max_decode_seq_len: int
