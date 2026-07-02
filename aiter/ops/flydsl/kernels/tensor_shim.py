@@ -24,6 +24,7 @@ def ptr_rsrc(ptr):
 def ptr_arg(t: torch.Tensor):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
     import flydsl.expr as fx
+
     type_name = type(t).__name__
     module_name = type(t).__module__
     if type_name == "FakeTensor" or "fake_tensor" in module_name:

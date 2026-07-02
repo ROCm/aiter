@@ -20,7 +20,6 @@ from flydsl.expr import buffer_ops
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
 
-
 BLOCK_THREADS = 256
 
 

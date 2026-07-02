@@ -200,6 +200,7 @@ def _make_m_tile_map(
         cfg.experts * max_m_tiles, device=masked_m.device, dtype=torch.int32
     )
     from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
     launch = _get_compiled_m_tile_map()
     launch(
         ptr_arg(m_tile_prefix),

@@ -10,6 +10,8 @@ from typing import Dict, Optional
 
 import torch
 
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
 
@@ -524,9 +526,6 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
         if t is not None and t.numel() > 0 and t.dtype not in _DLPACK_SAFE
         else t
     )
-
-
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 
 def runtime_swiglu_limit(swiglu_limit: Optional[float], act: str) -> float:

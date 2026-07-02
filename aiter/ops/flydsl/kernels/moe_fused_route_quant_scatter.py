@@ -585,7 +585,7 @@ def build_moe_fused_route_quant_scatter_module(
             # branch here.
             slot_on_lane0 = arith.constant(0, type=i32)
             if lane == 0:
-                counter_base = buffer_ops.extract_base_index(counter, address_space=1)
+                counter_base = arith.index_cast(T.index, ptrtoint(counter))
                 expert_idx = arith.index_cast(T.index, expert)
                 counter_addr = fx.Index(counter_base) + fx.Index(expert_idx) * fx.Index(
                     4
@@ -1573,7 +1573,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 rocdl.s_waitcnt(0)
 
         def _elem_ptr(tensor, elem_idx_i32):
-            base = buffer_ops.extract_base_index(tensor, address_space=1)
+            base = arith.index_cast(T.index, ptrtoint(tensor))
             idx = arith.index_cast(T.index, elem_idx_i32)
             addr = fx.Index(base) + idx * fx.Index(4)
             p = buffer_ops.create_llvm_ptr(addr, address_space=1)

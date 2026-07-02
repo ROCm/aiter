@@ -14,10 +14,10 @@ import torch
 from torch import Tensor
 
 import flydsl.expr as fx
-import flydsl.compiler as flyc
 from aiter import logger
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from aiter.jit.utils.chip_info import get_gfx
 
@@ -69,9 +69,6 @@ _HGEMM_KERNEL_RE = re.compile(
 SplitKStreamKey = tuple[int, int]
 SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
 SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
-
-
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL

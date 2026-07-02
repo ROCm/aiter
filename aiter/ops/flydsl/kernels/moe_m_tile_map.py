@@ -89,6 +89,7 @@ def build_moe_m_tile_prefix_map_module():
         m_tile_prefix[0].zero_()
         torch.cumsum(valid_tiles, dim=0, out=m_tile_prefix[1:])
         from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
         map_launch(
             ptr_arg(m_tile_prefix),
             ptr_arg(m_tile_map),

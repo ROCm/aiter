@@ -10,7 +10,7 @@ torch.cumsum (avoids rocprim trampoline overhead for small E).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, ptrtoint, range_constexpr
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
 from flydsl.compiler.kernel_function import CompilationContext
