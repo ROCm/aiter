@@ -458,6 +458,88 @@ def test_fused_sigmoid_gating_delta_rule_update(
 
 
 @pytest.mark.parametrize(
+    ("B", "T", "H", "HV", "K", "V", "dtype"),
+    [
+        pytest.param(*t, id="B{}-T{}-H{}-HV{}-K{}-V{}-{}".format(*t))
+        for t in [
+            (2, 1, 2, 6, 128, 128, torch.float),
+            (2, 1, 2, 6, 64, 128, torch.float),  # K!=V surfaces any transpose bug
+            (2, 1, 4, 4, 128, 256, torch.float),
+            (2, 1, 2, 6, 128, 128, torch.bfloat16),
+            (2, 1, 2, 6, 64, 128, torch.bfloat16),
+        ]
+    ],
+)
+def test_fused_sigmoid_gating_delta_rule_update_state_layout(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+):
+    """The ``"hvk"`` state layout (``[N, HV, V, K]``, V-major) must match the
+    default ``"hkv"`` layout (``[N, HV, K, V]``, K-major) for the SAME logical
+    state: the recurrence is identical, only the physical storage of the state
+    pool differs. This lets a V-major pool (e.g. SGLang's ``MambaPool``,
+    allocated ``[num_slots, HV, V, K]``) call this decode kernel in place --
+    with ``h0_indices`` scatter -- and NO transpose-copy."""
+    torch.manual_seed(42)
+    scale = K**-0.5
+
+    q = torch.randn(B, T, H, K, dtype=dtype)
+    k = torch.randn(B, T, H, K, dtype=dtype)
+    v = torch.randn(B, T, HV, V, dtype=dtype)
+    b = torch.randn(B, T, HV, dtype=dtype)
+    A_log = torch.randn(HV, dtype=torch.float32)
+    a = torch.randn(B, T, HV, dtype=torch.float32)
+    dt_bias = torch.randn(HV, dtype=torch.float32)
+    h0 = torch.randn(B, HV, K, V, dtype=dtype) * 0.1  # logical [N, HV, K, V]
+    idx = torch.randperm(B).to(torch.long)  # non-identity scatter into the pool
+
+    q, k, v, b, A_log, a, dt_bias, h0, idx = map(
+        lambda x: x.to(device),
+        (q, k, v, b, A_log, a, dt_bias, h0, idx),
+    )
+
+    def run(layout):
+        if layout == "hkv":
+            pool = torch.zeros(B, HV, K, V, dtype=dtype, device=device)
+            pool[idx] = h0
+        else:  # hvk: store the inner two dims transposed
+            pool = torch.zeros(B, HV, V, K, dtype=dtype, device=device)
+            pool[idx] = h0.transpose(-1, -2).contiguous()
+        out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q.clone(),
+            k=k.clone(),
+            v=v.clone(),
+            b=b.clone(),
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+            state_layout=layout,
+        )
+        state = pool[idx]  # final state written back in place
+        if layout == "hvk":
+            state = state.transpose(-1, -2).contiguous()
+        return out, state
+
+    o_hkv, s_hkv = run("hkv")
+    o_hvk, s_hvk = run("hvk")
+
+    tol = 0.005 if dtype == torch.bfloat16 else 0.002
+    assert_close("o", o_hkv, o_hvk, tol)
+    assert_close("final_state", s_hkv, s_hvk, tol)
+
+
+@pytest.mark.parametrize(
     ("H", "D", "mask_p", "cu_seqlens", "dtype"),
     [
         pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
