@@ -147,29 +147,36 @@ def _store_bf16_vec_g(vals_list, g_out, row_off_elems, idx, vec):
     g_out.store(my_off, bf16v, vec_size=vec)
 
 
-def _store_fp8_packed(vals_list, out_rsrc, row_base_bytes, idx, vec):
-    """Pack VEC fp32 -> VEC fp8 (e4m3fnuz) via cvt_pk_fp8_f32 and store.
+def _store_fp8_packed(vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False):
+    """Pack VEC fp32 -> VEC fp8 via cvt_pk_fp8_f32 and store.
 
     Emits one ``buffer_store_dwordx2`` per thread (VEC=8 -> 2 dwords = 8 bytes).
 
     Workaround for the e4m3fnuz NaN encoding 0x80: cvt_pk_fp8_f32 returns
     0x80 (NaN) for inputs that round to negative zero, which propagates
-    through downstream attention as NaN. Clamp v ? (-2^-8, 0) to +0 first.
+    through downstream attention as NaN. Clamp v in (-2^-8, 0) to +0 first.
+
+    On gfx950+ (OCP e4m3fn), 0x80 encodes -0 (not NaN), so the clamp is
+    unnecessary.  Pass ``skip_fnuz_clamp=True`` to elide it and save ~4
+    ALU ops per element.
     """
     f32 = T.f32
     i32 = T.i32
-    c0 = arith.constant(0.0, type=f32)
-    c_neg_uf = arith.constant(-(2.0**-8), type=f32)
     c8 = arith.constant(8, type=i32)
 
-    safe = []
-    for v in vals_list:
-        vv = v.ir_value() if hasattr(v, "ir_value") else v
-        is_tn = arith.andi(
-            arith.cmpf(CmpFPredicate.OLT, vv, c0),
-            arith.cmpf(CmpFPredicate.OGT, vv, c_neg_uf),
-        )
-        safe.append(arith.select(is_tn, c0, vv))
+    if skip_fnuz_clamp:
+        safe = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
+    else:
+        c0 = arith.constant(0.0, type=f32)
+        c_neg_uf = arith.constant(-(2.0**-8), type=f32)
+        safe = []
+        for v in vals_list:
+            vv = v.ir_value() if hasattr(v, "ir_value") else v
+            is_tn = arith.andi(
+                arith.cmpf(CmpFPredicate.OLT, vv, c0),
+                arith.cmpf(CmpFPredicate.OGT, vv, c_neg_uf),
+            )
+            safe.append(arith.select(is_tn, c0, vv))
 
     # Pack each pair (s[2i], s[2i+1]) into a packed-fp8 i32, then
     # combine 4 fp8 into one i32 via cvt_pk_fp8_f32 (lane 0 + lane 1).
@@ -275,7 +282,8 @@ def _build_kernel(
     # The HW FP8 element dtype follows the arch (matches ``_fp8_const``):
     # gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn (max_pos=448).
     # ``emit_mx_e8m0_scale`` uses this to pick the right ``max_pos`` reciprocal.
-    _fp8_mx_dtype = _D.FP8_E4M3_FNUZ if get_hip_arch() == "gfx942" else _D.FP8_E4M3
+    _is_fnuz = get_hip_arch() == "gfx942"
+    _fp8_mx_dtype = _D.FP8_E4M3_FNUZ if _is_fnuz else _D.FP8_E4M3
 
     # Kernel name: only include flags that affect the compiled binary.
     # Default (not quant, not q_weighted) -> "qk_norm_rope_H16_D512_RD64_flydsl"
@@ -472,32 +480,35 @@ def _build_kernel(
                     else:
                         buffer_ops.buffer_store(scale_val, scale_rsrc, my_scale_off)
 
+            # ---- Common: scale-multiply for ALL threads (hoisted) ----
+            # This computation was previously duplicated inside both the
+            # ROPE and NOPE branches.  Hoisting it eliminates ~VEC ALU ops
+            # of redundant work in the divergent NOPE path.
+            scaled = []
+            for vi in range_constexpr(VEC):
+                xi = x_f32_vec[vi]
+                if const_expr(weighted):
+                    xi = xi * w_f32_vec[vi]
+                if const_expr(quant):
+                    scaled.append(xi * factor)
+                else:
+                    scaled.append(xi * rstd)
+
             is_rope = tid >= fx.Int32(ROPE_THREAD_LO)
             if is_rope:
-                # ---- ROPE path: 8 elements in this thread = 4 GPT-J pairs ----
+                # ---- ROPE path: cos/sin load + GPT-J pair rotation ----
                 rope_rel = tid - fx.Int32(ROPE_THREAD_LO)
                 cos_vec = load_vec(cos_div, rope_rel, layout=rope_lay, atom=rope_atom)
                 sin_vec = load_vec(sin_div, rope_rel, layout=rope_lay, atom=rope_atom)
                 cos_f32 = cos_vec.to(fx.Float32)
                 sin_f32 = sin_vec.to(fx.Float32)
 
-                # pre-rotate values: x * factor (fp8) or x * rstd (bf16),
-                # with optional kv weight.
-                pe = []
-                for vi in range_constexpr(VEC):
-                    xi = x_f32_vec[vi]
-                    if const_expr(weighted):
-                        xi = xi * w_f32_vec[vi]
-                    if const_expr(quant):
-                        pe.append(xi * factor)
-                    else:
-                        pe.append(xi * rstd)
-
-                # GPT-J pair rotate: new_2k = e*c - o*s; new_2k+1 = e*s + o*c
+                # GPT-J pair rotate on pre-scaled values:
+                # new_2k = e*c - o*s; new_2k+1 = e*s + o*c
                 rope_out = []
                 for k in range_constexpr(PAIRS_PER_THREAD):
-                    e = pe[2 * k]
-                    o = pe[2 * k + 1]
+                    e = scaled[2 * k]
+                    o = scaled[2 * k + 1]
                     c = cos_f32[k]
                     s = sin_f32[k]
                     rope_out.append(e * c - o * s)
@@ -505,14 +516,11 @@ def _build_kernel(
 
                 if const_expr(quant):
                     rsrc, row_base = fp8_out_rsrc
-                    _store_fp8_packed(rope_out, rsrc, row_base, tid, VEC)
+                    _store_fp8_packed(rope_out, rsrc, row_base, tid, VEC,
+                                      skip_fnuz_clamp=not _is_fnuz)
                 else:
                     _store_bf16_vec_g(rope_out, bf16_out_g, bf16_out_row_off, tid, VEC)
                     if const_expr(kv_write):
-                        # Fused SWA scatter: same post-norm/rope bf16 row also
-                        # lands in swa_kv[slot, pos%cache_size, :]. swa_out_g
-                        # base is already shifted to that ring slot. Predicate
-                        # on do_swa (batch_id >= 0) to skip CG-pad tokens.
                         if do_swa:
                             _store_bf16_vec_g(
                                 rope_out,
@@ -522,19 +530,11 @@ def _build_kernel(
                                 VEC,
                             )
             else:
-                # ---- NOPE path: direct scaled store ----
-                scaled = []
-                for vi in range_constexpr(VEC):
-                    xi = x_f32_vec[vi]
-                    if const_expr(weighted):
-                        xi = xi * w_f32_vec[vi]
-                    if const_expr(quant):
-                        scaled.append(xi * factor)
-                    else:
-                        scaled.append(xi * rstd)
+                # ---- NOPE path: store pre-scaled values directly ----
                 if const_expr(quant):
                     rsrc, row_base = fp8_out_rsrc
-                    _store_fp8_packed(scaled, rsrc, row_base, tid, VEC)
+                    _store_fp8_packed(scaled, rsrc, row_base, tid, VEC,
+                                      skip_fnuz_clamp=not _is_fnuz)
                 else:
                     _store_bf16_vec_g(scaled, bf16_out_g, bf16_out_row_off, tid, VEC)
                     if const_expr(kv_write):
