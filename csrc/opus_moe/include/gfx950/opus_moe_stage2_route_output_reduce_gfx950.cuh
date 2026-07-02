@@ -55,11 +55,10 @@ opus_moe_stage2_route_reduce_pack_bf16x4(const float* acc, int base)
 }
 #endif
 
-// ROUTE_FP8 selects the packed MXFP8 path at compile time. Unlike decode, this
-// reduce kernel is small enough that specializing the output format trims the
-// unused bf16 path without increasing VGPR pressure.
-// TOPK > 0  -> slot loop bound is a compile-time constant so the whole loop
-//              unrolls and issues the route loads before the final reduction.
+// ROUTE_FP8 selects the packed MXFP8 path at compile time; specializing the
+// output format trims the unused bf16 path without adding VGPR pressure.
+// TOPK > 0  -> compile-time slot loop bound: loop unrolls, issuing route loads
+//              before the final reduction.
 // TOPK == 0 -> fallback to the runtime kargs.topk loop.
 template<int BLOCK_N, int BLOCK_THREADS, int TOPK = 0, bool ROUTE_FP8 = false>
 __global__ __launch_bounds__(BLOCK_THREADS, 4) void
