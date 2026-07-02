@@ -92,9 +92,8 @@ def get_gfx_runtime() -> str:
 # Backfill map for legacy tuned configs that predate the `gfx` column.
 # These cu_num values were only ever tuned on a single arch historically:
 #   256 -> gfx950, 80/304 -> gfx942.
-# Newer archs that happen to share a cu_num (e.g. gfx1250 also reports 256)
-# are always written with their real arch by the tuner, so they never rely on
-# this backfill.
+# Newer archs sharing a cu_num (e.g. gfx1250 also reports 256) are written
+# with their real arch by the tuner, so they never hit this backfill.
 _LEGACY_CU_NUM_TO_GFX = {
     256: "gfx950",
     80: "gfx942",

@@ -79,10 +79,8 @@ def _ptr_view_safe(t: torch.Tensor):
     return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 
-# Keep the generic auto-generated catalog aligned with the upstream FlyDSL
-# reference tuning space. The wider local one-off search space introduced
-# gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192),
-# and higher split-K values are now capped at 8 for better accuracy.
+# Catalog kept aligned to the upstream FlyDSL reference tuning space. The wider local search introduced gfx950-faulting
+# candidates (e.g. tile_k=160, tile_n=160/192); split-K is capped at 8 for accuracy.
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 128, 256)
@@ -950,9 +948,7 @@ def flydsl_hgemm(
     return out
 
 
-# ---------------------------------------------------------------------------
 # FlyDSL preshuffle GEMM kernel management
-# ---------------------------------------------------------------------------
 
 _flydsl_compile_fn = None
 _flydsl_import_done = False

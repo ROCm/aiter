@@ -79,8 +79,7 @@ def _bwd_preprocess(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
 
-    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout),
-    # so address each with its own strides.
+    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout), so address each with its own strides.
     offs_o = (
         bid * stride_o_b
         + hid * stride_o_h
@@ -425,8 +424,7 @@ def _bwd_dq_inner(
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
-        # end_n is needed because the end of causal True might not be perfectly
-        # aligned with the end of the block
+        # end_n is needed because the end of causal True might not be perfectly aligned with the end of the block
         mask_n = offs_n < end_n
         if DEBUG_TRITON_DETAIL:
             print(
@@ -769,10 +767,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
 
         # q > k: diretcly skip all the way until the start of causal block
         start_delta_q_gt_k = delta_qk
-        # q < k: some blocks will have no Masked block, other needs to re-calc
-        # starting position
-        # delta_qk is negative so flip it, only multiple of BLOCK_N can skip the
-        # masked op
+        # q < k: some blocks will have no Masked block, other needs to re-calc starting position
+        # delta_qk is negative so flip it, only multiple of BLOCK_N can skip the masked op
         num_blocks_skip = -delta_qk // BLOCK_N1
         delta_aligned = (num_blocks_skip + 1) * BLOCK_N1 + delta_qk
         start_delta_q_lt_k = delta_aligned // BLOCK_M1 * BLOCK_M1
@@ -835,9 +831,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             else:
                 start_m = max(start_n + delta_qk, 0)
                 start_m = start_m // BLOCK_M1 * BLOCK_M1
-                # because we might shift the masked blocks up, we are deeper into
-                # the masked out region, so we would potentially increase the total
-                # steps with masked operation to get out of it
+                # because we might shift the masked blocks up, we are deeper into the masked out region, so we would
+                # potentially increase the total steps with masked operation to get out of it
                 residue_m = max(start_n + delta_qk - start_m, 0)
                 len_m = BLOCK_N1 + residue_m
                 if DEBUG_TRITON:

@@ -31,15 +31,11 @@ launcher for callers who already have all buffers and want the lowest-overhead
 path.
 """
 
-# NOTE: do NOT add `from __future__ import annotations` to this file.
-# PEP 563 turns all annotations into strings, which defeats flydsl's
-# JitFunction._make_cache_key runtime detection:
-#   is_runtime = hasattr(ann, "__get_c_pointers__")
-# A string like 'fx.Int32' fails that check, so flydsl treats the
-# `kv_in_row_stride` and `num_tokens` Int32 parameters as compile-time
-# constants and embeds their VALUE in the cache key. Every distinct
-# batch size / KV stride then triggers a fresh ~30-70ms JIT compile
-# instead of hitting the in-memory CallState cache.
+# NOTE: do NOT add `from __future__ import annotations`. PEP 563 stringifies
+# annotations, defeating flydsl's JitFunction._make_cache_key runtime detection
+# (hasattr(ann, "__get_c_pointers__")): the Int32 params kv_in_row_stride/
+# num_tokens then become compile-time constants baked into the cache key, so
+# every distinct batch size / KV stride forces a fresh ~30-70ms JIT compile.
 
 import math
 from functools import lru_cache
@@ -47,13 +43,10 @@ from typing import Optional, Tuple
 
 import torch
 
-# NOTE: ``aiter.utility.dtypes`` transitively imports ``aiter.ops.enum``,
-# whose ``ActivationType = type(_ActivationType(0))`` triggers a JIT call
-# into ``module_aiter_core``. That JIT module is not yet built when
-# setup.py's AOT-compile pass walks the package, so importing dtypes at
-# module load time crashes setup with ``KeyError: 'module_aiter_core'``.
-# Defer the import until the first runtime call instead -- sibling modules
-# (moe_kernels._get_dtypes, gemm_kernels._get_dtypes) use the same pattern.
+# NOTE: ``aiter.utility.dtypes`` transitively triggers a module_aiter_core JIT
+# call (via aiter.ops.enum ActivationType), which isn't built during setup.py's
+# AOT pass -> KeyError at module load. Defer the import to first runtime call
+# (same pattern as moe_kernels/gemm_kernels._get_dtypes).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -66,10 +59,8 @@ from flydsl._mlir.dialects import llvm, rocdl
 
 from .tensor_shim import GTensor, _to_raw, _run_compiled
 
-# JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
-# pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
-# access; we only pull the int classes here so module import stays JIT-free
-# (mirrors the FlyDSL AOT-friendly pattern in ``quant_utils``).
+# JIT-free MX-format int mirrors only (pybind11 MxScaleRoundMode/MxDtype
+# lazy-load on access); keeps module import JIT-free, as in quant_utils.
 from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
     MxDtypeInt as _D,
@@ -99,7 +90,7 @@ def _cached_from_dlpack(t: torch.Tensor):
     return adaptor
 
 
-# --- shape constants (gfx1250 wave32) -----------------------------------------
+# shape constants (gfx1250 wave32)
 BLOCK_THREADS = 32  # 1 wave32 on RDNA4/gfx1250
 
 # SQRT2 has no aiter dependency, so it stays at module level.
@@ -130,11 +121,11 @@ def _fp8_const():
     }
 
 
-# --- supported quant-group sizes (1 x group_size block-scales) --------------
+# supported quant-group sizes (1 x group_size block-scales)
 # group_size == head_dim -> per-row scale (single scale per token-head).
 GROUP_SIZE_OPTIONS = (32, 64, 128)
 
-# --- scale-dtype constants --------------------------------------------------
+# scale-dtype constants
 SCALE_DTYPE_FP32 = "fp32"
 SCALE_DTYPE_E8M0 = "e8m0"
 SCALE_DTYPE_OPTIONS = (SCALE_DTYPE_FP32, SCALE_DTYPE_E8M0)
@@ -145,9 +136,7 @@ _TORCH_DTYPE_FOR_SCALE = {
 }
 
 
-# ============================================================================
 # Store helpers (module-level so they're easy to reuse / unit-test)
-# ============================================================================
 
 
 def _store_bf16_vec(vals_list, out_rsrc, row_base_bytes, idx, vec):
@@ -229,9 +218,7 @@ def _store_fp8_packed(vals_list, out_rsrc, row_base_bytes, idx, vec):
     buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
 
 
-# ============================================================================
 # Kernel builder
-# ============================================================================
 
 
 def _build_kernel(
@@ -278,9 +265,8 @@ def _build_kernel(
         "supported set: {2, 4, 8, 16}."
     )
 
-    # --- quant-group layout ------------------------------------------------
-    # group_size must divide D evenly AND be a multiple of VEC (so a single
-    # thread's VEC-wide slice never crosses a group boundary).
+    # quant-group layout: group_size must divide D evenly AND be a multiple of
+    # VEC (so a thread's VEC-wide slice never crosses a group boundary).
     assert (
         group_size > 0 and D % group_size == 0
     ), f"group_size {group_size} must divide head_dim {D}"
@@ -347,10 +333,9 @@ def _build_kernel(
         i32 = T.i32
         fm_fast = arith.FastMathFlags.fast
 
-        # --- vector load helpers (generalized for VEC ∈ {2..16}) ---
-        # CopyAtom-based loads work for VEC ≤ 8 (BufferCopy128b = 16 bytes
-        # = 8 bf16). For VEC=16 (32 bytes/thread), we use raw buffer_load
-        # split into dwordx4 chunks, matching the compress_attn gfx1250 pattern.
+        # vector load helpers (generalized for VEC ∈ {2..16}): CopyAtom loads work for VEC ≤ 8 (BufferCopy128b = 16
+        # bytes = 8 bf16); VEC=16 (32 bytes/thread) uses raw buffer_load split into dwordx4 (compress_attn gfx1250
+        # pattern).
 
         # Rope cos/sin: PAIRS_PER_THREAD bf16 pairs.
         # VEC=16 → PAIRS=8 → 16 bytes → BufferCopy128b.
@@ -364,9 +349,8 @@ def _build_kernel(
             rope_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
         rope_lay = fx.make_layout(PAIRS_PER_THREAD, 1)
 
-        # Full-row loads via CopyAtom (for weight tensors).
-        # VEC ≤ 8 → BufferCopy128b (16 bytes) is sufficient.
-        # VEC = 16 → need 32 bytes; use raw buffer_load split instead.
+        # Full-row loads (weight tensors): VEC ≤ 8 → BufferCopy128b (16 bytes);
+        # VEC = 16 → 32 bytes, use raw buffer_load split instead.
         full_lay = fx.make_layout(VEC, 1)
         if const_expr(VEC <= 8):
             full_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
@@ -851,9 +835,7 @@ def _build_kernel(
     return launch_qk_norm_rope_quant
 
 
-# ============================================================================
 # Cached compile + public API
-# ============================================================================
 
 _DEFAULT_COMPILE_HINTS = {
     "waves_per_eu": 8,

@@ -135,8 +135,7 @@ class TestTunePipeline(unittest.TestCase):
             "a8w8_blockscale": {
                 "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
                 "header": ["M", "N", "K"],
-                # Use the B-preshuffle ASM path to avoid expensive CK JIT builds
-                # in the smoke pipeline.
+                # Use the B-preshuffle ASM path to avoid expensive CK JIT builds in the smoke pipeline.
                 "shapes": [(16, 1536, 7168)],
                 "shapes_mp1": [(16, 1536, 7168)],
                 "keys": ["cu_num", "M", "N", "K"],
@@ -738,9 +737,8 @@ class TestOnlineTuneE2E(unittest.TestCase):
         env = os.environ.copy()
         env["AITER_ONLINE_TUNE"] = "1"
         env["AITER_CONFIG_FMOE"] = tuned_csv
-        # Force subprocess to import aiter from this checkout, not any editable
-        # install on PYTHONPATH (e.g. an older /app/aiter-test with the stale
-        # fmoe_2stages/tune.py online-tune path).
+        # Force subprocess to import aiter from this checkout, not any editable install on PYTHONPATH (e.g. an older
+        # /app/aiter-test with the stale fmoe_2stages/tune.py online-tune path).
         env["PYTHONPATH"] = AITER_ROOT + os.pathsep + env.get("PYTHONPATH", "")
 
         try:

@@ -34,9 +34,8 @@ AITER_DISABLE_KERNARG_PRELOAD = (
 
 
 def is_experimental_enabled() -> bool:
-    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
-    # any other integer value as enabled. Non-numeric strings are treated as
-    # disabled to avoid accidentally turning on experimental code paths.
+    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled, any other integer value as enabled.
+    # Non-numeric strings are treated as disabled to avoid accidentally turning on experimental code paths.
     val = os.environ.get("AITER_ENABLE_EXPERIMENTAL", "0")
     try:
         return int(val) != 0
@@ -243,9 +242,8 @@ class AITER_CONFIG(object):
             for c in all_cols:
                 if c not in df.columns:
                     if c == "gfx" and "cu_num" in df.columns:
-                        # Legacy config without a gfx column: infer the arch from
-                        # cu_num (256->gfx950, 80/304->gfx942) so archs that share
-                        # a cu_num stay distinguishable after the merge.
+                        # Legacy config without a gfx column: infer the arch from cu_num (256->gfx950, 80/304->gfx942)
+                        # so archs that share a cu_num stay distinguishable after the merge.
                         from aiter.jit.utils.chip_info import gfx_from_cu_num
 
                         df[c] = df["cu_num"].map(gfx_from_cu_num)
@@ -609,10 +607,9 @@ def get_module_custom_op(md_name: str) -> None:
 
 
 def _so_offload_archs(so_path):
-    # parse the gfx targets embedded in a built module .so from its clang
-    # offload-bundle entry ids (e.g. the 'gfx942' in '...amdhsa--gfx942').
-    # the .so is mmap'd, not read whole, since CK modules can be hundreds of MB.
-    # an empty set means host-only module, missing file, or unreadable.
+    # parse the gfx targets embedded in a built module .so from its clang offload-bundle entry ids (e.g. the 'gfx942' in
+    # '...amdhsa--gfx942'). the .so is mmap'd, not read whole, since CK modules can be hundreds of MB. an empty set
+    # means host-only module, missing file, or unreadable.
     import mmap
 
     archs = set()
@@ -627,10 +624,9 @@ def _so_offload_archs(so_path):
 
 
 def _needs_arch_rebuild(md_name):
-    # a prebuilt .so is a valid host extension on any GPU, so importing one
-    # built for the wrong arch succeeds and only faults later at kernel launch.
-    # if the .so carries device code for other arches but NOT the running GPU,
-    # force a JIT rebuild for the native arch instead.
+    # a prebuilt .so is a valid host extension on any GPU, so importing one built for the wrong arch succeeds and only
+    # faults later at kernel launch. if the .so carries device code for other arches but NOT the running GPU, force a
+    # JIT rebuild for the native arch instead.
     try:
         cur = get_gfx_runtime()
     except Exception:
@@ -900,9 +896,8 @@ def build_module(
                 f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
             )
 
-        # ASM kernel debug instrumentation (host prints + post-launch sync) in
-        # *.cu is compiled only when AITER_ASM_DEBUG=1, mirroring poc_kl's
-        # `compile-dbg` / -DASM_DEBUG. Default builds stay free of debug code.
+        # ASM kernel debug instrumentation (host prints + post-launch sync) in *.cu is compiled only when
+        # AITER_ASM_DEBUG=1, mirroring poc_kl's `compile-dbg` / -DASM_DEBUG. Default builds stay free of debug code.
         if int(os.environ.get("AITER_ASM_DEBUG", "0")) != 0:
             if not any("ASM_DEBUG" in f for f in flags_extra_hip):
                 flags_hip.append("-DASM_DEBUG")
@@ -941,8 +936,8 @@ def build_module(
                 f"{CK_3RDPARTY_DIR}/library/include",
             ]
         else:
-            # When CK is not available, define AITER_CK_FREE for all modules
-            # so headers use lightweight shims instead of ck_tile/core.hpp
+            # When CK is not available, define AITER_CK_FREE for all modules so headers use lightweight shims instead of
+            # ck_tile/core.hpp
             flags_cc.append("-DAITER_CK_FREE=1")
 
         if os.path.isdir(HIP_KITTENS_DIR):
@@ -1114,19 +1109,16 @@ def get_args_of_build(ops_name: str, exclude=[]):
         "hip_clang_path": None,
         "blob_gen_cmd": "",
         "third_party": [],
-        # Optional per-source HIP flags. Maps a source path or fnmatch
-        # glob (e.g. "*_device.cu") to a list of additional flags that
-        # ninja will append to that single TU's $cuda_post_cflags. Used
-        # by opus_gemm to apply -D__HIPCC_RTC__ to kernel-only TUs while
-        # leaving dispatcher / pybind TUs untouched.
+        # Optional per-source HIP flags. Maps a source path or fnmatch glob (e.g. "*_device.cu") to a list of additional
+        # flags that ninja will append to that single TU's $cuda_post_cflags. Used by opus_gemm to apply -D__HIPCC_RTC__
+        # to kernel-only TUs while leaving dispatcher / pybind TUs untouched.
         "flags_extra_hip_per_source": {},
     }
 
     def convert(d_ops: dict):
         for k, val in d_ops.items():
-            # `flags_extra_hip_per_source` is a dict-valued field
-            # whose string elements are plain compile flags (no env-var
-            # interpolation, no `eval`). Pass it through unchanged.
+            # `flags_extra_hip_per_source` is a dict-valued field whose string elements are plain compile flags (no
+            # env-var interpolation, no `eval`). Pass it through unchanged.
             if k == "flags_extra_hip_per_source":
                 continue
             if isinstance(val, list):

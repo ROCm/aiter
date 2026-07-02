@@ -38,9 +38,8 @@ from flydsl.expr import arith
 from flydsl.expr.typing import T
 from flydsl.expr.arith import CmpIPredicate
 
-# Bare-int mirrors of MxScaleRoundMode / MxDtype (mx_quant_utils.h). Same
-# numeric values as the pybind11 enum classes, but importing them is
-# JIT-free, which is required at FlyDSL AOT time.
+# Bare-int mirrors of MxScaleRoundMode / MxDtype (mx_quant_utils.h): same
+# numeric values as the pybind11 enums, but JIT-free (required at FlyDSL AOT).
 from aiter.utility.mx_types import (
     MxDtypeInt as _D,
     MxScaleRoundModeInt as _M,
@@ -126,17 +125,13 @@ def emit_mx_e8m0_scale(
     target_max_pow2_i32 = arith.constant(target_max_pow2, type=T.i32)
 
     def _clamp_u8(x):
-        # Defensive clamp into the E8M0 storage range [0, 0xFF]. Pathological
-        # inputs (denormals, fp32 inf, mantissa bump from 0xFF -> 0x100) can
-        # otherwise corrupt the stored uint8.
+        # Defensive clamp into the E8M0 storage range [0, 0xFF]. Pathological inputs (denormals, fp32 inf, mantissa bump
+        # from 0xFF -> 0x100) can otherwise corrupt the stored uint8.
         return arith.minsi(arith.maxsi(x, c0_i32), c0xFF_i32)
 
     if mode_int == _M.RoundUp:
-        # ceil_pow2(amax / max_pos): multiply by reciprocal of max_pos to get
-        # the working value, then bump the exponent if any mantissa bit is
-        # set. Bit-equivalent to HIP ``aiter::fp_f32_to_e8m0_scale<RoundUp,
-        # FP4_E2M1>`` and to PyTorch torchao ``_to_mx_rceil`` (modulo
-        # the GPU-vs-CPU fp32 ULP boundary effects documented in the PR).
+        # ceil_pow2(amax / max_pos): scale by 1/max_pos, then bump the exponent if any mantissa bit is set.
+        # Bit-equivalent to HIP fp_f32_to_e8m0_scale<RoundUp, FP4_E2M1> / torchao _to_mx_rceil.
         c_inv_max_pos = arith.constant(max_pos_inv_bits, type=T.i32)
         inv_max_pos_f32 = c_inv_max_pos.bitcast(T.f32)
         working = local_max * inv_max_pos_f32
@@ -159,8 +154,7 @@ def emit_mx_e8m0_scale(
         return _clamp_u8(biased_exp - target_max_pow2_i32)
 
     if mode_int == _M.Ceil:
-        # ceil_pow2(amax) / 2^target_max_pow2: same as RoundDown but bump
-        # the exponent if any mantissa bit is set.
+        # ceil_pow2(amax) / 2^target_max_pow2: same as RoundDown but bump the exponent if any mantissa bit is set.
         amax_i32 = local_max.bitcast(T.i32)
         mantissa = amax_i32 & c0x7FFFFF_i32
         biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32

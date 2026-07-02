@@ -647,10 +647,8 @@ def attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
             atol_floor = 5e-1 if is_forward else 1.0
             rtol_floor = 1e-1
         elif has_dropout:
-            # Dropout scaling (1/(1-p)) amplifies precision errors in the
-            # fused kernel differently than in the reference. The baseline
-            # between two references uses the same mask so it underestimates
-            # the kernel-vs-reference gap.
+            # Dropout scaling (1/(1-p)) amplifies precision errors in the fused kernel differently than in the reference.
+            # The baseline between two references uses the same mask so it underestimates the kernel-vs-reference gap.
             mult = 2
             atol_floor = 1e-1 if is_forward else 2.0
             rtol_floor = 1e-1

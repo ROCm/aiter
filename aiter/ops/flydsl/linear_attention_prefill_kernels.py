@@ -41,7 +41,7 @@ __all__ = [
 ]
 
 
-# -- K5 host wrapper (FlyDSL kernel + rule-based BV selection) ------------
+# K5 host wrapper (FlyDSL kernel + rule-based BV selection)
 
 _compiled_kernels = {}
 _BV_CANDIDATES = [16, 32, 64]
@@ -355,10 +355,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
     g_log2_scaled = bool(use_exp2)
 
-    # SSM state dtype: derived from ``initial_state.dtype`` when provided,
-    # otherwise from ``state_dtype`` kwarg, otherwise default f32 (matches
-    # the legacy behaviour). Only ``torch.float32`` and ``torch.bfloat16``
-    # are supported by the kernel.
+    # SSM state dtype: from initial_state.dtype if given, else state_dtype kwarg,
+    # else f32. Kernel supports only torch.float32 and torch.bfloat16.
     if initial_state is not None:
         resolved_state_dtype = initial_state.dtype
         if state_dtype is not None and state_dtype != resolved_state_dtype:
@@ -388,14 +386,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
         kernel_cu_seqlens = None
     else:
-        # Pass the ORIGINAL (cache-stable) cu_seqlens + the decode ints into
-        # the cached prologue helpers. They all key on the original tensor's
-        # identity, so chunk_offsets / NT / the rebased kernel cu_seqlens are
-        # computed ONCE per (cu_seqlens_id, BT, num_decodes, num_decode_tokens)
-        # tuple and every subsequent forward is a pure cache hit -> no
-        # per-forward D2H. (Passing a freshly-rebased tensor instead would key
-        # the offset/num-chunk caches on an unstable identity and re-fire the
-        # .tolist()/int() syncs every call.)
+        # Pass the ORIGINAL (cache-stable) cu_seqlens + decode ints to the cached prologue helpers, which key on the
+        # tensor identity: offsets/NT/rebased cu_seqlens compute once per (cu_seqlens_id, BT, num_decodes,
+        # num_decode_tokens), later forwards are cache hits (no per-forward D2H). A freshly-rebased tensor would break
+        # caching and re-fire host syncs.
         chunk_offsets = prepare_chunk_offsets(
             cu_seqlens, BT, num_decodes, num_decode_tokens
         )
@@ -421,9 +415,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
 
-    # G layout is fixed to head-major [B, H, T_flat] (matches Triton VK /
-    # HIP K5). The kernel reads ``g`` with stride-1 along the T dim; require
-    # the caller to provide a contiguous head-major tensor.
+    # G layout is fixed to head-major [B, H, T_flat] (matches Triton VK / HIP K5). The kernel reads ``g`` with stride-1
+    # along the T dim; require the caller to provide a contiguous head-major tensor.
     if g is not None:
         assert g.is_contiguous(), (
             "FlyDSL K5: ``g`` must be contiguous (head-major [B, H, T_flat] "
@@ -439,11 +432,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         )
     g_arg = g if g is not None else dummy
 
-    # Mirror the Triton VK wrapper: when ``use_exp2=True`` the K5 kernel
-    # interprets ``gk`` in log2 space, so pre-scale by log2(e) here. The
-    # kernel-side ``_fast_exp`` for ``gk`` is shared with the ``g`` path;
-    # ``g`` itself must already be log2-scaled by the K1+K2 producer when
-    # use_exp2 is on.
+    # Mirror the Triton VK wrapper: when use_exp2=True the kernel reads gk in log2 space, so pre-scale by log2(e) here
+    # (shares the g path's _fast_exp). g itself must already be log2-scaled by the K1+K2 producer when use_exp2.
     if gk is not None:
         gk = gk.contiguous()
         if g_log2_scaled:
@@ -452,10 +442,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     h0_arg = initial_state if initial_state is not None else dummy
     ht_arg = final_state if final_state is not None else dummy
     vn_arg = v_new_buf
-    # cu_arg / co_arg are the kernel-facing (rebased) offsets, narrowed to
-    # int32. `.to(torch.int32)` is a device-to-device cast (no host sync); the
-    # resulting fresh objects are consumed only by the kernel launch, so their
-    # identity does not matter for the @tensor_cache helpers above.
+    # cu_arg / co_arg: kernel-facing (rebased) offsets narrowed to int32. .to() is a device-to-device cast (no host
+    # sync); consumed only by the launch, so their identity doesn't matter for the @tensor_cache helpers above.
     cu_arg = (
         kernel_cu_seqlens.to(torch.int32)
         if kernel_cu_seqlens is not None

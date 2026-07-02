@@ -87,14 +87,10 @@ def _sage_fwd_no_mask(
                 v = tl.load(v_ptrs)
 
         # -- compute qk ----
-        # Optimization (vs. eagerly scaled qk): defer the (q_descale * k_descale)
-        # descale until softmax so it can be fused with the m_ij subtract into a
-        # single FMA. Mathematically equivalent because scale > 0:
+        # Defer (q_descale * k_descale) descale until softmax so it fuses with the
+        # m_ij subtract into one FMA. Valid because scale > 0:
         #   max(qk_int * scale) == max(qk_int) * scale
         #   (qk_int * scale) - m_ij == fma(qk_int, scale, -m_ij)
-        # The fast path (no bias/alibi) skips the per-element scale multiply that
-        # the original code emitted as 64 v_fma_f32 with a zero addend, and instead
-        # folds the scale into the subtract from m_ij as a real fused FMA.
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
 
@@ -190,8 +186,7 @@ def _sage_fwd_no_mask(
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
-        # alpha is an adjustment factor for acc and li as we loop and find new maxes
-        # store the diff in maxes to adjust acc and li as we discover new maxes
+        # alpha rescales acc/l_i by the max diff as new maxes are discovered
         if USE_BIAS:
             m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
         else:
@@ -288,12 +283,8 @@ def _sage_fwd_blocksparse_nomask(
                 v = tl.load(v_ptrs)
 
         # -- compute qk ----
-        # Same optimization as in `_sage_fwd_no_mask`: defer the
-        # (q_descale * k_descale) descale until softmax so it can be fused
-        # with the m_ij subtract into a single FMA. Mathematically equivalent
-        # because scale > 0:
-        #   max(qk_int * scale) == max(qk_int) * scale
-        #   (qk_int * scale) - m_ij == fma(qk_int, scale, -m_ij)
+        # Same optimization as `_sage_fwd_no_mask`: defer the (q_descale * k_descale) descale until softmax so it fuses
+        # with the m_ij subtract into one FMA (valid because scale > 0).
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
 
@@ -460,11 +451,9 @@ def _sage_fwd_blocksparse_mask(
             v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         # -- compute qk ----
-        # Same optimization as `_sage_fwd_no_mask`: defer the
-        # (q_descale * k_descale) descale until softmax so it can be fused
-        # with the m_ij subtract into a single FMA. Padding positions are
-        # masked to -inf, which is invariant under multiplication by the
-        # positive scale, so we can apply the mask in either domain.
+        # Same optimization as `_sage_fwd_no_mask`: defer the (q_descale * k_descale) descale until softmax to fuse it
+        # into one FMA. Padding masked to -inf is invariant under the positive scale, so the mask can be applied in
+        # either domain.
         qk_int = tl.dot(q, k)
         scale = q_descale * k_descale
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
@@ -673,91 +662,69 @@ def _sage_fwd_mask(
 
         if USE_SLIDING_WINDOW:
             if IS_CAUSAL:
-                # ========== CAUSAL SLIDING WINDOW MASKING ==========
-                # For causal sliding window, we need to apply both constraints:
+                # Causal sliding window: apply both constraints (True = cannot attend)
                 # 1. Causal: col_idx <= row_idx + (seqlen_k - seqlen_q)
-                # 2. Sliding window: row_idx - window_left <= col_idx <= row_idx + window_right
-
-                # Get positions
+                # 2. Window: row_idx - window_left <= col_idx <= row_idx + window_right
                 row_idx = offs_m  # Query positions
                 col_idx = kv_offs_n  # Key positions
 
-                # Expand for broadcasting
                 row_idx_expanded = row_idx[:, None]  # [BLOCK_M, 1]
                 col_idx_expanded = col_idx[None, :]  # [1, BLOCK_N]
 
-                # Apply causal constraint: can only attend to positions before or at the diagonal
                 causal_offset = seqlen_k - seqlen_q
                 causal_mask = col_idx_expanded > (row_idx_expanded + causal_offset)
 
-                # Apply sliding window constraint
                 if WINDOW_SIZE_LEFT < 0:
                     # Only right window constraint
                     window_mask = col_idx_expanded > (
                         row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
                     )
                 else:
-                    # Both left and right window constraints
-                    # Adjust window bounds by causal offset
+                    # Both bounds, adjusted by causal offset
                     left_bound = row_idx_expanded + causal_offset - WINDOW_SIZE_LEFT
                     right_bound = row_idx_expanded + causal_offset + WINDOW_SIZE_RIGHT
 
-                    # Can't attend to positions outside the window
                     window_mask = (col_idx_expanded < left_bound) | (
                         col_idx_expanded > right_bound
                     )
 
-                # Final mask is the union of both constraints (True = cannot attend)
+                # Union of both constraints (True = cannot attend)
                 mask = causal_mask | window_mask
 
-                # Apply mask
                 qk = tl.where(mask, float("-inf"), qk)
             else:
-                # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
-                # Exactly matching reference construct_local_mask:
-                # row_idx = query positions, col_idx = key positions
-                # sk = seqlen_k, sq = seqlen_q
-
-                # Get positions
+                # Non-causal sliding window, matching reference construct_local_mask.
+                # sk = seqlen_k, sq = seqlen_q (no padding masks in this test)
                 row_idx = offs_m  # Query positions
                 col_idx = kv_offs_n  # Key positions
 
-                # sk and sq from reference (no padding masks in this test)
                 sk = seqlen_k
                 sq = seqlen_q
 
-                # Expand for broadcasting
                 row_idx_expanded = row_idx[:, None]  # [BLOCK_M, 1]
                 col_idx_expanded = col_idx[None, :]  # [1, BLOCK_N]
 
-                # Reference logic for mask computation
                 if WINDOW_SIZE_LEFT < 0:
-                    # Reference: return col_idx > row_idx + sk - sq + window_size[1]
+                    # Reference: col_idx > row_idx + sk - sq + window_size[1]
                     mask = col_idx_expanded > (
                         row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
                     )
                 else:
                     # Reference:
-                    # sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
-                    # return torch.logical_or(
-                    #     col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
-                    #     col_idx < row_idx + sk - sq - window_size[0],
-                    # )
-                    # Create sk tensor with proper shape for broadcasting
-                    # sk represents the key sequence length, which should be compared per column
+                    #   col_idx > min(row_idx + sk - sq + window_size[1], sk)
+                    #   or col_idx < row_idx + sk - sq - window_size[0]
+                    # sk compared per column, so shaped for broadcasting.
                     sk_full = tl.full((1, BLOCK_N), sk, dtype=tl.int32)
 
-                    # Compute boundaries
                     right_bound_val = row_idx_expanded + sk - sq + WINDOW_SIZE_RIGHT
                     right_bound = tl.minimum(right_bound_val, sk_full)
                     left_bound = row_idx_expanded + sk - sq - WINDOW_SIZE_LEFT
 
-                    # Mask where True = cannot attend (matching reference)
+                    # True = cannot attend (matching reference)
                     mask = (col_idx_expanded > right_bound) | (
                         col_idx_expanded < left_bound
                     )
 
-                # Apply mask (set to -inf where mask is True)
                 qk = tl.where(mask, float("-inf"), qk)
         else:
             if IS_CAUSAL:
@@ -777,12 +744,7 @@ def _sage_fwd_mask(
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
-        # scale and subtract max
-        # IMPORTANT: Handle the case where all values are -inf
-        # When m_ij = -inf and qk = -inf, subtraction gives NaN
-        # We need to handle this explicitly
-        # Check if this block has any valid values (m_ij != -inf)
-        # For rows where everything is -inf, set q_shifted to -inf (not NaN)
+        # Subtract max; for all-(-inf) rows, m_ij-qk would be NaN, so force -inf.
         q_shifted = tl.where(
             m_ij[:, None] == float("-inf"), float("-inf"), qk - m_ij[:, None]
         )
@@ -899,8 +861,7 @@ def _sage_fwd_mask(
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
 
         # -- update output accumulator --
-        # alpha is an adjustment factor for acc and li as we loop and find new maxes
-        # store the diff in maxes to adjust acc and li as we discover new maxes
+        # alpha rescales acc/l_i by the max diff as new maxes are discovered
         m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
         if USE_EXP2:
             # alpha = tl.math.exp2(m_diff * RCP_LN2)
@@ -1125,8 +1086,7 @@ def compute_block_masking(
         )
     else:
         if IS_CAUSAL:
-            # ========== CAUSAL MODE: Classify K Blocks ==========
-            # Calculate causal boundary for this Q block
+            # Causal mode: classify K blocks (causal boundary per Q block)
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
             # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
             #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
@@ -1139,10 +1099,7 @@ def compute_block_masking(
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
 
-            # ------------------------------------------------------------
-            # 1. figure out, in tokens, the right-most K position
-            #    this Q-block may attend to
-            # ------------------------------------------------------------
+            # 1. right-most K position (in tokens) this Q-block may attend to
             k_max_token = q_end + diag  # last visible K index
 
             # this Q-block is entirely above the diagonal ⇒ nothing to do
@@ -1151,22 +1108,14 @@ def compute_block_masking(
 
             k_max_token = tl.minimum(k_max_token, seqlen_k - 1)
 
-            # ------------------------------------------------------------
             # 2. translate token indices into K-block indices
-            # ------------------------------------------------------------
             last_visible_k_block = k_max_token // BLOCK_N
             n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
 
-            # ------------------------------------------------------------
-            # 3. classify those visible blocks
-            #    – we *never* skip or mask blocks in front, because causal
-            #      attention always starts at K0
-            #    – the back side can require several masked blocks:
-            #         • intersection of the causal diagonal with K-grid
-            #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
-            #         • plus one extra block if this Q-block stops in the
-            #           middle of a K-block or the last K-block is padded
-            # ------------------------------------------------------------
+            # 3. classify visible blocks. Causal never skips/masks the front (starts
+            #    at K0). Back side may need several masked blocks: the causal diagonal
+            #    intersection with K-grid (at most ⌈BLOCK_M/BLOCK_N⌉) plus one extra if
+            #    this Q-block stops mid-K-block or the last K-block is padded.
             padded_last_k = n_extra_tokens != 0
             is_modulo_mn = (not padded_last_k) & (seqlen_q % BLOCK_M == 0)
 
@@ -1177,9 +1126,7 @@ def compute_block_masking(
             n_front_masked_blocks = 0  # ditto
             n_full_blocks = n_visible_k_blocks - n_back_masked_blocks
         else:
-            # ========== NON-CAUSAL MODE ==========
-            # Without causal mask, all positions can attend to all positions
-            # Only need to handle the padding in the last block
+            # Non-causal mode: all positions attend to all; only last-block padding needs a mask.
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
             # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
@@ -1399,9 +1346,7 @@ def sage_fwd(
         )
         has_any_range = True  # unused in this branch
 
-    # ============================================================
-    #          PROGRAM EARLY EXIT (All K Blocks Skipped)
-    # ============================================================
+    # Program early exit: all K blocks skipped
     if not USE_BLOCK_SPARSE:
         total_visible_blocks = (
             n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
@@ -1448,15 +1393,12 @@ def sage_fwd(
             )
         return
 
-    # ============================================================
-    #         NORMAL PROCESSING (Some K Blocks Visible)
-    # ============================================================
+    # Normal processing: some K blocks visible
     """
     This program has visible K blocks to process.
     We'll use two calls to handle different block types efficiently.
     """
 
-    # Initialize for processing
     # Compute pointers for all the tensors used in this kernel.
     q_offset = (
         Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
@@ -1515,10 +1457,10 @@ def sage_fwd(
         q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :] < ACTUAL_BLOCK_DMODEL_QK)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
-    # ========== Process K Blocks: either three-phase (causal/window) or block-sparse ranges ==========
+    # Process K blocks: three-phase (causal/window) or block-sparse ranges
     if not USE_BLOCK_SPARSE:
-        # ========== Process MASKED K Blocks in the front ==========
-        # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
+        # Front masked K blocks.
+        # NOTE: guarded by USE_SLIDING_WINDOW (front masking is window-only) else the compiler crashes.
         if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
             block_min = n_front_skip_blocks * BLOCK_N
             block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
@@ -1578,7 +1520,7 @@ def sage_fwd(
                 ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             )
 
-        # ========== Process FULL K Blocks (Fast Path) ==========
+        # Full K blocks (fast path).
         if n_full_blocks > 0:
             block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
             block_max = (
@@ -1638,7 +1580,7 @@ def sage_fwd(
                 ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             )
 
-        # ========== Process MASKED K Blocks in the back ==========
+        # Back masked K blocks.
         if n_back_masked_blocks > 0:
             block_min = (
                 n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
@@ -1710,7 +1652,7 @@ def sage_fwd(
                 ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             )
     else:
-        # ========== USE_BLOCK_SPARSE: nomask then mask (last block) ==========
+        # Block-sparse: nomask then mask (last block).
         lut_start_val = tl.load(lut_start + lut_idx)
         acc, l_i, m_i = _sage_fwd_blocksparse_nomask(
             acc,
@@ -1813,9 +1755,7 @@ def sage_fwd(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
         )
 
-    # ============================================================
-    #                        EPILOGUE
-    # ============================================================
+    # Epilogue
     # For rows where m_i is still -inf, no keys were valid. Use l_i_safe to avoid
     # 1/l_i = inf and log(l_i) = -inf (and to guard l_i underflow) in all paths.
     invalid_mask = m_i == float("-inf")

@@ -11,8 +11,7 @@ If Iris is not available, importing this module will raise ImportError.
 """
 
 # Import all Iris-based communication primitives
-# If Iris is not installed, this import will fail and the entire
-# aiter.ops.triton.comms module will be unavailable
+# If Iris is not installed, this import will fail and the entire aiter.ops.triton.comms module will be unavailable
 from .iris import IrisCommContext, calculate_heap_size
 from .reduce_scatter import reduce_scatter
 from .all_gather import all_gather

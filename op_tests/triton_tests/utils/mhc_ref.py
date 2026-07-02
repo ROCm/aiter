@@ -35,9 +35,7 @@ __all__ = [
     "generate_mhc_post_inputs",
 ]
 
-# =============================================================================
 # PyTorch Reference Implementations
-# =============================================================================
 
 
 def mhc_torch(
@@ -235,8 +233,7 @@ def sinkhorn_knopp_asymmetric_exp_domain_torch(
 
     A = logits.to(torch.float32)
 
-    # First iter (asymmetric): softmax over the row (last dim) + eps, then
-    # divide by (col_sum + eps).
+    # First iter (asymmetric): softmax over the row (last dim) + eps, then divide by (col_sum + eps).
     row_max = A.amax(dim=-1, keepdim=True)  # (M, N, 1)
     P = torch.exp(A - row_max)
     row_sum = P.sum(dim=-1, keepdim=True)  # (M, N, 1)
@@ -317,9 +314,7 @@ def is_doubly_stochastic(P: torch.Tensor, tol: float = 1e-3) -> bool:
     return True
 
 
-# =============================================================================
 # Test Input Generation
-# =============================================================================
 
 
 def generate_mhc_inputs(
@@ -367,9 +362,7 @@ def generate_mhc_inputs(
     return x, phi, alpha_pre, alpha_post, alpha_res, bias, n
 
 
-# =============================================================================
 # Test Configurations
-# =============================================================================
 
 
 def get_test_shapes():

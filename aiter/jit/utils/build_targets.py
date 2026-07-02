@@ -28,14 +28,10 @@ GFX_MAP = {
     18: "gfx1250",
 }
 
-# Maps gfx arch to the default (SPX / full-GPU) CU count used when no live GPU is
-# present at build time (e.g. CI nodes with GPU_ARCHS set but no device visible).
-# For live GPU builds, get_cu_num() is used instead and correctly reflects the
-# actual visible CU count, including non-SPX partition modes (DPX / QPX / CPX)
-# and binned variants (e.g. MI308X is gfx942 but has fewer CUs than MI300X).
-# If building without a GPU for a binned or partitioned target, set CU_NUM
-# explicitly alongside GPU_ARCHS to override the default here.
-# Extend this table when adding support for new GPU targets.
+# Default (SPX / full-GPU) CU count per gfx arch, used only when no live GPU is
+# visible at build time; live builds use get_cu_num() (reflects partition modes
+# DPX/QPX/CPX and binned variants). For binned/partitioned targets without a GPU,
+# set CU_NUM alongside GPU_ARCHS. Extend this table for new GPU targets.
 GFX_CU_NUM_MAP = {
     "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
     "gfx950": 256,  # MI350

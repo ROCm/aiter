@@ -166,17 +166,8 @@ def _fwd_kernel(
         )
         qk *= sm_scale
         if SLIDING_WINDOW > 0:
-            # (cur_batch_ctx_len + offs_m[:, None]) are the positions of
-            # Q entries in sequence
-            # (start_n + offs_n[None, :]) are the positions of
-            # KV entries in sequence
-            # So the condition makes sure each entry in Q only attends
-            # to KV entries not more than SLIDING_WINDOW away.
-            #
-            # We can't use -inf here, because the
-            # sliding window may lead to the entire row being masked.
-            # This then makes m_ij contain -inf, which causes NaNs in
-            # exp().
+            # Keep each Q (pos cur_batch_ctx_len+offs_m) attending only to KV (pos start_n+offs_n) within SLIDING_WINDOW.
+            # Use -10000 not -inf so a fully-masked row doesn't make m_ij=-inf and NaN in exp().
             qk = tl.where(
                 (cur_batch_ctx_len + offs_m[:, None]) - (start_n + offs_n[None, :])
                 < SLIDING_WINDOW,

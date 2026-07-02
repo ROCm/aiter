@@ -44,10 +44,8 @@ def _gemm_a8w8_blockscale_kernel(
     M,
     N,
     K,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `stride_am` is how much to increase `a_ptr` by to get the element one row down (A has M rows).
     stride_am,
     stride_ak,
     stride_bk,
@@ -240,10 +238,8 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
     M,
     N,
     K,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `stride_am` is how much to increase `a_ptr` by to get the element one row down (A has M rows).
     stride_am,
     stride_ak,
     stride_bn,

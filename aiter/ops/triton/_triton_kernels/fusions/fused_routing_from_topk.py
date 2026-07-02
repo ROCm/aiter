@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# Triton kernels that convert FusedMoE topk outputs (topk_weights, topk_ids)
-# into the (gather_indx, scatter_indx, gate_scal, hist) routing data consumed
-# by triton_kernels.matmul_ogs. Three single-CTA kernels implement a counting
-# sort over (token, slot) pairs by their expert id; replaces ~12 small torch
-# ops (per-row sort, gather, two stable argsorts, advanced indexing, fp32
-# histc, plus dtype casts) with three kernel launches.
+# Triton kernels that convert FusedMoE topk outputs (topk_weights, topk_ids) into the (gather_indx, scatter_indx,
+# gate_scal, hist) routing data consumed by triton_kernels.matmul_ogs. Three single-CTA kernels implement a counting
+# sort over (token, slot) pairs by their expert id; replaces ~12 small torch ops (per-row sort, gather, two stable
+# argsorts, advanced indexing, fp32 histc, plus dtype casts) with three kernel launches.
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -64,8 +62,7 @@ def _fused_routing_from_topk_hist_kernel(
     """
     item_offs = tl.arange(0, BLOCK_NK)
     item_mask = item_offs < NK
-    # Clamp the offset for masked-out lanes to 0 so the pointer arithmetic
-    # below stays within the allocated buffers.
+    # Clamp the offset for masked-out lanes to 0 so the pointer arithmetic below stays within the allocated buffers.
     safe_item = tl.where(item_mask, item_offs, 0)
     global_expt = tl.load(topk_ids_ptr + safe_item, mask=item_mask, other=0).to(
         tl.int32
@@ -76,8 +73,7 @@ def _fused_routing_from_topk_hist_kernel(
         local_expt = tl.load(
             expert_map_ptr + safe_global_expt, mask=map_mask, other=-1
         ).to(tl.int32)
-        # Match reference semantics: invalid experts are redirected to bucket 0
-        # and later zeroed in gate_scal.
+        # Match reference semantics: invalid experts are redirected to bucket 0 and later zeroed in gate_scal.
         expt = tl.where(local_expt >= 0, local_expt, 0)
     else:
         expt = global_expt
@@ -161,10 +157,8 @@ def _fused_routing_from_topk_place_kernel(
 
     pos = tl.atomic_add(offset_ptr + expt, 1, mask=item_mask)
 
-    # Clamp pos for masked-out lanes — `pos` is undefined there, and
-    # `topk_indx_ptr + pos` / `gate_scal_ptr + pos` would otherwise be
-    # arbitrary addresses. The mask=False store doesn't write, but the
-    # address calc is still evaluated and may fault on OOB pages.
+    # Clamp pos for masked-out lanes: `pos` is undefined there and the address
+    # calc is still evaluated (even for mask=False stores), so it could fault OOB.
     safe_pos = tl.where(item_mask, pos, 0)
 
     # gate_indx[i]   = pos       (original_flat → expert_sorted_pos)

@@ -192,9 +192,8 @@ def run_benchmark(args: argparse.Namespace):
         num_kv_heads = k_input.shape[1]
         assert num_q_heads >= num_kv_heads
 
-        # Note: As far as I understand it, rotary_dim <= qk_rope_head_dim,
-        # with the latter being the portion of the query/key dim reserved for RoPE
-        # and the former being the number of dims that RoPE is actually applied to.
+        # Note: As far as I understand it, rotary_dim <= qk_rope_head_dim, with the latter being the portion of the
+        # query/key dim reserved for RoPE and the former being the number of dims that RoPE is actually applied to.
         # Please correct the following calculations if the above is incorrect.
 
         # per batch:

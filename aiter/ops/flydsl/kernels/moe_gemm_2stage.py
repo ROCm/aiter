@@ -269,13 +269,11 @@ def compile_moe_gemm1(
             f"{total_threads}: tile_m={tile_m}, tile_k={tile_k}, elem_bytes={elem_bytes}"
         )
     bytes_per_thread_x = bytes_x_per_tile // total_threads
-    # Keep MoE stage1 X gmem->LDS pipeline consistent with the optimized GEMM kernel:
-    # split into <=16B pieces and use direct buffer_load for smaller widths.
-    # (Compute the split lens inside the kernel so the code matches GEMM structure.)
+    # X gmem->LDS pipeline matches the optimized GEMM kernel: split into <=16B pieces,
+    # direct buffer_load for smaller widths.
 
-    # LDS128 mode (same idea as test_preshuffle_gemm.py):
-    # - LDS stride == tile_k (no extra padding) + XOR16 swizzle
-    # - Use ds_{read,write}_b128 (16B) and extract 8B halves for MFMA steps
+    # LDS128 mode: LDS stride == tile_k (no padding) + XOR16 swizzle; ds_{read,write}_b128
+    # (16B) with 8B-half extraction for MFMA.
     _ck_lds128 = os.environ.get("FLYDSL_CK_LDS128", "1") in (
         "1",
         "true",
@@ -301,8 +299,8 @@ def compile_moe_gemm1(
         )
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
-    # IMPORTANT: module name participates in FlyDSL's compile cache key.
-    # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
+    # IMPORTANT: module name is part of the compile cache key; keep an ABI tag so
+    # signature changes can't reuse an old binary.
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
@@ -313,10 +311,8 @@ def compile_moe_gemm1(
         f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
     ).replace("-", "_")
 
-    # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
-    # Reuse the same LDS bytes for both:
-    # - ping-pong X tiles (2 * tile_m * lds_stride bytes)
-    # - optional epilogue CShuffle tile (tile_m * tile_n f16 -> 2 * tile_m * tile_n bytes)
+    # LDS sizing (pure Python). Same LDS bytes reused for ping-pong X tiles
+    # (2*tile_m*lds_stride) and the optional epilogue CShuffle tile (2*tile_m*tile_n).
     _use_cshuffle_epilog = bool(use_cshuffle_epilog)
     # Split-K requires CShuffle epilogue (atomic adds via store_pair callback)
     if _is_splitk:
@@ -554,9 +550,9 @@ def compile_moe_gemm1(
                 inter2_idx = arith.index(2 * inter_dim)
                 expert_off_idx = expert_idx * inter2_idx  # index
 
-                # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
-                # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
-                # 16, fall back to 8B (dwordx2) or 4B (dword) loads. For fp16/bf16 we require 16B.
+                # X gmem->reg prefetch (match preshuffle GEMM mapping). Prefer 16B
+                # (dwordx4); fall back to 8B/4B if per-thread bytes aren't 16-divisible.
+                # fp16/bf16 require 16B.
                 if const_expr(is_f16_or_bf16):
                     if const_expr(bytes_per_thread_x % 16 != 0):
                         raise ValueError(
@@ -687,9 +683,8 @@ def compile_moe_gemm1(
                 lane_div_16 = fx.get(coord_l16, 0)
                 lane_mod_16 = fx.get(coord_l16, 1)
 
-                # Match GEMM naming/pattern: row in LDS is lane_mod_16, and col base is lane_div_16 * a_kpack_elems.
-                # A-side kpack is always 16 bytes (activation elements); B-side kpack_bytes
-                # may differ (e.g. 8 for int4 weights), but that only affects B preshuffle.
+                # GEMM naming: LDS row is lane_mod_16, col base is lane_div_16*a_kpack_elems.
+                # A-side kpack is always 16 bytes; B-side kpack_bytes may differ (8 for int4).
                 row_a_lds = lane_mod_16
                 a_kpack_elems = 16 // elem_bytes
                 col_offset_base = lane_div_16 * arith.index(int(a_kpack_elems))
@@ -1859,9 +1854,8 @@ def compile_moe_gemm1(
                     return
 
                 def _stage1_store_row(*, mi: int, ii: int, row_in_tile, row):
-                    # `row` is the sorted-row index (bx_m + row_in_tile).
-                    # Block-level early-exit already guards `bx_m` range.
-                    # Here we rely on buffer OOB semantics for any tail rows.
+                    # `row` is the sorted-row index (bx_m + row_in_tile); block-level
+                    # early-exit guards bx_m, so rely on buffer OOB for tail rows.
                     fused2 = buffer_ops.buffer_load(
                         sorted_rsrc, row, vec_width=1, dtype=T.i32
                     )
@@ -2211,12 +2205,9 @@ def compile_moe_gemm2(
         return ty() if callable(ty) else ty
 
     epilog_tag = "cshuffle"
-    # IMPORTANT: include tiling in the module name to avoid accidentally reusing a compiled
-    # binary for a different (tile_m, tile_n, tile_k) configuration.
-    # See stage1 note: include ABI tag to prevent binary reuse across signature changes.
-    # IMPORTANT: module name participates in FlyDSL's compile cache key.
-    # Dynamic-shape variant: safe to reuse across (tokens/sorted_size/size_expert_ids) at runtime.
-    # Keep a distinct ABI tag so the compile cache never mixes with historical signatures.
+    # IMPORTANT: module name is part of the compile cache key. Encode tiling + an ABI
+    # tag so different (tile_m,tile_n,tile_k) or signature changes can't reuse a binary.
+    # Dynamic-shape variant: safe to reuse across tokens/sorted_size/size_expert_ids.
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     (
@@ -2226,9 +2217,8 @@ def compile_moe_gemm2(
         f"_abi2"  # mask sentinel token ids on loads/stores to avoid illegal address faults
     ).replace("-", "_")
 
-    # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
-    # because the AST rewriter intercepts `if` statements inside kernel bodies and
-    # turns them into closure dispatches, which breaks variable reassignment) ────
+    # CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel --
+    # the AST rewriter turns in-kernel `if` into closure dispatches, breaking reassignment).
     _cshuffle_nlane = 32
     if bool(accumulate):
         _e_vec = 2
@@ -2240,7 +2230,7 @@ def compile_moe_gemm2(
                 f"tile_n={tile_n} must be divisible by {_cshuffle_stride} when accumulate=False"
             )
 
-    # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
+    # LDS sizing (pure Python; no MLIR Context needed).
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
     lds_out_bytes = (
         2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
@@ -2375,9 +2365,8 @@ def compile_moe_gemm2(
                 else None
             )
 
-            # Buffer resources.
-            # For dynamic memrefs, `max_size=False` cannot infer the logical size from the memref *type*,
-            # so we should pass `num_records_bytes` explicitly for stable hardware OOB behavior.
+            # Buffer resources: dynamic memrefs can't infer logical size from the type,
+            # so pass `num_records_bytes` explicitly for stable hardware OOB behavior.
             c_topk = fx.Index(topk)
 
             # X(A2): [tokens*topk, inter_dim] bytes = tokens*topk*k*elem_bytes
@@ -2436,9 +2425,9 @@ def compile_moe_gemm2(
                 n_idx = fx.Index(model_dim)
                 expert_off_idx = expert_idx * n_idx  # index
 
-                # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
-                # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
-                # 16, fall back to 8B (dwordx2) or 4B (dword) loads. For fp16/bf16 we require 16B.
+                # X gmem->reg prefetch (match preshuffle GEMM mapping). Prefer 16B
+                # (dwordx4); fall back to 8B/4B if per-thread bytes aren't 16-divisible.
+                # fp16/bf16 require 16B.
                 if const_expr(is_f16_or_bf16):
                     if const_expr(bytes_per_thread_x % 16 != 0):
                         raise ValueError(
@@ -3096,11 +3085,9 @@ def compile_moe_gemm2(
                     row_a_lds, col_offset_base_bytes, lds_base_pong
                 )
 
-                # Main loop: process K tiles in 2-tile ping-pong steps.
-                #
-                # IMPORTANT: for odd number of K tiles, leave **1** tail tile; for even, leave **2**.
-                # Otherwise the 2-tile tail below would double-count the last tile when num_tiles is odd
-                # (e.g. inter_dim=192, tile_k=64 -> 3 tiles).
+                # Main loop: K tiles in 2-tile ping-pong steps. IMPORTANT: leave 1 tail
+                # tile for odd K-tile counts, 2 for even -- else the 2-tile tail below
+                # double-counts the last tile when num_tiles is odd (e.g. 192/64 -> 3).
                 num_k_tiles_py = int(inter_dim) // int(tile_k)
                 odd_k_tiles = (num_k_tiles_py % 2) == 1
                 tail_tiles = 1 if odd_k_tiles else 2
@@ -3236,8 +3223,8 @@ def compile_moe_gemm2(
                         a0_prefetch=a0_prefetch_ping,
                     )
 
-                # ---------------- Epilogue: LDS CShuffle + atomic half2 (x2) ----------------
-                # Reuse the shared helper so GEMM / MoE kernels share the exact same CShuffle skeleton.
+                # Epilogue: LDS CShuffle + atomic half2 (x2), via the shared helper so
+                # GEMM/MoE kernels share the same CShuffle skeleton.
                 expert_off = expert_off_idx
                 mask24_i32 = fx.Int32(0xFFFFFF)
                 model_i32 = fx.Int32(model_dim)
@@ -3685,13 +3672,9 @@ def compile_moe_reduction(
             tile_idx = gpu.block_id("y")
             tid = gpu.thread_id("x")
 
-            # ── 64-bit base-offset folding ─────────────────────────────────
-            # X is [m_tokens, topk, model_dim]; total bytes can exceed 4 GiB
-            # for large batches (e.g. 131072 * 6 * 4096 * 2 = 6 GiB), which
-            # overflows the i32 voffset used by buffer_load. To stay i32-safe,
-            # fold the per-WG token byte offset into the descriptor's 48-bit
-            # base address (computed in i64). The in-kernel voffsets then only
-            # need to address one token's slab.
+            # 64-bit base-offset folding: X is [m_tokens, topk, model_dim] and can exceed 4 GiB, overflowing
+            # buffer_load's i32 voffset. Fold the per-WG token byte offset into the descriptor's 48-bit base (i64) so
+            # in-kernel voffsets only address one token's slab.
             slab_elems_x = c_topk * c_model_dim
             x_slab_nbytes = slab_elems_x * fx.Index(elem_bytes_c)
             y_slab_nbytes = c_model_dim * fx.Index(elem_bytes_c)

@@ -189,8 +189,7 @@ def _routing_fields_equal(a_rd, a_g, a_s, b_rd, b_g, b_s):
     ), "gate_scal differs"
 
 
-# decode-sized shapes (HERD is a small-M, weight-bound feature); (256,8) is the
-# k=8 case that pads 8->16.
+# decode-sized shapes (HERD is a small-M, weight-bound feature); (256,8) is the k=8 case that pads 8->16.
 HERD_SHAPES = [(128, 4), (128, 6), (256, 8)]
 HERD_N_TOKENS = [16, 32, 64, 128]
 

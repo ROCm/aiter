@@ -138,21 +138,14 @@ def _if_then(if_op):
                 scf.YieldOp([])
 
 
-# ============================================================================
 # Constants
-# ============================================================================
-
 TILE_N = K_TILE_N  # 128 — KV tile width
 
-# ============================================================================
-# SmemAllocators — 4 separate LDS regions for K/V ping-pong
-# ============================================================================
-# K per tile: CNT_SU(4) * LDS_K_SU_P_SIZE(0x3200)
-# = 0xC800 = 51200 bytes (for QK_HDIM=192)
-# V per tile: CNT_SU(4) × LDS_V_SU_P_SIZE(0x2400) = 0x9000 = 36864 bytes
-#
-# K_a, K_b, V_a are padded to 64KB segment boundary to prevent TDM cross-segment.
-# V_b is last — no padding needed. D output reuses V_a (PV done before D store).
+# SmemAllocators — 4 separate LDS regions for K/V ping-pong.
+# K per tile: CNT_SU(4)*LDS_K_SU_P_SIZE(0x3200) = 0xC800 = 51200 B (QK_HDIM=192).
+# V per tile: CNT_SU(4)*LDS_V_SU_P_SIZE(0x2400) = 0x9000 = 36864 B.
+# K_a, K_b, V_a padded to 64KB segment boundary to prevent TDM cross-segment;
+# V_b is last (no pad). D output reuses V_a (PV done before D store).
 LDS_SEGMENT = 0x10000  # 64KB
 
 _lds_alloc_k_a = SmemAllocator(None, arch="gfx1250", global_sym_name="smem_k_a")
@@ -176,9 +169,7 @@ LDS_D_WV_SIZE = WV_SUBQD * TDM_D_TILE_DIM0 + 1024  # 9216 bytes per wave
 _lds_allocator = _lds_alloc_k_a
 
 
-# ============================================================================
 # LDS base extraction helper
-# ============================================================================
 
 
 def _extract_lds_base_i32(memref_base):
@@ -257,9 +248,8 @@ def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
 
     rocdl.sched_barrier(0)
 
-    # MSB-specific column-group offsets folded into each address register so
-    # all 8 V SSA values are genuinely distinct → one bank hint each → no
-    # allocator conflict.  _build_lds_v_schedule omits these from offset field.
+    # MSB-specific column-group offsets folded into each address register so all 8 V SSA values are genuinely distinct →
+    # one bank hint each → no allocator conflict.  _build_lds_v_schedule omits these from offset field.
     _V_COL_GROUP = (N_LDS_V_PER_MSB // 2) * 32  # 64 bytes (V_HDIM=128)
     _V_D_HALF = V_HDIM * KV_BPP // 2  # 128 bytes
     _V_MSB_EXTRA = [0, _V_D_HALF, _V_COL_GROUP, _V_D_HALF + _V_COL_GROUP]
@@ -284,9 +274,7 @@ def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
     ] + v_addrs
 
 
-# ============================================================================
 # TDM Priming — Load full tile_n=128 of K+V into LDS
-# ============================================================================
 
 
 def _build_tdm_descs(dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su):
@@ -700,9 +688,7 @@ def _tdm_prime_full_tile(
     rocdl.s_barrier_wait(-1)
 
 
-# ============================================================================
 # Initial K load from LDS — provides kv_tiles for core_loop entry
-# ============================================================================
 
 
 def _issue_k_loads(ty, kv_lds_addrs, blk, su):
@@ -738,9 +724,7 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
     return _wait_and_pair_k(ty, kv_raw)
 
 
-# ============================================================================
 # Unified FMHA Kernel
-# ============================================================================
 
 
 @functools.lru_cache(maxsize=None)
@@ -800,10 +784,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
         ty = _get_types()
 
-        # ================================================================
         # SECTION 1: Prologue — HW Setup + Q Load + Address Gen
-        # ================================================================
-
         _setreg(2074, 2)  # WAVE_SCHED_MODE = 2
         rocdl.s_nop(0)
 
@@ -831,9 +812,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         )
         # total workgroups
         _num_wgs = arith.muli(arith.muli(_gdx, _gdy), _gdz)
-        # Guard: only remap when num_wgs is a positive multiple of NUM_XCDS.
-        # Otherwise (num_wgs/8 truncates), the formula maps distinct wgids to
-        # the same new_wgid → workgroup collision and skipped tiles.
+        # Guard: only remap when num_wgs is a positive multiple of NUM_XCDS. Otherwise (num_wgs/8 truncates), the
+        # formula maps distinct wgids to the same new_wgid → workgroup collision and skipped tiles.
         _wgs_per_xcd = arith.divui(_num_wgs, _NUM_XCDS)
         _num_wgs_rem = arith.remui(_num_wgs, _NUM_XCDS)
         _is_gt = arith.cmpi(arith.CmpIPredicate.ugt, _num_wgs, _NUM_XCDS)
@@ -857,8 +837,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
         m_start = arith.muli(bx, arith.constant(TILE_N, type=T.i32))
 
-        # THD Step 2: load cu_seqlens -> q_start_tok,
-        # k_start_tok (in tokens, broadcast as SGPR)
+        # THD Step 2: load cu_seqlens -> q_start_tok, k_start_tok (in tokens, broadcast as SGPR)
         _i32_ty = ir.IntegerType.get_signless(32)
         _i64_ty = ir.IntegerType.get_signless(64)
         _glb_ptr_ty = ir.Type.parse("!llvm.ptr<1>")
@@ -961,9 +940,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         _v8 = llvm_dialect.insertelement(_v8, _mval, _ev)
                     su_sp_tiles[_su][_msb][0] = _v8
 
-        # ================================================================
         # OOB protection: pre-compute per-block dg1 lists for TDM loads
-        # ================================================================
         _stride_k_elems_oob = arith.unwrap(
             arith.shrui(stride_k_seq, arith.constant(1, type=T.i32))
         )
@@ -1009,18 +986,15 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             )
             for _su in range(CNT_SU)
         ]
-        # THD: clamp q_remain to ≥ 0 so excess workgroups (m_start >= actual_q_len)
-        # write nothing.
+        # THD: clamp q_remain to ≥ 0 so excess workgroups (m_start >= actual_q_len) write nothing.
         _q_remain_raw = arith.subi(actual_q_len, m_start_raw)
         _q_remain_o = arith.maxsi(
             _q_remain_raw, arith.unwrap(arith.constant(0, type=T.i32))
         )
         _o_oob_dim1 = _per_warp_oob_dim1(_q_remain_o, wave_id, 32)
 
-        # THD: skip workgroups whose m_start >= actual_q_len (no valid tokens for this
-        # tile).
-        # Everything below (Q load / K/V load / core loop / O writeback) is gated by
-        # _wg_valid.
+        # THD: skip workgroups whose m_start >= actual_q_len (no valid tokens for this tile).
+        # Everything below (Q load / K/V load / core loop / O writeback) is gated by _wg_valid.
         _wg_valid = arith.cmpi(arith.CmpIPredicate.slt, m_start_raw, actual_q_len)
         # ---- seqlen_k == 0: zero-fill output for valid Q rows, then skip compute ----
         _kv_is_zero = arith.cmpi(
@@ -1110,8 +1084,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         _wg_valid_compute = arith.andi(_wg_valid, _kv_nonzero)
         _if_wg = scf.IfOp(arith.unwrap(_wg_valid_compute))
         with _if_then(_if_wg):
-            # Q resource descriptor with OOB protection (THD: batch is implicit in
-            # q_start_tok)
+            # Q resource descriptor with OOB protection (THD: batch is implicit in q_start_tok)
             _q_tok = arith.addi(
                 q_start_tok,
                 arith.muli(
@@ -1129,8 +1102,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             )
 
             # Q load → q_frags[4 bank][2 frag] v16bf16
-            # Pass q_offset (byte offset for this workgroup's Q tile) so WG>0 reads
-            # correct rows
+            # Pass q_offset (byte offset for this workgroup's Q tile) so WG>0 reads correct rows
             q_frags_raw = _phase4_q_load_flydsl(
                 lane_id,
                 arith.unwrap(q_rsrc),
@@ -1200,17 +1172,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 "s_log2e_scl_pair": scale_pair,
             }
 
-            # ================================================================
-            # SECTION 2: Prologue — Tile 0 QK + Partial Softmax (no PV)
-            # ================================================================
-            #
+            # SECTION 2: Prologue — Tile 0 QK + Partial Softmax (no PV).
             #   1. TDM K(tile 0, 4 SUs) → wait → QK_pure (64 WMMAs)
             #   2. TDM V(tile 0, 4 SUs) — overlapped with softmax
             #   3. sp_tiles → sp_pairs → softmax PART0+PART1 only (no PART2)
             #   4. TDM K(tile 1) — prefetch K only, V(tile 0) stays in LDS
             #   5. Wait K(tile 1) → LDS K(su=0) — preload for core_loop entry
-            #
-            # No PV in prologue. PART2 + PV run in core_loop iterations.
+            # PART2 + PV run in core_loop iterations.
 
             zero_f32 = arith.unwrap(arith.constant(0.0, type=T.f32))
             neg_inf = arith.unwrap(arith.constant(float("-inf"), type=T.f32))
@@ -1288,11 +1256,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
             # -- 2e': PART2 first half for tile 0 --
             # Runs ops 0..PART2_SPLIT-1: setup(7)+pkfma(16)+pair_exp(8) = 31 ops/MSB.
-            # 4 MSBs × 8 pair_exp = 32 pair_exp + 4 exp_delta (unavoidable pipeline
-            # overhead).
+            # 4 MSBs × 8 pair_exp = 32 pair_exp + 4 exp_delta (unavoidable pipeline overhead).
             # sp_pairs_all_pro[m][0..15] are partially modified (pkfma+8-exp applied).
-            # pro_exp_delta seeds the O-rescale iter_arg for the first core_loop
-            # iteration.
+            # pro_exp_delta seeds the O-rescale iter_arg for the first core_loop iteration.
             _pro_part2_ops = _build_all_softmax_part2_ops(
                 ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state
             )
@@ -1377,8 +1343,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             kv_tiles_init = _load_initial_kv_tiles(ty, kv_lds_addrs_b, blk=0, su=0)
 
             # Prologue results: PART0+PART1+PART2 first half done.
-            # old_max = local_max (set by PART2 setup op0); row_sums rescaled
-            # (×exp_delta).
+            # old_max = local_max (set by PART2 setup op0); row_sums rescaled (×exp_delta).
             pro_old_max = [
                 softmax_state_pro["old_max"][m] for m in fx.range_constexpr(NUM_MSB)
             ]
@@ -1393,8 +1358,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             ]
 
             # Partial sp_pairs after first half: yield as separate lo+hi f32 scalars.
-            # Prologue runs pair_exp sequentially (correct v2f32), so extractelement is
-            # safe here.
+            # Prologue runs pair_exp sequentially (correct v2f32), so extractelement is safe here.
             pro_partial_sp_lo_flat = []
             pro_partial_sp_hi_flat = []
             for _m in fx.range_constexpr(NUM_MSB):
@@ -1414,8 +1378,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         )
                     )
             pro_partial_sp_flat = pro_partial_sp_lo_flat + pro_partial_sp_hi_flat
-            # exp_delta from PART2 setup (used by first core_loop iteration's O
-            # rescale).
+            # exp_delta from PART2 setup (used by first core_loop iteration's O rescale).
             pro_exp_delta = [
                 softmax_state_pro["exp_delta"][_m] for _m in fx.range_constexpr(NUM_MSB)
             ]
@@ -1432,16 +1395,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 for msb in fx.range_constexpr(NUM_MSB):
                     sp_flat_init.append(all_su_sp_tiles[su][msb][0])
 
-            # ================================================================
-            # SECTION 3: Dynamic KV Loop — scf.for_ from tile 1
-            # ================================================================
-            #
-            # Pipeline layout:
-            #   - K in LDS is one tile AHEAD of V in LDS
+            # SECTION 3: Dynamic KV Loop — scf.for_ from tile 1.
+            # Pipeline (K in LDS is one tile AHEAD of V):
             #   - Prologue loaded K(tile 0)+V(tile 0), did QK, prefetched K(tile 1)
             #   - Iteration i: GEMM1 on K(tile i+1), GEMM2 on V(tile i)
             #   - After core_loop: TDM V(tile i+1) + K(tile i+2)
-            #
             # O tiles start as zeros (no PV in prologue).
 
             def _core_loop(
@@ -1505,10 +1463,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 v_tiles_out = None
                 blk = 0
 
-                # ================================================================
-                # GEMM1 (QK): 4 stages (SU 0..3)
-                # Interleave PART2 on sp_pairs_prev during GEMM1 stages.
-                # ================================================================
+                # GEMM1 (QK): 4 stages (SU 0..3), interleaving PART2 on sp_pairs_prev.
                 sp_pairs_all = softmax_state.get("sp_pairs_prev", None)
                 if const_expr(sp_pairs_all is None):
                     sp_pairs_all = [[None] * N_SP_PAIRS for _ in range(NUM_MSB)]
@@ -1522,8 +1477,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # Second half starts at PART2_SPLIT; first half ran in previous GEMM2.
                 softmax_idx_by_msb = [PART2_SPLIT] * NUM_MSB
 
-                # Pre-run setup ops 0..PART2_SETUP_A-2 (skip last = row_sums rescale,
-                # already applied).
+                # Pre-run setup ops 0..PART2_SETUP_A-2 (skip last = row_sums rescale, already applied).
                 # Sets cur_max_log2e (needed by pkfma), exp_delta, old_max, etc.
                 # Row_sums is NOT re-rescaled here — ia_row_sums already carries the
                 # correctly-rescaled value from the previous GEMM2's PART2 first half.
@@ -1646,17 +1600,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 su_sp_tiles_list = []
 
-                # O rescale: all 4 MSBs across GEMM1 stages 0-3.
-                # Each stage dispatches N_PV_WMMA_N closures (1 tile per MSB, 4 MSBs
-                # total
-                # = N_PV_WMMA_N * NUM_MSB closures per stage), running at the last N
-                # WMMAs.
-                # This removes O_resc from GEMM2 stage 0 entirely — exp+O_resc+cvt
-                # interleave throughout GEMM1 (QK) stages.
-                #
-                # Stage assignment: stage s handles tile n=s for all 4 MSBs.
-                #   stage 0 → n=0 (all MSBs), stage 1 → n=1, stage 2 → n=2, stage 3 →
-                #   n=3
+                # O rescale spread across GEMM1 stages 0-3 (stage s handles tile n=s for all 4 MSBs), removing O_resc
+                # from GEMM2 stage 0 so exp+O_resc+cvt interleave throughout GEMM1.
                 # Build broadcast v8f32 for each MSB's exp_delta
                 _ed_v8 = []
                 for _dm in fx.range_constexpr(NUM_MSB):
@@ -1693,17 +1638,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                     softmax_stage = (stage_idx + 4) % ALU_STAGES
                     budget_per_msb = ALU_PER_STAGE[softmax_stage] // NUM_MSB
-                    # MSBs 0,1: dispatch ops during GEMM1 stages (register pressure
-                    # manageable).
-                    # MSBs 2,3: budget=0 → all ops 32+ run in sequential inter-GEMM
-                    # flush instead,
-                    #           avoiding WMMA-induced register collision for banks 2,3.
+                    # MSBs 0,1: dispatch during GEMM1 stages. MSBs 2,3: budget=0, all ops run in the sequential
+                    # inter-GEMM flush to avoid WMMA-induced register collision for banks 2,3.
                     softmax_budget = [budget_per_msb, budget_per_msb, 0, 0]
 
                     is_barrier_stage = stage_idx == 2 and (has_tdm_k_g1 or has_tdm_v_g1)
 
-                    # Distribute O_resc across all 4 GEMM1 stages (1
-                    # tile/MSB per stage).
+                    # Distribute O_resc across all 4 GEMM1 stages (1 tile/MSB per stage).
                     stage_o_rescale = _o_rescale_by_stage[stage_idx]
 
                     sp_tiles, kv_tiles_next_raw = _cl_su_v3_stage(
@@ -1742,24 +1683,18 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 if const_expr(not gemm2):
                     return sp_tiles, kv_tiles, o_tiles, su_sp_tiles_list
 
-                # ================================================================
                 # Between GEMM1 and GEMM2: complete softmax pipeline
-                # ================================================================
-
                 # 1. Flush any remaining PART2 second-half ops
                 for msb in fx.range_constexpr(NUM_MSB):
                     for op in softmax_ops_by_msb[msb][softmax_idx_by_msb[msb] :]:
                         op()
 
-                # DBG: row_sums after GEMM1 second-half (sum_accum done), before GEMM2
-                # PART0+1 rescale
+                # DBG: row_sums after GEMM1 second-half (sum_accum done), before GEMM2 PART0+1 rescale
 
                 # O_resc moved entirely to GEMM1 stages — no O_resc in GEMM2.
                 _o_rescale_exp_delta = None
 
-                # ================================================================
                 # Causal mask on current QK tile (before sp_pairs conversion)
-                # ================================================================
                 if const_expr(causal_n_start is not None):
                     _apply_causal_mask(su_sp_tiles_list, causal_n_start)
                 if const_expr(kv_oob_cols is not None):
@@ -1784,25 +1719,16 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     sgpr_state,
                 )
                 # P0/P1 dispatched via schedule tokens (P0 tokens in stages 0-1).
-                # Starts from op 0; token dispatch happens AFTER each WMMA's
-                # sched_barrier(0)
-                # so LLVM places ops between WMMAs rather than clustering before the
-                # loop.
+                # Starts from op 0; token dispatch happens AFTER each WMMA's sched_barrier(0) so LLVM places ops between
+                # WMMAs rather than clustering before the loop.
                 # PART2 (P2/EXP) starts from stage 2 (after PART1 updates local_max).
                 g2_rid_idx = [0] * RLTS_LEN
 
-                # 4. Build P tiles from p_bf16 (produced by PART2 second half on prev
-                # tile)
+                # 4. Build P tiles from p_bf16 (produced by PART2 second half on prev tile)
                 p_tiles_computed = _build_p_tiles_from_softmax(ty, softmax_state)
 
-                # ================================================================
-                # GEMM2 (PV): 4 stages (SU 0..3)
-                # PART0 distributed in two chunks so LLVM interleaves them with WMMAs:
-                #   Chunk A (ops 0..10): emitted above → LLVM places in G2-su0 WMMA
-                #   slots
-                #   Chunk B (ops 11..21) + PART1: emitted between G2-su0 and G2-su1
-                #                                  → LLVM places in G2-su1 WMMA slots
-                # ================================================================
+                # GEMM2 (PV): 4 stages (SU 0..3). PART0 in two chunks so LLVM interleaves with WMMAs: chunk A (ops
+                # 0..10) in G2-su0 slots, chunk B (ops 11..21) + PART1 between G2-su0 and G2-su1.
 
                 v_tiles_paired = _pair_v_tiles_for_wmma(v_tiles_out, ty)
 
@@ -1857,8 +1783,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     tdm_state["v_descs"] = v_descs
                     tdm_state["v_desc_idx"] = 0
 
-                # stage tuple: (gemm_su, lds_type, lds_blk, lds_su, tdm_type,
-                # tdm_barrier)
+                # stage tuple: (gemm_su, lds_type, lds_blk, lds_su, tdm_type, tdm_barrier)
                 g2_stage_configs = [
                     (0, KV_V, blk, 1, KV_V if has_tdm_v_g2 else KV_NONE, False),
                     (1, KV_V, blk, 2, KV_V if has_tdm_v_g2 else KV_NONE, False),
@@ -1922,10 +1847,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 rocdl.sched_barrier(0)
 
                 # Build partial_sp lo+hi flat lists for yield.
-                # For pairs 0-3: use f32 cache from EXP token dispatch (correct
-                # scalars).
-                # For pairs 4-15: extractelement from sp_pairs_current (pkfma, to be
-                # exp'd later).
+                # For pairs 0-3: use f32 cache from EXP token dispatch (correct scalars).
+                # For pairs 4-15: extractelement from sp_pairs_current (pkfma, to be exp'd later).
                 partial_sp_lo_out = []
                 partial_sp_hi_out = []
                 for _psm in fx.range_constexpr(NUM_MSB):
@@ -1960,7 +1883,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     partial_ed_out,
                 )
 
-            # ================================================================
             # Init iter_args layout (dynamic — offsets depend on N_WMMA_K_TILES):
             #   [0..15]            o_tiles[4][4] v8f32                  = 16 values
             #   [16..19]           old_max[4] f32                        = 4 values
@@ -1973,7 +1895,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             #   [24+KV+28..+91]    partial_sp_pairs[4][16] v2f32        = 64 values
             #                      (PART2 first half output, double-buffered pipeline)
             #   [24+KV+92..+95]    exp_delta[4] f32                     = 4 values
-            # ================================================================
             _KV_SIZE = NUM_MSB * N_WMMA_K_TILES  # 12 for 192-dim, 8 for 128-dim
             _OFF_LOCAL_MAX = 24 + _KV_SIZE  # 36 for 192-dim
             _OFF_DELTA = _OFF_LOCAL_MAX + NUM_MSB
@@ -2004,10 +1925,9 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             )
 
             # ---- Split point for causal loops (chunked-prefill: sq < sk) ----
-            # Tiles below _first_causal_tile are fully under the diagonal and
-            # need no causal mask.  Tiles at or above it cross the diagonal.
-            # When sq == sk, _first_causal_tile == num_tiles so loop 1 covers
-            # everything and loop 2 runs zero iterations — no regression.
+            # Tiles below _first_causal_tile are fully under the diagonal and need no causal mask.  Tiles at or above it
+            # cross the diagonal. When sq == sk, _first_causal_tile == num_tiles so loop 1 covers everything and loop 2
+            # runs zero iterations — no regression.
             if const_expr(IS_CAUSAL):
                 # Tile t is fully below the diagonal when
                 #   (t+1)*TILE_N - 1 <= _causal_offset + m_start
@@ -2026,9 +1946,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             else:
                 _first_causal_tile_idx = num_tiles_minus1_idx
 
-            # ================================================================
             # SECTION 3a: Main KV loop — non-causal tiles [1, _first_causal_tile)
-            # ================================================================
             for tile_idx, iter_args, loop1_results in scf.for_(
                 arith.index(1),
                 _first_causal_tile_idx,
@@ -2036,8 +1954,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 iter_args=init_args,
             ):
                 # ---- Unpack iter_args ----
-                # Pin each MSB's values to bank=d/msb for full-bank MSB
-                # pattern.
+                # Pin each MSB's values to bank=d/msb for full-bank MSB pattern.
                 o_tiles_flat = [iter_args[i] for i in fx.range_constexpr(16)]
                 o_tiles = []
                 for d in fx.range_constexpr(NUM_MSB):
@@ -2105,8 +2022,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     ia_v_next_base,
                 )
 
-                # ---- Unpack partial_sp_pairs: reconstruct
-                # v2f32 from separate lo+hi f32 scalars ----
+                # ---- Unpack partial_sp_pairs: reconstruct v2f32 from separate lo+hi f32 scalars ----
                 ia_partial_sp_lo = [
                     iter_args[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)
                 ]
@@ -2312,9 +2228,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     + new_exp_delta
                 )
 
-            # ================================================================
             # SECTION 3b: Main KV loop — causal tiles [_first_causal_tile, num_tiles-1)
-            # ================================================================
             for tile_idx, iter_args, loop_results in scf.for_(
                 _first_causal_tile_idx,
                 num_tiles_minus1_idx,
@@ -2593,18 +2507,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     + new_exp_delta
                 )
 
-            # ================================================================
-            # SECTION 4: Epilogue — post_process + div_cvt + write_out
-            # ================================================================
-            #
-            #   fmha_post_process(is_odd):
-            #     softmax stages 4..7 (PART2) → complete last tile's softmax
-            #     LDS V(su=0..3) → PV_pure (64 WMMAs)
-            #   fmha_div_cvt():
-            #     row_sums cross-MSB reduce → LSE = max*scale + log(sum)
-            #     O = O * rcp(row_sum) → cvt_pk_bf16
-            #   lds_store_D_LSE() + TDM_store_D_LSE()
-            #
+            # SECTION 4: Epilogue — post_process + div_cvt + write_out.
+            #   post_process: PART2 (softmax stages 4..7) + LDS V → PV_pure (64 WMMAs)
+            #   div_cvt: row_sums cross-MSB reduce → LSE = max*scale + log(sum);
+            #            O = O * rcp(row_sum) → cvt_pk_bf16; then TDM store D+LSE.
             # For tile_n=128: blk=0 always, no is_odd branching.
 
             # ---- 4a: Unpack loop results ----
@@ -2642,8 +2548,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 ep_v_cur_base,
             )
 
-            # ---- 4b: Unpack partial_sp_pairs:
-            # reconstruct v2f32 from separate lo+hi f32 ----
+            # ---- 4b: Unpack partial_sp_pairs: reconstruct v2f32 from separate lo+hi f32 ----
             ep_partial_sp_lo = [
                 loop_results[_OFF_PSP + i] for i in fx.range_constexpr(_PSP_SIZE)
             ]
@@ -2678,8 +2583,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 ]
                 ep_kv_tiles.append(_row)
 
-            # K_next / V_next LDS bases for endtile
-            # core_loop kv_lds_addrs_next.
+            # K_next / V_next LDS bases for endtile core_loop kv_lds_addrs_next.
             ep_k_next_base = loop_results[_OFF_PP + 2]
             ep_v_next_base = loop_results[_OFF_PP + 3]
             ep_kv_lds_addrs_next = _build_kv_lds_addrs(
@@ -2750,8 +2654,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # DBG: print row_sums_in at ep_finish entry
 
                 # PART2 second half: setup ops + pair_exp+cvt+sum.
-                # MSBs 0,1: pairs 0-3 already exp'd by GEMM2 EXP tokens → start from
-                # PART2_SPLIT.
+                # MSBs 0,1: pairs 0-3 already exp'd by GEMM2 EXP tokens → start from PART2_SPLIT.
                 _p2ops = _build_all_softmax_part2_ops(
                     ty,
                     0,
@@ -2916,10 +2819,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         )
                     _obf16.append(_mb16)
 
-                # Barrier: ensure all waves finish PV before any wave writes D to V_a
-                # LDS.
-                # Without this, wave 0 can overwrite V_a SU data still being read by
-                # waves 1-3.
+                # Barrier: ensure all waves finish PV before any wave writes D to V_a LDS.
+                # Without this, wave 0 can overwrite V_a SU data still being read by waves 1-3.
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
 
@@ -3053,8 +2954,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 tdm_ops.tensor_store_2d(tdm_ops.TDMDescriptor2D(_dg0, _dg1))
                 tdm_ops.tensor_wait(0)
 
-            # ---- 4c'': endtile dispatch — if N>=2: core_loop + ep_finish, else:
-            # ep_finish ----
+            # ---- 4c'': endtile dispatch — if N>=2: core_loop + ep_finish, else: ep_finish ----
             _two_ep = arith.constant(2, type=T.i32)
             _is_multi = arith.cmpi(arith.CmpIPredicate.uge, num_tiles, _two_ep)
 
@@ -3085,8 +2985,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         for _m in fx.range_constexpr(NUM_MSB)
                     ],
                 }
-                # DBG: row_sums entering endtile core_loop (= ep_row_sums from
-                # loop_results)
+                # DBG: row_sums entering endtile core_loop (= ep_row_sums from loop_results)
 
                 _et_z = arith.unwrap(arith.constant(0, type=T.i32))
                 _et_tdm = {
@@ -3160,10 +3059,8 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     endtile_v_dg1=_et_v_oob_dg1,
                     kv_oob_cols=_et_kv_remain,
                 )
-                # Pass updated softmax state (old_max/local_max/delta/row_sums after
-                # PART0+1
-                # for the endtile tile) so _ep_finish can correctly run PART2 second
-                # half.
+                # Pass updated softmax state (old_max/local_max/delta/row_sums after PART0+1 for the endtile tile) so
+                # _ep_finish can correctly run PART2 second half.
                 # Reconstruct v2f32 sp_pairs for _ep_finish from safe f32 lo+hi scalars.
                 _et_psp = []
                 for _rpsm in fx.range_constexpr(NUM_MSB):
@@ -3207,9 +3104,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
     return fmha_fwd_kernel
 
 
-# ============================================================================
 # Launch wrapper + PyTorch entry point
-# ============================================================================
 
 HEAD_DIM_QK = 192
 HEAD_DIM_V = 128

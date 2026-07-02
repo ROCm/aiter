@@ -74,8 +74,7 @@ def _bwd_preprocess(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
 
-    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout),
-    # so address each with its own strides.
+    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout), so address each with its own strides.
     offs_o = (
         bid * stride_o_b
         + hid * stride_o_h
@@ -314,8 +313,8 @@ def _bwd_dkdvdq_inner(
         else:
             dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
 
-        # We can compute the dq_partial here and do a atomic add to the correct memory location
-        # NOTE: Possible problems with the atomic add: contention, is inside a loop which has achieved bad perf before
+        # Atomic-add dq_partial to the correct memory location.
+        # NOTE: atomic add may contend and is inside a loop (has had bad perf before)
         # (BLOCK_M, BLOCK_N) x (BLOCK_N, D)
         if IS_FP8:
             dq_partial = (
@@ -532,18 +531,11 @@ def _bwd_kernel_dkdvdq_causal(
     dk = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
 
-    # Figure out causal starting block since we have seqlen_q >=< seqlen_k.
-    # Unlike forward pass where we tile on M dim and iterate on N dim, so that
-    # we can skip some M blocks, in backward pass, we tile on the N dim for kv
-    # and iterate over the M. In this way, we cannot skip N blocks, but only to
-    # determine the starting M blocks to skip some initial blocks masked by
-    # causal.
+    # Backward tiles on N (kv) and iterates M, so we can't skip N blocks; instead
+    # find the starting M block to skip initial causal-masked blocks.
     delta_qk = seqlen_q - seqlen_k
 
-    # q < k: some blocks will have no Masked block, other needs to re-calc
-    # starting position
-    # delta_qk is negative so flip it, only multiple of BLOCK_N can skip the
-    # masked op
+    # q < k: delta_qk is negative; only whole BLOCK_N multiples can skip the masked op.
     num_blocks_skip = -delta_qk // BLOCK_N
     delta_aligned = (num_blocks_skip + 1) * BLOCK_N + delta_qk
     start_delta_q_lt_k = delta_aligned // BLOCK_M * BLOCK_M
@@ -590,9 +582,8 @@ def _bwd_kernel_dkdvdq_causal(
     else:
         start_m = max(start_n + delta_qk, 0)
         start_m = (start_m // BLOCK_M) * BLOCK_M
-        # because we might shift the masked blocks up, we are deeper into
-        # the masked out region, so we would potentially increase the total
-        # steps with masked operation to get out of it
+        # shifting masked blocks up goes deeper into the masked region, so the
+        # masked-op step count may increase to get out of it
         residue_m = max(start_n + delta_qk - start_m, 0)
         len_m = BLOCK_N + residue_m
 
@@ -613,8 +604,7 @@ def _bwd_kernel_dkdvdq_causal(
     m_ptr_adj = m_ptr + adj_delta
     delta_ptr_adj = delta_ptr + adj_delta
 
-    # batch_philox_offset is the ACTUALLY dropout offset
-    # dropout_offset is for debug purpose and will be removed later
+    # batch_philox_offset is the real dropout offset; dropout_offset is for debug (to be removed)
     batch_philox_offset = 0
     dropout_offset = 0
     if ENABLE_DROPOUT:
@@ -919,8 +909,8 @@ def _bwd_kernel_dkdvdq_noncausal(
     # workgroup id
     wid = tl.program_id(0)  # 0, ..., NUM_K_PIDS * BATCH * NUM_K_HEADS - 1
 
-    # Workgroups get launched first along batch dim, then in head_k dim, and then in seq k block dim
-    # This is in order to avoid contention for the tl.atomic_add (inside _bwd_dkdvdq_inner) that happens between workgroups that share the same batch and head_k.
+    # Launch order: batch, then head_k, then seq-k block, to avoid tl.atomic_add
+    # (inside _bwd_dkdvdq_inner) contention between workgroups sharing batch and head_k.
     bid = wid % BATCH
     hkid = wid // BATCH % NUM_K_HEADS
     pid = wid // (BATCH * NUM_K_HEADS) % NUM_K_PIDS

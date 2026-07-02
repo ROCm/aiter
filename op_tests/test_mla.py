@@ -231,9 +231,8 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
-    # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both
-    # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
-    # (1M+) never trigger the O(N^2) ref.
+    # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both the lazy "tile area" gate and the per-call
+    # ctx so decode-scale ctx_lens (1M+) never trigger the O(N^2) ref.
     if (
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
@@ -324,11 +323,8 @@ def test_mla(
         return us_asm
 
     us_asm = None
-    # Absorb-prefill ref (mla_torch) builds [nhead, (batch*ctx_kv)^2] fp32 attn
-    # weights -- O(N^2) memory. Tile-area gate alone is not enough: bh16 CI
-    # sweeps run with decode-scale ctx_lens (-c 49152, -c 98304, -c 10000000)
-    # and would OOM the host. Mirror the normal-prefill gate's explicit
-    # ctx_lens <= 16384 cap to skip the ref for those configs.
+    # Absorb-prefill ref builds [nhead, (batch*ctx_kv)^2] fp32 attn weights (O(N^2)
+    # memory); ctx_lens <= 16384 cap skips the ref for decode-scale ctx to avoid host OOM.
     if (
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
         and batch_size * ctx_lens * nhead < 32 * 8192 * 16

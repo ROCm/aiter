@@ -167,9 +167,8 @@ def build_reduce_problem(
     for s in splits_per_tile:
         indptr.append(indptr[-1] + s)
 
-    # Assign every partial a unique base location in the partial buffer. The
-    # kernel reads partial row = base + local_seq, so reserve qo_len rows per
-    # partial to avoid collisions.
+    # Assign every partial a unique base location in the partial buffer. The kernel reads partial row = base +
+    # local_seq, so reserve qo_len rows per partial to avoid collisions.
     partial_map = []
     next_base = 0
     final_map = []
@@ -276,9 +275,8 @@ def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):
     ok = (err_out == 0) and (err_lse == 0)
     print(f"{'PASS' if ok else 'FAIL'}  {tag}  {us:>8.2f} us")
 
-    # Bytes moved by the reduce: read all partial outputs + partial lses +
-    # metadata, write final outputs + final lses. (dominant traffic is the f32
-    # partials; metadata is small but counted for completeness)
+    # Bytes moved by the reduce: read all partial outputs + partial lses + metadata, write final outputs + final lses.
+    # (dominant traffic is the f32 partials; metadata is small but counted for completeness)
     total_splits = sum(splits_per_tile)
     num_tiles = len(splits_per_tile)
     read_bytes = (
@@ -325,9 +323,8 @@ def main():
     out_dtype = dtypes.bf16 if args.dtype == "bf16" else dtypes.fp16
     head_dims = args.head_dim
 
-    # The kernel sizes its LDS scratch to max(CU_count, num_kv_splits), and the
-    # test passes num_kv_splits = max(per-tile splits), so any split count is
-    # safe regardless of device CU count.
+    # The kernel sizes its LDS scratch to max(CU_count, num_kv_splits), and the test passes num_kv_splits = max(per-tile
+    # splits), so any split count is safe regardless of device CU count.
 
     # (head_dim -> supported head counts from MLA_REDUCE_ROUTER in reduce.cu)
     heads_for_dim = {

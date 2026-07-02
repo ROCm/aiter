@@ -133,9 +133,8 @@ def build_moe_scatter_copy_preshuffle_scale_module(
     src_dwords = row_bytes // 4  # k_groups * k_wmma_steps (dwords/row)
     rows_per_tile = wmma_rep * 16  # grouped rows per row-tile
     dpr = src_dwords * wmma_rep  # dst dwords per output row
-    # The contiguous (wmma_rep, 4) dst block is wmma_rep dwords. Buffer ops cap at
-    # dwordx4 (128b), so store it in chunks of `store_vw` (largest of {4,2,1}
-    # dividing wmma_rep); wmma_rep in {1,2,4} is a single chunk, 8 -> two dwordx4.
+    # The contiguous (wmma_rep, 4) dst block is wmma_rep dwords. Buffer ops cap at dwordx4 (128b), so store it in chunks
+    # of `store_vw` (largest of {4,2,1} dividing wmma_rep); wmma_rep in {1,2,4} is a single chunk, 8 -> two dwordx4.
     if wmma_rep % 4 == 0:
         store_vw = 4
     elif wmma_rep % 2 == 0:
@@ -207,9 +206,8 @@ def build_moe_scatter_copy_preshuffle_scale_module(
                 # col = sd*wmma_rep + chunk*store_vw  (+ j for j in [0, store_vw))
                 dst_off = expert_dword_base + out_row * c_dpr + sd * c_wmma_rep + w_base
 
-                # Collect this chunk's store_vw dwords (one per wmma_rep row). The
-                # gather/identity choice is resolved in the plain helper, so no
-                # build-time `if` appears inside this rewritten kernel body.
+                # Collect this chunk's store_vw dwords (one per wmma_rep row). The gather/identity choice is resolved in
+                # the plain helper, so no build-time `if` appears inside this rewritten kernel body.
                 elems = []
                 for j in range_constexpr(store_vw):
                     grow = (

@@ -213,9 +213,8 @@ def run_benchmark(args, defaults):
 def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="Fused A8W8 Blockscale + A16W16 GEMM")
     parser = add_argparse_ff(parser)
-    # get_ff_args destructures a 4-element --shape as (B, M, N, K); for this op
-    # --shape is (M, N8, N16, K), so the shape path reads args.shape directly
-    # and ignores that (B, M, N, K) mapping.
+    # get_ff_args destructures a 4-element --shape as (B, M, N, K); for this op --shape is (M, N8, N16, K),
+    # so the shape path reads args.shape directly and ignores that (B, M, N, K) mapping.
     return get_ff_args(parser, args=args)
 
 

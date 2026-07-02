@@ -48,9 +48,7 @@ __all__ = [
 ]
 
 
-# -------------------------------
 # GPU Architecture
-# -------------------------------
 ArchFamily = Literal["cdna", "rdna"]
 
 CDNA_ARCHS = frozenset({"gfx908", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx950"})
@@ -114,9 +112,7 @@ class GpuArch:
         )
 
 
-# -------------------------------
 # Global Variables
-# -------------------------------
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 AUTOTUNE: AutotuneMode = (
     "on"
@@ -160,9 +156,7 @@ PHILOX_OFFSET = 0x1D4B49
 SHAPE_EXPECTATIONS: Literal["exact", "rounded"] = "exact"
 
 
-# -------------------------------
 # FP8
-# -------------------------------
 _FP8_DTYPES = frozenset(
     {
         torch.float8_e4m3fnuz,
@@ -218,9 +212,7 @@ def is_fp8(
     raise TypeError(f"Expected dtype, Tensor, or sequence of Tensors, got {type(x)}")
 
 
-# -------------------------------
 # Shape/Stride Helpers
-# -------------------------------
 def get_shape_from_layout(
     x: torch.Tensor,
     layout: Literal["bshd", "bhsd", "thd"],
@@ -275,17 +267,13 @@ def get_padded_headsize(size: int) -> int:
     return padded_d_model
 
 
-# -------------------------------
 # Misc helpers
-# -------------------------------
 def round_multiple(x: int, m: int) -> int:
     """Round x up to the nearest multiple of m."""
     return (x + m - 1) // m * m
 
 
-# -------------------------------
 # Runtime info
-# -------------------------------
 @functools.cache
 def is_hip() -> bool:
     """Check if running on HIP (AMD) backend."""
@@ -322,10 +310,7 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
     # Compute current XCD and local pid within the XCD
     xcd = pid % NUM_XCDS
     local_pid = pid // NUM_XCDS
-    # Calculate new pid based on the new grouping
-    # Note that we need to consider the following two cases:
-    # 1. the current pid is on a tall xcd
-    # 2. the current pid is on a short xcd
+    # Calculate new pid based on the new grouping (tall vs short xcd)
     if xcd < tall_xcds:
         pid = xcd * pids_per_xcd + local_pid
     else:

@@ -90,9 +90,8 @@ def fused_clamp_act_mul(
                 )
         num_blocks = (n_half + quant_block_size - 1) // quant_block_size
         if shuffle_scale:
-            # Scales are preshuffled inside the kernel (see e8m0_shuffle /
-            # aiter.ops.shuffle.shuffle_scale): rows padded to a multiple of 256
-            # and block-cols to a multiple of 8, written in the tiled layout.
+            # Scales are preshuffled inside the kernel (see e8m0_shuffle / aiter.ops.shuffle.shuffle_scale):
+            # rows padded to a multiple of 256 and block-cols to a multiple of 8, written in the tiled layout.
             scale_m_pad = (M + 255) // 256 * 256
             scale_n_pad = (num_blocks + 7) // 8 * 8
             if scale is None:

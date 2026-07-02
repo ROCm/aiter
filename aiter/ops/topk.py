@@ -57,8 +57,7 @@ def topk_gating(
         score_func in _VALID_SCORE_FUNCS
     ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
     if correction_bias is None:
-        # Match gating dtype/device so dispatch picks DTYPE_B == DTYPE_I,
-        # avoiding extra kernel template instantiations.
+        # Match gating dtype/device so dispatch picks DTYPE_B == DTYPE_I, avoiding extra kernel template instantiations.
         correction_bias = torch.empty(
             0, dtype=gating_output.dtype, device=gating_output.device
         )

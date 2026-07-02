@@ -55,9 +55,7 @@ _DEV = "cuda"
 _PEAK_BW_GBPS = 8000.0
 
 
-# ============================================================================
 # Reference (pure torch) -- mirrors Attention.forward L682-L686 in model.py.
-# ============================================================================
 
 
 def _cos_sin(max_pos, rope_dim, dtype):
@@ -124,9 +122,7 @@ def _kv_only_ref(kv, kv_weight, cos, sin, pos, eps, *, is_neox, group_size):
     return nope_fp8, scale_e8m0, pe_rotated.to(torch.bfloat16)
 
 
-# ============================================================================
 # Main test
-# ============================================================================
 
 
 @benchmark()
@@ -150,12 +146,10 @@ def test_fused_kv_norm_rope_group_quant(T, D, RD, *, is_neox, G):
         kv, kv_weight, cos, sin, pos, eps, is_neox=is_neox, group_size=G
     )
 
-    # Paged KV cache + slot_mapping. Use a random permutation of distinct slots
-    # (no collisions) so the test exercises a non-identity paged scatter. Caches
-    # are [num_blocks, page_size, entry] (MQA: no num_kv_heads dim); the kernel
-    # writes each token to slot_mapping[token] = block*page_size + offset.
-    # Zero-init so unwritten slots AND each entry's trailing pad read back as zero
-    # (asm-reader contract).
+    # Paged KV cache + slot_mapping: random permutation of distinct slots (no collisions) for a non-identity paged
+    # scatter. Caches are [num_blocks, page_size, entry] (MQA: no num_kv_heads dim); token -> slot_mapping[token] =
+    # block*page_size + offset. Zero-init so unwritten slots and each entry's trailing pad read
+    # back as zero (asm-reader contract).
     page_size = 1
     num_blocks = (T + page_size - 1) // page_size + 1  # a little slack
     num_slots = num_blocks * page_size
@@ -190,9 +184,8 @@ def test_fused_kv_norm_rope_group_quant(T, D, RD, *, is_neox, G):
     rope_buff = k_rope_buff.view(num_slots, RD)[slot_mapping].unsqueeze(1)
 
     # --- Accuracy ---
-    # K nope fp8 from nope_scale_buff[..., 0:nope]; e8m0 scale @[nope:nope+2*n_groups),
-    # written as each tile-scale duplicated x2 (s0,s0,s1,s1,...). Take the first of
-    # each pair for dequant; verify BOTH halves equal the reference scale.
+    # K nope fp8 from nope_scale_buff[..., 0:nope]; e8m0 scale @[nope:nope+2*n_groups), written as each tile-scale
+    # duplicated x2 (s0,s0,s1,s1,...). Take the first of each pair for dequant; verify BOTH halves equal the reference scale.
     k_nope_got = nope_scale_buff[..., :nope]
     k_scale_pairs = (
         nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups]
@@ -229,9 +222,8 @@ def test_fused_kv_norm_rope_group_quant(T, D, RD, *, is_neox, G):
     )
 
     # --- Bandwidth (effective): read kv + kv_weight, write K (nope+scale+rope) ---
-    # The wrapper still pays for a dummy bf16 Q wave alongside (see module
-    # docstring); that read+write is included in the kernel time but excluded
-    # from this "useful" byte count, so reported %peak is conservative.
+    # The wrapper still pays for a dummy bf16 Q wave (see module docstring),
+    # included in kernel time but not in this byte count, so %peak is conservative.
     bytes_in = T * NK * D * 2 + D * 2
     bytes_out = T * NK * (nope + 2 * n_groups) + T * NK * RD * 2
     gbps = (bytes_in + bytes_out) / (us * 1e-6) / 1e9
@@ -248,9 +240,7 @@ def test_fused_kv_norm_rope_group_quant(T, D, RD, *, is_neox, G):
     }
 
 
-# ============================================================================
 # argparse + matrix sweep
-# ============================================================================
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

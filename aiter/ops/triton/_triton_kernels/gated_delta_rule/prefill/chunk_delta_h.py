@@ -1317,11 +1317,9 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     T_flat = w.shape[2]
 
     if cu_seqlens is not None:
-        # Pass the ORIGINAL (cache-stable) cu_seqlens + decode ints into the
-        # cached prologue helpers so chunk_indices / chunk_offsets are built
-        # once per (cu_seqlens_id, BT, num_decodes, num_decode_tokens) tuple
-        # (no per-forward .tolist() D2H). The kernel walks the pre-sliced
-        # prefill data via the rebased cu_seqlens.
+        # Pass the ORIGINAL (cache-stable) cu_seqlens + decode ints into the cached prologue helpers so
+        # chunk_indices / chunk_offsets are built once per (cu_seqlens_id, BT, num_decodes, num_decode_tokens) tuple
+        # (no per-forward .tolist() D2H). The kernel walks the pre-sliced prefill data via the rebased cu_seqlens.
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, chunk_size, num_decodes, num_decode_tokens
         )

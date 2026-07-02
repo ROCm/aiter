@@ -143,10 +143,9 @@ def _find_grouped_config(
     }
     rows = _load_grouped_config_rows()
 
-    # Hardware is locked by (gfx, cu_num): gfx (architecture) is always a hard
-    # constraint, while cu_num can be relaxed as a fallback. Columns missing from
-    # the CSV (e.g. older configs without a 'gfx' column) are skipped, so this
-    # stays backward compatible with pre-gfx tuned files.
+    # Hardware is locked by (gfx, cu_num): gfx (architecture) is always a hard constraint, while cu_num can be relaxed
+    # as a fallback. Columns missing from the CSV (e.g. older configs without a 'gfx' column) are skipped, so this stays
+    # backward compatible with pre-gfx tuned files.
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():
             if k == "cu_num" and not require_cu_num:
@@ -469,9 +468,8 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     split_k1 = 1
     split_k2 = 1
     grouped_contiguous_m = False
-    # WST / As-prologue requests, applied to BOTH gemm1 and gemm2. Precedence:
-    # env var (if set) > CSV column > default(off). CSV sets the per-row default;
-    # an explicitly-set env var overrides it.
+    # WST / As-prologue requests, applied to BOTH gemm1 and gemm2. Precedence: env var (if set) > CSV column >
+    # default(off). CSV sets the per-row default; an explicitly-set env var overrides it.
     wave_specialized_tdm_req = False
     tdm_as_in_prologue_req = False
     cfg_row = _find_grouped_config(
@@ -534,8 +532,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             split_k2,
             stage1_weight_layout,
         )
-    # Env vars override the CSV when explicitly set (presence check, so an env
-    # value of "0" also overrides a CSV "1").
+    # Env vars override the CSV when explicitly set (presence check, so an env value of "0" also overrides a CSV "1").
     if "AITER_GROUPED_GEMM_WAVE_SPECIALIZED" in os.environ:
         wave_specialized_tdm_req = (
             os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] in _TRUTHY_ENV
@@ -553,10 +550,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     tile_k = _as_int(cfg_row.get("tile_k"), 256) if cfg_row else 256
     warp_tile_m = tile_m // m_warp
-    # gemm2 (stage2) tiles: tile_{m,n,k}2, each defaulting to the shared gemm1
-    # tile_{m,n,k} above. Absent columns keep the old behavior. max_m / routing
-    # use the shared tile_m; correctness of any non-default override is the
-    # caller's responsibility.
+    # gemm2 (stage2) tiles: tile_{m,n,k}2, each defaulting to the shared gemm1 tile_{m,n,k} above. Absent columns keep
+    # the old behavior. max_m / routing use the shared tile_m; correctness of any non-default override is the caller's
+    # responsibility.
     tile_m2 = _as_int(cfg_row.get("tile_m2"), tile_m) if cfg_row else tile_m
     tile_n2 = _as_int(cfg_row.get("tile_n2"), tile_n) if cfg_row else tile_n
     tile_k2 = _as_int(cfg_row.get("tile_k2"), tile_k) if cfg_row else tile_k

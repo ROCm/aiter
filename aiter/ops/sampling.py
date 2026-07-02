@@ -58,26 +58,18 @@ direct_register_custom_op(
 )
 
 
-# ---------------------------------------------------------------------------
 # "top-k first" fast path for top_k_top_p_sampling_from_probs.
+# Mirrors flashinfer PR #3461: for a modest scalar top_k over a large vocab, top-k select first then top-p over only the
+# k survivors is far cheaper than the fused full-vocab rejection kernel (one CTA per row, GPU-underutilized at small
+# batch).
 #
-# Mirrors flashinfer PR #3461: for a modest scalar top_k over a large vocab,
-# selecting the top-k entries first and running top-p over only those k
-# survivors is far cheaper than the fused full-vocab rejection kernel, which
-# launches a single CTA per row and underutilizes the GPU at small batch.
-#
-# Semantic note (why this is NOT a verbatim port of flashinfer): aiter's fused
-# TopKTopPSamplingFromProbKernel applies the top-p threshold on the ORIGINAL
-# (un-renormalized) probability mass (`aggregate_gt_pivot.value < p`),
-# intersected with the top-k count. flashinfer's `top_k_first` instead
-# renormalizes after top-k and then applies top-p. To stay distribution-
-# equivalent to aiter's existing kernel we renormalize the k survivors (mass S
-# per row, needed so the top-p kernel's proportional draw u~U[0,1) is valid)
-# and scale the threshold to p' = p / S (clamped to 1), so that
+# Not a verbatim flashinfer port: aiter's fused kernel applies top-p on the
+# ORIGINAL (un-renormalized) mass intersected with top-k, whereas flashinfer
+# renormalizes after top-k. To stay distribution-equivalent we renormalize the k
+# survivors (mass S per row, so the top-p kernel's draw u~U[0,1) is valid) and
+# scale the threshold to p' = p / S (clamped to 1), so that
 #     mass_k(x > pivot) < p'   <=>   mass_orig(x > pivot) < p .
-# This makes the accepted set identical to the fused kernel's, modulo
-# measure-zero floating-point ties at the boundary.
-# ---------------------------------------------------------------------------
+# Accepted set matches the fused kernel modulo measure-zero fp ties.
 _TOPK_FIRST_FAST_MAX_K = 256
 _TOPK_FIRST_FAST_MIN_VOCAB = 65536
 
@@ -138,15 +130,14 @@ def _topk_first_fast_path(
     top_p_val: float,
     deterministic: bool,
 ) -> torch.Tensor:
-    # 1. parallel top-k selection: shrinks the row the top-p kernel must scan
-    #    from `vocab` down to `k`.
+    # 1. parallel top-k selection: shrinks the row the top-p kernel must scan from `vocab` down to `k`.
     values, gathered_indices = _select_topk(probs, top_k_val)
-    # 2. renormalize over the k survivors so the top-p kernel's proportional
-    #    draw stays well-defined; clamp guards degenerate (all-zero) rows.
+    # 2. renormalize over the k survivors so the top-p kernel's proportional draw stays well-defined; clamp guards
+    # degenerate (all-zero) rows.
     denom = values.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     probs_k = values / denom
-    # 3. scale the top-p threshold to compensate for renormalization so the
-    #    accepted set matches aiter's original-mass top-p semantics.
+    # 3. scale the top-p threshold to compensate for renormalization so the accepted set matches aiter's original-mass
+    # top-p semantics.
     s = denom.squeeze(-1)
     if maybe_top_p_arr is not None:
         top_p_eff = (maybe_top_p_arr.float() / s).clamp_(max=1.0)
@@ -160,9 +151,8 @@ def _topk_first_fast_path(
         0.0,
         deterministic,
     )
-    # 5. map the local choice back to the global vocab index. The gathered
-    #    indices are always valid in [0, vocab), so the output is in-range even
-    #    on degenerate rows.
+    # 5. map the local choice back to the global vocab index. The gathered indices are always valid in [0, vocab), so
+    # the output is in-range even on degenerate rows.
     return (
         gathered_indices.gather(1, local.view(-1, 1).long()).squeeze(1).to(torch.int32)
     )

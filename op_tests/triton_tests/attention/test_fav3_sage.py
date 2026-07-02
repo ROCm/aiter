@@ -910,8 +910,7 @@ def test_sage_return_lse_matches_reference(
     assert (
         triton_lse.shape == lse_ref.shape
     ), f"LSE shape {tuple(triton_lse.shape)} != reference {tuple(lse_ref.shape)}"
-    # Pre-PR (no K-mean correction) the LSE is offset by
-    # softmax_scale * Q . mean(K)^T, which is O(1)+ in magnitude.
+    # Pre-PR (no K-mean correction) the LSE is offset by softmax_scale * Q . mean(K)^T, which is O(1)+ in magnitude.
     # With the correction, the residual is bounded by sage's int8/fp8 quant noise.
     torch.testing.assert_close(
         triton_lse,

@@ -700,9 +700,8 @@ def _mhc_post_kernel(
         other=0.0,
     )
 
-    # Pre-load each row of the per-token (n_src, n_dst) comb_mix matrix into
-    # a tuple of 2-D tiles. Each ``comb_rows[h]`` has shape (BLOCK_M, n_dst)
-    # and lives in registers across the C-loop, eliminating per-C-tile
+    # Pre-load each row of the per-token (n_src, n_dst) comb_mix matrix into a tuple of 2-D tiles. Each
+    # ``comb_rows[h]`` has shape (BLOCK_M, n_dst) and lives in registers across the C-loop, eliminating per-C-tile
     # reloads of the small per-token coefficients.
     comb_rows = ()
     for h in tl.static_range(n):
@@ -721,10 +720,9 @@ def _mhc_post_kernel(
         rc = c_start + tl.arange(0, BLOCK_C)
         c_mask = rc < C
 
-        # ``x`` and ``residual`` are bf16 / fp16 in production. Keeping them
-        # in their native dtype halves on-chip footprint vs an upfront fp32
-        # promotion; mixed-dtype multiply with fp32 ``post_mix`` / ``comb``
-        # is auto-promoted by Triton with an fp32 accumulator.
+        # ``x`` and ``residual`` are bf16 / fp16 in production. Keeping them in their native dtype halves on-chip
+        # footprint vs an upfront fp32 promotion; mixed-dtype multiply with fp32 ``post_mix`` / ``comb`` is
+        # auto-promoted by Triton with an fp32 accumulator.
         x_tile = tl.load(
             x_ptr + rm[:, None] * stride_x_m + rc[None, :] * stride_x_c,
             mask=m_mask[:, None] & c_mask[None, :],
@@ -895,9 +893,8 @@ def _mhc_post_pre_split_kernel(
     # The 4D outer product `comb[:, :, :, None] * res[:, :, None, :]` of shape
     # (BLOCK_M, n_src, n_dst, BLOCK_C) is folded into tl.sum(axis=1); Triton
     # fuses the broadcast + sum into a register-resident reduction without
-    # materializing the full 4D intermediate. Measured ~25-40% faster than the
-    # manual static_range(n) per-h load+accumulate at M ∈ {1..256}, hc=4,
-    # C=4096.
+    # materializing the full 4D intermediate. Faster than the manual
+    # static_range(n) per-h load+accumulate.
     out_tile = post_mix_tile[:, :, None] * x_tile[:, None, :].to(tl.float32)
     out_tile += tl.sum(
         comb_3d[:, :, :, None] * res_3d[:, :, None, :].to(tl.float32),
@@ -1125,9 +1122,8 @@ def _mhc_post_pre_reduce_apply_kernel(
     NUM_M_BLOCKS_POST_RES = tl.cdiv(M, BLOCK_M_POST_RES)
 
     K_INV: tl.constexpr = 1.0 / K
-    # POST_PID == NUM_C_BLOCKS, RES_PID == NUM_C_BLOCKS + 1 (inlined below to
-    # sidestep Triton's constexpr-arithmetic restriction on `: tl.constexpr =`
-    # binding sites).
+    # POST_PID == NUM_C_BLOCKS, RES_PID == NUM_C_BLOCKS + 1 (inlined below to sidestep Triton's constexpr-arithmetic
+    # restriction on `: tl.constexpr =` binding sites).
 
     ks_offs = tl.arange(0, KSPLIT_POW2)
     if KSPLIT_POW2 != ACTUAL_KSPLIT:

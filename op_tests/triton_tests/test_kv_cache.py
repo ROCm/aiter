@@ -128,10 +128,8 @@ def check_kv_buffer(
         kv_buffer_rope_dquant = torch_dequant_nvfp4(
             kv_buffer_rope, kv_buffer_rope_scales, out_dtype=dtype
         )
-        # Only compare the slots that were actually written via slot_mapping. The
-        # dequantized buffers are (num_blocks * KH, block_size, D); most of the
-        # buffer is zero-padding that matches trivially and would otherwise
-        # dilute the mismatch ratio, making tol_err_ratio meaningless.
+        # Only compare slots actually written via slot_mapping; the rest of the (num_blocks * KH, block_size, D) buffer
+        # is zero-padding that would dilute the mismatch ratio and make tol_err_ratio meaningless.
         num_blocks, KH = ref_kv_buffer.shape[0], ref_kv_buffer.shape[1]
         slot_t = slot_mapping // block_size
         slot_b = slot_mapping % block_size
@@ -142,12 +140,8 @@ def check_kv_buffer(
             d = dquant.shape[-1]
             return dquant.reshape(num_blocks, KH, block_size, d)[slot_t, :, slot_b]
 
-        # NVFP4 is a 4-bit format with only 8 magnitude levels, so a single FP4
-        # quantization step (~0.15 at these magnitudes) exceeds atol=0.1. Benign
-        # fp32-vs-bf16 / RoPE arithmetic differences between the kernel and this
-        # reference can flip a small number of elements to an adjacent FP4 code.
-        # Tolerate a tiny fraction of such mismatches instead of requiring an
-        # exact match.
+        # NVFP4 has only 8 magnitude levels, so one quant step (~0.15 here) exceeds atol=0.1; benign fp32-vs-bf16 / RoPE
+        # diffs can flip a few elements to an adjacent FP4 code, so tolerate a small mismatch ratio.
         checkAllclose(
             gather_written_slots(ref_kv_buffer_lora_dquant),
             gather_written_slots(kv_buffer_lora_dquant),

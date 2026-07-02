@@ -140,9 +140,8 @@ def _make_mla_mi400_case(
     num_pages_per_batch = (ctx_lens + page_size - 1) // page_size
 
     if num_kv_splits is None:
-        # Mirror mla_decode_fwd(num_kv_splits=None): resolve the auto split count
-        # and its indptr through the shared meta-param heuristic so the case
-        # carries a concrete value for the shape checks and the kernel args.
+        # Mirror mla_decode_fwd(num_kv_splits=None): resolve the auto split count and its indptr through the shared
+        # meta-param heuristic so the case carries a concrete value for the shape checks and the kernel args.
         num_kv_splits, num_kv_splits_indptr = aiter.mla.get_meta_param(
             None,
             batch,
@@ -170,10 +169,8 @@ def _make_mla_mi400_case(
     kv_last_page_lens = torch.full(
         (batch,), last_page_len, dtype=torch.int32, device=device
     )
-    # gfx1250/mi400 stage1 asm kernel consumes a PAGE-level kv_indptr directly
-    # (it walks the page-level kv_indices block table). Build it here as the
-    # per-batch prefix sum of page counts so mla.py no longer needs to convert a
-    # token-level kv_indptr. With uniform ctx_lens this is [0, npb, 2*npb, ...].
+    # gfx1250/mi400 stage1 asm kernel consumes a PAGE-level kv_indptr directly, so build it as the per-batch prefix sum
+    # of page counts ([0, npb, 2*npb, ...] for uniform ctx_lens).
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=device)
     kv_indptr[1:] = torch.cumsum(
         torch.full((batch,), num_pages_per_batch, dtype=torch.int32, device=device),
@@ -256,12 +253,9 @@ def _make_mla_mi400_kv_case(
                 dtype=kv_buffer_source_bf16.dtype,
                 device=kv_buffer_source_bf16.device,
             )
-    # Poison the unused tail of every batch's last (partially filled) page with
-    # NaN. When ctx_lens % page_size != 0 the final logical page of each batch
-    # keeps only last_page_len valid tokens; slots [last_page_len:page_size] are
-    # never valid KV. The kernel must honor kv_last_page_lens / kv_indptr and
-    # never read past them, so a correct kernel still yields a finite, matching
-    # output. The PyTorch reference excludes this tail via kv[:ctx_lens].
+    # Poison the never-valid tail (slots [last_page_len:page_size]) of each batch's
+    # last partially-filled page with NaN: a correct kernel honors kv_last_page_lens/
+    # kv_indptr and never reads past them, so output stays finite. Ref excludes it via kv[:ctx_lens].
     last_page_len = ctx_lens % page_size or page_size
     if last_page_len != page_size:
         last_logical_pages = [(b + 1) * num_pages_per_batch - 1 for b in range(batch)]

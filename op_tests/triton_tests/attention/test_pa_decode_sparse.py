@@ -81,9 +81,7 @@ def pa_decode_sparse_reference(
     ).squeeze(0)
 
 
-# ---------------------------------------------------------------------------
 # Input builder
-# ---------------------------------------------------------------------------
 
 
 def _make_inputs(
@@ -138,12 +136,8 @@ def _make_inputs(
     return q, unified_kv, indices, indptr, attn_sink, softmax_scale
 
 
-# ---------------------------------------------------------------------------
-# skip_reduce: the wrapper hands back the pre-reduce split-K partials and the
-# caller is responsible for the log-sum-exp combine + sink fold. This mirrors
-# the _pa_decode_sparse_reduce kernel in pure torch so we can validate the
-# partials against the dense reference.
-# ---------------------------------------------------------------------------
+# skip_reduce: wrapper returns pre-reduce split-K partials; caller does the
+# log-sum-exp combine + sink fold. Mirrors _pa_decode_sparse_reduce in torch.
 
 
 def _wrapper_main_kernel_params(D: int):
@@ -186,9 +180,8 @@ def _reduce_partials_torch(
     out = torch.empty(T, H, D, dtype=torch.float32, device=device)
     for t in range(T):
         n = int(kv_lens[t].item())
-        # Match the kernel's tiles_per_segment / act_num_segments masking so we
-        # ignore the stale (uninitialised) partial-buffer slots that the split
-        # kernel early-returned on.
+        # Match the kernel's tiles_per_segment / act_num_segments masking to
+        # ignore stale partial-buffer slots the split kernel early-returned on.
         if n <= 0:
             act_num_segments = 0
         else:
@@ -270,16 +263,13 @@ def test_pa_decode_sparse_vs_reference(
             acc_partial, m_partial, l_partial, sink, indptr, block_k, use_exp2
         ).to(q.dtype)
     else:
-        # kv_splits == 1 (skip_reduce is a no-op) or skip_reduce=False: the
-        # wrapper already returns the final output.
+        # kv_splits == 1 (skip_reduce is a no-op) or skip_reduce=False: the wrapper already returns the final output.
         out = result
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
 
 
-# ---------------------------------------------------------------------------
 # FP8 KV cache quantization helpers
-# ---------------------------------------------------------------------------
 
 _FP8_GROUP_SIZE = 64
 _FP8_DTYPE = torch.float8_e4m3fnuz

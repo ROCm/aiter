@@ -64,7 +64,7 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
     BLOCK_N: tl.constexpr,
 ):
     start_n = tl.multiple_of(start_n, BLOCK_N)
-    # -- compute qk ----
+    # compute qk
     k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
     qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
     invalid_mask = offs_m[:, None] == offs_n[None, :]

@@ -99,11 +99,9 @@ def fused_qknorm_idxrqknorm(
     v_scale: Optional[Tensor] = None,
     asm_layout: bool = False,
 ) -> None:
-    # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
-    # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
-    # (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k /
-    # kv_cache_v are typically the key/value slices of a fused
-    # [num_blocks, 2, block_size, num_kv_heads, head_dim] cache).
+    # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v tensors. asm_layout selects the in-cache
+    # addressing: page-16 SHUFFLE (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k / kv_cache_v
+    # are typically the key/value slices of a fused [num_blocks, 2, block_size, num_kv_heads, head_dim] cache).
     if (
         kv_cache_k is not None
         and isinstance(kv_cache_dtype, str)

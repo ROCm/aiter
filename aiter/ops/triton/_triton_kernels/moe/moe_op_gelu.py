@@ -77,10 +77,8 @@ def _fused_moe_kernel(
     N,
     K,
     num_valid_tokens,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `stride_am` is how much to increase `a_ptr` by to get the element one row down (A has M rows).
     stride_am,
     stride_ak,
     stride_be,
@@ -153,8 +151,7 @@ def _fused_moe_kernel(
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
+    # We will advance this pointer as we move in the K direction and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -164,8 +161,7 @@ def _fused_moe_kernel(
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
         # -----------------------------------------------------------
-        # Write back zeros to the output when the expert is not
-        # in the current expert parallel rank.
+        # Write back zeros to the output when the expert is not in the current expert parallel rank.
         _write_zeros_to_output(
             c_ptr,
             stride_cm,
@@ -211,13 +207,11 @@ def _fused_moe_kernel(
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
+        # Load the next block of A and B, generate a mask by checking the K dimension.
         if EVEN_K:
             a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
             b = tl.load(b_ptrs)
@@ -295,10 +289,8 @@ def _fused_moe_persistent_kernel(
     N,
     K,
     num_valid_tokens,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `stride_am` is how much to increase `a_ptr` by to get the element one row down (A has M rows).
     stride_am,
     stride_ak,
     stride_be,
@@ -417,8 +409,7 @@ def _fused_moe_persistent_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            # Load the next block of A and B, generate a mask by checking the
-            # K dimension.
+            # Load the next block of A and B, generate a mask by checking the K dimension.
             if EVEN_K:
                 a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
                 b = tl.load(b_ptrs)

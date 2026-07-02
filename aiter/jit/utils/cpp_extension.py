@@ -93,14 +93,11 @@ def get_hip_version():
         return output
     except Exception:
         pass
-    # The fallbacks below previously hard-coded /opt/rocm, so they never
-    # helped users whose ROCm lives elsewhere.  Resolve the ROCm root the
-    # same way the rest of this module does (ROCM_HOME / ROCM_PATH env, then
-    # `which hipcc`, then /opt/rocm).  NOTE: the module-level ROCM_HOME global
-    # is assigned *after* this function is first called (see bottom of file),
-    # so we must call _find_rocm_home() directly here rather than referencing
-    # the global.  /opt/rocm is kept as a last-resort candidate so behavior on
-    # default installs is unchanged.
+    # Resolve the ROCm root the same way the rest of this module does
+    # (ROCM_HOME / ROCM_PATH env, then `which hipcc`, then /opt/rocm as a
+    # last resort). NOTE: the module-level ROCM_HOME global is assigned *after*
+    # this function is first called (see bottom of file), so call
+    # _find_rocm_home() directly here rather than referencing the global.
     rocm_roots = []
     discovered = _find_rocm_home()
     if discovered:
@@ -145,10 +142,9 @@ def _find_rocm_home() -> Optional[str]:
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm_home is None:
         # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
-        # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
-        # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
-        # wrapper, not a real binary — realpath() can't recover the SDK
-        # root from it.
+        # tree under site-packages/_rocm_sdk_devel/. Prefer it over a
+        # hipcc-on-PATH lookup: the venv's bin/hipcc is a python wrapper, so
+        # realpath() can't recover the SDK root from it.
         try:
             spec = importlib.util.find_spec("_rocm_sdk_devel")
         except (ImportError, ValueError):
@@ -610,14 +606,11 @@ class BuildExtension(build_ext):
             depends=None,
         ):
             r"""Compiles sources by outputting a ninja file and running it."""
-            # NB: I copied some lines from self.compiler (which is an instance
-            # of distutils.UnixCCompiler). See the following link.
+            # NB: copied some lines from self.compiler (a distutils.UnixCCompiler).
             # https://github.com/python/cpython/blob/f03a8f8d5001963ad5b5b28dbd95497e9cc15596/Lib/distutils/ccompiler.py#L564-L567
-            # This can be fragile, but a lot of other repos also do this
-            # (see https://github.com/search?q=_setup_compile&type=Code)
-            # so it is probably OK; we'll also get CI signal if/when
-            # we update our python version (which is when distutils can be
-            # upgraded)
+            # Fragile, but many other repos do this too
+            # (https://github.com/search?q=_setup_compile&type=Code) and CI will
+            # signal if a python/distutils upgrade breaks it.
 
             # Use absolute path for output_dir so that the object file paths
             # (`objects`) get generated with absolute paths.
@@ -720,10 +713,8 @@ class BuildExtension(build_ext):
             extension.extra_compile_args.append(flag)
 
     def _define_torch_extension_name(self, extension):
-        # pybind11 doesn't support dots in the names
-        # so in order to support extensions in the packages
-        # like torch._C, we take the last part of the string
-        # as the library name
+        # pybind11 doesn't support dots in the names so in order to support extensions in the packages
+        # like torch._C, we take the last part of the string as the library name
         names = extension.name.split(".")
         name = names[-1]
         define = f"-DTORCH_EXTENSION_NAME={name}"
@@ -1527,18 +1518,13 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-        # Warning: don't pass stdout=None to subprocess.run to get output.
-        # subprocess.run assumes that sys.__stdout__ has not been modified and
-        # attempts to write to it by default.  However, when we call _run_ninja_build
-        # from ahead-of-time cpp extensions, the following happens:
-        # 1) If the stdout encoding is not utf-8, setuptools detachs __stdout__.
-        #    https://github.com/pypa/setuptools/blob/7e97def47723303fafabe48b22168bbc11bb4821/setuptools/dist.py#L1110
-        #    (it probably shouldn't do this)
-        # 2) subprocess.run (on POSIX, with no stdout override) relies on
-        #    __stdout__ not being detached:
-        #    https://github.com/python/cpython/blob/c352e6c7446c894b13643f538db312092b351789/Lib/subprocess.py#L1214
-        # To work around this, we pass in the fileno directly and hope that
-        # it is valid.
+        # Warning: don't pass stdout=None to subprocess.run. It writes to
+        # sys.__stdout__, but when _run_ninja_build runs from an AOT cpp
+        # extension setuptools may have detached __stdout__ (non-utf-8 stdout
+        # encoding), which POSIX subprocess.run relies on. Work around by
+        # passing the fileno directly.
+        #   https://github.com/pypa/setuptools/blob/7e97def47723303fafabe48b22168bbc11bb4821/setuptools/dist.py#L1110
+        #   https://github.com/python/cpython/blob/c352e6c7446c894b13643f538db312092b351789/Lib/subprocess.py#L1214
         stdout_fileno = 1
         subprocess.run(
             command,
@@ -1635,8 +1621,7 @@ def _write_ninja_file_to_build_library(
         if python_include_path is not None:
             system_includes.append(python_include_path)
 
-    # Turn into absolute paths so we can emit them into the ninja build
-    # file wherever it is.
+    # Turn into absolute paths so we can emit them into the ninja build file wherever it is.
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
 
     if not torch_exclude:
@@ -1760,8 +1745,7 @@ def _write_ninja_file(
         flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
     flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
 
-    # Turn into absolute paths so we can emit them into the ninja build
-    # file wherever it is.
+    # Turn into absolute paths so we can emit them into the ninja build file wherever it is.
     sources = [os.path.abspath(file) for file in sources]
 
     # See https://ninja-build.org/build.ninja.html for reference.
@@ -1780,12 +1764,10 @@ def _write_ninja_file(
         )
 
     # Emit one build rule per source to enable incremental build.
-    # Optional per-source override: ninja allows variable bindings under a
-    # build statement (indented `var = value` on the next line). For
-    # cuda_compile this re-binds $cuda_post_cflags for that single
-    # translation unit, which is exactly the granularity we need to apply
-    # something like -D__HIPCC_RTC__ to a kernel TU without breaking
-    # neighbouring host TUs. See `extra_cuda_cflags_per_source` docstring.
+    # Optional per-source override: ninja allows indented `var = value`
+    # bindings under a build statement, re-binding $cuda_post_cflags for a
+    # single TU (e.g. -D__HIPCC_RTC__ on a kernel TU without breaking host
+    # TUs). See `extra_cuda_cflags_per_source` docstring.
     import fnmatch as _fnmatch
 
     per_source_map = extra_cuda_cflags_per_source or {}
@@ -1817,9 +1799,8 @@ def _write_ninja_file(
         object_file_q = object_file.replace(" ", "$ ")
         build.append(f"build {object_file_q}: {rule} {source_file_q}")
         if per_source_flags:
-            # Append to the rule-level $cuda_post_cflags rather than
-            # replacing it, so the global flags (e.g. --offload-arch) stay
-            # in effect for this TU too.
+            # Append to the rule-level $cuda_post_cflags rather than replacing it, so the global flags
+            # (e.g. --offload-arch) stay in effect for this TU too.
             build.append(
                 "  cuda_post_cflags = "
                 f"{' '.join(cuda_post_cflags + list(per_source_flags))}"

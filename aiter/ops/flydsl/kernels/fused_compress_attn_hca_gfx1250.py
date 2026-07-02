@@ -36,10 +36,8 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from .tensor_shim import STensor, _to_raw, _run_compiled
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
 
-# Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
-# (the multi-wave LDS kernel references CompilationContext, STensor,
-# SmemAllocator, SmemPtr only inside @flyc.kernel / @flyc.jit closures,
-# which formatters may not see).
+# Force-bind LDS-related imports so format hooks don't drop them (referenced
+# only inside @flyc.kernel / @flyc.jit closures).
 _FORCE_BIND_LDS = (CompilationContext, STensor, SmemAllocator, SmemPtr, get_rocm_arch)
 
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
@@ -59,9 +57,7 @@ def _if_then(if_op):
                 scf.YieldOp([])
 
 
-# ============================================================================
 # Kernel A: compress_forward with multi-wave LDS K-split
-# ============================================================================
 
 
 def _build_compress_forward_kernel(
@@ -201,7 +197,7 @@ def _build_compress_forward_kernel(
         wid = arith.divsi(_to_raw(tid), c_WS)  # ? [0, NW)
         lid = arith.remui(_to_raw(tid), c_WS)  # ? [0, 32)
 
-        # -- Load plan row ----------------------------------------------
+        # Load plan row
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
         plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
@@ -213,8 +209,7 @@ def _build_compress_forward_kernel(
         is_active = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
         _if_active = scf.IfOp(is_active)
         with _if_then(_if_active):
-            # Per-thread head_dim base: each thread owns VEC contiguous
-            # elements starting at slice_base + lid * VEC.
+            # Per-thread head_dim base: each thread owns VEC contiguous elements starting at slice_base + lid * VEC.
             slice_base_i32 = ArithValue(sid) * c_SLICE
             col_off_base = slice_base_i32 + ArithValue(lid) * c_VEC
 
@@ -408,15 +403,9 @@ def _build_compress_forward_kernel(
             k_start_i32 = ArithValue(wid) * c_K_per_wave
             k_end_i32 = k_start_i32 + c_K_per_wave
 
-            # Split point inside this wave's K range. Each wave sees a
-            # window_len-dependent slice of Phase 1 followed by Phase 2.
-            # Cases (`wl = window_len`):
-            #   wl <= k_start:  pure Phase 2 (entire wave is input)
-            #   wl >= k_end:    pure Phase 1 (entire wave is state cache)
-            #   else:          mixed (Phase 1 in [k_start, wl), Phase 2 in [wl, k_end))
-            # ``split`` = clamp(wl, k_start, k_end) gives the boundary;
-            # both sub-loops are empty when their bound collapses, so any
-            # of the three cases naturally falls out.
+            # Split point = clamp(window_len, k_start, k_end): Phase 1 reads state cache in [k_start, split), Phase 2
+            # reads input in [split, k_end). Collapsing a sub-loop gives pure Phase 1 (wl>=k_end) or pure Phase 2
+            # (wl<=k_start).
             wl_i32 = _to_raw(window_len)
             split_lo = arith.maxsi(wl_i32, _to_raw(k_start_i32))
             split_i32 = arith.minsi(split_lo, _to_raw(k_end_i32))
@@ -427,8 +416,7 @@ def _build_compress_forward_kernel(
             init_w = [c_zero_f32 for _ in range(VEC)]
             init_state = init_m + init_kv + init_w
 
-            # Sub-loop 1: Phase 1 sub-range [k_start, split). Reads state
-            # cache; padded softmax (score can be -inf).
+            # Sub-loop 1: Phase 1 sub-range [k_start, split). Reads state cache; padded softmax (score can be -inf).
             phase1_local = init_state
             for k_static, state in range(
                 _to_raw(k_start_i32), _to_raw(split_i32), 1, init=init_state
@@ -443,9 +431,8 @@ def _build_compress_forward_kernel(
                 )
                 phase1_local = yield list(new_m) + list(new_kv) + list(new_w)
 
-            # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input;
-            # uses padded softmax (the is-pad-score branch is dead code
-            # since Phase 2 scores are always finite -- compiler elides).
+            # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input; uses padded softmax (the is-pad-score branch is
+            # dead code since Phase 2 scores are always finite -- compiler elides).
             # Carry Phase 1's accumulator through as init.
             final = phase1_local
             for k_static, state in range(
@@ -498,11 +485,8 @@ def _build_compress_forward_kernel(
 
             gpu.barrier()
 
-            # -- Cross-wave reduction: only wave 0 reads and reduces --
-            # Wave 0's 64 threads cover SLICE_SZ = 64 * VEC head_dim elements
-            # (VEC elements per thread). For each owned element, the thread
-            # reads NW values from LDS (one per K-split wave) and computes
-            # the global online-softmax.
+            # Cross-wave reduction: only wave 0 reads. For each of its VEC owned elements, read NW LDS values (one per
+            # K-split wave) and compute the global online-softmax.
             is_wave0 = arith.cmpi(CmpIPredicate.eq, wid, c_zero_i32)
             _if_w0 = scf.IfOp(is_wave0)
             with _if_then(_if_w0):
@@ -628,9 +612,7 @@ def _build_compress_forward_kernel(
     return launch_hca_compress_forward
 
 
-# ============================================================================
 # Kernel B: norm + rope + scatter (BF16, per-row)
-# ============================================================================
 
 
 def _build_norm_rope_scatter_kernel(
@@ -1064,9 +1046,7 @@ def _build_norm_rope_scatter_kernel(
     return launch_hca_norm_rope_scatter
 
 
-# ============================================================================
 # Cached compile + public API
-# ============================================================================
 
 
 _DEFAULT_COMPILE_HINTS = {
@@ -1198,9 +1178,8 @@ def flydsl_hca_compress_attn_gfx1250(
             slice_size = auto_slice
         if k_split_num_waves is None:
             k_split_num_waves = auto_kw
-    # User-facing input validation -- must be ``raise`` not ``assert`` (asserts
-    # are stripped under ``python -O``, which would let invalid inputs reach
-    # the kernel and silently corrupt outputs / fault the GPU).
+    # User-facing validation: use ``raise`` not ``assert`` (asserts are stripped
+    # under ``python -O``, letting bad inputs corrupt/fault the GPU).
     if head_dim != 512:
         raise ValueError(f"HCA 2-kernel only supports head_dim=512, got {head_dim}")
     if ratio != 128:
@@ -1290,11 +1269,8 @@ def flydsl_hca_compress_attn_gfx1250(
             raise TypeError("kv_compressed_scratch must be fp32")
         kv_compressed = kv_compressed_scratch
 
-    # CRITICAL: must pass current_stream when stream is None. Stream(None) =
-    # NULL/default stream, which during CUDA graph capture produces an empty
-    # graph entry (kernel launches don't get recorded into the active graph),
-    # so replay is a no-op -> HCA boundaries silently never fire in decode CG.
-    # Match v1 single-kernel pattern (fused_compress_attn.py:1381).
+    # CRITICAL: pass current_stream when stream is None. Stream(None)=NULL/default stream isn't recorded during CUDA
+    # graph capture, so replay is a no-op and HCA boundaries silently never fire in decode CG. Matches v1 single-kernel.
     if stream is None:
         stream = torch.cuda.current_stream()
     stream_obj = Stream(stream)

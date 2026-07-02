@@ -91,12 +91,10 @@ def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
     # Triton path.
     y_kern, s_kern = dynamic_mxfp8_quant(x)
 
-    # Scales must be bit-exact: the e8m0 derivation is integer-only after
-    # the fp32 cast, and amax is order-independent.
+    # Scales must be bit-exact: the e8m0 derivation is integer-only after the fp32 cast, and amax is order-independent.
     torch.testing.assert_close(s_kern, s_ref)
 
-    # Quantized values: compare via the uint8 view (allow off-by-1 for any
-    # rounding-mode subtlety in the fp32→fp8 cast).
+    # Quantized values: compare via the uint8 view (allow off-by-1 for any rounding-mode subtlety in the fp32→fp8 cast).
     torch.testing.assert_close(
         y_kern.view(torch.uint8).to(torch.int32),
         y_ref.view(torch.uint8).to(torch.int32),
@@ -406,8 +404,7 @@ def test_fused_flatten_mxfp8_quant(M: int, N1: int, N2: int, dtype: torch.dtype)
     # Scales must be bit-exact (integer-only after fp32 cast).
     torch.testing.assert_close(s_kern, s_ref)
 
-    # Quantized values: compare via uint8 view, allow off-by-1 for fp32->fp8
-    # rounding-mode subtlety.
+    # Quantized values: compare via uint8 view, allow off-by-1 for fp32->fp8 rounding-mode subtlety.
     torch.testing.assert_close(
         y_kern.view(torch.uint8).to(torch.int32),
         y_ref.view(torch.uint8).to(torch.int32),

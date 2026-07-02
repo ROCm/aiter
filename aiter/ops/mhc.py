@@ -135,15 +135,15 @@ def _mhc_fused_config_gfx950_256(m, hidden_size, num_cu):
 
     tile_n = 32  # tile_n=16 never wins on this chip
     if tile_k == 32:
-        # large-m underfill: geom fill at split_k 2..4 leaves ~1 wave; a 2nd
-        # K-reduction wave measured faster. Excludes geom>=8 (small m) and geom=1.
+        # large-m underfill: geom fill at split_k 2..4 leaves ~1 wave; a 2nd K-reduction wave measured faster. Excludes
+        # geom>=8 (small m) and geom=1.
         if 2 <= splitk <= 4 and (2 * splitk) in valid:
             splitk = 2 * splitk
         tile_m = 32 if (m + 31) // 32 * splitk >= num_cu else 16
     else:  # tile_k == 64: tile_m=32 would overflow LDS, keep 16
         tile_m = 16
-        # the compute-bound wide-k path wants >=2 K-reduction waves; fill gives
-        # sk=1 at this m but sk=2 is ~2-5% faster (measured m>=8192).
+        # the compute-bound wide-k path wants >=2 K-reduction waves; fill gives sk=1 at this m but sk=2 is ~2-5% faster
+        # (measured m>=8192).
         if splitk < 2 and 2 in valid:
             splitk = 2
     return splitk, tile_m, tile_n, tile_k
@@ -181,8 +181,8 @@ def _mhc_fused_config_gfx1250_256(m, hidden_size, num_cu):
     tile_n = 32
     tile_m = 16 if m <= 512 else 32
 
-    # (m upper bound, target split_k) measured per (m, hidden) then merged; the
-    # target is snapped to a legal divisor below so it stays valid for any hidden.
+    # (m upper bound, target split_k) measured per (m, hidden) then merged; the target is snapped to a legal divisor
+    # below so it stays valid for any hidden.
     if hidden_size >= 7168:
         table = [
             (128, 56),

@@ -146,10 +146,9 @@ def per_1x32_f4_quant(
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
 
-    # E8M0 block-scale dispatch via the generic helper; ``mode`` selects the
-    # formula (RoundDown / RoundUp / Even / Ceil) and ``dtype`` selects the
-    # ``max_pos`` / ``target_max_pow2`` / ``mbits`` constants -- see
-    # MxScaleRoundMode docstring for cross-stack equivalences.
+    # E8M0 block-scale dispatch via the generic helper; ``mode`` selects the formula (RoundDown / RoundUp / Even / Ceil)
+    # and ``dtype`` selects the ``max_pos`` / ``target_max_pow2`` / ``mbits`` constants -- see MxScaleRoundMode
+    # docstring for cross-stack equivalences.
     try:
         scale_e8m0_biased = fp4_utils.f32_to_mx_e8m0_scale(
             max_abs, mode=round_mode, dtype=MxDtypeInt.FP4_E2M1
@@ -265,12 +264,10 @@ def per_1x32_f8_scale_f8_quant(
         scale_f32 = max_abs / dtypeMax
         scale_e8m0_biased = None
     else:
-        # Route the e8m0 path through the centralized MX scale API so this
-        # reference honors MX_DEFAULT_ROUND_MODE (RoundUp / RCEIL =
-        # ceil_pow2(amax / max_pos)), matching the HIP kernel's
-        # fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, FP8_E4M3{,_FNUZ}>.
-        # The legacy f32_to_e8m0(amax / floor_pow2(max)) bypassed the default
-        # and diverged by one exponent on ~1/8 of groups vs the RoundUp kernel.
+        # Route the e8m0 path through the centralized MX scale API so this reference honors MX_DEFAULT_ROUND_MODE
+        # (RoundUp / RCEIL = ceil_pow2(amax / max_pos)), matching the HIP kernel's
+        # fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, FP8_E4M3{,_FNUZ}>. The legacy f32_to_e8m0(amax /
+        # floor_pow2(max)) bypassed the default and diverged by one exponent on ~1/8 of groups vs the RoundUp kernel.
         fp8_mx_dtype = (
             MxDtypeInt.FP8_E4M3_FNUZ if get_gfx() == "gfx942" else MxDtypeInt.FP8_E4M3
         )
@@ -341,11 +338,9 @@ def get_torch_quant(qType):
 
 @functools.lru_cache()
 def get_hip_quant(qType):
-    # `per_1x32` points to the dtype-aware MX entry so callers can do
-    # `get_hip_quant(QuantType.per_1x32)(x, quant_dtype=dtypes.fp4x2)` for
-    # MXFP4 or `quant_dtype=dtypes.fp8` for MXFP8. The legacy
-    # `per_1x32_f4_quant_hip` thin wrapper is preserved separately for
-    # external callers that imported it by name.
+    # `per_1x32` points to the dtype-aware MX entry so callers can do `get_hip_quant(QuantType.per_1x32)(x,
+    # quant_dtype=dtypes.fp4x2)` for MXFP4 or `quant_dtype=dtypes.fp8` for MXFP8. The legacy `per_1x32_f4_quant_hip`
+    # thin wrapper is preserved separately for external callers that imported it by name.
     tmp = {
         QuantType.No.value: lambda *a, **k: (a[0], None),
         QuantType.per_Tensor.value: per_tensor_quant_hip,
@@ -484,8 +479,8 @@ def per_1x32_mx_quant_hip(
     if quant_dtype == dtypes.fp4x2:
         assert n % 2 == 0
         out_cols = n // 2
-        # fp4 is always e8m0; ignore caller-supplied scale_type (or assert
-        # it agrees) so the public surface stays simple.
+        # fp4 is always e8m0; ignore caller-supplied scale_type (or assert it agrees) so the public surface stays
+        # simple.
         effective_scale_type = dtypes.fp8_e8m0
         if scale_type is not None and scale_type not in (dtypes.fp8_e8m0,):
             raise ValueError(
@@ -543,11 +538,9 @@ def per_1x32_mx_quant_hip(
     else:
         raise ValueError("unsupported: static per token quant")
     y = torch.empty(m, out_cols, dtype=quant_dtype, device=device)
-    # `dynamic_per_group_scaled_quant` is the canonical dtype-aware C entry;
-    # the C++ host dispatches by `out.dtype()` (fp4/fp8/i8) and by
-    # `scales.dtype()` (e8m0 vs fp32). The legacy
-    # `dynamic_per_group_scaled_quant_fp4` symbol is retained as a
-    # backward-compat forwarder for callers that import it directly.
+    # `dynamic_per_group_scaled_quant` is the canonical dtype-aware C entry; the C++ host dispatches by `out.dtype()`
+    # (fp4/fp8/i8) and by `scales.dtype()` (e8m0 vs fp32). The legacy `dynamic_per_group_scaled_quant_fp4` symbol is
+    # retained as a backward-compat forwarder for callers that import it directly.
     dynamic_per_group_scaled_quant(
         y,
         x,
@@ -932,9 +925,8 @@ def quant_mxfp4_hip(
     rows, cols = x.shape
     assert cols % group_size == 0
 
-    # Normalise to the raw int the C++ ``static_cast<MxScaleRoundMode>(int)``
-    # binding expects. ``MxScaleRoundMode`` is an ``IntEnum`` so this is also
-    # a no-op (and a cheap one) for callers that already pass a bare int.
+    # Normalise to the raw int the C++ ``static_cast<MxScaleRoundMode>(int)`` binding expects. ``MxScaleRoundMode`` is
+    # an ``IntEnum`` so this is also a no-op (and a cheap one) for callers that already pass a bare int.
     try:
         round_mode_int = int(round_mode)
     except (TypeError, ValueError) as e:
@@ -944,17 +936,13 @@ def quant_mxfp4_hip(
             "expected int in {0,1,2,3} or MxScaleRoundMode."
         ) from e
 
-    # Default-mode fast path: per_1x32_f4_quant_hip ->
-    # dynamic_per_group_scaled_quant_fp4 derives its scale via
-    # fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, FP4_E2M1>, so it is only
-    # valid when the *requested* round_mode equals the project-wide default
-    # (MX_DEFAULT_ROUND_MODE). Comparing against MX_DEFAULT_ROUND_MODE (not a
-    # hard-coded RoundUp) keeps this routing correct if the default is ever
-    # changed in lockstep with C++ kDefaultMxScaleRoundMode. Any non-default
-    # mode falls through to the quant_mxfp4 kernel's explicit 4-way dispatch.
-    # Skip on gfx942: dynamic_per_group_scaled_quant_fp4 requires
-    # __Float4_e2m1fn_x2 which is not available on gfx942; fall through
-    # to the quant_mxfp4 kernel instead.
+    # Default-mode fast path: per_1x32_f4_quant_hip -> dynamic_per_group_scaled_quant_fp4 derives its scale via
+    # fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, FP4_E2M1>, so it is only valid when the *requested* round_mode
+    # equals the project-wide default (MX_DEFAULT_ROUND_MODE). Comparing against MX_DEFAULT_ROUND_MODE (not a hard-coded
+    # RoundUp) keeps this routing correct if the default is ever changed in lockstep with C++ kDefaultMxScaleRoundMode.
+    # Any non-default mode falls through to the quant_mxfp4 kernel's explicit 4-way dispatch. Skip on gfx942:
+    # dynamic_per_group_scaled_quant_fp4 requires __Float4_e2m1fn_x2 which is not available on gfx942; fall through to
+    # the quant_mxfp4 kernel instead.
     if (
         round_mode_int == MxScaleRoundModeInt.RoundUp
         and not a16w4_shuffle
@@ -1052,18 +1040,14 @@ def fused_dynamic_mx_quant_moe_sort(
     # Packed fp4x2 stores 2 elements per byte; fp8 is 1 elem per byte.
     out_cols = N // 2 if quant_dtype == dtypes.fp4x2 else N
     is_stage1 = M == token_num
-    # `eff_topk` mirrors what the HIP launcher would infer from
-    # `input.numel() / (cols * token_num)` (= 1 for stage1, original topk
-    # for stage2). Used as `num_rows_factor` in the split path.
+    # `eff_topk` mirrors what the HIP launcher would infer from `input.numel() / (cols * token_num)` (= 1 for stage1,
+    # original topk for stage2). Used as `num_rows_factor` in the split path.
     eff_topk = 1 if is_stage1 else topk
-    # Scale cols pad to multiple of 8 to match `mx_scale_shuffle_idx`'s
-    # `scaleN_pad = pad8(scaleN)`. Without this, MX shapes with
-    # `N/group_size` not divisible by 8 (e.g. inter_dim=384 -> scaleN=12)
-    # trigger OOB writes in the kernel that uses the padded stride.
-    # Padding columns `[scaleN_valid, scaleN_pad)` are NOT written by the
-    # kernel (guarded by `scale_k < scaleN_valid`) and contain allocator
-    # garbage; production GEMM consumers don't read them so this is safe.
-    # Tests comparing byte-level equality must mask out those positions.
+    # Scale cols pad to multiple of 8 to match `mx_scale_shuffle_idx`'s `scaleN_pad = pad8(scaleN)`. Without this, MX
+    # shapes with `N/group_size` not divisible by 8 (e.g. inter_dim=384 -> scaleN=12) trigger OOB writes in the kernel
+    # that uses the padded stride. Padding columns `[scaleN_valid, scaleN_pad)` are NOT written by the kernel (guarded
+    # by `scale_k < scaleN_valid`) and contain allocator garbage; production GEMM consumers don't read them so this is
+    # safe. Tests comparing byte-level equality must mask out those positions.
     scaleN_pad = ((N + group_size - 1) // group_size + 7) // 8 * 8
     scale = torch.empty(
         (sorted_ids.shape[0] + 31) // 32 * 32,
@@ -1090,11 +1074,9 @@ def fused_dynamic_mx_quant_moe_sort(
             sorted_weights,
         )
     else:
-        # Split path: per-token quant produces unswizzled e8m0 byte scale,
-        # then `mxfp4_moe_sort_hip` (dtype-agnostic byte shuffle) sorts +
-        # swizzles it into the GEMM-consumed tile layout.
-        # `per_1x32_mx_quant_hip` handles both fp4 (always e8m0 scale) and
-        # fp8 (with `scale_type=fp8_e8m0` for the byte-scale split path).
+        # Split path: per-token quant produces unswizzled e8m0 byte scale, then `mxfp4_moe_sort_hip` (dtype-agnostic
+        # byte shuffle) sorts + swizzles it into the GEMM-consumed tile layout. `per_1x32_mx_quant_hip` handles both fp4
+        # (always e8m0 scale) and fp8 (with `scale_type=fp8_e8m0` for the byte-scale split path).
         scale_type = dtypes.fp8_e8m0 if quant_dtype == dtypes.fp8 else None
         out, scale_per_token = per_1x32_mx_quant_hip(
             input,

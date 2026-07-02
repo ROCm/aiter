@@ -29,8 +29,7 @@ def _fp8_mqa_logits_kernel(
     BLOCK_KV: tl.constexpr,
 ):
     row_id = tl.program_id(0)
-    # go from larger to smaller in terms of work
-    # to reduce the tail effect
+    # go from larger to smaller in terms of work to reduce the tail effect
     row_id = tl.num_programs(0) - row_id - 1
     tl.assume(row_id >= 0)
     tl.assume(stride_q_s > 0)

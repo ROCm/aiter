@@ -3,7 +3,6 @@
 
 
 # Imports.
-# ------------------------------------------------------------------------------
 
 # Python standard library
 from functools import partial
@@ -37,7 +36,6 @@ from aiter.ops.triton.gmm import (
 )
 
 # Common code shared by GMM and TGMM unit tests.
-# ------------------------------------------------------------------------------
 
 
 # Shapes.
@@ -117,7 +115,6 @@ def check_tensors(
 
 
 # GMM unit tests.
-# ------------------------------------------------------------------------------
 
 
 def torch_gmm(
@@ -225,14 +222,9 @@ def test_gmm(
 
         m = int(torch.sum(group_sizes).item())
 
-        # Tolerance handling:
-        # - Default (no bias): use strict global defaults (atol=5e-3, rtol=1e-2)
-        # - With bias: allow slightly looser tolerances due to:
-        #   * extra floating point op (add bias)
-        #   * large problem sizes and mixed precision
-        #   * very small fraction of elements differing by a few bf16/fp16 ULPs
+        # No bias: strict global defaults (atol=5e-3, rtol=1e-2). With bias:
+        # looser tolerances for the extra add + a few bf16/fp16 ULP diffs.
         if use_bias:
-            # Base tolerances for bias case.
             atol = 0.02
             rtol = 0.02
         else:
@@ -304,7 +296,6 @@ def test_gmm_alt_trans_rhs_int64_group_sizes_grid_dim_override_work_stealing(
 
 
 # TGMM unit tests.
-# ------------------------------------------------------------------------------
 
 
 def torch_tgmm(
@@ -409,11 +400,8 @@ def test_tgmm(
     out_triton = torch.empty_like(out_torch)
     bias_grad_triton = torch.empty_like(bias_grad_torch) if with_bias_grad else None
 
-    # For big shape (M, K, N, G) = (3145728, 2048, 1408, 8) there are some element
-    # mismatches (125 / 23068672 ~ 0.00013%) with absolute error greater than the
-    # default tolerance. This behavior is deterministic and, given a RNG seed,
-    # always happen for the same output elements. So, absolute tolerance is increased
-    # only for this shape.
+    # The largest shape (M > 1e6) has a deterministic handful of elements
+    # exceeding the default atol, so loosen atol only for that shape.
     atol = 2.5e-2 if M > 1e6 else None
 
     kernel_wrapper = triton_ptgmm if persistent else triton_nptgmm
@@ -450,14 +438,9 @@ def test_tgmm(
             atol=atol,
         )
 
-        # For persistent TGMM, also compare bias gradients on smaller shapes.
-        #
-        # For very large shapes (e.g., M > 1e6), bias_grad is an extremely long
-        # float32 reduction with atomics in the Triton kernel and a different
-        # reduction order in the PyTorch reference. Per-element comparisons
-        # become dominated by reduction-order noise rather than meaningful
-        # correctness checks, so we skip bias_grad comparison there and rely
-        # only on the output tensor check above.
+        # Compare bias gradients only on smaller shapes. For M > 1e6 the
+        # atomic float32 reduction and the torch reference use different
+        # reduction orders, so per-element comparison is just reduction noise.
         if with_bias_grad and M <= 1e6:
             bias_atol = 1.7
             bias_rtol = 0.1

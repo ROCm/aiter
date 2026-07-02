@@ -72,10 +72,9 @@ def get_shared_memory_per_block(device=None, fallback_gfx: str = "") -> int:
 def is_flydsl_available() -> bool:
     if importlib.util.find_spec("flydsl") is None:
         return False
-    # flydsl only ships kernels for the architectures in its SMEM_CAPACITY_MAP.
-    # On other archs (e.g. gfx1100 / RDNA3) importing the kernel modules crashes
-    # during config registration, so report flydsl as unavailable there instead
-    # of failing the import.
+    # flydsl only ships kernels for the architectures in its SMEM_CAPACITY_MAP. On other archs (e.g. gfx1100 / RDNA3)
+    # importing the kernel modules crashes during config registration, so report flydsl as unavailable there instead of
+    # failing the import.
     from flydsl.runtime.device import get_rocm_arch
     from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 

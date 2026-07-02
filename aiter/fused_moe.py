@@ -52,25 +52,22 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
-# Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
-# per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
-# so there is no overhead.
+# Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable) per-kernel launches in
+# fused_moe_2stages ("stage1"/"stage2"); None in production so there is no overhead.
 kernel_bench_callable = None
 
-# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
-# topk_weights through the sorted_* kernarg slots and accumulate via
-# global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
+# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids / topk_weights through the sorted_* kernarg slots and
+# accumulate via global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
 
 
 def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
     device = topk_ids.device
     M = topk_ids.shape[0]
-    # FLAT kernels zero their own output rows on-device and need an
-    # extra M*8-byte per-token coordination region appended to moe_buf.
-    # We over-allocate as a flat byte buffer and expose only the row part.
+    # FLAT kernels zero their own output rows on-device and need an extra M*8-byte per-token coordination region
+    # appended to moe_buf. We over-allocate as a flat byte buffer and expose only the row part.
     #
-    # The trailing region does not need initialisation; the kernel
-    # tolerates arbitrary contents on the first reference per dispatch.
+    # The trailing region does not need initialisation; the kernel tolerates arbitrary contents on the first reference
+    # per dispatch.
     elem_size = torch.empty(0, dtype=moebuf_dtype).element_size()
     row_bytes = M * model_dim * elem_size
     flag_bytes = 8
@@ -86,8 +83,8 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
         if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
         else topk_weights.to(dtypes.fp32).contiguous()
     )
-    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
-    # but must be valid device pointers -- alias topk_ids as scratch.
+    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels, but must be valid device pointers -- alias
+    # topk_ids as scratch.
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
@@ -126,8 +123,8 @@ def _moe_sorting_impl(
         moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     local_topk_ids = torch.empty_like(topk_ids) if return_local_topk_ids else None
     if return_local_topk_ids:
-        # CK sorting does not emit local ids; use Opus so callers do not need a slow
-        # Python-side remap or a hard failure when local expert ids are required.
+        # CK sorting does not emit local ids; use Opus so callers do not need a slow Python-side remap or a hard failure
+        # when local expert ids are required.
         use_opus = True
 
     if use_opus:
@@ -409,8 +406,8 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
-    # use FP8 as activation dtype to skip redundant re-quantization
+    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale, use FP8 as activation dtype to skip
+    # redundant re-quantization
     if (
         quant_type == QuantType.per_1x128
         and hidden_states.dtype == dtypes.fp8
@@ -1005,16 +1002,10 @@ def _flydsl_stage2_wrapper(
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
         inter_dim_pad, model_dim_pad, bias2
     )
-    # `parsed` is the static per-kernel params dict registered at
-    # import time by `get_flydsl_stage2_kernels` (see
-    # aiter/ops/flydsl/moe_kernels.py) and pre-populated into
-    # `_KERNEL_PARAMS` by `_register_all_configs()`. Variant-specific
-    # knobs that live on the kernel name (e.g. the
-    # `..._persist_async_w4_cumul3` production variant adds
-    # `use_async_copy=True / waves_per_eu=4 / cu_num_mul=3`) are
-    # already baked into this dict, so the `parsed.get(..., default)`
-    # calls below pick up the registered values for that kernel name
-    # rather than always falling back to defaults.
+    # `parsed` is the static per-kernel params dict registered at import time by `get_flydsl_stage2_kernels`
+    # (aiter/ops/flydsl/moe_kernels.py). Variant knobs encoded in the kernel name (e.g. `..._persist_async_w4_cumul3`
+    # sets use_async_copy=True / waves_per_eu=4 / cu_num_mul=3) are baked in here, so the `parsed.get(..., default)`
+    # calls below pick up the registered values.
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -1073,9 +1064,8 @@ def get_2stage_cfgs(
     has_stage2_bias=False,
 ):
     gate_mode = GateMode(gate_mode)
-    # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
-    # (e.g. gfx950 vs gfx1250, both report 256 CU) don't collide. Legacy CSVs
-    # without a `gfx` column are backfilled from cu_num at load time via
+    # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num (e.g. gfx950 vs gfx1250, both report 256 CU)
+    # don't collide. Legacy CSVs without a `gfx` column are backfilled from cu_num at load time via
     # ``_ensure_gfx_column`` (see gfx_from_cu_num).
     _INDEX_COLS = [
         "gfx",
@@ -1100,8 +1090,8 @@ def get_2stage_cfgs(
             df = df.copy()
             df["gfx"] = df["cu_num"].map(gfx_from_cu_num)
             return df
-        # Backfill placeholder/missing gfx (e.g. 0 filled when merging a config
-        # that lacks the column against ones that have it).
+        # Backfill placeholder/missing gfx (e.g. 0 filled when merging a config that lacks the column against ones that
+        # have it).
         bad = df["gfx"].isna() | df["gfx"].astype(str).isin(["0", "", "nan", "None"])
         if bad.any():
             df = df.copy()
@@ -1184,9 +1174,8 @@ def get_2stage_cfgs(
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
+    # EP convention: callers append one always-masked fake-expert slot to topk_ids, so runtime `topk` is routed_topk +
+    # 1. Tuned configs are keyed on routed_topk; strip the fake slot before building the lookup key.
     topk -= int(is_ep)
     keys = (
         gfx,
@@ -1538,12 +1527,9 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.i4x2
         and is_flydsl_available()
     ):
-        # Heuristic kernel dispatch for a16wi4 (bf16 activations, packed int4 weights
-        # with groupwise scale). Tile sizes and k-split are chosen based on problem
-        # dimensions to balance occupancy and memory bandwidth:
-        #   - _tile_m: scales with token count to improve utilization at larger batch sizes
-        #   - _tile_n/_tile_k: fixed at 128, tuned for int4 weight packing granularity
-        #   - _ksplit: partitions the K dimension across workgroups for large reductions
+        # Heuristic kernel dispatch for a16wi4 (bf16 activations, packed int4 weights with groupwise scale): _tile_m
+        # scales with token count; _tile_n/_tile_k fixed at 128 (int4 packing granularity); _ksplit partitions K for
+        # large reductions.
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = 128
@@ -1618,9 +1604,8 @@ def get_2stage_cfgs(
         kn1 = f"{_base_kn1}{_s1_sfx}"
         kn2 = f"{_base_kn2}{_s2_sfx}"
 
-        # fp8 stage1 kernel names always carry a "_gui" suffix
-        # (moe_kernels.py:114-115). Append it before the lookup so the fp8
-        # variants resolve; fp4 names are unchanged.
+        # fp8 stage1 kernel names always carry a "_gui" suffix (moe_kernels.py:114-115). Append it before the lookup so
+        # the fp8 variants resolve; fp4 names are unchanged.
         if _a_type == "fp8":
             kn1 = f"{kn1}_gui"
             _base_kn1 = f"{_base_kn1}_gui"
@@ -1662,11 +1647,10 @@ def get_2stage_cfgs(
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
         and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
     ):
-        # GPT-OSS Swiglu can use bf16/fp16 activations for small batches while
-        # keeping the generic preshuffled fp4 weights. CK2stages has no
-        # heuristic kernel for that A16W4 combination, so use CK-Tile.
-        # Use CK-Tile's split-k epilogue for the generic preshuffled MXFP4
-        # layout. The non-split gate/up epilogue is reserved for legacy A16W4.
+        # GPT-OSS Swiglu can use bf16/fp16 activations for small batches while keeping the generic preshuffled fp4
+        # weights. CK2stages has no heuristic kernel for that A16W4 combination, so use CK-Tile.
+        # Use CK-Tile's split-k epilogue for the generic preshuffled MXFP4 layout. The non-split gate/up epilogue is
+        # reserved for legacy A16W4.
         _min_split_k = 2 if swiglu_mxfp4_bf16_cktile else 1
         _split_k = max(int(ksplit), _min_split_k)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
@@ -1927,8 +1911,8 @@ def fused_moe_2stages(
                 [M, a1.shape[-1] // 32], dtype=dtypes.fp8_e8m0, device=a1.device
             )
         else:
-            # stage1 input is not topk-replicated, so M==token_num and the HIP
-            # launcher infers TOPK=1 from input.numel() / (cols * token_num).
+            # stage1 input is not topk-replicated, so M==token_num and the HIP launcher infers TOPK=1 from input.numel()
+            # / (cols * token_num).
             a1, a1_scale = fused_dynamic_mxfp8_quant_moe_sort(
                 hidden_states,
                 sorted_ids=sorted_ids,
@@ -1945,8 +1929,7 @@ def fused_moe_2stages(
         a1_scale = None
     elif quant_type == QuantType.per_1x32:
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
-            # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
-            # skip re-quantization, only sort the scale
+            # Input is already quantized to fp4x2 (e.g., from FP4 dispatch), skip re-quantization, only sort the scale
             a1 = hidden_states
             a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
@@ -2008,8 +1991,8 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if metadata.stage1.func is _flydsl_stage1_wrapper:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
-    # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
-    # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
+    # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can switch to reduce mode and fuse the
+    # validity gather in compile_moe_reduction.
     if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
@@ -2628,8 +2611,8 @@ def cktile_moe_stage1(
     ):
         out = torch.empty(expected_out_shape, dtype=dtype, device=hidden_states.device)
     needs_post_activation = split_k > 1
-    # Split-k reduces into a token-topk workspace and applies activation after
-    # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
+    # Split-k reduces into a token-topk workspace and applies activation after reduction. Non-split legacy A16W4 keeps
+    # CK-Tile's fused gate/up epilogue.
     workspace_rows = token_num * topk
     if needs_post_activation:
         tmp_out = torch.zeros(

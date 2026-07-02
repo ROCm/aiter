@@ -35,9 +35,7 @@ _P2_BASE = 5
 # token base for EXP_Mx (19..22 → MSB 0..3, draws from pair_exp)
 _EXP_BASE = 19
 
-# ============================================================================
 # Local rocdl primitive wrappers (until merged into upstream FlyDSL)
-# ============================================================================
 
 
 def _rocdl_exp2(res, arg, **kw):
@@ -62,10 +60,7 @@ def _rocdl_fmax3(a, b, c):
     return llvm_dialect.intr_maxnum(m, arith.unwrap(c))
 
 
-# ============================================================================
 # Constants
-# ============================================================================
-
 WAVE_SIZE = 32
 NUM_WAVES = 4
 NUM_MSB = 4
@@ -128,47 +123,26 @@ TDM_WAIT_CNT = TDM_LOADS_PER_STAGE * 2  # total loads across 2 stages
 QK_WMMA_INTERLEAVE = 1
 
 # PART2 double-buffer pipeline split (ops per MSB):
-#   FIRST HALF  [0..PART2_SPLIT-1] = setup(8) + pkfma(16) + exp(EXP_PER_MSB_TO_G2) ops
-#     All pkfmas run in GEMM2. The 16-op gap between each pkfma and its exp provides
-#     >4 cycles of transcendental latency hiding without interleaving.
-#     8 exp ops per MSB (pairs 0..3, lo+hi) are also folded into GEMM2 first half,
-#     moving 32 exp total (4 MSBs × 8) from GEMM1 to GEMM2 for load balance.
-#   SECOND HALF [PART2_SPLIT..] = exp(GEMM1_EXP_OPS)+pkadd(8)+cvt(16)+sum(9) = 57 ops
-#     cvt and sum-tree interleaved to break s_delay_alu dependency chains.
-#     dispatched in GEMM1 stages 0+1+2 (42/MSB/stage × 3 = 126 ≥ 57 ✓)
+#   FIRST HALF  [0..PART2_SPLIT-1] = setup(8) + pkfma(16) + exp(EXP_PER_MSB_TO_G2);
+#     runs in GEMM2. 16-op pkfma→exp gap hides transcendental latency; 8 exp/MSB
+#     folded here (32 total) to balance load off GEMM1.
+#   SECOND HALF [PART2_SPLIT..] = exp(GEMM1_EXP_OPS)+pkadd(8)+cvt(16)+sum(9)=57 ops;
+#     cvt/sum-tree interleaved to break s_delay_alu chains; runs in GEMM1 stages 0-2.
 EXP_PER_MSB_TO_G2 = 8  # pair_exp ops per MSB moved to GEMM2 (pairs 0..3 lo+hi)
-# Note: exp_delta (1 exp/MSB) is at op[2] in setup and is unavoidably included in
-# GEMM2 first half — it MUST be computed in GEMM2 because partial_ed_out carries
-# it as an iter_arg for the next tile's O-rescale. Cannot be deferred to GEMM1.
-# So GEMM2 has 4 exp_delta + 32 pair_exp = 36 exp total (4 is necessary overhead).
-# total setup ops (save_old_max..broadcast_dup..rescale_sum)
-PART2_SETUP_A = 8
+# exp_delta (1 exp/MSB, op[2]) MUST stay in GEMM2 first half: partial_ed_out carries
+# it as iter_arg for the next tile's O-rescale. GEMM2 = 4 exp_delta + 32 pair_exp.
+PART2_SETUP_A = 8  # setup ops (save_old_max..broadcast_dup..rescale_sum)
 PART2_SPLIT = 24 + EXP_PER_MSB_TO_G2  # = 32: setup(8)+pkfma(16)+pair_exp(8)
 PART2_G2_SPLIT = PART2_SPLIT  # GEMM2 truncation limit (mirrors PART2_SPLIT)
 GEMM1_EXP_OPS = VPS_MSB_SP - EXP_PER_MSB_TO_G2  # = 24: pair_exp remaining in GEMM1
 
-# GEMM2 (PV) softmax budget — stage 0-1 spread PART0, stage 2-3 run PART1+PART2:
-#   Stage 0: 40  (10/MSB; O-rescale moved to GEMM1 stages, frees slot for PART0)
-#   Stage 1: 52  (13/MSB, finishes PART0 remainder = 11/MSB; PART1 deferred to stage 2)
-#   Stage 2: 56  (PART1=8 + PART2 first 12/MSB)
-#   Stage 3: 168 (PART2 overflow → interleaves with K ds_loads)
-# PART2 first half now has 32 ops/MSB (was 24): budget 4+14+42=60/MSB ≥ 32 ✓.
-#
-# GEMM1 (QK) PART2 second-half budget (cycle-weighted: exp=3 cycles, others=1 cycle):
-#   Second-half = 24 exp (72 cy/MSB) + 33 pkadd/cvt/sum (33 cy/MSB) = 105 cy/MSB.
-#   Stages 4-5 throttled to 84 (21/MSB) to spread exp across all 4 stages instead of
-#   exhausting in su0-su2. Stage 7 (G1-su3) then receives all 33 cheap ops/MSB,
-#   filling its WMMAs that were previously naked (2.3 cy/W → ~6 cy/W target).
-# #   Stage 4: 120 → 30/MSB → 10 exp (30 cy) — fills 10/12 lds_done=True phases
-#     Stage 5: 120 → 30/MSB → 10 exp
-#     Stage 6: 132 → 33/MSB →  4 exp + cheap
-#     Stage 7: 132 → 33/MSB →  0 exp + cheap (G1-su3 cheap fill)
-#   10 exp/MSB × 2 phases/WMMA = 20 WMMAs with exp + O-rescale at last 4 = all covered.
-#   With phase cycle budget = 3: exactly 1 exp per phase, or 3 cheap ops per phase.
+# Per-stage softmax ALU budget (indices 0-3 = GEMM2/PV, 4-7 = GEMM1/QK).
+# GEMM2: stage 0-1 spread PART0, stage 2-3 run PART1+PART2 (first half 32 ops/MSB).
+# GEMM1 second-half (cycle-weighted exp=3cy, others=1cy): 24 exp + 33 cheap/MSB;
+#   exp spread across stages 4-7 so G1-su3 gets the cheap-op fill for its naked WMMAs.
 ALU_PER_STAGE = [40, 52, 56, 168, 120, 120, 132, 132]
 
-# Cycle budget per VALU phase in GEMM1 dispatch.
-# exp_f32 costs 3 cycles, all other VALU (pk_add, cvt, mov) costs 1 cycle.
+# Cycle budget per VALU phase in GEMM1 dispatch (exp_f32=3cy, others=1cy).
 # Budget=3 → exactly 1 exp op per phase, or up to 3 cheap ops.
 GEMM1_VALU_PER_PHASE = 3
 
@@ -179,18 +153,15 @@ GEMM2 = 1  # PV
 N_V_MSB = 2  # v_msb = d_msb % 2, only 2 V banks needed
 N_PV_WMMA_N = 4  # D_MSB_N / WMMA_N = 64 / 16
 D_MSB_K = SU_K_N  # 32 (one WMMA-K per stage)
-# With compact (no-padding) P layout, each PV WMMA src_b is built by
-# concatenating 2 sibling sp_msbs (sp_msb=2*m_tile and 2*m_tile+1) along the
-# K_pv (=N_qk) axis, giving a full 16 bf16/lane src_b = full K=32 real.
-# Each (d_msb, n) accumulator therefore receives exactly CNT_SU(=4) WMMAs
-# across the 4 PV stages, covering tile_n=128 K-reduction (4 * 32 = 128).
+# With compact (no-padding) P layout, each PV WMMA src_b is built by concatenating 2 sibling sp_msbs (sp_msb=2*m_tile
+# and 2*m_tile+1) along the K_pv (=N_qk) axis, giving a full 16 bf16/lane src_b = full K=32 real. Each (d_msb, n)
+# accumulator therefore receives exactly CNT_SU(=4) WMMAs across the 4 PV stages, covering tile_n=128 K-reduction (4 *
+# 32 = 128).
 PV_K_ITERS = 1  # 1 WMMA per (d_msb, n) per SU
 PV_GEMM_INST_COUNT = NUM_MSB * PV_K_ITERS * N_PV_WMMA_N  # 16
 
 
-# ============================================================================
 # Low-level Helpers
-# ============================================================================
 
 
 def _emit_void(inst_str, operands=None, constraints="", **kwargs):
@@ -221,22 +192,13 @@ def _sched_barrier(mask=0):
     llvm_dialect.call_intrinsic(None, "llvm.amdgcn.sched.barrier", [mask_val], [], [])
 
 
-# ============================================================================
 # VGPR Bank Hint
-# ============================================================================
 
 _USE_BANK_HINTS = False
 
-# Starting physical-register offset (within each bank) reserved for sp_pairs.
+# Physical-register offset (within each bank) reserved for sp_pairs:
 # sp_pairs[i] (v2f32) lands at HWIdx = bank*256 + SP_PAIR_BASE + i*2.
-#
-# Offset selection is driven by per-bank free-range analysis of the ISA:
-#   Bank0: saturated (198/256 used), NO contiguous 32-slot range → skip offset hint
-#   Bank1: free from offset 174 (V/K tiles occupy 0-173)
-#   Bank2: free from offset 127 (→ use 128 for even alignment)
-#   Bank3: free from offset 121 (→ use 122 for even alignment)
-# Using 174 is safe for all of banks 1-3 (all have free range ≥174).
-# Bank0 sp_pairs use only BankHint=0 (no offset constraint) since bank0 is full.
+# 174 is free for banks 1-3; bank0 is saturated so its sp_pairs use bank hint only.
 SP_PAIR_BASE = 174
 
 # Per-bank VGPR copy of s_log2e_scl_pair (v2f32) for pk_fma src1.
@@ -270,9 +232,7 @@ def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
     )
 
 
-# ============================================================================
 # MLIR Types
-# ============================================================================
 
 
 def _get_types():
@@ -294,9 +254,7 @@ def _get_types():
     }
 
 
-# ============================================================================
 # V2F32 Helpers (from epilogue)
-# ============================================================================
 
 
 def _make_v2f32(lo, hi, bank=0):
@@ -321,9 +279,7 @@ def _broadcast_f32_to_v2f32(val, bank=0):
     return _make_v2f32(val, val, bank)
 
 
-# ============================================================================
 # WMMA Fragment Pairing (from prologue — concat two v4i32 → v16bf16)
-# ============================================================================
 
 
 def make_wmma_frag_bf16(vec4_lo, vec4_hi):
@@ -380,10 +336,8 @@ def _pack_v2bf16_to_v16bf16(ty, v2bf16_list, bank):
     return set_vgpr_bank(result, bank)
 
 
-# ============================================================================
-# Atomic Instruction Primitives
-# Each emits exactly ONE instruction (scheduling controlled at stage level).
-# ============================================================================
+# Atomic Instruction Primitives — each emits exactly ONE instruction
+# (scheduling controlled at stage level).
 
 # --- WMMA ---
 
@@ -686,9 +640,7 @@ def _atom_wgp_barrier():
     _sched_barrier(0)
 
 
-# ============================================================================
 # Schedule Builders (compile-time, no IR emitted)
-# ============================================================================
 
 
 def _build_qk_wmma_schedule(blk, su):
@@ -826,9 +778,7 @@ def _build_lds_v_schedule(blk, su):
     return schedule
 
 
-# ============================================================================
 # Slot Scheduling Tables
-# ============================================================================
 
 
 def _get_lds_slots(stage, gemm_idx, cycle23, qpoint=GEMM_INST_COUNT // 4 - 1):
@@ -865,9 +815,7 @@ def _get_salu_slots(stage, gemm_idx, cycle23):
     return 2
 
 
-# ============================================================================
 # Softmax PART2 Builder
-# ============================================================================
 
 
 def _build_softmax_part2_ops(
@@ -901,23 +849,14 @@ def _build_softmax_part2_ops(
     bank = msb
 
     # --- Setup phase (8 ops) ---
-    # exp_delta is at op[2] — included in GEMM2 first half (< PART2_SPLIT=32).
-    # This is required: partial_ed_out carries exp_delta as iter_arg for the next
-    # tile's O-rescale. 4 exp_delta total (1/MSB) are unavoidable pipeline overhead.
+    # exp_delta (op[2]) stays in GEMM2 first half (< PART2_SPLIT=32) since
+    # partial_ed_out carries it as iter_arg for the next tile's O-rescale.
 
-    # 0. old_max[msb] = local_max[msb]
-    # Pre-materialize s_log2e_scl into a per-bank VGPR v2f32
-    # early (GEMM1 start) so pk_fma doesn't need a lazy
-    # SGPR->VGPR copy (which would cause s_delay_alu or
-    # v_nop).
-    #
-    # IMPORTANT: use plain MLIR insertelement so that the
-    # set_vgpr_bank_offset hint can freely direct the register allocator to the target
-    # physical register.
-    #
-    # CSE-safety: each bank (b) passes a different argument to set_vgpr_bank_offset /
-    # set_vgpr_bank, so CSE never merges the four copies.  LLVM allocates each at its
-    # bank-specific physical register (bank×256 + LOG2E_PAIR_OFFSET for banks 1-3).
+    # 0. old_max[msb] = local_max[msb]; also pre-materialize s_log2e_scl into a
+    # per-bank VGPR v2f32 early so pk_fma avoids a lazy SGPR->VGPR copy.
+    # Plain MLIR insertelement lets set_vgpr_bank_offset direct the allocator.
+    # CSE-safe: each bank passes a distinct bank arg so the 4 copies never merge
+    # (allocated at bank×256 + LOG2E_PAIR_OFFSET for banks 1-3).
     def op_save_old_max(b=bank):
         ss["old_max"][b] = _atom_mov_b32(ss["local_max"][b], b)
         _sched_barrier(0)
@@ -991,11 +930,8 @@ def _build_softmax_part2_ops(
         ops.append(op_rescale_sum)
 
     # --- Rescale phase: ALL pk_fma first, then ALL exp ---
-    # Separating pkfma and exp into two consecutive groups eliminates the
-    # EXP(bank0)↔PK_FMA(bank_msb) alternating MSB switches caused by escaped
-    # sp_pairs (pairs 0,1 land in bank0 instead of bank_msb).
-    # Latency hiding: 16 pkfmas separate each pair's pkfma from its exp,
-    # providing >4 cycles of delay to hide the transcendental exp latency.
+    # Two consecutive groups avoid EXP(bank0)↔PK_FMA(bank_msb) MSB switches from escaped sp_pairs (pairs 0,1 land in
+    # bank0), and the 16 pkfmas give each pair's pkfma→exp >4 cycles to hide the transcendental latency.
 
     # Phase A: all 16 pk_fma ops.
     # cur_max_log2e_dup (v2f32, lo==hi) produced by op5 broadcast.
@@ -1146,9 +1082,7 @@ def _build_all_softmax_part2_ops(ty, blk, sp_pairs_all, softmax_state, sgpr_stat
     return ops_by_msb
 
 
-# ============================================================================
 # Softmax PART0 + PART1 Builder (runs during GEMM2 stages)
-# ============================================================================
 
 # per MSB: tree-max(16) + merge2(1) + perm-prep(1)
 #   + perm-exec(1) + mul(1) + cur-max(1) + merge1(1)
@@ -1223,14 +1157,10 @@ def _build_softmax_part0_ops(ty, msb, sp_pairs, ss, sgpr):
             ops.append(op_cross_col)
 
     # Phase 3: bring in last element per group (4 ops)
-    # Use max3(sp[7], tmp, sp[0]) instead of max3(sp[7], tmp, old_max).
-    # sp[0] is guaranteed in bank=msb (same as the other operands here) so no
-    # s_set_vgpr_msb switch is needed.  old_max was used purely to prevent LLVM
-    # from collapsing max3→max2 AND to force VOP3 encoding; sp[0] achieves
-    # both without the cross-bank penalty.
-    # Correctness: sp[0] is already included in tmps[k_] via Phase 1
-    # (max3(sp[0],sp[1],sp[2])→tmps[k_]), so max3(sp[7], tmps[k_], sp[0])
-    # = max(sp[7], tmps[k_]).  old_max is still included via Phase 7.
+    # max3(sp[7], tmp, sp[0]): sp[0] (in bank=msb) forces VOP3 / blocks max3→max2
+    # collapse without a cross-bank penalty (old_max would switch s_set_vgpr_msb).
+    # Correctness: sp[0] already folded into tmps[k_] via Phase 1, so this
+    # = max(sp[7], tmps[k_]); old_max is still included via Phase 7.
     for k in range_constexpr(N_VALID_GROUPS):
 
         def op_last_elem(k_=k, b=bank):
@@ -1270,10 +1200,8 @@ def _build_softmax_part0_ops(ty, msb, sp_pairs, ss, sgpr):
 
     ops.append(op_perm)
 
-    # Phase 7 mul (op20): preMaxLog2eScl = old_max * log2e_scl — FULLY INDEPENDENT.
-    # This op has no data dependency on any op in the merge1→merge2→perm chain.
-    # The dispatch uses it as a 1-per-gap filler to provide 4 intervening VALU
-    # between each consecutive dependent pair.
+    # Phase 7 mul (op20): preMaxLog2eScl = old_max * log2e_scl. Independent of the
+    # merge1→merge2→perm chain; used as a 1-per-gap dispatch filler.
     def op_pre_max(b=bank):
         ss["pre_max_log2e_scl"][b] = _atom_mul_f32(
             ss["old_max"][b], sgpr["s_log2e_scl"], b
@@ -1303,11 +1231,9 @@ def _build_softmax_part1_ops(ty, ss, sgpr):
     ops = []
     msb_assign = []
 
-    # max_num(local_max[0], local_max[1]) → local_max[0]
-    # Use max3 with pre_max_log2e_scl[0] (bank0, already computed) as 3rd arg
-    # to force VOP3 without cross-bank penalty from old_max (which may be in
-    # wrong bank due to regalloc).  pre_max_log2e_scl[0] ≤ any local_max so
-    # it doesn't change the result; it also prevents LLVM from folding to max2.
+    # max_num(local_max[0], local_max[1]) → local_max[0].
+    # 3rd arg pre_max_log2e_scl[0] (bank0) forces VOP3 / blocks max2 fold without
+    # a cross-bank penalty; it's ≤ any local_max so the result is unchanged.
     def op_max01():
         ss["local_max"][0] = _atom_max3_num_f32(
             ss["local_max"][0], ss["local_max"][1], ss["pre_max_log2e_scl"][0], 0
@@ -1402,33 +1328,21 @@ def _build_all_softmax_gemm2_ops(
         )
         ops_by_rid[5 + m] = p2_ops[:PART2_G2_SPLIT]
 
-    # Budget layout (mirrors v0, adapted for 16-WMMA stages):
-    # Budget layout: spread PART0 across stages 0-1 to stay within slot capacity.
-    # Each stage has 16 WMMAs × 4 slots = 64 (−4 for dswait) ≈ 60 usable slots.
-    # PART0: 10/MSB in stage 0 (40 total), 11/MSB in stage 1 (44 total) → fits in 60.
-    # PART1: budget opened in stage 1 (dispatches once all PART0 rids exhaust, filling
-    #   the last 2-4 WMMAs of stage 1 that were previously
-    #   naked); stage 2 catches overflow.
-    # PART2: stages 2-3. In stage 2, lds_done=False also
-    #   dispatches PART2 per-MSB (rids 5..8) in parallel
-    #   with V LDS loads (see stage>=2 check in
-    #   _dispatch_softmax_gemm2), spreading PART2 across
-    #   8 lds phases instead of crowding lds_done=True.
+    # Budget layout (16-WMMA stages, ~60 usable slots/stage after dswait):
+    # PART0: 10/MSB stage 0, 11/MSB stage 1. PART1: stage 1 (after PART0 exhausts),
+    # stage 2 overflow. PART2: stages 2-3, spread across V-load phases in stage 2.
     rid_budget = [[0] * RLTS_LEN for _ in range_constexpr(4)]
 
-    # Stage 0: PART0 first chunk (10/MSB = 40 total).
-    # No PART1 here: budget=10 exhausts each rid before all 21 PART0 ops complete,
-    # so ss['local_max'] is stale when budget reaches 0. PART1 requires fully-completed
-    # PART0 (all 21 ops/MSB), which only holds after stage 1 finishes the remaining 11.
+    # Stage 0: PART0 first chunk (10/MSB). No PART1 here — PART1 needs all 21 PART0
+    # ops/MSB done (ss['local_max'] final), which only holds after stage 1.
     part0_left = PART0_INSTS
     p0c = min(part0_left, ALU_PER_STAGE[0] // NUM_MSB)
     for m in range_constexpr(NUM_MSB):
         rid_budget[0][m] = p0c
     part0_left -= p0c
 
-    # Stage 1: PART0 remainder (11/MSB = 44 total) + PART1 overflow + small PART2 seed.
-    # PART1 overflow catches any PART1 ops not dispatched in stage 0.
-    # PART2 seed (4/MSB) fills WMMAs 14-15 after PART1 exhausts, via drain-one-rid.
+    # Stage 1: PART0 remainder (11/MSB) + PART1 + small PART2 seed (4/MSB fills
+    # WMMAs 14-15 after PART1 exhausts, via drain-one-rid).
     p0c = min(part0_left, ALU_PER_STAGE[1] // NUM_MSB)
     for m in range_constexpr(NUM_MSB):
         rid_budget[1][m] = p0c
@@ -1438,12 +1352,8 @@ def _build_all_softmax_gemm2_ops(
         rid_budget[1][5 + m] = 4  # seed: ~1 WMMA of PART2 per MSB at stage 1 tail
 
     # Stage 2: remaining PART0 (if any) + PART1 fallback + PART2 start.
-    # PART1 budget kept for safety (catches any ops not dispatched in stage 1),
-    # but p2_budget_2 is computed from the full ALU_PER_STAGE[2] without subtracting
-    # PART1_INSTS: since PART1 is normally done in stage 1, those 8 slots are free
-    # for PART2 in practice. This gives p2_budget_2=14 instead of 12 per MSB, which
-    # provides 2 extra WMMAs of PART2 coverage in lds_done=True of stage 2, eliminating
-    # the 3-WMMA naked cluster at the end of stage 2.
+    # p2_budget_2 uses full ALU_PER_STAGE[2] (PART1 normally done in stage 1, so its
+    # 8 slots are free) → 14/MSB, adding 2 WMMAs of PART2 coverage vs subtracting.
     if const_expr(part0_left > 0):
         p0c = min(part0_left, ALU_PER_STAGE[2] // NUM_MSB)
         for m in range_constexpr(NUM_MSB):
@@ -1469,9 +1379,7 @@ def _build_all_softmax_gemm2_ops(
     return ops_by_rid, rid_budget, sp_lo_cache, sp_hi_cache
 
 
-# ============================================================================
 # Emit Helpers for Interleaving Engine
-# ============================================================================
 
 
 def _emit_qk_wmma(ty, wmma_op, q_tiles, kv_tiles, sp_tiles):
@@ -1533,9 +1441,8 @@ def _emit_lds_load(ty, lds_op, kv_lds_addrs, kv_tiles_out):
         tile = _atom_ds_load_b128(ty, addr, offset, msb)
     else:
         half_p = lds_op["half_p"]
-        # kv_lds_addrs[4 + msb*2 + half_p] — both dh0 and dh1 for
-        # this MSB are in bank=msb, so dst/addr/addr are all same bank →
-        # s_set_vgpr_msb stays constant within each MSB's load group.
+        # kv_lds_addrs[4 + msb*2 + half_p] — both dh0 and dh1 for this MSB are in bank=msb, so dst/addr/addr are all
+        # same bank → s_set_vgpr_msb stays constant within each MSB's load group.
         addr = kv_lds_addrs[NUM_MSB + msb * 2 + (1 if half_p else 0)]
         tile = _atom_ds_load_tr16_b128(ty, addr, offset, msb)
 
@@ -1567,9 +1474,7 @@ def _first_nonempty(counts):
     return len(counts)
 
 
-# ============================================================================
 # Core Loop Stage Composer — cl_su_V3 Interleaving Engine (GEMM1 only)
-# ============================================================================
 
 
 def _cl_su_v3_stage(
@@ -1740,9 +1645,7 @@ def _cl_su_v3_stage(
     return sp_tiles, kv_tiles_next
 
 
-# ============================================================================
 # Core Loop Stage Composer — cl_su_V3 Interleaving Engine (GEMM2 / PV)
-# ============================================================================
 
 
 def _cl_su_v3_stage_gemm2(
@@ -1969,9 +1872,7 @@ def _cl_su_v3_stage_gemm2(
     return o_tiles, kv_tiles_next
 
 
-# ============================================================================
 # Core Loop — GEMM1 Stages 0-3 + GEMM2 Stages 4-7
-# ============================================================================
 
 
 def _core_loop_gemm1(
@@ -2026,9 +1927,7 @@ def _pair_v_tiles_for_wmma(v_tiles_raw, ty):
     return v_paired
 
 
-# ============================================================================
 # Pure QK / PV / Softmax Helpers (for prologue — no interleaving)
-# ============================================================================
 
 
 def _load_k_su_from_lds(ty, kv_lds_addrs, blk, su):
@@ -2071,9 +1970,8 @@ def _load_v_two_sus_from_lds(ty, kv_lds_addrs, blk, su0, su1):
     raw0 = [[None] * N_LDS_V_PER_MSB for _ in range_constexpr(NUM_MSB)]
     raw1 = [[None] * N_LDS_V_PER_MSB for _ in range_constexpr(NUM_MSB)]
 
-    # Interleave by MSB: for each MSB, emit su0's loads then su1's loads.
-    # All loads in one MSB group share the same addr bank and dst bank,
-    # so no s_set_vgpr_msb switch is needed within the group.
+    # Interleave by MSB: for each MSB, emit su0's loads then su1's loads. All loads in one MSB group share the same addr
+    # bank and dst bank, so no s_set_vgpr_msb switch is needed within the group.
     for msb in range_constexpr(NUM_MSB):
         for op in sched0:
             if const_expr(op["msb"] == msb):
@@ -2233,25 +2131,11 @@ def _softmax_part01_only(ty, blk, sp_pairs_all, softmax_state, sgpr_state):
     #   op 20:    mul      (independent: old_max * log2e_scl)
     #   op 21:    cur_max  (max3, reads perm_exec result)
     #
-    # To eliminate all s_delay_alu in the chain
-    # merge1->merge2->perm_prep->perm_exec->cur_max,
-    # each consecutive pair needs 4+ intervening VALU
-    # (= dep at position 5+, not tracked).
-    # Strategy: dispatch 5 column-major groups separated by a SINGLE mul from ONE MSB
-    # as filler. This gives exactly 4 intervening between each dep pair:
-    #
-    #   merge1(M0..M3), [B], mul(M0), [B], merge2(M0..M3), [B], mul(M1), [B],
-    #   perm_prep(M0..M3), [B], mul(M2), [B], perm_exec(M0..M3), [B], mul(M3), [B],
-    #   cur_max(M0..M3)
-    #
-    # Verification (worst case = same-MSB chain):
-    #   merge1(Mi) at pos P -> merge2(Mi) at pos P+5:
-    #     4 intervening -> DEP_5 (not tracked)
-    #   merge2(Mi) at pos Q → perm_prep(Mi) at pos Q+5: 4 intervening ✓
-    #   perm_prep(Mi) at pos R → perm_exec(Mi) at pos R+5: 4 intervening ✓
-    #   perm_exec(Mi) at pos S → cur_max(Mi) at pos S+5: 4 intervening ✓
-    #   → zero s_delay_alu for the entire Part0 chain
-    #
+    # To eliminate s_delay_alu in the merge1->merge2->perm_prep->perm_exec->cur_max
+    # chain, each consecutive same-MSB pair needs 4+ intervening VALU (dep at pos 5+).
+    # Strategy: 5 column-major groups separated by a single-MSB mul filler:
+    #   merge1(M0..M3), mul(M0), merge2(M0..M3), mul(M1), perm_prep(M0..M3), mul(M2),
+    #   perm_exec(M0..M3), mul(M3), cur_max(M0..M3)  → 4 intervening per dep pair.
     _MUL = 20  # op index of mul (the filler)
     _BLK = 4  # ops per MSB per block
 
@@ -2415,10 +2299,7 @@ def _core_loop(
     v_tiles_out = None
     blk = 0
 
-    # ================================================================
-    # GEMM1 (QK): 4 stages (SU 0..3)
-    # Interleave PART2 on sp_pairs_prev during GEMM1 stages.
-    # ================================================================
+    # GEMM1 (QK): 4 stages (SU 0..3), interleaving PART2 on sp_pairs_prev.
     sp_pairs_all = softmax_state.get("sp_pairs_prev", None)
     if const_expr(sp_pairs_all is None):
         sp_pairs_all = [[None] * N_SP_PAIRS for _ in range_constexpr(NUM_MSB)]
@@ -2480,10 +2361,7 @@ def _core_loop(
     if const_expr(not gemm2):
         return sp_tiles, kv_tiles, o_tiles, su_sp_tiles_list
 
-    # ================================================================
     # Between GEMM1 and GEMM2: complete softmax pipeline
-    # ================================================================
-
     # 1. Run remaining PART2 ops (budget was insufficient during GEMM1)
     for msb in range_constexpr(NUM_MSB):
         for op in softmax_ops_by_msb[msb][softmax_idx_by_msb[msb] :]:
@@ -2498,15 +2376,10 @@ def _core_loop(
     # 4. Build P tiles from p_bf16 (produced by PART2)
     p_tiles_computed = _build_p_tiles_from_softmax(ty, softmax_state)
 
-    # ================================================================
     # fmha_mask placeholder (no causal mask)
-    # ================================================================
     _emit_void("s_nop 0")
 
-    # ================================================================
-    # GEMM2 (PV): 4 stages (SU 0..3)
-    # No softmax interleaving — PART0+PART1 already ran above.
-    # ================================================================
+    # GEMM2 (PV): 4 stages (SU 0..3). No softmax interleaving — PART0+PART1 done above.
 
     v_tiles_paired = _pair_v_tiles_for_wmma(v_tiles_out, ty)
 

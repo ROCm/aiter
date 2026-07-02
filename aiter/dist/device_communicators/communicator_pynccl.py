@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-# ===================== import region =====================
+# imports
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
@@ -92,8 +92,7 @@ class PyNcclCommunicator:
             self.nccl = NCCLLibrary(library_path)
         except Exception as e:
             print(f"Failed to load NCCL library: {e}")
-            # disable because of missing NCCL library
-            # e.g. in a non-GPU environment
+            # disable because of missing NCCL library e.g. in a non-GPU environment
             self.available = False
             self.disabled = True
             return
@@ -128,8 +127,7 @@ class PyNcclCommunicator:
         assert isinstance(device, torch.device)
         self.device = device
         # nccl communicator and stream will use this device
-        # `torch.cuda.device` is a context manager that changes the
-        # current cuda device to the specified one
+        # `torch.cuda.device` is a context manager that changes the current cuda device to the specified one
         with torch.cuda.device(device):
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank
@@ -151,9 +149,7 @@ class PyNcclCommunicator:
     ) -> torch.Tensor:
         if self.disabled:
             return None
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert in_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {in_tensor.device}"
@@ -180,9 +176,7 @@ class PyNcclCommunicator:
     ):
         if self.disabled:
             return
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert input_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
@@ -207,9 +201,7 @@ class PyNcclCommunicator:
     ):
         if self.disabled:
             return
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert input_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
@@ -242,9 +234,7 @@ class PyNcclCommunicator:
     ):
         if self.disabled:
             return
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert input_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
@@ -271,9 +261,7 @@ class PyNcclCommunicator:
     ):
         if self.disabled:
             return
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert input_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"

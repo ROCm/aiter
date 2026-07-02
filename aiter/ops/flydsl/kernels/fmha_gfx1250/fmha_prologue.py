@@ -40,8 +40,7 @@ K_SU_SIZE = 64
 NUM_K_SU = 2  # TDM loads 2 SUs (= compute)
 NUM_K_SU_COMPUTE = 2
 
-# TDM dim0=200 -> LDS inner stride = 200*2 = 400B
-# (2-way bank conflicts)
+# TDM dim0=200 -> LDS inner stride = 200*2 = 400B (2-way bank conflicts)
 K_ROW_BYTES = 400
 V_ROW_BYTES = 288
 K_SU_HALF_OFFSET = 0x1900  # 16 * K_ROW_BYTES = 16 * 400 = 6400
@@ -87,9 +86,8 @@ ACC_COL_BASE = {
 }
 
 # TDM config constants.
-# K: dim0=192 (QK_HDIM), no padding. QK_HDIM=192 is not a multiple of any
-# power-of-2 pad_interval that fits in one pad per row, so we skip padding to
-# avoid the continuous-stream rotation bug. No bank-conflict padding for K.
+# K: dim0=192 (QK_HDIM), no padding. QK_HDIM=192 is not a multiple of any power-of-2 pad_interval that fits in one pad
+# per row, so we skip padding to avoid the continuous-stream rotation bug. No bank-conflict padding for K.
 _K_TDM_CONFIG = 1 << 16  # data_size=1 (bf16), pad_enable=0
 # V: dim0=128, pad_interval=128 elems=64dwords → enc_interval=5, 32B pad → enc_amount=7
 _V_TDM_CONFIG = (1 << 20) | (5 << 22) | (7 << 25)

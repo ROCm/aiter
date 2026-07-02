@@ -200,9 +200,7 @@ def _attn_fwd_inner(
         alibi_bias = -1 * alibi_slope * relative_pos
         qk += alibi_bias * 1.44269504
 
-    # ------------------------------------------------------------------
     # masking
-    # ------------------------------------------------------------------
     if USE_SLIDING_WINDOW:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # q positions
         col_idx = pos + tl.arange(0, BLOCK_N)  # k positions
@@ -369,9 +367,8 @@ def _fwd_kernel_splitK(
     USE_BLOCK_TABLE: tl.constexpr,
     IS_FP8: tl.constexpr,  # FP8 flag
 ):
-    # Cast strides to int64 to prevent overflow in pointer arithmetic.
-    # stride * index can exceed int32 range for large tensors (e.g. batch=64, sk=8192, d=56).
-    # See mha.py USE_INT64_STRIDES for the same pattern used in the prefill kernel.
+    # Cast strides to int64 to prevent int32 overflow in pointer arithmetic for
+    # large tensors (stride * index). Matches mha.py USE_INT64_STRIDES in prefill.
     stride_qz_i64 = tl.cast(stride_qz, tl.int64)
     stride_qm_i64 = tl.cast(stride_qm, tl.int64)
     stride_qg_i64 = tl.cast(stride_qg, tl.int64)
@@ -497,9 +494,8 @@ def _fwd_kernel_splitK(
         v_mask = (offs_n < N_CTX_K_FINAL)[:, None]
         osk_mask = (offs_m < N_CTX_Q)[:, None]
 
-    # scale sm_scale by log_2(e) and use
-    # 2^x instead of exp in the loop because CSE and LICM
-    # don't work as expected with `exp` in the loop
+    # scale sm_scale by log_2(e) and use 2^x instead of exp in the loop because CSE and LICM don't work as expected
+    # with `exp` in the loop
     qk_scale = sm_scale * 1.44269504
 
     # load q: it will stay in SRAM throughout
@@ -539,13 +535,8 @@ def _fwd_kernel_splitK(
                 process_end = tl.minimum(hi - block_start, BLOCK_SIZE_K)
                 process_end = tl.minimum(process_end, block_end - block_start)
 
-                # Instead of forcing a floor alignment to BLOCK_N (which can still skip
-                # part of the intended range if start falls mid-tile for small splits),
-                # start from the raw (possibly unaligned) process_start rounded *down* but
-                # allow the loop to begin earlier (at most BLOCK_N before) so that any
-                # partial tile overlapping [lo, hi) is covered. Masking below will remove
-                # columns < lo or >= hi ensuring numerically identical coverage without
-                # duplication.
+                # Floor-align to BLOCK_N so the tile containing process_start is covered; masking below removes
+                # columns outside [lo, hi), giving identical coverage without duplication.
                 aligned_start = (process_start // BLOCK_N) * BLOCK_N
                 if aligned_start > 0 and aligned_start + BLOCK_N > process_start:
                     # ensure we include the tile that contains process_start
@@ -554,10 +545,9 @@ def _fwd_kernel_splitK(
                     process_start = aligned_start
 
                 for offset in range(process_start, process_end, BLOCK_N):
-                    # Current position (may begin slightly before logical split range; masking fixes it)
+                    # pos may begin before the logical split range; masking enforces [lo, hi)
                     pos = block_start + offset
-                    # Proceed unconditionally; masking below enforces [lo, hi)
-                    # Calculate base addresses for K and V in this physical block
+                    # Base addresses for K and V in this physical block
                     k_base = (
                         K
                         + physical_block * stride_kb_i64
@@ -631,9 +621,8 @@ def _fwd_kernel_splitK(
                         WINDOW_SIZE_RIGHT,
                     )
     else:
-        # Non-paged attention: process KV from cache
-        # Note: Cache should be updated externally before calling this kernel
-        # Compute bounds check flag once: needed if split size not aligned to BLOCK_N or variable seqlens
+        # Non-paged attention: process KV from cache (updated externally beforehand).
+        # Bounds check needed if split size not aligned to BLOCK_N or variable seqlens.
         bounds_checks_n = ((BLOCK_N_PER_SPLIT % BLOCK_N) > 0) | USE_CACHE_SEQLENs
         # loop over k, v and update accumulator
         for start_n in range(lo, hi, BLOCK_N):
@@ -652,9 +641,8 @@ def _fwd_kernel_splitK(
             kT = tl.load(kT_ptrs, mask=kT_mask, other=0.0)
             v = tl.load(V_ptrs, mask=v_mask, other=0.0)
 
-            # Use the same inner loop logic
-            # Precompute column validity mask for this tile (all True for full tiles).
-            # hi is the upper bound of the overall split range; start_n marks this tile's base.
+            # Column validity mask for this tile (all True for full tiles); hi is the
+            # split range upper bound, start_n this tile's base.
             col_valid_mask = offs_n < (hi - start_n)
 
             m_i, l_i, acc = _attn_fwd_inner(
@@ -1059,10 +1047,8 @@ def attention_forward_decode_triton_impl(
     )
     use_cache_seqlens = cache_seqlens is not None
     use_sliding_window = window_size_left != -1 or window_size_right != -1
-    # As in the prefill kernel, WINDOW_SIZE_RIGHT is used as a literal finite
-    # offset (no infinite-right branch), so a negative right collapses the band
-    # and silently over-masks. Reject it instead. (right == -1 is only valid as
-    # the off sentinel, paired with left == -1, which leaves this flag False.)
+    # WINDOW_SIZE_RIGHT is a literal finite offset (no infinite-right branch), so a negative right would silently
+    # over-mask; reject it. (right == -1 is only the off sentinel, paired with left == -1, which leaves this flag False.)
     if use_sliding_window and window_size_right < 0:
         raise NotImplementedError(
             "Sliding-window attention requires window_size_right >= 0 "
@@ -1080,9 +1066,8 @@ def attention_forward_decode_triton_impl(
         # For paged attention, k_cache and v_cache have shape [num_blocks, block_size, nheads, head_dim]
         num_blocks_kc, block_size_k, nheads_kc, dim_kc = k_cache.shape
         num_blocks_vc, block_size_v, nheads_vc, dim_vc = v_cache.shape
-        # Get the actual sequence length from the block_table upper bound.
-        # Avoid cache_seqlens.max().item(): GPU-to-CPU sync is illegal during
-        # CUDA graph capture, and the block-table bound is always safe.
+        # Get seqlen from the block_table upper bound, not cache_seqlens.max().item():
+        # GPU-to-CPU sync is illegal during CUDA graph capture.
         assert block_table is not None
         num_blocks_per_seq = block_table.shape[1]
         seqlen_kc = num_blocks_per_seq * block_size_k
@@ -1386,9 +1371,8 @@ def attention_forward_decode_triton_impl(
         # block table strides
         stride_bt_b=stride_bt_b,
         stride_bt_s=stride_bt_s,
-        # paged KV block strides (real k/v_cache.stride(0)); lets the kernel
-        # index a non-contiguous paged cache instead of assuming the block
-        # stride equals BLOCK_SIZE_K * stride_kn (contiguous-only).
+        # paged KV block strides (real k/v_cache.stride(0)); supports a
+        # non-contiguous paged cache, not just contiguous BLOCK_SIZE_K * stride_kn.
         stride_kb=(k_cache.stride(0) if use_block_table else 0),
         stride_vb=(v_cache.stride(0) if use_block_table else 0),
         # alibi strides

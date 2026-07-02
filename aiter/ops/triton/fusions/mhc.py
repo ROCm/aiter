@@ -119,9 +119,8 @@ def mhc(
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
     BLOCK_C = config.pop("BLOCK_C", min(64, triton.next_power_of_2(C)))
 
-    # Pin h_post to pid_c == 0 and h_res (with the sinkhorn loop) to pid_c == 1
-    # in `_mhc_reduce_apply_kernel`. When only one C-tile per M-tile exists,
-    # fall back to pid_c == 0 doing both. Resolved at compile time via constexpr.
+    # Pin h_post to pid_c == 0 and h_res (with the sinkhorn loop) to pid_c == 1 in `_mhc_reduce_apply_kernel`. When
+    # only one C-tile per M-tile exists, fall back to pid_c == 0 doing both. Resolved at compile time via constexpr.
     NUM_C_BLOCKS = triton.cdiv(C, BLOCK_C)
     RES_PID_C = 0 if NUM_C_BLOCKS == 1 else 1
 
@@ -153,9 +152,8 @@ def mhc(
     assert (
         BLOCK_N >= n
     ), f"BLOCK_N ({BLOCK_N}) must be >= n ({n}) for the apply-pre fusion"
-    # In-kernel SK requires a single program to own the full (n, n) res tile and
-    # reshapes its res sub-tile to (BLOCK_M, n, n); both kernels need
-    # n_squared to be a power of 2 (i.e. N_POW2_RES == n_squared) for the reshape
+    # In-kernel SK requires a single program to own the full (n, n) res tile and reshapes its res sub-tile to
+    # (BLOCK_M, n, n); both kernels need n_squared to be a power of 2 (i.e. N_POW2_RES == n_squared) for the reshape
     # to compile, and the non-split-K kernel additionally needs BLOCK_N == n_squared.
     if sinkhorn_iters > 0:
         assert BLOCK_N == n_squared, (
@@ -582,13 +580,9 @@ def mhc_post_pre(
             f"sinkhorn_iters=0."
         )
 
-    # Reuse MHC_FUSED tuning. Two block-sizes serve distinct roles here:
-    #   - BLOCK_K  : per-CTA K-axis width in the post_pre split kernel; one
-    #                CTA covers BLOCK_K K-elements of the next-pre GEMM,
-    #                equivalent to BLOCK_K/n contiguous C-elements per stream.
-    #                NUM_KSPLIT = cdiv(K, BLOCK_K).
-    #   - BLOCK_C  : C-axis tile for _mhc_reduce_apply_kernel only (apply-pre
-    #                output parallelism). Independent of BLOCK_K.
+    # Reuse MHC_FUSED tuning. BLOCK_K = per-CTA K-axis width in the post_pre split kernel (= BLOCK_K/n contiguous
+    # C-elements per stream; NUM_KSPLIT = cdiv(K, BLOCK_K)). BLOCK_C = C-axis tile for _mhc_reduce_apply_kernel only
+    # (apply-pre output parallelism), independent of BLOCK_K.
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode="sinkhorn")
     config = dict(config)
@@ -641,10 +635,9 @@ def mhc_post_pre(
             residual_out.dtype == dtype
         ), f"residual_out dtype mismatch: expected {dtype}, got {residual_out.dtype}"
 
-    # Split-K reduce-apply scratch. Write-before-read within this call (the
-    # split kernel writes every entry the reduce kernel reads, masked the same
-    # way), so callers may pass persistent buffers — keeping `.data_ptr()`
-    # stable lets CUDAGraph capture/replay work without surprise re-allocation.
+    # Split-K reduce-apply scratch. Write-before-read within this call (split kernel writes every entry the reduce
+    # kernel reads, same masking), so callers may pass persistent buffers; stable `.data_ptr()` lets CUDAGraph
+    # capture/replay work without surprise re-allocation.
     if acc_partial is None:
         acc_partial = torch.empty(
             (NUM_KSPLIT, M, N_total), dtype=torch.float32, device=device
@@ -713,9 +706,8 @@ def mhc_post_pre(
     )
 
     # --- Launch 2: reduce-apply kernel writes h_post and h_res directly.
-    # Allocate any caller-omitted outputs in `layer_input.dtype`. Callers can
-    # pre-allocate them in any float dtype (e.g. fp32) to skip a downstream
-    # cast — the kernel implicit-casts at the store.
+    # Allocate any caller-omitted outputs in `layer_input.dtype`. Callers can pre-allocate them in any float dtype
+    # (e.g. fp32) to skip a downstream cast — the kernel implicit-casts at the store.
     if h_post is None:
         h_post = torch.empty(M, n, 1, dtype=dtype, device=device)
     else:

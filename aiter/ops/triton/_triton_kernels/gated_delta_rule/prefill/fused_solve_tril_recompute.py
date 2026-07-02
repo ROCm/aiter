@@ -24,12 +24,8 @@ from ..utils import prepare_chunk_indices, prepare_rebased_cu_seqlens
 from ..utils.op import exp
 from ..utils.solve_tril import FLA_TRIL_PRECISION, solve_tril
 
-# solve_tril + recompute_w_u dispatch threshold in chunks (NT). At or below
-# this the single fused kernel is used; above it the split path
-# (solve_tril + recompute) is used.
-# The split path's small-NT cost is dominated by launch overhead, so the
-# crossover can shift under CUDA-graph/async capture -- re-tune via the env
-# var if needed.
+# Fused vs split (solve_tril + recompute) dispatch threshold in chunks (NT): at or below this NT the fused kernel wins
+# on launch overhead. Crossover can shift under CUDA-graph/async capture -- re-tune via the env var if needed.
 _SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX = int(
     os.environ.get("AITER_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", "32")
 )
@@ -123,9 +119,7 @@ def fused_solve_tril_recompute_w_u_kernel(
     else:
         bos = i_b * T
 
-    # ================================================================
     # Phase 1: compute (I + A)^{-1} in registers (triangular solve)
-    # ================================================================
     o_i = tl.arange(0, 16)
     m_lo = o_i[:, None] > o_i[None, :]
     m_id = o_i[:, None] == o_i[None, :]
@@ -252,9 +246,7 @@ def fused_solve_tril_recompute_w_u_kernel(
     h42 = b42.to(lowp_dtype)
     h43 = b43.to(lowp_dtype)
 
-    # ================================================================
     # Phase 2: u = Ai @ (v * beta), w = Ai @ (k * beta * exp(g))
-    # ================================================================
     beta_base = beta + bos * H + i_h
     if IS_VARLEN:
         g_base = g + i_h * T_flat + bos
@@ -395,14 +387,9 @@ def fused_solve_tril_recompute_w_u_kernel(
         tl.store(pw3, w3.to(pw3.dtype.element_ty), boundary_check=(0, 1))
 
 
-# =============================================================================
 # Split path: head-major recompute_w_u kernel (consumes pre-inverted Ai).
-#
-# Used by the adaptive dispatcher for long sequences, where running
-# solve_tril + a plain matmul is cheaper than the single fused kernel.
-# Output layout is [B, H, T, K/V] head-major so the downstream hidden-state
-# kernel (chunk_delta_h) sees the same tensors as the fused path.
-# =============================================================================
+# Used for long sequences where solve_tril + plain matmul beats the fused kernel.
+# Output layout [B, H, T, K/V] head-major matches the fused path so the downstream hidden-state kernel (chunk_delta_h) sees the same tensors.
 if IS_AMD:
     # Fixed BK=BV=64, autotune over num_warps x num_stages.
     _RECOMPUTE_WU_HM_CONFIGS = [
@@ -479,8 +466,7 @@ def recompute_w_u_head_major_kernel(
     else:
         bos = i_b * T
 
-    # Load beta, Ai (the inverted A), and the per-chunk gate eagerly so the
-    # compiler can hoist them out of the V/K loops and overlap memory latency.
+    # Load beta, Ai (inverted A), and gate eagerly so they hoist out of the V/K loops and overlap memory latency.
     if IS_VARLEN:
         g_base = g + i_h * T_flat + bos
     else:
@@ -502,7 +488,7 @@ def recompute_w_u_head_major_kernel(
     b_g_raw = tl.load(p_g, boundary_check=(0,))
     b_g = tl.math.exp2(b_g_raw) if USE_EXP2 else exp(b_g_raw)
 
-    # ---- u = Ai @ (v * beta) -> head-major store ----
+    # u = Ai @ (v * beta) -> head-major store
     v_base = v + (bos * H + i_h) * V
     if IS_VARLEN:
         u_base = u + (i_h * T_flat + bos) * V
@@ -521,7 +507,7 @@ def recompute_w_u_head_major_kernel(
         b_u = tl.dot(b_Ai, b_vb, allow_tf32=False)
         tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
 
-    # ---- w = Ai @ (k * beta * exp(g)) -> head-major store ----
+    # w = Ai @ (k * beta * exp(g)) -> head-major store
     k_base = k + (bos * Hg + i_h // (H // Hg)) * K
     if IS_VARLEN:
         w_base = w + (i_h * T_flat + bos) * K
@@ -536,7 +522,6 @@ def recompute_w_u_head_major_kernel(
             w_base, (T, K), (K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        # Single fused multiply-cast before the dot.
         b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
         b_w = tl.dot(b_Ai, b_kb)
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
@@ -625,9 +610,8 @@ def fused_solve_tril_recompute_w_u(
     H = v.shape[-2]
     BT = A_raw.shape[-1]
 
-    # Chunk indices come from the ORIGINAL (cache-stable) cu_seqlens + the
-    # decode ints (cached, no per-forward D2H); the kernels walk the
-    # pre-sliced prefill data via the rebased cu_seqlens.
+    # Chunk indices come from the original (cache-stable) cu_seqlens + cached decode ints (no per-forward D2H);
+    # kernels walk pre-sliced prefill data via the rebased cu_seqlens.
     if cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, BT, num_decodes, num_decode_tokens
@@ -647,8 +631,7 @@ def fused_solve_tril_recompute_w_u(
     elif _SOLVE_TRIL_RECOMPUTE_FORCE == "split":
         use_split = True
     else:
-        # Auto: use split once NT exceeds the threshold; below it the
-        # fused kernel's fewer launches win.
+        # Auto: split once NT exceeds the threshold.
         if (
             cu_seqlens is not None
             and _SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT is not None

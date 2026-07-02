@@ -58,8 +58,7 @@ SEED = 2026
 PREFILL_CONTEXT_LEN = 256  # per-seq context length for prefill mode
 SENTINEL_PAD = 16  # extra plan rows with position=-1 (kernel must skip them)
 CG_TOKEN_PAD = 32  # extra kv_in/score_in tail rows filled with NaN (CUDAGraph
-# bucket-padding: kernel must not read past the last valid ragged_id, else
-# NaN propagates and the test fails loudly)
+# bucket-padding); kernel must not read past the last valid ragged_id
 
 
 def _shape_by_label(label):
@@ -128,9 +127,8 @@ def _build_inputs(shape, bs, mtp, mode):
     score_in = (
         torch.randn(num_q_tokens, dim_full, dtype=torch.bfloat16, generator=g) * 0.5
     )
-    # Poison the CG-pad tail: kernel must never read these rows (they live
-    # past the last valid ragged_id). NaN propagates through softmax/RMSNorm,
-    # so any accidental read shows up as NaN in the cache scatter.
+    # Poison the CG-pad tail: kernel must never read these rows (past the last
+    # valid ragged_id); an accidental read shows up as NaN in the cache scatter.
     kv_in[num_valid_tokens:] = float("nan")
     score_in[num_valid_tokens:] = float("nan")
     kv_state = (
@@ -165,11 +163,9 @@ def _build_inputs(shape, bs, mtp, mode):
             else:  # prefill
                 position_in_seq = (s + 1) * ratio - 1
                 ragged_id = b * PREFILL_CONTEXT_LEN + position_in_seq
-                # window_len uses position_in_seq (not ragged_id) so the
-                # K-loop's input-phase reads stay within seq b's input
-                # range [b*seq_len, (b+1)*seq_len). Earlier source positions
-                # for the first few boundaries of every seq fall back to
-                # state-cache reads (or padding when s < 0).
+                # window_len uses position_in_seq (not ragged_id) so the K-loop's input-phase reads stay within seq
+                # b's input range [b*seq_len, (b+1)*seq_len). Earlier source positions for the first few boundaries of
+                # every seq fall back to state-cache reads (or padding when s < 0).
                 window_len = max(0, K_pool - 1 - position_in_seq)
             plan[pid, 0] = ragged_id
             plan[pid, 1] = b
@@ -190,10 +186,9 @@ def _build_inputs(shape, bs, mtp, mode):
         for j in range(blocks_per_seq):
             block_tables[b, j] = b * blocks_per_seq + j
 
-    # Dominant memory traffic (this kernel is bandwidth-bound): per compressed
-    # boundary it pools K_pool source tokens from kv_in + score_in (each dim_full
-    # wide, bf16) and writes D compressed elements to kv_cache. state-cache reads
-    # vary with window_len and are treated as a secondary term.
+    # Dominant memory traffic (bandwidth-bound): per compressed boundary pool K_pool source tokens from kv_in +
+    # score_in (dim_full wide, bf16) and write D compressed elements to kv_cache. state-cache reads are a secondary
+    # term.
     nbytes = num_compress * (
         K_pool * dim_full * 2 * kv_in.element_size()  # kv_in + score_in pooled reads
         + D * kv_cache.element_size()  # compressed cache write (fp8=1B / bf16=2B)
@@ -312,9 +307,8 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
             tol_err_ratio=0.05,
             msg=f"{msg} kv_cache(fp8)",
         )
-        # cache_scale: bit-exact. Reference mirrors the kernel's exact fp32
-        # ops (am_safe * inv_fp8_max constant + ue8m0 ceil-pow2), so the
-        # scale per row must match to the bit.
+        # cache_scale: bit-exact. Reference mirrors the kernel's exact fp32 ops
+        # (am_safe * inv_fp8_max constant + ue8m0 ceil-pow2).
         checkAllclose(
             inp["cache_scale"],
             ref_inp["cache_scale"],
@@ -324,11 +318,9 @@ def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
             msg=f"{msg} cache_scale(bit-exact)",
         )
     else:
-        # BF16 kv_cache: rare rounding-boundary flips at <=1 ulp because online
-        # softmax (kernel) and torch.softmax (reference) sum in different
-        # orders. Prefill processes 10-100x more boundaries per case than
-        # decode -> more chances to land on a rounding boundary, so the
-        # element-mismatch ratio scales. Tolerate <=2%; bound max delta at
+        # BF16 kv_cache: rare <=1 ulp rounding-boundary flips (kernel online
+        # softmax vs torch.softmax sum in different orders); prefill has more
+        # boundaries per case -> higher mismatch ratio. Tolerate <=2%; bound at
         # 2 ulp of bf16 ? 2e-2 at unit magnitude.
         err = checkAllclose(
             inp["kv_cache"].to(dtypes.fp32),
@@ -627,8 +619,7 @@ def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
 
 
 def main():
-    # The wrappers dispatch wave64/wave32 by arch; skip cleanly on anything
-    # outside the validated set.
+    # The wrappers dispatch wave64/wave32 by arch; skip cleanly on anything outside the validated set.
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
             "flydsl compress_attn unsupported on %s; skipping", get_gfx()

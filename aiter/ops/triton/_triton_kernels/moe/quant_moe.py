@@ -98,8 +98,7 @@ def _compute_mx_quant_and_scale(
         # DequantScaleRoundingMode.ROUND_UP
         # compute 2 ** ceil(log2(dequant_scale))
         # Adding 0x007FFFFF adds exponent by 1 unless mantissa is all zeros
-        # A corner case: exponent is 0xFF that will overflow but that's already
-        # NaN so assume we don't care.
+        # A corner case: exponent is 0xFF that will overflow but that's already NaN so assume we don't care.
         dequant_scale_exponent = (
             dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF
         ) & 0x7F800000

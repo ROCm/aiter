@@ -712,9 +712,8 @@ def decode_attention_fwd(
     kv_group_num = q.shape[1] // v_buffer.shape[-2]
     Lk = k_buffer.shape[-1]
 
-    # On ROCm, the grouped kernel uses tl.dot which fails compilation when
-    # BLOCK_DMODEL >= 512 (MLA's 576-dim keys).  Fall back to the per-head
-    # kernel that uses element-wise multiply + tl.sum instead.
+    # On ROCm, the grouped kernel uses tl.dot which fails compilation when BLOCK_DMODEL >= 512 (MLA's 576-dim keys).
+    # Fall back to the per-head kernel that uses element-wise multiply + tl.sum instead.
     use_grouped = kv_group_num != 1 and not (is_hip_ and Lk >= 576)
 
     if not use_grouped:

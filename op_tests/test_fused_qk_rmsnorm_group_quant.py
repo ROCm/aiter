@@ -780,8 +780,7 @@ if __name__ == "__main__":
     )
     if _fp4x2_available:
         l_quant_type = ["fp8", "fp4x2"]
-    # DeepSeekV2 MLA realistic default:
-    # q_lora_rank ~= 1536 (12 * 128), kv_lora_rank ~= 512 (4 * 128), usually n1 > n2.
+    # DeepSeekV2 MLA realistic default: q_lora_rank ~= 1536 (12 * 128), kv_lora_rank ~= 512 (4 * 128), usually n1 > n2.
     l_token = [32, 256, 8192, 16384]
     l_num_head1 = [12]
     l_num_head2 = [4]

@@ -98,8 +98,7 @@ FLOAT32_BYTES = torch.finfo(dtypes.fp32).bits // 8
 # This will change depending on the compute capability.
 # - 512 as a buffer
 MAX_SEQ_LEN = 65536
-# There may not be enough gpu memory due to large NUM_BLOCKS.
-# Reduce NUM_BLOCKS when it happens.
+# Reduce NUM_BLOCKS if GPU runs out of memory.
 NUM_BLOCKS = 32768  # Arbitrary values for testing
 PARTITION_SIZE = 512
 # flshattF and tritonflashattF supported: {dtypes.fp16, dtypes.bf16}

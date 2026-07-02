@@ -170,9 +170,8 @@ OPUS_A8W4_K3_SHAPE_FAMILY_CONTRACT = OpusA8W4ShapeFamilyContract(
     inter_dim_pad=128,
 )
 
-# K5 is kept as a small generalized decode family. It is not part of the
-# current DSV4 tuned target set, but it exercises the metadata/codegen path
-# without requiring one-off shape-specific code.
+# K5 is kept as a small generalized decode family. It is not part of the current DSV4 tuned target set, but it exercises
+# the metadata/codegen path without requiring one-off shape-specific code.
 OPUS_A8W4_K5_SHAPE_FAMILY_CONTRACT = OpusA8W4ShapeFamilyContract(
     name="a8w4_decode_k5",
     logical_inter_dim=768,

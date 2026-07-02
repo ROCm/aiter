@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# Fused replacement for the multi-kernel "topk → routing data" chain that
-# bridges FusedMoE.select_experts to triton_kernels.matmul_ogs. See the
-# accompanying _triton_kernels/fused_routing_from_topk.py for the kernel.
+# Fused replacement for the multi-kernel "topk → routing data" chain that bridges FusedMoE.select_experts to
+# triton_kernels.matmul_ogs. See the accompanying _triton_kernels/fused_routing_from_topk.py for the kernel.
 from typing import Optional, Tuple
 
 import torch
@@ -19,11 +18,9 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-# Maximum NK supported by the single-CTA fused kernel is 4096. Above this the
-# wrapper raises rather than degrading silently — callers should fall
-# back to a multi-kernel reference path for prefill-shaped inputs (NK in
-# the tens of thousands). Decode (num_tokens × top_k) at typical batch
-# sizes is well within this budget.
+# Maximum NK supported by the single-CTA fused kernel is 4096. Above this the wrapper raises rather than degrading
+# silently — callers should fall back to a multi-kernel reference path for prefill-shaped inputs (NK in the tens of
+# thousands). Decode (num_tokens × top_k) at typical batch sizes is well within this budget.
 
 
 def fused_routing_from_topk(
@@ -121,9 +118,8 @@ def fused_routing_from_topk(
     BLOCK_NK = max(triton.next_power_of_2(int(n_gates_pad)), 32)
     BLOCK_E = max(triton.next_power_of_2(int(n_expts_tot)), 32)
 
-    # Kernel 1 (Phase A): histogram via tl.histogram (warp-local
-    # shared-memory reduction). num_warps=1 keeps the reduction within a
-    # single wave, matching the CTA-local design of the original kernel.
+    # Kernel 1 (Phase A): histogram via tl.histogram (warp-local shared-memory reduction). num_warps=1 keeps the
+    # reduction within a single wave, matching the CTA-local design of the original kernel.
     _fused_routing_from_topk_hist_kernel[(1,)](
         topk_ids_flat,
         expert_map_flat,

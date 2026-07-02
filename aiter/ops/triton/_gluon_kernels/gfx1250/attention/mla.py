@@ -2312,13 +2312,11 @@ def _mla_prefill_fwd_kernel_non_pipelined(
         + 1
     )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
+    # adjust for potential padding in the last q_block by considering the actual sequence length
     max_seq_prefix_len = gl.minimum(max_seq_prefix_len, seq_len)
 
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
+    # calculate the number of tiles that need to be processed to cover the longest sequence prefix (due to causal
+    # masking, tiles beyond this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     # ---- Sliding-window tile pruning --------------------
@@ -2737,13 +2735,11 @@ def _mla_decode_fwd_kernel_non_pipelined(
         + 1
     )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
+    # adjust for potential padding in the last q_block by considering the actual sequence length
     max_seq_prefix_len = gl.minimum(max_seq_prefix_len, seq_len)
 
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
+    # calculate the number of tiles that need to be processed to cover the longest sequence prefix (due to causal
+    # masking, tiles beyond this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     seq_offset = segm_idx * tiles_per_segment * TILE_SIZE + offs_seq_t

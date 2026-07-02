@@ -863,17 +863,15 @@ def gemm_a8w8_blockscale_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[1]
     if not _hip_blockscale_supported():
-        # No CK code object for this arch -> triton preshuffle. WQ is already
-        # (16,16)-shuffled (the only blockscale layout) == triton's (N//16, K*16)
-        # view; x_scale is column-major. Direct fit.
+        # No CK code object for this arch -> triton preshuffle. WQ is already (16,16)-shuffled (the only blockscale
+        # layout) == triton's (N//16, K*16) view; x_scale is column-major. Direct fit.
         from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
             gemm_a8w8_blockscale_preshuffle as _gemm_a8w8_blockscale_preshuffle_triton,
         )
 
         xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
         wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
-        # Explicit config (no PRESHUFFLED tuning file on main yet); mirrors the
-        # gfx1201 non-preshuffle M_LEQ_8 default.
+        # Explicit config (no PRESHUFFLED tuning file on main yet); mirrors the gfx1201 non-preshuffle M_LEQ_8 default.
         _fallback_cfg = {
             "BLOCK_SIZE_M": 32,
             "BLOCK_SIZE_N": 16,
@@ -1075,12 +1073,9 @@ def gemm_a8w8_bpreshuffle_cktile_tune(
 ) -> Tensor: ...
 
 
-# ---------------------------------------------------------------------------
 # gfx1250 (mi400) MXFP8 x MXFP8 GEMM (a8w8) -- ASM, kernarg preload mode.
-# A (activation) and B (weight) are both mxfp8 (e4m3) with OCP MX e8m0 block
-# scales (block=32). Kernel variant is auto-selected by the .cu heuristic
-# unless an explicit kernelName is given. See asm_mxfp8fp4gemm_mi400.cu.
-# ---------------------------------------------------------------------------
+# A (activation) and B (weight) both mxfp8 (e4m3) with OCP MX e8m0 block scales (block=32). Kernel variant auto-selected
+# by the .cu heuristic unless an explicit kernelName is given. See asm_mxfp8fp4gemm_mi400.cu.
 @compile_ops(
     "module_mxfp8fp4gemm_asm",
     fc_name="mxfp8_mxfp8_gemm_asm",

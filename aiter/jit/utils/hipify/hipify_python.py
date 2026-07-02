@@ -132,14 +132,8 @@ class bcolors:
     UNDERLINE = "\033[4m"
 
 
-# To the programmer, the output of hipify most likely are intermediates.
-# This class allows users of hipify to ask for a cleanup by running the
-# hipify and compilation in a with instantiating this context manager class
-# with keep_intermediates=False.
-# The main usecase is the cpp_extensions, specifically the load method.
-# It is a good idea to keep intermediates (in case of errors or to
-# not recompile unchanged files), but in cases where you don't want to
-# keep them (e.g. in the CI), this can be used to remove files.
+# Context manager to remove hipify intermediates when keep_intermediates=False.
+# Main usecase is cpp_extensions.load; keeping intermediates avoids recompiles, but CI etc. may want them removed.
 class GeneratedFileCleaner:
     """Context Manager to clean up generated files"""
 
@@ -194,11 +188,8 @@ def matched_files_iter(
 
     exact_matches = set(includes)
 
-    # This is a very rough heuristic; really, we want to avoid scanning
-    # any file which is not checked into source control, but this script
-    # needs to work even if you're in a Git or Hg checkout, so easier to
-    # just block the biggest time sinks that won't matter in the
-    # end.
+    # Rough heuristic: skip the biggest non-source-control time sinks, since this
+    # must work under either a Git or Hg checkout.
     for abs_dirpath, dirs, filenames in os.walk(root_path, topdown=True):
         rel_dirpath = os.path.relpath(abs_dirpath, root_path)
         if rel_dirpath == ".":
@@ -213,8 +204,7 @@ def matched_files_iter(
         for filename in filenames:
             filepath = os.path.join(abs_dirpath, filename)
             rel_filepath = os.path.join(rel_dirpath, filename)
-            # We respect extensions, UNLESS you wrote the entire
-            # filename verbatim, in which case we always accept it
+            # We respect extensions, UNLESS you wrote the entire filename verbatim, in which case we always accept it
             if (
                 _fnmatch(filepath, includes)
                 and (not _fnmatch(filepath, ignores))
@@ -646,39 +636,15 @@ def get_hip_file_path(rel_filepath, is_pytorch_extension=False):
     dirpath, filename = os.path.split(rel_filepath)
     root, ext = os.path.splitext(filename)
 
-    # Here's the plan:
-    #
-    # In general, we need to disambiguate the HIPified filename so that
-    # it gets a different name from the original filename, so
-    # that we don't overwrite the original file
-    #
-    # There's a lot of different naming conventions across PyTorch
-    # and Caffe2, but the general recipe is to convert occurrences
-    # of cuda/gpu to hip, and add hip if there are no occurrences
-    # of cuda/gpu anywhere.
-    #
-    # Concretely, we do the following:
-    #
-    #   - If there is a directory component named "cuda", replace
-    #     it with "hip", AND
-    #
-    #   - If the file name contains "CUDA", replace it with "HIP", AND
-    #
-    #   - ALWAYS replace '.cu' with '.hip', because those files
-    #     contain CUDA kernels that needs to be hipified and processed with
-    #     hip compiler
-    #
-    #   - If we are not hipifying a PyTorch extension, and the parent
-    #     directory name did not change as a result of the above
-    #     transformations, insert "hip" in the file path
-    #     as the direct parent folder of the file
-    #
-    #   - If we are hipifying a PyTorch extension, and the parent directory
-    #     name as well as the filename (incl. extension) did not change as
-    #     a result of the above transformations, insert "_hip" in the filename
-    #
-    # This isn't set in stone; we might adjust this to support other
-    # naming conventions.
+    # Disambiguate the HIPified name from the original so we don't overwrite it.
+    # Recipe:
+    #   - replace "cuda" dir component with "hip"
+    #   - replace "CUDA" in the filename with "HIP"
+    #   - ALWAYS replace '.cu' with '.hip' (those files contain CUDA kernels)
+    #   - non-extension: if parent dir name did not change, insert "hip" as the
+    #     direct parent folder
+    #   - extension: if parent dir name and filename did not change, insert "_hip"
+    #     in the filename
 
     if ext == ".cu":
         ext = ".hip"
@@ -862,14 +828,11 @@ CAFFE2_MAP = {}
 PYTORCH_TRIE = Trie()
 PYTORCH_MAP: Dict[str, object] = {}
 
-# In PyTorch, we map cuBLAS->rocBLAS and cuSPARSE->hipSPARSE. Note the prefix, roc versus hip.
-# The 'hip' APIs offer a more direct CUDA-friendly mapping, but calling rocBLAS directly has better performance.
-# Unfortunately, the roc* types and hip* types differ, i.e., rocblas_float_complex versus hipComplex.
-# In the case of SPARSE, we must use the hip types for complex instead of the roc types,
-# but the pytorch mappings assume roc. Therefore, we create a new SPARSE mapping that has a higher priority.
-# Its mappings will trigger first, and only when a miss occurs will the lower-priority pytorch mapping take place.
-# When a file contains "sparse" in the filename, a mapping marked with API_SPARSE is preferred over other choices.
-# Similarly, "linalg" files require rocBLAS -> hipSOLVER so they also need special handling.
+# PyTorch maps cuBLAS->rocBLAS and cuSPARSE->hipSPARSE (roc is faster but roc*
+# and hip* types differ, e.g. rocblas_float_complex vs hipComplex). SPARSE needs
+# hip complex types, so we add a higher-priority SPARSE mapping that triggers
+# first for "sparse" files (API_SPARSE); "linalg" files similarly need
+# rocBLAS -> hipSOLVER.
 PYTORCH_SPECIAL_MAP = {}
 
 for mapping in CUDA_TO_HIP_MAPPINGS:

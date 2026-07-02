@@ -34,9 +34,8 @@ def _layernorm_kernel(
     b_ptr,
     mean_ptr,
     rstd_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `x_row_stride` is
-    # how much to increase `x_ptr` by to get the element one row down.
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `x_row_stride` is how much to increase `x_ptr` by to get the element one row down.
     x_row_stride,
     y_row_stride,
     # Matrix dimensions
@@ -140,9 +139,8 @@ def _fused_add_layernorm_kernel(
     b_ptr,
     mean_ptr,
     rstd_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `x_row_stride` is
-    # how much to increase `x_ptr` by to get the element one row down.
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `x_row_stride` is how much to increase `x_ptr` by to get the element one row down.
     x_row_stride,
     y_row_stride,
     # Matrix dimensions
@@ -263,9 +261,8 @@ def _quant_layernorm_kernel(
     y_scale_ptr,
     # Auxiliary tensor to store intermediate data
     aux_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `x_row_stride` is
-    # how much to increase `x_ptr` by to get the element one row down.
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `x_row_stride` is how much to increase `x_ptr` by to get the element one row down.
     x_row_stride,
     y_row_stride,
     aux_row_stride,
@@ -419,9 +416,8 @@ def _quant_fused_add_layernorm_kernel(
     y_scale_ptr,
     # Auxiliary tensor to store intermediate data
     aux_ptr,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `x_row_stride` is
-    # how much to increase `x_ptr` by to get the element one row down.
+    # The stride variables represent how much to increase the ptr by when moving by 1 element in a particular dimension.
+    # E.g. `x_row_stride` is how much to increase `x_ptr` by to get the element one row down.
     x_row_stride,
     y_row_stride,
     aux_row_stride,

@@ -345,16 +345,9 @@ def test_paged_attention(
     workspace_golden, out_golden = run_aiter(*ARGS_TUPLE, version="GOLDEN")
     workspace_experi, out_experi = run_aiter(*ARGS_TUPLE, version="EXPERIMENTAL")
 
-    # Grok1-bf16-TP8 + bs512-ilen2048:
-    #    num_seqs=512, num_heads=6, max_num_partitions=8, head_size=128, nbyes_per_qo_elem=2
-
-    # workspace_buffer size: from pa_ragged.cpp.jinja
-    #     exp_sums_ptr:  = (num_seqs * num_heads * max_num_partitions) * 4 as type is float
-    #                    = 512*6*8*4 bytes
-    #     max_logits_ptr:= (num_seqs * num_heads * max_num_partitions) * 4 as type is float
-    #                    = 512*6*8*4 bytes
-    #     tmp_out_ptr:   = (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
-    #                    = 512*6*8*128*2 bytes
+    # workspace_buffer layout (from pa_ragged.cpp.jinja):
+    #   exp_sums / max_logits: each (num_seqs * num_heads * max_num_partitions) * 4 (float)
+    #   tmp_out: (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
     # output size = torch.empty_like(query), dtype=dtype
     num_seqs, num_heads, head_size = query.shape
     block_size = key_cache.shape[2 if kv_cache_layout == "HND" else 1]

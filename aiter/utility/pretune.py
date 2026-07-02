@@ -47,22 +47,15 @@ import tempfile
 logger = logging.getLogger("aiter")
 
 
-# ---------------------------------------------------------------------------
-# Tune module script fallback table
-#
-# Some _tune modules share a tune script with a parent module.  The parent
-# tuner covers the child's kernel family via --libtype all.
-# Value None means no viable tune script exists — the module is skipped with
-# a warning.
-#
-# Background:
-#   gemm_a8w8_blockscale_tune.py covers cktile and standard bpreshuffle
-#   variants via --libtype all, but it writes to AITER_CONFIG_GEMM_A8W8_BLOCKSCALE.
-#   The blockscale_bpreshuffle family uses a separate CSV
-#   (AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE) that no existing
-#   .py script writes to — those modules cannot be pretuned until a dedicated
-#   tune script is added.
-# ---------------------------------------------------------------------------
+# Tune module script fallback table.
+# Some _tune modules share a tune script with a parent module (parent tuner covers
+# the child's kernel family via --libtype all). Value None means no viable tune
+# script exists -- the module is skipped with a warning.
+# Background: gemm_a8w8_blockscale_tune.py covers cktile and standard bpreshuffle
+# via --libtype all but writes to AITER_CONFIG_GEMM_A8W8_BLOCKSCALE; the
+# blockscale_bpreshuffle family uses a separate CSV
+# (AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE) that no .py script writes to,
+# so those modules can't be pretuned until a dedicated script is added.
 _SCRIPT_FALLBACK: dict = {
     # cktile variant: covered by blockscale parent tuner (--libtype all)
     "module_gemm_a8w8_blockscale_cktile_tune": "module_gemm_a8w8_blockscale_tune",

@@ -332,10 +332,8 @@ def compile_preshuffle_gemm_a8(
     _has_silu = epilogue == "bias_silu"
     _has_gelu = epilogue == "bias_gelu"
 
-    # Fused epilogue is implemented inside body_row (the direct store path).
-    # When use_cshuffle_epilog=True, the epilogue path goes through
-    # write_row_to_lds -> store_pair and returns before body_row, which would
-    # silently drop the bias + activation. Reject the unsupported combination.
+    # Fused epilogue lives in body_row; the cshuffle path returns before
+    # body_row and would silently drop bias+activation, so reject the combo.
     if _has_epilogue and use_cshuffle_epilog:
         raise ValueError(
             "Fused epilogue (epilogue != 'none') is not supported with "
@@ -476,9 +474,8 @@ def compile_preshuffle_gemm_a8(
             scale_a_rsrc = _ptr_buffer_resource(arg_scale_a, _scale_a_nrec)
 
         # ---- Bias buffer resource (for fused epilogue) ----
-        # Use max_size=True so the buffer descriptor's size is taken from the
-        # actual arg_bias tensor; this avoids hardcoding the output element
-        # size (was c_n * 2, which broke if out_dtype became fp32 etc.).
+        # Size taken from the arg_bias tensor itself, not hardcoded to the
+        # output elem size (c_n*2 broke for non-fp16 out_dtype).
         bias_rsrc = None
         if const_expr(_has_bias):
             bias_rsrc = _ptr_buffer_resource(arg_bias)
@@ -1279,20 +1276,13 @@ def compile_preshuffle_gemm_a8(
                         val_s = val_s + bias_val_f32
 
                     if const_expr(_has_relu):
-                        # ReLU(x) = max(x, 0). Use maximumf rather than
-                        # cmpf+select: the lower-level cmpf wrapper requires
-                        # an integer CmpFPredicate enum value, not the string
-                        # "ogt", so the previous form failed at compile time
-                        # the moment the bias_relu epilogue was actually
-                        # exercised (test coverage gap).
+                        # ReLU(x) = max(x, 0) via maximumf (cmpf+select needs an
+                        # int CmpFPredicate enum, not "ogt", and failed to compile).
                         zero_f32 = fx.Float32(0.0)
                         val_s = fx.Float32(val_s).maximumf(zero_f32)
                     elif const_expr(_has_silu):
-                        # SiLU(x) = x * sigmoid(x). Compute as
-                        #   sigmoid_x = 1 / (1 + exp(-x))    # one rcp instead of fdiv
-                        #   val_s    = val_s * sigmoid_x
-                        # to lower to v_rcp_f32 + v_mul_f32 instead of v_div_*
-                        # (~4x faster than fdiv on AMD GPUs).
+                        # SiLU(x) = x * sigmoid(x), sigmoid = 1/(1+exp(-x)).
+                        # Use rcp+mul (not fdiv) to lower to v_rcp_f32+v_mul_f32.
                         neg_one = fx.Float32(-1.0)
                         neg_val = val_s * neg_one
                         exp_neg = math.exp(neg_val)

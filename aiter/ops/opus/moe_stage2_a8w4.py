@@ -139,8 +139,8 @@ def opus_moe_stage2_a8w4_decode_fwd(
     return_per_slot: bool = False,
     route_out_dtype: Optional[str] = None,
 ) -> Tensor:
-    # Output mode is encoded in the kid. Route-out kernels must be requested
-    # explicitly after they have been added to the metadata table.
+    # Output mode is encoded in the kid. Route-out kernels must be requested explicitly after they have been added to
+    # the metadata table.
     shape_family = opus_a8w4_shape_family_for_shape(
         model_dim=w2.shape[1],
         inter_dim=inter_states.shape[2],

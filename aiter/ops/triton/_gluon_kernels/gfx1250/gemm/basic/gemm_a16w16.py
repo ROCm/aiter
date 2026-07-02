@@ -206,12 +206,10 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     # Main pipeline loop
     num_k_tiles = gl.cdiv(K, BLOCK_K)
 
-    # The interior iterations step K with update_tensor_descriptor(add_offsets=...),
-    # which moves the tile position only and leaves the descriptor's OOB bound
-    # untouched.  That is fine for every full K tile, but the final tile may be
-    # partial (K need not be a multiple of BLOCK_K).  Peel that last load out of
-    # the loop and install the true remaining extent with set_bounds so the TDM
-    # engine zero-fills past K instead of reading out of bounds.
+    # The interior iterations step K with update_tensor_descriptor(add_offsets=...), which moves the tile position only
+    # and leaves the descriptor's OOB bound untouched. That is fine for every full K tile, but the final tile may be
+    # partial (K need not be a multiple of BLOCK_K). Peel that last load out of the loop and install the true remaining
+    # extent with set_bounds so the TDM engine zero-fills past K instead of reading out of bounds.
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1) - 1):
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
@@ -268,9 +266,8 @@ def _gemm_a16w16_bandwidth_bound_kernel(
         compute_idx += 1
 
     # ---- Peeled final K tile (bounds-checked) ----
-    # The descriptors are already positioned at the last tile by the interior
-    # loop's add_offsets.  Rewrite the OOB extent to the real remaining size so
-    # a partial tail tile is clamped (the M/N extents are unchanged from make).
+    # The descriptors are already positioned at the last tile by the interior loop's add_offsets. Rewrite the OOB extent
+    # to the real remaining size so a partial tail tile is clamped (the M/N extents are unchanged from make).
     k_main = (num_k_tiles - 1) * BLOCK_K
     if LAYOUT[0] == "T":
         a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
@@ -529,9 +526,8 @@ def _gemm_a16w16_compute_bound_kernel(
 
     num_k_tiles = gl.cdiv(K, BLOCK_K)
 
-    # Register pre-load prologue: wait for tile 0 then read it into cur_a/cur_b.
-    # After TDM prologue there are (NUM_BUFFERS-1)*2 ops in-flight; waiting for
-    # (NUM_BUFFERS-2)*2 lets exactly one tile (tile 0) complete.
+    # Register pre-load prologue: wait for tile 0 then read it into cur_a/cur_b. After TDM prologue there are
+    # (NUM_BUFFERS-1)*2 ops in-flight; waiting for (NUM_BUFFERS-2)*2 lets exactly one tile (tile 0) complete.
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
     if LAYOUT[0] == "T":
@@ -589,16 +585,14 @@ def _gemm_a16w16_compute_bound_kernel(
             b_desc, add_offsets=[0, BLOCK_K]
         )
 
-    # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
-    # ops in-flight.  Waiting for (NUM_BUFFERS-2)*2 guarantees that tile
-    # compute_idx+1 has landed in LDS.
+    # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2 ops in-flight. Waiting for (NUM_BUFFERS-2)*2
+    # guarantees that tile compute_idx+1 has landed in LDS.
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
     load_idx += 1
 
-    # Pre-load the NEXT tile's operands into registers *before* the WMMA
-    # below.  The hardware can run LDS reads and the matrix unit in
-    # parallel, hiding the ds_read latency inside the WMMA execution.
+    # Pre-load the NEXT tile's operands into registers *before* the WMMA below. The hardware can run LDS reads and the
+    # matrix unit in parallel, hiding the ds_read latency inside the WMMA execution.
     if LAYOUT[0] == "T":
         next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
             a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
@@ -624,9 +618,8 @@ def _gemm_a16w16_compute_bound_kernel(
     compute_idx += 1
 
     # ---- Remaining main-loop iterations ----
-    # The final K tile is peeled out after this loop so its (possibly partial)
-    # TDM load can be bounds-checked with set_bounds; the interior iterations
-    # use the fast add_offsets path that leaves the OOB bound untouched.
+    # The final K tile is peeled out after this loop so its (possibly partial) TDM load can be bounds-checked with
+    # set_bounds; the interior iterations use the fast add_offsets path that leaves the OOB bound untouched.
     for _ in range(num_k_tiles - NUM_BUFFERS - 2):
 
         # WMMA for the current tile — uses operands pre-loaded in the
@@ -660,16 +653,14 @@ def _gemm_a16w16_compute_bound_kernel(
                 b_desc, add_offsets=[0, BLOCK_K]
             )
 
-        # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
-        # ops in-flight.  Waiting for (NUM_BUFFERS-2)*2 guarantees that tile
-        # compute_idx+1 has landed in LDS.
+        # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2 ops in-flight. Waiting for
+        # (NUM_BUFFERS-2)*2 guarantees that tile compute_idx+1 has landed in LDS.
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
         load_idx += 1
 
-        # Pre-load the NEXT tile's operands into registers *before* the WMMA
-        # below.  The hardware can run LDS reads and the matrix unit in
-        # parallel, hiding the ds_read latency inside the WMMA execution.
+        # Pre-load the NEXT tile's operands into registers *before* the WMMA below. The hardware can run LDS reads and
+        # the matrix unit in parallel, hiding the ds_read latency inside the WMMA execution.
         if LAYOUT[0] == "T":
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
@@ -695,10 +686,9 @@ def _gemm_a16w16_compute_bound_kernel(
         compute_idx += 1
 
     # ---- Peeled final K tile (bounds-checked) ----
-    # Identical to a main-loop iteration except the TDM load is bounds-checked:
-    # the descriptors are already positioned at the last tile, so rewrite the
-    # OOB extent to the real remaining size (the M/N extents are unchanged from
-    # make) and skip the trailing add_offsets since there is no next load.
+    # Identical to a main-loop iteration except the TDM load is bounds-checked: the descriptors are already positioned
+    # at the last tile, so rewrite the OOB extent to the real remaining size (the M/N extents are unchanged from make)
+    # and skip the trailing add_offsets since there is no next load.
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
     k_main = (num_k_tiles - 1) * BLOCK_K

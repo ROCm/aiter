@@ -145,8 +145,8 @@ arg_to_torch_dtype = {
 def main():
     args = parse_args()
     custom_config = False
-    # For sizing/custom configs, this benchmark currently only uses -M and -block_size
-    # from the CLI today. Guard against missing attributes to avoid AttributeError.
+    # For sizing/custom configs, this benchmark currently only uses -M and -block_size from the CLI today.
+    # Guard against missing attributes to avoid AttributeError.
     if all(getattr(args, name, 0) for name in ("M", "K", "N", "E", "top_k")):
         custom_config = True
     if args.print_vgpr:

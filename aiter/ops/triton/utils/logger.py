@@ -2,19 +2,8 @@ import os
 import logging
 
 
-# AITER Triton Logger which is singleton object around python logging.
-# Note: Python logging is also a singleton object, but we want to read the
-# env var AITER_LOG_LEVEL once at the beginning. Another alternative is to do
-# this in __init__.py. In fact, that's how CK logger is setup. We can look at
-# switching to that at some point
-#
-# AITER_LOG_LEVEL follows python logging levels
-#   DEBUG
-#   INFO
-#   WARNING
-#   ERROR
-#   CRITICAL
-#
+# AITER Triton Logger: singleton around python logging, reads env var AITER_TRITON_LOG_LEVEL once at init.
+# AITER_TRITON_LOG_LEVEL follows python logging levels: DEBUG, INFO, WARNING, ERROR, CRITICAL.
 class AiterTritonLogger(object):
     _instance = None
 

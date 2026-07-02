@@ -52,29 +52,20 @@ def mxfp4_to_f32(x):
     return mxfp4_in_f32[x.long()]
 
 
-# ---------------------------------------------------------------------------
-# MX-format E8M0 block-scale: generic + dtype-tagged API
-#
-# The four scale rounding modes (FLOOR / RCEIL / CEIL / EVEN) are dtype-
-# agnostic across the whole MX format family (mxfp4 / mxfp6 / mxfp8 /
-# mxint8). Only ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants
-# differ between dtypes. This mirrors PyTorch torchao's
-# ``to_mx(scaling_mode, elem_dtype)`` design, the HIP-side
-# ``MxScaleRoundMode`` enum (csrc/include/mx_quant_utils.h) and the
-# FlyDSL IR-builder helpers in
-# ``aiter/ops/flydsl/kernels/quant_utils.py::emit_mx_e8m0_scale``.
-# ---------------------------------------------------------------------------
+# MX-format E8M0 block-scale: generic + dtype-tagged API.
+# The four rounding modes (FLOOR/RCEIL/CEIL/EVEN) are dtype-agnostic across the MX
+# family (mxfp4/mxfp6/mxfp8/mxint8); only target_max_pow2/max_pos/mbits differ.
+# Mirrors torchao to_mx(scaling_mode, elem_dtype), the HIP MxScaleRoundMode enum
+# (csrc/include/mx_quant_utils.h), and FlyDSL emit_mx_e8m0_scale.
 
 
-# ``MxScaleRoundMode`` and ``MxDtype`` live in :mod:`aiter.utility.mx_types`
-# (single source of truth across HIP / Python ops / CPU ref / FlyDSL).
+# MxScaleRoundMode / MxDtype live in aiter.utility.mx_types (single source of truth).
 # Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos, mbits)
 # - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
 # - max_pos = max_normal(dtype) (e.g. 6.0 for fp4 e2m1, 448.0 for fp8 e4m3)
 # - mbits = mantissa bits of the target dtype (used only by EVEN mode)
-# Keyed by bare int (MxDtypeInt) so this dict can be built at import time
-# without triggering the pybind11 JIT build of module_aiter_core -- same
-# pattern as ``aiter/ops/flydsl/kernels/quant_utils.py::_DTYPE_CFG``.
+# Keyed by bare int (MxDtypeInt) so the dict builds at import time without the
+# pybind11 JIT build of module_aiter_core (same as quant_utils.py::_DTYPE_CFG).
 _DTYPE_CFG = {
     MxDtypeInt.FP4_E2M1: (2, 6.0, 1),  # OCP MXFP4 / DSv4 / FlashInfer
     MxDtypeInt.FP8_E4M3: (8, 448.0, 3),  # OCP / NVIDIA H100 / gfx950+ (e4m3fn)
@@ -116,9 +107,8 @@ def f32_to_mx_e8m0_scale(
         shape as ``amax``. NaN/Inf inputs map to ``0xFF`` (E8M0 NaN).
         Inputs near FLT_MAX may also map to ``0xFF`` after ceil rounding.
     """
-    # Normalise int / pybind enum into a plain int -- pybind11 enum classes
-    # do not auto-compare equal to ``int`` (unlike ``IntEnum``), so callers
-    # passing ``mode=1`` would otherwise mis-dispatch.
+    # Normalise int / pybind enum into a plain int -- pybind11 enum classes do not auto-compare equal to ``int``
+    # (unlike ``IntEnum``), so callers passing ``mode=1`` would otherwise mis-dispatch.
     mode_int = int(mode)
     dtype_int = int(dtype)
     if dtype_int not in _DTYPE_CFG:
@@ -172,13 +162,9 @@ def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
     )
 
 
-# ---------------------------------------------------------------------------
 # Low-level implementation used by the generic dispatcher above.
-#
-# ``_f32_to_e8m0_floor_impl`` and ``_f32_to_e8m0_ceil_impl`` are the only
-# two primitives that touch the f32 bit pattern; they take an
-# already-divided value (``amax / divisor``) and emit the biased exponent.
-# ---------------------------------------------------------------------------
+# _f32_to_e8m0_floor_impl / _f32_to_e8m0_ceil_impl are the only primitives that touch the f32 bit pattern; they take
+# an already-divided value (amax / divisor) and emit the biased exponent.
 
 
 def _f32_to_e8m0_floor_impl(x: Tensor) -> Tensor:
@@ -316,15 +302,13 @@ def _f32_to_floatx_unpacked(x: Tensor, ebits: int, mbits: int) -> Tensor:
     # converting to float? probably but need to verify
     x = x.view(torch.float)
 
-    # rewrite saturate/denorm/norm branches without explicit data dependent
-    # control flow, to be more compiler friendly
+    # rewrite saturate/denorm/norm branches without explicit data dependent control flow, to be more compiler friendly
     saturate_mask = x >= max_normal
     denormal_mask = torch.logical_and(torch.logical_not(saturate_mask), x < min_normal)
     normal_mask = torch.logical_not(torch.logical_or(saturate_mask, denormal_mask))
 
     #
-    # branch 1: saturate to max val - handled later in the code which combines
-    #   the branches
+    # branch 1: saturate to max val - handled later in the code which combines the branches
     #
 
     #
@@ -553,8 +537,7 @@ def dynamic_mxfp4_quant(
     assert (N // 2) % 2 == 0
 
     # This is fixed by spec for MXFP4. Do not tune this.
-    # For performance, perhaps, we should look at passing multiple of 32 column blocks
-    # that a triton program can process
+    # For performance, perhaps, we should look at passing multiple of 32 column blocks that a triton program can process
     MXFP4_QUANT_BLOCK_SIZE = 32
 
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
@@ -811,9 +794,8 @@ def moe_mxfp4_sort(
         device=blockscale_e8m0.device,
     )  # .fill_(0)
 
-    # Dispatch threshold: for small token counts the 2D-grid kernel has better
-    # parallelism; for large token counts the fused-N kernel wins by reusing
-    # sorted_ids row addresses across all N tiles.
+    # Dispatch threshold: for small token counts the 2D-grid kernel has better parallelism;
+    # for large token counts the fused-N kernel wins by reusing sorted_ids row addresses across all N tiles.
     _FUSED_N_THRESHOLD = 2048
 
     common_args = (

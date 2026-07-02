@@ -9,10 +9,9 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 
-# HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the flat-topk
-# path uses fused min-unique routing (top-(k+1) -> drop least-batch-popular -> keep-k)
-# for batch sizes in [MIN_M (default 16), MAX_M (default 128)]. Unset, or outside that
-# window (tiny M where the expert union can't shrink, or prefill), falls through to stock.
+# HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the flat-topk path uses fused min-unique
+# routing (top-(k+1) -> drop least-batch-popular -> keep-k) for batch sizes in [MIN_M (16), MAX_M (128)]. Otherwise
+# (unset, tiny M, or prefill) falls through to the stock path.
 _USE_HERD = os.environ.get("AITER_TRITON_USE_HERD", "") not in (
     "",
     "0",
@@ -27,12 +26,10 @@ _HERD_MAX_M = int(os.environ.get("AITER_TRITON_HERD_MAX_M", "128"))
 class ExptData:
     # hist[i] is the number of tokens routed to expert i
     hist: torch.Tensor
-    # token_offs_raw[i] is the offset of the first token routed
-    # to expert i in an expert-sorted array
+    # token_offs_raw[i] is the offset of the first token routed to expert i in an expert-sorted array
     token_offs_raw: torch.Tensor
-    # token_offs_pad[i] is the offset of the first token routed
-    # to expert i in an expert-sorted array, assuming histogram
-    # rounded to the next multiple of `block_m`
+    # token_offs_pad[i] is the offset of the first token routed to expert i in an expert-sorted array, assuming
+    # histogram rounded to the next multiple of `block_m`
     token_offs_pad: torch.Tensor
     # block_id_map contain one value for each `pid`` launched by
     # the matrix multiplication kernel launched with block_m:
@@ -75,11 +72,7 @@ class RoutingData:
             )
 
 
-# --------------------------
 # sort tokens by expert
-# --------------------------
-
-
 def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M):
     cdiv = triton.cdiv
 
@@ -221,11 +214,7 @@ def sort_tokens_fused(
     )
 
 
-# --------------------------
 # expt_data
-# --------------------------
-
-
 def log2_power_of_two(x):
     assert x > 0 and (x & (x - 1)) == 0, "x must be a power of two"
     return x.bit_length() - 1
@@ -261,11 +250,7 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
     return token_offs_raw, token_offs_pad, block_pid_map, blocks1, BLOCK, block_m_log2
 
 
-# --------------------------
 # routing
-# --------------------------
-
-
 def routing(
     logits: torch.Tensor,
     n_expts_act: int,
@@ -298,15 +283,12 @@ def routing(
     """
     num_tokens, n_expts_tot = logits.shape
 
-    # block_m heuristic from the raw logits shape and the originally requested
-    # n_expts_act.
+    # block_m heuristic from the raw logits shape and the originally requested n_expts_act.
     m = num_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
 
-    # ------------------------------------------------------------------
     # flat top-k path: plain top-k + softmax (score_mode is None)
-    # ------------------------------------------------------------------
     if score_mode is None:
         # HERD: env-gated fused min-unique routing (decode-sized batches only;
         # prefill / large M falls through to the stock top-k path below).
@@ -346,10 +328,7 @@ def routing(
             gate_indx,
         )
 
-    # ------------------------------------------------------------------
     # fused path: fused routing math + sort (score_mode given)
-    # ------------------------------------------------------------------
-
     if use_grouped_topk and num_expert_group != 1:
         assert (
             num_expert_group is not None and topk_group is not None
@@ -471,11 +450,7 @@ def routing_from_hash(
     return routing_data, topk_indx, gate_indx
 
 
-# --------------------------
 # torch reference
-# --------------------------
-
-
 def compute_expt_data_torch(hist, n_expts_tot, n_gates, block_m):
     # offset for each experts
     device = hist.device

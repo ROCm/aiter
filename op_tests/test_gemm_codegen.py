@@ -54,9 +54,8 @@ REPRO_BPRESHUFFLE_CSV = os.path.join(
     "gemm_codegen_gfx_filter_bpreshuffle.csv",
 )
 
-# GPU targets used throughout this test.  cu_num values match GFX_CU_NUM_MAP
-# in aiter/jit/utils/build_targets.py (re-exported via chip_info.py) — update
-# here if that mapping changes.
+# GPU targets used throughout this test.  cu_num values match GFX_CU_NUM_MAP in aiter/jit/utils/build_targets.py
+# (re-exported via chip_info.py) — update here if that mapping changes.
 TARGET_A = ("gfx942", 304)  # MI300X
 TARGET_B = ("gfx950", 256)  # MI350
 TARGET_C = ("gfx942", 80)  # MI308X — gfx942 with CU_NUM override
@@ -397,10 +396,9 @@ def test_write_name_keyed_lookup_header():
         def __init__(self, name):
             self.name = name
 
-    # Two distinct shapes mapping to the same kernel name + a different kernel
-    # exercise the dedup logic.  The negative-int default_dict entry must be
-    # skipped (it's a heuristic the dispatch references by symbol, not via
-    # the registry).
+    # Two distinct shapes mapping to the same kernel name + a different kernel exercise the dedup logic.  The
+    # negative-int default_dict entry must be skipped (it's a heuristic the dispatch references by symbol, not
+    # via the registry).
     k_a = _FakeKernel("a8w8_blockscale_kernel_alpha")
     k_b = _FakeKernel("a8w8_blockscale_kernel_beta")
     k_default = _FakeKernel("default_heuristic")
@@ -579,9 +577,8 @@ def test_blockscale_kernel_name_forwarding():
                 f"recorded kwargs={record.get('kwargs')}",
             )
 
-            # 6.2 Edit the CSV in place to a different kernelName, clear caches,
-            # confirm the new name flows through (the staleness scenario this
-            # whole refactor is designed to fix).
+            # 6.2 Edit the CSV in place to a different kernelName, clear caches, confirm the new name flows
+            # through (the staleness scenario this whole refactor is designed to fix).
             with open(csv_ck, "w") as f:
                 f.write(
                     "gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,"
@@ -634,9 +631,8 @@ def test_blockscale_kernel_name_forwarding():
                 f"recorded kwargs={record.get('kwargs')}",
             )
 
-        # 6.4 No tuned row for the shape → kernelName="" forwarded (default
-        # heuristic kicks in inside C++).  This guards the empty-name fallback
-        # path that's intentionally distinct from the wrong-name hard error.
+        # 6.4 No tuned row for the shape → kernelName="" forwarded (default heuristic kicks in inside C++).  This guards
+        # the empty-name fallback path that's intentionally distinct from the wrong-name hard error.
         csv_empty = _make_temp_csv(
             "gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,"
             "tflops,bw,errRatio\n"
@@ -650,9 +646,8 @@ def test_blockscale_kernel_name_forwarding():
             a8w8_mod.gemm_a8w8_blockscale(
                 XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
             )
-            # With no row matched, the dispatcher hits the "no config" fallback,
-            # which calls gemm_a8w8_blockscale_ck without kernelName= — Python's
-            # default kwarg ("") then propagates to C++.
+            # With no row matched, the dispatcher hits the "no config" fallback, which calls gemm_a8w8_blockscale_ck
+            # without kernelName= — Python's default kwarg ("") then propagates to C++.
             _check(
                 "no tuned row: still routed to gemm_a8w8_blockscale_ck (default path)",
                 record.get("libtype") == "ck",

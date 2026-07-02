@@ -127,8 +127,7 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     return ret
 
 
-# this function test a value/index pair, like the output of a topk function
-# w.r.t a target dim
+# this function test a value/index pair, like the output of a topk function w.r.t a target dim
 def check_topk_softmax_allclose(
     ref_val,
     ref_idx,

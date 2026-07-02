@@ -820,9 +820,8 @@ def _get_config(
     K: int,
     shuffle: bool = False,
 ):
-    # Custom file naming: N4={N_fp4}-N16={N_bf16}-K={2*K}
-    # Note: N and K are not passed to get_gemm_config here, as they are encoded in the specialized_filename.
-    # This differs from most other usages, where N and K are required as explicit arguments.
+    # Custom file naming: N4={N_fp4}-N16={N_bf16}-K={2*K}. N and K are encoded in
+    # specialized_filename rather than passed to get_gemm_config (unlike most usages).
     specialized_filename = f"N4={N_fp4}-N16={N_bf16}-K={2*K}"
     if shuffle:
         return get_gemm_config(

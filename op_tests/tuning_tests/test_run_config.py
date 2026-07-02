@@ -267,8 +267,7 @@ TUNER_FAMILIES = {
         "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
         "csv_pattern": "a8w8_blockscale_tuned_gemm",
         "exclude_patterns": ["bpreshuffle", "fmoe"],
-        # Merged CSV has ~15k shapes plus a production-op benchmark pass;
-        # the default 600s is not enough.
+        # Merged CSV has ~15k shapes plus a production-op benchmark pass; the default 600s is not enough.
         "timeout": 3600,
         "config_property": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE",
     },

@@ -391,22 +391,14 @@ def pa_ps_fwd_asm(
     return output
 
 
-# ---------------------------------------------------------------------------
-# pa_decode_bf16_asm (gfx1250) -- persistent / split-KV paged-attention decode.
-#
-# Wraps the SP3 kernel PA_DECODE_D64_1TG_4W_PS (head_dim=64, page_size=256,
-# gqa=8).  FP8 Q **and** FP8 paged KV cache, bf16 output, **per-tensor** scalar
-# dequant scales for Q/K/V (distinct from the per-token/per-block scale tensors
-# used by pa_ps_fwd_asm).  GPT-OSS style attention sink (per-Q-head fp32 logits
-# in the SCALED-logit domain, exp(sink); kernel divides by s_eff internally) is
-# always read by the kernel.
-#
-# Memory-allocation policy: all GPU tensors are allocated on the Python side;
-# the C++ entry point performs only pointer + stride bookkeeping and the kernel
-# launch (no torch dependency).  The public wrapper `pa_decode_bf16_asm` below
-# handles output/scale/sink allocation and folds the attention softmax scale
-# into key_scale (matching the reference host file sched2/pa_ps.cpp).
-# ---------------------------------------------------------------------------
+# pa_decode_bf16_asm (gfx1250): persistent / split-KV paged-attention decode.
+# Wraps SP3 kernel PA_DECODE_D64_1TG_4W_PS (head_dim=64, page_size=256, gqa=8).
+# FP8 Q + FP8 paged KV, bf16 out, per-tensor scalar dequant scales for Q/K/V
+# (unlike the per-token/per-block scales in pa_ps_fwd_asm). GPT-OSS attention
+# sink (per-Q-head fp32 logits in scaled-logit domain, exp(sink); kernel divides
+# by s_eff) is always read. All GPU tensors allocated Python-side; C++ does only
+# pointer/stride bookkeeping + launch. Wrapper handles output/scale/sink alloc
+# and folds softmax scale into key_scale (ref sched2/pa_ps.cpp).
 @compile_ops(
     "module_pa_decode_bf16_asm",
     fc_name="pa_decode_bf16_asm",
@@ -852,10 +844,8 @@ def mla_decode_v4_asm(
     kv_last_page_lens: torch.Tensor,
     # [num_seqs+1]
     split_indptr: torch.Tensor,
-    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
-    # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
-    # tensor; there is no nullable-sink convention on the C ABI. Pass
-    # torch.full((num_heads,), float("-inf")) for "no sink" math.
+    # [num_heads] FP32 attention sink logit (kernarg slot 18, 0x120). Always pass
+    # a real tensor (no nullable-sink on the C ABI); use full(-inf) for "no sink".
     sink: torch.Tensor,
     max_seqlen_q: int,
     # ignored on v4 nm; kernel hardcodes 1/sqrt(kV4DimNope+kV4DimRope)=1/sqrt(512)
@@ -1222,17 +1212,14 @@ def get_mla_metadata_info_v1(
         max_work = tile_cnt * cu_num
         max_split_tiles = tile_cnt * cu_num
 
-    # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
-    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). This is a GLOBAL
-    # budget shared across all tiles, so the total number of partial reduce
-    # entries is bounded by the base tiles (one per tile) plus at most the global
-    # split budget of EXTRA splits distributed across them:
+    # Metadata's global split cap is min(cu_num, max_split_per_batch*batch_size)
+    # (csrc/kernels/mla/metadata/v1_2_device.cuh:560-562), a GLOBAL budget shared
+    # across tiles. So partial reduce entries are bounded by base tiles plus at
+    # most that budget of extra splits:
     #     reduce_partial_map <= tile_cnt + per_tile_cap
-    # The previous `tile_cnt * per_tile_cap` assumed every tile could individually
-    # absorb the whole global budget simultaneously, which the shared budget
-    # forbids. With cudagraph batch_size >> cu_num that product collapsed to
-    # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
-    # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
+    # The old tile_cnt*per_tile_cap wrongly let every tile absorb the whole budget;
+    # with batch_size >> cu_num it collapsed to tile_cnt*cu_num and OOM'd (~32 GiB)
+    # since mla_decode_fwd sizes fp32 logits from reduce_partial_map.size(0).
     if max_split_per_batch > 0:
         per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
         max_split_tiles = max(max_split_tiles, tile_cnt + per_tile_cap)

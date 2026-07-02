@@ -41,9 +41,8 @@ def skip_test_if(condition: bool, reason: str) -> bool:
     if not condition:
         return False
 
-    # PYTEST_CURRENT_TEST is only set when pytest is actively running tests,
-    # not when pytest is just imported. This is the reliable way to detect
-    # if we're inside a pytest session.
+    # PYTEST_CURRENT_TEST is only set when pytest is actively running tests, not when pytest is just imported. This is
+    # the reliable way to detect if we're inside a pytest session.
     if "PYTEST_CURRENT_TEST" in os.environ:
         pytest.skip(reason)
 
@@ -810,10 +809,8 @@ def test_batch_prefill_page_size_1_linear_sglang(
             kv_last_page_lens=kv_last_page_len_gpu,
         )
 
-        # Causal + kv_len < qo_len: rows with few valid K positions amplify
-        # FP8 quantization error (not averaged over many attention targets).
-        # Larger head_dim accumulates more rounding error in dot products
-        # (CK's own FP8BF16 atol is 0.18 for reference).
+        # Bump threshold: causal + kv_len<qo_len rows and larger head_dim
+        # amplify FP8 error (CK's own FP8BF16 atol is 0.18 for reference).
         fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
         if head_dim > 128:
             fp8_threshold = max(fp8_threshold, 0.06)
@@ -1101,10 +1098,8 @@ def test_batch_prefill(
             profile=False,
         )
 
-        # Causal + kv_len < qo_len: rows with few valid K positions amplify
-        # FP8 quantization error (not averaged over many attention targets).
-        # Larger head_dim accumulates more rounding error in dot products
-        # (CK's own FP8BF16 atol is 0.18 for reference).
+        # Bump threshold: causal + kv_len<qo_len rows and larger head_dim
+        # amplify FP8 error (CK's own FP8BF16 atol is 0.18 for reference).
         fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
         if head_dim > 128:
             fp8_threshold = max(fp8_threshold, 0.06)
@@ -1784,9 +1779,8 @@ def test_batch_prefill_large_kvcache(
 
     # Check available GPU memory
     free_mem = torch.cuda.mem_get_info()[0]
-    # Per-batch page partition: uniform split, remainder absorbed by the last
-    # sequence to keep all kv_indptr deltas > 0 (zero-length sequences would be
-    # skipped by the kernel's per-batch dispatch and hide any rebase bug).
+    # Per-batch page partition: uniform split, remainder absorbed by the last sequence to keep all kv_indptr deltas > 0
+    # (zero-length sequences would be skipped by the kernel's per-batch dispatch and hide any rebase bug).
     blocks_per_seq = [num_blocks // batch_size] * batch_size
     blocks_per_seq[-1] += num_blocks % batch_size
     kv_lens_per_seq = [bps * page_size for bps in blocks_per_seq]
@@ -1853,8 +1847,7 @@ def test_batch_prefill_large_kvcache(
         total_qo_len, num_qo_heads, head_dim, device="cuda", dtype=dtype
     )
 
-    # Page indices: since the buffer exceeds INT32_MAX elements, these pages
-    # naturally span the overflow boundary.
+    # Page indices: since the buffer exceeds INT32_MAX elements, these pages naturally span the overflow boundary.
     overflow_page = INT32_MAX // stride_per_page
 
     if scatter_pages:
@@ -1870,9 +1863,8 @@ def test_batch_prefill_large_kvcache(
         page_indices = torch.arange(num_blocks, dtype=torch.int32)
 
     # --- Step 1: Compute SDPA reference FIRST (while bf16 data is alive) ---
-    # Per-batch loop: each iteration gathers its slice of pages, runs SDPA,
-    # and frees intermediates before the next batch. Keeps peak memory at
-    # one batch's worth (vs. materializing the full multi-batch score tensor).
+    # Per-batch loop: each iteration gathers its slice of pages, runs SDPA, and frees intermediates before the next
+    # batch. Keeps peak memory at one batch's worth (vs. materializing the full multi-batch score tensor).
     o_ref_list = []
     page_offset = 0
     for b in range(batch_size):
@@ -1881,10 +1873,9 @@ def test_batch_prefill_large_kvcache(
         page_offset += n_blocks_b
         kv_len_b = kv_lens_per_seq[b]
 
-        # Always gather: even sequential pages need a per-batch slice to keep
-        # the multi-batch SDPA references aligned with the kernel's per-batch
-        # SRD rebase. (For batch_size=1 + sequential, this is just an alias
-        # of the full cache via the index slice.)
+        # Always gather: even sequential pages need a per-batch slice to keep the multi-batch SDPA references aligned
+        # with the kernel's per-batch SRD rebase. (For batch_size=1 + sequential, this is just an alias of the full
+        # cache via the index slice.)
         if page_size == 1:
             k_ref_b = k_cache_bf16[page_slice_b.long()]
             v_ref_b = v_cache_bf16[page_slice_b.long()]
@@ -1994,10 +1985,9 @@ def test_batch_prefill_large_kvcache(
         device="cuda",
         dtype=torch.int32,
     )
-    # +256 padding is a batch_prefill ABI requirement: the kernel may speculatively
-    # read up to 256 entries past the last valid page index (one bn0=256 tile worth)
-    # before the bounds check kicks in. Padding with 0 keeps reads in-bounds; the
-    # values are masked out by causal/length logic and never affect the output.
+    # +256 padding is a batch_prefill ABI requirement: the kernel may speculatively read up to 256 entries past the
+    # last valid page index (one bn0=256 tile worth) before the bounds check kicks in. Padding with 0 keeps reads
+    # in-bounds; the values are masked out by causal/length logic and never affect the output.
     kv_page_indices = torch.nn.functional.pad(page_indices, (0, 256), value=0).to(
         "cuda"
     )
@@ -2028,12 +2018,10 @@ def test_batch_prefill_large_kvcache(
         kv_last_page_lens=kv_last_page_lens,
         **extra_kwargs,
     )
-    # Synchronize immediately to catch async GPU faults from CK kernel before
-    # they cascade. Without this sync, an async fault can surface inside the
-    # next test's torch.cuda.empty_cache() (or any other CUDA call), causing
-    # the failure to be misattributed to that unrelated test -- and on bad
-    # faults the cascade can trigger a GPU reset that wipes out subsequent
-    # test results too.
+    # Synchronize immediately to catch async GPU faults from CK kernel before they cascade. Without this sync, an
+    # async fault can surface inside the next test's torch.cuda.empty_cache() (or any other CUDA call), causing the
+    # failure to be misattributed to that unrelated test -- and on bad faults the cascade can trigger a GPU reset that
+    # wipes out subsequent test results too.
     torch.cuda.synchronize()
     out = result[0] if isinstance(result, (list, tuple)) else result
 
@@ -2055,13 +2043,11 @@ def test_batch_prefill_large_kvcache(
         )
 
 
-# Targeted boundary detector. Companion to test_batch_prefill_large_kvcache:
-# the latter exercises *correctness under stress* with 4M-token sequences,
-# but those long sequences dilute single-page-corruption bugs below the
-# threshold (one bad page contributes ~2e-4 to attention output).
-# This test picks exactly 2 contiguous pages at byte-offset boundaries
-# (factor*overflow_page) so kv_len=2048 and ALL attention math runs through
-# the suspect pages -- wrong reads produce max_diff well above threshold.
+# Targeted boundary detector. Companion to test_batch_prefill_large_kvcache: the latter exercises *correctness under
+# stress* with 4M-token sequences, but those long sequences dilute single-page-corruption bugs below the threshold
+# (one bad page contributes ~2e-4 to attention output). This test picks exactly 2 contiguous pages at byte-offset
+# boundaries (factor*overflow_page) so kv_len=2048 and ALL attention math runs through the suspect pages -- wrong
+# reads produce max_diff well above threshold.
 @pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("quant_mode", ["pertensor", "kv_blockscale"])
 @pytest.mark.parametrize("page_offset_factor", [1, 2])
@@ -2217,11 +2203,9 @@ def test_batch_prefill_4gb_boundary_targeted(
     k_ref = torch.cat(k_ref_pages, dim=0)  # [2048, 8, 128]
     v_ref = torch.cat(v_ref_pages, dim=0)
 
-    # Use PyTorch SDPA with explicit attn_mask -- same approach as
-    # test_batch_prefill_large_kvcache. Manual softmax + torch.triu produces
-    # subtle numerical differences from SDPA on small kv_len (off-by-one in the
-    # boundary region), which would falsely fail the causal cases here even
-    # though the kernel and the SDPA reference agree.
+    # Use PyTorch SDPA with explicit attn_mask -- same approach as test_batch_prefill_large_kvcache. Manual softmax +
+    # torch.triu produces subtle numerical differences from SDPA on small kv_len (off-by-one in the boundary region),
+    # which would falsely fail the causal cases here even though the kernel and the SDPA reference agree.
     # SDPA expects [B, H, S, D]; reshape from [S, H, D] -> [1, H, S, D].
     q_sdpa = q_for_ref.unsqueeze(0).transpose(1, 2)
     k_sdpa = k_ref.unsqueeze(0).transpose(1, 2)
@@ -2811,9 +2795,7 @@ if __name__ == "__main__":
     print("=" * 100)
 
 
-# =============================================================================
 # StreamLLM Sink Token Tests
-# =============================================================================
 
 
 def ref_masked_attention_with_sink(

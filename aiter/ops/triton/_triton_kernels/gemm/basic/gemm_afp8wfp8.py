@@ -338,10 +338,9 @@ def _gemm_afp8wfp8_preshuffle_kernel(
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
 
-        # B pointers for preshuffled layout. The shuffled storage is viewed as
-        # (N // 16, K * 16) elements. pid_n indexes BLOCK_SIZE_N // 16 N-tiles per
-        # step; the K dimension is expanded by 16x in byte addresses. The split
-        # offsets the K-byte axis by pid_k * SPLITK_BLOCK_SIZE * 16.
+        # B pointers for preshuffled layout. The shuffled storage is viewed as (N // 16, K * 16) elements.
+        # pid_n indexes BLOCK_SIZE_N // 16 N-tiles per step; the K dimension is expanded by 16x in byte addresses.
+        # The split offsets the K-byte axis by pid_k * SPLITK_BLOCK_SIZE * 16.
         offs_bn_shuffle = pid_n * (BLOCK_SIZE_N // 16) + tl.arange(
             0, BLOCK_SIZE_N // 16
         )
@@ -351,8 +350,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
             offs_bn_shuffle[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
         )
 
-        # A-scale pointers: per-row M, per 32-K group. Shift along the K-scale
-        # axis by the split's start in scale groups.
+        # A-scale pointers: per-row M, per 32-K group. Shift along the K-scale axis by the split's start in scale groups.
         offs_ks_a = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
         offs_ks_a_split = pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE) + offs_ks_a
         a_scale_ptrs = (

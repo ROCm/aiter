@@ -129,10 +129,8 @@ def e2e_moe(
 
     EM = sorted_token_ids.shape[0]
     if A.shape[0] < config["BLOCK_SIZE_M"]:
-        # optimize for small batch_size.
-        # We assume that top_ids of each token is unique, so
-        # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
-        # and we can skip some invalid blocks.
+        # Small batch: assuming each token's top_ids are unique,
+        # num_valid_experts <= batch_size <= BLOCK_SIZE_M, so skip invalid blocks.
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
 
     N = W1.shape[1]

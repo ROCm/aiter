@@ -88,8 +88,7 @@ def _reduce_scatter_impl(
         mask = mask_m_local[:, None] & mask_n[None, :]
 
         # Calculate which rows to read from each source rank's input
-        # This rank (cur_rank) needs rows [cur_rank*M_shard : (cur_rank+1)*M_shard]
-        # from ALL source ranks
+        # This rank (cur_rank) needs rows [cur_rank*M_shard : (cur_rank+1)*M_shard] from ALL source ranks
         rm_global = cur_rank * M_shard + rm_local
         mask_m_global = rm_global < M
         load_mask = mask_m_global[:, None] & mask_n[None, :]

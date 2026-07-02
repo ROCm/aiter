@@ -262,9 +262,8 @@ def test_fused_qk_norm_rope_group_quant(
             msg="Q bf16",
         )
 
-    # K nope fp8 from k_nope_scale_buff[..., 0:nope]; e8m0 scale @[nope:nope+2*n_groups),
-    # written as each tile-scale duplicated x2 (s0,s0,s1,s1,...). Take the first of
-    # each pair for dequant; verify BOTH halves equal the reference scale.
+    # K nope fp8 from k_nope_scale_buff[..., 0:nope]; e8m0 scale @[nope:nope+2*n_groups), written as each tile-scale
+    # duplicated x2 (s0,s0,s1,s1,...). Take the first of each pair for dequant; verify BOTH halves equal the reference scale.
     k_nope_got = k_nope_scale_buff[..., :nope]
     k_scale_pairs = (
         k_nope_scale_buff.view(torch.uint8)[..., nope : nope + 2 * n_groups_k]
@@ -354,9 +353,7 @@ def test_fused_qk_norm_rope_group_quant(
     }
 
 
-# ============================================================================
 # SWA fused ring-cache write test
-# ============================================================================
 #
 # Decode-only fusion: the post-norm/rope K row is ALSO scattered into a per-request
 # sliding-window ring that mirrors the main K output's two-buffer split:
@@ -364,10 +361,8 @@ def test_fused_qk_norm_rope_group_quant(
 #   swa_rope[slot, pos % cache_size, :] = k_rope_buff[t]         (rope bf16)
 # where slot = state_slot_mapping[batch_id_per_token[t]]; batch_id == -1 (CG-pad) skips.
 #
-# Verification strategy: run the kernel, then REPLAY the scatter in python from the
-# kernel's own main K outputs and compare byte-exact to the SWA ring. This validates
-# the ring addressing + the verbatim entry copy (incl. the duplicated scale + pad)
-# independently of the quant math (which the main test above already checks vs ref).
+# Verification: replay the scatter in python from the kernel's own main K outputs and compare byte-exact to the SWA
+# ring (validates ring addressing + verbatim entry copy incl. dup scale + pad, independently of the quant math).
 
 
 def _build_swa_batch(T, cache_size):
@@ -378,9 +373,8 @@ def _build_swa_batch(T, cache_size):
     positions [T], int32 state_slot_mapping [bs], num_slots, bs, n_pad."""
     n_pad = min(2, T - 1) if T > 1 else 0
     real = T - n_pad
-    # Pick bs so each seq has <= cache_size tokens (consecutive positions -> distinct
-    # pos%cache_size within a seq => collision-free ring writes). At least 4 seqs when
-    # there are enough tokens, to exercise multi-seq slot indirection.
+    # Pick bs so each seq has <= cache_size tokens (consecutive positions -> distinct pos%cache_size within a seq =>
+    # collision-free ring writes). At least 4 seqs when there are enough tokens, to exercise multi-seq slot indirection.
     min_bs = (real + cache_size - 1) // cache_size  # ceil(real / cache_size)
     bs = max(min(4, real), min_bs)
     counts = [real // bs + (1 if i < real % bs else 0) for i in range(bs)]

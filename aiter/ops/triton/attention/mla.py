@@ -164,9 +164,8 @@ def mla_prefill_fwd(
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
     BLOCK_Q = max(BLOCK_Q, 1)
-    # When num_queries_per_kv > BLOCK_M the query heads of a single KV head do
-    # not fit into one BLOCK_M tile, so we split them across NUM_HEAD_BLOCKS
-    # blocks along the head dimension.
+    # When num_queries_per_kv > BLOCK_M the query heads of a single KV head do not fit into one BLOCK_M tile,
+    # so we split them across NUM_HEAD_BLOCKS blocks along the head dimension.
     NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.

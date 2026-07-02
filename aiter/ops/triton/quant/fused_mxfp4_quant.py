@@ -588,8 +588,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     assert (N // 2) % 2 == 0
 
     # This is fixed by spec for MXFP4. Do not tune this.
-    # For performance, perhaps, we should look at passing multiple of 32 column blocks
-    # that a triton program can process
+    # For performance, perhaps, we should look at passing multiple of 32 column blocks that a triton program can process
     MXFP4_QUANT_BLOCK_SIZE = 32
 
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
@@ -649,11 +648,9 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         TOPK=topk,
     )
 
-    # The blockscale buffer is allocated with padded N (rounded up to
-    # BLOCK_SIZE_N).  Returning the padded view keeps the layout identical to
-    # ``e8m0_shuffle`` so downstream MoE GEMM kernels can use the same padded
-    # scale stride for any ``inter_dim/32``.  Padded columns are zero, so they
-    # contribute no extra signal.
+    # The blockscale buffer is allocated with padded N (rounded up to BLOCK_SIZE_N). Returning the padded view keeps the
+    # layout identical to ``e8m0_shuffle`` so downstream MoE GEMM kernels can use the same padded scale stride for any
+    # ``inter_dim/32``. Padded columns are zero, so they contribute no extra signal.
     padded_N_o = triton.cdiv(N_o, BLOCK_SIZE_N) * BLOCK_SIZE_N
     return (
         x_fp4.view(dtypes.fp4x2),

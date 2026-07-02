@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# ========================================================================
 # How to use AOT gluon kernel for pa_mqa_logits on lower triton version (below 3.4.0):
 #   1. Generate Gluon kernel based on rocm/triton/gluon_ext (3.5.0+gite392a058)
 #      it requires zip installed.
@@ -18,7 +17,6 @@
 #          $ python3 op_tests/op_benchmarks/triton/bench_deepgemm_attention.py -kv_length=32768 --batch=2 -mtp=1 -p
 #      Set AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=0 to disable AOT gluon kernel. It will backward
 #      to triton JIT kernel
-# ========================================================================
 
 import os
 import math

@@ -517,7 +517,7 @@ def test_pa_ps(
 
     scale = float(1.0 / (head_size**0.5))
 
-    # ################## quant start ######################
+    # quant start
     if quant_type in [
         QuantType.per_1x128,
         QuantType.per_256x128,

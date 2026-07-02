@@ -182,10 +182,9 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         )
 
         if return_lse:
-            # Recover the un-smoothed LSE. The kernel computed the LSE
-            # against (K - k_mean); adding delta = sm_scale * Q . k_mean^T
-            # shifts it back so it is consistent with a kernel call on the
-            # un-smoothed K (required for correct ring-attention merging).
+            # Recover the un-smoothed LSE. The kernel computed the LSE against (K - k_mean); adding delta = sm_scale
+            # * Q . k_mean^T shifts it back so it is consistent with a kernel call on the un-smoothed K
+            # (required for correct ring-attention merging).
             if sage_lse_delta is not None:
                 softmax_lse = softmax_lse + sage_lse_delta.to(softmax_lse.dtype)
             return out, softmax_lse

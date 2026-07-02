@@ -225,8 +225,7 @@ class RotaryEmbedding(nn.Module):
 
         self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
         self.sin_cache = self.sin_cache.to(query.device, dtype=query.dtype)
-        # ops.rotary_embedding()/batched_rotary_embedding()
-        # are in-place operations that update the query and key tensors.
+        # ops.rotary_embedding()/batched_rotary_embedding() are in-place operations that update the query and key tensors.
         if offsets is not None:
             ops.batched_rotary_embedding(
                 positions,
@@ -493,10 +492,8 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         # Each offset corresponds to the same index in scaling_factors.
         offsets: List[int] = []
         for scaling_factor in self.scaling_factors:
-            # NOTE(woosuk): self.max_position_embeddings is the original
-            # maximum length before applying the rope scaling.
-            # Thus, the maximum length after applying the rope scaling is
-            # self.max_position_embeddings * self.scaling_factor.
+            # NOTE(woosuk): self.max_position_embeddings is the original maximum length before applying the rope scaling.
+            # Thus, the maximum length after applying the rope scaling is self.max_position_embeddings * self.scaling_factor.
             max_len = self.max_position_embeddings * scaling_factor
             t = torch.arange(max_len, dtype=dtypes.fp32)
             t = t / scaling_factor
@@ -547,10 +544,8 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
-        # NOTE(woosuk): self.max_position_embeddings is the original
-        # maximum length before applying the rope scaling.
-        # Thus, the maximum length after applying the rope scaling is
-        # self.max_position_embeddings * self.scaling_factor.
+        # NOTE(woosuk): self.max_position_embeddings is the original maximum length before applying the rope scaling.
+        # Thus, the maximum length after applying the rope scaling is self.max_position_embeddings * self.scaling_factor.
         max_len = self.max_position_embeddings * self.scaling_factor
         base = self.base * (
             (self.scaling_factor * max_len / self.max_position_embeddings)
@@ -1675,8 +1670,7 @@ class DualChunkRotaryEmbedding(nn.Module):
     def _apply_rotary_embedding(self, cos_sin, hidden_rot, hidden_pass):
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.is_neox_style:
-            # NOTE(woosuk): Here we assume that the positions tensor has the
-            # shape [batch_size, seq_len].
+            # NOTE(woosuk): Here we assume that the positions tensor has the shape [batch_size, seq_len].
             cos = cos.repeat(1, 1, 2).unsqueeze(-2)
             sin = sin.repeat(1, 1, 2).unsqueeze(-2)
         else:

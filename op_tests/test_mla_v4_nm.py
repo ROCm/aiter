@@ -16,10 +16,8 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import checkAllclose, run_perftest
 
-# ---------------------------------------------------------------------------
 # Variant under test (matches the cfg_mla_v4_asm entry in
 # hsa/gfx950/mla_v4/mla_v4_asm.csv served by csrc/py_itfs_cu/asm_mla_v4.cu).
-# ---------------------------------------------------------------------------
 GQA_RATIO = 64  # num_heads / num_kv_heads
 PAGE_SIZE = 1
 NUM_KV_HEADS = 1
@@ -42,12 +40,8 @@ needs_gfx950 = pytest.mark.skipif(
 )
 
 
-# ---------------------------------------------------------------------------
-# Synthetic input builders. We do NOT replicate the host-side FP8+e8m0 dequant
-# packing here (that's poc_kl/mla_v4.h v4_detail::init_host_buffers). For
-# smoke testing the dispatcher we just need byte-level buffers of the right
-# shape and dtype; numerical correctness is deferred (see file docstring).
-# ---------------------------------------------------------------------------
+# Synthetic input builders: byte-level buffers of the right shape/dtype for dispatcher smoke testing. Does NOT replicate
+# host-side FP8+e8m0 dequant packing (poc_kl/mla_v4.h v4_detail::init_host_buffers); numerical correctness deferred.
 def _build_inputs(
     batch=2, kv_seq_lens=64, q_seq_logical=1, num_heads=GQA_RATIO, device="cuda", seed=0
 ):
@@ -68,18 +62,15 @@ def _build_inputs(
     num_page = batch * (kv_seq_lens // PAGE_SIZE)
     num_kv_splits = 1  # passes=1 for this variant
 
-    # FP8 dtype: use aiter's canonical alias which auto-resolves per arch
-    # (gfx942 = e4m3fnuz, gfx950 = e4m3fn). The kernel reads raw bytes (NOPE
-    # bytes + e8m0 dup-scale bytes packed by host), so we just need a
-    # 1-byte-per-elem tensor of the right shape — any random byte pattern
-    # will do for smoke testing (numerical correctness lives in
+    # FP8 dtype: use aiter's canonical alias which auto-resolves per arch (gfx942 = e4m3fnuz, gfx950 = e4m3fn). The
+    # kernel reads raw bytes (NOPE bytes + e8m0 dup-scale bytes packed by host), so we just need a 1-byte-per-elem
+    # tensor of the right shape — any random byte pattern will do for smoke testing (numerical correctness lives in
     # test_mla_v4_nm_golden.py).
     fp8_dt = aiter.dtypes.fp8
 
     def _rand_fp8(shape):
-        # numpy seeded RNG (NOT torch.randint — that is non-reproducible
-        # in this env for uint8 even on CPU; see comment at top of
-        # _build_inputs).
+        # numpy seeded RNG (NOT torch.randint — that is non-reproducible in this env for uint8 even on CPU; see comment
+        # at top of _build_inputs).
         np_arr = rng_np.integers(0, 256, size=shape, dtype=np.uint8)
         u = torch.from_numpy(np_arr).to(device)
         return u.view(fp8_dt)
@@ -166,9 +157,7 @@ def _build_inputs(
     )
 
 
-# ---------------------------------------------------------------------------
 # Tests
-# ---------------------------------------------------------------------------
 @needs_gfx950
 def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     """Regression guard for the 18-slot v4 nm kernarg layout.
@@ -192,8 +181,7 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     torch.cuda.synchronize()
 
     captured = capfd.readouterr()
-    # The dispatcher fprintf's "[aiter kernarg 288B]" then 18 rows of 16
-    # hex bytes. Parse the 18 rows out of stderr.
+    # The dispatcher fprintf's "[aiter kernarg 288B]" then 18 rows of 16 hex bytes. Parse the 18 rows out of stderr.
     import re
 
     lines = captured.err.splitlines()
@@ -231,9 +219,8 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     def slot_f32(i):
         return struct.unpack("<f", slot(i)[:4])[0]
 
-    # scalar_f is computed in jinja with C `float`s (1.0f/sqrtf(512.f)). Mirror
-    # that precision here so the byte-exact compare doesn't false-fail on the
-    # FP64→FP32 round-off difference.
+    # scalar_f is computed in jinja with C `float`s (1.0f/sqrtf(512.f)). Mirror that precision here so the byte-exact
+    # compare doesn't false-fail on the FP64→FP32 round-off difference.
     expected_scalar_f_bytes = struct.pack(
         "<f", float(np.float32(1.0) / np.float32(np.sqrt(np.float32(448 + 64))))
     )
@@ -241,11 +228,8 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     expected_kv_split = 1  # num_kv_splits=1
     expected_log2_page = 0  # log2(page_size=1)
     expected_out16ns = 0  # out_16_nosplit=0
-    # slots 10 (s_total_kv) and 11 (s_stride_page) are NEVER read — only 17 kernarg
-    # loads, none at offsets 0xA0/0xB0). The dispatcher leaves them at 0
-    # via `args = {}` zero-init to skip the per-call D2H readback that
-    # used to compute s_total_kv. See the "Dead kernarg slots" block in
-    # csrc/py_itfs_cu/asm_mla_v4.cu for the full justification.
+    # slots 10 (s_total_kv) / 11 (s_stride_page) are DEAD (never read); dispatcher zero-inits them to skip a per-call
+    # D2H readback. See "Dead kernarg slots" in csrc/py_itfs_cu/asm_mla_v4.cu.
     expected_total_kv = 0
     expected_stride_pg = 0
 
@@ -277,13 +261,11 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
         assert ptr != 0, f"slot {slot_idx} pointer is NULL"
 
 
-# ---------------------------------------------------------------------------
-# Torch golden + accuracy + perf tests (resolves the TODO #1 in the file
-# docstring). Mirrors op_tests/rui.py's torch reference and op_tests/test_mla.py's
-# checkAllclose/run_perftest pattern. The ATOM-style wrapper below mirrors
-# ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode
-# so the asm op can drop in as a replacement for the triton fallback there.
-# ---------------------------------------------------------------------------
+# Torch golden + accuracy + perf tests (resolves the TODO #1 in the file docstring).
+# Mirrors op_tests/rui.py's torch reference and test_mla.py's checkAllclose/
+# run_perftest pattern. The ATOM-style wrapper below mirrors
+# ATOM/atom/model_ops/v4_kernels/paged_decode.py::sparse_attn_v4_paged_decode so the
+# asm op can drop in for the triton fallback there.
 
 # MODEL1_FP8Sparse layout (mirrored locally; not exported by aiter.ops.quant
 # in this tree). Drives the per-token packing the v4 nm asm kernel expects.
@@ -292,10 +274,9 @@ _QUANT_D_NOPE = 448  # FP8-quantized
 _QUANT_D_ROPE = 64  # BF16 (kept separate in `qrope`/`kvrope` buffer)
 _QUANT_TILE_SIZE = 64
 _QUANT_NUM_TILES = _QUANT_D_NOPE // _QUANT_TILE_SIZE  # 7
-# v4 nm kernel reads each tile's e8m0 scale TWICE in a row, so the scale
-# block on disk is 14 bytes laid out as (s0,s0,s1,s1,...,s6,s6). Empirically
-# verified: without the duplication V[256:448] of the asm output is all-zero
-# and V[0:256] is partially correct, because scale reads land mid-pad.
+# v4 nm kernel reads each tile's e8m0 scale TWICE in a row, so the scale block on
+# disk is 14 bytes laid out as (s0,s0,s1,s1,...,s6,s6); without the duplication
+# scale reads land mid-pad and V[256:448] of the asm output comes back all-zero.
 _QUANT_NUM_SCALE_BYTES = _QUANT_NUM_TILES * 2  # 14
 
 
@@ -419,9 +400,8 @@ def _torch_attn_decode_bf16_golden(
         scores = torch.einsum("shd,khd->shk", q_b, kv_b) * sm_scale  # [s_q, H, seq_k]
 
         if attn_sink is not None:
-            # Sink as virtual K: per-head logit, broadcast across all q_token.
-            # attn_sink is [num_heads] (one scalar bias per head, shared by
-            # every query token in that head).
+            # Sink as virtual K: per-head logit, broadcast across all q_token. attn_sink is [num_heads] (one scalar bias
+            # per head, shared by every query token in that head).
             sink_b = attn_sink.view(1, num_heads).float()  # [1, H] -> [s_q, H]
             lse = scores.logsumexp(dim=-1)  # [s_q, H]
             m = torch.maximum(lse, sink_b)
@@ -501,9 +481,8 @@ def _asm_attn_decode_bf16(
     )  # [total_q, H, 512] / [.., 64] bf16
     kv_packed, kv_rope = _native_to_2buff_for_asm(kv_bf16)  # [P, 1, 1, 512] / [.., 64]
 
-    # `output` is required by the C ABI even when reading from logits. The
-    # kernel currently does not fully populate it (out_16_nosplit=1 path is
-    # unverified at correctness), so we read from `logits` instead.
+    # `output` is required by the C ABI even when reading from logits. The kernel currently does not fully populate it
+    # (out_16_nosplit=1 path is unverified at correctness), so we read from `logits` instead.
     output = torch.empty(
         (total_q, num_heads, V_HEAD_DIM), dtype=dtypes.bf16, device=q_bf16.device
     )
@@ -608,11 +587,10 @@ def _build_bf16_inputs(
     total_q = batch * q_seq_logical
     num_page = batch * (kv_seq_lens // PAGE_SIZE)
 
-    # Bare randn (~N(0,1)), matching op_tests/test_mla.py's input convention.
-    # No /10 scaling or clamp: under the strict 1% checkAllclose tolerance this
-    # leaves some elements over the bound (FP8 quant noise on the full dynamic
-    # range), reported as `failed!` — that is expected and double-checked by eye,
-    # not a hard gate (checkAllclose does not raise).
+    # Bare randn (~N(0,1)), matching op_tests/test_mla.py's input convention. No /10 scaling or clamp: under the strict
+    # 1% checkAllclose tolerance this leaves some elements over the bound (FP8 quant noise on the full dynamic range),
+    # reported as `failed!` — that is expected and double-checked by eye, not a hard gate (checkAllclose does not
+    # raise).
     q_bf16 = torch.randn(
         (total_q, gqa_ratio, _QUANT_D), dtype=dtypes.bf16, device=device
     )
@@ -638,12 +616,10 @@ def _build_bf16_inputs(
     # page_size=1: kv_last_page_lens must be in [1, page_size], so 1.
     kv_last_page_lens.fill_(1)
 
-    # sink: per-head [num_heads] attention sink (one scalar per head), consumed
-    # head-only by both the kernel and the torch ref — no q_token tiling.
-    # Scaled up by 10 (randn * 10) so the sink contributes ~15% to the softmax
-    # output vs a no-sink baseline: well above the checkAllclose tolerance, so a
-    # dropped / mis-scaled sink in the kernel shows up as a hard mismatch instead
-    # of being masked by quant noise (bare randn ~N(0,1) only moves ~0.8%).
+    # sink: per-head [num_heads] attention sink (one scalar per head), consumed head-only by both the kernel and the
+    # torch ref — no q_token tiling. Scaled up by 10 (randn * 10) so the sink contributes ~15% to the softmax output vs
+    # a no-sink baseline: well above the checkAllclose tolerance, so a dropped / mis-scaled sink in the kernel shows up
+    # as a hard mismatch instead of being masked by quant noise (bare randn ~N(0,1) only moves ~0.8%).
     num_heads = NUM_KV_HEADS * gqa_ratio
     if attn_sink:
         sink = torch.randn(num_heads, dtype=torch.float32, device=device) * 10.0
@@ -708,17 +684,14 @@ def _run_one_point(
         f"the head dim; only these three pairs are exercised by CSV+dispatcher."
     )
 
-    # Auto-pick the split count when the caller passes None — mirrors the
-    # production wrapper (aiter/mla.py mla_decode_fwd_v4_nm), which forwards
-    # num_kv_splits=None to get_meta_param's CU-occupancy x HBM-efficiency
-    # heuristic. We resolve it to a concrete int HERE (before any buffer
-    # allocation) because this driver pre-allocates logits/lse/split_indptr
-    # sized to a fixed split count; page_size=1 so total_kv = batch*kv_seq_lens
-    # and nhead = NUM_KV_HEADS*gqa_ratio.
+    # Auto-pick the split count when the caller passes None — mirrors the production wrapper (aiter/mla.py
+    # mla_decode_fwd_v4_nm), which forwards num_kv_splits=None to get_meta_param's CU-occupancy x HBM-efficiency
+    # heuristic. We resolve it to a concrete int HERE (before any buffer allocation) because this driver pre-allocates
+    # logits/lse/split_indptr sized to a fixed split count; page_size=1 so total_kv = batch*kv_seq_lens and nhead =
+    # NUM_KV_HEADS*gqa_ratio.
     if num_kv_splits is None:
-        # tg_factor mirrors the wrapper: gqa=128 launches ceil(128/64)=2 WGs
-        # per (seq, split), so its effective CU occupancy is 2x — feed that in
-        # so the heuristic doesn't over-split (bs=64/gqa=128 -> 2, not 4).
+        # tg_factor mirrors the wrapper: gqa=128 launches ceil(128/64)=2 WGs per (seq, split), so its effective CU
+        # occupancy is 2x — feed that in so the heuristic doesn't over-split (bs=64/gqa=128 -> 2, not 4).
         num_heads = NUM_KV_HEADS * gqa_ratio
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
         num_kv_splits, _ = aiter.mla.get_meta_param(
@@ -736,23 +709,19 @@ def _run_one_point(
             f"(tg_factor={tg_factor})"
         )
 
-    # out_16_nosplit=1 is the kernel's single-pass packed-BF16 direct path; it
-    # has no stage2 merge, so it is only valid with num_kv_splits==1 (the same
-    # constraint the wrapper enforces).
+    # out_16_nosplit=1 is the kernel's single-pass packed-BF16 direct path; it has no stage2 merge, so it is only valid
+    # with num_kv_splits==1 (the same constraint the wrapper enforces).
     if out_16_nosplit != 0:
         assert num_kv_splits == 1, (
             f"out_16_nosplit={out_16_nosplit} requires num_kv_splits==1 "
             f"(bf16-direct-write is single-pass only); got {num_kv_splits}."
         )
 
-    # Multi-split input guard (checked BEFORE any kernel launch): the v4 nm 32n
-    # .co inner KV loop processes SUB_KV=32 tokens/iteration; each split WG must
-    # get at least one full pass (>=32 tokens) or its tail is dropped. The
-    # operator handles a non-divisible kv_seq_lens // splits (remainder
-    # distributed internally), so the only requirement is that the SMALLEST
-    # split >= 32. floor(kv/splits) is the smallest split's size regardless of
-    # how the remainder lands. The dispatcher does NOT validate this (forwards
-    # num_kv_splits to kernarg slot 9 verbatim), so guard it here.
+    # Multi-split input guard (checked BEFORE any kernel launch): the v4 nm 32n .co inner KV loop processes SUB_KV=32
+    # tokens/iteration; each split WG must get at least one full pass (>=32 tokens) or its tail is dropped. The operator
+    # handles a non-divisible kv_seq_lens // splits (remainder distributed internally), so the only requirement is that
+    # the SMALLEST split >= 32. floor(kv/splits) is the smallest split's size regardless of how the remainder lands. The
+    # dispatcher does NOT validate this (forwards num_kv_splits to kernarg slot 9 verbatim), so guard it here.
     if num_kv_splits > 1:
         min_split = kv_seq_lens // num_kv_splits  # page_size=1
         assert min_split >= 32, (
@@ -772,10 +741,9 @@ def _run_one_point(
     )
     sm_scale = 1.0 / (_QUANT_D**0.5)  # kernel ignores; only used by torch ref
 
-    # Torch references (CPU-side reference math, not timed). inputs["sink"] is
-    # the per-head [num_heads] sink consumed directly by both the torch refs
-    # and the asm kernel (the kernel reads per-head sink natively as of the
-    # 2026-06-01 shrink — no q_token tiling needed).
+    # Torch references (CPU-side reference math, not timed). inputs["sink"] is the per-head [num_heads] sink consumed
+    # directly by both the torch refs and the asm kernel (the kernel reads per-head sink natively as of the 2026-06-01
+    # shrink — no q_token tiling needed).
     out_golden, _ = _torch_attn_decode_bf16_golden(
         inputs["q_bf16"],
         inputs["kv_bf16"],
@@ -787,9 +755,8 @@ def _run_one_point(
         attn_sink=inputs["sink"],
     )
 
-    # Pre-quantize once (Python quant helper is slow; would distort perf
-    # if timed). Same FP8 bytes feed both the asm kernel and the fp8-dequant
-    # ref so any diff between them isolates the kernel math.
+    # Pre-quantize once (Python quant helper is slow; would distort perf if timed). Same FP8 bytes feed both the asm
+    # kernel and the fp8-dequant ref so any diff between them isolates the kernel math.
     q_packed, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
     kv_packed, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
 
@@ -819,9 +786,8 @@ def _run_one_point(
     )
 
     # ---- timed call (1): torch fp8-dequant reference ----
-    # Same fp8 bytes the kernel reads → isolates kernel math from quant noise,
-    # and gives the speedup baseline. The ref does the dequant inside, so the
-    # us number includes that cost — matches what the asm kernel does on-die.
+    # Same fp8 bytes the kernel reads → isolates kernel math from quant noise, and gives the speedup baseline. The ref
+    # does the dequant inside, so the us number includes that cost — matches what the asm kernel does on-die.
     (out_fp8_ref, _lse_ref), us_ref = run_perftest(
         _torch_attn_decode_fp8_dequant_ref,
         q_packed,
@@ -840,10 +806,9 @@ def _run_one_point(
     )
 
     # ---- timed call (2a): asm kernel ONLY (no stage2 merge) ----
-    # Times the v4 nm decoder kernel in isolation so the perf number isolates
-    # kernel work from the cross-split merge cost. For num_kv_splits=1 this
-    # is the only kernel invocation; for num_kv_splits>1 the wrapper would
-    # additionally invoke `_fwd_kernel_stage2_asm` triton on top — see (2b).
+    # Times the v4 nm decoder kernel in isolation so the perf number isolates kernel work from the cross-split merge
+    # cost. For num_kv_splits=1 this is the only kernel invocation; for num_kv_splits>1 the wrapper would additionally
+    # invoke `_fwd_kernel_stage2_asm` triton on top — see (2b).
     _ret, us_asm_kernel = run_perftest(
         aiter.mla_decode_v4_asm,
         q_packed,
@@ -910,18 +875,16 @@ def _run_one_point(
         out_asm = output_buf  # already [total_q, num_heads, dv] BF16
 
     # ---- accuracy ----
-    # Two comparisons, run for BOTH single- and multi-split (split-kv is a perf
-    # optimization; its stage2-merged output is mathematically the same full
-    # attention the torch refs compute, so it is directly comparable):
+    # Two comparisons, run for BOTH single- and multi-split (split-kv is a perf optimization; its stage2-merged output
+    # is mathematically the same full attention the torch refs compute, so it is directly comparable):
     #   [golden vs fp8_ref] = FP8 quant noise floor (kernel-independent)
     #   [fp8_ref vs asm]    = kernel math error (quant-independent)
     print(
         f"\n[v4 nm accuracy] batch={batch} kv_seq_lens={kv_seq_lens} "
         f"q_seq_logical={q_seq_logical} num_kv_splits={num_kv_splits} seed={seed}"
     )
-    # Per-element check at checkAllclose's default 1% tolerance (rtol=atol=1e-2).
-    # checkAllclose prints pass/warning/failed with the offending-element ratio +
-    # max delta (it does not raise).
+    # Per-element check at checkAllclose's default 1% tolerance (rtol=atol=1e-2). checkAllclose prints
+    # pass/warning/failed with the offending-element ratio + max delta (it does not raise).
     checkAllclose(
         out_golden.float(),
         out_fp8_ref.float(),
@@ -994,11 +957,8 @@ def test_v4_nm_out_16_nosplit_accuracy_and_perf():
     )
 
 
-# ---------------------------------------------------------------------------
-# ATOM-API wrapper (future drop-in replacement for ATOM's
-# `sparse_attn_v4_paged_decode`). Lives in the test file as a *proof of API
-# fit*; the production wrapper belongs in aiter/mla.py once exercised here.
-# ---------------------------------------------------------------------------
+# ATOM-API wrapper (future drop-in replacement for ATOM's `sparse_attn_v4_paged_decode`): a proof of API fit; the
+# production wrapper belongs in aiter/mla.py once exercised here.
 def asm_sparse_attn_v4_paged_decode(
     q,  # [N, H=16, D=512] bf16
     unified_kv,  # [total_pages, D=512] bf16 (page_size=1, single KV head)
@@ -1064,14 +1024,9 @@ def asm_sparse_attn_v4_paged_decode(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Multi-pass (num_kv_splits > 1) — opens the path that mirrors V3's
-# non-persistent stage1 + stage2 reduce. The .co binary already supports any
-# number of passes via slot 9; this test verifies (a) the dispatcher lookup
-# isn't gated on num_kv_splits, (b) the python wrapper auto-builds
-# split_indptr V3-style, and (c) the in-place logsumexp merge writes a finite
-# result into the [:, 0] slot.
-# ---------------------------------------------------------------------------
+# Multi-pass (num_kv_splits > 1) — mirrors V3's non-persistent stage1 + stage2 reduce (.co supports any pass count via
+# slot 9). Verifies (a) dispatcher lookup isn't gated on num_kv_splits, (b) wrapper auto-builds split_indptr V3-style,
+# and (c) the in-place logsumexp merge writes a finite result into the [:, 0] slot.
 @needs_gfx950
 def test_v4_nm_multi_split():
     """Multi-pass (num_kv_splits>1) path, two checks in one:
@@ -1136,23 +1091,13 @@ def test_v4_nm_multi_split():
         aiter.mla.mla_decode_fwd_v4_nm(**args_rej)
 
 
-# ---------------------------------------------------------------------------
-# Sink interface (PR-2: sink-aware .co + slot 18 plumbed end-to-end)
-# ---------------------------------------------------------------------------
-# These tests pin down the behavioural contract: We assert that
-#   (a) sink=-inf vs sink=+inf produce DIFFERENT output bytes — proves the
-#       sink data actually reaches the kernel and modulates the softmax
-#       denominator,
-#   (b) sink=-inf does NOT produce extra NaNs vs a near-equivalent finite
-#       sentinel (-1e9), so callers can safely use -inf as the "no sink"
-#       convention without numerical surprises.
-#
-# Build helper note: we use _build_bf16_inputs + _native_to_2buff_for_asm
-# instead of _build_inputs because the latter generates random FP8 bytes
-# (incl. random e8m0 scale bytes), which dequant to 100% NaN/inf and make
-# bit comparisons impossible. The BF16-then-quant path produces finite
-# outputs that actually expose the sink merge math.
-# ---------------------------------------------------------------------------
+# Sink interface (PR-2: sink-aware .co + slot 18 plumbed end-to-end). Contract:
+#   (a) sink=-inf vs sink=+inf produce DIFFERENT output bytes (sink reaches the
+#       kernel and modulates the softmax denominator);
+#   (b) sink=-inf produces no extra NaNs vs a finite sentinel (-1e9), so -inf is
+#       safe as the "no sink" convention.
+# Build helper note: use _build_bf16_inputs + _native_to_2buff_for_asm (not _build_inputs, whose random FP8/e8m0 bytes
+# dequant to all NaN/inf) so outputs are finite and expose the sink merge math.
 def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0):
     """Properly-quantized wrapper-args for sink behaviour tests. Returns the
     full kwargs dict that mla_decode_fwd_v4_nm needs, with sink defaulted
@@ -1223,8 +1168,7 @@ def test_v4_nm_sink():
     torch.cuda.synchronize()
     logits_b_bits = logits_b.view(torch.int32)
 
-    # logits is 4D [total_q, num_kv_splits=1, num_heads, dv]; only [:, 0]
-    # is kernel-written.
+    # logits is 4D [total_q, num_kv_splits=1, num_heads, dv]; only [:, 0] is kernel-written.
     finite_both = torch.isfinite(logits_a[:, 0]) & torch.isfinite(logits_b[:, 0])
     assert finite_both.any(), (
         "All output cells were NaN/inf under both sink values — the quant "
@@ -1259,10 +1203,9 @@ def test_v4_nm_sink():
     nan_inf = torch.isnan(logits_inf[:, 0])
     nan_big = torch.isnan(logits_big[:, 0])
 
-    # -inf must not produce *more* NaNs than the -1e9 control. The inverse
-    # would mean sink=-inf hits a kernel-side division-by-zero or
-    # exp(-inf)*0=NaN somewhere it shouldn't, breaking the wrapper's
-    # documented "pass torch.full(..., -inf) for no-sink math" recipe.
+    # -inf must not produce *more* NaNs than the -1e9 control. The inverse would mean sink=-inf hits a kernel-side
+    # division-by-zero or exp(-inf)*0=NaN somewhere it shouldn't, breaking the wrapper's documented "pass
+    # torch.full(..., -inf) for no-sink math" recipe.
     extra_nans = (nan_inf & ~nan_big).sum().item()
     assert extra_nans == 0, (
         f"sink=-inf introduced {extra_nans} NaN cells over the -1e9 "
@@ -1330,11 +1273,10 @@ if __name__ == "__main__":
     import itertools
     import sys
 
-    # The v4 nm kernel ships only for gfx950 (mi350). CI runs every op_tests
-    # file via `python3 <file>` (not pytest), which bypasses the per-test
-    # @needs_gfx950 skipif marker and would execute this driver — loading the
-    # gfx950-only .co — on a gfx942 (mi300) runner and fail. Guard the driver
-    # so it cleanly no-ops (exit 0) anywhere that isn't gfx950.
+    # The v4 nm kernel ships only for gfx950 (mi350). CI runs every op_tests file via `python3 <file>` (not pytest),
+    # which bypasses the per-test @needs_gfx950 skipif marker and would execute this driver — loading the gfx950-only
+    # .co — on a gfx942 (mi300) runner and fail. Guard the driver so it cleanly no-ops (exit 0) anywhere that isn't
+    # gfx950.
     if not torch.cuda.is_available() or not _on_gfx950():
         print(
             "[v4 nm] skip: shipped only for gfx950 (mi350); "

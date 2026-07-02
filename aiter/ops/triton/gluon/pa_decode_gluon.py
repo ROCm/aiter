@@ -317,7 +317,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     Args:
         Various pointers to tensors and configuration parameters as described above.
     """
-    # ==================== Validation Checks ====================
+    # Validation Checks
     gl.static_assert(
         CONTEXT_PARTITION_SIZE == 256,
         f"CONTEXT_PARTITION_SIZE={CONTEXT_PARTITION_SIZE}, Only support CONTEXT_PARTITION_SIZE == 256",
@@ -349,7 +349,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
-    # ==================== Constants and Configuration ====================
+    # Constants and Configuration
     if COMPUTE_TYPE.is_fp8() or CDNA_VERSION == 4:
         MFMA_INSTR_K: gl.constexpr = 32
     else:
@@ -382,7 +382,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         )
     QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
 
-    # ==================== Memory Layout Definitions ====================
+    # Memory Layout Definitions
     if COMPUTE_TYPE.is_fp8():
         SHARED_LAYOUT_WIDTH: gl.constexpr = 8
     else:
@@ -490,7 +490,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         operand_index=1, parent=pv_mfma_layout, k_width=16
     )
 
-    # ==================== Dimension Layout Definitions ====================
+    # Dimension Layout Definitions
     # MTP Query layout slices (for 3D layout)
     mtp_query_len_layout: gl.constexpr = gl.SliceLayout(
         1, gl.SliceLayout(2, mtp_blocked_query_layout)
@@ -556,7 +556,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         query_row_mask_1d, layout=gl.SliceLayout(1, pv_mfma_layout)
     )
 
-    # ==================== Program ID and Sequence Setup ====================
+    # Program ID and Sequence Setup
     sequence_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
     output_partition_idx = gl.program_id(2)
@@ -581,7 +581,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     elif sequence_partition_idx % 4 == 3:
         page_offset = 3 * CONTEXT_PARTITION_SIZE
 
-    # ==================== Query Loading ====================
+    # Query Loading
     # Load query tensor with 3D MTP layout
     # Query shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     mtp_query_offsets = (
@@ -604,7 +604,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         [QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2],
     )
 
-    # ==================== Query Quantization Scale Handling ====================
+    # Query Quantization Scale Handling
     if QUERY_QUANT_MODE == 0:
         # Per-tensor quantization
         query_scale_value = gl.load(query_scale)
@@ -629,7 +629,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             query_scale_value, layout=qk_linear_layout
         )
 
-    # ==================== Output Buffer Setup ====================
+    # Output Buffer Setup
     # Create MTP layout indices for max_logits/exp_sums
     max_logits_base_offsets_mtp = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
@@ -673,7 +673,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         + output_head_size_offsets[None, :]
     )
 
-    # ==================== Attention State Initialization ====================
+    # Attention State Initialization
     # Initialize attention computation state
     max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float("inf")
     exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
@@ -681,7 +681,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
 
-    # ==================== Sequence Length Handling ====================
+    # Sequence Length Handling
     kv_sequence_start_index = sequence_partition_idx * CONTEXT_PARTITION_SIZE
 
     # Early return if partition is entirely before sliding window
@@ -727,16 +727,16 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
     )
     block_table_id = kv_sequence_start_index // KV_BLOCK_SIZE
-    # ==================== Block Table Lookup ====================
+    # Block Table Lookup
     block_tables_start_ptr = block_tables_ptr + sequence_idx * stride_block_table_seq
     kv_page_id = gl.load(block_tables_start_ptr + block_table_id)
-    # ==================== Key Quantization Scale Handling ====================
+    # Key Quantization Scale Handling
     if KV_QUANT_MODE == 0:
         # Per-tensor quantization
         key_scale_value = gl.load(key_scale)
         value_scale_value = gl.load(value_scale)
 
-    # ==================== Main Attention Computation Loop ====================
+    # Main Attention Computation Loop
     for kv_block_index in gl.static_range(KV_COMPUTE_BLOCK_COUNT):
         current_page_offset = page_offset + kv_block_index * KV_COMPUTE_BLOCK_SIZE
         kv_sub_sequence_start_index = (
@@ -774,7 +774,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         )
 
         kv_page_id = kv_page_id.to(gl.int64)
-        # ==================== Key Cache Loading ====================
+        # Key Cache Loading
         # Calculate key cache block offsets [KEY_HEAD_SIZE_POW2_SPLIT, KV_COMPUTE_BLOCK_SIZE, CONTIGUOUS_KV_ELEMENTS_16B_LOAD]
         key_block_offsets = (
             kv_page_id * stride_key_block
@@ -795,7 +795,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             key_block = _amd_iglp_sched_group_barrier(key_block, COMPUTE, 4, 0)
         key_block = _amd_iglp_sched_barrier(key_block, 0x0)
 
-        # ==================== QK Matrix Multiplication ====================
+        # QK Matrix Multiplication
         # Initialize QK accumulator
         qk_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
@@ -807,7 +807,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         query_converted = query_shared.load(qk_lhs_layout)
         key_converted = gl.convert_layout(key_block, layout=qk_rhs_layout)
         key_converted = key_converted.to(COMPUTE_TYPE)
-        # ==================== Value Cache Loading ====================
+        # Value Cache Loading
         if VALUE_TRANSPOSED:
             # Calculate offsets for transposed value cache
             value_block_offsets = (
@@ -849,7 +849,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             qk_matrix = _amd_iglp_sched_group_barrier(qk_matrix, VMEM_LOAD, 1, 1)
             qk_matrix = _amd_iglp_sched_group_barrier(qk_matrix, COMPUTE, 4, 1)
         qk_matrix = _amd_iglp_sched_barrier(qk_matrix, 0x0)
-        # ==================== Scale QK Scores ====================
+        # Scale QK Scores
         if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 1:
                 key_scale_value = key_scale_shared.load(
@@ -867,7 +867,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             else:
                 qk_scale_value = softmax_scale
 
-        # ==================== Attention Masking ====================
+        # Attention Masking
         # Apply causal masking if required
         if IS_CAUSAL:
             sequence_extension = (
@@ -899,7 +899,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         # Apply masking to QK scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         qk_matrix = gl.where(combined_mask, qk_matrix, float(-3.4e38))
 
-        # ==================== Softmax Computation ====================
+        # Softmax Computation
         # Compute new maximum logits
 
         current_max_logits = gl.max(qk_matrix, axis=1)
@@ -912,22 +912,19 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         attention_probs = tl.math.exp2((qk_matrix - new_max_logits[:, None]) * LOG2_E)
         exp_sums = accumulator_scale * exp_sums + gl.sum(attention_probs, axis=1)
 
-        # ==================== Value Scaling for FP8 ====================
+        # Value Scaling for FP8
         if value_block.dtype.is_fp8():
             if KV_QUANT_MODE == 1:
                 value_scale_value = value_scale_shared.load(
                     gl.SliceLayout(0, qk_linear_layout)
                 )
-                # Per-token quantization scaling
-                # Create mask for valid tokens
+                # Per-token: mask out value_scale of invalid tokens
                 valid_token_mask = qk_column_offsets < context_length
-                # Mask out value_scale of invalid tokens
                 value_scale_value = tl.where(
                     valid_token_mask, value_scale_value, float(0.0)
                 )
                 value_scale_max = gl.max(value_scale_value, axis=0)
-                # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
-                # Use fast reciprocal plus multiplies instead of a full divide.
+                # Scale value_scale max to FP8_MAX_VALUE for P*V precision; fast reciprocal, not full divide.
                 inv_value_scale_max = hip_libdevice.fast_dividef(
                     1.0, value_scale_max + 1e-8
                 )
@@ -944,7 +941,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         # Convert attention probabilities to compute type for MFMA operation
         attention_probs = attention_probs.to(COMPUTE_TYPE)
 
-        # ==================== PV Matrix Multiplication ====================
+        # PV Matrix Multiplication
         # Convert layouts for MFMA operation
         attention_probs_converted = gl.convert_layout(
             attention_probs, layout=pv_lhs_layout
@@ -975,7 +972,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         # Update maximum logits for next iteration
         max_logits = new_max_logits
 
-    # ==================== Final Output Scaling and Storage ====================
+    # Final Output Scaling and Storage
     # Compute final exponential sums
     exp_sums_reciprocal = 1.0 / exp_sums
     exp_sums_reciprocal_cvt = gl.convert_layout(
@@ -1105,7 +1102,7 @@ def paged_attention_decode_sliding_window_head_1(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
-    # ==================== VALIDATION CHECKS ====================
+    # VALIDATION CHECKS
     # Data type validation
     gl.static_assert(
         query_ptr.dtype.is_fp8()
@@ -1133,7 +1130,7 @@ def paged_attention_decode_sliding_window_head_1(
     mtp_idx = gl.program_id(1)
     split_idx = gl.program_id(2)
 
-    # ==================== CONSTANTS AND CONFIGURATION ====================
+    # CONSTANTS AND CONFIGURATION
     if COMPUTE_TYPE.is_fp8():
         MFMA_INSTR_K: gl.constexpr = 32
     else:
@@ -1163,7 +1160,7 @@ def paged_attention_decode_sliding_window_head_1(
     )
     sequence_split_idx = split_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK
     block_split_idx = split_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
-    # ==================== MEMORY LAYOUT DEFINITIONS ====================
+    # MEMORY LAYOUT DEFINITIONS
     # Query tensor layout - optimized for sequential access (2D)
     if COMPUTE_TYPE.is_fp8():
         SHARED_LAYOUT_WIDTH: gl.constexpr = 8
@@ -1315,7 +1312,7 @@ def paged_attention_decode_sliding_window_head_1(
         operand_index=1, parent=pv_mfma_layout, k_width=KV_16B_ELEMENT_COUNT
     )
 
-    # ==================== LAYOUT SLICE DEFINITIONS ====================
+    # LAYOUT SLICE DEFINITIONS
 
     if QUERY_SEQ_LEN_POW2 == 1:
         query_group_size_layout: gl.constexpr = gl.SliceLayout(1, blocked_query_layout)
@@ -1397,7 +1394,7 @@ def paged_attention_decode_sliding_window_head_1(
         0, HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
     )
 
-    # ==================== PROGRAM ID AND INITIALIZATION ====================
+    # PROGRAM ID AND INITIALIZATION
 
     max_logits = gl.full(
         (QUERY_GROUP_SIZE_POW2,),
@@ -1649,11 +1646,10 @@ def paged_attention_decode_sliding_window_head_1(
             query_scale_value, layout=qk_linear_layout
         )
 
-    # ==================== SEQUENCE PROCESSING ====================
+    # SEQUENCE PROCESSING
 
     if ONE_SHOT and sinks_ptr is not None:
-        # sinks_ptr is per-query-head: [num_query_heads] where
-        # num_query_heads = num_kv_heads * query_group_size.
+        # sinks_ptr is per-query-head: [num_query_heads] where num_query_heads = num_kv_heads * query_group_size.
         # It is shared across query positions (query_seq_len).
         sinks_values = gl.load(
             sinks_ptr + max_logits_group_idx_in_len,
@@ -1743,7 +1739,7 @@ def paged_attention_decode_sliding_window_head_1(
             key_converted, [HEAD_SIZE_POW2, CONTEXT_PARTITION_SIZE]
         )
 
-        # ==================== VALUE LOADING WITH QK MFMA OVERLAP ====================
+        # VALUE LOADING WITH QK MFMA OVERLAP
         # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
         key_converted = gl.convert_layout(key_converted, layout=qk_rhs_operand_layout)
         key_converted = key_converted.to(COMPUTE_TYPE)
@@ -1854,7 +1850,7 @@ def paged_attention_decode_sliding_window_head_1(
             else:
                 qk_scale_value = softmax_scale
 
-        # ==================== ATTENTION MASKING ====================
+        # ATTENTION MASKING
 
         if QUERY_SEQ_LEN_POW2 == 1:
             if IS_CAUSAL:
@@ -1940,16 +1936,14 @@ def paged_attention_decode_sliding_window_head_1(
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
 
-        # ==================== SOFTMAX COMPUTATION ====================
-        # Optimization: For per-token quant mode, load value_scale early and fuse its reduction
-        # with softmax max reduction to share the same barrier synchronization
+        # SOFTMAX COMPUTATION
+        # Per-token quant: load value_scale early and fuse its reduction with softmax max
+        # reduction to share one barrier.
         if KV_QUANT_MODE == 1:
-            # Load value_scale for fused reduction (reduces one barrier)
             value_scale_value = value_scale_shared.load(
                 gl.SliceLayout(0, qk_linear_layout)
             )
             valid_token_mask = qk_column_offsets < context_length
-            # Mask out value_scale of invalid tokens
             value_scale_value = gl.where(
                 valid_token_mask, value_scale_value, float(0.0)
             )
@@ -1961,8 +1955,7 @@ def paged_attention_decode_sliding_window_head_1(
                 axis=1,
                 combine_fn=_fused_max_combine,
             )
-            # All rows are identical (broadcast from 1D); collapse to scalar.
-            # This is a cheap intra-wave reduction, no extra cross-wave barrier.
+            # Rows identical (broadcast from 1D); collapse to scalar (cheap intra-wave, no extra barrier).
             value_scale_max = gl.max(value_scale_max_2d, axis=0)
         else:
             # Update running maximum for numerical stability
@@ -1997,17 +1990,13 @@ def paged_attention_decode_sliding_window_head_1(
                 + contiguous_kv_element_offsets[None, None, None, :]
             )
 
-        # ==================== VALUE ACCUMULATION ====================
+        # VALUE ACCUMULATION
         # Handle value quantization scaling for FP8
         if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 1:
-                # Per-token quantization scaling
-                # value_scale_value and value_scale_max already computed above (fused with softmax max)
-                # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
-                # Optimization: use fast reciprocal (v_rcp_f32) instead of full IEEE-754 division
-                # Use HIP libdevice fast_dividef which generates v_rcp_f32 + one Newton-Raphson step
-                # This reduces ~12 instructions to ~3-4 instructions with acceptable precision loss
-                # The relative error is < 2^-22 which is sufficient for FP8 quantization scaling
+                # Per-token: value_scale_value/value_scale_max computed above (fused with softmax max).
+                # Scale value_scale max to FP8_MAX_VALUE to improve P*V precision.
+                # fast_dividef (v_rcp_f32 + 1 Newton step) replaces full divide; rel err < 2^-22, ok for fp8.
                 inv_value_scale_max = hip_libdevice.fast_dividef(
                     1.0, value_scale_max + 1e-8
                 )
@@ -2086,12 +2075,12 @@ def paged_attention_decode_sliding_window_head_1(
             key_tensor = key_tensor2
             kv_block_start_idx = kv_block_start_idx2
 
-    # ==================== SINKS HANDLING ====================
+    # SINKS HANDLING
     # Add sinks contribution to exp_sums (does not contribute to attention output)
     if ONE_SHOT and sinks_ptr is not None:
         exp_sums += tl.math.exp2((sinks_values.to(gl.float32) - max_logits) * LOG2_E)
 
-    # ==================== OUTPUT NORMALIZATION AND STORING ====================
+    # OUTPUT NORMALIZATION AND STORING
     # Normalize attention output by softmax denominator
     # Guard against division by zero when all tokens are masked for a query position
     exp_sums_safe = tl.where(exp_sums > 0, exp_sums, 1.0)
@@ -2249,7 +2238,7 @@ def paged_attention_decode_sliding_window(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
-    # ==================== VALIDATION CHECKS ====================
+    # VALIDATION CHECKS
     # Data type validation
     gl.static_assert(
         query_ptr.dtype.is_fp8()
@@ -2276,7 +2265,7 @@ def paged_attention_decode_sliding_window(
     kv_head_idx = gl.program_id(1)
     split_idx = gl.program_id(2)
 
-    # ==================== CONSTANTS AND CONFIGURATION ====================
+    # CONSTANTS AND CONFIGURATION
     if COMPUTE_TYPE.is_fp8():
         MFMA_INSTR_K: gl.constexpr = 32
     else:
@@ -2304,7 +2293,7 @@ def paged_attention_decode_sliding_window(
     )
     sequence_split_idx = split_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK
     block_split_idx = split_idx % CONTEXT_PARTITION_SIZE_PER_BLOCK
-    # ==================== MEMORY LAYOUT DEFINITIONS ====================
+    # MEMORY LAYOUT DEFINITIONS
     # Query tensor layout - optimized for sequential access (2D)
     shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
     shared_probs_layout: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 8, order=[1, 0])
@@ -2433,7 +2422,7 @@ def paged_attention_decode_sliding_window(
         operand_index=1, parent=pv_mfma_layout, k_width=KV_16B_ELEMENT_COUNT
     )
 
-    # ==================== LAYOUT SLICE DEFINITIONS ====================
+    # LAYOUT SLICE DEFINITIONS
 
     # MTP Query layout slices (for 3D layout)
     mtp_query_len_layout: gl.constexpr = gl.SliceLayout(
@@ -2502,7 +2491,7 @@ def paged_attention_decode_sliding_window(
         0, HEAD_SIZE_POW2, layout=gl.SliceLayout(0, pv_mfma_layout)
     )
 
-    # ==================== PROGRAM ID AND INITIALIZATION ====================
+    # PROGRAM ID AND INITIALIZATION
 
     max_logits = gl.full(
         (QUERY_GROUP_SIZE_POW2,),
@@ -2693,11 +2682,10 @@ def paged_attention_decode_sliding_window(
             query_scale_value, layout=qk_linear_layout
         )
 
-    # ==================== SEQUENCE PROCESSING ====================
+    # SEQUENCE PROCESSING
 
     if ONE_SHOT and sinks_ptr is not None:
-        # sinks_ptr is per-query-head: [num_query_heads] where
-        # num_query_heads = num_kv_heads * query_group_size.
+        # sinks_ptr is per-query-head: [num_query_heads] where num_query_heads = num_kv_heads * query_group_size.
         # It is shared across query positions (query_seq_len).
         sinks_values = gl.load(
             sinks_ptr + kv_head_idx * query_group_size + max_logits_group_idx_in_len,
@@ -2712,16 +2700,11 @@ def paged_attention_decode_sliding_window(
         value_scale_value = gl.load(value_scale)
 
     if QUERY_QUANT_MODE < 0 and COMPUTE_TYPE.is_fp8():
-        # Quantize bf16 query to fp8
-        # Convert query to float32 for computation
+        # Quantize bf16 query to fp8: per-row max-abs scale, then cast to fp8
         query_f32 = mtp_query_tensor.to(gl.float32)
-        # Compute max absolute value for scaling
         query_abs = gl.abs(query_f32)
         query_max_abs = gl.max(query_abs, axis=1, keep_dims=True)
-        # Compute scale factor: FP8_MAX_VALUE / max_abs_value
-        # Add epsilon to avoid division by zero
         query_scale_value = query_max_abs / float(FP8_MAX_VALUE)
-        # Quantize: scale query to fp8 range and convert to fp8 type
         mtp_query_tensor = query_f32.to(COMPUTE_TYPE)
     else:
         mtp_query_tensor = mtp_query_tensor.to(COMPUTE_TYPE)
@@ -2750,7 +2733,7 @@ def paged_attention_decode_sliding_window(
         CONTEXT_PARTITION_SIZE_PER_BLOCK,
     ):
 
-        # ==================== KEY LOADING AND PROCESSING ====================
+        # KEY LOADING AND PROCESSING
         # Calculate key cache offsets and load keys
         kv_block_start_idx2 = (
             kv_block_start_idx
@@ -2838,7 +2821,7 @@ def paged_attention_decode_sliding_window(
             key_converted, [HEAD_SIZE_POW2, CONTEXT_PARTITION_SIZE]
         )
 
-        # ==================== VALUE LOADING WITH QK MFMA OVERLAP ====================
+        # VALUE LOADING WITH QK MFMA OVERLAP
         # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
         key_converted = gl.convert_layout(key_converted, layout=qk_rhs_operand_layout)
         key_converted = key_converted.to(COMPUTE_TYPE)
@@ -2940,7 +2923,7 @@ def paged_attention_decode_sliding_window(
             else:
                 qk_scale_value = softmax_scale
 
-        # ==================== ATTENTION MASKING ====================
+        # ATTENTION MASKING
         # Compute query token index (0 to query_seq_len-1)
         query_token_idx = qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
         qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
@@ -2982,7 +2965,7 @@ def paged_attention_decode_sliding_window(
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
 
-        # ==================== SOFTMAX COMPUTATION ====================
+        # SOFTMAX COMPUTATION
         # Update running maximum for numerical stability
         current_max_logits = gl.max(attention_scores, axis=1)
         new_max_logits = gl.maximum(max_logits, current_max_logits)
@@ -2994,26 +2977,22 @@ def paged_attention_decode_sliding_window(
         )
 
         exp_sums = accumulator_scale * exp_sums + gl.sum(attention_probs, axis=1)
-        # ==================== VALUE ACCUMULATION ====================
+        # VALUE ACCUMULATION
         # Handle value quantization scaling for FP8
         if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 1:
-                # Per-token quantization scaling
-                # Create mask for valid tokens
+                # Per-token: mask out value_scale of invalid tokens
                 valid_token_mask = qk_column_offsets < context_length
-                # Mask out value_scale of invalid tokens
                 value_scale_value = gl.where(
                     valid_token_mask, value_scale_value, float(0.0)
                 )
                 value_scale_max = gl.max(value_scale_value, axis=0)
-                # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
-                # Optimization: compute reciprocal once and reuse, use multiply instead of divide for FP8_MAX_VALUE
+                # Scale value_scale max to FP8_MAX_VALUE for P*V precision (reciprocal reused, no divide).
                 inv_value_scale_max = 1.0 / (value_scale_max + 1e-8)
                 value_scale_value = (
                     value_scale_value * float(FP8_MAX_VALUE) * inv_value_scale_max
                 )
                 attention_probs = value_scale_value[None, :] * attention_probs
-                # Use multiply by reciprocal instead of divide (precomputed 1/FP8_MAX_VALUE)
                 probability_scale = value_scale_max * (1.0 / float(FP8_MAX_VALUE))
             elif KV_QUANT_MODE == 0:
                 # Per-tensor quantization scaling
@@ -3075,12 +3054,12 @@ def paged_attention_decode_sliding_window(
             kv_block_start_idx = kv_block_start_idx2
             page_offset = page_offset2
 
-    # ==================== SINKS HANDLING ====================
+    # SINKS HANDLING
     # Add sinks contribution to exp_sums (does not contribute to attention output)
     if ONE_SHOT and sinks_ptr is not None:
         exp_sums += tl.math.exp2((sinks_values.to(gl.float32) - max_logits) * LOG2_E)
 
-    # ==================== OUTPUT NORMALIZATION AND STORING ====================
+    # OUTPUT NORMALIZATION AND STORING
     # Normalize attention output by softmax denominator
     # Guard against division by zero when all tokens are masked for a query position
     exp_sums_safe = tl.where(exp_sums > 0, exp_sums, 1.0)
@@ -3231,7 +3210,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         This kernel uses AMD CDNA3 MFMA instructions for efficient matrix operations
         and supports both FP8 and BF16 data types with various quantization modes.
     """
-    # ==================== VALIDATION CHECKS ====================
+    # VALIDATION CHECKS
     gl.static_assert(
         KV_BLOCK_SIZE == 16 or KV_BLOCK_SIZE == 64,
         f"KV_BLOCK_SIZE={KV_BLOCK_SIZE}, Only support KV_BLOCK_SIZE in [16, 64]",
@@ -3259,7 +3238,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
 
-    # ==================== CONSTANTS AND CONFIGURATION ====================
+    # CONSTANTS AND CONFIGURATION
     if COMPUTE_TYPE.is_fp8() or CDNA_VERSION == 4:
         MFMA_INSTR_K: gl.constexpr = 32
     else:
@@ -3290,7 +3269,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     K_HEAD_SIZE_SPLITS: gl.constexpr = HEAD_SIZE_POW2 // KV_16B_ELEMENT_COUNT
     MAX_NUM_KV_BLOCKS_PER_COMPUTE: gl.constexpr = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
 
-    # ==================== MEMORY LAYOUT DEFINITIONS ====================
+    # MEMORY LAYOUT DEFINITIONS
     # MTP Query tensor layout - 3D [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     if ONE_QUERY_GROUP_SIZE_POW2 <= 16:
         # ONE_QUERY_GROUP_SIZE_POW2 may be 4, 8, 16
@@ -3439,7 +3418,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         operand_index=1, parent=pv_mfma_layout, k_width=16
     )
 
-    # ==================== LAYOUT SLICE DEFINITIONS ====================
+    # LAYOUT SLICE DEFINITIONS
 
     # MTP Query layout slices (for 3D layout)
     mtp_query_len_layout: gl.constexpr = gl.SliceLayout(
@@ -3497,7 +3476,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         query_row_mask_1d, layout=gl.SliceLayout(1, pv_mfma_layout)
     )
 
-    # ==================== PROGRAM ID AND INITIALIZATION ====================
+    # PROGRAM ID AND INITIALIZATION
     sequence_idx = gl.program_id(0)
     kv_head_idx = gl.program_id(1)
     output_partition_idx = gl.program_id(2)
@@ -3611,7 +3590,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
 
-    # ==================== SEQUENCE PROCESSING ====================
+    # SEQUENCE PROCESSING
 
     KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
         CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
@@ -3619,9 +3598,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     SEQUENCE_PARTITION_KV_BLOCKS: gl.constexpr = CONTEXT_PARTITION_SIZE // KV_BLOCK_SIZE
 
     if SLIDING_WINDOW > 0:
-        # Only program 0 processes the full sliding window in a single FP32
-        # accumulation pass, avoiding BF16 intermediate quantization loss from
-        # multi-partition PS combine. All other programs early-return with defaults.
+        # Only program 0 processes the full sliding window in a single FP32 accumulation pass, avoiding BF16
+        # intermediate quantization loss from multi-partition PS combine. All other programs early-return with defaults.
         if output_partition_idx > 0:
             store_temporary_result(
                 max_logits,
@@ -3694,7 +3672,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         )
         kv_block_numbers = kv_block_numbers.to(gl.int64)
 
-        # ==================== KEY LOADING AND PROCESSING ====================
+        # KEY LOADING AND PROCESSING
         # Calculate key cache offsets and load keys
         key_block_offsets = (
             kv_block_numbers[:, None, None, None] * stride_key_block
@@ -3731,7 +3709,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         key_tensor = gl.permute(key_tensor, [1, 3, 0, 2])
         key_tensor = gl.reshape(key_tensor, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
 
-        # ==================== ATTENTION SCORE COMPUTATION ====================
+        # ATTENTION SCORE COMPUTATION
         # Initialize QK accumulator
         qk_accumulator = gl.zeros(
             (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
@@ -3754,7 +3732,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             attention_scores, [QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
         )
 
-        # ==================== VALUE LOADING AND PROCESSING ====================
+        # VALUE LOADING AND PROCESSING
         if VALUE_TRANSPOSED:
             # Load values from transposed cache layout
             kv_block_numbers_reshaped = gl.convert_layout(
@@ -3810,7 +3788,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             else:
                 qk_scale_value = softmax_scale
 
-        # ==================== ATTENTION MASKING ====================
+        # ATTENTION MASKING
         # Create boundary mask for valid sequence positions
         # Apply causal masking if required
         if IS_CAUSAL:
@@ -3846,7 +3824,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
         attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
 
-        # ==================== SOFTMAX COMPUTATION ====================
+        # SOFTMAX COMPUTATION
         # Update running maximum for numerical stability
         current_max_logits = gl.max(attention_scores, axis=1)
         new_max_logits = gl.maximum(max_logits, current_max_logits)
@@ -3860,19 +3838,17 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         )
         exp_sums = accumulator_scale * exp_sums + gl.sum(attention_probs, axis=1)
 
-        # ==================== VALUE ACCUMULATION ====================
+        # VALUE ACCUMULATION
         # Handle value quantization scaling for FP8
         if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 1:
-                # Per-token quantization scaling
-                # Create mask for valid tokens
+                # Per-token: mask out value_scale of invalid tokens
                 valid_token_mask = qk_column_offsets < context_length
-                # Mask out value_scale of invalid tokens
                 value_scale_value = tl.where(
                     valid_token_mask, value_scale_value, float(0.0)
                 )
                 value_scale_max = gl.max(value_scale_value, axis=0)
-                # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
+                # Scale value_scale max to FP8_MAX_VALUE for P*V precision.
                 value_scale_value = (
                     value_scale_value * float(FP8_MAX_VALUE) / (value_scale_max + 1e-8)
                 )
@@ -3917,7 +3893,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         # Update running maximum for next iteration
         max_logits = new_max_logits
 
-    # ==================== OUTPUT NORMALIZATION AND STORING ====================
+    # OUTPUT NORMALIZATION AND STORING
     # Normalize attention output by softmax denominator
     exp_sums_safe = tl.where(exp_sums > 0, exp_sums, 1.0)
     exp_sums_reciprocal = 1.0 / exp_sums_safe
@@ -4108,7 +4084,7 @@ def paged_attention_decode_v2_reduce_kernel(
         OUTPUT_SEQ_LEN_POW2 * ONE_OUTPUT_GROUP_SIZE_POW2
     )
 
-    # ==================== INITIALIZATION ====================
+    # INITIALIZATION
     sequence_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
@@ -4139,7 +4115,7 @@ def paged_attention_decode_v2_reduce_kernel(
     # Calculate number of iterations needed
     num_iterations = tl.cdiv(context_partition_num, MAX_CONTEXT_PARTITION_NUM)
 
-    # ==================== FIRST PASS: FIND GLOBAL MAX ====================
+    # FIRST PASS: FIND GLOBAL MAX
     # Loop through partitions in chunks of MAX_CONTEXT_PARTITION_NUM
     for iter_idx in range(num_iterations):
         partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
@@ -4188,7 +4164,7 @@ def paged_attention_decode_v2_reduce_kernel(
             mask=query_group_mask,
         )
         global_exp_sum += tl.exp(sink_token_values - global_max)
-    # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
+    # SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE
     for iter_idx in range(num_iterations):
         partition_base = iter_idx * MAX_CONTEXT_PARTITION_NUM
         partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM) + partition_base
@@ -4218,7 +4194,7 @@ def paged_attention_decode_v2_reduce_kernel(
         # Rescale exponential sums using global maximum for numerical stability
         exp_sums *= tl.exp(max_logits - global_max[None, :])
 
-        # ==================== ATTENTION PROBABILITY AND WEIGHTED SUMMATION ====================
+        # ATTENTION PROBABILITY AND WEIGHTED SUMMATION
         # Compute normalized attention probabilities for this chunk
         attention_probs = exp_sums / global_exp_sum[None, :]
 
@@ -4249,7 +4225,7 @@ def paged_attention_decode_v2_reduce_kernel(
         # Accumulate weighted sum of logits
         final_output += tl.sum(updated_output, axis=0)
 
-    # ==================== FINAL OUTPUT STORING ====================
+    # FINAL OUTPUT STORING
     # 3D output path
     # Output shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
     final_output = tl.reshape(
@@ -5420,7 +5396,7 @@ def pa_decode_gluon(
             dtype=query.dtype,
         )
 
-    # ==================== QUANTIZATION MODE CONFIGURATION ====================
+    # QUANTIZATION MODE CONFIGURATION
     stride_query_scale_bs = 0
     stride_query_scale_qlen = 0
     stride_query_scale_kv_head = 0
@@ -5492,7 +5468,7 @@ def pa_decode_gluon(
             key_scale.shape == value_scale.shape
         ), f"Key and value scales must have same shape, but got key: {key_scale.shape}, value: {value_scale.shape}"
 
-    # ==================== VALUE CACHE LAYOUT DETECTION ====================
+    # VALUE CACHE LAYOUT DETECTION
     value_transposed = False
     if len(value_cache.shape) == 5:
         value_transposed = True
@@ -5501,7 +5477,7 @@ def pa_decode_gluon(
     else:
         raise RuntimeError(f"Unsupported value cache shape: {value_cache.shape}")
 
-    # ==================== FP8 CONFIGURATION ====================
+    # FP8 CONFIGURATION
     fp8_max_value = 1.0
     if value_cache.dtype == aiter.dtypes.fp8:
         fp8_max_value = torch.finfo(aiter.dtypes.fp8).max
@@ -5514,7 +5490,7 @@ def pa_decode_gluon(
     output_5d = output.reshape(
         batch_size, query_length, num_kv_heads, query_group_size, head_size
     )
-    # ==================== ATTENTION DECODE KERNEL EXECUTION ====================
+    # ATTENTION DECODE KERNEL EXECUTION
     # Determine output tensor and strides based on one_shot mode
     output_for_kernel = output_5d if one_shot else temporary_output
     ps = ps or one_shot
@@ -5575,7 +5551,7 @@ def pa_decode_gluon(
     )
     # output is already reshaped via output_5d view
     if not one_shot:
-        # ==================== REDUCTION KERNEL EXECUTION ====================
+        # REDUCTION KERNEL EXECUTION
         grid = (batch_size, num_kv_heads, 1)
         _paged_attention_decode_v2_reduce_kernel_wrapper(
             grid,

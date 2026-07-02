@@ -396,8 +396,7 @@ def mqa_logits_loop_pipelined(
         BLOCK_KV,
         mfma_layout,
     )
-    # Body: 2-unrolled (sub-iter A → buf 0, sub-iter B → buf 1). Odd leftover
-    # runs in the post-loop block.
+    # Body: 2-unrolled (sub-iter A → buf 0, sub-iter B → buf 1). Odd leftover runs in the post-loop block.
     end = max(0, num_full_tiles - 1)
     odd_peel = end % 2
     end_pairs = end - odd_peel
@@ -490,8 +489,7 @@ def mqa_logits_loop_pipelined(
 
         logits_ptr += BLOCK_KV * stride_logits_k
     kv_pos_post = (start_ind + end_pairs) * BLOCK_KV
-    # Odd leftover: one sub-iter A so the epilogue's two stores line up
-    # with the last full tile + partial tail.
+    # Odd leftover: one sub-iter A so the epilogue's two stores line up with the last full tile + partial tail.
     if odd_peel:
         i = end_pairs
         mfma_k_next2 = kv_loader.load_from_shared(

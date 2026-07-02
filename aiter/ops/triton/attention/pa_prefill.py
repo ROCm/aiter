@@ -75,8 +75,7 @@ def context_attention_fwd(
         f"PA_PREFILL: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
     )
     q_dtype_is_f32 = q.dtype is torch.float32
-    # need to reduce num. blocks when using fp32
-    # due to increased use of GPU shared memory
+    # need to reduce num. blocks when using fp32 due to increased use of GPU shared memory
     # if q.dtype is torch.float32:
     BLOCK = BASE_BLOCK // 2 if q_dtype_is_f32 else BASE_BLOCK
 

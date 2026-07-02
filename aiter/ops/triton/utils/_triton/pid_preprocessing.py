@@ -30,9 +30,8 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
     # Number of pids per XCD in the new arrangement
     pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
     # When GRID_MN cannot divide NUM_XCDS, some xcds will have
-    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
-    # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
+    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids. We
+    # calculate the number of xcds that have pids_per_xcd pids as tall_xcds
     tall_xcds = GRID_MN % NUM_XCDS
     if tall_xcds == 0:
         tall_xcds = tl.cast(NUM_XCDS, tall_xcds.type)

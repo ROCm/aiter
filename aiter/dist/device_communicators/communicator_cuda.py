@@ -158,8 +158,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
-        # always try quick reduce first, then custom allreduce,
-        # and then pynccl. (quick reduce just for ROCM MI3*)
+        # always try quick reduce first, then custom allreduce, and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -190,10 +189,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = pynccl_comm.all_reduce(input_)
             assert out is not None
             return out
-        # fall back to the default all-reduce using PyTorch.
-        # this usually happens during testing.
-        # when we run the model, allreduce only happens for the TP
-        # group, where we always have either custom allreduce or pynccl.
+        # fall back to the default all-reduce using PyTorch. this usually happens during testing. when we run the model,
+        # allreduce only happens for the TP group, where we always have either custom allreduce or pynccl.
         out = input_.clone()
         torch.distributed.all_reduce(out, group=self.device_group)
         return out
@@ -294,17 +291,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         input_for_ar = input_ if input_is_weak_contiguous else input_.contiguous()
         ar_out = self.all_reduce(input_for_ar, prefill_support=prefill_support)
         if input_n != n:
-            # The padded tail is semantically zero for the current MoE path, so
-            # the fallback path only needs the valid hidden region for RMSNorm.
+            # The padded tail is semantically zero for the current MoE path, so the fallback path only needs the valid
+            # hidden region for RMSNorm.
             ar_out = ar_out[..., :n].contiguous()
 
         if use_general_path or x_pad_to_multiple > 0 or input_n != n:
-            # The custom fused AR+RMS kernel still falls back here for strided rows
-            # or when custom all-reduce is unavailable for padded outputs.
-            # Fall back to all-reduce + Triton RMSNorm so callers can pass strided
-            # inputs/residuals and optionally request a padded output width.
-            # The Triton kernel is 2-D, so flatten leading dims before launch and
-            # restore the original batch shape on return.
+            # The custom fused AR+RMS kernel still falls back here for strided rows or when custom all-reduce is
+            # unavailable for padded outputs. Fall back to all-reduce + Triton RMSNorm so callers can pass strided
+            # inputs/residuals and optionally request a padded output width. The Triton kernel is 2-D, so flatten
+            # leading dims before launch and restore the original batch shape on return.
             from aiter.ops.triton.normalization.fused_add_rmsnorm_pad import (
                 fused_add_rmsnorm_pad,
             )
@@ -500,16 +495,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 input_, res_inp_, weight_, eps, prefill_support
             )
             hip_quant = get_hip_quant(QuantType.per_1x128)
-            # The fused path and the registered op's fake return the per-group
-            # scale in column-major (1, M) layout (stride (1, M)) when
-            # transpose_scale=True. per_group_quant_hip cannot produce that
-            # stride directly (with transpose_scale=True it returns a contiguous
-            # (M, num_groups) buffer with SHUFFLED bytes -- a different physical
-            # arrangement). So compute the plain row-major scale and, when
-            # transpose_scale is requested, copy its values into a genuinely
-            # column-major (1, M)-strided tensor so the runtime stride/values
-            # match the fake (otherwise torch.compile's assert_size_stride fails
-            # or the GEMM reads the wrong layout).
+            # The fused path and the registered op's fake return the per-group scale in column-major (1, M) layout
+            # (stride (1, M)) when transpose_scale=True. per_group_quant_hip cannot produce that stride directly (with
+            # transpose_scale=True it returns a contiguous (M, num_groups) buffer with SHUFFLED bytes -- a different
+            # physical arrangement). So compute the plain row-major scale and, when transpose_scale is requested, copy
+            # its values into a genuinely column-major (1, M)-strided tensor so the runtime stride/values match the fake
+            # (otherwise torch.compile's assert_size_stride fails or the GEMM reads the wrong layout).
             out, scale_row = hip_quant(out_, quant_dtype=fp8, transpose_scale=False)
             if transpose_scale:
                 M, num_groups = scale_row.shape
@@ -613,8 +604,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and use_direct_mxfp4
         )
 
-        # 2-stage gate: larger prefill shapes that still fit the 512 KiB
-        # shared-memory reduce-scatter budget and split evenly across ranks.
+        # 2-stage gate: larger prefill shapes that still fit the 512 KiB shared-memory reduce-scatter budget and split
+        # evenly across ranks.
         can_2stage = (
             override is not True
             and K % 32 == 0
@@ -727,9 +718,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         world_size = self.world_size
         ca_comm = self.ca_comm
-        # Custom kernel supports scatter on first/last/mid dims; gate via
-        # should_custom_rs which also rejects first-dim-non-vectorizable
-        # shapes (no naive fallback exists for that case, see C++ dispatch).
+        # Custom kernel supports scatter on first/last/mid dims; gate via should_custom_rs which also rejects
+        # first-dim-non-vectorizable shapes (no naive fallback exists for that case, see C++ dispatch).
         if (
             ca_comm is not None
             and not ca_comm.disabled
@@ -843,8 +833,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None and not pynccl_comm.disabled
 
-        # 'sizes' is not needed if all inputs in the same group have the same
-        # shape
+        # 'sizes' is not needed if all inputs in the same group have the same shape
         if sizes is not None and all(s == sizes[0] for s in sizes):
             sizes = None
 

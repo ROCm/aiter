@@ -71,30 +71,24 @@ import torch
 import aiter
 from aiter import pertoken_quant
 
-# ---------- configuration matching the ATOM Eagle3 draft signature ----------
-# Production layout per TP=8 rank: num_q_heads = num_kv_heads = 8 (full MHA).
-# aiter's gqa-rounding selects the gqa8 kernel either way.
-#
-# Critical: per-block stride must match production for the i32-overflow
-# hypothesis to be testable. With NUM_KV_HEADS=8, HEAD_DIM=128, BLOCK_SIZE=16,
-# bf16 elem_size=2:
+# Configuration matching the ATOM Eagle3 draft signature.
+# Production TP=8 rank: num_q_heads = num_kv_heads = 8 (full MHA); gqa-rounding
+# picks the gqa8 kernel. Per-block stride must match production to make the
+# i32-overflow testable (lowering NUM_KV_HEADS shrinks stride, pushing the
+# boundary above any practical block_id and masking the bug):
 #     per_block_stride = 16 × 8 × 128 × 2 = 32,768 bytes
 #     i32 overflow boundary = 2^31 / 32768 = 65,536
-# Lowering NUM_KV_HEADS would shrink the stride and push the overflow
-# boundary far above any practical block_id, masking the bug.
 NUM_Q_HEADS = 8
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 BLOCK_SIZE = 16
 
-# To exercise the gqa16 kernel family we keep NUM_KV_HEADS=8 (so the 32 KB
-# per-block stride and the 65,536 overflow boundary are unchanged) and raise
-# the query-head count so gqa_ratio = 128 / 8 = 16 rounds to the gqa16 kernel.
+# To exercise the gqa16 kernel family we keep NUM_KV_HEADS=8 (so the 32 KB per-block stride and the 65,536 overflow
+# boundary are unchanged) and raise the query-head count so gqa_ratio = 128 / 8 = 16 rounds to the gqa16 kernel.
 GQA16_Q_HEADS = 128
 
-# Query/KV dtype families. The rebuilt .co set splits into a `pa_bf16_*` half
-# (bf16 query) and a `pa_fp16_*` half (fp16 query); both must read >4GB blocks
-# correctly, so we exercise both.
+# Query/KV dtype families. The rebuilt .co set splits into a `pa_bf16_*` half (bf16 query) and a `pa_fp16_*` half (fp16
+# query); both must read >4GB blocks correctly, so we exercise both.
 Q_DTYPES = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
@@ -116,8 +110,7 @@ EDGE_LAST_SAFE = 65_535
 EDGE_FIRST_BUGGY = 65_536
 BUGGY_BLOCK_ID = 67_000
 
-# Distinct fingerprint per block — kept small (< 1.0) to stay well within
-# bf16 precision after softmax normalization.
+# Distinct fingerprint per block — kept small (< 1.0) to stay well within bf16 precision after softmax normalization.
 SIG_SAFE = 0.50
 SIG_EDGE_LAST = 0.30
 SIG_EDGE_FIRST = 0.40
@@ -131,13 +124,9 @@ _FINGERPRINTS = [
 ]
 
 
-# ---------- KV-cache quantization variants ----------------------------------
-# The >4GB / block_id-truncation fix lives in the SP3 paged-attention kernels.
-# The non-quantized (bf16/fp16 KV) kernels use an unconditional 64-bit
-# global_load; the quantized (pertoken fp8 / int8 KV, "W8") kernels received
-# the same 64-bit global_load treatment in the *_MTP variants. We therefore
-# exercise all three KV families so the fix is validated across the kernels
-# that were actually rebuilt:
+# KV-cache quantization variants. The >4GB fix (64-bit global_load) lives in the
+# SP3 kernels: unconditional in noquant, added to the *_MTP quant variants. Test
+# all three families so the fix is covered across the rebuilt kernels:
 #   "noquant" → pa_bf16_noquant_gqa8_*           (bf16 KV)
 #   "fp8"     → pa_bf16_pertokenFp8_gqa8_*        (per-token fp8 KV)
 #   "int8"    → pa_bf16_pertokenInt8_gqa8_*       (per-token int8 KV)
@@ -150,11 +139,8 @@ _HIGH_PRECISION = {"noquant": 0, "fp8": 1, "int8": 0}
 # Dequant noise budget on top of the bf16 baseline tolerance.
 _ABS_TOL = {"noquant": 1e-2, "fp8": 2e-2, "int8": 3e-2}
 
-# Cache the (possibly large, ~5GB) quantized KV pools so the parametrized
-# pytest cases don't re-quantize 70k blocks for every block_id/qlen combo.
-# Keyed by (q_dtype_str, kv_quant); the pool only depends on the KV dtype and
-# NUM_KV_HEADS, so gqa8 and gqa16 (which differ only in query-head count) share
-# the same cached pool.
+# Cache the (~5GB) quantized KV pools, keyed by (q_dtype_str, kv_quant), so the parametrized cases don't re-quantize 70k
+# blocks each combo. The pool depends only on KV dtype + NUM_KV_HEADS, so gqa8 and gqa16 share it.
 _KV_CACHE_BY_QUANT = {}
 
 
@@ -192,9 +178,8 @@ def _pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype):
         .permute(0, 1, 3, 2)
         .contiguous()
     )
-    # ASM kernel consumes the raw per-token scales ([num_blocks, num_heads,
-    # block_size, 1]); the flattened [num_heads, total_tokens] form is only for
-    # the torch reference.
+    # ASM kernel consumes the raw per-token scales ([num_blocks, num_heads, block_size, 1]); the flattened [num_heads,
+    # total_tokens] form is only for the torch reference.
     return k_quant, v_quant, k_scale_asm, v_scale_asm
 
 
@@ -314,9 +299,8 @@ def _run_pa_fwd_asm(
         qo_indptr=cu_seqlens_q,
         high_precision=hp,
     )
-    # Output shape: [max_qlen, num_q_heads, head_dim] — all elements should
-    # equal the fingerprint of target_block_id (because V is constant in
-    # that block and softmax weights sum to 1).
+    # Output shape: [max_qlen, num_q_heads, head_dim] — all elements should equal the fingerprint of target_block_id
+    # (because V is constant in that block and softmax weights sum to 1).
     return out.float().mean().item()
 
 
@@ -555,9 +539,8 @@ if __name__ == "__main__":
             q_dtype,
         )
 
-    # ---- Performance comparison ----
-    # Measure latency across different block_id ranges and batch sizes
-    # to verify no performance regression from the rebase fix.
+    # Performance comparison: latency across block_id ranges and batch sizes to
+    # verify no regression from the rebase fix.
 
     print("=== Performance Comparison ===")
     print(

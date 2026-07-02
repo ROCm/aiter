@@ -117,9 +117,8 @@ def get_flydsl_stage1_kernels(
                                         base += "_gui"
                                     if xcd > 0:
                                         base += f"_xcd{xcd}"
-                                    # k_wave (intra-block K-slice): only for the
-                                    # small-M tile (tile_m==32), no split-K/mock,
-                                    # and capped to <=8 total waves (<=512 threads).
+                                    # k_wave (intra-block K-slice): only for the small-M tile (tile_m==32), no
+                                    # split-K/mock, and capped to <=8 total waves (<=512 threads).
                                     num_n_waves = min(4, tn // 32)
                                     k_waves = (
                                         [1, 2, 4]
@@ -475,11 +474,8 @@ def compile_flydsl_moe_stage2(
             waves_per_eu=waves_per_eu,
             use_async_copy=use_async_copy,
             cu_num_mul=cu_num_mul,
-            # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
-            # from the kernel-name parser. They are accepted as ignored
-            # kwargs on the fp4xfp4 path so callers parsing the
-            # `_bnt{N}` / `_xcd{N}` registry suffixes don't need
-            # per-dtype special cases.
+            # Forward `b_nt` / `xcd_swizzle` from the kernel-name parser; the fp4xfp4 path accepts them as ignored
+            # kwargs so callers parsing the `_bnt{N}` / `_xcd{N}` suffixes don't need per-dtype special cases.
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
             model_dim_pad=model_dim_pad,
@@ -808,23 +804,15 @@ def _run_moe_reduction(
     )
 
 
-# ---------------------------------------------------------------------------
-# gfx1250 MXScale shape-alignment helpers
-#
-# The FlyDSL mxscale MoE kernels hard-require K (the GEMM contraction dim,
-# stage1: model_dim, stage2: inter_dim) be divisible by tile_k (itself a
-# multiple of WMMA_K=128), and tile_n to divide N (stage1: 2*inter_dim with
-# the stage1 wrapper also requiring inter_dim % tile_n == 0; stage2:
-# model_dim). Model shapes like GPT-OSS (2880) break both constraints with
-# default tile_n=128 / tile_k=128.
-#
-# The helpers below let the gfx1250 stage1/stage2 wrappers (a) pick the
-# largest legal tile_n that divides the required N dims, and (b) zero-pad
-# activations, weights and scales on the K dim to the next multiple of
-# tile_k. Zero padding is algebraically safe for mx-quantized GEMM (the
-# extra K-slice contributes 0·anything = 0), and is cheap relative to the
-# kernel cost (~2% for 2944 vs 2880).
-# ---------------------------------------------------------------------------
+# gfx1250 MXScale shape-alignment helpers.
+# The mxscale MoE kernels require K (contraction dim; stage1: model_dim,
+# stage2: inter_dim) divisible by tile_k (a multiple of WMMA_K=128), and tile_n
+# to divide N (stage1: 2*inter_dim, also inter_dim % tile_n == 0; stage2:
+# model_dim). Shapes like GPT-OSS 2880 break both at default tile_n/tile_k=128.
+# Helpers below (a) pick the largest legal tile_n dividing the N dims and
+# (b) zero-pad activations/weights/scales on K to the next tile_k multiple.
+# Zero padding is algebraically safe for mx GEMM (extra K-slice = 0) and cheap
+# (~2% for 2944 vs 2880).
 
 _MXSCALE_FORMAT_PACK = {
     # in_dtype: (pack_a, pack_b, weight_is_preshuffled)
@@ -834,17 +822,13 @@ _MXSCALE_FORMAT_PACK = {
 }
 
 
-# Cache padded weight / scale tensors keyed on storage pointer so that
-# repeated fused_moe calls with the same W / W_scale don't re-pad +
-# re-memcpy ~100MB per invocation. This is the dominant cost for shapes
-# whose model_dim is not natively tile_k-aligned (e.g. GPT-OSS 2880 ->
-# padded to 2944).
-#
+# Cache padded weight/scale tensors keyed on storage pointer so repeated
+# fused_moe calls with the same W/W_scale don't re-pad+re-memcpy ~100MB each
+# (dominant cost for non-tile_k-aligned model_dim, e.g. GPT-OSS 2880->2944).
 # Key:   (data_ptr, numel, element_size, delta_bytes, pad_value, preshuffled)
 # Value: padded tensor (strong ref keeps the entry alive).
-# Policy: FIFO eviction bounded by _MXSCALE_PAD_CACHE_MAX_BYTES total VRAM
-# occupancy (default 512MB) to avoid OOM'ing on multi-GB weight tensors.
-# Disable via AITER_GFX1250_DISABLE_PAD_CACHE=1 if memory-constrained.
+# Policy: FIFO eviction bounded by _MXSCALE_PAD_CACHE_MAX_BYTES (default 512MB)
+# to avoid OOM on multi-GB weights. Disable via AITER_GFX1250_DISABLE_PAD_CACHE=1.
 _MXSCALE_PAD_CACHE: dict = {}
 _MXSCALE_PAD_CACHE_BYTES: int = 0
 _MXSCALE_PAD_CACHE_MAX_BYTES: int = int(
@@ -1547,12 +1531,9 @@ def flydsl_moe_stage2(
                 dtype=torch_out_dtype,
                 device=inter_states.device,
             )
-    # NOTE: when ``accumulate=True`` (atomic mode), the caller is responsible
-    # for ensuring ``out`` is zero-initialized. In the standard ``fused_moe``
-    # dispatch path this is handled by ``moe_sorting_*_fwd`` which already
-    # zeros ``moe_buf`` via ``moe_buf_set_zero_kernel_2d``, so an extra
-    # ``out.fill_(0)`` here would be a redundant ~``token_num * model_dim``
-    # HBM write (~130us per call at MI355X HBM bw on EP4 prefill shape).
+    # NOTE: with accumulate=True (atomic mode) the caller must zero-init ``out``.
+    # The standard fused_moe path already zeros moe_buf via moe_sorting_*_fwd, so
+    # an extra out.fill_(0) here would be a redundant token_num*model_dim HBM write.
 
     dev = inter_states.device
     flat_a_scale = (

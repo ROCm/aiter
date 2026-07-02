@@ -33,8 +33,7 @@ def get_config_dtype_str(
     elif use_mxfp4:
         return "MX_FP4"
     elif dtype == torch.float:
-        # avoiding cases where kernel fails when float32 MoE
-        # use fp16/bfloat16 configs
+        # avoiding cases where kernel fails when float32 MoE use fp16/bfloat16 configs
         return "float32"
     return None
 
@@ -49,8 +48,7 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
-    # First look up if an optimized configuration is available in the configs
-    # directory
+    # First look up if an optimized configuration is available in the configs directory
     dtype_str = "DEFAULT" if dtype is None else dtype
     dev = arch_info.get_arch()
     config_file_path = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json"
@@ -60,8 +58,7 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
             # If a configuration has been found, return it
             return {key: val for key, val in json.load(f).items()}
 
-    # If no optimized configuration is available, we will use the default
-    # configuration
+    # If no optimized configuration is available, we will use the default configuration
     warnings.warn(
         f"No MoE configuration found for device '{dev}' with dtype '{dtype_str}'. Using default configuration."
     )

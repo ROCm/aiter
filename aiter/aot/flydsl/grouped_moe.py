@@ -92,17 +92,14 @@ def _as_int(value, default: int | None = None) -> int | None:
 
 
 def _scheduler_variants(row, base_job):
-    # Production dispatch (grouped_moe_gfx1250._maybe_grouped_gfx1250_a8w4_moe)
-    # hardcodes grouped_persistent_m=False and expert_sched_mode=False; the only
-    # runtime axis is dense vs DeepGEMM contiguous-M (auto-enabled for large token
-    # counts). Mirror exactly that set so AOT never compiles GEMM variants the
-    # runtime cannot launch.
+    # Production dispatch (grouped_moe_gfx1250._maybe_grouped_gfx1250_a8w4_moe) hardcodes grouped_persistent_m=False and
+    # expert_sched_mode=False; the only runtime axis is dense vs DeepGEMM contiguous-M (auto-enabled for large token
+    # counts). Mirror exactly that set so AOT never compiles GEMM variants the runtime cannot launch.
     explicit_contiguous = _as_bool(row.get("grouped_contiguous_m"), False)
     contiguous_modes = [True] if explicit_contiguous else [False, True]
     warp_tile_m = base_job["tile_m"] // base_job["m_warp"]
-    # Contiguous-M sizes max_m as max(cfg.max_m, token_num*topk) (default 0 when
-    # the CSV omits max_m); dense uses cfg.max_m (default token_num). max_m is
-    # baked into the GEMM kernel_tag, so AOT must derive it per-mode exactly as
+    # Contiguous-M sizes max_m as max(cfg.max_m, token_num*topk) (default 0 when the CSV omits max_m); dense uses
+    # cfg.max_m (default token_num). max_m is baked into the GEMM kernel_tag, so AOT must derive it per-mode exactly as
     # grouped_moe_gfx1250 does or the precompiled kernel never gets hit.
     contiguous_max_m = _align_max_m(
         max(_as_int(row.get("max_m"), 0), base_job["token_num"] * base_job["topk"]),
@@ -225,8 +222,8 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         return out_e * (out_m // wmma_rep) * ((feat_dim // 32) * wmma_rep)
 
     def _route_ksplit(feat_dim, source_topk, out_e, out_m, grouped_in_numel):
-        # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never
-        # sets remap_rows on the grouped MoE fast path (row_starts stays None).
+        # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never sets remap_rows on the grouped MoE fast
+        # path (row_starts stays None).
         launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
@@ -285,8 +282,8 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
 
     # --- Stage1 activation prep (a1): fused route + MX-quant + scatter ---
     if contiguous:
-        # DeepGEMM contiguous-M: topids_to_rows -> contiguous psum+remap ->
-        # route-indexed quant+preshuffle into a single contiguous (E=1) buffer.
+        # DeepGEMM contiguous-M: topids_to_rows -> contiguous psum+remap -> route-indexed quant+preshuffle into a single
+        # contiguous (E=1) buffer.
         ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
         contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
 
@@ -360,9 +357,8 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         a2_out_e, a2_out_m = E, max_m
 
     # --- Stage2 activation prep (a2): fused grouped quant + preshuffle ---
-    # Runtime passes topids_to_rows whenever route rows fit the output capacity
-    # (almost always), taking the route-ksplit path with source_topk=0; the
-    # plain skip-padding path is the rare capacity-overflow fallback.
+    # Runtime passes topids_to_rows whenever route rows fit the output capacity (almost always), taking the route-ksplit
+    # path with source_topk=0; the plain skip-padding path is the rare capacity-overflow fallback.
     capacity_rows = a2_out_e * a2_out_m
     if numel < capacity_rows:
         _route_ksplit(
@@ -373,8 +369,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             grouped_in_numel=a2_out_e * a2_out_m * inter_dim,
         )
     else:
-        # masked_m is None on the contiguous path -> skip_padding=False;
-        # passed on the dense path -> skip_padding=True.
+        # masked_m is None on the contiguous path -> skip_padding=False; passed on the dense path -> skip_padding=True.
         _plain_preshuffle(
             feat_dim=inter_dim,
             out_e=a2_out_e,
@@ -383,12 +378,9 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         )
 
     # --- Epilogue: token-order gather-reduce (bf16/f16 fast path only) ---
-    # split_k mirrors stage2's split_k2: when split_k2 > 1 the GEMM emits an
-    # unreduced (split_k, E, max_m, model_dim) tensor and gather-reduce folds the
-    # split slices itself, so its kernel identity depends on split_k. Hardcoding
-    # 1 here makes the token=1 / split_k2>1 CSV rows miss the AOT cache at
-    # inference. vec width is token-count dependent at runtime; cover both so
-    # run-only coverage holds across inference batch sizes, not just the CSV token.
+    # split_k mirrors stage2's split_k2: split_k2>1 emits an unreduced (split_k, E, max_m, model_dim) tensor
+    # gather-reduce folds itself, so its kernel identity depends on split_k (don't hardcode 1). vec width is token-count
+    # dependent; cover both (2, 4) to span inference batch sizes.
     split_k = job["split_k2"]
     for vec in (2, 4):
         gather_reduce = build_moe_gather_reduce_module(
@@ -420,9 +412,8 @@ def compile_one_config(**job):
 
     aot_arch = job.pop("gfx", "") or GROUPED_MOE_AOT_ARCH_DEFAULT
     shape_str = (
-        # Use .get() so a missing key can't raise here, outside the try below:
-        # an escaping exception would crash the worker (exitcode != 0), which the
-        # AOT pool misreads as a transient failure and retries -> potential deadlock.
+        # Use .get() so a missing key can't raise here, outside the try below: an escaping exception would crash the
+        # worker (exitcode != 0), which the AOT pool misreads as a transient failure and retries -> potential deadlock.
         f"{job.get('kernel_name', 'grouped_gemm')}  "
         f"model_dim={job.get('model_dim')} inter_dim={job.get('inter_dim')} "
         f"E={job.get('experts')} topk={job.get('topk')} "
@@ -550,10 +541,9 @@ def compile_one_config(**job):
                 stream=0,
                 _m_tile_map=contiguous_layout,
             )
-            # Bias-epilogue variant: runtime calls stage1(..., bias=...) when the model
-            # carries per-expert bias (e.g. gpt-oss), which triggers a distinct compiled
-            # kernel (gemm1_bias_* / finalize_act_bias). Precompile it alongside the
-            # bias-free kernel so neither path JITs at first inference.
+            # Bias-epilogue variant: runtime calls stage1(..., bias=...) when the model carries per-expert bias (e.g.
+            # gpt-oss), which triggers a distinct compiled kernel (gemm1_bias_* / finalize_act_bias). Precompile it
+            # alongside the bias-free kernel so neither path JITs at first inference.
             bias1 = torch.empty((job["experts"], 2 * job["inter_dim"]), dtype=dtype)
             exe1(
                 y1,
@@ -602,11 +592,9 @@ def compile_one_config(**job):
                 _m_tile_map=contiguous_layout,
                 bias=bias2,
             )
-            # Non-GEMM auxiliary kernels the run-only fast path launches around
-            # the GEMMs (fused route+quant+scatter, grouped quant+preshuffle,
-            # contiguous prefix-sum(+remap), gather-reduce). These were fused in
-            # gfx1250_moe_splitk_fused, so AOT mirrors the new wrappers, not the
-            # legacy route_maps/scatter_copy kernels.
+            # Non-GEMM auxiliary kernels the run-only fast path launches around the GEMMs (fused route+quant+scatter,
+            # grouped quant+preshuffle, contiguous prefix-sum(+remap), gather-reduce). These were fused in
+            # gfx1250_moe_splitk_fused, so AOT mirrors the new wrappers, not the legacy route_maps/scatter_copy kernels.
             _compile_grouped_moe_aux_kernels(
                 job,
                 dtype=dtype,
@@ -618,10 +606,9 @@ def compile_one_config(**job):
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
     except Exception as e:
-        # Catch everything and return cleanly with compile_time=None: the AOT pool
-        # keys off exitcode 0 + compile_time=None to mark "produced no kernel" and
-        # NOT retry it. An escaping exception crashes the worker (exitcode != 0),
-        # which the pool misreads as a transient failure and retries -> deadlock.
+        # Catch everything and return cleanly with compile_time=None: the AOT pool keys off exitcode 0 +
+        # compile_time=None to mark "produced no kernel" and NOT retry it. An escaping exception crashes the worker
+        # (exitcode != 0), which the pool misreads as a transient failure and retries -> deadlock.
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
         traceback.print_exc()
         return {**job, "compile_time": None, "compile_arch": aot_arch}

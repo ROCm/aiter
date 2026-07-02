@@ -979,9 +979,8 @@ def chunk_fwd_o_opt_vk(
     T_flat = v.shape[2]
     V = v.shape[-1]
     BT = chunk_size
-    # Chunk indices from the ORIGINAL (cache-stable) cu_seqlens + decode ints
-    # (cached, no per-forward D2H); the kernel walks pre-sliced prefill data
-    # via the rebased cu_seqlens.
+    # Chunk indices from the ORIGINAL (cache-stable) cu_seqlens + decode ints (cached, no per-forward D2H);
+    # the kernel walks pre-sliced prefill data via the rebased cu_seqlens.
     if cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, BT, num_decodes, num_decode_tokens

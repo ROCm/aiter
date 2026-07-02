@@ -209,8 +209,7 @@ def test_top_k_top_p_deterministic_controlled(scenario, batch_size):
             )
 
 
-# Statistical Equivalence Test - Verify the sampling distribution matches the expected theoretical
-# distribution using chi-squared goodness-of-fit test.
+# Statistical equivalence: sampling distribution vs theoretical, via chi-squared.
 
 
 def _compute_expected_distribution(probs, k, p, eps=1e-4):
@@ -356,21 +355,10 @@ def test_top_k_top_p_statistical_distribution(batch_size, vocab_size, k, p):
             )
 
 
-# ---------------------------------------------------------------------------
-# Regression: HSA OOB caused by uninitialized `temp_storage.last_valid_id`.
-#
-# When every thread in a block fails the predicate `x > low` on the first
-# iteration of the kernel's do-while loop (e.g. an all-zero or all-NaN probs
-# row), `max_valid` from the BlockReduce is -1, so the guarded write
-# `temp_storage.last_valid_id = max_valid` is skipped.  The recovery path
-# `sampled_id = temp_storage.last_valid_id` then reads uninitialized shared
-# memory and the subsequent `probs[row_idx * d + sampled_id]` faults at a
-# page boundary.  Reproduced as a page-aligned `Memory access fault by GPU`
-# inside TopKTopPSamplingFromProbKernel on Qwen3.6-A3B-FP8 (vocab=248320).
-#
-# These tests must produce only in-range token ids (and not segfault) for
-# both kernels (TopP-only and joint TopK+TopP).
-# ---------------------------------------------------------------------------
+# Regression: HSA OOB from uninitialized `temp_storage.last_valid_id`. When every thread fails predicate `x > low` on
+# the first do-while iter (all-zero/all-NaN row), max_valid stays -1, the guarded write to last_valid_id is skipped,
+# and the recovery read faults at a page boundary. Reproduced on Qwen3.6-A3B-FP8 (vocab=248320). Tests must yield only
+# in-range ids (no segfault) for both the TopP-only and joint TopK+TopP kernels.
 
 
 def _make_degenerate_probs(batch_size, vocab_size, mode):
@@ -394,9 +382,8 @@ def _make_degenerate_probs(batch_size, vocab_size, mode):
 
 
 @pytest.mark.parametrize("batch_size", [1, 8])
-# Include 248320 (Qwen3.6 — original crash) and 128256 (Llama-3) which both
-# satisfy vocab %% (BLOCK_THREADS * VEC_SIZE) != 0, where the last block has
-# fewer active threads and the bug surfaces most reliably.
+# Include 248320 (Qwen3.6 — original crash) and 128256 (Llama-3) which both satisfy vocab %% (BLOCK_THREADS * VEC_SIZE)
+# != 0, where the last block has fewer active threads and the bug surfaces most reliably.
 @pytest.mark.parametrize("vocab_size", [32000, 128256, 248320])
 @pytest.mark.parametrize("mode", ["zero", "nan"])
 def test_top_p_sampling_degenerate_row(batch_size, vocab_size, mode):
@@ -434,18 +421,10 @@ def test_top_k_top_p_sampling_degenerate_row(batch_size, vocab_size, mode, k, p)
         )
 
 
-# ---------------------------------------------------------------------------
-# "top-k first" fast path (aiter port of flashinfer PR #3461).
-#
-# For a SCALAR top_k (maybe_top_k_arr=None) that is modest (<=256) over a large
-# vocab (>=65536), `top_k_top_p_sampling_from_probs` routes through a Python fast
-# path: parallel top-k -> renorm over the k survivors -> top-p over k elements
-# -> gather back to the global index. It must stay distribution-equivalent to
-# the fused full-vocab kernel.
-#
-# NOTE: the existing joint tests pass top_k as a TENSOR, which does NOT trigger
-# the fast path. These tests pass top_k as a Python int to exercise it.
-# ---------------------------------------------------------------------------
+# "top-k first" fast path (aiter port of flashinfer PR #3461). A scalar top_k (maybe_top_k_arr=None) <=256 over vocab
+# >=65536 routes through a Python fast path: parallel top-k -> renorm over k survivors -> top-p over k -> gather to
+# global index. Must stay distribution-equivalent to the fused full-vocab kernel.
+# NOTE: existing joint tests pass top_k as a TENSOR (does NOT trigger fast path); these pass a Python int to exercise it.
 
 
 def _joint_mask(normalized_prob, k, p, eps=1e-4):

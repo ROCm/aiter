@@ -124,12 +124,9 @@ def compile_chunk_gated_delta_h(
     # -- LDS layout: w and k store all K-blocks to reduce barriers --
     LDS_W_STRIDE = K
     LDS_W_ELEMS_PER_STAGE = BT * LDS_W_STRIDE
-    # OPT-DBW: ping/pong double-buffer for lds_w. Stage 0 is at byte offset
-    # 0, stage 1 at byte offset LDS_W_ELEMS_PER_STAGE * 2. ds_write(w[t+1])
-    # can be issued at the end of chunk t (after GEMM2) while chunk t still
-    # reads the (previously written) lds_w[t%2]. This decouples
-    # ds_write_b128(w) from the chunk-internal vmcnt(8) critical path that
-    # hotspot #2 in the ATT trace identified (2.32 M cycles / 9.7% stall).
+    # OPT-DBW: ping/pong double-buffer for lds_w (stage 0 at byte 0, stage 1 at LDS_W_ELEMS_PER_STAGE*2).
+    # ds_write(w[t+1]) issues at end of chunk t (after GEMM2) while chunk t still reads lds_w[t%2], decoupling
+    # ds_write_b128(w) from the chunk-internal vmcnt critical path.
     LDS_W_STAGES = 2
     LDS_W_ELEMS = LDS_W_ELEMS_PER_STAGE * LDS_W_STAGES
     LDS_W_BYTES = LDS_W_ELEMS * 2
@@ -152,7 +149,7 @@ def compile_chunk_gated_delta_h(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 25  # rev24, drop token-major g path: g layout is fixed to head-major [B, H, T] (offset = i_h * T_flat + (bos+row), stride=1) to match Triton VK / HIP K5
+    _K5_KERNEL_REVISION = 25  # g layout fixed head-major [B, H, T]: offset = i_h*T_flat + (bos+row), stride=1, matches Triton VK / HIP K5
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -175,29 +172,19 @@ def compile_chunk_gated_delta_h(
     ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64  # 32
     NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64  # 2
 
-    # ---- OPT-VC: precompute the GEMM1 prefetch interleaving schedule.
-    # All quantities here depend ONLY on compile-time constants
-    # (K, BV, USE_G, USE_GK) and live in the outer compile_*-function
-    # scope so they are pure Python ints/lists -- the FlyDSL AST rewriter
-    # only touches the @flyc.kernel body below, so any control flow here
-    # is safe to mix as ordinary Python.
-    # OPT-VC enablement gate: only spread prefetch into GEMM1 when N_REPEAT
-    # == 1 (i.e. BV == WMMA_N == 16). When OPT_VC_ENABLED is False (BV>=32),
-    # emit all g/gk/u prefetch in a BATCH BEFORE GEMM1 starts (via
-    # PROLOGUE_EMITTER_CT), exactly matching the pre-OPT-VC (rev5) layout --
-    # this leaves the full GEMM1 MFMA chain to overlap the HBM latency.
-    # An earlier attempt (rev21) routed disabled-BV prefetch to the GEMM1
-    # tail (TAIL_EMITTER_CT), which empirically lost 9-14% on BV>=32 shapes
-    # because the prefetched values had no MFMA to hide behind before being
-    # consumed by the gating / vn = u - bv computation.
+    # ---- OPT-VC: precompute the GEMM1 prefetch interleaving schedule. All
+    # quantities depend only on compile-time constants (K, BV, USE_G, USE_GK)
+    # and live in this outer scope as pure Python (the AST rewriter only touches
+    # the kernel body). Gate: spread prefetch into GEMM1 only when N_REPEAT==1
+    # (BV==16); for BV>=32 batch all g/gk/u prefetch BEFORE GEMM1
+    # (PROLOGUE_EMITTER_CT, the rev5 layout) so the MFMA chain hides HBM latency.
+    # Routing it to the GEMM1 tail instead lost 9-14% on BV>=32 (no MFMA to hide
+    # behind before use).
     K_STEPS_PER_BLOCK = 64 // WMMA_K
     OPT_VC_ENABLED = N_REPEAT == 1
-    # OPT-W is gated together with OPT-VC. On BV>=32 (N_REPEAT>=2) the GEMM2
-    # inner loop is also thin enough that interleaving w_next vec_loads into
-    # it causes the SIMD's single VMEM port to bottleneck on certain varlen
-    # shapes. Disabling the interleave on BV>=32 falls back to the rev5-style
-    # batched issue right before GEMM2, where the full MFMA chain hides the
-    # HBM latency.
+    # OPT-W gated with OPT-VC. On BV>=32 the GEMM2 inner loop is too thin to
+    # interleave w_next vec_loads (SIMD single VMEM port bottlenecks on some
+    # varlen shapes); disable it to fall back to rev5 batched issue before GEMM2.
     OPT_W_ENABLED = N_REPEAT == 1
     NUM_INNER_SLOTS = NUM_K_BLOCKS * K_STEPS_PER_BLOCK * N_REPEAT
     NUM_GK_LOADS_CT = (NUM_K_BLOCKS * 4) if USE_GK else 0
@@ -400,9 +387,8 @@ def compile_chunk_gated_delta_h(
                 h_accs.append(acc_zero)
 
         # -- Load initial state if provided --
-        # OPT-F: 4 x scalar f32 load -> 1 x buffer_load_dwordx4 (16 B).
-        # h0 is [V, K] so K is innermost; 4 consecutive K positions are
-        # contiguous in memory -> a single vec_load(4) covers them.
+        # OPT-F: 4 scalar f32 loads -> 1 buffer_load_dwordx4. h0 is [V, K] (K
+        # innermost) so 4 consecutive K positions are contiguous.
         if const_expr(USE_INITIAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for nr in range_constexpr(N_REPEAT):
@@ -446,12 +432,9 @@ def compile_chunk_gated_delta_h(
             i_t_i32 = fx.Int32(i_t)
 
             # -- 1. Compute w LDS offsets (w data already prefetched) --
-            # OPT-4: XOR swizzle to break 64-way bank conflict on lds_w.
-            # Pattern: swz_col = col ^ ((row & 7) << 3) at 8-bf16 granularity
-            # matching LOAD_VEC_WIDTH. Read path (W A-frag below) applies the
-            # SAME swizzle. lds_k / lds_h are NOT swizzled (ds_read_tr_b16
-            # spans 4 rows per instr; a row-dependent XOR would break the HW
-            # transpose alignment).
+            # OPT-4: XOR swizzle breaks 64-way bank conflict on lds_w. Pattern swz_col = col ^ ((row & 7) << 3) at
+            # 8-bf16 granularity; the read path (W A-frag) applies the SAME swizzle. lds_k / lds_h are NOT swizzled
+            # (ds_read_tr_b16 spans 4 rows; a row-dependent XOR would break HW transpose alignment).
             w_prefetch_lds_all = []
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for batch in range_constexpr(NUM_LOAD_BATCHES_64):
@@ -483,10 +466,8 @@ def compile_chunk_gated_delta_h(
 
             gpu.barrier()
 
-            # OPT-H: LDS -> HBM transpose loop.
-            # Iteration count uses VK_TOTAL = K * BV (actual elements, NOT
-            # LDS_H_ELEMS which now includes padding). Reading uses the padded
-            # LDS_H_STRIDE so we hit the same layout as the writer above.
+            # OPT-H: LDS -> HBM transpose loop. Iterate over VK_TOTAL = K * BV (actual elements, not padded
+            # LDS_H_ELEMS); read with padded LDS_H_STRIDE to match the writer's layout.
             VK_TOTAL = K * BV
             for vk_base in range_constexpr(0, VK_TOTAL, BLOCK_THREADS):
                 linear = fx.Int32(vk_base) + tid
@@ -509,12 +490,9 @@ def compile_chunk_gated_delta_h(
             gpu.barrier()
 
             # -- 2. Delta correction: b_v = w @ h, then v_new = u - b_v --
-            # OPT-K: k prefetch is interleaved into the GEMM1 main loop below
-            # so the 4 buffer_load_dwordx4 are issued one per (mfma_kb, ks)
-            # iteration and their HBM latency is hidden by the MFMA chain.
-            # Here we only precompute the per-batch HBM byte offsets and the
-            # LDS write offsets; the actual vec_load is emitted inside the
-            # GEMM1 loop.
+            # OPT-K: k prefetch is interleaved into GEMM1 (one dwordx4 per (mfma_kb, ks)) so HBM latency hides behind
+            # the MFMA chain. Here we only precompute HBM byte offsets and LDS write offsets; the actual vec_load is
+            # emitted inside the GEMM1 loop.
             k_prefetch_off = []
             k_prefetch_lds = []
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -540,18 +518,11 @@ def compile_chunk_gated_delta_h(
                 next_chunk_end, T_local
             ) - fx.Int32(1)
 
-            # OPT-VC (vmcnt-spread): precompute HBM offsets for g/gk/u prefetch
-            # but DEFER the actual vec_load/scalar load until interleaved into
-            # the GEMM1 main loop below. Hotspot report (35B/TP2/60K) shows the
-            # original "load-all-before-GEMM1" pattern piles up ~17 in-flight
-            # VMEM ops and triggers vmcnt(7) reverse-pressure (34% of total
-            # stall). Spreading them across the MFMA chain drops the steady-
-            # state vmcnt threshold to ~3-4 and unblocks GEMM1 entry.
-            # OPT-VC: precompute offsets for g/gk/u prefetch but defer the
-            # actual vec_load until interleaved into GEMM1 below. All Python
-            # bookkeeping (slot_assignments, EXTRAS_PER_SLOT, etc.) was done
-            # at compile-time in the enclosing compile_chunk_gated_delta_h
-            # scope to avoid AST-rewriter interference.
+            # OPT-VC (vmcnt-spread): precompute HBM offsets for g/gk/u prefetch but DEFER the vec_load/scalar load until
+            # interleaved into GEMM1 below. Loading all before GEMM1 piles up in-flight VMEM ops and triggers vmcnt
+            # reverse-pressure; spreading across the MFMA chain drops the steady-state vmcnt threshold and unblocks
+            # GEMM1 entry. All Python bookkeeping was done at compile-time in the enclosing scope to avoid AST-rewriter
+            # interference.
             # G layout: head-major [B, H, T_flat] (matches Triton VK / HIP).
             # Each head's gate values are contiguous in HBM (stride=1):
             #     g[i_h * T_flat + (bos + row)]
@@ -610,21 +581,12 @@ def compile_chunk_gated_delta_h(
             K_STEPS_PER_BLOCK = 64 // WMMA_K
             NUM_K_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
 
-            # OPT-VC: Build a flat queue of "extra" prefetches to inject one-
-            # per-(nr-step) into GEMM1 so that g_last/g_row/gk/u VMEM loads are
-            # spread across the entire MFMA chain instead of bursting into a
-            # single vmcnt(7) wall just before GEMM1. Order matters: items at
-            # the front issue earliest -> longest HBM latency hiding window;
-            # items at the back issue latest. Place gk first (it also needs a
-            # follow-up _fast_exp ALU op so earlier issue = more ALU overlap),
-            # then g_last / g_row (short scalar loads, ALU follow-up), then u
-            # (consumed right after GEMM1 with no ALU between).
-            # OPT-VC: emitter factories return zero-arg lambdas that bind all
-            # captured Python values via DEFAULT ARGUMENTS (not via implicit
-            # closures, which FlyDSL's AST rewriter does not preserve across
-            # its exec()-based function regeneration). The lambdas themselves
-            # are AST.Lambda nodes which the rewriter never visits, so their
-            # bodies execute unchanged at trace time.
+            # OPT-VC: build a flat queue of "extra" prefetches injected one per nr-step into GEMM1, spreading
+            # g_last/g_row/gk/u loads across the MFMA chain. Order matters (front issues earliest = longest hiding
+            # window): gk first (needs a follow-up _fast_exp ALU op), then g_last/g_row, then u (consumed right after
+            # GEMM1). Emitter factories return zero-arg lambdas that bind captured values via DEFAULT ARGUMENTS, not
+            # closures (FlyDSL's AST rewriter drops closures across its exec()-based regeneration; Lambda bodies are
+            # never visited).
             _gk_local = gk_ if USE_GK else g_  # safe placeholder when USE_GK=False
 
             def _make_emit_g_last(_g=g_, _off=g_last_off, _cell=g_last_prefetch_cell):
@@ -651,14 +613,9 @@ def compile_chunk_gated_delta_h(
                 _off_i = _offs[idx]
                 return lambda: _arr.__setitem__(idx, _v[fx.Index(_off_i)])
 
-            # OPT-VC: assemble emitter queue using plain Python ``for`` loops
-            # (not ``range_constexpr``). These emitter objects are pure Python
-            # callables built at trace time -- the actual MLIR ops are emitted
-            # only when the emitter is invoked inside the GEMM1 loop below.
-            # Avoid ``range_constexpr`` here because FlyDSL's AST rewriter
-            # rebinds local names captured inside ``range_constexpr`` bodies
-            # in ways that can hide subsequent plain-Python locals (e.g.
-            # ``EXTRAS_PER_SLOT`` derived from the queue length).
+            # OPT-VC: assemble the emitter queue (pure Python callables built at trace time; MLIR ops emit only when
+            # invoked inside GEMM1 below). FlyDSL's AST rewriter can rebind names captured inside range_constexpr bodies
+            # and hide subsequent plain-Python locals (e.g. EXTRAS_PER_SLOT derived from the queue length).
             extra_load_emitters = []
             if const_expr(USE_GK):
                 for i in range_constexpr(NUM_GK_LOADS_CT):
@@ -670,27 +627,17 @@ def compile_chunk_gated_delta_h(
             for i in range_constexpr(NUM_U_LOADS_CT):
                 extra_load_emitters.append(_make_emit_u(i))
 
-            # OPT-VC: the prefetch slot-assignment schedule lives in the
-            # outer compile_chunk_gated_delta_h scope as SLOT_ASSIGN_CT /
-            # PROLOGUE_EMITTER_CT / TAIL_EMITTER_CT (pure Python lists) so
-            # we don't run any Python control flow here that the AST
-            # rewriter would clobber. ``extra_load_emitters`` is populated
-            # above and is index-compatible with the static schedule.
-            #
-            # OPT-VC prologue path (BV>=32): when OPT_VC_ENABLED is False
-            # the schedule routes every emitter into PROLOGUE_EMITTER_CT,
-            # so the entire batch of g/gk/u prefetch is issued HERE -- right
-            # before the GEMM1 main loop begins. This matches the original
-            # pre-OPT-VC (rev5) placement and lets the full MFMA chain hide
-            # the HBM latency of these scalar / dwordx4 loads.
+            # OPT-VC: the slot-assignment schedule (SLOT_ASSIGN_CT / PROLOGUE_EMITTER_CT / TAIL_EMITTER_CT) lives in the
+            # outer scope as pure Python lists, index-compatible with extra_load_emitters above. Prologue path (BV>=32,
+            # OPT_VC_ENABLED False): every emitter is in PROLOGUE_EMITTER_CT, so the whole g/gk/u batch issues HERE
+            # before GEMM1 (rev5 placement) and the MFMA chain hides its HBM latency.
             for _eidx in PROLOGUE_EMITTER_CT:
                 extra_load_emitters[_eidx]()
 
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
-                    # OPT-K: issue one k_prefetch vec_load per (kb, ks) slot to
-                    # spread the 4 buffer_load_dwordx4 across the MFMA chain
-                    # so HBM latency is hidden by the MFMA dependency chain.
+                    # OPT-K: one k_prefetch vec_load per (kb, ks) slot spreads the
+                    # 4 dwordx4 across the MFMA chain to hide HBM latency.
                     mfma_slot = kb * K_STEPS_PER_BLOCK + ks
                     if mfma_slot < NUM_K_LOADS:
                         k_prefetch[mfma_slot] = k_.vec_load(
@@ -755,9 +702,8 @@ def compile_chunk_gated_delta_h(
                 bv_val = bv_accs[nr]
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
-                    # u_prefetch is a list of raw ir.Value from buffer_load;
-                    # wrap in fx.BFloat16 so we can use .to() instead of
-                    # the bare arith.extf wrapper.
+                    # u_prefetch is a list of raw ir.Value from buffer_load; wrap in fx.BFloat16 so we can use .to()
+                    # instead of the bare arith.extf wrapper.
                     u_bf16 = fx.BFloat16(u_prefetch[nr * 4 + elem_i])
                     u_f32_elems.append(u_bf16.to(fx.Float32))
                 u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
@@ -766,14 +712,9 @@ def compile_chunk_gated_delta_h(
 
             # -- 2b. Store v_new (pre-gating) for output --
             if const_expr(SAVE_NEW_VALUE):
-                # Closure wrapper to hide ``vn_`` from FlyDSL 0.1.5+
-                # ``ReplaceIfWithDispatch`` ast rewriter: it scans
-                # subscript-store and ``obj.method()`` calls inside dynamic
-                # ``if`` bodies and demands MLIR-Value state for any name
-                # written to / invoked on.  ``vn_`` is a GTensor (HBM tensor
-                # wrapper), not an MLIR Value.  Wrapping the store in a bare
-                # function call (ast.Name, not ast.Attribute / Subscript)
-                # makes the analyzer skip it.
+                # Closure wrapper hides ``vn_`` from FlyDSL 0.1.5+ ReplaceIfWithDispatch: it scans subscript-store /
+                # obj.method() in dynamic ``if`` bodies and demands MLIR-Value state for any name written/invoked.
+                # ``vn_`` is a GTensor, not an MLIR Value; a bare function call (ast.Name) makes the analyzer skip it.
                 def _emit_vn_store(off, value):
                     vn_[fx.Index(off)] = value
 
@@ -798,9 +739,8 @@ def compile_chunk_gated_delta_h(
                 g_last = g_last_prefetch_cell[0]
                 exp_g_last = _fast_exp(g_last)
 
-                # Build the 4-lane gate vector via a single from_elements
-                # instead of fx.full(0.0) + 4x vector.insert: less SSA chain,
-                # lets LLVM pack the 4 lanes directly as register-immediate.
+                # Build the 4-lane gate vector via one from_elements (not fx.full(0.0) + 4x insert): shorter SSA chain,
+                # lets LLVM pack the lanes as register-immediate.
                 gate_elems = []
                 for elem_i in range_constexpr(4):
                     g_row, in_bounds = g_row_prefetch[elem_i]
@@ -820,13 +760,11 @@ def compile_chunk_gated_delta_h(
                         acc_idx = kb * N_REPEAT + nr
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * exp_g_last_vec
 
-            # Per-K decay: h[v, k] *= exp(gk_last[k]) at chunk end.
-            # Each lane's v4f32 spans 4 different K positions (one per elem_i),
-            # so we build a per-kb gate vector and multiply h_accs accordingly.
+            # Per-K decay: h[v, k] *= exp(gk_last[k]) at chunk end. Each lane's v4f32 spans 4 different K positions (one
+            # per elem_i), so we build a per-kb gate vector and multiply h_accs accordingly.
             if const_expr(USE_GK):
                 for kb in range_constexpr(NUM_K_BLOCKS):
-                    # Same simplification as gate_vec above: one
-                    # from_elements instead of fx.full(0.0) + 4x insert.
+                    # Same simplification as gate_vec above: one from_elements instead of fx.full(0.0) + 4x insert.
                     gk_vec = vector.from_elements(
                         T.f32x4,
                         [gk_last_prefetch[kb][elem_i] for elem_i in range_constexpr(4)],
@@ -860,13 +798,9 @@ def compile_chunk_gated_delta_h(
 
             gpu.barrier()
 
-            # -- OPT-W: precompute NEXT iteration's w prefetch offsets only.
-            # The actual buffer_load vec_load calls are interleaved into the
-            # GEMM2 (k @ v_new) main loop below so the HBM latency of each
-            # buffer_load_dwordx4 is hidden behind the MFMA dependency chain
-            # (same idea as OPT-K for k). Without this, the 4 dwordx4 loads
-            # all issue back-to-back before GEMM2 and pile up at vmcnt(7),
-            # which is the #1 hotspot per ATT trace (~34% of total stall).
+            # -- OPT-W: precompute NEXT iteration's w prefetch offsets only. The vec_loads are interleaved into the
+            # GEMM2 (k @ v_new) loop below so each dwordx4's HBM latency hides behind the MFMA chain (like OPT-K).
+            # Issuing them all before GEMM2 piles up at vmcnt, the top hotspot per ATT trace.
             next_i_t_i32 = i_t_i32 + fx.Int32(1)
             w_next_prefetch_off = []
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -882,11 +816,8 @@ def compile_chunk_gated_delta_h(
             NUM_W_NEXT_LOADS = NUM_K_BLOCKS * NUM_LOAD_BATCHES_64
             w_next_prefetch = [None] * NUM_W_NEXT_LOADS
 
-            # OPT-W prologue path (BV>=32): issue all w_next vec_loads as a
-            # BATCH right before GEMM2 starts, matching the rev5 scheduling.
-            # The interleaved per-(kb,bt_s) issue inside GEMM2 below is then
-            # skipped. ``const_expr`` ensures the FlyDSL AST rewriter treats
-            # this branch as a compile-time const (no dispatch wrapper).
+            # OPT-W prologue path (BV>=32): issue all w_next vec_loads as a BATCH before GEMM2 (rev5 scheduling); the
+            # interleaved per-(kb,bt_s) issue below is skipped. const_expr keeps this a compile-time branch.
             if const_expr(not OPT_W_ENABLED):
                 for _i in range_constexpr(NUM_W_NEXT_LOADS):
                     w_next_prefetch[_i] = w_.vec_load(
@@ -895,11 +826,9 @@ def compile_chunk_gated_delta_h(
 
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for bt_s in range_constexpr(BT_STEPS):
-                    # OPT-W: issue one w-next vec_load per (kb, bt_s) slot.
-                    # NUM_K_BLOCKS * BT_STEPS == NUM_W_NEXT_LOADS for the
-                    # current (K=128, BT=64) config (4 == 4), so every slot
-                    # gets exactly one load. Skipped when OPT_W_ENABLED is
-                    # False (BV>=32) since the batch was already issued above.
+                    # OPT-W: one w-next vec_load per (kb, bt_s) slot. For the current (K=128, BT=64) config
+                    # NUM_K_BLOCKS*BT_STEPS == NUM_W_NEXT_LOADS, so each slot gets one load. Skipped when OPT_W_ENABLED
+                    # is False (BV>=32; batch issued above).
                     w_slot = kb * BT_STEPS + bt_s
                     if const_expr(OPT_W_ENABLED):
                         if w_slot < NUM_W_NEXT_LOADS:
@@ -949,10 +878,8 @@ def compile_chunk_gated_delta_h(
                             k_a_frag, vn_b_frag, h_accs_in[acc_idx]
                         )
 
-            # OPT-W: emit any remaining w_next loads that didn't fit into the
-            # GEMM2 main loop (only possible if NUM_K_BLOCKS*BT_STEPS <
-            # NUM_W_NEXT_LOADS for an exotic config). Const-expr loop, all
-            # slots resolved at trace time.
+            # OPT-W: emit any w_next loads that didn't fit the GEMM2 loop (only
+            # if NUM_K_BLOCKS*BT_STEPS < NUM_W_NEXT_LOADS, an exotic config).
             for i_wp in range_constexpr(NUM_W_NEXT_LOADS):
                 if w_next_prefetch[i_wp] is None:
                     w_next_prefetch[i_wp] = w_.vec_load(
@@ -966,9 +893,8 @@ def compile_chunk_gated_delta_h(
         h_accs_final = list(results[:NUM_H_ACCS])
 
         # -- Epilogue: store final state --
-        # OPT-7: 4 x scalar f32 store -> 1 x buffer_store_dwordx4 (16 B).
-        # acc_val is already f32x4 with element i at K offset i -> vec_store
-        # directly (no extract + from_elements needed).
+        # OPT-7: 4 scalar f32 stores -> 1 buffer_store_dwordx4. acc_val is
+        # already f32x4 (element i at K offset i) -> vec_store directly.
         if const_expr(STORE_FINAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for nr in range_constexpr(N_REPEAT):

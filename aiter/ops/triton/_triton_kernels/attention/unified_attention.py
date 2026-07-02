@@ -213,13 +213,11 @@ def kernel_unified_attention_2d(
         + 1
     )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
+    # adjust for potential padding in the last q_block by considering the actual sequence length
     max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
 
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
+    # calculate the number of tiles that need to be processed to cover the longest sequence prefix
+    # (due to causal masking, tiles beyond this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     # ---- Sliding-window tile pruning --------------------
@@ -631,13 +629,11 @@ def kernel_unified_attention_3d(
         + 1
     )
 
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
+    # adjust for potential padding in the last q_block by considering the actual sequence length
     max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
 
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
+    # calculate the number of tiles that need to be processed to cover the longest sequence prefix
+    # (due to causal masking, tiles beyond this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""

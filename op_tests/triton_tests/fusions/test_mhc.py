@@ -51,9 +51,7 @@ except ImportError:
     _HAS_AITER_MHC_POST = False
 
 
-# =============================================================================
 # Tests
-# =============================================================================
 
 
 def _alphas(alpha_pre, alpha_post, alpha_res, device="cuda"):
@@ -265,8 +263,7 @@ def test_mhc_large_values():
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
     triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
 
-    # Layer_input scales linearly with x, so loosen its absolute tolerance for
-    # x ~ N(0, 100²).
+    # Layer_input scales linearly with x, so loosen its absolute tolerance for x ~ N(0, 100²).
     _assert_mhc_close(triton_tuple, out_torch, layer_atol=2.0, layer_rtol=1e-2)
 
 
@@ -336,9 +333,7 @@ def test_mhc_output_range():
     )
 
 
-# =============================================================================
 # Split-K Tests
-# =============================================================================
 
 
 def _make_split_k_config(num_ksplit, n=4):
@@ -564,9 +559,7 @@ def test_split_k_large_k():
     )
 
 
-# =============================================================================
 # Triton-vs-HIP parity anchor
-# =============================================================================
 
 
 def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n):
@@ -704,9 +697,7 @@ def test_triton_mhc_matches_hip(M, n, C):
         ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
 
 
-# =============================================================================
 # mhc_post Tests
-# =============================================================================
 
 
 @pytest.mark.parametrize(
@@ -868,9 +859,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     assert pct <= 0.05, f"{msg} (atol=2e-2, rtol=1e-2, bad_element_ratio={pct:.2%})"
 
 
-# =============================================================================
 # Fused mhc_post_pre Tests
-# =============================================================================
 
 
 @pytest.mark.parametrize("M", [1, 4, 64, 128])
@@ -944,8 +933,7 @@ def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
     # internally; the Triton kernel consumes the same values).
     phi_triton = phi.T.contiguous().T
 
-    # Triton fused — mhc_post_pre selects log-domain (default) or
-    # HIP-compatible exp-domain Sinkhorn via the flag.
+    # Triton fused — mhc_post_pre selects log-domain (default) or HIP-compatible exp-domain Sinkhorn via the flag.
     h_post_t, h_res_t, layer_input_out_t, residual_out_t = mhc_post_pre(
         layer_input,
         residual_in,
@@ -1069,8 +1057,7 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
     )
     x_l = x_l_flat.view(M, n, C)
 
-    # Reference implementation — mhc_e2e_ref is the torch ref and takes
-    # three floats directly.
+    # Reference implementation — mhc_e2e_ref is the torch ref and takes three floats directly.
     layer_input_ref, x_l_plus_1_ref, h_post_ref, h_res_ref = mhc_e2e_ref(
         x_l,
         phi,

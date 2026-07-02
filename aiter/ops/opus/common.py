@@ -51,10 +51,8 @@ from aiter.jit.core import AITER_ROOT_DIR
 
 # ---- Env / default paths --------------------------------------------------
 
-# Colon-separated list of glob patterns; each pattern is expanded with
-# glob.glob() and the results concatenated. Order does not matter -- on
-# duplicate keys we keep the row with the smallest `us` (best winner)
-# across all files.
+# Colon-separated list of glob patterns; each pattern is expanded with glob.glob() and the results concatenated. Order
+# does not matter -- on duplicate keys we keep the row with the smallest `us` (best winner) across all files.
 _DEFAULT_TUNED_CSV_GLOB = (
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv"
     f":{AITER_ROOT_DIR}/aiter/configs/model_configs/*_bf16_tuned_gemm.csv"
@@ -117,9 +115,8 @@ def _load_tuned_dict() -> dict:
         except (pd.errors.EmptyDataError, FileNotFoundError):
             continue
         if "libtype" not in df.columns:
-            # CSVs without a `libtype` column predate the multi-backend
-            # schema; they cannot contain opus rows by definition. Skip
-            # rather than misclassify their rows as opus.
+            # CSVs without a `libtype` column predate the multi-backend schema; they cannot contain opus rows by
+            # definition. Skip rather than misclassify their rows as opus.
             continue
         df = df[df["libtype"] == "opus"]
         if df.empty:
@@ -134,9 +131,8 @@ def _load_tuned_dict() -> dict:
         return {}
     combined = pd.concat(frames, ignore_index=True).drop_duplicates()
 
-    # Conflict resolution: same 9-tuple key from multiple files -> keep
-    # the row with the smallest `us` (best timing). If `us` is missing,
-    # fall back to first-write-wins.
+    # Conflict resolution: same 9-tuple key from multiple files -> keep the row with the smallest `us` (best timing). If
+    # `us` is missing, fall back to first-write-wins.
     has_us = "us" in combined.columns
     if has_us:
         combined = combined.sort_values("us", ascending=True, kind="mergesort")
@@ -184,11 +180,9 @@ def _key_from_runtime(
     )
 
 
-# Mono-tile kid → (B_M, B_N, B_K). Must stay in lock-step with
-# csrc/opus_gemm/opus_gemm_common.py:_MONO_TILE_TILES; the runtime guard
-# below uses it to validate (N, K) alignment for CSV-picked mono kids,
-# since tuned_gemm.get_padded_m pads the lookup key by M only and can
-# surface a kid whose B_N / B_K does not divide the actual N / K.
+# Mono-tile kid → (B_M, B_N, B_K). Must stay in lock-step with csrc/opus_gemm/opus_gemm_common.py:_MONO_TILE_TILES; the
+# runtime guard below uses it to validate (N, K) alignment for CSV-picked mono kids, since tuned_gemm.get_padded_m pads
+# the lookup key by M only and can surface a kid whose B_N / B_K does not divide the actual N / K.
 _MONO_TILE_KID_TILES = {
     1400: (192, 256, 64),
     1401: (128, 256, 64),

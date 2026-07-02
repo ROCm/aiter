@@ -78,9 +78,8 @@ def ref_masked_attention(
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
 
     if attn_mask is not None:
-        # Explicit boolean visibility mask [s_q, s_k] (True == keep). Used by the
-        # round-robin CP reference where the causal relation is on GLOBAL token
-        # positions and therefore cannot be expressed as a single diagonal.
+        # Explicit boolean visibility mask [s_q, s_k] (True == keep). Used by the round-robin CP reference where the
+        # causal relation is on GLOBAL token positions and therefore cannot be expressed as a single diagonal.
         attn_bias = torch.zeros_like(attn_weights)  # [h, q, k]
         attn_bias.masked_fill_(attn_mask[None].logical_not(), float("-inf"))
         attn_weights = attn_weights + attn_bias

@@ -1146,8 +1146,7 @@ def test_gather_kv_b_proj_shuffled_kv(
     # FP4 weight reconstruction carries more error than fp8/bf16 weight.
     atol = 1e-1 if is_mxfp4_weight else 1e-2
     rtol = 1e-1 if is_mxfp4_weight else 1e-2
-    # checkAllclose only logs; assert here so the test actually fails on a
-    # mismatch instead of silently passing.
+    # checkAllclose only logs; assert here so the test actually fails on a mismatch instead of silently passing.
     for name, got, ref in (("k", k_prefix, k_ref), ("v", v_prefix, v_ref)):
         checkAllclose(ref, got, atol=atol, rtol=rtol)
         bad = (~torch.isclose(ref, got, atol=atol, rtol=rtol)).float().mean().item()

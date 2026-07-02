@@ -231,8 +231,7 @@ def test_causal_conv1d_update_with_batch_gather(
         dim=0,
     )
 
-    # conv_state will be (cache_lines, dim, state_len)
-    # with contiguous along dim-axis
+    # conv_state will be (cache_lines, dim, state_len) with contiguous along dim-axis
     conv_state = torch.randn(
         total_entries, width - 1, dim, device=device, dtype=itype
     ).transpose(1, 2)

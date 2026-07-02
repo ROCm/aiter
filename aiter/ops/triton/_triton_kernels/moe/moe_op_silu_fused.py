@@ -119,10 +119,8 @@ def _fused_moe_silu_kernel_gptq_awq(
     N: tl.constexpr,
     K: tl.constexpr,
     num_valid_tokens,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # Strides: ptr increment per 1-element move along a dimension
+    # (e.g. `stride_am` moves `a_ptr` one row down; A has M rows).
     stride_am,
     stride_ak,
     stride_be,
@@ -178,9 +176,7 @@ def _fused_moe_silu_kernel_gptq_awq(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
+    # Map program ids `pid` to the block of C it should compute, grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -194,21 +190,15 @@ def _fused_moe_silu_kernel_gptq_awq(
         return  # rest of the tiles are dummy paddings
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    # Create pointers for the first blocks of A and B; advanced along K.
+    # `a_ptrs`: [BLOCK_SIZE_M, BLOCK_SIZE_K], `b_ptrs`: [BLOCK_SIZE_K, BLOCK_SIZE_N]
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
-        # -----------------------------------------------------------
-        # Write back zeros to the output when the expert is not
-        # in the current expert parallel rank.
+        # Write back zeros when the expert is not in the current EP rank.
         _write_zeros_to_output(
             c_ptr,
             stride_cm,
@@ -231,7 +221,7 @@ def _fused_moe_silu_kernel_gptq_awq(
     offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
     # (i % 2): [0, 1, 0, 1,...] (alternating)
     # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
-    # So offs_bn now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+    # offs_bn alternates between the two halves (enables reshape without permute)
     offs_bn = (offs_half + (i % 2) * (N // 2)) % N
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -262,15 +252,10 @@ def _fused_moe_silu_kernel_gptq_awq(
     elif has_zp and use_int4_w4a16:
         b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
+    # Iterate to compute a block of C, accumulating in fp32 for accuracy; converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
+        # Load the next block of A and B, generate a mask by checking the K dimension.
 
         if not block_k_diviable:
             k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
@@ -350,7 +335,6 @@ def _fused_moe_silu_kernel_gptq_awq(
     silu_acc = _silu_exp2(silu_acc)
     accumulator = (silu_acc * mul_acc).to(compute_type)
 
-    # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
@@ -379,10 +363,8 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
     N: tl.constexpr,
     K: tl.constexpr,
     num_valid_tokens,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # Strides: ptr increment per 1-element move along a dimension
+    # (e.g. `stride_am` moves `a_ptr` one row down; A has M rows).
     stride_am,
     stride_ak,
     stride_be,
@@ -473,7 +455,7 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
         offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
         # (i % 2): [0, 1, 0, 1,...] (alternating)
         # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
-        # So offs_bn now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+        # offs_bn alternates between the two halves (enables reshape without permute)
         offs_bn = (offs_half + (i % 2) * (N // 2)) % N
 
         # Compute the A pointer
@@ -504,15 +486,10 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
         elif has_zp and use_int4_w4a16:
             b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
-        # -----------------------------------------------------------
-        # Iterate to compute a block of the C matrix.
-        # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-        # of fp32 values for higher accuracy.
-        # `accumulator` will be converted back to fp16 after the loop.
+        # Iterate to compute a block of C, accumulating in fp32 for accuracy; converted back to fp16 after the loop.
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            # Load the next block of A and B, generate a mask by checking the
-            # K dimension.
+            # Load the next block of A and B, generate a mask by checking the K dimension.
 
             if not block_k_diviable:
                 k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
@@ -594,7 +571,6 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
         silu_acc = _silu_exp2(silu_acc)
         accumulator = (silu_acc * mul_acc).to(compute_type)
 
-        # -----------------------------------------------------------
         # Write back the block of the output
         offs_cn = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
         c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
@@ -625,10 +601,8 @@ def _fused_moe_silu_kernel(
     N,
     K,
     num_valid_tokens,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # Strides: ptr increment per 1-element move along a dimension
+    # (e.g. `stride_am` moves `a_ptr` one row down; A has M rows).
     stride_am,
     stride_ak,
     stride_be,
@@ -683,9 +657,7 @@ def _fused_moe_silu_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
+    # Map program ids `pid` to the block of C it should compute, grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -699,21 +671,15 @@ def _fused_moe_silu_kernel(
         return  # rest of the tiles are dummy paddings
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    # Create pointers for the first blocks of A and B; advanced along K.
+    # `a_ptrs`: [BLOCK_SIZE_M, BLOCK_SIZE_K], `b_ptrs`: [BLOCK_SIZE_K, BLOCK_SIZE_N]
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
-        # -----------------------------------------------------------
-        # Write back zeros to the output when the expert is not
-        # in the current expert parallel rank.
+        # Write back zeros when the expert is not in the current EP rank.
         _write_zeros_to_output(
             c_ptr,
             stride_cm,
@@ -736,7 +702,7 @@ def _fused_moe_silu_kernel(
     offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
     # (i % 2): [0, 1, 0, 1,...] (alternating)
     # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
-    # So offs_bn now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+    # offs_bn alternates between the two halves (enables reshape without permute)
     offs_bn = (offs_half + (i % 2) * (N // 2)) % N
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -766,15 +732,10 @@ def _fused_moe_silu_kernel(
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
 
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
+    # Iterate to compute a block of C, accumulating in fp32 for accuracy; converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
+        # Load the next block of A and B, generate a mask by checking the K dimension.
         if EVEN_K:
             a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
             b = tl.load(b_ptrs)
@@ -826,7 +787,6 @@ def _fused_moe_silu_kernel(
     silu_acc = _silu_exp2(silu_acc)
     accumulator = (silu_acc * mul_acc).to(compute_type)
 
-    # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
@@ -855,10 +815,8 @@ def _fused_moe_persistent_silu_kernel(
     N,
     K,
     num_valid_tokens,
-    # The stride variables represent how much to increase the ptr by when
-    # moving by 1 element in a particular dimension. E.g. `stride_am` is
-    # how much to increase `a_ptr` by to get the element one row down
-    # (A has M rows).
+    # Strides: ptr increment per 1-element move along a dimension
+    # (e.g. `stride_am` moves `a_ptr` one row down; A has M rows).
     stride_am,
     stride_ak,
     stride_be,
@@ -915,8 +873,7 @@ def _fused_moe_persistent_silu_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
-    # -----------------------------------------------------------
-    # Simply compute how many iterations each persistent block needs to do
+    # Compute how many iterations each persistent block needs to do
     start_pid = tl.program_id(axis=0)
 
     # Load tile-invariant runtime constant
@@ -951,7 +908,7 @@ def _fused_moe_persistent_silu_kernel(
         offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
         # (i % 2): [0, 1, 0, 1,...] (alternating)
         # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
-        # So offs_bn now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+        # offs_bn alternates between the two halves (enables reshape without permute)
         offs_bn = (offs_half + (i % 2) * (N // 2)) % N
 
         # Compute the A pointer
@@ -985,8 +942,7 @@ def _fused_moe_persistent_silu_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            # Load the next block of A and B, generate a mask by checking the
-            # K dimension.
+            # Load the next block of A and B, generate a mask by checking the K dimension.
             if EVEN_K:
                 a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
                 b = tl.load(b_ptrs)
@@ -1042,7 +998,6 @@ def _fused_moe_persistent_silu_kernel(
         silu_acc = _silu_exp2(silu_acc)
         accumulator = (silu_acc * mul_acc).to(compute_type)
 
-        # -----------------------------------------------------------
         # Write back the block of the output
         offs_cn = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
         c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]

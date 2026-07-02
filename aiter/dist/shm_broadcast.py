@@ -169,15 +169,12 @@ class ShmRingBuffer:
                 try:
                     self.shared_memory = shared_memory.SharedMemory(name=name)
                     # See https://docs.python.org/3/library/multiprocessing.shared_memory.html # noqa
-                    # Some platforms allocate memory based on page size,
-                    # so the shared memory block size may be larger or equal
-                    # to the requested size. The size parameter is ignored
-                    # when attaching to an existing block.
+                    # Some platforms allocate memory based on page size, so the shared memory block size may be larger
+                    # or equal to the requested size. The size parameter is ignored when attaching to an existing block.
                     assert self.shared_memory.size >= self.total_bytes_of_buffer
                 except FileNotFoundError:
-                    # we might deserialize the object in a different node
-                    # in this case, this object is not used,
-                    # and we should suppress the error
+                    # we might deserialize the object in a different node in this case, this object is not used, and we
+                    # should suppress the error
                     pass
 
     def handle(self):
@@ -252,9 +249,8 @@ class MessageQueue:
             # 2. create a publish-subscribe socket to communicate large data
             self.buffer = ShmRingBuffer(n_local_reader, max_chunk_bytes, max_chunks)
 
-            # XPUB is very similar to PUB,
-            # except that it can receive subscription messages
-            # to confirm the number of subscribers
+            # XPUB is very similar to PUB, except that it can receive subscription messages to confirm the number of
+            # subscribers
             self.local_socket = context.socket(XPUB)
             # set the verbose option so that we can receive every subscription
             # message. otherwise, we will only receive the first subscription
@@ -369,8 +365,7 @@ class MessageQueue:
                 # wait for subscription messages from all local readers
                 self.local_socket.recv()
             if self.n_local_reader > 0:
-                # send a message to all local readers
-                # to make sure the publish channel is working
+                # send a message to all local readers to make sure the publish channel is working
                 self.local_socket.send(b"READY")
 
             # remote readers
@@ -378,8 +373,7 @@ class MessageQueue:
                 # wait for subscription messages from all remote readers
                 self.remote_socket.recv()
             if self.n_remote_reader > 0:
-                # send a message to all remote readers
-                # to make sure the publish channel is working
+                # send a message to all remote readers to make sure the publish channel is working
                 self.remote_socket.send(b"READY")
         elif self._is_local_reader:
             # wait for the writer to send a message
@@ -402,8 +396,7 @@ class MessageQueue:
                 if written_flag and read_count != self.buffer.n_reader:
                     # this block is written and not read by all readers
                     # for writers, `self.current_idx` is the next block to write
-                    # if this block is not ready to write,
-                    # we need to wait until it is read by all readers
+                    # if this block is not ready to write, we need to wait until it is read by all readers
 
                     # Release the processor to other threads
                     sched_yield()
@@ -468,8 +461,7 @@ class MessageQueue:
                     # (2) already read by this reader
 
                     # for readers, `self.current_idx` is the next block to read
-                    # if this block is not ready,
-                    # we need to wait until it is written
+                    # if this block is not ready, we need to wait until it is written
 
                     # Release the processor to other threads
                     self._read_spin_timer.spin()

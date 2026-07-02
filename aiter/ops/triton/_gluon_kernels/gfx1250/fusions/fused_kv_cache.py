@@ -271,10 +271,9 @@ def _store_mla_kv_cache(
             offsets=kv_cache_pe_offs.to(gl.int32),
         )
 
-    # Note: the async_store drain (tdm.async_wait) is done by the CALLER after
-    # any downstream ops, so the async_store latency can overlap with the
-    # post-helper work (decode_q_pe / zeros buffer_stores, etc.) instead of
-    # being exposed right at the helper return.
+    # Note: the async_store drain (tdm.async_wait) is done by the CALLER after any downstream ops, so the async_store
+    # latency can overlap with the post-helper work (decode_q_pe / zeros buffer_stores, etc.) instead of being exposed
+    # right at the helper return.
 
 
 @gluon.jit
@@ -443,9 +442,8 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     d_nope_offs = gl.arange(0, BLOCK_D_nope, layout=L_NOPE).to(gl.int64)
     d_pe_offs = gl.arange(0, BLOCK_D_pe, layout=L_PE).to(gl.int64)
 
-    # When q_out has the same dtype as q_nope/q_pe we can stage the passthrough
-    # q_nope straight from its load buffer (no cast). When it differs we need
-    # separate q_out-dtype staging buffers and an explicit cast on store.
+    # When q_out has the same dtype as q_nope/q_pe we can stage the passthrough q_nope straight from its load buffer (no
+    # cast). When it differs we need separate q_out-dtype staging buffers and an explicit cast on store.
     Q_OUT_MATCHES: gl.constexpr = (
         q_out_ptr.dtype.element_ty == q_nope_ptr.dtype.element_ty
     )
@@ -473,9 +471,8 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         pid_hq = pid // B
         pid_b = pid % B
 
-        # Issue ``pos`` first — it's used immediately by the cos/sin TDM
-        # descriptors. pid_slot / k_scale are only consumed later in the
-        # k-store path, so they sit behind pos in the issue stream.
+        # Issue ``pos`` first — it's used immediately by the cos/sin TDM descriptors. pid_slot / k_scale are only
+        # consumed later in the k-store path, so they sit behind pos in the issue stream.
         pos = gl.load(pos_ptr + pid_b * pos_stride_b)
         pid_slot = gl.load(slot_mapping_ptr + pid_b).to(gl.int64)
 
@@ -491,12 +488,10 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         else:
             k_scale = 1.0
 
-        # cos/sin: TDM-load the contiguous freq slice (base depends on pos),
-        # rebuilt into the BLOCK_D_pe vector after the wait. The slice is
-        # contiguous (no d_cos_offs gather), so it streams through LDS like the
-        # other inputs. Empirically faster than the buffer_load gather despite
-        # adding 2 to the TDM-load FIFO depth (the [FIFO full] stall on the
-        # 6th issue is an overlap stall — kernel keeps doing useful work).
+        # cos/sin: TDM-load the contiguous freq slice (base depends on pos), rebuilt into the BLOCK_D_pe vector after
+        # the wait. The slice is contiguous (no d_cos_offs gather), so it streams through LDS like the other inputs.
+        # Empirically faster than the buffer_load gather despite adding 2 to the TDM-load FIFO depth (the [FIFO full]
+        # stall on the 6th issue is an overlap stall — kernel keeps doing useful work).
         cos_desc = _make_tdm_desc_1d(
             cos_ptr + pos * cos_stride_b, cos_stride_d, FREQ_W, SH
         )
@@ -631,11 +626,9 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     L_PE,
                 )
 
-        # OUTPUT block at tail (after the kv-store path): both stores via
-        # buffer_store. Empirically beats moving the block earlier or putting
-        # decode_q_pe on TDM async_store — those alternatives lower per-WGP
-        # SIMD-instruction count but degrade IPC enough that wall-clock
-        # dispatch time grows.
+        # OUTPUT block at tail (after the kv-store path): both stores via buffer_store. Empirically beats moving the
+        # block earlier or putting decode_q_pe on TDM async_store — those alternatives lower per-WGP SIMD-instruction
+        # count but degrade IPC enough that wall-clock dispatch time grows.
         if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE:
             if pid < num_decode_toks_for_zeros * QH:
                 decode_q_pe_base = (
@@ -1466,9 +1459,8 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             k_pe = k_smem.load(L_T_PE)
             v = v_smem.load(L_T_PE)
 
-            # Pre-compute KV-cache / k_out offsets and masks. (k_scale_rcprl
-            # and v_scale_rcprl returned by the helper override the locals
-            # computed above; harmless since both expressions are equivalent.)
+            # Pre-compute KV-cache / k_out offsets and masks. (k_scale_rcprl and v_scale_rcprl returned by the helper
+            # override the locals computed above; harmless since both expressions are equivalent.)
             (
                 cache_mask_2d,
                 k_out_offs_2d,

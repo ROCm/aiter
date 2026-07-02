@@ -360,9 +360,7 @@ def test_fmoe_ep(
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
 
-# ---------------------------------------------------------------------------
 # EP end-to-end with per_1x32 mxfp4 (a8w4 / a4w4) via fused_moe
-# ---------------------------------------------------------------------------
 
 
 def _per_1x32_mxfp4_quant(w):
@@ -437,10 +435,9 @@ def test_fmoe_ep_mxfp4(
     w1_qt, w1_scale = _per_1x32_mxfp4_quant(w1)
     w2_qt, w2_scale = _per_1x32_mxfp4_quant(w2)
 
-    # Reference uses the dequantized mxfp4 weights so the comparison is
-    # apples-to-apples (kernel sees the same quantized values). Mirrors the
-    # mxfp4_to_f32 + e8m0_to_f32 dequant in aiter/fused_moe.py:2018-2021 and
-    # the quantized-weight reference path in test_moe_2stage.py:333-345.
+    # Reference uses the dequantized mxfp4 weights so the comparison is apples-to-apples (kernel sees the same quantized
+    # values). Mirrors the mxfp4_to_f32 + e8m0_to_f32 dequant in aiter/fused_moe.py:2018-2021 and the quantized-weight
+    # reference path in test_moe_2stage.py:333-345.
     def _dequant(w_qt, w_scale, orig_shape):
         wf = fp4_utils.mxfp4_to_f32(w_qt).view(*orig_shape)
         sf = fp4_utils.e8m0_to_f32(w_scale).view(orig_shape[0], orig_shape[1], -1)
@@ -459,10 +456,9 @@ def test_fmoe_ep_mxfp4(
     )
 
     if quant_label == "a8w4_mxfp4":
-        # a8w4 (fp8 activations, mxfp4 weights): use the CK a16w4 layout —
-        # weights interleaved on N (gate/up) — paired with gate_mode=INTERLEAVE
-        # at the call site. The FlyDSL fp4 (16,16) shuffle is separated and
-        # would mis-route gate/up here.
+        # a8w4 (fp8 activations, mxfp4 weights): use the CK a16w4 layout — weights interleaved on N (gate/up) — paired
+        # with gate_mode=INTERLEAVE at the call site. The FlyDSL fp4 (16,16) shuffle is separated and would mis-route
+        # gate/up here.
         w1_a = shuffle_weight_a16w4(w1_qt, 16, True)
         w1_s = shuffle_scale_a16w4(w1_scale, total_local, True)
         w2_a = shuffle_weight_a16w4(w2_qt, 16, False)
@@ -480,18 +476,15 @@ def test_fmoe_ep_mxfp4(
     else:
         raise ValueError(f"unknown quant_label: {quant_label}")
 
-    # a4w4: Silu + SEPARATED -> FlyDSL fp4/fp4 (AITER_FLYDSL_FORCE=1 drops the
-    # Swiglu gate). a8w4: Silu + INTERLEAVE -> q_dtype_a auto-picker selects
-    # fp8 on gfx950 (fused_moe.py:357-361), and since the L1261 CK-Tile
-    # pre-emption requires Swiglu, Silu falls through to the
-    # swiglu_mxfp4_flydsl branch (with FLYDSL_FORCE=1) and lands on
+    # a4w4: Silu + SEPARATED -> FlyDSL fp4/fp4 (AITER_FLYDSL_FORCE=1 drops the Swiglu gate). a8w4: Silu + INTERLEAVE ->
+    # q_dtype_a auto-picker selects fp8 on gfx950 (fused_moe.py:357-361), and since the L1261 CK-Tile pre-emption
+    # requires Swiglu, Silu falls through to the swiglu_mxfp4_flydsl branch (with FLYDSL_FORCE=1) and lands on
     # flydsl_moe1_afp8_wfp4_... Needs AITER_BF16_FP8_MOE_BOUND<=token.
     if quant_label == "a8w4_mxfp4":
         act = ActivationType.Silu
         gate_mode = GateMode.INTERLEAVE.value
-        # Force the fp8 (a8w4) kernel regardless of token count. Below the
-        # default AITER_BF16_FP8_MOE_BOUND (256) the picker selects bf16/a16w4,
-        # which for Silu at ksplit<=1 has no kernel and dispatch-crashes.
+        # Force the fp8 (a8w4) kernel regardless of token count. Below the default AITER_BF16_FP8_MOE_BOUND (256) the
+        # picker selects bf16/a16w4, which for Silu at ksplit<=1 has no kernel and dispatch-crashes.
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     else:
         act = ActivationType.Silu
