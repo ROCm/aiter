@@ -13,9 +13,7 @@
 #include "opus/opus.hpp"
 #endif
 
-// =====================================================================================================================
 // Keyword Glossary
-// =====================================================================================================================
 //
 //   1c / 2c              Number of input-output tensor pairs.
 //                        1c = one input & one output channel;  2c = two inputs & two outputs channels.
@@ -46,7 +44,6 @@
 // positions.scalar_type() at runtime. When zero, only int64 (torch.long) positions are accepted.
 
 namespace aiter {
-// =====================================================================================================================
 // Kernel Helper Functions
 //
 
@@ -541,7 +538,6 @@ elementwise_copy_2c(gmem_ix_t& g_ix,
     }
 }
 
-// =====================================================================================================================
 // Vectorized Helper Functions (using opus for buffer load/store)
 //
 
@@ -932,7 +928,6 @@ store_payload_vec(gmem_t& g_buffer,
 #endif
 }
 
-// =====================================================================================================================
 // Kernel Functionalities
 //
 
@@ -2705,7 +2700,6 @@ struct OpCachedBwd
     }
 };
 
-// =====================================================================================================================
 // Kernel Entries
 //
 
@@ -4267,7 +4261,6 @@ __launch_bounds__(256, 8) __global__
                                     threads_per_sb);
 }
 
-// =====================================================================================================================
 // Dispatches
 //
 
@@ -7230,23 +7223,12 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
 }
 
 // XOR-style butterfly sum reduce within a 32-lane subgroup.
-// Lowers to: 3x ds_swizzle_b32 (offset 16, 8, 4 via XOR mask) +
-//            2x v_*_dpp        (offset 2, 1   via opus::mov_dpp quad_perm).
-// Order is intentionally 16 -> 1 (descending) to match the historical
-//   for(offset=16; offset>0; offset>>=1) val += __shfl_xor(val, offset);
-// implementation. ds_swizzle and DPP latencies are symmetric, so reversing the
-// order vs the natural DPP-first form is a free constraint that buys us
-// bitwise-identical output to the prior bpermute-based reduce.
-// All lanes hold the full sum on return — XOR butterfly is symmetric, so no
-// follow-up broadcast is needed.
-//
-// Body is wrapped in #ifdef __HIP_DEVICE_COMPILE__ to match the rest of this
-// file: opus.hpp is only included in the device pass (see line 11), so the
-// opus::* references below would fail host-pass non-dependent-name lookup
-// and break any TU that includes rope_common.h without otherwise pulling in
-// opus.hpp (e.g. csrc/kernels/rope/general_2c_cached_positions_offsets_fwd_kernels.cu).
-// In the host pass the body is empty and the function returns `val`
-// unchanged — fine because these helpers are __device__-only.
+// Lowers to 3x ds_swizzle_b32 (offset 16, 8, 4) + 2x DPP (offset 2, 1).
+// Order 16 -> 1 (descending) matches the historical __shfl_xor reduce for
+// bitwise-identical output. All lanes hold the full sum on return (XOR butterfly
+// is symmetric, no follow-up broadcast needed).
+// Body is #ifdef __HIP_DEVICE_COMPILE__ because opus.hpp is device-pass only;
+// host pass leaves the body empty and returns `val` (these helpers are __device__-only).
 template <typename T>
 __inline__ __device__ T warp_reduce_sum(T val)
 {
@@ -7284,7 +7266,7 @@ __inline__ __device__ T warp_reduce_sum(T val)
 // 16-lane (half-warp) version of warp_reduce_sum: skips the XOR-by-16 step so
 // lanes 0..15 and lanes 16..31 reduce independently within their group.
 // Used by pair-packed kernels where each half-warp processes a separate head.
-// Body is #ifdef'd for the same reason as warp_reduce_sum above.
+// Body is #ifdef'd like warp_reduce_sum above.
 template <typename T>
 __inline__ __device__ T half_warp_reduce_sum(T val)
 {
@@ -7420,20 +7402,13 @@ __inline__ __device__ vec_t<T, vec_size> warp_shfl_sync_vec(vec_t<T, vec_size>& 
 
 // Constant-pattern XOR-style cross-lane shuffle for each 32-bit dword inside a vec.
 // Lowers to ds_swizzle_b32 (BitwiseMode XOR, AND=0x1F) within a 32-lane segment.
-// XorOffset must be a compile-time constant in [1, 31]. Compared to the lane-arith
-// path through warp_shfl_sync_vec(threadIdx.x + neighbor_offset), this saves
-// ~5 cycles per dword (ds_swizzle ~5 cyc vs ds_bpermute ~10 cyc) and removes
-// one VALU dependency chain (the runtime neighbor_offset computation).
+// XorOffset must be a compile-time constant in [1, 31]. Faster than the lane-arith
+// path (ds_swizzle ~5 cyc vs ds_bpermute ~10 cyc, no runtime neighbor_offset).
 //
-// Unlike warp_reduce_sum / half_warp_reduce_sum where opus::* only appears in
-// the body (and so can be hidden with #ifdef __HIP_DEVICE_COMPILE__ to keep
-// the host pass building), here opus::number<XorOffset> is a default
-// argument in the SIGNATURE — the signature is parsed in both passes, so
-// it cannot be #ifdef'd. We use std::integral_constant<int, XorOffset>
-// instead (which doesn't need opus.hpp). Existing callers passing
-// opus::number<X>{} continue to work because opus::number<I> is publicly
-// derived from std::integral_constant<index_t, I> (csrc/include/opus/opus.hpp:57)
-// — pass-by-value slicing of the empty derived type to its empty base is a no-op.
+// The tag is a default argument in the SIGNATURE (parsed in both host/device
+// passes), so it can't be #ifdef'd like the opus::* bodies above; we use
+// std::integral_constant<int, XorOffset> (no opus.hpp needed). Callers passing
+// opus::number<X>{} still work since opus::number<I> derives from it.
 template <typename T, int vec_size, int XorOffset>
 __inline__ __device__ vec_t<T, vec_size>
 warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
@@ -7454,41 +7429,22 @@ warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
 }
 
 // Pack two FP32 values into a single bf16x2 dword using round-to-nearest-even.
-//
-// Reference / adapted from:
-//   aiter/csrc/kernels/mla/hk/hk_mla_buffer_managers.cuh,
-//   `float_2_bf16_pair<kRoundMode = 0>` (gfx94 RNE branch).
-// The 10-instruction sequence and the constants 0x7FFF / 0x7FFF0000 /
-// 0xFFFF0000 are taken from there. Differences in this version:
-//   - input constraint changed from "i"(src_0) (which requires the caller to
-//     pin a register number as a compile-time integer constant) to "v"(a_bits)
-//     (a regular VGPR-bound value), so any callsite with compiler-allocated
-//     FP32 scratch can use this helper directly;
-//   - signature takes (float, float) and bit-casts internally, instead of
-//     (uint32_t, uint32_t);
-//   - scratch outputs are early-clobber (`=&s` / `=&v`) since with "v" inputs
-//     we can no longer rely on the immediate constraint to prevent aliasing;
-//   - only RNE is implemented (the RNA/RTZ paths from the original are not
-//     ported because all callers in this file want bit-equivalence with
-//     __hip_bfloat16(float)).
+// Adapted from aiter mla hk_mla_buffer_managers.cuh float_2_bf16_pair (gfx94 RNE
+// branch): "v" (VGPR) inputs instead of "i" immediate, (float,float) signature
+// with internal bit-cast, early-clobber scratch outputs, RNE only.
 //
 // Round semantics (bit-identical to __hip_bfloat16(float) ctor for non-NaN inputs):
 //   bf16 = (x + 0x7FFF + ((x >> 16) & 1)) >> 16
-// This is the standard RNE bias trick — adds 0x7FFF for normal rounding, plus the
-// 17-bit ("round") position to break ties to even.
+// Standard RNE bias trick: 0x7FFF for normal rounding, plus the round-position
+// bit to break ties to even.
 //
-// NaN handling differs from the ctor: the ctor preserves the NaN payload upper
-// bits (and OR-s 0x10000 if those bits are zero, to keep the NaN signaling); this
-// helper replaces all NaN inputs with the canonical FP32_NAN (0x7FFF0000), which
-// truncates to BF16 0x7FFF (BF16 quiet NaN). For RMSNorm + RoPE outputs, neither
-// path produces NaN under finite inputs (eps>0 prevents div-by-zero in rsqrt,
-// and rotate is a linear combination of finites), so the difference is unreachable.
+// NaN handling differs from the ctor (which preserves the NaN payload): this
+// helper maps all NaN inputs to canonical FP32_NAN (0x7FFF0000) -> BF16 0x7FFF.
+// Unreachable for RMSNorm+RoPE outputs (no NaN under finite inputs).
 //
-// On gfx94 (CDNA3) this lowers to a 10-instruction VALU sequence with NO EXEC
-// mask manipulation (vs 26 instructions for two scalar __hip_bfloat16(float)
-// expansions, each of which serializes the warp via s_and_saveexec / s_xor /
-// s_or around the NaN-check). On gfx95 (CDNA4) it would be a single
-// v_cvt_pk_bf16_f32 — not implemented here yet.
+// gfx94 (CDNA3): 10-instruction VALU sequence, no EXEC-mask manipulation (vs 26
+// insts for two scalar __hip_bfloat16(float) expansions). gfx95 (CDNA4) could use
+// a single v_cvt_pk_bf16_f32 — not implemented yet.
 __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
 {
     constexpr uint32_t ROUND_BIAS = 0x7fffu;     // RNE bias

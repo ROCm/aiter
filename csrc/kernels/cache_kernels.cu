@@ -1136,13 +1136,11 @@ __global__ void concat_and_cache_mla_opt_kernel(
 
 }
 
-// ============================================================================
 // Segmented paged KV cache write (no RoPE): concat kv_c (nope) + k_pe into a
-// flat block layout that matches fused_qk_rope_concat_and_cache_mla_seg:
+// flat block layout matching fused_qk_rope_concat_and_cache_mla_seg:
 //   block: [page_size x kv_lora (nope)][page_size x pe], token-major.
 //     nope: block_idx*block_stride + block_offset*kv_lora_rank + i
 //     pe:   block_idx*block_stride + page_size*kv_lora_rank + block_offset*pe_dim + i
-// ============================================================================
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_seg_kernel(
     const scalar_t* __restrict__ kv_c,        // [num_tokens, kv_lora_rank]
@@ -1634,10 +1632,8 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
         src_inblock_offset = src_block_offset + block_offset * head_dim + head_idx;
     }
 
-    // Inference engines like ATOM and vLLM allocate head_size+4 bytes for each block in kv_cache to
-    // store cache and scales. In models like DSv3.2 and GLM5, this gives 128+4=132 bytes per block,
-    // which is not divisible by VEC_SIZE=16. Therefore, use byte addressing to advance through the
-    // block before casting to dwordx4 for read/write.
+    // Engines allocate head_size+4 bytes per block (cache + scales), which need not be
+    // divisible by VEC_SIZE=16. Use byte addressing to advance, then cast to dwordx4.
     *reinterpret_cast<float4*>(dst_k + dst_inblock_offset) =
         *reinterpret_cast<const float4*>(kv_cache + src_inblock_offset);
     if(threadIdx.x == 0)
@@ -1963,12 +1959,9 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 
 }
 
-// ============================================================================
 // DeepSeek V3.1 MLA: fused QK RoPE(pe only) + static FP8 per-tensor quant +
 // segmented paged KV cache write. No RMSNorm (q/k are already post-projection).
-//
-// q: nope quantized directly, pe RoPE'd then quantized.
-// k: nope quantized directly, pe RoPE'd then quantized.
+// q/k: nope quantized directly, pe RoPE'd then quantized.
 //
 //   q_nope [T, H, KV_LORA]   q_pe [T, H, PE_DIM]
 //   kv_c   [T, KV_LORA]      k_pe [T, PE_DIM]      (num_kv_heads == 1)
@@ -1982,12 +1975,9 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
 //     nope: block_idx*block_stride + block_offset*KV_LORA + d
 //     rope: block_idx*block_stride + PAGE_SIZE*KV_LORA + block_offset*PE_DIM + d
 //
-// Launch: grid = T*H, block = KV_LORA/VEC threads. One block per (token, head)
-// handles that head's q; when head_idx==0 the same block also handles the
-// token's k (kv=1). The nope segment is written with VEC-wide vectorized
-// loads/stores (128-bit for 16-bit inputs); the pe segment is RoPE'd per
-// element (PE_DIM threads).
-// ============================================================================
+// Launch: grid = T*H, block = KV_LORA/VEC threads; block per (token,head) does
+// that head's q, and when head_idx==0 also the token's k (kv=1). nope uses
+// VEC-wide vectorized loads/stores; pe is RoPE'd per element (PE_DIM threads).
 template <typename scalar_t, typename cache_t, int KV_LORA, int PE_DIM,
           int PAGE_SIZE, bool IS_NEOX, int VEC>
 __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
@@ -2047,10 +2037,8 @@ __global__ void fused_qk_rope_concat_and_cache_mla_seg_kernel(
         const float cosv = static_cast<float>(cos_ptr[cos_idx]);
         const float sinv = static_cast<float>(sin_ptr[cos_idx]);
         // Standard RoPE pair transform (a,b) -> (a*cos - b*sin, b*cos + a*sin).
-        // xv is always the current element pe[d]; yv is its pair pe[pair_dim].
-        // For the "first" element of a pair (d<HALF / even d) output is
-        // xv*cos - yv*sin; for the "second" element output is xv*cos + yv*sin
-        // (i.e. b*cos + a*sin). The cos/sin operands must NOT be swapped here.
+        // xv=pe[d], yv=pe[pair_dim]. First element of a pair (d<HALF / even d)
+        // -> xv*cos - yv*sin; second -> xv*cos + yv*sin. Do NOT swap cos/sin.
         if constexpr(IS_NEOX)
             return d < HALF ? (xv * cosv - yv * sinv) : (xv * cosv + yv * sinv);
         else
@@ -4210,10 +4198,8 @@ void fused_qk_rope_concat_and_cache_mla(
   }
   AITER_CHECK(kv_c.stride(-1) == 1, "kv_c stride(-1) must be equal to 1");
   AITER_CHECK(k_pe.stride(-1) == 1, "k_pe stride(-1) must be equal to 1");
-  // ============================================================================
-  // Kernel Dispatch Logic
-  // ============================================================================
-  
+  // Kernel dispatch logic.
+
   // Configuration constants for kernel selection
   constexpr int64_t OPTIMIZED_KV_LORA_RANK = 512;
   constexpr int64_t OPTIMIZED_ROT_DIM = 64;
@@ -4238,13 +4224,10 @@ void fused_qk_rope_concat_and_cache_mla(
   
   const bool is_prefill_gqa = (kv_c.dim() == 3 && k_pe.dim() == 3 && 
                                kv_c.size(1) > 1);
-  // ============================================================================
   // DECODE PATH (per-token processing)
-  // ============================================================================
   if (is_decode || is_decode_single_kv_head) {
     
-    // Option 1: Per-head kernel for small batches with standard config
-    // Best for: low latency, small batch decode
+    // Option 1: per-head kernel for small-batch decode (low latency).
     const bool use_per_head_kernel = (
       is_nope_first && 
       kv_lora_rank <= OPTIMIZED_KV_LORA_RANK && 
@@ -4278,8 +4261,7 @@ void fused_qk_rope_concat_and_cache_mla(
         #undef CALL_OPT_VEC8
       }
     }
-    // Option 2: Optimized decode kernel for standard config with large workload
-    // Best for: high throughput, standard DeepSeek config
+    // Option 2: optimized decode kernel for large workload / standard DeepSeek config (throughput).
     else if (rot_dim == OPTIMIZED_ROT_DIM && 
              kv_lora_rank * num_heads >= MIN_SIZE_FOR_OPT && 
              kv_lora_rank == OPTIMIZED_KV_LORA_RANK) {
@@ -4290,8 +4272,7 @@ void fused_qk_rope_concat_and_cache_mla(
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv_c.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA);
     }
-    // Option 3: General decode kernel for arbitrary configs
-    // Best for: custom models, variable dimensions
+    // Option 3: general decode kernel for arbitrary configs / variable dims.
     else {
       // For decode path, we need to set up GQA-style strides even for single kv_head
       // Treat as if kv_c and k_pe have an extra dimension with size 1
@@ -4310,9 +4291,7 @@ void fused_qk_rope_concat_and_cache_mla(
     }
   }
   
-  // ============================================================================
   // PREFILL PATH (batched processing with GQA)
-  // ============================================================================
   else if (is_prefill_gqa) {
     // Extract GQA-specific strides
     const int kv_c_stride_0 = kv_c.stride(0);
@@ -4323,8 +4302,7 @@ void fused_qk_rope_concat_and_cache_mla(
     AITER_CHECK(num_kv_heads <= num_heads, "num_kv_heads must be less than or equal to num_heads");
     const int kv_cache_stride_h = kv_cache.stride(2);
     
-    // Option 1: Optimized prefill kernel for standard config
-    // Best for: DeepSeek-V2/V3 prefill phase
+    // Option 1: optimized prefill kernel for standard config (DeepSeek-V2/V3).
     const bool use_optimized_prefill = (
       rot_dim == OPTIMIZED_ROT_DIM && 
       kv_lora_rank == OPTIMIZED_KV_LORA_RANK
@@ -4336,8 +4314,7 @@ void fused_qk_rope_concat_and_cache_mla(
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv_c.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_PREFILL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA);
     }
-    // Option 2: General prefill kernel for arbitrary configs
-    // Best for: custom models, variable dimensions, different GQA ratios
+    // Option 2: general prefill kernel for arbitrary configs / GQA ratios.
     else {
       dim3 grid(num_tokens);
 
@@ -4354,10 +4331,8 @@ void fused_qk_rope_concat_and_cache_mla(
   }
 }
 
-// ============================================================================
 // DeepSeek V3.1 MLA: fused QK RoPE + static FP8 quant + segmented paged KV
 // cache write (no RMSNorm). See kernel comment for layout.
-// ============================================================================
 void fused_qk_rope_concat_and_cache_mla_seg(
     aiter_tensor_t& q_nope,       // [T, H, kv_lora_rank]
     aiter_tensor_t& q_pe,         // [T, H, pe_dim]

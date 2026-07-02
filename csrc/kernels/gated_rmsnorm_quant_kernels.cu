@@ -9,31 +9,15 @@
 namespace aiter {
 
 /**
- * Optimized Fused Gated RMSNorm + FP8 Group Quantization Kernel
+ * Fused Gated RMSNorm + FP8 group-quant kernel.
  *
- * Operations:
- * 1. Per-head Gated RMSNorm: norm(x) * silu(z) where:
- *    - norm(x) = x * weight / sqrt(variance + eps) (standard RMSNorm)
- *    - silu(z) = z / (1 + exp(-z))
- * 2. Flatten: [num_tokens, num_heads, head_dim] → [num_tokens, num_heads*head_dim]
- * 3. FP8 group quantization with group_size=128
+ * Per-head gated RMSNorm, then flatten and FP8 quantize (one head = one group):
+ *   norm(x) = x * weight / sqrt(variance + eps); silu(z) = z / (1 + exp(-z))
+ *   out = norm(x) * silu(z); [num_tokens, num_heads, head_dim] -> [num_tokens, num_heads*head_dim]
  *
- * Constraints:
- * - ONLY supports head_dim=128 and group_size=128
- * - Each head is exactly one quantization group
- * - AMD GPU: warp_size=64
- *
- * Template Parameters:
- * - GROUP_SIZE: Quantization group size (compile-time constant, default=128)
- * - BLOCK_SIZE: Number of threads per block (64, 128, or 256)
- *
- * Optimizations:
- * - Grid: (num_tokens, num_heads) - 2D grid
- * - Block: Configurable (64/128/256 threads)
- * - Each thread processes 2 elements using vectorized loads
- * - Warp reduction using __shfl_xor (NO shared memory)
- * - Loop unrolling with #pragma unroll
- * - Coalesced memory access
+ * Constraints: head_dim==group_size==128 (each head is one quant group), warp_size=64.
+ * Template params: GROUP_SIZE (default 128), BLOCK_SIZE (64/128/256 threads).
+ * Warp-shuffle reduction (no shared memory) over a 2D (num_tokens, num_heads) grid.
  */
 template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16, int BLOCK_SIZE = 256, bool TRANSPOSE_SCALE = false>
 __global__ void gated_rmsnorm_fp8_group_quant_kernel(
@@ -183,13 +167,8 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
 }
 
 /**
- * Host function to launch the optimized fused Gated RMSNorm + FP8 group quant kernel
- * with configurable block size for performance tuning.
- *
- * Block size options:
- * - 64 threads (1 warp): Baseline, minimal resource usage
- * - 128 threads (2 warps): Better occupancy, recommended for most cases
- * - 256 threads (4 warps): Maximum occupancy, best for large workloads
+ * Launches the fused Gated RMSNorm + FP8 group-quant kernel with a configurable
+ * block size (64/128/256 threads = 1/2/4 warps; more warps = higher occupancy).
  */
 template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE, int BLOCK_SIZE, bool TRANSPOSE_SCALE>
 void gated_rmsnorm_fp8_group_quant_launcher_impl(

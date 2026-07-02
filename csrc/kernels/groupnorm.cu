@@ -87,8 +87,7 @@ __device__ void groupnorm_kernel_up(uint32_t num_groups, uint32_t num_channels, 
     Element el{0.0f, 0.0f};
 
     if(align4) {
-        // the NVIDIA GPU arch can do a vectorized load of 128bits several years ago
-        // i'm not sure about the latest data, but loading 64 bits at a time should be sufficient
+        // vectorized load (64+ bits at a time is sufficient here)
         Vec<T, 4> vec;
         for(uint32_t i = tid*4; i < inner_size; i += (gridDim.x * THREADS_PER_BLOCK)*4) {
             uint32_t idx = blockIdx.y * inner_size + i;
@@ -305,12 +304,9 @@ torch::Tensor GroupNorm::launchGroupNormKernel(uint32_t num_groups, float epsilo
     uint32_t num_acc_slots = gridx * outer_size;
     reserveMeanAccumulator(num_acc_slots*2, x.device());
 
-    // there are some other ways:
-    //    1) use sequential atomicAdd in the first function to reduce, this may influence precision, and need an another memset kenrel
-    //    2) use cooperative groups to sync grid, results in hipErrorCooperativeLaunchTooLarge
-    // so i launch 2 differnt kernels(up && down)
-    // in fact, the second kernel is not needed if gridx==1
-    // but this is definitely a case with a small amount of data, so the overall difference seems minimal.
+    // Two kernels (up/down): sequential atomicAdd reduce hurts precision and needs an
+    // extra memset; cooperative-groups grid sync gives hipErrorCooperativeLaunchTooLarge.
+    // The down kernel is unneeded when gridx==1 (small data), but kept for simplicity.
     groupnorm_kernel_dispatch_up<T, THREADS_PER_BLOCK><<<grid_dim, block_dim, 0, stream>>>(
         num_groups,
         num_channels,

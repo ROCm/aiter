@@ -2,18 +2,10 @@
 // Copyright (C) 2023-2026, Tri Dao.
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Causal 1D Convolution Update Kernel for AIter Framework (ROCm/HIP)
-//
-// This kernel implements causal 1D convolution update for autoregressive generation,
-// designed for Mamba-style models. It processes one or a few new tokens at a time
-// while maintaining a sliding window state buffer.
-//
-// Key Features:
-// - Supports both circular and non-circular buffer modes
-// - Continuous batching support with flexible state indexing
-// - SiLU activation option
-// - Supports fp16, bf16, and fp32 data types
-// - Convolution widths: 2, 3, 4
+// Causal 1D convolution update for autoregressive (Mamba-style) generation:
+// processes a few new tokens while maintaining a sliding-window state buffer.
+// Supports circular/non-circular buffer modes, continuous batching with flexible
+// state indexing, optional SiLU, fp16/bf16/fp32, and conv widths 2/3/4.
 
 #include "aiter_hip_common.h"
 #include "aiter_tensor.h"
@@ -33,12 +25,7 @@
 
 namespace aiter {
 
-// ============================================================================
-// ConvParamsBaseUpdate - Kernel Parameters Structure
-// ============================================================================
-// Contains all parameters needed for the causal_conv1d_update kernel
-// Optimized for efficient GPU memory access and minimal register pressure
-
+// Kernel parameters for causal_conv1d_update.
 struct ConvParamsBaseUpdate {
     using index_t = uint32_t;
 
@@ -80,12 +67,7 @@ struct ConvParamsBaseUpdate {
     int pad_slot_id;  // Slot ID indicating padding (skip processing if matched)
 };
 
-// ============================================================================
-// Kernel Traits - Template Configuration
-// ============================================================================
-// Defines compile-time constants for kernel specialization
-// Allows the compiler to optimize for specific configurations
-
+// Compile-time kernel specialization constants.
 template<int kNThreads_, int kWidth_, typename input_t_, typename weight_t_>
 struct Causal_conv1d_update_kernel_traits {
     using input_t = input_t_;    // Input/output data type (float, fp16, bf16)
@@ -96,12 +78,7 @@ struct Causal_conv1d_update_kernel_traits {
     static_assert(kNBytes == 2 || kNBytes == 4, "Only 2-byte or 4-byte types supported");
 };
 
-// ============================================================================
-// Update Kernel
-// ============================================================================
-// Implements causal 1D convolution update for autoregressive generation
-// Processes one or few new tokens at a time while maintaining a sliding window state
-
+// Update kernel: convolves a few new tokens while maintaining the sliding-window state.
 template<typename Ktraits, bool kIsCircularBuffer>
 __global__ __launch_bounds__(Ktraits::kNThreads)
 void causal_conv1d_update_kernel(ConvParamsBaseUpdate params) {
@@ -223,11 +200,7 @@ void causal_conv1d_update_kernel(ConvParamsBaseUpdate params) {
     }
 }
 
-// ============================================================================
-// Launch Functions
-// ============================================================================
-// Helper functions to configure and launch the kernel with appropriate settings
-
+// Launch helpers: configure grid/kernel variant and launch.
 template<int kNThreads, int kWidth, typename input_t, typename weight_t>
 void causal_conv1d_update_launch(ConvParamsBaseUpdate &params, hipStream_t stream) {
     using Ktraits = Causal_conv1d_update_kernel_traits<kNThreads, kWidth, input_t, weight_t>;
@@ -258,12 +231,7 @@ void causal_conv1d_update_dispatch(ConvParamsBaseUpdate &params, hipStream_t str
     }
 }
 
-// ============================================================================
-// Host Interface
-// ============================================================================
-// Main entry point called from Python via pybind11
-// Handles tensor validation, parameter setup, and kernel dispatch
-
+// Host entry (called from Python via pybind11): validates tensors, sets up params, dispatches.
 void causal_conv1d_update(
     aiter_tensor_t& x,                          // [batch, dim, seqlen] - new input (typically seqlen=1 for decoding)
     aiter_tensor_t& conv_state,                 // [batch, dim, state_len] - state buffer (updated in-place)

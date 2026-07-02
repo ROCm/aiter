@@ -55,9 +55,8 @@ class alignas(Alignment) AlignedArray
     float data[N];
 };
 
-// ====================== Softmax things ===============================
-// We have our own implementation of softmax here so we can support transposing the output
-// in the softmax kernel when we extend this module to support expert-choice routing.
+// Softmax: own implementation so the output can be transposed for future
+// expert-choice routing support.
 template <typename DTYPE, int TPB>
 __launch_bounds__(TPB) __global__
     void moeSoftmax(const DTYPE* input, const bool* finished, float* output, const int num_cols)
@@ -200,7 +199,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
     }
 }
 
-// ====================== TopK softmax things ===============================
+// TopK gating softmax
 
 /*
   A Top-K gating softmax written to exploit when the number of experts in the MoE layers
@@ -267,12 +266,10 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     static_assert(ELTS_PER_WARP % ELTS_PER_ROW == 0,
                   "The elts per row must cleanly divide the total elt per warp");
 
-    // ===================== From this point, we finally start computing run-time variables.
-    // ========================
+    // Runtime variables begin here.
 
-    // Compute CTA and warp rows. We pack multiple rows into a single warp, and a block contains
-    // WARPS_PER_CTA warps. This, each block processes a chunk of rows. We start by computing the
-    // start row for each block.
+    // Pack multiple rows per warp; a block has WARPS_PER_CTA warps and processes
+    // a chunk of rows. Compute the block's base row.
     const int cta_base_row = blockIdx.x * ROWS_PER_CTA;
 
     // Now, using the base row per thread block, we compute the base row per warp.

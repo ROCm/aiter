@@ -1985,17 +1985,11 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     }
 }
 
-// Perf gate threshold for the coalesced LDS-staged store path in
-// mxfp4_moe_sort_kernel (see below). The LDS staging + double __syncthreads
-// cost scales with the LDS footprint per row (scaleN_pad bytes) times the
-// number of grid tiles (num_blocks). On MI355X/gfx950 uncoalesced byte stores
-// are already cheap, so the coalesced path is a net win for small/mid
-// (scaleN_pad x num_blocks) but loses once that product is large (empirically
-// the only regressor is dim=7168 @ M=16384: 224*4352=974,848; the largest
-// winner is dim=7168 @ M=8192: 224*2304=516,096). The threshold sits between
-// them with ~35% margin. This is a PURE PERFORMANCE knob: both the coalesced
-// and the scatter paths are byte-exact, so the value only affects speed, never
-// correctness.
+// Perf gate for the coalesced LDS-staged store path in mxfp4_moe_sort_kernel
+// (below): cost scales with scaleN_pad (LDS footprint/row) x num_blocks (grid
+// tiles). Threshold picked empirically between the largest known win (516,096)
+// and the smallest regression (974,848) on MI355X/gfx950. Perf-only: both the
+// coalesced and scatter paths are byte-exact.
 constexpr long MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX = 700000;
 
 template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32>
@@ -2027,42 +2021,32 @@ __global__ void mxfp4_moe_sort_kernel(
     auto buffer_scale =
                 opus::make_gmem<uint8_t>(scale, scale_per_row * num_tokens * topk * sizeof(uint8_t));
 
-    // Optimized store path: when one threadblock maps to exactly one 32-row
-    // swizzle tile (num_rows == 32), we stage this block's scale bytes into
-    // LDS in natural [row][col] order, then emit the swizzled out_scale layout
-    // with fully-coalesced 4-byte (dword) stores instead of 32 strided 1-byte
-    // scatters. The swizzle address for a fixed 32-row tile decomposes so that
-    // each contiguous 256-byte region == (one tile) x (8 columns), and one
-    // aligned dword at offset (y_blk*256 + c*64 + xl_lo*4) packs exactly:
+    // Optimized store path for num_rows == 32 (one threadblock == one 32-row
+    // swizzle tile): stage scale bytes into LDS in natural [row][col] order,
+    // then emit the swizzled out_scale layout via coalesced 4-byte (dword)
+    // stores instead of 32 strided 1-byte scatters. Each contiguous 256-byte
+    // region == (one tile) x (8 columns), and one aligned dword at offset
+    // (y_blk*256 + c*64 + xl_lo*4) packs exactly:
     //   byte0 = data[xl_lo   ][col_a]   byte1 = data[xl_lo+16][col_a]
     //   byte2 = data[xl_lo   ][col_a+4] byte3 = data[xl_lo+16][col_a+4]
     // with col_a = y_blk*8 + c. So 64 consecutive dwords fill a 256B block.
     //
-    // The coalesced path is gated by a pure perf heuristic computed here from
-    // values already in scope (scaleN_pad = LDS footprint per row, num_blocks =
-    // grid tiles); see MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX above. When the
-    // gate is off we fall through to the original per-byte scatter path below.
-    // Both paths are byte-exact; the gate only selects the faster one. The
-    // (long) casts avoid int32 overflow of the product.
+    // Gated by MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX (perf-only, byte-exact
+    // either way); falls through to the scatter path below otherwise. (long)
+    // casts avoid int32 overflow of the product.
     if constexpr (num_rows == 32)
     {
       if(((long)scaleN_pad * (long)num_blocks) <= MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX)
       {
-        // LDS holds 32 rows x scaleN_pad bytes (upper bound is compile-time:
-        // threads_per_row * thread_data_size columns). Zero-staged so invalid
-        // rows and padding columns store 0 (byte-exact with the reference,
-        // whose buffer is zero-initialised).
+        // LDS holds 32 rows x scaleN_pad bytes, zero-staged so invalid rows and
+        // padding columns store 0 (byte-exact with the zero-initialised reference).
         //
-        // The LDS row stride is PADDED (LDS_STRIDE = lds_cols + LDS_PAD), kept
-        // separate from the output stride scaleN_pad. Without padding, a
-        // scaleN_pad that is a multiple of 32 dwords (e.g. dim=4096 ->
-        // scaleN_pad=128 = 32 LDS banks) makes all 32 rows of a tile alias onto
-        // the same LDS bank, causing a ~32-way bank conflict in the packed
-        // read-out (s_scale[xl_lo*..] and s_scale[(xl_lo+16)*..]). Padding the
-        // stride by 4 bytes (one dword) breaks that aliasing while preserving
-        // dword alignment of the staged reads. This is invisible to the output:
-        // out_scale addressing still uses scaleN_pad, so the result is
-        // byte-identical; only the in-LDS layout changes.
+        // LDS row stride is padded (LDS_STRIDE = lds_cols + LDS_PAD) instead of
+        // using scaleN_pad directly: an unpadded stride that's a multiple of 32
+        // dwords (e.g. scaleN_pad=128 at dim=4096) would alias all 32 rows of a
+        // tile onto one LDS bank, causing ~32-way bank conflicts on read-out.
+        // The extra 4 bytes breaks the aliasing while keeping dword alignment;
+        // out_scale still addresses via scaleN_pad, so output bytes are unaffected.
         constexpr int lds_cols   = threads_per_row * thread_data_size;
         constexpr int LDS_PAD    = 4;
         constexpr int LDS_STRIDE = lds_cols + LDS_PAD;
@@ -2070,12 +2054,10 @@ __global__ void mxfp4_moe_sort_kernel(
 
         for(; block_idx < num_blocks; block_idx += num_tg)
         {
-            // Skip tiles whose 32 rows are entirely in the padding region
-            // (all rows >= num_valid_ids -> all invalid). The output buffer is
-            // pre-zeroed, so leaving such tiles untouched is byte-exact with the
-            // reference, and matches the original kernel's per-row guard. This
-            // avoids streaming zeros to the large E*block_m padding region.
-            // block_idx is uniform across the block, so no __syncthreads hazard.
+            // Skip tiles entirely in the padding region (all rows >= num_valid_ids):
+            // output is pre-zeroed so this is byte-exact and avoids streaming zeros
+            // to the large E*block_m padding region. block_idx is block-uniform, so
+            // no __syncthreads hazard from the early continue.
             if(block_idx * num_rows >= num_valid_ids_value)
             {
                 continue;

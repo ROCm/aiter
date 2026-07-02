@@ -403,9 +403,7 @@ __device__ void moe_fused_gate_impl(void* input,
     }
 }
 
-//------------------------------------------------------------------------------
-// Templated Kernel Version (using compile-time constants)
-//------------------------------------------------------------------------------
+// Templated kernel version (compile-time constants)
 template <int VPT_,
           int NUM_EXPERTS_,
           int THREADS_PER_ROW_,
@@ -480,9 +478,7 @@ __global__ void moe_fused_gate_kernel(void* input,
         dispatched = true;                                                                    \
     } while(0)
 
-//------------------------------------------------------------------------------
-// Dynamic Kernel Version (parameters computed at runtime)
-//------------------------------------------------------------------------------
+// Dynamic kernel version (params computed at runtime)
 struct KernelParamsDynamic
 {
     int VPT;
@@ -530,9 +526,7 @@ __global__ void moe_fused_gate_kernel_dynamic(void* input,
                            params);
 }
 
-//------------------------------------------------------------------------------
-// Host Launcher Function
-//------------------------------------------------------------------------------
+// Host launcher
 std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                                        at::Tensor& bias,
                                        at::Tensor& topk_weights,

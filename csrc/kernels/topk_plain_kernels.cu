@@ -1,35 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ============================================================================
-// TOP-K KERNEL IMPLEMENTATION FOR AMD GPUS
-// ============================================================================
+// Top-K kernel implementation for AMD GPUs. Three adaptive strategies:
+//   1. BlockTopkFilter - ballot-based filtering for large, sparse datasets
+//      (__ballot() compacts passing candidates into an LDS staging buffer);
+//      best when most values don't make Top-K.
+//   2. BlockTopkSort   - bitonic sort/merge over capacity-sized chunks;
+//      register-only, no LDS; best when most values need consideration.
+//   3. BlockTopkMerge  - merges pre-sorted k-sized chunks; multi-block reduction phase.
 //
-// This file implements three adaptive strategies for efficient Top-K selection:
-//
-// 1. BlockTopkFilter - Ballot-based filtering for large, sparse datasets
-//    - Uses __ballot() to identify and compact passing candidates
-//    - Accumulates filtered candidates in local data share staging buffer
-//    - Ideal when most values don't make it into Top-K
-//
-// 2. BlockTopkSort - Bitonic sort/merge for moderate datasets
-//    - Loads capacity-sized chunks, sorts, and merges using bitonic properties
-//    - Pure register-based, no local data share overhead
-//    - Ideal when most values need consideration
-//
-// 3. BlockTopkMerge - Efficient merging of pre-sorted chunks
-//    - Assumes input is already sorted in k-sized chunks
-//    - Used for multi-block reduction phase
-//
-// AMD GPU Optimizations Used:
-//   - DPP (Data Parallel Primitives) for small-stride shuffles (≤8)
-//   - Wave intrinsics (__ballot, __popcll, __shfl) for parallel operations
-//   - Buffer load instructions for coalesced memory access
-//   - Bitonic sort/merge leveraging wave-level parallelism
-//   - Med3 intrinsics for branchless min/max operations
-//
-// See detailed examples and explanations inline with each strategy class.
-// ============================================================================
+// AMD optimizations: DPP for small-stride shuffles (<=8); wave intrinsics
+// (__ballot, __popcll, __shfl); buffer loads for coalesced access; bitonic
+// sort/merge; med3 for branchless min/max. See inline examples per strategy.
 
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -197,28 +179,10 @@ __global__ void gather_topk_values_strided_kernel(const T* __restrict__ in,
 
 namespace topk {
 
-// ============================================================================
-// TYPE TRAITS FOR DATA/COMPUTE TYPE SEPARATION
-// ============================================================================
-//
-// Design Philosophy:
-//   - DataType (DataT): The storage/I/O type for memory operations
-//   - ComputeType (ComputeT): The type used for internal computations
-//
-// Mapping:
-//   - fp16, bf16, float -> compute as float (better precision, consistent ops)
-//   - int -> compute as int
-//
-// This separation allows:
-//   1. Memory-efficient storage with compact types (fp16, bf16)
-//   2. High-precision computation with float
-//   3. Easy extension for new types (e.g., fp8, int8)
-//
-// Usage:
-//   using ComputeT = compute_t<DataT>;
-//   ComputeT val = type_convert::to_compute<DataT>(data_val);
-//   DataT result = type_convert::to_data<DataT>(compute_val);
-// ============================================================================
+// Type traits separating DataT (storage/I/O type) from ComputeT (internal
+// compute type): fp16/bf16/float -> compute as float; int -> compute as int.
+// Compact storage + high-precision compute; easy to extend (fp8, int8).
+// Usage: ComputeT = compute_t<DataT>; convert via type_convert::to_compute/to_data.
 
 namespace type_traits {
 
@@ -266,10 +230,7 @@ using compute_t = typename ComputeTypeTraits<DataT>::type;
 // Bring compute_t into topk namespace for convenience
 using type_traits::compute_t;
 
-// ============================================================================
-// TYPE CONVERSION UTILITIES
-// ============================================================================
-
+// Type conversion utilities (DataT <-> ComputeT).
 namespace type_convert {
 
 // Convert from DataType to ComputeType
@@ -436,13 +397,8 @@ __inline__ __host__ __device__ constexpr int calc_capacity(int k)
 
 namespace numeric {
 
-// ============================================================================
-// BOUNDS AND SENTINEL VALUES
-// ============================================================================
-// These functions now work with ComputeType for internal operations.
-// The sentinel values are defined in ComputeType space (float for floating-point
-// DataTypes, int for integer DataTypes).
-// ============================================================================
+// Bounds and sentinel values, defined in ComputeType space (float for
+// floating-point DataTypes, int for integer DataTypes).
 
 /**
  * @brief Gets the absolute lowest possible value for a compute type.
@@ -564,18 +520,9 @@ __device__ __host__ __forceinline__ constexpr bool is_preferred(ComputeT val, Co
 
 namespace sorting {
 
-// ============================================================================
-// SORTING OPERATIONS (Work with ComputeType)
-// ============================================================================
-// All sorting operations in this namespace work with ComputeType values.
-// The template parameter T should be the compute type (float or int).
-// The idxT parameter is the index type (typically int32_t).
-//
-// The sorting algorithms use:
-//   - DPP (Data Parallel Primitives) for small-stride shuffles (≤8)
-//   - Wave intrinsics (__ballot, __popcll, __shfl) for larger operations
-//   - Bitonic sort/merge for efficient parallel sorting
-// ============================================================================
+// Sorting operations. T = compute type (float or int); idxT = index type
+// (typically int32_t). Uses DPP for small-stride shuffles (<=8), wave
+// intrinsics (__ballot, __popcll, __shfl) for larger strides, bitonic sort/merge.
 
 template <int size, bool ascending, typename T, typename idxT>
 struct BitonicMerge
@@ -1003,34 +950,16 @@ buffer_load_dwordx4(int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t a
 
 } // namespace buffer_load_helpers
 
-// --- Wave-Level Priority Selection Primitives (AMD/HIP Optimized) ---
-//
-// THREE STRATEGIES FOR TOP-K SELECTION:
-//
-// 1. WaveTopkFilter
-//    - Uses ballot-based filtering to skip irrelevant candidates
-//    - Best for: Large datasets where len_per_wave > capacity × 4
-//    - Uses local data share for staging
-//    - Example: Finding top 100 from 1 million elements (most filtered out)
-//
-// 2. WaveTopkSort
-//    - Processes data in capacity-sized batches with bitonic sort
-//    - Best for: Moderate datasets where len_per_wave ≤ capacity × 4
-//    - Register-only, no local data share
-//    - Example: Finding top 100 from 10,000 elements
-//
-// 3. WaveTopkMerge
-//    - Merges pre-sorted k-sized chunks iteratively
-//    - Best for: Multi-block reduction (merging results from multiple blocks)
-//    - Used in second pass when first pass produces multiple results
-//    - Example: Combining top-100 results from 8 different blocks
-//
-// Selection logic:
-//   - Compute len_per_wave based on launch configuration
-//   - If len_per_wave ≤ capacity × 4: Use BlockTopkSort
-//   - If len_per_wave > capacity × 4: Use BlockTopkFilter
-//   - For multi-block reduction: Always use BlockTopkMerge
-//
+// Wave-level priority selection primitives (AMD/HIP optimized).
+// Three strategies for Top-K selection:
+//   1. WaveTopkFilter - ballot-based filtering, LDS staging; for large datasets
+//      (len_per_wave > capacity*4).
+//   2. WaveTopkSort   - capacity-sized bitonic-sort batches, register-only;
+//      for moderate datasets (len_per_wave <= capacity*4).
+//   3. WaveTopkMerge  - iteratively merges pre-sorted k-sized chunks; second-pass
+//      multi-block reduction.
+// Selection (by len_per_wave from launch config): <= capacity*4 -> BlockTopkSort,
+// > capacity*4 -> BlockTopkFilter, multi-block reduction -> BlockTopkMerge.
 
 template <int capacity, bool descending, typename T, typename IdxT>
 struct WaveTopkFilter;
@@ -1050,22 +979,10 @@ struct BlockTopkSort;
 template <int capacity, bool descending, typename T, typename IdxT>
 struct BlockTopkMerge;
 
-// ============================================================================
-// WAVE BUFFER (Stores priorities in ComputeType)
-// ============================================================================
-//
-// WaveBuffer manages per-wave register storage for priority candidates.
-// Key design:
-//   - DataT: The I/O type for loading/storing data
-//   - ComputeT: The internal type for priorities (float or int)
-//   - Priorities are stored as ComputeType for consistent computation
-//   - Conversion happens at I/O boundaries
-//
-// Template parameters:
-//   - capacity: Power-of-2 buffer capacity (>= wave size)
-//   - DataT: Data type for I/O (fp16, bf16, float, int)
-//   - IdxT: Index type (typically int32_t)
-// ============================================================================
+// WaveBuffer: per-wave register storage for priority candidates. Priorities
+// stored as ComputeT (float or int) for consistent compute; DataT conversion
+// happens at I/O boundaries. Params: capacity (power-of-2, >= wave size),
+// DataT (I/O type), IdxT (index type, typically int32_t).
 
 template <int capacity, typename DataT, typename IdxT>
 struct WaveBuffer
@@ -1403,11 +1320,8 @@ void calc_launch_parameter_for_merge(IdxT len, IdxT k, int* block_per_batch, int
     *num_wave         = (len - 1) / len_per_wave + 1;
 }
 
-// WaveTopkSort: Batches data and uses bitonic sort for streaming inputs
-//
-// Template parameters:
-//   - DataT: The data type for I/O (fp16, bf16, float, int)
-//   - Internal computation uses ComputeT = compute_t<DataT>
+// WaveTopkSort: Batches data and uses bitonic sort for streaming inputs.
+// DataT = I/O type; internal computation uses ComputeT = compute_t<DataT>.
 //
 // EXAMPLE: Finding Top-4 largest from [5, 2, 8, 1, 9, 3, 7, 4, 6, 10, 11, 12]
 //          (capacity=8, processes 8 elements at a time)
@@ -1630,11 +1544,8 @@ __global__ void __launch_bounds__(512, 2) topk_sort_kernel(const DataT* __restri
          end);
 }
 
-// WaveTopkFilter: Ballot-based filtering with dynamic batching (AMD-optimized)
-//
-// Template parameters:
-//   - DataT: The data type for I/O (fp16, bf16, float, int)
-//   - Internal computation uses ComputeT = compute_t<DataT>
+// WaveTopkFilter: Ballot-based filtering with dynamic batching (AMD-optimized).
+// DataT = I/O type; internal computation uses ComputeT = compute_t<DataT>.
 //
 // EXAMPLE: Finding Top-4 largest from [50, 10, 5, 80, 3, 90, 2, 95, 1, 70, ...]
 //
@@ -2036,11 +1947,8 @@ __global__ void __launch_bounds__(512, 2) topk_filter_kernel(const DataT* __rest
                                                   batch_size * len);
 }
 
-// WaveTopkMerge: Iteratively merges pre-sorted k-sized chunks
-//
-// Template parameters:
-//   - DataT: The data type for I/O (fp16, bf16, float, int)
-//   - Internal computation uses ComputeT = compute_t<DataT>
+// WaveTopkMerge: Iteratively merges pre-sorted k-sized chunks.
+// DataT = I/O type; internal computation uses ComputeT = compute_t<DataT>.
 //
 // EXAMPLE: Finding Top-4 largest from 3 pre-sorted chunks (k=4 each, capacity=64)
 //   Input chunks (each sorted ascending, result of previous WaveTopkSort):

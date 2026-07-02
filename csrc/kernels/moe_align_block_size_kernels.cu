@@ -65,10 +65,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
     }
     __syncthreads();
 
-    /**
-     * Pass 1: Count tokens per expert using atomic operations
-     * Each thread processes its shard and atomically increments expert counts
-     */
+    // Pass 1: each thread atomically counts tokens per expert over its shard
     for(int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i)
     {
         int32_t expert_id = topk_ids[i];
@@ -77,10 +74,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
 
     __syncthreads();
 
-    /**
-     * Pass 2: Compute cumsum and initialize write positions
-     * Thread 0 computes the prefix sum and initializes atomic write counters
-     */
+    // Pass 2: thread 0 computes the block-offset prefix sum and inits atomic write positions
     if(threadIdx.x == 0)
     {
         cumsum[0] = 0;
@@ -95,10 +89,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
 
     __syncthreads();
 
-    /**
-     * Pass 3: Write expert metadata
-     * Each thread handles one expert (if threadIdx.x < num_experts)
-     */
+    // Pass 3: one thread per expert writes expert_ids/token_nums metadata
     if(threadIdx.x < num_experts)
     {
         int32_t num_tokens = expert_token_counts[threadIdx.x];
@@ -112,10 +103,7 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
 
     __syncthreads();
 
-    /**
-     * Pass 4: Assign tokens to output positions
-     * Each thread processes its shard and uses atomic operations to get write positions
-     */
+    // Pass 4: each thread scatters its shard's tokens via atomic per-expert write positions
     for(int i = start_idx; i < numel && i < start_idx + tokens_per_thread; ++i)
     {
         int32_t expert_id = topk_ids[i];
