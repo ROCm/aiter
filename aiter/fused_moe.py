@@ -632,6 +632,15 @@ def fused_moe_(
     sort_m_indices = None
     sort_reverse_sorted = None
     if metadata.output_aux:
+        # The a4w4 FlyDSL port routes through the adaptive/aux sort, which does
+        # not thread expert_mask into moe_sorting below -- EP masking would be
+        # silently ignored and tokens routed to the wrong experts. Fail loudly
+        # until EP support is added to the port.
+        if expert_mask is not None:
+            raise NotImplementedError(
+                "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
+                "(expert_mask is dropped by the output_aux sort path)."
+            )
         _kn2 = metadata.stage2.keywords.get("kernelName2", "")
         _atomic = _parse_mxfp4_g2_kname(_kn2)["atomic"]
         (
