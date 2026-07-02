@@ -140,7 +140,6 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
                                         int model_sensitive)
 {
     using V           = vec_t<scalar_t, 8>;
-    using Vf          = vec_t<float, 8>;
     const bool t5     = model_sensitive != 0;
     const bool add    = residual_ != nullptr;
     const int nx      = opus::thread_id_x(); // 0..TN-1, thread within row
@@ -153,9 +152,10 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
 
-    // norm-input in fp32; fused-add writes round(x+res) to residual, keeps fp32
-    // sum (default) or rounded sum (T5) for the norm.
-    Vf ni[RN];
+    // norm-input in fp32 as a scalar array (not a vector type), so the compiler
+    // does not reorder the squared-sum. Fused-add writes round(x+res) to residual,
+    // keeps the fp32 sum (default) or rounded sum (T5) for the norm.
+    float ni[RN][8];
 #pragma unroll
     for(int q = 0; q < RN; ++q)
     {
