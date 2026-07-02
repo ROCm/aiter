@@ -59,8 +59,10 @@ static_assert(sizeof(FmhaFwdVarlenKernelArgs) == 0x58,
 
 // ---- helpers ---------------------------------------------------------------
 
-// Kernel selection: only (dtype, hdim_q, hdim_v, mask).  Only the _brd (border)
-// causal kernels are shipped, so mask is always 1.
+// Kernel selection: (dtype, hdim_q, hdim_v, mask).  mask = is_causal: the csv
+// registers both mask=0 (non-causal, _rxy[_sink]_pfnr source) and mask=1
+// (causal, _rxy[_sink]_pfnr_cas_brd source -> *_mask_varlen.co) variants, so
+// is_causal picks the matching .co at launch time.
 static std::string get_heuristic_kernel_fmha_fwd_bf16_varlen(const std::string& dtype,
                                                              int hdim_q,
                                                              int hdim_v,
