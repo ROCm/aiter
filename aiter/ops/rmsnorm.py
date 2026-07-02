@@ -15,24 +15,14 @@ MD_NAME = "module_rmsnorm"
 
 
 def get_rmsnorm_backend() -> str:
-    """Active rmsnorm backend: 'ck' (default) or 'opus'.
-
-    Switch with the AITER_RMSNORM_BACKEND env var. 'opus' uses the self-contained
-    opus module (module_rmsnorm_opus, ~1 torch-free TU) and avoids the ~225s cold
-    JIT build of the CK module_rmsnorm (aiter issue #4055). Read per-call so it can
-    be toggled at runtime.
-    """
+    """rmsnorm backend from AITER_RMSNORM_BACKEND: 'ck' (default) or 'opus' (#4055)."""
     return os.environ.get("AITER_RMSNORM_BACKEND", "ck").strip().lower()
 
 
 def _use_opus(
     input, use_model_sensitive_rmsnorm: int = 0, gemma_norm: bool = False
 ) -> bool:
-    """True when the opus backend can serve this call.
-
-    Opus covers the plain (non-quant, non model-sensitive, non-gemma) bf16/fp16
-    path for any hidden size; everything else falls back to CK / quant kernels.
-    """
+    """True when opus can serve this call (plain bf16/fp16, non-quant/T5/gemma)."""
     return (
         get_rmsnorm_backend() == "opus"
         and use_model_sensitive_rmsnorm == 0
@@ -147,8 +137,7 @@ def rmsnorm2d_fwd_with_add(
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
     if _use_opus(input, use_model_sensitive_rmsnorm, gemma_norm):
-        # opus fused kernel is in-place on (io, res); stage into the caller's
-        # out / residual_out so input / residual_in are left untouched.
+        # opus kernel is in-place; stage into out/residual_out, leave inputs intact
         out.copy_(input)
         residual_out.copy_(residual_in)
         _fused_add_rms_norm_opus(out, residual_out, weight, epsilon)

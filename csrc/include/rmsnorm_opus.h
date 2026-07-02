@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Self-contained OPUS RMSNorm module -- a drop-in for the plain (non-quant,
-// non model-sensitive) CK rmsnorm2d path. No CK header / blob-generate
-// dependency, and -- crucially for build time -- NO torch and NO pybind11 in
-// the C++ world (see .claude/skills/opus-kernel-best-practice §0/§1 and
-// opus-module-build-optimization §3/§4):
-//
-//   * The public ABI is plain `extern "C"` (ctypes), so the module is one
-//     torch-free TU; there is no ~4s pybind11 / ~21s torch-extension TU.
-//   * Tensors cross the boundary as the POD `aiter_tensor_t` (from
-//     aiter_tensor.h), never `torch::Tensor`.
-//   * Device kernels live in opus/rmsnorm_opus_kernel.hpp with a host/device
-//     pass split so opus.hpp is parsed once (device pass only).
-//
-// This header carries only the host-side launch helpers; the extern "C"
-// entrypoints are emitted in rmsnorm_opus_kernels.cu via aiter_ctypes_error.h.
+// OPUS RMSNorm host-side launch helpers for the plain (non-quant, non
+// model-sensitive) path. Torch-free / pybind-free: tensors cross as the POD
+// aiter_tensor_t; the extern "C" entrypoints live in rmsnorm_opus_kernels.cu.
 #pragma once
 #include "aiter_hip_common.h" // AITER_CHECK, HipDeviceGuard
 #include "aiter_tensor.h"     // aiter_tensor_t (torch-free POD)
@@ -27,8 +15,7 @@
 namespace aiter {
 namespace rmsnorm_opus {
 
-// Reference launch heuristic (matches csrc/kernels/rmsnorm_kernels.cu): fewer
-// threads when there are many rows to raise block occupancy / latency hiding.
+// Fewer threads when there are many rows (matches csrc/kernels/rmsnorm_kernels.cu).
 inline int pick_block(int rows, int hidden)
 {
     const int max_block = (rows < 256) ? 1024 : 256;

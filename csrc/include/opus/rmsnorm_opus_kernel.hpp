@@ -1,17 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// OPUS RMSNorm device kernels (self-contained, no CK dependency).
-//
-// Build-time notes (see .claude/skills/opus-kernel-best-practice):
-//   * Host/device pass split: the heavy opus.hpp template library is pulled in
-//     only on the device pass; the host pass sees the __global__ declarations
-//     plus an empty stub, so hipcc's frontend does not parse opus.hpp twice.
-//   * Kernel args travel as POD scalars/pointers so the signatures stay light on
-//     the host pass; scalar element types use the plain compiler builtins that
-//     match opus's dtype registration.
-//   * Two kernel templates x {bf16, fp16} x {width 8, width 1} is a handful of
-//     instantiations, replacing CK's 1360-TU / 4972-instantiation generate.
+// OPUS RMSNorm device kernels. Host/device pass split: opus.hpp is parsed only
+// on the device pass; the host pass sees declarations + empty stubs.
 #pragma once
 
 #ifdef __HIP_DEVICE_COMPILE__
@@ -21,8 +12,7 @@
 namespace aiter {
 namespace rmsnorm_opus {
 
-// Element storage types, aliased to match opus's REGISTER_DTYPE choices so the
-// explicit instantiations in the .cu name the same types on both passes.
+// Element types matching opus's REGISTER_DTYPE so both passes name the same type.
 #if defined(__clang_major__) && __clang_major__ >= 20
 using bf16_t = __bf16;
 using fp16_t = __fp16;
@@ -31,10 +21,7 @@ using bf16_t = unsigned short;
 using fp16_t = _Float16;
 #endif
 
-// -----------------------------------------------------------------------------
-// Kernel declarations -- visible on BOTH passes.
-// out[t, i] = scalar( f32(in[t,i]) * rsqrt(mean_i(in[t,:]^2) + eps) * f32(w[i]) )
-// -----------------------------------------------------------------------------
+// out[t,i] = scalar( f32(in[t,i]) * rsqrt(mean_i(in[t,:]^2) + eps) * f32(w[i]) )
 template <typename scalar_t, int width>
 __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out,
                                      const void* __restrict__ in,
@@ -54,7 +41,7 @@ __global__ void fused_add_rmsnorm2d_fwd_kernel(void* __restrict__ inout,
                                                int hidden);
 
 #if !defined(__HIP_DEVICE_COMPILE__)
-// ---- Host pass: empty stubs so the __device_stub__ symbols resolve ----
+// Host pass: empty stubs so the __device_stub__ symbols resolve.
 template <typename scalar_t, int width>
 __global__ void rmsnorm2d_fwd_kernel(void*, const void*, const void*, float, int, int)
 {
@@ -64,11 +51,8 @@ __global__ void fused_add_rmsnorm2d_fwd_kernel(void*, void*, const void*, float,
 {
 }
 #else
-// ---- Device pass: real implementation ----
-
-// f32 <-> element conversions. bf16_t/fp16_t are native compiler types on
-// ROCm 7.x (clang >= 20); the implicit conversions are exact widening (to f32)
-// and round-to-nearest-even (from f32), matching the CK / vLLM reference.
+// Device pass. bf16/fp16 are native types; implicit f32 conversions are exact
+// widening / round-to-nearest, matching the CK / vLLM reference.
 template <typename scalar_t>
 __device__ inline float to_f32(scalar_t x)
 { return static_cast<float>(x); }
