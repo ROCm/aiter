@@ -183,16 +183,10 @@ def fwd(
         max_seqlens_q_local = q.shape[1] if max_seqlen_q is None else max_seqlen_q
         max_seqlens_k_local = k.shape[1] if max_seqlen_k is None else max_seqlen_k
 
-    # Now determine if we should use decode or prefill kernel
-    # Decode kernel should be used for KV cache scenarios where:
-    # 1. k_new/v_new are provided - incremental KV cache update (primary KV cache indicator)
-    # 2. kv_batch_idx is provided - KV cache batch indexing (primary KV cache indicator)
-    # 3. seqused_k without seqused_q - indicates KV cache fill levels (not varlen masking)
-    # Note: In varlen, both seqused_q and seqused_k are used for sequence masking
-    #       In KV cache, only seqused_k is used to track cache fill levels
-    # Detect KV cache scenarios:
-    # - Clear KV cache indicators (k_new, v_new, kv_batch_idx)
-    # - OR seqused_k without seqused_q (KV cache fill tracking, not varlen masking)
+    # Use decode kernel for KV cache scenarios: k_new/v_new (incremental update),
+    # kv_batch_idx (cache batch indexing), or seqused_k without seqused_q (cache fill
+    # levels). Varlen uses both seqused_q and seqused_k for masking, so that pairing
+    # stays on prefill.
     use_decode = (
         k_new is not None  # Have new KV to append (KV cache indicator)
         or v_new is not None  # Have new KV to append (KV cache indicator)
@@ -395,9 +389,8 @@ def fwd(
         softmax_lse.shape == expected_lse_shape
     ), f"[fwd_v3] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
 
-    # Return format compatible with v3
-    # V3 returns (out, softmax_lse, out_accum, softmax_lse_accum)
-    # out_accum and softmax_lse_accum are None for Triton AMD (no split-k accumulation)
+    # V3 returns (out, softmax_lse, out_accum, softmax_lse_accum); the accum tensors
+    # are None for Triton AMD (no split-k accumulation).
     return out, softmax_lse, None, None
 
 

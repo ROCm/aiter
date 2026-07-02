@@ -73,12 +73,10 @@ def streaming_topk(
     offs_x_n = loop_iterations * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_x_n[None, :] < n_expts_tot
 
-    # First iteration (peeled, may have masked lanes). For SCORE_MODE="softmax"
-    # (legacy), keep the exact original sequence (load with -inf placeholder,
-    # no transform). For SCORE_MODE="sqrtsoftplus", load with 0 placeholder,
-    # apply transform + optional bias, then explicitly mask invalid lanes to
-    # -inf — because the transform of -inf is NOT -inf (sqrt(softplus(-inf))
-    # = 0) and would incorrectly win topk against small valid scores.
+    # First iteration (peeled, may have masked lanes). "softmax" (legacy):
+    # load with -inf placeholder, no transform. "sqrtsoftplus": load with 0,
+    # apply transform + optional bias, then mask invalid lanes to -inf — the
+    # transform of -inf is 0 (not -inf) and would wrongly win topk otherwise.
     X_ptrs = X + offs_m[:, None] * stride_xm + offs_x_n[None, :]
     if SCORE_MODE == "softmax":
         x = tl.load(X_ptrs, mask=(mask_m & mask_n), other=float("-inf"))
@@ -112,12 +110,10 @@ def streaming_topk(
         x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
         acc = tl.maximum(acc, tl.topk(x, N_EXPTS_ACT_PAD, dim=1))
 
-    # Pre-existing bug fix: after the streaming merge loop, acc is not
-    # guaranteed to be sorted by value (tl.maximum of an ASC and the new
-    # tl.topk output is bitonic, not sorted). The mask `arange < K` only
-    # works if acc is already sorted descending by value with the top-K at
-    # positions 0..K-1. For K_PAD > K (e.g. K=6 with K_PAD=8), this drops
-    # arbitrary entries, including real top-K entries. Fix: sort by value
+    # Pre-existing bug fix: after the merge loop acc is bitonic, not sorted
+    # (tl.maximum of an ASC seq and tl.topk output). The `arange < K` mask
+    # needs acc sorted descending with top-K at 0..K-1; for K_PAD > K (e.g.
+    # K=6, K_PAD=8) it drops arbitrary/real top-K entries. Fix: sort by value
     # ascending first, then mask the smallest (K_PAD - K) positions.
     if N_EXPTS_ACT != N_EXPTS_ACT_PAD:
         acc = tl.sort(acc, dim=1)
@@ -176,9 +172,8 @@ def _topk(
     WRITE_POP: tl.constexpr = False,  # atomic-accumulate popularity here
 ):
     # Backward-compat sanity. APPLY_SOFTMAX = post-selection softmax over the
-    # K selected logits (legacy behavior). It only makes sense when no
-    # pre-transform is applied; for SCORE_MODE="sqrtsoftplus" the caller is
-    # expected to use APPLY_RENORM + ROUTED_SCALING instead.
+    # K selected logits (legacy); valid only with no pre-transform. For
+    # SCORE_MODE="sqrtsoftplus" use APPLY_RENORM + ROUTED_SCALING instead.
     tl.static_assert(
         (not APPLY_SOFTMAX) or (SCORE_MODE == "softmax"),
         "APPLY_SOFTMAX is only valid when SCORE_MODE='softmax'",
@@ -221,19 +216,17 @@ def _topk(
         HAS_BIAS=HAS_BIAS,
     )
 
-    # Real-entry mask: padded (sentinel) entries are flagged by
-    # y_indices == N_EXPTS_PAD inside streaming_topk and have y_values = -inf.
-    # Post-selection ops (bias-subtract, renorm, scaling) must operate on
-    # real entries only — otherwise -inf poisons the renorm sum, and the
-    # sentinel y_indices (== N_EXPTS_PAD) would OOB the Bias array.
+    # Real-entry mask: sentinel entries have y_indices == N_EXPTS_PAD and
+    # y_values = -inf. Post-selection ops (bias-subtract, renorm, scaling)
+    # must skip them — else -inf poisons the renorm sum and the sentinel
+    # index OOBs the Bias array.
     real_mask = (
         y_indices != N_EXPTS_PAD if N_EXPTS_ACT != N_EXPTS_ACT_PAD else (y_indices >= 0)
     )
 
-    # For SCORE_MODE="sqrtsoftplus" with HAS_BIAS, the y_values returned by
-    # streaming_topk are biased scores (sqrt(softplus(x)) + bias) — used for
-    # selection. We want the unbiased sqrt(softplus(x)) values as the gathered
-    # weights (the "noaux_tc" pattern from V4). Subtract bias[y_indices].
+    # For sqrtsoftplus + HAS_BIAS, streaming_topk returns biased scores
+    # (sqrt(softplus(x)) + bias) used for selection; gather unbiased weights
+    # by subtracting bias[y_indices] (V4 "noaux_tc" pattern).
     if SCORE_MODE == "sqrtsoftplus" and HAS_BIAS:
         safe_idx = tl.where(real_mask, y_indices, 0).to(tl.int32)
         b_at_idx = tl.load(Bias + safe_idx)

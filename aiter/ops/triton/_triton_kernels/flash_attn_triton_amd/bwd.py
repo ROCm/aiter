@@ -1334,20 +1334,12 @@ def _bwd_kernel_fused_atomic_causal(
     dk = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
 
-    # Figure out causal starting block since we have seqlen_q >=< seqlen_k.
-    # Unlike forward pass where we tile on M dim and iterate on N dim, so that
-    # we can skip some M blocks, in backward pass, we tile on the N dim for kv
-    # and iterate over the M. In this way, we cannot skip N blocks, but only to
-    # determine the starting M blocks to skip some initial blocks masked by
-    # causal.
+    # Backward tiles on N (kv) and iterates M, so we cannot skip N blocks; we
+    # only choose the starting M block to skip causal-masked initial blocks.
     delta_qk = seqlen_q - seqlen_k
 
-    # q > k: diretcly skip all the way until the start of causal block
-
-    # q < k: some blocks will have no Masked block, other needs to re-calc
-    # starting position
-    # delta_qk is negative so flip it, only multiple of BLOCK_N can skip the
-    # masked op
+    # q > k: skip directly to the start of the causal block.
+    # q < k: delta_qk is negative; only a multiple of BLOCK_N can skip the masked op.
     num_blocks_skip = -delta_qk // BLOCK_N
     delta_aligned = (num_blocks_skip + 1) * BLOCK_N + delta_qk
     start_delta_q_lt_k = delta_aligned // BLOCK_M * BLOCK_M
@@ -1652,20 +1644,12 @@ def _bwd_kernel_split_dkdv_causal(
     dk = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
 
-    # Figure out causal starting block since we have seqlen_q >=< seqlen_k.
-    # Unlike forward pass where we tile on M dim and iterate on N dim, so that
-    # we can skip some M blocks, in backward pass, we tile on the N dim for kv
-    # and iterate over the M. In this way, we cannot skip N blocks, but only to
-    # determine the starting M blocks to skip some initial blocks masked by
-    # causal.
+    # Backward tiles on N (kv) and iterates M, so we cannot skip N blocks; we
+    # only choose the starting M block to skip causal-masked initial blocks.
     delta_qk = seqlen_q - seqlen_k
 
-    # q > k: diretcly skip all the way until the start of causal block
-
-    # q < k: some blocks will have no Masked block, other needs to re-calc
-    # starting position
-    # delta_qk is negative so flip it, only multiple of BLOCK_N can skip the
-    # masked op
+    # q > k: skip directly to the start of the causal block.
+    # q < k: delta_qk is negative; only a multiple of BLOCK_N can skip the masked op.
     num_blocks_skip = -delta_qk // BLOCK_N
     delta_aligned = (num_blocks_skip + 1) * BLOCK_N + delta_qk
     start_delta_q_lt_k = delta_aligned // BLOCK_M * BLOCK_M
@@ -1948,14 +1932,8 @@ def _bwd_kernel_split_dq_causal(
         seqlen_q = q_end - q_start
         seqlen_k = k_end - k_start
 
-    # Figure out causal starting block since we have seqlen_q <=> seqlen_k.
-    # Unlike forward pass where we tile on M dim and iterate on N dim, so that
-    # we can skip some M blocks, in backward pass, we tile on the N dim for kv
-    # and iterate over the M. In this way, we cannot skip N blocks, but only to
-    # determine the starting M blocks to skip some initial blocks masked by
-    # causal.
-    # DQ tiles on M dim and iterate on N dim, so we there could be some tiles we
-    # can simply skip and we need to adjust starting position.
+    # DKdV tiles on N and iterates M; DQ tiles on M and iterates N, so some
+    # DQ tiles can be skipped by adjusting the starting position.
     start_m = seq_q_blk_idx * BLOCK_M
     # seqlen_q > seqlen_k, no need to process these tile for dq
     delta_qk = seqlen_q - seqlen_k
@@ -2044,10 +2022,9 @@ def _bwd_kernel_split_dq_causal(
 
         dq = tl.zeros([BLOCK_M, BLOCK_D_MODEL_POW2], dtype=tl.float32)
         # Compute dQ for masked (diagonal) blocks.
-        # NOTE: This code scans each row of QK^T backward (from right to left,
-        # but inside each call to _bwd_dq_inner, from left to right), but that's
-        # not due to anything important.  I just wanted to reuse the loop
-        # structure for dK & dV above as much as possible.
+        # NOTE: scans QK^T rows right-to-left (left-to-right within each
+        # _bwd_dq_inner call) only to reuse the dK/dV loop structure; ordering
+        # is not significant.
         dq = _bwd_dq_inner_split(
             dq,
             q,
@@ -3428,12 +3405,9 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
         dk = tl.zeros([BLOCK_N1, HEAD_DIM_QK], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N1, HEAD_DIM_V], dtype=tl.float32)
 
-        # q > k: diretcly skip all the way until the start of causal block
+        # q > k: skip directly to the start of the causal block.
         start_delta_q_gt_k = delta_qk
-        # q < k: some blocks will have no Masked block, other needs to re-calc
-        # starting position
-        # delta_qk is negative so flip it, only multiple of BLOCK_N can skip the
-        # masked op
+        # q < k: delta_qk is negative; only a multiple of BLOCK_N can skip the masked op.
         num_blocks_skip = -delta_qk // BLOCK_N1
         delta_aligned = (num_blocks_skip + 1) * BLOCK_N1 + delta_qk
         start_delta_q_lt_k = delta_aligned // BLOCK_M1 * BLOCK_M1
@@ -4633,21 +4607,16 @@ def attention_backward_triton_impl(
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )
 
-    # "Active" iff either edge differs from the -1 "off" sentinel. This mirrors
-    # the forward kernels (fwd_prefill.py / fwd_decode.py both test `!= -1`); the
-    # interface guards removed in this change used `>= 0`, which is equivalent for
-    # every valid input (-1 is the only negative either edge ever takes).
+    # Active iff either edge differs from the -1 "off" sentinel (mirrors the
+    # forward kernels' `!= -1` test; -1 is the only negative value either edge takes).
     use_sliding_window = window_size_left != -1 or window_size_right != -1
     if use_sliding_window and mode != "fused":
         raise NotImplementedError(
             "Sliding-window backward is currently implemented for fused mode only."
         )
-    # The kernels only special-case an infinite *left* edge (WINDOW_SIZE_LEFT < 0).
-    # There is no infinite-right code path, so a negative right bound would collapse
-    # right_bound to (anchor - 1) and silently mask out almost everything. When the
-    # window is active, window_size_right must therefore be >= 0. (window_size_right
-    # == -1 is only valid as the "off" sentinel, i.e. together with
-    # window_size_left == -1, which leaves use_sliding_window False.)
+    # Only an infinite *left* edge (WINDOW_SIZE_LEFT < 0) is special-cased; there
+    # is no infinite-right path, so an active window requires window_size_right >= 0
+    # (a negative right bound would silently mask out almost everything).
     if use_sliding_window and window_size_right < 0:
         raise NotImplementedError(
             "Sliding-window backward requires window_size_right >= 0 "

@@ -42,29 +42,22 @@ def batched_gemm_a16wfp4_fake_tensor(
     if y is None:
         Bx, M, _ = x.shape
         _, N, _ = w.shape
-        # Match the real kernel's allocation (lines 100-103 of this file).
-        # Returning ``(Bx, M, N)`` regardless of ``transpose_bm`` causes
-        # ``torch.compile`` to specialize the leading SymInt of the BMM
-        # output to ``Bx`` whenever a downstream op constrains it (e.g. a
-        # ``torch.cat`` on ``dim=-1`` with a tensor of shape ``(M, Bx, K)``),
-        # silently baking the wrong static slice into the captured graph.
+        # Must match the real kernel's allocation: returning (Bx, M, N)
+        # regardless of transpose_bm lets torch.compile specialize the output's
+        # leading SymInt wrongly when a downstream op constrains it, baking a
+        # bad static slice into the graph.
         if transpose_bm:
             return torch.empty((M, Bx, N), dtype=dtype, device=x.device)
         return torch.empty((Bx, M, N), dtype=dtype, device=x.device)
     return y
 
 
-# Explicit ``mutates_args=["y"]`` rather than the ``torch_compile_guard``
-# default ("unknown"). Without this, ``torch.library.infer_schema`` marks
-# every Tensor argument as in-place mutated (``Tensor(aN!)`` for
-# ``x`` / ``w`` / ``w_scales`` / ``y_scale``), which is wrong: the kernel
-# only writes to ``y``. The spurious markers cause downstream
-# ``torch.compile`` consumers to emit ``auto_functionalized()`` writeback
-# chains on the read-only inputs, which break FX pattern matchers (e.g.
-# vLLM's MLA decode q-prep fusion) and inflate cudagraph capture peak
-# memory. Do not remove this argument without re-auditing the kernel's
-# tl.store sites and re-checking the post-grad FX graph of any compiled
-# downstream consumer.
+# Explicit mutates_args=["y"] (not the default "unknown"): the kernel only
+# writes y, but infer_schema would otherwise mark every Tensor arg in-place
+# mutated, making torch.compile emit auto_functionalized() writeback chains on
+# read-only inputs that break FX pattern matchers (e.g. vLLM MLA decode q-prep
+# fusion) and inflate cudagraph capture memory. Do not remove without
+# re-auditing the kernel's tl.store sites and downstream FX graphs.
 @torch_compile_guard(mutates_args=["y"], gen_fake=batched_gemm_a16wfp4_fake_tensor)
 def batched_gemm_a16wfp4_(
     x: torch.Tensor,

@@ -149,22 +149,15 @@ def _attn_fwd_inner(
         if PRELOAD_V:
             v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
 
-        # We start from end of seqlen_k so only the first iteration would need
-        # to be checked for padding if it is not a multiple of block_n
+        # We start from end of seqlen_k, so only the first iteration needs a
+        # padding check when seqlen_k is not a multiple of block_n.
         # TODO: This can be optimized to only be true for the padded block.
         mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
         if MASK_STEPS:
-            # If this is the last block / iteration, we want to
-            # mask if the sequence length is not a multiple of block size
-            # a solution is to always do BLOCK_M // BLOCK_N + 1 steps if not is_modulo_mn.
-            # last step might get wasted but that is okay. check if this masking works For
-            # that case.
-
-            # remove the old if condition
+            # Mask the last block when seqlen_k is not a multiple of BLOCK_N.
+            # Computing mask_partial unconditionally (vs the old if) removes the
+            # if-else from the causal loop, helping scheduling and register pressure.
             # if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
-            # Though this will unconditionally compute mask_partial at runtime,
-            # the causal for loop does not have the if-else block any more, which
-            # helps instruction scheduling and register pressure.
             bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
             size_n = start_n + OFFS_N[None, :]
             mask_partial = size_n < seqlen_k
@@ -384,15 +377,10 @@ def _attn_fwd(
     if HAS_PE:
         offs_pe = BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL_PE)
 
-    # NOTE:
-    # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
-    # computation is done in 32 bit and overflows resulting in segfaults
-    # If input strides are defined as int64, it disables vectorized loads which drops perf
-    # If we define new strides as stride_x = stride_x_in.to(tl.int64), that does not work
-    # because strides are tl.constexpr and cannot be upcasted
-    # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
-    # The permanent solution is to enable upcasting of tl.constexpr
-    # In the meantime, the following workaround provides correctness and does not drop perf
+    # NOTE: Workaround for int64 strides. 32-bit offset computation overflows and
+    # segfaults; declaring input strides as int64 disables vectorized loads (perf loss),
+    # and constexpr strides cannot be upcast. So cast to int64 only when USE_INT64_STRIDES.
+    # Permanent fix is to enable upcasting of tl.constexpr.
     if USE_INT64_STRIDES:
         stride_qz = tl.cast(stride_qz_in, tl.int64)
         stride_qh = tl.cast(stride_qh_in, tl.int64)
@@ -509,29 +497,20 @@ def _attn_fwd(
 
     n_blocks = _cdiv_fn(seqlen_k, BLOCK_N)
 
-    # Now we compute whether we need to exit early due to causal masking.
-    # This is because for seqlen_q > seqlen_k, M rows of the attn scores
-    # are completely masked, resulting in 0s written to the output, and
-    # inf written to LSE. We don't need to do any GEMMs in this case.
-    # This block of code determines what N is, and if this WG is operating
-    # on those M rows.
+    # Early-exit for causal: when seqlen_q > seqlen_k, some M rows are fully
+    # masked (0 written to output, inf to LSE) and need no GEMMs. Determine N and
+    # whether this WG covers those rows.
     if IS_CAUSAL:
-        # If seqlen_q == seqlen_k, the attn scores are a square matrix.
-        # If seqlen_q != seqlen_k, attn scores are rectangular which means
-        # the causal mask boundary is bottom right aligned, and ends at either
-        # the top edge (seqlen_q < seqlen_k) or left edge.
-
-        # This captures the decrease in n_blocks if we have a rectangular attn matrix
+        # Causal boundary is bottom-right aligned; for rectangular scores this
+        # reduces n_blocks for this WG.
         n_blocks_seqlen = _cdiv_fn(
             (start_m + 1) * BLOCK_M + seqlen_k - seqlen_q, BLOCK_N
         )
 
-        # This is what adjusts the block_max for the current WG, only
-        # if IS_CAUSAL. Otherwise we want to always iterate through all n_blocks
+        # Adjust block_max (only when causal; else iterate all n_blocks).
         n_blocks = min(n_blocks, n_blocks_seqlen)
 
-        # If we have no blocks after adjusting for seqlen deltas, this WG is part of
-        # the blocks that are all 0. We exit early.
+        # No blocks left => this WG's rows are all 0, exit early.
         if n_blocks <= 0:
             offs_out = (
                 off_z * stride_oz
@@ -565,11 +544,9 @@ def _attn_fwd(
         off_k_head = off_q_head
 
     # q,k,v offsets
-    # When the caller guarantees that the head-axis strides of Q/K/V are
-    # multiples of 8 elements (set via HEAD_STRIDE_ALIGNED_8), the head-axis
-    # byte offset is 16-byte aligned. Auto-specialization only fires at the
-    # 16-element threshold, so hint the smaller multiple explicitly to let
-    # AxisInfo widen the global load.
+    # When HEAD_STRIDE_ALIGNED_8 guarantees head-axis strides are multiples of 8
+    # elements (16-byte aligned), hint that multiple explicitly so AxisInfo can
+    # widen the global load (auto-specialization only fires at the 16-element threshold).
     qh_off = off_q_head * stride_qh
     kh_off = off_k_head * stride_kh
     vh_off = off_k_head * stride_vh
@@ -703,8 +680,7 @@ def _attn_fwd(
     elif seqlen_k % BLOCK_N:
         n_extra_tokens = seqlen_k % BLOCK_N
 
-    # if CAUSAL, then determine masked_blocks and full blocks
-    # Here we compute how many full and masked blocks we have.
+    # Compute how many full and masked blocks we have.
     padded_block_k = n_extra_tokens != 0
     is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
     skipped_blocks = 0

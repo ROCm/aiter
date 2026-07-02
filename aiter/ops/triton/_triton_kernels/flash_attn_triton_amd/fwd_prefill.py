@@ -392,7 +392,7 @@ def _attn_fwd_inner(
         if APPLY_MASK:
             if USE_SLIDING_WINDOW:
                 if IS_CAUSAL:
-                    # ========== CAUSAL SLIDING WINDOW MASKING ==========
+                    # causal sliding window masking
                     row_idx = offs_m
                     col_idx = kv_offs_n
                     row_idx_expanded = row_idx[:, None]
@@ -417,7 +417,7 @@ def _attn_fwd_inner(
                     mask = causal_mask | window_mask
                     qk_scaled = tl.where(mask, float("-inf"), qk_scaled)
                 else:
-                    # ========== NON-CAUSAL SLIDING WINDOW MASKING ==========
+                    # non-causal sliding window masking
                     row_idx = offs_m
                     col_idx = kv_offs_n
                     sk = seqlen_k
@@ -806,7 +806,7 @@ def compute_block_masking(
         )
     else:
         if IS_CAUSAL:
-            # ========== CAUSAL MODE: Classify K Blocks ==========
+            # causal mode: classify K blocks
             # Calculate causal boundary for this Q block
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
             # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  <- Q0
@@ -820,10 +820,7 @@ def compute_block_masking(
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  <- Q6
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  <- Q7
 
-            # ------------------------------------------------------------
-            # 1. figure out, in tokens, the right-most K position
-            #    this Q-block may attend to
-            # ------------------------------------------------------------
+            # 1. right-most K position (in tokens) this Q-block may attend to
             k_max_token = q_end + diag  # last visible K index
 
             # this Q-block is entirely above the diagonal => nothing to do
@@ -832,21 +829,13 @@ def compute_block_masking(
 
             k_max_token = tl.minimum(k_max_token, seqlen_k - 1)
 
-            # ------------------------------------------------------------
             # 2. translate token indices into K-block indices
-            # ------------------------------------------------------------
             last_visible_k_block = k_max_token // BLOCK_N
             n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
 
-            # ------------------------------------------------------------
-            # 3. classify those visible blocks
-            #    - we *never* skip or mask blocks in front, because causal
-            #      attention always starts at K0
-            #    - the back side can require several masked blocks:
-            #         o intersection of the causal diagonal with K-grid
-            #           (at most  ?BLOCK_M / BLOCK_N? blocks)
-            #         o plus one for partial K blocks at the causal boundary
-            # ------------------------------------------------------------
+            # 3. classify visible blocks: causal never skips/masks the front
+            #    (always starts at K0); back side needs up to BLOCK_M/BLOCK_N
+            #    masked blocks (causal diagonal) + 1 for the partial K block.
             n_back_masked_blocks = BLOCK_M // BLOCK_N + 1
             n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
 
@@ -854,9 +843,8 @@ def compute_block_masking(
             n_front_masked_blocks = 0  # ditto
             n_full_blocks = n_visible_k_blocks - n_back_masked_blocks
         else:
-            # ========== NON-CAUSAL MODE ==========
-            # Without causal mask, all positions can attend to all positions
-            # Only need to handle the padding in the last block
+            # non-causal mode: all positions attend to all; only the last
+            # block's padding needs masking
             #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9  ??  ??]
             # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
             #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -inf -inf]
@@ -1076,9 +1064,7 @@ def attn_fwd(
         BLOCK_N,
     )
 
-    # ============================================================
-    #          PROGRAM EARLY EXIT (All K Blocks Skipped)
-    # ============================================================
+    # program early exit (all K blocks skipped)
     total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
     if total_visible_blocks == 0:
         """
@@ -1112,26 +1098,18 @@ def attn_fwd(
         tl.store(l_ptrs, tl.zeros([BLOCK_M], dtype=tl.float32), mask=offs_m < seqlen_q)
         return
 
-    # ============================================================
-    #         NORMAL PROCESSING (Some K Blocks Visible)
-    # ============================================================
+    # normal processing (some K blocks visible)
     """
     This program has visible K blocks to process.
     We'll use two calls to handle different block types efficiently.
     """
 
-    # Initialize for processing
     # Compute pointers for all the tensors used in this kernel.
-    # When the caller guarantees that the head-axis strides of Q/K/V are
-    # multiples of 8 elements (set via HEAD_STRIDE_ALIGNED_8), the head-axis
-    # offset is a multiple of 8 *elements*. The resulting byte alignment is
-    # element-size dependent: 16 bytes for 16-bit types (fp16/bf16), 8 bytes
-    # for fp8, 32 bytes for fp32. The 16-byte case is the one that lets
-    # AxisInfo widen the K/V global load to a 128-bit (buffer_load_b128)
-    # access; for the other dtypes the hint is still sound but yields a
-    # different (smaller or larger) vector width. Auto-specialization only
-    # fires at the 16-element threshold, so hint the smaller multiple
-    # explicitly.
+    # When HEAD_STRIDE_ALIGNED_8 is set the head-axis offset is a multiple of 8
+    # elements; the resulting byte alignment is dtype-dependent (16B for fp16/bf16,
+    # 8B for fp8, 32B for fp32). Only the 16-byte case lets AxisInfo widen the K/V
+    # load to 128-bit (buffer_load_b128). Auto-specialization fires only at the
+    # 16-element threshold, so hint the smaller multiple explicitly.
     qh_off = off_h_q * stride_qh
     kh_off = off_h_k * stride_kh
     vh_off = off_h_k * stride_vh
@@ -1175,7 +1153,7 @@ def attn_fwd(
         q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :] < ACTUAL_BLOCK_DMODEL_QK)
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0.0)
 
-    # ========== Process MASKED K Blocks in the front ==========
+    # Process MASKED K blocks in the front
     # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
     if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
         block_min = n_front_skip_blocks * BLOCK_N
@@ -1241,7 +1219,7 @@ def attn_fwd(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
         )
 
-    # ========== Process FULL K Blocks (Fast Path) ==========
+    # Process FULL K blocks (fast path)
     if n_full_blocks > 0:
         block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
         block_max = (
@@ -1308,7 +1286,7 @@ def attn_fwd(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
         )
 
-    # ========== Process MASKED K Blocks in the back ==========
+    # Process MASKED K blocks in the back
     if n_back_masked_blocks > 0:
         block_min = (
             n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
@@ -1380,9 +1358,7 @@ def attn_fwd(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
         )
 
-    # ============================================================
-    #                        EPILOGUE
-    # ============================================================
+    # epilogue
     # Handle invalid rows: rows with no valid keys to attend to.
     # This occurs with sliding window or causal attention (when seqlen_q > seqlen_k).
     # For invalid rows: m_i = -inf, l_i = 0, acc = 0.
@@ -1767,13 +1743,11 @@ def attention_forward_prefill_triton_impl(
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
     # The kernel only special-cases an infinite *left* edge (WINDOW_SIZE_LEFT < 0).
-    # WINDOW_SIZE_RIGHT is consumed as a literal finite offset everywhere (the
-    # per-element right_bound and the block-classification bounds), so a negative
-    # right does not mean "unbounded" -- it collapses right_bound to (anchor - 1)
-    # and silently over-masks. Reject it rather than return a wrong result.
-    # (window_size_right == -1 is only valid as the "off" sentinel, i.e. together
-    # with window_size_left == -1, which leaves use_sliding_window False.) This
-    # matches the backward guard in attention_backward_triton_impl.
+    # WINDOW_SIZE_RIGHT is always a literal finite offset, so a negative right does
+    # not mean "unbounded" -- it collapses right_bound to (anchor - 1) and silently
+    # over-masks. Reject it. (right == -1 is only valid as the "off" sentinel,
+    # together with left == -1.) Matches the backward guard in
+    # attention_backward_triton_impl.
     if use_sliding_window and window_size_right < 0:
         raise NotImplementedError(
             "Sliding-window attention requires window_size_right >= 0 "
@@ -1841,11 +1815,10 @@ def attention_forward_prefill_triton_impl(
 
     num_xcd = 1 if arch.is_rdna else 8
 
-    # Soundness precondition for the `tl.multiple_of` head-stride hint inside
-    # `attn_fwd`: only enable it when every Q/K/V head-axis stride is a
-    # multiple of 8 elements. With a non-contiguous input (e.g. a transposed
-    # view) stride_*h need not equal head_dim, so the head_dim constexpr
-    # alone is not enough.
+    # Soundness precondition for the `tl.multiple_of` head-stride hint in attn_fwd:
+    # only enable when every Q/K/V head-axis stride is a multiple of 8 elements.
+    # A non-contiguous input (e.g. transposed view) can have stride_*h != head_dim,
+    # so the head_dim constexpr alone is not enough.
     head_stride_aligned_8 = (
         stride_qh % 8 == 0 and stride_kh % 8 == 0 and stride_vh % 8 == 0
     )

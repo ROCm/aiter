@@ -60,8 +60,7 @@ def compute_block_masking(
     n_extra_tokens = compute_padding_info(seqlen_k, BLOCK_N)
 
     if IS_CAUSAL:
-        # ========== CAUSAL MODE: Classify K Blocks ==========
-        # Calculate causal boundary for this Q block
+        # Causal mode: classify K blocks (causal boundary per Q block)
         #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
         # Q0-Q3:   [ 1  0  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q0
         #          [ 1  1  0  0] [ 0  0  0  0] [ 0  0 -- --]  ← Q1
@@ -74,10 +73,7 @@ def compute_block_masking(
         #          [ 1  1  1  1] [ 1  1  1  1] [ 1  0 -- --]  ← Q6
         #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -- --]  ← Q7
 
-        # ------------------------------------------------------------
-        # 1. figure out, in tokens, the right-most K position
-        #    this Q-block may attend to
-        # ------------------------------------------------------------
+        # 1. right-most K position (in tokens) this Q-block may attend to
         k_max_token = q_end + diag  # last visible K index
 
         # this Q-block is entirely above the diagonal ⇒ nothing to do
@@ -86,22 +82,14 @@ def compute_block_masking(
 
         k_max_token = tl.minimum(k_max_token, seqlen_k - 1)
 
-        # ------------------------------------------------------------
         # 2. translate token indices into K-block indices
-        # ------------------------------------------------------------
         last_visible_k_block = k_max_token // BLOCK_N
         n_visible_k_blocks = tl.minimum(last_visible_k_block + 1, total_k_blocks)
 
-        # ------------------------------------------------------------
-        # 3. classify those visible blocks
-        #    – we *never* skip or mask blocks in front, because causal
-        #      attention always starts at K0
-        #    – the back side can require several masked blocks:
-        #         • intersection of the causal diagonal with K-grid
-        #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
-        #         • plus one extra block if this Q-block stops in the
-        #           middle of a K-block or the last K-block is padded
-        # ------------------------------------------------------------
+        # 3. classify visible blocks. Causal never skips/masks the front (starts at
+        #    K0). Back side may need several masked blocks: the causal diagonal
+        #    intersection with K-grid (at most ⌈BLOCK_M/BLOCK_N⌉) plus one extra if
+        #    this Q-block stops mid-K-block or the last K-block is padded.
         padded_last_k = n_extra_tokens != 0
         is_modulo_mn = (not padded_last_k) & (seqlen_q % BLOCK_M == 0)
 
@@ -112,9 +100,7 @@ def compute_block_masking(
         n_front_masked_blocks = 0  # ditto
         n_full_blocks = n_visible_k_blocks - n_back_masked_blocks
     else:
-        # ========== NON-CAUSAL MODE ==========
-        # Without causal mask, all positions can attend to all positions
-        # Only need to handle the padding in the last block
+        # Non-causal mode: all positions attend to all; only last-block padding needs a mask.
         #          [K0 K1 K2 K3] [K4 K5 K6 K7] [K8 K9 ?? ??]
         # Q0-Q3:   [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
         #          [ 1  1  1  1] [ 1  1  1  1] [ 1  1 -∞ -∞]
@@ -684,9 +670,7 @@ def sage_fwd_mxfp4(
         n_front_skip, n_front_masked, n_full, n_back_masked, n_extra = mask_info
         has_any_range = True
 
-    # ============================================================
-    #          PROGRAM EARLY EXIT (All K Blocks Skipped)
-    # ============================================================
+    # Program early exit: all K blocks skipped
     if not USE_BLOCK_SPARSE:
         total_visible_blocks = n_front_masked + n_full + n_back_masked
     # Early exit: no K blocks to process

@@ -7,11 +7,10 @@ import triton.language as tl
 from .quant import _mxfp8_quant_op
 
 # Fused RMSNorm + MXFP8 (1x32 e8m0) quant. Replaces the separate
-# rmsnorm_quant(fp8 fnuz + fp32 1x128) + transcode-to-MXFP8 sequence used
-# upstream of MXFP8-aware GEMMs (e.g. V4 q_norm -> wq_b).
-#
-# One program per row. Holds the full row in registers, so K is constrained
-# by the BLOCK_SIZE_K constexpr (must be a power of two >= K).
+# rmsnorm_quant(fp8 fnuz + fp32 1x128) + transcode-to-MXFP8 sequence upstream
+# of MXFP8-aware GEMMs (e.g. V4 q_norm -> wq_b).
+# One program per row; full row held in registers, so K <= BLOCK_SIZE_K
+# constexpr (power of two >= K).
 #
 # In:  x (M, K) bf16 or fp16
 #      g (K,)  bf16 or fp16 weight
@@ -88,13 +87,10 @@ def _fused_rms_mxfp8_kernel(
 
 
 # Dual fused RMSNorm: Q-side (MXFP8 quant + e8m0 scale emit) + K-side (bf16 out).
-# Replaces the CK `fused_qk_rmsnorm_group_quant` semantics in one Triton launch
-# for the MXFP8 GEMM path (Task #77). The two halves are independent (different
-# weight, different K dim) so they're packed into one program per row to amortize
-# launch overhead: same kernel launch loads both rows, normalizes both, stores Q
-# fp8 + scale, stores K bf16. Each row's Q and K are independently RMSNorm'd
-# (separate weights, separate eps, separate K dim) -- this kernel does NOT fuse
-# their normalization arithmetic, only their launch.
+# Replaces CK `fused_qk_rmsnorm_group_quant` in one Triton launch for the MXFP8
+# GEMM path (Task #77). Q and K are independent (separate weight, eps, K dim),
+# packed into one program per row to amortize launch overhead only -- the
+# normalization arithmetic is not fused.
 #
 # In:  q     (M, KQ) bf16 or fp16
 #      kv    (M, KK) bf16 or fp16

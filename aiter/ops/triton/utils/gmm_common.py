@@ -2,20 +2,15 @@
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # Imports.
-# ------------------------------------------------------------------------------
-
-# PyTorch
 import torch
 from torch import Tensor
 
-# AITER: logging
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER: AiterTritonLogger = AiterTritonLogger()
 
 
 # Supported data types.
-# ------------------------------------------------------------------------------
 
 # Supported data types, as strings.
 SUPPORTED_DTYPES_STR: set[str] = {"fp16", "bf16"}
@@ -57,7 +52,6 @@ DTYPE: torch.dtype = dtype_from_str(DTYPE_STR)
 
 
 # Supported integer data types for group sizes tensor.
-# ------------------------------------------------------------------------------
 
 # Supported group sizes data types, as strings.
 SUPPORTED_GROUP_SIZES_DTYPES_STR: set[str] = {"int32", "int64"}
@@ -106,7 +100,6 @@ def check_group_sizes_dtype(dtype: torch.dtype) -> None:
 
 
 # Other defaults.
-# ------------------------------------------------------------------------------
 
 # Default device.
 DEVICE: torch.device | str = "cuda"
@@ -123,7 +116,6 @@ TRANS_RHS: bool = False
 
 
 # Parameter checking functions.
-# ------------------------------------------------------------------------------
 
 
 def is_power_of_2(x: int) -> bool:
@@ -159,7 +151,6 @@ def check_bias_shape_stride(bias: Tensor, G: int, N: int) -> None:
 
 
 # Generation of group sizes.
-# ------------------------------------------------------------------------------
 
 
 # Probabilities for generating random group sizes.
@@ -338,7 +329,6 @@ def gen_multiple_group_sizes(
 
 
 # GMM helpers: tensor generation.
-# ------------------------------------------------------------------------------
 
 
 def gen_gmm_input(
@@ -367,22 +357,18 @@ def gen_gmm_input(
     lhs = lhs.to(preferred_element_type)
 
     if trans_rhs:
-        # Two physically equivalent transposed layouts are supported. They share the
-        # same memory ordering (K varies fastest, then N, then G); only the tensor
-        # metadata (shape/stride) differs.
+        # Two physically equivalent transposed layouts (same memory order: K fastest,
+        # then N, then G; only shape/stride differ).
         if alt_trans:
-            # Transposed layout 2: shape (G, N, K), stride (K*N, K, 1). The (N, K)
-            # sub-matrix per group is row-major.
+            # Transposed layout 2: shape (G, N, K), stride (K*N, K, 1); per-group (N, K) row-major.
             rhs = torch.randn((G, N, K), dtype=torch.float32, device=device)
         else:
-            # Transposed layout 1: shape (G, K, N), stride (K*N, 1, K). The (K, N)
-            # sub-matrix per group is column-major.
+            # Transposed layout 1: shape (G, K, N), stride (K*N, 1, K); per-group (K, N) col-major.
             rhs = torch.randn((G, N, K), dtype=torch.float32, device=device).permute(
                 0, 2, 1
             )
     else:
-        # alt_trans is ignored when trans_rhs is False; only the non-transposed
-        # row-major layout is supported in that case.
+        # alt_trans ignored when trans_rhs is False; only non-transposed row-major supported.
         rhs = torch.randn((G, K, N), dtype=torch.float32, device=device)
     rhs = rhs.to(preferred_element_type)
 
@@ -469,7 +455,6 @@ def gen_gmm_tensors(
 
 
 # GMM helpers: get information from tensors.
-# ------------------------------------------------------------------------------
 
 
 def get_gmm_shape(
@@ -566,9 +551,8 @@ def get_gmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool, 
     #   * Non-transposed:        shape (G, K, N), stride (K*N, N, 1) -> TRANS_RHS=False.
     #   * Transposed (layout 1): shape (G, K, N), stride (K*N, 1, K) -> TRANS_RHS=True.
     #   * Transposed (layout 2): shape (G, N, K), stride (K*N, K, 1) -> TRANS_RHS=True.
-    # Both transposed layouts produce identical byte offsets in the kernel's
-    # TRANS_RHS branch and therefore execute the same code; the difference is
-    # purely metadata.
+    # Both transposed layouts hit the same TRANS_RHS branch (identical byte offsets);
+    # they differ only in metadata.
     G, rhs_d1, rhs_d2 = rhs.shape
     is_kn_shape = (rhs_d1 == K) and (rhs_d2 == N)  # (G, K, N)
     is_nk_shape = (rhs_d1 == N) and (rhs_d2 == K)  # (G, N, K)
@@ -616,16 +600,13 @@ def get_gmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool, 
     assert is_out_row_major, "out must be row-major."
 
     is_rhs_transposed = is_rhs_transposed_layout_1 or is_rhs_transposed_layout_2
-    # Get rhs leading dimension according to transposition configuration. Both
-    # transposed layouts share the same leading dimension because they have the
-    # same physical memory ordering.
+    # rhs leading dimension; both transposed layouts share it (same physical order).
     ld_rhs = N if is_rhs_not_transposed else K
 
     return is_rhs_transposed, ld_rhs
 
 
 # TGMM helpers: tensor generation.
-# ------------------------------------------------------------------------------
 
 
 def gen_tgmm_input(
@@ -651,19 +632,16 @@ def gen_tgmm_input(
         torch.manual_seed(rng_seed)
 
     if trans_lhs:
-        # Two physically equivalent transposed layouts are supported. They share the
-        # same memory ordering (K varies fastest, then M); only the tensor metadata
-        # (shape/stride) differs.
+        # Two physically equivalent transposed layouts (same memory order: K fastest,
+        # then M; only shape/stride differ).
         if alt_trans:
-            # Transposed layout 2: shape (M, K), stride (K, 1). lhs is row-major over
-            # the swapped shape.
+            # Transposed layout 2: shape (M, K), stride (K, 1); row-major over swapped shape.
             lhs = torch.randn((M, K), dtype=torch.float32, device=device)
         else:
-            # Transposed layout 1: shape (K, M), stride (1, K). lhs is column-major.
+            # Transposed layout 1: shape (K, M), stride (1, K); col-major.
             lhs = torch.randn((M, K), dtype=torch.float32, device=device).T
     else:
-        # alt_trans is ignored when trans_lhs is False; only the non-transposed
-        # row-major layout is supported in that case.
+        # alt_trans ignored when trans_lhs is False; only non-transposed row-major supported.
         lhs = torch.randn((K, M), dtype=torch.float32, device=device)
     lhs = lhs.to(preferred_element_type)
 
@@ -771,7 +749,6 @@ def gen_tgmm_tensors(
 
 
 # TGMM helpers: get information from tensors.
-# ------------------------------------------------------------------------------
 
 
 def get_tgmm_shape(
@@ -896,9 +873,7 @@ def get_tgmm_bias_grad(
             1,
         ), f"bias_grad must be row-major with stride (K, 1) = ({K}, 1), got {existing_bias_grad.stride()}."
 
-        # Always zero the tensor since bias_grad represents gradients for the current
-        # computation and should start fresh. The kernel uses atomic_add which adds to
-        # existing values, so we must zero before the kernel runs.
+        # Zero before the kernel runs: it uses atomic_add, so bias_grad must start fresh.
         existing_bias_grad.zero_()
 
         return existing_bias_grad
@@ -926,9 +901,8 @@ def get_tgmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool,
     #   * Non-transposed:        shape (K, M), stride (M, 1) -> TRANS_LHS=False.
     #   * Transposed (layout 1): shape (K, M), stride (1, K) -> TRANS_LHS=True.
     #   * Transposed (layout 2): shape (M, K), stride (K, 1) -> TRANS_LHS=True.
-    # Both transposed layouts produce identical byte offsets in the kernel's
-    # TRANS_LHS branch and therefore execute the same code; the difference is
-    # purely metadata.
+    # Both transposed layouts hit the same TRANS_LHS branch (identical byte offsets);
+    # they differ only in metadata.
     lhs_d1, lhs_d2 = lhs.shape
     is_km_shape = (lhs_d1 == K) and (lhs_d2 == M)  # (K, M)
     is_mk_shape = (lhs_d1 == M) and (lhs_d2 == K)  # (M, K)
@@ -974,9 +948,7 @@ def get_tgmm_transposition(lhs: Tensor, rhs: Tensor, out: Tensor) -> tuple[bool,
     assert is_out_row_major, "out must be row-major."
 
     is_lhs_transposed = is_lhs_transposed_layout_1 or is_lhs_transposed_layout_2
-    # Get lhs leading dimension according to transposition configuration. Both
-    # transposed layouts share the same leading dimension because they have the
-    # same physical memory ordering.
+    # lhs leading dimension; both transposed layouts share it (same physical order).
     ld_lhs = M if is_lhs_not_transposed else K
 
     return is_lhs_transposed, ld_lhs

@@ -161,10 +161,8 @@ def _fused_routing_from_topk_place_kernel(
 
     pos = tl.atomic_add(offset_ptr + expt, 1, mask=item_mask)
 
-    # Clamp pos for masked-out lanes — `pos` is undefined there, and
-    # `topk_indx_ptr + pos` / `gate_scal_ptr + pos` would otherwise be
-    # arbitrary addresses. The mask=False store doesn't write, but the
-    # address calc is still evaluated and may fault on OOB pages.
+    # Clamp pos for masked-out lanes: `pos` is undefined there and the address
+    # calc is still evaluated (even for mask=False stores), so it could fault OOB.
     safe_pos = tl.where(item_mask, pos, 0)
 
     # gate_indx[i]   = pos       (original_flat → expert_sorted_pos)

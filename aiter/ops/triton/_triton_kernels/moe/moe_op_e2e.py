@@ -152,22 +152,14 @@ def e2e_moe_kernel(
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    ## pid remapping on xcds
-    # Number of pids per XCD in the new arrangement
+    # pid remapping on xcds. When GRID_MN is not divisible by NUM_XCDS, the
+    # first `tall_xcds` xcds get pids_per_xcd pids, the rest get one fewer.
     pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
-    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
-    # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
     tall_xcds = GRID_MN % NUM_XCDS
     tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    # Compute current XCD and local pid within the XCD
     xcd = pid % NUM_XCDS
     local_pid = pid // NUM_XCDS
-    # Calculate new pid based on the new grouping
-    # Note that we need to consider the following two cases:
-    # 1. the current pid is on a tall xcd
-    # 2. the current pid is on a short xcd
+    # New pid depends on whether the current pid is on a tall or short xcd.
     if xcd < tall_xcds:
         pid = xcd * pids_per_xcd + local_pid
     else:
@@ -187,12 +179,8 @@ def e2e_moe_kernel(
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    # Create pointers for the first blocks of A and B, advanced along K.
+    # a_ptrs: [BLOCK_SIZE_M, BLOCK_SIZE_K], b_ptrs: [BLOCK_SIZE_K, BLOCK_SIZE_N].
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
@@ -276,7 +264,6 @@ def e2e_moe_kernel(
     # TODO scale acc
     acc_scale = 1.0
     # TODO scale acc
-    # -------------------------------
 
     offs_w2n = tl.arange(0, BLOCK_SIZE_N // 2) + pid_n * (BLOCK_SIZE_N // 2)
 

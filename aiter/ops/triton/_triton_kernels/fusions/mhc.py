@@ -895,9 +895,8 @@ def _mhc_post_pre_split_kernel(
     # The 4D outer product `comb[:, :, :, None] * res[:, :, None, :]` of shape
     # (BLOCK_M, n_src, n_dst, BLOCK_C) is folded into tl.sum(axis=1); Triton
     # fuses the broadcast + sum into a register-resident reduction without
-    # materializing the full 4D intermediate. Measured ~25-40% faster than the
-    # manual static_range(n) per-h load+accumulate at M ∈ {1..256}, hc=4,
-    # C=4096.
+    # materializing the full 4D intermediate. Faster than the manual
+    # static_range(n) per-h load+accumulate.
     out_tile = post_mix_tile[:, :, None] * x_tile[:, None, :].to(tl.float32)
     out_tile += tl.sum(
         comb_3d[:, :, :, None] * res_3d[:, :, None, :].to(tl.float32),

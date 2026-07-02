@@ -67,12 +67,9 @@ def _store_logits_block(
 
 @gluon.constexpr_function
 def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, shape):
-    # Mirrors Triton's CoalesceAsyncCopy partition:
-    # lg2(C) bases to reg,
-    # lg2(WS) to lane,
-    # lg2(NW) to warp,
-    # leftovers back to reg.
-    # Keeps the blocked layout in sync with the shared layout so async-copy folds.
+    # Mirrors Triton's CoalesceAsyncCopy partition (lg2(C)->reg, lg2(WS)->lane,
+    # lg2(NW)->warp, leftovers->reg) so the blocked layout stays in sync with the
+    # shared layout and async-copy folds.
     rank = len(shape)
     lg2_c = contiguity.bit_length() - 1
     lg2_nw = num_warps.bit_length() - 1
@@ -101,10 +98,10 @@ def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, sha
 def _make_kv_load_layouts_cdna4(
     HEAD_SIZE, BLOCK_KV, NUM_WARPS, WARP_SIZE, USE_PADDED_SHARED_LAYOUT
 ):
-    # K [HEAD_SIZE, BLOCK_KV] fp8 layouts. XOR-swizzle dim1
-    # to break LDS bank-conflict periodicity + interval padding every 1 KiB;
-    # the matching blocked layout lets CoalesceAsyncCopy fold async-copy +
-    # shared store. Older Triton: simple fallback.
+    # K [HEAD_SIZE, BLOCK_KV] fp8 layouts. XOR-swizzle dim1 to break LDS
+    # bank-conflict periodicity + 1 KiB interval padding; the matching blocked
+    # layout lets CoalesceAsyncCopy fold async-copy + shared store. Older Triton:
+    # simple fallback.
     CONTIGUITY = 16  # 128-bit vector / 8-bit fp8
     if USE_PADDED_SHARED_LAYOUT:
         LG2_HS = HEAD_SIZE.bit_length() - 1
@@ -239,9 +236,8 @@ class MQAAsyncKVLoader:
         USE_BUFFER_LOAD: gl.constexpr,
         masked: gl.constexpr = False,
     ):
-        # When `end_row` is provided, rows at column j with `row_offset + j >= end_row`
-        # are masked out (predicated load). Used to safely prefetch tiles that may
-        # straddle the segment boundary; otherwise pass `end_row=None` (unmasked).
+        # If masked, columns with `row_offset + j >= seq_len_kv` are predicated
+        # out, to safely prefetch tiles straddling the segment boundary.
         if masked:
             offs_n = gl.arange(
                 0,

@@ -102,9 +102,7 @@ def _batched_gemm_afp4_wfp4_kernel(
     tl.assume(stride_in_bsk > 0)
     tl.assume(stride_in_bsn > 0)
 
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
+    # Map pid to the block of C it computes, in grouped order for L2 reuse.
     pid_batch = tl.program_id(axis=0)
     pid_unified = tl.program_id(axis=1)
     pid_k = pid_unified % NUM_KSPLIT

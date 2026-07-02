@@ -155,12 +155,9 @@ def pa_decode_sparse(
     waves_per_eu = 1
     reduce_num_warps = 4
 
-    # Infer KV_SPLITS from inputs when caller doesn't override.
-    # Fill ~512 total CTAs (MI300X has 304 CUs) while never splitting K into
-    # more pieces than there are K-blocks. Rounded up to a power of 2 so the
-    # reduce kernel's tl.arange(0, KV_SPLITS) compiles; over-splitting past
-    # max_kv_splits is handled by the kernel (empty splits early-return and
-    # the reduce masks their stale partial-buffer slots).
+    # Infer KV_SPLITS when not overridden: fill ~512 CTAs, cap at #K-blocks,
+    # round up to pow2 so the reduce kernel's tl.arange(0, KV_SPLITS) compiles.
+    # Over-splitting is safe: empty splits early-return, reduce masks stale slots.
     # print(f"{kv_indices.shape[0]=}")
     if kv_splits is None:
         max_kv_len = kv_indices.shape[0]
@@ -256,10 +253,8 @@ def pa_decode_sparse(
         # is responsible for the log-sum-exp combine + sink fold.
         return acc_partial, m_partial, l_partial
 
-    # One reduce CTA per head. For small per-rank H (TP=8 → H ∈ {8, 16}) this
-    # multiplies the reduce-side CTA count by H, replacing the previous single
-    # under-occupied CTA per token with a small fan-out that hides launch
-    # latency. tl.arange(0, 1) is a valid power-of-2 range.
+    # One reduce CTA per head: fans out the reduce so small per-rank H doesn't
+    # leave a single under-occupied CTA per token. tl.arange(0, 1) is valid pow2.
     block_h_reduce = 1
     grid_reduce = (T, triton.cdiv(H, block_h_reduce))
     _pa_decode_sparse_reduce[grid_reduce](

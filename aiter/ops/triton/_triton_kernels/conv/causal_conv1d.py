@@ -154,9 +154,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         if (
             state_len <= seqlen
         ):  # SMALL_CACHE=True (only move part of 'x' into conv_state cache)
-            # just read from 'x'
-            # copy 'x' data to conv_state
-            # load only 'x' data (and set 0 before 'x' if seqlen < state_len)
+            # copy only 'x' into conv_state (zero-fill before 'x' if seqlen < state_len)
             idx_tokens_last = (seqlen - state_len) + tl.arange(
                 0, NP2_STATELEN
             )  # [BLOCK_M]
@@ -437,19 +435,9 @@ def _causal_conv1d_update_kernel(
             return
 
     if IS_SPEC_DECODING:
-        # The rolling of conv state:
-        #
-        # Before forward, the conv_state is:
-        # [history1, history2, ..., historyM].
-        #
-        # After forward, the conv_state becomes:
-        # [history2, ..., historyM, draft1, draft2, ..., draftN].
-        #
-        # After acceptance, it becomes:
-        #
-        # - accept 1 tokens: [history2, ..., historyM, draft1]
-        # - accept 2 tokens: [history3, ..., historyM, draft1, draft2]
-        # - and so on.
+        # Rolling conv state for spec decode: [history1..historyM] -> after forward
+        # [history2..historyM, draft1..draftN]; on accepting k tokens, drop the k
+        # oldest history entries and keep draft1..draftk.
         conv_state_token_offset = tl.load(num_accepted_tokens_ptr + idx_seq) - 1
     else:
         conv_state_token_offset = 0

@@ -340,8 +340,7 @@ def fused_rms_fp8_group_quant(
         ACTIVATION="silu",
         num_warps=num_warps,
     )
-    # When transpose_scale=True, view the transposed buffer back to original shape
-    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    # transpose_scale: view buffer back to (M, num_bs_cols) with column-major layout
     if transpose_scale:
         out1_bs = out1_bs.view(M, num_bs_cols)
 
@@ -547,12 +546,9 @@ def fused_flatten_fp8_group_quant(
     out = torch.empty((M, N), dtype=dtype_quant, device=x.device)
 
     if transpose_scale:
-        # Physical buffer is (num_bs_cols, M) row-major; .T gives a
-        # (M, num_bs_cols) view with strides (1, M). The kernel writes
-        # at out_scales_ptr + m * stride_m + n * stride_n, so passing
-        # the natural strides of this view writes to the correct memory
-        # location regardless of layout — no special-case stride wiring
-        # or trailing .view() needed.
+        # (num_bs_cols, M) row-major buffer, .T'd to a (M, num_bs_cols) view with
+        # strides (1, M); passing its natural strides writes correct memory in
+        # column-major layout with no stride special-casing or trailing .view().
         out_block_scales = torch.empty(
             (num_bs_cols, M), dtype=torch.float32, device=x.device
         ).T
@@ -945,8 +941,7 @@ def fused_reduce_rms_fp8_group_quant(
         NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
         num_warps=num_warps,
     )
-    # When transpose_scale=True, view the transposed buffer back to original shape
-    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    # transpose_scale: view buffer back to (M, num_bs_cols) with column-major layout
     if transpose_scale:
         out1_bs = out1_bs.view(M, num_bs_cols)
 

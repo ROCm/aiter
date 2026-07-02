@@ -146,9 +146,7 @@ def _fused_moe_kernel_mxfp4(
             "BLOCK_SIZE_K must be a multiple of MX_PACK_DIVISOR",
         )
 
-    # -----------------------------------------------------------
-    # Map program ids `pid` to the block of C it should compute.
-    # This is done in a grouped ordering to promote L2 data reuse.
+    # Map pid to the block of C it computes, in grouped order for L2 reuse.
     pid = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -162,21 +160,15 @@ def _fused_moe_kernel_mxfp4(
         return  # rest of the tiles are dummy paddings
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
-    # ----------------------------------------------------------
-    # Create pointers for the first blocks of A and B.
-    # We will advance this pointer as we move in the K direction
-    # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    # Create pointers for the first blocks of A and B, advanced along K.
+    # a_ptrs: [BLOCK_SIZE_M, BLOCK_SIZE_K], b_ptrs: [BLOCK_SIZE_K, BLOCK_SIZE_N].
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
     off_expert = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_expert == -1:
-        # -----------------------------------------------------------
-        # Write back zeros to the output when the expert is not
-        # in the current expert parallel rank.
+        # Write back zeros when the expert is not in the current EP rank.
         _write_zeros_to_output(
             c_ptr,
             stride_cm,
@@ -292,11 +284,8 @@ def _fused_moe_kernel_mxfp4(
         + (offs_b_k[:, None] * stride_bk + offs_b_n[None, :] * stride_bn)
     )
 
-    # -----------------------------------------------------------
-    # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
+    # Iterate over K, accumulating into an fp32 [BLOCK_SIZE_M, BLOCK_SIZE_N]
+    # block for accuracy; converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, PACKED_BLOCK_K_A)):
         # Load the next block of A and B, generate a mask by checking the
@@ -374,7 +363,6 @@ def _fused_moe_kernel_mxfp4(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
     accumulator = accumulator.to(compute_type)
-    # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]

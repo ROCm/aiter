@@ -145,34 +145,25 @@ def gemm_a16w16_(
         NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
         num_warps = config["num_warps"]
 
-        # The kernels walk K with update_tensor_descriptor(add_offsets=...),
-        # which advances the load position without shrinking the descriptor's
-        # OOB bound. The final K tile is peeled out of the pipeline loop and
-        # reloaded with set_bounds, so a partial last tile (K not a multiple of
-        # BLOCK_K) is clamped and zero-filled instead of read out of bounds.
-        # Hence K need not be aligned to BLOCK_K. (M and N partial tiles are
-        # likewise handled by the descriptor bounds + store mask.)
+        # K need not be aligned to BLOCK_K: the final K tile is peeled out and
+        # reloaded with set_bounds, so a partial last tile is clamped/zero-filled
+        # instead of read OOB. M/N partial tiles use descriptor bounds + store mask.
 
-        # Clamp the software-pipeline depth to the number of K-tiles.
-        #
-        # The prologue/epilogue walk a fixed number of K-tiles determined by
-        # NUM_BUFFERS, independent of how many real tiles exist. If NUM_BUFFERS
-        # exceeds that count the pipeline loop counts go negative, so cap the
-        # depth at the real tile count. Both variants peel the final K tile out
-        # of the main loop for the bounds-checked tail load, which costs one
-        # extra tile of reach. Variants differ in reach and in the minimum depth
-        # they require:
-        #   bandwidth_bound : peels the last tile (needs num_k_tiles >= NB)
+        # Clamp software-pipeline depth to the K-tile count: prologue/epilogue
+        # walk a fixed NUM_BUFFERS tiles, so NUM_BUFFERS > real tiles makes loop
+        # counts go negative. Both variants peel the final K tile (one extra
+        # tile of reach); minimum depth differs:
+        #   bandwidth_bound : peels last tile (needs num_k_tiles >= NB)
         #                     -> cap = num_k_tiles
-        #   compute_bound : preloads one tile ahead AND peels the last tile
+        #   compute_bound : preloads one tile ahead AND peels last tile
         #                   (needs num_k_tiles >= NB + 2) -> cap = num_k_tiles - 2
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
         _DEPTH_SLACK = {"compute_bound": 2}
 
         if kernel_type_from_config is None:
-            # Fall back to the bandwidth_bound kernel when the requested variant
-            # cannot satisfy its minimum pipeline depth for this K.
+            # Fall back to bandwidth_bound when the requested variant can't meet
+            # its minimum pipeline depth for this K.
             depth_cap = num_k_tiles - _DEPTH_SLACK.get(kernel_type, 0)
             if depth_cap < _MIN_BUFFERS[kernel_type]:
                 needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
@@ -190,9 +181,9 @@ def gemm_a16w16_(
 
         w = w.T
 
-        # Operand layout in BLAS TT/TN/NT/NN form: 'T' (row-major, trailing dim
-        # contiguous) or 'N' (column-major, leading dim contiguous). First char
-        # is x (A), second is w (B, after the internal transpose above).
+        # Operand layout in BLAS TT/TN/NT/NN form: 'T' = row-major (trailing dim
+        # contiguous), 'N' = column-major. First char is x (A), second is w (B,
+        # after the transpose above).
         if x.stride(1) == 1:
             layout = "T"
         elif x.stride(0) == 1:
@@ -359,8 +350,8 @@ def gemm_a16w16(
     See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
     here and is serialized before dispatch so the op is torch.compile-traceable.
     """
-    # dtype must be a torch.dtype at the custom-op boundary (callers sometimes
-    # pass a placeholder when a preallocated y already fixes the output dtype).
+    # dtype must be a torch.dtype at the custom-op boundary (callers may pass a
+    # placeholder when a preallocated y already fixes the output dtype).
     if not isinstance(dtype, torch.dtype):
         dtype = torch.bfloat16
     config_hashable = serialize_dict(config) if config else None

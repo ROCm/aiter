@@ -36,17 +36,13 @@ def gather_kv_b_proj(
 
     qk_nope_head_dim = weight_n // tp_k_head_num_k - v_head_dim
 
-    # Three scale modes:
-    #   - kv_proj_scale is None   : weight is unquantized (e.g. bf16
-    #     kv_b_proj on Kimi-K2.5-MXFP4). Kernel skips scale-load and
-    #     scale-multiply entirely (NO_SCALE branch).
-    #   - kv_proj_scale.dim() == 1 (or [N, 1]) : per-row scale.
-    #   - else                     : per-block scale ([N//128, K//128]).
+    # Three scale modes: None -> unquantized weight (NO_SCALE branch skips
+    # scale load/multiply); dim==1 or [N,1] -> per-row; else per-block
+    # ([N//128, K//128]).
     no_scale = kv_proj_scale is None
     if no_scale:
-        # Triton requires a non-None tensor pointer for every kernel argument
-        # even if NO_SCALE=True makes it unread. Pass the weight tensor as a
-        # placeholder; the kernel does not load from it in this branch.
+        # Triton needs a non-None pointer per kernel arg even when unread; pass
+        # the weight tensor as placeholder (not loaded in this branch).
         kv_proj_scale = kv_proj_weight
         per_row_scale = False  # ignored when NO_SCALE=True
     else:
@@ -86,8 +82,7 @@ def gather_kv_b_proj(
                 assert scale_n_granularity == 128
 
     if shuffled_kv_cache:
-        # FP4 *kv_buffer* is not supported; the kv buffer must be bf16/fp8. The
-        # weight may still be MXFP4 (handled by the FP4 weight path below).
+        # FP4 kv_buffer unsupported (must be bf16/fp8); weight may still be MXFP4.
         assert k_buffer.dtype in (
             torch.bfloat16,
             torch.float8_e4m3fn,
@@ -97,8 +92,8 @@ def gather_kv_b_proj(
             f"shuffled_kv_cache gather requires block_size % 16 == 0 (16-token "
             f"shuffle groups), got block_size={block_size}"
         )
-        # The shuffle keeps each token's data within its own block, so a chunk
-        # must span exactly one block (KBlocksPerChunkK == 1).
+        # Shuffle keeps each token's data in its own block, so a chunk spans
+        # exactly one block (KBlocksPerChunkK == 1).
         ChunkK = block_size
     elif is_fp4_weight:
         ChunkK = 64
@@ -119,9 +114,8 @@ def gather_kv_b_proj(
 
     grid = (batch_size * tp_k_head_num_k,)
     if is_fp4_weight:
-        # Use the actual output token count, not kv_indices capacity. Serving
-        # paths may pass a preallocated kv_indices buffer that is much larger
-        # than the valid range described by kv_indptr/k_prefix.
+        # Use actual output token count, not kv_indices capacity (serving may
+        # pass a preallocated kv_indices buffer larger than the valid range).
         max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
         fp4_grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
