@@ -37,6 +37,13 @@ class Config:
         return cls(*[eval(p) for p in parts])
 
 
+def _get_decode_max_batch(E: int, TOPK: int, K1: int, K2: int) -> int:
+    # Qwen3.5-397B FP8 TP8 PTPC decode path is tuned for batch 64/128 only.
+    if E == 513 and TOPK == 11 and K1 == 4096 and K2 == 128:
+        return 128
+    return 32
+
+
 def get_tune_space():
     return [
         Config(16, True, False, False).to_string(),
@@ -82,8 +89,8 @@ def fused_moe_asmjit_aot(
 
     qtype_str = str(quant_type).split(".")[1]
 
-    E, N1, K1 = w1.shape
-    N2, K2 = w2.shape[1], w2.shape[2]
+    E, N1, K1 = w1.shape # num_experts, 2*moe_intermediate_size//TP, head_size
+    N2, K2 = w2.shape[1], w2.shape[2]  # K2 is moe_intermediate_size//TP
     TOPK = topk_ids.shape[1]
     fp8_ptpc = w1.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) and (
         quant_type == QuantType.per_Token
@@ -92,6 +99,7 @@ def fused_moe_asmjit_aot(
         hidden_states.device
     ).multi_processor_count
     assert N1 == 2 * K2
+    decode_max_B = _get_decode_max_batch(E, TOPK, K1, K2)
 
     topk_w_f32 = (
         topk_weight if topk_weight.dtype == torch.float32 else topk_weight.float()
@@ -249,7 +257,7 @@ def fused_moe_asmjit_aot(
             with_silu=False,
             quant_type_str=qtype_str,
         )
-    elif 2 <= B <= 128:
+    elif 2 <= B <= decode_max_B:
         # Stage 1: Shared ``moe_sorting`` + ``moe_gemm_batch``;
         # stage 2: Choose between ``moe_2stage_down_loopn`` and ``moe_2stage_splitk`` based on ``use_down_loopn`` condition.
         BLOCK_M = kcfgs.BLOCK_M
@@ -297,7 +305,7 @@ def fused_moe_asmjit_aot(
                 fp8_ptpc
                 and (N2 // BLOCK_N) * grid >= num_CU
                 and N2 % BLOCK_N == 0
-                and 16 <= B <= 128
+                and 16 <= B <= decode_max_B
             )
         else:
             use_down_loopn = False
