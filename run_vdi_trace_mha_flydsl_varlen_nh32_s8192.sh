@@ -31,6 +31,18 @@ container_main() {
         --warmup 5
         --repeat 20
     )
+    local prewarm_cmd=(
+        python op_tests/test_mha_flydsl_varlen.py
+        --causal true
+        --return_lse true
+        -b 1
+        -nh 32
+        -sq 8192
+        -sk 8192
+        --random-value false
+        --warmup 1
+        --repeat 1
+    )
 
     cd "${REPO_ROOT}"
     rm -rf "${OUT_DIR}" "${flydsl_dump_dir}"
@@ -319,10 +331,21 @@ PY
     local selector_status=${PIPESTATUS[0]}
     set -e
 
+    local prewarm_status=99
     local att_status=99
     if [[ "${selector_status}" -eq 0 ]]; then
         # shellcheck disable=SC1090
         source "${selected_env}"
+        set +e
+        run_and_log \
+            "prewarm-flydsl-cache" \
+            "${log_dir}/03_prewarm_flydsl_cache.log" \
+            env PYTORCH_ALLOC_CONF=expandable_segments:True \
+                GPU_ARCHS=gfx1250 \
+                "${prewarm_cmd[@]}"
+        prewarm_status=$?
+        set -e
+
         cat > "${input_yaml}" <<YAML
 jobs:
  -
@@ -343,21 +366,24 @@ YAML
 
         rm -rf "${att_output_dir}"
         mkdir -p "${thread_trace_dir}"
-        set +e
-        run_and_log \
-            "advanced-thread-trace-${KERNEL_NAME}" \
-            "${log_dir}/03_thread_trace.log" \
-            rocprofv3 -i "${input_yaml}" -- \
-                env PYTORCH_ALLOC_CONF=expandable_segments:True \
-                    GPU_ARCHS=gfx1250 \
-                    "${test_cmd[@]}"
-        att_status=$?
-        set -e
+        if [[ "${prewarm_status}" -eq 0 ]]; then
+            set +e
+            run_and_log \
+                "advanced-thread-trace-${KERNEL_NAME}" \
+                "${log_dir}/04_thread_trace.log" \
+                rocprofv3 -i "${input_yaml}" -- \
+                    env PYTORCH_ALLOC_CONF=expandable_segments:True \
+                        GPU_ARCHS=gfx1250 \
+                        "${test_cmd[@]}"
+            att_status=$?
+            set -e
+        fi
     fi
 
     {
         echo "kernel_trace_status=${kernel_trace_status}"
         echo "selector_status=${selector_status}"
+        echo "prewarm_status=${prewarm_status}"
         echo "att_status=${att_status}"
         echo "selected_kernel=${KERNEL_NAME:-unknown}"
         echo "final_tarball=${FINAL_TARBALL}"
@@ -371,7 +397,8 @@ YAML
     package_outputs
     chmod -R a+rwX "${OUT_DIR}"
 
-    if [[ "${kernel_trace_status}" -ne 0 || "${selector_status}" -ne 0 || "${att_status}" -ne 0 ]]; then
+    if [[ "${kernel_trace_status}" -ne 0 || "${selector_status}" -ne 0 ||
+          "${prewarm_status}" -ne 0 || "${att_status}" -ne 0 ]]; then
         return 1
     fi
 }
