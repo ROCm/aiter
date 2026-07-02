@@ -689,6 +689,7 @@ def compile_mxscale_gemm(
             flat_m_base_input = batch_m_base + blk_m
             if flat_m_base_override is not None:
                 flat_m_base_input = flat_m_base_override
+            group_m_base = flat_m_base_input - blk_m
             flat_m_base = split_k_m_offset + flat_m_base_input
             tile_valid = arith.constant(1, type=ir.IntegerType.get_signless(1))
             valid_m_i32 = i32_m.ir_value()
@@ -717,6 +718,12 @@ def compile_mxscale_gemm(
                             arith.index_cast(T.i32, blk_m),
                             valid_m_i32,
                         )
+
+            _oob_a_row_bound = None
+            if const_expr(grouped_masked_m):
+                _oob_a_row_bound = group_m_base + arith.index_cast(
+                    T.index, valid_m_i32
+                )
 
             if const_expr(use_cluster):
                 local_x, local_y = gpu.compute_cluster_position()
@@ -772,6 +779,7 @@ def compile_mxscale_gemm(
                     num_warps=tdm_desc_num_warps,
                     workgroup_mask=a_mcast_mask,
                     atomic_barrier_enable=atomic_barrier_enable,
+                    oob_outer_bound=_oob_a_row_bound,
                 )
 
             def make_desc_b(memref, k_base, n_offset=0):
