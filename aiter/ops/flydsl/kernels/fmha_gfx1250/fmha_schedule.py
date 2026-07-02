@@ -30,9 +30,7 @@ This matches the actual ISA pattern (L1279-1285 area):
 
 from typing import List
 
-# ---------------------------------------------------------------------------
 # Token constants
-# ---------------------------------------------------------------------------
 P0_M0, P0_M1, P0_M2, P0_M3 = 0, 1, 2, 3  # PART0 per MSB (max3/mul/fma, 1cy)
 P1 = 4  # PART1 cross-MSB merge (1cy)
 # PART2 cheap ops: setup(7) + pkfma(16) = ops[0..22], 1cy each
@@ -61,9 +59,7 @@ _V = [V_M0, V_M1, V_M2, V_M3]
 _P2 = [P2_M0, P2_M1, P2_M2, P2_M3]  # pkfma/setup (cheap, 1cy)
 _EXP = [EXP_M0, EXP_M1, EXP_M2, EXP_M3]  # pair_exp (expensive, 3cy)
 
-# ---------------------------------------------------------------------------
 # Constants (must match fmha_core_loop.py)
-# ---------------------------------------------------------------------------
 _NUM_MSB = 4
 _GEMM_INST_COUNT = 24  # WMMAs per GEMM1 stage
 _PV_GEMM_INST_COUNT = 16  # WMMAs per GEMM2 stage
@@ -76,9 +72,7 @@ _N_PV_WMMA_N = 4
 _NUM_G1_STAGES = 4
 _NUM_G2_STAGES = 4
 
-# ---------------------------------------------------------------------------
 # Cycle cost table (for balance analysis)
-# ---------------------------------------------------------------------------
 CY = {
     TDM: 4,  # tensor_load_to_lds
     O_RESC0: 1,  # 1 × v_pk_mul_f32
@@ -114,9 +108,7 @@ def row_cycles(row: List[int], cy_p2: int = 1) -> int:
     return total
 
 
-# ---------------------------------------------------------------------------
 # Builder helpers
-# ---------------------------------------------------------------------------
 
 
 def _interleave(a_tokens: List[int], b_tokens: List[int]) -> List[int]:
@@ -233,9 +225,7 @@ def _cheap_tokens(cheap_per_msb: int) -> List[int]:
     return tokens
 
 
-# ---------------------------------------------------------------------------
 # GEMM1 stage builder
-# ---------------------------------------------------------------------------
 
 
 def _build_gemm1_stage(
@@ -357,9 +347,7 @@ def _build_gemm1_stage(
     return rows
 
 
-# ---------------------------------------------------------------------------
 # GEMM2 stage builder
-# ---------------------------------------------------------------------------
 
 
 def _build_gemm2_stage(
@@ -498,9 +486,7 @@ def _build_gemm2_stage(
     return rows
 
 
-# ---------------------------------------------------------------------------
 # GEMM1 schedule: 96 rows
-# ---------------------------------------------------------------------------
 # Budget derivation (ALU_PER_STAGE = [40,52,56,168, 120,120,132,132]):
 #   GEMM1_EXP_OPS=24, cheap=33 per MSB
 #   Stage 0 (softmax_stage 4, budget=120): 10 exp/MSB, 0 cheap
@@ -623,16 +609,10 @@ def build_gemm1_schedule() -> List[List[int]]:
     return sched
 
 
-# ---------------------------------------------------------------------------
 # GEMM2 schedule: 64 rows
-# ---------------------------------------------------------------------------
-# Strict ordering: P0 (max) → P1 (cross-MSB delta) → P2 (pkfma) → EXP (pair_exp)
-#
-# Key dependency: PART2 setup op[2] reads delta[b] = PART1 output.
-# → P1 must finish BEFORE any P2 token fires.
-# → P1 placed in stage 1 post-load (after all P0 overflow), ensuring
-#   PART1 completes before stage 2 where P2 companions start. ✓
-#
+# Strict ordering: P0 (max) → P1 (cross-MSB delta) → P2 (pkfma) → EXP (pair_exp).
+# Dependency: PART2 setup op[2] reads delta[b]=PART1 output, so P1 must finish
+# before any P2 token fires; P1 is placed in stage 1 post-load (after P0 overflow).
 # Stage 0 (V+TDM): P0=10/MSB
 # Stage 1 (V+TDM): P0=12/MSB + P1=8 (P1 after all P0 overflow in post-load)
 # Stage 2 (V):     ALL P2=24/MSB (load-WMMAs give 8/MSB; post-load 64 tokens, row_cap=8)
@@ -721,16 +701,12 @@ def build_gemm2_schedule() -> List[List[int]]:
     return sched
 
 
-# ---------------------------------------------------------------------------
 # Pre-built tables
-# ---------------------------------------------------------------------------
 GEMM1_SCHEDULE: List[List[int]] = build_gemm1_schedule()
 GEMM2_SCHEDULE: List[List[int]] = build_gemm2_schedule()
 
 
-# ---------------------------------------------------------------------------
 # Index helpers
-# ---------------------------------------------------------------------------
 def g1_row_idx(stage: int, wmma: int) -> int:
     return stage * _GEMM_INST_COUNT + wmma
 
@@ -739,9 +715,7 @@ def g2_row_idx(stage: int, wmma: int) -> int:
     return stage * _PV_GEMM_INST_COUNT + wmma
 
 
-# ---------------------------------------------------------------------------
 # Pretty-printer
-# ---------------------------------------------------------------------------
 _TOKEN_NAMES = {
     0: "P0m0",
     1: "P0m1",
@@ -792,9 +766,7 @@ def validate_schedule(schedule, name):
             assert 0 <= t <= 22, f"{name}[{i}] invalid token {t}"  # 0-18 + EXP 19-22
 
 
-# ---------------------------------------------------------------------------
 # CSV schedule tool
-# ---------------------------------------------------------------------------
 # Workflow:
 #   1. Export current schedule:
 #      save_schedule_to_csv(

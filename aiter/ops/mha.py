@@ -313,21 +313,13 @@ def fmha_v3_fwd(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
-# ---------------------------------------------------------------------------
-# fmha_fwd_with_sink_asm (gfx1250) — single-shot batched FMHA forward.
-#
-# API contract: q/k/v are **bshd shape** ([batch, seq, head, dim]); strides are
-# read directly from the tensor so non-contiguous bshd-shaped views (e.g. of
-# sbhd / bhsd allocations) are accepted.  Only `tensor.stride(-1) == 1` is
-# required.  softmax_scale is forwarded to the kernel as-is (the kernel
-# applies it internally to Q·K^T before softmax).
-#
-# Memory-allocation policy: all GPU tensors (out, lse, sink) are allocated on
-# the Python side; the C++ entry point performs only pointer + stride
-# bookkeeping and kernel launch (no torch dependency).  The public wrapper
-# `fmha_fwd_with_sink_asm` below handles allocation and the AITER-post-scale →
-# kernel-pre-scale conversion for sink (multiply by sqrt(qk_head_dim)).
-# ---------------------------------------------------------------------------
+# fmha_fwd_with_sink_asm (gfx1250) single-shot batched FMHA forward.
+# q/k/v are bshd shape; strides read directly (only stride(-1)==1 required, so
+# bshd-shaped views of sbhd/bhsd allocations are accepted). softmax_scale is
+# forwarded as-is (kernel applies it to Q·K^T). All GPU tensors (out, lse, sink)
+# are allocated Python-side; the C++ entry only does pointer/stride bookkeeping
+# + launch. The wrapper below handles allocation and sink post->pre-scale
+# conversion (multiply by sqrt(qk_head_dim)).
 @compile_ops(
     "module_fmha_fwd_with_sink_asm",
     fc_name="fmha_fwd_with_sink_asm",
@@ -484,22 +476,14 @@ def fmha_fwd_with_sink_varlen_asm(
     return out, lse
 
 
-# ---------------------------------------------------------------------------
-# fmha_fwd_mxfp8_asm (gfx1250) — dedicated MXFP8 FMHA forward.
-#
-# This is an intentionally separate integration path from both the bf16
-# `fmha_fwd_with_sink_asm` and the shared `fmha_v3` paths.  The MXFP8 kernel
-# uses its own slot-padded kernarg ABI carrying q/k/v micro-scaling (e8m0)
-# descale pointers, expected to diverge further from the MI350 layout — so it
-# gets its own C++ translation unit (csrc/py_itfs_cu/asm_fmha_fwd_mxfp8.cu)
-# and its own Python entry point here.
-#
-# API contract: q/k/v are **bshd shape** ([batch, seq, head, dim]) fp8 (e4m3),
-# in bhsd memory order (stride_head > stride_seq); strides are read directly
-# from the tensors.  q/k/v_scale are 1-D float8_e8m0fnu descale buffers laid
-# out as the kernel expects (block_size=32 along head_dim).  All GPU tensors
-# (out, lse, scales) are allocated on the Python side.
-# ---------------------------------------------------------------------------
+# fmha_fwd_mxfp8_asm (gfx1250) dedicated MXFP8 FMHA forward.
+# Separate path from bf16 fmha_fwd_with_sink_asm and shared fmha_v3: its own
+# slot-padded kernarg ABI carries q/k/v micro-scaling (e8m0) descale pointers,
+# so it has its own C++ TU (csrc/py_itfs_cu/asm_fmha_fwd_mxfp8.cu) + entry point.
+# q/k/v are bshd shape fp8 (e4m3) in bhsd memory order (stride_head > stride_seq);
+# strides read directly. q/k/v_scale are 1-D float8_e8m0fnu descale buffers
+# (block_size=32 along head_dim). All GPU tensors (out, lse, scales) allocated
+# Python-side.
 @compile_ops(
     "module_fmha_fwd_mxfp8_asm",
     fc_name="fmha_fwd_mxfp8_asm",
@@ -1705,19 +1689,11 @@ def _flash_attn_forward(
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         # Per-hdim sink eligibility:
-        #
-        #   D128 kernels (`_rxy`) compile ENABLE_SINK=0 -- the kernel ignores
-        #   any sink buffer.  Routing a caller's sink_ptr to it would silently
-        #   drop the sink term, so we fall back to CK whenever sink_ptr is set.
-        #
-        #   D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 -- the kernel
-        #   ALWAYS reads SINK and adds `exp((sink - max) * scale)` to the
-        #   softmax denominator.  There is no "skip sink" mode on this binary,
-        #   so calling it with sink_ptr=None now forwards a null pointer to the
-        #   kernel (the wrapper no longer raises / zero-fills), which the D64
-        #   binary would dereference.  To preserve flash_attn_func's documented
-        #   `sink_ptr is None` semantics we keep requiring an explicit sink for
-        #   D64 here and fall back to CK otherwise.
+        #   D128 (`_rxy`) compile ENABLE_SINK=0 and ignore the sink buffer, so a
+        #   caller's sink_ptr would be silently dropped -> fall back to CK if set.
+        #   D64 (`_rxy_sink`) compile ENABLE_SINK=1 and ALWAYS read SINK (add
+        #   exp((sink-max)*scale) to the denom); no skip-sink mode, and null
+        #   sink_ptr would be dereferenced -> require an explicit sink, else CK.
         if hdim_q == 128:
             ret = ret and (sink_ptr is None)
         elif hdim_q == 64:
@@ -1830,16 +1806,11 @@ def _flash_attn_forward(
         # ns <= 1 (0 = heuristic fallback, 1 = forced no-split) -> existing dispatch
     # can_impl_fmha_native() False -> num_splits ignored, existing dispatch
     if can_impl_fmha_fwd_with_sink_asm():
-        # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
-        # no API-side permute.  softmax_scale is forwarded as-is (kernel applies
-        # it internally to Q·K^T).  sink_ptr is passed through verbatim -- it is
-        # the value the kernel consumes directly (no host-side scaling); whether
-        # the kernel reads it is decided inside the .co.
-        #
-        # `can_impl_fmha_fwd_with_sink_asm` still enforces the current-binary
-        # (hdim, sink_ptr) matrix (D128 requires sink_ptr is None; D64 requires
-        # sink_ptr is not None) so we never feed a null sink to a D64 binary that
-        # unconditionally reads it -- forward the caller's sink_ptr unmodified.
+        # gfx1250 ASM bf16 path: q/k/v bshd, strides read directly (no permute).
+        # softmax_scale and sink_ptr forwarded as-is (kernel consumes sink
+        # directly). can_impl_fmha_fwd_with_sink_asm enforces the (hdim, sink_ptr)
+        # matrix (D128 -> sink_ptr None; D64 -> sink_ptr not None) so a null sink
+        # never reaches a D64 binary that unconditionally reads it.
         out_, softmax_lse = fmha_fwd_with_sink_asm(
             q,
             k,
@@ -2674,12 +2645,10 @@ def _flash_attn_varlen_forward(
         ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         # Per-hdim sink eligibility (mirrors the fixed-batch path):
-        #   D128 (`_rxy`) binaries compile ENABLE_SINK=0 and ignore the sink
-        #   buffer, so routing a caller's sink_ptr to them would silently drop
-        #   the sink term -- fall back to CK whenever sink_ptr is set.
-        #   D64  (`_rxy_sink`) binaries compile ENABLE_SINK=1 and ALWAYS read
-        #   SINK, so calling with sink_ptr=None would dereference a null pointer
-        #   -- require an explicit sink for D64 and fall back to CK otherwise.
+        #   D128 (`_rxy`) compile ENABLE_SINK=0 and ignore the sink buffer -> fall
+        #   back to CK if sink_ptr is set (would be silently dropped).
+        #   D64 (`_rxy_sink`) compile ENABLE_SINK=1 and ALWAYS read SINK -> require
+        #   an explicit sink (null sink_ptr would be dereferenced), else CK.
         if hdim_q == 128:
             ret = ret and (sink_ptr is None)
         elif hdim_q == 64:
@@ -2689,13 +2658,11 @@ def _flash_attn_varlen_forward(
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
     if can_impl_fmha_fwd_with_sink_varlen_asm():
-        # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
-        # requires dense packing (the wrapper calls `.contiguous()` defensively)
-        # and carries no strides.  softmax_scale is forwarded as-is (the kernel
-        # applies it internally to Q·K^T).  sink_ptr is passed through verbatim;
-        # `can_impl_fmha_fwd_with_sink_varlen_asm` already enforces the per-hdim
-        # (D128→no sink, D64→sink) contract so we never feed a null sink to a
-        # D64 binary that unconditionally reads it.
+        # gfx1250 packed/varlen ASM bf16 path. q/k/v packed THD; kernel needs
+        # dense packing (wrapper calls .contiguous() defensively) and carries no
+        # strides. softmax_scale and sink_ptr forwarded as-is; the per-hdim
+        # (D128->no sink, D64->sink) contract is already enforced by
+        # can_impl_fmha_fwd_with_sink_varlen_asm.
         out, lse_asm = fmha_fwd_with_sink_varlen_asm(
             q,
             k,

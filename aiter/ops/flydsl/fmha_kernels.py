@@ -40,13 +40,10 @@ __all__ = [
 # Picked to match BLOCK_M=128 in the kernel; padding is invisible to callers.
 _KERNEL_BLOCK_M = 128
 
-# Maximum tolerated ratio of padded tokens for non-causal attention.
-# Padded K/V keys produce QK^T = 0, but exp(0) = 1 leaks into the softmax
-# denominator and silently scales the output. 0.5% is the bf16 mantissa
-# precision floor (~0.4%) plus 1 bit of margin. Above this the relative
-# error grows quickly (50% pad -> 37% rel_err per RCA in
-# 2969_padded_softmax_rca.md). Causal mode masks future tokens including
-# the padded ones, so it is unaffected.
+# Max tolerated padded-token ratio for non-causal attention. Padded K/V give
+# QK^T = 0 but exp(0) = 1 leaks into the softmax denominator and scales the
+# output. 0.5% = bf16 mantissa floor (~0.4%) + 1 bit margin. Causal mode masks
+# the padded (future) tokens, so it is unaffected. See 2969_padded_softmax_rca.md.
 _MAX_NONCAUSAL_PAD_RATIO = 0.005
 
 
@@ -141,12 +138,10 @@ def flydsl_flash_attn_func(
 
     dtype_str = _torch_dtype_to_str(q.dtype)
 
-    # Pad seq_len up to the kernel's tile size. Tight padding (<= 0.5% of
-    # S_pad) is empirically below the bf16 noise floor on production shapes
-    # (Wan2.1 cos_sim >= 0.999992). Higher ratios are rejected upstream:
-    # padded K/V tokens produce QK^T = 0 but exp(0) = 1 still contributes
-    # to the softmax denominator and would scale the output. Padded queries
-    # produce garbage rows that we slice off before returning.
+    # Pad seq_len up to the kernel's tile size. Tight padding (<= 0.5% of S_pad)
+    # is below the bf16 noise floor; higher ratios are rejected (padded K/V leak
+    # exp(0)=1 into the softmax denominator). Padded query rows are sliced off
+    # before returning.
     seq_len_pad = (
         (seq_len_real + _KERNEL_BLOCK_M - 1) // _KERNEL_BLOCK_M
     ) * _KERNEL_BLOCK_M
@@ -174,9 +169,8 @@ def flydsl_flash_attn_func(
 
     o_p = torch.empty_like(q_p)
 
-    # Wrap kernel build + launch in q.device context so multi-GPU callers
-    # whose current device differs from q.device get the kernel compiled
-    # and launched on the right device/stream.
+    # Build + launch under q.device context so multi-GPU callers (current device
+    # != q.device) compile/launch on the right device/stream.
     with torch.cuda.device(q.device.index):
         launch_stream = (
             torch.cuda.current_stream(q.device) if stream is None else stream

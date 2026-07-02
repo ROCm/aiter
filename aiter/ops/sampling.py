@@ -58,26 +58,19 @@ direct_register_custom_op(
 )
 
 
-# ---------------------------------------------------------------------------
 # "top-k first" fast path for top_k_top_p_sampling_from_probs.
-#
 # Mirrors flashinfer PR #3461: for a modest scalar top_k over a large vocab,
-# selecting the top-k entries first and running top-p over only those k
-# survivors is far cheaper than the fused full-vocab rejection kernel, which
-# launches a single CTA per row and underutilizes the GPU at small batch.
+# top-k select first then top-p over only the k survivors is far cheaper than the
+# fused full-vocab rejection kernel (one CTA per row, GPU-underutilized at small
+# batch).
 #
-# Semantic note (why this is NOT a verbatim port of flashinfer): aiter's fused
-# TopKTopPSamplingFromProbKernel applies the top-p threshold on the ORIGINAL
-# (un-renormalized) probability mass (`aggregate_gt_pivot.value < p`),
-# intersected with the top-k count. flashinfer's `top_k_first` instead
-# renormalizes after top-k and then applies top-p. To stay distribution-
-# equivalent to aiter's existing kernel we renormalize the k survivors (mass S
-# per row, needed so the top-p kernel's proportional draw u~U[0,1) is valid)
-# and scale the threshold to p' = p / S (clamped to 1), so that
+# Not a verbatim flashinfer port: aiter's fused kernel applies top-p on the
+# ORIGINAL (un-renormalized) mass intersected with top-k, whereas flashinfer
+# renormalizes after top-k. To stay distribution-equivalent we renormalize the k
+# survivors (mass S per row, so the top-p kernel's draw u~U[0,1) is valid) and
+# scale the threshold to p' = p / S (clamped to 1), so that
 #     mass_k(x > pivot) < p'   <=>   mass_orig(x > pivot) < p .
-# This makes the accepted set identical to the fused kernel's, modulo
-# measure-zero floating-point ties at the boundary.
-# ---------------------------------------------------------------------------
+# Accepted set matches the fused kernel modulo measure-zero fp ties.
 _TOPK_FIRST_FAST_MAX_K = 256
 _TOPK_FIRST_FAST_MIN_VOCAB = 65536
 

@@ -97,12 +97,10 @@ def build_silu_and_mul_fq_module(
     if _need_fp8:
         from flydsl._mlir.dialects import rocdl
 
-    # All four MXFP4/MXFP8 scale modes share NV ROUND_UP today (industry default,
-    # 0% max-value clipping). FP8 dtype follows the HW FP8 variant: gfx942 ships
-    # e4m3fnuz (max=240), gfx950+ ships OCP e4m3fn (max=448). Single-statement
-    # ternary avoids closure-cell binding edge cases in FlyDSL AOT trace; the
-    # bf16 fallback uses FP4_E2M1 as a placeholder (guarded by
-    # ``const_expr(_need_quant)`` at the call site).
+    # All scale modes use NV ROUND_UP (0% max-value clipping). FP8 dtype follows
+    # the HW variant: gfx942 e4m3fnuz (max=240), gfx950+ OCP e4m3fn (max=448).
+    # Single-statement ternary avoids FlyDSL AOT closure-cell binding issues;
+    # bf16 fallback uses FP4_E2M1 as a placeholder (guarded by _need_quant).
     _mx_dtype = (
         _D.FP4_E2M1
         if _need_fp4
@@ -185,9 +183,7 @@ def build_silu_and_mul_fq_module(
         s_ok = arith.cmpi(CmpIPredicate.ult, slot_id, topk_i32)
         is_valid = arith.andi(row_in_range, arith.andi(t_ok, s_ok))
 
-        # FP4/FP8 scale and f32->fp4 conversion are shared with
-        # mixed_moe_gemm_2stage; helpers live in
-        # aiter.ops.flydsl.kernels.quant_utils.
+        # FP4/FP8 scale and f32->fp4 conversion shared via quant_utils.
         _f32_to_e2m1 = emit_f32_to_e2m1
 
         thread_id = ArithValue(tid)
@@ -277,11 +273,9 @@ def build_silu_and_mul_fq_module(
                     swiglu_neg_alpha_log2e = arith.constant(
                         -1.4426950408889634 * 1.702, type=f32
                     )
-                    # ``swiglu_limit`` is a runtime f32 scalar.  The host passes the
-                    # clamp bound (7.0 default for swiglu) or +inf to disable the
-                    # clamp (silu without a configured limit).  ``min(x, lim)`` is
-                    # expressed via the wrapped ``maximumf`` + negation so the kernel
-                    # never bakes the limit as a compile-time constant.
+                    # Runtime f32 clamp bound: host passes 7.0 (swiglu default) or
+                    # +inf to disable. min(x, lim) via maximumf + negation keeps the
+                    # limit runtime, never a compile-time constant.
                     _neg_limit = -swiglu_limit_f
 
                     def _fmin(x):

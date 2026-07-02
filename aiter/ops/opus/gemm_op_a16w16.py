@@ -50,7 +50,7 @@ from . import common as _opus_common
 
 logger = logging.getLogger("aiter")
 
-# ---- Low-level pybind bindings --------------------------------------------
+# Low-level pybind bindings
 
 
 def _gen_opus_gemm_a16w16_tune_fake_tensors(
@@ -64,11 +64,10 @@ def _gen_opus_gemm_a16w16_tune_fake_tensors(
     return Y
 
 
-# Raw pybind binding to the C++ id-based dispatcher. We wrap it in a Python
-# function below to add a stride-layout guard before the C++ call -- the
-# launcher hardcodes stride_b_batch == N*K and reads gpu memory directly,
-# so a broadcast / non-contiguous WQ silently corrupts results or faults
-# the GPU. Keep `gen_fake` and `fc_name` on the raw binding so dynamo and
+# Raw pybind binding to the C++ id-based dispatcher, wrapped below to add a
+# stride-layout guard: the launcher hardcodes stride_b_batch == N*K and reads
+# gpu memory directly, so a broadcast / non-contiguous WQ corrupts results or
+# faults the GPU. gen_fake / fc_name stay on the raw binding so dynamo and
 # torch.library see the underlying op.
 @compile_ops(
     "module_deepgemm_opus",
@@ -239,16 +238,12 @@ def opus_gemm_a16w16_tune(
     return Y
 
 
-# Private bf16 no-scale dispatch binding, used only by gemm_a16w16_opus
-# as the CSV-miss fallback path. Wraps the same C++ function (opus_gemm)
-# that used to be exposed via the legacy aiter.ops.deepgemm.deepgemm_opus
-# entry, but deliberately hides its scale / group_layout arguments so
-# callers of the a16w16 module do not see FP8-grouped concepts. The C++
-# side's bf16 branch handles lookup + heuristic dispatch internally.
-#
-# Parameter annotations match the C++ signature exactly; torch_library's
-# infer_schema requires every parameter be typed even though we always
-# pass None for the last three.
+# Private bf16 no-scale dispatch binding, used only by gemm_a16w16_opus as the
+# CSV-miss fallback. Wraps the C++ opus_gemm (formerly aiter.ops.deepgemm.
+# deepgemm_opus) but hides its scale / group_layout args; the C++ bf16 branch
+# does lookup + heuristic dispatch internally. Param annotations match the C++
+# signature exactly (infer_schema needs all typed) even though the last three
+# are always None.
 def _gen_opus_gemm_bf16_dispatch_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -278,14 +273,12 @@ def _opus_gemm_bf16_dispatch(
 ) -> torch.Tensor: ...
 
 
-# ---- High-level shape-driven API -----------------------------------------
+# High-level shape-driven API
 
-# splitk kids (200..299) main kernel only has the <fp32_t> instantiation
-# (traits static_assert D_C==float, fp32 workspace). The reduce kernel
-# (splitk_reduce_kernel) is templated on D_OUT and dispatches to either
-# __bf16 or float at launch time based on Y.dtype(), so both bf16 and fp32
-# outputs are valid. Kept here only as a documentation anchor; the dispatch
-# code below no longer needs to special-case Y.dtype against splitk kids.
+# splitk kids (200..299): main kernel is <fp32_t>-only (fp32 workspace), but the
+# reduce kernel is templated on D_OUT and picks bf16/float at launch from
+# Y.dtype(), so both bf16 and fp32 Y are valid. Documentation anchor only; the
+# dispatch below no longer special-cases Y.dtype against splitk kids.
 _SPLITK_KID_MIN = 200
 _SPLITK_KID_MAX = 299
 
@@ -317,16 +310,10 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
     # B accepted shapes:
     #   * [N, K]                       - allowed only when batch == 1
     #   * [batch, N, K] real-strided   - allowed for any batch
-    #
-    # The opus a16w16-family launchers hardcode `kargs.stride_b_batch = N * K`
-    # (csrc/opus_gemm/gen_instances.py around lines 531/634/735/865) and the
-    # device kernel computes `ptr_b + batch_id * stride_b_batch` directly,
-    # ignoring the tensor's reported stride. A `B.unsqueeze(0).expand(batch,
-    # -1, -1)` view has batch_stride == 0, so the kernel reads garbage past
-    # B's real allocation -- this manifests as NaN, large numerical errors,
-    # or HIP "Memory access fault by GPU node-1" depending on what the
-    # caching allocator parked next to B. Reject the broken case at the
-    # Python boundary rather than letting it through.
+    # The launchers hardcode kargs.stride_b_batch = N*K (gen_instances.py) and
+    # index ptr_b + batch_id * stride_b_batch directly, ignoring reported strides.
+    # A B.unsqueeze(0).expand(batch,-1,-1) view has batch_stride 0 -> reads garbage
+    # (NaN / mem access fault), so reject broadcast views at the Python boundary.
     if B.dim() == 2:
         N, K_b = B.shape
         if K_b != K:
@@ -518,13 +505,12 @@ def gemm_a16w16_opus(
     return _finalize_output(Y, reshape_out_to_2d)
 
 
-# Per-stream splitk workspace init. Call once inside `with torch.cuda.stream(s):`
-# (eagerly, before HIP graph capture) to register a workspace handle for that
-# stream. Needed under vLLM/sglang-style TBO where two CPU threads drive two
-# streams concurrently -- each captured graph must bake in its own buffer
-# pointer; the prior thread_local cache would fail capture on the second
-# stream. After init, run the largest expected gemm eagerly on the same
-# stream to grow the buffer, then capture.
+# Per-stream splitk workspace init. Call once eagerly (before HIP graph capture)
+# inside `with torch.cuda.stream(s):` to register a per-stream workspace handle;
+# needed under vLLM/sglang TBO where two threads drive two streams concurrently
+# (each captured graph bakes in its own buffer pointer; a thread_local cache
+# would fail capture on the second stream). After init, run the largest expected
+# gemm eagerly on the same stream to grow the buffer, then capture.
 @compile_ops("module_deepgemm_opus", fc_name="opus_gemm_workspace_init", develop=True)
 def opus_gemm_workspace_init() -> None: ...
 

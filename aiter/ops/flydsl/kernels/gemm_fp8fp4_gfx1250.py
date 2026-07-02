@@ -209,7 +209,7 @@ def compile_fp8fp4_gemm(
             f"wave_specialized_tdm requires at least {_min_wave_spec_warps} waves, got {num_warps}"
         )
 
-    # ── Format-dependent compile-time constants ──
+    # Format-dependent compile-time constants.
     # A8W4: activation is FP8 (PACK_FACTOR_A=1), weight is FP4 (PACK_FACTOR_B=2)
     if is_a8w4:
         PACK_FACTOR_A = 1  # FP8 activation
@@ -322,10 +322,9 @@ def compile_fp8fp4_gemm(
             return value
         return (value + align - 1) // align * align
 
-    # TDM descriptors partition a tile cooperatively across ``num_warps`` by
-    # deriving per-wave offsets from ``wave_id``. In wave-specialized mode we
-    # dedicate one loader wave to each tensor (A/B/A_scale/B_scale), so each
-    # active loader wave must issue a full-tile descriptor by itself.
+    # TDM descriptors partition a tile cooperatively across ``num_warps`` via
+    # per-``wave_id`` offsets. Wave-specialized mode dedicates one loader wave per
+    # tensor (A/B/A_scale/B_scale), so each issues a full-tile descriptor alone.
     tdm_desc_num_warps = 1 if wave_specialized_tdm else num_warps
 
     # All pipeline stages share the same intra-stage layout in the generic
@@ -383,8 +382,8 @@ def compile_fp8fp4_gemm(
             f"scale_load_path={scale_load_path!r} requires the reference segmented "
             "LDS layout (not active for this tile/format configuration)"
         )
-    # Scale prefetch depth (K-tiles ahead) for the buffer->VGPR path. D=1 is the
-    # sweet spot; D=2 doubles scale VGPRs -> spill + ~18% regression.
+    # Scale prefetch depth (K-tiles ahead) for the buffer->VGPR path; D=1 is best
+    # (D>1 doubles scale VGPRs -> spill/regression).
     _bvs_D = max(1, int(os.environ.get("FLYDSL_BUFFER_VGPR_SCALE_DEPTH", "1")))
     # ab_half_split: repurpose the (under "vgpr") idle scale waves 2,3 as the
     # second halves of A/B, so all 4 waves share the A/B TDM (wave0=A0, wave1=B0,
@@ -1095,10 +1094,9 @@ def compile_fp8fp4_gemm(
                         fmtB=0,
                     )
                 else:
-                    # PTPC-FP8 needs no per-K scaling. We emit the scaled f8f6f4 op
-                    # with an identity E8M0 scale (0x7F = 2^0 = 1.0) for toolchain
-                    # compatibility; it is numerically equivalent to the dedicated
-                    # no-scale op. Future: switch to the equivalent no-scale wmma:
+                    # PTPC-FP8 needs no per-K scaling; emit the scaled f8f6f4 op with
+                    # an identity E8M0 scale (0x7F = 2^0 = 1.0) for toolchain compat
+                    # (numerically equal to the no-scale op). Future: switch to:
                     #   accs[idx] = rocdl.wmma_f32_16x16x128_fp8_fp8(T.vec(8, T.f32), b_frag, a_frag, accs[idx])
                     accs[idx] = rocdl.wmma_scale_f32_16x16x128_f8f6f4(
                         T.vec(8, T.f32),
@@ -1304,7 +1302,7 @@ def compile_fp8fp4_gemm(
                 return accs, _load_a_and_scales(*next_info)
             return accs
 
-        # ── Compute on one LDS buffer ──
+        # Compute on one LDS buffer.
         def compute_tile(
             accs_in,
             lds_a,
@@ -2281,7 +2279,7 @@ def compile_fp8fp4_gemm(
                 return prefetch_fp8_deep_a0_frags(lds_a)
             return None
 
-        # ── Epilogue (unified via _sub_tiles) ──
+        # Epilogue (unified via _sub_tiles).
         def _get_acc_sub8(accs, acc_idx, vec_base):
             """Extract 8-element sub-vector from accumulator."""
             if const_expr(ACC_VEC_SIZE == 8):
@@ -2411,10 +2409,8 @@ def compile_fp8fp4_gemm(
         def epilogue_load_ptpc_scales():
             # PTPC scales: sa[M] per-token (scalar per wm), sb[N] per-channel
             # (8 contiguous N cols per wn). Both fp32, constant along K.
-            # The scale memrefs are dynamically shaped, so max_size=False would fall
-            # back to a max-sized descriptor and disable hardware OOB. Derive
-            # num_records from runtime M / compile-time N (fp32 = 4 bytes) so the
-            # partial last M-tile clips rows >= M (and cols >= N) to 0.
+            # Derive num_records from runtime M / compile-time N (fp32 = 4 bytes) so
+            # hardware OOB clips the partial last M-tile (rows >= M, cols >= N) to 0.
             sa_rsrc = buffer_ops.create_buffer_resource(
                 arg_a_scale, num_records_bytes=m_idx * arith.index(4)
             )
@@ -2497,7 +2493,7 @@ def compile_fp8fp4_gemm(
                 block_threads=block_threads,
             )
 
-        # ====== Multi-stage pipeline ======
+        # Multi-stage pipeline.
         acc_zero = arith.constant_vector(0.0, T.vec(ACC_VEC_SIZE, T.f32))
         accs = [acc_zero] * n_accs
 
@@ -2838,8 +2834,8 @@ def compile_fp8fp4_gemm(
 
         _pipeline_fence(outstanding=TDM_LOADS_PER_STEP * (num_buffers - 2))
 
-        # Main loop — acc_mixed style: fence at top, TDM_load mid-compute.
-        # This overlaps TDM DMA with the remaining WMMA instructions,
+        # Main loop (acc_mixed): fence at top, TDM load mid-compute to overlap
+        # TDM DMA with the remaining WMMA instructions.
         _fence_outstanding = TDM_LOADS_PER_STEP * (num_buffers - 2)
 
         if const_expr(loop_iters > 0 and use_ws_tdm_split_signal_overlap):

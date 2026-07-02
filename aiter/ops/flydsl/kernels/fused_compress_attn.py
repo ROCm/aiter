@@ -108,12 +108,9 @@ _FORCE_BIND_LDS = (
 BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
 
 # --- fp8 + e8m0 constants ---------------------------------------------------
-# Defer ``aiter.utility.dtypes`` import to first call (matches
-# qk_norm_rope_quant pattern). The aiter package is walked by setup.py's AOT
-# compile pass while its top-level ``__init__`` is still executing, and
-# ``aiter.utility.dtypes`` transitively triggers a JIT call into
-# ``module_aiter_core`` (not yet built at that point). Resolving the dtype
-# constants lazily sidesteps both ordering hazards.
+# Defer ``aiter.utility.dtypes`` import to first call: setup.py's AOT pass walks
+# aiter while its __init__ runs, and dtypes triggers a JIT into module_aiter_core
+# (not yet built). Lazy resolution sidesteps the ordering hazard.
 _E8M0_HEADROOM = 7  # silu_and_mul_fq / qk_norm_rope_quant convention
 
 
@@ -134,9 +131,7 @@ _LOG2E = math.log2(math.e)  # exp(x) = exp2(x * log2e) -> single v_exp_f32
 _PRESHUFFLE_TILE = 16
 
 
-# ============================================================================
 # scf helpers (copied verbatim from moe_gemm_2stage.py -- too small to share)
-# ============================================================================
 
 
 @contextmanager
@@ -151,9 +146,7 @@ def _if_then(if_op):
                 scf.YieldOp([])
 
 
-# ============================================================================
 # Kernel builder
-# ============================================================================
 
 
 def _build_kernel(
@@ -584,19 +577,12 @@ def _build_kernel(
             phase1_state = final_state
 
             # ---- Step 7: Phase 2 -- ragged input loop (k ? [window_len, K)) ----
-            # No padding in input phase by construction (window_len absorbs all
-            # leading state-cache rows). Two code paths:
-            #
-            #   enable_prefetch_input=False (legacy): straight per-iter load
-            #     + compute. Issue and compute are serialized within each iter.
-            #
-            #   enable_prefetch_input=True (default): manual single-iter
-            #     prefetch. Prologue issues k=window_len's loads; each loop
-            #     iter consumes the prefetched values and issues k+1's loads
-            #     so the issue overlaps current iter's softmax compute. Helps
-            #     long K (HCA K=128) latency-bound chains. Loop carry grows
-            #     by 3*VEC fp32; gate off if VGPR spill regresses small VEC
-            #     configs.
+            # No padding here (window_len absorbs leading state-cache rows). Two paths:
+            #   enable_prefetch_input=False (legacy): per-iter load+compute serialized.
+            #   enable_prefetch_input=True (default): single-iter prefetch — each iter
+            #     consumes prefetched values and issues k+1's loads, overlapping issue
+            #     with softmax compute. Helps long K (HCA K=128); loop carry grows by
+            #     3*VEC fp32, so gate off if VGPR spill regresses small VEC.
 
             def _phase2_offsets(k_i32):
                 """Compute (col_off, in_row, ape_row) for Phase 2 iter k."""
@@ -660,26 +646,14 @@ def _build_kernel(
 
                 m_final, kv_final, w_final = _split_state(phase2_state)
             else:
-                # Phase 2 with single-iter prefetch, restructured to avoid a
-                # per-iter clamp on the speculative k+1 load.
-                #
-                # Why the restructure: a naive `for k ? [window_len, K)` body
-                # that issues at k+1 OOBs on the last iter (k+1 = K) -- and
-                # AMD CDNA's buffer_load(max_size=True) does NOT reliably
-                # return 0 for OOB (decode-time real workload faults). The
-                # obvious fix `k_next = min(k+1, K-1)` works but costs ~27%
-                # on v1 mid-N (an extra ``arith.minsi`` inside the K=128
-                # loop body trashes scheduling / VGPR pressure).
-                #
-                # Restructure: peel the last iter outside the loop.
-                #   prologue   : prefetch at min(window_len, K-1) -- clamps the
-                #                window_len==K edge case (Phase 2 empty);
-                #                otherwise loads the first real Phase 2 iter.
-                #   main loop  : k ? [window_len, K-1); k+1 <= K-1 is *always*
-                #                in-bounds -> no clamp inside the loop.
-                #   tail iter  : k = K-1, consumes prefetched values, issues
-                #                no new prefetch. Gated by window_len < K so
-                #                that wl==K skips Phase 2 entirely.
+                # Phase 2 with single-iter prefetch, restructured to avoid a per-iter
+                # clamp on the speculative k+1 load. A naive loop issuing at k+1 OOBs
+                # on the last iter (k+1=K), and CDNA buffer_load(max_size) doesn't
+                # reliably return 0 for OOB; the min(k+1,K-1) clamp costs ~27% mid-N.
+                # Restructure — peel the last iter:
+                #   prologue : prefetch at min(window_len, K-1) (clamps wl==K empty case)
+                #   main loop: k ? [window_len, K-1); k+1 <= K-1 always in-bounds
+                #   tail iter: k=K-1, consumes prefetch, no new load; gated by wl < K.
                 c_K_m1_i32 = arith.constant(K - 1, type=i32)
                 k_prologue = arith.minsi(_to_raw(window_len), c_K_m1_i32)
                 pre_kv0, pre_sc0, pre_ape0 = _phase2_issue_loads(k_prologue)
@@ -816,18 +790,10 @@ def _build_kernel(
                 arith.constant(ratio, type=i32),
             )
 
-            # Always compute the rotated/passthrough values per-lane, then
-            # store. ROPE-only threads load cos/sin; NOPE threads use the
-            # pass-through value. We branch via Python-level `if` because the
-            # tid range is static (ROPE_THREAD_LO is constexpr).
-            #
-            # Always compute the rotated values per-lane, then per-lane
-            # select(is_rope, rotated, normed). Avoids a scf.if whose body
-            # mutates `out_lane` (the mutated values would not dominate the
-            # outer scope -- MLIR verification fails).
-            #
-            # cos/sin loads for NOPE threads are safe because we clamp the
-            # row-relative index to 0 (a valid in-bounds position).
+            # Compute rotated values per-lane then per-lane select(is_rope, rotated,
+            # normed). Avoids a scf.if whose body mutates out_lane (those values
+            # wouldn't dominate the outer scope -> MLIR verify fails). cos/sin loads
+            # for NOPE threads are safe: row-relative index is clamped to 0.
             cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
             sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
             c_half_rd = arith.constant(RD // 2, type=i32)
@@ -1272,27 +1238,13 @@ def _build_kernel(
     return launch_fused_compress_attn
 
 
-# ============================================================================
-# K-split single-kernel builder (multi-wave LDS reduce)
-# ============================================================================
-#
-# Why this exists: the legacy single-wave kernel above runs ONE wave64 per
-# boundary, serializing K iters of online-softmax. PMC on CSA Main (D=512,
-# K=8) showed VALU IPC ~0.33 with 53% of cycles in SQ_WAIT_ANY and only 128
-# VMEM insts -- i.e. the wave is stalled on the *serial dependency chain*
-# (each iter's m/kv/w accumulator + 2x exp2 transcendental per lane), not on
-# memory. At decode bs=1-32 each CU holds a single wave, so nothing hides the
-# chain latency.
-#
-# Fix: split K across NW waves in ONE workgroup (block = 64*NW), grid stays
-# = plan_capacity (single dispatch -> no extra ~2.2us launch floor). Each wave
-# runs K/NW iters; LDS cross-wave online-softmax merges the per-wave
-# accumulators; wave 0 then does RMSNorm + GPT-J RoPE + BF16 scatter inline
-# (same tail as the legacy kernel). NW sibling waves on one CU hide each
-# other's exp2 / dependency latency.
-#
-# BF16 scatter only (the V4-Pro CSA Main path the user cares about). FP8 /
-# quant / preshuffle continue to use the legacy single-wave kernel.
+# K-split single-kernel builder (multi-wave LDS reduce).
+# The legacy single-wave kernel serializes K iters of online-softmax; at decode
+# bs=1-32 the wave stalls on that serial m/kv/w + 2x exp2 chain (not on memory).
+# Fix: split K across NW waves in ONE workgroup (block=64*NW, grid stays
+# plan_capacity so no extra launch). Each wave runs K/NW iters; LDS cross-wave
+# online-softmax merges accumulators; wave 0 does RMSNorm + RoPE + scatter inline.
+# Sibling waves hide each other's exp2/dependency latency.
 
 
 def _build_kernel_ksplit(
@@ -2121,9 +2073,7 @@ def _build_kernel_ksplit(
     return launch_fused_compress_attn_ksplit
 
 
-# ============================================================================
 # Cached compile + public API
-# ============================================================================
 
 
 _DEFAULT_COMPILE_HINTS = {

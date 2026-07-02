@@ -46,9 +46,8 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from .tensor_shim import STensor, _to_raw, _run_compiled
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
 
-# Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
-# (the K-split LDS path references these only inside @flyc.kernel / @flyc.jit
-# closures, which formatters may not see).
+# Force-bind LDS-related imports so format hooks don't drop them (K-split LDS
+# path references them only inside @flyc.kernel / @flyc.jit closures).
 _FORCE_BIND_LDS = (
     CompilationContext,
     STensor,
@@ -62,12 +61,9 @@ _FORCE_BIND_LDS = (
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250); D must be a multiple
 
 # --- fp8 + e8m0 constants ---------------------------------------------------
-# Defer ``aiter.utility.dtypes`` import to first call (matches
-# qk_norm_rope_quant pattern). The aiter package is walked by setup.py's AOT
-# compile pass while its top-level ``__init__`` is still executing, and
-# ``aiter.utility.dtypes`` transitively triggers a JIT call into
-# ``module_aiter_core`` (not yet built at that point). Resolving the dtype
-# constants lazily sidesteps both ordering hazards.
+# Defer ``aiter.utility.dtypes`` import to first call (qk_norm_rope_quant
+# pattern): setup.py's AOT pass walks aiter mid-__init__, and the dtype import
+# transitively JITs module_aiter_core before it is built. Lazy resolve avoids it.
 _E8M0_HEADROOM = 7  # silu_and_mul_fq / qk_norm_rope_quant convention
 
 
@@ -88,9 +84,7 @@ _LOG2E = math.log2(math.e)  # exp(x) = exp2(x * log2e) -> single v_exp_f32
 _PRESHUFFLE_TILE = 16
 
 
-# ============================================================================
 # scf helpers (copied verbatim from moe_gemm_2stage.py -- too small to share)
-# ============================================================================
 
 
 @contextmanager
@@ -105,9 +99,7 @@ def _if_then(if_op):
                 scf.YieldOp([])
 
 
-# ============================================================================
 # Kernel builder
-# ============================================================================
 
 
 def _build_kernel(
@@ -292,10 +284,8 @@ def _build_kernel(
             return w
 
         # ---- Step 1: load plan row (single dwordx4) ----
-        # plan layout: each row = 4 contiguous i32 [ragged_id, batch_id, position, window_len].
-        # Fuse the 4 scalar loads into one buffer_load_dwordx4 + 4 extracts --
-        # saves 3 buffer-load instructions per program (visible at small N
-        # where total program count is low).
+        # plan row = 4 contiguous i32 [ragged_id, batch_id, position, window_len].
+        # Fuse into one buffer_load_dwordx4 + 4 extracts (saves 3 loads/program).
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
         plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
@@ -305,9 +295,8 @@ def _build_kernel(
         window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
 
         # ---- Step 2: sentinel-skip ----
-        # Wrap the entire body in scf.IfOp(position >= 0). flydsl's
-        # `if cond: return` does NOT actually early-exit (tail kernel body
-        # still runs with stale values, OOB faults). The IfOp does.
+        # Wrap body in scf.IfOp(position >= 0): flydsl `if cond: return` does not
+        # early-exit (body runs with stale values -> OOB fault); IfOp does.
         is_active = arith.cmpi(
             CmpIPredicate.sge, _to_raw(position), arith.constant(0, type=i32)
         )
@@ -571,19 +560,12 @@ def _build_kernel(
             phase1_state = final_state
 
             # ---- Step 7: Phase 2 -- ragged input loop (k ? [window_len, K)) ----
-            # No padding in input phase by construction (window_len absorbs all
-            # leading state-cache rows). Two code paths:
-            #
-            #   enable_prefetch_input=False (legacy): straight per-iter load
-            #     + compute. Issue and compute are serialized within each iter.
-            #
-            #   enable_prefetch_input=True (default): manual single-iter
-            #     prefetch. Prologue issues k=window_len's loads; each loop
-            #     iter consumes the prefetched values and issues k+1's loads
-            #     so the issue overlaps current iter's softmax compute. Helps
-            #     long K (HCA K=128) latency-bound chains. Loop carry grows
-            #     by 3*VEC fp32; gate off if VGPR spill regresses small VEC
-            #     configs.
+            # No padding here by construction (window_len absorbs leading state
+            # rows). Two paths:
+            #   enable_prefetch_input=False (legacy): serialized per-iter load+compute.
+            #   enable_prefetch_input=True: single-iter prefetch -- iter consumes
+            #     prefetched vals and issues k+1's loads to overlap softmax compute.
+            #     Helps long K (HCA K=128); loop carry grows 3*VEC fp32 (VGPR cost).
 
             def _phase2_offsets(k_i32):
                 """Compute (col_off, in_row, ape_row) for Phase 2 iter k."""
@@ -648,25 +630,16 @@ def _build_kernel(
                 m_final, kv_final, w_final = _split_state(phase2_state)
             else:
                 # Phase 2 with single-iter prefetch, restructured to avoid a
-                # per-iter clamp on the speculative k+1 load.
-                #
-                # Why the restructure: a naive `for k ? [window_len, K)` body
-                # that issues at k+1 OOBs on the last iter (k+1 = K) -- and
-                # AMD CDNA's buffer_load(max_size=True) does NOT reliably
-                # return 0 for OOB (decode-time real workload faults). The
-                # obvious fix `k_next = min(k+1, K-1)` works but costs ~27%
-                # on v1 mid-N (an extra ``arith.minsi`` inside the K=128
-                # loop body trashes scheduling / VGPR pressure).
-                #
-                # Restructure: peel the last iter outside the loop.
+                # per-iter clamp on the speculative k+1 load. A naive k+1 issue
+                # OOBs on the last iter (k+1=K); CDNA buffer_load(max_size) does
+                # not reliably return 0 for OOB (real-workload fault), and the
+                # `min(k+1, K-1)` fix adds an in-loop minsi that hurts scheduling.
+                # Fix: peel the last iter out of the loop.
                 #   prologue   : prefetch at min(window_len, K-1) -- clamps the
-                #                window_len==K edge case (Phase 2 empty);
-                #                otherwise loads the first real Phase 2 iter.
-                #   main loop  : k ? [window_len, K-1); k+1 <= K-1 is *always*
-                #                in-bounds -> no clamp inside the loop.
-                #   tail iter  : k = K-1, consumes prefetched values, issues
-                #                no new prefetch. Gated by window_len < K so
-                #                that wl==K skips Phase 2 entirely.
+                #                window_len==K edge case (Phase 2 empty).
+                #   main loop  : k ? [window_len, K-1); k+1 <= K-1 always in-bounds.
+                #   tail iter  : k = K-1, consumes prefetch, no new issue. Gated by
+                #                window_len < K so wl==K skips Phase 2 entirely.
                 c_K_m1_i32 = arith.constant(K - 1, type=i32)
                 k_prologue = arith.minsi(_to_raw(window_len), c_K_m1_i32)
                 pre_kv0, pre_sc0, pre_ape0 = _phase2_issue_loads(k_prologue)
@@ -803,18 +776,11 @@ def _build_kernel(
                 arith.constant(ratio, type=i32),
             )
 
-            # Always compute the rotated/passthrough values per-lane, then
-            # store. ROPE-only threads load cos/sin; NOPE threads use the
-            # pass-through value. We branch via Python-level `if` because the
-            # tid range is static (ROPE_THREAD_LO is constexpr).
-            #
-            # Always compute the rotated values per-lane, then per-lane
-            # select(is_rope, rotated, normed). Avoids a scf.if whose body
-            # mutates `out_lane` (the mutated values would not dominate the
-            # outer scope -- MLIR verification fails).
-            #
-            # cos/sin loads for NOPE threads are safe because we clamp the
-            # row-relative index to 0 (a valid in-bounds position).
+            # Compute rotated values per-lane, then per-lane select(is_rope,
+            # rotated, normed). Avoids a scf.if that mutates out_lane (mutated
+            # values would not dominate outer scope -> MLIR verification fails).
+            # cos/sin loads for NOPE threads are safe: row-relative index clamped
+            # to 0 (a valid in-bounds position).
             cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
             sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
             c_half_rd = arith.constant(RD // 2, type=i32)
@@ -1015,12 +981,8 @@ def _build_kernel(
                     #       Supports both PRESHUFFLE (16x16 tile) and linear
                     #       layouts via the offset formula.
                     #   (f) lane-0 writes fp32 scale at cache_scale[phys, slot].
-                    #
                     # VEC=2 (Indexer D=128) -> 4 bytes per tid-pair (1 dword).
-                    # VEC=8 (would-be D=512 quant; not used in V4-Pro but
-                    # supported for symmetry) -> 8 bytes per thread alone (2
-                    # dwords); pair cooperation collapses to no-op for VEC>=4
-                    # since a single thread already has dword-aligned data.
+                    # VEC>=4: single thread already dword-aligned, pair-coop is a no-op.
 
                     _, fp8_max = _fp8_const()
                     c_fp8_max = arith.constant(fp8_max, type=f32)
@@ -1305,27 +1267,16 @@ def _build_kernel(
     return launch_fused_compress_attn
 
 
-# ============================================================================
 # K-split single-kernel builder (multi-wave LDS reduce)
-# ============================================================================
 #
-# Why this exists: the legacy single-wave kernel above runs ONE wave32 per
-# boundary, serializing K iters of online-softmax. PMC on CSA Main (D=512,
-# K=8) showed VALU IPC ~0.33 with 53% of cycles in SQ_WAIT_ANY and only 128
-# VMEM insts -- i.e. the wave is stalled on the *serial dependency chain*
-# (each iter's m/kv/w accumulator + 2x exp2 transcendental per lane), not on
-# memory. At decode bs=1-32 each CU holds a single wave, so nothing hides the
-# chain latency.
-#
-# Fix: split K across NW waves in ONE workgroup (block = 32*NW), grid stays
-# = plan_capacity (single dispatch -> no extra ~2.2us launch floor). Each wave
-# runs K/NW iters; LDS cross-wave online-softmax merges the per-wave
-# accumulators; wave 0 then does RMSNorm + GPT-J RoPE + BF16 scatter inline
-# (same tail as the legacy kernel). NW sibling waves on one CU hide each
-# other's exp2 / dependency latency.
-#
-# BF16 scatter only (the V4-Pro CSA Main path the user cares about). FP8 /
-# quant / preshuffle continue to use the legacy single-wave kernel.
+# The legacy single-wave kernel runs ONE wave32 per boundary, serializing K
+# iters of online-softmax -- at decode bs=1-32 one CU holds a single wave, so
+# nothing hides the serial dependency chain (per-iter m/kv/w accum + 2x exp2).
+# Fix: split K across NW waves in ONE workgroup (block=32*NW, grid stays
+# plan_capacity -> single dispatch, no extra launch floor). Each wave runs K/NW
+# iters; LDS cross-wave online-softmax merges accumulators; wave 0 does the
+# RMSNorm + GPT-J RoPE + scatter tail. Sibling waves hide each other's latency.
+# BF16 scatter (V4-Pro CSA Main); FP8/quant/preshuffle use the legacy kernel.
 
 
 def _build_kernel_ksplit(
@@ -2222,9 +2173,7 @@ def _build_kernel_ksplit(
     return launch_fused_compress_attn_ksplit
 
 
-# ============================================================================
 # Cached compile + public API
-# ============================================================================
 
 
 _DEFAULT_COMPILE_HINTS = {
