@@ -211,11 +211,9 @@ class Case:
         (True, True),
     ],
 )
-#@pytest.mark.parametrize("has_y_gammas", [False, True])
-#@pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("has_y_gammas", [False])
-@pytest.mark.parametrize("apply_swiglu", [False])
-@pytest.mark.parametrize("backend",[None,"triton"])
+@pytest.mark.parametrize("has_y_gammas", [False, True])
+@pytest.mark.parametrize("apply_swiglu", [False, True])
+@pytest.mark.parametrize("backend",[None, "triton"])
 def test_op(
     m,
     n,

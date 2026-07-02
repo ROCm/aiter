@@ -11,6 +11,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
+    swizzle_scales_gfx950
 )
 from aiter.ops.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -136,9 +137,7 @@ def compute_roofline(
 
 def check_and_shuffle_scales(scale, N, K):
     if N % 32 == 0 and K % (32 * 8) == 0:
-        scale = shuffle_scale_moe(
-            scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-        )
+        scale = swizzle_scales_gfx950(scale)
         return scale, "CDNA4_SCALE"
     else:
         return scale, None
@@ -168,7 +167,7 @@ def quantize(x, dtype):
 
 
 def bench_mlp_single_weight_init(
-    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+    batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex, backend
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -220,6 +219,7 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale1,
             out_dtype=x_dtype_torch,
             apply_swiglu=True,
+            backend=backend
         )
         x = moe_gemm_a16w4(
             x,
@@ -234,6 +234,7 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale2,
             out_dtype=x_dtype_torch,
             apply_swiglu=True,
+            backend=backend
         )
 
     proton.finalize()
@@ -253,11 +254,12 @@ def bench_mlp(
     TP,
     op_regex,
     num_weight_inits=1,
+    backend=None
 ):
     all_results = []
     for _ in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex
+            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex, backend
         )
         all_results.append(result)
 
@@ -285,6 +287,7 @@ def roofline_mlp(
     op_regex,
     name="",
     num_weight_inits=1,
+    backend=None,
 ):
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
@@ -302,6 +305,7 @@ def roofline_mlp(
         TP,
         op_regex,  # fixed args
         num_weight_inits,
+        backend=backend,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -347,6 +351,12 @@ def parse_args(args: list[str] | None = None):
         help="Number of different weight initializations to run for more stable results (default: 1). "
         "Each initialization runs 100 iterations. Use higher values (e.g., 10) for more stable benchmarks.",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="gluon",
+        help="gluon or triton backend",
+    )
     return parser.parse_args(args=args)
 
 
@@ -383,6 +393,7 @@ def main(args: list[str] | None = None) -> None:
         op_regex=parsed_args.op_regex,
         name="gpt-oss-x2",
         num_weight_inits=parsed_args.num_weight_inits,
+        backend=parsed_args.backend
     )
 
 
