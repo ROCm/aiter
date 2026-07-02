@@ -26,25 +26,14 @@ OPUS_EXPORT void rms_norm_opus(size_t out,
     using namespace aiter::rmsnorm_opus;
     if(rows <= 0 || hidden <= 0)
         return;
-    auto s = reinterpret_cast<hipStream_t>(stream);
+    auto s  = reinterpret_cast<hipStream_t>(stream);
+    auto* o = reinterpret_cast<void*>(out);
+    auto* i = reinterpret_cast<const void*>(in);
+    auto* w = reinterpret_cast<const void*>(weight);
     if(is_bf16)
-        launch_rms<bf16_t>(reinterpret_cast<void*>(out),
-                           reinterpret_cast<const void*>(in),
-                           reinterpret_cast<const void*>(weight),
-                           epsilon,
-                           rows,
-                           hidden,
-                           model_sensitive,
-                           s);
+        launch_norm<bf16_t>(o, i, w, nullptr, epsilon, rows, hidden, model_sensitive, s);
     else
-        launch_rms<fp16_t>(reinterpret_cast<void*>(out),
-                           reinterpret_cast<const void*>(in),
-                           reinterpret_cast<const void*>(weight),
-                           epsilon,
-                           rows,
-                           hidden,
-                           model_sensitive,
-                           s);
+        launch_norm<fp16_t>(o, i, w, nullptr, epsilon, rows, hidden, model_sensitive, s);
 }
 
 OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
@@ -60,25 +49,14 @@ OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
     using namespace aiter::rmsnorm_opus;
     if(rows <= 0 || hidden <= 0)
         return;
-    auto s = reinterpret_cast<hipStream_t>(stream);
-    if(is_bf16)
-        launch_fused_add<bf16_t>(reinterpret_cast<void*>(inout),
-                                 reinterpret_cast<void*>(residual),
-                                 reinterpret_cast<const void*>(weight),
-                                 epsilon,
-                                 rows,
-                                 hidden,
-                                 model_sensitive,
-                                 s);
+    auto s   = reinterpret_cast<hipStream_t>(stream);
+    auto* io = reinterpret_cast<void*>(inout);
+    auto* r  = reinterpret_cast<void*>(residual);
+    auto* w  = reinterpret_cast<const void*>(weight);
+    if(is_bf16) // in-place: out == in == inout
+        launch_norm<bf16_t>(io, io, w, r, epsilon, rows, hidden, model_sensitive, s);
     else
-        launch_fused_add<fp16_t>(reinterpret_cast<void*>(inout),
-                                 reinterpret_cast<void*>(residual),
-                                 reinterpret_cast<const void*>(weight),
-                                 epsilon,
-                                 rows,
-                                 hidden,
-                                 model_sensitive,
-                                 s);
+        launch_norm<fp16_t>(io, io, w, r, epsilon, rows, hidden, model_sensitive, s);
 }
 
 // Fused rmsnorm + dynamic/smooth quant. residual/xscale/unquant = 0 to disable

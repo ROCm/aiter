@@ -40,17 +40,20 @@ inline launch_dims pick_dims(int rows, int vhid)
 
 inline bool aligned16(const void* p) { return (reinterpret_cast<size_t>(p) % 16) == 0; }
 
+// rmsnorm (+ fused residual add when residual != nullptr; in-place when out == in).
 template <typename scalar_t>
-inline void launch_rms(void* out,
-                       const void* in,
-                       const void* weight,
-                       float epsilon,
-                       int rows,
-                       int hidden,
-                       int model_sensitive,
-                       hipStream_t stream)
+inline void launch_norm(void* out,
+                        const void* in,
+                        const void* weight,
+                        void* residual,
+                        float epsilon,
+                        int rows,
+                        int hidden,
+                        int model_sensitive,
+                        hipStream_t stream)
 {
-    const bool vec8     = (hidden % 8 == 0) && aligned16(out) && aligned16(in) && aligned16(weight);
+    const bool vec8 = (hidden % 8 == 0) && aligned16(out) && aligned16(in) && aligned16(weight) &&
+                      (residual == nullptr || aligned16(residual));
     const launch_dims d = pick_dims(rows, vec8 ? hidden / 8 : hidden);
     if(vec8)
         hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<scalar_t, 8>),
@@ -61,6 +64,7 @@ inline void launch_rms(void* out,
                            out,
                            in,
                            weight,
+                           residual,
                            epsilon,
                            rows,
                            hidden,
@@ -74,47 +78,7 @@ inline void launch_rms(void* out,
                            out,
                            in,
                            weight,
-                           epsilon,
-                           rows,
-                           hidden,
-                           model_sensitive);
-}
-
-template <typename scalar_t>
-inline void launch_fused_add(void* inout,
-                             void* residual,
-                             const void* weight,
-                             float epsilon,
-                             int rows,
-                             int hidden,
-                             int model_sensitive,
-                             hipStream_t stream)
-{
-    const bool vec8 =
-        (hidden % 8 == 0) && aligned16(inout) && aligned16(residual) && aligned16(weight);
-    const launch_dims d = pick_dims(rows, vec8 ? hidden / 8 : hidden);
-    if(vec8)
-        hipLaunchKernelGGL((fused_add_rmsnorm2d_fwd_kernel<scalar_t, 8>),
-                           d.grid,
-                           d.block,
-                           0,
-                           stream,
-                           inout,
                            residual,
-                           weight,
-                           epsilon,
-                           rows,
-                           hidden,
-                           model_sensitive);
-    else
-        hipLaunchKernelGGL((fused_add_rmsnorm2d_fwd_kernel<scalar_t, 1>),
-                           d.grid,
-                           d.block,
-                           0,
-                           stream,
-                           inout,
-                           residual,
-                           weight,
                            epsilon,
                            rows,
                            hidden,
