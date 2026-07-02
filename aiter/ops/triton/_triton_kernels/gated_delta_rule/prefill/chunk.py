@@ -227,6 +227,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     o: torch.Tensor | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    initial_state_indices: torch.Tensor | None = None,
+    return_h: bool = False,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
@@ -276,6 +278,12 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         )
     if use_chunk_hip and (_is_gfx12_runtime() or num_decodes > 0):
         use_chunk_hip = False
+
+    if initial_state_indices is not None and (use_chunk_hip or use_chunk_flydsl):
+        raise ValueError(
+            "initial_state_indices (in-place state scatter) is only supported on "
+            "the Triton VK hidden-state path; disable use_chunk_hip/use_chunk_flydsl."
+        )
 
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         k=k,
@@ -351,6 +359,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             state_dtype=state_dtype,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            initial_state_indices=initial_state_indices,
         )
 
     if o is None:
@@ -371,4 +380,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         num_decode_tokens=num_decode_tokens,
     )
 
+    if return_h:
+        return g_cumsum, o, final_state, h
     return g_cumsum, o, final_state

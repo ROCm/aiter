@@ -458,6 +458,8 @@ def chunk_gated_delta_rule_opt_vk(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    initial_state_indices: torch.Tensor | None = None,
+    return_h: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
@@ -513,7 +515,14 @@ def chunk_gated_delta_rule_opt_vk(
             )
         # Prefill sequence count == len(cu_seqlens) - 1 - num_decodes.
         n_prefill = len(cu_seqlens) - 1 - num_decodes
-        if initial_state is not None and initial_state.shape[0] != n_prefill:
+        # With initial_state_indices, `initial_state` is the full recurrent-state
+        # pool (num_slots >= n_prefill) indexed per-sequence, so its leading dim
+        # need not equal the sequence count.
+        if (
+            initial_state_indices is None
+            and initial_state is not None
+            and initial_state.shape[0] != n_prefill
+        ):
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {n_prefill} rather than {initial_state.shape[0]}."
@@ -532,7 +541,7 @@ def chunk_gated_delta_rule_opt_vk(
         q, _ = l2norm_fwd(q)
         k, _ = l2norm_fwd(k)
 
-    g_cumsum, o, final_state = chunk_gated_delta_rule_fwd_opt_vk(
+    result = chunk_gated_delta_rule_fwd_opt_vk(
         q=q,
         k=k,
         v=v,
@@ -549,5 +558,13 @@ def chunk_gated_delta_rule_opt_vk(
         o=o,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
+        initial_state_indices=initial_state_indices,
+        return_h=return_h,
     )
+    if return_h:
+        _, o, final_state, h = result
+        # h: per-chunk hidden-state snapshots [B, NT, H, V, K] (V-major), for
+        # radix / extra-buffer SSM-state tracking at chunk boundaries.
+        return o.to(q.dtype), final_state, h
+    _, o, final_state = result
     return o.to(q.dtype), final_state
