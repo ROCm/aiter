@@ -1,38 +1,96 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 from torch import Tensor
 from ..jit.core import compile_ops
 from typing import Optional
 
+from .rmsnorm_opus import fused_add_rms_norm_opus as _fused_add_rms_norm_opus
+from .rmsnorm_opus import rms_norm_opus as _rms_norm_opus
+
 MD_NAME = "module_rmsnorm"
 
 
-@compile_ops("module_rmsnorm")
-def rms_norm_cu(
+def get_rmsnorm_backend() -> str:
+    """Active rmsnorm backend: 'ck' (default) or 'opus'.
+
+    Switch with the AITER_RMSNORM_BACKEND env var. 'opus' uses the self-contained
+    opus module (module_rmsnorm_opus, ~1 torch-free TU) and avoids the ~225s cold
+    JIT build of the CK module_rmsnorm (aiter issue #4055). Read per-call so it can
+    be toggled at runtime.
+    """
+    return os.environ.get("AITER_RMSNORM_BACKEND", "ck").strip().lower()
+
+
+def _use_opus(
+    input, use_model_sensitive_rmsnorm: int = 0, gemma_norm: bool = False
+) -> bool:
+    """True when the opus backend can serve this call.
+
+    Opus covers the plain (non-quant, non model-sensitive, non-gemma) bf16/fp16
+    path for any hidden size; everything else falls back to CK / quant kernels.
+    """
+    return (
+        get_rmsnorm_backend() == "opus"
+        and use_model_sensitive_rmsnorm == 0
+        and not gemma_norm
+        and input.dtype in (torch.float16, torch.bfloat16)
+    )
+
+
+@compile_ops("module_rmsnorm", fc_name="rms_norm_cu")
+def rms_norm_cu_ck(
     out: Tensor,
     input: Tensor,
     weight: Tensor,
     epsilon: float,
 ) -> None:
     """
-    Cuda version of rmsnorm
+    Cuda version of rmsnorm (CK / module_rmsnorm)
     """
     ...
 
 
-@compile_ops("module_rmsnorm")
-def fused_add_rms_norm_cu(
+def rms_norm_cu(
+    out: Tensor,
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+) -> None:
+    """out = rmsnorm(input) * weight. Uses opus when AITER_RMSNORM_BACKEND=opus."""
+    if _use_opus(input):
+        _rms_norm_opus(out, input, weight, epsilon)
+    else:
+        rms_norm_cu_ck(out, input, weight, epsilon)
+
+
+@compile_ops("module_rmsnorm", fc_name="fused_add_rms_norm_cu")
+def fused_add_rms_norm_cu_ck(
     input: Tensor,  # input/out
     residual_in: Tensor,  # residual_in/out
     weight: Tensor,
     epsilon: float,
 ) -> None:
     """
-    Cuda version of rmsnorm fused add
+    Cuda version of rmsnorm fused add (CK / module_rmsnorm)
     """
     ...
+
+
+def fused_add_rms_norm_cu(
+    input: Tensor,  # input/out
+    residual_in: Tensor,  # residual_in/out
+    weight: Tensor,
+    epsilon: float,
+) -> None:
+    """In-place fused add + rmsnorm. Uses opus when AITER_RMSNORM_BACKEND=opus."""
+    if _use_opus(input):
+        _fused_add_rms_norm_opus(input, residual_in, weight, epsilon)
+    else:
+        fused_add_rms_norm_cu_ck(input, residual_in, weight, epsilon)
 
 
 def gen_rms_norm_fake_tensor(
@@ -44,9 +102,6 @@ def gen_rms_norm_fake_tensor(
     return torch.empty_like(input, dtype=input.dtype, device=input.device)
 
 
-@compile_ops(
-    "module_rmsnorm", fc_name="rmsnorm2d_fwd", gen_fake=gen_rms_norm_fake_tensor
-)
 def rms_norm(
     input: Tensor,
     weight: Tensor,
@@ -54,9 +109,13 @@ def rms_norm(
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
     """
-    CK version of rmsnorm
+    rmsnorm; CK by default, opus when AITER_RMSNORM_BACKEND=opus (plain bf16/fp16).
     """
-    ...
+    if _use_opus(input, use_model_sensitive_rmsnorm):
+        out = torch.empty_like(input)
+        _rms_norm_opus(out, input, weight, epsilon)
+        return out
+    return rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
 def rmsnorm2d_fwd(
@@ -65,6 +124,10 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
+    if _use_opus(input, use_model_sensitive_rmsnorm):
+        out = torch.empty_like(input, dtype=input.dtype, device=input.device)
+        _rms_norm_opus(out, input, weight, epsilon)
+        return out
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
     else:
@@ -83,6 +146,13 @@ def rmsnorm2d_fwd_with_add(
     gemma_norm: bool = False,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
+    if _use_opus(input, use_model_sensitive_rmsnorm, gemma_norm):
+        # opus fused kernel is in-place on (io, res); stage into the caller's
+        # out / residual_out so input / residual_in are left untouched.
+        out.copy_(input)
+        residual_out.copy_(residual_in)
+        _fused_add_rms_norm_opus(out, residual_out, weight, epsilon)
+        return
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         rmsnorm2d_fwd_with_add_ck(
             out,
