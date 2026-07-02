@@ -43,55 +43,9 @@ namespace aiter {
  * @param v_head_dim Dimension of value head
  * @param stream HIP stream for GPU execution
  *
- * @note This function requires HIP runtime environment and appropriate GPU support
- * @note The function will compile the kernel on first use with given parameters
- *
- * @throws May throw exceptions if kernel compilation fails or if GPU execution encounters errors
- *
- * @example
- * ```cpp
- * // Example usage:
- * hipStream_t stream;
- * hipStreamCreate(&stream);
- *
- * asm_mla_decode_fwd(
- *     std::nullopt,           // Use default folder
- *     q_ptr,                  // Query tensor
- *     kv_buffer_ptr,         // KV cache buffer
- *     qo_indptr_ptr,         // Query output indices
- *     kv_indptr_ptr,         // KV indices
- *     kv_page_indices_ptr,   // Page indices
- *     kv_last_page_lens_ptr, // Last page lengths
- *     max_seqlen_q,          // Maximum sequence length of query
- *     1.0f,                  // Softmax scale
- *     logits_ptr,           // Output logits
- *     attn_lse_ptr,         // Output LSE
- *     output_ptr,           // Final output
- *     batch_size,           // Number of sequences
- *     num_heads,            // Number of heads
- *     num_kv_heads,         // Number of KV heads
- *     q_stride_0,           // Query stride
- *     kv_stride_0,          // KV stride
- *     lse_stride_0,         // LSE strides
- *     lse_stride_1,
- *     lse_stride_2,
- *     out_stride_0,         // Output strides
- *     out_stride_1,
- *     page_size,            // Cache page size
- *     "bf16",              // Query data type
- *     "bf16",              // KV data type
- *     num_splits,          // Number of KV splits
- *     head_dim,            // Value head dimension
- *     stream               // HIP stream
- * );
- * ```
- *
- * @see Related functions:
- *      - run_lib() for kernel execution
- *      - get_default_func_name() for kernel naming
- *
- * @warning Ensure that all input and output pointers are properly allocated and aligned
- * @warning The function requires write access to compile and store the generated kernel
+ * @note Requires HIP runtime; compiles the kernel on first use with the given parameters.
+ * @throws May throw if kernel compilation fails or GPU execution errors.
+ * @warning All input/output pointers must be allocated and aligned; compilation needs write access.
  */
 void asm_mla_decode_fwd(std::optional<std::string> folder,
                         void* q,                 //   [num_seqs, num_heads, head_size]

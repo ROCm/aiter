@@ -1111,15 +1111,9 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
     }
 }
 
-// -----------------------------------------------------------------------
-// -----------------------------------------------------------------------
-// ----------------------- Experimental ----------------------------------
-// Works for: head_dim=128, cache_t=bf16
-// Feature:
-// 1. continuous threads work together to load K cache into LDS, then each thread save the LDS into
-// registers.
-// 2. Double buffer of K cache loading
-// 3. NT_KV_LOAD set to true
+// Experimental kernel. Works for: head_dim=128, cache_t=bf16
+// Features: 1) threads cooperatively load K cache into LDS, then each thread reads LDS into
+// registers; 2) double-buffered K cache loading; 3) NT_KV_LOAD set to true.
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
