@@ -33,7 +33,7 @@ def _valid_tiles(masked_rsrc, expert, max_m, tile_m):
     valid_m = buffer_ops.buffer_load(masked_rsrc, expert, vec_width=1, dtype=i32)
     valid_m = arith.maxsi(valid_m, c0)
     valid_m = arith.minsi(valid_m, max_m)
-    return (valid_m + tile_m - arith.constant(1, type=i32)) / tile_m
+    return (valid_m + tile_m - arith.constant(1, type=i32)) // tile_m
 
 
 def _emit_prefix_sum(masked_rsrc, expert, max_m, tile_m):
@@ -129,7 +129,7 @@ def build_moe_m_tile_map_module():
             max_tiles_idx = arith.index_cast(T.index, max_m_tiles)
             c0 = arith.constant(0, index=True)
             c1 = arith.constant(1, index=True)
-            trips = (max_tiles_idx + arith.index(BLOCK_THREADS - 1)) / arith.index(
+            trips = (max_tiles_idx + arith.index(BLOCK_THREADS - 1)) // arith.index(
                 BLOCK_THREADS
             )
 

@@ -775,11 +775,15 @@ allreduce_prototype_twoshot(T const* A,
                             int rank,
                             uint8_t** dbuffer_list,
                             uint32_t data_offset,
-                            uint32_t flag_color,
+                            uint32_t* d_flag_color,
                             int64_t data_size_per_phase)
 {
     int block = blockIdx.x;
     int grid  = gridDim.x;
+
+    // Per-block flag color from device memory, advanced on-device so each
+    // CUDA-graph replay uses a fresh color (a host scalar would be baked in).
+    uint32_t flag_color = d_flag_color[blockIdx.x];
 
     while(block < num_blocks)
     {
@@ -788,6 +792,8 @@ allreduce_prototype_twoshot(T const* A,
         block += grid;
         flag_color++;
     }
+    if (threadIdx.x == 0 && threadIdx.y == 0)
+        d_flag_color[blockIdx.x] = flag_color;
 }
 
 #define TWOSHOT_DISPATCH(__codec)                                             \
@@ -807,7 +813,7 @@ allreduce_prototype_twoshot(T const* A,
                            rank,                                              \
                            dbuffer_list,                                      \
                            data_offset,                                       \
-                           flag_color,                                        \
+                           d_flag_color,                                        \
                            this->kMaxProblemSize);                            \
     }                                                                         \
     else if(world_size == 4)                                                  \
@@ -826,7 +832,7 @@ allreduce_prototype_twoshot(T const* A,
                            rank,                                              \
                            dbuffer_list,                                      \
                            data_offset,                                       \
-                           flag_color,                                        \
+                           d_flag_color,                                        \
                            this->kMaxProblemSize);                            \
     }                                                                         \
     else if(world_size == 8)                                                  \
@@ -845,7 +851,7 @@ allreduce_prototype_twoshot(T const* A,
                            rank,                                              \
                            dbuffer_list,                                      \
                            data_offset,                                       \
-                           flag_color,                                        \
+                           d_flag_color,                                        \
                            this->kMaxProblemSize);                            \
     }
 
@@ -866,7 +872,7 @@ struct DeviceComms
     static int constexpr kMaxWorldSize = 8;
 
     bool initialized    = false;
-    uint32_t flag_color = 1;
+    uint32_t* d_flag_color = nullptr;
     int world_size;
     int rank;
 
@@ -900,6 +906,17 @@ struct DeviceComms
         // Clear the flags buffer.
         HIP_CHECK(hipMemset(dbuffer, 0, flags_buffer_size));
 
+        // Per-block flag color counter (device-side; see kernel). Init to 1,
+        // since 0 would collide with the just-memset'd flags buffer.
+        HIP_CHECK(hipMalloc(&d_flag_color, kMaxNumBlocks * sizeof(uint32_t)));
+        {
+            std::vector<uint32_t> init_color(kMaxNumBlocks, 1u);
+            HIP_CHECK(hipMemcpy(d_flag_color,
+                                init_color.data(),
+                                kMaxNumBlocks * sizeof(uint32_t),
+                                hipMemcpyHostToDevice));
+        }
+
         // Device-side list of IPC buffers.
         buffer_list.resize(world_size);
         HIP_CHECK(hipMalloc(&dbuffer_list, world_size * sizeof(uint8_t*)));
@@ -917,6 +934,14 @@ struct DeviceComms
 
     void destroy()
     {
+        // Freed unconditionally: it is allocated before `initialized` is set,
+        // so a HIP failure mid-init must not leak it. (Self-guarded: nullptr
+        // until allocated, reset after free.)
+        if(d_flag_color)
+        {
+            HIP_CHECK(hipFree(d_flag_color));
+            d_flag_color = nullptr;
+        }
         if(initialized)
         {
             for(int i = 0; i < world_size; i++)
@@ -986,8 +1011,7 @@ struct DeviceComms
         default: TWOSHOT_DISPATCH(CodecFP) break;
         }
         HIP_CHECK(hipGetLastError());
-        // Rotate the flag color.
-        flag_color += divceil(N, grid);
+        // flag color advances on-device now (see kernel), no host rotation.
     }
 };
 

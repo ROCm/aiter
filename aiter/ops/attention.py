@@ -392,13 +392,14 @@ def pa_ps_fwd_asm(
 
 
 # ---------------------------------------------------------------------------
-# pa_decode_bf16_asm (gfx1250) — persistent / split-KV paged-attention decode.
+# pa_decode_bf16_asm (gfx1250) -- persistent / split-KV paged-attention decode.
 #
 # Wraps the SP3 kernel PA_DECODE_D64_1TG_4W_PS (head_dim=64, page_size=256,
 # gqa=8).  FP8 Q **and** FP8 paged KV cache, bf16 output, **per-tensor** scalar
 # dequant scales for Q/K/V (distinct from the per-token/per-block scale tensors
 # used by pa_ps_fwd_asm).  GPT-OSS style attention sink (per-Q-head fp32 logits
-# in the kernel's pre-scale raw-logit domain) is always read by the kernel.
+# in the SCALED-logit domain, exp(sink); kernel divides by s_eff internally) is
+# always read by the kernel.
 #
 # Memory-allocation policy: all GPU tensors are allocated on the Python side;
 # the C++ entry point performs only pointer + stride bookkeeping and the kernel
@@ -417,6 +418,7 @@ def _pa_decode_bf16_asm(
     V: torch.Tensor,
     kv_indices: torch.Tensor,
     context_lens: torch.Tensor,
+    softmax_scale: float,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
@@ -444,9 +446,9 @@ def pa_decode_bf16_asm(
     kv_indptr: torch.Tensor,
     gqa: int = 8,
     mtp: int = 0,
-    query_scale: float = 1.0,
-    key_scale: float = 1.0,
-    value_scale: float = 1.0,
+    query_scale: Optional[torch.Tensor] = None,
+    key_scale: Optional[torch.Tensor] = None,
+    value_scale: Optional[torch.Tensor] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     work_indptr: Optional[torch.Tensor] = None,
     work_info: Optional[torch.Tensor] = None,
@@ -461,13 +463,15 @@ def pa_decode_bf16_asm(
     Contract details:
       * `Q`/`K`/`V` are FP8; `out` is bf16 with Q's logical shape.
       * `query_scale`/`key_scale`/`value_scale` are the per-tensor FP8 dequant
-        scales; the attention `softmax_scale` (typically 1/sqrt(head_dim)) is
-        folded into `key_scale` before launch (the kernel forms
-        scl_log2e = query_scale * key_scale * log2e).
-      * `sink` (optional) holds per-Q-head fp32 logits in the kernel's
-        pre-scale raw-logit domain, shape [kv_head_num * gqa].  The kernel
-        always reads this slot, so when `sink` is None a -inf buffer is
-        allocated, making the sink a numerical no-op.
+        scales as 1-element fp32 tensors (None means 1.0); the attention
+        `softmax_scale` (typically 1/sqrt(head_dim)) is
+        passed BY VALUE (kernarg 0x60) and the kernel forms
+        scl_log2e = query_scale * key_scale * softmax_scale * log2e.
+      * `sink` (optional) holds per-Q-head fp32 logits in the SCALED-logit
+        domain (exp(sink), Triton/GPT-OSS convention; the kernel divides by
+        s_eff internally), shape [kv_head_num * gqa].  The kernel always reads
+        this slot, so when `sink` is None a -inf buffer is allocated, making the
+        sink a numerical no-op.
     """
     device = Q.device
     kv_head_num = K.shape[1]
@@ -476,12 +480,9 @@ def pa_decode_bf16_asm(
     if out is None:
         out = torch.empty(Q.shape, dtype=torch.bfloat16, device=device)
 
-    q_scale = torch.tensor([query_scale], dtype=torch.float32, device=device)
-    # Fold the attention softmax scale into key_scale (matches pa_ps.cpp).
-    k_scale = torch.tensor(
-        [key_scale * softmax_scale], dtype=torch.float32, device=device
-    )
-    v_scale = torch.tensor([value_scale], dtype=torch.float32, device=device)
+    # query/key/value_scale are 1-element fp32 dequant scales, passed straight to
+    # the kernel. softmax_scale is passed BY VALUE (kernarg 0x60); the kernel
+    # applies it, so do NOT pre-fold it into key_scale.
 
     if sink is None:
         # The kernel is compiled sink-enabled (always reads + merges the sink
@@ -490,7 +491,7 @@ def pa_decode_bf16_asm(
         # produce inf/NaN in the in-kernel sink merge.
         sink = torch.full((q_head_num,), -1.0e30, dtype=torch.float32, device=device)
     else:
-        sink = sink.to(torch.float32).contiguous()
+        assert sink.dtype == torch.float32, "sink must be in fp32 for pa ASM"
 
     _pa_decode_bf16_asm(
         Q,
@@ -498,9 +499,10 @@ def pa_decode_bf16_asm(
         V,
         kv_indices,
         context_lens,
-        q_scale,
-        k_scale,
-        v_scale,
+        softmax_scale,
+        query_scale,
+        key_scale,
+        value_scale,
         out,
         qo_indptr,
         kv_indptr,
@@ -523,9 +525,12 @@ def pa_reduce_v1(
     reduce_final_map: Optional[torch.Tensor],
     reduce_partial_map: torch.Tensor,
     max_seqlen_q: int,
-    num_kv_splits: int,
     final_output: torch.Tensor,
     final_lse: Optional[torch.Tensor] = None,
+    # num_kv_splits is trailing+optional so the ATOM call site (which passes 8
+    # positional args, no split count) stays aligned. The kernel uses
+    # max(SM_count, num_kv_splits), so the default 0 means "auto" (SM_count).
+    num_kv_splits: int = 0,
 ) -> None:
     mla_reduce_v1(
         partial_output,
@@ -605,7 +610,6 @@ def pa_persistent_fwd(
         reduce_final_map,
         reduce_partial_map,
         max_qlen,
-        0,
         output,
         final_lse,
     )
@@ -809,10 +813,63 @@ def mla_decode_stage1_asm_fwd(
     output: torch.Tensor,
     # [batch_size, num_heads, v_head_dim]
     lse: Optional[torch.Tensor] = None,
-    # [batch_size, num_heads]
+    # [1] per-tensor
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
-    # [1] pertensor
+    # round-robin context-parallel (CP) extension:
+    #   g_kv_indptr   : [batch_size+1] GLOBAL kv_indptr (per-request global KV length)
+    #   cp_world_size : number of CP ranks (W); 1 == disabled
+    #   cp_rank       : this rank id (r); local kv idx j -> global pos j*W + r
+    g_kv_indptr: Optional[torch.Tensor] = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+    # [batch_size] scratch for gfx1250 packed MLA kernels
+    valid_split_count: Optional[torch.Tensor] = None,
+    use_valid_split_count_reduce: int = 0,
+) -> None: ...
+
+
+MD_NAME_V4 = "module_mla_v4_asm"
+
+
+@compile_ops(MD_NAME_V4, ffi_type="ctypes")
+def mla_decode_v4_asm(
+    # [total_query_len, num_heads, head_size]   FP8 packed Q + e8m0 scale region
+    Q: torch.Tensor,
+    # [total_query_len, num_heads, kv_rotary]   BF16
+    qrope: torch.Tensor,
+    # [num_page, page_size, num_kv_heads, head_size]  FP8
+    KV: torch.Tensor,
+    # [num_page, page_size, num_kv_heads, kv_rotary]  BF16
+    kvrope: torch.Tensor,
+    # [num_seqs+1]
+    qo_indptr: torch.Tensor,
+    # [num_seqs+1]
+    kv_indptr: torch.Tensor,
+    # [num_page_used]
+    kv_page_indices: torch.Tensor,
+    # [num_seqs]
+    kv_last_page_lens: torch.Tensor,
+    # [num_seqs+1]
+    split_indptr: torch.Tensor,
+    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
+    # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
+    # tensor; there is no nullable-sink convention on the C ABI. Pass
+    # torch.full((num_heads,), float("-inf")) for "no sink" math.
+    sink: torch.Tensor,
+    max_seqlen_q: int,
+    # ignored on v4 nm; kernel hardcodes 1/sqrt(kV4DimNope+kV4DimRope)=1/sqrt(512)
+    softmax_scale: float,
+    # 0 = fp32 split-out path; 1 = bf16 nosplit reduce path
+    out_16_nosplit: int,
+    num_kv_splits: int,
+    # outputs
+    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32
+    splitData: torch.Tensor,
+    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, 1]          FP32
+    splitLse: torch.Tensor,
+    # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
+    output: torch.Tensor,
 ) -> None: ...
 
 
@@ -1097,8 +1154,23 @@ def get_mla_metadata_info_v1(
     )
 
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
-    max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
+    packed_qo_len = effective_seqlen_qo * num_head_qo
+    max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 16))
+
     if (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.bf16
+        and kv_dtype == dtypes.bf16
+        and packed_qo_len >= 64
+        and num_head_qo <= 64
+        and (packed_qo_len < 128 or num_head_qo == 48)
+    ):
+        if num_head_qo * 2 > 64:
+            # e.g. nhead=48: C++ does  `return seqlen_qo`  (not ceil)
+            max_qo_tiles_per_batch = effective_seqlen_qo
+        else:
+            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 64))
+    elif (
         num_head_qo == 16
         or (
             get_gfx() == "gfx942"
@@ -1125,10 +1197,10 @@ def get_mla_metadata_info_v1(
             )
         )
     ):
-        max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
+        max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
     elif (
         get_gfx() == "gfx950"
-        and ((num_head_qo * effective_seqlen_qo) >= 128 or num_head_qo > 64)
+        and (packed_qo_len >= 128 or num_head_qo > 64)
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
         and num_head_qo != 48
@@ -1136,9 +1208,7 @@ def get_mla_metadata_info_v1(
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
         else:
-            max_qo_tiles_per_batch = int(
-                math.ceil(effective_seqlen_qo * num_head_qo / 128)
-            )
+            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
 
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
@@ -1153,12 +1223,19 @@ def get_mla_metadata_info_v1(
         max_split_tiles = tile_cnt * cu_num
 
     # Metadata's global split cap is `min(cu_num, max_split_per_batch * batch_size)`
-    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). A single tile can in
-    # the worst case absorb the entire global budget, so reduce_partial_map must
-    # hold up to tile_cnt * per_tile_cap entries.
+    # (see csrc/kernels/mla/metadata/v1_2_device.cuh:560-562). This is a GLOBAL
+    # budget shared across all tiles, so the total number of partial reduce
+    # entries is bounded by the base tiles (one per tile) plus at most the global
+    # split budget of EXTRA splits distributed across them:
+    #     reduce_partial_map <= tile_cnt + per_tile_cap
+    # The previous `tile_cnt * per_tile_cap` assumed every tile could individually
+    # absorb the whole global budget simultaneously, which the shared budget
+    # forbids. With cudagraph batch_size >> cu_num that product collapsed to
+    # tile_cnt * cu_num (e.g. 512 * 256 = 131072), and aiter mla_decode_fwd sizes
+    # its fp32 `logits` from reduce_partial_map.size(0) -> ~32 GiB OOM at capture.
     if max_split_per_batch > 0:
         per_tile_cap = min(cu_num, max_split_per_batch * batch_size)
-        max_split_tiles = max(max_split_tiles, tile_cnt * per_tile_cap)
+        max_split_tiles = max(max_split_tiles, tile_cnt + per_tile_cap)
 
     if not intra_batch_mode:
         return (
@@ -1204,6 +1281,7 @@ def get_mla_metadata_v1(
     intra_batch_mode: bool = False,
     dtype_q: Optional[torch.dtype] = None,
     dtype_kv: Optional[torch.dtype] = None,
+    is_cp_round_robin: bool = False,
 ) -> None:
     """
     Inputs:

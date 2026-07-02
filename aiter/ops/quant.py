@@ -1233,6 +1233,16 @@ def rope_rotate_activation(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
+    out_scale: Optional[torch.Tensor] = None,
+    group_size: int = 128,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate.
+
+    When ``out_scale`` is given, the rotated activation is additionally
+    fp8-quantized in-kernel (fusing what ``get_hip_quant(per_1x128)`` would do):
+    ``out`` must be fp8 and receives ``round(rotated / scale)``, while
+    ``out_scale`` (``[m, dim // group_size]`` fp32) receives the per-(row,
+    ``1 x group_size``) block scales ``scale = absMax / fp8_max``. Without
+    ``out_scale`` it is the bf16/fp16 in-place path (``out`` shares dtype with
+    ``input``)."""
     ...
