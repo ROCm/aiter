@@ -487,58 +487,116 @@ def _pa_decode_sparse(
         # out_val = gl.where(l_i[:, None] > 0.0, acc * one_over_L, 0.0)
         out_val = acc * one_over_L
 
-        h_offs_out = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
-        d_offs_out = gl.arange(0, BLOCK_D, layout=gl.SliceLayout(0, Q_BLOCKED_LAYOUT))
-        h_offs_out_eff = h_off_base + h_offs_out
-        h_mask_out = h_offs_out_eff < H
+        # Same two-half padded TDM store as the KV_SPLITS>1 acc path (see there
+        # for the full rationale). out is bf16, so a single [BLOCK_H, 512] store
+        # would actually fit padInterval <= 256 dwords, but we split for symmetry
+        # with the acc path; each [BLOCK_H, BLOCK_D//2] half pads 2 elements/row
+        # (half-row stride 129 dwords, 129 % 32 == 1) -> 16 rows on 16 distinct
+        # banks (no WMMA-store conflict), padInterval == innermost == BLOCK_D//2.
+        HALF_D: gl.constexpr = BLOCK_D // 2
+        out_half_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[HALF_D, 2]], [BLOCK_H, HALF_D], [1, 0]
+        )
 
-        out_blocked = gl.convert_layout(
-            out_val.to(out_ptr.dtype.element_ty), Q_BLOCKED_LAYOUT
+        out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=out_ptr + t * out_stride_t,
+            shape=[H, D],
+            strides=[out_stride_h, out_stride_d],
+            block_shape=[BLOCK_H, HALF_D],
+            layout=out_half_shared,
         )
-        gl.amd.cdna4.buffer_store(
-            out_blocked,
-            ptr=out_ptr + t * out_stride_t,
-            offsets=(
-                h_offs_out_eff[:, None] * out_stride_h
-                + d_offs_out[None, :] * out_stride_d
-            ).to(gl.int32),
-            mask=h_mask_out[:, None],
+
+        out_buf0 = gl.allocate_shared_memory(
+            out_ptr.dtype.element_ty, [BLOCK_H, HALF_D], out_half_shared
         )
+        out_buf1 = gl.allocate_shared_memory(
+            out_ptr.dtype.element_ty, [BLOCK_H, HALF_D], out_half_shared
+        )
+
+        # Contiguous register split -> out0 = cols [0, HALF_D), out1 = rest.
+        out_r = (
+            out_val.to(out_ptr.dtype.element_ty)
+            .reshape(BLOCK_H, 2, HALF_D)
+            .permute(0, 2, 1)
+        )
+        out0, out1 = gl.split(out_r)
+        out_buf0.store(out0)
+        gl.amd.gfx1250.tdm.async_store(out_desc, [h_off_base, 0], out_buf0)
+        out_buf1.store(out1)
+        gl.amd.gfx1250.tdm.async_store(out_desc, [h_off_base, HALF_D], out_buf1)
+        gl.amd.gfx1250.tdm.async_wait(0)
     else:
-        h_offs_ml = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
+        HALF_D: gl.constexpr = BLOCK_D // 2
+
+        # TDM store: acc -> shared -> global acc_partial. The descriptor views the
+        # per-(token, split) slab as [H, D]; TDM boundary handling drops rows
+        # beyond H, replacing the old h_mask_a masked buffer_store.
+        #
+        # Two constraints make a single [BLOCK_H, BLOCK_D] store impossible:
+        #   1. TDM stores require padInterval == innermost block dim.
+        #   2. f32 caps padInterval at 256 dwords (log2(padInterval) <= 8).
+        # With BLOCK_D=512 no padding scheme satisfies both. But row stride
+        # BLOCK_D is a multiple of 32, so bank == col % 32 and the WMMA store
+        # hits the same bank for all rows -> BLOCK_H-way conflict, and TDM only
+        # allows non-swizzled or padded layouts (no XOR swizzle) to fix it.
+        #
+        # So store acc as two [BLOCK_H, BLOCK_D//2] column halves. Each half pads
+        # 2 elements per row -> physical stride 258, (258 % 32) == 2, additive
+        # order 16 -> the 16 rows land on 16 distinct banks (no conflict), while
+        # padInterval == innermost == BLOCK_D//2 == 256 satisfies both TDM rules.
+        acc_half_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[HALF_D, 4]], [BLOCK_H, HALF_D], [1, 0]
+        )
+
+        acc_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=acc_partial_ptr + t * ap_stride_t + pid_k * ap_stride_k,
+            shape=[H, D],
+            strides=[ap_stride_h, ap_stride_d],
+            block_shape=[BLOCK_H, HALF_D],
+            layout=acc_half_shared,
+        )
+
+        acc_buf0 = gl.allocate_shared_memory(
+            acc_partial_ptr.dtype.element_ty, [BLOCK_H, HALF_D], acc_half_shared
+        )
+        acc_buf1 = gl.allocate_shared_memory(
+            acc_partial_ptr.dtype.element_ty, [BLOCK_H, HALF_D], acc_half_shared
+        )
+
+        acc_r = (
+            acc.to(acc_partial_ptr.dtype.element_ty)
+            .reshape(BLOCK_H, 2, HALF_D)
+            .permute(0, 2, 1)
+        )
+        acc0, acc1 = gl.split(acc_r)
+        # Ensure all wavefronts have finished writing to LDS before TDM reads it.
+        # gl.barrier()
+
+        acc_buf0.store(acc0)
+        gl.amd.gfx1250.tdm.async_store(acc_desc, [h_off_base, 0], acc_buf0)
+
+        acc_buf1.store(acc1)
+        gl.amd.gfx1250.tdm.async_store(acc_desc, [h_off_base, HALF_D], acc_buf1)
+
+        h_offs_ml = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT))
         h_offs_ml_eff = h_off_base + h_offs_ml
         h_mask_ml = h_offs_ml_eff < H
         m_base = t * mp_stride_t + pid_k * mp_stride_k
         l_base = t * lp_stride_t + pid_k * lp_stride_k
-        m_store = gl.convert_layout(m_i, gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
-        l_store = gl.convert_layout(l_i, gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
         gl.amd.cdna4.buffer_store(
-            m_store,
+            m_i,
             ptr=m_partial_ptr + m_base,
             offsets=(h_offs_ml_eff * mp_stride_h).to(gl.int32),
             mask=h_mask_ml,
         )
         gl.amd.cdna4.buffer_store(
-            l_store,
+            l_i,
             ptr=l_partial_ptr + l_base,
             offsets=(h_offs_ml_eff * lp_stride_h).to(gl.int32),
             mask=h_mask_ml,
         )
 
-        h_offs_a = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
-        d_offs_a = gl.arange(0, BLOCK_D, layout=gl.SliceLayout(0, Q_BLOCKED_LAYOUT))
-        h_offs_a_eff = h_off_base + h_offs_a
-        h_mask_a = h_offs_a_eff < H
-        a_base = t * ap_stride_t + pid_k * ap_stride_k
-        acc_blocked = gl.convert_layout(acc, Q_BLOCKED_LAYOUT)
-        gl.amd.cdna4.buffer_store(
-            acc_blocked,
-            ptr=acc_partial_ptr + a_base,
-            offsets=(
-                h_offs_a_eff[:, None] * ap_stride_h + d_offs_a[None, :] * ap_stride_d
-            ).to(gl.int32),
-            mask=h_mask_a[:, None],
-        )
+        gl.amd.gfx1250.tdm.async_wait(0)
 
 
 _pa_decode_sparse_reduce_repr = make_kernel_repr(
