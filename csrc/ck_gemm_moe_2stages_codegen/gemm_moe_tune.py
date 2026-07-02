@@ -35,6 +35,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
     shuffle_weight,
+    shuffle_scale,
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
     pack_int8_to_packed_int4,
@@ -4978,10 +4979,24 @@ class Mxfp4FlydslTuner(FmoeTuner):
             16,
             device="cuda",
         )
-        data["w1_a16"] = shuffle_weight_a16w4(data["w1_qt"], 16, True)
-        data["w1s_a16"] = shuffle_scale_a16w4(data["w1_scale"], expert, True)
-        data["w2_a16"] = shuffle_weight_a16w4(data["w2_qt"], 16, False)
-        data["w2s_a16"] = shuffle_scale_a16w4(data["w2_scale"], expert, False)
+        # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False,
+        # the port default since 2098023a9); _port_e2e drives the port at that
+        # default. Prepare weights/scales with is_guinterleave=False to match --
+        # shuffle_weight_a16w4 (is_guinterleave=True) is the interleaved a16w4/a8w4
+        # layout and feeding it to the separated port produces garbage
+        # (cosine_diff ~0.9975). w2 (down-proj, no gate/up) is layout-invariant.
+        data["w1_a16"] = shuffle_weight(
+            data["w1_qt"], (16, 16), is_guinterleave=False, gate_up=True
+        )
+        data["w1s_a16"] = shuffle_scale(
+            data["w1_scale"], expert, is_guinterleave=False, gate_up=True
+        )
+        data["w2_a16"] = shuffle_weight(
+            data["w2_qt"], (16, 16), is_guinterleave=False, gate_up=False
+        )
+        data["w2s_a16"] = shuffle_scale(
+            data["w2_scale"], expert, is_guinterleave=False, gate_up=False
+        )
         return data
 
     @staticmethod
