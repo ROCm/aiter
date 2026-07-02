@@ -75,8 +75,7 @@ struct mha_bwd_args
     //   (Note: Physical length equals logical length)
     //
     //   Group mode:
-    //     - seqstart_q_ptr, seqstart_k_ptr: Record cumulative physical sequence lengths. [array
-    //     size: batch + 1]
+    //     - seqstart_q_ptr, seqstart_k_ptr: Record cumulative physical sequence lengths. [array size: batch + 1]
     //     - seqlen_q_ptr/seqlen_k_ptr and cu_seqlen_q_ptr/cu_seqlen_k_ptr must be nullptr.
     //
     //   Batch mode:
@@ -144,20 +143,16 @@ struct mha_bwd_args
     std::variant<std::pair<uint64_t, uint64_t>, std::pair<const void*, const void*>>
         drop_seed_offset;
 
-    // Per-call device-buffer allocator. Caller keeps the returned pointer alive
-    // until aiter::mha_bwd returns. If zero_init is true the bytes must be zero
-    // by the time the kernel reads them.
+    // Per-call device-buffer allocator. Caller keeps the returned pointer alive until aiter::mha_bwd returns. If
+    // zero_init is true the bytes must be zero by the time the kernel reads them.
     std::function<void*(size_t bytes, bool zero_init)> workspace_alloc{};
 
-    // Per-call pinned (page-locked) host buffer allocator. Returned shared_ptr
-    // owns the underlying host allocation and is type-erased so the caller can
-    // back it with PyTorch's CachingHostAllocator (pin_memory=true), raw
-    // hipHostMalloc/hipHostFree, or a custom pool. The pointer accessed via
-    // .get() must remain valid (not reused by the allocator) for as long as any
-    // pending stream operation references it; aiter ensures this by extending
-    // shared_ptr lifetime via a stream-tail hipLaunchHostFunc keepalive.
-    // Required for the group-mode async pipeline; mha_bwd returns an error if
-    // left empty in group mode. Unused in batch mode (may be left empty).
+    // Per-call pinned (page-locked) host buffer allocator. Returned shared_ptr owns the underlying host allocation and
+    // is type-erased so the caller can back it with PyTorch's CachingHostAllocator (pin_memory=true), raw
+    // hipHostMalloc/hipHostFree, or a custom pool. The pointer accessed via .get() must remain valid (not reused by the
+    // allocator) for as long as any pending stream operation references it; aiter ensures this by extending shared_ptr
+    // lifetime via a stream-tail hipLaunchHostFunc keepalive. Required for the group-mode async pipeline; mha_bwd
+    // returns an error if left empty in group mode. Unused in batch mode (may be left empty).
     std::function<std::shared_ptr<void>(size_t bytes)> pinned_host_alloc{};
 };
 

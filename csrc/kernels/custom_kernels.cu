@@ -385,8 +385,7 @@ void LLGemm1(void* in_a,
              const int rows_per_block,
              const AiterDtype scalar_type)
 {
-    // NUM_TREADS need to be a multiple of WARP_SIZE, as we are using warp shuffle
-    // operations.
+    // NUM_TREADS need to be a multiple of WARP_SIZE, as we are using warp shuffle operations.
     const int NUM_THREADS = K * 2 / 16 % WARP_SIZE == 0
                                 ? K * 2 / 16
                                 : K * 2 / 16 + (WARP_SIZE - K * 2 / 16 % WARP_SIZE);
@@ -454,53 +453,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     float sum[N][YTILE];
     uint32_t m = (blockIdx.x * _WvPrGrp + threadIdx.y) * YTILE;
 
-    //----------------------------------------------------
-    // Each wave works on a single column of weight matrix.
-    // There are 16 waves per WG, and hence, each WG is
-    // working on 16 columns of weight matrix. Moreover,
-    // we tile in column direction by YTILE, so when YTILE=1
-    // the above math is right, however, when YTILE=2 then
-    // each wave  will be working on 2 columns and WG will
-    // be working on 32 columns.
-    //
-    // Top level loop that makes WGs persistent!
-    // - WGs iterates across columns of weight matrix
-    // - Each wave within WG works on a given column(s)
-    // - After completing first set of columns, WGs start
-    //   working on the next set of available columns
-    //----------------------------------------------------
+    // Each wave handles one column of B (YTILE columns when YTILE>1).
+    // Persistent WGs loop across successive sets of columns.
     while(m < M)
     {
-        //----------------------------------------------------
-        // 'sum' accumulates the matrix A x B computation
-        // split across 64 lanes.
-        //
-        // YTILE represents how many column of weight matrix
-        // are being worked on by each wave.
-        //----------------------------------------------------
+        // 'sum' accumulates A x B split across 64 lanes; YTILE = columns per wave.
         for(int i = 0; i < YTILE; i++)
             for(int n = 0; n < N; n++)
                 sum[n][i] = 0;
 
         bigType bigA[N][UNRL];
         bigType bigB[YTILE][UNRL];
-        //----------------------------------------------------
-        // Fetch weight matrix B in interleaved K-split!
-        // - Each thread (lane) is fetching 8 elements (A_Chunk)
-        // - Each wave will fetch 64*8=> 512 elements (1024B)
-        // - YTILE represents the number of column being serviced
-        //   by wave
-        // - Loop for fetching weight matrix (B) are unrolled
-        //
-        // Fetch activation matrix A from LDS
-        // - Loop for fetching activation matrix (A) are unrolled
-        //
-        // Finally, do the matrix multiplication in an unrolled
-        // fashion. This provides lot of food for compiler
-        // scheduling.
-        //
+        // Fetch B interleaved K-split (each lane 8 elems=A_CHUNK, wave 512 elems=1024B),
+        // fetch A from LDS, then matmul unrolled to aid compiler scheduling.
         // TODO: Logic below will only work when K is multiple of 8
-        //----------------------------------------------------
         for(uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL)
         {
             // Fetch weight matrix B from memory
@@ -514,9 +480,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
                 const scalar_t* B_ = &B[(m + 0) * K + k_];
                 bigB[0][k2].h8     = (loadnt((scalar8*)(&B_[0 * K])));
-                //----------------------------------------------------
                 // The following code with YTILE > 1 has to be deleted
-                //----------------------------------------------------
                 if constexpr(YTILE >= 2)
                     bigB[1][k2].h8 = (loadnt((scalar8*)(&B_[1 * K])));
                 if constexpr(YTILE >= 3)
@@ -601,9 +565,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                         for(uint32_t b = 0; b < A_CHUNK / 2; b++)
                         {
                             DOT2C(sum[n][0], bigA[n][k2].f[b], bigB[0][k2].f[b])
-                            //----------------------------------------------------
                             // The following code with YTILE > 1
-                            //----------------------------------------------------
                             if constexpr(YTILE >= 2)
                             {
                                 DOT2C(sum[n][1], bigA[n][k2].f[b], bigB[1][k2].f[b]);
@@ -622,9 +584,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
             }
         }
 
-        //----------------------------------------------------
-        // Final reduction step using shuffle
-        //----------------------------------------------------
+        // Final reduction via shuffle
         for(int n = 0; n < N; n++)
         {
             for(int y = 0; y < YTILE; y++)
@@ -701,24 +661,13 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
         scalar8 h8;
     };
 
-    //----------------------------------------------------
-    // Reserving 64 KB of LDS to have 1 WG / CU
-    // Goal is to bring the activation matrix A to the LDS
-    // and use it across the lifetime of the work group
+    // Reserve 64 KB LDS (1 WG/CU) to hold activation A across the WG lifetime.
     // TODO: When activation matrix is larger than 64 KB
     //	     then this is not goint to work!
-    //----------------------------------------------------
     __shared__ scalar_t s[1024 * 32];
 
-    //----------------------------------------------------
-    // Fetch the activation matrix to LDS
-    // Loop iteration:
-    // - Each thread (lane) is fetching 8 elements (A_Chunk)
-    // - Each wave will fetch 64*8=> 512 elements
-    // - Each WG will fetch 512 * 16 => 8K elements
-    // - Then the WG will move to another 8 K elements
+    // Fetch activation matrix to LDS (each lane 8 elems=A_CHUNK, wave 512, WG 8K per pass).
     // TODO: Logic below will only work when K is multiple of 8
-    //----------------------------------------------------
     for(uint32_t k = 0; k < min(K * N, 32 * 1024); k += THRDS * WvPrGrp * A_CHUNK)
     {
         uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
@@ -737,53 +686,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
 
     float sum[N][YTILE];
 
-    //----------------------------------------------------
-    // Each wave works on a single column of weight matrix.
-    // There are 16 waves per WG, and hence, each WG is
-    // working on 16 columns of weight matrix. Moreover,
-    // we tile in column direction by YTILE, so when YTILE=1
-    // the above math is right, however, when YTILE=2 then
-    // each wave  will be working on 2 columns and WG will
-    // be working on 32 columns.
-    //
-    // Top level loop that makes WGs persistent!
-    // - WGs iterates across columns of weight matrix
-    // - Each wave within WG works on a given column(s)
-    // - After completing first set of columns, WGs start
-    //   working on the next set of available columns
-    //----------------------------------------------------
+    // Each wave handles one column of B (YTILE columns when YTILE>1).
+    // Persistent WGs loop across successive sets of columns.
     while(m < M)
     {
-        //----------------------------------------------------
-        // 'sum' accumulates the matrix A x B computation
-        // split across 64 lanes.
-        //
-        // YTILE represents how many column of weight matrix
-        // are being worked on by each wave.
-        //----------------------------------------------------
+        // 'sum' accumulates A x B split across 64 lanes; YTILE = columns per wave.
         for(int i = 0; i < YTILE; i++)
             for(int n = 0; n < N; n++)
                 sum[n][i] = 0;
 
         bigType bigA[N][UNRL];
         bigType bigB[YTILE][UNRL];
-        //----------------------------------------------------
-        // Fetch weight matrix B in interleaved K-split!
-        // - Each thread (lane) is fetching 8 elements (A_Chunk)
-        // - Each wave will fetch 64*8=> 512 elements (1024B)
-        // - YTILE represents the number of column being serviced
-        //   by wave
-        // - Loop for fetching weight matrix (B) are unrolled
-        //
-        // Fetch activation matrix A from LDS
-        // - Loop for fetching activation matrix (A) are unrolled
-        //
-        // Finally, do the matrix multiplication in an unrolled
-        // fashion. This provides lot of food for compiler
-        // scheduling.
-        //
+        // Fetch B interleaved K-split (each lane 8 elems=A_CHUNK, wave 512 elems=1024B),
+        // fetch A from LDS, then matmul unrolled to aid compiler scheduling.
         // TODO: Logic below will only work when K is multiple of 8
-        //----------------------------------------------------
         // for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
         for(uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL)
         {
@@ -798,9 +714,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
 
                 const scalar_t* B_ = &B[(m + 0) * K + k_];
                 bigB[0][k2].h8     = (loadnt((scalar8*)(&B_[0 * K])));
-                //----------------------------------------------------
                 // The following code with YTILE > 1 has to be deleted
-                //----------------------------------------------------
                 if constexpr(YTILE >= 2)
                     bigB[1][k2].h8 = (loadnt((scalar8*)(&B_[1 * K])));
                 if constexpr(YTILE >= 3)
@@ -851,9 +765,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
                     for(uint32_t b = 0; b < A_CHUNK / 2; b++)
                     {
                         DOT2C(sum[n][0], bigA[n][k2].f[b], bigB[0][k2].f[b])
-                        //----------------------------------------------------
                         // The following code with YTILE > 1
-                        //----------------------------------------------------
                         if constexpr(YTILE >= 2)
                         {
                             DOT2C(sum[n][1], bigA[n][k2].f[b], bigB[1][k2].f[b]);
@@ -887,9 +799,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
             }
         }
 
-        //----------------------------------------------------
-        // Final reduction step using shuffle
-        //----------------------------------------------------
+        // Final reduction via shuffle
         for(int n = 0; n < N; n++)
         {
             for(int y = 0; y < YTILE; y++)
@@ -964,29 +874,19 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
         scalar8 h8;
     };
 
-    //----------------------------------------------------
-    // Reserving 64 KB of LDS to have 1 WG / CU
-    // Goal is to bring the activation matrix A to the LDS
-    // and use it across the lifetime of the work group
+    // Reserve 64 KB LDS (1 WG/CU) to hold activation A across the WG lifetime.
     // TODO: When activation matrix is larger than 64 KB
     //	     then this is not goint to work!
-    //----------------------------------------------------
     __shared__ scalar_t s[1024 * 32];
 
-    //----------------------------------------------------
-    // Computation of columns that need to be committed to memory!
-    //----------------------------------------------------
+    // Columns that need to be committed to memory.
     uint32_t commitColumn[YTILE];
     for(uint32_t i = 0; i < YTILE; i++)
     {
         commitColumn[i] = 1;
     }
 
-    //----------------------------------------------------
-    // Indexing function into the column of weight matrix B
-    // Algorithm does 64 lane k-splitting / wave and uses
-    // WG ID and Thread ID to find the index.
-    //----------------------------------------------------
+    // Index into a column of B: 64-lane k-splitting per wave, indexed by WG ID + thread ID.
     // int _WvPrGrp = mindiv(N, CuCount * YTILE, WvPrGrp);
     uint32_t m = (blockIdx.x * _WvPrGrp + threadIdx.y) * YTILE;
 
@@ -1002,15 +902,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
         m = startColumn;
     }
 
-    //----------------------------------------------------
-    // Fetch the activation matrix to LDS
-    // Loop iteration:
-    // - Each thread (lane) is fetching 8 elements (A_Chunk)
-    // - Each wave will fetch 64*8=> 512 elements
-    // - Each WG will fetch 512 * 16 => 8K elements
-    // - Then the WG will move to another 8 K elements
+    // Fetch activation matrix to LDS (each lane 8 elems=A_CHUNK, wave 512, WG 8K per pass).
     // TODO: Logic below will only work when K is multiple of 8
-    //----------------------------------------------------
     for(uint32_t k = 0; k < min(K * N, 32 * 1024); k += THRDS * WvPrGrp * A_CHUNK)
     {
         uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
@@ -1028,53 +921,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
 
     float sum[N][YTILE];
 
-    //----------------------------------------------------
-    // Each wave works on a single column of weight matrix.
-    // There are 16 waves per WG, and hence, each WG is
-    // working on 16 columns of weight matrix. Moreover,
-    // we tile in column direction by YTILE, so when YTILE=1
-    // the above math is right, however, when YTILE=2 then
-    // each wave  will be working on 2 columns and WG will
-    // be working on 32 columns.
-    //
-    // Top level loop that makes WGs persistent!
-    // - WGs iterates across columns of weight matrix
-    // - Each wave within WG works on a given column(s)
-    // - After completing first set of columns, WGs start
-    //   working on the next set of available columns
-    //----------------------------------------------------
+    // Each wave handles one column of B (YTILE columns when YTILE>1).
+    // Persistent WGs loop across successive sets of columns.
     while(m < M)
     {
-        //----------------------------------------------------
-        // 'sum' accumulates the matrix A x B computation
-        // split across 64 lanes.
-        //
-        // YTILE represents how many column of weight matrix
-        // are being worked on by each wave.
-        //----------------------------------------------------
+        // 'sum' accumulates A x B split across 64 lanes; YTILE = columns per wave.
         for(int i = 0; i < YTILE; i++)
             for(int n = 0; n < N; n++)
                 sum[n][i] = 0;
 
         bigType bigA[N][UNRL];
         bigType bigB[YTILE][UNRL];
-        //----------------------------------------------------
-        // Fetch weight matrix B in interleaved K-split!
-        // - Each thread (lane) is fetching 8 elements (A_Chunk)
-        // - Each wave will fetch 64*8=> 512 elements (1024B)
-        // - YTILE represents the number of column being serviced
-        //   by wave
-        // - Loop for fetching weight matrix (B) are unrolled
-        //
-        // Fetch activation matrix A from LDS
-        // - Loop for fetching activation matrix (A) are unrolled
-        //
-        // Finally, do the matrix multiplication in an unrolled
-        // fashion. This provides lot of food for compiler
-        // scheduling.
-        //
+        // Fetch B interleaved K-split (each lane 8 elems=A_CHUNK, wave 512 elems=1024B),
+        // fetch A from LDS, then matmul unrolled to aid compiler scheduling.
         // TODO: Logic below will only work when K is multiple of 8
-        //----------------------------------------------------
         for(uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL)
         {
             // Fetch the weight matrix from memory!
@@ -1088,9 +948,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
 
                 const scalar_t* B_ = &B[(m + 0) * K + k_];
                 bigB[0][k2].h8     = (loadnt((scalar8*)(&B_[0 * K])));
-                //----------------------------------------------------
                 // The following code with YTILE > 1 has to be deleted
-                //----------------------------------------------------
                 if constexpr(YTILE >= 2)
                     bigB[1][k2].h8 = (loadnt((scalar8*)(&B_[1 * K])));
                 if constexpr(YTILE >= 3)
@@ -1144,9 +1002,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
                     for(uint32_t b = 0; b < A_CHUNK / 2; b++)
                     {
                         DOT2C(sum[n][0], bigA[n][k2].f[b], bigB[0][k2].f[b]);
-                        //----------------------------------------------------
                         // The following code with YTILE > 1
-                        //----------------------------------------------------
                         if constexpr(YTILE >= 2)
                         {
                             DOT2C(sum[n][1], bigA[n][k2].f[b], bigB[1][k2].f[b]);
@@ -1180,9 +1036,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
             }
         }
 
-        //----------------------------------------------------
-        // Final reduction step using shuffle
-        //----------------------------------------------------
+        // Final reduction via shuffle
         for(int n = 0; n < N; n++)
         {
             for(int y = 0; y < YTILE; y++)
@@ -1272,18 +1126,12 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
         scalar8 h8;
     };
 
-    //----------------------------------------------------
-    // Reserving 64 KB of LDS to have 1 WG / CU
-    // Goal is to bring the activation matrix A to the LDS
-    // and use it across the lifetime of the work group
+    // Reserve 64 KB LDS (1 WG/CU) to hold activation A across the WG lifetime.
     // TODO: When activation matrix is larger than 64 KB
     //	     then this is not goint to work!
-    //----------------------------------------------------
     __shared__ scalar_t s[1024 * 32];
 
-    //----------------------------------------------------
-    // Computation of columns that need to be committed to memory!
-    //----------------------------------------------------
+    // Columns that need to be committed to memory.
     uint32_t commitColumn[YTILE];
     for(uint32_t i = 0; i < YTILE; i++)
     {
@@ -1294,11 +1142,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
     if(threadIdx.y >= _WvPrGrp)
         return;
 
-    //----------------------------------------------------
-    // Indexing function into the column of weight matrix B
-    // Algorithm does 64 lane k-splitting / wave and uses
-    // WG ID and Thread ID to find the index.
-    //----------------------------------------------------
+    // Index into a column of B: 64-lane k-splitting per wave, indexed by WG ID + thread ID.
     uint32_t m = (blockIdx.x * _WvPrGrp + threadIdx.y) * YTILE;
 
     // Check whether there will be fragmenation!
@@ -1313,15 +1157,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
         m = startColumn;
     }
 
-//----------------------------------------------------
-// Fetch the activation matrix to LDS
-// Loop iteration:
-// - Each thread (lane) is fetching 8 elements (A_Chunk)
-// - Each wave will fetch 64*8=> 512 elements
-// - Each WG will fetch 512 * 16 => 8K elements
-// - Then the WG will move to another 8 K elements
+// Fetch activation matrix to LDS (each lane 8 elems=A_CHUNK, wave 512, WG 8K per pass).
 // TODO: Logic below will only work when K is multiple of 8
-//----------------------------------------------------
 #define PCML
 #ifndef PCML
     for(uint32_t k = 0; k < min(K * N, 32 * 1024); k += THRDS * WvPrGrp * A_CHUNK)
@@ -1348,21 +1185,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
 
     float sum[N][YTILE];
 
-//----------------------------------------------------
-// Each wave works on a single column of weight matrix.
-// There are 16 waves per WG, and hence, each WG is
-// working on 16 columns of weight matrix. Moreover,
-// we tile in column direction by YTILE, so when YTILE=1
-// the above math is right, however, when YTILE=2 then
-// each wave  will be working on 2 columns and WG will
-// be working on 32 columns.
-//
-// Top level loop that makes WGs persistent!
-// - WGs iterates across columns of weight matrix
-// - Each wave within WG works on a given column(s)
-// - After completing first set of columns, WGs start
-//   working on the next set of available columns
-//----------------------------------------------------
+// Each wave handles one column of B (YTILE columns when YTILE>1).
+// Persistent WGs loop across successive sets of columns.
 #ifdef PCML
     int YW         = (YTILE * _WvPrGrp);
     uint32_t Mrndp = (M % YW == 0) ? M : (M - M % YW + YW);
@@ -1372,36 +1196,16 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
     while(m < M)
     {
 #endif
-        //----------------------------------------------------
-        // 'sum' accumulates the matrix A x B computation
-        // split across 64 lanes.
-        //
-        // YTILE represents how many column of weight matrix
-        // are being worked on by each wave.
-        //----------------------------------------------------
+        // 'sum' accumulates A x B split across 64 lanes; YTILE = columns per wave.
         for(int i = 0; i < YTILE; i++)
             for(int n = 0; n < N; n++)
                 sum[n][i] = 0;
 
         bigType bigA[N][UNRL];
         bigType bigB[YTILE][UNRL];
-        //----------------------------------------------------
-        // Fetch weight matrix B in interleaved K-split!
-        // - Each thread (lane) is fetching 8 elements (A_Chunk)
-        // - Each wave will fetch 64*8=> 512 elements (1024B)
-        // - YTILE represents the number of column being serviced
-        //   by wave
-        // - Loop for fetching weight matrix (B) are unrolled
-        //
-        // Fetch activation matrix A from LDS
-        // - Loop for fetching activation matrix (A) are unrolled
-        //
-        // Finally, do the matrix multiplication in an unrolled
-        // fashion. This provides lot of food for compiler
-        // scheduling.
-        //
+        // Fetch B interleaved K-split (each lane 8 elems=A_CHUNK, wave 512 elems=1024B),
+        // fetch A from LDS, then matmul unrolled to aid compiler scheduling.
         // TODO: Logic below will only work when K is multiple of 8
-        //----------------------------------------------------
         for(uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL)
         {
 #ifdef PCML
@@ -1441,9 +1245,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
 
                 const scalar_t* B_ = &B[(m + 0) * K + k_];
                 bigB[0][k2].h8     = (loadnt((scalar8*)(&B_[0 * K])));
-                //----------------------------------------------------
                 // The following code with YTILE > 1 has to be deleted
-                //----------------------------------------------------
                 if constexpr(YTILE >= 2)
                     bigB[1][k2].h8 = (loadnt((scalar8*)(&B_[1 * K])));
                 if constexpr(YTILE >= 3)
@@ -1501,9 +1303,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
                     for(uint32_t b = 0; b < A_CHUNK / 2; b++)
                     {
                         DOT2C(sum[n][0], bigA[n][k2].f[b], bigB[0][k2].f[b]);
-                        //----------------------------------------------------
                         // The following code with YTILE > 1
-                        //----------------------------------------------------
                         if constexpr(YTILE >= 2)
                         {
                             DOT2C(sum[n][1], bigA[n][k2].f[b], bigB[1][k2].f[b]);
@@ -1546,9 +1346,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
         }
 #endif
 
-        //----------------------------------------------------
-        // Final reduction step using shuffle
-        //----------------------------------------------------
+        // Final reduction via shuffle
         for(int n = 0; n < N; n++)
         {
             for(int y = 0; y < YTILE; y++)

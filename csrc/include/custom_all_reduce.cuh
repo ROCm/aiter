@@ -41,8 +41,7 @@ namespace aiter {
 enum class ReduceScatterSplitDim : int { kFirst = 0, kLast = 1, kMid = 2 };
 
 constexpr int kMaxBlocks = 80;
-// note: we don't want to use atomics for signals because peer atomics are no
-// supported on PCIe links
+// note: we don't want to use atomics for signals because peer atomics are no supported on PCIe links
 struct Signal
 {
     alignas(128) uint32_t start[kMaxBlocks][8];
@@ -412,9 +411,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
         iters   = rem > 0 ? (rem + step - 1) / step : 0;
     }
 
-    // -------------------------------
     // fill buffer 0
-    // -------------------------------
     int buf  = 0;
     int idx0 = start;
 
@@ -431,9 +428,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
         const int next_idx = cur_idx + step;
         const int next_buf = buf ^ 1;
 
-        // =======================================================
-        // 1. Warp 0 REDUCES current buffer
-        // =======================================================
+        // 1. Warp 0 reduces current buffer
         if(warp_id == 0 && cur_idx < size)
         {
             // GPU 0 contribution
@@ -463,10 +458,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
             ((P*)result)[cur_idx] = out;
         }
 
-        // =======================================================
-        // 2. ALL warps prefetch NEXT buffer
-        //    (including warp 0; safe to issue after reduction)
-        // =======================================================
+        // 2. All warps prefetch next buffer (incl. warp 0; safe after reduction)
         if(next_idx < size)
         {
             P nxt = ((const P**)&dp.ptrs[0])[warp_id][next_idx];
@@ -3395,8 +3387,7 @@ class CustomAllreduce
         {
             auto ptr = graph_unreg_input_buffers_[i];
             void* base_ptr;
-            // note: must share the base address of each allocation, or we get wrong
-            // address
+            // note: must share the base address of each allocation, or we get wrong address
             if(hipPointerGetAttribute(&base_ptr,
 #ifdef USE_ROCM
                                       HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
@@ -3543,13 +3534,9 @@ class CustomAllreduce
         return ptrs;
     }
 
-    // note: when registering graph buffers, we intentionally choose to not
-    // deduplicate the addresses. That means if the allocator reuses some
-    // addresses, they will be registered again. This is to account for the remote
-    // possibility of different allocation patterns between ranks. For example,
-    // rank 1 may get the same input address for the second allreduce, but rank 2
-    // got a different address. IPC handles have internal reference counting
-    // mechanism so overhead should be small.
+    // note: graph buffer addresses are intentionally NOT deduplicated, so a
+    // reused address is registered again. This handles ranks having different
+    // allocation patterns. IPC handles are refcounted, so overhead is small.
     void register_graph_buffers(const void* const* handles_per_rank,
                                 const int64_t* const* offsets_per_rank)
     {
@@ -3677,11 +3664,8 @@ class CustomAllreduce
     }
 
     /**
-     * This is the result after careful grid search. Using 36 blocks give the best
-     * or close to the best runtime on the devices I tried: A100, A10, A30, T4,
-     * V100. You'll notice that NCCL kernels also only take a small amount of SMs.
-     * Not quite sure the underlying reason, but my guess is that too many SMs
-     * will cause contention on NVLink bus.
+     * Empirically ~36 blocks gives best/near-best runtime across GPUs; like NCCL,
+     * too many SMs seems to contend on the NVLink bus.
      */
     template <typename T>
     void allreduce(hipStream_t stream,

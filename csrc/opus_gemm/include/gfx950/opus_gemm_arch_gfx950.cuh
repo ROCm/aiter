@@ -35,18 +35,12 @@
 
 namespace opus_gfx950_detail
 {
-// Sorted flat-array entries for the runtime (M, N, K) -> kernel lookup
-// (was: std::unordered_map<std::tuple<int,int,int>,
-// OpusA16W16NoscaleKernel, IntTupleHash>). The unordered_map version
-// added ~1s of frontend / template instantiation per dispatcher TU
-// because of the heavyweight std::function-valued hashtable templates;
-// a flat array of POD entries plus std::lower_bound costs essentially
-// nothing at parse time and matches the lookup at runtime in O(log N)
-// over 339 entries.
-// Nested {shape, func} aggregate matches the `{ {M, N, K}, &kernel }`
-// initializer the codegen emits. Splitting shape into its own struct
-// keeps the comparators small and gives gen_instances.py a stable
-// brace pattern to target.
+// Sorted flat-array entries for the runtime (M, N, K) -> kernel lookup (replaced
+// a std::unordered_map whose std::function-valued hashtable templates added ~1s
+// of instantiation per dispatcher TU; the flat array + std::lower_bound is
+// near-free at parse time and O(log N) at runtime). Nested {shape, func} matches
+// the `{ {M, N, K}, &kernel }` initializer the codegen emits; the split shape
+// struct keeps comparators small and gives gen_instances.py a stable brace.
 struct OpusA16W16Shape
 {
     int M;
@@ -76,8 +70,7 @@ constexpr bool entry_eq(const OpusA16W16RuntimeEntry& a,
     return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
 }
 
-// id -> kernel<CDataType>, same flat-array layout. Sorted by id (the
-// codegen always emits in ascending id order).
+// id -> kernel<CDataType>, same flat-array layout. Sorted by id (the codegen always emits in ascending id order).
 struct OpusA16W16TuneEntry
 {
     int kid;
@@ -186,13 +179,11 @@ opus_dispatch_a16w16_gfx950<bf16_t>(int M, int N, int K, int batch, bool has_bia
         return it->func;
     }
     (void)batch;  // heuristic does not currently use batch.
-    // 4 GiB buffer-resource guard. The heuristic returns one of
-    // HEURISTIC_DEFAULT_KIDS, all of which are legacy (non-4g_safe) and
-    // build a single AMDGPU buffer-resource over the whole A/B/C tensors;
-    // 32-bit num_records wraps when any A/B/C bytes exceed UINT32_MAX,
-    // producing silent OOB. Refuse fallback for >4 GiB shapes -- the
-    // caller must register a tuned CSV entry mapping the shape to a
-    // 4g_safe kid (5000-series / 6000-series).
+    // 4 GiB buffer-resource guard: the heuristic's default kids are legacy
+    // (non-4g_safe) and build one AMDGPU buffer-resource over each whole A/B/C
+    // tensor; 32-bit num_records wraps past UINT32_MAX -> silent OOB. Refuse
+    // >4 GiB shapes; caller must add a tuned CSV entry to a 4g_safe kid
+    // (5000-series / 6000-series).
     constexpr uint64_t U32_MAX_BYTES = (1ULL << 32) - 1;
     const uint64_t a_bytes = (uint64_t)M * (uint64_t)K * sizeof(bf16_t);
     const uint64_t b_bytes = (uint64_t)N * (uint64_t)K * sizeof(bf16_t);

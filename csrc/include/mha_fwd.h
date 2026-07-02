@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-// Include these 2 headers instead of torch/extension.h since we don't need all
-// of the torch headers.
+// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include "aiter_hip_common.h"
 #if ENABLE_CK
 #include "fmha_fwd.hpp"
@@ -166,8 +165,7 @@ struct mha_fwd_args
     //   (Note: Physical length equals logical length)
     //
     //   Group mode:
-    //     - seqstart_q_ptr, seqstart_k_ptr: Record cumulative physical sequence lengths. [array
-    //     size: batch + 1]
+    //     - seqstart_q_ptr, seqstart_k_ptr: Record cumulative physical sequence lengths. [array size: batch + 1]
     //     - seqlen_q_ptr/seqlen_k_ptr and cu_seqlen_q_ptr/cu_seqlen_k_ptr must be nullptr.
     //
     //   Batch mode:

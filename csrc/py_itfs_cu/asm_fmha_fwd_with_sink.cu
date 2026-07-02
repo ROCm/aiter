@@ -3,25 +3,19 @@
 //
 // ASM FMHA forward (BF16, gfx1250).
 //
-// Layout: q/k/v expected in **bshd shape** ([batch, seq, head, dim]).  The
-// kernel reads per-dim strides directly from the input tensor, so callers may
-// pass a non-contiguous bshd-shaped view backed by sbhd / bhsd memory and the
-// kernel will follow the strides correctly.  Only `tensor.stride(-1) == 1`
-// (last-dim contiguous) is required, matching flash_attn_func semantics.
+// Layout: q/k/v are bshd shape ([batch, seq, head, dim]). Kernel reads per-dim
+// strides directly, so non-contiguous bshd views backed by sbhd/bhsd memory
+// work; only stride(-1)==1 is required (matching flash_attn_func semantics).
 //
-// Memory-allocation policy:
-//   All tensors (q, k, v, out, lse, sink) are allocated by the Python caller.
-//   This C++ entry point performs **only pointer + stride bookkeeping and
-//   kernel launch** — no GPU memory allocation, no temporary tensors, no torch
-//   dependency.  In particular, the AITER post-scale → pre-scale conversion
-//   for `sink` (multiply by sqrt(qk_head_dim)) is the caller's responsibility:
-//   pass `sink` already in the kernel's pre-scale raw-logit domain.
+// All tensors are caller-allocated; this entry point does only pointer/stride
+// bookkeeping and launch -- no GPU allocation, no torch dep. The sink
+// post-scale->pre-scale conversion (multiply by sqrt(qk_head_dim)) is the
+// caller's responsibility: pass sink already in the pre-scale raw-logit domain.
 //
-// sink slot semantics (still enforced here):
-//   D64 `_rxy_sink` kernels compile ENABLE_SINK=1 → `sink` MUST be non-null.
-//   D128 `_rxy`     kernels compile ENABLE_SINK=0 → `sink` slot must still be
-//                   a valid non-null pointer (kernarg layout requires it), but
-//                   the kernel never reads its contents.  Pass a zero buffer.
+// sink slot semantics: D64 `_rxy_sink` kernels compile ENABLE_SINK=1 -> sink
+// MUST be non-null. D128 `_rxy` kernels compile ENABLE_SINK=0 -> slot must
+// still be a valid non-null pointer (kernarg layout) but is never read; pass a
+// zero buffer.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "aiter_hip_common.h"   // HipDeviceGuard, AiterAsmKernel, ...
@@ -31,10 +25,8 @@
 #include <memory>
 
 // Kernel argument block — packed ABI (132 B = 0x84), matches the .args YAML
-// emitted into the v8 .s patched HSA metadata.
-//
-// Field naming uses short forms (d_addr / q_seqs / k_hs / ...) rather than
-// the older 528-B slot-padded layout we used pre-v8.
+// emitted into the v8 .s patched HSA metadata. Short field names (d_addr /
+// q_seqs / k_hs / ...) replace the pre-v8 528-B slot-padded layout.
 //
 //   d   = output O
 //   q/k/v_seqs = stride along seq dim (bytes)
@@ -118,22 +110,14 @@ static std::string get_heuristic_kernel_fmha_fwd_bf16(const std::string& dtype,
 
 AITER_CTYPES_ERROR_DEF
 
-// C ABI: every tensor is caller-allocated.  No GPU memory is allocated here;
-// no torch dependency.
+// C ABI: every tensor is caller-allocated; no GPU allocation, no torch dep.
 //
-// q/k/v have **bshd shape**, i.e. q.shape = [batch, seq_q, hq, d], k/v.shape =
-// [batch, seq_k, hk, d].  Kernel reads strides directly from the tensor, so
-// non-contiguous bshd-shaped views backed by sbhd / bhsd memory work — only
-// `stride(-1) == 1` is required.
-//
-// out  : [batch, q_seq_len, q_head_num, v_head_dim] bf16, last dim contiguous.
-// lse  : [batch, q_head_num, q_seq_len] fp32.  Always required by kernel ABI
-//        (kernel may touch ptr_LSE even when return_lse=0); pass a buffer of
-//        the right size regardless of whether you read it.
-// sink : [q_head_num] fp32, passed through verbatim to the kernel (the value
-//        the kernel consumes directly — no host-side scaling).  Optional:
-//        may be null; whether the kernel reads it is decided inside the .co
-//        (ENABLE_SINK).  When non-null it must be 1-D fp32 of size q_head_num.
+// q/k/v : bshd shape, q=[batch, seq_q, hq, d], k/v=[batch, seq_k, hk, d].
+// out   : [batch, q_seq_len, q_head_num, v_head_dim] bf16, last dim contiguous.
+// lse   : [batch, q_head_num, q_seq_len] fp32. Always required by kernel ABI
+//         (touched even when return_lse=0); pass a right-sized buffer.
+// sink  : [q_head_num] fp32, passed verbatim (no host-side scaling). Optional/
+//         nullable; whether it is read is decided in the .co (ENABLE_SINK).
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmha_fwd_with_sink_asm,
     (aiter_tensor_t* q,
@@ -149,25 +133,14 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     (q, k, v, out, lse, sink, softmax_scale, is_causal, return_lse, stream))
 {
     // ---- null + multi-GPU safety -----------------------------------------
-    // Validate pointers BEFORE touching anything on the device, so the
-    // device_guard below can safely read q->device_id.
+    // Validate pointers before touching the device so device_guard can safely read q->device_id.
     AITER_CHECK(q && k && v && out && lse,
                 "fmha_fwd_with_sink_asm: q/k/v/out/lse must all be non-null");
 
-    // Pin current HIP device to q.device() for the duration of this call.
-    //
-    // Even though the ctypes layer (aiter/jit/core.py) already picks the
-    // stream via `torch.cuda.current_stream(tensor_device).cuda_stream`, the
-    // launch path inside AiterAsmKernelFast::launch_kernel does
-    // `hipGetFuncBySymbol(...)` which resolves the kernel handle against the
-    // *current* HIP device of the calling thread.  If the caller's
-    // current_device differs from q.device() (common in multi-GPU code that
-    // sets a default device once and then operates on tensors in several
-    // devices), we would either resolve to the wrong device's module table
-    // (returning a stale / null hipFunction_t) or submit a launch that
-    // mismatches the stream's device.  This guard mirrors what the other ASM
-    // MHA paths achieve with at::hip::OptionalHIPGuardMasqueradingAsCUDA;
-    // we use the torch-free HipDeviceGuard so this TU stays no-torch-dep.
+    // Pin current HIP device to q.device(): launch_kernel's hipGetFuncBySymbol
+    // resolves the kernel handle against the calling thread's current device,
+    // so a mismatch with q.device() would grab the wrong module table / stream.
+    // Torch-free HipDeviceGuard keeps this TU no-torch-dep.
     HipDeviceGuard device_guard{q->device_id};
 
     // ---- arch + dtype validation ------------------------------------------
@@ -285,13 +258,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.k_seqs     = stride_k_seq;
     args.k_hs       = stride_k_head;
     args.k_bas      = stride_k_batch;
-    // s_opt SGPR: packs three host-side switches.  Bit layout:
-    //   bit0: reverse_kv   (compile-time gated by CAS_MASK build; ignored by mask=0 kernels)
-    //   bit1: double_q     (compile-time gated by DOUBLE_Q   build; ignored by non-_dq kernels)
-    //   bit2: remap_xy     (must be 1 — we swap gdx/gdy at launch below)
-    // 7 = 0b111 enables all three.  Safe for the four shipped _rxy_brd /
-    // _rxy_cas_brd [_sink] .co binaries because bits 0/1 are compile-time
-    // gated off in those builds; bit2 matches the gdx/gdy swap on launch.
+    // s_opt SGPR: bit0 reverse_kv (CAS_MASK build), bit1 double_q (DOUBLE_Q
+    // build), bit2 remap_xy (must be 1 — gdx/gdy swapped at launch below).
+    // 7 = 0b111; safe for the shipped _rxy_brd/_rxy_cas_brd[_sink] .co because
+    // bits 0/1 are compile-time gated off there.
     args.opt        = 7;
     args.lse        = return_lse ? 1 : 0;
     args.kv_seq_len = kv_seq_len;
@@ -327,13 +297,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         name, [&]() { return AiterAsmKernel(name, co_name); });
 
     // ---- launch ------------------------------------------------------------
-    // gdx = ceil(q_seq_len / sub_Q) is the total number of Q-tiles to compute.
-    // When s_opt bit1 (double_q) is set, each WG processes 2 Q-tiles internally,
-    // so launch_gdx must be halved:
-    //   int tg_div = (double_q != 0) ? 2 : 1;
-    //   global_size_x = (q_tile_count + tg_div - 1) / tg_div * blockSizeX;
-    // The four shipped _brd v8 kernel binaries all support runtime double_q=1
-    // (D64 _rxy_sink_brd / _rxy_sink_cas_brd, D128 _rxy_brd / _rxy_cas_brd).
+    // gdx = ceil(q_seq_len / sub_Q) Q-tiles; halved when double_q (bit1) is set
+    // since each WG then processes 2 Q-tiles. All four shipped _brd v8 binaries
+    // support runtime double_q=1.
     const int wv_tg = 4;
     const int bdx   = (wv_tg == 4) ? 128 : 256;
     const int q_tile_count = (q_seq_len + sub_Q - 1) / sub_Q;
@@ -343,8 +309,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int  gdy         = q_head_num;
     const int  gdz         = batch;
 
-    // All _rxy kernels use remap_xy=1: swap gdx↔gdy at launch so that
-    // bid.x indexes heads and bid.y indexes Q-tiles.
+    // All _rxy kernels use remap_xy=1: swap gdx↔gdy at launch so that bid.x indexes heads and bid.y indexes Q-tiles.
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdy,   // launch_gdx = head count  (swapped)

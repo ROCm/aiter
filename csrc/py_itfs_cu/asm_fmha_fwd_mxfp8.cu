@@ -3,23 +3,15 @@
 //
 // ASM FMHA forward (MXFP8, gfx1250).
 //
-// This is a **dedicated** integration path, intentionally kept separate from
-// the bf16 `asm_fmha_fwd_with_sink` path and from the shared `fmha_v3` path.
-// The MXFP8 kernel uses its own tightly-packed kernarg ABI which carries the
-// q/k/v micro-scaling (e8m0) descale pointers and which is expected to diverge
-// further from the MI350 / bf16 layouts.  Keeping a separate translation unit
-// and KernelArgs struct here means future MXFP8 kernarg changes never disturb
-// the other paths.
+// Dedicated path kept separate from the bf16/fmha_v3 paths: uses its own tightly-packed kernarg ABI carrying q/k/v
+// micro-scaling (e8m0) descale pointers, expected to diverge further from the MI350/bf16 layouts.
 //
-// Layout: q/k/v are passed in **bshd shape** ([batch, seq, head, dim]).  The
-// kernel reads per-dim strides directly from the input tensors, so callers may
-// pass non-contiguous bshd-shaped views backed by bhsd memory (the MXFP8
-// kernel is validated for bhsd memory order: stride_head > stride_seq).  Only
-// `tensor.stride(-1) == 1` (last-dim contiguous) is required.
+// Layout: q/k/v are bshd shape ([batch, seq, head, dim]). Kernel reads per-dim
+// strides directly, so non-contiguous bshd views backed by bhsd memory work
+// (validated for bhsd order: stride_head > stride_seq); only stride(-1)==1 req.
 //
-// Memory-allocation policy: every tensor (q, k, v, out, lse, q/k/v_scale) is
-// allocated by the Python caller.  This entry point performs only pointer +
-// stride bookkeeping and kernel launch -- no GPU allocation, no torch dep.
+// All tensors are caller-allocated; this entry point does only pointer/stride
+// bookkeeping and launch -- no GPU allocation, no torch dep.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "aiter_hip_common.h"   // HipDeviceGuard, AiterAsmKernel, ...
@@ -30,12 +22,9 @@
 
 // Packed kernarg ABI (148 B = 0x94) -- matches the poc host
 // (poc_kl/mi400/fmha_fwd_mxfp8/fmha_fwd_mxfp8.cpp :: FmhaFwdKernelArgsBase,
-// branch features/yj/prefill).  This is the *new* tightly-packed layout: 8-byte
-// pointers and 4-byte ints with no slot padding.  Byte offsets (in comments)
-// are part of the kernel ABI emitted in the .co metadata -- do NOT reorder or
-// repack.  Notable changes vs the old 560-B slot-padded layout: scale pointers
-// moved to the middle (0x60-0x77), q_ts moved to 0x78, varlen QSeq/KSeq
-// pointers removed.
+// branch features/yj/prefill). Tightly-packed: 8-byte ptrs, 4-byte ints, no
+// slot padding. Byte offsets are part of the .co ABI -- do NOT reorder/repack.
+// vs the old 560-B layout: scale ptrs at 0x60-0x77, q_ts at 0x78, varlen QSeq/KSeq ptrs removed.
 #pragma pack(push, 1)
 struct KernelArgs
 {
@@ -109,15 +98,13 @@ static std::string get_heuristic_kernel_fmha_fwd_mxfp8(const std::string& dtype,
 
 AITER_CTYPES_ERROR_DEF
 
-// C ABI: every tensor is caller-allocated.  No GPU memory is allocated here.
+// C ABI: every tensor is caller-allocated; no GPU allocation here.
 //
-// q/k/v  : bshd shape ([batch, seq, head, dim]) fp8 (e4m3), last dim contiguous,
-//          bhsd memory order (stride_head > stride_seq).
+// q/k/v  : bshd shape fp8 (e4m3), last dim contiguous, bhsd memory order.
 // out    : [batch, q_seq_len, q_head_num, v_head_dim] bf16, last dim contiguous.
-// lse    : [batch, q_head_num, q_seq_len] fp32.  Always touched by the kernel
-//          ABI, so a valid buffer must be provided even when return_lse=0.
-// q/k/v_scale : 1-D micro-scaling (e8m0) descale buffers, laid out exactly as
-//          the kernel expects (block_size=32 along the head_dim).  Passed
+// lse    : [batch, q_head_num, q_seq_len] fp32. Always touched by the kernel
+//          ABI, so a valid buffer is required even when return_lse=0.
+// q/k/v_scale : 1-D e8m0 descale buffers (block_size=32 along head_dim), passed
 //          through verbatim as raw pointers.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmha_fwd_mxfp8_asm,

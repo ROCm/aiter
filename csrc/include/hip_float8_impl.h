@@ -141,14 +141,12 @@ namespace hip_fp8_impl
       return 0;
     }
 
-    // First need to check if it is normal or denorm as there is a difference of
-    // implicit 1 Then need to adjust the exponent to align with the F8 exponent,
-    // in the meanwhile, shift The mantissa. Then for stochastic rounding, add rng
-    // to mantissa and truncate. And for RNE, no need to add rng. Then probably
-    // need to check whether there is carry and adjust exponent and mantissa again
+    // First need to check if it is normal or denorm as there is a difference of implicit 1 Then need to adjust the
+    // exponent to align with the F8 exponent, in the meanwhile, shift The mantissa. Then for stochastic rounding, add
+    // rng to mantissa and truncate. And for RNE, no need to add rng. Then probably need to check whether there is carry
+    // and adjust exponent and mantissa again
 
-    // For IEEE bias mode, the bias is 2^(k-1) -1 where k is the width of exponent
-    // bits
+    // For IEEE bias mode, the bias is 2^(k-1) -1 where k is the width of exponent bits
     const int f8_bias = (1 << (we - 1)) - 1 + (negative_zero_nan ? 1 : 0);
     const int f8_denormal_act_exponent =
         1 - f8_bias; // actual exponent of f8 denormal
@@ -211,8 +209,7 @@ namespace hip_fp8_impl
       mantissa <<= -exponent_diff;
     }
     bool implicit_one = mantissa & (1 << mfmt);
-    // if there is no implicit 1, it  means the f8 is denormal and need to adjust
-    // to denorm exponent
+    // if there is no implicit 1, it  means the f8 is denormal and need to adjust to denorm exponent
     f8_exponent = (act_exponent + exponent_diff) /*actual f8 exponent*/ +
                   f8_bias - (implicit_one ? 0 : 1);
 

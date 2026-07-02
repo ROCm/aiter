@@ -3,12 +3,11 @@
 //
 // ASM FMHA forward, VARLEN / packed (BF16, gfx1250).
 //
-// Layout: q/k/v/out are **packed [token, head, dim]** (batch folded into the
-// token axis).  Per-batch sequence boundaries are described by cumulative
-// length arrays cu_seqlens_q / cu_seqlens_k (int32, length batch+1, no
-// padding).  Unlike the fixed-batch path, the kernel computes all addresses
-// internally from (q_head_num, gqa, head_dim, cu_seqlens) -- so the kernarg
-// block carries NO strides and the tensors MUST be densely packed / contiguous.
+// Layout: q/k/v/out are packed [token, head, dim] (batch folded into the token
+// axis). Per-batch boundaries via cumulative cu_seqlens_q/k (int32, len
+// batch+1, no padding). Kernel computes all addresses internally from
+// (q_head_num, gqa, head_dim, cu_seqlens), so the kernarg block carries NO
+// strides and tensors MUST be densely packed / contiguous.
 //
 //   q   : (total_q, nheads,   hdim_q)
 //   k   : (total_k, nheads_k, hdim_q)
@@ -17,13 +16,11 @@
 //   lse : packed [total_q, nheads]  (token-major; caller may shape (total_q, nheads, 1))
 //   cu_seqlens_q/k : int32 [batch+1] cumulative, cu[batch] == total
 //
-// Memory-allocation policy: all tensors are allocated by the Python caller.
-// This C++ entry point performs only pointer bookkeeping + kernel launch --
-// no GPU allocation, no temporaries, no torch dependency.
+// All tensors are caller-allocated; this entry point does only pointer
+// bookkeeping + launch -- no GPU allocation, no torch dep.
 //
-// sink: passed through verbatim (the value the kernel consumes directly, no
-// host-side scaling).  Optional -- may be null; whether the kernel reads it is
-// decided inside the .co (ENABLE_SINK).
+// sink: passed verbatim (no host-side scaling). Optional/nullable; whether it
+// is read is decided in the .co (ENABLE_SINK).
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "aiter_hip_common.h"   // HipDeviceGuard, AiterAsmKernel, ...
@@ -92,13 +89,10 @@ static std::string get_heuristic_kernel_fmha_fwd_bf16_varlen(const std::string& 
 
 AITER_CTYPES_ERROR_DEF
 
-// C ABI: every tensor is caller-allocated.  No GPU memory is allocated here;
-// no torch dependency.
-//
-// q/k/v/out are packed [token, head, dim] (densely contiguous).  cu_seqlens_q/k
-// are int32 [batch+1] cumulative arrays.  max_seqlen_q is the maximum per-batch
-// Q sequence length (host-supplied; used for the launch tile count).  sink is
-// optional and forwarded verbatim.
+// C ABI: every tensor is caller-allocated; no GPU allocation, no torch dep.
+// q/k/v/out packed [token, head, dim]; cu_seqlens_q/k int32 [batch+1]; sink
+// optional, forwarded verbatim. max_seqlen_q (host-supplied) sets the launch
+// tile count.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmha_fwd_with_sink_varlen_asm,
     (aiter_tensor_t* q,
@@ -214,9 +208,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.scalar     = softmax_scale;
     args.gqa        = gqa;
     args.q_head_num = q_head_num;
-    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy.
-    // 6 = 0b110 -> reverse_kv=0, double_q=1, remap_xy=1.  Must match how the
-    // shipped VARLEN .co was built.
+    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy. Must match how the shipped VARLEN .co was built.
     args.opt        = 4;
     args.lse        = return_lse ? 1 : 0;
     args.max_q_len  = max_seqlen_q;
@@ -241,10 +233,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         name, [&]() { return AiterAsmKernel(name, co_name); });
 
     // ---- launch ------------------------------------------------------------
-    // Dispatch along max_q_len (DOUBLE_Q halves via tg_div); z = batch index.
-    // The kernel early-exits q-tiles that fall beyond a batch's actual seqlen
-    // using cu_seqlens_q.  Shipped VARLEN kernels: ts_qo=128, double_q=1
-    // (tg_div=2), wv_tg=4 (block=128), remap_xy=1.
+    // Dispatch along max_q_len (double_q halves via tg_div); z = batch. Kernel
+    // early-exits q-tiles beyond a batch's actual seqlen via cu_seqlens_q.
+    // Shipped VARLEN kernels: ts_qo=128, double_q=1, wv_tg=4 (block=128), remap_xy=1.
     const int sub_Q        = 128;   // ts_qo
     const int wv_tg        = 4;
     const int bdx          = (wv_tg == 4) ? 128 : 256;

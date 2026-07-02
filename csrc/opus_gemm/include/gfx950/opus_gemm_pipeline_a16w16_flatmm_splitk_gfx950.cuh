@@ -20,12 +20,9 @@
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
 #include "splitk_reduce_gfx950.cuh"
 
-// ============================================================================
 // Layout functions -- device-only. Suffixed with _splitk to avoid symbol
 // collision with the non-splitk flatmm pipeline's identically-structured
-// helpers (each pipeline header is included in a separate translation unit
-// but keeping names distinct guards against ODR surprises).
-// ============================================================================
+// helpers (each pipeline header is a separate TU, but distinct names guard ODR).
 
 #ifdef __HIP_DEVICE_COMPILE__
 
@@ -197,17 +194,14 @@ void mask_va_tail(VA& v_a, int k_valid, int lane_id) {
 
 #endif // __HIP_DEVICE_COMPILE__
 
-// ============================================================================
 // Main kernel: signature on both passes, body device-only.
-// ============================================================================
 
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
 void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
-    // gfx950-only kernel body. See opus_gemm_pipeline_a16w16_gfx950.cuh for the
-    // multi-arch wheel rationale.
+    // gfx950-only kernel body. See opus_gemm_pipeline_a16w16_gfx950.cuh for the multi-arch wheel rationale.
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;

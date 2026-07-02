@@ -55,9 +55,7 @@ class alignas(Alignment) AlignedArray
     float data[N];
 };
 
-// ====================== Softmax things ===============================
-// We have our own implementation of softmax here so we can support transposing the output
-// in the softmax kernel when we extend this module to support expert-choice routing.
+// Softmax: own implementation so the output can be transposed for future expert-choice routing support.
 template <typename DTYPE, int TPB>
 __launch_bounds__(TPB) __global__
     void moeSoftmax(const DTYPE* input, const bool* finished, float* output, const int num_cols)
@@ -200,7 +198,7 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
     }
 }
 
-// ====================== TopK softmax things ===============================
+// TopK gating softmax
 
 /*
   A Top-K gating softmax written to exploit when the number of experts in the MoE layers
@@ -267,12 +265,10 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     static_assert(ELTS_PER_WARP % ELTS_PER_ROW == 0,
                   "The elts per row must cleanly divide the total elt per warp");
 
-    // ===================== From this point, we finally start computing run-time variables.
-    // ========================
+    // Runtime variables begin here.
 
-    // Compute CTA and warp rows. We pack multiple rows into a single warp, and a block contains
-    // WARPS_PER_CTA warps. This, each block processes a chunk of rows. We start by computing the
-    // start row for each block.
+    // Pack multiple rows per warp; a block has WARPS_PER_CTA warps and processes
+    // a chunk of rows. Compute the block's base row.
     const int cta_base_row = blockIdx.x * ROWS_PER_CTA;
 
     // Now, using the base row per thread block, we compute the base row per warp.
@@ -294,8 +290,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     // the start of the row it will read.
     const DTYPE* thread_row_ptr = input + thread_row * input_stride;
 
-    // Now, we compute the group each thread belong to in order to determine the first column to
-    // start loads.
+    // Now, we compute the group each thread belong to in order to determine the first column to start loads.
     const int thread_group_idx         = threadIdx.x % THREADS_PER_ROW;
     const int first_elt_read_by_thread = thread_group_idx * ELTS_PER_LDG;
     const DTYPE* thread_read_ptr       = thread_row_ptr + first_elt_read_by_thread;
@@ -380,8 +375,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     first_topk_expert = thread_kvp.key;
 
     // From this point, thread max in all the threads have the max within the row.
-    // Next: select top-K and compute softmax only on them; if need_renorm=false, normalize by the
-    // full row.
+    // Next: select top-K and compute softmax only on them; if need_renorm=false, normalize by the full row.
     int start_col                           = first_elt_read_by_thread;
     static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_LDG * THREADS_PER_ROW;
 
@@ -432,8 +426,8 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
             const bool node_uses_expert   = expert >= start_expert && expert < end_expert;
             const bool should_process_row = row_is_active && node_uses_expert;
 
-            // The lead thread from each sub-group will write out the final results to global
-            // memory. (This will be a single) thread per row of the input/output matrices.
+            // The lead thread from each sub-group will write out the final results to global memory.
+            // (This will be a single) thread per row of the input/output matrices.
             const int output_idx  = output_stride * thread_row + k_idx;
             const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx         = k * thread_row + k_idx;
@@ -451,8 +445,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
             const int ldg_group_for_expert     = expert / COLS_PER_GROUP_LDG;
             const int thread_to_clear_in_group = (expert / ELTS_PER_LDG) % THREADS_PER_ROW;
 
-            // Only the thread in the group which produced the max will reset the "winning" value to
-            // -inf.
+            // Only the thread in the group which produced the max will reset the "winning" value to -inf.
             if(thread_group_idx == thread_to_clear_in_group)
             {
                 const int offset_for_expert = expert % ELTS_PER_LDG;

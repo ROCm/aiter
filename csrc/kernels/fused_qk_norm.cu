@@ -9,13 +9,9 @@
 
 namespace aiter {
 
-// ============================================================================
-// Fused QK RMSNorm kernel with 2D grid: blockIdx.y selects Q (0) or K (1).
-// Q and K blocks execute fully in parallel on different CUs.
-// Both Q and K share the same BlockSize and thread_data_size.
-// Out-of-place: reads from q_in/k_in (may be non-contiguous), writes to
-// q_out/k_out (contiguous).
-// ============================================================================
+// Fused QK RMSNorm, 2D grid: blockIdx.y selects Q (0) or K (1); Q/K run in parallel
+// on different CUs and share BlockSize/thread_data_size. Out-of-place: reads q_in/k_in
+// (may be non-contiguous), writes q_out/k_out (contiguous).
 
 template <typename DTYPE_I, int BlockSize, int thread_data_size, bool interleave = true, int num_row = 1>
 __global__ void fused_qk_rmsnorm_kernel(
@@ -145,9 +141,7 @@ __global__ void fused_qk_rmsnorm_kernel(
     }
 }
 
-// ============================================================================
 // Dispatch macros
-// ============================================================================
 
 #define FUSED_QK_RMSNORM_KERNEL_IMPL_(BlockSize, thread_data_size, interleave, num_row)               \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(q.dtype(), "fused_qk_rmsnorm_kernel", [&] {               \
@@ -172,9 +166,7 @@ __global__ void fused_qk_rmsnorm_kernel(
     FUSED_QK_RMSNORM_KERNEL_IMPL_(BlockSize, thread_data_size, true, num_row)
 
 
-// ============================================================================
 // Public API
-// ============================================================================
 
 void fused_qk_rmsnorm(aiter_tensor_t& q,
                        aiter_tensor_t& q_weight,

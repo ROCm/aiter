@@ -152,10 +152,9 @@ __global__ void hadamard_rotate_activation_fp4quant_inplace_kernel(DTYPE_I* __re
 
     if constexpr(fp4quant)
     {
-        // MXFP4 (e8m0 microscaling) relies on the gfx950-only cvt_scalef32_pk_fp4
-        // intrinsics; on gfx942 those don't exist, so this branch must not codegen
-        // them. The host (rotate_activation_fp4quant_inplace) rejects gfx942 before
-        // launch, so the trap only guards a never-reached gfx942 device path.
+        // MXFP4 (e8m0) uses gfx950-only cvt_scalef32_pk_fp4 intrinsics absent on
+        // gfx942, so this branch must not codegen them. Host rejects gfx942 before
+        // launch; the trap only guards a never-reached gfx942 device path.
 #if defined(__gfx942__)
         __builtin_trap();
 #else
@@ -399,10 +398,9 @@ __global__ void rope_hadamard_rotate_activation_quant_kernel(DTYPE_O* __restrict
 
     if constexpr(QMODE == RQ_FP4)
     {
-        // MXFP4 (e8m0 microscaling) relies on the gfx950-only cvt_scalef32_pk_fp4
-        // intrinsics; on gfx942 those don't exist, so this branch must not codegen
-        // them. The host (rope_rotate_activation_fp4quant_inplace) rejects gfx942
-        // before launch, so the trap only guards a never-reached gfx942 device path.
+        // MXFP4 (e8m0) uses gfx950-only cvt_scalef32_pk_fp4 intrinsics absent on
+        // gfx942, so this branch must not codegen them. Host rejects gfx942 before
+        // launch; the trap only guards a never-reached gfx942 device path.
 #if defined(__gfx942__)
         __builtin_trap();
 #else
@@ -432,10 +430,9 @@ __global__ void rope_hadamard_rotate_activation_quant_kernel(DTYPE_O* __restrict
         //   absMax = max(1e-10f, group_max|x|)            (absMax seeded at 1e-10f)
         //   scale  = absMax * (1 / fp8_max)               (stored per-group scale)
         //   out_fp8 = round_to_nearest(af * (1 / scale))  (store reciprocal-multiply)
-        // finfo<fp8_t>::max() is arch-correct (448 OCP e4m3fn on gfx950, 240
-        // e4m3fnuz on gfx942), so the scale matches the torch reference per arch.
-        // 1/fp8_max uses double-then-narrow division to mirror the reference
-        // kernel's `inverted_DTYPE_MAX = 1. / static_cast<float>(max())`.
+        // finfo<fp8_t>::max() is arch-correct (448 e4m3fn gfx950, 240 e4m3fnuz gfx942).
+        // 1/fp8_max uses double-then-narrow division to mirror the reference's
+        // `inverted_DTYPE_MAX = 1. / static_cast<float>(max())`.
         constexpr float fp8_max      = static_cast<float>(opus::finfo<opus::fp8_t>::max());
         const float inverted_fp8_max = 1.0 / fp8_max;
         float absMax                 = 1e-10f;

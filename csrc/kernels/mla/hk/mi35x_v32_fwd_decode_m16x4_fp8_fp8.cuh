@@ -59,11 +59,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     constexpr uint32_t k_q_nope_end   = k_q_rope_begin - 1;             // 99
     constexpr uint32_t k_q_nope_begin = k_q_nope_end - k_q_nope_sz + 1; // 68
 
-    // p_mfma overlays p_comp[0..3]=v112-v115. Standard low-to-high pack order
-    // is hazard-free: each pack instruction is atomic (reads sources, then
-    // writes dst within the single instruction). The 8 packs write into
-    // p_mfma[0..3] (=v112-v115); p_comp[4..15] (=v116-v127) become free
-    // during PV and host kv_0_alt/kv_1_alt.
+    // p_mfma overlays p_comp[0..3]=v112-v115. Standard low-to-high pack order is hazard-free: each pack instruction
+    // is atomic (reads sources, then writes dst within the single instruction). The 8 packs write into p_mfma[0..3]
+    // (=v112-v115); p_comp[4..15] (=v116-v127) become free during PV and host kv_0_alt/kv_1_alt.
     constexpr uint32_t k_p_mfma_begin = k_p_comp_begin + 0; // 112
     constexpr uint32_t k_p_mfma_end   = k_p_comp_begin + 3; // 115
 
@@ -123,11 +121,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     OManager16bitsV2<T, out_t> o_manager;
     OManager32bitsV2<T, split_t> split_o_manager;
 
-    // kv_0/kv_1 hold 32 N-cols of K-matrix per load (= 4 vgprs = 2 mfma B-tiles).
-    // On kBlockN=64 this is the LOWER N-half; the upper half is re-loaded into
-    // the same VGPRs between the lower-half and upper-half QK mfmas. Shape uses
-    // a literal 32 (not T::kBlockN) so mma_ABt issues exactly 2 mfmas regardless
-    // of the kBlockN value.
+    // kv_0/kv_1 hold 32 N-cols of K-matrix per load (= 4 vgprs = 2 mfma B-tiles). On kBlockN=64 this is the LOWER
+    // N-half; the upper half is re-loaded into the same VGPRs between the lower-half and upper-half QK mfmas. Shape
+    // uses a literal 32 (not T::kBlockN) so mma_ABt issues exactly 2 mfmas regardless of the kBlockN value.
     hk::art<kv_t, T::kBlockK, 32, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
     hk::art<kv_t, T::kBlockK, 32, hk::row_l, hk::rt_16x32_s, kv_1_ranges> kv_1;
     hk::art<kv_t, T::kBlockK, 32, hk::row_l, hk::rt_16x32_s, kv_0_alt_ranges> kv_0_alt;
@@ -187,9 +183,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         hkdart::type_list<hkdart::range<k_kv_1_alt_begin + 2, k_kv_1_alt_begin + 3>>,
         2>;
 
-    // Each kv_*_top/bot is 2 vgprs = exactly 1 mfma B-tile (16 M-cols x 32 K-cols).
-    // K-dim sized to T::kBlockK (=32) -- on kBlockN=64 the same VGPRs are
-    // re-loaded from the upper N-half between the lower-half and upper-half PV
+    // Each kv_*_top/bot is 2 vgprs = exactly 1 mfma B-tile (16 M-cols x 32 K-cols). K-dim sized to T::kBlockK (=32)
+    // -- on kBlockN=64 the same VGPRs are re-loaded from the upper N-half between the lower-half and upper-half PV
     // mfmas, so the art still represents exactly one 1-mfma data buffer.
     hk::art<kv_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_0_top_ranges> kv_0_top;
     hk::art<kv_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, kv_0_bot_ranges> kv_0_bot;
@@ -241,12 +236,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     static_assert(kSzLdsO <= kSzLdsKv,
                   "kSzLdsO must be less than or equal to kSzLdsKv because we want to reuse p_lds_o "
                   "and p_lds_kv_next.");
-    // Overlay Q on the curr-pong KV slot. Q is consumed once (loaded into VGPRs
-    // before the prologue async_load_k) and never re-read; the curr-pong KV
-    // bytes are not touched until the prologue's buffer_load_lds fires. A cross-
-    // warp s_barrier between the Q load and that prefetch enforces the handoff
-    // (warp A's K writes must not clobber bytes warp B is still reading via Q
-    // ds_reads; per-warp lgkmcnt(0) alone is insufficient).
+    // Overlay Q on the curr-pong KV slot. Q is consumed once (loaded into VGPRs before the prologue async_load_k) and
+    // never re-read; the curr-pong KV bytes are not touched until the prologue's buffer_load_lds fires. A cross-warp
+    // s_barrier between the Q load and that prefetch enforces the handoff (warp A's K writes must not clobber bytes
+    // warp B is still reading via Q ds_reads; per-warp lgkmcnt(0) alone is insufficient).
     static_assert(kSzLdsQ <= kSzLdsKv,
                   "kSzLdsQ must be <= kSzLdsKv to overlay Q on the curr-pong KV slot.");
 
@@ -266,19 +259,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 4]);
         const int32_t kv_end_page = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 5]);
-        // kv_offset is in TOKEN units regardless of page_size: number of
-        // real KV tokens in this batch that come after this work item.
-        // kv_offset == 0 iff this work item ends at the batch tail.
+        // kv_offset is in TOKEN units regardless of page_size: number of real KV tokens in this batch that come after
+        // this work item. kv_offset == 0 iff this work item ends at the batch tail.
         const int32_t kv_offset = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 6]);
 
-        // Convert work_info page bounds to TOKEN space. When kPageSize == 1
-        // pages == tokens and we never touch p_kv_last_page_lens. When
-        // kPageSize > 1 and this is the batch tail (kv_offset == 0), the
-        // last page is partial and we clip with kv_last_page_lens[batch].
-        // The combined condition relies on compile-time folding of
-        // (T::kPageSize == 1) so the else branch (with the load) becomes
-        // dead code when kPageSize == 1.
+        // Convert work_info page bounds to TOKEN space. When kPageSize == 1 pages == tokens and we never touch
+        // p_kv_last_page_lens. When kPageSize > 1 and this is the batch tail (kv_offset == 0), the last page is
+        // partial and we clip with kv_last_page_lens[batch]. The combined condition relies on compile-time folding of
+        // (T::kPageSize == 1) so the else branch (with the load) becomes dead code when kPageSize == 1.
         const int32_t kv_start = kv_start_page * T::kPageSize;
         int32_t kv_end;
         if((T::kPageSize == 1) || (kv_offset != 0))
@@ -293,10 +282,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 __builtin_amdgcn_readfirstlane(params.p_kv_last_page_lens[batch_idx]);
             kv_end = (kv_end_page - 1) * T::kPageSize + last_page_len;
         }
-        // Per-warp causal offset: warp at qpos i must clamp kv_end to its
-        // visible range. With kv_offset KV positions remaining after this
-        // chunk, qpos i sees up to (kv_end + kv_offset - (Q - 1 - i)) =
-        // kv_end - max(0, qpos_off_from_last - kv_offset).
+        // Per-warp causal offset: warp at qpos i must clamp kv_end to its visible range. With kv_offset KV positions
+        // remaining after this chunk, qpos i sees up to (kv_end + kv_offset - (Q - 1 - i)) = kv_end - max(0,
+        // qpos_off_from_last - kv_offset).
         const int32_t causal_offset = opus::max(qpos_off_from_last - kv_offset, 0);
         const int32_t kv_end_eff    = kv_end - causal_offset;
         const int32_t kv_len        = kv_end - kv_start;
@@ -305,9 +293,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
         comp_t row_max;
         comp_t row_sum_e;
 
-        // Each tile is split into kNumPasses sub-chunks of 32 KV rows each.
-        // For kBlockN=64 (kNumPasses=2) the buffer-manager pass 0 covers rows
-        // [kv_tile_start, kv_tile_start+32) and pass 1 covers rows
+        // Each tile is split into kNumPasses sub-chunks of 32 KV rows each. For kBlockN=64 (kNumPasses=2) the
+        // buffer-manager pass 0 covers rows [kv_tile_start, kv_tile_start+32) and pass 1 covers rows
         // [kv_tile_start+32, kv_tile_start+64).
         constexpr int32_t kNumPasses = T::kBlockN / 32;
         int32_t row_kv_ld[kNumPasses];
@@ -333,11 +320,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             params.query, warp_idx, qo_start, p_lds_q);
         __builtin_amdgcn_sched_barrier(0);
 
-        // Cross-warp Q->KV LDS handoff: Q occupies the front of LDS and is loaded
-        // via VRAM->VGPR (LDS scratch only as bounce). After Q reaches VGPRs, all
-        // warps must complete their Q ds_reads before any warp's buffer_load_lds
-        // for KV writes the same bytes. Per-warp lgkmcnt(0) is insufficient
-        // because Q ds_reads from one warp can race with KV writes from another.
+        // Cross-warp Q->KV LDS handoff: Q occupies the front of LDS and is loaded via VRAM->VGPR (LDS scratch only as
+        // bounce). After Q reaches VGPRs, all warps must complete their Q ds_reads before any warp's buffer_load_lds
+        // for KV writes the same bytes. Per-warp lgkmcnt(0) is insufficient because Q ds_reads from one warp can race
+        // with KV writes from another.
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -405,22 +391,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
         }
 
-        // kSkipCompute: this warp has no real compute on this tile; it only
-        // participates in barriers and the cooperative V-transpose so active
-        // warps' PV GEMM can complete. row_max/row_sum/oaccu freeze.
-        // Invariant (enforced by dispatcher): kSkipCompute=true implies this is
-        // the warp's epilogue iter AND the global last iter (no next tile),
-        // because per-warp causal_offset < kBlockN can defer at most one tile.
+        // kSkipCompute: this warp has no real compute on this tile; it only participates in barriers and the
+        // cooperative V-transpose so active warps' PV GEMM can complete. row_max/row_sum/oaccu freeze. Invariant
+        // (enforced by dispatcher): kSkipCompute=true implies this is the warp's epilogue iter AND the global last
+        // iter (no next tile), because per-warp causal_offset < kBlockN can defer at most one tile.
         auto mla_main = [&]<bool kIsFirstIter,
                             bool kSkipCompute,
                             PvGemmEpilogueType kEpilogueType,
                             bool kCheckBoundaryNext>(const int32_t kv_tile_start,
                                                      const int32_t kv_tile_end) {
             constexpr bool kDoEpilogue = (kEpilogueType != PvGemmEpilogueType::None);
-            // A warp only stops loading K / swapping LDS pong on the global last
-            // tile. In the new design, "global last" coincides with either the
-            // epilogue iter (active or skip-with-epilogue) or the idle warp's
-            // single skip iter (no epilogue).
+            // A warp only stops loading K / swapping LDS pong on the global last tile. In the new design, "global
+            // last" coincides with either the epilogue iter (active or skip-with-epilogue) or the idle warp's single
+            // skip iter (no epilogue).
             constexpr bool kIsGlobalLast = kSkipCompute || kDoEpilogue;
 
             static_assert((kSkipCompute == false) || (kIsFirstIter == false),
@@ -534,9 +517,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     kv_manager.template load_k_to_gpr<48, (tile_idx + 1) * T::kBlockK>(
                         kv_1_bot, p_lds_kv_curr);
 
-                    // Passes 1..kNumPasses-1 (kRowOffset = p*32) for the col-block whose pass-0
-                    // was issued at the top of this iter (col-block idx+1). Both col-strips per
-                    // pass.
+                    // Passes 1..kNumPasses-1 (kRowOffset = p*32) for the col-block whose pass-0 was issued at the top
+                    // of this iter (col-block idx+1). Both col-strips per pass.
                     opus::static_for<kNumPasses - 1>([&](auto p) {
                         kv_manager.template async_load_k_tile<(p.value + 1) * 32,
                                                               (idx.value + 1) * 64,
@@ -655,9 +637,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 __builtin_amdgcn_s_setprio(2);
             }
 
-            // Element-wise scale. Boundary problem is handled here as well.
-            // Runtime-dispatch on whether this tile crosses kv_end_eff to keep
-            // mla_main from instantiating twice on a compile-time flag.
+            // Element-wise scale. Boundary problem is handled here as well. Runtime-dispatch on whether this tile
+            // crosses kv_end_eff to keep mla_main from instantiating twice on a compile-time flag.
             const uint32_t col_0_idx = lane_idx >> 4;
             if constexpr(kSkipCompute == false)
             {
@@ -700,10 +681,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 softmax_p1_16<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
             }
 
-            // Prepare for output. V is read directly from p_lds_kv_curr in the PV
-            // loop below, so the output bounce buffer overlays p_lds_kv_next instead.
-            // On the epilogue iteration kIsGlobalLast == true, so no async K load
-            // targets p_lds_kv_next and the swap at the end is also skipped.
+            // Prepare for output. V is read directly from p_lds_kv_curr in the PV loop below, so the output bounce
+            // buffer overlays p_lds_kv_next instead. On the epilogue iteration kIsGlobalLast == true, so no async K
+            // load targets p_lds_kv_next and the swap at the end is also skipped.
             const uintptr_t p_lds_o    = kDoEpilogue ? p_lds_kv_next : 0;
             const float reci_row_sum_e = kDoEpilogue ? (1.0f / row_sum_e) : .0f;
 
@@ -712,23 +692,16 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             // __builtin_amdgcn_s_barrier();
             // __builtin_amdgcn_sched_barrier(0);
 
-            // GEMM on PV -- fully double-buffered using p_comp aliases as alt V tile buffer.
-            //
-            // Per-pv_iter design (1 tile = 64 N-cols per iter):
-            //   kv_0/kv_1         : ALWAYS hold the LOWER N-half (rows 0..31) of tile i.
-            //   kv_0_alt/kv_1_alt : ALWAYS hold the UPPER N-half (rows 32..63) of tile i.
-            // Within an iter, _lo mfmas consume kv_0/kv_1 while the HI load streams into
-            // kv_*_alt; _hi mfmas then consume kv_*_alt while the next tile's LO streams
-            // into kv_0/kv_1. The iter-spanning LO load is hidden by the _hi mfmas plus
-            // any tail work; the in-iter HI load is hidden by the 4 _lo mfmas + rescale.
+            // GEMM on PV -- fully double-buffered using p_comp aliases as alt V tile buffer. Per-pv_iter (1 tile = 64
+            // N-cols): kv_0/kv_1 ALWAYS hold tile i's LOWER N-half (rows 0..31), kv_0_alt/kv_1_alt ALWAYS hold its
+            // UPPER N-half (rows 32..63). _lo mfmas consume kv_0/kv_1 while the HI load streams into kv_*_alt; _hi
+            // mfmas then consume kv_*_alt while the next tile's LO streams into kv_0/kv_1 (LO load hidden by _hi
+            // mfmas + tail work, HI load hidden by the 4 _lo mfmas + rescale).
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 8
 
-            // PV scaler workaround: HW bug -- mfma blocks the following v_pk_* even with
-            // no data dependency. Per sub-tile (4 vgprs) we split the rescale in half:
-            //   - pre-PV-loop:    1x v_pk_mul_f32 covering vgprs [base+0, base+1]
-            //   - interleaved:    2x v_mul_f32    covering vgprs [base+2, base+3]
-            // The interleaved phase is mfma-paired (rotation: scale_{i+1} after mfma_i),
-            // and uses single-precision v_mul_f32 so it doesn't trip the v_pk hazard.
+            // PV scaler workaround: HW bug makes mfma block the following v_pk_* even with no data dependency. Per
+            // sub-tile (4 vgprs), rescale is split: pre-PV-loop 1x v_pk_mul_f32 on [base+0,base+1], then interleaved
+            // (mfma-paired) 2x v_mul_f32 on [base+2,base+3] -- single-precision so it avoids the v_pk hazard.
             // pk_mul_pair(r, base_c): v_pk_mul_f32 on vgprs [base, base+1] *= r
             auto pk_mul_pair = [&](float r, auto base_c) {
                 constexpr uint32_t base = decltype(base_c)::value;
@@ -746,11 +719,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 
             if constexpr(kSkipCompute == false)
             {
-                // Pre-PV-loop scale: only tile 0's 4 sub-tiles. The remaining 7 tiles
-                // (28 sub-tiles) are scaled inside the PV loop using mul_pair (single-
-                // precision v_mul_f32, hazard-free) interleaved with the 8 mfmas per iter.
-                // pk_mul_pair (v_pk_mul_f32) is restricted to the prologue because the
-                // mfma->v_pk hazard would otherwise fire when used after a PV mfma.
+                // Pre-PV-loop scale: only tile 0's 4 sub-tiles. The remaining 7 tiles (28 sub-tiles) are scaled
+                // inside the PV loop using mul_pair (single-precision v_mul_f32, hazard-free) interleaved with the 8
+                // mfmas per iter. pk_mul_pair (v_pk_mul_f32) is restricted to the prologue because the mfma->v_pk
+                // hazard would otherwise fire when used after a PV mfma.
                 if constexpr(kIsFirstIter == false)
                 {
                     opus::static_for<4>([&](auto i) {
@@ -783,9 +755,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 pack_4f32_to_fp8<k_p_mfma_begin + 3, k_p_comp_begin + 12, true>();
                 pack_4f32_to_fp8<k_p_mfma_begin + 3, k_p_comp_begin + 14, false>();
 
-                // Finish scaling tile 0's 4 sub-tiles with mul_pair on vgprs +2/+3
-                // so iter 0's mfmas see fully-rescaled C. The +0/+1 halves were scaled
-                // by the pk_mul_pair block above.
+                // Finish scaling tile 0's 4 sub-tiles with mul_pair on vgprs +2/+3 so iter 0's mfmas see
+                // fully-rescaled C. The +0/+1 halves were scaled by the pk_mul_pair block above.
                 if constexpr(kIsFirstIter == false)
                 {
                     opus::static_for<4>([&](auto i) {
@@ -795,12 +766,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 // Prologue's LO load is finalized by iter 0's 2.1+2.2 (s_waitcnt + finalize).
             }
 
-            // Per-pv_iter loop. Each iter processes one tile (64 N-cols, 8 sub-tiles).
-            //   kv_0/kv_1     : ALWAYS hold tile i LOWER N-half (rows 0..15 + 16..31).
-            //   kv_0_alt/_1_alt: ALWAYS hold tile i UPPER N-half (rows 32..47 + 48..63).
-            // LO of next tile is prefetched into kv_0/kv_1 at the tail of each iter
-            // (overlaps with the _hi mfmas). HI of current tile is prefetched into
-            // kv_*_alt at the head (overlaps with the _lo mfmas).
+            // Per-pv_iter loop, one tile (64 N-cols, 8 sub-tiles) per iter. Next tile's LO
+            // is prefetched into kv_0/kv_1 at the tail (overlaps _hi mfmas); current tile's
+            // HI is prefetched into kv_*_alt at the head (overlaps _lo mfmas).
             opus::static_for<num_pv_iter>([&](auto i) {
                 constexpr uint32_t tile_idx = i.value;
                 constexpr bool has_next     = (tile_idx + 1) < num_pv_iter;
@@ -870,9 +838,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     // Next tile's vgpr base for interleaved rescale (sub-tiles 0..3 of tile i+1).
                     constexpr uint32_t next_oaccu_base = k_o_begin + (tile_idx + 1) * 16;
 
-                    // 2.4: 4 _lo mfmas, interleaved with mul_pairs scaling next tile's
-                    // sub-tiles 0 and 1 (both +0/+1 and +2/+3). Skipped on FirstIter
-                    // (no rescale anywhere) and on the final iter (no next tile).
+                    // 2.4: 4 _lo mfmas, interleaved with mul_pairs scaling next tile's sub-tiles 0 and 1 (both +0/+1
+                    // and +2/+3). Skipped on FirstIter (no rescale anywhere) and on the final iter (no next tile).
                     if constexpr(kIsFirstIter)
                     {
                         hk::mma_ABt(oaccu_0_a, kv_0_top, p_mfma_lo);
@@ -1011,18 +978,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
         };
 
-        // Per-warp dispatch.
-        // All warps execute the same number of global tiles (= num_iters). On
-        // tiles past this warp's effective end (kv_end_eff), the warp dispatches
-        // mla_main with kSkipCompute=true: it still participates in barriers and
-        // the cooperative V transpose but skips QK/softmax/PV. The epilogue
-        // (output_to_vram + LSE) fires ONLY on the global last tile and is
-        // synchronized across all working warps so the output writes overlap.
-        //
-        // Per-warp causal_offset < kBlockN (qseqlen <= 8, kBlockN = 64) means
-        // num_iters_eff in {0, num_iters - 1, num_iters}: at most 1 trailing
-        // skip iter.
-        //
+        // Per-warp dispatch. All warps execute the same number of global tiles
+        // (= num_iters). Past this warp's effective end (kv_end_eff), it dispatches
+        // mla_main with kSkipCompute=true: still joins barriers/cooperative V transpose
+        // but skips QK/softmax/PV. Epilogue (output_to_vram + LSE) fires ONLY on the
+        // global last tile, synchronized across working warps so writes overlap.
+        // Per-warp causal_offset < kBlockN (qseqlen <= 8, kBlockN = 64) bounds
+        // num_iters_eff to {0, num_iters-1, num_iters}: at most 1 trailing skip iter.
         // Per-warp template params: kEpilogueType, kSkipCompute.
         // Cooperative-uniform: kIsFirstIter, kCheckBoundaryNext.
         if(kv_len_eff <= 0)
@@ -1053,9 +1015,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
             else
             {
-                // num_iters == 2: real (partial) iter on tile 0, then skip+epilogue
-                // on tile 1. Tile 1 is global last and partial since
-                // kv_len in [kBlockN, kBlockN + qseqlen - 1].
+                // num_iters == 2: real (partial) iter on tile 0, then skip+epilogue on tile 1. Tile 1 is global last
+                // and partial since kv_len in [kBlockN, kBlockN + qseqlen - 1].
                 mla_main.template operator()<true, false, PvGemmEpilogueType::None, true>(
                     kv_start, kv_start + T::kBlockN);
                 if(partial_qo_loc < 0)
@@ -1176,9 +1137,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
             else
             {
-                // Warp's last real is NOT the global last; one trailing skip iter
-                // does the epilogue. Real iter prefetches K for the global last
-                // tile (kCheckBoundaryNext = global_last_partial).
+                // Warp's last real is NOT the global last; one trailing skip iter does the epilogue. Real iter
+                // prefetches K for the global last tile (kCheckBoundaryNext = global_last_partial).
                 const bool boundary_next = (kv_len % T::kBlockN) != 0;
                 if(boundary_next)
                 {
@@ -1355,9 +1315,8 @@ void hk_mi35x_mla_v32_fwd_decode_m16x4_fp8_fp8(torch::Tensor& query,
         break;                                                            \
     }
 
-        // Only page_size in {1, 64} are instantiated. 64 is the value used by
-        // FlashMLA, TRT-LLM-MLA and FlashInfer-MLA in vLLM/SGLang for typical
-        // DeepSeek deployments; 1 covers the unpaged path.
+        // Only page_size in {1, 64} are instantiated. 64 is the value used by FlashMLA, TRT-LLM-MLA and
+        // FlashInfer-MLA in vLLM/SGLang for typical DeepSeek deployments; 1 covers the unpaged path.
         switch(page_size)
         {
             DISPATCH_PAGE_SIZE(1)

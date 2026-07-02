@@ -85,9 +85,8 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
         sum_blocks);
 }
 
-// Parallel planner: Phase 1 (warp 0) runs an O(num_batches) scan
-// recording each batch's start CU / remainder / prefix counts;
-// phase 2 fills every batch's fragments in parallel (one warp per batch).
+// Parallel planner: Phase 1 (warp 0) runs an O(num_batches) scan recording each batch's start CU / remainder / prefix
+// counts; phase 2 fills every batch's fragments in parallel (one warp per batch).
 template <typename Traits>
 __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
     void kn_get_mla_metadata_v1_2_parallel(MlaMetadataV1KernelParameter params)
@@ -287,8 +286,7 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
             }
         }
 
-        // Each fragment -> one work covering kv blocks [block_begin, block_end)
-        // of this batch, landing in CU frag_cu.
+        // Each fragment -> one work covering kv blocks [block_begin, block_end) of this batch, landing in CU frag_cu.
         for(int32_t frag_idx = lane_idx; frag_idx < num_frags; frag_idx += opus::get_warp_size())
         {
             int32_t block_begin, block_end, frag_cu;
@@ -787,8 +785,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     auto arch_id = get_gpu_arch();
 
-    // In the following cases, we use #head=16 to simulate cases which is not natively supported by
-    // mla main kernel.
+    // In the following cases, we use #head=16 to simulate cases which is not natively supported by mla main kernel.
     const bool q_is_fp8 =
         (q_dtype == at::ScalarType::Float8_e4m3fnuz || q_dtype == at::ScalarType::Float8_e4m3fn);
     const bool kv_is_fp8 =
@@ -797,22 +794,17 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const bool enable_experimental = std::getenv("AITER_ENABLE_EXPERIMENTAL") != nullptr &&
                                      std::atoi(std::getenv("AITER_ENABLE_EXPERIMENTAL")) != 0;
 
-    // HK MLA m16x4 kernel runs at occupancy=2 (gfx950 + fp8/fp8 + 64 q-tokens per
-    // tile, gated on AITER_ENABLE_EXPERIMENTAL same as the dispatch in
-    // aiter/mla.py:use_hk). The m16x4 launch site spawns 2*num_cu workgroups; the
-    // work distribution here must produce work_indptr sized to match so the second
-    // occupancy slot actually receives work. Detection mirrors hk_decode_fwd
-    // dispatch (num_heads * max_seqlen_qo == 64) and uses ORIGINAL
-    // num_heads/max_seqlen_qo (pre-fold).
+    // HK MLA m16x4 kernel (gfx950, fp8/fp8, 64 q-tokens/tile, gated by AITER_ENABLE_EXPERIMENTAL,
+    // matches aiter/mla.py:use_hk) runs at occupancy=2 and its launch spawns 2*num_cu workgroups,
+    // so work_indptr here must be sized to match so the second occupancy slot gets work.
+    // Detection mirrors hk_decode_fwd dispatch; uses original (pre-fold) num_heads/max_seqlen_qo.
     const bool is_hk_m16x4 = (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
                              (num_heads * max_seqlen_qo == 64) && enable_experimental;
     const int32_t cluster_multiplier = is_hk_m16x4 ? 2 : 1;
     const int32_t num_clusters = (dev_prop.multiProcessorCount * cluster_multiplier) / num_heads_k;
 
-    // Gate on arch_id consistent with hk_mla_decode_fwd dispatch (gfx942/gfx950).
-    // Otherwise this would mark shapes as natively supported on archs where the
-    // HK kernels are unavailable, producing metadata that downstream kernels
-    // cannot consume.
+    // Gated on arch_id to match hk_mla_decode_fwd dispatch (gfx942/gfx950); otherwise shapes could
+    // be marked natively supported on archs lacking the HK kernels, producing unusable metadata.
     const bool hk_mtp_experimental =
         (arch_id == "gfx942" || arch_id == "gfx950") && (q_is_fp8 && kv_is_fp8) &&
         (num_heads * max_seqlen_qo == 128) &&

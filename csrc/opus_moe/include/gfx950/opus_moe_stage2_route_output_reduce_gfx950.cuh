@@ -55,11 +55,10 @@ opus_moe_stage2_route_reduce_pack_bf16x4(const float* acc, int base)
 }
 #endif
 
-// ROUTE_FP8 selects the packed MXFP8 path at compile time. Unlike decode, this
-// reduce kernel is small enough that specializing the output format trims the
-// unused bf16 path without increasing VGPR pressure.
-// TOPK > 0  -> slot loop bound is a compile-time constant so the whole loop
-//              unrolls and issues the route loads before the final reduction.
+// ROUTE_FP8 selects the packed MXFP8 path at compile time; specializing the
+// output format trims the unused bf16 path without adding VGPR pressure.
+// TOPK > 0  -> compile-time slot loop bound: loop unrolls, issuing route loads
+//              before the final reduction.
 // TOPK == 0 -> fallback to the runtime kargs.topk loop.
 template<int BLOCK_N, int BLOCK_THREADS, int TOPK = 0, bool ROUTE_FP8 = false>
 __global__ __launch_bounds__(BLOCK_THREADS, 4) void
@@ -92,8 +91,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
         const uint8_t* __restrict__ ro8 = kargs.route_out;
         const int64_t rstride = kargs.route_out_row_bytes;
         const int scale_off = kargs.model_dim;
-        // Interleave each 8-column read/sum/write group to keep loads wide while
-        // overlapping the final bf16 writes.
+        // Interleave each 8-column read/sum/write group to keep loads wide while overlapping the final bf16 writes.
         constexpr int NG = elems_per_thread / 8;
 #pragma unroll
         for(int group = 0; group < NG; ++group)
@@ -379,9 +377,8 @@ inline void opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
     const int block_n = opus_moe_stage2_reduce_token_slot_route_output_select_block_n(
         kargs.model_dim, requested_block_n);
     dim3 grid(kargs.token_num, (kargs.model_dim + block_n - 1) / block_n, 1);
-    // Specialize for common topk values (unrolls the slot loop -> all loads
-    // issued up front, hiding latency); otherwise fall back to the runtime-topk
-    // kernel (TOPK=0), which is correct for any topk.
+    // Specialize for common topk values (unrolls the slot loop -> all loads issued up front, hiding latency);
+    // otherwise fall back to the runtime-topk kernel (TOPK=0), which is correct for any topk.
     switch(kargs.topk)
     {
     case 4:

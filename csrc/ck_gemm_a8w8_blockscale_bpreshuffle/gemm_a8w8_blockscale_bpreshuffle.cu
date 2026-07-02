@@ -14,14 +14,12 @@
 using BlockwiseKernel = torch::Tensor (*)(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&);
 
-// Name-keyed dispatch table; see gemm_a8w8_blockscale.cu for the rationale
-// behind std::string_view keys + raw fn-ptr values (constant-init into
-// .data.rel.ro, matching PR #3255's GemmDispatchMap style).
+// Name-keyed dispatch table; see gemm_a8w8_blockscale.cu for the rationale behind std::string_view keys + raw fn-ptr values
+// (constant-init into .data.rel.ro, matching PR #3255's GemmDispatchMap style).
 using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 
-// Python-driven name-keyed dispatch (see gemm_a8w8_blockscale.cu for the
-// rationale).  Empty kernelName -> default heuristic; non-empty but unknown
-// kernelName -> hard error.
+// Python-driven name-keyed dispatch (see gemm_a8w8_blockscale.cu for the rationale).
+// Empty kernelName -> default heuristic; non-empty but unknown kernelName -> hard error.
 template <typename DDataType, typename EDataType = DDataType>
 BlockwiseKernel blockscale_bpreshuffle_dispatch(const std::string& kernelName)
 {

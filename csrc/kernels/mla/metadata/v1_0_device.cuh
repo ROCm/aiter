@@ -197,8 +197,7 @@ void get_mla_metadata_v1_0_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
 
     int32_t fixed_num_batches = reduce_indptr.size(0) - 1;
-    // In the following cases, we use #head=16 to simulate cases which is not natively supported by
-    // mla main kernel.
+    // In the following cases, we use #head=16 to simulate cases which is not natively supported by mla main kernel.
     if((num_heads != 16) &&
        (num_heads != 128) && // main kernel natively supports #head=16 or #head=128
        (num_heads % 16 == 0) && (num_heads < 128))

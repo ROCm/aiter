@@ -42,12 +42,10 @@ namespace aiter {
         return val;
     }
 
-// Branch must match mma_pack_size (= warp_size == 64 ? 1 : 2): the MFMA path
-// consumes scalar lanes ((a)[0]/(b)[0], pack size 1, wave64), while gfx1250
-// uses native wave32 WMMA and other wave32 targets use the FMA fallback.
-// The host compile pass defines neither __GFX9__ nor __gfx1250__ but
-// get_warp_size() returns 64 there, so it must take the MFMA (scalar) branch
-// to stay type-consistent with mma_pack_size.
+// Branch must match mma_pack_size (= warp_size == 64 ? 1 : 2): the MFMA path consumes scalar lanes ((a)[0]/(b)[0],
+// pack size 1, wave64), while gfx1250 uses native wave32 WMMA and other wave32 targets use the FMA fallback. The host
+// compile pass defines neither __GFX9__ nor __gfx1250__ but get_warp_size() returns 64 there, so it must take the
+// MFMA (scalar) branch to stay type-consistent with mma_pack_size.
 #if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
 #define MMA_F32_16X16X4(a, b, c) \
     __builtin_amdgcn_mfma_f32_16x16x4f32((a)[0], (b)[0], (c), 0, 0, 0)
@@ -166,9 +164,8 @@ namespace aiter {
         static constexpr int fn_vec_size = 1;
         static constexpr int fn_xor_shift = 0;
 #else
-        // Swizzle at 4-float granularity so LDS reads can use 128-bit contiguous loads.
-        // The row mask occupies bits [2:5], spreading 16 rows across 64 banks while
-        // preserving the low 2 bits of K for ds_read_b128.
+        // Swizzle at 4-float granularity so LDS reads can use 128-bit contiguous loads. The row mask occupies bits
+        // [2:5], spreading 16 rows across 64 banks while preserving the low 2 bits of K for ds_read_b128.
         static constexpr int fn_vec_size = 4;
         static constexpr int fn_xor_shift = 2;
 #endif
@@ -593,12 +590,9 @@ namespace aiter {
         auto buffer_gemm_out_sqrsum = opus::make_gmem<float>(gemm_out_sqrsum_ptr, (m * n_splits - m_idx) * sizeof(float));
         float* gemm_out_mul_ptr = gemm_out_mul + m_idx * gemm_out_mul_stride;
         auto buffer_gemm_out_mul = opus::make_gmem<float>(gemm_out_mul_ptr, (n_splits * m - m_idx) * gemm_out_mul_stride * sizeof(float));
-        // Issue the sqrsum load(s) WITHOUT consuming them yet, so the gemm_out_mul
-        // loads below can be issued back-to-back and both HBM read streams are in
-        // flight together. Consuming here (rms_acc += v) would force an s_waitcnt
-        // before the gemm loads, serializing the two exposed latencies. Each thread
-        // loads at most one split in the common case (n_splits <= block_size); a tail
-        // accumulator covers the rare n_splits > block_size case.
+        // Issue sqrsum load(s) without consuming yet, so the gemm_out_mul loads below overlap in flight; consuming
+        // here (rms_acc += v) would force an s_waitcnt that serializes the two latencies. Common case: one
+        // split/thread (n_splits <= block_size); a tail accumulator covers the rare n_splits > block_size case.
         float rms_acc[num_rows] = {0.0f};
         rms_load_t v_sq;
         #pragma unroll
@@ -1411,12 +1405,9 @@ namespace aiter {
         auto buffer_gemm_out_sqrsum = opus::make_gmem<float>(gemm_out_sqrsum_ptr, (m * n_splits - m_idx) * sizeof(float));
         float* gemm_out_mul_ptr = gemm_out_mul + m_idx * gemm_out_mul_stride;
         auto buffer_gemm_out_mul = opus::make_gmem<float>(gemm_out_mul_ptr, (n_splits * m - m_idx) * gemm_out_mul_stride * sizeof(float));
-        // Issue the sqrsum load(s) WITHOUT consuming them yet, so the gemm_out_mul
-        // loads below can be issued back-to-back and both HBM read streams are in
-        // flight together. Consuming here (rms_acc += v) would force an s_waitcnt
-        // before the gemm loads, serializing the two exposed latencies. Each thread
-        // loads at most one split in the common case (n_splits <= block_size); a tail
-        // accumulator covers the rare n_splits > block_size case.
+        // Issue sqrsum load(s) without consuming yet, so the gemm_out_mul loads below overlap in flight; consuming
+        // here (rms_acc += v) would force an s_waitcnt that serializes the two latencies. Common case: one
+        // split/thread (n_splits <= block_size); a tail accumulator covers the rare n_splits > block_size case.
         float rms_acc[num_rows] = {0.0f};
         rms_load_t v_sq;
         #pragma unroll
@@ -1425,9 +1416,8 @@ namespace aiter {
         if(has_sq0) {
             v_sq = load<num_rows>(buffer_gemm_out_sqrsum, threadIdx.x * m);
         }
-        // tail: only iterates when n_splits > block_size (not the case for tuned
-        // configs here); these loads ARE consumed inline since they are off the
-        // critical path.
+        // tail: only iterates when n_splits > block_size (not the case for tuned configs here); these loads ARE
+        // consumed inline since they are off the critical path.
         for(int split_idx = threadIdx.x + block_size; split_idx < n_splits; split_idx += block_size) {
             rms_load_t vt = load<num_rows>(buffer_gemm_out_sqrsum, split_idx * m);
             #pragma unroll
@@ -1505,9 +1495,8 @@ namespace aiter {
         if (threadIdx.x < num_rows * hc_mult3) {
             int row_idx = threadIdx.x / hc_mult3;
             int hc_idx = threadIdx.x % hc_mult3;
-            // Summing reduce_splits_per_round (~53) LDS values. Use several
-            // independent accumulators so the dependent fp-add chain is ~N/ACC deep
-            // instead of N, exposing ILP (the LDS loads are independent addresses).
+            // Sum reduce_splits_per_round LDS values with several independent
+            // accumulators so the dependent fp-add chain is ~N/ACC deep, exposing ILP.
             constexpr int RED_ACC = 4;
             float v_acc[RED_ACC] = {0.0f, 0.0f, 0.0f, 0.0f};
             const int red_base = row_idx * hc_mult3 + hc_idx;
@@ -2102,13 +2091,9 @@ namespace aiter {
             }
         };
 
-        // On gfx1250 the OOB guard replaces some async_load instructions with
-        // plain LDS zeroing (no async issued), so the number of in-flight async
-        // loads per stage is data-dependent (depends on m_oob), not the compile
-        // -time waitcnt constants. A partial asynccnt wait would then drain the
-        // wrong number of loads and read in-flight / stale LDS, producing
-        // non-deterministic NaNs. Drain all async loads (asynccnt 0) so the wait
-        // is correct regardless of how many were actually issued.
+        // On gfx1250 the OOB guard replaces some async_loads with plain LDS zeroing, so the in-flight async count per
+        // stage is data-dependent (m_oob), not the compile-time waitcnt constants. A partial wait would drain the
+        // wrong count and read stale/in-flight LDS -> nondeterministic NaNs. Drain all (asynccnt 0).
         static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : x_load_waitcnt + residual_load_waitcnt;
         static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : residual_load_waitcnt;
         auto wait_load_cnt = [&]() {
@@ -2170,14 +2155,10 @@ namespace aiter {
             compute_store_tile(i, v_fn0);
         }
 
-        // Reduce v_cf (gemm_out_mul) and sqrsum across the hc_mult warps in LDS so
-        // only warp 0 writes a single (split_k) partial, instead of each warp
-        // writing its own (split_k * hc_mult) partial. The hc_mult sum is part of
-        // the GEMM K-contraction (sum over hc_mult*hidden); summing the per-head
-        // warp results here completes it. For a fixed lane_id every warp holds a
-        // contribution to the SAME output element (same idx/n_idx tile + lane->
-        // row/col mapping), so the cross-warp sum is the head reduction.
-        // Reuse s_residual as scratch (dead after the k_loop); cast to float.
+        // Reduce v_cf (gemm_out_mul) and sqrsum across the hc_mult warps in LDS so only warp 0 writes one (split_k)
+        // partial. The hc_mult sum completes the GEMM K-contraction (sum over hc_mult*hidden); for a fixed lane_id
+        // every warp holds a contribution to the same output element. Reuse s_residual as scratch (dead now, cast to
+        // float).
         float* s_red = reinterpret_cast<float*>(s_residual);
         static constexpr int v_per_lane = m_repeat * repeat_n * ovec;
         __syncthreads();
@@ -2214,9 +2195,8 @@ namespace aiter {
             for (int b = 0; b < m_repeat; b++) {
                 sqrsum_w[b] = cross_row_sum_4(sqrsum_part[b], lane_id);
             }
-            // Deposit per-warp sqrsum (lane_id < mfma_m holds the reduced rows),
-            // then warp 0 sums across warps. Reuse s_red at a disjoint offset past
-            // the v_cf scratch region.
+            // Deposit per-warp sqrsum (lane_id < mfma_m holds the reduced rows), then warp 0 sums across warps. Reuse
+            // s_red at a disjoint offset past the v_cf scratch region.
             float* s_sq = s_red + (hc_mult - 1) * warp_size * v_per_lane;
             __syncthreads();
             if (warp_id != 0 && lane_id < mfma_m) {

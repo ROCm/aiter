@@ -6,74 +6,58 @@
 #include "op_softmax.hpp"
 #include "op_epilog.hpp"
 
-// ================================================================
 // pipeline.hpp — the per-block forward pass (heart of the kernel)
-// ================================================================
 //
-// ROLE IN THE PIPELINE
-//   fmha_fwd_d64_device<HasMask,IsVarlen,IsSplit> IS the whole FMHA forward pass
-//   for one M-tile (kM0=128 query rows of one batch/head). The split __global__
-//   entries (fmha_fwd_d64_bf16_msk{0,1}_split) are thin shells that decode
-//   blockIdx and call this. Everything below orchestrates the helpers in
-//   op_lds.hpp / op_gemm.hpp / op_softmax.hpp / op_epilog.hpp into a
-//   software-pipelined loop over the KV tiles.
+// fmha_fwd_d64_device<HasMask,IsVarlen,IsSplit> IS the whole FMHA forward pass for
+// one M-tile (kM0=128 query rows of one batch/head). The split __global__ entries
+// decode blockIdx and call this. It orchestrates op_lds/op_gemm/op_softmax/op_epilog
+// into a software-pipelined loop over KV tiles.
 //
 // END-TO-END FLOW (one block):
-//   1. SETUP   — decode lane/warp geometry; resolve Q/K/V/O base pointers and
-//                seqlens for dense vs varlen; build buffer SRDs; derive the causal
-//                loop bound (seqlen_k_end).
-//   2. Q LOAD  — each thread loads its slice of the 128xkHeadDim Q tile into
-//                registers ONCE (q_regs[4]); Q is reused for every KV tile.
-//   3. PROLOGUE— issue the first K sub-tile async copy into LDS so GEMM0 of the
-//                first iteration has data to read.
+//   1. SETUP   — decode geometry; resolve Q/K/V/O bases + seqlens (dense/varlen);
+//                build buffer SRDs; derive causal loop bound (seqlen_k_end).
+//   2. Q LOAD  — each thread loads its slice of the 128xkHeadDim Q tile ONCE
+//                (q_regs[4]); Q is reused for every KV tile.
+//   3. PROLOGUE— issue the first K sub-tile async copy so GEMM0 has data.
 //   4. TILE LOOP over KV tiles (kN0=64 keys each):
-//        GEMM0   S_acc = Q . K^T          (op_gemm: reads K from LDS, Q from reg)
-//        SOFTMAX mask -> row_max -> exp2 -> row_sum  (online; op_softmax)
-//        V STAGE DRAM -> regs -> v_perm shuffle -> LDS   (op_lds)
+//        GEMM0   S_acc = Q . K^T          (reads K from LDS, Q from reg)
+//        SOFTMAX mask -> row_max -> exp2 -> row_sum  (online)
+//        V STAGE DRAM -> regs -> v_perm shuffle -> LDS
 //        ONLINE  rescale carried O_acc by exp2(scale*(old_max-new_max)) when the
-//                running max grew this tile; correct the running sum likewise
-//        GEMM1   O_acc += P . V           (op_gemm: reads V from LDS, P from reg)
-//      All while prefetching the NEXT tile's K copy and the second V half so HBM
-//      latency overlaps compute.
-//   5. EPILOGUE— normalize O_acc by the final row sum, bf16-truncate, store O to
-//                DRAM, optionally write LSE (op_epilog).
+//                running max grew; correct the running sum likewise
+//        GEMM1   O_acc += P . V           (reads V from LDS, P from reg)
+//      while prefetching the next tile's K copy and the second V half to overlap HBM.
+//   5. EPILOGUE— normalize O_acc by the final sum, bf16-truncate, store O, opt LSE.
 //
-// ONLINE SOFTMAX (Milakov), carried across tiles in three scalars per row:
-//     rmax — running max of scaled scores seen so far
-//     rsum — running denominator (sum of exp2 probabilities)
-//     o_acc_d0/d1 — running numerator (sum of P.V), in TransposedC layout
-//   When a tile raises the max from rmax to m_new, every earlier contribution is
-//   too large by exp2(scale*(rmax-m_new)); we rescale o_acc and rsum by that
-//   factor BEFORE adding this tile, so the result equals a single global softmax.
+// ONLINE SOFTMAX (Milakov), carried across tiles in three per-row scalars:
+//     rmax — running max of scaled scores
+//     rsum — running denominator (sum of exp2 probs)
+//     o_acc_d0/d1 — running numerator (sum of P.V), TransposedC layout
+//   When a tile raises the max rmax->m_new, earlier contributions are too large by
+//   exp2(scale*(rmax-m_new)); rescale o_acc and rsum by it BEFORE adding this tile,
+//   so the result equals a single global softmax.
 //
 // LDS DOUBLE/TRIPLE BUFFERING via LdsSeq[] — see the constant's comment below.
 //
-// sched_barrier() CALLS: the __builtin_amdgcn_sched_barrier(mask) calls scattered
-//   through the loop mirror CK's barrier structure one-for-one. Their PURPOSE here
-//   is codegen/parity: pinning the compiler's instruction scheduling to match CK's
-//   so the generated ISA (and thus numerics/behavior) lines up — a CORRECTNESS /
-//   parity goal, not a perf lever. VERIFIED: barrier-for-barrier matching by
-//   itself moved performance ~0%. The mask argument restricts what the scheduler
-//   may move across the barrier (0 = full barrier / no reordering across it;
-//   0x1, 0x7, 0x7F = progressively allow only certain instruction classes, used
-//   to fence MFMA vs VALU regions exactly as CK does). Do not read them as a
-//   tuning knob.
+// sched_barrier() CALLS mirror CK's barrier structure one-for-one; their purpose is
+//   codegen/parity (pin the compiler's scheduling to CK's so the ISA/numerics line
+//   up), NOT perf — verified ~0% on their own. The mask restricts what may move
+//   across the barrier (0 = full barrier; 0x1/0x7/0x7F progressively allow certain
+//   instruction classes, fencing MFMA vs VALU as CK does). Not a tuning knob.
 //
-// THREAD GEOMETRY (shared with the op_*.hpp files):
+// THREAD GEOMETRY (shared with op_*.hpp):
 //   warp_id = threadIdx.x>>6 (0..3); lane_id = threadIdx.x&63 (0..63);
-//   k_sub = lane_id>>5 (0/1, the 32-lane half); m_row = (lane_id&31)+32*warp_id
-//   is this lane's query row within the M-tile (TransposedC: one M-row per lane).
+//   k_sub = lane_id>>5 (0/1, 32-lane half); m_row = (lane_id&31)+32*warp_id is this
+//   lane's query row within the M-tile (TransposedC: one M-row per lane).
 
-// Build an untyped byte buffer SRD over a DRAM tensor base. num_records is the
-// VALID byte extent of the region from `base`: the hardware bounds-check then
-// returns 0 for any access at or beyond it. This is load-bearing for the partial
-// tail tile (seqlen_k % kN0 != 0): the K/V tile loop walks a full kN0-wide tile
-// even when the last tile has fewer real keys, so the padding rows (row >=
-// seqlen_k) read PAST the tensor. Without a real bound those reads return whatever
-// is in adjacent memory (e.g. a freed NaN block), and the masked-but-still-summed
-// P(=0)*V term computes 0*NaN = NaN in GEMM1, poisoning O_acc. Bounding the SRD
-// makes those OOB reads return 0 instead. 0x00027000 is the CDNA data-format word
-// for a raw byte buffer used by the raw_buffer_load builtins.
+// Build an untyped byte buffer SRD over a DRAM tensor base. num_records is the VALID
+// byte extent; the HW bounds-check returns 0 for any access at or beyond it.
+// Load-bearing for the partial tail tile (seqlen_k % kN0 != 0): the loop walks a
+// full kN0-wide tile, so padding rows (row >= seqlen_k) read PAST the tensor.
+// Unbounded, those reads return adjacent memory (e.g. a freed NaN block) and the
+// masked-but-still-summed P(=0)*V term computes 0*NaN = NaN in GEMM1, poisoning
+// O_acc; bounding makes them return 0. 0x00027000 is the CDNA raw-byte-buffer
+// data-format word for the raw_buffer_load builtins.
 __device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer_resource(const void* base,
                                                                        unsigned num_records) {
     return __builtin_amdgcn_make_buffer_rsrc(
@@ -88,33 +72,29 @@ __device__ __forceinline__ unsigned clamp_num_records(int64_t bytes) {
     return (bytes < (int64_t)0xFFFFFFFFu) ? (unsigned)bytes : 0xFFFFFFFFu;
 }
 
-// LDS buffer rotation for the four staging slots used within one tile iteration.
-// The kernel runs a 3-buffer rotating LDS scheme (op_lds.hpp: buf_idx in {0,1,2}).
-// LdsSeq encodes which physical buffer each logical slot of a tile maps to:
-//   LdsSeq[0] = K sub-tile 0 (consumed by GEMM0 sub-tile 0, and where the NEXT
-//               tile's prefetched K lands)
-//   LdsSeq[1] = K sub-tile 1 (consumed by GEMM0 sub-tile 1)
-//   LdsSeq[2] = V half 0     (staged for GEMM1 sub-tile 0)
-//   LdsSeq[3] = V half 1     (staged for GEMM1 sub-tile 1)
-// The values {1,2,1,0} keep the K tile being read by GEMM0 in a different physical
-// buffer from the V tile being written for GEMM1, so producer and consumer never
-// alias the same buffer within an iteration (the reuse of buffer 1 for both K
-// halves is safe because GEMM0 finishes sub-tile 0 before sub-tile 1 is needed).
+// LDS buffer rotation for the four staging slots of one tile iteration (3-buffer
+// scheme, buf_idx in {0,1,2}). LdsSeq maps each logical slot to a physical buffer:
+//   LdsSeq[0] = K sub-tile 0 (consumed by GEMM0.0; also where the NEXT tile's
+//               prefetched K lands)
+//   LdsSeq[1] = K sub-tile 1 (consumed by GEMM0.1)
+//   LdsSeq[2] = V half 0     (staged for GEMM1.0)
+//   LdsSeq[3] = V half 1     (staged for GEMM1.1)
+// {1,2,1,0} keeps GEMM0's K and GEMM1's V in different buffers so producer and
+// consumer never alias within an iteration (reusing buffer 1 for both K halves is
+// safe: GEMM0 finishes sub-tile 0 before sub-tile 1 is needed).
 constexpr int LdsSeq[4] = {1, 2, 1, 0};
 
 // One block's full FMHA forward pass over its M-tile.
 //   HasMask  : compile-time. false = boundary mask only; true = causal+boundary.
 //   IsVarlen : compile-time. false = dense batch tensors; true = group/varlen.
-//   IsSplit  : compile-time. false (DEFAULT) = ordinary full forward pass: every
-//              split-specific branch below is `if constexpr`-discarded. true =
-//              split-K: walk only this split's disjoint KV sub-range and write a
-//              normalized fp32 partial (O_g, LSE_g) to the split-major scratch via
-//              epilog_store_split (see op_epilog.hpp).
+//   IsSplit  : compile-time. false (DEFAULT) = ordinary full forward (split branches
+//              if-constexpr-discarded). true = split-K: walk only this split's
+//              disjoint KV sub-range and write a normalized fp32 partial (O_g, LSE_g)
+//              to split-major scratch via epilog_store_split.
 //   params   : tensor pointers, strides, scale, optional LSE/seqstart arrays.
 //   lds      : this block's __shared__ scratch (kLdsBytes; the 3 rotating buffers).
-//   batch_idx/head_idx/m_tile_idx : the tile coordinates (from blockIdx; the
-//                                   causal M-tile reversal already applied in
-//                                   the entry .cu files for the masked entries).
+//   batch_idx/head_idx/m_tile_idx : tile coordinates (from blockIdx; causal M-tile
+//                                   reversal already applied in the entry .cu files).
 //   --- TRAILING split-only args (defaulted so a non-split call can omit them) ---
 //   scratch_o   : split-major fp32 partial-O scratch base (IsSplit only).
 //   scratch_lse : split-major fp32 LSE scratch base (IsSplit only).
@@ -136,8 +116,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     const int k_sub   = lane_id >> 5;                  // 32-lane half (0/1)
     const int m_row   = (lane_id & 31) + 32 * warp_id; // this lane's query row in tile
 
-    // GQA/MQA: several Q heads can share one K/V head. Map this Q head to its KV
-    // head (nhead_ratio==1 for full MHA).
+    // GQA/MQA: several Q heads can share one K/V head. Map this Q head to its KV head (nhead_ratio==1 for full MHA).
     const int nhead_ratio = params.nhead_q / params.nhead_k;
     const int kv_head_idx = head_idx / nhead_ratio;
 
@@ -188,12 +167,10 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
                            + static_cast<int64_t>(head_idx)  * params.nhead_stride_o;
     }
 
-    // Buffer SRDs the raw_buffer_load builtins read through (O's SRD is built
-    // separately inside the epilogue). Each SRD is bounded to the valid byte extent
-    // of this (b,h) tensor region so the partial-tail-tile padding rows (row >=
-    // seqlen_q / seqlen_k) read 0 rather than out-of-bounds garbage. Q rows are
-    // already guarded (OOB rows load zeros), but bounding it too costs nothing and
-    // keeps the three paths uniform. Extent = #rows * row_stride(elements) * 2 bytes.
+    // Buffer SRDs the raw_buffer_load builtins read through (O's SRD is built in the
+    // epilogue). Each is bounded to the valid byte extent of this (b,h) region so
+    // partial-tail-tile padding rows read 0, not OOB garbage. Extent = #rows *
+    // row_stride(elements) * 2 bytes.
     auto srd_q = make_buffer_resource(
         q_base, clamp_num_records((int64_t)seqlen_q * params.stride_q * 2));
     auto srd_k = make_buffer_resource(
@@ -210,15 +187,14 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     int mask_shift = seqlen_k - seqlen_q;
 
     if constexpr (HasMask) {
-        // Causal: skip every KV tile that lies entirely PAST this M-tile's
-        // diagonal (those keys are all masked, so they'd add nothing). Derivation:
+        // Causal: skip every KV tile entirely PAST this M-tile's diagonal (all
+        // masked). Derivation:
         //   last_q_row  = highest query row this M-tile owns (clamped to seqlen_q)
         //   raw_end     = last column that row may attend = last_q_row+mask_shift+1
-        //   seqlen_k_end= raw_end rounded UP to a whole kN0 tile (so the diagonal
-        //                 tile itself is still processed; softmax_mask handles the
-        //                 partial masking within it), clamped to seqlen_k.
-        // Combined with the heavy-first M-tile reversal in the entry .cu files, this is what
-        // makes causal cost ~linear in m_tile.
+        //   seqlen_k_end= raw_end rounded UP to a whole kN0 tile (diagonal tile still
+        //                 processed; softmax_mask handles its partial masking),
+        //                 clamped to seqlen_k.
+        // With heavy-first M-tile reversal (entry .cu), causal cost is ~linear in m_tile.
         int last_q_row = m_tile_idx * kM0 + kM0 - 1;
         if (last_q_row >= seqlen_q) last_q_row = seqlen_q - 1;
         int raw_end = last_q_row + mask_shift + 1;
@@ -232,19 +208,15 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     int num_total_loop = (seqlen_k_end - seqlen_k_start + kN0 - 1) / kN0;
 
     // ---- SPLIT-K KV-range narrowing (IsSplit=true ONLY) ----
-    // Discarded entirely when IsSplit=false. For a split, partition the FULL tile count
-    // computed above into G contiguous chunks and keep only THIS split's chunk:
+    // Partition the FULL tile count into G contiguous chunks, keep THIS split's:
     //   T (tiles per split) = ceil(num_total_loop_full / num_splits)
     //   this split owns tiles [split_idx*T, min((split_idx+1)*T, full))
-    // Translating tiles -> keys (×kN0) and adding to the existing seqlen_k_start
-    // narrows WITHIN the already-causal-clamped [seqlen_k_start, seqlen_k_end)
-    // range, so masked-future tiles a causal M-tile already excluded stay excluded
-    // (A4 causal-correctness). The kv_offset / kv_v_byte / kv_k_byte induction
-    // vars below initialize from seqlen_k_start, so narrowing it here makes them
-    // pick up the split's start key automatically (no separate fix-up needed).
-    // An empty split (start tile >= full) leaves num_total_loop <= 0, so the
-    // degenerate sentinel path below fires (and, for IsSplit, writes the fp32
-    // -inf/0 sentinel plane via epilog_store_split — see that path).
+    // Translating tiles -> keys (×kN0) narrows WITHIN the already-causal-clamped
+    // [seqlen_k_start, seqlen_k_end) range, so causally-excluded future tiles stay
+    // excluded (A4). The kv_offset / kv_v_byte / kv_k_byte IVs init from
+    // seqlen_k_start, so they pick up the split's start key automatically. An empty
+    // split (start >= full) leaves num_total_loop <= 0 -> the degenerate path below
+    // fires (writing the fp32 -inf/0 sentinel plane via epilog_store_split).
     if constexpr (IsSplit) {
         int num_total_loop_full = num_total_loop;
         int tiles_per_split = (num_total_loop_full + num_splits - 1) / num_splits;
@@ -267,15 +239,13 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     clear_acc(o_acc_d1);
 
     // ---- SPLIT-K scratch row-plane base pointers (IsSplit=true ONLY) ----
-    // Resolve, for THIS (split_idx, b, h), the base of the Sq×64 fp32 partial-O
-    // plane and the Sq fp32 LSE plane in the split-major scratch buffer:
+    // Resolve, for THIS (split_idx, b, h), the Sq×64 fp32 partial-O plane and Sq
+    // fp32 LSE plane in the split-major scratch:
     //   scratch_o_base  = scratch_o  + (((split_idx*B + b)*Hq + h)*Sq)*64
     //   scratch_lse_base= scratch_lse + (((split_idx*B + b)*Hq + h)*Sq)
-    // epilog_store_split then just adds the in-plane row/col (abs_m_row*64 + col /
-    // abs_m_row). Hq == params.nhead_q. B is not a kernarg field: the split grid's
-    // z-axis is batch*num_splits, so B = gridDim.z / num_splits (documented in
-    // FmhaFwdSplitParams). The whole block is if-constexpr-discarded when
-    // IsSplit=false.
+    // epilog_store_split adds the in-plane row/col. Hq == params.nhead_q; B is not a
+    // kernarg field (split grid z-axis is batch*num_splits, so B = gridDim.z /
+    // num_splits).
     float* scratch_o_base   = nullptr;
     float* scratch_lse_base = nullptr;
     if constexpr (IsSplit) {
@@ -288,13 +258,11 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         scratch_lse_base = scratch_lse + plane;
     }
 
-    // Degenerate tile (e.g. a causal M-tile whose every key is masked, or a varlen
-    // tail): no KV work. Emit a zeroed O row with LSE=-inf and return. The LSE base
-    // resolution mirrors the epilogue's (kept inline to avoid carrying it down).
-    // For a split this is ALSO the empty-split path (narrowed range empty); it must
-    // write the fp32 -inf/0 sentinel plane via epilog_store_split (A4: a mask1
-    // split entirely in the masked-future region still owns its scratch plane), NOT
-    // the bf16 epilog_store. The else-branch is the EXISTING code, unchanged.
+    // Degenerate tile (causal M-tile fully masked, or varlen tail): no KV work.
+    // Emit a zeroed O row with LSE=-inf and return. For a split this is ALSO the
+    // empty-split path and must write the fp32 -inf/0 sentinel plane via
+    // epilog_store_split (A4: a masked-future split still owns its scratch plane),
+    // NOT the bf16 epilog_store.
     if (num_total_loop <= 0) {
         if constexpr (IsSplit) {
             epilog_store_split(o_acc_d0, o_acc_d1, 0.0f, -INFINITY, params.scale,
@@ -322,11 +290,10 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     const int abs_m_row = m_tile_idx * kM0 + m_row;
     const int q_stride_bytes = params.stride_q * 2;
 
-    // Load this lane's full kHeadDim(=64) Q slice as 4x b128 (4 dwords = 8 bf16
-    // each). Per the TransposedC mapping, this lane owns headdim
-    // hd = kstep*16 + k_sub*8 + (0..7) in q_regs[kstep]; slice_q() (op_gemm.hpp)
-    // hands the right pair of these to each GEMM0 sub-tile. Out-of-range query rows
-    // (the last M-tile's padding) load zeros so masked rows contribute nothing.
+    // Load this lane's full kHeadDim(=64) Q slice as 4x b128 (4 dwords = 8 bf16).
+    // Per TransposedC this lane owns headdim hd = kstep*16 + k_sub*8 + (0..7) in
+    // q_regs[kstep]; slice_q() hands the right pair to each GEMM0 sub-tile.
+    // Out-of-range query rows (last M-tile padding) load zeros.
     v4i q_regs[4];
     if (abs_m_row < seqlen_q) {
         #pragma unroll
@@ -351,15 +318,13 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     int kv_offset = seqlen_k_start;
     int k_col_offset = 0;
 
-    // V byte-base induction variable: kv_offset pre-multiplied into the V row
-    // stride (bytes). load_v_from_dram consumes this directly so the per-tile
-    // address math is a constant add, not a multiply. kv_offset is wave-uniform
-    // (from blockIdx) so this stays in an SGPR — no VGPR-budget cost.
+    // V byte-base induction variable: kv_offset pre-multiplied into the V row stride
+    // (bytes) so per-tile address math is a constant add, not a multiply. Wave-uniform
+    // -> stays in an SGPR.
     const int v_stride_bytes = params.stride_v * 2;
     int kv_v_byte = kv_offset * v_stride_bytes;
 
-    // K byte-base induction variable: same transform as the V one above, for the
-    // async DRAM->LDS K copies. Also wave-uniform -> SGPR.
+    // K byte-base induction variable: same transform, for the async DRAM->LDS K copies. Also wave-uniform -> SGPR.
     const int k_stride_bytes = params.stride_k * 2;
     int kv_k_byte = kv_offset * k_stride_bytes;
 
@@ -424,16 +389,15 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
 
             // ---- V STAGING (slotted between row_max and exp so its LDS write +
             // the next half's DRAM load overlap the upcoming exp/sum/GEMM1) ----
-            // Drain the V regs loaded above, shuffle+store V half 0 into LDS
-            // (LdsSeq[2]) for GEMM1, then start loading V half 1 (rows +32).
+            // Drain the V regs, shuffle+store V half 0 into LDS (LdsSeq[2]) for GEMM1,
+            // then start loading V half 1 (rows +32).
             s_waitcnt_vmcnt_0();
             store_v_to_lds(v_k3_0, v_k3_1, lds, LdsSeq[2]);
             v2i v1_k3_0, v1_k3_1;
             load_v_from_dram(v1_k3_0, v1_k3_1, srd_v, params.stride_v, kv_v_byte + 32 * v_stride_bytes);
-            // v1 load left in flight: its only consumer is store_v_to_lds at the
-            // end of GEMM1 (already guarded by s_waitcnt_vmcnt_0 there). Draining
-            // here would expose the V-load HBM latency instead of overlapping it
-            // with the exp2 / row_sum / rescale / GEMM1 compute that follows.
+            // v1 load left in flight: consumed by store_v_to_lds at the end of GEMM1
+            // (guarded there). Draining now would expose HBM latency instead of
+            // overlapping it with the exp2 / row_sum / rescale / GEMM1 that follows.
 
             __builtin_amdgcn_sched_barrier(0); // CK barrier 6 — after V-staging, before O-rescale + GEMM1
 
@@ -455,14 +419,11 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
             rsum = rescale * rsum + l_new;
             rmax = m_new;
 
-            // P fp32->bf16 truncation is done inline by gemm1_subtile's
-            // v_perm_b32 (selector 0x07060302 extracts the high 16 bits of
-            // each fp32). A separate &=0xFFFF0000 pass would be redundant.
+            // (P fp32->bf16 truncation is done inline by gemm1_subtile's v_perm_b32.)
 
             // ---- GEMM1 sub-tile 0: O_acc += P_n0 . V_half0 ----
             // block_sync_lds() makes V half 0 (just stored) visible to all waves.
-            // P is packed to bf16 inline inside gemm1_subtile. After the MFMA,
-            // shuffle+store V half 1 into LDS (LdsSeq[3]) for sub-tile 1.
+            // After the MFMA, shuffle+store V half 1 into LDS (LdsSeq[3]) for sub-tile 1.
             {
                 block_sync_lds();
                 gemm1_subtile(o_acc_d0, o_acc_d1, s_acc_n0, lds, LdsSeq[2]);
@@ -503,10 +464,9 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
         epilog_store_split(o_acc_d0, o_acc_d1, rsum, rmax, params.scale,
                            seqlen_q, m_tile_idx, scratch_o_base, scratch_lse_base);
     } else {
-        // Resolve the LSE output base for this (batch/varlen, head). For varlen the
-        // LSE tensor is packed like Q (nhead_stride derived from Q's element strides
-        // + the sequence offset); for dense it is [batch][head][seqlen_q]. nullptr
-        // if the caller did not request LSE.
+        // Resolve the LSE output base for this (batch/varlen, head). Varlen: packed
+        // like Q (nhead_stride from Q's element strides + seq offset); dense:
+        // [batch][head][seqlen_q]. nullptr if LSE not requested.
         float* lse_base = nullptr;
         if (params.lse) {
             if constexpr (IsVarlen) {

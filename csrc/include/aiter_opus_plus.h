@@ -25,9 +25,8 @@ OPUS_D fp32x2_t pk_mul_f32(fp32x2_t a, fp32x2_t b)
 #if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
     defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
     defined(__gfx950__)
-    // CDNA-family archs have `v_pk_mul_f32`; keep the asm form so the
-    // packed instruction is guaranteed (compiler auto-vectorization is
-    // best-effort).
+    // CDNA-family archs have `v_pk_mul_f32`; keep the asm form so the packed instruction is guaranteed
+    // (compiler auto-vectorization is best-effort).
     fp32x2_t c;
     asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
     return c;
@@ -802,9 +801,8 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                 store<store_chunk_size_elements>(
                     buffer, chunk_store, row_offset, chunk_offset_elements, opus::number<aux>{});
             }
-            // Workaround: compiler may not insert s_nop after the last buffer_store, causing a
-            // WAR hazard where vdata VGPRs are overwritten before buffer_store finishes reading
-            // them.
+            // Workaround: compiler may not insert s_nop after the last buffer_store, causing a WAR hazard where
+            // vdata VGPRs are overwritten before buffer_store finishes reading them.
             asm volatile("s_nop 0");
         }
         else
@@ -858,12 +856,11 @@ __device__ void store_vector(opus::gmem<T>& buffer,
     }
 }
 
-// Wait until both the regular load queue and the async-load queue have at most
-// the given number of outstanding entries. A negative count means "don't wait"
-// on that queue: on split-counter archs the corresponding instruction is not
-// emitted, and on the combined-vmcnt arch it is treated as 0 in the sum.
-// gfx9 only has the combined vmcnt, which covers both, so wait on the sum.
-// Other archs (e.g. gfx1250) have split counters, so wait on loadcnt and asynccnt independently.
+// Wait until the load and async-load queues each have at most the given number
+// of outstanding entries. Negative count = don't wait on that queue (instruction
+// omitted on split-counter archs; treated as 0 in the sum on combined-vmcnt).
+// gfx9 has one combined vmcnt (wait on the sum); split-counter archs (e.g. gfx1250)
+// wait on loadcnt and asynccnt independently.
 template <index_t load_cnt, index_t async_load_cnt>
 OPUS_D void s_wait_all_loadcnt(number<load_cnt> = {}, number<async_load_cnt> = {})
 {

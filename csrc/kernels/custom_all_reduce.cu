@@ -419,10 +419,8 @@ void all_reduce(fptr_t _fa,
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
 
-    // reg_inp_ptr == 0 means the input tensor itself is IPC-registered
-    // (graph mode), so the write-mode kernel can directly write to peer
-    // GPUs via IPC-registered output buffers.  In eager mode (reg_inp_ptr
-    // != 0) the output is not IPC-registered, kernel uses temp-buffer path.
+    // reg_inp_ptr == 0 (graph mode): input is IPC-registered, write-mode kernel writes directly to
+    // peers' IPC output buffers. reg_inp_ptr != 0 (eager): output not registered, kernel uses temp-buffer path.
     bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
 
     if(reg_inp_ptr != 0)
@@ -665,10 +663,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
         inp_ptr = (void*)reg_ptr;
     }
 
-    // bf16_out_ptr is an opaque data pointer (0 = not requested). When non-zero
-    // the fused kernel writes the pre-quantization bf16/fp16 normed output so
-    // GDN-style callers can keep an unquantized view without launching a
-    // separate per-group quant kernel.
+    // bf16_out_ptr: opaque ptr (0 = not requested). Non-zero -> fused kernel also writes the pre-quant bf16/fp16
+    // normed output, so GDN-style callers get an unquantized view without a separate per-group quant kernel.
     void* bf16_out = reinterpret_cast<void*>(bf16_out_ptr);
 
     switch(dtype)

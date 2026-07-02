@@ -812,9 +812,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out(
     }
 }
 
-// MXFP8 route_out store: fp8 e4m3 + per-8col e8m0 (1-byte) scale. Per-thread
-// scale (each thread owns 8 cols) -> NO cross-lane reduction. Row layout:
-// [model_dim fp8 | model_dim/8 e8m0 scale bytes]. 0.56x of bf16 -> store ~ -44%.
+// MXFP8 route_out store: fp8 e4m3 + per-8col e8m0 (1-byte) scale. Per-thread scale (each thread owns 8 cols) -> NO
+// cross-lane reduction. Row layout: [model_dim fp8 | model_dim/8 e8m0 scale bytes]. 0.56x of bf16 -> store ~ -44%.
 template<typename T, bool FullRouteTile>
 inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
     const uint32_t* __restrict__ smem_c_pair,
@@ -855,9 +854,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8(
             E = 0;
         else if(E < 1)
             E = 1;
-        // gfx950 HW scaled-cvt: fp8 = bf16 / s, s = 2^(E-127) = bitcast(E<<23). Power-of-2
-        // scaling is exact, so this is bit-identical to (bf16->f32)*2^(127-E)->fp8 but skips
-        // 8x(bf16->f32) + 8x(*inv) per row -> fewer VALU.
+        // gfx950 HW scaled-cvt: fp8 = bf16 / s, s = 2^(E-127) = bitcast(E<<23). Power-of-2 scaling is exact, so this is
+        // bit-identical to (bf16->f32)*2^(127-E)->fp8 but skips 8x(bf16->f32) + 8x(*inv) per row -> fewer VALU.
         const float scale = (amax_bits == 0)
                                 ? 1.0f
                                 : __builtin_bit_cast(float, static_cast<uint32_t>(E) << 23);

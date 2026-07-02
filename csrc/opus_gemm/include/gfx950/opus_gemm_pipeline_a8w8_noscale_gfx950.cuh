@@ -8,10 +8,7 @@
 
 #include "opus_gemm_traits_a8w8_noscale_gfx950.cuh"
 
-// ============================================================================
-// Layout functions for noscale kernels (T_M=2, T_N=4 wave mapping)
-// Guarded: these are __device__ functions only needed on the device pass.
-// ============================================================================
+// Layout functions for noscale kernels (T_M=2, T_N=4 wave mapping). __device__-only: guarded to the device pass.
 
 #ifdef __HIP_DEVICE_COMPILE__
 
@@ -156,10 +153,8 @@ inline __device__ auto make_layout_rb_noscale(int lane_id, int wave_id_n) {
 
 #endif // __HIP_DEVICE_COMPILE__
 
-// ============================================================================
-// FP8 noscale GEMM kernel (a8w8 without scale)
+// FP8 noscale GEMM kernel (a8w8 without scale).
 // Kernel definition visible on both passes (host pass needs it for stub generation).
-// ============================================================================
 
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kernel(opus_gemm_noscale_kargs_gfx950 kargs) {
@@ -465,9 +460,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
     store_c(v_c[1][0], 1, 0);
     store_c(v_c[1][1], 1, 1);
 #else
-    // Non-gfx950 device pass: empty stub. a8w8 is gfx950-only; the host
-    // launcher symbol must still exist for the unconditional dispatcher
-    // reference, but the body uses gfx950-only intrinsics.
+    // Non-gfx950 device pass: empty stub. a8w8 is gfx950-only; the host launcher symbol must still exist for the
+    // unconditional dispatcher reference, but the body uses gfx950-only intrinsics.
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }

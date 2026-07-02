@@ -125,9 +125,8 @@ int select_a8w4_kernel_id(int requested_kernel_id,
     int selected_kernel_id = requested_kernel_id;
     if(selected_kernel_id == opus_moe::kStage2KidAuto)
     {
-        // Auto selects a direct-atomic kernel by sort block_m. Route-out kernels
-        // must be requested explicitly because they require a different output
-        // layout and follow-up reduce.
+        // Auto selects a direct-atomic kernel by sort block_m. Route-out kernels must be requested explicitly
+        // because they require a different output layout and follow-up reduce.
         selected_kernel_id = opus_moe::stage2_a8w4_auto_direct_atomic_kid(
             logical_inter_dim, inter_dim_pad, block_m);
     }

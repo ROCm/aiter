@@ -10,9 +10,8 @@
 
 namespace aiter {
 
-// MxScaleRoundMode lives in mx_quant_utils.h so future mx kernels
-// (quant_mxfp6.cu / quant_mxfp8.cu / quant_mxint8.cu) can reuse the same
-// enum without redefining it.
+// MxScaleRoundMode lives in mx_quant_utils.h so future mx kernels (quant_mxfp6.cu / quant_mxfp8.cu /
+// quant_mxint8.cu) can reuse the same enum without redefining it.
 
 #define EVEN_ROUND_FP32_SIGN_EXP_MASK 0x7F800000u
 #define EVEN_ROUND_VAL_TO_ADD         0x00200000u
@@ -38,10 +37,9 @@ __device__ __forceinline__ uint32_t cvt_fp4_pk(uint32_t src, uint32_t pair, floa
 __device__ __forceinline__ uint8_t even_round_e2m1(float val) {
     float a = fabsf(val);
     uint8_t mag;
-    // Round-to-nearest-even: at an exact midpoint, round to the value whose
-    // E2M1 mantissa bit is 0. Midpoints where the larger neighbor is odd
-    // (5.0, 2.5, 1.25, 0.25) use strict '>' so the tie rounds down to even;
-    // midpoints where the larger neighbor is even (3.5, 1.75, 0.75) use '>='.
+    // Round-to-nearest-even: at an exact midpoint, round to the value whose E2M1 mantissa bit is 0. Midpoints where
+    // the larger neighbor is odd (5.0, 2.5, 1.25, 0.25) use strict '>' so the tie rounds down to even; midpoints
+    // where the larger neighbor is even (3.5, 1.75, 0.75) use '>='.
     if      (a >  5.0f)  mag = 7;
     else if (a >= 3.5f)  mag = 6;
     else if (a >  2.5f)  mag = 5;
@@ -142,9 +140,8 @@ void quant_mxfp4_kernel(
         dequant_scale        = exp2f(scale_unbiased);
         biased_exp           = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     } else if constexpr (rmode == MxScaleRoundMode::Ceil) {
-        // torchao CEIL: ceil_pow2(amax) / 4. Same as RoundDown but bumps the
-        // exponent by 1 whenever any mantissa bit is set, so scale is the
-        // smallest power-of-two >= amax/4 (vs. RoundDown's largest pow2 <= amax/4).
+        // torchao CEIL: ceil_pow2(amax) / 4. Same as RoundDown but bumps the exponent by 1 whenever any mantissa
+        // bit is set, so scale is the smallest power-of-two >= amax/4 (vs. RoundDown's largest pow2 <= amax/4).
         dequant_scale = aiter::fp_f32_to_e8m0_scale<aiter::MxScaleRoundMode::Ceil, aiter::MxDtype::FP4_E2M1>(group_max);
         biased_exp    = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     }

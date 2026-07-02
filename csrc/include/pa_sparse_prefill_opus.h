@@ -38,8 +38,7 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
 
 // Public API: split-precision prefill attention for DeepSeek-V4 DSA on gfx950.
 //
-// Q/KV are split into a NoPE part (fp8 MXFP8 with embedded E8M0 block scales) and
-// a RoPE part (bf16).
+// Q/KV are split into a NoPE part (fp8 MXFP8 with embedded E8M0 block scales) and a RoPE part (bf16).
 //
 // Tensor expectations (row-major, last dim contiguous):
 //   q_nope             : [N, H, 512] fp8  (448 NoPE fp8 + 14 E8M0 scale bytes + pad)
@@ -70,9 +69,7 @@ void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
                                     float softmax_scale);
 
 #ifdef PA_SPARSE_PREFILL_OPUS_IMPL
-// ============================================================================
 // Implementation section - only compiled in the .cu translation unit
-// ============================================================================
 
 using bf16_t = __bf16;
 using fp16_t = __fp16;
@@ -310,8 +307,7 @@ struct pa_16mx1_16nx4_fp8_traits
     static constexpr int T_N = NUM_WARPS; // waves along N
     static constexpr int T_K = 1;         // waves along K
 
-    // MFMA base tile: NoPE uses fp8 16x16x128 (scaled f8f6f4 on gfx950);
-    // RoPE (bf16 QK^T) and PV (bf16) use 16x16x32.
+    // MFMA base tile: NoPE uses fp8 16x16x128 (scaled f8f6f4 on gfx950); RoPE (bf16 QK^T) and PV (bf16) use 16x16x32.
     static constexpr int W_M      = 16;
     static constexpr int W_N      = 16;
     static constexpr int W_K_NOPE = 128;
@@ -375,18 +371,14 @@ __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs)
 {
 }
 #else
-// =============================================================================
 // Device-side kernel implementation (gfx950 OPUS, D=512).
 // `pa_sparse_prefill_kargs` / `pa_prefill_*_traits<...>` are provided by the host plumbing above.
-// =============================================================================
 #include <opus/opus.hpp>
 #include <bit>
 
 using opus::operator""_I;
 
-// =============================================================================
 // Variant 16mx8_32nx1 (T_M=NUM_WARPS, T_N=1) — used when H > 32.
-// =============================================================================
 namespace pa_16mx8_32nx1 {
 
 constexpr int MFMA_MASK    = 0x08;
@@ -1499,9 +1491,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
 
-// =============================================================================
 // Variant 16mx1_16nx4 (T_M=1, T_N=NUM_WARPS) — used when H <= 32.
-// =============================================================================
 namespace pa_16mx1_16nx4 {
 
 // Create layout for loading Q matrix from global memory
@@ -1963,9 +1953,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
 
-// =============================================================================
 // Variant 16mx1_16nx4 fp8 (T_M=1, T_N=NUM_WARPS) — split NoPE fp8 / RoPE bf16.
-// =============================================================================
 namespace pa_16mx1_16nx4_fp8 {
 
 template<class T>

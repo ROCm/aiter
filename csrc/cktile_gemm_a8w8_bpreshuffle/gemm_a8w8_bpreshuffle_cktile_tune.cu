@@ -10,8 +10,7 @@
 using RowwiseKernel = std::function<torch::Tensor(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
 
-// For certain high priority shapes, we directly use the best kernel rather
-// than use heuristics.
+// For certain high priority shapes, we directly use the best kernel rather than use heuristics.
 using RowwiseKernelMap = std::unordered_map<int, RowwiseKernel>;
 
 // Helper function to return the next largest power of 2

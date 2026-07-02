@@ -785,7 +785,6 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
 #if (HIPBLASLT_VERSION_MAJOR >= 1)
         if(use_rowwise)
         {
-            // Set the scale mode to OUTER_VEC for rowwise scaling on A
             auto scale_mode_a = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
             CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
                 matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode_a, sizeof(scale_mode_a)));
@@ -799,7 +798,6 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
 #if (HIPBLASLT_VERSION_MAJOR >= 1)
         if(use_rowwise)
         {
-            // Set the scale mode to OUTER_VEC for rowwise scaling on B
             auto scale_mode_b = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
             CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
                 matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode_b, sizeof(scale_mode_b)));
@@ -1159,10 +1157,8 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
         // Note: hipBLASLt only supports uniform scaling modes (both per-tensor OR both rowwise)
         if(scaling_type == ScalingType::RowWise)
         {
-            // Both matrices use rowwise scaling
-            // Rowwise scaling is only supported for FP8 input with BFloat16 output
-            // For bpreshuffle (swizzled layout), proper alignment is required
-            // Note: m can be any value >= 1, but n should be >= 16 and aligned
+            // Rowwise scaling: FP8 input -> BFloat16 output; needs n>=16, n%16==0, k%16==0
+            // (m may be any value >= 1; bpreshuffle swizzled layout requires alignment)
             TORCH_CHECK(outDtype == at::kBFloat16,
                         "hipblaslt rowwise scaled_mm only supports BFloat16 output but got ",
                         outDtype);

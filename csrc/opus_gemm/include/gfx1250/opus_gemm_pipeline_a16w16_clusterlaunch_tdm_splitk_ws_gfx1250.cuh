@@ -83,13 +83,10 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
     //   FREE_A[s] = 1 +   P  + s   (ids 1+P..2P)   memcnt = 1 + kNumConsumerWaves (prodA + 2 cons)
     //   FREE_B[s] = 1 + 2*P  + s   (ids 1+2P..3P)  memcnt = 1 + kNumConsumerWaves (prodB + 2 cons)
     // PER-PRODUCER FREE barriers: each producer (w0=A, w1=B) reuse-waits on its OWN
-    // FREE barrier. The consumer signals BOTH FREE_A[s] and FREE_B[s] when it frees a
-    // slot. memcnt = 3 means a FREE_X[s] generation can only complete with that
-    // producer's own signal (2 consumer signals < 3), so the producer is always a
-    // joined member at completion -> it can never miss the completion broadcast.
-    // (A single shared FREE[s] with memcnt=4 let the consumer's extra prologue-slot
-    // free substitute for one producer, releasing only the producer that happened to
-    // be joined and hanging the other -> the split-K / desynced-producer deadlock.)
+    // FREE barrier; the consumer signals BOTH when it frees a slot. memcnt=3 means
+    // a FREE_X[s] generation can't complete without that producer's own signal (2
+    // consumer signals < 3), so the producer never misses the completion broadcast.
+    // (A single shared FREE[s] with memcnt=4 hung the other producer -> deadlock.)
     //   binit = init a barrier to a given memcnt
     //   bjs   = signal only             (run-ahead / no-wait side)
     //   bjsw  = join + signal + wait    (waiting side; join sets namedBarID, its own
@@ -192,33 +189,23 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
             binit(opus::number<1 + 2 * T::kNumSlots + s>{}, kFreeMemCnt); // FREE_B[s]
         });
     }
-    // Publish the named-barrier init (done by one consumer wave above) to every wave
-    // before first use. This workgroup barrier is ALWAYS needed, independent of the
-    // cluster barrier below.
+    // Publish the named-barrier init (done by one consumer wave above) to every wave before first use.
+    // This workgroup barrier is ALWAYS needed, independent of the cluster barrier below.
     __builtin_amdgcn_s_barrier();
 
     // Cluster sync (-3): align all CWGM*CWGN WGs before the first multicast TDM. It
-    // counts ONE arrival PER WORKGROUP, so only wave0 (the WG representative) may
-    // signal/wait it; the trailing workgroup barrier then makes the other 3 waves
-    // (incl. the B producer w1) wait for wave0's cluster sync, so no wave issues a
-    // multicast TDM before every peer WG of the cluster is aligned.
+    // counts ONE arrival PER WORKGROUP, so only wave0 signals/waits; the -3 wait is
+    // taken by ALL waves (every wave already waits on -3, so no separate trailing
+    // workgroup barrier is needed) -> no wave issues a multicast TDM before every
+    // peer WG is aligned.
     //
-    // ONLY emit it for a 2D cluster (kClusterWgM>1 && kClusterWgN>1). That is exactly
-    // when an operand's multicast mask is a multi-WG STRIDED group (mask_a step=CWGM>1
-    // over CWGN>=2 peers) that the TDM multicast HW needs aligned. For a DEGENERATE
-    // cluster (CWGM==1 or CWGN==1) the only multicast group is CONTIGUOUS, so the
-    // barrier is unnecessary -- AND a 1-wide (1D) cluster combined with split_k>=2
-    // (grid.z>=2) DEADLOCKS cluster co-residency: the thin 1D cluster's WGs can't be
-    // guaranteed co-resident across z layers, so s_barrier_wait(-3) hangs forever
-    // (verified on gfx1250: 1x4 and 4x1 hang at split_k>=2 with the barrier; 2x2 /
-    // 2x4 / 4x4 do not, and all pass split_k=1/2/4 with this rule).
-    // Combined: degenerate-skip guard + all-waves-wait sync. Emit -3 ONLY for a 2D
-    // cluster (CWGM>1 && CWGN>1) where the strided-A multicast needs cluster-wide
-    // alignment. A degenerate (1D) cluster (CWGM==1 || CWGN==1) has only a contiguous
-    // multicast group (or none) and would DEADLOCK the -3 cluster co-residency at
-    // split_k>=2 (thin 1D cluster can't be co-resident across grid.z layers), so it is
-    // skipped. The -3 sync itself uses wave0-signal + ALL-waves-wait (no separate
-    // trailing workgroup barrier needed: every wave already waits on -3).
+    // Emit -3 ONLY for a 2D cluster (CWGM>1 && CWGN>1), where an operand's multicast
+    // mask is a multi-WG STRIDED group the TDM HW needs aligned. A degenerate (1D)
+    // cluster (CWGM==1 || CWGN==1) has only a contiguous multicast group (or none),
+    // so it is unnecessary -- AND would DEADLOCK: a thin 1D cluster can't be
+    // guaranteed co-resident across grid.z (split_k>=2) layers, so s_barrier_wait(-3)
+    // hangs forever (verified on gfx1250: 1x4/4x1 hang at split_k>=2; 2x2/2x4/4x4 do
+    // not, all pass split_k=1/2/4 with this rule).
     if constexpr (T::kClusterWgM > 1 && T::kClusterWgN > 1) {
         if (wave_id == 0) {
             __builtin_amdgcn_s_barrier_signal(-3);

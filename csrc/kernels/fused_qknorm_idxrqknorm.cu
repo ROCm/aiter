@@ -43,10 +43,9 @@ __device__ __forceinline__ float warpReduceMax(float val)
     return val;
 }
 
-// Per-token dynamic quant scale = amax / fp8_max so the largest |value| maps to the
-// fp8 max. The fp8 max is arch-dependent: OCP e4m3fn (448) on gfx950+, e4m3fnuz (240)
-// on gfx942. opus::finfo<cache_t>::max() resolves this at compile time per arch and
-// matches the opus::cast<fp8> hardware clamp range, so do NOT hardcode 448 here.
+// Per-token dynamic quant scale = amax / fp8_max. fp8_max is arch-dependent:
+// e4m3fn 448 (gfx950+) vs e4m3fnuz 240 (gfx942); opus::finfo<cache_t>::max()
+// resolves it at compile time to match the opus::cast<fp8> clamp -- don't hardcode 448.
 template <typename cache_t>
 __device__ __forceinline__ float fp8Max()
 {

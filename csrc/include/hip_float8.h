@@ -91,8 +91,7 @@ inline std::ostream &operator<<(std::ostream &os, const hip_fp8 &f8)
 }
 
 // all + operator overloading with mixed types
-// mixed types, always converts to f32, does computation in f32, and returns
-// float
+// mixed types, always converts to f32, does computation in f32, and returns float
 inline HIP_FP8_HOST_DEVICE float operator+(const float fa, hip_fp8 b)
 {
   return (fa + float(b));

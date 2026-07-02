@@ -95,10 +95,9 @@ using mrope_utils::vec_t;
 // activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
 static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
 
-// HW-native fp8 e4m3 element dtype, selected by the compile target (same idiom as
-// quant_kernels.cu): gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn
-// (max_pos=448). Used as the MX dtype tag for the e8m0 block-scale helpers. Keyed on the
-// arch macro rather than an ad-hoc finfo<>::max() threshold, matching opus::finfo<fp8_t>.
+// HW-native fp8 e4m3 element dtype (MX tag for the e8m0 block-scale helpers),
+// selected by arch macro like quant_kernels.cu: gfx942 = e4m3fnuz (max_pos=240),
+// gfx950+ = OCP e4m3fn (max_pos=448). Matches opus::finfo<fp8_t>.
 static constexpr aiter::MxDtype kHwFp8E4m3Dtype =
 #if defined(__gfx942__)
     aiter::MxDtype::FP8_E4M3_FNUZ;
@@ -215,8 +214,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
     int64_t const act_sd     = isQ ? q_sd : (isK ? k_sd : v_sd);
     scalar_t* const act_base = isQ ? q_act : (isK ? k_act : v_act);
 
-    // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
-    // kernel launch
+    // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before kernel launch
     if(act_sd == 1)
     {
         int64_t const base_elems = (int64_t)tokenIdx * act_st + (int64_t)headIdx * act_sh +
@@ -515,11 +513,8 @@ __global__ void fusedQKNormRopeBlockQuantCacheShuffleKernel(
     int64_t slot_idx;
     int64_t block_idx;
     int64_t block_offset;
-    // ============================================================================
-    // BOUNDARY HANDLING: Similar to cache_kernels.cu lines 504-521
-    // Handle case where GPU block extends beyond current batch's sequence length
-    // Ensure one wave group only processes one cache block (page)
-    // ============================================================================
+    // BOUNDARY HANDLING (similar to cache_kernels.cu lines 504-521): handle a GPU
+    // block extending past the batch's seq length; one wave group -> one page.
     if(first_token_idx >= batch_end_idx)
     {
         // This is the extra block for this batch (boundary handler)
@@ -1723,10 +1718,8 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
     int data_offset;
 
     vec_t<T, VEC_SIZE> w_vec, x_vec;
-    // cos_sin is fp32 per the diffusers reference (qwen-image-edit
-    // _apply_rope_complex passes complex freqs in fp32, so the underlying
-    // cos/sin pairs carry full fp32 precision). Loading as fp32 keeps the
-    // input precision unchanged through the rope multiply.
+    // cos_sin is fp32 per the diffusers reference (qwen-image-edit passes complex
+    // freqs in fp32); load as fp32 to keep precision through the rope multiply.
     vec_t<float, VEC_SIZE> cos_sin_vec;
     vec_t<float, PAIR_VEC_SIZE> cos_vec, sin_vec;
 
@@ -1768,17 +1761,12 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
         }
     }
 
-    // ===========================================================
-    // Inline RMSNorm (vs the shared mrope_utils::warp_rms_norm_)
-    // ===========================================================
-    // Cache the FP32 reads of x_vec[i] in v[] so the writeback loop doesn't
-    // re-read bf16 from x_vec (would be redundant v_lshlrev_b32 conversions),
-    // then pack the result via pack_f32_to_vec_t (10 instr per bf16x2 pair vs
-    // the compiler default ~26 instr — see f32x2_to_bf16x2_rne in
-    // rope_common.h). Bit-exact RNE equivalent to warp_rms_norm_ — only
-    // difference is NaN payload normalisation (canonical 0x7fff bf16 NaN).
-    // To match diffusers RMSNorm semantics, reuse the same scratch for a
-    // 2-stage writeback:
+    // Inline RMSNorm (vs shared mrope_utils::warp_rms_norm_). Cache the FP32
+    // reads of x_vec in v[] to avoid redundant re-reads, pack via
+    // pack_f32_to_vec_t (10 instr/bf16x2 pair vs ~26 default; see
+    // f32x2_to_bf16x2_rne in rope_common.h). Bit-exact RNE equivalent to
+    // warp_rms_norm_ except NaN payload normalisation (canonical 0x7fff bf16).
+    // 2-stage writeback to match diffusers RMSNorm semantics:
     //   n = x * rsqrt(...)
     //   n = round_T(n * gamma_T) after x_vec has been packed back to T
     {
@@ -1813,21 +1801,16 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
 
     if constexpr(IS_NEOX)
     {
-        // ds_swizzle XOR-by-NEIGHBOR_XOR — replaces the prior runtime `lane + neighbor_offset`
-        // path that lowered to ds_bpermute_b32. Same semantics as `__shfl(v, lane ^ NEIGHBOR_XOR, 32)`.
+        // ds_swizzle XOR-by-NEIGHBOR_XOR, same semantics as `__shfl(v, lane ^ NEIGHBOR_XOR, 32)`.
         auto nb_cos_sin_vec = mrope_utils::warp_shfl_xor_sync_vec<float, VEC_SIZE>(
             cos_sin_vec, opus::number<NEIGHBOR_XOR>{});
         auto nb_x_vec = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_SIZE>(
             x_vec, opus::number<NEIGHBOR_XOR>{});
 
-        // Replace the divergent `if(is_lower_half){}else{}` (which made the
-        // compiler emit two copies of the RoPE math AND the FP32→bf16 cvt
-        // sequence with s_and_saveexec / s_xor / s_or EXEC mask flips between
-        // them) with a per-lane v_cndmask select. Both expressions are
-        // evaluated in the SAME FP32 op order as the original divergent code
-        // (mul + mul + sub for lower, mul + mul + add for upper) — bit-exact
-        // equivalent. Then a single pack_f32_to_vec_t cvt path is reused for
-        // every lane.
+        // Per-lane v_cndmask select instead of a divergent if(is_lower_half)
+        // (which duplicated the RoPE math + cvt with EXEC-mask flips). Both
+        // exprs use the SAME FP32 op order as the divergent code (mul+mul-sub
+        // lower, mul+mul+add upper) — bit-exact; single cvt path per lane.
         float out_f32[VEC_SIZE];
 #pragma unroll
         for(int i = 0; i < VEC_SIZE; ++i)
@@ -1845,8 +1828,8 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
     }
     else
     {
-        // Stage RoPE results in FP32 then pack via pack_f32_to_vec_t for the
-        // same conversion-instruction-count win as the RMSNorm writeback.
+        // Stage RoPE results in FP32 then pack via pack_f32_to_vec_t (same
+        // cvt-instruction-count win as the RMSNorm writeback).
         float out_f32[VEC_SIZE];
 #pragma unroll
         for(int i = 0; i < PAIR_VEC_SIZE; ++i)
@@ -1872,110 +1855,44 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
 }
 
 // quad kernel: a single warp processes 4 heads (= 2 same-token head_pairs)
-// for one q-or-k side. Built up from two ideas that compose:
+// for one q-or-k side, composing two ideas:
 //
-//   (1) PAIR PACKING (half-warp layout)
-//       The single-head 1way kernel uses VEC_SIZE = HEAD_SIZE / WARP_SIZE
-//       elements per lane. For HEAD_SIZE = 128 and bf16 that is 4 elements
-//       = 8 bytes/lane → the compiler emits global_load_dwordx2 (8B), which
-//       is half the peak per-lane VMEM bandwidth on gfx942.
-//
-//       Inside this kernel we carve the warp into TWO half-warps and assign
-//       each half to one head:
+//   (1) PAIR PACKING (half-warp layout): carve the warp into two half-warps,
+//       one head each, so each lane owns 16B (one global_load_dwordx4) instead
+//       of the 1way kernel's 8B/lane (dwordx2 = half peak VMEM BW on gfx942).
+//       cos_sin (token-only) and w_q/w_k (head-only) are shared across the two
+//       heads -> one load each; RMSNorm reduce is a 16-lane butterfly
+//       (half_warp_reduce_sum in rope_common.h, no XOR-by-16 step).
 //
 //           half_warp_idx = (lane >> 4)   ∈ {0, 1}     ← which head
 //           lane_in_half  = lane & 15      ∈ [0, 16)    ← position-in-head
 //           VEC_PAIR      = HEAD_SIZE / 16 = 8 bf16     ← bytes/lane × 2
 //
-//       Each lane now owns 16 bytes of work (a "pair" of heads, with the
-//       upper/lower half-warp providing each one). The compiler emits a
-//       single global_load_dwordx4 per (token, head_pair).
+//   (2) BUNDLED VMEM ISSUE: NOT software pipelining (no loop) — one warp does
+//       ONE (token, head_quad) tile. Doubling to 2 head_pairs of the SAME token
+//       lets all 4 input loads (2x q/k + w + cos_sin) issue back-to-back in the
+//       prologue; the compiler sinks consumers behind decreasing waitcnt so the
+//       HBM round-trips overlap (wait = max, not sum) — load-latency hidden
+//       behind load-latency, not compute. Also lets w_vec/cos_sin (and the NEOX
+//       cos_sin shuffle) be loaded once for all 4 heads. (A real loop-level
+//       double buffer via TPW=2 was tried and didn't help: already ~50-60% HBM
+//       peak BW with cross-warp occupancy hiding the latency.)
 //
-//       Knock-on wins from the pair grouping:
-//         * cos_sin depends only on the token — both heads share it, so we
-//           load it ONCE per pair instead of twice.
-//         * w_q / w_k depend only on the head index modulo HEAD_SIZE —
-//           identical for the two heads, again a single shared load.
-//         * RMSNorm reduce becomes a 16-lane butterfly (helper
-//           half_warp_reduce_sum() in rope_common.h skips the XOR-by-16
-//           step so the two halves reduce independently).
+// Per-warp VMEM cost: 6 dwordx4 ops per 4 heads = 1.5 ops/head (vs 4 for the
+// single-head fallback).
 //
-//   (2) BUNDLED VMEM ISSUE (multiple outstanding loads, same token)
-//       NOTE on naming: this is NOT classical software-pipelined double
-//       buffering — there is no `prefetch t0; for i: prefetch ti; compute
-//       t(i-1)` loop. There is no loop at all. Each warp processes ONE
-//       (token, head_quad) tile and exits. What we do is just batch
-//       multiple HBM round-trips so they fly in parallel; the win is from
-//       load↔load overlap, not load↔compute overlap.
+// Numerical envelope: identical math to the single-head kernel, only the reduce
+// tree changes (16- vs 32-lane butterfly); non-associative FP32 drifts <=1
+// mantissa ULP (0..1 bf16 ULP on <=0.0003% of outputs), inside atol=0.05 vs
+// PyTorch — no accuracy impact.
 //
-//       Step (1) gave us "1 warp = 1 head_pair" with 4 VMEM ops per pair
-//       (q/k load + w + cos_sin + store). At single in-flight load per
-//       warp the kernel is VMEM-latency-bound on MI300X: load → first-use
-//       distance is hundreds of cycles and one outstanding load can't fill
-//       that.
+// Constraint: num_heads_q % 4 == 0 && num_heads_k % 4 == 0; else the dispatcher
+// falls back to fused_rope_rms_1way_kernel (bitwise-identical baseline output).
 //
-//       So this kernel doubles the work per warp to TWO head_pairs of the
-//       SAME token and bundles ALL their input loads in the prologue:
-//
-//           prologue (no loop, all issued back-to-back):
-//             global_load_dwordx4 x_pair_0   [pair 0 q/k, heads 4p+0,4p+1]
-//             global_load_dwordx4 x_pair_1   [pair 1 q/k, heads 4p+2,4p+3,
-//                                             +offset 2*HEAD_SIZE]
-//             global_load_dwordx4 w_vec      [shared by both pairs]
-//             global_load_dwordx4 cos_sin    [shared by both pairs, same token]
-//
-//       The compiler sinks each consumer behind a decreasing waitcnt
-//       (vmcnt(3) → vmcnt(2) → ... → vmcnt(0)) so all 4 HBM round-trips
-//       are in flight simultaneously — total wait is max() of the four,
-//       not sum(). One load's latency is hidden behind ANOTHER LOAD's
-//       latency, not behind compute.
-//
-//       (Cross-loop producer-consumer pipelining — the "real" double
-//       buffer that interleaves prefetch ti with compute t(i-1) — needs a
-//       loop. We tried it via TPW=2 (1 warp = 2 tokens) and it didn't
-//       help: the kernel is already at ~50-60% HBM peak BW with ~10
-//       waves/SIMD, and cross-warp occupancy is already hiding the
-//       load latency that a loop-level pipeline would have to fight for.)
-//
-//       Same-token bundling adds two more wins on top of (1):
-//         * w_vec and cos_sin are now loaded ONCE for ALL FOUR heads, not
-//           once per pair (so 2× more reuse than pair packing alone).
-//         * The NEOX cos_sin shuffle (warp_shfl_xor_sync_vec) only needs
-//           to run once per warp; both pair-0 and pair-1 RoPE rotations
-//           reuse the same shuffled cos_sin_vec / nb_cos_sin_vec.
-//
-// Per-warp VMEM cost (4 heads of work):
-//     2× dwordx4 q/k load + 1× dwordx4 w + 1× dwordx4 cos_sin
-//   + 2× dwordx4 store
-//   = 6 VMEM ops per 4 heads → 1.5 ops/head
-//   (vs single-head fallback kernel: 4 ops/head)
-//
-// Numerical envelope:
-//   Each (token, head_pair) is computed with the identical math as the
-//   single-head kernel — only the cross-lane reduce tree changes (16-lane
-//   butterfly instead of 32-lane). With non-associative FP32 the rounded
-//   result drifts by at most 1 mantissa ULP, mapping to 0..1 bf16 ULP on
-//   ≤ 0.0003% of output elements (verified by sweep against the single-head
-//   path). The end-to-end magnitude bound stays inside atol=0.05 vs PyTorch
-//   reference, identical envelope to both the single-head 1way kernel and
-//   the existing 2way kernel — i.e. no model-accuracy impact.
-//
-// Constraint: num_heads_q % 4 == 0 && num_heads_k % 4 == 0. The dispatcher
-// falls back to the single-head fused_rope_rms_1way_kernel for any other
-// shape; that path is untouched and produces bitwise-identical output to
-// the pre-quad-kernel baseline.
-//
-// QUAD_Q_CT / QUAD_K_CT (compile-time):
-//   When > 0 the kernel uses them as constexpr divisors so the compiler
-//   folds `spec / quad_q` / `spec % quad_q` into a magic-number multiply
-//   (5 VALU ops: mul_hi + lshr + mul_lo + sub) instead of the runtime
-//   signed integer-divide expansion (~30 ops including v_rcp_iflag_f32).
-//   Pass 0 to keep the runtime path. Selected by the host dispatcher
-//   based on the actual num_heads_q / num_heads_k.
-//
-//   Empirical impact at T=8192, HEAD_SIZE=128, bf16 on MI308X: 3-5% faster
-//   per-warp than the runtime path (kernel is dominated by VMEM latency,
-//   not int-div). VGPR usage and occupancy are identical.
+// QUAD_Q_CT / QUAD_K_CT (compile-time): when > 0, used as constexpr divisors so
+// spec/quad and spec%quad fold to a magic-number multiply (~5 VALU ops) instead
+// of runtime signed int-div (~30 ops); pass 0 for the runtime path. Selected by
+// the host dispatcher from num_heads_q/num_heads_k; ~3-5% faster per-warp.
 template <typename T,
           int HEAD_SIZE,
           bool IS_NEOX,
@@ -2007,20 +1924,12 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
     const int global_warp_id      = blockIdx.x * num_warps_per_block + warp_id;
 
     // ---------- branch hoist (uniform Q/K split, scalar cmp) ----------
-    // Block layout is 256 threads = 4 physical waves × 2 logical warps each
-    // (WARP_SIZE here is 32, half of the 64-lane physical wave). Within a
-    // physical wave the two halves have consecutive global_warp_id values
-    // X and X+1, so `is_q = global_warp_id < warp_q_end` is uniform across
-    // the full 64-lane wave iff `warp_q_end = T*QUAD_Q_CT` is even — which
-    // is guaranteed when QUAD_Q_CT is even. Same logic for total_warps_quad
-    // = T*(QUAD_Q_CT + QUAD_K_CT). For our deployed instances Q,K ∈ {4,6,8}
-    // both are even, so we can `readfirstlane` the warp_id and let the
-    // compiler emit `s_cmp + s_cbranch` instead of the per-lane
-    // `v_cmp + s_and_saveexec + s_xor + s_cbranch_execz` sequence (saves a
-    // few cycles + EXEC-mask thrash on every wave). For odd QUAD_*_CT (e.g.
-    // H=12 → QUAD=3) the boundary may cut a wave, so we keep the original
-    // divergent path. `spec` below stays per-lane (it differs between the
-    // two logical warps of a physical wave by design).
+    // Block = 256 threads = 4 physical 64-lane waves x 2 logical warps (WARP_SIZE
+    // 32). is_q = global_warp_id < warp_q_end is wave-uniform iff warp_q_end =
+    // T*QUAD_Q_CT is even (and total_warps_quad = T*(QUAD_Q_CT+QUAD_K_CT)), i.e.
+    // both QUAD_*_CT even. If so, readfirstlane the warp_id -> scalar s_cmp+s_cbranch
+    // instead of per-lane v_cmp+saveexec (saves EXEC-mask thrash). Odd QUAD_*_CT
+    // (e.g. H=12) may cut a wave, so keep the divergent path. `spec` stays per-lane.
     constexpr bool kBranchUniform =
         (QUAD_Q_CT > 0) && (QUAD_Q_CT % 2 == 0) &&
         (QUAD_K_CT > 0) && (QUAD_K_CT % 2 == 0);
@@ -2038,11 +1947,9 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
     auto out_q         = out_q_ + batch_id * num_tokens * num_heads_q * HEAD_SIZE;
     auto out_k         = out_k_ + batch_id * num_tokens * num_heads_k * HEAD_SIZE;
 
-    // "quad" count per token = how many groups-of-4-heads each token contributes.
-    // When QUAD_Q_CT / QUAD_K_CT are non-zero compile-time constants, the
-    // div/mod below becomes a constant-divisor magic-multiply (~3 VALU ops);
-    // otherwise the compiler emits the full runtime int-div sequence
-    // (~30 ops, sat on the critical path before any VMEM can issue).
+    // "quad" count per token = groups-of-4-heads each token contributes.
+    // Non-zero compile-time QUAD_*_CT make the div/mod a magic-multiply (~3 VALU
+    // ops) vs the runtime int-div (~30 ops on the critical path before VMEM).
     const int quad_q     = (QUAD_Q_CT > 0) ? QUAD_Q_CT : (num_heads_q / 4);
     const int quad_k     = (QUAD_K_CT > 0) ? QUAD_K_CT : (num_heads_k / 4);
     const int warp_q_end = num_tokens * quad_q;
@@ -2084,13 +1991,11 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
         }
     }
 
-    // ===========================================================
     // PROLOGUE: issue all 4 input loads concurrently
     //   - x_pair_0: q/k for pair 0 (heads 4q+0, 4q+1)
     //   - x_pair_1: q/k for pair 1 (heads 4q+2, 4q+3) — offset = +2 * HEAD_SIZE
     //   - w_vec   : RMSNorm gamma (head-independent, shared across pairs)
     //   - cos_sin : token-only (shared across pairs since same token)
-    // ===========================================================
     const int head0_in_token = 4 * quad_idx_in_token;
 
     vec_t<T, VEC_PAIR> x_pair_0, x_pair_1;
@@ -2139,17 +2044,12 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
         }
     }
 
-    // ===========================================================
     // RMSNorm × 2 (one reduce per pair, both use shared w_vec)
-    // ===========================================================
     {
-        // Cache FP32 reads so the writeback loop doesn't re-read BF16 from
-        // x_pair_0/1 (would be redundant lshl b32 conversions). Same RNE on
-        // writeback via pack_f32_to_vec_t (10 instr per bf16x2 pair vs the
-        // compiler default 26 instr — see f32x2_to_bf16x2_rne in rope_common.h).
-        // To match diffusers RMSNorm semantics, reuse the same scratch for a
-        // 2-stage writeback: first pack x * rsqrt(...), then multiply the
-        // packed low-precision values by gamma and pack once more.
+        // Cache FP32 reads to avoid redundant re-reads; pack via pack_f32_to_vec_t
+        // (10 instr/bf16x2 pair vs 26 default; f32x2_to_bf16x2_rne in rope_common.h).
+        // 2-stage writeback for diffusers RMSNorm semantics: pack x*rsqrt(...),
+        // then pack (packed * gamma).
         float v0[VEC_PAIR], v1[VEC_PAIR];
         float acc0 = 0.f, acc1 = 0.f;
 #pragma unroll
@@ -2185,9 +2085,7 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
         mrope_utils::pack_f32_to_vec_t(x_pair_1, n1);
     }
 
-    // ===========================================================
     // RoPE × 2 (cos_sin shuffle SHARED between pair 0 and pair 1)
-    // ===========================================================
     vec_t<T, VEC_PAIR> out_pair_0, out_pair_1;
     if constexpr(IS_NEOX)
     {
@@ -2200,18 +2098,12 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
         auto nb_x_pair_1 = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_PAIR>(
             x_pair_1, opus::number<NEIGHBOR_XOR_PAIR>{});
 
-        // Replace divergent `if(is_lower_half){}else{}` (which forced the
-        // compiler to emit two copies of the rope math AND of the FP32→BF16
-        // cvt sequence, with s_and_saveexec / s_xor / s_or EXEC mask
-        // switches between them) with a per-lane cndmask select. Both
-        // expressions are evaluated in the SAME FP32 op order as the
-        // original divergent code (mul + mul + sub for lower, mul + mul +
-        // add for upper), then cndmask picks the right one — bit-exact
-        // equivalent for every lane, single cvt path per output.
-        // FP32 results are staged then packed via pack_f32_to_vec_t which
-        // for bfloat16 lowers to v_cmp_u_f32 + v_bfe_u32 + v_add3_u32 +
-        // v_cndmask + v_and_or_b32 (10 instr per bf16x2 pair vs 26 for the
-        // default scalar __hip_bfloat16(float) ctor expansion).
+        // Per-lane cndmask select instead of a divergent if(is_lower_half)
+        // (which duplicated the rope math + cvt with EXEC-mask flips). Both
+        // exprs use the SAME FP32 op order as the divergent code (mul+mul-sub
+        // lower, mul+mul+add upper) — bit-exact; single cvt path per output.
+        // Staged FP32 packed via pack_f32_to_vec_t (10 instr/bf16x2 pair vs 26
+        // for the default __hip_bfloat16(float) ctor).
         float out0_f32[VEC_PAIR], out1_f32[VEC_PAIR];
 #pragma unroll
         for(int i = 0; i < VEC_PAIR; ++i)
@@ -2257,9 +2149,7 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
         mrope_utils::pack_f32_to_vec_t(out_pair_1, out1_f32);
     }
 
-    // ===========================================================
     // Stores: 2 × dwordx4
-    // ===========================================================
     if(is_q)
     {
         const int64_t base_off =
@@ -2347,9 +2237,8 @@ void fused_rope_rms_1way(const T* q,
                                                         out_k);             \
     }
         // Outer macro: route common (num_heads_q, num_heads_k) shapes to the
-        // compile-time-divisor specialization, default to runtime path.
-        // Specialized list intentionally short — each adds ~one .so MB after
-        // template expansion across (T, HEAD_SIZE, IS_NEOX) → ~24 instances.
+        // compile-time-divisor specialization, default to runtime path. List kept
+        // short — each adds ~one .so MB after (T, HEAD_SIZE, IS_NEOX) expansion.
 #define DISPATCH_NEOX_QUAD(HEAD_SIZE)                              \
     if(num_heads_q == 24 && num_heads_k == 24)                     \
     {                                                              \
@@ -3940,10 +3829,7 @@ void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
 
 } // namespace aiter
 
-// ============================================================================
 // fused_qk_norm_rope_group_quant kernel (MLA group-quant path)
-// Moved from cache_kernels.cu for better file organization.
-// ============================================================================
 
 namespace aiter {
 
@@ -3991,7 +3877,6 @@ namespace aiter {
     };
 
 
-    // ============================================================================
     // K wave body (shared between fuse_qk_norm_rope_group_quant_cache_kernel_impl
     // and the K-only fuse_kv_norm_rope_group_quant_cache_kernel). RMSNorm over
     // the full head_dim, 1xG e8m0 group-quant on NoPE (writing nope fp8 +
@@ -4008,7 +3893,6 @@ namespace aiter {
     //     shape: [num_tokens, (NK=1,) pe_dim]. NK is hardcoded to 1 (MQA).
     //   - params.token_stride / kv_stride_0 / k_pe_out_stride_0 are used; other
     //     fields are ignored on this path.
-    // ============================================================================
     template <typename scalar_t, typename cache_t,
               vllm::Fp8KVCacheDataType kv_dt, bool is_neox,
               int HEAD_DIM = 512, int PE_DIM = 64, int GROUP_SIZE = 64,
@@ -4041,10 +3925,10 @@ namespace aiter {
       constexpr int32_t pe_dim    = PE_DIM;
       constexpr int32_t nope_dim  = head_size - pe_dim;
       // Elements/lane to cover one head in a single wave = HEAD_DIM/WARP_SIZE
-      // (wave64: 8; wave32: 16). WARP_SIZE is the device-resolved wavefront size; safe in
-      // this __device__ constexpr (using it in __launch_bounds__/template args would trip
-      // the host-pass ICE trap). fp32 input uses vec=8 too (load_vector_nbytes does the
-      // 32B as 2x float4 chunks); rope_t (cos/sin/rope-out) is decoupled (e.g. bf16).
+      // (wave64: 8; wave32: 16). WARP_SIZE (device-resolved) is safe in this
+      // __device__ constexpr but would ICE in __launch_bounds__/template args.
+      // fp32 uses vec=8 too (load_vector_nbytes splits 32B into 2x float4);
+      // rope_t (cos/sin/rope-out) is decoupled (e.g. bf16).
       constexpr int32_t kWave = WARP_SIZE;
       constexpr int32_t vec_size_i = (HEAD_DIM / 8 <= kWave) ? 8 : 16;
       constexpr int32_t vec_size_o = vec_size_i;
@@ -4062,10 +3946,9 @@ namespace aiter {
       // Disabled for fp32 (worse cache-line utilization). See aiter_opus_plus.h::GROUP_NT.
       constexpr int32_t IN_LOAD_AUX = (sizeof(scalar_t) < 4) ? GROUP_NT : 0;
 
-      // ---- Compile-time invariants on the dispatch-table template params (zero runtime
-      // cost; user-shape validation lives in the host entry). Each lane owns vec_size_i
-      // contiguous elems, one wave covers the head -> head_size/vec_size_i <= WARP_SIZE.
-      // No upper-bound assert: fp32 (head<=256) is dead-code-instantiated by the macro.
+      // ---- Compile-time invariants on the dispatch-table template params (host
+      // entry does user-shape validation). Each lane owns vec_size_i contiguous
+      // elems, one wave covers the head -> head_size/vec_size_i <= WARP_SIZE.
       static_assert(head_size % vec_size_i == 0 && pe_dim % vec_size_i == 0
                     && GROUP_SIZE % vec_size_i == 0,
                     "head_dim / pe_dim / GROUP_SIZE must each be divisible by vec_size_i");
@@ -4102,39 +3985,28 @@ namespace aiter {
       auto buffer_swa_o  = opus::make_gmem<cache_t>(
           ptr_swa_o != nullptr ? ptr_swa_o : ptr_o, oob_o * sizeof(cache_t));
 
-      // Unified vec load: all lanes load vec_size_i contiguous elements.
-      // For head_dim < 64*vec_size_i (e.g. 128, 192, 256, 384) the trailing
-      // lanes have tid*vec_size_i >= head_dim and would OOB on a raw pointer
-      // load. We use opus buffer descriptors (which return 0 for OOB) so the
-      // idle lanes' loaded values become zero -- benign because those lanes
-      // are filtered out by `is_nope_thread` / pe_tid range later, and the
-      // sum_sq wave-reduce sums in zeros from idle lanes (head_size still
-      // matches the active lane count via head_size / vec_size_i, so the
-      // mean(x^2) divisor is correct).
+      // Unified vec load: all lanes load vec_size_i contiguous elements. For
+      // head_dim < 64*vec_size_i the trailing lanes are OOB; opus buffer
+      // descriptors return 0 for OOB, so idle lanes load zeros -- benign (they
+      // are filtered by is_nope_thread / pe_tid range, and the zeros are correct
+      // for the sum_sq reduce since the mean(x^2) divisor is head_size).
       const bool is_nope_thread = (tid < nope_vec);  // V4 nope-first
 
       opus_vec_i vec_kv =
           load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes, IN_LOAD_AUX>(
               buffer_kv, tid * vec_size_i);
-      // Bounds-safe k_weight load: use buffer descriptor (OOB returns 0) so head_dim
-      // < 64*vec_size_i works (e.g. head_dim=128/192/256/384) without raw-pointer OOB
-      // faults on the trailing idle lanes. NT/SLC|GLC NOT applied here -- k_weight
-      // has heavy temporal reuse across tokens so we want it to live in L1.
+      // Bounds-safe k_weight load via buffer descriptor (OOB returns 0). No
+      // NT/SLC|GLC here -- k_weight has heavy temporal reuse, keep it in L1.
       auto buffer_kw = opus::make_gmem<scalar_t>(k_weight, head_size * sizeof(scalar_t));
       opus_vec_i vec_k_weight =
           load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes>(buffer_kw, tid * vec_size_i);
 
       // ---- Prefetch cos/sin for the PE lanes BEFORE the RMSNorm reduce ----
-      // The cos/sin gather (indexed by positions[token]) is a scattered global
-      // read issued by only the PE lanes. If loaded late (inside the rope block,
-      // after the row-sum reduce) its latency lands on the post-reduce critical
-      // path -- and since the wave can't retire until the PE lanes finish, that
-      // latency directly inflates wave time. Issuing the load HERE lets it fly
-      // during the reduce + norm + nope-quant so it has arrived by the time the
-      // rope math needs it. Each PE lane reads a contiguous run in ONE vector op
-      // (runs are aligned: cos_ptr is 64B-aligned via positions*(pe_dim/2), the
-      // lane offset is a multiple of the vector width) and converts to float;
-      // the rope math in Step 4 consumes these registers.
+      // Only PE lanes issue this scattered cos/sin gather (indexed by
+      // positions[token]). Issuing it here lets its latency hide behind the
+      // reduce + norm + nope-quant instead of landing on the post-reduce
+      // critical path. Each PE lane reads a contiguous, aligned run in one vector
+      // op (cos_ptr is 64B-aligned via positions*(pe_dim/2)); Step 4 consumes these.
       const bool is_pe_lane = (tid >= pe_tid_start && tid < pe_tid_end);
       float pe_cos[vec_size_i];
       float pe_sin[vec_size_i];
@@ -4351,9 +4223,8 @@ namespace aiter {
       constexpr int32_t pe_dim = 64;
       constexpr int32_t nope_dim = head_size - pe_dim;
       // Elements/lane to cover one head with a single wave = HEAD_DIM/WARP_SIZE
-      // (wave64: 8 for head=512; wave32: 16). WARP_SIZE is the device-resolved wavefront
-      // size; safe in this __device__ constexpr (matches the shared K-wave body), so the Q
-      // path is wave-generic without an extra per-wave-size instantiation.
+      // (wave64: 8 for head=512; wave32: 16). WARP_SIZE (device-resolved) is safe
+      // in this __device__ constexpr, so the Q path is wave-generic.
       // fp32 is a dead-code instantiation; cap at 4 (no 32-byte opus float vector).
       constexpr int32_t kWave = WARP_SIZE;
       constexpr int32_t vec_size_i =
@@ -4373,12 +4244,9 @@ namespace aiter {
       constexpr int32_t q_ooba_o = 4 / sizeof(query_t);
       constexpr int32_t q_oob_o = (head_size + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
       constexpr int32_t reduce_thread_size = GROUP_SIZE / vec_size_i;
-      // Non-temporal (streaming) load policy for the Q/KV inputs. Each input element is read
-      // exactly once with no reuse, so marking the buffer loads SLC|GLC (GROUP_NT) bypasses L2
-      // and avoids cache pollution, which helps the bandwidth-bound large-T regime (the Q read
-      // alone is T*H*head_size*2 bytes, e.g. ~268 MB at T=4096/H=128). NT hurts fp32 inputs
-      // (4 B/elem -> worse cache-line utilization), so gate on 2-byte dtypes only, matching the
-      // activation-kernel convention (see GROUP_NT in aiter_opus_plus.h).
+      // Streaming (read-once) NT/SLC|GLC loads for Q/KV inputs bypass L2 (helps
+      // the bandwidth-bound large-T regime). Gated on 2-byte dtypes only; NT hurts
+      // fp32 cache-line utilization. See GROUP_NT in aiter_opus_plus.h.
       constexpr int32_t IN_LOAD_AUX = (sizeof(scalar_t) < 4) ? GROUP_NT : 0;
       constexpr int32_t in_chunk_bytes = (vec_size_i * sizeof(scalar_t)) % 16 == 0 ? 16 : 8;
       // K nope_scale_buff layout (v4 nm asm reader, 512B entry for head_dim=512):
@@ -4459,16 +4327,14 @@ namespace aiter {
       const int64_t token_q_base = static_cast<int64_t>(token_idx) * params.q_stride_0;
       const int64_t token_qout_base = static_cast<int64_t>(token_idx) * params.q_out_stride_0;
 
-      // Q-quant constants. Q_REDUCE must be a supported power-of-two group width and
-      // Q_GROUP_SIZE must divide head_dim.
+      // Q-quant constants. Q_REDUCE must be a supported power-of-two group width and Q_GROUP_SIZE must divide head_dim.
       constexpr int32_t Q_REDUCE = Q_GROUP_SIZE / vec_size_i;
       constexpr int32_t Q_NUM_GROUPS = head_size / Q_GROUP_SIZE;
       static_assert(head_size % Q_GROUP_SIZE == 0, "head_size must be divisible by Q_GROUP_SIZE");
       static_assert(Q_REDUCE >= 1 && Q_REDUCE <= 64 && (Q_REDUCE & (Q_REDUCE - 1)) == 0,
                     "Q_REDUCE (Q_GROUP_SIZE/vec_size_i) must be a power of 2 in [1,64]");
 
-      // q_weight is loaded once per Q head (same across all heads since the weight is shared).
-      // We could hoist this out of the head loop, but the cost is negligible (1 load / 16B / thread).
+      // q_weight is shared across heads; loaded here (hoist would save a negligible 16B/thread).
       opus_vec_i vec_q_weight;
       if constexpr (HAS_Q_WEIGHT) {
         vec_q_weight = *reinterpret_cast<const opus_vec_i*>(&q_weight[tid * vec_size_i]);
@@ -4500,18 +4366,16 @@ namespace aiter {
         }
       }
 
-      // Build the q buffer descriptor ONCE per wave (base = this token's q row); load each
-      // head via a uniform per-head scalar offset (soffset) instead of rebuilding the SRD
-      // (the make_gmem readfirstlane/saveexec pattern) for every head.
+      // Build the q buffer descriptor ONCE per wave (base = this token's q row);
+      // load each head via a uniform scalar offset instead of rebuilding the SRD.
       const unsigned q_buf_bytes =
           static_cast<unsigned>(params.num_heads) * params.q_stride_1 * sizeof(scalar_t);
       auto q_buf = opus::make_gmem<scalar_t>(q + token_q_base, q_buf_bytes);
 
       for (int32_t q_head_idx = q_head_start; q_head_idx < q_head_end; q_head_idx++) {
         // Unified vec8 load: all 64 threads load 8 elements covering full head_dim.
-        // (Tried vLLM-style 2-deep prefetch of the next head here -- measured neutral:
-        // the compiler already pipelines the loop load, and the extra live vec_q_next
-        // costs VGPR/occupancy, so it's a wash. Kept the simple single-buffer load.)
+        // (2-deep next-head prefetch measured neutral -- compiler already pipelines
+        // the loop load and the extra live reg costs occupancy; kept single-buffer.)
         opus_vec_i vec_q =
             load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes, IN_LOAD_AUX>(
                 q_buf, tid * vec_size_i + q_head_idx * params.q_stride_1);
@@ -4680,27 +4544,17 @@ namespace aiter {
       }
     }
 
-    // ===========================================================================
-    // Fine-grained variant (FlyDSL-style decomposition) -- auto-selected for the
-    // xlarge prefill tier (T >= ~8k, num_tokens <= 65535); ~5-17% faster there.
-    // ---------------------------------------------------------------------------
-    // One block == one wave == exactly ONE (token, head) tile:
-    //   grid.x = num_heads + 1 (head; 0 -> K, 1.. -> Q), grid.y = num_tokens.
-    // Mirrors flydsl: no head loop, no tokens-per-block packing, head on the fast
-    // grid dim (co-scheduled blocks read contiguous q[token,*,:] rows). It also
-    // folds the quant: amax is taken over the RAW pre-norm input (so it fuses with
-    // the row-sum butterfly), and rstd is folded into a single forward factor
-    // applied to x_in directly -> fewer multiplies / live registers.
+    // Fine-grained variant (FlyDSL-style decomposition), one block == one wave ==
+    // one (token, head) tile: grid.x = num_heads+1 (head; 0 -> K, 1.. -> Q),
+    // grid.y = num_tokens. No head loop / tokens-per-block packing; head on the
+    // fast grid dim. Folds the quant: amax over the RAW pre-norm input (fuses with
+    // the row-sum butterfly), rstd folded into a single forward factor on x_in.
+    // Per-tile math + v4 nm asm store layout are identical to the coarse kernel.
     //
-    // MEASURED (MI355, gfx950): this MATCHES the coarse kernel, it does not beat it.
-    // The coarse kernel already runs at the HW occupancy cap (32 VGPR -> ~8 waves/
-    // SIMD), so "more, smaller waves" buys nothing -- the kernel is memory-traffic
-    // bound, not occupancy bound. The residual gap to flydsl's wall-clock is mostly
-    // that flydsl stores PE as fp8 (64 B) while the V4 nm asm layout requires PE as
-    // bf16 (128 B), i.e. a format difference, not a schedule difference. Kept as a
-    // documented, correct A/B baseline for future memory-layout experiments.
-    // The per-tile math + v4 nm asm store layout are identical to the coarse kernel.
-    // ===========================================================================
+    // MEASURED (MI355, gfx950): MATCHES the coarse kernel, does not beat it -- the
+    // coarse kernel is already memory-traffic bound at the occupancy cap, so more
+    // smaller waves buy nothing. Kept as a correct A/B baseline for memory-layout
+    // experiments.
     template <typename scalar_t, typename cache_t, typename query_t,
               vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, bool is_neox,
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
@@ -4730,9 +4584,8 @@ namespace aiter {
       constexpr int32_t pe_dim = 64;
       constexpr int32_t nope_dim = head_size - pe_dim;
       // Elements/lane to cover one head with a single wave = HEAD_DIM/WARP_SIZE
-      // (wave64: 8 for head=512; wave32: 16). WARP_SIZE is the device-resolved wavefront
-      // size; safe in this __device__ constexpr (matches the shared K-wave body), so the Q
-      // path is wave-generic without an extra per-wave-size instantiation.
+      // (wave64: 8 for head=512; wave32: 16). WARP_SIZE (device-resolved) is safe
+      // in this __device__ constexpr, so the Q path is wave-generic.
       // fp32 is a dead-code instantiation; cap at 4 (no 32-byte opus float vector).
       constexpr int32_t kWave = WARP_SIZE;
       constexpr int32_t vec_size_i =
@@ -4750,8 +4603,8 @@ namespace aiter {
       constexpr int32_t q_oob_o = (head_size + q_ooba_o - 1) / q_ooba_o * q_ooba_o;
       constexpr int32_t GROUP_SIZE = 64;
       constexpr int32_t reduce_thread_size = GROUP_SIZE / vec_size_i;
-      // Streaming (read-once) inputs -> NT/SLC|GLC to bypass L2 (same as the coarse
-      // kernel). Measured neutral here vs plain cached loads, kept for consistency.
+      // Streaming (read-once) NT/SLC|GLC loads (same as coarse kernel); measured
+      // neutral here, kept for consistency.
       constexpr int32_t IN_LOAD_AUX = (sizeof(scalar_t) < 4) ? GROUP_NT : 0;
       constexpr int32_t in_chunk_bytes = (vec_size_i * sizeof(scalar_t)) % 16 == 0 ? 16 : 8;
 
@@ -5334,24 +5187,15 @@ void fused_qk_norm_rope_group_quant(
   // launch matches the in-kernel wave_id = threadIdx.x / WARP_SIZE decomposition on wave32 too.
   const int warp_size = static_cast<int>(get_warp_size_func());
 
-  // ---------------------------------------------------------------------------
   // Launch-config heuristic: pick Q heads-per-wave (HPW) from the prefill size.
-  // grid.y = 1 (single K wave) + ceil(num_heads / HPW); the kernel is fully runtime-
-  // driven by gridDim.y so HPW costs no template re-instantiation. All constants
-  // are tuned (MI3xx, measured) and hardcoded -- intentionally NOT env-tunable.
-  //
+  // grid.y = 1 (single K wave) + ceil(num_heads / HPW); runtime-driven, so HPW
+  // costs no re-instantiation. Constants are tuned (MI3xx) and NOT env-tunable.
   // Four tiers, by prefill block count (= ceil(T/4) * (1 + q_waves_med)):
   //   decode : tiny T,  tokens_per_block=1, HPW=1   (max blocks to fill the CUs)
-  //   med    : mid T,                       HPW=3   (~8-11% better than 4 here;
-  //            the prefill mid-range is occupancy/latency-bound, so more, smaller
-  //            blocks fill the CUs better)
+  //   med    : mid T,                       HPW=3
   //   large  : T ~ 2k-4k,                   HPW=8
-  //   xlarge : T >= ~8k,                    HPW=16  (largest prefill chunks, e.g.
-  //            ATOM's 16384; HPW=16 is ~3-5% faster than 8 at T=8192/16384 for
-  //            H=64/128, while T<=4096 stays on the large tier at 8).
-  // Thresholds are in blocks/CU, so they scale with H (larger H reaches a tier at
-  // smaller T) and with the device CU count -- matching the measured per-H crossovers.
-  // ---------------------------------------------------------------------------
+  //   xlarge : T >= ~8k,                    HPW=16  (e.g. ATOM's 16384)
+  // Thresholds are in blocks/CU, so they scale with H and the device CU count.
   constexpr int PREFILL_TOKENS_PER_BLOCK       = 4;
   constexpr int PREFILL_Q_HEADS_PER_WAVE_MED   = 3;
   constexpr int PREFILL_Q_HEADS_PER_WAVE_LRG   = 8;
@@ -5391,25 +5235,16 @@ void fused_qk_norm_rope_group_quant(
   AITER_CHECK(head_dim == 512,
               "Unsupported head_dim=", head_dim, ". Supported: 512");
 
-  // 4-level dispatch (HEAD_DIM, Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT) collapsed into
-  // a single generic lambda. The kernel templates instantiate one .co per combination.
-  //   - 1 head_dim x 3 group sizes x 2 scale dtypes x 2 q_weight flags x 2 tokens_per_block x
-  //     4 dtype combos = 96 instantiations per source dtype (bf16 typical → 96 ko).
-  // Q_GROUP_SIZE / Q_SCALE_FP32 are only meaningful when q_out is fp8 (q_dt != kAuto);
-  // for bf16 q_out we collapse onto (G=64, e8m0) — the kernel ignores them.
+  // 4-level dispatch (HEAD_DIM, Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT) via one
+  // generic lambda; one .co per combination (96 instantiations per source dtype).
+  // Q_GROUP_SIZE / Q_SCALE_FP32 matter only for fp8 q_out (q_dt != kAuto); bf16
+  // q_out collapses onto (G=64, e8m0).
   // Fine-grained (FlyDSL-style) path: 1 wave per (token, head), block=64,
-  // grid=(num_heads+1, num_tokens). Measured on gfx950 (MI355): ~5-17% faster
-  // than the coarse HPW path at large prefill (T >= ~8k) for both bf16 and fp8 Q.
-  // At mid T (256-2048) the coarse path's per-wave head aggregation (one cos/sin
-  // gather reused across HPW heads) wins, so we only switch to FG for the xlarge
-  // tier. grid.y == num_tokens, so cap at 65535 (larger T would need a Y-chunk loop).
-  // Fine-grained (1 wave / (token,head)) is the xlarge-prefill default. It also
-  // wins for *many-head* shapes in the large tier: with H>=128 (e.g. DeepSeek-V4
-  // at TP=1) the coarse HPW=8 path serializes 8 heads/wave with a long
-  // load->2-pass-reduce->store chain, while FG's finer split hides the memory
-  // latency better. Measured on an idle MI355 (fp8 quant): H=128 large tier is
-  // ~3-14% faster under FG (T=2048..4096); H<=32 stays on coarse (FG regresses
-  // few-head shapes ~6-10%), and H=64 is mixed so it stays coarse too.
+  // grid=(num_heads+1, num_tokens); grid.y capped at 65535. ~5-17% faster than the
+  // coarse HPW path at xlarge prefill (T >= ~8k); mid T stays coarse (per-wave
+  // cos/sin reuse wins). Also wins for many-head (H>=128) shapes in the large tier
+  // where coarse HPW=8 serializes a long load->reduce->store chain; H<=32 (and
+  // mixed H=64) stay coarse (FG regresses few-head shapes ~6-10%).
   constexpr int FG_MANY_HEADS_MIN = 128;
   const bool use_finegrained =
       (num_tokens <= 65535)
@@ -5460,8 +5295,7 @@ void fused_qk_norm_rope_group_quant(
   const int  group_size    = q_is_fp8 ? static_cast<int>(quant_group_size) : 64;
   const bool scale_is_fp32 = q_is_fp8 ? (scale_dtype == "fp32") : false;
 
-  // For a fixed (group_size, scale_fp32), branch on q_weight presence (compile-time flag)
-  // and launch.
+  // For a fixed (group_size, scale_fp32), branch on q_weight presence (compile-time flag) and launch.
 #define LAUNCH_FOR_CONFIG(GROUP_SIZE, SCALE_FP32)                                              \
     do {                                                                                        \
       if (has_q_weight)                                                                         \
@@ -5484,14 +5318,9 @@ void fused_qk_norm_rope_group_quant(
 #undef LAUNCH_FOR_CONFIG
 }
 
-// ============================================================================
-// K-only kernel for V4-Pro Attention.forward (path A)
-// ----------------------------------------------------------------------------
-// Reuses k_wave_norm_rope_group_quant_impl (the shared K-wave body, also
-// called from the K branch of fuse_qk_norm_rope_group_quant_cache_kernel_impl)
-// so the algorithm/output layout stays bit-exact with the QK kernel. The only
-// new code here is the launch decomposition (no Q grid.y, no Q register
-// pressure) and the per-wave (token_idx, tid, cos/sin) prelude.
+// K-only kernel for V4-Pro Attention.forward (path A). Reuses the shared K-wave
+// body k_wave_norm_rope_group_quant_impl so output stays bit-exact with the QK
+// kernel; only the launch decomposition + per-wave prelude are new.
 //
 // Output layout (V4 nm asm sparse-attn reader, same as the K-side of QK):
 //   kv_cache [num_tokens, NK=1, head_dim]        fp8:
@@ -5505,16 +5334,14 @@ void fused_qk_norm_rope_group_quant(
 //   kv = self.kv_norm(kv)                                              -> RMSNorm + k_weight
 //   apply_rotary_emb(kv[..., -rd:], freqs_cis)                         -> RoPE on PE
 //   act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, inplace=True) -> nope fp8 + e8m0
-// ============================================================================
-// PLAN_BASED=false: per-token flat slot_mapping + positions (vLLM-style paged write,
-//   used by the SWA / generic decode K-only path).
-// PLAN_BASED=true: compress path -- resolve the paged dest + RoPE position IN-KERNEL
-//   from the SGLang-style `plan` ([cap,4] = ragged_id,batch_id,position,window_len) +
-//   `block_table`, so NO host slot_mapping/comp_pos build is needed (the plan is the
-//   MTP-aware / CG-safe source of truth, like flydsl Kernel B / fused_compress). `kv`
-//   is the pre-pooled compressed K [cap, head_dim]; row = pid. ci = position/ratio,
-//   slot_in_block = ci%page_size, physical_block = block_table[batch_id, ci/page_size],
-//   comp_pos = ci*ratio. Sentinel rows (position<0) bail -> CG-safe fixed grid.
+//
+// PLAN_BASED=false: per-token flat slot_mapping + positions (vLLM-style paged write).
+// PLAN_BASED=true: compress path -- resolve paged dest + RoPE position IN-KERNEL from
+//   the SGLang-style `plan` ([cap,4] = ragged_id,batch_id,position,window_len) +
+//   `block_table` (no host slot_mapping/comp_pos build). `kv` is the pre-pooled
+//   compressed K [cap, head_dim]; row = pid. ci = position/ratio, slot_in_block =
+//   ci%page_size, physical_block = block_table[batch_id, ci/page_size], comp_pos =
+//   ci*ratio. Sentinel rows (position<0) bail -> CG-safe fixed grid.
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt,
           bool is_neox, int HEAD_DIM = 512, int PE_DIM = 64,
           int GROUP_SIZE = 64, int TOKENS_PER_BLOCK = 1, bool PLAN_BASED = false,
@@ -5745,16 +5572,9 @@ void fused_kv_norm_rope_group_quant(
   }
 
   // Launch-config heuristic: TOKENS_PER_BLOCK=4 for prefill (matches the QK
-  // coarse kernel), TOKENS_PER_BLOCK=1 for very small T (decode-style). A
-  // single launch per token is enough since there is no Q wave to amortize.
-  //
-  // NOTE: a TPB sweep {1,2,4,8} x T {1k,4k,16k} on MI355 (rocprofv3 kernel
-  // time) showed NO measurable effect -- all TPB land within ~3-5% of each
-  // other and the ranking flips run-to-run (pure shared-box noise). The kernel
-  // is HBM-bandwidth bound and occupancy-saturated (~8 waves/CU) at every TPB,
-  // since __launch_bounds__'s min-blocks arg (512/(TPB*64)) scales inversely
-  // with block size. So this stays at the simple decode=1 / prefill=4 split;
-  // there is nothing to gain from a finer launch heuristic here.
+  // coarse kernel), =1 for very small T (decode-style). A TPB sweep showed no
+  // measurable effect (HBM-bandwidth bound, occupancy-saturated at every TPB),
+  // so this stays at the simple decode=1 / prefill=4 split.
   int num_CUs;
   hipDeviceGetAttribute(&num_CUs, hipDeviceAttributeMultiprocessorCount, kv.device_id);
   // Device wavefront size (64 GFX9 / 32 else), queried at runtime for the block dim.
@@ -5765,12 +5585,9 @@ void fused_kv_norm_rope_group_quant(
       (num_tokens + PREFILL_TOKENS_PER_BLOCK - 1) / PREFILL_TOKENS_PER_BLOCK;
   const bool use_decode_path = (prefill_blocks < MIN_OVERSUBSCRIPTION * num_CUs);
 
-  // Lambda factors out the (kv_dtype, kv_cache_dtype, tokens_per_block)
-  // dispatch from the (head_dim, pe_dim, group_size) compile-time triple.
-  // Captures `kv`, `kv_cache`, etc. for the launch macro. Each call to this
-  // lambda triggers ONE template instantiation per (head_dim, pe_dim,
-  // group_size, kv_dtype, cache_dtype, TPB, is_neox) -- the inner DISPATCH
-  // expands the dtype combos.
+  // Lambda factors the (kv_dtype, kv_cache_dtype, tokens_per_block) dispatch out
+  // from the (head_dim, pe_dim, group_size) compile-time triple; the inner
+  // DISPATCH expands the dtype combos into template instantiations.
   auto launch_for_shape = [&](auto head_dim_tag, auto pe_dim_tag, auto group_size_tag) {
     constexpr int head_dim_val   = decltype(head_dim_tag)::value;
     constexpr int pe_dim_val     = decltype(pe_dim_tag)::value;

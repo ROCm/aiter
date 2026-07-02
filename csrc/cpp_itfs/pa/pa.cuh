@@ -83,8 +83,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
     const auto seq_idx   = blockIdx.x;
     const int num_blocks = max_num_blocks_per_seq * gridDim.x;
-    // NOTE queries with sequence len > 1 are prefills and taken care by another
-    // kernel.
+    // NOTE queries with sequence len > 1 are prefills and taken care by another kernel.
     if(query_start_loc_ptr != nullptr &&
        (query_start_loc_ptr[seq_idx + 1] - query_start_loc_ptr[seq_idx]) != 1)
     {
@@ -154,8 +153,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     // for QK mfma, tokens in multiples of TOKENS_PER_WARP are spread across warps
     // each mfma takes QH16xT16x16HE across warp
     // repeat mfmas across QKHELOOP dimension
-    // output layout from QKmfma : QH16xT4x4 16 qheads across 16 lanes, 16 tokens
-    // across 4 rows x 4 tokens per lane
+    // output layout from QKmfma : QH16xT4x4 16 qheads across 16 lanes, 16 tokens across 4 rows x 4 tokens per lane
 
     const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
     const int last_ctx_block     = num_context_blocks - 1;
@@ -316,8 +314,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     {
         const int vlocal_token_idx =
             vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP + rowid * VTOKENS_PER_LANE;
-        // Safe to use an int32_t here assuming we are working with < 2 billion
-        // tokens
+        // Safe to use an int32_t here assuming we are working with < 2 billion tokens
         const int vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
         const int vblock_idx =
             (vglobal_token_idx < context_len) ? vglobal_token_idx / BLOCK_SIZE : last_ctx_block;
@@ -647,8 +644,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 {
                     if constexpr(LOGITS_RTZ_CONVERSION)
                     {
-                        // use rtz conversion for better performance, with negligible impact on
-                        // accuracy
+                        // use rtz conversion for better performance, with negligible impact on accuracy
                         shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
                                      [rowid] = from_floatx4_rtz<output_t>(
                                          d_out[gqa_ratio_loop][mtp][token_depth]);
@@ -747,8 +743,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                                    vfetch_depth * ELEMS8_ELEMS4_RATIO + i;
                                 const int offset1 = offset % ROWS_PER_WARP;
                                 const int offset2 = offset / ROWS_PER_WARP;
-                                // output format is 16 qheads across 16 lanes, 16 head elems spread
-                                // across 4 rows
+                                // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                                 tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
                                     Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i],
                                     shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
@@ -771,8 +766,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                             const int vlocal_token_idx =
                                 vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
                                 rowid * VTOKENS_PER_LANE;
-                            // Safe to use an int32_t here assuming we are working with < 2 billion
-                            // tokens
+                            // Safe to use an int32_t here assuming we are working with < 2 billion tokens
                             const int vglobal_token_idx =
                                 partition_start_token_idx + vlocal_token_idx;
                             const int v_scale_idx =
@@ -796,8 +790,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                                         j * ELEMS8_ELEMS4_RATIO + i;
                                     const int offset1 = (offset % ROWS_PER_WARP) / 2;
                                     const int offset2 = offset / ROWS_PER_WARP;
-                                    // output format is 16 qheads across 16 lanes, 16 head elems
-                                    // spread across 4 rows
+                                    // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                                     tmp_out_depth = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
                                         reinterpret_cast<_T8x8*>(&Vtmp8x8)->i64,
                                         reinterpret_cast<_T8x8*>(
@@ -914,8 +907,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 {
     const auto MTP     = gridDim.z;
     const auto seq_idx = blockIdx.y;
-    // NOTE queries with sequence len > 1 are prefills and taken care by another
-    // kernel.
+    // NOTE queries with sequence len > 1 are prefills and taken care by another kernel.
     if(query_start_loc_ptr != nullptr &&
        (query_start_loc_ptr[seq_idx + 1] - query_start_loc_ptr[seq_idx] != 1))
     {

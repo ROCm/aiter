@@ -11,8 +11,7 @@ using BlockwiseKernel = std::function<
                   torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, int)>;
 
-// For certain high priority shapes, we directly use the best kernel rather
-// than use heuristics.
+// For certain high priority shapes, we directly use the best kernel rather than use heuristics.
 using BlockwiseKernelMap = std::unordered_map<
     int,
     BlockwiseKernel>;

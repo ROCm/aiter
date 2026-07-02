@@ -9,18 +9,13 @@
 #include <memory>
 #include <unordered_map>
 
-// Debug instrumentation (host prints + post-launch sync/error checks + raw
-// buffer dumps) for the gfx1250 mi400 MLA dispatch is compiled ONLY when
-// ASM_DEBUG is defined (e.g. JIT build with `-DASM_DEBUG`, toggled by
-// AITER_ASM_DEBUG=1). When ASM_DEBUG is not defined, none of the debug code
-// below is compiled, so the normal build performs a pure async launch and is
-// completely unaffected. This mirrors poc_kl/mi400/mla/mla_execute_v3_hip.inl,
-// which keeps its prints and dumps in the C++ host under its own MLA_DEBUG
-// macro. ASM_DEBUG is shared across asm-kernel ports; the stage1 raw buffer
-// dump is additionally gated at runtime by the op-specific
-// AITER_MLA_DEBUG_DUMP_DIR environment variable. Python-only artifacts that
-// the asm kernel never sees (final output, final_lse, token-level kv_indptr)
-// are still dumped from aiter/mla.py.
+// gfx1250 mi400 MLA debug instrumentation (host prints + post-launch sync/error
+// checks + raw buffer dumps) is compiled only when ASM_DEBUG is defined
+// (JIT -DASM_DEBUG, via AITER_ASM_DEBUG=1); the normal build is a pure async
+// launch. ASM_DEBUG is shared across asm-kernel ports; the stage1 buffer dump
+// is additionally runtime-gated by AITER_MLA_DEBUG_DUMP_DIR. Python-only
+// artifacts (final output, final_lse, token-level kv_indptr) are dumped from
+// aiter/mla.py.
 #ifdef ASM_DEBUG
 #include <cstdlib>
 #include <string>
@@ -325,13 +320,10 @@ static void mla_decode_mi400_dispatch(
     constexpr int bdz      = 1;
 
     AITER_CHECK(nhead_kv == 1, __func__, ": only support nhead_kv == 1 for minimal smoke");
-    // Supported gfx1250 mi400 variants, matching hsa/gfx1250/mla/mla_asm.csv and
-    // the poc_kl 1-threadgroup (`1tg`) kernels. Each kernel processes the full
-    // flattened extent M = gqa_ratio * max_seqlen_q in a single workgroup, so
-    // sub_Q == M and the grid is exactly one tile along the M (x) dimension
-    // (mirrors make_launch_geometry() in poc_kl/mi400/mla/mla_helper.h). The CSV
-    // heuristic lookup is keyed by (gqa_ratio, max_seqlen_q), so reject any combo
-    // that has no registered kernel before touching the dispatch path.
+    // Supported gfx1250 mi400 variants (hsa/gfx1250/mla/mla_asm.csv, poc_kl 1tg
+    // kernels). Each kernel handles the full M = gqa_ratio * max_seqlen_q in one
+    // workgroup, so sub_Q == M and the grid is one M-tile. CSV lookup is keyed
+    // by (gqa_ratio, max_seqlen_q); reject unregistered combos up front.
     const bool supported_variant =
         (gqa_ratio == 8 &&
          (max_seqlen_q == 1 || max_seqlen_q == 2 || max_seqlen_q == 3 || max_seqlen_q == 4)) ||
@@ -407,9 +399,8 @@ static void mla_decode_mi400_dispatch(
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
     }
 
-    // gfx1250 mi400 dispatch. qh128 is temporarily left on the legacy 288B ABI
-    // because it is used by e2e. Other gfx1250 private kernels use the new
-    // 120B packed-preload ABI from poc_kl/mi400/mla/mla_execute_v3_hip.inl.
+    // qh128 stays on the legacy 288B ABI (used by e2e); other gfx1250 kernels
+    // use the 120B packed-preload ABI from poc_kl mla_execute_v3_hip.inl.
     const int q_elem_size = Q->element_size();
     const int qk_head_dim = Q->size(2);
     const int q_seq_lens_kernel = max_seqlen_q * gqa_ratio;

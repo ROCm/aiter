@@ -152,16 +152,9 @@ namespace vllm
   //   }
   // }
 
-  /* Converter structs for the conversion from torch types to HIP/CUDA types,
-     and the associated type conversions within HIP/CUDA. These helpers need
-     to be implemented for now because the relevant type conversion
-     operators/constructors are not consistently implemented by HIP/CUDA, so
-     a generic conversion via type casts cannot be implemented.
-
-     Each struct should have the member static constexpr bool `exists`:
-     If false, the optimized kernel is not used for the corresponding torch type.
-     If true, the struct should be fully defined as shown in the examples below.
-   */
+  /* Converter structs mapping torch types to HIP/CUDA types + the conversions, needed because HIP/CUDA conversion
+     ops aren't consistent enough for a generic cast. Each struct has `static constexpr bool exists`: if false the
+     optimized kernel is skipped for that torch type; if true, define it fully as in the examples below. */
   template <typename torch_type>
   struct _typeConvert
   {
@@ -223,16 +216,14 @@ namespace vllm
 #endif // defined(USE_ROCM) || (defined(CUDA_VERSION) && (CUDA_VERSION >=
        // 12000))
 
-  /* Vector POD struct to generate vectorized and packed FP16/BF16 ops
-     for appropriate specializations of fused_add_rms_norm_kernel.
-     Only functions that are necessary in that kernel are implemented.
-     Alignment to 16 bytes is required to use 128-bit global memory ops.
-   */
+  /* Vector POD struct to generate vectorized and packed FP16/BF16 ops for appropriate specializations of
+     fused_add_rms_norm_kernel. Only functions that are necessary in that kernel are implemented. Alignment to 16
+     bytes is required to use 128-bit global memory ops. */
   template <typename scalar_t, int width>
   struct alignas(16) _f16Vec
   {
-    /* Not theoretically necessary that width is a power of 2 but should
-       almost always be the case for optimization purposes */
+    /* Not theoretically necessary that width is a power of 2 but should almost always be the case for optimization
+       purposes */
     static_assert(width > 0 && (width & (width - 1)) == 0,
                   "Width is not a positive power of 2!");
     using Converter = _typeConvert<scalar_t>;
@@ -336,10 +327,7 @@ namespace vllm
     }
   };
 
-  /* Function specialization in the case of FP16/BF16 tensors.
-     Additional optimizations we can make in this case are
-     packed and vectorized operations, which help with the
-     memory latency bottleneck. */
+  /* FP16/BF16 specialization: packed + vectorized ops for the memory-latency bottleneck. */
   template <typename scalar_t, int width>
   __global__ std::enable_if_t<(width > 0) && _typeConvert<scalar_t>::exists>
   fused_add_rms_norm_kernel(
@@ -355,9 +343,8 @@ namespace vllm
     const int vec_hidden_size = hidden_size / width;
     __shared__ float s_variance;
     float variance = 0.0f;
-    /* These and the argument pointers are all declared `restrict` as they are
-       not aliased in practice. Argument pointers should not be dereferenced
-       in this kernel as that would be undefined behavior */
+    /* These and the argument pointers are all declared `restrict` as they are not aliased in practice. Argument
+       pointers should not be dereferenced in this kernel as that would be undefined behavior */
     auto *__restrict__ input_v =
         reinterpret_cast<_f16Vec<scalar_t, width> *>(input);
     auto *__restrict__ residual_v =
@@ -435,10 +422,7 @@ namespace vllm
     }
   }
 
-  /* Function specialization in the case of FP16/BF16 tensors.
-     Additional optimizations we can make in this case are
-     packed and vectorized operations, which help with the
-     memory latency bottleneck. */
+  /* FP16/BF16 specialization: packed + vectorized ops for the memory-latency bottleneck. */
 
   // template <>
   // struct Vec<c10::Float8_e4m3fnuz, 8> {
@@ -609,21 +593,14 @@ void fused_add_rms_norm(torch::Tensor &input,    // [..., hidden_size]
   int num_tokens = input.numel() / hidden_size;
 
   dim3 grid(num_tokens);
-  /* This kernel is memory-latency bound in many scenarios.
-     When num_tokens is large, a smaller block size allows
-     for increased block occupancy on CUs and better latency
-     hiding on global mem ops. */
+  /* Memory-latency bound: for large num_tokens a smaller block size raises CU occupancy and improves global-mem
+     latency hiding. */
   const int max_block_size = (num_tokens < 256) ? 1024 : 256;
   dim3 block(std::min(hidden_size, max_block_size));
   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
   const hipStream_t stream = at::hip::getCurrentHIPStream();
-  /*If the tensor types are FP16/BF16, try to use the optimized kernel
-    with packed + vectorized ops.
-    Max optimization is achieved with a width-8 vector of FP16/BF16s
-    since we can load at most 128 bits at once in a global memory op.
-    However, this requires each tensor's data to be aligned to 16
-    bytes.
-   */
+  /* For FP16/BF16, use the packed+vectorized kernel. Width-8 vectors are optimal (128-bit global loads) but require
+     16-byte-aligned data. */
   auto inp_ptr = reinterpret_cast<std::uintptr_t>(input.data_ptr());
   auto res_ptr = reinterpret_cast<std::uintptr_t>(residual.data_ptr());
   auto wt_ptr = reinterpret_cast<std::uintptr_t>(weight.data_ptr());

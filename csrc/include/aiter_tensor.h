@@ -28,12 +28,9 @@ struct aiter_tensor_t
 
     bool is_contiguous() const
     {
-        // Match PyTorch semantics: an empty tensor has no elements to access,
-        // so stride values are irrelevant and it is always considered
-        // contiguous. Without this special case, a 1-D tensor of shape [0]
-        // whose stride happens not to be 1 (e.g. an empty slice carved out of
-        // a larger non-unit-stride buffer) would be rejected by callers that
-        // only need stride==1 when numel>0.
+        // Match PyTorch: an empty tensor (numel==0) is always contiguous since
+        // strides are irrelevant with no elements to access. Without this, an
+        // empty tensor with a non-unit stride would be wrongly rejected.
         if(numel_ == 0)
             return true;
         int64_t expected = 1;

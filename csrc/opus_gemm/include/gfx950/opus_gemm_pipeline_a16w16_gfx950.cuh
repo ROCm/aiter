@@ -8,10 +8,8 @@
 
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
 
-// ============================================================================
-// Layout functions for noscale kernels (TILE/WAVE from Traits)
-// Guarded: these are __device__ functions only needed on the device pass.
-// ============================================================================
+// Layout functions for noscale kernels (TILE/WAVE from Traits).
+// __device__-only: guarded to the device pass.
 
 #ifdef __HIP_DEVICE_COMPILE__
 
@@ -156,10 +154,8 @@ inline __device__ auto make_layout_rb_noscale(int lane_id, int wave_id_n) {
 
 #endif // __HIP_DEVICE_COMPILE__ (layout functions)
 
-// ============================================================================
 // Cache policy (cpol/aux) bits — matches LLVM AMDGPU::CPol in SIDefines.h
 // Hardware mapping: GLC→SC0, SLC→NT, SCC→SC1 (see CDNA4 ISA Table 49/50)
-// ============================================================================
 #define CPOL_DEFAULT      0                       // all zero → L1 Hit LRU, L2 Hit LRU
 #define CPOL_GLC          1                       // bit0: GLC → SC0 (scope: group)
 #define CPOL_SLC          2                       // bit1: SLC → NT  (non-temporal)
@@ -174,22 +170,17 @@ inline __device__ auto make_layout_rb_noscale(int lane_id, int wave_id_n) {
 #define CPOL_BYPASS_L2    CPOL_SC0_SC1            // alias: L2 Coherent Bypass for loads
 #define CPOL_STORE_NT     CPOL_SC0_NT             // alias: non-temporal store
 
-// ============================================================================
-// BF16 noscale GEMM kernel (a16w16)
+// BF16 noscale GEMM kernel (a16w16).
 // Kernel definition visible on both passes (host pass needs it for stub generation).
-// ============================================================================
 
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus_gemm_noscale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
-    // Real kernel body. Non-gfx950 device passes drop into the empty #else
-    // branch below so multi-arch wheels (e.g. GPU_ARCHS='gfx942;gfx950')
-    // compile cleanly without pulling in MFMA / ds_read_b64_tr / 160 KiB
-    // LDS intrinsics that don't exist on other archs. The Python import
-    // guard (aiter/ops/opus/_arch.py) plus the host arch router in
-    // opus_gemm.cu prevent runtime dispatch from ever reaching the empty
-    // stub, so the unreachable case stays unreachable.
+    // Real kernel body. Non-gfx950 device passes take the empty #else so
+    // multi-arch wheels compile without gfx950-only intrinsics; the Python
+    // import guard (aiter/ops/opus/_arch.py) + host arch router in
+    // opus_gemm.cu keep the stub unreachable at runtime.
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
@@ -215,12 +206,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         int tid_per_group = W * num_tiles_n;
         int limit = (total_wgs / blocks_per_cycle) * blocks_per_cycle;
         if (xy >= limit) {
-            // Swizzle covers new_xy ∈ [0, limit) contiguously. Within that,
-            // (limit / tid_per_group) groups are full; the remainder lands in
-            // a partial last group covering (covered_cols) complete tn
-            // columns. The original fallback `xy/num_tiles_n` jumps row-major
-            // from xy without accounting for those holes, dropping the
-            // (partial_first_row..end, covered_cols..num_tiles_n) rectangle.
+            // Swizzle covers new_xy ∈ [0, limit) contiguously: full groups
+            // plus a partial last group of covered_cols complete tn columns.
+            // Row-major `xy/num_tiles_n` ignores those holes and would drop
+            // the (partial_first_row..end, covered_cols..num_tiles_n) rectangle.
             int full_groups = limit / tid_per_group;
             int covered_cols = (limit - full_groups * tid_per_group) / W;
             int partial_first_row = full_groups * W;
@@ -528,13 +517,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         return half_tile_m * T::HALF_B_M * kargs.stride_c + half_tile_n * T::HALF_B_N;
     };
 
-    // ── HAS_BIAS prefetch ─────────────────────────────────────────────────
-    // Bias is per-output-feature [N] (F.linear convention). u_gc_n already
-    // maps each VEC_C chunk to its N offset, so we use it as the bias gmem
-    // layout: load<VEC_C>(g_bias, u_gc_n, offset) fetches exactly the bias
-    // values that align 1:1 with vc elements. Bias only depends on N, so
-    // half_tile_m=0 and half_tile_m=1 share the same bias; we prefetch 2
-    // vectors (one per half_tile_n) and reuse across the M halves.
+    // HAS_BIAS prefetch. Bias is per-output-feature [N] (F.linear); u_gc_n
+    // maps each VEC_C chunk to its N offset, so it doubles as the bias gmem
+    // layout (values align 1:1 with vc). Bias depends only on N, so we
+    // prefetch 2 vectors (one per half_tile_n) and reuse across the M halves.
     using D_BIAS_ = typename T::D_BIAS;
     using VC_T = typename decltype(mma)::vtype_c;
     constexpr index_t BIAS_ELEM_ = opus::size<VC_T>();

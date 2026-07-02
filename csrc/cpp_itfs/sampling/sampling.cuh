@@ -1029,9 +1029,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
     do
     {
         temp_storage.sampled_id = d;
-        // Initialize last_valid_id: when no thread satisfies the predicate
-        // (e.g. NaN/all-zero row), max_valid stays -1 and the writer below is
-        // skipped, so the fallback would read uninitialized shared memory.
+        // Initialize last_valid_id: when no thread satisfies the predicate (e.g. NaN/all-zero row),
+        // max_valid stays -1 and the writer below is skipped, so the fallback would read uninitialized shared memory.
         if (tx == 0) temp_storage.last_valid_id = 0;
         __syncthreads();
         float u   = hiprand_uniform(&state) * q;
@@ -1066,8 +1065,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs,
             temp_storage.last_valid_id = max_valid;
         }
         __syncthreads();
-        // NOTE: this would happen when u is very close to 1
-        // and the sum of probabilities is smaller than u
+        // NOTE: this would happen when u is very close to 1 and the sum of probabilities is smaller than u
         sampled_id = temp_storage.sampled_id;
         if(sampled_id == d)
         {
@@ -1189,9 +1187,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
     do
     {
         temp_storage.sampled_id = d;
-        // Initialize last_valid_id: when no thread satisfies the predicate
-        // (e.g. NaN/all-zero row), max_valid stays -1 and the writer below is
-        // skipped, so the fallback would read uninitialized shared memory.
+        // Initialize last_valid_id: when no thread satisfies the predicate (e.g. NaN/all-zero row),
+        // max_valid stays -1 and the writer below is skipped, so the fallback would read uninitialized shared memory.
         if (tx == 0) temp_storage.last_valid_id = 0;
         __syncthreads();
         float u   = hiprand_uniform(&state) * q;
@@ -1226,8 +1223,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs,
             temp_storage.last_valid_id = max_valid;
         }
         __syncthreads();
-        // NOTE: this would happen when u is very close to 1
-        // and the sum of probabilities is smaller than u
+        // NOTE: this would happen when u is very close to 1 and the sum of probabilities is smaller than u
         sampled_id = temp_storage.sampled_id;
         if(sampled_id == d)
         {

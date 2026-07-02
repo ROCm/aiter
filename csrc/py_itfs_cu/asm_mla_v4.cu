@@ -3,8 +3,8 @@
 //
 // v4 MLA decode dispatcher (mi350 nm-recompile family).
 //
-// This is a peer of csrc/py_itfs_cu/asm_mla.cu but targets the v4 18-slot
-// kernarg ABI which is *binary incompatible* with v3's 14-slot layout:
+// Peer of asm_mla.cu but targets the v4 18-slot kernarg ABI, binary
+// incompatible with v3's 14-slot layout:
 //
 //   slot 8  = raw gqa_ratio          (not s_MQA = gqa_ratio*max_seqlen_q)
 //   slot 9  = num_kv_splits          (== poc_kl `passes`)
@@ -15,12 +15,11 @@
 //   slot 16 = ptr_QROPE              -- NEW
 //   slot 17 = ptr_KVROPE             -- NEW
 //
-// scalar is hardcoded to 1/sqrt(kV4DimNope + kV4DimRope) = 1/sqrt(512),
-// independent of head_size (the dispatcher's softmax_scale arg is kept for
-// API parity but the kernel itself ignores it).
+// scalar is hardcoded to 1/sqrt(kV4DimNope+kV4DimRope) = 1/sqrt(512); the
+// dispatcher's softmax_scale arg is kept for API parity but ignored.
 //
-// All kernel selection is driven by hsa/gfx950/mla_v4/mla_v4_asm.csv via
-// hsa/codegen.py -m mla_v4 -> asm_mla_v4_configs.hpp -> cfg_mla_v4_asm.
+// Kernel selection driven by hsa/gfx950/mla_v4/mla_v4_asm.csv via codegen ->
+// asm_mla_v4_configs.hpp -> cfg_mla_v4_asm.
 
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
@@ -32,21 +31,16 @@
 #include <cstdlib>
 #include <string>
 
-// Per-.so TLS error storage + aiter_get_last_error / aiter_clear_last_error
-// exports. Required so that AITER_CHECK failures in our dispatcher surface as
-// RuntimeError in Python instead of aborting the worker process.
+// Per-.so TLS error storage + aiter_get_last_error/clear exports, so
+// AITER_CHECK failures surface as a Python RuntimeError instead of aborting.
 AITER_CTYPES_ERROR_DEF
 
-// ----------------------------------------------------------------------------
-// 19-slot kernarg buffer (304 bytes).verified by
+// 19-slot kernarg buffer (304 bytes); verified by
 // op_tests/test_mla_v4_nm.py::test_v4_nm_kernarg_scalar_slots.
-//
-// `ptr_sink` (slot 18, byte offset 0x120) is the attention-sink logit
-// pointer. Pass `torch.full((num_heads,), -inf)` for "no sink"
-// math (exp(-inf - max) = 0 → no contribution); the wrapper does NOT
-// substitute a -1e9 sentinel for you — pure -inf works because the kernel
-// writes its running max in fp32 with no rescaling at the sink merge site.
-// ----------------------------------------------------------------------------
+// ptr_sink (slot 18, off 0x120) is the attention-sink logit pointer. Pass
+// torch.full((num_heads,), -inf) for "no sink" (exp(-inf-max)=0); pure -inf
+// works since the kernel keeps its running max in fp32 with no rescale at the
+// sink merge site.
 struct __attribute__((packed)) MlaV4KernelArgs
 {
     void *ptr_R;          p2 _p_r;     // 0:  splitData (logits) [FP32]
@@ -76,25 +70,16 @@ static_assert(offsetof(MlaV4KernelArgs, ptr_sink) == 0x120,
               "ptr_sink must land at kernarg byte offset 0x120 "
               "(matches 3_13.s `s_load_dwordx2 s[..], s[0:1], 0x120`)");
 
-// ----------------------------------------------------------------------------
-// kV4DimNope + kV4DimRope = 448 + 64 = 512. The kernel hardcodes
-// 1/sqrt(512) as its softmax pre-scale. Keep the constant here so the
-// dispatcher and the regression test agree without #include'ing poc_kl.
-// ----------------------------------------------------------------------------
+// kV4DimNope + kV4DimRope = 448 + 64 = 512; kernel hardcodes 1/sqrt(512) as its
+// softmax pre-scale. Kept here so dispatcher and regression test agree without
+// #include'ing poc_kl.
 static constexpr int kV4DimNope = 448;
 static constexpr int kV4DimRope = 64;
 
-// ----------------------------------------------------------------------------
-// Kernel selection — mirrors csrc/py_itfs_cu/asm_mla.cu::get_heuristic_kernel_mla
-// 1:1 in key set so v3 and v4 stay structurally identical.
-//
-// Lookup keys: (qType, kvType, Gqa, ps, qSeqLen, prefill, causal, lse).
-// `sub_Q` and `page_size` are NOT keys — sub_Q is derived in the dispatcher
-// (see the V3-style decision tree below) and page_size comes from KV->size(1).
-//
-// `num_kv_splits` ("passes") is also NOT a key — the .co supports any value
-// at runtime via slot 9 of the kernarg packet (mirrors poc_kl `params.passes`).
-// ----------------------------------------------------------------------------
+// Kernel selection — mirrors asm_mla.cu::get_heuristic_kernel_mla key set.
+// Lookup keys: (qType, kvType, Gqa, ps, qSeqLen, prefill, causal, lse). sub_Q
+// (derived below) and page_size (KV->size(1)) are NOT keys; num_kv_splits is
+// also NOT a key (runtime via slot 9).
 static std::string get_heuristic_kernel_mla_v4(const std::string& q_type,
                                                const std::string& kv_type,
                                                int gqa,
@@ -136,19 +121,12 @@ static std::string get_heuristic_kernel_mla_v4(const std::string& q_type,
     return "";
 }
 
-// ----------------------------------------------------------------------------
 // AITER_C_ITFS entry — exposed to Python via
-//   aiter/ops/attention.py::mla_decode_v4_asm  (@compile_ops ffi_type=ctypes)
-//
-// Mirrors mla_decode_stage1_asm_fwd in asm_mla.cu shape-wise but writes
-// the v4 nm 18-slot kernarg layout. Q/KV/output are aiter_tensor_t* (NOT
-// torch::Tensor) — see csrc/include/aiter_tensor.h for the C-friendly POD.
-//
-// Wrapped in AITER_CTYPES_DEFINE_ENTRYPOINT_VOID so that AITER_CHECK / HIP_CALL
-// failures (e.g. unsupported variant lookup, dtype mismatch) surface as a
-// clean Python RuntimeError via the aiter_get_last_error TLS bridge instead
-// of std::abort()-ing the worker process.
-// ----------------------------------------------------------------------------
+// aiter/ops/attention.py::mla_decode_v4_asm (@compile_ops ffi_type=ctypes).
+// Mirrors mla_decode_stage1_asm_fwd shape-wise but writes the v4 nm kernarg
+// layout; tensors are aiter_tensor_t* (see aiter_tensor.h). Wrapped in
+// AITER_CTYPES_DEFINE_ENTRYPOINT_VOID so AITER_CHECK/HIP_CALL failures surface
+// as a Python RuntimeError instead of aborting the worker.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     mla_decode_v4_asm,
     (aiter_tensor_t* Q,                  // [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
@@ -202,13 +180,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const float   scalar_f    = 1.0f / std::sqrt(static_cast<float>(qk_elem_dim));
     const unsigned int log2_page   = static_cast<unsigned int>(__builtin_ctz(page_size));
 
-    // ---- Dead kernarg slots ---------------------------------------------------
-    // Disassembling slot 10 (s_total_kv) at offset 0xA0 and slot 11 (s_stride_page) at
-    // offset 0xB0 are NEVER read. They were carried over from earlier kernel
-    // variants for ABI parity; computing s_total_kv used to require a per-call
-    // 4-byte D2H readback of `kv_indptr[-1]` plus `hipStreamSynchronize`,
-    // which created a host-side stall that cost ~5-7us on every launch.
-    //
+    // Dead kernarg slots: slot 10 (s_total_kv, 0xA0) and slot 11 (s_stride_page,
+    // 0xB0) are never read; kept only for ABI parity. Leaving s_total_kv unset
+    // also avoids a per-call D2H readback of kv_indptr[-1] + stream sync.
     MlaV4KernelArgs args = {};
     size_t arg_size = sizeof(args);
     args.ptr_R          = splitData->data_ptr();
@@ -249,14 +223,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     else
         AITER_CHECK(false, __func__, ": unsupport KV dtype:", AiterDtype_to_str(kv_dtype));
 
-    // ------------------------------------------------------------------
-    // V3-style per-shape heuristic. Mirrors the decision tree in
-    // csrc/py_itfs_cu/asm_mla.cu (~lines 272-318) for gqa_ratio=16 fp8;
-    // produces a `sub_Q` (per-WG Q tile, used in grid math) and a
-    // `config_max_seqlen_q` (padded qseq used as CSV lookup key against
-    // `qSeqLen`). v4 nm ships exactly one variant today; the heuristic
-    // mirrors V3's structure so adding future variants is mechanical.
-    // ------------------------------------------------------------------
+    // V3-style per-shape heuristic (mirrors asm_mla.cu). Produces sub_Q (per-WG
+    // Q tile, for grid math) and config_max_seqlen_q (padded qseq CSV key). v4
+    // nm ships one variant today; structure mirrors V3 for future variants.
     int sub_Q               = 64;            // default (matches V3 default)
     int config_max_seqlen_q = max_seqlen_q;
     int ps                  = 0;              // v4 nm always non-persistent today
@@ -312,16 +281,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         }
     }
 
-    // ---- CSV lookup-key normalization ---------------------------------------
-    // v4 nm ships ONE kernel binary (the 32n-tile .co, symbol
-    // mla_a8w8_qh64_qseqlen1_gqaratio64_nm). Its 64 q-row tile satisfies the
-    // invariant `gqa * q_seq_logical = 64`, so it serves all three shipped
-    // entry points: (gqa=16, qSeqLen=4), (gqa=64, qSeqLen=1) and (gqa=128,
-    // qSeqLen=1). The CSV carries a single (Gqa=64, qSeqLen=1) row; normalize
-    // every supported (gqa, qSeqLen) caller to that lookup key here. `sub_Q`
-    // and the per-launch grid geometry stay set to the gqa-correct values from
-    // the heuristic above — this remap only picks which CSV row (== which .co)
-    // to load.
+    // CSV lookup-key normalization. v4 nm ships ONE .co
+    // (mla_a8w8_qh64_qseqlen1_gqaratio64_nm); its 64 q-row tile satisfies
+    // gqa*q_seq_logical=64, serving (gqa=16,qseq=4), (gqa=64,qseq=1) and
+    // (gqa=128,qseq=1). CSV has one (Gqa=64,qSeqLen=1) row; remap those callers
+    // to it. sub_Q and grid geometry keep their gqa-correct heuristic values —
+    // this only picks which .co to load.
     int csv_gqa     = gqa_ratio;
     int csv_qseqlen = config_max_seqlen_q;
     if(q_type == "fp8" && kv_type == "fp8" &&
@@ -366,9 +331,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int gdy = num_seqs;
     const int gdz = num_kv_splits;
 
-    // ----- DEBUG: env-gated 304B kernarg dump for cross-check vs poc_kl. -----
-    // Used by op_tests/test_mla_v4_nm.py::test_v4_nm_kernarg_scalar_slots to
-    // lock in the 19-slot layout. Has no runtime cost when env unset.
+    // DEBUG: env-gated 304B kernarg dump for cross-check vs poc_kl (used by
+    // test_v4_nm_kernarg_scalar_slots). No runtime cost when env unset.
     if(const char* dbg = std::getenv("AITER_V4_NM_DUMP_KERNARG"))
     {
         if(dbg[0] == '1')

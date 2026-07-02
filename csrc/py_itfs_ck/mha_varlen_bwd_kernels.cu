@@ -165,9 +165,8 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
     };
 
     // Pinned host buffer allocator backed by PyTorch's CachingHostAllocator.
-    // The returned shared_ptr owns the at::Tensor; aiter holds it alive via a
-    // stream-tail hipLaunchHostFunc keepalive so the buffer is not recycled
-    // while async D2H/H2D copies are still in flight on the stream.
+    // The returned shared_ptr owns the at::Tensor; aiter holds it alive via a stream-tail hipLaunchHostFunc keepalive
+    // so the buffer is not recycled while async D2H/H2D copies are still in flight on the stream.
     auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
         auto t = std::make_shared<at::Tensor>(torch::empty(
             {static_cast<int64_t>(bytes)},

@@ -32,9 +32,8 @@ struct opus_gemm_a8w8_noscale_traits_gfx950 {
     static constexpr int T_N = 4;
     static constexpr int T_K = 1;
 
-    // a8w8 is gfx950-only (wave64). On a non-gfx950 device pass the kernel
-    // body is stubbed out, but the traits struct is still instantiated for the
-    // host launcher; skip the wave-size invariant there (gfx1250 is wave32).
+    // a8w8 is gfx950-only (wave64). On a non-gfx950 device pass the kernel body is stubbed out, but the traits struct
+    // is still instantiated for the host launcher; skip the wave-size invariant there (gfx1250 is wave32).
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)
     static_assert(BLOCK_SIZE / opus::get_warp_size() == T_M * T_N * T_K);
 #endif
@@ -74,9 +73,8 @@ struct opus_gemm_a8w8_noscale_traits_gfx950 {
 
 #ifndef OPUS_GEMM_NOSCALE_KARGS_GFX950_DEFINED
 #define OPUS_GEMM_NOSCALE_KARGS_GFX950_DEFINED
-// Shared kargs struct: must match the definition in
-// opus_gemm_traits_a16w16_gfx950.cuh exactly. The bias fields exist for the a16w16
-// split-barrier HAS_BIAS path; a8w8 launchers always pass nullptr / 0.
+// Shared kargs struct: must match the definition in opus_gemm_traits_a16w16_gfx950.cuh exactly. The bias fields exist
+// for the a16w16 split-barrier HAS_BIAS path; a8w8 launchers always pass nullptr / 0.
 struct opus_gemm_noscale_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;

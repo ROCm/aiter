@@ -326,14 +326,8 @@ __inline__ __device__ bf16_8_t vec_conversion<bf16_8_t, Float8_>(const Float8_& 
     return b;
 }
 
-/* Scaled and vectorized conversions, for data exchange between high and low
-   precision domains
-
-   Convention of the scale in API, e.g: FP8_data = Quantization(
-   High_Precision_data / scale ) s.t. Quantize(HP / scale) => FP8 Dequant(FP8) *
-   scale =>  HP
-
- */
+/* Scaled, vectorized conversions between high/low precision domains.
+   Scale convention: quantize FP8 = HP / scale; dequantize HP = FP8 * scale. */
 
 // fp8 -> half
 template <>
@@ -732,10 +726,8 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale)
     return {}; // Squash missing return statement warning
 }
 
-// The following macro is used to dispatch the conversion function based on
-// the data type of the key and value cache. The FN is a macro that calls a
-// function with template<typename scalar_t, typename cache_t,
-// Fp8KVCacheDataType kv_dt>.
+// Dispatch the conversion by kv-cache dtype. FN is a macro taking
+// template<typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>.
 #define DISPATCH_BY_KV_CACHE_DTYPE(SRC_DTYPE, KV_DTYPE, FN)                              \
     if(KV_DTYPE == "auto")                                                               \
     {                                                                                    \

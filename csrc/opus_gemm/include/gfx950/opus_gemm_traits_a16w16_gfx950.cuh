@@ -8,14 +8,12 @@
 //     Split-barrier pipeline used by opus_gemm_pipeline_a16w16_gfx950.cuh.
 //     Configurable TILE (T_M, T_N, T_K) and WAVE (W_M, W_N, W_K). 4-tuple DTYPE.
 //     HAS_BIAS / D_BIAS default off so existing instantiations remain valid.
-//     When HAS_BIAS=true the kernel reads kargs.ptr_bias as a D_BIAS* vector
-//     along N (shape [N] or [batch, N]; F.linear convention; selected via
-//     kargs.stride_bias_batch).
+//     When HAS_BIAS=true the kernel reads kargs.ptr_bias as a D_BIAS* vector along N (shape [N] or [batch, N]; F.linear
+//     convention; selected via kargs.stride_bias_batch).
 //
 //   opus_gemm_a16w16_flatmm_traits_gfx950<..., MFMA, WG_PER_CU, HAS_BIAS>
-//     4-wave warp-specialized pipeline (2 producer + 2 consumer) used by
-//     opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh. Derives prefetch depth dynamically
-//     from the LDS budget. Locked T_M=2/T_N=1/T_K=1. 5-tuple DTYPE.
+//     4-wave warp-specialized pipeline (2 producer + 2 consumer) used by opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh.
+//     Derives prefetch depth dynamically from the LDS budget. Locked T_M=2/T_N=1/T_K=1. 5-tuple DTYPE.
 //     Ported from gcnasm/opus_fmm/flatmm_a16w16_4wave_wasp.cc.
 //
 //   opus_flatmm_splitk_traits_gfx950<..., MFMA, WG_PER_CU, HAS_BIAS, HAS_OOB>
@@ -27,16 +25,13 @@
 //     M-outer + N-fast XCD swizzle persistent pipeline.
 //
 //   opus_gemm_a16w16_mono_tile_traits_gfx950<..., DTYPE, VEC>
-//     Single-MMA-per-K mono-tile pipeline. Locked geometry (T_M=2, T_N=4,
-//     T_K=1, W=16x16x32, VEC=8, BLOCK_SIZE=512). Divisible-only; no HAS_BIAS
-//     / HAS_OOB template parameters.
+//     Single-MMA-per-K mono-tile pipeline. Locked geometry (T_M=2, T_N=4, T_K=1, W=16x16x32, VEC=8, BLOCK_SIZE=512).
+//     Divisible-only; no HAS_BIAS / HAS_OOB template parameters.
 #pragma once
 
 #include "../opus_gemm_utils.cuh"
 
-// ============================================================================
 // Split-barrier a16w16 traits
-// ============================================================================
 
 template<int BLOCK_SIZE_,
         typename BLOCK_,
@@ -126,9 +121,8 @@ struct opus_gemm_a16w16_traits_gfx950 {
 
 #ifndef OPUS_GEMM_NOSCALE_KARGS_GFX950_DEFINED
 #define OPUS_GEMM_NOSCALE_KARGS_GFX950_DEFINED
-// Shared kargs struct between a16w16 split-barrier and a8w8 noscale launchers.
-// Must match the definition in opus_gemm_traits_a8w8_noscale.cuh exactly
-// (header-include order chooses which TU gets the canonical definition).
+// Shared kargs struct between a16w16 split-barrier and a8w8 noscale launchers. Must match the definition in
+// opus_gemm_traits_a8w8_noscale.cuh exactly (header-include order chooses which TU gets the canonical definition).
 //
 // bias fields:
 //   ptr_bias          : null when HAS_BIAS=false; otherwise points to D_BIAS
@@ -159,14 +153,9 @@ struct opus_gemm_noscale_kargs_gfx950 {
 };
 #endif
 
-// ============================================================================
-// Flatmm a16w16 traits (4-wave warp-specialized pipeline)
-// ============================================================================
-//
-// 7 template parameters: BLOCK_SIZE, BLOCK, DTYPE, VEC, MFMA, WG_PER_CU, HAS_BIAS.
-// The flatmm pipeline uses a warp-specialized 2 producer + 2 consumer layout
-// (not split-barrier), requires T_M=2/T_N=1/T_K=1, and derives prefetch depth
-// dynamically from the LDS budget.
+// Flatmm a16w16 traits (4-wave warp-specialized pipeline). 7 template params: BLOCK_SIZE, BLOCK, DTYPE, VEC, MFMA,
+// WG_PER_CU, HAS_BIAS. Warp-specialized 2 producer + 2 consumer layout (not split-barrier); requires T_M=2/T_N=1/T_K=1;
+// prefetch depth derived from the LDS budget.
 
 template<int BLOCK_SIZE_,   // workgroup size (locked to 256 for 4 waves)
         typename BLOCK_,    // opus::seq<B_M, B_N, B_K>
@@ -247,11 +236,9 @@ struct opus_gemm_a16w16_flatmm_traits_gfx950 {
 
     static constexpr bool HAS_BIAS = HAS_BIAS_;
 
-    // Compact LDS pixels for one async group_load. smem_sub is defined per
-    // LOAD_GROUP_K (not B_K): one group_load copies LOAD_GROUP_M * LOAD_GROUP_K
-    // pixels into an independent LDS block regardless of B_K. When
-    // B_K > LOAD_GROUP_K multiple LDS blocks are stacked along the K-group
-    // axis (see NUM_LOAD_GROUPS_PER_BK above).
+    // Compact LDS pixels for one async group_load. smem_sub is defined per LOAD_GROUP_K (not B_K): one group_load
+    // copies LOAD_GROUP_M * LOAD_GROUP_K pixels into an independent LDS block regardless of B_K. When B_K >
+    // LOAD_GROUP_K multiple LDS blocks are stacked along the K-group axis (see NUM_LOAD_GROUPS_PER_BK above).
     static_assert(VEC_A == 16 / sizeof(D_A));
     static constexpr int smem_linear_wave_per_async_load = opus::get_warp_size() * 16 / sizeof(D_A);
     static constexpr int smem_sub = smem_linear_wave_per_async_load / LOAD_GROUP_K;
@@ -259,30 +246,14 @@ struct opus_gemm_a16w16_flatmm_traits_gfx950 {
     static constexpr int smem_padding = (W_M >= 32) ? 16 / sizeof(D_A) : 2 * 16 / sizeof(D_A);
     static constexpr int smem_per_group_load_size = slots * (smem_linear_wave_per_async_load + smem_padding) * sizeof(D_A);
 
-    // Dynamic prefetch K to fill LDS within WG_PER_CU budget.
-    // Hardcoded gfx950 LDS size (160 KiB = 163840 B). Cannot use
-    // opus::get_smem_size() here because it's guarded by __gfx950__ which is
-    // only defined on the device pass; host pass would see 65536 and cause
-    // pfk<3 and break static_asserts.
+    // Dynamic prefetch K to fill LDS within WG_PER_CU budget. gfx950 LDS size hardcoded (160 KiB = 163840 B):
+    // opus::get_smem_size() is __gfx950__-gated (device pass only), so the host pass would see 65536 -> pfk<3 and break
+    // the static_asserts.
     //
-    // All aiter a16w16 kernels are gfx950-only today. Three-layer enforcement:
-    //   1. Python: aiter/ops/opus/__init__.py calls _arch._detect_arch({"gfx950"})
-    //      at import time. On non-gfx950 the import still succeeds (so it
-    //      cannot break the surrounding `from aiter.ops.opus import *` in
-    //      aiter/__init__.py) but gemm_a16w16_opus / opus_gemm_a16w16_tune
-    //      are replaced with stubs that raise RuntimeError on call, plus a
-    //      one-shot RuntimeWarning at import. Helper is reusable for future
-    //      opus submodules with different supported sets.
-    //   2. Host:   opus_dispatch_a16w16<T> / opus_a16w16_tune_dispatch<T> in
-    //      opus_gemm.cu are arch routers built on opus_get_gfx_arch(). Only
-    //      the gfx950 branch is wired up today (delegates to
-    //      opus_dispatch_a16w16_gfx950<T>); other archs return TORCH_CHECK
-    //      fail with a 'pipeline TBD' message. Future archs are added by
-    //      extending OpusGfxArch + adding a per-arch dispatch function.
-    //   3. Device: each __global__ kernel body wraps real code in
-    //      #if defined(__gfx950__) so non-gfx950 device passes (in multi-arch
-    //      wheels like GPU_ARCHS='gfx942;gfx950') compile to an empty stub.
-    //      Combined with layer 1/2 the empty stub is unreachable at runtime.
+    // aiter a16w16 is gfx950-only, enforced in three layers: (1) Python import guard (aiter/ops/opus/__init__.py) stubs
+    // the entrypoints on non-gfx950; (2) host arch routers (opus_dispatch_a16w16 / opus_a16w16_tune_dispatch in
+    // opus_gemm.cu) only wire gfx950; (3) device kernel bodies wrapped in #if defined(__gfx950__) so other archs
+    // compile to unreachable stubs.
     static constexpr int WG_PER_CU = WG_PER_CU_;
     static constexpr int LDS_SIZE_TOTAL = 163840;
     static constexpr int max_lds_size_per_wg = LDS_SIZE_TOTAL / WG_PER_CU_;
@@ -308,8 +279,7 @@ struct opus_gemm_a16w16_flatmm_traits_gfx950 {
 
 #ifndef OPUS_GEMM_FLATMM_KARGS_DEFINED
 #define OPUS_GEMM_FLATMM_KARGS_DEFINED
-// Kernel arguments for the a16w16 flatmm pipeline.
-// Layout: A[batch, M, K] bf16 row-major, B[batch, N, K] bf16 row-major
+// Kernel arguments for the a16w16 flatmm pipeline. Layout: A[batch, M, K] bf16 row-major, B[batch, N, K] bf16 row-major
 // (pre-transposed, no shuffle needed), C[batch, M, N] bf16 row-major.
 struct opus_gemm_flatmm_kargs_gfx950 {
     const void* __restrict__ ptr_a;
@@ -333,14 +303,8 @@ struct opus_gemm_flatmm_kargs_gfx950 {
 };
 #endif
 
-// ============================================================================
-// Split-K FlatMM traits (two-kernel variant: main writes fp32 workspace,
-// reduce kernel sums splits + casts to bf16 C)
-// ============================================================================
-//
-// 7 template parameters match opus_gemm_a16w16_flatmm_traits_gfx950, with
-// additional static_assert D_C=float (splitk main kernel writes fp32
-// partial sums to workspace). Ported from
+// Split-K FlatMM traits (two-kernel: main writes fp32 workspace, reduce kernel sums splits + casts to bf16 C). 7
+// template params match opus_gemm_a16w16_flatmm_traits_gfx950, plus a static_assert D_C=float. Ported from
 // gcnasm/opus_fmm/flatmm_a16w16_4wave_wasp_splitk.cc lines 34-143.
 
 template<int BLOCK_SIZE_,   // workgroup size (locked to 256)
@@ -421,9 +385,8 @@ struct opus_flatmm_splitk_traits_gfx950 {
     static constexpr int smem_padding = (W_M >= 32) ? 16 / sizeof(D_A) : 2 * 16 / sizeof(D_A);
     static constexpr int smem_per_group_load_size = slots * (smem_linear_wave_per_async_load + smem_padding) * sizeof(D_A);
 
-    // Dynamic prefetch depth from LDS budget. gfx950 = 160 KiB (hardcoded
-    // as in opus_gemm_a16w16_flatmm_traits_gfx950 above; host pass cannot use
-    // opus::get_smem_size() because it's device-gated).
+    // Dynamic prefetch depth from LDS budget. gfx950 = 160 KiB (hardcoded as in opus_gemm_a16w16_flatmm_traits_gfx950
+    // above; host pass cannot use opus::get_smem_size() because it's device-gated).
     static constexpr int WG_PER_CU = WG_PER_CU_;
     static constexpr int LDS_SIZE_TOTAL = 163840;
     static constexpr int max_lds_size_per_wg = LDS_SIZE_TOTAL / WG_PER_CU_;
@@ -440,26 +403,17 @@ struct opus_flatmm_splitk_traits_gfx950 {
     static constexpr int mma_insts = COM_REP_M * COM_REP_N * COM_REP_K;
 };
 
-// ============================================================================
-// Persistent a16w16 traits (M-outer + N-fast XCD swizzle)
-// ============================================================================
+// Persistent a16w16 traits (M-outer + N-fast XCD swizzle). Pipeline: opus_gemm_pipeline_a16w16_persistent_gfx950.cuh
+// (ported from gemm_a16w16_8wave_mouter.cc).
 //
-// Pipeline: opus_gemm_pipeline_a16w16_persistent_gfx950.cuh (ported from the
-// standalone reference kernel gemm_a16w16_8wave_mouter.cc).
+// Layout: each WG handles m_per_wg tile_m × 1 tile_n (M outer loop); within one XCD, consecutive launch-wave WGs share
+// the same m_grp and span all 8 tile_n stripes so the A tile stays resident in L2 across the 8 N tiles.
 //
-// Layout: each WG handles m_per_wg tile_m × 1 tile_n (M outer loop). Within
-// one XCD, consecutive launch-wave WGs share the same m_grp and span all 8
-// tile_n stripes; this lets the A tile stay resident in L2 across 8 N tiles
-// for the duration of one m_grp.
+// CACHECTL_A / CACHECTL_B default (0, 17) = (LRU, BYPASS_L2), matching the
+// split-barrier traits; other combos are exposed as separate KIDs by the tuner.
 //
-// CACHECTL_A / CACHECTL_B default to (0, 17) = (LRU, BYPASS_L2), matching
-// the split-barrier traits. Other (cachectl_a, cachectl_b) combos are
-// exposed as separate KIDs by the tuner.
-//
-// NUM_XCD is fixed to 8 (gfx950 = MI350); the swizzle is hard-wired to
-// N-fast inside the persistent pipeline body and does NOT take SWIZZLE_W/C
-// parameters (those belong to the HipKittens split-barrier swizzle, which
-// is a different, orthogonal optimization).
+// NUM_XCD fixed to 8 (gfx950 = MI350); swizzle is hard-wired N-fast in the pipeline body and takes no SWIZZLE_W/C
+// params (those are the orthogonal HipKittens split-barrier swizzle).
 template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
@@ -532,8 +486,7 @@ struct opus_gemm_a16w16_persistent_traits_gfx950 {
     static constexpr int CACHECTL_A = CACHECTL_A_;
     static constexpr int CACHECTL_B = CACHECTL_B_;
 
-    // MI350 = 8 XCDs. Persistent swizzle uses N-fast within each XCD
-    // (see kargs.num_tiles_n / kargs.m_grp_per_xcd).
+    // MI350 = 8 XCDs. Persistent swizzle uses N-fast within each XCD (see kargs.num_tiles_n / kargs.m_grp_per_xcd).
     static constexpr int NUM_XCD = 8;
 };
 
@@ -541,29 +494,22 @@ struct opus_gemm_a16w16_persistent_traits_gfx950 {
 #define OPUS_GEMM_PERSISTENT_KARGS_GFX950_DEFINED
 // Kernel arguments for the a16w16 persistent pipeline.
 //
-// Beyond the usual (M, N, K, batch, stride_*) fields this struct carries
-// three persistent-specific values that the launcher computes on the host:
-//   m_per_wg       : how many tile_m iters one WG covers in its M outer loop
-//                    (= num_tiles_m / split_m, where split_m is the WG grid
-//                    extent along M chosen by the launcher heuristic).
-//   num_tiles_n    : = grid.x (number of tile_n stripes; the in-kernel
-//                    swizzle reads this back instead of using gridDim.x).
-//   split_m        : un-padded m_grp count requested by the launcher
-//                    (= num_tiles_m / m_per_wg). Used by the kernel's
-//                    wave-uniform early-return guard for the over-shoot
-//                    WGs introduced when grid.y is padded up to a
-//                    NUM_XCD multiple (small-split_m case; no-op when
-//                    split_m % NUM_XCD == 0 so zero perf cost on the
-//                    large-M shapes the swizzle is tuned for).
-//   m_grp_per_xcd  : = ceil_div(split_m, NUM_XCD); used by the in-kernel
-//                    swizzle to compute the m_grp owned by this XCD slot.
-//                    Combined with grid.y = NUM_XCD * m_grp_per_xcd
-//                    (the padded grid the launcher uses), the swizzle
-//                    is bijective onto [0, NUM_XCD * m_grp_per_xcd).
+// Beyond the usual (M, N, K, batch, stride_*) fields, the launcher computes
+// these persistent-specific values:
+//   m_per_wg       : tile_m iters one WG covers in its M outer loop
+//                    (= num_tiles_m / split_m).
+//   num_tiles_n    : = grid.x (tile_n stripe count; the in-kernel swizzle
+//                    reads this instead of gridDim.x).
+//   split_m        : un-padded m_grp count (= num_tiles_m / m_per_wg). Drives
+//                    the wave-uniform early-return for over-shoot WGs when
+//                    grid.y is padded to a NUM_XCD multiple (no-op when
+//                    split_m % NUM_XCD == 0).
+//   m_grp_per_xcd  : = ceil_div(split_m, NUM_XCD). With grid.y =
+//                    NUM_XCD * m_grp_per_xcd the swizzle is bijective onto
+//                    [0, NUM_XCD * m_grp_per_xcd).
 //
-// NOTE: persistent pipeline does NOT support bias yet (matches the original
-// mouter.cc reference); this struct intentionally omits ptr_bias /
-// stride_bias_batch to keep the kargs surface minimal.
+// NOTE: persistent does NOT support bias yet (matches mouter.cc); omits
+// ptr_bias / stride_bias_batch to keep the kargs surface minimal.
 struct opus_gemm_persistent_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
@@ -587,9 +533,8 @@ struct opus_gemm_persistent_kargs_gfx950 {
 
 #ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
 #define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
-// Indirection slot for the split-K fp32 workspace pointer. Captured HIP
-// graphs hold the slot address (stable), not the workspace ptr, so a
-// post-capture grow + hipFree of the old buffer doesn't dangle the graph.
+// Indirection slot for the split-K fp32 workspace pointer. Captured HIP graphs hold the slot address (stable), not the
+// workspace ptr, so a post-capture grow + hipFree of the old buffer doesn't dangle the graph.
 struct opus_splitk_ws_handle {
     void*         ptr;    // current backing workspace; null until first grow
     unsigned long bytes;  // current capacity in bytes
@@ -600,9 +545,8 @@ struct opus_splitk_ws_handle {
 #define OPUS_GEMM_FLATMM_SPLITK_KARGS_DEFINED
 // Kernel arguments for the a16w16 flatmm split-K pipeline.
 //
-// Main kernel writes fp32 partial results to *ws_handle->ptr, laid out as
-// [split_k, B, padded_M, padded_N] (tile-aligned, no per-thread pred on
-// store). Reduce kernel consumes it and writes C[B, M, N].
+// Main kernel writes fp32 partial results to *ws_handle->ptr, laid out as [split_k, B, padded_M, padded_N]
+// (tile-aligned, no per-thread pred on store). Reduce kernel consumes it and writes C[B, M, N].
 //
 // Host must satisfy split_k * pfk * B_K <= K (launcher auto-clamps otherwise).
 struct opus_gemm_flatmm_splitk_kargs_gfx950 {
@@ -634,10 +578,7 @@ struct opus_gemm_flatmm_splitk_kargs_gfx950 {
 };
 #endif
 
-// ============================================================================
-// Mono-tile a16w16 traits (single MMA across the full B_M x B_N tile per K)
-// ============================================================================
-//
+// Mono-tile a16w16 traits (single MMA across the full B_M x B_N tile per K).
 // Pipeline: opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh.
 //
 // Locked geometry, derived in the kernel itself:
@@ -645,24 +586,12 @@ struct opus_gemm_flatmm_splitk_kargs_gfx950 {
 //   * W_M = 16, W_N = 16, W_K = 32 (MFMA 16x16x32 BF16).
 //   * VEC_A = VEC_B = VEC_C = 8.
 //
-// Constraints (mirror the kernel-internal static_asserts in
-// gemm_a16w16_mono_tile_kernel_template.hpp; static_asserts here surface
-// invalid tiles at traits instantiation):
-//   * BLOCK_SIZE == 512 (T_M * T_N * T_K * warp_size = 2 * 4 * 1 * 64).
-//   * B_M % (W_M * T_M) == 0  ->  B_M % 32 == 0.
-//   * B_N % (W_N * T_N) == 0  ->  B_N % 64 == 0.
-//   * B_K % (W_K * T_K) == 0  ->  B_K % 32 == 0.
-//   * smem_linear_wave / B_K must divide evenly (B_K must divide 512).
-//   * smem_m_rep = B_M / smem_sub must be >= 8 and divisible by 8 (num_waves).
-//   * smem_n_rep = B_N / smem_sub must be >= 8 and divisible by 8.
-//   * E_N = B_N / (W_N * T_N) must be divisible by (T_N / T_M) = 2.
-//   * ra layout requires (smem_sub / (W_M / T_N)) to divide E_M evenly.
-//   * D_A == D_B; D_A locked to bf16_t in current instances.
-//   * D_C in { bf16_t, fp32_t }.
+// Tile-divisibility / smem-rep / dtype constraints (B_M%32, B_N%64, B_K%32, smem_m_rep & smem_n_rep >=8 and %8, E_N %2,
+// D_A==D_B bf16, D_C in {bf16,fp32}, ...) are enforced by the static_asserts below, mirroring the kernel-internal
+// asserts in gemm_a16w16_mono_tile_kernel_template.hpp.
 //
-// No HAS_BIAS / HAS_OOB / CACHECTL template parameters: the mono-tile
-// launcher rejects non-empty bias up front and is only instantiated for
-// tile-aligned shapes (the launcher enforces M%B_M==N%B_N==K%B_K==0).
+// No HAS_BIAS / HAS_OOB / CACHECTL params: the launcher rejects non-empty bias
+// and only instantiates tile-aligned shapes (M%B_M==N%B_N==K%B_K==0).
 
 template<int BLOCK_SIZE_,
         typename BLOCK_,
@@ -764,13 +693,11 @@ struct opus_gemm_a16w16_mono_tile_traits_gfx950 {
 #define OPUS_GEMM_MONO_TILE_KARGS_GFX950_DEFINED
 // Kernel arguments for the a16w16 mono-tile pipeline.
 //
-// Mirrors `opus_gemm_kargs` from the upstream standalone reference
-// (yk_gcn/opus_gemm/bf16_gemm/gemm_defs.h). The kernel template casts
-// ptr_a, ptr_b, ptr_c to the traits-typed pointers internally.
+// Mirrors `opus_gemm_kargs` from the upstream standalone reference (yk_gcn/opus_gemm/bf16_gemm/gemm_defs.h). The kernel
+// template casts ptr_a, ptr_b, ptr_c to the traits-typed pointers internally.
 //
-// No bias / no splitK / no workspace fields: mono-tile is intrinsically
-// non-OOB (launcher enforces M%B_M==N%B_N==K%B_K==0) and the launcher
-// rejects any non-empty bias up front.
+// No bias / no splitK / no workspace fields: mono-tile is intrinsically non-OOB (launcher enforces
+// M%B_M==N%B_N==K%B_K==0) and the launcher rejects any non-empty bias up front.
 struct opus_gemm_mono_tile_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;

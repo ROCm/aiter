@@ -41,7 +41,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<int> splitk,     // splitk
                         std::optional<bool> nt)
 {
-    // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
+    // CK setup below
     ck::index_t StrideA = K;
     ck::index_t StrideB = K;
     ck::index_t StrideD = 0;
@@ -230,7 +230,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         std::optional<int> splitk,     // splitk
                         std::optional<bool> nt)
 {
-    // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
+    // CK setup below
     ck::index_t StrideA = K;
     ck::index_t StrideB = K;
     ck::index_t StrideD = 0;

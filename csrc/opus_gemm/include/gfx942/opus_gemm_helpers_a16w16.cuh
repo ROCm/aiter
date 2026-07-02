@@ -292,8 +292,7 @@ inline __device__ auto make_layout_rb_wave_n_major(int lane_id, int wave_id_n) {
 }
 
 // Dedicated B LDS read layout for the gfx942 quad MFMA32 path.
-// It reads the make_layout_sb() physical layout while mapping the compute
-// wave's N id onto the storing wave-M slot.
+// It reads the make_layout_sb() physical layout while mapping the compute wave's N id onto the storing wave-M slot.
 template<typename T, int STRIDE_PAD = 0>
 inline __device__ auto make_layout_rb_quad_mfma32(int lane_id, int wave_id_n) {
     static_assert(T::T_M == 2 && T::T_N == 2);

@@ -3,29 +3,25 @@
 //
 // ASM Paged-Attention decode (gfx1250) — persistent / split-KV variant.
 //
-// Wraps the SP3 kernel `PA_DECODE_D64_1TG_4W_PS` (see the reference host file
-// sched2/pa_ps.cpp).  Key properties of this kernel, distinct from the
-// MI300/MI350 PA kernels in asm_pa.cu:
+// Wraps the SP3 kernel `PA_DECODE_D64_1TG_4W_PS` (see the reference host file sched2/pa_ps.cpp). Key properties of this
+// kernel, distinct from the MI300/MI350 PA kernels in asm_pa.cu:
 //   * HeadDim = 64, PageSize = 256, GQA = 8, TileQ = 32.
 //   * FP8 Q **and** FP8 paged KV cache, bf16 output.
-//   * Per-tensor scalar dequant scales for Q/K/V (query_scale / key_scale /
-//     value_scale), passed as 1-element fp32 device tensors — NOT the
-//     per-token / per-block scale tensors used by asm_pa.cu.  The attention
-//     softmax scale (1/sqrt(d)) must be pre-folded into one of these scales by
-//     the caller (the kernel forms scl_log2e = query_scale*key_scale*log2e).
+//   * Per-tensor scalar dequant scales for Q/K/V (query_scale / key_scale / value_scale), passed as 1-element fp32
+//     device tensors — NOT the per-token / per-block scale tensors used by asm_pa.cu. The attention softmax scale
+//     (1/sqrt(d)) must be pre-folded into one of these scales by the caller (the kernel forms scl_log2e =
+//     query_scale*key_scale*log2e).
 //   * Single thread-group per work item, 4 waves of 32 lanes → bdx = 128
 //     (wave32), launched persistently with grid.x = CU count.
 //   * GPT-OSS style attention sink: per-Q-head fp32 sink logits in the SCALED-
 //     logit domain (compared directly to (q.k)*softmax_scale, i.e. exp(sink); the
 //     kernel divides by s_eff internally). Sink slot is always read by this kernel.
 //
-// Memory-allocation policy: every tensor is caller-allocated.  This entry point
-// does only pointer + stride bookkeeping and kernel launch — no GPU memory
-// allocation, no torch dependency (mirrors asm_fmha_fwd_with_sink.cu).
+// All tensors are caller-allocated; this entry point does only pointer/stride
+// bookkeeping and launch -- no GPU allocation, no torch dep.
 //
-// Kernel argument block — 16-byte-slot padded ABI, 0x170 bytes total.  Offsets
-// must match the s_load_dword offsets in the SP3 main (see sched2/pa_ps.cpp
-// "Kernel argument layout").  softmax_scale is a by-value f32 kernarg at 0x60.
+// Kernel argument block offsets must match the s_load_dword offsets in the SP3
+// main (see sched2/pa_ps.cpp). softmax_scale is a by-value f32 kernarg.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "aiter_hip_common.h"   // HipDeviceGuard, AiterAsmKernel, p2, p3, get_num_cu_func, ...
@@ -37,22 +33,17 @@
 #include <string>
 
 // PA_KARG_PRELOAD must match USE_KARG_PRELOAD in the deployed SP3 / the
-// .amdhsa_user_sgpr_kernarg_preload_length of the installed .co (and PA_KARG_PRELOAD
-// in sched2/pa_ps.cpp). 1 = tight 0x98 ABI whose first 0x78 (30 dwords) is
-// hardware-preloaded into s2..s31; 0 = legacy 0x170 16-byte-slot ABI.
+// installed .co's .amdhsa_user_sgpr_kernarg_preload_length. 1 = tight ABI whose
+// first 0x78 (30 dwords) is HW-preloaded into s2..s31; 0 = legacy 0x170 ABI.
 #ifndef PA_KARG_PRELOAD
 #define PA_KARG_PRELOAD 1
 #endif
 
 #if PA_KARG_PRELOAD
-// RSPILL tight preload ABI (matches PA_DECODE_D64_1TG_4W_PS.sp3.willa_fix.preload.rspill).
-// First 30 dwords (to 0x78) are CP-preloaded into s2..s31: 8 pointers + 14 scalars
-// (incl gqa_ratio and the by-value q/k/v scales) + 4-dword pad. The OUTPUTS —
-// ptr_O(R)/SplitO/SplitLSE — are SPILLED (used only by the late store paths) and
-// s_load'ed by the kernel, with ptr_Sink. QOIndptr dropped.
-// NOT packed: natural alignment. Scales are by-value f32 (s25/s26/s27 in SP3 =
-// 0x5C/0x60/0x64); explicit _pad0..3 8-align ptr_O so the sp3cvt parser (which
-// sums member sizes) computes matching offsets. static_asserts pin it.
+// RSPILL tight preload ABI (matches PA_DECODE_D64_1TG_4W_PS.sp3.willa_fix.preload.rspill). First 30 dwords (to 0x78)
+// are CP-preloaded into s2..s31: 8 ptrs + 14 scalars (incl gqa_ratio + by-value q/k/v scales) + 4-dword pad. Outputs
+// ptr_O(R)/SplitO/SplitLSE and ptr_Sink are SPILLED (s_load'ed); QOIndptr dropped. NOT packed: natural alignment;
+// _pad0..3 8-align ptr_O so the sp3cvt parser computes matching offsets. static_asserts pin it.
 struct KernelArgs
 {
     void* ptr_Q;            // 0x00  Q_addr (FP8)
@@ -70,10 +61,9 @@ struct KernelArgs
     unsigned int mtp;       // 0x50  mtp
     float softmax_scale;    // 0x54  attention softmax scale (by value)
     unsigned int GQA;       // 0x58  gqa_ratio
-    // TSCALE: q/k/v scales are device TENSORS (ptr_QScale/KScale/VScale below); these
-    // 3 dwords are now PADDING. Kept (not removed) so the 30-dword preload mapping and
-    // all spilled s_load offsets (ptr_O@0x78 ...) stay byte-identical. s25/s26/s27
-    // preload these dummies then get overwritten by the kernel's prologue scale deref.
+    // TSCALE: q/k/v scales are device TENSORS (ptr_QScale/KScale/VScale below); these 3 dwords are now PADDING, kept so
+    // the 30-dword preload mapping and spilled s_load offsets stay byte-identical. s25/s26/s27 preload these dummies,
+    // then get overwritten by the kernel prologue's scale deref.
     unsigned int _pad_qscale;  // 0x5C
     unsigned int _pad_kscale;  // 0x60
     unsigned int _pad_vscale;  // 0x64
@@ -86,9 +76,8 @@ struct KernelArgs
     void* ptr_SplitO;       // 0x80  SplitO — spilled
     void* ptr_SplitLSE;     // 0x88  SplitLSE — spilled
     void* ptr_Sink;         // 0x90  SinkBuffer (scaled-domain logits, exp(sink)) — spilled
-    // TSCALE: per-tensor Q/K/V dequant scales as fp32 DEVICE TENSOR pointers (spilled,
-    // s_load'ed + deref'd in the kernel prologue). The by-value floats at 0x5C/0x60/0x64
-    // are now dummy (kept so the 30-dword preload layout / s25-s27 are unchanged).
+    // TSCALE: per-tensor Q/K/V dequant scales as fp32 DEVICE TENSOR pointers
+    // (spilled, deref'd in the kernel prologue); the 0x5C/0x60/0x64 floats are dummy.
     void* ptr_QScale;       // 0x98  per-tensor Q scale tensor (fp32) — spilled
     void* ptr_KScale;       // 0xA0  per-tensor K scale tensor (fp32) — spilled
     void* ptr_VScale;       // 0xA8  per-tensor V scale tensor (fp32) — spilled
@@ -144,14 +133,12 @@ static constexpr int PA_PAGE_SIZE = 256;
 static constexpr int PA_GQA_RATIO = 8;
 static constexpr int PA_BDX       = 128;   // 4 waves * 32 lanes (wave32)
 
-// Kernel selection on the small set of keys captured by the csv manifest.
+// Kernel selection over the csv manifest keys.
 //
-// tile_q selection (data-driven from the csv manifest). The manifest currently
-// ships ONLY TileQ=16 (1 WMMA M-tile); the TileQ=32 variant was removed, so this
-// kernel is tq16-only. A variant is usable only if its query tile holds all (mtp+1)
-// MTP layers of every GQA group, i.e. (mtp+1)*gqa <= tile_q. For tq16/gqa=8 that
-// means mtp in {0,1}; mtp>=2 finds no usable tile (caller asserts mtp in {0,1}).
-// We still pick the SMALLEST usable tile_q (generic; harmless with one variant).
+// tile_q selection: the manifest currently ships only TileQ=16, so this is
+// tq16-only. A variant is usable iff its query tile holds all (mtp+1) MTP
+// layers of every GQA group: (mtp+1)*gqa <= tile_q. For tq16/gqa=8 that means
+// mtp in {0,1}. Pick the smallest usable tile_q (generic; one variant today).
 static std::string get_heuristic_kernel_pa_decode_bf16(const std::string& qdtype,
                                                        const std::string& kvdtype,
                                                        int hdim,
@@ -199,11 +186,9 @@ AITER_CTYPES_ERROR_DEF
 // out     : bf16, same logical layout as Q.
 // kv_indices / kv_indptr / context_lens / qo_indptr : persistent metadata.
 // work_indptr / work_info / split_o / split_lse      : persistent work split.
-// q_scale / k_scale / v_scale : per-tensor fp32 dequant scales, passed BY VALUE
-//           (per-tensor scales only; folded with softmax_scale in-kernel).
-// softmax_scale : attention scale (e.g. 1/sqrt(head_dim)), passed BY VALUE at
-//           kernarg 0x60.  The kernel folds query_scale*key_scale*softmax_scale
-//           *log2(e) into scl_log2e (caller does NOT pre-fold it).
+// q_scale / k_scale / v_scale : per-tensor fp32 dequant scales (folded with softmax_scale in-kernel).
+// softmax_scale : attention scale (e.g. 1/sqrt(head_dim)), by value. Kernel folds
+//           query_scale*key_scale*softmax_scale*log2(e) into scl_log2e (caller does NOT pre-fold it).
 // sink    : fp32 [kv_head*gqa] per-Q-head sink logits (scaled-logit domain); the
 //           kernel always reads this slot, so it must be non-null.
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
@@ -331,13 +316,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         name, [&]() { return AiterAsmKernel(name, co_name); });
 
     // ---- launch (persistent) ----------------------------------------------
-    // grid.x MUST equal the available_tgs the work metadata was built for: each
-    // TG t processes work_indptr[t]..work_indptr[t+1].  The metadata is generated
-    // (Python) for a specific TG count, so derive grid.x from work_indptr's length
-    // (= available_tgs + 1) rather than get_num_cu_func() — those can differ on
-    // gfx1250 (HIP CU count vs the count used to build the metadata), and a grid
-    // larger than the metadata makes extra TGs read work_indptr OOB -> they pick up
-    // garbage work and overwrite O with zeros.  Falls back to CU count if no metadata.
+    // grid.x MUST equal the available_tgs the work metadata was built for (each TG t processes
+    // work_indptr[t]..work_indptr[t+1]). Derive it from work_indptr length (= available_tgs+1), not get_num_cu_func() —
+    // a grid larger than the metadata makes extra TGs read work_indptr OOB and zero out O. Falls back to CU count if no
+    // metadata.
     const int gdx = (work_indptr != nullptr)
                         ? (int)(work_indptr->size(0) - 1)
                         : (int)get_num_cu_func();

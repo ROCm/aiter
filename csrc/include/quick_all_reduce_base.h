@@ -21,8 +21,7 @@ using fp32x4_t  = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 using fp32x8_t  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 using fp32x16_t = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 
-// Setup acquire-release semantics for vector memory reads (mubuf instruction)
-// as per architecture.
+// Setup acquire-release semantics for vector memory reads (mubuf instruction) as per architecture.
 #if defined(__gfx942__)
 // CDNA3: Scope bits sc0, sc1
 #define MUBUF_ACQUIRE 16
@@ -42,8 +41,7 @@ static constexpr int kAtoms = 8;
 static constexpr int kBlockSize  = 256;
 static constexpr int kAtomStride = kBlockSize;
 
-// Size and atom stride of source/destination data that the block will
-// process.
+// Size and atom stride of source/destination data that the block will process.
 // Workgroup scope = Tile = (256 threads x 8 atoms x 16B)
 static constexpr int kTileSize = kBlockSize * kAtoms * sizeof(int32x4_t);
 
@@ -79,8 +77,7 @@ union BufferResource
     int32x4_t descriptor;
     struct
     {
-        void* address; // 8B, out of which first 48b is address, and 16b is stride
-        // (unused)
+        void* address; // 8B, out of which first 48b is address, and 16b is stride (unused)
         uint32_t range;  // Byte range for the buffer resource
         uint32_t config; // Constant, DFMT=32b
     };
@@ -334,8 +331,7 @@ __quickreduce_device_inline__ int group_abs_max(int32x4_t atom)
     wmin = packed_min<T>(a, b);
 
     // Reduce the max among a group of threads
-    // Note: This is basically 2 blocks of values setup as the
-    // upper/lower halves of the f16x2_t
+    // Note: This is basically 2 blocks of values setup as the upper/lower halves of the f16x2_t
     for(int i = 1; i < kThreadGroupSize; i <<= 1)
     {
         int x = __shfl_down(wmax, i);

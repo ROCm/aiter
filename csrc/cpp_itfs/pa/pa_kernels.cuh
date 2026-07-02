@@ -80,8 +80,7 @@ _paged_attention_kernel(const int* block_table_seq,
 
     _B16x8 Qlocal[GQA_RATIO_LOOP][HEAD_LOOP][MTP_PER_THREAD][QKHELOOP]
                  [QK_SIZE_RATIO]; // note that 16 contiguous elements of Q should
-                                  // be fetched per lane for 8 bit cache types :
-                                  // QK_SIZE_RATIO changes for this
+                                  // be fetched per lane for 8 bit cache types : QK_SIZE_RATIO changes for this
 
     constexpr int CONTIGUOUS_SCALAR_ELEMS_16B = 16 / sizeof(scalar_t);
 
@@ -102,8 +101,7 @@ _paged_attention_kernel(const int* block_table_seq,
     // for QK mfma, tokens in multiples of TOKENS_PER_WARP are spread across warps
     // each mfma takes QH16xT16x16HE across warp
     // repeat mfmas across QKHELOOP dimension
-    // output layout from QKmfma : QH16xT4x4 16 qheads across 16 lanes, 16 tokens
-    // across 4 rows x 4 tokens per lane
+    // output layout from QKmfma : QH16xT4x4 16 qheads across 16 lanes, 16 tokens across 4 rows x 4 tokens per lane
 
     const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
     const int last_ctx_block     = num_context_blocks - 1;
@@ -264,8 +262,7 @@ _paged_attention_kernel(const int* block_table_seq,
     constexpr int VTLOOP           = NWARPS;   // corresponds to tokens across warps
     constexpr int VTLANELOOP =
         DIVIDE_ROUND_UP(VTOKENS_PER_LANE,
-                        CONTIGUOUS_KV_ELEMS_16B_LOAD); // optimized for 16B fetches; assumes
-                                                       // minimum block size is 16
+                        CONTIGUOUS_KV_ELEMS_16B_LOAD); // optimized for 16B fetches; assumes minimum block size is 16
     constexpr int VHELOOP = HEAD_SIZE / 16 / NWARPS;   // head_size distributed across warps; each
                                                        // mfma instr works on 16 head elements
 
@@ -604,8 +601,7 @@ _paged_attention_kernel(const int* block_table_seq,
                     d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
                     if constexpr(LOGITS_RTZ_CONVERSION)
                     {
-                        // use rtz conversion for better performance, with negligible impact on
-                        // accuracy
+                        // use rtz conversion for better performance, with negligible impact on accuracy
                         shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id]
                                      [rowid] = from_floatx4_rtz<scalar_t>(
                                          d_out[gqa_ratio_loop][mtp][token_depth]);
@@ -761,8 +757,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                                    vfetch_depth * ELEMS8_ELEMS4_RATIO + i;
                                 const int offset1 = offset % ROWS_PER_WARP;
                                 const int offset2 = offset / ROWS_PER_WARP;
-                                // output format is 16 qheads across 16 lanes, 16 head elems spread
-                                // across 4 rows
+                                // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                                 tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
                                     Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i],
                                     shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
@@ -789,8 +784,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                         j * ELEMS8_ELEMS4_RATIO + i;
                                     const int offset1 = (offset % ROWS_PER_WARP) / 2;
                                     const int offset2 = offset / ROWS_PER_WARP;
-                                    // output format is 16 qheads across 16 lanes, 16 head elems
-                                    // spread across 4 rows
+                                    // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                                     tmp_out = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
                                         reinterpret_cast<_T8x8*>(&Vtmp8x8)->i64,
                                         reinterpret_cast<_T8x8*>(
@@ -897,12 +891,9 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
     const int64_t query_loc,
     int context_len,
     OUTT* __restrict__ out,               // [num_seqs*mtp, num_heads, head_size]
-    const float* __restrict__ exp_sums,   // [num_seqs*mtp, num_heads,
-                                          // max_num_partitions]
-    const float* __restrict__ max_logits, // [num_seqs*mtp, num_heads,
-                                          // max_num_partitions]
-    const scalar_t* __restrict__ tmp_out, // [num_seqs*mtp, num_heads,
-                                          // max_num_partitions, head_size]
+    const float* __restrict__ exp_sums,   // [num_seqs*mtp, num_heads, max_num_partitions]
+    const float* __restrict__ max_logits, // [num_seqs*mtp, num_heads, max_num_partitions]
+    const scalar_t* __restrict__ tmp_out, // [num_seqs*mtp, num_heads, max_num_partitions, head_size]
     const int max_num_partitions,
     const float* __restrict__ fp8_out_scale_ptr)
 {
@@ -927,8 +918,7 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
                                       (seq_idx * MTP + mtp) * num_heads * max_num_partitions +
                                       head_idx * max_num_partitions;
 
-        // valid partition is the last valid partition in case threadid > num
-        // partitions
+        // valid partition is the last valid partition in case threadid > num partitions
         int valid_partition[NPAR_LOOPS];
         float reg_max_logit[NPAR_LOOPS];
         const int last_valid_partition = num_partitions - 1;
@@ -1111,15 +1101,9 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
     }
 }
 
-// -----------------------------------------------------------------------
-// -----------------------------------------------------------------------
-// ----------------------- Experimental ----------------------------------
-// Works for: head_dim=128, cache_t=bf16
-// Feature:
-// 1. continuous threads work together to load K cache into LDS, then each thread save the LDS into
-// registers.
-// 2. Double buffer of K cache loading
-// 3. NT_KV_LOAD set to true
+// Experimental kernel. Works for: head_dim=128, cache_t=bf16
+// Features: 1) threads cooperatively load K cache into LDS, then each thread reads LDS into
+// registers; 2) double-buffered K cache loading; 3) NT_KV_LOAD set to true.
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
@@ -1146,10 +1130,8 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     const int kv_head_stride,
     const int kv_seq_stride,
     float* __restrict__ exp_sums,   // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits, // [num_seqs, num_heads,
-                                    // max_num_partitions]
-    scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
-                                    // head_size]
+    float* __restrict__ max_logits, // [num_seqs, num_heads, max_num_partitions]
+    scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions, head_size]
     float logits_soft_cap,
     float logits_soft_cap_rcp,
     const float* q_scale_ptr,
@@ -1200,8 +1182,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
 
     _B16x8 Qlocal[GQA_RATIO_LOOP][HEAD_LOOP][MTP_PER_THREAD][QKHELOOP] // Jacob: 1x1x1x4x1
                  [QK_SIZE_RATIO]; // note that 16 contiguous elements of Q should
-                                  // be fetched per lane for 8 bit cache types :
-                                  // QK_SIZE_RATIO changes for this
+                                  // be fetched per lane for 8 bit cache types : QK_SIZE_RATIO changes for this
 
     constexpr int CONTIGUOUS_SCALAR_ELEMS_16B = 16 / sizeof(scalar_t);
 
@@ -1245,8 +1226,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     int kphysical_block_number[TLOOP][ITERS_16TK];
     int kphysical_offset[TLOOP][ITERS_16TK];
     // fetch k physical block numbers
-    // Jacob: loading order--> Token [0~16, 64~80, 128~144, 192~208], [16~32, 80~96, 144~160,
-    // 208~224]...
+    // Jacob: loading order--> Token [0~16, 64~80, 128~144, 192~208], [16~32, 80~96, 144~160, 208~224]...
     for(int token_depth = 0; token_depth < TLOOP; token_depth++) // 4
     {
         for(int iter_16tk = 0; iter_16tk < ITERS_16TK; iter_16tk++) // 4
@@ -1349,8 +1329,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     const cache_t* k_ptr = k_cache + wg_start_kv_head_idx * kv_head_stride;
     const int row_head_elem = rowid * CONTIGUOUS_KV_ELEMS_16B_LOAD;
     int curr = 0, next = 1;
-    __shared__ cache_t Kbuffer_lds[2][HEAD_LOOP][64][HEAD_SIZE]; // curr and next K buffer, each
-                                                                 // load 64 tokens K cache
+    __shared__ cache_t Kbuffer_lds[2][HEAD_LOOP][64][HEAD_SIZE]; // curr and next K buffer, each load 64 tokens K cache
     // Each warp processes 16x128 and it was divided into 4 mfma 16x(4x32), each thread records 4x
     // CONTIGUOUS_KV_ELEMS_16B_LOAD elems
     _B16x8 Kbuffer_reg[2][HEAD_LOOP][QKHELOOP];
@@ -1885,8 +1864,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                 d_out[gqa_ratio_loop][mtp][token_depth] *= inv_sum_scale[gqa_ratio_loop][mtp];
                 if constexpr(LOGITS_RTZ_CONVERSION)
                 {
-                    // use rtz conversion for better performance, with negligible impact on
-                    // accuracy
+                    // use rtz conversion for better performance, with negligible impact on accuracy
                     shared_logits[gqa_ratio_loop][0][mtp][warpid][token_depth][lane16id][rowid] =
                         from_floatx4_rtz<scalar_t>(d_out[gqa_ratio_loop][mtp][token_depth]);
                 }
@@ -1944,8 +1922,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
     constexpr int VTLOOP           = NWARPS;   // corresponds to tokens across warps
     constexpr int VTLANELOOP =
         DIVIDE_ROUND_UP(VTOKENS_PER_LANE,
-                        CONTIGUOUS_KV_ELEMS_16B_LOAD); // optimized for 16B fetches; assumes
-                                                       // minimum block size is 16
+                        CONTIGUOUS_KV_ELEMS_16B_LOAD); // optimized for 16B fetches; assumes minimum block size is 16
     constexpr int VHELOOP = HEAD_SIZE / 16 / NWARPS;   // head_size distributed across warps; each
                                                        // mfma instr works on 16 head elements
     int vphysical_block_number[VTLOOP][VBLOCKS_PER_LANE];
@@ -2092,8 +2069,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                                    vfetch_depth * ELEMS8_ELEMS4_RATIO + i;
                                 const int offset1 = offset % ROWS_PER_WARP;
                                 const int offset2 = offset / ROWS_PER_WARP;
-                                // output format is 16 qheads across 16 lanes, 16 head elems spread
-                                // across 4 rows
+                                // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                                 tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
                                     Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i],
                                     shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]
@@ -2138,8 +2114,7 @@ __inline__ __device__ void _paged_attention_kernel_EXPERIMENTAL(
                                         j * ELEMS8_ELEMS4_RATIO + i;
                                     const int offset1 = offset % ROWS_PER_WARP;
                                     const int offset2 = offset / ROWS_PER_WARP;
-                                    // output format is 16 qheads across 16 lanes, 16 head elems
-                                    // spread across 4 rows
+                                    // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                                     tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
                                         Vlocaltmp.xy[i],
                                         shared_logits[gqa_ratio_loop][0][mtp][vtoken_depth][offset2]

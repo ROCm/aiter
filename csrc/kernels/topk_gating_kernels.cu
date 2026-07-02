@@ -30,8 +30,8 @@ namespace aiter {
 enum { SCORE_SQRTSOFTPLUS = 0, SCORE_SIGMOID = 1, SCORE_SOFTMAX = 2 };
 
 // Fused DPP warp argmax: 6× v_max_f32+DPP + ballot + ctzll + readlane ≈ 9 instr.
-// NaN-safe: if all lanes have NaN (val_o == max_val is always false), ballot is 0
-// and ctzll(0) is UB.  Detect this via the ballot result and fall back to lane 0.
+// NaN-safe: if all lanes have NaN (val_o == max_val is always false), ballot is 0 and ctzll(0) is UB.
+// Detect this via the ballot result and fall back to lane 0.
 __device__ __forceinline__ void warpReduceMax_softplus(float& val_o, int& idx)
 {
     float max_val   = multithread_reduce_max_dpp<WARP_SIZE>(val_o);

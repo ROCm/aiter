@@ -3,27 +3,18 @@
 //
 // Mono-tile BF16 a16w16 pipeline -- 4g_safe variant.
 //
-// Buffer-resource (BR) construction is sized per-WG tile rectangle so the
-// 32-bit num_records field never wraps -- safe for tensors whose full
-// extent exceeds 4 GiB. See sibling 4g_safe header for the size
-// formulas; M/N tails are absorbed by BR num_records.
+// Buffer-resource (BR) sized per-WG tile rectangle so the 32-bit num_records
+// never wraps (safe for >4 GiB tensors); M/N tails absorbed by num_records.
 //
 // Direct port of the upstream yk_gcn mono-tile BF16 kernel template
-// (bf16_gemm/gemm_a16w16_mono_tile_kernel_template.hpp) with two mechanical
-// adjustments to fit the aiter codegen contract:
-//
-//   (1) `opus_gemm_kargs` (yk_gcn) -> `opus_gemm_mono_tile_kargs_gfx950`
-//       (aiter; defined in opus_gemm_traits_a16w16_gfx950.cuh alongside
-//       the other a16w16 traits/kargs structs).
-//   (2) The layout-helper namespace is renamed `gemm_mono_tile` ->
-//       `opus_mono_tile_gfx950` to avoid any ODR clash with a separate
-//       upstream build that ships the original symbol name.
-//
-// The kernel body is otherwise byte-for-byte identical to the upstream
-// reference. Geometry is locked (T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32,
-// VEC=8, BLOCK_SIZE=512); tile-divisibility / smem-rep constraints are
-// enforced in the traits header static_asserts and re-validated host-side
-// by _validate_a16w16_mono_tile in gen_instances.py.
+// (bf16_gemm/gemm_a16w16_mono_tile_kernel_template.hpp), byte-for-byte
+// identical body, with two mechanical adjustments for the aiter codegen
+// contract: (1) kargs `opus_gemm_kargs` -> `opus_gemm_mono_tile_kargs_gfx950`
+// (in opus_gemm_traits_a16w16_gfx950.cuh); (2) layout-helper namespace
+// `gemm_mono_tile` -> `opus_mono_tile_gfx950` to avoid ODR clash with the
+// upstream build. Geometry locked (T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32,
+// VEC=8, BLOCK_SIZE=512); constraints enforced by traits static_asserts and
+// re-validated host-side by _validate_a16w16_mono_tile in gen_instances.py.
 #pragma once
 
 #include <opus/opus.hpp>
@@ -277,12 +268,10 @@ void gemm_a16w16_mono_tile_4g_safe_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx95
     unsigned int b_size_bytes = (bn_eff > 0)
         ? ((unsigned)(bn_eff - 1) * kargs.stride_b + (unsigned)kargs.k) * sizeof(D_B)
         : 0u;
-    // mono_tile's C store uses `+col` in the store-offset (line below in
-    // the original epilogue: store<...>(g_c, ..., u_gc, ... + col)). So
-    // the C base does NOT bias by col; the BR must span from
-    // (row, 0) to (row + bm_eff - 1, col + bn_eff - 1) inclusive ->
+    // mono_tile's C store adds `+col` in the store-offset, so the C base
+    // does NOT bias by col; the BR must span (row, 0) to
+    // (row + bm_eff - 1, col + bn_eff - 1) inclusive ->
     // size = ((bm_eff-1)*stride_c + col + bn_eff) * sizeof(D_C).
-    // For B_M=256, N=129280, bf16 this is ~66 MB, far under UINT32_MAX.
     unsigned int c_size_bytes = (bm_eff > 0 && bn_eff > 0)
         ? ((unsigned)(bm_eff - 1) * kargs.stride_c + (unsigned)col + (unsigned)bn_eff) * sizeof(D_C)
         : 0u;

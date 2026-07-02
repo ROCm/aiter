@@ -403,9 +403,7 @@ __device__ void moe_fused_gate_impl(void* input,
     }
 }
 
-//------------------------------------------------------------------------------
-// Templated Kernel Version (using compile-time constants)
-//------------------------------------------------------------------------------
+// Templated kernel version (compile-time constants)
 template <int VPT_,
           int NUM_EXPERTS_,
           int THREADS_PER_ROW_,
@@ -480,9 +478,7 @@ __global__ void moe_fused_gate_kernel(void* input,
         dispatched = true;                                                                    \
     } while(0)
 
-//------------------------------------------------------------------------------
-// Dynamic Kernel Version (parameters computed at runtime)
-//------------------------------------------------------------------------------
+// Dynamic kernel version (params computed at runtime)
 struct KernelParamsDynamic
 {
     int VPT;
@@ -530,9 +526,7 @@ __global__ void moe_fused_gate_kernel_dynamic(void* input,
                            params);
 }
 
-//------------------------------------------------------------------------------
-// Host Launcher Function
-//------------------------------------------------------------------------------
+// Host launcher
 std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                                        at::Tensor& bias,
                                        at::Tensor& topk_weights,
@@ -568,8 +562,7 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     //             "num_experts must be a power of 2, but got ",
     //             num_experts);
 
-    // Check 2: Ensure that num_experts is divisible by num_expert_group. (this also means
-    // num_expert_group is power of 2)
+    // Check 2: Ensure that num_experts is divisible by num_expert_group. (this also means num_expert_group is power of 2)
     TORCH_CHECK(num_experts % num_expert_group == 0,
                 "num_experts must be divisible by num_expert_group, but got ",
                 num_experts,
@@ -597,8 +590,7 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     case 256:
         if(num_expert_group == 8)
         {
-            // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8 = 4,
-            // ROWS_PER_CTA = 6 * 4 = 24.
+            // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
             if(input.scalar_type() == at::kBFloat16)
             {
                 LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 8);
@@ -632,8 +624,7 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     case 192:
         if(num_expert_group == 8)
         {
-            // This is deepseek v3 case. Here VPT = 192/8 = 24, ROWS_PER_WARP = 32/8 = 4,
-            // ROWS_PER_CTA = 6 * 4 = 24.
+            // This is deepseek v3 case. Here VPT = 192/8 = 24, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
             if(input.scalar_type() == at::kBFloat16)
             {
                 LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 192, 8);
@@ -685,8 +676,7 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     case 96:
         if(num_expert_group == 8)
         {
-            // This is deepseek v3 case. Here VPT = 96/8 = 12, ROWS_PER_WARP = 32/8 = 4,
-            // ROWS_PER_CTA = 6 * 4 = 24.
+            // This is deepseek v3 case. Here VPT = 96/8 = 12, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
             if(input.scalar_type() == at::kBFloat16)
             {
                 LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 96, 8);

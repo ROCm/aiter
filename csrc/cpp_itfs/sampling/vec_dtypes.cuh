@@ -165,10 +165,8 @@ constexpr inline __attribute__((always_inline)) __device__ int get_mantissa_bits
 }
 
 /*!
- * \brief Fallback to software fast dequant implementation if hardware dequantization is not
- * available.
- * \note Inspired by Marlin's fast dequantization, but here we don't have to permute
- * weights order.
+ * \brief Fallback to software fast dequant implementation if hardware dequantization is not available.
+ * \note Inspired by Marlin's fast dequantization, but here we don't have to permute weights order.
  * \ref
  * https://github.com/vllm-project/vllm/blob/6dffa4b0a6120159ef2fe44d695a46817aff65bc/csrc/quantization/fp8/fp8_marlin.cu#L120
  */
@@ -287,14 +285,9 @@ struct vec_cast<__hip_bfloat16, FP8_E5M2_TYPE>
 // Function to convert half-precision to e4m3
 __device__ uint8_t convert_f32_to_e4m3(float val)
 {
-    // Define the range of e4m3
-    // 1. Minimum representable value for e4m3
-    // 2. Binary 1000.000 in e4m3
-    // 3. FLT_MIN is not suitable for e4m3 because e4m3 has a much smaller dynamic range.
+    // e4m3 range: min -8.0 (binary 1000.000), max 7.875 (binary 0111.111). FLT_MIN/FLT_MAX
+    // don't fit e4m3's much smaller dynamic range.
     float min_e4m3 = -8.0f;
-    // 1. Maximum representable value for e4m3
-    // 2. Binary 0111.111 in e4m3
-    // FLT_MAX far exceeds the maximum value representable in e4m3.
     float max_e4m3 = 7.875f;
 
     // Saturate the value to the e4m3 range
