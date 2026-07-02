@@ -152,11 +152,9 @@ namespace vllm
   //   }
   // }
 
-  /* Converter structs mapping torch types to HIP/CUDA types + the conversions,
-     needed because HIP/CUDA conversion ops aren't consistent enough for a
-     generic cast. Each struct has `static constexpr bool exists`: if false the
-     optimized kernel is skipped for that torch type; if true, define it fully
-     as in the examples below. */
+  /* Converter structs mapping torch types to HIP/CUDA types + the conversions, needed because HIP/CUDA conversion
+     ops aren't consistent enough for a generic cast. Each struct has `static constexpr bool exists`: if false the
+     optimized kernel is skipped for that torch type; if true, define it fully as in the examples below. */
   template <typename torch_type>
   struct _typeConvert
   {
@@ -218,16 +216,14 @@ namespace vllm
 #endif // defined(USE_ROCM) || (defined(CUDA_VERSION) && (CUDA_VERSION >=
        // 12000))
 
-  /* Vector POD struct to generate vectorized and packed FP16/BF16 ops
-     for appropriate specializations of fused_add_rms_norm_kernel.
-     Only functions that are necessary in that kernel are implemented.
-     Alignment to 16 bytes is required to use 128-bit global memory ops.
-   */
+  /* Vector POD struct to generate vectorized and packed FP16/BF16 ops for appropriate specializations of
+     fused_add_rms_norm_kernel. Only functions that are necessary in that kernel are implemented. Alignment to 16
+     bytes is required to use 128-bit global memory ops. */
   template <typename scalar_t, int width>
   struct alignas(16) _f16Vec
   {
-    /* Not theoretically necessary that width is a power of 2 but should
-       almost always be the case for optimization purposes */
+    /* Not theoretically necessary that width is a power of 2 but should almost always be the case for optimization
+       purposes */
     static_assert(width > 0 && (width & (width - 1)) == 0,
                   "Width is not a positive power of 2!");
     using Converter = _typeConvert<scalar_t>;
@@ -347,9 +343,8 @@ namespace vllm
     const int vec_hidden_size = hidden_size / width;
     __shared__ float s_variance;
     float variance = 0.0f;
-    /* These and the argument pointers are all declared `restrict` as they are
-       not aliased in practice. Argument pointers should not be dereferenced
-       in this kernel as that would be undefined behavior */
+    /* These and the argument pointers are all declared `restrict` as they are not aliased in practice. Argument
+       pointers should not be dereferenced in this kernel as that would be undefined behavior */
     auto *__restrict__ input_v =
         reinterpret_cast<_f16Vec<scalar_t, width> *>(input);
     auto *__restrict__ residual_v =
@@ -598,14 +593,14 @@ void fused_add_rms_norm(torch::Tensor &input,    // [..., hidden_size]
   int num_tokens = input.numel() / hidden_size;
 
   dim3 grid(num_tokens);
-  /* Memory-latency bound: for large num_tokens a smaller block size raises
-     CU occupancy and improves global-mem latency hiding. */
+  /* Memory-latency bound: for large num_tokens a smaller block size raises CU occupancy and improves global-mem
+     latency hiding. */
   const int max_block_size = (num_tokens < 256) ? 1024 : 256;
   dim3 block(std::min(hidden_size, max_block_size));
   const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
   const hipStream_t stream = at::hip::getCurrentHIPStream();
-  /* For FP16/BF16, use the packed+vectorized kernel. Width-8 vectors are
-     optimal (128-bit global loads) but require 16-byte-aligned data. */
+  /* For FP16/BF16, use the packed+vectorized kernel. Width-8 vectors are optimal (128-bit global loads) but require
+     16-byte-aligned data. */
   auto inp_ptr = reinterpret_cast<std::uintptr_t>(input.data_ptr());
   auto res_ptr = reinterpret_cast<std::uintptr_t>(residual.data_ptr());
   auto wt_ptr = reinterpret_cast<std::uintptr_t>(weight.data_ptr());

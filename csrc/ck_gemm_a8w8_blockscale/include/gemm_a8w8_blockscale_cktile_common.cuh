@@ -312,8 +312,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int N = WQ.size(0);
     const int K = XQ.size(1);
 
-    // Whether this kernel configuration uses column-major AQ layout,
-    // requiring a host-side transpose of x_scale.
+    // Whether this kernel configuration uses column-major AQ layout, requiring a host-side transpose of x_scale.
     constexpr bool aq_col_major =
         BQuantGroupSize::kN == 128 &&
         (GemmInstance::M_Warp_v * GemmInstance::N_Warp_v * GemmInstance::K_Warp_v == 8) &&
@@ -329,8 +328,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     ck_tile::QuantGemmHostArgs args;
     args.a_ptr = XQ.data_ptr();
 
-    // Declared at function scope so the transposed tensor stays alive
-    // through the async kernel launch.
+    // Declared at function scope so the transposed tensor stays alive through the async kernel launch.
     torch::Tensor x_scale_t;
 
     if constexpr(aq_col_major)
@@ -377,10 +375,9 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int BQK = ck_tile::integer_divide_ceil(K, BQuantGroupSize::kK);
     const int BQN = ck_tile::integer_divide_ceil(N, BQuantGroupSize::kN);
 
-    // Read leading-dimension strides from tensor metadata instead of
-    // assuming dense layout.  vLLM's _maybe_pad_fp8_weight can produce
-    // row-major tensors whose leading-dimension stride exceeds the
-    // logical column count (e.g. shape [N,K] with stride [K+pad, 1]).
+    // Read leading-dimension strides from tensor metadata instead of assuming dense layout.  vLLM's _maybe_pad_fp8_weight
+    // can produce row-major tensors whose leading-dimension stride exceeds the logical column count
+    // (e.g. shape [N,K] with stride [K+pad, 1]).
     const int stride_A  = XQ.stride(0);
     const int stride_B  = WQ.stride(0);
     const int stride_C  = Y.stride(0);

@@ -70,8 +70,7 @@ constexpr bool entry_eq(const OpusA16W16RuntimeEntry& a,
     return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
 }
 
-// id -> kernel<CDataType>, same flat-array layout. Sorted by id (the
-// codegen always emits in ascending id order).
+// id -> kernel<CDataType>, same flat-array layout. Sorted by id (the codegen always emits in ascending id order).
 struct OpusA16W16TuneEntry
 {
     int kid;

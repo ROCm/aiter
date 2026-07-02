@@ -385,8 +385,7 @@ void LLGemm1(void* in_a,
              const int rows_per_block,
              const AiterDtype scalar_type)
 {
-    // NUM_TREADS need to be a multiple of WARP_SIZE, as we are using warp shuffle
-    // operations.
+    // NUM_TREADS need to be a multiple of WARP_SIZE, as we are using warp shuffle operations.
     const int NUM_THREADS = K * 2 / 16 % WARP_SIZE == 0
                                 ? K * 2 / 16
                                 : K * 2 / 16 + (WARP_SIZE - K * 2 / 16 % WARP_SIZE);

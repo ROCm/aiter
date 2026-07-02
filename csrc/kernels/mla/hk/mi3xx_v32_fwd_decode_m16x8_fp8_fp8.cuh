@@ -73,10 +73,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     using kv_1_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_kv_1_begin, k_kv_1_end>>,
                              2>; // 4 vgprs
-    // Single-mfma-tile (16x32 = 2 vgpr) sub-views used as load_k_to_gpr
-    // destinations. Each load_k_to_gpr writes one mfma A-tile; RT must
-    // expose exactly one 2-vgpr range (function always writes range 0).
-    // The full kv_0/kv_1 (4 vgprs each) are still consumed by mma_ABt.
+    // Single-mfma-tile (16x32 = 2 vgpr) sub-views used as load_k_to_gpr destinations. Each load_k_to_gpr writes one
+    // mfma A-tile; RT must expose exactly one 2-vgpr range (function always writes range 0). The full kv_0/kv_1 (4
+    // vgprs each) are still consumed by mma_ABt.
     using kv_0_top_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_kv_0_begin + 0, k_kv_0_begin + 1>>,
                              2>;
@@ -179,19 +178,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 4]);
         const int32_t kv_end_page = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 5]);
-        // kv_offset is in TOKEN units regardless of page_size: number of
-        // real KV tokens in this batch that come after this work item.
-        // kv_offset == 0 iff this work item ends at the batch tail.
+        // kv_offset is in TOKEN units regardless of page_size: number of real KV tokens in this batch that come after
+        // this work item. kv_offset == 0 iff this work item ends at the batch tail.
         const int32_t kv_offset = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 6]);
 
-        // Convert work_info page bounds to TOKEN space. When kPageSize == 1
-        // pages == tokens and we never touch p_kv_last_page_lens. When
-        // kPageSize > 1 and this is the batch tail (kv_offset == 0), the
-        // last page is partial and we clip with kv_last_page_lens[batch].
-        // The combined condition relies on compile-time folding of
-        // (T::kPageSize == 1) so the else branch (with the load) becomes
-        // dead code when kPageSize == 1.
+        // Convert work_info page bounds to TOKEN space. When kPageSize == 1 pages == tokens and we never touch
+        // p_kv_last_page_lens. When kPageSize > 1 and this is the batch tail (kv_offset == 0), the last page is
+        // partial and we clip with kv_last_page_lens[batch]. The combined condition relies on compile-time folding of
+        // (T::kPageSize == 1) so the else branch (with the load) becomes dead code when kPageSize == 1.
         const int32_t kv_start = kv_start_page * T::kPageSize;
         int32_t kv_end;
         if((T::kPageSize == 1) || (kv_offset != 0))
@@ -206,10 +201,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 __builtin_amdgcn_readfirstlane(params.p_kv_last_page_lens[batch_idx]);
             kv_end = (kv_end_page - 1) * T::kPageSize + last_page_len;
         }
-        // Per-warp causal offset: warp at qpos i must clamp kv_end to its
-        // visible range. With kv_offset KV positions remaining after this
-        // chunk, qpos i sees up to (kv_end + kv_offset - (Q - 1 - i)) =
-        // kv_end - max(0, qpos_off_from_last - kv_offset).
+        // Per-warp causal offset: warp at qpos i must clamp kv_end to its visible range. With kv_offset KV positions
+        // remaining after this chunk, qpos i sees up to (kv_end + kv_offset - (Q - 1 - i)) = kv_end - max(0,
+        // qpos_off_from_last - kv_offset).
         const int32_t causal_offset = opus::max(qpos_off_from_last - kv_offset, 0);
         const int32_t kv_end_eff    = kv_end - causal_offset;
         const int32_t kv_len        = kv_end - kv_start;
@@ -260,22 +254,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 params.p_kv_indices, kv_ld_row_base_idx, kv_start + T::kBlockN, kv_end);
         }
 
-        // kSkipCompute: this warp has no real compute on this tile; it only
-        // participates in barriers and the cooperative V-transpose so active
-        // warps' PV GEMM can complete. row_max/row_sum/oaccu freeze.
-        // Invariant (enforced by dispatcher): kSkipCompute=true implies this is
-        // the warp's epilogue iter AND the global last iter (no next tile),
-        // because per-warp causal_offset < kBlockN can defer at most one tile.
+        // kSkipCompute: this warp has no real compute on this tile; it only participates in barriers and the
+        // cooperative V-transpose so active warps' PV GEMM can complete. row_max/row_sum/oaccu freeze. Invariant
+        // (enforced by dispatcher): kSkipCompute=true implies this is the warp's epilogue iter AND the global last
+        // iter (no next tile), because per-warp causal_offset < kBlockN can defer at most one tile.
         auto mla_main = [&]<bool kIsFirstIter,
                             bool kSkipCompute,
                             PvGemmEpilogueType kEpilogueType,
                             bool kCheckBoundaryNext>(const int32_t kv_tile_start,
                                                      const int32_t kv_tile_end) {
             constexpr bool kDoEpilogue = (kEpilogueType != PvGemmEpilogueType::None);
-            // A warp only stops loading K / swapping LDS pong on the global last
-            // tile. In the new design, "global last" coincides with either the
-            // epilogue iter (active or skip-with-epilogue) or the idle warp's
-            // single skip iter (no epilogue).
+            // A warp only stops loading K / swapping LDS pong on the global last tile. In the new design, "global
+            // last" coincides with either the epilogue iter (active or skip-with-epilogue) or the idle warp's single
+            // skip iter (no epilogue).
             constexpr bool kIsGlobalLast = kSkipCompute || kDoEpilogue;
 
             static_assert((kSkipCompute == false) || (kIsFirstIter == false),
@@ -409,9 +400,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 }
             }
 
-            // Element-wise scale. Boundary problem is handled here as well.
-            // Runtime-dispatch on whether this tile crosses kv_end_eff to keep
-            // mla_main from instantiating twice on a compile-time flag.
+            // Element-wise scale. Boundary problem is handled here as well. Runtime-dispatch on whether this tile
+            // crosses kv_end_eff to keep mla_main from instantiating twice on a compile-time flag.
             const uint32_t col_0_idx = lane_idx >> 4;
             if constexpr(kSkipCompute == false)
             {
@@ -662,9 +652,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
             else
             {
-                // num_iters == 2: real (partial) iter on tile 0, then skip+epilogue
-                // on tile 1. Tile 1 is global last and partial since
-                // kv_len in [kBlockN, kBlockN + qseqlen - 1].
+                // num_iters == 2: real (partial) iter on tile 0, then skip+epilogue on tile 1. Tile 1 is global last
+                // and partial since kv_len in [kBlockN, kBlockN + qseqlen - 1].
                 mla_main.template operator()<true, false, PvGemmEpilogueType::None, true>(
                     kv_start, kv_start + T::kBlockN);
                 if(partial_qo_loc < 0)
@@ -785,9 +774,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
             else
             {
-                // Warp's last real is NOT the global last; one trailing skip iter
-                // does the epilogue. Real iter prefetches K for the global last
-                // tile (kCheckBoundaryNext = global_last_partial).
+                // Warp's last real is NOT the global last; one trailing skip iter does the epilogue. Real iter
+                // prefetches K for the global last tile (kCheckBoundaryNext = global_last_partial).
                 const bool boundary_next = (kv_len % T::kBlockN) != 0;
                 if(boundary_next)
                 {
@@ -961,9 +949,8 @@ void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
         break;                                                            \
     }
 
-        // Only page_size in {1, 64} are instantiated. 64 is the value used by
-        // FlashMLA, TRT-LLM-MLA and FlashInfer-MLA in vLLM/SGLang for typical
-        // DeepSeek deployments; 1 covers the unpaged path.
+        // Only page_size in {1, 64} are instantiated. 64 is the value used by FlashMLA, TRT-LLM-MLA and
+        // FlashInfer-MLA in vLLM/SGLang for typical DeepSeek deployments; 1 covers the unpaged path.
         switch(page_size)
         {
             DISPATCH_PAGE_SIZE(1)

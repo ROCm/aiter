@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-// Include these 2 headers instead of torch/extension.h since we don't need all of the torch
-// headers.
+// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/HIPGeneratorImpl.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -32,9 +31,8 @@ num_splits_heuristic_ck(int batch_nheads_mblocks, int num_SMs, int num_n_blocks,
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);
     auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
-    // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
-    // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
-    // (i.e. it's 11 splits anyway).
+    // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits, we'll have 6 * 10 + 4
+    // blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks (i.e. it's 11 splits anyway).
     // So we check if the number of blocks per split is the same as the previous num_splits.
     auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
         return num_splits == 1 ||

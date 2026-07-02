@@ -4,14 +4,12 @@
 // Mono-tile BF16 a16w16 pipeline.
 //
 // Direct port of the upstream yk_gcn mono-tile BF16 kernel template
-// (bf16_gemm/gemm_a16w16_mono_tile_kernel_template.hpp), byte-for-byte
-// identical body, with two mechanical adjustments for the aiter codegen
-// contract: (1) kargs `opus_gemm_kargs` -> `opus_gemm_mono_tile_kargs_gfx950`
-// (in opus_gemm_traits_a16w16_gfx950.cuh); (2) layout-helper namespace
-// `gemm_mono_tile` -> `opus_mono_tile_gfx950` to avoid ODR clash with the
-// upstream build. Geometry locked (T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32,
-// VEC=8, BLOCK_SIZE=512); constraints enforced by traits static_asserts and
-// re-validated host-side by _validate_a16w16_mono_tile in gen_instances.py.
+// (bf16_gemm/gemm_a16w16_mono_tile_kernel_template.hpp), byte-for-byte identical body, with two mechanical adjustments
+// for the aiter codegen contract: (1) kargs `opus_gemm_kargs` -> `opus_gemm_mono_tile_kargs_gfx950` (in
+// opus_gemm_traits_a16w16_gfx950.cuh); (2) layout-helper namespace `gemm_mono_tile` -> `opus_mono_tile_gfx950` to avoid
+// ODR clash with the upstream build. Geometry locked (T_M=2, T_N=4, T_K=1, W_M=W_N=16, W_K=32, VEC=8, BLOCK_SIZE=512);
+// constraints enforced by traits static_asserts and re-validated host-side by _validate_a16w16_mono_tile in
+// gen_instances.py.
 #pragma once
 
 #include <opus/opus.hpp>
@@ -21,9 +19,8 @@ namespace opus_mono_tile_gfx950 {
 
 using opus::operator""_I;
 
-// Kernel-internal derived traits: wave layout, smem layout, instruction
-// counts. Mirrors the upstream kernel_traits<UT> verbatim so the layout
-// helpers below resolve their constants the same way.
+// Kernel-internal derived traits: wave layout, smem layout, instruction counts. Mirrors the upstream kernel_traits<UT>
+// verbatim so the layout helpers below resolve their constants the same way.
 template<typename UT>
 struct kernel_traits {
     static constexpr int BLOCK_SIZE = UT::BLOCK_SIZE;
@@ -389,9 +386,8 @@ void gemm_a16w16_mono_tile_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx950 kargs)
 
     auto u_gc = make_layout_gc<T>(lane_id, 0, wave_id_n, kargs.stride_c);
     auto v_c_f16 = cast<D_C>(v_c);
-    // For every 8 D_C elements (= 4 u32), swap lane L's upper-half (last 4
-    // elems) with lane (L^16)'s lower-half (first 4 elems) using
-    // v_permlane16_swap_b32.
+    // For every 8 D_C elements (= 4 u32), swap lane L's upper-half (last 4 elems) with lane (L^16)'s lower-half (first
+    // 4 elems) using v_permlane16_swap_b32.
     static_assert(sizeof(D_C) * 8 % sizeof(u32_t) == 0);
     constexpr int u32_per_chunk = sizeof(D_C) * 8 / sizeof(u32_t);
     constexpr int num_chunks = sizeof(v_c_f16) / (sizeof(u32_t) * u32_per_chunk);
@@ -406,9 +402,8 @@ void gemm_a16w16_mono_tile_kernel_gfx950(opus_gemm_mono_tile_kargs_gfx950 kargs)
 
     store<T::VEC_C>(g_c, v_c_f16, u_gc, wave_id_m * (T::B_M / T::T_M) * kargs.stride_c + col);
 #else
-    // Non-gfx950 device pass compiles to an empty stub; host-side arch
-    // routing in opus_gemm.cu prevents any non-gfx950 device from
-    // reaching this kernel at runtime.
+    // Non-gfx950 device pass compiles to an empty stub; host-side arch routing in opus_gemm.cu prevents any non-gfx950
+    // device from reaching this kernel at runtime.
     (void)kargs;
 #endif
 }

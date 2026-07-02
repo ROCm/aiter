@@ -5,20 +5,15 @@
 // HIP runtime split. Three include modes:
 //
 //   * __HIP_DEVICE_COMPILE__ (device pass, any TU): hip_minimal only.
-//   * __HIPCC_RTC__ (RTC mode, both passes of a TU built with
-//     -D__HIPCC_RTC__, i.e. the codegen-emitted .device.cu files):
-//     hip_minimal only. Their host pass has no kernel body and only
-//     needs the bare keyword fallbacks; the full <hip/hip_runtime.h>
-//     would be a 100K-line waste and would also pull in
-//     <hip/amd_detail/hip_fp16.h>, which depends on the wrapper that
-//     RTC short-circuits.
-//   * Otherwise (host pass of a non-RTC TU, e.g. all_instances_host.cu
-//     or opus_gemm.cu): full runtime, because ATen / ck_tile /
-//     pybind11 expect it.
+//   * __HIPCC_RTC__ (RTC mode, both passes of a TU built with -D__HIPCC_RTC__, i.e. the codegen-emitted .device.cu
+//     files): hip_minimal only. Their host pass has no kernel body and only needs the bare keyword fallbacks; the full
+//     <hip/hip_runtime.h> would be a 100K-line waste and would also pull in <hip/amd_detail/hip_fp16.h>, which depends
+//     on the wrapper that RTC short-circuits.
+//   * Otherwise (host pass of a non-RTC TU, e.g. all_instances_host.cu or opus_gemm.cu): full runtime, because ATen /
+//     ck_tile / pybind11 expect it.
 //
-// hip_bf16 / hip_fp8 stay in the full-runtime branch only: opus.hpp
-// defines bf16_t / fp8_t via compiler built-ins (__bf16, _BitInt(8))
-// so the legacy HIP type aliases are dead code on the device side.
+// hip_bf16 / hip_fp8 stay in the full-runtime branch only: opus.hpp defines bf16_t / fp8_t via compiler built-ins
+// (__bf16, _BitInt(8)) so the legacy HIP type aliases are dead code on the device side.
 #if defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC_RTC__)
 #include <opus/hip_minimal.hpp>
 #else
@@ -34,10 +29,8 @@ using bf16_t = opus::bf16_t;
 using fp32_t = opus::fp32_t;
 using opus::operator""_I;
 
-// CHECK_HIP / CHECK_HIP_KERNEL_LAUNCH are host-only diagnostics; the
-// macros are only expanded at host call sites (no kernel body uses
-// them) so we can leave the macros visible to both passes without
-// hurting device-side parsing.
+// CHECK_HIP / CHECK_HIP_KERNEL_LAUNCH are host-only diagnostics; the macros are only expanded at host call sites (no
+// kernel body uses them) so we can leave the macros visible to both passes without hurting device-side parsing.
 #define CHECK_HIP(call)                                                                                   \
     do {                                                                                                  \
         hipError_t status_ = call;                                                                        \

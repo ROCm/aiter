@@ -73,8 +73,7 @@ template <typename... Args>
         }                                                                            \
     } while(0)
 
-// Fatal on any HIP error -- use for init/teardown/resource management where
-// failure means unrecoverable state.
+// Fatal on any HIP error -- use for init/teardown/resource management where failure means unrecoverable state.
 #define HIP_CALL(call)                                                                  \
     do                                                                                  \
     {                                                                                   \

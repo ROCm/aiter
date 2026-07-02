@@ -16,15 +16,13 @@ const int32_t BlockSize           = 256;
 const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
-// emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
-// byte scale, fp8 / i8 output a continuous fp32 per-group scale.
+// emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0 byte scale, fp8 / i8 output a
+// continuous fp32 per-group scale.
 //
-// emit_e8m0_scale = true (opt-in for fp8): compute a power-of-2 per-group
-// scale via f32_to_e8m0_scale and write a single E8M0 byte per group,
-// matching the fp4 byte layout. Used by the MXFP8 "split" path
-// `per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)` so the
-// produced byte scale is directly consumable by `mxfp4_moe_sort_hip` /
-// MXFP8 GEMM kernels without a post-hoc fp32 -> e8m0 conversion.
+// emit_e8m0_scale = true (opt-in for fp8): compute a power-of-2 per-group scale via f32_to_e8m0_scale and write a
+// single E8M0 byte per group, matching the fp4 byte layout. Used by the MXFP8 "split" path
+// `per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)` so the produced byte scale is directly consumable
+// by `mxfp4_moe_sort_hip` / MXFP8 GEMM kernels without a post-hoc fp32 -> e8m0 conversion.
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false>
 __global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
@@ -43,8 +41,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                       || std::is_same_v<DTYPE_O, opus::fp8_t>,
                   "emit_e8m0_scale is only valid for fp4 / fp8 outputs");
 
-    // fp4 always emits e8m0 byte scale (no fp32-scale variant exists today);
-    // fp8 emits e8m0 byte scale iff caller opted in via emit_e8m0_scale.
+    // fp4 always emits e8m0 byte scale (no fp32-scale variant exists today); fp8 emits e8m0 byte scale iff caller
+    // opted in via emit_e8m0_scale.
     static constexpr bool use_e8m0_scale =
         std::is_same_v<DTYPE_O, opus::fp4_t> || emit_e8m0_scale;
 
@@ -56,9 +54,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int64_t row_offset       = static_cast<int64_t>(blockIdx.x) * block_size;
     int64_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
-    // Shuffle tiles e8m0 bytes 8-wide along scaleN regardless of element
-    // dtype, so the padding applies to any e8m0-scale path (fp4 always,
-    // fp8 only when emit_e8m0_scale).
+    // Shuffle tiles e8m0 bytes 8-wide along scaleN regardless of element dtype, so the padding applies to any
+    // e8m0-scale path (fp4 always, fp8 only when emit_e8m0_scale).
     int32_t scaleN_pad       = (use_e8m0_scale && shuffle_scale)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
@@ -81,10 +78,9 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, opus::fp4_t> ? thread_data_size / 2 : thread_data_size;
-    // The non-e8m0 (continuous fp32-scale) path uses the exact 1/DTYPE_MAX
-    // divisor. The e8m0 path instead derives a power-of-2 scale via
-    // fp_f32_to_e8m0_scale<> below (which folds in / max_pos), so it does not
-    // use this divisor.
+    // The non-e8m0 (continuous fp32-scale) path uses the exact 1/DTYPE_MAX divisor. The e8m0 path instead derives a
+    // power-of-2 scale via fp_f32_to_e8m0_scale<> below (which folds in / max_pos), so it does not use this
+    // divisor.
     const float inverted_DTYPE_MAX =
         (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
@@ -97,11 +93,9 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
     absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
-    // MX e8m0 path: use the project-wide default round mode
-    // (``kDefaultMxScaleRoundMode``, currently RoundUp = NV / DSv4 RCEIL).
-    // The helper returns the dequant scale (e.g. ceil_pow2(amax/max_pos))
-    // directly, so the (>>23)&0xFF extraction yields the e8m0 byte. fp4
-    // always e8m0; fp8 only when emit_e8m0_scale (use_e8m0_scale gates this).
+    // MX e8m0 path: use the project-wide default round mode (``kDefaultMxScaleRoundMode``, currently RoundUp = NV /
+    // DSv4 RCEIL). The helper returns the dequant scale (e.g. ceil_pow2(amax/max_pos)) directly, so the (>>23)&0xFF
+    // extraction yields the e8m0 byte. fp4 always e8m0; fp8 only when emit_e8m0_scale (use_e8m0_scale gates this).
     // rmode is shared across fp4/fp8; only the dtype constant differs.
     float inverted_scale;
     if constexpr (use_e8m0_scale)
@@ -145,15 +139,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             scale[groupId] = inverted_scale;
         }
     }
-    // The reciprocal is required by the store path, not by the scale-derivation
-    // mode: fp4 store uses the hardware `cvt_scalef32_pk_fp4_f32` intrinsic
-    // which consumes the e8m0 byte directly (so `inverted_scale` stays as the
-    // scale factor `pow2_amax / max_pow2`); fp8/i8 store does software
-    // `input * inv_scale` and therefore needs `inv_scale = 1 / row_scale`
-    // regardless of whether `row_scale` was derived via e8m0 (power-of-2)
-    // or the continuous `absMax * inv_DTYPE_MAX` formula. Earlier this gate
-    // was on `use_e8m0_scale` which silently skipped the reciprocal for the
-    // fp8 + e8m0 path and produced fp8 bytes ~2x off (`split_elem_err ≈ 100%`).
+    // The reciprocal is required by the store path, not by the scale-derivation mode: fp4 store uses the hardware
+    // `cvt_scalef32_pk_fp4_f32` intrinsic which consumes the e8m0 byte directly (so `inverted_scale` stays as the
+    // scale factor `pow2_amax / max_pow2`); fp8/i8 store does software `input * inv_scale` and therefore needs
+    // `inv_scale = 1 / row_scale` regardless of whether `row_scale` was derived via e8m0 (power-of-2) or the
+    // continuous `absMax * inv_DTYPE_MAX` formula. Earlier this gate was on `use_e8m0_scale` which silently skipped
+    // the reciprocal for the fp8 + e8m0 path and produced fp8 bytes ~2x off (`split_elem_err ≈ 100%`).
     inverted_scale =
         std::is_same_v<DTYPE_O, opus::fp4_t> ? inverted_scale : 1.0f / inverted_scale;
 
@@ -860,8 +851,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
 
     AITER_CHECK(cols % group_size == 0, __func__, " cols is not divisible by group_size");
 
-    // Decide e8m0 vs fp32 scale path from scales.dtype(). Note u8 alias is
-    // accepted for callers that build the scale tensor as raw uint8.
+    // Decide e8m0 vs fp32 scale path from scales.dtype(). Note u8 alias is accepted for callers that build the
+    // scale tensor as raw uint8.
     const bool use_e8m0_scale =
         scales.dtype() == AITER_DTYPE_fp8_e8m0 || scales.dtype() == AITER_DTYPE_u8;
     AITER_CHECK(use_e8m0_scale || scales.dtype() == AITER_DTYPE_fp32,
@@ -885,9 +876,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             using out_t = decltype(out_type_tag);
             constexpr bool ss = decltype(shuffle_tag)::value;
             constexpr bool ee = decltype(e8m0_tag)::value;
-            // e8m0 + shuffle pads scaleN up to a multiple of 8 (tile width)
-            // regardless of element dtype; non-shuffle / fp32-scale paths
-            // use exactly `rows * scaleN` slots.
+            // e8m0 + shuffle pads scaleN up to a multiple of 8 (tile width) regardless of element dtype;
+            // non-shuffle / fp32-scale paths use exactly `rows * scaleN` slots.
             int num_group;
             if constexpr(ee)
             {
@@ -958,9 +948,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
     )
 }
 
-// Backward-compat thin forwarder. Asserts fp4x2/u8 output and delegates to
-// the dtype-aware canonical entry. Existing callers (Python compile_ops
-// binding `dynamic_per_group_scaled_quant_fp4`, downstream tests, etc.)
+// Backward-compat thin forwarder. Asserts fp4x2/u8 output and delegates to the dtype-aware canonical entry.
+// Existing callers (Python compile_ops binding `dynamic_per_group_scaled_quant_fp4`, downstream tests, etc.)
 // continue to work unchanged.
 void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
                                         const aiter_tensor_t& input, // [..., d]
@@ -1679,12 +1668,10 @@ void moe_smooth_per_token_scaled_quant_v2(
 }
 
 
-// Fused dynamic MX (fp4 / fp8) quantization + MoE-sort writeback.
-// Template parameter DTYPE_O selects the element format (opus::fp4_t for MXFP4,
-// opus::fp8_t for MXFP8); both paths emit the same E8M0 scale byte layout via
-// `aiter::mx_scale_shuffle_idx`. The legacy kernel name
-// `mxfp4_quant_moe_sort_kernel` was misleading because it implied fp4-only
-// — the implementation has always been dtype-templated.
+// Fused dynamic MX (fp4 / fp8) quantization + MoE-sort writeback. Template parameter DTYPE_O selects the element
+// format (opus::fp4_t for MXFP4, opus::fp8_t for MXFP8); both paths emit the same E8M0 scale byte layout via
+// `aiter::mx_scale_shuffle_idx`. The legacy kernel name `mxfp4_quant_moe_sort_kernel` was misleading because it
+// implied fp4-only — the implementation has always been dtype-templated.
 template <typename DTYPE_O, int thread_data_size>
 __device__ void store_zero_mx_quant_moe_sort_row(
     DTYPE_O* __restrict__ out,
@@ -1757,18 +1744,15 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                                                 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4));
     using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
     using vec_f = opus::vector_t<float, vec_size_i>;
-    // Continuous fp32 scale divisor for non-MX dtypes (e.g. int8). MX dtypes
-    // (fp4 / fp8) take the e8m0 path via fp_f32_to_e8m0_scale<RoundUp, dtype>
-    // below, which returns a pure pow-2 dequant scale directly.
+    // Continuous fp32 scale divisor for non-MX dtypes (e.g. int8). MX dtypes (fp4 / fp8) take the e8m0 path via
+    // fp_f32_to_e8m0_scale<RoundUp, dtype> below, which returns a pure pow-2 dequant scale directly.
     const float inverted_DTYPE_MAX =
         1.0f / static_cast<float>(opus::finfo<DTYPE_O>::max());
 
-    // HW-native FP8 element dtype: gfx942 ships e4m3fnuz (max_pos=240),
-    // gfx950+ ships OCP e4m3fn (max_pos=448). The legacy
-    // ``fp_f32_to_e8m0_scale<RoundUp, FP4>(absMax) * 1/floor_pow2(MAX)`` formula here used
-    // to over-scale the FP8 working value by ~2x (factor*amax > max_pos),
-    // saturating the high tail; emit_mx_e8m0_scale<RoundUp, dtype> picks the
-    // correct ``ceil_pow2(amax / max_pos)`` per arch instead.
+    // HW-native FP8 element dtype: gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn (max_pos=448). The
+    // legacy ``fp_f32_to_e8m0_scale<RoundUp, FP4>(absMax) * 1/floor_pow2(MAX)`` formula here used to over-scale the
+    // FP8 working value by ~2x (factor*amax > max_pos), saturating the high tail; emit_mx_e8m0_scale<RoundUp,
+    // dtype> picks the correct ``ceil_pow2(amax / max_pos)`` per arch instead.
     constexpr aiter::MxDtype kHwFp8Dtype =
 #if defined(__gfx942__)
         aiter::MxDtype::FP8_E4M3_FNUZ;
@@ -1840,12 +1824,10 @@ __global__ void fused_mx_quant_moe_sort_kernel(
             }
             absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
-            // MXFP4 / MXFP8 use the project-wide default round mode
-            // (kDefaultMxScaleRoundMode, currently NV ROUND_UP =
-            // ceil_pow2(amax / max_pos)). The helper returns the dequant
-            // scale as a pow-2 fp32, so the ``(>> 23) & 0xFF`` extraction
-            // below yields the stored e8m0 byte directly. Other dtypes fall
-            // back to a continuous fp32 scale.
+            // MXFP4 / MXFP8 use the project-wide default round mode (kDefaultMxScaleRoundMode, currently NV
+            // ROUND_UP = ceil_pow2(amax / max_pos)). The helper returns the dequant scale as a pow-2 fp32, so the
+            // ``(>> 23) & 0xFF`` extraction below yields the stored e8m0 byte directly. Other dtypes fall back to a
+            // continuous fp32 scale.
             float row_scale;
             if constexpr (std::is_same_v<DTYPE_O, opus::fp4_t>)
             {
@@ -1985,11 +1967,10 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     }
 }
 
-// Perf gate for the coalesced LDS-staged store path in mxfp4_moe_sort_kernel
-// (below): cost scales with scaleN_pad (LDS footprint/row) x num_blocks (grid
-// tiles). Threshold picked empirically between the largest known win (516,096)
-// and the smallest regression (974,848) on MI355X/gfx950. Perf-only: both the
-// coalesced and scatter paths are byte-exact.
+// Perf gate for the coalesced LDS-staged store path in mxfp4_moe_sort_kernel (below): cost scales with scaleN_pad
+// (LDS footprint/row) x num_blocks (grid tiles). Threshold picked empirically between the largest known win
+// (516,096) and the smallest regression (974,848) on MI355X/gfx950. Perf-only: both the coalesced and scatter paths
+// are byte-exact.
 constexpr long MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX = 700000;
 
 template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32>
@@ -2038,15 +2019,14 @@ __global__ void mxfp4_moe_sort_kernel(
     {
       if(((long)scaleN_pad * (long)num_blocks) <= MXFP4_MOE_SORT_COALESCED_LDS_WORK_MAX)
       {
-        // LDS holds 32 rows x scaleN_pad bytes, zero-staged so invalid rows and
-        // padding columns store 0 (byte-exact with the zero-initialised reference).
+        // LDS holds 32 rows x scaleN_pad bytes, zero-staged so invalid rows and padding columns store 0 (byte-exact
+        // with the zero-initialised reference).
         //
-        // LDS row stride is padded (LDS_STRIDE = lds_cols + LDS_PAD) instead of
-        // using scaleN_pad directly: an unpadded stride that's a multiple of 32
-        // dwords (e.g. scaleN_pad=128 at dim=4096) would alias all 32 rows of a
-        // tile onto one LDS bank, causing ~32-way bank conflicts on read-out.
-        // The extra 4 bytes breaks the aliasing while keeping dword alignment;
-        // out_scale still addresses via scaleN_pad, so output bytes are unaffected.
+        // LDS row stride is padded (LDS_STRIDE = lds_cols + LDS_PAD) instead of using scaleN_pad directly: an
+        // unpadded stride that's a multiple of 32 dwords (e.g. scaleN_pad=128 at dim=4096) would alias all 32 rows
+        // of a tile onto one LDS bank, causing ~32-way bank conflicts on read-out. The extra 4 bytes breaks the
+        // aliasing while keeping dword alignment; out_scale still addresses via scaleN_pad, so output bytes are
+        // unaffected.
         constexpr int lds_cols   = threads_per_row * thread_data_size;
         constexpr int LDS_PAD    = 4;
         constexpr int LDS_STRIDE = lds_cols + LDS_PAD;
@@ -2054,10 +2034,9 @@ __global__ void mxfp4_moe_sort_kernel(
 
         for(; block_idx < num_blocks; block_idx += num_tg)
         {
-            // Skip tiles entirely in the padding region (all rows >= num_valid_ids):
-            // output is pre-zeroed so this is byte-exact and avoids streaming zeros
-            // to the large E*block_m padding region. block_idx is block-uniform, so
-            // no __syncthreads hazard from the early continue.
+            // Skip tiles entirely in the padding region (all rows >= num_valid_ids): output is pre-zeroed so this
+            // is byte-exact and avoids streaming zeros to the large E*block_m padding region. block_idx is
+            // block-uniform, so no __syncthreads hazard from the early continue.
             if(block_idx * num_rows >= num_valid_ids_value)
             {
                 continue;

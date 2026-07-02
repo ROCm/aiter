@@ -277,9 +277,8 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     QoState<Traits> qo_state(
         params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_qo_lens, params.p_seqlens_qo_indptr);
 
-    // Step.1. Calculate the size of cluster and some related information. The size is the number of
-    // workgroups
-    //         composing each cluster. The size is determined by average packed qo length.
+    // Step.1. Calculate the size of cluster and some related information. The size is the number of workgroups
+    // composing each cluster. The size is determined by average packed qo length.
     const int32_t sum_qo_len   = warp_sum(p_lds_qo_lens, params.num_batches);
     const int32_t cluster_size = [&]() {
         const int32_t avg_qo_len = sum_qo_len / params.num_batches;

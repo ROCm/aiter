@@ -106,8 +106,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
             const int32_t local_qo_start = query_tile_ranges[idx].first;
             const int32_t local_qo_end   = query_tile_ranges[idx].second;
 
-            // For causal attention, each query position can only attend to
-            // earlier positions, limiting the KV range
+            // For causal attention, each query position can only attend to earlier positions, limiting the KV range
             const int32_t effective_kv_length =
                 is_causal ? std::min(kv_length - qo_length + local_qo_end, kv_length) : kv_length;
             const int32_t num_units =
@@ -177,8 +176,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                     if(remaining_kv_len <= blocks_capacity * block_size + SPLIT_KV_OVERHEAD)
                     {
                         consuming_blocks = remaining_blocks;
-                        // This TG can process all of this qo_tile's remaining_blocks to the causal
-                        // boundary
+                        // This TG can process all of this qo_tile's remaining_blocks to the causal boundary
                         const int32_t partial_o_loc =
                             (current_block_idx == 0)
                                 ? -1
@@ -200,8 +198,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                     }
                     else
                     {
-                        // This TG can only process part of this qotile's KV units under
-                        // blocks_capacity
+                        // This TG can only process part of this qotile's KV units under blocks_capacity
                         consuming_blocks            = blocks_capacity;
                         const int32_t partial_o_loc = qlen_granularity * partial_tile_idx++;
 

@@ -110,11 +110,9 @@ struct MlaReduceKernelV1Params
 // separate from MlaReduceKernelV1Params, which only carries problem inputs).
 struct MlaReduceKernelV1Configs
 {
-    // Capacity (in #splits) of the p_lds_lse_scale / p_lds_local_lse LDS
-    // regions. The massive LSE path writes a fixed span per bucket
-    // (num_lse_per_thr * wave_size), which can exceed max_splits, so these
-    // regions are sized to that span instead of max_splits. See
-    // dispatch_mla_reduce_v1 for the exact formula.
+    // Capacity (in #splits) of the p_lds_lse_scale / p_lds_local_lse LDS regions. The massive LSE path writes a fixed
+    // span per bucket (num_lse_per_thr * wave_size), which can exceed max_splits, so these regions are sized to that
+    // span instead of max_splits. See dispatch_mla_reduce_v1 for the exact formula.
     int32_t lds_scale_cap;
 };
 

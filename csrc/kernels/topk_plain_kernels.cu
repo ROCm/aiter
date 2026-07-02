@@ -1134,8 +1134,7 @@ using KernelFuncPtr =
     void (*)(const DataT*, const IdxT*, int, IdxT, IdxT, DataT*, IdxT*, compute_t<DataT>);
 
 // Helper: Map block-level strategy class to its corresponding kernel function template
-// UseBufferAddressing: Controls whether BlockTopkFilter uses buffer addressing (limited to
-// UINT_MAX)
+// UseBufferAddressing: Controls whether BlockTopkFilter uses buffer addressing (limited to UINT_MAX)
 template <template <int, bool, typename, typename> class StrategyClass,
           bool UseBufferAddressing = true>
 struct StrategyKernelSelector

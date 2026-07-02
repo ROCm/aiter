@@ -2,18 +2,16 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // gfx1250 MXFP8 x {MXFP8, MXFP4} GEMM ASM dispatch (kernarg preload mode).
-// A (activation) is always MXFP8 (e4m3, 1 byte/elem); B (weight) is either
-// MXFP8 (a8w8) or MXFP4 (a8w4, e2m1, 2 elems/byte). Both operands carry OCP
-// micro-scaling block scales (e8m0, one per 32 K-elements).
+// A (activation) is always MXFP8 (e4m3, 1 byte/elem); B (weight) is either MXFP8 (a8w8) or MXFP4 (a8w4, e2m1, 2
+// elems/byte). Both operands carry OCP micro-scaling block scales (e8m0, one per 32 K-elements).
 //
 // Two entrypoints:
 //   - mxfp8_mxfp8_gemm_asm: D[M,N] bf16 = A[M,K] mxfp8 * B[N,K] mxfp8   (a8w8)
 //   - mxfp8_mxfp4_gemm_asm: D[M,N] bf16 = A[M,K] mxfp8 * B[N,K/2] mxfp4 (a8w4)
 //
-// KernelArgs is the POC packed preload layout (76B): 5 ptrs (MEM-first) + 9
-// tight 4B scalars. The persistent+cluster shaders self-schedule tiles, so
-// unlike f4gemm there are no log2_grid kernargs -- the host only supplies
-// M/N/K/batch and launches on a fixed cluster grid.
+// KernelArgs is the POC packed preload layout (76B): 5 ptrs (MEM-first) + 9 tight 4B scalars. The persistent+cluster
+// shaders self-schedule tiles, so unlike f4gemm there are no log2_grid kernargs -- the host only supplies M/N/K/batch
+// and launches on a fixed cluster grid.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_mxfp8fp4gemm_configs.hpp"
@@ -28,9 +26,8 @@ constexpr int B_DTYPE_FP4     = 1;
 constexpr int MX_SCALE_BLOCK  = 32; // OCP MX block size (e8m0, one scale / 32 K)
 constexpr int K_ALIGN         = 128; // POC requires K % 128 == 0
 
-// Packed preload KernelArgs (4B-tight, MEM-first). Offsets in comments are the
-// kernarg byte offsets the preload-aware shader s_load's from. Must stay
-// bit-identical to the POC host struct (sizeof == 76).
+// Packed preload KernelArgs (4B-tight, MEM-first). Offsets in comments are the kernarg byte offsets the preload-aware
+// shader s_load's from. Must stay bit-identical to the POC host struct (sizeof == 76).
 struct __attribute__((packed)) KernelArgs
 {
     void*        ptr_D;        // s[2:3]   off 0x00
@@ -50,8 +47,7 @@ struct __attribute__((packed)) KernelArgs
 };
 static_assert(sizeof(KernelArgs) == 76, "mxfp8fp4 preload KernelArgs must be 76B");
 
-// Pick the best registered kernel variant for (M,N,K) given the B dtype and
-// a_preshuffle.
+// Pick the best registered kernel variant for (M,N,K) given the B dtype and a_preshuffle.
 static std::tuple<std::string, int> get_heuristic_kernel(
     int M, int N, int K, std::string arch_id, int b_intype, int a_preshuffle, CFG* cfgs)
 {
@@ -76,10 +72,9 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         int cl_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
         int cl_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
-        // N is cluster-tiled with no partial-tile masking, so it must tile
-        // exactly. M must fill tile_m only when clustered (cluster_y > 1); a
-        // cluster_y==1 tile lets the persistent scheduler run a partial
-        // trailing M-tile bounded by the M kernarg, so small M picks 64mx1_128nx4.
+        // N is cluster-tiled with no partial-tile masking, so it must tile exactly. M must fill tile_m only when
+        // clustered (cluster_y > 1); a cluster_y==1 tile lets the persistent scheduler run a partial trailing M-tile
+        // bounded by the M kernarg, so small M picks 64mx1_128nx4.
         if((N % cfg.tile_n) != 0)
             continue;
         if(cl_y > 1 && (M % cfg.tile_m) != 0)
@@ -247,8 +242,8 @@ static void mxfp8fp4_mi400_launch(aiter_tensor_t* A,
 
     if(persistent)
     {
-        // 1D persistent launch: wg_max threadgroups along X, Y carries only the
-        // cluster_y rows. grid_x = wg_max / (cluster_x*cluster_y).
+        // 1D persistent launch: wg_max threadgroups along X, Y carries only the cluster_y rows. grid_x = wg_max /
+        // (cluster_x*cluster_y).
         const int cluster_size = cluster_x * cluster_y;
         AITER_CHECK(cluster_size > 0 && (wg_max % cluster_size) == 0,
                     __func__, " persistent wg_max=", wg_max,

@@ -47,9 +47,8 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
     }
     std::sort(batch_infos.begin(), batch_infos.end(), std::greater<BatchInfo>());
 
-    // Step.1. Calculate the size of cluster and some related information. The size is the number of
-    // workgroups
-    //         composing each cluster. The size is determined by average packed qo length.
+    // Step.1. Calculate the size of cluster and some related information. The size is the number of workgroups
+    // composing each cluster. The size is determined by average packed qo length.
     const int32_t cluster_size = [&]() {
         const int32_t avg_packed_qo_len = sum_packed_qo_len / num_batches;
         const int32_t cluster_size =
@@ -146,8 +145,7 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
                 cal_kv_len(workload_limit_global - accum_cost_top, cluster_len_q);
             const int32_t num_splits_estimated =
                 integer_divide_ceil(remaining_kv_len, remaining_capability_top);
-            // For the case of #splits==2, make sure that the tailing tile is smaller than
-            // Traits::kSplitTolerance.
+            // For the case of #splits==2, make sure that the tailing tile is smaller than Traits::kSplitTolerance.
             const bool split_kv =
                 (num_splits_estimated == 2)
                     ? ((remaining_kv_len - remaining_capability_top) > Traits::kSplitTolerance)

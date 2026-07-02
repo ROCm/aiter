@@ -85,9 +85,8 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
         sum_blocks);
 }
 
-// Parallel planner: Phase 1 (warp 0) runs an O(num_batches) scan
-// recording each batch's start CU / remainder / prefix counts;
-// phase 2 fills every batch's fragments in parallel (one warp per batch).
+// Parallel planner: Phase 1 (warp 0) runs an O(num_batches) scan recording each batch's start CU / remainder / prefix
+// counts; phase 2 fills every batch's fragments in parallel (one warp per batch).
 template <typename Traits>
 __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
     void kn_get_mla_metadata_v1_2_parallel(MlaMetadataV1KernelParameter params)
@@ -287,8 +286,7 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
             }
         }
 
-        // Each fragment -> one work covering kv blocks [block_begin, block_end)
-        // of this batch, landing in CU frag_cu.
+        // Each fragment -> one work covering kv blocks [block_begin, block_end) of this batch, landing in CU frag_cu.
         for(int32_t frag_idx = lane_idx; frag_idx < num_frags; frag_idx += opus::get_warp_size())
         {
             int32_t block_begin, block_end, frag_cu;
@@ -787,8 +785,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     auto arch_id = get_gpu_arch();
 
-    // In the following cases, we use #head=16 to simulate cases which is not natively supported by
-    // mla main kernel.
+    // In the following cases, we use #head=16 to simulate cases which is not natively supported by mla main kernel.
     const bool q_is_fp8 =
         (q_dtype == at::ScalarType::Float8_e4m3fnuz || q_dtype == at::ScalarType::Float8_e4m3fn);
     const bool kv_is_fp8 =

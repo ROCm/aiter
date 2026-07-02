@@ -165,10 +165,8 @@ constexpr inline __attribute__((always_inline)) __device__ int get_mantissa_bits
 }
 
 /*!
- * \brief Fallback to software fast dequant implementation if hardware dequantization is not
- * available.
- * \note Inspired by Marlin's fast dequantization, but here we don't have to permute
- * weights order.
+ * \brief Fallback to software fast dequant implementation if hardware dequantization is not available.
+ * \note Inspired by Marlin's fast dequantization, but here we don't have to permute weights order.
  * \ref
  * https://github.com/vllm-project/vllm/blob/6dffa4b0a6120159ef2fe44d695a46817aff65bc/csrc/quantization/fp8/fp8_marlin.cu#L120
  */

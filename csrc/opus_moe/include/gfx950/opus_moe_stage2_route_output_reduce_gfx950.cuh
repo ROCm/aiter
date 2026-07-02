@@ -91,8 +91,7 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
         const uint8_t* __restrict__ ro8 = kargs.route_out;
         const int64_t rstride = kargs.route_out_row_bytes;
         const int scale_off = kargs.model_dim;
-        // Interleave each 8-column read/sum/write group to keep loads wide while
-        // overlapping the final bf16 writes.
+        // Interleave each 8-column read/sum/write group to keep loads wide while overlapping the final bf16 writes.
         constexpr int NG = elems_per_thread / 8;
 #pragma unroll
         for(int group = 0; group < NG; ++group)
@@ -378,9 +377,8 @@ inline void opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
     const int block_n = opus_moe_stage2_reduce_token_slot_route_output_select_block_n(
         kargs.model_dim, requested_block_n);
     dim3 grid(kargs.token_num, (kargs.model_dim + block_n - 1) / block_n, 1);
-    // Specialize for common topk values (unrolls the slot loop -> all loads
-    // issued up front, hiding latency); otherwise fall back to the runtime-topk
-    // kernel (TOPK=0), which is correct for any topk.
+    // Specialize for common topk values (unrolls the slot loop -> all loads issued up front, hiding latency);
+    // otherwise fall back to the runtime-topk kernel (TOPK=0), which is correct for any topk.
     switch(kargs.topk)
     {
     case 4:

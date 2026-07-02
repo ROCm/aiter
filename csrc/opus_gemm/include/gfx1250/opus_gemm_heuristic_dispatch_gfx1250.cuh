@@ -11,8 +11,7 @@
 // tile from the kid set whose B_M divides M and B_N divides N, preferring the
 // B_M=16 "tileN" family for small M and the "tileM" family for larger M.
 //
-// MUST stay in sync with opus_gemm_common.py :: gfx1250_kernels_list and
-// HEURISTIC_DEFAULT_KIDS_GFX1250.
+// MUST stay in sync with opus_gemm_common.py :: gfx1250_kernels_list and HEURISTIC_DEFAULT_KIDS_GFX1250.
 #pragma once
 
 // Kid map (B_K=128 chosen here; tuner explores B_K 256/512 + the P/wg space).

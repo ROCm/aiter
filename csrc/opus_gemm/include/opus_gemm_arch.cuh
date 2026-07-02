@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Runtime architecture probe shared by all opus dispatch shells. Per-arch
-// dispatch lives in opus_gemm_arch_<arch>.cuh (included only by opus_gemm.cu).
+// Runtime architecture probe shared by all opus dispatch shells. Per-arch dispatch lives in opus_gemm_arch_<arch>.cuh
+// (included only by opus_gemm.cu).
 #pragma once
 
 #include "aiter_hip_common.h"  // AITER_CHECK + hip_runtime (torch-free)

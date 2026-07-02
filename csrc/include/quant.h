@@ -24,8 +24,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     int num_rows_factor                     = 1);
 
 // Canonical dtype-aware per-group dynamic quant. Accepts fp8 / i8 / fp4x2.
-// For fp4x2 it writes an e8m0 byte per group; for fp8/i8 it writes an
-// fp32 per-group scale.
+// For fp4x2 it writes an e8m0 byte per group; for fp8/i8 it writes an fp32 per-group scale.
 void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     const aiter_tensor_t& input, // [..., d]
                                     aiter_tensor_t& scales,

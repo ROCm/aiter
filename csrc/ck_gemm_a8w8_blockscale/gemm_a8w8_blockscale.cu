@@ -8,17 +8,15 @@
 #include <torch/extension.h>
 
 #include "gemm_a8w8_blockscale_common.cuh"
-// lookup.h is included by gemm_a8w8_blockscale_lookup_fp16.cu and
-// gemm_a8w8_blockscale_lookup_bf16.cu, not here, so ninja can expand
-// GENERATE_LOOKUP_TABLE for FP16 and BF16 in parallel.
+// lookup.h is included by gemm_a8w8_blockscale_lookup_fp16.cu and gemm_a8w8_blockscale_lookup_bf16.cu, not here, so
+// ninja can expand GENERATE_LOOKUP_TABLE for FP16 and BF16 in parallel.
 #include "gemm_a8w8_blockscale_manifest.h"
 
 using BlockwiseKernel = torch::Tensor (*)(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
-// Name-keyed dispatch table.  Keys are std::string_view onto the kernel-name
-// string literals in the generated *_lookup.h (static storage, permanently
-// valid).  Values are raw fn ptrs so the table is trivially destructible and
+// Name-keyed dispatch table.  Keys are std::string_view onto the kernel-name string literals in the generated
+// *_lookup.h (static storage, permanently valid).  Values are raw fn ptrs so the table is trivially destructible and
 // constant-initialized into .data.rel.ro (no per-pair std::function cost).
 using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 
@@ -26,12 +24,10 @@ using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>
 extern const BlockwiseKernelMap& get_blockscale_lookup_fp16();
 extern const BlockwiseKernelMap& get_blockscale_lookup_bf16();
 
-// Python-driven name-keyed dispatch.  The Python frontend
-// (aiter/ops/gemm_op_a8w8.py) reads a8w8_blockscale_tuned_gemm.csv and passes
-// the resolved `kernelName` here; the CSV is the single source of truth.
+// Python-driven name-keyed dispatch.  The Python frontend (aiter/ops/gemm_op_a8w8.py) reads
+// a8w8_blockscale_tuned_gemm.csv and passes the resolved `kernelName` here; the CSV is the single source of truth.
 //
-// Empty kernelName -> Python had no tuned row (or AITER_BYPASS_TUNE_CONFIG=1);
-//   use the heuristic default kernel.
+// Empty kernelName -> Python had no tuned row (or AITER_BYPASS_TUNE_CONFIG=1); use the heuristic default kernel.
 // Non-empty kernelName not in registry -> hard error: the CSV references a
 //   kernel not compiled into this .so (CSV updated without rebuilding aiter).
 template <typename DDataType, typename EDataType = DDataType>

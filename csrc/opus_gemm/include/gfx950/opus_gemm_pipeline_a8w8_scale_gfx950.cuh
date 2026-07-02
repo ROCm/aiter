@@ -542,9 +542,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
     store<T::VEC_C>(g_c, v_c[1][0], u_gc, c_offset(1, 0));
     store<T::VEC_C>(g_c, v_c[1][1], u_gc, c_offset(1, 1));
 #else
-    // Non-gfx950 device pass: empty stub. a8w8 is gfx950-only; the host
-    // launcher symbol must still exist for the unconditional dispatcher
-    // reference, but the body uses gfx950-only intrinsics.
+    // Non-gfx950 device pass: empty stub. a8w8 is gfx950-only; the host launcher symbol must still exist for the
+    // unconditional dispatcher reference, but the body uses gfx950-only intrinsics.
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }

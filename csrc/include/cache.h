@@ -65,8 +65,7 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
 
 void concat_and_cache_mla(aiter_tensor_t& kv_c,         // [num_tokens, kv_lora_rank]
                           aiter_tensor_t& k_pe,         // [num_tokens, pe_dim]
-                          aiter_tensor_t& kv_cache,     // [num_blocks, block_size, (kv_lora_rank +
-                                                        // pe_dim)]
+                          aiter_tensor_t& kv_cache,     // [num_blocks, block_size, (kv_lora_rank + pe_dim)]
                           aiter_tensor_t& slot_mapping,  // [num_tokens] or [num_actual_tokens]
                           const std::string& kv_cache_dtype,
                           aiter_tensor_t& scale);

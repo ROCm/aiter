@@ -133,8 +133,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     (q, k, v, out, lse, sink, softmax_scale, is_causal, return_lse, stream))
 {
     // ---- null + multi-GPU safety -----------------------------------------
-    // Validate pointers before touching the device so device_guard can safely
-    // read q->device_id.
+    // Validate pointers before touching the device so device_guard can safely read q->device_id.
     AITER_CHECK(q && k && v && out && lse,
                 "fmha_fwd_with_sink_asm: q/k/v/out/lse must all be non-null");
 
@@ -310,8 +309,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const int  gdy         = q_head_num;
     const int  gdz         = batch;
 
-    // All _rxy kernels use remap_xy=1: swap gdx↔gdy at launch so that
-    // bid.x indexes heads and bid.y indexes Q-tiles.
+    // All _rxy kernels use remap_xy=1: swap gdx↔gdy at launch so that bid.x indexes heads and bid.y indexes Q-tiles.
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdy,   // launch_gdx = head count  (swapped)

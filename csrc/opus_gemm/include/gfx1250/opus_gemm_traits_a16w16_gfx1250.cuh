@@ -23,8 +23,7 @@
 #include <type_traits>
 
 // ── Consumer-wave tiling layout ─────────────────────────────────────────────
-// The 4-wave pipeline is fixed at 2 producers + 2 consumers; the 2 consumers
-// split ONE dimension of the B_M x B_N tile:
+// The 4-wave pipeline is fixed at 2 producers + 2 consumers; the 2 consumers split ONE dimension of the B_M x B_N tile:
 //   TileN: consumers split along N (kTileM=1, kTileN=2) -- best for small M.
 //   TileM: consumers split along M (kTileM=2, kTileN=1) -- generalizes M.
 namespace opus_gfx1250 {
@@ -267,8 +266,7 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
 //    constexpr beyond loop-index helpers. ────────────────────────────────────
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
 
-// smem TILE layout (what the TDM write produces, ra/rb read): row-major
-// [rows][K] with padded row pitch.
+// smem TILE layout (what the TDM write produces, ra/rb read): row-major [rows][K] with padded row pitch.
 template <typename T>
 __device__ inline auto make_layout_sa_ctdm() {
     return opus::make_layout<0>(
@@ -282,8 +280,7 @@ __device__ inline auto make_layout_sb_ctdm() {
         opus::make_tuple(opus::number<T::kSmemPitch>{}, 1_I));
 }
 
-// A operand (M x K) read layout. wave_m selects this consumer's M sub-tile
-// (TileM: 0..1; TileN: always 0).
+// A operand (M x K) read layout. wave_m selects this consumer's M sub-tile (TileM: 0..1; TileN: always 0).
 template <typename T>
 __device__ inline auto make_layout_ra_ctdm(int lane_id, int wave_m) {
     constexpr auto shape = opus::make_tuple(
@@ -299,8 +296,7 @@ __device__ inline auto make_layout_ra_ctdm(int lane_id, int wave_m) {
         opus::unfold_p_coord(dim, opus::tuple{wave_m, lane_id % T::kWmmaM, 0, lane_id / T::kWmmaM}));
 }
 
-// B operand (N x K) read layout. wave_n selects this consumer's N sub-tile
-// (TileN: 0..1; TileM: always 0).
+// B operand (N x K) read layout. wave_n selects this consumer's N sub-tile (TileN: 0..1; TileM: always 0).
 //
 // N-dim decomposition order MUST be (kExpN[y] outer, kTileN[p]=wave_n inner,
 // kWmmaN), mirroring the A-side (kExpM outer, kTileM inner) and the C-output

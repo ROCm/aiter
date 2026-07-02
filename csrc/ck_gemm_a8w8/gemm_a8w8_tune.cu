@@ -13,8 +13,7 @@ using RowwiseKernel = std::function<
                   torch::Tensor &, std::optional<torch::Tensor>,
                   int)>;
 
-// For certain high priority shapes, we directly use the best kernel rather
-// than use heuristics.
+// For certain high priority shapes, we directly use the best kernel rather than use heuristics.
 using RowwiseKernelMap = std::unordered_map<
     int,
     RowwiseKernel>;

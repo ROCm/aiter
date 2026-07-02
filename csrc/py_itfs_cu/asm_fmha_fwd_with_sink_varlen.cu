@@ -208,8 +208,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.scalar     = softmax_scale;
     args.gqa        = gqa;
     args.q_head_num = q_head_num;
-    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy. Must match how the
-    // shipped VARLEN .co was built.
+    // s_opt: bit0 reverse_kv | bit1 double_q | bit2 remap_xy. Must match how the shipped VARLEN .co was built.
     args.opt        = 4;
     args.lse        = return_lse ? 1 : 0;
     args.max_q_len  = max_seqlen_q;

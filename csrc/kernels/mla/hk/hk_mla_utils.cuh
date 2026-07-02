@@ -123,12 +123,11 @@ enum class PvGemmEpilogueType : uint32_t
 
 namespace hk_mla {
 
-// Single-stride lane swap helpers. Use inline asm, not the LLVM builtin
-// __builtin_amdgcn_permlane{32,16}_swap: when chained, the builtin was miscompiled
-// (2nd swap reused only half of the 1st swap's result, reducing over 2 partners not 4).
-// `b` is the in/out seed; `a` is seeded from `b` via an opaque asm v_mov (not a C++
-// assignment) so the optimizer can't coalesce `a` onto `b`'s register, and so the
-// scheduler can fill the wait state with unrelated VALU work instead of an s_nop.
+// Single-stride lane swap helpers. Use inline asm, not the LLVM builtin __builtin_amdgcn_permlane{32,16}_swap: when
+// chained, the builtin was miscompiled (2nd swap reused only half of the 1st swap's result, reducing over 2 partners
+// not 4). `b` is the in/out seed; `a` is seeded from `b` via an opaque asm v_mov (not a C++ assignment) so the
+// optimizer can't coalesce `a` onto `b`'s register, and so the scheduler can fill the wait state with unrelated VALU
+// work instead of an s_nop.
 __device__ __forceinline__ void permlane32_swap_b32(int32_t& a, int32_t& b)
 {
     asm("v_mov_b32_e32 %0, %1\n\t" : "=v"(a) : "v"(b));
@@ -158,10 +157,9 @@ __device__ __forceinline__ T warp_reduce(T val)
 
         auto op = functor<T>();
 
-        // v_permlane{32,16}_swap_b32 swaps lower-32-of-vdst with upper-32-of-vsrc (other
-        // halves untouched). Seeding both a and b with val means one ends up holding self
-        // and the other the swap partner in every lane, so op(a,b) == op(self, partner)
-        // wave-wide -- correct for both idempotent (max) and additive (sum) functors.
+        // v_permlane{32,16}_swap_b32 swaps lower-32-of-vdst with upper-32-of-vsrc (other halves untouched). Seeding
+        // both a and b with val means one ends up holding self and the other the swap partner in every lane, so
+        // op(a,b) == op(self, partner) wave-wide -- correct for both idempotent (max) and additive (sum) functors.
         if constexpr(32 > stop_stride)
         {
             int32_t a = __builtin_bit_cast(int32_t, val);

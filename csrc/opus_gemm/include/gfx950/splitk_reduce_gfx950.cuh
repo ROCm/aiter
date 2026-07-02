@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Split-K reduce kernel: tile-agnostic; sums an fp32 workspace across the
-// split-K axis, casts fp32 -> D_OUT, and writes to C. Split out of
-// opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh so the reduce path can be
-// shared by future split-K main pipelines without the full flatmm header.
+// Split-K reduce kernel: tile-agnostic; sums an fp32 workspace across the split-K axis, casts fp32 -> D_OUT, and writes
+// to C. Split out of opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh so the reduce path can be shared by future
+// split-K main pipelines without the full flatmm header.
 //
 // Template parameters:
 //   * VEC_       - elements per thread along N (fast-path tile width).
@@ -20,14 +19,13 @@
 //
 // All splitk launchers use <VEC_=16, BLOCK_=64>; D_OUT defaults to __bf16.
 //
-// Grid: (ceil(N, VEC * BLOCK), batch * M, 1). Each thread handles VEC fp32
-// lanes along N; the workspace load is always fp32 regardless of D_OUT.
+// Grid: (ceil(N, VEC * BLOCK), batch * M, 1). Each thread handles VEC fp32 lanes along N; the workspace load is always
+// fp32 regardless of D_OUT.
 //
 // Store path bytes-per-thread:
 //   * D_OUT = __bf16 -> 16 elems x 2B = 32B   (2 x buffer_store_dwordx4)
 //   * D_OUT = float  -> 16 elems x 4B = 64B   (4 x buffer_store_dwordx4)
-// STEP = 16 / sizeof(D_OUT) so each store is one dwordx4 (128-bit) chunk and
-// the inner loop runs VEC / STEP times.
+// STEP = 16 / sizeof(D_OUT) so each store is one dwordx4 (128-bit) chunk and the inner loop runs VEC / STEP times.
 //
 // Store-path 3-way split on the N tail:
 //   * (n_base + VEC <= N): fast path, VEC/STEP x buffer_store_dwordx4.
@@ -64,8 +62,7 @@ __global__ void splitk_reduce_kernel(
 {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
-    // gfx950-only kernel body. See opus_gemm_pipeline_a16w16_gfx950.cuh for the
-    // multi-arch wheel rationale.
+    // gfx950-only kernel body. See opus_gemm_pipeline_a16w16_gfx950.cuh for the multi-arch wheel rationale.
     //
     // Deref the handle slot at entry; survives a post-capture grow.
     const float* __restrict__ workspace =
@@ -97,9 +94,8 @@ __global__ void splitk_reduce_kernel(
     const int m = bm_id - b * M;
 
     // ── Bias prefetch (per-N vector load) ──────────────────────────────────
-    // Bias is per-output-feature [N] (F.linear convention). Each thread
-    // loads VEC bias values at its own n_base. Fired before the split-K
-    // accumulation so the vmem loads overlap.
+    // Bias is per-output-feature [N] (F.linear convention). Each thread loads VEC bias values at its own n_base. Fired
+    // before the split-K accumulation so the vmem loads overlap.
     opus::vector_t<float, VEC> bias_fp32;
     if constexpr (HAS_BIAS) {
         #pragma unroll
@@ -108,8 +104,8 @@ __global__ void splitk_reduce_kernel(
         auto g_bias = opus::make_gmem(bias_base_ptr,
                         (unsigned int)((bias_stride_batch ? bias_stride_batch : N)
                                        * sizeof(D_BIAS)));
-        // Load VEC bias elements as groups of 4 (buffer_load_dwordx4 for
-        // fp32; buffer_load_b64 pairs for bf16 -- opus::load handles both).
+        // Load VEC bias elements as groups of 4 (buffer_load_dwordx4 for fp32; buffer_load_b64 pairs for bf16 --
+        // opus::load handles both).
         #pragma unroll
         for (int g = 0; g < VEC / 4; ++g) {
             auto bv4 = g_bias.template load<4>(n_base + g * 4);
@@ -140,10 +136,9 @@ __global__ void splitk_reduce_kernel(
     }
 
     if constexpr (HAS_BIAS) {
-        // Bias vmem loads were issued before the split-K loop. By the time
-        // the loop finishes (vmcnt(0) inside g_ws.load), all bias loads
-        // have also drained (they share the same vmcnt counter). No
-        // additional wait is needed.
+        // Bias vmem loads were issued before the split-K loop. By the time the loop finishes (vmcnt(0) inside
+        // g_ws.load), all bias loads have also drained (they share the same vmcnt counter). No additional wait is
+        // needed.
         #pragma unroll
         for (int t = 0; t < VEC; ++t) acc[t] += bias_fp32[t];
     }
@@ -165,9 +160,8 @@ __global__ void splitk_reduce_kernel(
 #define OPUS_REDUCE_ST1(OFF) g_c.template store<1>(out[OFF], c_idx + (OFF))
 
     if constexpr (!HAS_OOB) {
-        // Non-OOB: N is tile-aligned so no partial-VEC tail, but still
-        // need to skip threads whose n_base is past N (reduce grid is
-        // over-provisioned: grid.x = ceil(N, VEC*BLOCK)).
+        // Non-OOB: N is tile-aligned so no partial-VEC tail, but still need to skip threads whose n_base is past N
+        // (reduce grid is over-provisioned: grid.x = ceil(N, VEC*BLOCK)).
         if (n_base + VEC <= N) {
             opus::static_for<VEC / STEP>([&](auto g_c_idx) {
                 constexpr int g = decltype(g_c_idx)::value;
@@ -186,9 +180,8 @@ __global__ void splitk_reduce_kernel(
                     c_idx + g * STEP);
             });
         } else if (n_base < N) {
-            // Tail path: decompose valid ∈ [1, VEC-1] into descending
-            // power-of-2 chunks so we emit dwordx4/dwordx2/dword/short
-            // instead of VEC scalar stores.
+            // Tail path: decompose valid ∈ [1, VEC-1] into descending power-of-2 chunks so we emit
+            // dwordx4/dwordx2/dword/short instead of VEC scalar stores.
             // Ref: demon_gcn/opus_gemm/mxfp8_e8m0/gemm_mxfp_a8w8_1d1d.hpp
             static_assert(VEC == 16, "reduce tail switch assumes VEC=16");
             const int valid = N - n_base;

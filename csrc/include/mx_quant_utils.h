@@ -6,14 +6,12 @@
 
 namespace aiter {
 
-// E8M0 block-scale rounding modes for the whole MX format family
-// (mxfp4 / mxfp6 / mxfp8 / mxint8) -- the four formulas FLOOR / RCEIL /
-// CEIL / EVEN are dtype-agnostic, only ``max_pos`` / ``max_pow2`` constants
-// differ (see PyTorch torchao ``ScaleCalculationMode`` for the same design).
+// E8M0 block-scale rounding modes for the whole MX format family (mxfp4 / mxfp6 / mxfp8 / mxint8) -- the four formulas
+// FLOOR / RCEIL / CEIL / EVEN are dtype-agnostic, only ``max_pos`` / ``max_pow2`` constants differ (see PyTorch torchao
+// ``ScaleCalculationMode`` for the same design).
 //
-// Names follow AMD Quark's RoundMode for AMD-side familiarity. Each value is
-// 1:1 mathematically equivalent to a PyTorch torchao ScaleCalculationMode
-// (cross-stack mapping):
+// Names follow AMD Quark's RoundMode for AMD-side familiarity. Each value is 1:1 mathematically equivalent to a
+// PyTorch torchao ScaleCalculationMode (cross-stack mapping):
 //   Quark RoundMode (this enum) <-> torchao ScaleCalculationMode
 //   RoundDown                   <-> FLOOR
 //   RoundUp                     <-> RCEIL
@@ -24,11 +22,9 @@ namespace aiter {
 //      torchao/prototype/mx_formats/config.py       (ScaleCalculationMode)
 //      torchao/prototype/mx_formats/mx_tensor.py    (_to_mx_rceil and friends)
 //
-// Values **must** stay 1:1 with ``aiter.utility.mx_types.MxScaleRoundMode``
-// (the pybind11 binding) and ``aiter.utility.mx_types.MxScaleRoundModeInt``
-// (the JIT-free int mirror used by FlyDSL AOT). The lazy loader in
-// ``mx_types.py::__getattr__`` asserts the int values match on first
-// pybind enum access.
+// Values **must** stay 1:1 with ``aiter.utility.mx_types.MxScaleRoundMode`` (the pybind11 binding) and
+// ``aiter.utility.mx_types.MxScaleRoundModeInt`` (the JIT-free int mirror used by FlyDSL AOT). The lazy loader in
+// ``mx_types.py::__getattr__`` asserts the int values match on first pybind enum access.
 enum class MxScaleRoundMode : int {
     RoundDown = 0, // OCP / NV ROUND_DOWN / torchao FLOOR:
                    //   scale = floor_pow2(amax) / 2^target_max_pow2.
@@ -53,9 +49,8 @@ constexpr MxScaleRoundMode kDefaultMxScaleRoundMode = MxScaleRoundMode::RoundUp;
 // Values **must** stay 1:1 with ``aiter.utility.mx_types.MxDtype`` (the
 // pybind11 binding in ``rocm_ops.hpp::AITER_CORE_PYBIND``).
 //
-// Note that ``FP8_E4M3`` (a.k.a. ``e4m3fn``) and ``FP8_E4M3_FNUZ`` are
-// **different formats** with different ``max_pos`` (448 vs 240) and
-// different ``target_max_pow2`` (8 vs 7); they are NOT interchangeable.
+// Note that ``FP8_E4M3`` (a.k.a. ``e4m3fn``) and ``FP8_E4M3_FNUZ`` are **different formats** with different ``max_pos`` (448 vs
+// 240) and different ``target_max_pow2`` (8 vs 7); they are NOT interchangeable.
 //   * ``FP8_E4M3``      = OCP / NVIDIA H100 / AMD gfx950+ / FlashInfer.
 //                         exp_bias = 7, max_normal = 448.
 //   * ``FP8_E4M3_FNUZ`` = AMD gfx942 hardware FP8 (MI300 family).
@@ -95,10 +90,9 @@ template <> struct MxDtypeConfig<MxDtype::FP8_E4M3> {
     static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
 };
 
-// AMD gfx942 hardware FP8 (e4m3fnuz): exp_bias = 8 (one bigger than the
-// OCP e4m3fn = 7), so max_normal = 240.0 (= 1.875 * 2^7) and the
-// largest pow-2 fitting under it is 128 = 2^7. Mantissa width is the
-// same 3 bits, so EVEN's val_to_add is identical to FP8_E4M3.
+// AMD gfx942 hardware FP8 (e4m3fnuz): exp_bias = 8 (one bigger than the OCP e4m3fn = 7), so max_normal = 240.0
+// (= 1.875 * 2^7) and the largest pow-2 fitting under it is 128 = 2^7. Mantissa width is the same 3 bits, so EVEN's
+// val_to_add is identical to FP8_E4M3.
 template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
     static constexpr int      target_max_pow2 = 7;              // log2(128), 128 <= 240
     static constexpr float    max_pos         = 240.0f;
@@ -110,23 +104,19 @@ template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
 
 // Generic E8M0 dequant scale computation.
 //
-// Returns the *dequantization* scale as an f32 with a power-of-2 bit
-// pattern, ready for direct multiplication into the dequantized data and
-// for E8M0 bit extraction via ``(__float_as_uint(s) >> 23) & 0xFF``.
+// Returns the *dequantization* scale as an f32 with a power-of-2 bit pattern, ready for direct multiplication into the
+// dequantized data and for E8M0 bit extraction via ``(__float_as_uint(s) >> 23) & 0xFF``.
 //
-// This template mirrors PyTorch torchao's ``to_mx(scaling_mode, elem_dtype)``
-// 1:1 and is the C++ analogue of:
+// This template mirrors PyTorch torchao's ``to_mx(scaling_mode, elem_dtype)`` 1:1 and is the C++ analogue of:
 //   * Python CPU ref: ``aiter.utility.fp4_utils.f32_to_mx_e8m0_scale``
 //   * FlyDSL builder: ``aiter.ops.flydsl.kernels.quant_utils.emit_mx_e8m0_scale``
 //     (uses the JIT-free ``MxScaleRoundModeInt`` / ``MxDtypeInt`` mirrors so
 //     wheel ``PREBUILD_KERNELS`` can AOT-compile FlyDSL kernels before HIP)
 //
-// The template parameters are compile-time constants (selected by the
-// caller's switch over runtime ``round_mode``), so the ``if constexpr``
-// branch is fully resolved before codegen -- no runtime dispatch overhead.
+// The template parameters are compile-time constants (selected by the caller's switch over runtime ``round_mode``), so
+// the ``if constexpr`` branch is fully resolved before codegen -- no runtime dispatch overhead.
 //
-// NaN/Inf inputs preserve the f32 exponent (0xFF) which downstream consumers
-// interpret as E8M0 NaN.
+// NaN/Inf inputs preserve the f32 exponent (0xFF) which downstream consumers interpret as E8M0 NaN.
 template <MxScaleRoundMode rmode = kDefaultMxScaleRoundMode,
           MxDtype          dtype = MxDtype::FP4_E2M1>
 __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
@@ -175,17 +165,15 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
     }
 }
 
-// Block-scale result for an E8M0-quantised group: the stored 1-byte exponent plus
-// the f32 dequant scale (= 2^(byte-127)). Quantize data via ``* (1 / dq_scale)``;
-// store ``byte`` into the block-scale buffer.
+// Block-scale result for an E8M0-quantised group: the stored 1-byte exponent plus the f32 dequant scale
+// (= 2^(byte-127)). Quantize data via ``* (1 / dq_scale)``; store ``byte`` into the block-scale buffer.
 struct E8m0BlockScale {
     uint8_t byte;
     float   dq_scale;
 };
 
-// One-shot E8M0 block scale: computes BOTH the storage byte and the f32 dequant
-// scale from a group amax (same rounding as fp_f32_to_e8m0_scale). Saves callers
-// from re-deriving the exponent byte via ``(__float_as_uint(s) >> 23) & 0xFF``.
+// One-shot E8M0 block scale: computes BOTH the storage byte and the f32 dequant scale from a group amax (same rounding
+// as fp_f32_to_e8m0_scale). Saves callers from re-deriving the exponent byte via ``(__float_as_uint(s) >> 23) & 0xFF``.
 template <MxScaleRoundMode rmode = kDefaultMxScaleRoundMode,
           MxDtype          dtype = MxDtype::FP4_E2M1>
 __device__ __forceinline__ E8m0BlockScale fp_f32_to_e8m0_block_scale(float amax)
@@ -195,20 +183,16 @@ __device__ __forceinline__ E8m0BlockScale fp_f32_to_e8m0_block_scale(float amax)
         static_cast<uint8_t>((__builtin_bit_cast(uint32_t, dq) >> 23) & 0xFFu), dq};
 }
 
-// Default MXFP4 E8M0 scale helper: NV ROUND_UP / DSv4 / FlashInfer / torchao
-// RCEIL with FP4 E2M1 constants, i.e. ``ceil_pow2(amax / 6)``. This is the
-// industry-default MXFP4 block-scale formula and is preserved as a named
-// alias for readability / 1:1 mapping with the Python helper
-// :func:`aiter.utility.fp4_utils.fp4_f32_to_e8m0_scale`.
+// Default MXFP4 E8M0 scale helper: NV ROUND_UP / DSv4 / FlashInfer / torchao RCEIL with FP4 E2M1 constants, i.e.
+// ``ceil_pow2(amax / 6)``. This is the industry-default MXFP4 block-scale formula and is preserved as a named alias for
+// readability / 1:1 mapping with the Python helper :func:`aiter.utility.fp4_utils.fp4_f32_to_e8m0_scale`.
 __device__ __forceinline__ float fp4_f32_to_e8m0_scale(float amax)
 {
     return fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, MxDtype::FP4_E2M1>(amax);
 }
 
-// Compute the swizzled E8M0 scale index for the tiled MX layout.
-// Used by both MXFP4 and MXFP8 paths (the e8m0 byte layout is identical
-// regardless of the element dtype). Legacy `fp4_scale_shuffle_idx` kept as
-// an alias below.
+// Compute the swizzled E8M0 scale index for the tiled MX layout. Used by both MXFP4 and MXFP8 paths (the e8m0 byte
+// layout is identical regardless of the element dtype). Legacy `fp4_scale_shuffle_idx` kept as an alias below.
 __device__ __forceinline__ int mx_scale_shuffle_idx(int scaleN_pad, int x, int y)
 {
     return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +

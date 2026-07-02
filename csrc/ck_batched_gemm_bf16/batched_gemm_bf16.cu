@@ -10,8 +10,7 @@
 using BatchedKernel = torch::Tensor (*)(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, std::optional<torch::Tensor>, int);
 
-// For certain high priority shapes, we directly use the best kernel rather
-// than use heuristics.
+// For certain high priority shapes, we directly use the best kernel rather than use heuristics.
 using BatchedKernelMap = BatchedGemmDispatchMap<BatchedKernel>;
 
 BatchedKernel batched_heuristic_dispatch(int B, int M, int N, int K)

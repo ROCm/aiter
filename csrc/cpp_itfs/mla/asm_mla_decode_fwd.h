@@ -11,8 +11,7 @@ namespace aiter {
  * This function executes the forward pass of MLA decoding with paged key-value cache support.
  * It dynamically compiles and runs optimized assembly code for the specific configuration.
  *
- * @param folder Optional folder name for the compiled kernel. If not provided, uses auto-generated
- * name
+ * @param folder Optional folder name for the compiled kernel. If not provided, uses auto-generated name
  * @param q Pointer to query tensor [num_seqs, num_heads, head_size]
  * @param kv_buffer Pointer to key-value cache buffer [num_page, page_size, num_kv_heads, head_size]
  * @param qo_indptr Pointer to query tensor indices [batch_size+1]
@@ -21,10 +20,8 @@ namespace aiter {
  * @param kv_last_page_lens Pointer to last page lengths [batch_size]
  * @param max_seqlen_q Maximum sequence length of query
  * @param softmax_scale Scaling factor for softmax computation
- * @param logits Output pointer for attention logits [batch_size, num_kv_splits, num_heads,
- * v_head_dim]
- * @param attn_lse Output pointer for attention log-sum-exp [batch_size, num_kv_splits, num_heads,
- * 1]
+ * @param logits Output pointer for attention logits [batch_size, num_kv_splits, num_heads, v_head_dim]
+ * @param attn_lse Output pointer for attention log-sum-exp [batch_size, num_kv_splits, num_heads, 1]
  * @param output Output pointer for final results
  * @param num_seqs Number of sequences in the batch
  * @param num_heads Number of attention heads

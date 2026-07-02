@@ -27,8 +27,7 @@ struct OpusMoeStage2A8W4DecodeShape
     static constexpr int DEFAULT_BLOCK_SIZE = opus_moe::kStage2A8W4DecodeDefaultCtaThreads;
     static constexpr int BLOCK_SIZE =
         BlockThreadsOverride > 0 ? BlockThreadsOverride : DEFAULT_BLOCK_SIZE;
-    // Route-out kernels target higher occupancy; direct-atomic keeps its tuned
-    // occupancy unless a measured kid overrides it.
+    // Route-out kernels target higher occupancy; direct-atomic keeps its tuned occupancy unless a measured kid overrides it.
     static constexpr int DEFAULT_MIN_BLOCKS_PER_CU =
         !DIRECT_ATOMIC_OUT ? 4 : (IS_BM16 ? 4 : 2);
     static constexpr int MIN_BLOCKS_PER_CU =

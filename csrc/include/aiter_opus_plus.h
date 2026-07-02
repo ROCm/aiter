@@ -25,9 +25,8 @@ OPUS_D fp32x2_t pk_mul_f32(fp32x2_t a, fp32x2_t b)
 #if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
     defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
     defined(__gfx950__)
-    // CDNA-family archs have `v_pk_mul_f32`; keep the asm form so the
-    // packed instruction is guaranteed (compiler auto-vectorization is
-    // best-effort).
+    // CDNA-family archs have `v_pk_mul_f32`; keep the asm form so the packed instruction is guaranteed
+    // (compiler auto-vectorization is best-effort).
     fp32x2_t c;
     asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
     return c;
@@ -802,9 +801,8 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                 store<store_chunk_size_elements>(
                     buffer, chunk_store, row_offset, chunk_offset_elements, opus::number<aux>{});
             }
-            // Workaround: compiler may not insert s_nop after the last buffer_store, causing a
-            // WAR hazard where vdata VGPRs are overwritten before buffer_store finishes reading
-            // them.
+            // Workaround: compiler may not insert s_nop after the last buffer_store, causing a WAR hazard where
+            // vdata VGPRs are overwritten before buffer_store finishes reading them.
             asm volatile("s_nop 0");
         }
         else

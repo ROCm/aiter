@@ -41,10 +41,8 @@ template <int VERSION_ID,
           typename AttentionVariant>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
-    const cache_t* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads,
-                                         // head_size]
-    const cache_t* __restrict__ v_cache, // [num_blocks, block_size, num_kv_heads,
-                                         // head_size]
+    const cache_t* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads, head_size]
+    const cache_t* __restrict__ v_cache, // [num_blocks, block_size, num_kv_heads, head_size]
     const float scale,
     const int* __restrict__ kv_indptr,         // [num_seqs + 1]
     const int* __restrict__ kv_page_indices,   // [max_num_blocks]
@@ -55,10 +53,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     const int kv_head_stride,
     const int kv_seq_stride,
     float* __restrict__ exp_sums,   // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits, // [num_seqs, num_heads,
-                                    // max_num_partitions]
-    scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
-                                    // head_size]
+    float* __restrict__ max_logits, // [num_seqs, num_heads, max_num_partitions]
+    scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions, head_size]
     float logits_soft_cap,
     float logits_soft_cap_rcp,
     const float* q_scale_ptr,
@@ -113,12 +109,9 @@ template <typename scalar_t,
           bool ENABLE_LAST_PAGE_LENS>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                    // [num_seqs, num_heads, head_size]
-    const float* __restrict__ exp_sums,        // [num_seqs, num_heads,
-                                               // max_num_partitions]
-    const float* __restrict__ max_logits,      // [num_seqs, num_heads,
-                                               // max_num_partitions]
-    const scalar_t* __restrict__ tmp_out,      // [num_seqs, num_heads,
-                                               // max_num_partitions, head_size]
+    const float* __restrict__ exp_sums,        // [num_seqs, num_heads, max_num_partitions]
+    const float* __restrict__ max_logits,      // [num_seqs, num_heads, max_num_partitions]
+    const scalar_t* __restrict__ tmp_out,      // [num_seqs, num_heads, max_num_partitions, head_size]
     const int* __restrict__ kv_indptr,         // [num_seqs + 1]
     const int* __restrict__ kv_last_page_lens, // [num_seqs]
     const int block_size,
@@ -159,10 +152,8 @@ template <int VERSION_ID,
           typename AttentionVariant>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
-    const cache_t* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads,
-                                         // head_size]
-    const cache_t* __restrict__ v_cache, // [num_blocks, block_size, num_kv_heads,
-                                         // head_size]
+    const cache_t* __restrict__ k_cache, // [num_blocks, block_size, num_kv_heads, head_size]
+    const cache_t* __restrict__ v_cache, // [num_blocks, block_size, num_kv_heads, head_size]
     const float scale,
     const int* __restrict__ kv_indptr,         // [num_seqs + 1]
     const int* __restrict__ kv_page_indices,   // [max_num_blocks]
@@ -173,10 +164,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     const int kv_head_stride,
     const int kv_seq_stride,
     float* __restrict__ exp_sums,   // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits, // [num_seqs, num_heads,
-                                    // max_num_partitions]
-    scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
-                                    // head_size]
+    float* __restrict__ max_logits, // [num_seqs, num_heads, max_num_partitions]
+    scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions, head_size]
     float logits_soft_cap,
     float logits_soft_cap_rcp,
     const float* q_scale_ptr,
@@ -197,12 +186,9 @@ template <typename scalar_t,
           bool ENABLE_LAST_PAGE_LENS>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                    // [num_seqs, num_heads, head_size]
-    const float* __restrict__ exp_sums,        // [num_seqs, num_heads,
-                                               // max_num_partitions]
-    const float* __restrict__ max_logits,      // [num_seqs, num_heads,
-                                               // max_num_partitions]
-    const scalar_t* __restrict__ tmp_out,      // [num_seqs, num_heads,
-                                               // max_num_partitions, head_size]
+    const float* __restrict__ exp_sums,        // [num_seqs, num_heads, max_num_partitions]
+    const float* __restrict__ max_logits,      // [num_seqs, num_heads, max_num_partitions]
+    const scalar_t* __restrict__ tmp_out,      // [num_seqs, num_heads, max_num_partitions, head_size]
     const int* __restrict__ kv_indptr,         // [num_seqs + 1]
     const int* __restrict__ kv_last_page_lens, // [num_seqs]
     const int block_size,

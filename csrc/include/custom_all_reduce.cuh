@@ -41,8 +41,7 @@ namespace aiter {
 enum class ReduceScatterSplitDim : int { kFirst = 0, kLast = 1, kMid = 2 };
 
 constexpr int kMaxBlocks = 80;
-// note: we don't want to use atomics for signals because peer atomics are no
-// supported on PCIe links
+// note: we don't want to use atomics for signals because peer atomics are no supported on PCIe links
 struct Signal
 {
     alignas(128) uint32_t start[kMaxBlocks][8];
@@ -3388,8 +3387,7 @@ class CustomAllreduce
         {
             auto ptr = graph_unreg_input_buffers_[i];
             void* base_ptr;
-            // note: must share the base address of each allocation, or we get wrong
-            // address
+            // note: must share the base address of each allocation, or we get wrong address
             if(hipPointerGetAttribute(&base_ptr,
 #ifdef USE_ROCM
                                       HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,

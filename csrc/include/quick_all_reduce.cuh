@@ -61,16 +61,14 @@ struct CodecFP : public CodecBase
 };
 
 // Int4 symmetric quantization codec.
-// We quantize the FP16 data to block-scaled Int4 in blocks of 4 *
-// kThreadGroupSize.
+// We quantize the FP16 data to block-scaled Int4 in blocks of 4 * kThreadGroupSize.
 template <typename T, int world_size>
 struct CodecQ4 : public CodecBase
 {
     static constexpr int kWorldSize = world_size;
 
     // Codec tile size process by this workgroup.
-    // Each threads processes a fragment of fp16x8_t (16B),
-    // into a int4x8_t (4B) and a fp16 scale shared among 32 values.
+    // Each threads processes a fragment of fp16x8_t (16B), into a int4x8_t (4B) and a fp16 scale shared among 32 values.
     static constexpr int kRankAtoms               = kAtoms / kWorldSize;
     static constexpr int kRankTileStride          = 1152;
     static constexpr int kRankTileScaleOffset     = 1024;
@@ -215,8 +213,7 @@ struct CodecQ4 : public CodecBase
 };
 
 // Int6 symmetric quantization codec.
-// We quantize the FP16 data to block-scaled Int6 in blocks of 4 *
-// kThreadGroupSize.
+// We quantize the FP16 data to block-scaled Int6 in blocks of 4 * kThreadGroupSize.
 template <typename T, int world_size>
 struct CodecQ6 : public CodecBase
 {
@@ -393,16 +390,14 @@ struct CodecQ6 : public CodecBase
 };
 
 // Fp8 symmetric quantization codec.
-// We quantize the FP16 data to block-scaled Fp8 in blocks of 4 *
-// kThreadGroupSize.
+// We quantize the FP16 data to block-scaled Fp8 in blocks of 4 * kThreadGroupSize.
 template <typename T, int world_size>
 struct CodecFP8 : public CodecBase
 {
     static int constexpr kWorldSize = world_size;
 
     // Codec tile size process by this workgroup.
-    // Each threads processes a fragment of fp16x8_t (16B),
-    // into a fp8x8_t (8B) and a fp16 scale shared among 32 values.
+    // Each threads processes a fragment of fp16x8_t (16B), into a fp8x8_t (8B) and a fp16 scale shared among 32 values.
     static constexpr int kRankAtoms               = kAtoms / kWorldSize;
     static constexpr int kRankTileStride          = 2176;
     static constexpr int kRankTileScaleOffset     = 2048;

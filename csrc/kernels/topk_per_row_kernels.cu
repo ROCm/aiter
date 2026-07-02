@@ -137,8 +137,8 @@ __device__ typename hipcub::Traits<T>::UnsignedBits twiddle_in(T key, bool selec
 // }
 
 // Compute bucket index using v_bfe_u32 (single-instruction bit field extract).
-// `mask` is unused: __builtin_amdgcn_ubfe extracts a fixed BitsPerPass-wide
-// field, making the software mask redundant. Kept for interface compatibility.
+// `mask` is unused: __builtin_amdgcn_ubfe extracts a fixed BitsPerPass-wide field, making the software mask redundant.
+// Kept for interface compatibility.
 template <typename T, int BitsPerPass>
 __device__ int calc_bucket(T x, int start_bit, unsigned /*mask*/, bool select_min)
 {
@@ -979,8 +979,8 @@ __device__ typename hipcub::Traits<T>::UnsignedBits twiddle_in(T key, bool selec
 }
 
 // Compute bucket index using v_bfe_u32.
-// `mask` is unused: __builtin_amdgcn_ubfe extracts a fixed BitsPerPass-wide
-// field, making the software mask redundant. Kept for interface compatibility.
+// `mask` is unused: __builtin_amdgcn_ubfe extracts a fixed BitsPerPass-wide field, making the software mask redundant.
+// Kept for interface compatibility.
 template <typename T, int BitsPerPass>
 __device__ int calc_bucket(T x, int start_bit, unsigned /*mask*/, bool select_min)
 {

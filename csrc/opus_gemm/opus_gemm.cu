@@ -6,8 +6,8 @@
 
 #include "opus_gemm_arch.cuh"                      // OpusGfxArch + opus_get_arch_info / opus_get_gfx_arch
 #include "opus_build_archs.h"                      // OPUS_BUILD_HAS_GFX942 / OPUS_BUILD_HAS_GFX950
-// gfx950 dispatcher always included (carries OpusA16W16NoscaleKernel typedef +
-// a8w8 launchers used unconditionally below); a8w8 is gfx950-only today.
+// gfx950 dispatcher always included (carries OpusA16W16NoscaleKernel typedef + a8w8 launchers used unconditionally
+// below); a8w8 is gfx950-only today.
 #include "gfx950/opus_gemm_arch_gfx950.cuh"        // opus_dispatch_a16w16_gfx950<T> / opus_a16w16_tune_dispatch_gfx950<T>
 #ifdef OPUS_BUILD_HAS_GFX942
 #include "gfx942/opus_gemm_arch_gfx942.cuh"        // opus_dispatch_a16w16_gfx942<T> / opus_a16w16_tune_dispatch_gfx942<T>
@@ -197,10 +197,9 @@ static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
 // Persistent a16w16 kids: compact [300, 316) = 4 tiles × 4 cpol groups.
 static constexpr int OPUS_PERSISTENT_KID_MIN = 300;
 static constexpr int OPUS_PERSISTENT_KID_MAX = 316;
-// Mono-tile a16w16 kids: [1400, 1500). Mono-tile is intrinsically non-OOB
-// (no tail handling in the kernel body), so kids land in the >=1000 band
-// directly — there is no base/nooob mirror split for this family. See
-// opus_gemm_common.py :: a16w16_mono_tile_kernels_list.
+// Mono-tile a16w16 kids: [1400, 1500). Mono-tile is intrinsically non-OOB (no tail handling in the kernel body), so
+// kids land in the >=1000 band directly — there is no base/nooob mirror split for this family. See opus_gemm_common.py
+// :: a16w16_mono_tile_kernels_list.
 static constexpr int OPUS_MONO_TILE_KID_MIN = 1400;
 static constexpr int OPUS_MONO_TILE_KID_MAX = 1500;
 // non-OOB kid offset
@@ -256,10 +255,8 @@ static inline bool opus_kid_supports_bias(int kid)
 {
   // persistent and mono-tile do not support bias (kargs lacks
   // ptr_bias/stride_bias_batch; launchers reject non-empty bias up front).
-  // gfx942 splitk/SB silently ignored bias; exclude explicitly to surface
-  // misuse as a clear error.
-  // gfx1250 cluster_tdm_splitk_ws DOES support bias (the reduce kernel folds
-  // it once, like gfx950 flatmm_splitk).
+  // gfx942 splitk/SB silently ignored bias; exclude explicitly to surface misuse as a clear error.
+  // gfx1250 cluster_tdm_splitk_ws DOES support bias (the reduce kernel folds it once, like gfx950 flatmm_splitk).
   return (opus_kid_is_a16w16_sb(kid) || opus_kid_is_splitk(kid))
          && !opus_kid_is_gfx942_splitk(kid);
 }

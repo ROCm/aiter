@@ -214,8 +214,7 @@ __global__ void fusedQKNormRopeQuantCacheShuffleKernel(
     int64_t const act_sd     = isQ ? q_sd : (isK ? k_sd : v_sd);
     scalar_t* const act_base = isQ ? q_act : (isK ? k_act : v_act);
 
-    // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before
-    // kernel launch
+    // Load data first, suppose have no tail since we check the head_dim is multiple of 32 before kernel launch
     if(act_sd == 1)
     {
         int64_t const base_elems = (int64_t)tokenIdx * act_st + (int64_t)headIdx * act_sh +
@@ -4328,8 +4327,7 @@ namespace aiter {
       const int64_t token_q_base = static_cast<int64_t>(token_idx) * params.q_stride_0;
       const int64_t token_qout_base = static_cast<int64_t>(token_idx) * params.q_out_stride_0;
 
-      // Q-quant constants. Q_REDUCE must be a supported power-of-two group width and
-      // Q_GROUP_SIZE must divide head_dim.
+      // Q-quant constants. Q_REDUCE must be a supported power-of-two group width and Q_GROUP_SIZE must divide head_dim.
       constexpr int32_t Q_REDUCE = Q_GROUP_SIZE / vec_size_i;
       constexpr int32_t Q_NUM_GROUPS = head_size / Q_GROUP_SIZE;
       static_assert(head_size % Q_GROUP_SIZE == 0, "head_size must be divisible by Q_GROUP_SIZE");
@@ -5297,8 +5295,7 @@ void fused_qk_norm_rope_group_quant(
   const int  group_size    = q_is_fp8 ? static_cast<int>(quant_group_size) : 64;
   const bool scale_is_fp32 = q_is_fp8 ? (scale_dtype == "fp32") : false;
 
-  // For a fixed (group_size, scale_fp32), branch on q_weight presence (compile-time flag)
-  // and launch.
+  // For a fixed (group_size, scale_fp32), branch on q_weight presence (compile-time flag) and launch.
 #define LAUNCH_FOR_CONFIG(GROUP_SIZE, SCALE_FP32)                                              \
     do {                                                                                        \
       if (has_q_weight)                                                                         \

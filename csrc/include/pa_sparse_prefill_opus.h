@@ -38,8 +38,7 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
 
 // Public API: split-precision prefill attention for DeepSeek-V4 DSA on gfx950.
 //
-// Q/KV are split into a NoPE part (fp8 MXFP8 with embedded E8M0 block scales) and
-// a RoPE part (bf16).
+// Q/KV are split into a NoPE part (fp8 MXFP8 with embedded E8M0 block scales) and a RoPE part (bf16).
 //
 // Tensor expectations (row-major, last dim contiguous):
 //   q_nope             : [N, H, 512] fp8  (448 NoPE fp8 + 14 E8M0 scale bytes + pad)
@@ -308,8 +307,7 @@ struct pa_16mx1_16nx4_fp8_traits
     static constexpr int T_N = NUM_WARPS; // waves along N
     static constexpr int T_K = 1;         // waves along K
 
-    // MFMA base tile: NoPE uses fp8 16x16x128 (scaled f8f6f4 on gfx950);
-    // RoPE (bf16 QK^T) and PV (bf16) use 16x16x32.
+    // MFMA base tile: NoPE uses fp8 16x16x128 (scaled f8f6f4 on gfx950); RoPE (bf16 QK^T) and PV (bf16) use 16x16x32.
     static constexpr int W_M      = 16;
     static constexpr int W_N      = 16;
     static constexpr int W_K_NOPE = 128;

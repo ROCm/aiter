@@ -8,15 +8,12 @@
  * @file opus/hip_minimal.hpp
  * @brief Minimal HIP replacement for <hip/hip_runtime.h>.
  *
- * Replaces <hip/hip_runtime.h> (~100K+ preprocessed lines) on BOTH passes
- * for opus-based kernels:
+ * Replaces <hip/hip_runtime.h> (~100K+ preprocessed lines) on BOTH passes for opus-based kernels:
  *   * host pass: dim3, hipError_t, hipMalloc, hipLaunchKernelGGL, etc.
- *   * device pass: __launch_bounds__ / __global__ / __device__ /
- *     __forceinline__ keyword fallbacks.
+ *   * device pass: __launch_bounds__ / __global__ / __device__ / __forceinline__ keyword fallbacks.
  *
- * For device intrinsics (threadIdx / blockIdx / __syncthreads etc.),
- * include <opus/opus.hpp> and use opus::thread_id_x() / opus::block_id_x()
- * / opus::sync_threads() etc.
+ * For device intrinsics (threadIdx / blockIdx / __syncthreads etc.), include <opus/opus.hpp> and use
+ * opus::thread_id_x() / opus::block_id_x() / opus::sync_threads() etc.
  *
  * Usage:
  *   #include <opus/hip_minimal.hpp>   // both passes — drop-in replacement

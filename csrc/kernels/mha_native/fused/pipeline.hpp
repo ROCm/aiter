@@ -116,8 +116,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     const int k_sub   = lane_id >> 5;                  // 32-lane half (0/1)
     const int m_row   = (lane_id & 31) + 32 * warp_id; // this lane's query row in tile
 
-    // GQA/MQA: several Q heads can share one K/V head. Map this Q head to its KV
-    // head (nhead_ratio==1 for full MHA).
+    // GQA/MQA: several Q heads can share one K/V head. Map this Q head to its KV head (nhead_ratio==1 for full MHA).
     const int nhead_ratio = params.nhead_q / params.nhead_k;
     const int kv_head_idx = head_idx / nhead_ratio;
 
@@ -325,8 +324,7 @@ __device__ __forceinline__ void fmha_fwd_d64_device(const FmhaFwdParams& params,
     const int v_stride_bytes = params.stride_v * 2;
     int kv_v_byte = kv_offset * v_stride_bytes;
 
-    // K byte-base induction variable: same transform, for the async DRAM->LDS K
-    // copies. Also wave-uniform -> SGPR.
+    // K byte-base induction variable: same transform, for the async DRAM->LDS K copies. Also wave-uniform -> SGPR.
     const int k_stride_bytes = params.stride_k * 2;
     int kv_k_byte = kv_offset * k_stride_bytes;
 

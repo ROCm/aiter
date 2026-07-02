@@ -3,9 +3,8 @@
 //
 // ASM FMHA forward (MXFP8, gfx1250).
 //
-// Dedicated path kept separate from the bf16/fmha_v3 paths: uses its own
-// tightly-packed kernarg ABI carrying q/k/v micro-scaling (e8m0) descale
-// pointers, expected to diverge further from the MI350/bf16 layouts.
+// Dedicated path kept separate from the bf16/fmha_v3 paths: uses its own tightly-packed kernarg ABI carrying q/k/v
+// micro-scaling (e8m0) descale pointers, expected to diverge further from the MI350/bf16 layouts.
 //
 // Layout: q/k/v are bshd shape ([batch, seq, head, dim]). Kernel reads per-dim
 // strides directly, so non-contiguous bshd views backed by bhsd memory work
@@ -25,8 +24,7 @@
 // (poc_kl/mi400/fmha_fwd_mxfp8/fmha_fwd_mxfp8.cpp :: FmhaFwdKernelArgsBase,
 // branch features/yj/prefill). Tightly-packed: 8-byte ptrs, 4-byte ints, no
 // slot padding. Byte offsets are part of the .co ABI -- do NOT reorder/repack.
-// vs the old 560-B layout: scale ptrs at 0x60-0x77, q_ts at 0x78, varlen
-// QSeq/KSeq ptrs removed.
+// vs the old 560-B layout: scale ptrs at 0x60-0x77, q_ts at 0x78, varlen QSeq/KSeq ptrs removed.
 #pragma pack(push, 1)
 struct KernelArgs
 {

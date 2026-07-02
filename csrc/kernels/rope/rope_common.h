@@ -7224,9 +7224,8 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
 
 // XOR-style butterfly sum reduce within a 32-lane subgroup.
 // Lowers to 3x ds_swizzle_b32 (offset 16, 8, 4) + 2x DPP (offset 2, 1).
-// Order 16 -> 1 (descending) matches the historical __shfl_xor reduce for
-// bitwise-identical output. All lanes hold the full sum on return (XOR butterfly
-// is symmetric, no follow-up broadcast needed).
+// Order 16 -> 1 (descending) matches the historical __shfl_xor reduce for bitwise-identical output.
+// All lanes hold the full sum on return (XOR butterfly is symmetric, no follow-up broadcast needed).
 // Body is #ifdef __HIP_DEVICE_COMPILE__ because opus.hpp is device-pass only;
 // host pass leaves the body empty and returns `val` (these helpers are __device__-only).
 template <typename T>
@@ -7435,8 +7434,7 @@ warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
 //
 // Round semantics (bit-identical to __hip_bfloat16(float) ctor for non-NaN inputs):
 //   bf16 = (x + 0x7FFF + ((x >> 16) & 1)) >> 16
-// Standard RNE bias trick: 0x7FFF for normal rounding, plus the round-position
-// bit to break ties to even.
+// Standard RNE bias trick: 0x7FFF for normal rounding, plus the round-position bit to break ties to even.
 //
 // NaN handling differs from the ctor (which preserves the NaN payload): this
 // helper maps all NaN inputs to canonical FP32_NAN (0x7FFF0000) -> BF16 0x7FFF.
@@ -7458,8 +7456,7 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
     defined(__gfx950__)
     // CDNA path: v_cmp_u_f32 with explicit SGPR dest + v_add3 + v_and_or_b32
     // tmp scratch is read+written; nan_mask is an SGPR pair output of v_cmp_u_f32.
-    // We declare them as early-clobber outputs so the compiler doesn't alias them
-    // with any input register.
+    // We declare them as early-clobber outputs so the compiler doesn't alias them with any input register.
     using uint64x1_t = uint64_t;
     uint64x1_t nan_mask;
     uint32_t tmp;
@@ -7483,8 +7480,8 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
           [nan] "v"(FP32_NAN),
           [mmsk] "v"(MERGE_MASK));
 #else
-    // Portable path for RDNA and other archs that lack explicit-dest v_cmp
-    // and/or v_add3_u32. Implements the same RNE + NaN logic in C++.
+    // Portable path for RDNA and other archs that lack explicit-dest v_cmp and/or v_add3_u32.
+    // Implements the same RNE + NaN logic in C++.
     auto rne_f32_to_bf16 = [](uint32_t bits) -> uint32_t {
         // If NaN, return canonical BF16 NaN (0x7fff)
         if (__builtin_expect((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0, 0))
@@ -7501,13 +7498,11 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
     return result;
 }
 
-// Pack an array of N FP32 values into a vec_t<T, N>, using packed bf16x2
-// conversion (round-to-nearest-even) when T is bfloat16, falling back to
-// scalar static_cast for other element types. N must be even.
+// Pack an array of N FP32 values into a vec_t<T, N>, using packed bf16x2 conversion (round-to-nearest-even)
+// when T is bfloat16, falling back to scalar static_cast for other element types. N must be even.
 //
-// The bf16 path saves ~50% of the conversion cost relative to the default
-// per-element static_cast<bf16>(float) — see the comment on
-// f32x2_to_bf16x2_rne above.
+// The bf16 path saves ~50% of the conversion cost relative to the default per-element static_cast<bf16>(float)
+// — see the comment on f32x2_to_bf16x2_rne above.
 template <typename T, int N>
 __device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float (&src)[N])
 {
@@ -7673,8 +7668,7 @@ __device__ __forceinline__ int64_t get_shuffle_layout_k_base(const int64_t slot_
     const int64_t k_per_block =
         (k_block_stride != 0) ? k_block_stride : static_cast<int64_t>(num_heads_k) * k_head_stride;
     const int64_t dst_base = static_cast<int64_t>(block_id) * k_per_block + head_id_k * k_head_stride;
-    // Pre-compute K base offset: since VEC_SIZE <= x, all elements are in the same
-    // chunk
+    // Pre-compute K base offset: since VEC_SIZE <= x, all elements are in the same chunk
     const int chunk_id     = access_id_in_head / x;
     const int block_size_x = block_size * x;
     const int64_t k_base =

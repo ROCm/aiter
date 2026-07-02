@@ -14,8 +14,7 @@
 using BlockwiseKernel = torch::Tensor (*)(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
-// Name-keyed dispatch table (std::string_view keys + raw fn-ptr values); see
-// gemm_a8w8_blockscale.cu for the rationale.
+// Name-keyed dispatch table (std::string_view keys + raw fn-ptr values); see gemm_a8w8_blockscale.cu for the rationale.
 //
 // Note: the a4w4 tuned CSV mixes CK and ASM kernels; the ASM rows are filtered
 // out at codegen (gen_instances.py) and dispatched separately by
@@ -23,9 +22,8 @@ using BlockwiseKernel = torch::Tensor (*)(
 // This map only contains CK kernels.
 using BlockwiseKernelMap = std::unordered_map<std::string_view, BlockwiseKernel>;
 
-// Python-driven name-keyed dispatch (see gemm_a8w8_blockscale.cu for the
-// rationale).  Empty kernelName -> default heuristic; non-empty but unknown
-// kernelName -> hard error.
+// Python-driven name-keyed dispatch (see gemm_a8w8_blockscale.cu for the rationale).
+// Empty kernelName -> default heuristic; non-empty but unknown kernelName -> hard error.
 template <typename CDataType>
 BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
 {

@@ -355,10 +355,8 @@ _paged_attention_kernel(const int* block_table_seq,
                         const int kv_head_stride,
                         const int kv_seq_stride,
                         float* __restrict__ exp_sums,   // [num_seqs, num_heads, max_num_partitions]
-                        float* __restrict__ max_logits, // [num_seqs, num_heads,
-                                                        // max_num_partitions]
-                        scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
-                                                        // head_size]
+                        float* __restrict__ max_logits, // [num_seqs, num_heads, max_num_partitions]
+                        scalar_t* __restrict__ out, // [num_seqs, num_heads, max_num_partitions, head_size]
                         float logits_soft_cap,
                         float logits_soft_cap_rcp,
                         const float* k_scale_ptr,
@@ -430,8 +428,7 @@ _paged_attention_kernel(const int* block_table_seq,
     // for QK mfma, tokens in multiples of TOKENS_PER_WARP are spread across warps
     // each mfma takes QH16xT16x16HE across warp
     // repeat mfmas across QKHELOOP dimension
-    // output layout from QKmfma : QH16xT4x4 16 qheads across 16 lanes, 16 tokens
-    // across 4 rows x 4 tokens per lane
+    // output layout from QKmfma : QH16xT4x4 16 qheads across 16 lanes, 16 tokens across 4 rows x 4 tokens per lane
 
     const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
     const int last_ctx_block     = num_context_blocks - 1;
@@ -492,8 +489,7 @@ _paged_attention_kernel(const int* block_table_seq,
         }
     }
 
-    // set to true to enable non temporal kv loads: has some benefit in very high
-    // batch size cases
+    // set to true to enable non temporal kv loads: has some benefit in very high batch size cases
     constexpr bool NT_KV_LOAD = false;
 
     constexpr int KX     = 16 / sizeof(cache_t); // vLLM defines x as 16 Bytes of kv cache elements
@@ -548,8 +544,7 @@ _paged_attention_kernel(const int* block_table_seq,
     constexpr int VTLOOP           = NWARPS;   // corresponds to tokens across warps
     constexpr int VTLANELOOP =
         DIVIDE_ROUND_UP(VTOKENS_PER_LANE,
-                        CONTIGUOUS_KV_ELEMS_16B_LOAD); // optimized for 16B fetches; assumes
-                                                       // minimum block size is 16
+                        CONTIGUOUS_KV_ELEMS_16B_LOAD); // optimized for 16B fetches; assumes minimum block size is 16
     constexpr int VHELOOP = HEAD_SIZE / 16 / NWARPS;   // head_size distributed across warps; each
                                                        // mfma instr works on 16 head elements
 
@@ -848,8 +843,7 @@ _paged_attention_kernel(const int* block_table_seq,
                         const int offset2 = offset / ROWS_PER_WARP;
                         tmp_in.xy[i]      = shared_logits[vtoken_depth][offset2][lane16id][offset1];
                     }
-                    // output format is 16 qheads across 16 lanes, 16 head elems spread
-                    // across 4 rows
+                    // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                     tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
                         Vlocal[vtoken_depth][vhe_depth][vfetch_depth], tmp_in, tmp_out);
 #else
@@ -859,8 +853,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                            vfetch_depth * ELEMS8_ELEMS4_RATIO + i;
                         const int offset1 = offset % ROWS_PER_WARP;
                         const int offset2 = offset / ROWS_PER_WARP;
-                        // output format is 16 qheads across 16 lanes, 16 head elems spread
-                        // across 4 rows
+                        // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                         tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
                             Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i],
                             shared_logits[vtoken_depth][offset2][lane16id][offset1],
@@ -892,8 +885,7 @@ _paged_attention_kernel(const int* block_table_seq,
                             const int offset2 = offset / ROWS_PER_WARP;
                             tmp_in.xy[i] = shared_logits[vtoken_depth][offset2][lane16id][offset1];
                         }
-                        // output format is 16 qheads across 16 lanes, 16 head elems
-                        // spread across 4 rows
+                        // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                         tmp_out =
                             gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(Vlocaltmp, tmp_in, tmp_out);
 #else
@@ -903,8 +895,7 @@ _paged_attention_kernel(const int* block_table_seq,
                                                j * ELEMS8_ELEMS4_RATIO + i;
                             const int offset1 = offset % ROWS_PER_WARP;
                             const int offset2 = offset / ROWS_PER_WARP;
-                            // output format is 16 qheads across 16 lanes, 16 head elems
-                            // spread across 4 rows
+                            // output format is 16 qheads across 16 lanes, 16 head elems spread across 4 rows
                             tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
                                 Vlocaltmp.xy[i],
                                 shared_logits[vtoken_depth][offset2][lane16id][offset1],
@@ -984,12 +975,9 @@ __device__ void _paged_attention_ll4mi_reduce_kernel(
     const int64_t query_loc,
     int context_len,
     OUTT* __restrict__ out,               // [num_seqs, num_heads, head_size]
-    const float* __restrict__ exp_sums,   // [num_seqs, num_heads,
-                                          // max_num_partitions]
-    const float* __restrict__ max_logits, // [num_seqs, num_heads,
-                                          // max_num_partitions]
-    const scalar_t* __restrict__ tmp_out, // [num_seqs, num_heads,
-                                          // max_num_partitions, head_size]
+    const float* __restrict__ exp_sums,   // [num_seqs, num_heads, max_num_partitions]
+    const float* __restrict__ max_logits, // [num_seqs, num_heads, max_num_partitions]
+    const scalar_t* __restrict__ tmp_out, // [num_seqs, num_heads, max_num_partitions, head_size]
     const int max_num_partitions,
     const float* __restrict__ fp8_out_scale_ptr)
 {
@@ -1011,8 +999,7 @@ __device__ void _paged_attention_ll4mi_reduce_kernel(
         const float* max_logits_ptr =
             max_logits + seq_idx * num_heads * max_num_partitions + head_idx * max_num_partitions;
 
-        // valid partition is the last valid partition in case threadid > num
-        // partitions
+        // valid partition is the last valid partition in case threadid > num partitions
         int valid_partition[NPAR_LOOPS];
         float reg_max_logit[NPAR_LOOPS];
         const int last_valid_partition = num_partitions - 1;

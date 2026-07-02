@@ -3,21 +3,16 @@
 //
 // BF16 persistent a16w16 pipeline (M-outer + N-fast XCD swizzle).
 //
-// Ported from the standalone reference kernel
-// /home/blyu/demon_gcn/opus_gemm/gemm_a16w16_8wave_mouter.cc.
+// Ported from the standalone reference kernel /home/blyu/demon_gcn/opus_gemm/gemm_a16w16_8wave_mouter.cc.
 //
-// Key differences vs the default split-barrier pipeline
-// (opus_gemm_pipeline_a16w16_gfx950.cuh):
-//   * Persistent grid: each WG handles m_per_wg tile_m × 1 tile_n in an
-//     outer loop.
-//   * XCD-local N-fast swizzle: within an XCD, consecutive launch-wave WGs
-//     share the same m_grp and span all 8 tile_n stripes, keeping the A tile
-//     of one m_grp resident in L2 across all N stripes (higher L2 hit rate).
-//   * Cluster store INSIDE the outer loop; vmcnt(0)+s_barrier between
-//     iterations drains prior store_c before the next iter's async_load.
-//     Fully serial -- no store/next-prologue overlap.
-//   * No bias support (kargs lacks ptr_bias/stride_bias_batch); the launcher
-//     in opus_gemm_a16w16_persistent_*.cu rejects non-empty bias up front.
+// Key differences vs the default split-barrier pipeline (opus_gemm_pipeline_a16w16_gfx950.cuh):
+//   * Persistent grid: each WG handles m_per_wg tile_m × 1 tile_n in an outer loop.
+//   * XCD-local N-fast swizzle: within an XCD, consecutive launch-wave WGs share the same m_grp and span all 8 tile_n
+//     stripes, keeping the A tile of one m_grp resident in L2 across all N stripes (higher L2 hit rate).
+//   * Cluster store INSIDE the outer loop; vmcnt(0)+s_barrier between iterations drains prior store_c before the next
+//     iter's async_load. Fully serial -- no store/next-prologue overlap.
+//   * No bias support (kargs lacks ptr_bias/stride_bias_batch); the launcher in opus_gemm_a16w16_persistent_*.cu
+//     rejects non-empty bias up front.
 //
 // The K-loop body (prologue + main loop + 2-chunk epilogue) is byte-for-byte
 // the split-barrier reference (modulo kargs type and the HAS_BIAS prefetch/fold).
@@ -58,23 +53,18 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
     using D_ACC = typename T::D_ACC;
 
     // ── XCD-local N-fast swizzle ──
-    // Default round-robin (fid % 8 == xcd_id) puts consecutive WGs on the same
-    // XCD touching different m_grp + same tile_n, ballooning the per-XCD A
-    // working set past L2 on large-M shapes. We re-map (bx, by) so that within
-    // an XCD, consecutive launch-wave WGs share the SAME m_grp and span the
-    // tile_n stripes, shrinking the per-wave A working set to fit L2.
-    // See plan §2.3 and mouter.cc:277..290.
+    // Default round-robin (fid % 8 == xcd_id) puts consecutive WGs on the same XCD touching different m_grp + same
+    // tile_n, ballooning the per-XCD A working set past L2 on large-M shapes. We re-map (bx, by) so that within an XCD,
+    // consecutive launch-wave WGs share the SAME m_grp and span the tile_n stripes, shrinking the per-wave A working
+    // set to fit L2. See plan §2.3 and mouter.cc:277..290.
     //
     // Bijectivity & small-split_m correctness:
-    // The swizzle requires grid.y * gx (= grid.y * num_tiles_n) be a multiple
-    // of NUM_XCD so (xcd_id, pos_xcd) covers [0,NUM_XCD) × [0,grid.y*gx/NUM_XCD)
-    // bijectively, i.e. m_grp ∈ [0, NUM_XCD * m_grp_per_xcd). The launcher pads
-    // grid.y up to NUM_XCD * ceil(split_m/NUM_XCD). When split_m % NUM_XCD == 0
-    // the pad is a no-op (zero perf cost). When split_m < NUM_XCD the pad adds
-    // WGs with m_grp >= split_m that early-return below. That early-return is
-    // wave-uniform (m_grp via readfirstlane) -> single s_cbranch_execz, no
-    // divergence. Belt-and-suspenders, the A/B/C BRs below also clamp size to 0
-    // on over-shoot so wayward loads/stores are dropped even if it's skipped.
+    // The swizzle requires grid.y * gx (= grid.y * num_tiles_n) be a multiple of NUM_XCD so (xcd_id, pos_xcd) covers
+    // [0,NUM_XCD) × [0,grid.y*gx/NUM_XCD) bijectively, i.e. m_grp ∈ [0, NUM_XCD * m_grp_per_xcd). The launcher pads
+    // grid.y up to NUM_XCD * ceil(split_m/NUM_XCD). When split_m % NUM_XCD == 0 the pad is a no-op (zero perf cost).
+    // When split_m < NUM_XCD the pad adds WGs with m_grp >= split_m that early-return below. That early-return is
+    // wave-uniform (m_grp via readfirstlane) -> single s_cbranch_execz, no divergence. Belt-and-suspenders, the A/B/C
+    // BRs below also clamp size to 0 on over-shoot so wayward loads/stores are dropped even if it's skipped.
     int bx0 = __builtin_amdgcn_readfirstlane(opus::block_id_x());
     int by0 = __builtin_amdgcn_readfirstlane(opus::block_id_y());
     int gx  = __builtin_amdgcn_readfirstlane(kargs.num_tiles_n);
@@ -87,9 +77,8 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
     int m_grp       = __builtin_amdgcn_readfirstlane(
         xcd_id * kargs.m_grp_per_xcd + m_grp_local);
 
-    // Wave-uniform early-return for over-shoot WGs in the small-split_m
-    // case (grid.y padded > true split_m). No-op on the large-M case
-    // where split_m % NUM_XCD == 0 (kargs.split_m_padded == split_m).
+    // Wave-uniform early-return for over-shoot WGs in the small-split_m case (grid.y padded > true split_m). No-op on
+    // the large-M case where split_m % NUM_XCD == 0 (kargs.split_m_padded == split_m).
     if (m_grp >= kargs.split_m) return;
 
     int tile_m_lo = __builtin_amdgcn_readfirstlane(m_grp * kargs.m_per_wg);
@@ -100,13 +89,12 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
     int lane_id = opus::thread_id_x() % get_warp_size();
 
-    // B base is tile_n-bound: every M outer iter uses the same B[col:col+B_N, :]
-    // sub-matrix. Built once outside the outer loop to keep the L2 lines warm.
+    // B base is tile_n-bound: every M outer iter uses the same B[col:col+B_N, :] sub-matrix. Built once outside the
+    // outer loop to keep the L2 lines warm.
     //
-    // OOB-clamp: the BR `size` field is a hardware mask (vaddr >= size returns
-    // 0 / drops the op). Guards over-shoot WGs (col >= kargs.n in the
-    // split_m < NUM_XCD path): clamp size to 0 so every load returns 0, no
-    // fault, no visible side effect.
+    // OOB-clamp: the BR `size` field is a hardware mask (vaddr >= size returns 0 / drops the op). Guards over-shoot WGs
+    // (col >= kargs.n in the split_m < NUM_XCD path): clamp size to 0 so every load returns 0, no fault, no visible
+    // side effect.
     int b_rows_remaining = (kargs.n > col) ? (kargs.n - col) : 0;
     auto g_b = make_gmem(
         reinterpret_cast<const D_B*>(kargs.ptr_b)
@@ -162,35 +150,30 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
 
     const int loops = ceil_div(kargs.k, T::B_K);
 
-    // ── M outer loop: each iter is a full split-barrier-style computation
-    // (prologue + main + epilogue + cluster store) for one tile_m. Between
-    // iters, drain stores (vmcnt(0)) + s_barrier before reloading A. Fully
-    // serial: no store/next-prologue overlap.
+    // ── M outer loop: each iter is a full split-barrier-style computation (prologue + main + epilogue + cluster store)
+    // for one tile_m. Between iters, drain stores (vmcnt(0)) + s_barrier before reloading A. Fully serial: no
+    // store/next-prologue overlap.
     for (int tile_m = tile_m_lo; tile_m < tile_m_hi; ++tile_m) {
         int row = __builtin_amdgcn_readfirstlane(tile_m * T::B_M);
 
-        // A base: depends on tile_m, recomputed per outer iter. OOB-clamp
-        // (same scheme as g_b): over-shoot WG (row >= kargs.m) clamps BR size
-        // to 0 so loads return 0; without it (kargs.m - row) wraps to a huge
-        // unsigned and faults.
+        // A base: depends on tile_m, recomputed per outer iter. OOB-clamp (same scheme as g_b): over-shoot WG (row >=
+        // kargs.m) clamps BR size to 0 so loads return 0; without it (kargs.m - row) wraps to a huge unsigned and
+        // faults.
         int a_rows_remaining = (kargs.m > row) ? (kargs.m - row) : 0;
         auto g_a = make_gmem(
             reinterpret_cast<const D_A*>(kargs.ptr_a)
                 + batch_id * kargs.stride_a_batch
                 + row * kargs.stride_a,
             (unsigned)a_rows_remaining * kargs.stride_a * sizeof(D_A));
-        // C base: same OOB-clamp, stricter -- an over-shoot WG must NOT write
-        // any bytes to Y (else corrupts other tiles or writes past Y's
-        // allocation; root cause of the pre-fix "Write access to a read-only
-        // page" fault). BR size = bytes to end of this WG's valid Y rectangle,
-        // clamped to 0 on over-shoot. The store pred (HAS_OOB) or unconditional
-        // store rides on top of this hardware clamp.
+        // C base: same OOB-clamp, stricter -- an over-shoot WG must NOT write any bytes to Y (else corrupts other tiles
+        // or writes past Y's allocation; root cause of the pre-fix "Write access to a read-only page" fault). BR size =
+        // bytes to end of this WG's valid Y rectangle, clamped to 0 on over-shoot. The store pred (HAS_OOB) or
+        // unconditional store rides on top of this hardware clamp.
         int c_rows_remaining = (kargs.m > row) ? (kargs.m - row) : 0;
         int c_cols_remaining = (kargs.n > col) ? (kargs.n - col) : 0;
-        // C is row-major in [M, N], stride_c = N. Size the BR to cover the
-        // rest of this WG's row-band (c_rows_remaining full rows), which
-        // bounds both the rows-remaining and cols-remaining directions; 0 for
-        // the over-shoot WG so every store is dropped.
+        // C is row-major in [M, N], stride_c = N. Size the BR to cover the rest of this WG's row-band (c_rows_remaining
+        // full rows), which bounds both the rows-remaining and cols-remaining directions; 0 for the over-shoot WG so
+        // every store is dropped.
         unsigned int c_size_bytes = 0;
         if (c_rows_remaining > 0 && c_cols_remaining > 0) {
             // Bytes from (row, col) to end of WG's row-band:
@@ -215,9 +198,8 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
 
         int tic = 0, toc = 1;
 
-        // ── Prologue (same shape as split-barrier; wave-id-m phase shifter
-        // and B/A prefetch byte-identical). The loop-tail vmcnt(0)+s_barrier
-        // resets the wave phase, so every iter re-establishes the shifter.
+        // ── Prologue (same shape as split-barrier; wave-id-m phase shifter and B/A prefetch byte-identical). The
+        // loop-tail vmcnt(0)+s_barrier resets the wave phase, so every iter re-establishes the shifter.
         async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
         async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
         async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
@@ -239,14 +221,11 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
         __builtin_amdgcn_s_barrier();
 
         // ── Main loop ──
-        // Byte-for-byte matches mouter.cc:394..483. Intentional differences
-        // vs the split-barrier pipeline:
-        //   * Only 4 sched_barrier(0) per K-tile pair (after v_c[0][0] and
-        //     v_c[1][0] mmas), not 8, so the compiler can hoist v_b[0]/v_a
-        //     loads above the next mma group.
-        //   * v_c[1][1] mma group: the next k-tile's v_b[0] = load(...) is
-        //     emitted BEFORE the async_load + waitcnt + barrier, letting
-        //     ds_read overlap buffer_load issue.
+        // Byte-for-byte matches mouter.cc:394..483. Intentional differences vs the split-barrier pipeline:
+        //   * Only 4 sched_barrier(0) per K-tile pair (after v_c[0][0] and v_c[1][0] mmas), not 8, so the compiler can
+        //     hoist v_b[0]/v_a loads above the next mma group.
+        //   * v_c[1][1] mma group: the next k-tile's v_b[0] = load(...) is emitted BEFORE the async_load + waitcnt +
+        //     barrier, letting ds_read overlap buffer_load issue.
         for(int tile = 0; tile < loops - 2; tile += 2) {
             // First tile
             v_a = load<T::VEC_A>(s_a[tic][0], u_ra);
@@ -366,10 +345,9 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
         }
 
         // ── First epilogue chunk (K-tile = loops-2). ──
-        // Byte-for-byte matches mouter.cc:485..520. No sched_barrier inside:
-        // the inter-mma s_barrier is a sufficient fence, and adding
-        // sched_barrier(0) blocks overlapping the next group's ds_read with
-        // the prior mma's barrier wait.
+        // Byte-for-byte matches mouter.cc:485..520. No sched_barrier inside: the inter-mma s_barrier is a sufficient
+        // fence, and adding sched_barrier(0) blocks overlapping the next group's ds_read with the prior mma's barrier
+        // wait.
         {
             int tile = loops - 2;
 
@@ -484,16 +462,14 @@ gemm_a16w16_persistent_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
         store_c(v_c[1][0], 1, 0);
         store_c(v_c[1][1], 1, 1);
 
-        // ── M-outer iter barrier: drain all stores (vmcnt(0)) + s_barrier
-        // before reloading A for the next tile_m. Both wave groups hit this
-        // barrier, so their relative phase is preserved (no phase reset).
+        // ── M-outer iter barrier: drain all stores (vmcnt(0)) + s_barrier before reloading A for the next tile_m. Both
+        // wave groups hit this barrier, so their relative phase is preserved (no phase reset).
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
     }  // end M outer loop
 #else
-    // Non-gfx950 device pass: empty stub. The Python import guard
-    // (aiter/ops/opus/_arch.py) plus the host arch router in
-    // opus_gemm.cu prevent runtime dispatch from ever reaching here.
+    // Non-gfx950 device pass: empty stub. The Python import guard (aiter/ops/opus/_arch.py) plus the host arch router
+    // in opus_gemm.cu prevent runtime dispatch from ever reaching here.
     (void)kargs;
 #endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__

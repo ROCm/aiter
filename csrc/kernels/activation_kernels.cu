@@ -454,8 +454,7 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                              : "=v"(result)
                              : "v"(act_vals), "v"(y_vals), "v"(scale_vals));
 #else
-                // RDNA archs lack `v_pk_mul_f32`; portable fallback emits two
-                // pairs of `v_mul_f32`.
+                // RDNA archs lack `v_pk_mul_f32`; portable fallback emits two pairs of `v_mul_f32`.
                 result.x = act_vals.x * y_vals.x * scale_vals.x;
                 result.y = act_vals.y * y_vals.y * scale_vals.y;
 #endif

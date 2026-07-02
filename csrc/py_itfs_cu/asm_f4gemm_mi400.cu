@@ -74,8 +74,7 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         const auto& cfg = el.second;
         if(cfg.intype != intype || cfg.a_preshuffle != a_preshuffle)
             continue;
-        // Persistent/cluster shaders don't mask partial tiles, so the problem
-        // must tile both dims exactly.
+        // Persistent/cluster shaders don't mask partial tiles, so the problem must tile both dims exactly.
         if((N % cfg.tile_n) != 0 || (M % cfg.tile_m) != 0)
             continue;
 

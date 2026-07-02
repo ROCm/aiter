@@ -13,11 +13,9 @@
 #include <type_traits>
 #include <unordered_map>
 
-// GemmLookupKey: POD dispatch key on (gfx, cu_num, M, N, K). Trivially
-// destructible + standard-layout so lookup tables constant-init into
-// .data.rel.ro (no per-entry ctors, no exception-cleanup in the dispatch
-// lambda). gfx views must outlive the table: table entries use string
-// literals ("gfx950"), runtime keys point into get_device_gfx()'s
+// GemmLookupKey: POD dispatch key on (gfx, cu_num, M, N, K). Trivially destructible + standard-layout so lookup tables
+// constant-init into .data.rel.ro (no per-entry ctors, no exception-cleanup in the dispatch lambda). gfx views must
+// outlive the table: table entries use string literals ("gfx950"), runtime keys point into get_device_gfx()'s
 // permanently-cached std::string.
 struct GemmLookupKey
 {
@@ -50,9 +48,8 @@ struct GemmLookupKeyEq
     { return a.cu_num == b.cu_num && a.M == b.M && a.N == b.N && a.K == b.K && a.gfx == b.gfx; }
 };
 
-// get_device_cu_num: multiProcessorCount of the current HIP device, cached
-// per device ID (SynchronizedCache) so hipSetDevice() across GPUs with
-// different CU counts always returns the correct value.
+// get_device_cu_num: multiProcessorCount of the current HIP device, cached per device ID (SynchronizedCache) so
+// hipSetDevice() across GPUs with different CU counts always returns the correct value.
 inline int get_device_cu_num()
 {
     static SynchronizedCache<int, int> cache;
@@ -65,11 +62,9 @@ inline int get_device_cu_num()
     });
 }
 
-// get_device_gfx: GCN arch name of the current HIP device (e.g. "gfx942"),
-// with any :sramecc+:xnack- suffix stripped. Cached per device ID so
-// hipSetDevice() across differing archs always returns the correct string.
-// Returned as string_view since the cached std::string (function-local static
-// map, never erased) lives for the program's lifetime.
+// get_device_gfx: GCN arch name of the current HIP device (e.g. "gfx942"), with any :sramecc+:xnack- suffix stripped.
+// Cached per device ID so hipSetDevice() across differing archs always returns the correct string. Returned as
+// string_view since the cached std::string (function-local static map, never erased) lives for the program's lifetime.
 inline std::string_view get_device_gfx()
 {
     static SynchronizedCache<int, std::string> cache;
@@ -94,9 +89,8 @@ template <typename KernelFn>
 using GemmDispatchMap =
     std::unordered_map<GemmLookupKey, KernelFn, GemmLookupKeyHash, GemmLookupKeyEq>;
 
-// BatchedGemmLookupKey: POD dispatch key on (gfx, cu_num, B, M, N, K) for
-// batched GEMM modules. Same trivial-destructibility / standard-layout as
-// GemmLookupKey.
+// BatchedGemmLookupKey: POD dispatch key on (gfx, cu_num, B, M, N, K) for batched GEMM modules. Same
+// trivial-destructibility / standard-layout as GemmLookupKey.
 struct BatchedGemmLookupKey
 {
     std::string_view gfx;
@@ -133,8 +127,7 @@ struct BatchedGemmLookupKeyEq
     }
 };
 
-// BatchedGemmDispatchMap: alias for the (gfx, cu_num, B, M, N, K)-keyed map
-// used by batched GEMM modules:
+// BatchedGemmDispatchMap: alias for the (gfx, cu_num, B, M, N, K)-keyed map used by batched GEMM modules:
 //   using BatchedRowwiseKernelMap = BatchedGemmDispatchMap<BatchedRowwiseKernel>;
 template <typename KernelFn>
 using BatchedGemmDispatchMap = std::

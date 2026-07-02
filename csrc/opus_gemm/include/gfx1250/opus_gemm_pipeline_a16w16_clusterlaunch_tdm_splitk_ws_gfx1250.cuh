@@ -189,9 +189,8 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
             binit(opus::number<1 + 2 * T::kNumSlots + s>{}, kFreeMemCnt); // FREE_B[s]
         });
     }
-    // Publish the named-barrier init (done by one consumer wave above) to every wave
-    // before first use. This workgroup barrier is ALWAYS needed, independent of the
-    // cluster barrier below.
+    // Publish the named-barrier init (done by one consumer wave above) to every wave before first use.
+    // This workgroup barrier is ALWAYS needed, independent of the cluster barrier below.
     __builtin_amdgcn_s_barrier();
 
     // Cluster sync (-3): align all CWGM*CWGN WGs before the first multicast TDM. It

@@ -201,8 +201,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
 void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
-    // gfx950-only kernel body. See opus_gemm_pipeline_a16w16_gfx950.cuh for the
-    // multi-arch wheel rationale.
+    // gfx950-only kernel body. See opus_gemm_pipeline_a16w16_gfx950.cuh for the multi-arch wheel rationale.
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
