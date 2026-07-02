@@ -301,6 +301,7 @@ PY
         "${log_dir}/01_kernel_trace_stats.log" \
         rocprofv3 --kernel-trace --stats -d "${kernel_trace_dir}" -- \
             env PYTORCH_ALLOC_CONF=expandable_segments:True \
+                GPU_ARCHS=gfx1250 \
                 FLYDSL_DUMP_IR=1 \
                 FLYDSL_DUMP_DIR="${flydsl_dump_dir}" \
                 "${test_cmd[@]}"
@@ -348,6 +349,7 @@ YAML
             "${log_dir}/03_thread_trace.log" \
             rocprofv3 -i "${input_yaml}" -- \
                 env PYTORCH_ALLOC_CONF=expandable_segments:True \
+                    GPU_ARCHS=gfx1250 \
                     "${test_cmd[@]}"
         att_status=$?
         set -e
