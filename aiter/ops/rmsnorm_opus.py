@@ -109,6 +109,33 @@ def rms_norm(input: Tensor, weight: Tensor, epsilon: float) -> Tensor:
     return out
 
 
+# opus mirrors of the CK entrypoints (same signatures as the *_ck functions).
+def rmsnorm2d_fwd_opus(
+    input: Tensor, weight: Tensor, epsilon: float, use_model_sensitive_rmsnorm: int = 0
+) -> Tensor:
+    out = torch.empty_like(input)
+    rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
+    return out
+
+
+def rmsnorm2d_fwd_with_add_opus(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    use_model_sensitive_rmsnorm: int = 0,
+) -> None:
+    # opus fused kernel is in-place on (io, res); stage into out/residual_out so
+    # input/residual_in are left untouched.
+    out.copy_(input)
+    residual_out.copy_(residual_in)
+    fused_add_rms_norm_opus(
+        out, residual_out, weight, epsilon, use_model_sensitive_rmsnorm
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fused rmsnorm + dynamic/smooth quant (int8/fp8 out). residual/xscale/unquant
 # pointers are 0 when unused. out_code: 0=int8, 1=fp8.

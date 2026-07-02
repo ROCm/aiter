@@ -106,9 +106,9 @@ def rms_norm(
     rmsnorm; CK by default, opus when AITER_RMSNORM_BACKEND=opus (plain bf16/fp16).
     """
     if _use_opus(input, use_model_sensitive_rmsnorm):
-        out = torch.empty_like(input)
-        _rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
-        return out
+        return _opus.rmsnorm2d_fwd_opus(
+            input, weight, epsilon, use_model_sensitive_rmsnorm
+        )
     return rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
@@ -119,9 +119,9 @@ def rmsnorm2d_fwd(
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
     if _use_opus(input, use_model_sensitive_rmsnorm):
-        out = torch.empty_like(input, dtype=input.dtype, device=input.device)
-        _rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
-        return out
+        return _opus.rmsnorm2d_fwd_opus(
+            input, weight, epsilon, use_model_sensitive_rmsnorm
+        )
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
     else:
@@ -141,11 +141,14 @@ def rmsnorm2d_fwd_with_add(
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
     if _use_opus(input, use_model_sensitive_rmsnorm, gemma_norm):
-        # opus kernel is in-place; stage into out/residual_out, leave inputs intact
-        out.copy_(input)
-        residual_out.copy_(residual_in)
-        _fused_add_rms_norm_opus(
-            out, residual_out, weight, epsilon, use_model_sensitive_rmsnorm
+        _opus.rmsnorm2d_fwd_with_add_opus(
+            out,
+            input,
+            residual_in,
+            residual_out,
+            weight,
+            epsilon,
+            use_model_sensitive_rmsnorm,
         )
         return
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
