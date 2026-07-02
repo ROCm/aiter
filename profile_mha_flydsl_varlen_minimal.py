@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal FlyDSL varlen MHA driver for rocprofv3 ATT experiments."""
+"""Minimal varlen MHA driver for rocprofv3 ATT experiments."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import argparse
 import math
 import os
 
-# Keep aiter package import light; this script imports the FlyDSL kernel module
-# directly instead of routing through aiter.ops.mha or op_tests.
+# Keep aiter package import light for the FlyDSL path; the ASM path imports the
+# public ASM wrapper lazily only when requested.
 os.environ.setdefault("AITER_AOT_IMPORT", "1")
 os.environ.setdefault("GPU_ARCHS", "gfx1250")
 
@@ -27,6 +27,17 @@ def parse_bool(value: str | bool) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--kernel",
+        choices=("flydsl", "asm"),
+        default="flydsl",
+        help="Kernel path to run: FlyDSL D192 or gfx1250 ASM D128.",
+    )
+    parser.add_argument(
+        "-d_qk_v",
+        default=None,
+        help="Head dimensions as Dqk,Dv. 192,128 selects FlyDSL; 128,128 selects ASM.",
+    )
     parser.add_argument("--causal", type=parse_bool, default=True)
     parser.add_argument("--return_lse", type=parse_bool, default=True)
     parser.add_argument("-b", "--batch_size", type=int, default=1)
@@ -38,8 +49,17 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=20)
     args = parser.parse_args()
 
+    if args.d_qk_v is not None:
+        dims = tuple(int(part) for part in args.d_qk_v.split(","))
+        if dims == (128, 128):
+            args.kernel = "asm"
+        elif dims == (192, 128):
+            args.kernel = "flydsl"
+        else:
+            raise ValueError(f"unsupported -d_qk_v {args.d_qk_v!r}")
+
     device = torch.device("cuda")
-    d_qk = 192
+    d_qk = 128 if args.kernel == "asm" else 192
     d_v = 128
     total_q = args.batch_size * args.seqlen_q
     total_k = args.batch_size * args.seqlen_k
@@ -71,20 +91,47 @@ def main() -> int:
     out = torch.empty(total_q, args.nheads, d_v, dtype=torch.bfloat16, device=device)
     scale = 1.0 / math.sqrt(d_qk)
 
-    def run_once():
-        return flash_attn_varlen_d192_gfx1250(
-            q,
-            k,
-            v,
-            cu_q,
-            cu_k,
-            args.seqlen_q,
-            args.seqlen_k,
-            softmax_scale=scale,
-            causal=args.causal,
-            out=out,
-            return_lse=args.return_lse,
-        )
+    if args.kernel == "asm":
+        if not args.causal:
+            raise ValueError("gfx1250 ASM varlen path requires --causal true")
+
+        from aiter.ops.mha import fmha_fwd_with_sink_varlen_asm
+
+        def run_once():
+            result = fmha_fwd_with_sink_varlen_asm(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                args.seqlen_q,
+                scale,
+                True,
+                args.return_lse,
+                sink=None,
+                out=out,
+            )
+            if args.return_lse:
+                asm_out, asm_lse = result
+                return asm_out, asm_lse.squeeze(-1)
+            return result[0]
+
+    else:
+
+        def run_once():
+            return flash_attn_varlen_d192_gfx1250(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                args.seqlen_q,
+                args.seqlen_k,
+                softmax_scale=scale,
+                causal=args.causal,
+                out=out,
+                return_lse=args.return_lse,
+            )
 
     for _ in range(args.warmup):
         run_once()
@@ -108,7 +155,8 @@ def main() -> int:
     else:
         checksum = float(result[0, 0, 0].float().item())
     print(
-        "minimal_flydsl_mha "
+        "minimal_mha "
+        f"kernel={args.kernel} Dqk={d_qk} Dv={d_v} "
         f"B={args.batch_size} H={args.nheads} SQ={args.seqlen_q} SK={args.seqlen_k} "
         f"causal={args.causal} return_lse={args.return_lse} "
         f"avg_ms={avg_ms:.6f} checksum={checksum:.6f}"
