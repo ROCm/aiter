@@ -73,9 +73,8 @@ DTYPE_BYTES = 2
 LDG_VEC_SIZE = 8
 MAX_LDS_BYTES = 163840
 
-# Expand the original small-M catalog with the additional cases that proved
-# useful during the deeper exhaustive search, instead of maintaining separate
-# compact/exhaustive modes.
+# Expand the original small-M catalog with the additional cases that proved useful during the deeper exhaustive search,
+# instead of maintaining separate compact/exhaustive modes.
 SMALL_M_TILE_K_OPTIONS = (32, 64, 96, 128, 160, 192, 256)
 SMALL_M_MAX_SPLIT_K = 32
 SMALL_M_TILE_N_OPTIONS = (

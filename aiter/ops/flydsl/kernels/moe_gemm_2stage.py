@@ -3672,10 +3672,9 @@ def compile_moe_reduction(
             tile_idx = gpu.block_id("y")
             tid = gpu.thread_id("x")
 
-            # 64-bit base-offset folding: X is [m_tokens, topk, model_dim] and can
-            # exceed 4 GiB, overflowing buffer_load's i32 voffset. Fold the per-WG
-            # token byte offset into the descriptor's 48-bit base (i64) so in-kernel
-            # voffsets only address one token's slab.
+            # 64-bit base-offset folding: X is [m_tokens, topk, model_dim] and can exceed 4 GiB, overflowing
+            # buffer_load's i32 voffset. Fold the per-WG token byte offset into the descriptor's 48-bit base (i64) so
+            # in-kernel voffsets only address one token's slab.
             slab_elems_x = c_topk * c_model_dim
             x_slab_nbytes = slab_elems_x * fx.Index(elem_bytes_c)
             y_slab_nbytes = c_model_dim * fx.Index(elem_bytes_c)

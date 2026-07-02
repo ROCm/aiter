@@ -57,9 +57,8 @@ def _s_prefetch_inst_burst(num_pages: int, page_bytes: int = 4096):
     _llvm.inline_asm(None, [], "\n".join(lines), "", has_side_effects=True)
 
 
-# Feature-detect the installed flydsl's TDM descriptor builder. Older pinned
-# flydsl predates these args; we apply each only when supported and otherwise
-# fall back to the vendored OOB-capable builder for the non-tile-aligned-M path.
+# Feature-detect the installed flydsl's TDM descriptor builder. Older pinned flydsl predates these args; we apply each
+# only when supported and otherwise fall back to the vendored OOB-capable builder for the non-tile-aligned-M path.
 _TDM_SIG_PARAMS = inspect.signature(tdm_ops.make_tensor_descriptor_2d).parameters
 _TDM_HAS_EARLY_TIMEOUT = "early_timeout" in _TDM_SIG_PARAMS
 _TDM_HAS_OOB = "oob_outer_bound" in _TDM_SIG_PARAMS
@@ -164,9 +163,8 @@ def compile_fp8fp4_gemm(
             f"out_dtype must be 'f32', 'bf16', or 'f16', got {out_dtype!r}"
         )
     elem_bytes_d = 2 if out_dtype in ("bf16", "f16") else 4
-    # scale_load_path: "tdm" = TDM->LDS (default); "vgpr" = buffer_load->VGPR,
-    # off the LDS/TDM/barrier path; "vgpr_ab_split" = "vgpr" plus repurposing the
-    # idle scale waves 2,3 to load the second A/B halves.
+    # scale_load_path: "tdm" = TDM->LDS (default); "vgpr" = buffer_load->VGPR, off the LDS/TDM/barrier path;
+    # "vgpr_ab_split" = "vgpr" plus repurposing the idle scale waves 2,3 to load the second A/B halves.
     scale_load_paths = ("tdm", "vgpr", "vgpr_ab_split")
     if scale_load_path not in scale_load_paths:
         raise ValueError(
@@ -322,14 +320,12 @@ def compile_fp8fp4_gemm(
             return value
         return (value + align - 1) // align * align
 
-    # TDM descriptors partition a tile cooperatively across ``num_warps`` via
-    # per-``wave_id`` offsets. Wave-specialized mode dedicates one loader wave per
-    # tensor (A/B/A_scale/B_scale), so each issues a full-tile descriptor alone.
+    # TDM descriptors partition a tile cooperatively across ``num_warps`` via per-``wave_id`` offsets. Wave-specialized
+    # mode dedicates one loader wave per tensor (A/B/A_scale/B_scale), so each issues a full-tile descriptor alone.
     tdm_desc_num_warps = 1 if wave_specialized_tdm else num_warps
 
-    # All pipeline stages share the same intra-stage layout in the generic
-    # arena path. The active gfx1250 FP8 TDM tile uses a separate reference
-    # pool layout below.
+    # All pipeline stages share the same intra-stage layout in the generic arena path. The active gfx1250 FP8 TDM tile
+    # uses a separate reference pool layout below.
     stage_layout = SmemAllocator(
         None, arch=gpu_arch, global_sym_name=f"mxscale_{data_format}_layout"
     )
@@ -385,17 +381,15 @@ def compile_fp8fp4_gemm(
     # Scale prefetch depth (K-tiles ahead) for the buffer->VGPR path; D=1 is best
     # (D>1 doubles scale VGPRs -> spill/regression).
     _bvs_D = max(1, int(os.environ.get("FLYDSL_BUFFER_VGPR_SCALE_DEPTH", "1")))
-    # ab_half_split: repurpose the (under "vgpr") idle scale waves 2,3 as the
-    # second halves of A/B, so all 4 waves share the A/B TDM (wave0=A0, wave1=B0,
-    # wave2=A1, wave3=B1). Measured wall-neutral.
+    # ab_half_split: repurpose the (under "vgpr") idle scale waves 2,3 as the second halves of A/B, so all 4 waves share
+    # the A/B TDM (wave0=A0, wave1=B0, wave2=A1, wave3=B1). Measured wall-neutral.
     use_ab_half_split = scale_load_path == "vgpr_ab_split"
     # The buffer_load->VGPR scale ring is built only when scale is actually loaded.
     _bvs_active = use_buffer_vgpr_scale
 
     if use_ref_segmented_lds_layout:
-        # The A/B data pools are no longer packed into the same per-stage
-        # 64KiB segment window. Scale pools keep the reference 0x800 stride so
-        # every TDM LDS target remains 2KiB-aligned.
+        # The A/B data pools are no longer packed into the same per-stage 64KiB segment window. Scale pools keep the
+        # reference 0x800 stride so every TDM LDS target remains 2KiB-aligned.
         ref_a_stage_stride = 0x9000
         ref_b_stage_stride = 0x8000
         ref_scale_stage_stride = 0x800
@@ -431,9 +425,8 @@ def compile_fp8fp4_gemm(
         arena_alloc.ptr = LDS_GFX1250_MAX_BYTES
         arena_total_bytes = arena_alloc.ptr
 
-        # The epilogue may reuse the prefix only after all main/tail TDM traffic
-        # is fully fenced. This is outside the hot loop and avoids assuming a
-        # single monotonic per-stage base for the segmented pool layout.
+        # The epilogue may reuse the prefix only after all main/tail TDM traffic is fully fenced. This is outside the
+        # hot loop and avoids assuming a single monotonic per-stage base for the segmented pool layout.
         epilogue_fence_threshold_bytes = 0
     else:
         stage_phys_order = [i for i in range(num_buffers) if i != _last_compute_stage]
@@ -537,14 +530,12 @@ def compile_fp8fp4_gemm(
             return COMPUTE_SCHEDULE_B_STREAMING
         if wmma_m_rep % 2 != 0 or wmma_n_rep % 2 != 0 or n_accs < 8:
             return COMPUTE_SCHEDULE_ROW_MAJOR_STREAMING
-        # Quadrant schedules split B into left/right halves and compute
-        # top-left, bottom-left, top-right, bottom-right. FP4 additionally
-        # changes accumulator layout for bank friendliness; FP8 keeps row-major
-        # accumulators and uses the split to increase LDS-load-to-WMMA distance.
+        # Quadrant schedules split B into left/right halves and compute top-left, bottom-left, top-right, bottom-right.
+        # FP4 additionally changes accumulator layout for bank friendliness; FP8 keeps row-major accumulators and uses
+        # the split to increase LDS-load-to-WMMA distance.
         if is_fp4:
             return COMPUTE_SCHEDULE_FP4_COL_BAND
-        # A8W4 (FP8 act + FP4 weight) shares FP8's accumulator layout and operand
-        # path, so it reuses the FP8 schedules.
+        # A8W4 (FP8 act + FP4 weight) shares FP8's accumulator layout and operand path, so it reuses the FP8 schedules.
         if data_format in ("fp8", "a8w4"):
             if fp8_schedule == "deep-pipeline" or (
                 fp8_schedule == "auto" and fp8_deep_pipeline_eligible
@@ -673,9 +664,8 @@ def compile_fp8fp4_gemm(
         warp_n_base = wave_n_idx * arith.index(warp_tile_n)
 
         if const_expr(use_buffer_vgpr_scale):
-            # Direct global->VGPR scale load (no TDM/LDS). Coalesced lane-major
-            # host layout [M_block(128), K_tile, group(2), lane16(16), 4 i32], so
-            # each buffer_load_b128's 16 lanes read 256 contiguous bytes:
+            # Direct global->VGPR scale load (no TDM/LDS). Coalesced lane-major host layout [M_block(128), K_tile,
+            # group(2), lane16(16), 4 i32], so each buffer_load_b128's 16 lanes read 256 contiguous bytes:
             #   i32_off(group) = (mb*Kt + kt)*128 + group*64 + lane16*4
             _bvs_a_rsrc = buffer_ops.create_buffer_resource(arg_a_scale, max_size=False)
             _bvs_b_rsrc = buffer_ops.create_buffer_resource(arg_b_scale, max_size=False)
@@ -706,9 +696,8 @@ def compile_fp8fp4_gemm(
                 return a, b
 
         m_idx = fx.Index(i32_m)
-        # Leading-dim strides arrive at runtime (strided A // C); the dense path
-        # passes lda == K and ldc == N, giving byte-identical addressing. A's
-        # stride is in packed-A elements (== lda for fp8 where PACK_FACTOR_A == 1).
+        # Leading-dim strides arrive at runtime (strided A // C); the dense path passes lda == K and ldc == N, giving
+        # byte-identical addressing. A's stride is in packed-A elements (== lda for fp8 where PACK_FACTOR_A == 1).
         if const_expr(PACK_FACTOR_A == 1):
             lda_packed = fx.Index(i32_lda)
         else:
@@ -1523,9 +1512,8 @@ def compile_fp8fp4_gemm(
                     next_left_frags, next_left_scales = _load_b_half_bundle(
                         0, 0, ks + 1
                     )
-                    # Older right-half loads must be ready before consuming
-                    # them, while the next ks left-half preload can remain in
-                    # flight under the final two quadrants.
+                    # Older right-half loads must be ready before consuming them, while the next ks left-half preload
+                    # can remain in flight under the final two quadrants.
                     rocdl.s_wait_dscnt(_bank_half_wn * 4 + _b_half_scale_loads)
                 else:
                     rocdl.s_wait_dscnt(0)
@@ -1686,8 +1674,7 @@ def compile_fp8fp4_gemm(
                 a_top_frags = _load_a_group(0, _fp8_half_wm, ks)
 
                 # Consume the first top-left row before issuing bottom-A.
-                # The barriers only constrain LLVM scheduling; they are not
-                # hardware synchronization points.
+                # The barriers only constrain LLVM scheduling; they are not hardware synchronization points.
                 rocdl.s_wait_dscnt(_first_top_row_keep)
                 rocdl.sched_barrier(0)
                 _emit_group_rows(
@@ -2386,8 +2373,7 @@ def compile_fp8fp4_gemm(
                 addr_arg = (
                     addrs[addr_idx] if _bf16_out else addrs[addr_idx : addr_idx + 2]
                 )
-                # Atomics use a raw global ptr (no num_records clip), so predicate
-                # per-lane to skip rows >= M.
+                # Atomics use a raw global ptr (no num_records clip), so predicate per-lane to skip rows >= M.
                 row = blk_m + warp_m_base + arith.index(m_off) + lane16
                 if_op = scf.IfOp(row < m_idx, [], has_else=False)
                 with ir.InsertionPoint(if_op.then_block):
@@ -3184,9 +3170,8 @@ def compile_fp8fp4_gemm(
                 epilogue_stores(accs, epi_addrs_box[0])
 
         if const_expr(use_tdm_store):
-            # Full M-tiles take the fast TDM store; the partial last M-tile
-            # (rows >= M) falls back to the buffer store, whose num_records clip
-            # drops the OOB rows.
+            # Full M-tiles take the fast TDM store; the partial last M-tile (rows >= M) falls back to the buffer store,
+            # whose num_records clip drops the OOB rows.
             full_tile = (blk_m + arith.index(tile_m)) <= m_idx
             if_op = scf.IfOp(full_tile, [], has_else=True)
             with ir.InsertionPoint(if_op.then_block):

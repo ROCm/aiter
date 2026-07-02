@@ -53,11 +53,10 @@ WAVE_SIZE = 32
 SCALE_BLOCK = 32
 SCALES_PER_WMMA = WMMA_K // SCALE_BLOCK  # 4
 
-# n32k4 weight (B) scale layout (see grouped_moe_gfx1250._grouped_b_scale_
-# preshuffle_e8m0): a 32-row super-row folds the column as
-# col = remain_k*BS_N32K4_KSTEP_BYTES + row32*SCALES_PER_WMMA + r, where remain_k
-# is the WMMA-K=128 step, row32 (==lane) the row, r (0-3) the K-block.  The 4 e8m0
-# of one WMMA-K step are contiguous (one i32 = one lane's ds_load_b32 scaleB).
+# n32k4 weight (B) scale layout (see grouped_moe_gfx1250._grouped_b_scale_ preshuffle_e8m0): a 32-row super-row folds
+# the column as col = remain_k*BS_N32K4_KSTEP_BYTES + row32*SCALES_PER_WMMA + r, where remain_k is the WMMA-K=128 step,
+# row32 (==lane) the row, r (0-3) the K-block.  The 4 e8m0 of one WMMA-K step are contiguous (one i32 = one lane's
+# ds_load_b32 scaleB).
 BS_N32K4_BLOCK_N = 32  # N rows per super-row
 BS_N32K4_SUBBLOCK_N = WMMA_N  # 16, N rows per WMMA N-tile (= one op_sel half)
 BS_N32K4_KSTEP_BYTES = BS_N32K4_BLOCK_N * SCALES_PER_WMMA  # 128, WMMA-K step col stride
@@ -212,9 +211,8 @@ def compile_mxscale_gemm(
         if split_k != 1:
             raise ValueError("stage1_act GEMM epilogue fuse requires split_k == 1")
         if wave_specialized_tdm and stage1_weight_layout_mode != "gugu":
-            # gguu is dual-B (6 TDM streams: A, B_gate, B_up, As, Bs_gate, Bs_up),
-            # which won't map onto the 4-wave wave-specialized model. gugu
-            # (interleaved) is single-B (4 streams: A, B, As, Bs) and IS supported.
+            # gguu is dual-B (6 TDM streams: A, B_gate, B_up, As, Bs_gate, Bs_up), which won't map onto the 4-wave
+            # wave-specialized model. gugu (interleaved) is single-B (4 streams: A, B, As, Bs) and IS supported.
             raise ValueError(
                 "stage1_act fused epilogue supports wave_specialized_tdm only for "
                 "the gugu (interleaved single-B) layout, not gguu (dual-B)"
@@ -352,9 +350,8 @@ def compile_mxscale_gemm(
     wmma_m_rep = warp_tile_m // WMMA_M
     wmma_n_rep = warp_tile_n // WMMA_N_EFF
     n_accs = wmma_m_rep * wmma_n_rep
-    # A warp must own whole super-rows, or exactly one 16-row half of one
-    # (warp_tile_n==16, the per-tile read; needs tile_n%32==0 so LDS still stages
-    # whole super-rows).
+    # A warp must own whole super-rows, or exactly one 16-row half of one (warp_tile_n==16, the per-tile read; needs
+    # tile_n%32==0 so LDS still stages whole super-rows).
     if warp_tile_n % BS_N32K4_BLOCK_N != 0 and warp_tile_n != BS_N32K4_SUBBLOCK_N:
         raise ValueError(
             f"n32k4 B-scale requires warp_tile_n%32==0 or ==16, got {warp_tile_n}"
@@ -395,20 +392,17 @@ def compile_mxscale_gemm(
             return value
         return (value + align - 1) // align * align
 
-    # TDM descriptors partition a tile cooperatively across ``num_warps`` via
-    # per-``wave_id`` offsets. Wave-specialized mode dedicates one loader wave per
-    # tensor (A/B/A_scale/B_scale), so each issues a full-tile descriptor alone.
+    # TDM descriptors partition a tile cooperatively across ``num_warps`` via per-``wave_id`` offsets. Wave-specialized
+    # mode dedicates one loader wave per tensor (A/B/A_scale/B_scale), so each issues a full-tile descriptor alone.
     tdm_desc_num_warps = 1 if wave_specialized_tdm else num_warps
-    # WST B-split: hoisting A-scale to the prologue (tdm_as_in_prologue) frees the
-    # As wave, so B loads cooperatively via wave0+wave1 (2-warp descriptor).
-    # Otherwise B stays single (wst) / cooperative-by-all (non-wst).
+    # WST B-split: hoisting A-scale to the prologue (tdm_as_in_prologue) frees the As wave, so B loads cooperatively via
+    # wave0+wave1 (2-warp descriptor). Otherwise B stays single (wst) / cooperative-by-all (non-wst).
     b_desc_num_warps = (
         2 if (wave_specialized_tdm and tdm_as_in_prologue) else tdm_desc_num_warps
     )
 
-    # All pipeline stages share the same intra-stage layout. Keep that layout
-    # unchanged and only remap each logical stage to a physical base inside one
-    # LDS arena so TDM epilogue can alias the dead prefix of the arena.
+    # All pipeline stages share the same intra-stage layout. Keep that layout unchanged and only remap each logical
+    # stage to a physical base inside one LDS arena so TDM epilogue can alias the dead prefix of the arena.
     stage_layout = SmemAllocator(
         None, arch=gpu_arch, global_sym_name=f"mxscale_{data_format}_layout"
     )
@@ -458,11 +452,10 @@ def compile_mxscale_gemm(
     arena_alloc.ptr = stage_pitch_bytes * num_buffers
     arena_total_bytes = arena_alloc.ptr
 
-    # tdm_as_in_prologue: one resident buffer holding this K-chunk's entire
-    # A-scale, loaded once by wave0 in the prologue. Same 2D layout as the global
-    # tile ((WMMA_M*m_warp) super-rows, num_k_tiles tiles side by side; row stride
-    # = num_k_tiles * interleaved_scale_cols_a). Placed after the stage arena; the
-    # epilogue D-store may alias it (As is dead by then).
+    # tdm_as_in_prologue: one resident buffer holding this K-chunk's entire A-scale, loaded once by wave0 in the
+    # prologue. Same 2D layout as the global tile ((WMMA_M*m_warp) super-rows, num_k_tiles tiles side by side; row
+    # stride = num_k_tiles * interleaved_scale_cols_a). Placed after the stage arena; the epilogue D-store may alias it
+    # (As is dead by then).
     as_full_row_stride = num_k_tiles * interleaved_scale_cols_a
     _as_lds_cols = (
         as_full_row_stride if tdm_as_in_prologue else interleaved_scale_cols_a
@@ -503,9 +496,8 @@ def compile_mxscale_gemm(
     ]
 
     if use_tdm_store:
-        # TDM store copies the LDS tile as-is (no row de-pad), so keep it tightly
-        # packed: store extent = per-warp column count. gugu (stage1_act_interleave)
-        # writes de-interleaved swiglu output (C_N = N/2) -> warp_tile_n/2 columns;
+        # TDM store copies the LDS tile as-is (no row de-pad), so keep it tightly packed: store extent = per-warp column
+        # count. gugu (stage1_act_interleave) writes de-interleaved swiglu output (C_N = N/2) -> warp_tile_n/2 columns;
         # otherwise raw warp_tile_n columns.
         _tdm_store_warp_n = warp_tile_n // 2 if stage1_act_interleave else warp_tile_n
         lds_d_row_stride = _tdm_store_warp_n * elem_bytes_d
@@ -526,11 +518,10 @@ def compile_mxscale_gemm(
             arena_alloc.ptr = total_d_bytes
     check_smem_capacity(arena_total_bytes, gpu_arch)
 
-    # TENSORcnt is tracked per-wave. Regular path issues 4 tensor ops per wave per
-    # K-stage; wave-specialized issues 1 per dedicated loader wave. With A-scale
-    # hoisted to the prologue (tdm_as_in_prologue) the non-wst loop drops the
-    # per-step As load (4->3, dual-B 6->5); wst still issues 1 op/wave (the freed
-    # As wave now carries the second B half).
+    # TENSORcnt is tracked per-wave. Regular path issues 4 tensor ops per wave per K-stage; wave-specialized issues 1
+    # per dedicated loader wave. With A-scale hoisted to the prologue (tdm_as_in_prologue) the non-wst loop drops the
+    # per-step As load (4->3, dual-B 6->5); wst still issues 1 op/wave (the freed As wave now carries the second B
+    # half).
     TDM_LOADS_PER_STEP = (
         1
         if wave_specialized_tdm
@@ -815,11 +806,10 @@ def compile_mxscale_gemm(
                 )
 
             def make_desc_as_prologue(memref, k_base):
-                # One-shot resident A-scale load for tdm_as_in_prologue: a single
-                # wave (num_warps=1, issued from wave0) brings the whole K-chunk's
-                # A-scale tile (full width = as_full_row_stride) into LDS, matching
-                # the global 2D layout so the compute reads it with the same
-                # within-tile interleave, just a wider row stride.
+                # One-shot resident A-scale load for tdm_as_in_prologue: a single wave (num_warps=1, issued from wave0)
+                # brings the whole K-chunk's A-scale tile (full width = as_full_row_stride) into LDS, matching the
+                # global 2D layout so the compute reads it with the same within-tile interleave, just a wider row
+                # stride.
                 k_scale_off = k_base / arith.index(SCALE_BLOCK)
                 outer_off = blk_m / arith.index(wmma_m_rep)
                 inner_off = k_scale_off * arith.index(wmma_m_rep)
@@ -891,8 +881,7 @@ def compile_mxscale_gemm(
                         return arith.select(tdm_wave_is_b, b_value, result)
 
                 else:
-                    # Original wst: one tensor per wave -- wave0=A, wave1=B,
-                    # wave2=A-scale, wave3=B-scale.
+                    # Original wst: one tensor per wave -- wave0=A, wave1=B, wave2=A-scale, wave3=B-scale.
                     tdm_wave_is_a = tdm_wave_id == fx.Int32(0)
                     tdm_wave_is_b = tdm_wave_id == fx.Int32(1)
                     tdm_wave_is_as = tdm_wave_id == fx.Int32(2)
@@ -1063,9 +1052,8 @@ def compile_mxscale_gemm(
                     results.append(vi)
                 return results
 
-            # Runtime byte offset into the resident full-As LDS buffer for the
-            # tile currently being computed (set by the compute loop before each
-            # compute_tile call). Only used when tdm_as_in_prologue is on.
+            # Runtime byte offset into the resident full-As LDS buffer for the tile currently being computed (set by the
+            # compute loop before each compute_tile call). Only used when tdm_as_in_prologue is on.
             _as_full_base_off = [arith.index(0)]
 
             def _load_a_scales(as_buf, as_bases, reps, ks=0):
@@ -1216,10 +1204,9 @@ def compile_mxscale_gemm(
                                 b_scales,
                             )
 
-                # WST + as_prologue issues a single per-wave next-stage TDM, so hoist
-                # it early to overlap its global->LDS DMA with the whole WMMA body.
-                # Other paths issue several TDMs (non-WST = 6) whose addresses would
-                # bloat register pressure if hoisted, so keep them mid-compute.
+                # WST + as_prologue issues a single per-wave next-stage TDM, so hoist it early to overlap its
+                # global->LDS DMA with the whole WMMA body. Other paths issue several TDMs (non-WST = 6) whose addresses
+                # would bloat register pressure if hoisted, so keep them mid-compute.
                 _cb_early = wave_specialized_tdm and tdm_as_in_prologue
                 if const_expr(mid_compute_callback is not None and _cb_early):
                     rocdl.sched_barrier(0)
@@ -1491,9 +1478,8 @@ def compile_mxscale_gemm(
                         next_left_frags, next_left_scales = _load_b_half_bundle(
                             0, 0, ks + 1
                         )
-                        # Older right-half loads must be ready before consuming
-                        # them, while the next ks left-half preload can remain in
-                        # flight under the final two quadrants.
+                        # Older right-half loads must be ready before consuming them, while the next ks left-half
+                        # preload can remain in flight under the final two quadrants.
                         rocdl.s_wait_dscnt(_bank_half_wn * 4 + _b_half_scale_loads)
                     else:
                         rocdl.s_wait_dscnt(0)
@@ -1886,11 +1872,9 @@ def compile_mxscale_gemm(
                         scf.YieldOp([])
 
             def epilogue_stage1_act_interleaved_lds_stores(final_accs, d_buf, d_base):
-                # Same de-interleave + swiglu as the buffer-store path, but write
-                # the 4 activated outputs per sub-tile into the C_N-wide LDS output
-                # tile (de-interleaved layout) for a subsequent tensor_store_2d.
-                # No per-row mask here: the TDM-store path is gated on
-                # not needs_grouped_row_masked_store.
+                # Same de-interleave + swiglu as the buffer-store path, but write the 4 activated outputs per sub-tile
+                # into the C_N-wide LDS output tile (de-interleaved layout) for a subsequent tensor_store_2d. No per-row
+                # mask here: the TDM-store path is gated on not needs_grouped_row_masked_store.
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
                     raw_sub8 = _get_acc_sub8(final_accs, acc_idx, vec_base)
                     raw_sub8 = _add_bias_vec8(raw_sub8, wn)
@@ -1928,11 +1912,9 @@ def compile_mxscale_gemm(
                     )
 
             def epilogue_lds_stores_act_dual_b(gate_accs, up_accs, d_buf, d_base):
-                # Fused stage1 activation for the TDM store path: mirrors
-                # `epilogue_lds_stores` but writes silu/swiglu(gate) * up into the
-                # D LDS tile instead of the raw accumulator.  Valid only for the
-                # dual-B "gguu" layout, where the output tile width equals
-                # warp_tile_n so the 2D store descriptor is shared.
+                # Fused stage1 activation for the TDM store path: mirrors `epilogue_lds_stores` but writes
+                # silu/swiglu(gate) * up into the D LDS tile instead of the raw accumulator.  Valid only for the dual-B
+                # "gguu" layout, where the output tile width equals warp_tile_n so the 2D store descriptor is shared.
                 for acc_idx, vec_base, m_off, wn in _sub_tiles:
                     gate_sub8 = _get_acc_sub8(gate_accs, acc_idx, vec_base)
                     up_sub8 = _get_acc_sub8(up_accs, acc_idx, vec_base)
@@ -2183,10 +2165,9 @@ def compile_mxscale_gemm(
                     + lane16 * arith.index(_lds_d_stride_elems)
                     + lane_kgrp * arith.index(_kgrp_d_elems)
                 )
-                # Keep the TDM store descriptor in the same block-local warp
-                # coordinate system as the LDS stores above.  Using the raw
-                # hardware wave id here can point the descriptor at the wrong
-                # LDS tile when persistent workers are resident together.
+                # Keep the TDM store descriptor in the same block-local warp coordinate system as the LDS stores above.
+                # Using the raw hardware wave id here can point the descriptor at the wrong LDS tile when persistent
+                # workers are resident together.
                 local_wave_idx = wave_m_idx * arith.index(n_warp) + wave_n_idx
                 d_warp_off_sgpr = local_wave_idx * arith.index(
                     warp_d_bytes
@@ -2405,11 +2386,10 @@ def compile_mxscale_gemm(
                     # Clean i64 carry-add (no select) -> stays uniform/SGPR.
                     return tdm_ops.add_addr_with_carry(lo, hi, adv)
 
-            # tdm_as_in_prologue: load this K-chunk's entire A-scale once from wave0
-            # only (wave_specialized=True -> descriptor index 0 -> wave0), then fully
-            # drain (tensor_wait 0) + barrier so it is LDS-visible to every wave
-            # before the main loop. One-shot (never reloaded); the drain keeps it out
-            # of the data-prologue fence accounting below.
+            # tdm_as_in_prologue: load this K-chunk's entire A-scale once from wave0 only (wave_specialized=True ->
+            # descriptor index 0 -> wave0), then fully drain (tensor_wait 0) + barrier so it is LDS-visible to every
+            # wave before the main loop. One-shot (never reloaded); the drain keeps it out of the data-prologue fence
+            # accounting below.
             if const_expr(tdm_as_in_prologue):
                 _as_desc = make_desc_as_prologue(as_full_mem, split_k_base)
                 issue_tdm_loads(_as_desc, wave_specialized=True)
@@ -2508,10 +2488,9 @@ def compile_mxscale_gemm(
                             addr_lo_bs_up, addr_hi_bs_up, adv_bs_i32
                         )
 
-            # Entry fence: only needed when there is NO main loop (loop_iters==0,
-            # everything runs in the tail). When loop_iters>0 the main loop's
-            # first pipeline_fence_signal uses the same `outstanding` immediately
-            # after, with no TDM/compute/LDS-write in between, so this is redundant.
+            # Entry fence: only needed when there is NO main loop (loop_iters==0, everything runs in the tail). When
+            # loop_iters>0 the main loop's first pipeline_fence_signal uses the same `outstanding` immediately after,
+            # with no TDM/compute/LDS-write in between, so this is redundant.
             if const_expr(loop_iters == 0):
                 pipeline_fence(
                     outstanding=TDM_LOADS_PER_STEP * (num_buffers - 2),
@@ -2558,9 +2537,8 @@ def compile_mxscale_gemm(
                                 )
                                 _ab[0] = arith.addi(_ab[0], active_adv_i32)
 
-                            # L2 prefetch stays a mid-compute callback so it issues
-                            # inside the WMMA body (overlapping compute), separate
-                            # from the hoisted TDM above.
+                            # L2 prefetch stays a mid-compute callback so it issues inside the WMMA body (overlapping
+                            # compute), separate from the hoisted TDM above.
                             def _mid_prefetch_ws(
                                 _k_off=(
                                     split_k_base
@@ -2579,11 +2557,10 @@ def compile_mxscale_gemm(
                                 if tdm_as_in_prologue
                                 else stages_as_idx[buf_idx]
                             )
-                            # Hoist the TDM to the first load after the fence wait
-                            # (before compute's B/scale ds_loads) so its global->LDS
-                            # DMA overlaps the whole compute body; sched_barrier(0)
-                            # pins it so the compiler can't sink it below the ds_loads.
-                            # L2 prefetch still rides the mid-compute callback.
+                            # Hoist the TDM to the first load after the fence wait (before compute's B/scale ds_loads)
+                            # so its global->LDS DMA overlaps the whole compute body; sched_barrier(0) pins it so the
+                            # compiler can't sink it below the ds_loads. L2 prefetch still rides the mid-compute
+                            # callback.
                             rocdl.sched_barrier(0)
                             _issue_tdm_ws()
                             rocdl.sched_barrier(0)
@@ -2909,12 +2886,10 @@ def compile_mxscale_gemm(
                         addr_lo_bs = results[n_accs + 6]
                         addr_hi_bs = results[n_accs + 7]
 
-            # Tail -- same acc_mixed pattern: fence at top, TDM mid-compute. With a
-            # main loop the first tail step's own pipeline_fence_signal (Fence Y)
-            # drains to the right per-step level, making this tail-entry drain
-            # (Fence X) redundant. Exception: a terminal first tail step
-            # (outstanding==-1, e.g. extra==0/steps==1) carries no fence of its own,
-            # so X is the sole drain and must stay.
+            # Tail -- same acc_mixed pattern: fence at top, TDM mid-compute. With a main loop the first tail step's own
+            # pipeline_fence_signal (Fence Y) drains to the right per-step level, making this tail-entry drain (Fence X)
+            # redundant. Exception: a terminal first tail step (outstanding==-1, e.g. extra==0/steps==1) carries no
+            # fence of its own, so X is the sole drain and must stay.
             _skip_tail_entry_fence = bool(tail_plan) and tail_plan[0][2] != -1
             if const_expr(loop_iters > 0):
                 if const_expr(not _skip_tail_entry_fence):
@@ -2926,10 +2901,8 @@ def compile_mxscale_gemm(
             for _tail_i, (_load_stage, _compute_stage, _outstanding) in enumerate(
                 tail_plan
             ):
-                # tdm_as_in_prologue: tail computes the last `steps` tiles in
-                # order, so this step's absolute k-tile (compile-time) is
-                # loop_iters*num_buffers + _tail_i. Point the resident-As read at
-                # that slot.
+                # tdm_as_in_prologue: tail computes the last `steps` tiles in order, so this step's absolute k-tile
+                # (compile-time) is loop_iters*num_buffers + _tail_i. Point the resident-As read at that slot.
                 if const_expr(tdm_as_in_prologue):
                     _as_full_base_off[0] = arith.index(
                         (loop_iters * num_buffers + _tail_i) * interleaved_scale_cols_a
@@ -3151,10 +3124,9 @@ def compile_mxscale_gemm(
                 total_m_tiles_idx + grid_size - arith.index(1)
             ) // grid_size
 
-            # gfx950 a4w4 stage2 persist_m<=0 style: grid.x enumerates N tiles,
-            # grid.y enumerates CU workers. Each worker owns a contiguous chunk
-            # of M tiles for the fixed N tile, improving B reuse and avoiding a
-            # global flattened tile stream inside the worker loop.
+            # gfx950 a4w4 stage2 persist_m<=0 style: grid.x enumerates N tiles, grid.y enumerates CU workers. Each
+            # worker owns a contiguous chunk of M tiles for the fixed N tile, improving B reuse and avoiding a global
+            # flattened tile stream inside the worker loop.
             _c0_p = arith.index(0)
             _c1_p = arith.index(1)
             _i1 = ir.IntegerType.get_signless(1)
@@ -3175,9 +3147,8 @@ def compile_mxscale_gemm(
             cur_active = arith.andi(still_active, m_tile_in_range)
             tile_active = arith.andi(cur_active, n_tile_in_range)
 
-            # tile_active is uniform across the workgroup. Skipping the full
-            # tile body for inactive persistent workers avoids burning WMMA
-            # cycles on the common decode case where total_m_tiles << CU.
+            # tile_active is uniform across the workgroup. Skipping the full tile body for inactive persistent workers
+            # avoids burning WMMA cycles on the common decode case where total_m_tiles << CU.
             tile_if = scf.IfOp(tile_active, results_=[], has_else=False)
             with ir.InsertionPoint(tile_if.then_block):
                 map_entry_i32 = buffer_ops.buffer_load(
@@ -3361,16 +3332,14 @@ def compile_mxscale_gemm(
                 else:
                     _emit_tile(batch_idx, bx_local, by, bz)
 
-    # Bump this when changing generated IR in ways not otherwise reflected in
-    # the shape/config tuple below. This forces FlyDSL's JIT/cache path to stop
-    # reusing a previously compiled kernel after source-only descriptor fixes.
+    # Bump this when changing generated IR in ways not otherwise reflected in the shape/config tuple below. This forces
+    # FlyDSL's JIT/cache path to stop reusing a previously compiled kernel after source-only descriptor fixes.
     tdm_store_descriptor_version = 31
 
-    # M/N are compile-time constants used throughout the generated IR
-    # (B_TOTAL_N, C_N, grid dimensions, output/bias strides, scale descriptor
-    # shapes). They must be part of the JIT cache key; otherwise a kernel first
-    # compiled for a small inter_dim can be incorrectly reused for a larger
-    # grouped MoE shape (e.g. DS TP1 I=2048), causing OOB accesses.
+    # M/N are compile-time constants used throughout the generated IR (B_TOTAL_N, C_N, grid dimensions, output/bias
+    # strides, scale descriptor shapes). They must be part of the JIT cache key; otherwise a kernel first compiled for a
+    # small inter_dim can be incorrectly reused for a larger grouped MoE shape (e.g. DS TP1 I=2048), causing OOB
+    # accesses.
     cache_tag = (
         data_format,
         M,

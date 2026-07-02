@@ -822,8 +822,7 @@ def _load_groupwise_scale(
         scale_dtype = T.f32
 
     if scale_dtype == T.bf16:
-        # (E, G//2, N, 2) layout: dword at [e, pair, n] holds bf16 scales
-        # for groups 2*pair and 2*pair+1.
+        # (E, G//2, N, 2) layout: dword at [e, pair, n] holds bf16 scales for groups 2*pair and 2*pair+1.
         pair_idx = group_idx >> fx.Index(1)  # group_idx // 2
         # Dword index: same flat formula but with G//2 groups
         num_pairs = num_groups // 2

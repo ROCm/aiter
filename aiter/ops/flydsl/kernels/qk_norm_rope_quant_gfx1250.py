@@ -333,10 +333,9 @@ def _build_kernel(
         i32 = T.i32
         fm_fast = arith.FastMathFlags.fast
 
-        # vector load helpers (generalized for VEC ∈ {2..16}): CopyAtom loads
-        # work for VEC ≤ 8 (BufferCopy128b = 16 bytes = 8 bf16); VEC=16 (32
-        # bytes/thread) uses raw buffer_load split into dwordx4 (compress_attn
-        # gfx1250 pattern).
+        # vector load helpers (generalized for VEC ∈ {2..16}): CopyAtom loads work for VEC ≤ 8 (BufferCopy128b = 16
+        # bytes = 8 bf16); VEC=16 (32 bytes/thread) uses raw buffer_load split into dwordx4 (compress_attn gfx1250
+        # pattern).
 
         # Rope cos/sin: PAIRS_PER_THREAD bf16 pairs.
         # VEC=16 → PAIRS=8 → 16 bytes → BufferCopy128b.

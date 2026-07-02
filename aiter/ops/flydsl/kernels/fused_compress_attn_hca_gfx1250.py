@@ -209,8 +209,7 @@ def _build_compress_forward_kernel(
         is_active = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
         _if_active = scf.IfOp(is_active)
         with _if_then(_if_active):
-            # Per-thread head_dim base: each thread owns VEC contiguous
-            # elements starting at slice_base + lid * VEC.
+            # Per-thread head_dim base: each thread owns VEC contiguous elements starting at slice_base + lid * VEC.
             slice_base_i32 = ArithValue(sid) * c_SLICE
             col_off_base = slice_base_i32 + ArithValue(lid) * c_VEC
 
@@ -404,10 +403,9 @@ def _build_compress_forward_kernel(
             k_start_i32 = ArithValue(wid) * c_K_per_wave
             k_end_i32 = k_start_i32 + c_K_per_wave
 
-            # Split point = clamp(window_len, k_start, k_end): Phase 1 reads
-            # state cache in [k_start, split), Phase 2 reads input in
-            # [split, k_end). Collapsing a sub-loop gives pure Phase 1
-            # (wl>=k_end) or pure Phase 2 (wl<=k_start).
+            # Split point = clamp(window_len, k_start, k_end): Phase 1 reads state cache in [k_start, split), Phase 2
+            # reads input in [split, k_end). Collapsing a sub-loop gives pure Phase 1 (wl>=k_end) or pure Phase 2
+            # (wl<=k_start).
             wl_i32 = _to_raw(window_len)
             split_lo = arith.maxsi(wl_i32, _to_raw(k_start_i32))
             split_i32 = arith.minsi(split_lo, _to_raw(k_end_i32))
@@ -418,8 +416,7 @@ def _build_compress_forward_kernel(
             init_w = [c_zero_f32 for _ in range(VEC)]
             init_state = init_m + init_kv + init_w
 
-            # Sub-loop 1: Phase 1 sub-range [k_start, split). Reads state
-            # cache; padded softmax (score can be -inf).
+            # Sub-loop 1: Phase 1 sub-range [k_start, split). Reads state cache; padded softmax (score can be -inf).
             phase1_local = init_state
             for k_static, state in range(
                 _to_raw(k_start_i32), _to_raw(split_i32), 1, init=init_state
@@ -434,9 +431,8 @@ def _build_compress_forward_kernel(
                 )
                 phase1_local = yield list(new_m) + list(new_kv) + list(new_w)
 
-            # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input;
-            # uses padded softmax (the is-pad-score branch is dead code
-            # since Phase 2 scores are always finite -- compiler elides).
+            # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input; uses padded softmax (the is-pad-score branch is
+            # dead code since Phase 2 scores are always finite -- compiler elides).
             # Carry Phase 1's accumulator through as init.
             final = phase1_local
             for k_static, state in range(
@@ -489,9 +485,8 @@ def _build_compress_forward_kernel(
 
             gpu.barrier()
 
-            # Cross-wave reduction: only wave 0 reads. For each of its VEC
-            # owned elements, read NW LDS values (one per K-split wave) and
-            # compute the global online-softmax.
+            # Cross-wave reduction: only wave 0 reads. For each of its VEC owned elements, read NW LDS values (one per
+            # K-split wave) and compute the global online-softmax.
             is_wave0 = arith.cmpi(CmpIPredicate.eq, wid, c_zero_i32)
             _if_w0 = scf.IfOp(is_wave0)
             with _if_then(_if_w0):
@@ -1274,9 +1269,8 @@ def flydsl_hca_compress_attn_gfx1250(
             raise TypeError("kv_compressed_scratch must be fp32")
         kv_compressed = kv_compressed_scratch
 
-    # CRITICAL: pass current_stream when stream is None. Stream(None)=NULL/default
-    # stream isn't recorded during CUDA graph capture, so replay is a no-op and
-    # HCA boundaries silently never fire in decode CG. Matches v1 single-kernel.
+    # CRITICAL: pass current_stream when stream is None. Stream(None)=NULL/default stream isn't recorded during CUDA
+    # graph capture, so replay is a no-op and HCA boundaries silently never fire in decode CG. Matches v1 single-kernel.
     if stream is None:
         stream = torch.cuda.current_stream()
     stream_obj = Stream(stream)

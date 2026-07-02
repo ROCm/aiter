@@ -976,10 +976,9 @@ def _compile_base_a8w4_gemm(
             f"pipeline requires num_k_tiles >= 2. Increase K (e.g. model_dim), "
             "use tile_k=128 if it divides K/split_k, or lower split_k."
         )
-    # stage1_act is None => no fused gate/up activation epilogue. That is the
-    # non-fused gemm2, or the split-k gemm1_raw base (activation applied by a
-    # separate finalize kernel). Such GEMMs are single-B (4 TDM streams), unlike
-    # the fused gguu gemm1 which is dual-B (6 streams).
+    # stage1_act is None => no fused gate/up activation epilogue. That is the non-fused gemm2, or the split-k gemm1_raw
+    # base (activation applied by a separate finalize kernel). Such GEMMs are single-B (4 TDM streams), unlike the fused
+    # gguu gemm1 which is dual-B (6 streams).
     is_non_fused = stage1_act is None
     compiler = compile_mxfp4_gemm if cfg.data_format == "fp4" else compile_a8w4_gemm
     return compiler(
@@ -994,18 +993,16 @@ def _compile_base_a8w4_gemm(
         num_buffers=eff_num_buffers,
         waves_per_eu=cfg.waves_per_eu,
         out_dtype=cfg.out_dtype,
-        # TDM-store is valid for non-fused gemm1 and for the fused gugu
-        # (interleaved single-B) layout, whose de-interleaved swiglu output is
-        # staged to a C_N LDS tile then tensor_store'd. gguu (dual-B) still
-        # requires buffer_store.
+        # TDM-store is valid for non-fused gemm1 and for the fused gugu (interleaved single-B) layout, whose
+        # de-interleaved swiglu output is staged to a C_N LDS tile then tensor_store'd. gguu (dual-B) still requires
+        # buffer_store.
         use_tdm_store=cfg.use_tdm_store
         and cfg.split_k == 1
         and (is_non_fused or stage1_weight_layout == "gugu"),
         inst_prefetch=cfg.inst_prefetch,
-        # Wave-specialized TDM (4 streams A,B,As,Bs -> 4 loader waves) is valid for
-        # any single-B GEMM: the non-fused path (is_non_fused) and the gugu
-        # (interleaved single-B) fused gemm1. The gguu fused gemm1 is dual-B
-        # (6 streams) and is excluded.
+        # Wave-specialized TDM (4 streams A,B,As,Bs -> 4 loader waves) is valid for any single-B GEMM: the non-fused
+        # path (is_non_fused) and the gugu (interleaved single-B) fused gemm1. The gguu fused gemm1 is dual-B (6
+        # streams) and is excluded.
         wave_specialized_tdm=cfg.wave_specialized_tdm
         and (is_non_fused or stage1_weight_layout == "gugu"),
         tdm_as_in_prologue=cfg.tdm_as_in_prologue,

@@ -397,10 +397,9 @@ def compile_mixed_moe_gemm1(
             size_expert_ids_in = arith.index_cast(
                 ir.IndexType.get(), i32_size_expert_ids_in.ir_value()
             )
-            # Runtime clamp bound for the activation.  Host passes the configured
-            # swiglu_limit (7.0 default for swiglu) or +inf to disable clamping.
-            # ``-lim`` is precomputed once; ``min(x, lim) == -max(-x, -lim)`` so
-            # the kernel uses only the wrapped maximumf/negation ops.
+            # Runtime clamp bound for the activation.  Host passes the configured swiglu_limit (7.0 default for swiglu)
+            # or +inf to disable clamping. ``-lim`` is precomputed once; ``min(x, lim) == -max(-x, -lim)`` so the kernel
+            # uses only the wrapped maximumf/negation ops.
             swiglu_neg_limit = -f32_swiglu_limit
 
             x_elem = T.f8

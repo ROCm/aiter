@@ -161,9 +161,8 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
     is_fp8 = quant_mode == "fp8"
     arch = str(get_rocm_arch())
     use_native = _arch_has_native_scaled_cvt(arch)
-    # gfx1250: native 8-wide pk8 convert for both fp4 and fp8 -> 8 elems/lane
-    # (4 lanes per 32-elem MX block) instead of the 2 elems/lane (16 lanes) the
-    # SW/pk2 paths use.
+    # gfx1250: native 8-wide pk8 convert for both fp4 and fp8 -> 8 elems/lane (4 lanes per 32-elem MX block) instead of
+    # the 2 elems/lane (16 lanes) the SW/pk2 paths use.
     use_pk8 = _arch_has_pk8(arch)
     elems_per_lane = 8 if use_pk8 else ELEMS_PER_LANE
     lanes_per_mx_block = 32 // elems_per_lane
@@ -198,8 +197,7 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
         mx_blocks_per_row + mx_blocks_per_wave_iter - 1
     ) // mx_blocks_per_wave_iter
 
-    # Butterfly reduction distances within one MX block (16 lanes for the 2-elem
-    # paths, 4 lanes for pk8).
+    # Butterfly reduction distances within one MX block (16 lanes for the 2-elem paths, 4 lanes for pk8).
     amax_shuffle_dists = []
     dist = 1
     while dist < lanes_per_mx_block:
@@ -278,8 +276,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 bf16x8 = vector.bitcast(vec8_bf16_ty, dwords4)
                 f32x8 = bf16x8.extf(vec8_f32_ty)
 
-                # per-block amax over this lane's 8 elems, then a butterfly
-                # shuffle_xor across the block's 4 lanes.
+                # per-block amax over this lane's 8 elems, then a butterfly shuffle_xor across the block's 4 lanes.
                 block_amax = c.c0_f32
                 for j in range_constexpr(8):
                     xj = vector.extract(f32x8, static_position=[j], dynamic_position=[])
@@ -341,9 +338,8 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
                 )
 
-                # Forward block scale 2^(e8m0-127) = bitcast(e8m0<<23); the native
-                # scalef32 ops divide by its *exponent part*. The portable path
-                # multiplies by the reciprocal 2^(127-e8m0) then converts.
+                # Forward block scale 2^(e8m0-127) = bitcast(e8m0<<23); the native scalef32 ops divide by its *exponent
+                # part*. The portable path multiplies by the reciprocal 2^(127-e8m0) then converts.
                 if const_expr(c.is_fp8):
                     if const_expr(c.use_native):
                         block_scale_f32 = (ArithValue(e8m0_scale) << c.c23_i32).bitcast(
@@ -397,9 +393,8 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             byte_in_dword = mx_block - scale_dword * c.c4_i32
             e8m0_byte = arith.trunci(T.i8, e8m0_scale)
             for dst in c.dests:
-                # payload byte offset within grouped_payload. offset_is_bytes=True
-                # so the i8 (fp4) / i16 (fp8) / i32 (pk8) store does not rescale
-                # this already-byte offset by the data element size.
+                # payload byte offset within grouped_payload. offset_is_bytes=True so the i8 (fp4) / i16 (fp8) / i32
+                # (pk8) store does not rescale this already-byte offset by the data element size.
                 payload_byte_off = (
                     dst.payload_row_byte_base
                     + mx_block * c.c_payload_bytes_per_block
@@ -598,9 +593,8 @@ def build_moe_fused_route_quant_scatter_module(
             slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
             slot = ArithValue(slot)
 
-            # Destination row = per-expert base + within-expert slot. Masked
-            # layout fuses the former Python-side arange(E)*max_m into this
-            # kernel; contiguous-M still loads starts[e] from expert_row_base.
+            # Destination row = per-expert base + within-expert slot. Masked layout fuses the former Python-side
+            # arange(E)*max_m into this kernel; contiguous-M still loads starts[e] from expert_row_base.
             if const_expr(use_expert_row_base):
                 erb_rsrc = buffer_ops.create_buffer_resource(
                     expert_row_base, max_size=True
@@ -765,9 +759,8 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
     payload_bytes_per_block = L.payload_bytes_per_block
     payload_bytes_per_lane = L.payload_bytes_per_lane
     wave_size = L.wave_size
-    # This specialization is used only for token_num == 1. Use exactly one warp
-    # per route in the block so topk < 8 does not leave half of a 256-thread block
-    # idle (e.g. topk=4 on wave32 -> 128-thread blocks).
+    # This specialization is used only for token_num == 1. Use exactly one warp per route in the block so topk < 8 does
+    # not leave half of a 256-thread block idle (e.g. topk=4 on wave32 -> 128-thread blocks).
     warps_per_block = topk
     block_threads = topk * wave_size
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
@@ -993,9 +986,8 @@ def build_moe_fused_quant_preshuffle_module(
       max_m           : per-expert row capacity (for expert = row // max_m)
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
-    # Unpack into locals so the @kernel closure captures the quant_mode-derived
-    # scalars. The JIT cache keys on source + scalar closure values; kept inside
-    # ``L`` the fp4/fp8 variants (same feat_dim/wmma_rep) would share one binary.
+    # Unpack into locals so the @kernel closure captures the quant_mode-derived scalars. The JIT cache keys on source +
+    # scalar closure values; kept inside ``L`` the fp4/fp8 variants (same feat_dim/wmma_rep) would share one binary.
     is_fp8 = L.is_fp8
     use_native = L.use_native
     use_pk8 = L.use_pk8
@@ -1487,11 +1479,10 @@ def build_moe_fused_route_psum_quant_scatter_module(
         f"_{quant_mode}_{L.native_tag}"
     )
 
-    # gfx12 splits the wait counters (s_wait_loadcnt/s_wait_storecnt); gfx9 uses
-    # unified ``s_waitcnt``. The cross-block barrier publishes/reads its scratch
-    # (count/starts/psum/release flag) only via agent-scope atomics + plain buffer
-    # loads -- the only reliably L2-coherent cross-CU pattern on gfx1250 (inline-asm
-    # coherent global load/store miscompiles here).
+    # gfx12 splits the wait counters (s_wait_loadcnt/s_wait_storecnt); gfx9 uses unified ``s_waitcnt``. The cross-block
+    # barrier publishes/reads its scratch (count/starts/psum/release flag) only via agent-scope atomics + plain buffer
+    # loads -- the only reliably L2-coherent cross-CU pattern on gfx1250 (inline-asm coherent global load/store
+    # miscompiles here).
     _is_gfx12 = str(L.arch).startswith("gfx12")
 
     @flyc.kernel(name=module_name)
@@ -1577,9 +1568,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
         count_rsrc = buffer_ops.create_buffer_resource(count, max_size=True)
 
         # ============================ Phase 1: count ============================
-        # Strided warp-per-route histogram into ``count`` (== masked_m). Loop bounds
-        # are warp-uniform (lane-independent) so the post-phase gpu.barrier() is hit
-        # by every thread of the block.
+        # Strided warp-per-route histogram into ``count`` (== masked_m). Loop bounds are warp-uniform (lane-independent)
+        # so the post-phase gpu.barrier() is hit by every thread of the block.
         route0_idx = arith.index_cast(T.index, route0)
         numel_idx = arith.index_cast(T.index, ArithValue(numel))
         stride_idx = arith.index_cast(T.index, stride)
@@ -1606,9 +1596,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
             is_last = arith.cmpi(CmpIPredicate.eq, my_arrival, nwm1)
             is_not_last = arith.cmpi(CmpIPredicate.ne, my_arrival, nwm1)
 
-            # Last arriver: every block has bumped ``count`` (its atomics committed
-            # to L2 before its arrival atomic). Serial tile-aligned prefix sum,
-            # mirroring moe_contiguous_psum, reading ``count`` coherently.
+            # Last arriver: every block has bumped ``count`` (its atomics committed to L2 before its arrival atomic).
+            # Serial tile-aligned prefix sum, mirroring moe_contiguous_psum, reading ``count`` coherently.
             _if_last = scf.IfOp(is_last)
             with ir.InsertionPoint(_if_last.then_block):
                 tile_v = ArithValue(tile_m)
@@ -1621,15 +1610,12 @@ def build_moe_fused_route_psum_quant_scatter_module(
                     e = ploop.induction_variable
                     cur = ploop.inner_iter_args[0]
                     e_i32 = arith.index_cast(i32, e)
-                    # Serial prefix sum in one thread of the last-arriver block,
-                    # after the barrier commits every block's count atomics.
-                    # ``count`` uses a plain buffer load (L2-visible post-barrier);
-                    # inline-asm coherent load miscompiles here (aliases the count
-                    # read with the starts/psum accumulator -> runaway prefix sum).
-                    # ``starts``/``psum`` are published via agent-scope atomics
-                    # (zero-init, so atomic-add == atomic write) + plain buffer load
-                    # in Phase 3 -- the only reliably L2-coherent gfx1250 pattern;
-                    # an inline-asm coherent store can linger in L0.
+                    # Serial prefix sum in one thread of the last-arriver block, after the barrier commits every block's
+                    # count atomics. ``count`` uses a plain buffer load (L2-visible post-barrier); inline-asm coherent
+                    # load miscompiles here (aliases the count read with the starts/psum accumulator -> runaway prefix
+                    # sum). ``starts``/``psum`` are published via agent-scope atomics (zero-init, so atomic-add ==
+                    # atomic write) + plain buffer load in Phase 3 -- the only reliably L2-coherent gfx1250 pattern; an
+                    # inline-asm coherent store can linger in L0.
                     cnt = ArithValue(
                         buffer_ops.buffer_load(
                             count_rsrc, e_i32, vec_width=1, dtype=i32
@@ -1641,9 +1627,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
                     _atomic_add(psum, e_i32, _raw(ArithValue(cur) + cnt))
                     next_cur = ArithValue(cur) + ArithValue(aligned)
                     scf.YieldOp([next_cur])
-                # Drain starts/psum to L2, then publish release via agent-scope atomic
-                # (inline-asm coherent barrier is unreliable on gfx1250: readers could
-                # see the flag set before starts/psum are visible).
+                # Drain starts/psum to L2, then publish release via agent-scope atomic (inline-asm coherent barrier is
+                # unreliable on gfx1250: readers could see the flag set before starts/psum are visible).
                 _wait_mem()
                 _atomic_add(barrier, c1_i32, c1_i32)
                 scf.YieldOp([])

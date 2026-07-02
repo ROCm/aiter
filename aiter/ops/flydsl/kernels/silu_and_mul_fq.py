@@ -273,9 +273,8 @@ def build_silu_and_mul_fq_module(
                     swiglu_neg_alpha_log2e = arith.constant(
                         -1.4426950408889634 * 1.702, type=f32
                     )
-                    # Runtime f32 clamp bound: host passes 7.0 (swiglu default) or
-                    # +inf to disable. min(x, lim) via maximumf + negation keeps the
-                    # limit runtime, never a compile-time constant.
+                    # Runtime f32 clamp bound: host passes 7.0 (swiglu default) or +inf to disable. min(x, lim) via
+                    # maximumf + negation keeps the limit runtime, never a compile-time constant.
                     _neg_limit = -swiglu_limit_f
 
                     def _fmin(x):
@@ -331,9 +330,8 @@ def build_silu_and_mul_fq_module(
                             peer = local_max.shuffle_xor(off, c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        # NV ROUND_UP / torchao RCEIL: scale = ceil_pow2(amax / max_pos),
-                        # 0% max-value clipping. Same formula for FP4 / FP8; only
-                        # max_pos differs (selected by ``_mx_dtype``).
+                        # NV ROUND_UP / torchao RCEIL: scale = ceil_pow2(amax / max_pos), 0% max-value clipping. Same
+                        # formula for FP4 / FP8; only max_pos differs (selected by ``_mx_dtype``).
                         e8m0_biased = emit_mx_e8m0_scale(
                             local_max, mode=_DEFAULT_MODE, dtype=_mx_dtype
                         )

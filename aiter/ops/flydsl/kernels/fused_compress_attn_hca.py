@@ -236,8 +236,7 @@ def _build_compress_forward_kernel(
         is_active = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
         _if_active = scf.IfOp(is_active)
         with _if_then(_if_active):
-            # Per-thread head_dim base: each thread owns VEC contiguous
-            # elements starting at slice_base + lid * VEC.
+            # Per-thread head_dim base: each thread owns VEC contiguous elements starting at slice_base + lid * VEC.
             slice_base_i32 = ArithValue(sid) * c_SLICE
             col_off_base = slice_base_i32 + ArithValue(lid) * c_VEC
 
@@ -431,10 +430,9 @@ def _build_compress_forward_kernel(
             k_start_i32 = ArithValue(wid) * c_K_per_wave
             k_end_i32 = k_start_i32 + c_K_per_wave
 
-            # Split point = clamp(window_len, k_start, k_end): Phase 1 reads
-            # state cache in [k_start, split), Phase 2 reads input in
-            # [split, k_end). Collapsing a sub-loop gives pure Phase 1
-            # (wl>=k_end) or pure Phase 2 (wl<=k_start).
+            # Split point = clamp(window_len, k_start, k_end): Phase 1 reads state cache in [k_start, split), Phase 2
+            # reads input in [split, k_end). Collapsing a sub-loop gives pure Phase 1 (wl>=k_end) or pure Phase 2
+            # (wl<=k_start).
             wl_i32 = _to_raw(window_len)
             split_lo = arith.maxsi(wl_i32, _to_raw(k_start_i32))
             split_i32 = arith.minsi(split_lo, _to_raw(k_end_i32))
@@ -445,8 +443,7 @@ def _build_compress_forward_kernel(
             init_w = [c_zero_f32 for _ in range(VEC)]
             init_state = init_m + init_kv + init_w
 
-            # Sub-loop 1: Phase 1 sub-range [k_start, split). Reads state
-            # cache; padded softmax (score can be -inf).
+            # Sub-loop 1: Phase 1 sub-range [k_start, split). Reads state cache; padded softmax (score can be -inf).
             phase1_local = init_state
             for k_static, state in range(
                 _to_raw(k_start_i32), _to_raw(split_i32), 1, init=init_state
@@ -461,9 +458,8 @@ def _build_compress_forward_kernel(
                 )
                 phase1_local = yield list(new_m) + list(new_kv) + list(new_w)
 
-            # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input;
-            # uses padded softmax (the is-pad-score branch is dead code
-            # since Phase 2 scores are always finite -- compiler elides).
+            # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input; uses padded softmax (the is-pad-score branch is
+            # dead code since Phase 2 scores are always finite -- compiler elides).
             # Carry Phase 1's accumulator through as init.
             final = phase1_local
             for k_static, state in range(
@@ -516,9 +512,8 @@ def _build_compress_forward_kernel(
 
             gpu.barrier()
 
-            # Cross-wave reduction: only wave 0 reads. For each of its VEC
-            # owned elements, read NW LDS values (one per K-split wave) and
-            # compute the global online-softmax.
+            # Cross-wave reduction: only wave 0 reads. For each of its VEC owned elements, read NW LDS values (one per
+            # K-split wave) and compute the global online-softmax.
             is_wave0 = arith.cmpi(CmpIPredicate.eq, wid, c_zero_i32)
             _if_w0 = scf.IfOp(is_wave0)
             with _if_then(_if_w0):
@@ -669,10 +664,9 @@ def _build_norm_rope_scatter_kernel(
     D = head_dim
     RD = rope_head_dim
     NOPE = D - RD
-    # WAVE lanes process one plan row (reduce + group-amax shuffle_xor stay
-    # within the 64 lanes). k_waves rows packed per block (BT threads) to
-    # amortize launch/scheduling overhead; waves are independent (no cross-wave
-    # LDS). k_waves=1 is the 1-wave/block path.
+    # WAVE lanes process one plan row (reduce + group-amax shuffle_xor stay within the 64 lanes). k_waves rows packed
+    # per block (BT threads) to amortize launch/scheduling overhead; waves are independent (no cross-wave LDS).
+    # k_waves=1 is the 1-wave/block path.
     WAVE = 64
     KW = k_waves
     BT = WAVE * KW  # threads per block
@@ -750,9 +744,8 @@ def _build_norm_rope_scatter_kernel(
         batch_id = vector.extract(plan_vec, static_position=[1], dynamic_position=[])
         position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
 
-        # active = real plan row (position>=0 sentinel) AND within capacity (tail
-        # waves of the last block have pid>=cap and must bail; their plan load is
-        # bounds-checked to 0 by the buffer resource, so guard explicitly here).
+        # active = real plan row (position>=0 sentinel) AND within capacity (tail waves of the last block have pid>=cap
+        # and must bail; their plan load is bounds-checked to 0 by the buffer resource, so guard explicitly here).
         pos_ok = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
         row_ok = arith.cmpi(CmpIPredicate.slt, _to_raw(pid), _to_raw(plan_capacity))
         is_active = arith.andi(pos_ok, row_ok)
@@ -1216,8 +1209,7 @@ def flydsl_hca_compress_attn(
         )
 
     if k_split_num_waves is None or slice_size is None:
-        # Local import to avoid a circular import between the two HCA modules
-        # at package init time.
+        # Local import to avoid a circular import between the two HCA modules at package init time.
         from .fused_compress_attn import hca_per_n_config
 
         auto_slice, auto_kw = hca_per_n_config(plan_gpu.shape[0])
@@ -1316,9 +1308,8 @@ def flydsl_hca_compress_attn(
             raise TypeError("kv_compressed_scratch must be fp32")
         kv_compressed = kv_compressed_scratch
 
-    # CRITICAL: pass current_stream when stream is None. Stream(None)=NULL/default
-    # stream isn't recorded during CUDA graph capture, so replay is a no-op and
-    # HCA boundaries silently never fire in decode CG. Matches v1 single-kernel.
+    # CRITICAL: pass current_stream when stream is None. Stream(None)=NULL/default stream isn't recorded during CUDA
+    # graph capture, so replay is a no-op and HCA boundaries silently never fire in decode CG. Matches v1 single-kernel.
     if stream is None:
         stream = torch.cuda.current_stream()
     stream_obj = Stream(stream)
@@ -1352,9 +1343,8 @@ def flydsl_hca_compress_attn(
     _run_compiled(compress_fn, *compress_args)
 
     rms_weight_is_bf16 = rms_weight.dtype == torch.bfloat16
-    # Kernel-B wave packing (k_waves rows/block) amortizes launch/scheduling
-    # overhead at small and large N but hurts the mid-range. Pick by
-    # plan_capacity (fixed per graph -> CG-safe, distinct lru_cache'd compile).
+    # Kernel-B wave packing (k_waves rows/block) amortizes launch/scheduling overhead at small and large N but hurts the
+    # mid-range. Pick by plan_capacity (fixed per graph -> CG-safe, distinct lru_cache'd compile).
     norm_kw = 4 if (plan_capacity <= 32 or plan_capacity >= 1024) else 1
     norm_fn = compile_hca_norm_rope_scatter(
         head_dim=head_dim,
