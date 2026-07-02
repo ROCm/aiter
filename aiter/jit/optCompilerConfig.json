@@ -654,7 +654,9 @@
             "f'{AITER_CSRC_DIR}/py_itfs_cu/rmsnorm_opus_kernels.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-D__HIPCC_RTC__'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

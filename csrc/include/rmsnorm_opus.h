@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// OPUS RMSNorm host-side launch helpers for the plain (non-quant, non
-// model-sensitive) path. Torch-free / pybind-free: tensors cross as the POD
-// aiter_tensor_t; the extern "C" entrypoints live in rmsnorm_opus_kernels.cu.
+// OPUS RMSNorm host-side launch helpers. Fully torch-free / HIP-runtime-free:
+// only opus/hip_minimal.hpp (host launch) + opus.hpp (device, via the kernel
+// header). Tensors cross the ctypes boundary as raw pointers + dims, so nothing
+// pulls <hip/hip_runtime.h> or aiter_tensor.h.
 #pragma once
-#include "aiter_hip_common.h" // AITER_CHECK, HipDeviceGuard
-#include "aiter_tensor.h"     // aiter_tensor_t (torch-free POD)
+#include "opus/hip_minimal.hpp" // dim3, hipStream_t, hipLaunchKernelGGL (both passes)
 #include "opus/rmsnorm_opus_kernel.hpp"
-
-#include <cstdint>
-#include <hip/hip_runtime.h>
 
 namespace aiter {
 namespace rmsnorm_opus {
@@ -23,41 +20,28 @@ inline int pick_block(int rows, int hidden)
     return b < 1 ? 1 : b;
 }
 
-inline bool aligned16(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) % 16) == 0; }
-
-inline void check_common(const aiter_tensor_t& input, const aiter_tensor_t& weight)
-{
-    AITER_CHECK(input.dtype() == AITER_DTYPE_bf16 || input.dtype() == AITER_DTYPE_fp16,
-                "rms_norm_opus: only bf16/fp16 supported, got dtype ",
-                AiterDtype_to_str(input.dtype()));
-    AITER_CHECK(weight.dtype() == input.dtype(), "rms_norm_opus: weight dtype must match input");
-    AITER_CHECK(input.is_contiguous(), "rms_norm_opus: input must be contiguous");
-    AITER_CHECK(input.dim() >= 1, "rms_norm_opus: input needs >= 1 dim");
-    AITER_CHECK(weight.size(-1) == input.size(-1),
-                "rms_norm_opus: weight length must equal hidden size");
-}
+inline bool aligned16(const void* p) { return (reinterpret_cast<size_t>(p) % 16) == 0; }
 
 template <typename scalar_t>
-inline void launch_rms(aiter_tensor_t& out,
-                       aiter_tensor_t& input,
-                       aiter_tensor_t& weight,
+inline void launch_rms(void* out,
+                       const void* in,
+                       const void* weight,
                        float epsilon,
                        int rows,
                        int hidden,
                        hipStream_t stream)
 {
     const int block = pick_block(rows, hidden);
-    const bool vec8 = (hidden % 8 == 0) && aligned16(input.data_ptr()) &&
-                      aligned16(out.data_ptr()) && aligned16(weight.data_ptr());
+    const bool vec8 = (hidden % 8 == 0) && aligned16(out) && aligned16(in) && aligned16(weight);
     if(vec8)
         hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<scalar_t, 8>),
                            dim3(rows),
                            dim3(block),
                            0,
                            stream,
-                           out.data_ptr(),
-                           input.data_ptr(),
-                           weight.data_ptr(),
+                           out,
+                           in,
+                           weight,
                            epsilon,
                            rows,
                            hidden);
@@ -67,35 +51,35 @@ inline void launch_rms(aiter_tensor_t& out,
                            dim3(block),
                            0,
                            stream,
-                           out.data_ptr(),
-                           input.data_ptr(),
-                           weight.data_ptr(),
+                           out,
+                           in,
+                           weight,
                            epsilon,
                            rows,
                            hidden);
 }
 
 template <typename scalar_t>
-inline void launch_fused_add(aiter_tensor_t& input,
-                             aiter_tensor_t& residual,
-                             aiter_tensor_t& weight,
+inline void launch_fused_add(void* inout,
+                             void* residual,
+                             const void* weight,
                              float epsilon,
                              int rows,
                              int hidden,
                              hipStream_t stream)
 {
     const int block = pick_block(rows, hidden);
-    const bool vec8 = (hidden % 8 == 0) && aligned16(input.data_ptr()) &&
-                      aligned16(residual.data_ptr()) && aligned16(weight.data_ptr());
+    const bool vec8 =
+        (hidden % 8 == 0) && aligned16(inout) && aligned16(residual) && aligned16(weight);
     if(vec8)
         hipLaunchKernelGGL((fused_add_rmsnorm2d_fwd_kernel<scalar_t, 8>),
                            dim3(rows),
                            dim3(block),
                            0,
                            stream,
-                           input.data_ptr(),
-                           residual.data_ptr(),
-                           weight.data_ptr(),
+                           inout,
+                           residual,
+                           weight,
                            epsilon,
                            rows,
                            hidden);
@@ -105,9 +89,9 @@ inline void launch_fused_add(aiter_tensor_t& input,
                            dim3(block),
                            0,
                            stream,
-                           input.data_ptr(),
-                           residual.data_ptr(),
-                           weight.data_ptr(),
+                           inout,
+                           residual,
+                           weight,
                            epsilon,
                            rows,
                            hidden);
