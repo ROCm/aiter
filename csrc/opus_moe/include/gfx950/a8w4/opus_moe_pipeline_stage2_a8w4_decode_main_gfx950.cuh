@@ -631,7 +631,14 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_add_bf16x2(
 {
     const opus_moe_stage2_a8w4_decode_bf16x2_t data =
         __builtin_bit_cast(opus_moe_stage2_a8w4_decode_bf16x2_t, packed_bf16x2);
+#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
     __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16(data, out_rsrc, byte_offset, 0, 0);
+#else
+    opus::i32x4_t rsrc;
+    __builtin_memcpy(&rsrc, &out_rsrc, sizeof(opus::i32x4_t));
+    opus::llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(
+        __builtin_bit_cast(opus::fp16x2_t, data), rsrc, byte_offset, 0, 0);
+#endif
 }
 
 template<typename T, typename CAcc>
