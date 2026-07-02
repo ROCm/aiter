@@ -15,6 +15,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     swizzle_scales_gfx950,
     swizzle_scales_gfx1250,
 )
+from aiter.ops.shuffle import shuffle_weight_gfx1250
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -214,6 +215,7 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("preshuffled", [False, True])
 def test_op(
     m,
     n,
@@ -223,6 +225,7 @@ def test_op(
     has_y_gammas,
     apply_swiglu,
     fused_quant,
+    preshuffled,
     n_expts_tot,
     n_expts_act,
     act_dtype_str,
@@ -232,6 +235,9 @@ def test_op(
 
     if get_arch() != "gfx950" and get_arch() != "gfx1250":
         pytest.skip("Kernel not supported on this GPU.")
+
+    if preshuffled and get_arch() != "gfx1250":
+        pytest.skip("Preshuffled weights are only supported on gfx1250.")
 
     if get_arch() == "gfx1250":
         # if act_dtype_str == "mxfloat8_e4m3fn":
@@ -285,6 +291,8 @@ def test_op(
     # downcast to mxfp
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+    if preshuffled:
+        w_tri = shuffle_weight_gfx1250(w_tri)
     if hbm_swizzling:
         if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
@@ -333,6 +341,7 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        preshuffled=preshuffled,
     )
     if not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
