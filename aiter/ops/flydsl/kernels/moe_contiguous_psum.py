@@ -10,7 +10,7 @@ torch.cumsum (avoids rocprim trampoline overhead for small E).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
 from flydsl.compiler.kernel_function import CompilationContext
@@ -23,6 +23,11 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from aiter.ops.flydsl.kernels.tensor_shim import STensor
 
 MAX_EXPERTS_PER_BLOCK = 512
+
+
+def _ptr_rsrc(ptr):
+    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
+    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
 
 
 def build_moe_contiguous_psum_module():
@@ -42,10 +47,10 @@ def build_moe_contiguous_psum_module():
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def psum_kernel(
-        masked_m: fx.Tensor,  # (E,) int32 in
-        starts: fx.Tensor,  # (E,) int32 out
-        psum: fx.Tensor,  # (E,) int32 out
-        contiguous_m: fx.Tensor,  # (1,) int32 out
+        masked_m: fx.Pointer,  # (E,) int32 in
+        starts: fx.Pointer,  # (E,) int32 out
+        psum: fx.Pointer,  # (E,) int32 out
+        contiguous_m: fx.Pointer,  # (1,) int32 out
         experts: Int32,
         tile_m: Int32,
     ):
@@ -66,10 +71,10 @@ def build_moe_contiguous_psum_module():
             shape=(MAX_EXPERTS_PER_BLOCK,),
         )
 
-        m_rsrc = buffer_ops.create_buffer_resource(masked_m, max_size=True)
-        s_rsrc = buffer_ops.create_buffer_resource(starts, max_size=True)
-        p_rsrc = buffer_ops.create_buffer_resource(psum, max_size=True)
-        c_rsrc = buffer_ops.create_buffer_resource(contiguous_m, max_size=True)
+        m_rsrc = _ptr_rsrc(masked_m)
+        s_rsrc = _ptr_rsrc(starts)
+        p_rsrc = _ptr_rsrc(psum)
+        c_rsrc = _ptr_rsrc(contiguous_m)
 
         in_range = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(experts))
         _if_load = scf.IfOp(in_range)
@@ -134,10 +139,10 @@ def build_moe_contiguous_psum_module():
 
     @flyc.jit
     def launch_psum(
-        masked_m: fx.Tensor,
-        starts: fx.Tensor,
-        psum: fx.Tensor,
-        contiguous_m: fx.Tensor,
+        masked_m: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        contiguous_m: fx.Pointer,
         experts: fx.Int32,
         tile_m: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -151,6 +156,13 @@ def build_moe_contiguous_psum_module():
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
             stream=stream,
         )
+
+    launch_psum.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": 6,
+        },
+    }
 
     return launch_psum
 
@@ -172,11 +184,11 @@ def build_moe_contiguous_psum_remap_module():
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def psum_remap_kernel(
-        masked_m: fx.Tensor,
-        topids_to_rows: fx.Tensor,
-        starts: fx.Tensor,
-        psum: fx.Tensor,
-        contiguous_m: fx.Tensor,
+        masked_m: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        contiguous_m: fx.Pointer,
         numel: Int32,
         experts: Int32,
         route_max_m: Int32,
@@ -199,11 +211,11 @@ def build_moe_contiguous_psum_remap_module():
             shape=(MAX_EXPERTS_PER_BLOCK,),
         )
 
-        m_rsrc = buffer_ops.create_buffer_resource(masked_m, max_size=True)
-        rows_rsrc = buffer_ops.create_buffer_resource(topids_to_rows, max_size=True)
-        s_rsrc = buffer_ops.create_buffer_resource(starts, max_size=True)
-        p_rsrc = buffer_ops.create_buffer_resource(psum, max_size=True)
-        c_rsrc = buffer_ops.create_buffer_resource(contiguous_m, max_size=True)
+        m_rsrc = _ptr_rsrc(masked_m)
+        rows_rsrc = _ptr_rsrc(topids_to_rows)
+        s_rsrc = _ptr_rsrc(starts)
+        p_rsrc = _ptr_rsrc(psum)
+        c_rsrc = _ptr_rsrc(contiguous_m)
 
         in_expert = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(experts))
         _if_load = scf.IfOp(in_expert)
@@ -285,11 +297,11 @@ def build_moe_contiguous_psum_remap_module():
 
     @flyc.jit
     def launch_psum_remap(
-        masked_m: fx.Tensor,
-        topids_to_rows: fx.Tensor,
-        starts: fx.Tensor,
-        psum: fx.Tensor,
-        contiguous_m: fx.Tensor,
+        masked_m: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        starts: fx.Pointer,
+        psum: fx.Pointer,
+        contiguous_m: fx.Pointer,
         numel: fx.Int32,
         experts: fx.Int32,
         route_max_m: fx.Int32,
@@ -315,5 +327,12 @@ def build_moe_contiguous_psum_remap_module():
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
             stream=stream,
         )
+
+    launch_psum_remap.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": 9,
+        },
+    }
 
     return launch_psum_remap

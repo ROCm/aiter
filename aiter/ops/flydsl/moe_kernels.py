@@ -1747,9 +1747,9 @@ def flydsl_moe_topids_to_rows(
     route_grid = (numel + 255) // 256
     topids_to_rows_kernel = _get_compiled_topids_to_rows()
     topids_to_rows_kernel(
-        topk_ids.to(torch.int32).reshape(-1),
-        counter,
-        topids_to_rows,
+        _ptr_view_safe(topk_ids.to(torch.int32).reshape(-1)),
+        _ptr_view_safe(counter),
+        _ptr_view_safe(topids_to_rows),
         numel,
         int(max_m),
         route_grid,
@@ -1844,9 +1844,9 @@ def flydsl_moe_fused_route_quant_scatter(
     if use_routeks_stage1:
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
         topids_to_rows_kernel(
-            topk_ids_i32,
-            counter,
-            topids_to_rows,
+            _ptr_view_safe(topk_ids_i32),
+            _ptr_view_safe(counter),
+            _ptr_view_safe(topids_to_rows),
             numel,
             max_m,
             route_grid,
@@ -1859,11 +1859,11 @@ def flydsl_moe_fused_route_quant_scatter(
             source_topk=topk,
         )
         launch_routeks(
-            hidden_flat,
-            grouped_a1.view(-1),
-            grouped_a1_scale.view(-1),
-            topids_to_rows,
-            counter,  # dummy row_starts; unused because remap_rows=False
+            _ptr_view_safe(hidden_flat),
+            _ptr_view_safe(grouped_a1.view(-1)),
+            _ptr_view_safe(grouped_a1_scale.view(-1)),
+            _ptr_view_safe(topids_to_rows),
+            _ptr_view_safe(counter),  # dummy row_starts; unused because remap_rows=False
             1,
             numel,
             grid_blocks,
@@ -1896,13 +1896,13 @@ def flydsl_moe_fused_route_quant_scatter(
             max_m=max_m,
         )
     launch(
-        topk_ids_i32,
-        counter,
-        topids_to_rows,
-        hidden_flat,
-        grouped_a1.view(-1),
-        grouped_a1_scale.view(-1),
-        expert_row_base_arg,
+        _ptr_view_safe(topk_ids_i32),
+        _ptr_view_safe(counter),
+        _ptr_view_safe(topids_to_rows),
+        _ptr_view_safe(hidden_flat),
+        _ptr_view_safe(grouped_a1.view(-1)),
+        _ptr_view_safe(grouped_a1_scale.view(-1)),
+        _ptr_view_safe(expert_row_base_arg),
         numel,
         grid_blocks,
         stream=torch.cuda.current_stream(),
@@ -2009,16 +2009,16 @@ def flydsl_moe_fused_route_psum_quant_scatter(
         quant_mode=quant_mode,
     )
     launch(
-        topk_ids_i32,
-        count,
-        slot_counter,
-        starts,
-        psum,
-        barrier,
-        topids_to_rows,
-        hidden_flat,
-        grouped_a1.view(-1),
-        grouped_a1_scale.view(-1),
+        _ptr_view_safe(topk_ids_i32),
+        _ptr_view_safe(count),
+        _ptr_view_safe(slot_counter),
+        _ptr_view_safe(starts),
+        _ptr_view_safe(psum),
+        _ptr_view_safe(barrier),
+        _ptr_view_safe(topids_to_rows),
+        _ptr_view_safe(hidden_flat),
+        _ptr_view_safe(grouped_a1.view(-1)),
+        _ptr_view_safe(grouped_a1_scale.view(-1)),
         numel,
         int(E),
         int(tile_m),
@@ -2161,11 +2161,11 @@ def flydsl_moe_fused_quant_preshuffle(
             remap_rows=remap_rows,
         )
         launch(
-            grouped_in.contiguous().view(-1),
-            out_payload.view(-1),
-            out_scale.view(-1),
-            topids_to_rows_i32,
-            row_starts_i32,
+            _ptr_view_safe(grouped_in.contiguous().view(-1)),
+            _ptr_view_safe(out_payload.view(-1)),
+            _ptr_view_safe(out_scale.view(-1)),
+            _ptr_view_safe(topids_to_rows_i32),
+            _ptr_view_safe(row_starts_i32),
             route_max_m_arg,
             numel,
             grid_blocks,
@@ -2182,10 +2182,10 @@ def flydsl_moe_fused_quant_preshuffle(
         skip_padding=skip_padding,
     )
     launch(
-        grouped_in.contiguous().view(-1),
-        out_payload.view(-1),
-        out_scale.view(-1),
-        masked_m,
+        _ptr_view_safe(grouped_in.contiguous().view(-1)),
+        _ptr_view_safe(out_payload.view(-1)),
+        _ptr_view_safe(out_scale.view(-1)),
+        _ptr_view_safe(masked_m),
         n_rows,
         max_m,
         grid_blocks,
