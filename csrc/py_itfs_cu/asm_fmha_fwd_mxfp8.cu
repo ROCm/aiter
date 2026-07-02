@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// ASM FMHA forward (MXFP8, gfx1250 / MI450).
+// ASM FMHA forward (MXFP8, gfx1250).
 //
 // This is a **dedicated** integration path, intentionally kept separate from
 // the bf16 `asm_fmha_fwd_with_sink` path and from the shared `fmha_v3` path.
