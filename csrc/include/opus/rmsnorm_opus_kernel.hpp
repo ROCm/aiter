@@ -99,40 +99,43 @@ __device__ inline scalar_t norm_elem(scalar_t s, float inv, scalar_t w, bool t5)
     return from_f32<scalar_t>(xi * to_f32<scalar_t>(w));
 }
 
-// Sequential-addressing LDS reductions (bank-conflict-free, deterministic).
-// blockDim is a power of two (guaranteed by pick_block); idle threads pass in
-// the identity so the full block participates.
+// Per-row (segmented) sequential-addressing LDS reductions. The 2D block packs
+// blockDim.y rows, each owned by blockDim.x (power-of-two) threads; reduction is
+// within a row's segment. Bank-conflict-free and deterministic; all rows step
+// the same stride sequence so the block-wide barriers stay aligned.
 __device__ inline float block_reduce_sum(float v)
 {
     __shared__ float s[1024];
-    const int tid = opus::thread_id_x();
-    const int n   = opus::block_size_x();
-    s[tid]        = v;
+    const int lane = opus::thread_id_x();
+    const int tpr  = opus::block_size_x();
+    const int base = opus::thread_id_y() * tpr;
+    s[base + lane] = v;
     opus::sync_threads();
-    for(int stride = n >> 1; stride > 0; stride >>= 1)
+    for(int stride = tpr >> 1; stride > 0; stride >>= 1)
     {
-        if(tid < stride)
-            s[tid] += s[tid + stride];
+        if(lane < stride)
+            s[base + lane] += s[base + lane + stride];
         opus::sync_threads();
     }
-    return s[0];
+    return s[base];
 }
 
 // Block max-reduction (v >= 0 here).
 __device__ inline float block_reduce_max(float v)
 {
     __shared__ float s[1024];
-    const int tid = opus::thread_id_x();
-    const int n   = opus::block_size_x();
-    s[tid]        = v;
+    const int lane = opus::thread_id_x();
+    const int tpr  = opus::block_size_x();
+    const int base = opus::thread_id_y() * tpr;
+    s[base + lane] = v;
     opus::sync_threads();
-    for(int stride = n >> 1; stride > 0; stride >>= 1)
+    for(int stride = tpr >> 1; stride > 0; stride >>= 1)
     {
-        if(tid < stride)
-            s[tid] = fmaxf(s[tid], s[tid + stride]);
+        if(lane < stride)
+            s[base + lane] = fmaxf(s[base + lane], s[base + lane + stride]);
         opus::sync_threads();
     }
-    return s[0];
+    return s[base];
 }
 
 // fp32 -> quant element. int8: round-to-nearest; fp8: hardware e4m3 cvt.
@@ -160,57 +163,63 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
 {
     const bool t5        = model_sensitive != 0;
     using V              = vec_t<scalar_t, width>;
-    const int row        = opus::block_id_x();
-    const int tid        = opus::thread_id_x();
-    const int nthreads   = opus::block_size_x();
+    const int lane       = opus::thread_id_x();  // 0..tpr-1 within the row
+    const int tpr        = opus::block_size_x(); // threads per row
+    const int rpb        = opus::block_size_y(); // rows per block
+    const int row        = opus::block_id_x() * rpb + opus::thread_id_y();
     const int vec_hidden = hidden / width;
+    const bool active    = row < rows;
 
     auto* out          = reinterpret_cast<scalar_t*>(out_);
     const auto* in     = reinterpret_cast<const scalar_t*>(in_);
     const auto* weight = reinterpret_cast<const scalar_t*>(weight_);
-    const auto* in_v   = reinterpret_cast<const V*>(in + (size_t)row * hidden);
-    auto* out_v        = reinterpret_cast<V*>(out + (size_t)row * hidden);
+    const auto* in_v   = reinterpret_cast<const V*>(in + (size_t)(active ? row : 0) * hidden);
+    auto* out_v        = reinterpret_cast<V*>(out + (size_t)(active ? row : 0) * hidden);
     const auto* w_v    = reinterpret_cast<const V*>(weight);
 
     // Cache the row in registers so the normalize pass does not re-read input
-    // from global (single pass); overflow beyond the cache reloads. CACHE_V is
-    // sized so typical hidden (<= CACHE_V*width*blockDim) stays fully cached.
+    // from global (single pass); overflow beyond the cache reloads.
     constexpr int CACHE_V = 4;
     V cache[CACHE_V];
     float acc = 0.0f;
-#pragma unroll
-    for(int k = 0; k < CACHE_V; ++k)
+    if(active)
     {
-        const int idx = tid + k * nthreads;
-        if(idx < vec_hidden)
+#pragma unroll
+        for(int k = 0; k < CACHE_V; ++k)
         {
-            cache[k] = in_v[idx];
+            const int idx = lane + k * tpr;
+            if(idx < vec_hidden)
+            {
+                cache[k] = in_v[idx];
+#pragma unroll
+                for(int j = 0; j < width; ++j)
+                {
+                    float f = to_f32<scalar_t>(cache[k][j]);
+                    acc += f * f;
+                }
+            }
+        }
+        for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
+        {
+            V x = in_v[idx];
 #pragma unroll
             for(int j = 0; j < width; ++j)
             {
-                float f = to_f32<scalar_t>(cache[k][j]);
+                float f = to_f32<scalar_t>(x[j]);
                 acc += f * f;
             }
-        }
-    }
-    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
-    {
-        V x = in_v[idx];
-#pragma unroll
-        for(int j = 0; j < width; ++j)
-        {
-            float f = to_f32<scalar_t>(x[j]);
-            acc += f * f;
         }
     }
 
     float var = block_reduce_sum(acc);
     float inv = rsqrtf(var / hidden + epsilon);
+    if(!active)
+        return;
 
 #pragma unroll
     for(int k = 0; k < CACHE_V; ++k)
     {
-        const int idx = tid + k * nthreads;
+        const int idx = lane + k * tpr;
         if(idx < vec_hidden)
         {
             V w = w_v[idx];
@@ -221,7 +230,7 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
             out_v[idx] = y;
         }
     }
-    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
+    for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
     {
         V x = in_v[idx];
         V w = w_v[idx];
@@ -244,16 +253,18 @@ __global__ void fused_add_rmsnorm2d_fwd_kernel(void* __restrict__ inout_,
 {
     const bool t5        = model_sensitive != 0;
     using V              = vec_t<scalar_t, width>;
-    const int row        = opus::block_id_x();
-    const int tid        = opus::thread_id_x();
-    const int nthreads   = opus::block_size_x();
+    const int lane       = opus::thread_id_x();
+    const int tpr        = opus::block_size_x();
+    const int rpb        = opus::block_size_y();
+    const int row        = opus::block_id_x() * rpb + opus::thread_id_y();
     const int vec_hidden = hidden / width;
+    const bool active    = row < rows;
 
     auto* inout        = reinterpret_cast<scalar_t*>(inout_);
     auto* residual     = reinterpret_cast<scalar_t*>(residual_);
     const auto* weight = reinterpret_cast<const scalar_t*>(weight_);
-    auto* io_v         = reinterpret_cast<V*>(inout + (size_t)row * hidden);
-    auto* res_v        = reinterpret_cast<V*>(residual + (size_t)row * hidden);
+    auto* io_v         = reinterpret_cast<V*>(inout + (size_t)(active ? row : 0) * hidden);
+    auto* res_v        = reinterpret_cast<V*>(residual + (size_t)(active ? row : 0) * hidden);
     const auto* w_v    = reinterpret_cast<const V*>(weight);
 
     // Cache the pre-norm sum in registers (still written back to residual) so the
@@ -272,21 +283,26 @@ __global__ void fused_add_rmsnorm2d_fwd_kernel(void* __restrict__ inout_,
         }
         return s;
     };
-#pragma unroll
-    for(int k = 0; k < CACHE_V; ++k)
+    if(active)
     {
-        const int idx = tid + k * nthreads;
-        if(idx < vec_hidden)
+#pragma unroll
+        for(int k = 0; k < CACHE_V; ++k)
         {
-            cache[k]   = add_sq(io_v[idx], res_v[idx]);
-            res_v[idx] = cache[k]; // pre-norm residual write-back
+            const int idx = lane + k * tpr;
+            if(idx < vec_hidden)
+            {
+                cache[k]   = add_sq(io_v[idx], res_v[idx]);
+                res_v[idx] = cache[k]; // pre-norm residual write-back
+            }
         }
+        for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
+            res_v[idx] = add_sq(io_v[idx], res_v[idx]);
     }
-    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
-        res_v[idx] = add_sq(io_v[idx], res_v[idx]);
 
     float var = block_reduce_sum(acc);
     float inv = rsqrtf(var / hidden + epsilon);
+    if(!active)
+        return;
 
     auto normalize = [&](V s, V w) {
         V y;
@@ -298,11 +314,11 @@ __global__ void fused_add_rmsnorm2d_fwd_kernel(void* __restrict__ inout_,
 #pragma unroll
     for(int k = 0; k < CACHE_V; ++k)
     {
-        const int idx = tid + k * nthreads;
+        const int idx = lane + k * tpr;
         if(idx < vec_hidden)
             io_v[idx] = normalize(cache[k], w_v[idx]);
     }
-    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
+    for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
         io_v[idx] = normalize(res_v[idx], w_v[idx]);
 }
 
@@ -322,10 +338,13 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
 {
     using Vi             = vec_t<in_t, width>;
     using Vo             = vec_t<out_t, width>;
-    const int row        = opus::block_id_x();
-    const int tid        = opus::thread_id_x();
-    const int nthreads   = opus::block_size_x();
+    const int lane       = opus::thread_id_x();
+    const int tpr        = opus::block_size_x();
+    const int rpb        = opus::block_size_y();
+    const int row        = opus::block_id_x() * rpb + opus::thread_id_y();
     const int vec_hidden = hidden / width;
+    const bool active    = row < rows;
+    const size_t roff    = (size_t)(active ? row : 0) * hidden;
 
     const bool fused_add = residual_ != nullptr;
     const bool smooth    = xscale_ != nullptr;
@@ -334,11 +353,11 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
 
     const auto* in     = reinterpret_cast<const in_t*>(in_);
     const auto* weight = reinterpret_cast<const in_t*>(weight_);
-    const auto* in_v   = reinterpret_cast<const Vi*>(in + (size_t)row * hidden);
+    const auto* in_v   = reinterpret_cast<const Vi*>(in + roff);
     const auto* w_v    = reinterpret_cast<const Vi*>(weight);
-    auto* out_v = reinterpret_cast<Vo*>(reinterpret_cast<out_t*>(out_) + (size_t)row * hidden);
-    auto* res_v = reinterpret_cast<Vi*>(reinterpret_cast<in_t*>(residual_) + (size_t)row * hidden);
-    auto* uq_v  = reinterpret_cast<Vi*>(reinterpret_cast<in_t*>(unquant_) + (size_t)row * hidden);
+    auto* out_v        = reinterpret_cast<Vo*>(reinterpret_cast<out_t*>(out_) + roff);
+    auto* res_v        = reinterpret_cast<Vi*>(reinterpret_cast<in_t*>(residual_) + roff);
+    auto* uq_v         = reinterpret_cast<Vi*>(reinterpret_cast<in_t*>(unquant_) + roff);
     const auto* xscale = reinterpret_cast<const float*>(xscale_);
 
     // Pre-norm value s = x (+ residual). Cache in registers; overflow reloads
@@ -367,18 +386,21 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
             acc += f * f;
         }
     };
-#pragma unroll
-    for(int k = 0; k < CACHE_V; ++k)
+    if(active)
     {
-        const int idx = tid + k * nthreads;
-        if(idx < vec_hidden)
+#pragma unroll
+        for(int k = 0; k < CACHE_V; ++k)
         {
-            cache[k] = load_s(idx);
-            sumsq(cache[k]);
+            const int idx = lane + k * tpr;
+            if(idx < vec_hidden)
+            {
+                cache[k] = load_s(idx);
+                sumsq(cache[k]);
+            }
         }
+        for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
+            sumsq(load_s(idx));
     }
-    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
-        sumsq(load_s(idx));
 
     float var = block_reduce_sum(acc);
     float inv = rsqrtf(var / hidden + epsilon);
@@ -402,20 +424,25 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
         for(int j = 0; j < width; ++j)
             m = fmaxf(m, fabsf(norm_j(s[j], w[j], idx * width + j)));
     };
-#pragma unroll
-    for(int k = 0; k < CACHE_V; ++k)
+    if(active)
     {
-        const int idx = tid + k * nthreads;
-        if(idx < vec_hidden)
-            row_absmax(cache[k], idx);
+#pragma unroll
+        for(int k = 0; k < CACHE_V; ++k)
+        {
+            const int idx = lane + k * tpr;
+            if(idx < vec_hidden)
+                row_absmax(cache[k], idx);
+        }
+        for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
+            row_absmax(res_v[idx], idx);
     }
-    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
-        row_absmax(res_v[idx], idx);
 
     float rowmax = block_reduce_max(m);
+    if(!active)
+        return;
     float yscale = rowmax / qmax;
     float inv_ys = yscale > 0.0f ? 1.0f / yscale : 0.0f;
-    if(tid == 0)
+    if(lane == 0)
         reinterpret_cast<float*>(yscale_)[row] = yscale;
 
     // quantize (and optionally store pre-quant y)
@@ -438,11 +465,11 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
 #pragma unroll
     for(int k = 0; k < CACHE_V; ++k)
     {
-        const int idx = tid + k * nthreads;
+        const int idx = lane + k * tpr;
         if(idx < vec_hidden)
             quant(cache[k], idx);
     }
-    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
+    for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
         quant(res_v[idx], idx);
 }
 
