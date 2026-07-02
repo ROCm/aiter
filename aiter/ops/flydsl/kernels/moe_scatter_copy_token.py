@@ -59,10 +59,9 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
     ``dst_src`` is an int32 (num_dst,) map from dst row -> src row (-1 to skip).
     """
     assert row_bytes > 0
-    # Fallback ladder (mirrors moe_gemm_2stage X-load): pick the widest buffer op
-    # whose access size divides row_bytes. Because each width divides row_bytes,
-    # every row base (row * row_bytes) is naturally aligned for that width, and the
-    # row is covered by a whole number of units with no in-row remainder.
+    # Fallback ladder (mirrors moe_gemm_2stage X-load): pick the widest buffer op whose access size divides row_bytes.
+    # Because each width divides row_bytes, every row base (row * row_bytes) is naturally aligned for that width, and
+    # the row is covered by a whole number of units with no in-row remainder.
     if row_bytes % 16 == 0:
         vec_width, unit_bytes, use_dword, width_tag = 4, 16, True, "dwx4"
     elif row_bytes % 8 == 0:

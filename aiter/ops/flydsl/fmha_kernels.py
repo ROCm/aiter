@@ -40,10 +40,9 @@ __all__ = [
 # Picked to match BLOCK_M=128 in the kernel; padding is invisible to callers.
 _KERNEL_BLOCK_M = 128
 
-# Max tolerated padded-token ratio for non-causal attention. Padded K/V give
-# QK^T = 0 but exp(0) = 1 leaks into the softmax denominator and scales the
-# output. 0.5% = bf16 mantissa floor (~0.4%) + 1 bit margin. Causal mode masks
-# the padded (future) tokens, so it is unaffected. See 2969_padded_softmax_rca.md.
+# Max tolerated padded-token ratio for non-causal attention. Padded K/V give QK^T = 0 but exp(0) = 1 leaks into the
+# softmax denominator and scales the output. 0.5% = bf16 mantissa floor (~0.4%) + 1 bit margin. Causal mode masks the
+# padded (future) tokens, so it is unaffected. See 2969_padded_softmax_rca.md.
 _MAX_NONCAUSAL_PAD_RATIO = 0.005
 
 
@@ -138,9 +137,8 @@ def flydsl_flash_attn_func(
 
     dtype_str = _torch_dtype_to_str(q.dtype)
 
-    # Pad seq_len up to the kernel's tile size. Tight padding (<= 0.5% of S_pad)
-    # is below the bf16 noise floor; higher ratios are rejected (padded K/V leak
-    # exp(0)=1 into the softmax denominator). Padded query rows are sliced off
+    # Pad seq_len up to the kernel's tile size. Tight padding (<= 0.5% of S_pad) is below the bf16 noise floor; higher
+    # ratios are rejected (padded K/V leak exp(0)=1 into the softmax denominator). Padded query rows are sliced off
     # before returning.
     seq_len_pad = (
         (seq_len_real + _KERNEL_BLOCK_M - 1) // _KERNEL_BLOCK_M
@@ -230,9 +228,8 @@ def flydsl_flash_attn_varlen_func(
     """
     from ...jit.utils.chip_info import get_gfx
 
-    # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
-    # dropout, sliding window, paging, probs/deterministic) falls through to
-    # CK/Triton instead of being silently dropped.
+    # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink, dropout, sliding window, paging,
+    # probs/deterministic) falls through to CK/Triton instead of being silently dropped.
     supported = (
         get_gfx() == "gfx1250"
         and q.shape[-1] == 192

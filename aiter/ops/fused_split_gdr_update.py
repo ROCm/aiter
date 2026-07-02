@@ -66,9 +66,8 @@ def fused_split_gdr_update(
         initial_state_source: [N, HV, K/4, V, 4], float32 swizzled state, updated in-place.
         initial_state_indices: [B], int32 indices into initial_state_source.
     """
-    # The C side no longer allocates memory (Python owns all I/O). Pre-allocate
-    # the output buffer and default index tensor here, then forward to the
-    # de-torched binding which writes into `output` in-place.
+    # The C side no longer allocates memory (Python owns all I/O). Pre-allocate the output buffer and default index
+    # tensor here, then forward to the de-torched binding which writes into `output` in-place.
     B = mixed_qkv.shape[0]
     T = mixed_qkv.shape[2]
     HV = num_heads_v

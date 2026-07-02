@@ -44,8 +44,7 @@ V_M0, V_M1, V_M2, V_M3 = 13, 14, 15, 16  # V tile ds_load_tr16_b128 by MSB
 O_RESC0 = 17  # O-rescale v2f32 sub-op (1 v_pk_mul_f32 per token; 16 tokens per stage)
 TDM = 18  # tensor_load_to_lds
 
-# PART2 boundary: ops[0..PART2_EXP_START-1] = setup+pkfma
-# (cheap), ops[PART2_EXP_START..] = exp
+# PART2 boundary: ops[0..PART2_EXP_START-1] = setup+pkfma (cheap), ops[PART2_EXP_START..] = exp
 PART2_EXP_START = 24  # = PART2_SETUP_A(8) + pkfma(16)
 
 _P2_BASE = 5
@@ -66,8 +65,7 @@ _PV_GEMM_INST_COUNT = 16  # WMMAs per GEMM2 stage
 _N_LDS_PER_MSB = 6  # K tile loads per MSB per stage (QK_HDIM=192)
 _N_LDS_V_PER_MSB = 4  # V tile loads per MSB per stage (V_HDIM=128)
 _TDM_PER_STAGE = 2  # tensor_load_to_lds per stage
-# O-rescale tile groups per GEMM1 stage
-# (16 tokens = 4 MSBs x 4 sub-ops)
+# O-rescale tile groups per GEMM1 stage (16 tokens = 4 MSBs x 4 sub-ops)
 _N_PV_WMMA_N = 4
 _NUM_G1_STAGES = 4
 _NUM_G2_STAGES = 4
@@ -291,9 +289,8 @@ def _build_gemm1_stage(
 
     # ---- O_RESC0: placed earlier (rows 14-17), 1 token per row ----
     # O_RESC0 in row r = emitted AFTER WMMA r = BEFORE WMMA r+1.
-    # Placing at rows 14-17 (before WMMAs 15-18) is earlier than the old
-    # rows 19-22, but still valid since O-rescale just needs to run before
-    # the next GEMM2 PV stage, not before a specific GEMM1 WMMA.
+    # Placing at rows 14-17 (before WMMAs 15-18) is earlier than the old rows 19-22, but still valid since O-rescale
+    # just needs to run before the next GEMM2 PV stage, not before a specific GEMM1 WMMA.
     o_start = 14  # was: n - _N_PV_WMMA_N - 1 = 19
 
     # ---- Build flat P2 token list: same-MSB consecutive for bank grouping ----

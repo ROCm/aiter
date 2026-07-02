@@ -117,9 +117,8 @@ def get_flydsl_stage1_kernels(
                                         base += "_gui"
                                     if xcd > 0:
                                         base += f"_xcd{xcd}"
-                                    # k_wave (intra-block K-slice): only for the
-                                    # small-M tile (tile_m==32), no split-K/mock,
-                                    # and capped to <=8 total waves (<=512 threads).
+                                    # k_wave (intra-block K-slice): only for the small-M tile (tile_m==32), no
+                                    # split-K/mock, and capped to <=8 total waves (<=512 threads).
                                     num_n_waves = min(4, tn // 32)
                                     k_waves = (
                                         [1, 2, 4]
@@ -475,9 +474,8 @@ def compile_flydsl_moe_stage2(
             waves_per_eu=waves_per_eu,
             use_async_copy=use_async_copy,
             cu_num_mul=cu_num_mul,
-            # Forward `b_nt` / `xcd_swizzle` from the kernel-name parser; the
-            # fp4xfp4 path accepts them as ignored kwargs so callers parsing the
-            # `_bnt{N}` / `_xcd{N}` suffixes don't need per-dtype special cases.
+            # Forward `b_nt` / `xcd_swizzle` from the kernel-name parser; the fp4xfp4 path accepts them as ignored
+            # kwargs so callers parsing the `_bnt{N}` / `_xcd{N}` suffixes don't need per-dtype special cases.
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
             model_dim_pad=model_dim_pad,

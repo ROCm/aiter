@@ -68,9 +68,8 @@ def _detect_arch(
         for a in gpu_archs_env.split(";")
         if a.strip() and a.strip() != "native"
     ]
-    # Path 1: GPU_ARCHS lists explicit arch(es). Use that as the source of
-    # truth -- handles build-only hosts and multi-arch wheel scenarios where
-    # ``rocminfo`` cannot tell us which arch the wheel was built for.
+    # Path 1: GPU_ARCHS lists explicit arch(es). Use that as the source of truth -- handles build-only hosts and
+    # multi-arch wheel scenarios where ``rocminfo`` cannot tell us which arch the wheel was built for.
     if explicit_archs:
         match = next((a for a in explicit_archs if a in supported_set), None)
         if match is not None:

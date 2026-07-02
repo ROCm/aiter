@@ -191,9 +191,8 @@ def build_flash_attn_func_module_primary(
     lds_kv_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_kv_offset + LDS_KV_TOTAL_SIZE * 2
 
-    # Map dtype string to a FlyDSL Numeric class (for Vec.make_type and .to()).
-    # dtype_to_elem_type returns a raw MLIR ir.Type; the FlyDSL Vector API needs
-    # a Numeric subclass. Both forms are kept available.
+    # Map dtype string to a FlyDSL Numeric class (for Vec.make_type and .to()). dtype_to_elem_type returns a raw MLIR
+    # ir.Type; the FlyDSL Vector API needs a Numeric subclass. Both forms are kept available.
     _NUMERIC_MAP = {
         "f32": fx.Float32,
         "f16": fx.Float16,
@@ -373,9 +372,8 @@ def build_flash_attn_func_module_primary(
         # ---- Q preload ----
         q_row = q_start + wave_q_offset + lane16
         q_row_i32 = fx.Int32(q_row)
-        # Explicit signed-less-than to match baseline ISA (v_cmp_gt_i64_e64);
-        # fx.Index defaults to unsigned (v_cmp_gt_u64_e64), causing ISA hash
-        # drift though semantically equivalent for non-negative offsets.
+        # Explicit signed-less-than to match baseline ISA (v_cmp_gt_i64_e64); fx.Index defaults to unsigned
+        # (v_cmp_gt_u64_e64), causing ISA hash drift though semantically equivalent for non-negative offsets.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
         q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
@@ -471,10 +469,9 @@ def build_flash_attn_func_module_primary(
                 max_kv_col_i32 = kv_start_i32 + fx.Int32(BLOCK_N - 1)
                 tile_needs_mask = max_kv_col_i32 > q_start_i32
 
-                # SSA-style restructure (PR #462 pattern): FlyDSL's `if` rewriter
-                # requires each conditional state var to be a single MLIR Value,
-                # not a list. Unfold s_raw into NUM_S_VALS named scalars, reassign
-                # each inside the `if tile_needs_mask:` branch.
+                # SSA-style restructure (PR #462 pattern): FlyDSL's `if` rewriter requires each conditional state var to
+                # be a single MLIR Value, not a list. Unfold s_raw into NUM_S_VALS named scalars, reassign each inside
+                # the `if tile_needs_mask:` branch.
                 # NUM_S_VALS == NUM_S_ACCS * 8 == 16 for BLOCK_N=32.
                 s_v0 = s_raw[0]
                 s_v1 = s_raw[1]

@@ -61,9 +61,8 @@ _FORCE_BIND_LDS = (
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250); D must be a multiple
 
 # --- fp8 + e8m0 constants ---------------------------------------------------
-# Defer ``aiter.utility.dtypes`` import to first call (qk_norm_rope_quant
-# pattern): setup.py's AOT pass walks aiter mid-__init__, and the dtype import
-# transitively JITs module_aiter_core before it is built. Lazy resolve avoids it.
+# Defer ``aiter.utility.dtypes`` import to first call (qk_norm_rope_quant pattern): setup.py's AOT pass walks aiter
+# mid-__init__, and the dtype import transitively JITs module_aiter_core before it is built. Lazy resolve avoids it.
 _E8M0_HEADROOM = 7  # silu_and_mul_fq / qk_norm_rope_quant convention
 
 
@@ -560,8 +559,7 @@ def _build_kernel(
             phase1_state = final_state
 
             # ---- Step 7: Phase 2 -- ragged input loop (k ? [window_len, K)) ----
-            # No padding here by construction (window_len absorbs leading state
-            # rows). Two paths:
+            # No padding here by construction (window_len absorbs leading state rows). Two paths:
             #   enable_prefetch_input=False (legacy): serialized per-iter load+compute.
             #   enable_prefetch_input=True: single-iter prefetch -- iter consumes
             #     prefetched vals and issues k+1's loads to overlap softmax compute.
@@ -629,11 +627,10 @@ def _build_kernel(
 
                 m_final, kv_final, w_final = _split_state(phase2_state)
             else:
-                # Phase 2 with single-iter prefetch, restructured to avoid a
-                # per-iter clamp on the speculative k+1 load. A naive k+1 issue
-                # OOBs on the last iter (k+1=K); CDNA buffer_load(max_size) does
-                # not reliably return 0 for OOB (real-workload fault), and the
-                # `min(k+1, K-1)` fix adds an in-loop minsi that hurts scheduling.
+                # Phase 2 with single-iter prefetch, restructured to avoid a per-iter clamp on the speculative k+1 load.
+                # A naive k+1 issue OOBs on the last iter (k+1=K); CDNA buffer_load(max_size) does not reliably return 0
+                # for OOB (real-workload fault), and the `min(k+1, K-1)` fix adds an in-loop minsi that hurts
+                # scheduling.
                 # Fix: peel the last iter out of the loop.
                 #   prologue   : prefetch at min(window_len, K-1) -- clamps the
                 #                window_len==K edge case (Phase 2 empty).
@@ -717,8 +714,7 @@ def _build_kernel(
                     )
                     scf.YieldOp(list(new_m_t) + list(new_kv_t) + list(new_w_t))
                 with ir.InsertionPoint(_if_tail.else_block):
-                    # Phase 2 empty (window_len == K): pass through phase1
-                    # accumulator unchanged.
+                    # Phase 2 empty (window_len == K): pass through phase1 accumulator unchanged.
                     m_p1 = list(phase1_state[0:VEC])
                     kv_p1 = list(phase1_state[VEC : 2 * VEC])
                     w_p1 = list(phase1_state[2 * VEC : 3 * VEC])
@@ -776,11 +772,9 @@ def _build_kernel(
                 arith.constant(ratio, type=i32),
             )
 
-            # Compute rotated values per-lane, then per-lane select(is_rope,
-            # rotated, normed). Avoids a scf.if that mutates out_lane (mutated
-            # values would not dominate outer scope -> MLIR verification fails).
-            # cos/sin loads for NOPE threads are safe: row-relative index clamped
-            # to 0 (a valid in-bounds position).
+            # Compute rotated values per-lane, then per-lane select(is_rope, rotated, normed). Avoids a scf.if that
+            # mutates out_lane (mutated values would not dominate outer scope -> MLIR verification fails). cos/sin loads
+            # for NOPE threads are safe: row-relative index clamped to 0 (a valid in-bounds position).
             cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
             sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
             c_half_rd = arith.constant(RD // 2, type=i32)
@@ -791,9 +785,8 @@ def _build_kernel(
                 _to_raw(tid),
                 arith.constant(ROPE_THREAD_LO, type=i32),
             )
-            # rope_rel may be negative for NOPE threads; clamp to 0 so the
-            # cos/sin load address is in-bounds (the loaded value is unused
-            # because is_rope_t = false).
+            # rope_rel may be negative for NOPE threads; clamp to 0 so the cos/sin load address is in-bounds (the loaded
+            # value is unused because is_rope_t = false).
             rope_rel_raw = ArithValue(tid) - arith.constant(ROPE_THREAD_LO, type=i32)
             rope_rel = arith.maxsi(rope_rel_raw, arith.constant(0, type=i32))
             cs_lo = ArithValue(rope_rel) * arith.constant(PAIRS_PER_THREAD, type=i32)
@@ -1003,9 +996,8 @@ def _build_kernel(
                         am_safe, c_inv_fp8_max, fastmath=fm_fast
                     ).result
                     if const_expr(use_ue8m0):
-                        # ceil-to-pow2 via bit trick: add 0x7FFFFF to mantissa,
-                        # mask off mantissa. If mantissa was 0, exp unchanged;
-                        # else exp += 1.
+                        # ceil-to-pow2 via bit trick: add 0x7FFFFF to mantissa, mask off mantissa. If mantissa was 0,
+                        # exp unchanged; else exp += 1.
                         scale_i32 = scale_raw.bitcast(i32)
                         bits_up = (
                             scale_i32 + arith.constant(0x7FFFFF, type=i32)
@@ -1091,8 +1083,7 @@ def _build_kernel(
                         dword = tuple(dword_list)
 
                     # Compute store address (in BYTES from kv_cache base).
-                    # Both layouts use the same base (= phys * block_stride);
-                    # the offset within the block differs.
+                    # Both layouts use the same base (= phys * block_stride); the offset within the block differs.
                     out_rsrc = buffer_ops.create_buffer_resource(
                         kv_cache, max_size=True
                     )
@@ -1165,8 +1156,7 @@ def _build_kernel(
                                 offset_is_bytes=True,
                             )
                         else:
-                            # n_dw > 4 (VEC=16 -> n_dw=4, actually fits dwordx4;
-                            # kept for future-proofing)
+                            # n_dw > 4 (VEC=16 -> n_dw=4, actually fits dwordx4; kept for future-proofing)
                             for chunk_start in range_constexpr(n_dw // 4):
                                 base = chunk_start * 4
                                 sv = vector.from_elements(
@@ -1269,13 +1259,11 @@ def _build_kernel(
 
 # K-split single-kernel builder (multi-wave LDS reduce)
 #
-# The legacy single-wave kernel runs ONE wave32 per boundary, serializing K
-# iters of online-softmax -- at decode bs=1-32 one CU holds a single wave, so
-# nothing hides the serial dependency chain (per-iter m/kv/w accum + 2x exp2).
-# Fix: split K across NW waves in ONE workgroup (block=32*NW, grid stays
-# plan_capacity -> single dispatch, no extra launch floor). Each wave runs K/NW
-# iters; LDS cross-wave online-softmax merges accumulators; wave 0 does the
-# RMSNorm + GPT-J RoPE + scatter tail. Sibling waves hide each other's latency.
+# The legacy single-wave kernel runs ONE wave32 per boundary, serializing K iters of online-softmax -- at decode bs=1-32
+# one CU holds a single wave, so nothing hides the serial dependency chain (per-iter m/kv/w accum + 2x exp2). Fix: split
+# K across NW waves in ONE workgroup (block=32*NW, grid stays plan_capacity -> single dispatch, no extra launch floor).
+# Each wave runs K/NW iters; LDS cross-wave online-softmax merges accumulators; wave 0 does the RMSNorm + GPT-J RoPE +
+# scatter tail. Sibling waves hide each other's latency.
 # BF16 scatter (V4-Pro CSA Main); FP8/quant/preshuffle use the legacy kernel.
 
 
@@ -1912,9 +1900,8 @@ def _build_kernel_ksplit(
                             hi, out_rsrc, ArithValue(cache_off_dw) + c4_i32
                         )
                 else:
-                    # -- FP8 per-row scaled write + fp32 scale (mirror legacy) --
-                    # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
-                    # store via shuffle_xor(1) within the wave.
+                    # -- FP8 per-row scaled write + fp32 scale (mirror legacy) -- Wave-reduce-max over wave 0's 64
+                    # lanes; pair-coop dword store via shuffle_xor(1) within the wave.
                     def wave_reduce_max(x):
                         w = _to_raw(x)
                         for sh_exp in range_constexpr(log2_block):

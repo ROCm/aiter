@@ -658,8 +658,7 @@ def causal_conv1d_split_qkv_flydsl_fn(
         torch.cuda.current_stream(),
     )
 
-    # First call compiles and executes in one step; later calls reuse the
-    # cached CompiledFunction.
+    # First call compiles and executes in one step; later calls reuse the cached CompiledFunction.
     compiled = getattr(launcher, "_fast_compiled", None)
     if compiled is None:
         try:

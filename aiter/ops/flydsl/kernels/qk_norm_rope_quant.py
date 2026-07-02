@@ -262,9 +262,8 @@ def _build_kernel(
     elem_dtype = fx.BFloat16
     is_e8m0 = scale_dtype == SCALE_DTYPE_E8M0
 
-    # The HW FP8 element dtype follows the arch (matches ``_fp8_const``):
-    # gfx942 ships e4m3fnuz (max_pos=240), gfx950+ ships OCP e4m3fn (max_pos=448).
-    # ``emit_mx_e8m0_scale`` uses this to pick the right ``max_pos`` reciprocal.
+    # The HW FP8 element dtype follows the arch (matches ``_fp8_const``): gfx942 ships e4m3fnuz (max_pos=240), gfx950+
+    # ships OCP e4m3fn (max_pos=448). ``emit_mx_e8m0_scale`` uses this to pick the right ``max_pos`` reciprocal.
     _fp8_mx_dtype = _D.FP8_E4M3_FNUZ if get_hip_arch() == "gfx942" else _D.FP8_E4M3
 
     # Kernel name: only include flags that affect the compiled binary.
@@ -463,8 +462,7 @@ def _build_kernel(
                 cos_f32 = cos_vec.to(fx.Float32)
                 sin_f32 = sin_vec.to(fx.Float32)
 
-                # pre-rotate values: x * factor (fp8) or x * rstd (bf16),
-                # with optional kv weight.
+                # pre-rotate values: x * factor (fp8) or x * rstd (bf16), with optional kv weight.
                 pe = []
                 for vi in range_constexpr(VEC):
                     xi = x_f32_vec[vi]
@@ -491,9 +489,8 @@ def _build_kernel(
                 else:
                     _store_bf16_vec_g(rope_out, bf16_out_g, bf16_out_row_off, tid, VEC)
                     if const_expr(kv_write):
-                        # Fused SWA scatter: post-norm/rope bf16 row also lands
-                        # in swa_kv[slot, pos%cache_size, :] (base pre-shifted).
-                        # Gated on do_swa (batch_id >= 0) to skip CG-pad tokens.
+                        # Fused SWA scatter: post-norm/rope bf16 row also lands in swa_kv[slot, pos%cache_size, :]
+                        # (base pre-shifted). Gated on do_swa (batch_id >= 0) to skip CG-pad tokens.
                         if do_swa:
                             _store_bf16_vec_g(
                                 rope_out,
@@ -958,9 +955,8 @@ def flydsl_qk_norm_rope_quant(
         raise TypeError(f"kv_weight must be bf16, got {kv_weight.dtype}")
     if kv.stride(-1) != 1:
         raise ValueError(f"kv must be dense in the last dim, stride={kv.stride()}")
-    # KV load offset is ``(row * kv.stride(0) + tid * VEC) >> 1``; that ``>> 1``
-    # (bf16->dword) is only correct when every row is dword-aligned, i.e. the
-    # row stride in bf16 elements is even.
+    # KV load offset is ``(row * kv.stride(0) + tid * VEC) >> 1``; that ``>> 1`` (bf16->dword) is only correct when every
+    # row is dword-aligned, i.e. the row stride in bf16 elements is even.
     if kv.stride(0) % 2 != 0:
         raise ValueError(
             "kv row stride (in bf16 elements) must be even for dword-cast "
@@ -1122,9 +1118,8 @@ def flydsl_qk_norm_rope_quant(
             _ptr_arg(q_scale_arg[start:end] if quant else q_scale_arg),
             _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
             kv.stride(0),
-            # swa_kv / state_slot_mapping are global (indexed by absolute slot /
-            # batch_id), so pass unsliced; batch_id_per_token is [T], sliced
-            # like positions.
+            # swa_kv / state_slot_mapping are global (indexed by absolute slot / batch_id), so pass unsliced;
+            # batch_id_per_token is [T], sliced like positions.
             _ptr_arg(swa_kv_arg),
             _ptr_arg(ssm_arg),
             _ptr_arg(bid_arg[start:end] if kv_write else bid_arg),

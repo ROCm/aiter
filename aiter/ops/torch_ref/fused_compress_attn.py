@@ -211,10 +211,9 @@ def fused_compress_attn(
                 row_u8[nope_dim + 2 * g + 1] = e8m0[g]  # duplicated
             k_rope_buff[physical, slot_in_block] = rope_part.to(k_rope_buff.dtype)
         elif quant:
-            # Mirror kernel exactly: ``am_safe * (1.0/fp8_max)`` as a fp32 mul
-            # with a pre-folded fp32 reciprocal constant, NOT ``amax/fp8_max``
-            # (fp32 div differs in the last bit and would shift ue8m0 boundary
-            # rounding, breaking bit-exact cache_scale comparison).
+            # Mirror kernel exactly: ``am_safe * (1.0/fp8_max)`` as a fp32 mul with a pre-folded fp32 reciprocal
+            # constant, NOT ``amax/fp8_max`` (fp32 div differs in the last bit and would shift ue8m0 boundary rounding,
+            # breaking bit-exact cache_scale comparison).
             amax = normed.abs().max()
             am_safe = torch.clamp(amax, min=1e-4)
             inv_fp8_max = torch.tensor(

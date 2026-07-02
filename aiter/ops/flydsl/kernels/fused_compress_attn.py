@@ -92,9 +92,8 @@ from .tensor_shim import STensor, _to_raw, _run_compiled
 # the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
 
-# Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
-# (the K-split LDS path references these only inside @flyc.kernel / @flyc.jit
-# closures, which formatters may not see).
+# Force-bind LDS-related imports so isort/ruff/format hooks don't drop them (the K-split LDS path references these only
+# inside @flyc.kernel / @flyc.jit closures, which formatters may not see).
 _FORCE_BIND_LDS = (
     CompilationContext,
     STensor,
@@ -108,9 +107,8 @@ _FORCE_BIND_LDS = (
 BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
 
 # --- fp8 + e8m0 constants ---------------------------------------------------
-# Defer ``aiter.utility.dtypes`` import to first call: setup.py's AOT pass walks
-# aiter while its __init__ runs, and dtypes triggers a JIT into module_aiter_core
-# (not yet built). Lazy resolution sidesteps the ordering hazard.
+# Defer ``aiter.utility.dtypes`` import to first call: setup.py's AOT pass walks aiter while its __init__ runs, and
+# dtypes triggers a JIT into module_aiter_core (not yet built). Lazy resolution sidesteps the ordering hazard.
 _E8M0_HEADROOM = 7  # silu_and_mul_fq / qk_norm_rope_quant convention
 
 
@@ -331,9 +329,8 @@ def _build_kernel(
 
         # ---- Step 1: load plan row (single dwordx4) ----
         # plan layout: each row = 4 contiguous i32 [ragged_id, batch_id, position, window_len].
-        # Fuse the 4 scalar loads into one buffer_load_dwordx4 + 4 extracts --
-        # saves 3 buffer-load instructions per program (visible at small N
-        # where total program count is low).
+        # Fuse the 4 scalar loads into one buffer_load_dwordx4 + 4 extracts -- saves 3 buffer-load instructions per
+        # program (visible at small N where total program count is low).
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
         plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
@@ -343,9 +340,8 @@ def _build_kernel(
         window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
 
         # ---- Step 2: sentinel-skip ----
-        # Wrap the entire body in scf.IfOp(position >= 0). flydsl's
-        # `if cond: return` does NOT actually early-exit (tail kernel body
-        # still runs with stale values, OOB faults). The IfOp does.
+        # Wrap the entire body in scf.IfOp(position >= 0). flydsl's `if cond: return` does NOT actually early-exit (tail
+        # kernel body still runs with stale values, OOB faults). The IfOp does.
         is_active = arith.cmpi(
             CmpIPredicate.sge, _to_raw(position), arith.constant(0, type=i32)
         )
@@ -435,8 +431,7 @@ def _build_kernel(
                 Returns a list of VEC fp32 MLIR values.
                 """
                 off_dw = ArithValue(off_elems_i32) >> arith.constant(1, type=i32)
-                # bf16 VEC = VEC * 2 bytes; for VEC ? {2, 4, 8} that's
-                # {4, 8, 16} bytes = {1, 2, 4} dwords.
+                # bf16 VEC = VEC * 2 bytes; for VEC ? {2, 4, 8} that's {4, 8, 16} bytes = {1, 2, 4} dwords.
                 dwords = (VEC + 1) // 2  # ceil(VEC*2 / 4)
                 if const_expr(dwords == 1):
                     # buffer_load(vec_width=1) returns a scalar i32; wrap into
@@ -646,9 +641,8 @@ def _build_kernel(
 
                 m_final, kv_final, w_final = _split_state(phase2_state)
             else:
-                # Phase 2 with single-iter prefetch, restructured to avoid a per-iter
-                # clamp on the speculative k+1 load. A naive loop issuing at k+1 OOBs
-                # on the last iter (k+1=K), and CDNA buffer_load(max_size) doesn't
+                # Phase 2 with single-iter prefetch, restructured to avoid a per-iter clamp on the speculative k+1 load.
+                # A naive loop issuing at k+1 OOBs on the last iter (k+1=K), and CDNA buffer_load(max_size) doesn't
                 # reliably return 0 for OOB; the min(k+1,K-1) clamp costs ~27% mid-N.
                 # Restructure — peel the last iter:
                 #   prologue : prefetch at min(window_len, K-1) (clamps wl==K empty case)
@@ -731,8 +725,7 @@ def _build_kernel(
                     )
                     scf.YieldOp(list(new_m_t) + list(new_kv_t) + list(new_w_t))
                 with ir.InsertionPoint(_if_tail.else_block):
-                    # Phase 2 empty (window_len == K): pass through phase1
-                    # accumulator unchanged.
+                    # Phase 2 empty (window_len == K): pass through phase1 accumulator unchanged.
                     m_p1 = list(phase1_state[0:VEC])
                     kv_p1 = list(phase1_state[VEC : 2 * VEC])
                     w_p1 = list(phase1_state[2 * VEC : 3 * VEC])
@@ -790,10 +783,9 @@ def _build_kernel(
                 arith.constant(ratio, type=i32),
             )
 
-            # Compute rotated values per-lane then per-lane select(is_rope, rotated,
-            # normed). Avoids a scf.if whose body mutates out_lane (those values
-            # wouldn't dominate the outer scope -> MLIR verify fails). cos/sin loads
-            # for NOPE threads are safe: row-relative index is clamped to 0.
+            # Compute rotated values per-lane then per-lane select(is_rope, rotated, normed). Avoids a scf.if whose body
+            # mutates out_lane (those values wouldn't dominate the outer scope -> MLIR verify fails). cos/sin loads for
+            # NOPE threads are safe: row-relative index is clamped to 0.
             cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
             sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
             c_half_rd = arith.constant(RD // 2, type=i32)
@@ -804,9 +796,8 @@ def _build_kernel(
                 _to_raw(tid),
                 arith.constant(ROPE_THREAD_LO, type=i32),
             )
-            # rope_rel may be negative for NOPE threads; clamp to 0 so the
-            # cos/sin load address is in-bounds (the loaded value is unused
-            # because is_rope_t = false).
+            # rope_rel may be negative for NOPE threads; clamp to 0 so the cos/sin load address is in-bounds (the loaded
+            # value is unused because is_rope_t = false).
             rope_rel_raw = ArithValue(tid) - arith.constant(ROPE_THREAD_LO, type=i32)
             rope_rel = arith.maxsi(rope_rel_raw, arith.constant(0, type=i32))
             cs_lo = ArithValue(rope_rel) * arith.constant(PAIRS_PER_THREAD, type=i32)
@@ -999,9 +990,8 @@ def _build_kernel(
                         am_safe, c_inv_fp8_max, fastmath=fm_fast
                     ).result
                     if const_expr(use_ue8m0):
-                        # ceil-to-pow2 via bit trick: add 0x7FFFFF to mantissa,
-                        # mask off mantissa. If mantissa was 0, exp unchanged;
-                        # else exp += 1.
+                        # ceil-to-pow2 via bit trick: add 0x7FFFFF to mantissa, mask off mantissa. If mantissa was 0,
+                        # exp unchanged; else exp += 1.
                         scale_i32 = scale_raw.bitcast(i32)
                         bits_up = (
                             scale_i32 + arith.constant(0x7FFFFF, type=i32)
@@ -1080,8 +1070,7 @@ def _build_kernel(
                         dword = (p0, p1)
 
                     # Compute store address (in BYTES from kv_cache base).
-                    # Both layouts use the same base (= phys * block_stride);
-                    # the offset within the block differs.
+                    # Both layouts use the same base (= phys * block_stride); the offset within the block differs.
                     out_rsrc = buffer_ops.create_buffer_resource(
                         kv_cache, max_size=True
                     )
@@ -1239,12 +1228,10 @@ def _build_kernel(
 
 
 # K-split single-kernel builder (multi-wave LDS reduce).
-# The legacy single-wave kernel serializes K iters of online-softmax; at decode
-# bs=1-32 the wave stalls on that serial m/kv/w + 2x exp2 chain (not on memory).
-# Fix: split K across NW waves in ONE workgroup (block=64*NW, grid stays
-# plan_capacity so no extra launch). Each wave runs K/NW iters; LDS cross-wave
-# online-softmax merges accumulators; wave 0 does RMSNorm + RoPE + scatter inline.
-# Sibling waves hide each other's exp2/dependency latency.
+# The legacy single-wave kernel serializes K iters of online-softmax; at decode bs=1-32 the wave stalls on that serial
+# m/kv/w + 2x exp2 chain (not on memory). Fix: split K across NW waves in ONE workgroup (block=64*NW, grid stays
+# plan_capacity so no extra launch). Each wave runs K/NW iters; LDS cross-wave online-softmax merges accumulators; wave
+# 0 does RMSNorm + RoPE + scatter inline. Sibling waves hide each other's exp2/dependency latency.
 
 
 def _build_kernel_ksplit(
@@ -1841,8 +1828,7 @@ def _build_kernel_ksplit(
                         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
                 else:
                     # -- FP8 per-row scaled write + fp32 scale (mirror legacy) --
-                    # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
-                    # store via shuffle_xor(1) within the wave.
+                    # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword store via shuffle_xor(1) within the wave.
                     def wave_reduce_max(x):
                         w = _to_raw(x)
                         for sh_exp in range_constexpr(log2_block):
@@ -2101,9 +2087,8 @@ def hca_per_n_config(plan_capacity: int) -> tuple[int, int]:
     if plan_capacity <= 384:
         return 256, 8
     if plan_capacity <= 768:
-        # HCA decode bs=512 (plan_cap = bs * ceil((1+MTP)/ratio) = 512 for
-        # ratio=128, MTP<=3) prefers k_split=4 over 8: 30.4 vs 34.9 us on
-        # MI355X (~14% win, ~5 us per HCA layer).
+        # HCA decode bs=512 (plan_cap = bs * ceil((1+MTP)/ratio) = 512 for ratio=128, MTP<=3) prefers k_split=4 over 8:
+        # 30.4 vs 34.9 us on MI355X (~14% win, ~5 us per HCA layer).
         return 256, 4
     if plan_capacity <= 1024:
         return 512, 8

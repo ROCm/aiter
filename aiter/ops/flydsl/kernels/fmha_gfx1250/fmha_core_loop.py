@@ -153,11 +153,10 @@ GEMM2 = 1  # PV
 N_V_MSB = 2  # v_msb = d_msb % 2, only 2 V banks needed
 N_PV_WMMA_N = 4  # D_MSB_N / WMMA_N = 64 / 16
 D_MSB_K = SU_K_N  # 32 (one WMMA-K per stage)
-# With compact (no-padding) P layout, each PV WMMA src_b is built by
-# concatenating 2 sibling sp_msbs (sp_msb=2*m_tile and 2*m_tile+1) along the
-# K_pv (=N_qk) axis, giving a full 16 bf16/lane src_b = full K=32 real.
-# Each (d_msb, n) accumulator therefore receives exactly CNT_SU(=4) WMMAs
-# across the 4 PV stages, covering tile_n=128 K-reduction (4 * 32 = 128).
+# With compact (no-padding) P layout, each PV WMMA src_b is built by concatenating 2 sibling sp_msbs (sp_msb=2*m_tile
+# and 2*m_tile+1) along the K_pv (=N_qk) axis, giving a full 16 bf16/lane src_b = full K=32 real. Each (d_msb, n)
+# accumulator therefore receives exactly CNT_SU(=4) WMMAs across the 4 PV stages, covering tile_n=128 K-reduction (4 *
+# 32 = 128).
 PV_K_ITERS = 1  # 1 WMMA per (d_msb, n) per SU
 PV_GEMM_INST_COUNT = NUM_MSB * PV_K_ITERS * N_PV_WMMA_N  # 16
 
@@ -931,9 +930,8 @@ def _build_softmax_part2_ops(
         ops.append(op_rescale_sum)
 
     # --- Rescale phase: ALL pk_fma first, then ALL exp ---
-    # Two consecutive groups avoid EXP(bank0)↔PK_FMA(bank_msb) MSB switches from
-    # escaped sp_pairs (pairs 0,1 land in bank0), and the 16 pkfmas give each
-    # pair's pkfma→exp >4 cycles to hide the transcendental latency.
+    # Two consecutive groups avoid EXP(bank0)↔PK_FMA(bank_msb) MSB switches from escaped sp_pairs (pairs 0,1 land in
+    # bank0), and the 16 pkfmas give each pair's pkfma→exp >4 cycles to hide the transcendental latency.
 
     # Phase A: all 16 pk_fma ops.
     # cur_max_log2e_dup (v2f32, lo==hi) produced by op5 broadcast.
@@ -1443,9 +1441,8 @@ def _emit_lds_load(ty, lds_op, kv_lds_addrs, kv_tiles_out):
         tile = _atom_ds_load_b128(ty, addr, offset, msb)
     else:
         half_p = lds_op["half_p"]
-        # kv_lds_addrs[4 + msb*2 + half_p] — both dh0 and dh1 for
-        # this MSB are in bank=msb, so dst/addr/addr are all same bank →
-        # s_set_vgpr_msb stays constant within each MSB's load group.
+        # kv_lds_addrs[4 + msb*2 + half_p] — both dh0 and dh1 for this MSB are in bank=msb, so dst/addr/addr are all
+        # same bank → s_set_vgpr_msb stays constant within each MSB's load group.
         addr = kv_lds_addrs[NUM_MSB + msb * 2 + (1 if half_p else 0)]
         tile = _atom_ds_load_tr16_b128(ty, addr, offset, msb)
 
@@ -1973,9 +1970,8 @@ def _load_v_two_sus_from_lds(ty, kv_lds_addrs, blk, su0, su1):
     raw0 = [[None] * N_LDS_V_PER_MSB for _ in range_constexpr(NUM_MSB)]
     raw1 = [[None] * N_LDS_V_PER_MSB for _ in range_constexpr(NUM_MSB)]
 
-    # Interleave by MSB: for each MSB, emit su0's loads then su1's loads.
-    # All loads in one MSB group share the same addr bank and dst bank,
-    # so no s_set_vgpr_msb switch is needed within the group.
+    # Interleave by MSB: for each MSB, emit su0's loads then su1's loads. All loads in one MSB group share the same addr
+    # bank and dst bank, so no s_set_vgpr_msb switch is needed within the group.
     for msb in range_constexpr(NUM_MSB):
         for op in sched0:
             if const_expr(op["msb"] == msb):
