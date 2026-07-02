@@ -10,11 +10,10 @@
 //   - mxfp8_mxfp8_gemm_asm: D[M,N] bf16 = A[M,K] mxfp8 * B[N,K] mxfp8   (a8w8)
 //   - mxfp8_mxfp4_gemm_asm: D[M,N] bf16 = A[M,K] mxfp8 * B[N,K/2] mxfp4 (a8w4)
 //
-// KernelArgs is the packed preload layout the POC silicon host ships (76B):
-// 5 pointers (MEM-first), then 9 tight 4B scalars. The persistent + cluster
-// shaders do their own tile scheduling, so unlike f4gemm there are no
-// log2_grid kernargs -- the host only supplies M/N/K/batch and launches on a
-// fixed cluster grid (see f8gemm POC mxfp8fp4gemm.cpp).
+// KernelArgs is the POC packed preload layout (76B): 5 ptrs (MEM-first) + 9
+// tight 4B scalars. The persistent+cluster shaders self-schedule tiles, so
+// unlike f4gemm there are no log2_grid kernargs -- the host only supplies
+// M/N/K/batch and launches on a fixed cluster grid.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_mxfp8fp4gemm_configs.hpp"
@@ -78,10 +77,9 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         int cl_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
         // N is cluster-tiled with no partial-tile masking, so it must tile
-        // exactly. M only needs to fill tile_m when it is clustered
-        // (cluster_y > 1); a cluster_y == 1 tile lets the persistent scheduler
-        // run a partial trailing M-tile bounded by the M kernarg (scale padded
-        // to 32 rows), so small M selects the 64mx1_128nx4 tile.
+        // exactly. M must fill tile_m only when clustered (cluster_y > 1); a
+        // cluster_y==1 tile lets the persistent scheduler run a partial
+        // trailing M-tile bounded by the M kernarg, so small M picks 64mx1_128nx4.
         if((N % cfg.tile_n) != 0)
             continue;
         if(cl_y > 1 && (M % cfg.tile_m) != 0)
@@ -249,8 +247,8 @@ static void mxfp8fp4_mi400_launch(aiter_tensor_t* A,
 
     if(persistent)
     {
-        // 1D persistent launch of wg_max threadgroups along X; Y carries only the
-        // cluster_y rows. GRID_X = wg_max / (cluster_x*cluster_y), GRID_Y = 1.
+        // 1D persistent launch: wg_max threadgroups along X, Y carries only the
+        // cluster_y rows. grid_x = wg_max / (cluster_x*cluster_y).
         const int cluster_size = cluster_x * cluster_y;
         AITER_CHECK(cluster_size > 0 && (wg_max % cluster_size) == 0,
                     __func__, " persistent wg_max=", wg_max,

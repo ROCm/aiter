@@ -11,13 +11,10 @@
 //   MXFP4: 80B (struct minus the 2 trailing persistent log2 dwords)
 //   NVFP4: 88B (full struct incl. GlobalScaleA/B + trailing log2)
 //
-// Launch is cluster- and persistent-aware:
-//   - cluster_x/cluster_y are compile-time per .co and read from the CSV; a
-//     dim > 1 launches via hipDrvLaunchKernelEx with a cluster-dim attribute.
-//   - persistent dispatch is hardcoded on (persistent_tg=256, grid_y=4; both
-//     runtime-only knobs that don't affect the .co). The host ships
-//     log2(gridX)/log2(gridY) so the persistent shader can walk the cluster
-//     grid. NVFP4 carries them at dw20/21, MXFP4 reuses dw18/19.
+// Launch is cluster- and persistent-aware: cluster_x/y are compile-time per
+// .co (from CSV); persistent dispatch is hardcoded on (persistent_tg=256,
+// grid_y=4). Host ships log2(gridX)/log2(gridY) for the persistent shader:
+// NVFP4 at dw20/21, MXFP4 reuses the unused GlobalScale slots dw18/19.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_f4gemm_configs.hpp"
@@ -128,9 +125,8 @@ static std::tuple<std::string, int> get_heuristic_kernel(
     return std::make_tuple(selectedKernelName, 1);
 }
 
-// Shared dispatch body. NVFP4 ships the full preload struct (88B) with real
-// GlobalScale floats; MXFP4 leaves GlobalScale unset and ships 80B (dropping
-// the trailing persistent log2 dword pair).
+// Shared dispatch body. NVFP4 ships 88B with real GlobalScale floats; MXFP4
+// leaves GlobalScale unset and ships 80B (dropping the trailing log2 pair).
 static void f4gemm_mi400_launch(aiter_tensor_t* A,
                                 aiter_tensor_t* B,
                                 aiter_tensor_t* ScaleA,
@@ -192,9 +188,7 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
         args.GlobalScaleB = GlobalScaleB;
     }
 
-    // Bytes shipped to HW:
-    //   NVFP4: full struct (5 ptrs + 8 scalars + GlobalScaleA/B + 2 log2) = 88B
-    //   MXFP4: drop the 2 trailing persistent log2 dwords                 = 80B
+    // Bytes shipped: NVFP4 = full 88B struct; MXFP4 = 80B (drop 2 trailing log2 dwords).
     size_t arg_size = (intype == F4_INTYPE_NVFP4)
                           ? sizeof(KernelArgs)
                           : (sizeof(KernelArgs) - 2 * sizeof(unsigned int));
@@ -255,9 +249,8 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
     const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;  // compile-time per .co (CSV)
     const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
-    // Persistent dispatch is hardcoded on: all f4gemm_mi400 .co are persistent
-    // shaders. persistent_tg / grid_y are runtime-only knobs (don't affect the
-    // .co), so they're fixed here at the default; gridX is derived.
+    // Persistent dispatch hardcoded on (all f4gemm_mi400 .co are persistent).
+    // persistent_tg / grid_y are runtime-only knobs; gridX is derived.
     constexpr int PERSISTENT    = 1;
     constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
     constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
@@ -314,9 +307,8 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
         for(int g = gridY; g > 1; g >>= 1)
             log2_grid_y++;
 
-        // Persistent shader reads log2(gridX)/log2(gridY). NVFP4 ships them at
-        // dw20/21; MXFP4 has no GlobalScale so the shader reads them from the
-        // GlobalScale slots (dw18/19).
+        // NVFP4 ships log2(gridX/gridY) at dw20/21; MXFP4 has no GlobalScale
+        // so reuses those slots (dw18/19).
         if(intype == F4_INTYPE_NVFP4)
         {
             args.log2_grid_x = log2_grid_x;
