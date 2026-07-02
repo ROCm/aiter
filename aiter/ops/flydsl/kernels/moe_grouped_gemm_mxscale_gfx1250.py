@@ -62,6 +62,7 @@ class _GroupedA8W4Config:
     expert_sched_mode: bool
     tdm_as_in_prologue: bool = False
     grouped_persistent_m: bool = True
+    grouped_persistent_mn: bool = False
     grouped_contiguous_m: bool = False
     persistent_workers: Optional[int] = None
     data_format: str = "a8w4"
@@ -1017,6 +1018,7 @@ def _compile_base_a8w4_gemm(
         batch_count=cfg.experts,
         grouped_masked_m=True,
         grouped_persistent_m=cfg.grouped_persistent_m,
+        grouped_persistent_mn=cfg.grouped_persistent_mn,
         grouped_contiguous_m=cfg.grouped_contiguous_m,
         persistent_workers=cfg.persistent_workers,
         stage1_act=stage1_act,

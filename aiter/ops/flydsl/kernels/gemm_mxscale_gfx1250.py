@@ -126,6 +126,7 @@ def compile_mxscale_gemm(
     batch_count: int = 1,
     grouped_masked_m: bool = False,
     grouped_persistent_m: bool = False,
+    grouped_persistent_mn: bool = False,
     grouped_contiguous_m: bool = False,
     grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
@@ -225,6 +226,17 @@ def compile_mxscale_gemm(
     if grouped_persistent_m and (cluster_m > 1 or cluster_n > 1):
         raise ValueError(
             "grouped_persistent_m currently requires cluster_m=cluster_n=1"
+        )
+    # MN-persist folds the M-tile stream and the N-tile axis into a single flat
+    # work stream walked by the persistent workers (default: only M persists,
+    # N stays on grid.x). Compile-time switch; env presence overrides the arg
+    # (value "0"/"false" also overrides an arg of True).
+    _env_persist_mn = os.environ.get("AITER_GROUPED_PERSIST_MN", "").strip().lower()
+    if _env_persist_mn != "":
+        grouped_persistent_mn = _env_persist_mn in ("1", "true", "yes")
+    if grouped_persistent_mn and not grouped_persistent_m:
+        raise ValueError(
+            "grouped_persistent_mn requires grouped_persistent_m=True"
         )
     if grouped_persistent_m:
         if persistent_workers is None:
@@ -596,6 +608,7 @@ def compile_mxscale_gemm(
     module_name = (
         f"kernel_mxscale_{kernel_tag_mode}_{data_format}"
         f"_t{tile_m}x{tile_n}x{tile_k}_b{num_buffers}"
+        f"{'_pmn' if grouped_persistent_mn else ''}"
     ).replace("-", "_")
 
     if use_fp4_bank_friendly_schedule:
@@ -3146,12 +3159,11 @@ def compile_mxscale_gemm(
                 arg_m_tile_prefix, max_size=True
             )
             map_rsrc = buffer_ops.create_buffer_resource(arg_m_tile_map, max_size=True)
-            block_n_id = arith.index_cast(T.index, _raw(gpu.block_idx.x))
-            worker_id = arith.index_cast(T.index, _raw(gpu.block_idx.y))
             grid_size = arith.index(_persistent_workers)
             idx_n = arith.index_cast(T.index, i32_n.ir_value())
             n_tiles_per_batch = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
             max_m_tiles_per_batch = (M + tile_m - 1) // tile_m
+            split_k_id = arith.index_cast(T.index, _raw(gpu.block_idx.z))
 
             # Total M tile count = prefix[batch_count].
             # Do not wrap _emit_tile in a dynamic Python `if`: in FlyDSL this is
@@ -3160,57 +3172,114 @@ def compile_mxscale_gemm(
                 prefix_rsrc, batch_count, vec_width=1, dtype=T.i32
             )
             total_m_tiles_idx = arith.index_cast(T.index, total_m_tiles_i32)
-            tiles_per_worker = (
-                total_m_tiles_idx + grid_size - arith.index(1)
-            ) // grid_size
 
-            # gfx950 a4w4 stage2 persist_m<=0 style: grid.x enumerates N tiles,
-            # grid.y enumerates CU workers. Each worker owns a contiguous chunk
-            # of M tiles for the fixed N tile, improving B reuse and avoiding a
-            # global flattened tile stream inside the worker loop.
             _c0_p = arith.index(0)
             _c1_p = arith.index(1)
             _i1 = ir.IntegerType.get_signless(1)
             _init_active = arith.constant(1, type=_i1)
-            _for_persist = scf.ForOp(_c0_p, tiles_per_worker, _c1_p, [_init_active])
-            _for_ip = ir.InsertionPoint(_for_persist.body)
-            _for_ip.__enter__()
 
-            mi = _for_persist.induction_variable
-            still_active = _for_persist.inner_iter_args[0]
-            global_m_tile = worker_id * tiles_per_worker + mi
-            m_tile_in_range = arith.cmpi(
-                arith.CmpIPredicate.slt, global_m_tile, total_m_tiles_idx
-            )
-            n_tile_in_range = arith.cmpi(
-                arith.CmpIPredicate.slt, block_n_id, n_tiles_per_batch
-            )
-            cur_active = arith.andi(still_active, m_tile_in_range)
-            tile_active = arith.andi(cur_active, n_tile_in_range)
+            if const_expr(grouped_persistent_mn):
+                # MN-persist: fold the M-tile stream and the N-tile axis into a
+                # single flat work stream (m-major: N outer, M inner, preserving
+                # the fixed-N / iterate-M B-reuse of the M-only schedule). grid.x
+                # enumerates the CU workers; grid.y is 1. Each worker walks a
+                # contiguous chunk of the (n_tile, m_tile) product.
+                worker_id = arith.index_cast(T.index, _raw(gpu.block_idx.x))
+                total_work = total_m_tiles_idx * n_tiles_per_batch
+                work_per_worker = (
+                    total_work + grid_size - arith.index(1)
+                ) // grid_size
+                _for_persist = scf.ForOp(
+                    _c0_p, work_per_worker, _c1_p, [_init_active]
+                )
+                _for_ip = ir.InsertionPoint(_for_persist.body)
+                _for_ip.__enter__()
 
-            # tile_active is uniform across the workgroup. Skipping the full
-            # tile body for inactive persistent workers avoids burning WMMA
-            # cycles on the common decode case where total_m_tiles << CU.
-            tile_if = scf.IfOp(tile_active, results_=[], has_else=False)
-            with ir.InsertionPoint(tile_if.then_block):
-                map_entry_i32 = buffer_ops.buffer_load(
-                    map_rsrc, global_m_tile, vec_width=1, dtype=T.i32
+                wi = _for_persist.induction_variable
+                still_active = _for_persist.inner_iter_args[0]
+                global_work = worker_id * work_per_worker + wi
+                work_in_range = arith.cmpi(
+                    arith.CmpIPredicate.slt, global_work, total_work
                 )
-                map_entry = arith.index_cast(T.index, map_entry_i32)
-                batch_idx = map_entry // arith.index(max_m_tiles_per_batch)
-                bx_local = map_entry - batch_idx * arith.index(max_m_tiles_per_batch)
-                split_k_id = arith.index_cast(T.index, _raw(gpu.block_idx.z))
-                _emit_tile(
-                    batch_idx,
-                    bx_local,
-                    block_n_id,
-                    split_k_id,
-                    tile_valid_override=tile_active,
+                cur_active = arith.andi(still_active, work_in_range)
+                # n_tile outer, global_m_tile inner. total_m_tiles>=1 whenever
+                # the loop runs (work_per_worker==0 when total_work==0).
+                n_block_id = global_work // total_m_tiles_idx
+                global_m_tile = global_work - n_block_id * total_m_tiles_idx
+
+                tile_if = scf.IfOp(cur_active, results_=[], has_else=False)
+                with ir.InsertionPoint(tile_if.then_block):
+                    map_entry_i32 = buffer_ops.buffer_load(
+                        map_rsrc, global_m_tile, vec_width=1, dtype=T.i32
+                    )
+                    map_entry = arith.index_cast(T.index, map_entry_i32)
+                    batch_idx = map_entry // arith.index(max_m_tiles_per_batch)
+                    bx_local = map_entry - batch_idx * arith.index(
+                        max_m_tiles_per_batch
+                    )
+                    _emit_tile(
+                        batch_idx,
+                        bx_local,
+                        n_block_id,
+                        split_k_id,
+                        tile_valid_override=cur_active,
+                    )
+                    scf.YieldOp([])
+                gpu.barrier()
+                scf.YieldOp([cur_active])
+                _for_ip.__exit__(None, None, None)
+            else:
+                # M-only persist (gfx950 a4w4 stage2 persist_m<=0 style): grid.x
+                # enumerates N tiles, grid.y enumerates CU workers. Each worker
+                # owns a contiguous chunk of M tiles for the fixed N tile,
+                # improving B reuse and avoiding a global flattened tile stream.
+                block_n_id = arith.index_cast(T.index, _raw(gpu.block_idx.x))
+                worker_id = arith.index_cast(T.index, _raw(gpu.block_idx.y))
+                tiles_per_worker = (
+                    total_m_tiles_idx + grid_size - arith.index(1)
+                ) // grid_size
+                _for_persist = scf.ForOp(
+                    _c0_p, tiles_per_worker, _c1_p, [_init_active]
                 )
-                scf.YieldOp([])
-            gpu.barrier()
-            scf.YieldOp([cur_active])
-            _for_ip.__exit__(None, None, None)
+                _for_ip = ir.InsertionPoint(_for_persist.body)
+                _for_ip.__enter__()
+
+                mi = _for_persist.induction_variable
+                still_active = _for_persist.inner_iter_args[0]
+                global_m_tile = worker_id * tiles_per_worker + mi
+                m_tile_in_range = arith.cmpi(
+                    arith.CmpIPredicate.slt, global_m_tile, total_m_tiles_idx
+                )
+                n_tile_in_range = arith.cmpi(
+                    arith.CmpIPredicate.slt, block_n_id, n_tiles_per_batch
+                )
+                cur_active = arith.andi(still_active, m_tile_in_range)
+                tile_active = arith.andi(cur_active, n_tile_in_range)
+
+                # tile_active is uniform across the workgroup. Skipping the full
+                # tile body for inactive persistent workers avoids burning WMMA
+                # cycles on the common decode case where total_m_tiles << CU.
+                tile_if = scf.IfOp(tile_active, results_=[], has_else=False)
+                with ir.InsertionPoint(tile_if.then_block):
+                    map_entry_i32 = buffer_ops.buffer_load(
+                        map_rsrc, global_m_tile, vec_width=1, dtype=T.i32
+                    )
+                    map_entry = arith.index_cast(T.index, map_entry_i32)
+                    batch_idx = map_entry // arith.index(max_m_tiles_per_batch)
+                    bx_local = map_entry - batch_idx * arith.index(
+                        max_m_tiles_per_batch
+                    )
+                    _emit_tile(
+                        batch_idx,
+                        bx_local,
+                        block_n_id,
+                        split_k_id,
+                        tile_valid_override=tile_active,
+                    )
+                    scf.YieldOp([])
+                gpu.barrier()
+                scf.YieldOp([cur_active])
+                _for_ip.__exit__(None, None, None)
         else:
             if const_expr(grouped_contiguous_m):
                 masked_m_rsrc = buffer_ops.create_buffer_resource(
@@ -3411,6 +3480,7 @@ def compile_mxscale_gemm(
         batch_count,
         grouped_masked_m,
         grouped_persistent_m,
+        grouped_persistent_mn,
         grouped_contiguous_m,
         _k_contiguous_1d,
         _persistent_workers,
@@ -3578,8 +3648,15 @@ def compile_mxscale_gemm(
             arena_alloc.finalize()
 
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
-        gy = arith.index(_persistent_workers)
+        if const_expr(grouped_persistent_mn):
+            # MN-persist: N is folded into the flat work stream, so grid.x is the
+            # worker count and grid.y is 1 (kernel reads blockIdx.x as worker).
+            gx = arith.index(_persistent_workers)
+            gy = arith.index(1)
+        else:
+            # M-only persist: grid.x enumerates N tiles, grid.y the CU workers.
+            gx = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
+            gy = arith.index(_persistent_workers)
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
@@ -3773,8 +3850,15 @@ def compile_mxscale_gemm(
             arena_alloc.finalize()
 
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
-        gy = arith.index(_persistent_workers)
+        if const_expr(grouped_persistent_mn):
+            # MN-persist: N is folded into the flat work stream, so grid.x is the
+            # worker count and grid.y is 1 (kernel reads blockIdx.x as worker).
+            gx = arith.index(_persistent_workers)
+            gy = arith.index(1)
+        else:
+            # M-only persist: grid.x enumerates N tiles, grid.y the CU workers.
+            gx = (idx_n + arith.index(tile_n - 1)) // arith.index(tile_n)
+            gy = arith.index(_persistent_workers)
         gz = split_k
 
         launcher = kernel_mxscale_gemm(
