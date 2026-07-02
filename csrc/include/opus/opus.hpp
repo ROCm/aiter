@@ -1485,32 +1485,22 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 #undef OPUS_DEFINE_DPACKS
 #undef OPUS_DEFINE_FPACKS
 #undef OPUS_CAST_DEFINE
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
 // arch
 //
-// ---- HIPCC compilation model (clang-based)  ----
-//   hipcc compiles each translation unit in TWO passes: host pass, then device pass.
+// HIPCC (clang) compiles each TU in TWO passes: host then device.
+//   Host pass  : __device__ fns are fully parsed/instantiated and constexpr/static_assert evaluated; only codegen is skipped.
+//   Device pass: __host__ fns are truly skipped (not parsed/instantiated/checked).
+// Consequences:
+//   1. Arch macros (__GFX9__, __gfx950__, ...) are defined ONLY in the device pass; #if guards on them take #else during the host pass.
+//   2. __device__ constexpr vars / static_asserts in __device__ templates are still evaluated in the host pass (templates may be instantiated from __global__).
+//   3. For arch-specific preprocessor branches, guard the whole impl with #if defined(__HIP_DEVICE_COMPILE__) to skip the host pass.
 //
-//   Host pass  : __device__ functions are fully parsed, name-resolved, template-instantiated, and constexpr/static_assert evaluated. Only machine code generation is skipped.
-//   Device pass: __host__ functions are truly skipped -- not parsed, not instantiated, not checked.
+// get_warp_size() / get_smem_size(): OPUS_H_D constexpr, safe everywhere (template defaults, static_assert, __shared__ sizes, host calcs).
+//   Host-pass defaults (arch macros absent): warp_size 64 (GFX9), 32 for gfx1250 (wave32); smem 65536 (64 KB, non-gfx950).
+//   __builtin_amdgcn_wavefrontsize() is NOT constexpr in clang; prefer get_warp_size() (preprocessor arch detection) for constexpr use.
 //
-//   Key consequences:
-//     1. Architecture macros (__GFX9__, __gfx950__, etc.) are defined ONLY during the device pass. Any #if guard on them will take the #else branch during the host pass.
-//     2. __device__ constexpr variables and static_asserts inside __device__ templates are still evaluated during the host pass (since templates may be instantiated from __global__).
-//     3. If your device code relies on arch-specific preprocessor branches, consider guarding the entire implementation with #if defined(__HIP_DEVICE_COMPILE__) to skip the host pass.
-//
-// ---- get_warp_size() / get_smem_size() ----
-//   OPUS_H_D constexpr -- safe to use everywhere: template defaults, static_assert, constexpr variables, __shared__ array sizes, host launch-parameter calculations, etc.
-//   During the host pass (arch macros absent), they return safe defaults:
-//     get_warp_size() -> 64 (GFX9 default), 32 for gfx1250 (wave32)
-//     get_smem_size() -> 65536 (64 KB, non-gfx950 default)
-//   Note: __builtin_amdgcn_wavefrontsize() is NOT constexpr in clang, so it cannot be used in template arguments, static_assert, or if constexpr. Prefer get_warp_size() which uses
-//   preprocessor arch detection to provide a constexpr result.
-//
-// ---- query_warp_size() / query_smem_size() ----
-//   OPUS_H only -- runtime HIP API queries (hipGetDeviceProperties). Use when you need the true hardware value on the host (e.g. occupancy calculations).
-//   Guarded by OPUS_ENABLE_RUNTIME_QUERY (default 0). Define OPUS_ENABLE_RUNTIME_QUERY=1 before
-//   including opus.hpp (or via compiler flag) to enable these functions and the hip_runtime_api.h include.
+// query_warp_size() / query_smem_size(): OPUS_H only, runtime HIP queries (hipGetDeviceProperties) for true host-side hw values.
+//   Guarded by OPUS_ENABLE_RUNTIME_QUERY (default 0); define =1 to enable them and the hip_runtime_api.h include.
 //
 // gfx12 wave32/64 detection: __AMDGCN_WAVEFRONT_SIZE__ removed in ROCm 7.2; _w32 builtins are gated by wavefrontsize32 target feature, so __has_builtin is a constexpr proxy.
 #if (defined(__gfx1201__) || defined(__gfx1200__)) && defined(__HIP_DEVICE_COMPILE__)

@@ -87,19 +87,11 @@ using cpp_type_from_aiter_dtype_t = typename cpp_type_from_aiter_dtype<DTYPE>::t
 
 } // namespace aiter::dispatch_detail
 
-// ============================================================================
-// _rmTorch dtype dispatch macros (torch-free replacements for AT_DISPATCH_*)
-//
-// Usage (same pattern as PyTorch, scalar_t is auto-defined):
-//
+// _rmTorch dtype dispatch macros (torch-free replacements for AT_DISPATCH_*).
+// Same pattern as PyTorch; scalar_t is auto-defined. E.g.:
 //   AITER_DISPATCH_FLOATING16_TYPES_rmTorch(dtype, "my_kernel", [&] {
-//       kernel<scalar_t><<<grid, block, 0, stream>>>(data);
-//   });
-//
-//   VLLM_DISPATCH_FLOATING_TYPES_rmTorch(dtype, "my_kernel", [&] {
-//       kernel<scalar_t><<<grid, block, 0, stream>>>(data);
-//   });
-// ============================================================================
+//       kernel<scalar_t><<<grid, block, 0, stream>>>(data); });
+// VLLM_DISPATCH_FLOATING_TYPES_rmTorch has the same form.
 
 #define AT_DISPATCH_SWITCH_rmTorch(TYPE, NAME, ...)                                  \
     [&] {                                                                        \
@@ -138,9 +130,7 @@ using cpp_type_from_aiter_dtype_t = typename cpp_type_from_aiter_dtype<DTYPE>::t
         NAME,                                                 \
         AITER_DISPATCH_CASE_FLOATING16_TYPES_rmTorch(__VA_ARGS__))
 
-// ============================================================================
 // _rmTorch replacements for dispatch_utils.h vec_size and VLLM_DISPATCH_* macros.
-// ============================================================================
 
 // --- vec_size dispatch (_rmTorch) ---
 
@@ -198,12 +188,8 @@ using cpp_type_from_aiter_dtype_t = typename cpp_type_from_aiter_dtype<DTYPE>::t
     AT_DISPATCH_SWITCH_rmTorch(                                     \
         TYPE, NAME, VLLM_DISPATCH_CASE_INTEGRAL_TYPES_rmTorch(__VA_ARGS__))
 
-// ============================================================================
-// KV cache dtype dispatch macros (_rmTorch)
-//
-// These use opus::* and vllm::Fp8KVCacheDataType types which must be visible
-// at the point of macro expansion (not here).
-// ============================================================================
+// KV cache dtype dispatch macros (_rmTorch). opus::* and vllm::Fp8KVCacheDataType
+// must be visible at the point of macro expansion (not here).
 
 #define DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(SRC_DTYPE, KV_DTYPE, FN)               \
     if(KV_DTYPE == "auto")                                                             \
@@ -385,9 +371,7 @@ using cpp_type_from_aiter_dtype_t = typename cpp_type_from_aiter_dtype<DTYPE>::t
             false, "Unsupported data type of kv cache: ", KV_DTYPE, "Query type: ", QUERY_DTYPE); \
     }
 
-// ============================================================================
 // KV cache dtype dispatch (_rmTorch) using ck_tile types
-// ============================================================================
 
 #define DISPATCH_BY_KV_CACHE_DTYPE_rmTorch(SRC_DTYPE, KV_DTYPE, FN)                    \
     if(KV_DTYPE == "auto")                                                             \

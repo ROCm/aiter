@@ -110,15 +110,9 @@ __device__ __inline__ auto warp_swap_(const T& x, int lane_idx, opus::number<lan
     {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wuninitialized"
-        // this builtin require the old value, and
-        // will generate a v_mov_b32 vxxx [old] before cvt, which result in unwanted ISA
-        // so we prepare an uninitialized variable purposely, and turn off the warning
-        //
-        // note the 2nd operation, we need it as old value to prevent compiler optimize out for
-        // multi assignement
-        //
-        // NOTE: we can also use volatile, but compiler will generate scratch (it's memory
-        // operation?)
+        // upd_dpp needs an old value; using a purposely-uninitialized var (warning off)
+        // avoids an extra v_mov_b32. The 2nd op reuses r as old value to stop the compiler
+        // optimizing it out. (volatile works too but spills to scratch.)
         T r;
         r = upd_dpp_(
             r, x, opus::number<260>{}, opus::number<0xf>{}, opus::number<0b0101>{}); /*row_shl:4*/

@@ -3,45 +3,27 @@
 //
 // Generic C-ABI error bridging for aiter ctypes kernels.
 //
-// Problem:  extern "C" functions called via Python ctypes cannot propagate
-//           C++ exceptions -- crossing the C ABI boundary is undefined
-//           behaviour and typically kills the worker process.
-//
-// Solution: Store the last error in a thread-local string + return status code.
-//           Python reads status first, then fetches error from TLS when needed.
-//
-// Design (same as CUDA Driver API / TVM FFI):
-//   - Single extern "C" int entry point per kernel.
-//   - Implementation uses AITER_CHECK / HIP_CALL / throw for errors.
-//   - aiter_safe_call catches everything, stores in TLS, returns -1.
-//   - All callers (C, C++, Python) use the same function and check return code.
+// extern "C" functions called via Python ctypes cannot propagate C++ exceptions
+// across the C ABI (UB, usually kills the worker). Instead store the last error
+// in a thread-local string + return a status code; Python reads the status, then
+// fetches the message from TLS. Same approach as the CUDA Driver API / TVM FFI:
+// one extern "C" int entry point per kernel whose impl uses
+// AITER_CHECK/HIP_CALL/throw, wrapped by aiter_safe_call which catches
+// everything, stores it in TLS, and returns -1.
 //
 // Usage in a .cu file:
-//
 //   #include "aiter_ctypes_error.h"
 //   AITER_CTYPES_ERROR_DEF
+//   // no meaningful return value:
+//   AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(my_kernel, (int a, float b), (a, b))
+//   { AITER_CHECK(a > 0, "a must be positive, got ", a); }
+//   // meaningful int return:
+//   AITER_CTYPES_DEFINE_ENTRYPOINT(getPaddedM, (int M), (M))
+//   { return (M + 255) & ~255; }
 //
-//   // Preferred form for kernels with no meaningful return value:
-//   AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
-//       my_kernel,
-//       (int a, float b),
-//       (a, b))
-//   {
-//       AITER_CHECK(a > 0, "a must be positive, got ", a);
-//   }
-//
-//   // Use the non-VOID form only when returning a meaningful int:
-//   AITER_CTYPES_DEFINE_ENTRYPOINT(
-//       getPaddedM,
-//       (int M),
-//       (M))
-//   {
-//       return (M + 255) & ~255;
-//   }
-//
-// Python side (aiter/jit/core.py _ctypes_call) is already generic:
-//   it probes every .so for aiter_get_last_error / aiter_clear_last_error
-//   and raises RuntimeError automatically -- no per-kernel Python changes.
+// Python side (aiter/jit/core.py _ctypes_call) is generic: it probes every .so
+// for aiter_get_last_error / aiter_clear_last_error and raises RuntimeError --
+// no per-kernel Python changes.
 //
 #pragma once
 #include <string>

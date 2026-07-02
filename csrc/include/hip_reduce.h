@@ -281,11 +281,9 @@ __device__ constexpr T block_reduce(T local, F reduce_op)
     return local;
 }
 
-// ---------------------------------------------------------------------------
-// Fused DPP reduce for float max: generates a single v_max_f32 with DPP
-// modifier instead of separate v_mov_b32_dpp + v_max_f32.
+// Fused DPP reduce for float max: single v_max_f32 with DPP modifier instead
+// of separate v_mov_b32_dpp + v_max_f32.
 // bound_ctrl:1 ensures invalid DPP sources produce 0 (not stale register data).
-// ---------------------------------------------------------------------------
 #define _ASM_DPP_MAX_F32(v, dpp_mod)                                                        \
     do                                                                                      \
     {                                                                                       \
@@ -295,8 +293,7 @@ __device__ constexpr T block_reduce(T local, F reduce_op)
     } while(0)
 
 // Fused DPP reduce for float max with compile-time thread_num.
-// Dead branches eliminated via if constexpr, avoiding ~230 extra
-// instructions from runtime branching in the ISA.
+// if constexpr eliminates dead branches, avoiding runtime-branching ISA bloat.
 template <int thread_num, bool threadBroadcast = true>
 __device__ __forceinline__ float multithread_reduce_max_dpp(float v)
 {

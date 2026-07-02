@@ -70,9 +70,7 @@ void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
                                     float softmax_scale);
 
 #ifdef PA_SPARSE_PREFILL_OPUS_IMPL
-// ============================================================================
 // Implementation section - only compiled in the .cu translation unit
-// ============================================================================
 
 using bf16_t = __bf16;
 using fp16_t = __fp16;
@@ -375,18 +373,14 @@ __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs)
 {
 }
 #else
-// =============================================================================
 // Device-side kernel implementation (gfx950 OPUS, D=512).
 // `pa_sparse_prefill_kargs` / `pa_prefill_*_traits<...>` are provided by the host plumbing above.
-// =============================================================================
 #include <opus/opus.hpp>
 #include <bit>
 
 using opus::operator""_I;
 
-// =============================================================================
 // Variant 16mx8_32nx1 (T_M=NUM_WARPS, T_N=1) — used when H > 32.
-// =============================================================================
 namespace pa_16mx8_32nx1 {
 
 constexpr int MFMA_MASK    = 0x08;
@@ -1499,9 +1493,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
 
-// =============================================================================
 // Variant 16mx1_16nx4 (T_M=1, T_N=NUM_WARPS) — used when H <= 32.
-// =============================================================================
 namespace pa_16mx1_16nx4 {
 
 // Create layout for loading Q matrix from global memory
@@ -1963,9 +1955,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
 
-// =============================================================================
 // Variant 16mx1_16nx4 fp8 (T_M=1, T_N=NUM_WARPS) — split NoPE fp8 / RoPE bf16.
-// =============================================================================
 namespace pa_16mx1_16nx4_fp8 {
 
 template<class T>

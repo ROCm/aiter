@@ -89,12 +89,9 @@ template <typename... Args>
         }                                                                               \
     } while(0)
 
-// Launch-specific HIP error handling.
-// - hipErrorInvalidValue is treated as recoverable because it commonly means
-//   a software configuration problem (for example invalid grid/block dims)
-//   that tuning code can catch and skip without leaving the GPU in a bad state.
-// - All other launch failures remain fatal because they may indicate runtime
-//   or hardware problems after which continuing is unsafe.
+// Launch-specific HIP error handling. hipErrorInvalidValue is recoverable
+// (usually a config problem like bad grid/block dims that tuning code can skip);
+// all other launch failures stay fatal.
 #define HIP_CALL_LAUNCH(call)                                                               \
     do                                                                                      \
     {                                                                                       \
@@ -208,10 +205,9 @@ class AiterAsmKernelFast
                                             nullptr,
                                             nullptr,
                                             nullptr);
-        // Verify registration succeeded. __hipRegisterFunction returns void so
-        // we probe via hipGetFuncBySymbol -- if it returns null the runtime silently
-        // rejected the kernel (e.g. resource limits, arch mismatch). This runs
-        // once per kernel variant at init time, not on every launch.
+        // Verify registration: __hipRegisterFunction returns void, so probe via
+        // hipGetFuncBySymbol -- null means the runtime rejected the kernel (resource
+        // limits, arch mismatch). Runs once per kernel variant at init, not per launch.
         hipFunction_t probe = nullptr;
         (void)hipGetFuncBySymbol(&probe, reinterpret_cast<void*>(this));
         AITER_CHECK(probe != nullptr, "kernel registration failed for '", kernel_name, "'.");
@@ -264,10 +260,8 @@ class AiterAsmKernelFast
                 hipDrvLaunchKernelEx(&launch_config, kernel_func, nullptr, (void**)&config));
             return;
 #else
-            // Cluster dims were requested at runtime, but this build was compiled
-            // without cluster launch support. Fail loudly rather than silently
-            // dropping the cluster configuration (which would launch a plain grid
-            // and produce wrong results for a cluster-aware kernel).
+            // Cluster dims requested but this build lacks cluster launch support.
+            // Fail loudly instead of silently launching a plain grid (wrong results).
             AITER_CHECK(false,
                         "workgroup-cluster launch requested (cluster=",
                         kargs.cluster_x, "x", kargs.cluster_y, "x", kargs.cluster_z,
@@ -300,13 +294,9 @@ class AiterAsmKernel : private AiterAsmKernelFast
                                    const char* data,
                                    size_t size)
     {
-        // The AMDGPU metadata is stored as msgpack in an ELF .note section -- not as
-        // raw ASCII. We scan for the amdhsa kernel descriptor's group_segment_fixed_size
-        // field in the binary kernel descriptor block instead. In the AMDHSA kernel
-        // descriptor (64 bytes at the start of the .text symbol), byte offset 0 is a
-        // uint32_t group_segment_fixed_size. However the most reliable approach without
-        // linking a msgpack parser is to search the raw ELF for the msgpack integer that
-        // follows the "group_segment_fixed_size" msgpack string key.
+        // The AMDGPU metadata is msgpack in an ELF .note section, not raw ASCII.
+        // Rather than link a msgpack parser, search the raw ELF for the msgpack
+        // integer that follows the "group_segment_fixed_size" msgpack string key.
         //
         // Msgpack format for the key: 0xd9 <len8> <bytes> or 0xda <len16> <bytes> or
         // fixstr (0xa0|len) <bytes>. The value follows immediately as a msgpack uint.
@@ -326,9 +316,7 @@ class AiterAsmKernel : private AiterAsmKernelFast
             if(found == end)
                 return;
 
-            // The msgpack value follows the key bytes. Skip any msgpack string prefix
-            // byte (the byte before 'g' in "group_...") was already part of the key
-            // detection; now p points right after the key.
+            // The msgpack value follows the key bytes; vp points right after the key.
             const char* vp = found + key_len;
             if(vp >= end)
                 return;

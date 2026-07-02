@@ -27,9 +27,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt);
 
 #ifdef MOE_SORTING_OPUS_IMPL
-// ============================================================================
 // Implementation section - only compiled in the .cu translation unit
-// ============================================================================
 
 #include <algorithm>
 #include <cstddef>
@@ -253,11 +251,9 @@ struct MoeSortingClearWorkspaceProblem
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__HIP_PLATFORM_AMD__)
 #if defined(__gfx908__) || defined(__gfx906__) || defined(__gfx900__)
-// Explicitly disable for known unsupported architectures
 #define OPUS_HAS_ROW_NEWBCAST 0
 #else
-// Assume support for gfx90a and newer (including all gfx94x and RDNA)
-// This is safer as new architectures typically maintain backward compatibility
+// Assume support for gfx90a and newer (all gfx94x and RDNA)
 #define OPUS_HAS_ROW_NEWBCAST 1
 #endif
 #else

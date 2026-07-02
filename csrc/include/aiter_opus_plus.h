@@ -858,12 +858,11 @@ __device__ void store_vector(opus::gmem<T>& buffer,
     }
 }
 
-// Wait until both the regular load queue and the async-load queue have at most
-// the given number of outstanding entries. A negative count means "don't wait"
-// on that queue: on split-counter archs the corresponding instruction is not
-// emitted, and on the combined-vmcnt arch it is treated as 0 in the sum.
-// gfx9 only has the combined vmcnt, which covers both, so wait on the sum.
-// Other archs (e.g. gfx1250) have split counters, so wait on loadcnt and asynccnt independently.
+// Wait until the load and async-load queues each have at most the given number
+// of outstanding entries. Negative count = don't wait on that queue (instruction
+// omitted on split-counter archs; treated as 0 in the sum on combined-vmcnt).
+// gfx9 has one combined vmcnt (wait on the sum); split-counter archs (e.g. gfx1250)
+// wait on loadcnt and asynccnt independently.
 template <index_t load_cnt, index_t async_load_cnt>
 OPUS_D void s_wait_all_loadcnt(number<load_cnt> = {}, number<async_load_cnt> = {})
 {
