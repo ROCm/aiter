@@ -761,7 +761,7 @@ def _pa_decode_sparse_reduce(
     gl.amd.gfx1250.tdm.async_wait(0)
     m_p = smemM.load(L_KH)  # [KV_SPLITS, BLOCK_H]
     l_p = smemL.load(L_KH)  # [KV_SPLITS, BLOCK_H]
-    a_p = smemAcc.load(BLK3).to(gl.float32)  # [KV_SPLITS, BLOCK_H, BLOCK_D]
+    a_p = smemAcc.load(BLK3)  # [KV_SPLITS, BLOCK_H, BLOCK_D]
 
     m_p = gl.where(seg_active, m_p, neg_inf)
     l_p = gl.where(seg_active, l_p, zero_kh)

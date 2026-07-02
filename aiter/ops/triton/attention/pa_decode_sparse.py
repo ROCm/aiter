@@ -125,8 +125,6 @@ def pa_decode_sparse(
     out = torch.empty_like(q)
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
     assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
-    # kv_indices = kv_indices.to(torch.int32).contiguous()
-    # kv_indptr = kv_indptr.to(torch.int32).contiguous()
 
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).
