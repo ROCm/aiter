@@ -8,6 +8,7 @@ from torch import Tensor
 from ..jit.core import compile_ops
 from typing import Optional
 
+from . import rmsnorm_opus as _opus
 from .rmsnorm_opus import fused_add_rms_norm_opus as _fused_add_rms_norm_opus
 from .rmsnorm_opus import rms_norm_opus as _rms_norm_opus
 
@@ -22,10 +23,13 @@ def get_rmsnorm_backend() -> str:
 def _use_opus(
     input, use_model_sensitive_rmsnorm: int = 0, gemma_norm: bool = False
 ) -> bool:
-    """True when opus can serve this call (plain bf16/fp16, non-quant/T5/gemma)."""
+    """True when opus can serve this call.
+
+    Opus covers bf16/fp16 for the plain, fused-add, dynamic/smooth-quant and T5
+    paths (any hidden). gemma_norm is not supported and falls back to CK/quant.
+    """
     return (
         get_rmsnorm_backend() == "opus"
-        and use_model_sensitive_rmsnorm == 0
         and not gemma_norm
         and input.dtype in (torch.float16, torch.bfloat16)
     )
@@ -103,7 +107,7 @@ def rms_norm(
     """
     if _use_opus(input, use_model_sensitive_rmsnorm):
         out = torch.empty_like(input)
-        _rms_norm_opus(out, input, weight, epsilon)
+        _rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
         return out
     return rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
@@ -116,7 +120,7 @@ def rmsnorm2d_fwd(
 ) -> Tensor:
     if _use_opus(input, use_model_sensitive_rmsnorm):
         out = torch.empty_like(input, dtype=input.dtype, device=input.device)
-        _rms_norm_opus(out, input, weight, epsilon)
+        _rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
         return out
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
@@ -140,7 +144,9 @@ def rmsnorm2d_fwd_with_add(
         # opus kernel is in-place; stage into out/residual_out, leave inputs intact
         out.copy_(input)
         residual_out.copy_(residual_in)
-        _fused_add_rms_norm_opus(out, residual_out, weight, epsilon)
+        _fused_add_rms_norm_opus(
+            out, residual_out, weight, epsilon, use_model_sensitive_rmsnorm
+        )
         return
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         rmsnorm2d_fwd_with_add_ck(
@@ -156,8 +162,8 @@ def rmsnorm2d_fwd_with_add(
         add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon, gemma_norm)
 
 
-@compile_ops("module_rmsnorm")
-def rmsnorm2d_fwd_with_smoothquant(
+@compile_ops("module_rmsnorm", fc_name="rmsnorm2d_fwd_with_smoothquant")
+def rmsnorm2d_fwd_with_smoothquant_ck(
     out: Tensor,
     input: Tensor,
     xscale: Tensor,
@@ -168,8 +174,27 @@ def rmsnorm2d_fwd_with_smoothquant(
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm")
-def rmsnorm2d_fwd_with_add_smoothquant(
+def rmsnorm2d_fwd_with_smoothquant(
+    out: Tensor,
+    input: Tensor,
+    xscale: Tensor,
+    yscale: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    use_model_sensitive_rmsnorm: int = 0,
+) -> None:
+    if _use_opus(input):
+        _opus.rmsnorm2d_fwd_with_smoothquant_opus(
+            out, input, xscale, yscale, weight, epsilon, use_model_sensitive_rmsnorm
+        )
+    else:
+        rmsnorm2d_fwd_with_smoothquant_ck(
+            out, input, xscale, yscale, weight, epsilon, use_model_sensitive_rmsnorm
+        )
+
+
+@compile_ops("module_rmsnorm", fc_name="rmsnorm2d_fwd_with_add_smoothquant")
+def rmsnorm2d_fwd_with_add_smoothquant_ck(
     out: Tensor,
     input: Tensor,
     residual_in: Tensor,
@@ -183,6 +208,46 @@ def rmsnorm2d_fwd_with_add_smoothquant(
 ) -> None: ...
 
 
+def rmsnorm2d_fwd_with_add_smoothquant(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    xscale: Tensor,
+    yscale: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    out_before_quant: Optional[Tensor] = None,
+    use_model_sensitive_rmsnorm: int = 0,
+) -> None:
+    if _use_opus(input):
+        _opus.rmsnorm2d_fwd_with_add_smoothquant_opus(
+            out,
+            input,
+            residual_in,
+            residual_out,
+            xscale,
+            yscale,
+            weight,
+            epsilon,
+            out_before_quant,
+            use_model_sensitive_rmsnorm,
+        )
+    else:
+        rmsnorm2d_fwd_with_add_smoothquant_ck(
+            out,
+            input,
+            residual_in,
+            residual_out,
+            xscale,
+            yscale,
+            weight,
+            epsilon,
+            out_before_quant,
+            use_model_sensitive_rmsnorm,
+        )
+
+
 def rmsnorm2d_fwd_with_dynamicquant(
     out: Tensor,
     input: Tensor,
@@ -193,7 +258,11 @@ def rmsnorm2d_fwd_with_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
-    if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
+    if _use_opus(input) and group_size == 0 and not shuffle_scale:
+        _opus.rmsnorm2d_fwd_with_dynamicquant_opus(
+            out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
+        )
+    elif use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         assert group_size == 0, "group_size is not supported for ck rmsnorm"
         assert not shuffle_scale, "shuffle_scale is not supported for ck rmsnorm"
         rmsnorm2d_fwd_with_dynamicquant_ck(
@@ -215,7 +284,18 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
-    if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
+    if _use_opus(input) and group_size == 0 and not shuffle_scale:
+        _opus.rmsnorm2d_fwd_with_add_dynamicquant_opus(
+            out,
+            input,
+            residual_in,
+            residual_out,
+            yscale,
+            weight,
+            epsilon,
+            use_model_sensitive_rmsnorm,
+        )
+    elif use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         assert group_size == 0, "group_size is not supported for ck rmsnorm"
         assert not shuffle_scale, "shuffle_scale is not supported for ck rmsnorm"
         rmsnorm2d_fwd_with_add_dynamicquant_ck(

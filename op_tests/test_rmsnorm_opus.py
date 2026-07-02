@@ -179,6 +179,66 @@ def report_build_wall():
     )
 
 
+def _fp8_dtype():
+    from aiter import dtypes
+
+    return getattr(dtypes, "fp8", torch.float8_e4m3fn)
+
+
+def run_quant_case(dtype, m, n):
+    """opus vs CK parity for dynamic/smooth quant (int8 + fp8), with fused-add."""
+    x = torch.randn((m, n), dtype=dtype, device="cuda")
+    w = torch.randn(n, dtype=dtype, device="cuda")
+    res = torch.randn((m, n), dtype=dtype, device="cuda")
+    xscale = (torch.rand(n, device="cuda") * 0.3 + 1).float()
+
+    for out_dtype in (torch.int8, _fp8_dtype()):
+        for backend in ("ck", "opus"):
+            _set_backend(backend)
+            out = torch.empty((m, n), dtype=out_dtype, device="cuda")
+            ys = torch.empty((m, 1), dtype=torch.float32, device="cuda")
+            aiter.rmsnorm2d_fwd_with_dynamicquant(out, x, ys, w, 1e-6)
+            if backend == "ck":
+                ck_out, ck_ys = out.float(), ys.clone()
+            else:
+                # opus vs CK: int8 within 1 level, fp8 within a few percent
+                tol = 1.5 if out_dtype == torch.int8 else 0.15
+                checkAllclose(
+                    ck_ys, ys, rtol=5e-3, atol=5e-3, msg=f"dynq yscale {out_dtype}"
+                )
+                checkAllclose(
+                    ck_out,
+                    out.float(),
+                    rtol=tol,
+                    atol=tol,
+                    msg=f"dynq out {out_dtype} [{m},{n}]",
+                )
+
+        # smooth-quant + fused-add + save-unquant parity (opus vs CK)
+        for backend in ("ck", "opus"):
+            _set_backend(backend)
+            out = torch.empty((m, n), dtype=out_dtype, device="cuda")
+            ys = torch.empty((m, 1), dtype=torch.float32, device="cuda")
+            rout = torch.empty_like(x)
+            uq = torch.empty_like(x)
+            aiter.rmsnorm2d_fwd_with_add_smoothquant(
+                out, x, res, rout, xscale, ys, w, 1e-6, out_before_quant=uq
+            )
+            if backend == "ck":
+                ck = (out.float(), ys.clone(), rout.clone(), uq.clone())
+            else:
+                tol = 1.5 if out_dtype == torch.int8 else 0.15
+                checkAllclose(ck[1], ys, rtol=5e-3, atol=5e-3, msg="smoothq yscale")
+                checkAllclose(ck[2], rout, rtol=1e-2, atol=1e-2, msg="smoothq residual")
+                checkAllclose(
+                    ck[0],
+                    out.float(),
+                    rtol=tol,
+                    atol=tol,
+                    msg=f"smoothq out {out_dtype}",
+                )
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -194,6 +254,8 @@ if __name__ == "__main__":
         for dtype in DTYPES:
             for m, n in SHAPES:
                 run_case(dtype, m, n, args.perf)
+            for m, n in ((2048, 8192), (4096, 4096)):
+                run_quant_case(dtype, m, n)
         print("\nrmsnorm_opus: parity vs torch + CK passed for all cases")
     finally:
         if prev is None:
