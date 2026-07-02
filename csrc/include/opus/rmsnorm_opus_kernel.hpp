@@ -74,16 +74,6 @@ template <typename scalar_t>
 __device__ inline scalar_t from_f32(float x)
 { return static_cast<scalar_t>(x); }
 
-// normalized element: (t5 ? round_to_dtype(s*inv) : s*inv) * w
-template <typename scalar_t>
-__device__ inline scalar_t norm_elem(scalar_t s, float inv, scalar_t w, bool t5)
-{
-    float xi = to_f32<scalar_t>(s) * inv;
-    if(t5)
-        xi = to_f32<scalar_t>(from_f32<scalar_t>(xi));
-    return from_f32<scalar_t>(xi * to_f32<scalar_t>(w));
-}
-
 // fp32 -> quant element. int8: round-to-nearest; fp8: hardware e4m3 cvt.
 template <typename out_t>
 __device__ inline out_t quant_cast(float v)
@@ -131,6 +121,7 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
                                      int model_sensitive)
 {
     using V              = vec_t<scalar_t, width>;
+    using Vf             = vec_t<float, width>;
     const bool t5        = model_sensitive != 0;
     const bool add       = residual_ != nullptr;
     const int lane       = opus::thread_id_x();
@@ -140,35 +131,52 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
     const bool active    = row < rows;
     const size_t roff    = (size_t)(active ? row : 0) * hidden;
 
-    auto* out        = reinterpret_cast<scalar_t*>(out_);
-    auto* out_v      = reinterpret_cast<V*>(out + roff);
+    auto* out_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(out_) + roff);
     const auto* in_v = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(in_) + roff);
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
 
-    // s = in (+ residual, written back). Cache in registers; overflow reloads from
-    // the pre-norm buffer (res_v when fused-add, else in_v).
+    // fp32 norm-input, cached in registers (overflow reloads). Fused-add writes
+    // round(x+res) to residual, but the norm keeps the fp32 sum (default) or the
+    // rounded sum (T5, matching vLLM). Non-fused: just f32(in).
     constexpr int CACHE_V = 4;
-    V cache[CACHE_V];
-    float acc   = 0.0f;
-    auto load_s = [&](int idx) -> V {
+    Vf cache[CACHE_V];
+    float acc    = 0.0f;
+    auto load_ni = [&](int idx) -> Vf {
         V x = in_v[idx];
+        Vf ni;
         if(add)
+        {
+            V s;
+#pragma unroll
+            for(int j = 0; j < width; ++j)
+            {
+                float f = to_f32<scalar_t>(x[j]) + to_f32<scalar_t>(res_v[idx][j]);
+                s[j]    = from_f32<scalar_t>(f);
+                ni[j]   = t5 ? to_f32<scalar_t>(s[j]) : f;
+            }
+            res_v[idx] = s;
+        }
+        else
         {
 #pragma unroll
             for(int j = 0; j < width; ++j)
-                x[j] = from_f32<scalar_t>(to_f32<scalar_t>(x[j]) + to_f32<scalar_t>(res_v[idx][j]));
-            res_v[idx] = x;
+                ni[j] = to_f32<scalar_t>(x[j]);
         }
-        return x;
+        return ni;
     };
-    auto sumsq = [&](V s) {
+    auto reload_ni = [&](int idx) -> Vf { // overflow: residual already holds round(sum)
+        V s = add ? res_v[idx] : in_v[idx];
+        Vf ni;
 #pragma unroll
         for(int j = 0; j < width; ++j)
-        {
-            float f = to_f32<scalar_t>(s[j]);
-            acc += f * f;
-        }
+            ni[j] = to_f32<scalar_t>(s[j]);
+        return ni;
+    };
+    auto sumsq = [&](Vf ni) {
+#pragma unroll
+        for(int j = 0; j < width; ++j)
+            acc += ni[j] * ni[j];
     };
     if(active)
     {
@@ -178,24 +186,29 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
             const int idx = lane + k * tpr;
             if(idx < vec_hidden)
             {
-                cache[k] = load_s(idx);
+                cache[k] = load_ni(idx);
                 sumsq(cache[k]);
             }
         }
         for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
-            sumsq(load_s(idx));
+            sumsq(load_ni(idx));
     }
 
     float inv = rsqrtf(block_reduce<false>(acc) / hidden + epsilon);
     if(!active)
         return;
 
-    auto store = [&](V s, int idx) {
+    auto store = [&](Vf ni, int idx) {
         V w = w_v[idx];
         V y;
 #pragma unroll
         for(int j = 0; j < width; ++j)
-            y[j] = norm_elem<scalar_t>(s[j], inv, w[j], t5);
+        {
+            float xi = ni[j] * inv;
+            if(t5)
+                xi = to_f32<scalar_t>(from_f32<scalar_t>(xi));
+            y[j] = from_f32<scalar_t>(xi * to_f32<scalar_t>(w[j]));
+        }
         out_v[idx] = y;
     };
 #pragma unroll
@@ -206,7 +219,7 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
             store(cache[k], idx);
     }
     for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
-        store(add ? res_v[idx] : in_v[idx], idx);
+        store(reload_ni(idx), idx);
 }
 
 template <typename in_t, typename out_t, int width>
@@ -225,6 +238,7 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
 {
     using Vi             = vec_t<in_t, width>;
     using Vo             = vec_t<out_t, width>;
+    using Vf             = vec_t<float, width>;
     const bool add       = residual_ != nullptr;
     const bool smooth    = xscale_ != nullptr;
     const bool save_uq   = unquant_ != nullptr;
@@ -243,27 +257,46 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
     auto* uq_v         = reinterpret_cast<Vi*>(reinterpret_cast<in_t*>(unquant_) + roff);
     const auto* xscale = reinterpret_cast<const float*>(xscale_);
 
+    // fp32 norm-input, cached (see the norm kernel). Fused-add writes round(x+res)
+    // to residual; the norm keeps the fp32 sum (default) or the rounded sum (T5).
     constexpr int CACHE_V = 4;
-    Vi cache[CACHE_V];
-    float acc   = 0.0f;
-    auto load_s = [&](int idx) -> Vi {
+    Vf cache[CACHE_V];
+    float acc    = 0.0f;
+    auto load_ni = [&](int idx) -> Vf {
         Vi x = in_v[idx];
+        Vf ni;
         if(add)
+        {
+            Vi s;
+#pragma unroll
+            for(int j = 0; j < width; ++j)
+            {
+                float f = to_f32<in_t>(x[j]) + to_f32<in_t>(res_v[idx][j]);
+                s[j]    = from_f32<in_t>(f);
+                ni[j]   = t5 ? to_f32<in_t>(s[j]) : f;
+            }
+            res_v[idx] = s;
+        }
+        else
         {
 #pragma unroll
             for(int j = 0; j < width; ++j)
-                x[j] = from_f32<in_t>(to_f32<in_t>(x[j]) + to_f32<in_t>(res_v[idx][j]));
-            res_v[idx] = x;
+                ni[j] = to_f32<in_t>(x[j]);
         }
-        return x;
+        return ni;
     };
-    auto sumsq = [&](Vi s) {
+    auto reload_ni = [&](int idx) -> Vf {
+        Vi s = add ? res_v[idx] : in_v[idx];
+        Vf ni;
 #pragma unroll
         for(int j = 0; j < width; ++j)
-        {
-            float f = to_f32<in_t>(s[j]);
-            acc += f * f;
-        }
+            ni[j] = to_f32<in_t>(s[j]);
+        return ni;
+    };
+    auto sumsq = [&](Vf ni) {
+#pragma unroll
+        for(int j = 0; j < width; ++j)
+            acc += ni[j] * ni[j];
     };
     if(active)
     {
@@ -273,19 +306,19 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
             const int idx = lane + k * tpr;
             if(idx < vec_hidden)
             {
-                cache[k] = load_s(idx);
+                cache[k] = load_ni(idx);
                 sumsq(cache[k]);
             }
         }
         for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
-            sumsq(load_s(idx));
+            sumsq(load_ni(idx));
     }
 
     float inv = rsqrtf(block_reduce<false>(acc) / hidden + epsilon);
 
-    // normalized value at (row, idx*width+j): n = (t5 ? round(s*inv) : s*inv) * w [* xscale]
-    auto norm_j = [&](in_t sval, in_t wval, int col) -> float {
-        float xi = to_f32<in_t>(sval) * inv;
+    // normalized value: n = (t5 ? round(ni*inv) : ni*inv) * w [* xscale]
+    auto norm_j = [&](float ni, in_t wval, int col) -> float {
+        float xi = ni * inv;
         if(t5)
             xi = to_f32<in_t>(from_f32<in_t>(xi));
         float n = xi * to_f32<in_t>(wval);
@@ -295,11 +328,11 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
     float m = 0.0f;
     if(active)
     {
-        auto absmax = [&](Vi s, int idx) {
+        auto absmax = [&](Vf ni, int idx) {
             Vi w = w_v[idx];
 #pragma unroll
             for(int j = 0; j < width; ++j)
-                m = fmaxf(m, fabsf(norm_j(s[j], w[j], idx * width + j)));
+                m = fmaxf(m, fabsf(norm_j(ni[j], w[j], idx * width + j)));
         };
 #pragma unroll
         for(int k = 0; k < CACHE_V; ++k)
@@ -309,7 +342,7 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
                 absmax(cache[k], idx);
         }
         for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
-            absmax(res_v[idx], idx);
+            absmax(reload_ni(idx), idx);
     }
 
     float rowmax = block_reduce<true>(m);
@@ -320,14 +353,14 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
     if(lane == 0)
         reinterpret_cast<float*>(yscale_)[row] = yscale;
 
-    auto quant = [&](Vi s, int idx) {
+    auto quant = [&](Vf ni, int idx) {
         Vi w = w_v[idx];
         Vo q;
         Vi uq;
 #pragma unroll
         for(int j = 0; j < width; ++j)
         {
-            float n = norm_j(s[j], w[j], idx * width + j);
+            float n = norm_j(ni[j], w[j], idx * width + j);
             q[j]    = quant_cast<out_t>(n * inv_ys);
             if(save_uq)
                 uq[j] = from_f32<in_t>(n);
@@ -344,7 +377,7 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
             quant(cache[k], idx);
     }
     for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
-        quant(res_v[idx], idx);
+        quant(reload_ni(idx), idx);
 }
 
 #endif // __HIP_DEVICE_COMPILE__
