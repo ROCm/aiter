@@ -124,8 +124,28 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
     auto* out_v        = reinterpret_cast<V*>(out + (size_t)row * hidden);
     const auto* w_v    = reinterpret_cast<const V*>(weight);
 
+    // Cache the row in registers so the normalize pass does not re-read input
+    // from global (single pass); overflow beyond the cache reloads. CACHE_V is
+    // sized so typical hidden (<= CACHE_V*width*blockDim) stays fully cached.
+    constexpr int CACHE_V = 4;
+    V cache[CACHE_V];
     float acc = 0.0f;
-    for(int idx = tid; idx < vec_hidden; idx += nthreads)
+#pragma unroll
+    for(int k = 0; k < CACHE_V; ++k)
+    {
+        const int idx = tid + k * nthreads;
+        if(idx < vec_hidden)
+        {
+            cache[k] = in_v[idx];
+#pragma unroll
+            for(int j = 0; j < width; ++j)
+            {
+                float f = to_f32<scalar_t>(cache[k][j]);
+                acc += f * f;
+            }
+        }
+    }
+    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
     {
         V x = in_v[idx];
 #pragma unroll
@@ -139,7 +159,22 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
     float var = block_reduce_sum(acc);
     float inv = rsqrtf(var / hidden + epsilon);
 
-    for(int idx = tid; idx < vec_hidden; idx += nthreads)
+#pragma unroll
+    for(int k = 0; k < CACHE_V; ++k)
+    {
+        const int idx = tid + k * nthreads;
+        if(idx < vec_hidden)
+        {
+            V w = w_v[idx];
+            V y;
+#pragma unroll
+            for(int j = 0; j < width; ++j)
+                y[j] = from_f32<scalar_t>(to_f32<scalar_t>(cache[k][j]) * inv *
+                                          to_f32<scalar_t>(w[j]));
+            out_v[idx] = y;
+        }
+    }
+    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
     {
         V x = in_v[idx];
         V w = w_v[idx];
@@ -172,11 +207,12 @@ __global__ void fused_add_rmsnorm2d_fwd_kernel(void* __restrict__ inout_,
     auto* res_v        = reinterpret_cast<V*>(residual + (size_t)row * hidden);
     const auto* w_v    = reinterpret_cast<const V*>(weight);
 
-    float acc = 0.0f;
-    for(int idx = tid; idx < vec_hidden; idx += nthreads)
-    {
-        V x = io_v[idx];
-        V r = res_v[idx];
+    // Cache the pre-norm sum in registers (still written back to residual) so the
+    // normalize pass does not re-read it from global; overflow reloads.
+    constexpr int CACHE_V = 4;
+    V cache[CACHE_V];
+    float acc   = 0.0f;
+    auto add_sq = [&](V x, V r) {
         V s;
 #pragma unroll
         for(int j = 0; j < width; ++j)
@@ -185,22 +221,40 @@ __global__ void fused_add_rmsnorm2d_fwd_kernel(void* __restrict__ inout_,
             s[j]    = from_f32<scalar_t>(f);
             acc += f * f;
         }
-        res_v[idx] = s; // pre-norm residual write-back
+        return s;
+    };
+#pragma unroll
+    for(int k = 0; k < CACHE_V; ++k)
+    {
+        const int idx = tid + k * nthreads;
+        if(idx < vec_hidden)
+        {
+            cache[k]   = add_sq(io_v[idx], res_v[idx]);
+            res_v[idx] = cache[k]; // pre-norm residual write-back
+        }
     }
+    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
+        res_v[idx] = add_sq(io_v[idx], res_v[idx]);
 
     float var = block_reduce_sum(acc);
     float inv = rsqrtf(var / hidden + epsilon);
 
-    for(int idx = tid; idx < vec_hidden; idx += nthreads)
-    {
-        V s = res_v[idx];
-        V w = w_v[idx];
+    auto normalize = [&](V s, V w) {
         V y;
 #pragma unroll
         for(int j = 0; j < width; ++j)
             y[j] = from_f32<scalar_t>(to_f32<scalar_t>(s[j]) * inv * to_f32<scalar_t>(w[j]));
-        io_v[idx] = y;
+        return y;
+    };
+#pragma unroll
+    for(int k = 0; k < CACHE_V; ++k)
+    {
+        const int idx = tid + k * nthreads;
+        if(idx < vec_hidden)
+            io_v[idx] = normalize(cache[k], w_v[idx]);
     }
+    for(int idx = tid + CACHE_V * nthreads; idx < vec_hidden; idx += nthreads)
+        io_v[idx] = normalize(res_v[idx], w_v[idx]);
 }
 
 #endif // __HIP_DEVICE_COMPILE__
