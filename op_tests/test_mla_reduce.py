@@ -351,7 +351,10 @@ def run_case_fast_path(splits_per_tile, num_heads=16, head_dim=512):
     seed = torch.randn_like(p["final_output"])
     for t, s in enumerate(splits_per_tile):
         if s < 2:
-            q0, q1 = p["reduce_final_map"][t, 0].item(), p["reduce_final_map"][t, 1].item()
+            q0, q1 = (
+                p["reduce_final_map"][t, 0].item(),
+                p["reduce_final_map"][t, 1].item(),
+            )
             ref_out[q0:q1] = seed[q0:q1]
 
     num_kv_splits = max(splits_per_tile)
@@ -371,7 +374,9 @@ def run_case_fast_path(splits_per_tile, num_heads=16, head_dim=512):
     )
 
     slow_out = seed.clone()
-    slow_lse = torch.empty(p["num_out_rows"], num_heads, dtype=dtypes.fp32, device="cuda")
+    slow_lse = torch.empty(
+        p["num_out_rows"], num_heads, dtype=dtypes.fp32, device="cuda"
+    )
     run_perftest(
         aiter.mla_reduce_v1,
         p["partial_output"],
@@ -390,10 +395,18 @@ def run_case_fast_path(splits_per_tile, num_heads=16, head_dim=512):
         f" h={num_heads} dv={head_dim} bf16 FASTPATH"
     )
     err_ref = checkAllclose(
-        ref_out.float(), fast_out.float(), rtol=2e-2, atol=2e-2, msg=f"[{tag}] fast vs ref  "
+        ref_out.float(),
+        fast_out.float(),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"[{tag}] fast vs ref  ",
     )
     err_parity = checkAllclose(
-        slow_out.float(), fast_out.float(), rtol=2e-2, atol=2e-2, msg=f"[{tag}] fast vs slow"
+        slow_out.float(),
+        fast_out.float(),
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"[{tag}] fast vs slow",
     )
     ok = (err_ref == 0) and (err_parity == 0)
     print(f"{'PASS' if ok else 'FAIL'}  {tag}  {us_fast:>8.2f} us")
@@ -402,8 +415,8 @@ def run_case_fast_path(splits_per_tile, num_heads=16, head_dim=512):
         sum(splits_per_tile) * num_heads * head_dim * 4  # partial_output f32
         + sum(splits_per_tile) * num_heads * 4  # partial_lse f32
     )
-    write_bytes = p["num_out_rows"] * num_heads * head_dim * (
-        torch.finfo(out_dtype).bits // 8
+    write_bytes = (
+        p["num_out_rows"] * num_heads * head_dim * (torch.finfo(out_dtype).bits // 8)
     )
     bytes_total = read_bytes + write_bytes
 
