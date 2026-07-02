@@ -248,8 +248,18 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr, opus::u32_t neg_
     );
 }
 
+// Mask score columns of a KV tile to -inf where the column's global key position
+// exceeds `ref_pos` (attn_mask_vec2_imm masks a column when rel = ref_pos - k_pos
+// < THR). This single helper unifies the two masking uses, which have identical
+// bodies and differ only in `ref_pos`:
+//   * causal masking: ref_pos = q_pos (= q_start_pos + lane's query row) -> masks
+//     future keys (k_pos > q_pos).
+//   * OOB masking: ref_pos = N - 1 -> masks padding keys past the valid sequence
+//     (k_pos >= N), for arbitrary (non KV_TILE aligned) sequence lengths.
+// `rel` is int->u32 compared via signed `v_cmp_lt_i32`, so negative
+// (ref_pos - k_pos) stays correct. `lane_id` is passed in (used for lane_group).
 template<typename T, typename V>
-__device__ inline void attn_mask_causal_tile(V& v_s, int q_start_pos, int kv_tile_idx, opus::u32_t neg_inf_v, int lane_id) {
+__device__ inline void attn_mask_tile(V& v_s, int ref_pos, int kv_tile_idx, opus::u32_t neg_inf_v, int lane_id) {
     using D_ACC = typename T::D_ACC;
     using D_ACC_X2 = opus::vector_t<D_ACC, 2>;
     using U32_X2 = opus::vector_t<opus::u32_t, 2>;
@@ -259,63 +269,13 @@ __device__ inline void attn_mask_causal_tile(V& v_s, int q_start_pos, int kv_til
     constexpr int c_rept = elems_per_wave_tile / c_pack;
     constexpr int c_rept_stride = (T::WARP_SIZE / T::W_M) * c_pack;
 
-    const int q_pos = q_start_pos + (lane_id % T::W_M);
     const int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE;
     const int lane_group = lane_id / T::W_M;
 
     opus::static_for<T::GEMM0_E_N>([&](auto i_n) {
         constexpr int base_idx = i_n.value * elems_per_wave_tile;
         const int k_pos = k_start_pos + i_n.value * T::W_N + lane_group * c_pack;
-        const opus::u32_t rel = static_cast<opus::u32_t>(q_pos - k_pos);
-
-        opus::static_for<c_rept>([&](auto i_rept) {
-            constexpr int rept_base_idx = base_idx + i_rept.value * c_pack;
-            constexpr int thr_base = i_rept.value * c_rept_stride;
-            opus::static_for<c_pack / 2>([&](auto i_pair) {
-                constexpr int idx = rept_base_idx + i_pair.value * 2;
-                constexpr int thr_x = thr_base + i_pair.value * 2;
-                constexpr int thr_y = thr_x + 1;
-
-                auto pair_acc = opus::slice(v_s, opus::number<idx>{}, opus::number<idx + 2>{});
-                auto pair_bits = __builtin_bit_cast(U32_X2, pair_acc);
-                opus::u32_t x_ref = pair_bits[0];
-                opus::u32_t y_ref = pair_bits[1];
-                attn_mask_vec2_imm<thr_x, thr_y>(rel, neg_inf_v, x_ref, y_ref);
-                pair_bits[0] = x_ref;
-                pair_bits[1] = y_ref;
-                opus::set_slice(v_s, __builtin_bit_cast(D_ACC_X2, pair_bits), opus::number<idx>{}, opus::number<idx + 2>{});
-            });
-        });
-    });
-}
-
-// Mask out-of-bound KV columns (global kv position >= valid_kv_len) to -inf.
-// Mirrors attn_mask_causal_tile, but the comparison is against the last valid KV
-// position instead of the causal diagonal: a score column is masked iff its
-// global kv index exceeds (valid_kv_len - 1). Used for arbitrary (non KV_TILE
-// aligned) sequence lengths, where the final / padded KV tiles read OOB (0 via
-// the buffer-resource bounds) and must not contribute to the softmax.
-template<typename T, typename V>
-__device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_tile_idx, opus::u32_t neg_inf_v) {
-    using D_ACC = typename T::D_ACC;
-    using D_ACC_X2 = opus::vector_t<D_ACC, 2>;
-    using U32_X2 = opus::vector_t<opus::u32_t, 2>;
-
-    constexpr int elems_per_wave_tile = (T::W_M * T::W_N) / T::WARP_SIZE;
-    constexpr int c_pack = 4;
-    constexpr int c_rept = elems_per_wave_tile / c_pack;
-    constexpr int c_rept_stride = (T::WARP_SIZE / T::W_M) * c_pack;
-
-    const int last_valid_kv_pos = valid_kv_len - 1;
-    const int k_start_pos = kv_tile_idx * T::KV_TILE_SIZE;
-    int lane_id = opus::thread_id_x() % T::WARP_SIZE;
-    asm volatile("" : "+v"(lane_id));  // break CSE
-    const int lane_group = lane_id / T::W_M;
-
-    opus::static_for<T::GEMM0_E_N>([&](auto i_n) {
-        constexpr int base_idx = i_n.value * elems_per_wave_tile;
-        const int k_pos = k_start_pos + i_n.value * T::W_N + lane_group * c_pack;
-        const opus::u32_t rel = static_cast<opus::u32_t>(last_valid_kv_pos - k_pos);
+        const opus::u32_t rel = static_cast<opus::u32_t>(ref_pos - k_pos);
 
         opus::static_for<c_rept>([&](auto i_rept) {
             constexpr int rept_base_idx = base_idx + i_rept.value * c_pack;
@@ -357,7 +317,7 @@ __device__ inline void attn_mask_oob_kv_tile(V& v_s, int valid_kv_len, int kv_ti
 // fences and full mma1), just without the steady-state loop. Avoids padding 1-2
 // tiles up to the >=3/4-tile pipeline minimum. Used for causal & non-causal.
 template<class Traits>
-GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum_le2_tiles(opus_gqa_kargs kargs, char* smem_buf) {
+GQA_D128_DRAIN_ATTR __device__ void gqa_d128_le2_tiles(opus_gqa_kargs kargs, char* smem_buf) {
     using namespace opus;
     using namespace gqa_d128;
     using T = opus::remove_cvref_t<Traits>;
@@ -439,13 +399,13 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum_le2_tiles(opus_gqa_kargs karg
     auto kv_tile = [&](int tile_idx) { return tile_idx * kv_tile_stride; };
     auto mask_oob_kv = [&](auto& v_s_tile, int kv_tile_idx) {
         if ((kv_tile_idx + 1) * T::KV_TILE_SIZE > kargs.N) {
-            attn_mask_oob_kv_tile<T>(v_s_tile, kargs.N, kv_tile_idx, neg_inf_v);
+            attn_mask_tile<T>(v_s_tile, kargs.N - 1, kv_tile_idx, neg_inf_v, lane_id);
         }
     };
     auto causal_mask = [&](auto& v_s_tile, int kv_tile_idx) {
         if constexpr (T::CAUSAL) {
             if (q_start_pos < (kv_tile_idx + 1) * T::KV_TILE_SIZE) {
-                attn_mask_causal_tile<T>(v_s_tile, q_start_pos, kv_tile_idx, neg_inf_v, lane_id);
+                attn_mask_tile<T>(v_s_tile, q_start_pos + (lane_id % T::W_M), kv_tile_idx, neg_inf_v, lane_id);
             }
         }
     };
@@ -563,7 +523,7 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum_le2_tiles(opus_gqa_kargs karg
 // compiles exactly ONE drain via `if constexpr (OddTail)`. Unlike the host two-kernel
 // scheme this also covers CAUSAL (per-block parity varies within a launch).
 template<class Traits, bool OddTail>
-GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum(opus_gqa_kargs kargs, char* smem_buf) {
+GQA_D128_DRAIN_ATTR __device__ void gqa_d128_pipelined(opus_gqa_kargs kargs, char* smem_buf) {
     using namespace opus;
     using namespace gqa_d128;
     using T = opus::remove_cvref_t<Traits>;
@@ -696,13 +656,25 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum(opus_gqa_kargs kargs, char* s
     [[maybe_unused]] const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
 
     // Out-of-bound KV masking: mask any score column whose global kv index is
-    // >= N (the partial last real tile and any padded tiles) to -inf before the
-    // softmax. Only the prologue tile 0 and the three epilogue tiles can ever be
-    // partial/OOB, so (matching the causal masking sites) we gate per-tile and
-    // skip fully-in-bound interior tiles, keeping the aligned fast path free.
+    // >= N to -inf before the softmax (the final KV tile is partial when N is not
+    // a multiple of KV_TILE; its OOB columns read 0 via the buffer-resource bounds
+    // and must not enter the softmax). The internal (kv+1)*KV_TILE > N gate makes
+    // this a no-op unless the tile is actually partial.
+    //
+    // *** INVARIANT (correctness) — OOB mask on the FINAL tile only ***
+    // This lambda is now called on the FINAL KV tile ONLY (even-drain max-1,
+    // odd-drain p+2, and the two le2 last-tile sites). That is valid ONLY because
+    //   max_num_tiles == num_kv_tiles  (NO padding):
+    // the `eff <= 2` dispatch routes tiny tile counts to gqa_d128_le2_tiles, so
+    // the `< 3 / < 4` min-pad above is DEAD CODE in this pipelined path and only
+    // the last real tile can ever be OOB. Interior/prologue tiles are always full,
+    // so their OOB masks were removed (they were runtime-gated no-ops anyway).
+    // If even-padding is EVER reintroduced, the removed sites (prologue tile 0,
+    // even-drain max-3 / max-2, odd-drain p+1) MUST be restored — padded trailing
+    // tiles would be OOB and, unmasked, corrupt the softmax (wrong results).
     auto mask_oob_kv = [&](auto& v_s_tile, int kv_tile_idx) {
         if ((kv_tile_idx + 1) * T::KV_TILE_SIZE > kargs.N) {
-            attn_mask_oob_kv_tile<T>(v_s_tile, kargs.N, kv_tile_idx, neg_inf_v);
+            attn_mask_tile<T>(v_s_tile, kargs.N - 1, kv_tile_idx, neg_inf_v, lane_id);
         }
     };
 
@@ -734,10 +706,11 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum(opus_gqa_kargs kargs, char* s
     if constexpr (T::CAUSAL) {
         const int kv_end_pos = T::KV_TILE_SIZE;
         if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[0], q_start_pos, 0, neg_inf_v, lane_id);
+            attn_mask_tile<T>(v_s[0], q_start_pos + (lane_id % T::W_M), 0, neg_inf_v, lane_id);
         }
     }
-    mask_oob_kv(v_s[0], 0);
+    // [OOB last-tile-only] prologue tile 0 is always full here (pipelined path has
+    // num_kv_tiles >= 3); no OOB mask. See mask_oob_kv invariant above.
     m_row = attn_row_max<T>(v_s[0]);
     attn_sub_row<T>(v_s[0], m_row);
     asm volatile("" : "+v"(v_s[0]) ::);
@@ -838,7 +811,7 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum(opus_gqa_kargs kargs, char* s
         if constexpr (T::CAUSAL) {
             const int kv_end_pos = j * T::KV_TILE_SIZE;
             if (q_start_pos < kv_end_pos) {
-                attn_mask_causal_tile<T>(v_s[0], q_start_pos, j - 1, neg_inf_v, lane_id);
+                attn_mask_tile<T>(v_s[0], q_start_pos + (lane_id % T::W_M), j - 1, neg_inf_v, lane_id);
             }
         }
         s_waitcnt_lgkmcnt(0_I);
@@ -906,10 +879,11 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum(opus_gqa_kargs kargs, char* s
     if constexpr (T::CAUSAL) {
         const int kv_end_pos = (max_num_tiles - 2) * T::KV_TILE_SIZE;
         if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[1], q_start_pos, max_num_tiles - 3, neg_inf_v, lane_id);
+            attn_mask_tile<T>(v_s[1], q_start_pos + (lane_id % T::W_M), max_num_tiles - 3, neg_inf_v, lane_id);
         }
     }
-    mask_oob_kv(v_s[1], max_num_tiles - 3);
+    // [OOB last-tile-only] interior tile (max-3) is always full; OOB mask runs
+    // only on the final tile (max-1). See mask_oob_kv invariant above.
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts + T::v_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -964,10 +938,11 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum(opus_gqa_kargs kargs, char* s
     if constexpr (T::CAUSAL) {
         const int kv_end_pos = (max_num_tiles - 1) * T::KV_TILE_SIZE;
         if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[0], q_start_pos, max_num_tiles - 2, neg_inf_v, lane_id);
+            attn_mask_tile<T>(v_s[0], q_start_pos + (lane_id % T::W_M), max_num_tiles - 2, neg_inf_v, lane_id);
         }
     }
-    mask_oob_kv(v_s[0], max_num_tiles - 2);
+    // [OOB last-tile-only] interior tile (max-2) is always full; OOB mask runs
+    // only on the final tile (max-1). See mask_oob_kv invariant above.
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(number<T::v_buffer_load_insts>{});
     __builtin_amdgcn_sched_barrier(0);
@@ -1021,9 +996,11 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum(opus_gqa_kargs kargs, char* s
     if constexpr (T::CAUSAL) {
         const int kv_end_pos = max_num_tiles * T::KV_TILE_SIZE;
         if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[1], q_start_pos, max_num_tiles - 1, neg_inf_v, lane_id);
+            attn_mask_tile<T>(v_s[1], q_start_pos + (lane_id % T::W_M), max_num_tiles - 1, neg_inf_v, lane_id);
         }
     }
+    // Final KV tile (max-1): the only tile that can be partial/OOB (see the
+    // mask_oob_kv invariant above) — keep the OOB mask here.
     mask_oob_kv(v_s[1], max_num_tiles - 1);
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(0_I);
@@ -1093,10 +1070,11 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum(opus_gqa_kargs kargs, char* s
     if constexpr (T::CAUSAL) {
         const int kv_end_pos = (p + 2) * T::KV_TILE_SIZE;
         if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[1], q_start_pos, p + 1, neg_inf_v, lane_id);
+            attn_mask_tile<T>(v_s[1], q_start_pos + (lane_id % T::W_M), p + 1, neg_inf_v, lane_id);
         }
     }
-    mask_oob_kv(v_s[1], p + 1);
+    // [OOB last-tile-only] non-final tile (p+1) is always full; OOB mask runs only
+    // on the final tile (p+2). See mask_oob_kv invariant above.
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(0_I);
     __builtin_amdgcn_sched_barrier(0);
@@ -1147,9 +1125,11 @@ GQA_D128_DRAIN_ATTR __device__ void gqa_d128_accum(opus_gqa_kargs kargs, char* s
     if constexpr (T::CAUSAL) {
         const int kv_end_pos = (p + 3) * T::KV_TILE_SIZE;
         if (q_start_pos < kv_end_pos) {
-            attn_mask_causal_tile<T>(v_s[0], q_start_pos, p + 2, neg_inf_v, lane_id);
+            attn_mask_tile<T>(v_s[0], q_start_pos + (lane_id % T::W_M), p + 2, neg_inf_v, lane_id);
         }
     }
+    // Final KV tile (p+2): the only tile that can be partial/OOB (see the
+    // mask_oob_kv invariant above) — keep the OOB mask here.
     mask_oob_kv(v_s[0], p + 2);
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(0_I);
@@ -1215,7 +1195,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gqa_d128_kernel(opus_gq
         const int causal_tiles = ceil_div(q_block_start + q_block_size, T::KV_TILE_SIZE);
         eff = causal_tiles < eff ? causal_tiles : eff;
     }
-    if (eff <= 2)     gqa_d128_accum_le2_tiles<Traits>(kargs, smem_buf);
-    else if (eff & 1) gqa_d128_accum<Traits, true>(kargs, smem_buf);
-    else              gqa_d128_accum<Traits, false>(kargs, smem_buf);
+    if (eff <= 2)     gqa_d128_le2_tiles<Traits>(kargs, smem_buf);
+    else if (eff & 1) gqa_d128_pipelined<Traits, true>(kargs, smem_buf);
+    else              gqa_d128_pipelined<Traits, false>(kargs, smem_buf);
 }

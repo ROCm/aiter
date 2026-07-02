@@ -115,6 +115,7 @@ def run_fmha_fwd_hd128_bf16_opus(
     causal: bool,
     *,
     seed: int = 0,
+    softmax_scale: Optional[float] = None,
     verify: bool = True,
     bench: bool = True,
 ) -> Optional[dict]:
@@ -123,7 +124,8 @@ def run_fmha_fwd_hd128_bf16_opus(
 
     device = torch.device("cuda", 0)
     q, k, v = _make_inputs(b, n, h, h_kv, d, device, seed=seed)
-    softmax_scale = 1.0 / math.sqrt(d)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(d)
 
     row: dict = {}
     if verify:
@@ -158,28 +160,112 @@ def run_fmha_fwd_hd128_bf16_opus(
 
 
 # ---------------------------------------------------------------------------
-# pytest sweep (CI) — a few shapes incl. non-aligned N, causal + non-causal.
+# Code-path-targeted coverage matrix.
+#
+# Kernel constants: KV_TILE = 64, Q block = NUM_WARPS*Q_TILE = 256.
+# num_kv_tiles = ceil(N/64) selects the accum path:
+#   * num_kv_tiles <= 2  -> le2 fast path (1 or 2 tiles)
+#   * >2 and odd         -> pipelined odd-drain  (gqa_d128_accum<Traits, true>)
+#   * >2 and even        -> pipelined even-drain (gqa_d128_accum<Traits, false>)
+# OOB -inf masking fires only when N % 64 != 0 (partial final tile).
+# For causal, per-Q-block tile count is min(num_kv, (block+1)*4), so a single
+# large-N causal launch can dispatch different parities across blocks.
+#
+# Each entry: (tag, B, N, H, H_KV). Tile count t = ceil(N/64) is added to the id.
 # ---------------------------------------------------------------------------
 
-_PYTEST_SHAPES = [
-    # (B, N, H, H_KV)
-    (1, 128, 8, 2),
-    (2, 100, 16, 4),
-    (1, 1023, 8, 8),
-    (1, 257, 16, 1),
+_COVERAGE = [
+    # --- (1) le2 fast path, 1 tile (N <= 64) ---
+    ("le2_1t", 1, 1, 8, 2),
+    ("le2_1t", 1, 2, 8, 2),
+    ("le2_1t", 2, 16, 16, 4),
+    ("le2_1t_mha", 1, 32, 8, 8),
+    ("le2_1t_mqa", 1, 63, 8, 1),
+    ("le2_1t_aln", 2, 64, 16, 4),  # aligned, no OOB
+    # --- (2) le2 fast path, 2 tiles (64 < N <= 128) ---
+    ("le2_2t", 1, 65, 8, 2),  # partial tile 1
+    ("le2_2t_part", 2, 100, 16, 4),
+    ("le2_2t_mqa", 1, 127, 8, 1),
+    ("le2_2t_aln", 2, 128, 16, 4),  # aligned
+    # --- (3) pipelined odd-drain (odd num_kv_tiles > 2) ---
+    ("odd3_part", 2, 129, 16, 4),  # t=3
+    ("odd5_part", 2, 257, 16, 4),  # t=5
+    ("odd5_aln_mha", 1, 320, 8, 8),  # t=5 aligned
+    ("odd7_part", 2, 385, 16, 4),  # t=7
+    ("odd7_aln", 2, 448, 16, 4),  # t=7 aligned
+    # --- (4) pipelined even-drain (even num_kv_tiles > 2) ---
+    ("even4_part", 2, 200, 16, 4),  # t=4
+    ("even4_aln", 2, 256, 16, 4),  # t=4 aligned
+    ("even6_part", 1, 340, 16, 4),  # t=6
+    ("even6_aln", 1, 384, 8, 2),  # t=6 aligned
+    ("even8_aln", 2, 512, 16, 4),  # t=8 aligned
+    # --- (5)+(6)+(7) partial-last / aligned / large-N ---
+    ("part16", 1, 1000, 16, 4),  # t=16 partial
+    ("part16_mha", 1, 1023, 8, 8),  # t=16 partial
+    ("aln16", 1, 1024, 8, 2),  # t=16 aligned
+    ("large32", 1, 2048, 8, 2),  # t=32
+    ("aln64", 2, 4096, 16, 4),  # t=64 aligned
+    ("odd65_part", 1, 4097, 8, 2),  # t=65 partial; causal -> per-block parity mix
+    ("large128", 1, 8192, 8, 2),  # t=128 steady-state
+    # --- (9) GQA group variety (at N=300 -> t=5 odd partial) ---
+    ("gqa_4to1", 1, 300, 4, 1),
+    ("gqa_8to2", 2, 300, 8, 2),
+    ("gqa_16to2", 1, 300, 16, 2),
+    ("gqa_64to8", 1, 300, 64, 8),
+    # --- (8) large B*N (big 64-bit offsets, verifiable size) ---
+    ("bignhd", 4, 2048, 8, 2),  # t=32
 ]
 
 
+def _cid(case) -> str:
+    tag, b, n, h, h_kv = case
+    return f"{tag}-b{b}n{n}h{h}kv{h_kv}-t{(n + 63) // 64}"
+
+
 @pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize(
-    "b,n,h,h_kv",
-    _PYTEST_SHAPES,
-    ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
-)
-def test_fmha_fwd_hd128_bf16_opus(b, n, h, h_kv, causal):
+@pytest.mark.parametrize("case", _COVERAGE, ids=_cid)
+def test_fmha_fwd_hd128_bf16_opus(case, causal):
+    _tag, b, n, h, h_kv = case
     run_fmha_fwd_hd128_bf16_opus(
         b=b, n=n, h=h, h_kv=h_kv, d=128, causal=causal, verify=True, bench=False
     )
+
+
+# --- (11) non-default softmax_scale ---
+@pytest.mark.parametrize("causal", [True, False])
+def test_fmha_fwd_hd128_bf16_opus_scale(causal):
+    run_fmha_fwd_hd128_bf16_opus(
+        b=2,
+        n=257,
+        h=16,
+        h_kv=4,
+        d=128,
+        causal=causal,
+        softmax_scale=0.1,
+        verify=True,
+        bench=False,
+    )
+
+
+# --- (8) genuine 32-bit element-offset overflow guard (no fp32 ref: too large) ---
+def test_fmha_fwd_hd128_bf16_opus_int64_offset():
+    if _skip_if_unsupported(d=128):
+        return
+    # (B-1)*N*H*D must exceed INT_MAX (2^31). Here 63*4096*128*128 ~= 4.2e9 > 2.147e9.
+    b, n, h, h_kv, d = 64, 4096, 128, 8, 128
+    try:
+        free, _ = torch.cuda.mem_get_info()
+    except Exception:
+        free = 0
+    need = 4 * b * n * d * (h + h_kv) * 2  # q+out+k+v bytes, ~2x headroom
+    if free < need:
+        pytest.skip(f"insufficient GPU memory (free={free}, need~={need})")
+    device = torch.device("cuda", 0)
+    q, k, v = _make_inputs(b, n, h, h_kv, d, device, seed=0)
+    out = fmha_fwd_hd128_bf16_opus(q, k, v, causal=False)
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all(), "NaN/Inf output (offset overflow?)"
+    assert out.abs().float().sum().item() > 0.0, "all-zero output (offset overflow?)"
 
 
 # ---------------------------------------------------------------------------
