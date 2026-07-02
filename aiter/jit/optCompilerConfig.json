@@ -312,9 +312,11 @@
             "f'{AITER_CSRC_DIR}/opus_gemm/opus_gemm.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [
-            "'-mllvm --amdgpu-mfma-vgpr-form'"
-        ],
+  "flags_extra_hip": [
+   "'-mllvm --amdgpu-mfma-vgpr-form'",
+   "('-mllvm -amdgpu-expert-scheduling-mode' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')",
+   "('-mllvm -enable-post-misched=1' if (get_gfx() == 'gfx1250' or 'gfx1250' in os.environ.get('GPU_ARCHS', '')) else '')"
+  ],
         "flags_extra_hip_per_source": {
             "*.device.cu": ["-D__HIPCC_RTC__"]
         },
