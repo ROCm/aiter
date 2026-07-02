@@ -55,12 +55,8 @@ class All2AllManagerBase:
         self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))
 
     def get_handle(self, kwargs):
-        # get a handle for the all2all communication,
-        # based on the kwargs.
-        # different layers can have different configs,
-        # e.g. one layer has hidden size 1024, another has 2048.
-        # usually the underlying implementation caches the handle
-        # and reuse it for the same config.
+        # Get an all2all handle keyed on kwargs (layers differ, e.g. hidden size
+        # 1024 vs 2048); the implementation usually caches/reuses per config.
         raise NotImplementedError
 
     def dispatch(

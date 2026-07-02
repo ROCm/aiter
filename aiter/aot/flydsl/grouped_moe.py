@@ -383,12 +383,10 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         )
 
     # --- Epilogue: token-order gather-reduce (bf16/f16 fast path only) ---
-    # split_k mirrors stage2's split_k2: when split_k2 > 1 the GEMM emits an
-    # unreduced (split_k, E, max_m, model_dim) tensor and gather-reduce folds the
-    # split slices itself, so its kernel identity depends on split_k. Hardcoding
-    # 1 here makes the token=1 / split_k2>1 CSV rows miss the AOT cache at
-    # inference. vec width is token-count dependent at runtime; cover both so
-    # run-only coverage holds across inference batch sizes, not just the CSV token.
+    # split_k mirrors stage2's split_k2: split_k2>1 emits an unreduced
+    # (split_k, E, max_m, model_dim) tensor gather-reduce folds itself, so its
+    # kernel identity depends on split_k (don't hardcode 1). vec width is
+    # token-count dependent; cover both (2, 4) to span inference batch sizes.
     split_k = job["split_k2"]
     for vec in (2, 4):
         gather_reduce = build_moe_gather_reduce_module(

@@ -444,11 +444,8 @@ class CustomAllreduce:
 
         self.disabled = False
         self.enable_register_for_capturing = enable_register_for_capturing
-        # This is a buffer for storing the tuples of pointers pointing to
-        # IPC buffers from all ranks. Each registered tuple has size of
-        # 8*world_size bytes where world_size is at most 8. Allocating 8MB
-        # is enough for 131072 such tuples. The largest model I've seen only
-        # needs less than 10000 of registered tuples.
+        # Buffer for tuples of per-rank IPC buffer pointers. Each tuple is
+        # 8*world_size bytes (world_size <= 8); 8MB holds 131072 tuples.
         self.rank_data = torch.empty(
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )

@@ -1,26 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# This file is a pure Python wrapper for the NCCL library.
-# The main purpose is to use NCCL combined with CUDA graph.
-# Before writing this script, we tried the following approach:
-# 1. We tried to use `cupy`, it calls NCCL correctly, but `cupy` itself
-#  often gets stuck when initializing the NCCL communicator.
-# 2. We tried to use `torch.distributed`, but `torch.distributed.all_reduce`
-#  contains many other potential cuda APIs, that are not allowed during
-#  capturing the CUDA graph. For further details, please check
-# https://discuss.pytorch.org/t/pytorch-cudagraph-with-nccl-operation-failed/ .
-#
-# Another rejected idea is to write a C/C++ binding for NCCL. It is usually
-# doable, but we often encounter issues related with nccl versions, and need
-# to switch between different versions of NCCL. See
-# https://github.com/NVIDIA/nccl/issues/1234 for more details.
-# A C/C++ binding is not flexible enough to handle this. It requires
-# recompilation of the code every time we want to switch between different
-# versions. This current implementation, with a **pure** Python wrapper, is
-# more flexible. We can easily switch between different versions of NCCL by
-# changing the environment variable `VLLM_NCCL_SO_PATH`, or the `so_file`
-# variable in the code.
+# Pure Python wrapper for NCCL, so NCCL can be used with CUDA graphs.
+# Rejected alternatives: cupy (hangs on NCCL comm init); torch.distributed
+# (all_reduce uses cuda APIs disallowed during graph capture, see
+# https://discuss.pytorch.org/t/pytorch-cudagraph-with-nccl-operation-failed/);
+# a C/C++ binding (needs recompilation to switch NCCL versions). A pure Python
+# wrapper lets us switch NCCL versions via env VLLM_NCCL_SO_PATH / the so_file var.
 
 import ctypes
 import platform
@@ -31,9 +17,7 @@ import torch
 from torch.distributed import ReduceOp
 from aiter import logger
 
-
-# === export types and functions from nccl to Python ===
-# for the original nccl definition, please check
+# NCCL types/functions exported to Python; original defs:
 # https://github.com/NVIDIA/nccl/blob/master/src/nccl.h.in
 
 ncclResult_t = ctypes.c_int
@@ -407,11 +391,7 @@ class NCCLLibrary:
         comm: ncclComm_t,
         stream: cudaStream_t,
     ) -> None:
-        # `datatype` actually should be `ncclDataType_t`
-        # and `op` should be `ncclRedOp_t`
-        # both are aliases of `ctypes.c_int`
-        # when we pass int to a function, it will be converted to `ctypes.c_int`
-        # by ctypes automatically
+        # datatype/op are ncclDataType_t/ncclRedOp_t (ctypes.c_int aliases); ints auto-convert
         self.NCCL_CHECK(
             self._funcs["ncclAllReduce"](
                 sendbuff, recvbuff, count, datatype, op, comm, stream
@@ -429,11 +409,7 @@ class NCCLLibrary:
         comm: ncclComm_t,
         stream: cudaStream_t,
     ) -> None:
-        # `datatype` actually should be `ncclDataType_t`
-        # and `op` should be `ncclRedOp_t`
-        # both are aliases of `ctypes.c_int`
-        # when we pass int to a function, it will be converted to `ctypes.c_int`
-        # by ctypes automatically
+        # datatype/op are ncclDataType_t/ncclRedOp_t (ctypes.c_int aliases); ints auto-convert
         self.NCCL_CHECK(
             self._funcs["ncclReduce"](
                 sendbuff, recvbuff, count, datatype, op, root, comm, stream
@@ -450,11 +426,7 @@ class NCCLLibrary:
         comm: ncclComm_t,
         stream: cudaStream_t,
     ) -> None:
-        # `datatype` actually should be `ncclDataType_t`
-        # and `op` should be `ncclRedOp_t`
-        # both are aliases of `ctypes.c_int`
-        # when we pass int to a function, it will be converted to `ctypes.c_int`
-        # by ctypes automatically
+        # datatype/op are ncclDataType_t/ncclRedOp_t (ctypes.c_int aliases); ints auto-convert
         self.NCCL_CHECK(
             self._funcs["ncclReduceScatter"](
                 sendbuff, recvbuff, count, datatype, op, comm, stream
@@ -470,10 +442,7 @@ class NCCLLibrary:
         comm: ncclComm_t,
         stream: cudaStream_t,
     ) -> None:
-        # `datatype` actually should be `ncclDataType_t`
-        # which is an aliases of `ctypes.c_int`
-        # when we pass int to a function, it will be converted to `ctypes.c_int`
-        # by ctypes automatically
+        # datatype is ncclDataType_t (ctypes.c_int alias); ints auto-convert
         self.NCCL_CHECK(
             self._funcs["ncclAllGather"](
                 sendbuff, recvbuff, count, datatype, comm, stream

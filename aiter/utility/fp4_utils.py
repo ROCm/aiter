@@ -52,29 +52,20 @@ def mxfp4_to_f32(x):
     return mxfp4_in_f32[x.long()]
 
 
-# ---------------------------------------------------------------------------
-# MX-format E8M0 block-scale: generic + dtype-tagged API
-#
-# The four scale rounding modes (FLOOR / RCEIL / CEIL / EVEN) are dtype-
-# agnostic across the whole MX format family (mxfp4 / mxfp6 / mxfp8 /
-# mxint8). Only ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants
-# differ between dtypes. This mirrors PyTorch torchao's
-# ``to_mx(scaling_mode, elem_dtype)`` design, the HIP-side
-# ``MxScaleRoundMode`` enum (csrc/include/mx_quant_utils.h) and the
-# FlyDSL IR-builder helpers in
-# ``aiter/ops/flydsl/kernels/quant_utils.py::emit_mx_e8m0_scale``.
-# ---------------------------------------------------------------------------
+# MX-format E8M0 block-scale: generic + dtype-tagged API.
+# The four rounding modes (FLOOR/RCEIL/CEIL/EVEN) are dtype-agnostic across the MX
+# family (mxfp4/mxfp6/mxfp8/mxint8); only target_max_pow2/max_pos/mbits differ.
+# Mirrors torchao to_mx(scaling_mode, elem_dtype), the HIP MxScaleRoundMode enum
+# (csrc/include/mx_quant_utils.h), and FlyDSL emit_mx_e8m0_scale.
 
 
-# ``MxScaleRoundMode`` and ``MxDtype`` live in :mod:`aiter.utility.mx_types`
-# (single source of truth across HIP / Python ops / CPU ref / FlyDSL).
+# MxScaleRoundMode / MxDtype live in aiter.utility.mx_types (single source of truth).
 # Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos, mbits)
 # - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
 # - max_pos = max_normal(dtype) (e.g. 6.0 for fp4 e2m1, 448.0 for fp8 e4m3)
 # - mbits = mantissa bits of the target dtype (used only by EVEN mode)
-# Keyed by bare int (MxDtypeInt) so this dict can be built at import time
-# without triggering the pybind11 JIT build of module_aiter_core -- same
-# pattern as ``aiter/ops/flydsl/kernels/quant_utils.py::_DTYPE_CFG``.
+# Keyed by bare int (MxDtypeInt) so the dict builds at import time without the
+# pybind11 JIT build of module_aiter_core (same as quant_utils.py::_DTYPE_CFG).
 _DTYPE_CFG = {
     MxDtypeInt.FP4_E2M1: (2, 6.0, 1),  # OCP MXFP4 / DSv4 / FlashInfer
     MxDtypeInt.FP8_E4M3: (8, 448.0, 3),  # OCP / NVIDIA H100 / gfx950+ (e4m3fn)
@@ -172,13 +163,10 @@ def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
     )
 
 
-# ---------------------------------------------------------------------------
 # Low-level implementation used by the generic dispatcher above.
-#
-# ``_f32_to_e8m0_floor_impl`` and ``_f32_to_e8m0_ceil_impl`` are the only
-# two primitives that touch the f32 bit pattern; they take an
-# already-divided value (``amax / divisor``) and emit the biased exponent.
-# ---------------------------------------------------------------------------
+# _f32_to_e8m0_floor_impl / _f32_to_e8m0_ceil_impl are the only primitives that
+# touch the f32 bit pattern; they take an already-divided value (amax / divisor)
+# and emit the biased exponent.
 
 
 def _f32_to_e8m0_floor_impl(x: Tensor) -> Tensor:

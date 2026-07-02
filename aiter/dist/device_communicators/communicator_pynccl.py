@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-# ===================== import region =====================
+# imports
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
@@ -151,9 +151,7 @@ class PyNcclCommunicator:
     ) -> torch.Tensor:
         if self.disabled:
             return None
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert in_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {in_tensor.device}"
@@ -180,9 +178,7 @@ class PyNcclCommunicator:
     ):
         if self.disabled:
             return
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert input_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
@@ -207,9 +203,7 @@ class PyNcclCommunicator:
     ):
         if self.disabled:
             return
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert input_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
@@ -242,9 +236,7 @@ class PyNcclCommunicator:
     ):
         if self.disabled:
             return
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert input_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
@@ -271,9 +263,7 @@ class PyNcclCommunicator:
     ):
         if self.disabled:
             return
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
+        # nccl comm only works on tensors on its bound device (else illegal memory access)
         assert input_tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"

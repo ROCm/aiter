@@ -1005,16 +1005,11 @@ def _flydsl_stage2_wrapper(
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
         inter_dim_pad, model_dim_pad, bias2
     )
-    # `parsed` is the static per-kernel params dict registered at
-    # import time by `get_flydsl_stage2_kernels` (see
-    # aiter/ops/flydsl/moe_kernels.py) and pre-populated into
-    # `_KERNEL_PARAMS` by `_register_all_configs()`. Variant-specific
-    # knobs that live on the kernel name (e.g. the
-    # `..._persist_async_w4_cumul3` production variant adds
-    # `use_async_copy=True / waves_per_eu=4 / cu_num_mul=3`) are
-    # already baked into this dict, so the `parsed.get(..., default)`
-    # calls below pick up the registered values for that kernel name
-    # rather than always falling back to defaults.
+    # `parsed` is the static per-kernel params dict registered at import time by
+    # `get_flydsl_stage2_kernels` (aiter/ops/flydsl/moe_kernels.py). Variant knobs
+    # encoded in the kernel name (e.g. `..._persist_async_w4_cumul3` sets
+    # use_async_copy=True / waves_per_eu=4 / cu_num_mul=3) are baked in here, so the
+    # `parsed.get(..., default)` calls below pick up the registered values.
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
@@ -1539,11 +1534,8 @@ def get_2stage_cfgs(
         and is_flydsl_available()
     ):
         # Heuristic kernel dispatch for a16wi4 (bf16 activations, packed int4 weights
-        # with groupwise scale). Tile sizes and k-split are chosen based on problem
-        # dimensions to balance occupancy and memory bandwidth:
-        #   - _tile_m: scales with token count to improve utilization at larger batch sizes
-        #   - _tile_n/_tile_k: fixed at 128, tuned for int4 weight packing granularity
-        #   - _ksplit: partitions the K dimension across workgroups for large reductions
+        # with groupwise scale): _tile_m scales with token count; _tile_n/_tile_k
+        # fixed at 128 (int4 packing granularity); _ksplit partitions K for large reductions.
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = 128

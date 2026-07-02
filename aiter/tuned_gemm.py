@@ -48,20 +48,13 @@ except Exception:
     _opus_tune = None
     _opus_workspace_init = None
 
-# Every opus split-K arch (gfx950 / gfx942 / gfx1250) owns a per-stream fp32
-# workspace (process-global `opus_splitk_ws_get` registry, backed by raw
-# hipMalloc) that must be registered AND grown to the shape's size *eagerly*
-# before HIP graph capture -- hipMalloc/hipFree are stream-capture-illegal, so a
-# grow inside capture aborts the capture, leaving an empty graph whose replay
-# silently writes zeros (garbage logits). torch.cuda.graph captures on a
-# process-global stream (`torch.cuda.graphs.graph.default_capture_stream`) when
-# no explicit stream is passed (the vLLM/ATOM CUDAGraphWrapper case); we warm
-# that stream here during the eager pass so a later capture of the same shape
-# finds a ready workspace. (The opus launcher reads a stable device-resident
-# handle, so the captured graph stays valid across replays / post-capture grows
-# -- which is exactly why opus keeps a persistent workspace instead of a
-# per-call hipMallocAsync that would not survive capture; the only cost is this
-# one-time warm.)
+# Every opus split-K arch (gfx950/gfx942/gfx1250) owns a per-stream fp32 workspace
+# (process-global `opus_splitk_ws_get` registry, raw hipMalloc) that must be grown
+# eagerly before HIP graph capture: hipMalloc/hipFree are stream-capture-illegal, so
+# a grow inside capture aborts it -> empty graph -> replay writes zeros. torch.cuda.graph
+# uses a process-global default_capture_stream when no stream is passed (vLLM/ATOM
+# CUDAGraphWrapper), so we warm that stream eagerly. The launcher reads a stable
+# device-resident handle, so the graph stays valid across replays/post-capture grows.
 _OPUS_WS_ARCHS = {"gfx950", "gfx942", "gfx1250"}
 _opus_ws_warmed_sigs = set()
 

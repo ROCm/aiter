@@ -29,9 +29,7 @@ NV Triton, DSv4, FlashInfer, and AMD Quark ``RoundMode``.
 from ..jit.core import compile_ops
 
 
-# --------------------------------------------------------------------------
 # Plain-int mirror classes (JIT-free; safe at PREBUILD_KERNELS / AOT time).
-# --------------------------------------------------------------------------
 class MxScaleRoundModeInt:
     """Bare-int mirror of C++ ``MxScaleRoundMode`` (mx_quant_utils.h).
 
@@ -54,24 +52,17 @@ class MxDtypeInt:
     FP8_E4M3_FNUZ = 2
 
 
-# --------------------------------------------------------------------------
 # Project-wide default round mode (Python single source of truth).
-# Must match ``kDefaultMxScaleRoundMode`` in ``mx_quant_utils.h``; the
-# drift check in ``__getattr__`` below and in ``test_quant_mxfp4.py``
-# verifies this at runtime.
-# --------------------------------------------------------------------------
+# Must match ``kDefaultMxScaleRoundMode`` in ``mx_quant_utils.h``; drift checked
+# at runtime in ``__getattr__`` below and in ``test_quant_mxfp4.py``.
 MX_DEFAULT_ROUND_MODE = MxScaleRoundModeInt.RoundUp
 
 
-# --------------------------------------------------------------------------
 # Lazy pybind11 enum loading.
-# --------------------------------------------------------------------------
 # ``_MxScaleRoundMode`` / ``_MxDtype`` are listed in
-# ``aiter/jit/utils/torch_guard.py::NONE_WRAPPED_OP`` so the ``@compile_ops``
-# decorator skips the ``torch.library.infer_schema`` step. ``@compile_ops``
-# itself only registers the function for lazy JIT; it does **not** build
-# ``module_aiter_core`` at decoration time. The build only fires when the
-# wrapped function is *called*, which we defer to :func:`__getattr__`.
+# ``aiter/jit/utils/torch_guard.py::NONE_WRAPPED_OP`` so ``@compile_ops`` skips
+# ``torch.library.infer_schema``. ``@compile_ops`` only registers for lazy JIT;
+# the ``module_aiter_core`` build fires on first call, deferred to ``__getattr__``.
 @compile_ops("module_aiter_core", "MxScaleRoundMode")
 def _MxScaleRoundMode(dummy): ...
 
