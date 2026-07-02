@@ -56,6 +56,14 @@ WARP = 64
 NUM_WAVES = NUM_THREADS // WARP
 OCC = 8
 MASSIVE_THR = 4  # kMassiveThreshold
+# Persistent-launch grid = num_cu * PS_GRID_MULT. HIP uses num_cu*kOccupancy*2
+# (=16 here), but the FlyDSL Tier.ALL kernel runs at occupancy 1 wave/SIMD
+# (193 VGPR from the shared massive path), so that 16x grid is ~8x oversubscribed
+# on the sparse serving profile: thousands of blocks do one sentinel s_load then
+# terminate, and at occupancy 1 that latency cannot hide. grid=num_cu (mult=1)
+# trims the wasted blocks (grid-stride still covers any input; dense MLDS is
+# bandwidth-bound and unchanged). Overridable via MLA_PS_GRID_MULT for sweeps.
+PS_GRID_MULT = 1
 
 
 def _out_t(out_dtype: str):
@@ -919,8 +927,9 @@ def compile_mla_reduce(
         idx_H = fx.Index(H)
         idx_ntg = fx.arith.index_cast(T.index, _to_raw(max_seqlen_q))
         if fx.const_expr(persistent):
+            _ps_mult = int(os.environ.get("MLA_PS_GRID_MULT", PS_GRID_MULT))
             ps_grid = fx.arith.muli(
-                _to_raw(max_splits), fx.arith.constant(OCC * 2, type=T.i32)
+                _to_raw(max_splits), fx.arith.constant(_ps_mult, type=T.i32)
             )
             idx_grid = fx.arith.index_cast(T.index, ps_grid)
             grid = (idx_grid, fx.Index(1), fx.Index(1))
