@@ -54,6 +54,20 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out,
                                        float qmax,
                                        int model_sensitive);
 
+// Bit-exact (vs CK) rmsnorm, optional fused-add. Replicates CK's reduction order
+// for CK's tile geometry: TN threads/row own RN vectors (width 8) each; sum-of-
+// squares is a paired intra-thread sum + butterfly xor within the warp + a
+// cross-warp tree over TN/64 warps. Reproduces CK's square_sum bit-for-bit.
+template <typename scalar_t, int TN, int RN>
+__global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out,
+                                        const void* __restrict__ in,
+                                        const void* __restrict__ weight,
+                                        void* __restrict__ residual,
+                                        float epsilon,
+                                        int rows,
+                                        int hidden,
+                                        int model_sensitive);
+
 #if !defined(__HIP_DEVICE_COMPILE__)
 // Host pass: empty stubs so the __device_stub__ symbols resolve.
 template <typename scalar_t, int width>
@@ -63,6 +77,11 @@ __global__ void rmsnorm2d_fwd_kernel(void*, const void*, const void*, void*, flo
 template <typename in_t, typename out_t, int width>
 __global__ void rmsnorm2d_quant_kernel(
     void*, void*, void*, const void*, const void*, void*, const void*, float, int, int, float, int)
+{
+}
+template <typename scalar_t, int TN, int RN>
+__global__ void
+rmsnorm2d_fwd_be_kernel(void*, const void*, const void*, void*, float, int, int, int)
 {
 }
 #else
@@ -109,6 +128,126 @@ __device__ inline float block_reduce(float v)
 
 template <typename scalar_t, int width>
 using vec_t = scalar_t __attribute__((ext_vector_type(width)));
+
+template <typename scalar_t, int TN, int RN>
+__global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
+                                        const void* __restrict__ in_,
+                                        const void* __restrict__ weight_,
+                                        void* __restrict__ residual_,
+                                        float epsilon,
+                                        int rows,
+                                        int hidden,
+                                        int model_sensitive)
+{
+    using V           = vec_t<scalar_t, 8>;
+    using Vf          = vec_t<float, 8>;
+    const bool t5     = model_sensitive != 0;
+    const bool add    = residual_ != nullptr;
+    const int nx      = opus::thread_id_x(); // 0..TN-1, thread within row
+    const int row     = opus::block_id_x() * opus::block_size_y() + opus::thread_id_y();
+    const bool active = row < rows;
+    const size_t roff = (size_t)(active ? row : 0) * hidden;
+
+    auto* out_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(out_) + roff);
+    const auto* in_v = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(in_) + roff);
+    const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
+    auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
+
+    // norm-input in fp32; fused-add writes round(x+res) to residual, keeps fp32
+    // sum (default) or rounded sum (T5) for the norm.
+    Vf ni[RN];
+#pragma unroll
+    for(int q = 0; q < RN; ++q)
+    {
+        V x = in_v[nx + q * TN];
+        if(add)
+        {
+            V s;
+#pragma unroll
+            for(int j = 0; j < 8; ++j)
+            {
+                float f  = to_f32<scalar_t>(x[j]) + to_f32<scalar_t>(res_v[nx + q * TN][j]);
+                s[j]     = from_f32<scalar_t>(f);
+                ni[q][j] = t5 ? to_f32<scalar_t>(s[j]) : f;
+            }
+            res_v[nx + q * TN] = s;
+        }
+        else
+        {
+#pragma unroll
+            for(int j = 0; j < 8; ++j)
+                ni[q][j] = to_f32<scalar_t>(x[j]);
+        }
+    }
+
+    // intra-thread squared-sum in CK's order: T5 pipeline sums in pairs
+    // (a0^2+a1^2), the default pipeline sums one element at a time.
+    float sq = 0.0f;
+    if(t5)
+    {
+#pragma unroll
+        for(int q = 0; q < RN; ++q)
+#pragma unroll
+            for(int j = 0; j < 8; j += 2)
+                sq += ni[q][j] * ni[q][j] + ni[q][j + 1] * ni[q][j + 1];
+    }
+    else
+    {
+#pragma unroll
+        for(int q = 0; q < RN; ++q)
+#pragma unroll
+            for(int j = 0; j < 8; ++j)
+                sq += ni[q][j] * ni[q][j];
+    }
+
+    // within-warp butterfly over the row's TN-lane group
+    const int lane = opus::lane_id();
+#pragma unroll
+    for(int k = 1; k < TN && k < 64; k <<= 1)
+        sq += opus::shfl(sq, lane ^ k);
+
+    float total;
+    if constexpr(TN > 64)
+    {
+        // cross-warp tree over W = TN/64 warps of this row (1 row per block here)
+        constexpr int W = TN / 64;
+        __shared__ float ws[W];
+        if(lane == 0)
+            ws[nx / 64] = sq;
+        opus::sync_threads();
+        float v[W];
+#pragma unroll
+        for(int i = 0; i < W; ++i)
+            v[i] = ws[i];
+#pragma unroll
+        for(int stride = 1; stride < W; stride <<= 1)
+#pragma unroll
+            for(int idx = 0; idx + stride < W; idx += stride * 2)
+                v[idx] += v[idx + stride];
+        total = v[0];
+    }
+    else
+        total = sq;
+
+    if(!active)
+        return;
+    float inv = rsqrtf(total / hidden + epsilon);
+#pragma unroll
+    for(int q = 0; q < RN; ++q)
+    {
+        V w = w_v[nx + q * TN];
+        V y;
+#pragma unroll
+        for(int j = 0; j < 8; ++j)
+        {
+            float xi = ni[q][j] * inv;
+            if(t5)
+                xi = to_f32<scalar_t>(from_f32<scalar_t>(xi));
+            y[j] = from_f32<scalar_t>(xi * to_f32<scalar_t>(w[j]));
+        }
+        out_v[nx + q * TN] = y;
+    }
+}
 
 template <typename scalar_t, int width>
 __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,

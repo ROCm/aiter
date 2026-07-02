@@ -40,7 +40,73 @@ inline launch_dims pick_dims(int rows, int vhid)
 
 inline bool aligned16(const void* p) { return (reinterpret_cast<size_t>(p) % 16) == 0; }
 
+// Bit-exact (vs CK) launch for one CK tile geometry (TN threads/row, RN vecs).
+template <typename scalar_t, int TN, int RN>
+inline void launch_be(void* out,
+                      const void* in,
+                      const void* weight,
+                      void* residual,
+                      float epsilon,
+                      int rows,
+                      int hidden,
+                      int model_sensitive,
+                      hipStream_t stream)
+{
+    const int tm = (TN > 64) ? 1 : (256 / TN); // rows/block; TN>64 needs 1 row/block
+    const dim3 block(TN, tm);
+    const dim3 grid((rows + tm - 1) / tm);
+    hipLaunchKernelGGL((rmsnorm2d_fwd_be_kernel<scalar_t, TN, RN>),
+                       grid,
+                       block,
+                       0,
+                       stream,
+                       out,
+                       in,
+                       weight,
+                       residual,
+                       epsilon,
+                       rows,
+                       hidden,
+                       model_sensitive);
+}
+
+// Dispatch to the bit-exact kernel for CK's vn=8 tile buckets; returns false if
+// this hidden size has no bit-exact geometry (caller uses the generic kernel).
+template <typename scalar_t>
+inline bool launch_norm_be(void* out,
+                           const void* in,
+                           const void* weight,
+                           void* residual,
+                           float epsilon,
+                           int rows,
+                           int hidden,
+                           int model_sensitive,
+                           hipStream_t stream)
+{
+#define OPUS_BE(N, TN, RN)                                                              \
+    case N:                                                                             \
+        launch_be<scalar_t, TN, RN>(                                                    \
+            out, in, weight, residual, epsilon, rows, hidden, model_sensitive, stream); \
+        return true
+    switch(hidden)
+    {
+        OPUS_BE(64, 8, 1);
+        OPUS_BE(128, 16, 1);
+        OPUS_BE(512, 64, 1);
+        OPUS_BE(1024, 64, 2);
+        OPUS_BE(1536, 64, 3);
+        OPUS_BE(2048, 256, 1);
+        OPUS_BE(3072, 128, 3);
+        OPUS_BE(4096, 256, 2);
+        OPUS_BE(6144, 256, 3);
+        OPUS_BE(8192, 256, 4);
+    default: return false;
+    }
+#undef OPUS_BE
+}
+
 // rmsnorm (+ fused residual add when residual != nullptr; in-place when out == in).
+// Bit-exact vs CK on the vn=8 tile buckets; generic (formula-exact, <=2 ulp) otherwise.
 template <typename scalar_t>
 inline void launch_norm(void* out,
                         const void* in,
@@ -52,6 +118,12 @@ inline void launch_norm(void* out,
                         int model_sensitive,
                         hipStream_t stream)
 {
+    const bool aligned = aligned16(out) && aligned16(in) && aligned16(weight) &&
+                         (residual == nullptr || aligned16(residual));
+    if(aligned && (hidden % 8 == 0) &&
+       launch_norm_be<scalar_t>(
+           out, in, weight, residual, epsilon, rows, hidden, model_sensitive, stream))
+        return;
     const bool vec8 = (hidden % 8 == 0) && aligned16(out) && aligned16(in) && aligned16(weight) &&
                       (residual == nullptr || aligned16(residual));
     const launch_dims d = pick_dims(rows, vec8 ? hidden / 8 : hidden);
