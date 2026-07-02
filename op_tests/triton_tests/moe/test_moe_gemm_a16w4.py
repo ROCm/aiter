@@ -4,6 +4,7 @@
 from dataclasses import dataclass, fields
 import pytest
 import torch
+import os
 
 # routing utilities
 from aiter.ops.triton.moe.moe_routing.routing import routing
@@ -12,7 +13,8 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
     moe_gemm_torch,
-    swizzle_scales,
+    swizzle_scales_gfx950,
+    swizzle_scales_gfx1250,
 )
 
 # numerics utilities
@@ -180,6 +182,7 @@ class Case:
             Case(4, 1024, 3072, 128, 4),
             Case(32, 6144, 3072, 128, 4),
             Case(16, 1024, 1024, 128, 4),
+            Case(16, 128, 128, 2, 1),
             Case(16, 256, 256, 128, 4),
             Case(4096, 256, 256, 128, 4),
             Case(1024, 3072, 512, 128, 4),
@@ -188,6 +191,8 @@ class Case:
             Case(300, 400, 800, 8, 4),
             Case(1000, 704, 800, 8, 2),
             Case(4097, 1024, 1024, 128, 4),
+            Case(16, 32, 256, 2, 1, hbm_swizzling=True),
+            Case(16, 256, 256, 8, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
             Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
@@ -224,6 +229,10 @@ def test_op(
     hbm_swizzling,
     device="cuda",
 ):
+
+    if int(os.environ.get("AITER_IN_FFM_AM", 0)) == 1:
+        if m > 1024 or n > 1024 or k > 1024 or n_expts_tot >= 128:
+            pytest.skip("Test will take too long on FFM")
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -270,8 +279,13 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = swizzle_scales(w_scale_tri)
+        if arch_info.get_arch() == "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
+        else:
+            assert arch_info.get_arch() == "gfx950"
+            swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
     else:
         swizzle_mx_scale = None
 
