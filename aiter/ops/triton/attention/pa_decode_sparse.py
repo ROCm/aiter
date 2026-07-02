@@ -177,6 +177,11 @@ def pa_decode_sparse(
         kv_splits = min(max_kv_splits, kv_splits)
         kv_splits = triton.next_power_of_2(kv_splits)
 
+    if use_gluon:
+        if kv_splits > 8:
+            reduce_num_warps = 4
+            reduce_waves_per_eu = 1
+
     if kv_splits == 1:
         m_partial = l_partial = acc_partial = out  # unused inside the kernel
         mp_strides = (0, 0, 0)
