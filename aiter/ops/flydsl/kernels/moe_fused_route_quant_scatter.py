@@ -74,6 +74,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
 
 from aiter.utility.mx_types import (
     MxDtypeInt as _MxDtype,
@@ -147,11 +148,6 @@ def _raw(value):
 
 def _arch_has_native_scaled_cvt(arch: str) -> bool:
     return arch.startswith(_NATIVE_SCALED_CVT_ARCHS)
-
-
-def _ptr_rsrc(ptr):
-    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
-    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
 
 
 def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamespace:
@@ -577,7 +573,7 @@ def build_moe_fused_route_quant_scatter_module(
         route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
         _if_route = scf.IfOp(route_in_range)
         with ir.InsertionPoint(_if_route.then_block):
-            topk_ids_rsrc = _ptr_rsrc(topk_ids)
+            topk_ids_rsrc = ptr_rsrc(topk_ids)
             # expert id for this route (uniform across the warp)
             expert = ArithValue(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
@@ -619,7 +615,7 @@ def build_moe_fused_route_quant_scatter_module(
             # layout fuses the former Python-side arange(E)*max_m into this
             # kernel; contiguous-M still loads starts[e] from expert_row_base.
             if const_expr(use_expert_row_base):
-                erb_rsrc = _ptr_rsrc(expert_row_base)
+                erb_rsrc = ptr_rsrc(expert_row_base)
                 row_base = ArithValue(
                     buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
                 )
@@ -633,7 +629,7 @@ def build_moe_fused_route_quant_scatter_module(
 
             # topids_to_rows[route] = grouped_row (lane 0 only; warp-uniform value)
             if lane == 0:
-                topids_to_rows_rsrc = _ptr_rsrc(topids_to_rows)
+                topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
                 buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
 
             # --- per-row scale-preshuffle geometry (uniform; from the *global*
@@ -651,9 +647,9 @@ def build_moe_fused_route_quant_scatter_module(
             payload_row_byte_base = grouped_row * c_payload_bytes_per_row
             hidden_elem_base = token * c_model_dim  # bf16 element base for this token
 
-            hidden_rsrc = _ptr_rsrc(hidden)
-            payload_rsrc = _ptr_rsrc(grouped_payload)
-            scale_rsrc = _ptr_rsrc(grouped_scale)
+            hidden_rsrc = ptr_rsrc(hidden)
+            payload_rsrc = ptr_rsrc(grouped_payload)
+            scale_rsrc = ptr_rsrc(grouped_scale)
 
             # this lane's position inside its MX block group
             block_in_wave = arith.divui(lane, c_lanes_per_block)
@@ -846,7 +842,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
         _if_route = scf.IfOp(route_in_range)
         with ir.InsertionPoint(_if_route.then_block):
-            topk_ids_rsrc = _ptr_rsrc(topk_ids)
+            topk_ids_rsrc = ptr_rsrc(topk_ids)
             expert = ArithValue(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
             )
@@ -861,11 +857,11 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
             is_lane0_k0 = arith.andi(is_lane0, is_k0)
             if is_lane0_k0:
-                counter_rsrc = _ptr_rsrc(counter)
+                counter_rsrc = ptr_rsrc(counter)
                 buffer_ops.buffer_store(c1_i32, counter_rsrc, expert)
 
             if const_expr(use_expert_row_base):
-                erb_rsrc = _ptr_rsrc(expert_row_base)
+                erb_rsrc = ptr_rsrc(expert_row_base)
                 row_base = ArithValue(
                     buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
                 )
@@ -874,7 +870,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             grouped_row = slot + row_base
 
             if is_lane0_k0:
-                topids_to_rows_rsrc = _ptr_rsrc(topids_to_rows)
+                topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
                 buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
 
             scale_tile = arith.divui(grouped_row, c_rows_per_tile)
@@ -885,9 +881,9 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
             payload_row_byte_base = grouped_row * c_payload_bytes_per_row
 
-            hidden_rsrc = _ptr_rsrc(hidden)
-            payload_rsrc = _ptr_rsrc(grouped_payload)
-            scale_rsrc = _ptr_rsrc(grouped_scale)
+            hidden_rsrc = ptr_rsrc(hidden)
+            payload_rsrc = ptr_rsrc(grouped_payload)
+            scale_rsrc = ptr_rsrc(grouped_scale)
 
             block_in_wave = arith.divui(lane, c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
@@ -1111,9 +1107,9 @@ def build_moe_fused_quant_preshuffle_module(
                 payload_row_byte_base = row * c_payload_bytes_per_row
                 feat_elem_base = row * c_feat_dim  # bf16 element base for this row
 
-                hidden_rsrc = _ptr_rsrc(grouped_in)
-                payload_rsrc = _ptr_rsrc(grouped_payload)
-                scale_rsrc = _ptr_rsrc(grouped_scale)
+                hidden_rsrc = ptr_rsrc(grouped_in)
+                payload_rsrc = ptr_rsrc(grouped_payload)
+                scale_rsrc = ptr_rsrc(grouped_scale)
 
                 block_in_wave = arith.divui(lane, c_lanes_per_block)
                 lane_in_block = lane - block_in_wave * c_lanes_per_block
@@ -1161,7 +1157,7 @@ def build_moe_fused_quant_preshuffle_module(
                 # Skip padding rows: the masked GEMM never reads rows beyond
                 # masked_m[expert], so quantizing them is pure waste. With high
                 # capacity-factor padding this elides most of the work.
-                masked_rsrc = _ptr_rsrc(masked_m)
+                masked_rsrc = ptr_rsrc(masked_m)
                 valid = ArithValue(
                     buffer_ops.buffer_load(masked_rsrc, expert, vec_width=1, dtype=i32)
                 )
@@ -1303,7 +1299,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
         _if_route = scf.IfOp(route_in_range)
         with ir.InsertionPoint(_if_route.then_block):
-            rows_rsrc = _ptr_rsrc(topids_to_rows)
+            rows_rsrc = ptr_rsrc(topids_to_rows)
             row = ArithValue(
                 buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, dtype=i32)
             )
@@ -1311,7 +1307,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 m = ArithValue(route_max_m)
                 expert = ArithValue(arith.divui(row, m))
                 slot = row - expert * m
-                starts_rsrc = _ptr_rsrc(row_starts)
+                starts_rsrc = ptr_rsrc(row_starts)
                 row = (
                     ArithValue(
                         buffer_ops.buffer_load(
@@ -1344,9 +1340,9 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             else:
                 feat_elem_base = row * c_feat_dim
 
-            hidden_rsrc = _ptr_rsrc(grouped_in)
-            payload_rsrc = _ptr_rsrc(grouped_payload)
-            scale_rsrc = _ptr_rsrc(grouped_scale)
+            hidden_rsrc = ptr_rsrc(grouped_in)
+            payload_rsrc = ptr_rsrc(grouped_payload)
+            scale_rsrc = ptr_rsrc(grouped_scale)
 
             block_in_wave = arith.divui(lane, c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
@@ -1604,8 +1600,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
         route0 = bid * c_warps_per_block + warp_in_block  # first route this warp owns
         stride = ArithValue(num_workers) * c_warps_per_block
 
-        topk_ids_rsrc = _ptr_rsrc(topk_ids)
-        count_rsrc = _ptr_rsrc(count)
+        topk_ids_rsrc = ptr_rsrc(topk_ids)
+        count_rsrc = ptr_rsrc(count)
 
         # ============================ Phase 1: count ============================
         # Strided warp-per-route histogram into ``count`` (== masked_m). Loop bounds
@@ -1721,11 +1717,11 @@ def build_moe_fused_route_psum_quant_scatter_module(
         # coherent load is unreliable here (same miscompile as the Phase 2 prefix
         # sum: it can return a stale 0 instead of the published row base, which
         # scatters the first route of an expert into row 0).
-        starts_rd_rsrc = _ptr_rsrc(starts)
-        hidden_rsrc = _ptr_rsrc(hidden)
-        payload_rsrc = _ptr_rsrc(grouped_payload)
-        scale_rsrc = _ptr_rsrc(grouped_scale)
-        topids_to_rows_rsrc = _ptr_rsrc(topids_to_rows)
+        starts_rd_rsrc = ptr_rsrc(starts)
+        hidden_rsrc = ptr_rsrc(hidden)
+        payload_rsrc = ptr_rsrc(grouped_payload)
+        scale_rsrc = ptr_rsrc(grouped_scale)
+        topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
 
         loop3 = scf.ForOp(route0_idx, numel_idx, stride_idx)
         with ir.InsertionPoint(loop3.body):

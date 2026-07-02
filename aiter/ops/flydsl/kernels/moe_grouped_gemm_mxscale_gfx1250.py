@@ -199,13 +199,11 @@ def _make_m_tile_map(
     m_tile_map = torch.empty(
         cfg.experts * max_m_tiles, device=masked_m.device, dtype=torch.int32
     )
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx_
-    _p = lambda t: flyc.from_c_void_p(fx_.Uint8, t.data_ptr())
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
     launch = _get_compiled_m_tile_map()
     launch(
-        _p(m_tile_prefix),
-        _p(m_tile_map),
+        ptr_arg(m_tile_prefix),
+        ptr_arg(m_tile_map),
         int(cfg.experts),
         int(max_m_tiles),
         stream=torch.cuda.current_stream(),

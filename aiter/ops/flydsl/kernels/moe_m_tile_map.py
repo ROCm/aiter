@@ -20,16 +20,13 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, ptrtoint
+from flydsl.expr import arith, buffer_ops
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import T, Int32
 
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
+
 BLOCK_THREADS = 256
-
-
-def _ptr_rsrc(ptr):
-    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
-    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
 
 
 def _valid_tiles(masked_rsrc, expert, max_m, tile_m):
@@ -91,12 +88,10 @@ def build_moe_m_tile_prefix_map_module():
         )
         m_tile_prefix[0].zero_()
         torch.cumsum(valid_tiles, dim=0, out=m_tile_prefix[1:])
-        import flydsl.compiler as flyc
-        import flydsl.expr as fx_
-        _p = lambda t: flyc.from_c_void_p(fx_.Uint8, t.data_ptr())
+        from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
         map_launch(
-            _p(m_tile_prefix),
-            _p(m_tile_map),
+            ptr_arg(m_tile_prefix),
+            ptr_arg(m_tile_map),
             int(experts),
             int(max_m_tiles),
             stream=stream,
@@ -118,8 +113,8 @@ def build_moe_m_tile_map_module():
         i32 = T.i32
         expert = ArithValue(fx.block_idx.x)
         tid = ArithValue(fx.thread_idx.x)
-        prefix_rsrc = _ptr_rsrc(m_tile_prefix)
-        map_rsrc = _ptr_rsrc(m_tile_map)
+        prefix_rsrc = ptr_rsrc(m_tile_prefix)
+        map_rsrc = ptr_rsrc(m_tile_map)
 
         expert_valid = arith.cmpi(CmpIPredicate.ult, expert, ArithValue(experts))
         if_expert = scf.IfOp(expert_valid)

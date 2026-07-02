@@ -20,14 +20,9 @@ from flydsl._mlir.dialects import scf
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from aiter.ops.flydsl.kernels.tensor_shim import STensor
+from aiter.ops.flydsl.kernels.tensor_shim import STensor, ptr_rsrc
 
 MAX_EXPERTS_PER_BLOCK = 512
-
-
-def _ptr_rsrc(ptr):
-    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
-    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
 
 
 def build_moe_contiguous_psum_module():
@@ -71,10 +66,10 @@ def build_moe_contiguous_psum_module():
             shape=(MAX_EXPERTS_PER_BLOCK,),
         )
 
-        m_rsrc = _ptr_rsrc(masked_m)
-        s_rsrc = _ptr_rsrc(starts)
-        p_rsrc = _ptr_rsrc(psum)
-        c_rsrc = _ptr_rsrc(contiguous_m)
+        m_rsrc = ptr_rsrc(masked_m)
+        s_rsrc = ptr_rsrc(starts)
+        p_rsrc = ptr_rsrc(psum)
+        c_rsrc = ptr_rsrc(contiguous_m)
 
         in_range = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(experts))
         _if_load = scf.IfOp(in_range)
@@ -211,11 +206,11 @@ def build_moe_contiguous_psum_remap_module():
             shape=(MAX_EXPERTS_PER_BLOCK,),
         )
 
-        m_rsrc = _ptr_rsrc(masked_m)
-        rows_rsrc = _ptr_rsrc(topids_to_rows)
-        s_rsrc = _ptr_rsrc(starts)
-        p_rsrc = _ptr_rsrc(psum)
-        c_rsrc = _ptr_rsrc(contiguous_m)
+        m_rsrc = ptr_rsrc(masked_m)
+        rows_rsrc = ptr_rsrc(topids_to_rows)
+        s_rsrc = ptr_rsrc(starts)
+        p_rsrc = ptr_rsrc(psum)
+        c_rsrc = ptr_rsrc(contiguous_m)
 
         in_expert = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(experts))
         _if_load = scf.IfOp(in_expert)

@@ -63,7 +63,7 @@ Block : (BLOCK_THREADS, 1, 1)
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, ptrtoint, range_constexpr
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -72,12 +72,9 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.expr import buffer_ops, vector
 
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
+
 BLOCK_THREADS = 256
-
-
-def _ptr_rsrc(ptr):
-    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
-    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
 
 
 def _emit_preshuffle_dword(gather, map_rsrc, src_rsrc, grow, sd, c_src_dwords, c0):
@@ -190,9 +187,9 @@ def build_moe_scatter_copy_preshuffle_scale_module(
 
         # Created unconditionally (no in-body `if`): for gather=False the launcher
         # passes a placeholder for rows_to_tokens and the helper never reads it.
-        map_rsrc = _ptr_rsrc(rows_to_tokens)
-        src_rsrc = _ptr_rsrc(src)
-        dst_rsrc = _ptr_rsrc(dst)
+        map_rsrc = ptr_rsrc(rows_to_tokens)
+        src_rsrc = ptr_rsrc(src)
+        dst_rsrc = ptr_rsrc(dst)
 
         for it in range_constexpr(
             (units_per_tile + BLOCK_THREADS - 1) // BLOCK_THREADS

@@ -42,7 +42,7 @@ nothing and need no branch.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, ptrtoint, range_constexpr, vector
+from flydsl.expr import arith, range_constexpr, vector
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -51,11 +51,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.expr import buffer_ops
 
-
-def _ptr_rsrc(ptr):
-    """Convert an fx.Pointer to a buffer resource for buffer_load/store."""
-    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
-    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
 
 BLOCK_THREADS = 256
 
@@ -151,10 +147,10 @@ def build_moe_gather_reduce_module(
         tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
         _if_tok = scf.IfOp(tok_valid)
         with ir.InsertionPoint(_if_tok.then_block):
-            in_rsrc = _ptr_rsrc(grouped_out_flat)
-            rows_rsrc = _ptr_rsrc(topids_to_rows)
-            w_rsrc = _ptr_rsrc(gather_w)
-            out_rsrc = _ptr_rsrc(out)
+            in_rsrc = ptr_rsrc(grouped_out_flat)
+            rows_rsrc = ptr_rsrc(topids_to_rows)
+            w_rsrc = ptr_rsrc(gather_w)
+            out_rsrc = ptr_rsrc(out)
             thread_id = ArithValue(tid)
             iter_idx_i32 = ArithValue(fx.block_idx.y)
 

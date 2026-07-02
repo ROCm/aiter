@@ -18,11 +18,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import buffer_ops
 
-
-def _ptr_rsrc(ptr):
-    """Convert an fx.Pointer to a buffer resource for buffer_load/store."""
-    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
-    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
 
 
 BLOCK_THREADS = 256
@@ -48,9 +44,9 @@ def build_moe_route_maps_module():
         in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
         _if = scf.IfOp(in_range)
         with ir.InsertionPoint(_if.then_block):
-            topk_rsrc = _ptr_rsrc(topk_ids)
-            c_rsrc = _ptr_rsrc(topids_to_rows)
-            a_rsrc = _ptr_rsrc(rows_to_tokens)
+            topk_rsrc = ptr_rsrc(topk_ids)
+            c_rsrc = ptr_rsrc(topids_to_rows)
+            a_rsrc = ptr_rsrc(rows_to_tokens)
 
             e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
 
@@ -128,8 +124,8 @@ def build_moe_topids_to_rows_module():
         in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
         _if = scf.IfOp(in_range)
         with ir.InsertionPoint(_if.then_block):
-            topk_rsrc = _ptr_rsrc(topk_ids)
-            out_rsrc = _ptr_rsrc(topids_to_rows)
+            topk_rsrc = ptr_rsrc(topk_ids)
+            out_rsrc = ptr_rsrc(topids_to_rows)
 
             e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
             base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))

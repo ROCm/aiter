@@ -35,7 +35,7 @@ Block : (BLOCK_THREADS, 1, 1)
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, ptrtoint, range_constexpr
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -44,12 +44,9 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.expr import buffer_ops
 
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
+
 BLOCK_THREADS = 256
-
-
-def _ptr_rsrc(ptr):
-    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
-    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
 
 
 def build_moe_scatter_copy_token_module(row_bytes: int):
@@ -104,15 +101,15 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         dst_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_dst_i32)
         _if_dst = scf.IfOp(dst_valid)
         with ir.InsertionPoint(_if_dst.then_block):
-            map_rsrc = _ptr_rsrc(dst_src)
+            map_rsrc = ptr_rsrc(dst_src)
             srow = ArithValue(
                 buffer_ops.buffer_load(map_rsrc, bid_i32, vec_width=1, dtype=i32)
             )
             row_ok = arith.cmpi(CmpIPredicate.sge, srow, arith.constant(0, type=i32))
             _if_row = scf.IfOp(row_ok)
             with ir.InsertionPoint(_if_row.then_block):
-                src_rsrc = _ptr_rsrc(src)
-                dst_rsrc = _ptr_rsrc(dst)
+                src_rsrc = ptr_rsrc(src)
+                dst_rsrc = ptr_rsrc(dst)
                 tid_i32 = ArithValue(tid)
                 # Element base of each row, in copy-dtype elements (i32 if dword*, i8 otherwise).
                 src_base = srow * row_stride_i32

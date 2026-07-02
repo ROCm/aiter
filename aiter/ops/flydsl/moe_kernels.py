@@ -526,17 +526,7 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _ptr_view_safe(t: torch.Tensor):
-    """Pass only the device data pointer; shape is carried by explicit args."""
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx
-
-    view = _view_safe(t)
-    type_name = type(view).__name__
-    module_name = type(view).__module__
-    if type_name == "FakeTensor" or "fake_tensor" in module_name:
-        return flyc.from_c_void_p(fx.Uint8, 0)
-    return flyc.from_c_void_p(fx.Uint8, view.data_ptr())
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 
 def runtime_swiglu_limit(swiglu_limit: Optional[float], act: str) -> float:
@@ -577,17 +567,17 @@ def _s1_args_fp4(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(w),
-        _ptr_view_safe(a_scale),
-        _ptr_view_safe(w_scale),
-        _ptr_view_safe(sorted_ids),
-        _ptr_view_safe(sorted_expert_ids),
-        _ptr_view_safe(sorted_weights),
-        _ptr_view_safe(num_valid_ids),
-        _ptr_view_safe(_bias),
-        _ptr_view_safe(out_scale_sorted),
+        ptr_arg(out),
+        ptr_arg(a),
+        ptr_arg(w),
+        ptr_arg(a_scale),
+        ptr_arg(w_scale),
+        ptr_arg(sorted_ids),
+        ptr_arg(sorted_expert_ids),
+        ptr_arg(sorted_weights),
+        ptr_arg(num_valid_ids),
+        ptr_arg(_bias),
+        ptr_arg(out_scale_sorted),
         token_num,
         n_in,
         k_in,
@@ -616,15 +606,15 @@ def _s1_args_std(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(w),
-        _ptr_view_safe(a_scale),
-        _ptr_view_safe(w_scale),
-        _ptr_view_safe(sorted_ids),
-        _ptr_view_safe(sorted_expert_ids),
-        _ptr_view_safe(sorted_weights),
-        _ptr_view_safe(num_valid_ids),
+        ptr_arg(out),
+        ptr_arg(a),
+        ptr_arg(w),
+        ptr_arg(a_scale),
+        ptr_arg(w_scale),
+        ptr_arg(sorted_ids),
+        ptr_arg(sorted_expert_ids),
+        ptr_arg(sorted_weights),
+        ptr_arg(num_valid_ids),
         token_num,
         n_in,
         k_in,
@@ -659,16 +649,16 @@ def _s2_args_fp4(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        _ptr_view_safe(target),
-        _ptr_view_safe(a),
-        _ptr_view_safe(w),
-        _ptr_view_safe(a_scale),
-        _ptr_view_safe(w_scale),
-        _ptr_view_safe(sorted_ids),
-        _ptr_view_safe(sorted_expert_ids),
-        _ptr_view_safe(sorted_weights),
-        _ptr_view_safe(num_valid_ids),
-        _ptr_view_safe(_bias),
+        ptr_arg(target),
+        ptr_arg(a),
+        ptr_arg(w),
+        ptr_arg(a_scale),
+        ptr_arg(w_scale),
+        ptr_arg(sorted_ids),
+        ptr_arg(sorted_expert_ids),
+        ptr_arg(sorted_weights),
+        ptr_arg(num_valid_ids),
+        ptr_arg(_bias),
         token_num,
         n_in,
         k_in,
@@ -696,15 +686,15 @@ def _s2_args_std(
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
-        _ptr_view_safe(target),
-        _ptr_view_safe(a),
-        _ptr_view_safe(w),
-        _ptr_view_safe(a_scale),
-        _ptr_view_safe(w_scale),
-        _ptr_view_safe(sorted_ids),
-        _ptr_view_safe(sorted_expert_ids),
-        _ptr_view_safe(sorted_weights),
-        _ptr_view_safe(num_valid_ids),
+        ptr_arg(target),
+        ptr_arg(a),
+        ptr_arg(w),
+        ptr_arg(a_scale),
+        ptr_arg(w_scale),
+        ptr_arg(sorted_ids),
+        ptr_arg(sorted_expert_ids),
+        ptr_arg(sorted_weights),
+        ptr_arg(num_valid_ids),
         token_num,
         n_in,
         k_in,
@@ -798,10 +788,10 @@ def _run_moe_reduction(
     _run_compiled(
         reduce_exe,
         (
-            _ptr_view_safe(X),
-            _ptr_view_safe(out),
-            _ptr_view_safe(em),
-            _ptr_view_safe(tk),
+            ptr_arg(X),
+            ptr_arg(out),
+            ptr_arg(em),
+            ptr_arg(tk),
             token_num,
             stream,
         ),
@@ -1089,13 +1079,13 @@ def flydsl_silu_and_mul_interleaved(
     _run_compiled(
         _silu_fn,
         (
-            _ptr_view_safe(input),
-            _ptr_view_safe(out),
-            _ptr_view_safe(empty_scale),
-            _ptr_view_safe(sorted_token_ids),
-            _ptr_view_safe(num_valid_ids),
-            _ptr_view_safe(empty_i32),
-            _ptr_view_safe(empty_f32),
+            ptr_arg(input),
+            ptr_arg(out),
+            ptr_arg(empty_scale),
+            ptr_arg(sorted_token_ids),
+            ptr_arg(num_valid_ids),
+            ptr_arg(empty_i32),
+            ptr_arg(empty_f32),
             token_num,
             num_sorted_rows,
             float("inf"),
@@ -1365,13 +1355,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
-                _ptr_view_safe(out.view(-1).view(torch.uint8)),
-                _ptr_view_safe(out_scale_sorted_flat),
-                _ptr_view_safe(sorted_token_ids),
-                _ptr_view_safe(num_valid_ids),
-                _ptr_view_safe(topk_ids_arg),
-                _ptr_view_safe(bias_arg),
+                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
+                ptr_arg(out.view(-1).view(torch.uint8)),
+                ptr_arg(out_scale_sorted_flat),
+                ptr_arg(sorted_token_ids),
+                ptr_arg(num_valid_ids),
+                ptr_arg(topk_ids_arg),
+                ptr_arg(bias_arg),
                 token_num,
                 num_sorted_rows,
                 _swiglu_limit_val,
@@ -1390,13 +1380,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
-                _ptr_view_safe(out.view(-1).view(torch.uint8)),
-                _ptr_view_safe(out_scale_sorted_flat),
-                _ptr_view_safe(sorted_token_ids),
-                _ptr_view_safe(num_valid_ids),
-                _ptr_view_safe(topk_ids_arg),
-                _ptr_view_safe(bias_arg),
+                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
+                ptr_arg(out.view(-1).view(torch.uint8)),
+                ptr_arg(out_scale_sorted_flat),
+                ptr_arg(sorted_token_ids),
+                ptr_arg(num_valid_ids),
+                ptr_arg(topk_ids_arg),
+                ptr_arg(bias_arg),
                 token_num,
                 num_sorted_rows,
                 _swiglu_limit_val,
@@ -1413,13 +1403,13 @@ def flydsl_moe_stage1(
         _run_compiled(
             _silu_fused_k,
             (
-                _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
-                _ptr_view_safe(out.view(-1).view(torch.uint8)),
-                _ptr_view_safe(out_scale_sorted_flat),
-                _ptr_view_safe(sorted_token_ids),
-                _ptr_view_safe(num_valid_ids),
-                _ptr_view_safe(topk_ids_arg),
-                _ptr_view_safe(bias_arg),
+                ptr_arg(tmp_out.view(-1, inter_dim * 2)),
+                ptr_arg(out.view(-1).view(torch.uint8)),
+                ptr_arg(out_scale_sorted_flat),
+                ptr_arg(sorted_token_ids),
+                ptr_arg(num_valid_ids),
+                ptr_arg(topk_ids_arg),
+                ptr_arg(bias_arg),
                 token_num,
                 num_sorted_rows,
                 _swiglu_limit_val,
@@ -1747,9 +1737,9 @@ def flydsl_moe_topids_to_rows(
     route_grid = (numel + 255) // 256
     topids_to_rows_kernel = _get_compiled_topids_to_rows()
     topids_to_rows_kernel(
-        _ptr_view_safe(topk_ids.to(torch.int32).reshape(-1)),
-        _ptr_view_safe(counter),
-        _ptr_view_safe(topids_to_rows),
+        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+        ptr_arg(counter),
+        ptr_arg(topids_to_rows),
         numel,
         int(max_m),
         route_grid,
@@ -1844,9 +1834,9 @@ def flydsl_moe_fused_route_quant_scatter(
     if use_routeks_stage1:
         topids_to_rows_kernel = _get_compiled_topids_to_rows()
         topids_to_rows_kernel(
-            _ptr_view_safe(topk_ids_i32),
-            _ptr_view_safe(counter),
-            _ptr_view_safe(topids_to_rows),
+            ptr_arg(topk_ids_i32),
+            ptr_arg(counter),
+            ptr_arg(topids_to_rows),
             numel,
             max_m,
             route_grid,
@@ -1859,11 +1849,11 @@ def flydsl_moe_fused_route_quant_scatter(
             source_topk=topk,
         )
         launch_routeks(
-            _ptr_view_safe(hidden_flat),
-            _ptr_view_safe(grouped_a1.view(-1)),
-            _ptr_view_safe(grouped_a1_scale.view(-1)),
-            _ptr_view_safe(topids_to_rows),
-            _ptr_view_safe(counter),  # dummy row_starts; unused because remap_rows=False
+            ptr_arg(hidden_flat),
+            ptr_arg(grouped_a1.view(-1)),
+            ptr_arg(grouped_a1_scale.view(-1)),
+            ptr_arg(topids_to_rows),
+            ptr_arg(counter),  # dummy row_starts; unused because remap_rows=False
             1,
             numel,
             grid_blocks,
@@ -1896,13 +1886,13 @@ def flydsl_moe_fused_route_quant_scatter(
             max_m=max_m,
         )
     launch(
-        _ptr_view_safe(topk_ids_i32),
-        _ptr_view_safe(counter),
-        _ptr_view_safe(topids_to_rows),
-        _ptr_view_safe(hidden_flat),
-        _ptr_view_safe(grouped_a1.view(-1)),
-        _ptr_view_safe(grouped_a1_scale.view(-1)),
-        _ptr_view_safe(expert_row_base_arg),
+        ptr_arg(topk_ids_i32),
+        ptr_arg(counter),
+        ptr_arg(topids_to_rows),
+        ptr_arg(hidden_flat),
+        ptr_arg(grouped_a1.view(-1)),
+        ptr_arg(grouped_a1_scale.view(-1)),
+        ptr_arg(expert_row_base_arg),
         numel,
         grid_blocks,
         stream=torch.cuda.current_stream(),
@@ -2009,16 +1999,16 @@ def flydsl_moe_fused_route_psum_quant_scatter(
         quant_mode=quant_mode,
     )
     launch(
-        _ptr_view_safe(topk_ids_i32),
-        _ptr_view_safe(count),
-        _ptr_view_safe(slot_counter),
-        _ptr_view_safe(starts),
-        _ptr_view_safe(psum),
-        _ptr_view_safe(barrier),
-        _ptr_view_safe(topids_to_rows),
-        _ptr_view_safe(hidden_flat),
-        _ptr_view_safe(grouped_a1.view(-1)),
-        _ptr_view_safe(grouped_a1_scale.view(-1)),
+        ptr_arg(topk_ids_i32),
+        ptr_arg(count),
+        ptr_arg(slot_counter),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        ptr_arg(barrier),
+        ptr_arg(topids_to_rows),
+        ptr_arg(hidden_flat),
+        ptr_arg(grouped_a1.view(-1)),
+        ptr_arg(grouped_a1_scale.view(-1)),
         numel,
         int(E),
         int(tile_m),
@@ -2161,11 +2151,11 @@ def flydsl_moe_fused_quant_preshuffle(
             remap_rows=remap_rows,
         )
         launch(
-            _ptr_view_safe(grouped_in.contiguous().view(-1)),
-            _ptr_view_safe(out_payload.view(-1)),
-            _ptr_view_safe(out_scale.view(-1)),
-            _ptr_view_safe(topids_to_rows_i32),
-            _ptr_view_safe(row_starts_i32),
+            ptr_arg(grouped_in.contiguous().view(-1)),
+            ptr_arg(out_payload.view(-1)),
+            ptr_arg(out_scale.view(-1)),
+            ptr_arg(topids_to_rows_i32),
+            ptr_arg(row_starts_i32),
             route_max_m_arg,
             numel,
             grid_blocks,
@@ -2182,10 +2172,10 @@ def flydsl_moe_fused_quant_preshuffle(
         skip_padding=skip_padding,
     )
     launch(
-        _ptr_view_safe(grouped_in.contiguous().view(-1)),
-        _ptr_view_safe(out_payload.view(-1)),
-        _ptr_view_safe(out_scale.view(-1)),
-        _ptr_view_safe(masked_m),
+        ptr_arg(grouped_in.contiguous().view(-1)),
+        ptr_arg(out_payload.view(-1)),
+        ptr_arg(out_scale.view(-1)),
+        ptr_arg(masked_m),
         n_rows,
         max_m,
         grid_blocks,
