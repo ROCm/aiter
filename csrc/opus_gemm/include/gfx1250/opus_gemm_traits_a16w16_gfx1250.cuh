@@ -180,26 +180,20 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int kBRows = kBlockN;                       // w1 loads all B rows
     static constexpr int kSlotElemsA = kARows * kSmemPitch;
     static constexpr int kSlotElemsB = kBRows * kSmemPitch;
-    // Prefetch depth P (number of LDS slots). The s_barrier producer issues the
-    // first P TDMs in the prologue (peak in-flight = P), then per K-step does a
-    // full s_wait_tensorcnt(0) drain before the workgroup barrier and refills one
-    // slot -- so P bounds the peak in-flight TDM count. Lower P reduces the
-    // direct-copy TDM request count req = rows * P * (B_K/128) per operand,
-    // which must stay under the hardware direct-copy limit (256 / SIMD-pair;
-    // < 128 per operand for 2 WG/CU co-residency). The codegen picks P per tile
-    // to satisfy this -- see _ctdm_pick_num_slots() in opus_gemm_common.py.
+    // Prefetch depth P = number of LDS slots; bounds peak in-flight TDMs. Lower
+    // P shrinks the per-operand direct-copy request count (rows*P*(B_K/128)),
+    // which must stay under the HW limit (256/SIMD-pair; <128/operand for 2 WG/CU).
+    // Codegen picks P per tile -- see _ctdm_pick_num_slots() in opus_gemm_common.py.
     static constexpr int kNumSlots = NUM_SLOTS_;                 // prefetch depth P (2 or 3)
     static_assert(kNumSlots == 2 || kNumSlots == 3,
                   "kNumSlots (prefetch depth P) must be 2 or 3");
 
-    // Target WG/CU co-residency. When the in-flight TDM request count
-    // (rows * P * B_K*2/256 per operand) would exceed the 2-WG safe budget
-    // (< 128/operand) but LDS could still fit 2 WG, we MUST force 1 WG/CU so two
-    // workgroups don't oversubscribe a SIMD-pair's 256-request direct-copy budget
-    // (which deadlocks the TDM engine). The codegen sets this per (tile,P) -- see
-    // _ctdm_pick_configs() in opus_gemm_common.py. 1 WG/CU is enforced portably
-    // via LDS padding below (a WG using > 160 KB LDS leaves no room for a second
-    // on the 320 KB/CU budget), avoiding fragile occupancy attributes.
+    // Target WG/CU co-residency. Force 1 WG/CU when the in-flight TDM request
+    // count (rows*P*B_K*2/256 per operand) would exceed the 2-WG budget
+    // (<128/operand): two WGs oversubscribing a SIMD-pair's 256-request
+    // direct-copy budget deadlocks the TDM engine. Codegen sets this per (tile,P)
+    // -- see _ctdm_pick_configs() in opus_gemm_common.py. Enforced via LDS padding
+    // below (>160 KB leaves no room for a second WG on the 320 KB/CU budget).
     static constexpr int kWgPerCu = WG_PER_CU_;
     static_assert(kWgPerCu == 1 || kWgPerCu == 2, "kWgPerCu must be 1 or 2");
 
@@ -224,11 +218,9 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int kSegBytesB = kNumSlots * kSlotElemsB * (int)sizeof(DataB);
     // Real A/B LDS footprint.
     static constexpr int kSegBytesAB = kSegBytesA + kSegBytesB;
-    // 1-WG/CU enforcement via LDS padding: if this instance must run 1 WG/CU
-    // (kWgPerCu==1) but its A/B LDS would otherwise fit two WGs (<= 160 KB), pad
-    // the shared allocation past 160 KB so only one WG fits on the 320 KB/CU
-    // budget. (The pad tail is never accessed.) When kWgPerCu==2 or the tile is
-    // already > 160 KB, no pad is added.
+    // 1-WG/CU enforcement via LDS padding: when kWgPerCu==1 but A/B LDS would
+    // fit two WGs (<= 160 KB), pad past 160 KB so only one WG fits the 320 KB/CU
+    // budget (pad tail never accessed). No pad when kWgPerCu==2 or tile > 160 KB.
     static constexpr int kHalfLds = 160 * 1024;
     static constexpr int kLdsTotalBytes =
         (kWgPerCu == 1 && kSegBytesAB <= kHalfLds) ? (kHalfLds + 1024) : kSegBytesAB;
@@ -246,13 +238,10 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     static constexpr int kGrpKB = kWarpRt / kWmmaN;
 
     // ── scheduler hints (sched_group_barrier counts per ds-prefetch half) ────
-    // These counts are NOT optional perf hints: they force ds_read-before-WMMA
-    // ordering, so they MUST equal the real per-half instruction counts. They
-    // scale with the consumer register expansion (kExpM for A, kExpN for B,
-    // kExpKHalf K-subtiles per half). Hard-coding them for the kExpM==kExpN==1
-    // base (DS=8, WMMA=2) under-counts the high-expand tiles (e.g. tileM
-    // B_M=64 -> kExpM=2 with B_N=64 -> kExpN=4) and the resulting mis-schedule
-    // surfaces as NaN at the software-pipeline tail (per-split k_steps%3==2).
+    // Not optional perf hints: they force ds_read-before-WMMA ordering, so they
+    // MUST equal the real per-half instruction counts (they scale with the
+    // consumer register expansion: kExpM for A, kExpN for B, kExpKHalf per half).
+    // A wrong count mis-schedules and surfaces as NaN at the pipeline tail.
     //   ds_reads / half = (kExpM*kReptA + kExpN*kReptB) * kExpKHalf
     //   wmmas    / half =  kExpM*kExpN * kExpKHalf
     // Base (kExpM=kExpN=1, kReptA=kReptB=2, kExpKHalf=2): DS=8, WMMA=2.
@@ -315,12 +304,10 @@ __device__ inline auto make_layout_ra_ctdm(int lane_id, int wave_m) {
 //
 // N-dim decomposition order MUST be (kExpN[y] outer, kTileN[p]=wave_n inner,
 // kWmmaN), mirroring the A-side (kExpM outer, kTileM inner) and the C-output
-// tile layout tile_shape_c=(expd_m,tile_m,expd_n,tile_n) where expd_n is outer
-// and tile_n(=wave_n) is inner. If kTileN were placed outer here (wave_n owns a
-// contiguous N half) the B-read N positions would NOT match where the C-store
-// scatters them whenever BOTH kTileN==2 AND kExpN>1 -> wrong values for tileN
-// with B_N>32. (kExpN==1 or kTileN==1 hide the mismatch, which is why tileM
-// kExpN>1 and tileN B_N==32 were already correct.)
+// tile layout tile_shape_c=(expd_m,tile_m,expd_n,tile_n). If kTileN were placed
+// outer here the B-read N positions would NOT match where the C-store scatters
+// them whenever BOTH kTileN==2 AND kExpN>1 -> wrong values for tileN with B_N>32
+// (kExpN==1 or kTileN==1 hide the mismatch).
 template <typename T>
 __device__ inline auto make_layout_rb_ctdm(int lane_id, int wave_n) {
     constexpr auto shape = opus::make_tuple(

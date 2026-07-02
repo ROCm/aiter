@@ -65,13 +65,10 @@ void gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_tdm_ws_k
     //   FREE_A[s] = 1 +   P  + s   (ids 1+P..2P)   memcnt = 1 + kNumConsumerWaves (prodA + 2 cons)
     //   FREE_B[s] = 1 + 2*P  + s   (ids 1+2P..3P)  memcnt = 1 + kNumConsumerWaves (prodB + 2 cons)
     // PER-PRODUCER FREE barriers: each producer (w0=A, w1=B) reuse-waits on its OWN
-    // FREE barrier. The consumer signals BOTH FREE_A[s] and FREE_B[s] when it frees a
-    // slot. memcnt = 3 means a FREE_X[s] generation can only complete with that
-    // producer's own signal (2 consumer signals < 3), so the producer is always a
-    // joined member at completion -> it can never miss the completion broadcast.
-    // (A single shared FREE[s] with memcnt=4 let the consumer's extra prologue-slot
-    // free substitute for one producer, releasing only the producer that happened to
-    // be joined and hanging the other -> the split-K / desynced-producer deadlock.)
+    // FREE barrier; the consumer signals BOTH when it frees a slot. memcnt=3 means
+    // a FREE_X[s] generation can't complete without that producer's own signal (2
+    // consumer signals < 3), so the producer never misses the completion broadcast.
+    // (A single shared FREE[s] with memcnt=4 hung the other producer -> deadlock.)
     //   binit = init a barrier to a given memcnt
     //   bjs   = signal only             (run-ahead / no-wait side)
     //   bjsw  = join + signal + wait    (waiting side; join sets namedBarID, its own

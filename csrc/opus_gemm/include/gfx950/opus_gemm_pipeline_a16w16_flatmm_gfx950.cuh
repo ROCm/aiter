@@ -11,10 +11,8 @@
 
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
 
-// ============================================================================
 // Layout functions -- device-only; skipping them on the host pass saves ~50%
 // of the template-expansion compile time (see aiter skill "opus-kernel-best-practice").
-// ============================================================================
 
 #ifdef __HIP_DEVICE_COMPILE__
 
@@ -160,9 +158,7 @@ inline __device__ auto make_layout_rb_flatmm(int lane_id) {
 
 #endif // __HIP_DEVICE_COMPILE__
 
-// ============================================================================
 // Kernel: signature visible on both passes (host needs stub), body guarded.
-// ============================================================================
 
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)

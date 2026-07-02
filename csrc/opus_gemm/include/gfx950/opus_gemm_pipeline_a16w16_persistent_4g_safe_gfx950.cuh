@@ -3,12 +3,10 @@
 //
 // BF16 persistent a16w16 pipeline (M-outer + N-fast XCD swizzle) -- 4g_safe variant.
 //
-// Buffer-resource (BR) construction is sized per-WG tile rectangle so the
-// 32-bit num_records field never wraps -- safe for tensors whose full
-// extent exceeds 4 GiB. Legacy persistent already recomputes A/C per
-// inner tile_m and uses (unsigned) clamps, but C's size still uses the
-// full row-band remaining ((c_rows_remaining-1)*stride_c + ...), which
-// wraps when M*N is huge. Here we tighten to the per-tile rectangle:
+// Buffer-resource (BR) sized per-WG tile rectangle so the 32-bit num_records
+// never wraps (safe for >4 GiB tensors). Legacy persistent's C size used the
+// full row-band remaining, which wraps when M*N is huge; here we tighten to
+// the per-tile rectangle:
 //   A: ((bm_eff-1)*stride_a + K) * sizeof(D_A)
 //   B: ((bn_eff-1)*stride_b + K) * sizeof(D_B)   (built once at entry)
 //   C: ((bm_eff-1)*stride_c + bn_eff) * sizeof(D_C)
@@ -20,37 +18,28 @@
 //
 // Key differences vs the default split-barrier pipeline
 // (opus_gemm_pipeline_a16w16_gfx950.cuh):
-//   * Persistent grid: each WG handles m_per_wg tile_m × 1 tile_n. The
-//     WG iterates over its m_per_wg tile_m values in an outer loop.
-//   * XCD-local N-fast swizzle: within an XCD, consecutive launch-wave
-//     WGs share the same m_grp and span all 8 tile_n stripes. This
-//     keeps the A tile of a single m_grp resident in L2 across all
-//     N stripes for the duration of one m_grp -- standalone bench
-//     measures L2 hit rate going from ~50% (default split-barrier
-//     with HipKittens W=8,C=32 swizzle) to ~80% on 32K×2K×7K BF16.
+//   * Persistent grid: each WG handles m_per_wg tile_m × 1 tile_n in an
+//     outer loop.
+//   * XCD-local N-fast swizzle: within an XCD, consecutive launch-wave WGs
+//     share the same m_grp and span all 8 tile_n stripes, keeping the A tile
+//     of one m_grp resident in L2 across all N stripes (higher L2 hit rate).
 //   * Cluster store INSIDE the outer loop; vmcnt(0)+s_barrier between
-//     iterations to drain prior store_c traffic before the next iter's
-//     async_load. This is fully serial -- no overlap between current
-//     iter's store and next iter's prologue load.
-//   * No bias support (kargs lacks ptr_bias/stride_bias_batch). Bias
-//     plumbing can be added later if a producer needs it; the launcher
+//     iterations drains prior store_c before the next iter's async_load.
+//     Fully serial -- no store/next-prologue overlap.
+//   * No bias support (kargs lacks ptr_bias/stride_bias_batch); the launcher
 //     in opus_gemm_a16w16_persistent_*.cu rejects non-empty bias up front.
 //
-// The K-loop body (prologue + main loop + 2-chunk epilogue) is
-// byte-for-byte the same as the split-barrier reference (modulo
-// the kargs type and the absence of the HAS_BIAS prefetch / fold).
+// The K-loop body (prologue + main loop + 2-chunk epilogue) is byte-for-byte
+// the split-barrier reference (modulo kargs type and the HAS_BIAS prefetch/fold).
 //
-// One intentional deviation from the mouter reference: the main loop's
-// two `v_b[0] = load<VEC_B>(s_b[*][0], u_rb)` sites (at the v_c[1][1]
-// mma group of "First tile" and "Second tile") were moved AFTER the
-// `s_waitcnt_vmcnt + s_barrier` pair, matching the split-barrier
-// pipeline ordering (opus_gemm_pipeline_a16w16_gfx950.cuh:411). The
-// mouter "load before wait" ordering is unsafe for the tile-3 traits
-// (B_M=B_N=128, b_buffer_load_insts=1) because the vmcnt budget is too
-// tight to guarantee the specific s_b[*][0] write has landed before the
-// ds_read fires -- silent intermittent corruption only manifests on
-// tile-3 because tiles 0/1/2 have larger vmcnt budgets that absorb the
-// race. See per-site comments at the two fix sites for details.
+// One intentional deviation from the mouter reference: the two
+// `v_b[0] = load<VEC_B>(s_b[*][0], u_rb)` sites (v_c[1][1] mma group of the
+// First/Second tile) were moved AFTER the `s_waitcnt_vmcnt + s_barrier` pair,
+// matching split-barrier ordering (opus_gemm_pipeline_a16w16_gfx950.cuh:411).
+// The mouter "load before wait" ordering is unsafe for tile-3 (B_M=B_N=128,
+// b_buffer_load_insts=1): the vmcnt budget is too tight to guarantee the
+// s_b[*][0] write landed before ds_read -> silent corruption. See per-site
+// comments at the two fix sites.
 #pragma once
 
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
@@ -78,40 +67,24 @@ gemm_a16w16_persistent_4g_safe_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
     using D_C = typename T::D_C;
     using D_ACC = typename T::D_ACC;
 
-    // ── XCD-local N-fast swizzle ────────────────────────────────────────
-    // Default round-robin XCD assignment (fid % 8 == xcd_id) would put 4
-    // consecutive WGs on the same XCD but each touching a different
-    // m_grp + same tile_n; the per-XCD A working set then balloons to
-    // (4 m_grp × m_per_wg × A_tile) which exceeds L2 capacity on M=32K
-    // shapes. We re-map (bx, by) so that within an XCD, 8 consecutive
-    // launch-wave WGs share the SAME m_grp and span 4 different tile_n
-    // each launch wave (8 tile_n total across 2 launch waves), shrinking
-    // the per-wave A working set so it fits L2.
+    // ── XCD-local N-fast swizzle ──
+    // Default round-robin (fid % 8 == xcd_id) puts consecutive WGs on the same
+    // XCD touching different m_grp + same tile_n, ballooning the per-XCD A
+    // working set past L2 on large-M shapes. We re-map (bx, by) so that within
+    // an XCD, consecutive launch-wave WGs share the SAME m_grp and span the
+    // tile_n stripes, shrinking the per-wave A working set to fit L2.
+    // See plan §2.3 and mouter.cc:277..290.
     //
-    // See plan §2.3 and the standalone reference's swizzle block at
-    // gemm_a16w16_8wave_mouter.cc:277..290.
-    //
-    // Bijectivity & small-split_m correctness
-    // ---------------------------------------
-    // The swizzle requires grid.y * gx (= grid.y * num_tiles_n) be a
-    // multiple of NUM_XCD so that (xcd_id, pos_xcd) covers
-    // [0, NUM_XCD) × [0, grid.y*gx/NUM_XCD) bijectively. Equivalently
-    // m_grp ∈ [0, NUM_XCD * m_grp_per_xcd). The launcher therefore pads
-    // grid.y up to (NUM_XCD * m_grp_per_xcd = NUM_XCD * ceil(split_m/NUM_XCD)).
-    // When split_m is already a NUM_XCD multiple (the large-M case the
-    // swizzle is tuned for -- mouter's 32K case has split_m=32) the
-    // pad is a no-op and there is zero perf overhead. When split_m <
-    // NUM_XCD (small-M shapes like M=8192 N=8192 K=256 with B_M=256
-    // B_N=128 → split_m=4), the pad multiplies grid.y by NUM_XCD/split_m,
-    // and the WGs that land on m_grp >= split_m early-return below.
-    // The early-return is a WAVE-UNIFORM branch (every lane in the wave
-    // takes the same path -- m_grp is computed via readfirstlane and
-    // is identical across the wave), so it lowers to a single
-    // `s_cbranch_execz` with no warp divergence cost. Belt-and-
-    // suspenders, the gmem buffer resources for A / B / C below also
-    // clamp size to 0 on over-shoot, so even if the early-return were
-    // ever skipped the buffer hardware would still drop any wayward
-    // loads / stores.
+    // Bijectivity & small-split_m correctness:
+    // The swizzle requires grid.y * gx (= grid.y * num_tiles_n) be a multiple
+    // of NUM_XCD so (xcd_id, pos_xcd) covers [0,NUM_XCD) × [0,grid.y*gx/NUM_XCD)
+    // bijectively, i.e. m_grp ∈ [0, NUM_XCD * m_grp_per_xcd). The launcher pads
+    // grid.y up to NUM_XCD * ceil(split_m/NUM_XCD). When split_m % NUM_XCD == 0
+    // the pad is a no-op (zero perf cost). When split_m < NUM_XCD the pad adds
+    // WGs with m_grp >= split_m that early-return below. That early-return is
+    // wave-uniform (m_grp via readfirstlane) -> single s_cbranch_execz, no
+    // divergence. Belt-and-suspenders, the A/B/C BRs below also clamp size to 0
+    // on over-shoot so wayward loads/stores are dropped even if it's skipped.
     int bx0 = __builtin_amdgcn_readfirstlane(opus::block_id_x());
     int by0 = __builtin_amdgcn_readfirstlane(opus::block_id_y());
     int gx  = __builtin_amdgcn_readfirstlane(kargs.num_tiles_n);
@@ -138,25 +111,15 @@ gemm_a16w16_persistent_4g_safe_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
     int lane_id = opus::thread_id_x() % get_warp_size();
 
     // B base is tile_n-bound: every M outer iter uses the same B[col:col+B_N, :]
-    // sub-matrix. Built once outside the outer loop so the L2 line set stays warm.
+    // sub-matrix. Built once outside the outer loop to keep the L2 lines warm.
     //
-    // OOB-clamp protection
-    // --------------------
-    // The buffer resource (BR) `size` field is a hardware mask -- any
-    // buffer_load_* / buffer_store_* with vaddr >= size returns 0 / is
-    // silently dropped. We use this to defend against the rare case
-    // where the XCD-local swizzle assigns an over-shoot WG (col >=
-    // kargs.n in the degenerate split_m < NUM_XCD path). When col >=
-    // kargs.n, `(kargs.n - col)` is <= 0; we clamp via std::max so the
-    // BR size is 0, guaranteeing every load returns 0 (no fault, no
-    // garbage). The over-shoot WG still loops through its M outer
-    // iterations doing no-op loads / no-op stores, but produces no
-    // visible side effect to global memory.
-    // 4g_safe: clamp to per-tile rectangle (was: full (n-col)*stride_b
-    // row-band which wraps for big shapes). Persistent's tile_n is fixed
-    // for this WG so we can compute bn_eff once at entry. b_rows_remaining
-    // is conceptually "B's N-side remaining"; clamped to T::B_N (the
-    // single tile_n owned by this WG).
+    // OOB-clamp: the BR `size` field is a hardware mask (vaddr >= size returns
+    // 0 / drops the op). Guards over-shoot WGs (col >= kargs.n in the
+    // split_m < NUM_XCD path): clamp size to 0 so every load returns 0, no
+    // fault, no visible side effect.
+    // 4g_safe: clamp to the per-tile rectangle (was full (n-col)*stride_b
+    // row-band which wraps for big shapes). tile_n is fixed for this WG so
+    // bn_eff is computed once at entry, clamped to T::B_N.
     int bn_eff = (kargs.n > col) ? (kargs.n - col) : 0;
     if (bn_eff > T::B_N) bn_eff = T::B_N;
     unsigned int b_size_bytes = (bn_eff > 0)
@@ -219,23 +182,18 @@ gemm_a16w16_persistent_4g_safe_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
 
     const int loops = ceil_div(kargs.k, T::B_K);
 
-    // ── M outer loop: each iteration is a full split-barrier-style
-    // computation (prologue + main + epilogue + cluster store) for one
-    // tile_m. Between iterations, we drain stores fully (vmcnt(0)) and
-    // cross-wave sync (s_barrier) before reloading A for the next
-    // tile_m. This is fully serial: no overlap between current iter's
-    // store and next iter's prologue load.
+    // ── M outer loop: each iter is a full split-barrier-style computation
+    // (prologue + main + epilogue + cluster store) for one tile_m. Between
+    // iters, drain stores (vmcnt(0)) + s_barrier before reloading A. Fully
+    // serial: no store/next-prologue overlap.
     for (int tile_m = tile_m_lo; tile_m < tile_m_hi; ++tile_m) {
         int row = __builtin_amdgcn_readfirstlane(tile_m * T::B_M);
 
-        // A base: depends on tile_m, recomputed per outer iter.
-        //
-        // OOB-clamp protection (same scheme as g_b above): when the XCD
-        // swizzle assigns an over-shoot WG with row >= kargs.m, clamp
-        // the BR size to 0 so buffer_load_lds returns 0. Without this
-        // clamp, (kargs.m - row) wraps negative -> huge unsigned ->
-        // hardware lets the load through and faults on the dereference.
-        // 4g_safe: clamp to per-tile rectangle (was: full row-band remaining).
+        // A base: depends on tile_m, recomputed per outer iter. OOB-clamp
+        // (same scheme as g_b): over-shoot WG (row >= kargs.m) clamps BR size
+        // to 0 so loads return 0; without it (kargs.m - row) wraps to a huge
+        // unsigned and faults.
+        // 4g_safe: clamp to per-tile rectangle (was full row-band remaining).
         int bm_eff = (kargs.m > row) ? (kargs.m - row) : 0;
         if (bm_eff > T::B_M) bm_eff = T::B_M;
         unsigned int a_size_bytes = (bm_eff > 0)
@@ -246,21 +204,15 @@ gemm_a16w16_persistent_4g_safe_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
                 + (size_t)batch_id * kargs.stride_a_batch
                 + (size_t)row * kargs.stride_a,
             a_size_bytes);
-        // C base: same OOB-clamp story but stricter. g_c carries the
-        // store path; an over-shoot WG (row >= kargs.m OR col >= kargs.n)
-        // must NOT write any bytes to Y or it would corrupt other tiles
-        // or write past Y's allocation entirely (the root cause of the
-        // pre-fix M=8192 N=8192 K=256 "Memory access fault: Write
-        // access to a read-only page"). BR size = bytes from current
-        // base ptr to end of *this WG's valid Y rectangle* (clamped to
-        // 0 on over-shoot). The store path's pred (T::HAS_OOB=true) or
-        // the unconditional store (T::HAS_OOB=false) both ride on top
-        // of this hardware OOB clamp -- store path tightens the bound
-        // per-tile, BR loosens it to whole rectangle.
-        // 4g_safe: clamp to per-tile rectangle. C base biases by +col, so
-        // size only needs to span (bm_eff-1)*stride_c + bn_eff. Provably
-        // <= UINT32_MAX for any sane B_M/B_N/stride_c. bn_eff was set at
-        // entry (tile_n fixed across the outer loop).
+        // C base: same OOB-clamp, stricter -- an over-shoot WG must NOT write
+        // any bytes to Y (else corrupts other tiles or writes past Y's
+        // allocation; root cause of the pre-fix "Write access to a read-only
+        // page" fault). BR size = bytes to end of this WG's valid Y rectangle,
+        // clamped to 0 on over-shoot. The store pred (HAS_OOB) or unconditional
+        // store rides on top of this hardware clamp.
+        // 4g_safe: clamp to per-tile rectangle. C base biases by +col, so size
+        // spans (bm_eff-1)*stride_c + bn_eff (<= UINT32_MAX for sane tiles);
+        // bn_eff set at entry (tile_n fixed across the outer loop).
         unsigned int c_size_bytes = (bm_eff > 0 && bn_eff > 0)
             ? ((unsigned)(bm_eff - 1) * kargs.stride_c + (unsigned)bn_eff) * sizeof(D_C)
             : 0u;
@@ -279,10 +231,9 @@ gemm_a16w16_persistent_4g_safe_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
 
         int tic = 0, toc = 1;
 
-        // ── Prologue (same shape as split-barrier; wave-id-m phase
-        // shifter and B/A prefetch are byte-identical). The outer-iter
-        // vmcnt(0)+s_barrier at the loop tail resets the wave phase,
-        // so every iter re-establishes the shifter.
+        // ── Prologue (same shape as split-barrier; wave-id-m phase shifter
+        // and B/A prefetch byte-identical). The loop-tail vmcnt(0)+s_barrier
+        // resets the wave phase, so every iter re-establishes the shifter.
         async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, 0), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
         async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, 0), opus::number<0>{}, opus::number<T::CACHECTL_A>{});
         async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0), opus::number<0>{}, opus::number<T::CACHECTL_B>{});
@@ -304,15 +255,14 @@ gemm_a16w16_persistent_4g_safe_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
         __builtin_amdgcn_s_barrier();
 
         // ── Main loop ──
-        // Byte-for-byte matches the mouter reference (mouter.cc:394..483).
-        // Differences vs the split-barrier pipeline are intentional and
-        // measured (mouter at 1210 TFLOPS on 32K×2K×7K BF16 vs sb at 1149):
+        // Byte-for-byte matches mouter.cc:394..483. Intentional differences
+        // vs the split-barrier pipeline:
         //   * Only 4 sched_barrier(0) per K-tile pair (after v_c[0][0] and
-        //     v_c[1][0] mmas), not 8. The other 4 mma sites omit it so the
-        //     compiler can hoist v_b[0]/v_a loads above the next mma group.
-        //   * v_c[1][1] mma group: the v_b[0] = load(...) for the next
-        //     k-tile is emitted BEFORE the async_load + waitcnt + barrier
-        //     (not after), letting ds_read overlap buffer_load issue.
+        //     v_c[1][0] mmas), not 8, so the compiler can hoist v_b[0]/v_a
+        //     loads above the next mma group.
+        //   * v_c[1][1] mma group: the next k-tile's v_b[0] = load(...) is
+        //     emitted BEFORE the async_load + waitcnt + barrier, letting
+        //     ds_read overlap buffer_load issue.
         for(int tile = 0; tile < loops - 2; tile += 2) {
             // First tile
             v_a = load<T::VEC_A>(s_a[tic][0], u_ra);
@@ -432,10 +382,10 @@ gemm_a16w16_persistent_4g_safe_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
         }
 
         // ── First epilogue chunk (K-tile = loops-2). ──
-        // Byte-for-byte matches mouter.cc:485..520. No sched_barrier inside
-        // (the inter-mma s_barrier provides sufficient scheduling fence;
-        // adding sched_barrier(0) blocks the compiler from overlapping the
-        // next group's v_b/v_a ds_read with the prior mma's barrier wait).
+        // Byte-for-byte matches mouter.cc:485..520. No sched_barrier inside:
+        // the inter-mma s_barrier is a sufficient fence, and adding
+        // sched_barrier(0) blocks overlapping the next group's ds_read with
+        // the prior mma's barrier wait.
         {
             int tile = loops - 2;
 
@@ -550,10 +500,9 @@ gemm_a16w16_persistent_4g_safe_kernel(opus_gemm_persistent_kargs_gfx950 kargs) {
         store_c(v_c[1][0], 1, 0);
         store_c(v_c[1][1], 1, 1);
 
-        // ── M-outer iter barrier: drain all stores fully (vmcnt(0))
-        // and cross-wave sync (s_barrier) before reloading A for the
-        // next tile_m. Both wave groups hit this same barrier, so the
-        // relative phase they entered is preserved (no phase reset).
+        // ── M-outer iter barrier: drain all stores (vmcnt(0)) + s_barrier
+        // before reloading A for the next tile_m. Both wave groups hit this
+        // barrier, so their relative phase is preserved (no phase reset).
         s_waitcnt_vmcnt(0_I);
         __builtin_amdgcn_s_barrier();
     }  // end M outer loop

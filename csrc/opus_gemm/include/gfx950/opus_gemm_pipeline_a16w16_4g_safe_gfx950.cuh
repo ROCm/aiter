@@ -20,10 +20,7 @@
 
 #include "opus_gemm_traits_a16w16_gfx950.cuh"
 
-// ============================================================================
-// Layout functions for noscale kernels (TILE/WAVE from Traits)
-// Guarded: these are __device__ functions only needed on the device pass.
-// ============================================================================
+// Layout functions for noscale kernels (TILE/WAVE from Traits); device-only.
 
 #ifdef __HIP_DEVICE_COMPILE__
 
@@ -168,10 +165,8 @@ inline __device__ auto make_layout_rb_noscale(int lane_id, int wave_id_n) {
 
 #endif // __HIP_DEVICE_COMPILE__ (layout functions)
 
-// ============================================================================
 // Cache policy (cpol/aux) bits — matches LLVM AMDGPU::CPol in SIDefines.h
 // Hardware mapping: GLC→SC0, SLC→NT, SCC→SC1 (see CDNA4 ISA Table 49/50)
-// ============================================================================
 #define CPOL_DEFAULT      0                       // all zero → L1 Hit LRU, L2 Hit LRU
 #define CPOL_GLC          1                       // bit0: GLC → SC0 (scope: group)
 #define CPOL_SLC          2                       // bit1: SLC → NT  (non-temporal)
@@ -186,22 +181,16 @@ inline __device__ auto make_layout_rb_noscale(int lane_id, int wave_id_n) {
 #define CPOL_BYPASS_L2    CPOL_SC0_SC1            // alias: L2 Coherent Bypass for loads
 #define CPOL_STORE_NT     CPOL_SC0_NT             // alias: non-temporal store
 
-// ============================================================================
-// BF16 noscale GEMM kernel (a16w16)
-// Kernel definition visible on both passes (host pass needs it for stub generation).
-// ============================================================================
+// BF16 noscale GEMM kernel (a16w16); definition visible on both passes (host stub).
 
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_4g_safe_kernel(opus_gemm_noscale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx950__)
     // Real kernel body. Non-gfx950 device passes drop into the empty #else
-    // branch below so multi-arch wheels (e.g. GPU_ARCHS='gfx942;gfx950')
-    // compile cleanly without pulling in MFMA / ds_read_b64_tr / 160 KiB
-    // LDS intrinsics that don't exist on other archs. The Python import
-    // guard (aiter/ops/opus/_arch.py) plus the host arch router in
-    // opus_gemm.cu prevent runtime dispatch from ever reaching the empty
-    // stub, so the unreachable case stays unreachable.
+    // branch below so multi-arch wheels compile cleanly without gfx950-only
+    // MFMA / ds_read_b64_tr / 160 KiB LDS intrinsics. The Python import guard
+    // + host arch router in opus_gemm.cu keep runtime dispatch off the stub.
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
@@ -221,25 +210,14 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_4g_safe_ker
     // The swizzle is only a bijection on [0, total_wgs) when BOTH
     //   (a) total_wgs % (NUM_XCD * SWIZZLE_C) == 0   (every cycle is full)
     //   (b) num_tiles_m % SWIZZLE_W == 0             (every M-group is full)
-    // hold. When (b) fails, the last M-group has win_h < W, which leaves
-    // some (new_xy % tid_per_group) bins unreachable -> the corresponding
-    // (tile_m, tile_n) tiles never get scheduled and their C output stays
-    // uninitialized (NaN with the test poison, or whatever was in the
-    // backing pages otherwise). The legacy `tile_n_id >= num_tiles_n`
-    // fallback only catches the boundary case, not the missing bins.
+    // hold. When (b) fails, the last M-group has win_h < W, leaving some
+    // (new_xy % tid_per_group) bins unreachable -> those (tile_m, tile_n) tiles
+    // never get scheduled and their C output stays uninitialized (NaN). The
+    // legacy `tile_n_id >= num_tiles_n` fallback only catches the boundary case,
+    // not the missing bins.
     //
-    // Concrete failure observed on M=32768 N=129280 K=7168 with B_M=B_N=256
-    // (kid 9 / 5009): num_tiles_m=128, num_tiles_n=505, W=8, C=32; the last
-    // M-group [first_row=120, win_h=8] is fine, but the swizzle range
-    // [0, limit=64512) cannot reach (tile_m∈{120..126}, tile_n∈{489..504})
-    // because new_xy maxes at limit-1=64511 -> last group's last l index
-    // is 3911, capping tile_n at 488. Those 7×16=112 tiles are silently
-    // skipped, producing 7,339,008 NaN elements in the bottom rows.
-    //
-    // For the 4g_safe family we elect correctness over a small swizzle
-    // perf win: fall back to pure linear assignment whenever either
-    // precondition is unmet. Shapes that already meet (a)+(b) keep the
-    // swizzle and pay no extra runtime cost.
+    // So elect correctness: fall back to pure linear assignment whenever either
+    // precondition is unmet. Shapes meeting (a)+(b) keep the swizzle at no cost.
     int tile_m_id, tile_n_id;
     if constexpr (T::NUM_XCD > 1) {
         constexpr int nXCD = T::NUM_XCD;

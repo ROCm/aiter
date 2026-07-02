@@ -11,19 +11,11 @@
 // opus_a16w16_tune_dispatch_gfx950<>() against the (gen_instances.py-
 // emitted) tune lookup table.
 //
-// Why kid integers instead of launcher symbol names?
-// ---------------------------------------------------
-// The previous version of this file returned bare ``&opus_gemm_..._wgpcu1
-// <fp32_t>`` symbols. That coupled the heuristic to specific .so symbol
-// names, which is a real problem in the subset-compile world: if a build
-// excludes the splitk-128 launcher (because the CSV doesn't ask for it
-// and the heuristic doesn't either), but the .cuh still references the
-// symbol, the link fails. By returning an integer kid here and routing
-// through the tune lookup, the only invariant is "every kid this function
-// can return must also be in the compiled subset S". That invariant is
-// enforced at *codegen* time by csrc/opus_gemm/gen_instances.py
-//   assert HEURISTIC_DEFAULT_KIDS.issubset(S)
-// using the single source of truth in opus_gemm_common.py.
+// Returns integer kids, not launcher symbol names: naming .so symbols directly
+// would break the link in subset-compile builds that exclude a launcher the
+// .cuh still references. Routing kids through the tune lookup reduces the
+// invariant to "every kid returned here is in the compiled subset S", enforced
+// at codegen time by gen_instances.py (assert HEURISTIC_DEFAULT_KIDS.issubset(S)).
 //
 // Keep the integer kid returns in opus_a16w16_heuristic_kid_gfx950() below
 // in sync with the HEURISTIC_DEFAULT_KIDS frozenset in
@@ -41,45 +33,30 @@
 #include "opus_gemm_manifest.h"
 
 // a16w16-family launcher signature (split-barrier, flatmm, flatmm_splitk):
-// 3 tensors + std::optional<bias> + int splitK so all three populate the
-// same GENERATE_A16W16_TUNE_LOOKUP table. Non-splitk launchers ignore
-// splitK; the splitk launcher treats it as literal KBatch. bias is
-// consumed by the split-barrier and splitk launchers; the flatmm launcher
-// rejects any non-empty bias up front (HAS_BIAS=false on its warp-spec
-// epilogue).
-//
-// Returns void (in-place on Y); the launchers used to return Y but
-// nothing read the return value at any call site, and dropping the
-// torch::Tensor return type lets the whole dispatch graph go
-// torch-free.
-//
-// Plain function pointer (was: `std::function<void(...)>`). Every
-// callable we ever store in this slot is one of the explicitly
-// instantiated `xxx<bf16_t>` / `xxx<fp32_t>` launcher templates --
-// no captures, no type erasure needed. Switching to a function
-// pointer drops a heavyweight `std::function` template instantiation
-// from the dispatcher TU's host pass and also avoids the per-call
-// virtual-dispatch overhead that std::function pays for the type
-// erasure we don't actually use.
+// 3 tensors + std::optional<bias> + int splitK so all three populate the same
+// GENERATE_A16W16_TUNE_LOOKUP table. Non-splitk launchers ignore splitK; the
+// splitk launcher treats it as literal KBatch. bias is consumed by split-barrier
+// and splitk launchers; flatmm rejects any non-empty bias (HAS_BIAS=false).
+// Returns void (in-place on Y) to keep the dispatch graph torch-free. Plain
+// function pointer (not std::function): every stored callable is an explicitly
+// instantiated launcher template (no captures), so type erasure is unneeded and
+// dropping std::function saves a heavy instantiation + per-call indirection.
 using OpusA16W16NoscaleKernel = void (*)(
     aiter_tensor_t &, aiter_tensor_t &,
     aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
 
 
-// Pure (M, N, K, has_bias) -> integer kid mapping. No reference to launcher
-// symbols here -- the caller resolves the returned kid through
-// opus_a16w16_tune_dispatch_gfx950<CDataType>(kid).
+// Pure (M, N, K, has_bias) -> integer kid mapping; caller resolves the kid
+// through opus_a16w16_tune_dispatch_gfx950<CDataType>(kid).
 //
 // IMPORTANT: every kid this function can return MUST also be in
 // HEURISTIC_DEFAULT_KIDS in csrc/opus_gemm/opus_gemm_common.py, so
 // the subset-compile codegen always includes them in S.
 //
-// `has_bias` matters because the persistent pipeline does not yet
-// implement HAS_BIAS=true; when the user passes a non-empty bias the
-// heuristic must stay on the bias-aware splitk family even if the M-bucket
-// would otherwise return a persistent kid. Splitk kids 200/206/208 (+
-// nooob mirrors) are all bias-aware (see opus_kid_supports_bias in
-// opus_gemm.cu and BIAS_AWARE_KIDS in opus_gemm_common.py).
+// has_bias matters because the persistent pipeline does not yet implement
+// HAS_BIAS=true; with a non-empty bias the heuristic stays on the bias-aware
+// splitk family (kids 200/206/208 + nooob mirrors; see BIAS_AWARE_KIDS in
+// opus_gemm_common.py) even where the M-bucket would pick a persistent kid.
 inline int opus_a16w16_heuristic_kid_gfx950(int M, int N, int K, bool has_bias = false)
 {
   const bool split_barrier_ok =

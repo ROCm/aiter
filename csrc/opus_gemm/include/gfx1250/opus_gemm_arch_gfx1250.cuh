@@ -31,9 +31,8 @@
 #include <cstddef>
 
 // ── a16w16 tune dispatch (id-based) ─────────────────────────────────────────
-// Only the <fp32_t> table is populated (gfx1250 kids are fp32-only split-K).
-// The <bf16_t> specialization is defensive: it never carries a table (which
-// would be an empty array in a gfx1250-only build) and is never called.
+// Only <fp32_t> is populated (gfx1250 kids are fp32-only split-K); the <bf16_t>
+// specialization is defensive (would be an empty-array table) and never called.
 
 template <typename CDataType>
 inline opus_gfx950_detail::OpusA16W16TuneKernel
