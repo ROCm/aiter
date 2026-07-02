@@ -354,8 +354,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         gemma_norm: bool = False,
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
-        # "per_group"/"mxfp4") from the public API; an inline import here would
-        # graph-break Dynamo when this method is traced.
+        # "per_group"/"mxfp4") from the public API.
         if gemma_norm and quant_type != "per_token":
             raise NotImplementedError(
                 "gemma_norm fused quant currently supports per-token FP8 only"
