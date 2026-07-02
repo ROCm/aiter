@@ -625,18 +625,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
         };
 
-        // Per-warp dispatch.
-        // All warps execute the same number of global tiles (= num_iters). On
-        // tiles past this warp's effective end (kv_end_eff), the warp dispatches
-        // mla_main with kSkipCompute=true: it still participates in barriers and
-        // the cooperative V transpose but skips QK/softmax/PV. The epilogue
-        // (output_to_vram + LSE) fires ONLY on the global last tile and is
-        // synchronized across all working warps so the output writes overlap.
-        //
-        // Per-warp causal_offset < kBlockN (qseqlen <= 8, kBlockN = 32) means
-        // num_iters_eff in {0, num_iters - 1, num_iters}: at most 1 trailing
-        // skip iter.
-        //
+        // Per-warp dispatch. All warps execute the same number of global tiles
+        // (= num_iters). Past this warp's effective end (kv_end_eff), it dispatches
+        // mla_main with kSkipCompute=true: still joins barriers/cooperative V transpose
+        // but skips QK/softmax/PV. Epilogue (output_to_vram + LSE) fires ONLY on the
+        // global last tile, synchronized across working warps so writes overlap.
+        // Per-warp causal_offset < kBlockN (qseqlen <= 8, kBlockN = 32) bounds
+        // num_iters_eff to {0, num_iters-1, num_iters}: at most 1 trailing skip iter.
         // Per-warp template params: kEpilogueType, kSkipCompute.
         // Cooperative-uniform: kIsFirstIter, kCheckBoundaryNext.
         if(kv_len_eff <= 0)

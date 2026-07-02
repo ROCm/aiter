@@ -9,33 +9,27 @@
 #include "metadata/v1_2_pa_device.cuh"
 #include "metadata/v1_2_host.cuh"
 
-// ===================================================================================================================
 // MLA Metadata V1
-// ===================================================================================================================
 
-//
-// Persistent thread group solution which take variable query/output lengths into consideration as well.
+// Persistent thread group solution; accounts for variable query/output lengths.
 //
 // Returns
-//   [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
-//                                               work_info.
+//   [0] work_metadata_ptrs  (2)                 Two 64-bit pointers to the 1st element of work_indptr and work_info.
 //   [1] work_info           (#work, 8)
-//   [1.0] bs_index:         (#work),            The index of batch handled by each work.
-//   [1.1] partial_index:    (#work),            The index of tile in output buffer when splits. -1 means no split.
-//   [1.2] q_start:          (#work),            The global index in seq where q/o starts. Use global index here can
-//                                               reduce memory access count in kernel.
-//   [1.3] q_end:            (#work),            The global index in seq where q/o ends (not included).
-//   [1.4] kv_start:         (#work),            The global index in seq where k/v starts.
-//   [1.5] kv_end:           (#work),            The global index in seq where k/v ends (not included).
+//   [1.0] bs_index:         (#work),            Index of batch handled by each work.
+//   [1.1] partial_index:    (#work),            Index of tile in output buffer when split; -1 means no split.
+//   [1.2] q_start:          (#work),            Global seq index where q/o starts (global index avoids extra
+//                                               memory access in kernel).
+//   [1.3] q_end:            (#work),            Global seq index where q/o ends (not included).
+//   [1.4] kv_start:         (#work),            Global seq index where k/v starts.
+//   [1.5] kv_end:           (#work),            Global seq index where k/v ends (not included).
 //   [1.6] pad               (#work, 2),         Pad to 8 DWs.
-//   [2] work_indptr:        (#cu_part + 1),     The IDs of work handled by each cu_part.
+//   [2] work_indptr:        (#cu_part + 1),     IDs of work handled by each cu_part.
 //   [3] reduce_indptr:      (sum(qo_seqlen_blk_count) + 1),
-//                                               The IDs in reduce_partial_map indicates the tiles should be merged
-//                                               together.
+//                                               IDs in reduce_partial_map indicating tiles to merge together.
 //   [4] reduce_final_map:   (sum(qo_seqlen_blk_count)),
-//                                               The final output location of each group of tiles.
-//   [5] reduce_partial_map: (#partial_tiles),   The locations in partial buffer of partial tiles waiting for being
-//                                               reduced.
+//                                               Final output location of each group of tiles.
+//   [5] reduce_partial_map: (#partial_tiles),   Locations in partial buffer of partial tiles awaiting reduction.
 //
 void get_mla_metadata_v1(
     const torch::Tensor&                seqlens_qo_indptr,     // [batch size + 1]
@@ -161,9 +155,8 @@ std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(seqlens_kv_indptr));
 
-    // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and qo size from 1 to 4
-    // without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to prevent
-    // spliting in any case supported by it.
+    // Defaults for our ASM MLA decode kernel: num_heads=16, qo size 1-4, no per-workgroup qo split,
+    // so kPackedQoLenPerWg = 4*16 = 64 to avoid splitting in any case it supports.
     //                                PackedQoLenPerWg, MaxClusterSize
     using Traits = MlaMetadataV11Traits<64,               1>;
 

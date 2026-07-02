@@ -713,22 +713,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             // __builtin_amdgcn_sched_barrier(0);
 
             // GEMM on PV -- fully double-buffered using p_comp aliases as alt V tile buffer.
-            //
-            // Per-pv_iter design (1 tile = 64 N-cols per iter):
-            //   kv_0/kv_1         : ALWAYS hold the LOWER N-half (rows 0..31) of tile i.
-            //   kv_0_alt/kv_1_alt : ALWAYS hold the UPPER N-half (rows 32..63) of tile i.
-            // Within an iter, _lo mfmas consume kv_0/kv_1 while the HI load streams into
-            // kv_*_alt; _hi mfmas then consume kv_*_alt while the next tile's LO streams
-            // into kv_0/kv_1. The iter-spanning LO load is hidden by the _hi mfmas plus
-            // any tail work; the in-iter HI load is hidden by the 4 _lo mfmas + rescale.
+            // Per-pv_iter (1 tile = 64 N-cols): kv_0/kv_1 ALWAYS hold tile i's LOWER N-half
+            // (rows 0..31), kv_0_alt/kv_1_alt ALWAYS hold its UPPER N-half (rows 32..63).
+            // _lo mfmas consume kv_0/kv_1 while the HI load streams into kv_*_alt; _hi mfmas
+            // then consume kv_*_alt while the next tile's LO streams into kv_0/kv_1 (LO load
+            // hidden by _hi mfmas + tail work, HI load hidden by the 4 _lo mfmas + rescale).
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 8
 
-            // PV scaler workaround: HW bug -- mfma blocks the following v_pk_* even with
-            // no data dependency. Per sub-tile (4 vgprs) we split the rescale in half:
-            //   - pre-PV-loop:    1x v_pk_mul_f32 covering vgprs [base+0, base+1]
-            //   - interleaved:    2x v_mul_f32    covering vgprs [base+2, base+3]
-            // The interleaved phase is mfma-paired (rotation: scale_{i+1} after mfma_i),
-            // and uses single-precision v_mul_f32 so it doesn't trip the v_pk hazard.
+            // PV scaler workaround: HW bug makes mfma block the following v_pk_* even with no
+            // data dependency. Per sub-tile (4 vgprs), rescale is split: pre-PV-loop 1x
+            // v_pk_mul_f32 on [base+0,base+1], then interleaved (mfma-paired) 2x v_mul_f32 on
+            // [base+2,base+3] -- single-precision so it avoids the v_pk hazard.
             // pk_mul_pair(r, base_c): v_pk_mul_f32 on vgprs [base, base+1] *= r
             auto pk_mul_pair = [&](float r, auto base_c) {
                 constexpr uint32_t base = decltype(base_c)::value;
@@ -795,12 +790,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                 // Prologue's LO load is finalized by iter 0's 2.1+2.2 (s_waitcnt + finalize).
             }
 
-            // Per-pv_iter loop. Each iter processes one tile (64 N-cols, 8 sub-tiles).
-            //   kv_0/kv_1     : ALWAYS hold tile i LOWER N-half (rows 0..15 + 16..31).
-            //   kv_0_alt/_1_alt: ALWAYS hold tile i UPPER N-half (rows 32..47 + 48..63).
-            // LO of next tile is prefetched into kv_0/kv_1 at the tail of each iter
-            // (overlaps with the _hi mfmas). HI of current tile is prefetched into
-            // kv_*_alt at the head (overlaps with the _lo mfmas).
+            // Per-pv_iter loop, one tile (64 N-cols, 8 sub-tiles) per iter. Next tile's LO
+            // is prefetched into kv_0/kv_1 at the tail (overlaps _hi mfmas); current tile's
+            // HI is prefetched into kv_*_alt at the head (overlaps _lo mfmas).
             opus::static_for<num_pv_iter>([&](auto i) {
                 constexpr uint32_t tile_idx = i.value;
                 constexpr bool has_next     = (tile_idx + 1) < num_pv_iter;
@@ -1011,18 +1003,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
             }
         };
 
-        // Per-warp dispatch.
-        // All warps execute the same number of global tiles (= num_iters). On
-        // tiles past this warp's effective end (kv_end_eff), the warp dispatches
-        // mla_main with kSkipCompute=true: it still participates in barriers and
-        // the cooperative V transpose but skips QK/softmax/PV. The epilogue
-        // (output_to_vram + LSE) fires ONLY on the global last tile and is
-        // synchronized across all working warps so the output writes overlap.
-        //
-        // Per-warp causal_offset < kBlockN (qseqlen <= 8, kBlockN = 64) means
-        // num_iters_eff in {0, num_iters - 1, num_iters}: at most 1 trailing
-        // skip iter.
-        //
+        // Per-warp dispatch. All warps execute the same number of global tiles
+        // (= num_iters). Past this warp's effective end (kv_end_eff), it dispatches
+        // mla_main with kSkipCompute=true: still joins barriers/cooperative V transpose
+        // but skips QK/softmax/PV. Epilogue (output_to_vram + LSE) fires ONLY on the
+        // global last tile, synchronized across working warps so writes overlap.
+        // Per-warp causal_offset < kBlockN (qseqlen <= 8, kBlockN = 64) bounds
+        // num_iters_eff to {0, num_iters-1, num_iters}: at most 1 trailing skip iter.
         // Per-warp template params: kEpilogueType, kSkipCompute.
         // Cooperative-uniform: kIsFirstIter, kCheckBoundaryNext.
         if(kv_len_eff <= 0)

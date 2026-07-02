@@ -656,9 +656,7 @@ void get_mla_metadata_v1_1_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   torch::Tensor& reduce_final_map,
                                   torch::Tensor& reduce_partial_map)
 {
-    // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and
-    // qo size from 1 to 4 without support to split qo for each workgroup. This means that
-    // kPackedQoLenPerWg should be 4*16=64 to prevent spliting in any case supported by it.
+    // Default for our ASM MLA decode kernel (num_heads=16, qo size 1-4, no per-workgroup split).
     constexpr int32_t kPackedQoLenPerWg = 128;
     constexpr int32_t kMaxClusterSize   = 1;
 

@@ -1081,20 +1081,15 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
     }
     else
     {
-        // Host/device wave-size split: Traits::kWaveSize (== opus::get_warp_size())
-        // resolves to 64 in the host compiler pass regardless of the target arch,
-        // but the device kernel is compiled with the real wave size (32 on wave32
-        // GPUs). Launch parameters must match the *device* kernel, so derive the
-        // block dim and LDS spill boundary from the runtime warpSize instead.
+        // Traits::kWaveSize resolves to 64 on the host regardless of target arch, but the device
+        // kernel uses the real wave size (32 on wave32 GPUs), so derive block dim / LDS spill
+        // boundary from the runtime warpSize to match the device kernel.
         const int32_t wave_size = dev_prop.warpSize;
         const int32_t block_dim = Traits::kNumWarps * wave_size;
 
-        // lds_scale_cap = LDS span (in #splits) written by the massive LSE path,
-        // which is num_lse_per_thr * wave_size per bucket and can exceed max_splits:
-        //   <= wave_size splits      -> 1 LSE/lane -> span = wave_size
-        //   <= 4*wave_size splits    -> 4 LSE/lane -> span = 4*wave_size
-        //   >  4*wave_size splits    -> ceil(max_splits/wave_size) LSE/lane
-        //                               -> span = round_up(max_splits, wave_size)
+        // lds_scale_cap = LDS span (in #splits) written by the massive LSE path (num_lse_per_thr *
+        // wave_size per bucket, can exceed max_splits): <= wave_size splits -> span = wave_size;
+        // <= 4*wave_size splits -> span = 4*wave_size; else span = round_up(max_splits, wave_size).
         const int32_t round_up_splits =
             ((params.max_splits + wave_size - 1) / wave_size) * wave_size;
 
@@ -1104,11 +1099,9 @@ void dispatch_mla_reduce_v1(const MlaReduceKernelV1Params& params,
                 ? wave_size
                 : ((params.max_splits <= 4 * wave_size) ? 4 * wave_size : round_up_splits);
 
-        // 1. Reduce partial map of each split (max_splits entries);
-        // 2. LSE scale of each split for rescale output (lds_scale_cap entries);
-        // 3. Stack for the 1st warp to calculate LSE. The top 4*wave_size splits
-        //    (4 LSEs per lane) are kept in vgpr; the remainder spills to LDS
-        //    (lds_scale_cap - 4*wave_size entries).
+        // LDS layout: (1) reduce partial map per split (max_splits entries), (2) LSE scale per
+        // split (lds_scale_cap entries), (3) LSE spill stack for warp 0 beyond the 4*wave_size
+        // kept in vgpr (lds_scale_cap - 4*wave_size entries).
         const int32_t lds_size = params.max_splits * sizeof(int32_t) +
                                  configs.lds_scale_cap * sizeof(float) +
                                  max(0, configs.lds_scale_cap - 4 * wave_size) * sizeof(float);
