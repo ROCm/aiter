@@ -374,6 +374,69 @@ def test_serving_sparse_grid_cudagraph_replay():
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("num_kv_splits", [32, 128])
+def test_wrapper_host_tier_dispatch_cudagraph_replay(monkeypatch, num_kv_splits):
+    """Host per-tier dispatch (AITER_MLA_REDUCE_HOST_TIER=1) stays correct under
+    CUDA-graph capture/replay via the production wrapper.
+
+    Proves alt#1: the wrapper picks the tier on the HOST from num_kv_splits (no
+    device read), captures the per-tier kernel into the graph, and replays
+    correctly against the HIP reference. num_kv_splits=32 -> M64 (the mid-tail
+    win); num_kv_splits=128 -> M256 (over-provisioned tier still correct).
+    """
+    _require_cuda()
+    from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_HOST_TIER", "1")
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = build_serving_sparse_grid_inputs(
+        *_SERVING_SHAPE, out_dtype=out_dtype
+    )
+    fout.zero_()
+    flse.zero_()
+
+    def run():
+        flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, fout, flse,
+            num_kv_splits=num_kv_splits,
+        )
+
+    run_cudagraph_replay(run)
+    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+@pytest.mark.slow
+def test_wrapper_host_tier_dispatch_heterogeneous_upper_bound(monkeypatch):
+    """Critical safety case: heterogeneous per-tile splits [8, 304] with the
+    host baking the num_kv_splits=304 (MLDS) tier. The MLDS body must correctly
+    reduce the 8-split tile too (select_tier(upper_bound) caps LSE width only;
+    each tile still reduces its actual n_splits)."""
+    _require_cuda()
+    from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+    monkeypatch.setenv("AITER_MLA_REDUCE_HOST_TIER", "1")
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    H, Dv = _HIP_SHAPE
+    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
+        [8, 304], H, Dv, out_dtype, M=1, gap_stride=1
+    )
+    fout.zero_()
+    flse.zero_()
+
+    def run():
+        flydsl_mla_reduce_v1(
+            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=304
+        )
+
+    run_cudagraph_replay(run)
+    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
+
+
+@pytest.mark.slow
 def test_serving_stale_indptr_cudagraph_replay():
     """Cudagraph replay after batch-8→batch-1 layout (guards-ON/OFF differential)."""
     _require_cuda()

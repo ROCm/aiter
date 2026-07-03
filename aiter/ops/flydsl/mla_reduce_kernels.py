@@ -17,11 +17,14 @@ through this wrapper instead.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .kernels.mla_reduce import (
     Tier,
     compile_mla_reduce,
+    select_tier,
     should_use_persistent_launch,
     waves_per_eu_from_env,
 )
@@ -29,6 +32,31 @@ from .kernels.mla_reduce import (
 __all__ = [
     "flydsl_mla_reduce_v1",
 ]
+
+
+def _host_tier_dispatch_enabled() -> bool:
+    """Opt-in gate for host-visible per-tier dispatch (capture-safe).
+
+    Default (unset/0): ``Tier.ALL`` — one kernel with device-side per-tile tier
+    branch; correct for any data, but its VGPR footprint is set by the heaviest
+    body (M256/MLDS), which drags the M64 mid-tail to occupancy 1.
+
+    When set (``AITER_MLA_REDUCE_HOST_TIER=1``): the wrapper picks the tier on the
+    HOST from ``num_kv_splits`` and compiles that single per-tier body. This
+    recovers the per-tier occupancy win (M64 alone = occ-3, ~0.2-0.3us faster on
+    the mid-tail) with NO extra launch. It is capture-safe because ``num_kv_splits``
+    is a pure host scalar (no device read/sync) and, for a fixed CUDA-graph
+    capture configuration, is constant — so PyTorch's per-config graph capture
+    bakes the correct per-tier kernel and every replay reuses it.
+
+    CORRECTNESS PRECONDITION (why this is opt-in): ``num_kv_splits`` must be a true
+    upper bound on every active tile's ``n_splits``. ``select_tier`` is monotonic
+    and each per-tier body reduces a tile's *actual* ``n_splits`` (the tier only
+    caps the LSE-register width), so ``select_tier(num_kv_splits)`` yields a body
+    whose cap >= every tile's split count -> correct. If a caller cannot guarantee
+    that bound, leave this off and keep ``Tier.ALL``.
+    """
+    return os.environ.get("AITER_MLA_REDUCE_HOST_TIER", "0") == "1"
 
 
 def _out_dtype_str(dtype: torch.dtype) -> str:
@@ -94,11 +122,20 @@ def flydsl_mla_reduce_v1(
         num_cu=num_cu,
     )
 
+    # Capture-safe tier selection. Default: Tier.ALL (device-side per-tile
+    # branch). Opt-in: host per-tier dispatch from the num_kv_splits upper bound
+    # -- no device read, so it is CUDA-graph capture-safe and recovers the
+    # per-tier occupancy win (see _host_tier_dispatch_enabled).
+    if _host_tier_dispatch_enabled() and num_kv_splits > 0:
+        tier = select_tier(int(num_kv_splits))
+    else:
+        tier = Tier.ALL
+
     kernel = compile_mla_reduce(
         H=H,
         Dv=Dv,
         out_dtype=out_dtype_str,
-        tier=Tier.ALL,
+        tier=tier,
         persistent=use_persistent,
         output_lse=output_lse,
         use_reduce_final_map=use_reduce_final_map,
