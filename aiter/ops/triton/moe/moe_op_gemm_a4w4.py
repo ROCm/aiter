@@ -285,7 +285,7 @@ def get_moe_a4w4_layouts_gfx1250(
             order=[1, 0],
             cga_layout=CGA_B_NMAJOR,
         )
-    elif MX_SCALE_BLOCK_K <= 256:
+    elif PACKED_MX_BLOCK <= 256:
         SHARED_LAYOUT_W_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[256, 16]],
             shape=[SCALE_BLOCK_N, PACKED_MX_BLOCK],
@@ -294,7 +294,7 @@ def get_moe_a4w4_layouts_gfx1250(
         )
     else:
         SHARED_LAYOUT_W_SCALES = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[MX_SCALE_BLOCK_K, 16]],
+            interval_padding_pairs=[[PACKED_MX_BLOCK, 16]],
             shape=[SCALE_BLOCK_N, PACKED_MX_BLOCK],
             order=[1, 0],
             cga_layout=CGA_B_NMAJOR,
