@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Test for FlyDSL FMHA backward main kernel (non-causal, dK/dV/dQ).
+"""Tests for the FlyDSL FMHA backward (non-causal, fused dQ/dK/dV).
 
-Verifies dQ, dK, dV against torch autograd reference.
+Two paths, both checked against a torch-autograd reference:
+  run_test         — the fused kernel directly (BHSD, fp32 outputs); small + larger shapes.
+  run_wrapper_test — the full production wrapper flydsl_flash_attn_backward
+                     (BSHD, 3-pass preprocess -> fused kernel -> fp32->dtype cast).
+
+Constraints: bf16 only (kernel hardcodes bf16 MFMA); Sk must be a multiple of
+BLOCK_N (64) — max_size buffer resources aren't bounds-checked, so a partial last
+K-tile reads garbage.
 """
 
 import torch
@@ -164,7 +171,67 @@ def run_test(B, H, Sq, D, dtype=torch.bfloat16):
     print("  PASS")
 
 
+def run_wrapper_test(B, H, Sq, D, dtype=torch.bfloat16):
+    """Exercise the full production path: flydsl_flash_attn_backward (BSHD layout,
+    3-pass preprocess->fused kernel->cast). Output is cast to `dtype`, so tolerance
+    is looser than the direct fp32-kernel test above.
+    """
+    from aiter.ops.flydsl.fmha_bwd_kernels import flydsl_flash_attn_backward
+
+    sm_scale = 1.0 / math.sqrt(D)
+    torch.manual_seed(42)
+
+    # BSHD layout (what the wrapper expects)
+    q = torch.randn(B, Sq, H, D, dtype=dtype, device="cuda")
+    k = torch.randn(B, Sq, H, D, dtype=dtype, device="cuda")
+    v = torch.randn(B, Sq, H, D, dtype=dtype, device="cuda")
+    do = torch.randn(B, Sq, H, D, dtype=dtype, device="cuda")
+
+    # Reference in BHSD (transpose), then torch autograd
+    qb, kb, vb, dob = (t.transpose(1, 2) for t in (q, k, v, do))
+    o_b, lse = ref_forward(qb, kb, vb, sm_scale)  # o_b: BHSD, lse: [B,H,Sq]
+    dq_ref, dk_ref, dv_ref = ref_backward(qb, kb, vb, o_b, dob, lse, sm_scale)
+    out = o_b.transpose(1, 2).contiguous()  # BSHD
+
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    handled = flydsl_flash_attn_backward(
+        q, k, v, out, do, lse, dq, dk, dv, sm_scale, causal=False
+    )
+    assert handled, f"wrapper returned False (unsupported shape B={B} H={H} Sq={Sq})"
+    torch.cuda.synchronize()
+
+    # FlyDSL grads are BSHD → transpose to BHSD to compare with the reference
+    atol = 2e-2  # output is cast to dtype (bf16/fp16)
+    dq_err = (dq.transpose(1, 2).float() - dq_ref).abs().max().item()
+    dk_err = (dk.transpose(1, 2).float() - dk_ref).abs().max().item()
+    dv_err = (dv.transpose(1, 2).float() - dv_ref).abs().max().item()
+    dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
+    print(
+        f"[wrapper] B={B} H={H} Sq={Sq} D={D} {dtype_str}:"
+        f"  dQ_err={dq_err:.2e}  dK_err={dk_err:.2e}  dV_err={dv_err:.2e}"
+    )
+    assert dq_err < atol, f"dQ max error {dq_err} too large"
+    assert dk_err < atol, f"dK max error {dk_err} too large"
+    assert dv_err < atol, f"dV max error {dv_err} too large"
+    print("  PASS")
+
+
 if __name__ == "__main__":
+    print("== direct fused kernel (BHSD, fp32 out) ==")
     run_test(1, 5, 64, 128, torch.bfloat16)
     run_test(1, 5, 128, 128, torch.bfloat16)
+    run_test(1, 5, 512, 128, torch.bfloat16)  # larger shape
+    # NOTE: bf16 only — the kernel hardcodes bf16 MFMA + bf16 bit-extraction, so
+    # fp16 produces NaN (the wrapper rejects fp16 → Triton fallback).
+    # NOTE: Sk must be a multiple of BLOCK_N (64). The kernel uses max_size buffer
+    # resources (no bounds-checking), so a partial last K-tile reads garbage and
+    # corrupts output — e.g. Sq=Sk=80 gives ~2.0 error. The host wrapper enforces
+    # Sq % 64 == 0 for this reason; the 75600 profiler measures timing on garbage.
+
+    print("== host wrapper (BSHD, full 3-pass + cast) ==")
+    run_wrapper_test(1, 5, 256, 128, torch.bfloat16)
+    run_wrapper_test(1, 5, 512, 128, torch.bfloat16)
+
     print("All tests passed.")

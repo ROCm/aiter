@@ -333,7 +333,9 @@ def build_fmha_bwd_kernel_module(
 ):
     assert head_dim == 128, "MFMA bwd requires head_dim=128"
     assert block_m == 16, "MFMA bwd requires block_m=16"
-    assert dtype in ("bf16", "fp16")
+    # bf16 only: MFMA instrs and load path are bf16-hardcoded; fp16 would need the
+    # f16 MFMA variants + an fp16 load/truncate path (not implemented → NaN).
+    assert dtype == "bf16", "MFMA bwd is bf16-only (fp16 not implemented)"
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="fmha_bwd_mfma")

@@ -9,8 +9,8 @@ Three-pass execution (CK-style fused dQ+dK+dV):
                        dQ = dS^T·K fused in-kernel via fp32 atomic-add.
   3. Cast           — fp32 → input dtype
 
-Constraints: non-causal, MHA (Hq==Hk), BSHD layout, Sq multiple of 64,
-             head_dim=128, bf16/fp16.
+Constraints: non-causal, MHA (Hq==Hk), BSHD layout, Sq/Sk multiples of 64,
+             head_dim=128, bf16 only (fp16 unsupported — bf16-hardcoded MFMA).
 """
 
 from __future__ import annotations
@@ -75,12 +75,14 @@ def flydsl_flash_attn_backward(
 
     if Hq != Hk:
         return False
-    if Sq % _REQ_MULTIPLE != 0:
+    if Sq % _REQ_MULTIPLE != 0 or Sk % _REQ_MULTIPLE != 0:
         return False
-    if q.dtype not in (torch.bfloat16, torch.float16):
+    # bf16 only: the kernel hardcodes bf16 MFMA + bf16 bit-extraction, so fp16 would
+    # produce NaN. Reject it so the caller falls back to Triton.
+    if q.dtype != torch.bfloat16:
         return False
 
-    dtype_str = "bf16" if q.dtype == torch.bfloat16 else "fp16"
+    dtype_str = "bf16"
     if stream is None:
         stream = torch.cuda.current_stream(q.device)
 
