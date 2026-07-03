@@ -540,7 +540,8 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"));                                                              \
+          py::arg("use_1stage"),                                                               \
+          py::arg("gemma_norm") = false);                                                      \
     m.def("fused_allreduce_rmsnorm_quant_per_group",                                            \
           &aiter::fused_allreduce_rmsnorm_quant_per_group,                                      \
           py::arg("_fa"),                                                                       \
