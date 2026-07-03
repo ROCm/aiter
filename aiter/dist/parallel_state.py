@@ -624,7 +624,7 @@ class GroupCoordinator:
         transpose_scale: bool = False,
         gemma_norm: bool = False,
     ):
-        from aiter.dist.device_communicators.communicator_cuda import (
+        from aiter.dist.communication_op import (
             _normalize_fused_ar_rms_quant_type,
         )
 
