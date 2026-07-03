@@ -31,20 +31,17 @@ container_main() {
         --warmup 5
         --repeat 20
     )
-    local prewarm_cmd=(
-        python op_tests/test_mha_flydsl_varlen.py
-        --causal true
-        --return_lse true
-        -b 1
-        -nh 32
-        -sq 8192
-        -sk 8192
-        --random-value false
-        --warmup 1
-        --repeat 1
-    )
-
     cd "${REPO_ROOT}"
+
+    # --- gfx1250 ATT 修复注入（4 处，见 rocprofv3_att_debug/README_gfx1250_new.md）---
+    # ① 采集：source rocprof_env.sh 让 LD_LIBRARY_PATH 含 /opt/rocm/lib（HSA 裸名
+    #    dlopen aqlprofile），并前置 comgr_new（LLVM23，认 gfx1250 新指令，避免解码
+    #    吐 .long）。② 钉死自编译 rocprofv3（带 gfx1250 修复）。③ 强制用已验证能
+    #    解码 gfx1250 navi 的 0.1.5 decoder（decoder_new），绕开脚本下载的 0.1.6。
+    source /data/yanguahe/code/wk_sp1/rocprof_env.sh
+    export PATH=/data/yanguahe/code/wk_sp1/rocprof-install/bin:${PATH}
+    export ROCPROF_ATT_LIBRARY_PATH=/data/yanguahe/code/wk_sp1/decoder_new
+
     rm -rf "${OUT_DIR}" "${flydsl_dump_dir}"
     mkdir -p "${log_dir}" "${kernel_trace_dir}" "${thread_trace_dir}"
 
@@ -67,8 +64,17 @@ container_main() {
     ensure_trace_decoder() {
         {
             echo "Checking rocprof trace decoder:"
+            echo "ROCPROF_ATT_LIBRARY_PATH=${ROCPROF_ATT_LIBRARY_PATH:-unset}"
+            ls -lah "${ROCPROF_ATT_LIBRARY_PATH:-/nonexistent}/librocprof-trace-decoder.so" || true
             ls -lah /opt/rocm/lib/librocprof-trace-decoder.so || true
         } 2>&1 | tee "${log_dir}/trace_decoder.log"
+
+        # gfx1250: 已用 ROCPROF_ATT_LIBRARY_PATH 钉死已验证的 0.1.5 decoder，
+        # 其优先级高于 /opt/rocm/lib，无需再下载 0.1.6。
+        if [[ -n "${ROCPROF_ATT_LIBRARY_PATH:-}" && \
+              -f "${ROCPROF_ATT_LIBRARY_PATH}/librocprof-trace-decoder.so" ]]; then
+            return 0
+        fi
 
         if [[ -f /opt/rocm/lib/librocprof-trace-decoder.so ]]; then
             return 0
@@ -273,21 +279,14 @@ PY
         cp -a "${OUT_DIR}/kernel_trace_summary.txt" "${collect_dir}/kernel_trace_summary.txt" 2>/dev/null || true
 
         if [[ -d "${att_output_dir}" ]]; then
-            while IFS= read -r file; do
-                cp -a "${file}" "${collect_dir}/att_files/$(basename "${file}")"
-            done < <(
-                find "${att_output_dir}" -type f \( \
-                    -name '*.att' -o \
-                    -name 'ui_*' -o \
-                    -name '*_agent_info.csv' -o \
-                    -name 'stats_ui_*.csv' -o \
-                    -name 'code.json' -o \
-                    -name 'realtime.json' -o \
-                    -name 'occupancy.json' -o \
-                    -name 'wstates*.json' -o \
-                    -name 'filenames.json' \
-                \) -print | sort
-            )
+            shopt -s nullglob
+            cp -a \
+                "${att_output_dir}"/*.att \
+                "${att_output_dir}"/ui_* \
+                "${att_output_dir}"/*_agent_info.csv \
+                "${att_output_dir}"/stats_ui_*.csv \
+                "${collect_dir}/att_files/" 2>/dev/null || true
+            shopt -u nullglob
         fi
 
         {
@@ -331,20 +330,10 @@ PY
     local selector_status=${PIPESTATUS[0]}
     set -e
 
-    local prewarm_status=99
     local att_status=99
     if [[ "${selector_status}" -eq 0 ]]; then
         # shellcheck disable=SC1090
         source "${selected_env}"
-        set +e
-        run_and_log \
-            "prewarm-flydsl-cache" \
-            "${log_dir}/03_prewarm_flydsl_cache.log" \
-            env PYTORCH_ALLOC_CONF=expandable_segments:True \
-                GPU_ARCHS=gfx1250 \
-                "${prewarm_cmd[@]}"
-        prewarm_status=$?
-        set -e
 
         cat > "${input_yaml}" <<YAML
 jobs:
@@ -366,24 +355,21 @@ YAML
 
         rm -rf "${att_output_dir}"
         mkdir -p "${thread_trace_dir}"
-        if [[ "${prewarm_status}" -eq 0 ]]; then
-            set +e
-            run_and_log \
-                "advanced-thread-trace-${KERNEL_NAME}" \
-                "${log_dir}/04_thread_trace.log" \
-                rocprofv3 -i "${input_yaml}" -- \
-                    env PYTORCH_ALLOC_CONF=expandable_segments:True \
-                        GPU_ARCHS=gfx1250 \
-                        "${test_cmd[@]}"
-            att_status=$?
-            set -e
-        fi
+        set +e
+        run_and_log \
+            "advanced-thread-trace-${KERNEL_NAME}" \
+            "${log_dir}/03_thread_trace.log" \
+            rocprofv3 -i "${input_yaml}" -- \
+                env PYTORCH_ALLOC_CONF=expandable_segments:True \
+                    GPU_ARCHS=gfx1250 \
+                    "${test_cmd[@]}"
+        att_status=$?
+        set -e
     fi
 
     {
         echo "kernel_trace_status=${kernel_trace_status}"
         echo "selector_status=${selector_status}"
-        echo "prewarm_status=${prewarm_status}"
         echo "att_status=${att_status}"
         echo "selected_kernel=${KERNEL_NAME:-unknown}"
         echo "final_tarball=${FINAL_TARBALL}"
@@ -398,7 +384,7 @@ YAML
     chmod -R a+rwX "${OUT_DIR}"
 
     if [[ "${kernel_trace_status}" -ne 0 || "${selector_status}" -ne 0 ||
-          "${prewarm_status}" -ne 0 || "${att_status}" -ne 0 ]]; then
+          "${att_status}" -ne 0 ]]; then
         return 1
     fi
 }

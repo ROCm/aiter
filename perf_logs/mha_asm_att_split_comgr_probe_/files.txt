@@ -1,8 +1,0 @@
-perf_logs/mha_asm_att_split_comgr_probe_/files.txt
-perf_logs/mha_asm_att_split_comgr_probe_/raw/heliosr-2b805-d7-3/70225_19661_shader_engine_0_6.att
-perf_logs/mha_asm_att_split_comgr_probe_/raw/heliosr-2b805-d7-3/70225_gfx1250_code_object_id_1.out
-perf_logs/mha_asm_att_split_comgr_probe_/raw/heliosr-2b805-d7-3/70225_gfx1250_code_object_id_2.out
-perf_logs/mha_asm_att_split_comgr_probe_/raw/heliosr-2b805-d7-3/70225_gfx1250_code_object_id_3.out
-perf_logs/mha_asm_att_split_comgr_probe_/raw/heliosr-2b805-d7-3/70225_gfx1250_code_object_id_4.out
-perf_logs/mha_asm_att_split_comgr_probe_/raw/heliosr-2b805-d7-3/70225_gfx1250_code_object_id_5.out
-perf_logs/mha_asm_att_split_comgr_probe_/raw/heliosr-2b805-d7-3/70225_results.db
