@@ -52,6 +52,24 @@ torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+# Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
+# Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
+def _parse_num_expert_activated():
+    raw = os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0")
+    try:
+        val = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer, got {raw!r}"
+        )
+    if val < 0:
+        raise ValueError(
+            f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}"
+        )
+    return val
+
+
+AITER_MOE_NUM_EXPERT_ACTIVATED = _parse_num_expert_activated()
 
 
 @benchmark()
@@ -108,7 +126,17 @@ def test_fmoe(
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if disable_stage2_bias:
         exp_bias2 = None
-    if AITER_MOE_EXPERT_BALANCE:
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        # Highest priority: restrict topk candidates to the first n experts.
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+        if n_act < topk or n_act > E or n_act > token * topk:
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
+                f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
+            )
+        score = torch.randn((token, E), dtype=dtype)
+        score[:, n_act:] = float("-inf")
+    elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
         end_col = topk

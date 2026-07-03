@@ -58,6 +58,24 @@ pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+# Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
+# Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
+def _parse_num_expert_activated():
+    raw = os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0")
+    try:
+        val = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer, got {raw!r}"
+        )
+    if val < 0:
+        raise ValueError(
+            f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}"
+        )
+    return val
+
+
+AITER_MOE_NUM_EXPERT_ACTIVATED = _parse_num_expert_activated()
 
 SCALE_BLOCK = 32
 DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
@@ -237,10 +255,21 @@ def _make_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route via ``fused_topk``: normal (random gating) by default; round-robin
     balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
-    op_tests/test_moe_2stage.py). Returns ``(topk_ids, topk_weights)`` on the
-    same device as ``hidden_states``."""
+    op_tests/test_moe_2stage.py). ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest
+    priority) restricts topk to the first n experts. Returns
+    ``(topk_ids, topk_weights)`` on the same device as ``hidden_states``."""
     tokens = hidden_states.shape[0]
-    if AITER_MOE_EXPERT_BALANCE:
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        # Highest priority: restrict topk candidates to the first n experts.
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+        if n_act < topk or n_act > experts or n_act > tokens * topk:
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be in "
+                f"[topk={topk}, min(experts={experts}, tokens*topk={tokens * topk})]"
+            )
+        score = torch.randn((tokens, experts), dtype=torch.float32)
+        score[:, n_act:] = float("-inf")
+    elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((tokens, experts), dtype=torch.float32)
         start_col, end_col = 0, topk
         for token_id in range(tokens):
