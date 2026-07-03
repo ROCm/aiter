@@ -23,6 +23,7 @@ container_main() {
         python op_tests/test_mha_flydsl_varlen.py
         --causal true
         --return_lse true
+        -d_qk_v 128,128
         -b 1
         -nh 32
         -sq 8192
