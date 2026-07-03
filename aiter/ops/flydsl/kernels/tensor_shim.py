@@ -14,6 +14,25 @@ from flydsl.expr.typing import T
 
 from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
 
+MOE_KERNARG_PRELOAD_COUNT = 16
+
+
+def ptr_rsrc(ptr):
+    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""
+    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
+    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+
+
+def ptr_arg(t: torch.Tensor):
+    """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
+    import flydsl.expr as fx
+
+    type_name = type(t).__name__
+    module_name = type(t).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        return flyc.from_c_void_p(fx.Uint8, 0)
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
 
 def _run_compiled(exe, *args):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
