@@ -48,7 +48,6 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.gemm_kernels import (
-    SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_splitk_hgemm_kernel_params,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
@@ -239,20 +238,12 @@ def _compile_hgemm_to_cache(
     dev = torch.device("cpu")
     torch_dtype = _torch_dtype_for_kernel(dtype)
 
-    out = torch.empty((m, n), device=dev, dtype=torch_dtype)
-    a = torch.empty((m, k), device=dev, dtype=torch_dtype)
-    b = torch.empty((n, k), device=dev, dtype=torch_dtype)
-    bias = torch.empty((n,), device=dev, dtype=torch_dtype)
-    semaphore = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,),
-        device=dev,
-        dtype=torch.int32,
-    )
-    signal = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,),
-        device=dev,
-        dtype=torch.int32,
-    )
+    out = torch.empty(0, device=dev, dtype=torch_dtype)
+    a = torch.empty(0, device=dev, dtype=torch_dtype)
+    b = torch.empty(0, device=dev, dtype=torch_dtype)
+    bias = torch.empty(0, device=dev, dtype=torch_dtype)
+    semaphore = torch.empty(0, device=dev, dtype=torch.int32)
+    signal = torch.empty(0, device=dev, dtype=torch.int32)
     stream = fx.Stream(0)
 
     exe = compile_flydsl_hgemm_kernel(
@@ -318,12 +309,11 @@ def _compile_preshuffle_to_cache(
     dev = torch.device("cpu")
     out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
 
-    # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
-    a = torch.empty((m * k,), device=dev, dtype=torch.int8)
-    b = torch.empty((n * k,), device=dev, dtype=torch.int8)
-    out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
-    scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
-    scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
+    a = torch.empty(0, device=dev, dtype=torch.int8)
+    b = torch.empty(0, device=dev, dtype=torch.int8)
+    out = torch.empty(0, device=dev, dtype=out_torch_dtype)
+    scale_a = torch.empty(0, device=dev, dtype=torch.float32)
+    scale_b = torch.empty(0, device=dev, dtype=torch.float32)
     bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
     stream = fx.Stream(0)
 

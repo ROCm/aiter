@@ -20,7 +20,11 @@ from flydsl._mlir.dialects import scf
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from aiter.ops.flydsl.kernels.tensor_shim import STensor, ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    STensor,
+    ptr_rsrc,
+    MOE_KERNARG_PRELOAD_COUNT,
+)
 
 MAX_EXPERTS_PER_BLOCK = 512
 
