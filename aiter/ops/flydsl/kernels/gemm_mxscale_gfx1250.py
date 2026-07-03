@@ -721,9 +721,7 @@ def compile_mxscale_gemm(
 
             _oob_a_row_bound = None
             if const_expr(grouped_masked_m):
-                _oob_a_row_bound = group_m_base + arith.index_cast(
-                    T.index, valid_m_i32
-                )
+                _oob_a_row_bound = group_m_base + arith.index_cast(T.index, valid_m_i32)
 
             if const_expr(use_cluster):
                 local_x, local_y = gpu.compute_cluster_position()
