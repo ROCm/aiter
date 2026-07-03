@@ -4088,7 +4088,7 @@ class FmoeTuner(TunerCommon):
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
             if _want("flydsl_nvfp4"):
-                tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
+                tasks_ck.extend(self.gen_flydsl_nvfp4_bf16_2stages_task(info, blockMs))
             if _want("opus"):
                 tasks_ck.extend(self.gen_opus_2stages_task(info, blockMs))
             if _want("asm"):
