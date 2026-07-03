@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// v4 MLA decode kernel registry (mi350 nm-recompile family).
+// v4 MLA decode kernel registries.
 //
 // Schema is IDENTICAL to hsa/gfx950/mla/mla_asm.csv so the v3 and v4
 // registries are 1:1 column-compatible. The dispatcher in
 // csrc/py_itfs_cu/asm_mla_v4.cu computes the v4-specific dispatch keys
 // (sub_Q, page_size) internally — sub_Q via the same gqa × dtype ×
-// max_seqlen_q decision tree as v3's asm_mla.cu (~lines 272-318), and
-// page_size from the KV tensor shape.
+// max_seqlen_q decision tree, and page_size from the KV tensor shape.
 //
 // Columns (consumed by hsa/codegen.py -m mla_v4):
 //   qType    : Q dtype string (fp8 / bf16)
@@ -26,8 +25,7 @@
 //
 // Dispatcher keys lookup on (qType, kvType, Gqa, ps, qSeqLen, prefill,
 // causal, lse) — exactly the same set as v3.
-// v4 nm ships a single 32n-tile kernel. Its gqa*q_seq_logical=64 tile serves
-// all three entry points (gqa=16/qSeqLen=4, gqa=64/qSeqLen=1, gqa=128/qSeqLen=1)
+// v4 kernel gqa*q_seq_logical=64 tile serves three entry points (gqa=16/qSeqLen=4, gqa=64/qSeqLen=1, gqa=128/qSeqLen=1)
 // — the dispatcher (asm_mla_v4.cu) normalizes every supported caller to this
 // (Gqa=64, qSeqLen=1) lookup key. 
 //
