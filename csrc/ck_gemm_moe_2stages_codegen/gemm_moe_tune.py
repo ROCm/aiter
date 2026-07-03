@@ -4979,12 +4979,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
             16,
             device="cuda",
         )
-        # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False,
-        # the port default since 2098023a9); _port_e2e drives the port at that
-        # default. Prepare weights/scales with is_guinterleave=False to match --
-        # shuffle_weight_a16w4 (is_guinterleave=True) is the interleaved a16w4/a8w4
-        # layout and feeding it to the separated port produces garbage
-        # (cosine_diff ~0.9975). w2 (down-proj, no gate/up) is layout-invariant.
+        # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False),
+        # so prepare weights/scales with is_guinterleave=False. The interleaved
+        # a16w4/a8w4 layout (is_guinterleave=True) fed to the separated port
+        # produces garbage. w2 (down-proj, no gate/up) is layout-invariant.
         data["w1_a16"] = shuffle_weight(
             data["w1_qt"], (16, 16), is_guinterleave=False, gate_up=True
         )

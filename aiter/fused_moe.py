@@ -58,16 +58,13 @@ BLOCK_SIZE_M = 32
 # Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
-# "adaptive sort" backend selection (our mxfp4 sort as a general World-1 backend):
-#   auto (default) -> same as adaptive; NO shape fallback. The adaptive kernel is
-#                     codegen'd for a fixed shape set (see SHAPES in
-#                     csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py); an
-#                     un-codegen'd shape hits TORCH_CHECK in aux_find rather than
-#                     falling back. This is safe today only because output_aux is
-#                     set only for tuned-CSV rows routed to the port, which are
-#                     exactly the codegen'd shapes (an implicit, hand-synced coupling).
-#   adaptive       -> force the adaptive branch (same behavior as auto)
-#   opus / ck      -> never use adaptive (legacy path; ck still needs AITER_USE_CK_MOE_SORTING)
+# "adaptive sort" backend selection (mxfp4 sort as a general World-1 backend):
+#   auto (default) / adaptive -> use the adaptive branch. NO shape fallback: the
+#     kernel is codegen'd for a fixed shape set (SHAPES in
+#     csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py) and an un-codegen'd
+#     shape hits TORCH_CHECK. Safe only because output_aux is set only for
+#     tuned-CSV rows routed to the port (exactly the codegen'd shapes).
+#   opus / ck -> never use adaptive (legacy; ck still needs AITER_USE_CK_MOE_SORTING)
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))

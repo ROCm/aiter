@@ -208,12 +208,9 @@ def compile_one_config(**job):
 
     t0 = time.time()
     try:
-        # mxfp4 a4w4 kernels are gfx950-only (scaled-MFMA f8f6f4 intrinsics,
-        # SmemAllocator(arch="gfx950")). Under the GPU-free AOT build,
-        # flyc.compile -> get_rocm_arch() falls back to hardware detection
-        # and yields gfx942, so the gfx950 intrinsics fail to select and
-        # LLVM aborts the worker. Pin FLYDSL_GPU_ARCH so the compile targets
-        # gfx950 regardless of (absent) build-host hardware.
+        # mxfp4 a4w4 kernels are gfx950-only. In the GPU-free AOT build,
+        # get_rocm_arch() detects gfx942 and the gfx950 intrinsics fail to
+        # select (LLVM aborts), so pin FLYDSL_GPU_ARCH=gfx950.
         with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
             if stage == 1:
                 _compile_stage1(job)

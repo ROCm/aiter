@@ -112,14 +112,11 @@ def parse_csv(csv_path: str):
             )
             stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
 
-            # CK-Tile stage1 (cktile_*) with split-K runs a FlyDSL post-activation
-            # epilogue on the interleaved gate/up output: silu -> silu_and_mul_fq
-            # (quant_mode="none", gui_layout=True), swiglu -> swiglu_and_mul.
-            # These are *not* flydsl_ stage names so the loop below skips them;
-            # emit a dedicated epilogue job here. The cache key depends only on
-            # (inter_dim, topk) for silu and (inter_dim) for swiglu, so the model
-            # shape from the CSV row covers it regardless of the runtime split_k
-            # (which the cfg=None heuristic path derives from get_ksplit()).
+            # cktile_ stage1 runs a FlyDSL post-activation epilogue (silu ->
+            # silu_and_mul_fq, swiglu -> swiglu_and_mul) that the flydsl_-only loop
+            # below skips, so emit its job here. The cache key needs only
+            # (inter_dim, topk)/(inter_dim), which the CSV shape covers regardless
+            # of runtime split_k.
             if stage1_name.startswith("cktile_"):
                 epi_job = {
                     "kernel_name": f"cktile_epilogue_{act}",
