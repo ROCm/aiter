@@ -51,6 +51,8 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.expr import buffer_ops
 
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
+
 BLOCK_THREADS = 256
 
 
@@ -119,10 +121,10 @@ def build_moe_gather_reduce_module(
 
     @flyc.kernel(name=module_name)
     def moe_gather_reduce_kernel(
-        grouped_out_flat: fx.Tensor,  # (E*max_m, model_dim) bf16/f16
-        topids_to_rows: fx.Tensor,  # (token_num, topk)    i32
-        gather_w: fx.Tensor,  # (token_num, topk)    bf16/f16 (== out_dtype)
-        out: fx.Tensor,  # (token_num, model_dim) bf16/f16
+        grouped_out_flat: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        out: fx.Pointer,
         num_tokens: Int32,
         slice_stride_dw: Int32,
     ):
@@ -145,10 +147,10 @@ def build_moe_gather_reduce_module(
         tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
         _if_tok = scf.IfOp(tok_valid)
         with ir.InsertionPoint(_if_tok.then_block):
-            in_rsrc = buffer_ops.create_buffer_resource(grouped_out_flat, max_size=True)
-            rows_rsrc = buffer_ops.create_buffer_resource(topids_to_rows, max_size=True)
-            w_rsrc = buffer_ops.create_buffer_resource(gather_w, max_size=True)
-            out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
+            in_rsrc = ptr_rsrc(grouped_out_flat)
+            rows_rsrc = ptr_rsrc(topids_to_rows)
+            w_rsrc = ptr_rsrc(gather_w)
+            out_rsrc = ptr_rsrc(out)
             thread_id = ArithValue(tid)
             iter_idx_i32 = ArithValue(fx.block_idx.y)
 
@@ -284,10 +286,10 @@ def build_moe_gather_reduce_module(
 
     @flyc.jit
     def launch_moe_gather_reduce(
-        grouped_out_flat: fx.Tensor,
-        topids_to_rows: fx.Tensor,
-        gather_w: fx.Tensor,
-        out: fx.Tensor,
+        grouped_out_flat: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        out: fx.Pointer,
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -311,4 +313,10 @@ def build_moe_gather_reduce_module(
             stream=stream,
         )
 
+    launch_moe_gather_reduce.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
     return launch_moe_gather_reduce
