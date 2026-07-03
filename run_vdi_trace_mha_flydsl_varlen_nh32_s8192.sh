@@ -113,6 +113,7 @@ import os
 import re
 import shlex
 import sqlite3
+import subprocess
 import sys
 
 out_dir = sys.argv[1]
@@ -137,6 +138,29 @@ def first_existing(columns, names):
     return None
 
 
+def strip_flydsl_kernel_suffix(name):
+    if name.endswith(".kd"):
+        return name[:-3]
+    return name
+
+
+def demangle_kernel_name(name):
+    stripped = strip_flydsl_kernel_suffix(name)
+    if not stripped.startswith("_Z"):
+        return stripped
+    try:
+        completed = subprocess.run(
+            ["c++filt", stripped],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return stripped
+    demangled = completed.stdout.strip()
+    return demangled if completed.returncode == 0 and demangled else stripped
+
+
 dump_symbols = []
 for llvm_ir in sorted(glob.glob(os.path.join(flydsl_dump_dir, "**", "20_llvm_ir.ll"), recursive=True)):
     try:
@@ -152,7 +176,7 @@ if not db_files:
     db_files = sorted(glob.glob(os.path.join(out_dir, "**", "*.db"), recursive=True))
 
 rows = []
-resources_by_name = {}
+normalized_resources_by_name = {}
 db_path = db_files[0] if db_files else ""
 db_error = ""
 
@@ -210,27 +234,39 @@ if db_path:
         cur.execute(query)
         rows = cur.fetchall()
         for row in rows:
-            resources_by_name[row[0]] = row[5:]
+            normalized_resources_by_name[demangle_kernel_name(row[0])] = row[5:]
         conn.close()
     except Exception as exc:
         db_error = str(exc)
 
 selected = None
-for symbol in dump_symbols:
-    if symbol.startswith("fmha_fwd_kernel"):
-        selected = symbol
+selected_raw = None
+dump_candidates = [(symbol, demangle_kernel_name(symbol)) for symbol in dump_symbols]
+for raw_symbol, kernel_name in dump_candidates:
+    raw_without_suffix = strip_flydsl_kernel_suffix(raw_symbol)
+    if raw_without_suffix.startswith("_Z") and kernel_name == raw_without_suffix:
+        continue
+    if re.search(r"(fmha|flash.*attn|mha)", kernel_name, re.IGNORECASE) and not re.search(
+        r"(triton|aten|elementwise|copy|memset)", kernel_name, re.IGNORECASE
+    ):
+        selected_raw = raw_symbol
+        selected = kernel_name
         break
-if not selected and dump_symbols:
-    selected = dump_symbols[0]
+if not selected and dump_candidates:
+    for raw_symbol, kernel_name in dump_candidates:
+        raw_without_suffix = strip_flydsl_kernel_suffix(raw_symbol)
+        if not (raw_without_suffix.startswith("_Z") and kernel_name == raw_without_suffix):
+            selected_raw, selected = raw_symbol, kernel_name
+            break
 if not selected:
     preferred = [
-        row[0]
+        (row[0], demangle_kernel_name(row[0]))
         for row in rows
-        if re.search(r"(fmha|flash.*attn|mha)", row[0], re.IGNORECASE)
-        and not re.search(r"(triton|aten|elementwise|copy|memset)", row[0], re.IGNORECASE)
+        if re.search(r"(fmha|flash.*attn|mha)", demangle_kernel_name(row[0]), re.IGNORECASE)
+        and not re.search(r"(triton|aten|elementwise|copy|memset)", demangle_kernel_name(row[0]), re.IGNORECASE)
     ]
     if preferred:
-        selected = preferred[0]
+        selected_raw, selected = preferred[0]
 
 with open(summary_path, "w", encoding="utf-8") as out:
     out.write(f"db_path={db_path or 'not_found'}\n")
@@ -238,7 +274,7 @@ with open(summary_path, "w", encoding="utf-8") as out:
         out.write(f"db_error={db_error}\n")
     out.write("dump_symbols:\n")
     for symbol in dump_symbols:
-        out.write(f"  {symbol}\n")
+        out.write(f"  {symbol} -> {demangle_kernel_name(symbol)}\n")
     out.write("\ntop kernel trace rows:\n")
     out.write(
         "kernel_name,dispatches,avg_us,min_us,max_us,"
@@ -253,10 +289,12 @@ with open(summary_path, "w", encoding="utf-8") as out:
             + "\n"
         )
     out.write(f"\nselected_kernel={selected or 'not_found'}\n")
-    if selected and selected in resources_by_name:
+    if selected_raw and selected_raw != selected:
+        out.write(f"selected_raw_kernel={selected_raw}\n")
+    if selected and selected in normalized_resources_by_name:
         labels = ["arch_vgpr", "accum_vgpr", "sgpr", "lds"]
         out.write("selected_resources:\n")
-        for label, value in zip(labels, resources_by_name[selected]):
+        for label, value in zip(labels, normalized_resources_by_name[selected]):
             out.write(f"  {label}={value}\n")
 
 if not selected:
