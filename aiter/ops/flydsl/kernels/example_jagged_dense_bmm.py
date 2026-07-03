@@ -28,17 +28,29 @@ import flydsl.compiler as flyc
 from jagged_dense_bmm import BLOCK_M, K, N, jagged_dense_bmm
 
 
-def make_seq_offsets(n_groups, max_seq_len, regime, seed, device):
+def make_seq_offsets(n_groups, max_seq_len, regime, seed, device, sparsity=0.95):
     """Per-group prefix-sum row offsets (int32, length n_groups + 1).
 
     uniform: every group has exactly max_seq_len rows.
     skew:    max_seq_len * U(0,1)**4 rows, with ~20% empty groups plus one full
              and one near-full group (closer to a real deployment distribution).
+    genrec:  M_i ~ Uniform(1, max_seq_len) * sparsity, clamped >= 1 -- mirrors the
+             recsys harness (and bench_jagged_dense_bmm_bwd_perf.py's genrec) so the
+             profile driver reproduces an identical M_i instance for a given seed.
+             Here max_seq_len is the ENVELOPE, not the per-group length.
     """
     if regime == "uniform":
         return torch.arange(
             0, (n_groups + 1) * max_seq_len, max_seq_len, dtype=torch.int32, device=device
         )
+    if regime == "genrec":
+        g = torch.Generator(device=device).manual_seed(seed)
+        lengths = torch.randint(1, max_seq_len + 1, size=(n_groups,), device=device, generator=g)
+        if sparsity < 1.0:
+            lengths = (lengths.float() * sparsity).clamp(min=1.0).to(torch.int64)
+        so = torch.zeros(n_groups + 1, dtype=torch.int32, device=device)
+        so[1:] = torch.cumsum(lengths, dim=0).to(torch.int32)
+        return so
     g = torch.Generator().manual_seed(seed)
     u = torch.rand(n_groups, generator=g)
     rows = (max_seq_len * (u**4)).floor().to(torch.int64)
@@ -113,7 +125,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="jagged_dense_bmm (jdbba) example: validate + benchmark")
     p.add_argument("-b", "--n-groups", type=int, default=64, help="number of groups (batch)")
     p.add_argument("-m", "--max-seq-len", type=int, default=512, help="max rows per group")
-    p.add_argument("--regime", choices=["uniform", "skew"], default="uniform")
+    p.add_argument("--regime", choices=["uniform", "skew", "genrec"], default="uniform")
     p.add_argument("--seed", type=int, default=1234, help="skew RNG seed")
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iters", type=int, default=100)

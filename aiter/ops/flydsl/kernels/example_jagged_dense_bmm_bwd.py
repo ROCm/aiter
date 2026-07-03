@@ -46,10 +46,10 @@ GRADS = ("djagged", "ddense", "dbias")
 BENCH_TARGETS = ("djagged", "dense_bias")
 
 
-def make_inputs(n_groups, max_seq_len, regime, seed, device):
+def make_inputs(n_groups, max_seq_len, regime, seed, device, sparsity=0.95):
     """Build forward inputs plus the upstream gradient dOut (L, N)."""
     torch.manual_seed(0)
-    seq_offsets = make_seq_offsets(n_groups, max_seq_len, regime, seed, device)
+    seq_offsets = make_seq_offsets(n_groups, max_seq_len, regime, seed, device, sparsity=sparsity)
     total_rows = int(seq_offsets[-1].item())
     jagged = torch.randn(max(total_rows, 1), K, dtype=torch.bfloat16, device=device)
     dense = torch.randn(n_groups, K, N, dtype=torch.bfloat16, device=device)

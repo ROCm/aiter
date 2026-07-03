@@ -167,8 +167,13 @@ def main(argv=None):
     p.add_argument("-d", "--dim", type=int, default=None,
                    help="square dense dim D (= K = N); overrides the compile-time "
                         "constant at runtime so no source edit is needed")
-    p.add_argument("--regime", choices=["uniform", "skew"], default="uniform")
+    p.add_argument("--regime", choices=["uniform", "skew", "genrec"], default="uniform",
+                   help="sequence-length distribution. genrec mirrors the recsys/bench "
+                        "genrec instance (max_seq_len is the ENVELOPE); use --seed/--sparsity "
+                        "matching the bench to profile the identical M_i instance.")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--sparsity", type=float, default=0.95,
+                   help="genrec regime: scale M_i ~ Uniform(1,max_seq_len) by this factor (clamped >=1)")
     p.add_argument("--only", default="all", help="comma list of {djagged,dense_bias} or 'all'")
     p.add_argument("--mode", choices=["bench", "profile"], default="bench")
     p.add_argument("--warmup", type=int, default=10)
@@ -196,7 +201,7 @@ def main(argv=None):
 
     device = "cuda"
     jagged, dense, bias, d_out, seq_offsets, total_rows = make_inputs(
-        args.n_groups, args.max_seq_len, args.regime, args.seed, device
+        args.n_groups, args.max_seq_len, args.regime, args.seed, device, sparsity=args.sparsity
     )
     if args.mode == "bench":
         print(f"shape: n_groups={args.n_groups}, max_seq_len={args.max_seq_len}, K={K}, N={N}, "
