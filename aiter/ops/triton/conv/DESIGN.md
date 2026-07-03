@@ -90,27 +90,9 @@ flowchart LR
     M --> OT[output transform<br/>Y = AᵀMA]:::stage
     OT --> Y([Y<br/>NCHW or NHWC]):::data
 
-    V -.fused path.-> FU[fused GEMM + output<br/>V → Y, skips M]:::stage
-    FU -.-> Y
-
     classDef data fill:#1e3a5f,stroke:#4a90e2,color:#fff
     classDef stage fill:#553c9a,stroke:#b794f4,color:#fff
 ```
-
-The fused kernel (`_winograd_f4x3_fused_gemm_output_kernel`) reads `V` and the
-transformed filter `U` directly, accumulates the column transform's 24 partial
-outputs in registers across the channel-tile loop, applies the final row
-transform once at the end, and writes `Y` without ever materializing the
-intermediate `M[36, T, K_out]` tensor.
-
-**The fused path is opt-in, not router-selected.** `_select_3x3_method` only
-ever returns `winograd_f4x3` or `winograd_f4x3_cblocked` — both the standard
-3-kernel pipeline. The fused variant is reachable explicitly via
-`--method winograd_f4x3_fused` in the bench tool (`op_tests/op_benchmarks/triton/bench_conv2d.py`)
-or by importing `conv2d_winograd_f4x3_fused` directly. It wins on a narrow
-band of small/medium VAE shapes but hits register pressure at the larger
-ResNet 3×3 tile shapes, so it isn't worth a special-case branch in the
-production router.
 
 ### Layered Python modules
 
@@ -137,8 +119,8 @@ aiter/ops/triton/_triton_kernels/conv/
   conv_3x3.py          3×3 NHWC kernel + 3×3 cblocked (NCHWc) kernel
   conv_general.py      K-major reduction with on-the-fly (c, r, s) decoding
   conv_3x3_winograd_f4x3.py
-                       5 kernels: input transform (NCHW & NHWC), cblocked input
-                       transform, batched GEMM, output transform, fused GEMM+output
+                       4 kernels: input transform (NCHW & NHWC), cblocked input
+                       transform, batched GEMM, output transform
 ```
 
 The split mirrors *responsibility*, not LOC: `conv2d.py` is "what does the user
@@ -380,14 +362,14 @@ Note: dilated 3×3 still routes to cblocked, not here. Strategy:
   for non-1×1/3×3 NHWC shapes.
 - **Same L2 swizzle** as 5.1/5.2/5.3 — `GROUP_SIZE_M` super-grouping along M.
 
-### 5.5 The Winograd path — five kernels
+### 5.5 The Winograd path — four kernels
 
 Winograd F(4×4, 3×3) reduces the **144** multiplies per 4×4 output tile of
 a direct 3×3 (16 outputs × 9 taps) to 36 multiplies *total* (one batched
 36-way GEMM) — **4× fewer multiplies** in the inner GEMM, modulo
 floating-point ordering. We pay for it in: (a) input/output transforms
 that touch every element with small constants, (b) increased numerical
-sensitivity in fp16/bf16. The math is in section 6; here are the five kernels:
+sensitivity in fp16/bf16. The math is in section 6; here are the four kernels:
 
 | Kernel | What it does | Output shape |
 |---|---|---|
@@ -395,16 +377,9 @@ sensitivity in fp16/bf16. The math is in section 6; here are the five kernels:
 | `_winograd_f4x3_cblocked_input_transform_kernel` | Same, but reads from NCHWc `[N, C_blocks, H, W, Cb]` for coalesced loads | `V[36, T, C_pad]` |
 | `_winograd_f4x3_batched_gemm_kernel` | 36 independent GEMMs `T × C_pad × K_out`, output `M[36, T, K_out]` | `M[36, T, K_out]` |
 | `_winograd_f4x3_output_transform_kernel` | One 6×6 `M` slice per `(t, k)`, computes `AᵀMA` (4×4), bias + activation, scatter to NCHW or NHWC output | `Y[N, K_out, P, Q]` |
-| `_winograd_f4x3_fused_gemm_output_kernel` | Streams the 36 GEMMs in 6 column-groups; applies the column transform `Aᵀ · M[:,col]` on-the-fly per group to accumulate 24 `s` values (skipping materialization of `M`), then applies the row transform once at the end. Replaces kernels 3 + 4 with a single launch at the cost of higher per-CTA register pressure (24 `BLOCK_T × BLOCK_K` fp32 accumulators). | `Y[N, K_out, P, Q]` |
 
-`conv2d_winograd_f4x3` and `conv2d_winograd_f4x3_cblocked` use the
+`conv2d_winograd_f4x3` and `conv2d_winograd_f4x3_cblocked` both use the
 3-kernel pipeline (input transform + GEMM + output transform).
-`conv2d_winograd_f4x3_fused` uses the fused 2-kernel pipeline (input
-transform + fused GEMM/output). The fused variant trades a smaller
-intermediate (skips writing/reading `M[36, T, K_out]`) for higher per-CTA
-register pressure; on RDNA4 it's slightly faster on large `(T, K_out)` and
-slightly slower on small ones, which is why both exist in the registry but
-the auto-router picks only the unfused variants.
 
 The **filter transform** `U = G g Gᵀ` runs once on the host in
 `prepack_winograd_filter_f4x3` (in fp32), then is cast to the activation
@@ -516,16 +491,6 @@ compute `AᵀMA` (4×4), add bias, apply activation, scatter to `Y` (NCHW or
 NHWC, picked via a `LAYOUT` constexpr). The scatter has to write 16 values
 per tile to a strided output; this is where the kernel does the most index
 arithmetic.
-
-The **fused GEMM+output** kernel processes `M` column-by-column over its 6
-columns (not the 4 output columns). For each `col ∈ [0, 6)`, it runs 6
-mini-GEMMs (one per α-row at that column) and applies the column transform
-`Aᵀ` on-the-fly to compress the 6 GEMM results into 4 `s` values for that
-column. These accumulate into 24 (= 4 × 6) `BLOCK_T × BLOCK_K` fp32
-accumulators across the channel-tile loop. After the channel loop, a
-single row transform produces the 4×4 output. This skips the round-trip
-of `M` through global memory but needs many more live registers per
-program — hence the two variants.
 
 ### 6.4 Numerical caveat
 
@@ -651,7 +616,6 @@ METHOD_REGISTRY = {
     "default":                MethodEntry(conv2d_nchw,                   None,        False, "",                         "default"),
     "cblocked":               MethodEntry(conv2d_nchw_cblocked,          _3x3_guard,  False, "[cblocked]",               "cblocked"),
     "winograd_f4x3":          MethodEntry(conv2d_winograd_f4x3,          _wino_guard, True,  "[winograd_f4x3]",          "WF(4,3)"),
-    "winograd_f4x3_fused":    MethodEntry(conv2d_winograd_f4x3_fused,    _wino_guard, True,  "[wino_f4x3_fused]",        "WF4fused"),
     "winograd_f4x3_cblocked": MethodEntry(conv2d_winograd_f4x3_cblocked, _wino_guard, True,  "[winograd_f4x3_cblocked]", "WF4cb"),
 }
 ```

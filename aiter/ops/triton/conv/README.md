@@ -175,7 +175,7 @@ Cross-axis flags:
 ```
 --dtype {fp16,bf16}                           # default fp16
 --layout {nchw,nhwc}                          # default nchw
---method {auto,default,cblocked,nhwc,winograd_f4x3,winograd_f4x3_fused,winograd_f4x3_cblocked}
+--method {auto,default,cblocked,nhwc,winograd_f4x3,winograd_f4x3_cblocked}
 --metric {time,throughput}                    # default throughput
 --no-bias                                     # bench the bias=None code path
 --miopen-solvers                              # detect MIOpen solver names (sweep mode; ~60-120s subprocess)

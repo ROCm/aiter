@@ -25,11 +25,9 @@ from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
     _winograd_f4x3_cblocked_input_transform_kernel,
     _winograd_f4x3_batched_gemm_kernel,
     _winograd_f4x3_output_transform_kernel,
-    _winograd_f4x3_fused_gemm_output_kernel,
     _get_config_input as _get_config_wino_input,
     _get_config_gemm as _get_config_wino_gemm,
     _get_config_output as _get_config_wino_output,
-    _get_config_fused as _get_config_wino_fused,
 )
 
 
@@ -382,93 +380,6 @@ def _launch_general(
         ACTIVATION=activation,
         LAYOUT=layout,
         **config,
-    )
-
-
-def _launch_winograd_f4x3_fused(
-    x,
-    U,
-    bias_fp32,
-    y,
-    N,
-    C,
-    H,
-    W_in,
-    K_out,
-    P,
-    Q,
-    C_pad,
-    padding,
-    activation,
-    layout="nchw",
-):
-    """Launch Winograd F(4x4,3x3) with fused GEMM+output transform (2 kernels instead of 3)."""
-    ph, pw = padding
-    tile_H = (P + 3) // 4
-    tile_W = (Q + 3) // 4
-    T = N * tile_H * tile_W
-
-    input_dtype = x.dtype
-    V = torch.empty((36, T, C_pad), device=x.device, dtype=input_dtype)
-
-    shape_key = format_shape_key(
-        N=N,
-        C=C,
-        H=H,
-        W=W_in,
-        K=K_out,
-        R=3,
-        S=3,
-        sh=1,
-        sw=1,
-        ph=ph,
-        pw=pw,
-        dh=1,
-        dw=1,
-    )
-    input_config = _get_config_wino_input(shape_key=shape_key, M=T)
-    fused_config = _get_config_wino_fused(shape_key=shape_key, M=T)
-
-    # 1. Input transform
-    _winograd_f4x3_input_transform_kernel[_make_wino_input_grid(T, C_pad)](
-        x,
-        V,
-        N,
-        C,
-        C_pad,
-        H,
-        W_in,
-        tile_H,
-        tile_W,
-        T,
-        ph,
-        pw,
-        LAYOUT=layout,
-        **input_config,
-    )
-
-    # 2. Fused GEMM + output transform
-
-    def fused_grid_f4(meta):
-        return (triton.cdiv(T, meta["BLOCK_T"]), triton.cdiv(K_out, meta["BLOCK_K"]))
-
-    _winograd_f4x3_fused_gemm_output_kernel[fused_grid_f4](
-        V,
-        U,
-        bias_fp32,
-        y,
-        N,
-        K_out,
-        P,
-        Q,
-        C_pad,
-        tile_H,
-        tile_W,
-        T,
-        HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
-        LAYOUT=layout,
-        **fused_config,
     )
 
 
