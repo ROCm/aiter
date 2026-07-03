@@ -353,10 +353,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         transpose_scale: bool = False,
         gemma_norm: bool = False,
     ):
-        # Lazy import to avoid an aiter.dist import cycle.
-        from aiter.dist.communication_op import _normalize_fused_ar_rms_quant_type
-
-        quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
+        # quant_type arrives already canonicalized to a string ("per_token"/
+        # "per_group"/"mxfp4") from the public API.
         if gemma_norm and quant_type != "per_token":
             raise NotImplementedError(
                 "gemma_norm fused quant currently supports per-token FP8 only"

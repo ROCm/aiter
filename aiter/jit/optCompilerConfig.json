@@ -382,9 +382,9 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m f4gemm --output_dir {{}}'"
     },
-    "module_f4gemm_mi400_asm": {
+    "module_f4gemm_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_f4gemm_mi400.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_f4gemm.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -395,7 +395,7 @@
     },
     "module_mxfp8fp4gemm_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mxfp8fp4gemm_mi400.cu'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mxfp8fp4gemm.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
