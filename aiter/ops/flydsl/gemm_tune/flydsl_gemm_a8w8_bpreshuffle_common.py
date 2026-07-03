@@ -41,6 +41,7 @@ class kernelInstance:
     dtype: str  # output dtype: "bf16" | "fp16"
     use_async_copy: int  # 0 or 1
     waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
+    xcd_swizzle: int  # 0=off, >0=group size for XCD remap
     sScheduler: str  # "Default" (scheduler hints on) | "Off" (compiler default)
 
     @property
@@ -67,6 +68,7 @@ class kernelInstance:
                         [
                             self.use_async_copy,
                             self.waves_per_eu,
+                            self.xcd_swizzle,
                         ],
                     )
                 ),
@@ -81,6 +83,7 @@ def _ki(
     tile_k,
     async_copy=0,
     waves_per_eu=0,
+    xcd_swizzle=0,
     scheduler="Default",
     q_dtype_a="fp8",
     q_dtype_w="fp8",
@@ -95,6 +98,7 @@ def _ki(
         dtype,
         async_copy,
         waves_per_eu,
+        xcd_swizzle,
         scheduler,
     )
 
@@ -208,6 +212,7 @@ _base_tiles_950_extra = [
 # ---------------------------------------------------------------------------
 _ASYNC_COPY_VALS = (0, 1)
 _WAVES_PER_EU    = (0, 1, 2, 3, 4)
+_XCD_SWIZZLE_VALS = (0, 4)  # 0=off, >0=XCD remap group size
 _SCHEDULER_VALS  = ("Default", "Off")  # in-loop sched hints on / compiler default
 
 _WAVES_PER_WG = 4  # typical wavefronts per workgroup in FlyDSL preshuffle GEMM
@@ -247,11 +252,12 @@ def _build_kernels_list(tiles, total_vgpr=512):
     for sched in _SCHEDULER_VALS:
         for wpe in _WAVES_PER_EU:
             for acp in _ASYNC_COPY_VALS:
-                for tm, tn, tk in tiles:
-                    if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
-                        continue
-                    kl[idx] = _ki(tm, tn, tk, acp, wpe, sched)
-                    idx += 1
+                for xcd in _XCD_SWIZZLE_VALS:
+                    for tm, tn, tk in tiles:
+                        if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
+                            continue
+                        kl[idx] = _ki(tm, tn, tk, acp, wpe, xcd, sched)
+                        idx += 1
     return kl
 
 
@@ -264,20 +270,20 @@ kernels_list_950 = _build_kernels_list(
 # fmt: on
 
 default_kernels_dict_942 = {
-    (-1): _ki(128, 128, 128, 0, 2, "Default"),
-    (-2): _ki(16, 64, 512, 0, 2, "Default"),
-    (-3): _ki(32, 64, 512, 0, 2, "Default"),
-    (-4): _ki(64, 256, 64, 0, 2, "Default"),
-    (-5): _ki(128, 128, 64, 0, 2, "Default"),
-    (-6): _ki(128, 64, 128, 0, 2, "Default"),
-    (-7): _ki(64, 256, 128, 0, 2, "Default"),
+    (-1): _ki(128, 128, 128, 0, 2, scheduler="Default"),
+    (-2): _ki(16, 64, 512, 0, 2, scheduler="Default"),
+    (-3): _ki(32, 64, 512, 0, 2, scheduler="Default"),
+    (-4): _ki(64, 256, 64, 0, 2, scheduler="Default"),
+    (-5): _ki(128, 128, 64, 0, 2, scheduler="Default"),
+    (-6): _ki(128, 64, 128, 0, 2, scheduler="Default"),
+    (-7): _ki(64, 256, 128, 0, 2, scheduler="Default"),
 }
 
 default_kernels_dict_950 = {
-    (-1): _ki(128, 256, 256, 0, 2, "Default"),
-    (-2): _ki(16, 64, 512, 0, 2, "Default"),
-    (-3): _ki(32, 64, 512, 0, 2, "Default"),
-    (-4): _ki(128, 128, 128, 0, 2, "Default"),
+    (-1): _ki(128, 256, 256, 0, 2, scheduler="Default"),
+    (-2): _ki(16, 64, 512, 0, 2, scheduler="Default"),
+    (-3): _ki(32, 64, 512, 0, 2, scheduler="Default"),
+    (-4): _ki(128, 128, 128, 0, 2, scheduler="Default"),
 }
 
 arch = get_gfx()

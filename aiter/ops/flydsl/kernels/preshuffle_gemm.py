@@ -14,6 +14,8 @@ from flydsl.expr.typing import BFloat16, Float8E4M3FN, Float8E4M3FNUZ, Float16, 
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
+from .mfma_preshuffle_pipeline import xcd_remap_bx_by
+
 # (dsrd_preload, dvmem_preload) per (tile_m, tile_n, tile_k); ported from v1.
 _TILE_PRELOAD_TABLE = {
     # (tile_m, tile_n, tile_k): (dsrd_preload, dvmem_preload)
@@ -119,6 +121,7 @@ def compile_preshuffle_gemm(
     waves_per_eu: Optional[int] = None,
     enable_scheduler: bool = True,
     use_async_copy: bool = False,
+    xcd_swizzle: int = 0,
 ):
     """Compile preshuffle GEMM (layout API, fp8/int8/fp16/bf16).
 
@@ -208,6 +211,18 @@ def compile_preshuffle_gemm(
     ):
         tid = fx.thread_idx.x
         bid_x, bid_y, _ = fx.block_idx
+
+        if const_expr(xcd_swizzle > 0):
+            _bx, _by = xcd_remap_bx_by(
+                gpu.block_id("x"),
+                gpu.block_id("y"),
+                fx.Index(i32_m),
+                tile_m=tile_m,
+                tile_n=tile_n,
+                N=N,
+                xcd_swizzle=xcd_swizzle,
+            )
+            bid_x, bid_y = Int32(_bx), Int32(_by)
 
         if const_expr(use_mfma_scale_128):
             _scale_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, layout_elem))
@@ -516,8 +531,8 @@ def compile_preshuffle_gemm(
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
         else:
-            bx_m = gpu.block_id("x") * tile_m
-            by_n = gpu.block_id("y") * tile_n
+            bx_m = bid_x * tile_m
+            by_n = bid_y * tile_n
             wave_id = gpu.thread_id("x") // 64
             lane_id = gpu.thread_id("x") % 64
             lane_div_16 = lane_id // 16

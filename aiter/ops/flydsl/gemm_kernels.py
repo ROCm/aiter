@@ -990,6 +990,7 @@ def flydsl_preshuffle_gemm_a8(
     tile_k: int,
     use_async_copy: int = 0,
     waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
     enable_scheduler: bool = True,
 ) -> Tensor:
     """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel."""
@@ -1041,6 +1042,7 @@ def flydsl_preshuffle_gemm_a8(
         use_async_copy=bool(use_async_copy),
         waves_per_eu=wpe,
         enable_scheduler=bool(enable_scheduler),
+        xcd_swizzle=int(xcd_swizzle),
     )
 
     def _as_i8(t):
