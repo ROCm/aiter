@@ -144,7 +144,8 @@ float flatmm_calc(const ck_tile::ScaleFlatmmHostArgs<ScaleM, ScaleN>& args,
         auto kargs = Kernel::MakeKernelArgs(args);
 
         const dim3 grids      = Kernel::GridSize(kargs);
-        constexpr dim3 blocks = Kernel::BlockSize();
+        // BlockSize() calls runtime is_wave32(), so it cannot be constexpr
+        const dim3 blocks = Kernel::BlockSize();
 
         if(!Kernel::IsSupportedArgument(kargs))
         {
