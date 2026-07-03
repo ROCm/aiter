@@ -643,6 +643,8 @@ struct layout_cached : public remove_cvref_t<Layout> {
     array<index_t, num_issues> offsets;
 };
 
+// Wraps a layout with a *compile-time* offset N. Keeping N in the type lets smem::tr_load lower it into the `offset:` immediate of ds_read_b64_tr_*,
+// Construct it as `layout/layout_linear/layout_cached + number<N>{}`
 template<typename Layout, index_t N>
 struct layout_shifted : public remove_cvref_t<Layout> {
     using base = remove_cvref_t<Layout>;
@@ -651,6 +653,9 @@ struct layout_shifted : public remove_cvref_t<Layout> {
     OPUS_H_D constexpr layout_shifted(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord) {}
     template <typename... Cs>
     OPUS_H_D constexpr auto operator()(Cs&&... cs) const { return base::operator()(std::forward<Cs>(cs)...) + N; }
+
+    OPUS_H_D constexpr layout_shifted& operator+=(index_t offset) { static_cast<base&>(*this) += offset; return *this; }
+    OPUS_H_D constexpr layout_shifted operator+(index_t offset) const { layout_shifted result(*this); static_cast<base&>(result) += offset; return result; }
 };
 
 template<typename T> struct is_layout : false_type {};
