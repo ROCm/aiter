@@ -263,12 +263,20 @@ def get_moe_a4w4_layouts_gfx1250(
             order=[1, 0],
             cga_layout=CGA_B_NMAJOR,
         )
-    SHARED_LAYOUT_X_SCALES = gl.PaddedSharedLayout.with_identity_for(
-        interval_padding_pairs=[[256, 16]],
-        shape=[PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
-        order=[1, 0],
-        cga_layout=CGA_A,
-    )
+    if MX_SCALE_BLOCK_K <= 256:
+        SHARED_LAYOUT_X_SCALES = gl.PaddedSharedLayout.with_identity_for(
+            interval_padding_pairs=[[256, 16]],
+            shape=[PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
+            order=[1, 0],
+            cga_layout=CGA_A,
+        )
+    else:
+        SHARED_LAYOUT_X_SCALES = gl.PaddedSharedLayout.with_identity_for(
+            interval_padding_pairs=[[MX_SCALE_BLOCK_K, 16]],
+            shape=[PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
+            order=[1, 0],
+            cga_layout=CGA_A,
+        )
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         SHARED_LAYOUT_W_SCALES = gl.SwizzledSharedLayout(
             vec=1,
@@ -277,9 +285,16 @@ def get_moe_a4w4_layouts_gfx1250(
             order=[1, 0],
             cga_layout=CGA_B_NMAJOR,
         )
-    else:
+    elif MX_SCALE_BLOCK_K <= 256:
         SHARED_LAYOUT_W_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[256, 16]],
+            shape=[SCALE_BLOCK_N, PACKED_MX_BLOCK],
+            order=[1, 0],
+            cga_layout=CGA_B_NMAJOR,
+        )
+    else:
+        SHARED_LAYOUT_W_SCALES = gl.PaddedSharedLayout.with_identity_for(
+            interval_padding_pairs=[[MX_SCALE_BLOCK_K, 16]],
             shape=[SCALE_BLOCK_N, PACKED_MX_BLOCK],
             order=[1, 0],
             cga_layout=CGA_B_NMAJOR,
