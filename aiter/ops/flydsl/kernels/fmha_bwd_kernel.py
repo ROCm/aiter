@@ -25,15 +25,22 @@ B[k=(l//16)×4..+3, n=l%16] is loaded from Q[l%16, D_step×16+(l//16)×4..+3]
 which treats the M-index as MFMA-N and the D-index as MFMA-K.
 The result C[n,m] = Σ_d K[n,d]·Q[m,d] = (K @ Q^T)[n,m] ✓
 
-LDS layout  (~47.5 KB total; gfx950 LDS limit is 160 KB = 163840 B)
-Row strides are padded (LDS_D=136, LDS_M=20) to avoid bank conflicts.
+FUSED: this kernel produces dK, dV (VGPR accumulate → store) AND dQ (dS^T·K →
+fp32 atomic-add into the dq workspace), CK-style. There is no separate dQ kernel.
+
+LDS layout (~75 KB total; gfx950 limit 160 KB). Row strides padded (LDS_D=136,
+LDS_M=20) for bank conflicts; transposed copies (Qᵀ/dOᵀ/Kᵀ) let the K=16 MFMA B
+operand be read as a contiguous vec4 instead of a scalar column gather.
 ────────────────────────────────────────────────
-  k_lds  [64, 136] bf16  — 17 KB  loaded once per K-tile
-  v_lds  [64, 136] bf16  — 17 KB  loaded once per K-tile
-  q_lds  [16, 136] bf16  — 4.25KB reloaded each inner Q-block
-  do_lds [16, 136] bf16  — 4.25KB reloaded each inner Q-block
-  p_lds  [64,  20] bf16  — 2.5 KB written after softmax, read by dV MFMA
-  ds_lds [64,  20] bf16  — 2.5 KB written after dS pointwise, read by dK/dQ MFMA
+  k_lds  [64, 136] bf16   loaded once per K-tile (resident)
+  v_lds  [64, 136] bf16   loaded once per K-tile (resident)
+  kt_lds [128, 68] bf16   Kᵀ, written once per K-tile → fused-dQ B read
+  q_lds  [16, 136] bf16   reloaded each inner Q-block
+  do_lds [16, 136] bf16   reloaded each inner Q-block
+  qt_lds [128, 20] bf16   Qᵀ → dK MFMA B read
+  dot_lds[128, 20] bf16   dOᵀ → dV MFMA B read
+  p_lds  [64,  20] bf16   read by dV MFMA
+  ds_lds [64,  20] bf16   read by dK & fused-dQ MFMA
 """
 
 from __future__ import annotations
@@ -101,9 +108,15 @@ _DS_LDS_OFF = _P_LDS_OFF + BLOCK_N * LDS_M * 2
 # reads. Written during the Q/dO load (reusing the already-loaded value → no VGPR
 # blowup, no extra barrier). LDS_MT=20 keeps the transposed rows off bank 0.
 LDS_MT = BLOCK_M + 4  # 20  (Q^T/dO^T row stride, bf16; transposed M-dim)
+# K^T copy ([D, N]) written ONCE per K-tile (K is loop-invariant) so the fused dQ
+# reads its B=K operand as a contiguous vec4 instead of _load_b_col_frag's scalar
+# strided reads. Amortized across all inner Q-blocks. LDS_NT_K=68 → conflict-free
+# transposed read (bank=(d*2)%32 over 16 consecutive d) and 8-byte aligned.
+LDS_NT_K = BLOCK_N + 4  # 68  (K^T row stride = N dim, bf16)
 _QT_LDS_OFF = _DS_LDS_OFF + BLOCK_N * LDS_M * 2
 _DOT_LDS_OFF = _QT_LDS_OFF + D * LDS_MT * 2
-_LDS_TOTAL = _DOT_LDS_OFF + D * LDS_MT * 2  # ~58 KB (< 160 KB ✓)
+_KT_LDS_OFF = _DOT_LDS_OFF + D * LDS_MT * 2
+_LDS_TOTAL = _KT_LDS_OFF + D * LDS_NT_K * 2  # ~75 KB (< 160 KB ✓)
 
 ELEM_BYTES = 2  # bf16
 
@@ -227,9 +240,24 @@ def _load_b_rowT_frag(lds, d_col_base_i32, lane):
     m_start = arith.muli(kg, arith.constant(A_FRAG, type=i32))  # k=M start (0/4/8/12)
     idx = arith.index_cast(
         T.index,
-        arith.addi(
-            arith.muli(d_row, arith.constant(lds._lds_cols, type=i32)), m_start
-        ),
+        arith.addi(arith.muli(d_row, arith.constant(lds._lds_cols, type=i32)), m_start),
+    )
+    return _bf16_to_v4i16(lds.lds.vec_load((idx,), A_FRAG))
+
+
+def _load_b_rowT_frag_n(lds, d_col_base_i32, n_base_i32, lane):
+    """Like _load_b_rowT_frag but with an N-group base — for Kᵀ [D, N] where N
+    spans multiple 16-row groups. Reads B[k=N=n_base+(l//16)*4..+3, n=D=d_col_base
+    +l%16] as a contiguous vec4 in N. Returns v4i16.
+    """
+    i32 = T.i32
+    m16 = arith.remui(lane, arith.constant(WMMA_SIZE, type=i32))
+    kg = arith.divui(lane, arith.constant(WMMA_SIZE, type=i32))
+    d_row = arith.addi(d_col_base_i32, m16)
+    n_start = arith.addi(n_base_i32, arith.muli(kg, arith.constant(A_FRAG, type=i32)))
+    idx = arith.index_cast(
+        T.index,
+        arith.addi(arith.muli(d_row, arith.constant(lds._lds_cols, type=i32)), n_start),
     )
     return _bf16_to_v4i16(lds.lds.vec_load((idx,), A_FRAG))
 
@@ -443,6 +471,7 @@ def build_fmha_bwd_kernel_module(
             ds_lds_s = _mk_lds(_DS_LDS_OFF, BLOCK_N * LDS_M)
             qt_lds_s = _mk_lds(_QT_LDS_OFF, D * LDS_MT)  # Q^T [D, M]
             dot_lds_s = _mk_lds(_DOT_LDS_OFF, D * LDS_MT)  # dO^T [D, M]
+            kt_lds_s = _mk_lds(_KT_LDS_OFF, D * LDS_NT_K)  # K^T [D, N]
 
             K_LDS = _LDS(k_lds_s, LDS_D)
             V_LDS = _LDS(v_lds_s, LDS_D)
@@ -452,6 +481,7 @@ def build_fmha_bwd_kernel_module(
             DS_LDS = _LDS(ds_lds_s, LDS_M)
             QT_LDS = _LDS(qt_lds_s, LDS_MT)
             DOT_LDS = _LDS(dot_lds_s, LDS_MT)
+            KT_LDS = _LDS(kt_lds_s, LDS_NT_K)
 
             # ── Load K[BLOCK_N, D] into LDS  (256 threads, 32 elems each) ─
             for ei in range_constexpr(BLOCK_N * D // BLOCK_THREADS):
@@ -462,14 +492,7 @@ def build_fmha_bwd_kernel_module(
                 boff = arith.muli(
                     arith.addi(batch_idx * sb_k + head_idx * sh_k + n_g * sn_k, col), c2
                 )
-                k_lds_s[
-                    arith.index_cast(
-                        T.index,
-                        arith.addi(
-                            arith.muli(row, arith.constant(LDS_D, type=i32)), col
-                        ),
-                    )
-                ] = arith.bitcast(
+                k_val = arith.bitcast(
                     T.bf16,
                     arith.trunci(
                         T.i16,
@@ -479,6 +502,22 @@ def build_fmha_bwd_kernel_module(
                         ),
                     ),
                 )
+                k_lds_s[
+                    arith.index_cast(
+                        T.index,
+                        arith.addi(
+                            arith.muli(row, arith.constant(LDS_D, type=i32)), col
+                        ),
+                    )
+                ] = k_val
+                kt_lds_s[
+                    arith.index_cast(
+                        T.index,
+                        arith.addi(
+                            arith.muli(col, arith.constant(LDS_NT_K, type=i32)), row
+                        ),
+                    )
+                ] = k_val
 
             # ── Load V[BLOCK_N, D] into LDS ────────────────────────────────
             for ei in range_constexpr(BLOCK_N * D // BLOCK_THREADS):
@@ -742,11 +781,44 @@ def build_fmha_bwd_kernel_module(
                     )
                     new_dk[dt] = _mfma(a, b, new_dk[dt])
 
-                # ── dQ: MFMA contribution per warp → atomic add ──────────
-                # A = dS^T[M_Q, K_tile]: col access to DS_LDS
-                #   A[M=l%16=M_Q, K=(l//16)*4+j=K_tile_N_row]
-                #   = DS_LDS[K_tile_N_row=n_warp+(l//16)*4+j, M_Q=l%16]  (col access)
-                # dQ is handled by fmha_bwd_dq_kernel (outer-Q kernel, no atomics)
+                # ── Fused dQ: dQ[M,D] += dS^T @ K  → fp32 atomic-add ─────
+                # CK-style single-pass dQ (no separate recompute kernel). dS is
+                # already in DS_LDS [N,M] and K in K_LDS [N,D]; contract over N.
+                # Each warp owns 2 of the 8 D-tiles (2*wid, 2*wid+1) and sums over
+                # ALL N-groups → full dQ for those tiles, no cross-warp reduction.
+                # MFMA: A=dS[k=N,i=M], B=K[k=N,j=D] (both via _load_b_col_frag).
+                # C-layout: dQ[M=(l//16)*4+ci, D=l%16].
+                N_GROUPS = BLOCK_N // WMMA_SIZE  # 4
+                dqt0 = arith.muli(wid, arith.constant(2 * WMMA_SIZE, type=i32))
+                dqt1 = arith.addi(dqt0, arith.constant(WMMA_SIZE, type=i32))
+                dq0 = zero_v4
+                dq1 = zero_v4
+                for ng in range_constexpr(N_GROUPS):
+                    ngb = arith.constant(ng * WMMA_SIZE, type=i32)
+                    a_ds = _load_b_col_frag(
+                        DS_LDS, ngb, arith.constant(0, type=i32), lane
+                    )
+                    b_k0 = _load_b_rowT_frag_n(KT_LDS, dqt0, ngb, lane)
+                    b_k1 = _load_b_rowT_frag_n(KT_LDS, dqt1, ngb, lane)
+                    dq0 = _mfma(a_ds, b_k0, dq0)
+                    dq1 = _mfma(a_ds, b_k1, dq1)
+                for tile_off, dq_v in ((dqt0, dq0), (dqt1, dq1)):
+                    for ci in range_constexpr(C_FRAG):
+                        val = _llvm.extractelement(
+                            dq_v, arith.unwrap(arith.constant(ci, type=T.i32))
+                        )
+                        m_row = arith.addi(
+                            q_start,
+                            arith.addi(
+                                arith.muli(kg, c4_i32), arith.constant(ci, type=i32)
+                            ),
+                        )
+                        d_col = arith.addi(tile_off, m_lane)
+                        dq_dw = (
+                            batch_idx * sb_dq + head_idx * sh_dq + m_row * sm_dq + d_col
+                        )
+                        _buf_atomic_add_f32(dq_rsrc, dq_dw, arith.mulf(val, scale_v))
+
                 gpu.barrier()
                 scf.YieldOp(new_dk + new_dv)
 

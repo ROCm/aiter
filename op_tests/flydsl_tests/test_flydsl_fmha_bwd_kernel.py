@@ -12,9 +12,6 @@ from aiter.ops.flydsl.kernels.fmha_bwd_preprocess import (
     build_fmha_bwd_preprocess_module,
 )
 from aiter.ops.flydsl.kernels.fmha_bwd_kernel import build_fmha_bwd_kernel_module
-from aiter.ops.flydsl.kernels.fmha_bwd_dq_kernel import (
-    build_fmha_bwd_dq_kernel_module,
-)
 
 
 def ref_forward(q, k, v, sm_scale, causal=False):
@@ -90,7 +87,7 @@ def run_test(B, H, Sq, D, dtype=torch.bfloat16):
     )
     torch.cuda.synchronize()
 
-    # Pass 2: dK/dV kernel (outer-K, inner-Q) — writes dK, dV only
+    # Pass 2: fused dQ/dK/dV kernel (outer-K, inner-Q) — writes dQ (atomic), dK, dV
     dq = torch.zeros(B, H, Sq, D, dtype=torch.float32, device="cuda")
     dk = torch.zeros(B, H, Sq, D, dtype=torch.float32, device="cuda")
     dv = torch.zeros(B, H, Sq, D, dtype=torch.float32, device="cuda")
@@ -139,46 +136,6 @@ def run_test(B, H, Sq, D, dtype=torch.bfloat16):
         sdv_b,
         sdv_h,
         sdv_n,
-        sl_b,
-        sl_h,
-        sl_m,
-        sdelta_b,
-        sdelta_h,
-        sdelta_m,
-        Sq,
-        Sq,
-        H,
-        B,
-    )
-    torch.cuda.synchronize()
-
-    # Pass 3: dQ kernel (outer-Q, inner-K, MFMA, no atomics)
-    # The dK/dV kernel above does NOT write dQ — dQ is produced here.
-    dq_kern = build_fmha_bwd_dq_kernel_module(head_dim=D, dtype=dtype_str)
-    dq_kern(
-        q,
-        k,
-        v,
-        do,
-        dq,
-        lse,
-        delta,
-        sm_scale,
-        sq_b,
-        sq_h,
-        sq_m,
-        sk_b,
-        sk_h,
-        sk_n,
-        sv_b,
-        sv_h,
-        sv_n,
-        sdo_b,
-        sdo_h,
-        sdo_m,
-        sdq_b,
-        sdq_h,
-        sdq_m,
         sl_b,
         sl_h,
         sl_m,

@@ -15,9 +15,6 @@ from aiter.ops.flydsl.kernels.fmha_bwd_preprocess import (
     build_fmha_bwd_preprocess_module,
 )
 from aiter.ops.flydsl.kernels.fmha_bwd_kernel import build_fmha_bwd_kernel_module
-from aiter.ops.flydsl.kernels.fmha_bwd_dq_kernel import (
-    build_fmha_bwd_dq_kernel_module,
-)
 
 # ── shape ───────────────────────────────────────────────────────────────────
 # Env overrides let rocprof run a small, fast, counter-attributable pass:
@@ -25,7 +22,7 @@ from aiter.ops.flydsl.kernels.fmha_bwd_dq_kernel import (
 B, HQ, HK, D = 1, 5, 5, 128
 SQ = SK = int(os.environ.get("PROF_SQ", 75600))
 DTYPE = torch.bfloat16
-SM_SCALE = D**-0.5
+SM_SCALE = D ** -0.5
 WARMUP = int(os.environ.get("PROF_WARMUP", 5))
 ITERS = int(os.environ.get("PROF_ITERS", 20))
 
@@ -83,47 +80,65 @@ def main():
 
     prep = build_fmha_bwd_preprocess_module(head_dim=D, dtype="bf16")
     dkdv = build_fmha_bwd_kernel_module(head_dim=D, block_m=16, dtype="bf16")
-    dqk = build_fmha_bwd_dq_kernel_module(head_dim=D, dtype="bf16")
 
     def run_prep():
         prep(
-            out_, do_, delta,
-            *_bhsd(out_), *_bhsd(do_),
-            int(delta.stride(0)), int(delta.stride(1)), int(delta.stride(2)),
-            SQ, B, HQ,
+            out_,
+            do_,
+            delta,
+            *_bhsd(out_),
+            *_bhsd(do_),
+            int(delta.stride(0)),
+            int(delta.stride(1)),
+            int(delta.stride(2)),
+            SQ,
+            B,
+            HQ,
         )
 
     def run_dkdv():
         dkdv(
-            q_, k_, v_, do_, dq_f32, dk_f32, dv_f32, lse_, delta, SM_SCALE,
-            *_bhs(q_), *_bhs(k_), *_bhs(v_), *_bhs(do_),
-            *_bhs(dq_f32), *_bhs(dk_f32), *_bhs(dv_f32),
-            int(lse_.stride(0)), int(lse_.stride(1)), int(lse_.stride(2)),
-            int(delta.stride(0)), int(delta.stride(1)), int(delta.stride(2)),
-            SQ, SK, HQ, B,
-        )
-
-    def run_dq():
-        dqk(
-            q_, k_, v_, do_, dq_f32, lse_, delta, SM_SCALE,
-            *_bhs(q_), *_bhs(k_), *_bhs(v_), *_bhs(do_), *_bhs(dq_f32),
-            int(lse_.stride(0)), int(lse_.stride(1)), int(lse_.stride(2)),
-            int(delta.stride(0)), int(delta.stride(1)), int(delta.stride(2)),
-            SQ, SK, HQ, B,
+            q_,
+            k_,
+            v_,
+            do_,
+            dq_f32,
+            dk_f32,
+            dv_f32,
+            lse_,
+            delta,
+            SM_SCALE,
+            *_bhs(q_),
+            *_bhs(k_),
+            *_bhs(v_),
+            *_bhs(do_),
+            *_bhs(dq_f32),
+            *_bhs(dk_f32),
+            *_bhs(dv_f32),
+            int(lse_.stride(0)),
+            int(lse_.stride(1)),
+            int(lse_.stride(2)),
+            int(delta.stride(0)),
+            int(delta.stride(1)),
+            int(delta.stride(2)),
+            SQ,
+            SK,
+            HQ,
+            B,
         )
 
     print(f"Shape: B={B} HQ={HQ} Sq={SQ} D={D} {DTYPE}")
     print(f"{'':26s} {'ms':>10}")
     print("-" * 52)
     t_prep = time_kernel("1. preprocess (delta)", run_prep)
-    t_dkdv = time_kernel("2. dK/dV kernel", run_dkdv)
-    t_dq = time_kernel("3. dQ kernel", run_dq)
-    total = t_prep + t_dkdv + t_dq
+    t_dkdv = time_kernel("2. dQ/dK/dV (fused)", run_dkdv)
+    total = t_prep + t_dkdv
     print("-" * 52)
-    print(f"  {'sum of 3 kernels':26s} {total:8.3f} ms   "
-          f"{FLOPS_5 / (total * 1e-3) / 1e12:8.1f} TFLOPS")
-    print(f"  breakdown: prep {t_prep/total:.0%}  "
-          f"dK/dV {t_dkdv/total:.0%}  dQ {t_dq/total:.0%}")
+    print(
+        f"  {'sum of 2 kernels':26s} {total:8.3f} ms   "
+        f"{FLOPS_5 / (total * 1e-3) / 1e12:8.1f} TFLOPS"
+    )
+    print(f"  breakdown: prep {t_prep/total:.0%}  dQ/dK/dV {t_dkdv/total:.0%}")
     print(f"  CK target ~836 TFLOPS")
 
 

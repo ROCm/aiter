@@ -3,11 +3,11 @@
 
 """High-level FlyDSL Flash Attention Backward API.
 
-Four-pass execution:
-  1. Preprocess   — delta = rowsum(O * dO)
-  2. dK/dV kernel — outer-K, inner-Q MFMA (K/V LDS-resident)
-  3. dQ kernel    — outer-Q, inner-K MFMA (no atomics, direct VGPR store)
-  4. Cast         — fp32 → input dtype
+Three-pass execution (CK-style fused dQ+dK+dV):
+  1. Preprocess     — delta = rowsum(O * dO)
+  2. dQ/dK/dV kernel — outer-K, inner-Q MFMA (K/V LDS-resident). dK/dV in VGPR;
+                       dQ = dS^T·K fused in-kernel via fp32 atomic-add.
+  3. Cast           — fp32 → input dtype
 
 Constraints: non-causal, MHA (Hq==Hk), BSHD layout, Sq multiple of 64,
              head_dim=128, bf16/fp16.
@@ -23,10 +23,7 @@ from .kernels.fmha_bwd_preprocess import build_fmha_bwd_preprocess_module
 from .kernels.fmha_bwd_kernel import (
     build_fmha_bwd_kernel_module,
     BLOCK_M as _BWD_BLOCK_M,
-)
-from .kernels.fmha_bwd_dq_kernel import (
-    build_fmha_bwd_dq_kernel_module,
-    BLOCK_M_DQ as _DQ_BLOCK_M,
+    BLOCK_N as _BWD_BLOCK_N,
 )
 
 __all__ = ["flydsl_flash_attn_backward"]
@@ -46,13 +43,8 @@ def _get_dkdv_kernel(head_dim: int, block_m: int, dtype_str: str):
     )
 
 
-@lru_cache(maxsize=32)
-def _get_dq_kernel(head_dim: int, dtype_str: str):
-    return build_fmha_bwd_dq_kernel_module(head_dim=head_dim, dtype=dtype_str)
-
-
-# Sq must be a multiple of both kernels' tile sizes
-_REQ_MULTIPLE = max(_BWD_BLOCK_M, _DQ_BLOCK_M)  # max(16, 64) = 64
+# Sq/Sk must be a multiple of the fused kernel's K-tile (BLOCK_N=64).
+_REQ_MULTIPLE = _BWD_BLOCK_N  # 64
 
 
 def flydsl_flash_attn_backward(
@@ -130,7 +122,8 @@ def flydsl_flash_attn_backward(
     def _bhs(t):
         return int(t.stride(0)), int(t.stride(2)), int(t.stride(1))
 
-    # ── Pass 2: dK, dV kernel (outer-K, inner-Q, MFMA) ──────────────────
+    # ── Pass 2: fused dQ/dK/dV kernel (outer-K, inner-Q, MFMA) ──────────
+    # dK/dV via VGPR accumulate; dQ = dS^T·K fused, fp32 atomic-add into dq_f32.
     dkdv = _get_dkdv_kernel(D, _BWD_BLOCK_M, dtype_str)
     dkdv(
         q,
@@ -163,36 +156,10 @@ def flydsl_flash_attn_backward(
         stream=stream,
     )
 
-    # ── Pass 3: dQ kernel (outer-Q, inner-K, MFMA, no atomics) ──────────
-    dq_kern = _get_dq_kernel(D, dtype_str)
-    dq_kern(
-        q,
-        k,
-        v,
-        do,
-        dq_f32,
-        softmax_lse,
-        delta,
-        sm_scale,
-        *_bhs(q),
-        *_bhs(k),
-        *_bhs(v),
-        *_bhs(do),
-        *_bhs(dq_f32),
-        int(softmax_lse.stride(0)),
-        int(softmax_lse.stride(1)),
-        int(softmax_lse.stride(2)),
-        int(delta.stride(0)),
-        int(delta.stride(1)),
-        int(delta.stride(2)),
-        Sq,
-        Sk,
-        Hq,
-        B,
-        stream=stream,
-    )
+    # NOTE: dQ is now produced by the dK/dV kernel above (fused, CK-style, fp32
+    # atomic-add into dq_f32) — the separate outer-Q dQ kernel is retired.
 
-    # ── Pass 4: cast fp32 → input dtype ──────────────────────────────────
+    # ── Pass 3: cast fp32 → input dtype ──────────────────────────────────
     dq.copy_(dq_f32.to(q.dtype))
     dk.copy_(dk_f32.to(k.dtype))
     dv.copy_(dv_f32.to(v.dtype))
