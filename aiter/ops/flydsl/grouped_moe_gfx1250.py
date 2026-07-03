@@ -29,6 +29,11 @@ _GROUPED_WEIGHT_CACHE = {}
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable) per-kernel launches; None in production.
 kernel_bench_callable = None
 
+# Opt-in bench hook: a caller sets a list here to collect a single callable that
+# runs the full grouped MoE computation EXCLUDING routing (stage1 + a2_quant +
+# stage2 + gather-reduce). This lets the test bench loop skip route overhead.
+bench_callable = None
+
 
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     """Contiguous uint8 view of a static MoE weight, cached by data_ptr."""
@@ -202,7 +207,7 @@ def _make_contiguous_psum_layout(
     device = masked_m.device
 
     starts_t, psum_t, _ = contiguous_psum(masked_m, int(experts), int(tile_m))
-    ub = int(token_num) * int(topk) + int(experts) * (int(tile_m) - 1)
+    ub = int(token_num) * int(topk) + int(experts) * int(tile_m) - int(topk)
     contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
 
     old_flat = topids_to_rows.reshape(-1)
@@ -703,7 +708,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 flydsl_moe_topids_to_rows,
             )
 
-            ub = int(token_num) * int(topk) + int(E) * (int(tile_m) - 1)
+            ub = int(token_num) * int(topk) + int(E) * int(tile_m) - int(topk)
             contiguous_m = max(int(tile_m), _align_up(ub, int(tile_m)))
             route_E = 1
             route_max_m = int(contiguous_m)
@@ -1101,6 +1106,36 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 vals = vals * route_weights[e, :n].view(-1, 1)
             moe_out.index_add_(0, route_tokens[e, :n], vals)
         _grouped_dbg("scatter output done")
+    if bench_callable is not None and (not _use_naive) and dtype in (dtypes.bf16, dtypes.fp16):
+        _bench_a1 = grouped_a1
+        _bench_a1_scale = grouped_a1_scale
+        _bench_a2_payload = grouped_a2_payload
+        _bench_a2_scale = grouped_a2_scale
+        _bench_masked_m = masked_m
+        _bench_topids_to_rows = topids_to_rows
+        _bench_m_tile_map = m_tile_map
+
+        def _bench_fn():
+            stage1(
+                grouped_a2, _bench_a1, grouped_w1, _bench_a1_scale,
+                grouped_w1_scale, _bench_masked_m, max_m, inter_dim, model_dim, E,
+                stream=torch.cuda.current_stream(),
+                swiglu_limit=swiglu_limit,
+                _m_tile_prefix=m_tile_prefix, _m_tile_map=_bench_m_tile_map,
+                bias=_bias1_arg,
+            )
+            _s2_result = stage2(
+                _stage2_out, _bench_a2_payload, grouped_w2, _bench_a2_scale,
+                grouped_w2_scale, _bench_masked_m, max_m, model_dim, inter_dim, E,
+                stream=torch.cuda.current_stream(),
+                _m_tile_prefix=m_tile_prefix, _m_tile_map=_bench_m_tile_map,
+                bias=_bias2_arg,
+            )
+            flydsl_moe_gather_reduce(_s2_result, _bench_topids_to_rows, gather_w, out=moe_out)
+            return moe_out
+
+        bench_callable.append(("fused_moe_gemm_only", _bench_fn))
+
     impl_name = "grouped_a4w4" if data_format == "fp4" else "grouped_a8w4"
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = impl_name
     logger.debug(
