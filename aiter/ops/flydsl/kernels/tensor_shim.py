@@ -14,6 +14,8 @@ from flydsl.expr.typing import T
 
 from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
 
+MOE_KERNARG_PRELOAD_COUNT = 16
+
 
 def ptr_rsrc(ptr):
     """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""

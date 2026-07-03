@@ -20,7 +20,7 @@ from flydsl._mlir.dialects import scf
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from aiter.ops.flydsl.kernels.tensor_shim import STensor, ptr_rsrc
+from aiter.ops.flydsl.kernels.tensor_shim import STensor, ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
 
 MAX_EXPERTS_PER_BLOCK = 512
 
@@ -155,7 +155,7 @@ def build_moe_contiguous_psum_module():
     launch_psum.compile_hints = {
         "llvm_options": {
             "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": 6,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -326,7 +326,7 @@ def build_moe_contiguous_psum_remap_module():
     launch_psum_remap.compile_hints = {
         "llvm_options": {
             "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": 9,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
         },
     }
 

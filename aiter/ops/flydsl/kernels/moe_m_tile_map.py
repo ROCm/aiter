@@ -24,7 +24,7 @@ from flydsl.expr import arith, buffer_ops
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import T, Int32
 
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
 
 BLOCK_THREADS = 256
 
@@ -180,7 +180,7 @@ def build_moe_m_tile_map_module():
     launch_m_tile_map.compile_hints = {
         "llvm_options": {
             "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": 4,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
         },
     }
 

@@ -72,7 +72,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.expr import buffer_ops, vector
 
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
 
 BLOCK_THREADS = 256
 
@@ -258,7 +258,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         launch_scatter_preshuffle.compile_hints = {
             "llvm_options": {
                 "amdgpu-kernarg-preload": True,
-                "amdgpu-kernarg-preload-count": 4,
+                "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
             },
         }
         return launch_scatter_preshuffle
@@ -289,7 +289,7 @@ def build_moe_scatter_copy_preshuffle_scale_module(
     launch_preshuffle.compile_hints = {
         "llvm_options": {
             "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": 4,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
         },
     }
     return launch_preshuffle
