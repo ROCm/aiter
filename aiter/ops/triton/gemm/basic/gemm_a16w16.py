@@ -142,7 +142,7 @@ def gemm_a16w16_(
         NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
         num_warps = config["num_warps"]
 
-        # The kernels walk K with update_tensor_descriptor(add_offsets=...),
+        # The kernels walk K by passing computed offsets to async_load,
         # which advances the load position without shrinking the descriptor's
         # OOB bound, so a partial last K-tile would read past the end of K.
         # Require K to be a multiple of BLOCK_K rather than padding here. (M and
