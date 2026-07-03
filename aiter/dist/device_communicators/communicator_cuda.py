@@ -71,6 +71,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm = None
         self.symm_mem_comm = None
+        self._log_qr_rmsnorm_dispatch = (
+            os.environ.get("AITER_LOG_QR_RMSNORM_DISPATCH", "0") == "1"
+        )
+        self._logged_qr_rmsnorm_dispatch = False
         # if use_torch_symm_mem and current_platform.is_cuda():
         #     self.symm_mem_comm = SymmMemCommunicator(
         #         group=self.cpu_group,
@@ -252,6 +256,38 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_1stage_override is not None
             else (total_bytes <= total_bytes_limit)
         )
+        qr_comm = self.qr_comm
+        if (
+            not use_1stage
+            and not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and not gemma_norm
+            and qr_comm is not None
+            and not qr_comm.disabled
+            and qr_comm.should_quick_allreduce_rmsnorm(input_, res_inp_, weight_, n)
+        ):
+            if (
+                self._log_qr_rmsnorm_dispatch
+                and not self._logged_qr_rmsnorm_dispatch
+                and is_global_first_rank()
+            ):
+                logger.info(
+                    "AITER_FUSED_QR_RMSNORM_DISPATCH selected: "
+                    "shape=%s hidden_dim=%d world_size=%d total_bytes=%d",
+                    tuple(input_.shape),
+                    n,
+                    self.world_size,
+                    total_bytes,
+                )
+                self._logged_qr_rmsnorm_dispatch = True
+            out, res_out = qr_comm.quick_all_reduce_rmsnorm(
+                input_, res_inp_, weight_, eps, n
+            )
+            assert out is not None
+            assert res_out is not None
+            return out, res_out
+
         if (
             not use_general_path
             and can_use_custom_ar
