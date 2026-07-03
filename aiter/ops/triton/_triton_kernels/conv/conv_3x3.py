@@ -26,7 +26,7 @@ _conv2d_3x3_nhwc_kernel_repr = make_kernel_repr(
     [
         "BLOCK_M",
         "BLOCK_N",
-        "BLOCK_C",
+        "BLOCK_K",
         "GROUP_SIZE_M",
         "HAS_BIAS",
         "ACTIVATION",
@@ -39,7 +39,7 @@ _conv2d_3x3_cblocked_kernel_repr = make_kernel_repr(
     [
         "BLOCK_M",
         "BLOCK_N",
-        "BLOCK_C",
+        "BLOCK_K",
         "GROUP_SIZE_M",
         "HAS_BIAS",
         "ACTIVATION",
@@ -70,7 +70,7 @@ def _conv2d_3x3_nhwc_kernel(
     M_total,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_C: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     ACTIVATION: tl.constexpr,
@@ -104,7 +104,7 @@ def _conv2d_3x3_nhwc_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_c = tl.arange(0, BLOCK_C)
+    offs_k = tl.arange(0, BLOCK_K)
 
     m_mask = offs_m < M_total
     kout_mask = offs_n < K_out
@@ -132,24 +132,23 @@ def _conv2d_3x3_nhwc_kernel(
     for r in tl.static_range(3):
         ih = base_ih + r * dil_h
         valid_ih = n_valid & (ih >= 0) & (ih < H)
-        x_off_r = r * stride_x_dh
         for s in tl.static_range(3):
             rs_idx = r * 3 + s
             iw = base_iw + s * dil_w
             spatial_valid = valid_ih & (iw >= 0) & (iw < W_in)
 
-            for c0 in range(0, C_pad, BLOCK_C):
-                c_offs = c0 + offs_c
-                c_mask = c_offs < C
+            for k0 in range(0, C_pad, BLOCK_K):
+                k_offs = k0 + offs_k
+                k_mask = k_offs < C
 
-                x_ptrs = x_base + c_offs[None, :] + x_off_r + s * stride_x_dw
-                w_ptrs = w_base + rs_idx * stride_w_rs + c_offs[:, None] * stride_w_c
+                x_ptrs = x_base + k_offs[None, :] + r * stride_x_dh + s * stride_x_dw
+                w_ptrs = w_base + rs_idx * stride_w_rs + k_offs[:, None] * stride_w_c
 
                 x_tile = tl.load(
-                    x_ptrs, mask=spatial_valid & c_mask[None, :], other=0.0
+                    x_ptrs, mask=spatial_valid & k_mask[None, :], other=0.0
                 )
                 w_tile = tl.load(
-                    w_ptrs, mask=c_mask[:, None] & kout_mask[None, :], other=0.0
+                    w_ptrs, mask=k_mask[:, None] & kout_mask[None, :], other=0.0
                 )
                 acc = tl.dot(x_tile, w_tile, acc=acc)
 
@@ -199,7 +198,7 @@ def _conv2d_3x3_cblocked_kernel(
     M_total,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_C: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     ACTIVATION: tl.constexpr,
@@ -236,7 +235,7 @@ def _conv2d_3x3_cblocked_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_c = tl.arange(0, BLOCK_C)
+    offs_k = tl.arange(0, BLOCK_K)
 
     # Valid output mask
     m_mask = offs_m < M_total
@@ -255,7 +254,7 @@ def _conv2d_3x3_cblocked_kernel(
     stride_x_dh = dil_h * stride_x_h
     stride_x_dw = dil_w * stride_x_w
 
-    # x_base for channel-blocked layout: X[n, cblock, h, w, c_local]
+    # x_base for channel-blocked layout: X[n, cblock, h, w, k_local]
     # base pointer accounts for n, h, w
     x_base = X + n_idx * stride_x_n + base_ih * stride_x_h + base_iw * stride_x_w
 
@@ -267,34 +266,33 @@ def _conv2d_3x3_cblocked_kernel(
     for r in tl.static_range(3):
         ih = base_ih + r * dil_h
         valid_ih = n_valid & (ih >= 0) & (ih < H)
-        x_off_r = r * stride_x_dh
         for s in tl.static_range(3):
             rs_idx = r * 3 + s
             iw = base_iw + s * dil_w
             spatial_valid = valid_ih & (iw >= 0) & (iw < W_in)
 
-            for c0 in range(0, C_pad, BLOCK_C):
-                c_offs = c0 + offs_c
-                c_mask = c_offs < C
+            for k0 in range(0, C_pad, BLOCK_K):
+                k_offs = k0 + offs_k
+                k_mask = k_offs < C
 
                 # Compute cblock index and local offset within block
-                cblock_idx = c_offs // Cb
-                c_local = c_offs % Cb
+                cblock_idx = k_offs // Cb
+                k_local = k_offs % Cb
 
                 x_ptrs = (
                     x_base
                     + cblock_idx[None, :] * stride_x_cblock
-                    + c_local[None, :] * stride_x_cb
-                    + x_off_r
+                    + k_local[None, :] * stride_x_cb
+                    + r * stride_x_dh
                     + s * stride_x_dw
                 )
-                w_ptrs = w_base + rs_idx * stride_w_rs + c_offs[:, None] * stride_w_c
+                w_ptrs = w_base + rs_idx * stride_w_rs + k_offs[:, None] * stride_w_c
 
                 x_tile = tl.load(
-                    x_ptrs, mask=spatial_valid & c_mask[None, :], other=0.0
+                    x_ptrs, mask=spatial_valid & k_mask[None, :], other=0.0
                 )
                 w_tile = tl.load(
-                    w_ptrs, mask=c_mask[:, None] & kout_mask[None, :], other=0.0
+                    w_ptrs, mask=k_mask[:, None] & kout_mask[None, :], other=0.0
                 )
                 acc = tl.dot(x_tile, w_tile, acc=acc)
 
@@ -323,27 +321,27 @@ def _conv2d_3x3_cblocked_kernel(
 # Autotune search spaces (used when AITER_TRITON_CONV_AUTOTUNE=1).
 AUTOTUNE_3x3_NHWC_CONFIGS = [
     triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
         num_warps=8,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
         num_warps=4,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
         num_warps=4,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 64, "GROUP_SIZE_M": 4},
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
         num_warps=4,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 32, "GROUP_SIZE_M": 4},
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
         num_warps=4,
         num_stages=1,
     ),
@@ -351,27 +349,27 @@ AUTOTUNE_3x3_NHWC_CONFIGS = [
 
 AUTOTUNE_3x3_CBLOCKED_CONFIGS = [
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
         num_warps=4,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 64, "GROUP_SIZE_M": 4},
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
         num_warps=4,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_C": 128, "GROUP_SIZE_M": 4},
+        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_SIZE_M": 4},
         num_warps=4,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
         num_warps=4,
         num_stages=1,
     ),
     triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_C": 64, "GROUP_SIZE_M": 8},
+        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
         num_warps=8,
         num_stages=1,
     ),

@@ -32,7 +32,7 @@ _conv2d_general_kernel_repr = make_kernel_repr(
 @triton.jit(repr=_conv2d_general_kernel_repr)
 def _conv2d_general_kernel(
     X,
-    WK,
+    W,
     BIAS,
     Y,
     N,
@@ -54,7 +54,7 @@ def _conv2d_general_kernel(
     M_total,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,  # blocks the flattened C*R*S GEMM-K axis (see loop below), not channels
     GROUP_SIZE_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     ACTIVATION: tl.constexpr,
@@ -63,9 +63,9 @@ def _conv2d_general_kernel(
     """General conv kernel with precomputed bases.
     LAYOUT: "nchw" or "nhwc"
     """
-    # WK is always [K_out, K_pad] contiguous
-    stride_wk_kout: tl.constexpr = K_pad
-    stride_wk_kred: tl.constexpr = 1
+    # W is always [K_out, K_pad] contiguous
+    stride_w_kout: tl.constexpr = K_pad
+    stride_w_kred: tl.constexpr = 1
     if LAYOUT == "nchw":
         # NCHW: X[N, C, H, W_in], Y[N, K_out, P, Q]
         stride_x_n: tl.constexpr = C * H * W_in
@@ -99,12 +99,11 @@ def _conv2d_general_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    if pid_m >= num_pid_m:
-        return
-
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
+    m_mask = offs_m < M_total
     kout_mask = offs_n < K_out
 
     # Decode offs_m -> (n_idx, p_idx, q_idx)
@@ -116,47 +115,48 @@ def _conv2d_general_kernel(
     n_valid = n_idx < N
 
     # Precompute base positions
-    base_oh = p_idx * stride_h - pad_h
-    base_ow = q_idx * stride_w - pad_w
-    stride_dh = dil_h * stride_x_h
-    stride_dw = dil_w * stride_x_w
-    x_base = X + n_idx * stride_x_n + base_oh * stride_x_h + base_ow * stride_x_w
-    wk_base = WK + offs_n[None, :] * stride_wk_kout
+    base_ih = p_idx * stride_h - pad_h
+    base_iw = q_idx * stride_w - pad_w
+    stride_x_dh = dil_h * stride_x_h
+    stride_x_dw = dil_w * stride_x_w
 
-    Y_ptrs = (
-        Y
-        + n_idx * stride_y_n
-        + offs_n[None, :] * stride_y_k
-        + p_idx * stride_y_p
-        + q_idx * stride_y_q
-    )
+    # Input base: X[N, C, H, W_in] (NCHW) or X[N, H, W_in, C] (NHWC)
+    x_base = X + n_idx * stride_x_n + base_ih * stride_x_h + base_iw * stride_x_w
+    # Weight base: W[K_out, K_pad] contiguous (K_pad = padded C*R*S)
+    w_base = W + offs_n[None, :] * stride_w_kout
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    offs_k = tl.arange(0, BLOCK_K)
     rs_stride = R * S
 
+    # Reduction is over the flattened im2col GEMM-K axis (C*R*S = K_pad), not
+    # channels alone: one BLOCK_K step can straddle channel/filter-tap
+    # boundaries, so each kred is decoded below into (c, r, s). Here the GEMM-K
+    # axis is genuinely C*R*S, whereas in 1x1/3x3 the same BLOCK_K names a
+    # reduction that spans only channels (R=S=1, or the 3x3 taps looped
+    # separately in static_range).
     for k0 in range(0, K_pad, BLOCK_K):
         kred = k0 + offs_k
 
-        WK_ptrs = wk_base + kred[:, None] * stride_wk_kred
-        w_tile = tl.load(WK_ptrs, mask=kout_mask[None, :], other=0.0)
+        w_ptrs = w_base + kred[:, None] * stride_w_kred
+        w_tile = tl.load(w_ptrs, mask=kout_mask[None, :], other=0.0)
 
         c = kred // rs_stride
         rs = kred % rs_stride
         r = rs // S
         s = rs % S
 
-        oh = base_oh + r * dil_h
-        ow = base_ow + s * dil_w
+        ih = base_ih + r * dil_h
+        iw = base_iw + s * dil_w
 
-        X_ptrs = x_base + c * stride_x_c + r * stride_dh + s * stride_dw
+        X_ptrs = x_base + c * stride_x_c + r * stride_x_dh + s * stride_x_dw
         x_mask = (
-            n_valid & (oh >= 0) & (ow >= 0) & (oh < H) & (ow < W_in) & (c[None, :] < C)
+            n_valid & (ih >= 0) & (iw >= 0) & (ih < H) & (iw < W_in) & (c[None, :] < C)
         )
         x_tile = tl.load(X_ptrs, mask=x_mask, other=0.0)
 
         acc = tl.dot(x_tile, w_tile, acc=acc)
 
+    # Epilogue: bias + activation + store
     if HAS_BIAS:
         b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
         acc += b[None, :]
@@ -168,11 +168,14 @@ def _conv2d_general_kernel(
     elif ACTIVATION == "gelu":
         acc = _gelu_tanh(acc)
 
-    tl.store(
-        Y_ptrs,
-        acc,
-        mask=(n_valid & (p_idx < P) & (q_idx < Q) & kout_mask[None, :]),
+    y_ptrs = (
+        Y
+        + n_idx * stride_y_n
+        + offs_n[None, :] * stride_y_k
+        + p_idx * stride_y_p
+        + q_idx * stride_y_q
     )
+    tl.store(y_ptrs, acc, mask=(m_mask[:, None] & kout_mask[None, :]))
 
 
 # Autotune search space (used when AITER_TRITON_CONV_AUTOTUNE=1).

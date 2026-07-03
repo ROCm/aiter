@@ -794,9 +794,6 @@ def _winograd_f4x3_batched_gemm_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    if pid_m >= num_pid_m or pid_n >= num_pid_n:
-        return
-
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
