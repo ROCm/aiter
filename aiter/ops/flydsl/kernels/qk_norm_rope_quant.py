@@ -494,58 +494,54 @@ def _build_kernel(
                 else:
                     scaled.append(xi * rstd)
 
+            # ---- Store scaled to rmem for cross-branch value passing ----
+            out_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
+            scaled_raw = [_to_raw(s) for s in scaled]
+            scaled_vec = vector.from_elements(T.vec(VEC, f32), scaled_raw)
+            fx.memref_store_vec(scaled_vec, out_rmem)
+
+            # ---- ROPE branch: load from rmem, rotate, store back ----
             is_rope = tid >= fx.Int32(ROPE_THREAD_LO)
             if is_rope:
-                # ---- ROPE path: cos/sin load + GPT-J pair rotation ----
                 rope_rel = tid - fx.Int32(ROPE_THREAD_LO)
                 cos_vec = load_vec(cos_div, rope_rel, layout=rope_lay, atom=rope_atom)
                 sin_vec = load_vec(sin_div, rope_rel, layout=rope_lay, atom=rope_atom)
                 cos_f32 = cos_vec.to(fx.Float32)
                 sin_f32 = sin_vec.to(fx.Float32)
 
-                # GPT-J pair rotate on pre-scaled values:
-                # new_2k = e*c - o*s; new_2k+1 = e*s + o*c
-                rope_out = []
+                cur = fx.memref_load_vec(out_rmem)
+                rope_elems = []
                 for k in range_constexpr(PAIRS_PER_THREAD):
-                    e = scaled[2 * k]
-                    o = scaled[2 * k + 1]
+                    e = cur[2 * k]
+                    o = cur[2 * k + 1]
                     c = cos_f32[k]
                     s = sin_f32[k]
-                    rope_out.append(e * c - o * s)
-                    rope_out.append(e * s + o * c)
+                    rope_elems.append(_to_raw(e * c - o * s))
+                    rope_elems.append(_to_raw(e * s + o * c))
+                rotated_vec = vector.from_elements(
+                    T.vec(VEC, f32), rope_elems
+                )
+                fx.memref_store_vec(rotated_vec, out_rmem)
 
-                if const_expr(quant):
-                    rsrc, row_base = fp8_out_rsrc
-                    _store_fp8_packed(rope_out, rsrc, row_base, tid, VEC,
-                                      skip_fnuz_clamp=not _is_fnuz)
-                else:
-                    _store_bf16_vec_g(rope_out, bf16_out_g, bf16_out_row_off, tid, VEC)
-                    if const_expr(kv_write):
-                        if do_swa:
-                            _store_bf16_vec_g(
-                                rope_out,
-                                swa_out_g,
-                                arith.constant(0, type=i32),
-                                tid,
-                                VEC,
-                            )
+            # ---- Unified store: all threads read from rmem and write ----
+            final = fx.memref_load_vec(out_rmem)
+            final_list = [final[i] for i in range(VEC)]
+
+            if const_expr(quant):
+                rsrc, row_base = fp8_out_rsrc
+                _store_fp8_packed(final_list, rsrc, row_base, tid, VEC,
+                                  skip_fnuz_clamp=not _is_fnuz)
             else:
-                # ---- NOPE path: store pre-scaled values directly ----
-                if const_expr(quant):
-                    rsrc, row_base = fp8_out_rsrc
-                    _store_fp8_packed(scaled, rsrc, row_base, tid, VEC,
-                                      skip_fnuz_clamp=not _is_fnuz)
-                else:
-                    _store_bf16_vec_g(scaled, bf16_out_g, bf16_out_row_off, tid, VEC)
-                    if const_expr(kv_write):
-                        if do_swa:
-                            _store_bf16_vec_g(
-                                scaled,
-                                swa_out_g,
-                                arith.constant(0, type=i32),
-                                tid,
-                                VEC,
-                            )
+                _store_bf16_vec_g(final_list, bf16_out_g, bf16_out_row_off, tid, VEC)
+                if const_expr(kv_write):
+                    if do_swa:
+                        _store_bf16_vec_g(
+                            final_list,
+                            swa_out_g,
+                            arith.constant(0, type=i32),
+                            tid,
+                            VEC,
+                        )
 
         # ============ runtime dispatch on bid_x < H ============
         # Per-token byte offsets fold ``bid_t`` into the buffer descriptor
