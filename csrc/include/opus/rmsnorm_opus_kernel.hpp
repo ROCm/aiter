@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// OPUS RMSNorm device kernels. Host/device split: opus.hpp is parsed only on the
-// device pass; the host pass sees declarations + empty stubs. 2D block:
-// blockDim.x = threads-per-row, blockDim.y = rows-per-block.
+// OPUS RMSNorm device kernels. opus.hpp is device-pass only (its device builtins
+// break the host pass), so the host launcher uses the local element aliases below
+// (identical to opus REGISTER_DTYPE). 2D block: x = threads/row, y = rows/block.
 #pragma once
 
+// Pin fp32->bf16 to round-to-nearest-even (opus defaults to truncate on gfx94x);
+// must precede opus.hpp so opus::cast<bf16_t>() matches CK/torch on every arch.
+#ifndef OPUS_FP32_to_BF16_DEFAULT
+#define OPUS_FP32_to_BF16_DEFAULT 0
+#endif
 #ifdef __HIP_DEVICE_COMPILE__
 #include "opus/opus.hpp"
 #endif
@@ -13,7 +18,8 @@
 namespace aiter {
 namespace rmsnorm_opus {
 
-// Element types matching opus REGISTER_DTYPE so both passes name the same type.
+// Element aliases (identical to opus REGISTER_DTYPE; local because the host pass
+// cannot include opus.hpp).
 #if defined(__clang_major__) && __clang_major__ >= 20
 using bf16_t = __bf16;
 using fp16_t = __fp16;
@@ -21,13 +27,36 @@ using fp16_t = __fp16;
 using bf16_t = unsigned short;
 using fp16_t = _Float16;
 #endif
-using i8_t  = signed char;
-using fp8_t = _BitInt(8);
+using fp32_t = float;
+using i8_t   = signed char;
+using fp8_t  = _BitInt(8);
+
+// Per-kernel traits: one Traits param carrying the element type(s) + tile consts.
+template <typename Scalar, int Width>
+struct fwd_traits
+{
+    using scalar_t             = Scalar;
+    static constexpr int width = Width;
+};
+template <typename In, typename Out, int Width>
+struct quant_traits
+{
+    using in_t                 = In;
+    using out_t                = Out;
+    static constexpr int width = Width;
+};
+template <typename Scalar, int TileN, int RegN>
+struct be_traits
+{
+    using scalar_t          = Scalar;
+    static constexpr int TN = TileN;
+    static constexpr int RN = RegN;
+};
 
 // rmsnorm, optionally fused with a residual add. residual != 0: s = in + residual,
 // residual = s (pre-norm), out = rmsnorm(s) * weight (in-place when out == in).
 // model_sensitive != 0 selects the T5 variant (round s*inv to dtype before *w).
-template <typename scalar_t, int width>
+template <typename Traits>
 __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out,
                                      const void* __restrict__ in,
                                      const void* __restrict__ weight,
@@ -40,7 +69,7 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out,
 // rmsnorm + dynamic/smooth quant. Flags via pointers: residual != 0 fused-add,
 // xscale != 0 smooth (per-col premultiply), unquant != 0 store pre-quant y.
 // out is int8/fp8; yscale is [rows] fp32 (rowmax/qmax).
-template <typename in_t, typename out_t, int width>
+template <typename Traits>
 __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out,
                                        void* __restrict__ yscale,
                                        void* __restrict__ unquant,
@@ -54,11 +83,10 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out,
                                        float qmax,
                                        int model_sensitive);
 
-// Bit-exact (vs CK) rmsnorm, optional fused-add. Replicates CK's reduction order
-// for CK's tile geometry: TN threads/row own RN vectors (width 8) each; sum-of-
-// squares is a paired intra-thread sum + butterfly xor within the warp + a
-// cross-warp tree over TN/64 warps. Reproduces CK's square_sum bit-for-bit.
-template <typename scalar_t, int TN, int RN>
+// Bit-exact vs CK rmsnorm (+ optional fused-add): reproduces CK's square_sum order
+// for its tile geometry -- TN threads/row x RN width-8 vecs, paired intra-thread
+// sum + within-warp butterfly xor + cross-warp tree over TN/64 warps.
+template <typename Traits>
 __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out,
                                         const void* __restrict__ in,
                                         const void* __restrict__ weight,
@@ -70,29 +98,21 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out,
 
 #if !defined(__HIP_DEVICE_COMPILE__)
 // Host pass: empty stubs so the __device_stub__ symbols resolve.
-template <typename scalar_t, int width>
+template <typename Traits>
 __global__ void rmsnorm2d_fwd_kernel(void*, const void*, const void*, void*, float, int, int, int)
 {
 }
-template <typename in_t, typename out_t, int width>
+template <typename Traits>
 __global__ void rmsnorm2d_quant_kernel(
     void*, void*, void*, const void*, const void*, void*, const void*, float, int, int, float, int)
 {
 }
-template <typename scalar_t, int TN, int RN>
+template <typename Traits>
 __global__ void
 rmsnorm2d_fwd_be_kernel(void*, const void*, const void*, void*, float, int, int, int)
 {
 }
 #else
-// bf16/fp16 are native types; f32 conversions are exact widening / round-to-nearest.
-template <typename scalar_t>
-__device__ inline float to_f32(scalar_t x)
-{ return static_cast<float>(x); }
-template <typename scalar_t>
-__device__ inline scalar_t from_f32(float x)
-{ return static_cast<scalar_t>(x); }
-
 // fp32 -> quant element. int8: round-to-nearest; fp8: hardware e4m3 cvt.
 template <typename out_t>
 __device__ inline out_t quant_cast(float v)
@@ -112,6 +132,9 @@ __device__ inline float block_reduce(float v)
     const int lane = opus::thread_id_x();
     const int tpr  = opus::block_size_x();
     const int base = opus::thread_id_y() * tpr;
+    // Barrier before reusing s[]: stops a fast lane overwriting s[base] while a
+    // slow lane still reads it from a prior reduce (raced on gfx942).
+    opus::sync_threads();
     s[base + lane] = v;
     opus::sync_threads();
     for(int stride = tpr >> 1; stride > 0; stride >>= 1)
@@ -129,7 +152,7 @@ __device__ inline float block_reduce(float v)
 template <typename scalar_t, int width>
 using vec_t = scalar_t __attribute__((ext_vector_type(width)));
 
-template <typename scalar_t, int TN, int RN>
+template <typename Traits>
 __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
                                         const void* __restrict__ in_,
                                         const void* __restrict__ weight_,
@@ -139,6 +162,9 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
                                         int hidden,
                                         int model_sensitive)
 {
+    using scalar_t    = typename Traits::scalar_t;
+    constexpr int TN  = Traits::TN;
+    constexpr int RN  = Traits::RN;
     using V           = vec_t<scalar_t, 8>;
     const bool t5     = model_sensitive != 0;
     const bool add    = residual_ != nullptr;
@@ -152,9 +178,9 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
 
-    // norm-input in fp32 as a scalar array (not a vector type), so the compiler
-    // does not reorder the squared-sum. Fused-add writes round(x+res) to residual,
-    // keeps the fp32 sum (default) or rounded sum (T5) for the norm.
+    // fp32 norm-input as a scalar array (not a vector) so the compiler cannot
+    // reorder the squared-sum. Fused-add stores round(x+res) to residual; norm
+    // uses the fp32 sum (default) or the rounded sum (T5).
     float ni[RN][8];
 #pragma unroll
     for(int q = 0; q < RN; ++q)
@@ -166,9 +192,9 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
 #pragma unroll
             for(int j = 0; j < 8; ++j)
             {
-                float f  = to_f32<scalar_t>(x[j]) + to_f32<scalar_t>(res_v[nx + q * TN][j]);
-                s[j]     = from_f32<scalar_t>(f);
-                ni[q][j] = t5 ? to_f32<scalar_t>(s[j]) : f;
+                float f  = opus::cast<fp32_t>(x[j]) + opus::cast<fp32_t>(res_v[nx + q * TN][j]);
+                s[j]     = opus::cast<scalar_t>(f);
+                ni[q][j] = t5 ? opus::cast<fp32_t>(s[j]) : f;
             }
             res_v[nx + q * TN] = s;
         }
@@ -176,14 +202,12 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
         {
 #pragma unroll
             for(int j = 0; j < 8; ++j)
-                ni[q][j] = to_f32<scalar_t>(x[j]);
+                ni[q][j] = opus::cast<fp32_t>(x[j]);
         }
     }
 
-    // intra-thread squared-sum in CK's order: T5 pipeline sums in pairs
-    // (a0^2+a1^2), the default pipeline sums one element at a time.
-    // intra-thread squared-sum in CK's order: T5 sums pairs (a0^2+a1^2), the
-    // default sums one element at a time.
+    // intra-thread squared-sum in CK's order: T5 sums pairs (a0^2+a1^2), default
+    // one element at a time.
     float sq = 0.0f;
     if(t5)
     {
@@ -244,14 +268,14 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
         {
             float xi = ni[q][j] * inv;
             if(t5)
-                xi = to_f32<scalar_t>(from_f32<scalar_t>(xi));
-            y[j] = from_f32<scalar_t>(xi * to_f32<scalar_t>(w[j]));
+                xi = opus::cast<fp32_t>(opus::cast<scalar_t>(xi));
+            y[j] = opus::cast<scalar_t>(xi * opus::cast<fp32_t>(w[j]));
         }
         out_v[nx + q * TN] = y;
     }
 }
 
-template <typename scalar_t, int width>
+template <typename Traits>
 __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
                                      const void* __restrict__ in_,
                                      const void* __restrict__ weight_,
@@ -261,6 +285,8 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
                                      int hidden,
                                      int model_sensitive)
 {
+    using scalar_t       = typename Traits::scalar_t;
+    constexpr int width  = Traits::width;
     using V              = vec_t<scalar_t, width>;
     using Vf             = vec_t<float, width>;
     const bool t5        = model_sensitive != 0;
@@ -277,9 +303,8 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
 
-    // fp32 norm-input, cached in registers (overflow reloads). Fused-add writes
-    // round(x+res) to residual, but the norm keeps the fp32 sum (default) or the
-    // rounded sum (T5, matching vLLM). Non-fused: just f32(in).
+    // fp32 norm-input cached in registers (overflow reloads). Fused-add stores
+    // round(x+res) to residual; norm uses fp32 sum (default) or rounded sum (T5).
     constexpr int CACHE_V = 4;
     Vf cache[CACHE_V];
     float acc    = 0.0f;
@@ -292,9 +317,9 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
 #pragma unroll
             for(int j = 0; j < width; ++j)
             {
-                float f = to_f32<scalar_t>(x[j]) + to_f32<scalar_t>(res_v[idx][j]);
-                s[j]    = from_f32<scalar_t>(f);
-                ni[j]   = t5 ? to_f32<scalar_t>(s[j]) : f;
+                float f = opus::cast<fp32_t>(x[j]) + opus::cast<fp32_t>(res_v[idx][j]);
+                s[j]    = opus::cast<scalar_t>(f);
+                ni[j]   = t5 ? opus::cast<fp32_t>(s[j]) : f;
             }
             res_v[idx] = s;
         }
@@ -302,7 +327,7 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
         {
 #pragma unroll
             for(int j = 0; j < width; ++j)
-                ni[j] = to_f32<scalar_t>(x[j]);
+                ni[j] = opus::cast<fp32_t>(x[j]);
         }
         return ni;
     };
@@ -311,7 +336,7 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
         Vf ni;
 #pragma unroll
         for(int j = 0; j < width; ++j)
-            ni[j] = to_f32<scalar_t>(s[j]);
+            ni[j] = opus::cast<fp32_t>(s[j]);
         return ni;
     };
     auto sumsq = [&](Vf ni) {
@@ -347,8 +372,8 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
         {
             float xi = ni[j] * inv;
             if(t5)
-                xi = to_f32<scalar_t>(from_f32<scalar_t>(xi));
-            y[j] = from_f32<scalar_t>(xi * to_f32<scalar_t>(w[j]));
+                xi = opus::cast<fp32_t>(opus::cast<scalar_t>(xi));
+            y[j] = opus::cast<scalar_t>(xi * opus::cast<fp32_t>(w[j]));
         }
         out_v[idx] = y;
     };
@@ -363,7 +388,7 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
         store(reload_ni(idx), idx);
 }
 
-template <typename in_t, typename out_t, int width>
+template <typename Traits>
 __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
                                        void* __restrict__ yscale_,
                                        void* __restrict__ unquant_,
@@ -377,6 +402,9 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
                                        float qmax,
                                        int model_sensitive)
 {
+    using in_t           = typename Traits::in_t;
+    using out_t          = typename Traits::out_t;
+    constexpr int width  = Traits::width;
     using Vi             = vec_t<in_t, width>;
     using Vo             = vec_t<out_t, width>;
     using Vf             = vec_t<float, width>;
@@ -398,8 +426,7 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
     auto* uq_v         = reinterpret_cast<Vi*>(reinterpret_cast<in_t*>(unquant_) + roff);
     const auto* xscale = reinterpret_cast<const float*>(xscale_);
 
-    // fp32 norm-input, cached (see the norm kernel). Fused-add writes round(x+res)
-    // to residual; the norm keeps the fp32 sum (default) or the rounded sum (T5).
+    // fp32 norm-input cached (see the norm kernel).
     constexpr int CACHE_V = 4;
     Vf cache[CACHE_V];
     float acc    = 0.0f;
@@ -412,9 +439,9 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
 #pragma unroll
             for(int j = 0; j < width; ++j)
             {
-                float f = to_f32<in_t>(x[j]) + to_f32<in_t>(res_v[idx][j]);
-                s[j]    = from_f32<in_t>(f);
-                ni[j]   = t5 ? to_f32<in_t>(s[j]) : f;
+                float f = opus::cast<fp32_t>(x[j]) + opus::cast<fp32_t>(res_v[idx][j]);
+                s[j]    = opus::cast<in_t>(f);
+                ni[j]   = t5 ? opus::cast<fp32_t>(s[j]) : f;
             }
             res_v[idx] = s;
         }
@@ -422,7 +449,7 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
         {
 #pragma unroll
             for(int j = 0; j < width; ++j)
-                ni[j] = to_f32<in_t>(x[j]);
+                ni[j] = opus::cast<fp32_t>(x[j]);
         }
         return ni;
     };
@@ -431,7 +458,7 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
         Vf ni;
 #pragma unroll
         for(int j = 0; j < width; ++j)
-            ni[j] = to_f32<in_t>(s[j]);
+            ni[j] = opus::cast<fp32_t>(s[j]);
         return ni;
     };
     auto sumsq = [&](Vf ni) {
@@ -461,8 +488,8 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
     auto norm_j = [&](float ni, in_t wval, int col) -> float {
         float xi = ni * inv;
         if(t5)
-            xi = to_f32<in_t>(from_f32<in_t>(xi));
-        float n = xi * to_f32<in_t>(wval);
+            xi = opus::cast<fp32_t>(opus::cast<in_t>(xi));
+        float n = xi * opus::cast<fp32_t>(wval);
         return smooth ? n * xscale[col] : n;
     };
 
@@ -504,7 +531,7 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
             float n = norm_j(ni[j], w[j], idx * width + j);
             q[j]    = quant_cast<out_t>(n * inv_ys);
             if(save_uq)
-                uq[j] = from_f32<in_t>(n);
+                uq[j] = opus::cast<in_t>(n);
         }
         out_v[idx] = q;
         if(save_uq)

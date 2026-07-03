@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// OPUS RMSNorm host-side launch helpers. Fully torch-free / HIP-runtime-free:
-// only opus/hip_minimal.hpp (host launch) + opus.hpp (device, via the kernel
-// header). Tensors cross the ctypes boundary as raw pointers + dims, so nothing
-// pulls <hip/hip_runtime.h> or aiter_tensor.h.
+// OPUS RMSNorm host-side launch helpers. Torch-free / HIP-runtime-free: only
+// opus/hip_minimal.hpp + opus.hpp (via the kernel header); tensors cross as raw
+// pointers + dims.
 #pragma once
 #include "opus/hip_minimal.hpp" // dim3, hipStream_t, hipLaunchKernelGGL (both passes)
 #include "opus/rmsnorm_opus_kernel.hpp"
@@ -12,10 +11,9 @@
 namespace aiter {
 namespace rmsnorm_opus {
 
-// 2D launch geometry: blockDim.x = threads-per-row (power of two), blockDim.y =
-// rows-per-block. For large hidden this is 1 row/block; for small hidden it packs
-// several rows so tiny rows are not launch/occupancy-bound (vhid = vector work per
-// row = hidden/width). tpr targets ~2 vectors/thread so large hidden is unchanged.
+// 2D launch geometry: x = threads/row (pow2), y = rows/block. Large hidden -> 1
+// row/block; small hidden packs rows so tiny rows aren't occupancy-bound. tpr
+// targets ~2 vectors/thread (vhid = hidden/width).
 struct launch_dims
 {
     dim3 block;
@@ -26,16 +24,22 @@ inline launch_dims pick_dims(int rows, int vhid)
 {
     const int budget = (rows < 256) ? 1024 : 256; // total threads per block
     const int want   = (vhid + 1) / 2;            // ~2 vectors per thread
-    int tpr          = 64;
-    while(tpr < want && tpr < budget)
+    // Cap threads-per-row at 256 (CK's max tile): a single row spanning >256
+    // threads (16+ warps) in the LDS reduction misbehaves on some archs (gfx942).
+    const int tpr_cap = 256;
+    int tpr           = 64;
+    while(tpr < want && tpr < budget && tpr < tpr_cap)
         tpr <<= 1;
-    if(tpr > budget)
-        tpr = budget;
+    if(tpr > tpr_cap)
+        tpr = tpr_cap;
+    // pack small-hidden rows, but never more row slots than rows present.
     int rpb = budget / tpr;
     if(rpb < 1)
         rpb = 1;
+    if(rpb > rows)
+        rpb = rows;
     const int nblocks = (rows + rpb - 1) / rpb;
-    return {dim3(tpr, rpb), dim3(nblocks)};
+    return {dim3((unsigned)tpr, (unsigned)rpb), dim3((unsigned)nblocks)};
 }
 
 inline bool aligned16(const void* p) { return (reinterpret_cast<size_t>(p) % 16) == 0; }
@@ -55,7 +59,7 @@ inline void launch_be(void* out,
     const int tm = (TN > 64) ? 1 : (256 / TN); // rows/block; TN>64 needs 1 row/block
     const dim3 block(TN, tm);
     const dim3 grid((rows + tm - 1) / tm);
-    hipLaunchKernelGGL((rmsnorm2d_fwd_be_kernel<scalar_t, TN, RN>),
+    hipLaunchKernelGGL((rmsnorm2d_fwd_be_kernel<be_traits<scalar_t, TN, RN>>),
                        grid,
                        block,
                        0,
@@ -106,7 +110,8 @@ inline bool launch_norm_be(void* out,
 }
 
 // rmsnorm (+ fused residual add when residual != nullptr; in-place when out == in).
-// Bit-exact vs CK on the vn=8 tile buckets; generic (formula-exact, <=2 ulp) otherwise.
+// Bit-exact vs CK on the vn=8 tile buckets (2-byte types); generic (formula-exact,
+// <=2 ulp) otherwise. Vector width targets 16-byte access: 8 for bf16/fp16, 4 for fp32.
 template <typename scalar_t>
 inline void launch_norm(void* out,
                         const void* in,
@@ -118,17 +123,20 @@ inline void launch_norm(void* out,
                         int model_sensitive,
                         hipStream_t stream)
 {
+    constexpr int VW   = 16 / (int)sizeof(scalar_t); // 8 for bf16/fp16, 4 for fp32
     const bool aligned = aligned16(out) && aligned16(in) && aligned16(weight) &&
                          (residual == nullptr || aligned16(residual));
-    if(aligned && (hidden % 8 == 0) &&
-       launch_norm_be<scalar_t>(
-           out, in, weight, residual, epsilon, rows, hidden, model_sensitive, stream))
-        return;
-    const bool vec8 = (hidden % 8 == 0) && aligned16(out) && aligned16(in) && aligned16(weight) &&
-                      (residual == nullptr || aligned16(residual));
-    const launch_dims d = pick_dims(rows, vec8 ? hidden / 8 : hidden);
-    if(vec8)
-        hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<scalar_t, 8>),
+    if constexpr(sizeof(scalar_t) == 2)
+    {
+        if(aligned && (hidden % 8 == 0) &&
+           launch_norm_be<scalar_t>(
+               out, in, weight, residual, epsilon, rows, hidden, model_sensitive, stream))
+            return;
+    }
+    const bool vec      = (hidden % VW == 0) && aligned;
+    const launch_dims d = pick_dims(rows, vec ? hidden / VW : hidden);
+    if(vec)
+        hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<fwd_traits<scalar_t, VW>>),
                            d.grid,
                            d.block,
                            0,
@@ -142,7 +150,7 @@ inline void launch_norm(void* out,
                            hidden,
                            model_sensitive);
     else
-        hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<scalar_t, 1>),
+        hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<fwd_traits<scalar_t, 1>>),
                            d.grid,
                            d.block,
                            0,
@@ -172,12 +180,13 @@ inline void launch_quant_t(void* out,
                            int model_sensitive,
                            hipStream_t stream)
 {
-    const bool vec8 = (hidden % 8 == 0) && aligned16(out) && aligned16(in) && aligned16(weight) &&
-                      (residual == nullptr || aligned16(residual)) &&
-                      (unquant == nullptr || aligned16(unquant));
-    const launch_dims d = pick_dims(rows, vec8 ? hidden / 8 : hidden);
-    if(vec8)
-        hipLaunchKernelGGL((rmsnorm2d_quant_kernel<in_t, out_t, 8>),
+    constexpr int VW = 16 / (int)sizeof(in_t); // 8 for bf16/fp16, 4 for fp32
+    const bool vec = (hidden % VW == 0) && aligned16(out) && aligned16(in) && aligned16(weight) &&
+                     (residual == nullptr || aligned16(residual)) &&
+                     (unquant == nullptr || aligned16(unquant));
+    const launch_dims d = pick_dims(rows, vec ? hidden / VW : hidden);
+    if(vec)
+        hipLaunchKernelGGL((rmsnorm2d_quant_kernel<quant_traits<in_t, out_t, VW>>),
                            d.grid,
                            d.block,
                            0,
@@ -195,7 +204,7 @@ inline void launch_quant_t(void* out,
                            qmax,
                            model_sensitive);
     else
-        hipLaunchKernelGGL((rmsnorm2d_quant_kernel<in_t, out_t, 1>),
+        hipLaunchKernelGGL((rmsnorm2d_quant_kernel<quant_traits<in_t, out_t, 1>>),
                            d.grid,
                            d.block,
                            0,
@@ -214,7 +223,7 @@ inline void launch_quant_t(void* out,
                            model_sensitive);
 }
 
-// in_code: 0=fp16, 1=bf16 ; out_code: 0=int8, 1=fp8
+// in_code: 0=fp16, 1=bf16, 2=fp32 ; out_code: 0=int8, 1=fp8
 inline void launch_quant(void* out,
                          void* yscale,
                          void* unquant,
@@ -231,68 +240,31 @@ inline void launch_quant(void* out,
                          int model_sensitive,
                          hipStream_t stream)
 {
-    if(in_code)
+#define OPUS_QUANT(IN_T, OUT_T)                                                                     \
+    launch_quant_t<IN_T, OUT_T>(out, yscale, unquant, in, weight, residual, xscale, epsilon, rows, \
+                                hidden, qmax, model_sensitive, stream)
+    if(in_code == 2)
     {
         if(out_code)
-            launch_quant_t<bf16_t, fp8_t>(out,
-                                          yscale,
-                                          unquant,
-                                          in,
-                                          weight,
-                                          residual,
-                                          xscale,
-                                          epsilon,
-                                          rows,
-                                          hidden,
-                                          qmax,
-                                          model_sensitive,
-                                          stream);
+            OPUS_QUANT(fp32_t, fp8_t);
         else
-            launch_quant_t<bf16_t, i8_t>(out,
-                                         yscale,
-                                         unquant,
-                                         in,
-                                         weight,
-                                         residual,
-                                         xscale,
-                                         epsilon,
-                                         rows,
-                                         hidden,
-                                         qmax,
-                                         model_sensitive,
-                                         stream);
+            OPUS_QUANT(fp32_t, i8_t);
+    }
+    else if(in_code == 1)
+    {
+        if(out_code)
+            OPUS_QUANT(bf16_t, fp8_t);
+        else
+            OPUS_QUANT(bf16_t, i8_t);
     }
     else
     {
         if(out_code)
-            launch_quant_t<fp16_t, fp8_t>(out,
-                                          yscale,
-                                          unquant,
-                                          in,
-                                          weight,
-                                          residual,
-                                          xscale,
-                                          epsilon,
-                                          rows,
-                                          hidden,
-                                          qmax,
-                                          model_sensitive,
-                                          stream);
+            OPUS_QUANT(fp16_t, fp8_t);
         else
-            launch_quant_t<fp16_t, i8_t>(out,
-                                         yscale,
-                                         unquant,
-                                         in,
-                                         weight,
-                                         residual,
-                                         xscale,
-                                         epsilon,
-                                         rows,
-                                         hidden,
-                                         qmax,
-                                         model_sensitive,
-                                         stream);
+            OPUS_QUANT(fp16_t, i8_t);
     }
+#undef OPUS_QUANT
 }
 
 } // namespace rmsnorm_opus

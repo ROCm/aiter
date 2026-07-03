@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// OPUS RMSNorm C ABI (ctypes). Single torch-free TU with no HIP-runtime / CK /
-// pybind / aiter_tensor.h dependency: tensors arrive as raw pointers + dims, so
-// the whole module is a handful of preprocessed lines under -D__HIPCC_RTC__.
-//
-// Args are passed by aiter's _ctypes_call as int64 (pointers/dims) + float; the
-// Python wrapper validates dtype/shape and supplies the current HIP stream.
-// is_bf16: 1 = bf16, 0 = fp16.
+// OPUS RMSNorm C ABI (ctypes). Single torch-free TU (no HIP-runtime / CK / pybind):
+// tensors arrive as raw int64 pointers + dims via aiter's _ctypes_call, validated
+// Python-side, so the whole module is a few preprocessed lines under -D__HIPCC_RTC__.
+// dtype: 0=fp16, 1=bf16, 2=fp32.
 
 #include "rmsnorm_opus.h"
 
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
+
+// Dispatch a norm launch on the dtype code (0=fp16, 1=bf16, 2=fp32).
+#define OPUS_NORM_DISPATCH(DTYPE, O, I, W, R)                                          \
+    do                                                                                 \
+    {                                                                                  \
+        if((DTYPE) == 2)                                                               \
+            launch_norm<fp32_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, s); \
+        else if((DTYPE) == 1)                                                          \
+            launch_norm<bf16_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, s); \
+        else                                                                           \
+            launch_norm<fp16_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, s); \
+    } while(0)
 
 OPUS_EXPORT void rms_norm_opus(size_t out,
                                size_t in,
@@ -19,7 +28,7 @@ OPUS_EXPORT void rms_norm_opus(size_t out,
                                float epsilon,
                                int rows,
                                int hidden,
-                               int is_bf16,
+                               int dtype,
                                int model_sensitive,
                                size_t stream)
 {
@@ -30,10 +39,7 @@ OPUS_EXPORT void rms_norm_opus(size_t out,
     auto* o = reinterpret_cast<void*>(out);
     auto* i = reinterpret_cast<const void*>(in);
     auto* w = reinterpret_cast<const void*>(weight);
-    if(is_bf16)
-        launch_norm<bf16_t>(o, i, w, nullptr, epsilon, rows, hidden, model_sensitive, s);
-    else
-        launch_norm<fp16_t>(o, i, w, nullptr, epsilon, rows, hidden, model_sensitive, s);
+    OPUS_NORM_DISPATCH(dtype, o, i, w, nullptr);
 }
 
 OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
@@ -42,7 +48,7 @@ OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
                                          float epsilon,
                                          int rows,
                                          int hidden,
-                                         int is_bf16,
+                                         int dtype,
                                          int model_sensitive,
                                          size_t stream)
 {
@@ -53,14 +59,11 @@ OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
     auto* io = reinterpret_cast<void*>(inout);
     auto* r  = reinterpret_cast<void*>(residual);
     auto* w  = reinterpret_cast<const void*>(weight);
-    if(is_bf16) // in-place: out == in == inout
-        launch_norm<bf16_t>(io, io, w, r, epsilon, rows, hidden, model_sensitive, s);
-    else
-        launch_norm<fp16_t>(io, io, w, r, epsilon, rows, hidden, model_sensitive, s);
+    OPUS_NORM_DISPATCH(dtype, io, io, w, r); // in-place: out == in == inout
 }
 
 // Fused rmsnorm + dynamic/smooth quant. residual/xscale/unquant = 0 to disable
-// fused-add / smooth / save-unquant. in_code: 0=fp16,1=bf16; out_code: 0=int8,1=fp8.
+// fused-add / smooth / save-unquant. in_code: 0=fp16,1=bf16,2=fp32; out_code: 0=int8,1=fp8.
 OPUS_EXPORT void rms_norm_quant_opus(size_t out,
                                      size_t yscale,
                                      size_t unquant,
