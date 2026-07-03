@@ -347,8 +347,9 @@ def _build_bf16_inputs(
         # well above tolerance, so a dropped/mis-scaled sink is a hard mismatch.
         sink = torch.randn(num_heads, dtype=torch.float32, device=device) * 10.0
     else:
-        sink = torch.full((num_heads,), float("-inf"), dtype=torch.float32, device=device)
-
+        sink = torch.full(
+            (num_heads,), float("-inf"), dtype=torch.float32, device=device
+        )
     return dict(
         q_bf16=q_bf16,
         kv_bf16=kv_bf16,
