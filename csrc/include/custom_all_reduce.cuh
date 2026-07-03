@@ -2720,7 +2720,7 @@ void qknorm_allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                                     rotary_dim);
 }
 
-template <typename T, typename OutT, int ngpus>
+template <typename T, typename OutT, int ngpus, bool GEMMA_NORM = false>
 __global__ void __launch_bounds__(1024, 1)
     allreduce_fusion_kernel_2stage(RankData* _dp,
                                    RankSignals sg,
@@ -2810,12 +2810,12 @@ __global__ void __launch_bounds__(1024, 1)
         {
             acc[v] = upcast_s(vec[v]);
         }
-        ar_fusion_epilogue<P, A, T, OutT, pack_size>(
+        ar_fusion_epilogue<P, A, T, OutT, pack_size, GEMMA_NORM>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out);
     }
 }
 
-template <typename T, typename OutT, int NGPUS>
+template <typename T, typename OutT, int NGPUS, bool GEMMA_NORM = false>
 void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              RankSignals sg,
                                              Signal* self_sg,
@@ -2837,7 +2837,7 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
     size_t smem_size = BLOCK_SIZE * sizeof(typename opus::vector_t<T, PACK_SIZE>);
-    allreduce_fusion_kernel_2stage<T, OutT, NGPUS>
+    allreduce_fusion_kernel_2stage<T, OutT, NGPUS, GEMMA_NORM>
         <<<numBlocks, threadsPerBlock, smem_size, stream>>>(_dp,
                                                             sg,
                                                             self_sg,
@@ -2971,7 +2971,7 @@ void allreduce_fusion_kernel_2stage_per_group_launcher(
         launch(std::false_type{});
 }
 
-template <typename T, typename OutT>
+template <typename T, typename OutT, bool GEMMA_NORM = false>
 __global__ void __launch_bounds__(1024, 1)
     local_device_load_rmsnorm_quant_naive(RankSignals sg,
                                           int rank,
@@ -3008,7 +3008,7 @@ __global__ void __launch_bounds__(1024, 1)
         {
             acc[v] = upcast_s(vec[v]);
         }
-        ar_fusion_epilogue<P, A, T, OutT, pack_size>(
+        ar_fusion_epilogue<P, A, T, OutT, pack_size, GEMMA_NORM>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out);
     }
 }
@@ -3116,7 +3116,7 @@ void allreduce_fusion_kernel_split_per_group_launcher(RankData* _dp,
         launch(std::false_type{});
 }
 
-template <typename T, typename OutT, int NGPUS>
+template <typename T, typename OutT, int NGPUS, bool GEMMA_NORM = false>
 void allreduce_fusion_kernel_split_launcher(RankData* _dp,
                                             RankSignals sg,
                                             Signal* self_sg,
@@ -3158,7 +3158,7 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
     int nblocks             = size / hidden_dim;
     dim3 threadsPerBlock(BLOCK_SIZE);
     dim3 numBlocks(nblocks);
-    local_device_load_rmsnorm_quant_naive<T, OutT>
+    local_device_load_rmsnorm_quant_naive<T, OutT, GEMMA_NORM>
         <<<numBlocks, threadsPerBlock, 0, stream>>>(
             sg, rank, residual_inp, residual_out, output, weight, scale_out, size, hidden_dim, eps);
 }
@@ -4374,7 +4374,8 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
                                         float eps,
                                         int m,
                                         int n,
-                                        bool use_1stage)
+                                        bool use_1stage,
+                                        bool gemma_norm = false)
 {
     auto d   = 16 / sizeof(T);
     int size = m * n;
@@ -4389,58 +4390,59 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
     auto pack_size   = 16 / sizeof(T);
     bool n_constrain = (n % pack_size == 0) && (n / pack_size <= 1024);
     use_1stage       = use_1stage && n_constrain;
+
+#define launch_fused_allreduce_rmsnorm_quant_1stage(template_launcher, gemma_template_launcher) \
+    do                                                                                  \
+    {                                                                                   \
+        if(gemma_norm)                                                                  \
+        {                                                                               \
+            gemma_template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp,           \
+                                    residual_out, output, weight, scale_out, size, n, n, \
+                                    n, eps, stream);                                    \
+        }                                                                               \
+        else                                                                            \
+        {                                                                               \
+            template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp, residual_out,    \
+                              output, weight, scale_out, size, n, n, n, eps, stream);   \
+        }                                                                               \
+    } while(0)
+
+#define launch_fused_allreduce_rmsnorm_quant(template_launcher, gemma_template_launcher) \
+    do                                                                                   \
+    {                                                                                    \
+        if(gemma_norm)                                                                   \
+        {                                                                                \
+            gemma_template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp,            \
+                                    residual_out, output, weight, scale_out, size, n,     \
+                                    eps, stream);                                        \
+        }                                                                                \
+        else                                                                             \
+        {                                                                                \
+            template_launcher(ptrs, sg_, self_sg_, rank_, residual_inp, residual_out,     \
+                              output, weight, scale_out, size, n, eps, stream);          \
+        }                                                                                \
+    } while(0)
+
 #define DISPATCH_AR_FUSION_KERNEL(NGPUS)                                                       \
     if(use_1stage)                                                                             \
     {                                                                                          \
-        allreduce_fusion_kernel_1stage_launcher<T, QT, NGPUS>(ptrs,                            \
-                                                              sg_,                             \
-                                                              self_sg_,                        \
-                                                              rank_,                           \
-                                                              residual_inp,                    \
-                                                              residual_out,                    \
-                                                              output,                          \
-                                                              weight,                          \
-                                                              scale_out,                       \
-                                                              size,                            \
-                                                              n,                               \
-                                                              n,                               \
-                                                              n,                               \
-                                                              eps,                             \
-                                                              stream);                         \
+        launch_fused_allreduce_rmsnorm_quant_1stage(                                           \
+            (allreduce_fusion_kernel_1stage_launcher<T, QT, NGPUS, false>),                    \
+            (allreduce_fusion_kernel_1stage_launcher<T, QT, NGPUS, true>));                    \
         return;                                                                                \
     }                                                                                          \
     else if(n_constrain && (size * sizeof(T) <= 512 * 1024))                                   \
     {                                                                                          \
-        allreduce_fusion_kernel_2stage_launcher<T, QT, NGPUS>(ptrs,                            \
-                                                              sg_,                             \
-                                                              self_sg_,                        \
-                                                              rank_,                           \
-                                                              residual_inp,                    \
-                                                              residual_out,                    \
-                                                              output,                          \
-                                                              weight,                          \
-                                                              scale_out,                       \
-                                                              size,                            \
-                                                              n,                               \
-                                                              eps,                             \
-                                                              stream);                         \
+        launch_fused_allreduce_rmsnorm_quant(                                                  \
+            (allreduce_fusion_kernel_2stage_launcher<T, QT, NGPUS, false>),                    \
+            (allreduce_fusion_kernel_2stage_launcher<T, QT, NGPUS, true>));                    \
         return;                                                                                \
     }                                                                                          \
     else if(n_constrain)                                                                       \
     {                                                                                          \
-        allreduce_fusion_kernel_split_launcher<T, QT, NGPUS>(ptrs,                             \
-                                                             sg_,                              \
-                                                             self_sg_,                         \
-                                                             rank_,                            \
-                                                             residual_inp,                     \
-                                                             residual_out,                     \
-                                                             output,                           \
-                                                             weight,                           \
-                                                             scale_out,                        \
-                                                             size,                             \
-                                                             n,                                \
-                                                             eps,                              \
-                                                             stream);                          \
+        launch_fused_allreduce_rmsnorm_quant(                                                  \
+            (allreduce_fusion_kernel_split_launcher<T, QT, NGPUS, false>),                     \
+            (allreduce_fusion_kernel_split_launcher<T, QT, NGPUS, true>));                     \
         return;                                                                                \
     }                                                                                          \
     else                                                                                       \
@@ -4456,6 +4458,10 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
     case 2: DISPATCH_AR_FUSION_KERNEL(2); break;
     default: throw std::runtime_error("fused allreduce rmsnorm: unsupported world_size=" + std::to_string(world_size_));
     }
+
+#undef launch_fused_allreduce_rmsnorm_quant
+#undef launch_fused_allreduce_rmsnorm_quant_1stage
+#undef DISPATCH_AR_FUSION_KERNEL
 }
 
 template <typename T, typename QT>
