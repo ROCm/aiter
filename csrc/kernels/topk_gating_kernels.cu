@@ -1154,29 +1154,37 @@ void topk_softplus(aiter_tensor_t& topk_weights,
             }
 #undef _DISPATCH_OPT_N_KERNEL
 
-            // Multi-wave-per-token decode path for wave32. E=384/WPT=2 removes
-            // the EPT=12 bottleneck. E=256/WPT=8 (EPT=1) is a low-token decode
-            // win for topk=6: spreading one token across 8 waves fills the CUs
-            // when there aren't enough tokens to do so. Above num_tokens=256 the
-            // GPU is already saturated and the prefill_n multi-token path wins
-            // (measured on gfx1250: WPT=8 4.2-4.7us @ T<=256 vs 6.9/14.9us @
-            // T=1024/4096, while prefill_n is ~6.3/7.7us there).
+            // Multi-wave-per-token path for wave32: spread one token across
+            // several waves to fill the CUs when there aren't enough tokens, and
+            // to avoid the reg kernel's large-EPT sort (E=384 -> EPT=12).
+            // Gated to the token ranges where it was measured to win on gfx1250;
+            // above the gate, control falls to prefill_n / reg below.
 #define _DISPATCH_WAVE32_MULTIWAVE_KERNEL(NE, WPT)                                  \
     if(num_experts == NE && get_warp_size_func() == 32) {                            \
         if(need_renorm) { LAUNCH_TOPK_KERNEL_OPT_MULTIWAVE(NE, WPT, true,  SF) }     \
         else            { LAUNCH_TOPK_KERNEL_OPT_MULTIWAVE(NE, WPT, false, SF) }     \
         return;                                                                      \
     }
-            // EXPERIMENT: E=384 unconditional WPT=4 (no gate — the reg fallback
-            // for E=384 has EPT=12 and is catastrophic at high T).
-            _DISPATCH_WAVE32_MULTIWAVE_KERNEL(384, 4)
-            if(topk == 6 && num_tokens <= 256)
+            // E=384 WPT=4 wins up to T=1024 (measured); above that the prefill_n
+            // multi-token path is given a chance (reg fallback is EPT=12 and slow).
+            if(num_tokens <= 1024)
+            {
+                _DISPATCH_WAVE32_MULTIWAVE_KERNEL(384, 4)
+            }
+            // E=256 WPT=8 (EPT=1) is a low-token decode win across all topk on
+            // gfx1250 (measured ~4.1-6.0us @ T<=256 vs reg ~5.6-6.3us). Above
+            // T=256 the GPU saturates and reg is faster, so fall through.
+            if(num_tokens <= 256)
             {
                 _DISPATCH_WAVE32_MULTIWAVE_KERNEL(256, 8)
             }
 #undef _DISPATCH_WAVE32_MULTIWAVE_KERNEL
 
-            // opt1 (TOKENS_PER_WARP=1): decode path, or topk > 32, or few tokens.
+            // opt1 (register-only, TOKENS_PER_WARP=1): decode / low-T path.
+            // E=64/128/256 are fastest here (reg beats prefill_n for them, even
+            // at high T). E=384 reg has EPT = 384/WARP_SIZE: on wave64 (=6) it is
+            // fine, but on wave32 (=12) the sort is catastrophic — so on wave32
+            // E=384 is excluded here and falls through to prefill_n below.
 #define _DISPATCH_REG_KERNEL(NE)                                          \
     if(num_experts == NE) {                                                \
         if(need_renorm) { LAUNCH_TOPK_KERNEL_OPT(NE, true,  SF) }         \
@@ -1186,7 +1194,7 @@ void topk_softplus(aiter_tensor_t& topk_weights,
             _DISPATCH_REG_KERNEL(64)
             _DISPATCH_REG_KERNEL(128)
             _DISPATCH_REG_KERNEL(256)
-            _DISPATCH_REG_KERNEL(384)
+            if(get_warp_size_func() != 32) { _DISPATCH_REG_KERNEL(384) }
 #undef _DISPATCH_REG_KERNEL
         }
 
@@ -1197,7 +1205,11 @@ void topk_softplus(aiter_tensor_t& topk_weights,
         //   sigmoid/softplus: T≥4096 (compute_score is heavier per element)
         //   softmax: T≥1 (all T — register-only softmax beats smem for any token count)
         {
-            const int prefill_n_threshold = (sf_code == SCORE_SOFTMAX) ? 1 : 4096;
+            // E=384 non-softmax has no good reg path (EPT=12), so it uses
+            // prefill_n as soon as the multiwave gate (T<=1024) ends. Other
+            // expert counts keep the sigmoid/softplus T>=4096 breakeven.
+            const int prefill_n_threshold =
+                (sf_code == SCORE_SOFTMAX) ? 1 : (num_experts == 384 ? 1025 : 4096);
 #define _DISPATCH_PREFILL_N_KERNEL(NE, TPW)                                      \
     if(num_experts == NE) {                                                       \
         if(need_renorm) { LAUNCH_TOPK_KERNEL_PREFILL_N(NE, true,  SF, TPW) }    \
