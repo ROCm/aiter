@@ -60,7 +60,6 @@ from flydsl.runtime.device import get_rocm_arch
 from flydsl.compiler.kernel_function import CompilationContext
 
 from .tensor_shim import STensor
-from .kernels_common import get_warp_size
 
 _LOG2E = math.log2(math.e)
 
@@ -455,14 +454,18 @@ def build_fmha_bwd_kernel_module(
             scale_log2e = arith.mulf(arith.constant(_LOG2E, type=f32), scale_v)
             log2e_c = arith.constant(_LOG2E, type=f32)
             c2 = arith.constant(ELEM_BYTES, type=i32)
-            zero_f32 = arith.constant(0.0, type=f32)
             zero_v4 = arith.constant_vector(0.0, T.f32x4)
 
             # ── LDS setup ──────────────────────────────────────────────────
             lds_base = allocator.get_base()
-            _mk_lds = lambda off, sz: STensor(
-                SmemPtr(lds_base, off, T.bf16, shape=(sz,)), dtype=T.bf16, shape=(sz,)
-            )
+
+            def _mk_lds(off, sz):
+                return STensor(
+                    SmemPtr(lds_base, off, T.bf16, shape=(sz,)),
+                    dtype=T.bf16,
+                    shape=(sz,),
+                )
+
             k_lds_s = _mk_lds(_K_LDS_OFF, BLOCK_N * LDS_D)
             v_lds_s = _mk_lds(_V_LDS_OFF, BLOCK_N * LDS_D)
             q_lds_s = _mk_lds(_Q_LDS_OFF, BLOCK_M * LDS_D)

@@ -139,7 +139,7 @@ def main():
         f"{FLOPS_5 / (total * 1e-3) / 1e12:8.1f} TFLOPS"
     )
     print(f"  breakdown: prep {t_prep/total:.0%}  dQ/dK/dV {t_dkdv/total:.0%}")
-    print(f"  CK target ~836 TFLOPS")
+    print("  CK target ~836 TFLOPS")
 
 
 if __name__ == "__main__":
