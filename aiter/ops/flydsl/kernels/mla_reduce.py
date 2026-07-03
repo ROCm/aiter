@@ -51,11 +51,30 @@ _LOG2E = math.log2(math.e)
 fm_fast = fx.arith.FastMathFlags.fast
 
 # Matches MlaReduceKernelV1Traits (reduce.cu:13)
-NUM_THREADS = 128
+# NUM_THREADS is an env-overridable JOINT-SEARCH knob (MLA_NUM_THREADS ∈
+# {64,128,256}). It sets the block size (wave count = NT/64) and, via
+# VEC = Dv/NT, the per-thread output-accumulator width. Larger NT -> smaller VEC
+# -> smaller accumulate register live-set (the main VGPR lever for occupancy),
+# at the cost of more waves per block. Must divide Dv (512).
+NUM_THREADS = int(os.environ.get("MLA_NUM_THREADS", "256"))
 WARP = 64
 NUM_WAVES = NUM_THREADS // WARP
 OCC = 8
 MASSIVE_THR = 4  # kMassiveThreshold
+
+# GRP (splits processed per accumulate-loop iteration / loads-in-flight) is a
+# tier-dependent JOINT-SEARCH knob. GRP_M256 drives the long-loop M256/MLDS path
+# (nlse>=4), GRP_M64 the M64 path (nlse<4). Must be powers of two (the loop uses
+# a shift for num_iters). Overridable via MLA_GRP_M256 / MLA_GRP_M64 for sweeps.
+GRP_M256 = int(os.environ.get("MLA_GRP_M256", "16"))
+GRP_M64 = int(os.environ.get("MLA_GRP_M64", "8"))
+
+# Runtime M64 sub-split (JOINT-SEARCH knob). When M64_HI_THR > 0, M64 tiles with
+# n_splits > M64_HI_THR use GRP=M64_HI_GRP (deeper pipeline, wins high-split
+# shapes b8_s32/s26/s13) while low-split tiles keep GRP_M64 (fewer wasted masked
+# lanes, holds b8_s6/s5). Device-side branch -> capture-safe. 0 disables.
+M64_HI_THR = int(os.environ.get("MLA_M64_HI_THR", "0"))
+M64_HI_GRP = int(os.environ.get("MLA_M64_HI_GRP", "16"))
 # Persistent-launch grid = num_cu * PS_GRID_MULT. HIP uses num_cu*kOccupancy*2
 # (=16 here), but the FlyDSL Tier.ALL kernel runs at occupancy 1 wave/SIMD
 # (193 VGPR from the shared massive path), so that 16x grid is ~8x oversubscribed
@@ -536,8 +555,16 @@ def compile_mla_reduce(
                 store_result(seq_i32, out_elems)
                 store_lse(seq_i32, max_lse, sum_e)
 
-            def emit_massive_body(seq_i32, local_seq, nlse: int):
-                """Warp0 LSE reduce -> lds_scale -> barrier -> accumulate."""
+            def emit_massive_body(seq_i32, local_seq, nlse: int, grp_override=None):
+                """Warp0 LSE reduce -> lds_scale -> barrier -> accumulate.
+
+                ``grp_override`` forces the accumulate GRP (loads-in-flight)
+                independent of the nlse-derived default, so the runtime M64
+                sub-split can give high-split M64 tiles a deeper pipeline
+                (GRP=16) while low-split tiles keep GRP=8 (fewer wasted masked
+                lanes) -- a per-shape choice the single GRP_M64 constant can't
+                make.
+                """
                 neg_inf = fx.arith.constant(float("-inf"), type=T.f32)
                 is_wave0 = fx.arith.cmpi(
                     fx.arith.CmpIPredicate.eq, wave, fx.Int32(0)
@@ -631,7 +658,10 @@ def compile_mla_reduce(
                 # path (nlse=1) keeps GRP=8: at GRP=16 the low-split tail (b8_s5/
                 # s6 @5-6 splits) regresses +11% because a group wastes 10 masked
                 # lanes instead of 2, and b8_s32 sees no gain beyond noise.
-                GRP = 16 if nlse >= 4 else 8
+                if fx.const_expr(grp_override is not None):
+                    GRP = grp_override
+                else:
+                    GRP = GRP_M256 if nlse >= 4 else GRP_M64
                 _grp_shift = GRP.bit_length() - 1
                 zero_f = fx.arith.constant(0.0, type=T.f32)
 
@@ -810,7 +840,29 @@ def compile_mla_reduce(
                             is_le_64, results_=[], has_else=True
                         )
                         with _if_then(if_le64):
-                            emit_massive_body(seq_i32, local_seq, 1)
+                            if fx.const_expr(M64_HI_THR > 0):
+                                # Runtime M64 sub-split: high-split M64 tiles
+                                # (n_splits > thr) take the deeper GRP=M64_HI_GRP
+                                # pipeline; low-split tiles keep GRP_M64 (fewer
+                                # wasted masked lanes). Capture-safe (device-side
+                                # branch, no host tier baking).
+                                is_hi = fx.arith.cmpi(
+                                    fx.arith.CmpIPredicate.sgt,
+                                    n_splits,
+                                    fx.Int32(M64_HI_THR),
+                                )
+                                if_hi = scf.IfOp(
+                                    is_hi, results_=[], has_else=True
+                                )
+                                with _if_then(if_hi):
+                                    emit_massive_body(
+                                        seq_i32, local_seq, 1,
+                                        grp_override=M64_HI_GRP,
+                                    )
+                                with _if_else(if_hi):
+                                    emit_massive_body(seq_i32, local_seq, 1)
+                            else:
+                                emit_massive_body(seq_i32, local_seq, 1)
                         with _if_else(if_le64):
                             is_le_256 = fx.arith.cmpi(
                                 fx.arith.CmpIPredicate.sle,
