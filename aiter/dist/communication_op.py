@@ -20,6 +20,8 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.distributed
 
+from aiter.ops.enum import QuantType
+
 from .parallel_state import (
     get_tp_group,
     get_pp_group,
@@ -28,6 +30,93 @@ from .parallel_state import (
     get_custom_group,
     has_custom_group,
 )
+
+# quant_type aliases -> fused AR+RMSNorm+quant family. Single source of truth,
+# also imported by communicator_cuda.
+_FUSED_AR_RMS_QUANT_ALIASES = {
+    "fp8": "per_token",
+    "fp8_per_token": "per_token",
+    "per-token": "per_token",
+    "per_token": "per_token",
+    "per_token_fp8": "per_token",
+    "fp8_per_group": "per_group",
+    "per-group": "per_group",
+    "per_group": "per_group",
+    "per_group_fp8": "per_group",
+    "per_1x128": "per_group",
+    "fp4": "mxfp4",
+    "fp4_e2m1": "mxfp4",
+    "mx_fp4": "mxfp4",
+    "mxfp4": "mxfp4",
+    "per_1x32": "mxfp4",
+}
+
+
+def _normalize_fused_ar_rms_quant_type(quant_type):
+    if isinstance(quant_type, str):
+        normalized = _FUSED_AR_RMS_QUANT_ALIASES.get(quant_type.lower())
+        if normalized is not None:
+            return normalized
+    else:
+        if quant_type == QuantType.per_Token:
+            return "per_token"
+        if quant_type in (QuantType.per_1x128, getattr(QuantType, "per_128x128", None)):
+            return "per_group"
+        if quant_type == QuantType.per_1x32:
+            return "mxfp4"
+        try:
+            return _normalize_fused_ar_rms_quant_type(QuantType(quant_type))
+        except Exception:
+            pass
+    raise ValueError(
+        "unsupported fused AR+RMSNorm quant_type="
+        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
+    )
+
+
+# Lookup sets for trace-safe dispatch: `enum == enum` graph-breaks Dynamo, so
+# match on int `.value` / string membership instead.
+_PER_GROUP_QUANT_ALIASES = frozenset(
+    k for k, v in _FUSED_AR_RMS_QUANT_ALIASES.items() if v == "per_group"
+)
+_PER_GROUP_QUANT_VALUES = frozenset(
+    q.value
+    for q in (getattr(QuantType, "per_1x128", None), getattr(QuantType, "per_128x128", None))
+    if q is not None
+)
+_PER_TOKEN_QUANT_VALUES = frozenset(
+    q.value for q in (getattr(QuantType, "per_Token", None),) if q is not None
+)
+_MXFP4_QUANT_VALUES = frozenset(
+    q.value for q in (getattr(QuantType, "per_1x32", None),) if q is not None
+)
+
+
+def _is_per_group_quant(quant_type):
+    if isinstance(quant_type, str):
+        return quant_type.lower() in _PER_GROUP_QUANT_ALIASES
+    return getattr(quant_type, "value", quant_type) in _PER_GROUP_QUANT_VALUES
+
+
+def _canonical_fused_ar_rms_quant_type(quant_type):
+    """Trace-safe canonical string ("per_token"/"per_group"/"mxfp4").
+
+    Reduces the pybind enum via int ``.value`` (never ``enum == enum``, which
+    graph-breaks Dynamo) so downstream string guards match under torch.compile.
+    """
+    if isinstance(quant_type, str):
+        return _normalize_fused_ar_rms_quant_type(quant_type)
+    v = getattr(quant_type, "value", quant_type)
+    if v in _PER_GROUP_QUANT_VALUES:
+        return "per_group"
+    if v in _PER_TOKEN_QUANT_VALUES:
+        return "per_token"
+    if v in _MXFP4_QUANT_VALUES:
+        return "mxfp4"
+    raise ValueError(
+        "unsupported fused AR+RMSNorm quant_type="
+        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
+    )
 
 
 def _assert_no_custom_group(op_name: str):
@@ -100,11 +189,32 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     ``"per_group"`` / ``"per_1x128"`` for FP8 per-group quantization, and
     ``"mxfp4"`` / ``"per_1x32"`` for MXFP4 quantization.
 
+    ``group_size`` is the per-group quantization block size (per-group only).
+
     ``transpose_scale`` (per-group only) writes the per-group scale in
     column-major layout ``(num_groups, M)`` viewed as ``(M, num_groups)``,
     matching what ``gemm_a8w8_blockscale_preshuffle`` expects.
     """
     _assert_no_custom_group("tensor_model_parallel_fused_allreduce_rmsnorm_quant")
+
+    # Enum -> string up front (trace-safe) so downstream string guards match
+    # under torch.compile instead of falling to the untraced pybind path.
+    quant_type = _canonical_fused_ar_rms_quant_type(quant_type)
+
+    # Per-group has its own traceable torch.library method; the generic path would
+    # hit raw pybind and graph-break.
+    if _is_per_group_quant(quant_type):
+        return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_size=group_size,
+            prefill_support=prefill_support,
+            emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
+        )
+
     return get_tp_group().fused_allreduce_rmsnorm_quant(
         input_,
         residual_inp_,
@@ -116,37 +226,6 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         emit_bf16=emit_bf16,
         transpose_scale=transpose_scale,
         gemma_norm=gemma_norm,
-    )
-
-
-def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-    input_: torch.Tensor,
-    residual_inp_: torch.Tensor,
-    weight_: torch.Tensor,
-    eps: float,
-    group_size: int = 128,
-    prefill_support: bool = False,
-    emit_bf16: bool = False,
-    transpose_scale: bool = False,
-):
-    # Route through GroupCoordinator.fused_allreduce_rmsnorm_quant_per_group,
-    # which (for the non-emit_bf16 case) dispatches the torch.library-registered
-    # op ``fused_allreduce_rmsnorm_quant_per_group_``. Going through the generic
-    # ``fused_allreduce_rmsnorm_quant`` instead would reach the raw pybind chain
-    # directly, which Dynamo cannot trace -> graph break / compile failure under
-    # torch.compile, silently disabling the fusion.
-    _assert_no_custom_group(
-        "tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group"
-    )
-    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
-        input_,
-        residual_inp_,
-        weight_,
-        eps,
-        group_size=group_size,
-        prefill_support=prefill_support,
-        emit_bf16=emit_bf16,
-        transpose_scale=transpose_scale,
     )
 
 
