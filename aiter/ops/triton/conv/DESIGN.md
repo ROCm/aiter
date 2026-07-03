@@ -298,13 +298,13 @@ Highlights:
 NHWC-native 3×3 with **K-major weight layout** `W3[K_out, 9, C_pad]`:
 
 - For each `(p, q)` output column the kernel walks the 9 spatial taps, loads
-  the corresponding `[BLOCK_M, BLOCK_C]` slice of input and the matching
-  `[BLOCK_C, BLOCK_N]` slice of W3, and accumulates
+  the corresponding `[BLOCK_M, BLOCK_K]` slice of input and the matching
+  `[BLOCK_K, BLOCK_N]` slice of W3, and accumulates
   `tl.dot(...)` into `[BLOCK_M, BLOCK_N]`.
-- Channel padding `C_pad` is rounded up to a multiple of `BLOCK_C` and the
+- Channel padding `C_pad` is rounded up to a multiple of `BLOCK_K` and the
   trailing weight lanes are pre-zeroed in the prepack. The spatial validity
   mask is hoisted out of the inner C loop; the only per-iteration mask is
-  the channel-bound check (`c_offs < C`).
+  the channel-bound check (`k_offs < C`).
 - Hardcoded `stride_x_c=1` (channels are contiguous in NHWC) means the
   load addressing collapses to a single base + linear stride; the compiler
   emits one vectorized load per row.
@@ -334,13 +334,13 @@ addressing.
 
 Highlights:
 
-- **`stride_c_local=1` is hardcoded** in the load path (`c_local[None, :]`
+- **`stride_x_cb=1` is hardcoded** in the load path (`k_local[None, :]`
   is added directly to the pointer without a stride multiplier), so the
   compiler emits one vectorized load per channel chunk — structurally the
   same hardcoded-stride trick as `stride_x_c=1` in the NHWC kernel.
-- **Channel addressing.** Inside the C loop, `c_offs // Cb` selects the
-  block index and `c_offs % Cb` the offset within the block. This stays
-  coalesced **only when `BLOCK_C ≤ Cb`** — at the boundary, `cblock_idx`
+- **Channel addressing.** Inside the C loop, `k_offs // Cb` selects the
+  block index and `k_offs % Cb` the offset within the block. This stays
+  coalesced **only when `BLOCK_K ≤ Cb`** — at the boundary, `cblock_idx`
   jumps and the load address discontinues. This is an implicit constraint
   on `configs/conv/{arch}-CONV-3X3-CBLOCKED.json`; new configs must respect it.
 - **Same L2 swizzle as 5.1/5.2** — workgroups are reordered into
