@@ -62,7 +62,7 @@ def _mla_gluon(
     Req_to_tokens,
     B_seq_len,
     O,  # noqa: E741
-    Attn_sink,  # [NHEAD] fp32 per-head sink bias; unused unless HAS_ATTN_SINK
+    Attn_sink,
     sm_scale,
     kv_scale,
     stride_q_nope_bs,
@@ -768,18 +768,18 @@ def mla_gluon(
     page_table,  # 2D: block_table [batch, max_seqlen] | 1D: kv_indices [total_kv]
     seq_info,  # 2D: cache_seqlens [batch]           | 1D: kv_indptr [batch+1]
     sm_scale,
-    has_pe=True,  # DeepSeek V4 sparse prefill require no PE
     k_pe=None,
     kv_pe_offset=512,
     use_2d_view=True,
     kv_scale=1.0,
     min_kv_seq_len=1,
     return_lse=False,
-    attn_sink=None,
+    has_pe=True,
+    attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
 ):
     """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
 
-    Always runs the full decode (stage-1 + stage-2 reduce, or the stage-1-only
+    `mla_gluon` supports the full decode (stage-1 + stage-2 reduce, or the stage-1-only
     fast path when NUM_KV_SPLITS==1) and writes the final attention into the
     caller's `o` ([batch, nhead, kv_lora_rank]).
 
@@ -787,6 +787,10 @@ def mla_gluon(
 
     return_lse=True: additionally returns the merged log-sum-exp, a separate
         fp32 tensor [batch, nhead]
+
+    DSv4 Sparse prefill packs NoPE and RoPE in to one contiguous row (448+64).
+    To run DSv4 prefill, it requires has_pe=False, prepares valid Q / K in q_nope / kv_c,
+    and attn_sink, q_pe / k_pe are unused placeholders.
     """
     if k_pe is None:
         k_pe = kv_c
@@ -796,10 +800,6 @@ def mla_gluon(
     # DSV4 prefill (HAS_PE=False) has no PE, so q_pe may be None and RoPE head_dim is the fixed 64.
     head_dim_kpe = q_pe.shape[-1] if has_pe else 64
     if not has_pe:
-        # DSV4 sparse prefill: combined-D Q (RoPE folded in, K==V), 1-D ragged CSR KV,
-        # single split. Reuses the bh64 decode path with HAS_PE=False. q_pe / k_pe are
-        # unused placeholders but must be valid ptrs; the CSR view has no page stride and
-        # folds PE at offset 0. DSV4 assumes TopK in [512, 1024], so no kv-len guard.
         q_pe = q_nope
         k_pe = kv_c
         kv_pe_offset = 0
@@ -840,33 +840,21 @@ def mla_gluon(
     if REGIME == "bh64":
         BLOCK_H, BLOCK_N = 64, 64
         NUM_XCDS = get_num_xcds()
-        if has_pe:
-            # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
-            # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
-            base_grid = (
-                NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * (batch_size // NUM_XCDS)
-            )
-            NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(256, base_grid)))
+        # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
+        # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
+        base_grid = NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * (batch_size // NUM_XCDS)
+        NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(256, base_grid)))
 
-            assert batch_size in (
-                64,
-                128,
-                256,
-            ), f"mla_gluon[bh64] requires batch_size in (64, 128, 256), got {batch_size}"
-            # gl.assume(num_iter > 3) inside the kernel requires every split to have
-            # > 3*BLOCK_N tokens. Smallest split (last) for batch length s is
-            # s - (k-1)*ceil(s/k); a sufficient bound is min_kv_seq_len > k*(3*BLOCK_N + k).
-            min_kv_seq_len_required = NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)
-            assert (
-                min_kv_seq_len > min_kv_seq_len_required
-            ), f"mla_gluon[bh64] requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
-        else:
-            # DSV4 prefill: single split (stage-1 writes o directly), one program per
-            # (query token, head-block). TopK in [512, 1024] => num_iter >= 3.
-            NUM_KV_SPLITS = 1
-            assert (
-                batch_size % 64 == 0
-            ), f"mla_gluon[dsv4-prefill] requires batch_size divisible by 64, got {batch_size}"
+        assert (
+            batch_size % 64 == 0
+        ), f"mla_gluon[bh64] requires batch_size divisible by 64, got {batch_size}"
+        # gl.assume(num_iter > 3) inside the kernel requires every split to have
+        # > 3*BLOCK_N tokens. Smallest split (last) for batch length s is
+        # s - (k-1)*ceil(s/k); a sufficient bound is min_kv_seq_len > k*(3*BLOCK_N + k).
+        min_kv_seq_len_required = NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)
+        assert (
+            min_kv_seq_len > min_kv_seq_len_required
+        ), f"mla_gluon[bh64] requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"

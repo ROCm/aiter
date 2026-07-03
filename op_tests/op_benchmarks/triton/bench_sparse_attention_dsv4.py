@@ -62,6 +62,27 @@ def _build_csr(num_q: int, max_slots: int, max_topk: int, device: str):
     return torch.cat(flat), torch.tensor(ptr, dtype=torch.int32, device=device), lens
 
 
+def _ref_prefill(q, kv, indices, indptr, scale, attn_sink=None):
+    """torch reference: per-query masked softmax attention over the CSR-gathered KV."""
+    out = torch.zeros_like(q, dtype=torch.float32)
+    for t in range(q.shape[0]):
+        s, e = int(indptr[t]), int(indptr[t + 1])
+        if e <= s:
+            continue
+        K = kv[indices[s:e].long()].float()  # [L, D]
+        sc = (q[t].float() @ K.t()) * scale  # [H, L]
+        if attn_sink is not None:
+            m = torch.maximum(sc.max(-1).values, attn_sink.float())
+            p = torch.exp(sc - m[:, None])
+            denom = p.sum(-1) + torch.exp(attn_sink.float() - m)
+        else:
+            m = sc.max(-1).values
+            p = torch.exp(sc - m[:, None])
+            denom = p.sum(-1)
+        out[t] = (p / denom[:, None]) @ K
+    return out.to(q.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Kernel launchers
 # ---------------------------------------------------------------------------
@@ -89,6 +110,7 @@ def _launch_prefill(
             indices,  # page_table = ragged kv_indices
             indptr,  # seq_info = ragged kv_indptr
             scale,
+            min_kv_seq_len=float("inf"),  # skip min_kv_seq_len check for decode
             has_pe=False,
             attn_sink=attn_sink if has_sink else None,
         )
@@ -265,6 +287,57 @@ def _print_table(title, headers, rows):
         print("| " + " | ".join(s.rjust(widths[i]) for i, s in enumerate(c)) + " |")
 
 
+def check_correctness(device: str):
+    """Quick torch-reference correctness gate, run once before profiling.
+
+    Validates every available backend (Triton, and Gluon on gfx950) with and
+    without the attention sink on one small shape. Raises on mismatch so a broken
+    kernel fails loudly instead of being silently benchmarked.
+    """
+    print("\n========== CORRECTNESS ==========")
+    num_queries, num_heads, num_kv, topk = 128, 128, 2048, 512
+    torch.manual_seed(0)
+    q = torch.randn(
+        num_queries, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    kv = torch.randn(num_kv, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    indices, indptr, _ = _build_csr(num_queries, num_kv, topk, device)
+    scale = 1.0 / (HEAD_DIM**0.5)
+
+    backends = ["triton", "gluon"] if HAS_GLUON else ["triton"]
+    for backend in backends:
+        for has_sink in (False, True):
+            attn_sink = (
+                torch.randn(num_heads, dtype=torch.float32, device=device)
+                if has_sink
+                else torch.empty(1, dtype=torch.float32, device=device)
+            )
+            out = torch.empty_like(q)
+            _launch_prefill(
+                backend,
+                q,
+                kv,
+                indices,
+                indptr,
+                out,
+                num_queries,
+                num_heads,
+                HEAD_DIM,
+                has_sink,
+                attn_sink,
+                scale,
+            )
+            torch.cuda.synchronize()
+            ref = _ref_prefill(
+                q, kv, indices, indptr, scale, attn_sink if has_sink else None
+            )
+            max_diff = (out.float() - ref.float()).abs().max().item()
+            torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
+            print(
+                f"  {backend:6s} sink={str(has_sink):5s}: OK (max|delta|={max_diff:.4f})"
+            )
+
+
 def _parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -303,6 +376,7 @@ def main():
         else "Backends: Triton only (Gluon kernel unavailable)"
     )
     if args.shapes in ("all", "prefill"):
+        check_correctness(device)
         run_prefill_bench(args, device)
 
 
