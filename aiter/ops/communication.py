@@ -16,6 +16,7 @@ from ..dist.parallel_state import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from ..dist.init_timing import timed, report_init_timing
 
 logger = logging.getLogger("aiter")
 
@@ -40,35 +41,40 @@ def init_dist_env(
         * prefill_context_model_parallel_size
     )
     set_custom_all_reduce(True)
-    init_distributed_environment(
-        world_size=world_size,
-        rank=rankID,
-        distributed_init_method=distributed_init_method,
-        # distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
-        backend=backend,
-        local_rank=local_rank,
-        data_parallel_size=data_parallel_size,
-        data_parallel_rank=data_parallel_rank,
-    )
-    ensure_model_parallel_initialized(
-        tensor_model_parallel_size,
-        pipeline_model_parallel_size,
-        decode_context_model_parallel_size=decode_context_parallel_size,
-        data_parallel_size=data_parallel_size,
-        prefill_context_model_parallel_size=prefill_context_model_parallel_size,
-    )
+    with timed("init_dist_env(total)"):
+        with timed("init_distributed_environment"):
+            init_distributed_environment(
+                world_size=world_size,
+                rank=rankID,
+                distributed_init_method=distributed_init_method,
+                # distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+                backend=backend,
+                local_rank=local_rank,
+                data_parallel_size=data_parallel_size,
+                data_parallel_rank=data_parallel_rank,
+            )
+        with timed("ensure_model_parallel_initialized"):
+            ensure_model_parallel_initialized(
+                tensor_model_parallel_size,
+                pipeline_model_parallel_size,
+                decode_context_model_parallel_size=decode_context_parallel_size,
+                data_parallel_size=data_parallel_size,
+                prefill_context_model_parallel_size=prefill_context_model_parallel_size,
+            )
 
-    if tensor_model_parallel_size > 1:
-        # hack custom_allreduce
-        tp_grp = get_tp_group()
-        ca_comm = tp_grp.device_communicator.ca_comm
-        # signal
-        signal = torch.zeros(
-            tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
-        )
-        ca_comm.signal = signal
-        ca_comm.register_input_buffer(signal)
-        ca_comm.buffer = ca_comm._pool["input"].tensor
+        if tensor_model_parallel_size > 1:
+            with timed("hack_custom_allreduce_signal"):
+                # hack custom_allreduce
+                tp_grp = get_tp_group()
+                ca_comm = tp_grp.device_communicator.ca_comm
+                # signal
+                signal = torch.zeros(
+                    tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
+                )
+                ca_comm.signal = signal
+                ca_comm.register_input_buffer(signal)
+                ca_comm.buffer = ca_comm._pool["input"].tensor
+    report_init_timing()
     logger.debug(f"RANK: {rankID}/{tensor_model_parallel_size} init_dist_env...")
 
 

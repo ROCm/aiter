@@ -38,6 +38,7 @@ from torch.distributed import Backend, ProcessGroup
 import os
 from aiter import logger
 from aiter import torch_compile_guard
+from aiter.dist.init_timing import timed
 
 
 def supports_custom_op():
@@ -367,19 +368,22 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self_device_group = device_group
-                self_cpu_group = cpu_group
+        with timed(f"new_group:{group_name or 'anonymous'}"):
+            for ranks in group_ranks:
+                with timed(f"new_group:{group_name}:device"):
+                    device_group = torch.distributed.new_group(
+                        ranks, backend=torch_distributed_backend
+                    )
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
+                with timed(f"new_group:{group_name}:cpu(gloo)"):
+                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self_device_group = device_group
+                    self_cpu_group = cpu_group
 
         assert self_cpu_group is not None
         assert self_device_group is not None
@@ -401,20 +405,22 @@ class GroupCoordinator:
         if use_device_communicator and self.world_size > 1:
             from .device_communicators.communicator_cuda import CudaCommunicator
 
-            self.device_communicator = CudaCommunicator(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                device_group=self.device_group,
-                unique_name=self.unique_name,
-            )
+            with timed(f"device_communicator:{group_name}"):
+                self.device_communicator = CudaCommunicator(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                )
 
         from .shm_broadcast import MessageQueue
 
         self.mq_broadcaster = None
         if use_message_queue_broadcaster and self.world_size > 1:
-            self.mq_broadcaster = MessageQueue.create_from_process_group(
-                self.cpu_group, 1 << 22, 6
-            )
+            with timed(f"mq_broadcaster:{group_name}"):
+                self.mq_broadcaster = MessageQueue.create_from_process_group(
+                    self.cpu_group, 1 << 22, 6
+                )
 
     @property
     def first_rank(self):
@@ -1501,12 +1507,13 @@ def init_distributed_environment(
                 {"HIP_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))}
             )
 
-        torch.distributed.init_process_group(
-            backend=backend,
-            init_method=distributed_init_method,
-            world_size=world_size,
-            rank=rank,
-        )
+        with timed("init_process_group"):
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank,
+            )
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -1521,7 +1528,8 @@ def init_distributed_environment(
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
-        _WORLD = init_world_group(ranks, local_rank, backend)
+        with timed("init_world_group"):
+            _WORLD = init_world_group(ranks, local_rank, backend)
     else:
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
@@ -1612,14 +1620,15 @@ def initialize_model_parallel(
     group_ranks = [x.tolist() for x in group_ranks]
 
     # message queue broadcaster is only used in tensor model parallel group
-    _TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        use_message_queue_broadcaster=True,
-        group_name="tp",
-    )
+    with timed("init_group:tp"):
+        _TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            use_message_queue_broadcaster=True,
+            group_name="tp",
+        )
 
     # Build the DCP model-parallel groups.
     global _DCP
@@ -1630,13 +1639,14 @@ def initialize_model_parallel(
     # TP group into tp_size//dcp_size DCP groups.
     group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
-    _DCP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="dcp",
-    )
+    with timed("init_group:dcp"):
+        _DCP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            group_name="dcp",
+        )
 
     # Build the prefill context-parallel (PCP) groups.
     # PCP is an INDEPENDENT dimension (world = ... x pcp x tp), unlike the
@@ -1650,13 +1660,14 @@ def initialize_model_parallel(
         .unbind(0)
     )
     group_ranks = [x.tolist() for x in group_ranks]
-    _PCP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="pcp",
-    )
+    with timed("init_group:pcp"):
+        _PCP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            group_name="pcp",
+        )
 
     # Build the pipeline model-parallel groups.
     global _PP
@@ -1665,25 +1676,27 @@ def initialize_model_parallel(
         all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
     )
     group_ranks = [x.tolist() for x in group_ranks]
-    _PP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="pp",
-    )
+    with timed("init_group:pp"):
+        _PP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            group_name="pp",
+        )
 
     global _DP
     assert _DP is None, "data parallel group is already initialized"
     group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
-    _DP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="dp",
-    )
+    with timed("init_group:dp"):
+        _DP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            group_name="dp",
+        )
 
     global _EP
     assert _EP is None, "expert parallel group is already initialized"
@@ -1698,13 +1711,14 @@ def initialize_model_parallel(
         .unbind(0)
     )
     group_ranks = [x.tolist() for x in group_ranks]
-    _EP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="ep",
-    )
+    with timed("init_group:ep"):
+        _EP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            group_name="ep",
+        )
 
     # Build the custom allreduce group(s) (optional).
     global _CUSTOM
@@ -1910,6 +1924,8 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     assert (
         torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
     ), "in_the_same_node_as should be tested with a non-NCCL group."
+    _itsn_ctx = timed("in_the_same_node_as")
+    _itsn_ctx.__enter__()
     # local rank inside the group
     rank = torch.distributed.get_rank(group=pg)
     world_size = torch.distributed.get_world_size(group=pg)
@@ -1966,6 +1982,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
             shm.unlink()
     torch.distributed.all_reduce(is_in_the_same_node, group=pg)
 
+    _itsn_ctx.__exit__(None, None, None)
     return [x == 1 for x in is_in_the_same_node.tolist()]
 
 

@@ -84,6 +84,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         # from aiter.dist.device_communicators.symm_mem import SymmMemCommunicator
 
+        from aiter.dist.init_timing import timed
+
         self.pynccl_comm = None
         if self.world_size > 1:
             from aiter.dist.device_communicators.communicator_pynccl import (
@@ -91,10 +93,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
             try:
-                self.pynccl_comm = PyNcclCommunicator(
-                    group=self.cpu_group,
-                    device=self.device,
-                )
+                with timed(f"PyNcclCommunicator:{self.unique_name}"):
+                    self.pynccl_comm = PyNcclCommunicator(
+                        group=self.cpu_group,
+                        device=self.device,
+                    )
             except Exception as e:
                 logger.warning(
                     f"Failed to initialize PyNcclCommunicator for group "
@@ -114,13 +117,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if self.use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
-            self.ca_comm = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-                # symm_mem_enabled=(
-                #     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
-                # ),
-            )
+            with timed(f"CustomAllreduce:{self.unique_name}"):
+                self.ca_comm = CustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                    # symm_mem_enabled=(
+                    #     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
+                    # ),
+                )
 
         if self.world_size > 1:
             from aiter.dist.device_communicators.quick_all_reduce import (
@@ -132,7 +136,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             #     # Based on quickreduce (https://github.com/mk1-project/quickreduce).
             #     # If it's a rocm, 'use_custom_allreduce==True' means it must
             #     # currently be an MI300 series.
-            self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+            with timed(f"QuickAllReduce:{self.unique_name}"):
+                self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
     @property
     def all2all_manager(self):
