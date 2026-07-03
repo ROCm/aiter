@@ -102,6 +102,15 @@ def _cached_from_dlpack(t: torch.Tensor):
 # --- shape constants (gfx1250 wave32) -----------------------------------------
 BLOCK_THREADS = 32  # 1 wave32 on RDNA4/gfx1250
 
+# Waves (rows/tokens) per workgroup. gfx1250 caps resident workgroups per CU
+# below the 64-waves/CU ceiling, so a 1-wave workgroup leaves occupancy on the
+# table even at VGPR=32. Packing ROWS_PER_WG independent waves into one
+# workgroup lets a handful of workgroups reach full occupancy and, crucially,
+# overlaps one row's load->reduce->store latency with another row's memory ops
+# (the kernel is latency-bound on that chain, not bandwidth- or ALU-bound).
+# Each wave (thread_idx.y) still processes exactly one (head, token) row.
+ROWS_PER_WG = 32
+
 # SQRT2 has no aiter dependency, so it stays at module level.
 _SQRT2 = math.sqrt(2.0)
 
@@ -325,11 +334,13 @@ def _build_kernel(
         _name_parts.append(scale_dtype)
     if kv_write:
         _name_parts.append("kvw")
+    if ROWS_PER_WG > 1:
+        _name_parts.append(f"r{ROWS_PER_WG}")
     _name_parts.append("w32")
     _name_parts.append("flydsl")
     _kname = "_".join(_name_parts)
 
-    @flyc.kernel(name=_kname)
+    @flyc.kernel(name=_kname, known_block_size=[BLOCK_THREADS, ROWS_PER_WG, 1])
     def kernel(
         q_in: fx.Pointer,  # [T, H, D]         bf16, contig (H, D)
         kv_in: fx.Pointer,  # [T, D]            bf16, may be strided
@@ -349,6 +360,7 @@ def _build_kernel(
         swa_slot_stride: Int32,  # bf16 elements (= cache_size * D)
         swa_pos_stride: Int32,  # bf16 elements (= D)
         swa_cache_size: Int32,  # ring slot count
+        num_tokens: Int32,  # valid tokens in this launch chunk (for tail clamp)
     ):
         f32 = T.f32
         i32 = T.i32
@@ -439,9 +451,22 @@ def _build_kernel(
             return out
 
         bid_x = fx.block_idx.x  # 0..H-1 (Q head) or H (KV)
-        bid_t = fx.block_idx.y  # token id (chunked at MAX_GRID_Y per launch)
+        bid_t = fx.block_idx.y  # workgroup index along the token-chunk dim
         tid = fx.thread_idx.x
-        bid_t_idx = arith.index_cast(T.index, _to_raw(bid_t))
+        tid_y = fx.thread_idx.y  # wave within workgroup -> token selector
+
+        # Each workgroup owns ROWS_PER_WG consecutive waves; wave tid_y handles
+        # token (bid_t*ROWS_PER_WG + tid_y). Clamp OOB tail waves to the last
+        # valid token instead of branching: they recompute an already-valid row
+        # and write byte-identical results (idempotent), so there is no OOB
+        # access and no divergent bounds check on the hot path.
+        tok = ArithValue(bid_t) * arith.constant(
+            ROWS_PER_WG, type=i32
+        ) + ArithValue(tid_y)
+        _nt_m1 = arith.subi(_to_raw(num_tokens), arith.constant(1, type=i32))
+        tok = ArithValue(arith.minsi(_to_raw(tok), _nt_m1))
+        bid_t = tok  # all downstream token offsets use the clamped token
+        bid_t_idx = arith.index_cast(T.index, _to_raw(tok))
 
         def _ptr_buffer_resource(ptr, num_records_bytes=None):
             addr = fx.ptrtoint(ptr)
@@ -821,7 +846,17 @@ def _build_kernel(
         num_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        idx_tokens = arith.index_cast(T.index, _to_raw(num_tokens))
+        # grid.y = ceil(num_tokens / ROWS_PER_WG): each workgroup covers
+        # ROWS_PER_WG tokens (one per wave via thread_idx.y).
+        _nt = _to_raw(num_tokens)
+        _rpw = arith.constant(ROWS_PER_WG, type=T.i32)
+        _gy_i32 = arith.divsi(
+            arith.subi(
+                arith.addi(_nt, _rpw), arith.constant(1, type=T.i32)
+            ),
+            _rpw,
+        )
+        idx_grid_y = arith.index_cast(T.index, _gy_i32)
         k = kernel(
             q_in,
             kv_in,
@@ -841,10 +876,11 @@ def _build_kernel(
             swa_slot_stride,
             swa_pos_stride,
             swa_cache_size,
+            num_tokens,
         )
         k.launch(
-            grid=(H + 1, idx_tokens, 1),
-            block=(BLOCK_THREADS, 1, 1),
+            grid=(H + 1, idx_grid_y, 1),
+            block=(BLOCK_THREADS, ROWS_PER_WG, 1),
             stream=stream,
         )
 
