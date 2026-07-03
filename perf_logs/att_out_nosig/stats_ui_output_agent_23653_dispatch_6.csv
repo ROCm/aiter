@@ -1,0 +1,8 @@
+"CodeObj","Vaddr","Instruction","Hitcount","Latency","Stall","Idle","Source"
+3,7424,"; fmha_fwd_kernel_0",0,0,0,0,""
+3,7424,"s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2",14,6705,0,308,""
+3,7432,"s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 0x1001",7,7,0,56,""
+3,7440,"s_clause 0x1",7,63,56,0,""
+3,7444,"s_load_b64 s[24:25], s[0:1], 0x0 nv",7,7,0,0,""
+3,7452,"s_load_b64 s[2:3], s[0:1], 0xa0 nv",7,7,0,0,""
+3,7460,"s_wait_kmcnt 0x0",7,203,196,0,""

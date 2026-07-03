@@ -1,0 +1,2 @@
+Checking rocprof trace decoder:
+lrwxrwxrwx 1 root root 52 Mar  8 21:30 /opt/rocm/lib/librocprof-trace-decoder.so -> ../../_rocm_sdk_core/lib/librocprof-trace-decoder.so

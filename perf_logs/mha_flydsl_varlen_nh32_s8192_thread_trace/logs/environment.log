@@ -1,0 +1,21 @@
+date: 2026-07-02T13:27:04+00:00
+host: heliosr-2b805-b8-2
+container: hyg_fyd1
+pwd: /data/yanguahe/code/wk_sp1/aiter
+host_git_branch: hyg_dev
+host_git_commit: 2c8db163d1b7bbc55d7e90633b79459116fc7bb1
+HIP_VISIBLE_DEVICES: unset
+python: /opt/venv/bin/python
+Python 3.12.3
+rocprofv3: /opt/venv/bin/rocprofv3
+             version: 1.1.0
+        git_revision: 0208c97b3b17261e2fb38d76d535f658da0012f1
+        library_arch: x86_64-unknown-linux-gnu
+         system_name: Linux
+    system_processor: x86_64
+      system_version: 6.8.0-88-generic
+         compiler_id: Clang
+    compiler_version: 22.0.0
+        rocm_version: 
+
+test command: python op_tests/test_mha_flydsl_varlen.py --causal true --return_lse true -b 1 -nh 32 -sq 8192 -sk 8192 --random-value false --warmup 5 --repeat 20

@@ -1,0 +1,15 @@
+jobs:
+ -
+  kernel_include_regex: '^fmha_fwd_kernel_0$'
+  kernel_exclude_regex:
+  kernel_iteration_range: "[1]"
+  output_file: out
+  output_directory: perf_logs/mha_flydsl_varlen_nh32_s8192_thread_trace/thread_trace/rpf_v3
+  output_format: [csv]
+  truncate_kernels: false
+  sys_trace: false
+  advanced_thread_trace: true
+  att_target_cu: 1
+  att_shader_engine_mask: "0xf"
+  att_simd_select: "0xf"
+  att_buffer_size: "0x10000000"
