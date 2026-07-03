@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Cold-JIT build-wall benchmark: CK module_rmsnorm vs opus module_rmsnorm_opus
-# (aiter issue #4055). Deletes each module's cached .so + build dir and times the
-# first call that triggers a rebuild.
+# Cold-JIT build-wall benchmark for the opus rmsnorm module (aiter issue #4055).
+# Deletes the cached .so + build dir and times the first call that triggers a
+# rebuild. opus is a single torch-free ctypes TU (~1s cold) that replaced the
+# legacy CK module_rmsnorm (~1360 TUs / 4972 instantiations, ~225s cold).
 #
-#   python op_tests/bench_rmsnorm_compile.py            # both
-#   python op_tests/bench_rmsnorm_compile.py --only opus
+#   python op_tests/bench_rmsnorm_compile.py
 
-import argparse
 import os
 import shutil
 import time
@@ -42,30 +41,11 @@ def bench(md_name, trigger):
     return dt
 
 
-def trigger_ck(x, w):
-    os.environ["AITER_RMSNORM_BACKEND"] = "ck"
-    import aiter
-
-    aiter.rms_norm(x, w, 1e-6)  # -> module_rmsnorm (CK, ~1360 TUs)
-
-
 def trigger_opus(x, w):
-    os.environ["AITER_RMSNORM_BACKEND"] = "opus"
     import aiter
 
     aiter.rms_norm(x, w, 1e-6)  # -> module_rmsnorm_opus (1 torch-free TU)
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--only", choices=["ck", "opus"], default=None)
-    args = ap.parse_args()
-
-    results = {}
-    if args.only in (None, "opus"):
-        results["opus"] = bench("module_rmsnorm_opus", trigger_opus)
-    if args.only in (None, "ck"):
-        results["ck"] = bench("module_rmsnorm", trigger_ck)
-
-    if "ck" in results and "opus" in results and results["opus"]:
-        print(f"\nspeedup: {results['ck'] / results['opus']:.0f}x faster cold build")
+    bench("module_rmsnorm_opus", trigger_opus)
