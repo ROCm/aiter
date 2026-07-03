@@ -208,7 +208,9 @@ def _store_bf16_vec(vals_list, out_rsrc, row_base_bytes, idx, vec):
         )
 
 
-def _store_fp8_packed(vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False):
+def _store_fp8_packed(
+    vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
+):
     """Pack VEC fp32 -> VEC fp8 via cvt_pk_fp8_f32 and store.
 
     Generalized for VEC in {8, 16}: packs into VEC//4 dwords, stores as a
@@ -476,9 +478,9 @@ def _build_kernel(
         # valid token instead of branching: they recompute an already-valid row
         # and write byte-identical results (idempotent), so there is no OOB
         # access and no divergent bounds check on the hot path.
-        tok = ArithValue(bid_t) * arith.constant(
-            ROWS_PER_WG, type=i32
-        ) + ArithValue(tid_y)
+        tok = ArithValue(bid_t) * arith.constant(ROWS_PER_WG, type=i32) + ArithValue(
+            tid_y
+        )
         _nt_m1 = arith.subi(_to_raw(num_tokens), arith.constant(1, type=i32))
         tok = ArithValue(arith.minsi(_to_raw(tok), _nt_m1))
         bid_t = tok  # all downstream token offsets use the clamped token
@@ -633,9 +635,7 @@ def _build_kernel(
                     s = sin_f32[k]
                     rope_elems.append(_to_raw(e * c - o * s))
                     rope_elems.append(_to_raw(e * s + o * c))
-                rotated_vec = vector.from_elements(
-                    T.vec(VEC, f32), rope_elems
-                )
+                rotated_vec = vector.from_elements(T.vec(VEC, f32), rope_elems)
                 fx.memref_store_vec(rotated_vec, out_rmem)
 
             # ---- Unified store: all threads read from rmem and write ----
@@ -644,8 +644,9 @@ def _build_kernel(
 
             if const_expr(quant):
                 rsrc, row_base = fp8_out_rsrc
-                _store_fp8_packed(final_list, rsrc, row_base, tid, VEC,
-                                  skip_fnuz_clamp=True)
+                _store_fp8_packed(
+                    final_list, rsrc, row_base, tid, VEC, skip_fnuz_clamp=True
+                )
             else:
                 _store_bf16_vec(
                     final_list, bf16_out_rsrc, bf16_out_row_base_bytes, tid, VEC
@@ -867,9 +868,7 @@ def _build_kernel(
         _nt = _to_raw(num_tokens)
         _rpw = arith.constant(ROWS_PER_WG, type=T.i32)
         _gy_i32 = arith.divsi(
-            arith.subi(
-                arith.addi(_nt, _rpw), arith.constant(1, type=T.i32)
-            ),
+            arith.subi(arith.addi(_nt, _rpw), arith.constant(1, type=T.i32)),
             _rpw,
         )
         idx_grid_y = arith.index_cast(T.index, _gy_i32)
