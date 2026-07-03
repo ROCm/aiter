@@ -56,8 +56,7 @@ def compute_prefill_schedule(
     parallel_unit_num,
     max_seq_len,
 ):
-    """Compute the persistent-grid schedule for ragged-prefill MQA logits.
-    """
+    """Compute the persistent-grid schedule for ragged-prefill MQA logits."""
     device = local_ends.device
     P = parallel_unit_num
     T = local_ends.shape[0]  # fixed total_tokens (rows)
@@ -161,7 +160,9 @@ def _prefill_cta_info_kernel(
     hi = tl.full([BLOCK_P], T, tl.int32)
     for _ in tl.static_range(32):
         mid = (lo + hi) // 2
-        incl_mid = tl.load(incl_ptr + tl.minimum(mid, T - 1), mask=(mid < T), other=2147483647)
+        incl_mid = tl.load(
+            incl_ptr + tl.minimum(mid, T - 1), mask=(mid < T), other=2147483647
+        )
         go_right = incl_mid <= slot
         lo = tl.where(go_right, mid + 1, lo)
         hi = tl.where(go_right, hi, mid)
@@ -202,8 +203,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
     heads=DEFAULT_HEADS,
     head_dim=DEFAULT_HEAD_DIM,
 ):
-    """Build the ragged-prefill FP4 MQA logits kernel.
-    """
+    """Build the ragged-prefill FP4 MQA logits kernel."""
     block_threads_k = num_warps * WARP_SIZE
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128  # outer K-loop iters (MFMA K=128)
@@ -238,6 +238,21 @@ def build_pa_mqa_logits_fp4_prefill_module(
     # KV_scale: [block_id, K_TILES, K_chunks=4, kv_block_size]
     _stride_kvs_ktile = 4 * kv_block_size
     _stride_kvs_block = k_tiles * _stride_kvs_ktile
+
+    # All per-chunk address math divides/mods by `kv_block_size` and by 4
+    # (byte->dword). Those operands are always non-negative token/byte offsets,
+    # so when the divisor is a power of two we lower `//`/`%` to shift/mask.
+    # (Signed floordiv/rem by 2^k emit a sign-correction sequence, ~3 VALU each;
+    # this kernel is VALU-issue bound, so removing them is a direct win.)
+    _kb_is_pow2 = kv_block_size & (kv_block_size - 1) == 0
+    _kb_log2 = kv_block_size.bit_length() - 1
+    _kb_mask = kv_block_size - 1
+
+    def _floordiv_kb(x):
+        return (x >> fx.Int32(_kb_log2)) if _kb_is_pow2 else (x // kv_block_size)
+
+    def _mod_kb(x):
+        return (x & fx.Int32(_kb_mask)) if _kb_is_pow2 else (x % kv_block_size)
 
     allocator = SmemAllocator(
         None, arch="gfx950", global_sym_name="mqa_fp4_prefill_smem"
@@ -328,7 +343,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
         _stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(stride_out_row))
         _row_elems_i64 = arith.muli(_row_i64, _stride_i64)
         _row_bytes_i64 = arith.muli(
-            _row_elems_i64, arith.constant(4, type=T.i64)  # sizeof(f32)
+            _row_elems_i64,
+            arith.constant(4, type=T.i64),  # sizeof(f32)
         )
         out_rsrc = buffer_ops.create_buffer_resource(
             out_logits_ptr, max_size=True, base_byte_offset=_row_bytes_i64
@@ -389,13 +405,22 @@ def build_pa_mqa_logits_fp4_prefill_module(
             T.bf16, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
         )
         w_reg_lay = fx.make_layout(4, 1)
+        # Fold the scalar `weight_scale` into the hoisted per-head weights ONCE
+        # per wave. The final logit is `weight_scale * sum_e(relu*w)`, and the
+        # bperm cross-lane reduction is purely additive, so
+        # `weight_scale * sum(relu*w) == sum(relu*(w*weight_scale))`. Pre-scaling
+        # `w` here (m_tiles vector muls/wave) removes the per-nt scalar
+        # `* weight_scale` in `_post_process_nt` (4*chunk_count muls/wave). This
+        # kernel is VALU-issue bound, so the net drop is a direct runtime lever.
+        ws_vec = fx.Vector.from_elements([weight_scale] * 4, dtype=fx.Float32)
         w_per_lane = []
         for mi_idx in range_constexpr(m_tiles):
             tile = fx.slice(w_tiled_mi, (None, fx.Int32(mi_idx)))
             tile_div = fx.logical_divide(tile, fx.make_layout(4, 1))
             r = fx.memref_alloca(w_reg_ty, w_reg_lay)
             fx.copy_atom_call(w_atom, fx.slice(tile_div, (None, lane_div_16)), r)
-            w_per_lane.append(fx.memref_load_vec(r).to(fx.Float32))
+            w_f32 = fx.Vector(fx.memref_load_vec(r).to(fx.Float32))
+            w_per_lane.append(w_f32 * ws_vec)
 
         # ── prologue + N-1 prefetch loop + epilogue ──
 
@@ -406,7 +431,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 + ni_base * fx.Int32(MFMA_N)
                 + lane_mod_16
             )
-            bi_base = token_local_base // kv_block_size
+            bi_base = _floordiv_kb(token_local_base)
             phys_vec = buffer_ops.buffer_load(
                 bt_rsrc, batch_id * _stride_bt + bi_base, vec_width=N_PHYS, dtype=T.i32
             )
@@ -428,7 +453,10 @@ def build_pa_mqa_logits_fp4_prefill_module(
                     + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
                 )
                 kvs_packed = buffer_ops.buffer_load(
-                    kvs_rsrc, kvs_packed_off_bytes // 4, vec_width=1, dtype=T.i32
+                    kvs_rsrc,
+                    kvs_packed_off_bytes >> fx.Int32(2),
+                    vec_width=1,
+                    dtype=T.i32,
                 )
                 kvs_packed_list.append(kvs_packed)
 
@@ -439,7 +467,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
                     + ni_c * fx.Int32(MFMA_N)
                     + lane_mod_16
                 )
-                token_in_block_c = token_local_c % kv_block_size
+                token_in_block_c = _mod_kb(token_local_c)
                 phys_block_c = phys_list[nt]
                 for k_tile in range_constexpr(k_tiles):
                     kv_off_bytes_c = (
@@ -449,22 +477,22 @@ def build_pa_mqa_logits_fp4_prefill_module(
                         + token_in_block_c * _kv_chunk_bytes
                     )
                     kv_c = buffer_ops.buffer_load(
-                        kv_rsrc, kv_off_bytes_c // 4, vec_width=4, dtype=T.i32
+                        kv_rsrc,
+                        kv_off_bytes_c >> fx.Int32(2),
+                        vec_width=4,
+                        dtype=T.i32,
                     )
                     kv_list.append(kv_c)
 
             return kv_list, kvs_packed_list
 
-        def _extract_kvs_scales(kvs_packed_list_in):
-            scales = [[None] * k_tiles for _ in range(N_TILES_PER_WARP)]
-            for k_tile in range_constexpr(k_tiles):
-                packed = kvs_packed_list_in[k_tile]
-                for nt in range_constexpr(N_TILES_PER_WARP):
-                    shifted = arith.ArithValue(packed) >> fx.Int32(8 * nt)
-                    scales[nt][k_tile] = shifted & fx.Int32(0xFF)
-            return scales
-
-        def _issue_nt_mfmas(kv_list_in, kvs_scales_per_nt, nt):
+        def _issue_nt_mfmas(kv_list_in, kvs_packed_per_kt, nt):
+            # `kvs_packed_per_kt[k_tile]` is the RAW packed i32 holding the 4
+            # per-nt E8M0 kv-scale bytes (byte `nt` == this nt's scale). Rather
+            # than software-extract with `(packed >> 8*nt) & 0xFF` (2 VALU per
+            # nt per chunk), pass the packed dword straight as `scaleB` and let
+            # the MFMA `opselB` operand byte-select byte `nt` in hardware. This
+            # deletes the whole `_extract_kvs_scales` per-chunk VALU.
             zero = fx.Vector.filled(4, 0.0, fx.Float32)
             accs = [zero] * m_tiles
             for k_tile in range_constexpr(k_tiles):
@@ -472,7 +500,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 kv_i64_0 = _pack_i32_pair_to_i64(kv_4xi32[0], kv_4xi32[1])
                 kv_i64_1 = _pack_i32_pair_to_i64(kv_4xi32[2], kv_4xi32[3])
                 kv_b = _pack_lo_i64x2_to_i32x8(kv_i64_0, kv_i64_1)
-                kv_scale_val = kvs_scales_per_nt[k_tile]
+                kv_scale_packed = kvs_packed_per_kt[k_tile]
                 for mi_idx in range_constexpr(m_tiles):
                     accs[mi_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         T.f32x4,
@@ -484,8 +512,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
                             4,
                             0,
                             q_scale_ops[k_tile][mi_idx],
-                            0,
-                            kv_scale_val,
+                            nt,  # opselB: hardware byte-select byte `nt` of scaleB
+                            kv_scale_packed,
                         ],
                     )
             return accs
@@ -500,10 +528,17 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
             thread_sum = ZERO_F
             for mi_idx in range_constexpr(m_tiles):
+                # relu(acc) then weighted accumulate. Fuse the per-head
+                # `mul + add` into a single `fma` (drops the separate v_mul,
+                # ~4 VALU/head): thread_sum += relu_v[e] * w[e]. Accumulation
+                # order is unchanged; fma's single rounding is if anything more
+                # accurate than the mul-then-add it replaces. This kernel is
+                # VALU-issue bound (VALUBusy ~98%), so cutting VALU count here
+                # is the direct lever on runtime.
                 relu_v = fx.Vector(accs[mi_idx]).maximumf(zero)
-                prod_v = relu_v * fx.Vector(w_per_lane[mi_idx])
+                w_v = fx.Vector(w_per_lane[mi_idx])
                 for elem in [0, 1, 2, 3]:
-                    thread_sum = thread_sum + prod_v[elem]
+                    thread_sum = fx.fma(relu_v[elem], w_v[elem], thread_sum)
 
             lane_i32 = fx.Int32(lane_id)
 
@@ -517,7 +552,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
             thread_sum = _bperm_xor_add(thread_sum, 16)
             thread_sum = _bperm_xor_add(thread_sum, 32)
-            thread_sum = arith.ArithValue(thread_sum) * weight_scale
+            # `weight_scale` already folded into `w_per_lane` (hoisted, once/wave).
 
             # Only [local_start, local_end) is written (one writer lane per
             # token); the rest stays at the caller's -inf pre-fill.
@@ -538,21 +573,19 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 "pipelined-nt structure currently hardcoded for NTPW=4"
             )
 
-            kvs_scales = _extract_kvs_scales(kvs_packed_list_in)
-
             accs_nt0 = (
-                _issue_nt_mfmas(kv_list_in, kvs_scales[0], 0)
+                _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 0)
                 if nt0_accs_in is None
                 else list(nt0_accs_in)
             )
 
-            accs_nt1 = _issue_nt_mfmas(kv_list_in, kvs_scales[1], 1)
+            accs_nt1 = _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 1)
             _post_process_nt(accs_nt0, 0, c_i32_arg)
 
-            accs_nt2 = _issue_nt_mfmas(kv_list_in, kvs_scales[2], 2)
+            accs_nt2 = _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 2)
             _post_process_nt(accs_nt1, 1, c_i32_arg)
 
-            accs_nt3 = _issue_nt_mfmas(kv_list_in, kvs_scales[3], 3)
+            accs_nt3 = _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 3)
             _post_process_nt(accs_nt2, 2, c_i32_arg)
 
             _post_process_nt(accs_nt3, 3, c_i32_arg)
@@ -565,9 +598,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
         kv_pre, kvs_pre = _prefetch_chunk(c0_i32, phys_pre)
         phys_next_pre = _load_phys(fx.Int32(1))
 
-        nt0_accs_init = _issue_nt_mfmas(
-            list(kv_pre), _extract_kvs_scales(list(kvs_pre))[0], 0
-        )
+        nt0_accs_init = _issue_nt_mfmas(list(kv_pre), list(kvs_pre), 0)
         nt0_init_scalars = []
         for v in nt0_accs_init:
             vv = fx.Vector(v)
@@ -605,9 +636,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
             phys_next_next_list = _load_phys(c_next_next_i32)
 
-            nt0_accs_next = _issue_nt_mfmas(
-                list(kv_next), _extract_kvs_scales(list(kvs_next))[0], 0
-            )
+            nt0_accs_next = _issue_nt_mfmas(list(kv_next), list(kvs_next), 0)
             nt0_next_scalars = []
             for v in nt0_accs_next:
                 vv = fx.Vector(v)
@@ -654,6 +683,7 @@ def compile_pa_mqa_logits_fp4_prefill(
     num_warps: int = DEFAULT_NUM_WARPS,
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
+    waves_per_eu: int = 2,
 ):
     """Build (and cache) the @flyc.jit launcher, keyed by layout config.
 
@@ -698,6 +728,16 @@ def compile_pa_mqa_logits_fp4_prefill(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
         )
 
+    # Cap occupancy via --amdgpu-waves-per-eu (part of the JIT cache key). The
+    # prefill kernel is L2-bandwidth / VALU-issue bound (94% L2 hit, HBM idle),
+    # so fewer resident waves per EU can reduce VALU/L2 contention.
+    if waves_per_eu:
+        # min,max form so the value acts as an occupancy *cap* (a single value is
+        # treated as a lower bound and won't reduce occupancy).
+        launch_pa_mqa_logits_fp4_prefill.compile_hints = {
+            "waves_per_eu": f"{waves_per_eu},{waves_per_eu}"
+        }
+
     return launch_pa_mqa_logits_fp4_prefill, block_threads
 
 
@@ -718,13 +758,13 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
     parallel_unit_num: int = 512,
+    waves_per_eu: int = 2,
     out: Optional[torch.Tensor] = None,
     cta_info: Optional[torch.Tensor] = None,
     n_ctas: Optional[int] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
-    """Ragged-prefill FP4 paged MQA logits (gfx950).
-    """
+    """Ragged-prefill FP4 paged MQA logits (gfx950)."""
     total_tokens, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]
@@ -759,6 +799,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         num_warps=num_warps,
         heads=heads,
         head_dim=head_dim,
+        waves_per_eu=waves_per_eu,
     )
 
     if stream is None:
