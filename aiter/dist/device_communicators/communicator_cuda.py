@@ -14,46 +14,6 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
 
-_FUSED_AR_RMS_QUANT_ALIASES = {
-    "fp8": "per_token",
-    "fp8_per_token": "per_token",
-    "per-token": "per_token",
-    "per_token": "per_token",
-    "per_token_fp8": "per_token",
-    "fp8_per_group": "per_group",
-    "per-group": "per_group",
-    "per_group": "per_group",
-    "per_group_fp8": "per_group",
-    "per_1x128": "per_group",
-    "fp4": "mxfp4",
-    "fp4_e2m1": "mxfp4",
-    "mx_fp4": "mxfp4",
-    "mxfp4": "mxfp4",
-    "per_1x32": "mxfp4",
-}
-
-
-def _normalize_fused_ar_rms_quant_type(quant_type):
-    if isinstance(quant_type, str):
-        normalized = _FUSED_AR_RMS_QUANT_ALIASES.get(quant_type.lower())
-        if normalized is not None:
-            return normalized
-    else:
-        if quant_type == QuantType.per_Token:
-            return "per_token"
-        if quant_type in (QuantType.per_1x128, getattr(QuantType, "per_128x128", None)):
-            return "per_group"
-        if quant_type == QuantType.per_1x32:
-            return "mxfp4"
-        try:
-            return _normalize_fused_ar_rms_quant_type(QuantType(quant_type))
-        except Exception:
-            pass
-    raise ValueError(
-        "unsupported fused AR+RMSNorm quant_type="
-        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
-    )
-
 
 class CudaCommunicator(DeviceCommunicatorBase):
     # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
@@ -61,6 +21,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         os.environ.get("AITER_AR_1STAGE", "")
     )
     _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", -1))
+    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", -1))
+    _ar_quant_no_prefill_max_bytes = int(
+        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", -1)
+    )
 
     def __init__(
         self,
@@ -387,8 +351,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         group_size=128,
         emit_bf16: bool = False,
         transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
-        quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
+        # quant_type arrives already canonicalized to a string ("per_token"/
+        # "per_group"/"mxfp4") from the public API.
+        if gemma_norm and quant_type != "per_token":
+            raise NotImplementedError(
+                "gemma_norm fused quant currently supports per-token FP8 only"
+            )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
                 input_,
@@ -414,16 +384,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
         hidden_dim = int(input_.shape[-1])
         element_size = input_.element_size()
         total_bytes = input_.numel() * element_size
+        fused_quant_bytes_limit = (
+            self._ar_quant_max_bytes if self._ar_quant_max_bytes >= 0 else 4096 * 1024
+        )
+        no_prefill_quant_bytes_limit = (
+            self._ar_quant_no_prefill_max_bytes
+            if self._ar_quant_no_prefill_max_bytes >= 0
+            else 64 * 1024 * 1024
+        )
         if (
             (
                 hidden_dim in [512, 1024, 2048, 4096]
                 or (
-                    hidden_dim == 7168
+                    hidden_dim in [7168, 6144]
                     and input_.dtype in (torch.float16, torch.bfloat16)
                 )
             )
-            and total_bytes <= 4096 * 1024
-            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+            and total_bytes <= fused_quant_bytes_limit
+            and (prefill_support or total_bytes <= no_prefill_quant_bytes_limit)
         ):
             total_bytes_limit = (
                 self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
@@ -434,11 +412,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 else (total_bytes <= total_bytes_limit)
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
-                input_, res_inp_, weight_, eps, use_1stage
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                use_1stage,
+                gemma_norm=gemma_norm,
             )
         else:
             out_, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                prefill_support,
+                gemma_norm=gemma_norm,
             )
             hip_quant = get_hip_quant(QuantType.per_Token)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)
