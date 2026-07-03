@@ -265,6 +265,143 @@ __global__ void topk_softplus_kernel_opt(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-wave-per-token register kernel.
+//
+// This is the opposite trade-off from opt_n/prefill_n: one token gets multiple
+// waves. It is useful on wave32 targets when one wave leaves too many experts
+// per lane (E=384 -> EPT=12), but should stay opt-in per expert count because
+// smaller rows can regress from the extra cross-wave synchronization.
+// ---------------------------------------------------------------------------
+
+template <typename DTYPE_I, typename DTYPE_B, int NUM_EXPERTS, int WAVES_PER_TOKEN,
+          bool need_renorm, int SCORE_FUNC = SCORE_SQRTSOFTPLUS>
+__global__ void topk_softplus_kernel_opt_multiwave(
+    const DTYPE_I* __restrict__ gating_output,
+    const DTYPE_B* __restrict__ correction_bias,
+    float* __restrict__ topk_weights,
+    int* __restrict__ topk_ids,
+    const size_t stride_tk,
+    const int topk,
+    const int num_tokens,
+    const float routed_scaling_factor)
+{
+    static_assert(WAVES_PER_TOKEN > 1);
+    // This kernel is wave32-only (dispatched under get_warp_size_func()==32).
+    // Use a fixed 32-lane wave so the compile-time EPT/static_assert match the
+    // device value: the WARP_SIZE constant folds to 64 in the host/consteval
+    // pass, which would wrongly reject valid wave32 configs (e.g. WPT=8).
+    static constexpr int LANES = 32;
+    static constexpr int EPT   = NUM_EXPERTS / (WAVES_PER_TOKEN * LANES);
+    static_assert(NUM_EXPERTS % (WAVES_PER_TOKEN * LANES) == 0);
+
+    // Each wave first extracts its own local top-k entirely in registers/shfl
+    // (no barrier). One barrier then publishes the per-wave sorted lists, which
+    // are merged into the global top-k. This collapses the previous per-k
+    // cross-wave barrier (topk barriers) down to two.
+    // A wave holds NUM_EXPERTS/WAVES_PER_TOKEN experts, so it can contribute at
+    // most that many entries to the merge (topk is always <= this in practice).
+    static constexpr int MAX_LOCAL_TOPK = NUM_EXPERTS / WAVES_PER_TOKEN;
+    __shared__ float sm_val[WAVES_PER_TOKEN][MAX_LOCAL_TOPK];
+    __shared__ float sm_weight[WAVES_PER_TOKEN][MAX_LOCAL_TOPK];
+    __shared__ int   sm_idx[WAVES_PER_TOKEN][MAX_LOCAL_TOPK];
+    __shared__ float out_weight[MAX_LOCAL_TOPK];
+    __shared__ int   out_idx[MAX_LOCAL_TOPK];
+    __shared__ float out_scale;
+
+    const int token_idx = blockIdx.x;
+    const int wave_id   = static_cast<int>(threadIdx.x) / LANES;
+    const int lane_id   = static_cast<int>(threadIdx.x) & (LANES - 1);
+    auto const* input_ptr = gating_output + token_idx * NUM_EXPERTS;
+
+    float vals[EPT];
+    float orig[EPT];
+    int idxs[EPT];
+
+#pragma unroll
+    for(int i = 0; i < EPT; i++)
+    {
+        int e = lane_id + wave_id * LANES + i * WAVES_PER_TOKEN * LANES;
+        float score = compute_score<SCORE_FUNC>(static_cast<float>(input_ptr[e]));
+        orig[i]     = score;
+        vals[i]     = score;
+        idxs[i]     = e;
+        if(correction_bias != nullptr)
+            vals[i] += static_cast<float>(correction_bias[e]);
+    }
+
+    sort_network_desc<EPT>(vals, orig, idxs);
+
+    // Phase 1: per-wave local top-k via serial within-wave argmax (no barrier).
+    // A wave can contribute at most topk experts to the global top-k, so topk
+    // local entries per wave are sufficient.
+    int cursor = 0;
+    for(int k = 0; k < topk; ++k)
+    {
+        float my_val = (cursor < EPT) ? vals[cursor] : -INFINITY;
+        int   my_idx = (cursor < EPT) ? idxs[cursor] : 0;
+
+        warpReduceMax_softplus(my_val, my_idx);
+
+        bool  i_won   = (cursor < EPT && idxs[cursor] == my_idx);
+        float my_orig = i_won ? orig[cursor] : 0.0f;
+        if(i_won) cursor++;
+
+        int   win_lane = my_idx & (LANES - 1);
+        float weight   = __builtin_bit_cast(
+            float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, my_orig), win_lane));
+
+        if(lane_id == 0)
+        {
+            sm_val[wave_id][k]    = my_val;
+            sm_weight[wave_id][k] = weight;
+            sm_idx[wave_id][k]    = my_idx;
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: thread 0 merges the per-wave sorted lists into the global top-k
+    // (2-pointer / k-way merge) and folds in the renorm sum + scale.
+    if(threadIdx.x == 0)
+    {
+        int ptr[WAVES_PER_TOKEN];
+#pragma unroll
+        for(int w = 0; w < WAVES_PER_TOKEN; ++w)
+            ptr[w] = 0;
+
+        float sum = 0.0f;
+        for(int k = 0; k < topk; ++k)
+        {
+            int   bw = 0;
+            float bv = sm_val[0][ptr[0]];
+#pragma unroll
+            for(int w = 1; w < WAVES_PER_TOKEN; ++w)
+            {
+                float v = sm_val[w][ptr[w]];
+                if(v > bv) { bv = v; bw = w; }
+            }
+            out_weight[k] = sm_weight[bw][ptr[bw]];
+            out_idx[k]    = sm_idx[bw][ptr[bw]];
+            ptr[bw]++;
+            if constexpr(need_renorm) sum += out_weight[k];
+        }
+
+        if constexpr(need_renorm)
+            out_scale = routed_scaling_factor / fmaxf(sum, 1e-20f);
+        else
+            out_scale = routed_scaling_factor;
+    }
+    __syncthreads();
+
+    // Phase 3: coalesced scaled write.
+    if(static_cast<int>(threadIdx.x) < topk)
+    {
+        const int t = static_cast<int>(threadIdx.x);
+        topk_weights[token_idx * stride_tk + t] = out_weight[t] * out_scale;
+        topk_ids[token_idx * stride_tk + t]     = out_idx[t];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sub-warp argmax: reduce (val, orig, idx) within THREADS_PER_ROW lanes.
 //
 // Uses shfl_xor with offset < THREADS_PER_ROW, which stays within the group:
@@ -889,6 +1026,16 @@ __global__ void topk_softplus_kernel_smem_n(
         reinterpret_cast<int*>(topk_indices.data_ptr()),                                         \
         stride_tk, topk, num_tokens, routed_scaling_factor);
 
+#define LAUNCH_TOPK_KERNEL_OPT_MULTIWAVE(NE, WPT, RENORM, SF)                                   \
+    hipLaunchKernelGGL(                                                                          \
+        (aiter::topk_softplus_kernel_opt_multiwave<scalar_t, bias_scalar_t, NE, WPT, RENORM, SF>), \
+        dim3(grid), dim3((WPT) * block.x), 0, stream,                                            \
+        reinterpret_cast<const scalar_t*>(gating_output.data_ptr()),                              \
+        has_bias ? reinterpret_cast<const bias_scalar_t*>(correction_bias.data_ptr()) : nullptr,  \
+        reinterpret_cast<float*>(topk_weights.data_ptr()),                                       \
+        reinterpret_cast<int*>(topk_indices.data_ptr()),                                         \
+        stride_tk, topk, num_tokens, routed_scaling_factor);
+
 // opt_n: register-only prefill kernel with TOKENS_PER_WARP=TPW.
 #define LAUNCH_TOPK_KERNEL_OPT_N(NE, RENORM, SF, TPW)                                           \
     hipLaunchKernelGGL(                                                                          \
@@ -1006,6 +1153,28 @@ void topk_softplus(aiter_tensor_t& topk_weights,
                 _DISPATCH_OPT_N_KERNEL(128, 4)
             }
 #undef _DISPATCH_OPT_N_KERNEL
+
+            // Multi-wave-per-token decode path for wave32. E=384/WPT=2 removes
+            // the EPT=12 bottleneck. E=256/WPT=8 (EPT=1) is a low-token decode
+            // win for topk=6: spreading one token across 8 waves fills the CUs
+            // when there aren't enough tokens to do so. Above num_tokens=256 the
+            // GPU is already saturated and the prefill_n multi-token path wins
+            // (measured on gfx1250: WPT=8 4.2-4.7us @ T<=256 vs 6.9/14.9us @
+            // T=1024/4096, while prefill_n is ~6.3/7.7us there).
+#define _DISPATCH_WAVE32_MULTIWAVE_KERNEL(NE, WPT)                                  \
+    if(num_experts == NE && get_warp_size_func() == 32) {                            \
+        if(need_renorm) { LAUNCH_TOPK_KERNEL_OPT_MULTIWAVE(NE, WPT, true,  SF) }     \
+        else            { LAUNCH_TOPK_KERNEL_OPT_MULTIWAVE(NE, WPT, false, SF) }     \
+        return;                                                                      \
+    }
+            // EXPERIMENT: E=384 unconditional WPT=4 (no gate — the reg fallback
+            // for E=384 has EPT=12 and is catastrophic at high T).
+            _DISPATCH_WAVE32_MULTIWAVE_KERNEL(384, 4)
+            if(topk == 6 && num_tokens <= 256)
+            {
+                _DISPATCH_WAVE32_MULTIWAVE_KERNEL(256, 8)
+            }
+#undef _DISPATCH_WAVE32_MULTIWAVE_KERNEL
 
             // opt1 (TOKENS_PER_WARP=1): decode path, or topk > 32, or few tokens.
 #define _DISPATCH_REG_KERNEL(NE)                                          \
