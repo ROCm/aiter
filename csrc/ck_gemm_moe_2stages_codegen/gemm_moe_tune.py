@@ -5187,7 +5187,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
         # the mp_num concurrent workers never collide on the same device.
         import multiprocessing as _mp
 
-        print(f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True)
+        print(
+            f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True
+        )
         ctx = _mp.get_context("spawn")
         mgr = ctx.Manager()
         gpu_q = mgr.Queue()
