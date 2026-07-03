@@ -243,7 +243,7 @@ def main():
     if rows and args.mode != "func":
         df = pd.DataFrame(rows)
         aiter.logger.info(
-            "mxfp8fp4gemm_mi400 %s summary (markdown):\n%s",
+            "mxfp8fp4gemm %s summary (markdown):\n%s",
             args.mode,
             df.to_markdown(index=False),
         )

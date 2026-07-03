@@ -374,7 +374,10 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     # ===---------------------------------------------------
     # Gluon Layout
     # ===---------------------------------------------------
-    NumWarps: gl.constexpr = 1
+    if IS_GFX1250:
+        NumWarps: gl.constexpr = 1
+    else:
+        NumWarps: gl.constexpr = 4
     ThreadsPerWarp: gl.constexpr = 32 if IS_GFX1250 else 64
 
     ValQMPerThread: gl.constexpr = ChunkQ // (
