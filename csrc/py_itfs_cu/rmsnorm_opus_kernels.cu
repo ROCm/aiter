@@ -6,7 +6,7 @@
 // Python-side, so the whole module is a few preprocessed lines under -D__HIPCC_RTC__.
 // dtype: 0=fp16, 1=bf16, 2=fp32.
 
-#include "rmsnorm_opus.h"
+#include "rmsnorm.h"
 
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
 
