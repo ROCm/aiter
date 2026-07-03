@@ -21,7 +21,7 @@ from aiter.ops.flydsl.kernels.fmha_bwd_kernel import build_fmha_bwd_kernel_modul
 # Env overrides let rocprof run a small, fast, counter-attributable pass:
 #   PROF_SQ=8192 PROF_ITERS=2 PROF_WARMUP=1 rocprofv3 ... -- python <this>
 B, HQ, HK, D = 1, 5, 5, 128
-SQ = SK = int(os.environ.get("PROF_SQ", 75600))
+SQ = SK = int(os.environ.get("PROF_SQ", 75648))  # canonical shape rounded to a mult of 64
 DTYPE = torch.bfloat16
 SM_SCALE = 1.0 / math.sqrt(D)
 WARMUP = int(os.environ.get("PROF_WARMUP", 5))
