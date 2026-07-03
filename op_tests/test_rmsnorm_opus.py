@@ -110,6 +110,21 @@ def run_case(dtype, m, n, do_perf):
     checkAllclose(ref_out, go, rtol=rtol, atol=atol, msg="fwd_with_add out")
     checkAllclose(ref_resid, gr, rtol=rtol, atol=atol, msg="fwd_with_add resid")
 
+    # gemma_norm: opus applies (weight + 1) and handles any hidden size (no fallback
+    # to module_rmsnorm_quant, so this must also work for n > 8192).
+    gemma_out = torch.empty_like(x)
+    gemma_resid = torch.empty_like(x)
+    aiter.rmsnorm2d_fwd_with_add(
+        gemma_out, x, res, gemma_resid, w, 1e-6, gemma_norm=True
+    )
+    ref_gemma, _ = torch_rms(x, (w + 1).to(dtype), 1e-6, residual=res)
+    checkAllclose(
+        ref_gemma, gemma_out, rtol=rtol, atol=atol, msg="fwd_with_add gemma out"
+    )
+    checkAllclose(
+        ref_resid, gemma_resid, rtol=rtol, atol=atol, msg="fwd_with_add gemma resid"
+    )
+
     if do_perf:
         print(
             f"-- {dtype} [{m:5d},{n:5d}] --  "

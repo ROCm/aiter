@@ -11,15 +11,15 @@
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
 
 // Dispatch a norm launch on the dtype code (0=fp16, 1=bf16, 2=fp32).
-#define OPUS_NORM_DISPATCH(DTYPE, O, I, W, R)                                          \
-    do                                                                                 \
-    {                                                                                  \
-        if((DTYPE) == 2)                                                               \
-            launch_norm<fp32_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, s); \
-        else if((DTYPE) == 1)                                                          \
-            launch_norm<bf16_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, s); \
-        else                                                                           \
-            launch_norm<fp16_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, s); \
+#define OPUS_NORM_DISPATCH(DTYPE, O, I, W, R)                                                        \
+    do                                                                                               \
+    {                                                                                                \
+        if((DTYPE) == 2)                                                                             \
+            launch_norm<fp32_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, gemma, s); \
+        else if((DTYPE) == 1)                                                                        \
+            launch_norm<bf16_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, gemma, s); \
+        else                                                                                         \
+            launch_norm<fp16_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, gemma, s); \
     } while(0)
 
 OPUS_EXPORT void rms_norm_opus(size_t out,
@@ -30,6 +30,7 @@ OPUS_EXPORT void rms_norm_opus(size_t out,
                                int hidden,
                                int dtype,
                                int model_sensitive,
+                               int gemma,
                                size_t stream)
 {
     using namespace aiter::rmsnorm_opus;
@@ -50,6 +51,7 @@ OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
                                          int hidden,
                                          int dtype,
                                          int model_sensitive,
+                                         int gemma,
                                          size_t stream)
 {
     using namespace aiter::rmsnorm_opus;

@@ -12,11 +12,12 @@ def _use_opus(
 ) -> bool:
     """True when the opus backend can serve this call.
 
-    Opus is the sole rmsnorm backend and covers fp16/bf16/fp32 for the plain,
-    fused-add, dynamic/smooth-quant and T5 paths (any hidden). gemma_norm is not
-    supported and falls back to the (non-CK) module_rmsnorm_quant kernels.
+    Opus covers fp16/bf16/fp32 for the plain, fused-add, dynamic/smooth-quant, T5
+    and gemma_norm paths at any hidden size. Only group_size / shuffle_scale
+    (grouped/MXFP4 quant, which live in the shared module_rmsnorm_quant kernel) and
+    non fp16/bf16/fp32 dtypes fall back.
     """
-    return not gemma_norm and input.dtype in (
+    return input.dtype in (
         torch.float16,
         torch.bfloat16,
         torch.float32,
@@ -45,6 +46,7 @@ def _rms_norm_opus_raw(
     hidden: int,
     is_bf16: int,
     model_sensitive: int,
+    gemma: int,
     stream: int,
 ) -> None: ...
 
@@ -59,6 +61,7 @@ def _fused_add_rms_norm_opus_raw(
     hidden: int,
     is_bf16: int,
     model_sensitive: int,
+    gemma: int,
     stream: int,
 ) -> None: ...
 
@@ -75,9 +78,14 @@ def _check(input: Tensor, weight: Tensor):
 
 
 def rms_norm_opus(
-    out: Tensor, input: Tensor, weight: Tensor, epsilon: float, model_sensitive: int = 0
+    out: Tensor,
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    model_sensitive: int = 0,
+    gemma_norm: bool = False,
 ) -> None:
-    """out = rmsnorm(input) * weight (bf16/fp16, fp32 accumulate)."""
+    """out = rmsnorm(input) * (weight [+ 1 if gemma_norm]) (fp32 accumulate)."""
     _check(input, weight)
     assert out.dtype == input.dtype and out.is_contiguous(), "rms_norm_opus: bad out"
     hidden = input.shape[-1]
@@ -91,6 +99,7 @@ def rms_norm_opus(
         hidden,
         _DTYPE_CODE[input.dtype],
         int(model_sensitive),
+        int(gemma_norm),
         torch.cuda.current_stream().cuda_stream,
     )
 
@@ -101,8 +110,9 @@ def fused_add_rms_norm_opus(
     weight: Tensor,
     epsilon: float,
     model_sensitive: int = 0,
+    gemma_norm: bool = False,
 ) -> None:
-    """In place: x = input + residual; residual = x; input = rmsnorm(x) * weight."""
+    """In place: x = input + residual; residual = x; input = rmsnorm(x) * (weight [+1])."""
     _check(input, weight)
     assert residual.dtype == input.dtype and residual.is_contiguous(), "bad residual"
     assert residual.numel() == input.numel(), "residual shape != input"
@@ -117,6 +127,7 @@ def fused_add_rms_norm_opus(
         hidden,
         _DTYPE_CODE[input.dtype],
         int(model_sensitive),
+        int(gemma_norm),
         torch.cuda.current_stream().cuda_stream,
     )
 
@@ -138,13 +149,14 @@ def rmsnorm2d_fwd_with_add_opus(
     weight: Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
+    gemma_norm: bool = False,
 ) -> None:
     # opus fused kernel is in-place on (io, res); stage into out/residual_out so
     # input/residual_in are left untouched.
     out.copy_(input)
     residual_out.copy_(residual_in)
     fused_add_rms_norm_opus(
-        out, residual_out, weight, epsilon, use_model_sensitive_rmsnorm
+        out, residual_out, weight, epsilon, use_model_sensitive_rmsnorm, gemma_norm
     )
 
 
@@ -319,6 +331,8 @@ def rms_norm(
     """rmsnorm (opus; fp16/bf16/fp32)."""
     if _use_opus(input, use_model_sensitive_rmsnorm):
         return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
+    # only exotic (non fp16/bf16/fp32) dtypes reach here; the shared kernel is n<=8192.
+    assert input.shape[-1] <= 8192, "rmsnorm fallback supports hidden<=8192"
     out = torch.empty_like(input, dtype=input.dtype, device=input.device)
     rmsnorm(out, input, weight, epsilon)
     return out
@@ -332,6 +346,8 @@ def rmsnorm2d_fwd(
 ) -> Tensor:
     if _use_opus(input, use_model_sensitive_rmsnorm):
         return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
+    # only exotic (non fp16/bf16/fp32) dtypes reach here; the shared kernel is n<=8192.
+    assert input.shape[-1] <= 8192, "rmsnorm fallback supports hidden<=8192"
     out = torch.empty_like(input, dtype=input.dtype, device=input.device)
     rmsnorm(out, input, weight, epsilon)
     return out
@@ -356,8 +372,11 @@ def rmsnorm2d_fwd_with_add(
             weight,
             epsilon,
             use_model_sensitive_rmsnorm,
+            gemma_norm,
         )
         return
+    # only exotic (non fp16/bf16/fp32) dtypes reach here; the shared kernel is n<=8192.
+    assert input.shape[-1] <= 8192, "add_rmsnorm fallback supports hidden<=8192"
     add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon, gemma_norm)
 
 
@@ -416,6 +435,10 @@ def rmsnorm2d_fwd_with_dynamicquant(
             out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
         )
     else:
+        # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
+        assert (
+            input.shape[-1] <= 8192
+        ), "grouped/shuffle rmsnorm dynamicquant supports hidden<=8192"
         rmsnorm_quant(out, input, yscale, weight, epsilon, group_size, shuffle_scale)
 
 
@@ -443,6 +466,10 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
             use_model_sensitive_rmsnorm,
         )
     else:
+        # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
+        assert (
+            input.shape[-1] <= 8192
+        ), "grouped/shuffle rmsnorm add_dynamicquant supports hidden<=8192"
         add_rmsnorm_quant(
             out,
             input,

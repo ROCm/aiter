@@ -121,48 +121,45 @@ inline void launch_norm(void* out,
                         int rows,
                         int hidden,
                         int model_sensitive,
+                        int gemma,
                         hipStream_t stream)
 {
     constexpr int VW   = 16 / (int)sizeof(scalar_t); // 8 for bf16/fp16, 4 for fp32
     const bool aligned = aligned16(out) && aligned16(in) && aligned16(weight) &&
                          (residual == nullptr || aligned16(residual));
+    // gemma_norm (weight+1) has no CK bit-exact reference and is not perf-critical,
+    // so it uses the generic kernel at any hidden size; the bit-exact BE path is
+    // left untouched (only taken for gemma == 0).
     if constexpr(sizeof(scalar_t) == 2)
     {
-        if(aligned && (hidden % 8 == 0) &&
+        if(gemma == 0 && aligned && (hidden % 8 == 0) &&
            launch_norm_be<scalar_t>(
                out, in, weight, residual, epsilon, rows, hidden, model_sensitive, stream))
             return;
     }
     const bool vec      = (hidden % VW == 0) && aligned;
     const launch_dims d = pick_dims(rows, vec ? hidden / VW : hidden);
+    // gemma is a compile-time template param: GEMMA==false is byte-identical to the
+    // pre-gemma kernel (no runtime cost), only gemma launches the (weight+1) variant.
+#define OPUS_LAUNCH_FWD(WIDTH, G)                                                   \
+    hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<fwd_traits<scalar_t, WIDTH>, G>),      \
+                       d.grid, d.block, 0, stream, out, in, weight, residual,       \
+                       epsilon, rows, hidden, model_sensitive)
     if(vec)
-        hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<fwd_traits<scalar_t, VW>>),
-                           d.grid,
-                           d.block,
-                           0,
-                           stream,
-                           out,
-                           in,
-                           weight,
-                           residual,
-                           epsilon,
-                           rows,
-                           hidden,
-                           model_sensitive);
+    {
+        if(gemma)
+            OPUS_LAUNCH_FWD(VW, true);
+        else
+            OPUS_LAUNCH_FWD(VW, false);
+    }
     else
-        hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<fwd_traits<scalar_t, 1>>),
-                           d.grid,
-                           d.block,
-                           0,
-                           stream,
-                           out,
-                           in,
-                           weight,
-                           residual,
-                           epsilon,
-                           rows,
-                           hidden,
-                           model_sensitive);
+    {
+        if(gemma)
+            OPUS_LAUNCH_FWD(1, true);
+        else
+            OPUS_LAUNCH_FWD(1, false);
+    }
+#undef OPUS_LAUNCH_FWD
 }
 
 template <typename in_t, typename out_t>
