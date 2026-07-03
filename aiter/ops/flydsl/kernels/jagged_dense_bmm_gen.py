@@ -259,14 +259,14 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             copy_frag_A = fx.make_fragment_like(thr_sA[None, None, None, 0])
 
             mma_frag_A = thr_mma.make_fragment_A(sA[None, None, 0])
-            # NOTE: the B register buffer is a plain 2-slot double-buffer. The
-            # "decoupled 2-ahead/3-stage B prefetch" experiment (B_STAGES>2 +
-            # mod-B_STAGES rotation) mis-accumulated the K-reduction (cos 0.5 at
-            # D=256 / ~0 at D=512, values scrambled but ||out||~=||ref||); the
-            # 2-slot lockstep pipeline below is bit-exact (cos=1.0). B_STAGES is
-            # still threaded through for the launcher cache key but the compute
-            # path uses the correct 2-slot buffer.
-            mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=2)
+            # B register buffer: B_STAGES slots, 2-ahead prefetch (decoupled from A).
+            # A is LDS 2-slot double-buffered (slot = k%2). B uses B_STAGES register
+            # slots (slot = k%B_STAGES), prefetching tile k+2 while computing tile k.
+            # When B_STAGES=2 this collapses to plain lockstep double-buffer (safe
+            # fallback). When B_STAGES=3 the extra slot lets the 2-ahead global load
+            # of B tile k+2 fully overlap the MFMA wave for tile k without aliasing
+            # the tile k+1 slot still needed in the next iteration.
+            mma_frag_B = thr_mma.make_fragment_B(gB_k, stages=B_STAGES)
             mma_frag_C = thr_mma.make_fragment_C(gC)
 
             mma_frag_A_retile = thr_copy_s2r_A.retile(mma_frag_A)
@@ -275,30 +275,34 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
             gA_k_stride = fx.get_scalar(gA_k.stride[2])
             gB_k_stride = fx.get_scalar(gB_k.stride[2])
 
-            # A (LDS) and B (registers) are both 2-slot double-buffered in
-            # lockstep: at logical K-tile i we read slot i%2 and prefetch tile
-            # i+1 into slot (i%2)^1. read_next controls both A and B prefetch.
-            def run_pipeline_stage(read_stage, next_k, read_next=True):
-                write_stage = read_stage ^ 1
-                if fx.const_expr(read_next):
-                    next_k = fx.Int32(next_k)
+            # Decoupled A/B pipeline:
+            #   A LDS slot  = k_tile % 2         (always 1-ahead: load tile k+1 while computing k)
+            #   B reg slot  = k_tile % B_STAGES  (2-ahead when B_STAGES=3: prologue loads 0,1;
+            #                                     main loop loads tile k+2 into slot (k+2)%3)
+            # a_next_k: tile index to prefetch into A copy_frag (None = drain, no A fetch)
+            # b_next_k: tile index to prefetch into next B slot (None = drain, no B fetch)
+            def run_pipeline_stage(a_read_stage, b_read_slot, a_next_k=None, b_next_k=None):
+                a_write_stage = a_read_stage ^ 1
+                if fx.const_expr(a_next_k is not None):
                     fx.copy(
                         buffer_copy_128b,
                         thr_gA_k[None, None, None, 0],
                         copy_frag_A,
-                        soffset=next_k * gA_k_stride,
+                        soffset=fx.Int32(a_next_k) * gA_k_stride,
                     )
+                if fx.const_expr(b_next_k is not None):
+                    b_fetch_slot = (b_read_slot + (2 if fx.const_expr(B_STAGES > 2) else 1)) % B_STAGES
                     fx.copy(
                         buffer_copy_128b,
                         thr_gB_k[None, None, None, 0],
-                        mma_frag_B_retile[None, None, None, write_stage],
-                        soffset=next_k * gB_k_stride,
+                        mma_frag_B_retile[None, None, None, b_fetch_slot],
+                        soffset=fx.Int32(b_next_k) * gB_k_stride,
                     )
 
                 for block_k_iter in fx.range_constexpr(BLOCK_K // 32):
                     fx.copy(
                         uni_copy_128b,
-                        thr_sA_s2r[None, None, block_k_iter, read_stage],
+                        thr_sA_s2r[None, None, block_k_iter, a_read_stage],
                         mma_frag_A_retile[None, None, block_k_iter],
                     )
                     # K=32 atom: one atom spans tile_K_perm=32, so the fragment K
@@ -306,10 +310,10 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
                     # atoms per 32-wide perm group -> hierarchical (None, iter).
                     if fx.const_expr(USE_MFMA_K32):
                         frag_A_k = mma_frag_A[None, None, block_k_iter]
-                        frag_B_k = mma_frag_B[None, None, block_k_iter, read_stage]
+                        frag_B_k = mma_frag_B[None, None, block_k_iter, b_read_slot]
                     else:
                         frag_A_k = mma_frag_A[None, None, (None, block_k_iter)]
-                        frag_B_k = mma_frag_B[None, None, (None, block_k_iter), read_stage]
+                        frag_B_k = mma_frag_B[None, None, (None, block_k_iter), b_read_slot]
                     fx.gemm(
                         tiled_mma,
                         mma_frag_C,
@@ -319,24 +323,36 @@ def _build_launcher(N, K, BLOCK_M, BLOCK_N, BLOCK_K, STAGES_A, THREADS, BM_TILES
                         traversal_order=fx.GemmTraversalOrder.KNM,
                     )
 
-                fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, write_stage])
+                fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, a_write_stage])
                 fx.gpu.barrier()
 
-            # Prologue: load K-tile 0 into the read buffer (A LDS slot 0, B reg
-            # slot 0). The loop prefetches tile i+1 into the other slot each step.
+            # Prologue: load A tile 0 into LDS slot 0 and B tile 0 into B slot 0.
+            # For B_STAGES=3: also load B tile 1 into B slot 1 (2-ahead warmup).
             n_tiles = K // BLOCK_K
             fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
             fx.copy(buffer_copy_128b, thr_gB_k[None, None, None, 0], mma_frag_B_retile[None, None, None, 0])
+            if fx.const_expr(B_STAGES > 2 and n_tiles > 1):
+                fx.copy(
+                    buffer_copy_128b,
+                    thr_gB_k[None, None, None, 0],
+                    mma_frag_B_retile[None, None, None, 1],
+                    soffset=fx.Int32(1) * gB_k_stride,
+                )
             mma_frag_C.fill(0)
             fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
             fx.gpu.barrier()
 
-            # Main K-loop (double-buffered over n_tiles = K // BLOCK_K tiles).
-            for k_iter in range(0, n_tiles - 2, 2):
-                run_pipeline_stage(read_stage=0, next_k=k_iter + 1)
-                run_pipeline_stage(read_stage=1, next_k=k_iter + 2)
-            run_pipeline_stage(read_stage=0, next_k=n_tiles - 1)
-            run_pipeline_stage(read_stage=1, next_k=None, read_next=False)
+            # Main K-loop over n_tiles steps, unrolled at Python trace time so that
+            # per-step a_next/b_next are Python-level None (not dynamic MLIR values).
+            # Per step k:
+            #   A: reads LDS slot k%2, prefetches tile k+1 (stop at last).
+            #   B: reads reg slot k%B_STAGES, prefetches tile k+B_STAGES-1 (stop at last).
+            for k_tile in fx.range_constexpr(n_tiles):
+                a_slot = k_tile % 2
+                b_slot = k_tile % B_STAGES
+                a_next = k_tile + 1 if k_tile + 1 < n_tiles else None
+                b_next = (k_tile + B_STAGES - 1) if (k_tile + B_STAGES - 1) < n_tiles else None
+                run_pipeline_stage(a_slot, b_slot, a_next_k=a_next, b_next_k=b_next)
 
             # --- Epilogue: fp32 accumulators -> bf16, broadcast bias, masked store ---
             # O4 LDS C-shuffle: the MFMA accumulator layout is M-major per lane
