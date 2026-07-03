@@ -138,7 +138,6 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
         "bias_f32": bias_f32,
     }
 
-
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
@@ -309,10 +308,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             kernel_idx,
                             splitK,
                         ),
-                        {
-                            "num_warmup": 10,
-                            "num_iters": 101,
-                        },
+                        dict(run_kwargs),
                         run_torch,
                         (
                             ref_keys,
@@ -368,10 +364,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             kernel_idx,
                             splitK,
                         ),
-                        {
-                            "num_warmup": 10,
-                            "num_iters": 101,
-                        },
+                        dict(run_kwargs),
                         run_torch,
                         (
                             ref_keys,
@@ -442,10 +435,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                             True,
                             splitK,
                         ),
-                        {
-                            "num_warmup": 10,
-                            "num_iters": 101,
-                        },
+                        dict(run_kwargs),
                         run_torch,
                         (
                             ref_keys,
@@ -487,6 +477,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         run_kwargs = {
             "num_warmup": args.warmup,
             "num_iters": args.iters,
+            "num_rotate_args": 1, # rotating buffer crashes GPU?
         }
 
         for i in range(len(untunedf)):

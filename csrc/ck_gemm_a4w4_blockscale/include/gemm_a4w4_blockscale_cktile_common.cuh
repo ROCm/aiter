@@ -85,7 +85,7 @@ void TileGemmComputeImpl(const HostArguments& args)
     using AccDataType     = TILE_FP32;
 
     constexpr bool kPadM = true;
-    constexpr bool kPadN = false;
+    constexpr bool kPadN = true;
     constexpr bool kPadK = false;
 
     constexpr bool UseStructuredSparsity = false;
