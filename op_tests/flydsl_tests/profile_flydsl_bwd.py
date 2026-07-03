@@ -8,6 +8,7 @@ Run inside docker:
   HIP_VISIBLE_DEVICES=0 python op_tests/flydsl_tests/profile_flydsl_bwd.py
 """
 
+import os
 import torch
 from aiter.ops.triton.attention.mha import flash_attn_func
 from aiter.ops.flydsl.kernels.fmha_bwd_preprocess import (
@@ -19,11 +20,14 @@ from aiter.ops.flydsl.kernels.fmha_bwd_dq_kernel import (
 )
 
 # ── shape ───────────────────────────────────────────────────────────────────
-B, HQ, HK, SQ, SK, D = 1, 5, 5, 75600, 75600, 128
+# Env overrides let rocprof run a small, fast, counter-attributable pass:
+#   PROF_SQ=8192 PROF_ITERS=2 PROF_WARMUP=1 rocprofv3 ... -- python <this>
+B, HQ, HK, D = 1, 5, 5, 128
+SQ = SK = int(os.environ.get("PROF_SQ", 75600))
 DTYPE = torch.bfloat16
 SM_SCALE = D**-0.5
-WARMUP = 5
-ITERS = 20
+WARMUP = int(os.environ.get("PROF_WARMUP", 5))
+ITERS = int(os.environ.get("PROF_ITERS", 20))
 
 # 4 of the 5 GEMMs are [S,S]@[S,D]; the full backward is ~5. Report per-kernel
 # ms plus the whole-pipeline TFLOPS on the standard 5-GEMM count for context.

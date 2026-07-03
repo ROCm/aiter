@@ -25,14 +25,15 @@ B[k=(l//16)×4..+3, n=l%16] is loaded from Q[l%16, D_step×16+(l//16)×4..+3]
 which treats the M-index as MFMA-N and the D-index as MFMA-K.
 The result C[n,m] = Σ_d K[n,d]·Q[m,d] = (K @ Q^T)[n,m] ✓
 
-LDS layout  (44 KB total; gfx950 LDS limit is 160 KB = 163840 B)
+LDS layout  (~47.5 KB total; gfx950 LDS limit is 160 KB = 163840 B)
+Row strides are padded (LDS_D=136, LDS_M=20) to avoid bank conflicts.
 ────────────────────────────────────────────────
-  k_lds  [64, 128] bf16  — 16 KB  loaded once per K-tile
-  v_lds  [64, 128] bf16  — 16 KB  loaded once per K-tile
-  q_lds  [16, 128] bf16  —  4 KB  reloaded each inner Q-block
-  do_lds [16, 128] bf16  —  4 KB  reloaded each inner Q-block
-  p_lds  [64,  16] bf16  —  2 KB  written after softmax, read by dV MFMA
-  ds_lds [64,  16] bf16  —  2 KB  written after dS pointwise, read by dK/dQ MFMA
+  k_lds  [64, 136] bf16  — 17 KB  loaded once per K-tile
+  v_lds  [64, 136] bf16  — 17 KB  loaded once per K-tile
+  q_lds  [16, 136] bf16  — 4.25KB reloaded each inner Q-block
+  do_lds [16, 136] bf16  — 4.25KB reloaded each inner Q-block
+  p_lds  [64,  20] bf16  — 2.5 KB written after softmax, read by dV MFMA
+  ds_lds [64,  20] bf16  — 2.5 KB written after dS pointwise, read by dK/dQ MFMA
 """
 
 from __future__ import annotations
@@ -74,14 +75,35 @@ D_STEPS = D // WMMA_SIZE  # 8 K-steps (K=16 GEMMs)
 D_STEPS_K32 = D // 32  # 4 K-steps (K=32 GEMMs: QK^T, dP)
 D_TILES = D // WMMA_SIZE  # 8 D-output tiles (for dV / dK / dQ)
 
-# LDS byte offsets
+# ── LDS bank-conflict padding ──────────────────────────────────────────────
+# Unpadded strides (D=128 bf16 = 64 dwords = 2×32 banks; BLOCK_M=16 = 8 dwords)
+# make every LDS row start on bank 0, so the strided MFMA fragment reads (esp.
+# _load_b_col_frag's scalar column gather) collide on the same banks — rocprof
+# showed SQ_LDS_BANK_CONFLICT (807M) exceeding SQ_VALU_MFMA_BUSY_CYCLES (503M),
+# i.e. the kernel is LDS-bank-conflict bound. Padding de-aliases the rows.
+#   LDS_D = 136: keeps 16-byte alignment for the v8bf16 (K=32) frag loads and
+#                cuts the 4-row column read from 8-way to 2-way conflicts.
+#   LDS_M =  20: spreads the 16 P/dS rows across all 32 banks (conflict-free).
+LDS_PAD_D = 8
+LDS_PAD_M = 4
+LDS_D = D + LDS_PAD_D  # 136  (K/V/Q/dO row stride, bf16)
+LDS_M = BLOCK_M + LDS_PAD_M  # 20  (P/dS row stride, bf16)
+
+# LDS byte offsets (padded strides)
 _K_LDS_OFF = 0
-_V_LDS_OFF = BLOCK_N * D * 2  # 16 384
-_Q_LDS_OFF = _V_LDS_OFF + BLOCK_N * D * 2  # 32 768
-_DO_LDS_OFF = _Q_LDS_OFF + BLOCK_M * D * 2  # 36 864
-_P_LDS_OFF = _DO_LDS_OFF + BLOCK_M * D * 2  # 40 960
-_DS_LDS_OFF = _P_LDS_OFF + BLOCK_N * BLOCK_M * 2  # 42 112
-_LDS_TOTAL = _DS_LDS_OFF + BLOCK_N * BLOCK_M * 2  # 43 264  (< 64 KB ✓)
+_V_LDS_OFF = _K_LDS_OFF + BLOCK_N * LDS_D * 2
+_Q_LDS_OFF = _V_LDS_OFF + BLOCK_N * LDS_D * 2
+_DO_LDS_OFF = _Q_LDS_OFF + BLOCK_M * LDS_D * 2
+_P_LDS_OFF = _DO_LDS_OFF + BLOCK_M * LDS_D * 2
+_DS_LDS_OFF = _P_LDS_OFF + BLOCK_N * LDS_M * 2
+# Transposed copies of Q and dO (stored [D, M]) so the dV/dK GEMMs read the B
+# operand as contiguous vec4 rows instead of _load_b_col_frag's 4 scalar strided
+# reads. Written during the Q/dO load (reusing the already-loaded value → no VGPR
+# blowup, no extra barrier). LDS_MT=20 keeps the transposed rows off bank 0.
+LDS_MT = BLOCK_M + 4  # 20  (Q^T/dO^T row stride, bf16; transposed M-dim)
+_QT_LDS_OFF = _DS_LDS_OFF + BLOCK_N * LDS_M * 2
+_DOT_LDS_OFF = _QT_LDS_OFF + D * LDS_MT * 2
+_LDS_TOTAL = _DOT_LDS_OFF + D * LDS_MT * 2  # ~58 KB (< 160 KB ✓)
 
 ELEM_BYTES = 2  # bf16
 
@@ -188,6 +210,28 @@ def _load_b_col_frag(lds, k_base_i32, n_col_i32, lane):
         val = lds.lds[idx]  # scalar bf16
         v = _llvm.insertelement(v, val, arith.unwrap(arith.constant(j, type=T.i32)))
     return _bf16_to_v4i16(v)
+
+
+def _load_b_rowT_frag(lds, d_col_base_i32, lane):
+    """Load MFMA-B[K=16, N=16] from a TRANSPOSED [D, M] LDS tile as a vec4 row.
+
+    Equivalent fragment to _load_b_col_frag on the row-major [M, D] tile, but here
+    the source is stored transposed (element (d, m) at d*lds_cols + m), so the 4
+    values B[k=M=(l//16)*4..+3, n=D=d_col_base+l%16] are CONTIGUOUS in m — one
+    vec4 load instead of 4 scalar strided reads. Returns v4i16.
+    """
+    i32 = T.i32
+    m16 = arith.remui(lane, arith.constant(WMMA_SIZE, type=i32))
+    kg = arith.divui(lane, arith.constant(WMMA_SIZE, type=i32))
+    d_row = arith.addi(d_col_base_i32, m16)  # the n=D index → row of the [D,M] tile
+    m_start = arith.muli(kg, arith.constant(A_FRAG, type=i32))  # k=M start (0/4/8/12)
+    idx = arith.index_cast(
+        T.index,
+        arith.addi(
+            arith.muli(d_row, arith.constant(lds._lds_cols, type=i32)), m_start
+        ),
+    )
+    return _bf16_to_v4i16(lds.lds.vec_load((idx,), A_FRAG))
 
 
 # Wrapper carrying (STensor, lds_cols) so helpers can query the stride
@@ -391,19 +435,23 @@ def build_fmha_bwd_kernel_module(
             _mk_lds = lambda off, sz: STensor(
                 SmemPtr(lds_base, off, T.bf16, shape=(sz,)), dtype=T.bf16, shape=(sz,)
             )
-            k_lds_s = _mk_lds(_K_LDS_OFF, BLOCK_N * D)
-            v_lds_s = _mk_lds(_V_LDS_OFF, BLOCK_N * D)
-            q_lds_s = _mk_lds(_Q_LDS_OFF, BLOCK_M * D)
-            do_lds_s = _mk_lds(_DO_LDS_OFF, BLOCK_M * D)
-            p_lds_s = _mk_lds(_P_LDS_OFF, BLOCK_N * BLOCK_M)
-            ds_lds_s = _mk_lds(_DS_LDS_OFF, BLOCK_N * BLOCK_M)
+            k_lds_s = _mk_lds(_K_LDS_OFF, BLOCK_N * LDS_D)
+            v_lds_s = _mk_lds(_V_LDS_OFF, BLOCK_N * LDS_D)
+            q_lds_s = _mk_lds(_Q_LDS_OFF, BLOCK_M * LDS_D)
+            do_lds_s = _mk_lds(_DO_LDS_OFF, BLOCK_M * LDS_D)
+            p_lds_s = _mk_lds(_P_LDS_OFF, BLOCK_N * LDS_M)
+            ds_lds_s = _mk_lds(_DS_LDS_OFF, BLOCK_N * LDS_M)
+            qt_lds_s = _mk_lds(_QT_LDS_OFF, D * LDS_MT)  # Q^T [D, M]
+            dot_lds_s = _mk_lds(_DOT_LDS_OFF, D * LDS_MT)  # dO^T [D, M]
 
-            K_LDS = _LDS(k_lds_s, D)
-            V_LDS = _LDS(v_lds_s, D)
-            Q_LDS = _LDS(q_lds_s, D)
-            DO_LDS = _LDS(do_lds_s, D)
-            P_LDS = _LDS(p_lds_s, BLOCK_M)
-            DS_LDS = _LDS(ds_lds_s, BLOCK_M)
+            K_LDS = _LDS(k_lds_s, LDS_D)
+            V_LDS = _LDS(v_lds_s, LDS_D)
+            Q_LDS = _LDS(q_lds_s, LDS_D)
+            DO_LDS = _LDS(do_lds_s, LDS_D)
+            P_LDS = _LDS(p_lds_s, LDS_M)
+            DS_LDS = _LDS(ds_lds_s, LDS_M)
+            QT_LDS = _LDS(qt_lds_s, LDS_MT)
+            DOT_LDS = _LDS(dot_lds_s, LDS_MT)
 
             # ── Load K[BLOCK_N, D] into LDS  (256 threads, 32 elems each) ─
             for ei in range_constexpr(BLOCK_N * D // BLOCK_THREADS):
@@ -414,7 +462,14 @@ def build_fmha_bwd_kernel_module(
                 boff = arith.muli(
                     arith.addi(batch_idx * sb_k + head_idx * sh_k + n_g * sn_k, col), c2
                 )
-                k_lds_s[arith.index_cast(T.index, lin)] = arith.bitcast(
+                k_lds_s[
+                    arith.index_cast(
+                        T.index,
+                        arith.addi(
+                            arith.muli(row, arith.constant(LDS_D, type=i32)), col
+                        ),
+                    )
+                ] = arith.bitcast(
                     T.bf16,
                     arith.trunci(
                         T.i16,
@@ -434,7 +489,14 @@ def build_fmha_bwd_kernel_module(
                 boff = arith.muli(
                     arith.addi(batch_idx * sb_v + head_idx * sh_v + n_g * sn_v, col), c2
                 )
-                v_lds_s[arith.index_cast(T.index, lin)] = arith.bitcast(
+                v_lds_s[
+                    arith.index_cast(
+                        T.index,
+                        arith.addi(
+                            arith.muli(row, arith.constant(LDS_D, type=i32)), col
+                        ),
+                    )
+                ] = arith.bitcast(
                     T.bf16,
                     arith.trunci(
                         T.i16,
@@ -488,7 +550,7 @@ def build_fmha_bwd_kernel_module(
                         ),
                         c2,
                     )
-                    q_lds_s[arith.index_cast(T.index, lin)] = arith.bitcast(
+                    q_val = arith.bitcast(
                         T.bf16,
                         arith.trunci(
                             T.i16,
@@ -498,6 +560,22 @@ def build_fmha_bwd_kernel_module(
                             ),
                         ),
                     )
+                    q_lds_s[
+                        arith.index_cast(
+                            T.index,
+                            arith.addi(
+                                arith.muli(row, arith.constant(LDS_D, type=i32)), col
+                            ),
+                        )
+                    ] = q_val
+                    qt_lds_s[
+                        arith.index_cast(
+                            T.index,
+                            arith.addi(
+                                arith.muli(col, arith.constant(LDS_MT, type=i32)), row
+                            ),
+                        )
+                    ] = q_val
 
                 # ── Load dO[BLOCK_M, D] into do_lds ──────────────────────
                 for ei in range_constexpr(BLOCK_M * D // BLOCK_THREADS):
@@ -511,7 +589,7 @@ def build_fmha_bwd_kernel_module(
                         ),
                         c2,
                     )
-                    do_lds_s[arith.index_cast(T.index, lin)] = arith.bitcast(
+                    do_val = arith.bitcast(
                         T.bf16,
                         arith.trunci(
                             T.i16,
@@ -521,6 +599,22 @@ def build_fmha_bwd_kernel_module(
                             ),
                         ),
                     )
+                    do_lds_s[
+                        arith.index_cast(
+                            T.index,
+                            arith.addi(
+                                arith.muli(row, arith.constant(LDS_D, type=i32)), col
+                            ),
+                        )
+                    ] = do_val
+                    dot_lds_s[
+                        arith.index_cast(
+                            T.index,
+                            arith.addi(
+                                arith.muli(col, arith.constant(LDS_MT, type=i32)), row
+                            ),
+                        )
+                    ] = do_val
 
                 gpu.barrier()
 
@@ -608,7 +702,7 @@ def build_fmha_bwd_kernel_module(
                     lds_idx = arith.index_cast(
                         T.index,
                         arith.addi(
-                            arith.muli(n_abs_lds, arith.constant(BLOCK_M, type=i32)),
+                            arith.muli(n_abs_lds, arith.constant(LDS_M, type=i32)),
                             m_col_lds,
                         ),
                     )
@@ -633,11 +727,8 @@ def build_fmha_bwd_kernel_module(
                 new_dv = list(dv_it)
                 for dt in range_constexpr(D_TILES):
                     a = _load_a_frag(P_LDS, n_warp, arith.constant(0, type=i32), lane)
-                    b = _load_b_col_frag(
-                        DO_LDS,
-                        arith.constant(0, type=i32),
-                        arith.constant(dt * WMMA_SIZE, type=i32),
-                        lane,
+                    b = _load_b_rowT_frag(
+                        DOT_LDS, arith.constant(dt * WMMA_SIZE, type=i32), lane
                     )
                     new_dv[dt] = _mfma(a, b, new_dv[dt])
 
@@ -646,11 +737,8 @@ def build_fmha_bwd_kernel_module(
                 new_dk = list(dk_it)
                 for dt in range_constexpr(D_TILES):
                     a = _load_a_frag(DS_LDS, n_warp, arith.constant(0, type=i32), lane)
-                    b = _load_b_col_frag(
-                        Q_LDS,
-                        arith.constant(0, type=i32),
-                        arith.constant(dt * WMMA_SIZE, type=i32),
-                        lane,
+                    b = _load_b_rowT_frag(
+                        QT_LDS, arith.constant(dt * WMMA_SIZE, type=i32), lane
                     )
                     new_dk[dt] = _mfma(a, b, new_dk[dt])
 
