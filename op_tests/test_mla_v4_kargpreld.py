@@ -98,7 +98,7 @@ _gfx1250_VARIANT_BY_KEY_NAME = {v.name: v for v in _gfx1250_KERNEL_VARIANTS}
 _SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1)}
 
 # Default sweep grids (mirrors test_mla_gfx1250_triton.py).
-_gfx1250_CTX_LENS = [13, 61, 128+3, 256+67, 1024, 4096, 16384]
+_gfx1250_CTX_LENS = [13, 61, 128 + 3, 256 + 67, 1024, 4096, 16384]
 _gfx1250_BATCH_SIZES = [3, 17, 32, 64]
 _gfx1250_SPLIT_PER_BATCH = [1, 2, 4, 8]
 
