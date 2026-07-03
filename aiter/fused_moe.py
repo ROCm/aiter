@@ -2097,8 +2097,16 @@ def fused_moe_2stages(
         block_m=block_size_M,
         a1_scale=a1_scale,
         w1_scale=(
+            # Only reinterpret genuinely-packed (e8m0 / 1-byte) weight scales as
+            # fp8_e8m0. PR #3811 broadened this guard from fp4-only to all fp8 to
+            # add mxfp8 (per_1x32, e8m0 scale) support, but that also caught
+            # per_Token fp8 whose scale is fp32 -- reinterpreting fp32 bytes as
+            # e8m0 makes the host stride (eGUQs = stride(0)*sizeof(float)) 4x too
+            # large -> asm _pf stage1 reads weight scales OOB -> MEMORY_VIOLATION.
             w1_scale.view(dtypes.fp8_e8m0)
             if w1.dtype in (dtypes.fp4x2, dtypes.fp8)
+            and w1_scale is not None
+            and w1_scale.element_size() == 1
             else w1_scale
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
@@ -2199,8 +2207,13 @@ def fused_moe_2stages(
         moe_out,
         topk,
         w2_scale=(
+            # See stage1 w1_scale note: only reinterpret packed (e8m0) scales;
+            # per_Token fp8 uses an fp32 scale and must be passed through as-is
+            # (PR #3811 regression fix).
             w2_scale.view(dtypes.fp8_e8m0)
             if w2.dtype in (dtypes.fp4x2, dtypes.fp8)
+            and w2_scale is not None
+            and w2_scale.element_size() == 1
             else w2_scale
         ),
         a2_scale=a2_scale,
