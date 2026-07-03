@@ -114,14 +114,7 @@ def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
 
 
 def interleave_gate_up_rows(w: torch.Tensor) -> torch.Tensor:
-    """``(E, 2*I, ...)`` GGUU ``[g0..g_{I-1}, u0..u_{I-1}]`` -> GUGU
-    ``[g0, u0, g1, u1, ...]`` (row-level gate/up interleave).
-
-    Shared between ``moe_shuffle_weight`` (which interleaves the stage1 weight
-    rows) and callers that must apply the same interleave to the stage1 ``bias``
-    so it stays aligned with the GUGU output rows the GateMode.INTERLEAVE kernel
-    produces.
-    """
+    """``(E, 2*I, ...)`` GGUU ``[g..,u..]`` -> GUGU ``[g0,u0,g1,u1,...]`` (rows)."""
     inter = w.shape[1] // 2
     return torch.stack([w[:, :inter], w[:, inter:]], dim=2).flatten(1, 2).contiguous()
 
@@ -140,9 +133,10 @@ def moe_shuffle_weight(
     ``[g0, u0, g1, u1, ...]`` first. gfx1250 (MI450) does the gate/up interleave
     at the row level then the WMMA 16x16 tile shuffle; other archs (e.g. MI355)
     use ``shuffle_weight``'s lane-level interleave. Mirror of ``moe_shuffle_scale``.
+    ``is_guinterleave`` is ignored unless ``gate_up=True`` (stage2 has no gate/up).
     """
     if get_gfx() == "gfx1250":
-        if is_guinterleave:
+        if is_guinterleave and gate_up:
             src = interleave_gate_up_rows(src)
         return shuffle_weight(src, layout=layout)
     return shuffle_weight(
@@ -266,9 +260,7 @@ def shuffle_scale_n32k4(
       interleaved to ``[g0,u0,g1,u1,...]`` (matching the INTERLEAVE stage1
       weight layout produced for the fused gemm1) and then folded into n32k4.
 
-    ``gate_up`` is accepted for signature parity with ``shuffle_scale`` /
-    ``moe_shuffle_scale``; the gate/up interleave is driven by
-    ``is_guinterleave`` (the n32k4 fold is identical for both).
+    Only the fused stage1 gate_up scale interleaves: gated on ``gate_up=True``.
     """
     s = src.view(torch.uint8).contiguous()
     if s.ndim == 2:
@@ -278,7 +270,7 @@ def shuffle_scale_n32k4(
     elif s.ndim != 3:
         raise ValueError(f"n32k4 scale must be 2D or 3D, got {s.ndim}D")
     E, N, k_scale = s.shape
-    if is_guinterleave:
+    if is_guinterleave and gate_up:
         # GUGU: interleave gate/up rows [g..,u..] -> [g0,u0,g1,u1,...] so the
         # n32k4 super-rows line up with the INTERLEAVE stage1 weight layout.
         if N % 2 != 0:
