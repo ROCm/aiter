@@ -45,101 +45,6 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
 allocator = None
 
 
-def _compute_varctx_schedule_torch(
-    context_lens,
-    block_k,
-    parallel_unit_num,
-    max_seq_len,
-    next_n=1,
-):
-    """Reference (multi-op torch) persistent-grid schedule for varctx MQA logits.
-
-    Kept for validation / fallback. The production path is the single-kernel
-    :func:`compute_varctx_schedule` (Triton), which collapses these ~50 tiny
-    launches into one — decode builds this every step, so the per-launch
-    dispatch overhead (~300 us/step eager) dominated the FP4 indexer.
-    """
-    device = context_lens.device
-    P = parallel_unit_num
-    assert P % next_n == 0, (
-        f"parallel_unit_num={P} must be a multiple of next_n={next_n}"
-    )
-    S = P // next_n  # max number of (batch, chunk-split) slots before next_n fan-out
-
-    # Guard against silent batch-dropping. There are S per-next_n slots; each
-    # (batch, chunk-split) work item needs one. `valid = slot < total_splits`
-    # below truncates any work past slot S, leaving those batches at the
-    # caller's out pre-fill (-inf/NaN) -> wrong top-k with NO error. `S >= B`
-    # (i.e. P >= B * next_n) is a host-side (sync-free, CUDAGraph-safe)
-    # sufficient condition: at the coarsest folding (safe = max_chunks)
-    # total_splits == #non-empty batches <= B, so S >= B guarantees
-    # total_splits <= S.
-    B = context_lens.shape[0]
-    assert S >= B, (
-        f"compute_varctx_schedule: parallel_unit_num//next_n={S} < batches={B} "
-        f"would silently drop batches past slot {S} (logits stay at the "
-        f"caller's pre-fill -> wrong top-k). Pass parallel_unit_num >= "
-        f"batches * next_n."
-    )
-
-    ctx = context_lens.to(torch.int32)
-
-    chunks_per_batch = (ctx + (block_k - 1)) // block_k  # [B] int32
-
-    s_max = max(1, (max_seq_len + block_k - 1) // block_k)
-    s_cand = torch.arange(1, s_max + 1, device=device, dtype=torch.int32)  # [s_max]
-    ctas_per_b_s = (chunks_per_batch[None, :] + (s_cand[:, None] - 1)) // s_cand[
-        :, None
-    ]  # [s_max, B]
-    total_ctas_s = ctas_per_b_s.sum(dim=1) * next_n  # [s_max]
-    feasible = total_ctas_s <= P  # [s_max] bool, monotonic False..False,True..True
-    max_chunks = torch.clamp(chunks_per_batch.max(), min=1).to(torch.int32)
-
-    first_feasible_s = torch.clamp((~feasible).to(torch.int32).sum() + 1, max=s_max)
-    safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(torch.int32)
-
-    ctas_b = (chunks_per_batch + (safe - 1)) // safe  # [B] int32
-    incl = torch.cumsum(ctas_b, dim=0, dtype=torch.int32)  # [B] inclusive prefix sum
-    excl = incl - ctas_b  # exclusive prefix sum
-    total_splits = incl[-1]  # 0-dim tensor; total valid (batch,split) slots
-
-    # ── map each fixed slot → (batch, split_within_batch) via searchsorted ──
-    slot = torch.arange(S, device=device, dtype=torch.int32)  # [S]
-    batch_of_slot = torch.searchsorted(incl, slot, right=True)  # [S], in [0, B]
-    valid = slot < total_splits  # [S] bool
-    safe_batch = torch.clamp(batch_of_slot, max=ctx.shape[0] - 1)  # avoid OOB gather
-    split_within = slot - excl[safe_batch]  # [S]
-    start = split_within * safe  # [S]
-    n_chunks_slot = chunks_per_batch[safe_batch]  # [S]
-    count = torch.clamp(torch.minimum(safe, n_chunks_slot - start), min=0)  # [S]
-    ctx_slot = ctx[safe_batch]  # [S]
-
-    valid_i = valid.to(torch.int32)
-    base_batch = safe_batch * valid_i
-    start = start * valid_i
-    count = torch.where(valid, count, torch.ones_like(count))
-    ctx_slot = ctx_slot * valid_i
-
-    n_idx = torch.arange(next_n, device=device, dtype=torch.int32)  # [next_n]
-    valid_e = valid[:, None].expand(S, next_n)
-    batch_packed = torch.where(
-        valid_e,
-        base_batch[:, None] * next_n + n_idx[None, :],
-        torch.zeros((), dtype=torch.int32, device=device),
-    )  # [S, next_n]
-    start_e = start[:, None].expand(S, next_n)
-    count_e = count[:, None].expand(S, next_n)
-    ctx_e = ctx_slot[:, None].expand(S, next_n)
-
-    cta_info = (
-        torch.stack([batch_packed, start_e, count_e, ctx_e], dim=-1)
-        .reshape(P, 4)
-        .to(torch.int32)
-        .contiguous()
-    )
-    return safe, cta_info, P
-
-
 @triton.jit
 def _varctx_cta_info_kernel(
     ctx_ptr,  # [B] int32
@@ -155,11 +60,6 @@ def _varctx_cta_info_kernel(
     BLOCK_S: tl.constexpr,
 ):
     """Single-kernel build of the varctx persistent-grid schedule (cta_info).
-
-    Collapses ~50 tiny torch launches (arange/broadcast/cumsum/searchsorted/
-    gather/stack) into one launch. Each program recomputes the (cheap, B-vector)
-    `safe`/prefix-sum state and emits BLOCK_S slots; the redundancy is far
-    cheaper than per-op dispatch. Bit-exact with `_compute_varctx_schedule_torch`.
     """
     pid = tl.program_id(0)
     b = tl.arange(0, BLOCK_B)
@@ -168,8 +68,6 @@ def _varctx_cta_info_kernel(
     chunks = tl.where(bmask, (ctx + block_k - 1) // block_k, 0)
     max_chunks = tl.maximum(tl.max(chunks, axis=0), 1)
 
-    # smallest s in [1, s_max] with sum(ceil(chunks/s))*NEXT_N <= P
-    # (branchless binary search; total is monotonic non-increasing in s).
     lo = 1
     hi = s_max
     for _ in tl.static_range(32):
@@ -229,20 +127,11 @@ def compute_varctx_schedule(
     next_n=1,
     cta_info_out=None,
 ):
-    """Single-kernel persistent-grid schedule for varctx MQA logits.
-
-    Drop-in for :func:`_compute_varctx_schedule_torch` but one Triton launch
-    instead of ~50 tiny torch ops (decode rebuilds this every step, so the
-    launch overhead dominated). Returns ``(safe, cta_info, P)``. Pass
-    ``cta_info_out`` to write into a fixed-address buffer (CUDAGraph).
-    """
     P = parallel_unit_num
     if P % next_n != 0:
         raise ValueError(f"parallel_unit_num={P} must be a multiple of next_n={next_n}")
     S = P // next_n
     B = context_lens.shape[0]
-    # Host-side (sync-free) guard: S >= B guarantees no batch is dropped (see
-    # the torch reference for the derivation).
     if S < B:
         raise ValueError(
             f"compute_varctx_schedule: parallel_unit_num//next_n={S} < batches={B} "
@@ -289,31 +178,6 @@ def build_pa_mqa_logits_fp4_module(
     heads=DEFAULT_HEADS,
     head_dim=DEFAULT_HEAD_DIM,
 ):
-    """Build FP4 MQA logits kernel.
-
-    Returns (kernel_fn, allocator).
-
-    Grid: (total_ctas,) from compute_varctx_schedule(..., next_n=next_n)
-    Block: (num_warps * WARP_SIZE,)
-
-    `max_chunks_per_cta`: accepted for API compatibility with the host
-    scheduler caller; currently unused inside the kernel (the chunk loop
-    bounds are taken from the per-CTA `chunk_count` runtime value).
-
-    `next_n`: number of MTP queries per batch (default 1 = standard MQA).
-    Following gluon's design, each (batch, next_n_idx) is a separate CTA;
-    KV is shared across the next_n CTAs via L2 cache. cta_info[0] holds
-    batch_packed = batch * next_n + next_n_idx; the kernel decodes it.
-
-    `heads`: number of Q heads (must be a multiple of MFMA_M=16 and <= 128).
-    Drives m_tiles = heads // 16 — the inner mi_idx loop count.
-    `head_dim`: per-head dim. Must be a multiple of 128 (= MFMA K).
-    k_tiles = head_dim // 128 drives the outer MFMA-K loop.
-
-    `block_k` must be divisible by MFMA_N=16, and block_k / 16 must be a
-    multiple of `num_warps`. Each warp processes
-    N_TILES_PER_WARP = (block_k / 16) / num_warps N-tiles per chunk.
-    """
     block_threads_k = num_warps * WARP_SIZE
     head_dim_packed = head_dim // 2
     m_tiles = heads // MFMA_M
@@ -355,11 +219,6 @@ def build_pa_mqa_logits_fp4_module(
     allocator = SmemAllocator(None, arch="gfx950", global_sym_name="mqa_fp4_smem")
     allocator.ptr = 16  # minimal, no LDS needed for this approach
 
-    # Q-scale per-thread loader. The host-side preshuffled tensor is
-    # uint8 with shape [B, NEXT_N, K_TILES, 4 (K_chunks), 16, qs_pad];
-    # each thread loads its qs_pad bytes (= QS_DW i32 dwords) by slicing
-    # all 5 outer dims and copying the innermost row via a single buffer atom.
-    # Whole-row load → bitcast to i32 dwords in register.
     QS_DW = (m_tiles + 3) // 4
     qs_pad = QS_DW * 4
     qs_pad_bits = qs_pad * 8
@@ -374,10 +233,6 @@ def build_pa_mqa_logits_fp4_module(
         else:
             raise ValueError(f"unsupported QS_DW={QS_DW} (qs_pad_bits={qs_pad_bits})")
 
-    # Phys block-table loader: dispatched on N_PHYS at build time so the
-    # kernel body sees one shape (no scf.if). vec_width=1 returns a scalar
-    # (no vector to extract from); vec_width>1 returns a vector. Each loaded
-    # phys covers TILES_PER_BLOCK consecutive N-tiles → replicate per nt.
     if N_PHYS == 1:
 
         def _phys_to_list(phys_v):
@@ -430,17 +285,12 @@ def build_pa_mqa_logits_fp4_module(
         chunk_count = cta_info_vec[2]
         context_len = cta_info_vec[3]
 
-        # Per-CTA output base. `batch_packed * stride_out_batch` overflows i32
-        # when batch_packed * max_seq_len > 2^31-1 (large B*next_n with a big
-        # max_seq_len): the store offset wraps and the row is silently dropped
-        # (out stays at the caller's pre-fill). Fold the row base into the
-        # buffer-resource base pointer in i64 so only the small per-token offset
-        # rides the 32-bit buffer voffset.
         _row_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(batch_packed))
         _stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(stride_out_batch))
         _row_elems_i64 = arith.muli(_row_i64, _stride_i64)
         _row_bytes_i64 = arith.muli(
-            _row_elems_i64, arith.constant(4, type=T.i64)  # sizeof(f32)
+            _row_elems_i64,
+            arith.constant(4, type=T.i64),  # sizeof(f32)
         )
         out_rsrc = buffer_ops.create_buffer_resource(
             out_logits_ptr, max_size=True, base_byte_offset=_row_bytes_i64
@@ -513,15 +363,6 @@ def build_pa_mqa_logits_fp4_module(
 
         # ── Step 3: prologue + N-1 prefetch loop + epilogue ──
         def _load_phys(c_i32_arg):
-            """Load phys_block for chunk c, all N_TILES_PER_WARP N-tiles in
-            ONE wider buffer_load (vec_width=N_PHYS). When kv_block_size ==
-            MFMA_N, TILES_PER_BLOCK==1 and N_PHYS == NTPW (one phys per
-            n-tile, all distinct). When kv_block_size > MFMA_N, multiple
-            consecutive n-tiles share a single phys — _phys_to_list maps
-            nt → loaded[nt // TILES_PER_BLOCK]. bi_base alignment:
-            chunk_offset/kvbs = chunk_idx * num_warps * N_PHYS, so
-            bi_base % N_PHYS == 0 holds for every warp. -32% kernel cycle
-            vs scalar loads when NTPW > 1 — see commit be8f998b."""
             ni_base = warp_id * fx.Int32(N_TILES_PER_WARP)
             token_global_base = (
                 (chunk_start + c_i32_arg) * fx.Int32(block_k)
@@ -535,23 +376,6 @@ def build_pa_mqa_logits_fp4_module(
             return _phys_to_list(phys_vec)
 
         def _prefetch_chunk(c_i32_arg, phys_list):
-            """Issue KV+scale loads for chunk c using pre-loaded phys_list.
-
-            KV:  ONE dwordx4 per (nt, k_tile) — 16 bytes of FP4 per thread.
-                 Returns kv_list, length NTPW * K_TILES, flat-indexed
-                 [nt * K_TILES + k_tile].
-
-            KVS: ONE PACKED dword per k_tile (4 bytes covering all NTPW=4 nts).
-                 The host preshuffle interleaves nts so 4 bytes for nts 0..3
-                 of one (D, T) thread are adjacent — collapses 4 ubyte loads
-                 into 1 dword load per k_tile. Saves 3 VMEM ops per k_tile.
-                 Returns kvs_packed_list, length K_TILES (one i32 each).
-                 Consumer extracts nt's byte via (packed >> (8*nt)) & 0xff.
-
-            Requires N_PHYS == 1 (all NTPW nts share one phys block within a
-            warp). For kv_block_size=64, MFMA_N=16, NTPW=4 → all nts span
-            exactly one phys block, so phys_list[0] is shared.
-            """
             assert N_TILES_PER_WARP == 4, "packed kvs assumes NTPW=4"
             assert N_PHYS == 1, "packed kvs assumes N_PHYS=1 (NTPW nts share one phys)"
 
@@ -603,11 +427,6 @@ def build_pa_mqa_logits_fp4_module(
             return kv_list, kvs_packed_list
 
         def _extract_kvs_scales(kvs_packed_list_in):
-            """Pre-extract all NTPW nt scales from packed kvs i32s.
-            Returns scales[nt][k_tile] = i32.
-            Doing this UP-FRONT (vs lazy per-mfma) frees the packed register
-            early and decouples bfe from the mfma dep chain — letting the
-            scheduler interleave mfmas with post-process VALU."""
             scales = [[None] * k_tiles for _ in range(N_TILES_PER_WARP)]
             for k_tile in range_constexpr(k_tiles):
                 packed = kvs_packed_list_in[k_tile]
@@ -617,11 +436,6 @@ def build_pa_mqa_logits_fp4_module(
             return scales
 
         def _issue_nt_mfmas(kv_list_in, kvs_scales_per_nt, nt):
-            """Issue all m_tiles*k_tiles MFMAs for one nt (constexpr index).
-
-            `kvs_scales_per_nt`: list of k_tiles pre-extracted i32 scale values
-            for THIS nt (already extracted from packed via _extract_kvs_scales).
-            """
             zero = fx.Vector.filled(4, 0.0, fx.Float32)
             accs = [zero] * m_tiles
             for k_tile in range_constexpr(k_tiles):
@@ -648,9 +462,6 @@ def build_pa_mqa_logits_fp4_module(
             return accs
 
         def _post_process_nt(accs, nt, c_i32_arg):
-            """relu + per-head weight + per-thread sum + bperm + store
-            for one nt's accs.
-            """
             zero = fx.Vector.filled(4, 0.0, fx.Float32)
             ni_warp = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
             token_base = (chunk_start + c_i32_arg) * fx.Int32(
@@ -692,8 +503,7 @@ def build_pa_mqa_logits_fp4_module(
             buffer_ops.buffer_store(thread_sum, out_rsrc, out_off)
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
-            """Process chunk c using prefetched (kv, kvs_packed).
-            """
+            """Process chunk c using prefetched (kv, kvs_packed)."""
             assert N_TILES_PER_WARP == 4, (
                 "pipelined-nt structure currently hardcoded for NTPW=4"
             )
@@ -740,11 +550,6 @@ def build_pa_mqa_logits_fp4_module(
                 nt0_init_scalars.append(vv[i])
 
         # === Main loop: chunk_count - 1 iterations ===
-        # Carry layout (flat list):
-        #   kv_cur:    K_TILES * N_TILES_PER_WARP entries (kv_list[nt*K_TILES+k])
-        #   kvs_cur:   K_TILES entries (packed dword per k_tile, NTPW nts in one i32)
-        #   phys_next: N_TILES_PER_WARP entries
-        #   nt0_accs:  m_tiles * 4 = 16 f32 (pre-issued nt=0 for THIS iter)
         N_KVS = k_tiles  # one packed i32 per k_tile (NTPW=4 nts packed in)
         chunk_count_minus_1_i32 = chunk_count - fx.Int32(1)
         chunk_count_minus_1_idx = fx.Index(chunk_count_minus_1_i32)
@@ -833,8 +638,6 @@ def compile_pa_mqa_logits_fp4(
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
 ):
-    """Build (and cache) the @flyc.jit launcher for a given config.
-    """
     kfn, alloc = build_pa_mqa_logits_fp4_module(
         block_k=block_k,
         kv_block_size=kv_block_size,
@@ -846,9 +649,6 @@ def compile_pa_mqa_logits_fp4(
     )
     block_threads = getattr(alloc, "block_threads", DEFAULT_BLOCK_THREADS)
 
-    # Name the launcher explicitly so the flydsl disk cache directory becomes
-    # `~/.flydsl/cache/launch_pa_mqa_logits_fp4_<hash>/` rather than the
-    # generic `launcher_<hash>/`.
     @flyc.jit
     def launch_pa_mqa_logits_fp4(
         out,
@@ -898,8 +698,7 @@ def flydsl_pa_mqa_logits_fp4(
     total_ctas: Optional[int] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
-    """Decode/varctx FP4 paged MQA logits (gfx950).
-    """
+    """Decode/varctx FP4 paged MQA logits (gfx950)."""
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]

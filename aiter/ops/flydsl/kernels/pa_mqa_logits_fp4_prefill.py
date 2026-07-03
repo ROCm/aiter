@@ -61,14 +61,6 @@ def compute_prefill_schedule(
     P = parallel_unit_num
     T = local_ends.shape[0]  # fixed total_tokens (rows)
 
-    # Guard against silent row-dropping. The persistent grid has P slots; each
-    # (row, chunk-split) work item needs one. `valid = slot < total_splits`
-    # below truncates any work past slot P, leaving those rows at the caller's
-    # out pre-fill (-inf/NaN) -> wrong top-k with NO error. `P >= T` is a
-    # host-side (sync-free, CUDAGraph-safe) sufficient condition: at the
-    # coarsest folding (safe = max_chunks) total_splits == #non-empty rows <= T,
-    # so P >= T guarantees total_splits <= P. (Conservative for very sparse
-    # inputs where most rows are empty; the V4 indexer rows are all non-empty.)
     assert P >= T, (
         f"compute_prefill_schedule: parallel_unit_num={P} < rows={T} would "
         f"silently drop rows past slot {P} (logits stay at the caller's "
@@ -139,14 +131,7 @@ def _prefill_cta_info_kernel(
     P,
     BLOCK_P: tl.constexpr,
 ):
-    """Single-kernel slot->row mapping + cta_info emit for ragged prefill.
-
-    Each program handles BLOCK_P persistent-grid slots: binary-search the
-    per-row inclusive prefix sum (`incl`) for the owning row (searchsorted,
-    right=True), gather the row's fields, and write the [P,6] cta_info row.
-    Collapses ~25 tiny torch ops (gathers/where/stack) into one launch.
-    Bit-exact with the torch tail it replaces.
-    """
+    """Single-kernel slot->row mapping + cta_info emit for ragged prefill."""
     pid = tl.program_id(0)
     safe = tl.load(safe_ptr)
     total_splits = tl.load(total_splits_ptr)
@@ -235,15 +220,13 @@ def build_pa_mqa_logits_fp4_prefill_module(
     _kv_chunk_bytes = 16
     _stride_kv_ktile = 4 * kv_block_size * _kv_chunk_bytes
     _stride_kv_block = k_tiles * _stride_kv_ktile
+    # byte stride between consecutive nt tiles inside one kv block (one MFMA_N
+    # row of tokens); used as the per-nt constant `soffset` immediate delta.
+    _stride_kv_ntile = MFMA_N * _kv_chunk_bytes
     # KV_scale: [block_id, K_TILES, K_chunks=4, kv_block_size]
     _stride_kvs_ktile = 4 * kv_block_size
     _stride_kvs_block = k_tiles * _stride_kvs_ktile
 
-    # All per-chunk address math divides/mods by `kv_block_size` and by 4
-    # (byte->dword). Those operands are always non-negative token/byte offsets,
-    # so when the divisor is a power of two we lower `//`/`%` to shift/mask.
-    # (Signed floordiv/rem by 2^k emit a sign-correction sequence, ~3 VALU each;
-    # this kernel is VALU-issue bound, so removing them is a direct win.)
     _kb_is_pow2 = kv_block_size & (kv_block_size - 1) == 0
     _kb_log2 = kv_block_size.bit_length() - 1
     _kb_mask = kv_block_size - 1
@@ -333,12 +316,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
         chunk_start = cta_info_vec[2]
         chunk_count = cta_info_vec[3]
 
-        # Per-CTA output base. `row_id * stride_out_row` overflows i32 when
-        # row_id * max_seq_len > 2^31-1 (e.g. V4 max_model_len_idx = 262144 with
-        # >8k prefill rows): the store offset wraps and the row is silently
-        # dropped (out stays at the caller's NaN/-inf pre-fill). Fold the row
-        # base into the buffer-resource base pointer in i64 so only the small
-        # per-token offset rides the 32-bit buffer voffset.
         _row_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(row_id))
         _stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(stride_out_row))
         _row_elems_i64 = arith.muli(_row_i64, _stride_i64)
@@ -405,13 +382,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
             T.bf16, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
         )
         w_reg_lay = fx.make_layout(4, 1)
-        # Fold the scalar `weight_scale` into the hoisted per-head weights ONCE
-        # per wave. The final logit is `weight_scale * sum_e(relu*w)`, and the
-        # bperm cross-lane reduction is purely additive, so
-        # `weight_scale * sum(relu*w) == sum(relu*(w*weight_scale))`. Pre-scaling
-        # `w` here (m_tiles vector muls/wave) removes the per-nt scalar
-        # `* weight_scale` in `_post_process_nt` (4*chunk_count muls/wave). This
-        # kernel is VALU-issue bound, so the net drop is a direct runtime lever.
         ws_vec = fx.Vector.from_elements([weight_scale] * 4, dtype=fx.Float32)
         w_per_lane = []
         for mi_idx in range_constexpr(m_tiles):
@@ -445,54 +415,48 @@ def build_pa_mqa_logits_fp4_prefill_module(
             kvs_packed_list = []
 
             phys_shared = phys_list[0]
+            kvs_base_off_elems = (
+                phys_shared * _stride_kvs_block
+                + lane_div_16 * kv_block_size
+                + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
+            ) >> fx.Int32(2)
             for k_tile in range_constexpr(k_tiles):
-                kvs_packed_off_bytes = (
-                    phys_shared * _stride_kvs_block
-                    + fx.Int32(k_tile * _stride_kvs_ktile)
-                    + lane_div_16 * kv_block_size
-                    + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
-                )
                 kvs_packed = buffer_ops.buffer_load(
                     kvs_rsrc,
-                    kvs_packed_off_bytes >> fx.Int32(2),
+                    kvs_base_off_elems,
                     vec_width=1,
                     dtype=T.i32,
+                    soffset_bytes=k_tile * _stride_kvs_ktile,
                 )
                 kvs_packed_list.append(kvs_packed)
 
+            ni0 = warp_id * fx.Int32(N_TILES_PER_WARP)
+            token_local0 = (
+                (chunk_start + c_i32_arg) * fx.Int32(block_k)
+                + ni0 * fx.Int32(MFMA_N)
+                + lane_mod_16
+            )
+            token_in_block0 = _mod_kb(token_local0)
+            kv_base_off_elems = (
+                phys_shared * _stride_kv_block
+                + lane_div_16 * kv_block_size * _kv_chunk_bytes
+                + token_in_block0 * _kv_chunk_bytes
+            ) >> fx.Int32(2)
             for nt in range_constexpr(N_TILES_PER_WARP):
-                ni_c = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
-                token_local_c = (
-                    (chunk_start + c_i32_arg) * fx.Int32(block_k)
-                    + ni_c * fx.Int32(MFMA_N)
-                    + lane_mod_16
-                )
-                token_in_block_c = _mod_kb(token_local_c)
-                phys_block_c = phys_list[nt]
                 for k_tile in range_constexpr(k_tiles):
-                    kv_off_bytes_c = (
-                        phys_block_c * _stride_kv_block
-                        + fx.Int32(k_tile * _stride_kv_ktile)
-                        + lane_div_16 * kv_block_size * _kv_chunk_bytes
-                        + token_in_block_c * _kv_chunk_bytes
-                    )
+                    kv_soffset = k_tile * _stride_kv_ktile + nt * _stride_kv_ntile
                     kv_c = buffer_ops.buffer_load(
                         kv_rsrc,
-                        kv_off_bytes_c >> fx.Int32(2),
+                        kv_base_off_elems,
                         vec_width=4,
                         dtype=T.i32,
+                        soffset_bytes=kv_soffset,
                     )
                     kv_list.append(kv_c)
 
             return kv_list, kvs_packed_list
 
         def _issue_nt_mfmas(kv_list_in, kvs_packed_per_kt, nt):
-            # `kvs_packed_per_kt[k_tile]` is the RAW packed i32 holding the 4
-            # per-nt E8M0 kv-scale bytes (byte `nt` == this nt's scale). Rather
-            # than software-extract with `(packed >> 8*nt) & 0xFF` (2 VALU per
-            # nt per chunk), pass the packed dword straight as `scaleB` and let
-            # the MFMA `opselB` operand byte-select byte `nt` in hardware. This
-            # deletes the whole `_extract_kvs_scales` per-chunk VALU.
             zero = fx.Vector.filled(4, 0.0, fx.Float32)
             accs = [zero] * m_tiles
             for k_tile in range_constexpr(k_tiles):
@@ -528,13 +492,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
             thread_sum = ZERO_F
             for mi_idx in range_constexpr(m_tiles):
-                # relu(acc) then weighted accumulate. Fuse the per-head
-                # `mul + add` into a single `fma` (drops the separate v_mul,
-                # ~4 VALU/head): thread_sum += relu_v[e] * w[e]. Accumulation
-                # order is unchanged; fma's single rounding is if anything more
-                # accurate than the mul-then-add it replaces. This kernel is
-                # VALU-issue bound (VALUBusy ~98%), so cutting VALU count here
-                # is the direct lever on runtime.
                 relu_v = fx.Vector(accs[mi_idx]).maximumf(zero)
                 w_v = fx.Vector(w_per_lane[mi_idx])
                 for elem in [0, 1, 2, 3]:
@@ -683,14 +640,7 @@ def compile_pa_mqa_logits_fp4_prefill(
     num_warps: int = DEFAULT_NUM_WARPS,
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
-    waves_per_eu: int = 2,
 ):
-    """Build (and cache) the @flyc.jit launcher, keyed by layout config.
-
-    Returns ``(launcher, block_threads)``. Call the launcher directly (with
-    outputs/schedule precomputed) to skip the per-call torch overhead in
-    ``flydsl_pa_mqa_logits_fp4_prefill``.
-    """
     kfn, alloc = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
         kv_block_size=kv_block_size,
@@ -701,8 +651,6 @@ def compile_pa_mqa_logits_fp4_prefill(
     )
     block_threads = getattr(alloc, "block_threads", DEFAULT_BLOCK_THREADS)
 
-    # Named explicitly so the flydsl disk cache dir is
-    # `launch_pa_mqa_logits_fp4_prefill_<hash>/` not the generic `launcher_<hash>/`.
     @flyc.jit
     def launch_pa_mqa_logits_fp4_prefill(
         out,
@@ -728,16 +676,6 @@ def compile_pa_mqa_logits_fp4_prefill(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
         )
 
-    # Cap occupancy via --amdgpu-waves-per-eu (part of the JIT cache key). The
-    # prefill kernel is L2-bandwidth / VALU-issue bound (94% L2 hit, HBM idle),
-    # so fewer resident waves per EU can reduce VALU/L2 contention.
-    if waves_per_eu:
-        # min,max form so the value acts as an occupancy *cap* (a single value is
-        # treated as a lower bound and won't reduce occupancy).
-        launch_pa_mqa_logits_fp4_prefill.compile_hints = {
-            "waves_per_eu": f"{waves_per_eu},{waves_per_eu}"
-        }
-
     return launch_pa_mqa_logits_fp4_prefill, block_threads
 
 
@@ -758,7 +696,6 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
     parallel_unit_num: int = 512,
-    waves_per_eu: int = 2,
     out: Optional[torch.Tensor] = None,
     cta_info: Optional[torch.Tensor] = None,
     n_ctas: Optional[int] = None,
@@ -799,7 +736,6 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         num_warps=num_warps,
         heads=heads,
         head_dim=head_dim,
-        waves_per_eu=waves_per_eu,
     )
 
     if stream is None:
