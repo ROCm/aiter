@@ -106,15 +106,22 @@ def _flops_bytes(which, total_rows, n_groups):
         bytes_ = L * N * 2 + n_groups * K * N * 2 + L * K * 2
     elif which == "dense_bias":
         # Fused dDense (+ dBias). dDense[b] = Jagged[s:e].T @ dOut[s:e] -> 2*L*K*N MACs
-        # dominates; the dBias reduction (~L*N adds) now piggybacks on the same dOut
-        # reads. partials kernel reads Jagged+dOut, writes dDense+dBias fp32 partials;
-        # the two reduce passes read those partials and write bf16 dDense+dBias.
+        # dominates; the dBias reduction (~L*N adds) piggybacks on the same dOut reads.
         flops = 2 * L * K * N
-        dpart = n_groups * SPLIT * K * N * 4
-        bpart = n_groups * SPLIT * N * 4
-        bytes_ = (L * K * 2 + L * N * 2 + dpart + bpart) + (
-            dpart + n_groups * K * N * 2 + bpart + n_groups * N * 2
-        )
+        # Reads (both SPLIT paths): Jagged (L,K) + dOut (L,N), bf16.
+        reads = L * K * 2 + L * N * 2
+        if SPLIT == 1:
+            # Fast path: partials kernel truncates fp32 accumulators to bf16 and writes
+            # dDense + dBias DIRECTLY -- no fp32 partials round-trip, no reduce passes.
+            bytes_ = reads + n_groups * K * N * 2 + n_groups * N * 2
+        else:
+            # partials kernel writes fp32 dDense+dBias partials; two reduce passes read
+            # those partials and write the final bf16 dDense + dBias.
+            dpart = n_groups * SPLIT * K * N * 4
+            bpart = n_groups * SPLIT * N * 4
+            bytes_ = (reads + dpart + bpart) + (
+                dpart + n_groups * K * N * 2 + bpart + n_groups * N * 2
+            )
     else:
         raise ValueError(which)
     return flops, bytes_
