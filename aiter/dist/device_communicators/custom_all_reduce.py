@@ -887,6 +887,7 @@ class CustomAllreduce:
                 reg,
                 reg_bytes,
                 use_1stage,
+                gemma_norm,
             )
             return out, res_out, scale_out
 
@@ -1001,6 +1002,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         eps: float,
         use_1stage: bool,
+        gemma_norm: bool = False,
     ):
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
@@ -1015,6 +1017,7 @@ class CustomAllreduce:
                     registered=True,
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
+                    gemma_norm=gemma_norm,
                 )
             else:
                 dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
@@ -1031,6 +1034,7 @@ class CustomAllreduce:
                 registered=False,
                 use_1stage=use_1stage,
                 post_per_token_quant=True,
+                gemma_norm=gemma_norm,
             )
 
     def fused_ar_rms_per_group_quant(
