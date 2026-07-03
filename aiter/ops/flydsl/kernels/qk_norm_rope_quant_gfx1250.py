@@ -109,7 +109,19 @@ BLOCK_THREADS = 32  # 1 wave32 on RDNA4/gfx1250
 # overlaps one row's load->reduce->store latency with another row's memory ops
 # (the kernel is latency-bound on that chain, not bandwidth- or ALU-bound).
 # Each wave (thread_idx.y) still processes exactly one (head, token) row.
+#
+# Adaptive by token count (chosen per launch in the public API):
+#   - Large T (prefill): ROWS_PER_WG (=32, full 1024-thread workgroup) maximises
+#     waves/workgroup so few workgroups saturate 64 waves/CU.
+#   - Small T (decode, T <= SMALL_T_THRESHOLD): a smaller R yields MORE
+#     workgroups (grid = (H+1) * ceil(T/R)), spreading across more CUs when the
+#     total row count is too small to fill the machine at R=32.
 ROWS_PER_WG = 32
+ROWS_PER_WG_SMALL = 16
+# At/below this token count, R=32 launches < ~256 workgroups (65*ceil(T/32)),
+# leaving CUs idle; the small-R variant fills more of them. 65*ceil(96/32)=195
+# vs 65*ceil(96/16)=390 -- the crossover where extra workgroups still help.
+SMALL_T_THRESHOLD = 96
 
 # SQRT2 has no aiter dependency, so it stays at module level.
 _SQRT2 = math.sqrt(2.0)
@@ -260,6 +272,7 @@ def _build_kernel(
     scale_dtype: str,
     q_weighted: bool,
     kv_write: bool = False,
+    rows_per_wg: int = ROWS_PER_WG,
 ):
     """Build the @flyc.kernel + @flyc.jit launcher for a given config.
 
@@ -281,6 +294,9 @@ def _build_kernel(
     VEC = D // BLOCK_THREADS
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
+    # Local rebind so every ROWS_PER_WG reference below picks up the per-build
+    # value (adaptive: R=32 for prefill, R=16 for small-T decode).
+    ROWS_PER_WG = rows_per_wg
 
     assert (
         D % BLOCK_THREADS == 0
@@ -909,6 +925,7 @@ def compile_flydsl_qk_norm_rope_quant_gfx1250(
     scale_dtype: str,
     q_weighted: bool,
     kv_write: bool = False,
+    rows_per_wg: int = ROWS_PER_WG,
 ):
     """Compile (and cache) the gfx1250 wave32 launcher for a given config."""
     launcher = _build_kernel(
@@ -920,6 +937,7 @@ def compile_flydsl_qk_norm_rope_quant_gfx1250(
         scale_dtype=scale_dtype,
         q_weighted=q_weighted,
         kv_write=kv_write,
+        rows_per_wg=rows_per_wg,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
@@ -1076,6 +1094,12 @@ def flydsl_qk_norm_rope_quant_gfx1250(
         ssm_arg = q.new_empty(1, dtype=torch.int32)
         bid_arg = q.new_empty(1, dtype=torch.int32)
 
+    # Adaptive workgroup packing: small-T (decode) launches too few workgroups
+    # at R=32 to fill all CUs, so use the small-R variant there; large-T
+    # (prefill) keeps R=32 for max waves/workgroup. Selected once per launch by
+    # total token count (chunking below stays within one regime for real cases).
+    rows_per_wg = ROWS_PER_WG_SMALL if T_tok <= SMALL_T_THRESHOLD else ROWS_PER_WG
+
     launcher = compile_flydsl_qk_norm_rope_quant_gfx1250(
         num_q_heads=H,
         head_dim=D,
@@ -1085,6 +1109,7 @@ def flydsl_qk_norm_rope_quant_gfx1250(
         scale_dtype=scale_dtype,
         q_weighted=q_weighted,
         kv_write=kv_write,
+        rows_per_wg=rows_per_wg,
     )
 
     if stream is None:
