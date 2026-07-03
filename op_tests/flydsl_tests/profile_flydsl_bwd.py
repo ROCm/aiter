@@ -8,6 +8,7 @@ Run inside docker:
   HIP_VISIBLE_DEVICES=0 python op_tests/flydsl_tests/profile_flydsl_bwd.py
 """
 
+import math
 import os
 import torch
 from aiter.ops.triton.attention.mha import flash_attn_func
@@ -22,7 +23,7 @@ from aiter.ops.flydsl.kernels.fmha_bwd_kernel import build_fmha_bwd_kernel_modul
 B, HQ, HK, D = 1, 5, 5, 128
 SQ = SK = int(os.environ.get("PROF_SQ", 75600))
 DTYPE = torch.bfloat16
-SM_SCALE = D ** -0.5
+SM_SCALE = 1.0 / math.sqrt(D)
 WARMUP = int(os.environ.get("PROF_WARMUP", 5))
 ITERS = int(os.environ.get("PROF_ITERS", 20))
 
