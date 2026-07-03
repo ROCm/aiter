@@ -125,7 +125,7 @@ static std::tuple<std::string, int> get_heuristic_kernel(
 }
 
 // Shared dispatch body for both a8w8 (B=mxfp8) and a8w4 (B=mxfp4).
-static void mxfp8fp4_mi400_launch(aiter_tensor_t* A,
+static void mxfp8fp4_launch(aiter_tensor_t* A,
                                   aiter_tensor_t* B,
                                   aiter_tensor_t* ScaleA,
                                   aiter_tensor_t* ScaleB,
@@ -281,7 +281,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      hipStream_t     stream),
     (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, stream))
 {
-    mxfp8fp4_mi400_launch(A, B, ScaleA, ScaleB, out,
+    mxfp8fp4_launch(A, B, ScaleA, ScaleB, out,
                           kernelName, B_DTYPE_FP8, a_preshuffle, stream);
 }
 
@@ -297,6 +297,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      hipStream_t     stream),
     (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, stream))
 {
-    mxfp8fp4_mi400_launch(A, B, ScaleA, ScaleB, out,
+    mxfp8fp4_launch(A, B, ScaleA, ScaleB, out,
                           kernelName, B_DTYPE_FP4, a_preshuffle, stream);
 }
