@@ -52,7 +52,6 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_nchw_cblocked,
     conv2d_nhwc,
     conv2d_winograd_f4x3,
-    conv2d_winograd_f4x3_fused,
     conv2d_winograd_f4x3_cblocked,
 )
 
@@ -134,9 +133,6 @@ METHOD_REGISTRY = {
     ),
     "winograd_f4x3": MethodEntry(
         conv2d_winograd_f4x3, _wino_guard, True, "[winograd_f4x3]", "WF(4,3)"
-    ),
-    "winograd_f4x3_fused": MethodEntry(
-        conv2d_winograd_f4x3_fused, _wino_guard, True, "[wino_f4x3_fused]", "WF4fused"
     ),
     "winograd_f4x3_cblocked": MethodEntry(
         conv2d_winograd_f4x3_cblocked,

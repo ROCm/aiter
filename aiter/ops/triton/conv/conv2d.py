@@ -28,7 +28,6 @@ from aiter.ops.triton.conv._launch import (
     _launch_general,
     _launch_winograd_f4x3,
     _launch_winograd_f4x3_cblocked,
-    _launch_winograd_f4x3_fused,
     _select_3x3_method,
 )
 
@@ -200,43 +199,6 @@ def conv2d_winograd_f4x3_cblocked(
         padding,
         activation,
         block_k,
-    )
-    return y
-
-
-def conv2d_winograd_f4x3_fused(
-    x,
-    w_oihw,
-    bias=None,
-    stride=(1, 1),
-    padding=(0, 0),
-    dilation=(1, 1),
-    activation="none",
-    block_k=BLOCK_K,
-):
-    """NCHW conv2d using Winograd F(4x4,3x3) with fused GEMM+output transform.
-    Raises ValueError for non-eligible convs."""
-    N, C, H, W_in, K_out, R, S, P, Q = _conv_dims(x, w_oihw, stride, padding, dilation)
-    _require_winograd_eligible("conv2d_winograd_f4x3_fused", R, S, stride, dilation, C)
-
-    y = _alloc_output(N, K_out, P, Q, x, "nchw")
-    bias_fp32 = _prep_bias(bias)
-    U, C_pad = get_or_make_winograd_filter_f4x3(w_oihw.contiguous(), block_k)
-    _launch_winograd_f4x3_fused(
-        x,
-        U,
-        bias_fp32,
-        y,
-        N,
-        C,
-        H,
-        W_in,
-        K_out,
-        P,
-        Q,
-        C_pad,
-        padding,
-        activation,
     )
     return y
 

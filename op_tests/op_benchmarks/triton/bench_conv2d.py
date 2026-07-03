@@ -60,7 +60,6 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_nchw_cblocked,
     conv2d_nhwc,
     conv2d_winograd_f4x3,
-    conv2d_winograd_f4x3_fused,
     conv2d_winograd_f4x3_cblocked,
     _resolve_route,
 )
@@ -91,7 +90,6 @@ METHODS = {
     "cblocked": conv2d_nchw_cblocked,
     "nhwc": conv2d_nhwc,
     "winograd_f4x3": conv2d_winograd_f4x3,
-    "winograd_f4x3_fused": conv2d_winograd_f4x3_fused,
     "winograd_f4x3_cblocked": conv2d_winograd_f4x3_cblocked,
 }
 
