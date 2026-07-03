@@ -42,7 +42,7 @@ def run_ck(input, weight, eps, residual=None, use_model_sensitive_rmsnorm=0):
             residual_out,
             weight,
             eps,
-            use_model_sensitive_rmsnorm,
+            use_model_sensitive_rmsnorm=use_model_sensitive_rmsnorm,
         )
     return output, residual_out
 
