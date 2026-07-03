@@ -44,8 +44,8 @@ def bench(md_name, trigger):
 def trigger_opus(x, w):
     import aiter
 
-    aiter.rms_norm(x, w, 1e-6)  # -> module_rmsnorm_opus (1 torch-free TU)
+    aiter.rms_norm(x, w, 1e-6)  # -> module_rmsnorm (1 torch-free TU)
 
 
 if __name__ == "__main__":
-    bench("module_rmsnorm_opus", trigger_opus)
+    bench("module_rmsnorm", trigger_opus)

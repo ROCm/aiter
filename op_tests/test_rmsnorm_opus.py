@@ -119,7 +119,7 @@ def run_case(dtype, m, n, do_perf):
 
 
 def report_build_wall():
-    # Cold JIT build wall of module_rmsnorm_opus vs the ~225s CK module_rmsnorm.
+    # Cold JIT build wall of module_rmsnorm vs the ~225s CK module_rmsnorm.
     import shutil
     import time
 
@@ -127,8 +127,8 @@ def report_build_wall():
 
     jit = get_user_jit_dir()
     for p in (
-        os.path.join(jit, "module_rmsnorm_opus.so"),
-        os.path.join(jit, "build", "module_rmsnorm_opus"),
+        os.path.join(jit, "module_rmsnorm.so"),
+        os.path.join(jit, "build", "module_rmsnorm"),
     ):
         if os.path.isfile(p):
             os.remove(p)
@@ -139,9 +139,7 @@ def report_build_wall():
     t0 = time.perf_counter()
     aiter.rms_norm(x, w, 1e-6)  # blocks on cold build
     torch.cuda.synchronize()
-    print(
-        f"module_rmsnorm_opus cold build + first call: {time.perf_counter() - t0:.1f}s"
-    )
+    print(f"module_rmsnorm cold build + first call: {time.perf_counter() - t0:.1f}s")
 
 
 def _fp8_dtype():
