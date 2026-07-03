@@ -113,6 +113,19 @@ def shuffle_weight_gfx1250(w: torch.Tensor) -> torch.Tensor:
     return w
 
 
+def interleave_gate_up_rows(w: torch.Tensor) -> torch.Tensor:
+    """``(E, 2*I, ...)`` GGUU ``[g0..g_{I-1}, u0..u_{I-1}]`` -> GUGU
+    ``[g0, u0, g1, u1, ...]`` (row-level gate/up interleave).
+
+    Shared between ``moe_shuffle_weight`` (which interleaves the stage1 weight
+    rows) and callers that must apply the same interleave to the stage1 ``bias``
+    so it stays aligned with the GUGU output rows the GateMode.INTERLEAVE kernel
+    produces.
+    """
+    inter = w.shape[1] // 2
+    return torch.stack([w[:, :inter], w[:, inter:]], dim=2).flatten(1, 2).contiguous()
+
+
 def moe_shuffle_weight(
     src: torch.Tensor,
     experts_cnt: int = None,
@@ -128,18 +141,9 @@ def moe_shuffle_weight(
     at the row level then the WMMA 16x16 tile shuffle; other archs (e.g. MI355)
     use ``shuffle_weight``'s lane-level interleave. Mirror of ``moe_shuffle_scale``.
     """
-
-    def _interleave_gate_up_rows(w: torch.Tensor) -> torch.Tensor:
-        """``(E, 2*I, ...)`` GGUU ``[g0..g_{I-1}, u0..u_{I-1}]`` -> GUGU
-        ``[g0, u0, g1, u1, ...]`` (row-level gate/up interleave)."""
-        inter = w.shape[1] // 2
-        return (
-            torch.stack([w[:, :inter], w[:, inter:]], dim=2).flatten(1, 2).contiguous()
-        )
-
     if get_gfx() == "gfx1250":
         if is_guinterleave:
-            src = _interleave_gate_up_rows(src)
+            src = interleave_gate_up_rows(src)
         return shuffle_weight(src, layout=layout)
     return shuffle_weight(
         src, layout=layout, is_guinterleave=is_guinterleave, gate_up=gate_up
