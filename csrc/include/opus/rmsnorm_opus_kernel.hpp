@@ -4,9 +4,12 @@
 // OPUS RMSNorm device kernels. 2D block: x = threads/row, y = rows/block.
 #pragma once
 
-// Pin fp32->bf16 to round-to-nearest-even (must precede opus.hpp).
+// fp32->bf16 store rounding (must precede opus.hpp). Use truncate (2), matching the CK/HIP
+// reference: RNE (0) has no hardware bf16-cvt on gfx942 and lowers to a ~6-op/element
+// software sequence, making bf16 output/residual stores ~2x slower there (gfx950 has the
+// hardware cvt so RNE is free, but truncate matches the reference on both).
 #ifndef OPUS_FP32_to_BF16_DEFAULT
-#define OPUS_FP32_to_BF16_DEFAULT 0
+#define OPUS_FP32_to_BF16_DEFAULT 2
 #endif
 #include "opus/opus.hpp"
 #include "opus/opus_vec_io.hpp"
