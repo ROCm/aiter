@@ -264,29 +264,46 @@ inline void launch_arq_io(void* out, void* rout, void* scale, const void* in, co
                           int in_s, int rin_s, int rout_s, int out_s, int group, int shuffle,
                           int gemma, int cu_num, hipStream_t s)
 {
-#define ARQ(BLK, TDS)                                                                          \
-    hipLaunchKernelGGL((add_rmsnorm_quant_opus<arq_opus_traits<in_t, out_t, BLK, TDS>>),       \
-                       dim3(m), dim3(BLK), 0, s, out, rout, scale, in, rin, w, xsc, epsilon, m, \
+    constexpr bool QUANT = !std::is_same_v<out_t, in_t>;
+#define ARQ(BLK, TDS, ILV)                                                                        \
+    hipLaunchKernelGGL((add_rmsnorm_quant_opus<arq_opus_traits<in_t, out_t, BLK, TDS, ILV>>),     \
+                       dim3(m), dim3(BLK), 0, s, out, rout, scale, in, rin, w, xsc, epsilon, m,   \
                        n, qmax, in_s, rin_s, rout_s, out_s, group, shuffle, gemma)
-    if(group > 0)
+    // interleave: coalesced strided layout. Grouped quant with TDS>8 keeps the
+    // contiguous layout (ILV=false) for group locality; everything else interleaves.
+#define ARQ2(BLK, TDS)                                                                             \
+    do                                                                                             \
+    {                                                                                              \
+        if constexpr((TDS) > 8 && QUANT)                                                           \
+        {                                                                                          \
+            if(group > 0)                                                                          \
+                ARQ(BLK, TDS, false);                                                              \
+            else                                                                                   \
+                ARQ(BLK, TDS, true);                                                               \
+        }                                                                                          \
+        else                                                                                       \
+            ARQ(BLK, TDS, true);                                                                   \
+    } while(0)
+    if(n <= 512)
+        ARQ2(64, 8);
+    else if(n <= 1024)
+        ARQ2(128, 8);
+    else if(n <= 2048)
+        ARQ2(256, 8);
+    else if(n <= 4096)
+        ARQ2(256, 16);
+    else if(n <= 6144)
+        ARQ2(256, 24);
+    else if(group > 0) // 6144 < n <= 8192, grouped: switch config for group reduction
     {
         if(cu_num < 160)
-            ARQ(512, 16);
+            ARQ(512, 16, false);
         else
-            ARQ(1024, 8);
+            ARQ(1024, 8, true);
     }
-    else if(n <= 512)
-        ARQ(64, 8);
-    else if(n <= 1024)
-        ARQ(128, 8);
-    else if(n <= 2048)
-        ARQ(256, 8);
-    else if(n <= 4096)
-        ARQ(256, 16);
-    else if(n <= 6144)
-        ARQ(256, 24);
     else
-        ARQ(256, 32);
+        ARQ(256, 32, true);
+#undef ARQ2
 #undef ARQ
 }
 

@@ -9,6 +9,7 @@
 #define OPUS_FP32_to_BF16_DEFAULT 0
 #endif
 #include "opus/opus.hpp"
+#include "opus/opus_vec_io.hpp"
 #include "opus/rmsnorm_opus_quant_detail.hpp"
 
 namespace aiter {
@@ -77,16 +78,19 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out,
                                         int model_sensitive);
 
 // Faithful opus port of add_rmsnorm_quant_kernel (module_rmsnorm_quant): one row
-// per block, thread tid owns TDS contiguous elements, so a group of group_size
-// elements = reduce_thread_size = group_size/TDS contiguous lanes. Covers no-quant,
-// per-token & grouped int8/fp8/fp4, fused-add, gemma, smooth, shuffle, strided rows.
-template <typename In, typename Out, int Blk, int Tds>
+// per block. Uses the coalesced load_vector_nbytes/store_vector IO layer (opus_vec_io).
+// Per-token quant (group==0) loads interleaved for coalescing; grouped quant keeps
+// contiguous per-thread ownership (ILV=false) so a group of group_size elements =
+// reduce_thread_size = group_size/TDS contiguous lanes. Covers no-quant, per-token &
+// grouped int8/fp8/fp4, fused-add, gemma, shuffle, strided rows.
+template <typename In, typename Out, int Blk, int Tds, bool Interleave>
 struct arq_opus_traits
 {
-    using in_t               = In;
-    using out_t              = Out;
-    static constexpr int BLK = Blk;
-    static constexpr int TDS = Tds;
+    using in_t                = In;
+    using out_t               = Out;
+    static constexpr int BLK  = Blk;
+    static constexpr int TDS  = Tds;
+    static constexpr bool ILV = Interleave;
 };
 template <typename Traits>
 __global__ void add_rmsnorm_quant_opus(void* __restrict__ out,
@@ -162,6 +166,39 @@ __device__ inline float block_reduce(float v)
         opus::sync_threads();
     }
     return s[base];
+}
+
+// Fast 1D block reduction: shfl butterfly within a warp (no LDS/barrier), then a
+// single LDS exchange across warps. Matches the reference DPP-reduce latency, which
+// dominates the memory-light per-token/no-add quant paths. All lanes get the result.
+template <bool IS_MAX>
+__device__ inline float block_reduce_1d(float v)
+{
+    constexpr int W = opus::get_warp_size();
+    const int lane  = opus::lane_id();
+    const int nwarp = opus::block_size_x() / W;
+#pragma unroll
+    for(int k = W >> 1; k > 0; k >>= 1)
+    {
+        float o = opus::shfl(v, lane ^ k);
+        v       = IS_MAX ? fmaxf(v, o) : v + o;
+    }
+    if(nwarp == 1)
+        return v;
+    __shared__ float s[64];
+    const int warp = opus::thread_id_x() / W;
+    opus::sync_threads(); // leading barrier: s[] is reused across the sum + max reduces
+    if(lane == 0)
+        s[warp] = v;
+    opus::sync_threads();
+    float r = (lane < nwarp) ? s[lane] : (IS_MAX ? -3.4e38f : 0.0f);
+#pragma unroll
+    for(int k = W >> 1; k > 0; k >>= 1)
+    {
+        float o = opus::shfl(r, lane ^ k);
+        r       = IS_MAX ? fmaxf(r, o) : r + o;
+    }
+    return r; // every lane holds the full-block reduction
 }
 
 template <typename scalar_t, int width>
@@ -586,81 +623,100 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
 {
     using in_t         = typename Traits::in_t;
     using out_t        = typename Traits::out_t;
+    constexpr int BLK  = Traits::BLK;
     constexpr int TDS  = Traits::TDS;
+    constexpr bool ILV = Traits::ILV;
     constexpr bool FP4 = std::is_same_v<out_t, opus::fp4_t>;
     constexpr bool QNT = !std::is_same_v<out_t, in_t>; // quant when out dtype != in
     const bool ADD     = rin_ != nullptr;              // fused-add when residual given
+    (void)xscale_;                                     // smooth quant lives in module_rmsnorm
     const int row      = opus::block_id_x();
     if(row >= m)
         return;
-    const int tid     = opus::thread_id_x();
-    const int col0    = tid * TDS; // first element this thread owns
-    const float goff  = gemma ? 1.0f : 0.0f;
-    const bool smooth = xscale_ != nullptr;
-    const in_t* in    = reinterpret_cast<const in_t*>(in_) + (size_t)row * in_s;
-    const in_t* rin   = reinterpret_cast<const in_t*>(rin_) + (size_t)row * rin_s;
-    const in_t* w     = reinterpret_cast<const in_t*>(w_);
-    const float* xsc  = reinterpret_cast<const float*>(xscale_);
+    const int tid    = opus::thread_id_x();
+    const float goff = gemma ? 1.0f : 0.0f;
 
-    float f[TDS]; // fp32 norm-input; residual stored as round(x+res)
-#pragma unroll
-    for(int j = 0; j < TDS; ++j)
+    // Vectorized coalesced IO, mirroring add_rmsnorm_quant_kernel (opus_vec_io layer).
+    using out_store_t = std::conditional_t<FP4, uint8_t, out_t>;
+    constexpr int load_chunk_bytes = (sizeof(in_t) * TDS % 16 == 0) ? 16 : 8;
+    constexpr int load_vec_size    = load_chunk_bytes / sizeof(in_t);
+    constexpr int num_load_inst    = TDS / load_vec_size;
+    constexpr int load_aux         = (num_load_inst > 1 && !ILV) ? RT : GROUP_NT;
+    constexpr int ISZ              = opus::get_warp_size(); // interleave_thread_size
+    constexpr int ooba_i           = 4 / sizeof(in_t);
+    const int oob_i                = (n + ooba_i - 1) / ooba_i * ooba_i;
+
+    // Interleaved (per-token) layout permutes each thread's columns for coalescing;
+    // contiguous (grouped) layout keeps tid's TDS columns adjacent for group reduction.
+    const int row_offset = (ILV && num_load_inst > 1)
+                               ? (tid % ISZ * load_vec_size + tid / ISZ * ISZ * TDS)
+                               : (tid * TDS);
+    const int col0 = tid * TDS; // logical first column (grouped layout / guards)
+
+    auto buf_i = opus::make_gmem<in_t>(reinterpret_cast<const in_t*>(in_) + (size_t)row * in_s,
+                                       oob_i * sizeof(in_t));
+    auto buf_w = opus::make_gmem<in_t>(reinterpret_cast<const in_t*>(w_), oob_i * sizeof(in_t));
+    auto td_i  = load_vector_nbytes<in_t, TDS, load_chunk_bytes, load_aux, ILV, ISZ>(buf_i, row_offset);
+    auto td_w  = load_vector_nbytes<in_t, TDS, load_chunk_bytes, RT, ILV, ISZ>(buf_w, row_offset);
+
+    opus::vector_t<float, TDS> f; // fp32 norm-input; residual stored as round(x+res)
+    if(ADD)
     {
-        int c   = col0 + j;
-        float x = (c < n) ? opus::cast<float>(in[c]) : 0.0f;
-        if(ADD)
-        {
-            if(c < n)
-            {
-                x += opus::cast<float>(rin[c]);
-                reinterpret_cast<in_t*>(rout_)[(size_t)row * rout_s + c] = opus::cast<in_t>(x);
-            }
-        }
-        f[j] = x;
+        auto buf_r = opus::make_gmem<in_t>(reinterpret_cast<const in_t*>(rin_) + (size_t)row * rin_s,
+                                           oob_i * sizeof(in_t));
+        auto td_r =
+            load_vector_nbytes<in_t, TDS, load_chunk_bytes, load_aux, ILV, ISZ>(buf_r, row_offset);
+#pragma unroll
+        for(int j = 0; j < TDS; ++j)
+            f[j] = opus::cast<float>(td_i[j]) + opus::cast<float>(td_r[j]);
+        auto buf_ro = opus::make_gmem<in_t>(reinterpret_cast<in_t*>(rout_) + (size_t)row * rout_s,
+                                            oob_i * sizeof(in_t));
+        store_vector<in_t, float, TDS, load_aux, ILV, ISZ, num_load_inst, in_t>(buf_ro, f,
+                                                                                row_offset);
+    }
+    else
+    {
+#pragma unroll
+        for(int j = 0; j < TDS; ++j)
+            f[j] = opus::cast<float>(td_i[j]);
     }
 
     float sq = 0.0f;
 #pragma unroll
     for(int j = 0; j < TDS; ++j)
         sq += f[j] * f[j];
-    float inv = rsqrtf(block_reduce<false>(sq) / n + epsilon);
+    float inv = rsqrtf(block_reduce_1d<false>(sq) / n + epsilon);
 
-    float nv[TDS]; // normalized: (f*inv) * (w + goff) [* xscale]
 #pragma unroll
-    for(int j = 0; j < TDS; ++j)
-    {
-        int c    = col0 + j;
-        float wv = (c < n) ? (opus::cast<float>(w[c]) + goff) : 0.0f;
-        float v  = f[j] * inv * wv;
-        if(smooth && c < n)
-            v *= xsc[c];
-        nv[j] = v;
-    }
+    for(int j = 0; j < TDS; ++j) // normalized: (f*inv) * (w + goff)
+        f[j] = f[j] * inv * (opus::cast<float>(td_w[j]) + goff);
+
+    constexpr int ooba_o = 4 / sizeof(out_store_t);
+    const int oob_o      = (n + ooba_o - 1) / ooba_o * ooba_o;
 
     if constexpr(!QNT)
     {
-        out_t* o = reinterpret_cast<out_t*>(out_) + (size_t)row * out_s;
-#pragma unroll
-        for(int j = 0; j < TDS; ++j)
-            if(col0 + j < n)
-                o[col0 + j] = opus::cast<out_t>(nv[j]);
+        auto buf_o = opus::make_gmem<out_store_t>(
+            reinterpret_cast<out_store_t*>(out_) + (size_t)row * out_s, oob_o * sizeof(out_store_t));
+        store_vector<out_store_t, float, TDS, RT, ILV, ISZ, num_load_inst, out_t>(buf_o, f,
+                                                                                  row_offset);
         return;
     }
 
     float tmax = 1e-10f;
 #pragma unroll
     for(int j = 0; j < TDS; ++j)
-        tmax = fmaxf(tmax, fabsf(nv[j]));
+        tmax = fmaxf(tmax, fabsf(f[j]));
 
     const float qm = FP4 ? 6.0f : qmax;
-    float yscale, inv_ys;
+    float inv_ys; // store scale factor passed to store_vector (fp4: forward e8m0)
     if(group_size == 0)
     {
-        float gmax = block_reduce<true>(tmax);
-        yscale     = gmax / qm;
-        inv_ys     = yscale > 0.0f ? 1.0f / yscale : 0.0f;
+        float gmax  = block_reduce_1d<true>(tmax);
+        float ys    = gmax / qm;
+        inv_ys      = ys > 0.0f ? 1.0f / ys : 0.0f;
         if(tid == 0 && scale_)
-            reinterpret_cast<float*>(scale_)[row] = yscale;
+            reinterpret_cast<float*>(scale_)[row] = ys;
     }
     else
     {
@@ -670,15 +726,16 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
         for(int k = 1; k < 64; k <<= 1)
             if(k < rts)
                 tmax = fmaxf(tmax, opus::shfl(tmax, lane ^ k));
+        float ys;
         if constexpr(FP4)
         {
-            yscale = fp4_e8m0_scale(tmax);
-            inv_ys = yscale; // opus fp4 packer takes the forward scale
+            ys     = fp4_e8m0_scale(tmax);
+            inv_ys = ys; // opus fp4 packer takes the forward scale
         }
         else
         {
-            yscale = tmax / qm;
-            inv_ys = yscale > 0.0f ? 1.0f / yscale : 0.0f;
+            ys     = tmax / qm;
+            inv_ys = ys > 0.0f ? 1.0f / ys : 0.0f;
         }
         if((tid % rts) == 0 && col0 < n && scale_)
         {
@@ -686,40 +743,23 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
             int groups = n / group_size;
             if constexpr(FP4)
             {
-                int sp     = shuffle ? (groups + 7) / 8 * 8 : groups;
-                size_t si  = shuffle ? (size_t)mx_scale_shuffle_idx(sp, row, y) : (size_t)row * sp + y;
-                reinterpret_cast<unsigned char*>(scale_)[si] = e8m0_byte(yscale);
+                int sp    = shuffle ? (groups + 7) / 8 * 8 : groups;
+                size_t si = shuffle ? (size_t)mx_scale_shuffle_idx(sp, row, y) : (size_t)row * sp + y;
+                reinterpret_cast<unsigned char*>(scale_)[si] = e8m0_byte(ys);
             }
             else
             {
                 size_t si = shuffle ? (size_t)y * m + row : (size_t)row * groups + y;
-                reinterpret_cast<float*>(scale_)[si] = yscale;
+                reinterpret_cast<float*>(scale_)[si] = ys;
             }
         }
     }
 
-    if constexpr(FP4)
-    {
-#if defined(__gfx950__) // fp32_to_fp4 (cvt_scalef32) is gfx950-only; fp4 unused elsewhere
-        unsigned char* o = reinterpret_cast<unsigned char*>(out_) + (size_t)row * out_s + col0 / 2;
-#pragma unroll
-        for(int j = 0; j < TDS; j += 2)
-            if(col0 + j < n)
-            {
-                opus::fp32x2_t pr = {nv[j], nv[j + 1]};
-                auto b            = opus::fp32_to_fp4_packed_x2(pr, inv_ys);
-                o[j / 2]          = __builtin_bit_cast(unsigned char, b);
-            }
-#endif
-    }
-    else
-    {
-        out_t* o = reinterpret_cast<out_t*>(out_) + (size_t)row * out_s + col0;
-#pragma unroll
-        for(int j = 0; j < TDS; ++j)
-            if(col0 + j < n)
-                o[j] = quant_cast<out_t>(nv[j] * inv_ys);
-    }
+    const int store_off = FP4 ? row_offset / 2 : row_offset;
+    auto buf_o          = opus::make_gmem<out_store_t>(
+        reinterpret_cast<out_store_t*>(out_) + (size_t)row * out_s, oob_o * sizeof(out_store_t));
+    store_vector<out_store_t, float, TDS, RT, ILV, ISZ, num_load_inst, out_t>(buf_o, f, store_off,
+                                                                              inv_ys);
 }
 
 #endif // __HIP_DEVICE_COMPILE__
