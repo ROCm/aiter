@@ -33,7 +33,7 @@ OPUS_EXPORT void rms_norm_opus(size_t out,
                                int gemma,
                                size_t stream)
 {
-    using namespace aiter::rmsnorm_opus;
+    using namespace aiter;
     if(rows <= 0 || hidden <= 0)
         return;
     auto s  = reinterpret_cast<hipStream_t>(stream);
@@ -54,7 +54,7 @@ OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
                                          int gemma,
                                          size_t stream)
 {
-    using namespace aiter::rmsnorm_opus;
+    using namespace aiter;
     if(rows <= 0 || hidden <= 0)
         return;
     auto s   = reinterpret_cast<hipStream_t>(stream);
@@ -82,7 +82,7 @@ OPUS_EXPORT void rms_norm_quant_opus(size_t out,
                                      int model_sensitive,
                                      size_t stream)
 {
-    using namespace aiter::rmsnorm_opus;
+    using namespace aiter;
     if(rows <= 0 || hidden <= 0)
         return;
     launch_quant(reinterpret_cast<void*>(out),

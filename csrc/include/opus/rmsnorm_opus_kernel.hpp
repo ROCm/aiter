@@ -16,7 +16,6 @@
 #endif
 
 namespace aiter {
-namespace rmsnorm_opus {
 
 // Element aliases (identical to opus REGISTER_DTYPE; local because the host pass
 // cannot include opus.hpp).
@@ -33,21 +32,21 @@ using fp8_t  = _BitInt(8);
 
 // Per-kernel traits: one Traits param carrying the element type(s) + tile consts.
 template <typename Scalar, int Width, bool Gemma = false>
-struct fwd_traits
+struct rmsnorm_opus_traits
 {
     using scalar_t              = Scalar;
     static constexpr int width  = Width;
     static constexpr bool gemma = Gemma; // gemma_norm: multiply by (weight + 1)
 };
 template <typename In, typename Out, int Width>
-struct quant_traits
+struct rmsnorm_quant_opus_traits
 {
     using in_t                 = In;
     using out_t                = Out;
     static constexpr int width = Width;
 };
 template <typename Scalar, int TileN, int RegN>
-struct be_traits
+struct rmsnorm_be_opus_traits
 {
     using scalar_t          = Scalar;
     static constexpr int TN = TileN;
@@ -58,7 +57,7 @@ struct be_traits
 // residual = s (pre-norm), out = rmsnorm(s) * weight (in-place when out == in).
 // model_sensitive != 0 selects the T5 variant (round s*inv to dtype before *w).
 template <typename Traits>
-__global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out,
+__global__ void rmsnorm_opus_kernel(void* __restrict__ out,
                                      const void* __restrict__ in,
                                      const void* __restrict__ weight,
                                      void* __restrict__ residual,
@@ -71,7 +70,7 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out,
 // xscale != 0 smooth (per-col premultiply), unquant != 0 store pre-quant y.
 // out is int8/fp8; yscale is [rows] fp32 (rowmax/qmax).
 template <typename Traits>
-__global__ void rmsnorm2d_quant_kernel(void* __restrict__ out,
+__global__ void rmsnorm_quant_opus(void* __restrict__ out,
                                        void* __restrict__ yscale,
                                        void* __restrict__ unquant,
                                        const void* __restrict__ in,
@@ -88,7 +87,7 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out,
 // for its tile geometry -- TN threads/row x RN width-8 vecs, paired intra-thread
 // sum + within-warp butterfly xor + cross-warp tree over TN/64 warps.
 template <typename Traits>
-__global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out,
+__global__ void rmsnorm_be_opus(void* __restrict__ out,
                                         const void* __restrict__ in,
                                         const void* __restrict__ weight,
                                         void* __restrict__ residual,
@@ -100,17 +99,17 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out,
 #if !defined(__HIP_DEVICE_COMPILE__)
 // Host pass: empty stubs so the __device_stub__ symbols resolve.
 template <typename Traits>
-__global__ void rmsnorm2d_fwd_kernel(void*, const void*, const void*, void*, float, int, int, int)
+__global__ void rmsnorm_opus_kernel(void*, const void*, const void*, void*, float, int, int, int)
 {
 }
 template <typename Traits>
-__global__ void rmsnorm2d_quant_kernel(
+__global__ void rmsnorm_quant_opus(
     void*, void*, void*, const void*, const void*, void*, const void*, float, int, int, float, int)
 {
 }
 template <typename Traits>
 __global__ void
-rmsnorm2d_fwd_be_kernel(void*, const void*, const void*, void*, float, int, int, int)
+rmsnorm_be_opus(void*, const void*, const void*, void*, float, int, int, int)
 {
 }
 #else
@@ -154,7 +153,7 @@ template <typename scalar_t, int width>
 using vec_t = scalar_t __attribute__((ext_vector_type(width)));
 
 template <typename Traits>
-__global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
+__global__ void rmsnorm_be_opus(void* __restrict__ out_,
                                         const void* __restrict__ in_,
                                         const void* __restrict__ weight_,
                                         void* __restrict__ residual_,
@@ -277,7 +276,7 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
 }
 
 template <typename Traits>
-__global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
+__global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
                                      const void* __restrict__ in_,
                                      const void* __restrict__ weight_,
                                      void* __restrict__ residual_,
@@ -396,7 +395,7 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
 }
 
 template <typename Traits>
-__global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
+__global__ void rmsnorm_quant_opus(void* __restrict__ out_,
                                        void* __restrict__ yscale_,
                                        void* __restrict__ unquant_,
                                        const void* __restrict__ in_,
@@ -557,5 +556,4 @@ __global__ void rmsnorm2d_quant_kernel(void* __restrict__ out_,
 
 #endif // __HIP_DEVICE_COMPILE__
 
-} // namespace rmsnorm_opus
 } // namespace aiter

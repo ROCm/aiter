@@ -9,7 +9,6 @@
 #include "opus/rmsnorm_opus_kernel.hpp"
 
 namespace aiter {
-namespace rmsnorm_opus {
 
 // 2D launch geometry: x = threads/row (pow2), y = rows/block. Large hidden -> 1
 // row/block; small hidden packs rows so tiny rows aren't occupancy-bound. tpr
@@ -59,7 +58,7 @@ inline void launch_be(void* out,
     const int tm = (TN > 64) ? 1 : (256 / TN); // rows/block; TN>64 needs 1 row/block
     const dim3 block(TN, tm);
     const dim3 grid((rows + tm - 1) / tm);
-    hipLaunchKernelGGL((rmsnorm2d_fwd_be_kernel<be_traits<scalar_t, TN, RN>>),
+    hipLaunchKernelGGL((rmsnorm_be_opus<rmsnorm_be_opus_traits<scalar_t, TN, RN>>),
                        grid,
                        block,
                        0,
@@ -142,7 +141,7 @@ inline void launch_norm(void* out,
     // gemma is a compile-time template param: GEMMA==false is byte-identical to the
     // pre-gemma kernel (no runtime cost), only gemma launches the (weight+1) variant.
 #define OPUS_LAUNCH_FWD(WIDTH, G)                                                   \
-    hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<fwd_traits<scalar_t, WIDTH, G>>),      \
+    hipLaunchKernelGGL((rmsnorm_opus_kernel<rmsnorm_opus_traits<scalar_t, WIDTH, G>>),      \
                        d.grid, d.block, 0, stream, out, in, weight, residual,       \
                        epsilon, rows, hidden, model_sensitive)
     if(vec)
@@ -183,7 +182,7 @@ inline void launch_quant_t(void* out,
                      (unquant == nullptr || aligned16(unquant));
     const launch_dims d = pick_dims(rows, vec ? hidden / VW : hidden);
     if(vec)
-        hipLaunchKernelGGL((rmsnorm2d_quant_kernel<quant_traits<in_t, out_t, VW>>),
+        hipLaunchKernelGGL((rmsnorm_quant_opus<rmsnorm_quant_opus_traits<in_t, out_t, VW>>),
                            d.grid,
                            d.block,
                            0,
@@ -201,7 +200,7 @@ inline void launch_quant_t(void* out,
                            qmax,
                            model_sensitive);
     else
-        hipLaunchKernelGGL((rmsnorm2d_quant_kernel<quant_traits<in_t, out_t, 1>>),
+        hipLaunchKernelGGL((rmsnorm_quant_opus<rmsnorm_quant_opus_traits<in_t, out_t, 1>>),
                            d.grid,
                            d.block,
                            0,
@@ -264,5 +263,4 @@ inline void launch_quant(void* out,
 #undef OPUS_QUANT
 }
 
-} // namespace rmsnorm_opus
 } // namespace aiter
