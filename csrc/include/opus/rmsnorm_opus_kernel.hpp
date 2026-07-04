@@ -742,10 +742,11 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
     for(int j = 0; j < TDS; ++j)
         tmax = fmaxf(tmax, fabsf(f[j]));
 
-    // Fast reciprocals (v_rcp_f32), matching the reference: it stores max*(1/qmax) and
-    // quantizes with v_rcp(scale). Full IEEE divides here cost ~10 VALU each and, on the
-    // latency-bound small-n paths, are the main gap vs module_rmsnorm_quant.
-    const float iqm = FP4 ? 0.0f : __builtin_amdgcn_rcpf(qmax); // 1/qmax (unused for fp4)
+    // Reciprocal quant scaling, matching the reference (max*(1/qmax), quantize via
+    // v_rcp(scale)): avoids full IEEE divides (~10 VALU each) that dominate the
+    // latency-bound small-n paths. qmax_ carries the EXACT host-computed 1/qmax so the
+    // stored scale is bit-accurate (an approximate rcpf here flips int8 roundings).
+    const float iqm = FP4 ? 0.0f : qmax; // qmax param = 1/qmax (unused for fp4)
     float inv_ys; // store scale factor passed to store_vector (fp4: forward e8m0)
     if(group_size == 0)
     {

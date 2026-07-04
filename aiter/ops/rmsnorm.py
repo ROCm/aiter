@@ -478,6 +478,20 @@ def _out_code_qmax(out_dtype):
     return 2, 6.0  # fp4x2 (MXFP4, e8m0 block scale)
 
 
+# Cache the CU count per device: get_device_properties() is an expensive host query
+# that would otherwise dominate the small-n kernels (few-us) on every call.
+_CU_NUM: dict = {}
+
+
+def _cu_num(device) -> int:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cu = _CU_NUM.get(idx)
+    if cu is None:
+        cu = torch.cuda.get_device_properties(idx).multi_processor_count
+        _CU_NUM[idx] = cu
+    return cu
+
+
 def _arq(
     out,
     input,
@@ -496,7 +510,10 @@ def _arq(
     n = input.shape[-1]
     m = input.numel() // n
     add = residual_in is not None
-    cu = torch.cuda.get_device_properties(input.device).multi_processor_count
+    cu = _cu_num(input.device)
+    # pass the EXACT reciprocal of qmax: the kernel scales by it (max*(1/qmax)); an
+    # in-kernel approximate reciprocal would flip int8 roundings at boundaries.
+    inv_qmax = 1.0 / qmax if qmax > 0 else 0.0
     _add_rmsnorm_quant_opus_raw(
         out.data_ptr(),
         residual_out.data_ptr() if add else 0,
@@ -508,7 +525,7 @@ def _arq(
         float(epsilon),
         m,
         n,
-        float(qmax),
+        float(inv_qmax),
         _DTYPE_CODE[input.dtype],
         out_code,
         input.stride(0),
