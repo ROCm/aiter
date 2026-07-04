@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# A4W4 (F4GEMM) test/benchmark for gfx1250 (mi400), modeled on test_gemm_a4w4.py
+# A4W4 (F4GEMM) test/benchmark for gfx1250, modeled on test_gemm_a4w4.py
 # and the aiter-op-test standard (candidates dict + run_perftest loop, a torch
 # reference that is only compared (never timed/tabled), TFLOPS + TB/s per
 # candidate, one markdown summary table, and a __main__ guard).
 #
-# Two candidates per (intype, shape, apre) row -- both resolve to the same mi400
-# F4GEMM .co but exercise different entrypoints:
+# Two candidates per (intype, shape, apre) row -- both resolve to the same
+# gfx1250 F4GEMM .co but exercise different entrypoints:
 #   gemm_a4w4 : the unified API the model calls (C++ heuristic picks the tile)
 #   asm       : the low-level asm entry with the tile kernel forced by name
 #
@@ -32,7 +32,7 @@ torch.set_printoptions(sci_mode=False)
 pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 
-SUPPORTED_GFX = ["gfx1250"]  # mi400-only F4GEMM (preload SGPR) path
+SUPPORTED_GFX = ["gfx1250"]  # gfx1250-only F4GEMM (preload SGPR) path
 MXFP4_SCALE_BLOCK = 32
 NVFP4_SCALE_BLOCK = 16
 
@@ -61,7 +61,7 @@ def run_torch_nvfp4(xq, wq, xs, ws, gA, gB, dtype):
 
 def _prep_mxfp4(M, N, K, apre, dtype, init):
     if init == "random":
-        # Reuse the per_1x32 e8m0 quant (same block-32 scales the mi400 mxfp4
+        # Reuse the per_1x32 e8m0 quant (same block-32 scales the mxfp4
         # kernel expects); only the shuffle differs from the gfx950 path.
         quant = aiter.get_triton_quant(aiter.QuantType.per_1x32)
         x = torch.randn((M, K), dtype=dtype)
@@ -196,7 +196,7 @@ def main():
     # so an in-fn return would still emit an args-only NaN row.
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "gemm_a4w4 (mi400 F4GEMM) unsupported on %s; skipping", get_gfx()
+            "gemm_a4w4 (F4GEMM) unsupported on %s; skipping", get_gfx()
         )
         return
 
@@ -258,7 +258,7 @@ def main():
         ]
         df = pd.DataFrame(rows)
         aiter.logger.info(
-            "gemm_a4w4_mi400 summary (markdown):\n%s", df.to_markdown(index=False)
+            "gemm_a4w4 (F4GEMM) summary (markdown):\n%s", df.to_markdown(index=False)
         )
 
 
