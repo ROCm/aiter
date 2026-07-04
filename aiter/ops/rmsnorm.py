@@ -510,7 +510,12 @@ def _arq(
     shuffle_scale=False,
     gemma_norm=False,
 ):
-    assert input.dtype in _DTYPE_CODE and input.is_contiguous()
+    assert input.dtype in _DTYPE_CODE
+    # The kernel handles a row stride (in_s below), so a row-contiguous strided view
+    # (e.g. a torch.split slice from fused_qk_rmsnorm) is fine; only materialize when
+    # the last dim itself is strided.
+    if input.stride(-1) != 1:
+        input = input.contiguous()
     n = input.shape[-1]
     m = input.numel() // n
     add = residual_in is not None
