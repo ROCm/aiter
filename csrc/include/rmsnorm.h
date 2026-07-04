@@ -7,19 +7,14 @@
 #pragma once
 #include "opus/hip_minimal.hpp" // dim3, hipStream_t, hipLaunchKernelGGL (both passes)
 #include "opus/rmsnorm_opus_kernel.hpp"
+#include <utility> // std::pair (structured-binding launch geometry)
 
 namespace aiter {
 
-// 2D launch geometry: x = threads/row (pow2), y = rows/block. Large hidden -> 1
-// row/block; small hidden packs rows so tiny rows aren't occupancy-bound. tpr
-// targets ~2 vectors/thread (vhid = hidden/width).
-struct launch_dims
-{
-    dim3 block;
-    dim3 grid;
-};
-
-inline launch_dims pick_dims(int rows, int vhid)
+// 2D launch geometry as (block, grid): x = threads/row (pow2), y = rows/block.
+// Large hidden -> 1 row/block; small hidden packs rows so tiny rows aren't
+// occupancy-bound. tpr targets ~2 vectors/thread (vhid = hidden/width).
+inline std::pair<dim3, dim3> pick_dims(int rows, int vhid)
 {
     const int budget = (rows < 256) ? 1024 : 256; // total threads per block
     const int want   = (vhid + 1) / 2;            // ~2 vectors per thread
@@ -136,13 +131,13 @@ inline void launch_norm(void* out,
                out, in, weight, residual, epsilon, rows, hidden, model_sensitive, stream))
             return;
     }
-    const bool vec      = (hidden % VW == 0) && aligned;
-    const launch_dims d = pick_dims(rows, vec ? hidden / VW : hidden);
+    const bool vec           = (hidden % VW == 0) && aligned;
+    const auto [block, grid] = pick_dims(rows, vec ? hidden / VW : hidden);
     // gemma is a compile-time template param: GEMMA==false is byte-identical to the
     // pre-gemma kernel (no runtime cost), only gemma launches the (weight+1) variant.
 #define OPUS_LAUNCH_FWD(WIDTH, G)                                                   \
     hipLaunchKernelGGL((rmsnorm_opus_kernel<rmsnorm_opus_traits<scalar_t, WIDTH, G>>),      \
-                       d.grid, d.block, 0, stream, out, in, weight, residual,       \
+                       grid, block, 0, stream, out, in, weight, residual,           \
                        epsilon, rows, hidden, model_sensitive)
     if(vec)
     {
@@ -180,11 +175,11 @@ inline void launch_quant_t(void* out,
     const bool vec = (hidden % VW == 0) && aligned16(out) && aligned16(in) && aligned16(weight) &&
                      (residual == nullptr || aligned16(residual)) &&
                      (unquant == nullptr || aligned16(unquant));
-    const launch_dims d = pick_dims(rows, vec ? hidden / VW : hidden);
+    const auto [block, grid] = pick_dims(rows, vec ? hidden / VW : hidden);
     if(vec)
         hipLaunchKernelGGL((rmsnorm_quant_opus<rmsnorm_quant_opus_traits<in_t, out_t, VW>>),
-                           d.grid,
-                           d.block,
+                           grid,
+                           block,
                            0,
                            stream,
                            out,
@@ -201,8 +196,8 @@ inline void launch_quant_t(void* out,
                            model_sensitive);
     else
         hipLaunchKernelGGL((rmsnorm_quant_opus<rmsnorm_quant_opus_traits<in_t, out_t, 1>>),
-                           d.grid,
-                           d.block,
+                           grid,
+                           block,
                            0,
                            stream,
                            out,
