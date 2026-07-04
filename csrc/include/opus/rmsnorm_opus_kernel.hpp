@@ -48,6 +48,7 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out,
                                      float epsilon,
                                      int rows,
                                      int hidden,
+                                     int in_s,
                                      int model_sensitive);
 
 // rmsnorm + dynamic/smooth quant (out int8/fp8, yscale [rows]). Pointer flags:
@@ -76,12 +77,13 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out,
                                         float epsilon,
                                         int rows,
                                         int hidden,
+                                        int in_s,
                                         int model_sensitive);
 
 #if !defined(__HIP_DEVICE_COMPILE__)
 // Host pass: empty stubs so the __device_stub__ symbols resolve.
 template <typename Traits>
-__global__ void rmsnorm_opus_kernel(void*, const void*, const void*, void*, float, int, int, int)
+__global__ void rmsnorm_opus_kernel(void*, const void*, const void*, void*, float, int, int, int, int)
 {
 }
 template <typename Traits>
@@ -91,7 +93,7 @@ __global__ void rmsnorm_quant_opus(
 }
 template <typename Traits>
 __global__ void
-rmsnorm_be_opus(void*, const void*, const void*, void*, float, int, int, int)
+rmsnorm_be_opus(void*, const void*, const void*, void*, float, int, int, int, int)
 {
 }
 #else
@@ -140,6 +142,7 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
                                         float epsilon,
                                         int rows,
                                         int hidden,
+                                        int in_s,
                                         int model_sensitive)
 {
     using scalar_t    = typename Traits::scalar_t;
@@ -151,10 +154,12 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
     const int nx      = opus::thread_id_x(); // 0..TN-1, thread within row
     const int row     = opus::block_id_x() * opus::block_size_y() + opus::thread_id_y();
     const bool active = row < rows;
-    const size_t roff = (size_t)(active ? row : 0) * hidden;
+    // out/residual are contiguous (row*hidden); input may be row-strided (row*in_s).
+    const size_t roff   = (size_t)(active ? row : 0) * hidden;
+    const size_t roff_i = (size_t)(active ? row : 0) * in_s;
 
     auto* out_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(out_) + roff);
-    const auto* in_v = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(in_) + roff);
+    const auto* in_v = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(in_) + roff_i);
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
 
@@ -260,6 +265,7 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
                                      float epsilon,
                                      int rows,
                                      int hidden,
+                                     int in_s,
                                      int model_sensitive)
 {
     using scalar_t        = typename Traits::scalar_t;
@@ -274,10 +280,12 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
     const int row        = opus::block_id_x() * opus::block_size_y() + opus::thread_id_y();
     const int vec_hidden = hidden / width;
     const bool active    = row < rows;
+    // out/residual are contiguous (row*hidden); input may be row-strided (row*in_s).
     const size_t roff    = (size_t)(active ? row : 0) * hidden;
+    const size_t roff_i  = (size_t)(active ? row : 0) * in_s;
 
     auto* out_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(out_) + roff);
-    const auto* in_v = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(in_) + roff);
+    const auto* in_v = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(in_) + roff_i);
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
 
