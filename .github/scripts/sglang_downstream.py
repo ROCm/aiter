@@ -61,7 +61,8 @@ TESTS = [
         "timeout_minutes": 100,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35 --nightly --timeout-per-file 3600",
-        "run_on_pr": True,
+        "run_on_pr": False,
+        "comment": "Run in nightly first while failures are investigated.",
         "run_on_schedule": True,
     },
     {
@@ -87,7 +88,8 @@ TESTS = [
         "timeout_minutes": 70,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600",
-        "run_on_pr": True,
+        "run_on_pr": False,
+        "comment": "Run in nightly first while failures are investigated.",
         "run_on_schedule": True,
     },
     {

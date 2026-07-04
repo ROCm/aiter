@@ -1076,10 +1076,10 @@ def gemm_a8w8_bpreshuffle_cktile_tune(
 
 
 # ---------------------------------------------------------------------------
-# gfx1250 (mi400) MXFP8 x MXFP8 GEMM (a8w8) -- ASM, kernarg preload mode.
+# gfx1250 MXFP8 x MXFP8 GEMM (a8w8) -- ASM, kernarg preload mode.
 # A (activation) and B (weight) are both mxfp8 (e4m3) with OCP MX e8m0 block
 # scales (block=32). Kernel variant is auto-selected by the .cu heuristic
-# unless an explicit kernelName is given. See asm_mxfp8fp4gemm_mi400.cu.
+# unless an explicit kernelName is given. See asm_mxfp8fp4gemm.cu.
 # ---------------------------------------------------------------------------
 @compile_ops(
     "module_mxfp8fp4gemm_asm",
