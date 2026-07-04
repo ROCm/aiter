@@ -1,28 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// OPUS RMSNorm device kernels. opus.hpp is device-pass only (its device builtins
-// break the host pass), so the host launcher uses the local element aliases below
-// (identical to opus REGISTER_DTYPE). 2D block: x = threads/row, y = rows/block.
+// OPUS RMSNorm device kernels. 2D block: x = threads/row, y = rows/block.
 #pragma once
 
-// Pin fp32->bf16 to round-to-nearest-even (opus defaults to truncate on gfx94x);
-// must precede opus.hpp so opus::cast<bf16_t>() matches CK/torch on every arch.
+// Pin fp32->bf16 to round-to-nearest-even (must precede opus.hpp).
 #ifndef OPUS_FP32_to_BF16_DEFAULT
 #define OPUS_FP32_to_BF16_DEFAULT 0
 #endif
-// opus.hpp on both passes: host-safe since ROCm 7.2 / #4056 gated the device-only
-// TDM builtin, so the host launcher can source its element types from opus (below).
 #include "opus/opus.hpp"
 
 namespace aiter {
 
-// This header is the device kernel impl: it works in template element types
-// (Traits::scalar_t / in_t / out_t) plus builtin float, so it needs no element-type
-// aliases. The host-facing dtype vocabulary (bf16_t/fp16_t/fp32_t/i8_t/fp8_t, used
-// only to instantiate the launchers) lives in rmsnorm.h.
-
-// Per-kernel traits: one Traits param carrying the element type(s) + tile consts.
+// Per-kernel traits carrying the element type(s) + tile consts.
 template <typename Scalar, int Width, bool Gemma = false>
 struct rmsnorm_opus_traits
 {
@@ -45,9 +35,8 @@ struct rmsnorm_be_opus_traits
     static constexpr int RN = RegN;
 };
 
-// rmsnorm, optionally fused with a residual add. residual != 0: s = in + residual,
-// residual = s (pre-norm), out = rmsnorm(s) * weight (in-place when out == in).
-// model_sensitive != 0 selects the T5 variant (round s*inv to dtype before *w).
+// rmsnorm (+ residual add when residual != 0, in-place when out == in);
+// model_sensitive != 0 = T5 variant (round s*inv before *w).
 template <typename Traits>
 __global__ void rmsnorm_opus_kernel(void* __restrict__ out,
                                      const void* __restrict__ in,
@@ -58,9 +47,8 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out,
                                      int hidden,
                                      int model_sensitive);
 
-// rmsnorm + dynamic/smooth quant. Flags via pointers: residual != 0 fused-add,
-// xscale != 0 smooth (per-col premultiply), unquant != 0 store pre-quant y.
-// out is int8/fp8; yscale is [rows] fp32 (rowmax/qmax).
+// rmsnorm + dynamic/smooth quant (out int8/fp8, yscale [rows]). Pointer flags:
+// residual != 0 fused-add, xscale != 0 smooth, unquant != 0 store pre-quant y.
 template <typename Traits>
 __global__ void rmsnorm_quant_opus(void* __restrict__ out,
                                        void* __restrict__ yscale,
@@ -75,9 +63,8 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out,
                                        float qmax,
                                        int model_sensitive);
 
-// Bit-exact vs CK rmsnorm (+ optional fused-add): reproduces CK's square_sum order
-// for its tile geometry -- TN threads/row x RN width-8 vecs, paired intra-thread
-// sum + within-warp butterfly xor + cross-warp tree over TN/64 warps.
+// Bit-exact vs CK: reproduces CK's square_sum order for its tile geometry
+// (TN threads/row x RN width-8 vecs).
 template <typename Traits>
 __global__ void rmsnorm_be_opus(void* __restrict__ out,
                                         const void* __restrict__ in,
@@ -115,8 +102,7 @@ __device__ inline out_t quant_cast(float v)
         return opus::fp32_to_fp8(v);
 }
 
-// Per-row (segmented) sequential-addressing LDS reduction over blockDim.x threads;
-// bank-conflict-free and deterministic (all rows step the same stride sequence).
+// Per-row segmented LDS reduction; deterministic (all rows step the same strides).
 template <bool IS_MAX>
 __device__ inline float block_reduce(float v)
 {
@@ -124,8 +110,7 @@ __device__ inline float block_reduce(float v)
     const int lane = opus::thread_id_x();
     const int tpr  = opus::block_size_x();
     const int base = opus::thread_id_y() * tpr;
-    // Barrier before reusing s[]: stops a fast lane overwriting s[base] while a
-    // slow lane still reads it from a prior reduce (raced on gfx942).
+    // leading barrier: reuse of s[] across two reduces races on gfx942 without it
     opus::sync_threads();
     s[base + lane] = v;
     opus::sync_threads();
@@ -170,9 +155,7 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
 
-    // fp32 norm-input as a scalar array (not a vector) so the compiler cannot
-    // reorder the squared-sum. Fused-add stores round(x+res) to residual; norm
-    // uses the fp32 sum (default) or the rounded sum (T5).
+    // fp32 norm-input as a scalar array so the compiler can't reorder the sum.
     float ni[RN][8];
 #pragma unroll
     for(int q = 0; q < RN; ++q)
@@ -198,8 +181,7 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
         }
     }
 
-    // intra-thread squared-sum in CK's order: T5 sums pairs (a0^2+a1^2), default
-    // one element at a time.
+    // squared-sum in CK's order: T5 sums pairs, default one at a time.
     float sq = 0.0f;
     if(t5)
     {
@@ -296,8 +278,7 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
 
-    // fp32 norm-input cached in registers (overflow reloads). Fused-add stores
-    // round(x+res) to residual; norm uses fp32 sum (default) or rounded sum (T5).
+    // fp32 norm-input cached in registers (overflow reloads).
     constexpr int CACHE_V = 4;
     Vf cache[CACHE_V];
     float acc    = 0.0f;
@@ -366,8 +347,7 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
             float xi = ni[j] * inv;
             if(t5)
                 xi = opus::cast<float>(opus::cast<scalar_t>(xi));
-            // gemma_norm folds (weight + 1) at compile time; GEMMA==false is
-            // byte-identical to the non-gemma kernel (no extra add).
+            // GEMMA folds (weight + 1) at compile time; GEMMA==false adds nothing.
             if constexpr(GEMMA)
                 y[j] = opus::cast<scalar_t>(xi * (opus::cast<float>(w[j]) + 1.0f));
             else

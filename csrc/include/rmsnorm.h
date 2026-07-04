@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// OPUS RMSNorm host-side launch helpers. Torch-free / HIP-runtime-free: only
-// opus/hip_minimal.hpp + opus.hpp (via the kernel header); tensors cross as raw
-// pointers + dims.
+// OPUS RMSNorm host-side launch helpers (torch-free; raw pointers + dims).
 #pragma once
 #include "opus/hip_minimal.hpp" // dim3, hipStream_t, hipLaunchKernelGGL (both passes)
 #include "opus/rmsnorm_opus_kernel.hpp"
@@ -11,23 +9,19 @@
 
 namespace aiter {
 
-// Element-type vocabulary for instantiating the kernels below, sourced from opus
-// (single source of truth; opus.hpp is host-includable via rmsnorm_opus_kernel.hpp).
+// Element types for instantiating the kernels, sourced from opus.
 using bf16_t = opus::bf16_t;
 using fp16_t = opus::fp16_t;
 using fp32_t = opus::fp32_t;
 using i8_t   = opus::i8_t;
 using fp8_t  = opus::fp8_t;
 
-// 2D launch geometry as (block, grid): x = threads/row (pow2), y = rows/block.
-// Large hidden -> 1 row/block; small hidden packs rows so tiny rows aren't
-// occupancy-bound. tpr targets ~2 vectors/thread (vhid = hidden/width).
+// Launch geometry (block, grid): x = threads/row, y = rows/block; ~2 vecs/thread.
 inline std::pair<dim3, dim3> pick_dims(int rows, int vhid)
 {
     const int budget = (rows < 256) ? 1024 : 256; // total threads per block
     const int want   = (vhid + 1) / 2;            // ~2 vectors per thread
-    // Cap threads-per-row at 256 (CK's max tile): a single row spanning >256
-    // threads (16+ warps) in the LDS reduction misbehaves on some archs (gfx942).
+    // cap threads/row at 256; wider LDS reductions misbehave on gfx942
     const int tpr_cap = 256;
     int tpr           = 64;
     while(tpr < want && tpr < budget && tpr < tpr_cap)
@@ -110,9 +104,8 @@ inline bool launch_norm_be(void* out,
 #undef OPUS_BE
 }
 
-// rmsnorm (+ fused residual add when residual != nullptr; in-place when out == in).
-// Bit-exact vs CK on the vn=8 tile buckets (2-byte types); generic (formula-exact,
-// <=2 ulp) otherwise. Vector width targets 16-byte access: 8 for bf16/fp16, 4 for fp32.
+// rmsnorm (+ fused add when residual != nullptr). Bit-exact vs CK on the vn=8
+// buckets (2-byte); generic (<=2 ulp) otherwise.
 template <typename scalar_t>
 inline void launch_norm(void* out,
                         const void* in,
@@ -126,10 +119,8 @@ inline void launch_norm(void* out,
                         hipStream_t stream)
 {
     constexpr int VW = 16 / (int)sizeof(scalar_t); // 8 for bf16/fp16, 4 for fp32
-    // No pointer-alignment gate: AMDGPU tolerates misaligned 128-bit global access
-    // (verified bit-exact on gfx942/gfx950), and tensor pointers are always at least
-    // element-aligned, so the vec path is used whenever the length is a whole number
-    // of vectors. gemma uses the generic kernel (any hidden); BE only for gemma == 0.
+    // no pointer-alignment gate: AMDGPU handles misaligned 128-bit access.
+    // gemma uses the generic kernel (any hidden); BE only for gemma == 0.
     if constexpr(sizeof(scalar_t) == 2)
     {
         if(gemma == 0 && (hidden % 8 == 0) &&
@@ -139,8 +130,7 @@ inline void launch_norm(void* out,
     }
     const bool vec           = (hidden % VW == 0);
     const auto [block, grid] = pick_dims(rows, vec ? hidden / VW : hidden);
-    // gemma is a compile-time template param: GEMMA==false is byte-identical to the
-    // pre-gemma kernel (no runtime cost), only gemma launches the (weight+1) variant.
+    // gemma is a compile-time template arg (no runtime cost when false).
 #define OPUS_LAUNCH_FWD(WIDTH, G)                                                   \
     hipLaunchKernelGGL((rmsnorm_opus_kernel<rmsnorm_opus_traits<scalar_t, WIDTH, G>>),      \
                        grid, block, 0, stream, out, in, weight, residual,           \

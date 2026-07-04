@@ -10,32 +10,16 @@ from typing import Optional
 def _use_opus(
     input, use_model_sensitive_rmsnorm: int = 0, gemma_norm: bool = False
 ) -> bool:
-    """True when the opus backend can serve this call.
-
-    Opus covers fp16/bf16/fp32 for the plain, fused-add, dynamic/smooth-quant, T5
-    and gemma_norm paths at any hidden size. Only group_size / shuffle_scale
-    (grouped/MXFP4 quant, which live in the shared module_rmsnorm_quant kernel) and
-    non fp16/bf16/fp32 dtypes fall back.
-    """
-    return input.dtype in (
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-    )
+    """opus serves fp16/bf16/fp32 at any hidden; others fall back to quant module."""
+    return input.dtype in (torch.float16, torch.bfloat16, torch.float32)
 
 
-# ==========================================================================
-# OPUS backend (self-contained: no CK/torch/HIP-runtime in the C++ TU).
-# module_rmsnorm is a single ctypes TU and the sole rmsnorm backend
-# (fp16/bf16/fp32). Only gemma_norm/group_size/shuffle_scale fall back to the
-# separate module_rmsnorm_quant kernels.
-# ==========================================================================
+# opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
+# shuffle_scale quant and exotic dtypes fall back to module_rmsnorm_quant.
 _DTYPE_CODE = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
 
 
-# Raw C ABI (ctypes): pointers/dims/stream travel as int64, so the C++ side needs
-# no torch / HIP-runtime / aiter_tensor.h and compiles in ~0.2s. Validation and
-# pointer/stream extraction happen in the Python wrappers below.
+# Raw C ABI (ctypes): pointers/dims/stream as int64; validated in the wrappers below.
 @compile_ops("module_rmsnorm", fc_name="rms_norm_opus", ffi_type="ctypes")
 def _rms_norm_opus_raw(
     out: int,
@@ -151,8 +135,7 @@ def rmsnorm2d_fwd_with_add_opus(
     use_model_sensitive_rmsnorm: int = 0,
     gemma_norm: bool = False,
 ) -> None:
-    # opus fused kernel is in-place on (io, res); stage into out/residual_out so
-    # input/residual_in are left untouched.
+    # opus fused kernel is in-place; stage into out/residual_out to keep inputs.
     out.copy_(input)
     residual_out.copy_(residual_in)
     fused_add_rms_norm_opus(
@@ -160,10 +143,7 @@ def rmsnorm2d_fwd_with_add_opus(
     )
 
 
-# ---------------------------------------------------------------------------
-# Fused rmsnorm + dynamic/smooth quant (int8/fp8 out). residual/xscale/unquant
-# pointers are 0 when unused. out_code: 0=int8, 1=fp8.
-# ---------------------------------------------------------------------------
+# Fused rmsnorm + dynamic/smooth quant (int8/fp8). Unused pointers pass 0.
 @compile_ops("module_rmsnorm", fc_name="rms_norm_quant_opus", ffi_type="ctypes")
 def _rms_norm_quant_opus_raw(
     out: int,

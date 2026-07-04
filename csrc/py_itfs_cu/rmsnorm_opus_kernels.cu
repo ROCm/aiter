@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// OPUS RMSNorm C ABI (ctypes). Single torch-free TU (no HIP-runtime / CK / pybind):
-// tensors arrive as raw int64 pointers + dims via aiter's _ctypes_call, validated
-// Python-side, so the whole module is a few preprocessed lines under -D__HIPCC_RTC__.
+// OPUS RMSNorm C ABI (ctypes): raw int64 pointers + dims, validated Python-side.
 // dtype: 0=fp16, 1=bf16, 2=fp32.
 
 #include "rmsnorm.h"
 
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
 
-// Dispatch a norm launch on the dtype code (0=fp16, 1=bf16, 2=fp32).
+// Dispatch a norm launch on the dtype code.
 #define OPUS_NORM_DISPATCH(DTYPE, O, I, W, R)                                                        \
     do                                                                                               \
     {                                                                                                \
@@ -64,8 +62,7 @@ OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
     OPUS_NORM_DISPATCH(dtype, io, io, w, r); // in-place: out == in == inout
 }
 
-// Fused rmsnorm + dynamic/smooth quant. residual/xscale/unquant = 0 to disable
-// fused-add / smooth / save-unquant. in_code: 0=fp16,1=bf16,2=fp32; out_code: 0=int8,1=fp8.
+// Fused rmsnorm + quant. residual/xscale/unquant = 0 to disable. out_code: 0=int8,1=fp8.
 OPUS_EXPORT void rms_norm_quant_opus(size_t out,
                                      size_t yscale,
                                      size_t unquant,
