@@ -651,7 +651,11 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
     scale = torch.empty(N, NB, dtype=torch.uint8, device=x.device)
     cperm = _qk_field_perm_dev(x.device)
     n_blocks = N * NB
-    BLOCK_N = 128
+    # BLOCK_N=32 / num_warps=1 (many small 1-warp programs) measured ~17-19%
+    # faster than 128/4 across shapes for the arithmetic-encode kernel -- it is
+    # bandwidth/latency-bound (the permuted per-block gather), so more, smaller
+    # programs hide the load latency better than fewer wide ones.
+    BLOCK_N = 32
     grid = (triton.cdiv(n_blocks, BLOCK_N),)
     _pack_qk_fp6_kernel[grid](
         xflat,
@@ -662,6 +666,7 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
         NB,
         n_blocks,
         BLOCK_N=BLOCK_N,
+        num_warps=1,
     )
     return (
         packed.reshape(*lead, NB * 24),
