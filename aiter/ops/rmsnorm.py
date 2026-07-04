@@ -4,6 +4,7 @@
 import torch
 from torch import Tensor
 from ..jit.core import compile_ops
+from .quant import get_dtype_max
 from typing import Optional
 
 
@@ -165,13 +166,13 @@ def _rms_norm_quant_opus_raw(
 
 
 def _qmax_outcode(out_dtype):
-    if out_dtype == torch.int8:
-        return 127.0, 0
-    if out_dtype == torch.float8_e4m3fn:
-        return 448.0, 1
-    if out_dtype == torch.float8_e4m3fnuz:
-        return 240.0, 1
-    raise AssertionError(f"rms_norm_quant_opus: unsupported out dtype {out_dtype}")
+    # qmax from torch (127 / 448 / 240); out_code: 0=int8, 1=fp8.
+    assert out_dtype in (
+        torch.int8,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ), f"rms_norm_quant_opus: unsupported out dtype {out_dtype}"
+    return float(get_dtype_max(out_dtype)), (0 if out_dtype == torch.int8 else 1)
 
 
 def _quant(
