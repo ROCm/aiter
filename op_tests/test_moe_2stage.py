@@ -127,15 +127,20 @@ def test_fmoe(
     if disable_stage2_bias:
         exp_bias2 = None
     if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
-        # Highest priority: restrict topk candidates to the first n experts.
+        # Highest priority: activate n randomly-chosen experts (NOT the first n);
+        # the other E-n experts are masked to -inf. Load is spread evenly across
+        # the n active experts by round-robin (balanced), so all n are used.
         n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
         if n_act < topk or n_act > E or n_act > token * topk:
             raise ValueError(
                 f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
                 f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
             )
-        score = torch.randn((token, E), dtype=dtype)
-        score[:, n_act:] = float("-inf")
+        sel = torch.randperm(E)[:n_act]  # random active expert ids
+        score = torch.full((token, E), float("-inf"), dtype=dtype)
+        slot = torch.arange(token * topk) % n_act  # round-robin over active set
+        rows = torch.arange(token).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
     elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0

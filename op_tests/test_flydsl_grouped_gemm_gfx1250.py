@@ -260,15 +260,20 @@ def _make_topk(
     ``(topk_ids, topk_weights)`` on the same device as ``hidden_states``."""
     tokens = hidden_states.shape[0]
     if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
-        # Highest priority: restrict topk candidates to the first n experts.
+        # Highest priority: activate n randomly-chosen experts (NOT the first n);
+        # the other experts-n are masked to -inf. Load is spread evenly across
+        # the n active experts by round-robin (balanced), so all n are used.
         n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
         if n_act < topk or n_act > experts or n_act > tokens * topk:
             raise ValueError(
                 f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be in "
                 f"[topk={topk}, min(experts={experts}, tokens*topk={tokens * topk})]"
             )
-        score = torch.randn((tokens, experts), dtype=torch.float32)
-        score[:, n_act:] = float("-inf")
+        sel = torch.randperm(experts)[:n_act]  # random active expert ids
+        score = torch.full((tokens, experts), float("-inf"), dtype=torch.float32)
+        slot = torch.arange(tokens * topk) % n_act  # round-robin over active set
+        rows = torch.arange(tokens).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
     elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((tokens, experts), dtype=torch.float32)
         start_col, end_col = 0, topk
