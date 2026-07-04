@@ -763,8 +763,12 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
         f2[j] = pk_mul_f32(pk_mul_f32(f2[j], invv), wv);
     }
 
-    constexpr int ooba_o = 4 / sizeof(out_store_t);
-    const int oob_o      = (n + ooba_o - 1) / ooba_o * ooba_o;
+    // Output OOB bound in store elements: fp4 packs 2 values/byte so a row is n/2 bytes,
+    // not n. Using n here let OOB threads (n < BLK*TDS, e.g. n=5120/6144) store past the
+    // fp4 output row into adjacent memory. Size the buffer by the real element count.
+    constexpr int ooba_o  = 4 / sizeof(out_store_t);
+    const int out_elems   = FP4 ? n / 2 : n;
+    const int oob_o       = (out_elems + ooba_o - 1) / ooba_o * ooba_o;
 
     if constexpr(!QNT)
     {

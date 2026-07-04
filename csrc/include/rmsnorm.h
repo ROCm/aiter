@@ -284,7 +284,27 @@ inline void launch_arq_io(void* out, void* rout, void* scale, const void* in, co
         else                                                                                       \
             ARQ(BLK, TDS, true);                                                                   \
     } while(0)
-    if(n <= 512)
+    // Grouped quant requires the tile's thread_data_size to divide group_size (so a
+    // group is a whole power-of-two lane run). The per-token (256,24)/(256,32) tiles for
+    // n>4096 have TDS that does NOT divide 128/32, so grouped must switch to (512,16)/
+    // (1024,8) for ALL n>4096 (not just n>6144) -- otherwise rts is non-power-of-two and
+    // the scale store goes out of bounds (GPU fault at e.g. n=5120/6144).
+    if(group > 0)
+    {
+        if(n <= 512)
+            ARQ2(64, 8);
+        else if(n <= 1024)
+            ARQ2(128, 8);
+        else if(n <= 2048)
+            ARQ2(256, 8);
+        else if(n <= 4096)
+            ARQ2(256, 16);
+        else if(cu_num < 160)
+            ARQ(512, 16, false);
+        else
+            ARQ(1024, 8, true);
+    }
+    else if(n <= 512)
         ARQ2(64, 8);
     else if(n <= 1024)
         ARQ2(128, 8);
@@ -294,13 +314,6 @@ inline void launch_arq_io(void* out, void* rout, void* scale, const void* in, co
         ARQ2(256, 16);
     else if(n <= 6144)
         ARQ2(256, 24);
-    else if(group > 0) // 6144 < n <= 8192, grouped: switch config for group reduction
-    {
-        if(cu_num < 160)
-            ARQ(512, 16, false);
-        else
-            ARQ(1024, 8, true);
-    }
     else
         ARQ(256, 32, true);
 #undef ARQ2
