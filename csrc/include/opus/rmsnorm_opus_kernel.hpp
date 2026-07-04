@@ -168,21 +168,41 @@ __device__ inline float block_reduce(float v)
     return s[base];
 }
 
-// Fast 1D block reduction: shfl butterfly within a warp (no LDS/barrier), then a
-// single LDS exchange across warps. Matches the reference DPP-reduce latency, which
-// dominates the memory-light per-token/no-add quant paths. All lanes get the result.
+// Wave64 intra-warp all-reduce via DPP (single-cycle ALU cross-lane, ~20x lower
+// latency than ds_bpermute). bound_ctrl 0-fill is a valid identity here: sum operates
+// on squares and max on |values|, both non-negative. Result broadcast to all lanes.
+template <bool IS_MAX>
+__device__ inline float warp_reduce_dpp(float v)
+{
+    auto op = [](float a, float b) { return IS_MAX ? fmaxf(a, b) : a + b; };
+    v       = op(v, opus::mov_dpp(v, opus::number<0x111>{})); // row_shr:1
+    v       = op(v, opus::mov_dpp(v, opus::number<0x112>{})); // row_shr:2
+    v       = op(v, opus::mov_dpp(v, opus::number<0x114>{})); // row_shr:4
+    v       = op(v, opus::mov_dpp(v, opus::number<0x118>{})); // row_shr:8
+    v = op(v, opus::mov_dpp(v, opus::number<0x142>{}, opus::number<0xa>{})); // row_bcast:15
+    v = op(v, opus::mov_dpp(v, opus::number<0x143>{}, opus::number<0xc>{})); // row_bcast:31
+    return __builtin_bit_cast(float,
+                              __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), 63));
+}
+
+// Fast 1D block reduction: DPP all-reduce within a warp (wave64), then a single LDS
+// exchange across warps. Replaces the LDS reduction on the memory-light per-token /
+// no-add quant paths, where the reduce latency is on the critical path.
 template <bool IS_MAX>
 __device__ inline float block_reduce_1d(float v)
 {
     constexpr int W = opus::get_warp_size();
     const int lane  = opus::lane_id();
     const int nwarp = opus::block_size_x() / W;
+    if constexpr(W == 64)
+        v = warp_reduce_dpp<IS_MAX>(v);
+    else
 #pragma unroll
-    for(int k = W >> 1; k > 0; k >>= 1)
-    {
-        float o = opus::shfl(v, lane ^ k);
-        v       = IS_MAX ? fmaxf(v, o) : v + o;
-    }
+        for(int k = W >> 1; k > 0; k >>= 1)
+        {
+            float o = opus::shfl(v, lane ^ k);
+            v       = IS_MAX ? fmaxf(v, o) : v + o;
+        }
     if(nwarp == 1)
         return v;
     __shared__ float s[64];
