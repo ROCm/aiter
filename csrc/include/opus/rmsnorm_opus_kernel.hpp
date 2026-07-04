@@ -76,10 +76,49 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out,
                                         int hidden,
                                         int model_sensitive);
 
+// Faithful opus port of add_rmsnorm_quant_kernel (module_rmsnorm_quant): one row
+// per block, thread tid owns TDS contiguous elements, so a group of group_size
+// elements = reduce_thread_size = group_size/TDS contiguous lanes. Covers no-quant,
+// per-token & grouped int8/fp8/fp4, fused-add, gemma, smooth, shuffle, strided rows.
+template <typename In, typename Out, int Blk, int Tds, bool Add, bool Quant>
+struct arq_opus_traits
+{
+    using in_t                = In;
+    using out_t               = Out;
+    static constexpr int BLK  = Blk;
+    static constexpr int TDS  = Tds;
+    static constexpr bool ADD = Add;
+    static constexpr bool QNT = Quant;
+};
+template <typename Traits>
+__global__ void add_rmsnorm_quant_opus(void* __restrict__ out,
+                                       void* __restrict__ rout,
+                                       void* __restrict__ scale,
+                                       const void* __restrict__ in,
+                                       const void* __restrict__ rin,
+                                       const void* __restrict__ weight,
+                                       const void* __restrict__ xscale,
+                                       float epsilon,
+                                       int m,
+                                       int n,
+                                       float qmax,
+                                       int in_s,
+                                       int rin_s,
+                                       int rout_s,
+                                       int out_s,
+                                       int group_size,
+                                       int shuffle,
+                                       int gemma);
+
 #if !defined(__HIP_DEVICE_COMPILE__)
 // Host pass: empty stubs so the __device_stub__ symbols resolve.
 template <typename Traits>
 __global__ void rmsnorm_opus_kernel(void*, const void*, const void*, void*, float, int, int, int)
+{
+}
+template <typename Traits>
+__global__ void add_rmsnorm_quant_opus(void*, void*, void*, const void*, const void*, const void*,
+                                       const void*, float, int, int, float, int, int, int, int, int, int, int)
 {
 }
 template <typename Traits>
@@ -525,6 +564,162 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
     }
     for(int idx = lane + CACHE_V * tpr; idx < vec_hidden; idx += tpr)
         quant(reload_ni(idx), idx);
+}
+
+template <typename Traits>
+__global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
+                                       void* __restrict__ rout_,
+                                       void* __restrict__ scale_,
+                                       const void* __restrict__ in_,
+                                       const void* __restrict__ rin_,
+                                       const void* __restrict__ w_,
+                                       const void* __restrict__ xscale_,
+                                       float epsilon,
+                                       int m,
+                                       int n,
+                                       float qmax,
+                                       int in_s,
+                                       int rin_s,
+                                       int rout_s,
+                                       int out_s,
+                                       int group_size,
+                                       int shuffle,
+                                       int gemma)
+{
+    using in_t         = typename Traits::in_t;
+    using out_t        = typename Traits::out_t;
+    constexpr int TDS  = Traits::TDS;
+    constexpr bool ADD = Traits::ADD;
+    constexpr bool QNT = Traits::QNT;
+    constexpr bool FP4 = std::is_same_v<out_t, opus::fp4_t>;
+    const int row      = opus::block_id_x();
+    if(row >= m)
+        return;
+    const int tid     = opus::thread_id_x();
+    const int col0    = tid * TDS; // first element this thread owns
+    const float goff  = gemma ? 1.0f : 0.0f;
+    const bool smooth = xscale_ != nullptr;
+    const in_t* in    = reinterpret_cast<const in_t*>(in_) + (size_t)row * in_s;
+    const in_t* rin   = reinterpret_cast<const in_t*>(rin_) + (size_t)row * rin_s;
+    const in_t* w     = reinterpret_cast<const in_t*>(w_);
+    const float* xsc  = reinterpret_cast<const float*>(xscale_);
+
+    float f[TDS]; // fp32 norm-input; residual stored as round(x+res)
+#pragma unroll
+    for(int j = 0; j < TDS; ++j)
+    {
+        int c   = col0 + j;
+        float x = (c < n) ? opus::cast<float>(in[c]) : 0.0f;
+        if constexpr(ADD)
+        {
+            if(c < n)
+            {
+                x += opus::cast<float>(rin[c]);
+                reinterpret_cast<in_t*>(rout_)[(size_t)row * rout_s + c] = opus::cast<in_t>(x);
+            }
+        }
+        f[j] = x;
+    }
+
+    float sq = 0.0f;
+#pragma unroll
+    for(int j = 0; j < TDS; ++j)
+        sq += f[j] * f[j];
+    float inv = rsqrtf(block_reduce<false>(sq) / n + epsilon);
+
+    float nv[TDS]; // normalized: (f*inv) * (w + goff) [* xscale]
+#pragma unroll
+    for(int j = 0; j < TDS; ++j)
+    {
+        int c    = col0 + j;
+        float wv = (c < n) ? (opus::cast<float>(w[c]) + goff) : 0.0f;
+        float v  = f[j] * inv * wv;
+        if(smooth && c < n)
+            v *= xsc[c];
+        nv[j] = v;
+    }
+
+    if constexpr(!QNT)
+    {
+        out_t* o = reinterpret_cast<out_t*>(out_) + (size_t)row * out_s;
+#pragma unroll
+        for(int j = 0; j < TDS; ++j)
+            if(col0 + j < n)
+                o[col0 + j] = opus::cast<out_t>(nv[j]);
+        return;
+    }
+
+    float tmax = 1e-10f;
+#pragma unroll
+    for(int j = 0; j < TDS; ++j)
+        tmax = fmaxf(tmax, fabsf(nv[j]));
+
+    const float qm = FP4 ? 6.0f : qmax;
+    float yscale, inv_ys;
+    if(group_size == 0)
+    {
+        float gmax = block_reduce<true>(tmax);
+        yscale     = gmax / qm;
+        inv_ys     = yscale > 0.0f ? 1.0f / yscale : 0.0f;
+        if(tid == 0 && scale_)
+            reinterpret_cast<float*>(scale_)[row] = yscale;
+    }
+    else
+    {
+        const int rts  = group_size / TDS; // contiguous lanes per group
+        const int lane = opus::lane_id();
+#pragma unroll
+        for(int k = 1; k < 64; k <<= 1)
+            if(k < rts)
+                tmax = fmaxf(tmax, opus::shfl(tmax, lane ^ k));
+        if constexpr(FP4)
+        {
+            yscale = fp4_e8m0_scale(tmax);
+            inv_ys = yscale; // opus fp4 packer takes the forward scale
+        }
+        else
+        {
+            yscale = tmax / qm;
+            inv_ys = yscale > 0.0f ? 1.0f / yscale : 0.0f;
+        }
+        if((tid % rts) == 0 && col0 < n && scale_)
+        {
+            int y      = tid / rts;
+            int groups = n / group_size;
+            if constexpr(FP4)
+            {
+                int sp     = shuffle ? (groups + 7) / 8 * 8 : groups;
+                size_t si  = shuffle ? (size_t)mx_scale_shuffle_idx(sp, row, y) : (size_t)row * sp + y;
+                reinterpret_cast<unsigned char*>(scale_)[si] = e8m0_byte(yscale);
+            }
+            else
+            {
+                size_t si = shuffle ? (size_t)y * m + row : (size_t)row * groups + y;
+                reinterpret_cast<float*>(scale_)[si] = yscale;
+            }
+        }
+    }
+
+    if constexpr(FP4)
+    {
+        unsigned char* o = reinterpret_cast<unsigned char*>(out_) + (size_t)row * out_s + col0 / 2;
+#pragma unroll
+        for(int j = 0; j < TDS; j += 2)
+            if(col0 + j < n)
+            {
+                opus::fp32x2_t pr = {nv[j], nv[j + 1]};
+                auto b            = opus::fp32_to_fp4_packed_x2(pr, inv_ys);
+                o[j / 2]          = __builtin_bit_cast(unsigned char, b);
+            }
+    }
+    else
+    {
+        out_t* o = reinterpret_cast<out_t*>(out_) + (size_t)row * out_s + col0;
+#pragma unroll
+        for(int j = 0; j < TDS; ++j)
+            if(col0 + j < n)
+                o[j] = quant_cast<out_t>(nv[j] * inv_ys);
+    }
 }
 
 #endif // __HIP_DEVICE_COMPILE__
