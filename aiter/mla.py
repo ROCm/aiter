@@ -1256,25 +1256,18 @@ def mla_decode_fwd_v4_nm(
             f"note in the `logits` shape error above for details."
         )
 
-    # Per-batch valid-split count buffer (main added this to stage2 to skip
-    # empty splits in the reduce). Allocated HERE — alongside logits/attn_lse,
-    # at a fixed [num_seqs] size with num_kv_splits already resolved — rather
-    # than inside the `num_kv_splits > 1` stage2 block. v4 nm's split_indptr is
-    # uniform (every seq uses all num_kv_splits) so initialize to num_kv_splits.
-    valid_split_count = torch.full(
-        (num_seqs,), num_kv_splits, dtype=dtypes.i32, device=q.device
-    )
-
     # softmax_scale is ignored by the v4 nm kernel (hardcodes 1/sqrt(512));
     # we still pass *something* through to satisfy the C ABI.
     sm_scale_arg = 0.0 if sm_scale is None else float(sm_scale)
 
     # Per-batch valid KV split count writeback buffer. Always allocated (and
     # passed to the asm kernel) so it has a valid destination; whether stage2
-    # actually uses it is gated by use_valid_split_count_reduce. Initialized to
-    # num_kv_splits so a min() against it is a no-op until the kernel
-    # overwrites it with the real (smaller) valid count. Mirrors the V3
-    # mla_decode_fwd path (see the stage1 call above).
+    # actually uses it is gated by use_valid_split_count_reduce. Sized [num_seqs]
+    # with num_kv_splits already resolved, and initialized to num_kv_splits so a
+    # min() against it is a no-op until the kernel overwrites it with the real
+    # (smaller) valid count. v4 nm's split_indptr is uniform (every seq uses all
+    # num_kv_splits). Mirrors the V3 mla_decode_fwd path (see the stage1 call
+    # above).
     valid_split_count = torch.full(
         (num_seqs,), num_kv_splits, dtype=dtypes.i32, device=q.device
     )

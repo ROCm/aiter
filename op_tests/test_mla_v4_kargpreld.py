@@ -525,7 +525,6 @@ def test_mla_v4_nm(
             **common_kwargs,
             num_iters=_PERF["num_iters"],
             num_warmup=_PERF["num_warmup"],
-            num_rotate_args=1,
         )
         # Resolve the buffer the wrapper actually populated:
         #   o16=1        -> wrapper unpacked packed-BF16 into output_buf.
