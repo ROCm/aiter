@@ -59,7 +59,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, vector, buffer_ops
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, CmpFPredicate
+from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import T, Int32, Stream
 from flydsl.expr.vector import ReductionOp
 from flydsl._mlir.dialects import llvm, rocdl
@@ -386,18 +386,6 @@ def _build_kernel(
         # = 8 bf16). For VEC=16 (32 bytes/thread), we use raw buffer_load
         # split into dwordx4 chunks, matching the compress_attn gfx1250 pattern.
 
-        # Rope cos/sin: PAIRS_PER_THREAD bf16 pairs.
-        # VEC=16 → PAIRS=8 → 16 bytes → BufferCopy128b.
-        # VEC=8  → PAIRS=4 → 8 bytes  → BufferCopy(64).
-        # VEC=4  → PAIRS=2 → 4 bytes  → BufferCopy(32).
-        if const_expr(PAIRS_PER_THREAD <= 4):
-            rope_atom = fx.make_copy_atom(
-                fx.rocdl.BufferCopy(PAIRS_PER_THREAD * 16), 16
-            )
-        else:
-            rope_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
-        rope_lay = fx.make_layout(PAIRS_PER_THREAD, 1)
-
         # Full-row loads via CopyAtom (for weight tensors).
         # VEC ≤ 8 → BufferCopy128b (16 bytes) is sufficient.
         # VEC = 16 → need 32 bytes; use raw buffer_load split instead.
@@ -420,18 +408,12 @@ def _build_kernel(
                 Splits into dwordx4 chunks for VEC=16."""
                 wrsrc = buffer_ops.create_buffer_resource(weight_tensor, max_size=True)
                 tid_x_vec = ArithValue(tid_val) * VEC
-                # Element offset → dword offset (2 bf16 per dword)
                 off_dw = tid_x_vec >> 1
                 f32_list = _load_bf16_raw(wrsrc, off_dw)
                 f32_vec = vector.from_elements(T.vec(VEC, f32), f32_list)
                 rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
                 fx.memref_store_vec(f32_vec, rmem)
                 return fx.memref_load_vec(rmem)
-
-        def load_rope_vec(div_tensor, idx):
-            r = fx.make_rmem_tensor(rope_lay, elem_dtype)
-            fx.copy_atom_call(rope_atom, fx.slice(div_tensor, (None, idx)), r)
-            return fx.memref_load_vec(r)
 
         def _load_bf16_raw(rsrc, off_dw):
             """Load VEC bf16 from a raw buffer resource at dword offset.
@@ -495,13 +477,12 @@ def _build_kernel(
         pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
         pos_i32 = arith.trunci(i32, pos_val_i64)
 
-        # --- shared: cos/sin buffer tensors (used by rope-threads only) ---
-        cos_buf = fx.rocdl.make_buffer_tensor(cos_cache)
-        sin_buf = fx.rocdl.make_buffer_tensor(sin_cache)
-        cos_row = fx.slice(cos_buf, (pos_i32, None))
-        sin_row = fx.slice(sin_buf, (pos_i32, None))
-        cos_div = fx.logical_divide(cos_row, rope_lay)
-        sin_div = fx.logical_divide(sin_row, rope_lay)
+        # --- shared: cos/sin buffer resources (all threads load, NOPE
+        # threads clamp index to 0 so the load is in-bounds/harmless) ---
+        cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
+        sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
+        c_half_rd = arith.constant(RD // 2, type=i32)
+        cos_sin_row_base = ArithValue(pos_i32) * c_half_rd
 
         def wave_reduce_add(x):
             w = _to_raw(x)
@@ -604,36 +585,79 @@ def _build_kernel(
                 else:
                     scaled.append(xi * rstd)
 
-            # ---- Store scaled to rmem for cross-branch value passing ----
-            out_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
+            # ---- GPT-J RoPE via select (no rmem, no branch divergence) ----
+            # All threads load cos/sin (NOPE threads clamp index to 0,
+            # value unused). All threads compute rotated values. Then
+            # arith.select picks rotated vs scaled per-element.
+            is_rope_t = arith.cmpi(
+                CmpIPredicate.sge,
+                _to_raw(tid),
+                arith.constant(ROPE_THREAD_LO, type=i32),
+            )
+            rope_rel_raw = ArithValue(tid) - arith.constant(ROPE_THREAD_LO, type=i32)
+            rope_rel = arith.maxsi(
+                _to_raw(rope_rel_raw), arith.constant(0, type=i32)
+            )
+            cs_off = cos_sin_row_base + ArithValue(rope_rel) * arith.constant(
+                PAIRS_PER_THREAD, type=i32
+            )
+
+            if const_expr(PAIRS_PER_THREAD == 1):
+                cos_b = buffer_ops.buffer_load(
+                    cos_rsrc, cs_off, vec_width=1, dtype=T.bf16
+                )
+                sin_b = buffer_ops.buffer_load(
+                    sin_rsrc, cs_off, vec_width=1, dtype=T.bf16
+                )
+                cos_vals = [arith.extf(f32, cos_b)]
+                sin_vals = [arith.extf(f32, sin_b)]
+            else:
+                cos_vec = buffer_ops.buffer_load(
+                    cos_rsrc, cs_off, vec_width=PAIRS_PER_THREAD, dtype=T.bf16
+                )
+                sin_vec = buffer_ops.buffer_load(
+                    sin_rsrc, cs_off, vec_width=PAIRS_PER_THREAD, dtype=T.bf16
+                )
+                cos_vals = [
+                    arith.extf(
+                        f32,
+                        vector.extract(
+                            cos_vec, static_position=[i], dynamic_position=[]
+                        ),
+                    )
+                    for i in range(PAIRS_PER_THREAD)
+                ]
+                sin_vals = [
+                    arith.extf(
+                        f32,
+                        vector.extract(
+                            sin_vec, static_position=[i], dynamic_position=[]
+                        ),
+                    )
+                    for i in range(PAIRS_PER_THREAD)
+                ]
+
             scaled_raw = [_to_raw(s) for s in scaled]
-            scaled_vec = vector.from_elements(T.vec(VEC, f32), scaled_raw)
-            fx.memref_store_vec(scaled_vec, out_rmem)
+            rotated = list(scaled_raw)
+            for k in range_constexpr(PAIRS_PER_THREAD):
+                e = scaled_raw[2 * k]
+                o = scaled_raw[2 * k + 1]
+                c = cos_vals[k]
+                s = sin_vals[k]
+                rotated[2 * k] = arith.subf(
+                    arith.MulFOp(e, c, fastmath=fm_fast).result,
+                    arith.MulFOp(o, s, fastmath=fm_fast).result,
+                )
+                rotated[2 * k + 1] = arith.AddFOp(
+                    arith.MulFOp(e, s, fastmath=fm_fast).result,
+                    arith.MulFOp(o, c, fastmath=fm_fast).result,
+                    fastmath=fm_fast,
+                ).result
 
-            # ---- ROPE branch: load from rmem, rotate, store back ----
-            is_rope = tid >= ROPE_THREAD_LO
-            if is_rope:
-                rope_rel = tid - ROPE_THREAD_LO
-                cos_vec = load_rope_vec(cos_div, rope_rel)
-                sin_vec = load_rope_vec(sin_div, rope_rel)
-                cos_f32 = cos_vec.to(fx.Float32)
-                sin_f32 = sin_vec.to(fx.Float32)
-
-                cur = fx.memref_load_vec(out_rmem)
-                rope_elems = []
-                for k in range_constexpr(PAIRS_PER_THREAD):
-                    e = cur[2 * k]
-                    o = cur[2 * k + 1]
-                    c = cos_f32[k]
-                    s = sin_f32[k]
-                    rope_elems.append(_to_raw(e * c - o * s))
-                    rope_elems.append(_to_raw(e * s + o * c))
-                rotated_vec = vector.from_elements(T.vec(VEC, f32), rope_elems)
-                fx.memref_store_vec(rotated_vec, out_rmem)
-
-            # ---- Unified store: all threads read from rmem and write ----
-            final = fx.memref_load_vec(out_rmem)
-            final_list = [final[i] for i in range(VEC)]
+            final_list = [
+                arith.select(is_rope_t, rotated[i], scaled_raw[i])
+                for i in range_constexpr(VEC)
+            ]
 
             if const_expr(quant):
                 rsrc, row_base = fp8_out_rsrc
@@ -672,8 +696,6 @@ def _build_kernel(
             )
             q_off_dw = q_row_off_elems >> 1
             q_f32_list = _load_bf16_raw(q_in_rsrc, q_off_dw)
-
-            # Build Fly-wrapped VEC-wide f32 vector from raw scalars.
             q_f32_fly_vec = vector.from_elements(T.vec(VEC, f32), q_f32_list)
             q_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
             fx.memref_store_vec(q_f32_fly_vec, q_rmem)
