@@ -606,7 +606,61 @@ If a new kernel needs the Winograd bump, mark it `is_winograd=True` in
 
 ---
 
-## 9. Method registry
+## 9. Config resolution — how JSON serves every layer
+
+Each kernel fetches its launch parameters (tile sizes, `num_warps`, etc.) at
+launch time via `get_conv_config(...)` in
+`aiter/ops/triton/utils/conv_config_utils.py`, which reads the per-arch JSON in
+`configs/conv/{arch}-CONV-{KERNEL}.json`. There is **no runtime autotune on the
+hot path** — the search already happened offline and its winners are frozen in
+JSON, so first-call latency and CI compile time stay predictable. (The
+`AITER_TRITON_CONV_AUTOTUNE=1` escape hatch restores live `@triton.autotune`
+for development; it is off by default and never used in normal inference.)
+
+### The JSON is a keyed lookup, not a list of layers
+
+A common confusion: "ResNet-50 has 53 conv layers, but the JSON only has ~23
+entries — how does inference work?" The JSON is **not** a per-layer list. It is
+a shape-keyed lookup table with a three-tier fallback, so it can never "miss":
+
+```
+get_conv_config walks, first hit wins:
+  1. shapes[shape_key]   exact-shape pin  (the offline-tuned entries)
+  2. M_LEQ_<n>           nearest row-count bucket (M_total, or T for Winograd)
+  3. "any"               global fallback
+```
+
+At inference every one of the 53 physical layers fires and issues its own
+kernel launch. Each builds a `shape_key`
+(`format_shape_key(N,C,H,W,K,R,S,…)`) and looks it up:
+
+- ResNet-50's 53 conv layers span only **23 distinct shapes** (repeated
+  bottleneck blocks reuse shapes). The 23 distinct shapes hit **Tier 1**
+  (they are exactly what was tuned into `shapes`). The ~30 duplicate layers
+  build a `shape_key` identical to one of the 23, so they re-resolve to the
+  same Tier-1 entry — an LRU-cached, near-free re-read. **53 launches,
+  ≤23 distinct config lookups.**
+- A shape that was *not* tuned offline (e.g. a different batch size, so
+  `N` differs) matches nothing in Tier 1. It does not error — it falls to the
+  `M_LEQ_<n>` bucket for its row count, or ultimately to `"any"`. Slightly
+  less optimal, still correct.
+
+This tiered fallback is why tuning only the **deduped** shape set is safe:
+identical shapes need tuning once, and any unseen shape degrades gracefully
+instead of failing. `get_conv_config` is modeled on `get_gemm_config` and uses
+the same `M_LEQ_x → any` walk; the conv-native addition is the exact-shape
+Tier-1 (`shapes[shape_key]`), since conv has more shape degrees of freedom than
+GEMM's M/N/K.
+
+> The dedup lives in two independent places, both offline: the **bench** shape
+> list (`conv_shapes.json`, timing distinct work once) and the **tuning** set
+> (`tune_conv2d.py` dedups by literal tuple before sweeping). Neither the bench
+> nor the runtime lookup re-dedups; the runtime simply reuses a config when two
+> layers share a shape.
+
+---
+
+## 10. Method registry
 
 `op_tests/triton_tests/conv/_helpers.py` (`METHOD_REGISTRY`) is the **single source of truth**
 for kernel dispatch in the test harness. Adding a new method takes one entry:
@@ -633,7 +687,7 @@ tolerance dispatch — is automatic. You do not edit any of those.
 
 ---
 
-## 10. Adding a new kernel — checklist
+## 11. Adding a new kernel — checklist
 
 Concretely, to add (say) a `winograd_f6x3` variant:
 
@@ -678,7 +732,7 @@ Concretely, to add (say) a `winograd_f6x3` variant:
 
 ---
 
-## 11. Known limitations and future work
+## 12. Known limitations and future work
 
 - **`groups > 1`.** Kernels are `groups=1` only. Implementation entry
   points: a new `aiter/ops/triton/_triton_kernels/conv/conv_depthwise.py`
