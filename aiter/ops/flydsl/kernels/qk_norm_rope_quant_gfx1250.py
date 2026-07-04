@@ -595,9 +595,7 @@ def _build_kernel(
                 arith.constant(ROPE_THREAD_LO, type=i32),
             )
             rope_rel_raw = ArithValue(tid) - arith.constant(ROPE_THREAD_LO, type=i32)
-            rope_rel = arith.maxsi(
-                _to_raw(rope_rel_raw), arith.constant(0, type=i32)
-            )
+            rope_rel = arith.maxsi(_to_raw(rope_rel_raw), arith.constant(0, type=i32))
             cs_off = cos_sin_row_base + ArithValue(rope_rel) * arith.constant(
                 PAIRS_PER_THREAD, type=i32
             )
