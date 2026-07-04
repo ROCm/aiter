@@ -36,7 +36,6 @@ inline std::pair<dim3, dim3> pick_dims(int rows, int vhid)
     return {dim3((unsigned)tpr, (unsigned)rpb), dim3((unsigned)nblocks)};
 }
 
-inline bool aligned16(const void* p) { return (reinterpret_cast<size_t>(p) % 16) == 0; }
 
 // Bit-exact (vs CK) launch for one CK tile geometry (TN threads/row, RN vecs).
 template <typename scalar_t, int TN, int RN>
@@ -118,20 +117,19 @@ inline void launch_norm(void* out,
                         int gemma,
                         hipStream_t stream)
 {
-    constexpr int VW   = 16 / (int)sizeof(scalar_t); // 8 for bf16/fp16, 4 for fp32
-    const bool aligned = aligned16(out) && aligned16(in) && aligned16(weight) &&
-                         (residual == nullptr || aligned16(residual));
-    // gemma_norm (weight+1) has no CK bit-exact reference and is not perf-critical,
-    // so it uses the generic kernel at any hidden size; the bit-exact BE path is
-    // left untouched (only taken for gemma == 0).
+    constexpr int VW = 16 / (int)sizeof(scalar_t); // 8 for bf16/fp16, 4 for fp32
+    // No pointer-alignment gate: AMDGPU tolerates misaligned 128-bit global access
+    // (verified bit-exact on gfx942/gfx950), and tensor pointers are always at least
+    // element-aligned, so the vec path is used whenever the length is a whole number
+    // of vectors. gemma uses the generic kernel (any hidden); BE only for gemma == 0.
     if constexpr(sizeof(scalar_t) == 2)
     {
-        if(gemma == 0 && aligned && (hidden % 8 == 0) &&
+        if(gemma == 0 && (hidden % 8 == 0) &&
            launch_norm_be<scalar_t>(
                out, in, weight, residual, epsilon, rows, hidden, model_sensitive, stream))
             return;
     }
-    const bool vec           = (hidden % VW == 0) && aligned;
+    const bool vec           = (hidden % VW == 0);
     const auto [block, grid] = pick_dims(rows, vec ? hidden / VW : hidden);
     // gemma is a compile-time template param: GEMMA==false is byte-identical to the
     // pre-gemma kernel (no runtime cost), only gemma launches the (weight+1) variant.
@@ -172,9 +170,7 @@ inline void launch_quant_t(void* out,
                            hipStream_t stream)
 {
     constexpr int VW = 16 / (int)sizeof(in_t); // 8 for bf16/fp16, 4 for fp32
-    const bool vec = (hidden % VW == 0) && aligned16(out) && aligned16(in) && aligned16(weight) &&
-                     (residual == nullptr || aligned16(residual)) &&
-                     (unquant == nullptr || aligned16(unquant));
+    const bool vec = (hidden % VW == 0);
     const auto [block, grid] = pick_dims(rows, vec ? hidden / VW : hidden);
     if(vec)
         hipLaunchKernelGGL((rmsnorm_quant_opus<rmsnorm_quant_opus_traits<in_t, out_t, VW>>),
