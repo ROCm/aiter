@@ -773,6 +773,13 @@ def run_sweep(args) -> None:
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)
 
+    if args.batch_size is not None:
+        if args.batch_size < 1:
+            print("ERROR: --batch-size must be >= 1", file=sys.stderr)
+            sys.exit(1)
+        shapes = [(args.batch_size,) + entry[1:] for entry in shapes]
+        print(f"# batch-size override: N={args.batch_size} on all swept shapes")
+
     print(
         f"# dtype={args.dtype} method={args.method} layout={args.layout} "
         f"miopen_solvers={'on' if args.miopen_solvers else 'off'}"
@@ -910,6 +917,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="sweep mode: use the EDGE_CASE_SHAPES set instead of a real model. "
         "Exercises degenerate paths (C=1, dilation>1, asymmetric dims, etc.) "
         "for regression smoke-testing. NOT representative of production perf.",
+    )
+    p.add_argument(
+        "--batch-size",
+        "--batch_size",
+        type=int,
+        default=None,
+        help="sweep mode: override the batch dim N on every swept shape "
+        "(the JSON shapes ship with N=1). Ignored in single-shape mode.",
     )
 
     # Single-shape mode (used by bench_models.py and one-off measurements).
