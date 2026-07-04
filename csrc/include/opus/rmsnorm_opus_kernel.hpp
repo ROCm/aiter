@@ -701,15 +701,25 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
             f[j] = opus::cast<float>(td_i[j]);
     }
 
+    // packed square-sum + normalize (v_pk_mul_f32 on CDNA), matching the reference.
+    auto* f2 = reinterpret_cast<opus::fp32x2_t*>(&f);
     float sq = 0.0f;
 #pragma unroll
-    for(int j = 0; j < TDS; ++j)
-        sq += f[j] * f[j];
+    for(int j = 0; j < TDS / 2; ++j)
+    {
+        opus::fp32x2_t p = pk_mul_f32(f2[j], f2[j]);
+        sq += p[0] + p[1];
+    }
     float inv = rsqrtf(block_reduce_1d<false>(sq) / n + epsilon);
 
+    const opus::fp32x2_t invv{inv, inv};
 #pragma unroll
-    for(int j = 0; j < TDS; ++j) // normalized: (f*inv) * (w + goff)
-        f[j] = f[j] * inv * (opus::cast<float>(td_w[j]) + goff);
+    for(int j = 0; j < TDS / 2; ++j) // normalized: (f*inv) * (w + goff)
+    {
+        opus::fp32x2_t wv{opus::cast<float>(td_w[2 * j]) + goff,
+                          opus::cast<float>(td_w[2 * j + 1]) + goff};
+        f2[j] = pk_mul_f32(pk_mul_f32(f2[j], invv), wv);
+    }
 
     constexpr int ooba_o = 4 / sizeof(out_store_t);
     const int oob_o      = (n + ooba_o - 1) / ooba_o * ooba_o;
