@@ -509,6 +509,34 @@ def _build_kernel(
             """Apply RMSNorm + GPT-J RoPE (+ optional FP8 quant) for the row
             held by this block. ``x_f32_vec`` and (optional) ``w_f32_vec`` are
             VEC-wide fp32 vectors already loaded by the caller."""
+            # ---- Issue cos/sin loads EARLY so they overlap with the
+            # sumsq reduction ALU below (latency hiding). ----
+            is_rope_t = arith.cmpi(
+                CmpIPredicate.sge,
+                _to_raw(tid),
+                arith.constant(ROPE_THREAD_LO, type=i32),
+            )
+            rope_rel_raw = ArithValue(tid) - arith.constant(ROPE_THREAD_LO, type=i32)
+            rope_rel = arith.maxsi(_to_raw(rope_rel_raw), arith.constant(0, type=i32))
+            cs_off = cos_sin_row_base + ArithValue(rope_rel) * arith.constant(
+                PAIRS_PER_THREAD, type=i32
+            )
+            if const_expr(PAIRS_PER_THREAD == 1):
+                cos_raw = buffer_ops.buffer_load(
+                    cos_rsrc, cs_off, vec_width=1, dtype=T.bf16
+                )
+                sin_raw = buffer_ops.buffer_load(
+                    sin_rsrc, cs_off, vec_width=1, dtype=T.bf16
+                )
+            else:
+                cos_raw = buffer_ops.buffer_load(
+                    cos_rsrc, cs_off, vec_width=PAIRS_PER_THREAD, dtype=T.bf16
+                )
+                sin_raw = buffer_ops.buffer_load(
+                    sin_rsrc, cs_off, vec_width=PAIRS_PER_THREAD, dtype=T.bf16
+                )
+
+            # ---- RMSNorm: sumsq reduction (overlaps with cos/sin loads) ----
             x2 = x_f32_vec * x_f32_vec
             sq_local = x2.reduce(ReductionOp.ADD, fastmath=fm_fast)
 
@@ -519,7 +547,6 @@ def _build_kernel(
                 else:
                     am_local = fmath.absf(x_f32_vec).reduce(ReductionOp.MAX)
 
-                # Fused wave reduce: interleave sumsq-ADD and amax-MAX
                 w_sq = _to_raw(sq_local)
                 w_am = _to_raw(am_local)
                 for sh_exp in range_constexpr(log2_block):
@@ -532,7 +559,7 @@ def _build_kernel(
                         )
                         w_am = arith.maximumf(w_am, peer_am)
                 sq_block = w_sq
-                am_group = w_am  # per-group after partial butterfly
+                am_group = w_am
             else:
                 sq_block = wave_reduce_add(sq_local)
 
@@ -571,10 +598,7 @@ def _build_kernel(
                     else:
                         buffer_ops.buffer_store(scale_val, scale_rsrc, my_scale_off)
 
-            # ---- Common: scale-multiply for ALL threads (hoisted) ----
-            # This computation was previously duplicated inside both the
-            # ROPE and NOPE branches.  Hoisting it eliminates ~VEC ALU ops
-            # of redundant work in the divergent NOPE path.
+            # ---- Scale-multiply ----
             scaled = []
             for vi in range_constexpr(VEC):
                 xi = x_f32_vec[vi]
@@ -585,42 +609,16 @@ def _build_kernel(
                 else:
                     scaled.append(xi * rstd)
 
-            # ---- GPT-J RoPE via select (no rmem, no branch divergence) ----
-            # All threads load cos/sin (NOPE threads clamp index to 0,
-            # value unused). All threads compute rotated values. Then
-            # arith.select picks rotated vs scaled per-element.
-            is_rope_t = arith.cmpi(
-                CmpIPredicate.sge,
-                _to_raw(tid),
-                arith.constant(ROPE_THREAD_LO, type=i32),
-            )
-            rope_rel_raw = ArithValue(tid) - arith.constant(ROPE_THREAD_LO, type=i32)
-            rope_rel = arith.maxsi(_to_raw(rope_rel_raw), arith.constant(0, type=i32))
-            cs_off = cos_sin_row_base + ArithValue(rope_rel) * arith.constant(
-                PAIRS_PER_THREAD, type=i32
-            )
-
+            # ---- Extract cos/sin values (loads issued early, now consumed) ----
             if const_expr(PAIRS_PER_THREAD == 1):
-                cos_b = buffer_ops.buffer_load(
-                    cos_rsrc, cs_off, vec_width=1, dtype=T.bf16
-                )
-                sin_b = buffer_ops.buffer_load(
-                    sin_rsrc, cs_off, vec_width=1, dtype=T.bf16
-                )
-                cos_vals = [arith.extf(f32, cos_b)]
-                sin_vals = [arith.extf(f32, sin_b)]
+                cos_vals = [arith.extf(f32, cos_raw)]
+                sin_vals = [arith.extf(f32, sin_raw)]
             else:
-                cos_vec = buffer_ops.buffer_load(
-                    cos_rsrc, cs_off, vec_width=PAIRS_PER_THREAD, dtype=T.bf16
-                )
-                sin_vec = buffer_ops.buffer_load(
-                    sin_rsrc, cs_off, vec_width=PAIRS_PER_THREAD, dtype=T.bf16
-                )
                 cos_vals = [
                     arith.extf(
                         f32,
                         vector.extract(
-                            cos_vec, static_position=[i], dynamic_position=[]
+                            cos_raw, static_position=[i], dynamic_position=[]
                         ),
                     )
                     for i in range(PAIRS_PER_THREAD)
@@ -629,7 +627,7 @@ def _build_kernel(
                     arith.extf(
                         f32,
                         vector.extract(
-                            sin_vec, static_position=[i], dynamic_position=[]
+                            sin_raw, static_position=[i], dynamic_position=[]
                         ),
                     )
                     for i in range(PAIRS_PER_THREAD)
@@ -918,6 +916,7 @@ def _build_kernel(
 
 _DEFAULT_COMPILE_HINTS = {
     "waves_per_eu": 8,
+    "maxnreg": 64,
     "fast_fp_math": True,
     "unsafe_fp_math": True,
 }
