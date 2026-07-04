@@ -709,6 +709,7 @@ __global__ void __launch_bounds__(512, 1) allgather_naive(
         int write_idx     = warp_id * size + idx;
         result[write_idx] = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -736,6 +737,7 @@ __global__ void __launch_bounds__(512, 1) allgather_vec(
         int write_idx                                   = warp_id * size + idx;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -772,6 +774,7 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
         int write_idx                                   = (ngpus * y + warp_id) * last_dim_size + x;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // ========== reduce_scatter kernel start ==========
@@ -813,6 +816,7 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
         *(reinterpret_cast<P*>(result) + store_index) =
             packed_reduce<P, ngpus, A>(ptrs, load_index);
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on last dim — naive (non-vectorized) fallback.
@@ -850,6 +854,7 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
     }
     result[i] = downcast_s<T>(rslt_reg);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on last dim — vectorized (16B / thread).
@@ -883,6 +888,7 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
     int load_index = index_y * packed_dim_n + rank * splited_n + index_x;
     *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on middle dim — naive (non-vectorized) fallback.
@@ -920,6 +926,7 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
     }
     result[i] = downcast_s<T>(rslt_reg);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // reduce_scatter, scatter on middle dim — vectorized (16B / thread along k).
@@ -954,6 +961,7 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim(
     int load_index = index_m * (n * packed_dim_k) + (rank * splited_n + index_n) * packed_dim_k + index_k;
     *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 // ========== reduce_scatter kernel end ==========
 
@@ -2029,6 +2037,7 @@ __global__ void __launch_bounds__(1024, 1)
             *reinterpret_cast<OP*>(output + out_idx) = zero_pack;
         }
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // Per-group quant variant of the 1-stage fused allreduce+rmsnorm kernel.
@@ -2112,6 +2121,7 @@ __global__ void __launch_bounds__(1024, 1)
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             group_size, output, scale_out, active, bf16_output, token_num);
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, typename OutT, int NGPUS>
@@ -2221,6 +2231,7 @@ __global__ void __launch_bounds__(1024, 1)
             acc, weight_p, hidden_dim, eps, idx, tidx, padded_block_size,
             output, scale_out, active, bf16_output);
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int NGPUS>
