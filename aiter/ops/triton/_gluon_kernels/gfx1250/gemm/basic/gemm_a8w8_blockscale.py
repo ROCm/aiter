@@ -1037,7 +1037,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         if not SCALAR_B_SCALE:
             cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
-            
+
         # Advance scales
         if SCALAR_B_SCALE:
             b_scale = gl.load(
@@ -1050,15 +1050,14 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr, offsets=offs_a_scale, cache=cache_modifier
         )
-            
-            
+
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         if SCALAR_B_SCALE:
             cur_ab_scale = cur_a_scale[:, None] * cur_b_scale
         else:
             cur_ab_scale = cur_a_scale[:, None] * cur_b_scale[None, :]
         acc += res * cur_ab_scale
-                    
+
         # TDM load next tile
         gl.amd.gfx1250.tdm.async_load(
             a_desc,
