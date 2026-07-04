@@ -32,11 +32,12 @@ using i8_t   = signed char;
 using fp8_t  = _BitInt(8);
 
 // Per-kernel traits: one Traits param carrying the element type(s) + tile consts.
-template <typename Scalar, int Width>
+template <typename Scalar, int Width, bool Gemma = false>
 struct fwd_traits
 {
-    using scalar_t             = Scalar;
-    static constexpr int width = Width;
+    using scalar_t              = Scalar;
+    static constexpr int width  = Width;
+    static constexpr bool gemma = Gemma; // gemma_norm: multiply by (weight + 1)
 };
 template <typename In, typename Out, int Width>
 struct quant_traits
@@ -56,7 +57,7 @@ struct be_traits
 // rmsnorm, optionally fused with a residual add. residual != 0: s = in + residual,
 // residual = s (pre-norm), out = rmsnorm(s) * weight (in-place when out == in).
 // model_sensitive != 0 selects the T5 variant (round s*inv to dtype before *w).
-template <typename Traits, bool GEMMA = false>
+template <typename Traits>
 __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out,
                                      const void* __restrict__ in,
                                      const void* __restrict__ weight,
@@ -98,7 +99,7 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out,
 
 #if !defined(__HIP_DEVICE_COMPILE__)
 // Host pass: empty stubs so the __device_stub__ symbols resolve.
-template <typename Traits, bool GEMMA>
+template <typename Traits>
 __global__ void rmsnorm2d_fwd_kernel(void*, const void*, const void*, void*, float, int, int, int)
 {
 }
@@ -275,7 +276,7 @@ __global__ void rmsnorm2d_fwd_be_kernel(void* __restrict__ out_,
     }
 }
 
-template <typename Traits, bool GEMMA>
+template <typename Traits>
 __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
                                      const void* __restrict__ in_,
                                      const void* __restrict__ weight_,
@@ -285,11 +286,12 @@ __global__ void rmsnorm2d_fwd_kernel(void* __restrict__ out_,
                                      int hidden,
                                      int model_sensitive)
 {
-    using scalar_t       = typename Traits::scalar_t;
-    constexpr int width  = Traits::width;
-    using V              = vec_t<scalar_t, width>;
-    using Vf             = vec_t<float, width>;
-    const bool t5        = model_sensitive != 0;
+    using scalar_t        = typename Traits::scalar_t;
+    constexpr int width   = Traits::width;
+    constexpr bool GEMMA  = Traits::gemma;
+    using V               = vec_t<scalar_t, width>;
+    using Vf              = vec_t<float, width>;
+    const bool t5         = model_sensitive != 0;
     const bool add       = residual_ != nullptr;
     const int lane       = opus::thread_id_x();
     const int tpr        = opus::block_size_x();

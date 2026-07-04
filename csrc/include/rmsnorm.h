@@ -142,7 +142,7 @@ inline void launch_norm(void* out,
     // gemma is a compile-time template param: GEMMA==false is byte-identical to the
     // pre-gemma kernel (no runtime cost), only gemma launches the (weight+1) variant.
 #define OPUS_LAUNCH_FWD(WIDTH, G)                                                   \
-    hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<fwd_traits<scalar_t, WIDTH>, G>),      \
+    hipLaunchKernelGGL((rmsnorm2d_fwd_kernel<fwd_traits<scalar_t, WIDTH, G>>),      \
                        d.grid, d.block, 0, stream, out, in, weight, residual,       \
                        epsilon, rows, hidden, model_sensitive)
     if(vec)
