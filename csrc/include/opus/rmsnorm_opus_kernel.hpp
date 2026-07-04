@@ -713,7 +713,8 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
 #pragma unroll
     for(int j = 0; j < TDS; ++j)
         sq += f[j] * f[j];
-    float inv = rsqrtf(block_reduce_1d<false, BLK>(sq) / n + epsilon);
+    // mean via fast reciprocal of n (v_rcp_iflag), avoiding a full IEEE divide.
+    float inv = rsqrtf(block_reduce_1d<false, BLK>(sq) * __builtin_amdgcn_rcpf((float)n) + epsilon);
 
     const opus::fp32x2_t invv{inv, inv};
 #pragma unroll
@@ -741,13 +742,16 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
     for(int j = 0; j < TDS; ++j)
         tmax = fmaxf(tmax, fabsf(f[j]));
 
-    const float qm = FP4 ? 6.0f : qmax;
+    // Fast reciprocals (v_rcp_f32), matching the reference: it stores max*(1/qmax) and
+    // quantizes with v_rcp(scale). Full IEEE divides here cost ~10 VALU each and, on the
+    // latency-bound small-n paths, are the main gap vs module_rmsnorm_quant.
+    const float iqm = FP4 ? 0.0f : __builtin_amdgcn_rcpf(qmax); // 1/qmax (unused for fp4)
     float inv_ys; // store scale factor passed to store_vector (fp4: forward e8m0)
     if(group_size == 0)
     {
-        float gmax  = block_reduce_1d<true, BLK>(tmax);
-        float ys    = gmax / qm;
-        inv_ys      = ys > 0.0f ? 1.0f / ys : 0.0f;
+        float gmax = block_reduce_1d<true, BLK>(tmax);
+        float ys   = gmax * iqm;
+        inv_ys     = ys > 0.0f ? __builtin_amdgcn_rcpf(ys) : 0.0f;
         if(tid == 0 && scale_)
             reinterpret_cast<float*>(scale_)[row] = ys;
     }
@@ -767,8 +771,8 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
         }
         else
         {
-            ys     = tmax / qm;
-            inv_ys = ys > 0.0f ? 1.0f / ys : 0.0f;
+            ys     = tmax * iqm;
+            inv_ys = ys > 0.0f ? __builtin_amdgcn_rcpf(ys) : 0.0f;
         }
         if((tid % rts) == 0 && col0 < n && scale_)
         {
