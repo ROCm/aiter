@@ -9,6 +9,7 @@
 #define OPUS_FP32_to_BF16_DEFAULT 0
 #endif
 #include "opus/opus.hpp"
+#include "opus/rmsnorm_opus_quant_detail.hpp"
 
 namespace aiter {
 
