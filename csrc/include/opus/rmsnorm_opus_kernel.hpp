@@ -80,15 +80,13 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out,
 // per block, thread tid owns TDS contiguous elements, so a group of group_size
 // elements = reduce_thread_size = group_size/TDS contiguous lanes. Covers no-quant,
 // per-token & grouped int8/fp8/fp4, fused-add, gemma, smooth, shuffle, strided rows.
-template <typename In, typename Out, int Blk, int Tds, bool Add, bool Quant>
+template <typename In, typename Out, int Blk, int Tds>
 struct arq_opus_traits
 {
-    using in_t                = In;
-    using out_t               = Out;
-    static constexpr int BLK  = Blk;
-    static constexpr int TDS  = Tds;
-    static constexpr bool ADD = Add;
-    static constexpr bool QNT = Quant;
+    using in_t               = In;
+    using out_t              = Out;
+    static constexpr int BLK = Blk;
+    static constexpr int TDS = Tds;
 };
 template <typename Traits>
 __global__ void add_rmsnorm_quant_opus(void* __restrict__ out,
@@ -589,9 +587,9 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
     using in_t         = typename Traits::in_t;
     using out_t        = typename Traits::out_t;
     constexpr int TDS  = Traits::TDS;
-    constexpr bool ADD = Traits::ADD;
-    constexpr bool QNT = Traits::QNT;
     constexpr bool FP4 = std::is_same_v<out_t, opus::fp4_t>;
+    constexpr bool QNT = !std::is_same_v<out_t, in_t>; // quant when out dtype != in
+    const bool ADD     = rin_ != nullptr;              // fused-add when residual given
     const int row      = opus::block_id_x();
     if(row >= m)
         return;
@@ -610,7 +608,7 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
     {
         int c   = col0 + j;
         float x = (c < n) ? opus::cast<float>(in[c]) : 0.0f;
-        if constexpr(ADD)
+        if(ADD)
         {
             if(c < n)
             {
@@ -702,6 +700,7 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
 
     if constexpr(FP4)
     {
+#if defined(__gfx950__) // fp32_to_fp4 (cvt_scalef32) is gfx950-only; fp4 unused elsewhere
         unsigned char* o = reinterpret_cast<unsigned char*>(out_) + (size_t)row * out_s + col0 / 2;
 #pragma unroll
         for(int j = 0; j < TDS; j += 2)
@@ -711,6 +710,7 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
                 auto b            = opus::fp32_to_fp4_packed_x2(pr, inv_ys);
                 o[j / 2]          = __builtin_bit_cast(unsigned char, b);
             }
+#endif
     }
     else
     {

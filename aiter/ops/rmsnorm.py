@@ -439,51 +439,159 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
         )
 
 
-@compile_ops("module_rmsnorm_quant")
-def add_rmsnorm_quant(
-    out: Tensor,
-    input: Tensor,
-    residual_in: Tensor,
-    residual_out: Tensor,
-    scale: Tensor,
-    weight: Tensor,
+# ---------------------------------------------------------------------------
+# module_rmsnorm_quant surface, now served by opus (add_rmsnorm_quant_opus).
+# out_code: -1 no-quant, 0 int8, 1 fp8, 2 fp4x2. Grouped/shuffle/fp4 + strided.
+# ---------------------------------------------------------------------------
+@compile_ops("module_rmsnorm", fc_name="add_rmsnorm_quant_opus_raw", ffi_type="ctypes")
+def _add_rmsnorm_quant_opus_raw(
+    out: int,
+    rout: int,
+    scale: int,
+    input: int,
+    rin: int,
+    weight: int,
+    xscale: int,
     epsilon: float,
-    group_size: int = 0,
-    shuffle_scale: bool = False,
-    gemma_norm: bool = False,
+    m: int,
+    n: int,
+    qmax: float,
+    in_code: int,
+    out_code: int,
+    in_s: int,
+    rin_s: int,
+    rout_s: int,
+    out_s: int,
+    group_size: int,
+    shuffle: int,
+    gemma: int,
+    cu_num: int,
+    stream: int,
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm_quant")
+def _out_code_qmax(out_dtype):
+    if out_dtype == torch.int8:
+        return 0, 127.0
+    if out_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return 1, float(get_dtype_max(out_dtype))
+    return 2, 6.0  # fp4x2 (MXFP4, e8m0 block scale)
+
+
+def _arq(
+    out,
+    input,
+    weight,
+    epsilon,
+    out_code,
+    qmax,
+    scale=None,
+    residual_in=None,
+    residual_out=None,
+    group_size=0,
+    shuffle_scale=False,
+    gemma_norm=False,
+):
+    assert input.dtype in _DTYPE_CODE and input.is_contiguous()
+    n = input.shape[-1]
+    m = input.numel() // n
+    add = residual_in is not None
+    cu = torch.cuda.get_device_properties(input.device).multi_processor_count
+    _add_rmsnorm_quant_opus_raw(
+        out.data_ptr(),
+        residual_out.data_ptr() if add else 0,
+        scale.data_ptr() if scale is not None else 0,
+        input.data_ptr(),
+        residual_in.data_ptr() if add else 0,
+        weight.data_ptr(),
+        0,
+        float(epsilon),
+        m,
+        n,
+        float(qmax),
+        _DTYPE_CODE[input.dtype],
+        out_code,
+        input.stride(0),
+        residual_in.stride(0) if add else 0,
+        residual_out.stride(0) if add else 0,
+        out.stride(0),
+        int(group_size),
+        int(shuffle_scale),
+        int(gemma_norm),
+        int(cu),
+        torch.cuda.current_stream().cuda_stream,
+    )
+
+
+def rmsnorm(out, input, weight, epsilon, gemma_norm=False):
+    _arq(out, input, weight, epsilon, -1, 0.0, gemma_norm=gemma_norm)
+
+
 def add_rmsnorm(
-    out: Tensor,
-    input: Tensor,
-    residual_in: Tensor,
-    residual_out: Tensor,
-    weight: Tensor,
-    epsilon: float,
-    gemma_norm: bool = False,
-) -> None: ...
+    out, input, residual_in, residual_out, weight, epsilon, gemma_norm=False
+):
+    _arq(
+        out,
+        input,
+        weight,
+        epsilon,
+        -1,
+        0.0,
+        residual_in=residual_in,
+        residual_out=residual_out,
+        gemma_norm=gemma_norm,
+    )
 
 
-@compile_ops("module_rmsnorm_quant")
 def rmsnorm_quant(
-    out: Tensor,
-    input: Tensor,
-    scale: Tensor,
-    weight: Tensor,
-    epsilon: float,
-    group_size: int = 0,
-    shuffle_scale: bool = False,
-    gemma_norm: bool = False,
-) -> None: ...
+    out,
+    input,
+    scale,
+    weight,
+    epsilon,
+    group_size=0,
+    shuffle_scale=False,
+    gemma_norm=False,
+):
+    oc, qmax = _out_code_qmax(out.dtype)
+    _arq(
+        out,
+        input,
+        weight,
+        epsilon,
+        oc,
+        qmax,
+        scale=scale,
+        group_size=group_size,
+        shuffle_scale=shuffle_scale,
+        gemma_norm=gemma_norm,
+    )
 
 
-@compile_ops("module_rmsnorm_quant")
-def rmsnorm(
-    out: Tensor,
-    input: Tensor,
-    weight: Tensor,
-    epsilon: float,
-    gemma_norm: bool = False,
-) -> None: ...
+def add_rmsnorm_quant(
+    out,
+    input,
+    residual_in,
+    residual_out,
+    scale,
+    weight,
+    epsilon,
+    group_size=0,
+    shuffle_scale=False,
+    gemma_norm=False,
+):
+    oc, qmax = _out_code_qmax(out.dtype)
+    _arq(
+        out,
+        input,
+        weight,
+        epsilon,
+        oc,
+        qmax,
+        scale=scale,
+        residual_in=residual_in,
+        residual_out=residual_out,
+        group_size=group_size,
+        shuffle_scale=shuffle_scale,
+        gemma_norm=gemma_norm,
+    )

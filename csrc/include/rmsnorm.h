@@ -252,4 +252,74 @@ inline void launch_quant(void* out,
 #undef OPUS_QUANT
 }
 
+// ---------------------------------------------------------------------------
+// module_rmsnorm_quant replacement: no-quant / per-token / grouped / fp4 quant,
+// fused-add, gemma, smooth, shuffle_scale, strided rows. Mirrors the reference
+// per-n (BlockSize, thread_data_size) dispatch; grouped picks by cu_num. n<=8192.
+// out_code: -1 no-quant (out=in), 0 int8, 1 fp8, 2 fp4x2. in_code: 0 fp16, 1 bf16.
+// ---------------------------------------------------------------------------
+template <typename in_t, typename out_t>
+inline void launch_arq_io(void* out, void* rout, void* scale, const void* in, const void* rin,
+                          const void* w, const void* xsc, float epsilon, int m, int n, float qmax,
+                          int in_s, int rin_s, int rout_s, int out_s, int group, int shuffle,
+                          int gemma, int cu_num, hipStream_t s)
+{
+#define ARQ(BLK, TDS)                                                                          \
+    hipLaunchKernelGGL((add_rmsnorm_quant_opus<arq_opus_traits<in_t, out_t, BLK, TDS>>),       \
+                       dim3(m), dim3(BLK), 0, s, out, rout, scale, in, rin, w, xsc, epsilon, m, \
+                       n, qmax, in_s, rin_s, rout_s, out_s, group, shuffle, gemma)
+    if(group > 0)
+    {
+        if(cu_num < 160)
+            ARQ(512, 16);
+        else
+            ARQ(1024, 8);
+    }
+    else if(n <= 512)
+        ARQ(64, 8);
+    else if(n <= 1024)
+        ARQ(128, 8);
+    else if(n <= 2048)
+        ARQ(256, 8);
+    else if(n <= 4096)
+        ARQ(256, 16);
+    else if(n <= 6144)
+        ARQ(256, 24);
+    else
+        ARQ(256, 32);
+#undef ARQ
+}
+
+inline void launch_arq(int in_code, int out_code, void* out, void* rout, void* scale,
+                       const void* in, const void* rin, const void* w, const void* xsc,
+                       float epsilon, int m, int n, float qmax, int in_s, int rin_s, int rout_s,
+                       int out_s, int group, int shuffle, int gemma, int cu_num, hipStream_t s)
+{
+#define ARQ_OUT(IN_T)                                                                              \
+    do                                                                                             \
+    {                                                                                              \
+        if(out_code < 0)                                                                           \
+            launch_arq_io<IN_T, IN_T>(out, rout, scale, in, rin, w, xsc, epsilon, m, n, qmax,      \
+                                      in_s, rin_s, rout_s, out_s, group, shuffle, gemma, cu_num,    \
+                                      s);                                                           \
+        else if(out_code == 0)                                                                     \
+            launch_arq_io<IN_T, i8_t>(out, rout, scale, in, rin, w, xsc, epsilon, m, n, qmax,      \
+                                      in_s, rin_s, rout_s, out_s, group, shuffle, gemma, cu_num,    \
+                                      s);                                                           \
+        else if(out_code == 1)                                                                     \
+            launch_arq_io<IN_T, fp8_t>(out, rout, scale, in, rin, w, xsc, epsilon, m, n, qmax,     \
+                                       in_s, rin_s, rout_s, out_s, group, shuffle, gemma, cu_num,   \
+                                       s);                                                          \
+        else                                                                                       \
+            launch_arq_io<IN_T, opus::fp4_t>(out, rout, scale, in, rin, w, xsc, epsilon, m, n,     \
+                                             qmax, in_s, rin_s, rout_s, out_s, group, shuffle,      \
+                                             gemma, cu_num, s);                                     \
+    } while(0)
+    if(in_code == 1)
+        ARQ_OUT(bf16_t);
+    else
+        ARQ_OUT(fp16_t);
+#undef ARQ_OUT
+}
+
 } // namespace aiter

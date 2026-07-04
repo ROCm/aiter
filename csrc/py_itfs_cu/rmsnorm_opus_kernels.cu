@@ -98,3 +98,56 @@ OPUS_EXPORT void rms_norm_quant_opus(size_t out,
                  model_sensitive,
                  reinterpret_cast<hipStream_t>(stream));
 }
+
+// module_rmsnorm_quant replacement: no-quant / per-token / grouped / fp4 quant,
+// fused-add (residual != 0), gemma, smooth (xscale != 0), shuffle_scale, strided.
+// out_code: -1 no-quant, 0 int8, 1 fp8, 2 fp4x2. in_code: 0 fp16, 1 bf16.
+OPUS_EXPORT void add_rmsnorm_quant_opus_raw(size_t out,
+                                            size_t rout,
+                                            size_t scale,
+                                            size_t in,
+                                            size_t rin,
+                                            size_t weight,
+                                            size_t xscale,
+                                            float epsilon,
+                                            int m,
+                                            int n,
+                                            float qmax,
+                                            int in_code,
+                                            int out_code,
+                                            int in_s,
+                                            int rin_s,
+                                            int rout_s,
+                                            int out_s,
+                                            int group_size,
+                                            int shuffle,
+                                            int gemma,
+                                            int cu_num,
+                                            size_t stream)
+{
+    using namespace aiter;
+    if(m <= 0 || n <= 0)
+        return;
+    launch_arq(in_code,
+               out_code,
+               reinterpret_cast<void*>(out),
+               reinterpret_cast<void*>(rout),
+               reinterpret_cast<void*>(scale),
+               reinterpret_cast<const void*>(in),
+               reinterpret_cast<const void*>(rin),
+               reinterpret_cast<const void*>(weight),
+               reinterpret_cast<const void*>(xscale),
+               epsilon,
+               m,
+               n,
+               qmax,
+               in_s,
+               rin_s,
+               rout_s,
+               out_s,
+               group_size,
+               shuffle,
+               gemma,
+               cu_num,
+               reinterpret_cast<hipStream_t>(stream));
+}
