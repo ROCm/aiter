@@ -63,6 +63,10 @@ def rms_norm_opus(
     gemma_norm: bool = False,
 ) -> None:
     """out = rmsnorm(input) * (weight [+ 1 if gemma_norm]) (fp32 accumulate)."""
+    # The opus kernel reads rows contiguously; a strided input (e.g. a `torch.split`
+    # view feeding fused_qk_rmsnorm) must be materialized first.
+    if not input.is_contiguous():
+        input = input.contiguous()
     _check(input, weight)
     assert out.dtype == input.dtype and out.is_contiguous(), "rms_norm_opus: bad out"
     hidden = input.shape[-1]
