@@ -186,39 +186,43 @@ __device__ inline float warp_reduce_dpp(float v)
 }
 
 // Fast 1D block reduction: DPP all-reduce within a warp (wave64), then a single LDS
-// exchange across warps. Replaces the LDS reduction on the memory-light per-token /
-// no-add quant paths, where the reduce latency is on the critical path.
-template <bool IS_MAX>
+// exchange across warps combined serially (no ds_bpermute). Replaces the LDS reduction
+// on the memory-light per-token / no-add quant paths, where the reduce is on the
+// critical path. NWARP = BLK/warp is compile-time so the cross-warp loop fully unrolls.
+template <bool IS_MAX, int BLK>
 __device__ inline float block_reduce_1d(float v)
 {
-    constexpr int W = opus::get_warp_size();
-    const int lane  = opus::lane_id();
-    const int nwarp = opus::block_size_x() / W;
+    constexpr int W     = opus::get_warp_size();
+    constexpr int NWARP = BLK / W;
     if constexpr(W == 64)
         v = warp_reduce_dpp<IS_MAX>(v);
     else
+    {
+        const int lane = opus::lane_id();
 #pragma unroll
         for(int k = W >> 1; k > 0; k >>= 1)
         {
             float o = opus::shfl(v, lane ^ k);
             v       = IS_MAX ? fmaxf(v, o) : v + o;
         }
-    if(nwarp == 1)
-        return v;
-    __shared__ float s[64];
-    const int warp = opus::thread_id_x() / W;
-    opus::sync_threads(); // leading barrier: s[] is reused across the sum + max reduces
-    if(lane == 0)
-        s[warp] = v;
-    opus::sync_threads();
-    float r = (lane < nwarp) ? s[lane] : (IS_MAX ? -3.4e38f : 0.0f);
-#pragma unroll
-    for(int k = W >> 1; k > 0; k >>= 1)
-    {
-        float o = opus::shfl(r, lane ^ k);
-        r       = IS_MAX ? fmaxf(r, o) : r + o;
     }
-    return r; // every lane holds the full-block reduction
+    if constexpr(NWARP == 1)
+        return v;
+    else
+    {
+        __shared__ float s[NWARP];
+        const int lane = opus::lane_id();
+        const int warp = opus::thread_id_x() / W;
+        opus::sync_threads(); // leading barrier: s[] reused across the sum + max reduces
+        if(lane == 0)
+            s[warp] = v;
+        opus::sync_threads();
+        float r = s[0]; // every thread combines the NWARP partials from LDS
+#pragma unroll
+        for(int w = 1; w < NWARP; ++w)
+            r = IS_MAX ? fmaxf(r, s[w]) : r + s[w];
+        return r;
+    }
 }
 
 template <typename scalar_t, int width>
@@ -701,16 +705,13 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
             f[j] = opus::cast<float>(td_i[j]);
     }
 
-    // packed square-sum + normalize (v_pk_mul_f32 on CDNA), matching the reference.
+    // scalar square-sum (v_fmac) + packed normalize (v_pk_mul_f32), matching the reference.
     auto* f2 = reinterpret_cast<opus::fp32x2_t*>(&f);
     float sq = 0.0f;
 #pragma unroll
-    for(int j = 0; j < TDS / 2; ++j)
-    {
-        opus::fp32x2_t p = pk_mul_f32(f2[j], f2[j]);
-        sq += p[0] + p[1];
-    }
-    float inv = rsqrtf(block_reduce_1d<false>(sq) / n + epsilon);
+    for(int j = 0; j < TDS; ++j)
+        sq += f[j] * f[j];
+    float inv = rsqrtf(block_reduce_1d<false, BLK>(sq) / n + epsilon);
 
     const opus::fp32x2_t invv{inv, inv};
 #pragma unroll
@@ -742,7 +743,7 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
     float inv_ys; // store scale factor passed to store_vector (fp4: forward e8m0)
     if(group_size == 0)
     {
-        float gmax  = block_reduce_1d<true>(tmax);
+        float gmax  = block_reduce_1d<true, BLK>(tmax);
         float ys    = gmax / qm;
         inv_ys      = ys > 0.0f ? 1.0f / ys : 0.0f;
         if(tid == 0 && scale_)
