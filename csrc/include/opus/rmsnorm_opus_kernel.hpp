@@ -168,9 +168,47 @@ __device__ inline float block_reduce(float v)
     return s[base];
 }
 
-// Wave64 intra-warp all-reduce via DPP (single-cycle ALU cross-lane, ~20x lower
-// latency than ds_bpermute). bound_ctrl 0-fill is a valid identity here: sum operates
-// on squares and max on |values|, both non-negative. Result broadcast to all lanes.
+// Cross-lane partner value (lane ^ LG/2) within an aligned lanegroup of size LG.
+// Real v_mov_b32_dpp for LG<=16 (no LDS): quad_perm for 2/4; for 8/16, upd_dpp with an
+// uninitialized old value + complementary bank masks (the trick from carlushuang/gcnasm
+// warp_sort_bitonic — passing a defined old would emit an extra v_mov before the dpp, and
+// plain mov_dpp with row controls falls back to ds_bpermute on CDNA3). 32/64 use shfl.
+template <typename T, int LG>
+__device__ inline T warp_swap_(const T& x, int lane)
+{
+    if constexpr(LG == 2)
+        return opus::mov_dpp(x, opus::number<0xb1>{}); // quad_perm:[1,0,3,2]
+    else if constexpr(LG == 4)
+        return opus::mov_dpp(x, opus::number<0x4e>{}); // quad_perm:[2,3,0,1]
+    else if constexpr(LG == 8)
+    {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wuninitialized"
+        T r;
+        r = opus::upd_dpp(r, x, opus::number<260>{}, opus::number<0xf>{}, opus::number<0b0101>{}); // row_shl:4
+        r = opus::upd_dpp(r, x, opus::number<276>{}, opus::number<0xf>{}, opus::number<0b1010>{}); // row_shr:4
+#pragma clang diagnostic pop
+        return r;
+    }
+    else if constexpr(LG == 16)
+    {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wuninitialized"
+        T r;
+        r = opus::upd_dpp(r, x, opus::number<264>{}, opus::number<0xf>{}, opus::number<0b0011>{}); // row_shl:8
+        r = opus::upd_dpp(r, x, opus::number<280>{}, opus::number<0xf>{}, opus::number<0b1100>{}); // row_shr:8
+#pragma clang diagnostic pop
+        return r;
+    }
+    else if constexpr(LG == 32)
+        return opus::shfl(x, lane ^ 16);
+    else // LG == 64
+        return opus::shfl(x, lane ^ 32);
+}
+
+// Wave64 intra-warp all-reduce. The row_shr / row_bcast controls fuse into v_add_f32_dpp /
+// v_mov_b32_dpp (real single-cycle DPP, no ds_bpermute); result broadcast via readlane.
+// (A quad_perm+shfl butterfly would add ds_bpermute for the 32/64 span, so keep this form.)
 template <bool IS_MAX>
 __device__ inline float warp_reduce_dpp(float v)
 {
@@ -758,12 +796,20 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
     }
     else
     {
-        const int rts  = group_size / TDS; // contiguous lanes per group
+        // group-max over rts contiguous lanes via the warp_swap_ butterfly: real DPP for
+        // rts<=16 (no ds_bpermute), so the grouped small-n path stops paying LDS latency.
+        const int rts  = group_size / TDS;
         const int lane = opus::lane_id();
-#pragma unroll
-        for(int k = 1; k < 64; k <<= 1)
-            if(k < rts)
-                tmax = fmaxf(tmax, opus::shfl(tmax, lane ^ k));
+        if(rts >= 2)
+            tmax = fmaxf(tmax, warp_swap_<float, 2>(tmax, lane));
+        if(rts >= 4)
+            tmax = fmaxf(tmax, warp_swap_<float, 4>(tmax, lane));
+        if(rts >= 8)
+            tmax = fmaxf(tmax, warp_swap_<float, 8>(tmax, lane));
+        if(rts >= 16)
+            tmax = fmaxf(tmax, warp_swap_<float, 16>(tmax, lane));
+        if(rts >= 32)
+            tmax = fmaxf(tmax, warp_swap_<float, 32>(tmax, lane));
         float ys;
         if constexpr(FP4)
         {
