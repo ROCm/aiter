@@ -917,7 +917,6 @@ def _build_kernel(
 
 _DEFAULT_COMPILE_HINTS = {
     "waves_per_eu": 8,
-    "maxnreg": 64,
     "fast_fp_math": True,
     "unsafe_fp_math": True,
 }
