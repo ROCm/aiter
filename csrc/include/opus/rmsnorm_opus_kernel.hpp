@@ -11,9 +11,9 @@
 #ifndef OPUS_FP32_to_BF16_DEFAULT
 #define OPUS_FP32_to_BF16_DEFAULT 0
 #endif
-#ifdef __HIP_DEVICE_COMPILE__
+// opus.hpp on both passes: host-safe since ROCm 7.2 / #4056 gated the device-only
+// TDM builtin, so the host launcher can source its element types from opus (below).
 #include "opus/opus.hpp"
-#endif
 
 namespace aiter {
 

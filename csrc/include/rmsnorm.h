@@ -11,19 +11,13 @@
 
 namespace aiter {
 
-// Element-type vocabulary for instantiating the kernels below. Defined here (not
-// from opus.hpp) because the host pass cannot include opus.hpp; the device kernels
-// themselves work in template types + builtin float and need none of these.
-#if defined(__clang_major__) && __clang_major__ >= 20
-using bf16_t = __bf16;
-using fp16_t = __fp16;
-#else
-using bf16_t = unsigned short;
-using fp16_t = _Float16;
-#endif
-using fp32_t = float;
-using i8_t   = signed char;
-using fp8_t  = _BitInt(8);
+// Element-type vocabulary for instantiating the kernels below, sourced from opus
+// (single source of truth; opus.hpp is host-includable via rmsnorm_opus_kernel.hpp).
+using bf16_t = opus::bf16_t;
+using fp16_t = opus::fp16_t;
+using fp32_t = opus::fp32_t;
+using i8_t   = opus::i8_t;
+using fp8_t  = opus::fp8_t;
 
 // 2D launch geometry as (block, grid): x = threads/row (pow2), y = rows/block.
 // Large hidden -> 1 row/block; small hidden packs rows so tiny rows aren't
