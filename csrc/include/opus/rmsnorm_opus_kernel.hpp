@@ -821,10 +821,14 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
             ys     = tmax * iqm;
             inv_ys = ys > 0.0f ? __builtin_amdgcn_rcpf(ys) : 0.0f;
         }
-        if((tid % rts) == 0 && col0 < n && scale_)
+        // rts is a power of two, so the per-group store predicate is a cheap mask, not a
+        // runtime integer modulo (which all threads would otherwise pay every launch).
+        if((tid & (rts - 1)) == 0 && col0 < n && scale_)
         {
-            int y      = tid / rts;
-            int groups = n / group_size;
+            // rts and group_size are powers of two -> shifts, not runtime integer divides
+            // (which the compiler may hoist so every thread pays).
+            int y      = tid >> __builtin_ctz(rts);
+            int groups = n >> __builtin_ctz(group_size);
             if constexpr(FP4)
             {
                 int sp    = shuffle ? (groups + 7) / 8 * 8 : groups;
