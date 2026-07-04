@@ -189,6 +189,22 @@ model via forward hooks, deduped, and frozen there. To add a new model, append
 a `"<ModelName>": {"conv2d": [...]}` entry to `conv_shapes.json` with the same
 shape-dict fields.
 
+**Why the layer count in JSON is smaller than the model's name suggests.**
+An entry in `conv_shapes.json` is a *unique convolution shape*, not a physical
+layer. The extractor walks every `nn.Conv2d` in the model, records its
+`(N, C, H, W, K, R, S, stride, pad, dilation)` tuple, and dedupes — identical
+tuples collapse to one entry. So the count reflects distinct kernel *work
+items*, which is what the bench actually needs to measure (kernel TFLOPS is a
+function of shape, so benchmarking the same shape twice adds nothing).
+
+The gap is large because model names count *all* layers (conv + linear + norm +
+…), while the JSON holds only *conv* layers, and only the *distinct-shaped*
+ones. "ResNet-50" means ~50 weight layers total; of those, 53 are convs, but
+they collapse to **23 unique shapes** (15 × 1×1, 7 × 3×3, 1 × 7×7) because the
+network stacks many identically-shaped bottleneck blocks (e.g. all three 256→64
+1×1 reductions in `layer1` share one shape). The bench iterates the 23; the
+per-layer table therefore has 23 rows, one per unique shape.
+
 Tested on ROCm 7.2 / PyTorch `2.9.1+gitff65f5b` / Triton 3.7 (commit `23f4e522d`).
 
 ### Tuning
