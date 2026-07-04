@@ -117,10 +117,11 @@ BLOCK_THREADS = 32  # 1 wave32 on RDNA4/gfx1250
 #     workgroups (grid = (H+1) * ceil(T/R)), spreading across more CUs when the
 #     total row count is too small to fill the machine at R=32.
 ROWS_PER_WG = 32
-ROWS_PER_WG_SMALL = 16
+ROWS_PER_WG_SMALL = 4
 # At/below this token count, R=32 launches < ~256 workgroups (65*ceil(T/32)),
-# leaving CUs idle; the small-R variant fills more of them. 65*ceil(96/32)=195
-# vs 65*ceil(96/16)=390 -- the crossover where extra workgroups still help.
+# leaving CUs idle; the small-R variant fills more of them. R=4 (128 threads
+# per WG) yields many small workgroups that spread across CUs and reduce
+# memory contention under arg-rotation / changing data_ptr scenarios.
 SMALL_T_THRESHOLD = 96
 
 # SQRT2 has no aiter dependency, so it stays at module level.
