@@ -7,14 +7,6 @@ from ..jit.core import compile_ops
 from .quant import get_dtype_max
 from typing import Optional
 
-
-def _use_opus(
-    input, use_model_sensitive_rmsnorm: int = 0, gemma_norm: bool = False
-) -> bool:
-    """opus serves fp16/bf16/fp32 at any hidden; others fall back to quant module."""
-    return input.dtype in (torch.float16, torch.bfloat16, torch.float32)
-
-
 # opus is the sole rmsnorm backend (fp16/bf16/fp32, any hidden). Only group_size/
 # shuffle_scale quant and exotic dtypes fall back to module_rmsnorm_quant.
 _DTYPE_CODE = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}
@@ -310,13 +302,7 @@ def rms_norm(
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
     """rmsnorm (opus; fp16/bf16/fp32)."""
-    if _use_opus(input, use_model_sensitive_rmsnorm):
-        return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
-    # only exotic (non fp16/bf16/fp32) dtypes reach here; the shared kernel is n<=8192.
-    assert input.shape[-1] <= 8192, "rmsnorm fallback supports hidden<=8192"
-    out = torch.empty_like(input, dtype=input.dtype, device=input.device)
-    rmsnorm(out, input, weight, epsilon)
-    return out
+    return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
 def rmsnorm2d_fwd(
@@ -325,13 +311,7 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
-    if _use_opus(input, use_model_sensitive_rmsnorm):
-        return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
-    # only exotic (non fp16/bf16/fp32) dtypes reach here; the shared kernel is n<=8192.
-    assert input.shape[-1] <= 8192, "rmsnorm fallback supports hidden<=8192"
-    out = torch.empty_like(input, dtype=input.dtype, device=input.device)
-    rmsnorm(out, input, weight, epsilon)
-    return out
+    return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
 def rmsnorm2d_fwd_with_add(
@@ -344,21 +324,16 @@ def rmsnorm2d_fwd_with_add(
     gemma_norm: bool = False,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
-    if _use_opus(input, use_model_sensitive_rmsnorm, gemma_norm):
-        rmsnorm2d_fwd_with_add_opus(
-            out,
-            input,
-            residual_in,
-            residual_out,
-            weight,
-            epsilon,
-            use_model_sensitive_rmsnorm,
-            gemma_norm,
-        )
-        return
-    # only exotic (non fp16/bf16/fp32) dtypes reach here; the shared kernel is n<=8192.
-    assert input.shape[-1] <= 8192, "add_rmsnorm fallback supports hidden<=8192"
-    add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon, gemma_norm)
+    rmsnorm2d_fwd_with_add_opus(
+        out,
+        input,
+        residual_in,
+        residual_out,
+        weight,
+        epsilon,
+        use_model_sensitive_rmsnorm,
+        gemma_norm,
+    )
 
 
 def rmsnorm2d_fwd_with_smoothquant(
@@ -411,7 +386,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
-    if _use_opus(input) and group_size == 0 and not shuffle_scale:
+    if group_size == 0 and not shuffle_scale:
         rmsnorm2d_fwd_with_dynamicquant_opus(
             out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
         )
@@ -435,7 +410,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
-    if _use_opus(input) and group_size == 0 and not shuffle_scale:
+    if group_size == 0 and not shuffle_scale:
         rmsnorm2d_fwd_with_add_dynamicquant_opus(
             out,
             input,
