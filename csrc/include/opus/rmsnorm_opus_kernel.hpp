@@ -210,10 +210,12 @@ __device__ inline float block_reduce_1d(float v)
         return v;
     else
     {
+        // Each <IS_MAX,BLK> instantiation owns a distinct __shared__ array, so the sum
+        // and max reduces never race on it -> no leading barrier needed (one per reduce,
+        // matching the reference; barrier count is on the critical path at small n).
         __shared__ float s[NWARP];
         const int lane = opus::lane_id();
         const int warp = opus::thread_id_x() / W;
-        opus::sync_threads(); // leading barrier: s[] reused across the sum + max reduces
         if(lane == 0)
             s[warp] = v;
         opus::sync_threads();
