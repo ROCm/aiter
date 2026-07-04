@@ -17,18 +17,10 @@
 
 namespace aiter {
 
-// Element aliases (identical to opus REGISTER_DTYPE; local because the host pass
-// cannot include opus.hpp).
-#if defined(__clang_major__) && __clang_major__ >= 20
-using bf16_t = __bf16;
-using fp16_t = __fp16;
-#else
-using bf16_t = unsigned short;
-using fp16_t = _Float16;
-#endif
-using fp32_t = float;
-using i8_t   = signed char;
-using fp8_t  = _BitInt(8);
+// This header is the device kernel impl: it works in template element types
+// (Traits::scalar_t / in_t / out_t) plus builtin float, so it needs no element-type
+// aliases. The host-facing dtype vocabulary (bf16_t/fp16_t/fp32_t/i8_t/fp8_t, used
+// only to instantiate the launchers) lives in rmsnorm.h.
 
 // Per-kernel traits: one Traits param carrying the element type(s) + tile consts.
 template <typename Scalar, int Width, bool Gemma = false>
@@ -117,8 +109,8 @@ rmsnorm_be_opus(void*, const void*, const void*, void*, float, int, int, int)
 template <typename out_t>
 __device__ inline out_t quant_cast(float v)
 {
-    if constexpr(std::is_same_v<out_t, i8_t>)
-        return static_cast<i8_t>(__builtin_rintf(v));
+    if constexpr(std::is_same_v<out_t, signed char>)
+        return static_cast<signed char>(__builtin_rintf(v));
     else
         return opus::fp32_to_fp8(v);
 }
@@ -192,9 +184,9 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
 #pragma unroll
             for(int j = 0; j < 8; ++j)
             {
-                float f  = opus::cast<fp32_t>(x[j]) + opus::cast<fp32_t>(res_v[nx + q * TN][j]);
+                float f  = opus::cast<float>(x[j]) + opus::cast<float>(res_v[nx + q * TN][j]);
                 s[j]     = opus::cast<scalar_t>(f);
-                ni[q][j] = t5 ? opus::cast<fp32_t>(s[j]) : f;
+                ni[q][j] = t5 ? opus::cast<float>(s[j]) : f;
             }
             res_v[nx + q * TN] = s;
         }
@@ -202,7 +194,7 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
         {
 #pragma unroll
             for(int j = 0; j < 8; ++j)
-                ni[q][j] = opus::cast<fp32_t>(x[j]);
+                ni[q][j] = opus::cast<float>(x[j]);
         }
     }
 
@@ -268,8 +260,8 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
         {
             float xi = ni[q][j] * inv;
             if(t5)
-                xi = opus::cast<fp32_t>(opus::cast<scalar_t>(xi));
-            y[j] = opus::cast<scalar_t>(xi * opus::cast<fp32_t>(w[j]));
+                xi = opus::cast<float>(opus::cast<scalar_t>(xi));
+            y[j] = opus::cast<scalar_t>(xi * opus::cast<float>(w[j]));
         }
         out_v[nx + q * TN] = y;
     }
@@ -318,9 +310,9 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
 #pragma unroll
             for(int j = 0; j < width; ++j)
             {
-                float f = opus::cast<fp32_t>(x[j]) + opus::cast<fp32_t>(res_v[idx][j]);
+                float f = opus::cast<float>(x[j]) + opus::cast<float>(res_v[idx][j]);
                 s[j]    = opus::cast<scalar_t>(f);
-                ni[j]   = t5 ? opus::cast<fp32_t>(s[j]) : f;
+                ni[j]   = t5 ? opus::cast<float>(s[j]) : f;
             }
             res_v[idx] = s;
         }
@@ -328,7 +320,7 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
         {
 #pragma unroll
             for(int j = 0; j < width; ++j)
-                ni[j] = opus::cast<fp32_t>(x[j]);
+                ni[j] = opus::cast<float>(x[j]);
         }
         return ni;
     };
@@ -337,7 +329,7 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
         Vf ni;
 #pragma unroll
         for(int j = 0; j < width; ++j)
-            ni[j] = opus::cast<fp32_t>(s[j]);
+            ni[j] = opus::cast<float>(s[j]);
         return ni;
     };
     auto sumsq = [&](Vf ni) {
@@ -373,13 +365,13 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
         {
             float xi = ni[j] * inv;
             if(t5)
-                xi = opus::cast<fp32_t>(opus::cast<scalar_t>(xi));
+                xi = opus::cast<float>(opus::cast<scalar_t>(xi));
             // gemma_norm folds (weight + 1) at compile time; GEMMA==false is
             // byte-identical to the non-gemma kernel (no extra add).
             if constexpr(GEMMA)
-                y[j] = opus::cast<scalar_t>(xi * (opus::cast<fp32_t>(w[j]) + 1.0f));
+                y[j] = opus::cast<scalar_t>(xi * (opus::cast<float>(w[j]) + 1.0f));
             else
-                y[j] = opus::cast<scalar_t>(xi * opus::cast<fp32_t>(w[j]));
+                y[j] = opus::cast<scalar_t>(xi * opus::cast<float>(w[j]));
         }
         out_v[idx] = y;
     };
@@ -445,9 +437,9 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
 #pragma unroll
             for(int j = 0; j < width; ++j)
             {
-                float f = opus::cast<fp32_t>(x[j]) + opus::cast<fp32_t>(res_v[idx][j]);
+                float f = opus::cast<float>(x[j]) + opus::cast<float>(res_v[idx][j]);
                 s[j]    = opus::cast<in_t>(f);
-                ni[j]   = t5 ? opus::cast<fp32_t>(s[j]) : f;
+                ni[j]   = t5 ? opus::cast<float>(s[j]) : f;
             }
             res_v[idx] = s;
         }
@@ -455,7 +447,7 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
         {
 #pragma unroll
             for(int j = 0; j < width; ++j)
-                ni[j] = opus::cast<fp32_t>(x[j]);
+                ni[j] = opus::cast<float>(x[j]);
         }
         return ni;
     };
@@ -464,7 +456,7 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
         Vf ni;
 #pragma unroll
         for(int j = 0; j < width; ++j)
-            ni[j] = opus::cast<fp32_t>(s[j]);
+            ni[j] = opus::cast<float>(s[j]);
         return ni;
     };
     auto sumsq = [&](Vf ni) {
@@ -494,8 +486,8 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out_,
     auto norm_j = [&](float ni, in_t wval, int col) -> float {
         float xi = ni * inv;
         if(t5)
-            xi = opus::cast<fp32_t>(opus::cast<in_t>(xi));
-        float n = xi * opus::cast<fp32_t>(wval);
+            xi = opus::cast<float>(opus::cast<in_t>(xi));
+        float n = xi * opus::cast<float>(wval);
         return smooth ? n * xscale[col] : n;
     };
 
