@@ -147,7 +147,9 @@ def _store_bf16_vec_g(vals_list, g_out, row_off_elems, idx, vec):
     g_out.store(my_off, bf16v, vec_size=vec)
 
 
-def _store_fp8_packed(vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False):
+def _store_fp8_packed(
+    vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
+):
     """Pack VEC fp32 -> VEC fp8 via cvt_pk_fp8_f32 and store.
 
     Emits one ``buffer_store_dwordx2`` per thread (VEC=8 -> 2 dwords = 8 bytes).
@@ -518,9 +520,7 @@ def _build_kernel(
                     s = sin_f32[k]
                     rope_elems.append(_to_raw(e * c - o * s))
                     rope_elems.append(_to_raw(e * s + o * c))
-                rotated_vec = vector.from_elements(
-                    T.vec(VEC, f32), rope_elems
-                )
+                rotated_vec = vector.from_elements(T.vec(VEC, f32), rope_elems)
                 fx.memref_store_vec(rotated_vec, out_rmem)
 
             # ---- Unified store: all threads read from rmem and write ----
@@ -529,8 +529,9 @@ def _build_kernel(
 
             if const_expr(quant):
                 rsrc, row_base = fp8_out_rsrc
-                _store_fp8_packed(final_list, rsrc, row_base, tid, VEC,
-                                  skip_fnuz_clamp=not _is_fnuz)
+                _store_fp8_packed(
+                    final_list, rsrc, row_base, tid, VEC, skip_fnuz_clamp=not _is_fnuz
+                )
             else:
                 _store_bf16_vec_g(final_list, bf16_out_g, bf16_out_row_off, tid, VEC)
                 if const_expr(kv_write):
