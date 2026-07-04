@@ -557,7 +557,8 @@ if _HAVE_TRITON:
         buf_ptr,  # uint8 LDS-order output buffer [b, h, k_hs] flattened
         srcw_ptr,  # int32 [k_hs] within-(b,h) source byte offset = (gc//96)*(h*96)+(gc%96)
         valid_ptr,  # int8 [k_hs] 1=keep, 0=zero (fp6 dup/overflow + partial-seq tail)
-        KHS,  # nt*16384 output bytes per (b,h)
+        DATA_HS,  # nt*16384 data bytes per (b,h)
+        TILE_BYTES,
         SKH96,  # sk*h*96 = packed bytes per batch
         H,  # heads
         BLOCK: tl.constexpr,
@@ -565,7 +566,7 @@ if _HAVE_TRITON:
         # One fused pass replacing the torch permute+contiguous / advanced-index gather /
         # masked_fill / buffer-copy chain (~4 full-size passes -> 1 gathered read + 1 write).
         pid = tl.program_id(0)
-        nchunk = KHS // BLOCK
+        nchunk = DATA_HS // BLOCK
         bh = pid // nchunk
         chunk = pid % nchunk
         bIdx = bh // H
@@ -576,7 +577,39 @@ if _HAVE_TRITON:
         src_addr = bIdx * SKH96 + hIdx * 96 + srcw
         byte = tl.load(packed_ptr + src_addr).to(tl.int32)
         byte = tl.where(valid != 0, byte, 0).to(tl.uint8)
-        tl.store(buf_ptr + bh * KHS + p, byte)
+        tile = p // 16384
+        in_tile = p - tile * 16384
+        dst_addr = bh * (DATA_HS // 16384) * TILE_BYTES + tile * TILE_BYTES + in_tile
+        tl.store(buf_ptr + dst_addr, byte)
+
+    @triton.jit
+    def _fill_k_scale_tail_kernel(
+        scale_ptr,  # uint8 scale [b, sk, h, 4] flattened
+        buf_ptr,  # uint8 packed K buffer [b,h,nt*17408] flattened
+        SK,
+        H,
+        NT,
+        BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        bh = pid // NT
+        t = pid % NT
+        bidx = bh // H
+        hidx = bh % H
+        offs = tl.arange(0, BLOCK)
+        region_b = offs >= 512
+        region_off = offs - region_b.to(tl.int32) * 512
+        inst = region_off >> 8
+        lane = (region_off & 255) >> 2
+        byte_in_dword = region_off & 3
+        src_shift = byte_in_dword + region_b.to(tl.int32)
+        src_token = t * 128 + ((lane & 3) << 5) + (lane >> 2) + inst * 16 + (src_shift >> 2)
+        src_byte = src_shift & 3
+        dst = bh * (NT * 17408) + t * 17408 + 16384 + offs
+        src = ((bidx * SK + src_token) * H + hidx) * 4 + src_byte
+        valid = src_token < SK
+        val = tl.load(scale_ptr + src, mask=valid, other=0).to(tl.uint8)
+        tl.store(buf_ptr + dst, val)
 
 
 _QK_FIELD_PERM_CACHE: dict = {}
@@ -685,21 +718,23 @@ def _k_lds_src_within(nt: int, total: int, h: int, device):
 
 
 def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False):
-    """GPU equivalent of quantize_fp6_k_lds_order, returning the kernel-ready K view
-    (seq stride 128) + E8M0 scale. Byte-identical to the numpy oracle's buffer but
-    runs the pack+gather entirely on-device (seconds vs the per-tile numpy CPU
-    round-trip). Supports S % tile != 0 (the gather's valid mask zeroes the partial
-    tail tile, which the kernel masks in softmax).
+    """GPU pack of K into the kernel-ready LDS-order fp6 view WITH the E8M0 K-scale packed in the
+    per-tile tail. Each 128-token tile is 17408B = 16384B chunk-major fp6 K data + a 1024B
+    lane-major K-scale image (Region A unshifted + Region B pre-shifted); the kernel loads the
+    scale straight from the K buffer tail (coalesced buffer_load lds:1), so there is no separate
+    K-scale global-load stream. Runs the pack + gather + tail-fill entirely on-device. Supports
+    S % tile != 0 (the gather's valid mask zeroes the partial tail tile, which the kernel masks in
+    softmax).
 
     k_thd : float K [b, sk, h, 128] on GPU.
-    Returns (k_view uint8 [b, sk, h, 96] strided over a [b,h,n_tiles*16384] buffer,
-             scale uint8 [b, sk, h, 4]).
-    If return_raw: returns (buf, sbuf) -- the FULL contiguous backing buffers (uint8 1D)
-    instead of the strided/padded views. A torch.library.custom_op caller MUST take this
-    path: returning the strided k_view as a custom-op output lets AOTAutograd clone it to a
-    contiguous numel-sized tensor (dropping the seq-stride-128 LDS layout -> garbage). The
-    caller rebuilds k_view = buf.as_strided(...) and k_scale = sbuf[:n].view(...) OUTSIDE the
-    op (traced as_strided, which inductor handles correctly)."""
+    Returns (k_view uint8 [b, sk, h, 96] strided (seq stride 136) over a [b,h,n_tiles*17408]
+             buffer, scale uint8 [b, sk, h, 4]). `scale` only satisfies the k_descale ABI arg --
+             the kernel reads scales from the K tail, not this tensor.
+    If return_raw: returns (buf, sbuf) -- the FULL contiguous backing buffers (uint8 1D) instead of
+    the strided/padded views. A torch.library.custom_op caller MUST take this path: returning the
+    strided k_view as a custom-op output lets AOTAutograd clone it to a contiguous numel-sized
+    tensor (dropping the seq-stride-136 LDS layout -> garbage). The caller rebuilds
+    k_view = buf.as_strided((b, sk, h, 96), (h*nt*17408, 136, nt*17408, 1)) OUTSIDE the op."""
     assert _HAVE_TRITON, "triton/torch unavailable"
     b, sk, h, d = k_thd.shape
     assert d == 128 and tile == 128, (d, sk, tile)
@@ -711,31 +746,45 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, retu
     # permute+contiguous / advanced-index gather / masked_fill / buffer-copy (~4 full-size
     # passes -> 1 gathered read + 1 write; ~1.35x faster on the K reorder at long seq).
     srcw, valid8 = _k_lds_src_within(nt, total, h, k_thd.device)
-    k_hs = nt * 16384
+    # Each 128-token tile is 17408B: 16384B fp6 K data + a 1024B lane-major E8M0 K-scale TAIL image.
+    # The kernel loads that scale image with a coalesced buffer_load lds:1 straight from the K
+    # buffer (no separate scale pointer / global_load) -- this removes the stalling K-scale global
+    # loads. seq stride = 136 (17408/128) -> the kernel's _s_k_Seqs=136 -> tile base = token*136.
+    k_tile_bytes = 17408
+    k_hs = nt * k_tile_bytes
     k_bs = h * k_hs
     buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=k_thd.device)
     BLOCK = 1024
-    assert k_hs % BLOCK == 0, (k_hs, BLOCK)
-    grid = (b * h * (k_hs // BLOCK),)
+    data_hs = nt * 16384
+    assert data_hs % BLOCK == 0, (data_hs, BLOCK)
+    grid = (b * h * (data_hs // BLOCK),)
     _gather_k_lds_kernel[grid](
         packed.reshape(-1),
         buf,
         srcw,
         valid8,
-        k_hs,
+        data_hs,
+        k_tile_bytes,
         sk * h * 96,
         h,
         BLOCK=BLOCK,
         num_warps=4,
     )
-    # seq stride = tile (=128) -> the kernel's _s_k_Seqs=128 -> tile base = token*128.
-    k_view = buf.as_strided((b, sk, h, 96), (k_bs, tile, k_hs, 1))
-    # K-SCALE TRAILING PAD (gfx950 fwd_hd128_mxfp6 op_sel-shift-free K-scale path): the kernel's
-    # coalesced K-scale gather keeps a 2nd "Region B" pre-shifted LDS copy, gathered by reading each
-    # token's 4-byte E8M0 dword at a +1 BYTE source offset (so MFMA op_sel byte0/byte2 land dblk1/
-    # dblk3 directly, no runtime >>blk1*8 shift). On the final (token,head,batch) that +1 dword read
-    # runs 1 byte past the contiguous scale tensor -> re-home `scale` into a buffer with trailing
-    # slack so the read stays mapped. The pad byte is never consumed by the MFMA (op_sel ignores it).
+    # Fill the per-tile 1024B scale tail: Region A (unshifted) + Region B (pre-shifted +1 byte, so
+    # the kernel MFMA op_sel picks dblk1/dblk3 with no runtime shift). The B pre-shift reads 1 byte
+    # past the last token's scale on the final tile -> the +256 buf slack keeps it mapped.
+    _fill_k_scale_tail_kernel[(b * h * nt,)](
+        scale.reshape(-1),
+        buf,
+        sk,
+        h,
+        nt,
+        BLOCK=1024,
+        num_warps=4,
+    )
+    k_view = buf.as_strided((b, sk, h, 96), (k_bs, 136, k_hs, 1))
+    # `scale` is still returned to satisfy the k_descale ABI arg, but the kernel reads scales from
+    # the K tail, not this tensor. Re-home into a +64 slack buffer (harmless; keeps callers happy).
     sflat = scale.reshape(-1)
     sbuf = torch.empty(sflat.numel() + 64, dtype=torch.uint8, device=scale.device)
     sbuf[: sflat.numel()] = sflat
