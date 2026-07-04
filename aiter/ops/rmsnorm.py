@@ -21,6 +21,7 @@ def _rms_norm_opus_raw(
     epsilon: float,
     rows: int,
     hidden: int,
+    in_s: int,
     is_bf16: int,
     model_sensitive: int,
     gemma: int,
@@ -43,14 +44,18 @@ def _fused_add_rms_norm_opus_raw(
 ) -> None: ...
 
 
-def _check(input: Tensor, weight: Tensor):
+def _check(input: Tensor, weight: Tensor, allow_row_stride: bool = False):
     assert (
         input.dtype in _DTYPE_CODE
     ), f"rms_norm_opus: fp16/bf16/fp32 only, got {input.dtype}"
     assert weight.dtype == input.dtype, "rms_norm_opus: weight dtype must match input"
-    assert (
-        input.is_contiguous() and weight.is_contiguous()
-    ), "rms_norm_opus: contiguous only"
+    # rms_norm_opus threads a row stride, so a row-contiguous input is enough there;
+    # the quant/fused-add paths still require a fully contiguous input.
+    if allow_row_stride:
+        assert input.stride(-1) == 1, "rms_norm_opus: last dim must be contiguous"
+    else:
+        assert input.is_contiguous(), "rms_norm_opus: contiguous only"
+    assert weight.is_contiguous(), "rms_norm_opus: weight must be contiguous"
     assert weight.shape[-1] == input.shape[-1], "rms_norm_opus: weight length != hidden"
 
 
@@ -63,13 +68,17 @@ def rms_norm_opus(
     gemma_norm: bool = False,
 ) -> None:
     """out = rmsnorm(input) * (weight [+ 1 if gemma_norm]) (fp32 accumulate)."""
-    # The opus kernel reads rows contiguously; a strided input (e.g. a `torch.split`
-    # view feeding fused_qk_rmsnorm) must be materialized first.
-    if not input.is_contiguous():
-        input = input.contiguous()
-    _check(input, weight)
-    assert out.dtype == input.dtype and out.is_contiguous(), "rms_norm_opus: bad out"
     hidden = input.shape[-1]
+    # The kernel reads each row contiguously but accepts a row stride, so a 2-D
+    # row-strided view (e.g. a `torch.split` slice feeding fused_qk_rmsnorm) needs no
+    # copy. Anything else non-contiguous (non-unit last dim, or >2-D with gaps between
+    # rows) is materialized so a single row stride is valid.
+    row_strided_2d = input.dim() == 2 and input.stride(-1) == 1
+    if not (input.is_contiguous() or row_strided_2d):
+        input = input.contiguous()
+    in_s = input.stride(-2) if input.dim() >= 2 else hidden
+    _check(input, weight, allow_row_stride=True)
+    assert out.dtype == input.dtype and out.is_contiguous(), "rms_norm_opus: bad out"
     rows = input.numel() // hidden
     _rms_norm_opus_raw(
         out.data_ptr(),
@@ -78,6 +87,7 @@ def rms_norm_opus(
         float(epsilon),
         rows,
         hidden,
+        int(in_s),
         _DTYPE_CODE[input.dtype],
         int(model_sensitive),
         int(gemma_norm),

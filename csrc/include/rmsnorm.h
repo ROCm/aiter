@@ -48,6 +48,7 @@ inline void launch_be(void* out,
                       float epsilon,
                       int rows,
                       int hidden,
+                      int in_s,
                       int model_sensitive,
                       hipStream_t stream)
 {
@@ -66,6 +67,7 @@ inline void launch_be(void* out,
                        epsilon,
                        rows,
                        hidden,
+                       in_s,
                        model_sensitive);
 }
 
@@ -79,13 +81,14 @@ inline bool launch_norm_be(void* out,
                            float epsilon,
                            int rows,
                            int hidden,
+                           int in_s,
                            int model_sensitive,
                            hipStream_t stream)
 {
 #define OPUS_BE(N, TN, RN)                                                              \
     case N:                                                                             \
         launch_be<scalar_t, TN, RN>(                                                    \
-            out, in, weight, residual, epsilon, rows, hidden, model_sensitive, stream); \
+            out, in, weight, residual, epsilon, rows, hidden, in_s, model_sensitive, stream); \
         return true
     switch(hidden)
     {
@@ -114,6 +117,7 @@ inline void launch_norm(void* out,
                         float epsilon,
                         int rows,
                         int hidden,
+                        int in_s,
                         int model_sensitive,
                         int gemma,
                         hipStream_t stream)
@@ -125,7 +129,7 @@ inline void launch_norm(void* out,
     {
         if(gemma == 0 && (hidden % 8 == 0) &&
            launch_norm_be<scalar_t>(
-               out, in, weight, residual, epsilon, rows, hidden, model_sensitive, stream))
+               out, in, weight, residual, epsilon, rows, hidden, in_s, model_sensitive, stream))
             return;
     }
     const bool vec           = (hidden % VW == 0);
@@ -134,7 +138,7 @@ inline void launch_norm(void* out,
 #define OPUS_LAUNCH_FWD(WIDTH, G)                                                   \
     hipLaunchKernelGGL((rmsnorm_opus_kernel<rmsnorm_opus_traits<scalar_t, WIDTH, G>>),      \
                        grid, block, 0, stream, out, in, weight, residual,           \
-                       epsilon, rows, hidden, model_sensitive)
+                       epsilon, rows, hidden, in_s, model_sensitive)
     if(vec)
     {
         if(gemma)

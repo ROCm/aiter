@@ -13,11 +13,11 @@
     do                                                                                               \
     {                                                                                                \
         if((DTYPE) == 2)                                                                             \
-            launch_norm<fp32_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, gemma, s); \
+            launch_norm<fp32_t>((O), (I), (W), (R), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
         else if((DTYPE) == 1)                                                                        \
-            launch_norm<bf16_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, gemma, s); \
+            launch_norm<bf16_t>((O), (I), (W), (R), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
         else                                                                                         \
-            launch_norm<fp16_t>((O), (I), (W), (R), epsilon, rows, hidden, model_sensitive, gemma, s); \
+            launch_norm<fp16_t>((O), (I), (W), (R), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
     } while(0)
 
 OPUS_EXPORT void rms_norm_opus(size_t out,
@@ -26,6 +26,7 @@ OPUS_EXPORT void rms_norm_opus(size_t out,
                                float epsilon,
                                int rows,
                                int hidden,
+                               int in_s, // input row stride (elements); == hidden if contiguous
                                int dtype,
                                int model_sensitive,
                                int gemma,
@@ -55,6 +56,7 @@ OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
     using namespace aiter;
     if(rows <= 0 || hidden <= 0)
         return;
+    const int in_s = hidden; // in-place fused-add always operates on contiguous rows
     auto s   = reinterpret_cast<hipStream_t>(stream);
     auto* io = reinterpret_cast<void*>(inout);
     auto* r  = reinterpret_cast<void*>(residual);
