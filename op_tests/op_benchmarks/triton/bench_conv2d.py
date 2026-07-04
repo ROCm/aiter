@@ -867,11 +867,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--dtype",
         "--conv_dtype",
         "--conv-dtype",
+        type=str.lower,
         choices=["fp16", "bf16"],
         default="fp16",
     )
     p.add_argument(
         "--method",
+        type=str.lower,
         choices=list(METHODS.keys()),
         default="auto",
         help="kernel to bench. 'auto' uses the conv2d router.",
@@ -880,10 +882,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--layout",
         "--conv_layout",
         "--conv-layout",
+        type=str.lower,
         choices=["nchw", "nhwc"],
         default="nchw",
     )
-    p.add_argument("--metric", choices=["time", "throughput"], default="throughput")
+    p.add_argument(
+        "--metric",
+        type=str.lower,
+        choices=["time", "throughput"],
+        default="throughput",
+    )
     p.add_argument(
         "--no-bias",
         "--no_bias",
