@@ -3,6 +3,10 @@
 //
 // OPUS RMSNorm C ABI (ctypes): raw int64 pointers + dims, validated Python-side.
 // dtype: 0=fp16, 1=bf16, 2=fp32.
+//
+// Compile unit 1/N of module_rmsnorm: the plain norm entrypoints (no quant), all
+// backed by launch_norm (be/generic kernels). Split into its own translation unit so
+// the norm kernel family compiles in parallel with the quant/arq families.
 
 #include "rmsnorm.h"
 
@@ -91,41 +95,4 @@ OPUS_EXPORT void add_rms_norm_opus(size_t out,
     auto* ro = reinterpret_cast<void*>(residual_out);
     auto* w  = reinterpret_cast<const void*>(weight);
     OPUS_NORM_DISPATCH(dtype, o, i, w, ri, ro);
-}
-
-// Fused rmsnorm + quant. residual/xscale/unquant = 0 to disable. out_code: 0=int8,1=fp8.
-OPUS_EXPORT void rms_norm_quant_opus(size_t out,
-                                     size_t yscale,
-                                     size_t unquant,
-                                     size_t in,
-                                     size_t weight,
-                                     size_t residual,
-                                     size_t xscale,
-                                     float epsilon,
-                                     int rows,
-                                     int hidden,
-                                     float qmax,
-                                     int in_code,
-                                     int out_code,
-                                     int model_sensitive,
-                                     size_t stream)
-{
-    using namespace aiter;
-    if(rows <= 0 || hidden <= 0)
-        return;
-    launch_quant(reinterpret_cast<void*>(out),
-                 reinterpret_cast<void*>(yscale),
-                 reinterpret_cast<void*>(unquant),
-                 reinterpret_cast<const void*>(in),
-                 reinterpret_cast<const void*>(weight),
-                 reinterpret_cast<void*>(residual),
-                 reinterpret_cast<const void*>(xscale),
-                 epsilon,
-                 rows,
-                 hidden,
-                 qmax,
-                 in_code,
-                 out_code,
-                 model_sensitive,
-                 reinterpret_cast<hipStream_t>(stream));
 }
