@@ -131,7 +131,7 @@ static std::tuple<std::string, int> get_heuristic_kernel(
 // Shared dispatch body. NVFP4 ships the full preload struct (88B) with real
 // GlobalScale floats; MXFP4 leaves GlobalScale unset and ships 80B (dropping
 // the trailing persistent log2 dword pair).
-static void f4gemm_mi400_launch(aiter_tensor_t* A,
+static void f4gemm_launch(aiter_tensor_t* A,
                                 aiter_tensor_t* B,
                                 aiter_tensor_t* ScaleA,
                                 aiter_tensor_t* ScaleB,
@@ -255,7 +255,7 @@ static void f4gemm_mi400_launch(aiter_tensor_t* A,
     const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;  // compile-time per .co (CSV)
     const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
-    // Persistent dispatch is hardcoded on: all f4gemm_mi400 .co are persistent
+    // Persistent dispatch is hardcoded on: all f4gemm .co are persistent
     // shaders. persistent_tg / grid_y are runtime-only knobs (don't affect the
     // .co), so they're fixed here at the default; gridX is derived.
     constexpr int PERSISTENT    = 1;
@@ -349,7 +349,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      hipStream_t     stream),
     (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, stream))
 {
-    f4gemm_mi400_launch(A, B, ScaleA, ScaleB, out,
+    f4gemm_launch(A, B, ScaleA, ScaleB, out,
                         kernelName, F4_INTYPE_MXFP4, a_preshuffle,
                         0.0f, 0.0f, stream);
 }
@@ -369,7 +369,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     (A, B, ScaleA, ScaleB, GlobalScaleA, GlobalScaleB,
      out, kernelName, a_preshuffle, stream))
 {
-    f4gemm_mi400_launch(A, B, ScaleA, ScaleB, out,
+    f4gemm_launch(A, B, ScaleA, ScaleB, out,
                         kernelName, F4_INTYPE_NVFP4, a_preshuffle,
                         GlobalScaleA, GlobalScaleB, stream);
 }

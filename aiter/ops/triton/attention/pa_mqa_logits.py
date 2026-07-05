@@ -473,7 +473,13 @@ def deepgemm_fp8_paged_mqa_logits(
             WavePerEU = 1
 
     TileQCount = batch_size * next_n
-    SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU * 2
+    SplitKV = (
+        (max(1, TotalCuCount // TileQCount) + 4)
+        // 5
+        * 5
+        * WavePerEU
+        * (2 if get_gfx() == "gfx1250" else 1)
+    )
 
     assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
