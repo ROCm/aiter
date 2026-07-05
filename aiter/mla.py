@@ -245,9 +245,66 @@ def mla_decode_fwd(
     total_kv = kv_indices.shape[0]
 
     persistent_mode = work_meta_data is not None
+    # [glm-dsa DIAGNOSTIC] GLM_FORCE_NONPERSISTENT=1 hard-disables persistent mode so
+    # EVERY attention takes the non-persistent (folded gqa64->16) path. Isolates whether
+    # the non-persistent fold is numerically correct at long context, independent of the
+    # shape-gate's routing. Also drops the work_* metadata so the non-persistent branch runs.
+    import os as _glm_os2
+    if _glm_os2.environ.get("GLM_FORCE_NONPERSISTENT", "0") == "1":
+        persistent_mode = False
+        work_meta_data = None
 
     io_transformed = False
     qseqlen_folded = False
+
+    # [glm-dsa] Non-persistent gqa64->gqa16 fold. The asm MLA stage1 kernel ships
+    # only Gqa=16 (and 128) — see hsa/*/mla/mla_asm.csv. The persistent branch
+    # folds nhead in {32..112} down to 16 (spreading the head-group factor across
+    # the token dim) so gqa=64 hits the Gqa=16 kernel. The non-persistent branch
+    # had no such fold, so GLM DSA's accuracy gate (work_meta_data=None on chunked
+    # prefill) requested gqa=64 non-persistent -> "cannot get heuristic kernel" ->
+    # crash. We mirror the persistent fold here for the qseqlen==1 sparse-decode
+    # case (GLM DSA always calls with max_seqlen_q==1), targeting the shipped
+    # non-persistent kernel mla_a8w8_qh16_qseqlen1_gqaratio16.co. The [T,64,d] ->
+    # [4T,16,d] .view() is layout-identical iff head-groups are contiguous in the
+    # head dim — the SAME assumption the persistent max_seqlen_q==1 fold makes, so
+    # correctness is anchored to the (numerically-correct-on-decode) persistent path.
+    _glm_np_fold = (
+        not persistent_mode
+        and max_seqlen_q == 1
+        and nhead in range(32, 128, 16)  # 32,48,64,80,96,112
+    )
+    if _glm_np_fold:
+        ff = ori_nhead // 16
+        nhead = 16
+        total_s = ori_total_s * ff
+        # q/o: [T,64,d] -> [ff*T,16,d]; row ff*t+g = token t, head-group g (contiguous).
+        q = q.view(total_s, nhead, -1)
+        o = o.view(total_s, nhead, -1)
+        # CRITICAL: the non-persistent kernel indexes requests/KV from qo_indptr /
+        # kv_indptr / kv_indices directly (unlike persistent, which uses work_meta_data),
+        # so rebuild them for the ff*T-row layout. Each of a token's ff head-group rows is
+        # its own single-query "sequence" attending to that token's KV.
+        _ki_orig = kv_indptr  # [bs+1], original per-token kv offsets
+        _seg = _ki_orig[1:] - _ki_orig[:-1]                    # [bs] per-token kv lengths
+        _seg_f = _seg.repeat_interleave(ff)                    # [bs*ff]
+        _kv_indptr_new = torch.zeros(
+            _seg_f.numel() + 1, dtype=_ki_orig.dtype, device=device
+        )
+        torch.cumsum(_seg_f, dim=0, out=_kv_indptr_new[1:])
+        # duplicate each token's kv_indices slice ff times so every head-group row has its copy
+        _idx_parts = []
+        for _t in range(bs):
+            _a = int(_ki_orig[_t]); _b = int(_ki_orig[_t + 1])
+            _slice = kv_indices[_a:_b]
+            for _g in range(ff):
+                _idx_parts.append(_slice)
+        kv_indices = torch.cat(_idx_parts) if _idx_parts else kv_indices
+        kv_indptr = _kv_indptr_new
+        qo_indptr = torch.arange(0, total_s + 1, dtype=qo_indptr.dtype, device=device)
+        kv_last_page_lens = kv_last_page_lens.repeat_interleave(ff)
+        bs = total_s
+        io_transformed = True
 
     if not persistent_mode:
         if num_kv_splits is None or num_kv_splits_indptr is None:
@@ -365,6 +422,14 @@ def mla_decode_fwd(
             )
         ):
             lse = final_lse if return_lse else attn_lse
+            if io_transformed:
+                # un-fold: [4T,16,d] storage is layout-identical to [T,64,d]
+                return (
+                    logits.view(ori_total_s, ori_nhead, v_head_dim),
+                    lse.view(ori_total_s, ori_nhead)
+                    if (return_lse and lse is not None)
+                    else lse,
+                )
             return logits.view(total_s, nhead, v_head_dim), lse
 
         Lv = v_head_dim
