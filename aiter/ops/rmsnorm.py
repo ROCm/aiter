@@ -4,6 +4,7 @@
 import torch
 from torch import Tensor
 from ..jit.core import compile_ops
+from ..jit.utils.torch_guard import torch_compile_guard
 from .quant import get_dtype_max
 from typing import Optional
 
@@ -279,6 +280,10 @@ def rmsnorm2d_fwd_with_add_smoothquant_opus(
     )
 
 
+# The opus backend is ctypes (reads .data_ptr() in Python), so torch.compile must not
+# trace into these entrypoints — wrap each as an opaque aiter custom op with a fake impl
+# (mirrors how the pre-opus CK ops were registered via @compile_ops).
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *a, **k: None)
 def rms_norm_cu(
     out: Tensor,
     input: Tensor,
@@ -289,6 +294,9 @@ def rms_norm_cu(
     rms_norm_opus(out, input, weight, epsilon)
 
 
+@torch_compile_guard(
+    mutates_args=["input", "residual_in"], gen_fake=lambda *a, **k: None
+)
 def fused_add_rms_norm_cu(
     input: Tensor,  # input/out
     residual_in: Tensor,  # residual_in/out
@@ -299,6 +307,16 @@ def fused_add_rms_norm_cu(
     fused_add_rms_norm_opus(input, residual_in, weight, epsilon)
 
 
+def _rms_norm_fwd_fake(
+    input: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    use_model_sensitive_rmsnorm: int = 0,
+) -> Tensor:
+    return torch.empty_like(input)
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_rms_norm_fwd_fake)
 def rms_norm(
     input: Tensor,
     weight: Tensor,
@@ -309,6 +327,7 @@ def rms_norm(
     return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
+@torch_compile_guard(mutates_args=[], gen_fake=_rms_norm_fwd_fake)
 def rmsnorm2d_fwd(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -318,6 +337,9 @@ def rmsnorm2d_fwd(
     return rmsnorm2d_fwd_opus(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
+@torch_compile_guard(
+    mutates_args=["out", "residual_out"], gen_fake=lambda *a, **k: None
+)
 def rmsnorm2d_fwd_with_add(
     out: Tensor,
     input: Tensor,
