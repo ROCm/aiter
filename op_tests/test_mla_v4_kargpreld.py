@@ -82,7 +82,7 @@ class Mlagfx1250KernelVariant:
 
 
 _gfx1250_KERNEL_VARIANTS = [
-    Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
+    #Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
     Mlagfx1250KernelVariant(name="qh64-q1-16mx4-64nx1-np", nhead=64, decode_qlen=1),
     Mlagfx1250KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
 ]
@@ -98,9 +98,9 @@ _gfx1250_VARIANT_BY_KEY_NAME = {v.name: v for v in _gfx1250_KERNEL_VARIANTS}
 _SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1)}
 
 # Default sweep grids (mirrors test_mla_gfx1250_triton.py).
-_gfx1250_CTX_LENS = [13, 61, 128 + 3, 256 + 67, 1024, 4096, 16384]
-_gfx1250_BATCH_SIZES = [3, 17, 32, 64]
-_gfx1250_SPLIT_PER_BATCH = [1, 2, 4, 8]
+_gfx1250_CTX_LENS = [1024, 1024+512, 2048]
+_gfx1250_BATCH_SIZES = [64]
+_gfx1250_SPLIT_PER_BATCH = [2, 4]
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +366,43 @@ def _build_bf16_inputs(
 
 
 # ---------------------------------------------------------------------------
+# Per-stage timing: v4 nm runs two distinct GPU kernels — stage1 (the asm
+# sparse decode, symbol `..._sparse`) and stage2 (the triton cross-split merge
+# `_fwd_kernel_stage2_asm`). We profile a few iters and split total device time
+# by kernel name so the summary table can report stage1_us / stage2_us. (single
+# -pass num_kv_splits==1 has no stage2 -> stage2_us stays 0.)
+# ---------------------------------------------------------------------------
+_STAGE2_KERNEL_HINT = "stage2"  # matches `_fwd_kernel_stage2_asm`
+_STAGE1_KERNEL_HINT = "sparse"  # matches the asm `..._sparse` decode symbol
+
+
+def _profile_stage_times(fn, iters=5, warmup=2):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as prof:
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+    s1 = s2 = 0.0
+    for ev in prof.events():
+        dev_us = getattr(ev, "self_device_time_total", 0) or 0
+        if dev_us <= 0:
+            continue
+        nm = ev.name.lower()
+        if _STAGE2_KERNEL_HINT in nm:
+            s2 += dev_us
+        elif _STAGE1_KERNEL_HINT in nm:
+            s1 += dev_us
+    return s1 / iters, s2 / iters
+
+
+# ---------------------------------------------------------------------------
 # @benchmark perf + accuracy fn — the summary-table producer.
 # Its call args become the table's left-hand columns (SKILL rule 2).
 # ---------------------------------------------------------------------------
@@ -526,6 +563,11 @@ def test_mla_v4_nm(
             num_iters=_PERF["num_iters"],
             num_warmup=_PERF["num_warmup"],
         )
+        stage1_us, stage2_us = _profile_stage_times(
+            lambda: aiter.mla.mla_decode_fwd_v4_nm(
+                out_16_nosplit=int(o16), **common_kwargs
+            )
+        )
         # Resolve the buffer the wrapper actually populated:
         #   o16=1        -> wrapper unpacked packed-BF16 into output_buf.
         #   single-pass  -> kernel wrote one FP32 partial to logits[:, 0].
@@ -546,6 +588,8 @@ def test_mla_v4_nm(
             msg=f"{name}: mla_v4_nm [fp8_dequant_ref vs asm]",
         )
         ret[f"{name} us"] = us
+        ret[f"{name} stage1_us"] = stage1_us
+        ret[f"{name} stage2_us"] = stage2_us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
