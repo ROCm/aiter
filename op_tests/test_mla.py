@@ -596,10 +596,8 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    # MTP backend guard: the ASM/CK decode baseline only supports MTP up to
-    # decode_qlen=4 (see header). Longer MTP (qlen>4) is gluon-only, so skip the
-    # ASM baseline there instead of letting it error; the gluon path below still
-    # validates against the torch reference.
+    # ASM/CK decode baseline only supports MTP up to qlen=4; skip it beyond that
+    # (gluon still validates against the torch reference).
     asm_supports_mtp = decode_qlen <= 4
     # The ASM decode baseline aborts for these MLA configs when lse is requested
     if return_lse or not asm_supports_mtp:
@@ -628,8 +626,9 @@ def test_mla(
     ret["decode:bytes"] = bytes
     ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
     ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
-    # Per-token throughput (Mtok/s) for the ASM baseline; same metric as gluon's
-    # below so MTP throughput can be compared directly. total_q = batch*qlen.
+    # Per-token throughput (Mtok/s = total_q / us, total_q = batch*qlen): the MTP
+    # figure-of-merit, implementation-agnostic unlike TB/s (under-counts qlen KV
+    # re-reads) and TFLOPS (over-counts via the decode_qlen factor).
     ret["decode:Mtok/s"] = total_q / us_asm_decode
 
     # Gluon MLA decode test
@@ -663,9 +662,7 @@ def test_mla(
             ret["decode:gluon_576"] = us_gluon_decode
             ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
             ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
-            # Per-token throughput (Mtok/s): the MTP figure-of-merit. Implementation-
-            # agnostic (unlike TB/s, which under-counts v1's qlen KV re-reads, and
-            # TFLOPS, which over-counts via the decode_qlen factor). total_q = batch*qlen.
+            # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
             ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn128 decode test
@@ -687,9 +684,7 @@ def test_mla(
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
-        # Per-token throughput (Mtok/s): the MTP figure-of-merit. Implementation-
-        # agnostic (unlike TB/s, which under-counts v1's qlen KV re-reads, and
-        # TFLOPS, which over-counts via the decode_qlen factor). total_q = batch*qlen.
+        # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
         ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn64 decode test
@@ -711,9 +706,7 @@ def test_mla(
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
-        # Per-token throughput (Mtok/s): the MTP figure-of-merit. Implementation-
-        # agnostic (unlike TB/s, which under-counts v1's qlen KV re-reads, and
-        # TFLOPS, which over-counts via the decode_qlen factor). total_q = batch*qlen.
+        # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
         ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     return ret

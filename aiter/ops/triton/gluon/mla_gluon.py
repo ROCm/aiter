@@ -834,7 +834,7 @@ def mla_gluon(
     return_lse=False (default): returns (o, None).
 
     return_lse=True: additionally returns the merged log-sum-exp, a separate
-        fp32 tensor matching o's batch/qlen/nhead layout.
+        fp32 tensor [batch, qlen, nhead]
 
     DSv4 Sparse prefill packs NoPE and RoPE in to one contiguous row (448+64).
     To run DSv4 prefill, it requires has_pe=False, prepares valid Q / K in q_nope / kv_c,
