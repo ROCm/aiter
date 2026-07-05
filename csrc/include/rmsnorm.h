@@ -334,36 +334,8 @@ inline void launch_arq_io(void* out, void* rout, void* scale, const void* in, co
 #undef ARQ
 }
 
-inline void launch_arq(int in_code, int out_code, void* out, void* rout, void* scale,
-                       const void* in, const void* rin, const void* w, const void* xsc,
-                       float epsilon, int m, int n, float qmax, int in_s, int rin_s, int rout_s,
-                       int out_s, int group, int shuffle, int gemma, int cu_num, hipStream_t s)
-{
-#define ARQ_OUT(IN_T)                                                                              \
-    do                                                                                             \
-    {                                                                                              \
-        if(out_code < 0)                                                                           \
-            launch_arq_io<IN_T, IN_T>(out, rout, scale, in, rin, w, xsc, epsilon, m, n, qmax,      \
-                                      in_s, rin_s, rout_s, out_s, group, shuffle, gemma, cu_num,    \
-                                      s);                                                           \
-        else if(out_code == 0)                                                                     \
-            launch_arq_io<IN_T, i8_t>(out, rout, scale, in, rin, w, xsc, epsilon, m, n, qmax,      \
-                                      in_s, rin_s, rout_s, out_s, group, shuffle, gemma, cu_num,    \
-                                      s);                                                           \
-        else if(out_code == 1)                                                                     \
-            launch_arq_io<IN_T, fp8_t>(out, rout, scale, in, rin, w, xsc, epsilon, m, n, qmax,     \
-                                       in_s, rin_s, rout_s, out_s, group, shuffle, gemma, cu_num,   \
-                                       s);                                                          \
-        else                                                                                       \
-            launch_arq_io<IN_T, opus::fp4_t>(out, rout, scale, in, rin, w, xsc, epsilon, m, n,     \
-                                             qmax, in_s, rin_s, rout_s, out_s, group, shuffle,      \
-                                             gemma, cu_num, s);                                     \
-    } while(0)
-    if(in_code == 1)
-        ARQ_OUT(bf16_t);
-    else
-        ARQ_OUT(fp16_t);
-#undef ARQ_OUT
-}
+// The out_code dispatch that used to live here now lives in the per-out-dtype arq
+// translation units (csrc/kernels/rmsnorm/rmsnorm_opus_arq_*.cu) so int8/fp8/fp4 build
+// in parallel; each calls launch_arq_io<in_t, out_t> above.
 
 } // namespace aiter
