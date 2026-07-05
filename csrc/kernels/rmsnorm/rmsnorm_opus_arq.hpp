@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Per-output-dtype split of the add_rmsnorm_quant (arq) launcher. Each out dtype
-// (int8 / fp8 / fp4 / no-quant) is defined in its own .cu so the arq kernel families
-// compile in parallel; the C entrypoint (arq_entry.cu) dispatches out_code to these.
-// The kernels/launcher (launch_arq_io in rmsnorm.h) are unchanged -- this only moves
-// the instantiation of each out dtype into a separate translation unit.
+// add_rmsnorm_quant (arq) launcher split per output dtype (int8/fp8/fp4/no-quant), each in
+// its own .cu so they compile in parallel. Kernels/launcher (launch_arq_io) are unchanged.
 #pragma once
 #include "rmsnorm.h"
 
-// Common parameter/argument lists so every arq launcher shares one signature.
+// Shared param/arg lists so every arq launcher has one signature.
 #define OPUS_ARQ_PARAMS                                                                             \
     int in_code, void *out, void *rout, void *scale, const void *in, const void *rin,              \
         const void *w, const void *xsc, float epsilon, int m, int n, float qmax, int in_s,         \
@@ -19,7 +16,7 @@
     out, rout, scale, in, rin, w, xsc, epsilon, m, n, qmax, in_s, rin_s, rout_s, out_s, group,      \
         shuffle, gemma, cu_num, s
 
-// Defines one per-out-dtype launcher: dispatches in_code (bf16/fp16) into launch_arq_io.
+// One per-out-dtype launcher: dispatch in_code (bf16/fp16) into launch_arq_io.
 #define OPUS_ARQ_DEFINE(FN, OUT_T)                                                                  \
     void FN(OPUS_ARQ_PARAMS)                                                                        \
     {                                                                                              \

@@ -68,8 +68,7 @@ def _check(input: Tensor, weight: Tensor, allow_row_stride: bool = False):
         input.dtype in _DTYPE_CODE
     ), f"rms_norm_opus: fp16/bf16/fp32 only, got {input.dtype}"
     assert weight.dtype == input.dtype, "rms_norm_opus: weight dtype must match input"
-    # rms_norm_opus threads a row stride, so a row-contiguous input is enough there;
-    # the quant/fused-add paths still require a fully contiguous input.
+    # allow_row_stride: row-contiguous is enough (kernel takes a row stride); else fully contiguous.
     if allow_row_stride:
         assert input.stride(-1) == 1, "rms_norm_opus: last dim must be contiguous"
     else:
@@ -88,10 +87,8 @@ def rms_norm_opus(
 ) -> None:
     """out = rmsnorm(input) * (weight [+ 1 if gemma_norm]) (fp32 accumulate)."""
     hidden = input.shape[-1]
-    # The kernel reads each row contiguously but accepts a row stride, so a 2-D
-    # row-strided view (e.g. a `torch.split` slice feeding fused_qk_rmsnorm) needs no
-    # copy. Anything else non-contiguous (non-unit last dim, or >2-D with gaps between
-    # rows) is materialized so a single row stride is valid.
+    # The kernel takes a row stride, so a 2-D row-strided view (e.g. a torch.split slice)
+    # needs no copy; anything else non-contiguous is materialized.
     row_strided_2d = input.dim() == 2 and input.stride(-1) == 1
     if not (input.is_contiguous() or row_strided_2d):
         input = input.contiguous()
@@ -163,13 +160,11 @@ def rmsnorm2d_fwd_with_add_opus(
 ) -> None:
     """out = rmsnorm(input + residual_in) * weight; residual_out = input + residual_in.
 
-    Single out-of-place kernel pass (input/residual_in read, out/residual_out written) --
-    no host-side staging copies. This is the per-layer residual-add path that
-    vLLM / SGLang / ATOM all call, so the staging copies were a ~2x regression there.
+    Single out-of-place kernel pass (no host staging copies) -- the per-layer residual-add
+    path vLLM/SGLang/ATOM call, so staging copies were a ~2x regression.
     """
     hidden = input.shape[-1]
-    # kernel reads each row contiguously but takes an input row stride; only a non-unit
-    # last-dim stride needs materializing (a 2-D row-strided view is fine).
+    # kernel takes an input row stride; only a non-unit last-dim stride needs materializing.
     if input.stride(-1) != 1:
         input = input.contiguous()
     in_s = input.stride(-2) if input.dim() >= 2 else hidden
@@ -364,9 +359,8 @@ def fused_add_rms_norm_cu(
     fused_add_rms_norm_opus(input, residual_in, weight, epsilon)
 
 
-# The opus backend is ctypes (reads .data_ptr() in Python), so torch.compile must not
-# trace into these entrypoints — wrap each as an opaque aiter custom op with a fake impl
-# (mirrors how the pre-opus CK ops were registered via @compile_ops).
+# opus is ctypes (reads .data_ptr()), so torch.compile must not trace in -- wrap each
+# entrypoint as an opaque aiter custom op with a fake impl (as the CK ops were).
 def _rms_norm_fwd_fake(
     input: Tensor,
     weight: Tensor,
@@ -593,9 +587,7 @@ def _arq(
     gemma_norm=False,
 ):
     assert input.dtype in _DTYPE_CODE
-    # The kernel handles a row stride (in_s below), so a row-contiguous strided view
-    # (e.g. a torch.split slice from fused_qk_rmsnorm) is fine; only materialize when
-    # the last dim itself is strided.
+    # kernel takes a row stride (in_s); only materialize when the last dim is strided.
     if input.stride(-1) != 1:
         input = input.contiguous()
     n = input.shape[-1]

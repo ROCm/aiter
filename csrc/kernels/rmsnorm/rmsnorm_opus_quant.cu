@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Compile unit 2/N of module_rmsnorm: fused rmsnorm + dynamic/smooth quant (int8/fp8),
-// backed by launch_quant (rmsnorm_quant_opus kernel). Its own translation unit so the
-// per-token quant kernel family compiles in parallel with norm/arq.
+// Fused rmsnorm + dynamic/smooth quant (int8/fp8) via launch_quant. Own TU so the
+// per-token quant kernels compile in parallel with norm/arq.
 
 #include "rmsnorm.h"
 

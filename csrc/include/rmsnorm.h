@@ -126,9 +126,7 @@ inline void launch_norm(void* out,
                         hipStream_t stream)
 {
     constexpr int VW = 16 / (int)sizeof(scalar_t); // 8 for bf16/fp16, 4 for fp32
-    // out-of-place fused add: residual read from residual_, written to a distinct
-    // residual_out. In-place (residual_out==residual) and no-add (residual==nullptr)
-    // use the OOP=false instantiation, which never touches residual_out.
+    // oop: out-of-place add (residual_out != residual). In-place / no-add use OOP=false.
     const bool oop = (residual != nullptr) && (residual_out != residual);
     // no pointer-alignment gate: AMDGPU handles misaligned 128-bit access.
     // gemma uses the generic kernel (any hidden); BE only for gemma == 0.
@@ -266,12 +264,9 @@ inline void launch_quant(void* out,
 #undef OPUS_QUANT
 }
 
-// ---------------------------------------------------------------------------
-// module_rmsnorm_quant replacement: no-quant / per-token / grouped / fp4 quant,
-// fused-add, gemma, smooth, shuffle_scale, strided rows. Mirrors the reference
-// per-n (BlockSize, thread_data_size) dispatch; grouped picks by cu_num. n<=8192.
-// out_code: -1 no-quant (out=in), 0 int8, 1 fp8, 2 fp4x2. in_code: 0 fp16, 1 bf16.
-// ---------------------------------------------------------------------------
+// module_rmsnorm_quant replacement: no-quant/per-token/grouped/fp4, add, gemma, smooth,
+// shuffle, strided (n<=8192). Mirrors the reference per-n (BLK,TDS) dispatch; grouped by cu_num.
+// out_code: -1 no-quant, 0 int8, 1 fp8, 2 fp4x2. in_code: 0 fp16, 1 bf16.
 template <typename in_t, typename out_t>
 inline void launch_arq_io(void* out, void* rout, void* scale, const void* in, const void* rin,
                           const void* w, const void* xsc, float epsilon, int m, int n, float qmax,
@@ -298,11 +293,9 @@ inline void launch_arq_io(void* out, void* rout, void* scale, const void* in, co
         else                                                                                       \
             ARQ(BLK, TDS, true);                                                                   \
     } while(0)
-    // Grouped quant requires the tile's thread_data_size to divide group_size (so a
-    // group is a whole power-of-two lane run). The per-token (256,24)/(256,32) tiles for
-    // n>4096 have TDS that does NOT divide 128/32, so grouped must switch to (512,16)/
-    // (1024,8) for ALL n>4096 (not just n>6144) -- otherwise rts is non-power-of-two and
-    // the scale store goes out of bounds (GPU fault at e.g. n=5120/6144).
+    // Grouped needs TDS to divide group_size. The per-token (256,24)/(256,32) tiles for n>4096
+    // don't divide 128/32, so grouped switches to (512,16)/(1024,8) for ALL n>4096 -- else the
+    // scale store goes OOB (GPU fault at n=5120/6144).
     if(group > 0)
     {
         if(n <= 512)
@@ -334,8 +327,6 @@ inline void launch_arq_io(void* out, void* rout, void* scale, const void* in, co
 #undef ARQ
 }
 
-// The out_code dispatch that used to live here now lives in the per-out-dtype arq
-// translation units (csrc/kernels/rmsnorm/rmsnorm_opus_arq_*.cu) so int8/fp8/fp4 build
-// in parallel; each calls launch_arq_io<in_t, out_t> above.
+// out_code dispatch lives in the per-out-dtype arq TUs (kernels/rmsnorm/rmsnorm_opus_arq_*.cu).
 
 } // namespace aiter

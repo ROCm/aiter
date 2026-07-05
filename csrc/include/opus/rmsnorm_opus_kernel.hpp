@@ -4,10 +4,8 @@
 // OPUS RMSNorm device kernels. 2D block: x = threads/row, y = rows/block.
 #pragma once
 
-// fp32->bf16 store rounding (must precede opus.hpp). Use truncate (2), matching the CK/HIP
-// reference: RNE (0) has no hardware bf16-cvt on gfx942 and lowers to a ~6-op/element
-// software sequence, making bf16 output/residual stores ~2x slower there (gfx950 has the
-// hardware cvt so RNE is free, but truncate matches the reference on both).
+// fp32->bf16 store rounding (must precede opus.hpp): truncate (2) matches the CK reference.
+// RNE (0) is software (~2x slower) on gfx942, which lacks a hardware bf16 cvt.
 #ifndef OPUS_FP32_to_BF16_DEFAULT
 #define OPUS_FP32_to_BF16_DEFAULT 2
 #endif
@@ -84,12 +82,9 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out,
                                         int in_s,
                                         int model_sensitive);
 
-// Faithful opus port of add_rmsnorm_quant_kernel (module_rmsnorm_quant): one row
-// per block. Uses the coalesced load_vector_nbytes/store_vector IO layer (opus_vec_io).
-// Per-token quant (group==0) loads interleaved for coalescing; grouped quant keeps
-// contiguous per-thread ownership (ILV=false) so a group of group_size elements =
-// reduce_thread_size = group_size/TDS contiguous lanes. Covers no-quant, per-token &
-// grouped int8/fp8/fp4, fused-add, gemma, shuffle, strided rows.
+// opus port of add_rmsnorm_quant_kernel (one row/block, coalesced opus_vec_io). Per-token
+// (group==0) loads interleaved; grouped keeps contiguous ownership (ILV=false) so a group =
+// group_size/TDS contiguous lanes. Covers no-quant/int8/fp8/fp4, add, gemma, shuffle, strided.
 template <typename In, typename Out, int Blk, int Tds, bool Interleave>
 struct arq_opus_traits
 {
@@ -175,11 +170,9 @@ __device__ inline float block_reduce(float v)
     return s[base];
 }
 
-// Cross-lane partner value (lane ^ LG/2) within an aligned lanegroup of size LG.
-// Real v_mov_b32_dpp for LG<=16 (no LDS): quad_perm for 2/4; for 8/16, upd_dpp with an
-// uninitialized old value + complementary bank masks (the trick from carlushuang/gcnasm
-// warp_sort_bitonic — passing a defined old would emit an extra v_mov before the dpp, and
-// plain mov_dpp with row controls falls back to ds_bpermute on CDNA3). 32/64 use shfl.
+// Cross-lane partner (lane ^ LG/2) within an aligned lanegroup of size LG. Real v_mov_b32_dpp
+// for LG<=16 (no LDS): quad_perm for 2/4; upd_dpp with uninitialized old + complementary bank
+// masks for 8/16 (gcnasm warp_sort_bitonic trick; else falls back to ds_bpermute). 32/64: shfl.
 template <typename T, int LG>
 __device__ inline T warp_swap_(const T& x, int lane)
 {
@@ -230,10 +223,8 @@ __device__ inline float warp_reduce_dpp(float v)
                               __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), 63));
 }
 
-// Fast 1D block reduction: DPP all-reduce within a warp (wave64), then a single LDS
-// exchange across warps combined serially (no ds_bpermute). Replaces the LDS reduction
-// on the memory-light per-token / no-add quant paths, where the reduce is on the
-// critical path. NWARP = BLK/warp is compile-time so the cross-warp loop fully unrolls.
+// Fast 1D block reduction: DPP wave64 all-reduce, then one serial LDS exchange across warps
+// (no ds_bpermute); wins on memory-light per-token/no-add paths. NWARP=BLK/warp is compile-time.
 template <bool IS_MAX, int BLK>
 __device__ inline float block_reduce_1d(float v)
 {
@@ -405,9 +396,8 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
     }
 }
 
-// OOP=false: in-place fused add (residual read+written in residual_; residual_out_ unused
-// so the no-add / in-place instantiation compiles identically to the pre-out-of-place
-// kernel). OOP=true: out-of-place fused add (read residual_, write residual_out_).
+// OOP=false: in-place fused add (residual_out_ unused; codegen == pre-OOP kernel).
+// OOP=true: out-of-place (read residual_, write residual_out_).
 template <typename Traits, bool OOP>
 __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
                                      const void* __restrict__ in_,

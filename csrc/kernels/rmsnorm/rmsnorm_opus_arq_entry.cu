@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// module_rmsnorm_quant replacement C entrypoint. Dispatches out_code to the per-out-dtype
-// arq launchers (each compiled in its own TU) so int8/fp8/fp4 build in parallel. Also
-// holds the no-quant (out dtype == in dtype) launcher, which is small.
+// module_rmsnorm_quant replacement entrypoint: dispatch out_code to the per-out-dtype arq
+// launchers (each its own TU). Also holds the small no-quant launcher (out dtype == in).
 #include "rmsnorm_opus_arq.hpp"
 
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
