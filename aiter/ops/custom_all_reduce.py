@@ -104,14 +104,16 @@ def fused_allreduce_rmsnorm_pad(
 ) -> None: ...
 
 
-def is_prezero_free(num_tokens: int, n: int) -> bool:
+def is_prezero_free(num_tokens: int, n: int, out_hidden_dim: int = 4096) -> bool:
     """True if zeroing the ``(num_tokens, n)`` buffer rides the fused
-    allreduce-rmsnorm launch for free: its AR CTAs (one per token row) plus the
-    zero-fill CTAs fit one wave across all CUs. Mirrors the 2-stage grid in
-    dispatchFusedAllReduceRMSNorm.
+    allreduce-rmsnorm launch for free: AR CTAs (one per token row) plus zero-fill
+    CTAs fit one wave across all CUs. Each zero-fill CTA covers
+    ``8 * round_up(out_hidden_dim / 8, 32)`` elements (the AR block dim); the
+    default 4096 reproduces the legacy 512-thread estimate.
     """
-    # block(512), 8-elem 16-byte stores (fp16/bf16, the kernel's only dtypes)
-    prezero_cta = (num_tokens * n + 8 * 512 - 1) // (8 * 512)
+    launch_threads = ((out_hidden_dim // 8 + 31) // 32) * 32
+    per_cta = 8 * launch_threads
+    prezero_cta = (num_tokens * n + per_cta - 1) // per_cta
     return num_tokens + prezero_cta < get_cu_num()
 
 
