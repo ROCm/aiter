@@ -239,14 +239,8 @@ def test_mla(
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
         and ctx_lens <= 16384
     ):
-        try:
-            us_aiter = test_normal_prefill()
-            ret["prefill:ck_192"] = us_aiter
-        except ImportError as e:
-            # Prefill baseline (flash_attn_varlen_func) needs optional deps
-            # (e.g. flydsl) not present in every env; skip it without aborting
-            # the decode benchmark we actually care about.
-            aiter.logger.warning("skip prefill baseline (missing dep): %s", e)
+        us_aiter = test_normal_prefill()
+        ret["prefill:ck_192"] = us_aiter
 
     torch.cuda.empty_cache()
     # absorb init

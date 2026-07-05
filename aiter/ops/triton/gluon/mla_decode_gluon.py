@@ -101,8 +101,6 @@ def _mla_decode_gluon(
     RETURN_LSE: gl.constexpr,
     QLEN: gl.constexpr,  # MTP query length; 1 for plain decode
 ):
-    # MTP: QLEN>1 enables the per-q_pos causal tail mask (QLEN==1 folds it out).
-    IS_CAUSAL: gl.constexpr = QLEN > 1
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
     # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
     # MTP: an extra q_pos axis carries the query position within QLEN. bh64 packs
@@ -160,9 +158,9 @@ def _mla_decode_gluon(
 
     # MTP causal tail mask: query position q_pos may attend KV
     # [0, seq_len-QLEN+q_pos] only, so score_end is its per-program valid-score
-    # bound. For QLEN==1 this equals split_kv_end, so IS_CAUSAL=False keeps the
-    # original code path untouched.
-    if IS_CAUSAL:
+    # bound. For QLEN==1 this equals split_kv_end, keeping the original code
+    # path untouched.
+    if QLEN > 1:
         score_end = gl.minimum(split_kv_end, cur_batch_seq_len - QLEN + q_pos + 1)
     else:
         score_end = split_kv_end
@@ -539,7 +537,7 @@ def _mla_decode_gluon(
         LOG2E: gl.constexpr = 1.4426950408889634
         re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
         p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
-        if IS_CAUSAL:
+        if QLEN > 1:
             # MTP: a leading/whole fully-masked split keeps e_max=n_e_max=-inf,
             # making re_scale/p NaN. Force them to 0 so the split cleanly yields
             # e_sum=0 -> lse=-inf, which stage-2 drops.
@@ -609,7 +607,7 @@ def _mla_decode_gluon(
         n_e_max = gl.maximum(gl.max(qk, 1), e_max)
         re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
         p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
-        if IS_CAUSAL:
+        if QLEN > 1:
             re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
             p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
         e_sum = e_sum * re_scale + gl.sum(p, 1)
@@ -641,7 +639,7 @@ def _mla_decode_gluon(
     n_e_max = gl.maximum(gl.max(qk, 1), e_max)
     re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
     p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
-    if IS_CAUSAL:
+    if QLEN > 1:
         re_scale = gl.where(e_max == float("-inf"), 0.0, re_scale)
         p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
     e_sum = e_sum * re_scale + gl.sum(p, 1)
