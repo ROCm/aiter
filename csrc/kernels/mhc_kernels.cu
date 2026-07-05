@@ -2270,10 +2270,21 @@ namespace aiter {
         // contribution to the SAME output element (same idx/n_idx tile + lane->
         // row/col mapping), so the cross-warp sum is the head reduction.
         // Reuse s_residual as scratch (dead after the k_loop); cast to float.
+        // Cross-warp (over hc_mult heads) reduction of BOTH v_cf (gemm_out_mul) and
+        // sqrsum, sharing a single deposit + single barrier (2 __syncthreads total
+        // instead of 4). v_cf and sqrsum use disjoint regions of s_red, so warps
+        // 1..hc_mult-1 deposit both before one barrier, then warp 0 reduces+stores
+        // both. Reuse s_residual as scratch (dead after the k_loop); cast to float.
         float* s_red = reinterpret_cast<float*>(s_residual);
         static constexpr int v_per_lane = m_repeat * repeat_n * ovec;
-        __syncthreads();
-        // warps 1..hc_mult-1 deposit their v_cf, warp 0 reads and accumulates.
+        float* s_sq = s_red + (hc_mult - 1) * warp_size * v_per_lane;  // disjoint
+        // sqrsum per-warp partial (computed on all warps; DPP, no barrier needed)
+        float sqrsum_w[m_repeat];
+        if (n_idx == 0) {
+            for (int b = 0; b < m_repeat; b++)
+                sqrsum_w[b] = cross_row_sum_4(sqrsum_part[b], lane_id);
+        }
+        __syncthreads();  // (1) s_residual reads (last compute tile) done before reuse
         if (warp_id != 0) {
             int base = (warp_id - 1) * warp_size * v_per_lane + lane_id * v_per_lane;
             int c = 0;
@@ -2281,8 +2292,11 @@ namespace aiter {
                 for (int n = 0; n < repeat_n; n++)
                     for (int e = 0; e < ovec; e++)
                         s_red[base + c++] = v_cf[b][n][e];
+            if (n_idx == 0 && lane_id < mfma_m)
+                for (int b = 0; b < m_repeat; b++)
+                    s_sq[((warp_id - 1) * mfma_m + lane_id) * m_repeat + b] = sqrsum_w[b];
         }
-        __syncthreads();
+        __syncthreads();  // (2) all deposits visible
         if (warp_id == 0) {
             for (int w = 0; w < hc_mult - 1; w++) {
                 int base = w * warp_size * v_per_lane + lane_id * v_per_lane;
@@ -2299,33 +2313,13 @@ namespace aiter {
                         g_o, v_cf[b][n], gc_offset + n * mfma_n);
                 }
             }
-        }
-
-        if (n_idx == 0) {
-            float sqrsum_w[m_repeat];
-            for (int b = 0; b < m_repeat; b++) {
-                sqrsum_w[b] = cross_row_sum_4(sqrsum_part[b], lane_id);
-            }
-            // Deposit per-warp sqrsum (lane_id < mfma_m holds the reduced rows),
-            // then warp 0 sums across warps. Reuse s_red at a disjoint offset past
-            // the v_cf scratch region.
-            float* s_sq = s_red + (hc_mult - 1) * warp_size * v_per_lane;
-            __syncthreads();
-            if (warp_id != 0 && lane_id < mfma_m) {
-                for (int b = 0; b < m_repeat; b++) {
-                    s_sq[((warp_id - 1) * mfma_m + lane_id) * m_repeat + b] = sqrsum_w[b];
-                }
-            }
-            __syncthreads();
-            if (warp_id == 0 && lane_id < mfma_m) {
+            if (n_idx == 0 && lane_id < mfma_m) {
                 for (int b = 0; b < m_repeat; b++) {
                     float acc = sqrsum_w[b];
-                    for (int w = 0; w < hc_mult - 1; w++) {
+                    for (int w = 0; w < hc_mult - 1; w++)
                         acc += s_sq[(w * mfma_m + lane_id) * m_repeat + b];
-                    }
-                    if (b * mfma_m + lane_id < m_oob) {
+                    if (b * mfma_m + lane_id < m_oob)
                         sqrsum[k_split_idx * m + idx + b * mfma_m + lane_id] = acc;
-                    }
                 }
             }
         }
