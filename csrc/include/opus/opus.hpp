@@ -1632,8 +1632,8 @@ OPUS_D unsigned int lane_id() {
     else return __builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0));
 }
 
-//gfx1250 only feature
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+//gfx1250 only feature. Named-barrier / cluster-sync builtins + __amdgpu_named_workgroup_barrier_t only exist on clang>=22 (ROCm>=7.2); gate the host pass too so clang-20 (ROCm 7.1) CI does not parse them.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
 OPUS_D u32_t waveid_in_workgroup() { u32_t wave_id; asm volatile("s_bfe_u32 %0, ttmp8, 0x50019" : "=s"(wave_id)); return wave_id; }
 
 //Named Barrier define
@@ -2333,7 +2333,8 @@ template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // tdm (gfx1250): tdm_desc = stateless D# (sg0..sg3 raw dwords); tdm_window = stateful tile window with make() + move(d0..d4, lds) + load_to_lds<cpol>(); cpol[6:0] = | rsvd | NV | scope[2] | th[3] |.
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+// __builtin_amdgcn_tensor_load_to_lds only exists on clang>=22 (ROCm>=7.2); gate the host pass too so clang-20 (ROCm 7.1) CI does not parse it.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
 
 enum class tdm_load_th : u8_t { rt=0, nt=1, ht=2, bypass=3, nt_rt=4, rt_nt=5, nt_ht=6 };           // bypass = LU (last-use)
 enum class tdm_scope   : u8_t { cu=0, se=1, dev=2, sys=3 };

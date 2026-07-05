@@ -870,11 +870,11 @@ def mla_decode_v4_asm(
     splitLse: torch.Tensor,
     # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
     output: torch.Tensor,
-    # [num_seqs] i32 scratch (nullable). ABI parity with V3 stage1's
-    # valid-split-count slot; the shipped v4 nm .co does NOT consume it, so it is
-    # a passive placeholder enabling CUDA-graph-safe fixed-buffer plumbing.
+    # [num_seqs] int32 scratch for gfx1250 packed MLA kernels. Holds the
+    # per-request valid kv-split count the kernel writes (slot 19). Pass a
+    # real tensor when use_valid_split_count_reduce != 0; otherwise the
+    # kernel skips the write and nullptr is fine.
     valid_split_count: Optional[torch.Tensor] = None,
-    # ABI parity with V3 stage1's trailing scalar; ignored by the v4 nm kernel.
     use_valid_split_count_reduce: int = 0,
 ) -> None: ...
 
