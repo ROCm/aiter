@@ -9,7 +9,7 @@ PERF_ROOT="perf_logs"
 MHA_TEST_CMD="${MHA_TEST_CMD:-python op_tests/test_mha_flydsl_varlen.py --causal true --return_lse true -d_qk_v 128,128 -b 1 -nh 32 -sq 8192 -sk 8192 --random-value false --warmup 5 --repeat 20}"
 
 usage() {
-    echo "Usage: ${SCRIPT_NAME} <output-dir-name>" >&2
+    echo "Usage: ${SCRIPT_NAME} <output-dir-name> [--am]" >&2
 }
 
 validate_output_dir_name() {
@@ -401,6 +401,26 @@ fi
 output_dir_name="${1:-}"
 validate_output_dir_name "${output_dir_name}"
 output_dir="${PERF_ROOT}/${output_dir_name}"
+shift
+
+am_mode=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --am)
+            am_mode=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 host_git_branch="$(git -C "${REPO_ROOT}" branch --show-current || true)"
 host_git_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD || true)"
@@ -426,10 +446,19 @@ set -e
 if [[ -d "${REPO_ROOT}/${output_dir}" ]]; then
     git -C "${REPO_ROOT}" add -f "${output_dir}"
     if ! git -C "${REPO_ROOT}" diff --cached --quiet; then
-        git -C "${REPO_ROOT}" -c user.name=yanguahe -c user.email=yanguahe@amd.com \
-            commit --author="yanguahe <yanguahe@amd.com>" -m Update
+        if [[ "${am_mode}" -eq 1 ]]; then
+            git -C "${REPO_ROOT}" -c user.name=yanguahe -c user.email=yanguahe@amd.com \
+                commit --amend --author="yanguahe <yanguahe@amd.com>" -m Update
+        else
+            git -C "${REPO_ROOT}" -c user.name=yanguahe -c user.email=yanguahe@amd.com \
+                commit --author="yanguahe <yanguahe@amd.com>" -m Update
+        fi
     fi
-    git -C "${REPO_ROOT}" push origin hyg_dev
+    if [[ "${am_mode}" -eq 1 ]]; then
+        git -C "${REPO_ROOT}" push -f origin hyg_dev
+    else
+        git -C "${REPO_ROOT}" push origin hyg_dev
+    fi
 else
     echo "Missing expected output directory: ${REPO_ROOT}/${output_dir}" >&2
 fi
