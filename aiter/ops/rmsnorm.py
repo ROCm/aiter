@@ -144,7 +144,17 @@ def rmsnorm2d_fwd_opus(
     input: Tensor, weight: Tensor, epsilon: float, use_model_sensitive_rmsnorm: int = 0
 ) -> Tensor:
     out = torch.empty_like(input)
-    rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
+    # Common case (fp16/bf16, non-T5, hidden <= 8192, 2-D): opus arq kernel -- the bit-exact
+    # port of the HIP add_rmsnorm_quant_kernel main dispatched here. Generic kernel otherwise.
+    if (
+        use_model_sensitive_rmsnorm == 0
+        and input.dim() == 2
+        and input.element_size() == 2
+        and input.shape[-1] <= 8192
+    ):
+        rmsnorm(out, input, weight, epsilon)
+    else:
+        rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
     return out
 
 
@@ -164,6 +174,16 @@ def rmsnorm2d_fwd_with_add_opus(
     path vLLM/SGLang/ATOM call, so staging copies were a ~2x regression.
     """
     hidden = input.shape[-1]
+    # Common case (fp16/bf16, non-T5, hidden <= 8192, 2-D): opus arq kernel -- the bit-exact
+    # port of the HIP add_rmsnorm_quant_kernel main dispatched here. Generic kernel otherwise.
+    if (
+        use_model_sensitive_rmsnorm == 0
+        and input.dim() == 2
+        and input.element_size() == 2
+        and hidden <= 8192
+    ):
+        add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon, gemma_norm)
+        return
     # kernel takes an input row stride; only a non-unit last-dim stride needs materializing.
     if input.stride(-1) != 1:
         input = input.contiguous()
