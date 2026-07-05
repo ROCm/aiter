@@ -4,11 +4,10 @@
 // OPUS RMSNorm C ABI (ctypes): raw int64 pointers + dims, validated Python-side.
 // dtype: 0=fp16, 1=bf16, 2=fp32.
 //
-// Compile unit 1/N of module_rmsnorm: the plain norm entrypoints (no quant), all
-// backed by launch_norm (be/generic kernels). Split into its own translation unit so
-// the norm kernel family compiles in parallel with the quant/arq families.
-
-#include "rmsnorm.h"
+// The plain norm entrypoints (no quant). Dispatches the dtype code to the per-dtype
+// norm launchers (each compiled in its own TU) so bf16/fp16/fp32 build in parallel.
+// This TU only holds the dispatch/entrypoints (no kernel instantiation).
+#include "rmsnorm_opus_norm.hpp"
 
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
 
@@ -17,11 +16,11 @@
     do                                                                                               \
     {                                                                                                \
         if((DTYPE) == 2)                                                                             \
-            launch_norm<fp32_t>((O), (I), (W), (R), (RO), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
+            aiter::opus_norm_fp32((O), (I), (W), (R), (RO), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
         else if((DTYPE) == 1)                                                                        \
-            launch_norm<bf16_t>((O), (I), (W), (R), (RO), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
+            aiter::opus_norm_bf16((O), (I), (W), (R), (RO), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
         else                                                                                         \
-            launch_norm<fp16_t>((O), (I), (W), (R), (RO), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
+            aiter::opus_norm_fp16((O), (I), (W), (R), (RO), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
     } while(0)
 
 OPUS_EXPORT void rms_norm_opus(size_t out,
@@ -36,7 +35,6 @@ OPUS_EXPORT void rms_norm_opus(size_t out,
                                int gemma,
                                size_t stream)
 {
-    using namespace aiter;
     if(rows <= 0 || hidden <= 0)
         return;
     auto s  = reinterpret_cast<hipStream_t>(stream);
@@ -57,7 +55,6 @@ OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
                                          int gemma,
                                          size_t stream)
 {
-    using namespace aiter;
     if(rows <= 0 || hidden <= 0)
         return;
     const int in_s = hidden; // in-place fused-add always operates on contiguous rows
@@ -85,7 +82,6 @@ OPUS_EXPORT void add_rms_norm_opus(size_t out,
                                    int gemma,
                                    size_t stream)
 {
-    using namespace aiter;
     if(rows <= 0 || hidden <= 0)
         return;
     auto s   = reinterpret_cast<hipStream_t>(stream);
