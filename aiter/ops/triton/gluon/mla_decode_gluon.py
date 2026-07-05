@@ -784,7 +784,6 @@ def mla_decode_gluon(
     kv_scale=1.0,
     min_kv_seq_len=1,
     return_lse=False,
-    num_kv_splits=None,
 ):
     """
     Gluon MLA decode (gfx950 / CDNA4).
@@ -906,12 +905,6 @@ def mla_decode_gluon(
         assert (
             kv_c.dtype == kv_dtype and k_pe.dtype == kv_dtype
         ), f"kv_c/k_pe must be {kv_dtype}, got {kv_c.dtype}/{k_pe.dtype}"
-
-    # Optional NUM_KV_SPLITS override (tuning knob). Only for bh16* regimes (bh64's
-    # num_iter>=3 assume forbids it); clamped to [1, min_kv_seq_len] so every split
-    # stays non-empty.
-    if num_kv_splits is not None and REGIME != "bh64":
-        NUM_KV_SPLITS = max(1, min(int(num_kv_splits), min_kv_seq_len))
 
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
