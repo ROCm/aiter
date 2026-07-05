@@ -39,76 +39,6 @@ inline std::pair<dim3, dim3> pick_dims(int rows, int vhid)
 }
 
 
-// Bit-exact (vs CK) launch for one CK tile geometry (TN threads/row, RN vecs).
-template <typename scalar_t, int TN, int RN>
-inline void launch_be(void* out,
-                      const void* in,
-                      const void* weight,
-                      void* residual,
-                      void* residual_out,
-                      bool oop,
-                      float epsilon,
-                      int rows,
-                      int hidden,
-                      int in_s,
-                      int model_sensitive,
-                      hipStream_t stream)
-{
-    const int tm = (TN > 64) ? 1 : (256 / TN); // rows/block; TN>64 needs 1 row/block
-    const dim3 block(TN, tm);
-    const dim3 grid((rows + tm - 1) / tm);
-#define OPUS_BE_LAUNCH(OOP)                                                             \
-    hipLaunchKernelGGL((rmsnorm_be_opus<rmsnorm_be_opus_traits<scalar_t, TN, RN>, OOP>),\
-                       grid, block, 0, stream, out, in, weight, residual, residual_out, \
-                       epsilon, rows, hidden, in_s, model_sensitive)
-    if(oop)
-        OPUS_BE_LAUNCH(true);
-    else
-        OPUS_BE_LAUNCH(false);
-#undef OPUS_BE_LAUNCH
-}
-
-// Dispatch to the bit-exact kernel for CK's vn=8 tile buckets; returns false if
-// this hidden size has no bit-exact geometry (caller uses the generic kernel).
-template <typename scalar_t>
-inline bool launch_norm_be(void* out,
-                           const void* in,
-                           const void* weight,
-                           void* residual,
-                           void* residual_out,
-                           bool oop,
-                           float epsilon,
-                           int rows,
-                           int hidden,
-                           int in_s,
-                           int model_sensitive,
-                           hipStream_t stream)
-{
-#define OPUS_BE(N, TN, RN)                                                              \
-    case N:                                                                             \
-        launch_be<scalar_t, TN, RN>(                                                    \
-            out, in, weight, residual, residual_out, oop, epsilon, rows, hidden, in_s, model_sensitive, stream); \
-        return true
-    switch(hidden)
-    {
-        OPUS_BE(64, 8, 1);
-        OPUS_BE(128, 16, 1);
-        OPUS_BE(512, 64, 1);
-        OPUS_BE(1024, 64, 2);
-        OPUS_BE(1536, 64, 3);
-        OPUS_BE(2048, 256, 1);
-        OPUS_BE(2560, 64, 5);
-        OPUS_BE(3072, 128, 3);
-        OPUS_BE(4096, 256, 2);
-        OPUS_BE(5120, 128, 5);
-        OPUS_BE(6144, 256, 3);
-        OPUS_BE(7168, 128, 7);
-        OPUS_BE(8192, 256, 4);
-    default: return false;
-    }
-#undef OPUS_BE
-}
-
 // rmsnorm (+ fused add when residual != nullptr). Bit-exact vs CK on the vn=8
 // buckets (2-byte); generic (<=2 ulp) otherwise.
 template <typename scalar_t>
@@ -130,13 +60,7 @@ inline void launch_norm(void* out,
     const bool oop = (residual != nullptr) && (residual_out != residual);
     // no pointer-alignment gate: AMDGPU handles misaligned 128-bit access.
     // gemma uses the generic kernel (any hidden); BE only for gemma == 0.
-    if constexpr(sizeof(scalar_t) == 2)
-    {
-        if(gemma == 0 && (hidden % 8 == 0) &&
-           launch_norm_be<scalar_t>(
-               out, in, weight, residual, residual_out, oop, epsilon, rows, hidden, in_s, model_sensitive, stream))
-            return;
-    }
+    // be kernel removed: all sizes use the generic kernel
     const bool vec           = (hidden % VW == 0);
     const auto [block, grid] = pick_dims(rows, vec ? hidden / VW : hidden);
     // gemma and OOP are compile-time template args (no runtime cost when false).
