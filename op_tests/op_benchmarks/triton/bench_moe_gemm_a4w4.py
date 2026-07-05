@@ -11,8 +11,8 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
     mxfp4_quant,
     moe_gemm_a4w4,
-    swizzle_scales,
 )
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
@@ -129,9 +129,11 @@ def compute_roofline(
             w.writerow(row)
 
 
-def check_and_swizzle_scales(scale, N, K):
+def check_and_shuffle_scales(scale, N, K):
     if N % 32 == 0 and K % (32 * 8) == 0:
-        scale = swizzle_scales(scale)
+        scale = shuffle_scale_moe(
+            scale, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         return scale, "CDNA4_SCALE"
     else:
         return scale, None
@@ -184,8 +186,8 @@ def bench_mlp_single_weight_init(
     wg, _ = quantize(wg, "bf16")
     w1, w1_scale = quantize(w1, w_dtype)
     w2, w2_scale = quantize(w2, w_dtype)
-    w1_scale, swizzle_mx_scale1 = check_and_swizzle_scales(w1_scale, dim2 // TP, dim1)
-    w2_scale, swizzle_mx_scale2 = check_and_swizzle_scales(
+    w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
+    w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scale, dim1, dim2 // TP // 2
     )
 
