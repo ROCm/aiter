@@ -10,7 +10,7 @@
 #define OPUS_FP32_to_BF16_DEFAULT 2
 #endif
 #include "opus/opus.hpp"
-#include "opus/opus_vec_io.hpp"
+#include "opus/rmsnorm_opus_io.hpp"
 #include "opus/rmsnorm_opus_quant_detail.hpp"
 
 namespace aiter {
@@ -82,7 +82,7 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out,
                                         int in_s,
                                         int model_sensitive);
 
-// opus port of add_rmsnorm_quant_kernel (one row/block, coalesced opus_vec_io). Per-token
+// opus port of add_rmsnorm_quant_kernel (one row/block, coalesced IO). Per-token
 // (group==0) loads interleaved; grouped keeps contiguous ownership (ILV=false) so a group =
 // group_size/TDS contiguous lanes. Covers no-quant/int8/fp8/fp4, add, gemma, shuffle, strided.
 template <typename In, typename Out, int Blk, int Tds, bool Interleave>
@@ -720,7 +720,7 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out_,
     const int tid    = opus::thread_id_x();
     const float goff = gemma ? 1.0f : 0.0f;
 
-    // Vectorized coalesced IO, mirroring add_rmsnorm_quant_kernel (opus_vec_io layer).
+    // Vectorized coalesced IO, mirroring add_rmsnorm_quant_kernel (rmsnorm_opus_io).
     using out_store_t = std::conditional_t<FP4, uint8_t, out_t>;
     constexpr int load_chunk_bytes = (sizeof(in_t) * TDS % 16 == 0) ? 16 : 8;
     constexpr int load_vec_size    = load_chunk_bytes / sizeof(in_t);
