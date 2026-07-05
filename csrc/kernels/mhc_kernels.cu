@@ -2143,7 +2143,7 @@ namespace aiter {
                     for(int h = 0; h < hc_mult; h++) {
                         residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
                     }
-                    s_wait_all_dscnt(opus::number<0>{});
+                    s_wait_all_dscnt(opus::number<hc_mult>{});
                     for(int k = 0; k < ds_read_vec; k++) {
                         res[k] = static_cast<float>(x_vec[k]) * post_mix_v[b];
                     }
@@ -2187,11 +2187,13 @@ namespace aiter {
             // issuing wave drains its current stage down to the single prefetch left in
             // flight (KEEP1, per-wave counter; a no-op on the non-issuing warps), then
             // the workgroup barrier publishes both tiles to all warps. fn stays on
-            // loadcnt; there are no async loads left, so the async count is 0.
+            // loadcnt; there are no async loads left, so the async count is -1
+            // (sentinel: suppress s_wait_asynccnt emission; 0 would emit a spurious
+            // s_wait_asynccnt 0).
             MHC_TDM_KEEP1();
-            s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<0>{});
+            s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<-1>{});
             __builtin_amdgcn_s_barrier();
-            s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<0>{});
+            s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<-1>{});
         };
 #else
         auto wait_load_cnt = [&]() {
