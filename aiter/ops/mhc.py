@@ -179,30 +179,35 @@ def _mhc_fused_config_gfx1250_256(m, hidden_size, num_cu):
         return 1, 16, 32, tile_k
 
     tile_n = 32
-    tile_m = 16 if m <= 512 else 32
+    # Re-tuned on gfx1250/256 (TDM residual load): fn-reuse (tile_m=32) wins from
+    # m=512 up; m<=256 is launch-bound and stays on tile_m=16.
+    tile_m = 16 if m <= 256 else 32
 
     # (m upper bound, target split_k) measured per (m, hidden) then merged; the
     # target is snapped to a legal divisor below so it stays valid for any hidden.
+    # Mid/large m follows blocks_m*split_k ~= 4*cu (~128*cu/m); small m is
+    # launch-bound (high split_k, config barely matters); very large m goes deeper.
     if hidden_size >= 7168:
         table = [
-            (128, 56),
-            (256, 56),
+            (128, 32),
+            (256, 32),
             (512, 32),
-            (1024, 8),
+            (1024, 32),
             (2048, 16),
             (4096, 8),
-            (8192, 4),
-            (1 << 30, 2),
+            (8192, 14),
+            (1 << 30, 7),
         ]
     else:
         table = [
+            (128, 64),
             (256, 32),
-            (512, 64),
-            (1024, 16),
+            (512, 32),
+            (1024, 32),
             (2048, 16),
-            (4096, 16),
-            (8192, 4),
-            (1 << 30, 2),
+            (4096, 8),
+            (8192, 8),
+            (1 << 30, 8),
         ]
     target = next(t for ub, t in table if m <= ub)
     splitk = min(valid, key=lambda s: (abs(math.log(s) - math.log(target)), -s))
@@ -542,7 +547,7 @@ def mhc_fused_post_pre(
     fused_m_upper_bound = {
         "gfx950": 1024,
         "gfx942": 128,
-        "gfx1250": 256,
+        "gfx1250": 1024,
     }.get(arch, 1024)
 
     if not force_fused and m >= fused_m_upper_bound:
