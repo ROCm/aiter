@@ -870,6 +870,14 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     A_scale strides are already adjusted by the wrapper for the
     transposed vs non-transposed case.
     """
+    # Fast path: when a single scale group spans the whole tile in both N and K,
+    # every column shares one b_scale, so load it with a single scalar global
+    # load (folded into the a-scale at the multiply) instead of a BLOCK_SIZE_N
+    # vector load of identical values.
+    LDS_A_SCALE: gl.constexpr = False
+    SCALAR_B_SCALE: gl.constexpr = (GROUP_N >= BLOCK_SIZE_N) and (
+        GROUP_K >= BLOCK_SIZE_K
+    )
 
     # program setup — split-K decomposition
     pid_unified = gl.program_id(axis=0)
@@ -916,12 +924,14 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         operand_index=1, parent=wmma_layout, k_width=8
     )
 
-    smem_scale_a = gl.allocate_shared_memory(
-        gl.float32, [BLOCK_SIZE_M], layout=shared_a_scale
-    )
-    smem_scale_b = gl.allocate_shared_memory(
-        gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
-    )
+    if LDS_A_SCALE:
+        smem_scale_a = gl.allocate_shared_memory(
+            gl.float32, [BLOCK_SIZE_M], layout=shared_a_scale
+        )
+    if not SCALAR_B_SCALE:
+        smem_scale_b = gl.allocate_shared_memory(
+            gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
+        )
 
     offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
         0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
@@ -933,13 +943,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     offs_a_scale = offs_am * stride_ascale_m
     offs_b_scale_n = offs_bn // GROUP_N
     offs_b_scale = offs_b_scale_n * stride_bscale_n
-    # Fast path: when a single scale group spans the whole tile in both N and K,
-    # every column shares one b_scale, so load it with a single scalar global
-    # load (folded into the a-scale at the multiply) instead of a BLOCK_SIZE_N
-    # vector load of identical values.
-    SCALAR_B_SCALE: gl.constexpr = (GROUP_N >= BLOCK_SIZE_N) and (
-        GROUP_K >= BLOCK_SIZE_K
-    )
+
     b_scale_scalar_off = ((pid_n * BLOCK_SIZE_N) // GROUP_N) * stride_bscale_n
 
     # Offset scale pointers to this split-K partition
@@ -987,9 +991,6 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
 
     # ------------ Prologue ---------------
 
-    a_scale = gl.amd.cdna4.buffer_load(
-        ptr=a_scale_ptr, offsets=offs_a_scale, cache=cache_modifier
-    )
     if SCALAR_B_SCALE:
         b_scale = gl.load(
             b_scale_ptr + b_scale_scalar_off, cache_modifier=cache_modifier
@@ -998,6 +999,9 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr, offsets=offs_b_scale, cache=cache_modifier
         )
+    a_scale = gl.amd.cdna4.buffer_load(
+        ptr=a_scale_ptr, offsets=offs_a_scale, cache=cache_modifier
+    )
 
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
@@ -1021,24 +1025,28 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     ).load(layout=dot_b_layout)
 
-    smem_scale_a.store(a_scale)
     if not SCALAR_B_SCALE:
         smem_scale_b.store(b_scale)
-    # Scalar case carries b_scale in a register (folded into the a-scale below).
-    cur_b_scale = b_scale
+    else:
+        cur_b_scale = b_scale
+    if LDS_A_SCALE:
+        smem_scale_a.store(a_scale)
+    else:
+        cur_a_scale = a_scale
 
     k_tiles_count = gl.cdiv(K_local, BLOCK_SIZE_K)
 
     # ----- Main Loop --------
 
     for k in range(k_tiles_count - (NUM_BUFFERS - 1)):
+        # Advance scales
         a_scale_ptr += stride_ascale_k
         b_scale_ptr += stride_bscale_k
-        cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         if not SCALAR_B_SCALE:
             cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
+        if LDS_A_SCALE:
+            cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
 
-        # Advance scales
         if SCALAR_B_SCALE:
             b_scale = gl.load(
                 b_scale_ptr + b_scale_scalar_off, cache_modifier=cache_modifier
@@ -1085,10 +1093,14 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
             BLOCK_SIZE_K=BLOCK_SIZE_K,
         ).load(layout=dot_b_layout)
 
-        smem_scale_a.store(a_scale)
         if not SCALAR_B_SCALE:
             smem_scale_b.store(b_scale)
-        cur_b_scale = b_scale
+        else:
+            cur_b_scale = b_scale
+        if LDS_A_SCALE:
+            smem_scale_a.store(a_scale)
+        else:
+            cur_a_scale = a_scale
 
         cur_a = next_a
         cur_b = next_b
@@ -1096,12 +1108,12 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
 
     # ======= Epilogue ========
 
-    cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
+    if LDS_A_SCALE:
+        cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
     if not SCALAR_B_SCALE:
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
     for i in gl.static_range(NUM_BUFFERS - 2):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
         a_scale_ptr += stride_ascale_k
         b_scale_ptr += stride_bscale_k
         if SCALAR_B_SCALE:
@@ -1116,6 +1128,7 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
             ptr=a_scale_ptr, offsets=offs_a_scale, cache=cache_modifier
         )
 
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
         next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
             layout=dot_a_layout
         )
@@ -1134,12 +1147,17 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         cur_b = next_b
         num_computes += 1
 
-        smem_scale_a.store(a_scale)
         if not SCALAR_B_SCALE:
             smem_scale_b.store(b_scale)
-        cur_b_scale = b_scale
+        else:
+            cur_b_scale = b_scale
+        if LDS_A_SCALE:
+            smem_scale_a.store(a_scale)
+        else:
+            cur_a_scale = a_scale
 
-        cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
+        if LDS_A_SCALE:
+            cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         if not SCALAR_B_SCALE:
             cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
