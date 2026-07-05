@@ -39,8 +39,7 @@ inline std::pair<dim3, dim3> pick_dims(int rows, int vhid)
 }
 
 
-// rmsnorm (+ fused add when residual != nullptr). Bit-exact vs CK on the vn=8
-// buckets (2-byte); generic (<=2 ulp) otherwise.
+// rmsnorm (+ fused add when residual != nullptr), generic kernel (<=2 ulp).
 template <typename scalar_t>
 inline void launch_norm(void* out,
                         const void* in,
@@ -59,8 +58,6 @@ inline void launch_norm(void* out,
     // oop: out-of-place add (residual_out != residual). In-place / no-add use OOP=false.
     const bool oop = (residual != nullptr) && (residual_out != residual);
     // no pointer-alignment gate: AMDGPU handles misaligned 128-bit access.
-    // gemma uses the generic kernel (any hidden); BE only for gemma == 0.
-    // be kernel removed: all sizes use the generic kernel
     const bool vec           = (hidden % VW == 0);
     const auto [block, grid] = pick_dims(rows, vec ? hidden / VW : hidden);
     // gemma and OOP are compile-time template args (no runtime cost when false).
