@@ -42,11 +42,12 @@ struct rmsnorm_be_opus_traits
 
 // rmsnorm (+ residual add when residual != 0, in-place when out == in);
 // model_sensitive != 0 = T5 variant (round s*inv before *w).
-template <typename Traits>
+template <typename Traits, bool OOP>
 __global__ void rmsnorm_opus_kernel(void* __restrict__ out,
                                      const void* __restrict__ in,
                                      const void* __restrict__ weight,
                                      void* __restrict__ residual,
+                                     void* __restrict__ residual_out,
                                      float epsilon,
                                      int rows,
                                      int hidden,
@@ -71,11 +72,12 @@ __global__ void rmsnorm_quant_opus(void* __restrict__ out,
 
 // Bit-exact vs CK: reproduces CK's square_sum order for its tile geometry
 // (TN threads/row x RN width-8 vecs).
-template <typename Traits>
+template <typename Traits, bool OOP>
 __global__ void rmsnorm_be_opus(void* __restrict__ out,
                                         const void* __restrict__ in,
                                         const void* __restrict__ weight,
                                         void* __restrict__ residual,
+                                        void* __restrict__ residual_out,
                                         float epsilon,
                                         int rows,
                                         int hidden,
@@ -119,8 +121,8 @@ __global__ void add_rmsnorm_quant_opus(void* __restrict__ out,
 
 #if !defined(__HIP_DEVICE_COMPILE__)
 // Host pass: empty stubs so the __device_stub__ symbols resolve.
-template <typename Traits>
-__global__ void rmsnorm_opus_kernel(void*, const void*, const void*, void*, float, int, int, int, int)
+template <typename Traits, bool OOP>
+__global__ void rmsnorm_opus_kernel(void*, const void*, const void*, void*, void*, float, int, int, int, int)
 {
 }
 template <typename Traits>
@@ -133,9 +135,9 @@ __global__ void rmsnorm_quant_opus(
     void*, void*, void*, const void*, const void*, void*, const void*, float, int, int, float, int)
 {
 }
-template <typename Traits>
+template <typename Traits, bool OOP>
 __global__ void
-rmsnorm_be_opus(void*, const void*, const void*, void*, float, int, int, int, int)
+rmsnorm_be_opus(void*, const void*, const void*, void*, void*, float, int, int, int, int)
 {
 }
 #else
@@ -273,11 +275,13 @@ __device__ inline float block_reduce_1d(float v)
 template <typename scalar_t, int width>
 using vec_t = scalar_t __attribute__((ext_vector_type(width)));
 
-template <typename Traits>
+// OOP=false: in-place fused add (residual_out_ unused). OOP=true: out-of-place.
+template <typename Traits, bool OOP>
 __global__ void rmsnorm_be_opus(void* __restrict__ out_,
                                         const void* __restrict__ in_,
                                         const void* __restrict__ weight_,
                                         void* __restrict__ residual_,
+                                        void* __restrict__ residual_out_,
                                         float epsilon,
                                         int rows,
                                         int hidden,
@@ -301,6 +305,8 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
     const auto* in_v = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(in_) + roff_i);
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
+    auto* res_out_v  = OOP ? reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_out_) + roff)
+                           : static_cast<V*>(nullptr);
 
     // fp32 norm-input as a scalar array so the compiler can't reorder the sum.
     float ni[RN][8];
@@ -318,7 +324,10 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
                 s[j]     = opus::cast<scalar_t>(f);
                 ni[q][j] = t5 ? opus::cast<float>(s[j]) : f;
             }
-            res_v[nx + q * TN] = s;
+            if constexpr(OOP)
+                res_out_v[nx + q * TN] = s;
+            else
+                res_v[nx + q * TN] = s;
         }
         else
         {
@@ -396,11 +405,15 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
     }
 }
 
-template <typename Traits>
+// OOP=false: in-place fused add (residual read+written in residual_; residual_out_ unused
+// so the no-add / in-place instantiation compiles identically to the pre-out-of-place
+// kernel). OOP=true: out-of-place fused add (read residual_, write residual_out_).
+template <typename Traits, bool OOP>
 __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
                                      const void* __restrict__ in_,
                                      const void* __restrict__ weight_,
                                      void* __restrict__ residual_,
+                                     void* __restrict__ residual_out_,
                                      float epsilon,
                                      int rows,
                                      int hidden,
@@ -427,6 +440,9 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
     const auto* in_v = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(in_) + roff_i);
     const auto* w_v  = reinterpret_cast<const V*>(reinterpret_cast<const scalar_t*>(weight_));
     auto* res_v      = reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_) + roff);
+    // res_out_v is dead (nullptr) for OOP=false, so it costs the in-place/no-add path nothing.
+    auto* res_out_v  = OOP ? reinterpret_cast<V*>(reinterpret_cast<scalar_t*>(residual_out_) + roff)
+                           : static_cast<V*>(nullptr);
 
     // fp32 norm-input cached in registers (overflow reloads).
     constexpr int CACHE_V = 4;
@@ -445,7 +461,10 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
                 s[j]    = opus::cast<scalar_t>(f);
                 ni[j]   = t5 ? opus::cast<float>(s[j]) : f;
             }
-            res_v[idx] = s;
+            if constexpr(OOP)
+                res_out_v[idx] = s;
+            else
+                res_v[idx] = s;
         }
         else
         {
@@ -455,8 +474,8 @@ __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
         }
         return ni;
     };
-    auto reload_ni = [&](int idx) -> Vf { // overflow: residual already holds round(sum)
-        V s = add ? res_v[idx] : in_v[idx];
+    auto reload_ni = [&](int idx) -> Vf { // overflow: residual (out) already holds round(sum)
+        V s = add ? (OOP ? res_out_v[idx] : res_v[idx]) : in_v[idx];
         Vf ni;
 #pragma unroll
         for(int j = 0; j < width; ++j)

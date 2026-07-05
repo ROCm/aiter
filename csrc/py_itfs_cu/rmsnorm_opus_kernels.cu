@@ -8,16 +8,16 @@
 
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))
 
-// Dispatch a norm launch on the dtype code.
-#define OPUS_NORM_DISPATCH(DTYPE, O, I, W, R)                                                        \
+// Dispatch a norm launch on the dtype code. R = residual_in, RO = residual_out.
+#define OPUS_NORM_DISPATCH(DTYPE, O, I, W, R, RO)                                                    \
     do                                                                                               \
     {                                                                                                \
         if((DTYPE) == 2)                                                                             \
-            launch_norm<fp32_t>((O), (I), (W), (R), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
+            launch_norm<fp32_t>((O), (I), (W), (R), (RO), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
         else if((DTYPE) == 1)                                                                        \
-            launch_norm<bf16_t>((O), (I), (W), (R), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
+            launch_norm<bf16_t>((O), (I), (W), (R), (RO), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
         else                                                                                         \
-            launch_norm<fp16_t>((O), (I), (W), (R), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
+            launch_norm<fp16_t>((O), (I), (W), (R), (RO), epsilon, rows, hidden, in_s, model_sensitive, gemma, s); \
     } while(0)
 
 OPUS_EXPORT void rms_norm_opus(size_t out,
@@ -39,7 +39,7 @@ OPUS_EXPORT void rms_norm_opus(size_t out,
     auto* o = reinterpret_cast<void*>(out);
     auto* i = reinterpret_cast<const void*>(in);
     auto* w = reinterpret_cast<const void*>(weight);
-    OPUS_NORM_DISPATCH(dtype, o, i, w, nullptr);
+    OPUS_NORM_DISPATCH(dtype, o, i, w, nullptr, nullptr);
 }
 
 OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
@@ -61,7 +61,36 @@ OPUS_EXPORT void fused_add_rms_norm_opus(size_t inout,
     auto* io = reinterpret_cast<void*>(inout);
     auto* r  = reinterpret_cast<void*>(residual);
     auto* w  = reinterpret_cast<const void*>(weight);
-    OPUS_NORM_DISPATCH(dtype, io, io, w, r); // in-place: out == in == inout
+    OPUS_NORM_DISPATCH(dtype, io, io, w, r, r); // in-place: out==in==inout, residual_out==residual
+}
+
+// Out-of-place fused add + rmsnorm: out = rmsnorm(input + residual_in) * weight,
+// residual_out = input + residual_in. Reads input/residual_in, writes out/residual_out in
+// one pass (no host-side staging copies). in_s = input row stride (elements).
+OPUS_EXPORT void add_rms_norm_opus(size_t out,
+                                   size_t in,
+                                   size_t residual_in,
+                                   size_t residual_out,
+                                   size_t weight,
+                                   float epsilon,
+                                   int rows,
+                                   int hidden,
+                                   int in_s,
+                                   int dtype,
+                                   int model_sensitive,
+                                   int gemma,
+                                   size_t stream)
+{
+    using namespace aiter;
+    if(rows <= 0 || hidden <= 0)
+        return;
+    auto s   = reinterpret_cast<hipStream_t>(stream);
+    auto* o  = reinterpret_cast<void*>(out);
+    auto* i  = reinterpret_cast<const void*>(in);
+    auto* ri = reinterpret_cast<void*>(residual_in);
+    auto* ro = reinterpret_cast<void*>(residual_out);
+    auto* w  = reinterpret_cast<const void*>(weight);
+    OPUS_NORM_DISPATCH(dtype, o, i, w, ri, ro);
 }
 
 // Fused rmsnorm + quant. residual/xscale/unquant = 0 to disable. out_code: 0=int8,1=fp8.
