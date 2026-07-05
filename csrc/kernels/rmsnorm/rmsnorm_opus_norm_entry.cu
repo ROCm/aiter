@@ -4,9 +4,8 @@
 // OPUS RMSNorm C ABI (ctypes): raw int64 pointers + dims, validated Python-side.
 // dtype: 0=fp16, 1=bf16, 2=fp32.
 //
-// The plain norm entrypoints (no quant). Dispatches the dtype code to the per-dtype
-// norm launchers (each compiled in its own TU) so bf16/fp16/fp32 build in parallel.
-// This TU only holds the dispatch/entrypoints (no kernel instantiation).
+// Plain norm entrypoints (no quant): dispatch the dtype code to the per-dtype norm
+// launchers (own TUs). Dispatch only -- no kernel instantiation here.
 #include "rmsnorm_opus_norm.hpp"
 
 #define OPUS_EXPORT extern "C" __attribute__((visibility("default")))

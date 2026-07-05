@@ -126,9 +126,7 @@ inline void launch_norm(void* out,
                         hipStream_t stream)
 {
     constexpr int VW = 16 / (int)sizeof(scalar_t); // 8 for bf16/fp16, 4 for fp32
-    // out-of-place fused add: residual read from residual_, written to a distinct
-    // residual_out. In-place (residual_out==residual) and no-add (residual==nullptr)
-    // use the OOP=false instantiation, which never touches residual_out.
+    // oop: out-of-place add (residual_out != residual). In-place / no-add use OOP=false.
     const bool oop = (residual != nullptr) && (residual_out != residual);
     // no pointer-alignment gate: AMDGPU handles misaligned 128-bit access.
     // gemma uses the generic kernel (any hidden); BE only for gemma == 0.

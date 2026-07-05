@@ -4,10 +4,8 @@
 // OPUS RMSNorm device kernels. 2D block: x = threads/row, y = rows/block.
 #pragma once
 
-// fp32->bf16 store rounding (must precede opus.hpp). Use truncate (2), matching the CK/HIP
-// reference: RNE (0) has no hardware bf16-cvt on gfx942 and lowers to a ~6-op/element
-// software sequence, making bf16 output/residual stores ~2x slower there (gfx950 has the
-// hardware cvt so RNE is free, but truncate matches the reference on both).
+// fp32->bf16 store rounding (must precede opus.hpp): truncate (2) matches the CK reference.
+// RNE (0) is software (~2x slower) on gfx942, which lacks a hardware bf16 cvt.
 #ifndef OPUS_FP32_to_BF16_DEFAULT
 #define OPUS_FP32_to_BF16_DEFAULT 2
 #endif
@@ -266,9 +264,8 @@ __global__ void rmsnorm_be_opus(void* __restrict__ out_,
     }
 }
 
-// OOP=false: in-place fused add (residual read+written in residual_; residual_out_ unused
-// so the no-add / in-place instantiation compiles identically to the pre-out-of-place
-// kernel). OOP=true: out-of-place fused add (read residual_, write residual_out_).
+// OOP=false: in-place fused add (residual_out_ unused; codegen == pre-OOP kernel).
+// OOP=true: out-of-place (read residual_, write residual_out_).
 template <typename Traits, bool OOP>
 __global__ void rmsnorm_opus_kernel(void* __restrict__ out_,
                                      const void* __restrict__ in_,
