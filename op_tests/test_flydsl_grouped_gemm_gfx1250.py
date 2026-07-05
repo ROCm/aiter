@@ -43,7 +43,7 @@ from aiter.fused_moe import (
 )
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.utility import fp4_utils
 from aiter.utility import dtypes
 
@@ -379,16 +379,21 @@ def _run_grouped_via_fused_moe(
     # Stage1 weight/scale/bias get rearranged to physical ``layout``; stage2
     # has no GUGU/GGUU concept (single N=hidden GEMM).
     if layout == "gugu":
-        w1_phys = _gguu_to_gugu_rows(w1_logical)
         bias1_phys = _gguu_to_gugu_rows(bias1)
         gate_mode = GateMode.INTERLEAVE
     else:
-        w1_phys = w1_logical
         bias1_phys = bias1
         gate_mode = GateMode.SEPARATED
 
-    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
-    w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
+    # Arch-aware stage weight shuffle: GUGU interleaves gate/up rows internally
+    # (moe_shuffle_weight), so pass the logical GGUU weight either way.
+    w1_grouped = moe_shuffle_weight(
+        w1_logical,
+        experts_cnt=experts,
+        is_guinterleave=(layout == "gugu"),
+        gate_up=True,
+    )
+    w2_grouped = moe_shuffle_weight(w2_logical, experts_cnt=experts)
     if layout == "gugu":
         # GUGU B-scale is always built the production way: feed the RAW GGUU
         # scale to moe_shuffle_scale(is_guinterleave=True), which interleaves
