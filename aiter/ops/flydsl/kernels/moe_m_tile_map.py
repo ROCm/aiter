@@ -24,6 +24,8 @@ from flydsl.expr import arith, buffer_ops
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import T, Int32
 
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
+
 BLOCK_THREADS = 256
 
 
@@ -86,9 +88,11 @@ def build_moe_m_tile_prefix_map_module():
         )
         m_tile_prefix[0].zero_()
         torch.cumsum(valid_tiles, dim=0, out=m_tile_prefix[1:])
+        from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
         map_launch(
-            m_tile_prefix,
-            m_tile_map,
+            ptr_arg(m_tile_prefix),
+            ptr_arg(m_tile_map),
             int(experts),
             int(max_m_tiles),
             stream=stream,
@@ -102,16 +106,16 @@ def build_moe_m_tile_map_module():
 
     @flyc.kernel(name="moe_m_tile_map", known_block_size=[BLOCK_THREADS, 1, 1])
     def m_tile_map_kernel(
-        m_tile_prefix: fx.Tensor,
-        m_tile_map: fx.Tensor,
+        m_tile_prefix: fx.Pointer,
+        m_tile_map: fx.Pointer,
         experts: Int32,
         max_m_tiles: Int32,
     ):
         i32 = T.i32
         expert = ArithValue(fx.block_idx.x)
         tid = ArithValue(fx.thread_idx.x)
-        prefix_rsrc = buffer_ops.create_buffer_resource(m_tile_prefix, max_size=True)
-        map_rsrc = buffer_ops.create_buffer_resource(m_tile_map, max_size=True)
+        prefix_rsrc = ptr_rsrc(m_tile_prefix)
+        map_rsrc = ptr_rsrc(m_tile_map)
 
         expert_valid = arith.cmpi(CmpIPredicate.ult, expert, ArithValue(experts))
         if_expert = scf.IfOp(expert_valid)
@@ -151,8 +155,8 @@ def build_moe_m_tile_map_module():
 
     @flyc.jit
     def launch_m_tile_map(
-        m_tile_prefix: fx.Tensor,
-        m_tile_map: fx.Tensor,
+        m_tile_prefix: fx.Pointer,
+        m_tile_map: fx.Pointer,
         experts: fx.Int32,
         max_m_tiles: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -172,5 +176,12 @@ def build_moe_m_tile_map_module():
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
+
+    launch_m_tile_map.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+        },
+    }
 
     return launch_m_tile_map

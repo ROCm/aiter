@@ -78,6 +78,7 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     reference_intermediate_pad=0,
+    ref_dtype="bf16",
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -319,6 +320,13 @@ def test_fmoe(
                 # Fused Swiglu MXFP4 quantizes the f32 activation directly.
                 # Keep the torch reference at f32 until the quantization step.
                 stage1_ref_dtype = dtypes.fp32
+
+    # --ref-dtype fp32: keep the reference intermediate in fp32 so the a2 mxfp4
+    # amax is taken over fp32 (not bf16). This mirrors the fused asm kernel, which
+    # computes amax on the in-register fp32 silu result (no bf16 round-trip that
+    # the 2-stage flydsl/torch path does via its bf16 a2 buffer).
+    if ref_dtype == "fp32":
+        stage1_ref_dtype = dtypes.fp32
 
     out1_ref = torch_moe_stage1(
         a1_qt,
@@ -656,6 +664,15 @@ parser.add_argument(
     alone, excluding input prep) and report them as us_stage1 / us_stage2.
     Only the 2-stage path exposes per-kernel launches; the 1-stage path reports
     n/a.""",
+)
+parser.add_argument(
+    "--ref-dtype",
+    choices=["bf16", "fp32"],
+    default="bf16",
+    help="Precision of the torch reference stage-1 intermediate. 'fp32' keeps it "
+    "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
+    "kernel, which computes amax on the in-register fp32 silu result, instead "
+    "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
 )
 
 args = parser.parse_args()
@@ -1015,7 +1032,9 @@ for kwargs, extras in case_iter:
             run_only_env() if kwargs.get("check_aot_cache", False) else nullcontext()
         )
         with aot_guard:
-            ret = test_fmoe(**kwargs, kernel_bench=args.kernel)
+            ret = test_fmoe(
+                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+            )
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:
