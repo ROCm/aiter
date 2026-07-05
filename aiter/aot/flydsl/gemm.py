@@ -199,9 +199,9 @@ def _compile_executable_to_cache(exe, *args) -> None:
 
 
 def _ptr_view_safe(t):
-    from aiter.ops.flydsl.gemm_kernels import _ptr_view_safe as _wrap
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
-    return _wrap(t)
+    return ptr_arg(t)
 
 
 def _compile_hgemm_to_cache(
