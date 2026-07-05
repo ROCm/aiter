@@ -1812,7 +1812,11 @@ namespace aiter {
 #define MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m) \
     if (hidden_size == 7168) { \
         if (m < 4 * cu_num) { \
-            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 7168, 1024, 1024, false); \
+            if (WARP_SIZE == 32) { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 1, 7168, 1024, 1024, false); \
+            } else { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 7168, 1024, 1024, false); \
+            } \
         } else if (m <= 8 * cu_num) { \
             MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 7168, 512, 512, false); \
         } else { \
@@ -1820,7 +1824,11 @@ namespace aiter {
         } \
     } else if (hidden_size == 4096) { \
         if (m < 4 * cu_num) { \
-            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 4096, 1024, 1024, false); \
+            if (WARP_SIZE == 32) { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 1, 4096, 1024, 1024, false); \
+            } else { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 4096, 1024, 1024, false); \
+            } \
         } else if (m <= 8 * cu_num) { \
             MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 4096, 512, 512, false); \
         } else { \
