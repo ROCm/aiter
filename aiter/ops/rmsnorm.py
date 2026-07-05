@@ -45,6 +45,24 @@ def _fused_add_rms_norm_opus_raw(
 ) -> None: ...
 
 
+@compile_ops("module_rmsnorm", fc_name="add_rms_norm_opus", ffi_type="ctypes")
+def _add_rms_norm_opus_raw(
+    out: int,
+    input: int,
+    residual_in: int,
+    residual_out: int,
+    weight: int,
+    epsilon: float,
+    rows: int,
+    hidden: int,
+    in_s: int,
+    is_bf16: int,
+    model_sensitive: int,
+    gemma: int,
+    stream: int,
+) -> None: ...
+
+
 def _check(input: Tensor, weight: Tensor, allow_row_stride: bool = False):
     assert (
         input.dtype in _DTYPE_CODE
@@ -143,11 +161,43 @@ def rmsnorm2d_fwd_with_add_opus(
     use_model_sensitive_rmsnorm: int = 0,
     gemma_norm: bool = False,
 ) -> None:
-    # opus fused kernel is in-place; stage into out/residual_out to keep inputs.
-    out.copy_(input)
-    residual_out.copy_(residual_in)
-    fused_add_rms_norm_opus(
-        out, residual_out, weight, epsilon, use_model_sensitive_rmsnorm, gemma_norm
+    """out = rmsnorm(input + residual_in) * weight; residual_out = input + residual_in.
+
+    Single out-of-place kernel pass (input/residual_in read, out/residual_out written) --
+    no host-side staging copies. This is the per-layer residual-add path that
+    vLLM / SGLang / ATOM all call, so the staging copies were a ~2x regression there.
+    """
+    hidden = input.shape[-1]
+    # kernel reads each row contiguously but takes an input row stride; only a non-unit
+    # last-dim stride needs materializing (a 2-D row-strided view is fine).
+    if input.stride(-1) != 1:
+        input = input.contiguous()
+    in_s = input.stride(-2) if input.dim() >= 2 else hidden
+    _check(input, weight, allow_row_stride=True)
+    assert (
+        out.dtype == input.dtype and out.is_contiguous()
+    ), "add_rms_norm_opus: bad out"
+    assert (
+        residual_in.dtype == input.dtype and residual_out.dtype == input.dtype
+    ), "add_rms_norm_opus: residual dtype mismatch"
+    assert (
+        residual_in.is_contiguous() and residual_out.is_contiguous()
+    ), "add_rms_norm_opus: residual must be contiguous"
+    rows = input.numel() // hidden
+    _add_rms_norm_opus_raw(
+        out.data_ptr(),
+        input.data_ptr(),
+        residual_in.data_ptr(),
+        residual_out.data_ptr(),
+        weight.data_ptr(),
+        float(epsilon),
+        rows,
+        hidden,
+        int(in_s),
+        _DTYPE_CODE[input.dtype],
+        int(use_model_sensitive_rmsnorm),
+        int(gemma_norm),
+        torch.cuda.current_stream().cuda_stream,
     )
 
 
