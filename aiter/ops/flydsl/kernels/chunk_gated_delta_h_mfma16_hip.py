@@ -221,7 +221,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = 116  # fuse v_new+gating+gated_v store; h store after GEMM1 (HIP ordering)
+    _K5_KERNEL_REVISION = 117  # HIP-aligned pipeline: prologue w/k load + GEMM1-interleaved prefetch + GEMM2-end LDS write
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -549,14 +549,60 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     acc_idx = kb * N_REPEAT + slot
                     h_accs[acc_idx] = h_accs[acc_idx] + loaded_vec
 
-        # -- Non-pipelined main chunk loop --
-        # ALL prefetch / interleave / cross-chunk register carry removed (clean
-        # base for LDS/layout alignment work). Only the h_accs SSM recurrence
-        # state is carried across chunks; w/k/u/g are loaded fresh per chunk.
+        # -- HIP-aligned pipelined main chunk loop --
+        # Prologue loads w/k for chunk 0 to LDS; each iteration prefetches
+        # NEXT chunk's w (during GEMM1) and k (after gating) into VGPRs,
+        # then writes them to LDS at GEMM2 end (mirrors HIP .cu:1125-1194).
+        GEMM1_PF_SPLIT = min(1, NUM_K_BLOCKS)
+        k_row_base_pf = (lane & fx.Int32(7)) * fx.Int32(8)
+        k_pair_col_pf = wid * fx.Int32(8) + (lane >> fx.Int32(3))
+        k_t0_pf = k_pair_col_pf * fx.Int32(2)
+        k_t1_pf = k_t0_pf + fx.Int32(1)
+
         init_state = [_to_raw(v) for v in h_accs]
         c_zero = fx.Index(0)
         c_one = fx.Index(1)
         nt_idx = fx.Index(NT)
+
+        # -- PROLOGUE: load w/k for chunk 0 to LDS (HIP .cu:1125-1141) --
+        _prol_it = fx.Int32(0)
+        for kb in range_constexpr(NUM_K_BLOCKS):
+            wp_panel_base = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
+            for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                abs_row = _prol_it * fx.Int32(BT) + row
+                safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                w_g_off = (
+                    w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
+                )
+                wvec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
+                swz = wp_panel_base + _w_panel_swz_elems(row, load_col_base)
+                lds_wp.vec_store(
+                    (fx.Index(swz),), wvec.shuffle(wvec, [0, 1, 2, 3]), 4
+                )
+                lds_wp.vec_store(
+                    (fx.Index(swz ^ fx.Int32(4)),),
+                    wvec.shuffle(wvec, [4, 5, 6, 7]),
+                    4,
+                )
+        k_abs_t0_prol = _prol_it * fx.Int32(BT) + k_t0_pf
+        k_abs_t1_prol = _prol_it * fx.Int32(BT) + k_t1_pf
+        k_safe_t0_prol = (k_abs_t0_prol < T_local).select(k_abs_t0_prol, fx.Int32(0))
+        k_safe_t1_prol = (k_abs_t1_prol < T_local).select(k_abs_t1_prol, fx.Int32(0))
+        for kb in range_constexpr(NUM_K_BLOCKS):
+            kp_pbase = fx.Int32(kb * LDS_KP_PANEL_ELEMS)
+            k_col_off = fx.Int32(kb * 64) + k_row_base_pf
+            k_g_off_t0 = k_base + k_safe_t0_prol * stride_k + k_col_off
+            k_g_off_t1 = k_base + k_safe_t1_prol * stride_k + k_col_off
+            kvec_t0 = k_.vec_load((fx.Index(k_g_off_t0),), LOAD_VEC_WIDTH)
+            kvec_t1 = k_.vec_load((fx.Index(k_g_off_t1),), LOAD_VEC_WIDTH)
+            for i in range_constexpr(LOAD_VEC_WIDTH):
+                row_i = k_row_base_pf + fx.Int32(i)
+                byte_off = _k_panel_rotating_pair_addr_bytes(row_i, k_pair_col_pf)
+                elem_off = byte_off >> fx.Int32(1)
+                lds_kp[fx.Index(kp_pbase + elem_off)] = kvec_t0[i]
+                lds_kp[fx.Index(kp_pbase + elem_off + fx.Int32(1))] = kvec_t1[i]
+        gpu.barrier()
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
             h_accs_in = list(state[:NUM_H_ACCS])
@@ -602,57 +648,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         4,
                     )
 
-            gpu.barrier()
-
-            # -- 2. Load w FRESH -> lds_wp (swizzled panels). No cross-chunk
-            # prefetch: cooperative vec_load then split low4/high4 into the
-            # w_panel swizzle base / base^4, matching load_a_w_fragment_swizzled.
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                wp_panel_base = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
-                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                    abs_row = i_t_i32 * fx.Int32(BT) + row
-                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                    w_g_off = (
-                        w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
-                    )
-                    wvec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
-                    swz = wp_panel_base + _w_panel_swz_elems(row, load_col_base)
-                    lds_wp.vec_store(
-                        (fx.Index(swz),), wvec.shuffle(wvec, [0, 1, 2, 3]), 4
-                    )
-                    lds_wp.vec_store(
-                        (fx.Index(swz ^ fx.Int32(4)),),
-                        wvec.shuffle(wvec, [4, 5, 6, 7]),
-                        4,
-                    )
-
-            # -- 2b. Load k FRESH -> lds_kp (rotating-pair swizzle). Mirrors HIP's
-            # wave-partitioned load: each thread handles one (k_row_base, pair_col)
-            # slot. b128 global load fetches 8 K-cols for token-pair (t0, t1);
-            # then 8 b16x2 packed writes scatter to the swizzled LDS addresses.
-            k_row_base = (lane & fx.Int32(7)) * fx.Int32(8)
-            k_pair_col = wid * fx.Int32(8) + (lane >> fx.Int32(3))
-            k_t0 = k_pair_col * fx.Int32(2)
-            k_t1 = k_t0 + fx.Int32(1)
-            k_abs_t0 = i_t_i32 * fx.Int32(BT) + k_t0
-            k_abs_t1 = i_t_i32 * fx.Int32(BT) + k_t1
-            k_safe_t0 = (k_abs_t0 < T_local).select(k_abs_t0, fx.Int32(0))
-            k_safe_t1 = (k_abs_t1 < T_local).select(k_abs_t1, fx.Int32(0))
-            for kb in range_constexpr(NUM_K_BLOCKS):
-                kp_pbase = fx.Int32(kb * LDS_KP_PANEL_ELEMS)
-                k_col_off = fx.Int32(kb * 64) + k_row_base
-                k_g_off_t0 = k_base + k_safe_t0 * stride_k + k_col_off
-                k_g_off_t1 = k_base + k_safe_t1 * stride_k + k_col_off
-                kvec_t0 = k_.vec_load((fx.Index(k_g_off_t0),), LOAD_VEC_WIDTH)
-                kvec_t1 = k_.vec_load((fx.Index(k_g_off_t1),), LOAD_VEC_WIDTH)
-                for i in range_constexpr(LOAD_VEC_WIDTH):
-                    row_i = k_row_base + fx.Int32(i)
-                    byte_off = _k_panel_rotating_pair_addr_bytes(row_i, k_pair_col)
-                    elem_off = byte_off >> fx.Int32(1)
-                    lds_kp[fx.Index(kp_pbase + elem_off)] = kvec_t0[i]
-                    lds_kp[fx.Index(kp_pbase + elem_off + fx.Int32(1))] = kvec_t1[i]
-
+            # w/k for this chunk already in LDS (prologue or prev GEMM2 end).
             gpu.barrier()
 
             # last_idx for the current chunk (gating).
@@ -661,55 +657,75 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 next_chunk_end, T_local
             ) - fx.Int32(1)
 
-            # -- 3. GEMM1: b_v = w @ h_state (no prefetch/interleave).
-            # bv_accs: fresh-zero accumulator per V-tile (nr).
+            # -- GEMM1: b_v = w @ h_state, with w_next prefetch interleaved.
             bv_accs = []
             for _i in range_constexpr(N_REPEAT):
                 bv_accs.append(fx.full(4, 0.0, fx.Float32))
 
-            for kb in range_constexpr(NUM_K_BLOCKS):
+            # GEMM1 first K-block(s) -- before w prefetch.
+            for kb in range_constexpr(GEMM1_PF_SPLIT):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
-                    # HIP-ALIGN 2a: A = load_a_w_fragment_swizzled. Two
-                    # contiguous 16-K tiles (lo=[ks*32,+16), hi=[+16,+32));
-                    # k0 = tile_base + lane_m_base*4 (standard A layout).
                     wp_pbase = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
                     a_row = wid * fx.Int32(16) + lane_n
                     a_frag_lo = _load_a_w_swizzled(
-                        wp_pbase,
-                        a_row,
+                        wp_pbase, a_row,
                         fx.Int32(ks * WMMA_K) + lane_m_base * fx.Int32(4),
                     )
                     a_frag_hi = _load_a_w_swizzled(
-                        wp_pbase,
-                        a_row,
+                        wp_pbase, a_row,
                         fx.Int32(ks * WMMA_K + 16) + lane_m_base * fx.Int32(4),
                     )
-
                     for nr in range_constexpr(N_REPEAT):
-                        # HIP-ALIGN 1b/2a: B = load_b_shared2(panel_kb, k_base,
-                        # lane, nr*16), CONTIGUOUS to match the (now HIP-style)
-                        # contiguous w A read. col = (lane&15)+nr*16;
-                        # row_block = (k_base>>2)+(lane>>4). lo tile K in
-                        # [ks*32, ks*32+16), hi in [ks*32+16, ks*32+32).
                         hp_base = fx.Int32(kb * LDS_HP_PANEL_ELEMS)
                         hp_col_b = fx.Int32(nr * 16) + lane_n
                         rb_lo = fx.Int32((ks * WMMA_K) >> 2) + lane_m_base
                         rb_hi = fx.Int32(((ks * WMMA_K) + 16) >> 2) + lane_m_base
-                        idx_lo = hp_base + (
-                            rb_lo * fx.Int32(BV) + hp_col_b
-                        ) * fx.Int32(4)
-                        idx_hi = hp_base + (
-                            rb_hi * fx.Int32(BV) + hp_col_b
-                        ) * fx.Int32(4)
+                        idx_lo = hp_base + (rb_lo * fx.Int32(BV) + hp_col_b) * fx.Int32(4)
+                        idx_hi = hp_base + (rb_hi * fx.Int32(BV) + hp_col_b) * fx.Int32(4)
                         b_frag_lo = _lds_read_hp_bf16x4(idx_lo)
                         b_frag_hi = _lds_read_hp_bf16x4(idx_hi)
+                        bv_accs[nr] = _mfma_bf16_16x16x16(a_frag_lo, b_frag_lo, bv_accs[nr])
+                        bv_accs[nr] = _mfma_bf16_16x16x16(a_frag_hi, b_frag_hi, bv_accs[nr])
 
-                        bv_accs[nr] = _mfma_bf16_16x16x16(
-                            a_frag_lo, b_frag_lo, bv_accs[nr]
-                        )
-                        bv_accs[nr] = _mfma_bf16_16x16x16(
-                            a_frag_hi, b_frag_hi, bv_accs[nr]
-                        )
+            # >>> PREFETCH w_next: HBM loads for next chunk (HIP .cu:670-672).
+            # Always issued with safe addresses; LDS write is conditional at GEMM2 end.
+            next_i_t = i_t_i32 + fx.Int32(1)
+            w_next_vecs = []
+            w_next_swz = []
+            for kb in range_constexpr(NUM_K_BLOCKS):
+                wp_pb_next = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
+                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                    abs_row_next = next_i_t * fx.Int32(BT) + row
+                    safe_row_next = (abs_row_next < T_local).select(abs_row_next, fx.Int32(0))
+                    w_g_off_next = w_base + safe_row_next * stride_w + fx.Int32(kb * 64) + load_col_base
+                    w_next_vecs.append(w_.vec_load((fx.Index(w_g_off_next),), LOAD_VEC_WIDTH))
+                    w_next_swz.append(wp_pb_next + _w_panel_swz_elems(row, load_col_base))
+
+            # GEMM1 remaining K-blocks -- MFMA hides w prefetch HBM latency.
+            for kb in range_constexpr(GEMM1_PF_SPLIT, NUM_K_BLOCKS):
+                for ks in range_constexpr(K_STEPS_PER_BLOCK):
+                    wp_pbase = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
+                    a_row = wid * fx.Int32(16) + lane_n
+                    a_frag_lo = _load_a_w_swizzled(
+                        wp_pbase, a_row,
+                        fx.Int32(ks * WMMA_K) + lane_m_base * fx.Int32(4),
+                    )
+                    a_frag_hi = _load_a_w_swizzled(
+                        wp_pbase, a_row,
+                        fx.Int32(ks * WMMA_K + 16) + lane_m_base * fx.Int32(4),
+                    )
+                    for nr in range_constexpr(N_REPEAT):
+                        hp_base = fx.Int32(kb * LDS_HP_PANEL_ELEMS)
+                        hp_col_b = fx.Int32(nr * 16) + lane_n
+                        rb_lo = fx.Int32((ks * WMMA_K) >> 2) + lane_m_base
+                        rb_hi = fx.Int32(((ks * WMMA_K) + 16) >> 2) + lane_m_base
+                        idx_lo = hp_base + (rb_lo * fx.Int32(BV) + hp_col_b) * fx.Int32(4)
+                        idx_hi = hp_base + (rb_hi * fx.Int32(BV) + hp_col_b) * fx.Int32(4)
+                        b_frag_lo = _lds_read_hp_bf16x4(idx_lo)
+                        b_frag_hi = _lds_read_hp_bf16x4(idx_hi)
+                        bv_accs[nr] = _mfma_bf16_16x16x16(a_frag_lo, b_frag_lo, bv_accs[nr])
+                        bv_accs[nr] = _mfma_bf16_16x16x16(a_frag_hi, b_frag_hi, bv_accs[nr])
 
             # WAR barrier: gated_v aliases h_state_panel1, so all warps must
             # finish reading the h_state panels in GEMM1 above before any warp
@@ -801,6 +817,23 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     (fx.Index(gv_cell),),
                     _f32x4_to_bf16x4_rne(gated_val),
                     4,
+                )
+
+            # >>> PREFETCH k_next: HBM loads for next chunk (HIP .cu:727-731).
+            # Overlaps with the barrier + h store below.
+            k_abs_t0_next = next_i_t * fx.Int32(BT) + k_t0_pf
+            k_abs_t1_next = next_i_t * fx.Int32(BT) + k_t1_pf
+            k_safe_t0_next = (k_abs_t0_next < T_local).select(k_abs_t0_next, fx.Int32(0))
+            k_safe_t1_next = (k_abs_t1_next < T_local).select(k_abs_t1_next, fx.Int32(0))
+            k_next_vecs_t0 = []
+            k_next_vecs_t1 = []
+            for kb in range_constexpr(NUM_K_BLOCKS):
+                k_col_off_pf = fx.Int32(kb * 64) + k_row_base_pf
+                k_next_vecs_t0.append(
+                    k_.vec_load((fx.Index(k_base + k_safe_t0_next * stride_k + k_col_off_pf),), LOAD_VEC_WIDTH)
+                )
+                k_next_vecs_t1.append(
+                    k_.vec_load((fx.Index(k_base + k_safe_t1_next * stride_k + k_col_off_pf),), LOAD_VEC_WIDTH)
                 )
 
             # Apply exp(g_last) decay to h_accs (scalar broadcast).
@@ -906,6 +939,48 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
                             k_a_hi, vn_b_hi, h_accs_in[acc_idx]
                         )
+
+            # >>> WRITE prefetched w_next/k_next to LDS for next iteration.
+            # Barrier ensures GEMM2 done reading old panels (HIP .cu:794-798).
+            # Closures hide lds_wp/lds_kp (STensor) from the FlyDSL AST
+            # rewriter which otherwise tries to yield them through scf.if.
+            # Closures hide lds_wp/lds_kp (STensor) from the FlyDSL AST
+            # rewriter which otherwise tries to yield them through scf.if.
+            def _emit_wp_vec_store(idx_tuple, val, width):
+                lds_wp.vec_store(idx_tuple, val, width)
+
+            def _emit_kp_scalar_store(idx, val):
+                lds_kp[fx.Index(idx)] = val
+
+            has_next = next_i_t * fx.Int32(BT) < T_local
+            if has_next.ir_value():
+                gpu.barrier()
+                _pf_idx = 0
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                        wvec_pf = w_next_vecs[_pf_idx]
+                        swz_pf = w_next_swz[_pf_idx]
+                        _emit_wp_vec_store(
+                            (fx.Index(swz_pf),),
+                            wvec_pf.shuffle(wvec_pf, [0, 1, 2, 3]),
+                            4,
+                        )
+                        _emit_wp_vec_store(
+                            (fx.Index(swz_pf ^ fx.Int32(4)),),
+                            wvec_pf.shuffle(wvec_pf, [4, 5, 6, 7]),
+                            4,
+                        )
+                        _pf_idx += 1
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    kp_pbase = fx.Int32(kb * LDS_KP_PANEL_ELEMS)
+                    kvec_t0_pf = k_next_vecs_t0[kb]
+                    kvec_t1_pf = k_next_vecs_t1[kb]
+                    for i in range_constexpr(LOAD_VEC_WIDTH):
+                        row_i = k_row_base_pf + fx.Int32(i)
+                        byte_off = _k_panel_rotating_pair_addr_bytes(row_i, k_pair_col_pf)
+                        elem_off = byte_off >> fx.Int32(1)
+                        _emit_kp_scalar_store(kp_pbase + elem_off, kvec_t0_pf[i])
+                        _emit_kp_scalar_store(kp_pbase + elem_off + fx.Int32(1), kvec_t1_pf[i])
 
             results = yield [_to_raw(v) for v in h_accs_in]
 
