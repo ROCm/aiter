@@ -140,18 +140,23 @@ def fused_add_rms_norm_opus(
 
 
 # opus mirrors of the public rmsnorm entrypoints (same signatures).
-def rmsnorm2d_fwd_opus(
-    input: Tensor, weight: Tensor, epsilon: float, use_model_sensitive_rmsnorm: int = 0
-) -> Tensor:
-    out = torch.empty_like(input)
-    # Common case (fp16/bf16, non-T5, hidden <= 8192, 2-D): opus arq kernel -- the bit-exact
-    # port of the HIP add_rmsnorm_quant_kernel main dispatched here. Generic kernel otherwise.
-    if (
+def _use_arq_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
+    # Common case (fp16/bf16, non-T5, hidden <= 8192, 2-D): the opus arq kernel -- the
+    # bit-exact port of the HIP add_rmsnorm_quant_kernel -- is the hand-tuned fast path.
+    # The generic rmsnorm_quant_opus kernel handles the rest (fp32, T5, hidden>8192, non-2-D).
+    return (
         use_model_sensitive_rmsnorm == 0
         and input.dim() == 2
         and input.element_size() == 2
         and input.shape[-1] <= 8192
-    ):
+    )
+
+
+def rmsnorm2d_fwd_opus(
+    input: Tensor, weight: Tensor, epsilon: float, use_model_sensitive_rmsnorm: int = 0
+) -> Tensor:
+    out = torch.empty_like(input)
+    if _use_arq_common(input, use_model_sensitive_rmsnorm):
         rmsnorm(out, input, weight, epsilon)
     else:
         rms_norm_opus(out, input, weight, epsilon, use_model_sensitive_rmsnorm)
@@ -174,14 +179,7 @@ def rmsnorm2d_fwd_with_add_opus(
     path vLLM/SGLang/ATOM call, so staging copies were a ~2x regression.
     """
     hidden = input.shape[-1]
-    # Common case (fp16/bf16, non-T5, hidden <= 8192, 2-D): opus arq kernel -- the bit-exact
-    # port of the HIP add_rmsnorm_quant_kernel main dispatched here. Generic kernel otherwise.
-    if (
-        use_model_sensitive_rmsnorm == 0
-        and input.dim() == 2
-        and input.element_size() == 2
-        and hidden <= 8192
-    ):
+    if _use_arq_common(input, use_model_sensitive_rmsnorm):
         add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon, gemma_norm)
         return
     # kernel takes an input row stride; only a non-unit last-dim stride needs materializing.
@@ -502,11 +500,14 @@ def rmsnorm2d_fwd_with_dynamicquant(
     shuffle_scale: bool = False,
 ) -> None:
     if group_size == 0 and not shuffle_scale:
-        rmsnorm2d_fwd_with_dynamicquant_opus(
-            out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
-        )
+        if _use_arq_common(input, use_model_sensitive_rmsnorm):
+            rmsnorm_quant(out, input, yscale, weight, epsilon)  # fast opus arq
+        else:
+            rmsnorm2d_fwd_with_dynamicquant_opus(
+                out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
+            )
     else:
-        # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
+        # grouped / shuffle quant (n<=8192) also runs on the opus arq kernel.
         assert (
             input.shape[-1] <= 8192
         ), "grouped/shuffle rmsnorm dynamicquant supports hidden<=8192"
@@ -526,16 +527,21 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     shuffle_scale: bool = False,
 ) -> None:
     if group_size == 0 and not shuffle_scale:
-        rmsnorm2d_fwd_with_add_dynamicquant_opus(
-            out,
-            input,
-            residual_in,
-            residual_out,
-            yscale,
-            weight,
-            epsilon,
-            use_model_sensitive_rmsnorm,
-        )
+        if _use_arq_common(input, use_model_sensitive_rmsnorm):
+            add_rmsnorm_quant(  # fast opus arq
+                out, input, residual_in, residual_out, yscale, weight, epsilon
+            )
+        else:
+            rmsnorm2d_fwd_with_add_dynamicquant_opus(
+                out,
+                input,
+                residual_in,
+                residual_out,
+                yscale,
+                weight,
+                epsilon,
+                use_model_sensitive_rmsnorm,
+            )
     else:
         # grouped / shuffle quant lives in the shared module_rmsnorm_quant (n<=8192).
         assert (
