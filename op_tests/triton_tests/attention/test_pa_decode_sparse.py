@@ -153,7 +153,7 @@ def _wrapper_main_kernel_params(D: int):
     """
     use_gluon = arch_info.get_arch() == "gfx1250"
     use_exp2 = True
-    block_k = 32 if use_gluon else (16 if D >= 256 else 32)
+    block_k = 16 if (use_gluon or D >= 256) else 32
     return use_exp2, block_k
 
 
