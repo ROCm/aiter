@@ -190,7 +190,10 @@ jobs:
           rm -rf "${atom_source}"
           cp -R --no-preserve=mode,ownership,timestamps ATOM "${atom_source}"
 
-          sed "s|/it-share/yajizhan/code/ATOM|${atom_source}|g" "${script_src}" > "${script_dst}"
+          sed \
+            -e "s|/it-share/yajizhan|/data/xinhuang|g" \
+            -e "s|/data/xinhuang/code/ATOM|${atom_source}|g" \
+            "${script_src}" > "${script_dst}"
           chmod +x "${script_dst}"
 
           cat > "${shim_dir}/scontrol" <<'SHIM'
