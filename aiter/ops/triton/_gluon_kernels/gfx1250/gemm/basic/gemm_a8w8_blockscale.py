@@ -910,6 +910,10 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     if NUM_KSPLIT > 1:
         K_local = SPLITK_BLOCK_SIZE
 
+    # Descriptor stepping (update_tensor_descriptor + fixed [0,0] async_load) vs
+    # absolute [row, k*BK] offsets. Toggle for testing.
+    USE_DESC_STEP: gl.constexpr = False
+
     LOOP_UNROLL: gl.constexpr = (
         (SPLITK_BLOCK_SIZE + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     ) < 32
@@ -982,20 +986,36 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     # and shrink the descriptor shape (M - off_am, K_local) so async_load uses a
     # fixed [0, 0] and steps along K via update_tensor_descriptor (the boundary
     # clamp stays correct, and the tile descriptor stays in SGPRs).
-    a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_ptr + k_split_offset * stride_ak + off_am_tdm * stride_am,
-        shape=(M - off_am_tdm, K_local),
-        strides=(stride_am, stride_ak),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
-        layout=tdm_shared_a,
-    )
-    b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_ptr + k_split_offset * 16 * stride_bk + off_bn_tdm * stride_bn,
-        shape=(gl.cdiv(N, 16) - off_bn_tdm, K_local * 16),
-        strides=(stride_bn, stride_bk),
-        block_shape=(BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16),
-        layout=tdm_shared_b,
-    )
+    if USE_DESC_STEP:
+        a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_ptr + k_split_offset * stride_ak + off_am_tdm * stride_am,
+            shape=(M - off_am_tdm, K_local),
+            strides=(stride_am, stride_ak),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+            layout=tdm_shared_a,
+        )
+        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=b_ptr + k_split_offset * 16 * stride_bk + off_bn_tdm * stride_bn,
+            shape=(gl.cdiv(N, 16) - off_bn_tdm, K_local * 16),
+            strides=(stride_bn, stride_bk),
+            block_shape=(BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16),
+            layout=tdm_shared_b,
+        )
+    else:
+        a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_ptr + k_split_offset * stride_ak,
+            shape=(M, K_local),
+            strides=(stride_am, stride_ak),
+            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+            layout=tdm_shared_a,
+        )
+        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=b_ptr + k_split_offset * 16 * stride_bk,
+            shape=(gl.cdiv(N, 16), K_local * 16),
+            strides=(stride_bn, stride_bk),
+            block_shape=(BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16),
+            layout=tdm_shared_b,
+        )
 
     tdm_smem_a = gl.allocate_shared_memory(
         a_desc.dtype,
@@ -1030,35 +1050,47 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     )
 
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        if not EVEN_K:
-            # Ragged K: clamp each tile to its own remaining K extent
-            # (add_offsets leaves the bound stale). Full tiles get
-            # remaining >= BLOCK_SIZE_K (no clamp); the last, partial tile
-            # gets clamped so TDM zero-fills past K.
+        if USE_DESC_STEP:
+            if not EVEN_K:
+                # Ragged K: clamp each tile to its own remaining K extent
+                # (add_offsets leaves the bound stale). Full tiles get
+                # remaining >= BLOCK_SIZE_K (no clamp); the last, partial tile
+                # gets clamped so TDM zero-fills past K.
+                a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    a_desc,
+                    set_bounds=[M - off_am_tdm, K_local - num_loads * BLOCK_SIZE_K],
+                )
+                b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    b_desc,
+                    set_bounds=[
+                        gl.cdiv(N, 16) - off_bn_tdm,
+                        K_local * 16 - num_loads * BLOCK_SIZE_K * 16,
+                    ],
+                )
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc, [0, 0], tdm_smem_a.index(num_loads % NUM_BUFFERS)
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS)
+            )
+            # Advance to the next K tile.
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                a_desc,
-                set_bounds=[M - off_am_tdm, K_local - num_loads * BLOCK_SIZE_K],
+                a_desc, add_offsets=[0, BLOCK_SIZE_K]
             )
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                b_desc,
-                set_bounds=[
-                    gl.cdiv(N, 16) - off_bn_tdm,
-                    K_local * 16 - num_loads * BLOCK_SIZE_K * 16,
-                ],
+                b_desc, add_offsets=[0, BLOCK_SIZE_K * 16]
             )
-        gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], tdm_smem_a.index(num_loads % NUM_BUFFERS)
-        )
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS)
-        )
-        # Advance to the next K tile.
-        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            a_desc, add_offsets=[0, BLOCK_SIZE_K]
-        )
-        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            b_desc, add_offsets=[0, BLOCK_SIZE_K * 16]
-        )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [off_am_tdm, num_loads * BLOCK_SIZE_K],
+                tdm_smem_a.index(num_loads % NUM_BUFFERS),
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [off_bn_tdm, num_loads * BLOCK_SIZE_K * 16],
+                tdm_smem_b.index(num_loads % NUM_BUFFERS),
+            )
         num_loads += 1
 
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
@@ -1113,31 +1145,45 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
         )
 
         # TDM load next tile
-        if not EVEN_K:
+        if USE_DESC_STEP:
+            if not EVEN_K:
+                a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    a_desc,
+                    set_bounds=[M - off_am_tdm, K_local - num_loads * BLOCK_SIZE_K],
+                )
+                b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    b_desc,
+                    set_bounds=[
+                        gl.cdiv(N, 16) - off_bn_tdm,
+                        K_local * 16 - num_loads * BLOCK_SIZE_K * 16,
+                    ],
+                )
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc, [0, 0], tdm_smem_a.index(num_loads % NUM_BUFFERS), pred=1
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS), pred=1
+            )
+            # Advance to the next K tile.
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                a_desc,
-                set_bounds=[M - off_am_tdm, K_local - num_loads * BLOCK_SIZE_K],
+                a_desc, add_offsets=[0, BLOCK_SIZE_K]
             )
             b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                b_desc,
-                set_bounds=[
-                    gl.cdiv(N, 16) - off_bn_tdm,
-                    K_local * 16 - num_loads * BLOCK_SIZE_K * 16,
-                ],
+                b_desc, add_offsets=[0, BLOCK_SIZE_K * 16]
             )
-        gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], tdm_smem_a.index(num_loads % NUM_BUFFERS), pred=1
-        )
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS), pred=1
-        )
-        # Advance to the next K tile.
-        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            a_desc, add_offsets=[0, BLOCK_SIZE_K]
-        )
-        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            b_desc, add_offsets=[0, BLOCK_SIZE_K * 16]
-        )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [off_am_tdm, num_loads * BLOCK_SIZE_K],
+                tdm_smem_a.index(num_loads % NUM_BUFFERS),
+                pred=1,
+            )
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [off_bn_tdm, num_loads * BLOCK_SIZE_K * 16],
+                tdm_smem_b.index(num_loads % NUM_BUFFERS),
+                pred=1,
+            )
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
         num_loads += 1
