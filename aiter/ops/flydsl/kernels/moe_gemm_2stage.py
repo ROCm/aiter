@@ -1552,12 +1552,11 @@ def compile_moe_gemm1(
                             rocdl.sched_dswr(1)
                     rocdl.sched_barrier(0)
 
-                # Prologue: A-load → B-loads → A→LDS store → barrier.
-                # Matching CK-tile order: B loads overlap A global-memory latency (~300 cy).
-                # sched_barrier(0) pins prevent MLIR from sinking B loads after the LDS store.
+                # Prologue: B-loads first → A-load → A→LDS store → barrier.
+                # Issuing B before A gives B ~300 extra cycles of latency cover.
+                # By the time A finishes and the LDS store drains vmcnt(0), B has
+                # already arrived — the s_waitcnt stall covers only A's latency.
                 k0 = k_base_idx
-                x_regs0 = load_x_tile(k0)                     # A in-flight
-                rocdl.sched_barrier(0)
                 b_gate_cur = load_b_tile(k0, n_blk_gate, n_intra_gate)
                 # INTERLEAVE: gate and up alternate in n_blk_gate; no separate up tile needed.
                 b_up_cur = (
@@ -1566,7 +1565,9 @@ def compile_moe_gemm1(
                     else load_b_tile(k0, n_blk_up, n_intra_up)
                 )
                 rocdl.sched_barrier(0)
-                store_x_tile_to_lds(x_regs0, lds_base_cur)    # A has had time to arrive
+                x_regs0 = load_x_tile(k0)                     # A in-flight after B
+                rocdl.sched_barrier(0)
+                store_x_tile_to_lds(x_regs0, lds_base_cur)    # vmcnt(0) drains A; B already done
                 rocdl.sched_barrier(0)
                 _barrier(vmcnt=0, lgkmcnt=0)
 
@@ -3713,13 +3714,13 @@ def compile_moe_gemm2(
 
                     rocdl.sched_barrier(0)
 
-                # Prologue: A-load → B-load → A→LDS store → barrier (CK-tile order).
+                # Prologue: B-load first → A-load → A→LDS store → barrier.
                 k0 = fx.Index(0)
-                x_regs0 = load_x_tile(k0)                     # A in-flight
-                rocdl.sched_barrier(0)
                 b_cur = load_b_tile(k0)
                 rocdl.sched_barrier(0)
-                store_x_tile_to_lds(x_regs0, lds_base_cur)
+                x_regs0 = load_x_tile(k0)                     # A in-flight after B
+                rocdl.sched_barrier(0)
+                store_x_tile_to_lds(x_regs0, lds_base_cur)    # vmcnt(0) drains A; B already done
                 rocdl.sched_barrier(0)
                 _barrier(vmcnt=0, lgkmcnt=0)
 
