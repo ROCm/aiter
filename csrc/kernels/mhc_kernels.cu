@@ -1894,28 +1894,27 @@ namespace aiter {
             floatblock_t v_layer_input_f;
 
             auto process_norm_block = [&](int norm_block_id, halfblock_t v_norm_weight) {
-                halfblock_t v_layer_input = load_layer_input_loop(norm_block_id, 0);
+                #pragma unroll
                 for(int j = 0; j < norm_block_vecs; j++) {
                     v_norm_weight_f[j] = static_cast<float>(v_norm_weight[j]);
                 }
-                for(int j = 0; j < norm_block_vecs; j++) {
-                    v_layer_input_f[j] = static_cast<float>(v_layer_input[j]);
-                }
-                for(int j = 1; j < m_oob; j++) {
-                    v_layer_input = load_layer_input_loop(norm_block_id, j);
-                    for(int k = 0; k < norm_block_vecs; k++) {
-                        v_layer_input_f[k] = v_layer_input_f[k] * v_norm_weight_f[k] * rms[j-1];
+                // Unroll over the compile-time num_rows (with a runtime r < m_oob
+                // guard) so rms[r] uses a constant index. Indexing the rms[] register
+                // array by the runtime row (rms[j-1] / rms[m_oob-1]) previously forced
+                // the whole array to spill to scratch, since the HW cannot address
+                // VGPRs by a dynamic index. The per-row LDS loads are independent, so
+                // the compiler still overlaps them across the unrolled iterations.
+                #pragma unroll
+                for(int r = 0; r < num_rows; r++) {
+                    if (r < m_oob) {
+                        halfblock_t v_layer_input = load_layer_input_loop(norm_block_id, r);
+                        #pragma unroll
+                        for(int k = 0; k < norm_block_vecs; k++) {
+                            v_layer_input_f[k] = static_cast<float>(v_layer_input[k]) * v_norm_weight_f[k] * rms[r];
+                        }
+                        store_vector_nbytes<DTYPE_I, float, norm_block_vecs, norm_load_bytes, 0, false>(buffer_out, v_layer_input_f, r * hidden_size + norm_block_id * norm_block + lane_id * norm_block_vecs);
                     }
-                    store_vector_nbytes<DTYPE_I, float, norm_block_vecs, norm_load_bytes, 0, false>(buffer_out, v_layer_input_f, (j - 1) * hidden_size + norm_block_id * norm_block + lane_id * norm_block_vecs);
-                    for(int j = 0; j < norm_block_vecs; j++) {
-                        v_layer_input_f[j] = static_cast<float>(v_layer_input[j]);
-                    }
-
                 }
-                for(int k = 0; k < norm_block_vecs; k++) {
-                    v_layer_input_f[k] = v_layer_input_f[k] * v_norm_weight_f[k] * rms[m_oob-1];
-                }
-                store_vector_nbytes<DTYPE_I, float, norm_block_vecs, norm_load_bytes, 0, false>(buffer_out, v_layer_input_f, (m_oob - 1) * hidden_size + norm_block_id * norm_block + lane_id * norm_block_vecs);
             };
 
             int norm_i = 0;
