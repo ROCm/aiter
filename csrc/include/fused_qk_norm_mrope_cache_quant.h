@@ -3,15 +3,16 @@
 
 #pragma once
 
-#include <torch/extension.h>
+#include "aiter_tensor.h"
+#include <cstdint>
+#include <optional>
+#include <vector>
 
-using namespace at;
-
-void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(Tensor& qkv,
-                                                    Tensor& qw,
-                                                    Tensor& kw,
-                                                    Tensor& cos_sin,
-                                                    Tensor& positions,
+void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
+                                                    aiter_tensor_t& qw,
+                                                    aiter_tensor_t& kw,
+                                                    aiter_tensor_t& cos_sin,
+                                                    aiter_tensor_t& positions,
                                                     int64_t num_tokens,
                                                     int64_t num_heads_q,
                                                     int64_t num_heads_k,
@@ -21,14 +22,14 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(Tensor& qkv,
                                                     std::vector<int64_t> mrope_section_,
                                                     bool is_interleaved,
                                                     double eps,
-                                                    Tensor& q_out,
-                                                    Tensor& k_cache,
-                                                    Tensor& v_cache,
-                                                    Tensor& slot_mapping,
-                                                    Tensor& per_tensor_k_scale,
-                                                    Tensor& per_tensor_v_scale,
-                                                    std::optional<Tensor> k_out,
-                                                    std::optional<Tensor> v_out,
+                                                    aiter_tensor_t& q_out,
+                                                    aiter_tensor_t& k_cache,
+                                                    aiter_tensor_t& v_cache,
+                                                    aiter_tensor_t& slot_mapping,
+                                                    aiter_tensor_t& per_tensor_k_scale,
+                                                    aiter_tensor_t& per_tensor_v_scale,
+                                                    std::optional<aiter_tensor_t> k_out,
+                                                    std::optional<aiter_tensor_t> v_out,
                                                     bool return_kv,
                                                     bool use_shuffle_layout,
                                                     int64_t block_size,

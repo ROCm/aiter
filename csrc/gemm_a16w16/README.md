@@ -60,17 +60,24 @@ If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with n
 - **Type**: Comma-separated string
 - **Default**: `all`
 - **Choices**: `all`, `asm`, `hipblaslt`, `triton`, `flydsl`, `torch`, `skinny`, `opus`
-- **Description**: Choose which backends to tune. `all` includes every backend **except** hipblaslt. To include hipblaslt, you must also pass `--with-hipblaslt`.
+- **Description**: Choose which backends to tune. hipblaslt requires **both** `--libtype all` (or `--libtype hipblaslt`) **and** `--with-hipblaslt` to run.
 
 **Example**:
 ```bash
+# tune asm and opus only
 --libtype asm,opus
+
+# tune all backends including hipblaslt
+--with-hipblaslt
+
+# tune hipblaslt only
+--libtype hipblaslt --with-hipblaslt
 ```
 
 ### `--with-hipblaslt`
 - **Type**: Flag
 - **Default**: disabled
-- **Description**: Include hipblaslt solutions in tuning (imports from gradlib). Without this flag, hipblaslt is **never** run — even with `--libtype all` or `--libtype hipblaslt`. When using this flag, it is recommended to run via `gemm_tuner.py` (the subprocess wrapper) so that GPU-level crashes from hipblaslt are retried automatically.
+- **Description**: Enable hipblaslt backend (imports from gradlib). This is a **gate switch** — hipblaslt is never run without it, regardless of `--libtype`. With the default `--libtype all`, adding `--with-hipblaslt` is sufficient to include hipblaslt alongside all other backends. When using this flag, it is recommended to run via `gemm_tuner.py` (the subprocess wrapper) so that GPU-level crashes from hipblaslt are retried automatically.
 
 ### `--indtype` / `--outdtype`
 - **Choices**: `f32`, `f16`, `bf16`, `fp8`

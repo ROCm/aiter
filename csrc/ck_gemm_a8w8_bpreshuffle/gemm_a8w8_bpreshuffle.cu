@@ -181,15 +181,22 @@ torch::Tensor gemm_a8w8_bpreshuffle(torch::Tensor& XQ,
     int M      = XQ.size(0);
     int N      = WQ.size(0);
     int K      = XQ.size(1);
+    int WQK    = WQ.size(1);
     int KBatch = 1 << splitK;
+
+    TORCH_CHECK(WQK >= K,
+                "gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K=",
+                WQK,
+                ", XQ K=",
+                K);
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        rowwise_dispatch<F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        rowwise_dispatch<F32, F16>(M, N, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        rowwise_dispatch<F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        rowwise_dispatch<F32, B16>(M, N, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else
     {

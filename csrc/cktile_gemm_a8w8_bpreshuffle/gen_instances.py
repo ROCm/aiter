@@ -61,29 +61,52 @@ torch::Tensor
     // Check if this input needs to be padded.
     int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
     int N = WQ.size(0);
-    int K = WQ.size(1);
-    bool pad = (M % {k.MTile} != 0) || (N % {k.NTile} != 0) || (K % ({k.KTile}) != 0);
-    if (pad)
+    int K = XQ.size(1);
+    bool pad_m = M % {k.MTile} != 0;
+    bool pad_n = N % {k.NTile} != 0;
+    bool pad_k = K % ({k.KTile}) != 0;
+    if (pad_m && pad_n && pad_k)
     {{{{
-        // pad
-        {{INSTANCE_CONTENT_pad}}
-        // pad
+        {{INSTANCE_CONTENT_pad_mnk}}
+    }}}}
+    else if (pad_m && pad_n)
+    {{{{
+        {{INSTANCE_CONTENT_pad_mn}}
+    }}}}
+    else if (pad_m && pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_mk}}
+    }}}}
+    else if (pad_n && pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_nk}}
+    }}}}
+    else if (pad_m)
+    {{{{
+        {{INSTANCE_CONTENT_pad_m}}
+    }}}}
+    else if (pad_n)
+    {{{{
+        {{INSTANCE_CONTENT_pad_n}}
+    }}}}
+    else if (pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_k}}
     }}}}
     else
     {{{{
-        // no pad
         {{INSTANCE_CONTENT_nopad}}
-        // no pad
     }}}}
 }}}}
 
 """
 
-        INSTANCE_CONTENT_nobias = f"""using FlatmmInstance = CustomConfig<
+        def instance_content(pad_m: bool, pad_n: bool, pad_k: bool) -> str:
+            return f"""using FlatmmInstance = CustomConfig<
             DDataType, EDataType,
             {k.sTransposeC},{k.sUseStructuredSparsity}, {k.sTileParitionerGroupNum},
             {k.sTileParitionerM01}, {k.sNumWaveGroups}, {k.sDoubleSmemBuffer},
-            {k.PadM},  {k.PadN},  {k.PadK},
+            {int(pad_m)},  {int(pad_n)},  {int(pad_k)},
             {k.BlockPerCu},
             {k.MTile}, {k.NTile}, {k.KTile},
             {k.MWarp}, {k.NWarp}, {k.KWarp},
@@ -92,24 +115,22 @@ torch::Tensor
         // Run kernel instance.
         return gemm_a8w8_bpreshuffle_cktile_impl<DDataType, EDataType, FlatmmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
 """
+
+        INSTANCE_CONTENT_nopad = instance_content(k.PadM, k.PadN, k.PadK)
+        instance_replacements = {
+            "INSTANCE_CONTENT_nopad": INSTANCE_CONTENT_nopad,
+            "INSTANCE_CONTENT_pad_m": instance_content(True, k.PadN, k.PadK),
+            "INSTANCE_CONTENT_pad_n": instance_content(k.PadM, True, k.PadK),
+            "INSTANCE_CONTENT_pad_k": instance_content(k.PadM, k.PadN, True),
+            "INSTANCE_CONTENT_pad_mn": instance_content(True, True, k.PadK),
+            "INSTANCE_CONTENT_pad_mk": instance_content(True, k.PadN, True),
+            "INSTANCE_CONTENT_pad_nk": instance_content(k.PadM, True, True),
+            "INSTANCE_CONTENT_pad_mnk": instance_content(True, True, True),
+        }
         if self.istune:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
-                INSTANCE_CONTENT_pad=(
-                    INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")
-                ),
-                INSTANCE_CONTENT_nopad=(
-                    INSTANCE_CONTENT_nobias.format(GemmSpec="Default")
-                ),
-            )
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(**instance_replacements)
         else:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
-                INSTANCE_CONTENT_pad=INSTANCE_CONTENT_nobias.format(
-                    GemmSpec="MNKPadding"
-                ),
-                INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_nobias.format(
-                    GemmSpec="Default"
-                ),
-            )
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(**instance_replacements)
 
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
             INSTANCE_IMPL_str

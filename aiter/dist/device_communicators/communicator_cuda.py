@@ -14,51 +14,16 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
 
-_FUSED_AR_RMS_QUANT_ALIASES = {
-    "fp8": "per_token",
-    "fp8_per_token": "per_token",
-    "per-token": "per_token",
-    "per_token": "per_token",
-    "per_token_fp8": "per_token",
-    "fp8_per_group": "per_group",
-    "per-group": "per_group",
-    "per_group": "per_group",
-    "per_group_fp8": "per_group",
-    "per_1x128": "per_group",
-    "fp4": "mxfp4",
-    "fp4_e2m1": "mxfp4",
-    "mx_fp4": "mxfp4",
-    "mxfp4": "mxfp4",
-    "per_1x32": "mxfp4",
-}
-
-
-def _normalize_fused_ar_rms_quant_type(quant_type):
-    if isinstance(quant_type, str):
-        normalized = _FUSED_AR_RMS_QUANT_ALIASES.get(quant_type.lower())
-        if normalized is not None:
-            return normalized
-    else:
-        if quant_type == QuantType.per_Token:
-            return "per_token"
-        if quant_type in (QuantType.per_1x128, getattr(QuantType, "per_128x128", None)):
-            return "per_group"
-        if quant_type == QuantType.per_1x32:
-            return "mxfp4"
-        try:
-            return _normalize_fused_ar_rms_quant_type(QuantType(quant_type))
-        except Exception:
-            pass
-    raise ValueError(
-        "unsupported fused AR+RMSNorm quant_type="
-        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
-    )
-
 
 class CudaCommunicator(DeviceCommunicatorBase):
     # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
+    )
+    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", -1))
+    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", -1))
+    _ar_quant_no_prefill_max_bytes = int(
+        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", -1)
     )
 
     def __init__(
@@ -241,6 +206,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         prefill_support: bool = False,
         x_pad_to_multiple: int = 0,
+        gemma_norm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from aiter.dist.device_communicators.custom_all_reduce import (
             can_pack_2d_last_dim_slice,
@@ -276,10 +242,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         can_use_custom_ar = (
             ca_comm is not None and not ca_comm.disabled and can_use_fuse_ar_rms
         )
+        total_bytes_limit = (
+            self._ar_1stage_max_kb
+            if self._ar_1stage_max_kb >= 0
+            else 128 * 7168 * 2 // self.world_size
+        )
         use_1stage = (
             self._ar_1stage_override
             if self._ar_1stage_override is not None
-            else (total_bytes <= 128 * 1024)
+            else (total_bytes <= total_bytes_limit)
         )
         if (
             not use_general_path
@@ -293,6 +264,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 eps,
                 use_1stage,
                 out_hidden_dim=out_n,
+                gemma_norm=gemma_norm,
             )
             assert out is not None
             assert res_out is not None
@@ -313,6 +285,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 use_1stage,
                 out_hidden_dim=out_n,
                 prefill_support=prefill_support,
+                gemma_norm=gemma_norm,
             )
             assert out is not None
             assert res_out is not None
@@ -338,9 +311,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
             ar_out_2d = ar_out.reshape(-1, ar_out.shape[-1])
             res_inp_2d = res_inp_.reshape(-1, res_inp_.shape[-1])
+            norm_weight = weight_ + 1.0 if gemma_norm else weight_
             out_2d, residual_out_2d = fused_add_rmsnorm_pad(
                 ar_out_2d,
-                weight_,
+                norm_weight,
                 eps,
                 res_inp_2d,
                 x_pad_to_multiple=x_pad_to_multiple,
@@ -361,6 +335,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             residual_out,
             weight_,
             eps,
+            gemma_norm,
             0,
         )
         return out, residual_out
@@ -375,8 +350,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         quant_type="per_token",
         group_size=128,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
-        quant_type = _normalize_fused_ar_rms_quant_type(quant_type)
+        # quant_type arrives already canonicalized to a string ("per_token"/
+        # "per_group"/"mxfp4") from the public API.
+        if gemma_norm and quant_type != "per_token":
+            raise NotImplementedError(
+                "gemma_norm fused quant currently supports per-token FP8 only"
+            )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
                 input_,
@@ -386,6 +368,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group_size=group_size,
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
             )
         if quant_type == "mxfp4":
             return self.fused_allreduce_rmsnorm_mxfp4_quant(
@@ -398,23 +381,52 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
         if emit_bf16:
             raise ValueError("emit_bf16 is not supported for per-token FP8 quant")
-        total_bytes = input_.numel() * input_.element_size()
+        hidden_dim = int(input_.shape[-1])
+        element_size = input_.element_size()
+        total_bytes = input_.numel() * element_size
+        fused_quant_bytes_limit = (
+            self._ar_quant_max_bytes if self._ar_quant_max_bytes >= 0 else 4096 * 1024
+        )
+        no_prefill_quant_bytes_limit = (
+            self._ar_quant_no_prefill_max_bytes
+            if self._ar_quant_no_prefill_max_bytes >= 0
+            else 64 * 1024 * 1024
+        )
         if (
-            int(input_.shape[-1]) in [512, 1024, 2048, 4096]
-            and total_bytes <= 4096 * 1024
-            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+            (
+                hidden_dim in [512, 1024, 2048, 4096]
+                or (
+                    hidden_dim in [7168, 6144]
+                    and input_.dtype in (torch.float16, torch.bfloat16)
+                )
+            )
+            and total_bytes <= fused_quant_bytes_limit
+            and (prefill_support or total_bytes <= no_prefill_quant_bytes_limit)
         ):
+            total_bytes_limit = (
+                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+            )
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else (total_bytes <= total_bytes_limit)
             )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
-                input_, res_inp_, weight_, eps, use_1stage
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                use_1stage,
+                gemma_norm=gemma_norm,
             )
         else:
             out_, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                prefill_support,
+                gemma_norm=gemma_norm,
             )
             hip_quant = get_hip_quant(QuantType.per_Token)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)
@@ -432,6 +444,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         group_size=128,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         """Fused AR+RMSNorm+per-group FP8 quant, optionally also emitting the
         pre-quantization bf16/fp16 normed output.
@@ -453,10 +466,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and self.world_size != 6
             and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
+            total_bytes_limit = (
+                self._ar_1stage_max_kb if self._ar_1stage_max_kb >= 0 else 128 * 1024
+            )
             use_1stage = (
                 self._ar_1stage_override
                 if self._ar_1stage_override is not None
-                else (total_bytes <= 128 * 1024)
+                else (total_bytes <= total_bytes_limit)
             )
             try:
                 result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
@@ -467,12 +483,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     group_size,
                     use_1stage,
                     emit_bf16=emit_bf16,
+                    transpose_scale=transpose_scale,
                 )
-                if emit_bf16:
-                    out, res_out, scale_out, bf16_out = result
-                else:
-                    out, res_out, scale_out = result
-                fused_ok = True
+                if result is not None:
+                    if emit_bf16:
+                        out, res_out, scale_out, bf16_out = result
+                    else:
+                        out, res_out, scale_out = result
+                    fused_ok = True
             except Exception:
                 pass
         if not fused_ok:
@@ -480,7 +498,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 input_, res_inp_, weight_, eps, prefill_support
             )
             hip_quant = get_hip_quant(QuantType.per_1x128)
-            out, scale_out = hip_quant(out_, quant_dtype=fp8)
+            # The fused path and the registered op's fake return the per-group
+            # scale in column-major (1, M) layout (stride (1, M)) when
+            # transpose_scale=True. per_group_quant_hip cannot produce that
+            # stride directly (with transpose_scale=True it returns a contiguous
+            # (M, num_groups) buffer with SHUFFLED bytes -- a different physical
+            # arrangement). So compute the plain row-major scale and, when
+            # transpose_scale is requested, copy its values into a genuinely
+            # column-major (1, M)-strided tensor so the runtime stride/values
+            # match the fake (otherwise torch.compile's assert_size_stride fails
+            # or the GEMM reads the wrong layout).
+            out, scale_row = hip_quant(out_, quant_dtype=fp8, transpose_scale=False)
+            if transpose_scale:
+                M, num_groups = scale_row.shape
+                scale_out = torch.empty(
+                    (num_groups, M), dtype=scale_row.dtype, device=scale_row.device
+                ).transpose(0, 1)
+                scale_out.copy_(scale_row)
+            else:
+                scale_out = scale_row
             if emit_bf16:
                 bf16_out = out_
         assert out is not None
@@ -499,6 +535,32 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar(qkv_in, q_w, k_w, eps)
+        assert q_out is not None
+        assert k_out is not None
+        assert v_out is not None
+        return q_out, k_out, v_out
+
+    def fused_qknorm_allreduce_rope(
+        self,
+        qkv_in,
+        q_w,
+        k_w,
+        cos_sin_cache,
+        position_ids,
+        head_dim,
+        rotary_dim,
+        eps,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_out, k_out, v_out = self.ca_comm.custom_fused_qknorm_ar_rope(
+            qkv_in,
+            q_w,
+            k_w,
+            cos_sin_cache,
+            position_ids,
+            head_dim,
+            rotary_dim,
+            eps,
+        )
         assert q_out is not None
         assert k_out is not None
         assert v_out is not None
@@ -663,12 +725,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         world_size = self.world_size
         ca_comm = self.ca_comm
+        # Custom kernel supports scatter on first/last/mid dims; gate via
+        # should_custom_rs which also rejects first-dim-non-vectorizable
+        # shapes (no naive fallback exists for that case, see C++ dispatch).
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and ca_comm.should_custom_rs(input_, dim)
         ):
-            ca_comm.custom_reduce_scatter(input_, output_)
+            ca_comm.custom_reduce_scatter(input_, output_, dim)
         else:
             pynccl_comm = self.pynccl_comm
             assert pynccl_comm is not None
