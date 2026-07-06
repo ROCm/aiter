@@ -26,9 +26,12 @@ CSVs, or touch anything under `aiter/configs/**`.
 
 ## The hard rules
 
-1. **A key is (untuned columns) + `cu_num` + `gfx` + `_tag`.** Never hand-pick
-   key columns — they come from the family's `*_untuned_*.csv` header, exactly as
-   runtime derives them. Do not assume `M,N,K` alone: e.g. `a8w8` also keys on
+1. **A key is (untuned columns) + `cu_num`, plus `gfx`/`_tag` when those columns
+   are present.** Never hand-pick key columns — they come from the family's
+   `*_untuned_*.csv` header, exactly as runtime derives them (`update_config_files`
+   appends `cu_num` if absent, `gfx` only when a `gfx` column exists in the merge,
+   and `_tag` only when a `_tag` column exists). Do not assume `M,N,K` alone: e.g.
+   `a8w8` also keys on
    `q_dtype_w`, `bf16` on `bias,dtype,outdtype,scaleAB,bpreshuffle`, `fmoe` on the
    full `token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_*,q_type,
    use_g1u1,doweight_stage1` (+ `_tag`).
@@ -59,12 +62,13 @@ python3 -m unittest op_tests.tuning_tests.test_config_shape_collision -v
 
 - Requires torch (importing `aiter` pulls it in); it skips cleanly where torch is
   absent, so run it in an env/container that has torch.
-- A failing family prints the offending rows and the exact key, e.g.
-  `bf16_tuned_gemm: ... duplicate shapes ...` listing the `_src` file of each
-  colliding row.
+- A failing family surfaces the runtime `RuntimeError`: a `Found N duplicate shape
+  entries during merge of '<family>'` message, the colliding rows as a
+  `Duplicate rows:` table (the merged config columns — no `_src`/key line is
+  printed), and an `Updated files:` list of the source CSVs that were rewritten.
 
-To see it the way production does (and let runtime tell you the key + rows),
-trigger the merge directly on a scratch copy:
+To see it the way production does (runtime prints the colliding rows), trigger
+the merge directly on a scratch copy:
 
 ```python
 import shutil, tempfile, aiter.jit.core as core
@@ -131,9 +135,10 @@ After resolving, re-run the guard until it passes.
 - Your green CI does **not** prove `main` stays green — it never saw the other
   in-flight config PRs. When adding shapes shared across models (common decode
   shapes, MoE token grids), assume another PR may add the same shape.
-- The same guard runs on **push to `main`** as the backstop: if two PRs race and
-  both land a colliding shape, `main` goes red immediately — fix forward by
-  pruning the duplicate (lowest-`us` wins).
+- Backstop (once wired): if this guard is added to a **push-to-`main`** job, two
+  PRs that race and both land a colliding shape turn `main` red immediately — fix
+  forward by pruning the duplicate (lowest-`us` wins). The guard is not wired into
+  CI yet, so today this is a manual/local check, not an automatic backstop.
 - Reviewing a config PR: skim other open PRs touching the same family, and trust
   the guard rather than eyeballing shapes.
 
