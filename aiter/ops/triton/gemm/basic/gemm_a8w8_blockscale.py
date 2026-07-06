@@ -76,8 +76,14 @@ def gemm_a8w8_blockscale(
     w = w.T  # (K, N)
     w_scale = w_scale.T  # (scale_k, scale_n)
 
+    # Resolve backend up-front so the config is loaded from the backend's
+    # config dir (gemm/<backend>/), falling back to the shared gemm/ dir.
+    if backend is None:
+        backend = "gluon" if _is_gluon_available() else "triton"
+    backend = backend.lower()
+
     if config is None:
-        config, _ = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K, backend=backend)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -283,8 +289,14 @@ def gemm_a8w8_blockscale_preshuffle(
     # w = w.T  # (K, N)
     w_scale = w_scale.T  # (scale_k, scale_n)
 
+    # Resolve backend up-front so the config is loaded from the backend's
+    # config dir (gemm/<backend>/), falling back to the shared gemm/ dir.
+    if backend is None:
+        backend = "gluon" if _is_gluon_available(preshuffle=True) else "triton"
+    backend = backend.lower()
+
     if config is None:
-        config, _ = _get_config(M, N, K, True)
+        config, _ = _get_config(M, N, K, True, backend=backend)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
