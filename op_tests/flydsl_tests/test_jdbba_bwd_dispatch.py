@@ -58,6 +58,51 @@ def _cos(a, b):
     ).item()
 
 
+def _eager_grads(jagged, dense, bias, seq_offsets, grad_out, B):
+    """Analytic (torch-autograd) grads of the eager fp32 forward, ground truth for
+    the FlyDSL autograd op. loss = <Out, grad_out> so d(loss)/dOut == grad_out."""
+    import torch
+
+    j = jagged.float().detach().clone().requires_grad_(True)
+    d = dense.float().detach().clone().requires_grad_(True)
+    bi = bias.float().detach().clone().requires_grad_(True)
+    go = grad_out.float()
+    loss = j.new_zeros(())
+    for b in range(B):
+        s, e = int(seq_offsets[b]), int(seq_offsets[b + 1])
+        if e > s:
+            out_b = j[s:e] @ d[b] + bi[b][None, :]
+            loss = loss + (out_b * go[s:e]).sum()
+    loss.backward()
+    return j.grad, d.grad, bi.grad
+
+
+def _run_autograd_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95):
+    """Run the fwd+bwd autograd op through out.backward(); check grads vs eager."""
+    import torch
+
+    from aiter.ops.flydsl import jagged_dense_bmm_autograd
+    from bench_jagged_dense_bmm_bwd_perf import _make_inputs
+
+    jagged, dense, grad_out, seq_offsets, L, N, K = _make_inputs(
+        B, D, D, Mi, regime=regime, seed=seed, sparsity=sparsity
+    )
+    bias = torch.randn(B, N, dtype=torch.bfloat16, device=jagged.device)
+
+    jf = jagged.detach().clone().requires_grad_(True)
+    df = dense.detach().clone().requires_grad_(True)
+    bf = bias.detach().clone().requires_grad_(True)
+    out = jagged_dense_bmm_autograd(jf, df, bf, seq_offsets, n_groups=B, max_seq_len=Mi)
+    out.backward(grad_out)
+    torch.cuda.synchronize()
+
+    gj_e, gd_e, gb_e = _eager_grads(jagged, dense, bias, seq_offsets, grad_out, B)
+    c_j, c_d, c_b = _cos(jf.grad, gj_e), _cos(df.grad, gd_e), _cos(bf.grad, gb_e)
+    ok = min(c_j, c_d, c_b) > _COS_THRESH
+    tag = f"[autograd] B={B} D={D} Mi={Mi} {regime:6s} L={L}"
+    return ok, f"[{'PASS' if ok else 'FAIL'}] {tag}  grad cos(dJ={c_j:.5f}, dD={c_d:.5f}, dB={c_b:.5f})"
+
+
 def _run_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95, label=""):
     """Run the dispatched backward for one shape; return (ok, msg)."""
     import torch
@@ -115,6 +160,16 @@ def _worker(D: int) -> int:
                                  sparsity=r["sparsity"], label="[regression] ")
         ok &= case_ok
         print(msg)
+
+    # (4) end-to-end autograd (out.backward()) vs eager grads. D=256 only: D=512 is
+    # blocked at large L by the FORWARD int32-offset overflow (integration plan Risks).
+    if D <= 256:
+        for (B, Mi, regime) in [(120, 512, "genrec"), (120, 512, "skew")]:
+            case_ok, msg = _run_autograd_case(D, B, Mi, regime)
+            ok &= case_ok
+            print(msg)
+    else:
+        print(f"[SKIP] autograd D={D}: forward int32-overflow at large L (separate forward fix)")
 
     print(f"\nD={D} RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
