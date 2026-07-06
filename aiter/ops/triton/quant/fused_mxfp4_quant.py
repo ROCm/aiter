@@ -610,6 +610,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
 
     N_i = scaleN
     M_o, N_o = sorted_ids.shape[0], N_i
+    assert (N_i // 2) % 2 == 0
     assert block_size % BLOCK_SIZE_M == 0
 
     blockscale_e8m0_sorted = torch.empty(
@@ -641,7 +642,6 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         *blockscale_e8m0_sorted.stride(),
         token_num=token_num,
         N_i=N_i,
-        N_o=N_o,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         BLOCK_SIZE_Mx=BLOCK_SIZE_Mx,
         BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
@@ -649,6 +649,11 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         TOPK=topk,
     )
 
+    # The blockscale buffer is allocated with padded N (rounded up to
+    # BLOCK_SIZE_N).  Returning the padded view keeps the layout identical to
+    # ``e8m0_shuffle`` so downstream MoE GEMM kernels can use the same padded
+    # scale stride for any ``inter_dim/32``.  Padded columns are zero, so they
+    # contribute no extra signal.
     padded_N_o = triton.cdiv(N_o, BLOCK_SIZE_N) * BLOCK_SIZE_N
     return (
         x_fp4.view(dtypes.fp4x2),
