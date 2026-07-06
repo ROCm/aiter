@@ -76,17 +76,17 @@ jobs:
     runs-on: aiter-di-ci-spur-login
     timeout-minutes: 180
     env:
-      ATOM_REF: ${{ inputs.atom_ref }}
-      SPUR_ACCOUNT: ${{ inputs.spur_account }}
-      SPUR_PARTITION: ${{ inputs.spur_partition }}
-      SPUR_NODELIST: ${{ inputs.spur_nodelist }}
-      MODEL_PATH: ${{ inputs.model_path }}
-      DOCKER_IMAGE: ${{ inputs.docker_image }}
-      SHARED_ROOT: ${{ inputs.shared_root }}
-      ISL_LIST: ${{ inputs.isl_list }}
-      OSL: ${{ inputs.osl }}
-      CONC_LIST: ${{ inputs.conc_list }}
-      RUN_GSM8K_INPUT: ${{ format('{0}', inputs.run_gsm8k) }}
+      ATOM_REF: main
+      SPUR_ACCOUNT: amd-frameworks
+      SPUR_PARTITION: amd-frameworks
+      SPUR_NODELIST: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16
+      MODEL_PATH: /data/models2/DeepSeek-V4-Pro
+      DOCKER_IMAGE: rocm/atom-dev:latest
+      SHARED_ROOT_BASE: /data/xinhuang/spur_dsv4_logs
+      ISL_LIST: "8192"
+      OSL: "1"
+      CONC_LIST: "2"
+      RUN_GSM8K: "0"
       RANDOM_RANGE_RATIO: "0.8"
       SCRIPT_PATH: atom/mesh/scripts/ds_v4_2p_tp8_1d_tp8_atom_mtp_dpa_slurm.sh
     steps:
@@ -101,32 +101,77 @@ jobs:
           spur --help || true
           spur queue || true
 
+      - name: Apply ATOM DI smoke inputs
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
+          import json
+          import os
+          import sys
+
+          event_path = sys.argv[1]
+          with open(event_path, encoding="utf-8") as f:
+              event = json.load(f)
+
+          inputs = event.get("inputs") or {}
+
+          defaults = {
+              "ATOM_REF": "main",
+              "SPUR_ACCOUNT": "amd-frameworks",
+              "SPUR_PARTITION": "amd-frameworks",
+              "SPUR_NODELIST": "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16",
+              "MODEL_PATH": "/data/models2/DeepSeek-V4-Pro",
+              "DOCKER_IMAGE": "rocm/atom-dev:latest",
+              "ISL_LIST": "8192",
+              "OSL": "1",
+              "CONC_LIST": "2",
+          }
+          input_names = {
+              "ATOM_REF": "atom_ref",
+              "SPUR_ACCOUNT": "spur_account",
+              "SPUR_PARTITION": "spur_partition",
+              "SPUR_NODELIST": "spur_nodelist",
+              "MODEL_PATH": "model_path",
+              "DOCKER_IMAGE": "docker_image",
+              "ISL_LIST": "isl_list",
+              "OSL": "osl",
+              "CONC_LIST": "conc_list",
+          }
+
+          for env_name, default in defaults.items():
+              raw = inputs.get(input_names[env_name], "")
+              value = raw if raw not in ("", None) else default
+              print(f"{env_name}={value}")
+
+          shared_root = inputs.get("shared_root") or ""
+          if not shared_root:
+              run_id = os.environ["GITHUB_RUN_ID"]
+              run_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+              shared_root = f"/data/xinhuang/spur_dsv4_logs/aiter_spur_login_{run_id}_{run_attempt}"
+              print(f"SHARED_ROOT={shared_root}")
+          else:
+              print(f"SHARED_ROOT={shared_root}")
+
+          run_gsm8k = inputs.get("run_gsm8k", False)
+          print(f"RUN_GSM8K={1 if run_gsm8k in (True, 'true', 'True', '1', 1) else 0}")
+          PY
+
       - name: Checkout ATOM mesh scripts
         uses: actions/checkout@v4
         with:
           repository: ROCm/ATOM
-          ref: ${{ env.ATOM_REF || 'main' }}
+          ref: main
           path: ATOM
 
-      - name: Set ATOM DI smoke defaults
+      - name: Select ATOM ref
         run: |
           set -euo pipefail
-          {
-            echo "SPUR_ACCOUNT=${SPUR_ACCOUNT:-amd-frameworks}"
-            echo "SPUR_PARTITION=${SPUR_PARTITION:-amd-frameworks}"
-            echo "SPUR_NODELIST=${SPUR_NODELIST:-ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16}"
-            echo "MODEL_PATH=${MODEL_PATH:-/data/models2/DeepSeek-V4-Pro}"
-            echo "DOCKER_IMAGE=${DOCKER_IMAGE:-rocm/atom-dev:latest}"
-            echo "SHARED_ROOT=${SHARED_ROOT:-/data/xinhuang/spur_dsv4_logs/aiter_spur_login_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}}"
-            echo "ISL_LIST=${ISL_LIST:-8192}"
-            echo "OSL=${OSL:-1}"
-            echo "CONC_LIST=${CONC_LIST:-2}"
-            if [[ "${RUN_GSM8K_INPUT:-false}" == "true" ]]; then
-              echo "RUN_GSM8K=1"
-            else
-              echo "RUN_GSM8K=0"
-            fi
-          } >> "${GITHUB_ENV}"
+          cd ATOM
+          if [[ "${ATOM_REF}" != "main" ]]; then
+            git fetch --depth=1 origin "${ATOM_REF}"
+            git checkout FETCH_HEAD
+          fi
+          git rev-parse HEAD
 
       - name: Prepare shared ATOM source and patched Spur script
         run: |
