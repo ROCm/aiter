@@ -71,7 +71,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm = None
         self.symm_mem_comm = None
-        self._logged_qr_rmsnorm_dispatch = False
         # if use_torch_symm_mem and current_platform.is_cuda():
         #     self.symm_mem_comm = SymmMemCommunicator(
         #         group=self.cpu_group,
