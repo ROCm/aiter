@@ -66,17 +66,17 @@ jobs:
     runs-on: aiter-di-ci-spur-login
     timeout-minutes: 180
     env:
-      ATOM_REF: ${{ github.event.inputs.atom_ref || 'main' }}
-      SPUR_ACCOUNT: ${{ github.event.inputs.spur_account || 'amd-frameworks' }}
-      SPUR_PARTITION: ${{ github.event.inputs.spur_partition || 'amd-frameworks' }}
-      SPUR_NODELIST: ${{ github.event.inputs.spur_nodelist || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
-      MODEL_PATH: ${{ github.event.inputs.model_path || '/mnt/models/DeepSeek-V4-Pro/' }}
-      DOCKER_IMAGE: ${{ github.event.inputs.docker_image || 'rocm/atom-dev:latest' }}
-      SHARED_ROOT: ${{ github.event.inputs.shared_root || format('/it-share/yajizhan/spur_dsv4_logs/aiter_spur_login_{0}_{1}', github.run_id, github.run_attempt) }}
-      ISL_LIST: ${{ github.event.inputs.isl_list || '8192' }}
-      OSL: ${{ github.event.inputs.osl || '1' }}
-      CONC_LIST: ${{ github.event.inputs.conc_list || '2' }}
-      RUN_GSM8K: ${{ github.event.inputs.run_gsm8k == 'true' && '1' || '0' }}
+      ATOM_REF: ${{ inputs.atom_ref || 'main' }}
+      SPUR_ACCOUNT: ${{ inputs.spur_account || 'amd-frameworks' }}
+      SPUR_PARTITION: ${{ inputs.spur_partition || 'amd-frameworks' }}
+      SPUR_NODELIST: ${{ inputs.spur_nodelist || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-14,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
+      MODEL_PATH: ${{ inputs.model_path || '/mnt/models/DeepSeek-V4-Pro/' }}
+      DOCKER_IMAGE: ${{ inputs.docker_image || 'rocm/atom-dev:latest' }}
+      SHARED_ROOT: ${{ inputs.shared_root || format('/it-share/yajizhan/spur_dsv4_logs/aiter_spur_login_{0}_{1}', github.run_id, github.run_attempt) }}
+      ISL_LIST: ${{ inputs.isl_list || '8192' }}
+      OSL: ${{ inputs.osl || '1' }}
+      CONC_LIST: ${{ inputs.conc_list || '2' }}
+      RUN_GSM8K: ${{ inputs.run_gsm8k && '1' || '0' }}
       RANDOM_RANGE_RATIO: "0.8"
       SCRIPT_PATH: atom/mesh/scripts/ds_v4_2p_tp8_1d_tp8_atom_mtp_dpa_slurm.sh
     steps:
@@ -244,5 +244,5 @@ jobs:
           path: |
             ${{ env.SHARED_ROOT }}/**/*.out
             ${{ env.SHARED_ROOT }}/**/*.err
-            ${{ env.LOG_ROOT }}/**/*.json
-            ${{ env.LOG_ROOT }}/**/*.log
+            ${{ env.SHARED_ROOT }}/job/**/*.json
+            ${{ env.SHARED_ROOT }}/job/**/*.log
