@@ -172,7 +172,7 @@ void TileGemmComputeImpl(const HostArguments& args)
                           GemmConfig::N_Warp_Tile_v,
                           GemmConfig::K_Warp_Tile_v>>;
 
-    using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
+    using TilePartitioner = ck_tile::GemmSpatiallyLocalTilePartitioner<GemmShape, 8, 4>;
 
     using GemmTraits = ck_tile::TileGemmQuantTraits<kPadM,
                                                     kPadN,
