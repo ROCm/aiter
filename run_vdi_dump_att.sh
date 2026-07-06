@@ -352,6 +352,7 @@ jobs:
   att_shader_engine_mask: "0xf"
   att_simd_select: "0xf"
   att_buffer_size: "0x10000000"
+  att_library_path: ["${ROCPROF_ATT_LIBRARY_PATH}"]
 YAML
 
         rm -rf "${att_output_dir}"
